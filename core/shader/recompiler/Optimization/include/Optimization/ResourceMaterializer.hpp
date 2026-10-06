@@ -41,6 +41,7 @@ struct ResourceSpecialization {
 
     std::vector<Buffer> buffers;
     std::vector<Image> images;
+    std::uint32_t foldTexelOffsets = 0;
 
     bool operator==(const ResourceSpecialization& other) const;
 
