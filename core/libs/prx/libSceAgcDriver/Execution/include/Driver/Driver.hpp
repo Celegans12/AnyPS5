@@ -126,6 +126,7 @@ private:
     static bool stampValidate();
     static bool dataHits();
     static bool verifyDataHits();
+    static bool pipelineDispatch();
     static std::size_t dispatchVariants();
     static bool insertCompare();
     static std::size_t dispatchCacheEntries();
