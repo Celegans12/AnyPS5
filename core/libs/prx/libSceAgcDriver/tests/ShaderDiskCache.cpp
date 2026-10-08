@@ -171,7 +171,7 @@ CompiledVariant sampleVariant() {
     image.emulatedCompare = 0x1a07u;
     image.tableView = 0;
     info.info.images = {image};
-    info.info.samplers = {{7, 0x10, 3, true, false, SamplerUseExplicitLod | SamplerUseGather, 1}};
+    info.info.samplers = {{7, 0x10, 3, true, false, SamplerUseExplicitLod | SamplerUseGather, true, 1}};
     info.info.sampledPairs = {{0, 0, 0x10, 2}};
     info.info.tableViews = {{5, false, RdnaImageDimension::Dim2D, true, true, 5}, {7, true, RdnaImageDimension::Unknown, false, false, 3}};
     info.info.usesFaultBuffer = true;
@@ -361,6 +361,7 @@ void verifyKeySensitivity() {
     changes("an image sRGB decode", [](SampleRequest& sample) { sample.specialization.images[0].srgbDecode = true; });
     changes("the image count", [](SampleRequest& sample) { sample.specialization.images.emplace_back(); });
     changes("the bound descriptors", [](SampleRequest& sample) { sample.specialization.boundDescriptors.push_back(1); });
+    changes("the samplers whose texel offsets are folded", [](SampleRequest& sample) { sample.specialization.foldTexelOffsets = 1u; });
 
     SampleRequest moved;
     moved.userData[0] ^= 0x10000u;

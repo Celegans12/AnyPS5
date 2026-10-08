@@ -882,6 +882,17 @@ void buildResourceSpecialization(const IrResourcePlan& plan, ResourceSnapshot& s
         result.images.push_back(entry);
     }
 
+    static_assert(ShaderInfo::MaxSamplers <= 32u, "ResourceSpecialization::foldTexelOffsets has one bit per sampler");
+    for (const auto& memory : plan.memoryInfo) {
+        if (memory.kind != ResourceKind::Image || (memory.imageSampleFlags & RdnaImageSampleFlagOffset) == 0u || memory.sampler >= snapshot.samplers.size()) {
+            continue;
+        }
+        const auto& sampler = snapshot.samplers[memory.sampler];
+        if (sampler.dwordCount != 0u && ((sampler.dwords[0] >> 15u) & 1u) != 0u) {
+            result.foldTexelOffsets |= 1u << memory.sampler;
+        }
+    }
+
     const auto& views = plan.info.tableViews;
     auto& tables = snapshot.tables;
     result.tableViewClasses.assign(views.size(), 0u);
@@ -1036,6 +1047,9 @@ void ResourceMaterializer::Apply(IrProgram& program, const ResourceSpecializatio
         }
     }
     auto samplers = resources.info.samplers;
+    for (std::uint32_t index = 0; index < samplers.size(); index++) {
+        samplers[index].foldTexelOffsets = ((specialization.foldTexelOffsets >> index) & 1u) != 0u;
+    }
     auto sampledPairs = resources.info.sampledPairs;
     samplers.reserve(samplerCount);
     for (std::uint32_t index = 0; index < resources.info.samplers.size(); index++) {
@@ -1319,7 +1333,7 @@ bool ResourceSpecialization::Image::operator==(const Image& other) const {
 }
 
 bool ResourceSpecialization::operator==(const ResourceSpecialization& other) const {
-    return buffers == other.buffers && images == other.images && tableViewClasses == other.tableViewClasses && srtPoison == other.srtPoison;
+    return buffers == other.buffers && images == other.images && tableViewClasses == other.tableViewClasses && srtPoison == other.srtPoison && foldTexelOffsets == other.foldTexelOffsets;
 }
 
 }

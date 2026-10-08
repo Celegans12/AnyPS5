@@ -40,6 +40,7 @@ struct ResourceSpecialization {
     std::vector<Image> images;
     std::vector<std::uint8_t> tableViewClasses;
     std::vector<SrtReadPoison> srtPoison;
+    std::uint32_t foldTexelOffsets = 0;
 
     bool operator==(const ResourceSpecialization& other) const;
 

@@ -79,7 +79,7 @@ static_assert(sizeof(StageOutput) == 48, "StageOutput changed: update the info e
 static_assert(sizeof(IrBindingLayout) == 64, "IrBindingLayout changed: update the layout encoder");
 static_assert(sizeof(IrDescriptorBinding) == 32, "IrDescriptorBinding changed: update the layout encoder");
 static_assert(sizeof(BindingAllocationResult) == 120, "BindingAllocationResult changed: update the allocation encoder");
-static_assert(sizeof(ResourceSpecialization) == 120, "ResourceSpecialization changed: update BuildKey");
+static_assert(sizeof(ResourceSpecialization) == 128, "ResourceSpecialization changed: update BuildKey");
 static_assert(sizeof(ResourceSpecialization::Buffer) == 16, "ResourceSpecialization::Buffer changed: update BuildKey");
 static_assert(sizeof(ResourceSpecialization::Image) == 36, "ResourceSpecialization::Image changed: update BuildKey");
 static_assert(sizeof(BindingLayout) == 16, "BindingLayout changed: update BuildKey");
@@ -432,6 +432,7 @@ void encodeInfo(Writer& writer, const CompiledShaderInfo& compiled) {
         out.Value(sampler.forcePointFiltering);
         out.Value(sampler.depthCompare);
         out.Value(sampler.uses);
+        out.Value(sampler.foldTexelOffsets);
         out.Value(sampler.tableView);
     });
     writer.List(info.sampledPairs, [](Writer& out, const SampledResourcePair& pair) {
@@ -528,13 +529,14 @@ void decodeInfo(Reader& reader, CompiledShaderInfo& compiled) {
         in.Value(image.emulatedCompare);
         in.Value(image.tableView);
     });
-    reader.List(info.samplers, 19, [](Reader& in, SamplerResource& sampler) {
+    reader.List(info.samplers, 20, [](Reader& in, SamplerResource& sampler) {
         in.Value(sampler.source);
         in.Value(sampler.firstUsePc);
         in.Value(sampler.copyOf);
         in.Value(sampler.forcePointFiltering);
         in.Value(sampler.depthCompare);
         in.Value(sampler.uses);
+        in.Value(sampler.foldTexelOffsets);
         in.Value(sampler.tableView);
     });
     reader.List(info.sampledPairs, 16, [](Reader& in, SampledResourcePair& pair) {
@@ -853,6 +855,7 @@ void BuildKey(const RecompileRequest& request, std::uint32_t hostSubgroupSize, c
         out.Value(image.srgbDecode);
     });
     writer.Values(std::span<const std::uint8_t>(specialization.tableViewClasses));
+    writer.Value(specialization.foldTexelOffsets);
     writer.Values(std::span<const std::uint32_t>(specialization.boundDescriptors));
     writer.List(specialization.srtPoison, [](Writer& out, const SrtReadPoison& poison) {
         out.Value(poison.slot);
