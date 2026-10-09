@@ -1,4 +1,5 @@
 #include "Optimization/ResourceTracker.hpp"
+#include "Optimization/MemoryIndexOwners.hpp"
 #include "Optimization/SrtWalker.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
 #include "SpirvBackend/SpirvBufferFormat.hpp"
@@ -13,6 +14,7 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <optional>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -286,6 +288,9 @@ private:
     }
 
     bool MemoryIndexBelongsTo(std::uint32_t index, const IrValue& owner) const {
+        if (m_tableMemoryOwners.has_value()) {
+            return m_tableMemoryOwners->BelongsTo(index, owner);
+        }
         for (const auto& block : m_program.Blocks()) {
             for (const IrValue* inst : block->Instructions()) {
                 const auto op = inst->Opcode();
@@ -902,6 +907,10 @@ private:
         if (!enabled) {
             return;
         }
+        static const bool indexOwners = std::getenv("APS5_NO_PERF_TABLE_OWNERS") == nullptr;
+        if (indexOwners) {
+            m_tableMemoryOwners.emplace(m_program);
+        }
         for (auto& block : m_program.Blocks()) {
             for (IrValue* inst : block->Instructions()) {
                 const auto imageInfo = ImageOpcodeInfoOf(inst->Opcode());
@@ -1342,6 +1351,7 @@ private:
     // APS5_TRACE_BDA: address accesses seen by Collect (the first bdaTraceLimit are printed).
     unsigned m_bdaTraces = 0;
     std::vector<TableColumnPlan> m_tableColumns;
+    std::optional<Detail::MemoryIndexOwners> m_tableMemoryOwners;
     std::vector<const IrValue*> m_tablePlanningReads;
     std::vector<std::uint32_t> m_tablePlanningMemory;
     struct EdgeSelectorEntry {

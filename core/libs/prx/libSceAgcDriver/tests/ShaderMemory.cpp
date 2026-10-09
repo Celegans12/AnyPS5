@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
 #include "Optimization/DescriptorBindingBuilder.hpp"
+#include "Optimization/MemoryIndexOwners.hpp"
 #include "Optimization/RequestMemoryView.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
 #include "Optimization/ResourceProgram.hpp"
@@ -360,6 +361,72 @@ void verifyRegisterSources() {
     secondVector.SetRegister({RegisterBank::Vector, 1});
     require(!EquivalentValue(plan, &firstVector, &secondVector), "different vector registers were merged");
     require(!EquivalentValue(plan, &samplerRegister, &firstVector), "different register types were merged");
+}
+
+bool originalMemoryIndexBelongsTo(const ShaderRecompiler::IrProgram& program, std::uint32_t index, const ShaderRecompiler::IrValue& owner) {
+    using namespace ShaderRecompiler;
+    for (const auto& block : program.Blocks()) {
+        for (const IrValue* inst : block->Instructions()) {
+            const auto op = inst->Opcode();
+            if ((BufferAccessOf(op) == BufferAccess::None && AddressOpcodeInfoOf(op).access == AddressAccess::None && ImageOpcodeInfoOf(op).access == ImageAccess::None) || inst == &owner) {
+                continue;
+            }
+            if (inst->Flags<MemoryFlags>().index == index) return false;
+        }
+    }
+    return true;
+}
+
+void verifyMemoryIndexOwners() {
+    using namespace ShaderRecompiler;
+    IrProgram program;
+    program.Resources().memoryInfo.resize(3u);
+    auto& first = program.CreateBlock();
+    auto& second = program.CreateBlock();
+    const auto make = [&](IrOpcode opcode, std::uint32_t index) -> IrValue& {
+        auto& value = program.CreateValue(opcode, IrType::U32);
+        value.SetFlags(MemoryFlags{index, 0u});
+        return value;
+    };
+    auto& buffer = make(IrOpcode::LoadBufferU32, 0u);
+    auto& ignored = make(IrOpcode::Void, 0u);
+    auto& alias = make(IrOpcode::Identity, 0u);
+    alias.AddArgument(&buffer);
+    auto& absent = make(IrOpcode::LoadBufferU32, 0u);
+    const std::array<IrValue*, 14> choices{
+        nullptr, &buffer,
+        &make(IrOpcode::StoreBufferU32, 0u), &make(IrOpcode::BufferAtomicIAdd32, 0u),
+        &make(IrOpcode::LoadAddressU32, 0u), &make(IrOpcode::StoreAddressU32, 0u), &make(IrOpcode::AddressAtomicIAdd32, 0u),
+        &make(IrOpcode::ImageRead, 0u), &make(IrOpcode::ImageWrite, 0u), &make(IrOpcode::ImageAtomicIAdd32, 0u),
+        &ignored, &alias, &make(IrOpcode::LoadBufferU32, 1u), &make(IrOpcode::LoadAddressU32, 0xffffffffu)
+    };
+    std::vector<const IrValue*> queried(choices.begin() + 1, choices.end());
+    queried.push_back(&absent);
+    std::size_t fixture = 0;
+    for (auto* a : choices) {
+        for (auto* b : choices) {
+            for (auto* c : choices) {
+                first.Instructions().clear();
+                second.Instructions().clear();
+                if (a != nullptr) first.Instructions().push_back(a);
+                if (b != nullptr) first.Instructions().push_back(b);
+                if (c != nullptr) second.Instructions().push_back(c);
+                const Detail::MemoryIndexOwners owners(program);
+                for (std::uint32_t index = 0; index < program.Resources().memoryInfo.size(); ++index) {
+                    for (const auto* owner : queried) {
+                        if (owners.BelongsTo(index, *owner) != originalMemoryIndexBelongsTo(program, index, *owner)) {
+                            throw std::runtime_error("memory index owners: fixture " + std::to_string(fixture) + ", index " + std::to_string(index) + ", owner " + std::to_string(owner->Id()) + " differs from the original scan");
+                        }
+                    }
+                }
+                ++fixture;
+            }
+        }
+    }
+    first.Instructions() = {&buffer, &alias};
+    second.Instructions().clear();
+    const Detail::MemoryIndexOwners owners(program);
+    require(alias.Resolve() == &buffer && owners.BelongsTo(0u, buffer) && !owners.BelongsTo(0u, alias), "memory index owners: raw owner identity was collapsed through Resolve");
 }
 
 void verifyEvaluatedValues() {
@@ -2960,6 +3027,11 @@ void verifyCubeDepthCompareMode() {
 int main(int argc, char** argv) {
     try {
         using namespace ShaderRecompiler;
+        if (argc == 2 && std::string_view(argv[1]) == "--table-owners") {
+            verifyMemoryIndexOwners();
+            std::cout << "Memory index ownership matches the original scan\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--frontend-pair") {
             verifyFrontendPair();
             std::cout << "Prepared frontend reuse preserves full and partial-thread programs\n";
@@ -2977,6 +3049,7 @@ int main(int argc, char** argv) {
         require(argc == 1, "unknown shader memory test arguments");
         verifyRegisterSources();
         verifyEvaluatedValues();
+        verifyMemoryIndexOwners();
         verifyFrontendPair();
         verifySignedSrtComparison();
         verifyPureFlatSlots();
