@@ -568,6 +568,7 @@ public:
 
 private:
     RegistrationPreparePool() {
+        if (std::getenv("APS5_INLINE_SHADER_PREPARE") != nullptr) return;
         const auto count = std::max(2u, std::thread::hardware_concurrency() / 2u);
         pthread_attr_t attributes;
         pthread_attr_init(&attributes);

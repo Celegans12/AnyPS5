@@ -508,8 +508,9 @@ void Registration(bool indirect) {
     Require(destination == 0, "failed dispatch executed a subsequent memory write");
 }
 
-void DeferredRegistration() {
+void DeferredRegistration(bool preparationFailure = false) {
     alignas(256) std::array<std::uint32_t, 2> code{0xbe842104u, 0xbf810000u};
+    if (preparationFailure) code[0] = 0xbe802004u;
     struct Header {
         Shader shader{};
         std::array<ShaderRegister, 8> registers{};
@@ -530,10 +531,15 @@ void DeferredRegistration() {
     std::vector<std::uint32_t> commands;
     for (const auto reg : header.registers) commands.insert(commands.end(), {0xc0017600u, reg.offset, reg.value});
     commands.insert(commands.end(), {0xc0031500u, 1, 1, 1, 0x8041});
+    std::uint32_t destination = 0;
+    const auto destinationAddress = reinterpret_cast<std::uintptr_t>(&destination);
+    commands.insert(commands.end(), {0xc0033700u, 0x00100200u, static_cast<std::uint32_t>(destinationAddress), static_cast<std::uint32_t>(destinationAddress >> 32u), 7u});
     Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
     sceAgcDriverSubmitAcb(0x20, &packet);
-    ExpectFailure([] { AgcDriverWaitIdle_nid_postfix(); }, "not statically resolvable");
-    ExpectFailure([] { AgcDriverShutdown_nid_postfix(); }, "not statically resolvable");
+    const auto reason = preparationFailure ? "unsupported dynamic s_setpc_b64 at program counter 0x0" : "not statically resolvable";
+    ExpectFailure([] { AgcDriverWaitIdle_nid_postfix(); }, reason);
+    ExpectFailure([] { AgcDriverShutdown_nid_postfix(); }, reason);
+    Require(destination == 0u, "failed preparation executed a subsequent memory write");
 }
 
 void AperturePreparationClassification(AgcDriver::VulkanDevice& device) {
@@ -601,7 +607,7 @@ void DeferredUndecodableRegistration(bool aperture = false) {
 
 int main(int argc, char** argv) {
     try {
-        Require(argc == 1 || (argc == 2 && (std::string_view(argv[1]) == "--indirect" || std::string_view(argv[1]) == "--fail-before-registration" || std::string_view(argv[1]) == "--deferred" || std::string_view(argv[1]) == "--deferred-undecodable" || std::string_view(argv[1]) == "--deferred-aperture")), "invalid test arguments");
+        Require(argc == 1 || (argc == 2 && (std::string_view(argv[1]) == "--indirect" || std::string_view(argv[1]) == "--fail-before-registration" || std::string_view(argv[1]) == "--deferred" || std::string_view(argv[1]) == "--deferred-undecodable" || std::string_view(argv[1]) == "--deferred-aperture" || std::string_view(argv[1]) == "--preparation-failure")), "invalid test arguments");
         if (argc == 2 && std::string_view(argv[1]) == "--deferred-aperture") {
             auto device = OpenVulkanTestDevice();
             if (!device) return VulkanTestSkipped;
@@ -611,9 +617,9 @@ int main(int argc, char** argv) {
             std::cout << "deferred aperture shader tests passed\n";
             return 0;
         }
-        if (argc == 2 && std::string_view(argv[1]) == "--deferred") {
+        if (argc == 2 && (std::string_view(argv[1]) == "--deferred" || std::string_view(argv[1]) == "--preparation-failure")) {
             if (!OpenVulkanTestDevice()) return VulkanTestSkipped;
-            DeferredRegistration();
+            DeferredRegistration(std::string_view(argv[1]) == "--preparation-failure");
             std::cout << "deferred shader preparation tests passed\n";
             return 0;
         }
