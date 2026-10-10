@@ -1,5 +1,7 @@
 #include "VulkanTestDevice.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include "CompiledVariant.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderMemoryCensus.hpp"
 #include "RdnaDecoder/RdnaInstruction.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
@@ -86,6 +88,66 @@ void NullPixelAtDraw(AgcDriver::VulkanDevice& device) {
     Require(AgcDriver::DriverDetail::SourceHandleFor(snapshot, 0, request) == snapshot.prepared->entries.back().handle && snapshot.prepared->entries.size() == 2, "the null pixel program was prepared again for the same draw");
 }
 
+void RegisteredMemoryCensus(const std::shared_ptr<const ShaderRecompiler::SourceHandle>& source) {
+    using AgcDriver::DriverDetail::InspectRegisteredShaderMemory;
+    using AgcDriver::DriverDetail::ShaderRegistry;
+    using AgcDriver::DriverDetail::ShaderSnapshot;
+    Require(InspectRegisteredShaderMemory({}) == AgcDriver::DriverDetail::RegisteredShaderMemory{}, "empty registry census is not empty");
+    auto raw = std::make_shared<ShaderRecompiler::CompiledVariant>();
+    std::vector<std::uint32_t> words{1u, 2u, 3u};
+    words.reserve(128u);
+    raw->artifact.spirv = std::move(words);
+    auto cold = std::make_shared<ShaderRecompiler::CompiledVariant>();
+    cold->artifact.spirv = std::vector<std::uint32_t>(16u * 1024u, 0u);
+    Require(cold->artifact.spirv.TryMakeCold(), "census fixture could not make storage cold");
+    const auto rawBefore = raw->artifact.spirv.InspectStorage();
+    const auto coldBefore = cold->artifact.spirv.InspectStorage();
+    const auto handleFor = [&](const std::shared_ptr<ShaderRecompiler::CompiledVariant>& artifact) {
+        auto handle = std::make_shared<ShaderRecompiler::SourceHandle>();
+        handle->source = source->source;
+        handle->artifact = artifact;
+        return handle;
+    };
+    const auto rawHandle = handleFor(raw);
+    const auto rawAlias = handleFor(raw);
+    const auto coldHandle = handleFor(cold);
+    auto first = std::make_shared<ShaderSnapshot>(ShaderSnapshot{1u, 11u, 0u, {1u, 2u}, {std::byte{1}}});
+    auto second = std::make_shared<ShaderSnapshot>(ShaderSnapshot{2u, 12u, 0u, {3u}, {std::byte{2}}});
+    first->code.reserve(64u);
+    first->header.reserve(128u);
+    second->code.reserve(32u);
+    second->header.reserve(64u);
+    first->prepared->entries = {{0u, rawHandle}, {0u, rawAlias}, {0u, coldHandle}};
+    second->prepared->entries = {{0u, rawHandle}, {0u, nullptr}};
+    second->prepared->pending = true;
+    second->prepared->failure = std::make_exception_ptr(std::runtime_error("census fixture"));
+    second->prepared->rectangles.push_back({1u, 2u, nullptr});
+    const ShaderRegistry registry{{1u, first}, {2u, second}, {3u, first}};
+    const auto census = InspectRegisteredShaderMemory(registry);
+    Require(census.registryEntries == 3u && census.snapshots == 2u && census.pending == 1u && census.failed == 1u, "census lost registration status or counted an aliased snapshot twice");
+    Require(census.entryReferences == 5u && census.handles == 3u && census.sources == 1u && census.artifacts == 2u && census.missingArtifacts == 1u && census.excludedRectangles == 1u, "census did not deduplicate shared source/artifact owners or disclose omitted records");
+    Require(census.rawArtifacts == 1u && census.coldArtifacts == 1u && census.exposedArtifacts == 0u, "census storage state counts are wrong");
+    Require(census.logicalBytes == rawBefore.logicalBytes + coldBefore.logicalBytes && census.rawBytes == rawBefore.residentBytes && census.rawCapacityBytes == rawBefore.residentCapacityBytes && census.coldBytes == coldBefore.coldBytes && census.coldCapacityBytes == coldBefore.coldCapacityBytes, "census conflated logical bytes, backing size or capacity");
+    Require(census.rawCapacityBytes > census.rawBytes && census.codeBytes == 3u * sizeof(std::uint32_t) && census.codeCapacityBytes == (first->code.capacity() + second->code.capacity()) * sizeof(std::uint32_t) && census.headerBytes == 2u && census.headerCapacityBytes == first->header.capacity() + second->header.capacity(), "census registry capacity accounting is wrong");
+    Require(InspectRegisteredShaderMemory(registry) == census, "repeated census changed the sampled storage");
+    const auto coldAfter = cold->artifact.spirv.InspectStorage();
+    Require(coldAfter.residentBytes == 0u && coldAfter.coldBytes == coldBefore.coldBytes && coldAfter.coldCapacityBytes == coldBefore.coldCapacityBytes && !coldAfter.exposed, "census hydrated or exposed cold storage");
+
+    // DEBUG: distinct artifact objects can alias the same backing. This upper-bound fixture
+    // verifies why the diagnostic must not call its artifact-deduplicated sum physical memory.
+    const auto backingAlias = std::make_shared<ShaderRecompiler::CompiledVariant>(*cold);
+    first->prepared->entries.push_back({0u, handleFor(backingAlias)});
+    const auto aliased = InspectRegisteredShaderMemory(registry);
+    Require(aliased.artifacts == 3u && aliased.sources == 1u && aliased.coldArtifacts == 2u && aliased.coldBytes == 2u * coldBefore.coldBytes, "census hid the distinct-artifact shared-backing limit");
+    const ShaderRecompiler::SharedSpirv& explicitRead = cold->artifact.spirv;
+    Require(explicitRead.Words().size() == 16u * 1024u, "census fixture hydration lost words");
+    const auto hydrated = cold->artifact.spirv.InspectStorage();
+    const auto exposed = InspectRegisteredShaderMemory(registry);
+    Require(exposed.coldArtifacts == 0u && exposed.coldBytes == 0u && exposed.coldCapacityBytes == 0u && exposed.rawArtifacts == 3u && exposed.exposedArtifacts == 2u, "census reports publication-time storage instead of current exposed storage");
+    Require(exposed.rawBytes == rawBefore.residentBytes + 2u * hydrated.residentBytes && exposed.rawCapacityBytes == rawBefore.residentCapacityBytes + 2u * hydrated.residentCapacityBytes, "census current raw backing totals are wrong");
+    std::cout << "registered shader memory census preserves cold storage and deduplicates artifact references\n";
+}
+
 void Run(AgcDriver::VulkanDevice& device) {
     NullPixelAtDraw(device);
     alignas(256) std::array<std::uint32_t, 1> code{0xbf810000u};
@@ -97,6 +159,7 @@ void Run(AgcDriver::VulkanDevice& device) {
     snapshot.header.resize(sizeof(Shader));
     ExpectFailure([&] { static_cast<void>(AgcDriver::DriverDetail::SourceHandleFor(snapshot, 0, request)); }, "artifact is missing");
     const auto handle = ShaderRecompiler::PrepareShader(request);
+    RegisteredMemoryCensus(handle);
     snapshot.prepared->entries.push_back({0, handle});
     ExpectFailure([&] { static_cast<void>(AgcDriver::DriverDetail::SourceHandleFor(snapshot, 1, request)); }, "artifact is missing");
     const auto& artifact = ShaderRecompiler::GetPreparedArtifact(*handle);

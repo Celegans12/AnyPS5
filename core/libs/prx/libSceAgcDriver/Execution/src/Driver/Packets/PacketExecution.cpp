@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderMemoryCensus.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
@@ -26,6 +27,16 @@ void Driver::timed(double WorkerProfile::*bucket, TWork&& work) {
     if (report && end - profile.reported > std::chrono::seconds(10)) {
         profile.reported = end;
         AgcDriver::ProfilePrint_nid_no_patch( "[gpu] worker at %.0f s: dispatch %.1f s, draw %.1f s, wait %.1f s\n", std::chrono::duration<double>(end - profile.start).count(), profile.dispatchMs / 1000, profile.drawMs / 1000, profile.waitMs / 1000);
+        // DEBUG: inspect after host work, outside Driver::mutex; this does not imply GPU completion.
+        if (RegisteredShaderMemoryAfterWorkDue()) {
+            auto& driver = Get();
+            std::shared_ptr<const ShaderRegistry> registry;
+            {
+                std::lock_guard lock(driver.mutex);
+                registry = driver.shaders;
+            }
+            ReportRegisteredShaderMemory(*registry, "after_host_work");
+        }
     }
 }
 

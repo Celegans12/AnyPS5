@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderMemoryCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "CacheKey.hpp"
@@ -11,6 +12,7 @@
 #include "CompiledVariant.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
+#include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <cstddef>
@@ -22,10 +24,108 @@
 #include <list>
 #include <pthread.h>
 #include <stdexcept>
+#include <string_view>
 #include <thread>
+#include <unordered_set>
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
 
 namespace AgcDriver::DriverDetail {
+
+RegisteredShaderMemory InspectRegisteredShaderMemory(const ShaderRegistry& registry) {
+    RegisteredShaderMemory result;
+    result.registryEntries = registry.size();
+    std::unordered_set<const ShaderSnapshot*> snapshots;
+    std::unordered_set<const ShaderRecompiler::SourceHandle*> handles;
+    std::unordered_set<const ShaderRecompiler::SourceEntry*> sources;
+    std::unordered_set<const ShaderRecompiler::CompiledVariant*> artifacts;
+    std::vector<std::shared_ptr<const ShaderRecompiler::SourceHandle>> entries;
+    for (const auto& [address, snapshot] : registry) {
+        if (snapshot == nullptr || !snapshots.insert(snapshot.get()).second) continue;
+        ++result.snapshots;
+        result.codeBytes += snapshot->code.size() * sizeof(std::uint32_t);
+        result.codeCapacityBytes += snapshot->code.capacity() * sizeof(std::uint32_t);
+        result.headerBytes += snapshot->header.size();
+        result.headerCapacityBytes += snapshot->header.capacity();
+        {
+            std::lock_guard lock(snapshot->prepared->mutex);
+            result.pending += snapshot->prepared->pending;
+            result.failed += snapshot->prepared->failure != nullptr;
+            result.excludedRectangles += snapshot->prepared->rectangles.size();
+            result.entryReferences += snapshot->prepared->entries.size();
+            for (const auto& entry : snapshot->prepared->entries) entries.push_back(entry.handle);
+        }
+    }
+    // DEBUG: pin copied handles until deduplication ends, including replaced preparations.
+    for (const auto& handle : entries) {
+        if (handle == nullptr) {
+            ++result.missingArtifacts;
+            continue;
+        }
+        if (!handles.insert(handle.get()).second) continue;
+        if (handle->source != nullptr) sources.insert(handle->source.get());
+        if (handle->artifact == nullptr) {
+            ++result.missingArtifacts;
+            continue;
+        }
+        if (!artifacts.insert(handle->artifact.get()).second) continue;
+        const auto storage = ShaderRecompiler::GetPreparedArtifact(*handle).spirv.InspectStorage();
+        result.rawArtifacts += storage.residentBytes != 0;
+        result.coldArtifacts += storage.coldBytes != 0;
+        result.exposedArtifacts += storage.exposed;
+        result.logicalBytes += storage.logicalBytes;
+        result.rawBytes += storage.residentBytes;
+        result.rawCapacityBytes += storage.residentCapacityBytes;
+        result.coldBytes += storage.coldBytes;
+        result.coldCapacityBytes += storage.coldCapacityBytes;
+    }
+    result.handles = handles.size();
+    result.sources = sources.size();
+    result.artifacts = artifacts.size();
+    return result;
+}
+
+namespace {
+
+// DEBUG: an opt-in, coarse census, not a per-frame walk or a retention policy.
+bool RegisteredShaderMemoryEnabled() noexcept {
+    static const bool enabled = [] {
+        const auto* value = std::getenv("APS5_TRACE_SHADER_MEMORY");
+        return value != nullptr && std::string_view(value) == "1";
+    }();
+    return enabled;
+}
+
+bool RegisteredShaderMemoryDue(std::size_t entries) noexcept {
+    if (!RegisteredShaderMemoryEnabled()) return false;
+    static std::atomic<std::size_t> next{1024};
+    auto expected = next.load(std::memory_order_relaxed);
+    return entries >= expected && next.compare_exchange_strong(expected, entries + 1024, std::memory_order_relaxed);
+}
+
+}
+
+bool RegisteredShaderMemoryAfterWorkDue() noexcept {
+    if (!RegisteredShaderMemoryEnabled()) return false;
+    static const auto started = std::chrono::steady_clock::now();
+    const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - started).count();
+    static std::atomic<std::int64_t> next{0};
+    auto expected = next.load(std::memory_order_relaxed);
+    return seconds >= expected && next.compare_exchange_strong(expected, seconds + 60, std::memory_order_relaxed);
+}
+
+void ReportRegisteredShaderMemory(const ShaderRegistry& registry, const char* phase) noexcept {
+    try {
+        const auto started = std::chrono::steady_clock::now();
+        const auto m = InspectRegisteredShaderMemory(registry);
+        const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count();
+        std::fprintf(stderr, "[shader-memory] complete=1 phase=%s scope=current_registered_snapshots sampling=per_prepared_lock backing=per_unique_artifact_may_alias exposed_is_not_hydrated unmeasured=plans,variant_metadata,old_registries,specialized_modules,results,disk_temporaries,allocator_overhead,total_process registry_entries=%zu snapshots=%zu pending=%zu failed=%zu entry_refs=%zu handles=%zu sources=%zu artifacts=%zu missing_artifacts=%zu rectangle_pairs_excluded=%zu raw_artifacts=%zu cold_artifacts=%zu exposed_artifacts=%zu logical_bytes=%zu raw_bytes=%zu raw_capacity_bytes=%zu cold_bytes=%zu cold_capacity_bytes=%zu code_bytes=%zu code_capacity_bytes=%zu header_bytes=%zu header_capacity_bytes=%zu elapsed_us=%lld\n",
+                     phase, m.registryEntries, m.snapshots, m.pending, m.failed, m.entryReferences, m.handles, m.sources, m.artifacts, m.missingArtifacts, m.excludedRectangles,
+                     m.rawArtifacts, m.coldArtifacts, m.exposedArtifacts, m.logicalBytes, m.rawBytes, m.rawCapacityBytes, m.coldBytes, m.coldCapacityBytes,
+                     m.codeBytes, m.codeCapacityBytes, m.headerBytes, m.headerCapacityBytes, static_cast<long long>(elapsed));
+    } catch (...) {
+        std::fprintf(stderr, "[shader-memory] complete=0 phase=%s census_failed\n", phase);
+    }
+}
 
 std::shared_ptr<const ShaderRecompiler::SourceHandle> PrepareShaderWithDiagnostics(const ShaderRecompiler::RecompileRequest& request, ShaderRecompiler::ShaderPreparationContext* preparation) {
     try {
@@ -1005,7 +1105,7 @@ void Driver::RegisterShader(const Shader* shader) {
         std::fprintf(stderr, "\n");
     }
     const auto published = std::make_shared<const ShaderSnapshot>(std::move(snapshot));
-    std::lock_guard lock(mutex);
+    std::unique_lock lock(mutex);
     rethrowFailure();
     PublishRegisteredShader(shaders, published);
     if (shaders->find(NullPixelProgramAddress()) == shaders->end()) {
@@ -1013,6 +1113,11 @@ void Driver::RegisterShader(const Shader* shader) {
     }
     transaction.Commit();
     if (preparation != nullptr) PrepareRegisteredInBackground(published, std::move(preparation));
+    if (RegisteredShaderMemoryDue(shaders->size())) {
+        const auto registry = shaders;
+        lock.unlock();
+        ReportRegisteredShaderMemory(*registry, "registration");
+    }
 }
 
 }
