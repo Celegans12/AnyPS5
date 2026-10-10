@@ -1122,6 +1122,91 @@ void RunRecordPointerTests(AgcDriver::VulkanDevice& device, bool sharedSampler =
     std::puts("record pointer: native selection, pointer retarget, descriptor freshness and owned snapshots passed");
 }
 
+std::vector<std::uint32_t> DescriptorWaterfallCode(std::uint32_t waveSize) {
+    std::vector<std::uint32_t> code{
+        0xf4080700u, 0xfa000020u, 0xf40c0200u, 0xfa000040u, 0xf4080400u, 0xfa000030u,
+        0xf40c0a00u, 0xfa000080u, 0xf4080c00u, 0xfa0000a0u, 0xf4040d80u, 0xfa0000b0u,
+        waveSize == 64u ? 0xbebc047eu : 0xbebc037eu, 0xbeb80380u};
+    const auto branch = [&](std::size_t from, std::size_t to) {
+        const auto displacement = static_cast<std::int32_t>(to) - static_cast<std::int32_t>(from) - 1;
+        code[from] |= static_cast<std::uint16_t>(displacement);
+    };
+    const auto loop = code.size();
+    code.push_back(0xbf068038u);
+    const auto chooseA = code.size();
+    code.push_back(0xbf850000u);
+    if (waveSize == 64u) code.insert(code.end(), {0xbefe0380u, 0xbeff03c1u});
+    else code.insert(code.end(), {0xbefe03ffu, 0xffff0000u});
+    for (std::uint32_t word = 0; word < 12u; ++word) code.push_back(0x7e000200u | ((16u + word) << 17u) | (40u + word));
+    const auto join = code.size();
+    code.push_back(0xbf820000u);
+    branch(chooseA, code.size());
+    code.push_back(waveSize == 64u ? 0xbefe043cu : 0xbefe033cu);
+    for (std::uint32_t word = 0; word < 12u; ++word) code.push_back(0x7e000200u | ((16u + word) << 17u) | (8u + word));
+    branch(join, code.size());
+    code.insert(code.end(), {0x80388138u, 0xbf0a8238u});
+    const auto again = code.size();
+    code.push_back(0xbf850000u);
+    branch(again, loop);
+    code.push_back(waveSize == 64u ? 0xbefe0436u : 0xbefe0336u);
+    for (std::uint32_t word = 0; word < 12u; ++word) {
+        const auto destination = word < 8u ? 36u + word : 32u + word - 8u;
+        code.push_back(0x7e000500u | (destination << 17u) | (16u + word));
+    }
+    code.push_back(waveSize == 64u ? 0xbefe043cu : 0xbefe033cu);
+    code.insert(code.end(), {
+        0x360200bfu, 0x7e020d01u, 0x060202f0u, 0x100202ffu, 0x3d800000u, 0x7e0402ffu, 0x3e000000u,
+        0xf09c0f08u, 0x01090401u, 0x7e120202u, 0x34101286u, 0x4a101100u, 0x34101084u,
+        0xe0781000u, 0x80070408u, 0xbf810000u});
+    return code;
+}
+
+void RunDescriptorWaterfallTests(AgcDriver::VulkanDevice& device) {
+    Fill();
+    auto imageA = Image(FloatTexels.data(), Format32Float);
+    auto imageB = Image(OtherFloatTexels.data(), Format32Float);
+    imageB[3] = (imageB[3] & ~0xfffu) | 0x924u;
+    auto samplerB = PointClamp;
+    samplerB[0] &= ~7u;
+    auto direct = DirectCode;
+    direct[10] = 0x3d800000u;
+    const std::array<Outcome, 4> controls{
+        RunDirectCode(device, direct, PointClamp, imageA), RunDirectCode(device, direct, samplerB, imageB),
+        RunDirectCode(device, direct, samplerB, imageA), RunDirectCode(device, direct, PointClamp, imageB)};
+    for (std::size_t left = 0; left < controls.size(); ++left) {
+        Require(!Faulted(controls[left]), "descriptor waterfall: direct control faulted:\n" + controls[left].log);
+        for (std::size_t right = 0; right < left; ++right) {
+            Require(Group(controls[left], 0u, 32u) != Group(controls[right], 0u, 32u), "descriptor waterfall: crossed tuple controls do not distinguish image and sampler selection");
+        }
+    }
+    std::cout << "descriptor waterfall: four distinct direct tuple controls passed; compiling masked loop and ReadFirstLane" << std::endl;
+    for (const std::uint32_t waveSize : {32u, 64u}) {
+        const auto code = DescriptorWaterfallCode(waveSize);
+        for (const bool selectB : {false, true}) {
+            std::array<std::uint32_t, 48> root{};
+            const auto output = Buffer(Output.data(), static_cast<std::uint32_t>(sizeof(Output)));
+            std::copy(output.begin(), output.end(), root.begin() + 8);
+            std::copy(PointClamp.begin(), PointClamp.end(), root.begin() + 12);
+            std::copy(imageA.begin(), imageA.end(), root.begin() + 16);
+            std::copy(imageB.begin(), imageB.end(), root.begin() + 32);
+            std::copy(samplerB.begin(), samplerB.end(), root.begin() + 40);
+            const auto firstLane = selectB ? (waveSize == 64u ? 40u : 20u) : 4u;
+            const auto mask = std::uint64_t{1} << firstLane;
+            root[44] = static_cast<std::uint32_t>(mask);
+            root[45] = static_cast<std::uint32_t>(mask >> 32u);
+            const std::span<const std::uint32_t> words(code);
+            const std::array<ShaderRecompiler::MemoryRegion, 2> memory{{
+                {reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(words)},
+                {reinterpret_cast<std::uintptr_t>(root.data()), std::as_bytes(std::span(root))}}};
+            const auto outcome = Execute(device, words, root.data(), memory, 1u, waveSize, waveSize);
+            Require(!Faulted(outcome), "descriptor waterfall: selected tuple faulted:\n" + outcome.log);
+            Require(Group(outcome, 0u, waveSize) == Group(controls[selectB ? 1u : 0u], 0u, waveSize),
+                "descriptor waterfall: wave" + std::to_string(waveSize) + " first lane " + std::to_string(firstLane) + " mixed tuple words or lost lane selection");
+        }
+    }
+    std::puts("descriptor waterfall: masked tuple selection and whole-wave native pixels passed");
+}
+
 void RunPointerStorageWriteTests(AgcDriver::VulkanDevice& device) {
     alignas(256) static std::array<std::uint32_t, 256u * 8u> records{};
     alignas(256) static std::array<std::uint32_t, 256u * 8u> otherRecords{};
@@ -1312,6 +1397,10 @@ int main(int argc, char** argv) {
 #endif
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
+        if (argc == 2 && std::string_view(argv[1]) == "--descriptor-waterfall") {
+            RunDescriptorWaterfallTests(*device);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--record-pointer") {
             RunRecordPointerTests(*device);
             RunRecordPointerTests(*device, true);
