@@ -45,7 +45,7 @@ public:
         data = static_cast<std::uint8_t*>(std::aligned_alloc(BlockBytes, BlockBytes));
 #endif
         Require(data != nullptr, "direct image refusal: guest allocation failed");
-        GuestAllocations::Mutation().Add(data, BlockBytes, true, true);
+        GuestAllocations::Mutation().Add(data, BlockBytes, true, true, true);
     }
     ~GuestBlock() {
         GuestAllocations::Mutation().Remove(data);
