@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/LiveSnapshotRetry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -14,6 +15,17 @@
 namespace AgcDriver::DriverDetail {
 
 void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments) {
+    try {
+        RetryLiveSnapshot([&](bool forceFresh) { dispatchAttempt(queue, packet, submission, indirectArguments, forceFresh); });
+    } catch (const Graphics::LiveSnapshotInvalidated& error) {
+        const auto address = (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20c)) << 8u) | (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20d) & 0xffu) << 40u);
+        char where[64];
+        std::snprintf(where, sizeof(where), "compute shader 0x%llx: ", static_cast<unsigned long long>(address));
+        throw std::runtime_error(where + std::string(error.what()));
+    }
+}
+
+void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments, bool forceFresh) {
     PerformanceTimer timing("Driver.Dispatch");
     const auto address = (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20c)) << 8u) | (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20d) & 0xffu) << 40u);
     auto it = submission.shaders->upper_bound(address);
@@ -53,8 +65,8 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         if (const auto found = parked.find(currentPacketOffset()); found != parked.end()) {
             ahead = std::move(found->second);
             parked.erase(found);
-            fromAhead = ahead.address == address;
-            if (!fromAhead) ++groupStats.addressMismatches;
+            fromAhead = !forceFresh && ahead.address == address;
+            if (ahead.address != address) ++groupStats.addressMismatches;
         }
     }
     if (fromAhead) {
@@ -130,7 +142,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         explicit ProbeScope(bool active) : active(active) { if (active) ShaderRecompiler::SetDebugProbeActive(true); }
         ~ProbeScope() { if (active) ShaderRecompiler::SetDebugProbeActive(false); }
     } probeScope{probeThis};
-    const bool noDispatchCache = noDispatchCacheEnv || probeThis;
+    const bool noDispatchCache = noDispatchCacheEnv || probeThis || forceFresh;
     std::uint64_t key = 0xcbf29ce484222325ull;
     const auto mix = [&](std::uint64_t value) {
         key ^= value;
@@ -306,7 +318,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     if (verifyDataHits() && dataHit) verifyDataHit(snapshot, codeOffset, request, memory, address, *keepVariant, liveWords, *compiledResult);
 
     if (recordQueuedLabelsAfterCapture(submission.queue, captured)) {
-        dispatch(queue, packet, submission, indirectArguments);
+        dispatchAttempt(queue, packet, submission, indirectArguments, forceFresh);
         return;
     }
     phaseTiming.Phase(PhaseQueuedLabels);
@@ -337,14 +349,21 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     }
 
     const auto rethrow = [&](const std::exception& error) {
+        std::string message;
         if (fromAhead) {
             ++groupStats.deviceRejects;
-            dispatch(queue, packet, submission, indirectArguments);
-            return true;
+            try {
+                dispatchAttempt(queue, packet, submission, indirectArguments, forceFresh);
+                return true;
+            } catch (const Graphics::LiveSnapshotInvalidated& nested) {
+                message = nested.what();
+            }
+        } else {
+            message = error.what();
         }
         char where[64];
         std::snprintf(where, sizeof(where), "compute shader 0x%llx: ", static_cast<unsigned long long>(address));
-        throw std::runtime_error(where + std::string(error.what()));
+        throw std::runtime_error(where + message);
     };
     phaseTiming.Phase(PhaseSnapshots);
 
@@ -365,6 +384,8 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         if (recipeHit == nullptr || VulkanDevice::VerifyRecipes()) {
             try {
                 prepared = localDevice->PrepareDispatch(compiled, snapshots, dispatchThreads);
+            } catch (const Graphics::LiveSnapshotInvalidated&) {
+                throw;
             } catch (const std::exception& error) {
                 if (rethrow(error)) return;
             }
@@ -413,6 +434,8 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             } else {
                 localDevice->Dispatch(compiled, groups[0], groups[1], groups[2], snapshots, address, std::move(prepared), attachTo != nullptr ? &builtRecipe : nullptr);
             }
+        } catch (const Graphics::LiveSnapshotInvalidated&) {
+            throw;
         } catch (const std::exception& error) {
             if (rethrow(error)) return;
         }

@@ -3,6 +3,7 @@
 #include "ImageTableAbi.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/LiveSnapshotRetry.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include <algorithm>
 #include <array>
@@ -11,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -169,15 +171,14 @@ std::uint32_t CapturedWord(const Captured& capture, std::uint64_t address) {
     throw std::runtime_error("capture bind publication: changed word was not captured");
 }
 
-void QueuePublication(AgcDriver::VulkanDevice& device, Fixture& fixture, std::uint32_t record) {
+void QueuePublication(AgcDriver::VulkanDevice& device, Fixture& fixture, std::uint32_t record, std::uint32_t value = 1) {
     std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
     const std::array<std::uint32_t, 4> marker{7u, 7u, 7u, 7u};
     Require(device.FillBuffer(Address(fixture.guest.data + 0x5000), sizeof(marker), marker), "capture bind publication: host import required");
-    const std::uint32_t value = 1;
     const auto destination = Address(fixture.Changed(record));
     Require(device.WriteLabelOnGpu(destination, std::as_bytes(std::span(&value, 1)), 1, 1, false) == 0,
         "capture bind publication: producer label was not GPU-recorded");
-    Require(device.OpenWriteOverlaps(destination, sizeof(value)) && *fixture.Changed(record) == 0,
+    Require(device.OpenWriteOverlaps(destination, sizeof(value)) && *fixture.Changed(record) == value - 1,
         "capture bind publication: producer was not pending with old host bytes");
 }
 
@@ -232,16 +233,117 @@ void Run(AgcDriver::VulkanDevice& device, Fixture& fixture, bool beforeCapture, 
     std::cout << "capture bind publication: " << (beforeCapture ? "prior producer flushed" : "strict rejection then fresh recapture") << ", row " << record << '\n';
 }
 
+enum class RetryCase { Recover, Repeated, InheritedLock, Unrelated };
+
+void RunRetry(AgcDriver::VulkanDevice& device, Fixture& fixture, std::uint32_t record, RetryCase which) {
+    fixture.request.target = device.Target();
+    std::uint32_t attempts = 0;
+    std::uint32_t active = 0;
+    std::weak_ptr<AgcDriver::PreparedDispatch> previous;
+    bool typed = false;
+    std::string failure;
+    std::unique_lock inherited(AgcDriver::GuestMemory::GpuMutex(), std::defer_lock);
+    if (which == RetryCase::InheritedLock) inherited.lock();
+    try {
+        AgcDriver::DriverDetail::RetryLiveSnapshot([&](bool fresh) {
+            Require(fresh == (attempts != 0) && active == 0 && previous.expired(), "snapshot retry: prior attempt ownership survived");
+            Require(AgcDriver::GuestMemory::GpuMutex().DepthOnThisThread() == (inherited.owns_lock() ? 1u : 0u), "snapshot retry: prior GPU lock survived");
+            Require(AgcDriver::Graphics::Recorder::PendingWriteBackCompletions() == 0, "snapshot retry: rejected consumer was recorded");
+            Require(std::all_of(fixture.output, fixture.output + 64 * 4, [](auto value) { return value == Sentinel; }), "snapshot retry: rejected consumer wrote output");
+            struct AttemptScope {
+                std::uint32_t& active;
+                explicit AttemptScope(std::uint32_t& value) : active(value) { ++active; }
+                ~AttemptScope() { --active; }
+            } scope(active);
+            ++attempts;
+            auto captured = Capture(fixture);
+            CheckTable(captured);
+            Require(CapturedWord(captured, Address(fixture.Changed(record))) == (fresh ? 1u : 0u), "snapshot retry: capture did not refresh the changed word");
+            if (which != RetryCase::Unrelated && (!fresh || which == RetryCase::Repeated)) {
+                QueuePublication(device, fixture, record, attempts);
+                std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+                device.WaitIdle();
+                Require(*fixture.Changed(record) == attempts, "snapshot retry: producer did not complete");
+            }
+            auto prepared = device.PrepareDispatch(*captured.compiled, captured.snapshots);
+            previous = prepared;
+            std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            const auto groups = which == RetryCase::Unrelated ? std::numeric_limits<std::uint32_t>::max() : 1u;
+            device.Dispatch(*captured.compiled, groups, 1, 1, captured.snapshots, Address(Code.data()), std::move(prepared));
+        });
+    } catch (const AgcDriver::Graphics::LiveSnapshotInvalidated& error) {
+        typed = true;
+        failure = error.what();
+    } catch (const std::runtime_error& error) {
+        failure = error.what();
+    }
+    if (inherited.owns_lock()) inherited.unlock();
+    Require(active == 0 && previous.expired() && !AgcDriver::GuestMemory::GpuMutex().HeldByThisThread(), "snapshot retry: attempt did not unwind");
+    const auto expectedAttempts = which == RetryCase::Recover || which == RetryCase::Repeated ? 2u : 1u;
+    Require(attempts == expectedAttempts, "snapshot retry: unexpected attempt count");
+    if (which == RetryCase::Recover) {
+        Require(failure.empty(), "snapshot retry: recovery failed: " + failure);
+        Require(AgcDriver::Graphics::Recorder::PendingWriteBackCompletions() == 1, "snapshot retry: consumer was not recorded exactly once");
+        {
+            std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            device.WaitIdle();
+        }
+        CheckOutput(fixture);
+    } else {
+        const auto expected = which == RetryCase::Unrelated ? "Vulkan dispatch: workgroup count exceeds device limits" : "AGC graphics: guest snapshot differs from registered memory";
+        Require(failure == expected && typed == (which != RetryCase::Unrelated), "snapshot retry: wrong strict failure: " + failure);
+        Require(std::all_of(fixture.output, fixture.output + 64 * 4, [](auto value) { return value == Sentinel; }), "snapshot retry: failed consumer wrote output");
+    }
+    Require(AgcDriver::Graphics::Recorder::PendingWriteBackCompletions() == 0, "snapshot retry: completion survived cleanup");
+    std::cout << "snapshot retry: case " << static_cast<unsigned>(which) << ", row " << record << ", attempts " << attempts << '\n';
+}
+
+void OwnedConflict() {
+    AgcDriver::Graphics::Context context{};
+    AgcDriver::Graphics::GuestBufferMemory memory(context);
+    const std::array<std::uint32_t, 1> first{1}, second{2};
+    memory.AddSnapshot({Address(first.data()), std::as_bytes(std::span(first))});
+    std::uint32_t attempts = 0;
+    std::string failure;
+    try {
+        AgcDriver::DriverDetail::RetryLiveSnapshot([&](bool) {
+            ++attempts;
+            memory.AddSnapshot({Address(first.data()), std::as_bytes(std::span(second))});
+        });
+    } catch (const AgcDriver::Graphics::LiveSnapshotInvalidated&) {
+        throw std::runtime_error("snapshot retry: owned snapshot conflict became retryable");
+    } catch (const std::runtime_error& error) {
+        failure = error.what();
+    }
+    Require(attempts == 1 && failure == "AGC graphics: guest snapshot differs from registered memory", "snapshot retry: owned snapshot conflict changed");
+}
+
 }
 
 int main() {
     try {
         Require(std::getenv("APS5_NO_SNAPSHOT_CHECK") == nullptr, "capture bind publication: snapshot checks must stay enabled");
+        Require(std::getenv("APS5_SYNC_DISPATCH") == nullptr && std::getenv("APS5_SYNC_LEASE_DISPATCH") == nullptr, "snapshot retry: completion counting requires deferred dispatch");
+        OwnedConflict();
         for (const auto [before, record] : std::array<std::pair<bool, std::uint32_t>, 3>{{{true, 2}, {false, 1}, {false, 2}}}) {
             Fixture fixture;
             const auto device = OpenVulkanTestDevice();
             if (!device) return VulkanTestSkipped;
             Run(*device, fixture, before, record);
+        }
+        for (const auto record : {1u, 2u}) {
+            for (const auto which : {RetryCase::Recover, RetryCase::Repeated}) {
+                Fixture fixture;
+                const auto device = OpenVulkanTestDevice();
+                if (!device) return VulkanTestSkipped;
+                RunRetry(*device, fixture, record, which);
+            }
+        }
+        for (const auto which : {RetryCase::InheritedLock, RetryCase::Unrelated}) {
+            Fixture fixture;
+            const auto device = OpenVulkanTestDevice();
+            if (!device) return VulkanTestSkipped;
+            RunRetry(*device, fixture, 2, which);
         }
         std::puts("capture bind publication tests passed");
         return 0;

@@ -2094,7 +2094,9 @@ void GuestBufferMemory::AddSnapshot(const GuestMemorySnapshot& snapshot) {
         }
         const auto offset = static_cast<std::size_t>(snapshot.address - owner->begin);
         const auto* source = live ? reinterpret_cast<const std::byte*>(snapshot.address) : owner->snapshot.data() + offset;
-        Require(std::memcmp(source, snapshot.bytes.data(), snapshot.bytes.size()) == 0, "guest snapshot differs from registered memory");
+        const bool matches = std::memcmp(source, snapshot.bytes.data(), snapshot.bytes.size()) == 0;
+        if (live && !matches) throw LiveSnapshotInvalidated();
+        Require(matches, "guest snapshot differs from registered memory");
         if (profile) Snapshots().checked.fetch_add(1, std::memory_order_relaxed);
         return;
     }

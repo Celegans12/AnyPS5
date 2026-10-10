@@ -6,6 +6,7 @@
 #include "prx/libc/include/GuestAllocations.hpp"
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -17,6 +18,11 @@ void ShutdownGuestBufferWorkers();
 struct GuestMemorySnapshot {
     std::uint64_t address;
     std::span<const std::byte> bytes;
+};
+
+class LiveSnapshotInvalidated final : public std::runtime_error {
+public:
+    LiveSnapshotInvalidated() : std::runtime_error("AGC graphics: guest snapshot differs from registered memory") {}
 };
 
 // A guest allocation imported with VK_EXT_external_memory_host, usable by the GPU in place.
