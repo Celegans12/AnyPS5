@@ -1,10 +1,12 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchCache.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "Recompiler.hpp"
 #include "ImageTableAbi.hpp"
+#include "Optimization/ResourceProgram.hpp"
 #include "VulkanTestDevice.hpp"
 #include <algorithm>
 #include <array>
@@ -16,8 +18,10 @@
 #include <functional>
 #include <iostream>
 #include <iterator>
+#include <memory>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -191,6 +195,14 @@ alignas(256) constexpr std::array<std::uint32_t, 32> LoadedPointerCode{
     0x01090401u, 0x7e120202u, 0x34101286u, 0x4a101100u, 0x34101084u, 0xe0781000u, 0x80070408u, 0xbf810000u,
 };
 
+alignas(256) constexpr std::array<std::uint32_t, 33> RecordPointerCode{
+    0xf4080100u, 0xfa000000u, 0xf4080200u, 0xfa000010u, 0xf4080700u, 0xfa000020u, 0xf4080800u, 0xfa000030u,
+    0x8f108202u, 0xf4200444u, 0x20000000u, 0x9312ff11u, 0x00000250u, 0xf4240502u, 0x24000000u,
+    0xf40c090au, 0xfa000000u, 0x360200bfu, 0x7e020d01u, 0x060202f0u, 0x100202ffu, 0x3c800000u,
+    0x7e0402ffu, 0x3e000000u, 0xf09c0f08u, 0x01090401u, 0x7e120202u, 0x34101286u, 0x4a101100u,
+    0x34101084u, 0xe0781000u, 0x80070408u, 0xbf810000u,
+};
+
 alignas(256) constexpr std::array<std::uint32_t, 38> PointerStorageWriteCode{
     0xf4080200u, 0xfa000000u, 0xf4080700u, 0xfa000010u, 0xf4080800u, 0xfa000020u, 0xf4040500u, 0xfa000030u,
     0x8f108202u, 0xf4200444u, 0x20000000u, 0x8711ff11u, 0x000000ffu, 0x8f128511u, 0xf40c090au, 0x241fff00u,
@@ -319,7 +331,8 @@ std::vector<std::array<std::uint32_t, 4>> SamplerWords(const std::vector<std::ui
     return result;
 }
 
-Outcome Execute(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> span, const void* root, std::span<const ShaderRecompiler::MemoryRegion> memory, std::uint32_t groups, std::uint32_t threads, std::uint32_t waveSize) {
+Outcome Execute(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> span, const void* root, std::span<const ShaderRecompiler::MemoryRegion> memory, std::uint32_t groups, std::uint32_t threads, std::uint32_t waveSize,
+    std::shared_ptr<const ShaderRecompiler::ResourceCapture>* snapshot = nullptr) {
     const auto rootAddress = reinterpret_cast<std::uintptr_t>(root);
     const std::array<std::uint32_t, 2> userData{static_cast<std::uint32_t>(rootAddress), static_cast<std::uint32_t>(rootAddress >> 32u)};
     std::fill(Output.begin(), Output.end(), 0xdeadbeefu);
@@ -330,7 +343,12 @@ Outcome Execute(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> 
         device.Target(),
         {0, 0, 0, 128}
     };
-    const auto result = ShaderRecompiler::Recompile(request);
+    const auto result = [&] {
+        if (snapshot == nullptr) return ShaderRecompiler::Recompile(request);
+        AgcDriver::ShaderMemory capturedMemory(memory);
+        *snapshot = capturedMemory.Capture(request);
+        return *ShaderRecompiler::Recompile(request, **snapshot);
+    }();
     Outcome outcome;
     outcome.variantId = result.PipelineVariantId();
     outcome.artifactId = result.variantId;
@@ -963,6 +981,95 @@ void RunPointerTests(AgcDriver::VulkanDevice& device) {
     RequireRed(reads, 4, Lanes, [](std::uint32_t x) { return UintTexels[x]; }, "pointer image table read: key 0x1ff masked to entry 255");
 }
 
+void RunRecordPointerTests(AgcDriver::VulkanDevice& device) {
+    constexpr std::uint32_t RecordStride = 0x250u;
+    alignas(256) std::array<std::uint32_t, 2u * RecordStride / 4u> records{};
+    alignas(256) std::array<std::array<std::uint32_t, 8>, 3> descriptors{};
+    Fill();
+    const auto floatImage = Image(FloatTexels.data(), Format32Float);
+    const auto uintImage = Image(UintTexels.data(), Format32UInt);
+    const auto sintImage = Image(SintTexels.data(), Format32SInt);
+    std::copy(floatImage.begin(), floatImage.end(), descriptors[0].begin());
+    std::copy(uintImage.begin(), uintImage.end(), descriptors[1].begin());
+    std::copy(sintImage.begin(), sintImage.end(), descriptors[2].begin());
+    const auto floatControl = RunDirect(device, PointClamp, floatImage);
+    const auto uintControl = RunDirect(device, PointClamp, uintImage);
+    const auto sintControl = RunDirect(device, PointClamp, sintImage);
+    Require(!Faulted(floatControl) && !Faulted(uintControl) && !Faulted(sintControl), "record pointer: direct native control faulted");
+    RequireRed(floatControl, 0, Lanes, [](std::uint32_t x) { return std::bit_cast<std::uint32_t>(FloatTexels[x]); }, "record pointer float control");
+    RequireRed(uintControl, 0, Lanes, [](std::uint32_t x) { return UintTexels[x]; }, "record pointer uint control");
+    RequireRed(sintControl, 0, Lanes, [](std::uint32_t x) { return static_cast<std::uint32_t>(SintTexels[x]); }, "record pointer sint control");
+    const auto point = [&](std::uint32_t record, std::uint32_t descriptor) {
+        const auto address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(descriptors[descriptor].data()));
+        records[record * RecordStride / 4u] = static_cast<std::uint32_t>(address);
+        records[record * RecordStride / 4u + 1u] = static_cast<std::uint32_t>(address >> 32u);
+    };
+    point(0u, 0u);
+    point(1u, 1u);
+    Keys = {};
+    Keys[1] = 1u;
+    const auto run = [&](std::shared_ptr<const ShaderRecompiler::ResourceCapture>& capture) {
+        std::array<std::uint32_t, 16> root{};
+        const auto table = Buffer(records.data(), static_cast<std::uint32_t>(sizeof(records)));
+        const auto keys = Buffer(Keys.data(), 2u * sizeof(std::uint32_t));
+        const auto output = Buffer(Output.data(), static_cast<std::uint32_t>(sizeof(Output)));
+        std::copy(table.begin(), table.end(), root.begin());
+        std::copy(keys.begin(), keys.end(), root.begin() + 4);
+        std::copy(output.begin(), output.end(), root.begin() + 8);
+        std::copy(PointClamp.begin(), PointClamp.end(), root.begin() + 12);
+        const std::array<ShaderRecompiler::MemoryRegion, 5> memory{{
+            {reinterpret_cast<std::uintptr_t>(RecordPointerCode.data()), std::as_bytes(std::span(RecordPointerCode))},
+            {reinterpret_cast<std::uintptr_t>(root.data()), std::as_bytes(std::span(root))},
+            {reinterpret_cast<std::uintptr_t>(records.data()), std::as_bytes(std::span(records))},
+            {reinterpret_cast<std::uintptr_t>(descriptors.data()), std::as_bytes(std::span(descriptors))},
+            {reinterpret_cast<std::uintptr_t>(Keys.data()), std::as_bytes(std::span(Keys).first(2))},
+        }};
+        return Execute(device, RecordPointerCode, root.data(), memory, 2u, Lanes, 64u, &capture);
+    };
+    const auto check = [&](const Outcome& outcome, const ShaderRecompiler::ResourceCapture& capture, std::uint32_t firstDescriptor, const Outcome& control) {
+        Require(!Faulted(outcome) && outcome.imageTableFaults == 0u && outcome.poisonedSrtReads == 0u,
+            "record pointer: valid selection faulted:\n" + outcome.log);
+        Require(Group(outcome, 0u) == Group(control, 0u) && Group(outcome, 1u) == Group(uintControl, 0u),
+            "record pointer: selected output differs from direct native control");
+        const auto& tables = capture.snapshot.tables;
+        Require(tables.tables.size() == 1u && outcome.imageTableReadRanges.size() == 1u, "record pointer: expected one captured table");
+        const auto covered = [&](const void* pointer, std::uint64_t bytes) {
+            const auto address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(pointer));
+            return std::any_of(outcome.imageTableReadRanges[0].begin(), outcome.imageTableReadRanges[0].end(), [&](const auto& range) {
+                return address >= range.first && address - range.first <= range.second && bytes <= range.second - (address - range.first);
+            });
+        };
+        for (std::uint32_t record = 0; record < 2u; ++record) {
+            const auto descriptor = record == 0u ? firstDescriptor : 1u;
+            Require(covered(records.data() + record * RecordStride / 4u, 8u) && covered(descriptors[descriptor].data(), 32u),
+                "record pointer: capture omitted the record pointer or pointed descriptor dependency");
+            Require(std::any_of(tables.words.begin(), tables.words.end(), [&](const auto& value) {
+                return value.dwordCount == 8u && value.dwords == descriptors[descriptor];
+            }), "record pointer: capture does not own the current descriptor words");
+        }
+    };
+    std::cout << "record pointer: direct native controls passed; capturing bounded record-to-pointer-to-T# chain" << std::endl;
+    std::shared_ptr<const ShaderRecompiler::ResourceCapture> firstCapture;
+    const auto first = run(firstCapture);
+    check(first, *firstCapture, 0u, floatControl);
+    const auto firstSnapshot = firstCapture->snapshot.tables;
+    point(0u, 2u);
+    std::shared_ptr<const ShaderRecompiler::ResourceCapture> movedCapture;
+    const auto moved = run(movedCapture);
+    check(moved, *movedCapture, 2u, sintControl);
+    Require(firstCapture->snapshot.tables == firstSnapshot, "record pointer: retargeting mutated an earlier owned snapshot");
+    const auto movedSnapshot = movedCapture->snapshot.tables;
+    std::copy(floatImage.begin(), floatImage.end(), descriptors[2].begin());
+    std::shared_ptr<const ShaderRecompiler::ResourceCapture> changedCapture;
+    const auto changed = run(changedCapture);
+    check(changed, *changedCapture, 2u, floatControl);
+    Require(firstCapture->snapshot.tables == firstSnapshot && movedCapture->snapshot.tables == movedSnapshot,
+        "record pointer: leaf mutation changed an earlier owned snapshot");
+    Require(first.artifactId != 0u && first.artifactId == moved.artifactId && first.artifactId == changed.artifactId,
+        "record pointer: runtime pointer or descriptor changes recompiled the artifact");
+    std::puts("record pointer: native selection, pointer retarget, descriptor freshness and owned snapshots passed");
+}
+
 void RunPointerStorageWriteTests(AgcDriver::VulkanDevice& device) {
     alignas(256) static std::array<std::uint32_t, 256u * 8u> records{};
     alignas(256) static std::array<std::uint32_t, 256u * 8u> otherRecords{};
@@ -1144,7 +1251,7 @@ void RunGraphicsTests(AgcDriver::VulkanDevice& device) {
 
 }
 
-int main() {
+int main(int argc, char** argv) {
     try {
 #ifdef _WIN32
         _putenv_s("APS5_SRGB_SHADER_DECODE", "1");
@@ -1153,6 +1260,11 @@ int main() {
 #endif
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
+        if (argc == 2 && std::string_view(argv[1]) == "--record-pointer") {
+            RunRecordPointerTests(*device);
+            return 0;
+        }
+        Require(argc == 1, "image table: unknown test mode");
         RunTests(*device);
         RunBorderSwizzleTests(*device);
         RunAnisoOverrideTests(*device);
