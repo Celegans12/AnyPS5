@@ -29,7 +29,7 @@ constexpr std::uint32_t Width = 64;
 constexpr std::uint32_t Height = 32;
 constexpr std::uint32_t Threads = 32;
 constexpr std::uint32_t Format8UInt = 5;
-constexpr std::uint32_t Format8SInt = 6;
+constexpr std::uint32_t Format8UNorm = 1;
 constexpr std::uint32_t Format32UInt = 20;
 constexpr std::uint32_t Type2D = 9;
 constexpr std::uint32_t SwizzleZ64KBX = 24;
@@ -66,10 +66,10 @@ alignas(256) constexpr std::array<std::uint32_t, 32> MixedMarkCode{
     0xbf8cc07f, 0xf0001108, 0x000b1401, 0xbf8c3f70, 0x38282884, 0xf0201108, 0x000b1401, 0xbf810000,
 };
 
-alignas(256) constexpr std::array<std::uint32_t, 18> ConflictingMarkCode{
+alignas(256) constexpr std::array<std::uint32_t, 19> ConflictingMarkCode{
     0x7e080218, 0x343c0885, 0x4a3c3d00, 0x7e3e0219, 0xf0001108, 0x0001011e, 0xbf8c3f70, 0x340a3e86,
-    0x4a0a0b1e, 0x340c0a82, 0xe0701000, 0x80000106, 0x38020284, 0xf0201108, 0x0001011e, 0xf0201108,
-    0x0003011e, 0xbf810000,
+    0x4a0a0b1e, 0x340c0a82, 0xe0701000, 0x80000106, 0x38020284, 0xf0201108, 0x0001011e, 0x7e0202f2,
+    0xf0201108, 0x0003011e, 0xbf810000,
 };
 
 class GuestBlock {
@@ -232,7 +232,7 @@ void MarkPlane(AgcDriver::VulkanDevice& device, std::uint64_t address, std::uint
     std::copy(output.begin(), output.end(), userData.begin());
     std::copy(plane.begin(), plane.end(), userData.begin() + 4);
     if (conflictingAlias) {
-        const auto alias = PlaneDescriptor(address, swizzle, Format8SInt);
+        const auto alias = PlaneDescriptor(address, swizzle, Format8UNorm);
         std::copy(alias.begin(), alias.end(), userData.begin() + 12);
     }
     const auto code = conflictingAlias ? std::span<const std::uint32_t>(ConflictingMarkCode) : std::span<const std::uint32_t>(MarkCode);
@@ -254,11 +254,11 @@ void MarkPlane(AgcDriver::VulkanDevice& device, std::uint64_t address, std::uint
                 if (!binding.imageWritten[element]) continue;
                 const auto first = binding.guestDescriptor.begin() + element * 8u;
                 if (std::equal(plane.begin(), plane.end(), first)) writtenFormats |= 1u;
-                const auto alias = PlaneDescriptor(address, swizzle, Format8SInt);
+                const auto alias = PlaneDescriptor(address, swizzle, Format8UNorm);
                 if (std::equal(alias.begin(), alias.end(), first)) writtenFormats |= 2u;
             }
         }
-        Require(writtenFormats == 3u, "conflicting stencil: both UINT and SINT aliases must be materialized as writable storage");
+        Require(writtenFormats == 3u, "conflicting stencil: both UINT and UNORM aliases must be materialized as writable storage");
     }
     device.Dispatch(result, Width / Threads, Height, 1, {}, reinterpret_cast<std::uintptr_t>(code.data()));
     device.WaitIdle();
