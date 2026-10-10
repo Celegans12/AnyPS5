@@ -48,7 +48,13 @@ int APS5_VABI sceSystemServiceGetNoticeScreenSkipFlag(bool* value) {
  if (value == nullptr) {
   return SYSTEM_SERVICE_ERROR_PARAMETER;
  }
- *value = false;
+ static const bool skip = [] {
+  const char* text = std::getenv("APS5_NOTICE_SCREEN_SKIP");
+  const bool enabled = text != nullptr && text[0] != 0 && text[0] != '0';
+  if (enabled) APS5_LOG_OUT("[notice-screen] skip flag reported as %d (APS5_NOTICE_SCREEN_SKIP)", 1);
+  return enabled;
+ }();
+ *value = skip;
  return SYSTEM_SERVICE_OK;
 }
 
