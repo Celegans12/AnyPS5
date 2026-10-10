@@ -29,6 +29,11 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -825,6 +830,10 @@ void verifyAcrossProcesses(const char* self) {
     require(std::system(oppositeCommand.c_str()) == 0, "the opposite masked-select mode loading process failed");
     const std::string coldFileCommand = "\"" + std::string(self) + "\" --load-opposite-cold-file";
     require(std::system(coldFileCommand.c_str()) == 0, "the opposite cold file mode loading process failed");
+    for (const auto* mode : {"--load-lazy-plan", "--load-eager-plan"}) {
+        const std::string planCommand = "\"" + std::string(self) + "\" " + mode;
+        require(std::system(planCommand.c_str()) == 0, std::string(mode) + " process failed");
+    }
 }
 
 class DirectImageCacheLoopGuard {
@@ -849,6 +858,189 @@ private:
     std::string previous;
     const char* name;
 };
+
+class PlanIrCapture {
+public:
+    PlanIrCapture() {
+        std::fflush(stderr);
+        file = std::tmpfile();
+        require(file != nullptr, "lazy plan: cannot create IR capture");
+#ifdef _WIN32
+        saved = _dup(_fileno(stderr));
+        const auto redirected = saved < 0 ? -1 : _dup2(_fileno(file), _fileno(stderr));
+#else
+        saved = dup(fileno(stderr));
+        const auto redirected = saved < 0 ? -1 : dup2(fileno(file), fileno(stderr));
+#endif
+        if (redirected < 0) {
+            Restore();
+            std::fclose(file);
+            file = nullptr;
+            throw std::runtime_error("lazy plan: cannot redirect IR capture");
+        }
+    }
+    ~PlanIrCapture() {
+        if (file != nullptr) { Restore(); std::fclose(file); }
+    }
+    std::string Finish() {
+        Restore();
+        std::rewind(file);
+        std::string text;
+        std::array<char, 4096> buffer{};
+        for (std::size_t read = 0; (read = std::fread(buffer.data(), 1, buffer.size(), file)) != 0;) text.append(buffer.data(), read);
+        const bool failed = std::ferror(file) != 0;
+        std::fclose(file);
+        file = nullptr;
+        require(!failed, "lazy plan: cannot read IR capture");
+        return text;
+    }
+private:
+    void Restore() {
+        std::fflush(stderr);
+        if (saved < 0) return;
+#ifdef _WIN32
+        _dup2(saved, _fileno(stderr));
+        _close(saved);
+#else
+        dup2(saved, fileno(stderr));
+        close(saved);
+#endif
+        saved = -1;
+    }
+    std::FILE* file = nullptr;
+    int saved = -1;
+};
+
+std::size_t planTranslations(std::string_view text) {
+    std::size_t count = 0;
+    for (std::size_t cursor = 0; (cursor = text.find(" after translate", cursor)) != std::string_view::npos; ++cursor) ++count;
+    return count;
+}
+
+void verifyLatePlanFailure(bool eager) {
+    ComputeRequest sample(true);
+    sample.code = {0xf40c0200u, 0xfa000000u, 0xf4000400u, 0xfa000050u, 0xbf8cc07fu, 0xbf068010u, 0xbf850003u,
+        0xf4080500u, 0xfa000020u, 0xbf820002u, 0xf4080500u, 0x20000000u, 0xf4080600u, 0xfa000040u,
+        0xbf8cc07fu, 0xf09c0f08u, 0x00a20000u, 0xbf8c3f70u, 0xe0700000u, 0x80060000u, 0xbf810000u};
+    sample.request.shader = {ShaderStage::Compute, 0xabc58100u, sample.code, 0, {}};
+    sample.request.context.waveSize = 32;
+    sample.request.context.compute->numThreads = {32u, 1u, 1u};
+    sample.request.context.userData = std::span(sample.userData).first(2);
+    sample.capabilities[0] = 29u;
+    const auto fail = [&] {
+        try { static_cast<void>(PrepareShader(sample.request)); }
+        catch (const std::runtime_error& error) { return std::string(error.what()); }
+        throw std::runtime_error("lazy plan: unsupported descriptor Phi was accepted");
+    };
+    const auto before = ShaderDiskCache::Totals();
+    PlanIrCapture trace;
+    const auto expected = fail();
+    require(expected.find("GetSamplerResource dword 0 is not a valid runtime value") != std::string::npos, "lazy plan: wrong late planning failure: " + expected);
+    require(fail() == expected, "lazy plan: repeated planning failure changed");
+    std::barrier start(4);
+    std::latch launchReady(1);
+    bool launchFailed = false;
+    std::array<std::future<std::string>, 4> failures;
+    try {
+        for (auto& failure : failures) failure = std::async(std::launch::async, [&] {
+            launchReady.wait();
+            if (launchFailed) return std::string{};
+            start.arrive_and_wait();
+            return fail();
+        });
+    } catch (...) {
+        launchFailed = true;
+        launchReady.count_down();
+        throw;
+    }
+    launchReady.count_down();
+    for (auto& failure : failures) require(failure.get() == expected, "lazy plan: concurrent planning failure changed");
+    const auto ir = trace.Finish();
+    require(planTranslations(ir) == 1u && ir.find(" after fold") != std::string::npos,
+        "lazy plan: late failure was not memoized after translation/folding: " + ir);
+    ShaderDiskCache::Flush();
+    const auto after = ShaderDiskCache::Totals();
+    require(after.misses == before.misses + (eager ? 0u : 1u) && after.hits == before.hits && after.writes == before.writes,
+        "lazy plan: failed planning repeated disk lookup or stored an artifact");
+    std::cout << "late plan failure: one frontend, repeated/concurrent identical refusal, no cache store\n";
+}
+
+int runPlanLoadingProcess(bool eager) {
+    DirectImageCacheLoopGuard mode(eager ? "0" : nullptr, "APS5_NO_PERF_LAZY_CAPTURE_PLAN");
+    DirectImageCacheLoopGuard memo(nullptr, "APS5_NO_FAILURE_MEMO");
+    DirectImageCacheLoopGuard dump("all", "APS5_DUMP_IR");
+    ComputeRequest registered(true);
+    PlanIrCapture preparationTrace;
+    const auto handle = PrepareShader(registered.request);
+    const auto preparationIr = preparationTrace.Finish();
+    const auto totals = ShaderDiskCache::Totals();
+    require(totals.hits == 1u && totals.misses == 0u && totals.loadFailures == 0u, "lazy plan: preparation did not verify a disk hit");
+    require(planTranslations(preparationIr) == (eager ? 1u : 0u), "lazy plan: wrong warm preparation frontend count: " + preparationIr);
+    std::array<std::unique_ptr<ComputeRequest>, 4> current;
+    std::array<std::shared_ptr<const ResourceCapture>, 4> captures;
+    std::array<std::shared_ptr<const RecompileResult>, 4> results;
+    std::array<std::future<void>, 4> workers;
+    std::barrier start(4);
+    std::latch launchReady(1);
+    bool launchFailed = false;
+    for (std::size_t index = 0; index < current.size(); ++index) {
+        current[index] = std::make_unique<ComputeRequest>(true);
+        current[index]->request.shader.codeAddress = 0x30000u;
+        current[index]->userData[0] += static_cast<std::uint32_t>(index + 1u) * 0x10000u;
+        current[index]->userData[2] += static_cast<std::uint32_t>(index) * 16u;
+    }
+    PlanIrCapture captureTrace;
+    try {
+        for (std::size_t index = 0; index < current.size(); ++index) {
+            workers[index] = std::async(std::launch::async, [&, index] {
+                launchReady.wait();
+                if (launchFailed) return;
+                start.arrive_and_wait();
+                const auto& request = current[index]->request;
+                const auto invocation = PreparedShaderInvocation::TryCreate(request, handle);
+                require(invocation.has_value(), "lazy plan: relocated invocation did not match the loaded artifact");
+                SrtRuntime runtime{};
+                runtime.userData = current[index]->userData;
+                runtime.shaderBase = request.shader.codeAddress;
+                captures[index] = index % 2u == 0u ? invocation->Capture(runtime) : CaptureResources(request, runtime, *handle);
+                results[index] = index % 2u == 0u ? invocation->Materialize(*captures[index]) : MaterializeShader(request, *captures[index], *handle);
+            });
+        }
+    } catch (...) {
+        launchFailed = true;
+        launchReady.count_down();
+        throw;
+    }
+    launchReady.count_down();
+    for (auto& worker : workers) worker.get();
+    const auto captureIr = captureTrace.Finish();
+    require(planTranslations(captureIr) == (eager ? 0u : 1u), "lazy plan: concurrent first capture did not build exactly one plan: " + captureIr);
+    PlanIrCapture repeatedTrace;
+    for (std::size_t index = 0; index < current.size(); ++index) {
+        const auto& snapshot = captures[index]->snapshot;
+        require(captures[index]->plan == captures[0]->plan && captures[index]->plan->shaderHash == registered.request.shader.codeAddress,
+            "lazy plan: concurrent or relocated capture changed source-plan identity");
+        require(snapshot.buffers.size() == 1u && snapshot.buffers[0].dwordCount == 4u
+            && std::equal(current[index]->userData.begin(), current[index]->userData.end(), snapshot.buffers[0].dwords.begin()),
+            "lazy plan: capture reused another invocation's descriptor words");
+        SrtRuntime runtime{};
+        runtime.userData = current[index]->userData;
+        runtime.shaderBase = current[index]->request.shader.codeAddress;
+        const auto repeated = CaptureResources(current[index]->request, runtime, *handle);
+        require(repeated->plan == captures[0]->plan, "lazy plan: repeated capture replaced the plan");
+        requireSameResult(*results[index], *MaterializeShader(current[index]->request, *repeated, *handle), "lazy plan repeated capture");
+    }
+    const auto repeatedIr = repeatedTrace.Finish();
+    require(planTranslations(repeatedIr) == 0u, "lazy plan: repeated capture reran the frontend: " + repeatedIr);
+    for (std::size_t index = 0; index < current.size(); ++index) {
+        current[index]->request.useCache = false;
+        requireSameResult(Recompile(current[index]->request), *results[index], "lazy plan current descriptor against uncached compile");
+    }
+    std::cout << (eager ? "eager" : "lazy") << " verified disk hit: preparation frontend=" << planTranslations(preparationIr)
+        << ", first concurrent capture frontend=" << planTranslations(captureIr) << ", repeated=0; origin 0x20000, capture 0x30000, four exact current descriptors\n";
+    verifyLatePlanFailure(eager);
+    return 0;
+}
 
 void verifyUnnormalizedWrapTransitions(bool coldLoopOnly = false) {
     DirectImageCacheLoopGuard noLoop(coldLoopOnly ? "8" : nullptr);
@@ -1669,6 +1861,8 @@ int main(int argc, char** argv) {
     mainAllocationThread = true;
     try {
         if (argc == 2 && std::string_view(argv[1]) == "--load") return runLoadingProcess();
+        if (argc == 2 && std::string_view(argv[1]) == "--load-lazy-plan") return runPlanLoadingProcess(false);
+        if (argc == 2 && std::string_view(argv[1]) == "--load-eager-plan") return runPlanLoadingProcess(true);
         if (argc == 2 && std::string_view(argv[1]) == "--load-wrap-loop") { verifyUnnormalizedWrapTransitions(true); return 0; }
         if (argc == 2 && std::string_view(argv[1]) == "--load-opposite-masked-select") return runOppositeMaskedSelectLoadingProcess();
         if (argc == 2 && std::string_view(argv[1]) == "--load-opposite-cold-file") return runOppositeColdFileLoadingProcess();

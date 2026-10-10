@@ -264,6 +264,7 @@ struct SourceEntry {
     // accepted only when its code matches word for word. Owned here because the request's span
     // points into a registration the driver may replace while the entry lives on.
     std::vector<std::uint32_t> code;
+    std::uint64_t codeAddress = 0;
     std::shared_ptr<const IrResourcePlan> plan;
     // A plan build that threw (an unsupported resource chain or control flow) is remembered and
     // rethrown: the front end ran every pass before failing, ~13 ms per dispatch of a shader the
@@ -306,7 +307,7 @@ bool FailureMemo() {
     return memo;
 }
 
-std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPreparationContext* preparation = nullptr) {
+std::shared_ptr<SourceEntry> findSource(const RecompileRequest& request) {
     static std::shared_mutex mutex;
     // Entries whose code hashes alike share a bucket; the code comparison picks the right one.
     static std::unordered_map<std::vector<std::uint64_t>, std::vector<std::shared_ptr<SourceEntry>>, SourceKeyHash> sources;
@@ -333,6 +334,7 @@ std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPr
         if (source == nullptr) {
             source = std::make_shared<SourceEntry>();
             source->code.assign(request.shader.code.begin(), request.shader.code.end());
+            source->codeAddress = request.shader.codeAddress;
             auto& bucket = sources[key];
             if (!bucket.empty()) {
                 // A second entry under one key is a code hash collision (or the unhashed key with
@@ -345,21 +347,40 @@ std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPr
             bucket.push_back(source);
         }
     }
-    {
-        std::lock_guard lock(source->mutex);
-        if (source->plan == nullptr) {
-            if (FailureMemo() && source->planFailure) std::rethrow_exception(source->planFailure);
-            try {
-                ResourceProgram resource(request, preparation);
-                source->plan = std::move(resource.plan);
-                source->program = std::move(resource.program);
-            } catch (...) {
-                if (FailureMemo()) source->planFailure = std::current_exception();
-                throw;
-            }
-        }
-    }
     return source;
+}
+
+void ensureSourcePlanLocked(SourceEntry& source, const RecompileRequest& request, ShaderPreparationContext* preparation, bool retainProgram) {
+    if (source.plan != nullptr) return;
+    if (FailureMemo() && source.planFailure) std::rethrow_exception(source.planFailure);
+    try {
+        auto planRequest = request;
+        planRequest.shader.codeAddress = source.codeAddress;
+        ResourceProgram resource(planRequest, preparation);
+        source.plan = std::move(resource.plan);
+        if (retainProgram) source.program = std::move(resource.program);
+    } catch (...) {
+        if (FailureMemo()) source.planFailure = std::current_exception();
+        throw;
+    }
+}
+
+std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPreparationContext* preparation = nullptr) {
+    auto source = findSource(request);
+    std::lock_guard lock(source->mutex);
+    ensureSourcePlanLocked(*source, request, preparation, source->variants.empty());
+    return source;
+}
+
+std::shared_ptr<const IrResourcePlan> captureSourcePlan(SourceEntry& source, const RecompileRequest& request) {
+    std::lock_guard lock(source.mutex);
+    ensureSourcePlanLocked(source, request, nullptr, false);
+    return source.plan;
+}
+
+bool LazyCapturePlan() {
+    static const bool enabled = std::getenv("APS5_NO_PERF_LAZY_CAPTURE_PLAN") == nullptr;
+    return enabled;
 }
 
 std::array<std::uint32_t, 3> partialThreads(const RecompileRequest& request) {
@@ -941,6 +962,7 @@ void makeColdForPublication(SharedSpirv& spirv, bool diskLoaded) noexcept {
 }
 
 std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source, const RecompileRequest& request, bool& cacheHit, ShaderPreparationContext* preparation = nullptr) {
+    if (source.plan == nullptr && FailureMemo() && source.planFailure) std::rethrow_exception(source.planFailure);
     for (const auto& candidate : source.variants) {
         if (sameLayout(candidate->layout, request.layout)) {
             cacheHit = true;
@@ -966,6 +988,7 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
         }
     }
     if (variant == nullptr) {
+        ensureSourcePlanLocked(source, request, preparation, true);
         auto program = source.program != nullptr ? std::move(*source.program) : PrepareResourceProgram(request, preparation);
         source.program.reset();
         std::exception_ptr emissionFailure;
@@ -1275,7 +1298,7 @@ std::shared_ptr<const SourceHandle> PrepareShader(const RecompileRequest& reques
     return recompileReporting(request, [&]() -> std::shared_ptr<const SourceHandle> {
         static_cast<void>(RequestInputInfo(request));
         auto handle = std::make_shared<SourceHandle>();
-        handle->source = getSource(request, preparation);
+        handle->source = LazyCapturePlan() ? findSource(request) : getSource(request, preparation);
         RecompileCacheKey::BuildInterface(request, handle->staticKey);
         handle->staticKey.push_back(HostSubgroupSize(request));
         bool cacheHit = false;
@@ -1333,13 +1356,13 @@ std::optional<PreparedShaderInvocation> PreparedShaderInvocation::TryCreate(cons
 std::shared_ptr<const ResourceCapture> PreparedShaderInvocation::Capture(const SrtRuntime& runtime) const {
     auto capture = std::make_shared<ResourceCapture>();
     capture->source = handle->source;
-    capture->plan = handle->source->plan;
+    capture->plan = captureSourcePlan(*handle->source, request);
     materializeCapture(*capture, runtime, request.target.bdaAbiVersion == BdaAbi::Version);
     return capture;
 }
 
 std::shared_ptr<const RecompileResult> PreparedShaderInvocation::Materialize(const ResourceCapture& capture) const {
-    if (capture.source != handle->source || capture.plan != handle->source->plan) throw std::runtime_error("ShaderRecompiler: resource capture belongs to another prepared shader");
+    if (capture.source != handle->source || capture.plan != captureSourcePlan(*handle->source, request)) throw std::runtime_error("ShaderRecompiler: resource capture belongs to another prepared shader");
     if (request.useCache && ResultMemo()) return materializePreparedMemoized(*handle->source, handle->artifact, request, capture.snapshot, true, nullptr);
     auto result = std::make_shared<RecompileResult>(materializeResult(*handle->artifact, request, capture.snapshot));
     result->cacheHit = true;
@@ -1353,7 +1376,7 @@ const CompiledShaderArtifact& GetPreparedArtifact(const SourceHandle& handle) {
 
 std::shared_ptr<const RecompileResult> MaterializeShader(const RecompileRequest& request, const ResourceCapture& capture, const SourceHandle& handle) {
     if (!MatchesPreparedShader(request, handle)) throw std::runtime_error("ShaderRecompiler: prepared artifact does not match the static ABI");
-    if (capture.source != handle.source || capture.plan != handle.source->plan) throw std::runtime_error("ShaderRecompiler: resource capture belongs to another prepared shader");
+    if (capture.source != handle.source || capture.plan != captureSourcePlan(*handle.source, request)) throw std::runtime_error("ShaderRecompiler: resource capture belongs to another prepared shader");
     if (request.useCache && ResultMemo()) return materializePreparedMemoized(*handle.source, handle.artifact, request, capture.snapshot, true, nullptr);
     auto result = std::make_shared<RecompileResult>(materializeResult(*handle.artifact, request, capture.snapshot));
     result->cacheHit = true;
@@ -1369,7 +1392,7 @@ std::shared_ptr<const ResourceCapture> CaptureResources(const RecompileRequest& 
     if (request.shader.stage != ShaderStage::Compute && request.shader.stage != ShaderStage::Fragment) static_cast<void>(RequestInputInfo(request));
     auto capture = std::make_shared<ResourceCapture>();
     capture->source = handle.source;
-    capture->plan = handle.source->plan;
+    capture->plan = captureSourcePlan(*handle.source, request);
     if (profile) capture->sourceNanoseconds = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
     materializeCapture(*capture, runtime, request.target.bdaAbiVersion == BdaAbi::Version);
     return capture;
