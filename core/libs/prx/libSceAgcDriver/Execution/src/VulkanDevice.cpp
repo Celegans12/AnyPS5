@@ -3577,10 +3577,10 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         // Listed for DispatchIndirect until the write-back ran (a non-reusable object, so once).
         auto writers = state->copiedWriters;
         auto kept = record.resources;
-        recorder.OnComplete([kept, writers] {
+        recorder.OnComplete([kept, writers, shaderAddress = record.programAddress] {
             // Delisted before the write-back: one that fails must not keep indirect dispatches on the CPU.
             writers->erase(std::remove(writers->begin(), writers->end(), kept), writers->end());
-            kept->WriteBackBuffers();
+            kept->WriteBackBuffers(shaderAddress);
         });
         // Listed after the registration: a throw there leaves nothing that would pin the CPU path forever.
         writers->push_back(kept);

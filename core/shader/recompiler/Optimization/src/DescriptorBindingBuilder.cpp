@@ -277,7 +277,7 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
     }
     std::vector<std::uint32_t> imageModes(info.images.size());
     for (std::size_t index = 0; index < info.images.size(); ++index) {
-        if (info.images[index].table == NoTable) imageModes[index] = ResourceMaterializer::RuntimeImageMode(info.images[index], snapshot.images.at(index), info.runtimeImageModes.at(index));
+        if (info.images[index].table == NoTable) imageModes[index] = ResourceMaterializer::DirectImageMode(info, stage, static_cast<std::uint32_t>(index), snapshot.images.at(index), info.usesFaultBuffer);
     }
     for (std::uint32_t index = 0; index < info.buffers.size(); ++index) {
         const auto& descriptor = snapshot.buffers.at(index);
@@ -348,10 +348,12 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
             if (imageHeap) {
                 const auto& image = info.images.at(resource);
                 if (image.table != NoTable) fail("an image table resource was placed in a typed heap");
-                const auto& mode = info.runtimeImageModes.at(resource).at(imageModes[resource]);
                 mip = previous == resource ? mip + 1u : 0u;
                 previous = resource;
-                {
+                if (PipelineSpecialization::IsDeferredDirectImageMode(imageModes[resource])) {
+                    active = false;
+                } else {
+                    const auto& mode = info.runtimeImageModes.at(resource).at(imageModes[resource]);
                     const auto word = snapshot.images.at(resource).dwords[3];
                     active = DescriptorBindingForImage(mode) == logical.kind && mode.packedFormat != IrBufferFormat::Fmask8_S2_F1 && !mode.constantSwizzle && (image.mipMode != ImageMipMode::DynamicStorage || mip <= ((word >> 16u) & 0xfu) - ((word >> 12u) & 0xfu));
                 }

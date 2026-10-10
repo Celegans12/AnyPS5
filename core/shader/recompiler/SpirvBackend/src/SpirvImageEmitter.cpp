@@ -1,6 +1,7 @@
 #include "SpirvBackend/SpirvImageEmitter.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
 #include "PipelineSpecialization.hpp"
+#include "DirectImageRefusal.hpp"
 #include "SpirvBackend/SpirvBda.hpp"
 #include "SpirvBackend/SpirvBufferFormat.hpp"
 #include "SpirvBackend/SpirvEmitterInstructions.hpp"
@@ -1721,6 +1722,12 @@ void EmitImage(SpirvValueEmitContext& ctx, const IrValue& inst) {
     const auto& samplers = state.program.Info().samplers;
     const bool tableSampler = imageInfo.needsSampler && memory.sampler < samplers.size() && samplers[memory.sampler].table != NoTable;
     const bool tables = base.table != NoTable || tableSampler;
+    bool directRefusal = false;
+    if (!tables && state.loopGuardLimit == 0u && state.program.Info().usesFaultBuffer && CanDeferDirectImage(base, state.program.Resources().stage)) {
+        const auto [found, inserted] = state.directImageRefusals.try_emplace(memory.resource, false);
+        if (inserted) found->second = ResourceMaterializer::CanDeferDirectImage(state.program, memory.resource);
+        directRefusal = found->second;
+    }
     const auto modes = base.table != NoTable ? state.program.Info().runtimeImageModes.at(memory.resource) : ResourceMaterializer::RuntimeImageModes(base);
     std::uint32_t tableSelector = 0u;
     std::uint32_t samplerGuard = 0u;
@@ -1757,7 +1764,7 @@ void EmitImage(SpirvValueEmitContext& ctx, const IrValue& inst) {
             EmitImageMode(ctx, inst, mode);
         }
     };
-    if (modes.size() == 1u && !tables) {
+    if (modes.size() == 1u && !tables && !directRefusal) {
         emitMode(modes.front());
         state.runtimeImage = nullptr;
         return;
@@ -1779,6 +1786,7 @@ void EmitImage(SpirvValueEmitContext& ctx, const IrValue& inst) {
     const auto merge = state.module.AllocateId();
     const auto invalid = tables || exits ? state.module.AllocateId() : merge;
     const auto undefined = returnsValue && !tables && !exits ? state.module.AllocateId() : 0u;
+    const auto refused = directRefusal ? state.module.AllocateId() : 0u;
     std::vector<std::uint32_t> labels(modes.size());
     std::vector<std::uint32_t> words{spv::OpSwitch, selector, invalid};
     for (std::uint32_t index = 0u; index < modes.size(); ++index) {
@@ -1791,6 +1799,7 @@ void EmitImage(SpirvValueEmitContext& ctx, const IrValue& inst) {
         state.module.AddFunction(spv::OpUndef, TypeId(state, inst.Type()), undefined);
         incoming.insert(incoming.end(), {undefined, state.currentLabel});
     }
+    if (directRefusal) words.insert(words.end(), {PipelineSpecialization::DeferredDirectImageMode, refused});
     state.module.AddFunction(spv::OpSelectionMerge, merge, spv::SelectionControlMaskNone);
     state.module.AddFunction(words);
     for (std::uint32_t index = 0u; index < modes.size(); ++index) {
@@ -1803,6 +1812,14 @@ void EmitImage(SpirvValueEmitContext& ctx, const IrValue& inst) {
     }
     state.runtimeImage = nullptr;
     state.tableAccess = {};
+    if (directRefusal) {
+        if (memory.resource >= ShaderInfo::MaxImages) ctx.Fail(inst, "direct image refusal resource exceeds the fault payload bound");
+        EmitLabel(state, refused);
+        EmitIfCondition(state, ctx.Arg(inst, 3u), [&] {
+            RecordBdaFaultWords(state, ConstantU32(state, 0u), ConstantU32(state, 0u), ConstantU32(state, BdaAbi::PackDirectImageFault(memory.resource)), ConstantU32(state, inst.Flags<MemoryFlags>().pc), BdaAbi::FaultReason::DirectImage);
+        });
+        state.module.AddFunction(spv::OpBranch, merge);
+    }
     if (tables) {
         EmitLabel(state, invalid);
         if (returnsValue) incoming.insert(incoming.end(), {ConstantU32CompositeZero(state, 4u), invalid});

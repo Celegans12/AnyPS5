@@ -3984,8 +3984,8 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     AgcDriver::ProfilePrint_nid_no_patch("[buffers] descriptor elements bound: %llu total, %llu written, %llu read-only; %llu pending-write notes skipped\n", static_cast<unsigned long long>(elements), static_cast<unsigned long long>(elements - readOnly), static_cast<unsigned long long>(readOnly), static_cast<unsigned long long>(counters.notesSkipped.load()));
 }
 
-void ShaderResources::WriteBackBuffers() {
-    if (bda) bda->CheckFault();
+void ShaderResources::WriteBackBuffers(std::uint64_t shaderAddress) {
+    if (bda) bda->CheckFault(shaderAddress);
     if (SkipWriteBack()) return;
     guestMemory.WriteBack();
 }

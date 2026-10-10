@@ -1,4 +1,6 @@
 #include "BdaTests.hpp"
+#include "ImageTableAbi.hpp"
+#include "IntermediateRepresentation/IrMetadata/ShaderInfo.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestHeap.hpp"
@@ -14,6 +16,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <initializer_list>
@@ -569,7 +572,89 @@ void gpuMappingTests(const Context& context) {
     ::operator delete(gpu, std::align_val_t{bytes});
 }
 
+namespace {
+
+void directImageFaultTests(const Context& context, const BdaTestAccess& access) {
+    namespace Abi = ShaderRecompiler::BdaAbi;
+    auto map = binding(Role::ImageTableMap, 4);
+    map.guestDescriptor.resize(ShaderRecompiler::ImageTableAbi::HeaderWords);
+    map.guestDescriptor[ShaderRecompiler::ImageTableAbi::HeaderVersion] = ShaderRecompiler::ImageTableAbi::Version;
+    ShaderRecompiler::RecompileResult shader;
+    Require(!shader.hasDeferredDirectImage && shader.specialization.empty(), "direct image invocation defaults changed");
+    shader.bdaAbiVersion = Abi::Version;
+    shader.bindings = {map, binding(Role::FaultBuffer, 5)};
+    CompiledShader compiled{ShaderRecompiler::ShaderStage::Compute, &shader, 0};
+    auto faultOnly = context;
+    faultOnly.bufferDeviceAddress = false;
+    const auto report = Abi::Fault{Abi::FaultState::Ready, Abi::FaultReason::DirectImage, 0u, Abi::PackDirectImageFault(8u), 4u, 0x14d8u, 0u};
+    const bool loopGuarded = std::getenv("APS5_LOOP_GUARD") != nullptr;
+    for (const bool deferred : {false, true, false}) {
+        shader.hasDeferredDirectImage = deferred;
+        ShaderResources resources(faultOnly, compiled);
+        Require(resources.NeedsCompletion() == (deferred || loopGuarded), "direct image completion did not follow the current invocation flag");
+        Require(shader.specialization.empty(), "direct image completion required finalized specialization constants");
+        const auto fault = access.bytes(access.descriptor(5).buffer);
+        for (const auto byte : fault) Require(byte == std::byte{}, "direct image fault leaked across invocations");
+        if (deferred) {
+            std::memcpy(fault.data(), &report, sizeof(report));
+            reject([&] { resources.WriteBackBuffers(0x80002c4500ULL); }, "direct image: shader 0x80002c4500 stage 4 pc 0x14d8 resource 8: dimension");
+            reject([&] { resources.WriteBackBuffers(0x80003d5600ULL); }, "direct image: shader 0x80003d5600 stage 4 pc 0x14d8 resource 8: dimension");
+            reject([&] { resources.WriteBackBuffers(); }, "direct image: shader address unavailable stage 4 pc 0x14d8 resource 8: dimension");
+            auto malformed = report;
+            malformed.address = 0x80002c4500ULL;
+            std::memcpy(fault.data(), &malformed, sizeof(malformed));
+            reject([&] { resources.WriteBackBuffers(0x80003d5600ULL); }, "invalid direct image fault payload");
+            malformed.address = 0u;
+            malformed.bytes = (8u << 8u) | 2u;
+            std::memcpy(fault.data(), &malformed, sizeof(malformed));
+            reject([&] { resources.WriteBackBuffers(); }, "invalid direct image fault payload");
+            malformed.bytes = Abi::PackDirectImageFault(ShaderRecompiler::ShaderInfo::MaxImages);
+            std::memcpy(fault.data(), &malformed, sizeof(malformed));
+            reject([&] { resources.WriteBackBuffers(); }, "invalid direct image fault payload");
+            std::memset(fault.data(), 0, fault.size());
+        }
+        resources.WriteBackBuffers();
+    }
+    shader.hasDeferredDirectImage = true;
+    shader.bdaAbiVersion = 0u;
+    reject([&] { ShaderResources resources(faultOnly, compiled); }, "BDA table and fault descriptors");
+    shader.bindings = {map};
+    reject([&] { ShaderResources resources(faultOnly, compiled); }, "deferred direct image requires a compute fault buffer");
+    shader.hasDeferredDirectImage = false;
+    {
+        ShaderResources resources(faultOnly, compiled);
+        Require(!resources.NeedsCompletion(), "ordinary image table without a fault buffer required completion");
+    }
+    shader.hasDeferredDirectImage = true;
+    shader.bindings.push_back(binding(Role::FaultBuffer, 5));
+    shader.bdaAbiVersion = Abi::Version;
+    compiled.stage = ShaderRecompiler::ShaderStage::Fragment;
+    reject([&] { ShaderResources resources(faultOnly, compiled); }, "compute resources require a compute shader");
+    reject([&] { ShaderResources resources(faultOnly, std::span<const CompiledShader>(&compiled, 1), ColorTarget{}, 0, 0); }, "deferred direct image requires a compute fault buffer");
+    compiled.stage = ShaderRecompiler::ShaderStage::Compute;
+    alignas(64) std::array<std::uint32_t, 16> guest{};
+    guest[0] = 123u;
+    const auto address = reinterpret_cast<std::uintptr_t>(guest.data());
+    auto writable = binding(Role::GuestBuffers, 6);
+    writable.guestDescriptor = {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u) & 0xffffu, sizeof(guest), 0x31000000u};
+    shader.bindings.push_back(writable);
+    ShaderResources resources(faultOnly, compiled);
+    const auto destination = access.descriptor(6);
+    const std::uint32_t changed = 456u;
+    std::memcpy(access.bytes(destination.buffer).data() + destination.offset, &changed, sizeof(changed));
+    const auto fault = access.bytes(access.descriptor(5).buffer);
+    std::memcpy(fault.data(), &report, sizeof(report));
+    reject([&] { resources.WriteBackBuffers(0x80002c4500ULL); }, "direct image: shader 0x80002c4500 stage 4 pc 0x14d8 resource 8: dimension");
+    Require(guest[0] == 123u, "direct image failure published copied guest writes");
+    std::memset(fault.data(), 0, fault.size());
+    resources.WriteBackBuffers();
+    Require(guest[0] == changed, "cleared direct image fault lost copied guest writes");
+}
+
+}
+
 void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
+    directImageFaultTests(context, access);
     alignas(64) std::array<std::uint32_t, 16> guest{};
     guest[0] = 123;
     const auto address = reinterpret_cast<std::uintptr_t>(guest.data());

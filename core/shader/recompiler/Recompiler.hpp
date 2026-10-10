@@ -514,6 +514,7 @@ struct ShaderInvocation {
     std::vector<std::vector<std::pair<std::uint64_t, std::uint64_t>>> imageTableReadRanges;
     std::uint64_t imageTableShader = 0;
     std::uint32_t imageTableFaults = 0;
+    bool hasDeferredDirectImage = false;
 };
 
 struct RecompileResult : CompiledShaderArtifact, ShaderInvocation {

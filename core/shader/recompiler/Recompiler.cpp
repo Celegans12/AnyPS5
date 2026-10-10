@@ -380,6 +380,7 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
 
     constexpr ShaderInfoCollector shaderInfoCollector;
     shaderInfoCollector.Collect(program, inputInfo);
+    ResourceMaterializer::PrepareDirectImageRefusals(program, request.target.bdaAbiVersion == BdaAbi::Version);
 
     constexpr BindingAllocator bindingAllocator;
     auto bindings = bindingAllocator.Allocate(program, request.layout);
@@ -465,7 +466,90 @@ struct SpecializedModule {
     bool pushData = false;
 };
 
-std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target) {
+std::set<std::uint32_t> directImageRefusalIndices(std::span<const std::uint32_t> words, const IrBindingLayout& layout, std::span<const PipelineSpecializationConstant> constants) {
+    std::map<std::uint32_t, std::uint32_t> selectors;
+    for (const auto& constant : constants) {
+        if (constant.id < PipelineSpecialization::ImageBase || constant.id >= PipelineSpecialization::ImageBase + ShaderInfo::MaxImages * PipelineSpecialization::ImageWords
+            || (constant.id - PipelineSpecialization::ImageBase) % PipelineSpecialization::ImageWords != 0u || !PipelineSpecialization::IsDeferredDirectImageMode(constant.value)) continue;
+        selectors.emplace((constant.id - PipelineSpecialization::ImageBase) / PipelineSpecialization::ImageWords, 0u);
+    }
+    if (selectors.empty()) return {};
+    std::map<std::uint32_t, std::uint32_t> indexResources;
+    for (const auto& descriptor : layout.descriptors) {
+        if (ImageBindingResourceClass(descriptor.kind) == ImageResourceClass::None) continue;
+        for (std::uint32_t element = 0u; element < descriptor.resources.size(); ++element) {
+            if (selectors.contains(descriptor.resources[element])) indexResources.emplace(PipelineSpecialization::DescriptorIndex(static_cast<std::uint32_t>(descriptor.kind), element), descriptor.resources[element]);
+        }
+    }
+    std::map<std::uint32_t, std::uint32_t> indices;
+    for (std::size_t cursor = 5u; cursor < words.size();) {
+        const auto count = words[cursor] >> 16u;
+        const auto op = static_cast<spv::Op>(words[cursor] & 0xffffu);
+        if (count == 0u || count > words.size() - cursor) throw std::runtime_error("invalid direct image refusal proof module");
+        if (op == spv::OpDecorate && count == 4u && words[cursor + 2u] == spv::DecorationSpecId) {
+            const auto id = words[cursor + 3u];
+            if (const auto found = indexResources.find(id); found != indexResources.end()) indices.emplace(words[cursor + 1u], found->second);
+            if (id >= PipelineSpecialization::ImageBase && (id - PipelineSpecialization::ImageBase) % PipelineSpecialization::ImageWords == 0u) {
+                const auto found = selectors.find((id - PipelineSpecialization::ImageBase) / PipelineSpecialization::ImageWords);
+                if (found != selectors.end()) found->second = words[cursor + 1u];
+            }
+        }
+        cursor += count;
+    }
+    std::set<std::uint32_t> guarded;
+    std::set<std::uint32_t> accessed;
+    bool function = false;
+    for (std::size_t cursor = 5u; cursor < words.size();) {
+        const auto count = words[cursor] >> 16u;
+        const auto op = static_cast<spv::Op>(words[cursor] & 0xffffu);
+        if (op == spv::OpFunction) function = true;
+        if (op == spv::OpFunctionEnd) function = false;
+        if (op == spv::OpSwitch && count >= 5u) {
+            for (const auto& [resource, selector] : selectors) {
+                if (selector == 0u || words[cursor + 1u] != selector) continue;
+                bool refuses = false;
+                for (std::size_t operand = 3u; operand + 1u < count; operand += 2u) refuses |= PipelineSpecialization::IsDeferredDirectImageMode(words[cursor + operand]);
+                if (!refuses) throw std::runtime_error("direct image refusal lacks an explicit guarded store route");
+                guarded.insert(resource);
+            }
+        }
+        if (function || op == spv::OpSpecConstantOp || op == spv::OpSpecConstantComposite) {
+            for (std::size_t operand = 1u; operand < count; ++operand) {
+                const auto found = indices.find(words[cursor + operand]);
+                if (found == indices.end()) continue;
+                if ((op != spv::OpAccessChain && op != spv::OpInBoundsAccessChain) || count != 5u || operand != 4u) throw std::runtime_error("direct image refusal has an unproved descriptor index use");
+                accessed.insert(found->second);
+            }
+        }
+        cursor += count;
+    }
+    for (const auto& [resource, selector] : selectors) {
+        if (selector == 0u || !guarded.contains(resource) || !accessed.contains(resource)) throw std::runtime_error("direct image refusal has incomplete per-resource access proof");
+    }
+    std::set<std::uint32_t> result;
+    for (const auto& [id, resource] : indices) result.insert(id);
+    return result;
+}
+
+void verifyDirectImageRefusalPruning(std::span<const std::uint32_t> words, const std::set<std::uint32_t>& indices) {
+    if (indices.empty()) return;
+    bool function = false;
+    for (std::size_t cursor = 5u; cursor < words.size();) {
+        const auto count = words[cursor] >> 16u;
+        const auto op = static_cast<spv::Op>(words[cursor] & 0xffffu);
+        if (count == 0u || count > words.size() - cursor) throw std::runtime_error("invalid specialized direct image refusal module");
+        if (op == spv::OpFunction) function = true;
+        if (op == spv::OpFunctionEnd) function = false;
+        if (function) {
+            for (std::size_t operand = 1u; operand < count; ++operand) {
+                if (indices.contains(words[cursor + operand])) throw std::runtime_error("direct image refusal retained a descriptor access after specialization");
+            }
+        }
+        cursor += count;
+    }
+}
+
+std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledShaderArtifact& artifact, const IrBindingLayout& layout, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target) {
     auto source = SpecializeVertexInputTypes(artifact, classes);
     std::map<std::uint32_t, std::uint32_t> supplied;
     for (const auto& constant : constants) {
@@ -498,7 +582,10 @@ std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledSh
         }
         cursor += count;
     }
-    materialized = SpecializeFragmentOutputs(SpecializeSpirv(materialized), constants, specializedIds);
+    const auto refusedIndices = directImageRefusalIndices(words, layout, constants);
+    materialized = SpecializeSpirv(materialized);
+    verifyDirectImageRefusalPruning(materialized, refusedIndices);
+    materialized = SpecializeFragmentOutputs(materialized, constants, specializedIds);
 #if ANYPS5_ENABLE_SPIRV_TOOLS
     materialized = ValidateAndOptimizeSpirv(materialized, target.vulkanVersion, target.spirvVersion, target.nonConstantImageOffsets, true, true);
 #endif
@@ -623,7 +710,7 @@ std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& 
     return plan;
 }
 
-std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target) {
+std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderArtifact& artifact, const IrBindingLayout& layout, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target) {
     struct ModuleKeyStorage {};
     auto& key = HostThreadLocal<std::vector<std::uint64_t>, ModuleKeyStorage>();
     key.clear();
@@ -643,7 +730,7 @@ std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderAr
     }
     std::call_once(entry->ready, [&] {
         try {
-            entry->module = buildSpecializedModule(artifact, classes, constants, target);
+            entry->module = buildSpecializedModule(artifact, layout, classes, constants, target);
         } catch (...) {
             entry->failure = std::current_exception();
         }
@@ -653,6 +740,7 @@ std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderAr
 }
 
 RecompileResult materializeResult(const CompiledVariant& variant, const RecompileRequest& request, const ResourceSnapshot& snapshot) {
+    ResourceMaterializer::ValidateDirectImageRefusals(variant.info.info, variant.info.stage, snapshot, request.target.bdaAbiVersion == BdaAbi::Version && variant.artifact.bdaAbiVersion == BdaAbi::Version);
     RecompileResult result;
     const auto& artifact = variant.artifact;
     static_cast<CompiledShaderArtifact&>(result) = {
@@ -677,6 +765,10 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         .variantId = artifact.variantId
     };
     const auto plan = preparedBindingPlan(variant, snapshot, request.context.pixel ? std::span<const std::uint8_t>(request.context.pixel->targetExportMapping) : std::span<const std::uint8_t>{});
+    result.hasDeferredDirectImage = std::any_of(plan->bindings.specialization.begin(), plan->bindings.specialization.end(), [](const PipelineSpecializationConstant& value) {
+        return value.id >= PipelineSpecialization::ImageBase && value.id < PipelineSpecialization::ImageBase + ShaderInfo::MaxImages * PipelineSpecialization::ImageWords
+            && (value.id - PipelineSpecialization::ImageBase) % PipelineSpecialization::ImageWords == 0u && PipelineSpecialization::IsDeferredDirectImageMode(value.value);
+    });
     const DescriptorBindingPlan* bindingPlan = &plan->bindings;
     std::shared_ptr<PreparedModuleEntry> entry;
     struct LocalModuleKeyStorage {};
@@ -740,7 +832,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
                     constants.push_back({first + 5u, kind});
                 }
             }
-            const auto module = specializeModule(variant.artifact, vertexClasses, constants, request.target);
+            const auto module = specializeModule(variant.artifact, variant.bindings.layout, vertexClasses, constants, request.target);
             if (variant.bindings.layout.UsesPushData() && !module->pushData) throw std::runtime_error("specialization removed the prepared push constant interface");
             auto selected = DescriptorBindingBuilder{}.Select(plan->bindings, module->bindings);
             entry->bindings = std::move(selected);
@@ -766,6 +858,8 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
     DescriptorBindingBuilder{}.Populate(bindings, variant.bindings, *bindingPlan, variant.info.userDataBase, snapshot, partialThreads(request), &tables);
     result.workgroupMemoryDwords = WorkgroupMemoryStrideDwords(variant.info.info);
     result.bindings = std::move(bindings.bindings);
+    if (std::none_of(result.bindings.begin(), result.bindings.end(), [](const DescriptorBinding& binding) { return binding.role == DescriptorRole::FaultBuffer; })) result.bdaAbiVersion = 0u;
+    if (result.hasDeferredDirectImage && (variant.info.stage != IrShaderStage::Compute || result.bdaAbiVersion != BdaAbi::Version)) throw std::runtime_error("deferred direct image requires a compute fault buffer");
     result.pushConstants = std::move(bindings.pushConstants);
     result.poisonedSrtReads = static_cast<std::uint32_t>(snapshot.srtPoison.size());
     if (!tables.map.empty()) {
@@ -878,12 +972,12 @@ RecompileResult RecompileImpl(const RecompileRequest& request) {
     if (!request.useCache) {
         auto program = PrepareResourceProgram(request);
         const auto plan = materializer.ExtractPlan(program);
-        materializer.Materialize(plan, runtime, snapshot);
+        materializer.Materialize(plan, runtime, snapshot, request.target.bdaAbiVersion == BdaAbi::Version);
         const auto variant = compileVariant(request, std::move(program));
         return materializeResult(variant, request, snapshot);
     }
     const auto source = getSource(request);
-    materializer.Materialize(*source->plan, runtime, snapshot);
+    materializer.Materialize(*source->plan, runtime, snapshot, request.target.bdaAbiVersion == BdaAbi::Version);
     return materializeVariant(*source, request, snapshot);
 }
 
@@ -1001,6 +1095,7 @@ std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapsh
 // object, a miss materializes outside the source mutex and inserts (a concurrent miss's object is
 // as good). `memoHit` reports the hit.
 std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& source, const std::shared_ptr<const CompiledVariant>& variant, const RecompileRequest& request, const ResourceSnapshot& snapshot, bool cacheHit, bool* memoHit) {
+    ResourceMaterializer::ValidateDirectImageRefusals(variant->info.info, variant->info.stage, snapshot, request.target.bdaAbiVersion == BdaAbi::Version && variant->artifact.bdaAbiVersion == BdaAbi::Version);
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto hash = snapshotHash(request, snapshot);
     std::uint64_t index = 0;
@@ -1097,15 +1192,15 @@ namespace {
 
 // The capture's materialization; with pure flat slots in the plan the walk's read addresses are
 // traced into the capture (ResourceCapture::readTrace).
-void materializeCapture(ResourceCapture& capture, const SrtRuntime& runtime) {
+void materializeCapture(ResourceCapture& capture, const SrtRuntime& runtime, bool allowDirectImageRefusal) {
     const auto& plan = *capture.plan;
     if (std::none_of(plan.pureFlatSlots.begin(), plan.pureFlatSlots.end(), [](std::uint8_t pure) { return pure != 0u; })) {
-        ResourceMaterializer{}.Materialize(plan, runtime, capture.snapshot);
+        ResourceMaterializer{}.Materialize(plan, runtime, capture.snapshot, allowDirectImageRefusal);
         return;
     }
     SrtRuntime traced = runtime;
     traced.readTrace = &capture.readTrace;
-    ResourceMaterializer{}.Materialize(plan, traced, capture.snapshot);
+    ResourceMaterializer{}.Materialize(plan, traced, capture.snapshot, allowDirectImageRefusal);
     auto& other = capture.readTrace.otherReads;
     std::sort(other.begin(), other.end());
     other.erase(std::unique(other.begin(), other.end()), other.end());
@@ -1126,7 +1221,7 @@ std::shared_ptr<const ResourceCapture> CaptureResources(const RecompileRequest& 
         capture->plan = makeResourcePlan(request);
     }
     if (profile) capture->sourceNanoseconds = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
-    materializeCapture(*capture, runtime);
+    materializeCapture(*capture, runtime, request.target.bdaAbiVersion == BdaAbi::Version);
     return capture;
 }
 
@@ -1203,7 +1298,7 @@ std::shared_ptr<const ResourceCapture> PreparedShaderInvocation::Capture(const S
     auto capture = std::make_shared<ResourceCapture>();
     capture->source = handle->source;
     capture->plan = handle->source->plan;
-    materializeCapture(*capture, runtime);
+    materializeCapture(*capture, runtime, request.target.bdaAbiVersion == BdaAbi::Version);
     return capture;
 }
 
@@ -1240,7 +1335,7 @@ std::shared_ptr<const ResourceCapture> CaptureResources(const RecompileRequest& 
     capture->source = handle.source;
     capture->plan = handle.source->plan;
     if (profile) capture->sourceNanoseconds = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
-    materializeCapture(*capture, runtime);
+    materializeCapture(*capture, runtime, request.target.bdaAbiVersion == BdaAbi::Version);
     return capture;
 }
 

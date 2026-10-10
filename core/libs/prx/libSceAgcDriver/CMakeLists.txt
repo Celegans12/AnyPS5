@@ -891,6 +891,9 @@ target_link_libraries(agc_driver_interpolation_modes_tests PRIVATE shader_recomp
 target_include_directories(agc_driver_prepared_shaders_tests PRIVATE
         $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>
 )
+target_include_directories(agc_driver_direct_image_refusal_tests PRIVATE
+        $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>
+)
 
 if(BUILD_TESTING)
     set_target_properties(agc_shader_mode_register_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
@@ -923,6 +926,7 @@ if(BUILD_TESTING)
     endforeach()
     set_tests_properties(agc_shader_disk_cache PROPERTIES TIMEOUT 120)
     set_tests_properties(agc_driver_provoking_vertex PROPERTIES TIMEOUT 30)
+    set_tests_properties(agc_driver_direct_image_refusal PROPERTIES TIMEOUT 60)
     set_tests_properties(agc_driver_flat_store PROPERTIES RUN_SERIAL TRUE)
     set_tests_properties(agc_driver_storage_cache_budget PROPERTIES TIMEOUT 30)
     add_test(NAME agc_driver_sampled_cache_budget_memory COMMAND agc_driver_sampled_cache_budget_tests memory)

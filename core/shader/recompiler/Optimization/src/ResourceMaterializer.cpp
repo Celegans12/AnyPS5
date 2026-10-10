@@ -5,6 +5,8 @@
 #include "RdnaDecoder/RdnaImageOpDecoder.hpp"
 #include "SpirvBackend/SpirvBufferFormat.hpp"
 #include "ImageTableAbi.hpp"
+#include "DirectImageRefusal.hpp"
+#include "PipelineSpecialization.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -125,6 +127,28 @@ bool validImageDescriptor(const DescriptorValue& descriptor, bool r128) {
         return baseLevel == 0u && fragments >= 1u && fragments <= 3u && (r128 || maxMip == fragments);
     }
     return true;
+}
+
+bool directRefusalDescriptor(const DescriptorValue& descriptor) {
+    if (descriptor.dwordCount != 8u || nullImageDescriptor(descriptor) || rawImageType(descriptor) != ImageType::Color1D
+        || rawImageFormat(descriptor) != IrBufferFormat::Format8_8_8_8UNorm) return false;
+    const auto& words = descriptor.dwords;
+    if (((words[2] >> 14u) & 0x3fffu) != 0u || (words[3] & 0x0ffff000u) != 0u
+        || (words[4] & 0x1fff1fffu) != 0u || (words[5] & (0xffu | (1u << 23u) | (1u << 26u))) != 0u
+        || (words[6] & ((1u << 10u) | 0xffff8000u)) != 0u || words[7] != 0u) return false;
+    for (std::uint32_t component = 0u; component < 4u; ++component) {
+        const auto selector = (words[3] >> (3u * component)) & 7u;
+        if (selector == 2u || selector == 3u) return false;
+    }
+    return true;
+}
+
+bool directRefusalMemory(const MemoryInfo& memory) {
+    return memory.kind == ResourceKind::Image && memory.dataBits == 32u && !memory.d16 && memory.imageSampleFlags == 0u
+        && !memory.imageHasMip && !memory.imagePacked && !memory.imageR128 && memory.imageByElements == 0u
+        && !memory.gpuDescriptor && memory.imageDimension == RdnaImageDimension::Dim2DArray && memory.imageAddressComponents == 3u
+        && memory.dmask != 0u && memory.dmask <= 0xfu && memory.dataDwords == static_cast<std::uint32_t>(std::popcount(memory.dmask))
+        && memory.componentCount == memory.dataDwords && memory.componentIndex == 0u;
 }
 
 std::uint32_t storageMipCount(const ImageResource& base, const DescriptorValue& descriptor) {
@@ -786,7 +810,7 @@ std::uint32_t emulatedCompareState(const ShaderInfo& info, const ResourceSnapsho
     return *samplerState | (reference << EmulatedCompare::ReferenceShift) | (singleLevel ? EmulatedCompare::SingleLevel : 0u);
 }
 
-void materializeTables(const IrResourcePlan& plan, ResourceSnapshot& snapshot) {
+void materializeTables(const IrResourcePlan& plan, ResourceSnapshot& snapshot, bool allowDirectImageRefusal) {
     for (std::uint32_t i = 0u; i < plan.info.buffers.size(); ++i) {
         const auto decoded = decodeBufferDescriptor(snapshot.buffers.at(i));
         if (decoded.Type() != 0u) throw std::runtime_error("buffer descriptor uses an unsupported type");
@@ -796,7 +820,17 @@ void materializeTables(const IrResourcePlan& plan, ResourceSnapshot& snapshot) {
     for (std::uint32_t i = 0u; i < plan.info.images.size(); ++i) {
         const auto& image = plan.info.images[i];
         if (image.table != NoTable) continue;
-        static_cast<void>(ResourceMaterializer::RuntimeImageMode(image, snapshot.images.at(i), plan.info.runtimeImageModes.at(i)));
+        const auto mode = ResourceMaterializer::DirectImageMode(plan.info, plan.stage, i, snapshot.images.at(i), allowDirectImageRefusal);
+        if (PipelineSpecialization::IsDeferredDirectImageMode(mode)) {
+            bool allowed = true;
+            bool found = false;
+            for (const auto& memory : plan.memoryInfo) {
+                if (memory.kind != ResourceKind::Image || memory.resource != i) continue;
+                found = true;
+                allowed = allowed && directRefusalMemory(memory);
+            }
+            if (!allowed || !found) static_cast<void>(ResourceMaterializer::RuntimeImageMode(image, snapshot.images.at(i), plan.info.runtimeImageModes.at(i)));
+        }
     }
 }
 
@@ -1185,6 +1219,7 @@ RuntimeImageModeMatch ResourceMaterializer::TryRuntimeImageMode(const ImageResou
     }
     const auto inspected = inspectImageDescriptor(descriptor, image, image.srgbDecodeFormats);
     if (inspected.reason.has_value()) return reject(*inspected.reason, inspected.detail);
+    result.descriptorInspected = true;
     const auto& decoded = inspected.decoded;
     const auto format = rawImageFormat(descriptor);
     const bool emulated = image.depthCompare && format != IrBufferFormat::Format32Float && format != IrBufferFormat::Format16UNorm && !IsDepthBitsTexture(descriptor.dwords[1], descriptor.dwords[3]);
@@ -1242,6 +1277,56 @@ std::uint32_t ResourceMaterializer::RuntimeImageMode(const ImageResource& image,
     const auto match = TryRuntimeImageMode(image, descriptor, modes);
     if (!match.mode.has_value()) throw std::runtime_error(match.detail);
     return *match.mode;
+}
+
+std::uint32_t ResourceMaterializer::DirectImageMode(const ShaderInfo& info, IrShaderStage stage, std::uint32_t index, const DescriptorValue& descriptor, bool allowRefusal) {
+    if (index >= info.images.size()) throw std::runtime_error("ShaderRecompiler: direct image resource is missing");
+    if (index >= info.runtimeImageModes.size()) throw std::runtime_error("ShaderRecompiler: direct image runtime modes are missing");
+    const auto& image = info.images.at(index);
+    const auto match = TryRuntimeImageMode(image, descriptor, info.runtimeImageModes.at(index));
+    if (match.mode.has_value()) return *match.mode;
+    if (allowRefusal && !DirectImageLoopGuardEnabled() && ShaderRecompiler::CanDeferDirectImage(image, stage)
+        && std::none_of(info.sampledPairs.begin(), info.sampledPairs.end(), [&](const auto& pair) { return pair.image == index; })
+        && match.descriptorInspected && match.reason == PoisonReason::Dimension && directRefusalDescriptor(descriptor)) {
+        return PipelineSpecialization::DeferredDirectImageMode;
+    }
+    throw std::runtime_error(match.detail);
+}
+
+bool ResourceMaterializer::CanDeferDirectImage(const IrProgram& program, std::uint32_t index) {
+    const auto& resources = program.Resources();
+    if (!ShaderRecompiler::CanDeferDirectImage(resources.info.images.at(index), resources.stage)
+        || std::any_of(resources.info.sampledPairs.begin(), resources.info.sampledPairs.end(), [&](const auto& pair) { return pair.image == index; })) return false;
+    bool found = false;
+    for (const auto& block : program.Blocks()) {
+        for (const auto* instruction : block->Instructions()) {
+            if (ImageOpcodeInfoOf(instruction->Opcode()).resourceClass == ImageResourceClass::None) continue;
+            const auto& memory = resources.memoryInfo.at(instruction->Flags<MemoryFlags>().index);
+            if (memory.resource != index) continue;
+            if (instruction->Opcode() != IrOpcode::ImageWrite || !directRefusalMemory(memory)) return false;
+            found = true;
+        }
+    }
+    return found;
+}
+
+void ResourceMaterializer::PrepareDirectImageRefusals(IrProgram& program, bool faultAbi) {
+    if (!faultAbi || DirectImageLoopGuardEnabled()) return;
+    for (std::uint32_t index = 0u; index < program.Info().images.size(); ++index) {
+        if (CanDeferDirectImage(program, index)) {
+            program.Info().usesFaultBuffer = true;
+            return;
+        }
+    }
+}
+
+void ResourceMaterializer::ValidateDirectImageRefusals(const ShaderInfo& info, IrShaderStage stage, const ResourceSnapshot& snapshot, bool allowRefusal) {
+    if (allowRefusal && !DirectImageLoopGuardEnabled()) return;
+    for (std::uint32_t index = 0u; index < info.images.size(); ++index) {
+        if (ShaderRecompiler::CanDeferDirectImage(info.images[index], stage)) {
+            static_cast<void>(DirectImageMode(info, stage, index, snapshot.images.at(index), false));
+        }
+    }
 }
 
 std::uint32_t ResourceMaterializer::EmulatedCompareState(const ShaderInfo& info, const ResourceSnapshot& snapshot, std::uint32_t index) {
@@ -1414,7 +1499,7 @@ IrResourcePlan ResourceMaterializer::ExtractPlan(const IrProgram& program) const
     return plan;
 }
 
-void ResourceMaterializer::Materialize(const IrResourcePlan& program, const SrtRuntime& runtime, ResourceSnapshot& snapshot) const {
+void ResourceMaterializer::Materialize(const IrResourcePlan& program, const SrtRuntime& runtime, ResourceSnapshot& snapshot, bool allowDirectImageRefusal) const {
     const IrResourcePlan& plan = program;
     if (!plan.resourceTrackingComplete) {
         throw std::runtime_error("ResourceMaterializer::Materialize requires a completed resource plan");
@@ -1433,7 +1518,7 @@ void ResourceMaterializer::Materialize(const IrResourcePlan& program, const SrtR
         throw;
     }
     const auto started = MaterializeProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    materializeTables(plan, nextSnapshot);
+    materializeTables(plan, nextSnapshot, allowDirectImageRefusal);
     materializeSrtGuards(plan, nextSnapshot);
     if (MaterializeProfiled()) specializationNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
     snapshot = std::move(nextSnapshot);

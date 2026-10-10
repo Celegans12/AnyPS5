@@ -45,6 +45,7 @@ struct RuntimeImageModeMatch {
     std::optional<std::uint32_t> mode;
     ImageTableAbi::PoisonReason reason = ImageTableAbi::PoisonReason::InvalidFormat;
     std::string detail;
+    bool descriptorInspected = false;
 };
 
 class ResourceMaterializer {
@@ -54,11 +55,15 @@ public:
     static std::vector<ImageResource> RuntimeImageModes(const ImageResource& image);
     static RuntimeImageModeMatch TryRuntimeImageMode(const ImageResource& image, const DescriptorValue& descriptor, std::span<const ImageResource> modes);
     static std::uint32_t RuntimeImageMode(const ImageResource& image, const DescriptorValue& descriptor, std::span<const ImageResource> modes);
+    static std::uint32_t DirectImageMode(const ShaderInfo& info, IrShaderStage stage, std::uint32_t index, const DescriptorValue& descriptor, bool allowRefusal = false);
+    static bool CanDeferDirectImage(const IrProgram& program, std::uint32_t index);
+    static void PrepareDirectImageRefusals(IrProgram& program, bool faultAbi);
+    static void ValidateDirectImageRefusals(const ShaderInfo& info, IrShaderStage stage, const ResourceSnapshot& snapshot, bool allowRefusal);
     static void PrepareImageModes(ShaderInfo& info);
     static ResolvedImageTables ResolveImageTables(const ShaderInfo& info, const ResourceSnapshot& snapshot, std::uint64_t memoKey = 0);
     static const char* UnnormalizedSampleMismatch(const ImageResource& image);
     [[nodiscard]] IrResourcePlan ExtractPlan(const IrProgram& program) const;
-    void Materialize(const IrResourcePlan& program, const SrtRuntime& runtime, ResourceSnapshot& snapshot) const;
+    void Materialize(const IrResourcePlan& program, const SrtRuntime& runtime, ResourceSnapshot& snapshot, bool allowDirectImageRefusal = false) const;
     static std::uint64_t SpecializationNanoseconds();
 };
 

@@ -405,6 +405,7 @@ void encodeInvocation(Writer& writer, const ShaderInvocation& invocation) {
     });
     writer.Value(invocation.imageTableShader);
     writer.Value(invocation.imageTableFaults);
+    writer.Value(invocation.hasDeferredDirectImage);
 }
 
 void decodeInvocation(Reader& reader, ShaderInvocation& invocation) {
@@ -444,6 +445,7 @@ void decodeInvocation(Reader& reader, ShaderInvocation& invocation) {
     });
     reader.Value(invocation.imageTableShader);
     reader.Value(invocation.imageTableFaults);
+    reader.Value(invocation.hasDeferredDirectImage);
 }
 
 void encodeLayout(Writer& writer, const IrBindingLayout& layout) {

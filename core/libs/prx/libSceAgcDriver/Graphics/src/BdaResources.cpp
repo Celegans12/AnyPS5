@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "ImageTableAbi.hpp"
+#include "IntermediateRepresentation/IrMetadata/ShaderInfo.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
 #include <atomic>
@@ -237,7 +238,7 @@ bool LoopGuardTripped() {
     return loopGuardTripped.load(std::memory_order_relaxed);
 }
 
-void BdaResources::CheckFault() const {
+void BdaResources::CheckFault(std::uint64_t shaderAddress) const {
     markWrittenPages();
     ShaderRecompiler::BdaAbi::Fault report{};
     std::memcpy(&report, fault->Bytes().data(), sizeof(report));
@@ -253,6 +254,16 @@ void BdaResources::CheckFault() const {
         std::fprintf(stderr, "[gpu] loop guard: the loop exit at pc 0x%x of shader 0x%llx ran past %u evaluations\n", report.instruction, static_cast<unsigned long long>(report.address), report.bytes);
         std::memset(fault->Bytes().data(), 0, fault->Bytes().size());
         return;
+    }
+    if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::DirectImage) {
+        const auto resource = ShaderRecompiler::BdaAbi::DirectImageFaultResource(report.bytes);
+        Require(report.address == 0u && ShaderRecompiler::BdaAbi::DirectImageFaultReason(report.bytes) == ShaderRecompiler::BdaAbi::DirectImageDimension && resource < ShaderRecompiler::ShaderInfo::MaxImages, "invalid direct image fault payload");
+        std::ostringstream message;
+        message << "direct image: shader ";
+        if (shaderAddress != 0u) message << "0x" << std::hex << shaderAddress << std::dec;
+        else message << "address unavailable";
+        message << " stage " << report.stage << " pc 0x" << std::hex << report.instruction << std::dec << " resource " << resource << ": dimension";
+        throw std::runtime_error(message.str());
     }
     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::ImageTable) {
         const auto table = std::find_if(imageTables.begin(), imageTables.end(), [&](const ImageTableFaults& candidate) { return candidate.stage == report.stage; });

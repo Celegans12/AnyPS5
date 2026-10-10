@@ -17,7 +17,7 @@ public:
     BdaResources(const Context& context, const GuestBufferMemory& memory);
     VkDescriptorBufferInfo Table() const;
     VkDescriptorBufferInfo Fault() const;
-    void CheckFault() const;
+    void CheckFault(std::uint64_t shaderAddress = 0) const;
     struct ImageTableFaults {
         std::uint32_t stage = 0;
         std::uint64_t shader = 0;
