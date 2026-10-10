@@ -9,7 +9,10 @@
 #include "ControlFlow/RequestSerializer.hpp"
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <barrier>
 #include <chrono>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -17,12 +20,41 @@
 #include <functional>
 #include <future>
 #include <iostream>
+#include <latch>
 #include <map>
+#include <new>
 #include <random>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
+
+namespace {
+
+thread_local bool mainAllocationThread = false;
+std::atomic<bool> failColdWorkerAllocation{false};
+std::atomic<unsigned> coldWorkerAllocationFailures{0};
+
+void* allocateTestMemory(std::size_t size) {
+    bool fail = size == 128u * 1024u && !mainAllocationThread && failColdWorkerAllocation.exchange(false, std::memory_order_relaxed);
+    if (fail) coldWorkerAllocationFailures.fetch_add(1u, std::memory_order_relaxed);
+    for (;;) {
+        if (void* memory = fail ? nullptr : std::malloc(size == 0u ? 1u : size)) return memory;
+        fail = false;
+        const auto handler = std::get_new_handler();
+        if (handler == nullptr) throw std::bad_alloc();
+        handler();
+    }
+}
+
+}
+
+void* operator new(std::size_t size) { return allocateTestMemory(size); }
+void* operator new[](std::size_t size) { return allocateTestMemory(size); }
+void operator delete(void* memory) noexcept { std::free(memory); }
+void operator delete[](void* memory) noexcept { std::free(memory); }
+void operator delete(void* memory, std::size_t) noexcept { std::free(memory); }
+void operator delete[](void* memory, std::size_t) noexcept { std::free(memory); }
 
 namespace {
 
@@ -294,6 +326,140 @@ struct SampleRequest {
     }
 };
 
+std::vector<std::uint32_t> coldSpirvWords() {
+    std::vector<std::uint32_t> words(128u * 1024u / sizeof(std::uint32_t));
+    for (std::size_t index = 0; index < words.size(); ++index) words[index] = static_cast<std::uint32_t>(index % 64u);
+    words[0] = 0x07230203u;
+    return words;
+}
+
+void verifyColdSpirvStorage() {
+    const auto expected = coldSpirvWords();
+    SharedSpirv cold(expected);
+    {
+        const auto alias = cold;
+        require(!cold.TryMakeCold(), "shared SPIR-V storage was demoted");
+        require(alias.size() == expected.size(), "a failed demotion changed shared SPIR-V size");
+    }
+    require(cold.TryMakeCold(), "repetitive 128 KiB SPIR-V did not become cold");
+    const auto compressedBytes = cold.ColdBytes();
+    require(compressedBytes != 0u && compressedBytes < expected.size() * sizeof(std::uint32_t), "cold SPIR-V did not reduce stored bytes");
+    require(!cold.empty() && cold.size() == expected.size(), "cold SPIR-V lost its word count");
+    require(cold.ColdBytes() == compressedBytes, "size or empty hydrated cold SPIR-V");
+    const auto transient = cold.ReadTransient();
+    require(transient && *transient == expected, "transient SPIR-V read changed words");
+    require(cold.ColdBytes() == compressedBytes, "transient SPIR-V read warmed storage");
+    std::barrier start(4);
+    std::latch launchReady(1);
+    bool launchFailed = false;
+    std::array<std::future<const std::vector<std::uint32_t>*>, 4> readers;
+    try {
+        for (auto& reader : readers) {
+            reader = std::async(std::launch::async, [&]() -> const std::vector<std::uint32_t>* {
+                launchReady.wait();
+                if (launchFailed) return nullptr;
+                start.arrive_and_wait();
+                const auto& words = cold.Words();
+                require(words == expected, "concurrent SPIR-V hydration changed words");
+                return &words;
+            });
+        }
+    } catch (...) {
+        launchFailed = true;
+        launchReady.count_down();
+        throw;
+    }
+    launchReady.count_down();
+    const auto* first = readers.front().get();
+    for (std::size_t index = 1; index < readers.size(); ++index) {
+        require(readers[index].get() == first, "concurrent SPIR-V readers received different hydrated storage");
+    }
+    require(first == &cold.Words() && cold.ColdBytes() == 0u, "public words did not permanently hydrate SPIR-V");
+    require(!cold.TryMakeCold(), "SPIR-V was demoted after public word access");
+    require(*transient == expected, "public hydration invalidated a transient read");
+
+    SharedSpirv original(expected);
+    require(original.TryMakeCold(), "copy-on-write fixture did not become cold");
+    auto changed = original;
+    changed[7] ^= 0x80000000u;
+    require(original.ColdBytes() > 0u, "mutating a cold copy hydrated the original storage");
+    require(original.Words() == expected, "mutating a cold copy changed the original words");
+    require(changed.Words()[7] == (expected[7] ^ 0x80000000u), "cold copy mutation was lost");
+    changed.resize(expected.size() + 3u);
+    require(changed.size() == expected.size() + 3u && changed.Words().back() == 0u, "SPIR-V growth lost its word count or zero-filled tail");
+    changed.resize(17u);
+    require(changed.size() == 17u && original.size() == expected.size(), "SPIR-V shrink changed another holder's word count");
+    changed.insert(changed.begin() + 1, {0x12345678u, 0xabcdef01u});
+    require(changed.size() == 19u && changed.Words()[1] == 0x12345678u && changed.Words()[3] == expected[1], "SPIR-V insertion lost its count or original suffix");
+
+    SharedSpirv pinned(expected);
+    const auto pin = pinned.ReadTransient();
+    require(pin && *pin == expected && !pinned.TryMakeCold(), "pinned SPIR-V storage was demoted");
+    pinned[9] ^= 1u;
+    require(*pin == expected && pinned.Words()[9] == (expected[9] ^ 1u), "copy-on-write mutation changed pinned transient words");
+    SharedSpirv inserted(expected);
+    const auto insertionPin = inserted.ReadTransient();
+    inserted.insert(insertionPin->cbegin() + 3, {0x12345678u, 0xabcdef01u});
+    auto expectedInserted = expected;
+    expectedInserted.insert(expectedInserted.cbegin() + 3, {0x12345678u, 0xabcdef01u});
+    require(*insertionPin == expected && inserted.Words() == expectedInserted, "const-iterator insertion changed pinned words or lost its position during copy-on-write");
+    SharedSpirv released(expected);
+    {
+        const auto held = released.ReadTransient();
+        require(!released.TryMakeCold() && *held == expected, "an active transient pin did not retain warm SPIR-V");
+    }
+    require(released.TryMakeCold(), "releasing a transient pin prevented later demotion");
+
+    SharedSpirv tiny(std::vector<std::uint32_t>(16u, 0u));
+    require(!tiny.TryMakeCold() && tiny.ColdBytes() == 0u && tiny.size() == 16u, "tiny SPIR-V was demoted or changed");
+    std::mt19937 random(0x4c6f6c64u);
+    std::vector<std::uint32_t> noise(expected.size());
+    for (auto& word : noise) word = random();
+    SharedSpirv incompressible(noise);
+    require(!incompressible.TryMakeCold(), "incompressible SPIR-V was demoted");
+    require(incompressible.ColdBytes() == 0u && incompressible.Words() == noise, "failed compression changed SPIR-V storage");
+}
+
+void verifyColdCacheRoundTrips() {
+    const auto words = coldSpirvWords();
+    SampleRequest sample;
+    const auto key = sample.Key();
+    auto expectedVariant = sampleVariant();
+    expectedVariant.artifact.spirv = words;
+    auto variant = sampleVariant();
+    variant.artifact.spirv = words;
+    require(variant.artifact.spirv.TryMakeCold(), "entry fixture did not become cold");
+    const auto frozen = std::make_shared<const CompiledVariant>(std::move(variant));
+    const auto entryColdBytes = frozen->artifact.spirv.ColdBytes();
+    const auto file = ShaderDiskCache::EncodeEntry(key, *frozen);
+    require(frozen->artifact.spirv.ColdBytes() == entryColdBytes, "entry encoding warmed frozen SPIR-V storage");
+    require(file == ShaderDiskCache::EncodeEntry(key, expectedVariant), "cold entry encoding changed the cache wire format");
+    require(ShaderDiskCache::EncodeEntry(key, *frozen) == file, "repeated cold entry encoding changed bytes");
+    CompiledVariant decodedVariant;
+    require(ShaderDiskCache::DecodeEntry(file, key, decodedVariant) == ShaderDiskCache::LoadStatus::Loaded, "a cold encoded entry does not decode");
+    requireSameVariant(expectedVariant, decodedVariant, "cold entry round trip");
+    require(decodedVariant.artifact.variantId == 0u, "a cold entry retained a per-process artifact id");
+    require(frozen->artifact.spirv.ColdBytes() == entryColdBytes, "cold entry round trip warmed the frozen artifact");
+
+    auto expectedResult = sampleResult();
+    expectedResult.spirv = words;
+    auto result = sampleResult();
+    result.spirv = words;
+    require(result.spirv.TryMakeCold(), "result fixture did not become cold");
+    const auto resultColdBytes = result.spirv.ColdBytes();
+    std::vector<std::byte> bytes;
+    ShaderDiskCache::EncodeResult(result, bytes);
+    require(result.spirv.ColdBytes() == resultColdBytes, "result encoding warmed cold SPIR-V storage");
+    std::vector<std::byte> warmBytes;
+    ShaderDiskCache::EncodeResult(expectedResult, warmBytes);
+    require(bytes == warmBytes, "cold result encoding changed the cache wire format");
+    RecompileResult decodedResult;
+    require(ShaderDiskCache::DecodeResult(bytes, decodedResult), "a cold encoded result does not decode");
+    requireSameResult(expectedResult, decodedResult, "cold result round trip");
+    require(decodedResult.variantId == 0u && !decodedResult.cacheHit, "a cold result retained per-process fields");
+    require(result.spirv.ColdBytes() == resultColdBytes, "cold result round trip warmed the source artifact");
+}
+
 void verifyResultRoundTrip() {
     const auto result = sampleResult();
     std::vector<std::byte> bytes;
@@ -526,6 +692,49 @@ void verifyStore() {
     ShaderDiskCache::Store(key, variant);
     ShaderDiskCache::Flush();
     require(ShaderDiskCache::Load(key, loaded), "a rewritten entry does not load");
+}
+
+void verifyColdWriterAllocationFailure() {
+    const auto words = coldSpirvWords();
+    auto expected = sampleVariant();
+    expected.artifact.spirv = words;
+    auto variant = sampleVariant();
+    variant.artifact.spirv = words;
+    require(variant.artifact.spirv.TryMakeCold(), "writer failure fixture did not become cold");
+    const auto frozen = std::make_shared<const CompiledVariant>(std::move(variant));
+    const auto coldBytes = frozen->artifact.spirv.ColdBytes();
+    SampleRequest sample;
+    sample.code.back() = 0xc01df001u;
+    const auto key = sample.Key();
+    sample.code.back() = 0xc01df002u;
+    const auto nextKey = sample.Key();
+    const auto expectedBytes = ShaderDiskCache::EncodeEntry(key, *frozen).size() + ShaderDiskCache::EncodeEntry(nextKey, *frozen).size();
+    ShaderDiskCache::Flush();
+    const auto before = ShaderDiskCache::Totals();
+    struct DisarmInjection {
+        ~DisarmInjection() { failColdWorkerAllocation.store(false, std::memory_order_relaxed); }
+    } disarmInjection;
+    coldWorkerAllocationFailures.store(0u, std::memory_order_relaxed);
+    failColdWorkerAllocation.store(true, std::memory_order_relaxed);
+    ShaderDiskCache::Store(key, frozen);
+    ShaderDiskCache::Flush();
+    const bool stillArmed = failColdWorkerAllocation.exchange(false, std::memory_order_relaxed);
+    const auto failed = ShaderDiskCache::Totals();
+    require(!stillArmed && coldWorkerAllocationFailures.load(std::memory_order_relaxed) == 1u, "the cache worker did not encounter exactly one injected 128 KiB allocation failure");
+    require(failed.writeFailures == before.writeFailures + 1u && failed.writes == before.writes && failed.bytesWritten == before.bytesWritten, "a failed cold cache write changed success counters or was not counted once");
+    require(frozen->artifact.spirv.ColdBytes() == coldBytes && *frozen->artifact.spirv.ReadTransient() == words && frozen->artifact.spirv.ColdBytes() == coldBytes, "a failed cache write changed or hydrated the cold source");
+    require(!std::filesystem::exists(ShaderDiskCache::EntryDirectory() / ShaderDiskCache::EntryName(key)), "a failed cold cache write published an entry");
+    ShaderDiskCache::Store(key, frozen);
+    ShaderDiskCache::Store(nextKey, frozen);
+    ShaderDiskCache::Flush();
+    const auto recovered = ShaderDiskCache::Totals();
+    require(recovered.writeFailures == failed.writeFailures && recovered.writes == failed.writes + 2u && recovered.bytesWritten == failed.bytesWritten + expectedBytes, "the cache writer did not recover for the retry and following job");
+    for (const auto* storedKey : {&key, &nextKey}) {
+        CompiledVariant loaded{};
+        require(ShaderDiskCache::Load(*storedKey, loaded), "an entry written after worker allocation failure does not load");
+        requireSameVariant(expected, loaded, "cache writer allocation recovery");
+    }
+    require(coldWorkerAllocationFailures.load(std::memory_order_relaxed) == 1u && frozen->artifact.spirv.ColdBytes() == coldBytes && *frozen->artifact.spirv.ReadTransient() == words && frozen->artifact.spirv.ColdBytes() == coldBytes, "successful retries repeated injection or changed the cold source");
 }
 
 struct ComputeRequest {
@@ -1055,6 +1264,7 @@ void verifyDefaultDirectory(const char* self) {
 }
 
 int main(int argc, char** argv) {
+    mainAllocationThread = true;
     try {
         if (argc == 2 && std::string_view(argv[1]) == "--load") return runLoadingProcess();
         if (argc == 2 && std::string_view(argv[1]) == "--load-opposite-masked-select") return runOppositeMaskedSelectLoadingProcess();
@@ -1064,12 +1274,15 @@ int main(int argc, char** argv) {
         verifyDefaultDirectory(argv[0]);
         setEnvironment("ANYPS5_NO_SHADER_CACHE", "0");
         setEnvironment("ANYPS5_SHADER_CACHE_DIR", directory.string());
+        verifyColdSpirvStorage();
+        verifyColdCacheRoundTrips();
         verifyResultRoundTrip();
         verifyEntryRoundTrip();
         verifyArtifactStorageIsolation();
         verifyKeySensitivity();
         verifyFloatModeSerialization();
         verifyStore();
+        verifyColdWriterAllocationFailure();
         verifyAcrossProcesses(argv[0]);
         verifyEmissionFailureMemo();
         verifyFailureMemoSwitch(argv[0]);

@@ -1,7 +1,26 @@
+include("${CMAKE_CURRENT_LIST_DIR}/ColdSpirvCodec.cmake")
+
 function(add_shader_recompiler target runtimeTarget)
     cmake_parse_arguments(PARSE_ARGV 2 shaderCache "" "" "GUARD_SOURCES")
     if(NOT TARGET "${runtimeTarget}")
         message(FATAL_ERROR "Shader recompiler requires an existing runtime target: ${runtimeTarget}")
+    endif()
+
+    add_shader_cold_spirv_codec("${PROJECT_SOURCE_DIR}/3rdparty/libjpeg-turbo/src/spng/zlib")
+    if(BUILD_TESTING)
+        foreach(coldTest IN ITEMS shader_cold_spirv_codec shader_cold_spirv_storage)
+            get_property(coldRuntimeConfigured TARGET ${coldTest}_tests PROPERTY ANYPS5_COLD_SPIRV_RUNTIME_CONFIGURED)
+            if(coldRuntimeConfigured)
+                continue()
+            endif()
+            target_link_libraries(${coldTest}_tests PRIVATE ${runtimeTarget})
+            configure_windows_unwind(${coldTest}_tests)
+            if(WIN32)
+                set_tests_properties(${coldTest} PROPERTIES ENVIRONMENT_MODIFICATION
+                        "PATH=path_list_prepend:$<TARGET_FILE_DIR:${runtimeTarget}>")
+            endif()
+            set_property(TARGET ${coldTest}_tests PROPERTY ANYPS5_COLD_SPIRV_RUNTIME_CONFIGURED TRUE)
+        endforeach()
     endif()
 
     if(ANYPS5_ENABLE_SPIRV_TOOLS AND NOT TARGET SPIRV-Tools-opt)
@@ -34,6 +53,7 @@ function(add_shader_recompiler target runtimeTarget)
 
     add_library(${target} STATIC EXCLUDE_FROM_ALL
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Recompiler.cpp
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/SharedSpirv.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/ShaderDiskCache.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/SpirvBackend/src/RectListShaders.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/SpirvBackend/src/BarycentricGeometryShader.cpp
@@ -287,6 +307,7 @@ function(add_shader_recompiler target runtimeTarget)
     )
 
     target_link_libraries(${target} PRIVATE
+            shader_cold_spirv_codec
             ${runtimeTarget}
             glslang
             SPIRV

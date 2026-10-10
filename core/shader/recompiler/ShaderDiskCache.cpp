@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <exception>
 #include <fstream>
 #include <mutex>
 #include <optional>
@@ -288,7 +289,8 @@ void decodeBinding(Reader& reader, DescriptorBinding& binding) {
 
 void encodeArtifact(Writer& writer, const CompiledShaderArtifact& result) {
     writer.Value(result.runtimeAbiVersion);
-    writer.Values(std::span<const std::uint32_t>(result.spirv.Words()));
+    const auto words = result.spirv.ReadTransient();
+    writer.Values(std::span<const std::uint32_t>(*words));
     writer.Value(result.bdaAbiVersion);
     writer.Value(result.memoryOffsetDword);
     writer.Value(result.shaderDataDwords);
@@ -697,6 +699,7 @@ void decodeAllocation(Reader& reader, CompiledBindingLayout& allocation) {
 }
 
 constexpr std::string_view NeutralSwitches[] = {
+    "APS5_COLD_SPIRV",
     "APS5_PROFILE_DRAW",
     "APS5_DUMP_IR",
     "APS5_NO_CODE_HASH_KEY",
@@ -827,14 +830,24 @@ private:
         }
     }
 
-    void write(const Job& job) {
-        const auto file = EncodeEntry(job.key, *job.variant);
-        if (WriteFileAtomically(directory / EntryName(job.key), file)) {
-            writes.fetch_add(1, std::memory_order_relaxed);
-            bytesWritten.fetch_add(file.size(), std::memory_order_relaxed);
-        } else {
-            const auto failures = writeFailures.fetch_add(1, std::memory_order_relaxed);
-            if (failures < 4) std::fprintf(stderr, "[shader-disk-cache] cannot write %s\n", (directory / EntryName(job.key)).string().c_str());
+    void writeFailure(const Job& job, const char* reason) noexcept {
+        const auto failures = writeFailures.fetch_add(1, std::memory_order_relaxed);
+        if (failures < 4) std::fprintf(stderr, "[shader-disk-cache] cannot write artifact %llu (%zu key bytes): %.200s\n", static_cast<unsigned long long>(job.variant->artifact.variantId), job.key.size(), reason);
+    }
+
+    void write(const Job& job) noexcept {
+        try {
+            const auto file = EncodeEntry(job.key, *job.variant);
+            if (WriteFileAtomically(directory / EntryName(job.key), file)) {
+                writes.fetch_add(1, std::memory_order_relaxed);
+                bytesWritten.fetch_add(file.size(), std::memory_order_relaxed);
+            } else {
+                writeFailure(job, "file operation failed");
+            }
+        } catch (const std::exception& error) {
+            writeFailure(job, error.what());
+        } catch (...) {
+            writeFailure(job, "unknown exception during cache serialization or write");
         }
     }
 

@@ -784,6 +784,35 @@ bool sameLayout(const BindingLayout& left, const BindingLayout& right) {
     return left.descriptorSet == right.descriptorSet && left.firstBinding == right.firstBinding && left.pushConstantOffsetBytes == right.pushConstantOffsetBytes && left.pushConstantSizeBytes == right.pushConstantSizeBytes;
 }
 
+void makeColdForPublication(SharedSpirv& spirv, bool diskLoaded) noexcept {
+    try {
+        const auto before = spirv.InspectStorage();
+        const bool demoted = spirv.TryMakeCold();
+        const auto after = spirv.InspectStorage();
+        struct Totals {
+            std::mutex mutex;
+            unsigned long long variants = 0, diskLoads = 0, eligible = 0, cold = 0, exposed = 0;
+            unsigned long long logicalBytes = 0, rawBytes = 0, rawCapacityBytes = 0, coldBytes = 0, coldCapacityBytes = 0;
+        };
+        static Totals totals;
+        std::lock_guard lock(totals.mutex);
+        ++totals.variants;
+        totals.diskLoads += diskLoaded;
+        totals.eligible += before.eligible;
+        totals.cold += demoted;
+        totals.exposed += before.exposed;
+        totals.logicalBytes += after.logicalBytes;
+        totals.rawBytes += after.residentBytes;
+        totals.rawCapacityBytes += after.residentCapacityBytes;
+        totals.coldBytes += after.coldBytes;
+        totals.coldCapacityBytes += after.coldCapacityBytes;
+        if (totals.variants == 1 || totals.variants % 256u == 0 || (!demoted && before.logicalBytes >= 16u * 1024u * 1024u)) {
+            std::fprintf(stderr, "[cold-spirv] publication_totals variants=%llu disk=%llu eligible=%llu cold=%llu exposed=%llu logical_bytes=%llu raw_bytes=%llu raw_capacity_bytes=%llu cold_bytes=%llu cold_capacity_bytes=%llu\n", totals.variants, totals.diskLoads, totals.eligible, totals.cold, totals.exposed, totals.logicalBytes, totals.rawBytes, totals.rawCapacityBytes, totals.coldBytes, totals.coldCapacityBytes);
+        }
+    } catch (...) {
+    }
+}
+
 std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source, const RecompileRequest& request, bool& cacheHit, ShaderPreparationContext* preparation = nullptr) {
     for (const auto& candidate : source.variants) {
         if (sameLayout(candidate->layout, request.layout)) {
@@ -796,6 +825,7 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
     }
     cacheHit = false;
     const bool disk = ShaderDiskCache::Enabled() && !DebugProbeActive();
+    static const bool coldSpirv = [] { const auto* value = std::getenv("APS5_COLD_SPIRV"); return value != nullptr && std::string_view(value) == "1"; }();
     std::vector<std::byte> diskKey;
     std::shared_ptr<const CompiledVariant> variant;
     if (disk) {
@@ -804,6 +834,7 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
         if (ShaderDiskCache::Load(diskKey, loaded)) {
             loaded.layout = request.layout;
             loaded.artifact.variantId = nextVariantId();
+            if (coldSpirv) makeColdForPublication(loaded.artifact.spirv, true);
             variant = std::make_shared<const CompiledVariant>(std::move(loaded));
         }
     }
@@ -812,7 +843,9 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
         source.program.reset();
         std::exception_ptr emissionFailure;
         try {
-            variant = std::make_shared<const CompiledVariant>(compileVariant(request, std::move(program), &emissionFailure));
+            auto compiled = compileVariant(request, std::move(program), &emissionFailure);
+            if (coldSpirv) makeColdForPublication(compiled.artifact.spirv, false);
+            variant = std::make_shared<const CompiledVariant>(std::move(compiled));
         } catch (...) {
             if (emissionFailure != nullptr && FailureMemo()) source.emissionFailures.push_back({request.shader.codeAddress, request.layout, emissionFailure});
             throw;

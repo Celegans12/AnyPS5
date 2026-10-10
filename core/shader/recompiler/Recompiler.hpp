@@ -416,17 +416,28 @@ struct BarycentricEmulationLayout {
 // reference, or the per-dispatch copy this class removes comes back without a compiler hint.
 class SharedSpirv {
 public:
-    SharedSpirv() = default;
-    SharedSpirv(std::vector<std::uint32_t> words) : words(std::make_shared<std::vector<std::uint32_t>>(std::move(words))) {}
-    SharedSpirv& operator=(std::vector<std::uint32_t> other) {
-        words = std::make_shared<std::vector<std::uint32_t>>(std::move(other));
-        return *this;
-    }
+    struct StorageInfo {
+        std::size_t logicalBytes = 0;
+        std::size_t residentBytes = 0;
+        std::size_t residentCapacityBytes = 0;
+        std::size_t coldBytes = 0;
+        std::size_t coldCapacityBytes = 0;
+        bool exposed = false;
+        bool eligible = false;
+    };
 
-    [[nodiscard]] const std::vector<std::uint32_t>& Words() const { return words ? *words : Empty(); }
+    SharedSpirv() = default;
+    SharedSpirv(std::vector<std::uint32_t> words);
+    SharedSpirv& operator=(std::vector<std::uint32_t> other);
+
+    [[nodiscard]] const std::vector<std::uint32_t>& Words() const;
+    [[nodiscard]] std::shared_ptr<const std::vector<std::uint32_t>> ReadTransient() const;
+    [[nodiscard]] bool TryMakeCold() noexcept;
+    [[nodiscard]] std::size_t ColdBytes() const;
+    [[nodiscard]] StorageInfo InspectStorage() const;
     operator const std::vector<std::uint32_t>&() const { return Words(); }
-    [[nodiscard]] std::size_t size() const { return Words().size(); }
-    [[nodiscard]] bool empty() const { return Words().empty(); }
+    [[nodiscard]] std::size_t size() const;
+    [[nodiscard]] bool empty() const { return size() == 0; }
     [[nodiscard]] const std::uint32_t* data() const { return Words().data(); }
     [[nodiscard]] std::uint32_t* data() { return Mutable().data(); }
     [[nodiscard]] const std::uint32_t& operator[](std::size_t index) const { return Words()[index]; }
@@ -436,21 +447,18 @@ public:
     [[nodiscard]] std::vector<std::uint32_t>::iterator begin() { return Mutable().begin(); }
     [[nodiscard]] std::vector<std::uint32_t>::iterator end() { return Mutable().end(); }
     void resize(std::size_t count) { Mutable().resize(count); }
-    std::vector<std::uint32_t>::iterator insert(std::vector<std::uint32_t>::const_iterator where, std::initializer_list<std::uint32_t> values) { return Mutable().insert(where, values); }
-    friend bool operator==(const SharedSpirv& left, const SharedSpirv& right) { return left.words == right.words || left.Words() == right.Words(); }
+    std::vector<std::uint32_t>::iterator insert(std::vector<std::uint32_t>::const_iterator where, std::initializer_list<std::uint32_t> values);
+    friend bool operator==(const SharedSpirv& left, const SharedSpirv& right) { return left.storage == right.storage || left.Words() == right.Words(); }
 
 private:
     static const std::vector<std::uint32_t>& Empty() {
         static const std::vector<std::uint32_t> empty;
         return empty;
     }
-    // Copy on write: a holder whose words are shared gets its own copy before the first write.
-    std::vector<std::uint32_t>& Mutable() {
-        if (words == nullptr || words.use_count() != 1) words = std::make_shared<std::vector<std::uint32_t>>(Words());
-        return *words;
-    }
+    std::vector<std::uint32_t>& Mutable();
 
-    std::shared_ptr<std::vector<std::uint32_t>> words;
+    struct Storage;
+    std::shared_ptr<Storage> storage;
 };
 
 struct VertexInput {
