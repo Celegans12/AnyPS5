@@ -523,6 +523,18 @@ bool sameRange(const HostImport& entry, const GuestAllocations::Lease& lease) {
     return current != nullptr && !entry.range.owner_before(current) && !current.owner_before(entry.range);
 }
 
+std::uint64_t physicalMemoryBytes() {
+#ifdef _WIN32
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof(status);
+    return GlobalMemoryStatusEx(&status) ? status.ullTotalPhys : 0;
+#else
+    const auto pages = sysconf(_SC_PHYS_PAGES);
+    const auto pageSize = sysconf(_SC_PAGESIZE);
+    return pages > 0 && pageSize > 0 ? static_cast<std::uint64_t>(pages) * static_cast<std::uint64_t>(pageSize) : 0;
+#endif
+}
+
 const HostImport* importAllocation(const Context& context, HostImports& state, std::uint64_t base, std::uint64_t bytes, const GuestAllocations::Lease& lease) {
     if (const auto found = state.imports.find(base); found != state.imports.end()) {
         if (found->second.bytes == bytes && sameRange(found->second, lease)) return &found->second;
@@ -530,12 +542,10 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     }
     const auto alignment = context.hostImportAlignment;
     if (alignment == 0 || base % alignment != 0 || bytes % alignment != 0 || state.failed.contains(base)) return nullptr;
-    // Pinned imports count against the driver's system memory budget; past it ordinary host
-    // allocations fail, so imports stop at APS5_HOST_IMPORT_MIB (default 6 GiB, which covers the
-    // registered memory of address-based shaders; past it they copy gigabytes per dispatch).
-    static const std::uint64_t budget = [] {
+    static const std::uint64_t budget = []() -> std::uint64_t {
         const char* value = std::getenv("APS5_HOST_IMPORT_MIB");
-        return (value ? std::strtoull(value, nullptr, 10) : 6144ull) << 20u;
+        if (value != nullptr) return std::strtoull(value, nullptr, 10) << 20u;
+        return std::max<std::uint64_t>(6144ull << 20u, physicalMemoryBytes() / 2);
     }();
     std::uint64_t live = 0;
     for (const auto& [address, existing] : state.imports) live += existing.bytes;
