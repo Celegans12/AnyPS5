@@ -630,7 +630,7 @@ void directImageFaultTests(const Context& context, const BdaTestAccess& access) 
     shader.bdaAbiVersion = Abi::Version;
     compiled.stage = ShaderRecompiler::ShaderStage::Fragment;
     reject([&] { ShaderResources resources(faultOnly, compiled); }, "compute resources require a compute shader");
-    reject([&] { ShaderResources resources(faultOnly, std::span<const CompiledShader>(&compiled, 1), ColorTarget{}, 0, 0); }, "deferred direct image requires a compute fault buffer");
+    reject([&] { ShaderResources resources(faultOnly, std::span<const CompiledShader>(&compiled, 1), ColorTarget{}, 0, 0, 0); }, "deferred direct image requires a compute fault buffer");
     compiled.stage = ShaderRecompiler::ShaderStage::Compute;
     alignas(64) std::array<std::uint32_t, 16> guest{};
     guest[0] = 123u;
