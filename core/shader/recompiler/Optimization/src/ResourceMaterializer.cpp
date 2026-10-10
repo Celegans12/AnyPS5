@@ -380,9 +380,13 @@ struct ColumnRecords {
     std::uint32_t fault = 0;
     bool narrowed = false;
     bool outside = false;
+    bool outsidePointer = false;
     std::vector<RecordState> states;
     std::vector<std::uint32_t> words;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> readRanges;
+    std::vector<std::uint64_t> addresses;
+    std::optional<std::uint32_t> outsideCode;
+    std::uint64_t outsideAddress = 0;
 };
 
 struct TableTrace {
@@ -530,6 +534,7 @@ private:
                 continue;
             }
             if (column.address || ImageTableAbi::ScalarBufferDword(relative + column.addend, column.offset, records.size).has_value()) records.outside = true;
+            else if (column.recordPointer.has_value()) records.outsidePointer = true;
         }
         records.narrowed = true;
         if (positions != 0u) tables.ranges.emplace_back(base, size);
@@ -542,12 +547,38 @@ private:
         return found->second;
     }
 
+    static void ReadRange(ColumnRecords& records, std::uint64_t address) {
+        if (!records.readRanges.empty() && address - records.readRanges.back().first == records.readRanges.back().second) {
+            records.readRanges.back().second += sizeof(std::uint32_t);
+        } else {
+            records.readRanges.emplace_back(address, sizeof(std::uint32_t));
+        }
+    }
+
+    std::uint32_t ReadPointedDescriptor(const TableColumn& column, ColumnRecords& records, std::uint64_t pointer, std::uint64_t& firstAddress) {
+        const auto& leaf = *column.recordPointer;
+        DescriptorValue value;
+        value.dwordCount = column.sampler ? 4u : 8u;
+        for (std::uint32_t dword = 0; dword < column.dwordCount; ++dword) {
+            const auto address = ImageTableAbi::ScalarAddressDword(pointer, leaf.offset, leaf.immediate + dword * 4u);
+            if (dword == 0u) firstAddress = address.value_or(ImageTableAbi::UnknownDescriptorAddress);
+            if (!address.has_value() || (*address & 3u) != 0u || !AddressAccessible(*address)) return ImageTableAbi::PoisonCode(static_cast<std::uint32_t>(PoisonReason::Unmapped));
+            value.dwords[dword] = Read(*address);
+            ReadRange(records, *address);
+        }
+        return WordsIndex(value);
+    }
+
     ColumnRecords& Column(std::uint32_t source) {
         if (const auto found = columns.find(source); found != columns.end()) {
             return found->second;
         }
         auto& records = columns[source];
         const auto& column = *plan.descriptorSources.at(source).tableColumn;
+        if (column.recordPointer.has_value()) {
+            records.outsideCode = ImageTableAbi::PoisonCode(static_cast<std::uint32_t>(PoisonReason::OutsideSnapshot));
+            records.outsideAddress = ImageTableAbi::UnknownDescriptorAddress;
+        }
         const bool active = source >= activeSources.size() || activeSources[source] != 0u;
         if (!active) {
             records.fault = ImageTableAbi::PoisonCode(static_cast<std::uint32_t>(PoisonReason::Inactive));
@@ -577,11 +608,32 @@ private:
             Narrow(column, records);
         }
         records.words.assign(records.keys, 0u);
+        if (column.recordPointer.has_value()) records.addresses.assign(records.keys, ImageTableAbi::UnknownDescriptorAddress);
         const auto end = records.base + records.size;
         std::uint64_t low = std::numeric_limits<std::uint64_t>::max();
         std::uint64_t high = 0;
         for (std::uint32_t record = 0; record < records.keys; record++) {
             if (records.states[record] != RecordState::Read) continue;
+            if (column.recordPointer.has_value()) {
+                std::uint64_t pointer = 0;
+                const auto offset = column.addend + record * column.stride;
+                for (std::uint32_t word = 0; word < 2u; ++word) {
+                    const auto position = ImageTableAbi::ScalarBufferDword(offset, column.offset + word * 4u, records.size);
+                    if (!position.has_value()) continue;
+                    const auto address = records.base + *position;
+                    if (!PageAccessible(address, records.base, end)) {
+                        records.states[record] = RecordState::Unmapped;
+                        break;
+                    }
+                    pointer |= static_cast<std::uint64_t>(Read(address)) << (word * 32u);
+                    ReadRange(records, address);
+                }
+                if (records.states[record] == RecordState::Read) {
+                    records.words[record] = ReadPointedDescriptor(column, records, pointer, records.addresses[record]);
+                    if ((records.words[record] & ImageTableAbi::PoisonFlag) != 0u) records.states[record] = RecordState::Unmapped;
+                }
+                continue;
+            }
             DescriptorValue value;
             value.dwordCount = column.sampler ? 4u : 8u;
             const auto offset = column.addend + record * column.stride;
@@ -612,6 +664,11 @@ private:
             }
             if (records.states[record] == RecordState::Read) records.words[record] = WordsIndex(value);
         }
+        if (column.recordPointer.has_value() && records.narrowed && !records.outsidePointer) {
+            records.outsideCode = ImageTableAbi::PoisonCode(static_cast<std::uint32_t>(PoisonReason::OutsideDomain));
+        } else if (column.recordPointer.has_value() && records.records < ImageTableAbi::KeyRecords(column.maxKey, column.stride)) {
+            records.outsideCode = ReadPointedDescriptor(column, records, 0u, records.outsideAddress);
+        }
         if (column.address && low < high) tables.ranges.emplace_back(low, high - low);
         std::sort(records.readRanges.begin(), records.readRanges.end());
         std::size_t ranges = 0;
@@ -624,6 +681,7 @@ private:
             }
         }
         records.readRanges.resize(ranges);
+        if (column.recordPointer.has_value()) tables.ranges.insert(tables.ranges.end(), records.readRanges.begin(), records.readRanges.end());
         return records;
     }
 
@@ -639,6 +697,9 @@ private:
         out.outside = records.outside;
         out.codes.assign(records.keys, 0u);
         out.readRanges = records.readRanges;
+        out.addresses = records.addresses;
+        out.outsideCode = records.outsideCode;
+        out.outsideAddress = records.outsideAddress;
         TableTrace trace{records.base, records.size, records.records, records.keys, 0u, records.narrowed};
         auto& counters = tableCounters();
         if (records.fault != 0u) counters.poison[records.fault & ~ImageTableAbi::PoisonFlag].fetch_add(1, std::memory_order_relaxed);
@@ -1017,13 +1078,22 @@ ResolvedImageTables ResourceMaterializer::ResolveImageTables(const ShaderInfo& i
         const auto mapStart = static_cast<std::uint32_t>(out.map.size());
         out.map[header + Abi::TableMapStart] = mapStart;
         out.map.resize(out.map.size() + column.keys, 0u);
+        if (column.outsideCode.has_value()) {
+            if (column.addresses.size() != column.keys) throw std::runtime_error("indirect image table snapshot has truncated addresses");
+            out.map[header + Abi::TableAddressesStart] = static_cast<std::uint32_t>(out.map.size());
+            for (const auto address : column.addresses) {
+                out.map.push_back(static_cast<std::uint32_t>(address));
+                out.map.push_back(static_cast<std::uint32_t>(address >> 32u));
+            }
+            out.map.push_back(static_cast<std::uint32_t>(column.outsideAddress));
+            out.map.push_back(static_cast<std::uint32_t>(column.outsideAddress >> 32u));
+        }
         std::unordered_map<std::uint32_t, std::uint32_t> records;
-        for (std::uint32_t key = 0; key < column.keys; key++) {
-            const auto code = column.codes[key];
+        const auto mapCode = [&](std::uint32_t code) {
             std::uint32_t mapped = Abi::NullCode;
             if ((code & Abi::PoisonFlag) != 0u) {
                 const auto reason = static_cast<PoisonReason>(code & ~Abi::PoisonFlag);
-                mapped = reason == PoisonReason::OutsideDomain ? Abi::PoisonCode(Abi::OutsideDomainPoison) : poison(resource, reason, nullptr);
+                mapped = reason == PoisonReason::OutsideDomain ? Abi::PoisonCode(Abi::OutsideDomainPoison) : reason == PoisonReason::OutsideSnapshot ? Abi::PoisonCode(Abi::OutsideSnapshotPoison) : poison(resource, reason, nullptr);
             } else if (out.map[header + Abi::TableFault] == 0u) {
                 const auto& words = tables.words.at(code);
                 if (sampler || !nullImageDescriptor(words)) {
@@ -1032,9 +1102,14 @@ ResolvedImageTables ResourceMaterializer::ResolveImageTables(const ShaderInfo& i
                     mapped = found->second;
                 }
             }
-            out.map[mapStart + key] = mapped;
+            return mapped;
+        };
+        for (std::uint32_t key = 0; key < column.keys; key++) {
+            out.map[mapStart + key] = mapCode(column.codes[key]);
         }
-        if (sampler && out.map[header + Abi::TableFault] == 0u) {
+        if (column.outsideCode.has_value()) {
+            out.map[header + Abi::TableOutsideCode] = mapCode(*column.outsideCode);
+        } else if (sampler && out.map[header + Abi::TableFault] == 0u) {
             DescriptorValue zero;
             zero.dwordCount = 4u;
             out.map[header + Abi::TableOutsideCode] = samplerRecord(resource, zero);

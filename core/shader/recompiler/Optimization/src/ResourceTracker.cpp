@@ -177,6 +177,7 @@ private:
         IrValue* offset = nullptr;
         std::vector<std::uint32_t> memory;
         std::vector<const IrValue*> reads;
+        std::vector<const IrValue*> intermediates;
     };
 
     void MakeSource(const IrValue& handle, std::uint32_t width, bool sampler, bool sampleAdjust, DescriptorSource& descriptor) {
@@ -383,6 +384,37 @@ private:
         return KeyDomain{sourceIndex, memory->offset, std::max(4u, 1u << zeros)};
     }
 
+    bool TryRecordPointer(IrValue& pointer, IrValue* leafOffset, std::uint32_t leafImmediate, TableColumnPlan& plan, TableColumn& column, IrValue*& key) {
+        std::uint32_t constantOffset = 0;
+        if (pointer.Opcode() != IrOpcode::GetAddressResource || pointer.ArgumentCount() != 2u || !immediateU32(leafOffset, constantOffset)) return false;
+        IrValue* heap = nullptr;
+        IrValue* offset = nullptr;
+        std::array<std::uint32_t, 2> indices{};
+        std::array<const IrValue*, 2> reads{};
+        for (std::uint32_t word = 0; word < 2u; ++word) {
+            const auto* read = pointer.Argument(word)->Resolve();
+            const auto* memory = ScalarReadMemory(*read, indices[word]);
+            if (memory == nullptr || !MemoryIndexBelongsTo(indices[word], *read)) return false;
+            if (word == 0u) {
+                heap = read->Argument(0)->Resolve();
+                offset = read->Argument(1)->Resolve();
+                column.offset = memory->offset;
+                if (column.offset > 0xfffffffbu) return false;
+            } else if (read->Argument(0)->Resolve() != heap || !EquivalentValue(m_program.Resources(), offset, read->Argument(1)) || memory->offset != column.offset + 4u) {
+                return false;
+            }
+            reads[word] = read;
+        }
+        DescriptorSource source;
+        if (!MatchAffineOffset(offset, key, column.stride, column.addend) || !MakeRuntimeSource(*heap, IrOpcode::GetBufferResource, 4u, column.heapSource, source)) return false;
+        column.recordPointer = RecordPointer{constantOffset, leafImmediate};
+        plan.offset = offset;
+        plan.memory.insert(plan.memory.end(), indices.begin(), indices.end());
+        plan.reads.insert(plan.reads.end(), reads.begin(), reads.end());
+        plan.intermediates.push_back(&pointer);
+        return true;
+    }
+
     bool TryMakeTableColumn(IrValue& handle, bool sampler, bool r128, TableColumnPlan& plan) {
         const auto expected = sampler ? IrOpcode::GetSamplerResource : IrOpcode::GetImageResource;
         const std::uint32_t width = sampler ? 4u : 8u;
@@ -440,31 +472,22 @@ private:
             }
         }
         IrValue* key = nullptr;
-        std::uint32_t stride = 0;
-        std::uint32_t addend = 0;
-        if (!MatchAffineOffset(offset, key, stride, addend)) {
-            return false;
-        }
-        DescriptorSource heapSource;
-        std::uint32_t heapIndex = 0;
-        if (!MakeRuntimeSource(*heapHandle, address ? IrOpcode::GetAddressResource : IrOpcode::GetBufferResource, address ? 2u : 4u, heapIndex, heapSource)) {
-            return false;
-        }
         TableColumn column;
-        column.heapSource = heapIndex;
-        column.stride = stride;
-        column.addend = addend;
-        column.offset = first;
+        if (!address || !TryRecordPointer(*heapHandle, offset, first, plan, column, key)) {
+            DescriptorSource heapSource;
+            if (!MatchAffineOffset(offset, key, column.stride, column.addend) || !MakeRuntimeSource(*heapHandle, address ? IrOpcode::GetAddressResource : IrOpcode::GetBufferResource, address ? 2u : 4u, column.heapSource, heapSource)) return false;
+            column.offset = first;
+            column.address = address;
+            plan.offset = offset;
+        }
         column.dwordCount = words;
         column.maxKey = possibleU32Bits(key);
         column.sampler = sampler;
-        column.address = address;
         column.keyDomain = MatchKeyDomain(key);
-        DescriptorSource columnSource = heapSource;
+        DescriptorSource columnSource = m_sources[column.heapSource];
         columnSource.tableColumn = column;
         plan.handle = &handle;
         plan.source = InternSource(columnSource);
-        plan.offset = offset;
         return true;
     }
 
@@ -928,12 +951,27 @@ private:
                 }
             }
         }
+        std::vector<const IrValue*> consumed;
+        for (const auto& plan : m_tableColumns) consumed.push_back(plan.handle);
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            const auto consume = [&](const IrValue* value) {
+                if (std::ranges::find(consumed, value) != consumed.end()) return;
+                if (std::ranges::all_of(value->Uses(), [&](const IrValue* user) { return std::ranges::find(consumed, user) != consumed.end(); })) {
+                    consumed.push_back(value);
+                    changed = true;
+                }
+            };
+            for (const auto& plan : m_tableColumns) {
+                for (const auto* read : plan.reads) consume(read);
+                for (const auto* value : plan.intermediates) consume(value);
+            }
+        }
         for (const auto& plan : m_tableColumns) {
             for (std::size_t index = 0; index < plan.reads.size(); index++) {
                 const IrValue* read = plan.reads[index];
-                const bool planned = std::ranges::all_of(read->Uses(), [&](const IrValue* user) {
-                    return FindTableColumn(*user) != nullptr;
-                });
+                const bool planned = std::ranges::find(consumed, read) != consumed.end();
                 if (planned && std::ranges::find(m_tablePlanningReads, read) == m_tablePlanningReads.end()) {
                     m_tablePlanningReads.push_back(read);
                     m_tablePlanningMemory.push_back(plan.memory[index]);

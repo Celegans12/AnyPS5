@@ -279,7 +279,10 @@ void BdaResources::CheckFault(std::uint64_t shaderAddress) const {
         const auto table = std::find_if(imageTables.begin(), imageTables.end(), [&](const ImageTableFaults& candidate) { return candidate.stage == report.stage; });
         const auto* tables = table != imageTables.end() ? &*table : imageTables.size() == 1 ? &imageTables.front() : nullptr;
         std::ostringstream message;
-        message << "image table: shader 0x" << std::hex << (tables != nullptr ? tables->shader : 0u) << std::dec << " stage " << report.stage << " pc 0x" << std::hex << report.instruction << " selected the descriptor at 0x" << report.address << std::dec;
+        message << "image table: shader 0x" << std::hex << (tables != nullptr ? tables->shader : 0u) << std::dec << " stage " << report.stage << " pc 0x" << std::hex << report.instruction;
+        if (report.address == ShaderRecompiler::ImageTableAbi::UnknownDescriptorAddress) message << " selected a descriptor whose address was not captured";
+        else message << " selected the descriptor at 0x" << report.address;
+        message << std::dec;
         if (tables != nullptr && report.bytes < tables->poison.size()) {
             const auto& poison = tables->poison[report.bytes];
             if (poison.dwordCount != 0) {

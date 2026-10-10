@@ -11,6 +11,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -44,6 +45,9 @@ struct ImageTableColumnSnapshot {
     bool outside = false;
     std::vector<std::uint32_t> codes;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> readRanges;
+    std::vector<std::uint64_t> addresses;
+    std::optional<std::uint32_t> outsideCode;
+    std::uint64_t outsideAddress = 0;
 
     bool operator==(const ImageTableColumnSnapshot& other) const = default;
 };

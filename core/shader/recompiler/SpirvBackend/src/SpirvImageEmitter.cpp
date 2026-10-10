@@ -1601,6 +1601,15 @@ TableWord EmitTableWord(SpirvValueEmitContext& ctx, const IrValue& inst, std::ui
     const auto outside = Select(state, u32, dword.inRange, ConstantU32(state, ImageTableAbi::PoisonCode(ImageTableAbi::OutsideSnapshotPoison)), outsideCode);
     TableWord word;
     word.code = Select(state, u32, Binary(state, spv::OpINotEqual, boolean, tableFault, ConstantU32(state, 0u)), tableFault, Select(state, u32, inMap, mapped, outside));
+    if (column.recordPointer.has_value()) {
+        const auto addresses = field(ImageTableAbi::TableAddressesStart);
+        const auto index = Binary(state, spv::OpIAdd, u32, addresses, Binary(state, spv::OpIMul, u32, Select(state, u32, inMap, record, keys), ConstantU32(state, 2u)));
+        const auto known = Binary(state, spv::OpLogicalOr, boolean, inMap, Unary(state, spv::OpLogicalNot, boolean, dword.inRange));
+        word.addressLow = Select(state, u32, known, LoadTableMap(state, index), ConstantU32(state, 0xffffffffu));
+        word.addressHigh = Select(state, u32, known, TableMapAt(state, index, 1u), ConstantU32(state, 0xffffffffu));
+        word.poisoned = Binary(state, spv::OpINotEqual, boolean, Binary(state, spv::OpBitwiseAnd, u32, word.code, ConstantU32(state, ImageTableAbi::PoisonFlag)), ConstantU32(state, 0u));
+        return word;
+    }
     const auto low = state.module.AllocateId();
     state.module.AddFunction(spv::OpIAddCarry, TypeU32Pair(state), low, baseLow, dword.byte);
     const auto carry = state.module.AllocateId();

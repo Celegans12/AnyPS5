@@ -1122,6 +1122,11 @@ std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapsh
             mix(base);
             mix(size);
         }
+        mix(table.addresses.size());
+        for (const auto address : table.addresses) mix(address);
+        mix(table.outsideCode.has_value());
+        if (table.outsideCode.has_value()) mix(*table.outsideCode);
+        mix(table.outsideAddress);
     }
     mixDescriptors(tables.words);
     mix(tables.ranges.size());

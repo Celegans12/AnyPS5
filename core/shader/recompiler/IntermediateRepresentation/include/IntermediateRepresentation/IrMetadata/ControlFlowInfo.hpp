@@ -27,6 +27,13 @@ struct KeyDomain {
     bool operator==(const KeyDomain& other) const = default;
 };
 
+struct RecordPointer {
+    std::uint32_t offset = 0;
+    std::uint32_t immediate = 0;
+
+    bool operator==(const RecordPointer& other) const = default;
+};
+
 struct TableColumn {
     std::uint32_t heapSource = 0;
     std::uint32_t stride = 0;
@@ -37,6 +44,7 @@ struct TableColumn {
     bool sampler = false;
     bool address = false;
     std::optional<KeyDomain> keyDomain;
+    std::optional<RecordPointer> recordPointer;
 
     bool operator==(const TableColumn& other) const = default;
 };
