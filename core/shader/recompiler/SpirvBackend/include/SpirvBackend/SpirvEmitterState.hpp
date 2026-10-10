@@ -104,6 +104,7 @@ struct SpirvEmitterState {
     std::uint32_t storageBufferVariable = 0;
     std::uint32_t storageBufferU64Variable = 0;
     std::uint32_t storageBufferCoherentVariable = 0;
+    std::uint32_t storageBufferU8Variable = 0;
     std::vector<std::uint32_t> memoryByteOffsets;
     std::map<std::array<std::uint32_t, 6>, std::uint32_t> formattedBufferFunctions;
     std::map<std::array<std::uint32_t, 6>, std::uint32_t> formattedGpuBufferFunctions;
