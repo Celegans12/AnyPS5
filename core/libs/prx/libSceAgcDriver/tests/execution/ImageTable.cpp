@@ -1,6 +1,8 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
 #include "Recompiler.hpp"
 #include "ImageTableAbi.hpp"
 #include "VulkanTestDevice.hpp"
@@ -60,6 +62,9 @@ alignas(256) std::array<std::uint32_t, Records * Stride / 4> Table{};
 alignas(256) std::array<std::uint32_t, 64> Keys{};
 alignas(256) std::array<std::uint32_t, MaxGroups * 128 * 4> Output{};
 alignas(256) std::array<std::uint32_t, 32> Srt{};
+constexpr std::uint32_t PaletteOffset = 0x40;
+constexpr std::uint32_t PaletteBytes = PaletteOffset + 256u * 32u;
+std::vector<std::uint32_t> Root(0x100000u);
 
 alignas(256) constexpr std::array<std::uint32_t, 28> TableCode{
     0xf4080100u, 0xfa000000u, 0xf4080200u, 0xfa000010u, 0xf4080700u, 0xfa000020u, 0x8f108202u, 0xf4200444u,
@@ -172,6 +177,53 @@ alignas(256) constexpr std::array<std::uint32_t, 17> StoreTableCutCode{
     0xbf810000u,
 };
 
+alignas(256) constexpr std::array<std::uint32_t, 30> PointerCode{
+    0xf4080200u, 0xfa000000u, 0xf4080700u, 0xfa000010u, 0xf4080800u, 0xfa000020u, 0x8f108202u, 0xf4200444u,
+    0x20000000u, 0x8711ff11u, 0x000000ffu, 0x8f128511u, 0xf40c0900u, 0x24000040u, 0x360200bfu, 0x7e020d01u,
+    0x060202f0u, 0x100202ffu, 0x3c800000u, 0x7e0402ffu, 0x3e000000u, 0xf09c0f08u, 0x01090401u, 0x7e120202u,
+    0x34101286u, 0x4a101100u, 0x34101084u, 0xe0781000u, 0x80070408u, 0xbf810000u,
+};
+
+alignas(256) constexpr std::array<std::uint32_t, 32> LoadedPointerCode{
+    0xf4080200u, 0xfa000000u, 0xf4080700u, 0xfa000010u, 0xf4080800u, 0xfa000020u, 0xf4040500u, 0xfa000030u,
+    0x8f108202u, 0xf4200444u, 0x20000000u, 0x8711ff11u, 0x000000ffu, 0x8f128511u, 0xf40c090au, 0x241fff00u,
+    0x360200bfu, 0x7e020d01u, 0x060202f0u, 0x100202ffu, 0x3c800000u, 0x7e0402ffu, 0x3e000000u, 0xf09c0f08u,
+    0x01090401u, 0x7e120202u, 0x34101286u, 0x4a101100u, 0x34101084u, 0xe0781000u, 0x80070408u, 0xbf810000u,
+};
+
+alignas(256) constexpr std::array<std::uint32_t, 38> PointerStorageWriteCode{
+    0xf4080200u, 0xfa000000u, 0xf4080700u, 0xfa000010u, 0xf4080800u, 0xfa000020u, 0xf4040500u, 0xfa000030u,
+    0x8f108202u, 0xf4200444u, 0x20000000u, 0x8711ff11u, 0x000000ffu, 0x8f128511u, 0xf40c090au, 0x241fff00u,
+    0x360200bfu, 0x7e020d01u, 0x060202f0u, 0x100202ffu, 0x3c800000u, 0x7e0402ffu, 0x3e000000u, 0xf09c0f08u,
+    0x01090401u, 0x7e120202u, 0x34101286u, 0x4a101100u, 0x34101084u, 0xe0781000u, 0x80070408u,
+    0xf40c0b00u, 0xfa000040u, 0x7e3c0300u, 0x7e3e0280u, 0xf0201f08u, 0x000b041eu, 0xbf810000u,
+};
+
+alignas(256) constexpr std::array<std::uint32_t, 52> PointerStorageIsolationCode{
+    0xf4080200u, 0xfa000000u, 0xf4080700u, 0xfa000010u, 0xf4080800u, 0xfa000020u, 0xf4040500u, 0xfa000030u,
+    0x8f108202u, 0xf4200444u, 0x20000000u, 0x8711ff11u, 0x000000ffu, 0x8f128511u, 0xf40c090au, 0x241fff00u,
+    0x360200bfu, 0x7e020d01u, 0x060202f0u, 0x100202ffu, 0x3c800000u, 0x7e0402ffu, 0x3e000000u,
+    0x7e120202u, 0x34101286u, 0x4a101100u, 0x34101084u, 0xf4000600u, 0xfa000060u, 0x7da80018u,
+    0xf09c0f08u, 0x01090401u, 0xe0781000u, 0x80070408u, 0xbefe04c1u,
+    0xf4040500u, 0xfa000038u, 0xf40c090au, 0x241fff00u, 0x7da60018u,
+    0xf09c0f08u, 0x01090401u, 0xe0781000u, 0x80070408u, 0xbefe04c1u,
+    0xf40c0b00u, 0xfa000040u, 0x7e3c0300u, 0x7e3e0280u, 0xf0201f08u, 0x000b041eu, 0xbf810000u,
+};
+
+alignas(256) constexpr std::array<std::uint32_t, 28> UnboundedPointerCode{
+    0xf4080200u, 0xfa000000u, 0xf4080700u, 0xfa000010u, 0xf4080800u, 0xfa000020u, 0x8f108202u, 0xf4200444u,
+    0x20000000u, 0x8f128511u, 0xf40c0900u, 0x24000040u, 0x360200bfu, 0x7e020d01u, 0x060202f0u, 0x100202ffu,
+    0x3c800000u, 0x7e0402ffu, 0x3e000000u, 0xf09c0f08u, 0x01090401u, 0x7e120202u, 0x34101286u, 0x4a101100u,
+    0x34101084u, 0xe0781000u, 0x80070408u, 0xbf810000u,
+};
+
+alignas(256) constexpr std::array<std::uint32_t, 25> ReadPointerCode{
+    0xf4080200u, 0xfa000000u, 0xf4080700u, 0xfa000010u, 0xf4080800u, 0xfa000020u, 0x8f108202u, 0xf4200444u,
+    0x20000000u, 0x8711ff11u, 0x000000ffu, 0x8f128511u, 0xf40c0900u, 0x24000040u, 0x360200bfu, 0x7e040280u,
+    0xf0000f08u, 0x00090401u, 0x7e120202u, 0x34101286u, 0x4a101100u, 0x34101084u, 0xe0781000u, 0x80070408u,
+    0xbf810000u,
+};
+
 constexpr std::array<std::uint32_t, 4> PointClamp{0x92u, (4u * 256u) << 12u, 0u, 0u};
 constexpr std::array<std::uint32_t, 4> LinearWrap{0u, (4u * 256u) << 12u, (1u << 20u) | (1u << 22u), 0u};
 constexpr std::array<std::uint32_t, 4> PointWrap{0u, (4u * 256u) << 12u, 1u << 24u, 0u};
@@ -258,6 +310,7 @@ struct Outcome {
     bool cacheable = false;
     std::vector<std::array<std::uint32_t, 4>> samplers;
     std::vector<std::array<std::uint32_t, 4>> samplerTable;
+    std::vector<std::vector<std::pair<std::uint64_t, std::uint64_t>>> imageTableReadRanges;
 };
 
 std::vector<std::array<std::uint32_t, 4>> SamplerWords(const std::vector<std::uint32_t>& words) {
@@ -266,24 +319,10 @@ std::vector<std::array<std::uint32_t, 4>> SamplerWords(const std::vector<std::ui
     return result;
 }
 
-template <std::size_t CodeWords>
-Outcome Run(AgcDriver::VulkanDevice& device, const std::array<std::uint32_t, CodeWords>& code, std::uint32_t groups, std::uint32_t threads, std::uint32_t waveSize, bool outputIntoTable = false) {
-    const auto srtAddress = reinterpret_cast<std::uintptr_t>(Srt.data());
-    const std::array<std::uint32_t, 2> userData{static_cast<std::uint32_t>(srtAddress), static_cast<std::uint32_t>(srtAddress >> 32u)};
-    const auto table = Buffer(Table.data(), static_cast<std::uint32_t>(sizeof(Table)));
-    const auto keys = Buffer(Keys.data(), static_cast<std::uint32_t>(sizeof(Keys)));
-    const auto output = outputIntoTable ? Buffer(Table.data(), static_cast<std::uint32_t>(sizeof(Table))) : Buffer(Output.data(), static_cast<std::uint32_t>(sizeof(Output)));
-    std::copy(table.begin(), table.end(), Srt.begin());
-    std::copy(keys.begin(), keys.end(), Srt.begin() + 4);
-    std::copy(output.begin(), output.end(), Srt.begin() + 8);
+Outcome Execute(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> span, const void* root, std::span<const ShaderRecompiler::MemoryRegion> memory, std::uint32_t groups, std::uint32_t threads, std::uint32_t waveSize) {
+    const auto rootAddress = reinterpret_cast<std::uintptr_t>(root);
+    const std::array<std::uint32_t, 2> userData{static_cast<std::uint32_t>(rootAddress), static_cast<std::uint32_t>(rootAddress >> 32u)};
     std::fill(Output.begin(), Output.end(), 0xdeadbeefu);
-    const std::span<const std::uint32_t> span(code);
-    const std::array<ShaderRecompiler::MemoryRegion, 4> memory{{
-        {reinterpret_cast<std::uintptr_t>(span.data()), std::as_bytes(span)},
-        {srtAddress, std::as_bytes(std::span(Srt))},
-        {reinterpret_cast<std::uintptr_t>(Table.data()), std::as_bytes(std::span(Table))},
-        {reinterpret_cast<std::uintptr_t>(Keys.data()), std::as_bytes(std::span(Keys))},
-    }};
     const ShaderRecompiler::ShaderComputeStageInfo compute{{threads, 1, 1}, 0u, {true, false, false}, false, 1};
     ShaderRecompiler::RecompileRequest request{
         {ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(span.data()), span, 0, {}},
@@ -298,6 +337,7 @@ Outcome Run(AgcDriver::VulkanDevice& device, const std::array<std::uint32_t, Cod
     outcome.imageTableFaults = result.imageTableFaults;
     outcome.poisonedSrtReads = result.poisonedSrtReads;
     outcome.cacheable = AgcDriver::DriverDetail::CacheableResult(result);
+    outcome.imageTableReadRanges = result.imageTableReadRanges;
     for (const auto& binding : result.bindings) {
         if (binding.role == ShaderRecompiler::DescriptorRole::ImageTable) outcome.imageTableCount = binding.count;
         if (binding.role == ShaderRecompiler::DescriptorRole::GuestSamplers) outcome.samplers = SamplerWords(binding.guestDescriptor);
@@ -314,6 +354,50 @@ Outcome Run(AgcDriver::VulkanDevice& device, const std::array<std::uint32_t, Cod
     outcome.log = capture.Finish();
     outcome.words.assign(Output.begin(), Output.begin() + groups * threads * 4u);
     return outcome;
+}
+
+template <std::size_t CodeWords>
+Outcome Run(AgcDriver::VulkanDevice& device, const std::array<std::uint32_t, CodeWords>& code, std::uint32_t groups, std::uint32_t threads, std::uint32_t waveSize, bool outputIntoTable = false) {
+    const auto table = Buffer(Table.data(), static_cast<std::uint32_t>(sizeof(Table)));
+    const auto keys = Buffer(Keys.data(), static_cast<std::uint32_t>(sizeof(Keys)));
+    const auto output = outputIntoTable ? Buffer(Table.data(), static_cast<std::uint32_t>(sizeof(Table))) : Buffer(Output.data(), static_cast<std::uint32_t>(sizeof(Output)));
+    std::copy(table.begin(), table.end(), Srt.begin());
+    std::copy(keys.begin(), keys.end(), Srt.begin() + 4);
+    std::copy(output.begin(), output.end(), Srt.begin() + 8);
+    const std::span<const std::uint32_t> span(code);
+    const std::array<ShaderRecompiler::MemoryRegion, 4> memory{{
+        {reinterpret_cast<std::uintptr_t>(span.data()), std::as_bytes(span)},
+        {reinterpret_cast<std::uintptr_t>(Srt.data()), std::as_bytes(std::span(Srt))},
+        {reinterpret_cast<std::uintptr_t>(Table.data()), std::as_bytes(std::span(Table))},
+        {reinterpret_cast<std::uintptr_t>(Keys.data()), std::as_bytes(std::span(Keys))},
+    }};
+    return Execute(device, span, Srt.data(), memory, groups, threads, waveSize);
+}
+
+template <std::size_t CodeWords>
+Outcome RunPointer(AgcDriver::VulkanDevice& device, const std::array<std::uint32_t, CodeWords>& code, std::uint32_t groups) {
+    auto* root = Root.data();
+    const auto palette = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(root)) + PaletteOffset + 0x100u;
+    const auto keys = Buffer(Keys.data(), static_cast<std::uint32_t>(sizeof(Keys)));
+    const auto output = Buffer(Output.data(), static_cast<std::uint32_t>(sizeof(Output)));
+    std::copy(keys.begin(), keys.end(), root);
+    std::copy(output.begin(), output.end(), root + 4);
+    std::copy(PointClamp.begin(), PointClamp.end(), root + 8);
+    root[12] = static_cast<std::uint32_t>(palette);
+    root[13] = static_cast<std::uint32_t>(palette >> 32u);
+    const std::span<const std::uint32_t> span(code);
+    const std::array<ShaderRecompiler::MemoryRegion, 3> memory{{
+        {reinterpret_cast<std::uintptr_t>(span.data()), std::as_bytes(span)},
+        {reinterpret_cast<std::uintptr_t>(root), std::as_bytes(std::span(root, PaletteBytes / 4u))},
+        {reinterpret_cast<std::uintptr_t>(Keys.data()), std::as_bytes(std::span(Keys))},
+    }};
+    return Execute(device, span, root, memory, groups, Lanes, 64);
+}
+
+void SetEntry(std::uint32_t entry, const std::array<std::uint32_t, 4>& image) {
+    auto* words = Root.data() + (PaletteOffset + entry * 32u) / 4u;
+    std::fill(words, words + 8, 0u);
+    std::copy(image.begin(), image.end(), words);
 }
 
 template <std::size_t CodeWords>
@@ -807,6 +891,148 @@ void RunStoreTests(AgcDriver::VulkanDevice& device) {
     Require(UintTexels == saved, "image table store: an unsupported store reached the image");
 }
 
+void RunPointerTests(AgcDriver::VulkanDevice& device) {
+    const auto floatImage = Image(FloatTexels.data(), Format32Float);
+    const auto uintImage = Image(UintTexels.data(), Format32UInt);
+    const auto sintImage = Image(SintTexels.data(), Format32SInt);
+    const std::array<std::uint32_t, 4> invalid{0x1234u, 0x5678u, 0x9abcu, 0x0000ffacu};
+    std::fill(Root.begin(), Root.end(), 0u);
+    SetEntry(0, floatImage);
+    SetEntry(1, uintImage);
+    SetEntry(2, sintImage);
+    SetEntry(7, invalid);
+    SetEntry(255, uintImage);
+    const std::array<std::uint32_t, 6> keys{0u, 1u, 2u, 3u, 0x1ffu, 0x102u};
+    Keys = {};
+    std::copy(keys.begin(), keys.end(), Keys.begin());
+    const auto palette = RunPointer(device, PointerCode, 6);
+    Require(!Faulted(palette), "pointer image table: valid entries faulted:\n" + palette.log);
+    for (std::uint32_t group = 0; group < keys.size(); ++group) {
+        const auto* words = Root.data() + (PaletteOffset + (keys[group] & 0xffu) * 32u) / 4u;
+        if (std::all_of(words, words + 8, [](std::uint32_t word) { return word == 0u; })) {
+            const auto zeros = Group(palette, group);
+            Require(std::all_of(zeros.begin(), zeros.end(), [](std::uint32_t word) { return word == 0u; }), "pointer image table: a null entry did not sample zeros");
+            continue;
+        }
+        if (keys[group] == 0x1ffu) continue;
+        const auto control = RunDirect(device, PointClamp, {words[0], words[1], words[2], words[3]});
+        Require(Group(palette, group) == Group(control, 0), "pointer image table: key " + Hex(keys[group]) + " differs from the direct binding of its masked entry");
+    }
+    RequireRed(palette, 0, Lanes, [](std::uint32_t x) { return std::bit_cast<std::uint32_t>(FloatTexels[x]); }, "pointer image table float texels");
+    RequireRed(palette, 2, Lanes, [](std::uint32_t x) { return static_cast<std::uint32_t>(SintTexels[x]); }, "pointer image table sint texels");
+    RequireRed(palette, 4, Lanes, [](std::uint32_t x) { return UintTexels[x]; }, "pointer image table key 0x1ff masked to entry 255");
+
+    const auto loaded = RunPointer(device, LoadedPointerCode, 6);
+    Require(!Faulted(loaded) && loaded.words == palette.words, "pointer image table: a base loaded from the SRT with a negative immediate differs:\n" + loaded.log);
+    Require(loaded.artifactId != 0u && palette.artifactId != loaded.artifactId, "pointer image table: two programs share an artifact");
+
+    Keys[0] = 7;
+    const auto selected = RunPointer(device, PointerCode, 1);
+    char address[32];
+    std::snprintf(address, sizeof(address), "0x%llx", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(Root.data()) + PaletteOffset + 7u * 32u));
+    Require(Faulted(selected) && selected.log.find("not an image") != std::string::npos && selected.log.find(address) != std::string::npos && selected.log.find("00001234") != std::string::npos, "pointer image table: an invalid entry did not report its address, words and reason:\n" + selected.log);
+    Require(Zeros(selected), "pointer image table: a faulting access did not sample zeros");
+    Require(selected.variantId == palette.variantId, "pointer image table: other keys specialized another module");
+
+    Keys[0] = 2;
+    Keys[1] = 0x08000000u;
+    const auto unbounded = RunPointer(device, UnboundedPointerCode, 2);
+    Require(!Faulted(unbounded) && Group(unbounded, 0) == Group(palette, 2) && Group(unbounded, 1) == Group(palette, 0), "pointer image table: an unmasked key, or one whose offset wraps to entry 0, sampled the wrong entry:\n" + unbounded.log);
+    Keys[0] = 300;
+    const auto past = RunPointer(device, UnboundedPointerCode, 1);
+    Require(Faulted(past) && past.log.find("unmapped") != std::string::npos, "pointer image table: an entry past the captured palette did not fault as unmapped:\n" + past.log);
+    Keys[0] = 0x10000u;
+    const auto capped = RunPointer(device, UnboundedPointerCode, 1);
+    Require(Faulted(capped) && capped.log.find("outside the snapshot") != std::string::npos, "pointer image table: a key past the key cap did not fault as outside the snapshot:\n" + capped.log);
+
+    const std::array<std::uint32_t, 5> readKeys{0u, 1u, 2u, 3u, 0x1ffu};
+    Keys = {};
+    std::copy(readKeys.begin(), readKeys.end(), Keys.begin());
+    const auto reads = RunPointer(device, ReadPointerCode, 5);
+    Require(!Faulted(reads), "pointer image table read: valid entries faulted:\n" + reads.log);
+    for (std::uint32_t group = 0; group < readKeys.size(); ++group) {
+        const auto* words = Root.data() + (PaletteOffset + (readKeys[group] & 0xffu) * 32u) / 4u;
+        if (std::all_of(words, words + 8, [](std::uint32_t word) { return word == 0u; })) {
+            const auto zeros = Group(reads, group);
+            Require(std::all_of(zeros.begin(), zeros.end(), [](std::uint32_t word) { return word == 0u; }), "pointer image table read: a null entry did not read zeros");
+            continue;
+        }
+        const auto control = RunDirectCode(device, ReadDirectCode, PointClamp, std::span<const std::uint32_t>(words, 4));
+        Require(Group(reads, group) == Group(control, 0), "pointer image table read: key " + Hex(readKeys[group]) + " differs from the direct binding of its masked entry");
+    }
+    RequireRed(reads, 4, Lanes, [](std::uint32_t x) { return UintTexels[x]; }, "pointer image table read: key 0x1ff masked to entry 255");
+}
+
+void RunPointerStorageWriteTests(AgcDriver::VulkanDevice& device) {
+    alignas(256) static std::array<std::uint32_t, 256u * 8u> records{};
+    alignas(256) static std::array<std::uint32_t, 256u * 8u> otherRecords{};
+    alignas(256) static std::array<float, Width * Height> isolatedTexels{};
+    struct Registration {
+        void* data;
+        Registration(void* data, std::size_t bytes) : data(data) { GuestAllocations::Mutation().Add(data, bytes, true, true, true); }
+        ~Registration() { GuestAllocations::Mutation().Remove(data); }
+    } registeredRecords(records.data(), sizeof(records)), registeredOtherTexels(OtherFloatTexels.data(), sizeof(OtherFloatTexels));
+    for (std::uint32_t x = 0; x < isolatedTexels.size(); ++x) isolatedTexels[x] = 1024.0f + static_cast<float>(x);
+    const auto run = [&](std::span<const std::uint32_t> code, bool alias, std::uint32_t waveSize = 64u, std::uint32_t selectedLanes = 0u) {
+        records.fill(0u);
+        otherRecords.fill(0u);
+        const auto sampled = Image(FloatTexels.data(), Format32Float);
+        std::copy(sampled.begin(), sampled.end(), records.begin());
+        const auto isolated = Image(isolatedTexels.data(), Format32Float);
+        std::copy(isolated.begin(), isolated.end(), otherRecords.begin());
+        const auto keys = Buffer(Keys.data(), static_cast<std::uint32_t>(sizeof(Keys)));
+        const auto output = Buffer(Output.data(), static_cast<std::uint32_t>(sizeof(Output)));
+        const auto* storageData = alias ? static_cast<const void*>(records.data()) : OtherFloatTexels.data();
+        const auto storage = Image(storageData, Format32Float);
+        Srt.fill(0u);
+        std::copy(keys.begin(), keys.end(), Srt.begin());
+        std::copy(output.begin(), output.end(), Srt.begin() + 4);
+        std::copy(PointClamp.begin(), PointClamp.end(), Srt.begin() + 8);
+        const auto pointer = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(records.data())) + 0x100u;
+        Srt[12] = static_cast<std::uint32_t>(pointer);
+        Srt[13] = static_cast<std::uint32_t>(pointer >> 32u);
+        const auto otherPointer = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(otherRecords.data())) + 0x100u;
+        Srt[14] = static_cast<std::uint32_t>(otherPointer);
+        Srt[15] = static_cast<std::uint32_t>(otherPointer >> 32u);
+        std::copy(storage.begin(), storage.end(), Srt.begin() + 16);
+        Srt[24] = selectedLanes;
+        Keys.fill(0u);
+        const std::array<ShaderRecompiler::MemoryRegion, 5> memory{{
+            {reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)},
+            {reinterpret_cast<std::uintptr_t>(Srt.data()), std::as_bytes(std::span(Srt))},
+            {reinterpret_cast<std::uintptr_t>(records.data()), std::as_bytes(std::span(records))},
+            {reinterpret_cast<std::uintptr_t>(otherRecords.data()), std::as_bytes(std::span(otherRecords))},
+            {reinterpret_cast<std::uintptr_t>(Keys.data()), std::as_bytes(std::span(Keys))},
+        }};
+        const auto outcome = Execute(device, code, Srt.data(), memory, 1u, waveSize, waveSize);
+        AgcDriver::Graphics::StorageTexture::FlushPending(reinterpret_cast<std::uintptr_t>(storageData), sizeof(FloatTexels), nullptr, "test");
+        device.WaitIdle();
+        return outcome;
+    };
+    const auto separate = run(PointerStorageWriteCode, false);
+    Require(!Faulted(separate), "pointer image table: a separate storage image write faulted:\n" + separate.log);
+    RequireRed(separate, 0, Lanes, [](std::uint32_t x) { return std::bit_cast<std::uint32_t>(FloatTexels[x]); }, "pointer image table with a separate storage image write");
+    const auto aliased = run(PointerStorageWriteCode, true);
+    Require(Faulted(aliased) && aliased.log.find("is written by its own dispatch") != std::string::npos, "pointer image table: an overlapping storage image write did not fault:\n" + aliased.log);
+    Require(Zeros(aliased), "pointer image table: an overlapping storage image write did not suppress the sampled value");
+    const auto isolated = run(PointerStorageIsolationCode, true, 32u);
+    Require(isolated.imageTableReadRanges.size() == 2u && !isolated.imageTableReadRanges[0].empty() && !isolated.imageTableReadRanges[1].empty(), "pointer image table isolation: both tables were not captured");
+    for (const auto& [first, firstBytes] : isolated.imageTableReadRanges[0]) {
+        for (const auto& [second, secondBytes] : isolated.imageTableReadRanges[1]) {
+            Require(first <= second ? second - first >= firstBytes : first - second >= secondBytes, "pointer image table isolation: captured table ranges overlap");
+        }
+    }
+    Require(!Faulted(isolated), "pointer image table isolation: writing the table selected with EXEC clear faulted the other table:\n" + isolated.log);
+    RequireRed(isolated, 0, 32u, [](std::uint32_t x) { return std::bit_cast<std::uint32_t>(isolatedTexels[x]); }, "pointer image table isolation");
+    for (std::uint32_t x = 0; x < 32u; ++x) {
+        Require(records[x] == std::bit_cast<std::uint32_t>(isolatedTexels[x]), "pointer image table isolation: the storage image did not write the inactive table");
+    }
+    const auto selected = run(PointerStorageIsolationCode, true, 32u, 32u);
+    Require(selected.imageTableReadRanges == isolated.imageTableReadRanges, "pointer image table isolation: selecting the written table changed the captured ranges");
+    Require(Faulted(selected) && selected.log.find("is written by its own dispatch") != std::string::npos, "pointer image table isolation: selecting the written table did not fault:\n" + selected.log);
+    Require(Zeros(selected), "pointer image table isolation: selecting the written table did not suppress the sampled value");
+}
+
 std::array<std::uint32_t, 4> VertexBuffer(const void* data, std::uint32_t stride, std::uint32_t count) {
     const auto address = reinterpret_cast<std::uintptr_t>(data);
     return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu) | (stride << 16u), count, 0x01016facu};
@@ -934,6 +1160,8 @@ int main() {
         RunGuardedTableTests(*device);
         RunModeTests(*device);
         RunStoreTests(*device);
+        RunPointerTests(*device);
+        RunPointerStorageWriteTests(*device);
         RunGraphicsTests(*device);
         std::puts("image table tests passed");
         return 0;

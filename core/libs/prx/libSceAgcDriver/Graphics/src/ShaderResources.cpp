@@ -3649,7 +3649,7 @@ ImageTableReuseCounts ImageTableReuses() {
 void ShaderResources::finishImageTables() {
     namespace Abi = ShaderRecompiler::ImageTableAbi;
     if (tableStages.empty()) return;
-    const auto overlaps = [](std::uint64_t base, std::uint64_t size, std::uint64_t address, std::uint64_t bytes) { return size != 0 && bytes != 0 && address < base + size && base < address + bytes; };
+    const auto overlaps = [](std::uint64_t base, std::uint64_t size, std::uint64_t address, std::uint64_t bytes) { return size != 0 && bytes != 0 && (base <= address ? address - base < size : base - address < bytes); };
     std::vector<BdaResources::ImageTableFaults> faults;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
     for (auto& table : tableStages) {
@@ -3660,9 +3660,15 @@ void ShaderResources::finishImageTables() {
             if (map[header + Abi::TableFault] != 0u) continue;
             const auto base = static_cast<std::uint64_t>(map[header + Abi::TableBaseLow]) | (static_cast<std::uint64_t>(map[header + Abi::TableBaseHigh]) << 32u);
             const auto size = static_cast<std::uint64_t>(map[header + Abi::TableSizeLow]) | (static_cast<std::uint64_t>(map[header + Abi::TableSizeHigh]) << 32u);
+            const auto tableOverlaps = [&](std::uint64_t address, std::uint64_t bytes) {
+                if (overlaps(base, size, address, bytes)) return true;
+                if (index >= table.program->imageTableReadRanges.size()) return false;
+                const auto& reads = table.program->imageTableReadRanges[index];
+                return std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return overlaps(range.first, range.second, address, bytes); });
+            };
             bool written = false;
-            for (const auto& allocation : allocations) written = written || (allocation.guest && allocation.written && overlaps(base, size, allocation.address, allocation.size));
-            for (std::size_t image = 0; image < storageTextures.size(); ++image) written = written || (storageWritten[image] && storageTextures[image] != nullptr && overlaps(base, size, storageTextures[image]->Descriptor().baseAddress, storageTextures[image]->GuestBytes()));
+            for (const auto& allocation : allocations) written = written || (allocation.guest && allocation.written && tableOverlaps(allocation.address, allocation.size));
+            for (std::size_t image = 0; image < storageTextures.size(); ++image) written = written || (storageWritten[image] && storageTextures[image] != nullptr && tableOverlaps(storageTextures[image]->Descriptor().baseAddress, storageTextures[image]->GuestBytes()));
             if (!written) continue;
             ShaderRecompiler::ImageTableEntryPoison poison{};
             poison.resource = index;

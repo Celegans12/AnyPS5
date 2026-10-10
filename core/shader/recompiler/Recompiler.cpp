@@ -772,6 +772,8 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         result.imageTablePoison.reserve(tables.poison.size());
         for (const auto& poison : tables.poison) result.imageTablePoison.push_back({poison.words, poison.dwordCount, poison.resource, static_cast<std::uint32_t>(poison.reason)});
         result.imageTableRanges = snapshot.tables.ranges;
+        result.imageTableReadRanges.reserve(snapshot.tables.tables.size());
+        for (const auto& table : snapshot.tables.tables) result.imageTableReadRanges.push_back(table.readRanges);
         result.imageTableShader = snapshot.tables.shader;
         result.imageTableFaults = tables.faults;
     }
@@ -929,6 +931,11 @@ std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapsh
         mix(table.fault);
         mix(table.outside ? 1u : 0u);
         mixWords(table.codes);
+        mix(table.readRanges.size());
+        for (const auto& [base, size] : table.readRanges) {
+            mix(base);
+            mix(size);
+        }
     }
     mixDescriptors(tables.words);
     mix(tables.ranges.size());
