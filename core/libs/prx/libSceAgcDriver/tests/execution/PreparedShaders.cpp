@@ -1,5 +1,6 @@
 #include "VulkanTestDevice.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include "RdnaDecoder/RdnaInstruction.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
@@ -535,8 +536,36 @@ void DeferredRegistration() {
     ExpectFailure([] { AgcDriverShutdown_nid_postfix(); }, "not statically resolvable");
 }
 
-void DeferredUndecodableRegistration() {
+void AperturePreparationClassification(AgcDriver::VulkanDevice& device) {
+    using namespace ShaderRecompiler;
+    std::array<std::uint32_t, 2> code{0xbeea04ebu, 0xbf810000u};
+    RecompileRequest request{};
+    request.shader = {ShaderStage::Compute, 0x35800u, code, 0, {}};
+    request.context.waveSize = 32;
+    request.context.compute = ShaderComputeStageInfo{{1, 1, 1}, 0, {false, false, false}, false, 1, {}};
+    request.target = device.ComputeTarget(32);
+    request.layout.pushConstantSizeBytes = 128;
+    request.useCache = false;
+    for (std::uint32_t source = 234u; source <= 238u; ++source) {
+        code[0] = 0xbeea0400u | source;
+        bool rejected = false;
+        try { static_cast<void>(GetResourcePlan(request)); }
+        catch (const UnsupportedInstructionError& error) {
+            Require(source >= 235u, "a reserved scalar source became deferrable");
+            Require(std::string(error.what()).find("unsupported scalar source operand code " + std::to_string(source)) != std::string::npos, "aperture preparation lost its scalar source diagnostic");
+            rejected = true;
+        } catch (const std::invalid_argument& error) {
+            Require(source == 234u, "an aperture scalar source remained a malformed-input error");
+            Require(std::string(error.what()).find("unsupported scalar source operand code 234") != std::string::npos, "reserved scalar source lost its diagnostic");
+            rejected = true;
+        }
+        Require(rejected, "an unsupported scalar source compiled successfully");
+    }
+}
+
+void DeferredUndecodableRegistration(bool aperture = false) {
     alignas(256) std::array<std::uint32_t, 3> code{0xbe842104u, 0xf1949f05u, 0x00060018u};
+    if (aperture) code = {0xbeea04ebu, 0xbf810000u, 0xbf810000u};
     struct Header {
         Shader shader{};
         std::array<ShaderRegister, 8> registers{};
@@ -557,17 +586,31 @@ void DeferredUndecodableRegistration() {
     std::vector<std::uint32_t> commands;
     for (const auto reg : header.registers) commands.insert(commands.end(), {0xc0017600u, reg.offset, reg.value});
     commands.insert(commands.end(), {0xc0031500u, 1, 1, 1, 0x8041});
+    std::uint32_t destination = 0;
+    const auto destinationAddress = reinterpret_cast<std::uintptr_t>(&destination);
+    commands.insert(commands.end(), {0xc0033700u, 0x00100200u, static_cast<std::uint32_t>(destinationAddress), static_cast<std::uint32_t>(destinationAddress >> 32u), 7u});
     Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
     sceAgcDriverSubmitAcb(0x20, &packet);
-    ExpectFailure([] { AgcDriverWaitIdle_nid_postfix(); }, "unsupported MIMG opcode");
-    ExpectFailure([] { AgcDriverShutdown_nid_postfix(); }, "unsupported MIMG opcode");
+    const auto reason = aperture ? "unsupported scalar source operand code 235" : "unsupported MIMG opcode";
+    ExpectFailure([] { AgcDriverWaitIdle_nid_postfix(); }, reason);
+    ExpectFailure([] { AgcDriverShutdown_nid_postfix(); }, reason);
+    Require(destination == 0u, "a deferred unsupported dispatch executed a subsequent memory write");
 }
 
 }
 
 int main(int argc, char** argv) {
     try {
-        Require(argc == 1 || (argc == 2 && (std::string_view(argv[1]) == "--indirect" || std::string_view(argv[1]) == "--fail-before-registration" || std::string_view(argv[1]) == "--deferred" || std::string_view(argv[1]) == "--deferred-undecodable")), "invalid test arguments");
+        Require(argc == 1 || (argc == 2 && (std::string_view(argv[1]) == "--indirect" || std::string_view(argv[1]) == "--fail-before-registration" || std::string_view(argv[1]) == "--deferred" || std::string_view(argv[1]) == "--deferred-undecodable" || std::string_view(argv[1]) == "--deferred-aperture")), "invalid test arguments");
+        if (argc == 2 && std::string_view(argv[1]) == "--deferred-aperture") {
+            auto device = OpenVulkanTestDevice();
+            if (!device) return VulkanTestSkipped;
+            AperturePreparationClassification(*device);
+            device.reset();
+            DeferredUndecodableRegistration(true);
+            std::cout << "deferred aperture shader tests passed\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--deferred") {
             if (!OpenVulkanTestDevice()) return VulkanTestSkipped;
             DeferredRegistration();
