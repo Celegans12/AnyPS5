@@ -359,6 +359,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
                 message = nested.what();
             }
         } else {
+            CaptureTerminalComputeFailure(request, captured, error.what(), submission.queue, submission.serial, currentPacketOffset());
             message = error.what();
         }
         char where[64];

@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderPreparation.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
 #include <spirv/unified1/spirv.hpp>
@@ -25,6 +26,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <fstream>
+#include <filesystem>
 #include <sstream>
 #include <thread>
 
@@ -230,12 +232,16 @@ void Run(AgcDriver::VulkanDevice& device) {
     ExpectFailure([&] { static_cast<void>(AgcDriver::DriverDetail::SourceHandleFor(snapshot, 0, request)); }, "artifact is missing");
 }
 
-void FailureCapture(AgcDriver::VulkanDevice& device) {
+void FailureCapture(AgcDriver::VulkanDevice& device, bool terminalWriteFailure) {
     using namespace ShaderRecompiler;
     const std::array<std::uint32_t, 1> code{0xffffffffu};
     const std::vector<std::byte> header(2048, std::byte{0x5a});
     RecompileRequest request{{ShaderStage::Compute, 0x12345cafeull, code, 0x20000, header},
         {32, 0, {}, ShaderComputeStageInfo{{1, 1, 1}, 0, {}, false, 1, {}}, {}, {}, {}}, device.ComputeTarget(32), {0, 0, 0, 128}};
+    const std::array<std::uint32_t, 2> oldWords{1, 2}, terminalWords{3, 4};
+    const std::array<MemoryRegion, 1> oldMemory{{{0x40000, std::as_bytes(std::span(oldWords))}}};
+    const std::array<MemoryRegion, 1> terminalMemory{{{0x40000, std::as_bytes(std::span(terminalWords))}}};
+    request.context.memory = oldMemory;
     const auto failure = [&](auto action) {
         try { action(); }
         catch (const std::exception& error) { return std::string(error.what()); }
@@ -253,12 +259,46 @@ void FailureCapture(AgcDriver::VulkanDevice& device) {
 #endif
     Require(failure([&] { static_cast<void>(AgcDriver::DriverDetail::PrepareShaderWithDiagnostics(request)); }) == expected, "disabled shader capture changed the preparation failure");
     Require(!std::ifstream(path, std::ios::binary).is_open(), "disabled shader capture created a request");
+    Require(!AgcDriver::DriverDetail::CaptureTerminalComputeFailure(request, terminalMemory, "disabled", 0, 1, 2), "disabled terminal capture created a request");
 #ifdef _WIN32
     Require(_putenv_s("APS5_DUMP_SHADERS", "1") == 0, "cannot enable shader capture");
 #else
     Require(setenv("APS5_DUMP_SHADERS", "1", 1) == 0, "cannot enable shader capture");
 #endif
     const auto actual = failure([&] { static_cast<void>(AgcDriver::DriverDetail::PrepareShaderWithDiagnostics(request)); });
+    const auto directory = std::filesystem::temp_directory_path() / ("anyps5-terminal-capture-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    Require(std::filesystem::create_directory(directory), "cannot create terminal capture test directory");
+    const auto destination = (terminalWriteFailure ? directory / "missing" / "child" : directory).string();
+    bool written = false;
+    const auto terminalError = failure([&] {
+        try { throw std::runtime_error("terminal compute fixture failure"); }
+        catch (const std::exception& error) {
+            written = AgcDriver::DriverDetail::CaptureTerminalComputeFailure(request, terminalMemory, error.what(), 7, 11, 13, destination.c_str());
+            throw;
+        }
+    });
+    Require(terminalError == "terminal compute fixture failure", "terminal capture changed the original exception");
+    Require(written == !terminalWriteFailure, "terminal capture write outcome was incorrect");
+    Require(!AgcDriver::DriverDetail::CaptureTerminalComputeFailure(request, oldMemory, "second failure", 7, 12, 13, directory.string().c_str()), "terminal capture exceeded its one-attempt budget");
+    std::size_t terminalFiles = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(directory)) {
+        Require(entry.path().extension() == ".req", "terminal capture left a staging file");
+        Require(entry.path().filename().string().starts_with("shader_12345cafe_terminal_"), "terminal capture cannot be collected by the runner");
+        std::ifstream terminalFile(entry.path(), std::ios::binary);
+        const std::string bytes{std::istreambuf_iterator<char>(terminalFile), std::istreambuf_iterator<char>()};
+        auto terminalRequest = request;
+        terminalRequest.context.memory = terminalMemory;
+        const RequestSerializer terminalSerializer;
+        Require(bytes == terminalSerializer.Serialize(terminalRequest), "terminal capture used stale same-address request bytes");
+        const auto decoded = terminalSerializer.Deserialize(bytes);
+        Require(decoded.request.context.memory.size() == 1 && decoded.request.context.memory[0].bytes.size() == sizeof(terminalWords)
+            && std::memcmp(decoded.request.context.memory[0].bytes.data(), terminalWords.data(), sizeof(terminalWords)) == 0, "terminal captured memory did not roundtrip");
+        terminalFile.close();
+        Require(std::filesystem::remove(entry.path()), "cannot remove terminal capture test file");
+        ++terminalFiles;
+    }
+    Require(terminalFiles == (terminalWriteFailure ? 0u : 1u), "terminal capture file count was incorrect");
+    Require(std::filesystem::remove(directory), "cannot remove terminal capture test directory");
 #ifdef _WIN32
     Require(_putenv_s("APS5_DUMP_SHADERS", saved.c_str()) == 0, "cannot restore shader capture");
 #else
@@ -695,7 +735,7 @@ int main(int argc, char** argv) {
         auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         Run(*device);
-        FailureCapture(*device);
+        FailureCapture(*device, argc == 2 && std::string_view(argv[1]) == "--indirect");
         PendingRegistrationPreparation(*device);
         Require(argc != 2 || std::string_view(argv[1]) != "--fail-before-registration", "injected failure before registration");
         PrepareMultisampledStorage(*device);
