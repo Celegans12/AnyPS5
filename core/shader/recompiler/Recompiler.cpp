@@ -1,4 +1,5 @@
 #include "Recompiler.hpp"
+#include "BdaAbi.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
