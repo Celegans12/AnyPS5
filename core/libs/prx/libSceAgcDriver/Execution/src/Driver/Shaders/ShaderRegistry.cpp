@@ -18,6 +18,7 @@
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <limits>
 #include <list>
 #include <pthread.h>
 #include <stdexcept>
@@ -204,7 +205,35 @@ bool SameHeader(const ShaderSnapshot& snapshot, const Shader* shader) {
     std::memcpy(&used, static_cast<const void*>(shader), sizeof(Shader));
     std::memcpy(&registered, snapshot.header.data(), sizeof(Shader));
     used.user_data = registered.user_data;
-    return std::memcmp(&used, &registered, offsetof(Shader, num_sh_registers) + sizeof(Shader::num_sh_registers)) == 0;
+    Shader fixed = used;
+    fixed.cx_registers = registered.cx_registers;
+    fixed.sh_registers = registered.sh_registers;
+    fixed.specials = registered.specials;
+    fixed.input_semantics = registered.input_semantics;
+    fixed.output_semantics = registered.output_semantics;
+    if (std::memcmp(&fixed, &registered, offsetof(Shader, num_sh_registers) + sizeof(Shader::num_sh_registers)) != 0) return false;
+    const auto base = reinterpret_cast<std::uintptr_t>(shader);
+    const auto headerSize = std::min<std::size_t>(registered.header_size, snapshot.header.size());
+    const auto same = [&](const void* bound, const void* original, std::size_t bytes) {
+        if (bound == original) return true;
+        if (bound == nullptr || original == nullptr) return false;
+        const auto value = reinterpret_cast<std::uintptr_t>(original);
+        if (value < snapshot.headerAddress) return false;
+        const auto offset = value - snapshot.headerAddress;
+        if (offset > headerSize || bytes > headerSize - offset) return false;
+        if (offset > std::numeric_limits<std::uintptr_t>::max() - base) return false;
+        const auto address = base + offset;
+        if (reinterpret_cast<std::uintptr_t>(bound) != address) return false;
+        if (bytes > std::numeric_limits<std::uintptr_t>::max() - address) return false;
+        if (bytes == 0) return true;
+        GuestMemory::CheckRange(bound, bytes, 1);
+        return std::memcmp(bound, snapshot.header.data() + offset, bytes) == 0;
+    };
+    return same(used.cx_registers, registered.cx_registers, registered.num_cx_registers * sizeof(ShaderRegister))
+        && same(used.sh_registers, registered.sh_registers, registered.num_sh_registers * sizeof(ShaderRegister))
+        && same(used.specials, registered.specials, std::max<std::size_t>(sizeof(ShaderSpecialRegs), registered.special_sizes_bytes))
+        && same(used.input_semantics, registered.input_semantics, registered.num_input_semantics * sizeof(ShaderSemantic))
+        && same(used.output_semantics, registered.output_semantics, registered.num_output_semantics * sizeof(ShaderSemantic));
 }
 
 void PublishRegisteredShader(std::shared_ptr<ShaderRegistry>& registry, const std::shared_ptr<const ShaderSnapshot>& snapshot) {
