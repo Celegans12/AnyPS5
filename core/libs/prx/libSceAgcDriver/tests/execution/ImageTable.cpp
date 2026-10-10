@@ -203,6 +203,14 @@ alignas(256) constexpr std::array<std::uint32_t, 33> RecordPointerCode{
     0x34101084u, 0xe0781000u, 0x80070408u, 0xbf810000u,
 };
 
+alignas(256) constexpr std::array<std::uint32_t, 35> RecordSamplerCode{
+    0xf4080100u, 0xfa000000u, 0xf4080200u, 0xfa000010u, 0xf4080700u, 0xfa000020u, 0xf4080800u, 0xfa000030u,
+    0x8f108202u, 0xf4200444u, 0x20000000u, 0x9312ff11u, 0x00000250u, 0xf4240502u, 0x24000000u,
+    0xf408080au, 0xfa0003f8u, 0xf40c090au, 0xfa0003d0u, 0x360200bfu, 0x7e020d01u, 0x060202f0u,
+    0x100202ffu, 0x3d000000u, 0x7e0402ffu, 0x3e000000u, 0xf09c0f08u, 0x01090401u, 0x7e120202u,
+    0x34101286u, 0x4a101100u, 0x34101084u, 0xe0781000u, 0x80070408u, 0xbf810000u,
+};
+
 alignas(256) constexpr std::array<std::uint32_t, 38> PointerStorageWriteCode{
     0xf4080200u, 0xfa000000u, 0xf4080700u, 0xfa000010u, 0xf4080800u, 0xfa000020u, 0xf4040500u, 0xfa000030u,
     0x8f108202u, 0xf4200444u, 0x20000000u, 0x8711ff11u, 0x000000ffu, 0x8f128511u, 0xf40c090au, 0x241fff00u,
@@ -981,24 +989,29 @@ void RunPointerTests(AgcDriver::VulkanDevice& device) {
     RequireRed(reads, 4, Lanes, [](std::uint32_t x) { return UintTexels[x]; }, "pointer image table read: key 0x1ff masked to entry 255");
 }
 
-void RunRecordPointerTests(AgcDriver::VulkanDevice& device) {
+void RunRecordPointerTests(AgcDriver::VulkanDevice& device, bool sharedSampler = false) {
     constexpr std::uint32_t RecordStride = 0x250u;
-    alignas(256) std::array<std::uint32_t, 2u * RecordStride / 4u> records{};
-    alignas(256) std::array<std::array<std::uint32_t, 8>, 3> descriptors{};
+    const std::uint32_t imageOffset = sharedSampler ? 0x3d0u / 4u : 0u;
+    const std::span<const std::uint32_t> code = sharedSampler ? std::span<const std::uint32_t>(RecordSamplerCode) : std::span<const std::uint32_t>(RecordPointerCode);
+    alignas(256) std::array<std::uint32_t, 3u * RecordStride / 4u> records{};
+    alignas(256) std::array<std::array<std::uint32_t, 0x408u / 4u>, 3> descriptors{};
+    auto directCode = DirectCode;
+    if (sharedSampler) directCode[10] = 0x3d000000u;
+    for (auto& descriptor : descriptors) std::copy(PointClamp.begin(), PointClamp.end(), descriptor.begin() + 0x3f8u / 4u);
     Fill();
     const auto floatImage = Image(FloatTexels.data(), Format32Float);
     const auto uintImage = Image(UintTexels.data(), Format32UInt);
     const auto sintImage = Image(SintTexels.data(), Format32SInt);
-    std::copy(floatImage.begin(), floatImage.end(), descriptors[0].begin());
-    std::copy(uintImage.begin(), uintImage.end(), descriptors[1].begin());
-    std::copy(sintImage.begin(), sintImage.end(), descriptors[2].begin());
-    const auto floatControl = RunDirect(device, PointClamp, floatImage);
-    const auto uintControl = RunDirect(device, PointClamp, uintImage);
-    const auto sintControl = RunDirect(device, PointClamp, sintImage);
+    std::copy(floatImage.begin(), floatImage.end(), descriptors[0].begin() + imageOffset);
+    std::copy(uintImage.begin(), uintImage.end(), descriptors[1].begin() + imageOffset);
+    std::copy(sintImage.begin(), sintImage.end(), descriptors[2].begin() + imageOffset);
+    const auto floatControl = RunDirectCode(device, directCode, PointClamp, floatImage);
+    const auto uintControl = RunDirectCode(device, directCode, PointClamp, uintImage);
+    const auto sintControl = RunDirectCode(device, directCode, PointClamp, sintImage);
     Require(!Faulted(floatControl) && !Faulted(uintControl) && !Faulted(sintControl), "record pointer: direct native control faulted");
-    RequireRed(floatControl, 0, Lanes, [](std::uint32_t x) { return std::bit_cast<std::uint32_t>(FloatTexels[x]); }, "record pointer float control");
-    RequireRed(uintControl, 0, Lanes, [](std::uint32_t x) { return UintTexels[x]; }, "record pointer uint control");
-    RequireRed(sintControl, 0, Lanes, [](std::uint32_t x) { return static_cast<std::uint32_t>(SintTexels[x]); }, "record pointer sint control");
+    if (!sharedSampler) RequireRed(floatControl, 0, Lanes, [](std::uint32_t x) { return std::bit_cast<std::uint32_t>(FloatTexels[x]); }, "record pointer float control");
+    if (!sharedSampler) RequireRed(uintControl, 0, Lanes, [](std::uint32_t x) { return UintTexels[x]; }, "record pointer uint control");
+    if (!sharedSampler) RequireRed(sintControl, 0, Lanes, [](std::uint32_t x) { return static_cast<std::uint32_t>(SintTexels[x]); }, "record pointer sint control");
     const auto point = [&](std::uint32_t record, std::uint32_t descriptor) {
         const auto address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(descriptors[descriptor].data()));
         records[record * RecordStride / 4u] = static_cast<std::uint32_t>(address);
@@ -1008,23 +1021,23 @@ void RunRecordPointerTests(AgcDriver::VulkanDevice& device) {
     point(1u, 1u);
     Keys = {};
     Keys[1] = 1u;
-    const auto run = [&](std::shared_ptr<const ShaderRecompiler::ResourceCapture>& capture) {
+    const auto run = [&](std::shared_ptr<const ShaderRecompiler::ResourceCapture>& capture, const void* written = nullptr) {
         std::array<std::uint32_t, 16> root{};
         const auto table = Buffer(records.data(), static_cast<std::uint32_t>(sizeof(records)));
         const auto keys = Buffer(Keys.data(), 2u * sizeof(std::uint32_t));
-        const auto output = Buffer(Output.data(), static_cast<std::uint32_t>(sizeof(Output)));
+        const auto output = written == nullptr ? Buffer(Output.data(), static_cast<std::uint32_t>(sizeof(Output))) : Buffer(written, 4u);
         std::copy(table.begin(), table.end(), root.begin());
         std::copy(keys.begin(), keys.end(), root.begin() + 4);
         std::copy(output.begin(), output.end(), root.begin() + 8);
         std::copy(PointClamp.begin(), PointClamp.end(), root.begin() + 12);
         const std::array<ShaderRecompiler::MemoryRegion, 5> memory{{
-            {reinterpret_cast<std::uintptr_t>(RecordPointerCode.data()), std::as_bytes(std::span(RecordPointerCode))},
+            {reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)},
             {reinterpret_cast<std::uintptr_t>(root.data()), std::as_bytes(std::span(root))},
             {reinterpret_cast<std::uintptr_t>(records.data()), std::as_bytes(std::span(records))},
             {reinterpret_cast<std::uintptr_t>(descriptors.data()), std::as_bytes(std::span(descriptors))},
             {reinterpret_cast<std::uintptr_t>(Keys.data()), std::as_bytes(std::span(Keys).first(2))},
         }};
-        return Execute(device, RecordPointerCode, root.data(), memory, 2u, Lanes, 64u, &capture);
+        return Execute(device, code, root.data(), memory, 2u, Lanes, 64u, &capture);
     };
     const auto check = [&](const Outcome& outcome, const ShaderRecompiler::ResourceCapture& capture, std::uint32_t firstDescriptor, const Outcome& control) {
         Require(!Faulted(outcome) && outcome.imageTableFaults == 0u && outcome.poisonedSrtReads == 0u,
@@ -1032,20 +1045,24 @@ void RunRecordPointerTests(AgcDriver::VulkanDevice& device) {
         Require(Group(outcome, 0u) == Group(control, 0u) && Group(outcome, 1u) == Group(uintControl, 0u),
             "record pointer: selected output differs from direct native control");
         const auto& tables = capture.snapshot.tables;
-        Require(tables.tables.size() == 1u && outcome.imageTableReadRanges.size() == 1u, "record pointer: expected one captured table");
+        Require(tables.tables.size() == (sharedSampler ? 2u : 1u) && outcome.imageTableReadRanges.size() == tables.tables.size(), "record pointer: unexpected captured table count");
         const auto covered = [&](const void* pointer, std::uint64_t bytes) {
             const auto address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(pointer));
-            return std::any_of(outcome.imageTableReadRanges[0].begin(), outcome.imageTableReadRanges[0].end(), [&](const auto& range) {
-                return address >= range.first && address - range.first <= range.second && bytes <= range.second - (address - range.first);
+            return std::any_of(outcome.imageTableReadRanges.begin(), outcome.imageTableReadRanges.end(), [&](const auto& ranges) {
+                return std::any_of(ranges.begin(), ranges.end(), [&](const auto& range) {
+                    return address >= range.first && address - range.first <= range.second && bytes <= range.second - (address - range.first);
+                });
             });
         };
         for (std::uint32_t record = 0; record < 2u; ++record) {
             const auto descriptor = record == 0u ? firstDescriptor : 1u;
-            Require(covered(records.data() + record * RecordStride / 4u, 8u) && covered(descriptors[descriptor].data(), 32u),
+            Require(covered(records.data() + record * RecordStride / 4u, 8u) && covered(descriptors[descriptor].data() + imageOffset, 32u),
                 "record pointer: capture omitted the record pointer or pointed descriptor dependency");
             Require(std::any_of(tables.words.begin(), tables.words.end(), [&](const auto& value) {
-                return value.dwordCount == 8u && value.dwords == descriptors[descriptor];
+                return value.dwordCount == 8u && std::equal(value.dwords.begin(), value.dwords.end(), descriptors[descriptor].begin() + imageOffset);
             }), "record pointer: capture does not own the current descriptor words");
+            if (sharedSampler) Require(covered(descriptors[descriptor].data() + 0x3f8u / 4u, 16u),
+                "record pointer: capture omitted the shared-pointer sampler dependency");
         }
     };
     std::cout << "record pointer: direct native controls passed; capturing bounded record-to-pointer-to-T# chain" << std::endl;
@@ -1059,7 +1076,7 @@ void RunRecordPointerTests(AgcDriver::VulkanDevice& device) {
     check(moved, *movedCapture, 2u, sintControl);
     Require(firstCapture->snapshot.tables == firstSnapshot, "record pointer: retargeting mutated an earlier owned snapshot");
     const auto movedSnapshot = movedCapture->snapshot.tables;
-    std::copy(floatImage.begin(), floatImage.end(), descriptors[2].begin());
+    std::copy(floatImage.begin(), floatImage.end(), descriptors[2].begin() + imageOffset);
     std::shared_ptr<const ShaderRecompiler::ResourceCapture> changedCapture;
     const auto changed = run(changedCapture);
     check(changed, *changedCapture, 2u, floatControl);
@@ -1067,6 +1084,41 @@ void RunRecordPointerTests(AgcDriver::VulkanDevice& device) {
         "record pointer: leaf mutation changed an earlier owned snapshot");
     Require(first.artifactId != 0u && first.artifactId == moved.artifactId && first.artifactId == changed.artifactId,
         "record pointer: runtime pointer or descriptor changes recompiled the artifact");
+    if (sharedSampler) {
+        auto repeat = PointClamp;
+        repeat[0] &= ~7u;
+        std::copy(repeat.begin(), repeat.end(), descriptors[2].begin() + 0x3f8u / 4u);
+        const auto repeatControl = RunDirectCode(device, directCode, repeat, floatImage);
+        Require(!Faulted(repeatControl) && Group(repeatControl, 0u) != Group(floatControl, 0u), "record pointer: sampler mutation has no observable direct effect");
+        std::shared_ptr<const ShaderRecompiler::ResourceCapture> repeatedCapture;
+        const auto repeated = run(repeatedCapture);
+        check(repeated, *repeatedCapture, 2u, repeatControl);
+        Require(repeated.artifactId == first.artifactId && firstCapture->snapshot.tables == firstSnapshot && movedCapture->snapshot.tables == movedSnapshot,
+            "record pointer: sampler mutation recompiled the artifact or mutated retained snapshots");
+    }
+    if (sharedSampler) {
+        for (const void* written : {static_cast<const void*>(records.data()), static_cast<const void*>(descriptors[2].data() + imageOffset)}) {
+            const auto savedRecords = records;
+            const auto savedDescriptors = descriptors;
+            std::shared_ptr<const ShaderRecompiler::ResourceCapture> aliasCapture;
+            const auto alias = run(aliasCapture, written);
+            records = savedRecords;
+            descriptors = savedDescriptors;
+            Require(Faulted(alias) && alias.log.find("is written by its own dispatch") != std::string::npos,
+                "record pointer: pointer/leaf self-write did not produce HeapWritten:\n" + alias.log);
+        }
+    }
+    Keys[0] = 2u;
+    std::shared_ptr<const ShaderRecompiler::ResourceCapture> invalidCapture;
+    const auto invalid = run(invalidCapture);
+    Require(Faulted(invalid) && invalid.log.find("unmapped") != std::string::npos, "record pointer: selecting the formerly inactive null pointer did not fault as unmapped:\n" + invalid.log);
+    Keys[0] = 0u;
+    std::fill_n(descriptors[2].begin() + imageOffset, 8u, 0u);
+    std::shared_ptr<const ShaderRecompiler::ResourceCapture> nullCapture;
+    const auto nullImage = run(nullCapture);
+    const auto nullWords = Group(nullImage, 0u);
+    Require(!Faulted(nullImage) && std::all_of(nullWords.begin(), nullWords.end(), [](std::uint32_t word) { return word == 0u; }),
+        "record pointer: a mapped null T# was confused with a null pointer:\n" + nullImage.log);
     std::puts("record pointer: native selection, pointer retarget, descriptor freshness and owned snapshots passed");
 }
 
@@ -1262,6 +1314,7 @@ int main(int argc, char** argv) {
         if (!device) return VulkanTestSkipped;
         if (argc == 2 && std::string_view(argv[1]) == "--record-pointer") {
             RunRecordPointerTests(*device);
+            RunRecordPointerTests(*device, true);
             return 0;
         }
         Require(argc == 1, "image table: unknown test mode");

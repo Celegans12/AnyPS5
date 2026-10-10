@@ -1156,6 +1156,167 @@ void verifyPointerImageTable() {
 #endif
 }
 
+void verifyRecordPointerTables() {
+    using namespace ShaderRecompiler;
+    namespace Abi = ImageTableAbi;
+    constexpr std::uint64_t Root = 0x10000u, Records = 0x20000u, Keys = 0x30000u, Leaf = 0x40000u;
+    constexpr std::uint32_t Stride = 0x250u;
+    const std::vector<std::uint32_t> code{
+        0xf4080100u, 0xfa000000u, 0xf4080200u, 0xfa000010u, 0xf4080700u, 0xfa000020u,
+        0x8f108202u, 0xf4200444u, 0x20000000u, 0x9312ff11u, Stride, 0xf4240502u, 0x24000000u,
+        0xf408080au, 0xfa0003f8u, 0xf40c090au, 0xfa0003d0u, 0xf09c0f08u, 0x01090401u,
+        0xe0781000u, 0x80070408u, 0xbf810000u};
+    struct Memory {
+        std::map<std::uint64_t, std::uint32_t> words;
+        std::vector<std::uint64_t> reads;
+        std::uint64_t denied = ~std::uint64_t{0}, failed = ~std::uint64_t{0};
+        bool throws = false;
+        static bool Read(void* context, std::uint64_t address, std::uint32_t* value) {
+            auto& memory = *static_cast<Memory*>(context);
+            memory.reads.push_back(address);
+            if (address == memory.failed) {
+                if (memory.throws) throw std::runtime_error("record pointer callback failure");
+                return false;
+            }
+            const auto found = memory.words.find(address);
+            if (found == memory.words.end()) return false;
+            *value = found->second;
+            return true;
+        }
+        static bool Accessible(void* context, std::uint64_t address, std::uint64_t bytes) {
+            const auto& memory = *static_cast<Memory*>(context);
+            if (bytes == 0u || bytes > 0x1000u || address > ~std::uint64_t{0} - bytes) return false;
+            for (std::uint64_t offset = 0; offset < bytes; offset += 4u) {
+                if (address + offset == memory.denied || !memory.words.contains(address + offset)) return false;
+            }
+            return true;
+        }
+    } memory;
+    const auto put = [&](std::uint64_t address, std::span<const std::uint32_t> words) {
+        for (std::size_t index = 0; index < words.size(); ++index) memory.words[address + index * 4u] = words[index];
+    };
+    const auto buffer = [&](std::uint64_t base, std::uint32_t bytes) {
+        return TableV(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(base)), 0u, bytes);
+    };
+    for (std::uint32_t byte = 0; byte < 3u * Stride; byte += 4u) memory.words[Records + byte] = 0u;
+    put(Root, buffer(Records, 3u * Stride));
+    put(Root + 16u, buffer(Keys, 8u));
+    put(Root + 32u, buffer(0x80000u, 2048u));
+    memory.words[Keys] = 0u;
+    memory.words[Keys + 4u] = 1u;
+    const auto point = [&](std::uint32_t index, std::uint64_t address) {
+        memory.words[Records + index * Stride] = static_cast<std::uint32_t>(address);
+        memory.words[Records + index * Stride + 4u] = static_cast<std::uint32_t>(address >> 32u);
+    };
+    point(0u, Leaf);
+    point(1u, Leaf);
+    const auto image = TableT(reinterpret_cast<const void*>(0x90000u), TableFormat8888UNorm, TableType2D);
+    put(Leaf + 0x3d0u, image);
+    const std::array<std::uint32_t, 4> sampler{0x92u, 0u, 0u, 0u};
+    put(Leaf + 0x3f8u, sampler);
+    const std::array<std::uint32_t, 2> userData{static_cast<std::uint32_t>(Root), 0u};
+    auto request = TableRequest(code, userData);
+    request.context.compute->groupIdEnable = {true, false, false};
+    SrtRuntime runtime{userData, request.shader.codeAddress, Memory::Read, &memory};
+    runtime.accessible = Memory::Accessible;
+    const auto capture = [&] { memory.reads.clear(); return CaptureResources(request, runtime); };
+    const auto pointerReads = [](const IrProgram& program) {
+        std::vector<bool> planning;
+        for (const auto& block : program.Blocks()) for (const auto* instruction : block->Instructions()) {
+            if (instruction->Opcode() != IrOpcode::ReadConstBuffer || instruction->Flags<MemoryFlags>().pc != 0x2cu) continue;
+            planning.push_back(program.Resources().memoryInfo.at(instruction->Flags<MemoryFlags>().index).planningOnly);
+        }
+        return planning;
+    };
+    const auto descriptorOnly = pointerReads(PrepareResourceProgram(request));
+    require(std::none_of(descriptorOnly.begin(), descriptorOnly.end(), [](bool value) { return !value; }),
+        "record pointer: descriptor-only pointer load survived as a runtime read");
+    auto sharedCode = code;
+    sharedCode.insert(sharedCode.end() - 1, {0x7e1e0214u, 0xe0700000u, 0x80070f00u});
+    auto sharedRequest = request;
+    sharedRequest.shader.code = sharedCode;
+    const auto sharedReads = pointerReads(PrepareResourceProgram(sharedRequest));
+    require(std::count(sharedReads.begin(), sharedReads.end(), false) == 1,
+        "record pointer: a pointer component consumed by an ordinary store became planning-only");
+    const auto first = capture();
+    const auto& info = first->plan->info;
+    const auto table = info.images.at(0).table;
+    const auto samplerTable = info.samplers.at(0).table;
+    require(table != NoTable && samplerTable != NoTable && table != samplerTable, "record pointer: image and sampler did not get separate tables");
+    const auto& column = *first->plan->descriptorSources.at(info.images.at(0).source).tableColumn;
+    const auto& samplerColumn = *first->plan->descriptorSources.at(info.samplers.at(0).source).tableColumn;
+    require(column.recordPointer && samplerColumn.recordPointer && column.stride == Stride && column.recordPointer->immediate == 0x3d0u && samplerColumn.recordPointer->immediate == 0x3f8u,
+        "record pointer: plan lost the record stride or nonzero leaf offsets");
+    require(column.heapSource == samplerColumn.heapSource && column.keyDomain == samplerColumn.keyDomain, "record pointer: shared image/sampler record key diverged");
+    const auto& snapshot = first->snapshot.tables.tables.at(table);
+    require(snapshot.addresses.at(0) == Leaf + 0x3d0u && snapshot.addresses.at(1) == Leaf + 0x3d0u && snapshot.codes.at(0) == snapshot.codes.at(1), "record pointer: aliased leaf address or words differ");
+    const auto covered = [](const auto& ranges, std::uint64_t address, std::uint64_t bytes) {
+        return std::any_of(ranges.begin(), ranges.end(), [&](const auto& range) {
+            return address >= range.first && address - range.first <= range.second && bytes <= range.second - (address - range.first);
+        });
+    };
+    require(covered(snapshot.readRanges, Records, 8u) && covered(snapshot.readRanges, Records + Stride, 8u) && covered(snapshot.readRanges, Leaf + 0x3d0u, 32u), "record pointer: pointer or image read dependency absent");
+    require(covered(first->snapshot.tables.tables.at(samplerTable).readRanges, Leaf + 0x3f8u, 16u), "record pointer: sampler read dependency absent");
+    const auto unmapped = Abi::PoisonCode(static_cast<std::uint32_t>(Abi::PoisonReason::Unmapped));
+    require(snapshot.codes.at(2) == Abi::PoisonCode(static_cast<std::uint32_t>(Abi::PoisonReason::OutsideDomain)), "record pointer: inactive null pointer was read");
+    memory.words[Keys] = 2u;
+    const auto nullPointer = capture();
+    require(nullPointer->snapshot.tables.tables.at(table).codes.at(2) == unmapped, "record pointer: null pointer became a null descriptor");
+    memory.words[Keys] = 0u;
+    const std::array<std::uint32_t, 8> zeros{};
+    put(Leaf + 0x3d0u, zeros);
+    const auto nullImage = capture();
+    const auto nullMap = ResourceMaterializer::ResolveImageTables(info, nullImage->snapshot);
+    require(TableCodes(nullMap.map, table).at(0) == Abi::NullCode, "record pointer: mapped null descriptor did not stay null");
+    put(Leaf + 0x3d0u, image);
+    const auto saved = first->snapshot.tables;
+    put(Leaf + 0x1000u + 0x3d0u, image);
+    put(Leaf + 0x1000u + 0x3f8u, sampler);
+    point(0u, Leaf + 0x1000u);
+    memory.words[Leaf + 0x1000u + 0x3d0u] += 1u;
+    const auto retargeted = capture();
+    const auto& moved = retargeted->snapshot.tables.tables.at(table);
+    require(moved.addresses.at(0) == Leaf + 0x1000u + 0x3d0u && retargeted->snapshot.tables.words.at(moved.codes.at(0)).dwords[0] == image[0] + 1u && first->snapshot.tables == saved, "record pointer: pointer/leaf freshness or owned snapshot failed");
+    point(0u, Leaf);
+    for (const auto denied : {Records, Leaf + 0x3d0u}) {
+        memory.denied = denied;
+        const auto inaccessible = capture();
+        require(inaccessible->snapshot.tables.tables.at(table).codes.at(0) == unmapped && std::find(memory.reads.begin(), memory.reads.end(), denied) == memory.reads.end(), "record pointer: inaccessible word was dereferenced instead of poisoned");
+    }
+    memory.denied = ~std::uint64_t{0};
+    for (const auto failed : {Records, Leaf + 0x3d0u}) for (const bool throws : {false, true}) {
+        memory.failed = failed;
+        memory.throws = throws;
+        std::string failure;
+        try { static_cast<void>(capture()); } catch (const std::exception& error) { failure = error.what(); }
+        require(failure.find(throws ? "record pointer callback failure" : "image table: failed to read guest memory") != std::string::npos, "record pointer: callback failure was hidden as poison");
+    }
+    memory.failed = ~std::uint64_t{0};
+    memory.throws = false;
+    memory.words[Keys + 4u] = 0u;
+    for (const std::uint32_t bound : {4u, 7u}) {
+        put(Root, buffer(Records, bound));
+        memory.words[Records + 4u] = 0xffffffffu;
+        const auto partial = capture();
+        require(partial->snapshot.tables.tables.at(table).addresses.at(0) == Leaf + 0x3d0u && std::find(memory.reads.begin(), memory.reads.end(), Records + 4u) == memory.reads.end(), "record pointer: partial high pointer word did not zero-fill");
+    }
+    put(Root, buffer(Records, 3u));
+    const auto outside = capture();
+    require(outside->snapshot.tables.tables.at(table).outsideCode == unmapped && std::find(memory.reads.begin(), memory.reads.end(), Records) == memory.reads.end(), "record pointer: OOB pointer words were read or became a null T#");
+    put(0x3d0u, image);
+    put(0x3f8u, sampler);
+    const auto mappedOutside = capture();
+    const auto& outsideImage = mappedOutside->snapshot.tables.tables.at(table);
+    require(outsideImage.outsideAddress == 0x3d0u && outsideImage.outsideCode.has_value() && (*outsideImage.outsideCode & Abi::PoisonFlag) == 0u,
+        "record pointer: OOB zero pair did not retain a mapped nonzero immediate leaf");
+    require(covered(outsideImage.readRanges, 0x3d0u, 32u), "record pointer: OOB pointed descriptor dependency absent");
+    put(Root, buffer(Records, 8u));
+    point(0u, ~std::uint64_t{0} - 0xffu);
+    const auto overflow = capture();
+    require(overflow->snapshot.tables.tables.at(table).codes.at(0) == unmapped && overflow->snapshot.tables.tables.at(table).addresses.at(0) == Abi::UnknownDescriptorAddress, "record pointer: leaf overflow wrapped to a valid address");
+    require(std::none_of(memory.reads.begin(), memory.reads.end(), [](std::uint64_t address) { return address < Root; }), "record pointer: null or overflow leaf was dereferenced");
+}
+
 void verifyDescriptorPhis() {
     using namespace ShaderRecompiler;
     constexpr std::uint32_t Format8888UNorm = 56;
@@ -3035,6 +3196,10 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--frontend-pair") {
             verifyFrontendPair();
             std::cout << "Prepared frontend reuse preserves full and partial-thread programs\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--record-pointer") {
+            verifyRecordPointerTables();
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--bindless") {
