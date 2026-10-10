@@ -89,6 +89,7 @@ struct ImageResource {
     bool constantSwizzleCompatible = true;
     bool flatVolumeCompatible = true;
     bool flatLineCompatible = true;
+    bool foldTexelOffsetsOnly = false;
     std::uint32_t byElements = 0;
     std::uint32_t byComponents = 0;
     IrBufferFormat packedFormat = IrBufferFormat::Invalid;
@@ -124,9 +125,14 @@ struct SamplerResource {
     bool depthCompare = false;
     std::uint8_t uses = 0;
     std::uint32_t table = NoTable;
+    bool foldTexelOffsetsOnly = false;
 
     bool operator==(const SamplerResource& other) const = default;
 };
+
+inline bool FoldsTexelOffsets(const SamplerResource& sampler) {
+    return sampler.table == NoTable && (sampler.uses & SamplerUseOffset) != 0u && (sampler.uses & ~static_cast<std::uint32_t>(SamplerUseExplicitLod | SamplerUseOffset)) == 0u && !sampler.depthCompare;
+}
 
 struct SampledResourcePair {
     std::uint32_t image = 0;

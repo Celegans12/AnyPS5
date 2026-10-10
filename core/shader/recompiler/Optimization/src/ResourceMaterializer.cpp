@@ -1155,7 +1155,19 @@ std::vector<ImageResource> ResourceMaterializer::RuntimeImageModes(const ImageRe
         }
     }
     if (modes.empty() && !table) throw std::runtime_error("image instruction has no supported runtime modes");
+    if (image.foldTexelOffsetsOnly && std::ranges::any_of(modes, [](const ImageResource& mode) { return UnnormalizedSampleMismatch(mode) == nullptr; })) {
+        std::erase_if(modes, [](const ImageResource& mode) { return UnnormalizedSampleMismatch(mode) != nullptr; });
+    }
     return modes;
+}
+
+const char* ResourceMaterializer::UnnormalizedSampleMismatch(const ImageResource& image) {
+    if (image.table != NoTable) return "samples an image selected at run time";
+    if (image.constantSwizzle) return nullptr;
+    if ((image.dimension != RdnaImageDimension::Dim1D && image.dimension != RdnaImageDimension::Dim2D) || image.cube) return "samples a 1D-array, 2D-array, 3D, cube or multisampled image";
+    if (image.depthCompare) return "is used with depth comparison";
+    if (image.conversionFormat != IrBufferFormat::Invalid || image.packed) return "samples an image that needs a format conversion or packed access";
+    return nullptr;
 }
 
 RuntimeImageModeMatch ResourceMaterializer::TryRuntimeImageMode(const ImageResource& image, const DescriptorValue& descriptor, std::span<const ImageResource> modes) {
@@ -1214,6 +1226,7 @@ RuntimeImageModeMatch ResourceMaterializer::TryRuntimeImageMode(const ImageResou
         }
     }
     if (image.dimension == RdnaImageDimension::Dim1D && decoded.dimension != RdnaImageDimension::Dim1D) return reject(PoisonReason::Dimension, "image address has too few coordinate components");
+    if (image.foldTexelOffsetsOnly && image.table == NoTable) return reject(PoisonReason::UnsupportedOperation, "image sample with a texel offset that is not a constant takes only images an unnormalized S# can sample without VK_KHR_maintenance8 and shaderImageGatherExtended");
     const auto reason = emulated ? PoisonReason::ColorCompare
         : decoded.fmask ? PoisonReason::Fmask
         : decoded.depthBits ? PoisonReason::DepthBits16
@@ -1244,12 +1257,17 @@ void ResourceMaterializer::ApplyStaticInterface(IrProgram& program, bool nativeS
             for (const auto* inst : block->Instructions()) {
                 if (inst->Opcode() != IrOpcode::ImageSampleRaw) continue;
                 const auto& memory = resources.memoryInfo.at(inst->Flags<MemoryFlags>().index);
-                if ((memory.imageSampleFlags & (RdnaImageSampleFlagCompare | RdnaImageSampleFlagOffset)) != (RdnaImageSampleFlagCompare | RdnaImageSampleFlagOffset)) continue;
+                if ((memory.imageSampleFlags & RdnaImageSampleFlagOffset) == 0u) continue;
                 const auto* address = inst->Argument(2)->Resolve();
                 const auto component = GetRdnaImageAddressComponentLayout(memory.imageSampleFlags, 0u);
                 const auto argument = component.bitOffset / 32u;
                 if (component.bitWidth == 32u && argument < address->ArgumentCount() && address->Argument(argument)->Resolve()->HasImmediate()) continue;
-                images.at(memory.resource).emulatedCompare |= EmulatedCompare::NativeOffsetUnsupported;
+                if ((memory.imageSampleFlags & RdnaImageSampleFlagCompare) != 0u) {
+                    images.at(memory.resource).emulatedCompare |= EmulatedCompare::NativeOffsetUnsupported;
+                } else {
+                    images.at(memory.resource).foldTexelOffsetsOnly = true;
+                    resources.info.samplers.at(memory.sampler).foldTexelOffsetsOnly = true;
+                }
             }
         }
     }
