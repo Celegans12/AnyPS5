@@ -422,6 +422,7 @@ public:
         std::size_t residentCapacityBytes = 0;
         std::size_t coldBytes = 0;
         std::size_t coldCapacityBytes = 0;
+        std::size_t fileBytes = 0;
         bool exposed = false;
         bool eligible = false;
     };

@@ -801,6 +801,16 @@ int runOppositeMaskedSelectLoadingProcess() {
     return runLoadingProcess();
 }
 
+int runOppositeColdFileLoadingProcess() {
+    constexpr auto name = "APS5_COLD_SPIRV_FILE";
+    const auto* current = std::getenv(name);
+    const bool wasEnabled = current != nullptr && std::string_view(current) == "1";
+    setEnvironment(name, wasEnabled ? "0" : "1");
+    require((std::string_view(std::getenv(name)) == "1") != wasEnabled, "the child did not toggle cold file storage");
+    std::cout << "opposite cold file mode: " << (wasEnabled ? "on -> off" : "off -> on") << std::endl;
+    return runLoadingProcess();
+}
+
 void verifyAcrossProcesses(const char* self) {
     ComputeRequest request(true);
     const auto before = ShaderDiskCache::Totals();
@@ -813,6 +823,8 @@ void verifyAcrossProcesses(const char* self) {
     require(std::system(command.c_str()) == 0, "the loading process failed");
     const std::string oppositeCommand = "\"" + std::string(self) + "\" --load-opposite-masked-select";
     require(std::system(oppositeCommand.c_str()) == 0, "the opposite masked-select mode loading process failed");
+    const std::string coldFileCommand = "\"" + std::string(self) + "\" --load-opposite-cold-file";
+    require(std::system(coldFileCommand.c_str()) == 0, "the opposite cold file mode loading process failed");
 }
 
 class DirectImageCacheLoopGuard {
@@ -1659,6 +1671,7 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--load") return runLoadingProcess();
         if (argc == 2 && std::string_view(argv[1]) == "--load-wrap-loop") { verifyUnnormalizedWrapTransitions(true); return 0; }
         if (argc == 2 && std::string_view(argv[1]) == "--load-opposite-masked-select") return runOppositeMaskedSelectLoadingProcess();
+        if (argc == 2 && std::string_view(argv[1]) == "--load-opposite-cold-file") return runOppositeColdFileLoadingProcess();
         if (argc == 2 && (std::string_view(argv[1]) == "--load-direct-image-refusal" || std::string_view(argv[1]) == "--load-direct-image-loop-guard"
                 || std::string_view(argv[1]) == "--load-guarded-direct-image")) return runDirectImageLoadingProcess(argv[1]);
         if (argc == 2 && std::string_view(argv[1]) == "--no-failure-memo") return runWithoutFailureMemo();
