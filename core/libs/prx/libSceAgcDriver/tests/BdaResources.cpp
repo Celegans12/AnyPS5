@@ -15,6 +15,7 @@
 #endif
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -651,10 +652,62 @@ void directImageFaultTests(const Context& context, const BdaTestAccess& access) 
     Require(guest[0] == changed, "cleared direct image fault lost copied guest writes");
 }
 
+void guardedWrapFaultTests(const Context& context, const BdaTestAccess& access) {
+    namespace Abi = ShaderRecompiler::BdaAbi;
+    const auto* old = std::getenv("APS5_UNNORM_WRAP_GUARD");
+    const std::string previous = old ? old : "";
+    const auto set = [](const char* value) {
+#ifdef _WIN32
+        _putenv_s("APS5_UNNORM_WRAP_GUARD", value ? value : "");
+#else
+        if (value) setenv("APS5_UNNORM_WRAP_GUARD", value, 1); else unsetenv("APS5_UNNORM_WRAP_GUARD");
+#endif
+    };
+    struct Restore { decltype(set)& action; const char* value; ~Restore() { action(value); } } restore{set, old ? previous.c_str() : nullptr};
+    set("1");
+    auto map = binding(Role::ImageTableMap, 4);
+    map.guestDescriptor.resize(ShaderRecompiler::ImageTableAbi::HeaderWords);
+    map.guestDescriptor[ShaderRecompiler::ImageTableAbi::HeaderVersion] = ShaderRecompiler::ImageTableAbi::Version;
+    auto sampler = binding(Role::GuestSamplers, 57);
+    sampler.kind = ShaderRecompiler::DescriptorKind::Sampler;
+    sampler.guestDescriptor = {0x8000u, 0xfff000u, 0x05000000u, 0u};
+    sampler.samplerDepthCompare = {false};
+    sampler.samplerUnnormalized = {true};
+    ShaderRecompiler::RecompileResult shader;
+    shader.bdaAbiVersion = Abi::Version;
+    shader.hasGuardedUnnormalizedWrap = true;
+    shader.bindings = {map, binding(Role::FaultBuffer, 5), sampler};
+    CompiledShader compiled{ShaderRecompiler::ShaderStage::Compute, &shader, 0};
+    auto sampling = context;
+    sampling.limits.maxPerStageDescriptorSamplers = sampling.limits.maxDescriptorSetSamplers = 32;
+    sampling.limits.maxSamplerAnisotropy = 1.0f;
+    {
+        ShaderResources resources(sampling, compiled);
+        Require(resources.NeedsCompletion() && shader.specialization.empty(), "mixed image table lost guarded sampler completion");
+        const auto fault = access.bytes(access.descriptor(5).buffer);
+        auto report = Abi::Fault{Abi::FaultState::Ready, Abi::FaultReason::UnnormalizedWrap, 0u, std::bit_cast<std::uint32_t>(0.25f), 4u, 0x360u, 0u};
+        std::memcpy(fault.data(), &report, sizeof(report));
+        reject([&] { resources.WriteBackBuffers(0x80002c4500ULL); }, "unnormalized sampler: shader 0x80002c4500 stage 4 pc 0x360 axis 0 coordinate 0.25 outside [0.5, size - 0.5]");
+        reject([&] { resources.WriteBackBuffers(0x80003d5600ULL); }, "unnormalized sampler: shader 0x80003d5600");
+        report.address = 1u;
+        std::memcpy(fault.data(), &report, sizeof(report));
+        reject([&] { resources.WriteBackBuffers(); }, "invalid unnormalized sampler fault payload");
+        std::memset(fault.data(), 0, fault.size());
+        resources.WriteBackBuffers();
+    }
+    shader.hasGuardedUnnormalizedWrap = false;
+    reject([&] { ShaderResources resources(sampling, compiled); }, "unnormalized wrap requires verified guard proof");
+    shader.hasGuardedUnnormalizedWrap = true;
+    shader.bindings.erase(shader.bindings.begin() + 1);
+    shader.bdaAbiVersion = 0u;
+    reject([&] { ShaderResources resources(sampling, compiled); }, "unnormalized wrap requires verified guard proof");
+}
+
 }
 
 void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     directImageFaultTests(context, access);
+    guardedWrapFaultTests(context, access);
     alignas(64) std::array<std::uint32_t, 16> guest{};
     guest[0] = 123;
     const auto address = reinterpret_cast<std::uintptr_t>(guest.data());

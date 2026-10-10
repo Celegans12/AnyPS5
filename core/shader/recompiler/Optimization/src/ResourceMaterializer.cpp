@@ -6,6 +6,7 @@
 #include "SpirvBackend/SpirvBufferFormat.hpp"
 #include "ImageTableAbi.hpp"
 #include "DirectImageRefusal.hpp"
+#include "UnnormalizedWrap.hpp"
 #include "PipelineSpecialization.hpp"
 #include <algorithm>
 #include <array>
@@ -1291,6 +1292,25 @@ std::uint32_t ResourceMaterializer::DirectImageMode(const ShaderInfo& info, IrSh
         return PipelineSpecialization::DeferredDirectImageMode;
     }
     throw std::runtime_error(match.detail);
+}
+
+bool ResourceMaterializer::CanGuardUnnormalizedWrap(const IrProgram& program, std::uint32_t index) {
+    const auto& resources = program.Resources();
+    if (!UnnormalizedWrapCandidate(resources.info.samplers.at(index), resources.stage)) return false;
+    bool found = false;
+    for (const auto& block : program.Blocks()) {
+        for (const auto* instruction : block->Instructions()) {
+            if (!ImageOpcodeInfoOf(instruction->Opcode()).needsSampler) continue;
+            const auto& memory = resources.memoryInfo.at(instruction->Flags<MemoryFlags>().index);
+            if (memory.sampler != index) continue;
+            const auto flags = memory.imageSampleFlags;
+            if (instruction->Opcode() != IrOpcode::ImageSampleRaw || (flags & RdnaImageSampleFlagLevelZero) == 0u
+                || (flags & ~(RdnaImageSampleFlagLevelZero | RdnaImageSampleFlagOffset)) != 0u
+                || resources.info.images.at(memory.resource).table != NoTable) return false;
+            found = true;
+        }
+    }
+    return found;
 }
 
 bool ResourceMaterializer::CanDeferDirectImage(const IrProgram& program, std::uint32_t index) {

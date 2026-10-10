@@ -57,6 +57,7 @@ public:
     static std::uint32_t RuntimeImageMode(const ImageResource& image, const DescriptorValue& descriptor, std::span<const ImageResource> modes);
     static std::uint32_t DirectImageMode(const ShaderInfo& info, IrShaderStage stage, std::uint32_t index, const DescriptorValue& descriptor, bool allowRefusal = false);
     static bool CanDeferDirectImage(const IrProgram& program, std::uint32_t index);
+    static bool CanGuardUnnormalizedWrap(const IrProgram& program, std::uint32_t index);
     static void PrepareDirectImageRefusals(IrProgram& program, bool faultAbi);
     static void ValidateDirectImageRefusals(const ShaderInfo& info, IrShaderStage stage, const ResourceSnapshot& snapshot, bool allowRefusal);
     static void PrepareImageModes(ShaderInfo& info);

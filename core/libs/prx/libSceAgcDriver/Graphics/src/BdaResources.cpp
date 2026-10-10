@@ -255,6 +255,16 @@ void BdaResources::CheckFault(std::uint64_t shaderAddress) const {
         std::memset(fault->Bytes().data(), 0, fault->Bytes().size());
         return;
     }
+    if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::UnnormalizedWrap) {
+        Require(report.address == 0u, "invalid unnormalized sampler fault payload");
+        std::ostringstream message;
+        message << "unnormalized sampler: shader ";
+        if (shaderAddress != 0u) message << "0x" << std::hex << shaderAddress << std::dec;
+        else message << "address unavailable";
+        message << " stage " << report.stage << " pc 0x" << std::hex << (report.instruction & 0x7fffffffu) << std::dec
+            << " axis " << (report.instruction >> 31u) << " coordinate " << std::bit_cast<float>(report.bytes) << " outside [0.5, size - 0.5]";
+        throw std::runtime_error(message.str());
+    }
     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::DirectImage) {
         const auto resource = ShaderRecompiler::BdaAbi::DirectImageFaultResource(report.bytes);
         Require(report.address == 0u && ShaderRecompiler::BdaAbi::DirectImageFaultReason(report.bytes) == ShaderRecompiler::BdaAbi::DirectImageDimension && resource < ShaderRecompiler::ShaderInfo::MaxImages, "invalid direct image fault payload");

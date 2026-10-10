@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <string>
+#include "UnnormalizedWrap.hpp"
 
 namespace AgcDriver::Graphics {
 
@@ -71,9 +72,9 @@ namespace AgcDriver::Graphics {
 
     SamplerCache::SamplerCache(std::size_t capacity) : capacity(std::max<std::size_t>(capacity, 1)) {}
 
-    std::shared_ptr<Sampler> SamplerCache::Get(const Context& context, std::span<const std::uint32_t> words, bool compareEnable, bool unnormalizedProven, bool forceDegammaPaired) {
+    std::shared_ptr<Sampler> SamplerCache::Get(const Context& context, std::span<const std::uint32_t> words, bool compareEnable, bool unnormalizedProven, bool forceDegammaPaired, bool guardedUnnormalizedWrap) {
         Require(words.size() == 4, "guest sampler descriptor must contain 4 dwords");
-        const std::array<std::uint32_t, 5> key{words[0], words[1], words[2], words[3], (compareEnable ? 1u : 0u) | (unnormalizedProven ? 2u : 0u)};
+        const std::array<std::uint32_t, 5> key{words[0], words[1], words[2], words[3], (compareEnable ? 1u : 0u) | (unnormalizedProven ? 2u : 0u) | (ShaderRecompiler::UnnormalizedWrapEnabled() ? 4u : 0u) | (guardedUnnormalizedWrap ? 8u : 0u)};
         std::lock_guard lock(mutex);
         ++clock;
         if (const auto found = entries.find(key); found != entries.end()) {
@@ -83,7 +84,7 @@ namespace AgcDriver::Graphics {
             return found->second.sampler;
         }
         ++misses;
-        auto resource = DecodeSamplerResource(words, unnormalizedProven, forceDegammaPaired);
+        auto resource = DecodeSamplerResource(words, unnormalizedProven, forceDegammaPaired, guardedUnnormalizedWrap);
         resource.compareEnable = compareEnable;
         auto sampler = std::make_shared<Sampler>(context, resource);
         // The cap keeps live samplers well below the device's limit (NVIDIA: ~4000); a set in flight

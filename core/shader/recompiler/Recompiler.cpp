@@ -1,5 +1,7 @@
 #include "Recompiler.hpp"
 #include "BdaAbi.hpp"
+#include "DirectImageRefusal.hpp"
+#include "UnnormalizedWrap.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -382,6 +384,11 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
     constexpr ShaderInfoCollector shaderInfoCollector;
     shaderInfoCollector.Collect(program, inputInfo);
     ResourceMaterializer::PrepareDirectImageRefusals(program, request.target.bdaAbiVersion == BdaAbi::Version);
+    if (request.target.bdaAbiVersion == BdaAbi::Version && !DirectImageLoopGuardEnabled()) {
+        for (std::uint32_t index = 0; index < program.Info().samplers.size(); ++index) {
+            if (ResourceMaterializer::CanGuardUnnormalizedWrap(program, index)) program.Info().usesFaultBuffer = true;
+        }
+    }
 
     constexpr BindingAllocator bindingAllocator;
     auto bindings = bindingAllocator.Allocate(program, request.layout);
@@ -571,6 +578,9 @@ std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledSh
         }
         cursor += count;
     }
+    for (const auto& constant : constants) {
+        if (constant.id >= PipelineSpecialization::UnnormalizedWrapBase && constant.id < PipelineSpecialization::UnnormalizedWrapBase + ShaderInfo::MaxSamplers && constant.value != 0u && !specializedIds.contains(constant.id)) throw std::runtime_error("unnormalized wrap requires emitted per-sampler guard proof");
+    }
     std::vector<std::uint32_t> materialized(words.begin(), words.begin() + 5);
     for (std::size_t cursor = 5; cursor < words.size();) {
         const auto count = words[cursor] >> 16u;
@@ -666,6 +676,7 @@ std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& 
     auto& key = HostThreadLocal<std::vector<std::uint64_t>, BindingPlanKeyStorage>();
     key.clear();
     key.push_back(variant.artifact.variantId);
+    key.push_back(UnnormalizedWrapEnabled() ? 1u : 0u);
     for (std::size_t index = 0; index < variant.info.info.buffers.size(); ++index) {
         const auto& descriptor = snapshot.buffers.at(index);
         key.push_back(descriptor.dwordCount);
@@ -766,6 +777,10 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         .variantId = artifact.variantId
     };
     const auto plan = preparedBindingPlan(variant, snapshot, request.context.pixel ? std::span<const std::uint8_t>(request.context.pixel->targetExportMapping) : std::span<const std::uint8_t>{});
+    const bool guardedWrap = std::any_of(plan->bindings.specialization.begin(), plan->bindings.specialization.end(), [](const auto& value) {
+        return value.id >= PipelineSpecialization::UnnormalizedWrapBase && value.id < PipelineSpecialization::UnnormalizedWrapBase + ShaderInfo::MaxSamplers && value.value != 0u;
+    });
+    if (guardedWrap && DirectImageLoopGuardEnabled()) throw std::runtime_error("unnormalized wrap requires a compute fault buffer without a loop guard");
     result.hasDeferredDirectImage = std::any_of(plan->bindings.specialization.begin(), plan->bindings.specialization.end(), [](const PipelineSpecializationConstant& value) {
         return value.id >= PipelineSpecialization::ImageBase && value.id < PipelineSpecialization::ImageBase + ShaderInfo::MaxImages * PipelineSpecialization::ImageWords
             && (value.id - PipelineSpecialization::ImageBase) % PipelineSpecialization::ImageWords == 0u && PipelineSpecialization::IsDeferredDirectImageMode(value.value);
@@ -861,6 +876,23 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
     result.bindings = std::move(bindings.bindings);
     if (std::none_of(result.bindings.begin(), result.bindings.end(), [](const DescriptorBinding& binding) { return binding.role == DescriptorRole::FaultBuffer; })) result.bdaAbiVersion = 0u;
     if (result.hasDeferredDirectImage && (variant.info.stage != IrShaderStage::Compute || result.bdaAbiVersion != BdaAbi::Version)) throw std::runtime_error("deferred direct image requires a compute fault buffer");
+    if (UnnormalizedWrapEnabled()) {
+        for (const auto& entry : bindingPlan->bindings) {
+            if (entry.descriptor.role != DescriptorRole::GuestSamplers) continue;
+            const auto found = std::find_if(result.bindings.begin(), result.bindings.end(), [&](const auto& binding) { return binding.binding == entry.descriptor.binding; });
+            if (found == result.bindings.end()) continue;
+            for (std::size_t element = 0; element < found->samplerUnnormalized.size(); ++element) {
+                if (!found->samplerUnnormalized[element]) continue;
+                const auto axes = UnnormalizedWrapAxes(std::span<const std::uint32_t>(found->guestDescriptor).subspan(element * 4u, 4u));
+                if (axes == 0u) continue;
+                const auto id = PipelineSpecialization::UnnormalizedWrapBase + entry.resources.at(element);
+                const auto proof = std::find_if(plan->bindings.specialization.begin(), plan->bindings.specialization.end(), [&](const auto& value) { return value.id == id && (value.value & axes) == axes; });
+                if (proof == plan->bindings.specialization.end()) throw std::runtime_error("unnormalized wrap requires emitted per-sampler guard proof");
+                result.hasGuardedUnnormalizedWrap = true;
+            }
+        }
+    }
+    if (result.hasGuardedUnnormalizedWrap && (variant.info.stage != IrShaderStage::Compute || request.target.bdaAbiVersion != BdaAbi::Version || result.bdaAbiVersion != BdaAbi::Version)) throw std::runtime_error("unnormalized wrap requires a compute fault buffer");
     result.pushConstants = std::move(bindings.pushConstants);
     result.poisonedSrtReads = static_cast<std::uint32_t>(snapshot.srtPoison.size());
     if (!tables.map.empty()) {
@@ -1031,6 +1063,9 @@ std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapsh
         mix(words.size());
         for (const auto word : words) mix(word);
     };
+    mix(UnnormalizedWrapEnabled() ? 1u : 0u);
+    mix(DirectImageLoopGuardEnabled() ? 1u : 0u);
+    mix(request.target.bdaAbiVersion);
     const auto mixDescriptors = [&](const std::vector<DescriptorValue>& values) {
         mix(values.size());
         for (const auto& value : values) {

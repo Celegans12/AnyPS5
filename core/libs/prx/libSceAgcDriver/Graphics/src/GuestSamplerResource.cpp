@@ -3,6 +3,7 @@
 #include <array>
 #include <stdexcept>
 #include <string>
+#include "UnnormalizedWrap.hpp"
 
 namespace AgcDriver::Graphics {
 
@@ -54,7 +55,7 @@ float toSignedLodBias(std::uint32_t raw) {
 
 }
 
-GuestSamplerResource DecodeSamplerResource(std::span<const std::uint32_t> words, bool unnormalizedProven, bool forceDegammaPaired) {
+GuestSamplerResource DecodeSamplerResource(std::span<const std::uint32_t> words, bool unnormalizedProven, bool forceDegammaPaired, bool guardedUnnormalizedWrap) {
     Require(words.size() == 4, "guest sampler descriptor must contain 4 dwords");
 
     const auto clampX = (words[0] >> 0u) & 0x7u;
@@ -89,11 +90,12 @@ GuestSamplerResource DecodeSamplerResource(std::span<const std::uint32_t> words,
     const auto borderColorType = (words[3] >> 30u) & 0x3u;
 
     Require(!forceUnormCoords || unnormalizedProven, "guest sampler descriptor uses unnormalized coordinates which are not implemented");
+    const bool guarded = guardedUnnormalizedWrap && ShaderRecompiler::UnnormalizedWrapEnabled() && xyMagFilter == 0u && xyMinFilter == 0u;
     if (forceUnormCoords) {
         Require(xyMagFilter == xyMinFilter, "guest sampler descriptor uses unnormalized coordinates with different minification and magnification filters, which is not implemented");
         Require(!isAnisoFilter(xyMagFilter), "guest sampler descriptor uses unnormalized coordinates with anisotropic filtering, which is not implemented");
-        Require(clampX == 2u || clampX == 6u, "guest sampler descriptor uses unnormalized coordinates with clamp mode " + std::to_string(clampX) + " on X; only clamp-to-last-texel and clamp-to-border are implemented");
-        Require(clampY == 2u || clampY == 6u, "guest sampler descriptor uses unnormalized coordinates with clamp mode " + std::to_string(clampY) + " on Y; only clamp-to-last-texel and clamp-to-border are implemented");
+        Require(clampX == 2u || clampX == 6u || (guarded && clampX == 0u), "guest sampler descriptor uses unnormalized coordinates with clamp mode " + std::to_string(clampX) + " on X; only clamp-to-last-texel and clamp-to-border are implemented");
+        Require(clampY == 2u || clampY == 6u || (guarded && clampY == 0u), "guest sampler descriptor uses unnormalized coordinates with clamp mode " + std::to_string(clampY) + " on Y; only clamp-to-last-texel and clamp-to-border are implemented");
         Require(!truncCoord, "guest sampler descriptor uses unnormalized coordinates with TRUNC_COORD, which is not implemented");
         Require(!mcCoordTrunc, "guest sampler descriptor uses unnormalized coordinates with MC_COORD_TRUNC, which is not implemented");
     } else {
@@ -164,6 +166,8 @@ GuestSamplerResource DecodeSamplerResource(std::span<const std::uint32_t> words,
     result.nonSeamlessCube = disableCubeWrap;
     if (forceUnormCoords) {
         result.unnormalizedCoordinates = true;
+        if (guarded && clampX == 0u) result.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        if (guarded && clampY == 0u) result.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         result.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
         result.minLod = 0.0f;
         result.maxLod = 0.0f;

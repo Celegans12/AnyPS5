@@ -515,6 +515,7 @@ struct ShaderInvocation {
     std::uint64_t imageTableShader = 0;
     std::uint32_t imageTableFaults = 0;
     bool hasDeferredDirectImage = false;
+    bool hasGuardedUnnormalizedWrap = false;
 };
 
 struct RecompileResult : CompiledShaderArtifact, ShaderInvocation {

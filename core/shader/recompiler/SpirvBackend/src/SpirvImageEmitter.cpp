@@ -450,6 +450,43 @@ std::uint32_t FoldedOffsetCoord(SpirvValueEmitContext& ctx, const ImageEmitAcces
     return sum;
 }
 
+void GuardUnnormalizedWrap(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, const SampleSetup& setup, std::uint32_t coord) {
+    auto& state = ctx.state;
+    if (state.loopGuardLimit != 0u || state.faultBufferVariable == 0u || ResourceMaterializer::UnnormalizedSampleMismatch(access.image) != nullptr) return;
+    const auto [entry, inserted] = state.unnormalizedWrapGuards.try_emplace(access.mem.sampler, false);
+    if (inserted) entry->second = ResourceMaterializer::CanGuardUnnormalizedWrap(state.program, access.mem.sampler);
+    if (!entry->second) return;
+    const auto components = setup.dimensionInfo.spatialComponents;
+    const auto u32 = TypeU32(state);
+    const auto f32 = TypeF32(state);
+    const auto boolean = TypeBool(state);
+    const auto axes = state.module.SpecializationConstant(u32, PipelineSpecialization::UnnormalizedWrapBase + access.mem.sampler, 0u);
+    state.module.EmitCapability(spv::CapabilityImageQuery);
+    const auto exec = ctx.Arg(access.inst, access.inst.ArgumentCount() - 1u);
+    for (std::uint32_t axis = 0; axis < components; ++axis) {
+        const auto guarded = Binary(state, spv::OpINotEqual, boolean, Binary(state, spv::OpBitwiseAnd, u32, axes, ConstantU32(state, 1u << axis)), ConstantU32(state, 0u));
+        EmitIfCondition(state, guarded, [&] {
+            const auto size = state.module.AllocateId();
+            state.module.AddFunction(spv::OpImageQuerySizeLod, ImageViewSizeType(state, access.image.dimension), size, LoadSampledImageDescriptor(state, access.mem.resource), ConstantU32(state, 0u));
+            auto value = coord;
+            auto extent = size;
+            if (components != 1u) {
+                value = state.module.AllocateId();
+                state.module.AddFunction(spv::OpCompositeExtract, f32, value, coord, axis);
+                extent = state.module.AllocateId();
+                state.module.AddFunction(spv::OpCompositeExtract, u32, extent, size, axis);
+            }
+            const auto half = ConstantF32(state, std::bit_cast<std::uint32_t>(0.5f));
+            const auto last = Binary(state, spv::OpFSub, f32, Unary(state, spv::OpConvertUToF, f32, extent), half);
+            const auto inside = Binary(state, spv::OpLogicalAnd, boolean, Binary(state, spv::OpFOrdGreaterThanEqual, boolean, value, half), Binary(state, spv::OpFOrdLessThanEqual, boolean, value, last));
+            const auto outside = Binary(state, spv::OpLogicalAnd, boolean, exec, Unary(state, spv::OpLogicalNot, boolean, inside));
+            EmitIfCondition(state, outside, [&] {
+                RecordBdaFaultWords(state, ConstantU32(state, 0u), ConstantU32(state, 0u), Unary(state, spv::OpBitcast, u32, value), ConstantU32(state, access.inst.Flags<MemoryFlags>().pc | (axis << 31u)), BdaAbi::FaultReason::UnnormalizedWrap);
+            });
+        });
+    }
+}
+
 std::uint32_t HorizontalOffsets(SpirvValueEmitContext& ctx, const ImageEmitAccess& access) {
     auto& state = ctx.state;
     const auto components = RdnaImageDimensionInfoFor(access.image.dimension).spatialComponents;
@@ -1392,6 +1429,7 @@ void EmitSampleOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, con
 
     }
     const auto emitSample = [&](std::uint32_t coord, std::uint32_t mask, const std::vector<std::uint32_t>& arguments) {
+        GuardUnnormalizedWrap(ctx, access, setup, coord);
         const auto sampled = MakeSampledImage(state, mem.resource, mem.sampler);
         const auto sample = state.module.AllocateId();
         std::vector<std::uint32_t> words = {opcode, resultType, sample, sampled, coord};

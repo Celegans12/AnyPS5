@@ -27,7 +27,7 @@ struct Range {
 };
 
 enum class FaultState : std::uint32_t { Empty, Writing, Ready };
-enum class FaultReason : std::uint32_t { Unmapped = 1, Permission, Overflow, InvalidTable, InvalidRectangle, LoopLimit, Unaligned, InvalidDescriptor, ImageTable, DirectImage = 11 };
+enum class FaultReason : std::uint32_t { Unmapped = 1, Permission, Overflow, InvalidTable, InvalidRectangle, LoopLimit, Unaligned, InvalidDescriptor, ImageTable, UnnormalizedWrap = 10, DirectImage = 11 };
 
 inline constexpr std::uint32_t DirectImageDimension = 1u;
 

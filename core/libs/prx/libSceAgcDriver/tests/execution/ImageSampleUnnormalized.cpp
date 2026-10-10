@@ -8,12 +8,19 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -56,6 +63,27 @@ alignas(256) constexpr std::array<std::uint32_t, 45> OffsetCode{
     0xe0701038, 0x80001201, 0xe070103c, 0x80001301, 0xbf810000,
 };
 
+alignas(256) constexpr auto GuardedCode = [] {
+    auto code = Code;
+    code[10] = code[12] = 0xf09c0f08u;
+    return code;
+}();
+
+alignas(256) constexpr auto GuardedOffsetCode = [] {
+    auto code = OffsetCode;
+    code[14] = 0xf0dc0f08u;
+    return code;
+}();
+
+alignas(256) constexpr auto GuardedInactiveCode = [] {
+    std::array<std::uint32_t, GuardedCode.size() + 2> code{};
+    std::copy_n(GuardedCode.begin(), 8, code.begin());
+    code[8] = 0xbefe03ffu;
+    code[9] = 0x55555555u;
+    std::copy(GuardedCode.begin() + 8, GuardedCode.end(), code.begin() + 10);
+    return code;
+}();
+
 enum class Offset { None, Lane, Constant };
 constexpr std::int32_t ConstantOffsetU = -3;
 constexpr std::int32_t ConstantOffsetV = 2;
@@ -68,6 +96,9 @@ struct Program {
 
 const Program Plain{Code, {"image_sample_lz", "image_sample_l 2.7", "image_sample"}, {Offset::None, Offset::None, Offset::None}};
 const Program Offsets{OffsetCode, {"image_sample_lz_o", "image_sample_l_o 2.7", "image_sample_lz_o (-3, 2) NSA"}, {Offset::Lane, Offset::Lane, Offset::Constant}};
+const Program Guarded{GuardedCode, {"image_sample_lz first", "image_sample_lz second", "image_sample_lz third"}, Plain.offsets};
+const Program GuardedOffsets{GuardedOffsetCode, {"image_sample_lz_o first", "image_sample_lz_o second", "image_sample_lz_o (-3, 2) NSA"}, Offsets.offsets};
+const Program GuardedInactive{GuardedInactiveCode, Guarded.instructions, Plain.offsets};
 
 alignas(256) constexpr std::array<std::uint32_t, 34> ConstantCode{
     0x34020086, 0xe0301000, 0x80000201, 0xe0301004, 0x80000301, 0xbf8c3f70, 0xf09c0608, 0x00610802,
@@ -180,7 +211,7 @@ std::array<std::uint32_t, 8> TextureDescriptor(const void* data, std::uint32_t l
 
 using Samples = std::vector<std::array<std::uint32_t, Results>>;
 
-Samples Run(AgcDriver::VulkanDevice& device, const Program& program, const std::array<std::uint32_t, 8>& texture, const std::array<std::uint32_t, 4>& sampler, const std::vector<Coordinate>& coordinates) {
+Samples Run(AgcDriver::VulkanDevice& device, const Program& program, const std::array<std::uint32_t, 8>& texture, const std::array<std::uint32_t, 4>& sampler, const std::vector<Coordinate>& coordinates, bool guardedWrap = false, std::uint32_t waveSize = 32) {
     Samples samples;
     for (std::size_t first = 0; first < coordinates.size(); first += Threads) {
         Buffer.fill(0xdeadbeefu);
@@ -200,12 +231,13 @@ Samples Run(AgcDriver::VulkanDevice& device, const Program& program, const std::
         const ShaderRecompiler::ShaderComputeStageInfo compute{{Threads, 1, 1}, 0u, {false, false, false}, false, 1};
         ShaderRecompiler::RecompileRequest request{
             {ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}},
-            {32, 0, userData, compute, std::nullopt, std::nullopt, memory},
+            {waveSize, 0, userData, compute, std::nullopt, std::nullopt, memory},
             device.Target(),
             {0, 0, 0, 128}
         };
         request.useCache = false;
         const auto result = ShaderRecompiler::Recompile(request);
+        if (guardedWrap) Require(result.hasGuardedUnnormalizedWrap, "unnormalized wrap: emitted guard lost its invocation proof");
         device.Dispatch(result, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(code.data()));
         device.WaitIdle();
         for (std::uint32_t lane = 0; lane < Threads && first + lane < coordinates.size(); ++lane) {
@@ -265,6 +297,166 @@ void ExpectFailure(AgcDriver::VulkanDevice& device, const std::array<std::uint32
         return;
     }
     throw std::runtime_error(std::string(what) + " was accepted");
+}
+
+class StderrCapture {
+public:
+    StderrCapture() {
+        std::fflush(stderr);
+        file = std::tmpfile();
+        Require(file != nullptr, "unnormalized wrap: cannot capture completion errors");
+#ifdef _WIN32
+        saved = _dup(_fileno(stderr));
+        Require(saved >= 0 && _dup2(_fileno(file), _fileno(stderr)) == 0, "unnormalized wrap: cannot redirect stderr");
+#else
+        saved = dup(fileno(stderr));
+        Require(saved >= 0 && dup2(fileno(file), fileno(stderr)) >= 0, "unnormalized wrap: cannot redirect stderr");
+#endif
+    }
+    ~StderrCapture() { if (file != nullptr) static_cast<void>(Finish()); }
+    std::string Finish() {
+        std::fflush(stderr);
+#ifdef _WIN32
+        _dup2(saved, _fileno(stderr));
+        _close(saved);
+#else
+        dup2(saved, fileno(stderr));
+        close(saved);
+#endif
+        std::rewind(file);
+        std::string text;
+        std::array<char, 4096> buffer{};
+        for (std::size_t read = 0; (read = std::fread(buffer.data(), 1, buffer.size(), file)) != 0;) text.append(buffer.data(), read);
+        std::fclose(file);
+        file = nullptr;
+        std::fwrite(text.data(), 1, text.size(), stderr);
+        return text;
+    }
+private:
+    std::FILE* file = nullptr;
+    int saved = -1;
+};
+
+constexpr std::uint32_t CapturedExtent = 1408;
+constexpr std::uint32_t Format16UNorm = 7;
+constexpr std::array<std::uint32_t, 4> CapturedSampler{0x00008000u, 0x00fff000u, 0x05000000u, 0u};
+alignas(256) std::array<std::uint8_t, 4 * 1024 * 1024> CapturedTexels{};
+
+std::array<std::uint32_t, 8> CapturedTexture() {
+    const auto mips = AgcDriver::Graphics::ComputeMipLayout(AgcDriver::Graphics::TextureTileMode::kLinear, Format16UNorm, CapturedExtent, CapturedExtent, 1);
+    Require(AgcDriver::Graphics::ComputeSurfaceSize(mips, 1) <= CapturedTexels.size(), "unnormalized wrap: captured-size texture storage is too small");
+    CapturedTexels.fill(0xeeu);
+    for (std::uint32_t y = 0; y < CapturedExtent; ++y) {
+        for (std::uint32_t x = 0; x < CapturedExtent; ++x) {
+            const auto offset = mips[0].tiledOffset + y * mips[0].pitchBytes + x * 2u;
+            const auto byte = static_cast<std::uint8_t>((x + y) % 2u != 0u ? 0xffu : 0u);
+            CapturedTexels[offset] = CapturedTexels[offset + 1u] = byte;
+        }
+    }
+    const auto address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(CapturedTexels.data()));
+    return {static_cast<std::uint32_t>(address >> 8u),
+        static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (Format16UNorm << 20u) | (((CapturedExtent - 1u) & 3u) << 30u),
+        ((CapturedExtent - 1u) >> 2u) | ((CapturedExtent - 1u) << 14u), 0x24cu | (Type2D << 28u), 0u, 0u, 0u, 0u};
+}
+
+void CheckCaptured(const Program& program, const std::vector<Coordinate>& coordinates, const Samples& samples, bool masked = false) {
+    Require(samples.size() == coordinates.size(), "unnormalized wrap: captured tile lost samples");
+    for (std::size_t index = 0; index < coordinates.size(); ++index) {
+        for (std::uint32_t instruction = 0; instruction < 3u; ++instruction) {
+            const auto offset = program.offsets[instruction];
+            const auto& coordinate = coordinates[index];
+            const auto du = offset == Offset::Lane ? coordinate.du : offset == Offset::Constant ? ConstantOffsetU : 0;
+            const auto dv = offset == Offset::Lane ? coordinate.dv : offset == Offset::Constant ? ConstantOffsetV : 0;
+            const bool inactive = masked && index % 2u != 0u;
+            std::uint32_t red = 0;
+            if (!inactive) {
+                const auto x = static_cast<std::int32_t>(coordinate.u + static_cast<float>(du));
+                const auto y = static_cast<std::int32_t>(coordinate.v + static_cast<float>(dv));
+                red = (x + y) % 2 != 0 ? 0x3f800000u : 0u;
+            }
+            for (std::uint32_t component = 0; component < 4u; ++component) {
+                const auto expected = inactive ? 0xdeadbeefu : component == 0u ? red : 0x3f800000u;
+                Require(samples[index][instruction * 4u + component] == expected,
+                    std::string(program.instructions[instruction]) + ": captured R16 texel mismatch at sample " + std::to_string(index) + " component " + std::to_string(component));
+            }
+        }
+    }
+}
+
+void CapturedSamplerCases(AgcDriver::VulkanDevice& device) {
+    const auto texture = CapturedTexture();
+    std::vector<Coordinate> tile;
+    for (std::uint32_t y = 704; y < 720; ++y) {
+        for (std::uint32_t x = 704; x < 720; ++x) tile.push_back({static_cast<float>(x) + 0.5f, static_cast<float>(y) + 0.5f});
+    }
+    auto clamp = CapturedSampler;
+    clamp[0] |= 0x92u;
+    CheckCaptured(Guarded, tile, Run(device, Guarded, texture, clamp, tile));
+    const auto* option = std::getenv("APS5_UNNORM_WRAP_GUARD");
+    ExpectFailure(device, texture, CapturedSampler,
+        option != nullptr && std::string_view(option) == "1" ? "unnormalized wrap requires emitted per-sampler guard proof" : "clamp mode 0 on X",
+        "a wrap sampler shared by LZ and non-LZ operations");
+    if (option == nullptr || std::string_view(option) != "1") {
+        try {
+            static_cast<void>(Run(device, Guarded, texture, CapturedSampler, tile));
+        } catch (const std::exception& error) {
+            Require(std::string_view(error.what()).find("clamp mode 0 on X") != std::string_view::npos, std::string("unnormalized wrap OFF: unexpected refusal: ") + error.what());
+            for (std::uint32_t lane = 0; lane < Threads; ++lane) {
+                for (std::uint32_t result = 0; result < Results; ++result) Require(Buffer[lane * Words + ResultWord + result] == 0xdeadbeefu, "unnormalized wrap OFF: refused dispatch wrote output");
+            }
+            return;
+        }
+        throw std::runtime_error("unnormalized wrap OFF: captured sampler was accepted");
+    }
+    const auto execute = [&](const Program& program, const std::vector<Coordinate>& coordinates, bool fault, std::uint32_t waveSize = 32) {
+        StderrCapture capture;
+        const auto samples = Run(device, program, texture, CapturedSampler, coordinates, true, waveSize);
+        const auto log = capture.Finish();
+        const std::string prefix = "[gpu] deferred write-back failed: ";
+        const auto first = log.find(prefix);
+        if (fault) {
+            Require(first != std::string::npos && log.find(prefix, first + prefix.size()) == std::string::npos
+                && log.find(prefix + "unnormalized sampler: shader ") == first && log.find("outside [0.5, size - 0.5]", first) != std::string::npos,
+                "unnormalized wrap: active invalid coordinate did not report exactly one typed completion error: " + log);
+        } else {
+            Require(first == std::string::npos, "unnormalized wrap: valid or inactive coordinates caused a completion error: " + log);
+        }
+        return samples;
+    };
+    CheckCaptured(Guarded, tile, execute(Guarded, tile, false));
+    CheckCaptured(Guarded, tile, execute(Guarded, tile, false, 64));
+    for (auto& coordinate : tile) { coordinate.du = -3; coordinate.dv = 2; }
+    CheckCaptured(GuardedOffsets, tile, execute(GuardedOffsets, tile, false));
+    std::vector<Coordinate> boundary(Threads, {704.5f, 704.5f});
+    boundary[0] = {0.5f, 0.5f};
+    boundary[1] = {1407.5f, 0.5f};
+    boundary[2] = {0.5f, 1407.5f};
+    boundary[3] = {1407.5f, 1407.5f};
+    CheckCaptured(Guarded, boundary, execute(Guarded, boundary, false));
+    const float infinity = std::numeric_limits<float>::infinity();
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const std::array<Coordinate, 12> invalid{{
+        {0.0f, 704.5f}, {1408.0f, 704.5f}, {704.5f, 0.0f}, {704.5f, 1408.0f},
+        {0.25f, 704.5f}, {1407.75f, 704.5f}, {704.5f, 0.25f}, {704.5f, 1407.75f},
+        {nan, 704.5f}, {704.5f, nan}, {infinity, 704.5f}, {704.5f, -infinity},
+    }};
+    auto inactive = std::vector<Coordinate>(Threads, {704.5f, 705.5f});
+    for (std::uint32_t lane = 1; lane < Threads; lane += 2) inactive[lane] = invalid[(lane / 2u) % invalid.size()];
+    CheckCaptured(GuardedInactive, inactive, execute(GuardedInactive, inactive, false), true);
+    for (const auto& coordinate : invalid) {
+        auto active = std::vector<Coordinate>(Threads, {704.5f, 704.5f});
+        active[7] = coordinate;
+        static_cast<void>(execute(Guarded, active, true));
+    }
+    auto activeWave64 = std::vector<Coordinate>(Threads, {704.5f, 704.5f});
+    activeWave64[63] = {nan, 704.5f};
+    static_cast<void>(execute(Guarded, activeWave64, true, 64));
+    for (const auto& coordinate : std::array<Coordinate, 3>{{{3.5f, 704.5f, -4, 0}, {1407.5f, 704.5f, 1, 0}, {2.5f, 704.5f, 0, 0}}}) {
+        auto active = std::vector<Coordinate>(Threads, {704.5f, 704.5f});
+        active[7] = coordinate;
+        static_cast<void>(execute(GuardedOffsets, active, true));
+    }
+    CheckCaptured(Guarded, boundary, execute(Guarded, boundary, false));
 }
 
 }
@@ -328,6 +520,7 @@ int main() {
                 }
             }
         }
+        CapturedSamplerCases(*device);
         std::puts("image sample unnormalized tests passed");
         return 0;
     } catch (const std::exception& error) {

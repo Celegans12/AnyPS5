@@ -1,4 +1,5 @@
 #include "Optimization/DescriptorBindingBuilder.hpp"
+#include "UnnormalizedWrap.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
 #include "SpirvBackend/SpirvEmitterHelpers.hpp"
 #include "SpirvBackend/SpirvBufferFormat.hpp"
@@ -266,6 +267,10 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
     const auto unnormalized = ProveUnnormalized(info, snapshot);
     for (std::uint32_t index = 0; index < info.samplers.size(); ++index) {
         if (FoldsTexelOffsets(info.samplers[index])) plan.specialization.push_back({PipelineSpecialization::FoldOffsetBase + index, unnormalized.samplers[index] ? 1u : 0u});
+        if (UnnormalizedWrapCandidate(info.samplers[index], stage)) {
+            const bool sampled = std::any_of(info.sampledPairs.begin(), info.sampledPairs.end(), [&](const auto& pair) { return pair.sampler == index && unnormalized.images.at(pair.image); });
+            plan.specialization.push_back({PipelineSpecialization::UnnormalizedWrapBase + index, UnnormalizedWrapEnabled() && sampled && unnormalized.samplers[index] ? UnnormalizedWrapAxes(std::span<const std::uint32_t>(snapshot.samplers[index].dwords).first(4u)) : 0u});
+        }
     }
     std::vector<std::uint32_t> compareStates(info.images.size());
     for (std::uint32_t index = 0; index < info.images.size(); ++index) {

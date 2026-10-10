@@ -2,6 +2,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include "UnnormalizedWrap.hpp"
+#include "DirectImageRefusal.hpp"
 
 namespace AgcDriver::Graphics {
 
@@ -22,11 +24,21 @@ void ShaderResources::prepareAddressBindings(std::span<const CompiledShader> sha
         Require(shader.program->bdaAbiVersion == (faults == 0 ? 0u : ShaderRecompiler::BdaAbi::Version), "incompatible BDA ABI version");
         const bool hasDeferredDirectImage = shader.program->hasDeferredDirectImage;
         Require(!hasDeferredDirectImage || (shader.stage == ShaderRecompiler::ShaderStage::Compute && faults == 1u), "deferred direct image requires a compute fault buffer");
+        bool guardedWrap = false;
+        for (const auto& binding : shader.program->bindings) {
+            if (binding.role != ShaderRecompiler::DescriptorRole::GuestSamplers) continue;
+            for (std::size_t element = 0; element < binding.samplerUnnormalized.size(); ++element) {
+                if (!binding.samplerUnnormalized[element]) continue;
+                Require(binding.guestDescriptor.size() >= (element + 1u) * 4u, "guest sampler binding has incomplete descriptor words");
+                guardedWrap |= ShaderRecompiler::UnnormalizedWrapAxes(std::span<const std::uint32_t>(binding.guestDescriptor).subspan(element * 4u, 4u)) != 0u;
+            }
+        }
+        if (ShaderRecompiler::UnnormalizedWrapEnabled() && guardedWrap) Require(shader.program->hasGuardedUnnormalizedWrap && shader.stage == ShaderRecompiler::ShaderStage::Compute && faults == 1u && !ShaderRecompiler::DirectImageLoopGuardEnabled(), "unnormalized wrap requires verified guard proof and a compute fault buffer without a loop guard");
         // Rect-list validation needs a fault buffer, but never accesses guest addresses.
         usesBda = usesBda || tables != 0;
         usesFaultBuffer = usesFaultBuffer || faults != 0;
         const bool tableFaultsOnly = std::any_of(shader.program->bindings.begin(), shader.program->bindings.end(), [](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::ImageTableMap; });
-        faultChecks = faultChecks || tables != 0 || (faults != 0 && (!tableFaultsOnly || shader.program->imageTableFaults != 0 || shader.program->poisonedSrtReads != 0 || loopGuarded || hasDeferredDirectImage));
+        faultChecks = faultChecks || tables != 0 || (faults != 0 && (!tableFaultsOnly || shader.program->imageTableFaults != 0 || shader.program->poisonedSrtReads != 0 || loopGuarded || hasDeferredDirectImage || guardedWrap));
     }
     if (usesBda) {
         Require(context.bufferDeviceAddress, "buffer device address is not enabled");

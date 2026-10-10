@@ -115,6 +115,7 @@ void requireSameResult(const RecompileResult& left, const RecompileResult& right
     require(left.workgroupMemoryDwords == right.workgroupMemoryDwords, prefix + "workgroup memory stride differs");
     require(left.poisonedSrtReads == right.poisonedSrtReads, prefix + "poisoned SRT read counts differ");
     require(left.hasDeferredDirectImage == right.hasDeferredDirectImage, prefix + "deferred direct image flag differs");
+    require(left.hasGuardedUnnormalizedWrap == right.hasGuardedUnnormalizedWrap, prefix + "guarded unnormalized wrap flag differs");
     require(left.imageTableRanges == right.imageTableRanges && left.imageTableShader == right.imageTableShader && left.imageTableFaults == right.imageTableFaults && left.imageTablePoison.size() == right.imageTablePoison.size(), prefix + "image table invocation data differs");
     require(left.imageTableReadRanges == right.imageTableReadRanges, prefix + "image table read ranges differ");
     for (std::size_t i = 0; i < left.imageTablePoison.size(); ++i) {
@@ -205,6 +206,7 @@ RecompileResult sampleResult() {
     result.imageTableShader = 0x80003aa700ull;
     result.imageTableFaults = 3u;
     result.hasDeferredDirectImage = true;
+    result.hasGuardedUnnormalizedWrap = true;
     return result;
 }
 
@@ -815,25 +817,99 @@ void verifyAcrossProcesses(const char* self) {
 
 class DirectImageCacheLoopGuard {
 public:
-    explicit DirectImageCacheLoopGuard(const char* value) {
-        if (const auto* current = std::getenv("APS5_LOOP_GUARD")) { present = true; previous = current; }
+    explicit DirectImageCacheLoopGuard(const char* value, const char* variable = "APS5_LOOP_GUARD") : name(variable) {
+        if (const auto* current = std::getenv(name)) { present = true; previous = current; }
         Set(value);
     }
     ~DirectImageCacheLoopGuard() { Set(present ? previous.c_str() : nullptr); }
 private:
-    static void Set(const char* value) {
-        if (value != nullptr) setEnvironment("APS5_LOOP_GUARD", value);
+    void Set(const char* value) {
+        if (value != nullptr) setEnvironment(name, value);
         else {
 #ifdef _WIN32
-            _putenv_s("APS5_LOOP_GUARD", "");
+            _putenv_s(name, "");
 #else
-            unsetenv("APS5_LOOP_GUARD");
+            unsetenv(name);
 #endif
         }
     }
     bool present = false;
     std::string previous;
+    const char* name;
 };
+
+void verifyUnnormalizedWrapTransitions(bool coldLoopOnly = false) {
+    DirectImageCacheLoopGuard noLoop(coldLoopOnly ? "8" : nullptr);
+    DirectImageCacheLoopGuard policy("0", "APS5_UNNORM_WRAP_GUARD");
+    ComputeRequest sample(true);
+    sample.code = {0x7e0402ffu, 0x3f000000u, 0x7e0602ffu, 0x3f000000u, 0xf09c0108u, 0x00610802u, 0xe0700000u, 0x80000800u, 0xbf810000u};
+    std::array<std::uint32_t, 20> users{0x10000000u, 0u, 256u, 0x00027facu,
+        0x20000000u, 0x00700000u, 0x815fc15fu, 0x9050024cu, 0u, 0u, 0u, 0u,
+        0x00008000u, 0x00fff000u, 0x05000000u, 0u};
+    sample.request.shader = {ShaderStage::Compute, 0xabc57000u, sample.code, 0, {}};
+    sample.request.context.userData = users;
+    SrtRuntime runtime{};
+    runtime.userData = users;
+    if (coldLoopOnly) {
+        sample.code.insert(sample.code.begin(), 0xbe900382u);
+        sample.code.insert(sample.code.end() - 1, {0x80908110u, 0xbf068010u, 0xbf84fff5u, 0x7e3c0280u, 0xdc708000u, 0x0012081eu});
+        users[18] = 0x30000000u;
+        sample.request.shader = {ShaderStage::Compute, 0xabc57300u, sample.code, 0, {}};
+        const auto loopArtifact = PrepareShader(sample.request);
+        require(GetPreparedArtifact(*loopArtifact).bdaAbiVersion == BdaAbi::Version, "loop artifact lacks its independent fault interface");
+        DirectImageCacheLoopGuard cleared(nullptr);
+        setEnvironment("APS5_UNNORM_WRAP_GUARD", "1");
+        bool refused = false;
+        try { static_cast<void>(MaterializeShader(sample.request, *CaptureResources(sample.request, runtime, *loopArtifact), *loopArtifact)); }
+        catch (const std::runtime_error& error) { refused = std::string_view(error.what()) == "unnormalized wrap requires emitted per-sampler guard proof"; }
+        require(refused, "loop artifact's fault buffer was mistaken for emitted wrap capability after clearing the loop guard");
+        std::cout << "cold loop artifact: independent BDA1 cannot replace wrap capability after clearing policy\n";
+        return;
+    }
+    const auto handle = PrepareShader(sample.request);
+    const auto capture = CaptureResources(sample.request, runtime, *handle);
+    const auto materialize = [&] { return MaterializeShader(sample.request, *capture, *handle); };
+    const auto hasFault = [](const auto& result) { return std::any_of(result.bindings.begin(), result.bindings.end(), [](const auto& binding) { return binding.role == DescriptorRole::FaultBuffer; }); };
+    const auto off = materialize();
+    require(!off->hasGuardedUnnormalizedWrap && !hasFault(*off), "disabled wrap retained a guard or fault completion");
+    setEnvironment("APS5_UNNORM_WRAP_GUARD", "1");
+    const auto on = materialize();
+    require(on->hasGuardedUnnormalizedWrap && hasFault(*on) && on->PipelineVariantId() != off->PipelineVariantId(), "wrap policy reused the disabled result memo");
+    require(materialize() == on, "enabled wrap did not reuse its result memo");
+    {
+        DirectImageCacheLoopGuard loop("8");
+        bool refused = false;
+        try { static_cast<void>(materialize()); }
+        catch (const std::runtime_error& error) { refused = std::string_view(error.what()) == "unnormalized wrap requires a compute fault buffer without a loop guard"; }
+        require(refused, "enabled loop guard reused the guarded wrap result memo");
+    }
+    require(materialize() == on, "clearing loop guard lost the valid wrap result memo");
+    sample.request.target.bdaAbiVersion = 0u;
+    bool abiRefused = false;
+    try { static_cast<void>(materialize()); }
+    catch (const std::runtime_error& error) { abiRefused = std::string_view(error.what()) == "ShaderRecompiler: prepared artifact does not match the static ABI"; }
+    require(abiRefused, "changed request ABI reused the guarded wrap result memo");
+    sample.request.target.bdaAbiVersion = BdaAbi::Version;
+    setEnvironment("APS5_UNNORM_WRAP_GUARD", "0");
+    require(materialize() == off, "disabling wrap reused the enabled result memo");
+    setEnvironment("APS5_UNNORM_WRAP_GUARD", "1");
+    for (const auto word : {0x12u, 0x8012u}) {
+        users[12] = word;
+        const auto ordinary = MaterializeShader(sample.request, *CaptureResources(sample.request, runtime, *handle), *handle);
+        require(!ordinary->hasGuardedUnnormalizedWrap && !hasFault(*ordinary), "normalized or clamp sampling retained wrap fault completion");
+    }
+    users[12] = 0x8000u;
+    sample.code[4] = 0xf0900108u;
+    sample.request.shader.codeAddress += 0x100u;
+    bool refused = false;
+    try {
+        const auto unsupported = PrepareShader(sample.request);
+        static_cast<void>(MaterializeShader(sample.request, *CaptureResources(sample.request, runtime, *unsupported), *unsupported));
+    }
+    catch (const std::runtime_error& error) { refused = std::string_view(error.what()) == "unnormalized wrap requires emitted per-sampler guard proof"; }
+    require(refused, "non-LZ artifact was accepted without emitted wrap capability");
+    std::cout << "unnormalized wrap: policy/result memo, loop guard, pruning and missing capability controls passed\n";
+}
 
 struct DirectImageCacheRequest : ComputeRequest {
     std::array<std::uint32_t, 12> imageUsers{0x00010000u, 56u << 20u, 0u, 0xd0000facu};
@@ -1581,6 +1657,7 @@ int main(int argc, char** argv) {
     mainAllocationThread = true;
     try {
         if (argc == 2 && std::string_view(argv[1]) == "--load") return runLoadingProcess();
+        if (argc == 2 && std::string_view(argv[1]) == "--load-wrap-loop") { verifyUnnormalizedWrapTransitions(true); return 0; }
         if (argc == 2 && std::string_view(argv[1]) == "--load-opposite-masked-select") return runOppositeMaskedSelectLoadingProcess();
         if (argc == 2 && (std::string_view(argv[1]) == "--load-direct-image-refusal" || std::string_view(argv[1]) == "--load-direct-image-loop-guard"
                 || std::string_view(argv[1]) == "--load-guarded-direct-image")) return runDirectImageLoadingProcess(argv[1]);
@@ -1601,6 +1678,12 @@ int main(int argc, char** argv) {
         verifyColdWriterAllocationFailure();
         verifyAcrossProcesses(argv[0]);
         verifyDirectImageAcrossProcesses(argv[0]);
+        verifyUnnormalizedWrapTransitions();
+        {
+            DirectImageCacheLoopGuard loop("8");
+            const std::string command = "\"" + std::string(argv[0]) + "\" --load-wrap-loop";
+            require(std::system(command.c_str()) == 0, "cold wrap loop artifact process failed");
+        }
         verifyEmissionFailureMemo();
         verifyFailureMemoSwitch(argv[0]);
         verifyInvocationIsolation();

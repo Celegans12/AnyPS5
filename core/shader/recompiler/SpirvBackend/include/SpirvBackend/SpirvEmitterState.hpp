@@ -87,6 +87,7 @@ struct SpirvTableAccess {
 struct SpirvEmitterState {
     const ImageResource* runtimeImage = nullptr;
     std::map<std::uint32_t, bool> directImageRefusals;
+    std::map<std::uint32_t, bool> unnormalizedWrapGuards;
     SpirvTableAccess tableAccess;
     SpirvEmitterState(const IrProgram& program, const ShaderStageInputInfo& inputInfo);
 

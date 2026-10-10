@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "ThreadOwned.hpp"
+#include "UnnormalizedWrap.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -1456,7 +1457,7 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
                 if (imageRole) {
                     if (binding.kind == ShaderRecompiler::DescriptorKind::SampledImage || binding.kind == ShaderRecompiler::DescriptorKind::StorageImage) stageResources += binding.count;
                     requireStageLimits();
-                    addImageBinding(binding, flags);
+                    addImageBinding(binding, flags, shader.program->hasGuardedUnnormalizedWrap);
                     continue;
                 }
                 if (!bufferRole) Require(false, std::string("unsupported descriptor role ") + roleName(binding.role));
@@ -1829,6 +1830,8 @@ template<typename TVisitor>
 void VisitContentKey(const CompiledShader& shader, bool dataWords, bool movableBuffers, const TVisitor& visit) {
     Require(shader.program != nullptr, "missing compiled shader");
     const auto& program = *shader.program;
+    visit(program.hasGuardedUnnormalizedWrap ? 1u : 0u);
+    visit(ShaderRecompiler::UnnormalizedWrapEnabled() ? 1u : 0u);
     visit(dataWords ? 1u : 0u);
     visit(static_cast<std::uint32_t>(shader.stage));
     visit(static_cast<std::uint32_t>(program.PipelineVariantId()));
@@ -3122,7 +3125,7 @@ void ShaderResources::PrecollectSurfaces() const {
     for (const auto& range : describedRanges) GuestMemory::CollectWrites(range.address, static_cast<std::size_t>(range.bytes));
 }
 
-void ShaderResources::addImageBinding(const ShaderRecompiler::DescriptorBinding& binding, VkShaderStageFlags flags) {
+void ShaderResources::addImageBinding(const ShaderRecompiler::DescriptorBinding& binding, VkShaderStageFlags flags, bool guardedUnnormalizedWrap) {
     Require(binding.count != 0, "empty descriptor binding");
     const auto heap = static_cast<ShaderRecompiler::RuntimeAbi::Binding>(binding.binding % static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Count));
     const auto capacity = binding.count;
@@ -3170,9 +3173,9 @@ void ShaderResources::addImageBinding(const ShaderRecompiler::DescriptorBinding&
             const bool compareEnable = binding.samplerDepthCompare.at(element);
             const bool unnormalized = element < binding.samplerUnnormalized.size() && binding.samplerUnnormalized[element];
             if (context.samplerCache != nullptr && !SamplerCacheDisabled()) {
-                samplers.push_back(context.samplerCache->Get(context, words, compareEnable, unnormalized, true));
+                samplers.push_back(context.samplerCache->Get(context, words, compareEnable, unnormalized, true, guardedUnnormalizedWrap));
             } else {
-                auto resource = DecodeSamplerResource(words, unnormalized, true);
+                auto resource = DecodeSamplerResource(words, unnormalized, true, guardedUnnormalizedWrap);
                 resource.compareEnable = compareEnable;
                 samplers.push_back(std::make_shared<Sampler>(context, resource));
             }
