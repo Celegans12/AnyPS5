@@ -61,6 +61,7 @@ alignas(256) std::array<float, Width * Height> FloatTexels{};
 alignas(256) std::array<float, Width * Height> OtherFloatTexels{};
 alignas(256) std::array<std::uint32_t, Width * Height> UintTexels{};
 alignas(256) std::array<std::int32_t, Width * Height> SintTexels{};
+alignas(256) std::array<std::uint16_t, Width * Height> StoreHalfTexels{};
 alignas(4096) std::array<std::uint32_t, 49152> DepthStorage{};
 alignas(256) std::array<std::uint32_t, Records * Stride / 4> Table{};
 alignas(256) std::array<std::uint32_t, 64> Keys{};
@@ -170,15 +171,16 @@ alignas(256) constexpr std::array<std::uint32_t, 17> ReadDirect256Code{
     0xbf810000u,
 };
 
-alignas(256) constexpr std::array<std::uint32_t, 15> StoreTableCode{
+alignas(256) constexpr std::array<std::uint32_t, 17> StoreTableCode{
     0xf4080100u, 0xfa000000u, 0xf4080200u, 0xfa000010u, 0x8f108202u, 0xf4200444u, 0x20000000u, 0x9312b011u,
-    0xf42c0802u, 0x24000000u, 0x360200bfu, 0x7e040280u, 0xf0208f08u, 0x00090401u, 0xbf810000u,
+    0xf42c0802u, 0x24000000u, 0x360200bfu, 0x7e040202u, 0x7e0802ffu, 0x00003e00u, 0xf0202108u, 0x80080401u,
+    0xbf810000u,
 };
 
-alignas(256) constexpr std::array<std::uint32_t, 17> StoreTableCutCode{
+alignas(256) constexpr std::array<std::uint32_t, 19> StoreTableCutCode{
     0xf4080100u, 0xfa000000u, 0xf4080200u, 0xfa000010u, 0x8f108202u, 0xf4200444u, 0x20000000u, 0x9312b011u,
-    0xf42c0802u, 0x24000000u, 0x360200bfu, 0x7e040280u, 0x7da400ffu, 0x00001000u, 0xf0208f08u, 0x00090401u,
-    0xbf810000u,
+    0xf42c0802u, 0x24000000u, 0x360200bfu, 0x7e040202u, 0x7e0802ffu, 0x00003e00u, 0x7da400ffu, 0x00001000u,
+    0xf0202108u, 0x80080401u, 0xbf810000u,
 };
 
 alignas(256) constexpr std::array<std::uint32_t, 30> PointerCode{
@@ -910,15 +912,38 @@ void RunModeTests(AgcDriver::VulkanDevice& device) {
 }
 
 void RunStoreTests(AgcDriver::VulkanDevice& device) {
-    SetClassRecords();
-    const auto saved = UintTexels;
+    StoreHalfTexels.fill(0x3555u);
+    auto image = Image(StoreHalfTexels.data(), 13u);
+    image[3] = (image[3] & ~0xfffu) | 0x24cu;
+    SetWideRecord(0u, image);
+    SetWideRecord(1u, image);
+    SetWideRecord(2u, {0x1234u, 0x5678u, 0x9abcu, 0x0000ffacu});
+    const auto flush = [&] {
+        AgcDriver::Graphics::StorageTexture::FlushPending(reinterpret_cast<std::uintptr_t>(StoreHalfTexels.data()), sizeof(StoreHalfTexels), nullptr, "test");
+        device.WaitIdle();
+    };
+    const auto saved = StoreHalfTexels;
     Keys = {};
-    Keys[0] = 1;
+    Keys[0] = 2u;
     const auto cut = Run(device, StoreTableCutCode, 1, Lanes, 64);
     Require(!Faulted(cut), "image table store: a store with EXEC clear faulted:\n" + cut.log);
-    const auto stored = Run(device, StoreTableCode, 1, Lanes, 64);
-    Require(Faulted(stored) && stored.log.find("unsupported operation") != std::string::npos, "image table store: an image_store through a table did not fault as an unsupported operation:\n" + stored.log);
-    Require(UintTexels == saved, "image table store: an unsupported store reached the image");
+    flush();
+    Require(StoreHalfTexels == saved, "image table store: a store with EXEC clear changed the image");
+    Keys[0] = 0u;
+    Keys[1] = 1u;
+    const auto stored = Run(device, StoreTableCode, 2, Lanes, 64);
+    Require(!Faulted(stored), "image table store: an active 2D D16 store faulted:\n" + stored.log);
+    flush();
+    for (std::uint32_t index = 0; index < StoreHalfTexels.size(); ++index) {
+        Require(StoreHalfTexels[index] == (index < 2u * Width ? 0x3e00u : 0x3555u), "image table store: aliased R16_FLOAT descriptors wrote the wrong texel " + std::to_string(index));
+    }
+    const auto afterStore = StoreHalfTexels;
+    Keys[0] = 2u;
+    const auto invalid = Run(device, StoreTableCode, 1, Lanes, 64);
+    Require(Faulted(invalid) && invalid.log.find("not an image") != std::string::npos, "image table store: an active invalid selection did not report its descriptor fault:\n" + invalid.log);
+    flush();
+    Require(StoreHalfTexels == afterStore, "image table store: an invalid selection changed the valid image");
+    SetClassRecords();
 }
 
 void RunPointerTests(AgcDriver::VulkanDevice& device) {
@@ -1416,6 +1441,10 @@ int main(int argc, char** argv) {
 #endif
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
+        if (argc == 2 && std::string_view(argv[1]) == "--stores") {
+            RunStoreTests(*device);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--descriptor-waterfall-guard") {
             const auto* enabled = std::getenv("APS5_UNNORM_WRAP_GUARD");
             Require(enabled != nullptr && std::string_view(enabled) == "1", "descriptor waterfall: guarded-arm mode requires APS5_UNNORM_WRAP_GUARD=1");
