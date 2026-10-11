@@ -17,6 +17,7 @@ struct RegisteredShaderMemory {
     std::size_t logicalBytes = 0, rawBytes = 0, rawCapacityBytes = 0;
     std::size_t coldBytes = 0, coldCapacityBytes = 0;
     std::size_t fileArtifacts = 0, fileBytes = 0;
+    std::size_t cacheArtifacts = 0, cacheBytes = 0;
     std::size_t codeBytes = 0, codeCapacityBytes = 0, headerBytes = 0, headerCapacityBytes = 0;
 
     bool operator==(const RegisteredShaderMemory&) const = default;

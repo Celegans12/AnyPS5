@@ -2,9 +2,13 @@
 #include "ColdSpirvCodec.hpp"
 #include "ColdSpirvCodecTestHooks.hpp"
 #include "ColdSpirvStorageTestHooks.hpp"
+#include "ShaderCacheDirectory.hpp"
 #include <barrier>
+#include <cstring>
 #include <future>
 #include <iostream>
+#include <latch>
+#include <random>
 #include <stdexcept>
 
 namespace {
@@ -174,6 +178,192 @@ void FileConcurrentReaders() {
     Require(Testing::InspectFileStorage().activeFiles == 0, "concurrent readers retained the arena after release");
 }
 
+struct CacheFile {
+    static constexpr std::uint64_t Offset = 16;
+    std::filesystem::path directory = std::filesystem::temp_directory_path() /
+        ("aps5-owned-cache-test-" + std::to_string(std::random_device{}()));
+    std::filesystem::path path = directory / "entry.bin";
+    std::vector<std::uint32_t> words = FileWords();
+    std::vector<std::byte> bytes;
+
+    CacheFile() : bytes(Offset + words.size() * sizeof(std::uint32_t) + 16, std::byte{0x35}) {
+        Require(std::filesystem::create_directory(directory), "cache fixture directory already exists");
+        std::memcpy(bytes.data() + Offset, words.data(), words.size() * sizeof(std::uint32_t));
+        Require(WriteFileAtomically(path, bytes), "cannot publish cache fixture");
+    }
+    ~CacheFile() {
+        std::error_code error;
+        std::filesystem::remove(path, error);
+        std::filesystem::remove(directory, error);
+    }
+    void WriteInPlace(std::span<const std::byte> data) const {
+        std::ofstream file(path, std::ios::binary | std::ios::trunc);
+        Require(static_cast<bool>(file), "cannot open cache fixture for in-place write");
+        file.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+        file.close();
+        Require(!file.fail(), "cannot finish in-place cache fixture write");
+    }
+};
+
+template<class F>
+void RequireCacheFailure(F&& action, const char* message) {
+    bool failed = false;
+    try { action(); }
+    catch (const std::runtime_error& error) { failed = std::string_view(error.what()) == message; }
+    Require(failed, "cache read did not report the expected failure");
+}
+
+void CacheAcquisitionAndMoves() {
+    CacheFile file;
+    SharedSpirv raw(file.words);
+    auto unchanged = [&] {
+        const auto info = raw.InspectStorage();
+        Require(info.residentBytes == file.words.size() * sizeof(std::uint32_t) && info.cacheBytes == 0 && !info.exposed &&
+                *raw.ReadTransient() == file.words, "failed cache acquisition changed resident storage");
+    };
+    Require(!raw.TryUseCacheFile(file.directory / "absent", CacheFile::Offset, file.bytes), "missing cache file was accepted");
+    Require(!raw.TryUseCacheFile(file.path, UINT64_MAX - 8, file.bytes), "overflowing cache range was accepted");
+    Require(!raw.TryUseCacheFile(file.path, file.bytes.size(), file.bytes), "out-of-file cache range was accepted");
+    Require(!raw.TryUseCacheFile(file.path, CacheFile::Offset + 4, file.bytes), "incorrect in-bounds cache word offset was accepted");
+    unchanged();
+    auto replacement = file.bytes;
+    replacement.front() ^= std::byte{1};
+    Require(WriteFileAtomically(file.path, replacement), "cannot replace cache fixture before acquisition");
+    Require(!raw.TryUseCacheFile(file.path, CacheFile::Offset, file.bytes), "changed full entry was accepted before acquisition");
+    replacement = file.bytes;
+    replacement[CacheFile::Offset] ^= std::byte{1};
+    Require(WriteFileAtomically(file.path, replacement), "cannot publish different cache words");
+    Require(!raw.TryUseCacheFile(file.path, CacheFile::Offset, replacement), "verified different words replaced the original artifact");
+    file.WriteInPlace(std::span(file.bytes).first(CacheFile::Offset + 4));
+    Require(!raw.TryUseCacheFile(file.path, CacheFile::Offset, file.bytes), "truncated cache file was accepted");
+    unchanged();
+    file.WriteInPlace(file.bytes);
+    {
+        const auto pin = raw.ReadTransient();
+        Require(!raw.TryUseCacheFile(file.path, CacheFile::Offset, file.bytes), "a live transient resident pin permitted eviction");
+        Require(*pin == file.words, "failed pinned acquisition changed borrowed words");
+    }
+    Require(raw.TryUseCacheFile(file.path, CacheFile::Offset, file.bytes), "cache acquisition did not retry after pin release");
+    const auto state = raw.InspectStorage();
+    Require(state.cacheBytes == file.words.size() * sizeof(std::uint32_t) && state.residentBytes == 0 && state.residentCapacityBytes == 0 &&
+            state.coldBytes == 0 && state.coldCapacityBytes == 0 && state.fileBytes == 0 && !state.exposed,
+            "cache publication retained another payload or reported incorrect bytes");
+    Require(!raw.TryMakeCold() && !raw.TryUseCacheFile(file.path, CacheFile::Offset, file.bytes), "cache-backed storage was replaced or recompressed");
+    Require(*raw.ReadTransient() == file.words && raw.InspectStorage().cacheBytes == state.cacheBytes, "transient cache read exposed or changed backing");
+    const auto& held = raw.Words();
+    SharedSpirv moved(std::move(raw));
+    Require(!moved.TryUseCacheFile(file.path, CacheFile::Offset, file.bytes), "move construction lost the exposed-reference guard");
+    SharedSpirv assigned;
+    assigned = std::move(moved);
+    Require(!assigned.TryUseCacheFile(file.path, CacheFile::Offset, file.bytes), "move assignment lost the exposed-reference guard");
+    Require(&assigned.Words() == &held && held == file.words, "move changed a previously exposed word reference");
+    for (const bool spill : {false, true}) {
+        Testing::ConfigureFileStorage(spill);
+        SharedSpirv cold(file.words);
+        Require(cold.TryMakeCold(), "cache transition fixture did not become cold");
+        Require(cold.TryUseCacheFile(file.path, CacheFile::Offset, file.bytes), "cold storage could not move to its verified cache entry");
+        Require(cold.InspectStorage().cacheBytes == state.cacheBytes && cold.InspectStorage().fileBytes == 0 &&
+                cold.InspectStorage().coldCapacityBytes == 0 && Testing::InspectFileStorage().activeFiles == 0 &&
+                *cold.ReadTransient() == file.words, "cache adoption retained the prior compressed/spool payload");
+    }
+}
+
+void CacheFailureAndOwnership() {
+    CacheFile file;
+    SharedSpirv source(file.words);
+    Require(source.TryUseCacheFile(file.path, CacheFile::Offset, file.bytes), "cache failure fixture did not acquire its file");
+    const auto bytes = source.InspectStorage().cacheBytes;
+    for (const auto [failure, message] : {
+            std::pair{Testing::CacheFailure::Read, "cache SPIR-V injected read failure"},
+            std::pair{Testing::CacheFailure::ShortRead, "cache SPIR-V read failed"},
+            std::pair{Testing::CacheFailure::CorruptRead, "cache SPIR-V checksum differs"}}) {
+        Testing::FailCacheOperation(failure);
+        RequireCacheFailure([&] { static_cast<void>(source.Words()); }, message);
+        Require(source.InspectStorage().cacheBytes == bytes && !source.InspectStorage().exposed &&
+                *source.ReadTransient() == file.words, "cache read failure lost the retryable original backing");
+    }
+    auto changed = source;
+    Testing::FailCacheOperation(Testing::CacheFailure::Read);
+    RequireCacheFailure([&] { changed[13] ^= 0x10u; }, "cache SPIR-V injected read failure");
+    Require(changed.InspectStorage().cacheBytes == bytes && source.InspectStorage().cacheBytes == bytes, "failed cache COW detached its source");
+    const auto pin = source.ReadTransient();
+    changed[13] ^= 0x10u;
+    auto expectedChange = file.words;
+    expectedChange[13] ^= 0x10u;
+    Require(changed.Words() == expectedChange && *pin == file.words && *source.ReadTransient() == file.words &&
+            source.InspectStorage().cacheBytes == bytes, "cache COW changed a transient pin or its sibling");
+#ifdef _WIN32
+    {
+        std::ofstream writer(file.path, std::ios::binary | std::ios::trunc);
+        Require(!writer, "an owned cache handle permitted in-place truncation");
+    }
+#else
+    auto corrupt = file.bytes;
+    corrupt[CacheFile::Offset] ^= std::byte{1};
+    file.WriteInPlace(corrupt);
+    RequireCacheFailure([&] { static_cast<void>(source.ReadTransient()); }, "cache SPIR-V checksum differs");
+    file.WriteInPlace(std::span(file.bytes).first(CacheFile::Offset + 4));
+    RequireCacheFailure([&] { static_cast<void>(source.Words()); }, "cache SPIR-V read failed");
+    Require(source.InspectStorage().cacheBytes == bytes && !source.InspectStorage().exposed, "in-place damage discarded the cache handle");
+    file.WriteInPlace(file.bytes);
+    Require(*source.ReadTransient() == file.words, "cache restore could not retry after in-place file repair");
+#endif
+    auto last = source;
+    source = SharedSpirv{};
+    Require(*last.ReadTransient() == file.words, "releasing one owner closed the shared cache file");
+    Require(last.Words() == file.words && last.InspectStorage().cacheBytes == 0, "hydration failed to release cache backing");
+    file.WriteInPlace(file.bytes);
+    {
+        SharedSpirv finalOwner(file.words);
+        Require(finalOwner.TryUseCacheFile(file.path, CacheFile::Offset, file.bytes), "destruction fixture did not acquire cache backing");
+    }
+    file.WriteInPlace(file.bytes);
+}
+
+void CacheConcurrentReaders() {
+    CacheFile file;
+    SharedSpirv source(file.words);
+    Require(source.TryUseCacheFile(file.path, CacheFile::Offset, file.bytes), "concurrent cache fixture did not acquire its file");
+    std::barrier start(4);
+    std::latch launchReady(1);
+    bool launchFailed = false;
+    std::vector<std::future<const std::vector<std::uint32_t>*>> tasks;
+    tasks.reserve(4);
+    try {
+        for (unsigned i = 0; i < 4; ++i) tasks.push_back(std::async(std::launch::async, [&, i] {
+            launchReady.wait();
+            if (launchFailed) return static_cast<const std::vector<std::uint32_t>*>(nullptr);
+            start.arrive_and_wait();
+            std::exception_ptr failure;
+            try {
+                const auto transient = source.ReadTransient();
+                auto copy = source;
+                copy[13] ^= i + 1;
+                auto expected = file.words;
+                expected[13] ^= i + 1;
+                Require(*transient == file.words && copy.Words() == expected && !source.InspectStorage().exposed,
+                        "concurrent transient reads or COW changed shared cache storage");
+            } catch (...) { failure = std::current_exception(); }
+            start.arrive_and_wait();
+            if (failure) std::rethrow_exception(failure);
+            return &source.Words();
+        }));
+    } catch (...) {
+        launchFailed = true;
+        launchReady.count_down();
+        throw;
+    }
+    launchReady.count_down();
+    const std::vector<std::uint32_t>* first = nullptr;
+    for (auto& task : tasks) {
+        const auto* result = task.get();
+        Require(result != nullptr && *result == file.words && (first == nullptr || first == result), "concurrent cache hydration published different words");
+        first = result;
+    }
+    Require(source.InspectStorage().cacheBytes == 0, "concurrent hydration retained cache backing");
+    file.WriteInPlace(file.bytes);
+}
+
 }
 
 int main() {
@@ -186,6 +376,9 @@ int main() {
         Testing::ConfigureFileStorage(true);
         AllocationFailurePreservesStorage();
         Require(Testing::InspectFileStorage().activeFiles == 0, "allocation-failure tests leaked a file owner");
+        CacheAcquisitionAndMoves();
+        CacheFailureAndOwnership();
+        CacheConcurrentReaders();
         std::cout << "cold SPIR-V storage allocation tests passed\n";
         return 0;
     } catch (const std::exception& error) {

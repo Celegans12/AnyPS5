@@ -719,6 +719,75 @@ void verifyStore() {
     require(ShaderDiskCache::Load(key, loaded), "a rewritten entry does not load");
 }
 
+void verifyVertexTypeSpecialization(bool cacheBacked = false);
+
+int runCacheBackingProcess() {
+    setEnvironment("APS5_CACHE_SPIRV_BACKING", "1");
+    const auto words = coldSpirvWords();
+    auto otherWords = words;
+    otherWords[17] ^= 0x1234u;
+    SampleRequest sample;
+    sample.code.back() = 0xcacebac1u;
+    const auto key = sample.Key();
+    auto variant = sampleVariant();
+    variant.artifact.spirv = words;
+    const auto original = std::make_shared<const CompiledVariant>(std::move(variant));
+    auto other = sampleVariant();
+    other.artifact.spirv = otherWords;
+    const auto replacement = std::make_shared<const CompiledVariant>(std::move(other));
+    const auto originalBytes = ShaderDiskCache::EncodeEntry(key, *original);
+    const auto replacementBytes = ShaderDiskCache::EncodeEntry(key, *replacement);
+    require(originalBytes.size() == replacementBytes.size() && originalBytes != replacementBytes,
+            "cache backing fixture did not create different valid same-size entries");
+    const auto before = ShaderDiskCache::Totals();
+    ShaderDiskCache::Store(key, original);
+    ShaderDiskCache::Flush();
+    const auto wordBytes = words.size() * sizeof(std::uint32_t);
+    require(original->artifact.spirv.InspectStorage().cacheBytes == wordBytes &&
+            original->artifact.spirv.InspectStorage().residentBytes == 0,
+            "successful async store did not adopt its cache entry");
+    CompiledVariant first;
+    require(ShaderDiskCache::Load(key, first) && first.artifact.spirv.InspectStorage().cacheBytes == wordBytes,
+            "verified cache hit did not adopt its entry");
+    const auto path = ShaderDiskCache::EntryDirectory() / ShaderDiskCache::EntryName(key);
+    ShaderDiskCache::Store(key, replacement);
+    ShaderDiskCache::Flush();
+    require(replacement->artifact.spirv.InspectStorage().cacheBytes == wordBytes,
+            "atomic replacement store did not adopt its own entry");
+    std::vector<std::byte> actual;
+    require(ReadWholeFile(path, actual) && actual == replacementBytes, "same-size atomic replacement did not publish the new valid entry");
+    CompiledVariant second;
+    require(ShaderDiskCache::Load(key, second) && second.artifact.spirv.InspectStorage().cacheBytes == wordBytes &&
+            *second.artifact.spirv.ReadTransient() == otherWords, "new load did not see the replacement words");
+    require(*original->artifact.spirv.ReadTransient() == words && *first.artifact.spirv.ReadTransient() == words,
+            "same-size replacement changed an already-owned artifact");
+    require(ShaderDiskCache::EncodeEntry(key, first) == originalBytes && ShaderDiskCache::EncodeEntry(key, second) == replacementBytes,
+            "cache backing changed serialized entry bytes");
+    require(WriteFileAtomically(path, std::span(replacementBytes).first(replacementBytes.size() / 2)), "cannot publish truncated replacement");
+    CompiledVariant rejected;
+    require(!ShaderDiskCache::Load(key, rejected), "new load accepted truncated replacement");
+    auto corrupt = replacementBytes;
+    corrupt.back() ^= std::byte{1};
+    require(WriteFileAtomically(path, corrupt) && !ShaderDiskCache::Load(key, rejected), "new load accepted corrupt replacement");
+    require(*second.artifact.spirv.ReadTransient() == otherWords && *first.artifact.spirv.ReadTransient() == words,
+            "invalid replacement damaged existing owned backing");
+    std::error_code error;
+    require(std::filesystem::remove(path, error) && !error, "owned cache handles prevented entry deletion");
+    require(!ShaderDiskCache::Load(key, rejected), "a deleted entry still loaded by pathname");
+    require(*original->artifact.spirv.ReadTransient() == words && *first.artifact.spirv.ReadTransient() == words &&
+            *replacement->artifact.spirv.ReadTransient() == otherWords && *second.artifact.spirv.ReadTransient() == otherWords,
+            "deletion invalidated a live owned cache handle");
+    require(first.artifact.spirv.InspectStorage().cacheBytes == wordBytes && !first.artifact.spirv.InspectStorage().exposed,
+            "replacement/deletion checks hydrated the retained original");
+    const auto after = ShaderDiskCache::Totals();
+    require(after.writes == before.writes + 2 && after.writeFailures == before.writeFailures &&
+            after.hits == before.hits + 2 && after.loadFailures == before.loadFailures + 2 && after.misses == before.misses + 1,
+            "cache ownership cases changed expected store/load outcomes");
+    verifyVertexTypeSpecialization(true);
+    std::cout << "owned cache backing survived valid replacement, rejected replacements and deletion\n";
+    return 0;
+}
+
 void verifyColdWriterAllocationFailure() {
     const auto words = coldSpirvWords();
     auto expected = sampleVariant();
@@ -759,7 +828,13 @@ void verifyColdWriterAllocationFailure() {
         require(ShaderDiskCache::Load(*storedKey, loaded), "an entry written after worker allocation failure does not load");
         requireSameVariant(expected, loaded, "cache writer allocation recovery");
     }
-    require(coldWorkerAllocationFailures.load(std::memory_order_relaxed) == 1u && frozen->artifact.spirv.ColdBytes() == coldBytes && *frozen->artifact.spirv.ReadTransient() == words && frozen->artifact.spirv.ColdBytes() == coldBytes, "successful retries repeated injection or changed the cold source");
+    const auto* backingSwitch = std::getenv("APS5_CACHE_SPIRV_BACKING");
+    const bool cacheBacking = backingSwitch != nullptr && std::string_view(backingSwitch) == "1";
+    const auto retainedBytes = cacheBacking ? words.size() * sizeof(std::uint32_t) : coldBytes;
+    require(coldWorkerAllocationFailures.load(std::memory_order_relaxed) == 1u &&
+            frozen->artifact.spirv.InspectStorage().cacheBytes == (cacheBacking ? retainedBytes : 0u) &&
+            frozen->artifact.spirv.ColdBytes() == retainedBytes && *frozen->artifact.spirv.ReadTransient() == words &&
+            frozen->artifact.spirv.ColdBytes() == retainedBytes, "successful retries repeated injection or changed the retained cold source");
 }
 
 struct ComputeRequest {
@@ -826,6 +901,36 @@ int runOppositeColdFileLoadingProcess() {
     return runLoadingProcess();
 }
 
+int runOppositeCacheBackingLoadingProcess() {
+    constexpr auto name = "APS5_CACHE_SPIRV_BACKING";
+    const auto* current = std::getenv(name);
+    const bool wasEnabled = current != nullptr && std::string_view(current) == "1";
+    setEnvironment(name, wasEnabled ? "0" : "1");
+    require((std::string_view(std::getenv(name)) == "1") != wasEnabled, "the child did not toggle cache backing");
+    std::cout << "opposite cache backing mode: " << (wasEnabled ? "on -> off" : "off -> on") << std::endl;
+    ComputeRequest cached(true);
+    const auto handle = PrepareShader(cached.request);
+    const auto& artifact = GetPreparedArtifact(*handle);
+    const auto before = artifact.spirv.InspectStorage();
+    require(before.cacheBytes == (wasEnabled ? 0u : artifact.spirv.size() * sizeof(std::uint32_t)) && !before.exposed,
+            "opposite cache mode did not use the expected prepared storage");
+    SrtRuntime runtime{};
+    runtime.userData = cached.userData;
+    runtime.shaderBase = cached.request.shader.codeAddress;
+    const auto capture = CaptureResources(cached.request, runtime, *handle);
+    const auto loaded = MaterializeShader(cached.request, *capture, *handle);
+    const auto after = artifact.spirv.InspectStorage();
+    require(after.cacheBytes == before.cacheBytes && after.residentBytes == before.residentBytes && !after.exposed,
+            "materialization permanently hydrated the prepared artifact");
+    const auto totals = ShaderDiskCache::Totals();
+    require(totals.hits == 1 && totals.misses == 0 && totals.loadFailures == 0 && totals.writes == 0,
+            "opposite cache mode did not reuse the same persisted key");
+    ComputeRequest fresh(false);
+    requireSameResult(Recompile(fresh.request), *loaded, "cache-backed materialization against uncached");
+    std::cout << "opposite cache mode: verified hit, exact materialization, prepared storage unchanged\n";
+    return 0;
+}
+
 void verifyAcrossProcesses(const char* self) {
     ComputeRequest request(true);
     const auto before = ShaderDiskCache::Totals();
@@ -840,6 +945,10 @@ void verifyAcrossProcesses(const char* self) {
     require(std::system(oppositeCommand.c_str()) == 0, "the opposite masked-select mode loading process failed");
     const std::string coldFileCommand = "\"" + std::string(self) + "\" --load-opposite-cold-file";
     require(std::system(coldFileCommand.c_str()) == 0, "the opposite cold file mode loading process failed");
+    for (const auto* mode : {"--load-opposite-cache-backing", "--cache-backing"}) {
+        const std::string cacheCommand = "\"" + std::string(self) + "\" " + mode;
+        require(std::system(cacheCommand.c_str()) == 0, std::string(mode) + " process failed");
+    }
     for (const auto* mode : {"--load-lazy-plan", "--load-eager-plan"}) {
         const std::string planCommand = "\"" + std::string(self) + "\" " + mode;
         require(std::system(planCommand.c_str()) == 0, std::string(mode) + " process failed");
@@ -1558,7 +1667,7 @@ void verifyBindingPlanSelection() {
     rejectsAlignment("base is not aligned to its element");
 }
 
-void verifyVertexTypeSpecialization() {
+void verifyVertexTypeSpecialization(bool cacheBacked) {
     CompiledShaderArtifact artifact;
     artifact.vertexInputs = {{0, 4, 0, 1}, {1, 4, 0, 1}};
     artifact.spirv = std::vector<std::uint32_t>{
@@ -1591,6 +1700,19 @@ void verifyVertexTypeSpecialization() {
     };
     PrepareVertexInputSpecialization(artifact);
     const auto original = artifact.spirv.Words();
+    if (cacheBacked) {
+        SampleRequest sample;
+        sample.code.back() = 0xcacebac2u;
+        const auto key = sample.Key();
+        auto variant = sampleVariant();
+        variant.artifact = artifact;
+        ShaderDiskCache::Store(key, std::make_shared<const CompiledVariant>(std::move(variant)));
+        ShaderDiskCache::Flush();
+        CompiledVariant loaded;
+        require(ShaderDiskCache::Load(key, loaded) && loaded.artifact.spirv.InspectStorage().cacheBytes == original.size() * sizeof(std::uint32_t),
+                "vertex specialization fixture did not load cache-backed words");
+        artifact = std::move(loaded.artifact);
+    }
     for (std::uint32_t first = 0; first < 3u; ++first) {
         for (std::uint32_t second = 0; second < 3u; ++second) {
             const std::array classes{first, second};
@@ -1614,7 +1736,9 @@ void verifyVertexTypeSpecialization() {
                 }
             }
             require(checked == 4u, "vertex specialization lost attribute loads");
-            require(artifact.spirv.Words() == original, "vertex specialization mutated the shared template");
+            require(*artifact.spirv.ReadTransient() == original, "vertex specialization mutated the shared template");
+            if (cacheBacked) require(artifact.spirv.InspectStorage().cacheBytes == original.size() * sizeof(std::uint32_t) &&
+                                    !artifact.spirv.InspectStorage().exposed, "vertex specialization permanently hydrated the prepared artifact");
         }
     }
     auto invalid = artifact;
@@ -1876,6 +2000,8 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--load-wrap-loop") { verifyUnnormalizedWrapTransitions(true); return 0; }
         if (argc == 2 && std::string_view(argv[1]) == "--load-opposite-masked-select") return runOppositeMaskedSelectLoadingProcess();
         if (argc == 2 && std::string_view(argv[1]) == "--load-opposite-cold-file") return runOppositeColdFileLoadingProcess();
+        if (argc == 2 && std::string_view(argv[1]) == "--load-opposite-cache-backing") return runOppositeCacheBackingLoadingProcess();
+        if (argc == 2 && std::string_view(argv[1]) == "--cache-backing") return runCacheBackingProcess();
         if (argc == 2 && (std::string_view(argv[1]) == "--load-direct-image-refusal" || std::string_view(argv[1]) == "--load-direct-image-loop-guard"
                 || std::string_view(argv[1]) == "--load-guarded-direct-image")) return runDirectImageLoadingProcess(argv[1]);
         if (argc == 2 && std::string_view(argv[1]) == "--no-failure-memo") return runWithoutFailureMemo();

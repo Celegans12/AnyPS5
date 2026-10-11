@@ -6,6 +6,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <initializer_list>
 #include <memory>
 #include <optional>
@@ -423,6 +424,7 @@ public:
         std::size_t coldBytes = 0;
         std::size_t coldCapacityBytes = 0;
         std::size_t fileBytes = 0;
+        std::size_t cacheBytes = 0;
         bool exposed = false;
         bool eligible = false;
     };
@@ -434,6 +436,8 @@ public:
     [[nodiscard]] const std::vector<std::uint32_t>& Words() const;
     [[nodiscard]] std::shared_ptr<const std::vector<std::uint32_t>> ReadTransient() const;
     [[nodiscard]] bool TryMakeCold() noexcept;
+    [[nodiscard]] bool TryUseCacheFile(const std::filesystem::path& path, std::uint64_t spirvOffset,
+                                       std::span<const std::byte> verifiedEntry) const noexcept;
     [[nodiscard]] std::size_t ColdBytes() const;
     [[nodiscard]] StorageInfo InspectStorage() const;
     operator const std::vector<std::uint32_t>&() const { return Words(); }

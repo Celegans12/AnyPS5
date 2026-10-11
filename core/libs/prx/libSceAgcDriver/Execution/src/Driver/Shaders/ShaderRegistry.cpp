@@ -70,8 +70,9 @@ RegisteredShaderMemory InspectRegisteredShaderMemory(const ShaderRegistry& regis
         if (!artifacts.insert(handle->artifact.get()).second) continue;
         const auto storage = ShaderRecompiler::GetPreparedArtifact(*handle).spirv.InspectStorage();
         result.rawArtifacts += storage.residentBytes != 0;
-        result.coldArtifacts += storage.coldBytes != 0 || storage.fileBytes != 0;
+        result.coldArtifacts += storage.coldBytes != 0 || storage.fileBytes != 0 || storage.cacheBytes != 0;
         result.fileArtifacts += storage.fileBytes != 0;
+        result.cacheArtifacts += storage.cacheBytes != 0;
         result.exposedArtifacts += storage.exposed;
         result.logicalBytes += storage.logicalBytes;
         result.rawBytes += storage.residentBytes;
@@ -79,6 +80,7 @@ RegisteredShaderMemory InspectRegisteredShaderMemory(const ShaderRegistry& regis
         result.coldBytes += storage.coldBytes;
         result.coldCapacityBytes += storage.coldCapacityBytes;
         result.fileBytes += storage.fileBytes;
+        result.cacheBytes += storage.cacheBytes;
     }
     result.handles = handles.size();
     result.sources = sources.size();
@@ -120,10 +122,10 @@ void ReportRegisteredShaderMemory(const ShaderRegistry& registry, const char* ph
         const auto started = std::chrono::steady_clock::now();
         const auto m = InspectRegisteredShaderMemory(registry);
         const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count();
-        std::fprintf(stderr, "[shader-memory] complete=1 phase=%s scope=current_registered_snapshots sampling=per_prepared_lock backing=per_unique_artifact_may_alias exposed_is_not_hydrated unmeasured=plans,variant_metadata,old_registries,specialized_modules,results,disk_temporaries,allocator_overhead,total_process registry_entries=%zu snapshots=%zu pending=%zu failed=%zu entry_refs=%zu handles=%zu sources=%zu artifacts=%zu missing_artifacts=%zu rectangle_pairs_excluded=%zu raw_artifacts=%zu cold_artifacts=%zu exposed_artifacts=%zu logical_bytes=%zu raw_bytes=%zu raw_capacity_bytes=%zu cold_bytes=%zu cold_capacity_bytes=%zu file_artifacts=%zu file_bytes=%zu code_bytes=%zu code_capacity_bytes=%zu header_bytes=%zu header_capacity_bytes=%zu elapsed_us=%lld\n",
+        std::fprintf(stderr, "[shader-memory] complete=1 phase=%s scope=current_registered_snapshots sampling=per_prepared_lock backing=per_unique_artifact_may_alias exposed_is_not_hydrated unmeasured=plans,variant_metadata,old_registries,specialized_modules,results,disk_temporaries,allocator_overhead,total_process registry_entries=%zu snapshots=%zu pending=%zu failed=%zu entry_refs=%zu handles=%zu sources=%zu artifacts=%zu missing_artifacts=%zu rectangle_pairs_excluded=%zu raw_artifacts=%zu cold_artifacts=%zu exposed_artifacts=%zu logical_bytes=%zu raw_bytes=%zu raw_capacity_bytes=%zu cold_bytes=%zu cold_capacity_bytes=%zu file_artifacts=%zu file_bytes=%zu cache_artifacts=%zu cache_bytes=%zu code_bytes=%zu code_capacity_bytes=%zu header_bytes=%zu header_capacity_bytes=%zu elapsed_us=%lld\n",
                      phase, m.registryEntries, m.snapshots, m.pending, m.failed, m.entryReferences, m.handles, m.sources, m.artifacts, m.missingArtifacts, m.excludedRectangles,
                      m.rawArtifacts, m.coldArtifacts, m.exposedArtifacts, m.logicalBytes, m.rawBytes, m.rawCapacityBytes, m.coldBytes, m.coldCapacityBytes,
-                     m.fileArtifacts, m.fileBytes, m.codeBytes, m.codeCapacityBytes, m.headerBytes, m.headerCapacityBytes, static_cast<long long>(elapsed));
+                     m.fileArtifacts, m.fileBytes, m.cacheArtifacts, m.cacheBytes, m.codeBytes, m.codeCapacityBytes, m.headerBytes, m.headerCapacityBytes, static_cast<long long>(elapsed));
     } catch (...) {
         std::fprintf(stderr, "[shader-memory] complete=0 phase=%s census_failed\n", phase);
     }

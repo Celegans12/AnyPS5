@@ -586,7 +586,8 @@ std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledSh
     }
     std::map<std::uint32_t, std::uint32_t> values;
     std::set<std::uint32_t> specializedIds;
-    const auto& words = source.Words();
+    const auto pinned = source.ReadTransient();
+    const auto& words = *pinned;
     if (words.size() < 5u || words[0] != spv::MagicNumber) throw std::runtime_error("invalid prepared specialization module");
     for (std::size_t cursor = 5; cursor < words.size();) {
         const auto count = words[cursor] >> 16u;
@@ -939,7 +940,7 @@ void makeColdForPublication(SharedSpirv& spirv, bool diskLoaded) noexcept {
         const auto after = spirv.InspectStorage();
         struct Totals {
             std::mutex mutex;
-            unsigned long long variants = 0, diskLoads = 0, eligible = 0, cold = 0, exposed = 0;
+            unsigned long long variants = 0, diskLoads = 0, eligible = 0, cold = 0, exposed = 0, cache = 0, cacheBytes = 0;
             unsigned long long logicalBytes = 0, rawBytes = 0, rawCapacityBytes = 0, coldBytes = 0, coldCapacityBytes = 0;
         };
         static Totals totals;
@@ -954,8 +955,10 @@ void makeColdForPublication(SharedSpirv& spirv, bool diskLoaded) noexcept {
         totals.rawCapacityBytes += after.residentCapacityBytes;
         totals.coldBytes += after.coldBytes;
         totals.coldCapacityBytes += after.coldCapacityBytes;
-        if (totals.variants == 1 || totals.variants % 256u == 0 || (!demoted && before.logicalBytes >= 16u * 1024u * 1024u)) {
-            std::fprintf(stderr, "[cold-spirv] publication_totals variants=%llu disk=%llu eligible=%llu cold=%llu exposed=%llu logical_bytes=%llu raw_bytes=%llu raw_capacity_bytes=%llu cold_bytes=%llu cold_capacity_bytes=%llu\n", totals.variants, totals.diskLoads, totals.eligible, totals.cold, totals.exposed, totals.logicalBytes, totals.rawBytes, totals.rawCapacityBytes, totals.coldBytes, totals.coldCapacityBytes);
+        totals.cache += after.cacheBytes != 0;
+        totals.cacheBytes += after.cacheBytes;
+        if (totals.variants == 1 || totals.variants % 256u == 0 || (!demoted && after.cacheBytes == 0 && before.logicalBytes >= 16u * 1024u * 1024u)) {
+            std::fprintf(stderr, "[cold-spirv] publication_totals variants=%llu disk=%llu eligible=%llu cold=%llu exposed=%llu logical_bytes=%llu raw_bytes=%llu raw_capacity_bytes=%llu cold_bytes=%llu cold_capacity_bytes=%llu cache=%llu cache_bytes=%llu\n", totals.variants, totals.diskLoads, totals.eligible, totals.cold, totals.exposed, totals.logicalBytes, totals.rawBytes, totals.rawCapacityBytes, totals.coldBytes, totals.coldCapacityBytes, totals.cache, totals.cacheBytes);
         }
     } catch (...) {
     }

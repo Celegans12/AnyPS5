@@ -12,13 +12,20 @@
 #include <mutex>
 #include <stdexcept>
 #include <string_view>
+#include <sys/stat.h>
 #include "ShaderCacheDirectory.hpp"
 #ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 #include <fcntl.h>
 #include <io.h>
 #include <process.h>
 #include <share.h>
-#include <sys/stat.h>
 #else
 #include <fcntl.h>
 #include <unistd.h>
@@ -54,9 +61,13 @@ FileCounters& Counters() { static FileCounters counters; return counters; }
 std::atomic<int> fileEnabled{-1};
 std::atomic<std::uint64_t> fileLimit{FileLimit}, fileReserve{FileReserve}, fileAvailable{UINT64_MAX};
 std::atomic<ColdSpirv::Testing::FileFailure> fileFailure{ColdSpirv::Testing::FileFailure::None};
+std::atomic<ColdSpirv::Testing::CacheFailure> cacheFailure{ColdSpirv::Testing::CacheFailure::None};
 std::filesystem::path lastFilePath;
 bool Fail(ColdSpirv::Testing::FileFailure wanted) {
     return fileFailure.compare_exchange_strong(wanted, ColdSpirv::Testing::FileFailure::None);
+}
+bool Fail(ColdSpirv::Testing::CacheFailure wanted) {
+    return cacheFailure.compare_exchange_strong(wanted, ColdSpirv::Testing::CacheFailure::None);
 }
 #endif
 bool FileEnabled() {
@@ -286,6 +297,89 @@ std::shared_ptr<const FileSlice> Spill(std::span<const std::byte> encoded) noexc
     } catch (...) { Fallback("exception"); return {}; }
 }
 
+struct CacheSlice {
+    ~CacheSlice() {
+#ifdef _WIN32
+        if (handle != INVALID_HANDLE_VALUE) CloseHandle(handle);
+#else
+        if (handle >= 0) close(handle);
+#endif
+    }
+    bool Open(const std::filesystem::path& path, std::span<const std::byte> expected) {
+        if (expected.empty() || expected.size() > INT64_MAX) return false;
+#ifdef _WIN32
+        handle = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE,
+                             nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        LARGE_INTEGER size;
+        if (handle == INVALID_HANDLE_VALUE || !GetFileSizeEx(handle, &size) || size.QuadPart < 0 ||
+            static_cast<std::uint64_t>(size.QuadPart) != expected.size()) return false;
+#else
+        handle = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        struct stat status;
+        if (handle < 0 || fstat(handle, &status) != 0 || status.st_size < 0 ||
+            static_cast<std::uint64_t>(status.st_size) != expected.size()) return false;
+#endif
+        std::array<std::byte, 64u * 1024u> check;
+        for (std::size_t done = 0; done < expected.size();) {
+            const auto count = std::min(check.size(), expected.size() - done);
+            if (!ReadAt(done, std::span(check).first(count)) ||
+                std::memcmp(check.data(), expected.data() + done, count) != 0) return false;
+            done += count;
+        }
+        return true;
+    }
+    std::vector<std::uint32_t> Read() const {
+        static std::mutex restoreMutex;
+        std::lock_guard restore(restoreMutex);
+        std::vector<std::uint32_t> words(bytes / sizeof(std::uint32_t));
+        auto output = std::as_writable_bytes(std::span(words));
+#ifdef ANYPS5_COLD_SPIRV_TESTING
+        if (Fail(ColdSpirv::Testing::CacheFailure::Read)) throw std::runtime_error("cache SPIR-V injected read failure");
+        if (Fail(ColdSpirv::Testing::CacheFailure::ShortRead)) output = output.first(output.size() - 1);
+#endif
+        if (!ReadAt(offset, output) || output.size() != bytes) throw std::runtime_error("cache SPIR-V read failed");
+#ifdef ANYPS5_COLD_SPIRV_TESTING
+        if (Fail(ColdSpirv::Testing::CacheFailure::CorruptRead)) output.front() ^= std::byte{1};
+#endif
+        if (HashBytes(output) != hash) throw std::runtime_error("cache SPIR-V checksum differs");
+        return words;
+    }
+    std::uint64_t offset = 0, bytes = 0, hash = 0;
+
+private:
+    bool ReadAt(std::uint64_t position, std::span<std::byte> output) const {
+        if (!Fits(position, output.size(), INT64_MAX)) return false;
+        std::lock_guard lock(ioMutex);
+#ifdef _WIN32
+        LARGE_INTEGER location;
+        location.QuadPart = static_cast<LONGLONG>(position);
+        if (!SetFilePointerEx(handle, location, nullptr, FILE_BEGIN)) return false;
+#else
+        static_assert(sizeof(off_t) >= sizeof(std::int64_t));
+#endif
+        while (!output.empty()) {
+            const auto count = std::min<std::size_t>(output.size(), 1024u * 1024u);
+#ifdef _WIN32
+            DWORD read = 0;
+            if (!ReadFile(handle, output.data(), static_cast<DWORD>(count), &read, nullptr) || read == 0) return false;
+#else
+            const auto read = pread(handle, output.data(), count, static_cast<off_t>(position));
+            if (read < 0 && errno == EINTR) continue;
+            if (read <= 0) return false;
+#endif
+            position += read;
+            output = output.subspan(static_cast<std::size_t>(read));
+        }
+        return true;
+    }
+    mutable std::mutex ioMutex;
+#ifdef _WIN32
+    HANDLE handle = INVALID_HANDLE_VALUE;
+#else
+    int handle = -1;
+#endif
+};
+
 }
 
 #ifdef ANYPS5_COLD_SPIRV_TESTING
@@ -298,6 +392,7 @@ void ConfigureFileStorage(bool enabled, std::uint64_t limit, std::uint64_t reser
     c.peak.store(0); c.highWater.store(0); c.live.store(0); c.appends.store(0); c.reads.store(0); c.fallbacks.store(0); c.peakRestores.store(0);
 }
 void FailFileOperation(FileFailure failure) noexcept { fileFailure.store(failure); }
+void FailCacheOperation(CacheFailure failure) noexcept { cacheFailure.store(failure); }
 FileStats InspectFileStorage() noexcept {
     auto& c = Counters();
     return {c.active.load(), c.peak.load(), c.highWater.load(), c.live.load(), c.appends.load(), c.reads.load(), c.fallbacks.load(), c.peakRestores.load()};
@@ -310,18 +405,25 @@ bool FileRangeFits(std::uint64_t offset, std::uint64_t bytes, std::uint64_t limi
 struct SharedSpirv::Storage {
     explicit Storage(std::vector<std::uint32_t> value) : words(std::make_shared<std::vector<std::uint32_t>>(std::move(value))) {}
 
+    std::vector<std::uint32_t> ReadCold() const {
+        if (cache != nullptr) return cache->Read();
+        return file != nullptr ? file->Read(wordCount) : ColdSpirv::Decompress(compressed, wordCount);
+    }
+
     void Hydrate() {
         if (words != nullptr) return;
-        auto loaded = std::make_shared<std::vector<std::uint32_t>>(file != nullptr ? file->Read(wordCount) : ColdSpirv::Decompress(compressed, wordCount));
+        auto loaded = std::make_shared<std::vector<std::uint32_t>>(ReadCold());
         words = std::move(loaded);
         std::vector<std::byte>().swap(compressed);
         file.reset();
+        cache.reset();
     }
 
     mutable std::mutex mutex;
     std::shared_ptr<std::vector<std::uint32_t>> words;
     std::vector<std::byte> compressed;
     std::shared_ptr<const FileSlice> file;
+    std::shared_ptr<const CacheSlice> cache;
     std::size_t wordCount = 0;
     std::atomic<bool> exposed{false};
     bool attempted = false;
@@ -350,7 +452,38 @@ std::shared_ptr<const std::vector<std::uint32_t>> SharedSpirv::ReadTransient() c
     }
     std::lock_guard lock(storage->mutex);
     if (storage->words != nullptr) return storage->words;
-    return std::make_shared<const std::vector<std::uint32_t>>(storage->file != nullptr ? storage->file->Read(storage->wordCount) : ColdSpirv::Decompress(storage->compressed, storage->wordCount));
+    return std::make_shared<const std::vector<std::uint32_t>>(storage->ReadCold());
+}
+
+bool SharedSpirv::TryUseCacheFile(const std::filesystem::path& path, std::uint64_t spirvOffset,
+                                std::span<const std::byte> verifiedEntry) const noexcept {
+    try {
+        if (storage == nullptr) return false;
+        std::lock_guard lock(storage->mutex);
+        if (storage->exposed.load(std::memory_order_relaxed) || storage->cache != nullptr ||
+            (storage->words != nullptr && storage->words.use_count() != 1)) return false;
+        const auto count = storage->words != nullptr ? storage->words->size() : storage->wordCount;
+        if (count == 0 || count > ColdSpirv::MaxBytes / sizeof(std::uint32_t) ||
+            !Fits(spirvOffset, count * sizeof(std::uint32_t), verifiedEntry.size())) return false;
+        const auto expected = verifiedEntry.subspan(static_cast<std::size_t>(spirvOffset), count * sizeof(std::uint32_t));
+        auto cache = std::make_shared<CacheSlice>();
+        if (!cache->Open(path, verifiedEntry)) return false;
+        std::vector<std::uint32_t> restored;
+        if (storage->words == nullptr) restored = storage->ReadCold();
+        const auto& words = storage->words != nullptr ? *storage->words : restored;
+        if (std::memcmp(words.data(), expected.data(), expected.size()) != 0) return false;
+        cache->offset = spirvOffset;
+        cache->bytes = expected.size();
+        cache->hash = HashBytes(expected);
+        storage->cache = std::move(cache);
+        storage->wordCount = count;
+        storage->words.reset();
+        std::vector<std::byte>().swap(storage->compressed);
+        storage->file.reset();
+        return true;
+    } catch (...) {
+        return false;
+    }
 }
 
 bool SharedSpirv::TryMakeCold() noexcept {
@@ -376,6 +509,7 @@ std::size_t SharedSpirv::ColdBytes() const {
     if (storage == nullptr) return 0;
     if (storage->exposed.load(std::memory_order_acquire)) return 0;
     std::lock_guard lock(storage->mutex);
+    if (storage->cache != nullptr) return static_cast<std::size_t>(storage->cache->bytes);
     return storage->file != nullptr ? static_cast<std::size_t>(storage->file->bytes) : storage->compressed.size();
 }
 
@@ -391,6 +525,7 @@ SharedSpirv::StorageInfo SharedSpirv::InspectStorage() const {
     info.coldBytes = storage->compressed.size();
     info.coldCapacityBytes = storage->compressed.capacity();
     info.fileBytes = storage->file != nullptr ? static_cast<std::size_t>(storage->file->bytes) : 0;
+    info.cacheBytes = storage->cache != nullptr ? static_cast<std::size_t>(storage->cache->bytes) : 0;
     info.exposed = storage->exposed.load(std::memory_order_relaxed);
     info.eligible = storage.use_count() == 1 && storage->words != nullptr && storage->words.use_count() == 1 && !info.exposed && !storage->attempted && info.logicalBytes >= 64u * 1024u && info.logicalBytes <= ColdSpirv::MaxBytes;
     return info;

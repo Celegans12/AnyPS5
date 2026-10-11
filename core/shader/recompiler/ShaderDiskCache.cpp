@@ -703,6 +703,7 @@ void decodeAllocation(Reader& reader, CompiledBindingLayout& allocation) {
 }
 
 constexpr std::string_view NeutralSwitches[] = {
+    "APS5_CACHE_SPIRV_BACKING",
     "APS5_COLD_SPIRV",
     "APS5_COLD_SPIRV_FILE",
     "APS5_PROFILE_DRAW",
@@ -731,6 +732,18 @@ const std::vector<std::byte>& switchKey() {
         return bytes;
     }();
     return key;
+}
+
+void retainEntry(const CompiledVariant& variant, const std::filesystem::path& path,
+                 std::size_t keyBytes, std::span<const std::byte> file) {
+    static const bool enabled = [] {
+        const auto* value = std::getenv("APS5_CACHE_SPIRV_BACKING");
+        return value != nullptr && std::string_view(value) == "1";
+    }();
+    if (!enabled) return;
+    constexpr std::size_t prefix = sizeof(FileHeader) + sizeof(std::uint32_t) + sizeof(std::uint64_t);
+    if (file.size() < prefix || keyBytes > file.size() - prefix) return;
+    static_cast<void>(variant.artifact.spirv.TryUseCacheFile(path, prefix + keyBytes, file));
 }
 
 std::string hex(std::uint64_t value) {
@@ -765,6 +778,7 @@ public:
                 case LoadStatus::Loaded:
                     hits.fetch_add(1, std::memory_order_relaxed);
                     bytesRead.fetch_add(file.size(), std::memory_order_relaxed);
+                    retainEntry(variant, directory / name, key.size(), file);
                     loaded = true;
                     break;
                 case LoadStatus::Absent:
@@ -849,6 +863,7 @@ private:
             if (WriteFileAtomically(directory / EntryName(job.key), file)) {
                 writes.fetch_add(1, std::memory_order_relaxed);
                 bytesWritten.fetch_add(file.size(), std::memory_order_relaxed);
+                retainEntry(*job.variant, directory / EntryName(job.key), job.key.size(), file);
             } else {
                 writeFailure(job, "file operation failed");
             }
