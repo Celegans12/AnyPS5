@@ -761,17 +761,18 @@ void AperturePreparationClassification(AgcDriver::VulkanDevice& device) {
     request.target = device.ComputeTarget(32);
     request.layout.pushConstantSizeBytes = 128;
     request.useCache = false;
+    const std::array apertureNames{"src_shared_base", "src_shared_limit", "src_private_base", "src_private_limit"};
     for (std::uint32_t source = 234u; source <= 238u; ++source) {
         code[0] = 0xbeea0400u | source;
         bool rejected = false;
         try { static_cast<void>(GetResourcePlan(request)); }
-        catch (const UnsupportedInstructionError& error) {
-            Require(source >= 235u, "a reserved scalar source became deferrable");
-            Require(std::string(error.what()).find("unsupported scalar source operand code " + std::to_string(source)) != std::string::npos, "aperture preparation lost its scalar source diagnostic");
-            rejected = true;
-        } catch (const std::invalid_argument& error) {
+        catch (const std::invalid_argument& error) {
             Require(source == 234u, "an aperture scalar source remained a malformed-input error");
             Require(std::string(error.what()).find("unsupported scalar source operand code 234") != std::string::npos, "reserved scalar source lost its diagnostic");
+            rejected = true;
+        } catch (const std::runtime_error& error) {
+            Require(source >= 235u, "a reserved scalar source became a translation failure");
+            Require(std::string(error.what()) == "TranslationContext::readRawU32: the scalar aperture source " + std::string(apertureNames[source - 235u]) + " is not modelled", "aperture preparation lost its named translation diagnostic");
             rejected = true;
         }
         Require(rejected, "an unsupported scalar source compiled successfully");
@@ -806,7 +807,7 @@ void DeferredUndecodableRegistration(bool aperture = false) {
     commands.insert(commands.end(), {0xc0033700u, 0x00100200u, static_cast<std::uint32_t>(destinationAddress), static_cast<std::uint32_t>(destinationAddress >> 32u), 7u});
     Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
     sceAgcDriverSubmitAcb(0x20, &packet);
-    const auto reason = aperture ? "unsupported scalar source operand code 235" : "unsupported MIMG opcode";
+    const auto reason = aperture ? "TranslationContext::readRawU32: the scalar aperture source src_shared_base is not modelled" : "unsupported MIMG opcode";
     ExpectFailure([] { AgcDriverWaitIdle_nid_postfix(); }, reason);
     ExpectFailure([] { AgcDriverShutdown_nid_postfix(); }, reason);
     Require(destination == 0u, "a deferred unsupported dispatch executed a subsequent memory write");

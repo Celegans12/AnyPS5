@@ -2570,7 +2570,7 @@ void descriptorCacheTests() {
         const auto fittingLayout = cache.Layout(fittingKey, fittingBindings, true, flags);
         const std::array<VkDescriptorPoolSize, 2> fitting{{{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 17}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 3}}};
         const auto chained = cache.Allocate(fittingLayout, fitting, true, 3u);
-        Require(mock.poolMaxSets == 1024 && mock.poolFlags == (VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT | VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT) && mock.variableDescriptorCount == 3u, "a chained update-after-bind pool lost the variable image count");
+        Require(mock.poolMaxSets == 1024 && mock.poolFlags == VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT && mock.variableDescriptorCount == 3u, "a chained update-after-bind pool lost the variable image count");
         cache.Free(chained);
         const auto reused = cache.Allocate(fittingLayout, fitting, true, 0u);
         Require(reused.pool == chained.pool && mock.variableDescriptorCount == 0u, "reusing an update-after-bind pool lost an empty variable image table");

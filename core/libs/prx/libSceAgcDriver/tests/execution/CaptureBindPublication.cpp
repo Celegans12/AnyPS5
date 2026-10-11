@@ -9,6 +9,7 @@
 #include <array>
 #include <bit>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -17,6 +18,7 @@
 #include <mutex>
 #include <span>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 #ifdef _WIN32
@@ -290,8 +292,14 @@ void RunRetry(AgcDriver::VulkanDevice& device, Fixture& fixture, std::uint32_t r
         }
         CheckOutput(fixture);
     } else {
-        const auto expected = which == RetryCase::Unrelated ? "Vulkan dispatch: workgroup count exceeds device limits" : "AGC graphics: guest snapshot differs from registered memory";
-        Require(failure == expected && typed == (which != RetryCase::Unrelated), "snapshot retry: wrong strict failure: " + failure);
+        bool expected = failure == "AGC graphics: guest snapshot differs from registered memory";
+        if (which == RetryCase::Unrelated) {
+            constexpr std::string_view prefix = "Vulkan dispatch: workgroup count 4294967295x1x1 exceeds device limits ";
+            std::array<unsigned, 3> limits{};
+            int consumed = 0;
+            expected = failure.starts_with(prefix) && std::sscanf(failure.c_str() + prefix.size(), "%ux%ux%u%n", &limits[0], &limits[1], &limits[2], &consumed) == 3 && prefix.size() + static_cast<std::size_t>(consumed) == failure.size();
+        }
+        Require(expected && typed == (which != RetryCase::Unrelated), "snapshot retry: wrong strict failure: " + failure);
         Require(std::all_of(fixture.output, fixture.output + 64 * 4, [](auto value) { return value == Sentinel; }), "snapshot retry: failed consumer wrote output");
     }
     Require(AgcDriver::Graphics::Recorder::PendingWriteBackCompletions() == 0, "snapshot retry: completion survived cleanup");
