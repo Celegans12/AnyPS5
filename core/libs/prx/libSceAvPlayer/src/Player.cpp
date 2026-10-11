@@ -29,13 +29,17 @@ void APS5_VABI GuestDeallocate_nid_no_patch(void*, void* memory) {
     GuestHeap::GuestHeapFree_nid_postfix(memory);
 }
 
+void* APS5_VABI GuestAllocateTexture_nid_no_patch(void*, std::uint32_t alignment, std::uint32_t size) {
+    return GuestHeap::GuestHeapAlignForGpu_nid_postfix(std::max<std::uint32_t>(alignment, 16), size);
+}
+
 AvPlayerMemAllocator WithGuestHeapFallback(AvPlayerMemAllocator memory) {
     if (!memory.allocate || !memory.deallocate) {
         memory.allocate = GuestAllocate_nid_no_patch;
         memory.deallocate = GuestDeallocate_nid_no_patch;
     }
     if (!memory.allocate_texture || !memory.deallocate_texture) {
-        memory.allocate_texture = GuestAllocate_nid_no_patch;
+        memory.allocate_texture = GuestAllocateTexture_nid_no_patch;
         memory.deallocate_texture = GuestDeallocate_nid_no_patch;
     }
     return memory;
@@ -136,7 +140,15 @@ void Player::deliver(const Event& event) {
     callback.event_callback(callback.object_ptr, event.id, 0, event.id == EventWarningId ? &warning : nullptr);
 }
 
+bool Player::readyLocked() const {
+    return source && state == State::Ready;
+}
+
 void Player::autoStart() {
+    {
+        std::lock_guard lock(mutex);
+        if (!readyLocked()) return;
+    }
     const int count = StreamCount();
     if (count <= 0) {
         Stop();
@@ -155,7 +167,8 @@ void Player::autoStart() {
     }
     if (video != -1) EnableStream(static_cast<std::uint32_t>(video));
     if (audio != -1) EnableStream(static_cast<std::uint32_t>(audio));
-    Start();
+    std::lock_guard lock(mutex);
+    if (readyLocked()) startLocked();
 }
 
 void Player::checkEndOfFile() {
@@ -246,6 +259,10 @@ int Player::ChangeStream(std::uint32_t from, std::uint32_t to) {
 
 int Player::Start() {
     std::lock_guard lock(mutex);
+    return startLocked();
+}
+
+int Player::startLocked() {
     if (!source) return SCE_AVPLAYER_ERROR_OPERATION_FAILED;
     if (state != State::Ready && state != State::Stop && stopLocked() != SCE_OK) return SCE_AVPLAYER_ERROR_OPERATION_FAILED;
     const int result = source->Start();

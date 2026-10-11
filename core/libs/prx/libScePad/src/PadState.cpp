@@ -2,10 +2,13 @@
 #include "prx/libScePad/include/Pad.hpp"
 #include "prx/libScePad/include/PadScript.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libScePad/include/InputCommandFile.hpp"
 #include "prx/libkernel/Time/include/Time.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
+#include <deque>
 #include <mutex>
 #include <stdexcept>
 
@@ -14,6 +17,13 @@ namespace {
     PadInputState state;
     PadOutputState output;
     std::uint64_t timestamp = 0;
+
+    struct QueuedInput {
+        PadInputState input;
+        std::uint64_t timestamp = 0;
+    };
+    constexpr std::size_t kQueueCapacity = 64;
+    std::deque<QueuedInput> queue;
     std::exception_ptr failure;
     bool initialized = false;
     Pad::PadScript script;
@@ -99,32 +109,21 @@ void Pad::Initialize() {
         if (!script.Empty()) APS5_LOG_OUT("[pad-script] t=%.3fs %s", Pad::ProcessSeconds(), script.Describe().c_str());
         timestamp = sceKernelGetProcessTime();
         lastFuseTime = timestamp;
+        queue.clear();
     }
     initialized = true;
 }
 
-PadData Pad::ReadState() {
-    std::lock_guard lock(stateMutex);
-    if (failure) std::rethrow_exception(failure);
-    if (!initialized) throw std::runtime_error("Pad: read before initialization");
-    const std::uint64_t now = sceKernelGetProcessTime();
-    const std::uint64_t scriptNow = script.Empty() ? 0 : Pad::MicrosSinceProcessStart();
-    const std::uint32_t scripted = script.Empty() ? 0 : script.Sample(scriptNow);
-    if (scripted != scriptButtons) {
-        APS5_LOG_OUT("[pad-script] t=%.3fs scripted buttons %s -> %s", static_cast<double>(scriptNow) * 1e-6,
-            Pad::ScriptButtonNames(scriptButtons).c_str(), Pad::ScriptButtonNames(scripted).c_str());
-        scriptButtons = scripted;
-        timestamp = now;
-    }
-    const std::uint32_t buttons = state.buttons | scripted;
+namespace {
+PadData BuildData(const PadInputState& state, std::uint64_t changeTime, std::uint64_t now, std::uint32_t injected) {
     PadData data{};
-    data.buttons = buttons;
+    data.buttons = state.buttons | injected;
     data.left_stick_x = state.sticks[0];
     data.left_stick_y = state.sticks[1];
     data.right_stick_x = state.sticks[2];
     data.right_stick_y = state.sticks[3];
-    data.analog_buttons_l2 = std::max<std::uint8_t>(state.analogButtonsL2, (buttons & 0x100) != 0 ? 255 : 0);
-    data.analog_buttons_r2 = std::max<std::uint8_t>(state.analogButtonsR2, (buttons & 0x200) != 0 ? 255 : 0);
+    data.analog_buttons_l2 = std::max<std::uint8_t>(state.analogButtonsL2, (data.buttons & 0x100) != 0 ? 255 : 0);
+    data.analog_buttons_r2 = std::max<std::uint8_t>(state.analogButtonsR2, (data.buttons & 0x200) != 0 ? 255 : 0);
 
     const bool live = state.hasMotion && output.motionEnabled;
     const std::array<float, 3> rest{0.0f, 9.80665f, 0.0f};
@@ -153,7 +152,7 @@ PadData Pad::ReadState() {
 
     data.connected = true;
     data.connected_count = 1;
-    data.timestamp = timestamp;
+    data.timestamp = changeTime;
 
     std::uint8_t touchNum = 0;
     for (int i = 0; i < 2; ++i) {
@@ -177,6 +176,54 @@ PadData Pad::ReadState() {
     }
     data.touch_data_touch_num = touchNum;
     return data;
+}
+
+std::uint32_t InjectedButtons(std::uint64_t now) {
+    static Pad::InputCommandFile commands(std::getenv("APS5_PAD_INPUT_FILE"));
+    static std::uint32_t lastInjected = 0;
+    const std::uint64_t scriptNow = script.Empty() ? 0 : Pad::MicrosSinceProcessStart();
+    const std::uint32_t scripted = script.Empty() ? 0 : script.Sample(scriptNow);
+    if (scripted != scriptButtons) {
+        APS5_LOG_OUT("[pad-script] t=%.3fs scripted buttons %s -> %s", static_cast<double>(scriptNow) * 1e-6,
+            Pad::ScriptButtonNames(scriptButtons).c_str(), Pad::ScriptButtonNames(scripted).c_str());
+        scriptButtons = scripted;
+    }
+    const auto injected = commands.Buttons(now) | scripted;
+    if (injected != lastInjected) {
+        lastInjected = injected;
+        timestamp = now;
+    }
+    return injected;
+}
+}
+
+PadData Pad::ReadState() {
+    std::lock_guard lock(stateMutex);
+    if (failure) std::rethrow_exception(failure);
+    if (!initialized) throw std::runtime_error("Pad: read before initialization");
+    const std::uint64_t now = sceKernelGetProcessTime();
+    const std::uint32_t injected = InjectedButtons(now);
+    return BuildData(state, timestamp, now, injected);
+}
+
+int Pad::Read(PadData* data, int num) {
+    if (data == nullptr || num <= 0) throw std::invalid_argument("Pad: invalid read buffer");
+    std::lock_guard lock(stateMutex);
+    if (failure) std::rethrow_exception(failure);
+    if (!initialized) throw std::runtime_error("Pad: read before initialization");
+    const std::uint64_t now = sceKernelGetProcessTime();
+    const std::uint32_t injected = InjectedButtons(now);
+    if (queue.empty()) {
+        data[0] = BuildData(state, timestamp, now, injected);
+        return 1;
+    }
+    int count = 0;
+    while (count < num && !queue.empty()) {
+        const QueuedInput& entry = queue.front();
+        data[count++] = BuildData(entry.input, entry.timestamp, now, injected);
+        queue.pop_front();
+    }
+    return count;
 }
 
 void Pad::SetVibration(std::uint8_t large, std::uint8_t small) {
@@ -295,6 +342,8 @@ extern "C" void PadPublishInput_nid_postfix(const PadInputState& input) {
         state.touch == input.touch && state.deviceKind == input.deviceKind) return;
     state = input;
     timestamp = sceKernelGetProcessTime();
+    if (queue.size() == kQueueCapacity) queue.pop_front();
+    queue.push_back({input, timestamp});
 }
 
 extern "C" void PadReportInputFailure_nid_postfix(std::exception_ptr error) {

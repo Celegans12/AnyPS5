@@ -90,6 +90,10 @@ std::size_t capture(SDL_AudioDeviceID device, std::uint8_t* dest, std::size_t by
 
 extern "C" {
 
+int APS5_VABI sceAudioInInit() {
+    return 0;
+}
+
 int APS5_VABI sceAudioInGetSilentState(int handle) {
     std::lock_guard lock(g_mutex);
     const Port* port = find(handle);

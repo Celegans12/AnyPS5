@@ -1,5 +1,4 @@
 #include "Optimization/ResourceTracker.hpp"
-#include "Optimization/MemoryIndexOwners.hpp"
 #include "Optimization/SrtWalker.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
 #include "SpirvBackend/SpirvBufferFormat.hpp"
@@ -289,14 +288,29 @@ private:
         return memory.kind == ResourceKind::ScalarAddress && !memory.addressIsFull && memory.dataBits == 32u && memory.dataDwords == 1u && immediateU32(read.Argument(2), high) && high == 0u && always ? &memory : nullptr;
     }
 
+    static bool AccessesMemory(IrOpcode op) {
+        return BufferAccessOf(op) != BufferAccess::None || AddressOpcodeInfoOf(op).access != AddressAccess::None || ImageOpcodeInfoOf(op).access != ImageAccess::None;
+    }
+
+    void IndexMemoryUsers() {
+        for (const auto& block : m_program.Blocks()) {
+            for (const IrValue* inst : block->Instructions()) {
+                if (AccessesMemory(inst->Opcode())) {
+                    m_memoryUsers[inst->Flags<MemoryFlags>().index].push_back(inst);
+                }
+            }
+        }
+        m_memoryUsersIndexed = true;
+    }
+
     bool MemoryIndexBelongsTo(std::uint32_t index, const IrValue& owner) const {
-        if (m_tableMemoryOwners.has_value()) {
-            return m_tableMemoryOwners->BelongsTo(index, owner);
+        if (m_memoryUsersIndexed) {
+            const auto users = m_memoryUsers.find(index);
+            return users == m_memoryUsers.end() || std::ranges::all_of(users->second, [&](const IrValue* user) { return user == &owner; });
         }
         for (const auto& block : m_program.Blocks()) {
             for (const IrValue* inst : block->Instructions()) {
-                const auto op = inst->Opcode();
-                if ((BufferAccessOf(op) == BufferAccess::None && AddressOpcodeInfoOf(op).access == AddressAccess::None && ImageOpcodeInfoOf(op).access == ImageAccess::None) || inst == &owner) {
+                if (!AccessesMemory(inst->Opcode()) || inst == &owner) {
                     continue;
                 }
                 if (inst->Flags<MemoryFlags>().index == index) {
@@ -815,6 +829,7 @@ private:
             IrValue* value;
         };
         std::vector<Pending> pending;
+        std::unordered_map<const IrBlock*, std::size_t> order;
     };
 
     IrValue* WebSelector(std::vector<IrValue*> tuple, DescriptorWeb& web, IrValue& position) {
@@ -893,7 +908,27 @@ private:
             web.arms.push_back(std::move(tuple));
             return arm;
         }
-        IrBlock* block = (*phi)->Parent();
+        if (web.order.empty()) {
+            const auto& order = m_program.BlockOrder();
+            for (std::size_t index = 0; index < order.size(); index++) {
+                web.order.emplace(order[index], index);
+            }
+        }
+        IrBlock* block = nullptr;
+        std::size_t latest = 0;
+        for (const IrValue* value : tuple) {
+            if (!value->IsPhi()) {
+                continue;
+            }
+            const auto found = web.order.find(value->Parent());
+            if (found == web.order.end()) {
+                return nullptr;
+            }
+            if (block == nullptr || found->second > latest) {
+                block = value->Parent();
+                latest = found->second;
+            }
+        }
         if (block == nullptr || web.selectors.size() == DescriptorWeb::maxStates) {
             return nullptr;
         }
@@ -902,7 +937,7 @@ private:
             return nullptr;
         }
         for (IrValue* value : tuple) {
-            if (value->IsPhi() && (value->Parent() != block || value->PhiBlockCount() != predecessors.size())) {
+            if (value->IsPhi() && value->Parent() == block && value->PhiBlockCount() != predecessors.size()) {
                 return nullptr;
             }
             if (web.lifted && !value->IsPhi() && (HoldsProgramCounter(value, phiSearchDepth) || Rematerialize(value, position, false, phiSearchDepth) == nullptr)) {
@@ -915,7 +950,7 @@ private:
         for (IrBlock* predecessor : predecessors) {
             std::vector<IrValue*> incoming;
             for (IrValue* value : tuple) {
-                IrValue* edge = value->IsPhi() ? PhiIncoming(*value, predecessor) : value;
+                IrValue* edge = value->IsPhi() && value->Parent() == block ? PhiIncoming(*value, predecessor) : value;
                 if (edge == nullptr) {
                     return nullptr;
                 }
@@ -1122,10 +1157,7 @@ private:
         if (!enabled) {
             return;
         }
-        static const bool indexOwners = std::getenv("APS5_NO_PERF_TABLE_OWNERS") == nullptr;
-        if (indexOwners) {
-            m_tableMemoryOwners.emplace(m_program);
-        }
+        IndexMemoryUsers();
         for (auto& block : m_program.Blocks()) {
             for (IrValue* inst : block->Instructions()) {
                 const auto imageInfo = ImageOpcodeInfoOf(inst->Opcode());
@@ -1170,6 +1202,8 @@ private:
                 }
             }
         }
+        m_memoryUsersIndexed = false;
+        m_memoryUsers.clear();
     }
 
     void KeepSourceAlive(IrValue& position, const DescriptorSource& source, std::vector<const IrValue*>& referenced) {
@@ -1376,11 +1410,12 @@ private:
         image.fmaskCompatible = image.fmaskCompatible && op == IrOpcode::ImageRead && memory.dataBits == 32u;
         image.depthBitsCompatible = image.depthBitsCompatible && memory.dataBits == 32u;
         image.constantSwizzleCompatible = image.constantSwizzleCompatible && (op == IrOpcode::ImageSampleRaw || op == IrOpcode::ImageGatherRaw);
-        const bool flatVolumeLoad = op == IrOpcode::ImageRead && !memory.imageHasMip && memory.imageSampleFlags == 0u;
+        const bool flatVolumeLoad = op == IrOpcode::ImageRead && memory.imageSampleFlags == 0u;
         const bool flatVolumeSample = op == IrOpcode::ImageSampleRaw && memory.imageSampleFlags == RdnaImageSampleFlagLevelZero;
-        image.flatVolumeCompatible = image.flatVolumeCompatible && (flatVolumeLoad || flatVolumeSample) && !memory.imagePacked && memory.imageByElements == 0u;
+        const bool flatVolumeQuery = op == IrOpcode::ImageQueryDimensions;
+        image.flatVolumeCompatible = image.flatVolumeCompatible && (flatVolumeLoad || flatVolumeSample || flatVolumeQuery) && !memory.imagePacked && memory.imageByElements == 0u;
         const bool flatLineLoad = op == IrOpcode::ImageRead && !memory.imageHasMip && memory.imageSampleFlags == 0u;
-        const bool flatLineSample = op == IrOpcode::ImageSampleRaw && memory.imageSampleFlags == RdnaImageSampleFlagLevelZero;
+        const bool flatLineSample = op == IrOpcode::ImageSampleRaw && (memory.imageSampleFlags == RdnaImageSampleFlagLevelZero || memory.imageSampleFlags == 0u);
         image.flatLineCompatible = image.flatLineCompatible && (flatLineLoad || flatLineSample) && !memory.imagePacked && memory.imageByElements == 0u;
         if ((memory.imageSampleFlags & RdnaImageSampleFlagCompare) != 0u) {
             constexpr auto unsupported = RdnaImageSampleFlagLod | RdnaImageSampleFlagDerivative;
@@ -1582,9 +1617,10 @@ private:
     // APS5_TRACE_BDA: address accesses seen by Collect (the first bdaTraceLimit are printed).
     unsigned m_bdaTraces = 0;
     std::vector<TableColumnPlan> m_tableColumns;
-    std::optional<Detail::MemoryIndexOwners> m_tableMemoryOwners;
     std::vector<const IrValue*> m_tablePlanningReads;
     std::vector<std::uint32_t> m_tablePlanningMemory;
+    std::unordered_map<std::uint32_t, std::vector<const IrValue*>> m_memoryUsers;
+    bool m_memoryUsersIndexed = false;
     struct EdgeSelectorEntry {
         IrBlock* block = nullptr;
         std::vector<bool> edges;

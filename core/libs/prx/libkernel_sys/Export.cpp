@@ -1,3 +1,4 @@
+#include <atomic>
 #include <algorithm>
 #include <cstdint>
 #include <cstddef>
@@ -13,9 +14,12 @@ extern "C" int* APS5_VABI __error_nid_postfix();
 
 namespace {
 constexpr int GuestEnoent = 2;
+constexpr int GuestEperm = 1;
 constexpr int GuestEio = 5;
 constexpr int GuestEfault = 14;
 constexpr int GuestEinval = 22;
+
+std::atomic<std::uint16_t> creationMask{022};
 
 std::int64_t Fail(int error) {
     *__error_nid_postfix() = error;
@@ -29,6 +33,19 @@ int GuestError(const std::error_code& error) {
 }
 
 extern "C" {
+
+int APS5_VABI fork_nid_postfix(void) {
+    NotImplemented_nid_no_patch("fork: child processes");
+    return -1;
+}
+
+int APS5_VABI setsid_nid_postfix(void) {
+    return static_cast<int>(Fail(GuestEperm));
+}
+
+std::uint16_t APS5_VABI umask_nid_postfix(std::uint16_t mask) {
+    return creationMask.exchange(static_cast<std::uint16_t>(mask & 07777));
+}
 
 std::int64_t APS5_VABI readlink_nid_postfix(const char* path, char* buffer, std::size_t size) {
     if (path == nullptr) return Fail(GuestEfault);

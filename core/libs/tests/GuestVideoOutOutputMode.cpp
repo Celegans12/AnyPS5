@@ -1,5 +1,6 @@
 #include "SceTypes.hpp"
 #include "prx/libc/include/Shutdown.hpp"
+#include "tests/VideoOutTestEnvironment.hpp"
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -26,6 +27,7 @@ static constexpr int UNKNOWN_OUTPUT_MODE = static_cast<int>(0x8029001E);
 static void Require(bool value) { if (!value) std::abort(); }
 
 int main() {
+    VideoOutTestEnvironment environment;
     std::array<std::uint8_t, sizeof(VideoOutOutputOptions)> raw{};
     raw.fill(0xAA);
     VideoOutOutputOptions options{};

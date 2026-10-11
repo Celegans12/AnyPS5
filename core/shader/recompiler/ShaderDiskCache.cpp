@@ -68,7 +68,7 @@ namespace ShaderRecompiler::ShaderDiskCache {
 static_assert(sizeof(CompiledShaderArtifact) == 192, "CompiledShaderArtifact changed: update the artifact encoder");
 static_assert(sizeof(ShaderInvocation) == 200, "ShaderInvocation changed: update the invocation encoder");
 static_assert(sizeof(RecompileResult) == 400, "RecompileResult changed: update EncodeResult and DecodeResult");
-static_assert(sizeof(DescriptorBinding) == 512, "DescriptorBinding changed: update the binding encoder");
+static_assert(sizeof(DescriptorBinding) == 592, "DescriptorBinding changed: update the binding encoder");
 static_assert(sizeof(VertexAttribute) == 32, "VertexAttribute changed: update the attribute encoder");
 static_assert(sizeof(VertexInput) == 16, "VertexInput changed: update the vertex input encoder");
 static_assert(sizeof(FragmentParameter) == 12, "FragmentParameter changed: update the parameter encoder");
@@ -258,6 +258,8 @@ void encodeBinding(Writer& writer, const DescriptorBinding& binding) {
     writer.Flags(binding.bufferWritten);
     writer.Flags(binding.samplerUnnormalized);
     writer.Flags(binding.imageUnnormalized);
+    writer.Flags(binding.imageUnnormalizedBaseLevel);
+    writer.Flags(binding.samplerIntegerBorder);
     writer.Values(std::span<const std::uint32_t>(binding.imageSamplers));
     writer.Flags(binding.bufferRead);
 }
@@ -283,6 +285,8 @@ void decodeBinding(Reader& reader, DescriptorBinding& binding) {
     reader.Flags(binding.bufferWritten);
     reader.Flags(binding.samplerUnnormalized);
     reader.Flags(binding.imageUnnormalized);
+    reader.Flags(binding.imageUnnormalizedBaseLevel);
+    reader.Flags(binding.samplerIntegerBorder);
     reader.Values(binding.imageSamplers);
     reader.Flags(binding.bufferRead);
 }
@@ -607,7 +611,7 @@ void decodeInfo(Reader& reader, CompiledShaderInfo& compiled) {
         in.Value(buffer.scalar);
         in.Value(buffer.typedAlignment);
     });
-    reader.List(info.images, 75, [](Reader& in, ImageResource& image) {
+    reader.List(info.images, 83, [](Reader& in, ImageResource& image) {
         in.Value(image.source);
         in.Value(image.firstUsePc);
         in.Value(image.resourceClass);
@@ -647,7 +651,7 @@ void decodeInfo(Reader& reader, CompiledShaderInfo& compiled) {
     bool preparedImageModes = false;
     reader.Value(preparedImageModes);
     if (preparedImageModes) ResourceMaterializer::PrepareImageModes(info);
-    reader.List(info.samplers, 20, [](Reader& in, SamplerResource& sampler) {
+    reader.List(info.samplers, 21, [](Reader& in, SamplerResource& sampler) {
         in.Value(sampler.source);
         in.Value(sampler.firstUsePc);
         in.Value(sampler.copyOf);
@@ -713,8 +717,6 @@ constexpr std::string_view NeutralSwitches[] = {
     "APS5_NO_PERF_FRONTEND_PAIR",
     "APS5_NO_PERF_DOM_INTERSECTION",
     "APS5_NO_PERF_LAZY_CAPTURE_PLAN",
-    "APS5_NO_PERF_MASKED_SELECT_SCRATCH",
-    "APS5_NO_PERF_TABLE_OWNERS",
     "APS5_NO_RESULT_MEMO",
 };
 

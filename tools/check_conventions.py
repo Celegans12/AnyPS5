@@ -30,6 +30,7 @@ AGENT_FILES = {"AGENTS.md", "CLAUDE.md", "GEMINI.md", ".cursorrules", "copilot-i
 
 CONVENTIONAL = re.compile(r"^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([^)]+\))?!?: \S")
 STRINGS = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'')
+TOKENS = re.compile(r'"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|//[^\n]*|/\*.*?\*/', re.S)
 ALLOWED_COMMENT = re.compile(r"^\s*(#\s*endif\b|}\s*;?\s*//\s*(end\s+)?namespace\b)")
 EXPORT = re.compile(r"\bAPS5_VABI\s+(\w+)\s*\(")
 STUB_BODY = re.compile(r"^(?:\(void\)\s*\w+\s*;|static_cast<void>\(\s*\w+\s*\)\s*;)*"
@@ -82,7 +83,7 @@ class Check:
         return git("show", f"{self.head}:{path}")
 
     def code(self):
-        debt = [(text, links("docs/dev/TechnicalDebt.md", text)) for text in self.show("docs/dev/TechnicalDebt.md").splitlines()] if "docs/dev/TechnicalDebt.md" in self.tree else []
+        debt = silent_stub_debt(self.show("docs/dev/TechnicalDebt.md")) if "docs/dev/TechnicalDebt.md" in self.tree else []
         exports = {}
         for path, lines in self.files(lambda p: p.suffix in CPP):
             core = path.startswith("core/") and "tests" not in PurePosixPath(path).parts
@@ -126,6 +127,8 @@ class Check:
 
     def build(self):
         for path, lines in self.files(lambda p: p.name == "CMakeLists.txt" or p.suffix == ".cmake"):
+            if path == "cmake/SystemDeps.cmake":
+                continue
             for number, text in lines:
                 if SYSTEM_DEPENDENCY.search(text.split("#", 1)[0]):
                     self.report("system-dependency", path, number, text.strip())
@@ -192,6 +195,22 @@ def links(path, text):
     return result
 
 
+def silent_stub_debt(text):
+    debt = []
+    section_level = 0
+    for line in text.splitlines():
+        heading = re.match(r"^(#{1,6})\s+(.+?)\s*$", line)
+        if heading:
+            level = len(heading[1])
+            if heading[2] == "Silent stubs":
+                section_level = level
+            elif level <= section_level:
+                section_level = 0
+        if section_level:
+            debt.append((line, links("docs/dev/TechnicalDebt.md", line)))
+    return debt
+
+
 def listed(debt, name, path):
     own = PurePosixPath(path).parts[:4]
     for text, targets in debt:
@@ -216,7 +235,7 @@ def allowed_notes(path):
 
 def function_body(lines, start):
     text = "\n".join(lines[start:start + 400])
-    text = re.sub(r"//[^\r\n]*|/\*.*?\*/", "", STRINGS.sub('""', text), flags=re.S)
+    text = TOKENS.sub(lambda match: "" if match.group(0).startswith("/") else '""', text)
     brace, semicolon = text.find("{"), text.find(";")
     if brace < 0 or 0 <= semicolon < brace:
         return None

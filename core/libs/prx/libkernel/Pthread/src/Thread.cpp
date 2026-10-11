@@ -6,6 +6,7 @@
 #include "prx/libkernel/KernelErrors.hpp"
 #include "prx/libc/include/CpuTopology.hpp"
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
@@ -23,6 +24,7 @@
 #include <cerrno>
 #include <csetjmp>
 #include <pthread.h>
+#include <sys/mman.h>
 #include <unistd.h>
 #endif
 
@@ -72,6 +74,7 @@ static GuestThreadState& CurrentGuestState() {
 }
 static std::mutex stackLock;
 static std::map<PthreadPrivate*, std::pair<std::uintptr_t, std::uintptr_t>> liveStacks;
+static std::map<std::uintptr_t, std::size_t> protectedStackPages;
 
 static bool HostStackLimits(std::uintptr_t* low, std::uintptr_t* high) {
 #ifdef _WIN32
@@ -122,8 +125,37 @@ static void RegisterStack(PthreadPrivate* self) {
     liveStacks[self] = {low, high};
 }
 
+static void RestoreStackPages(std::uintptr_t start, std::size_t bytes) noexcept {
+#ifdef _WIN32
+    DWORD previous = 0;
+    const bool restored = VirtualProtect(reinterpret_cast<void*>(start), bytes, PAGE_READWRITE, &previous) != 0;
+#else
+    const bool restored = ::mprotect(reinterpret_cast<void*>(start), bytes, PROT_READ | PROT_WRITE) == 0;
+#endif
+    if (!restored) std::fprintf(stderr, "[thread] cannot restore the protection of guest stack pages 0x%llx+0x%zx at thread exit\n", static_cast<unsigned long long>(start), bytes);
+}
+
+void NoteGuestStackProtection(std::uintptr_t start, std::size_t bytes, bool readWrite) {
+    std::lock_guard lock(stackLock);
+    auto it = protectedStackPages.upper_bound(start);
+    if (it != protectedStackPages.begin() && std::prev(it)->first + std::prev(it)->second > start) --it;
+    while (it != protectedStackPages.end() && it->first < start + bytes) it = protectedStackPages.erase(it);
+    if (!readWrite) protectedStackPages[start] = bytes;
+}
+
 static void UnregisterStack(PthreadPrivate* self) {
     std::lock_guard lock(stackLock);
+    if (const auto found = liveStacks.find(self); found != liveStacks.end()) {
+        const auto [low, high] = found->second;
+        for (auto it = protectedStackPages.begin(); it != protectedStackPages.end();) {
+            if (it->first < high && it->first + it->second > low) {
+                RestoreStackPages(it->first, it->second);
+                it = protectedStackPages.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
     liveStacks.erase(self);
 }
 
@@ -189,6 +221,14 @@ static void BindHostCpuClock(PthreadPrivate* self) {
 
 int GuestThreadCpuClockId(const PthreadPrivate* thread) {
     return static_cast<int>(CPU_CLOCK_BIT | static_cast<std::uint32_t>(thread->cpuClockThread));
+}
+
+void SetLiveGuestThreadsAffinity(KernelCpumask mask) {
+    auto& registry = CpuClocks();
+    std::lock_guard lock(registry.lock);
+    for (const auto& [id, thread] : registry.threads) {
+        if (!thread->_finished.load(std::memory_order_acquire)) thread->affinity.store(mask, std::memory_order_relaxed);
+    }
 }
 
 bool GuestThreadCpuNanos(int cpuClockThread, std::uint64_t* nanos) {

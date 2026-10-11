@@ -15,7 +15,45 @@ int APS5_VABI sigaddset_nid_postfix(GuestSignalSet*, int);
 int APS5_VABI sigdelset_nid_postfix(GuestSignalSet*, int);
 int APS5_VABI sigismember_nid_postfix(const GuestSignalSet*, int);
 int* APS5_VABI __error_nid_postfix();
+int APS5_VABI _sigprocmask_nid_postfix(int, const GuestSignalSet*, GuestSignalSet*);
+int APS5_VABI TitleSigsetjmp(std::uint64_t* buffer, int saveMask);
+[[noreturn]] void APS5_VABI siglongjmp_nid_postfix(std::uint64_t* buffer, int value);
 }
+
+#ifdef _WIN32
+#define TEST_ASM_FUNCTION(name) ".globl " name "\n.def " name "; .scl 2; .type 32; .endef\n" name ":\n"
+#define TEST_ASM_CALL(name) "    call " name "\n"
+#else
+#define TEST_ASM_FUNCTION(name) ".globl " name "\n.type " name ", @function\n" name ":\n"
+#define TEST_ASM_CALL(name) "    call " name "@PLT\n"
+#endif
+
+asm(".text\n"
+    TEST_ASM_FUNCTION("TitleSigsetjmp")
+    "    movl %esi, 88(%rdi)\n"
+    "    testl %esi, %esi\n"
+    "    jz 2f\n"
+    "    pushq %rdi\n"
+    "    movq %rdi, %rcx\n"
+    "    movq $1, %rdi\n"
+    "    movq $0, %rsi\n"
+    "    leaq 72(%rcx), %rdx\n"
+    TEST_ASM_CALL("_sigprocmask_nid_postfix")
+    "    popq %rdi\n"
+    "2:\n"
+    "    movq %rdi, %rcx\n"
+    "    movq 0(%rsp), %rdx\n"
+    "    movq %rdx, 0(%rcx)\n"
+    "    movq %rbx, 8(%rcx)\n"
+    "    movq %rsp, 16(%rcx)\n"
+    "    movq %rbp, 24(%rcx)\n"
+    "    movq %r12, 32(%rcx)\n"
+    "    movq %r13, 40(%rcx)\n"
+    "    movq %r14, 48(%rcx)\n"
+    "    movq %r15, 56(%rcx)\n"
+    "    fnstcw 64(%rcx)\n"
+    "    xorq %rax, %rax\n"
+    "    ret\n");
 
 static void Require(bool value) { if (!value) std::abort(); }
 
@@ -23,7 +61,43 @@ static bool Equals(const GuestSignalSet& set, std::uint32_t w0, std::uint32_t w1
     return set.bits[0] == w0 && set.bits[1] == w1 && set.bits[2] == w2 && set.bits[3] == w3;
 }
 
+static std::uint32_t BlockedMask() {
+    GuestSignalSet current{};
+    Require(_sigprocmask_nid_postfix(1, nullptr, &current) == 0);
+    return current.bits[0];
+}
+
+static void SetBlockedMask(std::uint32_t mask) {
+    const GuestSignalSet set{{mask, 0, 0, 0}};
+    Require(_sigprocmask_nid_postfix(3, &set, nullptr) == 0);
+}
+
+static int JumpBack(int saveMask, int value, std::uint32_t maskAtSet, std::uint32_t maskAtJump) {
+    std::uint64_t buffer[12]{};
+    volatile int jumped = 0;
+    SetBlockedMask(maskAtSet);
+    const int result = TitleSigsetjmp(buffer, saveMask);
+    if (jumped == 0) {
+        Require(result == 0);
+        jumped = 1;
+        SetBlockedMask(maskAtJump);
+        siglongjmp_nid_postfix(buffer, value);
+    }
+    return result;
+}
+
+static void CheckSiglongjmp() {
+    Require(JumpBack(1, 0, 0x5u, 0x30u) == 1);
+    Require(BlockedMask() == 0x5u);
+    Require(JumpBack(1, 7, 0x9u, 0u) == 7);
+    Require(BlockedMask() == 0x9u);
+    Require(JumpBack(0, -3, 0x5u, 0x30u) == -3);
+    Require(BlockedMask() == 0x30u);
+    SetBlockedMask(0);
+}
+
 int main() {
+    CheckSiglongjmp();
     static constexpr int Untouched = 5;
     GuestSignalSet set{{0x12345678u, 0x9abcdef0u, 0xffffffffu, 1u}};
     *__error_nid_postfix() = Untouched;

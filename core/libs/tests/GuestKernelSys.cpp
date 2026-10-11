@@ -11,6 +11,8 @@
 
 extern "C" {
 std::int64_t APS5_VABI readlink_nid_postfix(const char*, char*, std::size_t);
+int APS5_VABI setsid_nid_postfix(void);
+std::uint16_t APS5_VABI umask_nid_postfix(std::uint16_t);
 int* APS5_VABI __error_nid_postfix();
 }
 
@@ -26,6 +28,10 @@ int Error() {
 }
 
 int main() {
+    Require(setsid_nid_postfix() == -1 && Error() == 1);
+    Require(umask_nid_postfix(0) == 022);
+    Require(umask_nid_postfix(07777) == 0);
+    Require(umask_nid_postfix(022) == 07777);
     const auto root = std::filesystem::path("anyps5-kernel-sys-test-" +
         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     Require(std::filesystem::create_directory(root));

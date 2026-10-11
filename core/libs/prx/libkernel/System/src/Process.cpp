@@ -4,6 +4,7 @@
 #endif
 #include <windows.h>
 #include <shellapi.h>
+#include <tlhelp32.h>
 #else
 #include <sched.h>
 #include <unistd.h>
@@ -13,7 +14,9 @@
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/ApplicationHeap.hpp"
 #include "prx/libc/include/Shutdown.hpp"
+#include "prx/libkernel/AppMetadata/include/AppMetadata.hpp"
 #include "prx/libkernel/DirectMemory/DirectMemory.hpp"
+#include "prx/libkernel/KernelErrors.hpp"
 #include "prx/libkernel/Pthread/include/Pthread.hpp"
 #include <array>
 #include <atomic>
@@ -197,6 +200,47 @@ int APS5_VABI getpid_nid_postfix(void) {
     return static_cast<int>(pid);
 }
 
+int APS5_VABI getppid_nid_postfix(void) {
+#ifdef _WIN32
+    const DWORD self = GetCurrentProcessId();
+    const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE)
+        throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "getppid: CreateToolhelp32Snapshot");
+    PROCESSENTRY32W entry{};
+    entry.dwSize = sizeof(entry);
+    bool found = false;
+    DWORD pid = 0;
+    for (BOOL more = Process32FirstW(snapshot, &entry); more && !found; more = Process32NextW(snapshot, &entry)) {
+        if (entry.th32ProcessID == self) {
+            pid = entry.th32ParentProcessID;
+            found = true;
+        }
+    }
+    CloseHandle(snapshot);
+    if (!found) throw std::runtime_error("getppid: the process is missing from the process snapshot");
+#else
+    const auto pid = ::getppid();
+#endif
+    if (static_cast<std::uint64_t>(pid) > static_cast<std::uint64_t>(std::numeric_limits<int>::max()))
+        throw std::runtime_error("Parent process identifier is outside the guest range");
+    return static_cast<int>(pid);
+}
+
+int APS5_VABI sceKernelGetAppInfo(int pid, void* info) {
+    if (pid != getpid_nid_postfix()) return SCE_KERNEL_ERROR_EPERM;
+    if (info == nullptr) return 0;
+    constexpr std::size_t TitleIdOffset = 0x10;
+    constexpr std::size_t TitleIdBytes = 10;
+    const auto titleId = GetAppTitleId_nid_postfix();
+    char field[TitleIdBytes] = {};
+    std::strncpy(field, titleId.value, sizeof(field) - 1);
+    auto* bytes = static_cast<std::uint8_t*>(info);
+    const std::uint32_t appId = 1;
+    std::memcpy(bytes, &appId, sizeof(appId));
+    std::memcpy(bytes + TitleIdOffset, field, TitleIdBytes);
+    return 0;
+}
+
 int APS5_VABI getuid_nid_postfix(void) {
     return 0;
 }
@@ -234,6 +278,13 @@ int APS5_VABI waitpid_nid_postfix(int pid, int* status, int options) {
     (void)pid;
     (void)status;
     *__error_nid_postfix() = (static_cast<unsigned>(options) & ~freebsdWaitOptions) != 0 ? errnoInvalidArgument : errnoNoChild;
+    return -1;
+}
+
+int APS5_VABI execvp_nid_postfix(const char* file, char* const* arguments) {
+    (void)file;
+    (void)arguments;
+    NotImplemented_nid_no_patch("execvp: executable replacement");
     return -1;
 }
 
@@ -291,6 +342,10 @@ int APS5_VABI sceKernelUuidCreate(std::uint32_t* uuid) {
 
 void APS5_VABI sceKernelSync(void) {
     SyncWrittenPaths_nid_no_patch();
+}
+
+void APS5_VABI sync_nid_postfix(void) {
+    sceKernelSync();
 }
 
 int APS5_VABI sched_get_priority_max_nid_postfix(int policy) {

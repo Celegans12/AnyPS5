@@ -34,6 +34,7 @@ struct HostImport {
     VkDeviceAddress address;
     void* alias = nullptr;
     std::shared_ptr<const GuestAllocations::Range> range {};
+    std::vector<std::shared_ptr<const GuestAllocations::Range>> ranges {};
     // Identity for the life of this import (see HostImportSerial); 0 until first asked for.
     std::uint64_t serial = 0;
     bool unwatched = false;
@@ -50,6 +51,7 @@ struct ImportProbe {
     std::uint32_t writtenAtImport = 0;
     std::uint32_t writtenAfterSubmit = 0;
     std::uint32_t writtenByCpu = 0;
+    std::uint32_t writtenAfterFill = 0;
 };
 
 ImportProbe ProbeImportWriteProtection(const Context& context);
@@ -61,6 +63,7 @@ void SetImportWatch(const Context& context, ImportWatch watch);
 // (alignment and budget permitting), or null. Bytes at `address` are at `address - import->base` in
 // the import's buffer.
 const HostImport* HostImportFor(const Context& context, std::uint64_t address, std::size_t bytes);
+bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& ranges, std::uint64_t generation, bool adoptDevice);
 // Whether an existing import covers [address, address + bytes), without reconciling the imports
 // with the registry or making one (HostImportFor may take a registry lease): a hint for choices
 // made outside the device lock (a sampled texture's path, a dispatch's pre-sync); the path taken
@@ -69,6 +72,7 @@ bool HostImportCovers(const Context& context, std::uint64_t address, std::size_t
 // Whether a readable registered allocation contains [address, address + bytes) right now (one
 // registry lease): a storage image whose memory was freed or re-registered has nothing to store to.
 bool RegisteredReadableCovers(std::uint64_t address, std::size_t bytes);
+std::uint64_t RegisteredReadableEnd(std::uint64_t address);
 
 // A persistent device copy of one registered range of the main guest image (which cannot be host
 // imported); see GuestBufferMemory.cpp.
@@ -159,6 +163,7 @@ struct MirrorStats {
     std::uint64_t heapRefills = 0;
     std::uint64_t sweeps = 0;
     std::uint64_t heapChecks = 0;
+    std::uint64_t sparseBinds = 0;
 };
 MirrorStats MirrorCounters();
 void ClearImageMirrors(VkDevice device);
@@ -251,7 +256,7 @@ public:
     bool HoldsLease() const { return !lease.empty() || space != nullptr; }
     std::size_t CopiedBytes() const {
         std::size_t bytes = 0;
-        for (const auto& region : regions) if (region.buffer != nullptr) bytes += static_cast<std::size_t>(region.end - region.begin);
+        for (const auto& region : regions) if (region.buffer != nullptr) bytes += static_cast<std::size_t>((region.bufferEnd != 0 ? region.bufferEnd : region.end) - region.begin);
         return bytes;
     }
     // Every uploaded region as [begin, end) when all of them are served by host imports, in place or
@@ -284,7 +289,10 @@ private:
         // Set when the region covers uncommitted pages: only the `backed` parts (possibly none) are guest
         // memory; the rest reads as zeros and is never stored.
         bool sparse = false;
+        bool sparseHeap = false;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> backed {};
+        std::uint64_t lastView = 0;
+        std::uint64_t bufferEnd = 0;
         // Set when the region is served by an image mirror: nothing is copied; writable mirrors are
         // written back by comparing with the mirror's shadow. Kept alive here for recorded work.
         std::shared_ptr<ImageMirror> mirror {};
@@ -336,11 +344,15 @@ private:
     void addCopiedRange(const CopiedRange& range);
     // The BDA table entry of an uploaded region.
     static ShaderRecompiler::BdaAbi::Range addressRange(const Region& region);
+    static std::uint64_t servedEnd(const Region& region);
     void validate(std::uint64_t address, std::size_t bytes) const;
     // The region of a descriptor-bound range (AddWritable/AddReadable), committed pages only. A
     // range inside a base region of the space adds nothing: the region serves it, as today's merge
     // of the two did.
     void addDescriptorRegion(std::uint64_t address, std::size_t bytes, bool atomic, bool swept);
+    static bool servesView(const Region& region, std::uint64_t view);
+    static bool sparseHeapCandidate(const Region& region);
+    bool bindSparseMirror(Region& region, const GuestAllocations::Lease& lease);
     // Gives a region a buffer of its own with its bytes (guest memory for host-backed and writable
     // ranges, plus the write-back's reference copy for a range a descriptor writes; else its snapshot).
     void copyRegion(Region& region, bool addressable);

@@ -4,14 +4,20 @@
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include <chrono>
+#include <thread>
 using Handler = void (APS5_VABI *)(int);
 extern "C" {
 Handler APS5_VABI signal_nid_postfix(int, Handler);
 int APS5_VABI raise_nid_postfix(int);
+int APS5_VABI pthread_kill_nid_postfix(void*, int);
+void* APS5_VABI scePthreadSelf();
 int APS5_VABI sigaction_nid_postfix(int, const void*, void*);
 int APS5_VABI sigprocmask_nid_postfix(int, const void*, void*);
+int APS5_VABI pthread_sigmask_nid_postfix(int, const void*, void*);
 int* APS5_VABI __error_nid_postfix();
 int APS5_VABI _is_signal_return_nid_postfix(std::uint64_t);
+unsigned int APS5_VABI GuestAlarm_nid_no_patch(unsigned int);
 }
 struct GuestSignalSet {
     std::uint32_t bits[4];
@@ -45,6 +51,19 @@ int main() {
     Require(_is_signal_return_nid_postfix(0) == 0);
     received = 0;
     Require(raise_nid_postfix(15) == 0 && received == 15);
+    received = 0;
+    Require(pthread_kill_nid_postfix(scePthreadSelf(), 15) == 0 && received == 15);
+    received = 0;
+    Require(pthread_kill_nid_postfix(scePthreadSelf(), 0) == 0 && received == 0);
+    Require(pthread_kill_nid_postfix(scePthreadSelf(), 200) == 22);
+    Require(pthread_kill_nid_postfix(scePthreadSelf(), -1) == 22);
+    Require(pthread_kill_nid_postfix(nullptr, 15) == 3);
+    Require(pthread_kill_nid_postfix(nullptr, 128) == 3);
+    Require(pthread_kill_nid_postfix(nullptr, 129) == 22);
+    bool threw = false;
+    try { pthread_kill_nid_postfix(reinterpret_cast<void*>(std::uintptr_t{0x10}), 15); }
+    catch (const std::runtime_error&) { threw = true; }
+    Require(threw && received == 0);
     Require(signal_nid_postfix(15, ignore) != invalid);
     received = 0;
     Require(raise_nid_postfix(15) == 0 && received == 0);
@@ -59,6 +78,16 @@ int main() {
     Require(sigprocmask_nid_postfix(2, &blocked, nullptr) == 0);
     Require(sigprocmask_nid_postfix(1, nullptr, &previous) == 0);
     Require(previous.bits[0] == 0);
+    *__error_nid_postfix() = 0;
+    Require(pthread_sigmask_nid_postfix(1, &blocked, nullptr) == 0);
+    Require(pthread_sigmask_nid_postfix(0, &blocked, &previous) == 22);
+    Require(pthread_sigmask_nid_postfix(4, &blocked, &previous) == 22);
+    Require(*__error_nid_postfix() == 0);
+    Require(pthread_sigmask_nid_postfix(0, nullptr, &previous) == 0);
+    Require(previous.bits[0] == 0x20);
+    Require(sigprocmask_nid_postfix(1, nullptr, &previous) == 0 && previous.bits[0] == 0x20);
+    Require(pthread_sigmask_nid_postfix(2, &blocked, &previous) == 0 && previous.bits[0] == 0x20);
+    Require(pthread_sigmask_nid_postfix(1, nullptr, &previous) == 0 && previous.bits[0] == 0);
 
     const auto callback = reinterpret_cast<std::uintptr_t>(Callback);
     const auto infoCallback = reinterpret_cast<std::uintptr_t>(InfoCallback);
@@ -117,4 +146,15 @@ int main() {
     Require(sigprocmask_nid_postfix(1, &urgMask, nullptr) == 0);
     Require(raise_nid_postfix(15) == 0 && received == 15);
     Require(sigprocmask_nid_postfix(2, &urgMask, nullptr) == 0);
+
+    Require(GuestAlarm_nid_no_patch(0) == 0);
+    Require(GuestAlarm_nid_no_patch(5) == 0);
+    Require(GuestAlarm_nid_no_patch(3) == 5);
+    Require(GuestAlarm_nid_no_patch(0) == 3);
+    Require(GuestAlarm_nid_no_patch(0) == 0);
+    const GuestSigaction ignoreAlarm{1, 0, {}};
+    Require(sigaction_nid_postfix(14, &ignoreAlarm, nullptr) == 0);
+    Require(GuestAlarm_nid_no_patch(1) == 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    Require(GuestAlarm_nid_no_patch(0) == 0);
 }

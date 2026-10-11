@@ -80,7 +80,7 @@ void Check(AgcDriver::VulkanDevice& device, AgcDriver::Graphics::ShaderPath path
     fragment.snapshot->code.resize(64);
     fragment.snapshot->code.insert(fragment.snapshot->code.end(), pixelCode.begin(), pixelCode.end());
     ShaderRegistry registry;
-    for (const auto* fixture : {&front, &back, &domain, &fragment}) registry.emplace(fixture->snapshot->codeAddress, fixture->snapshot);
+    for (const auto* fixture : {&front, &back, &domain, &fragment}) registry.emplace(fixture->snapshot->codeAddress, std::vector<std::shared_ptr<const ShaderSnapshot>>{fixture->snapshot});
     AgcDriver::QueueState queue{};
     queue.context[0x8e] = 0xfu;
     queue.context[0x8f] = 0xfu;
@@ -231,15 +231,20 @@ void Check(AgcDriver::VulkanDevice& device, AgcDriver::Graphics::ShaderPath path
         request.layout.pushConstantSizeBytes -= 4;
         static_cast<void>(InvocationFor(*program.snapshot, program.codeOffset, request));
         request.layout.pushConstantOffsetBytes = 2;
-        Reject([&] { static_cast<void>(InvocationFor(*program.snapshot, program.codeOffset, request)); }, "artifact is missing");
+        Reject([&] { static_cast<void>(InvocationFor(*program.snapshot, program.codeOffset, request)); }, "not dword-aligned");
         request.layout = {0, 0, 0, mesh ? MeshDrawPushOffsetBytes : 128u};
         if (pixel) request.context.pixel->interpolatorSettings[0] ^= 1u;
         else if (tessellation) ++request.graphics->tessellation->outputControlPoints;
         else if (mesh) ++request.graphics->mesh->maxVertices;
         else ++request.context.userDataBaseRegister;
-        Reject([&] { static_cast<void>(InvocationFor(*program.snapshot, program.codeOffset, request)); }, "artifact is missing");
+        const auto predicted = program.snapshot->prepared->entries.size();
+        static_cast<void>(InvocationFor(*program.snapshot, program.codeOffset, request));
+        Require(program.snapshot->prepared->entries.size() == predicted + 1, "a draw state that registration did not predict was not prepared");
+        static_cast<void>(InvocationFor(*program.snapshot, program.codeOffset, request));
+        Require(program.snapshot->prepared->entries.size() == predicted + 1, "an artifact prepared at a draw was not reused");
     }
     ShaderRegistry invalidRegistry;
+    invalidRegistry[1] = {std::make_shared<const ShaderSnapshot>(ShaderSnapshot{1, 0, 2, {}, {}})};
     DrawDecode invalid{};
     invalid.state = prepared.state;
     Reject([&] { DecodeGraphicsPrograms(invalid, queue, invalidRegistry, true, true); }, "registered");
@@ -256,8 +261,8 @@ void NullPixelMatchesRegistration(AgcDriver::VulkanDevice& device) {
     const auto registered = null->prepared->entries;
     Require(!registered.empty(), "the null pixel program was not prepared at registration");
     ShaderRegistry registry;
-    registry.emplace(front.snapshot->codeAddress, front.snapshot);
-    registry.emplace(null->codeAddress, null);
+    registry.emplace(front.snapshot->codeAddress, std::vector<std::shared_ptr<const ShaderSnapshot>>{front.snapshot});
+    registry.emplace(null->codeAddress, std::vector<std::shared_ptr<const ShaderSnapshot>>{null});
     AgcDriver::QueueState queue{};
     queue.context[0x8e] = 0xfu;
     queue.context[0x8f] = 0xfu;

@@ -176,10 +176,11 @@ const char* UnnormalizedUseReason(std::uint32_t uses) {
 struct UnnormalizedProof {
     std::vector<bool> samplers;
     std::vector<bool> images;
+    std::vector<bool> imagesAtBaseLevel;
 };
 
 UnnormalizedProof ProveUnnormalized(const ShaderInfo& info, const ResourceSnapshot& snapshot) {
-    UnnormalizedProof proof{std::vector<bool>(info.samplers.size()), std::vector<bool>(info.images.size())};
+    UnnormalizedProof proof{std::vector<bool>(info.samplers.size()), std::vector<bool>(info.images.size()), std::vector<bool>(info.images.size())};
     for (std::uint32_t r = 0; r < info.samplers.size(); r++) {
         if (snapshot.samplers.at(r).dwordCount != 4u) fail("sampler descriptor must contain four dwords");
         const auto& sampler = info.samplers[r];
@@ -190,7 +191,7 @@ UnnormalizedProof ProveUnnormalized(const ShaderInfo& info, const ResourceSnapsh
             }
             continue;
         }
-        const std::uint32_t unsupported = sampler.uses & ~static_cast<std::uint32_t>(SamplerUseExplicitLod | SamplerUseOffset);
+        const std::uint32_t unsupported = sampler.uses & ~static_cast<std::uint32_t>(SamplerUseExplicitLod | SamplerUseOffset | SamplerUseNonZeroLod);
         if (unsupported != 0u) {
             failUnnormalized(UnnormalizedUseReason(unsupported));
         }
@@ -213,6 +214,16 @@ UnnormalizedProof ProveUnnormalized(const ShaderInfo& info, const ResourceSnapsh
             proof.images[pair.image] = true;
         }
         proof.samplers[r] = true;
+    }
+    for (std::uint32_t resource = 0; resource < info.images.size(); resource++) {
+        bool exact = proof.images[resource];
+        for (const auto& pair : info.sampledPairs) {
+            if (!exact) break;
+            if (pair.image != resource) continue;
+            const auto& words = snapshot.samplers.at(pair.sampler).dwords;
+            exact = proof.samplers[pair.sampler] && info.samplers.at(pair.sampler).uses == SamplerUseExplicitLod && (words[1] & 0xfffu) == 0u && (words[2] & 0x3fffu) == 0u;
+        }
+        proof.imagesAtBaseLevel[resource] = exact;
     }
     return proof;
 }
@@ -323,15 +334,24 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
     }
     std::vector<std::uint32_t> samplerModes(info.samplers.size(), 0u);
     std::vector<std::uint32_t> directSamplerModes(info.samplers.size(), 0u);
+    std::vector<std::uint32_t> samplerIntegerModes(info.samplers.size(), 0u);
+    std::vector<std::uint32_t> samplerFloatModes(info.samplers.size(), 0u);
     const auto samplerMode = [](const ImageResource& image) { return !image.constantSwizzle && (image.numericClass == IrTextureNumericClass::Sint || image.conversionFormat != IrBufferFormat::Invalid || image.depthBits) ? 2u : 1u; };
+    const auto pairSampler = [&](std::uint32_t sampler, const ImageResource& image) {
+        const auto mode = samplerMode(image);
+        samplerModes.at(sampler) |= mode;
+        (image.numericClass == IrTextureNumericClass::Uint || image.numericClass == IrTextureNumericClass::Sint ? samplerIntegerModes : samplerFloatModes).at(sampler) |= mode;
+    };
     for (const auto& pair : info.sampledPairs) {
         const auto& image = info.images.at(pair.image);
         if (image.table == NoTable) {
-            const auto mode = samplerMode(info.runtimeImageModes.at(pair.image).at(imageModes[pair.image]));
-            samplerModes.at(pair.sampler) |= mode;
-            directSamplerModes.at(pair.sampler) |= mode;
+            const auto& mode = info.runtimeImageModes.at(pair.image).at(imageModes[pair.image]);
+            pairSampler(pair.sampler, mode);
+            directSamplerModes.at(pair.sampler) |= samplerMode(mode);
         } else {
             samplerModes.at(pair.sampler) |= 3u;
+            samplerIntegerModes.at(pair.sampler) |= 3u;
+            samplerFloatModes.at(pair.sampler) |= 3u;
         }
     }
     for (std::uint32_t index = 0; index < info.images.size(); ++index) {
@@ -406,6 +426,7 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
                 physical.imageDepthCompare.push_back(mode.depthCompare);
                 physical.imageAtomic.push_back(image.atomic);
                 physical.imageUnnormalized.push_back(unnormalized.images.at(resource));
+                physical.imageUnnormalizedBaseLevel.push_back(unnormalized.imagesAtBaseLevel.at(resource));
                 physical.imageSamplers.push_back(0u);
                 physical.imageAtomic64.push_back(image.atomic64);
             }
@@ -419,6 +440,8 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
                 const auto& words = snapshot.samplers.at(resource).dwords;
                 const bool tablePointOnly = (directSamplerModes.at(resource) & 2u) == 0u;
                 if ((originals[element] & 1u) != 0u && !(tablePointOnly && ReducesBetweenTexels(words[0], words[2]))) entry.samplerFilterElements.push_back(element);
+                const auto mode = 1u << (originals[element] & 1u);
+                physical.samplerIntegerBorder.push_back((samplerIntegerModes.at(resource) & mode) != 0u && (samplerFloatModes.at(resource) & mode) == 0u);
             }
         } else if (physical.role == DescriptorRole::ShaderData && layout.UsesPushData()) {
             fail("DescriptorBindingBuilder::Populate shader-data binding must not exist when push data is used");

@@ -34,6 +34,8 @@ extern "C" std::uint32_t* APS5_VABI sceAgcAcbPushMarker(CommandBuffer* buf, cons
 extern "C" std::uint32_t* APS5_VABI sceAgcAcbPopMarker(CommandBuffer* buf);
 extern "C" std::uint32_t* APS5_VABI sceAgcAcbSetMarker(CommandBuffer* buf, const char* str, std::uint32_t color);
 extern "C" std::uint32_t* APS5_VABI sceAgcDcbSetIndexBuffer(CommandBuffer* buf, std::uint64_t indexAddress);
+extern "C" std::uint32_t* APS5_VABI sceAgcDcbSetBaseIndirectArgs(CommandBuffer* buf, std::uint32_t shaderType, const volatile void* indirectBaseAddr);
+extern "C" std::uint32_t* APS5_VABI sceAgcSetNop(CommandBuffer* buf, std::uint32_t sizeDw);
 
 namespace {
 
@@ -107,6 +109,21 @@ void testPackets() {
     check(noDown.cursor_up == scratch.data() + 6, "buffer without a down cursor did not use its top as the limit");
     expectFailure([&] { Agc::Command::WriteNop(&noDown, 3, __func__); });
     check(noDown.cursor_up == scratch.data() + 6, "allocation past the top of a buffer without a down cursor advanced its cursor");
+}
+
+void testNop() {
+    Storage storage;
+    storage.words.fill(0xdeadbeefu);
+    auto* single = sceAgcSetNop(&storage.buffer, 1);
+    auto* pair = sceAgcSetNop(&storage.buffer, 2);
+    auto* triple = sceAgcSetNop(&storage.buffer, 3);
+    const std::array<std::uint32_t, 7> expected{0xffff1000u, 0xc0001000u, 0, 0xc0011000u, 0, 0, 0xdeadbeefu};
+    check(single == storage.words.data() && pair == single + 1 && triple == pair + 2, "incorrect NOP placement");
+    check(std::equal(expected.begin(), expected.end(), storage.words.begin()), "incorrect NOP packet");
+    check(storage.buffer.cursor_up == storage.words.data() + 6, "incorrect NOP cursor advance");
+    expectFailure([&] { sceAgcSetNop(&storage.buffer, 0); });
+    expectFailure([&] { sceAgcSetNop(&storage.buffer, 0x4002u); });
+    check(storage.buffer.cursor_up == storage.words.data() + 6, "invalid NOP advanced the cursor");
 }
 
 void testClearState() {
@@ -203,6 +220,19 @@ void testIndexBuffer() {
         return;
     }
     throw std::runtime_error("misaligned index buffer was accepted");
+}
+
+void testIndirectBase() {
+    Storage storage;
+    alignas(8) std::uint32_t arguments[4]{};
+    const auto address = reinterpret_cast<std::uintptr_t>(arguments);
+    const auto* bound = sceAgcDcbSetBaseIndirectArgs(&storage.buffer, 0, arguments);
+    check(bound[1] == 1 && bound[2] == static_cast<std::uint32_t>(address) && bound[3] == static_cast<std::uint32_t>(address >> 32u), "indirect base address mismatch");
+    const auto* cleared = sceAgcDcbSetBaseIndirectArgs(&storage.buffer, 1, nullptr);
+    check(cleared == bound + 4 && (cleared[0] & 2u) != 0 && cleared[1] == 1 && cleared[2] == 0 && cleared[3] == 0, "indirect base was not cleared");
+    const auto before = storage.words;
+    expectFailure([&] { sceAgcDcbSetBaseIndirectArgs(&storage.buffer, 0, reinterpret_cast<const volatile void*>(address + 4)); });
+    check(storage.words == before, "misaligned indirect base modified packet memory");
 }
 
 void testContextState() {
@@ -404,10 +434,12 @@ int main(int argc, char** argv) {
             return 0;
         }
         testPackets();
+        testNop();
         testClearState();
         testIndexedIndirectDraws();
         testMarkers();
         testIndexBuffer();
+        testIndirectBase();
         testContextState();
         testFlip();
         testRegisters();

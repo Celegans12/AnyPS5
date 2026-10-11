@@ -26,6 +26,10 @@ int APS5_VABI sceFontSupportExternalFonts(FontLibrary, std::uint32_t, std::uint3
 int APS5_VABI sceFontOpenFontSet(FontLibrary, std::uint32_t, std::uint32_t, const FontOpenDetail*, FontHandle*);
 int APS5_VABI sceFontOpenFontMemory(FontLibrary, const void*, std::uint32_t, const FontOpenDetail*, FontHandle*);
 int APS5_VABI sceFontCloseFont(FontHandle);
+int APS5_VABI sceFontSetScriptLanguage(FontHandle, int, int);
+int APS5_VABI sceFontGetScriptLanguage(FontHandle, int, int*);
+int APS5_VABI sceFontSetTypographicDesign(FontHandle, int, int);
+int APS5_VABI sceFontGetTypographicDesign(FontHandle, int, int*);
 int APS5_VABI sceFontSetResolutionDpi(FontHandle, std::uint32_t, std::uint32_t);
 int APS5_VABI sceFontGetResolutionDpi(FontHandle, std::uint32_t*, std::uint32_t*);
 int APS5_VABI sceFontSetScalePixel(FontHandle, float, float);
@@ -203,6 +207,17 @@ int main() {
 
     const std::vector<unsigned char> fontData = EmptyGlyphFont();
     Require(sceFontOpenFontMemory(library, fontData.data(), static_cast<std::uint32_t>(fontData.size()), nullptr, &font) == SCE_FONT_OK && font != nullptr);
+    int setting = -1;
+    Require(sceFontGetScriptLanguage(font, 3, &setting) == SCE_FONT_OK && setting == 0);
+    Require(sceFontSetScriptLanguage(font, 3, 7) == SCE_FONT_OK && sceFontSetScriptLanguage(font, 4, 9) == SCE_FONT_OK);
+    Require(sceFontGetScriptLanguage(font, 3, &setting) == SCE_FONT_OK && setting == 7);
+    Require(sceFontGetScriptLanguage(font, 4, &setting) == SCE_FONT_OK && setting == 9);
+    Require(sceFontGetScriptLanguage(font, 3, nullptr) == SCE_FONT_ERROR_INVALID_PARAMETER);
+    Require(sceFontSetScriptLanguage(nullptr, 3, 7) == SCE_FONT_ERROR_INVALID_FONT_HANDLE);
+    Require(sceFontSetTypographicDesign(font, 1, 2) == SCE_FONT_OK);
+    Require(sceFontGetTypographicDesign(font, 1, &setting) == SCE_FONT_OK && setting == 2);
+    Require(sceFontGetTypographicDesign(font, 5, &setting) == SCE_FONT_OK && setting == 0);
+    Require(sceFontGetTypographicDesign(nullptr, 1, &setting) == SCE_FONT_ERROR_INVALID_FONT_HANDLE);
     std::uint32_t hDpi = 1;
     std::uint32_t vDpi = 1;
     Require(sceFontGetResolutionDpi(font, &hDpi, &vDpi) == SCE_FONT_OK && hDpi == 72 && vDpi == 72);

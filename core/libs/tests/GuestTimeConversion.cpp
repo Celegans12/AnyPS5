@@ -20,6 +20,9 @@ GuestTm* APS5_VABI gmtime_s_nid_postfix(const std::int64_t*, GuestTm*);
 GuestTm* APS5_VABI localtime_s_nid_postfix(const std::int64_t*, GuestTm*);
 std::int64_t APS5_VABI mktime_nid_postfix(GuestTm*);
 std::size_t APS5_VABI strftime_nid_postfix(char*, std::size_t, const char*, const GuestTm*);
+void APS5_VABI tzset_nid_postfix(void);
+char* APS5_VABI ctime_nid_postfix(const std::int64_t*);
+int* APS5_VABI __error_nid_postfix();
 }
 
 using Converter = GuestTm* (APS5_VABI *)(const std::int64_t*);
@@ -127,6 +130,13 @@ int main() {
     Require(roundTrip.tm_wday == 4 && roundTrip.tm_yday == 0, "mktime did not normalize the calendar fields");
     Require(roundTrip.tm_gmtoff == 7200 && roundTrip.tm_zone != nullptr, "mktime did not set the zone fields");
 
+    Require(std::strcmp(ctime_nid_postfix(&epoch), "Thu Jan  1 02:00:00 1970\n") == 0, "ctime did not format local time");
+    const std::int64_t leap = 951782400 + 13 * 3600 + 4 * 60 + 5;
+    Require(std::strcmp(ctime_nid_postfix(&leap), "Tue Feb 29 15:04:05 2000\n") == 0, "ctime formatted the wrong date");
+    *__error_nid_postfix() = 0;
+    Require(std::strcmp(ctime_nid_postfix(&underflow), "??? ??? ?? ??:??:?? ????\n") == 0 && *__error_nid_postfix() == 22,
+        "ctime of an unrepresentable time did not report it");
+
     GuestTm utc{};
     Require(gmtime_s_nid_postfix(&epoch, &utc) == &utc, "UTC epoch conversion failed");
     char formatted[64]{};
@@ -137,4 +147,13 @@ int main() {
     CheckConcurrent(gmtime_nid_postfix, gmtime_s_nid_postfix, "Concurrent gmtime returned another thread's date");
     CheckConcurrent(libc_localtime_nid_postfix, localtime_s_nid_postfix, "Concurrent libc_localtime returned another thread's date");
     CheckConcurrent(localtime_nid_postfix, localtime_s_nid_postfix, "Concurrent localtime returned another thread's date");
+#ifdef _WIN32
+    _putenv_s("TZ", "UTC-5");
+#else
+    setenv("TZ", "UTC-5", 1);
+#endif
+    tzset_nid_postfix();
+    GuestTm shifted{};
+    Require(localtime_s_nid_postfix(&epoch, &shifted) == &shifted && shifted.tm_hour == 5 && shifted.tm_gmtoff == 18000,
+        "tzset did not pick up the new TZ");
 }

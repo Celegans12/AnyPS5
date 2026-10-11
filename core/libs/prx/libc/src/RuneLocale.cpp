@@ -2,6 +2,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <iterator>
+#include <stdexcept>
+#include <string>
 
 namespace GuestRune {
 
@@ -106,6 +109,16 @@ int APS5_VABI iswspace_nid_postfix(std::uint32_t c) { return GuestRune::Is(c, Gu
 int APS5_VABI iswupper_nid_postfix(std::uint32_t c) { return GuestRune::Is(c, GuestRune::Upper); }
 int APS5_VABI iswxdigit_nid_postfix(std::uint32_t c) { return GuestRune::Is(c, GuestRune::Hex); }
 int APS5_VABI iswctype_nid_postfix(std::uint32_t c, std::uint64_t mask) { return GuestRune::Is(c, mask); }
+
+int APS5_VABI _Iswctype_nid_postfix(std::uint32_t c, std::uint64_t type) {
+    static constexpr std::uint64_t masks[] = {
+        GuestRune::Alpha | GuestRune::Number, GuestRune::Alpha, GuestRune::Control, GuestRune::Digit,
+        GuestRune::Graph, GuestRune::Lower, GuestRune::Print, GuestRune::Punct,
+        GuestRune::Space, GuestRune::Upper, GuestRune::Hex, GuestRune::Blank,
+    };
+    if (type == 0 || type > std::size(masks)) throw std::invalid_argument("_Iswctype: unknown class " + std::to_string(type));
+    return GuestRune::Is(c, masks[type - 1]);
+}
 
 std::uint64_t APS5_VABI wctype_nid_postfix(const char* property) {
     static constexpr struct {

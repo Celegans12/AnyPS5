@@ -243,4 +243,10 @@ int APS5_VABI sceNpGetUserIdByAccountId() {
     return 0;
 }
 
+int APS5_VABI sceNpGetSandboxInfo(void* sandbox_info) {
+    (void)sandbox_info;
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
 }

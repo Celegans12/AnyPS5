@@ -35,6 +35,7 @@ struct Http2MemoryPoolStats {
 extern "C" {
 int APS5_VABI sceHttp2GetMemoryPoolStats(int, Http2MemoryPoolStats*);
 int APS5_VABI sceHttp2SetResolveRetry(int, std::int32_t);
+int APS5_VABI sceHttp2WebSocketSetPingInterval();
 }
 
 static void Require(bool value) { if (!value) std::abort(); }
@@ -67,6 +68,7 @@ int main() {
     Require(request > 0);
     Require(sceHttp2SetCookieBox(request, other) == 0);
     Require(sceHttp2SetRequestNoContentLength(request) == 0);
+    Require(Throws([] { sceHttp2WebSocketSetPingInterval(); }));
     Require(sceHttp2CookieFlush(context) == 0);
     Require(sceHttp2SendRequest(request, nullptr, 0) == static_cast<int>(0x80436063));
 

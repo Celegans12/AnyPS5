@@ -9,6 +9,46 @@ import progress
 
 
 class ProgressTests(unittest.TestCase):
+    def test_nonvoid_stub_wrappers_keep_callers_unimplemented(self):
+        with tempfile.TemporaryDirectory() as directory:
+            library = Path(directory) / "libSceExample"
+            library.mkdir()
+            (library / "Export.cpp").write_text(
+                "static int SupportFormat() { NotImplemented_nid_no_patch(__func__); return 0; }\n"
+                "int APS5_VABI sceExampleSupportFormat() { return SupportFormat(); }\n")
+            group = progress.scan_library(library)
+            self.assertEqual(group["done_names"], [])
+            self.assertEqual(group["todo_names"], ["sceExampleSupportFormat"])
+
+    def test_braces_in_literals_and_comments_do_not_delimit_bodies(self):
+        with tempfile.TemporaryDirectory() as directory:
+            library = Path(directory) / "libSceExample"
+            library.mkdir()
+            (library / "Export.cpp").write_text(
+                "static int Helper() { const char* brace = \"}\"; NotImplemented_nid_no_patch(__func__); return 0; }\n"
+                "int APS5_VABI sceExampleOpen(char* out) { *out = '{'; return 0; }\n"
+                "int APS5_VABI sceExampleClose(char* out) { *out = '}'; NotImplemented_nid_no_patch(__func__); return 0; }\n"
+                "int APS5_VABI sceExampleQuote(std::string& out) { out += \"{\\\"\"; return 0; }\n"
+                "int APS5_VABI sceExampleNoted() { // }\n    NotImplemented_nid_no_patch(__func__); return 0; }\n"
+                "int APS5_VABI sceExampleBlock() { /* { */ return 0; }\n"
+                "int APS5_VABI sceExampleWrapped() { return Helper(); }\n"
+                "int APS5_VABI sceExampleReady() { return 0; }\n")
+            group = progress.scan_library(library)
+            self.assertEqual(group["done_names"], ["sceExampleBlock", "sceExampleOpen", "sceExampleQuote", "sceExampleReady"])
+            self.assertEqual(group["todo_names"], ["sceExampleClose", "sceExampleNoted", "sceExampleWrapped"])
+
+    def test_apostrophe_in_a_comment_does_not_pair_with_a_later_literal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            library = Path(directory) / "libSceExample"
+            library.mkdir()
+            (library / "Export.cpp").write_text(
+                "int APS5_VABI sceExamplePending() {\n    /* it's */ log('}');\n"
+                "    NotImplemented_nid_no_patch(__func__);\n    return 0;\n}\n"
+                "int APS5_VABI sceExampleReady() { return 0; }\n")
+            group = progress.scan_library(library)
+            self.assertEqual(group["done_names"], ["sceExampleReady"])
+            self.assertEqual(group["todo_names"], ["sceExamplePending"])
+
     def test_test_sources_do_not_change_library_progress(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "tests" / "prx"

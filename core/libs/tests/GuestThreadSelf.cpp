@@ -14,6 +14,8 @@ void APS5_VABI scePthreadTestcancel();
 void APS5_VABI pthread_testcancel_nid_postfix(void);
 int APS5_VABI scePthreadSetcancelstate(int state, int* old_state);
 int APS5_VABI scePthreadSetcanceltype(int type, int* old_type);
+void APS5_VABI pthread_set_name_np_nid_postfix(Pthread thread, const char* name);
+int APS5_VABI scePthreadGetname(Pthread thread, char* name);
 int APS5_VABI scePthreadMutexattrInit(PthreadMutexattr* attr);
 int APS5_VABI scePthreadMutexattrDestroy(PthreadMutexattr* attr);
 int APS5_VABI scePthreadMutexattrSettype(PthreadMutexattr* attr, int type);
@@ -130,4 +132,12 @@ int main() {
 
     Require(scePthreadMutexUnlock(&mutex) == SCE_OK);
     Require(scePthreadMutexDestroy(&mutex) == SCE_OK);
+
+    char name[32] = {'x'};
+    pthread_set_name_np_nid_postfix(mainSelf, "q2-main");
+    Require(scePthreadGetname(mainSelf, name) == SCE_OK && std::strcmp(name, "q2-main") == 0);
+    pthread_set_name_np_nid_postfix(mainSelf, nullptr);
+    Require(scePthreadGetname(mainSelf, name) == SCE_OK && name[0] == '\0');
+    pthread_set_name_np_nid_postfix(nullptr, "ignored");
+
 }

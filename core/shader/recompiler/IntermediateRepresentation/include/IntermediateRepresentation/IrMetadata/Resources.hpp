@@ -100,7 +100,7 @@ struct ImageResource {
     bool operator==(const ImageResource& other) const = default;
 };
 
-enum SamplerUse : std::uint8_t {
+enum SamplerUse : std::uint16_t {
     SamplerUseExplicitLod = 1u << 0u,
     SamplerUseImplicitLod = 1u << 1u,
     SamplerUseGradient = 1u << 2u,
@@ -109,6 +109,7 @@ enum SamplerUse : std::uint8_t {
     SamplerUseGather = 1u << 5u,
     SamplerUseQueryLod = 1u << 6u,
     SamplerUseAdjust = 1u << 7u,
+    SamplerUseNonZeroLod = 1u << 8u,
 };
 
 inline bool ImageSampleExplicitLod(std::uint32_t flags, IrShaderStage stage) {
@@ -123,7 +124,7 @@ struct SamplerResource {
     std::uint32_t copyOf = NoCopy;
     bool forcePointFiltering = false;
     bool depthCompare = false;
-    std::uint8_t uses = 0;
+    std::uint16_t uses = 0;
     std::uint32_t table = NoTable;
     bool foldTexelOffsetsOnly = false;
 
@@ -131,7 +132,7 @@ struct SamplerResource {
 };
 
 inline bool FoldsTexelOffsets(const SamplerResource& sampler) {
-    return sampler.table == NoTable && (sampler.uses & SamplerUseOffset) != 0u && (sampler.uses & ~static_cast<std::uint32_t>(SamplerUseExplicitLod | SamplerUseOffset)) == 0u && !sampler.depthCompare;
+    return sampler.table == NoTable && (sampler.uses & SamplerUseOffset) != 0u && (sampler.uses & ~static_cast<std::uint32_t>(SamplerUseExplicitLod | SamplerUseOffset | SamplerUseNonZeroLod)) == 0u && !sampler.depthCompare;
 }
 
 struct SampledResourcePair {

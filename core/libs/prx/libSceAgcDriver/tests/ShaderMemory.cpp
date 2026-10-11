@@ -1,13 +1,13 @@
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
 #include "Optimization/DescriptorBindingBuilder.hpp"
-#include "Optimization/MemoryIndexOwners.hpp"
 #include "Optimization/RequestMemoryView.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "Optimization/ShaderStageInputInfo.hpp"
 #include "Optimization/SrtWalker/SrtDescriptorEvaluation.hpp"
 #include "Optimization/SrtWalker/SrtEvaluator.hpp"
+#include "Optimization/SrtWalker/SrtInstructionPredicates.hpp"
 #include "Optimization/SrtWalker/SrtFlatSlotClasses.hpp"
 #include "SpirvBackend/SpirvAnalysis.hpp"
 #if ANYPS5_ENABLE_SPIRV_TOOLS
@@ -363,70 +363,26 @@ void verifyRegisterSources() {
     require(!EquivalentValue(plan, &samplerRegister, &firstVector), "different register types were merged");
 }
 
-bool originalMemoryIndexBelongsTo(const ShaderRecompiler::IrProgram& program, std::uint32_t index, const ShaderRecompiler::IrValue& owner) {
+void verifySignedMinimum() {
     using namespace ShaderRecompiler;
-    for (const auto& block : program.Blocks()) {
-        for (const IrValue* inst : block->Instructions()) {
-            const auto op = inst->Opcode();
-            if ((BufferAccessOf(op) == BufferAccess::None && AddressOpcodeInfoOf(op).access == AddressAccess::None && ImageOpcodeInfoOf(op).access == ImageAccess::None) || inst == &owner) {
-                continue;
-            }
-            if (inst->Flags<MemoryFlags>().index == index) return false;
-        }
+    IrResourcePlan plan;
+    IrValue reg(IrOpcode::Void, IrType::ScalarReg, 0);
+    reg.SetRegister({RegisterBank::Scalar, 0});
+    IrValue input(IrOpcode::GetUserData, IrType::U32, 1);
+    input.AddArgument(&reg);
+    IrValue limit(IrOpcode::Void, IrType::U32, 2);
+    limit.SetImmediateU32(8);
+    IrValue minimum(IrOpcode::SMin32, IrType::U32, 3);
+    minimum.AddArgument(&input);
+    minimum.AddArgument(&limit);
+    require(Detail::IsRuntimeUniformOp(IrOpcode::SMin32), "signed minimum must be a runtime uniform operation");
+    for (const auto& [value, expected] : std::array<std::pair<std::uint32_t, std::uint32_t>, 6>{{{0, 0}, {4, 4}, {20, 8}, {0x7fffffffu, 8}, {0xffffffffu, 0xffffffffu}, {0x80000000u, 0x80000000u}}}) {
+        std::array<std::uint32_t, 1> data{value};
+        SrtRuntime runtime{data};
+        Detail::Evaluator evaluator(plan, runtime);
+        std::uint32_t result = 0;
+        require(evaluator.Evaluate(&minimum, result) && result == expected, "SRT signed minimum used unsigned ordering or failed evaluation");
     }
-    return true;
-}
-
-void verifyMemoryIndexOwners() {
-    using namespace ShaderRecompiler;
-    IrProgram program;
-    program.Resources().memoryInfo.resize(3u);
-    auto& first = program.CreateBlock();
-    auto& second = program.CreateBlock();
-    const auto make = [&](IrOpcode opcode, std::uint32_t index) -> IrValue& {
-        auto& value = program.CreateValue(opcode, IrType::U32);
-        value.SetFlags(MemoryFlags{index, 0u});
-        return value;
-    };
-    auto& buffer = make(IrOpcode::LoadBufferU32, 0u);
-    auto& ignored = make(IrOpcode::Void, 0u);
-    auto& alias = make(IrOpcode::Identity, 0u);
-    alias.AddArgument(&buffer);
-    auto& absent = make(IrOpcode::LoadBufferU32, 0u);
-    const std::array<IrValue*, 14> choices{
-        nullptr, &buffer,
-        &make(IrOpcode::StoreBufferU32, 0u), &make(IrOpcode::BufferAtomicIAdd32, 0u),
-        &make(IrOpcode::LoadAddressU32, 0u), &make(IrOpcode::StoreAddressU32, 0u), &make(IrOpcode::AddressAtomicIAdd32, 0u),
-        &make(IrOpcode::ImageRead, 0u), &make(IrOpcode::ImageWrite, 0u), &make(IrOpcode::ImageAtomicIAdd32, 0u),
-        &ignored, &alias, &make(IrOpcode::LoadBufferU32, 1u), &make(IrOpcode::LoadAddressU32, 0xffffffffu)
-    };
-    std::vector<const IrValue*> queried(choices.begin() + 1, choices.end());
-    queried.push_back(&absent);
-    std::size_t fixture = 0;
-    for (auto* a : choices) {
-        for (auto* b : choices) {
-            for (auto* c : choices) {
-                first.Instructions().clear();
-                second.Instructions().clear();
-                if (a != nullptr) first.Instructions().push_back(a);
-                if (b != nullptr) first.Instructions().push_back(b);
-                if (c != nullptr) second.Instructions().push_back(c);
-                const Detail::MemoryIndexOwners owners(program);
-                for (std::uint32_t index = 0; index < program.Resources().memoryInfo.size(); ++index) {
-                    for (const auto* owner : queried) {
-                        if (owners.BelongsTo(index, *owner) != originalMemoryIndexBelongsTo(program, index, *owner)) {
-                            throw std::runtime_error("memory index owners: fixture " + std::to_string(fixture) + ", index " + std::to_string(index) + ", owner " + std::to_string(owner->Id()) + " differs from the original scan");
-                        }
-                    }
-                }
-                ++fixture;
-            }
-        }
-    }
-    first.Instructions() = {&buffer, &alias};
-    second.Instructions().clear();
-    const Detail::MemoryIndexOwners owners(program);
-    require(alias.Resolve() == &buffer && owners.BelongsTo(0u, buffer) && !owners.BelongsTo(0u, alias), "memory index owners: raw owner identity was collapsed through Resolve");
 }
 
 void verifyEvaluatedValues() {
@@ -1578,6 +1534,15 @@ void verifyDescriptorPhis() {
     };
     require(loopImages.size() == 2u && holdsLoopImage(first) && holdsLoopImage(second), "descriptor Phi: the loop's chained T# Phis were not split into the two SRT T#s");
 
+    const std::vector<std::uint32_t> sequentialCode{0xf4000400u, 0xfa000050u, 0xbf8cc07fu, 0xbf068010u, 0xbf850003u, 0xf40c0200u, 0xfa000000u, 0xbf820002u, 0xf40c0200u, 0xfa000060u, 0xbf068010u, 0xbf850003u, 0xf4080500u, 0xfa000020u, 0xbf820002u, 0xf4080500u, 0xfa000030u, 0xf4080600u, 0xfa000040u, 0xbf8cc07fu, 0xf09c0f08u, 0x00a20000u, 0xbf8c3f70u, 0xe0700000u, 0x80060000u, 0xbf810000u};
+    auto sequential = makeRequest(sequentialCode);
+    const auto sequentialPlan = GetResourcePlan(sequential);
+    require(sequentialPlan->info.images.size() == 2u && sequentialPlan->info.samplers.size() == 2u, "descriptor Phi: a T# and an S# chosen in separate blocks were not split into their SRT descriptors");
+    AgcDriver::ShaderMemory sequentialMemory({});
+    const auto sequentialCapture = sequentialMemory.Capture(sequential);
+    sequential.context.memory = sequentialMemory.Regions();
+    static_cast<void>(Recompile(sequential, *sequentialCapture));
+
     const auto entryWrites = [&](std::initializer_list<std::uint32_t> words) {
         auto code = loopCode;
         code.insert(code.begin() + 8, words);
@@ -2002,7 +1967,7 @@ void verifyPixelRequestSerialization() {
                         value.posZ, value.posW, value.frontFace, value.ancillary, value.sampleShading,
                         value.noPerspective, value.linearCentroid, value.pixelKillEnable, value.depthExportEnable,
                         value.sampleMaskExportEnable, value.earlyZ, value.executeOnNoop, value.conservativeZExport, value.orderedPixelShader,
-                        value.targetOutputMode, value.targetExportMapping);
+                        value.targetOutputMode, value.targetExportMapping, value.alphaToCoverage);
     };
     const std::array<std::uint32_t, 1> code{0xbf810000u};
     const std::array<std::uint32_t, 3> userData{0x12345678u, 0xabcdef01u, 0x87654321u};
@@ -2045,6 +2010,7 @@ void verifyPixelRequestSerialization() {
         .targetOutputMode = {1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u}
     };
     for (std::uint32_t i = 0; i < pixel.interpolatorSettings.size(); ++i) pixel.interpolatorSettings[i] = 0x10101010u + i;
+    pixel.alphaToCoverage = true;
     const std::array<std::array<std::uint8_t, 8>, 3> mappings{{
         {0x00u, 0xe4u, 0xc6u, 0x1bu, 0xffu, 0x80u, 0x55u, 0xaau},
         {0xe4u, 0xe4u, 0xe4u, 0xe4u, 0xe4u, 0xe4u, 0xe4u, 0xe4u},
@@ -2069,6 +2035,10 @@ void verifyPixelRequestSerialization() {
             RecompileCacheKey::Build(changed, replayKey);
             require(key == replayKey && RecompileCacheKey::ContextHash(request) == RecompileCacheKey::ContextHash(changed), "runtime pixel export mapping changed the static shader identity");
         }
+        auto withoutCoverage = request;
+        withoutCoverage.context.pixel->alphaToCoverage = false;
+        RecompileCacheKey::Build(withoutCoverage, replayKey);
+        require(key != replayKey && RecompileCacheKey::ContextHash(request) != RecompileCacheKey::ContextHash(withoutCoverage), "alpha-to-coverage did not change the static shader identity");
     }
     request.context.pixel.reset();
     request.shader.stage = ShaderStage::Vertex;
@@ -2080,12 +2050,12 @@ void verifyPixelRequestSerialization() {
     minimal.context.waveSize = 64;
     minimal.context.pixel = ShaderPixelStageInfo{};
     const auto encoded = serializer.Serialize(minimal);
-    require(requestPrefix(encoded, 8u) == "NVNQQQ8AAAA=", "new requests did not use serialization version 15");
+    require(requestPrefix(encoded, 8u) == "NVNQQRAAAAA=", "new requests did not use serialization version 16");
     constexpr std::size_t mappingOffset = 8u + 37u + 18u + 163u;
-    for (std::size_t bytes = 0; bytes < 17u; ++bytes) {
-        expectFailure([&] { static_cast<void>(serializer.Deserialize(requestPrefix(encoded, mappingOffset + bytes))); }, "truncated data", "a truncated pixel mapping, packing or dual-source flag was accepted");
+    for (std::size_t bytes = 0; bytes < 18u; ++bytes) {
+        expectFailure([&] { static_cast<void>(serializer.Deserialize(requestPrefix(encoded, mappingOffset + bytes))); }, "truncated data", "a truncated pixel mapping, packing, dual-source or alpha-to-coverage flag was accepted");
     }
-    for (const auto unsupported : {"NVNQQQAAAAA=", "NVNQQRAAAAA="}) {
+    for (const auto unsupported : {"NVNQQQAAAAA=", "NVNQQREAAAA="}) {
         expectFailure([&] { static_cast<void>(serializer.Deserialize(unsupported)); }, "serialization version", "an unsupported request version was accepted");
     }
 }
@@ -2174,12 +2144,13 @@ void verifyLegacyPixelRequests() {
         require(pixel.targetExportMapping == std::array<std::uint8_t, 8>{}, "legacy pixel mapping no longer defaults to zero");
         require(pixel.targetExportPacking == std::array<ColorExportPacking, 8>{}, "a legacy request packed a color export");
         require(!pixel.dualSourceBlend, "a legacy request enabled dual-source blending");
+        require(!pixel.alphaToCoverage, "a legacy request enabled alpha-to-coverage");
         require(pixel.inputAddr == 2u && pixel.hasPerspectiveCenterVgpr && pixel.targetOutputMode[0] == 9u, "legacy pixel layout was misread");
         require(pixel.conservativeZExport == (version >= 7u ? ConservativeZExport::GreaterThanZ : ConservativeZExport::AnyZ), "legacy conservative Z layout was misread");
         require(!pixel.orderedPixelShader, "a legacy request became a primitive-ordered pixel shader");
         require(request.shader.stage == ShaderStage::Fragment && request.shader.code.size() == 1u && request.shader.code[0] == 0xbf810000u && !request.context.vertex.has_value() && request.context.memory.empty(), "legacy guest context was misaligned");
         require(request.target.vulkanVersion == 0x00401000u && request.target.spirvVersion == 0x00010300u && request.target.subgroupSize == 64u && request.layout.firstBinding == 11u && request.layout.pushConstantSizeBytes == 128u, "legacy target or binding layout was misaligned");
-        require(request.useCache == (version == 1u) && request.target.nonConstantImageOffsets == (version >= 6u) && request.target.srgbDecodeFormats == 0u && !request.target.narrowSubgroupClock, "legacy request trailer was misread");
+        require(request.useCache == (version == 1u) && request.target.nonConstantImageOffsets == (version >= 6u) && request.target.srgbDecodeFormats == 0u && !request.target.narrowSubgroupClock && !request.target.float64DenormPreserve, "legacy request trailer was misread");
         const auto upgraded = serializer.Deserialize(serializer.Serialize(request));
         require(upgraded.request.context.pixel->targetExportMapping == pixel.targetExportMapping && RecompileCacheKey::ContextHash(upgraded.request) == RecompileCacheKey::ContextHash(request), "upgrading a legacy capture changed its pixel mapping");
     }
@@ -2785,6 +2756,21 @@ void verifyUnusedUnnormalizedSampler() {
     snapshot.images[0].dwords[3] = 0xa0000facu;
     expectFailure([&] { static_cast<void>(populate(foldVolume)); }, "takes only images an unnormalized S# can sample", "unnormalized texel offsets: an ordinary 3D view matched a constant-only mode");
     snapshot.images[0].dwords[3] = 0x90000facu;
+    const auto atBaseLevel = [&](const ShaderInfo& shader) { return populate(shader)[0].imageUnnormalizedBaseLevel; };
+    auto levelZero = info;
+    levelZero.samplers[0].uses = SamplerUseExplicitLod;
+    require(atBaseLevel(levelZero) == std::vector<bool>{true}, "unnormalized samplers: an image read only by image_sample_lz was not flagged as exact at its base level");
+    require(atBaseLevel(info) == std::vector<bool>{false}, "unnormalized samplers: an image without live uses was flagged as exact at its base level");
+    require(atBaseLevel(offset) == std::vector<bool>{false}, "unnormalized samplers: an image read with a texel offset was flagged as exact at its base level");
+    auto selectedLod = levelZero;
+    selectedLod.samplers[0].uses |= SamplerUseNonZeroLod;
+    require(atBaseLevel(selectedLod) == std::vector<bool>{false}, "unnormalized samplers: an image also read at a selected LOD was flagged as exact at its base level");
+    snapshot.samplers[0].dwords[1] = 0x00fff100u;
+    require(atBaseLevel(levelZero) == std::vector<bool>{false}, "unnormalized samplers: an S# with a minimum LOD was flagged as exact at the base level");
+    snapshot.samplers[0].dwords[1] = 0x00fff000u;
+    snapshot.samplers[0].dwords[2] = 0x05500180u;
+    require(atBaseLevel(levelZero) == std::vector<bool>{false}, "unnormalized samplers: an S# with a LOD bias was flagged as exact at the base level");
+    snapshot.samplers[0].dwords[2] = 0x05500000u;
     snapshot.samplers[0].dwords[0] = 0x00000092u;
     const auto normalized = populate(info);
     require(normalized[0].imageUnnormalized == std::vector<bool>{false} && normalized[1].samplerUnnormalized == std::vector<bool>{false}, "unnormalized samplers: a normalized S# was flagged");
@@ -3341,7 +3327,12 @@ void verifyGuardedNullPointers() {
     }
     NestedRequest rootless(branchCode, nullptr);
     AgcDriver::ShaderMemory rootlessMemory({});
-    expectFailure([&] { static_cast<void>(rootlessMemory.Capture(rootless.request)); }, "null or misaligned address", "guarded pointer: a null user-data pointer was accepted");
+    const auto rootlessCapture = rootlessMemory.Capture(rootless.request);
+    require(rootlessCapture->snapshot.nullRootReads != 0u && GuardRecords(*rootlessCapture), "guarded pointer: reads through a null user-data pointer were not counted");
+    require(std::all_of(rootlessCapture->snapshot.buffers.begin(), rootlessCapture->snapshot.buffers.end(), [](const DescriptorValue& value) { return std::all_of(value.dwords.begin(), value.dwords.end(), [](std::uint32_t word) { return word == 0u; }); }), "guarded pointer: a V# read through a null user-data pointer is not zero");
+    rootless.request.context.memory = rootlessMemory.Regions();
+    const auto rootlessResult = Recompile(rootless.request, *rootlessCapture);
+    require(rootlessResult->poisonedSrtReads >= rootlessCapture->snapshot.nullRootReads, "guarded pointer: a capture through a null user-data pointer is cacheable");
     point(0u);
 #ifdef _WIN32
     VirtualFree(reserved, 0, MEM_RELEASE);
@@ -3365,11 +3356,6 @@ void verifyCubeDepthCompareMode() {
 int main(int argc, char** argv) {
     try {
         using namespace ShaderRecompiler;
-        if (argc == 2 && std::string_view(argv[1]) == "--table-owners") {
-            verifyMemoryIndexOwners();
-            std::cout << "Memory index ownership matches the original scan\n";
-            return 0;
-        }
         if (argc == 2 && std::string_view(argv[1]) == "--frontend-pair") {
             verifyFrontendPair();
             std::cout << "Prepared frontend reuse preserves full and partial-thread programs\n";
@@ -3391,10 +3377,10 @@ int main(int argc, char** argv) {
         require(argc == 1, "unknown shader memory test arguments");
         verifyRegisterSources();
         verifyEvaluatedValues();
-        verifyMemoryIndexOwners();
         verifyFrontendPair();
         verifyScalarBufferBounds();
         verifySignedSrtComparison();
+        verifySignedMinimum();
         verifyPureFlatSlots();
         verifyImageTableKeys();
         verifyImageTables();
@@ -3523,6 +3509,9 @@ int main(int argc, char** argv) {
         auto narrowClock = uncached;
         narrowClock.target.narrowSubgroupClock = true;
         require(RequestSerializer{}.Deserialize(RequestSerializer{}.Serialize(narrowClock)).request.target.narrowSubgroupClock, "the narrow subgroup clock was lost in serialization");
+        auto float64Denormals = uncached;
+        float64Denormals.target.float64DenormPreserve = true;
+        require(RequestSerializer{}.Deserialize(RequestSerializer{}.Serialize(float64Denormals)).request.target.float64DenormPreserve, "f64 denormal preservation was lost in serialization");
         auto changedLayout = request;
         changedLayout.layout.pushConstantSizeBytes = 64;
         require(!Recompile(changedLayout).cacheHit, "binding layout change reused an incompatible variant");
@@ -3619,8 +3608,11 @@ int main(int argc, char** argv) {
         request.context.memory = {};
         const std::array<std::uint32_t, 2> nullUserData{};
         request.context.userData = nullUserData;
-        AgcDriver::ShaderMemory invalid({});
-        expectFailure([&] { invalid.Capture(request); }, "null or misaligned address", "null user-data pointer was accepted");
+        AgcDriver::ShaderMemory nullRoot({});
+        const auto nullRootCapture = nullRoot.Capture(request);
+        require(nullRootCapture->snapshot.nullRootReads != 0u, "reads through a null user-data pointer were not counted");
+        request.context.memory = nullRoot.Regions();
+        require(Recompile(request, *nullRootCapture)->poisonedSrtReads >= nullRootCapture->snapshot.nullRootReads, "a capture through a null user-data pointer is cacheable");
         std::cout << "Shader memory capture, strict validation and deterministic replay passed\n";
         return 0;
     } catch (const std::exception& error) {

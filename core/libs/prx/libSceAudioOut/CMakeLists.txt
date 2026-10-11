@@ -11,7 +11,7 @@ add_library(libSceAudioOut SHARED EXCLUDE_FROM_ALL
 
 target_include_directories(libSceAudioOut PRIVATE
         ${LIBS_INCLUDE_DIR}
-        ${CMAKE_SOURCE_DIR}/3rdparty/SDL2/include
+        ${ANYPS5_SDL2_INCLUDE_DIR}
 )
 target_link_libraries(libSceAudioOut PRIVATE libc libkernel SDL2-static)
 configure_windows_unwind(libSceAudioOut)
@@ -44,6 +44,16 @@ if(BUILD_TESTING)
     add_test(NAME audio_out_last_output_time COMMAND audio_out_last_output_time_tests)
     if(WIN32)
         set_tests_properties(audio_out_last_output_time PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceAudioOut>")
+    endif()
+
+    add_test_executable(audio_out_ex_tests tests/AudioOutEx.cpp)
+    target_include_directories(audio_out_ex_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(audio_out_ex_tests PRIVATE libSceAudioOut libc)
+    configure_windows_unwind(audio_out_ex_tests)
+    add_test(NAME audio_out_ex COMMAND audio_out_ex_tests)
+    if(WIN32)
+        set_tests_properties(audio_out_ex PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceAudioOut>")
     endif()
 

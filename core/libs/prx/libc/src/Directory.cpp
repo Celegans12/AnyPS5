@@ -17,6 +17,9 @@ int DirectoryError(int error) {
     case ENFILE: return 23;
     case ENOMEM: return 12;
     case ENAMETOOLONG: return 63;
+#ifdef ELOOP
+    case ELOOP: return 62;
+#endif
     default: return 5;
     }
 }

@@ -60,3 +60,44 @@ int APS5_VABI sigismember_nid_postfix(const GuestSignalSet* set, int signal) {
     return (set->bits[WordIndex(signal)] & Bit(signal)) != 0 ? 1 : 0;
 }
 }
+#ifdef _WIN32
+#define APS5_SIGNAL_ASM_FUNCTION(name) ".globl " name "\n.def " name "; .scl 2; .type 32; .endef\n" name ":\n"
+#define APS5_SIGNAL_ASM_CALL(name) "    call " name "\n"
+#else
+#define APS5_SIGNAL_ASM_FUNCTION(name) ".globl " name "\n.type " name ", @function\n" name ":\n"
+#define APS5_SIGNAL_ASM_CALL(name) "    call " name "@PLT\n"
+#endif
+
+asm(".text\n"
+    APS5_SIGNAL_ASM_FUNCTION("siglongjmp_nid_postfix")
+    "    cmpl $0, 88(%rdi)\n"
+    "    jz 2f\n"
+    "    movq %rdi, %rdx\n"
+    "    pushq %rdi\n"
+    "    pushq %rsi\n"
+    "    movl $3, %edi\n"
+    "    leaq 72(%rdx), %rsi\n"
+    "    xorl %edx, %edx\n"
+    "    subq $8, %rsp\n"
+    APS5_SIGNAL_ASM_CALL("_sigprocmask_nid_postfix")
+    "    addq $8, %rsp\n"
+    "    popq %rsi\n"
+    "    popq %rdi\n"
+    "2:\n"
+    "    movq %rdi, %rdx\n"
+    "    movl %esi, %eax\n"
+    "    movq 0(%rdx), %rcx\n"
+    "    movq 8(%rdx), %rbx\n"
+    "    movq 16(%rdx), %rsp\n"
+    "    movq 24(%rdx), %rbp\n"
+    "    movq 32(%rdx), %r12\n"
+    "    movq 40(%rdx), %r13\n"
+    "    movq 48(%rdx), %r14\n"
+    "    movq 56(%rdx), %r15\n"
+    "    fldcw 64(%rdx)\n"
+    "    testl %eax, %eax\n"
+    "    jnz 1f\n"
+    "    incl %eax\n"
+    "1:\n"
+    "    movq %rcx, 0(%rsp)\n"
+    "    ret\n");

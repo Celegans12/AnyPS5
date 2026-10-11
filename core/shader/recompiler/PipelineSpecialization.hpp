@@ -35,6 +35,8 @@ inline constexpr std::uint32_t HeapCountBase = 8256u;
 inline constexpr std::uint32_t MipCountBase = 8320u;
 inline constexpr std::uint32_t DescriptorIndexBase = 16384u;
 inline constexpr std::uint32_t DescriptorIndexStride = 128u;
+inline constexpr std::uint32_t ImageModeBase = 32768u;
+inline constexpr std::uint32_t ImageModeStride = 256u;
 inline constexpr std::uint32_t FoldOffsetBase = 57344u;
 inline constexpr std::uint32_t UnnormalizedWrapBase = 57472u;
 

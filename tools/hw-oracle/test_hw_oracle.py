@@ -123,6 +123,25 @@ class FloatModeTests(unittest.TestCase):
 
 
 class GroupSegmentTests(unittest.TestCase):
+    def test_wave64_dispatches_at_most_512_rows(self):
+        rows = [(index, 0, 0, 0) for index in range(1025)]
+        for wave64, expected in ((False, [1024, 32]), (True, [512, 512, 64])):
+            with self.subTest(wave64=wave64), tempfile.TemporaryDirectory() as tmp:
+                dispatch_sizes = []
+
+                def dispatch(command, *, check, env):
+                    self.assertTrue(check)
+                    dispatch_sizes.append(int(command[2]))
+                    Path(command[4]).write_bytes(bytes(int(command[2]) * 64))
+
+                with patch.object(hw_oracle, "assemble", return_value=Path(tmp) / "kernel.co"), \
+                        patch.object(hw_oracle, "oracle", return_value="oracle"), \
+                        patch.object(hw_oracle.subprocess, "run", side_effect=dispatch):
+                    result = hw_oracle.run("s_nop 0", rows, wave64=wave64, **MODES)
+
+                self.assertEqual(dispatch_sizes, expected)
+                self.assertEqual(len(result), len(rows))
+
     def test_cli_forwards_lds(self):
         with tempfile.TemporaryDirectory() as tmp:
             body = Path(tmp) / "body.s"

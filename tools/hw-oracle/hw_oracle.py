@@ -89,8 +89,9 @@ def run(body, rows, extra=b"", wave64=False, coarse=False, *, ieee, denorm32, de
         work = Path(tmp)
         code = assemble(body, work, wave64, ieee=ieee, denorm32=denorm32, denorm16=denorm16,
                         dx10_clamp=dx10_clamp, round32=round32, round16=round16, fp16_overflow=fp16_overflow, lds=lds)
-        for start in range(0, len(padded), ROWS_PER_DISPATCH):
-            chunk = padded[start:start + ROWS_PER_DISPATCH]
+        rows_per_dispatch = ROWS_PER_DISPATCH // 2 if wave64 else ROWS_PER_DISPATCH
+        for start in range(0, len(padded), rows_per_dispatch):
+            chunk = padded[start:start + rows_per_dispatch]
             (work / "in.bin").write_bytes(b"".join(struct.pack("<4I", *r) for r in chunk) + extra)
             subprocess.run([oracle(), str(code), str(len(chunk)), str(work / "in.bin"), str(work / "out.bin"), "16"], check=True, env=env)
             data = (work / "out.bin").read_bytes()

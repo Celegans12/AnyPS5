@@ -88,6 +88,7 @@ public:
     void Keep(std::shared_ptr<void> object, std::size_t bytes = 0);
     void KeepBytes(const void* owner, std::size_t bytes);
     std::size_t OpenKeptBytes() const { return open != nullptr ? open->keptBytes : 0; }
+    void FlushDeferredReleases();
     static constexpr std::size_t KeptBytesBudget = std::size_t{512} << 20u;
     void BoundKeptBytes();
     std::size_t InFlightKeptBytes() const { return inFlightKeptBytes; }
@@ -382,6 +383,7 @@ public:
     // The recorder of the current device, for code that only has guest addresses (the flush hook)
     // and for helpers that must not recycle resources the recorded work still uses.
     static Recorder* Active();
+    VkDevice Device() const { return context.device; }
     // Whether the calling thread runs inside a batch's completion action (finish()): a store made
     // there must not have a publish recorded for it (UnitShadow), see SyncThrough.
     static bool InCompletion();

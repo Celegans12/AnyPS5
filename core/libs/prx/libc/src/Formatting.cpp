@@ -408,6 +408,15 @@ int APS5_VABI vsnprintf_nid_postfix(char* str, size_t size, const char* format, 
 
 #ifdef _WIN32
 
+int APS5_VABI vsscanf_s_nid_postfix(const char* buffer, const char* format, VaList* args) {
+    LibcDetail::FormatArguments arguments(args);
+    return ScanGuest(buffer, format, true, [&] { return arguments.Next<void*>(); }, [&] { return arguments.Next<unsigned int>(); });
+}
+
+int APS5_VABI vsnprintf_s_nid_postfix(char* buffer, size_t size, const char* format, VaList* args) {
+    return LibcDetail::FormatWindows(buffer, size, format, args);
+}
+
 int APS5_VABI snprintf_s_nid_postfix(char* buffer, size_t size, const char* format, ...) {
     __builtin_sysv_va_list args;
     __builtin_sysv_va_start(args, format);
@@ -425,6 +434,20 @@ int APS5_VABI printf_s_nid_postfix(const char* format, ...) {
 }
 
 #else
+
+int APS5_VABI vsscanf_s_nid_postfix(const char* buffer, const char* format, VaList* args) {
+    LibcDetail::FormatArguments arguments(args);
+    return ScanGuest(buffer, format, true, [&] { return arguments.Next<void*>(); }, [&] { return arguments.Next<unsigned int>(); });
+}
+
+int APS5_VABI vsnprintf_s_nid_postfix(char* buffer, size_t size, const char* format, VaList* args) {
+    if (HasGuestWideFormat(format)) return LibcDetail::FormatWindows(buffer, size, format, args);
+    std::va_list copy;
+    va_copy(copy, *reinterpret_cast<std::va_list*>(args));
+    const int result = std::vsnprintf(buffer, size, format, copy);
+    va_end(copy);
+    return result;
+}
 
 int APS5_VABI vsprintf_s_nid_postfix(char* buffer, size_t size, const char* format, VaList* args) {
     if (HasGuestWideFormat(format)) return LibcDetail::FormatWindows(buffer, size, format, args);

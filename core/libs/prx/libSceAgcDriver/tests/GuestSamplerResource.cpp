@@ -297,24 +297,24 @@ void RunGuardedWrapTests() {
     context.deviceProc = captureProc;
     SamplerCache cache;
     set("0");
-    reject([&] { cache.Get(context, words, false, true, false, true); }, "clamp mode 0 on X");
+    reject([&] { cache.Get(context, words, false, true, false, false, true); }, "clamp mode 0 on X");
     set("1");
     reject([&] { cache.Get(context, words, false, true); }, "clamp mode 0 on X");
-    const auto first = cache.Get(context, words, false, true, false, true);
-    Require(cache.Get(context, words, false, true, false, true) == first, "guarded sampler cache missed identical proof");
-    const auto decoded = DecodeSamplerResource(words, true, false, true);
+    const auto first = cache.Get(context, words, false, true, false, false, true);
+    Require(cache.Get(context, words, false, true, false, false, true) == first, "guarded sampler cache missed identical proof");
+    const auto decoded = DecodeSamplerResource(words, true, false, false, true);
     Require(decoded.addressModeU == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE && decoded.addressModeV == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, "guarded point repeat was not mapped to edge clamp");
     reject([&] { cache.Get(context, words, false, true); }, "clamp mode 0 on X");
     for (const auto clamp : {1u, 3u, 4u, 5u, 7u}) {
         auto unsupported = words;
         unsupported[0] |= clamp;
-        reject([&] { DecodeSamplerResource(unsupported, true, false, true); }, "clamp mode " + std::to_string(clamp) + " on X");
+        reject([&] { DecodeSamplerResource(unsupported, true, false, false, true); }, "clamp mode " + std::to_string(clamp) + " on X");
     }
     auto linear = words;
     linear[2] |= 5u << 20u;
-    reject([&] { DecodeSamplerResource(linear, true, false, true); }, "clamp mode 0 on X");
+    reject([&] { DecodeSamplerResource(linear, true, false, false, true); }, "clamp mode 0 on X");
     set("0");
-    reject([&] { cache.Get(context, words, false, true, false, true); }, "clamp mode 0 on X");
+    reject([&] { cache.Get(context, words, false, true, false, false, true); }, "clamp mode 0 on X");
 }
 
 }
@@ -327,7 +327,7 @@ void RunGuestSamplerResourceTests() {
     Require(result.addressModeU == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, "clamp mode 2 must decode to clamp-to-edge");
     Require(!result.anisotropyEnable && result.maxAnisotropy == 1.0f, "non-anisotropic filter must leave anisotropy disabled");
     Require(nearlyEqual(result.maxLod, 12.0f), "max LOD decoded incorrectly");
-    Require(result.borderColor == VK_BORDER_COLOR_INT_TRANSPARENT_BLACK, "border color type 0 must decode to transparent black");
+    Require(result.borderColor == VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK, "border color type 0 must decode to transparent black");
 
     Fields nearest = base;
     nearest.xyMagFilter = 0;
@@ -399,7 +399,7 @@ void RunGuestSamplerResourceTests() {
     requireUnnormalized(unnormalized, "captured unnormalized S#");
     Require(unnormalized.magFilter == VK_FILTER_LINEAR && unnormalized.minFilter == VK_FILTER_LINEAR, "captured unnormalized S# filters decoded incorrectly");
     Require(unnormalized.addressModeU == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE && unnormalized.addressModeV == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, "captured unnormalized S# clamp modes decoded incorrectly");
-    Require(unnormalized.borderColor == VK_BORDER_COLOR_INT_TRANSPARENT_BLACK, "captured unnormalized S# border color decoded incorrectly");
+    Require(unnormalized.borderColor == VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK, "captured unnormalized S# border color decoded incorrectly");
     Require(!DecodeSamplerResource(pack(base)).unnormalizedCoordinates, "a normalized S# decoded to unnormalized coordinates");
 
     Fields unnormalizedBase = base;
@@ -410,7 +410,7 @@ void RunGuestSamplerResourceTests() {
     const auto point = DecodeSamplerResource(pack(unnormalizedPoint), true);
     requireUnnormalized(point, "unnormalized point S#");
     Require(point.magFilter == VK_FILTER_NEAREST && point.minFilter == VK_FILTER_NEAREST, "unnormalized point S# filters decoded incorrectly");
-    const std::array borders{VK_BORDER_COLOR_INT_TRANSPARENT_BLACK, VK_BORDER_COLOR_INT_OPAQUE_BLACK, VK_BORDER_COLOR_INT_OPAQUE_WHITE};
+    const std::array borders{VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK, VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK, VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE};
     for (std::uint32_t type = 0; type < borders.size(); ++type) {
         Fields border = unnormalizedBase;
         border.clampX = 6;
@@ -544,10 +544,13 @@ void RunGuestSamplerResourceTests() {
 
     Fields opaqueBlack = base;
     opaqueBlack.borderColorType = 1;
-    Require(DecodeSamplerResource(pack(opaqueBlack)).borderColor == VK_BORDER_COLOR_INT_OPAQUE_BLACK, "border color type 1 must decode to opaque black");
+    Require(DecodeSamplerResource(pack(opaqueBlack)).borderColor == VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK, "border color type 1 must decode to opaque black");
+    Require(DecodeSamplerResource(pack(opaqueBlack), false, false, true).borderColor == VK_BORDER_COLOR_INT_OPAQUE_BLACK, "border color type 1 of a sampler for integer images must decode to integer opaque black");
     Fields opaqueWhite = base;
     opaqueWhite.borderColorType = 2;
-    Require(DecodeSamplerResource(pack(opaqueWhite)).borderColor == VK_BORDER_COLOR_INT_OPAQUE_WHITE, "border color type 2 must decode to opaque white");
+    Require(DecodeSamplerResource(pack(opaqueWhite)).borderColor == VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE, "border color type 2 must decode to opaque white");
+    Require(DecodeSamplerResource(pack(opaqueWhite), false, false, true).borderColor == VK_BORDER_COLOR_INT_OPAQUE_WHITE, "border color type 2 of a sampler for integer images must decode to integer opaque white");
+    Require(DecodeSamplerResource(pack(base), false, false, true).borderColor == VK_BORDER_COLOR_INT_TRANSPARENT_BLACK, "border color type 0 of a sampler for integer images must decode to integer transparent black");
 
     Fields positiveBias = base;
     positiveBias.lodBiasRaw = 256;

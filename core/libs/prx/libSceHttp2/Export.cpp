@@ -1,5 +1,6 @@
 #include <cstdint>
 #include <cstddef>
+#include <cstring>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libkernel/Equeue/Equeue.hpp"
@@ -13,6 +14,8 @@
 // No network is emulated: contexts, templates and requests can be created, but any request
 // that would touch the network fails with the library's network error.
 static constexpr int ERROR_NETWORK = static_cast<int>(0x80436063);
+static constexpr int ERROR_INVALID_ID = static_cast<int>(0x817B1100);
+static constexpr int ERROR_NULL_POINTER = static_cast<int>(0x817B1225);
 static std::atomic<int> g_nextHandle{1};
 static std::mutex g_poolsMutex;
 static std::map<int, size_t> g_pools;
@@ -256,10 +259,13 @@ int APS5_VABI sceHttp2AbortRequest(int req_id) {
 }
 
 int APS5_VABI sceHttp2GetMemoryPoolStats(int lib_http2_ctx_id, Http2MemoryPoolStats* stats) {
-    if (stats == nullptr) APS5_INVALID_ARG_EX;
+    if (stats == nullptr) return ERROR_NULL_POINTER;
     std::lock_guard lock(g_poolsMutex);
     const auto pool = g_pools.find(lib_http2_ctx_id);
-    if (pool == g_pools.end()) throw std::invalid_argument("sceHttp2GetMemoryPoolStats: unknown context");
+    if (pool == g_pools.end()) {
+        std::memset(stats, 0, sizeof(*stats));
+        return ERROR_INVALID_ID;
+    }
     *stats = {pool->second, 0, 0, 0};
     return 0;
 }
@@ -308,6 +314,11 @@ int APS5_VABI sceHttp2WebSocketSendTextMessageAsync() {
 }
 
 int APS5_VABI sceHttp2WebSocketSendDataMessageAsync() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceHttp2WebSocketSetPingInterval() {
     NotImplemented_nid_no_patch(__func__);
     return 0;
 }

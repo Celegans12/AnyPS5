@@ -3,6 +3,7 @@
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libkernel/Socket/include/SocketPoll.hpp"
+#include "prx/libkernel/Socket/include/SocketSelectDeadline.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -67,12 +68,13 @@ int APS5_VABI select_nid_postfix(int nfds, void* readfds, void* writefds, void* 
     }
     const auto start = std::chrono::steady_clock::now();
     const auto deadline = limit == nullptr ? std::chrono::steady_clock::time_point::max()
-        : start + std::chrono::seconds(limit->seconds) + std::chrono::microseconds(limit->microseconds);
+        : KernelSocketSelect::DeadlineAfter(start, limit->seconds, limit->microseconds);
     for (;;) {
         int waitMilliseconds = 100;
         if (limit != nullptr) {
             const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(deadline - std::chrono::steady_clock::now()).count();
-            waitMilliseconds = static_cast<int>(std::clamp<std::int64_t>((remaining + 999) / 1000, 0, 100));
+            const auto roundedMilliseconds = remaining > 0 ? remaining / 1000 + (remaining % 1000 != 0) : 0;
+            waitMilliseconds = static_cast<int>(std::clamp<std::int64_t>(roundedMilliseconds, 0, 100));
         }
         if (!entries.empty()) {
             const auto poller = g_socketPoller.load();

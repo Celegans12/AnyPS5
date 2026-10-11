@@ -11,6 +11,8 @@ int APS5_VABI printf_nid_postfix(const char*, ...);
 int APS5_VABI libc_printf_nid_postfix(const char*, ...);
 int APS5_VABI sscanf_nid_postfix(const char*, const char*, ...);
 int APS5_VABI vsnprintf_nid_postfix(char*, size_t, const char*, VaList*);
+int APS5_VABI vsnprintf_s_nid_postfix(char*, size_t, const char*, VaList*);
+int APS5_VABI vsscanf_s_nid_postfix(const char*, const char*, VaList*);
 int APS5_VABI vprintf_nid_postfix(const char*, VaList*);
 }
 
@@ -26,6 +28,26 @@ static int APS5_VABI FormatList(char* buffer, size_t size, const char* format, .
     const VaList original = list;
     const int result = vsnprintf_nid_postfix(buffer, size, format, &list);
     Require(std::memcmp(&list, &original, sizeof(list)) == 0);
+    __builtin_sysv_va_end(args);
+    return result;
+}
+
+static int APS5_VABI FormatListS(char* buffer, size_t size, const char* format, ...) {
+    __builtin_sysv_va_list args;
+    __builtin_sysv_va_start(args, format);
+    VaList list;
+    std::memcpy(&list, args, sizeof(list));
+    const int result = vsnprintf_s_nid_postfix(buffer, size, format, &list);
+    __builtin_sysv_va_end(args);
+    return result;
+}
+
+static int APS5_VABI ScanListS(const char* buffer, const char* format, ...) {
+    __builtin_sysv_va_list args;
+    __builtin_sysv_va_start(args, format);
+    VaList list;
+    std::memcpy(&list, args, sizeof(list));
+    const int result = vsscanf_s_nid_postfix(buffer, format, &list);
     __builtin_sysv_va_end(args);
     return result;
 }
@@ -137,6 +159,12 @@ __attribute__((noinline)) static void APS5_VABI RunChecks() {
     Require(libc_printf_nid_postfix("libc_printf: %s\n", "OK") == 16);
     Require(libc_printf_nid_postfix("%d %d %d %d %d %d %d\n", 1, 22, 333, 4444, 55555, 666666, 7777777) == 35);
     Require(PrintList("vprintf: %d\n", 42) == 12);
+    Require(FormatListS(buffer, sizeof(buffer), "%d-%s", 42, "x") == 4 && std::strcmp(buffer, "42-x") == 0);
+    int scanNum = 0;
+    char scanWord[8] = {};
+    Require(ScanListS("123 test", "%d %s", &scanNum, scanWord, 8u) == 2 && scanNum == 123 && std::strcmp(scanWord, "test") == 0);
+    char tooSmall[4] = {'x', 'x', 'x', 'x'};
+    Require(ScanListS("abcdef", "%s", tooSmall, 4u) == 0 && tooSmall[0] == '\0');
     std::puts("Formatting checks passed: 10000 iterations");
 }
 

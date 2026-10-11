@@ -139,7 +139,7 @@ private:
     std::size_t entries = 0;
 };
 
-inline Registers InitialContextRegisters() {
+inline Registers BuildInitialContextRegisters() {
     Registers result{
         {0x200, 0}, {0x201, 0}, {0x202, 0xcc0010}, {0x203, 0},
         {0x204, 0}, {0x205, 0}, {0x206, 1087}, {0x207, 0},
@@ -169,6 +169,11 @@ inline Registers InitialContextRegisters() {
         for (std::uint32_t j = 0; j < 6; ++j) result.emplace(0x10f + 6 * i + j, j % 2 == 0 ? 0x3f800000 : 0);
     }
     return result;
+}
+
+inline Registers InitialContextRegisters() {
+    static const Registers& initial = *new Registers(BuildInitialContextRegisters());
+    return initial;
 }
 
 struct Predication {

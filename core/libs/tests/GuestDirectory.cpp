@@ -42,6 +42,13 @@ int main() {
     Require(closedir_nid_postfix(directory) == 0);
     Require(opendir_nid_postfix((root / "missing").string().c_str()) == nullptr);
     Require(*__error_nid_postfix() == 2);
+#ifndef _WIN32
+    const auto symlinkLoop = root / "symlink-loop";
+    std::filesystem::create_symlink("symlink-loop", symlinkLoop);
+    Require(opendir_nid_postfix(symlinkLoop.string().c_str()) == nullptr);
+    Require(*__error_nid_postfix() == 62);
+    Require(std::filesystem::remove(symlinkLoop));
+#endif
     Require(opendir_nid_postfix((root / "sample.txt").string().c_str()) == nullptr);
     Require(*__error_nid_postfix() == 20);
     Require(opendir_nid_postfix("") == nullptr && *__error_nid_postfix() == 2);

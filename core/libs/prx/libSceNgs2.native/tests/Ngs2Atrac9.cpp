@@ -481,6 +481,21 @@ static void TestAppendWithoutWaveform() {
     Require(sceNgs2SystemDestroy(system, nullptr) == SCE_NGS2_OK);
 }
 
+static void TestSilenceFlagRejected() {
+    const auto system = CreateSystem();
+    const auto voice = Voice(CreateRack(system, SCE_NGS2_RACK_ID_SAMPLER));
+    Control(voice, SCE_NGS2_SAMPLER_VOICE_PARAM_SETUP, Ngs2SamplerVoiceSetupParam{{}, {SCE_NGS2_WAVEFORM_TYPE_ATRAC9, 1, 48000, Config, 0, 0}});
+    const Ngs2WaveformBlock block{0, 0, 0, 0, SuperframeSamples, 0, 0};
+    bool rejected = false;
+    try {
+        Control(voice, SCE_NGS2_SAMPLER_VOICE_PARAM_ADD_WAVEFORM_BLOCKS, Ngs2SamplerVoiceWaveformBlocksParam{{}, Superframe, 0x10, 1, &block});
+    } catch (const std::runtime_error& error) {
+        rejected = std::strstr(error.what(), "silence flag") != nullptr;
+    }
+    Require(rejected);
+    Require(sceNgs2SystemDestroy(system, nullptr) == SCE_NGS2_OK);
+}
+
 int main() {
     const auto reference = Reference();
     TestSkipAndBlockEnd(reference);
@@ -495,5 +510,6 @@ int main() {
     TestStarvationAndTruncation(reference);
     TestAppendBoundaries(reference);
     TestAppendWithoutWaveform();
+    TestSilenceFlagRejected();
     return 0;
 }

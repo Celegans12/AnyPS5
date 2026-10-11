@@ -44,8 +44,9 @@ static int DoFstat(int fd, NativeStat* st) {
     return ReadHandleInfo(reinterpret_cast<HANDLE>(::_get_osfhandle(fd)), st);
 }
 static int DoLstat(const std::filesystem::path& p, NativeStat* st) {
-    std::error_code error;
-    if (std::filesystem::is_symlink(std::filesystem::symlink_status(p, error))) NotImplemented_nid_no_patch("lstat of a Windows symbolic link");
+    const auto attributes = GetFileAttributesW(p.c_str());
+    if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
+        NotImplemented_nid_no_patch("lstat of a Windows symbolic link");
     return DoStat(p, st);
 }
 #else

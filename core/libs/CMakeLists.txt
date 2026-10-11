@@ -3,6 +3,12 @@ if(NOT WIN32)
     string(STRIP "${CMAKE_EXE_LINKER_FLAGS}" CMAKE_EXE_LINKER_FLAGS)
 endif()
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    include(CheckPIESupported)
+    check_pie_supported(LANGUAGES C CXX)
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+endif()
+
 add_executable(nid_patcher
         ${CMAKE_CURRENT_SOURCE_DIR}/nid/src/Sha1.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/nid/src/NidCompute.cpp
@@ -47,6 +53,9 @@ set(LIBS_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 add_subdirectory(${LIBC_DIR} ${CMAKE_CURRENT_BINARY_DIR}/prx/libc)
 target_include_directories(libc PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 configure_windows_unwind(libc)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_options(libc PRIVATE LINKER:-z,now)
+endif()
 
 set(UNPATCHED_DIR ${CMAKE_CURRENT_BINARY_DIR}/libs/unpatched)
 set(PATCHED_DIR ${CMAKE_CURRENT_BINARY_DIR}/libs)
@@ -96,6 +105,9 @@ foreach(LIB_DIR ${LIBS_DIRS})
         else()
             target_link_libraries(${LIB_NAME} PRIVATE libkernel libc)
         endif()
+        if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+            target_link_options(${LIB_NAME} PRIVATE LINKER:-z,now)
+        endif()
         if(WIN32 AND LIB_NAME STREQUAL "libSceNet")
             target_link_libraries(${LIB_NAME} PRIVATE ws2_32)
             target_compile_definitions(${LIB_NAME} PRIVATE _WIN32_WINNT=0x0602)
@@ -132,6 +144,15 @@ endforeach()
 add_custom_target(libs DEPENDS ${PATCHED_OUTPUTS})
 
 if(BUILD_TESTING)
+    add_test_executable(guest_posix_scalar_io_tests tests/GuestPosixScalarIo.cpp)
+    target_include_directories(guest_posix_scalar_io_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(guest_posix_scalar_io_tests PRIVATE libkernel libc)
+    configure_windows_unwind(guest_posix_scalar_io_tests)
+    add_test(NAME guest_posix_scalar_io COMMAND guest_posix_scalar_io_tests)
+    if(WIN32)
+        set_tests_properties(guest_posix_scalar_io PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+    endif()
     find_package(Python3 QUIET COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)
         add_test(NAME nid_patcher_macho COMMAND ${Python3_EXECUTABLE}
@@ -165,6 +186,36 @@ if(BUILD_TESTING)
     if(WIN32)
         set_tests_properties(guest_offline_imports PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceHttp>")
+    endif()
+
+    add_test_executable(guest_rudp_status_tests tests/GuestRudpStatus.cpp)
+    target_include_directories(guest_rudp_status_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(guest_rudp_status_tests PRIVATE libSceRudp libc)
+    configure_windows_unwind(guest_rudp_status_tests)
+    add_test(NAME guest_rudp_status COMMAND guest_rudp_status_tests)
+    if(WIN32)
+        set_tests_properties(guest_rudp_status PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceRudp>")
+    endif()
+
+    add_test_executable(guest_memory_pool_stats_tests tests/GuestMemoryPoolStats.cpp)
+    target_include_directories(guest_memory_pool_stats_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(guest_memory_pool_stats_tests PRIVATE libSceSsl libSceHttp2 libSceNet libkernel libc)
+    configure_windows_unwind(guest_memory_pool_stats_tests)
+    add_test(NAME guest_memory_pool_stats COMMAND guest_memory_pool_stats_tests)
+    if(WIN32)
+        set_tests_properties(guest_memory_pool_stats PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceSsl>")
+    endif()
+
+    add_test_executable(guest_system_gesture_tests tests/GuestSystemGesture.cpp)
+    target_include_directories(guest_system_gesture_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(guest_system_gesture_tests PRIVATE libSceSystemGesture libc)
+    configure_windows_unwind(guest_system_gesture_tests)
+    add_test(NAME guest_system_gesture COMMAND guest_system_gesture_tests)
+    if(WIN32)
+        set_tests_properties(guest_system_gesture PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceSystemGesture>")
     endif()
 
     if(UNIX AND (CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$" OR CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64"))
@@ -237,5 +288,25 @@ if(BUILD_TESTING)
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceSaveData>")
         set_tests_properties(savedata_native_write_replacement PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceSaveData.native>")
+    endif()
+
+    add_test_executable(guest_ppsa01530_exports_tests tests/GuestPPSA01530Exports.cpp)
+    target_include_directories(guest_ppsa01530_exports_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(guest_ppsa01530_exports_tests PRIVATE libkernel libSceJson2 libSceNet libScePad libc)
+    configure_windows_unwind(guest_ppsa01530_exports_tests)
+    add_test(NAME guest_ppsa01530_exports COMMAND guest_ppsa01530_exports_tests)
+    if(WIN32)
+        set_tests_properties(guest_ppsa01530_exports PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+    endif()
+
+    add_test_executable(guest_posix_random_tests tests/GuestPosixRandom.cpp)
+    target_include_directories(guest_posix_random_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(guest_posix_random_tests PRIVATE libScePosixForWebKit)
+    configure_windows_unwind(guest_posix_random_tests)
+    add_test(NAME guest_posix_random COMMAND guest_posix_random_tests)
+    if(WIN32)
+        set_tests_properties(guest_posix_random PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libScePosixForWebKit>")
     endif()
 endif()

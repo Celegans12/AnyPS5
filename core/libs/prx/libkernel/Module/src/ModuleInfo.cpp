@@ -276,8 +276,6 @@ extern "C" {
 int APS5_VABI sceKernelGetModuleInfoFromAddr(std::uint64_t address, int flags, ModuleInfoEx* info) {
     if (!info) return SCE_KERNEL_ERROR_EFAULT;
     if (flags != 2) throw std::invalid_argument("sceKernelGetModuleInfoFromAddr: unsupported flags " + std::to_string(flags));
-    if (info->st_size != sizeof(ModuleInfoEx))
-        throw std::invalid_argument("sceKernelGetModuleInfoFromAddr: unsupported st_size " + std::to_string(info->st_size));
     ModuleInfoEx result{};
     result.st_size = sizeof(ModuleInfoEx);
 #ifdef _WIN32

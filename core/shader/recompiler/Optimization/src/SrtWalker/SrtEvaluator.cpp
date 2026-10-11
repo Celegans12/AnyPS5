@@ -154,6 +154,11 @@ bool Evaluator::EvaluateRawRead(IrValue& inst, std::uint64_t& result) {
             return false;
         }
     }
+    if (_nullRoots != nullptr && base == 0 && !LoadedFromMemory(*handle)) {
+        ++*_nullRoots;
+        result = 0;
+        return true;
+    }
     if (_inaccessible != nullptr && _runtime.accessible != nullptr && !_runtime.accessible(_runtime.userContext, address, sizeof(std::uint32_t)) && LoadedFromMemory(*handle)) {
         *_inaccessible = {&inst, address};
         return false;
@@ -194,6 +199,7 @@ bool Evaluator::EvaluateInst(IrValue& inst, std::uint64_t& result) {
         case IrOpcode::ReadFirstLane: {
             Evaluator active(_program, _runtime, _cleanFlatSlots, _cleanEvaluator, inst.Argument(1));
             active.ReportInaccessibleReads(_inaccessible);
+            active.ReportNullRootReads(_nullRoots);
             return active.EvaluateWide(inst.Argument(0), result);
         }
         case IrOpcode::BitCastU32F32:
@@ -255,6 +261,12 @@ bool Evaluator::EvaluateInst(IrValue& inst, std::uint64_t& result) {
         case IrOpcode::IMul64:
             if (binary()) {
                 result = a * b;
+                return true;
+            }
+            return false;
+        case IrOpcode::SMin32:
+            if (binary()) {
+                result = static_cast<std::uint32_t>(std::min(std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(a)), std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(b))));
                 return true;
             }
             return false;

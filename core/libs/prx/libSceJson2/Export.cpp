@@ -825,4 +825,9 @@ int APS5_VABI _ZN3sce4Json18InitParameterRtti216setAllocatorRttiEPNS0_14AllocPar
     NotImplemented_nid_no_patch(__func__);
     return 0;
 }
+
+int APS5_VABI _ZN3sce4Json5Value21setNullAccessCallBackEPFRKS1_NS0_9ValueTypeEPS2_PvES6_() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
 }

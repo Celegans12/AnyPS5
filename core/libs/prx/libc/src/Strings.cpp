@@ -73,6 +73,16 @@ const void* APS5_VABI memchr_nid_postfix(const void* s, int c, size_t n) {
     return std::memchr(s, c, n);
 }
 
+void* APS5_VABI memrchr_nid_postfix(const void* s, int c, size_t n) {
+    const auto* bytes = static_cast<const unsigned char*>(s);
+    const auto value = static_cast<unsigned char>(c);
+    while (n != 0) {
+        --n;
+        if (bytes[n] == value) return const_cast<unsigned char*>(bytes + n);
+    }
+    return nullptr;
+}
+
 int APS5_VABI strcmp_nid_postfix(const char* s1, const char* s2) {
     return std::strcmp(s1, s2);
 }
@@ -119,32 +129,37 @@ size_t APS5_VABI strlcpy_nid_postfix(char* dest, const char* src, size_t size) {
     return srcLen;
 }
 
-bool StopAtBinaryPrefix_nid_no_patch(const char* str, char** endptr, int base) {
-    if (base != 0 && base != 2) return false;
+bool StopAtPrefixLetter_nid_no_patch(const char* str, char** endptr, int base) {
+    if (base != 0 && base != 2 && base != 16) return false;
     while (*str == ' ' || (*str >= '\t' && *str <= '\r')) ++str;
     if (*str == '+' || *str == '-') ++str;
-    if (str[0] != '0' || (str[1] != 'b' && str[1] != 'B') || (str[2] != '0' && str[2] != '1')) return false;
+    if (str[0] != '0' || str[1] == '\0') return false;
+    const char next = str[2];
+    const bool binary = base != 16 && (str[1] == 'b' || str[1] == 'B') && (next == '0' || next == '1');
+    const bool hexDigit = (next >= '0' && next <= '9') || (next >= 'a' && next <= 'f') || (next >= 'A' && next <= 'F');
+    const bool bareHex = base != 2 && (str[1] == 'x' || str[1] == 'X') && !hexDigit;
+    if (!binary && !bareHex) return false;
     if (endptr) *endptr = const_cast<char*>(str + 1);
     return true;
 }
 
 std::int64_t APS5_VABI strtol_nid_postfix(const char* str, char** endptr, int base) {
-    if (StopAtBinaryPrefix_nid_no_patch(str, endptr, base)) return 0;
+    if (StopAtPrefixLetter_nid_no_patch(str, endptr, base)) return 0;
     return std::strtoll(str, endptr, base);
 }
 
 std::uint64_t APS5_VABI strtoul_nid_postfix(const char* str, char** endptr, int base) {
-    if (StopAtBinaryPrefix_nid_no_patch(str, endptr, base)) return 0;
+    if (StopAtPrefixLetter_nid_no_patch(str, endptr, base)) return 0;
     return std::strtoull(str, endptr, base);
 }
 
 long long APS5_VABI strtoll_nid_postfix(const char* str, char** endptr, int base) {
-    if (StopAtBinaryPrefix_nid_no_patch(str, endptr, base)) return 0;
+    if (StopAtPrefixLetter_nid_no_patch(str, endptr, base)) return 0;
     return std::strtoll(str, endptr, base);
 }
 
 unsigned long long APS5_VABI strtoull_nid_postfix(const char* str, char** endptr, int base) {
-    if (StopAtBinaryPrefix_nid_no_patch(str, endptr, base)) return 0;
+    if (StopAtPrefixLetter_nid_no_patch(str, endptr, base)) return 0;
     return std::strtoull(str, endptr, base);
 }
 
@@ -161,6 +176,14 @@ long double APS5_VABI strtold_nid_postfix(const char* str, char** endptr) {
 
 int APS5_VABI atoi_nid_postfix(const char* str) {
     return std::atoi(str);
+}
+
+std::int64_t APS5_VABI atol_nid_postfix(const char* str) {
+    return std::strtoll(str, nullptr, 10);
+}
+
+long long APS5_VABI atoll_nid_postfix(const char* str) {
+    return std::strtoll(str, nullptr, 10);
 }
 
 std::div_t APS5_VABI div_nid_postfix(int numerator, int denominator) {
@@ -310,12 +333,12 @@ int APS5_VABI memmove_s_nid_postfix(void* dest, size_t destsz, const void* src, 
 
 int APS5_VABI memset_s_nid_postfix(void* dest, size_t destsz, int value, size_t count) {
     constexpr int GuestEinval = 22;
-    constexpr int GuestErange = 34;
-    if (!dest) return GuestEinval;
+    constexpr size_t RsizeMax = SIZE_MAX >> 1;
+    if (!dest || destsz > RsizeMax || count > RsizeMax) return GuestEinval;
     const auto length = count > destsz ? destsz : count;
     auto* bytes = static_cast<volatile unsigned char*>(dest);
     for (size_t index = 0; index < length; ++index) bytes[index] = static_cast<unsigned char>(value);
-    return count > destsz ? GuestErange : 0;
+    return count > destsz ? GuestEinval : 0;
 }
 
 char* APS5_VABI strnstr_nid_postfix(const char* haystack, const char* needle, size_t length) {
@@ -329,7 +352,7 @@ char* APS5_VABI strnstr_nid_postfix(const char* haystack, const char* needle, si
 }
 
 unsigned long long APS5_VABI _Stoull_nid_postfix(const char* str, char** endptr, int base) {
-    if (StopAtBinaryPrefix_nid_no_patch(str, endptr, base)) return 0;
+    if (StopAtPrefixLetter_nid_no_patch(str, endptr, base)) return 0;
     return std::strtoull(str, endptr, base);
 }
 
@@ -423,19 +446,24 @@ long double APS5_VABI wcstold_nid_postfix(const char16_t* str, char16_t** endptr
 }
 
 long long APS5_VABI wcstol_nid_postfix(const char16_t* str, char16_t** endptr, int base) {
-    return ParseAsciiPrefix(str, endptr, [base](const char* text, char** end) { return StopAtBinaryPrefix_nid_no_patch(text, end, base) ? 0LL : std::strtoll(text, end, base); });
+    return ParseAsciiPrefix(str, endptr, [base](const char* text, char** end) { return StopAtPrefixLetter_nid_no_patch(text, end, base) ? 0LL : std::strtoll(text, end, base); });
 }
 
 long long APS5_VABI wcstoll_nid_postfix(const char16_t* str, char16_t** endptr, int base) {
-    return ParseAsciiPrefix(str, endptr, [base](const char* text, char** end) { return StopAtBinaryPrefix_nid_no_patch(text, end, base) ? 0LL : std::strtoll(text, end, base); });
+    return ParseAsciiPrefix(str, endptr, [base](const char* text, char** end) { return StopAtPrefixLetter_nid_no_patch(text, end, base) ? 0LL : std::strtoll(text, end, base); });
 }
 
 unsigned long long APS5_VABI wcstoul_nid_postfix(const char16_t* str, char16_t** endptr, int base) {
-    return ParseAsciiPrefix(str, endptr, [base](const char* text, char** end) { return StopAtBinaryPrefix_nid_no_patch(text, end, base) ? 0ULL : std::strtoull(text, end, base); });
+    return ParseAsciiPrefix(str, endptr, [base](const char* text, char** end) { return StopAtPrefixLetter_nid_no_patch(text, end, base) ? 0ULL : std::strtoull(text, end, base); });
 }
 
 unsigned long long APS5_VABI wcstoull_nid_postfix(const char16_t* str, char16_t** endptr, int base) {
-    return ParseAsciiPrefix(str, endptr, [base](const char* text, char** end) { return StopAtBinaryPrefix_nid_no_patch(text, end, base) ? 0ULL : std::strtoull(text, end, base); });
+    return ParseAsciiPrefix(str, endptr, [base](const char* text, char** end) { return StopAtPrefixLetter_nid_no_patch(text, end, base) ? 0ULL : std::strtoull(text, end, base); });
+}
+
+std::uint64_t APS5_VABI _WStoul_nid_postfix(const char16_t* str, char16_t** endptr, int base) {
+    if (base < 0 || base == 1 || base > 36) throw std::invalid_argument("_WStoul: unsupported base " + std::to_string(base));
+    return wcstoul_nid_postfix(str, endptr, base);
 }
 
 int APS5_VABI wcscoll_nid_postfix(const char16_t* first, const char16_t* second) {

@@ -3,8 +3,14 @@
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libkernel/Apr/include/AprCommandBuffer.hpp"
+#include "prx/libkernel/Time/include/Time.hpp"
+#include <algorithm>
+#include <array>
+#include <atomic>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
+#include <thread>
 
 static constexpr int SCE_AMPR_ERROR_BUFFER_FULL = 0x8002001C;
 static constexpr int SCE_KERNEL_ERROR_EINVAL = 0x80020016;
@@ -210,6 +216,40 @@ static int RecordWriteAddressFromCounterPair(Apr::CommandBufferObject* buffer, v
     return AppendCommand(buffer, Apr::Opcode::WriteAddressFromCounterPair, Apr::WriteAddressFromCounterCommand{{}, reinterpret_cast<std::uint64_t>(address), counter, counter + 1u});
 }
 
+struct Xtime {
+    std::int64_t sec;
+    std::int64_t nsec;
+};
+
+static constexpr int ThrdSuccess = 0;
+static constexpr int ThrdError = 4;
+static constexpr int GuestClockRealtime = 0;
+static constexpr std::int64_t NanosPerSecond = 1000000000;
+static constexpr std::int64_t LongestSleepSeconds = 86400;
+
+static std::atomic_flag sharedPtrSpinLock;
+
+extern "C" {
+int APS5_VABI pthread_join_nid_postfix(Pthread thread, void** value);
+int APS5_VABI wcsrtombs_s_nid_postfix(std::size_t* result, char* destination, std::size_t capacity, const std::uint16_t** source, std::size_t limit, void* state);
+}
+
+static KernelTimespec XtimeDeadline(const Xtime& time) {
+    constexpr auto largest = std::numeric_limits<std::int64_t>::max();
+    constexpr auto smallest = std::numeric_limits<std::int64_t>::min();
+    const auto carry = time.nsec / NanosPerSecond;
+    auto nanos = time.nsec % NanosPerSecond;
+    auto seconds = time.sec;
+    if ((carry > 0 && seconds > largest - carry) || (carry < 0 && seconds < smallest - carry)) throw std::overflow_error("_Thrd_sleep: xtime seconds overflow");
+    seconds += carry;
+    if (nanos < 0) {
+        if (seconds == smallest) throw std::overflow_error("_Thrd_sleep: xtime seconds overflow");
+        nanos += NanosPerSecond;
+        --seconds;
+    }
+    return {seconds, nanos};
+}
+
 extern "C" {
 
 int APS5_VABI sceAmprCommandBufferWriteAddressOnCompletion(Apr::CommandBufferObject* buffer, volatile std::uint64_t* address, std::uint64_t value) {
@@ -297,7 +337,11 @@ int APS5_VABI sceAmprAprCommandBufferReadFileGather(Apr::CommandBufferObject* bu
     (void)mapState;
     (void)scatterGatherState;
     if (!ValidReadLength(size) || !ValidReadOffset(offset)) return SCE_KERNEL_ERROR_EINVAL;
-    return AppendRead(buffer, Apr::Opcode::ReadFileGather, 0, nullptr, size, offset);
+    if (!buffer || (buffer->recording & Apr::ScatterGatherValid) == 0u) return SCE_KERNEL_ERROR_EINVAL;
+    const Apr::CompactReadFileGatherCommand command{
+        static_cast<std::uint32_t>(Apr::Opcode::CompactReadFileGather) | static_cast<std::uint32_t>(offset >> 32u) << 8u,
+        static_cast<std::uint32_t>(size - 1u), static_cast<std::uint32_t>(offset)};
+    return Append(buffer, &command, sizeof(command));
 }
 
 int APS5_VABI sceAmprAprCommandBufferReadFileGatherScatter(Apr::CommandBufferObject* buffer, std::uint64_t* mapState, std::uint64_t* scatterGatherState, void* destination, std::uint64_t size, std::uint64_t offset) {
@@ -358,7 +402,7 @@ int APS5_VABI sceAmprCommandBufferConstructNop(Apr::CommandBufferObject* buffer,
 }
 
 int APS5_VABI sceAmprCommandBufferConstructor(Apr::CommandBufferObject* buffer) {
-    *buffer = {nullptr, 0, 0, 0, Apr::BufferType::Generic};
+    *buffer = {Apr::BufferType::Generic, 0, 0, 0, 0, nullptr};
     return 0;
 }
 
@@ -521,7 +565,7 @@ uint32_t APS5_VABI sceAmprMeasureCommandSizeReadFile(void) {
 
 std::uint64_t APS5_VABI sceAmprMeasureCommandSizeReadFileGather(std::uint64_t size, std::uint64_t offset) {
     if (!ValidReadLength(size) || !ValidReadOffset(offset)) return MeasureInvalid;
-    return sizeof(Apr::ReadFileCommand);
+    return sizeof(Apr::CompactReadFileGatherCommand);
 }
 
 std::uint64_t APS5_VABI sceAmprMeasureCommandSizeReadFileGatherScatter(void* destination, std::uint64_t size, std::uint64_t offset) {
@@ -812,9 +856,11 @@ int APS5_VABI _ZSt16_Throw_Cpp_errori_nid_postfix(void) {
     return 0;
 }
 
-int APS5_VABI _Thrd_join_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+int APS5_VABI _Thrd_join_nid_postfix(Pthread thread, int* code) {
+    void* result = nullptr;
+    if (pthread_join_nid_postfix(thread, &result) != 0) return ThrdError;
+    if (code) *code = static_cast<int>(reinterpret_cast<std::intptr_t>(result));
+    return ThrdSuccess;
 }
 
 int APS5_VABI _ZNSt4_Pad8_ReleaseEv_nid_postfix(void) {
@@ -852,9 +898,8 @@ int APS5_VABI _Cnd_signal_nid_postfix(void) {
     return 0;
 }
 
-int APS5_VABI _Unlock_shared_ptr_spin_lock_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+void APS5_VABI _Unlock_shared_ptr_spin_lock_nid_postfix(void) {
+    sharedPtrSpinLock.clear(std::memory_order_release);
 }
 
 int APS5_VABI _Cnd_init_with_name_nid_postfix(void) {
@@ -892,19 +937,30 @@ int APS5_VABI _ZNSt8time_getIcSt19istreambuf_iteratorIcSt11char_traitsIcEEE7_Get
     return 0;
 }
 
-int APS5_VABI _Lock_shared_ptr_spin_lock_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+void APS5_VABI _Lock_shared_ptr_spin_lock_nid_postfix(void) {
+    while (sharedPtrSpinLock.test_and_set(std::memory_order_acquire)) std::this_thread::yield();
 }
 
-int APS5_VABI _Thrd_sleep_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+int APS5_VABI _Thrd_sleep_nid_postfix(const Xtime* target, Xtime*) {
+    if (!target) APS5_INVALID_ARG_EX;
+    const auto deadline = XtimeDeadline(*target);
+    for (;;) {
+        KernelTimespec now{};
+        if (clock_gettime_nid_postfix(GuestClockRealtime, &now) != 0) throw std::runtime_error("_Thrd_sleep: reading the realtime clock failed");
+        if (now.tv_sec > deadline.tv_sec || (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec)) return 0;
+        KernelTimespec remaining{deadline.tv_sec - now.tv_sec, deadline.tv_nsec - now.tv_nsec};
+        if (remaining.tv_nsec < 0) {
+            remaining.tv_nsec += NanosPerSecond;
+            --remaining.tv_sec;
+        }
+        remaining.tv_sec = std::min(remaining.tv_sec, LongestSleepSeconds);
+        if (nanosleep_nid_postfix(&remaining, nullptr) != 0) throw std::runtime_error("_Thrd_sleep: nanosleep failed");
+    }
 }
 
-int APS5_VABI wcstombs_s_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+int APS5_VABI wcstombs_s_nid_postfix(std::size_t* result, char* destination, std::size_t capacity, const std::uint16_t* source, std::size_t limit) {
+    std::array<std::uint64_t, 16> state{};
+    return wcsrtombs_s_nid_postfix(result, destination, capacity, &source, limit, state.data());
 }
 
 int APS5_VABI __cxa_call_unexpected_nid_postfix(void) {

@@ -59,6 +59,7 @@ int APS5_VABI sceKernelClearVirtualRangeName(const void*, std::uint64_t);
 int APS5_VABI sceKernelAllocateDirectMemory(std::int64_t, std::int64_t, std::size_t, std::size_t, int, std::int64_t*);
 int APS5_VABI sceKernelMapDirectMemory(void**, std::size_t, int, int, std::int64_t, std::size_t);
 int APS5_VABI sceKernelReleaseDirectMemory(std::int64_t, std::size_t);
+int APS5_VABI sceKernelAvailableDirectMemorySize(std::int64_t, std::int64_t, std::size_t, std::int64_t*, std::size_t*);
 int APS5_VABI sceKernelCheckedReleaseDirectMemory(std::int64_t, std::size_t);
 int APS5_VABI sceKernelReserveVirtualRange(void**, std::size_t, int, std::size_t);
 int APS5_VABI sceKernelMemoryPoolReserve(void*, std::size_t, std::size_t, int, void**);
@@ -466,6 +467,89 @@ static void CheckGpuAccessFollowsProtection() {
     Require(sceKernelMunmap(flexible, page) == 0);
 }
 
+static std::vector<std::pair<std::uintptr_t, std::size_t>> gpuMapped;
+
+static std::atomic<bool> observerEntered{false};
+static std::atomic<bool> observerDone{false};
+
+static void CheckClearingTheObserverWaitsForItsCalls() {
+    GuestAllocations::GuestAllocationsSetGpuMapObserver_nid_postfix([](const GuestAllocations::Mapped&, std::uint64_t) {
+        observerEntered = true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        observerDone = true;
+    });
+    constexpr std::size_t page = 0x4000;
+    std::int64_t phys = 0;
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, page, 0, 0, &phys) == 0);
+    void* gpu = nullptr;
+    std::thread mapper([&] { Require(sceKernelMapDirectMemory(&gpu, page, 0x32, 0, phys, 0) == 0); });
+    while (!observerEntered) std::this_thread::yield();
+    GuestAllocations::GuestAllocationsSetGpuMapObserver_nid_postfix(nullptr);
+    Require(observerDone);
+    mapper.join();
+    Require(sceKernelMunmap(gpu, page) == 0);
+    Require(sceKernelReleaseDirectMemory(phys, page) == 0);
+}
+
+static void CheckGpuMapsAreObserved() {
+    GuestAllocations::GuestAllocationsSetGpuMapObserver_nid_postfix([](const GuestAllocations::Mapped& mapped, std::uint64_t) {
+        const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+        for (const auto& weak : mapped) {
+            const auto range = weak.lock();
+            if (range == nullptr) continue;
+            const bool registered = std::any_of(lease.begin(), lease.end(), [&](const auto& current) { return current == range; });
+            gpuMapped.emplace_back(registered && range->gpu ? range->address : 0, range->bytes);
+        }
+    });
+    constexpr std::size_t page = 0x4000;
+    void* heap = GuestHeap::GuestHeapAlign_nid_postfix(page, page);
+    Require(heap != nullptr && gpuMapped.empty());
+    GuestHeap::GuestHeapFree_nid_postfix(heap);
+    std::int64_t phys = 0;
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, page * 2, 0, 0, &phys) == 0);
+    void* cpu = nullptr;
+    Require(sceKernelMapDirectMemory(&cpu, page, 3, 0, phys, 0) == 0);
+    Require(gpuMapped.empty());
+    void* gpu = nullptr;
+    Require(sceKernelMapDirectMemory(&gpu, page, 0x32, 0, phys + static_cast<std::int64_t>(page), 0) == 0);
+    Require(gpuMapped.size() == 1 && gpuMapped.front().first == reinterpret_cast<std::uintptr_t>(gpu) && gpuMapped.front().second == page);
+    Require(sceKernelMprotect(cpu, page, 0x13) == 0);
+    Require(gpuMapped.size() == 1);
+    std::int64_t remapPhys = 0;
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, page * 2, 0, 0, &remapPhys) == 0);
+    void* reserved = nullptr;
+    Require(sceKernelReserveVirtualRange(&reserved, page * 2, 0, 0) == 0);
+    void* cpuRemap = reserved;
+    Require(sceKernelMapDirectMemory(&cpuRemap, page, 3, 0x10, remapPhys, 0) == 0 && cpuRemap == reserved);
+    Require(gpuMapped.size() == 1);
+    void* gpuRemap = static_cast<unsigned char*>(reserved) + page;
+    void* const gpuTarget = gpuRemap;
+    Require(sceKernelMapDirectMemory(&gpuRemap, page, 0x32, 0x10, remapPhys + static_cast<std::int64_t>(page), 0) == 0 && gpuRemap == gpuTarget);
+    Require(gpuMapped.size() == 2 && gpuMapped.back().first == reinterpret_cast<std::uintptr_t>(gpuTarget) && gpuMapped.back().second == page);
+    GuestAllocations::GuestAllocationsSetGpuMapObserver_nid_postfix(nullptr);
+    Require(sceKernelMunmap(reserved, page * 2) == 0);
+    Require(sceKernelReleaseDirectMemory(remapPhys, page * 2) == 0);
+    Require(sceKernelMunmap(cpu, page) == 0);
+    Require(sceKernelMunmap(gpu, page) == 0);
+    Require(sceKernelReleaseDirectMemory(phys, page * 2) == 0);
+}
+
+static void CheckHintedVirtualReservation() {
+    constexpr std::size_t page = 0x4000;
+    void* probe = nullptr;
+    Require(sceKernelReserveVirtualRange(&probe, page * 8, 0, 0) == 0);
+    Require(sceKernelMunmap(probe, page * 8) == 0);
+    void* const hint = static_cast<unsigned char*>(probe) + page * 2;
+    void* placed = hint;
+    Require(sceKernelReserveVirtualRange(&placed, page * 2, 0, 0) == 0);
+    Require(placed == hint);
+    void* above = hint;
+    Require(sceKernelReserveVirtualRange(&above, page * 2, 0, 0) == 0);
+    Require(above > hint);
+    Require(sceKernelMunmap(above, page * 2) == 0);
+    Require(sceKernelMunmap(placed, page * 2) == 0);
+}
+
 static void CheckFixedVirtualReservation() {
     constexpr std::size_t page = 0x4000;
     void* probe = nullptr;
@@ -512,6 +596,37 @@ static void CheckFixedVirtualReservation() {
     Require(sceKernelMemoryPoolReserve(requested, page * 2, 0, 0x10, &pooled) == 0);
     Require(pooled == requested);
     Require(sceKernelMunmap(pooled, page * 2) == 0);
+}
+
+static void CheckHintInsideReservation() {
+    constexpr std::size_t page = 0x4000;
+    void* reserved = nullptr;
+    Require(sceKernelReserveVirtualRange(&reserved, page * 4, 0, 0) == 0);
+    auto* base = static_cast<unsigned char*>(reserved);
+    std::int64_t phys = 0;
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, page * 3, 0, 0, &phys) == 0);
+    void* direct = base + page;
+    Require(sceKernelMapDirectMemory(&direct, page, 3, 0, phys, 0) == 0);
+    Require(direct == base + page);
+    static_cast<unsigned char*>(direct)[0] = 21;
+    void* flexible = base + page * 2;
+    Require(sceKernelMapFlexibleMemory(&flexible, page, 3, 0) == 0);
+    Require(flexible == base + page * 2);
+    static_cast<unsigned char*>(flexible)[0] = 22;
+    VirtualQueryInfo info{};
+    Require(sceKernelVirtualQuery(direct, 0, &info, sizeof(info)) == 0);
+    Require(info.is_direct && info.offset == static_cast<std::uint64_t>(phys));
+    Require(sceKernelVirtualQuery(flexible, 0, &info, sizeof(info)) == 0);
+    Require(info.is_flexible);
+    Require(sceKernelVirtualQuery(base + page * 3, 0, &info, sizeof(info)) == 0);
+    Require(!info.is_committed && info.protection == 0);
+    void* overlapping = base + page;
+    Require(sceKernelMapDirectMemory(&overlapping, page * 2, 3, 0, phys + page, 0) == 0);
+    Require(overlapping != base + page);
+    Require(static_cast<unsigned char*>(direct)[0] == 21 && static_cast<unsigned char*>(flexible)[0] == 22);
+    Require(sceKernelMunmap(overlapping, page * 2) == 0);
+    Require(sceKernelMunmap(reserved, page * 4) == 0);
+    Require(sceKernelReleaseDirectMemory(phys, page * 3) == 0);
 }
 
 static void CheckReservedRangeIsNotCommitted() {
@@ -1507,10 +1622,41 @@ static void CheckVirtualQueryPartialMunmap() {
     Require(munmap_nid_postfix(memory + page * 2, page) == 0);
 }
 
+
+static void CheckAvailableDirectMemoryIsLargestFreeBlock() {
+    constexpr std::int64_t window = 0x4000000;
+    const std::int64_t top = static_cast<std::int64_t>(DIRECT_MEMORY_SIZE) - window;
+    std::int64_t first = -1;
+    std::int64_t gap = -1;
+    std::int64_t last = -1;
+    Require(sceKernelAllocateDirectMemory(top, top + window, 0x200000, 0x200000, 0, &first) == 0 && first == top);
+    Require(sceKernelAllocateDirectMemory(top, top + window, 0x400000, 0x200000, 0, &gap) == 0 && gap == top + 0x200000);
+    Require(sceKernelAllocateDirectMemory(top, top + window, 0x200000, 0x200000, 0, &last) == 0 && last == top + 0x600000);
+    Require(sceKernelReleaseDirectMemory(gap, 0x400000) == 0);
+
+    std::int64_t start = -1;
+    std::size_t size = 0;
+    Require(sceKernelAvailableDirectMemorySize(top, top + window, 0, &start, &size) == 0);
+    Require(start == top + 0x800000 && size == static_cast<std::size_t>(window - 0x800000));
+    Require(sceKernelAvailableDirectMemorySize(top, top + 0x800000, 0, &start, &size) == 0);
+    Require(start == top + 0x200000 && size == 0x400000);
+    Require(sceKernelAvailableDirectMemorySize(top, top + window, 0x1000000, &start, &size) == 0);
+    Require(start == top + 0x1000000 && size == static_cast<std::size_t>(window - 0x1000000));
+    Require(sceKernelAvailableDirectMemorySize(top, top + 0x200000, 0, &start, &size) == SCE_KERNEL_ERROR_EAGAIN);
+    Require(start == 0 && size == 0);
+    Require(sceKernelAvailableDirectMemorySize(top, top + window, 0, nullptr, &size) == SCE_KERNEL_ERROR_EINVAL);
+
+    Require(sceKernelReleaseDirectMemory(first, 0x200000) == 0);
+    Require(sceKernelReleaseDirectMemory(last, 0x200000) == 0);
+    Require(sceKernelAvailableDirectMemorySize(top, top + window, 0, &start, &size) == 0);
+    Require(start == top && size == static_cast<std::size_t>(window));
+}
+
 int main() {
 #ifdef _WIN32
     _putenv_s("APS5_PIN_WAIT_MS", "1000");
 #endif
+    CheckAvailableDirectMemoryIsLargestFreeBlock();
     CheckVirtualQuerySplitFlexibleRanges();
     CheckVirtualQueryForNonReadableGuestRange();
     CheckReleaseFlexibleMemory();
@@ -1526,8 +1672,12 @@ int main() {
     CheckFixedMappingReplacesPartialOverlap();
     CheckDirectMemoryGpuProtBits();
     CheckGpuAccessFollowsProtection();
+    CheckGpuMapsAreObserved();
+    CheckClearingTheObserverWaitsForItsCalls();
+    CheckHintedVirtualReservation();
     CheckFixedVirtualReservation();
     CheckReservedRangeIsNotCommitted();
+    CheckHintInsideReservation();
     CheckNoOverwriteRefusesLiveMapping();
     CheckMlock();
     CheckSharedDirectMemoryLifecycle();

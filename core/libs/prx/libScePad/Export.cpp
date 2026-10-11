@@ -156,14 +156,10 @@ int APS5_VABI scePadSetFeatureReport() { NotImplemented_nid_no_patch(__func__); 
 
 int APS5_VABI scePadOutputReport() { NotImplemented_nid_no_patch(__func__); return 0; }
 
-int APS5_VABI scePadReadState(int handle, PadData* data);
-
 int APS5_VABI scePadRead_nid_postfix(int handle, PadData* data, int num) {
-    // The title drains the queued states; one current state is reported per call.
-    if (data == nullptr || num <= 0) APS5_INVALID_ARG_EX;
-    const int result = scePadReadState(handle, data);
-    if (result != 0) return result;
-    return 1;
+ if (handle != PAD_HANDLE) return PAD_ERROR_INVALID_HANDLE;
+ if (data == nullptr || num <= 0) APS5_INVALID_ARG_EX;
+ return Pad::Read(data, num);
 }
 
 int APS5_VABI scePadReadState(int handle, PadData* data) {
@@ -260,6 +256,13 @@ int APS5_VABI scePadVrControllerRead() {
  return 0;
 }
 
+int APS5_VABI scePadVrControllerReadState(int handle, void* state) {
+ (void)handle;
+ (void)state;
+ NotImplemented_nid_no_patch(__func__);
+ return 0;
+}
+
 int APS5_VABI scePadIsRemoteController(int handle, bool* remote) {
  if (handle != PAD_HANDLE) return PAD_ERROR_INVALID_HANDLE;
  if (remote == nullptr) return PAD_ERROR_INVALID_ARG;
@@ -272,6 +275,12 @@ int APS5_VABI scePadSetAngularVelocityBiasCorrectionState(int handle, bool enabl
  if (handle != PAD_HANDLE) return PAD_ERROR_INVALID_HANDLE;
  if (enabled) NotImplemented_nid_no_patch(__func__);
  return PAD_OK;
+}
+
+APS5_EXPORT("n3kSX62fgNo", scePadUnknown_n3kSX62fgNo);
+int APS5_VABI scePadUnknown_n3kSX62fgNo() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
 }
 
 }

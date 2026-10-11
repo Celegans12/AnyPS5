@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/Shutdown.hpp"
+#include "tests/VideoOutTestEnvironment.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -14,8 +15,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <filesystem>
-#include <fstream>
 #include <initializer_list>
 #include <string>
 #include <limits>
@@ -308,6 +307,14 @@ void testControls() {
     check(owner->GetTriggeredEvents(&event, 1) == 1, "initial output mode event missing");
     int64_t mode = 0;
     check(sceVideoOutGetEventData(&event, &mode) == 0 && mode == VIDEO_OUT_OUTPUT_MODE_DEFAULT && sceVideoOutGetEventCount(&event) == 1, "initial output mode event encoding is wrong");
+    check(sceVideoOutDeleteOutputModeEvent(queue, handle) == 0, "output mode unsubscription failed");
+    {
+        std::lock_guard lock(cfg->mutex);
+        check(cfg->outputModeEvents.empty(), "output mode unsubscription did not clear registration");
+    }
+    check(sceVideoOutDeleteOutputModeEvent(queue, handle) == 0, "duplicate output mode unsubscription failed");
+    expectFailure([&] { sceVideoOutDeleteOutputModeEvent(0, handle); });
+    expectFailure([&] { sceVideoOutDeleteOutputModeEvent(queue, -1); });
     check(sceVideoOutAddVblankEvent(queue, handle, nullptr) == 0 && sceVideoOutAddVblankEvent(queue, handle, &settings) == 0, "vblank subscription failed");
     {
         std::lock_guard lock(cfg->mutex);
@@ -341,7 +348,15 @@ void testControls() {
     vrrStatus.ident = VIDEO_OUT_EVENT_VRR_STATUS;
     vrrStatus.filter = EVFILT_VIDEO_OUT;
     check(sceVideoOutGetEventId(&vrrStatus) == VIDEO_OUT_EVENT_VRR_STATUS, "VRR status event id rejected");
+    check(sceVideoOutVrrPegToFixedRate(handle, 0, 0) == 0, "VRR peg on an open handle failed");
+    check(sceVideoOutVrrUnpegFromFixedRate(handle) == 0, "VRR unpeg on an open handle failed");
+    expectFailure([&] { sceVideoOutVrrPegToFixedRate(handle, 1, 0); });
+    expectFailure([&] { sceVideoOutVrrPegToFixedRate(handle, 0, 1); });
+    expectFailure([&] { sceVideoOutVrrPegToFixedRate(handle, 0x100000000ull, 0); });
+    expectFailure([&] { sceVideoOutVrrPegToFixedRate(handle, 0, 0x100000000ull); });
     sceVideoOutClose(handle);
+    expectFailure([&] { sceVideoOutVrrPegToFixedRate(handle, 0, 0); });
+    expectFailure([&] { sceVideoOutVrrUnpegFromFixedRate(handle); });
     check(owner->GetTriggeredEvents(&event, 1) == 0, "closed port retained pending events");
     check(sceKernelDeleteEqueue(queue) == 0, "event queue deletion failed");
     LibcRunShutdown_nid_postfix();
@@ -657,9 +672,8 @@ void testOneDevice() {
 }
 
 int main(int argc, char** argv) {
+    VideoOutTestEnvironment environment;
     try {
-        std::filesystem::create_directories("app0/sce_sys");
-        std::ofstream("app0/sce_sys/param.json", std::ios::binary) << R"({"titleId":"PPSA00000","localizedParameters":{"en-US":{"titleName":"Example"}},"downloadDataSize":0})";
         if (argc == 2 && std::string(argv[1]) == "decode") testDecode();
         else if (argc == 2 && std::string(argv[1]) == "controls") testControls();
         else if (argc == 2 && std::string(argv[1]) == "present") testPresentation();
