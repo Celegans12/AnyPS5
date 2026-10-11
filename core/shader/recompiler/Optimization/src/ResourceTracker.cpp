@@ -931,6 +931,8 @@ private:
     }
 
     bool WaterfallPlacementValid(const DescriptorWeb& web, IrValue& first, IrValue& consumer, std::span<IrValue* const> inputs) const {
+        const auto& order = m_program.BlockOrder();
+        if (order.empty()) return false;
         struct Site { IrBlock* block; std::size_t index; };
         std::unordered_map<const IrValue*, Site> sites;
         for (const auto& block : m_program.Blocks()) {
@@ -960,7 +962,7 @@ private:
                     continue;
                 }
                 if (!visited.insert(block).second) continue;
-                if (visited.size() > DescriptorWeb::maxStates || block == &m_program.EntryBlock() || block->Predecessors().empty()) {
+                if (visited.size() > DescriptorWeb::maxStates || block == order.front() || block->Predecessors().empty()) {
                     dominators.emplace(key, false);
                     return false;
                 }
