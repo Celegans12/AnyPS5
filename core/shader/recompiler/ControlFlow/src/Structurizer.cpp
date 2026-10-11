@@ -428,6 +428,7 @@ std::uint32_t mergeBesideReturns(const ControlFlowGraph& graph, const BasicBlock
 
 std::uint32_t iterationSelectionMerge(const ControlFlowGraph& graph, const NaturalLoop& loop, const BasicBlock& header, std::uint32_t join) {
     const auto count = static_cast<std::uint32_t>(graph.blocks.size());
+    static const bool reuse = std::getenv("APS5_NO_PERF_ITERATION_SELECTION") == nullptr;
     const auto escapes = [&](std::uint32_t blockId) { return blockId == loop.continueBlock || blockId == loop.mergeBlock; };
     std::vector<bool> joins(count, false);
     std::vector<std::uint32_t> pending = {join};
@@ -463,16 +464,30 @@ std::uint32_t iterationSelectionMerge(const ControlFlowGraph& graph, const Natur
             if (!joins[block.id] || !inBody[block.id] || block.id == join) {
                 continue;
             }
-            auto next = allBlockIds(count);
+            bool seeded = !reuse;
+            auto next = seeded ? allBlockIds(count) : std::vector<std::uint32_t>{};
             for (const auto successor : block.successors) {
                 if (joins[successor]) {
-                    next = intersectSorted(next, postDominators[successor]);
+                    if (!seeded) {
+                        next = postDominators[successor];
+                        seeded = true;
+                    } else if (reuse) {
+                        intersectAnalysisSet(next, postDominators[successor]);
+                    } else {
+                        next = intersectSorted(next, postDominators[successor]);
+                    }
                 }
             }
-            addUnique(next, block.id);
-            sortUnique(next);
+            if (!seeded) next = allBlockIds(count);
+            if (reuse) {
+                addSortedUnique(next, block.id);
+            } else {
+                addUnique(next, block.id);
+                sortUnique(next);
+            }
             if (next != postDominators[block.id]) {
-                postDominators[block.id] = std::move(next);
+                if (reuse) replaceAnalysisSet(postDominators[block.id], std::move(next));
+                else postDominators[block.id] = std::move(next);
                 changed = true;
             }
         }
