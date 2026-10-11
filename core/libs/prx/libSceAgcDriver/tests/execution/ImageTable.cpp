@@ -943,6 +943,38 @@ void RunStoreTests(AgcDriver::VulkanDevice& device) {
     Require(Faulted(invalid) && invalid.log.find("not an image") != std::string::npos, "image table store: an active invalid selection did not report its descriptor fault:\n" + invalid.log);
     flush();
     Require(StoreHalfTexels == afterStore, "image table store: an invalid selection changed the valid image");
+    Keys[0] = 0u;
+    alignas(256) std::array<std::uint32_t, ReadTable256Code.size() + 3u> mixedCode{};
+    std::copy_n(ReadTable256Code.begin(), 16u, mixedCode.begin());
+    mixedCode[16] = 0x060808f2u;
+    mixedCode[17] = 0xf0202108u;
+    mixedCode[18] = 0x00080401u;
+    std::copy(ReadTable256Code.begin() + 16u, ReadTable256Code.end(), mixedCode.begin() + 19u);
+    const auto mixed = Run(device, mixedCode, 1, Lanes, 64);
+    Require(!Faulted(mixed), "image table store: mixed sampled/storage bindings faulted:\n" + mixed.log);
+    RequireRed(mixed, 0u, Lanes, [](std::uint32_t) { return std::bit_cast<std::uint32_t>(2.5f); }, "image table store: sampled alias did not read the prior store");
+    flush();
+    for (std::uint32_t index = 0; index < StoreHalfTexels.size(); ++index) {
+        const auto expected = index < Width ? 0x4100u : index < 2u * Width ? 0x3e00u : 0x3555u;
+        Require(StoreHalfTexels[index] == expected, "image table store: mixed bindings wrote the wrong texel " + std::to_string(index));
+    }
+    UintTexels.fill(0x12345678u);
+    SetWideRecord(0u, Image(UintTexels.data(), Format32UInt));
+    auto uintCode = StoreTableCode;
+    uintCode[13] = 0x89abcdefu;
+    uintCode[15] &= 0x7fffffffu;
+    const auto storedUint = Run(device, uintCode, 1, Lanes, 64);
+    Require(!Faulted(storedUint), "image table store: an ordinary UINT store faulted:\n" + storedUint.log);
+    AgcDriver::Graphics::StorageTexture::FlushPending(reinterpret_cast<std::uintptr_t>(UintTexels.data()), sizeof(UintTexels), nullptr, "test");
+    device.WaitIdle();
+    for (std::uint32_t index = 0; index < UintTexels.size(); ++index) Require(UintTexels[index] == (index < Width ? 0x89abcdefu : 0x12345678u), "image table store: UINT descriptor wrote the wrong texel " + std::to_string(index));
+    SetWideRecord(0u, Image(Table.data(), 13u));
+    const auto savedTable = Table;
+    const auto overlap = Run(device, StoreTableCode, 1, Lanes, 64);
+    Require(Faulted(overlap) && overlap.log.find("is written by its own dispatch") != std::string::npos, "image table store: descriptor self-write did not produce HeapWritten:\n" + overlap.log);
+    AgcDriver::Graphics::StorageTexture::FlushPending(reinterpret_cast<std::uintptr_t>(Table.data()), sizeof(Table), nullptr, "test");
+    device.WaitIdle();
+    Require(Table == savedTable, "image table store: descriptor self-write modified the table");
     SetClassRecords();
 }
 

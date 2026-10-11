@@ -293,6 +293,7 @@ private:
         ShaderRecompiler::ShaderStage stage = ShaderRecompiler::ShaderStage::Compute;
         const ShaderRecompiler::RecompileResult* program = nullptr;
         const ShaderRecompiler::DescriptorBinding* images = nullptr;
+        const ShaderRecompiler::DescriptorBinding* storageImages = nullptr;
         std::size_t mapAllocation = std::numeric_limits<std::size_t>::max();
         std::vector<std::uint32_t> map;
         std::vector<ShaderRecompiler::ImageTableEntryPoison> poison;
@@ -305,12 +306,15 @@ private:
     };
     std::vector<TableStage> tableStages;
     std::size_t tableBinding = std::numeric_limits<std::size_t>::max();
+    std::size_t storageTableBinding = std::numeric_limits<std::size_t>::max();
+    std::uint32_t sampledTableCapacity = 0;
     std::uint32_t tableElements = 0;
     TableStage& tableStage(const CompiledShader& shader);
     static const ShaderRecompiler::DescriptorBinding* tableImages(std::span<const CompiledShader> shaders, ShaderRecompiler::ShaderStage stage);
     std::uint32_t rejectTableElement(TableStage& table, std::span<const std::uint32_t> words, const std::string& message);
     void addSamplerTable(const ShaderRecompiler::DescriptorBinding& binding, VkShaderStageFlags flags, TableStage& table);
     void resolveImageTables();
+    void resolveStorageImageTables();
     void finishImageTables();
 
     // A host-imported buffer region the set reads in place, with its import's identity at build time.

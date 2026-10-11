@@ -271,14 +271,17 @@ void RequireRead(const std::vector<bool>& inside, std::uint32_t in, std::uint32_
     }
 }
 
-void MixedMarkPlane(AgcDriver::VulkanDevice& device, std::uint64_t address, const std::vector<bool>& inside) {
+void MixedMarkPlane(AgcDriver::VulkanDevice& device, std::uint64_t address, const std::vector<bool>& inside, bool conflictingTable = false) {
     TableOutput.fill(0xdeadbeefu);
     alignas(256) std::array<std::uint32_t, 12> table{};
     alignas(256) std::array<std::uint32_t, Height> keys{};
     alignas(256) std::array<std::uint32_t, 24> root{};
     const auto plane = PlaneDescriptor(address, SwizzleZ64KBX, Format8UInt);
-    std::copy(plane.begin(), plane.end(), table.begin() + 4);
+    const auto tablePlane = PlaneDescriptor(address, SwizzleZ64KBX, conflictingTable ? Format8UNorm : Format8UInt);
+    std::copy(tablePlane.begin(), tablePlane.end(), table.begin() + 4);
     std::copy(plane.begin(), plane.end(), root.begin() + 16);
+    auto code = MixedMarkCode;
+    if (conflictingTable) code[14] = 0xf0200108u;
     const auto putBuffer = [&](const void* data, std::uint32_t bytes, std::size_t offset) {
         auto words = BufferDescriptor(data, 0u, bytes);
         words[3] = 0x31016facu;
@@ -290,14 +293,14 @@ void MixedMarkPlane(AgcDriver::VulkanDevice& device, std::uint64_t address, cons
     const auto rootAddress = reinterpret_cast<std::uintptr_t>(root.data());
     const std::array<std::uint32_t, 2> userData{static_cast<std::uint32_t>(rootAddress), static_cast<std::uint32_t>(rootAddress >> 32u)};
     const std::array<ShaderRecompiler::MemoryRegion, 4> memory{{
-        {reinterpret_cast<std::uintptr_t>(MixedMarkCode.data()), std::as_bytes(std::span(MixedMarkCode))},
+        {reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(std::span(code))},
         {rootAddress, std::as_bytes(std::span(root))},
         {reinterpret_cast<std::uintptr_t>(table.data()), std::as_bytes(std::span(table))},
         {reinterpret_cast<std::uintptr_t>(keys.data()), std::as_bytes(std::span(keys))},
     }};
     const ShaderRecompiler::ShaderComputeStageInfo compute{{Width, 1, 1}, 0u, {true, false, false}, false, 1};
     ShaderRecompiler::RecompileRequest request{
-        {ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(MixedMarkCode.data()), MixedMarkCode, 0, {}},
+        {ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}},
         {64, 0, userData, compute, std::nullopt, std::nullopt, memory},
         device.Target(),
         {0, 0, 0, 128}
@@ -306,18 +309,21 @@ void MixedMarkPlane(AgcDriver::VulkanDevice& device, std::uint64_t address, cons
     const auto result = ShaderRecompiler::Recompile(request);
     bool directWritten = false;
     bool sampledAlias = false;
+    bool tableWritten = false;
     for (const auto& binding : result.bindings) {
         for (std::size_t element = 0; element < binding.count && (element + 1u) * 8u <= binding.guestDescriptor.size(); ++element) {
+            if (binding.role == ShaderRecompiler::DescriptorRole::ImageTable && binding.kind == ShaderRecompiler::DescriptorKind::StorageImage && element < binding.imageWritten.size() && binding.imageWritten[element] && std::equal(tablePlane.begin(), tablePlane.end(), binding.guestDescriptor.begin() + element * 8u)) tableWritten = true;
             if (!std::equal(plane.begin(), plane.end(), binding.guestDescriptor.begin() + element * 8u)) continue;
             if (binding.role == ShaderRecompiler::DescriptorRole::GuestImages && binding.kind == ShaderRecompiler::DescriptorKind::StorageImage && element < binding.imageWritten.size() && binding.imageWritten[element]) directWritten = true;
             if (binding.role == ShaderRecompiler::DescriptorRole::ImageTable && binding.kind == ShaderRecompiler::DescriptorKind::SampledImage) sampledAlias = true;
         }
     }
-    Require(directWritten && sampledAlias, "mixed stencil: the same descriptor must have both a written direct storage binding and a sampled table binding");
+    Require(directWritten && (conflictingTable ? tableWritten : sampledAlias), "mixed stencil: the direct writer and its table alias were not materialized");
     Require(result.imageTableFaults == 0u && result.poisonedSrtReads == 0u, "mixed stencil: valid descriptor sources must not fault");
-    std::puts("mixed stencil: direct writable storage and sampled table alias materialized");
-    device.Dispatch(result, Height, 1, 1, {}, reinterpret_cast<std::uintptr_t>(MixedMarkCode.data()));
+    std::puts(conflictingTable ? "mixed stencil: conflicting direct and table writers materialized" : "mixed stencil: direct writable storage and sampled table alias materialized");
+    device.Dispatch(result, Height, 1, 1, {}, reinterpret_cast<std::uintptr_t>(code.data()));
     device.WaitIdle();
+    if (conflictingTable) return;
     for (std::uint32_t pixel = 0; pixel < Width * Height; ++pixel) {
         const auto expected = inside[pixel] ? Written : ClearStencil;
         for (std::uint32_t component = 0; component < 4; ++component) {
@@ -396,6 +402,19 @@ int main() {
         RequireCoverage(Draw(*device, screen, mixedTarget, VK_COMPARE_OP_EQUAL, VK_STENCIL_OP_KEEP, Written | Mark), inside, "conflicting stencil refusal preserves inside stencil");
         RequireCoverage(Draw(*device, screen, mixedTarget, VK_COMPARE_OP_EQUAL, VK_STENCIL_OP_KEEP, ClearStencil | Mark), outside, "conflicting stencil refusal preserves outside stencil");
         std::puts("conflicting stencil aliases refused before shader writes; stencil and depth unchanged");
+
+        conflict.clear();
+        try {
+            MixedMarkPlane(*device, mixedTarget.stencilAddress, inside, true);
+        } catch (const std::exception& error) {
+            conflict = error.what();
+        }
+        Require(conflict == "AGC graphics: conflicting writable storage images alias the same depth/stencil plane", "conflicting stencil table did not fail at the pre-dispatch ownership guard: " + conflict);
+        Require(std::all_of(TableOutput.begin(), TableOutput.end(), [](auto value) { return value == 0xdeadbeefu; }), "conflicting stencil table executed the shader's buffer store before refusal");
+        RequireCoverage(Draw(*device, screen, mixedTarget, VK_COMPARE_OP_ALWAYS, VK_STENCIL_OP_KEEP, 0, 2), inside, "conflicting stencil table refusal preserves depth");
+        RequireCoverage(Draw(*device, screen, mixedTarget, VK_COMPARE_OP_EQUAL, VK_STENCIL_OP_KEEP, Written | Mark), inside, "conflicting stencil table refusal preserves inside stencil");
+        RequireCoverage(Draw(*device, screen, mixedTarget, VK_COMPARE_OP_EQUAL, VK_STENCIL_OP_KEEP, ClearStencil | Mark), outside, "conflicting stencil table refusal preserves outside stencil");
+        std::puts("conflicting stencil table refused before shader writes; stencil and depth unchanged");
 
         RequireRefused(*device, target.stencilAddress, SwizzleR64KBX, "storage image access to the stencil plane", "an 8_UINT view in SW_64KB_R_X of a SW_64KB_Z_X stencil plane");
         const auto htile = Target(tiled, true, SwizzleZ64KBX, HalfDepth);

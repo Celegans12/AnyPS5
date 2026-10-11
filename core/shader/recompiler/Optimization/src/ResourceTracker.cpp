@@ -1224,7 +1224,8 @@ private:
             }
             image.table = next++;
             const bool storage = image.resourceClass == ImageResourceClass::Storage || image.written || image.atomic;
-            if (storage || image.packed || image.byElements != 0u) {
+            const bool store2D = image.resourceClass == ImageResourceClass::Storage && image.written && !image.read && !image.atomic && image.dimension == RdnaImageDimension::Dim2D && image.mipMode == ImageMipMode::None;
+            if ((storage && !store2D) || image.packed || image.byElements != 0u) {
                 image.tableOperation = TableOperation::Unsupported;
             }
         }

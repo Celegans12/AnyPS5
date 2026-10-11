@@ -417,11 +417,21 @@ void DefineDescriptors(SpirvEmitterState& state) {
         case DescriptorBindingKind::Gds:
             state.gdsVariable = Define(StorageBufferBlockType(state), "gds");
             break;
+        case DescriptorBindingKind::StorageImageTable:
         case DescriptorBindingKind::ImageTable:
             RequireTableIndexing(state);
+            if (binding.kind == DescriptorBindingKind::StorageImageTable) {
+                for (const auto capability : {spv::CapabilityStorageImageArrayDynamicIndexing, spv::CapabilityStorageImageWriteWithoutFormat}) {
+                    if (std::ranges::find(state.supportedCapabilities, capability) == state.supportedCapabilities.end()) FailEmit("storage image tables require storage image dynamic indexing and writes without format");
+                }
+                if (state.tableIndexNonUniform && std::ranges::find(state.supportedCapabilities, spv::CapabilityStorageImageArrayNonUniformIndexing) == state.supportedCapabilities.end()) FailEmit("storage image tables require nonuniform storage image indexing");
+                state.module.EmitCapability(spv::CapabilityStorageImageArrayDynamicIndexing);
+            }
             for (std::uint32_t resource = 0; resource < state.program.Info().images.size(); ++resource) {
                 const auto& image = state.program.Info().images[resource];
                 if (image.table == NoTable) continue;
+                if ((image.resourceClass == ImageResourceClass::Storage) != (binding.kind == DescriptorBindingKind::StorageImageTable)) continue;
+                if (image.resourceClass == ImageResourceClass::Storage && image.tableOperation != TableOperation::Supported) continue;
                 for (const auto& mode : state.program.Info().runtimeImageModes.at(resource)) {
                     if (!TableModeEmitted(mode)) continue;
                     const auto kind = DescriptorBindingForImage(mode);

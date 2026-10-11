@@ -2338,6 +2338,7 @@ void imageTableAllocationTests() {
                 images.imageShapes.resize(count);
                 images.imageDepthCompare.resize(count);
                 images.imageSamplers.resize(count);
+                for (std::uint32_t element = 0; element < count; ++element) images.guestDescriptor[element * 8u] = 1u;
                 program.bindings.push_back(std::move(images));
                 const AgcDriver::Graphics::CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
                 {
@@ -2357,6 +2358,66 @@ void imageTableAllocationTests() {
                 }
             }
             Require(mock.live == 0, "the bounded image table leaked Vulkan objects");
+        }
+    }
+}
+
+void storageImageTableAllocationTests() {
+    namespace Abi = ShaderRecompiler::ImageTableAbi;
+    namespace Runtime = ShaderRecompiler::RuntimeAbi;
+    constexpr auto sampledReserve = (Runtime::FirstStorageImageBinding - Runtime::FirstImageBinding) * Runtime::SampledHeapCapacity;
+    constexpr auto storageReserve = (static_cast<std::uint32_t>(Runtime::Binding::Samplers) - Runtime::FirstStorageImageBinding) * Runtime::StorageHeapCapacity;
+    for (const bool storageFirst : {false, true}) {
+        for (const std::uint32_t count : {0u, 2u, 3u}) {
+            mock = MockVulkan{};
+            auto context = mockContext();
+            context.runtimeDescriptorArray = context.partiallyBound = context.variableDescriptorCount = context.descriptorIndexing = true;
+            context.limits.maxPerStageDescriptorSampledImages = sampledReserve + 2u;
+            context.limits.maxDescriptorSetSampledImages = sampledReserve * Runtime::StageCount + 2u;
+            context.limits.maxPerStageDescriptorStorageImages = storageReserve + 2u;
+            context.limits.maxDescriptorSetStorageImages = storageReserve * Runtime::StageCount + 2u;
+            context.limits.maxPerStageResources = sampledReserve + storageReserve + Runtime::BufferCapacity + 8u + 3u;
+            context.imageTableCapacity = AgcDriver::Graphics::ImageTableCapacity(context);
+            Require(context.imageTableCapacity == 2u && AgcDriver::Graphics::StorageImageTableCapacity(context) == 2u, "mixed image tables did not honor the image descriptor limits");
+            ShaderRecompiler::RecompileResult program;
+            auto map = makeBinding(Role::ImageTableMap, static_cast<std::uint32_t>(Runtime::Binding::ImageTableMap), 1, std::vector<std::uint32_t>(Abi::HeaderWords + count));
+            map.guestDescriptor[Abi::HeaderVersion] = Abi::Version;
+            map.guestDescriptor[Abi::HeaderElementCount] = count;
+            map.guestDescriptor[Abi::HeaderElementFaults] = Abi::HeaderWords;
+            map.guestDescriptor[Abi::HeaderSamplerFaults] = Abi::HeaderWords + count;
+            program.bindings.push_back(map);
+            for (const bool storage : {storageFirst, !storageFirst}) {
+                auto images = makeBinding(Role::ImageTable, storage ? Runtime::StorageImageTableBinding : Runtime::ImageTableBinding, count, std::vector<std::uint32_t>(count * 8u));
+                images.kind = storage ? Kind::StorageImage : Kind::SampledImage;
+                images.imageShapes.resize(count, ShaderRecompiler::DescriptorImageShape::Image2D);
+                images.imageDepthCompare.resize(count);
+                images.imageSamplers.resize(count);
+                images.imageWritten.resize(count);
+                for (std::uint32_t element = 0; element < count; ++element) {
+                    if (((element % 2u == 0u) == storageFirst) != storage) continue;
+                    images.guestDescriptor[element * 8u] = 1u;
+                    images.imageWritten[element] = storage;
+                }
+                program.bindings.push_back(std::move(images));
+            }
+            {
+                const AgcDriver::Graphics::CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+                AgcDriver::Graphics::ShaderResources resources(context, shader, {}, true);
+                const auto storageCount = std::max(1u, std::min(count, 2u));
+                const auto& storage = findLayoutBinding(Runtime::StorageImageTableBinding);
+                const auto& sampled = findLayoutBinding(Runtime::ImageTableBinding);
+                Require(storage.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE && storage.descriptorCount == storageCount && sampled.descriptorCount == std::min(2u, 3u - storageCount), "mixed image tables exceeded their combined resource budget");
+                const auto pool = std::find_if(mock.poolSizes.begin(), mock.poolSizes.end(), [](const auto& size) { return size.type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; });
+                Require(pool != mock.poolSizes.end() && pool->descriptorCount == storageCount, "fixed storage table pool size disagrees with its declared layout");
+                Require(mock.variableDescriptorCount == std::min(count, sampled.descriptorCount), "sampled table lost its bounded variable allocation");
+                resources.Complete();
+                const auto& bytes = bufferBytes(findWrite(map.binding).buffers.at(0).buffer);
+                std::vector<std::uint32_t> actual(bytes.size() / sizeof(std::uint32_t));
+                std::memcpy(actual.data(), bytes.data(), bytes.size());
+                Require(actual[Abi::HeaderElementCount] == count && actual[Abi::HeaderPoisonCount] == count, "mixed table holes created or overwrote faults in the other class");
+                for (std::uint32_t element = 0; element < count; ++element) Require((actual[Abi::HeaderWords + element] & Abi::PoisonFlag) != 0u, "a live invalid or over-capacity table element lost its fault");
+            }
+            Require(mock.live == 0, "mixed image tables leaked Vulkan objects");
         }
     }
 }
@@ -4185,6 +4246,7 @@ int main() {
         descriptorSnapshotTests();
         descriptorCacheTests();
         imageTableAllocationTests();
+        storageImageTableAllocationTests();
         samplerTableNonSeamlessCubeTests();
         misalignedShaderDataTests();
         debugBranchTests();

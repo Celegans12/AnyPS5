@@ -205,7 +205,8 @@ inline void EndRenderPass(const Context& context, VkCommandBuffer commands) {
     else context.Resolved(&DeviceFunctions::cmdEndRenderPass, "vkCmdEndRenderPass")(commands);
 }
 
-std::uint32_t ImageTableCapacity(const Context& context);
+std::uint32_t ImageTableCapacity(const Context& context, std::uint32_t storageTableDescriptors = 0u);
+std::uint32_t StorageImageTableCapacity(const Context& context);
 std::uint32_t SamplerTableCapacity(const Context& context);
 
 }

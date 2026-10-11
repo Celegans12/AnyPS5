@@ -42,6 +42,9 @@ DescriptorKind PhysicalKindFor(DescriptorBindingKind kind) {
     if (kind == DescriptorBindingKind::ImageTable) {
         return DescriptorKind::SampledImage;
     }
+    if (kind == DescriptorBindingKind::StorageImageTable) {
+        return DescriptorKind::StorageImage;
+    }
     const ImageResourceClass imageClass = ImageBindingResourceClass(kind);
     if (imageClass == ImageResourceClass::Sampled) {
         return DescriptorKind::SampledImage;
@@ -74,7 +77,7 @@ DescriptorRole RoleFor(DescriptorBindingKind kind) {
     if (kind == DescriptorBindingKind::ShaderData) {
         return DescriptorRole::ShaderData;
     }
-    if (kind == DescriptorBindingKind::ImageTable) {
+    if (kind == DescriptorBindingKind::ImageTable || kind == DescriptorBindingKind::StorageImageTable) {
         return DescriptorRole::ImageTable;
     }
     if (kind == DescriptorBindingKind::SamplerTable) {
@@ -503,12 +506,15 @@ void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, con
             if (tables == nullptr) fail("DescriptorBindingBuilder::Populate image table elements were not resolved");
             physical.guestDescriptor.reserve(tables->elements.size() * 8u);
             for (const auto& element : tables->elements) {
-                physical.guestDescriptor.insert(physical.guestDescriptor.end(), element.words.begin(), element.words.end());
+                const bool storage = ImageBindingResourceClass(element.kind) == ImageResourceClass::Storage;
+                const bool selected = storage == (physical.kind == DescriptorKind::StorageImage);
+                if (selected) physical.guestDescriptor.insert(physical.guestDescriptor.end(), element.words.begin(), element.words.end());
+                else physical.guestDescriptor.insert(physical.guestDescriptor.end(), 8u, 0u);
                 ImageResource shape;
                 shape.dimension = element.dimension;
                 physical.imageShapes.push_back(ImageShapeForResource(shape));
                 physical.imageDepthCompare.push_back(element.depthCompare);
-                physical.imageWritten.push_back(false);
+                physical.imageWritten.push_back(selected && storage);
                 physical.imageAtomic.push_back(false);
                 std::uint32_t samplers = 0;
                 for (std::uint32_t sampler = 0; sampler < entry.tableSamplerMasks.size(); ++sampler) {

@@ -810,7 +810,7 @@ std::vector<std::uint32_t> TableLoadCode(std::vector<std::uint32_t> code) {
 
 ShaderRecompiler::RecompileRequest TableRequest(const std::vector<std::uint32_t>& code, const std::array<std::uint32_t, 2>& userData, std::uint32_t subgroupSize = 32u) {
     using namespace ShaderRecompiler;
-    static constexpr std::array<std::uint32_t, 4> capabilities{29u, spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess};
+    static constexpr std::array<std::uint32_t, 7> capabilities{29u, spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess, spv::CapabilityStorageImageArrayDynamicIndexing, spv::CapabilityStorageImageWriteWithoutFormat, spv::CapabilityStorageImageArrayNonUniformIndexing};
     static constexpr std::array<std::string_view, 2> extensions{"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
     std::uint64_t hash = 0xcbf29ce484222325ull;
     for (const auto word : code) hash = (hash ^ word) * 0x100000001b3ull;
@@ -1087,11 +1087,33 @@ void verifyImageTableRegistration() {
     const std::vector<std::uint32_t> storeCode{0xf4080100u, 0xfa000000u, 0xf4080700u, 0xfa000030u, 0x7e200500u, 0x8f108510u, 0xf42c0502u, 0x20000000u, 0xf0200f08u, 0x00050200u, 0xbf810000u};
     const auto store = CompileTable(TableRequest(storeCode, userData));
     const auto& storePlan = *store.capture->plan;
-    require(storePlan.info.images.size() == 1u && storePlan.info.images[0].table == 0u && storePlan.info.images[0].tableOperation == TableOperation::Unsupported, "image table registration: a table T# feeding image_store was not an unsupported table operation");
+    require(storePlan.info.images.size() == 1u && storePlan.info.images[0].table == 0u && storePlan.info.images[0].tableOperation == TableOperation::Supported, "image table registration: an ordinary 2D image_store was not supported");
     const auto& storeMap = TableMap(*store.result);
     const auto storeFault = storeMap[Abi::TableHeader(0) + Abi::TableFault];
-    require((storeFault & Abi::PoisonFlag) != 0u && store.result->imageTablePoison.at(storeFault & ~Abi::PoisonFlag).reason == static_cast<std::uint32_t>(Abi::PoisonReason::UnsupportedOperation) && store.result->imageTableFaults != 0u, "image table registration: the store's table does not fault on use");
-    require(TableBinding(*store.result, DescriptorRole::ImageTable) == nullptr || TableBinding(*store.result, DescriptorRole::ImageTable)->count == 0u, "image table registration: an unsupported table bound elements");
+    require(storeFault == 0u, "image table registration: an ordinary store has a whole-table fault");
+    const auto* stores = TableBinding(*store.result, DescriptorRole::ImageTable);
+    require(stores != nullptr && stores->kind == DescriptorKind::StorageImage && !stores->readOnly && stores->binding == RuntimeAbi::StorageImageTableBinding && stores->count == 2u && std::all_of(stores->imageWritten.begin(), stores->imageWritten.end(), [](bool written) { return written; }), "image table registration: storage elements lack their writable binding");
+    for (const auto opcode : {0x0au, 0x0fu, 0x52u}) {
+        auto unsupportedCode = storeCode;
+        unsupportedCode[8] = (unsupportedCode[8] & ~(0x7fu << 18u)) | (opcode << 18u);
+        if (opcode == 0x0fu) unsupportedCode[8] = (unsupportedCode[8] & ~0xf00u) | 0x100u;
+        const auto unsupported = CompileTable(TableRequest(unsupportedCode, userData));
+        require(unsupported.capture->plan->info.images.at(0).tableOperation == TableOperation::Unsupported, "image table registration: packed, atomic or BY stores were admitted");
+        const auto fault = TableMap(*unsupported.result)[Abi::TableHeader(0) + Abi::TableFault];
+        require((fault & Abi::PoisonFlag) != 0u && unsupported.result->imageTablePoison.at(fault & ~Abi::PoisonFlag).reason == static_cast<std::uint32_t>(Abi::PoisonReason::UnsupportedOperation), "image table registration: an unsupported store lost its whole-table fault");
+        if (opcode != 0x0fu) {
+            auto mixedCode = unsupportedCode;
+            mixedCode.insert(mixedCode.end() - 1, storeCode.begin() + 8, storeCode.begin() + 10);
+            const auto mixed = CompileTable(TableRequest(mixedCode, userData));
+            const auto& info = mixed.capture->plan->info;
+            require(info.images.size() == 2u && info.images[0].tableOperation == TableOperation::Unsupported && info.runtimeImageModes[0].empty() && info.images[1].tableOperation == TableOperation::Supported && !info.runtimeImageModes[1].empty(), "image table registration: a mixed shader emitted unsupported store modes or lost its supported store");
+            const auto& map = TableMap(*mixed.result);
+            const auto mixedFault = map[Abi::TableHeader(info.images[0].table) + Abi::TableFault];
+            require((mixedFault & Abi::PoisonFlag) != 0u && mixed.result->imageTablePoison.at(mixedFault & ~Abi::PoisonFlag).reason == static_cast<std::uint32_t>(Abi::PoisonReason::UnsupportedOperation) && map[Abi::TableHeader(info.images[1].table) + Abi::TableFault] == 0u, "image table registration: mixed stores did not retain independent support and fault states");
+            const auto* binding = TableBinding(*mixed.result, DescriptorRole::ImageTable);
+            require(binding != nullptr && binding->kind == DescriptorKind::StorageImage && binding->count == stores->count, "image table registration: unsupported stores changed the supported storage binding");
+        }
+    }
 
     const std::vector<std::uint32_t> compareCode{0xf4080100u, 0xfa000000u, 0xf4080200u, 0xfa000010u, 0xf4080700u, 0xfa000030u, 0x7e200500u, 0x8f108510u, 0xf42c0502u, 0x20000000u, 0xf0fc0108u, 0x00450000u, 0xe0700000u, 0x80070000u, 0xbf810000u};
     auto compareRequest = TableRequest(compareCode, userData);
