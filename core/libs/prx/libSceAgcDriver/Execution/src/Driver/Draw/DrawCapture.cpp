@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <sstream>
@@ -56,6 +57,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     }();
 
     stageCapture.regions = shaderMemory.TakeRecentRegions();
+    stageCapture.userDataUse = capture->userDataUse;
     recompiled[i] = true;
     memory = shaderMemory.Regions();
 
@@ -165,13 +167,7 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
             std::vector<ShaderRecompiler::MemoryRegion> regions(stageCapture.regions.begin(), stageCapture.regions.end());
             for (const auto& read : decodeReads[i]) regions.push_back({read.address, std::as_bytes(std::span(read.bytes))});
             std::stable_sort(regions.begin(), regions.end(), [](const ShaderRecompiler::MemoryRegion& a, const ShaderRecompiler::MemoryRegion& b) { return a.guestAddress < b.guestAddress; });
-            for (const auto& region : regions) {
-                variant->runs.emplace_back(region.guestAddress, region.guestAddress + region.bytes.size());
-                const auto count = region.bytes.size() / sizeof(std::uint32_t);
-                const auto offset = variant->words.size();
-                variant->words.resize(offset + count);
-                std::memcpy(variant->words.data() + offset, region.bytes.data(), count * sizeof(std::uint32_t));
-            }
+            tagVariantRuns(*variant, regions, stageCapture.userDataUse, decodeReads[i].empty() && (!vertexInfos[i] || vertexInfos[i]->resourcesNum == 0), programs[i].hiddenUserWords);
             if (drawStageDataHits() && stageCapture.capture != nullptr && !stageCapture.capture->readTrace.leaves.empty()) recordStageDataPositions(*variant, *stageCapture.capture, decodeReads[i]);
             if (traceDrawCache() && entry != nullptr && matched[i] == nullptr && i < entry->stages.size()) {
                 const auto& variants = entry->stages[i];
@@ -183,7 +179,19 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
                     ++differingRunsChanged;
                 }
             }
-            if (verifyHit && matched[i] != nullptr && (matched[i]->runs != variant->runs || matched[i]->words != variant->words)) {
+            const auto sameContent = [](const DispatchVariant& a, const DispatchVariant& b) {
+                const auto flatten = [](const DispatchVariant& source) {
+                    std::vector<std::pair<std::uint64_t, std::uint32_t>> flat;
+                    std::size_t word = 0;
+                    for (const auto& [begin, end] : source.runs) {
+                        for (auto address = begin; address < end && word < source.words.size(); address += sizeof(std::uint32_t)) flat.emplace_back(address, source.words[word++]);
+                    }
+                    std::sort(flat.begin(), flat.end());
+                    return flat;
+                };
+                return (a.runs == b.runs && a.words == b.words) || flatten(a) == flatten(b);
+            };
+            if (verifyHit && matched[i] != nullptr && (!sameContent(*matched[i], *variant) || matched[i]->compiled->pushConstants != variant->compiled->pushConstants)) {
                 ++mismatches;
                 static std::atomic<std::uint64_t> reports{0};
                 if (reports.fetch_add(1) < 20) std::fprintf(stderr, "[draw-cache] verify: stage %zu (program 0x%llx) of a hit captured differently: %zu runs / %zu words matched, %zu / %zu fresh\n", i, static_cast<unsigned long long>(programs[i].binary.codeAddress), matched[i]->runs.size(), matched[i]->words.size(), variant->runs.size(), variant->words.size());
