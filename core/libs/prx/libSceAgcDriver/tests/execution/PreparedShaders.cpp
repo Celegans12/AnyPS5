@@ -245,10 +245,10 @@ void FailureCapture(AgcDriver::VulkanDevice& device, bool terminalWriteFailure) 
     alignas(4096) std::array<std::uint32_t, 1024> dependencyPage{};
     const auto dependencyAddress = reinterpret_cast<std::uintptr_t>(dependencyPage.data());
     const auto leafAddress = reinterpret_cast<std::uintptr_t>(dependencyPage.data() + 4);
-    const std::array<std::uint32_t, 4> terminalWords{static_cast<std::uint32_t>(leafAddress), static_cast<std::uint32_t>(leafAddress >> 32u), 2u, 0x31016facu};
+    const std::array<std::uint32_t, 4> terminalWords{static_cast<std::uint32_t>(leafAddress), static_cast<std::uint32_t>(leafAddress >> 32u), 16u, 0x31016facu};
     std::copy(terminalWords.begin(), terminalWords.end(), dependencyPage.begin());
     const std::array<std::uint32_t, 2> users{static_cast<std::uint32_t>(dependencyAddress), static_cast<std::uint32_t>(dependencyAddress >> 32u)};
-    const std::array<std::uint32_t, 7> captureCode{0xf4080100u, 0xfa000000u, 0xf4280202u, 0xfa000000u, 0xe0700000u, 0x80020000u, 0xbf810000u};
+    const std::array<std::uint32_t, 7> captureCode{0xf4080100u, 0xfa000000u, 0xf4280202u, 0xfa1ffffcu, 0xe0700000u, 0x80020000u, 0xbf810000u};
     auto captureRequest = request;
     captureRequest.shader = {ShaderStage::Compute, request.shader.codeAddress, captureCode, 0, {}};
     captureRequest.context.userData = users;
@@ -295,7 +295,7 @@ void FailureCapture(AgcDriver::VulkanDevice& device, bool terminalWriteFailure) 
             throw;
         }
     });
-    Require(captureError.find("SrtWalker::EvaluateRuntimeSources") != std::string::npos && captureError.find("ReadConstBuffer") != std::string::npos, "partial capture did not refuse the undersized scalar buffer");
+    Require(captureError.find("SrtWalker::EvaluateRuntimeSources") != std::string::npos && captureError.find("ReadConstBuffer") != std::string::npos, "partial capture did not refuse the unsupported negative scalar-buffer offset");
     Require(terminalError == captureError, "terminal capture changed the original exception");
     Require(terminalMemory.size() == 1 && terminalMemory[0].guestAddress == dependencyAddress && terminalMemory[0].bytes.size() == sizeof(terminalWords)
         && std::memcmp(terminalMemory[0].bytes.data(), terminalWords.data(), sizeof(terminalWords)) == 0, "failed capture did not retain its actual descriptor reads");

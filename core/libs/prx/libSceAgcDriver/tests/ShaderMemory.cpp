@@ -510,6 +510,127 @@ void verifySignedSrtComparison() {
     }
 }
 
+void verifyScalarBufferBounds() {
+    using namespace ShaderRecompiler;
+    IrResourcePlan plan;
+    plan.srtPlanComplete = true;
+    MemoryInfo memory;
+    memory.kind = ResourceKind::ScalarBuffer;
+    plan.memoryInfo.push_back(memory);
+    std::vector<std::unique_ptr<IrValue>> values;
+    const auto make = [&](IrOpcode opcode, IrType type, std::initializer_list<IrValue*> arguments = {}) -> IrValue& {
+        values.push_back(std::make_unique<IrValue>(opcode, type, static_cast<std::uint32_t>(values.size())));
+        for (auto* argument : arguments) values.back()->AddArgument(argument);
+        return *values.back();
+    };
+    const auto constant = [&](std::uint32_t bits) -> IrValue& {
+        auto& value = make(IrOpcode::Void, IrType::U32);
+        value.SetImmediateU32(bits);
+        return value;
+    };
+    auto& base = constant(0x1000u);
+    auto& zero = constant(0u);
+    auto& srt = make(IrOpcode::GetSrtResource, IrType::SrtResource);
+    auto& low = make(IrOpcode::ReadConst, IrType::U32, {&srt, &zero});
+    auto& high = constant(0u);
+    auto& records = constant(0u);
+    auto& word3 = constant(0x5204u);
+    auto& offset = constant(0u);
+    auto& handle = make(IrOpcode::GetBufferResource, IrType::BufferResource, {&low, &high, &records, &word3});
+    auto& read = make(IrOpcode::ReadConstBuffer, IrType::U32, {&handle, &offset});
+    read.SetFlags(MemoryFlags{0u, 0x294u});
+    plan.srtReads = {{&base, 0u}, {&read, 1u}};
+    struct Callbacks {
+        unsigned probes = 0;
+        unsigned reads = 0;
+        bool accessible = true;
+        unsigned failure = 0;
+        std::uint64_t address = 0;
+    } callbacks;
+    SrtReadTrace trace;
+    trace.leaf = &read;
+    trace.leafSlot = 1u;
+    SrtRuntime runtime;
+    runtime.userContext = &callbacks;
+    runtime.readTrace = &trace;
+    runtime.accessible = [](void* context, std::uint64_t address, std::uint64_t bytes) {
+        auto& state = *static_cast<Callbacks*>(context);
+        ++state.probes;
+        require(address == state.address && bytes == 4u, "scalar buffer bounds: accessibility address changed");
+        return state.accessible;
+    };
+    runtime.readMemory = [](void* context, std::uint64_t address, std::uint32_t* value) {
+        auto& state = *static_cast<Callbacks*>(context);
+        ++state.reads;
+        require(address == state.address, "scalar buffer bounds: read address changed");
+        if (state.failure == 2u) throw std::runtime_error("scalar buffer callback failure");
+        *value = 0x12345678u;
+        return state.failure == 0u;
+    };
+    struct Case { std::uint32_t stride, records, offset, immediate; bool inRange; };
+    const std::array cases{
+        Case{0u, 0u, 0u, 0u, false}, Case{8u, 0u, 0u, 0u, false},
+        Case{0u, 1u, 0u, 0u, false}, Case{0u, 2u, 0u, 0u, false}, Case{0u, 3u, 0u, 0u, false},
+        Case{0u, 4u, 0u, 0u, true}, Case{0u, 4u, 3u, 0u, true},
+        Case{0u, 4u, 4u, 0u, false}, Case{0u, 4u, 8u, 0u, false},
+        Case{0u, 6u, 4u, 0u, false}, Case{0u, 8u, 4u, 0u, true},
+        Case{8u, 2u, 8u, 4u, true}, Case{8u, 2u, 12u, 4u, false},
+    };
+    for (const auto& entry : cases) {
+        high.SetImmediateU32(entry.stride << 16u);
+        records.SetImmediateU32(entry.records);
+        offset.SetImmediateU32(entry.offset);
+        plan.memoryInfo[0].offset = entry.immediate;
+        callbacks = {};
+        callbacks.address = 0x1000u + ((entry.offset + entry.immediate) & ~3u);
+        trace.leaves.clear();
+        Detail::InaccessibleRead inaccessible;
+        Detail::Evaluator evaluator(plan, runtime);
+        evaluator.ReportInaccessibleReads(&inaccessible);
+        std::uint32_t result = 0xdeadbeefu;
+        const bool evaluated = evaluator.Evaluate(&read, result);
+        require(evaluated && result == (entry.inRange ? 0x12345678u : 0u), entry.inRange ? "scalar buffer bounds: in-range read changed" : "scalar buffer bounds: out-of-range read was not zero");
+        require(callbacks.probes == unsigned(entry.inRange) && callbacks.reads == unsigned(entry.inRange), "scalar buffer bounds: out-of-range read called memory callbacks");
+        require(trace.otherReads.empty() && trace.leaves.size() == std::size_t(entry.inRange) && inaccessible.read == nullptr, "scalar buffer bounds: out-of-range read was traced or poisoned");
+        if (entry.inRange) require(trace.leaves[0] == std::pair<std::uint32_t, std::uint64_t>{1u, callbacks.address}, "scalar buffer bounds: traced address changed");
+    }
+    high.SetImmediateU32(0u);
+    records.SetImmediateU32(4u);
+    offset.SetImmediateU32(0u);
+    plan.memoryInfo[0].offset = 0u;
+    callbacks = {};
+    callbacks.address = 0x1000u;
+    for (unsigned failure : {1u, 2u}) {
+        callbacks.failure = failure;
+        Detail::Evaluator evaluator(plan, runtime);
+        std::uint32_t result = 0u;
+        if (failure == 1u) require(!evaluator.Evaluate(&read, result), "scalar buffer bounds: failed in-range callback was accepted");
+        else expectFailure([&] { evaluator.Evaluate(&read, result); }, "scalar buffer callback failure", "scalar buffer bounds: callback exception was swallowed");
+    }
+    callbacks = {};
+    callbacks.address = 0x1000u;
+    callbacks.accessible = false;
+    trace.leaves.clear();
+    DescriptorSource source;
+    source.dwordCount = 1u;
+    source.dwords[0] = &read;
+    plan.descriptorSources.push_back(source);
+    const std::array<std::uint32_t, 1> sourceIndices{0u};
+    std::vector<DescriptorValue> descriptors;
+    std::vector<std::uint32_t> flat;
+    std::vector<std::uint8_t> active;
+    std::vector<SrtReadPoison> poison;
+    require(Detail::EvaluateRuntimeSourcesImpl(plan, sourceIndices, runtime, descriptors, flat, true, {}, active, &poison), "scalar buffer bounds: inaccessible in-range read lost poison handling");
+    require(poison == std::vector<SrtReadPoison>{{1u, 0x294u, 0x1000u}} && descriptors[0].dwords[0] == 0u && flat[1] == 0u, "scalar buffer bounds: inaccessible in-range poison changed");
+    require(callbacks.probes != 0u && callbacks.reads == 0u && trace.leaves.empty() && trace.otherReads.empty(), "scalar buffer bounds: inaccessible in-range read touched memory");
+    records.SetImmediateU32(0u);
+    runtime.readMemory = nullptr;
+    runtime.accessible = nullptr;
+    Detail::Evaluator noCallbacks(plan, runtime);
+    std::uint32_t result = 0xdeadbeefu;
+    require(noCallbacks.Evaluate(&read, result) && result == 0u, "scalar buffer bounds: out-of-range read dereferenced guest memory");
+}
+
 // The pure flat slots of a hand-built plan (Detail::ComputePureFlatSlots): a slot is pure unless
 // a descriptor dword, a condition, a uniform value or another slot's address cone reaches it.
 void verifyPureFlatSlots() {
@@ -3246,6 +3367,7 @@ int main(int argc, char** argv) {
         verifyEvaluatedValues();
         verifyMemoryIndexOwners();
         verifyFrontendPair();
+        verifyScalarBufferBounds();
         verifySignedSrtComparison();
         verifyPureFlatSlots();
         verifyImageTableKeys();
