@@ -15,7 +15,9 @@
 #include <cstdio>
 #include <exception>
 #include <fstream>
+#include <span>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 
 namespace {
@@ -44,6 +46,26 @@ bool g_spirv = false;
 bool g_graph = false;
 bool g_maintenance8 = false;
 bool g_code = false;
+bool g_prepareOnly = false;
+
+void InspectSpirv(const char* path, std::span<const std::uint32_t> words) {
+    if (g_spirv) {
+        std::string name(path);
+        name = name.substr(name.find_last_of("/\\") + 1) + ".spv";
+        std::ofstream file(name, std::ios::binary);
+        file.write(reinterpret_cast<const char*>(words.data()), static_cast<std::streamsize>(words.size_bytes()));
+        if (!file) throw std::runtime_error("could not write " + name);
+    }
+#if ANYPS5_ENABLE_SPIRV_TOOLS
+    if (g_disassemble) {
+        spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+        std::string text;
+        if (tools.Disassemble(words.data(), words.size(), &text, SPV_BINARY_TO_TEXT_OPTION_FRIENDLY_NAMES)) std::printf("%s\n", text.c_str());
+    }
+#else
+    if (g_disassemble) std::printf("  (--dis needs ANYPS5_ENABLE_SPIRV_TOOLS=ON)\n");
+#endif
+}
 
 bool Replay(const char* path) {
     auto request = ShaderRecompiler::RequestSerializer{}.Deserialize(ReadText(path));
@@ -106,22 +128,31 @@ bool Replay(const char* path) {
         }
     }
     try {
-        auto program = ShaderRecompiler::PrepareResourceProgram(request.request);
-        constexpr ShaderRecompiler::ResourceMaterializer materializer;
-        static_cast<void>(materializer.ExtractPlan(program));
+        if (g_prepareOnly) {
+            static_cast<void>(ShaderRecompiler::GetResourcePlan(request.request));
+        } else {
+            auto program = ShaderRecompiler::PrepareResourceProgram(request.request);
+            constexpr ShaderRecompiler::ResourceMaterializer materializer;
+            static_cast<void>(materializer.ExtractPlan(program));
+        }
     } catch (const std::exception& error) {
         std::printf("  resource analysis failed: %s\n", FirstLine(error.what()).c_str());
         return false;
     }
     try {
         if (g_maintenance8) request.request.target.nonConstantImageOffsets = true;
+        if (g_prepareOnly) {
+            const auto prepared = ShaderRecompiler::PrepareShader(request.request);
+            if (!prepared) throw std::runtime_error("prepared shader handle is absent");
+            const auto words = ShaderRecompiler::GetPreparedArtifact(*prepared).spirv.ReadTransient();
+            if (!words || words->empty()) throw std::runtime_error("prepared shader has no SPIR-V");
+            std::printf("  prepared only: %zu SPIR-V words; runtime memory not materialized\n", words->size());
+            InspectSpirv(path, *words);
+            return true;
+        }
         const auto result = ShaderRecompiler::Recompile(request.request);
         std::printf("  recompiled: %zu SPIR-V words\n", result.spirv.size());
-        if (g_spirv) {
-            std::string name(path);
-            name = name.substr(name.find_last_of("/\\") + 1) + ".spv";
-            std::ofstream(name, std::ios::binary).write(reinterpret_cast<const char*>(result.spirv.data()), static_cast<std::streamsize>(result.spirv.size() * sizeof(result.spirv[0])));
-        }
+        InspectSpirv(path, result.spirv);
         if (g_memory) {
             for (const auto& binding : result.bindings) {
                 if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
@@ -132,18 +163,9 @@ bool Replay(const char* path) {
                 }
             }
         }
-#if ANYPS5_ENABLE_SPIRV_TOOLS
-        if (g_disassemble) {
-            spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
-            std::string text;
-            if (tools.Disassemble(result.spirv, &text, SPV_BINARY_TO_TEXT_OPTION_FRIENDLY_NAMES)) std::printf("%s\n", text.c_str());
-        }
-#else
-        if (g_disassemble) std::printf("  (--dis needs ANYPS5_ENABLE_SPIRV_TOOLS=ON)\n");
-#endif
         return true;
     } catch (const std::exception& error) {
-        std::printf("  recompile failed: %s\n", FirstLine(error.what()).c_str());
+        std::printf("  %s failed: %s\n", g_prepareOnly ? "preparation" : "recompile", FirstLine(error.what()).c_str());
         return false;
     }
 }
@@ -152,11 +174,15 @@ bool Replay(const char* path) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] [--code] [--maintenance8] <shader.req>...\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set\n");
+        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] [--code] [--maintenance8] [--prepare-only] <shader.req>...\n  --prepare-only plans and compiles without materializing runtime memory\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set\n");
         return 2;
     }
     int failures = 0;
     for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--prepare-only") {
+            g_prepareOnly = true;
+            continue;
+        }
         if (std::string(argv[i]) == "--dis") {
             g_disassemble = true;
             continue;
