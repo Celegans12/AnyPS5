@@ -9,6 +9,8 @@
 #include <functional>
 #include <memory>
 #include <stdexcept>
+#include <string>
+#include <csignal>
 #include <pthread.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -160,6 +162,27 @@ void CheckTerminate(void (*function)()) {
     assert(waitpid(child, &status, 0) == child);
     assert(WIFEXITED(status) && WEXITSTATUS(status) == 61);
 }
+void CheckDefaultTerminateMessage() {
+    const std::string message = std::string(3000, 'w') + " end of message";
+    int channel[2];
+    assert(pipe(channel) == 0);
+    pid_t child = fork();
+    assert(child >= 0);
+    if (child == 0) {
+        close(channel[0]);
+        dup2(channel[1], 2);
+        throw std::runtime_error(message);
+    }
+    close(channel[1]);
+    std::string output;
+    char buffer[4096];
+    for (ssize_t count; (count = read(channel[0], buffer, sizeof(buffer))) > 0;) output.append(buffer, static_cast<std::size_t>(count));
+    close(channel[0]);
+    int status;
+    assert(waitpid(child, &status, 0) == child);
+    assert(WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
+    assert(output.find("  what():  " + message + "\n") != std::string::npos);
+}
 struct ForcedGuard { ~ForcedGuard() { ++destroyed; } };
 [[gnu::noinline]] void ForceUnwind() {
     ForcedGuard guard;
@@ -231,6 +254,7 @@ int main() {
     CheckThreads();
     CheckTerminate(UncaughtThrow);
     CheckTerminate(NoexceptThrow);
+    CheckDefaultTerminateMessage();
     CheckForcedUnwind();
     int frames = 0;
     auto backtrace = _Unwind_Backtrace_nid_postfix([](_Unwind_Context* context, void* argument) {
