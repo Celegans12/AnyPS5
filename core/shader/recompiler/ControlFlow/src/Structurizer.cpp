@@ -447,12 +447,20 @@ std::uint32_t iterationSelectionMerge(const ControlFlowGraph& graph, const Natur
     if (!joins[trueTarget] || !joins[falseTarget]) {
         return InvalidControlFlowId;
     }
+    std::vector<bool> inBody(count, false);
+    for (const auto blockId : loop.blocks) {
+        inBody[blockId] = true;
+    }
     std::vector<std::vector<std::uint32_t>> postDominators(count, allBlockIds(count));
-    postDominators[join] = {join};
+    for (std::uint32_t blockId = 0; blockId < count; ++blockId) {
+        if (blockId == join || !inBody[blockId]) {
+            postDominators[blockId] = {join};
+        }
+    }
     for (bool changed = true; changed;) {
         changed = false;
         for (const auto& block : graph.blocks) {
-            if (!joins[block.id] || block.id == join) {
+            if (!joins[block.id] || !inBody[block.id] || block.id == join) {
                 continue;
             }
             auto next = allBlockIds(count);

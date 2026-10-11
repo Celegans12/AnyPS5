@@ -268,6 +268,16 @@ int main() {
         }
         Structurizer{}.Structurize(sharedDiscard);
         requireStructuredBranches(sharedDiscard, "early discards that share one ending block");
+        auto exitJoin = makeGraph({{1}, {2, 3}, {4, 5}, {}, {3, 6}, {7, 3}, {1}, {1}});
+        bool exitJoinStructured = true;
+        try {
+            Structurizer{}.Structurize(exitJoin);
+        } catch (const std::runtime_error&) {
+            exitJoinStructured = false;
+        }
+        if (exitJoinStructured) {
+            requireStructuredBranches(exitJoin, "loop selection arms that rejoin only after leaving the loop body");
+        }
         requireOriginalDominanceSets(makeGraph(diamonds), "raw diamond chain");
         requireOriginalDominanceSets(makeGraph({{1}, {2, 3}, {1}, {}}), "a loop with an exit");
         requireOriginalDominanceSets(makeGraph({{1}, {2}, {1}}), "a non-exiting SCC");
