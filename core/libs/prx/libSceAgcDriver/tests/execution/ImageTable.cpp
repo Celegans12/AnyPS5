@@ -61,7 +61,8 @@ alignas(256) std::array<float, Width * Height> FloatTexels{};
 alignas(256) std::array<float, Width * Height> OtherFloatTexels{};
 alignas(256) std::array<std::uint32_t, Width * Height> UintTexels{};
 alignas(256) std::array<std::int32_t, Width * Height> SintTexels{};
-alignas(256) std::array<std::uint16_t, Width * Height> StoreHalfTexels{};
+constexpr std::uint32_t StoreHalfPitch = 256u / sizeof(std::uint16_t);
+alignas(256) std::array<std::uint16_t, StoreHalfPitch * Height> StoreHalfTexels{};
 alignas(4096) std::array<std::uint32_t, 49152> DepthStorage{};
 alignas(256) std::array<std::uint32_t, Records * Stride / 4> Table{};
 alignas(256) std::array<std::uint32_t, 64> Keys{};
@@ -912,6 +913,11 @@ void RunModeTests(AgcDriver::VulkanDevice& device) {
 }
 
 void RunStoreTests(AgcDriver::VulkanDevice& device) {
+    struct Registration {
+        void* data;
+        Registration(void* data, std::size_t bytes) : data(data) { GuestAllocations::Mutation().Add(data, bytes, true, true, true); }
+        ~Registration() { GuestAllocations::Mutation().Remove(data); }
+    } registeredHalf(StoreHalfTexels.data(), sizeof(StoreHalfTexels)), registeredUint(UintTexels.data(), sizeof(UintTexels)), registeredTable(Table.data(), sizeof(Table));
     StoreHalfTexels.fill(0x3555u);
     auto image = Image(StoreHalfTexels.data(), 13u);
     image[3] = (image[3] & ~0xfffu) | 0x24cu;
@@ -935,7 +941,9 @@ void RunStoreTests(AgcDriver::VulkanDevice& device) {
     Require(!Faulted(stored), "image table store: an active 2D D16 store faulted:\n" + stored.log);
     flush();
     for (std::uint32_t index = 0; index < StoreHalfTexels.size(); ++index) {
-        Require(StoreHalfTexels[index] == (index < 2u * Width ? 0x3e00u : 0x3555u), "image table store: aliased R16_FLOAT descriptors wrote the wrong texel " + std::to_string(index));
+        const auto row = index / StoreHalfPitch;
+        const auto column = index % StoreHalfPitch;
+        Require(StoreHalfTexels[index] == (row < 2u && column < Width ? 0x3e00u : 0x3555u), "image table store: aliased R16_FLOAT descriptors wrote the wrong texel or padding " + std::to_string(index));
     }
     const auto afterStore = StoreHalfTexels;
     Keys[0] = 2u;
@@ -955,8 +963,10 @@ void RunStoreTests(AgcDriver::VulkanDevice& device) {
     RequireRed(mixed, 0u, Lanes, [](std::uint32_t) { return std::bit_cast<std::uint32_t>(2.5f); }, "image table store: sampled alias did not read the prior store");
     flush();
     for (std::uint32_t index = 0; index < StoreHalfTexels.size(); ++index) {
-        const auto expected = index < Width ? 0x4100u : index < 2u * Width ? 0x3e00u : 0x3555u;
-        Require(StoreHalfTexels[index] == expected, "image table store: mixed bindings wrote the wrong texel " + std::to_string(index));
+        const auto row = index / StoreHalfPitch;
+        const auto column = index % StoreHalfPitch;
+        const auto expected = column >= Width ? 0x3555u : row == 0u ? 0x4100u : row == 1u ? 0x3e00u : 0x3555u;
+        Require(StoreHalfTexels[index] == expected, "image table store: mixed bindings wrote the wrong texel or padding " + std::to_string(index));
     }
     UintTexels.fill(0x12345678u);
     SetWideRecord(0u, Image(UintTexels.data(), Format32UInt));
@@ -968,7 +978,9 @@ void RunStoreTests(AgcDriver::VulkanDevice& device) {
     AgcDriver::Graphics::StorageTexture::FlushPending(reinterpret_cast<std::uintptr_t>(UintTexels.data()), sizeof(UintTexels), nullptr, "test");
     device.WaitIdle();
     for (std::uint32_t index = 0; index < UintTexels.size(); ++index) Require(UintTexels[index] == (index < Width ? 0x89abcdefu : 0x12345678u), "image table store: UINT descriptor wrote the wrong texel " + std::to_string(index));
-    SetWideRecord(0u, Image(Table.data(), 13u));
+    auto overlapImage = Image(Table.data(), 13u);
+    overlapImage[2] = (overlapImage[2] & ~(0x3fffu << 14u)) | (1u << 14u);
+    SetWideRecord(0u, overlapImage);
     const auto savedTable = Table;
     const auto overlap = Run(device, StoreTableCode, 1, Lanes, 64);
     Require(Faulted(overlap) && overlap.log.find("is written by its own dispatch") != std::string::npos, "image table store: descriptor self-write did not produce HeapWritten:\n" + overlap.log);
