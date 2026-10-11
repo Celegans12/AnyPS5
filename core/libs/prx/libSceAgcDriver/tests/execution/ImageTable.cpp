@@ -993,11 +993,12 @@ void RunStoreLayoutClassTests(AgcDriver::VulkanDevice& device) {
     constexpr std::uint32_t TexelsPerImage = StoreHalfPitch * Height;
     alignas(256) static std::array<std::uint16_t, MaximumRecords * TexelsPerImage> texels{};
     alignas(256) static std::array<std::uint32_t, MaximumRecords * Stride / 4u> records{};
+    alignas(256) static std::array<std::uint32_t, MaximumRecords> keyValues{};
     struct Registration {
         void* data;
         Registration(void* data, std::size_t bytes) : data(data) { GuestAllocations::Mutation().Add(data, bytes, true, true, true); }
         ~Registration() { GuestAllocations::Mutation().Remove(data); }
-    } registeredTexels(texels.data(), sizeof(texels)), registeredRecords(records.data(), sizeof(records));
+    } registeredTexels(texels.data(), sizeof(texels)), registeredRecords(records.data(), sizeof(records)), registeredKeys(keyValues.data(), sizeof(keyValues));
     std::uint64_t artifact = 0u;
     for (const std::uint32_t count : {200u, 270u, 513u}) {
         texels.fill(0x3555u);
@@ -1007,10 +1008,11 @@ void RunStoreLayoutClassTests(AgcDriver::VulkanDevice& device) {
             image[3] = (image[3] & ~0xfffu) | 0x24cu;
             std::copy(image.begin(), image.end(), records.begin() + record * (Stride / 4u));
         }
-        Keys = {};
-        Keys[0] = count - 1u;
+        keyValues.fill(0u);
+        keyValues[0] = count - 1u;
+        for (std::uint32_t key = 1u; key < count; ++key) keyValues[key] = key - 1u;
         const auto table = Buffer(records.data(), count * Stride);
-        const auto keys = Buffer(Keys.data(), sizeof(std::uint32_t));
+        const auto keys = Buffer(keyValues.data(), count * sizeof(std::uint32_t));
         const auto output = Buffer(Output.data(), sizeof(Output));
         std::copy(table.begin(), table.end(), Srt.begin());
         std::copy(keys.begin(), keys.end(), Srt.begin() + 4u);
@@ -1019,11 +1021,11 @@ void RunStoreLayoutClassTests(AgcDriver::VulkanDevice& device) {
             {reinterpret_cast<std::uintptr_t>(StoreTableCode.data()), std::as_bytes(std::span(StoreTableCode))},
             {reinterpret_cast<std::uintptr_t>(Srt.data()), std::as_bytes(std::span(Srt))},
             {reinterpret_cast<std::uintptr_t>(records.data()), std::as_bytes(std::span(records).first(count * Stride / 4u))},
-            {reinterpret_cast<std::uintptr_t>(Keys.data()), std::as_bytes(std::span(Keys).first(1u))},
+            {reinterpret_cast<std::uintptr_t>(keyValues.data()), std::as_bytes(std::span(keyValues).first(count))},
         }};
         const auto before = records;
         const auto stored = Execute(device, StoreTableCode, Srt.data(), memory, 1u, Lanes, 64u);
-        Require(stored.storageTableBinding && !stored.sampledTableBinding && stored.imageTableCount == count, "storage layout class: capture did not preserve the real descriptor count");
+        Require(stored.storageTableBinding && !stored.sampledTableBinding && stored.imageTableCount == count, "storage layout class: capture did not preserve the real descriptor count (expected " + std::to_string(count) + ", actual " + std::to_string(stored.imageTableCount) + ", artifact " + std::to_string(stored.artifactId) + ")");
         Require(!Faulted(stored), "storage layout class: selected store faulted:\n" + stored.log);
         if (artifact == 0u) artifact = stored.artifactId;
         Require(artifact != 0u && stored.artifactId == artifact, "storage layout class: runtime count changed the shader artifact");
