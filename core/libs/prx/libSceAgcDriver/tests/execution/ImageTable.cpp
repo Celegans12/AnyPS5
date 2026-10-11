@@ -988,6 +988,57 @@ void RunModeTests(AgcDriver::VulkanDevice& device) {
     SetClassRecords();
 }
 
+void RunStoreLayoutClassTests(AgcDriver::VulkanDevice& device) {
+    constexpr std::uint32_t MaximumRecords = 513u;
+    constexpr std::uint32_t TexelsPerImage = StoreHalfPitch * Height;
+    alignas(256) static std::array<std::uint16_t, MaximumRecords * TexelsPerImage> texels{};
+    alignas(256) static std::array<std::uint32_t, MaximumRecords * Stride / 4u> records{};
+    struct Registration {
+        void* data;
+        Registration(void* data, std::size_t bytes) : data(data) { GuestAllocations::Mutation().Add(data, bytes, true, true, true); }
+        ~Registration() { GuestAllocations::Mutation().Remove(data); }
+    } registeredTexels(texels.data(), sizeof(texels)), registeredRecords(records.data(), sizeof(records));
+    std::uint64_t artifact = 0u;
+    for (const std::uint32_t count : {200u, 270u, 513u}) {
+        texels.fill(0x3555u);
+        records.fill(0u);
+        for (std::uint32_t record = 0; record < count; ++record) {
+            auto image = Image(texels.data() + record * TexelsPerImage, 13u);
+            image[3] = (image[3] & ~0xfffu) | 0x24cu;
+            std::copy(image.begin(), image.end(), records.begin() + record * (Stride / 4u));
+        }
+        Keys = {};
+        Keys[0] = count - 1u;
+        const auto table = Buffer(records.data(), count * Stride);
+        const auto keys = Buffer(Keys.data(), sizeof(std::uint32_t));
+        const auto output = Buffer(Output.data(), sizeof(Output));
+        std::copy(table.begin(), table.end(), Srt.begin());
+        std::copy(keys.begin(), keys.end(), Srt.begin() + 4u);
+        std::copy(output.begin(), output.end(), Srt.begin() + 8u);
+        const std::array<ShaderRecompiler::MemoryRegion, 4> memory{{
+            {reinterpret_cast<std::uintptr_t>(StoreTableCode.data()), std::as_bytes(std::span(StoreTableCode))},
+            {reinterpret_cast<std::uintptr_t>(Srt.data()), std::as_bytes(std::span(Srt))},
+            {reinterpret_cast<std::uintptr_t>(records.data()), std::as_bytes(std::span(records).first(count * Stride / 4u))},
+            {reinterpret_cast<std::uintptr_t>(Keys.data()), std::as_bytes(std::span(Keys).first(1u))},
+        }};
+        const auto before = records;
+        const auto stored = Execute(device, StoreTableCode, Srt.data(), memory, 1u, Lanes, 64u);
+        Require(stored.storageTableBinding && !stored.sampledTableBinding && stored.imageTableCount == count, "storage layout class: capture did not preserve the real descriptor count");
+        Require(!Faulted(stored), "storage layout class: selected store faulted:\n" + stored.log);
+        if (artifact == 0u) artifact = stored.artifactId;
+        Require(artifact != 0u && stored.artifactId == artifact, "storage layout class: runtime count changed the shader artifact");
+        AgcDriver::Graphics::StorageTexture::FlushPending(reinterpret_cast<std::uintptr_t>(texels.data()), sizeof(texels), nullptr, "test");
+        device.WaitIdle();
+        for (std::uint32_t index = 0; index < texels.size(); ++index) {
+            const auto image = index / TexelsPerImage;
+            const auto within = index % TexelsPerImage;
+            const auto expected = image == count - 1u && within < Width ? 0x3e00u : 0x3555u;
+            Require(texels[index] == expected, "storage layout class: store changed the wrong image, texel or padding at " + std::to_string(index));
+        }
+        Require(records == before, "storage layout class: pipeline creation or store changed descriptor records");
+    }
+}
+
 void RunStoreTests(AgcDriver::VulkanDevice& device) {
     struct Registration {
         void* data;
@@ -1065,6 +1116,7 @@ void RunStoreTests(AgcDriver::VulkanDevice& device) {
     AgcDriver::Graphics::StorageTexture::FlushPending(reinterpret_cast<std::uintptr_t>(Table.data()), sizeof(Table), nullptr, "test");
     device.WaitIdle();
     Require(Table == savedTable, "image table store: descriptor self-write modified the table");
+    RunStoreLayoutClassTests(device);
     SetClassRecords();
 }
 

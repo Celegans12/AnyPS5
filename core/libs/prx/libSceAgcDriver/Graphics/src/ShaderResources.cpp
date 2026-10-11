@@ -1544,9 +1544,8 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
         }
         std::uint32_t storageTableDescriptors = 0;
         if (storageTableFlags != 0) {
-            const auto capacity = StorageImageTableCapacity(context);
-            Require(capacity != 0, "storage image tables exceed device descriptor limits or require unavailable descriptor indexing features");
-            storageTableDescriptors = std::max(1u, std::min(tableElements, capacity));
+            storageTableDescriptors = StorageImageTableDescriptorCount(context, tableElements, tableFlags != 0);
+            Require(storageTableDescriptors != 0, "storage image tables exceed device descriptor limits or require unavailable descriptor indexing features");
             bindings.push_back({{ShaderRecompiler::RuntimeAbi::StorageImageTableBinding, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, storageTableDescriptors, storageTableFlags, nullptr}, {}, {}, VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT});
             storageTableBinding = bindings.size() - 1u;
         }
@@ -3493,6 +3492,21 @@ std::uint32_t StorageImageTableCapacity(const Context& context) {
     capacity = std::min(capacity, room(context.limits.maxPerStageResources, sampledHeaps + storageHeaps + buffers));
     capacity = std::min(capacity, room(context.limits.maxDescriptorSetStorageImages, storageHeaps * ShaderRecompiler::RuntimeAbi::StageCount));
     return static_cast<std::uint32_t>(capacity);
+}
+
+std::uint32_t StorageImageTableDescriptorCount(const Context& context, std::uint32_t elements, bool hasSampledTable) {
+    const auto capacity = StorageImageTableCapacity(context);
+    if (capacity == 0u) return 0u;
+    if (elements == 0u) return 1u;
+    const auto raw = std::min(elements, capacity);
+    const auto rounded = (static_cast<std::uint64_t>(elements) + 511u) / 512u * 512u;
+    auto descriptors = static_cast<std::uint32_t>(std::min<std::uint64_t>(rounded, capacity));
+    if (hasSampledTable) {
+        const auto oldSampled = std::min(context.imageTableCapacity, ImageTableCapacity(context, raw));
+        const auto paddedSampled = std::min(context.imageTableCapacity, ImageTableCapacity(context, descriptors));
+        descriptors -= oldSampled - paddedSampled;
+    }
+    return descriptors;
 }
 
 std::uint32_t SamplerTableCapacity(const Context& context) {

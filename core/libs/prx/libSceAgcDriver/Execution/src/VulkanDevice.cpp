@@ -3661,9 +3661,8 @@ PlannedComputeLayout planComputeLayout(const Graphics::Context& context, const S
     Graphics::Require(storageTable == nullptr || storageTable->count == elements, "pipeline-only: sampled and storage image tables disagree on their element domain");
     std::uint32_t storageTableDescriptors = 0;
     if (storageTable != nullptr) {
-        const auto capacity = Graphics::StorageImageTableCapacity(context);
-        Graphics::Require(capacity != 0, "pipeline-only: storage image tables exceed device descriptor limits");
-        storageTableDescriptors = std::max(1u, std::min(elements, capacity));
+        storageTableDescriptors = Graphics::StorageImageTableDescriptorCount(context, elements, sampledTable != nullptr);
+        Graphics::Require(storageTableDescriptors != 0, "pipeline-only: storage image tables exceed device descriptor limits");
         append(ShaderRecompiler::RuntimeAbi::StorageImageTableBinding, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, storageTableDescriptors, VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT);
     }
     if (sampledTable != nullptr) {
