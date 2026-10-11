@@ -1478,6 +1478,36 @@ void verifyDescriptorPhis() {
     };
     require(planImages(splitReloads(8u)) == 4u, "descriptor Phi: separate reloads of T# dword 7 and dwords 0-6 were not split into their 4 T#s");
     expectFailure([&] { static_cast<void>(planImages(splitReloads(260u))); }, "GetImageResource dword 0 is not a valid runtime value", "descriptor Phi: a web over more than 512 descriptor tuples was accepted");
+    const auto laneTuple = [](bool mismatchedMask, bool mismatchedPredicate) {
+        std::vector<std::uint32_t> code{
+            0xf40c0200u, 0xfa000000u, 0xf4080400u, 0xfa000020u, 0xf40c0a00u, 0xfa000060u,
+            0xf4080c00u, 0xfa000030u, 0xf4080700u, 0xfa000040u, 0xbebc047eu};
+        for (std::uint32_t word = 0; word < 12u; ++word) code.push_back(0x7e000200u | ((16u + word) << 17u) | (8u + word));
+        code.insert(code.end(), {0xbefe0380u, 0xbeff03c1u});
+        for (std::uint32_t word = 0; word < 12u; ++word) {
+            if (mismatchedPredicate && word == 0u) code.insert(code.end(), {0xbeff03ffu, 0xfffffeffu});
+            if (mismatchedPredicate && word == 1u) code.push_back(0xbeff03c1u);
+            code.push_back(0x7e000200u | ((16u + word) << 17u) | (40u + word));
+        }
+        code.insert(code.end(), {0xbefe0380u, 0xbeff03ffu, 0x100u});
+        for (std::uint32_t word = 0; word < 12u; ++word) {
+            if (mismatchedMask && word == 0u) code.insert(code.end(), {0xbefe0390u, 0xbeff0380u});
+            if (mismatchedMask && word == 1u) code.insert(code.end(), {0xbefe0380u, 0xbeff03ffu, 0x100u});
+            const auto destination = word < 8u ? 36u + word : 32u + word - 8u;
+            code.push_back(0x7e000500u | (destination << 17u) | (16u + word));
+        }
+        code.insert(code.end(), {0xbefe043cu, 0xf09c0f08u, 0x01090401u, 0xe0781000u, 0x80070408u, 0xbf810000u});
+        return code;
+    };
+    const auto coherent = laneTuple(false, false);
+    const auto coherentPlan = GetResourcePlan(makeRequest(coherent, 64u));
+    require(coherentPlan->info.images.size() >= 2u && coherentPlan->info.samplers.size() >= 2u,
+        "descriptor waterfall: coherent lane-selected tuple lost an image or sampler arm");
+    for (const auto mismatch : {std::pair{true, false}, std::pair{false, true}}) {
+        const auto invalid = laneTuple(mismatch.first, mismatch.second);
+        expectFailure([&] { static_cast<void>(GetResourcePlan(makeRequest(invalid, 64u))); }, "GetImageResource dword 0 is not a valid runtime value",
+            mismatch.first ? "descriptor waterfall: distinct lane masks were zipped into one tuple" : "descriptor waterfall: distinct predicates were zipped into one tuple");
+    }
 }
 
 void verifyProgramCounterRelativeData() {

@@ -328,6 +328,8 @@ struct Outcome {
     std::uint32_t imageTableFaults = 0;
     std::uint32_t poisonedSrtReads = 0;
     bool cacheable = false;
+    bool guardedWrap = false;
+    bool faultBuffer = false;
     std::vector<std::array<std::uint32_t, 4>> samplers;
     std::vector<std::array<std::uint32_t, 4>> samplerTable;
     std::vector<std::vector<std::pair<std::uint64_t, std::uint64_t>>> imageTableReadRanges;
@@ -359,6 +361,8 @@ Outcome Execute(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> 
     }();
     Outcome outcome;
     outcome.variantId = result.PipelineVariantId();
+    outcome.guardedWrap = result.hasGuardedUnnormalizedWrap;
+    outcome.faultBuffer = std::any_of(result.bindings.begin(), result.bindings.end(), [](const auto& binding) { return binding.role == ShaderRecompiler::DescriptorRole::FaultBuffer; });
     outcome.artifactId = result.variantId;
     outcome.imageTableFaults = result.imageTableFaults;
     outcome.poisonedSrtReads = result.poisonedSrtReads;
@@ -1161,7 +1165,7 @@ std::vector<std::uint32_t> DescriptorWaterfallCode(std::uint32_t waveSize) {
     return code;
 }
 
-void RunDescriptorWaterfallTests(AgcDriver::VulkanDevice& device) {
+void RunDescriptorWaterfallTests(AgcDriver::VulkanDevice& device, bool guardedArm = false) {
     Fill();
     auto imageA = Image(FloatTexels.data(), Format32Float);
     auto imageB = Image(OtherFloatTexels.data(), Format32Float);
@@ -1180,7 +1184,9 @@ void RunDescriptorWaterfallTests(AgcDriver::VulkanDevice& device) {
         }
     }
     std::cout << "descriptor waterfall: four distinct direct tuple controls passed; compiling masked loop and ReadFirstLane" << std::endl;
+    if (guardedArm) samplerB[0] |= 1u << 15u;
     for (const std::uint32_t waveSize : {32u, 64u}) {
+        if (guardedArm && waveSize != 64u) continue;
         const auto code = DescriptorWaterfallCode(waveSize);
         for (const bool selectB : {false, true}) {
             std::array<std::uint32_t, 48> root{};
@@ -1200,6 +1206,19 @@ void RunDescriptorWaterfallTests(AgcDriver::VulkanDevice& device) {
                 {reinterpret_cast<std::uintptr_t>(root.data()), std::as_bytes(std::span(root))}}};
             const auto outcome = Execute(device, words, root.data(), memory, 1u, waveSize, waveSize);
             Require(!Faulted(outcome), "descriptor waterfall: selected tuple faulted:\n" + outcome.log);
+            const std::string completion = "[gpu] deferred write-back failed: ";
+            const auto error = outcome.log.find(completion);
+            if (guardedArm) {
+                Require(outcome.guardedWrap && outcome.faultBuffer, "descriptor waterfall: dormant/selected fault arm has no verified runtime guard");
+                if (selectB) {
+                    Require(error != std::string::npos && outcome.log.find(completion, error + completion.size()) == std::string::npos
+                        && outcome.log.find(completion + "unnormalized sampler: shader ") == error
+                        && outcome.log.find("outside [0.5, size - 0.5]", error) != std::string::npos,
+                        "descriptor waterfall: selected invalid-coordinate arm did not report exactly one typed completion fault:\n" + outcome.log);
+                    continue;
+                }
+            }
+            Require(error == std::string::npos, "descriptor waterfall: dormant arm caused a completion fault:\n" + outcome.log);
             Require(Group(outcome, 0u, waveSize) == Group(controls[selectB ? 1u : 0u], 0u, waveSize),
                 "descriptor waterfall: wave" + std::to_string(waveSize) + " first lane " + std::to_string(firstLane) + " mixed tuple words or lost lane selection");
         }
@@ -1397,6 +1416,12 @@ int main(int argc, char** argv) {
 #endif
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
+        if (argc == 2 && std::string_view(argv[1]) == "--descriptor-waterfall-guard") {
+            const auto* enabled = std::getenv("APS5_UNNORM_WRAP_GUARD");
+            Require(enabled != nullptr && std::string_view(enabled) == "1", "descriptor waterfall: guarded-arm mode requires APS5_UNNORM_WRAP_GUARD=1");
+            RunDescriptorWaterfallTests(*device, true);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--descriptor-waterfall") {
             RunDescriptorWaterfallTests(*device);
             return 0;
