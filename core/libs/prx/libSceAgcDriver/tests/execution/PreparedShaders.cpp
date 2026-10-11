@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderPreparation.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
@@ -238,10 +239,24 @@ void FailureCapture(AgcDriver::VulkanDevice& device, bool terminalWriteFailure) 
     const std::vector<std::byte> header(2048, std::byte{0x5a});
     RecompileRequest request{{ShaderStage::Compute, 0x12345cafeull, code, 0x20000, header},
         {32, 0, {}, ShaderComputeStageInfo{{1, 1, 1}, 0, {}, false, 1, {}}, {}, {}, {}}, device.ComputeTarget(32), {0, 0, 0, 128}};
-    const std::array<std::uint32_t, 2> oldWords{1, 2}, terminalWords{3, 4};
+    const std::array<std::uint32_t, 2> oldWords{1, 2};
     const std::array<MemoryRegion, 1> oldMemory{{{0x40000, std::as_bytes(std::span(oldWords))}}};
-    const std::array<MemoryRegion, 1> terminalMemory{{{0x40000, std::as_bytes(std::span(terminalWords))}}};
     request.context.memory = oldMemory;
+    alignas(4096) std::array<std::uint32_t, 1024> dependencyPage{};
+    const auto dependencyAddress = reinterpret_cast<std::uintptr_t>(dependencyPage.data());
+    const auto leafAddress = reinterpret_cast<std::uintptr_t>(dependencyPage.data() + 4);
+    const std::array<std::uint32_t, 4> terminalWords{static_cast<std::uint32_t>(leafAddress), static_cast<std::uint32_t>(leafAddress >> 32u), 2u, 0x31016facu};
+    std::copy(terminalWords.begin(), terminalWords.end(), dependencyPage.begin());
+    const std::array<std::uint32_t, 2> users{static_cast<std::uint32_t>(dependencyAddress), static_cast<std::uint32_t>(dependencyAddress >> 32u)};
+    const std::array<std::uint32_t, 7> captureCode{0xf4080100u, 0xfa000000u, 0xf4280202u, 0xfa000000u, 0xe0700000u, 0x80020000u, 0xbf810000u};
+    auto captureRequest = request;
+    captureRequest.shader = {ShaderStage::Compute, request.shader.codeAddress, captureCode, 0, {}};
+    captureRequest.context.userData = users;
+    captureRequest.context.memory = {};
+    captureRequest.useCache = false;
+    AgcDriver::ShaderMemory partialMemory({});
+    Require(partialMemory.Regions().empty(), "partial capture started with supplied dependency regions");
+    std::vector<MemoryRegion> terminalMemory;
     const auto failure = [&](auto action) {
         try { action(); }
         catch (const std::exception& error) { return std::string(error.what()); }
@@ -270,14 +285,20 @@ void FailureCapture(AgcDriver::VulkanDevice& device, bool terminalWriteFailure) 
     Require(std::filesystem::create_directory(directory), "cannot create terminal capture test directory");
     const auto destination = (terminalWriteFailure ? directory / "missing" / "child" : directory).string();
     bool written = false;
+    std::string captureError;
     const auto terminalError = failure([&] {
-        try { throw std::runtime_error("terminal compute fixture failure"); }
+        try { static_cast<void>(partialMemory.Capture(captureRequest)); }
         catch (const std::exception& error) {
-            written = AgcDriver::DriverDetail::CaptureTerminalComputeFailure(request, terminalMemory, error.what(), 7, 11, 13, destination.c_str());
+            captureError = error.what();
+            terminalMemory = partialMemory.Regions();
+            written = AgcDriver::DriverDetail::CaptureTerminalComputeFailure(captureRequest, terminalMemory, error.what(), 7, 11, 13, destination.c_str());
             throw;
         }
     });
-    Require(terminalError == "terminal compute fixture failure", "terminal capture changed the original exception");
+    Require(captureError.find("SrtWalker::EvaluateRuntimeSources") != std::string::npos && captureError.find("ReadConstBuffer") != std::string::npos, "partial capture did not refuse the undersized scalar buffer");
+    Require(terminalError == captureError, "terminal capture changed the original exception");
+    Require(terminalMemory.size() == 1 && terminalMemory[0].guestAddress == dependencyAddress && terminalMemory[0].bytes.size() == sizeof(terminalWords)
+        && std::memcmp(terminalMemory[0].bytes.data(), terminalWords.data(), sizeof(terminalWords)) == 0, "failed capture did not retain its actual descriptor reads");
     Require(written == !terminalWriteFailure, "terminal capture write outcome was incorrect");
     Require(!AgcDriver::DriverDetail::CaptureTerminalComputeFailure(request, oldMemory, "second failure", 7, 12, 13, directory.string().c_str()), "terminal capture exceeded its one-attempt budget");
     std::size_t terminalFiles = 0;
@@ -286,12 +307,12 @@ void FailureCapture(AgcDriver::VulkanDevice& device, bool terminalWriteFailure) 
         Require(entry.path().filename().string().starts_with("shader_12345cafe_terminal_"), "terminal capture cannot be collected by the runner");
         std::ifstream terminalFile(entry.path(), std::ios::binary);
         const std::string bytes{std::istreambuf_iterator<char>(terminalFile), std::istreambuf_iterator<char>()};
-        auto terminalRequest = request;
+        auto terminalRequest = captureRequest;
         terminalRequest.context.memory = terminalMemory;
         const RequestSerializer terminalSerializer;
         Require(bytes == terminalSerializer.Serialize(terminalRequest), "terminal capture used stale same-address request bytes");
         const auto decoded = terminalSerializer.Deserialize(bytes);
-        Require(decoded.request.context.memory.size() == 1 && decoded.request.context.memory[0].bytes.size() == sizeof(terminalWords)
+        Require(decoded.request.context.memory.size() == 1 && decoded.request.context.memory[0].guestAddress == dependencyAddress && decoded.request.context.memory[0].bytes.size() == sizeof(terminalWords)
             && std::memcmp(decoded.request.context.memory[0].bytes.data(), terminalWords.data(), sizeof(terminalWords)) == 0, "terminal captured memory did not roundtrip");
         terminalFile.close();
         Require(std::filesystem::remove(entry.path()), "cannot remove terminal capture test file");

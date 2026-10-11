@@ -279,6 +279,12 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
             totalMs += elapsed;
             if (profile && elapsed > 200) std::fprintf(stderr, "[gpu] compute shader 0x%llx recompile took %.0f ms (%zu SPIR-V words, %zu captured regions, total %.1f s)\n", static_cast<unsigned long long>(address), elapsed, compiledResult->spirv.size(), captured.size(), totalMs / 1000);
         } catch (const std::exception& error) {
+            if (dumpShaders) {
+                try {
+                    const auto partial = shaderMemory->Regions();
+                    CaptureTerminalComputeFailure(request, partial, error.what(), submission.queue, submission.serial, currentPacketOffset());
+                } catch (...) {}
+            }
             const auto dump = dumpShaders ? dumpRequest(address, request) : std::string{};
 
             std::string reason = error.what();
