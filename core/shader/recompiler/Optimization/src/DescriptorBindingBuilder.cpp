@@ -557,6 +557,10 @@ void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, con
     const auto& layout = compiled.layout;
     const bool needsShaderData = layout.UsesPushData() || plan.storageData;
     auto shaderData = needsShaderData ? ShaderDataDwordsFor(layout, userDataBase, snapshot, partialThreads, plan.imageMetadata, plan.runtimeState) : std::vector<std::uint32_t>{};
+    allocation.shaderDataUserWords.clear();
+    if (needsShaderData) {
+        for (const auto reg : layout.userDataRegisters) allocation.shaderDataUserWords.push_back(reg - userDataBase);
+    }
     std::vector<DescriptorBinding> bindings;
     bindings.reserve(plan.bindings.size());
     std::size_t writtenHere = 0;

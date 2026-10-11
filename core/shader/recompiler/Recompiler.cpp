@@ -1237,6 +1237,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
             std::copy_n(runtimeSelectors.begin(), layout.runtimeStateDwords, data->guestDescriptor.begin() + first);
         }
     }
+    result.shaderDataUserWords = std::move(bindings.shaderDataUserWords);
     result.poisonedSrtReads = static_cast<std::uint32_t>(snapshot.srtPoison.size()) + snapshot.nullRootReads;
     if (!tables.map.empty()) {
         result.imageTablePoison.reserve(tables.poison.size());
@@ -1634,11 +1635,12 @@ namespace {
 // traced into the capture (ResourceCapture::readTrace).
 void materializeCapture(ResourceCapture& capture, const SrtRuntime& runtime, bool allowDirectImageRefusal) {
     const auto& plan = *capture.plan;
+    SrtRuntime traced = runtime;
+    traced.userDataUse = &capture.userDataUse;
     if (std::none_of(plan.pureFlatSlots.begin(), plan.pureFlatSlots.end(), [](std::uint8_t pure) { return pure != 0u; })) {
-        ResourceMaterializer{}.Materialize(plan, runtime, capture.snapshot, allowDirectImageRefusal);
+        ResourceMaterializer{}.Materialize(plan, traced, capture.snapshot, allowDirectImageRefusal);
         return;
     }
-    SrtRuntime traced = runtime;
     traced.readTrace = &capture.readTrace;
     ResourceMaterializer{}.Materialize(plan, traced, capture.snapshot, allowDirectImageRefusal);
     auto& other = capture.readTrace.otherReads;
