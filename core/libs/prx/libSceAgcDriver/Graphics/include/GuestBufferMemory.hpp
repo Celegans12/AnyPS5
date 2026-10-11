@@ -58,11 +58,19 @@ ImportProbe ProbeImportWriteProtection(const Context& context);
 ImportProbe ProbeDmaBufImportWriteProtection(const Context& context);
 ImportWatch PrepareImportWatch(const Context& context);
 void SetImportWatch(const Context& context, ImportWatch watch);
+// Whether a host import that leaves its range write-watched can stamp the range's pages when it is
+// made (the device's probe saw pages written at the import): its import window then stamps them as
+// a possible CPU store, which a storage image resolves only by comparing with its guest-byte copy.
+// Decides the device's import watch first; false without host imports or a write watch, true when
+// the imports were not probed. The overload without a device reads the last decision (true before one).
+bool WatchedImportsStampPages(const Context& context);
+bool WatchedImportsStampPages();
 
 // The host import of the registered allocation containing [address, address + bytes), made on demand
 // (alignment and budget permitting), or null. Bytes at `address` are at `address - import->base` in
 // the import's buffer.
 const HostImport* HostImportFor(const Context& context, std::uint64_t address, std::size_t bytes);
+void SetHostImportWindow(std::uint64_t bytes);
 bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& ranges, std::uint64_t generation, bool adoptDevice);
 // Whether an existing import covers [address, address + bytes), without reconciling the imports
 // with the registry or making one (HostImportFor may take a registry lease): a hint for choices

@@ -36,6 +36,7 @@ extern "C" std::uint32_t* APS5_VABI sceAgcAcbSetMarker(CommandBuffer* buf, const
 extern "C" std::uint32_t* APS5_VABI sceAgcDcbSetIndexBuffer(CommandBuffer* buf, std::uint64_t indexAddress);
 extern "C" std::uint32_t* APS5_VABI sceAgcDcbSetBaseIndirectArgs(CommandBuffer* buf, std::uint32_t shaderType, const volatile void* indirectBaseAddr);
 extern "C" std::uint32_t* APS5_VABI sceAgcSetNop(CommandBuffer* buf, std::uint32_t sizeDw);
+extern "C" int APS5_VABI sceAgcDebugRaiseException(std::uint32_t exceptionId);
 
 namespace {
 
@@ -133,12 +134,14 @@ void testClearState() {
         auto* packet = sceAgcDcbClearState(&storage.buffer, command);
         check(packet == storage.words.data() + command * 2 && packet[0] == 0xc0001200u && packet[1] == command, "incorrect CLEAR_STATE packet");
     }
-    check(storage.buffer.cursor_up == storage.words.data() + 32 && storage.words[32] == 0xdeadbeefu, "incorrect CLEAR_STATE cursor advance");
+    auto* maskedZero = sceAgcDcbClearState(&storage.buffer, 0x10u);
+    check(maskedZero == storage.words.data() + 32 && maskedZero[0] == 0xc0001200u && maskedZero[1] == 0, "CLEAR_STATE did not mask the command to four bits");
+    auto* maskedF = sceAgcDcbClearState(&storage.buffer, 0xffffffffu);
+    check(maskedF == storage.words.data() + 34 && maskedF[0] == 0xc0001200u && maskedF[1] == 0xfu, "CLEAR_STATE did not mask the command to four bits");
+    check(storage.buffer.cursor_up == storage.words.data() + 36 && storage.words[36] == 0xdeadbeefu, "incorrect CLEAR_STATE cursor advance");
     const auto before = storage.words;
-    expectFailure([&] { sceAgcDcbClearState(&storage.buffer, 0x10u); });
-    expectFailure([&] { sceAgcDcbClearState(&storage.buffer, 0xffffffffu); });
     expectFailure([] { sceAgcDcbClearState(nullptr, 0); });
-    check(storage.words == before && storage.buffer.cursor_up == storage.words.data() + 32, "invalid CLEAR_STATE modified the buffer");
+    check(storage.words == before && storage.buffer.cursor_up == storage.words.data() + 36, "invalid CLEAR_STATE modified the buffer");
 }
 
 struct ContextGrowth {
@@ -401,6 +404,16 @@ void testMemory() {
     check(storage.words == beforeMask, "invalid mask patch modified packet memory");
 }
 
+void testDebugRaiseException() {
+    int result = -1;
+    try {
+        result = sceAgcDebugRaiseException(0x1234abcdu);
+    } catch (const std::exception& error) {
+        throw std::runtime_error(std::string("debug exception stopped the caller: ") + error.what());
+    }
+    check(result == 0, "debug exception did not return 0");
+}
+
 void testDefaults() {
     std::uint32_t state = 0x12345678;
     check(sceAgcInit_0090(&state, 8) == 0 && state == 0x12345678, "AGC initialization failed or modified caller state");
@@ -446,6 +459,7 @@ int main(int argc, char** argv) {
         testRegisterRange();
         testPacketPayloadAddress();
         testMemory();
+        testDebugRaiseException();
         testDefaults();
         LibcRunShutdown_nid_postfix();
         std::puts("AGC command tests passed");

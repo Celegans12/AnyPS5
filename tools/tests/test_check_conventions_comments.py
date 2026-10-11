@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from check_conventions import STUB_BODY, function_body
+from check_conventions import STUB_BODY, SYSTEM_DEPENDENCY, Check, function_body
 
 
 class FunctionBodyTests(unittest.TestCase):
@@ -92,6 +92,44 @@ class SilentStubTests(unittest.TestCase):
             self.assertNotIn("[comment]", result.stdout)
 
 
+class QuotedPathTests(unittest.TestCase):
+    def test_non_ascii_path_does_not_crash_the_checker(self):
+        checker = Path(__file__).resolve().parents[1] / "check_conventions.py"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            def git(*args):
+                return subprocess.run(
+                    ["git", "-c", "user.name=Conventions Test", "-c", "user.email=test@example.com",
+                     "-c", "commit.gpgsign=false", *args],
+                    cwd=root, capture_output=True, text=True, check=True,
+                )
+
+            git("init", "-q")
+            git("config", "core.quotePath", "true")
+            readme = root / "README.md"
+            readme.write_text("# Example\n", encoding="utf-8")
+            git("add", ".")
+            git("commit", "-qm", "docs: add readme")
+            note = root / "docs/dev/caf\u00e9.md"
+            note.parent.mkdir(parents=True)
+            note.write_text("# Cafe\n\nA short note.\n", encoding="utf-8")
+            source = root / "core/x.cpp"
+            source.parent.mkdir(parents=True)
+            source.write_text("int x; // note\n", encoding="utf-8")
+            git("add", ".")
+            git("commit", "-qm", "feat: add cafe note")
+            result = subprocess.run(
+                [sys.executable, "-I", str(checker), "--base", "HEAD~1"],
+                cwd=root, capture_output=True, text=True, encoding="utf-8",
+                env={key: value for key, value in os.environ.items()
+                     if key not in ("GITHUB_EVENT_PATH", "GITHUB_STEP_SUMMARY", "GITHUB_ACTIONS")},
+            )
+            self.assertNotIn("Traceback", result.stderr)
+            self.assertIn("[comment]", result.stdout)
+            self.assertIn("core/x.cpp", result.stdout)
+
+
 class SilentStubSectionTests(unittest.TestCase):
     path = "core/libs/prx/libSceExample/Export.cpp"
     entry = f"- [Existing limitation](../../{path}) - console layout is unknown.\n"
@@ -169,6 +207,67 @@ class SilentStubSectionTests(unittest.TestCase):
 
     def test_subsection_in_silent_stubs_keeps_exemption(self):
         self.require_accepted(f"# Project technical debt\n\n### Silent stubs\n\n#### Dialogs\n\n{self.entry}")
+
+
+class PullRequestTemplateTests(unittest.TestCase):
+    def findings(self, line):
+        check = Check.__new__(Check)
+        check.findings = []
+        body = f"### What\nx\n### Tested\nLinux\n### Checklist\n{line}\n- [x] Depends on: none\n- [x] AI-assisted: no\n"
+        check.pull_request("fix: x", body)
+        return check.findings
+
+    def test_unchecked_items_with_any_bullet_are_reported(self):
+        for bullet in ("-", "*", "+"):
+            with self.subTest(bullet=bullet):
+                self.assertEqual(self.findings(f"{bullet} [ ] all"), [("pr-template", "", 0, "unchecked: all")])
+
+    def test_checked_item_is_accepted(self):
+        self.assertEqual(self.findings("- [x] all"), [])
+
+
+class SpacedPathTests(unittest.TestCase):
+    def test_comment_in_path_with_space_is_reported(self):
+        checker = Path(__file__).resolve().parents[1] / "check_conventions.py"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            def git(*args):
+                return subprocess.run(
+                    ["git", "-c", "user.name=Conventions Test", "-c", "user.email=test@example.com",
+                     "-c", "commit.gpgsign=false", *args],
+                    cwd=root, capture_output=True, text=True, check=True,
+                )
+
+            git("init", "-q")
+            (root / "readme.txt").write_text("x\n", encoding="utf-8")
+            git("add", ".")
+            git("commit", "-qm", "docs: add readme")
+            source = root / "core/a b.cpp"
+            source.parent.mkdir(parents=True)
+            source.write_text("int x; // note\n", encoding="utf-8")
+            git("add", ".")
+            git("commit", "-qm", "feat: add spaced file")
+            result = subprocess.run(
+                [sys.executable, "-I", str(checker), "--base", "HEAD~1"],
+                cwd=root, capture_output=True, text=True,
+                env={key: value for key, value in os.environ.items()
+                     if key not in ("GITHUB_EVENT_PATH", "GITHUB_STEP_SUMMARY", "GITHUB_ACTIONS")},
+            )
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("core/a b.cpp:1: error: [comment]", result.stdout)
+
+
+class SystemDependencyTests(unittest.TestCase):
+    def test_flags_system_lookups(self):
+        for line in ("find_package( SDL2 REQUIRED)", "FIND_PACKAGE(SDL2)", "find_path(X x.h)", "find_program(P prog)"):
+            with self.subTest(line=line):
+                self.assertIsNotNone(SYSTEM_DEPENDENCY.search(line))
+
+    def test_allows_exempt_lines(self):
+        for line in ("find_package(Python3 COMPONENTS Interpreter)", "find_package( Threads REQUIRED )", "FIND_PACKAGE(Git)", "add_library(x)"):
+            with self.subTest(line=line):
+                self.assertIsNone(SYSTEM_DEPENDENCY.search(line))
 
 
 if __name__ == "__main__":

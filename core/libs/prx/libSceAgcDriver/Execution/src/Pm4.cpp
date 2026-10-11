@@ -610,8 +610,8 @@ std::optional<StoreWrite> ResolveStore(std::span<const std::uint32_t> packet, co
             return StoreWrite{destination, {}, dmaSourceBytes(packet)};
         }
         case 0x83: {
-            if (packet.size() < 5 || packet[1] / 4 > queue.constantRam.size() || packet[2] > queue.constantRam.size() - packet[1] / 4) return std::nullopt;
-            const auto words = std::span<const std::uint32_t>(queue.constantRam).subspan(packet[1] / 4, packet[2]);
+            if (packet.size() < 5 || packet[1] / 4 > QueueState::ConstantRamWords || packet[2] > QueueState::ConstantRamWords - packet[1] / 4) return std::nullopt;
+            const auto words = queue.ConstantRam().subspan(packet[1] / 4, packet[2]);
             if (words.size_bytes() > limit) return std::nullopt;
             // A view of the queue's constant RAM: valid until the next CONST_RAM write on this queue,
             // which is a later packet of the same worker.
@@ -913,10 +913,10 @@ void Execute(std::span<const std::uint32_t> packet, QueueState& queue) {
             return;
         }
         case 0x81:
-            std::copy(packet.begin() + 2, packet.end(), queue.constantRam.begin() + packet[1] / 4);
+            std::copy(packet.begin() + 2, packet.end(), queue.WritableConstantRam().begin() + packet[1] / 4);
             return;
         case 0x83:
-            GuestMemory::Write(address(packet[3], packet[4]), std::as_bytes(std::span(queue.constantRam).subspan(packet[1] / 4, packet[2])), 4);
+            GuestMemory::Write(address(packet[3], packet[4]), std::as_bytes(queue.ConstantRam().subspan(packet[1] / 4, packet[2])), 4);
             return;
         case 0x45: {
             std::uint32_t value = 0;

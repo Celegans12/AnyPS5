@@ -7,10 +7,12 @@
 #include <algorithm>
 #include <fstream>
 #include <functional>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <map>
 #include <set>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -88,7 +90,6 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
         if (stream.gcount() != 4) return false;
         const auto byte = [&](const std::size_t index) { return static_cast<unsigned char>(magic[index]); };
         const bool self = (byte(0) == 0x4f && byte(1) == 0x15 && byte(2) == 0x3d && byte(3) == 0x1d) || (byte(0) == 0x54 && byte(1) == 0x14 && byte(2) == 0xf5 && byte(3) == 0xee);
-        if (self) throw Domain::RelinkerException("Guest module is a SELF container, not an ELF: " + Io::Utf8Path(path));
         return byte(0) == 0x7f && magic[1] == 'E' && magic[2] == 'L' && magic[3] == 'F';
     };
     for (const auto& directory : directories) {
@@ -154,17 +155,6 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
             if (!windows && repeated) throw Domain::RelinkerException("Duplicate guest export after stripping #: " + symbol.Name + " in " + Io::Utf8Path(path) + " and " + Io::Utf8Path(images[providers.front()].SourcePath));
             if (!repeated) providers.push_back(images.size());
             if (!windows && providers.size() > 1) sharedExports[symbol.Name].insert(providers.begin(), providers.end());
-        }
-        std::vector<Domain::ProgramHeader> codeHeaders;
-        for (const auto& header : image.Headers) if (header.Type == 1 && (header.Flags & 1) != 0) codeHeaders.push_back(header);
-        if (toIntel) {
-            auto converted = Codegen::MakeAmd64OnlyConverter(toRosetta ? Codegen::Amd64OnlyTarget::Rosetta : Codegen::Amd64OnlyTarget::Intel)->Convert(std::move(image.Bytes), codeHeaders);
-            image.Trampolines = std::move(converted.Trampolines);
-            image.Bytes = std::move(converted.Bytes);
-        }
-        for (const auto& header : codeHeaders) {
-            const std::vector<std::uint8_t> code(image.Bytes.begin() + header.Offset, image.Bytes.begin() + header.Offset + header.FileSize);
-            syscallScanner.ScanCodeSectionForSyscalls(code, header.MappedAddress, header.FileSize);
         }
         images.push_back(std::move(image));
     }
@@ -339,7 +329,21 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
     const auto outputDirectory = std::filesystem::absolute(outputPath).parent_path().lexically_normal();
     std::vector<GuestArtifact> artifacts;
     for (const auto index : order) {
-        const auto& image = images[index];
+        auto& image = images[index];
+        std::ostringstream moduleSize;
+        moduleSize << std::fixed << std::setprecision(2) << static_cast<double>(image.Bytes.size()) / 1000000.0;
+        std::cout << "Processing " << image.SourcePath.lexically_relative(root).generic_string() << " (" << moduleSize.str() << "MB)" << std::flush;
+        std::vector<Domain::ProgramHeader> codeHeaders;
+        for (const auto& header : image.Headers) if (header.Type == 1 && (header.Flags & 1) != 0) codeHeaders.push_back(header);
+        if (toIntel) {
+            auto converted = Codegen::MakeAmd64OnlyConverter(toRosetta ? Codegen::Amd64OnlyTarget::Rosetta : Codegen::Amd64OnlyTarget::Intel)->Convert(std::move(image.Bytes), codeHeaders);
+            image.Trampolines = std::move(converted.Trampolines);
+            image.Bytes = std::move(converted.Bytes);
+        }
+        for (const auto& header : codeHeaders) {
+            const std::vector<std::uint8_t> code(image.Bytes.begin() + header.Offset, image.Bytes.begin() + header.Offset + header.FileSize);
+            syscallScanner.ScanCodeSectionForSyscalls(code, header.MappedAddress, header.FileSize);
+        }
         const auto relativeDirectory = "app0/" + image.SourcePath.parent_path().lexically_relative(root).generic_string();
         const auto destination = outputDirectory / relativeDirectory;
         const auto target = destination / image.OutputName;
@@ -382,7 +386,8 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
             }
         }
         dynamic.GuestModules.push_back(std::move(runtime));
-        artifacts.push_back({target, std::move(output), std::move(imports)});
+        artifacts.push_back({target, std::move(output), std::move(imports), image.SourcePath});
+        std::cout << " [DONE]" << std::endl;
     }
     return artifacts;
 }

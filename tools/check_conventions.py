@@ -35,7 +35,7 @@ ALLOWED_COMMENT = re.compile(r"^\s*(#\s*endif\b|}\s*;?\s*//\s*(end\s+)?namespace
 EXPORT = re.compile(r"\bAPS5_VABI\s+(\w+)\s*\(")
 STUB_BODY = re.compile(r"^(?:\(void\)\s*\w+\s*;|static_cast<void>\(\s*\w+\s*\)\s*;)*"
                        r"(?:return\s*\(?\s*(?:-?(?:0x[0-9a-fA-F]+|\d+)[uUlL]*|nullptr|true|false|\w*_OK)?\s*\)?\s*;)?$")
-SYSTEM_DEPENDENCY = re.compile(r"\b(find_package\s*\((?!\s*(Python3|Threads|Git)\b)|pkg_check_modules|pkg_search_module|find_library)\b")
+SYSTEM_DEPENDENCY = re.compile(r"\b(find_package\s*\((?!\s*(Python3|Threads|Git)\b)|pkg_check_modules\b|pkg_search_module\b|find_(library|path|program|file)\b)", re.I)
 TITLE = re.compile(r"\b(PPSA|CUSA)\d{5}\b")
 EXTENSION = re.compile(r"__attribute__|__declspec|#\s*pragma\s+(?!once\b)")
 LINK = re.compile(r"\]\(([^)\s]+)")
@@ -43,7 +43,7 @@ SECTION = re.compile(r"^###\s*(.+?)\s*$", re.M)
 
 
 def git(*args, text=True):
-    output = subprocess.run(["git", *args], capture_output=True, check=True).stdout
+    output = subprocess.run(["git", "-c", "core.quotePath=false", *args], capture_output=True, check=True).stdout
     return output.decode("utf-8", errors="replace") if text else output
 
 
@@ -66,7 +66,7 @@ class Check:
         path = None
         for line in git("diff", "-U0", "--no-color", "--no-renames", "--no-prefix", self.base, head).splitlines():
             if line.startswith("+++ "):
-                path = None if line == "+++ /dev/null" else line[4:]
+                path = None if line == "+++ /dev/null" else line[4:].rstrip("\t")
             elif line.startswith("@@"):
                 number = int(re.search(r"\+(\d+)", line).group(1))
             elif line.startswith("+") and path:
@@ -169,7 +169,7 @@ class Check:
             if not sections.get(name, "").strip():
                 self.report("pr-template", "", 0, f"section '{name}' is missing or empty")
         checklist = sections.get("Checklist", "")
-        for item in re.findall(r"^\s*-\s*\[ \]\s*(.+)$", checklist, re.M):
+        for item in re.findall(r"^\s*[-*+]\s*\[ \]\s*(.+)$", checklist, re.M):
             self.report("pr-template", "", 0, f"unchecked: {item.strip()}")
         if checklist and not re.search(r"AI-assisted:\s*(yes|no)\b", checklist, re.I):
             self.report("pr-template", "", 0, "answer AI-assisted with yes or no")

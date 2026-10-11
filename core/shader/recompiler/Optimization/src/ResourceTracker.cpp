@@ -16,6 +16,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -549,6 +550,10 @@ private:
             }
             return;
         }
+        if (depth != 0u && value->Opcode() == IrOpcode::ReadFirstLane && value->ArgumentCount() == 2u) {
+            CollectDescriptorPhis(value->Argument(0), phis, depth - 1u);
+            return;
+        }
         if (depth == 0u || !Detail::IsRuntimeUniformOp(value->Opcode())) {
             return;
         }
@@ -822,6 +827,7 @@ private:
         std::vector<std::vector<IrValue*>> arms;
         std::map<std::vector<IrValue*>, IrValue*> selectors;
         std::vector<std::pair<IrBlock*, IrValue*>> phis;
+        std::vector<std::tuple<IrBlock*, IrValue*, IrValue*>> lanes;
         std::unordered_map<IrValue*, IrValue*> resolved;
         bool lifted = false;
         struct Pending {
@@ -852,6 +858,10 @@ private:
             return nullptr;
         }
         const auto phi = std::ranges::find_if(tuple, [](const IrValue* value) { return value->IsPhi(); });
+        const auto lane = std::ranges::find_if(tuple, [](const IrValue* value) { return value->Opcode() == IrOpcode::SelectU32 || value->Opcode() == IrOpcode::ReadFirstLane; });
+        if (phi == tuple.end() && lane != tuple.end()) {
+            return LaneSelector(tuple, **lane, web, position);
+        }
         if (phi == tuple.end()) {
             const auto select = std::ranges::find_if(tuple, [](const IrValue* value) { return value->Opcode() == IrOpcode::SelectU32; });
             if (web.lifted && select != tuple.end()) {
@@ -1098,6 +1108,64 @@ private:
         return true;
     }
 
+    IrValue* LaneSelector(const std::vector<IrValue*>& tuple, IrValue& first, DescriptorWeb& web, IrValue& position) {
+        IrBlock* block = first.Parent();
+        const auto op = first.Opcode();
+        const bool select = op == IrOpcode::SelectU32;
+        if (block == nullptr || first.ArgumentCount() != (select ? 3u : 2u) || web.selectors.size() == DescriptorWeb::maxStates) {
+            return nullptr;
+        }
+        IrValue* shared = first.Argument(select ? 0u : 1u);
+        std::vector<IrValue*> left;
+        std::vector<IrValue*> right;
+        for (IrValue* value : tuple) {
+            if (value->Opcode() == op && value->Parent() == block && value->ArgumentCount() == first.ArgumentCount() && EquivalentValue(m_program.Resources(), value->Argument(select ? 0u : 1u), shared)) {
+                left.push_back(value->Argument(select ? 1u : 0u));
+                if (select) {
+                    right.push_back(value->Argument(2u));
+                }
+            } else if (value->HasImmediate() || (select && !value->IsPhi() && value->Opcode() != IrOpcode::ReadFirstLane)) {
+                left.push_back(value);
+                if (select) {
+                    right.push_back(value);
+                }
+            } else {
+                return nullptr;
+            }
+        }
+        auto& instructions = block->Instructions();
+        auto latest = instructions.end();
+        for (auto it = instructions.begin(); it != instructions.end(); ++it) {
+            if (std::ranges::find(tuple, *it) != tuple.end()) {
+                latest = it;
+            }
+        }
+        if (latest == instructions.end()) {
+            return nullptr;
+        }
+        IrValue* before = std::next(latest) == instructions.end() ? nullptr : *std::next(latest);
+        IrValue* leftSelector = WebSelector(std::move(left), web, position);
+        if (leftSelector == nullptr) {
+            return nullptr;
+        }
+        IrValue& node = m_program.CreateValue(op, IrType::U32, first.Flags<std::uint64_t>());
+        if (select) {
+            IrValue* rightSelector = WebSelector(std::move(right), web, position);
+            if (rightSelector == nullptr) {
+                return nullptr;
+            }
+            node.AddArgument(shared);
+            node.AddArgument(leftSelector);
+            node.AddArgument(rightSelector);
+        } else {
+            node.AddArgument(leftSelector);
+            node.AddArgument(shared);
+        }
+        web.selectors.emplace(tuple, &node);
+        web.lanes.emplace_back(block, before, &node);
+        return &node;
+    }
+
     void SplitDescriptorWeb(IrValue& inst, const std::array<IrValue*, 2>& handles, const std::array<bool, 2>& split, std::uint32_t handleCount) {
         std::vector<IrValue*> tuple;
         std::array<std::size_t, 2> offsets {};
@@ -1114,14 +1182,29 @@ private:
             for (const auto& [block, phi] : web.phis) {
                 block->InsertInstructionBefore(nullptr, phi);
             }
+            for (const auto& [block, before, node] : web.lanes) {
+                if (before == nullptr) {
+                    block->AppendInstruction(node);
+                } else {
+                    block->InsertInstructionBefore(before, node);
+                }
+            }
         } else {
             for (const auto& [block, phi] : web.phis) {
                 for (std::size_t index = 0; index < phi->ArgumentCount(); index++) {
                     phi->ReplaceArgument(index, nullptr);
                 }
             }
+            for (const auto& [block, before, node] : web.lanes) {
+                for (std::size_t index = 0; index < node->ArgumentCount(); index++) {
+                    node->ReplaceArgument(index, nullptr);
+                }
+            }
             for (const auto& [block, phi] : web.phis) {
                 phi->Invalidate();
+            }
+            for (const auto& [block, before, node] : web.lanes) {
+                node->Invalidate();
             }
         }
         if (selector == nullptr || web.arms.empty()) {

@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <thread>
@@ -15,6 +16,9 @@ void APS5_VABI srandom_nid_postfix(std::uint64_t);
 char* APS5_VABI initstate_nid_postfix(std::uint64_t, char*, std::int64_t);
 char* APS5_VABI setstate_nid_postfix(char*);
 int* APS5_VABI __error_nid_postfix();
+double APS5_VABI erand48_nid_postfix(std::uint16_t*);
+std::int64_t APS5_VABI nrand48_nid_postfix(std::uint16_t*);
+std::int64_t APS5_VABI jrand48_nid_postfix(std::uint16_t*);
 }
 
 static int failures = 0;
@@ -40,7 +44,38 @@ static std::uint32_t Word(const char* table, std::size_t index) {
     return value;
 }
 
+static bool SeedIs(const std::uint16_t* seed, std::uint16_t low, std::uint16_t middle, std::uint16_t high) {
+    return seed[0] == low && seed[1] == middle && seed[2] == high;
+}
+
+static void CheckRand48() {
+    std::uint16_t seed[3] = {0x330e, 0xabcd, 0x1234};
+    Require(erand48_nid_postfix(seed) == 0x657eb7255101p-48 && SeedIs(seed, 0x5101, 0xb725, 0x657e), "erand48 first value");
+    Require(nrand48_nid_postfix(seed) == 1804928587 && SeedIs(seed, 0x6378, 0x0c96, 0xd72a), "nrand48 second value");
+    Require(jrand48_nid_postfix(seed) == 1517566982 && SeedIs(seed, 0x2a23, 0x3c06, 0x5a74), "jrand48 third value");
+    Require(erand48_nid_postfix(seed) == 0x72534abf62f2p-48 && SeedIs(seed, 0x62f2, 0x4abf, 0x7253), "erand48 fourth value");
+    Require(nrand48_nid_postfix(seed) == 684387517 && SeedIs(seed, 0x8d15, 0xd97a, 0x5195), "nrand48 fifth value");
+    Require(jrand48_nid_postfix(seed) == -487786166 && SeedIs(seed, 0xeffc, 0xf94a, 0xe2ec), "jrand48 negative value");
+
+    std::uint16_t zero[3] = {};
+    Require(nrand48_nid_postfix(zero) == 0 && SeedIs(zero, 0x000b, 0, 0), "rand48 zero seed adds the increment");
+    std::uint16_t top[3] = {0xffff, 0xffff, 0xffff};
+    const double value = erand48_nid_postfix(top);
+    Require(value >= 0.0 && value < 1.0, "erand48 stays below 1");
+
+#ifndef _WIN32
+    std::uint16_t guest[3] = {0x1234, 0x5678, 0x9abc};
+    unsigned short host[3] = {0x1234, 0x5678, 0x9abc};
+    for (int round = 0; round < 64; ++round) {
+        Require(erand48_nid_postfix(guest) == ::erand48(host), "erand48 matches the host");
+        Require(nrand48_nid_postfix(guest) == ::nrand48(host), "nrand48 matches the host");
+        Require(jrand48_nid_postfix(guest) == ::jrand48(host), "jrand48 matches the host");
+    }
+#endif
+}
+
 int main() {
+    CheckRand48();
     constexpr Sequence seedOne {1408992891, 1638182910, 83848093, 145962118, 627851256};
     constexpr Sequence seed12345 {1052984060, 1639322404, 1971525204, 2097956667, 2012147915};
     constexpr std::array<Sequence, 5> seed42ByType {{

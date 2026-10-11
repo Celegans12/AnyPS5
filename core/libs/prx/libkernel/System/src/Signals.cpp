@@ -165,8 +165,7 @@ thread_local GuestStack alternateStack{nullptr, 0, SsDisable};
 extern "C" {
 GuestHandler APS5_VABI signal_nid_postfix(int guest, GuestHandler handler) {
     const auto invalid = reinterpret_cast<GuestHandler>(static_cast<std::uintptr_t>(-1));
-    const int native = NativeSignal(guest);
-    if (!native || handler == invalid) { *__error_nid_postfix() = 22; return invalid; }
+    if (guest < 1 || guest > MaxSignal || ((guest == GuestSigkill || guest == GuestSigstop) && handler != nullptr)) { *__error_nid_postfix() = 22; return invalid; }
     std::lock_guard lock(registration);
     const GuestSigaction action{reinterpret_cast<std::uintptr_t>(handler), SaRestart, {}};
     if (!Install(guest, action)) { *__error_nid_postfix() = 22; return invalid; }
@@ -249,6 +248,14 @@ int APS5_VABI sigprocmask_nid_postfix(int how, const void* set, void* previousSe
 int APS5_VABI pthread_sigmask_nid_postfix(int how, const GuestSignalSet* set, GuestSignalSet* previousSet) {
     if (set != nullptr && (how < 1 || how > 3)) return 22;
     return _sigprocmask_nid_postfix(how, set, previousSet);
+}
+
+int APS5_VABI sigtimedwait_nid_postfix(const GuestSignalSet* set, void* info, const void* timeout) {
+    (void)set;
+    (void)info;
+    (void)timeout;
+    NotImplemented_nid_no_patch("sigtimedwait: waiting for a pending signal");
+    return -1;
 }
 }
 

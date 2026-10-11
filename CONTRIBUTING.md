@@ -50,9 +50,10 @@ python3 tools/check_conventions.py --base origin/main
 The [pull request template](.github/pull_request_template.md) is the checklist for these rules.
 
 - One branch per topic, based on current `main`. Follow-up work goes in a new pull request, not into an open one.
+- Open pull requests per author are limited by how many of theirs are merged into `main`: 1 with none merged, 20 with at least 1, no limit from 20. A pull request opened or reopened over the limit is closed automatically; reopen it once another one is merged or closed.
 - Before starting, check that no open pull request already implements the same functions.
 - Keep the branch up to date with `main` and resolve conflicts yourself; rebasing and force-pushing is fine.
-- If a pull request needs another one first, say so in the description (`Depends on #N`).
+- If a pull request needs another one first, say so on the checklist line (`Depends on: #N`; `none` otherwise).
 - Run the tests before opening the pull request and describe what was tested (OS, title or homebrew).
 - Investigation notes, reports, screenshots and logs go in the pull request, not in the repository. Images for documentation go in the [gist](https://gist.github.com/boykopovar/0e53f2e1426f29ecd41e3b51540b8a90) comments.
 - Say whether the change was written with AI assistance. The author of the pull request is responsible for every line of it.

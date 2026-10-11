@@ -16,6 +16,23 @@ struct alignas(16) __m128 { float v[4]; };
 
 using Bool = std::uint8_t;
 
+struct SonyLconv {
+    char* monetary[7];
+    char chars[14];
+    char pad[2];
+    char* decimal_point;
+    char* grouping;
+    char* thousands_sep;
+    char* frac_grouping;
+    char* frac_sep;
+    char* false_text;
+    char* true_text;
+    char* no_text;
+    char* yes_text;
+};
+static_assert(offsetof(SonyLconv, decimal_point) == 0x48);
+static_assert(sizeof(SonyLconv) == 0x90);
+
 using KernelModule = std::int32_t;
 using KernelCpumask = std::uint64_t;
 using KernelUseconds = unsigned int;

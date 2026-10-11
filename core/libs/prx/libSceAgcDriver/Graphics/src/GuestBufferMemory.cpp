@@ -159,6 +159,10 @@ struct HostImports {
     VkDevice watchDevice = VK_NULL_HANDLE;
     bool unwatchImports = false;
     bool unwatchDmaBufImports = false;
+    // Whether making an import of each kind was seen to stamp the imported pages (the probe's
+    // writtenAtImport): its import window then stamps a range the import leaves watched.
+    bool importsStampPages = true;
+    bool dmaBufImportsStampPages = true;
 };
 
 HostImports& Imports() {
@@ -484,14 +488,21 @@ void decideImportWatch(const Context& context, HostImports& state) {
     state.watchDevice = context.device;
     state.unwatchImports = true;
     state.unwatchDmaBufImports = false;
+    state.importsStampPages = false;
+    state.dmaBufImportsStampPages = false;
     if (context.hostImportAlignment != 0 && GuestMemory::WriteWatched()) std::fprintf(stderr, "[write-watch] Windows direct host imports use comparisons; separate shared aliases retain guest write tracking\n");
 #else
     const auto request = importWatchRequest();
     state.watchDevice = context.device;
     state.unwatchImports = false;
     state.unwatchDmaBufImports = false;
+    state.importsStampPages = false;
+    state.dmaBufImportsStampPages = false;
     if (context.hostImportAlignment == 0 || !GuestMemory::WriteWatched()) return;
     if (request == ImportWatchRequest::Watch) {
+        // Not probed: whether an import stamps its pages is unknown.
+        state.importsStampPages = true;
+        state.dmaBufImportsStampPages = true;
         std::fprintf(stderr, "[write-watch] host imports stay watched (APS5_WRITE_WATCH_IMPORTS=watch)\n");
         return;
     }
@@ -507,9 +518,11 @@ void decideImportWatch(const Context& context, HostImports& state) {
         std::fprintf(stderr, "[write-watch] host imports resolve write protection: unknown (probe failed at %s, %d); imported ranges are compared\n", probe.failure, static_cast<int>(probe.result));
     } else {
         state.unwatchImports = probe.writtenAfterSubmit != 0 || probe.writtenAfterFill != 0;
+        state.importsStampPages = probe.writtenAtImport != 0;
         std::fprintf(stderr, "[write-watch] host imports resolve write protection: %s (%u of %u scratch pages written after a GPU read, %u after a GPU write, %u after the import); imported ranges %s\n", state.unwatchImports ? "yes" : "no", probe.writtenAfterSubmit, probe.pages, probe.writtenAfterFill, probe.writtenAtImport, state.unwatchImports ? "are compared" : "stay watched");
     }
     state.unwatchDmaBufImports = state.unwatchImports;
+    state.dmaBufImportsStampPages = state.importsStampPages;
     if (!context.dmaBufImport) return;
     const auto dmaBuf = ProbeDmaBufImportWriteProtection(context);
     if (dmaBuf.failure != nullptr) {
@@ -518,6 +531,7 @@ void decideImportWatch(const Context& context, HostImports& state) {
         return;
     }
     state.unwatchDmaBufImports = dmaBuf.writtenAfterSubmit != 0 || dmaBuf.writtenAfterFill != 0 || dmaBuf.writtenByCpu == 0;
+    state.dmaBufImportsStampPages = dmaBuf.writtenAtImport != 0;
     std::fprintf(stderr, "[write-watch] dma-buf imports keep write protection: %s (%u of %u scratch pages written after a GPU read, %u after a GPU write, %u after the import, %u seen after a CPU store); imported ranges %s\n", state.unwatchDmaBufImports ? "no" : "yes", dmaBuf.writtenAfterSubmit, dmaBuf.pages, dmaBuf.writtenAfterFill, dmaBuf.writtenAtImport, dmaBuf.writtenByCpu, state.unwatchDmaBufImports ? "are compared" : "stay watched");
 #endif
 }
@@ -557,13 +571,28 @@ std::size_t leasedIndexContaining(const GuestAllocations::Lease& lease, std::uin
     return range.readable && address < range.address + range.bytes ? index : lease.size();
 }
 
+std::atomic<std::uint64_t> importWindow{0};
+
 ImportRun importRun(const GuestAllocations::Lease& lease, std::uint64_t address) {
     const auto index = leasedIndexContaining(lease, address);
     if (index == lease.size()) return {};
+    const auto& containing = *lease[index];
+    std::uint64_t low = 0;
+    std::uint64_t high = std::numeric_limits<std::uint64_t>::max();
+    const auto window = importWindow.load(std::memory_order_relaxed);
+    if (window != 0) {
+        low = address / window * window;
+        high = low + window;
+        if (containing.address < low || containing.address + containing.bytes > high) {
+            low = containing.address;
+            high = containing.address + containing.bytes;
+        }
+    }
     auto first = index;
-    while (first > 0 && continuesRun(*lease[first - 1], *lease[first])) --first;
+    while (first > 0 && lease[first - 1]->address >= low && continuesRun(*lease[first - 1], *lease[first])) --first;
     auto last = index;
-    while (last + 1 < lease.size() && continuesRun(*lease[last], *lease[last + 1])) ++last;
+    while (last + 1 < lease.size() && lease[last + 1]->address + lease[last + 1]->bytes <= high && continuesRun(*lease[last], *lease[last + 1])) ++last;
+    if (window != 0 && (lease[first]->address != low || lease[last]->address + lease[last]->bytes != high)) first = last = index;
     if (first != last && Imports().unaliasedSpans.contains(lease[first]->address)) return {lease[index]->address, lease[index]->bytes, {lease[index]}};
     ImportRun run{lease[first]->address, lease[last]->address + lease[last]->bytes - lease[first]->address, {}};
     run.ranges.assign(lease.begin() + static_cast<std::ptrdiff_t>(first), lease.begin() + static_cast<std::ptrdiff_t>(last) + 1);
@@ -1899,12 +1928,37 @@ ImportWatch PrepareImportWatch(const Context& context) {
     return state.unwatchImports ? ImportWatch::Unwatch : ImportWatch::Watch;
 }
 
+namespace {
+
+bool stampsWatchedPages(const HostImports& state) {
+    return (!state.unwatchImports && state.importsStampPages) || (!state.unwatchDmaBufImports && state.dmaBufImportsStampPages);
+}
+
+}
+
+bool WatchedImportsStampPages(const Context& context) {
+    auto& state = Imports();
+    std::lock_guard lock(state.mutex);
+    decideImportWatch(context, state);
+    return stampsWatchedPages(state);
+}
+
+bool WatchedImportsStampPages() {
+    auto& state = Imports();
+    std::lock_guard lock(state.mutex);
+    return state.watchDevice == VK_NULL_HANDLE || stampsWatchedPages(state);
+}
+
 void SetImportWatch(const Context& context, ImportWatch watch) {
     auto& state = Imports();
     std::lock_guard lock(state.mutex);
     state.watchDevice = context.device;
     state.unwatchImports = watch == ImportWatch::Unwatch;
     state.unwatchDmaBufImports = state.unwatchImports;
+}
+
+void SetHostImportWindow(std::uint64_t bytes) {
+    importWindow.store(bytes, std::memory_order_relaxed);
 }
 
 const HostImport* HostImportFor(const Context& context, std::uint64_t address, std::size_t bytes) {
