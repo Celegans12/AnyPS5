@@ -7,18 +7,24 @@
 #include "Optimization/ResourceProgram.hpp"
 #include "Recompiler.hpp"
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
+#include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 
 #if ANYPS5_ENABLE_SPIRV_TOOLS
 #include "spirv-tools/libspirv.hpp"
 #endif
 
+#include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <exception>
+#include <filesystem>
 #include <fstream>
+#include <memory>
 #include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -47,6 +53,62 @@ bool g_graph = false;
 bool g_maintenance8 = false;
 bool g_code = false;
 bool g_prepareOnly = false;
+bool g_pipelineOnly = false;
+std::string g_expectedSpirv;
+
+void ConfigurePipelineReplay(int argc, char** argv) {
+    std::string cache;
+    bool prepare = false;
+    bool maintenance = false;
+    for (int i = 1; i < argc; ++i) {
+        const std::string option(argv[i]);
+        if (option == "--pipeline-only") g_pipelineOnly = true;
+        if (option == "--prepare-only") prepare = true;
+        if (option == "--maintenance8") maintenance = true;
+        if (option == "--expect-spv") {
+            if (!g_expectedSpirv.empty() || i + 1 == argc || std::string(argv[i + 1]).starts_with("--")) throw std::runtime_error("--expect-spv requires one reference file");
+            g_expectedSpirv = argv[++i];
+            if (g_expectedSpirv.empty()) throw std::runtime_error("--expect-spv file is empty");
+        }
+        if (option == "--pipeline-cache") {
+            if (!cache.empty() || i + 1 == argc || std::string(argv[i + 1]).starts_with("--")) throw std::runtime_error("--pipeline-cache requires one explicit directory");
+            cache = argv[++i];
+            if (cache.empty()) throw std::runtime_error("--pipeline-cache directory is empty");
+        }
+    }
+    if (!g_pipelineOnly) {
+        if (!cache.empty() || !g_expectedSpirv.empty()) throw std::runtime_error("--pipeline-cache and --expect-spv require --pipeline-only");
+        return;
+    }
+    if (prepare || maintenance) throw std::runtime_error("--pipeline-only cannot be combined with --prepare-only or --maintenance8");
+    if (cache.empty()) throw std::runtime_error("--pipeline-only requires --pipeline-cache");
+    if (g_expectedSpirv.empty()) throw std::runtime_error("--pipeline-only requires --expect-spv");
+    if (std::getenv("ANYPS5_NO_SHADER_CACHE") != nullptr) throw std::runtime_error("--pipeline-only requires ANYPS5_NO_SHADER_CACHE to be unset");
+    const std::filesystem::path directory(cache);
+    if (!directory.is_absolute() || !std::filesystem::is_directory(directory)) throw std::runtime_error("--pipeline-cache must be an existing absolute private directory");
+    const auto* driverCache = std::getenv("__GL_SHADER_DISK_CACHE_PATH");
+    if (driverCache == nullptr || *driverCache == '\0') throw std::runtime_error("--pipeline-only requires an explicit fresh __GL_SHADER_DISK_CACHE_PATH");
+    const std::filesystem::path driverDirectory(driverCache);
+    if (!driverDirectory.is_absolute() || !std::filesystem::is_directory(driverDirectory) || !std::filesystem::is_empty(driverDirectory) || std::filesystem::equivalent(directory, driverDirectory)) throw std::runtime_error("__GL_SHADER_DISK_CACHE_PATH must be a separate existing absolute empty directory");
+    const auto selected = std::filesystem::canonical(directory).string();
+#ifdef _WIN32
+    const auto error = _putenv_s("ANYPS5_SHADER_CACHE_DIR", selected.c_str());
+#else
+    const auto error = setenv("ANYPS5_SHADER_CACHE_DIR", selected.c_str(), 1);
+#endif
+    if (error != 0) throw std::runtime_error("could not select the private pipeline cache directory");
+    std::printf("pipeline-only cache: %s\nNVIDIA cache: %s\n", selected.c_str(), driverDirectory.string().c_str());
+}
+
+void CheckExpectedSpirv(std::span<const std::uint32_t> words) {
+    std::ifstream file(g_expectedSpirv, std::ios::binary | std::ios::ate);
+    if (!file || file.tellg() != static_cast<std::streamoff>(words.size_bytes())) throw std::runtime_error("pipeline-only expected SPIR-V file is unreadable or has a different size");
+    file.seekg(0);
+    std::vector<std::uint32_t> expected(words.size());
+    file.read(reinterpret_cast<char*>(expected.data()), static_cast<std::streamsize>(words.size_bytes()));
+    if (!file || !std::equal(words.begin(), words.end(), expected.begin())) throw std::runtime_error("pipeline-only SPIR-V differs from the expected ordinary replay");
+    std::printf("  expected SPIR-V matches: %zu bytes\n", words.size_bytes());
+}
 
 void InspectSpirv(const char* path, std::span<const std::uint32_t> words) {
     if (g_spirv) {
@@ -67,8 +129,11 @@ void InspectSpirv(const char* path, std::span<const std::uint32_t> words) {
 #endif
 }
 
-bool Replay(const char* path) {
+bool Replay(const char* path, std::unique_ptr<AgcDriver::VulkanDevice>& device) {
     auto request = ShaderRecompiler::RequestSerializer{}.Deserialize(ReadText(path));
+    if (g_pipelineOnly) {
+        if (request.request.shader.stage != ShaderRecompiler::ShaderStage::Compute || !request.request.context.compute.has_value() || request.request.graphics.has_value()) throw std::runtime_error("pipeline-only requires a compute request");
+    }
     std::printf("%s: %zu code words, %zu user data, %zu memory regions, wave%u\n", path, request.request.shader.code.size(), request.request.context.userData.size(), request.request.context.memory.size(), request.request.context.waveSize);
     if (request.request.context.compute.has_value()) {
         const auto& compute = *request.request.context.compute;
@@ -152,7 +217,20 @@ bool Replay(const char* path) {
         }
         const auto result = ShaderRecompiler::Recompile(request.request);
         std::printf("  recompiled: %zu SPIR-V words\n", result.spirv.size());
+        if (g_pipelineOnly) CheckExpectedSpirv(result.spirv);
         InspectSpirv(path, result.spirv);
+        if (g_pipelineOnly) {
+            if (!device) device = std::make_unique<AgcDriver::VulkanDevice>();
+            auto nativeRequest = request.request;
+            nativeRequest.target = device->ComputeTarget(request.request.context.waveSize);
+            const ShaderRecompiler::RequestSerializer serializer;
+            if (serializer.Serialize(request.request) != serializer.Serialize(nativeRequest)) throw std::runtime_error("pipeline-only captured target differs from the native compute target");
+            std::printf("  pipeline-only device: %s; all serialized compute target fields match (graphics-only fixedPushSlots is not captured)\n", device->DeviceName().c_str());
+            std::printf("  native pipeline begin: %zu SPIR-V words; no dispatch\n", result.spirv.size());
+            std::fflush(stdout);
+            const auto elapsed = device->WarmComputePipeline(result, request.request.shader.codeAddress);
+            std::printf("  native pipeline complete: %.3f ms; no guest resources or dispatch\n", elapsed);
+        }
         if (g_memory) {
             for (const auto& binding : result.bindings) {
                 if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
@@ -165,7 +243,7 @@ bool Replay(const char* path) {
         }
         return true;
     } catch (const std::exception& error) {
-        std::printf("  %s failed: %s\n", g_prepareOnly ? "preparation" : "recompile", FirstLine(error.what()).c_str());
+        std::printf("  %s failed: %s\n", g_pipelineOnly ? "pipeline replay" : g_prepareOnly ? "preparation" : "recompile", FirstLine(error.what()).c_str());
         return false;
     }
 }
@@ -174,11 +252,23 @@ bool Replay(const char* path) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] [--code] [--maintenance8] [--prepare-only] <shader.req>...\n  --prepare-only plans and compiles without materializing runtime memory\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set\n");
+        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] [--code] [--maintenance8] [--prepare-only | --pipeline-only --pipeline-cache DIR --expect-spv FILE] <shader.req>...\n  --prepare-only plans and compiles without materializing runtime memory\n  --pipeline-only recompiles captured compute inputs and creates the native pipeline without guest resources or dispatch\n  --pipeline-cache selects an existing private cache directory; __GL_SHADER_DISK_CACHE_PATH must select a separate fresh empty directory\n  --expect-spv requires byte equality with an ordinary replay before device creation\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set\n");
         return 2;
     }
+    try {
+        ConfigurePipelineReplay(argc, argv);
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "%s\n", error.what());
+        return 2;
+    }
+    std::unique_ptr<AgcDriver::VulkanDevice> device;
     int failures = 0;
     for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--pipeline-only") continue;
+        if (std::string(argv[i]) == "--pipeline-cache" || std::string(argv[i]) == "--expect-spv") {
+            ++i;
+            continue;
+        }
         if (std::string(argv[i]) == "--prepare-only") {
             g_prepareOnly = true;
             continue;
@@ -212,7 +302,7 @@ int main(int argc, char** argv) {
             continue;
         }
         try {
-            if (!Replay(argv[i])) ++failures;
+            if (!Replay(argv[i], device)) ++failures;
         } catch (const std::exception& error) {
             std::printf("%s: could not load request: %s\n", argv[i], FirstLine(error.what()).c_str());
             ++failures;

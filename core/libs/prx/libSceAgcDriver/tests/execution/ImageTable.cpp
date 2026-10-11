@@ -71,6 +71,7 @@ alignas(256) std::array<std::uint32_t, 32> Srt{};
 constexpr std::uint32_t PaletteOffset = 0x40;
 constexpr std::uint32_t PaletteBytes = PaletteOffset + 256u * 32u;
 std::vector<std::uint32_t> Root(0x100000u);
+bool pipelineOnly = false;
 
 alignas(256) constexpr std::array<std::uint32_t, 28> TableCode{
     0xf4080100u, 0xfa000000u, 0xf4080200u, 0xfa000010u, 0xf4080700u, 0xfa000020u, 0x8f108202u, 0xf4200444u,
@@ -328,6 +329,9 @@ struct Outcome {
     std::uint64_t variantId = 0;
     std::uint64_t artifactId = 0;
     std::uint32_t imageTableCount = 0;
+    bool imageTableBinding = false;
+    bool sampledTableBinding = false;
+    bool storageTableBinding = false;
     std::uint32_t imageTableFaults = 0;
     std::uint32_t poisonedSrtReads = 0;
     bool cacheable = false;
@@ -372,9 +376,45 @@ Outcome Execute(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> 
     outcome.cacheable = AgcDriver::DriverDetail::CacheableResult(result);
     outcome.imageTableReadRanges = result.imageTableReadRanges;
     for (const auto& binding : result.bindings) {
-        if (binding.role == ShaderRecompiler::DescriptorRole::ImageTable) outcome.imageTableCount = binding.count;
+        if (binding.role == ShaderRecompiler::DescriptorRole::ImageTable) {
+            outcome.imageTableCount = binding.count;
+            outcome.imageTableBinding = true;
+            outcome.sampledTableBinding = outcome.sampledTableBinding || binding.kind == ShaderRecompiler::DescriptorKind::SampledImage;
+            outcome.storageTableBinding = outcome.storageTableBinding || binding.kind == ShaderRecompiler::DescriptorKind::StorageImage;
+        }
         if (binding.role == ShaderRecompiler::DescriptorRole::GuestSamplers) outcome.samplers = SamplerWords(binding.guestDescriptor);
         if (binding.role == ShaderRecompiler::DescriptorRole::SamplerTable) outcome.samplerTable = SamplerWords(binding.guestDescriptor);
+    }
+    if (pipelineOnly) {
+        static bool checkedRefusals = false;
+        if (!checkedRefusals) {
+            const auto refuse = [&](ShaderRecompiler::DescriptorKind kind, std::uint32_t count, const char* expected) {
+                auto invalid = result;
+                invalid.bindings = {{kind, ShaderRecompiler::DescriptorRole::GuestBuffers, 0, 0, count, {}}};
+                std::string reason;
+                try { static_cast<void>(device.WarmComputePipeline(invalid)); }
+                catch (const std::exception& error) { reason = error.what(); }
+                Require(reason == expected, "pipeline-only: wrong planner refusal: " + reason);
+            };
+            refuse(ShaderRecompiler::DescriptorKind::Sampler, 1u, "AGC graphics: pipeline-only: unsupported descriptor layout");
+            refuse(ShaderRecompiler::DescriptorKind::StorageBuffer, UINT32_MAX, "AGC graphics: pipeline-only: update-after-bind layout is unsupported");
+            checkedRefusals = true;
+        }
+        if (outcome.sampledTableBinding && outcome.storageTableBinding) {
+            auto invalid = result;
+            for (auto& binding : invalid.bindings) if (binding.role == ShaderRecompiler::DescriptorRole::ImageTable && binding.kind == ShaderRecompiler::DescriptorKind::StorageImage) ++binding.count;
+            std::string reason;
+            try { static_cast<void>(device.WarmComputePipeline(invalid)); }
+            catch (const std::exception& error) { reason = error.what(); }
+            Require(reason == "AGC graphics: pipeline-only: sampled and storage image tables disagree on their element domain", "pipeline-only: mismatched table domains were not refused: " + reason);
+        }
+        const auto savedTable = Table;
+        const auto savedHalf = StoreHalfTexels;
+        const auto savedUint = UintTexels;
+        const auto elapsed = device.WarmComputePipeline(result, reinterpret_cast<std::uintptr_t>(span.data()), true);
+        Require(elapsed >= 0, "pipeline-only: invalid elapsed time");
+        Require(std::all_of(Output.begin(), Output.end(), [](std::uint32_t value) { return value == 0xdeadbeefu; }), "pipeline-only: warming wrote guest output");
+        Require(Table == savedTable && StoreHalfTexels == savedHalf && UintTexels == savedUint, "pipeline-only: warming changed a guest descriptor or storage image");
     }
     StderrCapture capture;
     try {
@@ -648,6 +688,42 @@ void RunAnisoOverrideTests(AgcDriver::VulkanDevice& device) {
             Require(std::all_of(cut.words.begin(), cut.words.end(), [](std::uint32_t word) { return word == 0xdeadbeefu; }), "image table ANISO_OVERRIDE: EXEC-clear sampling wrote output");
         }
     }
+}
+
+void RunStoreTests(AgcDriver::VulkanDevice& device);
+
+void RunPipelineOnlyTests(AgcDriver::VulkanDevice& device) {
+    Fill();
+    SetClassRecords();
+    const auto direct = [&](std::uint32_t group) {
+        const auto* words = Table.data() + group * (Stride / 4u);
+        return RunDirect(device, {words[0], words[1], words[2], words[3]}, {words[4], words[5], words[6], words[7]});
+    };
+    const std::array<Outcome, 3> baseline{direct(0), direct(1), direct(2)};
+    for (const auto& control : baseline) Require(!Faulted(control), "pipeline-only: direct control faulted");
+    RequireRed(baseline[0], 0, Lanes, [](std::uint32_t x) { return std::bit_cast<std::uint32_t>(FloatTexels[x]); }, "pipeline-only float control");
+    RequireRed(baseline[1], 0, Lanes, [](std::uint32_t x) { return UintTexels[x]; }, "pipeline-only uint control");
+    RequireRed(baseline[2], 0, Lanes, [](std::uint32_t x) { return static_cast<std::uint32_t>(SintTexels[x]); }, "pipeline-only sint control");
+    pipelineOnly = true;
+    Keys = {};
+    for (std::uint32_t group = 0; group < 3u; ++group) Keys[group] = group;
+    const auto table = Run(device, TableCode, 3, Lanes, 64);
+    Require(table.imageTableCount == 3u && !Faulted(table), "pipeline-only: typed image table did not bind all three classes");
+    for (std::uint32_t group = 0; group < 3u; ++group) {
+        Require(Group(table, group) == Group(baseline[group], 0), "pipeline-only: table dispatch changed a typed result");
+        const auto warmed = direct(group);
+        Require(!Faulted(warmed) && Group(warmed, 0) == Group(baseline[group], 0), "pipeline-only: direct dispatch changed a typed result");
+    }
+    for (std::uint32_t record = 0; record < Records; ++record) SetRecord(record, PointClamp, {});
+    const auto nullTable = Run(device, TableCode, 3, Lanes, 64);
+    Require(nullTable.imageTableBinding && nullTable.imageTableCount == 0u && !Faulted(nullTable), "pipeline-only: all-null table did not retain its zero-element binding");
+    Require(std::all_of(nullTable.words.begin(), nullTable.words.end(), [](std::uint32_t word) { return word == 0u; }), "pipeline-only: all-null table did not sample exact zeros");
+    RunStoreTests(device);
+    for (std::uint32_t record = 0; record < Records; ++record) SetWideRecord(record, {});
+    const auto nullStorage = Run(device, StoreTableCode, 1, Lanes, 64);
+    Require(nullStorage.storageTableBinding && !nullStorage.sampledTableBinding && nullStorage.imageTableCount == 0u && !Faulted(nullStorage), "pipeline-only: all-null storage table did not retain its zero-element binding");
+    pipelineOnly = false;
+    std::puts("pipeline-only: typed heaps, sampled/storage/mixed tables, zero-element tables, layout parity, sentinels, and planner refusals passed");
 }
 
 void RunTests(AgcDriver::VulkanDevice& device) {
@@ -938,6 +1014,7 @@ void RunStoreTests(AgcDriver::VulkanDevice& device) {
     Keys[0] = 0u;
     Keys[1] = 1u;
     const auto stored = Run(device, StoreTableCode, 2, Lanes, 64);
+    if (pipelineOnly) Require(stored.storageTableBinding && !stored.sampledTableBinding && stored.imageTableCount != 0u, "pipeline-only: the store did not use a storage-only table layout");
     Require(!Faulted(stored), "image table store: an active 2D D16 store faulted:\n" + stored.log);
     flush();
     for (std::uint32_t index = 0; index < StoreHalfTexels.size(); ++index) {
@@ -959,6 +1036,7 @@ void RunStoreTests(AgcDriver::VulkanDevice& device) {
     mixedCode[18] = 0x00080401u;
     std::copy(ReadTable256Code.begin() + 16u, ReadTable256Code.end(), mixedCode.begin() + 19u);
     const auto mixed = Run(device, mixedCode, 1, Lanes, 64);
+    if (pipelineOnly) Require(mixed.storageTableBinding && mixed.sampledTableBinding && mixed.imageTableCount != 0u, "pipeline-only: the mixed shader did not use both table classes");
     Require(!Faulted(mixed), "image table store: mixed sampled/storage bindings faulted:\n" + mixed.log);
     RequireRed(mixed, 0u, Lanes, [](std::uint32_t) { return std::bit_cast<std::uint32_t>(2.5f); }, "image table store: sampled alias did not read the prior store");
     flush();
@@ -1485,6 +1563,10 @@ int main(int argc, char** argv) {
 #endif
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
+        if (argc == 2 && std::string_view(argv[1]) == "--pipeline-only") {
+            RunPipelineOnlyTests(*device);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--stores") {
             RunStoreTests(*device);
             return 0;

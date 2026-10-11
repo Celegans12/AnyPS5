@@ -26,6 +26,7 @@ struct PreparedDispatch;
 struct RecipeHit;
 // The record tail shared by an ordinary dispatch and a recipe hit (VulkanDevice::recordDispatch).
 struct RecordedDispatch;
+class PerformanceTimer;
 
 class VulkanDevice {
 public:
@@ -224,6 +225,7 @@ public:
     // APS5_PROFILE_DRAW: the parts of a PrepareDispatch in milliseconds, in the order key, find,
     // precollect, presync, stage A (the driver's 'prepare:' rows).
     static std::span<const double, 5> PreparePhaseMs(const PreparedDispatch& prepared);
+    double WarmComputePipeline(const ShaderRecompiler::RecompileResult& shader, std::uint64_t programAddress = 0, bool verifyDispatchLayout = false);
     // `recipe`, when given, receives the Recipe a successful call built for its dispatch-cache
     // variant (design_cpu_final M4): only when the resource cache served or took the object
     // (reusable, cacheable) and recipes are on (APS5_NO_DISPATCH_RECIPE=1 builds none); else null.
@@ -296,6 +298,7 @@ private:
     Graphics::Context graphicsContext() const;
     ShaderRecompiler::SpirvTarget buildTarget() const;
     Graphics::Context buildContext() const;
+    std::shared_ptr<ComputePipelineObjects> createComputePipeline(const ShaderRecompiler::RecompileResult& shader, const Graphics::Context& context, VkDescriptorSetLayout setLayout, bool pushes, std::uint64_t programAddress, PerformanceTimer* timing);
     // Body of Dispatch and DispatchIndirect: `arguments` 0 dispatches x, y, z groups.
     IndirectOutcome dispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t programAddress, std::shared_ptr<PreparedDispatch> prepared, std::shared_ptr<const Recipe>* recipe);
     // The stage-A pre-sync over `surfaces` (see PrepareDispatch): the serial waited for, 0 none.
