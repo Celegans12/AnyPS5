@@ -1097,8 +1097,12 @@ void verifyImageTableRegistration() {
         auto unsupportedCode = storeCode;
         unsupportedCode[8] = (unsupportedCode[8] & ~(0x7fu << 18u)) | (opcode << 18u);
         if (opcode == 0x0fu) unsupportedCode[8] = (unsupportedCode[8] & ~0xf00u) | 0x100u;
+        if (opcode == 0x52u) {
+            expectFailure([&] { static_cast<void>(CompileTable(TableRequest(unsupportedCode, userData))); }, "MIMG BY2/BY4 stores are not implemented", "image table registration: a BY store passed translation");
+            continue;
+        }
         const auto unsupported = CompileTable(TableRequest(unsupportedCode, userData));
-        require(unsupported.capture->plan->info.images.at(0).tableOperation == TableOperation::Unsupported, "image table registration: packed, atomic or BY stores were admitted");
+        require(unsupported.capture->plan->info.images.at(0).tableOperation == TableOperation::Unsupported, "image table registration: packed or atomic stores were admitted");
         const auto fault = TableMap(*unsupported.result)[Abi::TableHeader(0) + Abi::TableFault];
         require((fault & Abi::PoisonFlag) != 0u && unsupported.result->imageTablePoison.at(fault & ~Abi::PoisonFlag).reason == static_cast<std::uint32_t>(Abi::PoisonReason::UnsupportedOperation), "image table registration: an unsupported store lost its whole-table fault");
         if (opcode != 0x0fu) {
