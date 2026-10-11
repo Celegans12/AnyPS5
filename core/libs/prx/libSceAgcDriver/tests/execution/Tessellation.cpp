@@ -64,6 +64,16 @@ alignas(256) constexpr std::array<std::uint32_t, 29> LocalIndexAsData{
     0x0000030a, 0xd8340010, 0x0000070a, 0xbf8cc07f, 0xbefd2106,
 };
 
+alignas(256) constexpr std::array<std::uint32_t, 50> HullDescendingRecords{
+    0xd7650000, 0x000100c1, 0xd7660000, 0x000200c1, 0xbf8a0000, 0x7da206f9, 0x81060000, 0xd5480014,
+    0x02151101, 0x362402ff, 0x000000ff, 0x160028a0, 0xd5430015, 0x040224ff, 0x00000060, 0xdbfc0000,
+    0x02000015, 0x162c2890, 0xd5430016, 0x045a24ff, 0x00000030, 0xbf8cc07f, 0xe0781000, 0x02020216,
+    0x7da82881, 0xbe94047e, 0xb06a0060, 0x162602f9, 0x0086066a, 0xd8d80008, 0x06000013, 0xd8dc1008,
+    0x07000013, 0xbf8cc07f, 0x7e300306, 0x7e320306, 0x7e340306, 0x7e360306, 0x34142484, 0xbefe0414,
+    0xe0781000, 0x0403180a, 0x4a162481, 0x161616ff, 0x000000d0, 0x4c1616ff, 0x00008000, 0xe0741000,
+    0x0202070b, 0xbf810000,
+};
+
 alignas(256) constexpr std::array<std::uint32_t, 46> HullUnguardedFactors{
     0xd7650000, 0x000100c1, 0xd7660000, 0x000200c1, 0xbf8a0000, 0x7da206f9, 0x81060000, 0xd5480014,
     0x02151101, 0x362402ff, 0x000000ff, 0x160028a0, 0xd5430015, 0x040224ff, 0x00000060, 0xdbfc0000,
@@ -273,24 +283,24 @@ std::uint32_t CoveredPixels(std::uint32_t patch, bool interior) {
     return count;
 }
 
-void RequirePatches(AgcDriver::VulkanDevice& device, const ShaderRecompiler::SpirvTarget& target, std::span<const std::uint32_t> hull, const std::string& program) {
+void RequirePatches(AgcDriver::VulkanDevice& device, const ShaderRecompiler::SpirvTarget& target, std::span<const std::uint32_t> hull, const std::string& program, const PatchDraw& patches = Triangles) {
     std::uint32_t cursor = 0;
     const Stages stages{
-        Compile(target, ShaderStage::Local, LocalCode, cursor),
-        Compile(target, ShaderStage::TessellationControl, hull, cursor),
-        Compile(target, ShaderStage::TessellationEvaluation, DomainCode, cursor),
-        Compile(target, ShaderStage::Fragment, PixelCode, cursor),
+        Compile(target, ShaderStage::Local, LocalCode, cursor, patches),
+        Compile(target, ShaderStage::TessellationControl, hull, cursor, patches),
+        Compile(target, ShaderStage::TessellationEvaluation, DomainCode, cursor, patches),
+        Compile(target, ShaderStage::Fragment, PixelCode, cursor, patches),
     };
     const auto center = Row(-0.5f + 1.0f / 3.0f);
     for (const auto cull : {VK_CULL_MODE_NONE, VK_CULL_MODE_BACK_BIT}) {
-        Draw(device, stages, cull, VK_FRONT_FACE_COUNTER_CLOCKWISE);
+        Draw(device, stages, cull, VK_FRONT_FACE_COUNTER_CLOCKWISE, patches);
         const std::string name = program + (cull == VK_CULL_MODE_NONE ? ", unculled" : ", back-face culled");
         Require(CoveredPixels(0, false) > 100 && CoveredPixels(0, true) == 0, name + ": the level-1 patch was not drawn as one flat triangle, centre " + PixelText(PixelAt(Column(0, 0.25f), center)));
         Require(CoveredPixels(1, false) == 0, name + ": the patch with level 0 was not culled");
         Require(CoveredPixels(2, false) > 100 && PixelAt(Column(2, 0.25f), center)[1] > 32, name + ": the level-5 patch has no interior domain points at its centre, " + PixelText(PixelAt(Column(2, 0.25f), center)));
         Require(PixelAt(0, 0) == Background && PixelAt(Width - 1, Height - 1) == Background, name + ": the corners changed");
     }
-    Draw(device, stages, VK_CULL_MODE_BACK_BIT, VK_FRONT_FACE_CLOCKWISE);
+    Draw(device, stages, VK_CULL_MODE_BACK_BIT, VK_FRONT_FACE_CLOCKWISE, patches);
     Require(CoveredPixels(0, false) == 0 && CoveredPixels(2, false) == 0, program + ": tessellated triangles did not keep the control points' winding");
 }
 
@@ -415,9 +425,12 @@ int main() {
         ExpectRefusal(target, ShaderStage::TessellationEvaluation, DomainCulledPrimitive, "passthrough primitive");
         ExpectRefusal(target, ShaderStage::Local, LocalIndexAsData, "outside a tessellation ring or LDS address");
         ExpectRefusal(target, ShaderStage::TessellationControl, HullCode, "outside its patch's quad factors", {{3u, 3u, 2u, 2u, 2u}, Indices});
+        ExpectRefusal(target, ShaderStage::TessellationControl, HullDescendingRecords, "not affine");
+        ExpectRefusal(target, ShaderStage::TessellationControl, HullDescendingRecords, "not affine", {{3u, 3u, 1u, 2u, 2u, 1.0f, 64.0f, 158u}, Indices});
 
         RequirePatches(*device, target, HullCode, "hull program");
         RequirePatches(*device, target, HullRestoredExecSaved, "hull program saving its restored exec");
+        RequirePatches(*device, target, HullDescendingRecords, "hull program with descending patch records in 157-patch groups", {{3u, 3u, 1u, 2u, 2u, 1.0f, 64.0f, 157u}, Indices});
         RequireCounterClockwise(*device, target);
         RequireLevelClamps(*device, target);
         RequireQuads(*device, target);

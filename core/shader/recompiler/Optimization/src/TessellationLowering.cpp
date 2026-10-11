@@ -16,7 +16,6 @@
 namespace ShaderRecompiler {
 namespace {
 
-constexpr std::int64_t PatchIndexCount = 256;
 constexpr std::int64_t LocalVertexIndexCount = 8192;
 constexpr std::int64_t TriangleFactorBytes = 16;
 constexpr std::int64_t QuadFactorBytes = 24;
@@ -352,7 +351,7 @@ std::uint32_t ComponentCount(IrOpcode opcode) {
 class Lowering {
 public:
     Lowering(IrProgram& program, const ShaderTessellationInputInfo& tessellation)
-        : program(program), tessellation(tessellation), stage(program.Resources().stage), evaluator(stage == IrShaderStage::TessellationControl ? tessellation.outputControlPoints : 0u, stage == IrShaderStage::Local ? LocalVertexIndexCount : PatchIndexCount) {}
+        : program(program), tessellation(tessellation), stage(program.Resources().stage), evaluator(stage == IrShaderStage::TessellationControl ? tessellation.outputControlPoints : 0u, stage == IrShaderStage::Local ? LocalVertexIndexCount : static_cast<std::int64_t>(tessellation.patchesPerGroup)) {}
 
     void Run() {
         for (IrBlock* block : program.BlockOrder()) {

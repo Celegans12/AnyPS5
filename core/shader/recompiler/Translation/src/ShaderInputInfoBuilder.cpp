@@ -180,6 +180,7 @@ ShaderStageInputInfo BuildShaderStageInputInfo(ShaderStageKind stage, const Gues
             if (tessellation->inputControlPoints == 0u || tessellation->inputControlPoints > 32u || tessellation->outputControlPoints == 0u || tessellation->outputControlPoints > 32u) throw std::runtime_error("ShaderInputInfoBuilder: invalid tessellation control-point counts");
             if ((tessellation->domain != 1u && tessellation->domain != 2u) || tessellation->partitioning != 2u || (tessellation->outputTopology != 2u && tessellation->outputTopology != 3u)) throw std::runtime_error("ShaderInputInfoBuilder: unsupported tessellation configuration");
             if (!(tessellation->minLevel >= 0.0f && tessellation->minLevel <= 63.0f && tessellation->minLevel <= tessellation->maxLevel && tessellation->maxLevel >= 1.0f && std::isfinite(tessellation->maxLevel))) throw std::runtime_error("ShaderInputInfoBuilder: unsupported tessellation level clamps");
+            if (tessellation->patchesPerGroup == 0u || tessellation->patchesPerGroup > 256u) throw std::runtime_error("ShaderInputInfoBuilder: invalid tessellation patches per group");
             auto& target = vertexStorage.tess;
             target.inputControlPoints = tessellation->inputControlPoints;
             target.outputControlPoints = tessellation->outputControlPoints;
@@ -188,6 +189,7 @@ ShaderStageInputInfo BuildShaderStageInputInfo(ShaderStageKind stage, const Gues
             target.outputTopology = tessellation->outputTopology;
             target.minLevel = tessellation->minLevel;
             target.maxLevel = tessellation->maxLevel;
+            target.patchesPerGroup = tessellation->patchesPerGroup;
         }
         if (stage == ShaderStageKind::Mesh) {
             if (mesh == nullptr) throw std::runtime_error("ShaderInputInfoBuilder: a mesh-stage program has no mesh configuration");

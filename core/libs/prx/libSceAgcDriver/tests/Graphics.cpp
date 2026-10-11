@@ -505,7 +505,7 @@ void ShaderStageTests() {
     }
     Require(stages.path == AgcDriver::Graphics::ShaderPath::Tessellation && stages.tessellation, "tessellation routing changed");
     const auto& tessellation = *stages.tessellation;
-    Require(tessellation.inputControlPoints == 3 && tessellation.outputControlPoints == 3 && tessellation.domain == 1 && tessellation.partitioning == 2 && tessellation.outputTopology == 2 && tessellation.minLevel == 1.0f && tessellation.maxLevel == 64.0f, "the passthrough triangle-patch configuration decoded differently");
+    Require(tessellation.inputControlPoints == 3 && tessellation.outputControlPoints == 3 && tessellation.domain == 1 && tessellation.partitioning == 2 && tessellation.outputTopology == 2 && tessellation.minLevel == 1.0f && tessellation.maxLevel == 64.0f && tessellation.patchesPerGroup == 85, "the passthrough triangle-patch configuration decoded differently");
     for (const auto [parameters, reason] : {std::pair{0x44049u, "VGT_TF_PARAM"}, std::pair{0x140049u, "VGT_TF_PARAM"}, std::pair{0x2040049u, "VGT_TF_PARAM"}, std::pair{0x40059u, "fractional-odd partitioning"}, std::pair{0x4004du, "fractional-odd partitioning"}, std::pair{0x40048u, "fractional-odd partitioning"}, std::pair{0x40029u, "fractional-odd partitioning"}, std::pair{0x4004bu, "fractional-odd partitioning"}}) {
         queue.context[0x2db] = parameters;
         expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, reason);
@@ -514,7 +514,7 @@ void ShaderStageTests() {
     queue.context[0x2db] = 0x4006a;
     queue.context[0x286] = 0x41100000;
     const auto quads = AgcDriver::Graphics::DecodeState(queue).stages.tessellation;
-    Require(quads && quads->inputControlPoints == 4 && quads->outputControlPoints == 4 && quads->domain == 2 && quads->partitioning == 2 && quads->outputTopology == 3 && quads->minLevel == 1.0f && quads->maxLevel == 9.0f, "counter-clockwise quad patches with HOS levels [1, 9] decoded differently");
+    Require(quads && quads->inputControlPoints == 4 && quads->outputControlPoints == 4 && quads->domain == 2 && quads->partitioning == 2 && quads->outputTopology == 3 && quads->minLevel == 1.0f && quads->maxLevel == 9.0f && quads->patchesPerGroup == 63, "counter-clockwise quad patches with HOS levels [1, 9] and 63 patches per group decoded differently");
     queue.context[0x2db] = 0x40069;
     Require(AgcDriver::Graphics::DecodeState(queue).stages.tessellation->outputTopology == 3, "counter-clockwise triangle patches decoded differently");
     for (const auto [maximum, minimum, reason] : {std::tuple{0x3f800000u, 0x40000000u, "tessellation level clamps"}, std::tuple{0x41100000u, 0xbf800000u, "tessellation level clamps"}, std::tuple{0x3f000000u, 0x00000000u, "tessellation level clamps"}, std::tuple{0x42800000u, 0x42800000u, "tessellation level clamps"}, std::tuple{0x7fc00000u, 0x3f800000u, "non-finite register"}, std::tuple{0x7f800000u, 0x3f800000u, "non-finite register"}}) {
@@ -531,6 +531,8 @@ void ShaderStageTests() {
     queue.context[0x2d5] = 0x0200210d;
     queue.context[0x2d6] = 0;
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "control-point counts");
+    queue.context[0x2d6] = 0xc300;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "NUM_PATCHES is zero");
     queue = makeState();
     for (const auto value : {0x2003u, 0x2018u, 0x20c0u, 0x80002000u}) {
         queue.context[0x2d5] = value;
