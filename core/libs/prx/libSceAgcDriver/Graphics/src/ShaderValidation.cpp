@@ -403,9 +403,12 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
         mode(spv::ExecutionModeOutputVertices, {state.rectList ? 4u : state.stages.tessellation->outputControlPoints});
         Require(module.modes.size() == 1, "unsupported tessellation-control execution mode");
     } else if (evaluation) {
-        mode(state.rectList ? spv::ExecutionModeQuads : spv::ExecutionModeTriangles, {});
+        Require(state.rectList || state.stages.tessellation.has_value(), "tessellation configuration is missing");
+        const bool quads = state.rectList || state.stages.tessellation->domain == 2u;
+        const bool counterClockwise = !state.rectList && state.stages.tessellation->outputTopology == 3u;
+        mode(quads ? spv::ExecutionModeQuads : spv::ExecutionModeTriangles, {});
         mode(state.rectList ? spv::ExecutionModeSpacingEqual : spv::ExecutionModeSpacingFractionalOdd, {});
-        mode(spv::ExecutionModeVertexOrderCw, {});
+        mode(counterClockwise ? spv::ExecutionModeVertexOrderCcw : spv::ExecutionModeVertexOrderCw, {});
         Require(module.modes.size() == 3, "unsupported tessellation-evaluation execution mode");
     } else if (geometry) {
         mode(spv::ExecutionModeTriangles, {});

@@ -4,6 +4,7 @@
 #include "Recompiler.hpp"
 #include "RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
+#include <bit>
 #include <cstdlib>
 #include <stdexcept>
 #include <type_traits>
@@ -106,6 +107,8 @@ private:
         append(key, tessellation != nullptr);
         if (tessellation == nullptr) return;
         for (const auto value : {tessellation->inputControlPoints, tessellation->outputControlPoints, tessellation->domain, tessellation->partitioning, tessellation->outputTopology}) append(key, value);
+        if (request.shader.stage != ShaderStage::TessellationControl) return;
+        for (const auto level : {tessellation->minLevel, tessellation->maxLevel}) append(key, std::bit_cast<std::uint32_t>(level));
     }
 
     template<typename TValue>

@@ -715,6 +715,8 @@ void pipelineKey(std::vector<std::byte>& key, const Context& context, const Stat
         append(key, tessellation.domain);
         append(key, tessellation.partitioning);
         append(key, tessellation.outputTopology);
+        append(key, tessellation.minLevel);
+        append(key, tessellation.maxLevel);
     }
 }
 

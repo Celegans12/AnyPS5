@@ -112,6 +112,8 @@ struct ShaderTessellationInputInfo {
     std::uint32_t domain = 0;
     std::uint32_t partitioning = 0;
     std::uint32_t outputTopology = 0;
+    float minLevel = 1.0f;
+    float maxLevel = 64.0f;
 };
 
 struct ShaderVertexInputInfo {
