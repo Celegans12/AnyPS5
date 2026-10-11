@@ -281,7 +281,7 @@ void MixedMarkPlane(AgcDriver::VulkanDevice& device, std::uint64_t address, cons
     std::copy(tablePlane.begin(), tablePlane.end(), table.begin() + 4);
     std::copy(plane.begin(), plane.end(), root.begin() + 16);
     auto code = MixedMarkCode;
-    if (conflictingTable) code[14] = 0xf0200108u;
+    if (conflictingTable) code[14] = 0xf0208108u;
     const auto putBuffer = [&](const void* data, std::uint32_t bytes, std::size_t offset) {
         auto words = BufferDescriptor(data, 0u, bytes);
         words[3] = 0x31016facu;
