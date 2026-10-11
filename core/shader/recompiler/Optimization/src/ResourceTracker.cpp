@@ -18,6 +18,7 @@
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -659,6 +660,9 @@ private:
                 }
             }
         }
+        if (SplitDescriptorWaterfall(inst, handles, handleCount)) {
+            return;
+        }
         if (phis.empty()) {
             return;
         }
@@ -729,12 +733,17 @@ private:
     }
 
     template <typename Dword>
-    void ReplaceWithArmCopies(IrValue& inst, const std::array<IrValue*, 2>& handles, const std::array<bool, 2>& split, std::uint32_t handleCount, std::span<IrValue* const> conditions, Dword&& dword) {
+    void ReplaceWithArmCopies(IrValue& inst, const std::array<IrValue*, 2>& handles, const std::array<bool, 2>& split, std::uint32_t handleCount, std::span<IrValue* const> conditions, Dword&& dword, IrValue* selector = nullptr) {
         std::vector<IrValue*> copies;
         const auto flags = inst.Flags<MemoryFlags>();
         const auto memory = m_program.Resources().memoryInfo.at(flags.index);
         for (std::uint32_t arm = 0; arm <= conditions.size(); arm++) {
             std::vector<IrValue*> arguments(inst.Arguments().begin(), inst.Arguments().end());
+            if (selector != nullptr) {
+                const std::array<IrValue*, 2> compare {selector, &m_builder.Constant(arm)};
+                const std::array<IrValue*, 2> active {arguments.back(), EmitBefore(inst, IrOpcode::IEqual32, IrType::Bool, compare)};
+                arguments.back() = EmitBefore(inst, IrOpcode::LogicalAnd, IrType::Bool, active);
+            }
             for (std::uint32_t slot = 0; slot < handleCount; slot++) {
                 if (!split[slot]) {
                     continue;
@@ -800,6 +809,12 @@ private:
         std::map<std::vector<IrValue*>, IrValue*> selectors;
         std::vector<std::pair<IrBlock*, IrValue*>> phis;
         std::unordered_map<IrValue*, IrValue*> resolved;
+        bool lifted = false;
+        struct Pending {
+            IrValue* before;
+            IrValue* value;
+        };
+        std::vector<Pending> pending;
     };
 
     IrValue* WebSelector(std::vector<IrValue*> tuple, DescriptorWeb& web, IrValue& position) {
@@ -818,8 +833,45 @@ private:
         if (const auto known = web.selectors.find(tuple); known != web.selectors.end()) {
             return known->second;
         }
+        if (web.lifted && web.selectors.size() == DescriptorWeb::maxStates) {
+            return nullptr;
+        }
         const auto phi = std::ranges::find_if(tuple, [](const IrValue* value) { return value->IsPhi(); });
         if (phi == tuple.end()) {
+            const auto select = std::ranges::find_if(tuple, [](const IrValue* value) { return value->Opcode() == IrOpcode::SelectU32; });
+            if (web.lifted && select != tuple.end()) {
+                IrBlock* block = (*select)->Parent();
+                if (block == nullptr || (*select)->ArgumentCount() != 3u) return nullptr;
+                IrValue* condition = (*select)->Argument(0)->Resolve();
+                std::vector<IrValue*> selected;
+                for (IrValue* value : tuple) {
+                    if (value->Opcode() == IrOpcode::SelectU32) {
+                        if (value->Parent() != block || value->ArgumentCount() != 3u || value->Argument(0)->Resolve() != condition) return nullptr;
+                        selected.push_back(value);
+                    } else if (HoldsProgramCounter(value, phiSearchDepth) || Rematerialize(value, position, false, phiSearchDepth) == nullptr) {
+                        return nullptr;
+                    }
+                }
+                IrValue* anchor = nullptr;
+                for (IrValue* value : block->Instructions()) {
+                    if (std::ranges::find(selected, value) != selected.end()) anchor = value;
+                }
+                if (anchor == nullptr) return nullptr;
+                IrValue& selector = m_program.CreateValue(IrOpcode::SelectU32, IrType::U32);
+                web.selectors.emplace(tuple, &selector);
+                web.pending.push_back({anchor, &selector});
+                selector.AddArgument(condition);
+                for (std::size_t arm = 1u; arm < 3u; arm++) {
+                    auto incoming = tuple;
+                    for (IrValue*& value : incoming) {
+                        if (value->Opcode() == IrOpcode::SelectU32) value = value->Argument(arm);
+                    }
+                    IrValue* branch = WebSelector(std::move(incoming), web, position);
+                    if (branch == nullptr) return nullptr;
+                    selector.AddArgument(branch);
+                }
+                return &selector;
+            }
             for (IrValue* value : tuple) {
                 if (HoldsProgramCounter(value, phiSearchDepth) || Rematerialize(value, position, false, phiSearchDepth) == nullptr) {
                     return nullptr;
@@ -829,13 +881,17 @@ private:
                 return std::ranges::equal(tuple, arm, [&](IrValue* left, IrValue* right) { return EquivalentValue(m_program.Resources(), left, right); });
             });
             if (same != web.arms.end()) {
-                return &m_builder.Constant(static_cast<std::uint32_t>(same - web.arms.begin()));
+                IrValue* arm = &m_builder.Constant(static_cast<std::uint32_t>(same - web.arms.begin()));
+                if (web.lifted) web.selectors.emplace(tuple, arm);
+                return arm;
             }
             if (web.arms.size() == DescriptorWeb::maxArms) {
                 return nullptr;
             }
+            IrValue* arm = &m_builder.Constant(static_cast<std::uint32_t>(web.arms.size()));
+            if (web.lifted) web.selectors.emplace(tuple, arm);
             web.arms.push_back(std::move(tuple));
-            return &m_builder.Constant(static_cast<std::uint32_t>(web.arms.size() - 1u));
+            return arm;
         }
         IrBlock* block = (*phi)->Parent();
         if (block == nullptr || web.selectors.size() == DescriptorWeb::maxStates) {
@@ -845,8 +901,11 @@ private:
         if (predecessors.size() < 2u) {
             return nullptr;
         }
-        for (const IrValue* value : tuple) {
+        for (IrValue* value : tuple) {
             if (value->IsPhi() && (value->Parent() != block || value->PhiBlockCount() != predecessors.size())) {
+                return nullptr;
+            }
+            if (web.lifted && !value->IsPhi() && (HoldsProgramCounter(value, phiSearchDepth) || Rematerialize(value, position, false, phiSearchDepth) == nullptr)) {
                 return nullptr;
             }
         }
@@ -869,6 +928,137 @@ private:
             selector.AddPhiOperand(predecessor, edgeSelector);
         }
         return &selector;
+    }
+
+    bool WaterfallPlacementValid(const DescriptorWeb& web, IrValue& first, IrValue& consumer, std::span<IrValue* const> inputs) const {
+        struct Site { IrBlock* block; std::size_t index; };
+        std::unordered_map<const IrValue*, Site> sites;
+        for (const auto& block : m_program.Blocks()) {
+            std::size_t index = 1u;
+            for (IrValue* value : block->Instructions()) sites.emplace(value, Site{block.get(), index++});
+        }
+        for (const auto& [block, phi] : web.phis) sites.emplace(phi, Site{block, 0u});
+        for (const auto& pending : web.pending) sites.emplace(pending.value, sites.at(pending.before));
+        std::map<std::pair<IrBlock*, IrBlock*>, bool> dominators;
+        const auto dominates = [&](IrValue* definition, Site use) {
+            definition = definition->Resolve();
+            if (definition->HasImmediate()) return true;
+            const auto found = sites.find(definition);
+            if (found == sites.end()) return false;
+            const auto site = found->second;
+            if (site.block == use.block) return site.index < use.index;
+            const auto key = std::pair{site.block, use.block};
+            if (const auto known = dominators.find(key); known != dominators.end()) return known->second;
+            std::vector<IrBlock*> pending{use.block};
+            std::unordered_set<IrBlock*> visited;
+            bool reachesDefinition = false;
+            while (!pending.empty()) {
+                IrBlock* block = pending.back();
+                pending.pop_back();
+                if (block == site.block) {
+                    reachesDefinition = true;
+                    continue;
+                }
+                if (!visited.insert(block).second) continue;
+                if (visited.size() > DescriptorWeb::maxStates || block == &m_program.EntryBlock() || block->Predecessors().empty()) {
+                    dominators.emplace(key, false);
+                    return false;
+                }
+                pending.insert(pending.end(), block->Predecessors().begin(), block->Predecessors().end());
+            }
+            dominators.emplace(key, reachesDefinition);
+            return reachesDefinition;
+        };
+        for (IrValue* input : inputs) {
+            if (!dominates(input, sites.at(&first))) return false;
+        }
+        for (const auto& [block, phi] : web.phis) {
+            for (std::size_t index = 0; index < phi->ArgumentCount(); index++) {
+                if (!dominates(phi->Argument(index), {phi->PhiBlock(index), std::numeric_limits<std::size_t>::max()})) return false;
+            }
+        }
+        for (const auto& pending : web.pending) {
+            for (IrValue* argument : pending.value->Arguments()) {
+                if (!dominates(argument, sites.at(pending.value))) return false;
+            }
+        }
+        return dominates(web.pending.back().value, sites.at(&consumer));
+    }
+
+    bool SplitDescriptorWaterfall(IrValue& inst, const std::array<IrValue*, 2>& handles, std::uint32_t handleCount) {
+        if (m_program.Resources().stage != IrShaderStage::Compute || (inst.Opcode() != IrOpcode::ImageSampleRaw && inst.Opcode() != IrOpcode::ImageRead)) return false;
+        const auto index = inst.Flags<MemoryFlags>().index;
+        if (index >= m_program.Resources().memoryInfo.size()) return false;
+        const auto& memory = m_program.Resources().memoryInfo[index];
+        const auto allowedFlags = inst.Opcode() == IrOpcode::ImageSampleRaw ? RdnaImageSampleFlagLevelZero : 0u;
+        if (memory.dataBits != 32u || memory.d16 || memory.imageR128 || memory.imagePacked || memory.imageSampleFlags != allowedFlags) return false;
+        std::vector<IrValue*> tuple;
+        std::vector<IrValue*> reads;
+        std::array<std::size_t, 2> offsets{};
+        IrValue* mask = nullptr;
+        IrBlock* block = nullptr;
+        for (std::uint32_t slot = 0; slot < handleCount; slot++) {
+            offsets[slot] = tuple.size();
+            for (IrValue* argument : handles[slot]->Arguments()) {
+                IrValue* value = argument->Resolve();
+                if (value->Opcode() == IrOpcode::ReadFirstLane) {
+                    if (value->Parent() == nullptr || value->ArgumentCount() != 2u || value->Argument(1)->Type() != IrType::Bool) return false;
+                    if (mask != nullptr && (mask != value->Argument(1)->Resolve() || block != value->Parent())) return false;
+                    mask = value->Argument(1)->Resolve();
+                    block = value->Parent();
+                    reads.push_back(value);
+                    value = value->Argument(0)->Resolve();
+                } else if (HoldsProgramCounter(value, phiSearchDepth) || Rematerialize(value, inst, false, phiSearchDepth) == nullptr) {
+                    return false;
+                }
+                tuple.push_back(value);
+            }
+        }
+        if (reads.empty()) return false;
+        IrValue* first = nullptr;
+        for (IrValue* value : block->Instructions()) {
+            if (std::ranges::find(reads, value) != reads.end()) {
+                first = value;
+                break;
+            }
+        }
+        if (first == nullptr) return false;
+        DescriptorWeb web;
+        web.lifted = true;
+        const auto discard = [&] {
+            for (const auto& [owner, phi] : web.phis) {
+                for (std::size_t arg = 0; arg < phi->ArgumentCount(); arg++) phi->ReplaceArgument(arg, nullptr);
+            }
+            for (const auto& pending : web.pending) {
+                for (std::size_t arg = 0; arg < pending.value->ArgumentCount(); arg++) pending.value->ReplaceArgument(arg, nullptr);
+            }
+            for (const auto& [owner, phi] : web.phis) phi->Invalidate();
+            for (const auto& pending : web.pending) pending.value->Invalidate();
+        };
+        IrValue* selector = WebSelector(tuple, web, inst);
+        if (selector == nullptr || web.arms.empty() || web.selectors.size() == DescriptorWeb::maxStates) {
+            discard();
+            return false;
+        }
+        IrValue& scalar = m_program.CreateValue(IrOpcode::ReadFirstLane, IrType::U32);
+        scalar.AddArgument(selector);
+        scalar.AddArgument(mask);
+        web.pending.push_back({first, &scalar});
+        if (!WaterfallPlacementValid(web, *first, inst, tuple)) {
+            discard();
+            return false;
+        }
+        for (const auto& [owner, phi] : web.phis) owner->InsertInstructionBefore(nullptr, phi);
+        for (const auto& pending : web.pending) pending.before->Parent()->InsertInstructionBefore(pending.before, pending.value);
+        std::vector<IrValue*> conditions;
+        for (std::uint32_t arm = 0; arm + 1u < web.arms.size(); arm++) {
+            const std::array<IrValue*, 2> compare{&scalar, &m_builder.Constant(arm)};
+            conditions.push_back(EmitBefore(inst, IrOpcode::IEqual32, IrType::Bool, compare));
+        }
+        ReplaceWithArmCopies(inst, handles, {true, true}, handleCount, conditions, [&](std::uint32_t arm, std::uint32_t slot, std::size_t dword) {
+            return Rematerialize(web.arms[arm][offsets[slot] + dword], inst, true, phiSearchDepth);
+        }, &scalar);
+        return true;
     }
 
     void SplitDescriptorWeb(IrValue& inst, const std::array<IrValue*, 2>& handles, const std::array<bool, 2>& split, std::uint32_t handleCount) {

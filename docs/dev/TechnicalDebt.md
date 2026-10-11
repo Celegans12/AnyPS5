@@ -503,3 +503,4 @@ Throughout the project, every function at every stage either **does exactly what
 
 - [Registration preparation](../../core/libs/prx/libSceAgcDriver/Execution/src/Driver/Shaders/ShaderRegistry.cpp) runs tasks on the caller when `APS5_INLINE_SHADER_PREPARE` is present, retaining deferred failures. This local diagnostic leaves `APS5_SYNC_SHADER_PREPARE` unchanged.
 - [Warm prepared shaders](../../core/shader/recompiler/Recompiler.cpp) defer resource-plan construction after a verified disk hit until first capture; cold misses remain eager. `APS5_NO_PERF_LAZY_CAPTURE_PLAN=1` restores eager preparation within the same cache namespace.
+- [Descriptor waterfalls](../../core/shader/recompiler/Optimization/src/ResourceTracker.cpp) support at most 512 correlated states and 64 arms for compute LZ/read operations. Mismatched masks, unsafe placement and other shapes still throw.
