@@ -135,12 +135,21 @@ F16x2Math FindF16x2Math(std::span<const std::uint32_t> spirv) {
         const std::uint32_t words = spirv[offset] >> 16u;
         const std::uint32_t opcode = spirv[offset] & 0xffffu;
         Require(words != 0u && offset + words <= spirv.size(), "f16 native: malformed SPIR-V");
-        if (opcode == spv::OpTypeFloat && spirv[offset + 2u] == 16u) half = spirv[offset + 1u];
-        if (opcode == spv::OpTypeVector && half && spirv[offset + 2u] == *half && spirv[offset + 3u] == 2u) pair = spirv[offset + 1u];
-        if (pair && spirv[offset + 1u] == *pair) {
-            math.add = math.add || opcode == spv::OpFAdd;
-            math.mul = math.mul || opcode == spv::OpFMul;
-            math.fma = math.fma || opcode == spv::OpExtInst;
+        if (opcode == spv::OpTypeFloat) {
+            Require(words >= 3u, "f16 native: malformed float type");
+            if (spirv[offset + 2u] == 16u) half = spirv[offset + 1u];
+        }
+        if (opcode == spv::OpTypeVector) {
+            Require(words >= 4u, "f16 native: malformed vector type");
+            if (half && spirv[offset + 2u] == *half && spirv[offset + 3u] == 2u) pair = spirv[offset + 1u];
+        }
+        if (opcode == spv::OpFAdd || opcode == spv::OpFMul || opcode == spv::OpExtInst) {
+            Require(words >= 5u, "f16 native: malformed arithmetic instruction");
+            if (pair && spirv[offset + 1u] == *pair) {
+                math.add = math.add || opcode == spv::OpFAdd;
+                math.mul = math.mul || opcode == spv::OpFMul;
+                math.fma = math.fma || opcode == spv::OpExtInst;
+            }
         }
         offset += words;
     }
