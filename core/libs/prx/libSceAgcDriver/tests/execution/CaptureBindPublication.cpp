@@ -297,7 +297,7 @@ void RunRetry(AgcDriver::VulkanDevice& device, Fixture& fixture, std::uint32_t r
             constexpr std::string_view prefix = "Vulkan dispatch: workgroup count 4294967295x1x1 exceeds device limits ";
             std::array<unsigned, 3> limits{};
             int consumed = 0;
-            expected = failure.starts_with(prefix) && std::sscanf(failure.c_str() + prefix.size(), "%ux%ux%u%n", &limits[0], &limits[1], &limits[2], &consumed) == 3 && prefix.size() + static_cast<std::size_t>(consumed) == failure.size();
+            expected = failure.starts_with(prefix) && std::sscanf(failure.c_str() + prefix.size(), "%ux%ux%u%n", &limits[0], &limits[1], &limits[2], &consumed) == 3 && (prefix.size() + static_cast<std::size_t>(consumed) == failure.size() || std::string_view(failure).substr(prefix.size() + static_cast<std::size_t>(consumed)) == " and NVIDIA drops workgroups of a vkCmdDispatchBase split");
         }
         Require(expected && typed == (which != RetryCase::Unrelated), "snapshot retry: wrong strict failure: " + failure);
         Require(std::all_of(fixture.output, fixture.output + 64 * 4, [](auto value) { return value == Sentinel; }), "snapshot retry: failed consumer wrote output");

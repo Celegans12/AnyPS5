@@ -859,7 +859,7 @@ private:
         }
         const auto phi = std::ranges::find_if(tuple, [](const IrValue* value) { return value->IsPhi(); });
         const auto lane = std::ranges::find_if(tuple, [](const IrValue* value) { return value->Opcode() == IrOpcode::SelectU32 || value->Opcode() == IrOpcode::ReadFirstLane; });
-        if (phi == tuple.end() && lane != tuple.end()) {
+        if (phi == tuple.end() && lane != tuple.end() && !web.lifted) {
             return LaneSelector(tuple, **lane, web, position);
         }
         if (phi == tuple.end()) {
@@ -985,6 +985,7 @@ private:
             for (IrValue* value : block->Instructions()) sites.emplace(value, Site{block.get(), index++});
         }
         for (const auto& [block, phi] : web.phis) sites.emplace(phi, Site{block, 0u});
+        for (const auto& [block, before, node] : web.lanes) sites.emplace(node, before != nullptr ? sites.at(before) : Site{block, std::numeric_limits<std::size_t>::max()});
         for (const auto& pending : web.pending) sites.emplace(pending.value, sites.at(pending.before));
         std::map<std::pair<IrBlock*, IrBlock*>, bool> dominators;
         const auto dominates = [&](IrValue* definition, Site use) {
@@ -1022,6 +1023,11 @@ private:
         for (const auto& [block, phi] : web.phis) {
             for (std::size_t index = 0; index < phi->ArgumentCount(); index++) {
                 if (!dominates(phi->Argument(index), {phi->PhiBlock(index), std::numeric_limits<std::size_t>::max()})) return false;
+            }
+        }
+        for (const auto& [block, before, node] : web.lanes) {
+            for (IrValue* argument : node->Arguments()) {
+                if (!dominates(argument, sites.at(node))) return false;
             }
         }
         for (const auto& pending : web.pending) {
@@ -1079,8 +1085,12 @@ private:
             for (const auto& pending : web.pending) {
                 for (std::size_t arg = 0; arg < pending.value->ArgumentCount(); arg++) pending.value->ReplaceArgument(arg, nullptr);
             }
+            for (const auto& [owner, before, node] : web.lanes) {
+                for (std::size_t arg = 0; arg < node->ArgumentCount(); arg++) node->ReplaceArgument(arg, nullptr);
+            }
             for (const auto& [owner, phi] : web.phis) phi->Invalidate();
             for (const auto& pending : web.pending) pending.value->Invalidate();
+            for (const auto& [owner, before, node] : web.lanes) node->Invalidate();
         };
         IrValue* selector = WebSelector(tuple, web, inst);
         if (selector == nullptr || web.arms.empty() || web.selectors.size() == DescriptorWeb::maxStates) {
@@ -1096,6 +1106,10 @@ private:
             return false;
         }
         for (const auto& [owner, phi] : web.phis) owner->InsertInstructionBefore(nullptr, phi);
+        for (const auto& [owner, before, node] : web.lanes) {
+            if (before == nullptr) owner->AppendInstruction(node);
+            else owner->InsertInstructionBefore(before, node);
+        }
         for (const auto& pending : web.pending) pending.before->Parent()->InsertInstructionBefore(pending.before, pending.value);
         std::vector<IrValue*> conditions;
         for (std::uint32_t arm = 0; arm + 1u < web.arms.size(); arm++) {

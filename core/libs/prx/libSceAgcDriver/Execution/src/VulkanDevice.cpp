@@ -3654,7 +3654,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     // the batch can signal its labels from the GPU.
     if (resources.NeedsCompletion() && resources.Reusable()) {
         auto kept = record.resources;
-        recorder.OnComplete([kept] { kept->CheckFaults(); });
+        recorder.OnComplete([kept, shaderAddress = record.programAddress] { kept->CheckFaults(shaderAddress); });
     } else if (resources.NeedsCompletion()) {
         // Listed for DispatchIndirect until the write-back ran (a non-reusable object, so once).
         auto writers = state->copiedWriters;

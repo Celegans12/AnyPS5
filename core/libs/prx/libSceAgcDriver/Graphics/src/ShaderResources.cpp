@@ -4150,8 +4150,8 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     AgcDriver::ProfilePrint_nid_no_patch("[buffers] descriptor elements bound: %llu total, %llu written, %llu read-only; %llu pending-write notes skipped\n", static_cast<unsigned long long>(elements), static_cast<unsigned long long>(elements - readOnly), static_cast<unsigned long long>(readOnly), static_cast<unsigned long long>(counters.notesSkipped.load()));
 }
 
-void ShaderResources::CheckFaults() const {
-    if (bda) bda->CheckFault();
+void ShaderResources::CheckFaults(std::uint64_t shaderAddress) const {
+    if (bda) bda->CheckFault(shaderAddress);
 }
 
 void ShaderResources::WriteBackBuffers(std::uint64_t shaderAddress) {
