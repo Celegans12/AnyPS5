@@ -9,6 +9,7 @@ from pathlib import Path
 
 from test_guest_intel_trampolines import main_fixture
 from test_guest_module_directories import module_with_symbol, needed_libraries
+from test_guest_tls import data_directory, guest_with_tls
 
 
 def dynamic(image, offset, phoff, tags):
@@ -86,7 +87,7 @@ def consumer(owner, symbol='shared#A#B', expected=22, module_name=None):
     return image
 
 
-def executable(owner, symbol='shared#A#B', module_name=None, extra_dependencies=()):
+def executable(owner, symbol='shared#A#B', module_name=None, extra_dependencies=(), library_name=None):
     image = main_fixture()
     struct.pack_into('<I', image, 68, 7)
     strings = b'\0' + symbol.encode() + b'\0' + owner.encode() + b'\0'
@@ -99,11 +100,16 @@ def executable(owner, symbol='shared#A#B', module_name=None, extra_dependencies=
     for dependency in extra_dependencies:
         dependency_offsets.append(len(strings))
         strings += dependency.encode() + b'\0'
+    library_offset = len(strings)
+    if library_name is not None:
+        strings += library_name.encode() + b'\0'
     image[0x4800:0x4800 + len(strings)] = strings
     tags = [(5, 0x4800), (10, len(strings)), (6, 0x4880), (11, 24),
             (4, 0x4840), (7, 0x4900), (8, 24), (9, 24),
             (1, owner_offset), (0x61000045, (1 << 48) | module_offset)]
     tags.extend((1, offset) for offset in dependency_offsets)
+    if library_name is not None:
+        tags.append((0x61000049, library_offset))
     dynamic(image, 0x4600, 120, tags)
     struct.pack_into('<IIIII', image, 0x4840, 1, 2, 1, 0, 0)
     struct.pack_into('<IBBHQQ', image, 0x4898, 1, 0x12, 0, 0, 0, 0)
@@ -335,6 +341,50 @@ def main():
             run = subprocess.run([str(output)], capture_output=True, text=True, timeout=30)
             assert run.returncode != 0 and 'Failed to load module:' in run.stderr and 'missing.prx' in run.stderr, (run.returncode, run.stderr)
             assert run.stderr.startswith('Failed to load module:'), run.stderr
+
+        result, shared = convert('unnamed-import-provider', 'a.prx')
+        assert result.returncode == 0, result.stderr
+        shared_provider = shared.parent / 'app0' / 'prx' / 'a.prx.guest.prx'
+        for name, owner, symbol, identity in (
+                ('unnamed-import-from-host-library', 'libhost.prx', 'shared', None),
+                ('unmatched-import-from-host-library', 'libhost_debug.prx', 'shared#A#B', 'libhost')):
+            case = work / name
+            (case / 'prx').mkdir(parents=True)
+            other = provider(33)
+            other[0x800:0x80c] = b'\0other#A#B\0\0'
+            (case / 'prx' / 'c.prx').write_bytes(other)
+            source = case / 'input.elf'
+            source.write_bytes(executable(owner, symbol, identity, library_name=identity))
+            output = case / 'output.exe'
+            result = subprocess.run([str(relinker), '--windows', str(source), str(output)], capture_output=True, text=True, timeout=30)
+            assert result.returncode == 0, (result.stdout, result.stderr)
+            (case / 'libs').mkdir()
+            (case / 'libs' / owner).write_bytes(shared_provider.read_bytes())
+            if os.name == 'nt':
+                run = subprocess.run([str(output)], capture_output=True, text=True, timeout=30)
+                assert run.returncode == 11, ('a needed host library must be loaded for an import without a matching library name', name, run.returncode, run.stdout, run.stderr)
+
+        case = work / 'optional-host-transitive-dependency'
+        (case / 'prx').mkdir(parents=True)
+        (case / 'prx' / 'tls.prx').write_bytes(guest_with_tls(True))
+        source = case / 'input.elf'
+        source.write_bytes(executable('libhost.prx', 'shared', extra_dependencies=('unused.prx',)))
+        output = case / 'output.exe'
+        result = subprocess.run([str(relinker), '--windows', str(source), str(output)], capture_output=True, text=True, timeout=30)
+        assert result.returncode == 0, (result.stdout, result.stderr)
+        (case / 'libs').mkdir()
+        (case / 'libs' / 'libhost.prx').write_bytes(shared_provider.read_bytes())
+        if os.name == 'nt':
+            run = subprocess.run([str(output)], capture_output=True, text=True, timeout=30)
+            assert run.returncode == 11 and 'unused.prx' not in run.stderr, (run.returncode, run.stdout, run.stderr)
+        broken = (case / 'app0' / 'prx' / 'tls.prx.guest.prx').read_bytes()
+        assert data_directory(broken, 1)[0] and broken.count(b'KERNEL32.dll\0') == 1
+        broken = broken.replace(b'KERNEL32.dll\0', b'APS5MISS.dll\0')
+        (case / 'libs' / 'unused.prx').write_bytes(broken)
+        if os.name == 'nt':
+            run = subprocess.run([str(output)], capture_output=True, text=True, timeout=30)
+            assert run.returncode != 0 and 'Failed to load module:' in run.stderr and 'unused.prx' in run.stderr and 'GetLastError: 126' in run.stderr, (run.returncode, run.stdout, run.stderr)
+            assert 'nothing is imported from it' not in run.stderr, run.stderr
 
         for index, (symbol, module_name) in enumerate([('shared#A#B', None), ('shared', None), ('shared#A#B', 'libSceJson')]):
             case = work / ('missing-unused-dependency-' + str(index))

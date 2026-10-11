@@ -130,6 +130,7 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
     std::vector<std::uint32_t> searchCounts;
     std::vector<bool> platformTlsResolvers;
     std::vector<bool> imported(libraries.size());
+    std::vector<bool> loadCandidates(libraries.size());
     for (const auto& import : imports) {
         std::vector<std::uint32_t> order;
         for (std::size_t index = 0; index < libraries.size(); ++index) {
@@ -162,6 +163,7 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
         searchCounts.push_back(CheckedRva(order.size()));
         for (const auto index : order) {
             Io::AppendU32(data, index);
+            loadCandidates[index] = true;
             if (!import.Library.empty()) imported[index] = true;
         }
     }
@@ -359,7 +361,7 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
     }
 
     for (std::size_t index = 0; index < libraries.size(); ++index) {
-        if (index >= guestModules.size() && !imported[index]) continue;
+        if (index >= guestModules.size() && !imported[index] && !loadCandidates[index]) continue;
         if (absolutePath && index >= guestModules.size()) {
             code.Rip({0x48, 0x8d, 0x0d}, libraryPaths[index]);
         } else {
@@ -381,6 +383,22 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
         code.Emit({0x48, 0x89, 0xce, 0x49, 0x89, 0xf0});
         writeUtf8(resolvedPaths[index]);
 
+        std::vector<std::size_t> missingOptional;
+        std::optional<std::size_t> probeFailed;
+        if (index >= guestModules.size() && !imported[index]) {
+            code.Emit({0x48, 0x89, 0xf1});
+            call("GetFileAttributesW");
+            code.Emit({0x83, 0xf8, 0xff});
+            const auto exists = code.Branch({0x0f, 0x85});
+            captureLastError();
+            code.Emit({0x83, 0xf8, 2});
+            missingOptional.push_back(code.Branch({0x0f, 0x84}));
+            code.Emit({0x83, 0xf8, 3});
+            missingOptional.push_back(code.Branch({0x0f, 0x84}));
+            probeFailed = code.Branch({0xe9});
+            code.PatchBranch(exists, code.GetRva());
+        }
+
         if (dependencyDiagnostics) {
             writeString(loading);
             writeString(resolvedPaths[index]);
@@ -394,6 +412,7 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
         if (dependencyDiagnostics) {
             writeString(loadFailed, true);
         }
+        if (probeFailed) code.PatchBranch(*probeFailed, code.GetRva());
         writeString(failedModule, true);
         writeString(resolvedPaths[index], true);
         writeString(newline, true);
@@ -410,6 +429,7 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
         if (dependencyDiagnostics) {
             writeString(loaded);
         }
+        for (const auto branch : missingOptional) code.PatchBranch(branch, code.GetRva());
     }
 
     std::vector<std::size_t> unresolvedBranches;
@@ -526,10 +546,17 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
             code.PatchBranch(branch, code.GetRva());
         writeString(searched, true);
         for (std::size_t index = 0; index < resolvedPaths.size(); ++index) {
-            if (index >= guestModules.size() && !imported[index]) continue;
+            if (index >= guestModules.size() && !imported[index] && !loadCandidates[index]) continue;
+            std::optional<std::size_t> notLoaded;
+            if (index >= guestModules.size() && !imported[index]) {
+                code.Rip({0x48, 0x8b, 0x05}, CheckedRva(handles + index * 8));
+                code.Emit({0x48, 0x85, 0xc0});
+                notLoaded = code.Branch({0x0f, 0x84});
+            }
             writeString(indent, true);
             writeString(resolvedPaths[index], true);
             writeString(newline, true);
+            if (notLoaded) code.PatchBranch(*notLoaded, code.GetRva());
         }
         writeLastError();
         raise(0xc0000139u);
