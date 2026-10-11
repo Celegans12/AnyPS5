@@ -9,14 +9,39 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
+#include <functional>
 #include <stdexcept>
+#include <thread>
 
 namespace AgcDriver::DriverDetail {
 
 void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments) {
+    static const bool traceMismatch = std::getenv("APS5_TRACE_SNAPSHOT_MISMATCH") != nullptr;
+    const auto initialGpuDepth = traceMismatch ? GuestMemory::GpuMutex().DepthOnThisThread() : 0u;
+    const bool initialCompletion = traceMismatch && Graphics::Recorder::InCompletion();
     try {
-        RetryLiveSnapshot([&](bool forceFresh) { dispatchAttempt(queue, packet, submission, indirectArguments, forceFresh); });
+        RetryLiveSnapshot([&](bool forceFresh) {
+            try {
+                dispatchAttempt(queue, packet, submission, indirectArguments, forceFresh);
+            } catch (const Graphics::LiveSnapshotInvalidated&) {
+                [&]() noexcept {
+                    if (!traceMismatch) return;
+                    static std::atomic<std::uint64_t> records{0};
+                    const auto record = records.fetch_add(1, std::memory_order_relaxed);
+                    if (record >= 32u) return;
+                    const auto low = queue.shader.find(0x20c);
+                    const auto high = queue.shader.find(0x20d);
+                    const bool addressKnown = low != queue.shader.end() && high != queue.shader.end();
+                    const auto address = addressKnown ? (static_cast<std::uint64_t>(low->second) << 8u) | (static_cast<std::uint64_t>(high->second & 0xffu) << 40u) : 0ull;
+                    const auto thread = std::hash<std::thread::id>{}(std::this_thread::get_id());
+                    std::fprintf(stderr, "[snapshot-mismatch-dispatch] record=%llu thread=%zu shader=0x%llx shader_known=%u queue=%u serial=%llu packet=%zu attempt=%u force_fresh=%u initial_eligible=%u initial_gpu_depth=%u initial_completion=%u unwound_gpu_depth=%u unwound_completion=%u failure=LiveSnapshotInvalidated action=rethrow\n",
+                        static_cast<unsigned long long>(record + 1u), thread, static_cast<unsigned long long>(address), addressKnown ? 1u : 0u, submission.queue, static_cast<unsigned long long>(submission.serial), currentPacketOffset(), forceFresh ? 1u : 0u, forceFresh ? 1u : 0u, initialGpuDepth == 0u && !initialCompletion ? 1u : 0u, initialGpuDepth, initialCompletion ? 1u : 0u, GuestMemory::GpuMutex().DepthOnThisThread(), Graphics::Recorder::InCompletion() ? 1u : 0u);
+                }();
+                throw;
+            }
+        });
     } catch (const Graphics::LiveSnapshotInvalidated& error) {
         const auto address = (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20c)) << 8u) | (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20d) & 0xffu) << 40u);
         char where[64];

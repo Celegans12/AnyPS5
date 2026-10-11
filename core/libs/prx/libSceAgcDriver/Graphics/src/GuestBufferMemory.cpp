@@ -2095,6 +2095,41 @@ void GuestBufferMemory::AddSnapshot(const GuestMemorySnapshot& snapshot) {
         const auto offset = static_cast<std::size_t>(snapshot.address - owner->begin);
         const auto* source = live ? reinterpret_cast<const std::byte*>(snapshot.address) : owner->snapshot.data() + offset;
         const bool matches = std::memcmp(source, snapshot.bytes.data(), snapshot.bytes.size()) == 0;
+        if (!matches) [&]() noexcept {
+            static const bool trace = std::getenv("APS5_TRACE_SNAPSHOT_MISMATCH") != nullptr;
+            if (!trace) return;
+            static std::atomic<std::uint64_t> records{0};
+            const auto record = records.fetch_add(1, std::memory_order_relaxed);
+            if (record >= 32u) return;
+            const auto scanBytes = std::min(snapshot.bytes.size(), std::size_t{65536});
+            std::size_t first = scanBytes;
+            std::size_t sampleBytes = 0;
+            char expected[33]{};
+            char observed[33]{};
+            constexpr char hex[] = "0123456789abcdef";
+            const volatile std::byte* reread = source;
+            for (std::size_t index = 0; index < scanBytes; ++index) {
+                const auto a = std::to_integer<unsigned>(snapshot.bytes[index]);
+                const auto b = std::to_integer<unsigned>(reread[index]);
+                if (first == scanBytes && a != b) {
+                    first = index;
+                    sampleBytes = 0;
+                }
+                if (sampleBytes < 16u && (first != scanBytes || index < 16u)) {
+                    expected[2u * sampleBytes] = hex[a >> 4u];
+                    expected[2u * sampleBytes + 1u] = hex[a & 15u];
+                    observed[2u * sampleBytes] = hex[b >> 4u];
+                    observed[2u * sampleBytes + 1u] = hex[b & 15u];
+                    ++sampleBytes;
+                }
+            }
+            expected[2u * sampleBytes] = '\0';
+            observed[2u * sampleBytes] = '\0';
+            const bool differs = first != scanBytes;
+            const auto thread = std::hash<std::thread::id>{}(std::this_thread::get_id());
+            std::fprintf(stderr, "[snapshot-mismatch] record=%llu thread=%zu original_memcmp=mismatch observation=later_nonatomic_reread snapshot=0x%llx total_bytes=%zu owner_begin=0x%llx owner_end=0x%llx writable=%u host_backed=%u mirror=%u owner_live=%u source=%s scan_bytes=%zu scan_status=%s diff_found=%u first_diff_offset=%lld sample_offset=%zu sample_bytes=%zu expected=%s observed=%s\n",
+                static_cast<unsigned long long>(record + 1u), thread, static_cast<unsigned long long>(snapshot.address), snapshot.bytes.size(), static_cast<unsigned long long>(owner->begin), static_cast<unsigned long long>(owner->end), owner->writable ? 1u : 0u, owner->hostBacked ? 1u : 0u, owner->mirror != nullptr ? 1u : 0u, live ? 1u : 0u, live ? "live" : "owned_snapshot", scanBytes, differs ? "diff_found" : scanBytes == snapshot.bytes.size() ? "full_recheck_equal" : "prefix_equal_remainder_unscanned", differs ? 1u : 0u, differs ? static_cast<long long>(first) : -1ll, differs ? first : 0u, sampleBytes, expected, observed);
+        }();
         if (live && !matches) throw LiveSnapshotInvalidated();
         Require(matches, "guest snapshot differs from registered memory");
         if (profile) Snapshots().checked.fetch_add(1, std::memory_order_relaxed);
