@@ -431,6 +431,17 @@ private:
         return true;
     }
 
+    static IrValue* SplitImmediateAddend(IrValue* value, std::uint32_t& addend) {
+        value = value->Resolve();
+        addend = 0;
+        if (value->Opcode() == IrOpcode::IAdd32 && value->ArgumentCount() == 2u) {
+            if (immediateU32(value->Argument(0), addend)) return value->Argument(1)->Resolve();
+            if (immediateU32(value->Argument(1), addend)) return value->Argument(0)->Resolve();
+        }
+        addend = 0;
+        return value;
+    }
+
     bool TryMakeTableColumn(IrValue& handle, bool sampler, bool r128, TableColumnPlan& plan) {
         const auto expected = sampler ? IrOpcode::GetSamplerResource : IrOpcode::GetImageResource;
         const std::uint32_t width = sampler ? 4u : 8u;
@@ -450,6 +461,8 @@ private:
         }
         IrValue* heapHandle = nullptr;
         IrValue* offset = nullptr;
+        IrValue* base = nullptr;
+        std::uint32_t baseAddend = 0;
         std::uint32_t first = 0;
         bool address = false;
         for (std::uint32_t dword = 0; dword < words; dword++) {
@@ -460,20 +473,24 @@ private:
             if (memory == nullptr || !MemoryIndexBelongsTo(memoryIndex, *read)) {
                 return false;
             }
+            std::uint32_t readAddend = 0;
+            IrValue* readBase = SplitImmediateAddend(read->Argument(1), readAddend);
             if (dword == 0u) {
                 first = memory->offset;
                 address = addressRead;
-            } else if (addressRead != address || memory->offset != first + dword * static_cast<std::uint32_t>(sizeof(std::uint32_t))) {
+                base = readBase;
+                baseAddend = readAddend;
+            } else if (addressRead != address || memory->offset + readAddend != first + baseAddend + dword * static_cast<std::uint32_t>(sizeof(std::uint32_t))) {
                 return false;
             }
             IrValue* currentHandle = read->Argument(0)->Resolve();
-            if (heapHandle != nullptr && currentHandle != heapHandle) {
+            if (heapHandle != nullptr && currentHandle != heapHandle && !EquivalentValue(m_program.Resources(), heapHandle, currentHandle)) {
                 return false;
             }
-            heapHandle = currentHandle;
+            if (heapHandle == nullptr) heapHandle = currentHandle;
             if (dword == 0u) {
                 offset = read->Argument(1)->Resolve();
-            } else if (!EquivalentValue(m_program.Resources(), offset, read->Argument(1))) {
+            } else if (!EquivalentValue(m_program.Resources(), base, readBase)) {
                 return false;
             }
             plan.memory.push_back(memoryIndex);
