@@ -218,10 +218,18 @@ public:
             throw std::runtime_error(text);
         }
         ApplyFastClear();
+        // Writes of an aliased storage image (the layered path, ForStorageDepth) land first.
+        TakeWrites(stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT);
         auto& plane = stencil ? stencilPlane : depthPlane;
         if (plane.storage == nullptr || plane.storage->Descriptor().format != resource.format || plane.storage->Descriptor().tileMode != resource.tileMode || plane.storage->Descriptor().baseAddress != resource.baseAddress) plane.storage = std::make_shared<StorageTexture>(context, *context.detiler, resource, 0);
+        // A stencil plane whose layout the target programs (SW_MODE, HTILE) keeps the alias rules.
+        if (stencil && (target.stencilSwizzle != 0 || target.htileStencil)) RequireStencilLayout(*plane.storage);
         copyPlane(plane, stencil, true);
         return plane.storage;
+    }
+
+    bool OwnsPlane(const StorageTexture* candidate) const {
+        return candidate != nullptr && (depthPlane.storage.get() == candidate || stencilPlane.storage.get() == candidate);
     }
 
     bool StoreBack(const StorageTexture& candidate) {
@@ -251,14 +259,15 @@ private:
     PlaneStorage stencilPlane;
 
     void copyPlane(PlaneStorage& plane, bool stencil, bool toStorage) {
-        auto* recorder = Recorder::Active();
-        Require(recorder != nullptr, "depth surface storage copies need an active recorder");
+        auto* recorder = RecorderFor(context);
+        std::unique_ptr<CommandBatch> batch;
+        if (recorder == nullptr) batch = std::make_unique<CommandBatch>(context);
         const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
         const auto bytes = static_cast<std::size_t>(target.extent.width) * target.extent.height * (stencil ? 1u : d16 ? 2u : 4u);
         if (plane.staging == nullptr) plane.staging = std::make_unique<DeviceBuffer>(context, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-        const auto commands = recorder->Commands();
-        recorder->Keep(plane.storage);
-        const auto timing = recorder->BeginGpuTiming(Recorder::CommandClass::Copy);
+        const auto commands = recorder != nullptr ? recorder->Commands() : batch->Handle();
+        if (recorder != nullptr) recorder->Keep(plane.storage);
+        const auto timing = recorder != nullptr ? recorder->BeginGpuTiming(Recorder::CommandClass::Copy) : 0u;
         VkBufferImageCopy planeRegion{0, 0, 0, {stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, {0, 0, 0}, {target.extent.width, target.extent.height, 1}};
         VkBufferImageCopy colorRegion = planeRegion;
         colorRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -269,6 +278,10 @@ private:
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
         context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, plane.staging->Handle(), destinationImage, VK_IMAGE_LAYOUT_GENERAL, 1, toStorage ? &colorRegion : &planeRegion);
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+        if (batch) {
+            batch->SubmitAndWait();
+            return;
+        }
         Recorder::CountBarriers(Recorder::CommandClass::Copy, 3);
         recorder->EndGpuTiming(timing, bytes);
     }
@@ -305,13 +318,27 @@ std::set<std::uint64_t>& clearedHtiles() {
     return *cleared;
 }
 
+// As in DepthSurface::Storage (and the sampled lookup): a view of another extent, or of a format
+// that cannot hold the plane's bits, only reuses the memory of an earlier depth surface (games put
+// transient color targets there) and takes the ordinary texture path.
+bool AliasesPlane(const DepthTarget& target, const StorageTexture& storage, bool stencil) {
+    const auto& descriptor = storage.Descriptor();
+    if (descriptor.width != target.extent.width || descriptor.height != target.extent.height) return false;
+    const auto format = storage.StorageFormat();
+    if (stencil) return format == VK_FORMAT_R8_UINT || format == VK_FORMAT_R8_UNORM || format == VK_FORMAT_R8_SINT || format == VK_FORMAT_R8_SNORM;
+    if (target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT) return format == VK_FORMAT_R16_UINT || format == VK_FORMAT_R16_UNORM || format == VK_FORMAT_R16_SINT || format == VK_FORMAT_R16_SNORM || format == VK_FORMAT_R16_SFLOAT;
+    return format == VK_FORMAT_R32_SFLOAT || format == VK_FORMAT_R32_UINT || format == VK_FORMAT_R32_SINT;
+}
+
 template<class Action>
-void ForStorageDepth(const Context& context, const StorageTexture& storage, Action&& action) {
+void ForStorageDepth(const Context& context, const StorageTexture& storage, Action&& action, bool skipOwned = true) {
     const auto& list = surfaces();
     const auto& descriptor = storage.Descriptor();
     const auto found = std::find_if(list.rbegin(), list.rend(), [&](const auto& surface) { return surface->context.device == context.device && (surface->target.address == descriptor.baseAddress || (surface->target.stencilAddress != 0 && surface->target.stencilAddress == descriptor.baseAddress)); });
-    if (found == list.rend()) return;
-    if ((*found)->target.stencilAddress != 0 && (*found)->target.stencilAddress == descriptor.baseAddress) {
+    if (found == list.rend() || (skipOwned && (*found)->OwnsPlane(&storage))) return;
+    const bool stencil = (*found)->target.stencilAddress != 0 && (*found)->target.stencilAddress == descriptor.baseAddress;
+    if (!AliasesPlane((*found)->target, storage, stencil)) return;
+    if (stencil) {
         action(**found, 0, VK_IMAGE_ASPECT_STENCIL_BIT);
         return;
     }
@@ -443,7 +470,7 @@ void ValidateStorageDepthWrites(const Context& context, std::span<const std::sha
             const auto found = std::find_if(writes.begin(), writes.end(), [&](const auto& write) { return write.surface == &surface && write.aspect == aspect; });
             Require(found == writes.end() || (found->storage == image.get() && found->layer == layer), "conflicting writable storage images alias the same depth/stencil plane");
             if (found == writes.end()) writes.push_back({&surface, image.get(), layer, aspect});
-        });
+        }, false);
     }
 }
 
@@ -498,6 +525,7 @@ void NoteDepthMetadataFill(std::uint64_t address, std::size_t bytes, std::uint32
 }
 
 std::shared_ptr<StorageTexture> DepthSurfaceStorage(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, std::uint32_t mip) {
+    std::lock_guard gpu(GuestMemory::GpuMutex());
     std::lock_guard lock(surfacesMutex());
     const auto& list = surfaces();
     const auto found = std::find_if(list.rbegin(), list.rend(), [&](const auto& surface) {
@@ -507,6 +535,7 @@ std::shared_ptr<StorageTexture> DepthSurfaceStorage(const Context& context, std:
 }
 
 bool DepthSurfaceStoreBack(const Context& context, const StorageTexture& storage) {
+    std::lock_guard gpu(GuestMemory::GpuMutex());
     std::lock_guard lock(surfacesMutex());
     for (const auto& surface : surfaces()) {
         if (surface->context.device == context.device && surface->StoreBack(storage)) return true;

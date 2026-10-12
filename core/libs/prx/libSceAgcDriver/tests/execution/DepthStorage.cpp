@@ -31,6 +31,7 @@ constexpr std::size_t BlockBytes = 65536;
 alignas(4096) std::array<std::uint8_t, BlockBytes * 2> Storage{};
 constexpr std::uint32_t Format32Float = 22;
 constexpr std::uint32_t Format8Uint = 5;
+constexpr std::uint32_t Format16x4Float = 71;
 
 class Device {
 public:
@@ -196,6 +197,17 @@ void Run(Context context, std::uint8_t* block) {
     };
     const DepthTarget target{address, stencilAddress, {Side, Side}, VK_FORMAT_D32_SFLOAT_S8_UINT, 0.25f, 7};
     Require(DepthSurfaceView(context, target) != VK_NULL_HANDLE, "depth surface was not created");
+    // Memory reuse at the surface's extent: a 64-bit color view over the depth plane (Ghost of Yotei
+    // writes an R16G16B16A16 target over a D32 surface's memory) is neither the plane's storage image
+    // nor an alias to seed from or copy back into the depth image.
+    Require(DepthSurfaceStorage(context, {}, PlaneResource(address, Format16x4Float), 0) == nullptr, "a 64-bit storage view of the depth plane was taken for the depth surface");
+    {
+        const auto reused = std::make_shared<StorageTexture>(context, *context.detiler, PlaneResource(address, Format16x4Float), 0);
+        SeedStorageFromDepth(context, reused);
+        MarkStorageDepthWrites(context, reused);
+        Require(DepthSurfaceView(context, target) != VK_NULL_HANDLE, "the depth surface was lost after a reused-memory view");
+        submit(recorder);
+    }
     Require(DepthSurfaceStorage(context, {}, PlaneResource(address, Format32Float, Side / 2), 0) == nullptr, "a storage view of another extent over the depth memory was taken for the depth surface");
     Require(DepthSurfaceTexture(context, {}, PlaneResource(address, Format32Float, Side / 2), {}) == nullptr, "a sampled view of another extent over the depth memory was taken for the depth surface");
     Require(DepthSurfaceStorage(context, {}, PlaneResource(address, Format8Uint), 0) == nullptr, "an 8-bit storage view of the depth plane was taken for the depth surface");
