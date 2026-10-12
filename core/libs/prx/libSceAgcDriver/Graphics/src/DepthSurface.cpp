@@ -204,6 +204,36 @@ public:
     VkImageAspectFlags pendingClear = 0;
     float clearDepth = 0.0f;
     std::uint8_t clearStencil = 0;
+
+    std::shared_ptr<StorageTexture> Storage(std::span<const std::uint32_t> words, const GuestTextureResource& resource, std::uint32_t mip) {
+        if (resource.dimension != TextureDimension::k2D || resource.width != target.extent.width || resource.height != target.extent.height) return nullptr;
+        const bool stencil = target.stencilAddress != 0 && resource.baseAddress == target.stencilAddress;
+        const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
+        const auto expected = stencil ? VK_FORMAT_R8_UINT : d16 ? VK_FORMAT_R16_UNORM : VK_FORMAT_R32_SFLOAT;
+        const bool depthBits = !stencil && words.size() >= 4 && ShaderRecompiler::DepthBitsTextureWidth(words[1], words[3]) == (d16 ? 16u : 32u);
+        if (ResolveTextureFormat(resource.format) != expected && !depthBits) return nullptr;
+        if (mip != 0 || resource.baseLevel != 0) {
+            char text[224];
+            std::snprintf(text, sizeof(text), "AGC graphics: storage image access to level %u of the %s plane of depth surface 0x%llx is not implemented", mip, stencil ? "stencil" : "depth", static_cast<unsigned long long>(target.address));
+            throw std::runtime_error(text);
+        }
+        ApplyFastClear();
+        auto& plane = stencil ? stencilPlane : depthPlane;
+        if (plane.storage == nullptr || plane.storage->Descriptor().format != resource.format || plane.storage->Descriptor().tileMode != resource.tileMode || plane.storage->Descriptor().baseAddress != resource.baseAddress) plane.storage = std::make_shared<StorageTexture>(context, *context.detiler, resource, 0);
+        copyPlane(plane, stencil, true);
+        return plane.storage;
+    }
+
+    bool StoreBack(const StorageTexture& candidate) {
+        for (const bool stencil : {false, true}) {
+            auto& plane = stencil ? stencilPlane : depthPlane;
+            if (plane.storage.get() != &candidate) continue;
+            copyPlane(plane, stencil, false);
+            return true;
+        }
+        return false;
+    }
+
     const Context context;
     const DepthTarget target;
     VkImage image = VK_NULL_HANDLE;
@@ -211,10 +241,41 @@ public:
     VkDeviceMemory memory = VK_NULL_HANDLE;
 
 private:
+    struct PlaneStorage {
+        std::shared_ptr<StorageTexture> storage;
+        std::unique_ptr<DeviceBuffer> staging;
+    };
     std::map<std::array<std::uint32_t, 12>, std::shared_ptr<Texture>> textures;
     std::unique_ptr<DeviceBuffer> transferBuffer;
+    PlaneStorage depthPlane;
+    PlaneStorage stencilPlane;
+
+    void copyPlane(PlaneStorage& plane, bool stencil, bool toStorage) {
+        auto* recorder = Recorder::Active();
+        Require(recorder != nullptr, "depth surface storage copies need an active recorder");
+        const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
+        const auto bytes = static_cast<std::size_t>(target.extent.width) * target.extent.height * (stencil ? 1u : d16 ? 2u : 4u);
+        if (plane.staging == nullptr) plane.staging = std::make_unique<DeviceBuffer>(context, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        const auto commands = recorder->Commands();
+        recorder->Keep(plane.storage);
+        const auto timing = recorder->BeginGpuTiming(Recorder::CommandClass::Copy);
+        VkBufferImageCopy planeRegion{0, 0, 0, {stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, {0, 0, 0}, {target.extent.width, target.extent.height, 1}};
+        VkBufferImageCopy colorRegion = planeRegion;
+        colorRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        const auto sourceImage = toStorage ? image : plane.storage->Image();
+        const auto destinationImage = toStorage ? plane.storage->Image() : image;
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, sourceImage, VK_IMAGE_LAYOUT_GENERAL, plane.staging->Handle(), 1, toStorage ? &planeRegion : &colorRegion);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, plane.staging->Handle(), destinationImage, VK_IMAGE_LAYOUT_GENERAL, 1, toStorage ? &colorRegion : &planeRegion);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+        Recorder::CountBarriers(Recorder::CommandClass::Copy, 3);
+        recorder->EndGpuTiming(timing, bytes);
+    }
 
     void release() noexcept {
+        depthPlane = {};
+        stencilPlane = {};
         textures.clear();
         if (view) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, view, nullptr);
         if (image) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);
@@ -434,6 +495,23 @@ void NoteDepthMetadataFill(std::uint64_t address, std::size_t bytes, std::uint32
         const VkImageAspectFlags written = VK_IMAGE_ASPECT_DEPTH_BIT | (target.htileStencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
         surface->pendingClear = (surface->pendingClear & ~written) | HtileFillClears(pattern, target.htileStencil);
     }
+}
+
+std::shared_ptr<StorageTexture> DepthSurfaceStorage(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, std::uint32_t mip) {
+    std::lock_guard lock(surfacesMutex());
+    const auto& list = surfaces();
+    const auto found = std::find_if(list.rbegin(), list.rend(), [&](const auto& surface) {
+        return surface->context.device == context.device && (surface->target.address == resource.baseAddress || (surface->target.stencilAddress != 0 && surface->target.stencilAddress == resource.baseAddress));
+    });
+    return found == list.rend() ? nullptr : (*found)->Storage(words, resource, mip);
+}
+
+bool DepthSurfaceStoreBack(const Context& context, const StorageTexture& storage) {
+    std::lock_guard lock(surfacesMutex());
+    for (const auto& surface : surfaces()) {
+        if (surface->context.device == context.device && surface->StoreBack(storage)) return true;
+    }
+    return false;
 }
 
 bool DepthSurfaceAt(std::uint64_t address) {
