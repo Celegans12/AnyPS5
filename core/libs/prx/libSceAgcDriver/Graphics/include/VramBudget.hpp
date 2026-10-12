@@ -24,6 +24,10 @@ public:
     VramBudget& operator=(const VramBudget&) = delete;
     static VkDeviceSize HeadroomFor(VkDeviceSize size);
     static VkDeviceSize TargetFor(VkDeviceSize size, VkDeviceSize available, VkDeviceSize reserve);
+    // APS5_VRAM_BUDGET_MIB / APS5_VRAM_HEADROOM_MIB in bytes (0: not set); the texture caches'
+    // share of the heap (TextureCacheBudgetsFor) follows the same settings.
+    static VkDeviceSize ForcedLimit();
+    static VkDeviceSize ForcedHeadroom();
     bool Enabled() const { return heap.has_value(); }
     void Refresh();
     VkDeviceSize Excess();

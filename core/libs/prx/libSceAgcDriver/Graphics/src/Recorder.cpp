@@ -3119,6 +3119,7 @@ void Recorder::Submit() {
     Check(function(queueSubmit, "vkQueueSubmit")(context.queue, 1, &submission, batch->fence), "vkQueueSubmit recorder");
     batch->submitted = true;
     batch->serial = ++submissions;
+    submittedSerial.store(submissions, std::memory_order_release);
     batch->submittedAt = std::chrono::steady_clock::now();
     if (DrawProfiled()) {
         const auto us = std::chrono::duration<double, std::micro>(batch->submittedAt - submitStart).count();
@@ -3583,6 +3584,8 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             release(*batch);
             Check(result, "vkWaitForFences recorder");
         }
+    }
+    for (auto seen = retiredSerial.load(std::memory_order_relaxed); seen < batch->serial && !retiredSerial.compare_exchange_weak(seen, batch->serial, std::memory_order_acq_rel);) {
     }
     readGpuTiming(*batch);
     readSamples(*batch);

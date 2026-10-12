@@ -2950,29 +2950,42 @@ void textureCacheBudgetTests() {
 }
 
 void sampledTextureBudgetTests() {
-    using AgcDriver::Graphics::SampledTextureBudget;
+    using AgcDriver::Graphics::TextureCacheBudgetsFor;
+    using AgcDriver::Graphics::TextureCacheBudgets;
+    using AgcDriver::Graphics::TextureMemoryUse;
     constexpr std::uint64_t GiB = 1ull << 30u;
     constexpr std::uint64_t MiB = 1ull << 20u;
+    const auto expect = [](const TextureCacheBudgets& budgets, std::uint64_t ceiling, std::uint64_t storage, std::uint64_t target, const std::string& what) {
+        Require(budgets.ceiling == ceiling && budgets.sampled == ceiling - ceiling / 5u && budgets.storage == storage && budgets.target == target, what + ": ceiling " + std::to_string(budgets.ceiling >> 20u) + " MiB, sampled " + std::to_string(budgets.sampled >> 20u) + " MiB, storage " + std::to_string(budgets.storage >> 20u) + " MiB, share " + std::to_string(budgets.target >> 20u) + " MiB");
+    };
     VkPhysicalDeviceMemoryProperties memory{};
     memory.memoryHeapCount = 3;
     memory.memoryHeaps[0] = {256 * MiB, VK_MEMORY_HEAP_DEVICE_LOCAL_BIT};
     memory.memoryHeaps[1] = {32 * GiB, 0};
     memory.memoryHeaps[2] = {16 * GiB, VK_MEMORY_HEAP_DEVICE_LOCAL_BIT};
     VkPhysicalDeviceMemoryBudgetPropertiesEXT reported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
-    Require(SampledTextureBudget(memory, nullptr, 0) == 4 * GiB, "without VK_EXT_memory_budget the sampled texture cache does not keep a quarter of the 16 GiB heap");
+    expect(TextureCacheBudgetsFor(memory, nullptr, {}), 5 * GiB, 4 * GiB, 0, "without VK_EXT_memory_budget the caches do not keep a quarter of the 16 GiB heap each, the sampled ceiling a quarter over");
     reported.heapBudget[0] = 100 * GiB;
     reported.heapBudget[1] = 100 * GiB;
-    Require(SampledTextureBudget(memory, &reported, 0) == 4 * GiB, "a zero budget for the largest device-local heap did not fall back to a quarter of the heap");
+    expect(TextureCacheBudgetsFor(memory, &reported, {}), 5 * GiB, 4 * GiB, 0, "a zero budget for the largest device-local heap did not fall back to the static budgets");
+    // 15 GiB budget, 960 MiB headroom, 9 GiB in use of which 5 GiB are textures: the caches share
+    // 10 GiB 64 MiB; the storage cache keeps its 4 GiB, the sampled images outside the cache take
+    // 1 GiB, the sampled cache the 5 GiB 64 MiB left.
     reported.heapBudget[2] = 15 * GiB;
     reported.heapUsage[2] = 9 * GiB;
-    Require(SampledTextureBudget(memory, &reported, 5 * GiB) == 5 * GiB + 128 * MiB, "a 15 GiB budget with 4 GiB used outside the texture caches does not leave 5 GiB 128 MiB after the 4 GiB storage cache and 1 GiB 896 MiB of headroom");
+    const TextureMemoryUse use{3 * GiB, 2 * GiB, 2 * GiB};
+    const auto shared = TextureCacheBudgetsFor(memory, &reported, use);
+    expect(shared, 5184 * MiB, 4 * GiB, 10304 * MiB, "a 15 GiB budget with 4 GiB used outside the texture caches");
+    Require(shared.ceiling + shared.storage + (use.sampled - use.sampledCached) + 4 * GiB + 960 * MiB == 15 * GiB, "the texture caches, the sampled images outside them, the other users and the headroom do not add up to the device's budget");
     reported.heapUsage[2] = 3 * GiB;
-    Require(SampledTextureBudget(memory, &reported, 5 * GiB) == 9 * GiB + 128 * MiB, "usage below the cached bytes is not read as no other device memory in use");
-    reported.heapUsage[2] = 12 * GiB;
-    Require(SampledTextureBudget(memory, &reported, 1 * GiB) == 2 * GiB, "a heap whose other users leave no room does not keep the 2 GiB floor");
+    expect(TextureCacheBudgetsFor(memory, &reported, use), 9280 * MiB, 4 * GiB, 14400 * MiB, "usage below the texture bytes is not read as no other device memory in use");
+    reported.heapUsage[2] = 9 * GiB;
+    expect(TextureCacheBudgetsFor(memory, &reported, {1 * GiB, 1 * GiB, 6 * GiB}), 6208 * MiB, 4 * GiB, 12352 * MiB, "a storage cache above its budget is not counted at its size against the sampled cache");
+    reported.heapUsage[2] = 15 * GiB;
+    expect(TextureCacheBudgetsFor(memory, &reported, {1 * GiB, 1 * GiB, 0}), 256 * MiB, 256 * MiB, 512 * MiB, "a heap whose other users leave no room does not keep the 512 MiB floor, half of it for each cache");
     memory.memoryHeaps[0].flags = 0;
     memory.memoryHeaps[2].flags = 0;
-    Require(SampledTextureBudget(memory, &reported, 0) == 2 * GiB, "a device without a device-local heap does not keep 2 GiB of sampled textures");
+    expect(TextureCacheBudgetsFor(memory, &reported, {}), 2 * GiB + 512 * MiB, 2 * GiB, 0, "a device without a device-local heap does not keep 2 GiB for each texture cache");
 }
 
 void sampledBudgetReportTests() {

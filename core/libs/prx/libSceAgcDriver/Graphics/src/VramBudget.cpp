@@ -40,10 +40,20 @@ VramBudget::VramBudget(const Context& context) : query(context.memoryProperties2
         heap.reset();
         return;
     }
-    static const VkDeviceSize forcedLimit = mibSetting("APS5_VRAM_BUDGET_MIB");
-    static const VkDeviceSize forcedHeadroom = mibSetting("APS5_VRAM_HEADROOM_MIB");
+    const VkDeviceSize forcedLimit = ForcedLimit();
+    const VkDeviceSize forcedHeadroom = ForcedHeadroom();
     limit = forcedLimit != 0 ? std::min(forcedLimit, heapBytes) : heapBytes;
     headroom = forcedHeadroom != 0 ? forcedHeadroom : HeadroomFor(limit);
+}
+
+VkDeviceSize VramBudget::ForcedLimit() {
+    static const VkDeviceSize forced = mibSetting("APS5_VRAM_BUDGET_MIB");
+    return forced;
+}
+
+VkDeviceSize VramBudget::ForcedHeadroom() {
+    static const VkDeviceSize forced = mibSetting("APS5_VRAM_HEADROOM_MIB");
+    return forced;
 }
 
 VkDeviceSize VramBudget::HeadroomFor(VkDeviceSize size) {

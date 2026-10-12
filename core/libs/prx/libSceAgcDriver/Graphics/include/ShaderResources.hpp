@@ -17,6 +17,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace AgcDriver { class VulkanDevice; }
@@ -28,7 +29,29 @@ class Recorder;
 void FlushCachedTextures(VkDevice device);
 void ClearCachedTextures(VkDevice device);
 std::uint64_t TextureCacheBudget(const VkPhysicalDeviceMemoryProperties& memory);
-std::uint64_t SampledTextureBudget(const VkPhysicalDeviceMemoryProperties& memory, const VkPhysicalDeviceMemoryBudgetPropertiesEXT* reported, std::uint64_t textureBytes);
+// What the texture caches hold: every live sampled texture's own image (SampledTextureMemory), the
+// part of it the sampled cache's snapshot entries account, and the storage image cache's bytes.
+struct TextureMemoryUse {
+    std::uint64_t sampled = 0;
+    std::uint64_t sampledCached = 0;
+    std::uint64_t storageCached = 0;
+};
+// The texture caches' budgets, out of one share of the device-local heap: VK_EXT_memory_budget's
+// budget (or APS5_VRAM_BUDGET_MIB) less the VramBudget headroom and less what everything else uses
+// (the heap's usage minus the texture bytes above: the buffer pool, unit shadows, depth surfaces,
+// presentation, the driver's own). The storage cache takes up to half of it (never more than
+// TextureCacheBudget); the sampled cache admits up to `ceiling`, what is left after the storage
+// budget and the sampled images alive outside the cache (in recorded work, in builds), and evicts
+// down to `sampled` (four fifths of it). `target` is the share (0 without VK_EXT_memory_budget: the
+// static budgets of before, the ceiling a quarter over the sampled budget). APS5_TEXTURE_CACHE_MIB
+// forces both caches' budgets.
+struct TextureCacheBudgets {
+    std::uint64_t sampled = 0;
+    std::uint64_t ceiling = 0;
+    std::uint64_t storage = 0;
+    std::uint64_t target = 0;
+};
+TextureCacheBudgets TextureCacheBudgetsFor(const VkPhysicalDeviceMemoryProperties& memory, const VkPhysicalDeviceMemoryBudgetPropertiesEXT* reported, const TextureMemoryUse& use);
 bool SampledBudgetReportDue(std::uint64_t reported, std::uint64_t budget, std::chrono::steady_clock::duration sinceReport);
 struct TextureCacheUse {
     std::size_t sampledEntries = 0;
@@ -37,6 +60,17 @@ struct TextureCacheUse {
 };
 TextureCacheUse TextureCacheUsage();
 std::uint64_t SampledTextureCacheBudget(const Context& context);
+TextureCacheBudgets CurrentTextureCacheBudgets(const Context& context);
+// Cumulative sampled-cache counters (the [texture-cache] line reports them per 10 s).
+struct SampledCacheCounts {
+    std::uint64_t evicted = 0;
+    std::uint64_t evictedBytes = 0;
+    std::uint64_t refused = 0;
+    std::uint64_t refusedBytes = 0;
+    std::uint64_t droppedSets = 0;
+    std::uint64_t refusedSets = 0;
+};
+SampledCacheCounts SampledCacheCounters();
 std::shared_ptr<Texture> CachedSampledTexture(const Context& context, std::span<const std::uint32_t> words);
 bool SampledTexturesShareEntry(std::span<const std::uint32_t> first, std::span<const std::uint32_t> second);
 
@@ -193,6 +227,12 @@ public:
     bool Reusable() const { return reusable; }
     static bool NeverReusable(std::span<const CompiledShader> shaders);
     const std::vector<std::shared_ptr<Texture>>& SampledTextures() const { return textures; }
+    // Whether a sampled texture of the set left the sampled cache (evicted, replaced, or made for
+    // one use and never admitted): such a set is not kept by the resource cache, whose entries may
+    // pin only textures the sampled cache accounts.
+    bool BindsReleasedTexture() const;
+    // The resource cache's pins on the set's sampled textures (Insert pins, every removal unpins).
+    void PinTextures(bool pin) const;
     bool ChecksFaults() const { return bda != nullptr; }
     void CheckFaults(std::uint64_t shaderAddress = 0) const;
     // `shaders` are the stages the object was built from, in build order (a recorded draw's vertex
@@ -561,6 +601,8 @@ public:
     // meanwhile by another worker stays).
     void Remove(const Key& key, const ShaderResources* object = nullptr);
     void RemoveImage(const StorageTexture* image, std::vector<std::shared_ptr<ShaderResources>>* evicted = nullptr);
+    // Drops every entry binding one of `textures` (sampled textures the sampled cache let go).
+    void RemoveTextures(const std::unordered_set<const Texture*>& textures, std::vector<std::shared_ptr<ShaderResources>>* evicted = nullptr);
     // Moves the entry to the front of the LRU (a recipe hit uses its template without Find, and a
     // hot template must not age out under the recipes that depend on it); false when no entry.
     bool Touch(const Key& key);
@@ -572,6 +614,7 @@ public:
 
 private:
     void erase(const Key& key);
+    void drop(std::list<std::pair<Key, std::shared_ptr<ShaderResources>>>::iterator entry, std::vector<std::shared_ptr<ShaderResources>>* evicted);
     void noteMiss(const Key& key);
     struct KeyHash {
         std::size_t operator()(const Key& key) const noexcept {
@@ -583,6 +626,9 @@ private:
     mutable std::mutex mutex;
     std::list<std::pair<Key, std::shared_ptr<ShaderResources>>> entries;
     std::unordered_map<Key, decltype(entries)::iterator, KeyHash> index;
+    // The entries by each sampled texture they bind (once per entry): RemoveTextures without a scan.
+    std::unordered_multimap<const Texture*, decltype(entries)::iterator> textureIndex;
+    void indexTextures(decltype(entries)::iterator entry, bool add);
 };
 
 // The process-wide cache the device and the draw path share (keys name the device; a device clears

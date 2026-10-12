@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VramBudget.hpp"
 #include <algorithm>
 #include <atomic>
 #include <memory>
@@ -125,7 +126,14 @@ struct TextureCache {
     std::list<CachedTexture> entries;
     std::unordered_map<TextureKey, std::list<CachedTexture>::iterator, TextureKeyHash> index;
     std::unordered_multimap<const StorageTexture*, std::list<CachedTexture>::iterator> views;
+    // Entries by their texture object (a Revalidate's touch of the textures its set binds).
+    std::unordered_map<const Texture*, std::list<CachedTexture>::iterator> byTexture;
+    // Textures of erased entries that resource-cache entries still pinned: the entries go with them
+    // once the cache's mutex is released (dropReleasedDependents).
+    std::vector<std::shared_ptr<Texture>> released;
     std::uint64_t bytes = 0;
+    // The part of `bytes` that snapshot entries account (their own images: SampledTextureMemory's).
+    std::uint64_t snapshotBytes = 0;
     std::size_t passed = 0;
     std::chrono::steady_clock::time_point passedSince{};
     std::uint64_t firstUsesPresent = 0;
@@ -136,20 +144,50 @@ struct TextureCache {
         std::uint64_t evicted = 0;
         std::uint64_t passed = 0;
         std::uint64_t stale = 0;
-    } counts;
+        std::uint64_t evictedBytes = 0;
+        std::uint64_t refused = 0;
+        std::uint64_t refusedBytes = 0;
+    } counts, totals;
     std::chrono::steady_clock::time_point countsReported = std::chrono::steady_clock::now();
-    VkPhysicalDevice budgetDevice = VK_NULL_HANDLE;
-    std::chrono::steady_clock::time_point budgetRead{};
-    std::uint64_t budget = 0;
-    std::uint64_t reportedBudget = 0;
-    std::chrono::steady_clock::time_point reportedAt{};
     std::uint64_t erasures = 0;
 };
+
+// The snapshot bytes of the sampled cache, readable without its mutex (the budgets of both caches
+// are computed under either cache's mutex).
+std::atomic<std::uint64_t>& SampledCachedBytes() {
+    static std::atomic<std::uint64_t> bytes{0};
+    return bytes;
+}
+
+// Resource-cache sets dropped because a sampled texture they bind left the cache, and inserts
+// refused because the set binds such a texture.
+struct SampledCacheAtomics {
+    std::atomic<std::uint64_t> droppedSets{0};
+    std::atomic<std::uint64_t> refusedSets{0};
+};
+
+SampledCacheAtomics& SampledAtomics() {
+    static SampledCacheAtomics counters;
+    return counters;
+}
+
+// The recorder serial a use made now is recorded under, and the newest one retired (see
+// Texture::LastUse); 0 without a recorder (tests that build without one).
+std::uint64_t useSerial() {
+    const auto* recorder = Recorder::Active();
+    return recorder != nullptr ? recorder->UseSerial() : 0;
+}
+
+std::uint64_t retiredSerial() {
+    const auto* recorder = Recorder::Active();
+    return recorder != nullptr ? recorder->RetiredSerial() : 0;
+}
 
 TextureCache& Textures() {
     static TextureCache cache;
     return cache;
 }
+
 
 struct UncachedImages {
     std::mutex mutex;
@@ -192,6 +230,13 @@ std::list<CachedTexture>::iterator findTexture(TextureCache& cache, const Textur
 
 void eraseTexture(TextureCache& cache, std::list<CachedTexture>::iterator it) {
     cache.bytes -= it->accounted;
+    if (it->source == nullptr) {
+        cache.snapshotBytes -= it->accounted;
+        SampledCachedBytes().store(cache.snapshotBytes, std::memory_order_relaxed);
+    }
+    it->texture->SetSampledCacheState(Texture::CacheState::Released);
+    if (it->texture->ResourcePins() != 0) cache.released.push_back(it->texture);
+    cache.byTexture.erase(it->texture.get());
     if (it->source != nullptr) {
         for (auto [view, last] = cache.views.equal_range(it->source.get()); view != last; ++view) {
             if (view->second == it) {
@@ -221,13 +266,33 @@ void dropUncachedViews(TextureCache& cache) {
     }
 }
 
-// Moves an entry to the front (most recently used).
+// Moves an entry to the front (most recently used); the recorded work about to bind it uses it.
 void touchTexture(TextureCache& cache, std::list<CachedTexture>::iterator it) {
     cache.entries.splice(cache.entries.begin(), cache.entries, it);
     it->present = Recorder::Presents();
+    it->texture->NoteUse(useSerial());
 }
 
-bool admitTexture(TextureCache& cache, const TextureKey& key, std::uint64_t incoming, std::uint64_t budget) {
+// Whether evicting the entry would free nothing now: a holder other than the cache and the
+// resource-cache entries binding it (a build, a caller, a set kept by recorded work), or a recorded
+// batch that uses it and has not retired. Pins alone do not hold it: the eviction drops those sets.
+bool textureInUse(const CachedTexture& entry, std::uint64_t retired) {
+    const auto holders = static_cast<long>(entry.texture.use_count()) - 1 - static_cast<long>(entry.texture->ResourcePins());
+    return holders > 0 || entry.texture->LastUse() > retired;
+}
+
+void countEvicted(TextureCache& cache, std::uint64_t bytes) {
+    ++cache.counts.evicted;
+    ++cache.totals.evicted;
+    cache.counts.evictedBytes += bytes;
+    cache.totals.evictedBytes += bytes;
+}
+
+// Evicts unused entries (least recently used first) down to the budget, passing over the ones in
+// use (textureInUse) and views that free nothing, then admits the incoming texture unless the cache
+// would pass the ceiling: a refused texture serves its one use and goes with it.
+bool admitTexture(TextureCache& cache, const TextureKey& key, std::uint64_t incoming, const TextureCacheBudgets& budgets) {
+    const auto budget = budgets.sampled;
     if (cache.bytes + incoming <= budget) return true;
     if (const auto now = std::chrono::steady_clock::now(); now - cache.passedSince >= std::chrono::seconds(1)) {
         cache.passed = 0;
@@ -239,38 +304,91 @@ bool admitTexture(TextureCache& cache, const TextureKey& key, std::uint64_t inco
         cache.firstUsesPresent = present;
     }
     const bool firstUse = incoming != 0 && present != 0 && !cache.firstUses.contains(key);
-    const auto ceiling = budget + budget / 4u;
+    const auto retired = retiredSerial();
     while (!cache.entries.empty() && cache.bytes + incoming > budget) {
         const auto back = std::prev(cache.entries.end());
         if (firstUse && back->present + 1u >= present) {
             cache.firstUses.insert(key);
             ++cache.counts.uncached;
+            ++cache.totals.uncached;
             return false;
         }
-        const bool over = cache.bytes + incoming > ceiling;
-        const bool keep = back->accounted == 0 || (!over && back->texture.use_count() > 1);
+        const bool keep = back->accounted == 0 || textureInUse(*back, retired);
         if (keep && cache.passed < cache.entries.size()) {
             cache.entries.splice(cache.entries.begin(), cache.entries, back);
             ++cache.passed;
             ++cache.counts.passed;
-        } else if (keep && !over) {
+        } else if (keep) {
             break;
         } else {
+            countEvicted(cache, back->accounted);
             eraseTexture(cache, back);
-            ++cache.counts.evicted;
         }
+    }
+    if (incoming != 0 && cache.bytes + incoming > budgets.ceiling) {
+        ++cache.counts.refused;
+        ++cache.totals.refused;
+        cache.counts.refusedBytes += incoming;
+        cache.totals.refusedBytes += incoming;
+        return false;
     }
     return true;
 }
 
-void reportCacheCounts(TextureCache& cache, std::uint64_t budget) {
+// Drops the resource-cache sets that bind textures the sampled cache let go (cache.released), so
+// they do not keep the images alive past the cache's budget; a set the next use needs is built
+// again. Called with the cache's mutex released. The sets go to the open batch when there is one
+// (their destruction then runs off the device lock once it completed), else here.
+void dropReleasedDependents() {
+    std::vector<std::shared_ptr<Texture>> released;
+    {
+        auto& cache = Textures();
+        std::lock_guard lock(cache.mutex);
+        if (cache.released.empty()) return;
+        released.swap(cache.released);
+    }
+    std::unordered_set<const Texture*> set;
+    set.reserve(released.size());
+    for (const auto& texture : released) set.insert(texture.get());
+    std::vector<std::shared_ptr<ShaderResources>> resources;
+    SharedResourceCache().RemoveTextures(set, &resources);
+    if (!resources.empty()) {
+        if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->Recording() && GuestMemory::GpuMutex().HeldByThisThread()) {
+            for (auto& resource : resources) recorder->Keep(std::move(resource));
+        }
+    }
+}
+
+// The RAII form, declared before the cache's lock so it runs after the unlock.
+struct DropReleasedDependents {
+    DropReleasedDependents() = default;
+    DropReleasedDependents(const DropReleasedDependents&) = delete;
+    DropReleasedDependents& operator=(const DropReleasedDependents&) = delete;
+    ~DropReleasedDependents() {
+        try {
+            dropReleasedDependents();
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "[texture-cache] dropping the resource sets of released textures failed: %s\n", error.what());
+        }
+    }
+};
+
+void reportCacheCounts(TextureCache& cache, const TextureCacheBudgets& budgets) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (!profile) return;
     const auto now = std::chrono::steady_clock::now();
     if (now - cache.countsReported < std::chrono::seconds(10)) return;
     cache.countsReported = now;
     const auto counts = std::exchange(cache.counts, {});
-    AgcDriver::ProfilePrint_nid_no_patch("[texture-cache] (10 s): %llu textures cached, %llu used uncached (first use this frame, the least recently used entry used this frame or the last), %llu evicted, %llu held ones passed over, %llu found changed; %llu MiB in %zu entries, budget %llu MiB, frame %llu\n", static_cast<unsigned long long>(counts.inserted), static_cast<unsigned long long>(counts.uncached), static_cast<unsigned long long>(counts.evicted), static_cast<unsigned long long>(counts.passed), static_cast<unsigned long long>(counts.stale), static_cast<unsigned long long>(cache.bytes >> 20u), cache.entries.size(), static_cast<unsigned long long>(budget >> 20u), static_cast<unsigned long long>(Recorder::Presents()));
+    static std::uint64_t droppedBefore = 0, refusedSetsBefore = 0;
+    auto& atomics = SampledAtomics();
+    const auto dropped = atomics.droppedSets.load(std::memory_order_relaxed);
+    const auto refusedSets = atomics.refusedSets.load(std::memory_order_relaxed);
+    const auto sampled = SampledTextureMemory();
+    const auto outside = sampled - std::min(sampled, cache.snapshotBytes);
+    AgcDriver::ProfilePrint_nid_no_patch("[texture-cache] (10 s): %llu textures cached, %llu used uncached (first use this frame, the least recently used entry used this frame or the last), %llu refused over the ceiling (%llu MiB), %llu evicted (%llu MiB), %llu in-use ones passed over, %llu found changed; %llu resource sets dropped with released textures, %llu not cached for binding one; %llu MiB in %zu entries, budget %llu MiB, ceiling %llu MiB; sampled images outside the cache %llu MiB (in recorded work and builds); storage budget %llu MiB, VRAM share of the texture caches %llu MiB; frame %llu\n", static_cast<unsigned long long>(counts.inserted), static_cast<unsigned long long>(counts.uncached), static_cast<unsigned long long>(counts.refused), static_cast<unsigned long long>(counts.refusedBytes >> 20u), static_cast<unsigned long long>(counts.evicted), static_cast<unsigned long long>(counts.evictedBytes >> 20u), static_cast<unsigned long long>(counts.passed), static_cast<unsigned long long>(counts.stale), static_cast<unsigned long long>(dropped - droppedBefore), static_cast<unsigned long long>(refusedSets - refusedSetsBefore), static_cast<unsigned long long>(cache.bytes >> 20u), cache.entries.size(), static_cast<unsigned long long>(budgets.sampled >> 20u), static_cast<unsigned long long>(budgets.ceiling >> 20u), static_cast<unsigned long long>(outside >> 20u), static_cast<unsigned long long>(budgets.storage >> 20u), static_cast<unsigned long long>(budgets.target >> 20u), static_cast<unsigned long long>(Recorder::Presents()));
+    droppedBefore = dropped;
+    refusedSetsBefore = refusedSets;
 }
 
 struct ImageMemoEntry {
@@ -489,35 +607,52 @@ std::uint64_t forcedCacheBudget() {
     return forced;
 }
 
-std::uint64_t storageBudget(const Context& context) {
-    const auto forced = forcedCacheBudget();
-    return forced != 0 ? forced : TextureCacheBudget(context.memory);
+// Both caches' budgets (TextureCacheBudgetsFor), read from VK_EXT_memory_budget at most once a
+// second and shared by the two caches; under its own mutex, which nothing else is taken under.
+struct BudgetState {
+    std::mutex mutex;
+    VkPhysicalDevice device = VK_NULL_HANDLE;
+    std::chrono::steady_clock::time_point readAt{};
+    TextureCacheBudgets budgets;
+    std::uint64_t reportedBudget = 0;
+    std::chrono::steady_clock::time_point reportedAt{};
+};
+
+BudgetState& Budgets() {
+    static BudgetState state;
+    return state;
 }
 
-std::uint64_t sampledBudget(const Context& context, TextureCache& cache) {
-    if (const auto forced = forcedCacheBudget(); forced != 0) return forced;
-    if (context.memoryProperties2 == nullptr || context.physical == VK_NULL_HANDLE) return TextureCacheBudget(context.memory);
+TextureCacheBudgets currentBudgets(const Context& context) {
+    if (const auto forced = forcedCacheBudget(); forced != 0) return {forced, forced + forced / 4u, forced, 0};
+    if (context.memoryProperties2 == nullptr || context.physical == VK_NULL_HANDLE) return TextureCacheBudgetsFor(context.memory, nullptr, {});
+    auto& state = Budgets();
+    std::lock_guard lock(state.mutex);
     const auto now = std::chrono::steady_clock::now();
-    if (cache.budgetDevice == context.physical && now - cache.budgetRead < std::chrono::seconds(1)) return cache.budget;
+    if (state.device == context.physical && now - state.readAt < std::chrono::seconds(1)) return state.budgets;
     VkPhysicalDeviceMemoryBudgetPropertiesEXT reported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
     VkPhysicalDeviceMemoryProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
     properties.pNext = &reported;
     context.memoryProperties2(context.physical, &properties);
-    const auto sampled = SampledTextureMemory();
-    const auto storage = storageCacheBytes();
-    const auto budget = SampledTextureBudget(context.memory, &reported, sampled + storage);
-    const bool fresh = cache.budgetDevice != context.physical;
-    if (const auto heap = largestDeviceLocalHeap(context.memory); heap && (fresh || SampledBudgetReportDue(cache.reportedBudget, budget, now - cache.reportedAt))) {
+    const TextureMemoryUse use{SampledTextureMemory(), SampledCachedBytes().load(std::memory_order_relaxed), storageCacheBytes()};
+    const auto budgets = TextureCacheBudgetsFor(context.memory, &reported, use);
+    const bool fresh = state.device != context.physical;
+    if (const auto heap = largestDeviceLocalHeap(context.memory); heap && (fresh || SampledBudgetReportDue(state.reportedBudget, budgets.sampled, now - state.reportedAt))) {
         char was[48] = "";
-        if (!fresh) std::snprintf(was, sizeof(was), " (was %llu MiB)", static_cast<unsigned long long>(cache.reportedBudget >> 20u));
-        std::fprintf(stderr, "[gpu] sampled texture cache budget %llu MiB%s: device-local heap %u has a VK_EXT_memory_budget budget of %llu MiB and uses %llu MiB, %llu MiB of it sampled textures (%llu MiB in the cache) and %llu MiB cached storage images; storage image cache budget %llu MiB\n", static_cast<unsigned long long>(budget >> 20u), was, *heap, static_cast<unsigned long long>(reported.heapBudget[*heap] >> 20u), static_cast<unsigned long long>(reported.heapUsage[*heap] >> 20u), static_cast<unsigned long long>(sampled >> 20u), static_cast<unsigned long long>(cache.bytes >> 20u), static_cast<unsigned long long>(storage >> 20u), static_cast<unsigned long long>(TextureCacheBudget(context.memory) >> 20u));
-        cache.reportedBudget = budget;
-        cache.reportedAt = now;
+        if (!fresh) std::snprintf(was, sizeof(was), " (was %llu MiB)", static_cast<unsigned long long>(state.reportedBudget >> 20u));
+        const auto outside = use.sampled - std::min(use.sampled, use.sampledCached);
+        std::fprintf(stderr, "[gpu] sampled texture cache budget %llu MiB%s, ceiling %llu MiB; storage image cache budget %llu MiB; the texture caches' share of the VRAM %llu MiB: device-local heap %u has a VK_EXT_memory_budget budget of %llu MiB and uses %llu MiB, %llu MiB of it sampled textures (%llu MiB in the cache, %llu MiB outside it) and %llu MiB cached storage images\n", static_cast<unsigned long long>(budgets.sampled >> 20u), was, static_cast<unsigned long long>(budgets.ceiling >> 20u), static_cast<unsigned long long>(budgets.storage >> 20u), static_cast<unsigned long long>(budgets.target >> 20u), *heap, static_cast<unsigned long long>(reported.heapBudget[*heap] >> 20u), static_cast<unsigned long long>(reported.heapUsage[*heap] >> 20u), static_cast<unsigned long long>(use.sampled >> 20u), static_cast<unsigned long long>(use.sampledCached >> 20u), static_cast<unsigned long long>(outside >> 20u), static_cast<unsigned long long>(use.storageCached >> 20u));
+        state.reportedBudget = budgets.sampled;
+        state.reportedAt = now;
     }
-    cache.budgetDevice = context.physical;
-    cache.budgetRead = now;
-    cache.budget = budget;
-    return budget;
+    state.device = context.physical;
+    state.readAt = now;
+    state.budgets = budgets;
+    return budgets;
+}
+
+std::uint64_t storageBudget(const Context& context) {
+    return currentBudgets(context).storage;
 }
 
 // `guestBytes` is the surface size when the caller described the surface already (0: described here).
@@ -636,6 +771,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     }
     auto& cache = Textures();
     const auto key = MakeTextureKey(context.device, words, components, depthCompare);
+    const DropReleasedDependents dropAfterUnlock;
     std::lock_guard lock(cache.mutex);
     dropUncachedViews(cache);
     if (auto it = findTexture(cache, key); it != cache.entries.end()) {
@@ -685,7 +821,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         } else {
             entry.texture = std::make_shared<Texture>(context, source, resource, components);
         }
-        entry.accounted = source->Cached() ? 0u : heldBytes(*source);
+        entry.accounted = (source->Cached() ? 0u : heldBytes(*source)) + (entry.texture->IsDepthCopy() ? entry.texture->AllocationBytes() : 0u);
         counters.fromStorage.fetch_add(1, std::memory_order_relaxed);
     } else {
         // Snapshot before the upload so a write racing with it is caught by the next comparison.
@@ -706,23 +842,32 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         entry.accounted = entry.texture->AllocationBytes();
         counters.snapshots.fetch_add(1, std::memory_order_relaxed);
     }
-    const auto budget = sampledBudget(context, cache);
+    const auto budgets = currentBudgets(context);
     auto texture = entry.texture;
-    if (!admitTexture(cache, key, entry.accounted, budget)) {
+    texture->NoteUse(useSerial());
+    if (!admitTexture(cache, key, entry.accounted, budgets)) {
+        texture->SetSampledCacheState(Texture::CacheState::Released);
         logLookup({texture.get(), resource, guestBytes, *keys, generation, source.get()});
-        reportCacheCounts(cache, budget);
+        reportCacheCounts(cache, budgets);
         reportTextureCounters();
         if (profile) LookupOutcomes::Add(source != nullptr ? LookupOutcomes::SampledMadeView : LookupOutcomes::SampledMadeSnapshot, start);
         return texture;
     }
     cache.bytes += entry.accounted;
+    if (source == nullptr) {
+        cache.snapshotBytes += entry.accounted;
+        SampledCachedBytes().store(cache.snapshotBytes, std::memory_order_relaxed);
+    }
     entry.present = Recorder::Presents();
     ++cache.counts.inserted;
+    ++cache.totals.inserted;
     logLookup({texture.get(), resource, guestBytes, *keys, generation, source.get()});
+    texture->SetSampledCacheState(Texture::CacheState::Cached);
     cache.entries.push_front(std::move(entry));
     cache.index[key] = cache.entries.begin();
+    cache.byTexture[texture.get()] = cache.entries.begin();
     if (source != nullptr) cache.views.emplace(source.get(), cache.entries.begin());
-    reportCacheCounts(cache, budget);
+    reportCacheCounts(cache, budgets);
     reportTextureCounters();
     if (profile) LookupOutcomes::Add(source != nullptr ? LookupOutcomes::SampledMadeView : LookupOutcomes::SampledMadeSnapshot, start);
     return texture;
@@ -924,13 +1069,23 @@ std::uint64_t TextureCacheBudget(const VkPhysicalDeviceMemoryProperties& memory)
     return std::max<std::uint64_t>(2048ull << 20u, heap ? memory.memoryHeaps[*heap].size / 4u : 0u);
 }
 
-std::uint64_t SampledTextureBudget(const VkPhysicalDeviceMemoryProperties& memory, const VkPhysicalDeviceMemoryBudgetPropertiesEXT* reported, std::uint64_t textureBytes) {
+TextureCacheBudgets TextureCacheBudgetsFor(const VkPhysicalDeviceMemoryProperties& memory, const VkPhysicalDeviceMemoryBudgetPropertiesEXT* reported, const TextureMemoryUse& use) {
+    constexpr std::uint64_t MiB = 1ull << 20u;
+    const auto fixed = TextureCacheBudget(memory);
     const auto heap = largestDeviceLocalHeap(memory);
-    if (reported == nullptr || !heap || reported->heapBudget[*heap] == 0) return TextureCacheBudget(memory);
-    const auto budget = reported->heapBudget[*heap];
+    if (reported == nullptr || !heap || reported->heapBudget[*heap] == 0) return {fixed, fixed + fixed / 4u, fixed, 0};
+    auto limit = std::min<std::uint64_t>(reported->heapBudget[*heap], memory.memoryHeaps[*heap].size);
+    if (const auto forced = VramBudget::ForcedLimit(); forced != 0) limit = std::min<std::uint64_t>(limit, forced);
+    const auto headroom = VramBudget::ForcedHeadroom() != 0 ? VramBudget::ForcedHeadroom() : VramBudget::HeadroomFor(limit);
     const auto usage = reported->heapUsage[*heap];
-    const auto reserved = usage - std::min<std::uint64_t>(usage, textureBytes) + TextureCacheBudget(memory) + budget / 8u;
-    return std::max<std::uint64_t>(2048ull << 20u, budget > reserved ? budget - reserved : 0u);
+    const auto other = usage - std::min<std::uint64_t>(usage, use.sampled + use.storageCached);
+    const auto reserved = headroom + other;
+    const auto target = std::max<std::uint64_t>(limit > reserved ? limit - reserved : 0u, std::min<std::uint64_t>(limit / 16u, 512 * MiB));
+    const auto storage = std::min<std::uint64_t>(fixed, std::max<std::uint64_t>(target / 2u, 256 * MiB));
+    const auto outside = use.sampled - std::min(use.sampled, use.sampledCached);
+    const auto taken = std::max<std::uint64_t>(storage, use.storageCached) + outside;
+    const auto ceiling = std::max<std::uint64_t>(target > taken ? target - taken : 0u, std::min<std::uint64_t>(target / 8u, 128 * MiB));
+    return {ceiling - ceiling / 5u, ceiling, storage, target};
 }
 
 bool SampledBudgetReportDue(std::uint64_t reported, std::uint64_t budget, std::chrono::steady_clock::duration sinceReport) {
@@ -939,18 +1094,23 @@ bool SampledBudgetReportDue(std::uint64_t reported, std::uint64_t budget, std::c
 }
 
 void AppendTextureMemoryStats(std::string& line) {
-    std::uint64_t snapshotBytes = 0, coveredBytes = 0, deviceBytes = 0;
+    std::uint64_t snapshotBytes = 0, coveredBytes = 0, deviceBytes = 0, cachedSnapshots = 0;
     std::size_t entries = 0, snapshots = 0, views = 0;
+    std::size_t pinned = 0;
+    decltype(Textures().totals) totals;
     {
         auto& sampled = Textures();
         std::lock_guard lock(sampled.mutex);
         entries = sampled.entries.size();
         deviceBytes = sampled.bytes;
+        cachedSnapshots = sampled.snapshotBytes;
+        totals = sampled.totals;
         for (const auto& entry : sampled.entries) {
             snapshotBytes += entry.hashes.capacity() * sizeof(ContentHash::Hash128);
             coveredBytes += entry.bytes;
             snapshots += entry.bytes != 0;
             views += entry.source != nullptr;
+            pinned += entry.texture->ResourcePins() != 0;
         }
     }
     // Host bytes held to validate snapshots (block hashes), and the guest bytes they stand for.
@@ -958,6 +1118,27 @@ void AppendTextureMemoryStats(std::string& line) {
     MemoryStats::AppendMiB(line, "tex_sampled_snapshot_guest", coveredBytes);
     MemoryStats::AppendMiB(line, "tex_sampled_device", deviceBytes, entries);
     MemoryStats::AppendCount(line, "tex_sampled_views", views);
+    // Sampled images alive outside the cache's accounting (refused or evicted ones still in
+    // recorded work or builds), the cached ones resource-cache sets pin, the budgets of both
+    // caches and their share of the VRAM, and what the eviction did.
+    const auto sampledAll = SampledTextureMemory();
+    MemoryStats::AppendMiB(line, "tex_sampled_outside", sampledAll - std::min(sampledAll, cachedSnapshots));
+    MemoryStats::AppendCount(line, "tex_sampled_pinned", pinned);
+    TextureCacheBudgets current;
+    {
+        auto& state = Budgets();
+        std::lock_guard lock(state.mutex);
+        current = state.budgets;
+    }
+    MemoryStats::AppendMiB(line, "tex_sampled_budget", current.sampled);
+    MemoryStats::AppendMiB(line, "tex_sampled_ceiling", current.ceiling);
+    MemoryStats::AppendMiB(line, "tex_storage_budget", current.storage);
+    MemoryStats::AppendMiB(line, "tex_vram_share", current.target);
+    MemoryStats::AppendMiB(line, "tex_sampled_evicted", totals.evictedBytes, totals.evicted);
+    MemoryStats::AppendMiB(line, "tex_sampled_refused", totals.refusedBytes, totals.refused);
+    auto& atomics = SampledAtomics();
+    MemoryStats::AppendCount(line, "rescache_sets_dropped", atomics.droppedSets.load(std::memory_order_relaxed));
+    MemoryStats::AppendCount(line, "rescache_sets_refused", atomics.refusedSets.load(std::memory_order_relaxed));
     std::size_t storageEntries = 0;
     {
         auto& storage = StorageTextures();
@@ -970,6 +1151,7 @@ void AppendTextureMemoryStats(std::string& line) {
 TextureCacheUse TextureCacheUsage() {
     TextureCacheUse use;
     {
+        const DropReleasedDependents dropAfterUnlock;
         auto& sampled = Textures();
         std::lock_guard lock(sampled.mutex);
         dropUncachedViews(sampled);
@@ -981,9 +1163,27 @@ TextureCacheUse TextureCacheUsage() {
 }
 
 std::uint64_t SampledTextureCacheBudget(const Context& context) {
-    auto& cache = Textures();
-    std::lock_guard lock(cache.mutex);
-    return sampledBudget(context, cache);
+    return currentBudgets(context).sampled;
+}
+
+TextureCacheBudgets CurrentTextureCacheBudgets(const Context& context) {
+    return currentBudgets(context);
+}
+
+SampledCacheCounts SampledCacheCounters() {
+    SampledCacheCounts counts;
+    {
+        auto& cache = Textures();
+        std::lock_guard lock(cache.mutex);
+        counts.evicted = cache.totals.evicted;
+        counts.evictedBytes = cache.totals.evictedBytes;
+        counts.refused = cache.totals.refused;
+        counts.refusedBytes = cache.totals.refusedBytes;
+    }
+    auto& atomics = SampledAtomics();
+    counts.droppedSets = atomics.droppedSets.load(std::memory_order_relaxed);
+    counts.refusedSets = atomics.refusedSets.load(std::memory_order_relaxed);
+    return counts;
 }
 
 std::shared_ptr<Texture> CachedSampledTexture(const Context& context, std::span<const std::uint32_t> words) {
@@ -1019,6 +1219,7 @@ void ClearCachedTextures(VkDevice device) {
             else ++it;
         }
     }
+    dropReleasedDependents();
     auto& storage = StorageTextures();
     std::lock_guard lock(storage.mutex);
     for (auto it = storage.entries.begin(); it != storage.entries.end();) {
@@ -2161,6 +2362,24 @@ bool EpochRevalidate() {
 
 }
 
+namespace {
+
+bool touchSampledTextures(const std::vector<std::shared_ptr<Texture>>& textures) {
+    const auto managed = [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->SampledCacheState() != Texture::CacheState::Unmanaged; };
+    if (std::none_of(textures.begin(), textures.end(), managed)) return true;
+    auto& cache = Textures();
+    std::lock_guard lock(cache.mutex);
+    for (const auto& texture : textures) {
+        if (!managed(texture)) continue;
+        const auto found = cache.byTexture.find(texture.get());
+        if (found == cache.byTexture.end()) return false;
+        touchTexture(cache, found->second);
+    }
+    return true;
+}
+
+}
+
 // Turns the lookups' records into this object's per-texture validation records (see
 // ValidatedSurface); the last record of an object is the freshest.
 void ShaderResources::captureValidation() {
@@ -2708,6 +2927,11 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             return finish(fast, false);
         }
     }
+    // (4) The sampled textures are used again: their cache entries move to the front of the
+    // eviction order and take this batch's serial, like a lookup's hit. A texture that left the
+    // cache meanwhile (evicted while another holder kept this object) fails the proof: the
+    // rebuild takes a cached one, so the set never pins what the cache does not account.
+    if (!touchSampledTextures(textures)) return finish(fast, false, ProofFailure::Evicted);
     pendingSerialSeen = EpochRevalidate() && StorageTexture::PendingSerial() == serialBefore ? serialBefore : 0;
     for (const auto& texture : textures) {
         if (texture != nullptr && texture->IsDepthCopy()) texture->RefreshDepthCopy();
@@ -2875,13 +3099,18 @@ void ResourceCache::noteMiss(const Key& key) {
 
 void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> resources, std::vector<std::shared_ptr<ShaderResources>>* evicted) {
     std::lock_guard lock(mutex);
-    if (const auto found = index.find(key); found != index.end()) {
-        if (evicted != nullptr) evicted->push_back(std::move(found->second->second));
-        entries.erase(found->second);
-        index.erase(found);
+    if (const auto found = index.find(key); found != index.end()) drop(found->second, evicted);
+    // A set binding a sampled texture the sampled cache let go would keep its image alive outside
+    // the cache's budget: it serves its own use only. Checked under this mutex, after which an
+    // eviction's RemoveTextures finds the entry (the eviction marks the texture first).
+    if (resources->BindsReleasedTexture()) {
+        SampledAtomics().refusedSets.fetch_add(1, std::memory_order_relaxed);
+        return;
     }
+    resources->PinTextures(true);
     entries.emplace_front(key, std::move(resources));
     index.emplace(key, entries.begin());
+    indexTextures(entries.begin(), true);
     // Entries pin their textures and storage images past the texture caches' budgets, so the bound
     // stays modest: APS5_RESOURCE_CACHE_ENTRIES (default 1024) covers several frames of distinct
     // dispatch and draw content.
@@ -2890,11 +3119,7 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
         const auto parsed = value ? std::strtoull(value, nullptr, 10) : 1024ull;
         return static_cast<std::size_t>(parsed != 0 ? parsed : 1024ull);
     }();
-    while (entries.size() > capacity) {
-        if (evicted != nullptr) evicted->push_back(std::move(entries.back().second));
-        index.erase(entries.back().first);
-        entries.pop_back();
-    }
+    while (entries.size() > capacity) drop(std::prev(entries.end()), evicted);
 }
 
 void ResourceCache::Remove(const Key& key, const ShaderResources* object) {
@@ -2913,10 +3138,52 @@ void ResourceCache::RemoveImage(const StorageTexture* image, std::vector<std::sh
             ++it;
             continue;
         }
-        if (evicted != nullptr) evicted->push_back(std::move(it->second));
-        index.erase(it->first);
-        it = entries.erase(it);
+        drop(it++, evicted);
     }
+}
+
+void ResourceCache::RemoveTextures(const std::unordered_set<const Texture*>& textures, std::vector<std::shared_ptr<ShaderResources>>* evicted) {
+    if (textures.empty()) return;
+    std::lock_guard lock(mutex);
+    std::vector<decltype(entries)::iterator> binding;
+    for (const auto* texture : textures) {
+        for (auto [found, last] = textureIndex.equal_range(texture); found != last; ++found) binding.push_back(found->second);
+    }
+    std::sort(binding.begin(), binding.end(), [](const auto& first, const auto& second) { return std::less<>{}(&*first, &*second); });
+    binding.erase(std::unique(binding.begin(), binding.end()), binding.end());
+    for (const auto entry : binding) drop(entry, evicted);
+    if (!binding.empty()) SampledAtomics().droppedSets.fetch_add(binding.size(), std::memory_order_relaxed);
+}
+
+void ResourceCache::indexTextures(decltype(entries)::iterator entry, bool add) {
+    thread_local std::vector<const Texture*>* uniqueSlot = nullptr;
+    auto& unique = ShaderRecompiler::ThreadOwned(uniqueSlot);
+    unique.clear();
+    for (const auto& texture : entry->second->SampledTextures()) {
+        if (texture != nullptr) unique.push_back(texture.get());
+    }
+    std::sort(unique.begin(), unique.end());
+    unique.erase(std::unique(unique.begin(), unique.end()), unique.end());
+    for (const auto* texture : unique) {
+        if (add) {
+            textureIndex.emplace(texture, entry);
+            continue;
+        }
+        for (auto [found, last] = textureIndex.equal_range(texture); found != last; ++found) {
+            if (found->second == entry) {
+                textureIndex.erase(found);
+                break;
+            }
+        }
+    }
+}
+
+void ResourceCache::drop(std::list<std::pair<Key, std::shared_ptr<ShaderResources>>>::iterator entry, std::vector<std::shared_ptr<ShaderResources>>* evicted) {
+    entry->second->PinTextures(false);
+    indexTextures(entry, false);
+    index.erase(entry->first);
+    if (evicted != nullptr) evicted->push_back(std::move(entry->second));
+    entries.erase(entry);
 }
 
 bool ResourceCache::Touch(const Key& key) {
@@ -2938,6 +3205,8 @@ std::uint64_t ResourceCache::Touches() {
 
 void ResourceCache::Clear() {
     std::lock_guard lock(mutex);
+    for (const auto& entry : entries) entry.second->PinTextures(false);
+    textureIndex.clear();
     index.clear();
     entries.clear();
 }
@@ -2950,8 +3219,7 @@ std::size_t ResourceCache::Size() const {
 void ResourceCache::erase(const Key& key) {
     const auto found = index.find(key);
     if (found == index.end()) return;
-    entries.erase(found->second);
-    index.erase(found);
+    drop(found->second, nullptr);
 }
 
 ResourceCache& SharedResourceCache() {
@@ -4227,6 +4495,18 @@ bool ShaderResources::ReadsImage(const StorageTexture* image) const {
         if (texture != nullptr && texture->StorageSource() == image) return true;
     }
     return std::any_of(storageTextures.begin(), storageTextures.end(), [&](const auto& storage) { return storage.get() == image; });
+}
+
+bool ShaderResources::BindsReleasedTexture() const {
+    return std::any_of(textures.begin(), textures.end(), [](const auto& texture) { return texture != nullptr && texture->SampledCacheState() == Texture::CacheState::Released; });
+}
+
+void ShaderResources::PinTextures(bool pin) const {
+    for (const auto& texture : textures) {
+        if (texture == nullptr) continue;
+        if (pin) texture->Pin();
+        else texture->Unpin();
+    }
 }
 
 }

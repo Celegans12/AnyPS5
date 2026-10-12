@@ -101,8 +101,28 @@ public:
     // the source image's own (snapshots, views over other metadata); one per cache entry, so every
     // object binding the texture shares it. Under GuestMemory::GpuMutex only.
     DccKeyProof& KeyProof() const { return keyProof; }
+    // The sampled texture cache's bookkeeping (ShaderResources.cpp): whether the cache holds the
+    // texture (Unmanaged: it never did, e.g. a depth surface's view; Released: it left the cache, or
+    // was made for one use and never admitted), how many entries of the resource cache bind it
+    // (they pin it), and the recorder serial of the newest batch that uses it, which a batch
+    // retired past means no recorded GPU work uses it any more.
+    enum class CacheState : std::uint8_t { Unmanaged, Cached, Released };
+    CacheState SampledCacheState() const { return cacheState.load(std::memory_order_acquire); }
+    void SetSampledCacheState(CacheState state) { cacheState.store(state, std::memory_order_release); }
+    std::uint32_t ResourcePins() const { return resourcePins.load(std::memory_order_acquire); }
+    void Pin() { resourcePins.fetch_add(1, std::memory_order_acq_rel); }
+    void Unpin() { resourcePins.fetch_sub(1, std::memory_order_acq_rel); }
+    std::uint64_t LastUse() const { return lastUse.load(std::memory_order_acquire); }
+    void NoteUse(std::uint64_t serial) {
+        auto seen = lastUse.load(std::memory_order_relaxed);
+        while (seen < serial && !lastUse.compare_exchange_weak(seen, serial, std::memory_order_acq_rel)) {
+        }
+    }
 
 private:
+    std::atomic<CacheState> cacheState{CacheState::Unmanaged};
+    std::atomic<std::uint32_t> resourcePins{0};
+    std::atomic<std::uint64_t> lastUse{0};
     void release() noexcept;
     void createFirstLayerView(const GuestTextureResource& descriptor, VkImageViewCreateInfo viewInfo);
     void prepareBaseLevelView(const GuestTextureResource& descriptor, VkImageViewCreateInfo viewInfo);

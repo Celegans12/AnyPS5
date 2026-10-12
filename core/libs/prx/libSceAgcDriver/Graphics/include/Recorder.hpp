@@ -218,6 +218,10 @@ public:
     // Completes batches that already finished; returns whether nothing is in flight.
     bool Reap();
     std::uint64_t Submissions() const { return submissions; }
+    // Lock-free: the serial the work recorded now will carry (the open batch's, or the next one's),
+    // and the newest serial whose batch and every earlier one finished (their GPU work is done).
+    std::uint64_t UseSerial() const { return submittedSerial.load(std::memory_order_acquire) + 1; }
+    std::uint64_t RetiredSerial() const { return retiredSerial.load(std::memory_order_acquire); }
     // Batches submitted and not yet finished (what a full Sync() waits for); under GuestMemory::GpuMutex.
     std::size_t InFlightBatches() const { return inFlight.size(); }
     // Reaps that retired at least one batch so far (the [recorder] line's 'with work' count).
@@ -783,6 +787,8 @@ private:
     // snapshot (a rebuild from inside a completion must not drop them) until finish returns.
     std::vector<const Batch*> finishing;
     std::uint64_t submissions = 0;
+    std::atomic<std::uint64_t> submittedSerial{0};
+    std::atomic<std::uint64_t> retiredSerial{0};
     std::size_t inFlightKeptBytes = 0;
     std::uint64_t writeNoteCount = 0;
     // Command buffers and fences of completed batches, reused by later ones (hundreds of batches per

@@ -246,13 +246,14 @@ void reportedBudgetTests(const Context& context) {
     VkPhysicalDeviceMemoryProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
     properties.pNext = &reported;
     context.memoryProperties2(context.physical, &properties);
-    const auto budget = SampledTextureBudget(context.memory, &reported, 0);
-    Require(budget >= (2048ull << 20u), "the sampled texture cache budget is below the 2 GiB floor");
+    const auto budgets = TextureCacheBudgetsFor(context.memory, &reported, {});
+    const auto budget = budgets.sampled;
+    Require(budget != 0 && budgets.ceiling > budget && budgets.storage <= TextureCacheBudget(context.memory) && budgets.target >= budgets.storage, "the texture cache budgets of the device are inconsistent");
     for (std::uint32_t heap = 0; heap < context.memory.memoryHeapCount; ++heap) {
         if ((context.memory.memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0) continue;
         std::printf("device-local heap %u: %llu MiB, VK_EXT_memory_budget budget %llu MiB, usage %llu MiB\n", heap, static_cast<unsigned long long>(context.memory.memoryHeaps[heap].size >> 20u), static_cast<unsigned long long>(reported.heapBudget[heap] >> 20u), static_cast<unsigned long long>(reported.heapUsage[heap] >> 20u));
     }
-    std::printf("sampled texture cache budget %llu MiB, storage image cache budget %llu MiB\n", static_cast<unsigned long long>(budget >> 20u), static_cast<unsigned long long>(TextureCacheBudget(context.memory) >> 20u));
+    std::printf("sampled texture cache budget %llu MiB (ceiling %llu MiB), storage image cache budget %llu MiB, VRAM share of the texture caches %llu MiB\n", static_cast<unsigned long long>(budget >> 20u), static_cast<unsigned long long>(budgets.ceiling >> 20u), static_cast<unsigned long long>(budgets.storage >> 20u), static_cast<unsigned long long>(budgets.target >> 20u));
 }
 
 void snapshotTests(const Context& context) {
@@ -318,9 +319,10 @@ void heldTests(const Context& context) {
     for (std::size_t surface = 0; surface <= capacity; ++surface) all.push_back(Sampled(context, block.Surface(surface)));
     Require(TextureCacheUsage().sampledEntries == capacity + 1u && TextureCacheUsage().sampledBytes > Budget, "textures their callers hold left a cache over its budget");
     for (std::size_t surface = 0; surface < all.size(); ++surface) Require(Sampled(context, block.Surface(surface)) == all[surface], "surface " + std::to_string(surface) + " was made again while its texture was held");
-    all.push_back(Sampled(context, block.Surface(capacity + 1u)));
+    const std::weak_ptr<Texture> refused = Sampled(context, block.Surface(capacity + 1u));
+    Require(refused.expired(), "past the ceiling, a texture nobody holds any more was cached or kept");
     Require(TextureCacheUsage().sampledEntries == capacity + 1u && TextureCacheUsage().sampledBytes <= Ceiling, "held textures took the sampled texture cache past a quarter over its budget");
-    for (std::size_t surface = 1; surface < all.size(); ++surface) Require(Sampled(context, block.Surface(surface)) == all[surface], "past the ceiling, surface " + std::to_string(surface) + " left in place of the least recently used held texture");
+    for (std::size_t surface = 0; surface < all.size(); ++surface) Require(Sampled(context, block.Surface(surface)) == all[surface], "past the ceiling, held surface " + std::to_string(surface) + " was evicted, which frees nothing, instead of the new texture being refused");
     all.clear();
     Sampled(context, block.Surface(capacity + 2u));
     Require(TextureCacheUsage().sampledEntries == capacity && TextureCacheUsage().sampledBytes <= Budget, "released textures were not evicted down to the budget");
@@ -472,7 +474,8 @@ std::uint64_t ExpectedBudget(const Context& context) {
     VkPhysicalDeviceMemoryBudgetPropertiesEXT reported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
     VkPhysicalDeviceMemoryProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &reported};
     ReportBudget(context.physical, &properties);
-    return SampledTextureBudget(context.memory, &reported, SampledTextureMemory() + TextureCacheUsage().storageBytes);
+    const auto use = TextureCacheUsage();
+    return TextureCacheBudgetsFor(context.memory, &reported, {SampledTextureMemory(), use.sampledBytes, use.storageBytes}).sampled;
 }
 
 std::uint64_t ReadBudget(const Context& context) {
@@ -491,7 +494,7 @@ void memoryTests(Context context) {
     ClearCachedTextures(context.device);
     Require(TextureCacheUsage().sampledEntries == 0 && SampledTextureMemory() == before + held->AllocationBytes(), "a texture its caller still holds stopped counting as sampled texture memory when it left the cache");
     const auto budget = ReadBudget(context);
-    Require(budget == ExpectedBudget(context), "the sampled texture cache budget counts a texture its caller still holds as memory in use outside the texture caches");
+    Require(budget == ExpectedBudget(context), "the sampled texture cache budget does not count a texture its caller still holds outside the cache against the cache");
     std::printf("reported heap budget %llu MiB with %llu MiB in use: sampled texture cache budget %llu MiB with a %llu KiB texture held outside the cache\n", static_cast<unsigned long long>(ReportedBudget >> 20u), static_cast<unsigned long long>(ReportedUsage >> 20u), static_cast<unsigned long long>(budget >> 20u), static_cast<unsigned long long>(held->AllocationBytes() >> 10u));
     held.reset();
     Require(SampledTextureMemory() == before, "a released texture still counts as sampled texture memory");
