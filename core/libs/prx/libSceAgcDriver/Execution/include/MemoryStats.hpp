@@ -17,6 +17,7 @@ namespace AgcDriver::MemoryStats {
 enum class Counter : std::uint8_t {
     ShaderMemoryPages,
     StorageTextureOriginal,
+    StorageTextureHashes,
     Count,
 };
 

@@ -32,6 +32,7 @@ namespace {
 constexpr const char* CounterNames[] = {
     "dispatch_shader_memory_pages",
     "storage_texture_host_copies",
+    "storage_texture_hashes",
 };
 static_assert(std::size(CounterNames) == static_cast<std::size_t>(Counter::Count));
 

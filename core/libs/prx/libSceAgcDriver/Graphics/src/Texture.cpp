@@ -1577,7 +1577,8 @@ bool StorageTexture::Refresh() {
         const auto equalsOriginal = [&] {
             // Named for the [hooksync] attribution: the compare goes through the flush hook.
             const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureCompare);
-            return GuestMemory::EqualsCommitted(descriptor.baseAddress, original);
+            GuestMemory::FlushGpuWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+            return snapshotMatches(descriptor.baseAddress, descriptor.baseAddress + guestBytes);
         };
         const auto scanBlocks = [&] {
             blockGenerations(generations);
@@ -1873,13 +1874,79 @@ void traceKeyStore(const char* path, const GuestTextureResource& descriptor, std
 
 }
 
+std::size_t StorageTexture::snapshotBlocks() const {
+    return GuestMemory::HashBlockCount(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+}
+
+bool StorageTexture::snapshotComplete() const {
+    return original.size() == guestBytes || originalHashes.size() == snapshotBlocks();
+}
+
+bool StorageTexture::blockRange(std::uint64_t from, std::uint64_t to, std::size_t& first, std::size_t& count) const {
+    constexpr auto block = GuestMemory::HashBlockBytes;
+    const auto end = descriptor.baseAddress + guestBytes;
+    if (from < descriptor.baseAddress || to > end || from >= to) return false;
+    if ((from != descriptor.baseAddress && from % block != 0) || (to != end && to % block != 0)) return false;
+    first = static_cast<std::size_t>(from / block - descriptor.baseAddress / block);
+    count = static_cast<std::size_t>((to - 1) / block - from / block + 1);
+    return true;
+}
+
+bool StorageTexture::snapshotMatches(std::uint64_t from, std::uint64_t to) const {
+    if (from >= to) return true;
+    if (original.size() == guestBytes) {
+        if (from < descriptor.baseAddress || to > descriptor.baseAddress + guestBytes) return false;
+        return GuestMemory::EqualsCommittedUnsynced(from, std::span<const std::byte>(original).subspan(static_cast<std::size_t>(from - descriptor.baseAddress), static_cast<std::size_t>(to - from)));
+    }
+    std::size_t first = 0, count = 0;
+    if (originalHashes.size() != snapshotBlocks() || !blockRange(from, to, first, count)) return false;
+    return GuestMemory::CommittedBlocksMatch(from, static_cast<std::size_t>(to - from), std::span<const ContentHash::Hash128>(originalHashes).subspan(first, count));
+}
+
+void StorageTexture::accountHeld() {
+    const auto copies = static_cast<std::int64_t>(original.capacity());
+    const auto hashes = static_cast<std::int64_t>((originalHashes.capacity() + generationBaseline.capacity()) * sizeof(ContentHash::Hash128));
+    if (copies != accountedCopies) MemoryStats::Add(MemoryStats::Counter::StorageTextureOriginal, copies - accountedCopies, static_cast<std::int64_t>(copies != 0) - static_cast<std::int64_t>(accountedCopies != 0));
+    if (hashes != accountedHashes) MemoryStats::Add(MemoryStats::Counter::StorageTextureHashes, hashes - accountedHashes, static_cast<std::int64_t>(hashes != 0) - static_cast<std::int64_t>(accountedHashes != 0));
+    accountedCopies = copies;
+    accountedHashes = hashes;
+}
+
 void StorageTexture::captureGuestBytes(const std::vector<bool>* layers) {
     comparedGuestBytes = {};
     const bool complete = layers == nullptr || std::all_of(layers->begin(), layers->end(), [](bool selected) { return selected; });
+    // Only a surface the CPU round trip of writeBackLayers stores from (no host import) keeps a
+    // byte copy; every other one keeps block hashes.
+    if (complete && HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) == nullptr) {
+        original.resize(static_cast<std::size_t>(guestBytes));
+        GuestMemory::ReadCommitted(descriptor.baseAddress, original);
+        originalHashes = {};
+        originalValid = true;
+        return;
+    }
+    const auto blocks = snapshotBlocks();
+    if (originalHashes.size() != blocks) {
+        // The unselected layers keep what the copy held (zeros without one).
+        originalHashes.assign(blocks, {});
+        if (original.size() == guestBytes) {
+            GuestMemory::HashBlocksOf(descriptor.baseAddress, original, originalHashes);
+        } else {
+            static const std::vector<std::byte> zeros(static_cast<std::size_t>(GuestMemory::HashBlockBytes));
+            std::size_t index = 0;
+            for (auto at = descriptor.baseAddress; at < descriptor.baseAddress + guestBytes; ++index) {
+                const auto stop = std::min(descriptor.baseAddress + guestBytes, (at / GuestMemory::HashBlockBytes + 1) * GuestMemory::HashBlockBytes);
+                originalHashes[index] = ContentHash::Of(zeros.data(), static_cast<std::size_t>(stop - at));
+                at = stop;
+            }
+        }
+    }
+    original = {};
     for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
         if (layers != nullptr && !(*layers)[layer]) continue;
-        const auto offset = static_cast<std::size_t>(layerBegin(layer) - descriptor.baseAddress);
-        GuestMemory::ReadCommitted(layerBegin(layer), std::span(original).subspan(offset, static_cast<std::size_t>(layerBytes(layer))));
+        std::size_t first = 0, count = 0;
+        Require(blockRange(layerBegin(layer), layerBegin(layer) + layerBytes(layer), first, count), "a tracked layer is not whole hash blocks");
+        GuestMemory::FlushGpuWrites(layerBegin(layer), static_cast<std::size_t>(layerBytes(layer)));
+        GuestMemory::HashCommittedBlocks(layerBegin(layer), static_cast<std::size_t>(layerBytes(layer)), std::span(originalHashes).subspan(first, count));
     }
     originalValid = originalValid || complete;
 }
@@ -1892,7 +1959,7 @@ bool StorageTexture::compareUntracked(std::uint64_t address, std::size_t bytes, 
     } exempt{refreshing};
     refreshing = this;
     Require(address >= descriptor.baseAddress && bytes <= guestBytes && address - descriptor.baseAddress <= guestBytes - bytes, "texture comparison exceeds its snapshot");
-    Require(original.size() == guestBytes, "texture comparison has no complete snapshot");
+    if (!snapshotComplete()) return false;
     GuestMemory::FlushGpuWrites(address, bytes);
     if (!originalValid) return false;
     constexpr std::uint64_t blockBytes = 65536;
@@ -1906,19 +1973,22 @@ bool StorageTexture::compareUntracked(std::uint64_t address, std::size_t bytes, 
         std::fill(changed.begin(), changed.end(), GuestMemory::BlockUnchanged);
         return true;
     }
-    const auto saved = std::span(original).subspan(static_cast<std::size_t>(address - descriptor.baseAddress), bytes);
-    if (GuestMemory::EqualsCommittedUnsynced(address, saved)) {
+    // A byte copy answers the whole range first; block hashes are compared block by block anyway.
+    const bool bytesHeld = original.size() == guestBytes;
+    if (bytesHeld && snapshotMatches(address, end)) {
         std::fill(changed.begin(), changed.end(), GuestMemory::BlockUnchanged);
         if (cacheable) comparedGuestBytes = stamp;
         return true;
     }
     comparedGuestBytes = {};
+    bool all = true;
     for (std::size_t index = 0; index < changed.size(); ++index) {
         const auto begin = std::max(address, (first + index) * blockBytes);
         const auto stop = std::min(end, (first + index + 1) * blockBytes);
-        const auto saved = std::span(original).subspan(static_cast<std::size_t>(begin - descriptor.baseAddress), static_cast<std::size_t>(stop - begin));
-        changed[index] = GuestMemory::EqualsCommittedUnsynced(begin, saved) ? GuestMemory::BlockUnchanged : GuestMemory::BlockWritten;
+        changed[index] = snapshotMatches(begin, stop) ? GuestMemory::BlockUnchanged : GuestMemory::BlockWritten;
+        all = all && changed[index] == GuestMemory::BlockUnchanged;
     }
+    if (!bytesHeld && all && cacheable) comparedGuestBytes = stamp;
     return true;
 }
 
@@ -1930,16 +2000,10 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto elementBytes = BytesPerElement(descriptor.format);
     const auto linearBytes = sliceLinearBytes * arrayLayers;
-    const auto heldBefore = original.capacity() + generationBaseline.capacity();
-    original.resize(static_cast<std::size_t>(guestBytes));
     const struct HeldBytes {
-        const StorageTexture& image;
-        std::size_t before;
-        ~HeldBytes() {
-            const auto after = image.original.capacity() + image.generationBaseline.capacity();
-            MemoryStats::Add(MemoryStats::Counter::StorageTextureOriginal, static_cast<std::int64_t>(after) - static_cast<std::int64_t>(before), before == 0 && after != 0 ? 1 : 0);
-        }
-    } held{*this, heldBefore};
+        StorageTexture& image;
+        ~HeldBytes() { image.accountHeld(); }
+    } held{*this};
     // A layer selection applies to the direct path alone (the others upload everything); it names
     // array layers, which the tracked layers are when there are several.
     if (layers != nullptr && ((!blockUnits && trackedLayers != arrayLayers) || std::all_of(layers->begin(), layers->end(), [](bool selected) { return selected; }))) layers = nullptr;
@@ -1948,15 +2012,17 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         const bool whole = !selectedOnly || layers == nullptr;
         if (guestBytes > GenerationBaselineBytes || !guestBytesSettled()) generationBaseline.clear();
         else if (whole) {
-            generationBaseline.resize(static_cast<std::size_t>(guestBytes));
-            GuestMemory::ReadCommitted(descriptor.baseAddress, generationBaseline);
+            generationBaseline.resize(snapshotBlocks());
+            GuestMemory::FlushGpuWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+            GuestMemory::HashCommittedBlocks(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), generationBaseline);
         }
         for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
             if (!whole && !(*layers)[layer]) continue;
             layerGeneration[layer] = now;
-            if (whole || generationBaseline.size() != guestBytes) continue;
-            const auto offset = static_cast<std::size_t>(layerBegin(layer) - descriptor.baseAddress);
-            GuestMemory::ReadCommitted(layerBegin(layer), std::span<std::byte>(generationBaseline).subspan(offset, static_cast<std::size_t>(layerBytes(layer))));
+            std::size_t first = 0, count = 0;
+            if (whole || generationBaseline.size() != snapshotBlocks() || !blockRange(layerBegin(layer), layerBegin(layer) + layerBytes(layer), first, count)) continue;
+            GuestMemory::FlushGpuWrites(layerBegin(layer), static_cast<std::size_t>(layerBytes(layer)));
+            GuestMemory::HashCommittedBlocks(layerBegin(layer), static_cast<std::size_t>(layerBytes(layer)), std::span(generationBaseline).subspan(first, count));
         }
         refreshGeneration();
     };
@@ -2020,8 +2086,12 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         return;
     }
     if (const auto* import = uploadedKeys == DccKeys::Uncompressed ? HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) : nullptr) {
-        if (GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) originalValid = false;
-        else captureGuestBytes(layers);
+        if (GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) {
+            originalValid = false;
+            original = {};
+        } else {
+            captureGuestBytes(layers);
+        }
         stampLayers(true);
         // A whole-surface upload of a block-unit image goes through the windows too when a unit
         // shadow holds part of the surface (the detile then reads the slabs; a new image has no
@@ -2145,6 +2215,8 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
     originalValid = true;
     forgetBorrowed(0, trackedLayers);
     stampLayers(false);
+    original.resize(static_cast<std::size_t>(guestBytes));
+    originalHashes = {};
     GuestMemory::ReadCommitted(descriptor.baseAddress, original);
     {
             Buffer staging(context, original.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
@@ -3947,10 +4019,10 @@ bool StorageTexture::guestBytesSettled() const {
 }
 
 bool StorageTexture::unchangedSinceBaseline(std::uint64_t from, std::uint64_t to) const {
-    const auto& baseline = originalValid ? original : generationBaseline;
-    if (baseline.size() != guestBytes) return false;
-    const auto offset = static_cast<std::size_t>(from - descriptor.baseAddress);
-    return GuestMemory::EqualsCommittedUnsynced(from, std::span<const std::byte>(baseline).subspan(offset, static_cast<std::size_t>(to - from)));
+    if (originalValid) return snapshotComplete() && snapshotMatches(from, to);
+    std::size_t first = 0, count = 0;
+    if (generationBaseline.size() != snapshotBlocks() || !blockRange(from, to, first, count)) return false;
+    return GuestMemory::CommittedBlocksMatch(from, static_cast<std::size_t>(to - from), std::span<const ContentHash::Hash128>(generationBaseline).subspan(first, count));
 }
 
 void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
@@ -3966,7 +4038,10 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     // layers pending).
     struct Reconcile {
         StorageTexture& texture;
-        ~Reconcile() { texture.reconcilePending(); }
+        ~Reconcile() {
+            texture.accountHeld();
+            texture.reconcilePending();
+        }
     } reconcile{*this};
     const auto elementBytes = BytesPerElement(descriptor.format);
     // 64 KiB blocks the CPU wrote since the layer was last in sync keep the CPU's bytes: the game
@@ -4216,8 +4291,14 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     // them (a GPU clear, a dropped or kept unit). Reading them says nothing about the image: a
     // stale unit (dropped, or kept for the CPU) still differs from them, so `original` vouches for
     // the content again only where it did before, or once every unit is stored.
-    const bool wasValid = originalValid;
-    if (!wasValid) GuestMemory::ReadCommitted(descriptor.baseAddress, original);
+    // Block hashes cannot seed the store: without the copy the guest bytes are read as for an
+    // invalid one.
+    const bool wasValid = originalValid && original.size() == guestBytes;
+    if (!wasValid) {
+        original.resize(static_cast<std::size_t>(guestBytes));
+        GuestMemory::ReadCommitted(descriptor.baseAddress, original);
+    }
+    originalHashes = {};
     DeviceBuffer linear(context, static_cast<std::size_t>(sliceLinearBytes * arrayLayers), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     DeviceBuffer tiled(context, original.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     Buffer host(context, original.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
@@ -4311,7 +4392,8 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
 }
 
 StorageTexture::~StorageTexture() {
-    if (const auto held = original.capacity() + generationBaseline.capacity(); held != 0) MemoryStats::Add(MemoryStats::Counter::StorageTextureOriginal, -static_cast<std::int64_t>(held), -1);
+    if (accountedCopies != 0) MemoryStats::Add(MemoryStats::Counter::StorageTextureOriginal, -accountedCopies, -1);
+    if (accountedHashes != 0) MemoryStats::Add(MemoryStats::Counter::StorageTextureHashes, -accountedHashes, -1);
     {
         auto& live = Live();
         std::lock_guard lock(live.mutex);

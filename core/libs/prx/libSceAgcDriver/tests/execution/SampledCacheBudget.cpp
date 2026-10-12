@@ -281,6 +281,26 @@ void snapshotTests(const Context& context) {
     Require(TextureCacheUsage().sampledBytes == tiny->AllocationBytes(), "a snapshot whose " + std::to_string(tiny->AllocationBytes()) + "-byte image is smaller than its " + std::to_string(guestBytes) + " guest bytes counted " + std::to_string(TextureCacheUsage().sampledBytes) + " bytes, not its allocation");
 }
 
+// A snapshot is validated by block hashes of its guest bytes: an unchanged surface hits its entry,
+// and one changed byte anywhere (either end, either side of a 64 KiB block boundary) makes it again.
+void snapshotChangeTests(const Context& context) {
+    Block block(context);
+    ClearCachedTextures(context.device);
+    auto texture = Sampled(context, block.Surface(1));
+    Require(!texture->ViewsStorageImage(), "a sampled texture outside host-imported memory is not a snapshot");
+    Require(Sampled(context, block.Surface(1)) == texture, "an unchanged snapshot was made again");
+    auto* bytes = reinterpret_cast<std::uint8_t*>(block.Surface(1));
+    for (const std::size_t offset : {std::size_t{0}, std::size_t{65535}, std::size_t{65536}, SurfaceBytes / 2 + 3, SurfaceBytes - 1}) {
+        bytes[offset] ^= 0x10;
+        auto again = Sampled(context, block.Surface(1));
+        Require(again != texture, "a changed byte at +" + std::to_string(offset) + " of a snapshot's surface was not seen");
+        texture = again;
+        Require(Sampled(context, block.Surface(1)) == texture, "the snapshot made after a change at +" + std::to_string(offset) + " was made again");
+    }
+    texture.reset();
+    ClearCachedTextures(context.device);
+}
+
 void heldTests(const Context& context) {
     Block block(context);
     auto held = Sampled(context, block.Surface(0));
@@ -516,6 +536,7 @@ int main(int argc, char** argv) {
             frameTests(context);
             earlyMissTests(context);
             collidingKeyTests(context);
+            snapshotChangeTests(context);
             ClearCachedTextures(context.device);
         }
         std::puts("sampled texture cache budget tests passed");

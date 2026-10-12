@@ -63,8 +63,9 @@ VkComponentMapping ViewComponents(const GuestTextureResource& resource) {
     return {channel(resource.dstSelX), channel(resource.dstSelY), channel(resource.dstSelZ), channel(resource.dstSelW)};
 }
 
-// Sampled textures are reused across draws and dispatches while their guest bytes are unchanged; a
-// byte copy of the guest surface validates each reuse, so CPU or GPU writes to it force a re-upload.
+// Sampled textures are reused across draws and dispatches while their guest bytes are unchanged; block
+// hashes of the guest surface (GuestMemory::HashBlocksOf of the uploaded bytes) validate each reuse,
+// so CPU or GPU writes to it force a re-upload.
 // The key is everything a lookup matches: the device, the eight descriptor words and the swizzle.
 struct TextureKey {
     VkDevice device;
@@ -99,7 +100,10 @@ TextureKey MakeTextureKey(VkDevice device, std::span<const std::uint32_t> words,
 struct CachedTexture {
     TextureKey key;
     std::uint64_t address;
-    std::vector<std::byte> bytes;
+    // Size of the snapshot (0 for a view) and, for one of guest bytes (uncompressed keys), its block
+    // hashes; a snapshot of clear texels needs none.
+    std::uint64_t bytes = 0;
+    std::vector<ContentHash::Hash128> hashes;
     std::shared_ptr<Texture> texture;
     // A fast-cleared surface is cached as its clear texels; it stays valid while the keys are unchanged.
     DccKeys keys = DccKeys::Uncompressed;
@@ -649,16 +653,17 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 if (profile) LookupOutcomes::Add(*keys != DccKeys::Uncompressed ? LookupOutcomes::SampledHitClearedView : LookupOutcomes::SampledHitView, start);
                 return it->texture;
             }
-        } else if (source == nullptr && it->bytes.size() == guestBytes && it->keys == *keys) {
+        } else if (source == nullptr && it->bytes == guestBytes && it->keys == *keys) {
             // Unwritten pages need no comparison; partially resident textures compare only committed
             // pages. The compare goes through the flush hook: it waits for recorded work over the
             // surface (counted, and named for the [hooksync] line).
             const auto equalsCommitted = [&] {
                 if (Recorder::SnapshotWriteOverlaps(address, bytes)) counters.pendingReads.fetch_add(1, std::memory_order_relaxed);
                 const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureCompare);
-                return GuestMemory::EqualsCommitted(address, it->bytes);
+                GuestMemory::FlushGpuWrites(address, bytes);
+                return GuestMemory::CommittedBlocksMatch(address, bytes, it->hashes);
             };
-            if (*keys != DccKeys::Uncompressed || GuestMemory::UnchangedSince(address, it->bytes.size(), it->generation) || equalsCommitted()) {
+            if (*keys != DccKeys::Uncompressed || GuestMemory::UnchangedSince(address, bytes, it->generation) || equalsCommitted()) {
                 it->generation = generation;
                 touchTexture(cache, it);
                 logLookup({it->texture.get(), resource, guestBytes, *keys, generation, nullptr});
@@ -670,7 +675,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         eraseTexture(cache, it);
         ++cache.counts.stale;
     }
-    CachedTexture entry{key, address, std::vector<std::byte>(source != nullptr ? 0u : bytes), nullptr, *keys, generation};
+    CachedTexture entry{key, address, source != nullptr ? 0u : guestBytes, {}, nullptr, *keys, generation};
     if (source != nullptr) {
         entry.source = source;
         entry.sourceVersion = source->Version();
@@ -685,14 +690,19 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     } else {
         // Snapshot before the upload so a write racing with it is caught by the next comparison.
         if (*keys == DccKeys::Uncompressed && Recorder::SnapshotWriteOverlaps(address, bytes)) counters.pendingReads.fetch_add(1, std::memory_order_relaxed);
-        ReadTextureSurface(resource, *keys, entry.bytes);
+        std::vector<std::byte> snapshot(bytes);
+        ReadTextureSurface(resource, *keys, snapshot);
         static const bool traceTextures = std::getenv("APS5_TRACE_TEXTURES") != nullptr;
         if (traceTextures) {
             std::size_t nonzero = 0;
-            for (std::size_t i = 0; i < entry.bytes.size(); i += 64) nonzero += entry.bytes[i] != std::byte{0};
-            std::fprintf(stderr, "[texture] 0x%llx %ux%u format %u tile %d: %zu of %zu sampled bytes nonzero\n", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, static_cast<int>(resource.tileMode), nonzero, entry.bytes.size() / 64);
+            for (std::size_t i = 0; i < snapshot.size(); i += 64) nonzero += snapshot[i] != std::byte{0};
+            std::fprintf(stderr, "[texture] 0x%llx %ux%u format %u tile %d: %zu of %zu sampled bytes nonzero\n", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, static_cast<int>(resource.tileMode), nonzero, snapshot.size() / 64);
         }
-        entry.texture = std::make_shared<Texture>(context, *context.detiler, resource, components, entry.bytes, depthCompare);
+        entry.texture = std::make_shared<Texture>(context, *context.detiler, resource, components, snapshot, depthCompare);
+        if (*keys == DccKeys::Uncompressed) {
+            entry.hashes.resize(GuestMemory::HashBlockCount(address, bytes));
+            GuestMemory::HashBlocksOf(address, snapshot, entry.hashes);
+        }
         entry.accounted = entry.texture->AllocationBytes();
         counters.snapshots.fetch_add(1, std::memory_order_relaxed);
     }
@@ -926,7 +936,7 @@ bool SampledBudgetReportDue(std::uint64_t reported, std::uint64_t budget, std::c
 }
 
 void AppendTextureMemoryStats(std::string& line) {
-    std::uint64_t snapshotBytes = 0, deviceBytes = 0;
+    std::uint64_t snapshotBytes = 0, coveredBytes = 0, deviceBytes = 0;
     std::size_t entries = 0, snapshots = 0, views = 0;
     {
         auto& sampled = Textures();
@@ -934,12 +944,15 @@ void AppendTextureMemoryStats(std::string& line) {
         entries = sampled.entries.size();
         deviceBytes = sampled.bytes;
         for (const auto& entry : sampled.entries) {
-            snapshotBytes += entry.bytes.capacity();
-            snapshots += entry.bytes.capacity() != 0;
+            snapshotBytes += entry.hashes.capacity() * sizeof(ContentHash::Hash128);
+            coveredBytes += entry.bytes;
+            snapshots += entry.bytes != 0;
             views += entry.source != nullptr;
         }
     }
+    // Host bytes held to validate snapshots (block hashes), and the guest bytes they stand for.
     MemoryStats::AppendMiB(line, "tex_sampled_host_snapshots", snapshotBytes, snapshots);
+    MemoryStats::AppendMiB(line, "tex_sampled_snapshot_guest", coveredBytes);
     MemoryStats::AppendMiB(line, "tex_sampled_device", deviceBytes, entries);
     MemoryStats::AppendCount(line, "tex_sampled_views", views);
     std::size_t storageEntries = 0;

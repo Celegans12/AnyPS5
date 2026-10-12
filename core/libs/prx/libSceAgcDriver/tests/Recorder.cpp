@@ -3171,6 +3171,146 @@ void unchangedCpuStampTests(const Device& device, Recorder& recorder) {
     std::cout << "unchanged CPU stamps: ok\n";
 }
 
+// Storage images in untracked memory: a host-imported one keeps block hashes of its guest bytes, one
+// without an import (the CPU round trip) a byte copy. Either way a changed byte anywhere in the
+// surface is seen by Refresh, and a write-back of results over part of the surface stores them
+// while a 64 KiB block the CPU wrote meanwhile keeps the CPU's bytes.
+void hashedSnapshotTests(const Device& device, Recorder& recorder) {
+    const auto& base = device.GetContext();
+    if (base.hostImportAlignment == 0) {
+        std::cout << "host imports unavailable: hashed snapshots not tested\n";
+        return;
+    }
+    struct Case {
+        const char* name;
+        TextureTileMode tileMode;
+        std::uint32_t width;
+        std::uint32_t height;
+        std::uint32_t mipCount;
+        std::uint64_t offset;
+    };
+    constexpr Case cases[] = {
+        {"64 KiB R_X 520x260, 6 mips", TextureTileMode::kR64KBX, 520, 260, 6, 0},
+        {"linear 300x200 off a 64 KiB boundary", TextureTileMode::kLinear, 300, 200, 1, 4096},
+    };
+    const auto pattern = [](std::size_t i) { return static_cast<std::uint8_t>(i * 131u + 7u); };
+    constexpr std::array<std::uint8_t, 4> red{255, 0, 0, 255};
+    for (const auto& test : cases) {
+        for (const bool imported : {true, false}) {
+            const std::string what = std::string(test.name) + (imported ? " (host import, hashes)" : " (no import, copy)");
+            GuestTextureResource resource{};
+            resource.width = test.width;
+            resource.height = test.height;
+            resource.mipCount = test.mipCount;
+            resource.tileMode = test.tileMode;
+            resource.dimension = TextureDimension::k2D;
+            resource.format = 56;
+            resource.dstSelX = 4;
+            resource.dstSelY = 5;
+            resource.dstSelZ = 6;
+            resource.dstSelW = 7;
+            const auto surfaceBytes = static_cast<std::size_t>(DescribeSurface(resource).guestBytes);
+            const auto bytes = (static_cast<std::size_t>(test.offset) + surfaceBytes + 65535) / 65536 * 65536 + 65536;
+#ifdef _WIN32
+            void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+            void* block = std::aligned_alloc(65536, bytes);
+#endif
+            Require(block != nullptr, "cannot allocate the hashed snapshot block");
+            auto* memory = static_cast<std::uint8_t*>(block);
+            for (std::size_t i = 0; i < bytes; ++i) memory[i] = pattern(i);
+            const auto blockAddress = reinterpret_cast<std::uint64_t>(block);
+            const auto address = blockAddress + test.offset;
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Add(block, bytes, true, true, true);
+            }
+            struct Unregister {
+                const Context& context;
+                void* block;
+                std::uint64_t address;
+                std::size_t bytes;
+                ~Unregister() {
+                    {
+                        GuestAllocations::Mutation mutation;
+                        mutation.Remove(block);
+                    }
+                    HostImportFor(context, address, bytes);
+#ifdef _WIN32
+                    VirtualFree(block, 0, MEM_RELEASE);
+#else
+                    std::free(block);
+#endif
+                }
+            } unregister{base, block, blockAddress, bytes};
+            TextureDetiler detiler(base);
+            auto context = base;
+            context.detiler = &detiler;
+            if (!imported) context.hostImportAlignment = 0;
+            if (imported && HostImportFor(base, blockAddress, bytes) == nullptr) {
+                std::cout << "host import of the hashed snapshot block refused: " << what << " not tested\n";
+                continue;
+            }
+            Require(!AgcDriver::GuestMemory::Watched(address, surfaceBytes), what + ": the test memory is write-watched");
+            resource.baseAddress = address;
+            {
+                auto image = std::make_shared<StorageTexture>(context, detiler, resource, 0);
+                recorder.Keep(image);
+                Require(image->GuestSnapshotValid(), what + ": the upload kept no snapshot of the guest bytes");
+                Require(image->Refresh(), what + ": an unchanged surface was uploaded again");
+                std::vector<std::size_t> offsets{0, surfaceBytes / 2, surfaceBytes - 1};
+                for (auto boundary = (address / 65536 + 1) * 65536; boundary < address + surfaceBytes; boundary += 65536) {
+                    offsets.push_back(static_cast<std::size_t>(boundary - address) - 1);
+                    offsets.push_back(static_cast<std::size_t>(boundary - address));
+                }
+                for (const auto offset : offsets) {
+                    memory[test.offset + offset] ^= 0x01;
+                    Require(!image->Refresh(), what + ": a changed byte at +" + std::to_string(offset) + " was not seen");
+                    Require(image->Refresh(), what + ": the surface changed again after the re-upload of +" + std::to_string(offset));
+                }
+                std::vector<std::uint8_t> expected(memory, memory + bytes);
+                const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                const auto commands = recorder.Commands();
+                const VkClearColorValue value{{1.0f, 0.0f, 0.0f, 1.0f}};
+                RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+                context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, image->Image(), VK_IMAGE_LAYOUT_GENERAL, &value, 1, &range);
+                RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+                image->MarkDirty();
+                const auto cpuOffset = static_cast<std::size_t>(test.offset) + surfaceBytes / 3;
+                memory[cpuOffset] ^= 0xff;
+                expected[cpuOffset] ^= 0xff;
+                image->WriteBack();
+                recorder.Submit();
+                device.WaitQueue();
+                recorder.Sync();
+                const auto keptBegin = static_cast<std::size_t>(((blockAddress + cpuOffset) / 65536 * 65536) - blockAddress);
+                const auto keptEnd = keptBegin + 65536;
+                std::size_t texels = 0, kept = 0, garbage = 0;
+                for (std::size_t i = 0; i < bytes; i += 4) {
+                    const bool inside = i >= test.offset && i < test.offset + surfaceBytes;
+                    bool isTexel = inside, isExpected = true;
+                    for (std::size_t c = 0; c < 4; ++c) {
+                        isTexel = isTexel && memory[i + c] == red[c];
+                        isExpected = isExpected && memory[i + c] == expected[i + c];
+                    }
+                    if (i >= keptBegin && i < keptEnd) {
+                        kept += isExpected;
+                        continue;
+                    }
+                    if (isTexel) ++texels;
+                    else if (!isExpected) ++garbage;
+                }
+                Require(kept == 65536 / 4, what + ": the block the CPU wrote while results were pending lost " + std::to_string(65536 / 4 - kept) + " of its words");
+                Require(garbage == 0, what + ": the write-back changed " + std::to_string(garbage) + " words to neither a result nor the guest bytes");
+                const auto mip0 = static_cast<std::size_t>(test.width) * test.height;
+                Require(texels + 65536 / 4 >= mip0 && texels <= mip0, what + ": the write-back stored " + std::to_string(texels) + " of " + std::to_string(mip0) + " result texels");
+            }
+            recorder.Sync();
+        }
+    }
+    std::cout << "hashed storage snapshots: ok\n";
+}
+
 void settledBaselineTests(const Device& device, Recorder& recorder) {
     const auto& base = device.GetContext();
 #ifdef _WIN32
@@ -4946,6 +5086,10 @@ int main(int argc, char** argv) {
             settledBaselineTests(device, recorder);
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--hashed-snapshot-only") {
+            hashedSnapshotTests(device, recorder);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--completion-labels-only") {
             completionCountTests(device, recorder);
             afterRecordedWorkTests(device, recorder);
@@ -5017,6 +5161,7 @@ int main(int argc, char** argv) {
         storageRefreshTests(device, recorder, true);
         writeBackPaddingTests(device, recorder, false);
         writeBackPaddingTests(device, recorder, true);
+        hashedSnapshotTests(device, recorder);
         singlePassTests(device, recorder, false);
         singlePassTests(device, recorder, true);
         unchangedCpuStampTests(device, recorder);

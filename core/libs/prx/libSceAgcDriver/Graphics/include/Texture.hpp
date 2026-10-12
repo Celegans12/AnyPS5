@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_TEXTURE_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_TEXTURE_HPP
 
+#include "prx/libSceAgcDriver/Execution/include/ContentHash.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
@@ -333,6 +334,16 @@ private:
     // upload everything).
     void upload(const std::vector<bool>* layers = nullptr);
     void captureGuestBytes(const std::vector<bool>* layers);
+    // The guest bytes the image matches while `originalValid`: a byte copy (`original`) where a CPU
+    // round trip stores from it (no host import), else one ContentHash per 64 KiB block of the
+    // surface (`originalHashes`, GuestMemory::HashCommittedBlocks). Both answer for whole blocks:
+    // [from, to) starts at the base or a 64 KiB boundary and ends at the end or one.
+    std::size_t snapshotBlocks() const;
+    bool snapshotComplete() const;
+    bool snapshotMatches(std::uint64_t from, std::uint64_t to) const;
+    bool blockRange(std::uint64_t from, std::uint64_t to, std::size_t& first, std::size_t& count) const;
+    // Charges the copies' and hashes' capacity changes to the [mem] counters.
+    void accountHeld();
     bool compareUntracked(std::uint64_t address, std::size_t bytes, std::span<std::uint8_t> changed, bool memoize = false) const;
     // Stores the pending tracked layers overlapping [address, address + bytes) to guest memory; in
     // each, 64 KiB blocks the CPU wrote since the layer's generation keep the CPU's bytes. Block
@@ -477,8 +488,12 @@ private:
     std::uint64_t sliceLinearBytes = 0;
     SurfaceGeometry geometry;
     std::vector<std::byte> original;
+    std::vector<ContentHash::Hash128> originalHashes;
     mutable std::array<std::uint64_t, 4> comparedGuestBytes{};
-    std::vector<std::byte> generationBaseline;
+    // Block hashes of the guest bytes at the layers' generations (surfaces up to 1 MiB).
+    std::vector<ContentHash::Hash128> generationBaseline;
+    std::int64_t accountedCopies = 0;
+    std::int64_t accountedHashes = 0;
     // DCC keys the image content was uploaded under: a fast-cleared surface starts as its clear value.
     DccKeys uploadedKeys = DccKeys::Uncompressed;
     mutable DccKeys filledKeys = DccKeys::Uncompressed;
