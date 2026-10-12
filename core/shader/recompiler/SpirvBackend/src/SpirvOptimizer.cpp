@@ -12,6 +12,8 @@ namespace ShaderRecompiler {
 
 namespace {
 
+constexpr std::uint32_t ScalarReplacementLimit = 64;
+
 bool HasLimitedUseTypes(std::span<const std::uint32_t> spirv) {
     if (spirv.size() < 5) throw std::runtime_error("SPIRV-Tools: incomplete module header");
     bool int8 = false, int16 = false, float16 = false;
@@ -161,7 +163,7 @@ std::vector<std::uint32_t> ValidateAndOptimizeSpirv(std::span<const std::uint32_
             .RegisterPass(spvtools::CreateLocalSingleBlockLoadStoreElimPass())
             .RegisterPass(spvtools::CreateLocalSingleStoreElimPass())
             .RegisterPass(spvtools::CreateAggressiveDCEPass(true))
-            .RegisterPass(spvtools::CreateScalarReplacementPass(0))
+            .RegisterPass(spvtools::CreateScalarReplacementPass(ScalarReplacementLimit))
             .RegisterPass(spvtools::CreateLocalAccessChainConvertPass())
             .RegisterPass(spvtools::CreateLocalSingleBlockLoadStoreElimPass())
             .RegisterPass(spvtools::CreateLocalSingleStoreElimPass())
@@ -176,7 +178,7 @@ std::vector<std::uint32_t> ValidateAndOptimizeSpirv(std::span<const std::uint32_
         if (full) optimizer.RegisterPass(spvtools::CreateCombineAccessChainsPass());
         if (allowFolding) optimizer.RegisterPass(spvtools::CreateSimplificationPass());
         if (full) {
-            optimizer.RegisterPass(spvtools::CreateScalarReplacementPass(0))
+            optimizer.RegisterPass(spvtools::CreateScalarReplacementPass(ScalarReplacementLimit))
                 .RegisterPass(spvtools::CreateLocalAccessChainConvertPass())
                 .RegisterPass(spvtools::CreateLocalSingleBlockLoadStoreElimPass())
                 .RegisterPass(spvtools::CreateLocalSingleStoreElimPass())
