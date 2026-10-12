@@ -2098,16 +2098,31 @@ void verifyMeshConfiguration() {
         RecompileCacheKey::Build(primitiveGrouped, key);
         require((key != patchKey) == (stage != ShaderStage::Local), "only the hull and domain cache keys may depend on the primitive group size, which rebuilds their relative patch index");
     }
-    auto shared = hull;
-    shared.graphics->tessellation->breakAtInstance = false;
+    auto instanced = hull;
+    instanced.graphics->draw.instanceCount = 2u;
+    instanced.graphics->draw.indexCount = 12u;
+    instanced.graphics->tessellation->breakAtInstance = false;
+    auto longer = instanced;
+    longer.graphics->draw.indexCount = 16u;
+    auto breaking = instanced;
+    breaking.graphics->tessellation->breakAtInstance = true;
     for (const auto stage : {ShaderStage::Local, ShaderStage::TessellationControl, ShaderStage::TessellationEvaluation}) {
         hull.shader.stage = stage;
-        shared.shader.stage = stage;
+        instanced.shader.stage = stage;
+        longer.shader.stage = stage;
+        breaking.shader.stage = stage;
         RecompileCacheKey::Build(hull, key);
-        const auto patchKey = key;
-        RecompileCacheKey::Build(shared, key);
-        require((key != patchKey) == (stage != ShaderStage::Local), "only the hull and domain cache keys may depend on BREAK_WAVE_AT_EOI, which decides whether their relative patch index can be rebuilt");
+        const auto single = key;
+        RecompileCacheKey::Build(instanced, key);
+        const auto shared = key;
+        RecompileCacheKey::Build(longer, key);
+        require((shared != single && key != shared) == (stage != ShaderStage::Local), "only the hull and domain cache keys may depend on the patches per instance of an instanced draw");
+        RecompileCacheKey::Build(breaking, key);
+        require(key == single, "an instanced draw whose instances start hull threadgroups (BREAK_WAVE_AT_EOI) changed the cache key");
     }
+    breaking.shader.stage = ShaderStage::TessellationControl;
+    const auto breakingReplay = RequestSerializer{}.Deserialize(RequestSerializer{}.Serialize(breaking));
+    require(breakingReplay.request.graphics && breakingReplay.request.graphics->tessellation && breakingReplay.request.graphics->tessellation->breakAtInstance, "BREAK_WAVE_AT_EOI was lost in serialization");
     const std::array<std::uint32_t, 8> users{};
     request.context.waveSize = 32u;
     request.context.userData = users;

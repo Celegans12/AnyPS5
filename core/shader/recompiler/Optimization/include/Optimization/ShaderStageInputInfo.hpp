@@ -117,6 +117,8 @@ struct ShaderTessellationInputInfo {
     std::uint32_t patchesPerGroup = 256;
     std::uint32_t primitiveGroupSize = 0;
     bool breakAtInstance = false;
+    std::uint32_t instancePatches = 0;
+    bool drawParameters = false;
 };
 
 struct ShaderVertexInputInfo {

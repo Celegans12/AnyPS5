@@ -131,6 +131,9 @@ void DefineModule(SpirvEmitterState& state) {
         state.module.EmitCapability(spv::CapabilityComputeDerivativeGroupQuadsKHR);
         state.module.EmitExtension("SPV_KHR_compute_shader_derivatives");
     }
+    if (std::any_of(state.inputs.begin(), state.inputs.end(), [](const SpirvInputBinding& input) { return input.kind == StageInputKind::BaseInstance; })) {
+        state.module.EmitCapability(spv::CapabilityDrawParameters);
+    }
     const bool fragmentBarycentric = StageOf(state) == IrShaderStage::Pixel && std::any_of(state.inputs.begin(), state.inputs.end(), [](const SpirvInputBinding& input) {
         return input.perVertex || input.kind == StageInputKind::BaryCoordSmooth || input.kind == StageInputKind::BaryCoordNoPerspective;
     });

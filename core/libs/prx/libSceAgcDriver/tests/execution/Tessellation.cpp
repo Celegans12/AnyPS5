@@ -5,6 +5,7 @@
 #include "Recompiler.hpp"
 #include "SceShaders.hpp"
 #include "VulkanTestDevice.hpp"
+#include <spirv/unified1/spirv.hpp>
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -22,6 +23,7 @@
 #include <string>
 #include <tuple>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -281,6 +283,8 @@ alignas(256) constexpr std::array<std::uint16_t, 12> QuadIndices{
 struct PatchDraw {
     TessellationConfiguration configuration;
     std::span<const std::uint16_t> indices;
+    std::uint32_t instances = 1;
+    std::uint32_t firstInstance = 0;
 };
 
 const PatchDraw Triangles{Patches, Indices};
@@ -309,7 +313,7 @@ ShaderRecompiler::RecompileResult Compile(const ShaderRecompiler::SpirvTarget& t
         pixel = info;
     } else {
         vertex = ShaderRecompiler::ShaderVertexStageInfo{};
-        graphics = ShaderRecompiler::GraphicsCompileContext{hull ? 0u : 8u, {}, std::nullopt, patches.configuration, {reinterpret_cast<std::uintptr_t>(patches.indices.data()), static_cast<std::uint32_t>(patches.indices.size()), 2, 1}};
+        graphics = ShaderRecompiler::GraphicsCompileContext{hull ? 0u : 8u, {}, std::nullopt, patches.configuration, {reinterpret_cast<std::uintptr_t>(patches.indices.data()), static_cast<std::uint32_t>(patches.indices.size()), 2, patches.instances}};
     }
     const ShaderRecompiler::RecompileRequest request{
         {stage, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}},
@@ -384,7 +388,7 @@ void Draw(AgcDriver::VulkanDevice& device, const Stages& stages, VkCullModeFlags
     state.blend.colorWriteMask = 15;
     state.blends = {state.blend};
     state.blendConstants = {};
-    device.Draw(state, {reinterpret_cast<std::uintptr_t>(patches.indices.data()), static_cast<std::uint32_t>(patches.indices.size()), 2, 1, 0, true}, shaders);
+    device.Draw(state, {reinterpret_cast<std::uintptr_t>(patches.indices.data()), static_cast<std::uint32_t>(patches.indices.size()), 2, patches.instances, 0, true, 0, patches.firstInstance}, shaders);
     device.WaitIdle();
 }
 
@@ -491,6 +495,33 @@ void RequireRelativePatches(AgcDriver::VulkanDevice& device, const ShaderRecompi
             Require(PixelAt(Column(1, 0.25f), center) == Background, "the patch with level 0 was not culled");
         }
     }
+}
+
+void RequireInstancedRelativePatches(AgcDriver::VulkanDevice& device, const ShaderRecompiler::SpirvTarget& target) {
+    const auto center = Row(-0.5f + 1.0f / 3.0f);
+    TessellationConfiguration restarting{3u, 3u, 1u, 2u, 2u, 1.0f, 64.0f, 4u, 8u};
+    restarting.breakAtInstance = true;
+    for (const auto& [patches, first, last] : {std::tuple{PatchDraw{{3u, 3u, 1u, 2u, 2u, 1.0f, 64.0f, 4u, 8u}, Indices, 2u, 1u}, 128, 64}, std::tuple{PatchDraw{{3u, 3u, 1u, 2u, 2u, 1.0f, 64.0f, 3u, 3u}, Indices, 2u, 1u}, 32, 96}, std::tuple{PatchDraw{restarting, Indices, 2u, 1u}, 32, 96}}) {
+        std::uint32_t cursor = 0;
+        const Stages stages{
+            Compile(target, ShaderStage::Local, LocalCode, cursor, patches),
+            Compile(target, ShaderStage::TessellationControl, HullRelativeData, cursor, patches),
+            Compile(target, ShaderStage::TessellationEvaluation, DomainPatchRead, cursor, patches),
+            Compile(target, ShaderStage::Fragment, PixelCode, cursor, patches),
+        };
+        Draw(device, stages, VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE, patches);
+        for (const auto& [patch, expected] : {std::pair{0u, first}, std::pair{2u, last}}) {
+            const auto pixel = PixelAt(Column(patch, 0.25f), center);
+            Require(pixel[0] == 255 && std::abs(pixel[2] - expected) <= 1, "the patch in column " + std::to_string(patch) + " of an instanced draw with " + std::to_string(patches.configuration.patchesPerGroup) + " patches per group and " + std::to_string(patches.configuration.primitiveGroupSize) + " primitives per group" + (patches.configuration.breakAtInstance ? " and BREAK_WAVE_AT_EOI" : "") + " did not take its blue channel from the hull's relative patch index across instances, " + PixelText(pixel));
+        }
+    }
+    const PatchDraw shared{{3u, 3u, 1u, 2u, 2u, 1.0f, 64.0f, 4u, 8u}, Indices, 2u, 1u};
+    ExpectRefusal(target, ShaderStage::TessellationEvaluation, DomainRelativeData, "domain program uses its relative patch index as data in an instanced draw", shared);
+    std::vector<std::uint32_t> capabilities(target.supportedCapabilities.begin(), target.supportedCapabilities.end());
+    std::erase(capabilities, static_cast<std::uint32_t>(spv::CapabilityDrawParameters));
+    auto withoutDrawParameters = target;
+    withoutDrawParameters.supportedCapabilities = capabilities;
+    ExpectRefusal(withoutDrawParameters, ShaderStage::TessellationControl, HullRelativeData, "shaderDrawParameters", shared);
 }
 
 class GuestBlock {
@@ -701,8 +732,6 @@ int main(int argc, char** argv) {
         ExpectRefusal(target, ShaderStage::Local, LocalIndexAsData, "outside a tessellation ring or LDS address");
         ExpectRefusal(target, ShaderStage::TessellationControl, HullRelativeData, "GE_CNTL.PRIM_GRP_SIZE is 0", RecordPatches);
         ExpectRefusal(target, ShaderStage::TessellationEvaluation, DomainRelativeData, "GE_CNTL.PRIM_GRP_SIZE is 0", RecordPatches);
-        ExpectRefusal(target, ShaderStage::TessellationControl, HullRelativeData, "GE_CNTL.BREAK_WAVE_AT_EOI is clear", {{3u, 3u, 1u, 2u, 2u, 1.0f, 64.0f, 3u, 3u}, Indices});
-        ExpectRefusal(target, ShaderStage::TessellationEvaluation, DomainRelativeData, "GE_CNTL.BREAK_WAVE_AT_EOI is clear", {{3u, 3u, 1u, 2u, 2u, 1.0f, 64.0f, 3u, 3u}, Indices});
         ExpectRefusal(target, ShaderStage::TessellationControl, HullCode, "outside its patch's quad factors", {{3u, 3u, 2u, 2u, 2u}, Indices});
         ExpectRefusal(target, ShaderStage::TessellationControl, HullDescendingRecords, "not affine");
         ExpectRefusal(target, ShaderStage::TessellationControl, HullDescendingRecords, "not affine", {{3u, 3u, 1u, 2u, 2u, 1.0f, 64.0f, 158u}, Indices});
@@ -718,6 +747,7 @@ int main(int argc, char** argv) {
         RequireQuads(*device, target);
         RequirePatchConstants(*device, target);
         RequireRelativePatches(*device, target);
+        RequireInstancedRelativePatches(*device, target);
         RequireHullBdaReads(*device, target);
         device.reset();
         RequireRegisteredStages();
