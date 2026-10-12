@@ -126,6 +126,7 @@ struct Context {
     VkDeviceSize hostImportAlignment = 0;
     bool dmaBufImport = false;
     PFN_vkGetPhysicalDeviceMemoryProperties2 memoryProperties2 = nullptr;
+    bool integratedGpu = false;
     RenderCache* renderCache = nullptr;
     DrawQueue* drawQueue = nullptr;
     GraphicsPipelineCache* graphicsPipelines = nullptr;
