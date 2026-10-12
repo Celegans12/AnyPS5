@@ -74,6 +74,16 @@ alignas(256) constexpr std::array<std::uint32_t, 50> HullDescendingRecords{
     0x0202070b, 0xbf810000,
 };
 
+alignas(256) constexpr std::array<std::uint32_t, 52> HullPatchConstant{
+    0xd7650000, 0x000100c1, 0xd7660000, 0x000200c1, 0xbf8a0000, 0x7da206f9, 0x81060000, 0xd5480014,
+    0x02151101, 0x362402ff, 0x000000ff, 0x160028a0, 0xd5430015, 0x040224ff, 0x00000060, 0xdbfc0000,
+    0x02000015, 0x162c2890, 0xd5430016, 0x045a24ff, 0x00000030, 0xbf8cc07f, 0xe0781000, 0x02020216,
+    0x7da82881, 0xbe94047e, 0xb06a0060, 0x162602f9, 0x0086066a, 0xd8d80008, 0x06000013, 0xd8dc1008,
+    0x07000013, 0xbf8cc07f, 0x7e300306, 0x7e320306, 0x7e340306, 0x7e360306, 0x34142484, 0xbefe0414,
+    0xe0781000, 0x0403180a, 0x4a162481, 0x161616ff, 0x000000d0, 0x4c1616ff, 0x00008000, 0xe0741000,
+    0x0202070b, 0xe0701064, 0x0202060b, 0xbf810000,
+};
+
 alignas(256) constexpr std::array<std::uint32_t, 46> HullUnguardedFactors{
     0xd7650000, 0x000100c1, 0xd7660000, 0x000200c1, 0xbf8a0000, 0x7da206f9, 0x81060000, 0xd5480014,
     0x02151101, 0x362402ff, 0x000000ff, 0x160028a0, 0xd5430015, 0x040224ff, 0x00000060, 0xdbfc0000,
@@ -102,12 +112,39 @@ alignas(256) constexpr std::array<std::uint32_t, 49> HullAndSaveexec{
     0xbf810000,
 };
 
-alignas(256) constexpr std::array<std::uint32_t, 36> DomainPatchRead{
+alignas(256) constexpr std::array<std::uint32_t, 39> DomainPatchRead{
     0xf8000941, 0x00000000, 0x34020e84, 0x16020283, 0xe0341000, 0x04030a01, 0xe0341010, 0x04030c01,
-    0xe0341020, 0x04030e01, 0x4a060e81, 0x16060690, 0x4c0606ff, 0x00008000, 0xe0341000, 0x04030c03,
-    0xbf8c3f70, 0x08040af2, 0x08040d02, 0x10201505, 0x3e201906, 0x3e201d02, 0x10221705, 0x3e221b06,
-    0x3e221f02, 0xd5510012, 0x040a0d05, 0x102424ff, 0x40400000, 0x7e260280, 0x7e2802f2, 0xf80008cf,
-    0x14131110, 0xf800020f, 0x14131214, 0xbf810000,
+    0xe0341020, 0x04030e01, 0x4a060e81, 0x160606ff, 0x000000d0, 0x4c0606ff, 0x00008000, 0xe0301064,
+    0x04031503, 0xbf8c3f70, 0x08040af2, 0x08040d02, 0x10201505, 0x3e201906, 0x3e201d02, 0x10221705,
+    0x3e221b06, 0x3e221f02, 0xd5510012, 0x040a0d05, 0x102424ff, 0x40400000, 0x102a2aff, 0x3e000000,
+    0x7e260280, 0x7e2802f2, 0xf80008cf, 0x14131110, 0xf800020f, 0x14151214, 0xbf810000,
+};
+
+alignas(256) constexpr std::array<std::uint32_t, 42> DomainNeighbourRecord{
+    0xf8000941, 0x00000000, 0x34020e84, 0x16020283, 0xe0341000, 0x04030a01, 0xe0341010, 0x04030c01,
+    0xe0341020, 0x04030e01, 0x4a060e81, 0x160606ff, 0x000000d0, 0x4c0606ff, 0x00008000, 0xe0301064,
+    0x04031503, 0xe0301134, 0x04031603, 0xbf8c3f70, 0x062a2b16, 0x08040af2, 0x08040d02, 0x10201505,
+    0x3e201906, 0x3e201d02, 0x10221705, 0x3e221b06, 0x3e221f02, 0xd5510012, 0x040a0d05, 0x102424ff,
+    0x40400000, 0x102a2aff, 0x3e000000, 0x7e260280, 0x7e2802f2, 0xf80008cf, 0x14131110, 0xf800020f,
+    0x14151214, 0xbf810000,
+};
+
+alignas(256) constexpr std::array<std::uint32_t, 42> DomainFixedPatchRead{
+    0xf8000941, 0x00000000, 0x34020e84, 0x16020283, 0xe0341000, 0x04030a01, 0xe0341010, 0x04030c01,
+    0xe0341020, 0x04030e01, 0x4a060e81, 0x160606ff, 0x000000d0, 0x4c0606ff, 0x00008000, 0xe0301064,
+    0x04031503, 0xe0300064, 0x04031600, 0xbf8c3f70, 0x062a2b16, 0x08040af2, 0x08040d02, 0x10201505,
+    0x3e201906, 0x3e201d02, 0x10221705, 0x3e221b06, 0x3e221f02, 0xd5510012, 0x040a0d05, 0x102424ff,
+    0x40400000, 0x102a2aff, 0x3e000000, 0x7e260280, 0x7e2802f2, 0xf80008cf, 0x14131110, 0xf800020f,
+    0x14151214, 0xbf810000,
+};
+
+alignas(256) constexpr std::array<std::uint32_t, 42> DomainNeighbourPoint{
+    0xf8000941, 0x00000000, 0x34020e84, 0x16020283, 0xe0341000, 0x04030a01, 0xe0341010, 0x04030c01,
+    0xe0341020, 0x04030e01, 0x4a060e81, 0x160606ff, 0x000000d0, 0x4c0606ff, 0x00008000, 0xe0301064,
+    0x04031503, 0xe0301030, 0x04031601, 0xbf8c3f70, 0x062a2b16, 0x08040af2, 0x08040d02, 0x10201505,
+    0x3e201906, 0x3e201d02, 0x10221705, 0x3e221b06, 0x3e221f02, 0xd5510012, 0x040a0d05, 0x102424ff,
+    0x40400000, 0x102a2aff, 0x3e000000, 0x7e260280, 0x7e2802f2, 0xf80008cf, 0x14131110, 0xf800020f,
+    0x14151214, 0xbf810000,
 };
 
 alignas(256) constexpr std::array<std::uint32_t, 32> DomainCulledPrimitive{
@@ -335,6 +372,25 @@ void RequireLevelClamps(AgcDriver::VulkanDevice& device, const ShaderRecompiler:
     Require(CoveredPixels(1, false) == 0, "VGT_HOS_MIN_TESS_LEVEL 5 raised the patch with level 0 instead of culling it");
 }
 
+const PatchDraw RecordPatches{{3u, 3u, 1u, 2u, 2u, 1.0f, 64.0f, 63u}, Indices};
+
+void RequirePatchConstants(AgcDriver::VulkanDevice& device, const ShaderRecompiler::SpirvTarget& target) {
+    std::uint32_t cursor = 0;
+    const Stages stages{
+        Compile(target, ShaderStage::Local, LocalCode, cursor, RecordPatches),
+        Compile(target, ShaderStage::TessellationControl, HullPatchConstant, cursor, RecordPatches),
+        Compile(target, ShaderStage::TessellationEvaluation, DomainPatchRead, cursor, RecordPatches),
+        Compile(target, ShaderStage::Fragment, PixelCode, cursor, RecordPatches),
+    };
+    Draw(device, stages, VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE, RecordPatches);
+    const auto center = Row(-0.5f + 1.0f / 3.0f);
+    for (const auto& [patch, blue] : {std::pair{0u, 32}, std::pair{2u, 159}}) {
+        const auto pixel = PixelAt(Column(patch, 0.25f), center);
+        Require(pixel[0] == 255 && std::abs(pixel[2] - blue) <= 1, "patch " + std::to_string(patch) + " did not take its blue channel from the patch constant its hull wrote, " + PixelText(pixel));
+    }
+    Require(PixelAt(Column(1, 0.25f), center) == Background, "the patch with level 0 was not culled");
+}
+
 void RequireQuads(AgcDriver::VulkanDevice& device, const ShaderRecompiler::SpirvTarget& target) {
     const auto center = Row(0.0f);
     std::array<bool, 2> frontFacing{};
@@ -421,7 +477,9 @@ int main() {
         ExpectRefusal(target, ShaderStage::TessellationControl, HullUnguardedFactors, "not written by control point 0 alone");
         ExpectRefusal(target, ShaderStage::TessellationControl, HullSquaredAddress, "not affine");
         ExpectRefusal(target, ShaderStage::TessellationControl, HullAndSaveexec, "lane mask");
-        ExpectRefusal(target, ShaderStage::TessellationEvaluation, DomainPatchRead, "patch constants");
+        ExpectRefusal(target, ShaderStage::TessellationEvaluation, DomainNeighbourRecord, "more than one patch-constant record", RecordPatches);
+        ExpectRefusal(target, ShaderStage::TessellationEvaluation, DomainFixedPatchRead, "not indexed by its relative patch", RecordPatches);
+        ExpectRefusal(target, ShaderStage::TessellationEvaluation, DomainNeighbourPoint, "neither its patch's control points nor a patch-constant record", RecordPatches);
         ExpectRefusal(target, ShaderStage::TessellationEvaluation, DomainCulledPrimitive, "passthrough primitive");
         ExpectRefusal(target, ShaderStage::Local, LocalIndexAsData, "outside a tessellation ring or LDS address");
         ExpectRefusal(target, ShaderStage::TessellationControl, HullCode, "outside its patch's quad factors", {{3u, 3u, 2u, 2u, 2u}, Indices});
@@ -434,6 +492,7 @@ int main() {
         RequireCounterClockwise(*device, target);
         RequireLevelClamps(*device, target);
         RequireQuads(*device, target);
+        RequirePatchConstants(*device, target);
         device.reset();
         RequireRegisteredStages();
         std::puts("Tessellation tests passed");

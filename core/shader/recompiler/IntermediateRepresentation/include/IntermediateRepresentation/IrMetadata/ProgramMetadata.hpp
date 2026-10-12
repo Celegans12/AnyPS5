@@ -27,6 +27,7 @@ struct IrProgramMetadata {
     bool bindingLayoutComplete = false;
     std::uint32_t tessellationLocalStride = 0;
     std::uint32_t tessellationControlStride = 0;
+    std::uint32_t tessellationPatchStride = 0;
 };
 
 }
