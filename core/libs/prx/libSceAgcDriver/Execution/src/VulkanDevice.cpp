@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/MemoryStatsDevice.hpp"
+#include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineSpecialization.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -394,6 +395,7 @@ struct VulkanDevice::State {
         auto memory = std::make_shared<WorkgroupMemory>();
         memory->device = device;
         memory->destroyPool = DeviceFunction<PFN_vkDestroyDescriptorPool>("vkDestroyDescriptorPool");
+        const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::WorkgroupMemory);
         memory->buffer = std::make_unique<Graphics::DeviceBuffer>(context, static_cast<std::size_t>(size), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         const VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1};
         VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
@@ -431,6 +433,7 @@ struct VulkanDevice::State {
             buffer.size = pixels.size();
             buffer.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
             buffer.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::Present);
             check(DeviceFunction<PFN_vkCreateBuffer>("vkCreateBuffer")(device, &buffer, nullptr, &uploadBuffer), "vkCreateBuffer display upload");
             VkMemoryRequirements requirements{};
             DeviceFunction<PFN_vkGetBufferMemoryRequirements>("vkGetBufferMemoryRequirements")(device, uploadBuffer, &requirements);

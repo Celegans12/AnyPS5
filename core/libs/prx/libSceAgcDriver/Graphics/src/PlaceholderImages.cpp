@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
+#include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include <string>
 #include <vector>
@@ -35,6 +36,7 @@ PlaceholderImages::PlaceholderImages(const Context& context) : context(context) 
             info.usage = shape.usage;
             info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
             info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::Misc);
             Check(context.Function<PFN_vkCreateImage>("vkCreateImage")(context.device, &info, nullptr, &image.image), "vkCreateImage placeholder");
             VkMemoryRequirements requirements{};
             context.Function<PFN_vkGetImageMemoryRequirements>("vkGetImageMemoryRequirements")(context.device, image.image, &requirements);

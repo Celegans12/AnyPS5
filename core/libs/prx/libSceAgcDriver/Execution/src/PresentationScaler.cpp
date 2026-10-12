@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/PresentationScaler.hpp"
+#include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/AspectFit.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 
@@ -43,6 +44,7 @@ void PresentationScaler::EnsureSourceImage(std::uint32_t width, std::uint32_t he
     imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::Present);
     Graphics::Check(context.Function<PFN_vkCreateImage>("vkCreateImage")(context.device, &imageInfo, nullptr, &sourceImage), "vkCreateImage presentation source");
     VkMemoryRequirements requirements{};
     context.Function<PFN_vkGetImageMemoryRequirements>("vkGetImageMemoryRequirements")(context.device, sourceImage, &requirements);

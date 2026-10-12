@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -28,6 +29,7 @@ Recorder* RecorderFor(const Context& context) {
 class DepthSurface {
 public:
     DepthSurface(const Context& context, const DepthTarget& target) : clearDepth(target.clearDepth), clearStencil(target.clearStencil), context(context), target(target) {
+        const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::DepthSurface);
         this->context.bufferPool.reset();
         VkFormatProperties properties{};
         context.formatProperties(context.physical, target.format, &properties);
@@ -157,6 +159,7 @@ public:
             std::snprintf(text, sizeof(text), "AGC graphics: storage image access to depth surface 0x%llx (%ux%u, vk format %d) as a %ux%u image of vk format %d, dimension %d, %u mips is not implemented", static_cast<unsigned long long>(target.address), target.extent.width, target.extent.height, static_cast<int>(target.format), descriptor.width, descriptor.height, static_cast<int>(storageFormat), static_cast<int>(descriptor.dimension), descriptor.mipCount);
             throw std::runtime_error(text);
         }
+        const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::DepthSurface);
         if (transferBuffer == nullptr) transferBuffer = std::make_unique<DeviceBuffer>(context, static_cast<std::size_t>(target.extent.width) * target.extent.height * (d16 ? 2u : 4u), VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
         auto* recorder = RecorderFor(context);
         std::unique_ptr<CommandBatch> batch;
@@ -221,6 +224,7 @@ public:
         // Writes of an aliased storage image (the layered path, ForStorageDepth) land first.
         TakeWrites(stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT);
         auto& plane = stencil ? stencilPlane : depthPlane;
+        const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::DepthPlaneStorage);
         if (plane.storage == nullptr || plane.storage->Descriptor().format != resource.format || plane.storage->Descriptor().tileMode != resource.tileMode || plane.storage->Descriptor().baseAddress != resource.baseAddress) plane.storage = std::make_shared<StorageTexture>(context, *context.detiler, resource, 0);
         // A stencil plane whose layout the target programs (SW_MODE, HTILE) keeps the alias rules.
         if (stencil && (target.stencilSwizzle != 0 || target.htileStencil)) RequireStencilLayout(*plane.storage);
@@ -264,6 +268,7 @@ private:
         if (recorder == nullptr) batch = std::make_unique<CommandBatch>(context);
         const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
         const auto bytes = static_cast<std::size_t>(target.extent.width) * target.extent.height * (stencil ? 1u : d16 ? 2u : 4u);
+        const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::DepthPlaneStorage);
         if (plane.staging == nullptr) plane.staging = std::make_unique<DeviceBuffer>(context, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
         const auto commands = recorder != nullptr ? recorder->Commands() : batch->Handle();
         if (recorder != nullptr) recorder->Keep(plane.storage);

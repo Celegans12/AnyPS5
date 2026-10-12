@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/GpuColorTransfer.hpp"
+#include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include "prx/libSceAgcDriver/Graphics/shaders/ColorTransfer_spv.h"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/HalfFloatScanout.hpp"
@@ -86,6 +87,7 @@ void GpuColorTransfer::prepare(std::uint32_t newWidth, std::uint32_t newHeight, 
     Require((newWidth + 7u) / 8u <= context.limits.maxComputeWorkGroupCount[0] && (newHeight + 7u) / 8u <= context.limits.maxComputeWorkGroupCount[1], "color transfer exceeds workgroup limits");
     if (tiled && width == newWidth && height == newHeight && mode == newMode && elementBytes == newElementBytes) return;
     constexpr VkBufferUsageFlags copies = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::ColorTransfer);
     auto newTiled = std::make_unique<Buffer>(context, layout.Bytes(), copies);
     auto newTiledDevice = std::make_unique<DeviceBuffer>(context, layout.Bytes(), copies | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     auto newLinear = std::make_unique<DeviceBuffer>(context, linearBytes, copies | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);

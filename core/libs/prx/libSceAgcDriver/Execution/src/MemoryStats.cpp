@@ -67,7 +67,15 @@ struct State {
     std::mutex devicesMutex;
     std::vector<DeviceEntry> devices;
     std::mutex memoryMutex;
-    std::unordered_map<std::uint64_t, std::pair<VkDeviceSize, VkClass>> allocations;
+    struct Allocation {
+        VkDeviceSize bytes;
+        VkClass kind;
+        Owner owner;
+    };
+    std::unordered_map<std::uint64_t, Allocation> allocations;
+    std::mutex objectMutex;
+    std::unordered_map<std::uint64_t, Owner> imageOwners;
+    std::unordered_map<std::uint64_t, Owner> bufferOwners;
     std::mutex shaderMutex;
     std::unordered_map<std::uint64_t, std::size_t> shaderModuleBytes;
     std::unordered_map<const void*, std::size_t> spirvSources;
@@ -119,6 +127,13 @@ VkClass Classify(const DeviceEntry& entry, const VkMemoryAllocateInfo& info) {
     return VkClass::Other;
 }
 
+Slot& OwnerMemorySlot(Owner owner, VkClass kind) {
+    auto& slots = OwnerAt(owner);
+    if (kind == VkClass::Device || kind == VkClass::Bar) return slots.device;
+    if (kind == VkClass::Imported) return slots.imported;
+    return slots.host;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL TrackedAllocateMemory(VkDevice device, const VkMemoryAllocateInfo* info, const VkAllocationCallbacks* allocator, VkDeviceMemory* memory) {
     const auto* entry = Find(device);
     const auto result = entry->allocateMemory(device, info, allocator, memory);
@@ -126,8 +141,10 @@ VKAPI_ATTR VkResult VKAPI_CALL TrackedAllocateMemory(VkDevice device, const VkMe
         auto& state = Get();
         const auto kind = Classify(*entry, *info);
         Bump(state.vk[static_cast<std::size_t>(kind)], static_cast<std::int64_t>(info->allocationSize), 1);
+        const auto owner = CurrentPoolTier() != Owner::None ? CurrentPoolTier() : CurrentOwner();
+        Bump(OwnerMemorySlot(owner, kind), static_cast<std::int64_t>(info->allocationSize), 1);
         std::lock_guard lock(state.memoryMutex);
-        state.allocations[HandleKey(*memory)] = {info->allocationSize, kind};
+        state.allocations[HandleKey(*memory)] = {info->allocationSize, kind, owner};
     }
     return result;
 }
@@ -138,7 +155,8 @@ VKAPI_ATTR void VKAPI_CALL TrackedFreeMemory(VkDevice device, VkDeviceMemory mem
         auto& state = Get();
         std::lock_guard lock(state.memoryMutex);
         if (const auto found = state.allocations.find(HandleKey(memory)); found != state.allocations.end()) {
-            Bump(state.vk[static_cast<std::size_t>(found->second.second)], -static_cast<std::int64_t>(found->second.first), -1);
+            Bump(state.vk[static_cast<std::size_t>(found->second.kind)], -static_cast<std::int64_t>(found->second.bytes), -1);
+            Bump(OwnerMemorySlot(found->second.owner, found->second.kind), -static_cast<std::int64_t>(found->second.bytes), -1);
             state.allocations.erase(found);
         }
     }
@@ -223,26 +241,52 @@ VKAPI_ATTR VkResult VKAPI_CALL TrackedGetPipelineCacheData(VkDevice device, VkPi
 VKAPI_ATTR VkResult VKAPI_CALL TrackedCreateImage(VkDevice device, const VkImageCreateInfo* info, const VkAllocationCallbacks* allocator, VkImage* image) {
     const auto* entry = Find(device);
     const auto result = entry->createImage(device, info, allocator, image);
-    if (result == VK_SUCCESS) Bump(Get().images, 0, 1);
+    if (result == VK_SUCCESS && image != nullptr) {
+        Bump(Get().images, 0, 1);
+        const auto owner = CurrentOwner();
+        Bump(OwnerAt(owner).images, 0, 1);
+        std::lock_guard lock(Get().objectMutex);
+        Get().imageOwners[HandleKey(*image)] = owner;
+    }
     return result;
 }
 
 VKAPI_ATTR void VKAPI_CALL TrackedDestroyImage(VkDevice device, VkImage image, const VkAllocationCallbacks* allocator) {
     const auto* entry = Find(device);
-    if (image != VK_NULL_HANDLE) Bump(Get().images, 0, -1);
+    if (image != VK_NULL_HANDLE) {
+        Bump(Get().images, 0, -1);
+        std::lock_guard lock(Get().objectMutex);
+        if (const auto found = Get().imageOwners.find(HandleKey(image)); found != Get().imageOwners.end()) {
+            Bump(OwnerAt(found->second).images, 0, -1);
+            Get().imageOwners.erase(found);
+        }
+    }
     entry->destroyImage(device, image, allocator);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL TrackedCreateBuffer(VkDevice device, const VkBufferCreateInfo* info, const VkAllocationCallbacks* allocator, VkBuffer* buffer) {
     const auto* entry = Find(device);
     const auto result = entry->createBuffer(device, info, allocator, buffer);
-    if (result == VK_SUCCESS) Bump(Get().buffers, 0, 1);
+    if (result == VK_SUCCESS && buffer != nullptr) {
+        Bump(Get().buffers, 0, 1);
+        const auto owner = CurrentOwner();
+        Bump(OwnerAt(owner).buffers, 0, 1);
+        std::lock_guard lock(Get().objectMutex);
+        Get().bufferOwners[HandleKey(*buffer)] = owner;
+    }
     return result;
 }
 
 VKAPI_ATTR void VKAPI_CALL TrackedDestroyBuffer(VkDevice device, VkBuffer buffer, const VkAllocationCallbacks* allocator) {
     const auto* entry = Find(device);
-    if (buffer != VK_NULL_HANDLE) Bump(Get().buffers, 0, -1);
+    if (buffer != VK_NULL_HANDLE) {
+        Bump(Get().buffers, 0, -1);
+        std::lock_guard lock(Get().objectMutex);
+        if (const auto found = Get().bufferOwners.find(HandleKey(buffer)); found != Get().bufferOwners.end()) {
+            Bump(OwnerAt(found->second).buffers, 0, -1);
+            Get().bufferOwners.erase(found);
+        }
+    }
     entry->destroyBuffer(device, buffer, allocator);
 }
 
@@ -391,6 +435,38 @@ void AppendVulkan(std::string& line) {
     }
 }
 
+std::uint64_t Live(const std::atomic<std::int64_t>& value) {
+    return static_cast<std::uint64_t>(std::max<std::int64_t>(0, value.load(std::memory_order_relaxed)));
+}
+
+// Per owner, only the non-zero parts: devmem_<owner> (DEVICE_LOCAL allocations charged to it, MB and
+// allocation count), hostmem_/importmem_<owner>, img_/buf_<owner> (live VkImages/VkBuffers made under
+// it) and pooled_<owner> / pooledhost_<owner> (live pooled buffer objects it asked for, capacity MB and
+// count). vk_device_unattributed is the device memory made outside every owner scope.
+void AppendOwners(std::string& line) {
+    for (std::size_t i = 0; i < static_cast<std::size_t>(Owner::Count); ++i) {
+        const auto& slots = OwnerAt(static_cast<Owner>(i));
+        const auto name = std::string(OwnerNames[i]);
+        if (i == 0) {
+            AppendMiB(line, "vk_device_unattributed", Live(slots.device.bytes), Live(slots.device.count));
+            AppendCount(line, "vk_images_unattributed", Live(slots.images.count));
+            AppendCount(line, "vk_buffers_unattributed", Live(slots.buffers.count));
+            if (Live(slots.host.count) != 0) AppendMiB(line, "vk_host_unattributed", Live(slots.host.bytes), Live(slots.host.count));
+            if (Live(slots.imported.count) != 0) AppendMiB(line, "vk_imported_unattributed", Live(slots.imported.bytes), Live(slots.imported.count));
+            if (Live(slots.liveDevice.count) != 0) AppendMiB(line, "pooled_unattributed", Live(slots.liveDevice.bytes), Live(slots.liveDevice.count));
+            if (Live(slots.liveHost.count) != 0) AppendMiB(line, "pooledhost_unattributed", Live(slots.liveHost.bytes), Live(slots.liveHost.count));
+            continue;
+        }
+        if (Live(slots.device.count) != 0) AppendMiB(line, ("devmem_" + name).c_str(), Live(slots.device.bytes), Live(slots.device.count));
+        if (Live(slots.host.count) != 0) AppendMiB(line, ("hostmem_" + name).c_str(), Live(slots.host.bytes), Live(slots.host.count));
+        if (Live(slots.imported.count) != 0) AppendMiB(line, ("importmem_" + name).c_str(), Live(slots.imported.bytes), Live(slots.imported.count));
+        if (Live(slots.images.count) != 0) AppendCount(line, ("img_" + name).c_str(), Live(slots.images.count));
+        if (Live(slots.buffers.count) != 0) AppendCount(line, ("buf_" + name).c_str(), Live(slots.buffers.count));
+        if (Live(slots.liveDevice.count) != 0) AppendMiB(line, ("pooled_" + name).c_str(), Live(slots.liveDevice.bytes), Live(slots.liveDevice.count));
+        if (Live(slots.liveHost.count) != 0) AppendMiB(line, ("pooledhost_" + name).c_str(), Live(slots.liveHost.bytes), Live(slots.liveHost.count));
+    }
+}
+
 void Report() {
     auto& state = Get();
     std::string line;
@@ -398,6 +474,7 @@ void Report() {
     Append(line, "[mem] t=%.0f", std::chrono::duration<double>(std::chrono::steady_clock::now() - state.start).count());
     AppendProcess(line);
     AppendVulkan(line);
+    AppendOwners(line);
     for (std::size_t i = 0; i < static_cast<std::size_t>(Counter::Count); ++i) {
         const auto& slot = At(static_cast<Counter>(i));
         AppendMiB(line, CounterNames[i], static_cast<std::uint64_t>(std::max<std::int64_t>(0, slot.bytes.load())), static_cast<std::uint64_t>(std::max<std::int64_t>(0, slot.count.load())));
@@ -463,7 +540,7 @@ void Start() {
         if (state.started || state.stopping) return;
         state.started = true;
     }
-    std::fprintf(stderr, "[mem] reporter every %u s (APS5_MEM_STATS); fields: process_* from GetProcessMemoryInfo, *_heap from HeapSummary, vq_* from a VirtualQuery walk (committed bytes), vk_* from the device's vkAllocateMemory/vkFreeMemory, the other fields are live MB(objects)\n", PeriodSeconds());
+    std::fprintf(stderr, "[mem] reporter every %u s (APS5_MEM_STATS); fields: process_* from GetProcessMemoryInfo, *_heap from HeapSummary, vq_* from a VirtualQuery walk (committed bytes), vk_* from the device's vkAllocateMemory/vkFreeMemory, devmem_/hostmem_/importmem_<owner> charge each allocation to the owner scope it was made in (pool_* = the buffer pool's own allocations), img_/buf_<owner> count live VkImages/VkBuffers by owner, pooled_<owner> = live pooled buffer objects by the owner that asked, vk_device_unattributed = device memory made outside every owner scope, the other fields are live MB(objects)\n", PeriodSeconds());
     std::thread([] {
         auto& state = Get();
         std::unique_lock lock(state.reportMutex);

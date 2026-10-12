@@ -239,6 +239,7 @@ std::uint64_t SampledTextureMemory() {
 }
 
 Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare) : context(context) {
+    const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::SampledTexture);
 
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PhaseTimer timer;
@@ -305,6 +306,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
                 // Entries may also be extents ("3840x2160"), since heap addresses change between runs.
                 dumpWanted = dumpList.find(address) != std::string::npos || dumpList.find(extent) != std::string::npos;
             }
+            const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::TextureUpload);
             auto staging = std::make_shared<Buffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
             std::memcpy(staging->Bytes().data(), snapshot.data(), snapshot.size());
             auto tiled = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
@@ -477,6 +479,7 @@ bool Texture::CanDepthCopyFrom(const StorageTexture& source, const GuestTextureR
 }
 
 Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& source, const GuestTextureResource& descriptor, VkComponentMapping components, DepthCopyTag) : context(context), storageSource(source), depthCopy(true) {
+    const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::DepthCopy);
     try {
         Require(source != nullptr && CanDepthCopyFrom(*source, descriptor), "storage image cannot serve a depth copy of the sampled texture");
         const auto colorFormat = ResolveTextureFormat(descriptor.format);
@@ -540,6 +543,7 @@ bool Texture::RefreshDepthCopy() {
     if (copiedOnce && storageSource->Version() == copiedVersion) return false;
     std::uint64_t linearBytes = 0;
     for (std::uint32_t level = 0; level < copyLevels; ++level) linearBytes += static_cast<std::uint64_t>(std::max(copyWidth >> level, 1u)) * std::max(copyHeight >> level, 1u) * copyElementBytes * copyLayers;
+    const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::TextureUpload);
     auto linear = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(linearBytes), VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     std::vector<VkBufferImageCopy> fromSource, toDepth;
     std::uint64_t offset = 0;
@@ -622,6 +626,7 @@ bool Texture::CanCopyFrom(const StorageTexture& source, const GuestTextureResour
 }
 
 Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& source, const GuestTextureResource& descriptor, VkComponentMapping components) : context(context), storageSource(source) {
+    const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::SampledTexture);
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PhaseTimer timer;
     try {
@@ -868,6 +873,7 @@ VkFormat AttachmentProxyFormat(const Context& context, VkFormat format) {
 }
 
 StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, std::uint32_t mipLevel) : context(context), detiler(detiler), descriptor(descriptor) {
+    const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::StorageTexture, true);
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PhaseTimer timer;
     try {
@@ -1180,6 +1186,7 @@ bool AdjacentGenerationEnabled() {
 }
 
 bool ClearKeepsDenormals(const Context& context, VkFormat format) {
+    const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::Misc);
     static std::mutex mutex;
     static std::map<std::pair<VkDevice, VkFormat>, bool> known;
     std::lock_guard lock(mutex);
@@ -1341,6 +1348,7 @@ VkImageView StorageTexture::AttachmentView(VkFormat format, std::uint32_t mip, s
 }
 
 VkImageView StorageTexture::AttachmentProxyView() {
+    const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::AttachmentProxy);
     if (proxyView != VK_NULL_HANDLE) return proxyView;
     Require(storageFormat == VK_FORMAT_R8_UNORM && descriptor.dimension == TextureDimension::k2D && descriptor.mipCount == 1 && geometry.imageLayers == 1, "an RGBA8_SRGB attachment proxy is only modeled for a single-mip 2D R8 surface");
     try {
@@ -2128,6 +2136,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
             }
         }
         const bool direct = singlePass();
+        const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::TextureUpload);
         auto linear = direct ? nullptr : std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(linearBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
         detiler.BeginBatch();
         auto* recorder = Recorder::Active();
@@ -2219,6 +2228,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
     originalHashes = {};
     GuestMemory::ReadCommitted(descriptor.baseAddress, original);
     {
+            const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::TextureUpload);
             Buffer staging(context, original.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
             if (uploadedKeys == DccKeys::Uncompressed) std::memcpy(staging.Bytes().data(), original.data(), original.size());
             else ReadTextureSurface(descriptor, uploadedKeys, staging.Bytes().first(original.size()));
@@ -2501,6 +2511,7 @@ std::uint64_t StorageTexture::uploadWindows(const HostImport& import, std::span<
     }
     for (const auto& [begin, end] : runs) uploadedBytes += end - begin;
     const bool direct = singlePass();
+    const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::TextureUpload);
     auto linear = direct ? nullptr : std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(linearTotal), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
     detiler.BeginBatch();
     auto* recorder = Recorder::Active();
@@ -2694,6 +2705,7 @@ std::uint64_t StorageTexture::writeBackWindows(const HostImport& import, std::sp
         flushEnd = std::max(flushEnd, seed.end);
     }
     const bool direct = singlePass();
+    const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::TextureUpload);
     auto linear = direct ? nullptr : std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(linearTotal), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     auto tiledScratch = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(scratchTotal), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     detiler.BeginBatch();
@@ -4168,6 +4180,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         // The surface lives in host-imported memory: the retiler writes into device scratch and the
         // untouched blocks are copied into the imported bytes in place, recorded behind the work that
         // produced the image; nothing crosses to the CPU.
+        const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::TextureUpload);
         auto linear = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(sliceLinearBytes * arrayLayers), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
         auto tiledScratch = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
         std::vector<CopiedBytes> copied;
@@ -4299,6 +4312,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         GuestMemory::ReadCommitted(descriptor.baseAddress, original);
     }
     originalHashes = {};
+    const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::TextureUpload);
     DeviceBuffer linear(context, static_cast<std::size_t>(sliceLinearBytes * arrayLayers), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     DeviceBuffer tiled(context, original.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     Buffer host(context, original.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);

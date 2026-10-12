@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_RESOURCES_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
+#include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include <span>
 
 namespace AgcDriver::Graphics {
@@ -39,6 +40,8 @@ private:
     VkBufferUsageFlags usage;
     VkMemoryPropertyFlags properties;
     std::shared_ptr<BufferPool> cache;
+    // APS5_MEM_STATS: this object's capacity, charged to the owner scope it was made in.
+    MemoryStats::LiveToken live;
 };
 
 // Device-local scratch memory for GPU-side layout conversion. The detiler reads and writes scattered
@@ -63,6 +66,7 @@ private:
     VkDeviceSize allocationBytes = 0;
     VkBufferUsageFlags usage;
     std::shared_ptr<BufferPool> cache;
+    MemoryStats::LiveToken live;
 };
 
 // Records a whole-range buffer copy.
