@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/VramBudget.hpp"
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -44,6 +45,24 @@ VramBudget::VramBudget(const Context& context) : query(context.memoryProperties2
     const VkDeviceSize forcedHeadroom = ForcedHeadroom();
     limit = forcedLimit != 0 ? std::min(forcedLimit, heapBytes) : heapBytes;
     headroom = forcedHeadroom != 0 ? forcedHeadroom : HeadroomFor(limit);
+}
+
+namespace {
+
+std::atomic<TextureMemoryReclaimer>& Reclaimer() {
+    static std::atomic<TextureMemoryReclaimer> reclaimer{nullptr};
+    return reclaimer;
+}
+
+}
+
+void SetTextureMemoryReclaimer(TextureMemoryReclaimer reclaimer) {
+    Reclaimer().store(reclaimer, std::memory_order_release);
+}
+
+VkDeviceSize ReclaimTextureMemory(VkDevice device, VkDeviceSize wanted) {
+    const auto reclaimer = Reclaimer().load(std::memory_order_acquire);
+    return reclaimer != nullptr ? reclaimer(device, wanted) : 0;
 }
 
 VkDeviceSize VramBudget::ForcedLimit() {

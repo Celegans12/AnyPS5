@@ -158,6 +158,9 @@ private:
 };
 
 std::shared_ptr<BufferPool> GetBufferPool(const Context& context);
+// vkAllocateMemory with the out-of-memory recovery of BufferPool::AllocateMemory (the context's pool
+// trimmed, then sampled textures reclaimed, then one retry); throws with `operation` on failure.
+VkDeviceMemory AllocateDeviceMemory(const Context& context, const VkMemoryAllocateInfo& allocation, const char* operation);
 
 }
 

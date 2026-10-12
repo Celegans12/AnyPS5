@@ -69,6 +69,8 @@ struct SampledCacheCounts {
     std::uint64_t refusedBytes = 0;
     std::uint64_t droppedSets = 0;
     std::uint64_t refusedSets = 0;
+    std::uint64_t reclaims = 0;
+    std::uint64_t reclaimedBytes = 0;
 };
 SampledCacheCounts SampledCacheCounters();
 std::shared_ptr<Texture> CachedSampledTexture(const Context& context, std::span<const std::uint32_t> words);

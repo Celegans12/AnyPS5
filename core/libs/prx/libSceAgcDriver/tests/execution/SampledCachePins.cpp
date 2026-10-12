@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VramBudget.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "Recompiler.hpp"
 #include "VulkanTestDevice.hpp"
@@ -182,6 +183,20 @@ int main() {
             Require(afterBurst.refused + afterBurst.evicted > afterRetired.refused + afterRetired.evicted, "a burst past the budget neither refused nor evicted a texture");
             Require(afterBurst.refused == afterRetired.refused || afterBurst.refusedSets > afterRetired.refusedSets, "a refused texture's resource set was cached");
 
+            // Out of device memory: the reclaim evicts every texture no recorded work uses, with the
+            // sets binding them, and leaves the one the open batch uses.
+            Sample(*device, sampled, target, Surfaces - 1u);
+            const auto reclaimed = AgcDriver::Graphics::ReclaimTextureMemory(device->Device(), 1);
+            const auto kept = TextureCacheUsage();
+            std::printf("out-of-memory reclaim with one dispatch recorded: %s released, %zu entries (%s) left\n", MiB(reclaimed).c_str(), kept.sampledEntries, MiB(kept.sampledBytes).c_str());
+            Require(reclaimed != 0, "the out-of-memory reclaim released nothing from a cache of completed textures");
+            Require(kept.sampledEntries <= 1u && kept.sampledBytes <= perTexture, "the out-of-memory reclaim left textures no recorded work uses");
+            Require(SampledTextureMemory() - baseline <= 2u * perTexture, "the out-of-memory reclaim evicted textures whose resource sets kept them alive");
+            device->WaitIdle();
+            AgcDriver::Graphics::ReclaimTextureMemory(device->Device(), 1);
+            Require(TextureCacheUsage().sampledEntries == 0 && SampledTextureMemory() == baseline, "once its work completed, the last texture was not reclaimed");
+            const auto counts = SampledCacheCounters();
+            Require(counts.reclaims >= 1u && counts.reclaimedBytes >= reclaimed, "the reclaim was not counted");
         } catch (...) {
             release();
             throw;

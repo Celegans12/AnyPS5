@@ -48,7 +48,9 @@ VkDeviceMemory BufferPool::AllocateMemory(const VkMemoryAllocateInfo& allocation
     const auto initialResult = result;
     unsigned attempts = 1;
     VkDeviceSize reclaimed = 0;
-    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY || result == VK_ERROR_OUT_OF_HOST_MEMORY) {
+    VkDeviceSize textures = 0;
+    const auto outOfMemory = [&] { return result == VK_ERROR_OUT_OF_DEVICE_MEMORY || result == VK_ERROR_OUT_OF_HOST_MEMORY; };
+    if (outOfMemory()) {
         reclaimed = trim();
         if (reclaimed != 0) {
             memory = VK_NULL_HANDLE;
@@ -56,14 +58,38 @@ VkDeviceMemory BufferPool::AllocateMemory(const VkMemoryAllocateInfo& allocation
             ++attempts;
         }
     }
+    // Then the sampled textures no recorded work uses (and the resource sets pinning them), whose
+    // pooled buffers the second trim releases: the texture caches are the bulk of the heap.
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+        textures = ReclaimTextureMemory(device, allocation.allocationSize);
+        if (textures != 0) {
+            reclaimed += trim();
+            memory = VK_NULL_HANDLE;
+            result = allocateMemory(device, &allocation, nullptr, &memory);
+            ++attempts;
+        }
+    }
     if (result == VK_SUCCESS) {
-        if (attempts == 2) std::fprintf(stderr, "[bufferpool] %s recovered: allocation=%llu reclaimed=%llu initialResult=%d attempts=%u\n", operation, static_cast<unsigned long long>(allocation.allocationSize), static_cast<unsigned long long>(reclaimed), static_cast<int>(initialResult), attempts);
+        if (attempts >= 2) std::fprintf(stderr, "[bufferpool] %s recovered: allocation=%llu reclaimed=%llu textures=%llu initialResult=%d attempts=%u\n", operation, static_cast<unsigned long long>(allocation.allocationSize), static_cast<unsigned long long>(reclaimed), static_cast<unsigned long long>(textures), static_cast<int>(initialResult), attempts);
         return memory;
     }
     char details[512];
-    std::snprintf(details, sizeof(details), "%s: allocation=%llu memoryType=%u reclaimed=%llu initialResult=%d attempts=%u", operation, static_cast<unsigned long long>(allocation.allocationSize), allocation.memoryTypeIndex, static_cast<unsigned long long>(reclaimed), static_cast<int>(initialResult), attempts);
+    std::snprintf(details, sizeof(details), "%s: allocation=%llu memoryType=%u reclaimed=%llu textures=%llu initialResult=%d attempts=%u", operation, static_cast<unsigned long long>(allocation.allocationSize), allocation.memoryTypeIndex, static_cast<unsigned long long>(reclaimed), static_cast<unsigned long long>(textures), static_cast<int>(initialResult), attempts);
     Check(result, details);
     return VK_NULL_HANDLE;
+}
+
+VkDeviceMemory AllocateDeviceMemory(const Context& context, const VkMemoryAllocateInfo& allocation, const char* operation) {
+    if (context.bufferPool) return context.bufferPool->AllocateMemory(allocation, operation);
+    const auto allocate = context.Function<PFN_vkAllocateMemory>("vkAllocateMemory");
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    auto result = allocate(context.device, &allocation, nullptr, &memory);
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && ReclaimTextureMemory(context.device, allocation.allocationSize) != 0) {
+        memory = VK_NULL_HANDLE;
+        result = allocate(context.device, &allocation, nullptr, &memory);
+    }
+    Check(result, operation);
+    return memory;
 }
 
 bool BufferPool::SlabEligible(std::size_t capacity, VkDeviceSize alignment, VkDeviceSize size, VkDeviceSize atom) {

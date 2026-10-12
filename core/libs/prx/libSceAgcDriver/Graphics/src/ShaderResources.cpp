@@ -159,11 +159,13 @@ std::atomic<std::uint64_t>& SampledCachedBytes() {
     return bytes;
 }
 
-// Resource-cache sets dropped because a sampled texture they bind left the cache, and inserts
-// refused because the set binds such a texture.
+// Resource-cache sets dropped because a sampled texture they bind left the cache, inserts refused
+// because the set binds such a texture, and out-of-memory reclaims (count, bytes).
 struct SampledCacheAtomics {
     std::atomic<std::uint64_t> droppedSets{0};
     std::atomic<std::uint64_t> refusedSets{0};
+    std::atomic<std::uint64_t> reclaims{0};
+    std::atomic<std::uint64_t> reclaimedBytes{0};
 };
 
 SampledCacheAtomics& SampledAtomics() {
@@ -188,6 +190,26 @@ TextureCache& Textures() {
     return cache;
 }
 
+// The sampled cache's mutex, taken at most once per thread: an allocation made under it (a new
+// snapshot's image in cachedTexture) that runs out of device memory reclaims from the cache on the
+// same thread (ReclaimTextureMemory), which then owns it already.
+thread_local bool sampledCacheHeld = false;
+
+struct SampledCacheLock {
+    explicit SampledCacheLock(TextureCache& cache) : lock(cache.mutex, std::defer_lock) {
+        if (sampledCacheHeld) return;
+        lock.lock();
+        sampledCacheHeld = true;
+        owner = true;
+    }
+    ~SampledCacheLock() {
+        if (owner) sampledCacheHeld = false;
+    }
+    SampledCacheLock(const SampledCacheLock&) = delete;
+    SampledCacheLock& operator=(const SampledCacheLock&) = delete;
+    std::unique_lock<std::mutex> lock;
+    bool owner = false;
+};
 
 struct UncachedImages {
     std::mutex mutex;
@@ -343,7 +365,7 @@ void dropReleasedDependents() {
     std::vector<std::shared_ptr<Texture>> released;
     {
         auto& cache = Textures();
-        std::lock_guard lock(cache.mutex);
+        SampledCacheLock lock(cache);
         if (cache.released.empty()) return;
         released.swap(cache.released);
     }
@@ -380,15 +402,19 @@ void reportCacheCounts(TextureCache& cache, const TextureCacheBudgets& budgets) 
     if (now - cache.countsReported < std::chrono::seconds(10)) return;
     cache.countsReported = now;
     const auto counts = std::exchange(cache.counts, {});
-    static std::uint64_t droppedBefore = 0, refusedSetsBefore = 0;
+    static std::uint64_t droppedBefore = 0, refusedSetsBefore = 0, reclaimsBefore = 0, reclaimedBefore = 0;
     auto& atomics = SampledAtomics();
     const auto dropped = atomics.droppedSets.load(std::memory_order_relaxed);
     const auto refusedSets = atomics.refusedSets.load(std::memory_order_relaxed);
+    const auto reclaims = atomics.reclaims.load(std::memory_order_relaxed);
+    const auto reclaimed = atomics.reclaimedBytes.load(std::memory_order_relaxed);
     const auto sampled = SampledTextureMemory();
     const auto outside = sampled - std::min(sampled, cache.snapshotBytes);
-    AgcDriver::ProfilePrint_nid_no_patch("[texture-cache] (10 s): %llu textures cached, %llu used uncached (first use this frame, the least recently used entry used this frame or the last), %llu refused over the ceiling (%llu MiB), %llu evicted (%llu MiB), %llu in-use ones passed over, %llu found changed; %llu resource sets dropped with released textures, %llu not cached for binding one; %llu MiB in %zu entries, budget %llu MiB, ceiling %llu MiB; sampled images outside the cache %llu MiB (in recorded work and builds); storage budget %llu MiB, VRAM share of the texture caches %llu MiB; frame %llu\n", static_cast<unsigned long long>(counts.inserted), static_cast<unsigned long long>(counts.uncached), static_cast<unsigned long long>(counts.refused), static_cast<unsigned long long>(counts.refusedBytes >> 20u), static_cast<unsigned long long>(counts.evicted), static_cast<unsigned long long>(counts.evictedBytes >> 20u), static_cast<unsigned long long>(counts.passed), static_cast<unsigned long long>(counts.stale), static_cast<unsigned long long>(dropped - droppedBefore), static_cast<unsigned long long>(refusedSets - refusedSetsBefore), static_cast<unsigned long long>(cache.bytes >> 20u), cache.entries.size(), static_cast<unsigned long long>(budgets.sampled >> 20u), static_cast<unsigned long long>(budgets.ceiling >> 20u), static_cast<unsigned long long>(outside >> 20u), static_cast<unsigned long long>(budgets.storage >> 20u), static_cast<unsigned long long>(budgets.target >> 20u), static_cast<unsigned long long>(Recorder::Presents()));
+    AgcDriver::ProfilePrint_nid_no_patch("[texture-cache] (10 s): %llu textures cached, %llu used uncached (first use this frame, the least recently used entry used this frame or the last), %llu refused over the ceiling (%llu MiB), %llu evicted (%llu MiB), %llu in-use ones passed over, %llu found changed; %llu resource sets dropped with released textures, %llu not cached for binding one; %llu out-of-memory reclaims (%llu MiB); %llu MiB in %zu entries, budget %llu MiB, ceiling %llu MiB; sampled images outside the cache %llu MiB (in recorded work and builds); storage budget %llu MiB, VRAM share of the texture caches %llu MiB; frame %llu\n", static_cast<unsigned long long>(counts.inserted), static_cast<unsigned long long>(counts.uncached), static_cast<unsigned long long>(counts.refused), static_cast<unsigned long long>(counts.refusedBytes >> 20u), static_cast<unsigned long long>(counts.evicted), static_cast<unsigned long long>(counts.evictedBytes >> 20u), static_cast<unsigned long long>(counts.passed), static_cast<unsigned long long>(counts.stale), static_cast<unsigned long long>(dropped - droppedBefore), static_cast<unsigned long long>(refusedSets - refusedSetsBefore), static_cast<unsigned long long>(reclaims - reclaimsBefore), static_cast<unsigned long long>((reclaimed - reclaimedBefore) >> 20u), static_cast<unsigned long long>(cache.bytes >> 20u), cache.entries.size(), static_cast<unsigned long long>(budgets.sampled >> 20u), static_cast<unsigned long long>(budgets.ceiling >> 20u), static_cast<unsigned long long>(outside >> 20u), static_cast<unsigned long long>(budgets.storage >> 20u), static_cast<unsigned long long>(budgets.target >> 20u), static_cast<unsigned long long>(Recorder::Presents()));
     droppedBefore = dropped;
     refusedSetsBefore = refusedSets;
+    reclaimsBefore = reclaims;
+    reclaimedBefore = reclaimed;
 }
 
 struct ImageMemoEntry {
@@ -772,9 +798,12 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     auto& cache = Textures();
     const auto key = MakeTextureKey(context.device, words, components, depthCompare);
     const DropReleasedDependents dropAfterUnlock;
-    std::lock_guard lock(cache.mutex);
+    const SampledCacheLock lock(cache);
     dropUncachedViews(cache);
     if (auto it = findTexture(cache, key); it != cache.entries.end()) {
+        // Held while the hit is checked: a refresh below may allocate, and an out-of-memory reclaim
+        // on this thread (ReclaimTextureMemory) then passes over the entry as in use.
+        const auto checked = it->texture;
         if (it->source != nullptr) {
             // The view follows the storage image, whatever the GPU wrote to it since; guest memory
             // written meanwhile is taken in by refreshing the image. A fast clear the image cannot
@@ -1120,7 +1149,7 @@ void AppendTextureMemoryStats(std::string& line) {
     MemoryStats::AppendCount(line, "tex_sampled_views", views);
     // Sampled images alive outside the cache's accounting (refused or evicted ones still in
     // recorded work or builds), the cached ones resource-cache sets pin, the budgets of both
-    // caches and their share of the VRAM, and what the eviction did.
+    // caches and their share of the VRAM, and what the eviction and the out-of-memory reclaim did.
     const auto sampledAll = SampledTextureMemory();
     MemoryStats::AppendMiB(line, "tex_sampled_outside", sampledAll - std::min(sampledAll, cachedSnapshots));
     MemoryStats::AppendCount(line, "tex_sampled_pinned", pinned);
@@ -1139,6 +1168,7 @@ void AppendTextureMemoryStats(std::string& line) {
     auto& atomics = SampledAtomics();
     MemoryStats::AppendCount(line, "rescache_sets_dropped", atomics.droppedSets.load(std::memory_order_relaxed));
     MemoryStats::AppendCount(line, "rescache_sets_refused", atomics.refusedSets.load(std::memory_order_relaxed));
+    MemoryStats::AppendMiB(line, "tex_oom_reclaimed", atomics.reclaimedBytes.load(std::memory_order_relaxed), atomics.reclaims.load(std::memory_order_relaxed));
     std::size_t storageEntries = 0;
     {
         auto& storage = StorageTextures();
@@ -1153,7 +1183,7 @@ TextureCacheUse TextureCacheUsage() {
     {
         const DropReleasedDependents dropAfterUnlock;
         auto& sampled = Textures();
-        std::lock_guard lock(sampled.mutex);
+        const SampledCacheLock lock(sampled);
         dropUncachedViews(sampled);
         use.sampledEntries = sampled.entries.size();
         use.sampledBytes = sampled.bytes;
@@ -1174,7 +1204,7 @@ SampledCacheCounts SampledCacheCounters() {
     SampledCacheCounts counts;
     {
         auto& cache = Textures();
-        std::lock_guard lock(cache.mutex);
+        const SampledCacheLock lock(cache);
         counts.evicted = cache.totals.evicted;
         counts.evictedBytes = cache.totals.evictedBytes;
         counts.refused = cache.totals.refused;
@@ -1183,7 +1213,60 @@ SampledCacheCounts SampledCacheCounters() {
     auto& atomics = SampledAtomics();
     counts.droppedSets = atomics.droppedSets.load(std::memory_order_relaxed);
     counts.refusedSets = atomics.refusedSets.load(std::memory_order_relaxed);
+    counts.reclaims = atomics.reclaims.load(std::memory_order_relaxed);
+    counts.reclaimedBytes = atomics.reclaimedBytes.load(std::memory_order_relaxed);
     return counts;
+}
+
+namespace {
+
+VkDeviceSize reclaimSampledTextures(VkDevice device, VkDeviceSize wanted) {
+    constexpr VkDeviceSize MiB = VkDeviceSize{1} << 20u;
+    const auto goal = std::max<VkDeviceSize>(wanted * 4u, 256 * MiB);
+    VkDeviceSize freed = 0;
+    std::size_t evicted = 0;
+    std::vector<std::shared_ptr<Texture>> doomed;
+    std::vector<std::shared_ptr<Texture>> released;
+    {
+        auto& cache = Textures();
+        const SampledCacheLock lock(cache);
+        const auto retired = retiredSerial();
+        for (auto it = cache.entries.end(); it != cache.entries.begin() && freed < goal;) {
+            const auto current = std::prev(it);
+            if (current->key.device != device || current->accounted == 0 || textureInUse(*current, retired)) {
+                it = current;
+                continue;
+            }
+            freed += current->accounted;
+            ++evicted;
+            countEvicted(cache, current->accounted);
+            doomed.push_back(current->texture);
+            eraseTexture(cache, current);
+        }
+        released.swap(cache.released);
+    }
+    std::size_t sets = 0;
+    if (!released.empty()) {
+        std::unordered_set<const Texture*> set;
+        for (const auto& texture : released) set.insert(texture.get());
+        std::vector<std::shared_ptr<ShaderResources>> resources;
+        SharedResourceCache().RemoveTextures(set, &resources);
+        sets = resources.size();
+    }
+    released.clear();
+    doomed.clear();
+    if (freed != 0) {
+        auto& atomics = SampledAtomics();
+        atomics.reclaims.fetch_add(1, std::memory_order_relaxed);
+        atomics.reclaimedBytes.fetch_add(freed, std::memory_order_relaxed);
+    }
+    static std::atomic<std::uint64_t> reports{0};
+    if (freed != 0 || reports.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[texture-cache] out of device memory (%llu bytes wanted): evicted %zu sampled textures no recorded work uses (%.1f MiB) and %zu resource sets binding them\n", static_cast<unsigned long long>(wanted), evicted, static_cast<double>(freed) / (1u << 20u), sets);
+    return freed;
+}
+
+[[maybe_unused]] const bool reclaimerRegistered = (SetTextureMemoryReclaimer(&reclaimSampledTextures), true);
+
 }
 
 std::shared_ptr<Texture> CachedSampledTexture(const Context& context, std::span<const std::uint32_t> words) {
@@ -1213,7 +1296,7 @@ void ClearCachedTextures(VkDevice device) {
     Require(device != VK_NULL_HANDLE, "cannot clear textures without a Vulkan device");
     auto& sampled = Textures();
     {
-        std::lock_guard lock(sampled.mutex);
+        const SampledCacheLock lock(sampled);
         for (auto it = sampled.entries.begin(); it != sampled.entries.end();) {
             if (it->key.device == device) eraseTexture(sampled, it++);
             else ++it;
@@ -2368,7 +2451,7 @@ bool touchSampledTextures(const std::vector<std::shared_ptr<Texture>>& textures)
     const auto managed = [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->SampledCacheState() != Texture::CacheState::Unmanaged; };
     if (std::none_of(textures.begin(), textures.end(), managed)) return true;
     auto& cache = Textures();
-    std::lock_guard lock(cache.mutex);
+    const SampledCacheLock lock(cache);
     for (const auto& texture : textures) {
         if (!managed(texture)) continue;
         const auto found = cache.byTexture.find(texture.get());

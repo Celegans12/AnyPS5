@@ -17,6 +17,14 @@ struct VramReport {
     VkDeviceSize target = 0;
 };
 
+// Last line of defence for an allocation that failed with VK_ERROR_OUT_OF_DEVICE_MEMORY: the texture
+// caches' reclaim (ShaderResources.cpp registers it; builds without the caches have none) evicts
+// sampled textures no recorded GPU work uses, least recently used first, with the resource-cache
+// entries that pin them, until about `wanted` bytes are free; returns the device memory released.
+using TextureMemoryReclaimer = VkDeviceSize (*)(VkDevice device, VkDeviceSize wanted);
+void SetTextureMemoryReclaimer(TextureMemoryReclaimer reclaimer);
+VkDeviceSize ReclaimTextureMemory(VkDevice device, VkDeviceSize wanted);
+
 class VramBudget {
 public:
     explicit VramBudget(const Context& context);
