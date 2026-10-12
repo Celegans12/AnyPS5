@@ -357,6 +357,16 @@ void DefineOutputs(SpirvEmitterState& state) {
             const auto type = uintOutput ? TypeU32Vector(state, 4u) : TypeF32Vector(state, 4u);
             binding.variableId = DefineInterfaceVariable(state, type, spv::StorageClassOutput, binding.debugName.c_str());
             state.module.AddAnnotation(spv::OpDecorate, binding.variableId, spv::DecorationLocation, binding.location);
+            if (binding.kind == StageOutputKind::Mrt && BlendableTarget(state, binding.index) && state.blendTargetImages[binding.index] == 0u) {
+                state.blendTargetWritten[binding.index] = state.module.DefineGlobalVariable(TypePointer(state, spv::StorageClassPrivate, TypeU32(state)), spv::StorageClassPrivate);
+                const auto image = state.module.Type(spv::OpTypeImage, TypeU32(state), spv::Dim2D, 0u, 0u, 0u, 2u, spv::ImageFormatR32ui);
+                const auto variable = state.module.DefineGlobalVariable(TypePointer(state, spv::StorageClassUniformConstant, image), spv::StorageClassUniformConstant);
+                state.module.AddName(variable, "blended_target");
+                state.module.AddAnnotation(spv::OpDecorate, variable, spv::DecorationDescriptorSet, 1u);
+                state.module.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBinding, binding.index);
+                state.module.AddAnnotation(spv::OpDecorate, variable, spv::DecorationCoherent);
+                state.blendTargetImages[binding.index] = variable;
+            }
             break;
         }
         }
@@ -364,6 +374,12 @@ void DefineOutputs(SpirvEmitterState& state) {
     if (state.program.Resources().stage == IrShaderStage::Pixel && state.inputInfo.pixel != nullptr && state.inputInfo.pixel->psAlphaToCoverage) {
         if (state.inputInfo.pixel->psSampleMaskExportEnable) throw std::runtime_error("alpha-to-coverage with a sample-mask export is unsupported");
         BuiltIn(state.sampleMaskVariable, SampleMaskArrayType(state), "gl_SampleMask", spv::BuiltInSampleMask);
+    }
+    if (std::none_of(state.blendTargetImages.begin(), state.blendTargetImages.end(), [](std::uint32_t variable) { return variable != 0u; })) return;
+    state.blendFragCoordVariable = InputVariableForKind(state, StageInputKind::FragCoord);
+    if (state.blendFragCoordVariable == 0u) {
+        state.blendFragCoordVariable = DefineInterfaceVariable(state, TypeF32Vector(state, 4u), spv::StorageClassInput, "gl_FragCoord");
+        state.module.AddAnnotation(spv::OpDecorate, state.blendFragCoordVariable, spv::DecorationBuiltIn, spv::BuiltInFragCoord);
     }
 }
 

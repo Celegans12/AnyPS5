@@ -173,6 +173,9 @@ struct SpirvEmitterState {
     std::uint32_t currentLabel = 0;
     const IrBlock* currentBlock = nullptr;
     std::uint32_t pixelValidMaskVariable = 0;
+    std::array<std::uint32_t, 8> blendTargetImages {};
+    std::array<std::uint32_t, 8> blendTargetWritten {};
+    std::uint32_t blendFragCoordVariable = 0;
     std::uint32_t subgroupLocalInvocationIdVariable = 0;
     std::uint32_t perVertexVariable = 0;
     std::uint32_t pointSizeVariable = 0;

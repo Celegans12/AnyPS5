@@ -98,6 +98,8 @@ DppTargetLane EmitDppMirrorTargetLane(SpirvEmitterState& state, std::uint32_t su
 DppTargetLane EmitDppTargetLane(SpirvEmitterState& state, std::uint32_t control);
 std::uint32_t InputVariableForKind(const SpirvEmitterState& state, StageInputKind kind);
 bool OrderedPixelShader(const SpirvEmitterState& state);
+bool BlendableTarget(const SpirvEmitterState& state, std::uint32_t index);
+void EmitBlendedTargets(SpirvEmitterState& state);
 const SpirvInputBinding* SpirvInputBindingForParameter(const SpirvEmitterState& state, std::uint32_t location);
 std::uint32_t EmitVertexParameterComponentU32(SpirvEmitterState& state, const SpirvInputBinding& input, std::uint32_t component);
 std::uint32_t EmitInputComponentU32(SpirvEmitterState& state, StageInputKind kind, std::uint32_t component);

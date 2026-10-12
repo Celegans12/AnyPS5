@@ -345,6 +345,52 @@ void memoryBarrier(const Context& context, VkCommandBuffer commands, VkPipelineS
     context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(commands, sourceStage, destinationStage, 0, 1, &barrier, 0, nullptr, 0, nullptr);
 }
 
+struct BlendedTargetSet {
+    BlendedTargetSet(const Context& context, VkDescriptorSetLayout layout, std::span<const ColorTarget> colors, std::vector<std::shared_ptr<StorageTexture>> targets) : device(context.device), destroyPool(context.Function<PFN_vkDestroyDescriptorPool>("vkDestroyDescriptorPool")), images(std::move(targets)) {
+        Require(layout != VK_NULL_HANDLE && colors.size() == images.size(), "blended color targets disagree with the pipeline layout");
+        const VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, static_cast<std::uint32_t>(images.size())};
+        VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        poolInfo.maxSets = 1;
+        poolInfo.poolSizeCount = 1;
+        poolInfo.pPoolSizes = &size;
+        Check(context.Function<PFN_vkCreateDescriptorPool>("vkCreateDescriptorPool")(device, &poolInfo, nullptr, &pool), "vkCreateDescriptorPool blended targets");
+        VkDescriptorSetAllocateInfo allocation{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        allocation.descriptorPool = pool;
+        allocation.descriptorSetCount = 1;
+        allocation.pSetLayouts = &layout;
+        Check(context.Function<PFN_vkAllocateDescriptorSets>("vkAllocateDescriptorSets")(device, &allocation, &set), "vkAllocateDescriptorSets blended targets");
+        std::vector<VkDescriptorImageInfo> views(images.size());
+        std::vector<VkWriteDescriptorSet> writes(images.size());
+        for (std::size_t index = 0; index < images.size(); ++index) {
+            views[index] = {VK_NULL_HANDLE, images[index]->StorageView(0, false), VK_IMAGE_LAYOUT_GENERAL};
+            writes[index] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            writes[index].dstSet = set;
+            writes[index].dstBinding = colors[index].exportIndex;
+            writes[index].descriptorCount = 1;
+            writes[index].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            writes[index].pImageInfo = &views[index];
+        }
+        context.Function<PFN_vkUpdateDescriptorSets>("vkUpdateDescriptorSets")(device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    }
+    ~BlendedTargetSet() {
+        if (pool != VK_NULL_HANDLE) destroyPool(device, pool, nullptr);
+    }
+    BlendedTargetSet(const BlendedTargetSet&) = delete;
+    BlendedTargetSet& operator=(const BlendedTargetSet&) = delete;
+    VkDevice device;
+    PFN_vkDestroyDescriptorPool destroyPool;
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    std::vector<std::shared_ptr<StorageTexture>> images;
+};
+
+void blendedTargetBarriers(const Context& context, VkCommandBuffer commands, const BlendedTargetSet& blended, bool before) {
+    for (const auto& image : blended.images) {
+        if (before) imageBarrier(context, commands, image->Image(), VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        else imageBarrier(context, commands, image->Image(), VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+    }
+}
+
 // The color surface as one untailed SW_64KB_R_X mip for the GPU detiler, with tightly packed linear rows.
 TileMipLayout ColorTargetMip(const ColorTarget& color, const ColorTargetLayout& layout) {
     TileMipLayout mip{};
@@ -666,6 +712,8 @@ bool ValidationKey(const Context& context, std::span<const CompiledShader> shade
         add(state.topology);
         add(state.cullMode);
         add(state.blends.size());
+        add(state.blendedColors.size());
+        for (const auto& color : state.blendedColors) add(color.exportIndex);
         add(context.subgroup.subgroupSize);
         add(context.subgroup.supportedStages);
         add(context.subgroup.supportedOperations);
@@ -1523,6 +1571,7 @@ struct RecordedDraw {
     std::span<const VkImageView> targetViews;
     std::vector<std::shared_ptr<StorageTexture>> targets;
     std::vector<std::shared_ptr<StorageTexture>> proxies;
+    std::shared_ptr<BlendedTargetSet> blended;
     const IndirectRecord* indirect = nullptr;
     std::span<const ShaderResources::MovedBuffer> moved;
     bool listed = false;
@@ -1668,7 +1717,10 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         passReads.emplace_back(args->arguments, args->arguments + args->RangeBytes());
         if (args->countIndirect) passReads.emplace_back(args->countAddress, args->countAddress + 4);
     }
-    const auto passImages = resources.StorageImages();
+    auto passImages = resources.StorageImages();
+    if (record.blended != nullptr) {
+        for (const auto& image : record.blended->images) passImages.emplace_back(image->Image(), true);
+    }
     std::vector<std::pair<VkImage, bool>> passAttachments;
     passAttachments.reserve(record.targets.size());
     for (const auto& target : record.targets) {
@@ -1676,8 +1728,8 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     }
     const bool unknownMemory = addressBased || resources.UsesAddressTable() || resources.HasCopiedWrites();
     const PassAccess passAccess{passReads, resources.GpuWrites(), passImages, passAttachments, unknownMemory, unknownMemory};
-    const bool fenced = state.depth.has_value() || !record.proxies.empty();
-    const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect, fenced, passAccess);
+    const bool fenced = state.depth.has_value() || !record.proxies.empty() || record.blended != nullptr;
+    const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect || record.blended != nullptr, fenced, passAccess);
     const bool continued = start.continued;
     outcome.passContinued = continued;
     outcome.passBegun = !continued;
@@ -1696,6 +1748,9 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         }
         auto images = resources.StorageImages();
         for (const auto& target : record.targets) images.emplace_back(target->Image(), true);
+        if (record.blended != nullptr) {
+            for (const auto& image : record.blended->images) images.emplace_back(image->Image(), true);
+        }
         recorder->NoteAccess(CommandClass::Draw, Recorder::Access{reads, resources.GpuWrites(), images, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | inputs.shaderStages, resources.HoldsLease()});
     }
     std::unique_ptr<DeviceBuffer> scratch;
@@ -1735,6 +1790,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     } else {
         resources.Bind(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout());
     }
+    if (record.blended != nullptr) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout(), 1, 1, &record.blended->set, 0, nullptr);
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
     pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, record.pushBytes, record.pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty());
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
@@ -1762,6 +1818,10 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     }
     recorder->LeaveRenderPassOpen(passKey, drawTiming, fenced, passAccess, std::move(storeProxies));
     timer.phase(PhaseRecord);
+    if (record.blended != nullptr) {
+        recorder->Keep(record.blended);
+        record.targets.insert(record.targets.end(), record.blended->images.begin(), record.blended->images.end());
+    }
     keepRecordedDraw(*recorder, record.resources, std::move(record.pipeline), std::move(record.framebuffer), inputs, std::move(record.targets), std::move(scratch), std::move(checkRecords), record.listed, record.completion, outcome);
     timer.phase(PhaseKeep);
     if (record.waited) {
@@ -1935,6 +1995,19 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         targetViews.push_back(binding.target->View());
     }
     if (state.depth) targetViews.push_back(DepthSurfaceView(context, *state.depth));
+    std::vector<std::shared_ptr<StorageTexture>> blendedTargets;
+    for (const auto& color : state.blendedColors) {
+        Require(color.tileMode != ColorTileMode::Linear && context.detiler != nullptr, "blending into a linear 10_11_11 unorm color target is unsupported");
+        Require(color.mipCount == 1 && color.depth == 1 && !color.mipTail, "blending into a mipmapped or 3D 10_11_11 unorm color target is unsupported");
+        const ColorTargetLayout colorLayout(color.extent.width, color.extent.height, color.tileMode, color.elementBytes);
+        auto resident = refreshResidentTarget(context, state, color, outcome, profile, [&] {
+            auto surface = CachedStorageSurface(context, SurfaceForTarget(color));
+            Require(surface->GuestBytes() == colorLayout.Bytes(), "resident image layout differs from the color layout");
+            return surface;
+        });
+        Require(resident != nullptr, "a blended 10_11_11 unorm color target has no resident image");
+        blendedTargets.push_back(std::move(resident));
+    }
     timer.phase(PhasePrepare);
     const bool recordDraws = RecordDraws();
     auto* recorder = Recorder::Active();
@@ -2056,7 +2129,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     APS5_LOG_CHARS_OUT_DEBUG("Creating Pipeline");
     // The state is copied only when a mask must change.
     auto masked = maskedState(state, inputs.fragmentOutputs);
-    if (std::any_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.proxied; })) recipeOut = nullptr;
+    if (std::any_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.proxied; }) || !state.blendedColors.empty()) recipeOut = nullptr;
     for (std::size_t index = 0; index < targets.size(); ++index) {
         if (!targets[index].proxied) continue;
         if (!masked.has_value()) masked = state;
@@ -2071,6 +2144,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     owners.reserve(targets.size());
     for (const auto& binding : targets) owners.push_back(binding.resident);
     auto framebuffer = pipeline->AcquireFramebuffer(targetViews, owners, state.renderExtent);
+    const auto blendedSet = blendedTargets.empty() ? nullptr : std::make_shared<BlendedTargetSet>(context, pipeline->BlendedTargetLayout(), state.blendedColors, blendedTargets);
     timer.phase(PhasePipeline);
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline created");
     if (lean) {
@@ -2085,6 +2159,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         for (const auto& binding : targets) {
             if (binding.proxied) record.proxies.push_back(binding.resident);
         }
+        record.blended = blendedSet;
         record.indirect = args != nullptr ? &indirect : nullptr;
         record.listed = listed;
         record.completion = completion;
@@ -2208,10 +2283,15 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         context.Resolved(&DeviceFunctions::cmdCopyBufferToImage, "vkCmdCopyBufferToImage")(commands, linear, binding.target->Image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
         imageBarrier(context, commands, binding.target->Image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
     }
+    if (blendedSet != nullptr) {
+        blendedTargetBarriers(context, commands, *blendedSet, true);
+        countBarrier(static_cast<std::uint32_t>(blendedSet->images.size()));
+    }
     APS5_LOG_OUT_DEBUG("Beginning pipeline renderExtent=%ux%u", state.renderExtent.width, state.renderExtent.height);
     pipeline->Begin(commands, *framebuffer, state.renderExtent, state);
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline Begin OK");
     resources->Bind(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->Layout());
+    if (blendedSet != nullptr) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->Layout(), 1, 1, &blendedSet->set, 0, nullptr);
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
     pushDrawConstants(*pipeline, commands, state, draw, shaders, *resources, nullptr, 0, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty());
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
@@ -2231,6 +2311,10 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     if (recorded) recorder->EndPassSamples();
     EndRenderPass(context, commands);
     APS5_LOG_CHARS_OUT_DEBUG("Render pass ended");
+    if (blendedSet != nullptr) {
+        blendedTargetBarriers(context, commands, *blendedSet, false);
+        countBarrier(static_cast<std::uint32_t>(blendedSet->images.size()));
+    }
     for (auto& binding : targets) {
         if (binding.proxied) {
             binding.resident->RecordAttachmentProxyStore(commands, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
@@ -2281,7 +2365,12 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     APS5_LOG_CHARS_OUT_DEBUG("SubmitAndWait");
     timer.phase(PhaseRecord);
     if (recorded) {
-        keepRecordedDraw(*recorder, resources, pipeline, framebuffer, inputs, owners, std::move(scratch), std::move(checkRecords), listed, completion, outcome);
+        auto keptTargets = owners;
+        if (blendedSet != nullptr) {
+            recorder->Keep(blendedSet);
+            keptTargets.insert(keptTargets.end(), blendedSet->images.begin(), blendedSet->images.end());
+        }
+        keepRecordedDraw(*recorder, resources, pipeline, framebuffer, inputs, std::move(keptTargets), std::move(scratch), std::move(checkRecords), listed, completion, outcome);
         timer.phase(PhaseKeep);
         if (outcome.waited) {
             // The wait the dispatch path makes for such work (source 3, "address-based"): the
@@ -2334,6 +2423,9 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         // The stored texels are the whole target now, so later reads must see them rather than a fast clear.
         const auto targetBytes = ColorTargetLayout(binding.color.extent.width, binding.color.extent.height, binding.color.tileMode, binding.color.elementBytes).Bytes();
         MarkDccUncompressed(binding.color.dccAddress, targetBytes, colorKeyCount(binding.color, targetBytes));
+    }
+    if (blendedSet != nullptr && !skipTargetWrite) {
+        for (const auto& image : blendedSet->images) image->MarkDirty();
     }
     timer.phase(PhaseWriteBack);
     if (profile && traceDraws) {

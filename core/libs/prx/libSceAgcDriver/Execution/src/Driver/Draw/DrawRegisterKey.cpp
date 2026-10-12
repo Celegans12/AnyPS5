@@ -91,6 +91,10 @@ bool Driver::sameDecode(const DrawDecode& a, const DrawDecode& b) {
     for (std::size_t i = 0; i < s.colors.size(); ++i) {
         if (!sameColor(s.colors[i], t.colors[i])) return false;
     }
+    if (s.blendedColors.size() != t.blendedColors.size() || s.targetBlends != t.targetBlends) return false;
+    for (std::size_t i = 0; i < s.blendedColors.size(); ++i) {
+        if (!sameColor(s.blendedColors[i], t.blendedColors[i])) return false;
+    }
     for (std::size_t i = 0; i < s.blends.size(); ++i) {
         if (!sameBlend(s.blends[i], t.blends[i])) return false;
     }
@@ -105,7 +109,7 @@ bool Driver::sameDecode(const DrawDecode& a, const DrawDecode& b) {
         const auto& y = b.programs[i];
         if (x.binary.stage != y.binary.stage || x.binary.codeAddress != y.binary.codeAddress || x.userDataBase != y.userDataBase || x.firstUserSgpr != y.firstUserSgpr || x.userData != y.userData || x.snapshot != y.snapshot || x.codeOffset != y.codeOffset) return false;
     }
-    if (p.targetExportPacking != q.targetExportPacking || p.dualSourceBlend != q.dualSourceBlend || p.alphaToCoverage != q.alphaToCoverage) return false;
+    if (p.targetExportPacking != q.targetExportPacking || p.targetBlend != q.targetBlend || p.dualSourceBlend != q.dualSourceBlend || p.alphaToCoverage != q.alphaToCoverage) return false;
     return true;
 }
 

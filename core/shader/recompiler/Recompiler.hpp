@@ -114,6 +114,15 @@ enum class ColorExportPacking : std::uint8_t {
     Unorm10_11_11
 };
 
+struct ColorTargetBlend {
+    bool enable = false;
+    std::uint8_t sourceFactor = 0;
+    std::uint8_t destinationFactor = 0;
+    std::uint8_t function = 0;
+    std::uint8_t writeMask = 0;
+    bool operator==(const ColorTargetBlend&) const = default;
+};
+
 struct ShaderPixelStageInfo {
     std::uint32_t interpolatorCount;
     std::array<std::uint32_t, 32> interpolatorSettings;
@@ -142,6 +151,7 @@ struct ShaderPixelStageInfo {
     std::array<ColorExportPacking, 8> targetExportPacking;
     bool dualSourceBlend;
     bool alphaToCoverage;
+    std::array<ColorTargetBlend, 8> targetBlend;
 };
 
 struct ShaderVertexBufferResource {

@@ -70,6 +70,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             for (const auto value : pixel.targetExportPacking) mix(static_cast<std::uint64_t>(value));
             mix(pixel.dualSourceBlend);
             mix(pixel.alphaToCoverage);
+            for (const auto& blend : pixel.targetBlend) mix(static_cast<std::uint64_t>(blend.enable) | (static_cast<std::uint64_t>(blend.sourceFactor) << 8u) | (static_cast<std::uint64_t>(blend.destinationFactor) << 16u) | (static_cast<std::uint64_t>(blend.function) << 24u) | (static_cast<std::uint64_t>(blend.writeMask) << 32u));
             std::lock_guard cacheLock(drawCacheMutex);
             ++drawEntryCounters.lookups;
             const auto found = drawCache.find(drawKey);

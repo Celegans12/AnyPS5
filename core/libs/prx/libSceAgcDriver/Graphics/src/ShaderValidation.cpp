@@ -369,6 +369,7 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
             case spv::OpTypeRuntimeArray:
             case spv::OpTypeStruct:
             case spv::OpTypePointer:
+            case spv::OpTypeImage:
                 Require(count >= 2 && module.types.emplace(instruction[1], std::vector<std::uint32_t>(instruction.begin(), instruction.end())).second, "invalid or duplicate SPIR-V type");
                 break;
             case spv::OpVariable:
@@ -423,6 +424,7 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
     } else Require(module.modes.empty(), "unsupported vertex execution mode");
     std::set<std::pair<std::uint32_t, std::uint32_t>> descriptors;
     std::map<std::pair<std::uint32_t, std::uint32_t>, bool> bufferViews;
+    std::set<std::uint32_t> blendedTargets;
     bool push = false;
     for (const auto& [id, variable] : module.variables) {
         if (variable.storage == spv::StorageClassFunction || variable.storage == spv::StorageClassPrivate) continue;
@@ -496,6 +498,13 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
             Require(mesh, "workgroup memory outside a mesh shader");
         } else if (variable.storage == spv::StorageClassUniformConstant) {
             Require(decoration.set && decoration.binding, "unbound shader resource");
+            if (fragment && *decoration.set == 1u) {
+                const auto exportIndex = *decoration.binding;
+                Require(std::any_of(state.blendedColors.begin(), state.blendedColors.end(), [&](const ColorTarget& color) { return color.exportIndex == exportIndex; }), "fragment shader blends into an export that has no blended 10_11_11 unorm target");
+                Require(blendedTargets.insert(exportIndex).second, "duplicate blended 10_11_11 unorm target binding");
+                Require(type.size() == 9 && (type[0] & 0xffffu) == spv::OpTypeImage && module.Signature(type[2]) == "u32" && type[3] == spv::Dim2D && type[4] == 0 && type[5] == 0 && type[6] == 0 && type[7] == 2 && type[8] == spv::ImageFormatR32ui, "a blended 10_11_11 unorm target must be an R32ui 2D storage image");
+                continue;
+            }
             const auto key = std::make_pair(*decoration.set, *decoration.binding);
             const auto binding = std::find_if(shader.bindings.begin(), shader.bindings.end(), [&](const auto& item) { return item.descriptorSet == key.first && item.binding == key.second; });
             Require(descriptors.insert(key).second || (binding != shader.bindings.end() && binding->role == ShaderRecompiler::DescriptorRole::ImageTable), "duplicate SPIR-V resource binding");

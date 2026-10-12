@@ -372,6 +372,35 @@ VkBlendOp blendOp(std::uint32_t value) {
     }
 }
 
+std::uint32_t optionalRegister(const Registers& cx, std::uint32_t offset) {
+    const auto found = find(cx, offset);
+    return found == cx.end() ? 0u : found->second;
+}
+
+ShaderRecompiler::ColorTargetBlend decodeTargetBlend(const Registers& cx, const ColorTarget& color, std::uint32_t control, const VkPipelineColorBlendAttachmentState& state) {
+    for (const auto index : {color.exportIndex, color.slot}) {
+        Require(((optionalRegister(cx, 0x1d5) >> (4u * index)) & 0xfu) == 0, "SX export conversion into a blended or partially written 10_11_11 unorm color target is unsupported");
+    }
+    ShaderRecompiler::ColorTargetBlend blend{true, 1u, 0u, 0u, static_cast<std::uint8_t>(state.colorWriteMask & 7u)};
+    if (!state.blendEnable) return blend;
+    blend.sourceFactor = static_cast<std::uint8_t>(control & 0x1fu);
+    blend.destinationFactor = static_cast<std::uint8_t>((control >> 8u) & 0x1fu);
+    blend.function = static_cast<std::uint8_t>((control >> 5u) & 7u);
+    for (const auto factor : {blend.sourceFactor, blend.destinationFactor}) {
+        if (factor > 5u && factor != 8u && factor != 9u) throw std::runtime_error("AGC graphics: blend factor " + std::to_string(factor) + " into a 10_11_11 unorm color target is unsupported");
+    }
+    if (blend.function != 0u && blend.function != 1u && blend.function != 4u) throw std::runtime_error("AGC graphics: blend function " + std::to_string(blend.function) + " into a 10_11_11 unorm color target is unsupported");
+    for (const auto index : {color.exportIndex, color.slot}) {
+        const auto shift = 4u * index;
+        Require(((optionalRegister(cx, 0x1d6) >> shift) & 0xfu) == 0 || ((optionalRegister(cx, 0x1d7) >> shift) & 1u) != 0, "SX blend optimizations with a nonzero epsilon on a 10_11_11 unorm color target are unsupported");
+    }
+    return blend;
+}
+
+bool writesStencil(const VkStencilOpState& face) {
+    return face.writeMask != 0 && (face.failOp != VK_STENCIL_OP_KEEP || face.passOp != VK_STENCIL_OP_KEEP || face.depthFailOp != VK_STENCIL_OP_KEEP);
+}
+
 struct DecodedColorFormat {
     VkFormat format;
     std::uint32_t elementBytes;
@@ -779,8 +808,10 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
         if (color.packing != ShaderRecompiler::ColorExportPacking::None) {
             const auto slotExport = (exportFormat >> (4u * color.exportIndex)) & 0xfu;
             if (slotExport == 5 || slotExport == 6) throw std::runtime_error("AGC graphics: color export format " + std::to_string(slotExport) + " into a 10_11_11 unorm target is unsupported");
-            Require(!state.blendEnable, "blending into a 10_11_11 unorm color target is unsupported");
-            Require((exportedMask & 7u) == 7u, "partial writes of a 10_11_11 unorm color target are unsupported");
+            if (state.blendEnable || (exportedMask & 7u) != 7u) {
+                result.targetBlends[color.exportIndex] = decodeTargetBlend(cx, color, blend, state);
+                continue;
+            }
         }
         if (state.blendEnable && (secondSource(state.srcColorBlendFactor) || secondSource(state.dstColorBlendFactor) || secondSource(state.srcAlphaBlendFactor) || secondSource(state.dstAlphaBlendFactor))) {
             const auto addition = [](VkBlendOp op) { return op == VK_BLEND_OP_ADD || op == VK_BLEND_OP_SUBTRACT || op == VK_BLEND_OP_REVERSE_SUBTRACT; };
@@ -791,6 +822,21 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
     }
     for (std::uint32_t i = 0; i < 3; ++i) {
         if ((requiredBlendMask & (1u << i)) != 0) result.blendConstants[i] = requiredBlendConstants[i];
+    }
+    if (std::any_of(result.targetBlends.begin(), result.targetBlends.end(), [](const ShaderRecompiler::ColorTargetBlend& blend) { return blend.enable; })) {
+        const auto shaderControl = read(cx, 0x203);
+        Require((shaderControl & 0x107u) == 0, "a pixel shader that exports depth, stencil or a sample mask cannot blend into a 10_11_11 unorm color target");
+        Require(!result.alphaToCoverage, "alpha-to-coverage beside a blended 10_11_11 unorm color target is unsupported");
+        const auto countsSamples = (optionalRegister(cx, 0x001) & 0xf00u) != 0;
+        Require((shaderControl & 0x40u) == 0 || !countsSamples, "a pixel shader that kills cannot blend into a 10_11_11 unorm color target while DB_COUNT_CONTROL counts passing samples");
+        if (result.depth && (result.depthTest || result.stencilTest || result.depthBoundsTest)) {
+            Require(((shaderControl >> 4u) & 3u) == 1u && (shaderControl & 0x200u) == 0, "blending into a 10_11_11 unorm color target under depth or stencil tests needs Z_ORDER EARLY_Z_THEN_LATE_Z without EXEC_ON_HIER_FAIL");
+            Require((shaderControl & 0x40u) == 0 || (!result.depthWrite && !(result.stencilTest && (writesStencil(result.stencilFront) || writesStencil(result.stencilBack)))), "a pixel shader that kills cannot blend into a 10_11_11 unorm color target while it writes depth or stencil");
+        }
+        std::vector<ColorTarget> attached;
+        for (const auto& color : result.colors) (result.targetBlends[color.exportIndex].enable ? result.blendedColors : attached).push_back(color);
+        result.colors = std::move(attached);
+        result.blends.resize(result.colors.empty() ? 0u : result.colors.back().exportIndex + 1u);
     }
     if (!result.colors.empty()) result.blend = result.blends[result.colors.front().exportIndex];
     if (result.dualSourceBlend) {
@@ -812,8 +858,10 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
 
 std::array<ShaderRecompiler::ColorExportPacking, 8> ExportPackings(const State& state) {
     std::array<ShaderRecompiler::ColorExportPacking, 8> packings{};
-    for (const auto& color : state.colors) {
-        if (color.exportIndex < packings.size()) packings[color.exportIndex] = color.packing;
+    for (const auto* colors : {&state.colors, &state.blendedColors}) {
+        for (const auto& color : *colors) {
+            if (color.exportIndex < packings.size()) packings[color.exportIndex] = color.packing;
+        }
     }
     return packings;
 }

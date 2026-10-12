@@ -3,12 +3,14 @@
 
 #include "PipelineSpecialization.hpp"
 #include "Recompiler.hpp"
+#include <cstring>
 #include <limits>
 #include <map>
 #include <set>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <spirv/unified1/spirv.hpp>
 
@@ -16,27 +18,59 @@ namespace ShaderRecompiler {
 
 inline std::vector<std::uint32_t> SpecializeFragmentOutputs(std::vector<std::uint32_t> words, std::span<const PipelineSpecializationConstant> constants, const std::set<std::uint32_t>& specializedIds) {
     std::set<std::uint32_t> packed;
+    std::set<std::uint32_t> blended;
     bool dualSource = false;
     for (const auto& constant : constants) {
         if (constant.id == PipelineSpecialization::DualSourceBlend) {
             if (constant.value > 1u) throw std::runtime_error("invalid prepared dual-source blend flag");
             dualSource = constant.value != 0u;
         }
+        if (constant.id >= PipelineSpecialization::ExportBlendBase && constant.id < PipelineSpecialization::ExportBlendBase + 8u) {
+            if ((constant.value & 1u) != 0u) blended.insert(constant.id - PipelineSpecialization::ExportBlendBase);
+            continue;
+        }
         if (constant.id < PipelineSpecialization::ExportPackingBase || constant.id >= PipelineSpecialization::ExportPackingBase + 8u) continue;
         if (constant.value > static_cast<std::uint32_t>(ColorExportPacking::Unorm10_11_11)) throw std::runtime_error("invalid prepared fragment export packing");
         if (constant.value != static_cast<std::uint32_t>(ColorExportPacking::None)) packed.insert(constant.id - PipelineSpecialization::ExportPackingBase);
     }
-    if (packed.empty() && !dualSource) return words;
+    if (packed.empty() && blended.empty() && !dualSource) return words;
     if (words.size() < 5u || words[0] != spv::MagicNumber) throw std::runtime_error("invalid fragment output specialization module");
     std::map<std::uint32_t, std::uint32_t> locations;
     std::set<std::uint32_t> indexed;
     std::map<std::uint32_t, std::vector<std::uint32_t>> typeKeys;
     std::map<std::vector<std::uint32_t>, std::uint32_t> types;
     std::map<std::uint32_t, std::uint32_t> outputs;
+    std::set<std::uint32_t> capabilities;
+    std::set<std::string> extensions;
+    std::set<std::uint32_t> modes;
+    std::uint32_t entry = 0;
+    bool interlocked = false;
+    std::size_t capabilityEnd = 5;
+    std::size_t extensionEnd = 0;
+    std::size_t modeEnd = 0;
     for (std::size_t cursor = 5; cursor < words.size();) {
         const auto count = words[cursor] >> 16u;
         const auto op = static_cast<spv::Op>(words[cursor] & 0xffffu);
         if (count == 0u || count > words.size() - cursor) throw std::runtime_error("truncated fragment output specialization instruction");
+        if (op == spv::OpCapability && count == 2u) {
+            capabilities.insert(words[cursor + 1u]);
+            capabilityEnd = cursor + count;
+        }
+        if (op == spv::OpExtension && count >= 2u) {
+            std::string name(reinterpret_cast<const char*>(&words[cursor + 1u]), (count - 1u) * sizeof(std::uint32_t));
+            extensions.insert(name.substr(0, name.find('\0')));
+            extensionEnd = cursor + count;
+        }
+        if (op == spv::OpEntryPoint && count >= 3u) {
+            if (entry != 0u) throw std::runtime_error("fragment output specialization module has several entry points");
+            entry = words[cursor + 2u];
+            modeEnd = cursor + count;
+        }
+        if ((op == spv::OpExecutionMode || op == spv::OpExecutionModeId) && count >= 3u) {
+            if (words[cursor + 1u] == entry) modes.insert(words[cursor + 2u]);
+            modeEnd = cursor + count;
+        }
+        if (op == spv::OpBeginInvocationInterlockEXT) interlocked = true;
         if (op == spv::OpDecorate && count == 4u && words[cursor + 2u] == spv::DecorationLocation) locations.emplace(words[cursor + 1u], words[cursor + 3u]);
         if (op == spv::OpDecorate && count == 4u && words[cursor + 2u] == spv::DecorationIndex) indexed.insert(words[cursor + 1u]);
         if ((op == spv::OpTypeInt || op == spv::OpTypeFloat || op == spv::OpTypeVector || op == spv::OpTypePointer) && count >= 3u) {
@@ -48,6 +82,7 @@ inline std::vector<std::uint32_t> SpecializeFragmentOutputs(std::vector<std::uin
         if (op == spv::OpVariable && count >= 4u && words[cursor + 3u] == spv::StorageClassOutput) outputs.emplace(words[cursor + 2u], words[cursor + 1u]);
         cursor += count;
     }
+    if (extensionEnd == 0u) extensionEnd = capabilityEnd;
     const auto key = [&](std::uint32_t id) {
         const auto found = typeKeys.find(id);
         return found != typeKeys.end() ? found->second : std::vector<std::uint32_t>{};
@@ -76,16 +111,29 @@ inline std::vector<std::uint32_t> SpecializeFragmentOutputs(std::vector<std::uin
         if (!floatVectorPointer(outputs.at(variable))) throw std::runtime_error("packed fragment output " + std::to_string(location) + " is not a float4");
         retyped.insert(variable);
     }
+    std::set<std::uint32_t> privatized;
+    for (const auto location : blended) {
+        const auto variable = output(location);
+        if (variable == 0u) continue;
+        if (!specializedIds.contains(PipelineSpecialization::ExportBlendBase + location)) throw std::runtime_error("fragment output " + std::to_string(location) + " has no 10_11_11 unorm blend path");
+        if (!floatVectorPointer(outputs.at(variable)) || retyped.contains(variable)) throw std::runtime_error("blended fragment output " + std::to_string(location) + " is not an unpacked float4");
+        privatized.insert(variable);
+    }
     const auto secondSource = dualSource ? output(1u) : 0u;
     if (retyped.contains(secondSource)) throw std::runtime_error("the second dual-source blend color cannot be packed");
-    if (retyped.empty() && secondSource == 0u) return words;
+    if (privatized.contains(secondSource)) throw std::runtime_error("the second dual-source blend color cannot be blended into a 10_11_11 unorm target");
+    if (retyped.empty() && privatized.empty() && secondSource == 0u) return words;
+    if (!privatized.empty() && entry == 0u) throw std::runtime_error("fragment output specialization module has no entry point");
     auto bound = words[3];
+    const auto allocate = [&] {
+        if (bound == std::numeric_limits<std::uint32_t>::max()) throw std::runtime_error("fragment output specialization module ID overflow");
+        return bound++;
+    };
     std::vector<std::vector<std::uint32_t>> declarations;
     const auto declare = [&](std::vector<std::uint32_t> declaration) {
         const auto found = types.find(declaration);
         if (found != types.end()) return found->second;
-        if (bound == std::numeric_limits<std::uint32_t>::max()) throw std::runtime_error("fragment output specialization module ID overflow");
-        const auto id = bound++;
+        const auto id = allocate();
         std::vector<std::uint32_t> instruction{(static_cast<std::uint32_t>(declaration.size() + 1u) << 16u) | declaration.front(), id};
         instruction.insert(instruction.end(), declaration.begin() + 1, declaration.end());
         types.emplace(std::move(declaration), id);
@@ -95,18 +143,47 @@ inline std::vector<std::uint32_t> SpecializeFragmentOutputs(std::vector<std::uin
     const auto wordType = retyped.empty() ? 0u : declare({spv::OpTypeInt, 32u, 0u});
     const auto vectorType = retyped.empty() ? 0u : declare({spv::OpTypeVector, wordType, 4u});
     const auto pointerType = retyped.empty() ? 0u : declare({spv::OpTypePointer, spv::StorageClassOutput, vectorType});
+    std::map<std::uint32_t, std::uint32_t> privateTypes;
+    for (const auto variable : privatized) privateTypes.emplace(variable, declare({spv::OpTypePointer, spv::StorageClassPrivate, key(outputs.at(variable))[2]}));
+    const bool interlock = !privatized.empty() && !interlocked;
+    std::vector<std::uint32_t> pendingCapability;
+    if (interlock && !capabilities.contains(spv::CapabilityFragmentShaderPixelInterlockEXT)) pendingCapability = {(2u << 16u) | spv::OpCapability, spv::CapabilityFragmentShaderPixelInterlockEXT};
+    std::vector<std::uint32_t> pendingExtension;
+    if (interlock && !extensions.contains("SPV_EXT_fragment_shader_interlock")) {
+        constexpr std::string_view name = "SPV_EXT_fragment_shader_interlock";
+        std::vector<std::uint32_t> text(name.size() / sizeof(std::uint32_t) + 1u, 0u);
+        std::memcpy(text.data(), name.data(), name.size());
+        pendingExtension = {(static_cast<std::uint32_t>(text.size() + 1u) << 16u) | spv::OpExtension};
+        pendingExtension.insert(pendingExtension.end(), text.begin(), text.end());
+    }
+    std::vector<std::uint32_t> pendingModes;
+    const bool orderedMode = modes.contains(spv::ExecutionModePixelInterlockOrderedEXT) || modes.contains(spv::ExecutionModePixelInterlockUnorderedEXT) || modes.contains(spv::ExecutionModeSampleInterlockOrderedEXT) || modes.contains(spv::ExecutionModeSampleInterlockUnorderedEXT) || modes.contains(spv::ExecutionModeShadingRateInterlockOrderedEXT) || modes.contains(spv::ExecutionModeShadingRateInterlockUnorderedEXT);
+    if (interlock && !orderedMode) pendingModes.insert(pendingModes.end(), {(3u << 16u) | spv::OpExecutionMode, entry, spv::ExecutionModePixelInterlockOrderedEXT});
+    if (!privatized.empty() && !modes.contains(spv::ExecutionModeEarlyFragmentTests)) pendingModes.insert(pendingModes.end(), {(3u << 16u) | spv::OpExecutionMode, entry, spv::ExecutionModeEarlyFragmentTests});
     std::vector<std::uint32_t> result(words.begin(), words.begin() + 5);
     std::vector<std::vector<std::uint32_t>> variables;
     bool inserted = false;
+    bool inEntry = false;
+    bool labelled = false;
+    bool begun = false;
     for (std::size_t cursor = 5; cursor < words.size();) {
+        if (cursor == capabilityEnd) result.insert(result.end(), pendingCapability.begin(), pendingCapability.end());
+        if (cursor == extensionEnd) result.insert(result.end(), pendingExtension.begin(), pendingExtension.end());
+        if (cursor == modeEnd) result.insert(result.end(), pendingModes.begin(), pendingModes.end());
         const auto count = words[cursor] >> 16u;
         const auto op = static_cast<spv::Op>(words[cursor] & 0xffffu);
         const auto operand = [&](std::size_t index) { return index < count ? words[cursor + index] : 0u; };
-        if (op == spv::OpVariable && retyped.contains(operand(2u))) {
-            if (count != 4u) throw std::runtime_error("a packed fragment output has an initializer");
+        if (op == spv::OpVariable && (retyped.contains(operand(2u)) || privatized.contains(operand(2u)))) {
+            if (count != 4u) throw std::runtime_error("a specialized fragment output has an initializer");
             std::vector<std::uint32_t> variable(words.begin() + cursor, words.begin() + cursor + count);
-            variable[1] = pointerType;
+            const bool isPrivate = privatized.contains(variable[2]);
+            variable[1] = isPrivate ? privateTypes.at(variable[2]) : pointerType;
+            if (isPrivate) variable[3] = spv::StorageClassPrivate;
             variables.push_back(std::move(variable));
+            cursor += count;
+            continue;
+        }
+        if (op == spv::OpDecorate && count >= 3u && privatized.contains(operand(1u)) && (operand(2u) == spv::DecorationLocation || operand(2u) == spv::DecorationIndex)) {
             cursor += count;
             continue;
         }
@@ -115,27 +192,73 @@ inline std::vector<std::uint32_t> SpecializeFragmentOutputs(std::vector<std::uin
             cursor += count;
             continue;
         }
+        if (op == spv::OpEntryPoint && !privatized.empty() && words[1] < 0x00010400u) {
+            std::size_t interfaceIndex = 3u;
+            for (; interfaceIndex < count; ++interfaceIndex) {
+                const auto word = words[cursor + interfaceIndex];
+                if ((word & 0xffu) == 0u || (word & 0xff00u) == 0u || (word & 0xff0000u) == 0u || (word & 0xff000000u) == 0u) {
+                    ++interfaceIndex;
+                    break;
+                }
+            }
+            const auto start = result.size();
+            result.insert(result.end(), words.begin() + cursor, words.begin() + cursor + interfaceIndex);
+            for (auto index = interfaceIndex; index < count; ++index) {
+                if (!privatized.contains(words[cursor + index])) result.push_back(words[cursor + index]);
+            }
+            result[start] = (static_cast<std::uint32_t>(result.size() - start) << 16u) | spv::OpEntryPoint;
+            cursor += count;
+            continue;
+        }
         if (op == spv::OpFunction && !inserted) {
             for (const auto& declaration : declarations) result.insert(result.end(), declaration.begin(), declaration.end());
             for (const auto& variable : variables) result.insert(result.end(), variable.begin(), variable.end());
             inserted = true;
         }
+        if (op == spv::OpFunction) {
+            inEntry = operand(2u) == entry;
+            labelled = false;
+        }
+        if (op == spv::OpFunctionEnd) inEntry = false;
+        if (interlock && inEntry) {
+            if (op == spv::OpLabel && !labelled) {
+                labelled = true;
+                result.insert(result.end(), words.begin() + cursor, words.begin() + cursor + count);
+                cursor += count;
+                continue;
+            }
+            if (labelled && !begun && op != spv::OpVariable && op != spv::OpLine && op != spv::OpNoLine) {
+                result.push_back((1u << 16u) | spv::OpBeginInvocationInterlockEXT);
+                begun = true;
+            }
+            if (op == spv::OpReturn || op == spv::OpReturnValue || op == spv::OpKill || op == spv::OpTerminateInvocation || op == spv::OpUnreachable) result.push_back((1u << 16u) | spv::OpEndInvocationInterlockEXT);
+        }
         if (op == spv::OpStore && count >= 3u && retyped.contains(operand(1u))) {
-            if (bound == std::numeric_limits<std::uint32_t>::max()) throw std::runtime_error("fragment output specialization module ID overflow");
-            const auto bits = bound++;
+            const auto bits = allocate();
             result.insert(result.end(), {(4u << 16u) | spv::OpBitcast, vectorType, bits, operand(2u)});
             result.insert(result.end(), words.begin() + cursor, words.begin() + cursor + count);
             result[result.size() - count + 2u] = bits;
             cursor += count;
             continue;
         }
-        const bool pointerUse = ((op == spv::OpLoad || op == spv::OpAccessChain || op == spv::OpInBoundsAccessChain || op == spv::OpPtrAccessChain || op == spv::OpInBoundsPtrAccessChain || op == spv::OpCopyObject) && retyped.contains(operand(3u))) ||
-            ((op == spv::OpCopyMemory || op == spv::OpCopyMemorySized) && (retyped.contains(operand(1u)) || retyped.contains(operand(2u))));
-        if (pointerUse) throw std::runtime_error("a packed fragment output is accessed other than by whole stores");
+        if (op == spv::OpLoad && count >= 4u && retyped.contains(operand(3u))) {
+            const auto bits = allocate();
+            result.insert(result.end(), words.begin() + cursor, words.begin() + cursor + count);
+            result[result.size() - count + 1u] = vectorType;
+            result[result.size() - count + 2u] = bits;
+            result.insert(result.end(), {(4u << 16u) | spv::OpBitcast, operand(1u), operand(2u), bits});
+            cursor += count;
+            continue;
+        }
+        const auto special = [&](std::uint32_t id) { return retyped.contains(id) || privatized.contains(id); };
+        const bool pointerUse = ((op == spv::OpAccessChain || op == spv::OpInBoundsAccessChain || op == spv::OpPtrAccessChain || op == spv::OpInBoundsPtrAccessChain || op == spv::OpCopyObject) && special(operand(3u))) ||
+            ((op == spv::OpCopyMemory || op == spv::OpCopyMemorySized) && (special(operand(1u)) || special(operand(2u))));
+        if (pointerUse) throw std::runtime_error("a specialized fragment output is accessed other than by whole loads and stores");
         result.insert(result.end(), words.begin() + cursor, words.begin() + cursor + count);
         cursor += count;
     }
     if (!inserted) throw std::runtime_error("fragment output specialization module has no function");
+    if (interlock && !begun) throw std::runtime_error("fragment output specialization found no entry block for the pixel interlock");
     result[3] = bound;
     return result;
 }

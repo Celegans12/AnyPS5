@@ -3994,12 +3994,6 @@ void unorm10_11_11TargetTests() {
     changed.context[0x31c] |= 1u << 8u;
     expectFailure([&] { AgcDriver::Graphics::DecodeState(changed); }, "unsupported color format 6 number type 1");
     changed = queue;
-    changed.context[0x1e0] = 0x40010001u;
-    for (std::uint32_t i = 0; i < 4; ++i) changed.context[0x105 + i] = 0;
-    expectFailure([&] { AgcDriver::Graphics::DecodeState(changed); }, "blending into a 10_11_11 unorm color target");
-    changed = queue;
-    changed.context[0x8e] = 3;
-    expectFailure([&] { AgcDriver::Graphics::DecodeState(changed); }, "partial writes of a 10_11_11 unorm color target");
     changed.context[0x8e] = 7;
     Require(AgcDriver::Graphics::DecodeState(changed).color.packing == ColorExportPacking::Unorm10_11_11, "an RGB write of a 10_11_11 unorm target was refused");
     for (const auto format : {5u, 6u}) {
@@ -4186,6 +4180,159 @@ void DualSourceBlendTests() {
     auto singleState = state;
     singleState.dualSourceBlend = false;
     expectFailure([&] { validate(dual, singleState); }, "Index decoration");
+}
+
+void unorm10_11_11BlendTests() {
+    using ShaderRecompiler::ColorExportPacking;
+    using ShaderRecompiler::ColorTargetBlend;
+    auto queue = makeState();
+    queue.context[0x31c] = (queue.context.at(0x31c) & ~0x7cu) | (6u << 2u);
+    queue.context[0x1b3] = 2;
+    queue.context[0x1b4] = 2;
+    queue.context[0x1e0] = 0x40010504u;
+    for (std::uint32_t i = 0; i < 4; ++i) queue.context[0x105 + i] = 0;
+    std::vector<AgcDriver::Graphics::RegisterRead> log;
+    AgcDriver::Graphics::RegisterReadLog() = &log;
+    const auto state = AgcDriver::Graphics::DecodeState(queue);
+    AgcDriver::Graphics::RegisterReadLog() = nullptr;
+    for (const auto read : log) Require(AgcDriver::Graphics::DrawKeyCovers(read), "DrawKeyRegisters lacks a register the blend decode reads: " + std::to_string(read.offset));
+    Require(std::any_of(log.begin(), log.end(), [](const AgcDriver::Graphics::RegisterRead& read) { return read.offset == 0x1d6u; }), "the blend decode did not read SX_BLEND_OPT_EPSILON");
+    Require(std::any_of(log.begin(), log.end(), [](const AgcDriver::Graphics::RegisterRead& read) { return read.offset == 0x001u; }), "the blend decode did not read DB_COUNT_CONTROL");
+    Require(AgcDriver::Graphics::DrawRejection(queue, false).empty(), "the precheck rejected a blend into a 10_11_11 unorm target");
+    Require(state.colors.empty() && state.blends.empty() && state.blendedColors.size() == 1u && state.blendedColors[0].packing == ColorExportPacking::Unorm10_11_11 && state.blendedColors[0].format == VK_FORMAT_R32_UINT && state.hasColorTarget && state.color.address == state.blendedColors[0].address, "a blended 10_11_11 unorm target was decoded as an attachment");
+    Require(state.targetBlends[0] == ColorTargetBlend{true, 4u, 5u, 0u, 7u} && std::none_of(state.targetBlends.begin() + 1, state.targetBlends.end(), [](const ColorTargetBlend& blend) { return blend.enable; }), "the SRC_ALPHA / ONE_MINUS_SRC_ALPHA blend was not decoded");
+    Require(AgcDriver::Graphics::ExportPackings(state)[0] == ColorExportPacking::Unorm10_11_11, "the blended target lost its export packing");
+    const auto decoded = [&](std::uint32_t control, std::uint32_t mask) {
+        auto changed = queue;
+        changed.context[0x1e0] = control;
+        changed.context[0x8e] = mask;
+        return AgcDriver::Graphics::DecodeState(changed).targetBlends[0];
+    };
+    Require(decoded(0, 3) == ColorTargetBlend{true, 1u, 0u, 0u, 3u}, "a partial write of a 10_11_11 unorm target did not become a masked read-modify-write");
+    Require(decoded(0x40010524u, 0xf) == ColorTargetBlend{true, 4u, 5u, 1u, 7u} && decoded(0x40010988u, 5) == ColorTargetBlend{true, 8u, 9u, 4u, 5u} && decoded(0x40010302u, 0xf) == ColorTargetBlend{true, 2u, 3u, 0u, 7u}, "a subtracting or color-factor blend was not decoded");
+    for (const auto factor : {6u, 7u, 10u, 13u, 14u, 19u, 20u}) {
+        expectFailure([&] { decoded(0x40010500u | factor, 0xf); }, "blend factor " + std::to_string(factor) + " into a 10_11_11 unorm color target");
+        expectFailure([&] { decoded(0x40010004u | (factor << 8u), 0xf); }, "blend factor " + std::to_string(factor) + " into a 10_11_11 unorm color target");
+    }
+    for (const auto function : {2u, 3u}) expectFailure([&] { decoded(0x40010504u | (function << 5u), 0xf); }, "blend function " + std::to_string(function) + " into a 10_11_11 unorm color target");
+    const auto rejected = [&](std::initializer_list<std::pair<std::uint32_t, std::uint32_t>> registers, std::string_view reason) {
+        auto changed = queue;
+        for (const auto& [offset, value] : registers) changed.context[offset] = value;
+        expectFailure([&] { AgcDriver::Graphics::DecodeState(changed); }, reason);
+    };
+    rejected({{0x1d5, 3u}}, "SX export conversion");
+    rejected({{0x1e0, 0u}, {0x8e, 3u}, {0x1d5, 3u}}, "SX export conversion");
+    rejected({{0x1d6, 1u}}, "SX blend optimizations with a nonzero epsilon");
+    rejected({{0x2dc, 0xaa01u}}, "alpha-to-coverage beside a blended 10_11_11 unorm color target");
+    rejected({{0x1c4, 1u}, {0x203, 0x801u}}, "exports depth, stencil or a sample mask cannot blend");
+    for (const auto counting : {0x100u, 0x800u}) rejected({{0x203, 0x840u}, {0x001, counting}}, "a pixel shader that kills cannot blend into a 10_11_11 unorm color target while DB_COUNT_CONTROL counts passing samples");
+    for (const auto& [control, counting] : std::initializer_list<std::pair<std::uint32_t, std::uint32_t>>{{0x840u, 0u}, {0x800u, 0x100u}}) {
+        auto changed = queue;
+        changed.context[0x203] = control;
+        changed.context[0x001] = counting;
+        Require(AgcDriver::Graphics::DecodeState(changed).targetBlends[0].enable, "a blend that kills without ZPASS counting, or counts without kills, was refused");
+    }
+    auto accepted = queue;
+    accepted.context[0x1d5] = 0x30u;
+    accepted.context[0x1d6] = 0x5u;
+    accepted.context[0x1d7] = 0x1u;
+    Require(AgcDriver::Graphics::DecodeState(accepted).targetBlends[0] == state.targetBlends[0], "a blend with disabled SX optimizations or another MRT's conversion was refused");
+    auto holed = queue;
+    for (const auto offset : {0x318u, 0x31bu, 0x31cu, 0x31du}) holed.context[offset + 4u * 0xfu] = queue.context.at(offset);
+    for (const auto offset : {0x390u, 0x3b0u, 0x3b8u}) holed.context[offset + 4u] = queue.context.at(offset);
+    holed.context[0x1e4] = queue.context.at(0x1e0);
+    holed.context[0x8e] = 0x70000u;
+    holed.context[0x8f] = 0xf0000u;
+    const auto holedState = AgcDriver::Graphics::DecodeState(holed);
+    Require(holedState.blendedColors.size() == 1u && holedState.blendedColors[0].slot == 4u && holedState.blendedColors[0].exportIndex == 0u && holedState.targetBlends[0] == state.targetBlends[0], "a blend into MRT slot 4 behind a CB_SHADER_MASK hole was not decoded as export 0");
+    for (const auto conversion : {0x3u, 0x30000u}) {
+        auto changed = holed;
+        changed.context[0x1d5] = conversion;
+        expectFailure([&] { AgcDriver::Graphics::DecodeState(changed); }, "SX export conversion");
+    }
+    holed.context[0x1d6] = 0x10001u;
+    for (const auto disabled : {0x1u, 0x10000u}) {
+        auto changed = holed;
+        changed.context[0x1d7] = disabled;
+        expectFailure([&] { AgcDriver::Graphics::DecodeState(changed); }, "SX blend optimizations with a nonzero epsilon");
+    }
+    holed.context[0x1d7] = 0x10001u;
+    Require(AgcDriver::Graphics::DecodeState(holed).targetBlends[0].enable, "a blend behind a CB_SHADER_MASK hole with the SX optimizations disabled at its export and slot was refused");
+    auto tested = queue;
+    for (const auto& [offset, value] : std::initializer_list<std::pair<std::uint32_t, std::uint32_t>>{{0x000, 0}, {0x002, 0}, {0x007, (1u << 16u) | 3u}, {0x00a, 7}, {0x00b, 0}, {0x010, 0x22900983}, {0x011, 0x20000181}, {0x012, 0x100}, {0x014, 0x100}, {0x013, 0x200}, {0x015, 0x200}, {0x10b, 0}, {0x10c, 0x01ffff02}, {0x10d, 0x01000001}, {0x200, 0x00200211}, {0x203, 0x850}}) tested.context[offset] = value;
+    const auto stencilTested = AgcDriver::Graphics::DecodeState(tested);
+    Require(stencilTested.depth && stencilTested.stencilTest && stencilTested.targetBlends[0].enable, "a stencil-tested blend from a killing early-Z pixel shader was refused");
+    for (const auto control : {0x840u, 0xa50u, 0x870u}) {
+        auto changed = tested;
+        changed.context[0x203] = control;
+        expectFailure([&] { AgcDriver::Graphics::DecodeState(changed); }, "needs Z_ORDER EARLY_Z_THEN_LATE_Z without EXEC_ON_HIER_FAIL");
+    }
+    auto writing = tested;
+    writing.context[0x10b] = 0x00050050;
+    writing.context[0x10c] = 0x01ffff01;
+    writing.context[0x200] = 0x00700711;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(writing); }, "a pixel shader that kills cannot blend into a 10_11_11 unorm color target while it writes depth or stencil");
+    writing.context[0x203] = 0x810;
+    Require(AgcDriver::Graphics::DecodeState(writing).targetBlends[0].enable, "a stencil-writing blend from a pixel shader without kills was refused");
+
+    constexpr std::array<std::uint32_t, 3> code{0xf800180fu, 0x07060504u, 0xbf810000u};
+    const std::array<std::uint32_t, 2> interlock{spv::CapabilityShader, spv::CapabilityFragmentShaderPixelInterlockEXT};
+    auto request = packedExportRequest(queue, state, code);
+    request.context.pixel->targetBlend = state.targetBlends;
+    expectFailure([&] { static_cast<void>(ShaderRecompiler::Recompile(request)); }, "blending into a 10_11_11 unorm target needs the fragmentShaderPixelInterlock feature");
+    request.target.supportedCapabilities = interlock;
+    const ShaderRecompiler::RequestSerializer serializer;
+    Require(serializer.Deserialize(serializer.Serialize(request)).request.context.pixel->targetBlend == request.context.pixel->targetBlend, "the blend of a 10_11_11 unorm target was lost in serialization");
+    auto unblended = request;
+    unblended.context.pixel->targetBlend = {};
+    std::vector<std::uint64_t> key;
+    std::vector<std::uint64_t> unblendedKey;
+    ShaderRecompiler::BuildPreparedShaderKey(request, key);
+    ShaderRecompiler::BuildPreparedShaderKey(unblended, unblendedKey);
+    Require(key == unblendedKey, "the blend entered the static shader ABI");
+    const auto prepared = ShaderRecompiler::PrepareShader(unblended);
+    Require(ShaderRecompiler::MatchesPreparedShader(request, *prepared), "a blended draw did not match the registered pixel shader");
+    const auto blended = ShaderRecompiler::Recompile(request);
+    const auto plain = ShaderRecompiler::Recompile(unblended);
+    Require(blended.variantId == plain.variantId && blended.variantId == ShaderRecompiler::GetPreparedArtifact(*prepared).variantId, "the blended draw did not reuse the registered artifact");
+    Require(blended.PipelineVariantId() != plain.PipelineVariantId() && ShaderRecompiler::Recompile(request).PipelineVariantId() == blended.PipelineVariantId(), "the blend did not key its own specialization");
+    Require(interlockShape(plain.spirv.Words()).empty(), "an unblended pixel shader declared a pixel interlock: " + interlockShape(plain.spirv.Words()));
+    const auto words = blended.spirv.Words();
+    Require(interlockShape(words) == "capability extension ordered begin end end ", "a blending pixel shader declared the wrong pixel interlock: " + interlockShape(words));
+    std::size_t kills = 0;
+    const auto exits = interlockExits(words, kills);
+    Require(exits.empty(), "a blending pixel shader: " + exits);
+    std::size_t reads = 0, writes = 0, early = 0, set1 = 0;
+    for (std::size_t at = 5; at < words.size() && (words[at] >> 16u) != 0; at += words[at] >> 16u) {
+        const auto op = static_cast<spv::Op>(words[at] & 0xffffu);
+        reads += op == spv::OpImageRead;
+        writes += op == spv::OpImageWrite;
+        early += op == spv::OpExecutionMode && words[at + 2] == spv::ExecutionModeEarlyFragmentTests;
+        set1 += op == spv::OpDecorate && words[at + 2] == spv::DecorationDescriptorSet && words[at + 3] == 1u;
+    }
+    Require(reads == 1u && writes == 1u && early == 1u && set1 == 1u, "a blending pixel shader does not read and write its target once through set 1 with early fragment tests");
+    ShaderRecompiler::RecompileResult vertex;
+    vertex.spirv = makeModule({});
+    const VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+    const auto validate = [&](const AgcDriver::Graphics::State& target) {
+        const std::array<AgcDriver::Graphics::CompiledShader, 2> shaders{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &blended, 0}}};
+        return AgcDriver::Graphics::ValidateShaders(shaders, target, subgroup, false);
+    };
+    Require(validate(state).empty(), "a blended 10_11_11 unorm target was validated as an attachment output");
+    auto unblendedState = state;
+    unblendedState.blendedColors.clear();
+    expectFailure([&] { validate(unblendedState); }, "blends into an export that has no blended 10_11_11 unorm target");
+    for (const auto& invalid : {ColorTargetBlend{true, 6u, 5u, 0u, 7u}, ColorTargetBlend{true, 4u, 13u, 0u, 7u}, ColorTargetBlend{true, 4u, 5u, 2u, 7u}, ColorTargetBlend{true, 4u, 5u, 0u, 8u}}) {
+        auto wrong = request;
+        wrong.context.pixel->targetBlend[0] = invalid;
+        expectFailure([&] { static_cast<void>(ShaderRecompiler::Recompile(wrong)); }, "requests a blend into a non-10_11_11 target or with an unsupported factor, function or mask");
+    }
+    auto unpacked = request;
+    unpacked.context.pixel->targetExportPacking[0] = ColorExportPacking::None;
+    expectFailure([&] { static_cast<void>(ShaderRecompiler::Recompile(unpacked)); }, "requests a blend into a non-10_11_11 target");
+    auto depthExport = request;
+    depthExport.context.pixel->depthExportEnable = true;
+    expectFailure([&] { static_cast<void>(ShaderRecompiler::Recompile(depthExport)); }, "exports depth or a sample mask cannot blend");
 }
 
 void validationTests() {
@@ -4727,6 +4874,7 @@ int main(int argc, char** argv) {
         htileDepthClearTests();
         ZExportTests();
         unorm10_11_11TargetTests();
+        unorm10_11_11BlendTests();
         DepthBoundsBiasTests();
         conservativeZExportTests();
         orderedPixelShaderTests();

@@ -397,6 +397,28 @@ bool LazyCapturePlan() {
     return enabled;
 }
 
+std::uint32_t targetBlendWord(const ColorTargetBlend& blend) {
+    if (!blend.enable) return 0u;
+    return 1u | (static_cast<std::uint32_t>(blend.sourceFactor) << 8u) | (static_cast<std::uint32_t>(blend.destinationFactor) << 16u) | (static_cast<std::uint32_t>(blend.function) << 24u) | (static_cast<std::uint32_t>(blend.writeMask) << 28u);
+}
+
+void validateTargetBlends(const RecompileRequest& request) {
+    if (!request.context.pixel) return;
+    const auto& pixel = *request.context.pixel;
+    if (std::none_of(pixel.targetBlend.begin(), pixel.targetBlend.end(), [](const ColorTargetBlend& blend) { return blend.enable; })) return;
+    if (pixel.depthExportEnable || pixel.sampleMaskExportEnable) throw std::runtime_error("a pixel shader that exports depth or a sample mask cannot blend into a 10_11_11 unorm target");
+    const auto factor = [](std::uint32_t value) { return value <= 5u || value == 8u || value == 9u; };
+    for (std::uint32_t index = 0; index < pixel.targetBlend.size(); ++index) {
+        const auto& blend = pixel.targetBlend[index];
+        if (!blend.enable) continue;
+        if (pixel.targetExportPacking[index] != ColorExportPacking::Unorm10_11_11 || !factor(blend.sourceFactor) || !factor(blend.destinationFactor) || (blend.function != 0u && blend.function != 1u && blend.function != 4u) || blend.writeMask > 7u) {
+            throw std::runtime_error("export " + std::to_string(index) + " requests a blend into a non-10_11_11 target or with an unsupported factor, function or mask");
+        }
+    }
+    const auto& capabilities = request.target.supportedCapabilities;
+    if (std::find(capabilities.begin(), capabilities.end(), static_cast<std::uint32_t>(spv::CapabilityFragmentShaderPixelInterlockEXT)) == capabilities.end()) throw std::runtime_error("blending into a 10_11_11 unorm target needs the fragmentShaderPixelInterlock feature, which the device lacks");
+}
+
 std::array<std::uint32_t, 3> partialThreads(const RecompileRequest& request) {
     return request.context.compute ? request.context.compute->partialThreads : std::array<std::uint32_t, 3>{};
 }
@@ -672,12 +694,14 @@ std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledSh
 #endif
     auto module = std::make_shared<SpecializedModule>();
     std::map<std::uint32_t, std::uint32_t> bindingNumbers;
+    std::set<std::uint32_t> blendedTargets;
     for (std::size_t cursor = 5; cursor < materialized.size();) {
         const auto count = materialized[cursor] >> 16u;
         const auto op = static_cast<spv::Op>(materialized[cursor] & 0xffffu);
+        if (op == spv::OpDecorate && count == 4u && materialized[cursor + 2u] == spv::DecorationDescriptorSet && materialized[cursor + 3u] == 1u) blendedTargets.insert(materialized[cursor + 1u]);
         if (op == spv::OpDecorate && count == 4u && materialized[cursor + 2u] == spv::DecorationBinding) bindingNumbers.emplace(materialized[cursor + 1u], materialized[cursor + 3u]);
         if (op == spv::OpVariable && count >= 4u) {
-            if (const auto found = bindingNumbers.find(materialized[cursor + 2u]); found != bindingNumbers.end()) module->bindings.push_back(found->second);
+            if (const auto found = bindingNumbers.find(materialized[cursor + 2u]); found != bindingNumbers.end() && !blendedTargets.contains(found->first)) module->bindings.push_back(found->second);
             module->pushData |= materialized[cursor + 3u] == spv::StorageClassPushConstant;
         }
         cursor += count;
@@ -829,8 +853,10 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
     moduleKey.clear();
     if (variant.bindings.layout.UsesPushData()) moduleKey.push_back(request.layout.pushConstantOffsetBytes / 4u);
     if (request.context.pixel) {
-        for (const auto packing : request.context.pixel->targetExportPacking) moduleKey.push_back(static_cast<std::uint32_t>(packing));
+        validateTargetBlends(request);
+        for (std::uint32_t target = 0; target < request.context.pixel->targetExportPacking.size(); ++target) moduleKey.push_back(request.context.pixel->targetBlend[target].enable ? static_cast<std::uint32_t>(ColorExportPacking::None) : static_cast<std::uint32_t>(request.context.pixel->targetExportPacking[target]));
         moduleKey.push_back(request.context.pixel->dualSourceBlend ? 1u : 0u);
+        for (const auto& blend : request.context.pixel->targetBlend) moduleKey.push_back(targetBlendWord(blend));
     }
     result.vertexAttributes.reserve(result.vertexInputs.size());
     std::array<std::uint32_t, ShaderVertexStageInfo::MaxResources> vertexClasses{};
@@ -874,6 +900,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
             if (request.context.pixel) {
                 for (std::uint32_t target = 0; target < request.context.pixel->targetExportPacking.size(); ++target) constants.push_back({PipelineSpecialization::ExportPackingBase + target, moduleKey[index++]});
                 constants.push_back({PipelineSpecialization::DualSourceBlend, moduleKey[index++]});
+                for (std::uint32_t target = 0; target < request.context.pixel->targetBlend.size(); ++target) constants.push_back({PipelineSpecialization::ExportBlendBase + target, moduleKey[index++]});
             }
             if (!artifact.vertexInputPatches.empty()) {
                 for (const auto& input : result.vertexInputs) {
@@ -1158,6 +1185,7 @@ std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapsh
         for (const auto mapping : request.context.pixel->targetExportMapping) mix(mapping);
         for (const auto packing : request.context.pixel->targetExportPacking) mix(static_cast<std::uint64_t>(packing));
         mix(request.context.pixel->dualSourceBlend);
+        for (const auto& blend : request.context.pixel->targetBlend) mix(targetBlendWord(blend));
     }
     if (request.context.vertex) {
         const auto& vertex = *request.context.vertex;

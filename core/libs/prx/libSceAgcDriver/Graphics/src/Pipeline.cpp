@@ -156,7 +156,7 @@ bool fragmentWritesMemory(std::span<const CompiledShader> shaders) {
 
 bool libraryKeys(PipelineLibraryKeys& keys, const Context& context, const State& state, const VertexInputLayout& input, const ShaderResources& resources, std::span<const CompiledShader> shaders) {
     using Stage = ShaderRecompiler::ShaderStage;
-    if (!context.graphicsPipelineLibrary || context.pipelineExecutableInfo || state.depthBiasPerFace || state.rectList || SplitsAlternateAlpha(state)) return false;
+    if (!context.graphicsPipelineLibrary || context.pipelineExecutableInfo || state.depthBiasPerFace || state.rectList || SplitsAlternateAlpha(state) || !state.blendedColors.empty()) return false;
     keys = {};
     for (const auto& shader : shaders) {
         if (shader.stage == Stage::Geometry || shader.program->PipelineVariantId() == 0) return false;
@@ -256,12 +256,22 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         }
         // A descriptor set layout with the same bindings as this one is compatible with the pipeline
         // layout, so later draws bind their own ShaderResources' set under it.
-        const auto setLayout = resources.Layout();
+        std::array<VkDescriptorSetLayout, 2> setLayouts{resources.Layout(), VK_NULL_HANDLE};
+        if (!state.blendedColors.empty()) {
+            Require(state.blendedColors.size() <= context.limits.maxPerStageDescriptorStorageImages, "blended color targets exceed per-stage storage image limits");
+            std::vector<VkDescriptorSetLayoutBinding> blended;
+            for (const auto& color : state.blendedColors) blended.push_back({color.exportIndex, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr});
+            VkDescriptorSetLayoutCreateInfo blendedInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+            blendedInfo.bindingCount = static_cast<std::uint32_t>(blended.size());
+            blendedInfo.pBindings = blended.data();
+            Check(context.Function<PFN_vkCreateDescriptorSetLayout>("vkCreateDescriptorSetLayout")(context.device, &blendedInfo, nullptr, &blendedLayout), "vkCreateDescriptorSetLayout blended targets");
+            setLayouts[1] = blendedLayout;
+        }
         const VkPushConstantRange push{pushStages, 0, PipelinePushSlotBytes};
         const std::array<VkPushConstantRange, 2> slots{{{pushStagesOf(context), 0, PipelinePushSlotBytes}, {VK_SHADER_STAGE_FRAGMENT_BIT, PipelinePushSlotBytes, PipelinePushSlotBytes}}};
         VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-        layoutInfo.setLayoutCount = 1;
-        layoutInfo.pSetLayouts = &setLayout;
+        layoutInfo.setLayoutCount = blendedLayout != VK_NULL_HANDLE ? 2u : 1u;
+        layoutInfo.pSetLayouts = setLayouts.data();
         layoutInfo.pushConstantRangeCount = dynamicRendering ? static_cast<std::uint32_t>(slots.size()) : pushStages != 0 ? 1 : 0;
         layoutInfo.pPushConstantRanges = dynamicRendering ? slots.data() : pushStages != 0 ? &push : nullptr;
         Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &layoutInfo, nullptr, &layout), "vkCreatePipelineLayout graphics");
@@ -450,6 +460,7 @@ void Pipeline::release() noexcept {
     if (secondChannel) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, secondChannel, nullptr);
     if (renderPass) context.Function<PFN_vkDestroyRenderPass>("vkDestroyRenderPass")(context.device, renderPass, nullptr);
     if (layout) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, layout, nullptr);
+    if (blendedLayout) context.Function<PFN_vkDestroyDescriptorSetLayout>("vkDestroyDescriptorSetLayout")(context.device, blendedLayout, nullptr);
     for (auto module : _modules) {
         if (module) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
     }
@@ -458,6 +469,7 @@ void Pipeline::release() noexcept {
     secondChannel = VK_NULL_HANDLE;
     renderPass = VK_NULL_HANDLE;
     layout = VK_NULL_HANDLE;
+    blendedLayout = VK_NULL_HANDLE;
     _modules.clear();
 }
 
@@ -471,6 +483,7 @@ void Pipeline::Abandon() noexcept {
     secondChannel = VK_NULL_HANDLE;
     renderPass = VK_NULL_HANDLE;
     layout = VK_NULL_HANDLE;
+    blendedLayout = VK_NULL_HANDLE;
     _modules.clear();
 }
 
@@ -480,6 +493,10 @@ void Framebuffer::Abandon() noexcept {
 
 VkPipelineLayout Pipeline::Layout() const {
     return layout;
+}
+
+VkDescriptorSetLayout Pipeline::BlendedTargetLayout() const {
+    return blendedLayout;
 }
 
 std::shared_ptr<Framebuffer> Pipeline::AcquireFramebuffer(std::span<const VkImageView> targets, std::span<const std::shared_ptr<StorageTexture>> owners, VkExtent2D extent) {
@@ -682,6 +699,8 @@ void pipelineKey(std::vector<std::byte>& key, const Context& context, const Stat
     if (state.blends.size() != state.colors.size()) {
         for (const auto& color : state.colors) append(key, color.exportIndex);
     }
+    append(key, state.blendedColors.size());
+    for (const auto& color : state.blendedColors) append(key, color.exportIndex);
     append(key, state.depth.has_value());
     if (state.depth) {
         append(key, state.depth->format);
