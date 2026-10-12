@@ -9,6 +9,7 @@
 #include <span>
 #include <utility>
 #include <vector>
+#include "prx/libSceAgcDriver/Execution/include/ContentHash.hpp"
 
 namespace AgcDriver::GuestMemory {
 
@@ -49,6 +50,19 @@ void Write(std::uint64_t address, std::span<const std::byte> source, std::size_t
 // Stores the parts of `current` that differ from `original` (the guest bytes the GPU started from), so
 // guest writes made meanwhile to untouched bytes survive. Compares in 256-byte blocks.
 void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original);
+
+// Content hashes standing in for a byte copy where only "do the guest bytes still match" is asked:
+// one ContentHash per 64 KiB tracker block of [address, address + bytes) (block 0 holds `address`,
+// each block clipped to the range), so a range starting at the same address or on a block boundary
+// shares the blocks. Uncommitted pages hash as the zeros ReadCommitted reads. No flush hook: the
+// caller flushes first where EqualsCommitted would.
+inline constexpr std::uint64_t HashBlockBytes = 65536;
+std::size_t HashBlockCount(std::uint64_t address, std::size_t bytes);
+void HashCommittedBlocks(std::uint64_t address, std::size_t bytes, std::span<ContentHash::Hash128> out);
+// The same blocks of a host copy of the guest bytes at `address`.
+void HashBlocksOf(std::uint64_t address, std::span<const std::byte> bytes, std::span<ContentHash::Hash128> out);
+// Whether every block of the range still hashes to `expected` (stops at the first differing block).
+bool CommittedBlocksMatch(std::uint64_t address, std::size_t bytes, std::span<const ContentHash::Hash128> expected);
 
 // Write tracking. The guest arena is reserved with page write watching, so CollectWrites learns which
 // pages of a range the CPU wrote since they were last collected, stamps their 64 KiB blocks with a new

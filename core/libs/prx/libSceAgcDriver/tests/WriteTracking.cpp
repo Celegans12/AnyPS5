@@ -11,6 +11,7 @@
 #endif
 #include <array>
 #include <cstdint>
+#include <span>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
@@ -246,6 +247,74 @@ void CheckVersionRanges() {
     Require(UnchangedSince(base, bytes, checkpoints.back()), "the latest checkpoint was rejected");
 }
 
+// Block hashes stand in for texture byte copies: every changed byte (anywhere in a block, at either
+// end of a clipped block, a swap of two words) changes exactly its block's hash, a host copy hashes
+// like the guest bytes, and uncommitted pages hash as zeros.
+void CheckContentHashes() {
+    using AgcDriver::ContentHash::Hash128;
+    std::vector<std::byte> storage(6 * Block);
+    for (std::size_t i = 0; i < storage.size(); ++i) storage[i] = static_cast<std::byte>((i * 167u + 13u) ^ (i >> 9));
+    const auto blockBase = (reinterpret_cast<std::uint64_t>(storage.data()) + Block - 1) / Block * Block;
+    const auto address = blockBase + 0x1234;
+    const std::size_t bytes = 3 * Block + 100;
+    Require(HashBlockCount(address, bytes) == 4 && HashBlockCount(blockBase, Block) == 1 && HashBlockCount(blockBase, Block + 1) == 2 && HashBlockCount(address, 0) == 0, "hash block counts are wrong");
+    std::vector<Hash128> hashes(HashBlockCount(address, bytes));
+    HashCommittedBlocks(address, bytes, hashes);
+    std::vector<std::byte> copy(bytes);
+    std::memcpy(copy.data(), reinterpret_cast<const void*>(address), bytes);
+    std::vector<Hash128> fromCopy(hashes.size());
+    HashBlocksOf(address, copy, fromCopy);
+    Require(fromCopy == hashes, "a host copy hashes unlike the guest bytes it copies");
+    Require(CommittedBlocksMatch(address, bytes, hashes), "unchanged bytes do not match their hashes");
+    Require(CommittedBlocksMatch(blockBase + Block, Block, std::span<const Hash128>(hashes).subspan(1, 1)), "a whole block inside the range does not match its own hash");
+    Require(!CommittedBlocksMatch(address, bytes, std::span<const Hash128>(hashes).first(3)), "a hash list of the wrong length matched");
+    auto* bytesAt = reinterpret_cast<std::uint8_t*>(address);
+    const auto blockOf = [&](std::size_t offset) { return static_cast<std::size_t>((address + offset) / Block - address / Block); };
+    const std::size_t firstBoundary = static_cast<std::size_t>(blockBase + Block - address);
+    for (const std::size_t offset : {std::size_t{0}, firstBoundary - 1, firstBoundary, firstBoundary + 4097, firstBoundary + Block - 1, bytes / 2, bytes - 1}) {
+        for (const std::uint8_t flip : {std::uint8_t{0x01}, std::uint8_t{0x80}}) {
+            bytesAt[offset] ^= flip;
+            std::vector<Hash128> changed(hashes.size());
+            HashCommittedBlocks(address, bytes, changed);
+            for (std::size_t block = 0; block < hashes.size(); ++block) Require((changed[block] == hashes[block]) == (block != blockOf(offset)), "a changed byte at +" + std::to_string(offset) + " did not change exactly its block's hash");
+            Require(!CommittedBlocksMatch(address, bytes, hashes), "a changed byte at +" + std::to_string(offset) + " still matches");
+            bytesAt[offset] ^= flip;
+            Require(CommittedBlocksMatch(address, bytes, hashes), "restored bytes do not match again");
+        }
+    }
+    std::uint64_t first = 0, second = 0;
+    std::memcpy(&first, bytesAt + firstBoundary + 64, 8);
+    std::memcpy(&second, bytesAt + firstBoundary + 1024, 8);
+    Require(first != second, "the swap test words are equal");
+    std::memcpy(bytesAt + firstBoundary + 64, &second, 8);
+    std::memcpy(bytesAt + firstBoundary + 1024, &first, 8);
+    Require(!CommittedBlocksMatch(address, bytes, hashes), "two swapped words still match");
+    std::memcpy(bytesAt + firstBoundary + 64, &first, 8);
+    std::memcpy(bytesAt + firstBoundary + 1024, &second, 8);
+    const std::array<std::byte, 128> zeros{};
+    Require(!(AgcDriver::ContentHash::Of(zeros.data(), 10) == AgcDriver::ContentHash::Of(zeros.data(), 11)), "zero runs of different lengths hash alike");
+    std::array<std::byte, 40> small{};
+    const auto smallHash = AgcDriver::ContentHash::Of(small.data(), small.size());
+    small[39] = std::byte{1};
+    Require(!(AgcDriver::ContentHash::Of(small.data(), small.size()) == smallHash), "a changed byte of a short run keeps its hash");
+#ifdef _WIN32
+    auto* reserved = static_cast<std::byte*>(VirtualAlloc(nullptr, 2 * Block, MEM_RESERVE, PAGE_NOACCESS));
+    Require(reserved != nullptr && VirtualAlloc(reserved + 4096, 4096, MEM_COMMIT, PAGE_READWRITE) != nullptr, "cannot reserve the partly committed block");
+    std::memset(reserved + 4096, 0x77, 4096);
+    const auto sparse = reinterpret_cast<std::uint64_t>(reserved) + 256;
+    const std::size_t sparseBytes = 2 * Block - 512;
+    std::vector<std::byte> read(sparseBytes);
+    ReadCommitted(sparse, read);
+    std::vector<Hash128> sparseHashes(HashBlockCount(sparse, sparseBytes)), readHashes(sparseHashes.size());
+    HashCommittedBlocks(sparse, sparseBytes, sparseHashes);
+    HashBlocksOf(sparse, read, readHashes);
+    Require(sparseHashes == readHashes && CommittedBlocksMatch(sparse, sparseBytes, readHashes), "uncommitted pages do not hash as the zeros ReadCommitted reads");
+    reserved[4096 + 5] = std::byte{0};
+    Require(!CommittedBlocksMatch(sparse, sparseBytes, readHashes), "a changed committed byte next to uncommitted pages still matches");
+    VirtualFree(reserved, 0, MEM_RELEASE);
+#endif
+}
+
 void CheckCollectBoundaries() {
     constexpr std::size_t bytes = 3 * Block;
     auto* memory = static_cast<std::uint8_t*>(AllocateWatched(bytes));
@@ -303,6 +372,7 @@ void CheckCollectBoundaries() {
 
 int main() {
     try {
+        CheckContentHashes();
         if (!WriteWatched()) {
             std::cout << "no write watching: skipped\n";
             return 77;

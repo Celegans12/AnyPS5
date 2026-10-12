@@ -1869,6 +1869,81 @@ void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std
     });
 }
 
+namespace {
+
+// Visits the hash blocks of [address, address + bytes) in order: (index, begin, length).
+template <class Visit>
+bool forEachHashBlock(std::uint64_t address, std::size_t bytes, Visit&& visit) {
+    const auto end = address + bytes;
+    std::size_t index = 0;
+    for (auto at = address; at < end; ++index) {
+        const auto stop = std::min<std::uint64_t>(end, (at / HashBlockBytes + 1) * HashBlockBytes);
+        if (!visit(index, at, static_cast<std::size_t>(stop - at))) return false;
+        at = stop;
+    }
+    return true;
+}
+
+// Hashes guest blocks in place while every page is readable; otherwise each block is assembled as
+// ReadCommitted would read it (zeros where nothing is committed).
+class CommittedHasher {
+public:
+    CommittedHasher(std::uint64_t address, std::size_t bytes) : whole(Accessible(reinterpret_cast<const void*>(address), bytes)) {
+        if (!whole) ranges = CommittedRanges(address, bytes);
+    }
+    ContentHash::Hash128 operator()(std::uint64_t begin, std::size_t length) {
+        if (whole) return ContentHash::Of(reinterpret_cast<const void*>(begin), length);
+        thread_local std::vector<std::byte>* scratchSlot = nullptr;
+        auto& scratch = ShaderRecompiler::ThreadOwned(scratchSlot);
+        scratch.assign(length, std::byte{0});
+        const auto end = begin + length;
+        for (const auto& [from, to] : ranges) {
+            const auto low = std::max<std::uint64_t>(from, begin);
+            const auto high = std::min<std::uint64_t>(to, end);
+            if (low < high) std::memcpy(scratch.data() + (low - begin), reinterpret_cast<const void*>(low), static_cast<std::size_t>(high - low));
+        }
+        return ContentHash::Of(scratch.data(), length);
+    }
+
+private:
+    bool whole;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+};
+
+}
+
+std::size_t HashBlockCount(std::uint64_t address, std::size_t bytes) {
+    if (bytes == 0) return 0;
+    return static_cast<std::size_t>((address + bytes - 1) / HashBlockBytes - address / HashBlockBytes + 1);
+}
+
+void HashCommittedBlocks(std::uint64_t address, std::size_t bytes, std::span<ContentHash::Hash128> out) {
+    require(out.size() == HashBlockCount(address, bytes), "hash block count differs");
+    if (bytes == 0) return;
+    const TimedAccess timed(CounterRead, bytes);
+    CommittedHasher hash(address, bytes);
+    forEachHashBlock(address, bytes, [&](std::size_t index, std::uint64_t begin, std::size_t length) {
+        out[index] = hash(begin, length);
+        return true;
+    });
+}
+
+void HashBlocksOf(std::uint64_t address, std::span<const std::byte> bytes, std::span<ContentHash::Hash128> out) {
+    require(out.size() == HashBlockCount(address, bytes.size()), "hash block count differs");
+    forEachHashBlock(address, bytes.size(), [&](std::size_t index, std::uint64_t begin, std::size_t length) {
+        out[index] = ContentHash::Of(bytes.data() + (begin - address), length);
+        return true;
+    });
+}
+
+bool CommittedBlocksMatch(std::uint64_t address, std::size_t bytes, std::span<const ContentHash::Hash128> expected) {
+    if (expected.size() != HashBlockCount(address, bytes)) return false;
+    if (bytes == 0) return true;
+    const TimedAccess timed(CounterCompare, bytes);
+    CommittedHasher hash(address, bytes);
+    return forEachHashBlock(address, bytes, [&](std::size_t index, std::uint64_t begin, std::size_t length) { return hash(begin, length) == expected[index]; });
+}
+
 void Write(std::uint64_t address, std::span<const std::byte> source, std::size_t alignment) {
     if (source.empty()) return;
     // A store, as in WriteChanged.
