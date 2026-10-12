@@ -1,9 +1,12 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ShaderPreparation.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <functional>
+#include <iterator>
 #include <stdexcept>
 #include <string_view>
 
@@ -55,6 +58,20 @@ void Driver::reportSkip(const char* kind, const std::string& what) {
 bool SkipRefusedShaders() {
     static const bool skip = [] { const char* text = std::getenv("APS5_SKIP_REFUSED_SHADERS"); return text != nullptr && std::atoi(text) != 0; }();
     return skip;
+}
+
+std::string RefusedShaderSubject(std::uint32_t stage, std::uint64_t address) {
+    static constexpr const char* stageNames[] = {"compute", "vertex", "hull", "domain", "geometry", "pixel", "local", "mesh"};
+    char text[64];
+    std::snprintf(text, sizeof(text), "%s shader 0x%llx", stage < std::size(stageNames) ? stageNames[stage] : "graphics", static_cast<unsigned long long>(address));
+    return text;
+}
+
+void Driver::SkipRefusedPreparation(const ShaderRefusal& refusal) {
+    ShaderPreparationTransaction::ContinueAfterRefusal();
+    std::string reason = refusal.what();
+    if (const auto newline = reason.find('\n'); newline != std::string::npos) reason.resize(newline);
+    reportSkip("shader preparation", (refusal.subject.empty() ? std::string("shader") : refusal.subject) + ": " + reason);
 }
 
 std::string Driver::dumpRequest(std::uint64_t address, const ShaderRecompiler::RecompileRequest& request) {

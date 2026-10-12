@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ThreadPriority.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include <mutex>
 
 namespace AgcDriver {
@@ -123,13 +124,22 @@ extern "C" void AgcDriverReportFailure_nid_postfix(std::exception_ptr error) {
     AgcDriver::ReportFailure(error);
 }
 
-extern "C" void AgcDriverResolveShaderAbi_nid_postfix(const Shader* shader, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive) {
+// ABI resolution prepares programs on the title's thread. A refusal there (APS5_SKIP_REFUSED_SHADERS only)
+// is reported and skipped; the draws and dispatches that use the program are skipped as they come.
+extern "C" void AgcDriverResolveShaderAbi_nid_postfix(const Shader* shader, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive) try {
     AgcDriver::DriverDetail::Driver::Get().ResolveShaderAbi(shader, context, primitive);
+} catch (const AgcDriver::DriverDetail::ShaderRefusal& refusal) {
+    AgcDriver::DriverDetail::Driver::SkipRefusedPreparation(refusal);
 }
 
-extern "C" void AgcDriverResolveGraphicsAbi_nid_postfix(const Shader* vertex, const Shader* pixel, std::uint32_t primitiveType) {
+extern "C" void AgcDriverResolveGraphicsAbi_nid_postfix(const Shader* vertex, const Shader* pixel, std::uint32_t primitiveType) try {
     AgcDriver::DriverDetail::Driver::Get().ResolveGraphicsAbi(vertex, pixel, primitiveType);
+} catch (const AgcDriver::DriverDetail::ShaderRefusal& refusal) {
+    AgcDriver::DriverDetail::Driver::SkipRefusedPreparation(refusal);
 }
-extern "C" void AgcDriverResolveGraphicsStagesAbi_nid_postfix(std::span<const Shader* const> stages, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive) {
+
+extern "C" void AgcDriverResolveGraphicsStagesAbi_nid_postfix(std::span<const Shader* const> stages, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive) try {
     AgcDriver::DriverDetail::Driver::Get().ResolveGraphicsStagesAbi(stages, context, primitive);
+} catch (const AgcDriver::DriverDetail::ShaderRefusal& refusal) {
+    AgcDriver::DriverDetail::Driver::SkipRefusedPreparation(refusal);
 }

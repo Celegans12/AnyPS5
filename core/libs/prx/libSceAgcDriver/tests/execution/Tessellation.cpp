@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ShaderPreparationScope.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "Recompiler.hpp"
@@ -632,16 +633,63 @@ void RequireRegisteredStages() {
     AgcDriverShutdown_nid_postfix();
 }
 
+// sceAgcCreatePrimState resolves the hull and domain programs on the title's thread, inside the
+// transaction sceAgcLinkShaders opens. A domain program the recompiler refuses fails that call; with
+// APS5_SKIP_REFUSED_SHADERS the preparation is skipped and the open transaction still commits.
+void RequireRegisteredRefusal() {
+    const char* skipText = std::getenv("APS5_SKIP_REFUSED_SHADERS");
+    const bool skip = skipText != nullptr && std::atoi(skipText) != 0;
+    const auto low = [](const auto& code) { return static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(code.data()) >> 8u); };
+    const auto high = [](const auto& code) { return static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(code.data()) >> 40u); };
+    RegisteredStage local;
+    RegisteredStage hull;
+    RegisteredStage domain;
+    Describe(local, LocalCode, 5u, {{0x10au, 0u}, {0x10bu, 0u}}, {}, 0u);
+    Describe(hull, HullCode, 7u, {{0x148u, 0u}, {0x149u, 0u}, {0x10au, 0u}, {0x10bu, 16u}, {0x108u, low(HullCode)}, {0x109u, high(HullCode)}}, {{0x2dbu, 0x40049u}, {0x286u, 0x42800000u}, {0x287u, 0x3f800000u}, {0x2d6u, 0xc355u}}, 0x105u);
+    Describe(domain, DomainRelativeData, 2u, {{0xc8u, low(DomainRelativeData)}, {0xc9u, high(DomainRelativeData)}, {0x8au, 0u}, {0x8bu, 16u}}, {}, 0x02002008u);
+    for (const auto* stage : {&local, &hull, &domain}) AgcDriverRegisterShader_nid_postfix(&stage->shader);
+    const std::array<const Shader*, 2> stages{&hull.shader, &domain.shader};
+    const std::array<ShaderRegister, 2> context{{{0x2d5u, 0x0200210du}, {0x29bu, 0u}}};
+    const std::array<ShaderRegister, 3> primitive{{{0x25bu, 0u}, {0x262u, 0u}, {0x242u, 9u}}};
+    std::string refusal;
+    {
+        AgcDriver::ShaderPreparationScope scope;
+        try {
+            AgcDriverResolveGraphicsStagesAbi_nid_postfix(stages, context, primitive);
+            AgcDriverResolveGraphicsStagesAbi_nid_postfix(stages, context, primitive);
+            scope.Commit();
+        } catch (const std::exception& error) {
+            const std::string what = error.what();
+            refusal = what.substr(0, what.find('\n'));
+        }
+    }
+    if (skip && refusal.empty()) AgcDriverWaitIdle_nid_postfix();
+    AgcDriverShutdown_nid_postfix();
+    if (!skip) {
+        Require(refusal.find("ShaderRecompiler::Recompile: tessellation lowering: ") != std::string::npos, "the refused domain program did not stop ABI resolution: " + (refusal.empty() ? std::string("it was prepared") : refusal));
+        std::puts("registered domain refusal stopped ABI resolution");
+        return;
+    }
+    Require(refusal.empty(), "APS5_SKIP_REFUSED_SHADERS did not skip the refused domain program at ABI resolution: " + refusal);
+    std::puts("registered domain refusal skipped at ABI resolution");
 }
 
-int main() {
+}
+
+int main(int argc, char** argv) {
     try {
+        Require(argc == 1 || (argc == 2 && std::string(argv[1]) == "--registered-refusal"), "invalid test arguments");
         auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         const auto target = device->Target();
         if (!target.tessellation.has_value()) {
             std::puts("Tessellation tests skipped: the device has no tessellation shaders");
             return VulkanTestSkipped;
+        }
+        if (argc == 2) {
+            device.reset();
+            RequireRegisteredRefusal();
+            return 0;
         }
         ExpectRefusal(target, ShaderStage::TessellationControl, HullUnguardedFactors, "not written by control point 0 alone");
         ExpectRefusal(target, ShaderStage::TessellationControl, HullSquaredAddress, "not affine");

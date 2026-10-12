@@ -136,12 +136,21 @@ void ReportRegisteredShaderMemory(const ShaderRegistry& registry, const char* ph
 }
 
 std::shared_ptr<const ShaderRecompiler::SourceHandle> PrepareShaderWithDiagnostics(const ShaderRecompiler::RecompileRequest& request, ShaderRecompiler::ShaderPreparationContext* preparation) {
-    try {
-        return ShaderRecompiler::PrepareShader(request, preparation);
-    } catch (...) {
+    const auto dump = [&] {
         try {
             if (std::getenv("APS5_DUMP_SHADERS") != nullptr) static_cast<void>(Driver::dumpRequest(request.shader.codeAddress, request));
         } catch (...) {}
+    };
+    try {
+        return ShaderRecompiler::PrepareShader(request, preparation);
+    } catch (const std::exception& error) {
+        dump();
+        // Under APS5_SKIP_REFUSED_SHADERS every caller (draw, dispatch, ABI resolution, registration)
+        // sees the refusal as one, wherever the program is first prepared.
+        if (SkipRefusedShaders() && dynamic_cast<const ShaderRefusal*>(&error) == nullptr) throw ShaderRefusal(error.what(), RefusedShaderSubject(static_cast<std::uint32_t>(request.shader.stage), request.shader.codeAddress));
+        throw;
+    } catch (...) {
+        dump();
         throw;
     }
 }
@@ -306,6 +315,10 @@ const PreparedShaderState& ShaderPreparationTransaction::Read(const ShaderSnapsh
     std::unique_lock lock(snapshot.prepared->mutex);
     AwaitRegisteredPreparation(*snapshot.prepared, lock);
     return changes.emplace(snapshot.prepared.get(), State::Change{snapshot.prepared, *snapshot.prepared, false, snapshot.prepared->entries.size(), snapshot.prepared->registeredAbis.size()}).first->second.prepared;
+}
+
+void ShaderPreparationTransaction::ContinueAfterRefusal() {
+    if (State::active != nullptr) State::active->failed = false;
 }
 
 void ShaderPreparationTransaction::Commit() {
@@ -1266,7 +1279,13 @@ void Driver::RegisterShader(const Shader* shader) {
         if (preparation != nullptr && (snapshot.type == 0 || snapshot.type == 1)) BuildRegisteredAbiKey(registered, *localDevice, preparation->abiKey);
         snapshot.prepared->pending = preparation != nullptr;
     } else {
-        snapshot.prepared->entries = PrepareRegistered(snapshot, *localDevice, registered, true, &snapshot.prepared->deferred);
+        try {
+            snapshot.prepared->entries = PrepareRegistered(snapshot, *localDevice, registered, true, &snapshot.prepared->deferred);
+        } catch (const ShaderRefusal& refusal) {
+            // As a failed background preparation: its uses rethrow the refusal and are skipped.
+            APS5_LOG_ERR("Shader 0x%llx could not be prepared at registration: %s", static_cast<unsigned long long>(snapshot.codeAddress), refusal.what());
+            snapshot.prepared->failure = std::current_exception();
+        }
         if ((snapshot.type == 0 || snapshot.type == 1) && !snapshot.prepared->entries.empty()) {
             std::vector<std::uint64_t> key;
             BuildRegisteredAbiKey(registered, *localDevice, key);
