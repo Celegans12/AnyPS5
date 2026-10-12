@@ -682,20 +682,22 @@ private:
 
     void requireGroupedPatches() const {
         if (stage != IrShaderStage::TessellationControl) Fail("the relative patch or vertex index is used outside a tessellation ring or LDS address", 0u);
-        if (tessellation.primitiveGroupSize == 0u || tessellation.primitiveGroupSize % tessellation.patchesPerGroup != 0u) Fail("the hull program uses its relative patch index as data, but GE_CNTL.PRIM_GRP_SIZE is not a multiple of VGT_LS_HS_CONFIG.NUM_PATCHES", 0u);
+        if (tessellation.primitiveGroupSize == 0u) Fail("the hull program uses its relative patch index as data, but GE_CNTL.PRIM_GRP_SIZE is 0 or not programmed", 0u);
     }
 
     IrValue& groupedPatch(IrValue& base) {
-        IrValue& patches = constant(tessellation.patchesPerGroup);
         const auto emit = [&](IrOpcode opcode, std::initializer_list<IrValue*> arguments) -> IrValue& {
             IrValue& value = program.CreateValue(opcode, IrType::U32);
             for (IrValue* argument : arguments) value.AddArgument(argument);
             base.Parent()->InsertInstructionBefore(&base, &value);
             return value;
         };
+        const auto remainder = [&](IrValue& value, std::uint32_t divisor) -> IrValue& {
+            IrValue& count = constant(divisor);
+            return emit(IrOpcode::ISub32, {&value, &emit(IrOpcode::IMul32, {&emit(IrOpcode::UDiv32, {&value, &count}), &count})});
+        };
         IrValue& primitive = emit(IrOpcode::GetBuiltin, {&constant(static_cast<std::uint32_t>(StageInputKind::PrimitiveId)), &constant(0u)});
-        IrValue& group = emit(IrOpcode::UDiv32, {&primitive, &patches});
-        return emit(IrOpcode::ISub32, {&primitive, &emit(IrOpcode::IMul32, {&group, &patches})});
+        return remainder(remainder(primitive, tessellation.primitiveGroupSize), tessellation.patchesPerGroup);
     }
 
     void removeUnobservedCycles() {

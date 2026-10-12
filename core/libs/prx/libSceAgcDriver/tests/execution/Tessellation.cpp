@@ -251,6 +251,17 @@ alignas(256) constexpr std::array<std::uint16_t, 9> Indices{
     Corner(2, 0, 0), Corner(2, 2, 0), Corner(2, 1, 2),
 };
 
+alignas(256) constexpr std::array<std::uint16_t, 24> LatePatchIndices{
+    Corner(1, 0, 0), Corner(1, 2, 0), Corner(1, 1, 2),
+    Corner(1, 0, 0), Corner(1, 2, 0), Corner(1, 1, 2),
+    Corner(1, 0, 0), Corner(1, 2, 0), Corner(1, 1, 2),
+    Corner(1, 0, 0), Corner(1, 2, 0), Corner(1, 1, 2),
+    Corner(1, 0, 0), Corner(1, 2, 0), Corner(1, 1, 2),
+    Corner(1, 0, 0), Corner(1, 2, 0), Corner(1, 1, 2),
+    Corner(2, 0, 0), Corner(2, 2, 0), Corner(2, 1, 2),
+    Corner(0, 0, 0), Corner(0, 2, 0), Corner(0, 1, 2),
+};
+
 alignas(256) constexpr std::array<std::uint16_t, 12> QuadIndices{
     Corner(0, 0, 0), Corner(0, 2, 0), Corner(0, 2, 2), Corner(0, 0, 2),
     Corner(1, 0, 0), Corner(1, 2, 0), Corner(1, 2, 2), Corner(1, 0, 2),
@@ -453,7 +464,7 @@ void RequirePatchConstants(AgcDriver::VulkanDevice& device, const ShaderRecompil
 
 void RequireRelativePatches(AgcDriver::VulkanDevice& device, const ShaderRecompiler::SpirvTarget& target) {
     const auto center = Row(-0.5f + 1.0f / 3.0f);
-    for (const auto& [patches, blue] : {std::pair{PatchDraw{{3u, 3u, 1u, 2u, 2u, 1.0f, 64.0f, 3u, 3u}, Indices}, 96}, std::pair{PatchDraw{{3u, 3u, 1u, 2u, 2u, 1.0f, 64.0f, 2u, 4u}, Indices}, 32}}) {
+    for (const auto& [patches, blue] : {std::pair{PatchDraw{{3u, 3u, 1u, 2u, 2u, 1.0f, 64.0f, 3u, 3u}, Indices}, 96}, std::pair{PatchDraw{{3u, 3u, 1u, 2u, 2u, 1.0f, 64.0f, 2u, 4u}, Indices}, 32}, std::pair{PatchDraw{{3u, 3u, 1u, 2u, 2u, 1.0f, 64.0f, 3u, 4u}, LatePatchIndices}, 96}, std::pair{PatchDraw{{3u, 3u, 1u, 2u, 2u, 1.0f, 64.0f, 3u, 2u}, Indices}, 32}}) {
         std::uint32_t cursor = 0;
         const Stages stages{
             Compile(target, ShaderStage::Local, LocalCode, cursor, patches),
@@ -464,7 +475,7 @@ void RequireRelativePatches(AgcDriver::VulkanDevice& device, const ShaderRecompi
         Draw(device, stages, VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE, patches);
         for (const auto& [patch, expected] : {std::pair{0u, 32}, std::pair{2u, blue}}) {
             const auto pixel = PixelAt(Column(patch, 0.25f), center);
-            Require(pixel[0] == 255 && std::abs(pixel[2] - expected) <= 1, "patch " + std::to_string(patch) + " with " + std::to_string(patches.configuration.patchesPerGroup) + " patches per group did not take its blue channel from its relative patch index, " + PixelText(pixel));
+            Require(pixel[0] == 255 && std::abs(pixel[2] - expected) <= 1, "the patch in column " + std::to_string(patch) + " with " + std::to_string(patches.configuration.patchesPerGroup) + " patches per group and " + std::to_string(patches.configuration.primitiveGroupSize) + " primitives per group did not take its blue channel from its relative patch index, " + PixelText(pixel));
         }
         Require(PixelAt(Column(1, 0.25f), center) == Background, "the patch with level 0 was not culled");
     }
@@ -629,8 +640,7 @@ int main() {
         ExpectRefusal(target, ShaderStage::TessellationEvaluation, DomainNeighbourPoint, "neither its patch's control points nor a patch-constant record", RecordPatches);
         ExpectRefusal(target, ShaderStage::TessellationEvaluation, DomainCulledPrimitive, "passthrough primitive");
         ExpectRefusal(target, ShaderStage::Local, LocalIndexAsData, "outside a tessellation ring or LDS address");
-        ExpectRefusal(target, ShaderStage::TessellationControl, HullRelativeData, "PRIM_GRP_SIZE is not a multiple of VGT_LS_HS_CONFIG.NUM_PATCHES", {{3u, 3u, 1u, 2u, 2u, 1.0f, 64.0f, 3u, 4u}, Indices});
-        ExpectRefusal(target, ShaderStage::TessellationControl, HullRelativeData, "PRIM_GRP_SIZE is not a multiple of VGT_LS_HS_CONFIG.NUM_PATCHES", RecordPatches);
+        ExpectRefusal(target, ShaderStage::TessellationControl, HullRelativeData, "GE_CNTL.PRIM_GRP_SIZE is 0", RecordPatches);
         ExpectRefusal(target, ShaderStage::TessellationControl, HullCode, "outside its patch's quad factors", {{3u, 3u, 2u, 2u, 2u}, Indices});
         ExpectRefusal(target, ShaderStage::TessellationControl, HullDescendingRecords, "not affine");
         ExpectRefusal(target, ShaderStage::TessellationControl, HullDescendingRecords, "not affine", {{3u, 3u, 1u, 2u, 2u, 1.0f, 64.0f, 158u}, Indices});
