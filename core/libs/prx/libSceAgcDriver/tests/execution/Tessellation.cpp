@@ -112,6 +112,27 @@ alignas(256) constexpr std::array<std::uint32_t, 49> HullAndSaveexec{
     0xbf810000,
 };
 
+alignas(256) constexpr std::array<std::uint32_t, 57> HullSaveexecLoop{
+    0xd7650000, 0x000100c1, 0xd7660000, 0x000200c1, 0xbf8a0000, 0x7da206f9, 0x81060000, 0xd5480014,
+    0x02151101, 0x362402ff, 0x000000ff, 0x160028a0, 0xd5430015, 0x040224ff, 0x00000060, 0xdbfc0000,
+    0x02000015, 0x162c2890, 0xd5430016, 0x045a24ff, 0x00000030, 0xbf8cc07f, 0xbe980382, 0xbe9a0480,
+    0x7d882881, 0xbe96246a, 0x889a7e1a, 0xbefe0416, 0x80988118, 0xbf078018, 0xbf85fff9, 0xe0781000,
+    0x02020216, 0x7d882881, 0xbe94246a, 0xb06a0060, 0x162602f9, 0x0086066a, 0xd8d80008, 0x06000013,
+    0xd8dc1008, 0x07000013, 0xbf8cc07f, 0x7e300306, 0x7e320306, 0x7e340306, 0x7e360306, 0x34142484,
+    0xe0781000, 0x0403180a, 0x4a162481, 0x16161690, 0x4c1616ff, 0x00008000, 0xe0741000, 0x0202070b,
+    0xbf810000,
+};
+
+alignas(256) constexpr std::array<std::uint32_t, 50> HullLaneCount{
+    0xd7650000, 0x000100c1, 0xd7660000, 0x000200c1, 0xbf8a0000, 0x7da206f9, 0x81060000, 0xd5480014,
+    0x02151101, 0x362402ff, 0x000000ff, 0x160028a0, 0xd5430015, 0x040224ff, 0x00000060, 0xdbfc0000,
+    0x02000015, 0x162c2890, 0xd5430016, 0x045a24ff, 0x00000030, 0xbf8cc07f, 0xe0781000, 0x02020216,
+    0x7da82881, 0xbe98107e, 0xbe94047e, 0xb06a0060, 0x162602f9, 0x0086066a, 0xd8d80008, 0x06000013,
+    0xd8dc1008, 0x07000013, 0xbf8cc07f, 0x7e300218, 0x7e320306, 0x7e340306, 0x7e360306, 0x34142484,
+    0xbefe0414, 0xe0781000, 0x0403180a, 0x4a162481, 0x16161690, 0x4c1616ff, 0x00008000, 0xe0741000,
+    0x0202070b, 0xbf810000,
+};
+
 alignas(256) constexpr std::array<std::uint32_t, 39> DomainPatchRead{
     0xf8000941, 0x00000000, 0x34020e84, 0x16020283, 0xe0341000, 0x04030a01, 0xe0341010, 0x04030c01,
     0xe0341020, 0x04030e01, 0x4a060e81, 0x160606ff, 0x000000d0, 0x4c0606ff, 0x00008000, 0xe0301064,
@@ -476,7 +497,7 @@ int main() {
         }
         ExpectRefusal(target, ShaderStage::TessellationControl, HullUnguardedFactors, "not written by control point 0 alone");
         ExpectRefusal(target, ShaderStage::TessellationControl, HullSquaredAddress, "not affine");
-        ExpectRefusal(target, ShaderStage::TessellationControl, HullAndSaveexec, "lane mask");
+        ExpectRefusal(target, ShaderStage::TessellationControl, HullLaneCount, "lane mask");
         ExpectRefusal(target, ShaderStage::TessellationEvaluation, DomainNeighbourRecord, "more than one patch-constant record", RecordPatches);
         ExpectRefusal(target, ShaderStage::TessellationEvaluation, DomainFixedPatchRead, "not indexed by its relative patch", RecordPatches);
         ExpectRefusal(target, ShaderStage::TessellationEvaluation, DomainNeighbourPoint, "neither its patch's control points nor a patch-constant record", RecordPatches);
@@ -488,6 +509,8 @@ int main() {
 
         RequirePatches(*device, target, HullCode, "hull program");
         RequirePatches(*device, target, HullRestoredExecSaved, "hull program saving its restored exec");
+        RequirePatches(*device, target, HullAndSaveexec, "hull program narrowing exec with s_and_saveexec_b64");
+        RequirePatches(*device, target, HullSaveexecLoop, "hull program restoring exec through loop phis");
         RequirePatches(*device, target, HullDescendingRecords, "hull program with descending patch records in 157-patch groups", {{3u, 3u, 1u, 2u, 2u, 1.0f, 64.0f, 157u}, Indices});
         RequireCounterClockwise(*device, target);
         RequireLevelClamps(*device, target);
