@@ -485,14 +485,7 @@ public:
         : program(program), tessellation(tessellation), stage(program.Resources().stage), evaluator(stage == IrShaderStage::TessellationControl ? tessellation.outputControlPoints : 0u, stage == IrShaderStage::Local ? LocalVertexIndexCount : static_cast<std::int64_t>(tessellation.patchesPerGroup)) {}
 
     void Run() {
-        LaneBits laneBits(program);
-        for (IrBlock* block : program.BlockOrder()) {
-            for (IrValue* inst : block->Instructions()) {
-                const auto words = LaneBitWords(inst, program.WaveSize());
-                if (!words) continue;
-                if (IrValue* bit = laneBits.Of(*words)) inst->ReplaceAllUsesWith(bit);
-            }
-        }
+        if (stage == IrShaderStage::TessellationControl) lowerOwnLaneBits();
         collect();
         derive();
         for (const auto& access : accesses) rewrite(access);
@@ -523,6 +516,17 @@ public:
     }
 
 private:
+    void lowerOwnLaneBits() {
+        LaneBits laneBits(program);
+        for (IrBlock* block : program.BlockOrder()) {
+            for (IrValue* inst : block->Instructions()) {
+                const auto words = LaneBitWords(inst, program.WaveSize());
+                if (!words) continue;
+                if (IrValue* bit = laneBits.Of(*words)) inst->ReplaceAllUsesWith(bit);
+            }
+        }
+    }
+
     void collect() {
         const auto& memoryInfo = program.Resources().memoryInfo;
         for (IrBlock* block : program.BlockOrder()) {
