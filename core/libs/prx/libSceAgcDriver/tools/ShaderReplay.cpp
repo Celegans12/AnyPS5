@@ -8,6 +8,7 @@
 #include "Recompiler.hpp"
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/PipelineFingerprint.hpp"
 
 #if ANYPS5_ENABLE_SPIRV_TOOLS
 #include "spirv-tools/libspirv.hpp"
@@ -54,6 +55,8 @@ bool g_maintenance8 = false;
 bool g_code = false;
 bool g_prepareOnly = false;
 bool g_pipelineOnly = false;
+int g_requests = 0;
+bool g_noReference = false;
 std::string g_expectedSpirv;
 
 void ConfigurePipelineReplay(int argc, char** argv) {
@@ -63,6 +66,7 @@ void ConfigurePipelineReplay(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         const std::string option(argv[i]);
         if (option == "--pipeline-only") g_pipelineOnly = true;
+        if (option == "--no-reference") g_noReference = true;
         if (option == "--prepare-only") prepare = true;
         if (option == "--maintenance8") maintenance = true;
         if (option == "--expect-spv") {
@@ -77,12 +81,11 @@ void ConfigurePipelineReplay(int argc, char** argv) {
         }
     }
     if (!g_pipelineOnly) {
-        if (!cache.empty() || !g_expectedSpirv.empty()) throw std::runtime_error("--pipeline-cache and --expect-spv require --pipeline-only");
+        if (!cache.empty() || !g_expectedSpirv.empty() || g_noReference) throw std::runtime_error("--pipeline-cache, --expect-spv and --no-reference require --pipeline-only");
         return;
     }
     if (prepare || maintenance) throw std::runtime_error("--pipeline-only cannot be combined with --prepare-only or --maintenance8");
     if (cache.empty()) throw std::runtime_error("--pipeline-only requires --pipeline-cache");
-    if (g_expectedSpirv.empty()) throw std::runtime_error("--pipeline-only requires --expect-spv");
     if (std::getenv("ANYPS5_NO_SHADER_CACHE") != nullptr) throw std::runtime_error("--pipeline-only requires ANYPS5_NO_SHADER_CACHE to be unset");
     const std::filesystem::path directory(cache);
     if (!directory.is_absolute() || !std::filesystem::is_directory(directory)) throw std::runtime_error("--pipeline-cache must be an existing absolute private directory");
@@ -110,6 +113,35 @@ void CheckExpectedSpirv(std::span<const std::uint32_t> words) {
     std::printf("  expected SPIR-V matches: %zu bytes\n", words.size_bytes());
 }
 
+// --pipeline-only: each request needs a reference, the byte-exact SPIR-V of an ordinary replay (--expect-spv,
+// one request) or the .fp sidecar the driver saved with it (APS5_PIPELINE_REQUESTS), whose fingerprint covers
+// everything the pipeline create info takes from the recompile. Returns a refusal text, empty when it matches.
+std::string CheckPipelineReference(const char* path, const ShaderRecompiler::RecompileResult& result) {
+    std::filesystem::path sidecar(path);
+    sidecar.replace_extension(".fp");
+    const auto fingerprint = AgcDriver::ComputePipelineFingerprint(result);
+    std::printf("  pipeline fingerprint: %016llx\n", static_cast<unsigned long long>(fingerprint));
+    if (std::filesystem::exists(sidecar)) {
+        std::ifstream file(sidecar);
+        std::string key;
+        std::string value;
+        while (file >> key >> value) {
+            if (key != "fingerprint") continue;
+            if (std::stoull(value, nullptr, 16) != fingerprint) return "fingerprint differs from the game's (" + value + " in " + sidecar.string() + ")";
+            std::printf("  game fingerprint matches: %s\n", sidecar.string().c_str());
+            return {};
+        }
+        return "sidecar " + sidecar.string() + " has no fingerprint";
+    }
+    if (g_noReference) {
+        std::printf("  no reference (--no-reference): this replay's own SPIR-V; only a hit in the game's cache proves it is the game's pipeline\n");
+        return {};
+    }
+    if (g_expectedSpirv.empty()) return "no reference: give --expect-spv or --no-reference, or keep the request's .fp sidecar next to it";
+    CheckExpectedSpirv(result.spirv);
+    return {};
+}
+
 void InspectSpirv(const char* path, std::span<const std::uint32_t> words) {
     if (g_spirv) {
         std::string name(path);
@@ -132,6 +164,7 @@ void InspectSpirv(const char* path, std::span<const std::uint32_t> words) {
 bool Replay(const char* path, std::unique_ptr<AgcDriver::VulkanDevice>& device) {
     auto request = ShaderRecompiler::RequestSerializer{}.Deserialize(ReadText(path));
     if (g_pipelineOnly) {
+        if (!g_expectedSpirv.empty() && g_requests > 1) throw std::runtime_error("--expect-spv takes one request; several requests need their .fp sidecars");
         if (request.request.shader.stage != ShaderRecompiler::ShaderStage::Compute || !request.request.context.compute.has_value() || request.request.graphics.has_value()) throw std::runtime_error("pipeline-only requires a compute request");
     }
     std::printf("%s: %zu code words, %zu user data, %zu memory regions, wave%u\n", path, request.request.shader.code.size(), request.request.context.userData.size(), request.request.context.memory.size(), request.request.context.waveSize);
@@ -217,7 +250,9 @@ bool Replay(const char* path, std::unique_ptr<AgcDriver::VulkanDevice>& device) 
         }
         const auto result = ShaderRecompiler::Recompile(request.request);
         std::printf("  recompiled: %zu SPIR-V words\n", result.spirv.size());
-        if (g_pipelineOnly) CheckExpectedSpirv(result.spirv);
+        if (g_pipelineOnly) {
+            if (const auto refusal = CheckPipelineReference(path, result); !refusal.empty()) throw std::runtime_error("pipeline-only " + refusal);
+        }
         InspectSpirv(path, result.spirv);
         if (g_pipelineOnly) {
             if (!device) device = std::make_unique<AgcDriver::VulkanDevice>();
@@ -230,6 +265,8 @@ bool Replay(const char* path, std::unique_ptr<AgcDriver::VulkanDevice>& device) 
             std::fflush(stdout);
             const auto elapsed = device->WarmComputePipeline(result, request.request.shader.codeAddress);
             std::printf("  native pipeline complete: %.3f ms; no guest resources or dispatch\n", elapsed);
+            std::printf("PIPELINE-RESULT %s words=%zu fingerprint=%016llx create_ms=%.3f\n", path, result.spirv.size(), static_cast<unsigned long long>(AgcDriver::ComputePipelineFingerprint(result)), elapsed);
+            std::fflush(stdout);
         }
         if (g_memory) {
             for (const auto& binding : result.bindings) {
@@ -252,7 +289,7 @@ bool Replay(const char* path, std::unique_ptr<AgcDriver::VulkanDevice>& device) 
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] [--code] [--maintenance8] [--prepare-only | --pipeline-only --pipeline-cache DIR --expect-spv FILE] <shader.req>...\n  --prepare-only plans and compiles without materializing runtime memory\n  --pipeline-only recompiles captured compute inputs and creates the native pipeline without guest resources or dispatch\n  --pipeline-cache selects an existing private cache directory; __GL_SHADER_DISK_CACHE_PATH must select a separate fresh empty directory\n  --expect-spv requires byte equality with an ordinary replay before device creation\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set\n");
+        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] [--code] [--maintenance8] [--prepare-only | --pipeline-only --pipeline-cache DIR [--expect-spv FILE | --no-reference]] <shader.req>...\n  --prepare-only plans and compiles without materializing runtime memory\n  --pipeline-only recompiles captured compute inputs and creates the native pipeline without guest resources or dispatch\n  --pipeline-cache selects an existing private cache directory; __GL_SHADER_DISK_CACHE_PATH must select a separate fresh empty directory\n  --expect-spv requires byte equality with an ordinary replay before device creation (one request); without it each\n    request needs the .fp sidecar APS5_PIPELINE_REQUESTS saved next to it, and its pipeline fingerprint must match\n  --no-reference skips that check (requests from older runs); a hit in the game's pipeline cache then proves the match\n  several requests share one device and cache; each success prints a PIPELINE-RESULT line\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set\n");
         return 2;
     }
     try {
@@ -261,10 +298,15 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "%s\n", error.what());
         return 2;
     }
+    for (int i = 1; i < argc; ++i) {
+        const std::string option(argv[i]);
+        if (option == "--pipeline-cache" || option == "--expect-spv") ++i;
+        else if (!option.starts_with("--")) ++g_requests;
+    }
     std::unique_ptr<AgcDriver::VulkanDevice> device;
     int failures = 0;
     for (int i = 1; i < argc; ++i) {
-        if (std::string(argv[i]) == "--pipeline-only") continue;
+        if (std::string(argv[i]) == "--pipeline-only" || std::string(argv[i]) == "--no-reference") continue;
         if (std::string(argv[i]) == "--pipeline-cache" || std::string(argv[i]) == "--expect-spv") {
             ++i;
             continue;

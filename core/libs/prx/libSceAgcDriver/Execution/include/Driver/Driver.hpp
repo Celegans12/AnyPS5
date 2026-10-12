@@ -67,6 +67,10 @@ public:
     static void FoldDrawOffsets(const ShaderRecompiler::RecompileResult& result, const DrawProgram& program, Pm4::DrawParameters& parameters);
     static std::optional<Graphics::IndirectDrawPath> ClassifyIndirectDraw(const ShaderRecompiler::RecompileResult& result, const Graphics::State& graphics, const DrawProgram& frontProgram, const std::shared_ptr<VulkanDevice>& localDevice, Pm4::DrawParameters& drawParameters, bool traceIndirect);
     static std::string dumpRequest(std::uint64_t address, const ShaderRecompiler::RecompileRequest& request);
+    // APS5_PIPELINE_REQUESTS=<dir>: saves the request of each compute variant of at least
+    // APS5_PIPELINE_REQUESTS_MIN_WORDS SPIR-V words (default 500000) as c_<words>_<address>_<fingerprint>.req
+    // with a .fp sidecar, once per pipeline fingerprint, for offline precompiling (agc_shader_replay --pipeline-only).
+    static void capturePipelineRequest(std::uint64_t address, const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::RecompileResult& result) noexcept;
     // APS5_SKIP_REFUSED_SHADERS: reports a refused preparation on the title's thread once and lets the open
     // preparation transaction commit what was prepared before it.
     static void SkipRefusedPreparation(const ShaderRefusal& refusal);

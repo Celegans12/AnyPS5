@@ -1,10 +1,12 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/PipelineFingerprint.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderPreparation.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iterator>
 #include <stdexcept>
@@ -91,6 +93,52 @@ std::string Driver::dumpRequest(std::uint64_t address, const ShaderRecompiler::R
         std::fprintf(stderr, "[gpu] could not serialize request for 0x%llx: %s\n", static_cast<unsigned long long>(address), error.what());
     }
     return name;
+}
+
+void Driver::capturePipelineRequest(std::uint64_t address, const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::RecompileResult& result) noexcept {
+    static const char* directory = [] {
+        const char* value = std::getenv("APS5_PIPELINE_REQUESTS");
+        return value != nullptr && *value != '\0' ? value : nullptr;
+    }();
+    if (directory == nullptr || request.shader.stage != ShaderRecompiler::ShaderStage::Compute || request.graphics.has_value()) return;
+    static const std::size_t minimum = [] {
+        const char* value = std::getenv("APS5_PIPELINE_REQUESTS_MIN_WORDS");
+        return value != nullptr && *value != '\0' ? static_cast<std::size_t>(std::strtoull(value, nullptr, 10)) : std::size_t{500000};
+    }();
+    static std::mutex savedMutex;
+    static std::set<std::uint64_t> saved;
+    try {
+        const auto words = result.spirv.size();
+        if (words < minimum) return;
+        const auto fingerprint = ComputePipelineFingerprint(result);
+        {
+            std::lock_guard lock(savedMutex);
+            if (!saved.insert(fingerprint).second) return;
+        }
+        char stem[96];
+        std::snprintf(stem, sizeof(stem), "c_%07zu_%llx_%016llx", words, static_cast<unsigned long long>(address), static_cast<unsigned long long>(fingerprint));
+        const std::filesystem::path folder(directory);
+        std::filesystem::create_directories(folder);
+        const auto target = folder / (std::string(stem) + ".req");
+        if (std::filesystem::exists(target)) return;
+        const auto write = [](const std::filesystem::path& path, std::string_view text) {
+            const auto temporary = std::filesystem::path(path.string() + ".tmp");
+            {
+                std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
+                file.write(text.data(), static_cast<std::streamsize>(text.size()));
+                if (!file) throw std::runtime_error("cannot write " + temporary.string());
+            }
+            std::filesystem::rename(temporary, path);
+        };
+        char sidecar[192];
+        std::snprintf(sidecar, sizeof(sidecar), "fingerprint %016llx\nwords %zu\naddress 0x%llx\nvariant %016llx\n", static_cast<unsigned long long>(fingerprint), words, static_cast<unsigned long long>(address), static_cast<unsigned long long>(result.PipelineVariantId()));
+        write(folder / (std::string(stem) + ".fp"), sidecar);
+        write(target, ShaderRecompiler::RequestSerializer{}.Serialize(request));
+        std::fprintf(stderr, "[pipeline-requests] saved %s.req (%zu SPIR-V words, program 0x%llx)\n", stem, words, static_cast<unsigned long long>(address));
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "[pipeline-requests] could not save the request of program 0x%llx: %s\n", static_cast<unsigned long long>(address), error.what());
+    } catch (...) {
+    }
 }
 
 bool CaptureTerminalComputeFailure(const ShaderRecompiler::RecompileRequest& request, std::span<const ShaderRecompiler::MemoryRegion> captured, const char* error, std::uint32_t queue, std::uint64_t serial, std::size_t packetOffset, const char* directory) noexcept {
