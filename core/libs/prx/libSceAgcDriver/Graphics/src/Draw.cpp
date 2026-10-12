@@ -693,6 +693,7 @@ bool ValidationKey(const Context& context, std::span<const CompiledShader> shade
             add(std::bit_cast<std::uint32_t>(tessellation.minLevel));
             add(std::bit_cast<std::uint32_t>(tessellation.maxLevel));
             add(tessellation.patchesPerGroup);
+            add(tessellation.primitiveGroupSize);
         }
     }
     return keyed;

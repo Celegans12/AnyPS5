@@ -115,6 +115,7 @@ struct ShaderTessellationInputInfo {
     float minLevel = 1.0f;
     float maxLevel = 64.0f;
     std::uint32_t patchesPerGroup = 256;
+    std::uint32_t primitiveGroupSize = 0;
 };
 
 struct ShaderVertexInputInfo {

@@ -718,6 +718,7 @@ void pipelineKey(std::vector<std::byte>& key, const Context& context, const Stat
         append(key, tessellation.minLevel);
         append(key, tessellation.maxLevel);
         append(key, tessellation.patchesPerGroup);
+        append(key, tessellation.primitiveGroupSize);
     }
 }
 
