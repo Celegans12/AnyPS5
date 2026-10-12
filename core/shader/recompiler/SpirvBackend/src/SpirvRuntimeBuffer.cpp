@@ -203,7 +203,7 @@ std::uint32_t byteBuffers(SpirvEmitterState& state) {
     state.module.AddAnnotation(spv::OpDecorate, variable, spv::DecorationDescriptorSet, 0u);
     state.module.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBinding, NativeBinding(state.program.Resources().stage, DescriptorBindingKind::Buffers));
     state.module.AddAnnotation(spv::OpDecorate, variable, spv::DecorationAliased);
-    if (state.storageBufferU64Variable == 0u) state.module.AddAnnotation(spv::OpDecorate, state.storageBufferVariable, spv::DecorationAliased);
+    if (state.storageBufferU64Variable == 0u && state.storageBufferCoherentVariable == 0u) state.module.AddAnnotation(spv::OpDecorate, state.storageBufferVariable, spv::DecorationAliased);
     if (state.requirements.coherentBuffers) state.module.AddAnnotation(spv::OpDecorate, variable, spv::DecorationCoherent);
     state.storageBufferU8Variable = variable;
     return variable;
