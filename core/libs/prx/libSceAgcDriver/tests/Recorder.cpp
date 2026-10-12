@@ -3395,10 +3395,16 @@ void drawInputInPlaceTests(const Device& device, Recorder& recorder) {
     Require(InPlaceDrawInput(context, vertices + 2, 256, 2) != nullptr, "an aligned 16-bit draw input was not bound in place");
     recorder.NotePendingWrite(address + 8192, 16);
     Require(InPlaceDrawInput(context, address + 8192, 256, 4) != nullptr && !recorder.PendingWriteOverlaps(address + 8192, 256), "a draw input under a pending GPU write was bound before the write completed");
+    bool behind = false;
+    Require(InPlaceDrawInput(context, address + 20480, 256, 4, &behind) != nullptr && !behind, "a vertex input free of pending GPU writes was marked as ordered behind one");
+    recorder.NotePendingWrite(address + 20480, 16);
+    Require(InPlaceDrawInput(context, address + 20480, 256, 4, &behind) != nullptr && behind && recorder.PendingWriteOverlaps(address + 20480, 256), "a vertex input under a pending GPU write was not bound in place behind it");
     const std::array<std::byte, 4> label{std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}};
     recorder.RecordStore(import->buffer, address + 12288 - import->base, label, address + 12288);
     Require(recorder.QueuedStoreOverlaps(address + 12288, 4), "the label store was not queued");
     Require(InPlaceDrawInput(context, address + 12288, 256, 4) == nullptr, "a draw input under a queued label store was bound in place");
+    behind = false;
+    Require(InPlaceDrawInput(context, address + 12288, 256, 4, &behind) == nullptr, "a vertex input under a queued label store was bound in place");
     Require(InPlaceDrawInput(context, address + 16384, 256, 4) != nullptr, "a queued label store refused a disjoint draw input");
     alignas(64) static std::array<std::byte, 256> unregistered{};
     Require(InPlaceDrawInput(context, reinterpret_cast<std::uint64_t>(unregistered.data()), unregistered.size(), 4) == nullptr, "memory without a host import was bound in place");
@@ -7609,7 +7615,7 @@ bool vertexTargetRangeTests(const Device& device, Recorder& recorder, bool impor
         Draw(context, consumer, draw, shaders, {}, &recipe);
         WaitForOptimizedPipelines(context.device);
         const auto read = recorder.DescribePendingRead(address + unit, 16);
-        Require(read.has_value() == imported && (!read || read->kind == Recorder::ReadKind::DrawInput), "the vertex regression used the wrong copied/imported path");
+        Require(read.has_value() == imported && (!read || read->kind == Recorder::ReadKind::DrawInput || read->kind == Recorder::ReadKind::StorageUpload), "the vertex regression used the wrong copied/imported path");
         check(16);
         Require(recipe != nullptr, "the range regression did not create a draw recipe");
         std::vector<std::byte> cleared(unit);
