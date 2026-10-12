@@ -1,12 +1,20 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
 #include "Recompiler.hpp"
 #include "SceShaders.hpp"
 #include "VulkanTestDevice.hpp"
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 #include <algorithm>
 #include <array>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <optional>
 #include <span>
@@ -21,7 +29,9 @@ using ShaderRecompiler::ShaderStage;
 constexpr std::uint32_t Width = 256;
 constexpr std::uint32_t Height = 80;
 constexpr std::array<std::uint8_t, 4> Background{16, 24, 40, 255};
+constexpr std::size_t GuestBytes = 65536;
 alignas(256) std::array<std::byte, Width * Height * 4> Pixels{};
+std::array<std::uint32_t, 16> HullUserData{0x1000u};
 
 alignas(256) constexpr std::array<std::uint32_t, 29> LocalCode{
     0xd5480004, 0x02090502, 0xd5480005, 0x02090102, 0xd5480006, 0x02110902, 0xd5480007, 0x02111102,
@@ -143,6 +153,26 @@ alignas(256) constexpr std::array<std::uint32_t, 50> HullLaneCount{
     0x0202070b, 0xbf810000,
 };
 
+alignas(256) constexpr std::array<std::uint32_t, 54> HullBdaScale{
+    0xd7650000, 0x000100c1, 0xd7660000, 0x000200c1, 0xbf8a0000, 0x7da206f9, 0x81060000, 0xd5480014,
+    0x02151101, 0x362402ff, 0x000000ff, 0x160028a0, 0xd5430015, 0x040224ff, 0x00000060, 0xdbfc0000,
+    0x02000015, 0x162c2890, 0xd5430016, 0x045a24ff, 0x00000030, 0xbf8cc07f, 0xe0781000, 0x02020216,
+    0x7da82881, 0xbe94047e, 0xb06a0060, 0x162602f9, 0x0086066a, 0xd8d80008, 0x06000013, 0xd8dc1008,
+    0x07000013, 0xbf8cc07f, 0x7e180280, 0xdc308000, 0x0d06000c, 0xbf8c3f70, 0x100c1b06, 0x7e300306,
+    0x7e320306, 0x7e340306, 0x7e360306, 0x34142484, 0xbefe0414, 0xe0781000, 0x0403180a, 0x4a162481,
+    0x16161690, 0x4c1616ff, 0x00008000, 0xe0741000, 0x0202070b, 0xbf810000,
+};
+
+alignas(256) constexpr std::array<std::uint32_t, 53> HullBdaScaleWithoutBarrier{
+    0xd7650000, 0x000100c1, 0xd7660000, 0x000200c1, 0x7da206f9, 0x81060000, 0xd5480014, 0x02151101,
+    0x362402ff, 0x000000ff, 0x160028a0, 0xd5430015, 0x040224ff, 0x00000060, 0xdbfc0000, 0x02000015,
+    0x162c2890, 0xd5430016, 0x045a24ff, 0x00000030, 0xbf8cc07f, 0xe0781000, 0x02020216, 0x7da82881,
+    0xbe94047e, 0xb06a0060, 0x162602f9, 0x0086066a, 0xd8d80008, 0x06000013, 0xd8dc1008, 0x07000013,
+    0xbf8cc07f, 0x7e180280, 0xdc308000, 0x0d06000c, 0xbf8c3f70, 0x100c1b06, 0x7e300306, 0x7e320306,
+    0x7e340306, 0x7e360306, 0x34142484, 0xbefe0414, 0xe0781000, 0x0403180a, 0x4a162481, 0x16161690,
+    0x4c1616ff, 0x00008000, 0xe0741000, 0x0202070b, 0xbf810000,
+};
+
 alignas(256) constexpr std::array<std::uint32_t, 39> DomainPatchRead{
     0xf8000941, 0x00000000, 0x34020e84, 0x16020283, 0xe0341000, 0x04030a01, 0xe0341010, 0x04030c01,
     0xe0341020, 0x04030e01, 0x4a060e81, 0x160606ff, 0x000000d0, 0x4c0606ff, 0x00008000, 0xe0301064,
@@ -242,11 +272,10 @@ struct Stages {
 };
 
 ShaderRecompiler::RecompileResult Compile(const ShaderRecompiler::SpirvTarget& target, ShaderStage stage, std::span<const std::uint32_t> code, std::uint32_t& pushCursor, const PatchDraw& patches = Triangles) {
-    static const std::array<std::uint32_t, 16> hullUserData{0x1000u};
     static const std::array<std::uint32_t, 8> domainUserData{};
     const std::array<ShaderRecompiler::MemoryRegion, 1> memory{{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)}}};
     const bool hull = stage == ShaderStage::TessellationControl;
-    const auto userData = hull ? std::span<const std::uint32_t>(hullUserData) : stage == ShaderStage::TessellationEvaluation ? std::span<const std::uint32_t>(domainUserData) : std::span<const std::uint32_t>();
+    const auto userData = hull ? std::span<const std::uint32_t>(HullUserData) : stage == ShaderStage::TessellationEvaluation ? std::span<const std::uint32_t>(domainUserData) : std::span<const std::uint32_t>();
     std::optional<ShaderRecompiler::ShaderPixelStageInfo> pixel;
     std::optional<ShaderRecompiler::ShaderVertexStageInfo> vertex;
     std::optional<ShaderRecompiler::GraphicsCompileContext> graphics;
@@ -441,6 +470,74 @@ void RequireRelativePatches(AgcDriver::VulkanDevice& device, const ShaderRecompi
     }
 }
 
+class GuestBlock {
+public:
+    GuestBlock() {
+#ifdef _WIN32
+        block = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, 2 * GuestBytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+#else
+        block = static_cast<std::uint8_t*>(std::aligned_alloc(GuestBytes, 2 * GuestBytes));
+#endif
+        Require(block != nullptr, "tessellation: cannot allocate the guest block");
+        std::memset(block, 0, 2 * GuestBytes);
+        GuestAllocations::Mutation().Add(block, GuestBytes, true, true, true);
+    }
+
+    ~GuestBlock() {
+        GuestAllocations::Mutation().Remove(block);
+#ifdef _WIN32
+        VirtualFree(block, 0, MEM_RELEASE);
+#else
+        std::free(block);
+#endif
+    }
+
+    GuestBlock(const GuestBlock&) = delete;
+    GuestBlock& operator=(const GuestBlock&) = delete;
+
+    std::uint8_t* Data() { return block; }
+    std::uint64_t Address() const { return reinterpret_cast<std::uintptr_t>(block); }
+
+private:
+    std::uint8_t* block = nullptr;
+};
+
+void RequireHullBdaReads(AgcDriver::VulkanDevice& device, const ShaderRecompiler::SpirvTarget& target) {
+    GuestBlock guest;
+    const float scale = 1.0f;
+    std::memcpy(guest.Data(), &scale, sizeof(scale));
+    const auto address = [](std::uint64_t value) {
+        HullUserData[6] = static_cast<std::uint32_t>(value);
+        HullUserData[7] = static_cast<std::uint32_t>(value >> 32u);
+    };
+    const bool llvmpipe = device.DeviceName().starts_with("llvmpipe");
+    for (const auto& [hull, program] : {std::pair{std::span<const std::uint32_t>(HullBdaScale), std::string("hull program scaling its levels by a BDA read after s_barrier")}, std::pair{std::span<const std::uint32_t>(HullBdaScaleWithoutBarrier), std::string("hull program scaling its levels by a BDA read without s_barrier")}}) {
+        address(guest.Address());
+        RequirePatches(device, target, hull, program);
+        if (llvmpipe) {
+            std::puts(("skipped the unmapped read of the " + program + ": llvmpipe runs tessellation-control loads that the check of the unmapped address skips").c_str());
+            continue;
+        }
+        address(guest.Address() + GuestBytes);
+        std::uint32_t cursor = 0;
+        const Stages stages{
+            Compile(target, ShaderStage::Local, LocalCode, cursor),
+            Compile(target, ShaderStage::TessellationControl, hull, cursor),
+            Compile(target, ShaderStage::TessellationEvaluation, DomainCode, cursor),
+            Compile(target, ShaderStage::Fragment, PixelCode, cursor),
+        };
+        std::string failure;
+        try {
+            Draw(device, stages, VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE);
+        } catch (const std::exception& error) {
+            failure = error.what();
+        }
+        device.WaitIdle();
+        Require(failure.find("BDA access failed") != std::string::npos && failure.find("stage=7 reason=1") != std::string::npos, program + ": the unmapped read was reported as \"" + failure + "\", not as a tessellation-control BDA fault");
+    }
+    address(0u);
+}
+
 void RequireQuads(AgcDriver::VulkanDevice& device, const ShaderRecompiler::SpirvTarget& target) {
     const auto center = Row(0.0f);
     std::array<bool, 2> frontFacing{};
@@ -548,6 +645,7 @@ int main() {
         RequireQuads(*device, target);
         RequirePatchConstants(*device, target);
         RequireRelativePatches(*device, target);
+        RequireHullBdaReads(*device, target);
         device.reset();
         RequireRegisteredStages();
         std::puts("Tessellation tests passed");
