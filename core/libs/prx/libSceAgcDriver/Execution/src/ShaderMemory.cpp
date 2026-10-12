@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "Optimization/RequestMemoryView.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
@@ -94,10 +95,15 @@ ShaderMemory::ShaderMemory(std::span<const ShaderRecompiler::MemoryRegion> regio
     }
 }
 
+ShaderMemory::~ShaderMemory() {
+    MemoryStats::Add(MemoryStats::Counter::ShaderMemoryPages, -static_cast<std::int64_t>(pages.size() * sizeof(Page)), -static_cast<std::int64_t>(pages.size()));
+}
+
 ShaderMemory::Page& ShaderMemory::page(std::uint64_t base) {
     const auto found = pages.find(base);
     if (found != pages.end()) return found->second;
     auto& page = pages[base];
+    MemoryStats::Add(MemoryStats::Counter::ShaderMemoryPages, sizeof(Page));
     ++CaptureTotals().pages;
     // A page is either mapped whole or read word by word where the guest mapped less than a page,
     // or where recorded GPU work writes into it (a whole-page read would wait for that work).

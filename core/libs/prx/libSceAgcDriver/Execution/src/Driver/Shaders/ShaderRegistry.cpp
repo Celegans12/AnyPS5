@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderMemoryCensus.hpp"
+#include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "CacheKey.hpp"
@@ -827,6 +828,11 @@ public:
         task();
     }
 
+    std::pair<std::size_t, unsigned> Load() {
+        std::lock_guard lock(mutex);
+        return {tasks.size(), running};
+    }
+
     void Close() {
         std::unique_lock lock(mutex);
         closed = true;
@@ -1321,6 +1327,99 @@ void Driver::RegisterShader(const Shader* shader) {
         lock.unlock();
         ReportRegisteredShaderMemory(*registry, "registration");
     }
+}
+
+}
+
+namespace AgcDriver::DriverDetail {
+
+// DEBUG (APS5_MEM_STATS): sampled on the reporter thread. Compiled results pinned by the caches are
+// deduplicated by result object, their SPIR-V by specialization id (a specialized module) or else by
+// variant id (the artifact itself); InspectStorage does not hydrate cold SPIR-V.
+void Driver::AppendMemoryStats(std::string& line) {
+    auto& driver = Get();
+    std::shared_ptr<const ShaderRegistry> registry;
+    for (int attempt = 0; attempt < 50 && registry == nullptr; ++attempt) {
+        std::unique_lock lock(driver.mutex, std::try_to_lock);
+        if (lock.owns_lock()) registry = driver.shaders;
+        else std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    if (registry != nullptr) {
+        const auto m = InspectRegisteredShaderMemory(*registry);
+        MemoryStats::AppendCount(line, "reg_snapshots", m.snapshots);
+        MemoryStats::AppendMiB(line, "reg_code", m.codeCapacityBytes + m.headerCapacityBytes);
+        MemoryStats::AppendCount(line, "reg_pending", m.pending);
+        MemoryStats::AppendMiB(line, "reg_spirv_logical", m.logicalBytes, m.artifacts);
+        MemoryStats::AppendMiB(line, "reg_spirv_resident", m.rawCapacityBytes, m.rawArtifacts);
+        MemoryStats::AppendMiB(line, "reg_spirv_cold_ram", m.coldCapacityBytes, m.coldArtifacts - m.fileArtifacts - m.cacheArtifacts);
+        MemoryStats::AppendMiB(line, "reg_spirv_cold_file", m.fileBytes, m.fileArtifacts);
+        MemoryStats::AppendMiB(line, "reg_spirv_cache_backed", m.cacheBytes, m.cacheArtifacts);
+        MemoryStats::AppendCount(line, "reg_spirv_exposed", m.exposedArtifacts);
+        MemoryStats::AppendCount(line, "reg_sources", m.sources);
+    } else {
+        line += " reg=busy";
+    }
+    const auto [queued, running] = RegistrationPreparePool::Instance().Load();
+    MemoryStats::AppendCount(line, "prepare_queued", queued);
+    MemoryStats::AppendCount(line, "prepare_running", running);
+
+    std::unordered_set<const ShaderRecompiler::RecompileResult*> results;
+    std::unordered_set<const ShaderSnapshot*> snapshots;
+    std::unordered_set<std::uint64_t> modules;
+    std::uint64_t residentSpirv = 0, logicalSpirv = 0, residentModules = 0, snapshotBytes = 0, variantCount = 0;
+    std::uint64_t specialized = 0, specializedBytes = 0;
+    const auto visit = [&](const DispatchVariant& variant) {
+        ++variantCount;
+        if (variant.shader != nullptr && snapshots.insert(variant.shader.get()).second) snapshotBytes += variant.shader->code.capacity() * sizeof(std::uint32_t) + variant.shader->header.capacity();
+        const auto* result = variant.compiled.get();
+        if (result == nullptr || !results.insert(result).second) return;
+        const auto module = result->specializationId != 0 ? result->specializationId : (result->variantId | (1ull << 63u));
+        if (!modules.insert(module).second) return;
+        const auto storage = result->spirv.InspectStorage();
+        logicalSpirv += storage.logicalBytes;
+        residentSpirv += storage.residentCapacityBytes;
+        residentModules += storage.residentBytes != 0;
+        if (result->specializationId != 0) {
+            ++specialized;
+            specializedBytes += storage.residentCapacityBytes;
+        }
+    };
+    std::size_t dispatchEntries = 0;
+    std::uint64_t dispatchVariantBytes = 0;
+    {
+        std::lock_guard lock(driver.dispatchCacheMutex);
+        dispatchEntries = driver.dispatchCache.size();
+        dispatchVariantBytes = driver.dispatchCacheVariantBytes;
+        for (const auto& [key, entry] : driver.dispatchCache) {
+            for (const auto& variant : entry->variants) if (variant != nullptr) visit(*variant);
+        }
+    }
+    MemoryStats::AppendMiB(line, "dispatch_cache_counted", dispatchVariantBytes, dispatchEntries);
+    std::size_t drawEntries = 0;
+    std::uint64_t drawVariantBytes = 0, drawUserData = 0;
+    {
+        std::lock_guard lock(driver.drawCacheMutex);
+        drawEntries = driver.drawCache.size();
+        drawVariantBytes = driver.drawCacheVariantBytes;
+        for (const auto& [key, entry] : driver.drawCache) {
+            if (entry->decode != nullptr) {
+                for (const auto& program : entry->decode->programs) {
+                    drawUserData += program.userData.capacity() * sizeof(std::uint32_t);
+                    if (program.snapshot != nullptr && snapshots.insert(program.snapshot.get()).second) snapshotBytes += program.snapshot->code.capacity() * sizeof(std::uint32_t) + program.snapshot->header.capacity();
+                }
+            }
+            for (const auto& stage : entry->stages) {
+                for (const auto& variant : stage) if (variant != nullptr) visit(*variant);
+            }
+        }
+    }
+    MemoryStats::AppendMiB(line, "draw_cache_counted", drawVariantBytes + drawUserData, drawEntries);
+    MemoryStats::AppendCount(line, "cache_variants", variantCount);
+    MemoryStats::AppendCount(line, "cache_results", results.size());
+    MemoryStats::AppendMiB(line, "cache_snapshot_code", snapshotBytes, snapshots.size());
+    MemoryStats::AppendMiB(line, "cache_spirv_logical", logicalSpirv, modules.size());
+    MemoryStats::AppendMiB(line, "cache_spirv_resident", residentSpirv, residentModules);
+    MemoryStats::AppendMiB(line, "cache_spirv_specialized", specializedBytes, specialized);
 }
 
 }

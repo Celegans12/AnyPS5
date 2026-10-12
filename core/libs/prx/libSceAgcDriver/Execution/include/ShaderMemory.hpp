@@ -56,6 +56,9 @@ public:
     using WaitedMsProvider = double (*)();
     static void SetWaitedMsProvider(WaitedMsProvider provider);
     explicit ShaderMemory(std::span<const ShaderRecompiler::MemoryRegion> initial, PendingWriteQuery pendingWrite = nullptr, PendingWriteObserver observe = nullptr, HookWaitCounter hookWaits = nullptr);
+    ShaderMemory(const ShaderMemory&) = delete;
+    ShaderMemory& operator=(const ShaderMemory&) = delete;
+    ~ShaderMemory();
     // Returns what the capture resolved (plan, snapshot, specialization) for
     // ShaderRecompiler::Recompile(request, capture), which then skips its own materialization. One
     // result per call: the draw path captures several stages on one ShaderMemory. With `handle`

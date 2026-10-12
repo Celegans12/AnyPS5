@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -1929,7 +1930,16 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto elementBytes = BytesPerElement(descriptor.format);
     const auto linearBytes = sliceLinearBytes * arrayLayers;
+    const auto heldBefore = original.capacity() + generationBaseline.capacity();
     original.resize(static_cast<std::size_t>(guestBytes));
+    const struct HeldBytes {
+        const StorageTexture& image;
+        std::size_t before;
+        ~HeldBytes() {
+            const auto after = image.original.capacity() + image.generationBaseline.capacity();
+            MemoryStats::Add(MemoryStats::Counter::StorageTextureOriginal, static_cast<std::int64_t>(after) - static_cast<std::int64_t>(before), before == 0 && after != 0 ? 1 : 0);
+        }
+    } held{*this, heldBefore};
     // A layer selection applies to the direct path alone (the others upload everything); it names
     // array layers, which the tracked layers are when there are several.
     if (layers != nullptr && ((!blockUnits && trackedLayers != arrayLayers) || std::all_of(layers->begin(), layers->end(), [](bool selected) { return selected; }))) layers = nullptr;
@@ -4301,6 +4311,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
 }
 
 StorageTexture::~StorageTexture() {
+    if (const auto held = original.capacity() + generationBaseline.capacity(); held != 0) MemoryStats::Add(MemoryStats::Counter::StorageTextureOriginal, -static_cast<std::int64_t>(held), -1);
     {
         auto& live = Live();
         std::lock_guard lock(live.mutex);

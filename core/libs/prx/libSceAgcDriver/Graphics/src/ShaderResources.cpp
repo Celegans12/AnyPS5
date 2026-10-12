@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -922,6 +923,32 @@ std::uint64_t SampledTextureBudget(const VkPhysicalDeviceMemoryProperties& memor
 bool SampledBudgetReportDue(std::uint64_t reported, std::uint64_t budget, std::chrono::steady_clock::duration sinceReport) {
     const auto change = budget > reported ? budget - reported : reported - budget;
     return change > reported / 10u && sinceReport >= std::chrono::seconds(10);
+}
+
+void AppendTextureMemoryStats(std::string& line) {
+    std::uint64_t snapshotBytes = 0, deviceBytes = 0;
+    std::size_t entries = 0, snapshots = 0, views = 0;
+    {
+        auto& sampled = Textures();
+        std::lock_guard lock(sampled.mutex);
+        entries = sampled.entries.size();
+        deviceBytes = sampled.bytes;
+        for (const auto& entry : sampled.entries) {
+            snapshotBytes += entry.bytes.capacity();
+            snapshots += entry.bytes.capacity() != 0;
+            views += entry.source != nullptr;
+        }
+    }
+    MemoryStats::AppendMiB(line, "tex_sampled_host_snapshots", snapshotBytes, snapshots);
+    MemoryStats::AppendMiB(line, "tex_sampled_device", deviceBytes, entries);
+    MemoryStats::AppendCount(line, "tex_sampled_views", views);
+    std::size_t storageEntries = 0;
+    {
+        auto& storage = StorageTextures();
+        std::lock_guard lock(storage.mutex);
+        storageEntries = storage.entries.size();
+    }
+    MemoryStats::AppendMiB(line, "tex_storage_cache", storageCacheBytes(), storageEntries);
 }
 
 TextureCacheUse TextureCacheUsage() {

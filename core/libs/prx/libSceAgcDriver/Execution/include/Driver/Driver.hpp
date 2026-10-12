@@ -46,6 +46,8 @@ class ShaderRefusal;
 class Driver {
 public:
     static Driver& Get();
+    // APS5_MEM_STATS (see MemoryStats.hpp): registered shaders, the prepare pool and the dispatch/draw caches.
+    static void AppendMemoryStats(std::string& line);
     ~Driver();
     void Shutdown();
     void WaitIdle();

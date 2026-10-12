@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "ThreadOwned.hpp"
@@ -1714,6 +1715,40 @@ std::string AddressCopyOverflow(std::vector<AddressCopy> copies, std::uint64_t l
         message += text;
     }
     return message;
+}
+
+void AppendGuestBufferMemoryStats(std::string& line) {
+    std::uint64_t mirrorBytes = 0, heapBytes = 0, shadowBytes = 0, buffers = 0;
+    std::size_t mirrors = 0, heapMirrors = 0;
+    {
+        auto& state = Mirrors();
+        std::lock_guard lock(state.mutex);
+        mirrors = state.entries.size();
+        for (const auto& [base, mirror] : state.entries) {
+            if (mirror == nullptr) continue;
+            if (mirror->buffer != nullptr) {
+                mirrorBytes += mirror->bytes;
+                ++buffers;
+                if (mirror->heap) {
+                    heapBytes += mirror->bytes;
+                    ++heapMirrors;
+                }
+            }
+            shadowBytes += mirror->shadow.capacity();
+        }
+    }
+    MemoryStats::AppendMiB(line, "mirror_buffers", mirrorBytes, buffers);
+    MemoryStats::AppendMiB(line, "mirror_heap_buffers", heapBytes, heapMirrors);
+    MemoryStats::AppendMiB(line, "mirror_shadows", shadowBytes, mirrors);
+    std::uint64_t importBytes = 0;
+    std::size_t imports = 0;
+    {
+        auto& state = Imports();
+        std::lock_guard lock(state.mutex);
+        importBytes = state.liveBytes;
+        imports = state.imports.size();
+    }
+    MemoryStats::AppendMiB(line, "host_imports", importBytes, imports);
 }
 
 MirrorStats MirrorCounters() {
