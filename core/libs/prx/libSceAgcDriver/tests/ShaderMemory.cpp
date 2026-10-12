@@ -2096,7 +2096,7 @@ void verifyMeshConfiguration() {
         RecompileCacheKey::Build(hull, key);
         const auto patchKey = key;
         RecompileCacheKey::Build(primitiveGrouped, key);
-        require((key != patchKey) == (stage == ShaderStage::TessellationControl), "only the hull cache key may depend on the primitive group size, which rebuilds its relative patch index");
+        require((key != patchKey) == (stage != ShaderStage::Local), "only the hull and domain cache keys may depend on the primitive group size, which rebuilds their relative patch index");
     }
     const std::array<std::uint32_t, 8> users{};
     request.context.waveSize = 32u;

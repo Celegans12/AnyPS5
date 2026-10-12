@@ -685,8 +685,8 @@ private:
     }
 
     void requireGroupedPatches() const {
-        if (stage != IrShaderStage::TessellationControl) Fail("the relative patch or vertex index is used outside a tessellation ring or LDS address", 0u);
-        if (tessellation.primitiveGroupSize == 0u) Fail("the hull program uses its relative patch index as data, but GE_CNTL.PRIM_GRP_SIZE is 0 or not programmed", 0u);
+        if (stage == IrShaderStage::Local) Fail("the relative patch or vertex index is used outside a tessellation ring or LDS address", 0u);
+        if (tessellation.primitiveGroupSize == 0u) Fail(stage == IrShaderStage::TessellationControl ? "the hull program uses its relative patch index as data, but GE_CNTL.PRIM_GRP_SIZE is 0 or not programmed" : "the domain program uses its relative patch index as data, but GE_CNTL.PRIM_GRP_SIZE is 0 or not programmed", 0u);
     }
 
     IrValue& groupedPatch(IrValue& base) {

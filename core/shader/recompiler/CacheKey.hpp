@@ -109,9 +109,9 @@ private:
         for (const auto value : {tessellation->inputControlPoints, tessellation->outputControlPoints, tessellation->domain, tessellation->partitioning, tessellation->outputTopology}) append(key, value);
         if (request.shader.stage == ShaderStage::Local) return;
         append(key, tessellation->patchesPerGroup);
+        append(key, tessellation->primitiveGroupSize);
         if (request.shader.stage != ShaderStage::TessellationControl) return;
         for (const auto level : {tessellation->minLevel, tessellation->maxLevel}) append(key, std::bit_cast<std::uint32_t>(level));
-        append(key, tessellation->primitiveGroupSize);
     }
 
     template<typename TValue>
