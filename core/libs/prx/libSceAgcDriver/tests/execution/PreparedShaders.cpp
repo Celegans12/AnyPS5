@@ -779,7 +779,7 @@ void AperturePreparationClassification(AgcDriver::VulkanDevice& device) {
     }
 }
 
-void DeferredUndecodableRegistration(bool aperture = false) {
+void DeferredUndecodableRegistration(bool aperture = false, bool skipRefused = false) {
     alignas(256) std::array<std::uint32_t, 3> code{0xbe842104u, 0xf1949f05u, 0x00060018u};
     if (aperture) code = {0xbeea04ebu, 0xbf810000u, 0xbf810000u};
     struct Header {
@@ -807,6 +807,16 @@ void DeferredUndecodableRegistration(bool aperture = false) {
     commands.insert(commands.end(), {0xc0033700u, 0x00100200u, static_cast<std::uint32_t>(destinationAddress), static_cast<std::uint32_t>(destinationAddress >> 32u), 7u});
     Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
     sceAgcDriverSubmitAcb(0x20, &packet);
+    if (skipRefused) {
+        AgcDriverWaitIdle_nid_postfix();
+        Require(destination == 7u, "a skipped refused dispatch stopped the rest of its submission");
+        destination = 0;
+        sceAgcDriverSubmitAcb(0x20, &packet);
+        AgcDriverWaitIdle_nid_postfix();
+        Require(destination == 7u, "a refused dispatch was not skipped when it was used again");
+        AgcDriverShutdown_nid_postfix();
+        return;
+    }
     const auto reason = aperture ? "TranslationContext::readRawU32: the scalar aperture source src_shared_base is not modelled" : "unsupported MIMG opcode";
     ExpectFailure([] { AgcDriverWaitIdle_nid_postfix(); }, reason);
     ExpectFailure([] { AgcDriverShutdown_nid_postfix(); }, reason);
@@ -817,7 +827,7 @@ void DeferredUndecodableRegistration(bool aperture = false) {
 
 int main(int argc, char** argv) {
     try {
-        Require(argc == 1 || (argc == 2 && (std::string_view(argv[1]) == "--indirect" || std::string_view(argv[1]) == "--fail-before-registration" || std::string_view(argv[1]) == "--deferred" || std::string_view(argv[1]) == "--deferred-undecodable" || std::string_view(argv[1]) == "--deferred-aperture" || std::string_view(argv[1]) == "--preparation-failure")), "invalid test arguments");
+        Require(argc == 1 || (argc == 2 && (std::string_view(argv[1]) == "--indirect" || std::string_view(argv[1]) == "--fail-before-registration" || std::string_view(argv[1]) == "--deferred" || std::string_view(argv[1]) == "--deferred-undecodable" || std::string_view(argv[1]) == "--deferred-aperture" || std::string_view(argv[1]) == "--skip-refused" || std::string_view(argv[1]) == "--preparation-failure")), "invalid test arguments");
         if (argc == 2 && std::string_view(argv[1]) == "--deferred-aperture") {
             auto device = OpenVulkanTestDevice();
             if (!device) return VulkanTestSkipped;
@@ -831,6 +841,12 @@ int main(int argc, char** argv) {
             if (!OpenVulkanTestDevice()) return VulkanTestSkipped;
             DeferredRegistration(std::string_view(argv[1]) == "--preparation-failure");
             std::cout << "deferred shader preparation tests passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--skip-refused") {
+            if (!OpenVulkanTestDevice()) return VulkanTestSkipped;
+            DeferredUndecodableRegistration(false, true);
+            std::cout << "skipped refused dispatch tests passed\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--deferred-undecodable") {

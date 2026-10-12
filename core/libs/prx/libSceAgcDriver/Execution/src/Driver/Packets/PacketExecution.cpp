@@ -248,8 +248,16 @@ void Driver::execute(const Submission& submission) {
                 gateOpened() = false;
                 timed(&WorkerProfile::dispatchMs, [&] { resolveGroupAhead(submission, queue, cursor); });
             }
-            if (opcode == 0x15) timed(&WorkerProfile::dispatchMs, [&] { dispatch(queue, packet, submission); });
-            else timed(&WorkerProfile::dispatchMs, [&] { dispatchIndirect(queue, packet, submission); });
+            timed(&WorkerProfile::dispatchMs, [&] {
+                try {
+                    if (opcode == 0x15) dispatch(queue, packet, submission);
+                    else dispatchIndirect(queue, packet, submission);
+                } catch (const ShaderRefusal& refusal) {
+                    CaptureTrace::Log("dispatch-refused submission=%llu offset=%zu reason=%.256s", static_cast<unsigned long long>(submission.serial), cursor, refusal.what());
+                    pendingDispatchPhases().outcome = DispatchOutcome::Skipped;
+                    reportSkip("dispatch", refusal.what());
+                }
+            });
             Graphics::Recorder::CountRecordedWork();
             finishDispatchPacket(opcode == 0x16);
         } else if (opcode == 0x3c || opcode == 0x93) {
@@ -294,6 +302,10 @@ void Driver::execute(const Submission& submission) {
                     } else if (traceDraws) {
                         std::fprintf(stderr, "[draw] target 0x%llx mask 0x%x ok\n",static_cast<unsigned long long>(color), readRegister(queue.context, 0x8e));
                     }
+                } catch (const ShaderRefusal& refusal) {
+                    CaptureTrace::Log("draw-refused submission=%llu offset=%zu reason=%.256s", static_cast<unsigned long long>(submission.serial), cursor, refusal.what());
+                    countSkip(Graphics::DrawSkip::Thrown);
+                    reportSkip("draw", refusal.what());
                 } catch (const std::exception& error) {
                     CaptureTrace::Log("draw-error submission=%llu offset=%zu reason=%.256s", static_cast<unsigned long long>(submission.serial), cursor, error.what());
                     countSkip(Graphics::DrawSkip::Thrown);

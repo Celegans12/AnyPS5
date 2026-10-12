@@ -52,6 +52,11 @@ void Driver::reportSkip(const char* kind, const std::string& what) {
     if (!line.empty()) std::fwrite(line.data(), 1, line.size(), stderr);
 }
 
+bool SkipRefusedShaders() {
+    static const bool skip = [] { const char* text = std::getenv("APS5_SKIP_REFUSED_SHADERS"); return text != nullptr && std::atoi(text) != 0; }();
+    return skip;
+}
+
 std::string Driver::dumpRequest(std::uint64_t address, const ShaderRecompiler::RecompileRequest& request) {
     static std::mutex dumpMutex;
     static std::set<std::uint64_t> dumped;
