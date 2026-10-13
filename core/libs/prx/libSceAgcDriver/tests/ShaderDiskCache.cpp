@@ -1533,6 +1533,10 @@ void verifyInvocationIsolation() {
         if ((descriptor[0] & 3u) == (original[0] & 3u) && (descriptor[1] & 0xffff0000u) == (original[1] & 0xffff0000u) && descriptor[3] == original[3] && (descriptor[0] != 0u || (descriptor[1] & 0xffffu) != 0u)) {
             require(first.spirv.data() == changed.spirv.data() && first.PipelineVariantId() == changed.PipelineVariantId(), "buffer address or size rebuilt the specialized module");
         }
+        if (descriptor[2] == 0u) {
+            require(first.spirv.data() == changed.spirv.data() && first.PipelineVariantId() == changed.PipelineVariantId(), "a null V# did not specialize with the bound slot's substitute");
+            continue;
+        }
         ComputeRequest fresh(false);
         fresh.userData = descriptor;
         requireSameResult(Recompile(fresh.request), changed, "reused binding plan against fresh compilation");
@@ -1578,6 +1582,65 @@ void verifyBufferAlignmentSpecialization() {
     request.userData[0] = 0x10000000u;
     const auto restored = Recompile(request.request);
     require(restored.spirv.data() == aligned.spirv.data(), "unaligned buffers replaced the aligned specialization");
+}
+
+struct PresenceRequest : ComputeRequest {
+    std::vector<std::uint32_t> presenceCode{0xe0700000u, 0x80000000u, 0xbf800005u, 0xbf810000u};
+
+    explicit PresenceRequest(const std::array<std::uint32_t, 4>& descriptor) : ComputeRequest(true) {
+        request.shader.code = presenceCode;
+        userData = descriptor;
+        request.context.userData = userData;
+    }
+};
+
+constexpr std::array<std::uint32_t, 4> PresenceBound{0x10000000u, 0x00000000u, 0x40u, 0x00027facu};
+constexpr std::array<std::uint32_t, 4> PresenceNull{0x00000000u, 0x00080050u, 0x00000000u, 0x00005204u};
+
+std::vector<std::uint32_t> spirvWords(const RecompileResult& result) {
+    const auto words = result.spirv.ReadTransient();
+    require(words && !words->empty(), "the result has no SPIR-V");
+    return {words->begin(), words->end()};
+}
+
+std::filesystem::path presenceReference() {
+    return ShaderDiskCache::EntryDirectory() / "presence-reference.spv";
+}
+
+std::size_t substituteRecords() {
+    std::size_t records = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(ShaderDiskCache::EntryDirectory())) records += entry.path().extension() == ".slots";
+    return records;
+}
+
+void verifyBufferPresenceSubstitutes(const char* self) {
+    const auto recordsBefore = substituteRecords();
+    PresenceRequest bound(PresenceBound);
+    const auto boundResult = Recompile(bound.request);
+    PresenceRequest absent(PresenceNull);
+    const auto absentResult = Recompile(absent.request);
+    require(absentResult.specializationId == boundResult.specializationId && spirvWords(absentResult) == spirvWords(boundResult), "a null V# did not share the bound slot's specialized module");
+    ShaderDiskCache::Flush();
+    require(substituteRecords() == recordsBefore + 1u, "the bound slot's substitute was not persisted");
+    const auto words = spirvWords(boundResult);
+    std::vector<std::byte> bytes(words.size() * sizeof(std::uint32_t));
+    std::memcpy(bytes.data(), words.data(), bytes.size());
+    require(WriteFileAtomically(presenceReference(), bytes), "cannot write the presence reference SPIR-V");
+    const std::string command = "\"" + std::string(self) + "\" --load-presence-substitutes";
+    require(std::system(command.c_str()) == 0, "the process loading the persisted substitutes failed");
+}
+
+int runPresenceSubstituteProcess() {
+    PresenceRequest absent(PresenceNull);
+    const auto result = Recompile(absent.request);
+    const auto totals = ShaderDiskCache::Totals();
+    require(totals.hits == 1 && totals.misses == 0, "the presence program was not loaded from the disk cache");
+    std::vector<std::byte> reference;
+    require(ReadWholeFile(presenceReference(), reference), "cannot read the presence reference SPIR-V");
+    const auto words = spirvWords(result);
+    require(reference.size() == words.size() * sizeof(std::uint32_t) && std::memcmp(reference.data(), words.data(), reference.size()) == 0, "a null V# in a new process did not reproduce the module specialized with the persisted substitute");
+    std::cout << "a new process specialized the null V# with the persisted substitute (" << words.size() << " SPIR-V words)\n";
+    return 0;
 }
 
 void verifyBindingPlanSelection() {
@@ -1989,6 +2052,7 @@ int main(int argc, char** argv) {
         if (argc == 2 && (std::string_view(argv[1]) == "--load-direct-image-refusal" || std::string_view(argv[1]) == "--load-direct-image-loop-guard"
                 || std::string_view(argv[1]) == "--load-guarded-direct-image")) return runDirectImageLoadingProcess(argv[1]);
         if (argc == 2 && std::string_view(argv[1]) == "--no-failure-memo") return runWithoutFailureMemo();
+        if (argc == 2 && std::string_view(argv[1]) == "--load-presence-substitutes") return runPresenceSubstituteProcess();
         const auto directory = std::filesystem::temp_directory_path() / ("aps5-shader-disk-cache-test-" + std::to_string(std::random_device{}()));
         std::filesystem::remove_all(directory);
         verifyDefaultDirectory(argv[0]);
@@ -2015,6 +2079,7 @@ int main(int argc, char** argv) {
         verifyFailureMemoSwitch(argv[0]);
         verifyInvocationIsolation();
         verifyBufferAlignmentSpecialization();
+        verifyBufferPresenceSubstitutes(argv[0]);
         verifyBindingPlanSelection();
         verifyVertexTypeSpecialization();
         verifyBuiltinSpecialization();

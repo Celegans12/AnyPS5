@@ -90,6 +90,7 @@ static_assert(sizeof(BindingLayout) == 16, "BindingLayout changed: update BuildK
 namespace {
 
 constexpr std::uint32_t FileMagic = 0x43535041u;
+constexpr std::uint32_t SubstituteMagic = 0x53425041u;
 
 struct FileHeader {
     std::uint32_t magic;
@@ -719,6 +720,8 @@ constexpr std::string_view NeutralSwitches[] = {
     "APS5_NO_PERF_ITERATION_SELECTION",
     "APS5_NO_PERF_LAZY_CAPTURE_PLAN",
     "APS5_NO_RESULT_MEMO",
+    "APS5_NO_UNDECLARED_CONSTANT_FILTER",
+    "APS5_TRACE_SPECIALIZATION",
 };
 
 const std::vector<std::byte>& switchKey() {
@@ -1053,6 +1056,61 @@ void Store(std::vector<std::byte> key, std::shared_ptr<const CompiledVariant> va
 void Flush() {
     auto& instance = store();
     if (instance.Enabled()) instance.Flush();
+}
+
+std::shared_ptr<BufferSubstituteTable> OpenSubstitutes(std::span<const std::byte> key, std::size_t slots) {
+    auto& instance = store();
+    if (!instance.Enabled()) return std::make_shared<BufferSubstituteTable>(std::vector<BufferSubstitute>(slots), BufferSubstituteTable::Persist{});
+    auto name = EntryName(key);
+    name.replace(name.size() - 4u, 4u, ".slots");
+    const auto path = instance.Directory() / name;
+    const auto keyHash = HashBytes(key);
+    const auto read = [path, keyHash, slots] {
+        std::vector<BufferSubstitute> table(slots);
+        std::vector<std::byte> file;
+        if (!ReadWholeFile(path, file)) return table;
+        Reader reader(file);
+        std::uint32_t magic = 0, format = 0;
+        std::uint64_t source = 0, hash = 0, count = 0;
+        reader.Value(magic);
+        reader.Value(format);
+        reader.Value(source);
+        reader.Value(hash);
+        reader.Value(count);
+        if (!reader.Ok() || magic != SubstituteMagic || format != FormatVersion || source != SourceVersion() || hash != keyHash || count != slots) return table;
+        std::vector<BufferSubstitute> decoded(slots);
+        for (auto& slot : decoded) {
+            reader.Value(slot.known);
+            reader.Value(slot.word1);
+            reader.Value(slot.word3);
+            reader.Value(slot.misalignment);
+        }
+        if (!reader.Done()) return table;
+        return decoded;
+    };
+    auto persist = [path, keyHash, read](const std::vector<BufferSubstitute>& learned) {
+        static std::mutex mutex;
+        std::lock_guard lock(mutex);
+        auto merged = read();
+        for (std::size_t slot = 0; slot < merged.size() && slot < learned.size(); ++slot) {
+            if (!merged[slot].known) merged[slot] = learned[slot];
+        }
+        std::vector<std::byte> bytes;
+        Writer writer(bytes);
+        writer.Value(SubstituteMagic);
+        writer.Value(FormatVersion);
+        writer.Value(SourceVersion());
+        writer.Value(keyHash);
+        writer.Value<std::uint64_t>(merged.size());
+        for (const auto& slot : merged) {
+            writer.Value(slot.known);
+            writer.Value(slot.word1);
+            writer.Value(slot.word3);
+            writer.Value(slot.misalignment);
+        }
+        if (!WriteFileAtomically(path, bytes)) std::fprintf(stderr, "[shader-disk-cache] cannot write buffer substitutes %s\n", path.string().c_str());
+    };
+    return std::make_shared<BufferSubstituteTable>(read(), std::move(persist));
 }
 
 Counters Totals() {

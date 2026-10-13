@@ -713,6 +713,12 @@ std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledSh
         }
         cursor += count;
     }
+    static const bool traceSpecialization = std::getenv("APS5_TRACE_SPECIALIZATION") != nullptr;
+    if (traceSpecialization) {
+        std::string text;
+        for (const auto& constant : constants) text += " " + std::to_string(constant.id) + "=" + std::to_string(constant.value);
+        std::fprintf(stderr, "[specialization] generic=%zu specialized=%zu bindings=%zu constants=%zu:%s\n", words.size(), materialized.size(), module->bindings.size(), constants.size(), text.c_str());
+    }
     module->spirv = std::move(materialized);
     module->specializationId = constants.empty() ? 0u : nextVariantId();
     return module;
@@ -745,13 +751,14 @@ std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& 
     key.clear();
     key.push_back(variant.artifact.variantId);
     key.push_back(UnnormalizedWrapEnabled() ? 1u : 0u);
+    const auto substitutes = variant.substitutes != nullptr ? variant.substitutes->Slots() : std::vector<BufferSubstitute>{};
     for (std::size_t index = 0; index < variant.info.info.buffers.size(); ++index) {
         const auto& descriptor = snapshot.buffers.at(index);
         key.push_back(descriptor.dwordCount);
-        key.push_back(descriptor.dwords[1] & 0xffff0000u);
-        key.push_back(descriptor.dwords[3]);
-        const bool present = descriptor.dwords[2] != 0u && (descriptor.dwords[0] != 0u || (descriptor.dwords[1] & 0xffffu) != 0u);
-        key.push_back(present ? 4u | (descriptor.dwords[0] & 3u) : 0u);
+        const auto fields = BufferDescriptorPresent(descriptor) ? BufferSpecializationFields(descriptor) : index < substitutes.size() && substitutes[index].known ? substitutes[index] : BufferSubstitute{};
+        key.push_back(fields.word1);
+        key.push_back(fields.word3);
+        key.push_back(fields.known ? 4u | fields.misalignment : 0u);
     }
     for (std::size_t index = 0; index < variant.info.info.images.size(); ++index) {
         const auto& descriptor = snapshot.images.at(index);
@@ -781,13 +788,43 @@ std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& 
     }
     std::call_once(plan->ready, [&] {
         try {
-            plan->bindings = DescriptorBindingBuilder{}.Prepare(variant.bindings.layout, variant.info.info, variant.info.stage, snapshot, exports);
+            plan->bindings = DescriptorBindingBuilder{}.Prepare(variant.bindings.layout, variant.info.info, variant.info.stage, snapshot, exports, substitutes);
         } catch (...) {
             plan->failure = std::current_exception();
         }
     });
     if (plan->failure) std::rethrow_exception(plan->failure);
+    if (variant.substitutes != nullptr) {
+        for (std::size_t index = 0; index < variant.info.info.buffers.size(); ++index) {
+            const auto& descriptor = snapshot.buffers.at(index);
+            if ((index >= substitutes.size() || !substitutes[index].known) && BufferDescriptorPresent(descriptor)) variant.substitutes->Learn(index, BufferSpecializationFields(descriptor));
+        }
+    }
     return plan;
+}
+
+std::shared_ptr<const std::set<std::uint32_t>> declaredSpecializationIds(const CompiledShaderArtifact& artifact) {
+    static std::mutex mutex;
+    static std::map<std::uint64_t, std::shared_ptr<const std::set<std::uint32_t>>> declared;
+    {
+        std::lock_guard lock(mutex);
+        if (const auto found = declared.find(artifact.variantId); found != declared.end()) return found->second;
+    }
+    auto ids = std::make_shared<std::set<std::uint32_t>>();
+    const auto pinned = artifact.spirv.ReadTransient();
+    if (pinned) {
+        const auto& words = *pinned;
+        for (std::size_t cursor = 5; cursor < words.size();) {
+            const auto count = words[cursor] >> 16u;
+            const auto op = static_cast<spv::Op>(words[cursor] & 0xffffu);
+            if (count == 0u || count > words.size() - cursor) throw std::runtime_error("truncated prepared specialization instruction");
+            if (op == spv::OpDecorate && count == 4u && words[cursor + 2u] == spv::DecorationSpecId) ids->insert(words[cursor + 3u]);
+            if (op == spv::OpFunction) break;
+            cursor += count;
+        }
+    }
+    std::lock_guard lock(mutex);
+    return declared.emplace(artifact.variantId, std::move(ids)).first->second;
 }
 
 std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderArtifact& artifact, const IrBindingLayout& layout, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target) {
@@ -919,6 +956,11 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
                     constants.push_back({first + 5u, kind});
                 }
             }
+            static const bool keepUndeclared = std::getenv("APS5_NO_UNDECLARED_CONSTANT_FILTER") != nullptr;
+            if (!keepUndeclared) {
+                const auto declared = declaredSpecializationIds(artifact);
+                std::erase_if(constants, [&](const PipelineSpecializationConstant& constant) { return constant.id >= PipelineSpecialization::BufferBase && constant.id < PipelineSpecialization::ImageBase && !declared->contains(constant.id); });
+            }
             const auto module = specializeModule(variant.artifact, variant.bindings.layout, vertexClasses, constants, request.target);
             if (variant.bindings.layout.UsesPushData() && !module->pushData) throw std::runtime_error("specialization removed the prepared push constant interface");
             auto selected = DescriptorBindingBuilder{}.Select(plan->bindings, module->bindings);
@@ -1035,6 +1077,7 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
         if (ShaderDiskCache::Load(diskKey, loaded)) {
             loaded.layout = request.layout;
             loaded.artifact.variantId = nextVariantId();
+            loaded.substitutes = ShaderDiskCache::OpenSubstitutes(diskKey, loaded.info.info.buffers.size());
             if (coldSpirv) makeColdForPublication(loaded.artifact.spirv, true);
             variant = std::make_shared<const CompiledVariant>(std::move(loaded));
         }
@@ -1046,6 +1089,7 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
         std::exception_ptr emissionFailure;
         try {
             auto compiled = compileVariant(request, std::move(program), &emissionFailure);
+            compiled.substitutes = disk ? ShaderDiskCache::OpenSubstitutes(diskKey, compiled.info.info.buffers.size()) : std::make_shared<BufferSubstituteTable>(std::vector<BufferSubstitute>(compiled.info.info.buffers.size()), BufferSubstituteTable::Persist{});
             if (coldSpirv) makeColdForPublication(compiled.artifact.spirv, false);
             variant = std::make_shared<const CompiledVariant>(std::move(compiled));
         } catch (...) {
