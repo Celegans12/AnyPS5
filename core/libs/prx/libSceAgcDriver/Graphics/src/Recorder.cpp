@@ -2458,6 +2458,16 @@ void Recorder::KeepBytes(const void* owner, std::size_t bytes) {
     if (open->keptOwners.insert(owner).second) open->keptBytes += bytes;
 }
 
+bool Recorder::RetireOldest() {
+    if (!GuestMemory::GpuMutex().HeldByThisThread()) return false;
+    if (inFlight.empty() && open != nullptr) Submit();
+    if (inFlight.empty()) return false;
+    auto batch = std::move(inFlight.front());
+    inFlight.pop_front();
+    finish(std::move(batch), true, 4, true);
+    return true;
+}
+
 void Recorder::BoundKeptBytes() {
     if (!GuestMemory::GpuMutex().HeldByThisThread()) return;
     if (open != nullptr && open->keptBytes >= KeptBytesBudget) Submit();

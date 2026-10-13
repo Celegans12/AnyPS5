@@ -2992,6 +2992,20 @@ void sampledTextureBudgetTests() {
     expect(TextureCacheBudgetsFor(memory, &reported, use, shared.target), 4984 * MiB, 4 * GiB, 10104 * MiB, "200 MiB more reported usage did not take the share down");
     reported.heapUsage[2] = 9 * GiB - 64 * MiB;
     expect(TextureCacheBudgetsFor(memory, &reported, use, 1024 * MiB), 5248 * MiB, 4 * GiB, 10368 * MiB, "a share 9 GiB above the last one was held at the last one");
+    // Sampled images in the overflow type are the caches' own (not other usage) and are not taken
+    // from the sampled ceiling: 1 GiB of the 3 GiB outside the cache in it leaves the ceiling 1 GiB
+    // higher. Their budget is the system heap's headroom less a sixteenth of its budget.
+    reported.heapUsage[2] = 9 * GiB;
+    const auto withOverflow = TextureCacheBudgetsFor(memory, &reported, {3 * GiB, 1 * GiB, 2 * GiB, 1 * GiB});
+    expect(withOverflow, 5184 * MiB, 4 * GiB, 10304 * MiB, "a GiB of sampled images in the overflow type was taken from the sampled ceiling or read as other usage");
+    Require(withOverflow.overflow == 100 * GiB - 100 * GiB / 16u, "the overflow budget is not the system heap's budget less its usage and a sixteenth");
+    reported.heapBudget[1] = 16 * GiB;
+    reported.heapUsage[1] = 11 * GiB;
+    Require(TextureCacheBudgetsFor(memory, &reported, use).overflow == 4 * GiB, "16 GiB of system heap budget with 11 GiB used does not leave 4 GiB of overflow budget");
+    reported.heapUsage[1] = 16 * GiB;
+    Require(TextureCacheBudgetsFor(memory, &reported, use).overflow == 1, "a full system heap does not leave the overflow type the least budget");
+    reported.heapBudget[1] = 100 * GiB;
+    reported.heapUsage[1] = 0;
     reported.heapUsage[2] = 3 * GiB;
     expect(TextureCacheBudgetsFor(memory, &reported, use), 9280 * MiB, 4 * GiB, 14400 * MiB, "usage below the texture bytes is not read as no other device memory in use");
     reported.heapUsage[2] = 9 * GiB;

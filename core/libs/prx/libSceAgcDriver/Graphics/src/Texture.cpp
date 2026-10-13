@@ -256,6 +256,15 @@ std::uint64_t SampledTextureHostMemory() {
     return SampledHostMemoryCounter().load(std::memory_order_relaxed);
 }
 
+std::atomic<std::uint64_t>& SampledOverflowMemoryCounter() {
+    static std::atomic<std::uint64_t> bytes{0};
+    return bytes;
+}
+
+std::uint64_t SampledTextureOverflowMemory() {
+    return SampledOverflowMemoryCounter().load(std::memory_order_relaxed);
+}
+
 VkDeviceSize ImageAllocationOverhead(VkDeviceSize bytes) {
     constexpr VkDeviceSize granularity = VkDeviceSize{64} << 10u;
     return (granularity - bytes % granularity) % granularity;
@@ -505,6 +514,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
         }
         countedBytes = allocationBytes;
         (inHostMemory ? SampledHostMemoryCounter() : SampledMemoryCounter()).fetch_add(countedBytes, std::memory_order_relaxed);
+        if (spilled && !inHostMemory) SampledOverflowMemoryCounter().fetch_add(countedBytes, std::memory_order_relaxed);
     } catch (...) {
         release();
         throw;
@@ -811,6 +821,7 @@ void Texture::release() noexcept {
     // The image and its memory go with the last holder: this texture, or the batch still uploading it.
     owned.reset();
     image = VK_NULL_HANDLE;
+    if (spilled && !inHostMemory) SampledOverflowMemoryCounter().fetch_sub(countedBytes, std::memory_order_relaxed);
     (inHostMemory ? SampledHostMemoryCounter() : SampledMemoryCounter()).fetch_sub(std::exchange(countedBytes, 0), std::memory_order_relaxed);
 }
 

@@ -666,7 +666,38 @@ int burstOverflowTests(Context context) {
     Require(overflowed + 4u >= Count, "only " + std::to_string(overflowed) + " of the " + std::to_string(Count) + " snapshots past the share went to the overflow type");
     Require(sampled == counted, "the snapshots in the overflow type are not counted as device-local sampled memory");
     Require(limit.refused > refusedBefore, "the device buffer did not meet the full heap");
+    {
+        std::lock_guard lock(limit.mutex);
+        limit.limit = ~VkDeviceSize{0};
+    }
     held.clear();
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+
+    // Builds of a burst bind the same image table again and again: the spilled snapshots are kept
+    // for reuse, so each surface is made once however many builds bind it, and the kept ones nothing
+    // uses go down to the overflow budget (APS5_TEXTURE_OVERFLOW_MIB=4 for this test; the trim that
+    // found everything in use above is repeated after 50 ms without a recorder retiring batches).
+    constexpr std::size_t Table = 8;
+    constexpr std::size_t Builds = 5;
+    const auto first = SampledCacheCounters();
+    std::uint64_t afterFirstBuild = 0;
+    for (std::size_t build = 0; build < Builds; ++build) {
+        std::vector<std::shared_ptr<Texture>> bound;
+        for (std::size_t surface = 0; surface < Table; ++surface) {
+            auto words = Descriptor(base + surface * Stride);
+            words[3] |= LastMip << 16u;
+            words[5] |= LastMip << 4u;
+            bound.push_back(CachedSampledTexture(context, words));
+        }
+        if (build == 0) afterFirstBuild = SampledTextureOverflowMemory();
+    }
+    const auto last = SampledCacheCounters();
+    const auto budget = CurrentTextureCacheBudgets(context).overflow;
+    std::printf("%zu builds binding the same %zu mipmapped snapshots past the share: %llu made, %llu spilled ones reused, %llu kept ones dropped; %llu KiB in the overflow type after the first build (budget %llu KiB)\n", Builds, Table, static_cast<unsigned long long>(last.made - first.made), static_cast<unsigned long long>(last.spilledReuses - first.spilledReuses), static_cast<unsigned long long>(last.overflowDropped - first.overflowDropped), static_cast<unsigned long long>(afterFirstBuild >> 10u), static_cast<unsigned long long>(budget >> 10u));
+    Require(last.made - first.made <= Table, std::to_string(last.made - first.made) + " snapshots were made for " + std::to_string(Builds) + " builds binding the same " + std::to_string(Table) + " surfaces");
+    Require(last.spilledReuses - first.spilledReuses >= (Builds - 1u) * (Table - 4u), "the builds after the first reused only " + std::to_string(last.spilledReuses - first.spilledReuses) + " spilled snapshots");
+    Require(last.overflowDropped > first.overflowDropped, "the burst's kept snapshots nothing used were not dropped down to the overflow budget");
+    Require(budget == 4ull << 20u && afterFirstBuild <= budget + Stride, "the overflow type held " + std::to_string(afterFirstBuild >> 10u) + " KiB after the first build, past its " + std::to_string(budget >> 10u) + " KiB budget");
     ClearCachedTextures(context.device);
     GuestAllocations::Mutation().Remove(memory);
 #ifdef _WIN32

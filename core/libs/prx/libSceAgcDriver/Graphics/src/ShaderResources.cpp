@@ -146,15 +146,32 @@ struct TextureCache {
     // Snapshots made for one use (refused), by key while some recorded work or build still holds
     // them: a lookup of the key meanwhile takes the same image (admitting it when it may) instead
     // of reading and uploading the surface again. Expired entries are swept as the map grows.
+    // Spilled ones (past the share, Texture::Spilled) are also kept alive by the map (`kept`), in
+    // least recently used order (`overflowLru`, front = most recent): the game binds whole image
+    // tables, so every build of a loading burst binds the same thousands of textures past the share,
+    // and lean-x24 made 82k spilled snapshots, a new set for each build, until the overflow type
+    // ran out. The kept ones go least recently used first, unused ones only, while the overflow type
+    // holds more than its budget (boundOverflow) or the device runs out of memory (the reclaim).
     struct OneOff {
         std::weak_ptr<Texture> texture;
         std::uint64_t bytes = 0;
         std::vector<ContentHash::Hash128> hashes;
         DccKeys keys = DccKeys::Uncompressed;
         std::uint64_t generation = 0;
+        std::shared_ptr<Texture> kept;
+        std::list<TextureKey>::iterator lru{};
     };
     std::unordered_map<TextureKey, OneOff, TextureKeyHash> oneOffs;
     std::size_t oneOffsSwept = 0;
+    std::list<TextureKey> overflowLru;
+    std::uint64_t overflowKept = 0;
+    // boundOverflow's last trim that dropped nothing, repeated only once the recorder retired a
+    // batch or 50 ms passed (as makeRoom's).
+    bool overflowTrimFailed = false;
+    std::uint64_t overflowTrimRetired = 0;
+    std::chrono::steady_clock::time_point overflowTrimAt{};
+    // Snapshots made and the distinct surfaces (address and size) they were made of, per report.
+    std::unordered_set<std::uint64_t> madeSurfaces;
     // makeRoom's last scan that found nothing to evict, repeated only once the recorder retired a
     // batch or 50 ms passed (a build binding thousands of textures would scan per texture).
     bool roomFailed = false;
@@ -172,6 +189,11 @@ struct TextureCache {
         std::uint64_t spilled = 0;
         std::uint64_t spilledBytes = 0;
         std::uint64_t oneOffReuses = 0;
+        std::uint64_t made = 0;
+        std::uint64_t spilledReuses = 0;
+        std::uint64_t overflowDropped = 0;
+        std::uint64_t overflowDroppedBytes = 0;
+        std::uint64_t overflowWaits = 0;
     } counts, totals;
     std::chrono::steady_clock::time_point countsReported = std::chrono::steady_clock::now();
     std::uint64_t erasures = 0;
@@ -404,7 +426,8 @@ bool admitTexture(TextureCache& cache, const TextureKey& key, std::uint64_t inco
 // recently used first. False when that is not enough (what is left is in use): the snapshot then
 // goes to system memory rather than past the share where it can (APS5_NO_TEXTURE_SPILL=1 keeps it device-local).
 bool makeRoom(TextureCache& cache, std::uint64_t incoming, const TextureCacheBudgets& budgets) {
-    const auto live = SampledTextureMemory();
+    const auto all = SampledTextureMemory();
+    const auto live = all - std::min(all, SampledTextureOverflowMemory());
     if (budgets.share == 0 || live + incoming <= budgets.share) return true;
     const auto retired = retiredSerial();
     const auto now = std::chrono::steady_clock::now();
@@ -432,12 +455,55 @@ bool SpillEnabled() {
     return !disabled;
 }
 
+void eraseOneOff(TextureCache& cache, std::unordered_map<TextureKey, TextureCache::OneOff, TextureKeyHash>::iterator it) {
+    if (it->second.kept != nullptr) {
+        cache.overflowKept -= it->second.kept->AllocationBytes();
+        cache.overflowLru.erase(it->second.lru);
+    }
+    cache.oneOffs.erase(it);
+}
+
 void rememberOneOff(TextureCache& cache, const TextureKey& key, const std::shared_ptr<Texture>& texture, std::uint64_t bytes, std::vector<ContentHash::Hash128> hashes, DccKeys keys, std::uint64_t generation) {
     if (cache.oneOffs.size() >= 2 * cache.oneOffsSwept + 1024) {
-        std::erase_if(cache.oneOffs, [](const auto& entry) { return entry.second.texture.expired(); });
+        std::erase_if(cache.oneOffs, [](const auto& entry) { return entry.second.kept == nullptr && entry.second.texture.expired(); });
         cache.oneOffsSwept = cache.oneOffs.size();
     }
-    cache.oneOffs[key] = {texture, bytes, std::move(hashes), keys, generation};
+    if (const auto found = cache.oneOffs.find(key); found != cache.oneOffs.end()) eraseOneOff(cache, found);
+    auto& oneOff = cache.oneOffs[key];
+    oneOff = {texture, bytes, std::move(hashes), keys, generation, nullptr, {}};
+    if (texture->Spilled()) {
+        oneOff.kept = texture;
+        oneOff.lru = cache.overflowLru.insert(cache.overflowLru.begin(), key);
+        cache.overflowKept += texture->AllocationBytes();
+    }
+}
+
+// Drops kept spilled snapshots no build or recorded work uses, least recently used first, while
+// `over()` holds; returns how many.
+template<typename Over>
+std::size_t trimOverflow(TextureCache& cache, Over over) {
+    const auto retired = retiredSerial();
+    std::size_t dropped = 0;
+    for (auto it = cache.overflowLru.end(); it != cache.overflowLru.begin() && over();) {
+        const auto current = std::prev(it);
+        const auto found = cache.oneOffs.find(*current);
+        if (found == cache.oneOffs.end() || found->second.kept == nullptr) {
+            cache.overflowLru.erase(current);
+            continue;
+        }
+        const auto& kept = found->second.kept;
+        if (kept.use_count() > 1 || kept->LastUse() > retired) {
+            it = current;
+            continue;
+        }
+        ++dropped;
+        ++cache.counts.overflowDropped;
+        ++cache.totals.overflowDropped;
+        cache.counts.overflowDroppedBytes += kept->AllocationBytes();
+        cache.totals.overflowDroppedBytes += kept->AllocationBytes();
+        eraseOneOff(cache, found);
+    }
+    return dropped;
 }
 
 // Drops the resource-cache sets that bind textures the sampled cache let go (cache.released), so
@@ -494,6 +560,8 @@ void reportCacheCounts(TextureCache& cache, const TextureCacheBudgets& budgets) 
     const auto sampled = SampledTextureMemory();
     const auto outside = sampled - std::min(sampled, cache.snapshotBytes);
     AgcDriver::ProfilePrint_nid_no_patch("[texture-cache] (10 s): %llu textures cached, %llu used uncached (first use this frame, the least recently used entry used this frame or the last), %llu refused over the ceiling (%llu MiB), %llu evicted (%llu MiB), %llu in-use ones passed over, %llu found changed; %llu resource sets dropped with released textures, %llu not cached for binding one; %llu out-of-memory reclaims (%llu MiB); %llu snapshots placed in system memory past the share (%llu MiB), %llu one-off snapshots reused; %llu MiB in %zu entries, budget %llu MiB, ceiling %llu MiB; sampled images outside the cache %llu MiB (in recorded work and builds); storage budget %llu MiB, VRAM share of the texture caches %llu MiB; frame %llu\n", static_cast<unsigned long long>(counts.inserted), static_cast<unsigned long long>(counts.uncached), static_cast<unsigned long long>(counts.refused), static_cast<unsigned long long>(counts.refusedBytes >> 20u), static_cast<unsigned long long>(counts.evicted), static_cast<unsigned long long>(counts.evictedBytes >> 20u), static_cast<unsigned long long>(counts.passed), static_cast<unsigned long long>(counts.stale), static_cast<unsigned long long>(dropped - droppedBefore), static_cast<unsigned long long>(refusedSets - refusedSetsBefore), static_cast<unsigned long long>(reclaims - reclaimsBefore), static_cast<unsigned long long>((reclaimed - reclaimedBefore) >> 20u), static_cast<unsigned long long>(counts.spilled), static_cast<unsigned long long>(counts.spilledBytes >> 20u), static_cast<unsigned long long>(counts.oneOffReuses), static_cast<unsigned long long>(cache.bytes >> 20u), cache.entries.size(), static_cast<unsigned long long>(budgets.sampled >> 20u), static_cast<unsigned long long>(budgets.ceiling >> 20u), static_cast<unsigned long long>(outside >> 20u), static_cast<unsigned long long>(budgets.storage >> 20u), static_cast<unsigned long long>(budgets.target >> 20u), static_cast<unsigned long long>(Recorder::Presents()));
+    AgcDriver::ProfilePrint_nid_no_patch("[texture-cache] (10 s): %llu snapshots made of %zu distinct surfaces; %llu spilled snapshots reused, %llu kept ones dropped (%llu MiB), %llu batches waited for; overflow type %llu MiB of a %llu MiB budget, %llu MiB of it kept for reuse in %zu snapshots\n", static_cast<unsigned long long>(counts.made), cache.madeSurfaces.size(), static_cast<unsigned long long>(counts.spilledReuses), static_cast<unsigned long long>(counts.overflowDropped), static_cast<unsigned long long>(counts.overflowDroppedBytes >> 20u), static_cast<unsigned long long>(counts.overflowWaits), static_cast<unsigned long long>(SampledTextureOverflowMemory() >> 20u), static_cast<unsigned long long>(budgets.overflow >> 20u), static_cast<unsigned long long>(cache.overflowKept >> 20u), cache.overflowLru.size());
+    cache.madeSurfaces.clear();
     droppedBefore = dropped;
     refusedSetsBefore = refusedSets;
     reclaimsBefore = reclaims;
@@ -733,8 +801,24 @@ BudgetState& Budgets() {
     return state;
 }
 
+std::uint64_t forcedOverflowBudget() {
+    static const std::uint64_t forced = [] {
+        const char* text = std::getenv("APS5_TEXTURE_OVERFLOW_MIB");
+        return text != nullptr ? std::strtoull(text, nullptr, 10) << 20u : 0u;
+    }();
+    return forced;
+}
+
+TextureCacheBudgets readBudgets(const Context& context);
+
 TextureCacheBudgets currentBudgets(const Context& context) {
-    if (const auto forced = forcedCacheBudget(); forced != 0) return {forced, forced + forced / 4u, forced, 0, forced + forced / 4u};
+    auto budgets = readBudgets(context);
+    if (const auto forced = forcedOverflowBudget(); forced != 0) budgets.overflow = forced;
+    return budgets;
+}
+
+TextureCacheBudgets readBudgets(const Context& context) {
+    if (const auto forced = forcedCacheBudget(); forced != 0) return {forced, forced + forced / 4u, forced, 0, forced + forced / 4u, 0};
     if (context.memoryProperties2 == nullptr || context.physical == VK_NULL_HANDLE) return TextureCacheBudgetsFor(context.memory, nullptr, {});
     auto& state = Budgets();
     std::lock_guard lock(state.mutex);
@@ -744,7 +828,7 @@ TextureCacheBudgets currentBudgets(const Context& context) {
     VkPhysicalDeviceMemoryProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
     properties.pNext = &reported;
     context.memoryProperties2(context.physical, &properties);
-    const TextureMemoryUse use{SampledTextureMemory(), SampledCachedBytes().load(std::memory_order_relaxed), storageCacheBytes()};
+    const TextureMemoryUse use{SampledTextureMemory(), SampledCachedBytes().load(std::memory_order_relaxed), storageCacheBytes(), SampledTextureOverflowMemory()};
     const bool fresh = state.device != context.physical;
     const auto budgets = TextureCacheBudgetsFor(context.memory, &reported, use, fresh ? 0u : state.budgets.target);
     if (const auto heap = largestDeviceLocalHeap(context.memory); heap && (fresh || SampledBudgetReportDue(state.reportedBudget, budgets.sampled, now - state.reportedAt))) {
@@ -766,9 +850,39 @@ std::uint64_t storageBudget(const Context& context) {
 }
 
 // `guestBytes` is the surface size when the caller described the surface already (0: described here).
+// Before a lookup (outside the cache's mutex): kept spilled snapshots nothing uses go while the
+// overflow type (or system memory, for the linear ones) holds more than the overflow budget; while
+// the budget is still passed, up to four of the oldest
+// recorded batches are waited for (their one-offs go with them) and the kept ones trimmed again.
+void boundOverflow(const Context& context) {
+    if (SampledTextureOverflowMemory() == 0 && SampledTextureHostMemory() == 0) return;
+    const auto budgets = currentBudgets(context);
+    const auto overBudget = [&] { return budgets.overflow != 0 && (SampledTextureOverflowMemory() > budgets.overflow || SampledTextureHostMemory() > budgets.overflow); };
+    const auto over = overBudget;
+    auto& cache = Textures();
+    {
+        const SampledCacheLock lock(cache);
+        if (cache.overflowLru.empty() || !over()) return;
+        const auto retired = retiredSerial();
+        const auto now = std::chrono::steady_clock::now();
+        if (cache.overflowTrimFailed && cache.overflowTrimRetired == retired && now - cache.overflowTrimAt < std::chrono::milliseconds(50)) return;
+        cache.overflowTrimFailed = trimOverflow(cache, over) == 0;
+        cache.overflowTrimRetired = retired;
+        cache.overflowTrimAt = now;
+    }
+    auto* recorder = Recorder::Active();
+    for (int wait = 0; wait < 4 && recorder != nullptr && overBudget() && recorder->RetireOldest(); ++wait) {
+        const SampledCacheLock lock(cache);
+        ++cache.counts.overflowWaits;
+        ++cache.totals.overflowWaits;
+        trimOverflow(cache, overBudget);
+    }
+}
+
 std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components, std::uint64_t guestBytes = 0, bool depthCompare = false) {
     CaptureTrace::Log("sampled-lookup address=%llx width=%u height=%u dcc=%llx", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, static_cast<unsigned long long>(resource.dccAddress));
     if (auto* recorder = Recorder::Active(); recorder != nullptr) recorder->BoundKeptBytes();
+    boundOverflow(context);
     if (auto depth = DepthSurfaceTexture(context, words, resource, components)) {
         logLookup({depth.get(), resource, 0, DccKeys::Uncompressed, 0, nullptr, true});
         return depth;
@@ -954,11 +1068,16 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             if (texture != nullptr && oneOff.bytes == guestBytes && oneOff.keys == *keys && current()) {
                 ++cache.counts.oneOffReuses;
                 ++cache.totals.oneOffReuses;
+                if (oneOff.kept != nullptr) {
+                    ++cache.counts.spilledReuses;
+                    ++cache.totals.spilledReuses;
+                    cache.overflowLru.splice(cache.overflowLru.begin(), cache.overflowLru, oneOff.lru);
+                }
                 texture->NoteUse(useSerial());
                 CachedTexture entry{key, address, guestBytes, std::move(oneOff.hashes), texture, *keys, generation};
                 entry.accounted = texture->AllocationBytes();
                 if (!texture->Spilled() && admitTexture(cache, key, entry.accounted, budgets)) {
-                    cache.oneOffs.erase(found);
+                    eraseOneOff(cache, found);
                     insert(std::move(entry), texture);
                 } else {
                     oneOff.hashes = std::move(entry.hashes);
@@ -970,7 +1089,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 if (profile) LookupOutcomes::Add(LookupOutcomes::SampledHitSnapshot, start);
                 return texture;
             }
-            cache.oneOffs.erase(found);
+            eraseOneOff(cache, found);
         }
     }
     CachedTexture entry{key, address, source != nullptr ? 0u : guestBytes, {}, nullptr, *keys, generation};
@@ -998,6 +1117,9 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         }
         const bool spill = SpillEnabled() && !makeRoom(cache, bytes, budgets);
         entry.texture = std::make_shared<Texture>(context, *context.detiler, resource, components, snapshot, depthCompare, spill);
+        ++cache.counts.made;
+        ++cache.totals.made;
+        cache.madeSurfaces.insert(address * 0x9e3779b97f4a7c15ull ^ guestBytes);
         if (entry.texture->Spilled()) {
             ++cache.counts.spilled;
             ++cache.totals.spilled;
@@ -1240,10 +1362,20 @@ TextureCacheBudgets TextureCacheBudgetsFor(const VkPhysicalDeviceMemoryPropertie
     auto target = std::max<std::uint64_t>(limit > reserved ? limit - reserved : 0u, std::min<std::uint64_t>(limit / 16u, 512 * MiB));
     if (previousTarget != 0 && (target > previousTarget ? target - previousTarget : previousTarget - target) <= std::max<std::uint64_t>(previousTarget / 64u, 64 * MiB)) target = previousTarget;
     const auto storage = std::min<std::uint64_t>(fixed, std::max<std::uint64_t>(target / 2u, 256 * MiB));
-    const auto outside = use.sampled - std::min(use.sampled, use.sampledCached);
+    const auto outside = use.sampled - std::min(use.sampled, use.sampledCached + use.overflow);
     const auto taken = std::max<std::uint64_t>(storage, use.storageCached) + outside;
     const auto ceiling = std::max<std::uint64_t>(target > taken ? target - taken : 0u, std::min<std::uint64_t>(target / 8u, 128 * MiB));
-    return {ceiling - ceiling / 5u, ceiling, storage, target, ceiling + outside};
+    std::uint64_t overflow = 0;
+    std::optional<std::uint32_t> system;
+    for (std::uint32_t i = 0; i < std::min<std::uint32_t>(memory.memoryHeapCount, VK_MAX_MEMORY_HEAPS); ++i) {
+        if ((memory.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0 && (!system || memory.memoryHeaps[i].size > memory.memoryHeaps[*system].size)) system = i;
+    }
+    if (system && reported->heapBudget[*system] != 0) {
+        const auto systemBudget = reported->heapBudget[*system];
+        const auto reserve = reported->heapUsage[*system] + systemBudget / 16u;
+        overflow = std::max<std::uint64_t>(systemBudget > reserve ? systemBudget - reserve : 0u, 1u);
+    }
+    return {ceiling - ceiling / 5u, ceiling, storage, target, ceiling + outside, overflow};
 }
 
 bool SampledBudgetReportDue(std::uint64_t reported, std::uint64_t budget, std::chrono::steady_clock::duration sinceReport) {
@@ -1301,6 +1433,17 @@ void AppendTextureMemoryStats(std::string& line) {
     MemoryStats::AppendMiB(line, "tex_sampled_spilled", totals.spilledBytes, totals.spilled);
     MemoryStats::AppendCount(line, "tex_oneoff_reuses", totals.oneOffReuses);
     MemoryStats::AppendMiB(line, "tex_sampled_share", current.share);
+    MemoryStats::AppendMiB(line, "tex_overflow_live", SampledTextureOverflowMemory());
+    MemoryStats::AppendMiB(line, "tex_overflow_budget", current.overflow);
+    {
+        auto& sampled = Textures();
+        const SampledCacheLock lock(sampled);
+        MemoryStats::AppendMiB(line, "tex_overflow_kept", sampled.overflowKept, sampled.overflowLru.size());
+        MemoryStats::AppendCount(line, "tex_snapshots_made", sampled.totals.made);
+        MemoryStats::AppendCount(line, "tex_spilled_reuses", sampled.totals.spilledReuses);
+        MemoryStats::AppendMiB(line, "tex_overflow_dropped", sampled.totals.overflowDroppedBytes, sampled.totals.overflowDropped);
+        MemoryStats::AppendCount(line, "tex_overflow_waits", sampled.totals.overflowWaits);
+    }
     MemoryStats::AppendMiB(line, "tex_oom_reclaimed", atomics.reclaimedBytes.load(std::memory_order_relaxed), atomics.reclaims.load(std::memory_order_relaxed));
     std::size_t storageEntries = 0;
     {
@@ -1345,6 +1488,9 @@ SampledCacheCounts SampledCacheCounters() {
         counts.spilled = cache.totals.spilled;
         counts.spilledBytes = cache.totals.spilledBytes;
         counts.oneOffReuses = cache.totals.oneOffReuses;
+        counts.made = cache.totals.made;
+        counts.spilledReuses = cache.totals.spilledReuses;
+        counts.overflowDropped = cache.totals.overflowDropped;
     }
     auto& atomics = SampledAtomics();
     counts.droppedSets = atomics.droppedSets.load(std::memory_order_relaxed);
@@ -1379,6 +1525,9 @@ VkDeviceSize reclaimSampledTextures(VkDevice device, VkDeviceSize wanted) {
             doomed.push_back(current->texture);
             eraseTexture(cache, current);
         }
+        const auto keptBefore = cache.overflowKept;
+        evicted += trimOverflow(cache, [&] { return freed + (keptBefore - cache.overflowKept) < goal; });
+        freed += keptBefore - cache.overflowKept;
         released.swap(cache.released);
     }
     std::size_t sets = 0;
@@ -1437,7 +1586,10 @@ void ClearCachedTextures(VkDevice device) {
             if (it->key.device == device) eraseTexture(sampled, it++);
             else ++it;
         }
-        std::erase_if(sampled.oneOffs, [&](const auto& entry) { return entry.first.device == device; });
+        for (auto it = sampled.oneOffs.begin(); it != sampled.oneOffs.end();) {
+            if (it->first.device == device) eraseOneOff(sampled, it++);
+            else ++it;
+        }
     }
     dropReleasedDependents();
     auto& storage = StorageTextures();

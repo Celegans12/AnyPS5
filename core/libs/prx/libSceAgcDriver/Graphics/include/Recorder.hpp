@@ -91,6 +91,10 @@ public:
     void FlushDeferredReleases();
     static constexpr std::size_t KeptBytesBudget = std::size_t{512} << 20u;
     void BoundKeptBytes();
+    // Waits for the oldest submitted batch (submitting the open one first when none is in flight)
+    // and runs its completion, releasing what it kept; false when there is nothing to wait for or
+    // the GPU mutex is not held by this thread.
+    bool RetireOldest();
     std::size_t InFlightKeptBytes() const { return inFlightKeptBytes; }
     enum class SnapshotUse : std::uint8_t { Storage, Vertex, Index16, Index32, Index16Restart, Index32Restart };
     static constexpr std::size_t DrawSnapshotBudget = std::size_t{1024} << 20u;

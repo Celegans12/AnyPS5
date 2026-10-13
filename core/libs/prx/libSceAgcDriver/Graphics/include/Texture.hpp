@@ -41,6 +41,9 @@ bool StorageClearAvailable(const Context& context, std::uint32_t guestFormat, Dc
 // count), and in system memory (snapshots made past the sampled share, see cachedTexture).
 std::uint64_t SampledTextureMemory();
 std::uint64_t SampledTextureHostMemory();
+// The part of SampledTextureMemory in the overflow type (Texture::Spilled outside system memory):
+// VRAM by the reported usage, but backed by system memory once the driver moves it there.
+std::uint64_t SampledTextureOverflowMemory();
 // What an image with an allocation of its own takes in its heap beyond its memory requirements: the
 // allocation rounded up to 64 KiB (NVIDIA on Windows: a 16 KiB image takes 64 KiB of the reported
 // usage, 64 and 256 KiB ones nothing more, images without memory and views nothing; see

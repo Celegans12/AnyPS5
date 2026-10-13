@@ -30,11 +30,15 @@ void FlushCachedTextures(VkDevice device);
 void ClearCachedTextures(VkDevice device);
 std::uint64_t TextureCacheBudget(const VkPhysicalDeviceMemoryProperties& memory);
 // What the texture caches hold: every live sampled texture's own image (SampledTextureMemory), the
-// part of it the sampled cache's snapshot entries account, and the storage image cache's bytes.
+// part of it the sampled cache's snapshot entries account, the storage image cache's bytes, and the
+// part of `sampled` in the overflow type (SampledTextureOverflowMemory): the caches' own, so not
+// other usage, but not taken from the sampled ceiling either (the driver moves those pages out of
+// the VRAM when it needs the room; the overflow budget bounds them).
 struct TextureMemoryUse {
     std::uint64_t sampled = 0;
     std::uint64_t sampledCached = 0;
     std::uint64_t storageCached = 0;
+    std::uint64_t overflow = 0;
 };
 // The texture caches' budgets, out of one share of the device-local heap: VK_EXT_memory_budget's
 // budget (or APS5_VRAM_BUDGET_MIB) less the VramBudget headroom and less what everything else uses
@@ -50,12 +54,19 @@ struct TextureMemoryUse {
 // `previousTarget` (the share of the last read, 0: none) is kept while the new one is within a
 // sixty-fourth of it or 64 MiB: the reported usage moves by a few MiB as the driver frees memory
 // late (images a retired batch held) or allocates for itself, and the budgets should not follow.
+// `overflow` bounds the sampled images in the overflow type (SampledTextureOverflowMemory): the
+// driver backs them with system memory once the VRAM is taken, and lean-x24 failed to allocate one
+// with heap 1 (system memory) 11.6 of its 15.5 GB budget used and 4.7 GB of them alive, where an
+// otherwise idle RTX 3080 Laptop takes 12 GiB of them past a full VRAM (heap 1 nearly empty). So
+// the largest heap that is not device-local's budget less its usage less a sixteenth of its budget
+// (0: no such heap or no VK_EXT_memory_budget, unbounded); APS5_TEXTURE_OVERFLOW_MIB forces it.
 struct TextureCacheBudgets {
     std::uint64_t sampled = 0;
     std::uint64_t ceiling = 0;
     std::uint64_t storage = 0;
     std::uint64_t target = 0;
     std::uint64_t share = 0;
+    std::uint64_t overflow = 0;
 };
 TextureCacheBudgets TextureCacheBudgetsFor(const VkPhysicalDeviceMemoryProperties& memory, const VkPhysicalDeviceMemoryBudgetPropertiesEXT* reported, const TextureMemoryUse& use, std::uint64_t previousTarget = 0);
 bool SampledBudgetReportDue(std::uint64_t reported, std::uint64_t budget, std::chrono::steady_clock::duration sinceReport);
@@ -80,6 +91,9 @@ struct SampledCacheCounts {
     std::uint64_t spilled = 0;
     std::uint64_t spilledBytes = 0;
     std::uint64_t oneOffReuses = 0;
+    std::uint64_t made = 0;
+    std::uint64_t spilledReuses = 0;
+    std::uint64_t overflowDropped = 0;
 };
 SampledCacheCounts SampledCacheCounters();
 std::shared_ptr<Texture> CachedSampledTexture(const Context& context, std::span<const std::uint32_t> words);

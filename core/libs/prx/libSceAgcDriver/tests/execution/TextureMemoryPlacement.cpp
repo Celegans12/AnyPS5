@@ -408,8 +408,13 @@ void FullHeapPlacements(const Device& device, std::uint32_t local) {
             if ((requirements.memoryTypeBits & (1u << type)) == 0) continue;
             const auto overflowBefore = device.Settled();
             Images overflow(device);
-            const auto overflowResult = Allocate(device, overflow, type, 128, 2048, 1);
-            std::printf("then 2 GiB of optimal images in type %u with the device-local heap out of memory: %zu allocated (%s), %s\n", type, overflow.memories.size(), overflowResult == VK_SUCCESS ? "all" : "failed", Delta(overflowBefore, device.Settled()).c_str());
+            auto overflowResult = VK_SUCCESS;
+            for (int gib = 0; gib < 12 && overflowResult == VK_SUCCESS; ++gib) {
+                overflowResult = Allocate(device, overflow, type, 64, 2048, 1);
+                const auto now = device.Settled();
+                std::printf("then optimal images in type %u with the device-local heap out of memory: %zu MiB allocated%s, heap0 usage %lld MiB, heap1 usage %lld MiB\n", type, overflow.memories.size() * 16u, overflowResult == VK_SUCCESS ? "" : " (failed)", static_cast<long long>(now.heaps[local] >> 20u), static_cast<long long>(now.heaps[1u - local] >> 20u));
+            }
+            std::printf("overflow type %u took %zu MiB past the full device-local heap: %s\n", type, overflow.memories.size() * 16u, Delta(overflowBefore, device.Settled()).c_str());
         }
     }
 }
