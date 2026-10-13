@@ -63,6 +63,7 @@ int g_requests = 0;
 bool g_noReference = false;
 bool g_variants = false;
 bool g_describe = false;
+bool g_nativeTarget = false;
 std::string g_expectedSpirv;
 
 void ConfigurePipelineReplay(int argc, char** argv) {
@@ -75,6 +76,7 @@ void ConfigurePipelineReplay(int argc, char** argv) {
         if (option == "--no-reference") g_noReference = true;
         if (option == "--fingerprint-variants") g_variants = true;
         if (option == "--describe") g_describe = true;
+        if (option == "--native-target") g_nativeTarget = true;
         if (option == "--prepare-only") prepare = true;
         if (option == "--maintenance8") maintenance = true;
         if (option == "--expect-spv") {
@@ -332,6 +334,30 @@ std::string CheckPipelineReference(const char* path, const ShaderRecompiler::Rec
     return {};
 }
 
+std::string TargetDifference(const ShaderRecompiler::SpirvTarget& captured, const ShaderRecompiler::SpirvTarget& native) {
+    std::string text;
+    const auto differs = [&](const char* name, bool different) {
+        if (different) text += std::string(" ") + name;
+    };
+    differs("vulkanVersion", captured.vulkanVersion != native.vulkanVersion);
+    differs("spirvVersion", captured.spirvVersion != native.spirvVersion);
+    differs("subgroupSize", captured.subgroupSize != native.subgroupSize);
+    differs("bdaAbiVersion", captured.bdaAbiVersion != native.bdaAbiVersion);
+    differs("supportedCapabilities", !std::ranges::equal(captured.supportedCapabilities, native.supportedCapabilities));
+    differs("supportedExtensions", !std::ranges::equal(captured.supportedExtensions, native.supportedExtensions));
+    differs("fragmentShaderBarycentricEnabled", captured.fragmentShaderBarycentricEnabled != native.fragmentShaderBarycentricEnabled);
+    differs("maxWorkgroupSize", captured.maxWorkgroupSize != native.maxWorkgroupSize);
+    differs("maxWorkgroupInvocations", captured.maxWorkgroupInvocations != native.maxWorkgroupInvocations);
+    differs("maxWorkgroupSharedMemoryBytes", captured.maxWorkgroupSharedMemoryBytes != native.maxWorkgroupSharedMemoryBytes);
+    differs("mesh", captured.mesh.has_value() != native.mesh.has_value());
+    differs("tessellation", captured.tessellation.has_value() != native.tessellation.has_value());
+    differs("nonConstantImageOffsets", captured.nonConstantImageOffsets != native.nonConstantImageOffsets);
+    differs("srgbDecodeFormats", captured.srgbDecodeFormats != native.srgbDecodeFormats);
+    differs("narrowSubgroupClock", captured.narrowSubgroupClock != native.narrowSubgroupClock);
+    differs("float64DenormPreserve", captured.float64DenormPreserve != native.float64DenormPreserve);
+    return text;
+}
+
 void InspectSpirv(const char* path, std::span<const std::uint32_t> words) {
     if (g_spirv) {
         std::string name(path);
@@ -353,6 +379,13 @@ void InspectSpirv(const char* path, std::span<const std::uint32_t> words) {
 
 bool Replay(const char* path, std::unique_ptr<AgcDriver::VulkanDevice>& device) {
     auto request = ShaderRecompiler::RequestSerializer{}.Deserialize(ReadText(path));
+    if (g_nativeTarget) {
+        if (!device) device = std::make_unique<AgcDriver::VulkanDevice>();
+        const auto native = device->ComputeTarget(request.request.context.waveSize);
+        const auto difference = TargetDifference(request.request.target, native);
+        std::printf("  native target (--native-target): %s%s\n", difference.empty() ? "the captured target matches" : "replaced the captured target's", difference.c_str());
+        request.request.target = native;
+    }
     if (g_pipelineOnly) {
         if (!g_expectedSpirv.empty() && g_requests > 1) throw std::runtime_error("--expect-spv takes one request; several requests need their .fp sidecars");
         if (request.request.shader.stage != ShaderRecompiler::ShaderStage::Compute || !request.request.context.compute.has_value() || request.request.graphics.has_value()) throw std::runtime_error("pipeline-only requires a compute request");
@@ -511,7 +544,7 @@ bool Replay(const char* path, std::unique_ptr<AgcDriver::VulkanDevice>& device) 
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] [--code] [--maintenance8] [--prepare-only | --pipeline-only --pipeline-cache DIR [--expect-spv FILE | --no-reference]] <shader.req>...\n  --prepare-only plans and compiles without materializing runtime memory\n  --pipeline-only recompiles captured compute inputs and creates the native pipeline without guest resources or dispatch\n  --pipeline-cache selects an existing private cache directory; __GL_SHADER_DISK_CACHE_PATH must select a separate fresh empty directory\n  --expect-spv requires byte equality with an ordinary replay before device creation (one request); without it each\n    request needs the .fp sidecar APS5_PIPELINE_REQUESTS saved next to it, and its pipeline fingerprint must match\n  --no-reference skips that check (requests from older runs); a hit in the game's pipeline cache then proves the match\n  several requests share one device and cache; each success prints a PIPELINE-RESULT line\n  --fingerprint-variants prints the pipeline fingerprint components of each way to materialize a request against its .fp\n    (--describe adds the values: specialization constants, bindings)\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set\n");
+        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] [--code] [--maintenance8] [--prepare-only | --pipeline-only --pipeline-cache DIR [--expect-spv FILE | --no-reference]] <shader.req>...\n  --prepare-only plans and compiles without materializing runtime memory\n  --pipeline-only recompiles captured compute inputs and creates the native pipeline without guest resources or dispatch\n  --pipeline-cache selects an existing private cache directory; __GL_SHADER_DISK_CACHE_PATH must select a separate fresh empty directory\n  --expect-spv requires byte equality with an ordinary replay before device creation (one request); without it each\n    request needs the .fp sidecar APS5_PIPELINE_REQUESTS saved next to it, and its pipeline fingerprint must match\n  --no-reference skips that check (requests from older runs); a hit in the game's pipeline cache then proves the match\n  several requests share one device and cache; each success prints a PIPELINE-RESULT line\n  --fingerprint-variants prints the pipeline fingerprint components of each way to materialize a request against its .fp\n    (--describe adds the values: specialization constants, bindings)\n  --native-target replaces a captured compute target with this device's (requests from builds with another target) and names the fields that differed\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set\n");
         return 2;
     }
     try {
@@ -528,7 +561,7 @@ int main(int argc, char** argv) {
     std::unique_ptr<AgcDriver::VulkanDevice> device;
     int failures = 0;
     for (int i = 1; i < argc; ++i) {
-        if (std::string(argv[i]) == "--pipeline-only" || std::string(argv[i]) == "--no-reference" || std::string(argv[i]) == "--fingerprint-variants" || std::string(argv[i]) == "--describe") continue;
+        if (std::string(argv[i]) == "--pipeline-only" || std::string(argv[i]) == "--no-reference" || std::string(argv[i]) == "--fingerprint-variants" || std::string(argv[i]) == "--describe" || std::string(argv[i]) == "--native-target") continue;
         if (std::string(argv[i]) == "--pipeline-cache" || std::string(argv[i]) == "--expect-spv") {
             ++i;
             continue;
