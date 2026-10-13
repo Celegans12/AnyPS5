@@ -13,6 +13,7 @@
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/ApplicationHeap.hpp"
+#include "prx/libc/include/HostEntropy.hpp"
 #include "prx/libc/include/Shutdown.hpp"
 #include "prx/libkernel/AppMetadata/include/AppMetadata.hpp"
 #include "prx/libkernel/DirectMemory/DirectMemory.hpp"
@@ -29,7 +30,6 @@
 #include <limits>
 #include <memory>
 #include <mutex>
-#include <random>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -329,11 +329,8 @@ void* APS5_VABI sceKernelGetProcParam(void) {
 
 int APS5_VABI sceKernelUuidCreate(std::uint32_t* uuid) {
     if (!uuid) return sceInvalidArgument;
-    static thread_local std::random_device device;
-    std::uniform_int_distribution<std::uint32_t> distribution;
     std::array<std::uint32_t, 4> value;
-    for (auto& word : value)
-        word = distribution(device);
+    HostEntropy_nid_no_patch(value.data(), sizeof(value));
     value[1] = (value[1] & 0x0fffffffu) | 0x40000000u;
     value[2] = (value[2] & 0xffffff3fu) | 0x80u;
     std::memcpy(uuid, value.data(), sizeof(value));
