@@ -167,7 +167,7 @@ int main() {
             return std::ranges::find(target.supportedCapabilities, static_cast<std::uint32_t>(capability)) != target.supportedCapabilities.end();
         };
         if (!supports(spv::CapabilityFloat16) || !supports(spv::CapabilityRoundingModeRTE) || !supports(spv::CapabilityDenormPreserve)) {
-            std::puts("f16 native: the device has no native f16 with RTE rounding and kept denormals, skipped");
+            std::puts("f16 native: skipped, the device has no native f16 with RTE rounding and kept denormals");
             return VulkanTestSkipped;
         }
         std::vector<std::uint32_t> withoutFloat16;
