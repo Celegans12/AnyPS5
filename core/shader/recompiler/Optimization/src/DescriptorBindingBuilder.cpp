@@ -415,7 +415,7 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
         if ((imageHeap || samplerHeap) && compact.resources.empty()) continue;
         PreparedDescriptorBinding entry{};
         auto& physical = entry.descriptor;
-        physical.descriptorSet = fragmentDescriptorSet && stage == IrShaderStage::Pixel ? RuntimeAbi::FragmentDescriptorSet : RuntimeAbi::DescriptorSet;
+        physical.descriptorSet = fragmentDescriptorSet && stage == IrShaderStage::Pixel && compact.kind != DescriptorBindingKind::ImageTable && compact.kind != DescriptorBindingKind::StorageImageTable ? RuntimeAbi::FragmentDescriptorSet : RuntimeAbi::DescriptorSet;
         physical.binding = NativeBinding(stage, compact.kind);
         physical.count = compact.resources.empty() ? 1u : static_cast<std::uint32_t>(compact.resources.size());
         physical.kind = PhysicalKindFor(compact.kind);

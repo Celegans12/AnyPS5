@@ -305,6 +305,11 @@ public:
         return candidate != nullptr && (depthPlane.storage.get() == candidate || stencilPlane.storage.get() == candidate);
     }
 
+    bool PlaneView(const StorageTexture* candidate) const {
+        const auto replaced = [&](const PlaneStorage& plane) { return std::any_of(plane.replaced.begin(), plane.replaced.end(), [&](const auto& old) { return old.lock().get() == candidate; }); };
+        return OwnsPlane(candidate) || (candidate != nullptr && (replaced(depthPlane) || replaced(stencilPlane)));
+    }
+
     bool StoreBack(const StorageTexture& candidate) {
         for (const bool stencil : {false, true}) {
             auto& plane = stencil ? stencilPlane : depthPlane;
@@ -873,7 +878,7 @@ void ValidateStorageDepthWrites(const Context& context, std::span<const std::sha
     for (const auto& image : storage) {
         ForStorageDepth(context, *image, [&](DepthSurface& surface, std::uint32_t layer, VkImageAspectFlagBits aspect) {
             const auto found = std::find_if(writes.begin(), writes.end(), [&](const auto& write) { return write.surface == &surface && write.aspect == aspect; });
-            Require(found == writes.end() || (found->storage == image.get() && found->layer == layer), "conflicting writable storage images alias the same depth/stencil plane");
+            Require(found == writes.end() || (found->storage == image.get() && found->layer == layer) || (surface.PlaneView(found->storage) && surface.PlaneView(image.get())), "conflicting writable storage images alias the same depth/stencil plane");
             if (found == writes.end()) writes.push_back({&surface, image.get(), layer, aspect});
         }, false);
     }

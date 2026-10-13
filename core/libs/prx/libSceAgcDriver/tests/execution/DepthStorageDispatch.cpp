@@ -253,7 +253,9 @@ void ArrayViewCase(AgcDriver::VulkanDevice& device, const Shaders& shaders, std:
     std::copy(texture.begin(), texture.end(), userData.begin() + 4);
     userData[14] = std::bit_cast<std::uint32_t>(1.0f / 64.0f);
     const auto program = Compile(device, StoreLayerCode, userData);
-    ExpectRefusal([&] { device.Dispatch(program, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(StoreLayerCode.data())); }, "storage image access to depth/stencil surface", "a two-layer 2D array storage view of the depth plane");
+    device.Dispatch(program, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(StoreLayerCode.data()));
+    device.WaitIdle();
+    RequireRow(Draw(device, shaders, surface, {.depthCompare = VK_COMPARE_OP_GREATER}), "depth test against layer 0 of the two-layer 2D array view's depth");
 }
 
 void MultisampledCase(AgcDriver::VulkanDevice& device, const Shaders& compiled, std::uint8_t* block) {
