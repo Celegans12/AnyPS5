@@ -34,6 +34,15 @@ using GuestExitCallback = void (APS5_VABI*)();
 std::mutex exitCallbackMutex;
 std::vector<GuestExitCallback> exitCallbacks;
 
+void ReportGuestExit(const char* how, int code, void* caller) {
+#ifdef _WIN32
+    std::fprintf(stderr, "[libc] guest %s(%d) from %p on thread %lu ends the process\n", how, code, caller, GetCurrentThreadId());
+#else
+    std::fprintf(stderr, "[libc] guest %s(%d) from %p ends the process\n", how, code, caller);
+#endif
+    std::fflush(stderr);
+}
+
 void runGuestExitCallback() {
     GuestExitCallback callback;
     {
@@ -104,11 +113,7 @@ extern "C" void LibcRunShutdown_nid_postfix() {
 extern "C" {
 
 [[noreturn]] void APS5_VABI _Exit_nid_postfix(int code) {
-    static const bool trace = std::getenv("APS5_TRACE_EXIT") != nullptr;
-    if (trace) {
-        std::fprintf(stderr, "[libc] _Exit(%d) called from %p\n", code, __builtin_return_address(0));
-        std::fflush(stderr);
-    }
+    ReportGuestExit("_Exit", code, __builtin_return_address(0));
     LibcTerminate_nid_no_patch(code);
 }
 
@@ -128,15 +133,12 @@ extern "C" {
 }
 
 void APS5_VABI exit_nid_postfix(int code) {
-    static const bool trace = std::getenv("APS5_TRACE_EXIT") != nullptr;
-    if (trace) {
-        std::fprintf(stderr, "[libc] exit(%d) called from %p\n", code, __builtin_return_address(0));
-        std::fflush(stderr);
-    }
+    ReportGuestExit("exit", code, __builtin_return_address(0));
     LibcExit_nid_no_patch(code);
 }
 
 [[noreturn]] void APS5_VABI catchReturnFromMain_nid_postfix(int status) {
+    ReportGuestExit("return from main", status, __builtin_return_address(0));
     LibcExit_nid_no_patch(status);
 }
 
