@@ -478,13 +478,15 @@ void rememberOneOff(TextureCache& cache, const TextureKey& key, const std::share
     }
 }
 
-// Drops kept spilled snapshots no build or recorded work uses, least recently used first, while
-// `over()` holds; returns how many.
-template<typename Over>
-std::size_t trimOverflow(TextureCache& cache, Over over) {
+// Drops kept spilled snapshots no build or recorded work uses (no other holder, last used by a
+// batch the recorder retired: the open batch's serial is past every retired one), least recently
+// used first, until `excess` bytes are dropped; returns how many. The textures go to `doomed`, for
+// the caller to hand to the open batch once the cache's mutex is released (keepUntilRetired).
+std::size_t trimOverflow(TextureCache& cache, std::uint64_t excess, std::vector<std::shared_ptr<Texture>>& doomed) {
     const auto retired = retiredSerial();
     std::size_t dropped = 0;
-    for (auto it = cache.overflowLru.end(); it != cache.overflowLru.begin() && over();) {
+    std::uint64_t droppedBytes = 0;
+    for (auto it = cache.overflowLru.end(); it != cache.overflowLru.begin() && droppedBytes < excess;) {
         const auto current = std::prev(it);
         const auto found = cache.oneOffs.find(*current);
         if (found == cache.oneOffs.end() || found->second.kept == nullptr) {
@@ -497,13 +499,27 @@ std::size_t trimOverflow(TextureCache& cache, Over over) {
             continue;
         }
         ++dropped;
+        droppedBytes += kept->AllocationBytes();
         ++cache.counts.overflowDropped;
         ++cache.totals.overflowDropped;
         cache.counts.overflowDroppedBytes += kept->AllocationBytes();
         cache.totals.overflowDroppedBytes += kept->AllocationBytes();
+        doomed.push_back(kept);
         eraseOneOff(cache, found);
     }
     return dropped;
+}
+
+// Textures (and resource sets) the caches let go of are destroyed with the open batch's retirement
+// when one is recording on this thread, not on the spot: nothing GPU-side may still name their
+// images or views by then, whatever path bound them.
+template<typename T>
+void keepUntilRetired(std::vector<std::shared_ptr<T>>& objects) {
+    if (objects.empty()) return;
+    if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->Recording() && GuestMemory::GpuMutex().HeldByThisThread()) {
+        for (auto& object : objects) recorder->Keep(std::move(object));
+    }
+    objects.clear();
 }
 
 // Drops the resource-cache sets that bind textures the sampled cache let go (cache.released), so
@@ -857,25 +873,37 @@ std::uint64_t storageBudget(const Context& context) {
 void boundOverflow(const Context& context) {
     if (SampledTextureOverflowMemory() == 0 && SampledTextureHostMemory() == 0) return;
     const auto budgets = currentBudgets(context);
-    const auto overBudget = [&] { return budgets.overflow != 0 && (SampledTextureOverflowMemory() > budgets.overflow || SampledTextureHostMemory() > budgets.overflow); };
-    const auto over = overBudget;
+    const auto excess = [&]() -> std::uint64_t {
+        if (budgets.overflow == 0) return 0;
+        const auto live = std::max(SampledTextureOverflowMemory(), SampledTextureHostMemory());
+        return live > budgets.overflow ? live - budgets.overflow : 0;
+    };
     auto& cache = Textures();
+    std::vector<std::shared_ptr<Texture>> doomed;
     {
         const SampledCacheLock lock(cache);
-        if (cache.overflowLru.empty() || !over()) return;
+        const auto over = excess();
+        if (cache.overflowLru.empty() || over == 0) return;
         const auto retired = retiredSerial();
         const auto now = std::chrono::steady_clock::now();
         if (cache.overflowTrimFailed && cache.overflowTrimRetired == retired && now - cache.overflowTrimAt < std::chrono::milliseconds(50)) return;
-        cache.overflowTrimFailed = trimOverflow(cache, over) == 0;
+        cache.overflowTrimFailed = trimOverflow(cache, over, doomed) == 0;
         cache.overflowTrimRetired = retired;
         cache.overflowTrimAt = now;
     }
+    // Dropped while the open batch records: they go when it retires, so a wait comes first.
+    const bool deferred = !doomed.empty();
+    keepUntilRetired(doomed);
+    if (!deferred && !cache.overflowTrimFailed) return;
     auto* recorder = Recorder::Active();
-    for (int wait = 0; wait < 4 && recorder != nullptr && overBudget() && recorder->RetireOldest(); ++wait) {
-        const SampledCacheLock lock(cache);
-        ++cache.counts.overflowWaits;
-        ++cache.totals.overflowWaits;
-        trimOverflow(cache, overBudget);
+    for (int wait = 0; wait < 4 && recorder != nullptr && excess() != 0 && recorder->RetireOldest(); ++wait) {
+        {
+            const SampledCacheLock lock(cache);
+            ++cache.counts.overflowWaits;
+            ++cache.totals.overflowWaits;
+            trimOverflow(cache, excess(), doomed);
+        }
+        keepUntilRetired(doomed);
     }
 }
 
@@ -1491,6 +1519,7 @@ SampledCacheCounts SampledCacheCounters() {
         counts.made = cache.totals.made;
         counts.spilledReuses = cache.totals.spilledReuses;
         counts.overflowDropped = cache.totals.overflowDropped;
+        counts.overflowWaits = cache.totals.overflowWaits;
     }
     auto& atomics = SampledAtomics();
     counts.droppedSets = atomics.droppedSets.load(std::memory_order_relaxed);
@@ -1526,7 +1555,7 @@ VkDeviceSize reclaimSampledTextures(VkDevice device, VkDeviceSize wanted) {
             eraseTexture(cache, current);
         }
         const auto keptBefore = cache.overflowKept;
-        evicted += trimOverflow(cache, [&] { return freed + (keptBefore - cache.overflowKept) < goal; });
+        evicted += trimOverflow(cache, freed < goal ? goal - freed : 0u, doomed);
         freed += keptBefore - cache.overflowKept;
         released.swap(cache.released);
     }
@@ -1537,8 +1566,13 @@ VkDeviceSize reclaimSampledTextures(VkDevice device, VkDeviceSize wanted) {
         std::vector<std::shared_ptr<ShaderResources>> resources;
         SharedResourceCache().RemoveTextures(set, &resources);
         sets = resources.size();
+        keepUntilRetired(resources);
     }
-    released.clear();
+    keepUntilRetired(released);
+    // The evicted textures themselves go now (their memory is what the allocation waits for): no
+    // holder is left (a resource set or batch binding one holds it) and the newest batch that used
+    // one retired (every lookup, hit, revalidation and table reuse stamps the use's serial; a set
+    // binding a texture outside the cache is never reused without a lookup).
     doomed.clear();
     if (freed != 0) {
         auto& atomics = SampledAtomics();

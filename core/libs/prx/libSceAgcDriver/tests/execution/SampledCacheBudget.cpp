@@ -28,6 +28,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -709,12 +710,345 @@ int burstOverflowTests(Context context) {
     return 0;
 }
 
+// Use-after-free watch on the device functions (no validation layer on this machine): which
+// images and views each command buffer names (copies, clears, barriers, bound descriptor sets) from
+// its begin until it is reset, freed or its submission's fence signals, and every image or view
+// destroyed while a command buffer naming it is still pending.
+struct HandleWatch {
+    PFN_vkGetDeviceProcAddr real = nullptr;
+    VkDevice device = VK_NULL_HANDLE;
+    std::mutex mutex;
+    struct Commands {
+        std::unordered_set<std::uint64_t> handles;
+        bool submitted = false;
+        VkFence fence = VK_NULL_HANDLE;
+        std::uint64_t epoch = 0;
+        bool idle = false;
+        VkCommandPool pool = VK_NULL_HANDLE;
+    };
+    std::unordered_map<VkFence, std::uint64_t> fenceEpochs;
+    std::unordered_map<VkCommandBuffer, Commands> commands;
+    std::unordered_map<VkDescriptorSet, std::vector<std::uint64_t>> sets;
+    std::uint64_t destroyed = 0;
+    std::uint64_t violations = 0;
+    std::string first;
+    template<typename F>
+    F at(const char* name) const { return reinterpret_cast<F>(real(device, name)); }
+    bool pending(const Commands& state) const {
+        if (!state.submitted) return true;
+        if (state.idle) return false;
+        if (state.fence == VK_NULL_HANDLE) return true;
+        // A fence submitted again was reset first, which the earlier submission had to finish for.
+        if (const auto found = fenceEpochs.find(state.fence); found != fenceEpochs.end() && found->second != state.epoch) return false;
+        return at<PFN_vkGetFenceStatus>("vkGetFenceStatus")(device, state.fence) != VK_SUCCESS;
+    }
+    void name(VkCommandBuffer buffer, std::uint64_t handle) {
+        std::lock_guard lock(mutex);
+        commands[buffer].handles.insert(handle);
+    }
+    void destroying(std::uint64_t handle, const char* what) {
+        std::lock_guard lock(mutex);
+        ++destroyed;
+        for (const auto& [buffer, state] : commands) {
+            if (!state.handles.contains(handle) || !pending(state)) continue;
+            if (violations++ == 0) {
+                const auto status = state.fence != VK_NULL_HANDLE ? static_cast<int>(at<PFN_vkGetFenceStatus>("vkGetFenceStatus")(device, state.fence)) : 99;
+                first = std::string(what) + " destroyed while a " + (state.submitted ? "submitted, unfinished" : "recorded, unsubmitted") + " command buffer names it (handle " + std::to_string(handle) + ", fence status " + std::to_string(status) + ", epoch " + std::to_string(state.epoch) + ", " + std::to_string(state.handles.size()) + " handles named)";
+                if (std::getenv("APS5_WATCH_ABORT") != nullptr) {
+                    std::fputs(first.c_str(), stderr);
+                    std::abort();
+                }
+            }
+            return;
+        }
+    }
+    void reset(VkCommandBuffer buffer) {
+        std::lock_guard lock(mutex);
+        commands.erase(buffer);
+    }
+};
+
+HandleWatch& Watch() {
+    static HandleWatch watch;
+    return watch;
+}
+
+template<typename T>
+std::uint64_t Handle(T handle) {
+    return reinterpret_cast<std::uint64_t>(handle);
+}
+
+VkResult VKAPI_PTR WatchedAllocateCommandBuffers(VkDevice device, const VkCommandBufferAllocateInfo* info, VkCommandBuffer* buffers) {
+    const auto result = Watch().at<PFN_vkAllocateCommandBuffers>("vkAllocateCommandBuffers")(device, info, buffers);
+    if (result == VK_SUCCESS) {
+        std::lock_guard lock(Watch().mutex);
+        for (std::uint32_t i = 0; i < info->commandBufferCount; ++i) Watch().commands[buffers[i]] = {{}, false, VK_NULL_HANDLE, 0, false, info->commandPool};
+    }
+    return result;
+}
+
+VkResult VKAPI_PTR WatchedBegin(VkCommandBuffer buffer, const VkCommandBufferBeginInfo* info) {
+    {
+        std::lock_guard lock(Watch().mutex);
+        auto& state = Watch().commands[buffer];
+        const auto pool = state.pool;
+        state = {{}, false, VK_NULL_HANDLE, 0, false, pool};
+    }
+    return Watch().at<PFN_vkBeginCommandBuffer>("vkBeginCommandBuffer")(buffer, info);
+}
+
+VkResult VKAPI_PTR WatchedResetCommandBuffer(VkCommandBuffer buffer, VkCommandBufferResetFlags flags) {
+    {
+        std::lock_guard lock(Watch().mutex);
+        auto& state = Watch().commands[buffer];
+        state.handles.clear();
+        state.submitted = true;
+        state.idle = true;
+    }
+    return Watch().at<PFN_vkResetCommandBuffer>("vkResetCommandBuffer")(buffer, flags);
+}
+
+void VKAPI_PTR WatchedFreeCommandBuffers(VkDevice device, VkCommandPool pool, std::uint32_t count, const VkCommandBuffer* buffers) {
+    for (std::uint32_t i = 0; i < count; ++i) Watch().reset(buffers[i]);
+    Watch().at<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(device, pool, count, buffers);
+}
+
+VkResult VKAPI_PTR WatchedResetCommandPool(VkDevice device, VkCommandPool pool, VkCommandPoolResetFlags flags) {
+    {
+        std::lock_guard lock(Watch().mutex);
+        for (auto& [buffer, state] : Watch().commands) {
+            if (state.pool != pool) continue;
+            state.handles.clear();
+            state.submitted = true;
+            state.idle = true;
+        }
+    }
+    return Watch().at<PFN_vkResetCommandPool>("vkResetCommandPool")(device, pool, flags);
+}
+
+VkResult VKAPI_PTR WatchedSubmit(VkQueue queue, std::uint32_t count, const VkSubmitInfo* submits, VkFence fence) {
+    {
+        std::lock_guard lock(Watch().mutex);
+        const auto epoch = fence != VK_NULL_HANDLE ? ++Watch().fenceEpochs[fence] : 0;
+        for (std::uint32_t i = 0; i < count; ++i) {
+            for (std::uint32_t j = 0; j < submits[i].commandBufferCount; ++j) {
+                auto& state = Watch().commands[submits[i].pCommandBuffers[j]];
+                state.submitted = true;
+                state.fence = fence;
+                state.epoch = epoch;
+                state.idle = false;
+            }
+        }
+    }
+    return Watch().at<PFN_vkQueueSubmit>("vkQueueSubmit")(queue, count, submits, fence);
+}
+
+// A fence the device waited for or reset (which needs its submission finished) completes the
+// command buffers submitted with it.
+void FenceDone(std::uint32_t count, const VkFence* fences) {
+    std::lock_guard lock(Watch().mutex);
+    for (auto& [buffer, state] : Watch().commands) {
+        if (!state.submitted || state.fence == VK_NULL_HANDLE) continue;
+        for (std::uint32_t i = 0; i < count; ++i) {
+            if (fences[i] == state.fence) state.idle = true;
+        }
+    }
+}
+
+VkResult VKAPI_PTR WatchedWaitForFences(VkDevice device, std::uint32_t count, const VkFence* fences, VkBool32 all, std::uint64_t timeout) {
+    const auto result = Watch().at<PFN_vkWaitForFences>("vkWaitForFences")(device, count, fences, all, timeout);
+    if (result == VK_SUCCESS && (all || count == 1)) FenceDone(count, fences);
+    return result;
+}
+
+VkResult VKAPI_PTR WatchedResetFences(VkDevice device, std::uint32_t count, const VkFence* fences) {
+    FenceDone(count, fences);
+    return Watch().at<PFN_vkResetFences>("vkResetFences")(device, count, fences);
+}
+
+VkResult VKAPI_PTR WatchedQueueWaitIdle(VkQueue queue) {
+    const auto result = Watch().at<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(queue);
+    std::lock_guard lock(Watch().mutex);
+    for (auto& [buffer, state] : Watch().commands) {
+        if (state.submitted) state.idle = true;
+    }
+    return result;
+}
+
+void VKAPI_PTR WatchedCopyBufferToImage(VkCommandBuffer buffer, VkBuffer source, VkImage image, VkImageLayout layout, std::uint32_t count, const VkBufferImageCopy* regions) {
+    Watch().name(buffer, Handle(image));
+    Watch().at<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(buffer, source, image, layout, count, regions);
+}
+
+void VKAPI_PTR WatchedClearColorImage(VkCommandBuffer buffer, VkImage image, VkImageLayout layout, const VkClearColorValue* color, std::uint32_t count, const VkImageSubresourceRange* ranges) {
+    Watch().name(buffer, Handle(image));
+    Watch().at<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(buffer, image, layout, color, count, ranges);
+}
+
+void VKAPI_PTR WatchedBarrier(VkCommandBuffer buffer, VkPipelineStageFlags from, VkPipelineStageFlags to, VkDependencyFlags flags, std::uint32_t memoryCount, const VkMemoryBarrier* memory, std::uint32_t bufferCount, const VkBufferMemoryBarrier* buffers, std::uint32_t imageCount, const VkImageMemoryBarrier* images) {
+    for (std::uint32_t i = 0; i < imageCount; ++i) Watch().name(buffer, Handle(images[i].image));
+    Watch().at<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(buffer, from, to, flags, memoryCount, memory, bufferCount, buffers, imageCount, images);
+}
+
+void VKAPI_PTR WatchedUpdateDescriptorSets(VkDevice device, std::uint32_t writeCount, const VkWriteDescriptorSet* writes, std::uint32_t copyCount, const VkCopyDescriptorSet* copies) {
+    {
+        std::lock_guard lock(Watch().mutex);
+        for (std::uint32_t i = 0; i < writeCount; ++i) {
+            if (writes[i].pImageInfo == nullptr) continue;
+            auto& views = Watch().sets[writes[i].dstSet];
+            for (std::uint32_t j = 0; j < writes[i].descriptorCount; ++j) views.push_back(Handle(writes[i].pImageInfo[j].imageView));
+        }
+    }
+    Watch().at<PFN_vkUpdateDescriptorSets>("vkUpdateDescriptorSets")(device, writeCount, writes, copyCount, copies);
+}
+
+void VKAPI_PTR WatchedBindDescriptorSets(VkCommandBuffer buffer, VkPipelineBindPoint point, VkPipelineLayout layout, std::uint32_t first, std::uint32_t count, const VkDescriptorSet* sets, std::uint32_t dynamicCount, const std::uint32_t* dynamic) {
+    {
+        std::lock_guard lock(Watch().mutex);
+        for (std::uint32_t i = 0; i < count; ++i) {
+            const auto found = Watch().sets.find(sets[i]);
+            if (found == Watch().sets.end()) continue;
+            for (const auto view : found->second) Watch().commands[buffer].handles.insert(view);
+        }
+    }
+    Watch().at<PFN_vkCmdBindDescriptorSets>("vkCmdBindDescriptorSets")(buffer, point, layout, first, count, sets, dynamicCount, dynamic);
+}
+
+void VKAPI_PTR WatchedDestroyImage(VkDevice device, VkImage image, const VkAllocationCallbacks* callbacks) {
+    Watch().destroying(Handle(image), "an image");
+    Watch().at<PFN_vkDestroyImage>("vkDestroyImage")(device, image, callbacks);
+}
+
+void VKAPI_PTR WatchedDestroyImageView(VkDevice device, VkImageView view, const VkAllocationCallbacks* callbacks) {
+    Watch().destroying(Handle(view), "an image view");
+    Watch().at<PFN_vkDestroyImageView>("vkDestroyImageView")(device, view, callbacks);
+}
+
+PFN_vkVoidFunction VKAPI_PTR WatchedProc(VkDevice device, const char* name) {
+    static const std::unordered_map<std::string, PFN_vkVoidFunction> table{
+        {"vkAllocateCommandBuffers", reinterpret_cast<PFN_vkVoidFunction>(&WatchedAllocateCommandBuffers)},
+        {"vkBeginCommandBuffer", reinterpret_cast<PFN_vkVoidFunction>(&WatchedBegin)},
+        {"vkResetCommandBuffer", reinterpret_cast<PFN_vkVoidFunction>(&WatchedResetCommandBuffer)},
+        {"vkFreeCommandBuffers", reinterpret_cast<PFN_vkVoidFunction>(&WatchedFreeCommandBuffers)},
+        {"vkResetCommandPool", reinterpret_cast<PFN_vkVoidFunction>(&WatchedResetCommandPool)},
+        {"vkQueueSubmit", reinterpret_cast<PFN_vkVoidFunction>(&WatchedSubmit)},
+        {"vkQueueWaitIdle", reinterpret_cast<PFN_vkVoidFunction>(&WatchedQueueWaitIdle)},
+        {"vkWaitForFences", reinterpret_cast<PFN_vkVoidFunction>(&WatchedWaitForFences)},
+        {"vkResetFences", reinterpret_cast<PFN_vkVoidFunction>(&WatchedResetFences)},
+        {"vkCmdCopyBufferToImage", reinterpret_cast<PFN_vkVoidFunction>(&WatchedCopyBufferToImage)},
+        {"vkCmdClearColorImage", reinterpret_cast<PFN_vkVoidFunction>(&WatchedClearColorImage)},
+        {"vkCmdPipelineBarrier", reinterpret_cast<PFN_vkVoidFunction>(&WatchedBarrier)},
+        {"vkUpdateDescriptorSets", reinterpret_cast<PFN_vkVoidFunction>(&WatchedUpdateDescriptorSets)},
+        {"vkCmdBindDescriptorSets", reinterpret_cast<PFN_vkVoidFunction>(&WatchedBindDescriptorSets)},
+        {"vkDestroyImage", reinterpret_cast<PFN_vkVoidFunction>(&WatchedDestroyImage)},
+        {"vkDestroyImageView", reinterpret_cast<PFN_vkVoidFunction>(&WatchedDestroyImageView)},
+    };
+    if (const auto found = table.find(name); found != table.end()) return found->second;
+    return Watch().real(device, name);
+}
+
+// lean-x25 lost the device in a burst with kept spilled snapshots being dropped. Kept snapshots a
+// build let go of while their uploads (or uses) are still in the recorder's open batch must
+// survive the overflow trim and the out-of-memory reclaim; once that batch retired they go, and no
+// image or view is ever destroyed while a recorded or submitted command buffer names it.
+int overflowLifetimeTests(Context context) {
+    if (!OverflowMemoryType(context.memory, ~0u)) {
+        std::puts("skipped: the device has no memory type outside its device-local heaps");
+        return VulkanTestSkipped;
+    }
+    auto& watch = Watch();
+    watch.real = context.deviceProc;
+    watch.device = context.device;
+    context.deviceProc = &WatchedProc;
+    TextureDetiler detiler(context);
+    context.detiler = &detiler;
+    constexpr std::size_t Stride = std::size_t{1} << 20u;
+    constexpr std::size_t Count = 32;
+    constexpr std::size_t Build = 12;
+    constexpr std::uint32_t LastMip = 8;
+#ifdef _WIN32
+    void* memory = VirtualAlloc(nullptr, Stride * Count, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* memory = std::aligned_alloc(65536, Stride * Count);
+#endif
+    Require(memory != nullptr, "cannot allocate the surfaces");
+    std::memset(memory, 0x5a, Stride * Count);
+    GuestAllocations::Mutation().Add(memory, Stride * Count, true, true, true);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    const auto lookup = [&](std::size_t surface) {
+        auto words = Descriptor(base + surface * Stride);
+        words[3] |= LastMip << 16u;
+        words[5] |= LastMip << 4u;
+        return CachedSampledTexture(context, words);
+    };
+    {
+        Recorder recorder(context);
+        recorder.Activate();
+        const auto retire = [&] {
+            recorder.Submit();
+            Check(context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue), "vkQueueWaitIdle");
+            while (recorder.RetireOldest()) {
+            }
+        };
+        std::vector<std::weak_ptr<Texture>> first;
+        {
+            std::vector<std::shared_ptr<Texture>> build;
+            for (std::size_t surface = 0; surface < Build; ++surface) build.push_back(lookup(surface));
+            for (const auto& texture : build) first.push_back(texture);
+        }
+        Require(recorder.Recording(), "the first build's uploads are not in an open batch");
+        const auto before = SampledCacheCounters();
+        AgcDriver::Graphics::ReclaimTextureMemory(context.device, VkDeviceSize{1} << 30u);
+        std::size_t reclaimedAlive = 0;
+        for (const auto& texture : first) reclaimedAlive += !texture.expired();
+        Require(reclaimedAlive == Build && SampledCacheCounters().overflowDropped == before.overflowDropped, "the out-of-memory reclaim dropped kept snapshots whose uploads are in the open batch");
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));
+        {
+            std::vector<std::shared_ptr<Texture>> build;
+            for (std::size_t surface = Build; surface < 2 * Build; ++surface) build.push_back(lookup(surface));
+        }
+        AgcDriver::Graphics::ReclaimTextureMemory(context.device, VkDeviceSize{1} << 30u);
+        std::size_t alive = 0;
+        for (const auto& texture : first) alive += !texture.expired();
+        const auto held = SampledCacheCounters();
+        const auto waits = held.overflowWaits - before.overflowWaits;
+        std::printf("a build let go of %zu kept spilled snapshots before its batch was submitted; a second build passed the 4 MiB overflow budget and the out-of-memory reclaim ran: %zu of them alive, %llu kept ones dropped, %llu batches waited for, %llu KiB in the overflow type\n", Build, alive, static_cast<unsigned long long>(held.overflowDropped - before.overflowDropped), static_cast<unsigned long long>(waits), static_cast<unsigned long long>(SampledTextureOverflowMemory() >> 10u));
+        Require(watch.violations == 0, watch.first);
+        Require(alive == Build || waits != 0, "kept snapshots whose uploads were in the open batch were dropped without waiting for it");
+        retire();
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));
+        lookup(2 * Build);
+        retire();
+        lookup(2 * Build + 1);
+        retire();
+        const auto after = SampledCacheCounters();
+        std::size_t left = 0;
+        for (const auto& texture : first) left += !texture.expired();
+        std::printf("after the batches retired: %llu kept ones dropped, %zu of the first build's left, %llu KiB in the overflow type; %llu images and views destroyed, %llu while a command buffer named them\n", static_cast<unsigned long long>(after.overflowDropped - before.overflowDropped), left, static_cast<unsigned long long>(SampledTextureOverflowMemory() >> 10u), static_cast<unsigned long long>(watch.destroyed), static_cast<unsigned long long>(watch.violations));
+        Require(watch.violations == 0, watch.first);
+        Require(after.overflowDropped > before.overflowDropped && left == 0, "the kept snapshots were not dropped once the batches using them retired");
+        Require(SampledTextureOverflowMemory() <= CurrentTextureCacheBudgets(context).overflow + Stride, "the overflow type stayed past its budget once nothing used the kept snapshots");
+        ClearCachedTextures(context.device);
+        retire();
+    }
+    Require(watch.violations == 0, watch.first);
+    GuestAllocations::Mutation().Remove(memory);
+#ifdef _WIN32
+    VirtualFree(memory, 0, MEM_RELEASE);
+#else
+    std::free(memory);
+#endif
+    std::puts("sampled texture overflow lifetime tests passed");
+    return 0;
+}
+
 }
 
 int main(int argc, char** argv) {
     try {
         const bool memory = argc > 1 && std::string(argv[1]) == "memory";
         const bool burst = argc > 1 && std::string(argv[1]) == "burst-overflow";
+        const bool lifetime = argc > 1 && std::string(argv[1]) == "overflow-lifetime";
 #ifdef _WIN32
         if (!memory) _putenv_s("APS5_TEXTURE_CACHE_MIB", "1");
 #else
@@ -722,7 +1056,7 @@ int main(int argc, char** argv) {
 #endif
         std::unique_ptr<Device> device;
         try {
-            device = std::make_unique<Device>(burst);
+            device = std::make_unique<Device>(burst || lifetime);
         } catch (const std::exception& error) {
             if (std::getenv("ANYPS5_REQUIRE_VULKAN") != nullptr) throw;
             std::printf("skipped, no usable Vulkan device: %s\n", error.what());
@@ -731,6 +1065,10 @@ int main(int argc, char** argv) {
         if (burst) {
             std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
             return burstOverflowTests(device->GetContext());
+        }
+        if (lifetime) {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            return overflowLifetimeTests(device->GetContext());
         }
         auto context = device->GetContext();
         TextureDetiler detiler(context);

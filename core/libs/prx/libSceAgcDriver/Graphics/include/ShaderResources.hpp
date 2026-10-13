@@ -94,6 +94,7 @@ struct SampledCacheCounts {
     std::uint64_t made = 0;
     std::uint64_t spilledReuses = 0;
     std::uint64_t overflowDropped = 0;
+    std::uint64_t overflowWaits = 0;
 };
 SampledCacheCounts SampledCacheCounters();
 std::shared_ptr<Texture> CachedSampledTexture(const Context& context, std::span<const std::uint32_t> words);
