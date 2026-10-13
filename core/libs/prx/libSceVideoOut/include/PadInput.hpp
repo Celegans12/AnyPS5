@@ -17,8 +17,10 @@ public:
     ~PadInput();
     void HandleEvent(const SDL_Event& event, DisplayWindow& window);
     void Update();
+    bool MouseModeEnabled() const { return mouseEnabled; }
 
 private:
+    explicit PadInput(Pad::InputConfiguration configuration);
     void publish();
     void setMouseMode(bool enabled);
     void openFirstAvailableController();
@@ -29,6 +31,7 @@ private:
     void enableSensors();
 
     std::vector<Pad::InputBinding> bindings;
+    Pad::InputSettings settings;
     std::vector<bool> pressed;
     std::vector<std::chrono::steady_clock::time_point> wheelReleaseTimes;
     std::array<std::uint8_t, 2> mouseStick{128, 128};

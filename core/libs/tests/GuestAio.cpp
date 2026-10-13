@@ -15,13 +15,20 @@
 #include <string>
 #include <thread>
 #include <vector>
+#ifdef _WIN32
+#include <io.h>
+extern "C" _invalid_parameter_handler _set_thread_local_invalid_parameter_handler(_invalid_parameter_handler);
+#endif
 extern "C" {
 int APS5_VABI sceKernelOpen(const char* path, int flags, std::uint16_t mode);
 int APS5_VABI sceKernelClose(int d);
+std::int64_t APS5_VABI sceKernelPread(int, void*, std::size_t, std::int64_t);
+std::int64_t APS5_VABI sceKernelPwrite(int, const void*, std::size_t, std::int64_t);
 std::int64_t APS5_VABI sceKernelLseek(int d, std::int64_t offset, int whence);
 int APS5_VABI sceKernelAioDeleteRequest(std::int32_t id, std::int32_t* ret);
 int APS5_VABI sceKernelAioInitializeImpl(void* param, std::int32_t size);
 void APS5_VABI sceKernelAioInitializeParam(void* param);
+int APS5_VABI sceKernelAioSetParam(KernelAioSchedulingParam* param, std::int32_t schedulingWindowSize, std::int32_t delayedCountLimit, std::uint32_t enableSplit, std::uint32_t splitSize, std::uint32_t splitChunkSize);
 int APS5_VABI sceKernelAioSubmitReadCommands(KernelAioRwRequest* req, std::int32_t size, std::int32_t prio, std::int32_t* id);
 int APS5_VABI sceKernelAioSubmitWriteCommands(KernelAioRwRequest* req, std::int32_t size, std::int32_t prio, std::int32_t* id);
 int APS5_VABI sceKernelAioPollRequest(std::int32_t id, std::int32_t* state);
@@ -41,14 +48,85 @@ static void Require(bool value, int line) {
     }
 }
 #define Check(value) Require((value), __LINE__)
-int main() {
+#ifdef _WIN32
+static int g_parameterReports = 0;
+static void CountParameterReport(const wchar_t*, const wchar_t*, const wchar_t*, unsigned int, std::uintptr_t) {
+    ++g_parameterReports;
+}
+static void CheckBadPositionedDescriptors() {
+    const auto file = std::filesystem::path("anyps5-aio-bad-descriptor-" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    { std::ofstream stream(file, std::ios::binary); stream << "data"; Check(static_cast<bool>(stream)); }
+    const int closed = sceKernelOpen(file.string().c_str(), SCE_KERNEL_O_RDWR, 0);
+    Check(closed >= 0 && sceKernelClose(closed) == 0);
+    const auto previous = _set_thread_local_invalid_parameter_handler(CountParameterReport);
+    for (int descriptor : {-1, closed}) {
+        for (std::size_t count : {std::size_t{0}, std::size_t{1}}) {
+            char buffer = 'x';
+            Check(sceKernelPread(descriptor, &buffer, count, 0) == SCE_KERNEL_ERROR_EBADF);
+            Check(sceKernelPwrite(descriptor, &buffer, count, 0) == SCE_KERNEL_ERROR_EBADF);
+            for (bool write : {false, true}) {
+                KernelAioResult result{-1, 0};
+                KernelAioRwRequest request{0, count, &buffer, &result, descriptor};
+                std::int32_t id = 0;
+                Check((write ? sceKernelAioSubmitWriteCommands(&request, 1, 0, &id)
+                             : sceKernelAioSubmitReadCommands(&request, 1, 0, &id)) == 0);
+                Check(result.state == 4 && result.return_value == SCE_KERNEL_ERROR_EBADF);
+                std::int32_t removed = -1;
+                Check(sceKernelAioDeleteRequest(id, &removed) == 0);
+            }
+            Check(buffer == 'x');
+            Check(g_parameterReports == 0);
+        }
+    }
+    Check(::_get_osfhandle(closed) == -1);
+    Check(g_parameterReports == 1);
+    Check(_set_thread_local_invalid_parameter_handler(previous) == CountParameterReport);
+    Check(std::filesystem::remove(file));
+}
+#endif
+int main(int argc, char** argv) {
+#ifdef _WIN32
+    if (argc > 1 && std::strcmp(argv[1], "bad-descriptors") == 0) {
+        CheckBadPositionedDescriptors();
+        return 0;
+    }
+#endif
     const auto root = std::filesystem::path("anyps5-aio-test-" +
         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     Check(std::filesystem::create_directory(root));
     const auto file = root / "data.bin";
     const std::string seed = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     { std::ofstream stream(file, std::ios::binary); stream << seed; }
-    Check(sceKernelAioInitializeImpl(nullptr, 0) == 0);
+    static_assert(sizeof(KernelAioSchedulingParam) == 20);
+    std::array<KernelAioSchedulingParam, 3> schedulingParams{};
+    schedulingParams.fill({7, 7, 7, 7, 7});
+    Check(sceKernelAioSetParam(&schedulingParams[1], 64, 16, 1, 0x200000, 0x40000) == 0);
+    Check(schedulingParams[1].schedulingWindowSize == 64 && schedulingParams[1].delayedCountLimit == 16);
+    Check(schedulingParams[1].enableSplit == 1 && schedulingParams[1].splitSize == 0x200000 && schedulingParams[1].splitChunkSize == 0x40000);
+    Check(schedulingParams[0].schedulingWindowSize == 7 && schedulingParams[0].splitChunkSize == 7);
+    Check(schedulingParams[2].schedulingWindowSize == 7 && schedulingParams[2].splitChunkSize == 7);
+    Check(sceKernelAioSetParam(&schedulingParams[2], 128, 128, 0, 0x1000000, 0x1000000) == 0);
+    Check(schedulingParams[2].schedulingWindowSize == 128 && schedulingParams[2].delayedCountLimit == 128);
+    Check(schedulingParams[2].enableSplit == 0 && schedulingParams[2].splitSize == 0x1000000 && schedulingParams[2].splitChunkSize == 0x1000000);
+    const auto setParamThrows = [&](std::int32_t window, std::int32_t delayed, std::uint32_t split, std::uint32_t size, std::uint32_t chunk) {
+        KernelAioSchedulingParam untouchedParam{7, 7, 7, 7, 7};
+        bool thrown = false;
+        try { sceKernelAioSetParam(&untouchedParam, window, delayed, split, size, chunk); } catch (const std::exception&) { thrown = true; }
+        return thrown && untouchedParam.schedulingWindowSize == 7 && untouchedParam.delayedCountLimit == 7 &&
+            untouchedParam.enableSplit == 7 && untouchedParam.splitSize == 7 && untouchedParam.splitChunkSize == 7;
+    };
+    Check(setParamThrows(129, 32, 1, 0x100000, 0x100000));
+    Check(setParamThrows(-1, 32, 1, 0x100000, 0x100000));
+    Check(setParamThrows(32, 129, 1, 0x100000, 0x100000));
+    Check(setParamThrows(32, -1, 1, 0x100000, 0x100000));
+    Check(setParamThrows(32, 32, 2, 0x100000, 0x100000));
+    Check(setParamThrows(32, 32, 1, 0x1000001, 0x100000));
+    Check(setParamThrows(32, 32, 1, 0x100000, 0x1000001));
+    bool nullThrew = false;
+    try { sceKernelAioSetParam(nullptr, 32, 32, 1, 0x100000, 0x100000); } catch (const std::invalid_argument&) { nullThrew = true; }
+    Check(nullThrew);
+    Check(sceKernelAioInitializeImpl(schedulingParams.data(), static_cast<std::int32_t>(sizeof(schedulingParams))) == 0);
     int initParam = 0;
     sceKernelAioInitializeParam(&initParam);
     const int fd = sceKernelOpen(file.string().c_str(), SCE_KERNEL_O_RDONLY, 0);

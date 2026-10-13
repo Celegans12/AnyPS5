@@ -12,7 +12,7 @@
 
 namespace ShaderRecompiler::ShaderDiskCache {
 
-inline constexpr std::uint32_t FormatVersion = 39;
+inline constexpr std::uint32_t FormatVersion = 40;
 
 enum class LoadStatus {
     Loaded,

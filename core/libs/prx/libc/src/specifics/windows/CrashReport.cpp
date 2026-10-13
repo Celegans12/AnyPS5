@@ -1,6 +1,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <tlhelp32.h>
+#include "prx/libc/include/CallTrace.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include <atomic>
 #include <chrono>
@@ -10,6 +11,7 @@
 #include <cstdarg>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <utility>
 #include <mutex>
 #include "Sse4aEmulation.hpp"
@@ -31,6 +33,8 @@ void Report(const char* format, ...) {
 }
 
 void ReportAllThreads();
+void ReportStackCandidates(std::uint64_t rsp, int limit, std::uint64_t span);
+void ReportCallTrace();
 
 void DescribeAddress(std::uint64_t address, char* buffer, std::size_t size) {
     HMODULE module = nullptr;
@@ -350,16 +354,7 @@ LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
         if (next <= frame) break;
         frame = next;
     }
-    Report("  stack return address candidates:\n");
-    int printed = 0;
-    for (std::uint64_t slot = context->Rsp; printed < 16 && slot < context->Rsp + 0x2000; slot += 8) {
-        if (!IsReadable(slot)) break;
-        const auto value = *reinterpret_cast<const std::uint64_t*>(slot);
-        if (!IsExecutable(value)) continue;
-        DescribeAddress(value, line, sizeof(line));
-        Report("    [rsp+0x%llx] %s\n", static_cast<unsigned long long>(slot - context->Rsp), line);
-        ++printed;
-    }
+    ReportStackCandidates(context->Rsp, 16, 0x2000);
     if (context->Rip == 0 || !IsExecutable(context->Rip)) {
         // A jump into nothing usually follows a return through a clobbered frame; the frames that just
         // returned are still below rsp.
@@ -387,10 +382,32 @@ LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
             }
         }
     }
+    ReportCallTrace();
     std::fflush(stderr);
     ReportAllThreads();
     std::fflush(stderr);
     return EXCEPTION_CONTINUE_SEARCH;
+}
+
+void ReportCallTrace() {
+    static CallTraceEntry entries[64];
+    const std::size_t count = CopyCallTrace_nid_no_patch(entries, std::size(entries));
+    if (count == 0) return;
+    char line[MAX_PATH + 64];
+    Report("  last traced system library calls (APS5_TRACE_CALLS):\n");
+    for (std::size_t index = 0; index < count; ++index) {
+        DescribeAddress(entries[index].returnAddress, line, sizeof(line));
+        Report("    #%llu thread %llu %s %s from %s\n", static_cast<unsigned long long>(entries[index].sequence),
+            static_cast<unsigned long long>(entries[index].thread), entries[index].library, entries[index].name, line);
+    }
+    static CallTraceCount counts[32];
+    std::uint64_t total = 0;
+    const std::size_t counted = CopyCallCounts_nid_no_patch(counts, std::size(counts), &total);
+    if (counted == 0) return;
+    Report("  most called traced imports (%llu calls in total):\n", static_cast<unsigned long long>(total));
+    for (std::size_t index = 0; index < counted; ++index) {
+        Report("    %12llu %s %s\n", static_cast<unsigned long long>(counts[index].calls), counts[index].library, counts[index].name);
+    }
 }
 
 std::size_t CaptureFrames(const CONTEXT* context, std::uint64_t* frames, std::size_t capacity) {
@@ -487,6 +504,20 @@ DWORD WINAPI HangWatchdog(LPVOID param) {
     return 0;
 }
 
+void ReportStackCandidates(std::uint64_t rsp, int limit, std::uint64_t span) {
+    char line[256];
+    Report("  stack return address candidates:\n");
+    int printed = 0;
+    for (std::uint64_t slot = rsp; printed < limit && slot < rsp + span; slot += 8) {
+        if (!IsReadable(slot)) break;
+        const auto value = *reinterpret_cast<const std::uint64_t*>(slot);
+        if (!IsExecutable(value)) continue;
+        DescribeAddress(value, line, sizeof(line));
+        Report("    [rsp+0x%llx] %s\n", static_cast<unsigned long long>(slot - rsp), line);
+        ++printed;
+    }
+}
+
 // abort() and the UCRT's invalid-parameter path end the process with a silent fast fail
 // (0xc0000409); both are reported with the calling thread's stack first.
 void ReportBacktrace(const char* what, bool reportThreads) {
@@ -498,6 +529,8 @@ void ReportBacktrace(const char* what, bool reportThreads) {
         DescribeAddress(reinterpret_cast<std::uint64_t>(frames[i]), line, sizeof(line));
         Report("    #%u %s\n", static_cast<unsigned>(i), line);
     }
+    ReportStackCandidates(reinterpret_cast<std::uint64_t>(__builtin_frame_address(0)), 32, 0x4000);
+    ReportCallTrace();
     if (reportThreads) ReportAllThreads();
     std::fflush(stderr);
 }

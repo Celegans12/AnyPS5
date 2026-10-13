@@ -1,23 +1,29 @@
-#include "prx/libc/include/general/VabiMacros.hpp"
+#include "prx/libc/include/General.hpp"
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
-extern "C" int APS5_VABI execvp_nid_postfix(const char*, char* const*);
-static void Require(bool value) { if (!value) std::abort(); }
-static bool ReportsNotImplemented(const char* file, char* const* arguments) {
+extern "C" {
+int APS5_VABI execvp_nid_postfix(const char*, char* const*);
+int APS5_VABI execv_nid_postfix(const char*, char* const*);
+int APS5_VABI execve_nid_postfix(const char*, char* const*, char* const*);
+}
+template <typename TCall> static bool Throws(TCall call, const std::string& message) {
     try {
-        execvp_nid_postfix(file, arguments);
+        call();
     } catch (const std::runtime_error& error) {
-        return std::string(error.what()) == "execvp: executable replacement not implemented";
+        return error.what() == message;
     }
     return false;
 }
+static void Require(bool value) { if (!value) std::abort(); }
 int main() {
-    char shell[] = "sh";
-    char option[] = "-c";
-    char command[] = "exit 0";
-    char* arguments[] = {shell, option, command, nullptr};
-    Require(ReportsNotImplemented("sh", arguments));
-    Require(ReportsNotImplemented("/bin/sh", arguments));
-    Require(ReportsNotImplemented(nullptr, nullptr));
+    char name[] = "sh";
+    char* arguments[] = {name, nullptr};
+    char variable[] = "HOME=/";
+    char* environment[] = {variable, nullptr};
+    Require(Throws([&] { execvp_nid_postfix("sh", arguments); }, "execvp: executable replacement not implemented"));
+    Require(Throws([&] { execvp_nid_postfix("/bin/sh", arguments); }, "execvp: executable replacement not implemented"));
+    Require(Throws([&] { execvp_nid_postfix(nullptr, nullptr); }, "execvp: executable replacement not implemented"));
+    Require(Throws([&] { execv_nid_postfix("/bin/sh", arguments); }, "execv: executable replacement not implemented"));
+    Require(Throws([&] { execve_nid_postfix("/bin/sh", arguments, environment); }, "execve: executable replacement not implemented"));
 }

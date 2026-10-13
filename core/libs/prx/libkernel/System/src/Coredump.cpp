@@ -2,12 +2,30 @@
 #include <cstddef>
 #include <atomic>
 #include <cstdio>
+#include <stdexcept>
+#include <string>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 
 // The handler is recorded but never invoked: host crashes are not turned into guest core dumps.
 static std::atomic<uint64_t> g_coredumpHandler{0};
 static std::atomic<uint64_t> g_coredumpContext{0};
+
+static constexpr int SCE_COREDUMP_ERROR_NOT_IN_COREDUMP_HANDLER = static_cast<int>(0x81180003u);
+
+static void requireRegionOutsideHandler(const char* function, const void* mem, size_t size) {
+    if (mem == nullptr || size == 0 || size > UINTPTR_MAX - reinterpret_cast<uintptr_t>(mem))
+        throw std::runtime_error(std::string(function) + ": null, empty or wrapping region outside the core dump handler");
+}
+
+static int attachOutsideCoredumpHandler(const char* function, const void* mem, size_t size) {
+    requireRegionOutsideHandler(function, mem, size);
+    return SCE_COREDUMP_ERROR_NOT_IN_COREDUMP_HANDLER;
+}
+
+static void requireTextOutsideHandler(const char* function, const char* argument, const char* text) {
+    if (text == nullptr) throw std::runtime_error(std::string(function) + ": null " + argument + " outside the core dump handler");
+}
 
 extern "C" {
 
@@ -31,9 +49,10 @@ int APS5_VABI sceKernelDebugWriteCppExceptionInfo(const void* exception, uint64_
 }
 
 
-int APS5_VABI sceCoredumpAttachUserFile(void) {
-    NotImplemented_nid_no_patch("5nc2gdLNsok");
-    return 0;
+int APS5_VABI sceCoredumpAttachUserFile(uint32_t userValue, const char* path) {
+    (void)userValue;
+    requireTextOutsideHandler(__func__, "path", path);
+    return SCE_COREDUMP_ERROR_NOT_IN_COREDUMP_HANDLER;
 }
 
 int APS5_VABI sceCoredumpGetStopInfoGpu_Agc(void) {
@@ -41,9 +60,11 @@ int APS5_VABI sceCoredumpGetStopInfoGpu_Agc(void) {
     return 0;
 }
 
-int APS5_VABI sceCoredumpAttachMemoryRegionAsUserFile(void) {
-    NotImplemented_nid_no_patch("MEJ7tc7ThwM");
-    return 0;
+int APS5_VABI sceCoredumpAttachMemoryRegionAsUserFile(uint32_t userValue, const void* mem, size_t size, const char* name) {
+    (void)userValue;
+    requireRegionOutsideHandler(__func__, mem, size);
+    requireTextOutsideHandler(__func__, "name", name);
+    return SCE_COREDUMP_ERROR_NOT_IN_COREDUMP_HANDLER;
 }
 
 int APS5_VABI sceCoredumpSetUserDataType(void) {
@@ -51,14 +72,24 @@ int APS5_VABI sceCoredumpSetUserDataType(void) {
     return 0;
 }
 
-int APS5_VABI sceCoredumpDebugTextOut(void) {
-    NotImplemented_nid_no_patch("dei8oUx6DbU");
-    return 0;
+void APS5_VABI sceCoredumpDebugTextOut(const char* str, int len) {
+    if (len < 0 || (str == nullptr && len != 0))
+        throw std::runtime_error(std::string(__func__) + ": null text or negative length");
+    if (len == 0) return;
+    const int shown = str[len - 1] == '\n' ? len - 1 : len;
+    std::fprintf(stderr, "[coredump] %.*s\n", shown, str);
 }
 
-int APS5_VABI sceCoredumpGetStopInfoCpu(void) {
-    NotImplemented_nid_no_patch("kK0DUW1Ukgc");
-    return 0;
+int64_t APS5_VABI sceCoredumpWriteUserData(const void* data, size_t size) {
+    requireRegionOutsideHandler(__func__, data, size);
+    return SCE_COREDUMP_ERROR_NOT_IN_COREDUMP_HANDLER;
+}
+
+int APS5_VABI sceCoredumpGetStopInfoCpu(void* info, size_t size) {
+    const auto address = reinterpret_cast<uintptr_t>(info);
+    if (info == nullptr || size != 16 || address % alignof(uint64_t) != 0 || size > UINTPTR_MAX - address)
+        throw std::runtime_error(std::string(__func__) + ": null, unaligned, wrapping or unsupported CPU stop-info buffer outside the core dump handler");
+    return SCE_COREDUMP_ERROR_NOT_IN_COREDUMP_HANDLER;
 }
 
 int APS5_VABI sceCoredumpGetThreadContextInfo(void* threadContextInfo, size_t threadContextInfoSize) {
@@ -73,13 +104,13 @@ int APS5_VABI sceCoredumpWriteUserString() {
     return 0;
 }
 
-int APS5_VABI sceCoredumpAttachUserMemoryFile(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+int APS5_VABI sceCoredumpAttachUserMemoryFile(uint32_t userValue, const void* mem, size_t size) {
+    (void)userValue;
+    return attachOutsideCoredumpHandler(__func__, mem, size);
 }
 
-int APS5_VABI sceCoredumpAttachMemoryRegion(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+int APS5_VABI sceCoredumpAttachMemoryRegion(uint32_t userValue, const void* mem, size_t size) {
+    (void)userValue;
+    return attachOutsideCoredumpHandler(__func__, mem, size);
 }
 }

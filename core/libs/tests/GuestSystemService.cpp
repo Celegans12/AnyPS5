@@ -42,6 +42,8 @@ extern "C" int APS5_VABI sceSystemServiceReenableMusicPlayer(void);
 extern "C" int APS5_VABI sceSystemServiceDisableMediaPlay(void);
 extern "C" int APS5_VABI sceSystemServiceReenableMediaPlay(void);
 extern "C" int APS5_VABI sceSystemServiceLaunchWebBrowser(const char* uri, void* param);
+extern "C" int APS5_VABI sceSystemServiceShowControllerSettings(void);
+extern "C" int APS5_VABI sceSystemServiceOpenChallengeActivity(void);
 
 int main() {
     Require(sceSystemServicePowerTick() == SYSTEM_SERVICE_OK);
@@ -57,6 +59,8 @@ int main() {
     Require(sceSystemServiceDisableMediaPlay() == SYSTEM_SERVICE_OK);
     Require(sceSystemServiceReenableMediaPlay() == SYSTEM_SERVICE_OK);
     Require(sceSystemServiceReenableMediaPlay() == SYSTEM_SERVICE_OK);
+    Require(sceSystemServiceShowControllerSettings() == SYSTEM_SERVICE_OK);
+    Require(sceSystemServiceOpenChallengeActivity() == SYSTEM_SERVICE_OK);
     Require(sceSystemServiceLaunchWebBrowser("http://127.0.0.1:8780/video?v=0", nullptr) == browserUnavailable);
     unsigned char browserParam[64];
     std::memset(browserParam, 0x5a, sizeof(browserParam));

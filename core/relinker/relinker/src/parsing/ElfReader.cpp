@@ -1,6 +1,7 @@
 #include <relinker/parsing/ElfReader.hpp>
 #include <elfpatcher/general/ElfConstants.hpp>
 #include <relinker/domain/Types.hpp>
+#include <algorithm>
 #include <cstring>
 
 namespace Relinker {
@@ -85,6 +86,12 @@ ElfHeader ElfReader::ReadHeader() const {
     }
     if (_fileBuffer[4] != 2 || _fileBuffer[5] != 1 || _fileBuffer[6] != 1)
         throw RelinkerException("Expected little-endian ELF64 version 1");
+    if (_readU16At(0x12) != 62)
+        throw RelinkerException("Expected an x86-64 ELF");
+    if (_readU32At(0x14) != 1)
+        throw RelinkerException("Unsupported ELF object version: expected 1", 0x14);
+    if (_readU16At(0x34) != 64)
+        throw RelinkerException("Invalid ELF header size: expected 64 bytes", 0x34);
 
     ElfHeader header{};
     header.Machine = _readU16At(0x12);
@@ -127,11 +134,38 @@ std::vector<ProgramHeader> ElfReader::ReadProgramHeaders() const {
         offset += header.ProgramHeaderEntrySize;
     }
 
+    for (auto& relro : headers) {
+        if (relro.Type != PT_OS_RELRO || relro.MemorySize == 0) continue;
+        bool covered = false;
+        for (const auto& load : headers) {
+            if (load.Type != PT_LOAD || load.MemorySize == 0) continue;
+            const bool overlaps = relro.MappedAddress < load.MappedAddress ? load.MappedAddress - relro.MappedAddress < relro.MemorySize : relro.MappedAddress - load.MappedAddress < load.MemorySize;
+            if (!overlaps) continue;
+            if (relro.MappedAddress < load.MappedAddress || relro.MemorySize > load.MemorySize - (relro.MappedAddress - load.MappedAddress))
+                throw RelinkerException("PT_SCE_RELRO partially overlaps a PT_LOAD segment", relro.MappedAddress);
+            covered = true;
+        }
+        if (!covered) {
+            relro.Type = PT_LOAD;
+            relro.Flags = PF_R | PF_W;
+        }
+    }
+
     return headers;
 }
 
 std::vector<SectionHeader> ElfReader::ReadSectionHeaders() const {
     const ElfHeader header = ReadHeader();
+    if (header.SectionHeaderCount != 0 && header.SectionHeaderEntrySize != kShdrEntrySize) {
+        throw RelinkerException("Invalid ELF section header entry size: expected 64 bytes", 0x3a);
+    }
+    const ByteCount tableSize = static_cast<ByteCount>(header.SectionHeaderCount) * header.SectionHeaderEntrySize;
+    if (!_rangeFits(header.SectionHeaderOffset, tableSize, _fileBuffer.size())) {
+        throw RelinkerException("Section header table out of bounds", header.SectionHeaderOffset);
+    }
+    if (header.SectionHeaderStringIndex != 0 && header.SectionHeaderStringIndex >= header.SectionHeaderCount) {
+        throw RelinkerException("Section header string table index out of bounds", 0x3e);
+    }
 
     std::vector<SectionHeader> headers;
     FileByteOffset offset = header.SectionHeaderOffset;
@@ -146,7 +180,7 @@ std::vector<SectionHeader> ElfReader::ReadSectionHeaders() const {
         sh.SectionSize = _readU64At(offset + 0x20);
         sh.Link = _readU32At(offset + 0x28);
         sh.Info = _readU32At(offset + 0x2c);
-        sh.EntrySize = _readU64At(offset + 0x30);
+        sh.EntrySize = _readU64At(offset + kShdrEntSizeOffset);
 
         sh.Name = _resolveShdrName(nameOffset, header);
 
@@ -165,17 +199,27 @@ std::string ElfReader::_resolveShdrName(std::uint32_t nameOffset, const ElfHeade
     FileByteOffset shstrOffset = header.SectionHeaderOffset +
                         (header.SectionHeaderStringIndex * header.SectionHeaderEntrySize);
 
-    const FileByteOffset strTableOffset = _readU64At(shstrOffset + 0x18);
-
-    std::string name;
-    FileByteOffset currentPos = strTableOffset + nameOffset;
-
-    while (currentPos < _fileBuffer.size() && _fileBuffer[currentPos] != '\0') {
-        name += static_cast<char>(_fileBuffer[currentPos]);
-        currentPos++;
+    if (_readU32At(shstrOffset + kShdrTypeOffset) != SHT_STRTAB) {
+        throw RelinkerException("Section names do not reference a string table", shstrOffset);
     }
-
-    return name;
+    const FileByteOffset strTableOffset = _readU64At(shstrOffset + 0x18);
+    const ByteCount strTableSize = _readU64At(shstrOffset + kShdrSizeOffset);
+    if (!_rangeFits(strTableOffset, strTableSize, _fileBuffer.size())) {
+        throw RelinkerException("Section name string table out of bounds", strTableOffset);
+    }
+    if (strTableSize == 0 && nameOffset == 0) {
+        return "";
+    }
+    if (nameOffset >= strTableSize) {
+        throw RelinkerException("Section name offset out of bounds", nameOffset);
+    }
+    const auto first = _fileBuffer.begin() + strTableOffset + nameOffset;
+    const auto end = _fileBuffer.begin() + strTableOffset + strTableSize;
+    const auto terminator = std::find(first, end, 0);
+    if (terminator == end) {
+        throw RelinkerException("Unterminated section name", strTableOffset + nameOffset);
+    }
+    return std::string(first, terminator);
 }
 
 std::vector<DynamicTag> ElfReader::ReadDynamicTags(const ProgramHeader& dynamicHeader) const {
@@ -207,21 +251,14 @@ std::vector<DynamicTag> ElfReader::ReadDynamicTags(const ProgramHeader& dynamicH
 }
 
 FileByteOffset ElfReader::TranslateVirtualAddress(VirtualAddress address) const {
-    const ElfHeader header = ReadHeader();
-
-    FileByteOffset offset = header.ProgramHeaderOffset;
-
-    for (std::uint16_t i = 0; i < header.ProgramHeaderCount; ++i) {
-        const std::uint32_t type = _readU32At(offset);
-        const FileByteOffset segOffset = _readU64At(offset + 0x08);
-        const VirtualAddress segVAddr = _readU64At(offset + 0x10);
-        const ByteCount segFileSize = _readU64At(offset + 0x20);
-
-        if (type == PT_LOAD && address >= segVAddr && address < segVAddr + segFileSize) {
-            return segOffset + (address - segVAddr);
+    for (const auto& segment : ReadProgramHeaders()) {
+        if (segment.Type == PT_LOAD && address >= segment.MappedAddress &&
+            address - segment.MappedAddress < segment.FileSize) {
+            if (!_rangeFits(segment.Offset, segment.FileSize, _fileBuffer.size())) {
+                throw RelinkerException("PT_LOAD file mapping out of bounds", segment.Offset);
+            }
+            return segment.Offset + (address - segment.MappedAddress);
         }
-
-        offset += header.ProgramHeaderEntrySize;
     }
 
     throw RelinkerException("Virtual address not mapped by any PT_LOAD segment", address);
@@ -245,18 +282,6 @@ std::vector<std::uint8_t> ElfReader::ReadSegment(const ProgramHeader& header) co
     return std::vector<std::uint8_t>(
         _fileBuffer.begin() + header.Offset,
         _fileBuffer.begin() + header.Offset + header.FileSize);
-}
-
-std::vector<ProgramHeader> ElfReader::ReadCodeSegments() const {
-    static constexpr std::uint32_t kPtLoad = 1;
-    static constexpr std::uint32_t kPfX = 0x1;
-    std::vector<ProgramHeader> result;
-    for (const auto& ph : ReadProgramHeaders()) {
-        if (ph.Type == kPtLoad && (ph.Flags & kPfX)) {
-            result.push_back(ph);
-        }
-    }
-    return result;
 }
 
 std::uint64_t ElfReader::GetFileSize() const {

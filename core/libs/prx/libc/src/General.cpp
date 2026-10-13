@@ -1,3 +1,5 @@
+#include <atomic>
+#include <cstdio>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -20,6 +22,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <io.h>
 #else
 #include <ctime>
 #include <fcntl.h>
@@ -115,6 +118,29 @@ struct WorkingDirectory {
     std::filesystem::path current = root;
 };
 WorkingDirectory& Directories() { static WorkingDirectory state; return state; }
+std::filesystem::path HostPath(WorkingDirectory& state, const std::filesystem::path& guest) {
+    if (auto aliased = ResolveAlias(guest.relative_path().generic_string())) return *aliased;
+    return ResolveHostPath(state.root, guest.relative_path()).make_preferred();
+}
+void RequireHostDirectory(WorkingDirectory& state, const std::filesystem::path& guest) {
+    const auto host = HostPath(state, guest);
+    std::error_code error;
+    const auto status = std::filesystem::status(host, error);
+    if (std::filesystem::is_directory(status)) return;
+    if (!error) error = std::make_error_code(std::filesystem::exists(status) ? std::errc::not_a_directory : std::errc::no_such_file_or_directory);
+#ifdef _WIN32
+    if (error == std::errc::no_such_file_or_directory) {
+        for (auto prefix = host.parent_path(); prefix.has_relative_path(); prefix = prefix.parent_path()) {
+            std::error_code prefixError;
+            const auto prefixStatus = std::filesystem::status(prefix, prefixError);
+            if (!std::filesystem::exists(prefixStatus)) continue;
+            if (!std::filesystem::is_directory(prefixStatus)) error = std::make_error_code(std::errc::not_a_directory);
+            break;
+        }
+    }
+#endif
+    throw std::filesystem::filesystem_error("Guest path component is not a directory", host, error);
+}
 std::filesystem::path Resolve(WorkingDirectory& state, const char* path) {
     std::string text(path);
     for (auto& character : text) if (character == '\\') character = '/';
@@ -123,10 +149,17 @@ std::filesystem::path Resolve(WorkingDirectory& state, const char* path) {
     // Preserve the existing ability to pass explicit native drive paths.
     if (input.has_root_name()) return input;
 #endif
-    auto guest = (std::filesystem::path("/") / state.current.lexically_relative(state.root));
-    guest = (input.is_absolute() ? input : guest / input).lexically_normal();
-    if (auto aliased = ResolveAlias(guest.relative_path().generic_string())) return *aliased;
-    return ResolveHostPath(state.root, guest.relative_path()).make_preferred();
+    const auto current = std::filesystem::path("/") / state.current.lexically_relative(state.root);
+    const auto relative = (input.is_absolute() ? input : current / input).relative_path();
+    std::filesystem::path guest("/");
+    for (auto part = relative.begin(); part != relative.end(); ++part) {
+        if (*part == "..") {
+            const auto parent = guest.lexically_normal();
+            if (parent.has_relative_path()) RequireHostDirectory(state, parent);
+        }
+        guest /= *part;
+    }
+    return HostPath(state, guest.lexically_normal());
 }
 #ifdef _WIN32
 using WriteMark = FILETIME;
@@ -220,6 +253,38 @@ int SetWorkingDirectory(WorkingDirectory& state, const std::filesystem::path& re
     return 0;
 }
 }
+
+#ifndef _WIN32
+namespace {
+std::mutex g_hostStandardErrorMutex;
+std::atomic<int> g_hostStandardError{-1};
+}
+
+extern "C" int KeepHostStandardError_nid_no_patch() {
+    const std::lock_guard lock(g_hostStandardErrorMutex);
+    if (const int kept = g_hostStandardError.load(); kept >= 0) return kept;
+    const int kept = ::fcntl(2, F_DUPFD_CLOEXEC, 3);
+    if (kept < 0) {
+        if (errno == EBADF) return -1;
+        throw std::system_error(errno, std::generic_category(), "Keeping the host standard error");
+    }
+    std::FILE* const stream = ::fdopen(kept, "w");
+    if (stream == nullptr) {
+        const int error = errno;
+        ::close(kept);
+        throw std::system_error(error, std::generic_category(), "Keeping the host standard error");
+    }
+    std::setvbuf(stream, nullptr, _IONBF, 0);
+    std::fflush(stderr);
+    stderr = stream;
+    g_hostStandardError.store(kept);
+    return kept;
+}
+
+extern "C" int HostStandardError_nid_no_patch() {
+    return g_hostStandardError.load();
+}
+#endif
 
 extern "C" void AddPathAlias_nid_no_patch(const char* guestPrefix, const char* hostPath) {
     if (guestPrefix == nullptr || hostPath == nullptr) {
@@ -315,6 +380,13 @@ extern "C" std::filesystem::path ResolvePath_nid_no_patch(const char* path) {
     return Resolve(state, path);
 }
 
+extern "C" std::filesystem::path RelinkedModulePath_nid_no_patch(const std::filesystem::path& path) {
+    auto relinked = path;
+    relinked += ".guest.prx";
+    std::error_code error;
+    return std::filesystem::is_regular_file(relinked, error) ? relinked : path;
+}
+
 extern "C" int SetWorkingDirectory_nid_no_patch(const char* resolved) {
     if (resolved == nullptr) return 14;
     auto& state = Directories();
@@ -370,6 +442,63 @@ extern "C" char* APS5_VABI getcwd_nid_postfix(char* buffer, std::size_t size) {
     } catch (const std::bad_alloc&) { errno = 12; return nullptr; }
       catch (const std::filesystem::filesystem_error& error) { errno = DirectoryFailure(error.code()); return nullptr; }
 }
+
+#ifdef _WIN32
+extern "C" int WindowsOpenError_nid_no_patch(unsigned long error) {
+    switch (error) {
+    case ERROR_FILE_NOT_FOUND:
+    case ERROR_PATH_NOT_FOUND:
+    case ERROR_INVALID_DRIVE:
+    case ERROR_BAD_NETPATH:
+    case ERROR_BAD_NET_NAME:
+    case ERROR_BAD_PATHNAME:
+    case ERROR_FILENAME_EXCED_RANGE:
+        return ENOENT;
+    case ERROR_ACCESS_DENIED:
+    case ERROR_SHARING_VIOLATION:
+    case ERROR_LOCK_VIOLATION:
+    case ERROR_WRITE_PROTECT:
+    case ERROR_NETWORK_ACCESS_DENIED:
+    case ERROR_CANNOT_MAKE:
+    case ERROR_DRIVE_LOCKED:
+        return EACCES;
+    case ERROR_FILE_EXISTS:
+    case ERROR_ALREADY_EXISTS:
+        return EEXIST;
+    case ERROR_TOO_MANY_OPEN_FILES:
+        return EMFILE;
+    case ERROR_NOT_ENOUGH_MEMORY:
+    case ERROR_OUTOFMEMORY:
+        return ENOMEM;
+    case ERROR_DISK_FULL:
+        return ENOSPC;
+    default:
+        return EINVAL;
+    }
+}
+
+extern "C" _invalid_parameter_handler _set_thread_local_invalid_parameter_handler(_invalid_parameter_handler);
+static DWORD StandardHandleId(int descriptor) {
+    return descriptor == 0 ? STD_INPUT_HANDLE : descriptor == 1 ? STD_OUTPUT_HANDLE : STD_ERROR_HANDLE;
+}
+extern "C" void* HostStandardHandle_nid_no_patch(int descriptor) {
+    if (descriptor < 0 || descriptor > 2) return nullptr;
+    const HANDLE current = GetStdHandle(StandardHandleId(descriptor));
+    if (current == nullptr || current == INVALID_HANDLE_VALUE) return nullptr;
+    const auto previous = _set_thread_local_invalid_parameter_handler([](const wchar_t*, const wchar_t*, const wchar_t*, unsigned int, std::uintptr_t) {});
+    const auto owned = ::_get_osfhandle(descriptor);
+    _set_thread_local_invalid_parameter_handler(previous);
+    if (reinterpret_cast<HANDLE>(owned) != current) return current;
+    HANDLE kept = nullptr;
+    if (!DuplicateHandle(GetCurrentProcess(), current, GetCurrentProcess(), &kept, 0, TRUE, DUPLICATE_SAME_ACCESS))
+        throw std::runtime_error("Cannot keep the host standard handle of descriptor " + std::to_string(descriptor));
+    return kept;
+}
+extern "C" void KeepStandardHandle_nid_no_patch(int descriptor, void* handle) {
+    if (handle != nullptr && !SetStdHandle(StandardHandleId(descriptor), handle))
+        throw std::runtime_error("Cannot keep the host standard handle of descriptor " + std::to_string(descriptor));
+}
+#endif
 
 extern "C" void NotImplemented_nid_no_patch(const char* funcName) {
     throw std::runtime_error(std::string(funcName) + " not implemented");

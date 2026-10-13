@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_COLORTARGETLAYOUT_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -17,11 +18,12 @@ enum class ColorTileMode : std::uint32_t {
     Standard64KB = 9,
     S4KBX = 0x15,
     D4KBX = 0x16,
+    D64KBX = 0x1a,
     RenderTarget = 0x1b
 };
 
 constexpr bool ColorTileModeIsXor(ColorTileMode mode) {
-    return mode == ColorTileMode::S4KBX || mode == ColorTileMode::D4KBX || mode == ColorTileMode::RenderTarget;
+    return mode == ColorTileMode::S4KBX || mode == ColorTileMode::D4KBX || mode == ColorTileMode::D64KBX || mode == ColorTileMode::RenderTarget;
 }
 
 constexpr std::uint32_t ColorTileModeBlockBytes(ColorTileMode mode) {
@@ -29,10 +31,11 @@ constexpr std::uint32_t ColorTileModeBlockBytes(ColorTileMode mode) {
 }
 
 constexpr TextureTileMode ColorTextureTileMode(ColorTileMode mode) {
-    return mode == ColorTileMode::Linear ? TextureTileMode::kLinear : mode == ColorTileMode::Standard4KB ? TextureTileMode::kStandard4KB : mode == ColorTileMode::Standard64KB ? TextureTileMode::kStandard64KB : mode == ColorTileMode::S4KBX ? TextureTileMode::kS4KBX : mode == ColorTileMode::D4KBX ? TextureTileMode::kD4KBX : TextureTileMode::kR64KBX;
+    return mode == ColorTileMode::Linear ? TextureTileMode::kLinear : mode == ColorTileMode::Standard4KB ? TextureTileMode::kStandard4KB : mode == ColorTileMode::Standard64KB ? TextureTileMode::kStandard64KB : mode == ColorTileMode::S4KBX ? TextureTileMode::kS4KBX : mode == ColorTileMode::D4KBX ? TextureTileMode::kD4KBX : mode == ColorTileMode::D64KBX ? TextureTileMode::kD64KBX : TextureTileMode::kR64KBX;
 }
 
 ColorTileMode DecodeColorTileMode(std::uint32_t attrib3);
+TileMipLayout ComputeColorTargetMipLayout(ColorTileMode mode, std::uint32_t bytesPerElement, std::uint32_t surfaceWidth, std::uint32_t surfaceHeight, std::uint32_t mipCount, std::uint32_t mipLevel);
 
 class ColorTargetLayout {
 public:

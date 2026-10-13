@@ -30,6 +30,14 @@
 #include <string_view>
 #include <vector>
 #ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 #include <io.h>
 #else
 #include <unistd.h>
@@ -100,6 +108,7 @@ void requireSameArtifact(const CompiledShaderArtifact& left, const CompiledShade
     require(left.hostSubgroupSize == right.hostSubgroupSize, prefix + "host subgroup size differs");
     require(left.vertexInputs == right.vertexInputs, prefix + "vertex inputs differ");
     require(left.vertexInputPatches == right.vertexInputPatches, prefix + "vertex type patches differ");
+    require(left.registrationModule == right.registrationModule, prefix + "registration module flags differ");
     require(left.vertexOffsetSgpr == right.vertexOffsetSgpr && left.instanceOffsetSgpr == right.instanceOffsetSgpr, prefix + "offset SGPRs differ");
     require(left.vertexOffsetShared == right.vertexOffsetShared && left.instanceOffsetShared == right.instanceOffsetShared && left.vertexOffsetConflict == right.vertexOffsetConflict && left.instanceOffsetConflict == right.instanceOffsetConflict, prefix + "offset flags differ");
     require(left.parameterExports == right.parameterExports, prefix + "parameter exports differ");
@@ -203,6 +212,7 @@ RecompileResult sampleResult() {
     result.workgroupMemoryDwords = 32769u;
     result.vertexInputs = {{1, 4, 2}, {5, 2, 0}};
     result.vertexInputPatches = {{1, 20, {7, 8, 9}}, {5, 40, {10, 11, 12}}};
+    result.registrationModule = true;
     result.specialization = {{512, 4}, {516, 0x3f800000u}, {517, 0}};
     result.vertexAttributes = {{1, 4, {{0x1000u, 0x20000u, 0x30u, 0x4u}}, 2}, {5, 2, {{9u, 8u, 7u, 6u}}, 0}};
     result.vertexInputs[0].outputMask = 5u;
@@ -301,6 +311,7 @@ CompiledVariant sampleVariant() {
     info.info.hasBitwiseXor = true;
     info.info.usesDma = true;
     info.info.usesFaultBuffer = true;
+    info.info.rasterPrimitive = true;
     info.bindings.pushDataStartDword = 2;
     info.bindings.memoryOffsetDword = 1;
     info.bindings.memoryOffsetCount = 5;
@@ -608,6 +619,7 @@ void verifyKeySensitivity() {
     changes("the sRGB formats decoded in the shader", [](SampleRequest& sample) { sample.request.target.srgbDecodeFormats = 2u; });
     changes("the narrow subgroup clock", [](SampleRequest& sample) { sample.request.target.narrowSubgroupClock = true; });
     changes("f64 denormal preservation", [](SampleRequest& sample) { sample.request.target.float64DenormPreserve = true; });
+    changes("f16 denormal preservation", [](SampleRequest& sample) { sample.request.target.float16DenormPreserve = true; });
     changes("the workgroup size limit", [](SampleRequest& sample) { sample.request.target.maxWorkgroupSize[2] = 128; });
     changes("the invocation limit", [](SampleRequest& sample) { sample.request.target.maxWorkgroupInvocations = 512; });
     changes("the shared memory limit", [](SampleRequest& sample) { sample.request.target.maxWorkgroupSharedMemoryBytes = 32768; });
@@ -690,6 +702,63 @@ void verifyFloatModeSerialization() {
     sample.request.context.floatMode = mode;
     const auto back = serializer.Deserialize(serializer.Serialize(sample.request));
     require(back.request.context.floatMode == mode, "the float mode did not survive serialization");
+}
+
+void verifyAtomicReplacement(const std::filesystem::path& directory) {
+    struct Reader {
+#ifdef _WIN32
+        HANDLE file;
+        explicit Reader(const std::filesystem::path& path)
+            : file(CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE,
+                               nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr)) {
+            require(file != INVALID_HANDLE_VALUE, "cannot retain the cache file");
+        }
+        ~Reader() { CloseHandle(file); }
+        std::vector<std::byte> Read() {
+            require(SetFilePointerEx(file, {}, nullptr, FILE_BEGIN), "cannot seek the retained cache file");
+            std::array<std::byte, 32> bytes{};
+            DWORD count = 0;
+            require(ReadFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &count, nullptr), "cannot read the retained cache file");
+            return {bytes.begin(), bytes.begin() + count};
+        }
+#else
+        std::ifstream file;
+        explicit Reader(const std::filesystem::path& path) : file(path, std::ios::binary) {
+            require(file.is_open(), "cannot retain the cache file");
+        }
+        std::vector<std::byte> Read() {
+            file.clear();
+            file.seekg(0);
+            require(!file.fail(), "cannot seek the retained cache file");
+            std::array<std::byte, 32> bytes{};
+            file.read(reinterpret_cast<char*>(bytes.data()), bytes.size());
+            require(file.eof() && !file.bad(), "cannot read the retained cache file");
+            return {bytes.begin(), bytes.begin() + file.gcount()};
+        }
+#endif
+        Reader(const Reader&) = delete;
+        Reader& operator=(const Reader&) = delete;
+    };
+    const auto root = directory / "atomic-replacement";
+    const auto path = root / "entry.bin";
+    const std::vector<std::byte> original{std::byte{0x12}, std::byte{0x00}, std::byte{0x34}};
+    const std::vector<std::byte> replacement{std::byte{0xab}, std::byte{0xcd}, std::byte{0x00}, std::byte{0xef}};
+    require(WriteFileAtomically(path, original), "cannot write the initial cache entry");
+    {
+        Reader old(path);
+        require(old.Read() == original, "the retained reader did not read the original entry");
+        require(WriteFileAtomically(path, replacement), "cannot replace cache entry with a retained reader");
+        require(old.Read() == original, "replacement changed the retained original entry");
+        std::vector<std::byte> fresh;
+        require(ReadWholeFile(path, fresh) && fresh == replacement, "a fresh reader did not read the replacement entry");
+        Reader current(path);
+        require(current.Read() == replacement, "the replacement reader did not retain its entry");
+        require(std::filesystem::remove(path), "cannot delete the replacement while readers retain it");
+        require(!ReadWholeFile(path, fresh), "the deleted cache entry remains readable by path");
+        require(old.Read() == original && current.Read() == replacement, "deletion invalidated retained cache readers");
+    }
+    require(std::filesystem::is_empty(root), "atomic replacement left a temporary file behind");
+    require(std::filesystem::remove(root), "cannot remove the empty replacement directory");
 }
 
 void verifyStore() {
@@ -2060,6 +2129,7 @@ int main(int argc, char** argv) {
         setEnvironment("ANYPS5_SHADER_CACHE_DIR", directory.string());
         verifyColdSpirvStorage();
         verifyColdCacheRoundTrips();
+        verifyAtomicReplacement(directory);
         verifyResultRoundTrip();
         verifyEntryRoundTrip();
         verifyArtifactStorageIsolation();

@@ -127,21 +127,28 @@ int main() {
 
     const std::string longText = "collation of a longer text";
     require(Vtable(facet).transform(&result, collate, longText.data(), longText.data() + longText.size()) == &result);
-    require(allocations == 2 && lastSize == longText.size() + 1 && result.pointer == lastAllocation);
-    require(result.size == longText.size() && result.capacity == longText.size() && std::string(result.pointer) == longText);
+    require(allocations == 2 && lastSize == 32 && result.pointer == lastAllocation);
+    require(result.size == longText.size() && result.capacity == 31 && std::string(result.pointer) == longText);
     std::free(result.pointer);
 
-    const std::string largest(4094, 'z');
-    require(Vtable(facet).transform(&result, collate, largest.data(), largest.data() + largest.size()) == &result);
-    require(allocations == 3 && lastSize == 4095 && result.capacity == 4094 && std::string(result.pointer) == largest);
+    const std::string largestSmall(4079, 'z');
+    require(Vtable(facet).transform(&result, collate, largestSmall.data(), largestSmall.data() + largestSmall.size()) == &result);
+    require(allocations == 3 && lastSize == 4080 && result.pointer == lastAllocation && result.capacity == 4079 && std::string(result.pointer) == largestSmall);
     std::free(result.pointer);
 
-    const std::string tooLong(4095, 'z');
-    reject([&] { Vtable(facet).transform(&result, collate, tooLong.data(), tooLong.data() + tooLong.size()); });
+    const std::string smallestLarge(4080, 'y');
+    require(Vtable(facet).transform(&result, collate, smallestLarge.data(), smallestLarge.data() + smallestLarge.size()) == &result);
+    const auto raw = reinterpret_cast<std::uintptr_t>(lastAllocation);
+    const auto aligned = reinterpret_cast<std::uintptr_t>(result.pointer);
+    require(allocations == 4 && lastSize == 4096 + 0x27);
+    require(aligned % 0x20 == 0 && aligned >= raw + 8 && aligned <= raw + 0x27 && reinterpret_cast<void**>(result.pointer)[-1] == lastAllocation);
+    require(result.size == 4080 && result.capacity == 4095 && std::string(result.pointer) == smallestLarge);
+    std::free(lastAllocation);
+
     const std::string embedded("a\0b", 3);
     reject([&] { Vtable(facet).transform(&result, collate, embedded.data(), embedded.data() + embedded.size()); });
     reject([&] { Vtable(facet).transform(nullptr, collate, text, text + 1); });
-    require(allocations == 3);
+    require(allocations == 4);
 
     Vtable(facet).facet.retain(facet);
     Vtable(facet).facet.retain(facet);

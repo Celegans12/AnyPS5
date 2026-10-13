@@ -4,11 +4,15 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <limits>
+#include <new>
+#include <stdexcept>
 #include <span>
 #include <string>
 #include <system_error>
@@ -89,17 +93,27 @@ inline bool WriteFileAtomically(const std::filesystem::path& path, std::span<con
 
 inline bool ReadWholeFile(const std::filesystem::path& path, std::vector<std::byte>& bytes) {
     bytes.clear();
-    std::ifstream file(path, std::ios::binary | std::ios::ate);
-    if (!file) return false;
-    const auto size = static_cast<std::streamoff>(file.tellg());
-    if (size < 0) return false;
-    file.seekg(0, std::ios::beg);
-    bytes.resize(static_cast<std::size_t>(size));
-    if (!file.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()))) {
+    try {
+        std::ifstream file(path, std::ios::binary | std::ios::ate);
+        if (!file) return false;
+        const auto size = static_cast<std::streamoff>(file.tellg());
+        if (size < 0 || static_cast<std::uintmax_t>(size) > bytes.max_size() ||
+            static_cast<std::uintmax_t>(size) > static_cast<std::uintmax_t>(std::numeric_limits<std::streamsize>::max()))
+            return false;
+        if (!file.seekg(0, std::ios::beg)) return false;
+        bytes.resize(static_cast<std::size_t>(size));
+        if (!file.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()))) {
+            bytes.clear();
+            return false;
+        }
+        return true;
+    } catch (const std::bad_alloc&) {
+        bytes.clear();
+        return false;
+    } catch (const std::length_error&) {
         bytes.clear();
         return false;
     }
-    return true;
 }
 
 inline std::uint64_t HashBytes(std::span<const std::byte> bytes, std::uint64_t seed = 0) {

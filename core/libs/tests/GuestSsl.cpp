@@ -12,6 +12,7 @@ int APS5_VABI sceSslFreeCaCerts(int, void*);
 int APS5_VABI sceSslGetCaList(int, void*);
 int APS5_VABI sceSslFreeCaList(int, void*);
 int APS5_VABI sceSslUnloadCert(int);
+int APS5_VABI sceSslSetVerifyCallback(void);
 }
 
 struct SslMemoryPoolStats {
@@ -50,6 +51,7 @@ int main() {
     constexpr int notFound = static_cast<int>(0x8095F004);
     constexpr int invalidArg = static_cast<int>(0x8095177A);
     int marker = 0;
+    Require(Throws([] { sceSslSetVerifyCallback(); }));
 
     const int context = sceSslInit_nid_postfix(0x10000);
     Require(context > 0);

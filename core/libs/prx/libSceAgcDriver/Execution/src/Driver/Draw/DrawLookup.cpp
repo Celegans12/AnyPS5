@@ -27,7 +27,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             mix(graphics.stages.tessellation.has_value());
             if (graphics.stages.tessellation) {
                 const auto& tess = *graphics.stages.tessellation;
-                for (const auto value : {tess.inputControlPoints, tess.outputControlPoints, tess.domain, tess.partitioning, tess.outputTopology, std::bit_cast<std::uint32_t>(tess.minLevel), std::bit_cast<std::uint32_t>(tess.maxLevel), tess.patchesPerGroup, tess.primitiveGroupSize, static_cast<std::uint32_t>(tess.breakAtInstance)}) mix(value);
+                for (const auto value : {tess.inputControlPoints, tess.outputControlPoints, tess.domain, tess.partitioning, tess.outputTopology, tess.patchesPerGroup, tess.primitiveGroupSize, static_cast<std::uint32_t>(tess.breakAtInstance)}) mix(value);
             }
             mix(graphics.rectList);
             mix(programs.size());
@@ -49,6 +49,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                 mix(vertex.fetchAttribReg);
                 mix(vertex.fetchBufferReg);
                 mix(vertex.fetchEmbedded);
+                mix(vertex.paClVsOutCntl);
                 for (std::uint32_t r = 0; r < vertex.resourcesNum; ++r) {
                     for (const auto field : vertex.resources[r].fields) mix(field);
                     const auto& destination = vertex.resourcesDst[r];
@@ -65,12 +66,14 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             for (const bool flag : {pixel.wave32, pixel.hasPerspectiveCenterVgpr, pixel.perspectiveCentroid, pixel.posX, pixel.posY, pixel.posZ, pixel.posW, pixel.frontFace, pixel.ancillary, pixel.sampleShading, pixel.noPerspective, pixel.linearCentroid, pixel.pixelKillEnable, pixel.depthExportEnable, pixel.sampleMaskExportEnable, pixel.earlyZ, pixel.executeOnNoop}) mix(flag);
             mix(static_cast<std::uint64_t>(pixel.conservativeZExport));
             mix(pixel.orderedPixelShader);
+            mix(pixel.stencilRefExportEnable);
             for (const auto value : pixel.targetOutputMode) mix(value);
             for (const auto value : pixel.targetExportMapping) mix(value);
             for (const auto value : pixel.targetExportPacking) mix(static_cast<std::uint64_t>(value));
             mix(pixel.dualSourceBlend);
             mix(pixel.alphaToCoverage);
             for (const auto& blend : pixel.targetBlend) mix(static_cast<std::uint64_t>(blend.enable) | (static_cast<std::uint64_t>(blend.sourceFactor) << 8u) | (static_cast<std::uint64_t>(blend.destinationFactor) << 16u) | (static_cast<std::uint64_t>(blend.function) << 24u) | (static_cast<std::uint64_t>(blend.writeMask) << 32u));
+            mix(static_cast<std::uint64_t>(pixel.rasterPrimitive));
             std::lock_guard cacheLock(drawCacheMutex);
             ++drawEntryCounters.lookups;
             const auto found = drawCache.find(drawKey);

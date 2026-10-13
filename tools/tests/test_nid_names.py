@@ -1,8 +1,10 @@
+import contextlib
+import io
 import json
 import tempfile
 import sys
 import unittest
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from unittest.mock import patch
 from urllib.error import URLError
 
@@ -68,8 +70,61 @@ class DatabaseCacheTests(unittest.TestCase):
                 self.assertEqual(nid_names.load_db(cache), {"nid1": "sceExisting"})
                 download.assert_not_called()
 
+    def test_utf8_bom_does_not_change_the_first_nid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory) / "aerolib.csv"
+            nid = nid_names.compute_nid("sceExample")
+            cache.write_text(f"{nid} sceExample\n", encoding="utf-8-sig")
+            self.assertEqual(nid_names.load_db(cache), {nid: "sceExample"})
+
+    def test_comment_rows_do_not_become_database_entries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory) / "aerolib.csv"
+            nid = nid_names.compute_nid("sceExample")
+            cache.write_text(f"# Database names\n{nid} sceExample\n", encoding="utf-8")
+            self.assertEqual(nid_names.load_db(cache), {nid: "sceExample"})
+
+    def test_annotations_do_not_change_hash_inputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory) / "aerolib.csv"
+            nid = nid_names.compute_nid("sceExample")
+            cache.write_text(f"{nid}#A#B sceExample#verified\n", encoding="utf-8")
+            self.assertEqual(nid_names.load_db(cache), {nid: "sceExample"})
+
 class NidArgumentTests(unittest.TestCase):
     options = ["-h", "--help", "--db", "--nid", "--json"]
+
+    def test_invalid_nids_fail_before_database_or_source_access(self):
+        for nid in ("short", "ABCDEFGHIJKL", "ABCDEFGHIJ/", "ABCDEFGHIJ_", "ABCDEFGHIJ\u00e9", "", "--jsooon"):
+            with self.subTest(nid=nid):
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as error, \
+                        patch.object(nid_names, "load_db", return_value={}) as database, \
+                        patch.object(nid_names, "collect_unknowns") as sources, \
+                        patch.object(nid_names, "collect_real_names", return_value=set()), \
+                        self.assertRaises(SystemExit) as exited:
+                    nid_names.main(["--nid=" + nid, "--json"])
+                self.assertEqual(exited.exception.code, 2)
+                self.assertIn("invalid NID", error.getvalue())
+                database.assert_not_called()
+                sources.assert_not_called()
+
+    def test_option_typo_in_nid_list_is_not_an_unknown_success(self):
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as error, \
+                patch.object(nid_names, "load_db", return_value={}) as database, \
+                patch.object(nid_names, "collect_real_names", return_value=set()), self.assertRaises(SystemExit) as exited:
+            nid_names.main(["--nid", "ZjtRqSMJwdw", "--jsooon"])
+        self.assertEqual(exited.exception.code, 2)
+        self.assertIn("--jsooon", error.getvalue())
+        database.assert_not_called()
+
+    def test_valid_unknown_nid_remains_a_successful_lookup(self):
+        output = io.StringIO()
+        with patch.object(nid_names, "load_db", return_value={}), \
+                patch.object(nid_names, "collect_real_names", return_value=set()), \
+                contextlib.redirect_stdout(output):
+            self.assertEqual(nid_names.main(["--nid=AAAAAAAAAA+", "--json"]), 0)
+        row, = json.loads(output.getvalue())["rows"]
+        self.assertEqual((row["nid"], row["status"]), ("AAAAAAAAAA+", "unknown"))
 
     def normalize(self, arguments):
         return nid_names.nid_arguments(arguments, self.options)
@@ -100,6 +155,94 @@ class NidArgumentTests(unittest.TestCase):
             self.assertEqual(nid_names.main(), 0)
         rows = json.loads(printed.call_args.args[0])["rows"]
         self.assertEqual({row["nid"]: row["suggestion"] for row in rows}, database)
+
+
+class SourceCollectionTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.prx = self.root / "core" / "libs" / "prx"
+        self.module = self.prx / "libSceExample"
+        self.module.mkdir(parents=True)
+        self.root_patch = patch.object(nid_names, "ROOT", self.root)
+        self.prx_patch = patch.object(nid_names, "PRX", self.prx)
+        self.root_patch.start()
+        self.prx_patch.start()
+        self.addCleanup(self.root_patch.stop)
+        self.addCleanup(self.prx_patch.stop)
+
+    def write_source(self, text, relative="Export.cpp"):
+        path = self.module / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def test_comments_and_literals_do_not_create_export_records(self):
+        self.write_source('''// APS5_EXPORT("AAAAAAAAAAA", exampleUnknown00);
+/* int APS5_VABI sceCommented() { return 0; } */
+auto example = R"text(APS5_EXPORT("BBBBBBBBBBB", exampleUnknown01);
+int APS5_VABI sceQuoted() { return 0; })text";
+APS5_EXPORT("CCCCCCCCCCC", exampleUnknown02);
+int APS5_VABI sceReal() { return 0; }
+''')
+        self.assertEqual(nid_names.collect_unknowns(), {"CCCCCCCCCCC": "core/libs/prx/libSceExample/Export.cpp:exampleUnknown02"})
+        self.assertEqual(nid_names.collect_real_names(), {"sceReal"})
+
+    def test_formatted_alias_macro_is_detected(self):
+        self.write_source('APS5_EXPORT (\n "AAAAAAAAAAA" ,\n exampleUnknown00\n );\n')
+        self.assertEqual(nid_names.collect_unknowns(), {"AAAAAAAAAAA": "core/libs/prx/libSceExample/Export.cpp:exampleUnknown00"})
+
+    def test_known_aliases_are_not_unknown_exports(self):
+        self.write_source('APS5_EXPORT("AAAAAAAAAAA", sceKnownCall);\n'
+                          'APS5_EXPORT("BBBBBBBBBBB", exampleUnknown00);\n')
+        self.assertEqual(nid_names.collect_unknowns(), {"BBBBBBBBBBB": "core/libs/prx/libSceExample/Export.cpp:exampleUnknown00"})
+
+    def test_windows_source_paths_use_portable_separators(self):
+        self.write_source('APS5_EXPORT("AAAAAAAAAAA", exampleUnknown00);\n')
+        relative = PureWindowsPath("core/libs/prx/libSceExample/Export.cpp")
+        with patch.object(Path, "relative_to", return_value=relative):
+            self.assertEqual(nid_names.collect_unknowns(), {"AAAAAAAAAAA": "core/libs/prx/libSceExample/Export.cpp:exampleUnknown00"})
+
+    def test_test_fixtures_are_not_runtime_implementations(self):
+        self.write_source('APS5_EXPORT("AAAAAAAAAAA", exampleUnknown00);\nint APS5_VABI sceFixture() { return 0; }\n', "tests/Fixture.cpp")
+        self.assertEqual(nid_names.collect_unknowns(), {})
+        self.assertEqual(nid_names.collect_real_names(), set())
+
+    def test_unreadable_sources_fail_instead_of_returning_incomplete_names(self):
+        self.write_source('int APS5_VABI sceReal() { return 0; }\n')
+        with patch.object(Path, "read_text", side_effect=OSError("read denied")):
+            with self.assertRaisesRegex(OSError, "read denied"):
+                nid_names.collect_unknowns()
+            with self.assertRaisesRegex(OSError, "read denied"):
+                nid_names.collect_real_names()
+
+    def test_explicit_empty_nid_filter_does_not_scan_the_tree(self):
+        cache = self.root / "aerolib.csv"
+        cache.write_text("AAAAAAAAAAA example\n", encoding="utf-8")
+        output = io.StringIO()
+        with patch.object(sys, "argv", ["nid_names.py", "--db", str(cache), "--nid", "--json"]), patch.object(nid_names, "collect_unknowns", side_effect=AssertionError("unexpected tree scan")), contextlib.redirect_stdout(output):
+            self.assertEqual(nid_names.main(), 0)
+        self.assertEqual(json.loads(output.getvalue())["rows"], [])
+
+    def test_empty_abbreviated_filter_skips_all_source_scans(self):
+        cache = self.root / "aerolib.csv"
+        cache.write_text("AAAAAAAAAAA example\n", encoding="utf-8")
+        arguments = ["nid_names.py", "--db", str(cache), "--ni", "--json"]
+        with patch.object(sys, "argv", arguments), patch.object(nid_names, "collect_unknowns", side_effect=AssertionError("unexpected aliases scan")), patch.object(nid_names, "collect_real_names", side_effect=AssertionError("unexpected definitions scan")), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(nid_names.main(), 0)
+
+    def test_literals_and_digit_separators_keep_following_definitions(self):
+        self.write_source('''auto count = 1'000;
+auto quote = '\\'';
+auto string = "\\\" APS5_VABI sceQuoted() { }";
+int APS5_VABI sceReal() { return 0; }
+''')
+        self.assertEqual(nid_names.collect_real_names(), {"sceReal"})
+
+    def test_spliced_line_comment_and_macro_tokens(self):
+        self.write_source('// continued \\\nAPS5_EXPORT("AAAAAAAAAAA", exampleUnknown00);\nAPS5_EX\\\nPORT("BBBBBBBBBBB", exampleUnknown01);\n')
+        self.assertEqual(nid_names.collect_unknowns(), {"BBBBBBBBBBB": "core/libs/prx/libSceExample/Export.cpp:exampleUnknown01"})
 
 
 if __name__ == "__main__":

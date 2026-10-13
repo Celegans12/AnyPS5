@@ -202,7 +202,7 @@ void Run(Context context, std::uint8_t* block) {
     // nor an alias to seed from or copy back into the depth image.
     Require(DepthSurfaceStorage(context, {}, PlaneResource(address, Format16x4Float), 0) == nullptr, "a 64-bit storage view of the depth plane was taken for the depth surface");
     {
-        const auto reused = std::make_shared<StorageTexture>(context, *context.detiler, PlaneResource(address, Format16x4Float), 0);
+        const auto reused = StorageTexture::Create(context, *context.detiler, PlaneResource(address, Format16x4Float), 0);
         SeedStorageFromDepth(context, reused);
         MarkStorageDepthWrites(context, reused);
         Require(DepthSurfaceView(context, target) != VK_NULL_HANDLE, "the depth surface was lost after a reused-memory view");
@@ -232,6 +232,33 @@ void Run(Context context, std::uint8_t* block) {
     readBack(*stencil);
     const auto stencilBytes = DescribeSurface(PlaneResource(stencilAddress, Format8Uint)).guestBytes;
     Require(stencilBytes <= BlockBytes / 2 && std::count(block + BlockBytes / 2, block + BlockBytes / 2 + stencilBytes, 7) == static_cast<std::ptrdiff_t>(Side * Side), "the storage image did not receive the cleared stencil");
+    const std::array<std::uint32_t, 4> half{std::bit_cast<std::uint32_t>(0.5f), std::bit_cast<std::uint32_t>(0.5f), std::bit_cast<std::uint32_t>(0.5f), std::bit_cast<std::uint32_t>(0.5f)};
+    Require(depth->FillClear(half, StorageTexture::WholeImage, refusal), refusal != nullptr ? refusal : "the storage image could not be filled");
+    Require(DepthSurfaceStoreBack(context, *depth), "the depth plane's storage image was not stored back");
+    submit(recorder);
+    auto layeredDepth = PlaneResource(address, Format32Float);
+    layeredDepth.dimension = TextureDimension::k2DArray;
+    const auto arrayDepth = DepthSurfaceStorage(context, {}, layeredDepth, 0);
+    Require(arrayDepth != nullptr && arrayDepth != depth, "a one-layer 2D array view of the depth plane was not taken for the depth surface as a storage image of its own");
+    ExpectFailure([&] { static_cast<void>(DepthSurfaceStoreBack(context, *depth)); }, "through a view that another view of the plane", "a store back through the 2D view that the one-layer 2D array view replaced was accepted");
+    submit(recorder);
+    readBack(*arrayDepth);
+    Require(CountFloats(block, 0.5f) == Side * Side, "the one-layer 2D array view did not receive the depth plane");
+    std::fill(block + BlockBytes / 2, block + BlockBytes / 2 + stencilBytes, std::uint8_t{0});
+    auto layeredStencil = PlaneResource(stencilAddress, Format8Uint);
+    layeredStencil.dimension = TextureDimension::k2DArray;
+    const auto arrayStencil = DepthSurfaceStorage(context, {}, layeredStencil, 0);
+    Require(arrayStencil != nullptr, "a one-layer 2D array view of the stencil plane was not taken for the depth surface");
+    submit(recorder);
+    readBack(*arrayStencil);
+    Require(std::count(block + BlockBytes / 2, block + BlockBytes / 2 + stencilBytes, 7) == static_cast<std::ptrdiff_t>(Side * Side), "the one-layer 2D array view did not receive the stencil plane");
+    layeredStencil.depthOrLastArray = 1;
+    Require(DepthSurfaceStorage(context, {}, layeredStencil, 0) == nullptr, "a two-layer 2D array view of the stencil plane was taken for the plane's own storage image");
+    layeredDepth.depthOrLastArray = 1;
+    Require(DepthSurfaceStorage(context, {}, layeredDepth, 0) == nullptr, "a two-layer 2D array view of the depth plane was taken for the plane's own storage image");
+    layeredDepth.depthOrLastArray = 0;
+    layeredDepth.baseArray = 1;
+    Require(DepthSurfaceStorage(context, {}, layeredDepth, 0) == nullptr, "a 2D array view of layer 1 of the depth plane was taken for the plane's own storage image");
 }
 
 }

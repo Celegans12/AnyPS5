@@ -25,6 +25,7 @@ static constexpr char SAVE_DIR[] = "_sd";
 
 static std::atomic<std::int32_t> g_transaction_counter{1};
 static std::atomic<int> g_initializations{0};
+static std::atomic<float> g_convertProgress{0.0f};
 
 static std::string save_root() {
     return std::string(SAVE_DIR);
@@ -60,6 +61,9 @@ static bool dir_name_match(const char* str, const char* pattern) {
             return false;
         }
         str++;
+        pattern++;
+    }
+    while (*pattern == '%') {
         pattern++;
     }
     return *str == '\0' && *pattern == '\0';
@@ -270,13 +274,22 @@ static int dirNameSearch(const SaveDataDirNameSearchCond* cond, SaveDataDirNameS
     }
     result->hit_num = 0;
     result->set_num = 0;
+    const std::uint32_t key = cond->key;
+    if ((key > SAVE_DATA_SORT_KEY_MTIME && key != SAVE_DATA_SORT_KEY_FREE_BLOCKS) || cond->order > SAVE_DATA_SORT_ORDER_DESCENT) {
+        return SAVE_DATA_ERROR_PARAMETER;
+    }
     const char* pattern = (cond->dir_name != nullptr) ? cond->dir_name->data : nullptr;
     const std::string root = save_root();
     if (!std::filesystem::is_directory(root)) {
         return SAVE_DATA_OK;
     }
-    std::uint32_t hit = 0;
-    std::uint32_t set = 0;
+    struct Match {
+        std::string name;
+        std::string path;
+        SaveDataParam param;
+    };
+    const bool sortByParam = key == SAVE_DATA_SORT_KEY_USER_PARAM || key == SAVE_DATA_SORT_KEY_MTIME;
+    std::vector<Match> matches;
     for (const auto& entry : std::filesystem::directory_iterator(root)) {
         if (!entry.is_directory()) {
             continue;
@@ -285,16 +298,32 @@ static int dirNameSearch(const SaveDataDirNameSearchCond* cond, SaveDataDirNameS
         if (!dir_name_match(name.c_str(), pattern)) {
             continue;
         }
-        hit++;
-        if (result->dir_names != nullptr && set < result->dir_names_num) {
-            std::snprintf(result->dir_names[set].data, sizeof(result->dir_names[set].data), "%s", name.c_str());
-            if (result->params != nullptr) {
-                result->params[set] = load_param(entry.path().string());
-            }
-            set++;
+        Match match{name, entry.path().string(), {}};
+        if (sortByParam) {
+            match.param = load_param(match.path);
+        }
+        matches.push_back(std::move(match));
+    }
+    std::sort(matches.begin(), matches.end(), [](const Match& a, const Match& b) { return a.name < b.name; });
+    if (key == SAVE_DATA_SORT_KEY_USER_PARAM) {
+        std::stable_sort(matches.begin(), matches.end(), [](const Match& a, const Match& b) { return a.param.user_param < b.param.user_param; });
+    } else if (key == SAVE_DATA_SORT_KEY_MTIME) {
+        std::stable_sort(matches.begin(), matches.end(), [](const Match& a, const Match& b) { return a.param.mtime < b.param.mtime; });
+    }
+    if (cond->order == SAVE_DATA_SORT_ORDER_DESCENT) {
+        std::reverse(matches.begin(), matches.end());
+    }
+    const std::uint32_t set = result->dir_names == nullptr ? 0 : static_cast<std::uint32_t>(std::min<std::size_t>(result->dir_names_num, matches.size()));
+    for (std::uint32_t i = 0; i < set; i++) {
+        std::snprintf(result->dir_names[i].data, sizeof(result->dir_names[i].data), "%s", matches[i].name.c_str());
+        if (result->params != nullptr) {
+            result->params[i] = sortByParam ? matches[i].param : load_param(matches[i].path);
+        }
+        if (result->infos != nullptr) {
+            result->infos[i] = SaveDataSearchInfo{SAVE_DATA_BLOCKS_MAX, SAVE_DATA_BLOCKS_MAX, {}};
         }
     }
-    result->hit_num = hit;
+    result->hit_num = static_cast<std::uint32_t>(matches.size());
     result->set_num = set;
     return SAVE_DATA_OK;
 }
@@ -625,22 +654,30 @@ static int setupSaveDataMemory2(const SaveDataMemorySetup2* setup_param, SaveDat
     if (!have) {
         existed = 0;
     }
+    const bool needParam = (setup_param->init_param != nullptr && (setup_param->option & 1u) != 0);
+    const std::string paramPath = mem_path(setup_param->user_id, setup_param->slot_id, "param");
+    std::size_t paramSize = 0;
+    const bool haveParam = file_size_of(paramPath, &paramSize);
     // First run: create a zero-filled blob and report existed size 0 so the title treats it as a new save.
-    if (!have || existed < setup_param->memory_size) {
+    if (!have || existed < setup_param->memory_size || (needParam && !haveParam)) {
         std::error_code ec;
         std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
-        std::vector<char> data;
-        if (have && !read_file_all(path, data)) {
-            return SAVE_DATA_ERROR_INTERNAL;
-        }
-        data.resize(setup_param->memory_size, 0);
-        if (!write_file_replace(path, data)) {
-            return SAVE_DATA_ERROR_INTERNAL;
-        }
-        if (setup_param->init_param != nullptr && (setup_param->option & 1u) != 0) {
+        if (needParam) {
             std::vector<char> pd(sizeof(SaveDataParam));
             std::memcpy(pd.data(), setup_param->init_param, sizeof(SaveDataParam));
-            write_file_replace(mem_path(setup_param->user_id, setup_param->slot_id, "param"), pd);
+            if (!write_file_replace(paramPath, pd)) {
+                return SAVE_DATA_ERROR_INTERNAL;
+            }
+        }
+        if (!have || existed < setup_param->memory_size) {
+            std::vector<char> data;
+            if (have && !read_file_all(path, data)) {
+                return SAVE_DATA_ERROR_INTERNAL;
+            }
+            data.resize(setup_param->memory_size, 0);
+            if (!write_file_replace(path, data)) {
+                return SAVE_DATA_ERROR_INTERNAL;
+            }
         }
     }
     if (result != nullptr) {
@@ -680,6 +717,9 @@ int APS5_VABI sceSaveDataTerminate(void) {
         return SAVE_DATA_ERROR_BUSY;
     }
     --g_initializations;
+    if (g_initializations == 0) {
+        g_convertProgress = 0.0f;
+    }
     return SAVE_DATA_OK;
 }
 
@@ -740,18 +780,64 @@ int APS5_VABI sceSaveDataDirNameSearchPs4(const SaveDataDirNameSearchCond* cond,
     return rc;
 }
 
-int APS5_VABI sceSaveDataConvert() {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+static int convert(const SaveDataConvert* param) {
+    if (param == nullptr || param->dir_name == nullptr) {
+        throw std::runtime_error("sceSaveDataConvert: null argument");
+    }
+    g_convertProgress = 0.0f;
+    const auto* nameEnd = static_cast<const char*>(std::memchr(param->dir_name->data, '\0', sizeof(param->dir_name->data)));
+    if (nameEnd == nullptr) {
+        return SAVE_DATA_ERROR_PARAMETER;
+    }
+    const std::string dirName(param->dir_name->data, static_cast<std::size_t>(nameEnd - param->dir_name->data));
+    if (dirName.empty() || dirName == "." || dirName == ".." || dirName.find_first_of("/\\:") != std::string::npos) {
+        return SAVE_DATA_ERROR_PARAMETER;
+    }
+    if (!std::filesystem::is_directory(save_root() + "/" + dirName)) {
+        return SAVE_DATA_ERROR_NOT_FOUND;
+    }
+    g_convertProgress = 1.0f;
+    return SAVE_DATA_OK;
 }
 
-int APS5_VABI sceSaveDataGetConvertProgress() {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+int APS5_VABI sceSaveDataConvert(const SaveDataConvert* param) {
+    const int rc = convert(param);
+    SAVEDATA_TRACE("convert user=%d dir=%s -> 0x%08x", param != nullptr ? param->user_id : -1, param != nullptr && param->dir_name != nullptr ? param->dir_name->data : "(null)", static_cast<unsigned>(rc));
+    return rc;
+}
+
+static int getConvertProgress(float* progress) {
+    if (progress == nullptr) {
+        return SAVE_DATA_ERROR_PARAMETER;
+    }
+    if (g_initializations == 0) {
+        return SAVE_DATA_ERROR_NOT_INITIALIZED;
+    }
+    *progress = g_convertProgress.load();
+    return SAVE_DATA_OK;
+}
+
+int APS5_VABI sceSaveDataGetConvertProgress(float* progress) {
+    const int rc = getConvertProgress(progress);
+    SAVEDATA_TRACE("getConvertProgress -> 0x%08x progress=%.2f", static_cast<unsigned>(rc), progress != nullptr && rc == SAVE_DATA_OK ? *progress : 0.0f);
+    return rc;
 }
 
 int APS5_VABI sceSaveDataCancel() {
     NotImplemented_nid_no_patch(__func__);
     return 0;
 }
+
+int APS5_VABI sceSaveDataDirNameSearch2(const SaveDataDirNameSearchCond* cond, SaveDataDirNameSearchResult* result) {
+    const int rc = dirNameSearch(cond, result);
+    SAVEDATA_TRACE("dirNameSearch2 user=%d pattern=%s hit=%u set=%u -> 0x%08x", cond != nullptr ? cond->user_id : -1, cond != nullptr && cond->dir_name != nullptr ? cond->dir_name->data : "(all)", result != nullptr ? result->hit_num : 0u, result != nullptr ? result->set_num : 0u, static_cast<unsigned>(rc));
+    return rc;
+}
+
+APS5_EXPORT("RvID8BVeg+g", sceSaveDataUnknown_RvID8BVeg);
+int APS5_VABI sceSaveDataUnknown_RvID8BVeg() {
+    NotImplemented_nid_no_patch("RvID8BVeg+g");
+    return 0;
+}
+
 }

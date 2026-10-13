@@ -51,6 +51,7 @@ inline constexpr std::size_t kRelaPltAlignment = 8;
 inline constexpr std::size_t kGotAlignment = 8;
 inline constexpr std::size_t kGotReservedSlots = 3;
 
+inline constexpr std::uint64_t kElfHeaderSize = 64;
 inline constexpr std::uint64_t kDefaultLoadAlignment = 0x1000;
 inline constexpr std::uint64_t kPhdrHeaderAlignment = 8;
 inline constexpr std::uint64_t kDynamicHeaderAlignment = 8;
@@ -141,6 +142,7 @@ inline constexpr std::uint32_t R_X86_64_REX_GOTPCRELX = 42;
 
 inline constexpr std::uint8_t STB_GLOBAL = 1;
 inline constexpr std::uint8_t STB_WEAK = 2;
+inline constexpr std::uint8_t STT_NOTYPE = 0;
 inline constexpr std::uint8_t STT_FUNC = 2;
 inline constexpr std::uint8_t STV_DEFAULT = 0;
 inline constexpr std::uint16_t SHN_UNDEF = 0;

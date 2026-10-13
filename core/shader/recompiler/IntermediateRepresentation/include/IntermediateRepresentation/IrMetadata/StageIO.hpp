@@ -46,6 +46,8 @@ enum class StageInputKind {
     DispatchThreadLimit,
     Parameter,
     HelperInvocation,
+    RasterPrimitive,
+    LayerExported,
     BaseInstance,
 };
 
@@ -55,6 +57,7 @@ enum class StageOutputKind {
     Mrt,
     Depth,
     SampleMask,
+    StencilRef,
     PointSize,
     ClipDistance,
     CullDistance,

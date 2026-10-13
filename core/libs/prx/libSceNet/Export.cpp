@@ -30,8 +30,10 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/GuestArena.hpp"
 #include "prx/libkernel/Socket/include/SocketPoll.hpp"
 
 // Guest socket descriptors retain PS5 semantics while their transport is backed by host sockets.
@@ -39,11 +41,13 @@
 namespace {
 // FreeBSD errno numbers as reported through sceNetErrnoLoc (SCE_NET_ERROR_* is 0x80410100 + errno).
 constexpr int NET_ENOENT = 2;
+constexpr int NET_EINTR = 4;
 constexpr int NET_EBADF = 9;
 constexpr int NET_EACCES = 13;
 constexpr int NET_EFAULT = 14;
 constexpr int NET_EINVAL = 22;
 constexpr int NET_ENOSPC = 28;
+constexpr int NET_EDOM = 33;
 constexpr int NET_EAGAIN = 35;
 constexpr int NET_EINPROGRESS = 36;
 constexpr int NET_EALREADY = 37;
@@ -64,16 +68,27 @@ constexpr int NET_ECONNREFUSED = 61;
 constexpr int NET_EHOSTUNREACH = 65;
 constexpr int NET_ERROR_BASE = static_cast<int>(0x80410100u);
 constexpr int NET_ERROR_RESOLVER_ENODNS = static_cast<int>(0x804101E1u);
+constexpr int NET_RESOLVER_ABORT_FLAG_NTOA_PRESERVATION = 0x1;
+constexpr int NET_RESOLVER_ABORT_FLAG_ATON_PRESERVATION = 0x2;
 
 constexpr int NET_AF_INET = 2;
 constexpr int NET_AF_INET6 = 28;
 constexpr int NET_SOCK_STREAM = 1;
 constexpr int NET_SOCK_DGRAM = 2;
 constexpr int NET_SOCK_RAW = 3;
+constexpr int NET_EPOLL_CTL_ADD = 1;
+constexpr int NET_EPOLL_CTL_MOD = 2;
+constexpr int NET_EPOLL_CTL_DEL = 3;
 constexpr int NET_SOL_SOCKET = 0xFFFF;
 constexpr int NET_SO_SNDTIMEO = 0x1005;
 constexpr int NET_SO_RCVTIMEO = 0x1006;
 constexpr int NET_SO_NBIO = 0x1200;
+constexpr int NET_SO_REUSEADDR = 0x4;
+constexpr int NET_SO_BROADCAST = 0x20;
+constexpr int NET_SO_SNDBUF = 0x1001;
+constexpr int NET_SO_RCVBUF = 0x1002;
+constexpr int NET_SO_SCE_SNDTIMEO = 0x1105;
+constexpr int NET_SO_SCE_RCVTIMEO = 0x1106;
 constexpr int NET_MSG_PEEK = 0x2;
 constexpr int NET_MSG_TRUNC = 0x10;
 constexpr int NET_UIO_MAXIOV = 1024;
@@ -167,7 +182,7 @@ bool guest_to_native_address(const void* address, std::uint32_t length,
                              sockaddr_storage& native, NativeLength& native_length) {
     if (!address || length < 2) return false;
     const auto* bytes = static_cast<const std::uint8_t*>(address);
-    if (bytes[1] == NET_AF_INET && bytes[0] == 16 && length >= 16) {
+    if (bytes[1] == NET_AF_INET && length >= 16) {
         auto& v4 = reinterpret_cast<sockaddr_in&>(native);
         v4.sin_family = AF_INET;
         std::memcpy(&v4.sin_port, bytes + 2, 2);
@@ -175,7 +190,7 @@ bool guest_to_native_address(const void* address, std::uint32_t length,
         native_length = sizeof(v4);
         return true;
     }
-    if (bytes[1] == NET_AF_INET6 && bytes[0] == 28 && length >= 28) {
+    if (bytes[1] == NET_AF_INET6 && length >= 28) {
         auto& v6 = reinterpret_cast<sockaddr_in6&>(native);
         v6.sin6_family = AF_INET6;
         std::memcpy(&v6.sin6_port, bytes + 2, 2);
@@ -190,6 +205,10 @@ bool guest_to_native_address(const void* address, std::uint32_t length,
 
 bool native_to_guest_address(const sockaddr_storage& native, void* address, std::uint32_t* length) {
     if (!address || !length) return false;
+    if (native.ss_family == AF_UNSPEC) {
+        *length = 0;
+        return true;
+    }
     std::uint8_t bytes[28]{};
     if (native.ss_family == AF_INET) {
         const auto& v4 = reinterpret_cast<const sockaddr_in&>(native);
@@ -208,9 +227,9 @@ bool native_to_guest_address(const sockaddr_storage& native, void* address, std:
     } else {
         return false;
     }
-    const auto required = static_cast<std::uint32_t>(bytes[0]);
-    std::memcpy(address, bytes, std::min(*length, required));
-    *length = required;
+    const auto copied = std::min<std::uint32_t>(*length, bytes[0]);
+    std::memcpy(address, bytes, copied);
+    *length = copied;
     return true;
 }
 
@@ -289,7 +308,14 @@ struct NetMemoryPoolStats {
     std::size_t max_inuse_size;
     std::size_t current_inuse_size;
 };
-std::map<int, int> g_resolvers;
+struct Resolver {
+    int error = 0;
+    int running = 0;
+    std::uint64_t aborts = 0;
+    bool abort_ntoa = false;
+    bool abort_aton = false;
+};
+std::map<int, Resolver> g_resolvers;
 int g_next_sock = 32;
 int g_next_epoll = 0x4000;
 int g_next_pool = 1;
@@ -301,15 +327,78 @@ int* errno_slot() {
     return &e;
 }
 
-int fail(int err) {
+extern "C" int* APS5_VABI __error_nid_postfix();
+
+void set_errno(int err) {
     *errno_slot() = err;
+    *__error_nid_postfix() = err;
+}
+
+int fail(int err) {
+    set_errno(err);
     return NET_ERROR_BASE | err;
 }
 
-void set_resolver_error(int rid, int error) {
+int set_native_timeout(NativeSocket native, int optname, std::int64_t microseconds) {
+    const int native_option = optname == NET_SO_RCVTIMEO ? SO_RCVTIMEO : SO_SNDTIMEO;
+#ifdef _WIN32
+    const std::int64_t milliseconds = (microseconds + 999) / 1000;
+    const DWORD timeout_ms = milliseconds > static_cast<std::int64_t>(MAXDWORD) ? MAXDWORD : static_cast<DWORD>(milliseconds);
+    return ::setsockopt(native, SOL_SOCKET, native_option, reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
+#else
+    timeval timeout{};
+    timeout.tv_sec = static_cast<time_t>(microseconds / 1000000);
+    timeout.tv_usec = static_cast<suseconds_t>(microseconds % 1000000);
+    return ::setsockopt(native, SOL_SOCKET, native_option, &timeout, sizeof(timeout));
+#endif
+}
+
+int set_kernel_timeout(int descriptor, int optname, const void* value, std::uint32_t length) {
+    KernelTimeval timeout{};
+    if (value == nullptr && length != 0) return NET_EFAULT;
+    if (length < sizeof(timeout)) return NET_EINVAL;
+    std::memcpy(&timeout, value, sizeof(timeout));
+    if (timeout.tv_sec < 0 || timeout.tv_usec < 0 || timeout.tv_usec >= 1000000) return NET_EDOM;
+    const std::int64_t microseconds = std::min<std::int64_t>(timeout.tv_sec, INT32_MAX) * 1000000 + timeout.tv_usec;
+    Sock socket;
+    {
+        std::lock_guard lk(g_mutex);
+        const auto it = g_socks.find(descriptor);
+        if (it == g_socks.end()) return NET_EBADF;
+        socket = it->second;
+    }
+    if (set_native_timeout(socket.native->value, optname, microseconds) != 0) return native_error();
+    std::lock_guard lk(g_mutex);
+    const auto it = g_socks.find(descriptor);
+    if (it != g_socks.end()) {
+        const int stored = static_cast<int>(std::min<std::int64_t>(microseconds, INT_MAX));
+        if (optname == NET_SO_RCVTIMEO) it->second.rcv_timeout_us = stored;
+        else it->second.snd_timeout_us = stored;
+    }
+    return 0;
+}
+
+int begin_lookup(int rid, bool Resolver::*preservedAbort, std::uint64_t& generation) {
     std::lock_guard lk(g_mutex);
     const auto resolver = g_resolvers.find(rid);
-    if (resolver != g_resolvers.end()) resolver->second = error;
+    if (resolver == g_resolvers.end()) return fail(NET_EBADF);
+    if (std::exchange(resolver->second.*preservedAbort, false)) {
+        resolver->second.error = NET_ERROR_BASE | NET_EINTR;
+        return fail(NET_EINTR);
+    }
+    ++resolver->second.running;
+    generation = resolver->second.aborts;
+    return 0;
+}
+
+int end_lookup(int rid, std::uint64_t generation, int error) {
+    std::lock_guard lk(g_mutex);
+    const auto resolver = g_resolvers.find(rid);
+    if (resolver == g_resolvers.end()) return error;
+    --resolver->second.running;
+    if (resolver->second.aborts != generation) error = fail(NET_EINTR);
+    resolver->second.error = error;
+    return error;
 }
 
 void log_soft(const char* func, const char* what) {
@@ -350,6 +439,12 @@ struct NetMsghdr {
 static_assert(sizeof(NetMsghdr) == 48 && offsetof(NetMsghdr, iov) == 16 && offsetof(NetMsghdr, control) == 32 &&
     offsetof(NetMsghdr, flags) == 44);
 
+int timeout_option(int optname) {
+    if (optname == NET_SO_SCE_SNDTIMEO) return NET_SO_SNDTIMEO;
+    if (optname == NET_SO_SCE_RCVTIMEO) return NET_SO_RCVTIMEO;
+    return optname;
+}
+
 std::int64_t message_length(const NetMsghdr* message) {
     if (!message) return fail(NET_EFAULT);
     if (message->iov_length < 0 || message->iov_length > NET_UIO_MAXIOV) return fail(NET_EMSGSIZE);
@@ -364,11 +459,21 @@ std::int64_t message_length(const NetMsghdr* message) {
     return static_cast<std::int64_t>(total);
 }
 
+int receive_error(const Sock& socket) {
+#ifdef _WIN32
+    if (WSAGetLastError() == WSAETIMEDOUT && socket.type != NET_SOCK_STREAM && socket.rcv_timeout_us > 0) return NET_EAGAIN;
+#else
+    (void)socket;
+#endif
+    return native_error();
+}
+
 }  // namespace
 
 extern "C" {
 
 extern const std::uint32_t sce_net_in6addr_any[4] = {};
+alignas(std::uint32_t) extern const std::uint8_t sce_net_in6addr_linklocal_allnodes[16] = {0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
 
 int* APS5_VABI sceNetErrnoLoc(void) {
     return errno_slot();
@@ -438,6 +543,37 @@ int PollSockets(KernelSocketPoll::Entry* entries, int count, int timeoutMillisec
 
 const bool g_socketPollerRegistered = (KernelSetSocketPoller_nid_no_patch(&PollSockets), true);
 
+extern "C" int APS5_VABI sceNetSocketClose(int s);
+
+bool CloseSocketForKernel(int descriptor, int* error) {
+    {
+        std::lock_guard lk(g_mutex);
+        if (g_socks.count(descriptor) == 0) return false;
+    }
+    *error = sceNetSocketClose(descriptor) == 0 ? 0 : *errno_slot();
+    return true;
+}
+
+const bool g_socketCloserRegistered = (KernelSetSocketCloser_nid_no_patch(&CloseSocketForKernel), true);
+
+extern "C" int APS5_VABI sceNetSetsockopt(int s, int level, int optname, const void* optval, uint32_t optlen);
+
+bool SetSocketOptionForKernel(int descriptor, int level, int option, const void* value, std::uint32_t length, int* error) {
+    {
+        std::lock_guard lk(g_mutex);
+        if (g_socks.count(descriptor) == 0) return false;
+    }
+    if (level == NET_SOL_SOCKET && (option == NET_SO_RCVTIMEO || option == NET_SO_SNDTIMEO)) {
+        *error = set_kernel_timeout(descriptor, option, value, length);
+        if (*error != 0) set_errno(*error);
+        return true;
+    }
+    *error = sceNetSetsockopt(descriptor, level, option, value, length) == 0 ? 0 : *errno_slot();
+    return true;
+}
+
+const bool g_socketOptionSetterRegistered = (KernelSetSocketOptionSetter_nid_no_patch(&SetSocketOptionForKernel), true);
+
 int APS5_VABI sceNetInit_nid_postfix(void) {
     std::lock_guard lk(g_mutex);
     g_net_inited = true;
@@ -478,6 +614,13 @@ int APS5_VABI sceNetSocket(const char* name, int family, int type, int protocol)
     if (!initialize_sockets()) return fail(5);
     const NativeSocket native = ::socket(family == NET_AF_INET ? AF_INET : AF_INET6, type, protocol);
     if (native == INVALID_NATIVE_SOCKET) return fail(native_error());
+    const int ipv6_only = 1;
+    if (family == NET_AF_INET6 &&
+        ::setsockopt(native, IPPROTO_IPV6, IPV6_V6ONLY, reinterpret_cast<const char*>(&ipv6_only), sizeof(ipv6_only)) != 0) {
+        const int error = native_error();
+        close_socket(native);
+        return fail(error);
+    }
     std::shared_ptr<NativeSocketHandle> handle;
     try {
         handle = std::make_shared<NativeSocketHandle>(native);
@@ -485,8 +628,9 @@ int APS5_VABI sceNetSocket(const char* name, int family, int type, int protocol)
         close_socket(native);
         return fail(12);
     }
+    const int fd = KernelReserveSocketNumber_nid_no_patch(static_cast<std::uintptr_t>(handle->value));
+    if (fd < 0) return fail(-fd);
     std::lock_guard lk(g_mutex);
-    const int fd = g_next_sock++;
     Sock s;
     s.family = family;
     s.type = type;
@@ -504,6 +648,7 @@ int APS5_VABI sceNetSocketClose(int s) {
         native = it->second.native;
         g_socks.erase(it);
     }
+    KernelReleaseSocketNumber_nid_no_patch(s);
     if (native) {
 #ifdef _WIN32
         ::shutdown(native->value, SD_BOTH);
@@ -600,10 +745,10 @@ int APS5_VABI sceNetAccept(int s, void* addr, uint32_t* addrlen) {
     connection.family = listener.family;
     connection.type = NET_SOCK_STREAM;
     connection.native = std::move(handle);
-    int descriptor;
+    const int descriptor = KernelReserveSocketNumber_nid_no_patch(static_cast<std::uintptr_t>(connection.native->value));
+    if (descriptor < 0) return fail(-descriptor);
     {
         std::lock_guard lk(g_mutex);
-        descriptor = g_next_sock++;
         g_socks.emplace(descriptor, connection);
     }
     if (addr && !native_to_guest_address(peer, addr, addrlen)) {
@@ -643,9 +788,14 @@ int64_t APS5_VABI sceNetRecv(int s, void* buf, size_t len, int flags) {
         if (it == g_socks.end()) return fail(NET_EBADF);
         socket = it->second;
     }
+    const GuestArena::HostWrite destination(len == 0 ? nullptr : buf, len);
+    if (!destination.Open()) return fail(NET_EFAULT);
     const int native_flags = flags == 2 ? MSG_PEEK : 0;
     const int result = ::recv(socket.native->value, static_cast<char*>(buf), static_cast<int>(len), native_flags);
-    return result >= 0 ? result : fail(native_error());
+#ifdef _WIN32
+    if (result < 0 && socket.type == NET_SOCK_DGRAM && WSAGetLastError() == WSAEMSGSIZE) return static_cast<int64_t>(len);
+#endif
+    return result >= 0 ? result : fail(receive_error(socket));
 }
 
 int64_t APS5_VABI sceNetRecvfrom(int s, void* buf, size_t len, int flags, void* from, uint32_t* fromlen) {
@@ -660,12 +810,17 @@ int64_t APS5_VABI sceNetRecvfrom(int s, void* buf, size_t len, int flags, void* 
         if (it == g_socks.end()) return fail(NET_EBADF);
         socket = it->second;
     }
+    const GuestArena::HostWrite destination(len == 0 ? nullptr : buf, len);
+    if (!destination.Open()) return fail(NET_EFAULT);
     sockaddr_storage peer{};
     NativeLength peer_length = sizeof(peer);
     const int native_flags = flags == 2 ? MSG_PEEK : 0;
-    const int result = ::recvfrom(socket.native->value, static_cast<char*>(buf), static_cast<int>(len),
+    int result = ::recvfrom(socket.native->value, static_cast<char*>(buf), static_cast<int>(len),
         native_flags, from ? reinterpret_cast<sockaddr*>(&peer) : nullptr, from ? &peer_length : nullptr);
-    if (result < 0) return fail(native_error());
+#ifdef _WIN32
+    if (result < 0 && socket.type == NET_SOCK_DGRAM && WSAGetLastError() == WSAEMSGSIZE) result = static_cast<int>(len);
+#endif
+    if (result < 0) return fail(receive_error(socket));
     if (from && !native_to_guest_address(peer, from, fromlen)) return fail(NET_EAFNOSUPPORT);
     return result;
 }
@@ -753,7 +908,7 @@ int64_t APS5_VABI sceNetRecvmsg(int s, NetMsghdr* msg, int flags) {
         flags == NET_MSG_PEEK ? MSG_PEEK : 0, reinterpret_cast<sockaddr*>(&peer), &peer_length);
     if (received < 0) {
 #ifdef _WIN32
-        if (!datagram || WSAGetLastError() != WSAEMSGSIZE) return fail(native_error());
+        if (!datagram || WSAGetLastError() != WSAEMSGSIZE) return fail(receive_error(socket));
         received = static_cast<std::int64_t>(buffer.size());
 #else
         return fail(native_error());
@@ -796,6 +951,7 @@ int APS5_VABI sceNetSetsockopt(int s, int level, int optname, const void* optval
         socket = it->second;
     }
     if (level != NET_SOL_SOCKET) return fail(NET_EOPNOTSUPP);
+    optname = timeout_option(optname);
     if (!optval || optlen < sizeof(int)) return fail(NET_EINVAL);
     int value = 0;
     std::memcpy(&value, optval, sizeof(value));
@@ -810,20 +966,11 @@ int APS5_VABI sceNetSetsockopt(int s, int level, int optname, const void* optval
 #endif
     } else if (optname == NET_SO_RCVTIMEO || optname == NET_SO_SNDTIMEO) {
         if (value < 0) return fail(NET_EINVAL);
-#ifdef _WIN32
-        const DWORD timeout_ms = value == 0 ? 0 : static_cast<DWORD>((value + 999) / 1000);
-        const int native_option = optname == NET_SO_RCVTIMEO ? SO_RCVTIMEO : SO_SNDTIMEO;
-        if (::setsockopt(socket.native->value, SOL_SOCKET, native_option,
-                         reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms)) != 0)
+        if (set_native_timeout(socket.native->value, optname, value) != 0) return fail(native_error());
+    } else if (optname == NET_SO_REUSEADDR || optname == NET_SO_BROADCAST || optname == NET_SO_SNDBUF || optname == NET_SO_RCVBUF) {
+        const int native_option = optname == NET_SO_REUSEADDR ? SO_REUSEADDR : optname == NET_SO_BROADCAST ? SO_BROADCAST : optname == NET_SO_SNDBUF ? SO_SNDBUF : SO_RCVBUF;
+        if (::setsockopt(socket.native->value, SOL_SOCKET, native_option, reinterpret_cast<const char*>(&value), sizeof(value)) != 0)
             return fail(native_error());
-#else
-        timeval timeout{};
-        timeout.tv_sec = value / 1000000;
-        timeout.tv_usec = value % 1000000;
-        const int native_option = optname == NET_SO_RCVTIMEO ? SO_RCVTIMEO : SO_SNDTIMEO;
-        if (::setsockopt(socket.native->value, SOL_SOCKET, native_option, &timeout, sizeof(timeout)) != 0)
-            return fail(native_error());
-#endif
     } else {
         return fail(NET_EOPNOTSUPP);
     }
@@ -850,7 +997,7 @@ int APS5_VABI sceNetGetsockopt(int s, int level, int optname, void* optval, uint
     }
     if (level != NET_SOL_SOCKET) return fail(NET_EOPNOTSUPP);
     int value = 0;
-    switch (optname) {
+    switch (timeout_option(optname)) {
         case NET_SO_NBIO: value = socket.nonblock ? 1 : 0; break;
         case NET_SO_RCVTIMEO: value = socket.rcv_timeout_us; break;
         case NET_SO_SNDTIMEO: value = socket.snd_timeout_us; break;
@@ -872,8 +1019,15 @@ int APS5_VABI sceNetGetsockname(int s, void* addr, uint32_t* addrlen) {
     if (!addr || !addrlen) return fail(NET_EINVAL);
     sockaddr_storage native{};
     NativeLength native_length = sizeof(native);
-    if (::getsockname(socket.native->value, reinterpret_cast<sockaddr*>(&native), &native_length) != 0)
+    if (::getsockname(socket.native->value, reinterpret_cast<sockaddr*>(&native), &native_length) != 0) {
+#ifdef _WIN32
+        if (WSAGetLastError() != WSAEINVAL) return fail(native_error());
+        native = {};
+        native.ss_family = socket.family == NET_AF_INET ? AF_INET : AF_INET6;
+#else
         return fail(native_error());
+#endif
+    }
     return native_to_guest_address(native, addr, addrlen) ? 0 : fail(NET_EAFNOSUPPORT);
 }
 
@@ -951,13 +1105,13 @@ int APS5_VABI sceNetEpollControl(int eid, int op, int id, const NetEpollEvent* e
     if (g_epolls.count(eid) == 0) {
         return fail(NET_EBADF);
     }
-    if (op < 1 || op > 3) return fail(NET_EINVAL);
-    if (op != 2 && !event) return fail(NET_EINVAL);
-    if (op != 2 && g_socks.count(id) == 0) return fail(NET_EBADF);
+    if (op != NET_EPOLL_CTL_ADD && op != NET_EPOLL_CTL_MOD && op != NET_EPOLL_CTL_DEL) return fail(NET_EINVAL);
+    if (op != NET_EPOLL_CTL_DEL && !event) return fail(NET_EINVAL);
+    if (op != NET_EPOLL_CTL_DEL && g_socks.count(id) == 0) return fail(NET_EBADF);
     auto& registrations = g_epoll_socks[eid];
-    if (op == 1) {
+    if (op == NET_EPOLL_CTL_ADD) {
         if (!registrations.emplace(id, *event).second) return fail(NET_EADDRINUSE);
-    } else if (op == 2) {
+    } else if (op == NET_EPOLL_CTL_DEL) {
         if (registrations.erase(id) == 0) return fail(NET_ENOENT);
     } else {
         auto registration = registrations.find(id);
@@ -985,7 +1139,7 @@ int APS5_VABI sceNetEpollWait(int eid, NetEpollEvent* events, int maxevents, int
                 for (const auto& entry : registration->second) {
                     const auto socket = g_socks.find(entry.first);
                     if (socket == g_socks.end()) continue;
-                    registered_events.push_back(entry.second);
+                    registered_events.push_back({entry.second.events, 0, static_cast<std::uint64_t>(entry.first), entry.second.data});
                     native_sockets.push_back(socket->second.native);
                 }
             }
@@ -1006,14 +1160,14 @@ int APS5_VABI sceNetEpollWait(int eid, NetEpollEvent* events, int maxevents, int
         for (std::size_t index = 0; index < descriptors.size(); ++index) {
             descriptors[index].fd = native_sockets[index]->value;
             if (registered_events[index].events & 1) descriptors[index].events |= POLLRDNORM;
-            if (registered_events[index].events & 4) descriptors[index].events |= POLLWRNORM;
+            if (registered_events[index].events & 2) descriptors[index].events |= POLLWRNORM;
         }
 #else
         std::vector<pollfd> descriptors(registered_events.size());
         for (std::size_t index = 0; index < descriptors.size(); ++index) {
             descriptors[index].fd = native_sockets[index]->value;
             if (registered_events[index].events & 1) descriptors[index].events |= POLLIN;
-            if (registered_events[index].events & 4) descriptors[index].events |= POLLOUT;
+            if (registered_events[index].events & 2) descriptors[index].events |= POLLOUT;
         }
 #endif
         const auto now = std::chrono::steady_clock::now();
@@ -1043,10 +1197,10 @@ int APS5_VABI sceNetEpollWait(int eid, NetEpollEvent* events, int maxevents, int
                 std::uint32_t guest_events = 0;
 #ifdef _WIN32
                 if (native_events & (POLLRDNORM | POLLPRI)) guest_events |= 1;
-                if (native_events & POLLWRNORM) guest_events |= 4;
+                if (native_events & POLLWRNORM) guest_events |= 2;
 #else
                 if (native_events & (POLLIN | POLLPRI)) guest_events |= 1;
-                if (native_events & POLLOUT) guest_events |= 4;
+                if (native_events & POLLOUT) guest_events |= 2;
 #endif
                 if (native_events & POLLERR) guest_events |= 8;
                 if (native_events & POLLHUP) guest_events |= 16;
@@ -1084,11 +1238,11 @@ int APS5_VABI sceNetInetPton(int af, const char* src, void* dst) {
 
 const char* APS5_VABI sceNetInetNtop(int af, const void* src, char* dst, uint32_t size) {
     if (src == nullptr || dst == nullptr) {
-        *errno_slot() = NET_EINVAL;
+        set_errno(NET_EINVAL);
         return nullptr;
     }
     if (af != NET_AF_INET && af != NET_AF_INET6) {
-        *errno_slot() = NET_EAFNOSUPPORT;
+        set_errno(NET_EAFNOSUPPORT);
         return nullptr;
     }
     char text[INET6_ADDRSTRLEN];
@@ -1098,12 +1252,12 @@ const char* APS5_VABI sceNetInetNtop(int af, const void* src, char* dst, uint32_
     const auto* result = ::inet_ntop(af == NET_AF_INET ? AF_INET : AF_INET6, src, text, sizeof(text));
 #endif
     if (!result) {
-        *errno_slot() = native_error();
+        set_errno(native_error());
         return nullptr;
     }
     const auto length = std::strlen(text) + 1;
     if (length > size) {
-        *errno_slot() = NET_ENOSPC;
+        set_errno(NET_ENOSPC);
         return nullptr;
     }
     std::memcpy(dst, text, length);
@@ -1136,7 +1290,7 @@ int APS5_VABI sceNetResolverCreate(const char* name, int memid, int flags) {
     (void)flags;
     std::lock_guard lk(g_mutex);
     const int id = g_next_resolver++;
-    g_resolvers[id] = 0;
+    g_resolvers[id] = {};
     return id;
 }
 
@@ -1146,28 +1300,24 @@ int APS5_VABI sceNetResolverDestroy(int rid) {
 }
 
 int lookup_ipv4(int rid, const char* hostname, const char* func, std::vector<std::uint32_t>& addresses) {
-    {
-        std::lock_guard lk(g_mutex);
-        if (g_resolvers.count(rid) == 0) return fail(NET_EBADF);
-    }
     if (!initialize_sockets()) return fail(5);
+    std::uint64_t generation = 0;
+    if (const int error = begin_lookup(rid, &Resolver::abort_ntoa, generation)) return error;
     addrinfo hints{};
     hints.ai_family = AF_INET;
     addrinfo* results = nullptr;
     const int result = ::getaddrinfo(hostname, nullptr, &hints, &results);
     if (result != 0) {
-        *errno_slot() = result == EAI_AGAIN ? NET_ETIMEDOUT : NET_ENOENT;
+        set_errno(result == EAI_AGAIN ? NET_ETIMEDOUT : NET_ENOENT);
         log_soft(func, "host DNS lookup failed");
-        set_resolver_error(rid, NET_ERROR_RESOLVER_ENODNS);
-        return NET_ERROR_RESOLVER_ENODNS;
+        return end_lookup(rid, generation, NET_ERROR_RESOLVER_ENODNS);
     }
     for (const addrinfo* entry = results; entry != nullptr; entry = entry->ai_next) {
         const auto address = reinterpret_cast<const sockaddr_in*>(entry->ai_addr)->sin_addr.s_addr;
         if (std::find(addresses.begin(), addresses.end(), address) == addresses.end()) addresses.push_back(address);
     }
     ::freeaddrinfo(results);
-    set_resolver_error(rid, 0);
-    return 0;
+    return end_lookup(rid, generation, 0);
 }
 
 int APS5_VABI sceNetResolverStartNtoa(int rid, const char* hostname, void* addr, int timeout, int retry, int flags) {
@@ -1197,14 +1347,11 @@ struct NetResolverInfo {
 static_assert(sizeof(NetResolverRecord) == 32 && offsetof(NetResolverRecord, family) == 16);
 static_assert(sizeof(NetResolverInfo) == 384 && offsetof(NetResolverInfo, count) == 320 && offsetof(NetResolverInfo, count4) == 324);
 
-int APS5_VABI sceNetResolverStartNtoaMultipleRecordsEx(int rid, const char* hostname, NetResolverInfo* info, int timeout,
-    int retry, int flags) {
-    (void)timeout;
-    (void)retry;
-    if (flags != 0) throw std::runtime_error("sceNetResolverStartNtoaMultipleRecordsEx: flags " + std::to_string(flags) + " are not supported");
+int lookup_records(int rid, const char* hostname, NetResolverInfo* info, int flags, const char* func) {
+    if (flags != 0) throw std::runtime_error(std::string(func) + ": flags " + std::to_string(flags) + " are not supported");
     if (!hostname || !info) return fail(NET_EINVAL);
     std::vector<std::uint32_t> addresses;
-    if (const int error = lookup_ipv4(rid, hostname, __func__, addresses)) return error;
+    if (const int error = lookup_ipv4(rid, hostname, func, addresses)) return error;
     *info = {};
     info->count = static_cast<std::int32_t>(std::min<std::size_t>(addresses.size(), std::size(info->records)));
     info->count4 = info->count;
@@ -1215,28 +1362,41 @@ int APS5_VABI sceNetResolverStartNtoaMultipleRecordsEx(int rid, const char* host
     return 0;
 }
 
+int APS5_VABI sceNetResolverStartNtoaMultipleRecords(int rid, const char* hostname, NetResolverInfo* info, int timeout,
+    int retry, int flags) {
+    (void)timeout;
+    (void)retry;
+    return lookup_records(rid, hostname, info, flags, __func__);
+}
+
+int APS5_VABI sceNetResolverStartNtoaMultipleRecordsEx(int rid, const char* hostname, NetResolverInfo* info, int timeout,
+    int retry, int flags) {
+    (void)timeout;
+    (void)retry;
+    return lookup_records(rid, hostname, info, flags, __func__);
+}
+
 int APS5_VABI sceNetResolverStartAton(int rid, const void* addr, char* hostname, int len, int timeout, int retry, int flags) {
     (void)timeout;
     (void)retry;
     (void)flags;
     if (!addr || !hostname || len <= 0) return fail(NET_EINVAL);
-    {
-        std::lock_guard lk(g_mutex);
-        if (g_resolvers.count(rid) == 0) return fail(NET_EBADF);
-    }
     if (!initialize_sockets()) return fail(5);
+    std::uint64_t generation = 0;
+    if (const int error = begin_lookup(rid, &Resolver::abort_aton, generation)) return error;
     sockaddr_in address{};
     address.sin_family = AF_INET;
     std::memcpy(&address.sin_addr, addr, sizeof(address.sin_addr));
-    const int result = ::getnameinfo(reinterpret_cast<const sockaddr*>(&address), sizeof(address), hostname,
+    std::vector<char> name(static_cast<std::size_t>(len));
+    const int result = ::getnameinfo(reinterpret_cast<const sockaddr*>(&address), sizeof(address), name.data(),
         static_cast<NativeLength>(len), nullptr, 0, NI_NAMEREQD);
     if (result != 0) {
-        *errno_slot() = result == EAI_AGAIN ? NET_ETIMEDOUT : NET_ENOENT;
+        set_errno(result == EAI_AGAIN ? NET_ETIMEDOUT : NET_ENOENT);
         log_soft(__func__, "host reverse DNS lookup failed");
-        set_resolver_error(rid, NET_ERROR_RESOLVER_ENODNS);
-        return NET_ERROR_RESOLVER_ENODNS;
+        return end_lookup(rid, generation, NET_ERROR_RESOLVER_ENODNS);
     }
-    set_resolver_error(rid, 0);
+    if (const int error = end_lookup(rid, generation, 0)) return error;
+    std::memcpy(hostname, name.data(), std::strlen(name.data()) + 1);
     return 0;
 }
 
@@ -1245,17 +1405,23 @@ int APS5_VABI sceNetResolverGetError(int rid, int* status) {
     std::lock_guard lk(g_mutex);
     const auto resolver = g_resolvers.find(rid);
     if (resolver == g_resolvers.end()) return fail(NET_EBADF);
-    *status = resolver->second;
+    *status = resolver->second.error;
     return 0;
 }
 
-int APS5_VABI sceNetResolverAbort(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI sceNetResolverStartNtoaMultipleRecords() {
-    NotImplemented_nid_no_patch(__func__);
+int APS5_VABI sceNetResolverAbort(int rid, int flags) {
+    constexpr int preservation = NET_RESOLVER_ABORT_FLAG_NTOA_PRESERVATION | NET_RESOLVER_ABORT_FLAG_ATON_PRESERVATION;
+    std::lock_guard lk(g_mutex);
+    const auto resolver = g_resolvers.find(rid);
+    if (resolver == g_resolvers.end()) return fail(NET_EBADF);
+    if ((flags & ~preservation) != 0) throw std::runtime_error("sceNetResolverAbort: flags " + std::to_string(flags) + " are not supported");
+    if (resolver->second.running != 0) {
+        ++resolver->second.aborts;
+        resolver->second.error = NET_ERROR_BASE | NET_EINTR;
+        return 0;
+    }
+    if ((flags & NET_RESOLVER_ABORT_FLAG_NTOA_PRESERVATION) != 0) resolver->second.abort_ntoa = true;
+    if ((flags & NET_RESOLVER_ABORT_FLAG_ATON_PRESERVATION) != 0) resolver->second.abort_aton = true;
     return 0;
 }
 

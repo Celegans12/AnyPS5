@@ -95,6 +95,27 @@ std::uint32_t parseHex4(const std::string& text, std::size_t& position) {
     return value;
 }
 
+void appendRawUtf8(const std::string& text, std::size_t& position, unsigned char first, std::string& result) {
+    unsigned count;
+    std::uint32_t codepoint;
+    std::uint32_t minimum;
+    if (first >= 0xC2 && first <= 0xDF) { count = 1; codepoint = first & 0x1F; minimum = 0x80; }
+    else if (first >= 0xE0 && first <= 0xEF) { count = 2; codepoint = first & 0x0F; minimum = 0x800; }
+    else if (first >= 0xF0 && first <= 0xF4) { count = 3; codepoint = first & 0x07; minimum = 0x10000; }
+    else throw std::runtime_error("invalid UTF-8 in param.json");
+    if (count > text.size() - position) throw std::runtime_error("truncated UTF-8 in param.json");
+    for (unsigned index = 0; index < count; ++index) {
+        const auto byte = static_cast<unsigned char>(text[position + index]);
+        if ((byte & 0xC0) != 0x80) throw std::runtime_error("invalid UTF-8 continuation in param.json");
+        codepoint = (codepoint << 6) | (byte & 0x3F);
+    }
+    if (codepoint < minimum || codepoint > 0x10FFFF || (codepoint >= 0xD800 && codepoint <= 0xDFFF))
+        throw std::runtime_error("invalid UTF-8 codepoint in param.json");
+    result.push_back(static_cast<char>(first));
+    result.append(text, position, count);
+    position += count;
+}
+
 std::string parseJsonString(const std::string& text, std::size_t& position) {
     expectChar(text, position, '"');
     std::string result;
@@ -103,7 +124,11 @@ std::string parseJsonString(const std::string& text, std::size_t& position) {
         const char c = text[position++];
         if (c == '"') break;
         if (static_cast<unsigned char>(c) < 0x20) throw std::runtime_error("control character in param.json string");
-        if (c != '\\') { result.push_back(c); continue; }
+        if (c != '\\') {
+            if (static_cast<unsigned char>(c) < 0x80) result.push_back(c);
+            else appendRawUtf8(text, position, static_cast<unsigned char>(c), result);
+            continue;
+        }
         if (position >= text.size()) throw std::runtime_error("unterminated escape in param.json");
         const char escape = text[position++];
         switch (escape) {
@@ -135,9 +160,12 @@ std::string parseJsonString(const std::string& text, std::size_t& position) {
     return result;
 }
 
-JsonValue parseJsonValue(const std::string& text, std::size_t& position);
+constexpr std::size_t MaxNestingDepth = 512;
 
-JsonValue parseJsonObject(const std::string& text, std::size_t& position) {
+JsonValue parseJsonValue(const std::string& text, std::size_t& position, std::size_t depth);
+
+JsonValue parseJsonObject(const std::string& text, std::size_t& position, std::size_t depth) {
+    if (depth >= MaxNestingDepth) throw std::runtime_error("param.json is nested too deeply");
     expectChar(text, position, '{');
     JsonValue value;
     value.type = JsonType::Object;
@@ -148,7 +176,7 @@ JsonValue parseJsonObject(const std::string& text, std::size_t& position) {
         std::string key = parseJsonString(text, position);
         skipWhitespace(text, position);
         expectChar(text, position, ':');
-        JsonValue member = parseJsonValue(text, position);
+        JsonValue member = parseJsonValue(text, position, depth + 1);
         value.objectValue.emplace_back(std::move(key), std::move(member));
         skipWhitespace(text, position);
         const char next = peekChar(text, position);
@@ -159,14 +187,15 @@ JsonValue parseJsonObject(const std::string& text, std::size_t& position) {
     return value;
 }
 
-JsonValue parseJsonArray(const std::string& text, std::size_t& position) {
+JsonValue parseJsonArray(const std::string& text, std::size_t& position, std::size_t depth) {
+    if (depth >= MaxNestingDepth) throw std::runtime_error("param.json is nested too deeply");
     expectChar(text, position, '[');
     JsonValue value;
     value.type = JsonType::Array;
     skipWhitespace(text, position);
     if (peekChar(text, position) == ']') { ++position; return value; }
     while (true) {
-        JsonValue element = parseJsonValue(text, position);
+        JsonValue element = parseJsonValue(text, position, depth + 1);
         value.arrayValue.push_back(std::move(element));
         skipWhitespace(text, position);
         const char next = peekChar(text, position);
@@ -201,15 +230,18 @@ JsonValue parseJsonNumber(const std::string& text, std::size_t& position) {
     JsonValue value;
     value.type = JsonType::Number;
     value.numberText = text.substr(start, position - start);
-    value.numberValue = std::stod(value.numberText);
+    const auto& number = value.numberText;
+    const auto converted = std::from_chars(number.data(), number.data() + number.size(), value.numberValue);
+    if (converted.ec != std::errc{} || converted.ptr != number.data() + number.size())
+        throw std::runtime_error("number outside supported range in param.json");
     return value;
 }
 
-JsonValue parseJsonValue(const std::string& text, std::size_t& position) {
+JsonValue parseJsonValue(const std::string& text, std::size_t& position, std::size_t depth) {
     skipWhitespace(text, position);
     const char c = peekChar(text, position);
-    if (c == '{') return parseJsonObject(text, position);
-    if (c == '[') return parseJsonArray(text, position);
+    if (c == '{') return parseJsonObject(text, position, depth);
+    if (c == '[') return parseJsonArray(text, position, depth);
     if (c == '"') { JsonValue value; value.type = JsonType::String; value.stringValue = parseJsonString(text, position); return value; }
     if (c == 't') { expectLiteral(text, position, "true"); JsonValue value; value.type = JsonType::Boolean; value.boolValue = true; return value; }
     if (c == 'f') { expectLiteral(text, position, "false"); JsonValue value; value.type = JsonType::Boolean; value.boolValue = false; return value; }
@@ -220,7 +252,7 @@ JsonValue parseJsonValue(const std::string& text, std::size_t& position) {
 
 JsonValue parseJsonDocument(const std::string& text) {
     std::size_t position = 0;
-    JsonValue root = parseJsonValue(text, position);
+    JsonValue root = parseJsonValue(text, position, 0);
     skipWhitespace(text, position);
     if (position != text.size()) throw std::runtime_error("unexpected trailing data in param.json");
     return root;
@@ -276,6 +308,12 @@ ParsedParamJson parseParamJson(const std::filesystem::path& paramJsonPath) {
     ParsedParamJson result;
     result.title = title;
     result.titleId = titleId;
+    if (const JsonValue* attribute = findObjectMember(root, "attribute3")) {
+        const auto& number = attribute->numberText;
+        if (attribute->type != JsonType::Number || number.find_first_of("-.eE") != std::string::npos) throw std::runtime_error("param.json attribute3 is not an unsigned integer");
+        const auto parsed = std::from_chars(number.data(), number.data() + number.size(), result.attribute3);
+        if (parsed.ec != std::errc{} || parsed.ptr != number.data() + number.size()) throw std::runtime_error("param.json attribute3 exceeds uint32 range");
+    }
     if (const JsonValue* downloadData = findObjectMember(root, "downloadDataSize")) {
         if (downloadData->type != JsonType::Number || downloadData->numberValue < 0) throw std::runtime_error("param.json downloadDataSize is not a size");
         if (downloadData->numberText.find_first_of("-.eE") == std::string::npos) {

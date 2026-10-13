@@ -1,18 +1,24 @@
 #include "SceTypes.hpp"
 #include <array>
+#include <climits>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <stdexcept>
 
 extern "C" {
 int APS5_VABI clock_gettime_nid_postfix(int clockId, KernelTimespec* tp);
 int APS5_VABI clock_getres_nid_postfix(int clockId, KernelTimespec* res);
+int APS5_VABI clock_settime_nid_postfix(int clockId, const KernelTimespec* tp);
 int APS5_VABI sceKernelClockGettime(KernelClockid clockId, KernelTimespec* tp);
 int APS5_VABI sceKernelClockGetres(KernelClockid clockId, KernelTimespec* tp);
+int* APS5_VABI __error_nid_postfix();
 int APS5_VABI sceKernelUsleep_nid_postfix(KernelUseconds microseconds);
 int APS5_VABI gettimeofday_nid_postfix(KernelTimeval* tv, KernelTimezone* tz);
 std::int64_t APS5_VABI _Xtime_get_ticks_nid_postfix();
 int APS5_VABI sceKernelConvertLocaltimeToUtc(std::int64_t, std::int64_t, std::int64_t*, KernelTimesec*, std::int32_t*);
-int APS5_VABI sceKernelConvertUtcToLocaltime(std::int64_t, std::int64_t*, KernelTimesec*, std::uint64_t*);
+int APS5_VABI sceKernelConvertUtcToLocaltime(std::int64_t, std::int64_t*, KernelTimesec*, std::int32_t*);
 }
 
 static constexpr int SCE_OK = 0;
@@ -21,7 +27,9 @@ static constexpr int GUEST_CLOCK_REALTIME = 0;
 static constexpr int GUEST_CLOCK_VIRTUAL = 1;
 static constexpr int GUEST_CLOCK_PROF = 2;
 static constexpr int GUEST_CLOCK_MONOTONIC = 4;
+static constexpr int GUEST_CLOCK_REALTIME_PRECISE = 9;
 static constexpr int GUEST_CLOCK_SECOND = 13;
+static constexpr int GUEST_CLOCK_THREAD_CPUTIME_ID = 14;
 static constexpr int GUEST_CLOCK_PROCESS_CPUTIME_ID = 15;
 
 static constexpr std::int64_t NANOS_PER_SECOND = 1000000000LL;
@@ -31,6 +39,34 @@ static constexpr std::int64_t IDLE_LIMIT_NANOS = 100 * NANOS_PER_MILLISECOND;
 static constexpr std::int64_t GIVE_UP_NANOS = 10 * NANOS_PER_SECOND;
 
 static void Require(bool value) { if (!value) std::abort(); }
+
+static bool OmittedResolutionSucceeds() {
+    constexpr int clocks[] = {0, 1, 2, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 3, 6, 9999, -1, INT_MIN, INT_MAX};
+    for (const int clock : clocks) {
+        *__error_nid_postfix() = 77;
+        try {
+            if (clock_getres_nid_postfix(clock, nullptr) == SCE_OK && *__error_nid_postfix() == 77) continue;
+        } catch (const std::runtime_error&) {
+        }
+        std::fprintf(stderr, "clock_getres(%d, nullptr) must succeed without changing errno\n", clock);
+        return false;
+    }
+    return true;
+}
+
+static void UnsupportedResolutionStillThrows() {
+    KernelTimespec resolution{-1, -1};
+    bool rejected = false;
+    try {
+        clock_getres_nid_postfix(3, &resolution);
+    } catch (const std::runtime_error&) {
+        rejected = true;
+    }
+    Require(rejected && resolution.tv_sec == -1 && resolution.tv_nsec == -1);
+    constexpr int fault = static_cast<int>(0x8002000eu);
+    Require(sceKernelClockGetres(GUEST_CLOCK_REALTIME, nullptr) == fault);
+    Require(sceKernelClockGetres(3, nullptr) == fault);
+}
 
 static KernelTimespec Read(int clockId) {
     KernelTimespec time{-1, -1};
@@ -147,6 +183,11 @@ static void CalendarConversionsInitializeTheirState() {
         KernelTimesec state;
         std::uint64_t after;
     };
+    struct GuardedDst {
+        std::int32_t seconds;
+        std::uint32_t after;
+    };
+    static_assert(sizeof(GuardedDst) == 8);
     for (const auto seconds : std::array<std::int64_t, 4>{-86400, 0, 1767225600, 2147483648}) {
         GuardedState local{sentinel, {-1, 0xa5a5a5a5u, 0xa5a5a5a5u}, sentinel};
         std::int64_t utc = -1;
@@ -157,9 +198,10 @@ static void CalendarConversionsInitializeTheirState() {
         Require(local.before == sentinel && local.after == sentinel);
         GuardedState universal{sentinel, {-1, 0xa5a5a5a5u, 0xa5a5a5a5u}, sentinel};
         std::int64_t converted = -1;
-        std::uint64_t universalDst = sentinel;
-        Require(sceKernelConvertUtcToLocaltime(utc, &converted, &universal.state, &universalDst) == SCE_OK);
-        Require(converted == seconds && universalDst == 0);
+        GuardedDst universalDst{-1, 0xa5a5a5a5u};
+        Require(sceKernelConvertUtcToLocaltime(utc, &converted, &universal.state, &universalDst.seconds) == SCE_OK);
+        Require(converted == seconds && universalDst.seconds == 0);
+        Require(universalDst.after == 0xa5a5a5a5u);
         Require(universal.state.t == seconds && universal.state.west_sec == 0 && universal.state.dst_sec == 0);
         Require(universal.before == sentinel && universal.after == sentinel);
     }
@@ -167,7 +209,43 @@ static void CalendarConversionsInitializeTheirState() {
     Require(sceKernelConvertUtcToLocaltime(0, nullptr, nullptr, nullptr) == SCE_OK);
 }
 
+static void RequireSettimeError(int clockId, const KernelTimespec* time, int error) {
+    *__error_nid_postfix() = 0;
+    Require(clock_settime_nid_postfix(clockId, time) == -1 && *__error_nid_postfix() == error);
+}
+
+static bool SettimeThrows(const KernelTimespec& time, const char* requested) {
+    try {
+        clock_settime_nid_postfix(GUEST_CLOCK_REALTIME, &time);
+    } catch (const std::runtime_error& error) {
+        return std::strstr(error.what(), requested) != nullptr;
+    }
+    return false;
+}
+
+static void SettimeValidatesLikeFreebsd() {
+    const KernelTimespec valid{1767225600, 5};
+    RequireSettimeError(GUEST_CLOCK_REALTIME, nullptr, 14);
+    RequireSettimeError(GUEST_CLOCK_MONOTONIC, nullptr, 14);
+    for (const int clockId : {GUEST_CLOCK_VIRTUAL, GUEST_CLOCK_PROF, GUEST_CLOCK_MONOTONIC, GUEST_CLOCK_REALTIME_PRECISE,
+             GUEST_CLOCK_SECOND, GUEST_CLOCK_THREAD_CPUTIME_ID, GUEST_CLOCK_PROCESS_CPUTIME_ID, -1, 16})
+        RequireSettimeError(clockId, &valid, 22);
+    const KernelTimespec negativeNanoseconds{0, -1};
+    const KernelTimespec wholeSecondOfNanoseconds{0, NANOS_PER_SECOND};
+    const KernelTimespec negativeSeconds{-1, 0};
+    RequireSettimeError(GUEST_CLOCK_REALTIME, &negativeNanoseconds, 22);
+    RequireSettimeError(GUEST_CLOCK_REALTIME, &wholeSecondOfNanoseconds, 22);
+    RequireSettimeError(GUEST_CLOCK_REALTIME, &negativeSeconds, 22);
+    RequireSettimeError(GUEST_CLOCK_MONOTONIC, &negativeSeconds, 22);
+    Require(SettimeThrows(valid, "1767225600.000000005"));
+    Require(SettimeThrows(KernelTimespec{0, 0}, "0.000000000"));
+    Require(SettimeThrows(KernelTimespec{1, NANOS_PER_SECOND - 1}, "1.999999999"));
+}
+
 int main() {
+    if (!OmittedResolutionSucceeds()) return 1;
+    UnsupportedResolutionStillThrows();
+    SettimeValidatesLikeFreebsd();
     CalendarConversionsInitializeTheirState();
     SecondClockReportsWholeSeconds();
     KernelTimezone zone{-1, -1};

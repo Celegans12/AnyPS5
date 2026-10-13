@@ -12,6 +12,8 @@ Supported input sources are:
 - `MOUSE:Left`, `MOUSE:Middle`, `MOUSE:Right`, `MOUSE:X1`, or `MOUSE:X2`.
 - `WHEEL:Up` or `WHEEL:Down` for pad buttons.
 
+While a title has a mouse open (`sceMouseOpen`) and the window is focused, AnyPS5 hides and captures the host cursor, so the title's own cursor is the only one; the capture ends when the window loses focus or when the mouse-to-stick toggle (`ToggleMouse`) is on. Mouse movement reaches the title scaled from the window's presented image to the title's display resolution, so the title's cursor moves as far as the host cursor would.
+
 Game-controller bindings are enabled automatically and are not affected by keyboard or mouse overrides in this file.
 
 Supported actions are `Cross`, `Circle`, `Triangle`, `Square`, `L1`, `R1`, `L2`, `R2`, `L3`, `R3`, `Options`, `Up`, `Right`, `Down`, `Left`, `LeftStickLeft`, `LeftStickRight`, `LeftStickUp`, `LeftStickDown`, `RightStickLeft`, `RightStickRight`, `RightStickUp`, `RightStickDown`, `TouchLeft`, `TouchRight`, `ToggleMouse`, and `ToggleFullscreen`.
@@ -28,6 +30,19 @@ LeftStickDown = KEY:K
 Square = MOUSE:Left
 R2 = MOUSE:Right
 ToggleMouse = MOUSE:Middle
+```
+
+The same file also accepts these settings, each at most once, in the form `Setting = Value`:
+
+| Setting | Value | Default |
+|---------|-------|---------|
+| `LeftStickDeadzone`, `RightStickDeadzone` | Whole percentage from 0 to 90 of the controller stick's travel that reads as centered. Outside it the travel is rescaled, so the stick still reaches its full range. Keyboard and mouse stick bindings are not affected. | `0` |
+| `MouseSensitivity` | Number greater than 0 and at most 10 that scales mouse movement on the right stick while the mouse is captured (`ToggleMouse`). | `1` |
+
+```ini
+LeftStickDeadzone = 12
+RightStickDeadzone = 8
+MouseSensitivity = 2.5
 ```
 
 An invalid line reports the file and line number and stops input initialization. If the configured file does not exist or cannot be read, AnyPS5 reports an error. With no `anyps5-input.ini` and no `ANYPS5_INPUT_CONFIG`, the built-in mapping is used.

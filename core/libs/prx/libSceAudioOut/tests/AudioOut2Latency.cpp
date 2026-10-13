@@ -11,6 +11,7 @@ int APS5_VABI sceAudioOut2Set3DLatency(int, std::uint32_t);
 int APS5_VABI sceAudioOut2MasteringInit(std::uint32_t);
 int APS5_VABI sceAudioOut2MasteringTerm();
 int APS5_VABI sceAudioOut2MasteringSetParam(const void*, std::uint32_t, std::uint32_t);
+int APS5_VABI sceAudioOut2EnableChat();
 }
 
 static void Require(bool value, const char* message) {
@@ -60,6 +61,11 @@ void TestMasteringSetParam() {
     Require(ThrowsRuntimeError([] { sceAudioOut2MasteringSetParam(nullptr, 0, 0); }), "null mastering parameters must throw");
 }
 
+void TestEnableChat() {
+    Require(sceAudioOut2EnableChat() == 0, "enabling chat must be accepted");
+    Require(sceAudioOut2EnableChat() == 0, "enabling chat again must be accepted");
+}
+
 }
 
 int main() {
@@ -68,5 +74,6 @@ int main() {
     TestMasteringInit();
     TestMasteringTerm();
     TestMasteringSetParam();
+    TestEnableChat();
     return 0;
 }

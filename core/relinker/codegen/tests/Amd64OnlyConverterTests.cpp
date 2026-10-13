@@ -8,6 +8,7 @@
 #include <codegen/x86/ClzeroOperands.hpp>
 #include <codegen/x86/ClzeroLowering.hpp>
 #include <codegen/x86/ReciprocalOperands.hpp>
+#include <codegen/x86/WideStoreOperands.hpp>
 #include <codegen/x86/StubBodyBuilder.hpp>
 #include <codegen/x86/DecodedInstruction.hpp>
 #include <codegen/x86/X64InstructionDecoder.hpp>
@@ -670,6 +671,258 @@ void rosettaSubstitutions() {
     require(rdpid->ReturnBranchOffset == 6 && Bytes(rdpid->StubBody.begin(), rdpid->StubBody.begin() + 7) == Bytes{0x41, 0xBB, 0, 0, 0, 0, 0xE9}, "RDPID r11 stub does not load 0 before returning");
 }
 
+void wideStoreSplit() {
+    struct Case {
+        Bytes Original;
+        Bytes Low;
+        Bytes High;
+        const char* Name;
+    };
+    const std::vector<Case> cases = {
+        {{0xC5, 0xFC, 0x11, 0x07}, {0xC5, 0xF8, 0x11, 0x07}, {0xC4, 0xE3, 0x7D, 0x19, 0x47, 0x10, 0x01}, "vmovups (%rdi)"},
+        {{0xC4, 0x41, 0x7E, 0x7F, 0x4C, 0x87, 0x70}, {0xC4, 0x41, 0x7A, 0x7F, 0x4C, 0x87, 0x70}, {0xC4, 0x43, 0x7D, 0x19, 0x8C, 0x87, 0x80, 0x00, 0x00, 0x00, 0x01}, "vmovdqu 0x70(%r15,%rax,4)"},
+        {{0xC5, 0xFC, 0x11, 0x4C, 0x24, 0xF8}, {0xC5, 0xF8, 0x11, 0x4C, 0x24, 0xF8}, {0xC4, 0xE3, 0x7D, 0x19, 0x4C, 0x24, 0x08, 0x01}, "vmovups -8(%rsp)"},
+        {{0xC5, 0xFE, 0x7F, 0x93, 0x78, 0x56, 0x34, 0x12}, {0xC5, 0xFA, 0x7F, 0x93, 0x78, 0x56, 0x34, 0x12}, {0xC4, 0xE3, 0x7D, 0x19, 0x93, 0x88, 0x56, 0x34, 0x12, 0x01}, "vmovdqu 0x12345678(%rbx)"},
+        {{0x64, 0xC5, 0xFC, 0x11, 0x04, 0x25, 0x40, 0x00, 0x00, 0x00}, {0x64, 0xC5, 0xF8, 0x11, 0x04, 0x25, 0x40, 0x00, 0x00, 0x00}, {0x64, 0xC4, 0xE3, 0x7D, 0x19, 0x04, 0x25, 0x50, 0x00, 0x00, 0x00, 0x01}, "vmovups %fs:0x40"},
+        {{0xC4, 0x41, 0x7C, 0x11, 0x65, 0x00}, {0xC4, 0x41, 0x78, 0x11, 0x65, 0x00}, {0xC4, 0x43, 0x7D, 0x19, 0x65, 0x10, 0x01}, "vmovups (%r13)"},
+        {{0xC4, 0xC1, 0x7C, 0x11, 0x47, 0x68}, {0xC4, 0xC1, 0x78, 0x11, 0x47, 0x68}, {0xC4, 0xC3, 0x7D, 0x19, 0x47, 0x78, 0x01}, "vmovups 0x68(%r15)"}};
+    for (const auto& item : cases) {
+        const auto split = Codegen::DecodeVexWideStore(item.Original.data(), item.Original.size());
+        require(split && split->Low.Bytes == item.Low && split->High.Bytes == item.High && !split->Low.RipDisplacementOffset && !split->High.RipDisplacementOffset, (std::string("256-bit store was not split into its 128-bit halves: ") + item.Name).c_str());
+    }
+    const Bytes rip = {0xC5, 0xFD, 0x11, 0x1D, 0x00, 0x01, 0x00, 0x00};
+    const auto ripSplit = Codegen::DecodeVexWideStore(rip.data(), rip.size());
+    require(ripSplit && ripSplit->Low.Bytes == Bytes{0xC5, 0xF9, 0x11, 0x1D, 0x00, 0x01, 0x00, 0x00} && ripSplit->High.Bytes == Bytes{0xC4, 0xE3, 0x7D, 0x19, 0x1D, 0x00, 0x00, 0x00, 0x00, 0x01}, "RIP-relative 256-bit store was not split");
+    require(ripSplit->Low.RipDisplacementOffset == 4 && ripSplit->Low.RipTarget == 8 + 0x100 && ripSplit->High.RipDisplacementOffset == 5 && ripSplit->High.RipTarget == 8 + 0x110, "RIP-relative halves do not address the original operand and the one 16 bytes above it");
+    for (const auto& other : {Bytes{0xC5, 0xF8, 0x11, 0x07}, Bytes{0xC5, 0xFC, 0x11, 0xC1}, Bytes{0xC5, 0xFC, 0x10, 0x07}, Bytes{0xC4, 0xE2, 0x75, 0x2E, 0x07}, Bytes{0xC5, 0xF4, 0x11, 0x07}, Bytes{0xC4, 0xE3, 0x7D, 0x19, 0x07, 0x01}, Bytes{0xC5, 0xFC, 0x11, 0x04}, Bytes{0xC5, 0xFC, 0x11, 0x47}})
+        require(!Codegen::DecodeVexWideStore(other.data(), other.size()).has_value(), "An instruction other than a plain 256-bit store was split");
+    for (const auto& aligned : {Bytes{0xC5, 0xFC, 0x29, 0x4C, 0x24, 0xF8}, Bytes{0xC5, 0xFD, 0xE7, 0x93, 0x78, 0x56, 0x34, 0x12}, Bytes{0xC5, 0xFD, 0x7F, 0x1F}, Bytes{0xC5, 0xFC, 0x2B, 0x27}})
+        require(!Codegen::DecodeVexWideStore(aligned.data(), aligned.size()).has_value(), "An aligned 256-bit store, which cannot cross a page, was split");
+    const Bytes farRip = {0xC5, 0xFC, 0x11, 0x05, 0xF8, 0xFF, 0xFF, 0x7F};
+    const auto farRipSplit = Codegen::DecodeVexWideStore(farRip.data(), farRip.size());
+    require(farRipSplit && farRipSplit->High.RipTarget == std::int64_t{8} + 0x7FFFFFF8 + 0x10, "A RIP-relative 256-bit store near the end of its displacement range was not split");
+    const Bytes farBase = {0xC5, 0xFC, 0x11, 0x80, 0xF8, 0xFF, 0xFF, 0x7F};
+    requireFailure([&] { (void)Codegen::DecodeVexWideStore(farBase.data(), farBase.size()); }, "A 256-bit store whose upper half has no 32-bit displacement was kept");
+    requireFailure([] { Codegen::StubBodyBuilder body; body.RipRelative(Bytes{0x90}, 0, 0); }, "A RIP-relative displacement outside its instruction was relocated");
+    const auto rosetta = Codegen::MakeAmd64OnlyInstructionMatcher(Codegen::Amd64OnlyTarget::Rosetta);
+    const Bytes store = {0xC4, 0xC1, 0x7C, 0x11, 0x47, 0x68};
+    const auto lowered = rosetta->Match(store.data(), store.size());
+    require(lowered && lowered->Lowering == Codegen::Amd64OnlyLowering::Trampoline && !lowered->Optional && lowered->RelocatableWindow && lowered->InstructionName == "256-bit store", "A 256-bit store was not lowered through a required stub that may move its neighbours for Rosetta");
+    Bytes expectedBody = cases.back().Low;
+    expectedBody.insert(expectedBody.end(), cases.back().High.begin(), cases.back().High.end());
+    require(Bytes(lowered->StubBody.begin(), lowered->StubBody.begin() + static_cast<std::ptrdiff_t>(lowered->ReturnBranchOffset)) == expectedBody, "The 256-bit store stub is not the two halves");
+    const std::vector<std::span<const std::uint8_t>> pair = {std::span<const std::uint8_t>(cases[0].Original), std::span<const std::uint8_t>(rip)};
+    const auto sequence = rosetta->MatchSequence(pair, {});
+    require(sequence && sequence->Relocations.size() == 2 && sequence->Relocations[0].SiteTarget == 4 + 8 + 0x100 && sequence->Relocations[1].SiteTarget == 4 + 8 + 0x110, "A RIP-relative 256-bit store after another is not relocated from its place in the site");
+    require(!Codegen::MakeAmd64OnlyInstructionMatcher()->Match(store.data(), store.size()).has_value(), "A 256-bit store was split for an Intel host");
+    const std::vector<std::span<const std::uint8_t>> single = {std::span<const std::uint8_t>(store)};
+    require(!Codegen::MakeAmd64OnlyInstructionMatcher()->MatchSequence(single, {}).has_value(), "A 256-bit store was split in a sequence for an Intel host");
+}
+
+void converterWideStoreWindows() {
+    const auto converter = Codegen::MakeAmd64OnlyConverter(Codegen::Amd64OnlyTarget::Rosetta);
+    const Bytes store = {0xC5, 0xFC, 0x11, 0x07};
+    Bytes halves = {0xC5, 0xF8, 0x11, 0x07, 0xC4, 0xE3, 0x7D, 0x19, 0x47, 0x10, 0x01};
+    const auto convert = [&](const Bytes& text) {
+        Bytes file(0x300 + text.size(), 0xCC);
+        std::copy(text.begin(), text.end(), file.begin() + 0x200);
+        return converter->Convert(file, {segmentHeader(text.size())});
+    };
+    const auto body = [](const Codegen::TrampolineSite& site) {
+        return Bytes(site.Body.begin(), site.Body.begin() + static_cast<std::ptrdiff_t>(site.ReturnBranchOffset));
+    };
+    const auto withStore = [&](Bytes before, const Bytes& after) {
+        before.insert(before.end(), store.begin(), store.end());
+        before.insert(before.end(), after.begin(), after.end());
+        return before;
+    };
+
+    const auto returned = convert(withStore({}, {0xC3}));
+    Bytes expected = halves;
+    expected.push_back(0xC3);
+    require(returned.Trampolines.size() == 1 && returned.KeptCount == 0 && returned.Reports.size() == 1 && returned.Reports[0].InstructionName == "256-bit store", "A 256-bit store followed by a return was not moved");
+    require(returned.Trampolines[0].Offset == 0x200 && returned.Trampolines[0].Length == 5 && body(returned.Trampolines[0]) == expected, "A 256-bit store followed by a return did not end its stub with the return");
+
+    const auto called = convert(withStore({}, {0xE8, 0x10, 0x00, 0x00, 0x00}));
+    require(called.Trampolines.size() == 1 && called.Trampolines[0].Offset == 0x200 && called.Trampolines[0].Length == 9, "A 256-bit store followed by a call did not take the call");
+    const auto& call = called.Trampolines[0];
+    expected = halves;
+    expected.insert(expected.end(), {0x48, 0x8D, 0x64, 0x24, 0xF8, 0x50, 0x48, 0x8D, 0x05, 0, 0, 0, 0, 0x48, 0x89, 0x44, 0x24, 0x08, 0x58, 0xE9, 0, 0, 0, 0});
+    require(body(call) == expected, "A moved call does not push its original return address and jump");
+    require(call.Relocations.size() == 2 && call.Relocations[0].DisplacementOffset == halves.size() + 9 && call.Relocations[0].SiteTarget == 9 && call.Relocations[1].DisplacementOffset == halves.size() + 20 && call.Relocations[1].SiteTarget == 9 + 0x10, "A moved call returns to or calls the wrong address");
+
+    const auto branched = convert(withStore({}, {0x75, 0x10, 0x90}));
+    require(branched.Trampolines.size() == 1 && branched.Trampolines[0].Length == 6, "A 256-bit store followed by a short conditional branch did not take the branch");
+    const auto& jcc = branched.Trampolines[0];
+    expected = halves;
+    expected.insert(expected.end(), {0x0F, 0x85, 0, 0, 0, 0});
+    require(body(jcc) == expected && jcc.Relocations.size() == 1 && jcc.Relocations[0].SiteTarget == 6 + 0x10, "A moved short conditional branch was not re-encoded with a 32-bit displacement to its target");
+
+    const auto jumped = convert(withStore({}, {0xEB, 0x10, 0x90}));
+    expected = halves;
+    expected.insert(expected.end(), {0xE9, 0, 0, 0, 0});
+    require(jumped.Trampolines.size() == 1 && body(jumped.Trampolines[0]) == expected && jumped.Trampolines[0].Relocations.size() == 1 && jumped.Trampolines[0].Relocations[0].SiteTarget == 6 + 0x10, "A moved short jump was not re-encoded with a 32-bit displacement to its target");
+
+    const auto longBranched = convert(withStore({}, {0x0F, 0x85, 0x10, 0x00, 0x00, 0x00}));
+    expected = halves;
+    expected.insert(expected.end(), {0x0F, 0x85, 0, 0, 0, 0});
+    require(longBranched.Trampolines.size() == 1 && longBranched.Trampolines[0].Length == 10 && body(longBranched.Trampolines[0]) == expected && longBranched.Trampolines[0].Relocations.size() == 1 && longBranched.Trampolines[0].Relocations[0].SiteTarget == 10 + 0x10, "A moved conditional branch with a 32-bit displacement does not reach its target");
+
+    const auto entered = convert(withStore({0x48, 0x83, 0xC1, 0x01}, {0xC3, 0xEB, 0xFD}));
+    expected = {0x48, 0x83, 0xC1, 0x01};
+    expected.insert(expected.end(), halves.begin(), halves.end());
+    require(entered.Trampolines.size() == 1 && entered.Trampolines[0].Offset == 0x200 && entered.Trampolines[0].Length == 8 && body(entered.Trampolines[0]) == expected, "A 256-bit store before a branch target did not take room from the instruction before it");
+
+    Bytes adds;
+    for (int index = 0; index < 4; ++index)
+        adds.insert(adds.end(), {0x48, 0x83, 0xC1, 0x01});
+    Bytes after = {0xC3, 0xEB, 0xFD};
+    after.insert(after.end(), adds.begin(), adds.end());
+    const auto island = convert(withStore({0xE8, 0x00, 0x00, 0x00, 0x00}, after));
+    require(island.Trampolines.size() == 2 && island.KeptCount == 0, "A 256-bit store with no movable neighbours was not lowered through an island");
+    const auto& moved = island.Trampolines[0];
+    const auto& lowered = island.Trampolines[1];
+    expected = adds;
+    expected.insert(expected.end(), {0xE9, 0, 0, 0, 0});
+    require(moved.Offset == 0x20C && moved.Length == 8 && body(moved) == expected && moved.Relocations.size() == 1 && moved.Relocations[0].SiteTarget == 16, "The instructions under the island were not moved and continued after it");
+    expected = halves;
+    expected.insert(expected.end(), {0xE9, 0, 0, 0, 0});
+    require(lowered.Offset == 0x214 && lowered.Length == 5 && body(lowered) == expected && lowered.Relocations.size() == 1 && lowered.Relocations[0].SiteTarget == -11, "The island does not store both halves and return after the original store");
+    require(Bytes(island.Bytes.begin() + 0x205, island.Bytes.begin() + 0x209) == Bytes{0xEB, 0x0D, 0xCC, 0xCC}, "The 256-bit store was not replaced by a short jump to its island");
+
+    requireFailure([&] { (void)convert(withStore({0xE8, 0x00, 0x00, 0x00, 0x00}, {0xC3, 0xEB, 0xFD})); }, "A 256-bit store with no room for a stub jump was kept");
+
+    const auto paired = convert(withStore({}, {0xC5, 0xFC, 0x11, 0x0E, 0xC3}));
+    expected = halves;
+    expected.insert(expected.end(), {0xC5, 0xF8, 0x11, 0x0E, 0xC4, 0xE3, 0x7D, 0x19, 0x4E, 0x10, 0x01});
+    require(paired.Trampolines.size() == 1 && paired.Trampolines[0].Length == 8 && body(paired.Trampolines[0]) == expected && paired.Reports.size() == 1, "A 256-bit store followed by another was not lowered with it in one stub");
+
+    const Bytes push = {0x48, 0x8D, 0x64, 0x24, 0xF8, 0x50, 0x48, 0x8D, 0x05, 0, 0, 0, 0, 0x48, 0x89, 0x44, 0x24, 0x08, 0x58};
+    const auto ripCalled = convert(withStore({}, {0xFF, 0x15, 0x10, 0x00, 0x00, 0x00}));
+    expected = halves;
+    expected.insert(expected.end(), push.begin(), push.end());
+    expected.insert(expected.end(), {0xFF, 0x25, 0, 0, 0, 0});
+    const auto& ripCall = ripCalled.Trampolines[0];
+    require(ripCalled.Trampolines.size() == 1 && ripCall.Length == 10 && body(ripCall) == expected, "A moved call through a RIP-relative pointer does not push its original return address and jump through the pointer");
+    require(ripCall.Relocations.size() == 2 && ripCall.Relocations[0].SiteTarget == 10 && ripCall.Relocations[1].DisplacementOffset == halves.size() + 21 && ripCall.Relocations[1].SiteTarget == 10 + 0x10, "A moved call through a RIP-relative pointer returns to or reads the wrong address");
+
+    const auto ripJumped = convert(withStore({}, {0xFF, 0x25, 0x10, 0x00, 0x00, 0x00}));
+    expected = halves;
+    expected.insert(expected.end(), {0xFF, 0x25, 0, 0, 0, 0});
+    require(ripJumped.Trampolines.size() == 1 && body(ripJumped.Trampolines[0]) == expected && ripJumped.Trampolines[0].Relocations.size() == 1 && ripJumped.Trampolines[0].Relocations[0].SiteTarget == 10 + 0x10, "A moved jump through a RIP-relative pointer reads the wrong address");
+
+    const auto relaxed = convert(withStore({}, {0x67, 0xE8, 0x10, 0x00, 0x00, 0x00}));
+    expected = halves;
+    expected.insert(expected.end(), push.begin(), push.end());
+    expected.insert(expected.end(), {0xE9, 0, 0, 0, 0});
+    require(relaxed.Trampolines.size() == 1 && relaxed.Trampolines[0].Length == 10 && body(relaxed.Trampolines[0]) == expected && relaxed.Trampolines[0].Relocations.size() == 2 && relaxed.Trampolines[0].Relocations[1].SiteTarget == 10 + 0x10, "A call with an address-size prefix was not moved like a call");
+
+    const Bytes add = {0x48, 0x83, 0xC1, 0x01};
+    for (const auto& follower : {Bytes{0xFF, 0xD0}, Bytes{0xE3, 0x10}, Bytes{0x66, 0x75, 0x10}, Bytes{0x66, 0x0F, 0xAE, 0x37}}) {
+        const auto preceded = convert(withStore(add, follower));
+        expected = add;
+        expected.insert(expected.end(), halves.begin(), halves.end());
+        require(!preceded.Trampolines.empty() && preceded.Trampolines[0].Offset == 0x200 && preceded.Trampolines[0].Length == 8 && body(preceded.Trampolines[0]) == expected, "A 256-bit store moved a following instruction that cannot leave its place instead of the one before it");
+    }
+
+    Bytes throwing = {0xC3, 0xEB, 0xFD};
+    for (int index = 0; index < 3; ++index)
+        throwing.insert(throwing.end(), add.begin(), add.end());
+    throwing.insert(throwing.end(), {0xFF, 0xD0});
+    throwing.insert(throwing.end(), adds.begin(), adds.end());
+    const auto farther = convert(withStore({0xE8, 0x00, 0x00, 0x00, 0x00}, throwing));
+    require(farther.Trampolines.size() == 2 && farther.Trampolines[0].Offset == 0x21A && farther.Trampolines[1].Offset == 0x222, "An island that would move a register call was not passed over for the next one");
+    require(Bytes(farther.Bytes.begin() + 0x205, farther.Bytes.begin() + 0x207) == Bytes{0xEB, 0x1B}, "The 256-bit store does not jump to the island after the register call");
+
+    Bytes reentered = {0xFF, 0xD0, 0xEB, 0xF8};
+    reentered.insert(reentered.end(), adds.begin(), adds.end());
+    const auto beyondStore = convert(withStore(Bytes(adds.begin(), adds.begin() + 8), reentered));
+    require(beyondStore.Trampolines.size() == 2 && beyondStore.Trampolines[0].Offset == 0x210 && beyondStore.Trampolines[1].Offset == 0x218, "An island before a 256-bit store that is a branch target took the store with it");
+    require(Bytes(beyondStore.Bytes.begin() + 0x208, beyondStore.Bytes.begin() + 0x20A) == Bytes{0xEB, 0x0E}, "The 256-bit store that is a branch target does not jump to the island after it");
+
+    const Bytes farCall = {0xE8, 0x40, 0x00, 0x00, 0x00};
+    Bytes claimedFirst = {0xFF, 0xD0};
+    claimedFirst.insert(claimedFirst.end(), adds.begin(), adds.end());
+    const auto afterSequence = convert(withStore({0xC5, 0xF8, 0x53, 0xC1, 0x48, 0x83, 0xC1, 0x01}, claimedFirst));
+    require(afterSequence.Trampolines.size() == 3 && afterSequence.Trampolines[0].Offset == 0x200 && afterSequence.Trampolines[0].Length == 8 && afterSequence.Trampolines[1].Offset == 0x20E && afterSequence.Trampolines[2].Offset == 0x216, "A 256-bit store moved an instruction already moved into the stub of the instruction before it");
+
+    Bytes pendingRun = {0xFF, 0xD0, 0x48, 0x83, 0xC1, 0x01, 0xC5, 0xFC, 0x11, 0x47, 0x10};
+    pendingRun.insert(pendingRun.end(), adds.begin(), adds.end());
+    const auto pendingIsland = convert(withStore(farCall, pendingRun));
+    require(pendingIsland.Trampolines.size() == 3 && pendingIsland.Trampolines[0].Offset == 0x214 && pendingIsland.Trampolines[1].Offset == 0x21C && pendingIsland.Trampolines[2].Offset == 0x20F && pendingIsland.Trampolines[2].Length == 5, "An island moved the call before a 256-bit store or another store that still needs its own stub");
+
+    Bytes enteredRun = {0xFF, 0xD0};
+    for (int index = 0; index < 6; ++index)
+        enteredRun.insert(enteredRun.end(), add.begin(), add.end());
+    enteredRun.insert(enteredRun.end(), {0xEB, 0xEE});
+    const auto enteredIsland = convert(withStore(farCall, enteredRun));
+    require(enteredIsland.Trampolines.size() == 2 && enteredIsland.Trampolines[0].Offset == 0x213 && enteredIsland.Trampolines[1].Offset == 0x21B, "An island was placed over a branch target");
+
+    Bytes returning = {0xFF, 0xD0};
+    for (int index = 0; index < 3; ++index)
+        returning.insert(returning.end(), add.begin(), add.end());
+    returning.push_back(0xC3);
+    const auto returnIsland = convert(withStore(farCall, returning));
+    expected = Bytes(adds.begin(), adds.begin() + 12);
+    expected.push_back(0xC3);
+    require(returnIsland.Trampolines.size() == 2 && returnIsland.Trampolines[0].Offset == 0x20B && body(returnIsland.Trampolines[0]) == expected, "Instructions moved for an island that end in a return jump back after it");
+
+    const auto afterBranch = convert(withStore({0x75, 0x10}, {0xFF, 0xD0}));
+    expected = {0x0F, 0x85, 0, 0, 0, 0};
+    expected.insert(expected.end(), halves.begin(), halves.end());
+    require(afterBranch.Trampolines.size() == 1 && afterBranch.Trampolines[0].Offset == 0x200 && afterBranch.Trampolines[0].Length == 6 && body(afterBranch.Trampolines[0]) == expected && afterBranch.Trampolines[0].Relocations[0].SiteTarget == 2 + 0x10, "A 256-bit store after a conditional branch did not take the branch");
+
+    Bytes far = adds;
+    far.resize(8);
+    for (int index = 0; index < 60; ++index)
+        far.insert(far.end(), {0xFF, 0xD0});
+    far.insert(far.end(), adds.begin(), adds.end());
+    for (int index = 0; index < 70; ++index)
+        far.insert(far.end(), {0xFF, 0xD0});
+    Bytes tail;
+    for (int index = 0; index < 11; ++index)
+        tail.insert(tail.end(), {0xFF, 0xD0});
+    tail.insert(tail.end(), {0x90, 0x90});
+    requireFailure([&] { (void)convert(withStore(far, tail)); }, "A 256-bit store whose movable neighbours are all beyond a short jump was kept");
+}
+
+void converterJumpTableTargets() {
+    const auto converter = Codegen::MakeAmd64OnlyConverter(Codegen::Amd64OnlyTarget::Rosetta);
+    const Bytes leaTable = {0x48, 0x8D, 0x0D, 0xF9, 0x1F, 0x00, 0x00};
+    const Bytes dispatch = {0x48, 0x63, 0x04, 0x81, 0x48, 0x01, 0xC8, 0xFF, 0xE0, 0x48, 0x83, 0xC1, 0x01, 0xC5, 0xFC, 0x11, 0x07, 0x48, 0x83, 0xC2, 0x01, 0xC3};
+    const Bytes store = {0xC5, 0xFC, 0x11, 0x07};
+    const Domain::ProgramHeader code{1, 5, 0x200, 0x1000, 0, 29, 29, 16};
+    const Domain::ProgramHeader data{1, 4, 0x300, 0x3000, 0, 0x40, 0x40, 16};
+    const auto table = [](const std::uint64_t base, const std::vector<std::uint64_t>& targets) {
+        Bytes bytes;
+        for (const auto target : targets) {
+            const auto relative = static_cast<std::uint32_t>(target - base);
+            for (std::size_t byte = 0; byte < 4; ++byte)
+                bytes.push_back(static_cast<std::uint8_t>(relative >> (byte * 8)));
+        }
+        return bytes;
+    };
+    const auto convert = [&](const Bytes& first, const std::vector<std::pair<std::size_t, Bytes>>& placed, const std::vector<Domain::ProgramHeader>& headers) {
+        Bytes file(0x400, 0xCC);
+        std::copy(first.begin(), first.end(), file.begin() + 0x200);
+        std::copy(dispatch.begin(), dispatch.end(), file.begin() + 0x207);
+        for (const auto& [offset, bytes] : placed)
+            std::copy(bytes.begin(), bytes.end(), file.begin() + static_cast<std::ptrdiff_t>(offset));
+        return converter->Convert(file, headers);
+    };
+    const auto placedAt = [](const Codegen::ConvertResult& result, const Domain::FileByteOffset offset) {
+        return result.Trampolines.size() == 1 && result.Trampolines[0].Offset == offset && result.Trampolines[0].Length == 8;
+    };
+
+    require(placedAt(convert(leaTable, {{0x300, table(0x3000, {0x1010, 0x1018})}, {0x330, store}}, {code, data}), 0x210), "A 256-bit store moved the instruction after it although a jump table enters that instruction");
+    require(placedAt(convert(leaTable, {{0x300, table(0x3000, {0x1010, 0x1019, 0x1018})}}, {code, data}), 0x214), "A jump table was read past an entry that does not start an instruction");
+    require(placedAt(convert({0x48, 0x8B, 0x0D, 0xF9, 0x1F, 0x00, 0x00}, {{0x300, table(0x3000, {0x1010, 0x1018})}}, {code, data}), 0x214), "A jump table was read at an address loaded rather than formed by LEA");
+    require(placedAt(convert({0x48, 0x8D, 0x0D, 0xF7, 0x1F, 0x00, 0x00}, {{0x2FE, table(0x2FFE, {0x1018})}}, {code, data}), 0x214), "A jump table was read at an address outside every segment");
+    require(placedAt(convert(leaTable, {{0x300, table(0x3000, {0x1010})}, {0x380, table(0x3000, {0x1018})}}, {code, data, {0x61000000, 4, 0x380, 0x3000, 0, 0x10, 0x10, 16}}), 0x214), "A jump table was read from a segment that is not loaded");
+    require(placedAt(convert(leaTable, {{0x300, table(0x3000, {0x1010, 0x1018})}, {0x3A0, store}}, {code, data, {2, 5, 0x3A0, 0x2000, 0, 4, 4, 16}}), 0x210), "A segment that is not loaded was converted");
+    requireFailure([&] { (void)convert(leaTable, {{0x300, table(0x3000, {0x1010, 0x1018})}}, {code, {1, 4, 0x300, 0x3000, 0, 0x1000, 0x1000, 16}}); }, "A jump table was read from a segment that exceeds the file");
+}
+
 void converterRosetta() {
     const auto converter = Codegen::MakeAmd64OnlyConverter(Codegen::Amd64OnlyTarget::Rosetta);
     Bytes file(0x300, 0xCC);
@@ -700,17 +953,23 @@ void converterRosetta() {
 }
 
 void reciprocalOperands() {
-    const auto vex2 = Codegen::DecodeVexReciprocal(Bytes{0xC5, 0xF8, 0x52, 0xD5}.data(), 4);
+    const auto vex2 = Codegen::DecodeReciprocal(Bytes{0xC5, 0xF8, 0x52, 0xD5}.data(), 4);
     require(vex2 && vex2->Operation == Codegen::ReciprocalOperation::ReciprocalSquareRoot && vex2->Destination == 2 && vex2->Source == 5, "VEX2 VRSQRTPS was not decoded");
-    const auto vex2High = Codegen::DecodeVexReciprocal(Bytes{0xC5, 0x78, 0x53, 0xC1}.data(), 4);
+    const auto vex2High = Codegen::DecodeReciprocal(Bytes{0xC5, 0x78, 0x53, 0xC1}.data(), 4);
     require(vex2High && vex2High->Operation == Codegen::ReciprocalOperation::Reciprocal && vex2High->Destination == 8 && vex2High->Source == 1, "VEX2 VRCPPS with a high destination was not decoded");
-    const auto vex3 = Codegen::DecodeVexReciprocal(Bytes{0xC4, 0x41, 0x78, 0x52, 0xC9}.data(), 5);
+    const auto vex3 = Codegen::DecodeReciprocal(Bytes{0xC4, 0x41, 0x78, 0x52, 0xC9}.data(), 5);
     require(vex3 && vex3->Destination == 9 && vex3->Source == 9, "VEX3 VRSQRTPS with high registers was not decoded");
-    require(!Codegen::DecodeVexReciprocal(Bytes{0xC5, 0xFC, 0x52, 0xD5}.data(), 4), "256-bit VRSQRTPS must stay native");
-    require(!Codegen::DecodeVexReciprocal(Bytes{0xC5, 0xFA, 0x52, 0xD5}.data(), 4), "VRSQRTSS must stay native");
-    require(!Codegen::DecodeVexReciprocal(Bytes{0xC5, 0xF8, 0x52, 0x10}.data(), 4), "Memory form must stay native");
-    require(!Codegen::DecodeVexReciprocal(Bytes{0xC5, 0xF8, 0x51, 0xD5}.data(), 4), "VSQRTPS is not a reciprocal");
-    require(!Codegen::DecodeVexReciprocal(Bytes{0x0F, 0x52, 0xD5}.data(), 3), "Legacy RSQRTPS must stay native");
+    require(!Codegen::DecodeReciprocal(Bytes{0xC5, 0xFC, 0x52, 0xD5}.data(), 4), "256-bit VRSQRTPS must stay native");
+    require(!Codegen::DecodeReciprocal(Bytes{0xC5, 0xFA, 0x52, 0xD5}.data(), 4), "VRSQRTSS must stay native");
+    require(!Codegen::DecodeReciprocal(Bytes{0xC5, 0xF8, 0x52, 0x10}.data(), 4), "Memory form must stay native");
+    require(!Codegen::DecodeReciprocal(Bytes{0xC5, 0xF8, 0x51, 0xD5}.data(), 4), "VSQRTPS is not a reciprocal");
+    require(vex2->Vex && vex2High->Vex && vex3->Vex, "VEX reciprocals must clear the upper vector bits");
+    const auto legacy = Codegen::DecodeReciprocal(Bytes{0x0F, 0x52, 0xD5}.data(), 3);
+    require(legacy && !legacy->Vex && legacy->Operation == Codegen::ReciprocalOperation::ReciprocalSquareRoot && legacy->Destination == 2 && legacy->Source == 5, "Legacy RSQRTPS was not decoded");
+    const auto legacyHigh = Codegen::DecodeReciprocal(Bytes{0x45, 0x0F, 0x53, 0xC9}.data(), 4);
+    require(legacyHigh && !legacyHigh->Vex && legacyHigh->Operation == Codegen::ReciprocalOperation::Reciprocal && legacyHigh->Destination == 9 && legacyHigh->Source == 9, "Legacy RCPPS with high registers was not decoded");
+    for (const Bytes& unsupported : {Bytes{0xF3, 0x0F, 0x52, 0xD5}, Bytes{0xF3, 0x0F, 0x53, 0xD5}, Bytes{0x0F, 0x52, 0x10}, Bytes{0x0F, 0x53, 0x10}, Bytes{0x0F, 0x51, 0xD5}, Bytes{0x0F, 0x52}, Bytes{0x45, 0x0F, 0x53}})
+        require(!Codegen::DecodeReciprocal(unsupported.data(), unsupported.size()), "An unsupported legacy reciprocal encoding was accepted");
 }
 
 void converterReciprocal() {
@@ -744,12 +1003,33 @@ void converterReciprocal() {
     require(moved.Trampolines.size() == 1 && moved.KeptCount == 0 && moved.Bytes == ripRelative && moved.Trampolines[0].Length == 10, "VRSQRTPS did not absorb the following RIP-relative load");
     const auto& movedSite = moved.Trampolines[0];
     require(movedSite.Relocations.size() == 1 && movedSite.Relocations[0].DisplacementOffset == movedSite.ReturnBranchOffset - 4 && movedSite.Relocations[0].InstructionEnd == movedSite.ReturnBranchOffset && movedSite.Relocations[0].SiteTarget == 10 + 0x10, "Absorbed RIP-relative load has the wrong relocation");
+    for (const std::uint8_t opcode : {std::uint8_t{0x52}, std::uint8_t{0x53}}) {
+        const std::string name = opcode == 0x52 ? "RSQRTPS" : "RCPPS";
+        for (const Bytes& instruction : {Bytes{0x0F, opcode, 0xD5}, Bytes{0x45, 0x0F, opcode, 0xC9}}) {
+            auto legacyFile = file;
+            Bytes legacyText = instruction;
+            legacyText.insert(legacyText.end(), {0x90, 0x90, 0xC3});
+            std::copy(legacyText.begin(), legacyText.end(), legacyFile.begin() + 0x200);
+            const auto legacy = converter->Convert(legacyFile, {segmentHeader(legacyText.size())});
+            require(legacy.Trampolines.size() == 1 && legacy.KeptCount == 0 && legacy.Reports[0].InstructionName == name && legacy.Trampolines[0].Length == 5, "Legacy reciprocal did not absorb enough instructions for a jump");
+            legacyText = instruction;
+            legacyText.push_back(0xC3);
+            std::copy(legacyText.begin(), legacyText.end(), legacyFile.begin() + 0x200);
+            const auto kept = converter->Convert(legacyFile, {segmentHeader(legacyText.size())});
+            require(kept.Trampolines.empty() && kept.KeptCount == 1 && kept.Bytes == legacyFile && kept.Reports[0].InstructionName == name, "Legacy reciprocal before a return must stay native");
+        }
+    }
+    auto sequenceFile = file;
+    const Bytes sequenceText = {0x0F, 0x52, 0xD5, 0xC5, 0xF8, 0x53, 0xC1, 0xC3};
+    std::copy(sequenceText.begin(), sequenceText.end(), sequenceFile.begin() + 0x200);
+    const auto sequence = converter->Convert(sequenceFile, {segmentHeader(sequenceText.size())});
+    require(sequence.Trampolines.size() == 1 && sequence.KeptCount == 0 && sequence.Trampolines[0].Length == 7 && sequence.Reports[0].InstructionName == "RSQRTPS", "Mixed legacy and VEX reciprocals were not lowered together");
 }
 
 void converterStrayRex() {
     const auto converter = Codegen::MakeAmd64OnlyConverter();
     const auto convert = [&](const Bytes& text) {
-        Bytes file(0x300, 0xCC);
+        Bytes file(0x300 + text.size(), 0xCC);
         std::copy(text.begin(), text.end(), file.begin() + 0x200);
         return std::pair{file, converter->Convert(file, {segmentHeader(text.size())})};
     };
@@ -1037,10 +1317,10 @@ void reciprocalExecution() {
     for (const auto& lanes : inputs) {
         const std::uint64_t source[2] = {packLanes(lanes, 0), packLanes(lanes, 2)};
         const std::uint64_t destination[2] = {0x1111111111111111ull, 0x2222222222222222ull};
-        for (const bool squareRoot : {true, false}) {
+        for (const bool squareRoot : {true, false}) for (const bool vex : {false, true}) {
             const std::uint8_t opcode = squareRoot ? 0x52 : 0x53;
-            const Bytes distinct = {0xC5, 0xF8, opcode, 0xD5};
-            const Bytes same = {0xC5, 0xF8, opcode, 0xD2};
+            const Bytes distinct = vex ? Bytes{0xC5, 0xF8, opcode, 0xD5} : Bytes{0x0F, opcode, 0xD5};
+            const Bytes same = vex ? Bytes{0xC5, 0xF8, opcode, 0xD2} : Bytes{0x0F, opcode, 0xD2};
             const auto distinctOut = runRegisterFormStub(distinct, destination, source);
             const auto sameOut = runRegisterFormStub(same, source, source);
             float distinctLanes[4];
@@ -1049,8 +1329,8 @@ void reciprocalExecution() {
             std::memcpy(sameLanes, sameOut.data(), sizeof(sameLanes));
             for (std::size_t lane = 0; lane < 4; ++lane) {
                 const float expected = squareRoot ? 1.0f / std::sqrt(lanes[lane]) : 1.0f / lanes[lane];
-                require(sameLane(expected, distinctLanes[lane]), "VRSQRTPS/VRCPPS stub is not correctly rounded");
-                require(sameLane(expected, sameLanes[lane]), "VRSQRTPS/VRCPPS stub with equal operands is not correctly rounded");
+                require(sameLane(expected, distinctLanes[lane]), "Packed reciprocal stub is not correctly rounded");
+                require(sameLane(expected, sameLanes[lane]), "Packed reciprocal stub with equal operands is not correctly rounded");
             }
         }
     }
@@ -1392,6 +1672,9 @@ int main() {
         converterClzero();
         rosettaSubstitutions();
         converterRosetta();
+        wideStoreSplit();
+        converterWideStoreWindows();
+        converterJumpTableTargets();
         converterReciprocal();
         converterStrayRex();
         rewriterStrayRex();

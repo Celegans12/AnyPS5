@@ -30,6 +30,10 @@
 #include <cstdio>
 #include <mutex>
 
+extern "C" std::uint64_t GuestImageSegmentBytes_nid_no_patch();
+extern "C" void* APS5_VABI mmap_nid_postfix(void* address, std::size_t length, int protection, int flags, int descriptor, std::int64_t offset) noexcept;
+extern "C" int* APS5_VABI __error_nid_postfix();
+
 namespace {
 
 constexpr size_t FLEXIBLE_MEMORY_SIZE = 448ULL * 1024 * 1024;
@@ -90,9 +94,11 @@ size_t _flexibleUsedLocked() {
 }
 
 int _mapFlexible(void** addr, size_t len, int prot, int flags) {
+    const size_t images = GuestImageSegmentBytes_nid_no_patch();
     std::lock_guard lock(g_flexibleLock);
-    if (len > FLEXIBLE_MEMORY_SIZE - std::min(FLEXIBLE_MEMORY_SIZE, _flexibleUsedLocked())) {
-        std::fprintf(stderr, "[memory] flexible memory exhausted: request 0x%zx with 0x%zx of 0x%zx in use\n", len, _flexibleUsedLocked(), static_cast<size_t>(FLEXIBLE_MEMORY_SIZE));
+    const size_t used = images + _flexibleUsedLocked();
+    if (len > FLEXIBLE_MEMORY_SIZE - std::min(FLEXIBLE_MEMORY_SIZE, used)) {
+        std::fprintf(stderr, "[memory] flexible memory exhausted: request 0x%zx with 0x%zx of 0x%zx in use\n", len, used, static_cast<size_t>(FLEXIBLE_MEMORY_SIZE));
         return SCE_KERNEL_ERROR_ENOMEM;
     }
     const int result = DoMapAnon(addr, len, prot, flags);
@@ -167,6 +173,10 @@ size_t APS5_VABI sceKernelGetDirectMemorySize(void) {
  return DIRECT_MEMORY_SIZE;
 }
 
+int APS5_VABI sceKernelEnableDmemAliasing(void) {
+ return 0;
+}
+
 int APS5_VABI sceKernelMapDirectMemory(void** addr, size_t len, int prot, int flags, int64_t direct_memory_start, size_t alignment) {
  (void)alignment;
  return DoMapDirect(addr, len, prot, flags, direct_memory_start, alignment);
@@ -178,7 +188,8 @@ int APS5_VABI sceKernelMapDirectMemory2(void** addr, size_t len, int type, int p
 }
 
 int APS5_VABI sceKernelMapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags) {
- return _mapFlexible(addr_in_out, len, prot, flags);
+ constexpr int IgnoredHeapFlag = 0x8000;
+ return _mapFlexible(addr_in_out, len, prot, flags & ~IgnoredHeapFlag);
 }
 
 int APS5_VABI sceKernelSetVirtualRangeName(const void* addr, uint64_t len, const char* name);
@@ -208,6 +219,13 @@ int APS5_VABI sceKernelMunmap(uint64_t vaddr, size_t len) {
  const int result = DoMunmap(reinterpret_cast<void*>(vaddr), len);
  if (result == 0) _releaseFlexible(static_cast<uintptr_t>(vaddr), len);
  return result;
+}
+
+int APS5_VABI sceKernelMmap(void* addr, size_t len, int prot, int flags, int fd, int64_t offset, void** res) {
+ void* mapped = mmap_nid_postfix(addr, len, prot, flags, fd, offset);
+ if (mapped == reinterpret_cast<void*>(static_cast<uintptr_t>(-1))) return SceKernelError(*__error_nid_postfix());
+ *res = mapped;
+ return 0;
 }
 
 int APS5_VABI sceKernelReleaseFlexibleMemory(void* addr, size_t len) {
@@ -241,15 +259,7 @@ int APS5_VABI sceKernelVirtualQuery(const void* addr, int flags, VirtualQueryInf
   info->end = reservedEnd;
   return 0;
  }
- const auto lease = GuestAllocations::GuestAllocationsAcquireAll_nid_postfix();
- assert(std::is_sorted(lease.begin(), lease.end(), [](const auto& left, const auto& right) { return left->address < right->address; }));
- const GuestAllocations::Range* best = nullptr;
- for (const auto& range : lease) {
-  const auto begin = range->address;
-  const auto end = begin + range->bytes;
-  if (address >= begin && address < end) { best = range.get(); break; }
-  if ((flags & findNext) != 0 && begin > address && (best == nullptr || begin < best->address)) best = range.get();
- }
+ const auto best = GuestAllocations::GuestAllocationsLookup_nid_postfix(address, (flags & findNext) != 0);
  if (best != nullptr) {
   info->start = best->address;
   info->end = best->address + best->bytes;
@@ -350,14 +360,21 @@ int APS5_VABI sceKernelIsStack(void* addr, void** start, void** end) {
 
 int APS5_VABI sceKernelAvailableFlexibleMemorySize(size_t* size) {
  if (!size) return SCE_KERNEL_ERROR_EINVAL;
+ const size_t images = GuestImageSegmentBytes_nid_no_patch();
  std::lock_guard lock(g_flexibleLock);
- *size = FLEXIBLE_MEMORY_SIZE - std::min(FLEXIBLE_MEMORY_SIZE, _flexibleUsedLocked());
+ *size = FLEXIBLE_MEMORY_SIZE - std::min(FLEXIBLE_MEMORY_SIZE, images + _flexibleUsedLocked());
  return 0;
 }
 
 int APS5_VABI sceKernelConfiguredFlexibleMemorySize(size_t* size) {
  if (!size) return SCE_KERNEL_ERROR_EINVAL;
  *size = FLEXIBLE_MEMORY_SIZE;
+ return 0;
+}
+
+int APS5_VABI sceKernelInternalMemoryGetAvailableSize(size_t* size) {
+ if (!size) return SCE_KERNEL_ERROR_EINVAL;
+ *size = 0;
  return 0;
 }
 
@@ -379,11 +396,12 @@ int APS5_VABI sceKernelClearVirtualRangeName(const void* addr, uint64_t len) {
 }
 
 int APS5_VABI sceKernelGetPageTableStats(int* cpu_total, int* cpu_available, int* gpu_total, int* gpu_available) {
- (void)cpu_total;
- (void)cpu_available;
- (void)gpu_total;
- (void)gpu_available;
- NotImplemented_nid_no_patch(__func__);
+ if (!cpu_total || !cpu_available || !gpu_total || !gpu_available) return SCE_KERNEL_ERROR_EFAULT;
+ constexpr int pageTableEntries = static_cast<int>((4ull << 30) / (2ull << 20));
+ *cpu_total = pageTableEntries;
+ *cpu_available = pageTableEntries;
+ *gpu_total = pageTableEntries;
+ *gpu_available = pageTableEntries;
  return 0;
 }
 

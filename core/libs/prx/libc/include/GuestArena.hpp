@@ -19,6 +19,7 @@ bool GuestArenaAvailable_nid_postfix();
 bool GuestArenaContains_nid_postfix(const void* pointer, std::size_t bytes);
 void* GuestArenaAllocate_nid_postfix(std::size_t bytes, std::size_t alignment);
 void* GuestArenaAllocateAtOrAbove_nid_postfix(std::uintptr_t hint, std::size_t bytes, std::size_t alignment);
+std::uintptr_t GuestArenaHighestFree_nid_no_patch(std::size_t bytes, std::size_t alignment);
 void GuestArenaMarkUsed_nid_postfix(const void* pointer, std::size_t bytes);
 void GuestArenaRelease_nid_postfix(const void* pointer, std::size_t bytes);
 // The reserved range, and whether it was reserved with page write watching (Windows MEM_WRITE_WATCH).
@@ -33,6 +34,8 @@ void GuestArenaPinWritable_nid_postfix(const void* pointer, std::size_t bytes);
 void GuestArenaUnpinWritable_nid_postfix(const void* pointer, std::size_t bytes);
 bool GuestArenaProtection_nid_postfix(std::uintptr_t address, std::uint32_t* protection);
 bool GuestArenaCollectWrites_nid_postfix(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear);
+bool GuestArenaCollectArmedWrites_nid_postfix(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear);
+bool GuestArenaCollectFreshWrites_nid_postfix(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear);
 bool GuestArenaHostRegionOverlaps_nid_postfix(std::uintptr_t address, std::size_t bytes);
 std::uint64_t GuestArenaCommitGeneration_nid_postfix();
 void GuestArenaSetPrivateMappingObserver_nid_postfix(void (*callback)(std::uintptr_t address, std::size_t bytes, std::uint64_t generation));

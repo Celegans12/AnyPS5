@@ -81,7 +81,9 @@ def main():
                 assert set(artifacts) == expected, artifacts
                 for artifact in artifacts:
                     assert artifact.read_bytes().startswith(b"MZ" if windows else b"\x7fELF")
-                    assert f"    {artifact.relative_to(case / 'app0').as_posix()}\n" in result.stdout, result.stdout
+                    tree = result.stdout.split("Arrange the files like this:\n", 1)[1]
+                    assert f"-- {artifact.parent.name}/\n" in tree, tree
+                    assert f"              |-- {artifact.name}\n" in tree, tree
                 if windows and os.name == "nt":
                     run = subprocess.run([str(output)], capture_output=True, text=True, timeout=30)
                     assert run.returncode == 42, (run.returncode, run.stdout, run.stderr)
@@ -118,9 +120,12 @@ def main():
                 (case / "prx" / "provider.prx").write_bytes(module_with_symbol(True))
                 result, output = convert(case, windows)
                 assert result.returncode == 0 and output.exists(), result.stderr
+                warning = "Skipping SELF container: sce_module/libc.prx (unwrap it before relinking)"
+                assert result.stdout.count(warning) == 1, result.stdout
                 assert {path.name for path in (case / "app0").rglob("*.guest.prx")} == {"provider.prx.guest.prx"}
                 result, output = convert(case, windows, ["--exclude-sce-module", "libc.prx"])
                 assert result.returncode == 0 and output.exists(), result.stderr
+                assert warning not in result.stdout, result.stdout
                 assert {path.name for path in (case / "app0").rglob("*.guest.prx")} == {"provider.prx.guest.prx"}
 
             case = work / f"{windows}-ambiguous"

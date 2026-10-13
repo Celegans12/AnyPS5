@@ -5,6 +5,73 @@ import sys
 import tempfile
 
 from test_guest_intel_trampolines import PLAIN_SITE, guest_fixture, main_fixture
+from test_linux_desktop_entry_output import png
+
+
+def check_diagnostic_inputs(relinker, work):
+    filename = "windows-diagnostics-imports.txt"
+    for bundled in (False, True):
+        for alias in ("direct", "hardlink", "symlink"):
+            for registry in (False, True):
+                case = work / f"diagnostics-{bundled}-{alias}-{registry}"
+                modules = case / "sce_module"
+                modules.mkdir(parents=True)
+                diagnostics = (modules if bundled and alias == "direct" else case) / filename
+                source = diagnostics if not bundled and alias == "direct" else case / "input.elf"
+                original = bytes(main_fixture())
+                source.write_bytes(original)
+                module = diagnostics if bundled and alias == "direct" else modules / "sample.prx"
+                module_original = bytes(guest_fixture(PLAIN_SITE))
+                module.write_bytes(module_original)
+                protected = module if bundled else source
+                if alias == "hardlink":
+                    os.link(protected, diagnostics)
+                elif alias == "symlink":
+                    try:
+                        diagnostics.symlink_to(protected)
+                    except OSError as error:
+                        if os.name != "nt" or error.winerror != 1314:
+                            raise
+                        print("Diagnostic symbolic-link case skipped: Windows symlink privilege unavailable")
+                        continue
+                output = case / "output.exe"
+                previous_output = b"previous executable"
+                output.write_bytes(previous_output)
+                registry_path = case / "output.registry.json"
+                previous_registry = b"previous registry"
+                registry_path.write_bytes(previous_registry)
+                options = [] if bundled else ["--skip-sce-module"]
+                if registry:
+                    options.append("--registry")
+                result = subprocess.run([str(relinker), "--windows", "--windows-diagnostics", *options,
+                                         str(source), str(output)], cwd=diagnostics.parent,
+                                        capture_output=True, text=True, timeout=20)
+                owner = "an input module" if bundled else "the input executable"
+                assert result.returncode == 2 and f"Windows import diagnostics output would overwrite {owner}" in result.stderr, (result.stdout, result.stderr)
+                assert str(diagnostics) in result.stderr, result.stderr
+                assert source.read_bytes() == original and module.read_bytes() == module_original
+                assert diagnostics.read_bytes() == (module_original if bundled else original)
+                assert output.read_bytes() == previous_output and registry_path.read_bytes() == previous_registry
+                assert not (case / "app0").exists()
+
+    for enabled in (False, True):
+        for existing in (False, True):
+            case = work / f"diagnostics-valid-{enabled}-{existing}"
+            case.mkdir()
+            diagnostics = case / filename
+            source = case / "input.elf" if enabled else diagnostics
+            original = bytes(main_fixture())
+            source.write_bytes(original)
+            if enabled and existing:
+                diagnostics.write_bytes(b"previous diagnostics")
+            output = case / "output.exe"
+            options = ["--windows-diagnostics"] if enabled else []
+            result = subprocess.run([str(relinker), "--windows", "--skip-sce-module", *options,
+                                     str(source), str(output)], cwd=case,
+                                    capture_output=True, text=True, timeout=20)
+            assert result.returncode == 0 and output.read_bytes().startswith(b"MZ"), (result.stdout, result.stderr)
+            assert source.read_bytes() == original
+            assert diagnostics.read_bytes() == (b"" if enabled else original)
 
 
 def check_registry_inputs(relinker, work, windows):
@@ -52,10 +119,91 @@ def check_registry_inputs(relinker, work, windows):
                 assert not (case / "app0").exists()
 
 
+def check_registry_after_failed_patch(relinker, work):
+    case = work / "registry-failed-patch"
+    (case / "sce_module").mkdir(parents=True)
+    (case / "sce_module" / "sample.prx").write_bytes(guest_fixture(PLAIN_SITE))
+    (case / "sce_sys").mkdir()
+    (case / "sce_sys" / "icon0.png").write_bytes(b"\x89PNG\r\n\x1a\n" + bytes(40))
+    source = case / "input.elf"
+    source.write_bytes(main_fixture())
+    output = case / "output.exe"
+    previous_output = b"previous executable"
+    output.write_bytes(previous_output)
+    registries = [case / "output.registry.json", case / "output.sample.prx.guest.prx.registry.json"]
+    previous_registry = b"previous registry"
+    for registry in registries:
+        registry.write_bytes(previous_registry)
+    result = subprocess.run([str(relinker), "--windows", "--registry", str(source), str(output)],
+                            capture_output=True, text=True, timeout=20)
+    assert result.returncode == 2 and "Invalid Windows icon PNG" in result.stderr, (result.stdout, result.stderr)
+    assert output.read_bytes() == previous_output
+    assert all(registry.read_bytes() == previous_registry for registry in registries)
+    assert not (case / "app0").exists()
+
+
+def check_desktop_inputs(relinker, work):
+    for desktop in (False, True):
+        for bundled in (False, True):
+            for alias in ("direct", "hardlink", "symlink"):
+                for registry in (False, True):
+                    case = work / f"desktop-{desktop}-{bundled}-{alias}-{registry}"
+                    modules = case / "sce_module"
+                    modules.mkdir(parents=True)
+                    sce_sys = case / "sce_sys"
+                    sce_sys.mkdir()
+                    image = png(1, 1)
+                    (sce_sys / "icon0.png").write_bytes(image)
+                    output = (modules if bundled and alias == "direct" else case) / "output.elf"
+                    paths = [Path(f"{output}.png"), Path(f"{output}.desktop")]
+                    target = paths[int(desktop)]
+                    source = target if not bundled and alias == "direct" else case / "input.elf"
+                    original = bytes(main_fixture())
+                    source.write_bytes(original)
+                    module = target if bundled and alias == "direct" else modules / "sample.prx"
+                    module_original = bytes(guest_fixture(PLAIN_SITE))
+                    module.write_bytes(module_original)
+                    protected = module if bundled else source
+                    if alias == "hardlink":
+                        os.link(protected, target)
+                    elif alias == "symlink":
+                        try:
+                            target.symlink_to(protected)
+                        except OSError as error:
+                            if os.name != "nt" or error.winerror != 1314:
+                                raise
+                            print("Desktop symbolic-link case skipped: Windows symlink privilege unavailable")
+                            continue
+                    previous_output = b"previous executable"
+                    output.write_bytes(previous_output)
+                    untouched = paths[int(not desktop)]
+                    previous_auxiliary = b"previous auxiliary output"
+                    untouched.write_bytes(previous_auxiliary)
+                    registry_path = output.with_suffix(".registry.json")
+                    previous_registry = b"previous registry"
+                    registry_path.write_bytes(previous_registry)
+                    options = ["--registry"] if registry else []
+                    result = subprocess.run([str(relinker), *options, str(source), str(output)],
+                                            capture_output=True, text=True, timeout=20)
+                    kind = "Desktop entry" if desktop else "Icon"
+                    owner = "an input module" if bundled else "the input executable"
+                    assert result.returncode == 2 and f"{kind} output would overwrite {owner}" in result.stderr, (result.stdout, result.stderr)
+                    assert str(target) in result.stderr, result.stderr
+                    assert source.read_bytes() == original and module.read_bytes() == module_original
+                    assert output.read_bytes() == previous_output and untouched.read_bytes() == previous_auxiliary
+                    assert registry_path.read_bytes() == previous_registry
+                    assert target.read_bytes() == (module_original if bundled else original)
+                    assert (sce_sys / "icon0.png").read_bytes() == image
+                    assert not (output.parent / "app0").exists()
+
+
 def main():
     relinker = Path(sys.argv[1]).resolve()
     with tempfile.TemporaryDirectory(prefix="anyps5-input-preservation-") as directory:
         work = Path(directory)
+        check_diagnostic_inputs(relinker, work)
+        check_desktop_inputs(relinker, work)
+        check_registry_after_failed_patch(relinker, work)
         for windows in (False, True):
             options = ["--windows"] if windows else []
             check_registry_inputs(relinker, work, windows)
@@ -115,6 +263,13 @@ def main():
                 module_original = guest_fixture(PLAIN_SITE)
                 module.write_bytes(module_original)
                 output = case / ("output.exe" if windows else "output.elf")
+                if not windows:
+                    (case / "sce_sys").mkdir()
+                    image = png(1, 1)
+                    (case / "sce_sys" / "icon0.png").write_bytes(image)
+                    if existing:
+                        Path(f"{output}.png").write_bytes(b"previous icon")
+                        Path(f"{output}.desktop").write_bytes(b"previous desktop entry")
                 if existing:
                     output.write_bytes(b"previous output")
                 result = subprocess.run([str(relinker), *options, "--registry", str(source), str(output)],
@@ -126,6 +281,9 @@ def main():
                         or not output.with_suffix(".registry.json").exists()
                         or source.read_bytes() != original or module.read_bytes() != module_original):
                     raise AssertionError((windows, existing, result.returncode, result.stdout, result.stderr))
+                if not windows:
+                    assert Path(f"{output}.png").read_bytes() == image
+                    assert Path(f"{output}.desktop").read_text().startswith("[Desktop Entry]\n")
     print("Input preservation tests passed")
 
 

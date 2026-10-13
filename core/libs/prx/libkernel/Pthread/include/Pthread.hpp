@@ -11,7 +11,6 @@
 #include <cstdint>
 #include <ctime>
 #include <mutex>
-#include <shared_mutex>
 #include <string>
 #include <thread>
 #ifndef _WIN32
@@ -50,15 +49,11 @@ struct PthreadRwlockattrPrivate {
 };
 
 struct PthreadRwlockPrivate {
-    // TODO(technical debt): winpthreads initializes a static rwlock on first use and fails a
-    // concurrent first lock with EINVAL, which shared_timed_mutex ignores. Initialize it here.
-    PthreadRwlockPrivate() {
-        _lock.lock();
-        _lock.unlock();
-    }
-    std::shared_timed_mutex _lock;
+    std::mutex _state;
+    TimedWait::Condition _changed;
     std::atomic<std::thread::id> _writer;
     std::atomic<int> _readers{0};
+    int _waitingWriters = 0;
 };
 
 struct PthreadCondattrPrivate {
@@ -83,6 +78,10 @@ static constexpr int DEFAULT_THREAD_PRIORITY = 700;
 static constexpr std::uint32_t CPU_CLOCK_BIT = 0x80000000u;
 static constexpr std::uint32_t CPU_CLOCK_PROCESS_BIT = 0x40000000u;
 static constexpr std::uint32_t CPU_CLOCK_ID_MASK = ~(CPU_CLOCK_BIT | CPU_CLOCK_PROCESS_BIT);
+static constexpr int GUEST_EXPLICIT_SCHED = 0;
+static constexpr int GUEST_INHERIT_SCHED = 4;
+static constexpr int GUEST_SCOPE_PROCESS = 0;
+static constexpr int GUEST_SCOPE_SYSTEM = 2;
 
 inline int GuestCpuFromHost(unsigned hostCpu, KernelCpumask threadAffinity) {
     KernelCpumask mask = threadAffinity & DEFAULT_THREAD_AFFINITY;
@@ -102,6 +101,7 @@ struct PthreadAttrPrivate {
     bool _affinityExplicit = false;
     std::size_t _guardsize = 0x1000;
     int _solosched = 0;
+    int _scope = GUEST_SCOPE_SYSTEM;
 };
 
 inline std::atomic<std::int64_t> nextThreadId{100000};
@@ -117,16 +117,21 @@ struct PthreadPrivate {
     std::atomic<unsigned> references{2};
     std::atomic<bool> inWait{false};
     std::atomic<int> pendingException{0};
+    std::atomic<int> schedPolicy{1};
     void* wakeEvent = nullptr;
     void* stackAddress = nullptr;
     std::size_t stackSize = 0;
     std::atomic<int> waitCount{0};
     std::atomic<KernelCpumask> affinity{DEFAULT_THREAD_AFFINITY};
     std::atomic<int> priority{DEFAULT_THREAD_PRIORITY};
+    int scope = GUEST_SCOPE_SYSTEM;
     int cpuClockThread = 0;
 #ifndef _WIN32
     clockid_t hostCpuClock{};
     bool hostCpuClockBound = false;
+    void* guestStack = nullptr;
+    std::size_t guestStackBytes = 0;
+    int hostTid = 0;
 #endif
     std::mutex nameLock;
     std::string name;
@@ -147,9 +152,13 @@ struct PthreadPrivate {
 };
 
 bool GuestThreadStack(std::uintptr_t address, std::uintptr_t* start, std::uintptr_t* end);
+bool GuestThreadStackHostRangeOverlaps(std::uintptr_t start, std::uintptr_t end);
 void NoteGuestStackProtection(std::uintptr_t start, std::size_t bytes, bool readWrite);
 int GuestThreadCpuClockId(const PthreadPrivate* thread);
 bool GuestThreadCpuNanos(int cpuClockThread, std::uint64_t* nanos);
 void SetLiveGuestThreadsAffinity(KernelCpumask mask);
+KernelCpumask LiveGuestThreadsAffinity();
+bool GuestThreadIsLive(const PthreadPrivate* thread);
+bool LiveGuestThreadExists(std::int64_t tid);
 
 #endif

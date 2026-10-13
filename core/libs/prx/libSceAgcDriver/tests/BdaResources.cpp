@@ -123,6 +123,98 @@ void importSpanTests(const Context& context) {
     ::operator delete(block, std::align_val_t{piece});
 }
 
+void failedImportRemapTests(const Context& context, const BdaTestAccess& access) {
+    constexpr std::size_t piece = 65536;
+    auto* block = static_cast<std::byte*>(::operator new(4 * piece, std::align_val_t{piece}));
+    auto importing = context;
+    importing.hostImportAlignment = piece;
+    const auto address = reinterpret_cast<std::uintptr_t>(block);
+    const auto add = [&](std::size_t index) {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block + index * piece, piece, true, true, true);
+    };
+    const auto remove = [&](std::size_t index) {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(block + index * piece);
+    };
+    SetHostImportWindow(0);
+    for (std::size_t replaced = 0; replaced < 2; ++replaced) {
+        add(0);
+        add(1);
+        std::weak_ptr<const GuestAllocations::Range> owner;
+        {
+            const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+            const auto found = std::find_if(lease.begin(), lease.end(), [&](const auto& range) { return range->address == address + replaced * piece; });
+            Require(found != lease.end(), "failed import fixture has no registered owner");
+            owner = *found;
+        }
+        access.limitMemory(0);
+        const auto attempts = access.allocationAttempts();
+        Require(HostImportFor(importing, address, 2 * piece) == nullptr && access.allocationAttempts() == attempts + 1, "host import failure was not exercised");
+        Require(owner.use_count() == 1, "a failed import pins its owner");
+        Require(HostImportFor(importing, address, 2 * piece) == nullptr && access.allocationAttempts() == attempts + 1, "an unchanged failed import was retried");
+        add(3);
+        Require(HostImportFor(importing, address, 2 * piece) == nullptr && access.allocationAttempts() == attempts + 1, "an unrelated mapping retried a failed import");
+        remove(replaced);
+        Require(owner.expired(), "a failed import kept the replaced owner alive");
+        add(replaced);
+        access.limitMemory(std::nullopt);
+        const auto* imported = HostImportFor(importing, address, 2 * piece);
+        Require(imported != nullptr && imported->base == address && imported->bytes == 2 * piece && access.allocationAttempts() == attempts + 2, "same-address remap retained a failed import decision");
+        remove(0);
+        remove(1);
+        remove(3);
+        ClearHostImports(importing.device);
+    }
+    add(0);
+    add(1);
+    access.limitMemory(0);
+    Require(HostImportFor(importing, address, 2 * piece) == nullptr, "span failure was not exercised");
+    remove(1);
+    access.limitMemory(std::nullopt);
+    const auto* shortened = HostImportFor(importing, address, piece);
+    Require(shortened != nullptr && shortened->bytes == piece, "a failed span suppressed an import of its remaining range");
+    remove(0);
+    ClearHostImports(importing.device);
+    ::operator delete(block, std::align_val_t{piece});
+}
+
+void spaceImportRunTests(const Context& context) {
+    constexpr std::size_t piece = 65536;
+    void* block = ::operator new(2 * piece, std::align_val_t{piece});
+    const auto first = reinterpret_cast<std::uintptr_t>(block);
+    std::memset(block, 0x3c, 2 * piece);
+    auto importing = context;
+    importing.hostImportAlignment = piece;
+    const auto change = [&](std::uint8_t* range, bool add) {
+        auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
+        if (add) GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, range, piece, true, false, true);
+        else GuestAllocations::GuestAllocationsRemove_nid_postfix(mutation, range);
+        GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
+    };
+    auto* guest = static_cast<std::uint8_t*>(block);
+    change(guest, true);
+    change(guest + piece, true);
+    for (int build = 0; build < 2; ++build) {
+        const auto before = AddressSpaceCounters();
+        GuestBufferMemory leased(importing);
+        leased.AcquireRegistered();
+        leased.AddReadable(first + piece - 256, 512);
+        leased.Upload(true);
+        std::uint32_t adjustment = 0;
+        const auto view = leased.Descriptor(first + piece - 256, 512, adjustment);
+        Require(view.buffer != VK_NULL_HANDLE && view.range == 512 + adjustment, "a V# across one import's ranges has no descriptor");
+        const auto ranges = leased.AddressRanges();
+        Require(std::any_of(ranges.begin(), ranges.end(), [&](const auto& range) { return range.begin <= first && first + 2 * piece <= range.end; }), "one import's adjacent ranges are not one BDA table entry");
+        leased.WriteBack();
+        const auto after = AddressSpaceCounters();
+        if (after.enabled && build == 1) Require(after.hits == before.hits + 1 && after.dissolvedOverlap == before.dissolvedOverlap, "a V# across one import's ranges dissolved the cached address space");
+    }
+    change(guest, false);
+    change(guest + piece, false);
+    ::operator delete(block, std::align_val_t{piece});
+}
+
 void importWindowTests(const Context& context) {
     constexpr std::size_t piece = 65536;
     constexpr std::size_t window = 2 * piece;
@@ -151,6 +243,81 @@ void importWindowTests(const Context& context) {
     const auto* kept = HostImportFor(importing, first, 16);
     Require(kept != nullptr && kept->buffer == lowBuffer, "growth in one window re-imported another");
     for (std::size_t index = 0; index < 4; ++index) change(guest + index * piece, false);
+    SetHostImportWindow(0);
+    ::operator delete(block, std::align_val_t{window});
+}
+
+void importJoinTests(const Context& context) {
+    constexpr std::size_t piece = 65536;
+    constexpr std::size_t window = 2 * piece;
+    constexpr std::size_t large = 3 * piece;
+    void* block = ::operator new(3 * large + 5 * piece, std::align_val_t{window});
+    auto* guest = static_cast<std::uint8_t*>(block);
+    std::memset(guest, 0x11, 3 * large);
+    const auto first = reinterpret_cast<std::uintptr_t>(block);
+    const auto second = first + large;
+    const auto third = second + large;
+    auto importing = context;
+    importing.hostImportAlignment = piece;
+    SetHostImportWindow(window);
+    const auto change = [&](std::uint8_t* range, std::size_t bytes, bool add) {
+        auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
+        if (add) GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, range, bytes, true, false, true);
+        else GuestAllocations::GuestAllocationsRemove_nid_postfix(mutation, range);
+        GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
+    };
+    const auto bind = [&](std::uintptr_t address) {
+        GuestBufferMemory plain(importing);
+        plain.AddReadable(address, 32);
+        plain.Upload(false);
+        std::uint32_t adjustment = 0;
+        const auto view = plain.Descriptor(address, 32, adjustment);
+        const auto copied = plain.CopiedBytes();
+        plain.WriteBack();
+        return std::pair{view.buffer, copied};
+    };
+    change(guest, large, true);
+    change(guest + large, large, true);
+    const auto* low = HostImportFor(importing, first, 16);
+    Require(low != nullptr && low->base == first && low->bytes == large, "a range larger than the import window was not imported alone");
+    const auto* high = HostImportFor(importing, second, 16);
+    Require(high != nullptr && high->base == second && high->bytes == large, "the next range larger than the import window was not imported alone");
+    Require(HostImportFor(importing, second - 16, 32) == nullptr, "a view across two imported ranges was imported before it was bound");
+    {
+        GuestBufferMemory leased(importing);
+        leased.AcquireRegistered();
+        leased.AddReadable(second - 16, 32);
+        leased.Upload(true);
+        const auto* joined = HostImportFor(importing, second - 16, 32);
+        Require(joined != nullptr && joined->base == first && joined->bytes == 2 * large, "a buffer bound across two adjacent ranges larger than the import window was not imported as one");
+        std::uint32_t adjustment = 0;
+        const auto crossing = leased.Descriptor(second - 16, 32, adjustment);
+        Require(crossing.buffer == joined->buffer && crossing.offset + adjustment == second - 16 - first, "a buffer bound across the joined ranges is not bound in place");
+        leased.WriteBack();
+    }
+    const auto joinedBuffer = HostImportFor(importing, first, 16)->buffer;
+    const auto [again, copied] = bind(second - 16);
+    Require(again == joinedBuffer && copied == 0, "a later bind across the joined ranges did not use the joined import");
+    auto* heap = guest + 3 * large + 2 * piece;
+    change(heap, piece, true);
+    change(heap + piece, piece, true);
+    Require(bind(reinterpret_cast<std::uintptr_t>(heap + piece) - 16).second != 0 && HostImportFor(importing, reinterpret_cast<std::uintptr_t>(heap + piece) - 16, 32) == nullptr, "two pieces no larger than the import window were joined");
+    const auto* kept = HostImportFor(importing, first, 16);
+    Require(kept != nullptr && kept->buffer == joinedBuffer && kept->bytes == 2 * large, "a registry change elsewhere re-imported the joined ranges");
+    change(guest + 2 * large, large, true);
+    Require(HostImportFor(importing, first, 16)->buffer == joinedBuffer, "a range registered next to the joined ranges re-imported them");
+    const auto [grownBuffer, grownCopied] = bind(third - 16);
+    const auto* grown = HostImportFor(importing, third - 16, 32);
+    Require(grown != nullptr && grown->base == first && grown->bytes == 3 * large && grownBuffer == grown->buffer && grownCopied == 0, "a bind across the next range did not grow the joined import");
+    Require(bind(second - 16).first == grownBuffer && HostImportFor(importing, first, 16)->buffer == grownBuffer, "two joins sharing a range retired each other");
+    change(heap, piece, false);
+    change(heap + piece, piece, false);
+    change(guest + large, large, false);
+    const auto* alone = HostImportFor(importing, first, 16);
+    Require(alone != nullptr && alone->base == first && alone->bytes == large, "the joined import outlived one of its ranges");
+    change(guest, large, false);
+    change(guest + 2 * large, large, false);
+    Require(HostImportFor(importing, first, 16) == nullptr && HostImportFor(importing, third, 16) == nullptr, "the host imports outlived their ranges");
     SetHostImportWindow(0);
     ::operator delete(block, std::align_val_t{window});
 }
@@ -882,6 +1049,82 @@ void sparseHeapTests(const Context& context, const BdaTestAccess& access) {
     releaseSparse(block, reserved);
 }
 
+bool RunSparseBufferHoleTests(const Context& context, const BdaTestAccess& access) {
+    constexpr std::size_t unit = 65536;
+    constexpr std::size_t copied = 3 * unit;
+    bool passed = true;
+    for (const bool writable : {false, true}) {
+        for (const std::string shape : {"interior", "shortened", "committed"}) {
+            const auto name = std::string(writable ? "writable " : "readable ") + shape;
+            try {
+                const bool whole = shape == "committed";
+                const auto reserved = shape == "shortened" ? 4 * unit : copied;
+                struct Reservation {
+                    std::size_t bytes;
+                    std::byte* data;
+                    ~Reservation() { releaseSparse(data, bytes); }
+                } reservation{reserved, reserveSparse(reserved, whole ? reserved : unit)};
+                if (!whole) {
+#ifdef _WIN32
+                    Require(VirtualAlloc(reservation.data + 2 * unit, unit, MEM_COMMIT, PAGE_READWRITE) != nullptr, "cannot commit the sparse heap tail");
+#else
+                    Require(mprotect(reservation.data + 2 * unit, unit, PROT_READ | PROT_WRITE) == 0, "cannot commit the sparse heap tail");
+#endif
+                }
+                std::memset(reservation.data, 0x31, unit);
+                if (whole) std::memset(reservation.data + unit, 0x3c, unit);
+                std::memset(reservation.data + 2 * unit, 0x72, unit);
+                VkBuffer seeded = VK_NULL_HANDLE;
+                {
+                    Buffer seed(context, copied, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+                    std::fill(seed.Bytes().begin(), seed.Bytes().end(), std::byte{0xa5});
+                    seeded = seed.Handle();
+                }
+                const auto base = reinterpret_cast<std::uintptr_t>(reservation.data);
+                GuestBufferMemory memory(context);
+                if (writable) memory.AddWritable(base, reserved);
+                else memory.AddReadable(base, reserved);
+                memory.Upload(false);
+                std::uint32_t adjustment = 0;
+                const auto view = memory.Descriptor(base, reserved, adjustment);
+                Require(view.buffer == seeded, "the sparse upload did not reuse the poisoned buffer");
+                Require(adjustment == 0 && view.offset == 0 && view.range == copied && memory.CopiedBytes() == copied, "the sparse upload has the wrong allocated span");
+                auto bytes = access.bytes(view.buffer).first(copied);
+                const auto equals = [](std::span<const std::byte> part, std::byte value) {
+                    return std::all_of(part.begin(), part.end(), [value](std::byte byte) { return byte == value; });
+                };
+                Require(equals(bytes.first(unit), std::byte{0x31}) && equals(bytes.subspan(2 * unit, unit), std::byte{0x72}), "committed GPU bytes changed during upload");
+                const bool holeZero = equals(bytes.subspan(unit, unit), whole ? std::byte{0x3c} : std::byte{});
+                bytes[8] = std::byte{0x19};
+                bytes[unit + 8] = std::byte{0xd4};
+                bytes[2 * unit + 8] = std::byte{0x27};
+                memory.WriteBack();
+                Require(reservation.data[8] == (writable ? std::byte{0x19} : std::byte{0x31}) && reservation.data[2 * unit + 8] == (writable ? std::byte{0x27} : std::byte{0x72}), "sparse write-back did not preserve its writable ranges");
+                if (whole) Require(reservation.data[unit + 8] == (writable ? std::byte{0xd4} : std::byte{0x3c}), "committed middle write-back changed permissions");
+                Require(holeZero, "uncommitted GPU bytes retain prior buffer contents");
+                std::cout << "sparse buffer holes: " << name << " passed\n";
+            } catch (const std::exception& error) {
+                std::cerr << "sparse buffer holes: " << name << ": " << error.what() << '\n';
+                passed = false;
+            }
+        }
+    }
+    return passed;
+}
+
+void hostWriteWatchExclusionTests() {
+#ifdef _WIN32
+    std::vector<std::uint8_t> host(64, 0x31);
+    const auto address = reinterpret_cast<std::uintptr_t>(host.data());
+    Require(!AgcDriver::GuestMemory::Watched(address, host.size()), "ordinary host heap memory was reported as write-watched");
+    Require(AgcDriver::GuestMemory::CollectWritesUncached(address, host.size()) == 0, "ordinary host heap memory returned a guest write generation");
+    Require(!AgcDriver::GuestMemory::UnchangedSince(address, host.size(), 1), "ordinary host heap memory was proven unchanged");
+    const std::array queries{AgcDriver::GuestMemory::UnchangedQuery{address, host.size(), 1}};
+    Require(!AgcDriver::GuestMemory::UnchangedSinceAll(queries), "a host heap range passed a bulk unchanged proof");
+    Require(std::all_of(host.begin(), host.end(), [](std::uint8_t value) { return value == 0x31; }), "write-watch eligibility changed host bytes");
+#endif
+}
+
 void sparseHeapMirrorTests(const Context& context, const BdaTestAccess& access) {
 #ifdef _WIN32
     if (!GuestArena::GuestArenaAvailable_nid_postfix() || !GuestArena::GuestArenaWriteWatched_nid_postfix()) {
@@ -1207,7 +1450,10 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     }
     importCrossingTests(context, access);
     importSpanTests(context);
+    failedImportRemapTests(context, access);
+    spaceImportRunTests(context);
     importWindowTests(context);
+    importJoinTests(context);
     heapMirrorTests(context, access);
     importedHeapMirrorTests(context, access);
     importWatchTests();
@@ -1215,6 +1461,7 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     gpuMappingTests(context);
     stridedOverhangTests(context, access);
     sparseHeapTests(context, access);
+    hostWriteWatchExclusionTests();
     sparseHeapMirrorTests(context, access);
     Require(AddressCopyOverflow({{0x1000, 0x3000, 0x2000, "uncommitted pages"}}, 0x2000).empty(), "copies within the limit were refused");
     const auto copies = AddressCopyOverflow({{0x1000, 0x2000, 0x1000, "not mirrored"}, {0x10000, 0x30000, 0x18000, "uncommitted pages"}}, 0x2000);

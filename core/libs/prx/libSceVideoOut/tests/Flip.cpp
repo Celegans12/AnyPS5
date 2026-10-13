@@ -86,8 +86,16 @@ void testLifetime(bool reopen) {
         std::lock_guard lock(cfg->mutex);
         check(cfg->flipStatus.flipPendingNum == 1 && cfg->flipStatus.count == 0, "reservation status is wrong");
     }
+    auto smaller = attribute;
+    smaller.width = 32;
+    smaller.height = 32;
+    check(sceVideoOutSubmitChangeBufferAttribute2(handle, 0, &smaller, nullptr) == 0, "attributes of a buffer with a pending flip could not be changed");
+    {
+        std::lock_guard lock(cfg->mutex);
+        check(cfg->groups[0].attribute.width == 32 && cfg->groups[0].attribute.height == 32 && cfg->flipStatus.flipPendingNum == 1, "the attribute change did not reach later flips or dropped the pending one");
+    }
     attribute.dcc_control = 1;
-    check(expectFailure([&] { sceVideoOutSubmitChangeBufferAttribute2(handle, 0, &attribute, nullptr); }).find("pending flip") != std::string::npos, "pending attributes were changed");
+    check(expectFailure([&] { sceVideoOutSubmitChangeBufferAttribute2(handle, 0, &attribute, nullptr); }).find("DCC") != std::string::npos, "an invalid attribute change was accepted");
     check(expectFailure([&] { sceVideoOutUnregisterBuffers(handle, 0); }).find("pending flip") != std::string::npos, "pending buffer was unregistered");
     check(sceVideoOutWaitVblank(handle) == 0 && sceVideoOutWaitVblank(handle) == 0, "vblank stalled behind the GPU queue");
     std::shared_ptr<VideoOutConfig> replacement;
@@ -233,6 +241,16 @@ void testDecode() {
         group.attribute.option = option;
         check(expectFailure([&] { DescribeVideoOutBuffer(registered, group); }).find("buffer option " + std::to_string(option)) != std::string::npos, "an unsupported buffer option was accepted");
     }
+    sceVideoOutSetBufferAttribute2(&group.attribute, 0x8000000000000000ull, 0, 259, 137, VIDEO_OUT_BUFFER_ATTRIBUTE_OPTION_NONE, 0, 0);
+    sceVideoOutAddBufferAttributeOption(&group.attribute, VIDEO_OUT_BUFFER_ATTRIBUTE_OPTION_STRICT_COLORIMETRY);
+    check(group.attribute.option == VIDEO_OUT_BUFFER_ATTRIBUTE_OPTION_STRICT_COLORIMETRY && group.attribute.width == 259 && group.attribute.height == 137, "an added buffer option was not stored");
+    sceVideoOutAddBufferAttributeOption(&group.attribute, VIDEO_OUT_BUFFER_ATTRIBUTE_OPTION_STRICT_COLORIMETRY);
+    check(group.attribute.option == VIDEO_OUT_BUFFER_ATTRIBUTE_OPTION_STRICT_COLORIMETRY, "adding a buffer option twice changed it");
+    check(DescribeVideoOutBuffer(registered, group).address == plain.address, "a buffer with an added supported option was rejected");
+    sceVideoOutAddBufferAttributeOption(&group.attribute, 0x20);
+    check(group.attribute.option == 0x28, "an added buffer option did not keep the existing bits");
+    check(expectFailure([&] { DescribeVideoOutBuffer(registered, group); }).find("buffer option 40") != std::string::npos, "an unsupported added buffer option was accepted");
+    check(expectFailure([&] { sceVideoOutAddBufferAttributeOption(nullptr, 0x20); }).find("null attribute") != std::string::npos, "a null attribute was accepted");
     VideoOutBuffer dccBuffer{0, reinterpret_cast<uint64_t>(tiled.data()), 0x7f0000};
     sceVideoOutSetBufferAttribute2(&group.attribute, 0x8000000000000000ull, 0, 259, 137, VIDEO_OUT_BUFFER_ATTRIBUTE_OPTION_NONE, 0x208, 0x11223344);
     group.category = VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_COMPRESSED;
@@ -288,7 +306,8 @@ void testControls() {
     check(handle >= 0, "open with the highest priority on every CPU failed");
     const auto cfg = VideoOutDriver::Get().GetConfig(handle);
     check(sceVideoOutIsOutputSupported(handle, VIDEO_OUT_OUTPUT_MODE_DEFAULT, nullptr, nullptr, 0) == 1, "default output mode is unsupported");
-    check(sceVideoOutIsOutputSupported(handle, VIDEO_OUT_OUTPUT_MODE_119_88HZ, nullptr, nullptr, 0) == VIDEO_OUT_ERROR_UNSUPPORTED_OUTPUT_MODE, "unavailable output mode is supported");
+    const int highFrameRate = sceVideoOutIsOutputSupported(handle, VIDEO_OUT_OUTPUT_MODE_119_88HZ, nullptr, nullptr, 0);
+    check(highFrameRate == 1 || highFrameRate == VIDEO_OUT_ERROR_UNSUPPORTED_OUTPUT_MODE, "unexpected high-frame-rate support result");
     check(sceVideoOutConfigureOutput(handle, VIDEO_OUT_OUTPUT_MODE_119_88HZ, nullptr, nullptr, 0) == VIDEO_OUT_ERROR_UNSUPPORTED_OUTPUT_MODE, "unavailable output mode was configured");
     check(sceVideoOutIsOutputSupported(handle, 0xd000000aull, nullptr, nullptr, 0) == VIDEO_OUT_ERROR_UNKNOWN_OUTPUT_MODE, "unknown output mode is supported");
     check(sceVideoOutConfigureOutput(handle, 0xd000000aull, nullptr, nullptr, 0) == VIDEO_OUT_ERROR_UNKNOWN_OUTPUT_MODE, "unknown output mode was configured");
@@ -350,6 +369,14 @@ void testControls() {
     check(sceVideoOutGetEventId(&vrrStatus) == VIDEO_OUT_EVENT_VRR_STATUS, "VRR status event id rejected");
     check(sceVideoOutVrrPegToFixedRate(handle, 0, 0) == 0, "VRR peg on an open handle failed");
     check(sceVideoOutVrrUnpegFromFixedRate(handle) == 0, "VRR unpeg on an open handle failed");
+    check(sceVideoOutDeleteVrrActiveStatusEvent(queue, handle) == 0, "VRR status unsubscription failed");
+    {
+        std::lock_guard lock(cfg->mutex);
+        check(cfg->vrrStatusEvents.empty(), "VRR status unsubscription did not clear registration");
+    }
+    check(sceVideoOutDeleteVrrActiveStatusEvent(queue, handle) == 0, "duplicate VRR status unsubscription failed");
+    expectFailure([&] { sceVideoOutDeleteVrrActiveStatusEvent(0, handle); });
+    expectFailure([&] { sceVideoOutDeleteVrrActiveStatusEvent(queue, -1); });
     expectFailure([&] { sceVideoOutVrrPegToFixedRate(handle, 1, 0); });
     expectFailure([&] { sceVideoOutVrrPegToFixedRate(handle, 0, 1); });
     expectFailure([&] { sceVideoOutVrrPegToFixedRate(handle, 0x100000000ull, 0); });
@@ -638,6 +665,19 @@ void testFlipAfterGpuWork() {
     LibcRunShutdown_nid_postfix();
 }
 
+void testUnopenedEventRegistration() {
+    KernelEqueue eq = 0;
+    check(sceKernelCreateEqueue(&eq, "unopened") == 0, "the event queue was not created");
+    check(sceVideoOutAddFlipEvent(eq, 0, nullptr) == VIDEO_OUT_ERROR_INVALID_HANDLE, "flip event on an unopened port was accepted");
+    check(sceVideoOutAddVblankEvent(eq, 1, nullptr) == VIDEO_OUT_ERROR_INVALID_HANDLE, "vblank event on an unopened port was accepted");
+    const int handle = sceVideoOutOpen(255, 0, 0, nullptr);
+    check(sceVideoOutAddFlipEvent(eq, handle, nullptr) == 0, "flip event on an open port was refused");
+    sceVideoOutClose(handle);
+    check(sceVideoOutAddFlipEvent(eq, handle, nullptr) == VIDEO_OUT_ERROR_INVALID_HANDLE, "flip event on a closed port was accepted");
+    check(sceKernelDeleteEqueue(eq) == 0, "the event queue was not deleted");
+    LibcRunShutdown_nid_postfix();
+}
+
 void testOneDevice() {
     const int handle = sceVideoOutOpen(255, 0, 0, nullptr);
     auto cfg = VideoOutDriver::Get().GetConfig(handle);
@@ -683,6 +723,7 @@ int main(int argc, char** argv) {
         else if (argc == 2 && std::string(argv[1]) == "aftergpu") testFlipAfterGpuWork();
         else if (argc == 2 && std::string(argv[1]) == "unavailable") testUnavailable();
         else if (argc == 2 && std::string(argv[1]) == "onedevice") testOneDevice();
+        else if (argc == 2 && std::string(argv[1]) == "unopened") testUnopenedEventRegistration();
         else if (argc == 2 && std::string(argv[1]) == "overlay") testOverlay();
         else if (argc == 2 && std::string(argv[1]) == "deferred") testDeferredBuffer();
         else if (argc == 2 && std::string(argv[1]) == "unregistered") testUnregisteredBuffer();

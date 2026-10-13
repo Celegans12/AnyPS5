@@ -11,6 +11,8 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#elif defined(__APPLE__)
+#include <mach-o/dyld.h>
 #endif
 #include "ShaderCacheVersion.hpp"
 #include <algorithm>
@@ -55,7 +57,15 @@ std::filesystem::path ShaderCacheDirectory() {
     const char* directory = std::getenv("ANYPS5_SHADER_CACHE_DIR");
     if (directory != nullptr && *directory != '\0') return std::filesystem::path(directory);
     std::error_code error;
+#ifdef __APPLE__
+    std::uint32_t size = 0;
+    _NSGetExecutablePath(nullptr, &size);
+    std::vector<char> buffer(size);
+    if (_NSGetExecutablePath(buffer.data(), &size) != 0) return {};
+    const auto executable = std::filesystem::canonical(buffer.data(), error);
+#else
     const auto executable = std::filesystem::read_symlink("/proc/self/exe", error);
+#endif
     if (error) return {};
     return executable.parent_path() / "shader_cache";
 #endif
@@ -66,9 +76,9 @@ std::filesystem::path ShaderCacheDirectory() {
 namespace ShaderRecompiler::ShaderDiskCache {
 
 #if defined(__linux__) && defined(__x86_64__) && defined(__GLIBCXX__)
-static_assert(sizeof(CompiledShaderArtifact) == 192, "CompiledShaderArtifact changed: update the artifact encoder");
+static_assert(sizeof(CompiledShaderArtifact) == 200, "CompiledShaderArtifact changed: update the artifact encoder");
 static_assert(sizeof(ShaderInvocation) == 200, "ShaderInvocation changed: update the invocation encoder");
-static_assert(sizeof(RecompileResult) == 400, "RecompileResult changed: update EncodeResult and DecodeResult");
+static_assert(sizeof(RecompileResult) == 408, "RecompileResult changed: update EncodeResult and DecodeResult");
 static_assert(sizeof(DescriptorBinding) == 592, "DescriptorBinding changed: update the binding encoder");
 static_assert(sizeof(VertexAttribute) == 32, "VertexAttribute changed: update the attribute encoder");
 static_assert(sizeof(VertexInput) == 16, "VertexInput changed: update the vertex input encoder");
@@ -303,6 +313,7 @@ void encodeArtifact(Writer& writer, const CompiledShaderArtifact& result) {
     writer.Value(result.imageMetadataDword);
     writer.Value(result.runtimeImageCount);
     writer.Values(std::span<const std::uint32_t>(result.runtimeImageResources));
+    writer.Value(result.registrationModule);
     writer.List(result.vertexInputPatches, [](Writer& out, const VertexInputPatch& patch) {
         out.Value(patch.location);
         out.Value(patch.word);
@@ -328,6 +339,7 @@ void encodeArtifact(Writer& writer, const CompiledShaderArtifact& result) {
         out.Value(parameter.flat);
         out.Value(parameter.perVertex);
         out.Value(parameter.custom);
+        out.Value(parameter.flatP10);
     });
     writer.Value(result.barycentricEmulation.active);
     writer.Value(result.barycentricEmulation.smooth);
@@ -345,6 +357,7 @@ void decodeArtifact(Reader& reader, CompiledShaderArtifact& result) {
     reader.Value(result.imageMetadataDword);
     reader.Value(result.runtimeImageCount);
     reader.Values(result.runtimeImageResources);
+    reader.Value(result.registrationModule);
     reader.List(result.vertexInputPatches, 20, [](Reader& in, VertexInputPatch& patch) {
         in.Value(patch.location);
         in.Value(patch.word);
@@ -370,6 +383,7 @@ void decodeArtifact(Reader& reader, CompiledShaderArtifact& result) {
         in.Value(parameter.flat);
         in.Value(parameter.perVertex);
         in.Value(parameter.custom);
+        in.Value(parameter.flatP10);
     });
     reader.Value(result.barycentricEmulation.active);
     reader.Value(result.barycentricEmulation.smooth);
@@ -462,6 +476,7 @@ void encodeLayout(Writer& writer, const IrBindingLayout& layout) {
     writer.Value(layout.memoryOffsetCount);
     writer.Value(layout.dispatchThreadLimit);
     writer.Value(layout.runtimeImageCount);
+    writer.Value(layout.runtimeStateDwords);
     writer.Values(std::span<const std::uint32_t>(layout.userDataRegisters));
     writer.List(layout.descriptors, [](Writer& out, const IrDescriptorBinding& descriptor) {
         out.Value(descriptor.kind);
@@ -475,6 +490,7 @@ void decodeLayout(Reader& reader, IrBindingLayout& layout) {
     reader.Value(layout.memoryOffsetCount);
     reader.Value(layout.dispatchThreadLimit);
     reader.Value(layout.runtimeImageCount);
+    reader.Value(layout.runtimeStateDwords);
     reader.Values(layout.userDataRegisters);
     reader.List(layout.descriptors, 12, [](Reader& in, IrDescriptorBinding& descriptor) {
         in.Value(descriptor.kind);
@@ -585,6 +601,8 @@ void encodeInfo(Writer& writer, const CompiledShaderInfo& compiled) {
     writer.Value(info.bdaWrites);
     writer.Value(info.usesFaultBuffer);
     writer.Value(info.dispatchThreadLimit);
+    writer.Value(info.rasterPrimitive);
+    writer.Value(info.layerExported);
     encodeLayout(writer, compiled.bindings);
 }
 
@@ -693,6 +711,8 @@ void decodeInfo(Reader& reader, CompiledShaderInfo& compiled) {
     reader.Value(info.bdaWrites);
     reader.Value(info.usesFaultBuffer);
     reader.Value(info.dispatchThreadLimit);
+    reader.Value(info.rasterPrimitive);
+    reader.Value(info.layerExported);
     decodeLayout(reader, compiled.bindings);
 }
 

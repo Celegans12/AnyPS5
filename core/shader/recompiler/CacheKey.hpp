@@ -4,7 +4,6 @@
 #include "Recompiler.hpp"
 #include "RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
-#include <bit>
 #include <cstdlib>
 #include <stdexcept>
 #include <type_traits>
@@ -111,8 +110,6 @@ private:
         append(key, tessellation->patchesPerGroup);
         append(key, tessellation->primitiveGroupSize);
         append(key, TessellationInstancePatches(request));
-        if (request.shader.stage != ShaderStage::TessellationControl) return;
-        for (const auto level : {tessellation->minLevel, tessellation->maxLevel}) append(key, std::bit_cast<std::uint32_t>(level));
     }
 
     template<typename TValue>
@@ -184,6 +181,7 @@ private:
         append(key, value.conservativeZExport);
         append(key, value.orderedPixelShader);
         append(key, value.alphaToCoverage);
+        append(key, value.stencilRefExportEnable);
         append(key, value.targetOutputMode);
     }
 
@@ -198,6 +196,7 @@ private:
         append(key, value.fetchAttribReg);
         append(key, value.fetchBufferReg);
         append(key, value.fetchEmbedded);
+        append(key, value.paClVsOutCntl);
         if (value.resourcesNum > value.resources.size()) throw std::runtime_error("Shader cache: invalid vertex resource count");
         append(key, value.resourcesNum);
         for (std::uint32_t i = 0; i < value.resourcesNum; ++i) {
@@ -247,6 +246,10 @@ private:
         append(key, value.srgbDecodeFormats);
         append(key, value.narrowSubgroupClock);
         append(key, value.float64DenormPreserve);
+        append(key, value.registrationModules);
+        append(key, value.registrationWordLimit);
+        append(key, value.vertexSubgroups);
+        append(key, value.float16DenormPreserve);
     }
 };
 

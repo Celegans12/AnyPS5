@@ -26,10 +26,8 @@ int APS5_VABI _ZSt14_Atomic_assertPKcS0__nid_postfix() {
 }
 
 
-APS5_EXPORT("H+8UBOwfScI", libcCyberUnknown08);
-std::uint64_t APS5_VABI libcCyberUnknown08(void) {
-    NotImplemented_nid_no_patch("H+8UBOwfScI");
-    return 0;
+APS5_EXPORT("H2e8t5ScQGc", libc___cxa_finalize);
+void APS5_VABI libc___cxa_finalize(void* dsoHandle) {
+    CxaFinalize_nid_no_patch(dsoHandle);
 }
-
 }

@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <new>
+#include <stdexcept>
 
 #include "prx/libc/include/FileStream.hpp"
 #include "prx/libc/include/ApplicationHeap.hpp"
@@ -29,6 +30,9 @@ void* Allocate(std::size_t size) {
         } catch (const std::bad_alloc&) {
             handler = g_newHandler.load();
             if (handler == nullptr) throw;
+        } catch (const std::length_error&) {
+            handler = g_newHandler.load();
+            if (handler == nullptr) throw std::bad_alloc();
         }
         handler();
     }
@@ -62,7 +66,7 @@ int APS5_VABI sprintf_s_nid_postfix(char* buffer, size_t size, const char* forma
 
 // Only the "C" locale exists.
 const char* APS5_VABI setlocale_nid_postfix(int category, const char* locale) {
-    (void)category;
+    if (category < 0 || category > 6) return nullptr;
     if (locale == nullptr || locale[0] == 0 || std::strcmp(locale, "C") == 0 || std::strcmp(locale, "POSIX") == 0) return "C";
     return nullptr;
 }

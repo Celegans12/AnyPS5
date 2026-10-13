@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <unordered_map>
@@ -103,6 +104,9 @@ struct SpirvEmitterState {
     bool splitSubgroup = false;
     bool narrowSubgroupClock = false;
     bool float64DenormPreserve = false;
+    bool registrationModules = false;
+    bool fragmentDescriptorSet = false;
+    bool float16DenormPreserve = false;
     std::unordered_set<const IrValue*> sharedLaneValues;
     std::uint32_t laneHalf = 0;
     std::uint32_t spirvVersion = 0x00010300u;
@@ -114,6 +118,7 @@ struct SpirvEmitterState {
     std::uint32_t storageBufferU64Variable = 0;
     std::uint32_t storageBufferU8Variable = 0;
     std::uint32_t storageBufferCoherentVariable = 0;
+    std::uint32_t storageBufferU8Variable = 0;
     std::vector<std::uint32_t> memoryByteOffsets;
     std::map<std::array<std::uint32_t, 6>, std::uint32_t> formattedBufferFunctions;
     std::map<std::array<std::uint32_t, 6>, std::uint32_t> formattedGpuBufferFunctions;
@@ -131,6 +136,7 @@ struct SpirvEmitterState {
     std::array<std::uint32_t, 2> bdaByteWriteFunctions {};
     std::uint32_t bdaFaultFunction = 0;
     bool nativeF16ModesEmitted = false;
+    bool f16DenormPreserveEmitted = false;
     std::uint32_t dot2F32F16Function = 0;
     std::array<std::array<std::uint32_t, 2>, 2> bdaDwordReadFunctions {};
     std::array<std::array<std::uint32_t, 2>, 2> bdaSpanReadFunctions {};
@@ -158,6 +164,7 @@ struct SpirvEmitterState {
     std::uint32_t ldsBufferBase = 0;
     std::uint32_t numWorkgroupsVariable = 0;
     std::array<std::uint32_t, 2> scratchVariable {};
+    std::array<std::uint32_t, 2> vectorWindowVariable {};
     std::array<std::uint32_t, ImageBindingCount> imageVariables {};
     std::uint32_t samplerVariable = 0;
     std::vector<SpirvTableImageVariable> tableImageVariables;
@@ -180,11 +187,13 @@ struct SpirvEmitterState {
     std::uint32_t perVertexVariable = 0;
     std::uint32_t pointSizeVariable = 0;
     std::uint32_t clipDistanceVariable = 0;
+    std::optional<std::uint32_t> zeroPositionClipIndex;
     std::uint32_t cullDistanceVariable = 0;
     std::uint32_t layerVariable = 0;
     std::uint32_t viewportIndexVariable = 0;
     std::uint32_t depthVariable = 0;
     std::uint32_t sampleMaskVariable = 0;
+    std::uint32_t stencilRefVariable = 0;
     std::vector<SpirvInputBinding> inputs;
     std::vector<SpirvOutputBinding> outputs;
     std::vector<std::uint32_t> interfaceVariables;

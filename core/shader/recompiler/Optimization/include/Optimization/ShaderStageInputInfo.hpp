@@ -112,8 +112,6 @@ struct ShaderTessellationInputInfo {
     std::uint32_t domain = 0;
     std::uint32_t partitioning = 0;
     std::uint32_t outputTopology = 0;
-    float minLevel = 1.0f;
-    float maxLevel = 64.0f;
     std::uint32_t patchesPerGroup = 256;
     std::uint32_t primitiveGroupSize = 0;
     bool breakAtInstance = false;
@@ -134,6 +132,7 @@ struct ShaderVertexInputInfo {
     int fetchBufferReg = 0;
     int buffersNum = 0;
     std::uint32_t scratchSizeDwords = 0;
+    std::uint32_t hostSubgroupSize = 64;
     std::uint32_t paClVsOutCntl = 0;
     ShaderClipSpaceTransform clipSpace;
     ShaderMeshInputInfo mesh;
@@ -173,6 +172,7 @@ struct ShaderPixelInputInfo {
     bool psPixelKillEnable = false;
     bool psDepthExportEnable = false;
     bool psSampleMaskExportEnable = false;
+    bool psStencilRefExportEnable = false;
     bool psSampleShading = false;
     bool psEarlyZ = false;
     bool psExecuteOnNoop = false;

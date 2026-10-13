@@ -125,6 +125,26 @@ alignas(256) constexpr std::array<std::uint32_t, 46> HullUnguardedFactors{
     0x16161690, 0x4c1616ff, 0x00008000, 0xe0741000, 0x0202070b, 0xbf810000,
 };
 
+alignas(256) constexpr std::array<std::uint32_t, 50> HullDynamicIndex{
+    0xd7650000, 0x000100c1, 0xd7660000, 0x000200c1, 0xbf8a0000, 0x7da206f9, 0x81060000, 0xd5480014,
+    0x02151101, 0x362402ff, 0x000000ff, 0x26002882, 0x34000085, 0xd5430015, 0x040224ff, 0x00000060,
+    0xdbfc0000, 0x02000015, 0x162c2890, 0xd5430016, 0x045a24ff, 0x00000030, 0xbf8cc07f, 0xe0781000,
+    0x02020216, 0x7da82881, 0xbe94047e, 0xb06a0060, 0x162602f9, 0x0086066a, 0xd8d80008, 0x06000013,
+    0xd8dc1008, 0x07000013, 0xbf8cc07f, 0x7e300306, 0x7e320306, 0x7e340306, 0x7e360306, 0x34142484,
+    0xbefe0414, 0xe0781000, 0x0403180a, 0x4a162481, 0x16161690, 0x4c1616ff, 0x00008000, 0xe0741000,
+    0x0202070b, 0xbf810000,
+};
+
+alignas(256) constexpr std::array<std::uint32_t, 50> HullHalfSlotIndex{
+    0xd7650000, 0x000100c1, 0xd7660000, 0x000200c1, 0xbf8a0000, 0x7da206f9, 0x81060000, 0xd5480014,
+    0x02151101, 0x362402ff, 0x000000ff, 0x26002882, 0x34000084, 0xd5430015, 0x040224ff, 0x00000060,
+    0xdbfc0000, 0x02000015, 0x162c2890, 0xd5430016, 0x045a24ff, 0x00000030, 0xbf8cc07f, 0xe0781000,
+    0x02020216, 0x7da82881, 0xbe94047e, 0xb06a0060, 0x162602f9, 0x0086066a, 0xd8d80008, 0x06000013,
+    0xd8dc1008, 0x07000013, 0xbf8cc07f, 0x7e300306, 0x7e320306, 0x7e340306, 0x7e360306, 0x34142484,
+    0xbefe0414, 0xe0781000, 0x0403180a, 0x4a162481, 0x16161690, 0x4c1616ff, 0x00008000, 0xe0741000,
+    0x0202070b, 0xbf810000,
+};
+
 alignas(256) constexpr std::array<std::uint32_t, 47> HullSquaredAddress{
     0xd7650000, 0x000100c1, 0xd7660000, 0x000200c1, 0xbf8a0000, 0x7da206f9, 0x81060000, 0xd5480014,
     0x02151101, 0x362402ff, 0x000000ff, 0x16002914, 0xd5430015, 0x040224ff, 0x00000060, 0xdbfc0000,
@@ -263,6 +283,12 @@ alignas(256) constexpr std::array<std::uint16_t, 9> Indices{
     Corner(2, 0, 0), Corner(2, 2, 0), Corner(2, 1, 2),
 };
 
+alignas(256) constexpr std::array<std::uint16_t, 12> QuadIndices{
+    Corner(0, 0, 0), Corner(0, 2, 0), Corner(0, 2, 2), Corner(0, 0, 2),
+    Corner(1, 0, 0), Corner(1, 2, 0), Corner(1, 2, 2), Corner(1, 0, 2),
+    Corner(2, 0, 0), Corner(2, 2, 0), Corner(2, 2, 2), Corner(2, 0, 2),
+};
+
 alignas(256) constexpr std::array<std::uint16_t, 24> LatePatchIndices{
     Corner(1, 0, 0), Corner(1, 2, 0), Corner(1, 1, 2),
     Corner(1, 0, 0), Corner(1, 2, 0), Corner(1, 1, 2),
@@ -274,15 +300,11 @@ alignas(256) constexpr std::array<std::uint16_t, 24> LatePatchIndices{
     Corner(0, 0, 0), Corner(0, 2, 0), Corner(0, 1, 2),
 };
 
-alignas(256) constexpr std::array<std::uint16_t, 12> QuadIndices{
-    Corner(0, 0, 0), Corner(0, 2, 0), Corner(0, 2, 2), Corner(0, 0, 2),
-    Corner(1, 0, 0), Corner(1, 2, 0), Corner(1, 2, 2), Corner(1, 0, 2),
-    Corner(2, 0, 0), Corner(2, 2, 0), Corner(2, 2, 2), Corner(2, 0, 2),
-};
-
 struct PatchDraw {
     TessellationConfiguration configuration;
     std::span<const std::uint16_t> indices;
+    float minLevel = 1.0f;
+    float maxLevel = 64.0f;
     std::uint32_t instances = 1;
     std::uint32_t firstInstance = 0;
 };
@@ -315,11 +337,13 @@ ShaderRecompiler::RecompileResult Compile(const ShaderRecompiler::SpirvTarget& t
         vertex = ShaderRecompiler::ShaderVertexStageInfo{};
         graphics = ShaderRecompiler::GraphicsCompileContext{hull ? 0u : 8u, {}, std::nullopt, patches.configuration, {reinterpret_cast<std::uintptr_t>(patches.indices.data()), static_cast<std::uint32_t>(patches.indices.size()), 2, patches.instances}};
     }
+    auto layout = stage == ShaderStage::Fragment ? PixelPushLayout(pushCursor, target) : ShaderRecompiler::BindingLayout{0, 0, pushCursor, AgcDriver::Graphics::PipelinePushSlotBytes - pushCursor};
+    if (layout.pushConstantOffsetBytes < AgcDriver::Graphics::PipelinePushSlotBytes) layout.pushConstantSizeBytes = ShaderRecompiler::TessellationLevelPushOffsetBytes - layout.pushConstantOffsetBytes;
     const ShaderRecompiler::RecompileRequest request{
         {stage, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}},
         {64, hull ? 0u : 8u, userData, std::nullopt, pixel, vertex, memory},
         target,
-        stage == ShaderStage::Fragment ? PixelPushLayout(pushCursor, target) : ShaderRecompiler::BindingLayout{0, 0, pushCursor, AgcDriver::Graphics::PipelinePushSlotBytes - pushCursor},
+        layout,
         graphics
     };
     auto result = ShaderRecompiler::Recompile(request);
@@ -374,7 +398,7 @@ void Draw(AgcDriver::VulkanDevice& device, const Stages& stages, VkCullModeFlags
         {ShaderStage::Fragment, &stages.fragment, PixelPushOffset(cursor, device.Target())},
     }};
     AgcDriver::Graphics::State state{};
-    state.stages = {AgcDriver::Graphics::ShaderPath::Tessellation, 0x0200210du, 64, 64, std::nullopt, patches.configuration};
+    state.stages = {AgcDriver::Graphics::ShaderPath::Tessellation, 0x0200210du, 64, 64, std::nullopt, patches.configuration, patches.minLevel, patches.maxLevel};
     state.color = {reinterpret_cast<std::uintptr_t>(Pixels.data()), {Width, Height}, VK_FORMAT_R8G8B8A8_UNORM, Pixels.size(), 0xe4u};
     state.colors = {state.color};
     state.hasColorTarget = true;
@@ -447,17 +471,20 @@ void RequireCounterClockwise(AgcDriver::VulkanDevice& device, const ShaderRecomp
 
 void RequireLevelClamps(AgcDriver::VulkanDevice& device, const ShaderRecompiler::SpirvTarget& target) {
     const auto center = Row(-0.5f + 1.0f / 3.0f);
-    const PatchDraw flattened{{3u, 3u, 1u, 2u, 2u, 1.0f, 1.0f}, Indices};
-    Draw(device, CompileTriangles(target, flattened), VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE, flattened);
+    const auto stages = CompileTriangles(target, Triangles);
+    const PatchDraw flattened{Patches, Indices, 1.0f, 1.0f};
+    Draw(device, stages, VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE, flattened);
     Require(CoveredPixels(2, false) > 100 && CoveredPixels(2, true) == 0, "VGT_HOS_MAX_TESS_LEVEL 1 did not flatten the level-5 patch, centre " + PixelText(PixelAt(Column(2, 0.25f), center)));
     Require(CoveredPixels(1, false) == 0, "VGT_HOS_MAX_TESS_LEVEL 1 kept the patch with level 0");
-    const PatchDraw raised{{3u, 3u, 1u, 2u, 2u, 5.0f, 64.0f}, Indices};
-    Draw(device, CompileTriangles(target, raised), VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE, raised);
+    Draw(device, stages, VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE, Triangles);
+    Require(CoveredPixels(2, false) > 100 && PixelAt(Column(2, 0.25f), center)[1] > 32, "the same hull kept the previous draw's VGT_HOS_MAX_TESS_LEVEL 1 for a draw with level 64, centre " + PixelText(PixelAt(Column(2, 0.25f), center)));
+    const PatchDraw raised{Patches, Indices, 5.0f, 64.0f};
+    Draw(device, stages, VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE, raised);
     Require(PixelAt(Column(0, 0.25f), center)[1] > 32, "VGT_HOS_MIN_TESS_LEVEL 5 did not tessellate the level-1 patch, centre " + PixelText(PixelAt(Column(0, 0.25f), center)));
     Require(CoveredPixels(1, false) == 0, "VGT_HOS_MIN_TESS_LEVEL 5 raised the patch with level 0 instead of culling it");
 }
 
-const PatchDraw RecordPatches{{3u, 3u, 1u, 2u, 2u, 1.0f, 64.0f, 63u}, Indices};
+const PatchDraw RecordPatches{{3u, 3u, 1u, 2u, 2u, 63u}, Indices};
 
 void RequirePatchConstants(AgcDriver::VulkanDevice& device, const ShaderRecompiler::SpirvTarget& target) {
     std::uint32_t cursor = 0;
@@ -479,7 +506,7 @@ void RequirePatchConstants(AgcDriver::VulkanDevice& device, const ShaderRecompil
 void RequireRelativePatches(AgcDriver::VulkanDevice& device, const ShaderRecompiler::SpirvTarget& target) {
     const auto center = Row(-0.5f + 1.0f / 3.0f);
     for (const auto& [hull, domain, name] : {std::tuple{std::span<const std::uint32_t>(HullRelativeData), std::span<const std::uint32_t>(DomainPatchRead), "hull"}, std::tuple{std::span<const std::uint32_t>(HullCode), std::span<const std::uint32_t>(DomainRelativeData), "domain"}}) {
-        for (const auto& [patches, blue] : {std::pair{PatchDraw{{3u, 3u, 1u, 2u, 2u, 1.0f, 64.0f, 3u, 3u, true}, Indices}, 96}, std::pair{PatchDraw{{3u, 3u, 1u, 2u, 2u, 1.0f, 64.0f, 2u, 4u, true}, Indices}, 32}, std::pair{PatchDraw{{3u, 3u, 1u, 2u, 2u, 1.0f, 64.0f, 3u, 4u, true}, LatePatchIndices}, 96}, std::pair{PatchDraw{{3u, 3u, 1u, 2u, 2u, 1.0f, 64.0f, 3u, 2u, true}, Indices}, 32}}) {
+        for (const auto& [patches, blue] : {std::pair{PatchDraw{{3u, 3u, 1u, 2u, 2u, 3u, 3u, true}, Indices}, 96}, std::pair{PatchDraw{{3u, 3u, 1u, 2u, 2u, 2u, 4u, true}, Indices}, 32}, std::pair{PatchDraw{{3u, 3u, 1u, 2u, 2u, 3u, 4u, true}, LatePatchIndices}, 96}, std::pair{PatchDraw{{3u, 3u, 1u, 2u, 2u, 3u, 2u, true}, Indices}, 32}}) {
             std::uint32_t cursor = 0;
             const Stages stages{
                 Compile(target, ShaderStage::Local, LocalCode, cursor, patches),
@@ -499,9 +526,9 @@ void RequireRelativePatches(AgcDriver::VulkanDevice& device, const ShaderRecompi
 
 void RequireInstancedRelativePatches(AgcDriver::VulkanDevice& device, const ShaderRecompiler::SpirvTarget& target) {
     const auto center = Row(-0.5f + 1.0f / 3.0f);
-    TessellationConfiguration restarting{3u, 3u, 1u, 2u, 2u, 1.0f, 64.0f, 4u, 8u};
+    TessellationConfiguration restarting{3u, 3u, 1u, 2u, 2u, 4u, 8u};
     restarting.breakAtInstance = true;
-    for (const auto& [patches, first, last] : {std::tuple{PatchDraw{{3u, 3u, 1u, 2u, 2u, 1.0f, 64.0f, 4u, 8u}, Indices, 2u, 1u}, 128, 64}, std::tuple{PatchDraw{{3u, 3u, 1u, 2u, 2u, 1.0f, 64.0f, 3u, 3u}, Indices, 2u, 1u}, 32, 96}, std::tuple{PatchDraw{restarting, Indices, 2u, 1u}, 32, 96}}) {
+    for (const auto& [patches, first, last] : {std::tuple{PatchDraw{{3u, 3u, 1u, 2u, 2u, 4u, 8u}, Indices, 1.0f, 64.0f, 2u, 1u}, 128, 64}, std::tuple{PatchDraw{{3u, 3u, 1u, 2u, 2u, 3u, 3u}, Indices, 1.0f, 64.0f, 2u, 1u}, 32, 96}, std::tuple{PatchDraw{restarting, Indices, 1.0f, 64.0f, 2u, 1u}, 32, 96}}) {
         std::uint32_t cursor = 0;
         const Stages stages{
             Compile(target, ShaderStage::Local, LocalCode, cursor, patches),
@@ -515,7 +542,7 @@ void RequireInstancedRelativePatches(AgcDriver::VulkanDevice& device, const Shad
             Require(pixel[0] == 255 && std::abs(pixel[2] - expected) <= 1, "the patch in column " + std::to_string(patch) + " of an instanced draw with " + std::to_string(patches.configuration.patchesPerGroup) + " patches per group and " + std::to_string(patches.configuration.primitiveGroupSize) + " primitives per group" + (patches.configuration.breakAtInstance ? " and BREAK_WAVE_AT_EOI" : "") + " did not take its blue channel from the hull's relative patch index across instances, " + PixelText(pixel));
         }
     }
-    const PatchDraw shared{{3u, 3u, 1u, 2u, 2u, 1.0f, 64.0f, 4u, 8u}, Indices, 2u, 1u};
+    const PatchDraw shared{{3u, 3u, 1u, 2u, 2u, 4u, 8u}, Indices, 1.0f, 64.0f, 2u, 1u};
     ExpectRefusal(target, ShaderStage::TessellationEvaluation, DomainRelativeData, "domain program uses its relative patch index as data in an instanced draw", shared);
     std::vector<std::uint32_t> capabilities(target.supportedCapabilities.begin(), target.supportedCapabilities.end());
     std::erase(capabilities, static_cast<std::uint32_t>(spv::CapabilityDrawParameters));
@@ -596,7 +623,7 @@ void RequireQuads(AgcDriver::VulkanDevice& device, const ShaderRecompiler::Spirv
     const auto center = Row(0.0f);
     std::array<bool, 2> frontFacing{};
     for (const std::uint32_t topology : {2u, 3u}) {
-        const PatchDraw patches{{4u, 4u, 2u, 2u, topology, 1.0f, 9.0f}, QuadIndices};
+        const PatchDraw patches{{4u, 4u, 2u, 2u, topology}, QuadIndices, 1.0f, 9.0f};
         std::uint32_t cursor = 0;
         const Stages stages{
             Compile(target, ShaderStage::Local, LocalCode, cursor, patches),
@@ -664,6 +691,8 @@ void RequireRegisteredStages() {
     AgcDriverShutdown_nid_postfix();
 }
 
+}
+
 // sceAgcCreatePrimState resolves the hull and domain programs on the title's thread, inside the
 // transaction sceAgcLinkShaders opens. A domain program the recompiler refuses fails that call; with
 // APS5_SKIP_REFUSED_SHADERS the preparation is skipped and the open transaction still commits.
@@ -705,8 +734,6 @@ void RequireRegisteredRefusal() {
     std::puts("registered domain refusal skipped at ABI resolution");
 }
 
-}
-
 int main(int argc, char** argv) {
     try {
         Require(argc == 1 || (argc == 2 && std::string(argv[1]) == "--registered-refusal"), "invalid test arguments");
@@ -714,7 +741,7 @@ int main(int argc, char** argv) {
         if (!device) return VulkanTestSkipped;
         const auto target = device->Target();
         if (!target.tessellation.has_value()) {
-            std::puts("Tessellation tests skipped: the device has no tessellation shaders");
+            std::puts("tessellation: skipped, the device has no tessellation shaders");
             return VulkanTestSkipped;
         }
         if (argc == 2) {
@@ -723,7 +750,8 @@ int main(int argc, char** argv) {
             return 0;
         }
         ExpectRefusal(target, ShaderStage::TessellationControl, HullUnguardedFactors, "not written by control point 0 alone");
-        ExpectRefusal(target, ShaderStage::TessellationControl, HullSquaredAddress, "not affine");
+        ExpectRefusal(target, ShaderStage::TessellationControl, HullSquaredAddress, "not a whole number of control points");
+        ExpectRefusal(target, ShaderStage::TessellationControl, HullHalfSlotIndex, "not a whole number of control points");
         ExpectRefusal(target, ShaderStage::TessellationControl, HullLaneCount, "lane mask");
         ExpectRefusal(target, ShaderStage::TessellationEvaluation, DomainNeighbourRecord, "more than one patch-constant record", RecordPatches);
         ExpectRefusal(target, ShaderStage::TessellationEvaluation, DomainFixedPatchRead, "not indexed by its relative patch", RecordPatches);
@@ -734,14 +762,15 @@ int main(int argc, char** argv) {
         ExpectRefusal(target, ShaderStage::TessellationEvaluation, DomainRelativeData, "GE_CNTL.PRIM_GRP_SIZE is 0", RecordPatches);
         ExpectRefusal(target, ShaderStage::TessellationControl, HullCode, "outside its patch's quad factors", {{3u, 3u, 2u, 2u, 2u}, Indices});
         ExpectRefusal(target, ShaderStage::TessellationControl, HullDescendingRecords, "not affine");
-        ExpectRefusal(target, ShaderStage::TessellationControl, HullDescendingRecords, "not affine", {{3u, 3u, 1u, 2u, 2u, 1.0f, 64.0f, 158u}, Indices});
-        ExpectRefusal(target, ShaderStage::TessellationControl, HullDescendingRecords, "outside its control points and patch constants", {{3u, 3u, 1u, 2u, 2u, 1.0f, 64.0f, 129u}, Indices});
+        ExpectRefusal(target, ShaderStage::TessellationControl, HullDescendingRecords, "not affine", {{3u, 3u, 1u, 2u, 2u, 158u}, Indices});
+        ExpectRefusal(target, ShaderStage::TessellationControl, HullDescendingRecords, "outside its control points and patch constants", {{3u, 3u, 1u, 2u, 2u, 129u}, Indices});
 
         RequirePatches(*device, target, HullCode, "hull program");
         RequirePatches(*device, target, HullRestoredExecSaved, "hull program saving its restored exec");
+        RequirePatches(*device, target, HullDynamicIndex, "hull program reading a control point at a computed index");
         RequirePatches(*device, target, HullAndSaveexec, "hull program narrowing exec with s_and_saveexec_b64");
         RequirePatches(*device, target, HullSaveexecLoop, "hull program restoring exec through loop phis");
-        RequirePatches(*device, target, HullDescendingRecords, "hull program with descending patch records in 128-patch groups", {{3u, 3u, 1u, 2u, 2u, 1.0f, 64.0f, 128u}, Indices});
+        RequirePatches(*device, target, HullDescendingRecords, "hull program with descending patch records in 128-patch groups", {{3u, 3u, 1u, 2u, 2u, 128u}, Indices});
         RequireCounterClockwise(*device, target);
         RequireLevelClamps(*device, target);
         RequireQuads(*device, target);

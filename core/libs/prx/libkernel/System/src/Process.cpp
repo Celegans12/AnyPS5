@@ -19,6 +19,7 @@
 #include "prx/libkernel/DirectMemory/DirectMemory.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
 #include "prx/libkernel/Pthread/include/Pthread.hpp"
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cerrno>
@@ -39,12 +40,18 @@
 #endif
 
 extern "C" int* APS5_VABI __error_nid_postfix();
+extern "C" int APS5_VABI stat_nid_postfix(const char* path, FileStat* sb);
 
 namespace {
 
 constexpr int sceInvalidArgument = static_cast<int>(0x80020016u);
+constexpr int errnoNoSuchProcess = 3;
 constexpr int errnoNoChild = 10;
+constexpr int errnoBadAddress = 14;
 constexpr int errnoInvalidArgument = 22;
+constexpr int freebsdGroupsMax = 1023;
+std::mutex supplementaryGroupsMutex;
+std::vector<std::uint32_t> supplementaryGroups{0};
 constexpr unsigned freebsdWaitOptions = 0x8000003Fu;
 
 std::atomic<std::uint32_t> gpoBits{0};
@@ -107,14 +114,22 @@ ProcessArguments& getProcessArguments() {
     return arguments;
 }
 
-void validateSchedulingPolicy(int policy) {
-    if (policy < 1 || policy > 3)
-        throw std::invalid_argument("Unsupported guest scheduling policy");
+bool hasPriorityRange(int policy) {
+    return policy == 1 || policy == 3;
 }
 
 constexpr int guestFault = 14;
 constexpr int guestInvalid = 22;
+constexpr int guestRlimitCpu = 0;
+constexpr int guestRlimitFsize = 1;
 constexpr int guestRlimitData = 2;
+constexpr int guestRlimitCore = 4;
+constexpr int guestRlimitSbsize = 9;
+constexpr int guestRlimitVmem = 10;
+constexpr int guestRlimitNpts = 11;
+constexpr int guestRlimitSwap = 12;
+constexpr int guestRlimitKqueues = 13;
+constexpr int guestRlimitUmtxp = 14;
 constexpr int guestRlimitCount = 15;
 constexpr std::int64_t guestRlimitInfinity = std::numeric_limits<std::int64_t>::max();
 
@@ -200,6 +215,13 @@ int APS5_VABI getpid_nid_postfix(void) {
     return static_cast<int>(pid);
 }
 
+int APS5_VABI getsid_nid_postfix(int pid) {
+    const int self = getpid_nid_postfix();
+    if (pid == 0 || pid == self) return self;
+    *__error_nid_postfix() = errnoNoSuchProcess;
+    return -1;
+}
+
 int APS5_VABI getppid_nid_postfix(void) {
 #ifdef _WIN32
     const DWORD self = GetCurrentProcessId();
@@ -281,10 +303,56 @@ int APS5_VABI waitpid_nid_postfix(int pid, int* status, int options) {
     return -1;
 }
 
+int APS5_VABI getrlimit_nid_postfix(int resource, GuestResourceLimit* limit);
+
+int APS5_VABI setrlimit_nid_postfix(int resource, const GuestResourceLimit* limit) {
+    if (limit == nullptr) {
+        *__error_nid_postfix() = guestFault;
+        return -1;
+    }
+    if (resource < 0 || resource >= guestRlimitCount) {
+        *__error_nid_postfix() = guestInvalid;
+        return -1;
+    }
+
+    GuestResourceLimit requested = *limit;
+    if (requested.rlim_cur < 0)
+        requested.rlim_cur = guestRlimitInfinity;
+    if (requested.rlim_max < 0)
+        requested.rlim_max = guestRlimitInfinity;
+    if (requested.rlim_cur > requested.rlim_max)
+        requested.rlim_cur = requested.rlim_max;
+
+    GuestResourceLimit current{};
+    getrlimit_nid_postfix(resource, &current);
+    if (requested.rlim_cur != current.rlim_cur || requested.rlim_max != current.rlim_max)
+        throw std::runtime_error("setrlimit: changing the limit of resource " + std::to_string(resource) + " is not supported");
+    return 0;
+}
+
+int APS5_VABI wait_nid_postfix(int* status) {
+    return waitpid_nid_postfix(-1, status, 0);
+}
+
 int APS5_VABI execvp_nid_postfix(const char* file, char* const* arguments) {
     (void)file;
     (void)arguments;
     NotImplemented_nid_no_patch("execvp: executable replacement");
+    return -1;
+}
+
+int APS5_VABI execv_nid_postfix(const char* path, char* const* arguments) {
+    (void)path;
+    (void)arguments;
+    NotImplemented_nid_no_patch("execv: executable replacement");
+    return -1;
+}
+
+int APS5_VABI execve_nid_postfix(const char* path, char* const* arguments, char* const* environment) {
+    (void)path;
+    (void)arguments;
+    (void)environment;
+    NotImplemented_nid_no_patch("execve: executable replacement");
     return -1;
 }
 
@@ -306,6 +374,14 @@ int APS5_VABI sceKernelGetCurrentCpu(void) {
     const auto index = static_cast<unsigned>(cpu);
 #endif
     return GuestCpuFromHost(index, scePthreadSelf()->affinity.load(std::memory_order_relaxed));
+}
+
+int APS5_VABI sceKernelGetMainSocId(void) {
+    return 0;
+}
+
+int APS5_VABI sceKernelGetCpumode(void) {
+    return 0;
 }
 
 std::uint64_t APS5_VABI sceKernelGetGPI(void) {
@@ -346,18 +422,28 @@ void APS5_VABI sync_nid_postfix(void) {
 }
 
 int APS5_VABI sched_get_priority_max_nid_postfix(int policy) {
-    validateSchedulingPolicy(policy);
-    return 256;
+    if (!hasPriorityRange(policy)) {
+        *__error_nid_postfix() = guestInvalid;
+        return -1;
+    }
+    return 767;
 }
 
 int APS5_VABI sched_get_priority_min_nid_postfix(int policy) {
-    validateSchedulingPolicy(policy);
-    return 767;
+    if (!hasPriorityRange(policy)) {
+        *__error_nid_postfix() = guestInvalid;
+        return -1;
+    }
+    return 256;
 }
 
 int APS5_VABI getrusage_nid_postfix(int who, GuestResourceUsage* usage) {
     if (usage == nullptr)
         throw std::invalid_argument("getrusage: usage is null");
+    if (who == -1) {
+        *usage = {};
+        return 0;
+    }
     if (who != 0 && who != 1)
         throw std::invalid_argument("getrusage: unsupported who");
 #ifdef _WIN32
@@ -430,32 +516,47 @@ int APS5_VABI getrlimit_nid_postfix(int resource, GuestResourceLimit* limit) {
         *__error_nid_postfix() = guestFault;
         return -1;
     }
-    if (resource != guestRlimitData)
-        throw std::runtime_error("getrlimit: unsupported resource " + std::to_string(resource));
+    switch (resource) {
+    case guestRlimitData: {
 #ifdef _WIN32
-    const std::int64_t memory = hostMemoryLimit();
-    limit->rlim_cur = memory;
-    limit->rlim_max = memory;
+        const std::int64_t memory = hostMemoryLimit();
+        limit->rlim_cur = memory;
+        limit->rlim_max = memory;
 #else
-    rlimit native{};
-    if (::getrlimit(RLIMIT_DATA, &native) != 0)
-        throw std::system_error(errno, std::generic_category(), "getrlimit: getrlimit failed");
-    limit->rlim_cur = toGuestLimit(native.rlim_cur);
-    limit->rlim_max = toGuestLimit(native.rlim_max);
+        rlimit native{};
+        if (::getrlimit(RLIMIT_DATA, &native) != 0)
+            throw std::system_error(errno, std::generic_category(), "getrlimit: getrlimit failed");
+        limit->rlim_cur = toGuestLimit(native.rlim_cur);
+        limit->rlim_max = toGuestLimit(native.rlim_max);
 #endif
-    return 0;
+        return 0;
+    }
+    case guestRlimitCpu:
+    case guestRlimitFsize:
+    case guestRlimitCore:
+    case guestRlimitSbsize:
+    case guestRlimitVmem:
+    case guestRlimitNpts:
+    case guestRlimitSwap:
+    case guestRlimitKqueues:
+    case guestRlimitUmtxp:
+        limit->rlim_cur = guestRlimitInfinity;
+        limit->rlim_max = guestRlimitInfinity;
+        return 0;
+    default:
+        throw std::runtime_error("getrlimit: unsupported resource " + std::to_string(resource));
+    }
 }
 
 int APS5_VABI sceKernelIsTrinityMode(void) {
     return 0;
 }
 
-int APS5_VABI sceKernelGetOperationMode(int* mode, int* submode) {
+void APS5_VABI sceKernelGetOperationMode(int* mode, int* submode) {
     if (!mode || !submode)
         throw std::invalid_argument("sceKernelGetOperationMode: null output");
-    *mode = 0;
+    *mode = 2;
     *submode = 0;
-    return 0;
 }
 
 int APS5_VABI seteuid_nid_postfix(std::uint32_t euid) {
@@ -468,6 +569,66 @@ int APS5_VABI setegid_nid_postfix(std::uint32_t egid) {
     if (egid != 0)
         throw std::runtime_error("setegid: unsupported group id " + std::to_string(egid));
     return 0;
+}
+
+int APS5_VABI setuid_nid_postfix(std::uint32_t uid) {
+    if (uid != 0)
+        throw std::runtime_error("setuid: unsupported user id " + std::to_string(uid));
+    return 0;
+}
+
+int APS5_VABI setreuid_nid_postfix(std::uint32_t ruid, std::uint32_t euid) {
+    constexpr std::uint32_t unchanged = 0xffffffffu;
+    if (ruid != 0 && ruid != unchanged)
+        throw std::runtime_error("setreuid: unsupported real user id " + std::to_string(ruid));
+    if (euid != 0 && euid != unchanged)
+        throw std::runtime_error("setreuid: unsupported effective user id " + std::to_string(euid));
+    return 0;
+}
+
+int APS5_VABI setregid_nid_postfix(std::uint32_t rgid, std::uint32_t egid) {
+    constexpr std::uint32_t unchanged = 0xffffffffu;
+    if (rgid != 0 && rgid != unchanged)
+        throw std::runtime_error("setregid: unsupported real group id " + std::to_string(rgid));
+    if (egid != 0 && egid != unchanged)
+        throw std::runtime_error("setregid: unsupported effective group id " + std::to_string(egid));
+    return 0;
+}
+
+int APS5_VABI setgroups_nid_postfix(int count, const std::uint32_t* groups) {
+    if (count < 0 || count > freebsdGroupsMax) {
+        *__error_nid_postfix() = errnoInvalidArgument;
+        return -1;
+    }
+    if (count > 0 && groups == nullptr) {
+        *__error_nid_postfix() = errnoBadAddress;
+        return -1;
+    }
+    if (count > 0 && groups[0] != 0)
+        throw std::runtime_error("setgroups: unsupported effective group id " + std::to_string(groups[0]));
+    std::lock_guard lock(supplementaryGroupsMutex);
+    if (count == 0) {
+        supplementaryGroups.resize(1);
+        return 0;
+    }
+    supplementaryGroups.assign(groups, groups + count);
+    return 0;
+}
+
+int APS5_VABI getgroups_nid_postfix(int capacity, std::uint32_t* groups) {
+    std::lock_guard lock(supplementaryGroupsMutex);
+    const int count = static_cast<int>(supplementaryGroups.size());
+    if (capacity == 0) return count;
+    if (capacity < count) {
+        *__error_nid_postfix() = errnoInvalidArgument;
+        return -1;
+    }
+    if (groups == nullptr) {
+        *__error_nid_postfix() = errnoBadAddress;
+        return -1;
+    }
+    std::copy(supplementaryGroups.begin(), supplementaryGroups.end(), groups);
+    return count;
 }
 
 }

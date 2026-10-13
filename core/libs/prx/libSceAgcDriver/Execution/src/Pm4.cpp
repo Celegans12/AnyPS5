@@ -249,7 +249,7 @@ void Validate(std::span<const std::uint32_t> packet, std::uint32_t queue) {
                 require((packet[1] & 0xffff0000u) != 0x68750000u, "typed user-data and legacy flip markers are not implemented");
                 break;
             case 0x09: size(2); break;
-            case 0x06: graphics(); size(4); require(packet[3] == 0, "unsupported rendering wait mode"); break;
+            case 0x06: size(4); require(packet[3] == 0, "unsupported rendering wait mode"); break;
             case 0x0b: {
                 const auto data = std::as_bytes(packet.subspan(1));
                 require(std::find(data.begin(), data.end(), std::byte{}) != data.end(), "unterminated marker text");
@@ -453,7 +453,7 @@ void Validate(std::span<const std::uint32_t> packet, std::uint32_t queue) {
             require(packet.size() >= 5, "WRITE_DATA has no data");
             require((packet[1] & ~(0x40110f00u | WriteDataCachePolicy)) == 0, "WRITE_DATA engine or reserved fields are not implemented");
             const auto destination = (packet[1] >> 8u) & 0xfu;
-            require(destination == 1 || destination == 2 || destination == 5, "WRITE_DATA register or GDS destination is not implemented");
+            require(destination == 1 || destination == 2 || destination == 3 || destination == 5, "WRITE_DATA register destination is not implemented");
             require((packet[2] & 3u) == 0, "misaligned WRITE_DATA destination");
             break;
         }

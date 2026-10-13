@@ -10,6 +10,7 @@
 extern "C" {
 FileStream* APS5_VABI _ZSt7_FiopenPKcNSt5_IosbIiE9_OpenmodeEi_nid_postfix(const char*, int, int);
 FileStream* APS5_VABI fopen_nid_postfix(const char*, const char*);
+int APS5_VABI fopen_s_nid_postfix(FileStream**, const char*, const char*);
 int APS5_VABI fclose_nid_postfix(FileStream*);
 std::int64_t APS5_VABI ftello_nid_postfix(FileStream*);
 }
@@ -24,6 +25,8 @@ static void Check(bool value, int line) {
 
 constexpr int In = 0x01, Out = 0x02, Ate = 0x04, App = 0x08, Trunc = 0x10, Nocreate = 0x20, Noreplace = 0x40,
     Binary = 0x80;
+constexpr int GuestEinval = 22;
+constexpr int GuestEnoent = 2;
 
 static FileStream* Open(const char* name, int mode) {
     return _ZSt7_FiopenPKcNSt5_IosbIiE9_OpenmodeEi_nid_postfix(name, mode, 0x1b6);
@@ -65,6 +68,21 @@ int main() {
 
     Write(Open(file, Out), "abc");
     Require(Contents(file) == "abc");
+
+    FileStream* checkedStream = &_Stdout_nid_postfix;
+    Require(fopen_s_nid_postfix(&checkedStream, nullptr, "rb") == GuestEinval);
+    Require(checkedStream == nullptr);
+    checkedStream = &_Stderr_nid_postfix;
+    Require(fopen_s_nid_postfix(&checkedStream, file, nullptr) == GuestEinval);
+    Require(checkedStream == nullptr);
+    Require(fopen_s_nid_postfix(nullptr, file, "rb") == GuestEinval);
+    checkedStream = &_Stdout_nid_postfix;
+    Require(fopen_s_nid_postfix(&checkedStream, file, "rb") == 0);
+    Require(checkedStream != nullptr);
+    Require(fclose_nid_postfix(checkedStream) == 0);
+    checkedStream = &_Stdout_nid_postfix;
+    Require(fopen_s_nid_postfix(&checkedStream, missing, "rb") == GuestEnoent);
+    Require(checkedStream == nullptr);
 
     auto* stream = Open(file, In);
     Require(stream != nullptr && std::fgetc(stream->GetHandle()) == 'a');
@@ -130,6 +148,14 @@ int main() {
     stream = Open(file, In | 0x100 | 0x8000);
     Require(stream != nullptr && std::fgetc(stream->GetHandle()) == 'k');
     fclose_nid_postfix(stream);
+
+#ifndef _WIN32
+    auto* full = std::fopen("/dev/full", "wb");
+    Require(full != nullptr);
+    auto* fullStream = new FileStream(full, true);
+    Require(std::fwrite("buffered", 1, 8, full) == 8);
+    Require(fclose_nid_postfix(fullStream) == EOF);
+#endif
 
     std::filesystem::remove_all(dir);
     return 0;

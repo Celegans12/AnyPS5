@@ -10,6 +10,7 @@
 #include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Query.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
+#include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
 #include "prx/libkernel/Equeue/Equeue.hpp"
 #include <array>
 #include <algorithm>
@@ -22,6 +23,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 #ifdef _WIN32
@@ -108,6 +110,17 @@ void testValidation() {
     expectFailure([&] { sceAgcDriverSubmitDcb(&packet); });
     packet.addr = reinterpret_cast<std::uint32_t*>(0x1000);
     expectFailure([&] { sceAgcDriverSubmitDcb(&packet); });
+    AgcDriverWaitIdle_nid_postfix();
+}
+
+void testReadOnlyResummarize() {
+    std::vector<std::uint32_t> commands;
+    for (const auto [offset, value] : {std::pair{0x000u, 0x10u}, {0x200u, 0x007007f3u}, {0x010u, 0xa0000183u}, {0x011u, 0x20000180u}, {0x8eu, 0xffffffffu}, {0x8fu, 0u}, {0x1c4u, 0u}, {0x203u, 0u}}) {
+        commands.insert(commands.end(), {0xc0016900u, offset, value});
+    }
+    commands.insert(commands.end(), {0xc0012d00u, 3u, 2u});
+    Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
+    check(sceAgcDriverSubmitDcb(&packet) == 0, "read-only resummarize submission failed");
     AgcDriverWaitIdle_nid_postfix();
 }
 
@@ -199,6 +212,22 @@ void testEndOfPipeInterrupts() {
     check(sceAgcDriverSubmitDcb(&packet) == 0, "plain release submit failed");
     AgcDriverWaitIdle_nid_postfix();
     check(owner->GetTriggeredEvents(events.data(), 2) == 0, "release without INT_SEL raised an interrupt");
+    struct Output final : AgcDriver::IVideoOutput, AgcDriver::IFlipRequest, std::enable_shared_from_this<Output> {
+        std::atomic<int> ready{0};
+        std::shared_ptr<AgcDriver::IFlipRequest> Reserve(const AgcDriver::FlipInfo&) override { return shared_from_this(); }
+        void GpuReady(const std::shared_ptr<AgcDriver::FrameTiming>&) override { ready.fetch_add(1); }
+        void Fail(std::exception_ptr error) noexcept override { if (!error) std::terminate(); }
+    };
+    const auto output = std::make_shared<Output>();
+    AgcDriverRegisterVideoOutput_nid_postfix(7, output);
+    std::array<std::uint32_t, 6> flip{AgcDriver::FlipPacketHeader, 7, 0xfffffffeu, 1, 0, 0};
+    Packet flipPacket{flip.data(), static_cast<std::uint32_t>(flip.size()), 0, {}};
+    check(sceAgcDriverSubmitDcb(&flipPacket) == 0, "flip submit failed");
+    AgcDriverWaitIdle_nid_postfix();
+    check(output->ready.load() == 1, "flip was not handed to its output");
+    check(owner->GetTriggeredEvents(events.data(), 2) == 1 && events[0].udata == &graphicsTag && events[0].data == 1 && sceAgcDriverGetEqEventType(events.data()) == 0, "flip did not raise the graphics end-of-pipe event");
+    check(owner->GetTriggeredEvents(events.data(), 2) == 0, "flip event was not cleared");
+    AgcDriverUnregisterVideoOutput_nid_postfix(7, output);
     alignas(8) static volatile std::uint64_t label = 0;
     const auto labelAddress = reinterpret_cast<std::uintptr_t>(&label);
     words = {0xc0064900, 0x528, (3u << 29u) | (3u << 24u) | (1u << 16u), static_cast<std::uint32_t>(labelAddress), static_cast<std::uint32_t>(static_cast<std::uint64_t>(labelAddress) >> 32u), 0x89abcdefu, 0x01234567u, 0};
@@ -629,6 +658,30 @@ void testProgramWorkgroupUse() {
     check(!AgcDriver::DriverDetail::ProgramUsesWorkgroup(entry, 2) && AgcDriver::DriverDetail::ProgramUsesWorkgroup(entry, 0), "the workgroup check did not start at the program's entry");
 }
 
+void testRegisteredVertexWorkgroupRouting() {
+    using namespace AgcDriver::DriverDetail;
+    ShaderSnapshot snapshot{0x20000, 0x30000, 2, {0xd8340000u, 0x00000100u, 0xbf810000u, 0xbf810000u}, {}};
+    snapshot.header.resize(sizeof(Shader));
+    const ShaderRegistry registry{{snapshot.codeAddress, {std::make_shared<const ShaderSnapshot>(std::move(snapshot))}}};
+    AgcDriver::QueueState queue{};
+    queue.shader = {{0xc8, 0x200}, {0xc9, 0}};
+    queue.context[0x2d5] = 0x2000;
+    check(VertexWorkgroupRequired(queue, registry), "a registered NGG vertex program using LDS did not need a workgroup");
+    for (const auto routing : {0u, 0x2020u, 0x2004u, 0x02002000u}) {
+        queue.context[0x2d5] = routing;
+        check(!VertexWorkgroupRequired(queue, registry), "legacy, geometry, tessellation or passthrough routing changed to an NGG vertex workgroup");
+    }
+    queue.context[0x2d5] = 0x2000;
+    auto unaligned = registry;
+    const auto aligned = unaligned.begin()->second.front();
+    ShaderSnapshot shifted{0x1ffff, 0x30000, 2, aligned->code, aligned->header};
+    unaligned.clear();
+    unaligned[shifted.codeAddress].push_back(std::make_shared<const ShaderSnapshot>(std::move(shifted)));
+    check(expectFailure([&] { static_cast<void>(VertexWorkgroupRequired(queue, unaligned)); }).find("not dword aligned") != std::string::npos, "an unaligned registered entry was accepted");
+    queue.shader[0xc9] = 0x100;
+    check(expectFailure([&] { static_cast<void>(VertexWorkgroupRequired(queue, registry)); }).find("reserved graphics program address") != std::string::npos, "reserved NGG program address bits were accepted");
+}
+
 void testWorkerFailure() {
     std::array<std::uint32_t, 5> words{0xc0031500, 1, 1, 1, 0x41};
     Packet packet{words.data(), static_cast<std::uint32_t>(words.size()), 0, {}};
@@ -647,8 +700,14 @@ void testWorkerFailure() {
 
 }
 
-int main() {
+int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--readonly-resummarize") {
+            testReadOnlyResummarize();
+            LibcRunShutdown_nid_postfix();
+            std::puts("Read-only resummarize submission passed");
+            return 0;
+        }
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         alignas(256) std::array<std::uint32_t, 64> rawCode{};
@@ -722,6 +781,7 @@ int main() {
 #endif
         testProgramSnapshots();
         testProgramWorkgroupUse();
+        testRegisteredVertexWorkgroupRouting();
         testEvents();
         testValidation();
         testClearState();
@@ -741,6 +801,7 @@ int main() {
         testHeaderWithoutProgramAddress();
         testCopyIntoHostMemory();
         testRegisteredFloatMode();
+        testReadOnlyResummarize();
         testWorkerFailure();
         check(expectFailure([] { LibcRunShutdown_nid_postfix(); }).find("required shader register") != std::string::npos, "shutdown lost worker failure");
         std::puts("AGC driver submit tests passed");

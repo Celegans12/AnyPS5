@@ -1,5 +1,8 @@
 import argparse
+import hashlib
 import os
+import operator
+import shlex
 import shutil
 import struct
 import subprocess
@@ -33,15 +36,23 @@ def tool(name):
 
 
 def oracle():
-    binary = CACHE / "oracle"
     source = HERE / "oracle.c"
-    if binary.exists() and binary.stat().st_mtime >= source.stat().st_mtime:
+    compiler = shlex.split(os.environ.get("CC", "cc"))
+    if not compiler:
+        raise ValueError("CC must name a compiler command")
+    root = rocm_root()
+    if root is not None:
+        root = root.resolve()
+    configuration = repr((compiler, str(root))).encode("utf-8")
+    key = hashlib.sha256(source.read_bytes() + configuration).hexdigest()
+    directory = CACHE / key
+    binary = directory / "oracle"
+    if binary.is_file():
         return binary
-    CACHE.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(dir=CACHE) as tmp:
+    directory.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=directory) as tmp:
         output = Path(tmp) / "oracle"
-        command = [os.environ.get("CC", "cc"), "-O1", str(source), "-o", str(output)]
-        root = rocm_root()
+        command = [*compiler, "-O1", str(source), "-o", str(output)]
         if root:
             lib = root / "lib"
             command += [f"-I{root / 'include'}", f"-L{lib}", f"-Wl,-rpath,{lib}"]
@@ -50,9 +61,15 @@ def oracle():
     return binary
 
 
+
+
 @cache
+def detected_target(binary):
+    return subprocess.run([binary, "--target"], capture_output=True, text=True, check=True).stdout.strip()
+
+
 def target():
-    return os.environ.get("HW_ORACLE_TARGET") or subprocess.run([oracle(), "--target"], capture_output=True, text=True, check=True).stdout.strip()
+    return os.environ.get("HW_ORACLE_TARGET") or detected_target(oracle())
 
 
 def assemble(body, work, wave64, *, ieee, denorm32, denorm16, dx10_clamp, round32, round16, fp16_overflow, lds=DEFAULT_LDS):
@@ -77,7 +94,16 @@ def assemble(body, work, wave64, *, ieee, denorm32, denorm16, dx10_clamp, round3
 
 
 def run(body, rows, extra=b"", wave64=False, coarse=False, *, ieee, denorm32, denorm16, dx10_clamp, round32, round16, fp16_overflow, lds=DEFAULT_LDS):
-    rows = [tuple(r) for r in rows]
+    validated = []
+    for index, row in enumerate(rows, 1):
+        try:
+            values = tuple(operator.index(value) for value in row)
+        except TypeError as error:
+            raise ValueError(f"row {index} needs 4 unsigned 32-bit integers") from error
+        if len(values) != 4 or any(value < 0 or value > 0xffffffff for value in values):
+            raise ValueError(f"row {index} needs 4 unsigned 32-bit integers")
+        validated.append(values)
+    rows = validated
     wave = 64 if wave64 else 32
     padded = rows + [(0, 0, 0, 0)] * (-len(rows) % wave)
     env = dict(os.environ)
@@ -99,6 +125,13 @@ def run(body, rows, extra=b"", wave64=False, coarse=False, *, ieee, denorm32, de
     return out[:len(rows)]
 
 
+def parse_word(value):
+    try:
+        return int(value, 0)
+    except ValueError:
+        return int(value, 10)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run an RDNA kernel body on the local AMD GPU, one input row per lane.")
     parser.add_argument("body", type=Path, help="assembly inserted into template.s")
@@ -116,7 +149,7 @@ def main():
     parser.add_argument("--extra", type=Path, help="bytes appended after the rows")
     parser.add_argument("--outs", type=int, choices=range(1, 17), default=16, metavar="N", help="print v10..v(10+N-1)")
     args = parser.parse_args()
-    rows = [tuple(int(v, 0) for v in line.split()) for line in args.rows.read_text().splitlines() if line.strip()]
+    rows = [tuple(parse_word(v) for v in line.split()) for line in args.rows.read_text().splitlines() if line.strip()]
     if any(len(r) != 4 for r in rows):
         sys.exit("every row needs 4 values")
     extra = args.extra.read_bytes() if args.extra else b""

@@ -35,6 +35,7 @@ struct Amd64OnlyMatch {
     std::size_t ReturnBranchOffset;
     bool Optional = false;
     std::vector<StubRelocation> Relocations = {};
+    bool RelocatableWindow = false;
 };
 
 struct Amd64OnlySubstitutionReport {

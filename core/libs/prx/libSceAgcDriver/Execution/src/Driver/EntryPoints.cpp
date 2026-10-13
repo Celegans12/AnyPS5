@@ -130,16 +130,22 @@ extern "C" void AgcDriverResolveShaderAbi_nid_postfix(const Shader* shader, std:
     AgcDriver::DriverDetail::Driver::Get().ResolveShaderAbi(shader, context, primitive);
 } catch (const AgcDriver::DriverDetail::ShaderRefusal& refusal) {
     AgcDriver::DriverDetail::Driver::SkipRefusedPreparation(refusal);
+} catch (const ProcessShutdown&) {
+    LibcAwaitExit_nid_postfix();
 }
 
 extern "C" void AgcDriverResolveGraphicsAbi_nid_postfix(const Shader* vertex, const Shader* pixel, std::uint32_t primitiveType) try {
     AgcDriver::DriverDetail::Driver::Get().ResolveGraphicsAbi(vertex, pixel, primitiveType);
 } catch (const AgcDriver::DriverDetail::ShaderRefusal& refusal) {
     AgcDriver::DriverDetail::Driver::SkipRefusedPreparation(refusal);
+} catch (const ProcessShutdown&) {
+    LibcAwaitExit_nid_postfix();
 }
 
 extern "C" void AgcDriverResolveGraphicsStagesAbi_nid_postfix(std::span<const Shader* const> stages, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive) try {
     AgcDriver::DriverDetail::Driver::Get().ResolveGraphicsStagesAbi(stages, context, primitive);
 } catch (const AgcDriver::DriverDetail::ShaderRefusal& refusal) {
     AgcDriver::DriverDetail::Driver::SkipRefusedPreparation(refusal);
+} catch (const ProcessShutdown&) {
+    LibcAwaitExit_nid_postfix();
 }

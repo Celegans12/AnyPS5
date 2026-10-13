@@ -54,6 +54,7 @@ bool g_disassemble = false;
 bool g_assembly = false;
 bool g_memory = false;
 bool g_spirv = false;
+bool g_prepare = false;
 bool g_graph = false;
 bool g_maintenance8 = false;
 bool g_code = false;
@@ -460,6 +461,16 @@ bool Replay(const char* path, std::unique_ptr<AgcDriver::VulkanDevice>& device) 
         std::printf("  resource analysis failed: %s\n", FirstLine(error.what()).c_str());
         return false;
     }
+    if (g_prepare) {
+        try {
+            const auto handle = ShaderRecompiler::PrepareShader(request.request);
+            std::printf("  prepared: %zu SPIR-V words\n", ShaderRecompiler::GetPreparedArtifact(*handle).spirv.Words().size());
+            return true;
+        } catch (const std::exception& error) {
+            std::printf("  prepare failed: %s\n", FirstLine(error.what()).c_str());
+            return false;
+        }
+    }
     try {
         if (g_maintenance8) request.request.target.nonConstantImageOffsets = true;
         if (g_prepareOnly) {
@@ -544,7 +555,7 @@ bool Replay(const char* path, std::unique_ptr<AgcDriver::VulkanDevice>& device) 
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] [--code] [--maintenance8] [--prepare-only | --pipeline-only --pipeline-cache DIR [--expect-spv FILE | --no-reference]] <shader.req>...\n  --prepare-only plans and compiles without materializing runtime memory\n  --pipeline-only recompiles captured compute inputs and creates the native pipeline without guest resources or dispatch\n  --pipeline-cache selects an existing private cache directory; __GL_SHADER_DISK_CACHE_PATH must select a separate fresh empty directory\n  --expect-spv requires byte equality with an ordinary replay before device creation (one request); without it each\n    request needs the .fp sidecar APS5_PIPELINE_REQUESTS saved next to it, and its pipeline fingerprint must match\n  --no-reference skips that check (requests from older runs); a hit in the game's pipeline cache then proves the match\n  several requests share one device and cache; each success prints a PIPELINE-RESULT line\n  --fingerprint-variants prints the pipeline fingerprint components of each way to materialize a request against its .fp\n    (--describe adds the values: specialization constants, bindings)\n  --native-target replaces a captured compute target with this device's (requests from builds with another target) and names the fields that differed\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set\n");
+        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] [--prepare] [--code] [--maintenance8] [--prepare-only | --pipeline-only --pipeline-cache DIR [--expect-spv FILE | --no-reference]] <shader.req>...\n  --prepare replays the request as a prepared artifact\n  --prepare-only plans and compiles without materializing runtime memory\n  --pipeline-only recompiles captured compute inputs and creates the native pipeline without guest resources or dispatch\n  --pipeline-cache selects an existing private cache directory; __GL_SHADER_DISK_CACHE_PATH must select a separate fresh empty directory\n  --expect-spv requires byte equality with an ordinary replay before device creation (one request); without it each\n    request needs the .fp sidecar APS5_PIPELINE_REQUESTS saved next to it, and its pipeline fingerprint must match\n  --no-reference skips that check (requests from older runs); a hit in the game's pipeline cache then proves the match\n  several requests share one device and cache; each success prints a PIPELINE-RESULT line\n  --fingerprint-variants prints the pipeline fingerprint components of each way to materialize a request against its .fp\n    (--describe adds the values: specialization constants, bindings)\n  --native-target replaces a captured compute target with this device's (requests from builds with another target) and names the fields that differed\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set\n");
         return 2;
     }
     try {
@@ -592,6 +603,10 @@ int main(int argc, char** argv) {
         }
         if (std::string(argv[i]) == "--code") {
             g_code = true;
+            continue;
+        }
+        if (std::string(argv[i]) == "--prepare") {
+            g_prepare = true;
             continue;
         }
         if (std::string(argv[i]) == "--spv") {

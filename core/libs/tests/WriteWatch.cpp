@@ -41,13 +41,14 @@ struct Region {
     std::uintptr_t Address(std::size_t index) const {
         return reinterpret_cast<std::uintptr_t>(base) + index * page;
     }
-    std::set<std::size_t> Collect() {
+    using Collector = bool (*)(std::uintptr_t, std::size_t, void (*)(void*, std::uintptr_t, std::uintptr_t), void*);
+    std::set<std::size_t> Collect(Collector collector = &GuestWriteWatchCollect_nid_postfix, std::size_t first = 0, std::size_t count = 0) {
         std::set<std::size_t> pages;
         struct Sink {
             Region* region;
             std::set<std::size_t>* pages;
         } sink{this, &pages};
-        const bool complete = GuestWriteWatchCollect_nid_postfix(Address(0), bytes, [](void* context, std::uintptr_t begin, std::uintptr_t end) {
+        const bool complete = collector(Address(first), count == 0 ? bytes - first * page : count * page, [](void* context, std::uintptr_t begin, std::uintptr_t end) {
             auto& target = *static_cast<Sink*>(context);
             for (auto at = begin; at < end; at += target.region->page) target.pages->insert((at - target.region->Address(0)) / target.region->page);
         }, &sink);
@@ -81,6 +82,29 @@ void CheckCollect() {
     Require(region.base[3 * region.page + 17] == 1 && region.base[5 * region.page + 9] == 3, "watched writes were lost");
     std::memset(region.base + region.page - 4, 7, 8);
     Require(region.Collect() == std::set<std::size_t>({0, 1}), "a write across a page boundary is not reported on both pages");
+}
+
+void CheckFresh() {
+    Region region(8);
+    GuestWriteWatchRegister_nid_postfix(region.base, region.bytes);
+    Require(region.Collect(&GuestWriteWatchCollect_nid_postfix, 0, 4) == All(4), "the collected half is not reported in full");
+    region.base[region.page] = 1;
+    Require(region.Collect(&GuestWriteWatchCollectFresh_nid_postfix) == std::set<std::size_t>({4, 5, 6, 7}), "a fresh collection does not report exactly the never collected pages");
+    Require(region.Collect(&GuestWriteWatchCollectFresh_nid_postfix).empty(), "a fresh collection reports pages again");
+    region.base[6 * region.page] = 1;
+    Require(region.Collect() == std::set<std::size_t>({1, 6}), "a fresh collection does not arm the pages it reports");
+    Require(region.Collect().empty(), "collected writes are reported again");
+}
+
+void CheckArmed() {
+    Region region(8);
+    GuestWriteWatchRegister_nid_postfix(region.base, region.bytes);
+    Require(region.Collect(&GuestWriteWatchCollect_nid_postfix, 0, 4) == All(4), "the collected half is not reported in full");
+    region.base[region.page] = 1;
+    region.base[6 * region.page] = 1;
+    Require(region.Collect(&GuestWriteWatchCollectArmed_nid_postfix) == std::set<std::size_t>({1}), "an armed collection does not report exactly the written armed pages");
+    Require(region.Collect() == std::set<std::size_t>({4, 5, 6, 7}), "an armed collection takes never collected pages");
+    Require(region.Collect().empty(), "collected writes are reported again");
 }
 
 void CheckRegisterAgain() {
@@ -208,9 +232,11 @@ void CheckThreads() {
 
 int main(int argc, char** argv) {
     try {
-        Require(argc == 2, "expected collect, register, mapped, host, protection or threads");
+        Require(argc == 2, "expected collect, fresh, armed, register, mapped, host, protection or threads");
         const std::string_view mode(argv[1]);
         if (mode == "collect") CheckCollect();
+        else if (mode == "fresh") CheckFresh();
+        else if (mode == "armed") CheckArmed();
         else if (mode == "register") CheckRegisterAgain();
         else if (mode == "mapped") CheckRegisterMapped();
         else if (mode == "host") CheckHostWrite();

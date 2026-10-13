@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstring>
 #include <new>
+#include <stdexcept>
 #include <vector>
 
 #include "prx/libSceFont/include/FontInternal.hpp"
@@ -63,10 +64,11 @@ struct FontWritingData {
     bool hasCurrentStep = false;
     bool maskFormatCharacters = true;
     bool ownsStorage = false;
+    bool hasRawGlyphMetrics = false;
     FontWritingStep step{};
     FontWritingMetrics metrics{};
     FontGlyphMetrics rawGlyphMetrics{};
-    bool hasRawGlyphMetrics = false;
+    FontWritingLetterStep letterStep{};
 };
 
 static_assert(sizeof(FontWritingData) <= sizeof(FontWriting));
@@ -491,6 +493,16 @@ int APS5_VABI sceFontCharacterGetBidiLevel(const FontTextCharacter* textCharacte
     return SCE_FONT_OK;
 }
 
+int APS5_VABI sceFontCharacterGetSyllableStringState(const FontTextCharacter* textCharacter, int* syllableStringState) {
+    if (!textCharacter || !syllableStringState) {
+        if (syllableStringState) *syllableStringState = 0;
+        return SCE_FONT_ERROR_INVALID_PARAMETER;
+    }
+    if (textCharacter->characterCode >= 0x0E00 && textCharacter->characterCode <= 0x0E7F) throw std::runtime_error("libSceFont: sceFontCharacterGetSyllableStringState for Thai syllable clusters is not implemented");
+    *syllableStringState = 0;
+    return SCE_FONT_OK;
+}
+
 int APS5_VABI sceFontCharacterGetTextFontCode(const FontTextCharacter* textCharacter, FontHandle* pFontHandle, std::uint32_t* textCode) {
     if (!textCharacter) {
         if (pFontHandle) *pFontHandle = nullptr;
@@ -596,21 +608,22 @@ const FontWritingStep* APS5_VABI sceFontWritingRefersRenderStep(FontWriting* fon
     return &writing->step;
 }
 
-FontTextCharacter* APS5_VABI sceFontWritingRefersRenderStepCharacter(FontWriting* fontWriting, FontWritingLetterStep* letterStep) {
-    if (letterStep) std::memset(letterStep, 0, sizeof(*letterStep));
+FontTextCharacter* APS5_VABI sceFontWritingRefersRenderStepCharacter(FontWriting* fontWriting, const FontWritingLetterStep** pLetterStep) {
+    if (pLetterStep) *pLetterStep = nullptr;
     auto* writing = GetWritingData(fontWriting);
     if (!writing || !writing->hasCurrentStep || !writing->storage || writing->currentIndex >= writing->storage->characters.size()) return nullptr;
-    if (letterStep) {
-        letterStep->x = writing->step.x;
-        letterStep->y = writing->step.y;
-        letterStep->advanceX = writing->step.advanceX;
-        letterStep->advanceY = writing->step.advanceY;
-        letterStep->Components.textsCount = 1;
-        letterStep->Components.textsIndex = static_cast<std::uint32_t>(writing->currentIndex);
-        letterStep->Components.glyphsCount = 1;
-        letterStep->Components.glyphsIndex = static_cast<std::uint32_t>(writing->currentIndex);
-        letterStep->Components.characterTextCount = static_cast<std::uint8_t>(std::max<std::uint32_t>(writing->step.Profile.characterCount, 1));
-    }
+    auto& letterStep = writing->letterStep;
+    letterStep = {};
+    letterStep.x = writing->step.x;
+    letterStep.y = writing->step.y;
+    letterStep.advanceX = writing->step.advanceX;
+    letterStep.advanceY = writing->step.advanceY;
+    letterStep.Components.textsCount = 1;
+    letterStep.Components.textsIndex = static_cast<std::uint32_t>(writing->currentIndex);
+    letterStep.Components.glyphsCount = 1;
+    letterStep.Components.glyphsIndex = static_cast<std::uint32_t>(writing->currentIndex);
+    letterStep.Components.characterTextCount = static_cast<std::uint8_t>(std::max<std::uint32_t>(writing->step.Profile.characterCount, 1));
+    if (pLetterStep) *pLetterStep = &letterStep;
     return &writing->storage->characters[writing->currentIndex];
 }
 

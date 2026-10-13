@@ -12,6 +12,7 @@
 #include "SDL_vulkan.h"
 #include "prx/libSceVideoOut/include/PadInput.hpp"
 #include "prx/libSceVideoOut/include/MouseInput.hpp"
+#include "prx/libSceAgcDriver/Execution/include/AspectFit.hpp"
 #include "prx/libSceVideoOut/include/KeyboardInput.hpp"
 #include "prx/libScePad/include/PadState.hpp"
 #include "prx/libkernel/Equeue/Equeue.hpp"
@@ -84,7 +85,7 @@ void resolveFlipBuffer(FlipRequest& request, const VideoOutConfig& cfg) {
         return;
     }
     require(request.buffer.groupIndex < VIDEO_OUT_BUFFER_ATTRIBUTE_NUM_MAX, "invalid buffer group");
-    request.group = cfg.groups[request.buffer.groupIndex];
+    if (!request.groupCaptured) request.group = cfg.groups[request.buffer.groupIndex];
     require(request.group.occupied, "buffer group is not registered");
     require(request.buffer.dataAddress != 0, "null registered buffer address");
     static_cast<void>(DescribeVideoOutBuffer(request.buffer, request.group));
@@ -152,6 +153,10 @@ public:
         ++queue->reservations;
         ++cfg->flipStatus.flipPendingNum;
         if (info.index >= 0) ++cfg->bufferPending[info.index];
+        if (info.index >= 0 && cfg->buffers[info.index].Occupied() && cfg->buffers[info.index].groupIndex < VIDEO_OUT_BUFFER_ATTRIBUTE_NUM_MAX && cfg->groups[cfg->buffers[info.index].groupIndex].occupied) {
+            request->group = cfg->groups[cfg->buffers[info.index].groupIndex];
+            request->groupCaptured = true;
+        }
         request->reserved = true;
         return request;
     }
@@ -443,12 +448,29 @@ void VideoOutDriver::triggerEvents(VideoOutConfig& cfg, int eventKind, void* tri
     }
 }
 
-void VideoOutDriver::vblankEnd() {
+bool VideoOutDriver::SupportsHighFrameRate() {
+    return GetDisplayRefreshRate() >= 120;
+}
+
+int VideoOutDriver::GetDisplayRefreshRate() {
+    return displayRefreshRate.load();
+}
+
+void VideoOutDriver::updateDisplayRefreshRate() {
+    const int display = SDL_GetWindowDisplayIndex(window.Handle());
+    if (display < 0) throw std::runtime_error(std::string("SDL_GetWindowDisplayIndex failed: ") + SDL_GetError());
+    SDL_DisplayMode mode{};
+    if (SDL_GetCurrentDisplayMode(display, &mode) != 0) throw std::runtime_error(std::string("SDL_GetCurrentDisplayMode failed: ") + SDL_GetError());
+    displayRefreshRate.store(mode.refresh_rate);
+}
+
+void VideoOutDriver::vblankEnd(std::uint64_t tick) {
     std::lock_guard lock(mutex);
     for (const auto& cfg : contexts) {
         if (!cfg) continue;
         std::lock_guard cfgLock(cfg->mutex);
         if (!cfg->opened || cfg->failure) continue;
+        if (cfg->outputMode != VIDEO_OUT_OUTPUT_MODE_119_88HZ && tick % 2 != 0) continue;
         require(cfg->vblankStatus.count != std::numeric_limits<uint64_t>::max(), "vblank counter overflow");
         ++cfg->preVblankStatus.count;
         cfg->preVblankStatus.processTime = sceKernelGetProcessTime();
@@ -473,6 +495,7 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
             req.ReleaseLocked();
             return;
         }
+        require(req.cfg->outputMode != VIDEO_OUT_OUTPUT_MODE_119_88HZ || SupportsHighFrameRate(), "display no longer supports 119.88 Hz output");
         require(req.ready && !req.terminal && req.generation == req.cfg->generation, "stale or incomplete flip request");
         const auto interval = static_cast<uint64_t>(req.flipRate + 1);
         require(req.cfg->lastFlipVblank <= std::numeric_limits<uint64_t>::max() - interval, "flip interval overflow");
@@ -551,6 +574,7 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
 void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& started) {
     try {
         window.Ensure(VIDEO_OUT_DEFAULT_WIDTH, VIDEO_OUT_DEFAULT_HEIGHT);
+        updateDisplayRefreshRate();
         const auto extensions = windowExtensions(window.Handle());
         AgcDriverAttachWindow_nid_postfix({window.Handle(), extensions, &createWindowSurface, &windowDrawableSize, VIDEO_OUT_DEFAULT_WIDTH, VIDEO_OUT_DEFAULT_HEIGHT, nullptr});
     } catch (...) {
@@ -595,11 +619,20 @@ void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& star
                 }
             }
             padInput.Update();
+            updateDisplayRefreshRate();
+            mouseInput.UpdateCapture(!padInput.MouseModeEnabled());
             if (current) {
                 require(current->timing != nullptr, "missing presentation timing");
                 const auto dequeued = AgcDriver::FrameTiming::Clock::now();
                 current->timing->Add(current->timing->Get("VideoOut", "queue"), dequeued - current->queuedAt);
                 processFlip(*current);
+                int windowWidth = 0;
+                int windowHeight = 0;
+                if (window.Handle() != nullptr) SDL_GetWindowSize(window.Handle(), &windowWidth, &windowHeight);
+                if (windowWidth > 0 && windowHeight > 0) {
+                    const auto presented = AgcDriver::ComputeContainSize_nid_postfix(current->width, current->height, static_cast<std::uint32_t>(windowWidth), static_cast<std::uint32_t>(windowHeight), true);
+                    mouseInput.SetPresentation(current->width, current->height, presented.width, presented.height);
+                }
                 const auto finished = AgcDriver::FrameTiming::Clock::now();
                 AgcDriver::FrameTiming::Clock::duration interval{};
                 {
@@ -654,7 +687,7 @@ void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& star
 }
 
 void VideoOutDriver::vblankLoop(std::stop_token token) {
-    using Frame = std::chrono::duration<int64_t, std::ratio<1001, 60000>>;
+    using Frame = std::chrono::duration<int64_t, std::ratio<1001, 120000>>;
     const auto start = std::chrono::steady_clock::now();
     try {
         for (int64_t frame = 1; !token.stop_requested(); ++frame) {
@@ -665,7 +698,7 @@ void VideoOutDriver::vblankLoop(std::stop_token token) {
                 std::lock_guard lock(flipQueue->mutex);
                 if (token.stop_requested() || flipQueue->failure) return;
             }
-            vblankEnd();
+            vblankEnd(static_cast<std::uint64_t>(frame));
         }
     } catch (const std::exception& error) {
         std::fprintf(stderr, "[videoout] vblank failed: %s\n", error.what());

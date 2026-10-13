@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRegisterKey.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
 #include "prx/libc/include/Shutdown.hpp"
@@ -50,8 +51,10 @@ std::uint32_t low(const void* pointer) { return static_cast<std::uint32_t>(reint
 std::uint32_t high(const void* pointer) { return static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(pointer) >> 32u); }
 
 void execute(AgcDriver::QueueState& state, const std::vector<std::uint32_t>& packet) {
+    AgcDriver::DriverDetail::RegisterStateKey(state);
     AgcDriver::Pm4::Validate(packet, 0);
     AgcDriver::Pm4::Execute(packet, state);
+    check(AgcDriver::DriverDetail::RegisterStateKey(state) == AgcDriver::DriverDetail::RegisterStateKey(state, false, false), "PM4 changed registers without updating their fingerprint");
 }
 
 void testCatalog() {
@@ -362,6 +365,12 @@ void testMemory() {
     check(data[0] == 61 && data[1] == 62, "WRITE_DATA with a cache policy failed");
     execute(state, makePacket(0x37, {0x40100500, low(data.data()), high(data.data()), 81, 82}));
     check(data[0] == 81 && data[1] == 82, "WRITE_DATA to memory from the graphics queue failed");
+    execute(state, makePacket(0x37, {0x06100300, low(data.data()), high(data.data()), 91, 92}));
+    check(data[0] == 91 && data[1] == 92, "WRITE_DATA with destination 3 did not write memory");
+    const auto fence = makePacket(0x37, {0x06100300, low(data.data()), high(data.data()), 0});
+    const auto fenceLabel = AgcDriver::Pm4::DecodeLabelWrite(fence);
+    check(fenceLabel.has_value() && fenceLabel->address == reinterpret_cast<std::uint64_t>(data.data()), "WRITE_DATA with destination 3 did not resolve as a label");
+    expectFailure([&] { AgcDriver::Pm4::Validate(makePacket(0x37, {0x100000, low(data.data()), high(data.data()), 1}), 0); }, "register destination");
     expectFailure([&] { AgcDriver::Pm4::Validate(makePacket(0x37, {0x08000100, low(data.data()), high(data.data()), 71}), 0); }, "reserved");
     expectFailure([&] { AgcDriver::Pm4::Validate(makePacket(0x37, {0x80000100, low(data.data()), high(data.data()), 51}), 0); }, "engine");
     execute(state, makePacket(0x83, {0xbff8, 2, low(data.data()), high(data.data())}));

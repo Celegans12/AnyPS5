@@ -4,6 +4,9 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineSpecialization.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "BdaAbi.hpp"
+#if ANYPS5_ENABLE_SPIRV_TOOLS
+#include "SpirvBackend/SpirvOptimizer.hpp"
+#endif
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -12,11 +15,13 @@
 #include "prx/libSceAgcDriver/Execution/include/PipelineLinkOptimization.hpp"
 #include "prx/libSceAgcDriver/Execution/include/SubgroupClock.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderDeviceProfile.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PresentMode.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PresentationScaler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DisplayFormat.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GpuColorTransfer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
@@ -40,6 +45,7 @@
 #include <fstream>
 #include <cctype>
 #include <cstdlib>
+#include <ctime>
 #include <mutex>
 #include <SDL_loadso.h>
 #include <SDL_error.h>
@@ -71,6 +77,50 @@ void check(VkResult result, const char* operation) {
 
 void require(bool condition, const char* reason) {
     if (!condition) throw std::runtime_error(std::string("Vulkan presentation: ") + reason);
+}
+
+bool CoreVulkanCapability(std::uint32_t capability) {
+    switch (capability) {
+        case spv::CapabilityMatrix:
+        case spv::CapabilityShader:
+        case spv::CapabilityInputAttachment:
+        case spv::CapabilitySampled1D:
+        case spv::CapabilityImage1D:
+        case spv::CapabilitySampledBuffer:
+        case spv::CapabilityImageBuffer:
+        case spv::CapabilityImageQuery:
+        case spv::CapabilityDerivativeControl:
+        case spv::CapabilityStorageImageExtendedFormats:
+            return true;
+        default:
+            return false;
+    }
+}
+
+void CreateComputePipeline(VkDevice device, PFN_vkCreateComputePipelines create, VkPipelineCache cache, VkShaderModule module, VkPipelineLayout layout, VkPipelineCreateFlags flags, VkPipelineShaderStageCreateFlags stageFlags, const VkSpecializationInfo* specialization, std::uint32_t subgroupSize, VkPipeline* pipeline) {
+    VkComputePipelineCreateInfo info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    info.flags = flags;
+    info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    info.stage.flags = stageFlags;
+    info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    info.stage.module = module;
+    info.stage.pName = "main";
+    info.stage.pSpecializationInfo = specialization;
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT subgroup{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT};
+    subgroup.requiredSubgroupSize = subgroupSize;
+    if (subgroupSize != 0) info.stage.pNext = &subgroup;
+    info.layout = layout;
+    check(create(device, cache, 1, &info, nullptr, pipeline), "vkCreateComputePipelines");
+}
+
+bool CaptureComputePipeline(std::size_t words) {
+    const char* minimum = std::getenv("APS5_DUMP_COMPUTE_MIN_WORDS");
+    if (minimum == nullptr) return true;
+    std::uint32_t threshold = 0;
+    const auto end = minimum + std::strlen(minimum);
+    const auto parsed = std::from_chars(minimum, end, threshold);
+    require(parsed.ec == std::errc{} && parsed.ptr == end && threshold <= ComputePipelineCapture::MaxSpirvWords, "APS5_DUMP_COMPUTE_MIN_WORDS must be an integer from 0 through 8388608");
+    return words >= threshold;
 }
 
 // The ShaderResources content cache dispatches share with recorded draws: Graphics::ResourceCache,
@@ -181,6 +231,7 @@ struct WorkgroupMemory {
 };
 
 struct VulkanDevice::State {
+    bool compileOnly = false;
     void* library = nullptr;
     PFN_vkGetInstanceProcAddr instanceProc = nullptr;
     PFN_vkGetDeviceProcAddr deviceProc = nullptr;
@@ -195,6 +246,7 @@ struct VulkanDevice::State {
     VkExtent2D extent{};
     std::vector<VkImage> images;
     VkFence acquireFence = VK_NULL_HANDLE;
+    VkPresentModeKHR presentMode = VK_PRESENT_MODE_FIFO_KHR;
     struct RetiredSwapchain {
         VkSwapchainKHR swapchain = VK_NULL_HANDLE;
         std::vector<VkSemaphore> rendered;
@@ -207,6 +259,9 @@ struct VulkanDevice::State {
     void* uploadMapping = nullptr;
     VkDeviceSize uploadSize = 0;
     VkPhysicalDeviceProperties properties{};
+    std::string driverInfo;
+    PFN_vkGetCalibratedTimestampsKHR calibratedTimestamps = nullptr;
+    VkTimeDomainKHR hostTimeDomain = VK_TIME_DOMAIN_DEVICE_KHR;
     VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
     std::vector<std::uint32_t> capabilities{1};
     std::vector<std::string_view> spirvExtensions;
@@ -216,19 +271,23 @@ struct VulkanDevice::State {
     bool fragmentShaderBarycentric = false;
     bool geometryShader = false;
     bool sampleRateShading = false;
+    bool shaderClipDistance = false;
+    bool shaderCullDistance = false;
     bool shaderClock = false;
     bool narrowSubgroupClock = false;
     bool float64DenormPreserve = false;
+    bool float16DenormPreserve = false;
     // VK_EXT_descriptor_indexing with non-uniform image array indexing (bindless image tables in
     // graphics stages, and compute workgroups wider than a wave).
     bool descriptorIndexing = false;
     bool storageBufferUpdateAfterBind = false;
+    bool descriptorBindingPartiallyBound = false;
+    bool descriptorBindingVariableDescriptorCount = false;
+    bool runtimeDescriptorArray = false;
     VkPhysicalDeviceDescriptorIndexingPropertiesEXT descriptorIndexingProperties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_PROPERTIES_EXT};
     bool imageInt64Atomics = false;
     bool bufferInt64Atomics = false;
-    bool runtimeDescriptorArray = false;
-    bool partiallyBound = false;
-    bool variableDescriptorCount = false;
+    bool viewportIndexLayer = false;
     bool primitiveListRestart = false;
     bool depthClipControl = false;
     bool graphicsPipelineLibrary = false;
@@ -238,6 +297,7 @@ struct VulkanDevice::State {
     bool maintenance8 = false;
     std::uint32_t srgbDecodeFormats = 0;
     bool storageImageWithoutFormat = false;
+    VkSampleCountFlags sampleLocationSampleCounts = 0;
     bool depthClamp = false;
     bool depthBounds = false;
     bool depthBiasClamp = false;
@@ -465,7 +525,7 @@ struct VulkanDevice::State {
     // Whether a recorded dispatch's or draw's copied write-back (listed until it ran) stores into
     // the range on the CPU; under GpuMutex.
     bool CopiedWriterOverlaps(std::uint64_t address, std::size_t bytes) const {
-        const auto overlaps = [&](const auto& writer) { return writer->WritesOverlap(address, bytes); };
+        const auto overlaps = [&](const auto& writer) { return writer->CopiedWritesOverlap(address, bytes); };
         return std::any_of(copiedWriters->begin(), copiedWriters->end(), overlaps) || std::any_of(Graphics::DrawCopiedWriters()->begin(), Graphics::DrawCopiedWriters()->end(), overlaps);
     }
 
@@ -547,13 +607,19 @@ struct VulkanDevice::State {
 
     void WriteFrameDump(const PresentSlot& slot) {
         require(slot.dumpBuffer != nullptr, "frame dump was not recorded");
-        std::vector<std::byte> full(slot.dumpBuffer->Bytes().begin(), slot.dumpBuffer->Bytes().end());
+        const auto full = slot.dumpBuffer->Bytes();
         const auto index = slot.dumpIndex;
-        const auto width = slot.dumpWidth;
-        const auto height = slot.dumpHeight;
+        const auto scale = slot.dumpScale;
+        require(scale != 0 && full.size() == static_cast<std::size_t>(slot.dumpWidth) * slot.dumpHeight * 4, "invalid frame dump pixels");
+        const auto width = (slot.dumpWidth + scale - 1) / scale;
+        const auto height = (slot.dumpHeight + scale - 1) / scale;
+        std::vector<std::byte> pixels(static_cast<std::size_t>(width) * height * 4);
+        for (std::uint32_t y = 0; y < height; ++y) {
+            for (std::uint32_t x = 0; x < width; ++x) std::memcpy(pixels.data() + (static_cast<std::size_t>(y) * width + x) * 4, full.data() + (static_cast<std::size_t>(y) * scale * slot.dumpWidth + static_cast<std::size_t>(x) * scale) * 4, 4);
+        }
         static const auto start = std::chrono::steady_clock::now();
-        std::fprintf(stderr, "[gpu] frame_%03d.bmp: %ux%u display read back on the GPU at %.1f s\n", index, width, height, std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
-        dumpWriter.Enqueue(index, width, height, slot.dumpScale, std::move(full));
+        std::fprintf(stderr, "[gpu] frame_%03d.bmp: %ux%u display read back on the GPU at %.1f s\n", index, slot.dumpWidth, slot.dumpHeight, std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
+        dumpWriter.Enqueue(index, width, height, 1, std::move(pixels));
     }
 
     // Blocks on the fence, or polls it every 50 us with APS5_PRESENT_POLL_FENCE=1 (the difference
@@ -576,6 +642,10 @@ struct VulkanDevice::State {
 
     ~State() {
         contextReady = false;
+        if (compileOnly && device != VK_NULL_HANDLE) {
+            reinterpret_cast<PFN_vkDestroyDevice>(deviceProc(device, "vkDestroyDevice"))(device, nullptr);
+            device = VK_NULL_HANDLE;
+        }
         if (device != VK_NULL_HANDLE) {
             const auto idle = reinterpret_cast<PFN_vkDeviceWaitIdle>(deviceProc(device, "vkDeviceWaitIdle"))(device);
             if (idle != VK_SUCCESS && idle != VK_ERROR_DEVICE_LOST) std::terminate();
@@ -607,6 +677,7 @@ struct VulkanDevice::State {
             // belong to this device and must be destroyed while it lives.
             Graphics::ClearCachedPipelines(device);
             Graphics::ClearDepthSurfaces(device);
+            Graphics::ClearMultisampleTargets(device);
             {
                 std::lock_guard pipelines(computePipelinesMutex);
                 computePipelines.clear();
@@ -665,7 +736,165 @@ struct VulkanDevice::State {
     }
 };
 
-VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_unique<State>()), serial([] { static std::atomic<std::uint64_t> serials{0}; return serials.fetch_add(1, std::memory_order_relaxed) + 1; }()) {
+ComputePipelineReplayResult VulkanDevice::ReplayComputePipeline(const ComputePipelineCapture& capture, std::span<const std::byte> initialCache) {
+    require(state->compileOnly, "pipeline replay requires a compile-only device");
+    const auto start = std::chrono::steady_clock::now();
+    const auto elapsed = [](auto since) { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - since).count(); };
+    capture.Validate();
+    require(initialCache.size() <= 64u * 1024u * 1024u, "replay pipeline cache exceeds 64 MiB");
+    if (!initialCache.empty()) {
+        require(initialCache.size() >= 32, "replay pipeline cache header is truncated");
+        const auto word = [&](std::size_t offset) {
+            std::uint32_t result = 0;
+            for (unsigned shift = 0; shift < 32; shift += 8) result |= std::to_integer<std::uint32_t>(initialCache[offset++]) << shift;
+            return result;
+        };
+        require(word(0) >= 32 && word(0) <= initialCache.size() && word(4) == VK_PIPELINE_CACHE_HEADER_VERSION_ONE, "unsupported replay pipeline cache header");
+        require(word(8) == state->properties.vendorID && word(12) == state->properties.deviceID, "replay pipeline cache belongs to another device");
+        for (std::size_t index = 0; index < VK_UUID_SIZE; ++index) require(std::to_integer<std::uint8_t>(initialCache[16 + index]) == state->properties.pipelineCacheUUID[index], "replay pipeline cache UUID differs from the driver");
+    }
+    require((capture.flags & VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR) == 0 || state->pipelineExecutableInfo, "captured pipeline statistics feature is not enabled");
+    if (capture.requiredSubgroupSize != 0) {
+        VkPhysicalDeviceSubgroupSizeControlPropertiesEXT subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES_EXT};
+        VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &subgroup};
+        state->InstanceFunction<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(state->physical, &properties);
+        require(state->computeWave32 && capture.requiredSubgroupSize >= subgroup.minSubgroupSize && capture.requiredSubgroupSize <= subgroup.maxSubgroupSize && (subgroup.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT) != 0, "captured required subgroup size is unsupported");
+    }
+    const auto target = Target();
+    require(capture.spirv[1] <= target.spirvVersion, "captured SPIR-V version exceeds enabled device support");
+    for (std::size_t cursor = 5; cursor < capture.spirv.size(); cursor += capture.spirv[cursor] >> 16u) {
+        const auto count = capture.spirv[cursor] >> 16u;
+        if ((capture.spirv[cursor] & 0xffffu) == spv::OpCapability) {
+            require(count == 2 && (CoreVulkanCapability(capture.spirv[cursor + 1]) || std::ranges::find(target.supportedCapabilities, capture.spirv[cursor + 1]) != target.supportedCapabilities.end()), "captured SPIR-V capability is not enabled");
+        }
+    }
+#if ANYPS5_ENABLE_SPIRV_TOOLS
+    static_cast<void>(ShaderRecompiler::ValidateAndOptimizeSpirv(capture.spirv, target.vulkanVersion, target.spirvVersion, target.nonConstantImageOffsets, false));
+#else
+    throw std::runtime_error("compute pipeline replay requires ANYPS5_ENABLE_SPIRV_TOOLS=ON");
+#endif
+    ShaderRecompiler::RecompileResult shader;
+    shader.spirv = capture.spirv;
+    for (const auto& value : capture.specialization) shader.specialization.push_back({value.id, value.value});
+    const Graphics::PipelineSpecialization specialization(shader);
+    const auto& limits = state->properties.limits;
+    require(capture.sets.size() <= limits.maxBoundDescriptorSets, "captured descriptor sets exceed device limits");
+    for (const auto& range : capture.pushConstants) require(range.offset + range.size <= limits.maxPushConstantsSize, "captured push constants exceed device limits");
+    struct ReplayObjects {
+        VkDevice device;
+        PFN_vkDestroyDescriptorSetLayout destroySetLayout;
+        PFN_vkDestroyPipelineCache destroyCache;
+        std::vector<VkDescriptorSetLayout> sets;
+        VkPipelineCache cache = VK_NULL_HANDLE;
+        ~ReplayObjects() {
+            for (auto layout : sets) destroySetLayout(device, layout, nullptr);
+            if (cache != VK_NULL_HANDLE) destroyCache(device, cache, nullptr);
+        }
+    } replay{state->device, state->DeviceFunction<PFN_vkDestroyDescriptorSetLayout>("vkDestroyDescriptorSetLayout"), state->DeviceFunction<PFN_vkDestroyPipelineCache>("vkDestroyPipelineCache"), {}};
+    ComputePipelineObjects objects;
+    objects.device = state->device;
+    objects.destroyModule = state->DeviceFunction<PFN_vkDestroyShaderModule>("vkDestroyShaderModule");
+    objects.destroyLayout = state->DeviceFunction<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout");
+    objects.destroyPipeline = state->DeviceFunction<PFN_vkDestroyPipeline>("vkDestroyPipeline");
+    ComputePipelineReplayResult result;
+    result.deviceName = state->properties.deviceName;
+    result.vendorId = state->properties.vendorID;
+    result.deviceId = state->properties.deviceID;
+    result.driverVersion = state->properties.driverVersion;
+    result.apiVersion = state->properties.apiVersion;
+    std::copy_n(state->properties.pipelineCacheUUID, VK_UUID_SIZE, result.pipelineCacheUuid.begin());
+    result.initialCacheBytes = initialCache.size();
+    auto phase = std::chrono::steady_clock::now();
+    VkPipelineCacheCreateInfo cacheInfo{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+    cacheInfo.initialDataSize = initialCache.size();
+    cacheInfo.pInitialData = initialCache.data();
+    check(state->DeviceFunction<PFN_vkCreatePipelineCache>("vkCreatePipelineCache")(state->device, &cacheInfo, nullptr, &replay.cache), "vkCreatePipelineCache replay");
+    result.cacheMilliseconds = elapsed(phase);
+    phase = std::chrono::steady_clock::now();
+    VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    moduleInfo.codeSize = capture.spirv.size() * sizeof(std::uint32_t);
+    moduleInfo.pCode = capture.spirv.data();
+    check(state->DeviceFunction<PFN_vkCreateShaderModule>("vkCreateShaderModule")(state->device, &moduleInfo, nullptr, &objects.module), "vkCreateShaderModule replay");
+    result.moduleMilliseconds = elapsed(phase);
+    phase = std::chrono::steady_clock::now();
+    std::array<std::array<std::uint64_t, 4>, 2> descriptorCounts{};
+    bool hasUpdateAfterBindLayout = false;
+    for (const auto& layout : capture.sets) {
+        const bool updateAfterBind = (layout.flags & VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT) != 0;
+        hasUpdateAfterBindLayout |= updateAfterBind;
+        require(!updateAfterBind || state->storageBufferUpdateAfterBind, "captured update-after-bind descriptors are unsupported");
+        std::vector<VkDescriptorSetLayoutBinding> bindings;
+        std::vector<VkDescriptorBindingFlags> flags;
+        std::uint32_t variableCount = 0;
+        for (const auto& binding : layout.bindings) {
+            require((binding.flags & VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT) == 0 || state->descriptorBindingPartiallyBound, "captured partially-bound descriptors are unsupported");
+            require((binding.flags & VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT) == 0 || state->descriptorBindingVariableDescriptorCount, "captured variable descriptor count is unsupported");
+            if ((binding.flags & VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT) != 0) variableCount = binding.count;
+            bindings.push_back({binding.binding, binding.type, binding.count, binding.stages, nullptr});
+            flags.push_back(binding.flags);
+            const std::size_t kind = binding.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ? 0 : binding.type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ? 1 : binding.type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ? 2 : 3;
+            descriptorCounts[updateAfterBind ? 1 : 0][kind] += binding.count;
+        }
+        VkDescriptorSetLayoutBindingFlagsCreateInfo bindingFlags{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
+        bindingFlags.bindingCount = static_cast<std::uint32_t>(flags.size());
+        bindingFlags.pBindingFlags = flags.data();
+        VkDescriptorSetLayoutCreateInfo info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        info.pNext = std::ranges::any_of(flags, [](auto value) { return value != 0; }) ? &bindingFlags : nullptr;
+        info.flags = layout.flags;
+        info.bindingCount = static_cast<std::uint32_t>(bindings.size());
+        info.pBindings = bindings.data();
+        VkDescriptorSetVariableDescriptorCountLayoutSupport variableSupport{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_LAYOUT_SUPPORT};
+        VkDescriptorSetLayoutSupport support{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_SUPPORT, variableCount != 0 ? &variableSupport : nullptr};
+        state->DeviceFunction<PFN_vkGetDescriptorSetLayoutSupport>("vkGetDescriptorSetLayoutSupport")(state->device, &info, &support);
+        require(support.supported == VK_TRUE, "captured descriptor set layout is unsupported");
+        require(variableCount <= variableSupport.maxVariableDescriptorCount, "captured variable descriptor count exceeds layout support");
+        VkDescriptorSetLayout handle = VK_NULL_HANDLE;
+        check(state->DeviceFunction<PFN_vkCreateDescriptorSetLayout>("vkCreateDescriptorSetLayout")(state->device, &info, nullptr, &handle), "vkCreateDescriptorSetLayout replay");
+        replay.sets.push_back(handle);
+    }
+    const std::array<std::uint32_t, 4> regularLimits{std::min(limits.maxDescriptorSetStorageBuffers, limits.maxPerStageDescriptorStorageBuffers), std::min(limits.maxDescriptorSetSampledImages, limits.maxPerStageDescriptorSampledImages), std::min(limits.maxDescriptorSetStorageImages, limits.maxPerStageDescriptorStorageImages), std::min(limits.maxDescriptorSetSamplers, limits.maxPerStageDescriptorSamplers)};
+    const auto& indexed = state->descriptorIndexingProperties;
+    const std::array<std::uint32_t, 4> indexedLimits{std::min(indexed.maxDescriptorSetUpdateAfterBindStorageBuffers, indexed.maxPerStageDescriptorUpdateAfterBindStorageBuffers), std::min(indexed.maxDescriptorSetUpdateAfterBindSampledImages, indexed.maxPerStageDescriptorUpdateAfterBindSampledImages), std::min(indexed.maxDescriptorSetUpdateAfterBindStorageImages, indexed.maxPerStageDescriptorUpdateAfterBindStorageImages), std::min(indexed.maxDescriptorSetUpdateAfterBindSamplers, indexed.maxPerStageDescriptorUpdateAfterBindSamplers)};
+    std::uint64_t regularResources = 0;
+    std::uint64_t indexedResources = 0;
+    for (std::size_t kind = 0; kind < regularLimits.size(); ++kind) {
+        require(descriptorCounts[0][kind] <= regularLimits[kind], "captured pipeline descriptors exceed device limits");
+        require(!hasUpdateAfterBindLayout || descriptorCounts[0][kind] + descriptorCounts[1][kind] <= indexedLimits[kind], "captured update-after-bind pipeline descriptors exceed device limits");
+        if (kind != 3) {
+            regularResources += descriptorCounts[0][kind];
+            indexedResources += descriptorCounts[0][kind] + descriptorCounts[1][kind];
+        }
+    }
+    require(regularResources <= limits.maxPerStageResources && (!hasUpdateAfterBindLayout || indexedResources <= indexed.maxPerStageUpdateAfterBindResources), "captured pipeline resources exceed device limits");
+    VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    layoutInfo.setLayoutCount = static_cast<std::uint32_t>(replay.sets.size());
+    layoutInfo.pSetLayouts = replay.sets.data();
+    layoutInfo.pushConstantRangeCount = static_cast<std::uint32_t>(capture.pushConstants.size());
+    layoutInfo.pPushConstantRanges = capture.pushConstants.data();
+    check(state->DeviceFunction<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(state->device, &layoutInfo, nullptr, &objects.layout), "vkCreatePipelineLayout replay");
+    result.layoutMilliseconds = elapsed(phase);
+    phase = std::chrono::steady_clock::now();
+    CreateComputePipeline(state->device, state->DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines"), replay.cache, objects.module, objects.layout, capture.flags, capture.stageFlags, specialization.Info(), capture.requiredSubgroupSize, &objects.pipeline);
+    result.pipelineMilliseconds = elapsed(phase);
+    phase = std::chrono::steady_clock::now();
+    const auto getCache = state->DeviceFunction<PFN_vkGetPipelineCacheData>("vkGetPipelineCacheData");
+    std::size_t cacheBytes = 0;
+    check(getCache(state->device, replay.cache, &cacheBytes, nullptr), "vkGetPipelineCacheData size replay");
+    require(cacheBytes <= 64u * 1024u * 1024u, "exported replay pipeline cache exceeds 64 MiB");
+    result.cache.resize(cacheBytes);
+    check(getCache(state->device, replay.cache, &cacheBytes, result.cache.data()), "vkGetPipelineCacheData replay");
+    result.cache.resize(cacheBytes);
+    result.cacheMilliseconds += elapsed(phase);
+    result.totalMilliseconds = elapsed(start);
+    return result;
+}
+
+VulkanDevice::VulkanDevice(const PresentationWindow* window) : VulkanDevice(window, false) {}
+
+VulkanDevice::VulkanDevice(CompileOnly) : VulkanDevice(nullptr, true) {}
+
+VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) : state(std::make_unique<State>()), serial([] { static std::atomic<std::uint64_t> serials{0}; return serials.fetch_add(1, std::memory_order_relaxed) + 1; }()) {
+    state->compileOnly = compileOnly;
     APS5_LOG_OUT("VulkanDevice constructor window=%p", static_cast<const void*>(window));
 #ifdef _WIN32
     state->library = SDL_LoadObject("vulkan-1.dll");
@@ -823,6 +1052,12 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     std::vector<VkExtensionProperties> availableExtensions(extensionCount);
     check(enumerateDeviceExtensions(selected, nullptr, &extensionCount, availableExtensions.data()), "vkEnumerateDeviceExtensionProperties");
     const auto hasExtension = [&](const char* name) { return std::any_of(availableExtensions.begin(), availableExtensions.end(), [&](const auto& item) { return std::strcmp(item.extensionName, name) == 0; }); };
+    if (hasExtension(VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME)) {
+        VkPhysicalDeviceDriverProperties driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+        VkPhysicalDeviceProperties2 driverProperties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &driver};
+        state->InstanceFunction<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(selected, &driverProperties);
+        state->driverInfo = std::string(driver.driverName) + " " + driver.driverInfo;
+    }
     auto byteFeatures = QueryBdaByteFeatures(selected, state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2"), availableExtensions);
     auto bdaFeatures = QueryBdaFeatures(selected, state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2"), availableExtensions);
     require(hasExtension(VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME), "VK_KHR_shader_float_controls is unavailable");
@@ -887,6 +1122,11 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
         state->capabilities.push_back(spv::CapabilityFragmentShaderPixelInterlockEXT);
         state->spirvExtensions.push_back("SPV_EXT_fragment_shader_interlock");
     }
+    if (hasExtension(VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME)) {
+        deviceExtensions.push_back(VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME);
+        state->capabilities.push_back(spv::CapabilityStencilExportEXT);
+        state->spirvExtensions.push_back("SPV_EXT_shader_stencil_export");
+    }
     if (state->shaderClock) {
         deviceExtensions.push_back(VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
         state->capabilities.push_back(spv::CapabilityShaderClockKHR);
@@ -917,6 +1157,12 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
         state->imageInt64Atomics = true;
         state->spirvExtensions.push_back("SPV_EXT_shader_image_int64");
     }
+    if (hasExtension(VK_EXT_SHADER_VIEWPORT_INDEX_LAYER_EXTENSION_NAME)) {
+        deviceExtensions.push_back(VK_EXT_SHADER_VIEWPORT_INDEX_LAYER_EXTENSION_NAME);
+        state->capabilities.push_back(spv::CapabilityShaderViewportIndexLayerEXT);
+        state->spirvExtensions.push_back("SPV_EXT_shader_viewport_index_layer");
+        state->viewportIndexLayer = true;
+    }
     deviceExtensions.push_back(VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME);
     state->capabilities.push_back(spv::CapabilitySignedZeroInfNanPreserve);
     state->spirvExtensions.push_back("SPV_KHR_float_controls");
@@ -935,6 +1181,9 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
         state->capabilities.push_back(spv::CapabilityRoundingModeRTE);
         state->capabilities.push_back(spv::CapabilityDenormPreserve);
     }
+    state->float16DenormPreserve = floatControls.shaderDenormPreserveFloat16 == VK_TRUE &&
+        floatControls.denormBehaviorIndependence == VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL;
+    if (state->float16DenormPreserve && std::find(state->capabilities.begin(), state->capabilities.end(), static_cast<std::uint32_t>(spv::CapabilityDenormPreserve)) == state->capabilities.end()) state->capabilities.push_back(spv::CapabilityDenormPreserve);
     deviceExtensions.push_back(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
     deviceExtensions.push_back(VK_KHR_8BIT_STORAGE_EXTENSION_NAME);
     state->capabilities.push_back(4448);
@@ -944,6 +1193,31 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     state->spirvExtensions.push_back("SPV_KHR_physical_storage_buffer");
     state->depthRangeUnrestricted = hasExtension(VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
     if (state->depthRangeUnrestricted) deviceExtensions.push_back(VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
+    if (hasExtension(VK_EXT_SAMPLE_LOCATIONS_EXTENSION_NAME)) {
+        VkPhysicalDeviceSampleLocationsPropertiesEXT locations{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLE_LOCATIONS_PROPERTIES_EXT};
+        VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &locations};
+        state->InstanceFunction<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(selected, &properties);
+        if (locations.sampleLocationSubPixelBits >= 4 && locations.sampleLocationCoordinateRange[0] <= 0.0f && locations.sampleLocationCoordinateRange[1] >= 15.0f / 16.0f) {
+            const auto multisampleProperties = state->InstanceFunction<PFN_vkGetPhysicalDeviceMultisamplePropertiesEXT>("vkGetPhysicalDeviceMultisamplePropertiesEXT");
+            for (const auto samples : {VK_SAMPLE_COUNT_2_BIT, VK_SAMPLE_COUNT_4_BIT, VK_SAMPLE_COUNT_8_BIT}) {
+                if ((locations.sampleLocationSampleCounts & samples) == 0) continue;
+                VkMultisamplePropertiesEXT multisample{VK_STRUCTURE_TYPE_MULTISAMPLE_PROPERTIES_EXT};
+                multisampleProperties(selected, samples, &multisample);
+                if (multisample.maxSampleLocationGridSize.width != 0 && multisample.maxSampleLocationGridSize.height != 0) state->sampleLocationSampleCounts |= samples;
+            }
+        }
+        if (state->sampleLocationSampleCounts != 0) deviceExtensions.push_back(VK_EXT_SAMPLE_LOCATIONS_EXTENSION_NAME);
+    }
+    const char* fifoLatestReadyExtension = hasExtension(VK_KHR_PRESENT_MODE_FIFO_LATEST_READY_EXTENSION_NAME) ? VK_KHR_PRESENT_MODE_FIFO_LATEST_READY_EXTENSION_NAME : hasExtension("VK_EXT_present_mode_fifo_latest_ready") ? "VK_EXT_present_mode_fifo_latest_ready" : nullptr;
+    const char* requestedPresentMode = std::getenv("ANYPS5_PRESENT_MODE");
+    VkPhysicalDevicePresentModeFifoLatestReadyFeaturesKHR fifoLatestReadyFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_MODE_FIFO_LATEST_READY_FEATURES_KHR};
+    bool fifoLatestReady = false;
+    if (requestedPresentMode != nullptr && std::strcmp(requestedPresentMode, "fifo_latest_ready") == 0 && fifoLatestReadyExtension != nullptr) {
+        VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &fifoLatestReadyFeatures};
+        state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(selected, &features);
+        fifoLatestReady = fifoLatestReadyFeatures.presentModeFifoLatestReady == VK_TRUE;
+        if (fifoLatestReady) deviceExtensions.push_back(fifoLatestReadyExtension);
+    }
     // Guest dispatches cover whole thread groups past the edge of small images; robust image access
     // drops those writes instead of faulting the device.
     const bool imageRobustness = hasExtension(VK_EXT_IMAGE_ROBUSTNESS_EXTENSION_NAME);
@@ -975,10 +1249,10 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
         VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &hostProperties};
         state->InstanceFunction<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(selected, &properties);
         state->hostImportAlignment = hostProperties.minImportedHostPointerAlignment;
-        Graphics::SetHostImportWindow(8ull << 20u);
+        if (!compileOnly) Graphics::SetHostImportWindow(8ull << 20u);
 #ifdef _WIN32
         // Imported pages are locked; locking is bounded by the process working-set minimum.
-        if (const char* value = std::getenv("APS5_WORKING_SET_MIB")) {
+        if (const char* value = std::getenv("APS5_WORKING_SET_MIB"); value != nullptr && !compileOnly) {
             const SIZE_T bytes = static_cast<SIZE_T>(std::strtoull(value, nullptr, 10)) << 20u;
             if (!SetProcessWorkingSetSizeEx(GetCurrentProcess(), bytes, bytes * 2, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE)) std::fprintf(stderr, "[gpu] SetProcessWorkingSetSizeEx failed: %lu\n", GetLastError());
         }
@@ -1150,6 +1424,11 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     state->sampleRateShading = enabled.sampleRateShading == VK_TRUE;
     if (enabled.geometryShader) state->capabilities.push_back(spv::CapabilityGeometry);
     enabled.shaderClipDistance = available.shaderClipDistance;
+    enabled.shaderCullDistance = available.shaderCullDistance;
+    state->shaderClipDistance = enabled.shaderClipDistance == VK_TRUE;
+    state->shaderCullDistance = enabled.shaderCullDistance == VK_TRUE;
+    if (enabled.shaderClipDistance) state->capabilities.push_back(spv::CapabilityClipDistance);
+    if (enabled.shaderCullDistance) state->capabilities.push_back(spv::CapabilityCullDistance);
     if (enabled.shaderStorageImageWriteWithoutFormat) state->capabilities.push_back(spv::CapabilityStorageImageWriteWithoutFormat);
     if (enabled.shaderStorageImageReadWithoutFormat) state->capabilities.push_back(spv::CapabilityStorageImageReadWithoutFormat);
     state->storageImageWithoutFormat = enabled.shaderStorageImageWriteWithoutFormat == VK_TRUE && enabled.shaderStorageImageReadWithoutFormat == VK_TRUE;
@@ -1164,37 +1443,37 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
         state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(selected, &features);
         state->descriptorIndexing = descriptorIndexingFeatures.shaderSampledImageArrayNonUniformIndexing == VK_TRUE && descriptorIndexingFeatures.shaderStorageImageArrayNonUniformIndexing == VK_TRUE;
         state->storageBufferUpdateAfterBind = descriptorIndexingFeatures.descriptorBindingStorageBufferUpdateAfterBind == VK_TRUE;
+        state->descriptorBindingPartiallyBound = descriptorIndexingFeatures.descriptorBindingPartiallyBound == VK_TRUE;
+        state->descriptorBindingVariableDescriptorCount = descriptorIndexingFeatures.descriptorBindingVariableDescriptorCount == VK_TRUE;
+        state->runtimeDescriptorArray = descriptorIndexingFeatures.runtimeDescriptorArray == VK_TRUE;
         if (state->storageBufferUpdateAfterBind) {
             VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &state->descriptorIndexingProperties};
             state->InstanceFunction<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(selected, &properties);
         }
-        state->runtimeDescriptorArray = descriptorIndexingFeatures.runtimeDescriptorArray == VK_TRUE;
-        state->partiallyBound = descriptorIndexingFeatures.descriptorBindingPartiallyBound == VK_TRUE;
-        state->variableDescriptorCount = descriptorIndexingFeatures.descriptorBindingVariableDescriptorCount == VK_TRUE;
     }
     descriptorIndexingFeatures = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES_EXT};
-    const bool descriptorIndexingExtension = state->descriptorIndexing || state->storageBufferUpdateAfterBind || state->runtimeDescriptorArray || state->partiallyBound || state->variableDescriptorCount;
+    if (state->descriptorIndexing || state->storageBufferUpdateAfterBind || state->descriptorBindingPartiallyBound || state->descriptorBindingVariableDescriptorCount || state->runtimeDescriptorArray) deviceExtensions.push_back(VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME);
     if (state->descriptorIndexing) {
         descriptorIndexingFeatures.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
         descriptorIndexingFeatures.shaderStorageImageArrayNonUniformIndexing = VK_TRUE;
         state->capabilities.push_back(spv::CapabilityShaderNonUniform);
         state->capabilities.push_back(spv::CapabilitySampledImageArrayNonUniformIndexing);
         state->capabilities.push_back(spv::CapabilityStorageImageArrayNonUniformIndexing);
-    }
-    if (state->runtimeDescriptorArray) {
-        descriptorIndexingFeatures.runtimeDescriptorArray = VK_TRUE;
-        state->capabilities.push_back(spv::CapabilityRuntimeDescriptorArray);
-    }
-    if (state->partiallyBound) descriptorIndexingFeatures.descriptorBindingPartiallyBound = VK_TRUE;
-    if (state->variableDescriptorCount) descriptorIndexingFeatures.descriptorBindingVariableDescriptorCount = VK_TRUE;
-    if (descriptorIndexingExtension) {
-        deviceExtensions.push_back(VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME);
         state->spirvExtensions.push_back("SPV_EXT_descriptor_indexing");
     }
     descriptorIndexingFeatures.descriptorBindingStorageBufferUpdateAfterBind = state->storageBufferUpdateAfterBind ? VK_TRUE : VK_FALSE;
+    descriptorIndexingFeatures.descriptorBindingPartiallyBound = state->descriptorBindingPartiallyBound ? VK_TRUE : VK_FALSE;
+    descriptorIndexingFeatures.descriptorBindingVariableDescriptorCount = state->descriptorBindingVariableDescriptorCount ? VK_TRUE : VK_FALSE;
+    descriptorIndexingFeatures.runtimeDescriptorArray = state->runtimeDescriptorArray ? VK_TRUE : VK_FALSE;
+    if (state->runtimeDescriptorArray) {
+        state->capabilities.push_back(spv::CapabilityRuntimeDescriptorArray);
+        if (!state->descriptorIndexing) state->spirvExtensions.push_back("SPV_EXT_descriptor_indexing");
+    }
     state->samplerAnisotropy = true;
     state->textureCompressionBC = true;
     deviceInfo.pEnabledFeatures = &enabled;
+    const char* calibratedTimestamps = !PerformanceTrace::Configured() ? nullptr : hasExtension(VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) ? VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME : hasExtension(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) ? VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME : nullptr;
+    if (calibratedTimestamps != nullptr) deviceExtensions.push_back(calibratedTimestamps);
     deviceInfo.enabledExtensionCount = static_cast<std::uint32_t>(deviceExtensions.size());
     deviceInfo.ppEnabledExtensionNames = deviceExtensions.data();
     if (state->meshShader) {
@@ -1220,6 +1499,12 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     if (state->imageViewMinLod) {
         minLodFeatures.pNext = const_cast<void*>(deviceInfo.pNext);
         deviceInfo.pNext = &minLodFeatures;
+    }
+    fifoLatestReadyFeatures = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_MODE_FIFO_LATEST_READY_FEATURES_KHR};
+    fifoLatestReadyFeatures.presentModeFifoLatestReady = VK_TRUE;
+    if (fifoLatestReady) {
+        fifoLatestReadyFeatures.pNext = const_cast<void*>(deviceInfo.pNext);
+        deviceInfo.pNext = &fifoLatestReadyFeatures;
     }
     if (state->maintenance8) {
         maintenance8Features.pNext = const_cast<void*>(deviceInfo.pNext);
@@ -1259,7 +1544,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
         imageRobustnessFeatures.pNext = byteFeatures.pNext;
         byteFeatures.pNext = &imageRobustnessFeatures;
     }
-    if (descriptorIndexingExtension) {
+    if (state->descriptorIndexing || state->storageBufferUpdateAfterBind || state->descriptorBindingPartiallyBound || state->descriptorBindingVariableDescriptorCount || state->runtimeDescriptorArray) {
         descriptorIndexingFeatures.pNext = byteFeatures.pNext;
         byteFeatures.pNext = &descriptorIndexingFeatures;
     }
@@ -1345,6 +1630,26 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     state->deviceProc = MemoryStats::TrackDevice(state->device, selected, state->memoryProperties, state->deviceProc,
         state->memoryBudget ? state->InstanceFunction<PFN_vkGetPhysicalDeviceMemoryProperties2>("vkGetPhysicalDeviceMemoryProperties2") : nullptr);
     state->shaderProfile = std::move(shaderProfile);
+    if (compileOnly) return;
+    if (calibratedTimestamps != nullptr) {
+        const bool khr = std::strcmp(calibratedTimestamps, VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) == 0;
+        const auto domains = reinterpret_cast<PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR>(state->instanceProc(state->instance, khr ? "vkGetPhysicalDeviceCalibrateableTimeDomainsKHR" : "vkGetPhysicalDeviceCalibrateableTimeDomainsEXT"));
+        std::uint32_t domainCount = 0;
+        std::vector<VkTimeDomainKHR> available;
+        if (domains != nullptr && domains(selected, &domainCount, nullptr) == VK_SUCCESS) {
+            available.resize(domainCount);
+            if (domains(selected, &domainCount, available.data()) != VK_SUCCESS) available.clear();
+        }
+#ifdef _WIN32
+        const auto host = VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_KHR;
+#else
+        const auto host = VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR;
+#endif
+        if (std::ranges::find(available, VK_TIME_DOMAIN_DEVICE_KHR) != available.end() && std::ranges::find(available, host) != available.end()) {
+            state->hostTimeDomain = host;
+            state->calibratedTimestamps = state->DeviceFunction<PFN_vkGetCalibratedTimestampsKHR>(khr ? "vkGetCalibratedTimestampsKHR" : "vkGetCalibratedTimestampsEXT");
+        }
+    }
     state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, family, 0, &state->queue);
     APS5_LOG_OUT("Vulkan device ready device=%p queue=%p family=%u", reinterpret_cast<void*>(state->device), reinterpret_cast<void*>(state->queue), family);
     VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -1402,6 +1707,13 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
         std::vector<VkSurfaceFormatKHR> formats(formatCount);
         check(getFormats(selected, state->surface, &formatCount, formats.data()), "vkGetPhysicalDeviceSurfaceFormatsKHR");
         require(std::any_of(formats.begin(), formats.end(), [](const auto& format) { return format.format == VK_FORMAT_B8G8R8A8_UNORM && format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR; }), "BGRA8 sRGB-nonlinear surface format is unavailable");
+        std::uint32_t presentModeCount = 0;
+        auto getPresentModes = state->InstanceFunction<PFN_vkGetPhysicalDeviceSurfacePresentModesKHR>("vkGetPhysicalDeviceSurfacePresentModesKHR");
+        check(getPresentModes(selected, state->surface, &presentModeCount, nullptr), "vkGetPhysicalDeviceSurfacePresentModesKHR");
+        std::vector<VkPresentModeKHR> presentModes(presentModeCount);
+        check(getPresentModes(selected, state->surface, &presentModeCount, presentModes.data()), "vkGetPhysicalDeviceSurfacePresentModesKHR");
+        presentModes.resize(presentModeCount);
+        state->presentMode = SelectPresentMode(std::getenv("ANYPS5_PRESENT_MODE"), presentModes);
         VkSwapchainCreateInfoKHR swapchain{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
         swapchain.surface = state->surface;
         swapchain.minImageCount = surface.minImageCount;
@@ -1413,7 +1725,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
         swapchain.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
         swapchain.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
         swapchain.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-        swapchain.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+        swapchain.presentMode = state->presentMode;
         swapchain.clipped = VK_FALSE;
         check(state->DeviceFunction<PFN_vkCreateSwapchainKHR>("vkCreateSwapchainKHR")(state->device, &swapchain, nullptr, &state->swapchain), "vkCreateSwapchainKHR");
         std::uint32_t imageCount = 0;
@@ -1476,6 +1788,14 @@ bool OpportunisticReap() {
     return enabled;
 }
 
+}
+
+void VulkanDevice::StoreIdleResults(bool reapFirst) {
+    if (!Graphics::StorageTexture::AnyPending()) return;
+    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
+    std::lock_guard gpuLock(GuestMemory::GpuMutex());
+    Graphics::StorageTexture::FlushAllPending("idle");
+    SubmitRecorded(reapFirst);
 }
 
 void VulkanDevice::SubmitRecorded(bool reapFirst) {
@@ -1672,8 +1992,7 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
     if (recorder.PendingWriteOverlaps(address, bytes)) {
         // Recorded draws with copied writes keep their own registry (Graphics::DrawCopiedWriters):
         // their CPU write-back would land after a fill recorded on the GPU, so they count too.
-        bool sync = alwaysSync || std::any_of(state->copiedWriters->begin(), state->copiedWriters->end(), [&](const auto& writer) { return writer->WritesOverlap(address, bytes); })
-            || std::any_of(Graphics::DrawCopiedWriters()->begin(), Graphics::DrawCopiedWriters()->end(), [&](const auto& writer) { return writer->WritesOverlap(address, bytes); });
+        bool sync = alwaysSync || state->CopiedWriterOverlaps(address, bytes);
         if (!sync && Graphics::Recorder::PendingCompletionLabels() != 0) {
             // A label the CPU will store after a completion must not be overwritten by the fill:
             // only a label inside the filled range matters, whatever the range's size.
@@ -1876,9 +2195,8 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
     // A store a batch's completion makes on the CPU over the range (a copied buffer's write-back,
     // a completion-deferred label): it lands only when that batch is reaped, whatever its fence.
     const auto completionStoreOverlaps = [&](std::uint64_t address) {
-        if (alwaysSync || std::any_of(state->copiedWriters->begin(), state->copiedWriters->end(), [&](const auto& writer) { return writer->WritesOverlap(address, bytes); })
-            || std::any_of(Graphics::DrawCopiedWriters()->begin(), Graphics::DrawCopiedWriters()->end(), [&](const auto& writer) { return writer->WritesOverlap(address, bytes); })) return true;
-        return Graphics::Recorder::PendingCompletionLabels() != 0 && recorder.PendingLabelIn(address, bytes);
+        if (alwaysSync || state->CopiedWriterOverlaps(address, bytes)) return true;
+        return Graphics::Recorder::PendingCompletionLabels() != 0 && recorder.CompletionLabelIn(address, bytes);
     };
     // The CPU decision (see the header): pure queries, in the order that makes the first failing
     // test the reason; a signaled writer of the source is fine (its in-place stores are final in
@@ -2084,7 +2402,7 @@ void VulkanDevice::Resize(std::uint32_t width, std::uint32_t height) {
     create.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     create.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
     create.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-    create.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+    create.presentMode = state->presentMode;
     create.oldSwapchain = state->swapchain;
     state->retiredSwapchains.reserve(state->retiredSwapchains.size() + 1);
     VkSwapchainKHR replacement = VK_NULL_HANDLE;
@@ -2270,6 +2588,7 @@ FrameDumps& Dumps() {
 bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
     static const bool storeAtFlip = Graphics::StorageTexture::StoreAtFlipRequested(std::getenv("APS5_STORE_AT_FLIP"));
     if (storeAtFlip) Graphics::StorageTexture::FlushAllPending("flip");
+    else Graphics::StorageTexture::FlushDumpSelected("flip");
     if (buffer.tilingMode == 1) {
         const auto pixels = ReadDisplayBuffer(buffer);
         return present(buffer.width, buffer.height, true, pixels);
@@ -2354,9 +2673,13 @@ bool VulkanDevice::AcquireImage() {
     std::uint32_t index = 0;
     timing.Mark("fence_reset");
     // An out-of-date swapchain (the window changed) drops this frame; the next Resize recreates it.
-    const auto acquired = state->DeviceFunction<PFN_vkAcquireNextImageKHR>("vkAcquireNextImageKHR")(state->device, state->swapchain, 5'000'000'000ULL, VK_NULL_HANDLE, state->acquireFence, &index);
+    const auto acquired = state->DeviceFunction<PFN_vkAcquireNextImageKHR>("vkAcquireNextImageKHR")(state->device, state->swapchain, 0, VK_NULL_HANDLE, state->acquireFence, &index);
     if (acquired == VK_ERROR_OUT_OF_DATE_KHR) {
         state->extent = {0, 0};
+        return false;
+    }
+    if (acquired == VK_NOT_READY || acquired == VK_TIMEOUT) {
+        ++presentCounters.acquireDrops;
         return false;
     }
     if (acquired != VK_SUBOPTIMAL_KHR) check(acquired, "vkAcquireNextImageKHR");
@@ -2687,6 +3010,34 @@ std::string VulkanDevice::DeviceName() const {
     return state->properties.deviceName;
 }
 
+std::string VulkanDevice::DriverInfo() const {
+    return state->driverInfo.empty() ? std::to_string(state->properties.driverVersion) : state->driverInfo;
+}
+
+bool VulkanDevice::CalibrateClock(double& gpuNs, std::chrono::steady_clock::time_point& cpu) const {
+    if (state->calibratedTimestamps == nullptr) return false;
+    const std::array<VkCalibratedTimestampInfoKHR, 2> domains{VkCalibratedTimestampInfoKHR{VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR, nullptr, VK_TIME_DOMAIN_DEVICE_KHR}, VkCalibratedTimestampInfoKHR{VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR, nullptr, state->hostTimeDomain}};
+    std::array<std::uint64_t, 2> stamps{};
+    std::uint64_t deviation = 0;
+    if (state->calibratedTimestamps(state->device, static_cast<std::uint32_t>(domains.size()), domains.data(), stamps.data(), &deviation) != VK_SUCCESS) return false;
+#ifdef _WIN32
+    LARGE_INTEGER counter{};
+    LARGE_INTEGER frequency{};
+    QueryPerformanceCounter(&counter);
+    const auto now = std::chrono::steady_clock::now();
+    QueryPerformanceFrequency(&frequency);
+    const double sinceNs = static_cast<double>(static_cast<std::uint64_t>(counter.QuadPart) - stamps[1]) * 1e9 / static_cast<double>(frequency.QuadPart);
+#else
+    timespec monotonic{};
+    clock_gettime(CLOCK_MONOTONIC, &monotonic);
+    const auto now = std::chrono::steady_clock::now();
+    const double sinceNs = static_cast<double>(static_cast<std::uint64_t>(monotonic.tv_sec) * 1000000000ull + static_cast<std::uint64_t>(monotonic.tv_nsec) - stamps[1]);
+#endif
+    gpuNs = static_cast<double>(stamps[0]) * state->properties.limits.timestampPeriod;
+    cpu = now - std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double, std::nano>(sinceNs));
+    return true;
+}
+
 const std::uint32_t* VulkanDevice::WorkGroupCountLimit() const {
     return state->properties.limits.maxComputeWorkGroupCount;
 }
@@ -2707,8 +3058,11 @@ ShaderRecompiler::SpirvTarget VulkanDevice::buildTarget() const {
     target.nonConstantImageOffsets = state->maintenance8;
     target.narrowSubgroupClock = state->narrowSubgroupClock;
     target.float64DenormPreserve = state->float64DenormPreserve;
+    target.float16DenormPreserve = state->float16DenormPreserve;
     target.fixedPushSlots = state->graphicsPipelineLibrary;
+    target.registrationModules = state->graphicsPipelineLibrary;
     target.srgbDecodeFormats = state->srgbDecodeFormats;
+    target.vertexSubgroups = (state->subgroup.supportedStages & VK_SHADER_STAGE_VERTEX_BIT) != 0;
     if (state->meshShader) {
         const auto& mesh = state->meshLimits;
         target.mesh = ShaderRecompiler::MeshTargetLimits{{mesh.maxMeshWorkGroupSize[0], mesh.maxMeshWorkGroupSize[1], mesh.maxMeshWorkGroupSize[2]}, mesh.maxMeshWorkGroupInvocations, std::min(mesh.maxMeshSharedMemorySize, mesh.maxMeshPayloadAndSharedMemorySize), mesh.maxMeshOutputVertices, mesh.maxMeshOutputPrimitives, mesh.maxMeshOutputComponents, std::min(mesh.maxMeshOutputMemorySize, mesh.maxMeshPayloadAndOutputMemorySize), mesh.meshOutputPerVertexGranularity, mesh.meshOutputPerPrimitiveGranularity};
@@ -2812,19 +3166,23 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.descriptorIndexingLimits = state->descriptorIndexingProperties;
     context.imageInt64Atomics = state->imageInt64Atomics;
     context.runtimeDescriptorArray = state->runtimeDescriptorArray;
-    context.partiallyBound = state->partiallyBound;
-    context.variableDescriptorCount = state->variableDescriptorCount;
+    context.partiallyBound = state->descriptorBindingPartiallyBound;
+    context.variableDescriptorCount = state->descriptorBindingVariableDescriptorCount;
     context.imageTableCapacity = ImageTableCapacity(context);
     context.samplerTableCapacity = SamplerTableCapacity(context);
     context.geometryShader = state->geometryShader;
     context.sampleRateShading = state->sampleRateShading;
+    context.shaderClipDistance = state->shaderClipDistance;
+    context.shaderCullDistance = state->shaderCullDistance;
     context.nullDescriptors = state->shaderProfile != nullptr && state->shaderProfile->NullDescriptors();
     context.bufferInt64Atomics = state->bufferInt64Atomics;
     context.placeholderImages = state->placeholderImages.get();
+    context.viewportIndexLayer = state->viewportIndexLayer;
     context.primitiveListRestart = state->primitiveListRestart;
     context.imageViewMinLod = state->imageViewMinLod;
     context.pipelineExecutableInfo = state->pipelineExecutableInfo;
     context.srgbDecodeFormats = state->srgbDecodeFormats;
+    context.sampleLocationSampleCounts = state->sampleLocationSampleCounts;
     context.memoryProperties2 = state->memoryBudget ? state->InstanceFunction<PFN_vkGetPhysicalDeviceMemoryProperties2>("vkGetPhysicalDeviceMemoryProperties2") : nullptr;
     context.integratedGpu = state->properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
     context.singlePassStorage = state->storageImageWithoutFormat;
@@ -2841,6 +3199,44 @@ std::optional<std::string> VulkanDevice::KnownDrawRejection(const Graphics::Stat
 
 void VulkanDevice::ColorMetadataPass(const Graphics::ColorMetadataPass& pass) {
     Graphics::RunColorMetadataPass(graphicsContext(), pass);
+}
+
+bool VulkanDevice::PrebuildGraphicsLibraries(const Graphics::ShaderStages& stages, std::span<const Graphics::CompiledShader> shaders) {
+    PerformanceTimer timing("Vulkan.GraphicsPipelinePrebuild");
+    const auto context = graphicsContext();
+    if (!context.graphicsPipelineLibrary || context.descriptorCache == nullptr) return false;
+    Graphics::State state{};
+    state.stages = stages;
+    state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    state.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    state.color.format = VK_FORMAT_R8G8B8A8_UNORM;
+    state.color.exportIndex = 0;
+    state.colors.push_back(state.color);
+    state.hasColorTarget = true;
+    state.blend.colorWriteMask = 15;
+    state.blends.push_back(state.blend);
+    state.renderExtent = {1, 1};
+    std::vector<Graphics::CompiledShader> group(shaders.begin(), shaders.end());
+    if (group.size() == 1u) {
+        const bool vertex = group.front().stage == ShaderRecompiler::ShaderStage::Fragment;
+        static const auto stub = [](bool vertexStub) {
+            auto result = std::make_shared<ShaderRecompiler::RecompileResult>();
+            const std::uint32_t model = vertexStub ? 0u : 4u;
+            std::vector<std::uint32_t> words{0x07230203u, 0x00010000u, 0u, 6u, 0u, 0x00020011u, 1u, 0x0003000eu, 0u, 1u, 0x0005000fu, model, 4u, 0x6e69616du, 0u};
+            if (!vertexStub) words.insert(words.end(), {0x00030010u, 4u, 7u});
+            words.insert(words.end(), {0x00020013u, 2u, 0x00030021u, 3u, 2u, 0x00050036u, 2u, 4u, 0u, 3u, 0x000200f8u, 5u, 0x000100fdu, 0x00010038u});
+            result->spirv = std::move(words);
+            result->variantId = vertexStub ? ~std::uint64_t{0} - 1u : ~std::uint64_t{0} - 2u;
+            result->runtimeAbiVersion = ShaderRecompiler::RuntimeAbi::Version;
+            return result;
+        };
+        static const auto vertexStub = stub(true);
+        static const auto fragmentStub = stub(false);
+        if (vertex) group.insert(group.begin(), {ShaderRecompiler::ShaderStage::Vertex, vertexStub.get(), 0u});
+        else group.push_back({ShaderRecompiler::ShaderStage::Fragment, fragmentStub.get(), Graphics::PipelinePushSlotBytes});
+    }
+    const auto layouts = Graphics::DescribeSetLayouts(context, group);
+    return Graphics::Pipeline::Prebuild(context, state, Graphics::VertexInputLayout{}, layouts.View(), group);
 }
 
 void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipe) {
@@ -3497,8 +3893,7 @@ void VulkanDevice::decideIndirect(RecordedDispatch& record, IndirectOutcome& out
         recorder.Sync();
     } else if (record.shader->program->workgroupMemoryDwords != 0) {
         outcome.cpuReason = 8;
-    } else if (labelPending() || std::any_of(state->copiedWriters->begin(), state->copiedWriters->end(), [&](const auto& writer) { return writer->WritesOverlap(arguments, 12); })
-               || std::any_of(Graphics::DrawCopiedWriters()->begin(), Graphics::DrawCopiedWriters()->end(), [&](const auto& writer) { return writer->WritesOverlap(arguments, 12); })) {
+    } else if (labelPending() || state->CopiedWriterOverlaps(arguments, 12)) {
         outcome.cpuReason = 2;
     } else if ((record.argumentImport = Graphics::HostImportFor(context, arguments, 12)) == nullptr) {
         // Valid until the next refreshImports, which only runs under GuestMemory::GpuMutex (held
@@ -3817,20 +4212,11 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::createComputePipeline(cons
     layoutInfo.pushConstantRangeCount = pushes ? 1 : 0;
     layoutInfo.pPushConstantRanges = pushes ? &push : nullptr;
     check(state->DeviceFunction<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(state->device, &layoutInfo, nullptr, &objects->layout), "vkCreatePipelineLayout");
-    VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-    pipelineInfo.flags = (context.pipelineExecutableInfo ? VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR : 0) | VK_PIPELINE_CREATE_DISPATCH_BASE_BIT;
-    pipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-    pipelineInfo.stage.module = objects->module;
-    pipelineInfo.stage.pName = "main";
+    const VkPipelineCreateFlags pipelineFlags = (context.pipelineExecutableInfo ? VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR : 0) | VK_PIPELINE_CREATE_DISPATCH_BASE_BIT;
     const Graphics::PipelineSpecialization specialization(shader);
-    pipelineInfo.stage.pSpecializationInfo = specialization.Info();
-    VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT requiredSubgroup{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT};
-    requiredSubgroup.requiredSubgroupSize = std::min(shader.hostSubgroupSize, state->maxComputeSubgroupSize);
-    if (state->computeWave32 && (shader.hostSubgroupSize == 32u || shader.hostSubgroupSize > state->maxComputeSubgroupSize)) pipelineInfo.stage.pNext = &requiredSubgroup;
-    pipelineInfo.layout = objects->layout;
+    const auto subgroupSize = state->computeWave32 && (shader.hostSubgroupSize == 32u || shader.hostSubgroupSize > state->maxComputeSubgroupSize) ? std::min(shader.hostSubgroupSize, state->maxComputeSubgroupSize) : 0u;
     if (profile && shader.spirv.size() > 100000) std::fprintf(stderr, "[dispatch] creating a pipeline for %zu SPIR-V words (program 0x%llx)\n", shader.spirv.size(), static_cast<unsigned long long>(programAddress));
-    check(state->DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(state->device, context.pipelineCache, 1, &pipelineInfo, nullptr, &objects->pipeline), "vkCreateComputePipelines");
+    CreateComputePipeline(state->device, state->DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines"), context.pipelineCache, objects->module, objects->layout, pipelineFlags, 0, specialization.Info(), subgroupSize, &objects->pipeline);
     objects->destroyModule(objects->device, objects->module, nullptr);
     objects->module = VK_NULL_HANDLE;
     Graphics::LogPipelineStatistics_nid_no_patch(context, objects->pipeline);
@@ -4008,6 +4394,34 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         Graphics::Require(planComputeLayout(context, shader).key == resources->LayoutKey(), "pipeline-only: planned descriptor layout differs from dispatch");
     }
     if (objects == nullptr) {
+        if (const char* directory = std::getenv("APS5_DUMP_COMPUTE_PIPELINES"); directory != nullptr && *directory != '\0' && CaptureComputePipeline(shader.spirv.size())) {
+            ComputePipelineCapture capture;
+            capture.spirv = shader.spirv;
+            ComputeDescriptorSetLayout resourcesLayout;
+            resourcesLayout.flags = resources->LayoutUpdateAfterBind() ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT : 0;
+            const auto layoutBindings = resources->LayoutBindings();
+            const auto bindingFlags = resources->LayoutBindingFlags();
+            require(layoutBindings.size() == bindingFlags.size(), "compute capture binding flag count differs from layout");
+            for (std::size_t index = 0; index < layoutBindings.size(); ++index) {
+                const auto& binding = layoutBindings[index];
+                require(binding.pImmutableSamplers == nullptr, "compute capture does not support immutable samplers");
+                resourcesLayout.bindings.push_back({binding.binding, binding.descriptorType, binding.descriptorCount, binding.stageFlags, bindingFlags[index]});
+            }
+            capture.sets.push_back(std::move(resourcesLayout));
+            if (shader.workgroupMemoryDwords != 0) capture.sets.push_back({0, {{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, 0}}});
+            if (pushStages != 0) capture.pushConstants.push_back({VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::ComputePushConstantBytes});
+            for (const auto& value : shader.specialization) capture.specialization.push_back({value.id, value.value});
+            capture.requiredSubgroupSize = state->computeWave32 && (shader.hostSubgroupSize == 32u || shader.hostSubgroupSize > state->maxComputeSubgroupSize) ? std::min(shader.hostSubgroupSize, state->maxComputeSubgroupSize) : 0u;
+            capture.flags = (context.pipelineExecutableInfo ? VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR : 0) | VK_PIPELINE_CREATE_DISPATCH_BASE_BIT;
+            capture.deviceName = state->properties.deviceName;
+            capture.vendorId = state->properties.vendorID;
+            capture.deviceId = state->properties.deviceID;
+            capture.driverVersion = state->properties.driverVersion;
+            capture.apiVersion = state->properties.apiVersion;
+            std::copy_n(state->properties.pipelineCacheUUID, VK_UUID_SIZE, capture.pipelineCacheUuid.begin());
+            const auto path = capture.Write(directory);
+            std::fprintf(stderr, "[compute-capture] %s\n", path.string().c_str());
+        }
         objects = createComputePipeline(shader, context, resources->Layout(), pushStages != 0, programAddress, &timing);
         if (pipelineKey != 0) {
             // Find-or-insert: objects another dispatch of the variant mapped meanwhile serve this

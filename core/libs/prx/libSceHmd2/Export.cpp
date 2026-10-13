@@ -11,12 +11,37 @@ constexpr std::int32_t SCE_HMD2_ERROR_UNSUPPORTED_FEATURE = static_cast<std::int
 
 extern "C" {
 
+int APS5_VABI sceHmd2ReprojectionQuerySeeThroughBufferSizeAlign() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
 std::int32_t APS5_VABI sceHmd2Initialize(const void* param) {
     (void)param;
     return SCE_HMD2_ERROR_UNSUPPORTED_FEATURE;
 }
 
+int APS5_VABI sceHmd2GetFieldOfView() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceHmd2GetDeviceInformationByHandle() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceHmd2Terminate() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
 int APS5_VABI sceHmd2Close() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceHmd2GazeGetResult() {
     NotImplemented_nid_no_patch(__func__);
     return 0;
 }
@@ -46,12 +71,32 @@ int APS5_VABI sceHmd2ReprojectionBeginFrame() {
     return 0;
 }
 
+int APS5_VABI sceHmd2ReprojectionDisableMirroring() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
 int APS5_VABI sceHmd2ReprojectionDisableVrMode() {
     NotImplemented_nid_no_patch(__func__);
     return 0;
 }
 
+int APS5_VABI sceHmd2ReprojectionEnableMirroring() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
 int APS5_VABI sceHmd2ReprojectionEnableVrMode() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceHmd2ReprojectionGetMirroringDisplayBufferSizeAlign() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceHmd2ReprojectionGetMirroringWorkMemorySizeAlign() {
     NotImplemented_nid_no_patch(__func__);
     return 0;
 }
@@ -81,12 +126,32 @@ int APS5_VABI sceHmd2ReprojectionSetAllowPositionalReprojection() {
     return 0;
 }
 
+int APS5_VABI sceHmd2ReprojectionSetMirroringOption() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceHmd2ReprojectionSetParam() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
 int APS5_VABI sceHmd2ReprojectionSetParamWithBuffer() {
     NotImplemented_nid_no_patch(__func__);
     return 0;
 }
 
 int APS5_VABI sceHmd2ReprojectionSetRenderConfig() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceHmd2ReprojectionSetTiming() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceHmd2ReprojectionTerminate() {
     NotImplemented_nid_no_patch(__func__);
     return 0;
 }

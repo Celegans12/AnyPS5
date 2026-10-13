@@ -1,11 +1,12 @@
 #include "ControlFlow/RequestSerializer.hpp"
-#include <bit>
 #include <stdexcept>
 
 namespace ShaderRecompiler {
 
 namespace {
 
+constexpr std::uint32_t CurrentVersion = 24u;
+constexpr std::uint32_t LocalFeatures = 22u;
 constexpr char kBase64Alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 std::string base64Encode(std::string_view data) {
@@ -207,6 +208,8 @@ public:
         }
     }
 
+    [[nodiscard]] bool Done() const { return m_offset == m_data.size(); }
+
 private:
     std::string_view m_data;
     std::uint64_t m_offset = 0u;
@@ -242,6 +245,14 @@ ColorExportPacking readColorExportPacking(Reader& reader) {
         throw std::runtime_error("RequestSerializer: invalid ColorExportPacking value");
     }
     return static_cast<ColorExportPacking>(value);
+}
+
+RasterPrimitive readRasterPrimitive(Reader& reader) {
+    const auto value = reader.ReadU8();
+    if (value > static_cast<std::uint8_t>(RasterPrimitive::Rectangle)) {
+        throw std::runtime_error("RequestSerializer: invalid RasterPrimitive value");
+    }
+    return static_cast<RasterPrimitive>(value);
 }
 
 void writeShaderBinary(Writer& writer, const ShaderBinary& binary) {
@@ -326,6 +337,9 @@ void writePixelInfo(Writer& writer, const ShaderPixelStageInfo& info) {
     }
     writer.WriteBool(info.dualSourceBlend);
     writer.WriteBool(info.alphaToCoverage);
+    writer.WriteBool(info.stencilRefExportEnable);
+    writer.WriteU8(static_cast<std::uint8_t>(info.rasterPrimitive));
+    writer.WriteBool(info.layerExported);
     for (const ColorTargetBlend& blend : info.targetBlend) {
         writer.WriteBool(blend.enable);
         writer.WriteU8(blend.sourceFactor);
@@ -335,7 +349,7 @@ void writePixelInfo(Writer& writer, const ShaderPixelStageInfo& info) {
     }
 }
 
-ShaderPixelStageInfo readPixelInfo(Reader& reader, std::uint32_t version) {
+ShaderPixelStageInfo readPixelInfo(Reader& reader, std::uint32_t version, std::uint32_t local) {
     ShaderPixelStageInfo info{};
     info.interpolatorCount = reader.ReadU32();
     for (std::uint32_t& value : info.interpolatorSettings) {
@@ -381,7 +395,10 @@ ShaderPixelStageInfo readPixelInfo(Reader& reader, std::uint32_t version) {
     }
     if (version >= 15u) info.dualSourceBlend = reader.ReadBool();
     if (version >= 16u) info.alphaToCoverage = reader.ReadBool();
-    if (version >= 20u) {
+    if (version >= 17u) info.stencilRefExportEnable = reader.ReadBool();
+    if (version >= 19u) info.rasterPrimitive = readRasterPrimitive(reader);
+    if (version >= 23u) info.layerExported = reader.ReadBool();
+    if (local >= 20u) {
         for (ColorTargetBlend& blend : info.targetBlend) {
             blend.enable = reader.ReadBool();
             blend.sourceFactor = reader.ReadU8();
@@ -417,9 +434,10 @@ void writeVertexInfo(Writer& writer, const ShaderVertexStageInfo& info) {
     writer.WriteU32(info.fetchAttribReg);
     writer.WriteU32(info.fetchBufferReg);
     writer.WriteBool(info.fetchEmbedded);
+    writer.WriteU32(info.paClVsOutCntl);
 }
 
-ShaderVertexStageInfo readVertexInfo(Reader& reader) {
+ShaderVertexStageInfo readVertexInfo(Reader& reader, std::uint32_t version) {
     ShaderVertexStageInfo info{};
     for (auto& resource : info.resources) {
         for (std::uint32_t& value : resource.fields) {
@@ -436,6 +454,7 @@ ShaderVertexStageInfo readVertexInfo(Reader& reader) {
     info.fetchAttribReg = reader.ReadU32();
     info.fetchBufferReg = reader.ReadU32();
     info.fetchEmbedded = reader.ReadBool();
+    if (version >= 20u) info.paClVsOutCntl = reader.ReadU32();
     return info;
 }
 
@@ -523,27 +542,25 @@ void writeTessellationConfiguration(Writer& writer, const TessellationConfigurat
     writer.WriteU32(configuration.domain);
     writer.WriteU32(configuration.partitioning);
     writer.WriteU32(configuration.outputTopology);
-    writer.WriteU32(std::bit_cast<std::uint32_t>(configuration.minLevel));
-    writer.WriteU32(std::bit_cast<std::uint32_t>(configuration.maxLevel));
     writer.WriteU32(configuration.patchesPerGroup);
     writer.WriteU32(configuration.primitiveGroupSize);
     writer.WriteBool(configuration.breakAtInstance);
 }
 
-TessellationConfiguration readTessellationConfiguration(Reader& reader, std::uint32_t version) {
+TessellationConfiguration readTessellationConfiguration(Reader& reader, std::uint32_t version, std::uint32_t local) {
     TessellationConfiguration configuration{};
     configuration.inputControlPoints = reader.ReadU32();
     configuration.outputControlPoints = reader.ReadU32();
     configuration.domain = reader.ReadU32();
     configuration.partitioning = reader.ReadU32();
     configuration.outputTopology = reader.ReadU32();
-    if (version >= 17u) {
-        configuration.minLevel = std::bit_cast<float>(reader.ReadU32());
-        configuration.maxLevel = std::bit_cast<float>(reader.ReadU32());
+    if (local >= 17u && local < LocalFeatures) {
+        static_cast<void>(reader.ReadU32());
+        static_cast<void>(reader.ReadU32());
     }
-    if (version >= 18u) configuration.patchesPerGroup = reader.ReadU32();
-    if (version >= 19u) configuration.primitiveGroupSize = reader.ReadU32();
-    if (version >= 21u) configuration.breakAtInstance = reader.ReadBool();
+    if (version >= 22u || local >= 18u) configuration.patchesPerGroup = reader.ReadU32();
+    if (local >= 19u) configuration.primitiveGroupSize = reader.ReadU32();
+    if (local >= 21u) configuration.breakAtInstance = reader.ReadBool();
     return configuration;
 }
 
@@ -577,7 +594,7 @@ void writeGuestContext(Writer& writer, const GuestContext& context) {
     }
 }
 
-GuestContext readGuestContext(Reader& reader, DeserializedRequest& result, std::uint32_t version) {
+GuestContext readGuestContext(Reader& reader, DeserializedRequest& result, std::uint32_t version, std::uint32_t local) {
     GuestContext context{};
     context.waveSize = reader.ReadU32();
     context.userDataBaseRegister = reader.ReadU32();
@@ -588,11 +605,11 @@ GuestContext readGuestContext(Reader& reader, DeserializedRequest& result, std::
         context.compute = result.compute;
     }
     if (reader.ReadBool()) {
-        result.pixel = readPixelInfo(reader, version);
+        result.pixel = readPixelInfo(reader, version, local);
         context.pixel = result.pixel;
     }
     if (reader.ReadBool()) {
-        result.vertex = readVertexInfo(reader);
+        result.vertex = readVertexInfo(reader, version);
         context.vertex = result.vertex;
     }
     const auto regionCount = reader.ReadU64();
@@ -718,7 +735,7 @@ void writeGraphicsCompileContext(Writer& writer, const GraphicsCompileContext& g
     writer.WriteU32(graphics.draw.instanceCount);
 }
 
-GraphicsCompileContext readGraphicsCompileContext(Reader& reader, DeserializedGraphicsCompileContext& storage, std::uint32_t version) {
+GraphicsCompileContext readGraphicsCompileContext(Reader& reader, DeserializedGraphicsCompileContext& storage, std::uint32_t version, std::uint32_t local) {
     GraphicsCompileContext graphics{};
     graphics.firstUserSgpr = reader.ReadU32();
     const auto programCount = reader.ReadU64();
@@ -746,7 +763,7 @@ GraphicsCompileContext readGraphicsCompileContext(Reader& reader, DeserializedGr
         graphics.mesh = storage.mesh;
     }
     if (reader.ReadBool()) {
-        storage.tessellation = readTessellationConfiguration(reader, version);
+        storage.tessellation = readTessellationConfiguration(reader, version, local);
         graphics.tessellation = storage.tessellation;
     }
     storage.draw.indexAddress = reader.ReadU64();
@@ -757,13 +774,45 @@ GraphicsCompileContext readGraphicsCompileContext(Reader& reader, DeserializedGr
     return graphics;
 }
 
+DeserializedRequest deserialize(std::string_view decoded, std::uint32_t version, std::uint32_t local, bool exact) {
+    Reader reader(decoded);
+    static_cast<void>(reader.ReadU32());
+    static_cast<void>(reader.ReadU32());
+    DeserializedRequest result{};
+    result.request.shader = readShaderBinary(reader, result.shaderCode, result.shaderHeader);
+    result.request.context = readGuestContext(reader, result, version, local);
+    result.request.target = readSpirvTarget(reader, result);
+    result.request.layout = readBindingLayout(reader);
+    if (reader.ReadBool()) {
+        result.graphicsStorage = std::make_unique<DeserializedGraphicsCompileContext>();
+        result.request.graphics = readGraphicsCompileContext(reader, *result.graphicsStorage, version, local);
+    }
+    if (version >= 2u) result.request.useCache = reader.ReadBool();
+    if (version >= 3u && result.request.context.compute.has_value()) {
+        for (std::uint32_t& value : result.request.context.compute->partialThreads) {
+            value = reader.ReadU32();
+        }
+    }
+    if (version >= 6u) result.request.target.nonConstantImageOffsets = reader.ReadBool();
+    if (version >= 9u) result.request.target.srgbDecodeFormats = reader.ReadU32();
+    if (version >= 10u && result.request.context.compute.has_value()) result.request.context.compute->scratchDwords = reader.ReadU32();
+    if (version >= 12u) result.request.target.narrowSubgroupClock = reader.ReadBool();
+    if (version >= 16u) result.request.target.float64DenormPreserve = reader.ReadBool();
+    if (version >= 17u) result.request.target.registrationModules = reader.ReadBool();
+    if (version >= 17u) result.request.target.registrationWordLimit = reader.ReadU32();
+    if (version >= 18u) result.request.target.vertexSubgroups = reader.ReadBool();
+    if (version >= 21u) result.request.target.float16DenormPreserve = reader.ReadBool();
+    if (exact && !reader.Done()) throw std::runtime_error("RequestSerializer: trailing data");
+    return result;
+}
+
 }
 
 std::string RequestSerializer::Serialize(const RecompileRequest& request) const {
     std::string buffer;
     Writer writer(buffer);
     writer.WriteU32(0x41505335u);
-    writer.WriteU32(21u);
+    writer.WriteU32(CurrentVersion);
     writeShaderBinary(writer, request.shader);
     writeGuestContext(writer, request.context);
     writeSpirvTarget(writer, request.target);
@@ -783,6 +832,10 @@ std::string RequestSerializer::Serialize(const RecompileRequest& request) const 
     if (request.context.compute.has_value()) writer.WriteU32(request.context.compute->scratchDwords);
     writer.WriteBool(request.target.narrowSubgroupClock);
     writer.WriteBool(request.target.float64DenormPreserve);
+    writer.WriteBool(request.target.registrationModules);
+    writer.WriteU32(request.target.registrationWordLimit);
+    writer.WriteBool(request.target.vertexSubgroups);
+    writer.WriteBool(request.target.float16DenormPreserve);
     return base64Encode(buffer);
 }
 
@@ -791,28 +844,13 @@ DeserializedRequest RequestSerializer::Deserialize(std::string_view text) const 
     Reader reader(decoded);
     if (reader.ReadU32() != 0x41505335u) throw std::runtime_error("invalid recompile request signature");
     const auto version = reader.ReadU32();
-    if (version < 1u || version > 21u) throw std::runtime_error("unsupported recompile request serialization version");
-    DeserializedRequest result{};
-    result.request.shader = readShaderBinary(reader, result.shaderCode, result.shaderHeader);
-    result.request.context = readGuestContext(reader, result, version);
-    result.request.target = readSpirvTarget(reader, result);
-    result.request.layout = readBindingLayout(reader);
-    if (reader.ReadBool()) {
-        result.graphicsStorage = std::make_unique<DeserializedGraphicsCompileContext>();
-        result.request.graphics = readGraphicsCompileContext(reader, *result.graphicsStorage, version);
+    if (version < 1u || version > CurrentVersion) throw std::runtime_error("unsupported recompile request serialization version");
+    if (version < 17u || version > 21u) return deserialize(decoded, version, version >= CurrentVersion ? LocalFeatures : 0u, false);
+    try {
+        return deserialize(decoded, 16u, version, true);
+    } catch (const std::exception&) {
     }
-    if (version >= 2u) result.request.useCache = reader.ReadBool();
-    if (version >= 3u && result.request.context.compute.has_value()) {
-        for (std::uint32_t& value : result.request.context.compute->partialThreads) {
-            value = reader.ReadU32();
-        }
-    }
-    if (version >= 6u) result.request.target.nonConstantImageOffsets = reader.ReadBool();
-    if (version >= 9u) result.request.target.srgbDecodeFormats = reader.ReadU32();
-    if (version >= 10u && result.request.context.compute.has_value()) result.request.context.compute->scratchDwords = reader.ReadU32();
-    if (version >= 12u) result.request.target.narrowSubgroupClock = reader.ReadBool();
-    if (version >= 16u) result.request.target.float64DenormPreserve = reader.ReadBool();
-    return result;
+    return deserialize(decoded, version, 0u, false);
 }
 
 }

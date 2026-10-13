@@ -16,6 +16,7 @@ struct PreparedDescriptorBinding {
     std::vector<bool> identityImageSwizzle;
     std::vector<std::uint32_t> samplerFilterElements;
     std::vector<std::uint32_t> tableSamplerMasks;
+    std::vector<bool> inactive;
     std::size_t writtenBuffers = 0;
     std::size_t readOnlyBuffers = 0;
 };
@@ -42,12 +43,13 @@ struct DescriptorBindingPlan {
     std::vector<PreparedDescriptorBinding> bindings;
     std::vector<PreparedImageMetadata> imageMetadata;
     std::vector<PipelineSpecializationConstant> specialization;
+    std::vector<std::uint32_t> runtimeState;
     bool storageData = false;
 };
 
 class DescriptorBindingBuilder {
 public:
-    DescriptorBindingPlan Prepare(const IrBindingLayout& layout, const ShaderInfo& info, IrShaderStage stage, const ResourceSnapshot& snapshot, std::span<const std::uint8_t> exportMappings = {}, std::span<const BufferSubstitute> substitutes = {}) const;
+    DescriptorBindingPlan Prepare(const IrBindingLayout& layout, const ShaderInfo& info, IrShaderStage stage, const ResourceSnapshot& snapshot, std::span<const std::uint8_t> exportMappings = {}, bool registrationModules = false, bool fragmentDescriptorSet = false, std::span<const BufferSubstitute> substitutes = {}) const;
     DescriptorBindingPlan Select(const DescriptorBindingPlan& plan, std::span<const std::uint32_t> bindings) const;
     void Populate(BindingAllocationResult& allocation, const CompiledBindingLayout& compiled, const DescriptorBindingPlan& plan, std::uint32_t userDataBase, const ResourceSnapshot& snapshot, const std::array<std::uint32_t, 3>& partialThreads, const ResolvedImageTables* tables = nullptr) const;
     void Populate(BindingAllocationResult& allocation, const IrProgram& program, const ResourceSnapshot& snapshot, const std::array<std::uint32_t, 3>& partialThreads, std::span<const std::uint8_t> exportMappings = {}) const;

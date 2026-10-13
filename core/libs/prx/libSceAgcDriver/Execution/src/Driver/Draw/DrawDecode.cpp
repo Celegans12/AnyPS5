@@ -109,22 +109,15 @@ void DecodeGraphicsPrograms(DrawDecode& decoded, const QueueState& queue, const 
 
 std::shared_ptr<DrawDecode> Driver::decodeDraw(const QueueState& queue, const Submission& submission) {
     auto product = std::make_shared<DrawDecode>();
-    bool vertexWorkgroup = false;
-    const auto stages = queue.context.find(0x2d5);
-    const auto low = queue.shader.find(0xc8);
-    const auto high = queue.shader.find(0xc9);
-    if (stages != queue.context.end() && (stages->second & 0x02002024u) == 0x2000u && low != queue.shader.end() && high != queue.shader.end()) {
-        const auto address = (static_cast<std::uint64_t>(low->second) << 8u) | (static_cast<std::uint64_t>(high->second & 0xffu) << 40u);
-        const auto front = ProgramSnapshot(*submission.shaders, address, {2});
-        vertexWorkgroup = front->header.empty() && ProgramUsesWorkgroup(*front, static_cast<std::size_t>((address - front->codeAddress) / sizeof(std::uint32_t)));
-    }
-    product->state = Graphics::DecodeState(queue, vertexWorkgroup);
+    product->state = Graphics::DecodeState(queue, VertexWorkgroupRequired(queue, *submission.shaders));
     DecodeGraphicsPrograms(*product, queue, *submission.shaders, false, true);
     product->pixel = Graphics::DecodePixelStageInfo(queue.context, Graphics::ExportMappings(product->state), Graphics::PixelProgramSkipped(queue));
     product->pixel.targetExportPacking = Graphics::ExportPackings(product->state);
     product->pixel.dualSourceBlend = product->state.dualSourceBlend;
     product->pixel.alphaToCoverage = product->state.alphaToCoverage;
     product->pixel.targetBlend = product->state.targetBlends;
+    if (product->pixel.ancillary) product->pixel.rasterPrimitive = Graphics::RasterPrimitiveOf(product->state);
+    if (product->pixel.ancillary) product->pixel.layerExported = product->state.layerExports != 0;
     return product;
 }
 

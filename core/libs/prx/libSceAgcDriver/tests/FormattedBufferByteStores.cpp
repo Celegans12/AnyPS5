@@ -79,19 +79,22 @@ Counts Count(std::span<const std::uint32_t> words) {
     return counts;
 }
 
-Counts Compile(bool byteAccess) {
-    const std::array<std::uint32_t, 6> code{0xe0000000u, 0x80020a00u, 0xbf8c3f70u, 0xe0100000u, 0x80020a00u, 0xbf810000u};
+Counts Compile(bool byteAccess, bool vertex = false) {
+    std::vector<std::uint32_t> code{0xe0000000u, 0x80020a00u, 0xbf8c3f70u, 0xe0100000u, 0x80020a00u};
+    if (vertex) code.insert(code.end(), {0xf80008cfu, 0x03020100u});
+    code.push_back(0xbf810000u);
     const std::span<const std::uint32_t> words(code);
     const std::array<MemoryRegion, 1> memory{{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(words)}}};
     const std::array<std::uint32_t, 12> userData{0u, 0u, 0u, 0u, 0x10000000u, 0u, 0x1000u, 0x31016facu, 0x20000000u, 0u, 0x1000u, 0x31038facu};
     RecompileRequest request{};
-    request.shader = {ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), words, 0, {}};
+    request.shader = {vertex ? ShaderStage::Vertex : ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), words, 0, {}};
     request.target = Target(byteAccess);
     request.layout = {0, 0, 0, 128};
     request.context.waveSize = 32;
     request.context.userDataBaseRegister = 0;
     request.context.userData = userData;
-    request.context.compute = ShaderComputeStageInfo{{32u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
+    if (vertex) request.context.vertex = ShaderVertexStageInfo{};
+    else request.context.compute = ShaderComputeStageInfo{{32u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
     request.context.memory = memory;
     request.useCache = false;
     return Count(Recompile(request).spirv.Words());

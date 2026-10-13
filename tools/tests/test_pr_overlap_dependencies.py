@@ -12,8 +12,25 @@ def pull_requests(body):
     response = [{"number": number, "user": {"login": "contributor"}, "head": {"sha": str(number) * 40},
                  "body": body if number == 1 else "Depends on: none"} for number in (1, 2)]
     with patch.object(pr_overlap, "REPO", "owner/repo", create=True), \
-            patch.object(pr_overlap, "gh", return_value=json.dumps([response])):
+            patch.object(pr_overlap, "gh", return_value=json.dumps(response)):
         return pr_overlap.open_prs("main")
+
+
+STACK = {
+    1: (set(), {"one.cpp"}, {"sceFooInit"}),
+    2: ({1, 999}, {"one.cpp", "two.cpp"}, {"sceFooInit"}),
+    3: ({2}, {"one.cpp", "two.cpp", "three.cpp"}, {"sceFooInit"}),
+    4: ({1}, {"one.cpp", "four.cpp"}, {"sceFooInit", "sceFooTerm"}),
+    5: ({1}, {"one.cpp", "four.cpp"}, {"sceFooInit", "sceFooTerm"}),
+    6: (set(), {"one.cpp"}, {"sceFooInit"}),
+    7: ({8}, {"one.cpp", "seven.cpp"}, {"sceFooInit"}),
+    8: ({7, 1}, {"one.cpp", "seven.cpp"}, {"sceFooInit"}),
+}
+
+
+def stacked_pull_requests():
+    return {number: {"author": f"author{number}", "depends": depends, "added": added, "exports": exports, "tree": None}
+            for number, (depends, added, exports) in STACK.items()}
 
 
 class DependencyTests(unittest.TestCase):
@@ -54,6 +71,15 @@ class DependencyTests(unittest.TestCase):
             with self.subTest(body=body):
                 self.assertEqual(pull_requests(body)[1]["depends"], {2})
 
+    def test_colon_declaration_stops_before_unrelated_prose(self):
+        for body in ("Depends on: #2. Related #3 covers something else.",
+                     "Depends on: #2; related #3 covers something else.",
+                     "Depends on: none; see issue #3.",
+                     "Depends on: #2, related work is in #3."):
+            with self.subTest(body=body):
+                expected = set() if "none" in body else {2}
+                self.assertEqual(pull_requests(body)[1]["depends"], expected)
+
     def test_checklist_declaration_keeps_precedence(self):
         for declaration, expected in (("#3", {3}), ("none", set())):
             body = "Previously: Depends on #2.\n\n- [x] Depends on: " + declaration
@@ -84,6 +110,31 @@ class DependencyTests(unittest.TestCase):
         for pr in prs.values():
             pr["added"] = {"shared.cpp"}
         self.assertEqual(pr_overlap.overlaps(prs, 1, 2), {"added": {"shared.cpp"}})
+
+
+class StackedDependencyTests(unittest.TestCase):
+    def test_transitive_dependency_suppresses_overlap(self):
+        prs = stacked_pull_requests()
+        self.assertIsNone(pr_overlap.overlaps(prs, 1, 3))
+        self.assertIsNone(pr_overlap.overlaps(prs, 3, 1))
+
+    def test_changes_inherited_from_a_shared_dependency_are_not_overlap(self):
+        prs = stacked_pull_requests()
+        self.assertIsNone(pr_overlap.overlaps(prs, 3, 4))
+        self.assertIsNone(pr_overlap.overlaps(prs, 2, 4))
+
+    def test_overlap_beyond_a_shared_dependency_is_kept(self):
+        self.assertEqual(pr_overlap.overlaps(stacked_pull_requests(), 4, 5),
+                         {"added": {"four.cpp"}, "conflicts": {}, "exports": {"sceFooTerm"}})
+
+    def test_independent_pull_request_keeps_inherited_overlap(self):
+        self.assertEqual(pr_overlap.overlaps(stacked_pull_requests(), 3, 6),
+                         {"added": {"one.cpp"}, "conflicts": {}, "exports": {"sceFooInit"}})
+
+    def test_dependency_cycle_terminates(self):
+        prs = stacked_pull_requests()
+        self.assertIsNone(pr_overlap.overlaps(prs, 7, 8))
+        self.assertIsNone(pr_overlap.overlaps(prs, 8, 2))
 
 
 if __name__ == "__main__":

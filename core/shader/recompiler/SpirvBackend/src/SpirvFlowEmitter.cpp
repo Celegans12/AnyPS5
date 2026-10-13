@@ -133,7 +133,7 @@ bool IsContinueTarget(const IrProgram& program, std::uint32_t block) {
 
 std::uint32_t EmitWaveAny(SpirvEmitterState& state, std::uint32_t predicate) {
     const auto ballot = state.module.AllocateId();
-    state.module.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4u), ballot, ConstantU32(state, spv::ScopeSubgroup), predicate);
+    EmitSubgroupBallot(state, ballot, predicate);
     const auto wave = EmitWaveBallot(state, ballot);
     const auto low = state.module.AllocateId();
     const auto high = state.module.AllocateId();
@@ -217,6 +217,11 @@ void EmitStructuredTerminator(SpirvValueEmitContext& ctx, const IrProgram& progr
                 const std::string where = resolved->Parent() == nullptr ? std::string("no block") : "block " + std::to_string(resolved->Parent()->Id());
                 const std::string message = "branch condition " + std::string(IrOpcodeName(resolved->Opcode())) + " of block " + std::to_string(info.id) + " (defined in " + where + ") was not emitted before the branch";
                 ctx.Fail(message.c_str());
+            }
+            if (ctx.Label(trueBlock) == ctx.Label(falseBlock)) {
+                if (term.loopHeader) emitMerge();
+                state.module.AddFunction(spv::OpBranch, ctx.Label(trueBlock));
+                return;
             }
             auto condition = EmitBranchCondition(ctx, info);
             if (state.loopGuardLimit != 0 && term.trueBlock != term.falseBlock) {
@@ -309,6 +314,8 @@ void EmitDirectInstruction(SpirvValueEmitContext& ctx, const IrValue& inst) {
         case IrOpcode::SetScalarRegister: return Invoke(EmitSetScalarRegister, ctx, inst);
         case IrOpcode::GetVectorRegister: return Invoke(EmitGetVectorRegister, ctx, inst);
         case IrOpcode::SetVectorRegister: return Invoke(EmitSetVectorRegister, ctx, inst);
+        case IrOpcode::LoadVectorWindow: return Invoke(EmitLoadVectorWindow, ctx, inst);
+        case IrOpcode::StoreVectorWindow: return Invoke(EmitStoreVectorWindow, ctx, inst);
         case IrOpcode::GetGotoVariable: return Invoke(EmitGetGotoVariable, ctx, inst);
         case IrOpcode::SetGotoVariable: return Invoke(EmitSetGotoVariable, ctx, inst);
         case IrOpcode::GetScc: return Invoke(EmitGetScc, ctx, inst);
@@ -357,6 +364,8 @@ void EmitDirectInstruction(SpirvValueEmitContext& ctx, const IrValue& inst) {
         case IrOpcode::CompositeExtractU32x4: return Invoke(EmitCompositeExtractU32x4, ctx, inst);
         case IrOpcode::PackHalf2x16: return Invoke(EmitPackHalf2x16, ctx, inst);
         case IrOpcode::PackFloat2x16Rtz: return Invoke(EmitPackFloat2x16Rtz, ctx, inst);
+        case IrOpcode::FPAdd16x2: return Invoke(EmitFPAdd16x2, ctx, inst);
+        case IrOpcode::FPMul16x2: return Invoke(EmitFPMul16x2, ctx, inst);
         case IrOpcode::FPAbs32: return Invoke(EmitFPAbs32, ctx, inst);
         case IrOpcode::FPNeg32: return Invoke(EmitFPNeg32, ctx, inst);
         case IrOpcode::FPSaturate32: return Invoke(EmitFPSaturate32, ctx, inst);

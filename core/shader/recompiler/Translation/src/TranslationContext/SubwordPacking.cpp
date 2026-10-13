@@ -125,7 +125,10 @@ IrU32 TranslationContext::readU16LaneRaw(const RdnaOperand& operand, bool highLa
 }
 
 IrU32 TranslationContext::readU16LaneAsU32(const RdnaOperand& operand, bool highLane, bool signExtend) {
-    const IrU32 raw = readU16LaneRaw(operand, highLane ? operand.opSelHi : operand.opSel);
+    IrU32 raw = readU16LaneRaw(operand, highLane ? operand.opSelHi : operand.opSel);
+    if (highLane ? operand.negateHi : operand.negate) {
+        raw = IrU32(ir.BitwiseXor(raw.Value(), ir.Constant(0x8000u)));
+    }
     if (!signExtend) {
         return raw;
     }
@@ -158,6 +161,27 @@ void TranslationContext::write16Bits(const RdnaOperand& operand, IrU32 value) {
 
 bool TranslationContext::directedF16Rounding() const {
     return floatMode.has_value() && ((floatMode->floatMode >> 2u) & 3u) != 0u && ((floatMode->floatMode >> 6u) & 3u) == 3u;
+}
+
+IrU32 TranslationContext::flushF16Bits(IrU32 bits, std::uint32_t keepBit) {
+    if (!floatMode.has_value() || (floatMode->floatMode & keepBit) != 0u) return bits;
+    const IrU1 tiny(ir.ULessThan(ir.BitwiseAnd(bits.Value(), ir.Constant(0x7fffu)), ir.Constant(0x0400u)));
+    return IrU32(ir.Select(tiny.Value(), ir.BitwiseAnd(bits.Value(), ir.Constant(0x8000u)), bits.Value()));
+}
+
+IrU32 TranslationContext::flushF16Input(IrU32 bits) {
+    return flushF16Bits(bits, 0x40u);
+}
+
+IrU32 TranslationContext::flushF16Result(IrU32 bits) {
+    return flushF16Bits(bits, 0x80u);
+}
+
+IrF32 TranslationContext::flushF16InputValue(IrF32 value) {
+    if (!floatMode.has_value() || (floatMode->floatMode & 0x40u) != 0u) return value;
+    const IrU32 bits(ir.BitCastU32(value.Value()));
+    const IrU1 tiny(ir.ULessThan(ir.BitwiseAnd(bits.Value(), ir.Constant(0x7fffffffu)), ir.Constant(0x38800000u)));
+    return IrF32(ir.BitCastF32(ir.Select(tiny.Value(), ir.BitwiseAnd(bits.Value(), ir.Constant(0x80000000u)), bits.Value())));
 }
 
 IrU32 TranslationContext::convertF32ToF16Bits(IrF32 value, std::initializer_list<IrValue*> sources) {

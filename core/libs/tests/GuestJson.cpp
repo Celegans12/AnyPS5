@@ -35,6 +35,10 @@ void APS5_VABI _ZN3sce4Json6StringD1Ev(String*);
 const char* APS5_VABI _ZNK3sce4Json6String5c_strEv(const String*);
 std::size_t APS5_VABI _ZNK3sce4Json6String6lengthEv(const String*);
 void APS5_VABI _ZN3sce4Json5ArrayC1Ev(Array*);
+void APS5_VABI _ZN3sce4Json5ArrayC1ERKS1_(Array*, const Array*);
+void APS5_VABI _ZN3sce4Json5Array5clearEv(Array*);
+const Value* APS5_VABI _ZNK3sce4Json5Array5frontEv(const Array*);
+Value* APS5_VABI _ZNK3sce4Json5Array8iteratorptEv(const Iterator*);
 void APS5_VABI _ZN3sce4Json5ArrayD1Ev(Array*);
 void APS5_VABI _ZN3sce4Json5Array9push_backERKNS0_5ValueE(Array*, const Value*);
 Iterator* APS5_VABI _ZNK3sce4Json5Array5beginEv(Iterator*, const Array*);
@@ -53,6 +57,9 @@ Iterator* APS5_VABI _ZNK3sce4Json6Object3endEv(Iterator*, const Object*);
 void APS5_VABI _ZN3sce4Json6Object8iteratorD1Ev(Iterator*);
 Iterator* APS5_VABI _ZN3sce4Json6Object8iteratorppEv(Iterator*);
 Pair* APS5_VABI _ZNK3sce4Json6Object8iteratordeEv(const Iterator*);
+Pair* APS5_VABI _ZNK3sce4Json6Object8iteratorptEv(const Iterator*);
+Iterator* APS5_VABI _ZNK3sce4Json6Object4findERKNS0_6StringE(Iterator*, const Object*, const String*);
+int APS5_VABI _ZNK3sce4Json6String7compareEPKc(const String*, const char*);
 bool APS5_VABI _ZNK3sce4Json6Object8iteratorneERKS2_(const Iterator*, const Iterator*);
 void APS5_VABI _ZN3sce4Json5ValueC1Ev(Value*);
 void APS5_VABI _ZN3sce4Json5ValueC1Eb(Value*, bool);
@@ -75,6 +82,7 @@ Value* APS5_VABI _ZN3sce4Json5Value10referValueERKNS0_6StringE(Value*, const Str
 const Value* APS5_VABI _ZNK3sce4Json5ValueixEm(const Value*, std::size_t);
 int APS5_VABI _ZN3sce4Json5Value9serializeERNS0_6StringE(Value*, String*);
 int APS5_VABI _ZN3sce4Json6Parser5parseERNS0_5ValueEPKcm(Value*, const char*, std::size_t);
+int APS5_VABI _ZN3sce4Json6Parser5parseERNS0_5ValueEPFiRcPvES5_(Value*, int (APS5_VABI*)(char&, void*), void*);
 bool APS5_VABI _ZNK3sce4Json6Object5emptyEv(const Object*);
 std::size_t APS5_VABI _ZNK3sce4Json6Object4sizeEv(const Object*);
 const Object* APS5_VABI _ZNK3sce4Json5Value9getObjectEv(const Value*);
@@ -83,9 +91,13 @@ const Value* APS5_VABI _ZNK3sce4Json5Value8getValueEm(const Value*, std::size_t)
 const Value* APS5_VABI _ZNK3sce4Json5Value8getValueERKNS0_6StringE(const Value*, const String*);
 Value* APS5_VABI _ZN3sce4Json5Value10referValueEm(Value*, std::size_t);
 void APS5_VABI _ZN3sce4Json14InitParameter2C1Ev(void*);
+void APS5_VABI _ZN3sce4Json14InitParameter2C2Ev(void*);
 void APS5_VABI _ZN3sce4Json14InitParameter212setAllocatorEPNS0_12MemAllocatorEPv(void*, void*, void*);
 void APS5_VABI _ZN3sce4Json14InitParameter217setFileBufferSizeEm(void*, std::size_t);
 int APS5_VABI _ZN3sce4Json11Initializer10initializeEPKNS0_14InitParameter2E(void*, const void*);
+void APS5_VABI _ZN3sce4Json18InitParameterRtti216setAllocatorRttiEPNS0_14AllocParamRttiEPv(void*, void*, void*);
+void APS5_VABI _ZN3sce4Json14InitParameter225setSpecialFloatFormatTypeENS0_22SpecialFloatFormatTypeE(void*, std::int32_t);
+void APS5_VABI _ZN3sce4Json17InitParameterRttiC1EPNS0_14AllocParamRttiEPvm(void*, void*, void*, std::size_t);
 }
 
 static void Check(bool value, int line) {
@@ -268,7 +280,75 @@ static void ObjectsAndArrays() {
     _ZNK3sce4Json5Array3endEv(&end, &array);
     for (; _ZNK3sce4Json5Array8iteratorneERKS2_(&it, &end); _ZN3sce4Json5Array8iteratorppEv(&it)) ++visited;
     Require(visited == 2);
+    Require(*_ZNK3sce4Json5Value10getBooleanEv(_ZNK3sce4Json5Array5frontEv(&array)));
+    _ZNK3sce4Json5Array5beginEv(&it, &array);
+    Require(_ZNK3sce4Json5Array8iteratorptEv(&it) == _ZNK3sce4Json5Array8iteratordeEv(&it));
+    Array copy{};
+    _ZN3sce4Json5ArrayC1ERKS1_(&copy, &array);
+    _ZN3sce4Json5Array5clearEv(&array);
+    Require(_ZNK3sce4Json5Array4sizeEv(&array) == 0);
+    bool threw = false;
+    try {
+        _ZNK3sce4Json5Array5frontEv(&array);
+    } catch (const std::out_of_range&) {
+        threw = true;
+    }
+    Require(threw);
+    Require(_ZNK3sce4Json5Array4sizeEv(&copy) == 2);
+    Require(*_ZNK3sce4Json5Value10getBooleanEv(_ZNK3sce4Json5Array5frontEv(&copy)));
+    Require(*_ZNK3sce4Json5Value7getRealEv(_ZNK3sce4Json5Array4backEv(&copy)) == 2.5);
+    _ZN3sce4Json5ArrayD1Ev(&copy);
     _ZN3sce4Json5ArrayD1Ev(&array);
+}
+
+static void ObjectFind() {
+    Object object{};
+    _ZN3sce4Json6ObjectC1Ev(&object);
+    String alpha{}, beta{}, gamma{};
+    _ZN3sce4Json6StringC1EPKc(&alpha, "alpha");
+    _ZN3sce4Json6StringC1EPKc(&beta, "beta");
+    _ZN3sce4Json6StringC1EPKc(&gamma, "gamma");
+    Iterator found{}, end{};
+    _ZNK3sce4Json6Object3endEv(&end, &object);
+    _ZNK3sce4Json6Object4findERKNS0_6StringE(&found, &object, &alpha);
+    Require(!_ZNK3sce4Json6Object8iteratorneERKS2_(&found, &end));
+    _ZN3sce4Json6Object8iteratorD1Ev(&found);
+    _ZN3sce4Json6Object8iteratorD1Ev(&end);
+
+    Require(_ZN3sce4Json5Value3setEl(_ZN3sce4Json6ObjectixERKNS0_6StringE(&object, &alpha), 1) == 0);
+    Value* second = _ZN3sce4Json6ObjectixERKNS0_6StringE(&object, &beta);
+    Require(_ZN3sce4Json5Value3setEPKc(second, "b") == 0);
+    _ZNK3sce4Json6Object3endEv(&end, &object);
+    Iterator* returned = _ZNK3sce4Json6Object4findERKNS0_6StringE(&found, &object, &beta);
+    Require(returned == &found);
+    Require(_ZNK3sce4Json6Object8iteratorneERKS2_(&found, &end));
+    const Pair* pair = _ZNK3sce4Json6Object8iteratorptEv(&found);
+    Require(pair == _ZNK3sce4Json6Object8iteratordeEv(&found));
+    Require(&pair->value == second);
+    Require(std::strcmp(_ZNK3sce4Json6String5c_strEv(&pair->key), "beta") == 0);
+    _ZN3sce4Json6Object8iteratorppEv(&found);
+    Require(!_ZNK3sce4Json6Object8iteratorneERKS2_(&found, &end));
+    _ZNK3sce4Json6Object4findERKNS0_6StringE(&found, &object, &gamma);
+    Require(!_ZNK3sce4Json6Object8iteratorneERKS2_(&found, &end));
+    Require(_ZNK3sce4Json6Object4sizeEv(&object) == 2);
+    _ZN3sce4Json6Object8iteratorD1Ev(&found);
+    _ZN3sce4Json6Object8iteratorD1Ev(&end);
+
+    Require(_ZNK3sce4Json6String7compareEPKc(&beta, "beta") == 0);
+    Require(_ZNK3sce4Json6String7compareEPKc(&beta, "betb") < 0);
+    Require(_ZNK3sce4Json6String7compareEPKc(&beta, "bet") > 0);
+    Require(_ZNK3sce4Json6String7compareEPKc(&beta, "alpha") > 0);
+    bool threw = false;
+    try {
+        static_cast<void>(_ZNK3sce4Json6String7compareEPKc(&beta, nullptr));
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    Require(threw);
+    _ZN3sce4Json6StringD1Ev(&alpha);
+    _ZN3sce4Json6StringD1Ev(&beta);
+    _ZN3sce4Json6StringD1Ev(&gamma);
+    _ZN3sce4Json6ObjectD1Ev(&object);
 }
 
 static void NullAccess(SetNullAccessCallback setCallback) {
@@ -361,6 +441,106 @@ static void ValueAccess() {
     Require(_ZN3sce4Json11InitializerD1Ev(initializer) == 0);
 }
 
+static void InitParameter2BaseConstructor() {
+    alignas(16) std::uint8_t parameter[40];
+    std::memset(parameter, 0xff, sizeof(parameter));
+    _ZN3sce4Json14InitParameter2C1Ev(parameter);
+    alignas(16) std::uint8_t baseStorage[72];
+    std::memset(baseStorage, 0xff, sizeof(baseStorage));
+    auto* baseParameter = baseStorage + 16;
+    _ZN3sce4Json14InitParameter2C2Ev(baseParameter);
+    Require(std::memcmp(parameter, baseParameter, sizeof(parameter)) == 0);
+    void* defaultAllocator;
+    void* defaultUserData;
+    std::size_t defaultFileBufferSize;
+    std::memcpy(&defaultAllocator, baseParameter, sizeof(defaultAllocator));
+    std::memcpy(&defaultUserData, baseParameter + sizeof(void*), sizeof(defaultUserData));
+    std::memcpy(&defaultFileBufferSize, baseParameter + 2 * sizeof(void*), sizeof(defaultFileBufferSize));
+    Require(defaultAllocator == nullptr && defaultUserData == nullptr && defaultFileBufferSize == 0);
+    int allocator = 0;
+    int userData = 0;
+    _ZN3sce4Json14InitParameter212setAllocatorEPNS0_12MemAllocatorEPv(baseParameter, &allocator, &userData);
+    _ZN3sce4Json14InitParameter217setFileBufferSizeEm(baseParameter, 4096);
+    void* storedAllocator;
+    void* storedUserData;
+    std::size_t storedFileBufferSize;
+    std::memcpy(&storedAllocator, baseParameter, sizeof(storedAllocator));
+    std::memcpy(&storedUserData, baseParameter + sizeof(void*), sizeof(storedUserData));
+    std::memcpy(&storedFileBufferSize, baseParameter + 2 * sizeof(void*), sizeof(storedFileBufferSize));
+    Require(storedAllocator == &allocator && storedUserData == &userData && storedFileBufferSize == 4096);
+    for (std::size_t i = 0; i < 16; ++i) Require(baseStorage[i] == 0xff);
+    for (std::size_t i = 16 + sizeof(parameter); i < sizeof(baseStorage); ++i)
+        Require(baseStorage[i] == 0xff);
+    alignas(16) std::uint8_t initializer[16]{};
+    Require(_ZN3sce4Json11InitializerC1Ev(initializer) == 0);
+    Require(_ZN3sce4Json11Initializer10initializeEPKNS0_14InitParameter2E(initializer, baseParameter) == 0);
+    Require(_ZN3sce4Json11Initializer9terminateEv(initializer) == 0);
+    Require(_ZN3sce4Json11InitializerD1Ev(initializer) == 0);
+}
+
+struct StoredInitParameter2 {
+    void* allocator;
+    void* userData;
+    std::size_t fileBufferSize;
+    std::int32_t specialFloatFormatType;
+    std::uint32_t reserved[3];
+};
+static_assert(sizeof(StoredInitParameter2) == 40);
+
+static StoredInitParameter2 Stored(const std::uint8_t* parameter) {
+    StoredInitParameter2 stored{};
+    std::memcpy(&stored, parameter, sizeof(stored));
+    return stored;
+}
+
+static bool Untouched(const std::uint8_t* parameter, std::size_t from) {
+    for (std::size_t i = from; i < 40; ++i)
+        if (parameter[i] != 0xff) return false;
+    return true;
+}
+
+static void InitParameters() {
+    using Constructor = void (APS5_VABI*)(void*);
+    for (Constructor construct : {_ZN3sce4Json14InitParameter2C1Ev, _ZN3sce4Json14InitParameter2C2Ev}) {
+        alignas(16) std::uint8_t parameter[40];
+        std::memset(parameter, 0xff, sizeof(parameter));
+        construct(parameter);
+        StoredInitParameter2 stored = Stored(parameter);
+        Require(stored.allocator == nullptr && stored.userData == nullptr && stored.fileBufferSize == 0);
+        Require(stored.specialFloatFormatType == 0);
+        Require(stored.reserved[0] == 0 && stored.reserved[1] == 0 && stored.reserved[2] == 0);
+
+        int allocParam = 0;
+        int userData = 0;
+        _ZN3sce4Json14InitParameter217setFileBufferSizeEm(parameter, 8192);
+        _ZN3sce4Json14InitParameter225setSpecialFloatFormatTypeENS0_22SpecialFloatFormatTypeE(parameter, 2);
+        _ZN3sce4Json18InitParameterRtti216setAllocatorRttiEPNS0_14AllocParamRttiEPv(parameter, &allocParam, &userData);
+        stored = Stored(parameter);
+        Require(stored.allocator == &allocParam && stored.userData == &userData && stored.fileBufferSize == 8192);
+        Require(stored.specialFloatFormatType == 2);
+        Require(stored.reserved[0] == 0 && stored.reserved[1] == 0 && stored.reserved[2] == 0);
+
+        _ZN3sce4Json14InitParameter225setSpecialFloatFormatTypeENS0_22SpecialFloatFormatTypeE(parameter, 0);
+        Require(Stored(parameter).specialFloatFormatType == 0 && Stored(parameter).fileBufferSize == 8192);
+
+        alignas(16) std::uint8_t initializer[16]{};
+        Require(_ZN3sce4Json11InitializerC1Ev(initializer) == 0);
+        Require(_ZN3sce4Json11Initializer10initializeEPKNS0_14InitParameter2E(initializer, parameter) == 0);
+        Require(_ZN3sce4Json11Initializer9terminateEv(initializer) == 0);
+        Require(_ZN3sce4Json11InitializerD1Ev(initializer) == 0);
+    }
+
+    alignas(16) std::uint8_t rttiParameter[40];
+    std::memset(rttiParameter, 0xff, sizeof(rttiParameter));
+    int allocParam = 0;
+    int userData = 0;
+    _ZN3sce4Json17InitParameterRttiC1EPNS0_14AllocParamRttiEPvm(rttiParameter, &allocParam, &userData, 4096);
+    void* rttiStored[3]{};
+    std::memcpy(rttiStored, rttiParameter, sizeof(rttiStored));
+    Require(rttiStored[0] == &allocParam && rttiStored[1] == &userData && reinterpret_cast<std::uintptr_t>(rttiStored[2]) == 4096);
+    Require(Untouched(rttiParameter, sizeof(rttiStored)));
+}
+
 static void ValueClear() {
     Value value{};
     _ZN3sce4Json5ValueC1Ev(&value);
@@ -384,6 +564,7 @@ static void ValueClear() {
     _ZN3sce4Json6StringC1EPKc(&key, "prop");
     Value* item = _ZN3sce4Json6ObjectixERKNS0_6StringE(&obj, &key);
     _ZN3sce4Json5Value3setEl(item, 999);
+    _ZN3sce4Json5ValueD1Ev(&value);
     _ZN3sce4Json5ValueC1ERKNS0_6ObjectE(&value, &obj);
     Require(_ZNK3sce4Json5Value7getTypeEv(&value) == TypeObject);
     _ZN3sce4Json5Value5clearEv(&value);
@@ -398,12 +579,47 @@ static void ValueClear() {
     _ZN3sce4Json5ValueD1Ev(&value);
 }
 
+struct ReadState {
+    const char* text;
+    std::size_t position;
+    int calls;
+};
+
+static int APS5_VABI ReadNext(char& ch, void* context) {
+    auto* state = static_cast<ReadState*>(context);
+    ++state->calls;
+    if (state->text[state->position] == '\0') {
+        ch = '\0';
+        return -1;
+    }
+    ch = state->text[state->position++];
+    return 0;
+}
+
+static void StreamParse() {
+    Value root{};
+    _ZN3sce4Json5ValueC1Ev(&root);
+    ReadState valid{"{\"list\": [1, 2.5, true]}", 0, 0};
+    Require(_ZN3sce4Json6Parser5parseERNS0_5ValueEPFiRcPvES5_(&root, ReadNext, &valid) == 0);
+    Require(valid.calls == static_cast<int>(std::strlen(valid.text)) + 1);
+    Require(_ZNK3sce4Json5Value7getTypeEv(&root) == TypeObject);
+    ReadState invalid{"{\"list\": [1, 2.5", 0, 0};
+    Require(_ZN3sce4Json6Parser5parseERNS0_5ValueEPFiRcPvES5_(&root, ReadNext, &invalid) < 0);
+    ReadState trailing{"[1] 2", 0, 0};
+    Require(_ZN3sce4Json6Parser5parseERNS0_5ValueEPFiRcPvES5_(&root, ReadNext, &trailing) < 0);
+    _ZN3sce4Json5ValueD1Ev(&root);
+}
+
 int main() {
     ParseAndRoundTrip();
     NestingDepth();
     ObjectsAndArrays();
+    ObjectFind();
     NullAccess(_ZN3sce4Json11Initializer27setGlobalNullAccessCallBackEPFRKNS0_5ValueENS0_9ValueTypeEPS3_PvES7_);
     NullAccess(_ZN3sce4Json11Initializer27setGlobalNullAccessCallbackEPFRKNS0_5ValueENS0_9ValueTypeEPS3_PvES7_);
     ValueAccess();
+    InitParameter2BaseConstructor();
+    InitParameters();
     ValueClear();
+    StreamParse();
 }

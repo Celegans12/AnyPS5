@@ -2,7 +2,6 @@
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "IntermediateRepresentation/IrMetadata.hpp"
 #include <array>
-#include <cmath>
 #include <cstdint>
 #include <stdexcept>
 
@@ -137,6 +136,7 @@ ShaderStageInputInfo BuildShaderStageInputInfo(ShaderStageKind stage, const Gues
         pixelStorage.psPixelKillEnable = pixel.pixelKillEnable;
         pixelStorage.psDepthExportEnable = pixel.depthExportEnable;
         pixelStorage.psSampleMaskExportEnable = pixel.sampleMaskExportEnable;
+        pixelStorage.psStencilRefExportEnable = pixel.stencilRefExportEnable;
         pixelStorage.psSampleShading = pixel.sampleShading;
         pixelStorage.psEarlyZ = pixel.earlyZ;
         pixelStorage.psExecuteOnNoop = pixel.executeOnNoop;
@@ -161,7 +161,9 @@ ShaderStageInputInfo BuildShaderStageInputInfo(ShaderStageKind stage, const Gues
         auto& vertexStorage = HostThreadLocal<ShaderVertexInputInfo, VertexStorage>();
         vertexStorage = ShaderVertexInputInfo{};
         vertexStorage.logicalStage = _toIrShaderStage(stage);
+        vertexStorage.hostSubgroupSize = hostSubgroupSize;
         vertexStorage.fetchEmbedded = vertex.fetchEmbedded;
+        vertexStorage.paClVsOutCntl = vertex.paClVsOutCntl;
         vertexStorage.fetchExternal = false;
         vertexStorage.fetchAttribReg = static_cast<int>(vertex.fetchAttribReg);
         vertexStorage.fetchBufferReg = static_cast<int>(vertex.fetchBufferReg);
@@ -179,7 +181,6 @@ ShaderStageInputInfo BuildShaderStageInputInfo(ShaderStageKind stage, const Gues
             if (tessellation == nullptr) throw std::runtime_error("ShaderInputInfoBuilder: tessellation configuration is missing");
             if (tessellation->inputControlPoints == 0u || tessellation->inputControlPoints > 32u || tessellation->outputControlPoints == 0u || tessellation->outputControlPoints > 32u) throw std::runtime_error("ShaderInputInfoBuilder: invalid tessellation control-point counts");
             if ((tessellation->domain != 1u && tessellation->domain != 2u) || tessellation->partitioning != 2u || (tessellation->outputTopology != 2u && tessellation->outputTopology != 3u)) throw std::runtime_error("ShaderInputInfoBuilder: unsupported tessellation configuration");
-            if (!(tessellation->minLevel >= 0.0f && tessellation->minLevel <= 63.0f && tessellation->minLevel <= tessellation->maxLevel && tessellation->maxLevel >= 1.0f && std::isfinite(tessellation->maxLevel))) throw std::runtime_error("ShaderInputInfoBuilder: unsupported tessellation level clamps");
             if (tessellation->patchesPerGroup == 0u || tessellation->patchesPerGroup > 256u) throw std::runtime_error("ShaderInputInfoBuilder: invalid tessellation patches per group");
             auto& target = vertexStorage.tess;
             target.inputControlPoints = tessellation->inputControlPoints;
@@ -187,8 +188,6 @@ ShaderStageInputInfo BuildShaderStageInputInfo(ShaderStageKind stage, const Gues
             target.domain = tessellation->domain;
             target.partitioning = tessellation->partitioning;
             target.outputTopology = tessellation->outputTopology;
-            target.minLevel = tessellation->minLevel;
-            target.maxLevel = tessellation->maxLevel;
             target.patchesPerGroup = tessellation->patchesPerGroup;
             target.primitiveGroupSize = tessellation->primitiveGroupSize;
             target.breakAtInstance = tessellation->breakAtInstance;

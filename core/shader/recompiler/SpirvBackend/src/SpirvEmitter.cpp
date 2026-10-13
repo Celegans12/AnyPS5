@@ -118,7 +118,7 @@ std::uint32_t SpirvValueEmitContext::Ballot(const IrValue* predicate) {
     const auto ballotType = TypeU32Vector(state, 4u);
     const auto scope = ConstantU32(state, spv::ScopeSubgroup);
     const auto low = state.module.AllocateId();
-    state.module.AddFunction(spv::OpGroupNonUniformBallot, ballotType, low, scope, otherHalf == nullptr || half == 0u ? Def(predicate) : otherHalf->Def(predicate));
+    EmitSubgroupBallot(state, low, otherHalf == nullptr || half == 0u ? Def(predicate) : otherHalf->Def(predicate));
     if (otherHalf == nullptr) {
         return EmitWaveBallot(state, low);
     }
@@ -136,7 +136,7 @@ std::uint32_t SpirvValueEmitContext::Ballot(const IrValue* predicate) {
 std::uint32_t SpirvValueEmitContext::FirstLane(std::uint32_t ballot) {
     if (otherHalf == nullptr) {
         const auto result = state.module.AllocateId();
-        state.module.AddFunction(spv::OpGroupNonUniformBallotFindLSB, TypeU32(state), result, ConstantU32(state, spv::ScopeSubgroup), ballot);
+        EmitSubgroupBallotFindLsb(state, result, ballot);
         return result;
     }
     const auto low = state.module.AllocateId();
@@ -159,7 +159,7 @@ std::uint32_t SpirvValueEmitContext::Shuffle(const IrValue& inst, std::size_t in
     const auto scope = ConstantU32(state, spv::ScopeSubgroup);
     const auto low = state.module.AllocateId();
     if (otherHalf == nullptr) {
-        state.module.AddFunction(spv::OpGroupNonUniformShuffle, type, low, scope, Arg(inst, index), EmitHostSubgroupLane(state, lane));
+        EmitSubgroupShuffle(state, type, low, Arg(inst, index), EmitHostSubgroupLane(state, lane));
         return low;
     }
     const auto physicalLane = EmitBinaryU32(state, spv::OpBitwiseAnd, lane, ConstantU32(state, 31u));
@@ -250,7 +250,15 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
     state.nonConstantImageOffsets = target.nonConstantImageOffsets;
     state.narrowSubgroupClock = target.narrowSubgroupClock;
     state.float64DenormPreserve = target.float64DenormPreserve;
+    state.registrationModules = target.registrationModules;
+    state.fragmentDescriptorSet = target.fragmentDescriptorSet;
+    state.float16DenormPreserve = target.float16DenormPreserve;
     state.hostSubgroupSize = target.subgroupSize;
+    if (HostSubgroupSingleLane(state)) {
+        state.requirements.subgroupBallot = false;
+        state.requirements.subgroupShuffle = false;
+        state.requirements.subgroupLocalInvocationId = false;
+    }
     state.splitSubgroup = program.WaveSize() == 32u && target.subgroupSize > 32u;
     if (state.splitSubgroup && (state.requirements.subgroupBallot || state.requirements.subgroupShuffle)) state.requirements.subgroupLocalInvocationId = true;
     const auto* workgroup = ShaderWorkgroupInputFor(state);
