@@ -620,7 +620,7 @@ private:
                 break;
             case TessellationAttribute::ControlOutput:
                 if (address.vertex == 0) {
-                    if (controlStride == 0u || address.constant < outputs * controlStride) Fail("the hull shader writes off-chip memory outside its control points and patch constants", access.pc);
+                    if (controlStride == 0u || evaluator.Lowest(address) < static_cast<std::int64_t>(tessellation.patchesPerGroup) * outputs * controlStride) Fail("the hull shader writes off-chip memory outside its control points and patch constants", access.pc);
                     record(access, end);
                     access.kind = TessellationAttribute::PatchOutput;
                     requireFirstInvocation(access);

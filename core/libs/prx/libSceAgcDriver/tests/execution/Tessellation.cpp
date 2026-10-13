@@ -704,12 +704,13 @@ int main(int argc, char** argv) {
         ExpectRefusal(target, ShaderStage::TessellationControl, HullCode, "outside its patch's quad factors", {{3u, 3u, 2u, 2u, 2u}, Indices});
         ExpectRefusal(target, ShaderStage::TessellationControl, HullDescendingRecords, "not affine");
         ExpectRefusal(target, ShaderStage::TessellationControl, HullDescendingRecords, "not affine", {{3u, 3u, 1u, 2u, 2u, 1.0f, 64.0f, 158u}, Indices});
+        ExpectRefusal(target, ShaderStage::TessellationControl, HullDescendingRecords, "outside its control points and patch constants", {{3u, 3u, 1u, 2u, 2u, 1.0f, 64.0f, 129u}, Indices});
 
         RequirePatches(*device, target, HullCode, "hull program");
         RequirePatches(*device, target, HullRestoredExecSaved, "hull program saving its restored exec");
         RequirePatches(*device, target, HullAndSaveexec, "hull program narrowing exec with s_and_saveexec_b64");
         RequirePatches(*device, target, HullSaveexecLoop, "hull program restoring exec through loop phis");
-        RequirePatches(*device, target, HullDescendingRecords, "hull program with descending patch records in 157-patch groups", {{3u, 3u, 1u, 2u, 2u, 1.0f, 64.0f, 157u}, Indices});
+        RequirePatches(*device, target, HullDescendingRecords, "hull program with descending patch records in 128-patch groups", {{3u, 3u, 1u, 2u, 2u, 1.0f, 64.0f, 128u}, Indices});
         RequireCounterClockwise(*device, target);
         RequireLevelClamps(*device, target);
         RequireQuads(*device, target);
