@@ -1070,6 +1070,131 @@ void hostImportRetirementTests(const Device& device) {
     std::cout << "Host import retirement locking and GPU readback tests passed\n";
 }
 
+// The driver's map observer calls ImportMappedRanges on the mapping thread, first without the GPU
+// lock. Here one thread keeps recording, submitting and completing batches under the lock while
+// another maps like that: each round imports one unit, then maps the unit after it, which grows the
+// import's run and so retires the import. A retirement made without the lock writes the recorder's
+// batches under the recording thread (lean-x17 died of the heap damage, 0xc0000374 in retireImport).
+void hostImportRetirementStressTests(const Device& device) {
+    const auto& context = device.GetContext();
+    constexpr std::size_t UnitBytes = 65536;
+    constexpr std::size_t Units = 2;
+    const auto seconds = [] {
+        const char* value = std::getenv("APS5_TEST_STRESS_SECONDS");
+        return value != nullptr ? std::max(1, std::atoi(value)) : 5;
+    }();
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, Units * UnitBytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(UnitBytes, Units * UnitBytes);
+#endif
+    Require(block != nullptr, "cannot allocate the host import retirement stress block");
+    const auto release = [](void* pointer) {
+#ifdef _WIN32
+        VirtualFree(pointer, 0, MEM_RELEASE);
+#else
+        std::free(pointer);
+#endif
+    };
+    std::unique_ptr<void, decltype(release)> allocation(block, release);
+    auto* memory = static_cast<std::byte*>(block);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    std::unique_ptr<Recorder> recorder;
+    std::unique_ptr<Buffer> scratch;
+    {
+        std::lock_guard gpu(GpuMutex());
+        PrepareImportWatch(context);
+        Require(ImportMappedRanges(context, {}, GuestAllocations::GuestAllocationsGeneration_nid_postfix(), true), "host import retirement stress could not adopt the device");
+        recorder = std::make_unique<Recorder>(context);
+        recorder->Activate();
+        scratch = std::make_unique<Buffer>(context, 256, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    }
+    const auto fill = context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer");
+    std::atomic<bool> stop{false};
+    std::atomic<std::uint64_t> batches{0};
+    std::exception_ptr failure;
+    std::thread recording([&] {
+        try {
+            while (!stop.load(std::memory_order_relaxed)) {
+                {
+                    std::lock_guard gpu(GpuMutex());
+                    const auto commands = recorder->Commands();
+                    fill(commands, scratch->Handle(), 0, 256, static_cast<std::uint32_t>(batches.load(std::memory_order_relaxed)));
+                    recorder->Submit();
+                    if (batches.fetch_add(1, std::memory_order_relaxed) % 8 == 7) {
+                        recorder->Sync();
+                        recorder->FlushDeferredReleases();
+                    }
+                }
+                std::this_thread::yield();
+            }
+        } catch (...) {
+            failure = std::current_exception();
+            stop.store(true);
+        }
+    });
+    std::array<bool, Units> registered{};
+    const auto add = [&](std::size_t index) {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(memory + index * UnitBytes, UnitBytes, true, true, true);
+        registered[index] = true;
+    };
+    const auto removeAll = [&] {
+        GuestAllocations::Mutation mutation;
+        for (std::size_t index = 0; index < Units; ++index) {
+            if (registered[index]) mutation.Remove(memory + index * UnitBytes);
+            registered[index] = false;
+        }
+    };
+    // As the observer in Driver::Driver: unlocked, then under the GPU lock when refused.
+    std::uint64_t unlocked = 0, refused = 0;
+    const auto observe = [&](std::size_t index) {
+        GuestAllocations::Mapped ranges;
+        for (const auto& range : GuestAllocations::GuestAllocationsAcquire_nid_postfix()) {
+            if (range->address == address + index * UnitBytes) ranges.push_back(range);
+        }
+        Require(ranges.size() == 1, "host import retirement stress lost its registered range");
+        const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+        ++unlocked;
+        if (ImportMappedRanges(context, ranges, generation, false)) return;
+        ++refused;
+        std::lock_guard gpu(GpuMutex());
+        ImportMappedRanges(context, ranges, generation, true);
+    };
+    std::uint64_t rounds = 0;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+    try {
+        while (!stop.load() && std::chrono::steady_clock::now() < deadline) {
+            add(0);
+            observe(0);
+            add(1);
+            observe(1);
+            removeAll();
+            ++rounds;
+        }
+    } catch (...) {
+        stop.store(true);
+        recording.join();
+        throw;
+    }
+    stop.store(true);
+    recording.join();
+    {
+        std::lock_guard gpu(GpuMutex());
+        recorder->Sync();
+        recorder->FlushDeferredReleases();
+        ClearHostImports(context.device);
+        removeAll();
+        scratch.reset();
+        recorder.reset();
+    }
+    if (failure != nullptr) std::rethrow_exception(failure);
+    std::cout << "host import retirement stress: " << rounds << " rounds, " << batches.load() << " batches, " << unlocked << " unlocked imports (" << refused << " retried under the GPU lock)\n";
+    Require(rounds != 0 && batches.load() != 0, "host import retirement stress did not run");
+    Require(refused != 0, "no unlocked mapping deferred an import retirement to the GPU lock");
+    std::cout << "Host import retirement stress tests passed\n";
+}
+
 void movedMetadataTests(const Device& device, Recorder& recorder) {
     const auto& base = device.GetContext();
     if (base.hostImportAlignment == 0) {
@@ -5188,6 +5313,15 @@ int main(int argc, char** argv) {
                 return 77;
             }
             hostImportRetirementTests(device);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--host-import-retirement-stress-only") {
+            const auto alignment = device.GetContext().hostImportAlignment;
+            if (alignment == 0 || alignment > 65536) {
+                std::cout << "skipped, host import retirement stress requires host imports aligned within 64 KiB; alignment=" << alignment << '\n';
+                return 77;
+            }
+            hostImportRetirementStressTests(device);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--pipeline-library-only") {
