@@ -943,8 +943,6 @@ bool StorageClearAvailable(const Context& context, std::uint32_t guestFormat, Dc
 }
 
 VkFormat SrgbTwinFormat(const Context& context, VkFormat format) {
-    // Devices that decode 8_SRGB or 8_8_SRGB in the shader cannot sample R8_SRGB or R8G8_SRGB (or are forced
-    // not to), so those formats keep no sRGB twin and a FORCE_DEGAMMA sampler on them stays refused.
     const auto decoded = [&](ShaderRecompiler::IrBufferFormat srgb) { return (context.srgbDecodeFormats & ShaderRecompiler::SrgbDecodeBit(srgb)) != 0u; };
     switch (format) {
         case VK_FORMAT_R8_UNORM: return decoded(ShaderRecompiler::IrBufferFormat::Format8Srgb) ? VK_FORMAT_UNDEFINED : VK_FORMAT_R8_SRGB;
