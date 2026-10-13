@@ -336,16 +336,13 @@ void AppendProcess(std::string& line) {
     const HANDLE crt = GetProcessHeap();
     std::uint64_t otherAllocated = 0, otherCommitted = 0, largestOther = 0;
     for (const auto heap : heaps) {
+        if (heap == crt) continue;
         HEAP_SUMMARY summary{};
         summary.cb = sizeof(summary);
         if (!HeapSummary(heap, 0, &summary)) continue;
-        if (heap == crt) {
-            Append(line, " crt_heap=%.0fMB crt_heap_committed=%.0fMB", summary.cbAllocated / MiB, summary.cbCommitted / MiB);
-        } else {
-            otherAllocated += summary.cbAllocated;
-            otherCommitted += summary.cbCommitted;
-            largestOther = std::max<std::uint64_t>(largestOther, summary.cbCommitted);
-        }
+        otherAllocated += summary.cbAllocated;
+        otherCommitted += summary.cbCommitted;
+        largestOther = std::max<std::uint64_t>(largestOther, summary.cbCommitted);
     }
     Append(line, " other_heaps=%.0fMB(%zu) other_heaps_committed=%.0fMB largest_other_heap=%.0fMB", otherAllocated / MiB, heaps.size() > 0 ? heaps.size() - 1 : 0, otherCommitted / MiB, largestOther / MiB);
 
@@ -540,7 +537,7 @@ void Start() {
         if (state.started || state.stopping) return;
         state.started = true;
     }
-    std::fprintf(stderr, "[mem] reporter every %u s (APS5_MEM_STATS); fields: process_* from GetProcessMemoryInfo, *_heap from HeapSummary, vq_* from a VirtualQuery walk (committed bytes), vk_* from the device's vkAllocateMemory/vkFreeMemory, devmem_/hostmem_/importmem_<owner> charge each allocation to the owner scope it was made in (pool_* = the buffer pool's own allocations), img_/buf_<owner> count live VkImages/VkBuffers by owner, pooled_<owner> = live pooled buffer objects by the owner that asked, vk_device_unattributed = device memory made outside every owner scope, the other fields are live MB(objects)\n", PeriodSeconds());
+    std::fprintf(stderr, "[mem] reporter every %u s (APS5_MEM_STATS); fields: process_* from GetProcessMemoryInfo, other_heaps from HeapSummary (the CRT heap is not walked: HeapSummary holds its lock for seconds once it reaches GBs), vq_* from a VirtualQuery walk (committed bytes), vk_* from the device's vkAllocateMemory/vkFreeMemory, devmem_/hostmem_/importmem_<owner> charge each allocation to the owner scope it was made in (pool_* = the buffer pool's own allocations), img_/buf_<owner> count live VkImages/VkBuffers by owner, pooled_<owner> = live pooled buffer objects by the owner that asked, vk_device_unattributed = device memory made outside every owner scope, the other fields are live MB(objects)\n", PeriodSeconds());
     std::thread([] {
         auto& state = Get();
         std::unique_lock lock(state.reportMutex);
