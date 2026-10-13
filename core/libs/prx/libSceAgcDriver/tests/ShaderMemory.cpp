@@ -2062,10 +2062,10 @@ void verifyMeshConfiguration() {
     RecompileRequest hull{};
     hull.shader = {ShaderStage::TessellationControl, 0x10000u, code, 0, {}};
     hull.context.waveSize = 64;
-    hull.graphics = GraphicsCompileContext{0u, {}, std::nullopt, TessellationConfiguration{4u, 4u, 2u, 2u, 3u, 1.0f, 9.0f, 63u, 63u}, {}};
+    hull.graphics = GraphicsCompileContext{0u, {}, std::nullopt, TessellationConfiguration{4u, 4u, 2u, 2u, 3u, 1.0f, 9.0f, 63u, 63u, true}, {}};
     const auto hullReplay = RequestSerializer{}.Deserialize(RequestSerializer{}.Serialize(hull));
     const auto* replayed = hullReplay.request.graphics && hullReplay.request.graphics->tessellation ? &*hullReplay.request.graphics->tessellation : nullptr;
-    require(replayed != nullptr && replayed->domain == 2u && replayed->outputTopology == 3u && replayed->minLevel == 1.0f && replayed->maxLevel == 9.0f && replayed->patchesPerGroup == 63u && replayed->primitiveGroupSize == 63u, "the quad tessellation configuration, its level clamps, its patches per group or its primitive group size were lost in serialization");
+    require(replayed != nullptr && replayed->domain == 2u && replayed->outputTopology == 3u && replayed->minLevel == 1.0f && replayed->maxLevel == 9.0f && replayed->patchesPerGroup == 63u && replayed->primitiveGroupSize == 63u && replayed->breakAtInstance, "the quad tessellation configuration, its level clamps, its patches per group, its primitive group size or BREAK_WAVE_AT_EOI were lost in serialization");
     auto clamped = hull;
     clamped.graphics->tessellation->maxLevel = 5.0f;
     RecompileCacheKey::Build(hull, key);
@@ -2097,6 +2097,16 @@ void verifyMeshConfiguration() {
         const auto patchKey = key;
         RecompileCacheKey::Build(primitiveGrouped, key);
         require((key != patchKey) == (stage != ShaderStage::Local), "only the hull and domain cache keys may depend on the primitive group size, which rebuilds their relative patch index");
+    }
+    auto shared = hull;
+    shared.graphics->tessellation->breakAtInstance = false;
+    for (const auto stage : {ShaderStage::Local, ShaderStage::TessellationControl, ShaderStage::TessellationEvaluation}) {
+        hull.shader.stage = stage;
+        shared.shader.stage = stage;
+        RecompileCacheKey::Build(hull, key);
+        const auto patchKey = key;
+        RecompileCacheKey::Build(shared, key);
+        require((key != patchKey) == (stage != ShaderStage::Local), "only the hull and domain cache keys may depend on BREAK_WAVE_AT_EOI, which decides whether their relative patch index can be rebuilt");
     }
     const std::array<std::uint32_t, 8> users{};
     request.context.waveSize = 32u;
@@ -2232,12 +2242,12 @@ void verifyPixelRequestSerialization() {
     minimal.context.waveSize = 64;
     minimal.context.pixel = ShaderPixelStageInfo{};
     const auto encoded = serializer.Serialize(minimal);
-    require(requestPrefix(encoded, 8u) == "NVNQQRQAAAA=", "new requests did not use serialization version 20");
+    require(requestPrefix(encoded, 8u) == "NVNQQRUAAAA=", "new requests did not use serialization version 21");
     constexpr std::size_t mappingOffset = 8u + 37u + 18u + 163u;
     for (std::size_t bytes = 0; bytes < 58u; ++bytes) {
         expectFailure([&] { static_cast<void>(serializer.Deserialize(requestPrefix(encoded, mappingOffset + bytes))); }, "truncated data", "a truncated pixel mapping, packing, dual-source or alpha-to-coverage flag or blend was accepted");
     }
-    for (const auto unsupported : {"NVNQQQAAAAA=", "NVNQQRUAAAA="}) {
+    for (const auto unsupported : {"NVNQQQAAAAA=", "NVNQQRYAAAA="}) {
         expectFailure([&] { static_cast<void>(serializer.Deserialize(unsupported)); }, "serialization version", "an unsupported request version was accepted");
     }
 }

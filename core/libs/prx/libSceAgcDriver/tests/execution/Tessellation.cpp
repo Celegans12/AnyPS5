@@ -475,7 +475,7 @@ void RequirePatchConstants(AgcDriver::VulkanDevice& device, const ShaderRecompil
 void RequireRelativePatches(AgcDriver::VulkanDevice& device, const ShaderRecompiler::SpirvTarget& target) {
     const auto center = Row(-0.5f + 1.0f / 3.0f);
     for (const auto& [hull, domain, name] : {std::tuple{std::span<const std::uint32_t>(HullRelativeData), std::span<const std::uint32_t>(DomainPatchRead), "hull"}, std::tuple{std::span<const std::uint32_t>(HullCode), std::span<const std::uint32_t>(DomainRelativeData), "domain"}}) {
-        for (const auto& [patches, blue] : {std::pair{PatchDraw{{3u, 3u, 1u, 2u, 2u, 1.0f, 64.0f, 3u, 3u}, Indices}, 96}, std::pair{PatchDraw{{3u, 3u, 1u, 2u, 2u, 1.0f, 64.0f, 2u, 4u}, Indices}, 32}, std::pair{PatchDraw{{3u, 3u, 1u, 2u, 2u, 1.0f, 64.0f, 3u, 4u}, LatePatchIndices}, 96}, std::pair{PatchDraw{{3u, 3u, 1u, 2u, 2u, 1.0f, 64.0f, 3u, 2u}, Indices}, 32}}) {
+        for (const auto& [patches, blue] : {std::pair{PatchDraw{{3u, 3u, 1u, 2u, 2u, 1.0f, 64.0f, 3u, 3u, true}, Indices}, 96}, std::pair{PatchDraw{{3u, 3u, 1u, 2u, 2u, 1.0f, 64.0f, 2u, 4u, true}, Indices}, 32}, std::pair{PatchDraw{{3u, 3u, 1u, 2u, 2u, 1.0f, 64.0f, 3u, 4u, true}, LatePatchIndices}, 96}, std::pair{PatchDraw{{3u, 3u, 1u, 2u, 2u, 1.0f, 64.0f, 3u, 2u, true}, Indices}, 32}}) {
             std::uint32_t cursor = 0;
             const Stages stages{
                 Compile(target, ShaderStage::Local, LocalCode, cursor, patches),
@@ -701,6 +701,8 @@ int main(int argc, char** argv) {
         ExpectRefusal(target, ShaderStage::Local, LocalIndexAsData, "outside a tessellation ring or LDS address");
         ExpectRefusal(target, ShaderStage::TessellationControl, HullRelativeData, "GE_CNTL.PRIM_GRP_SIZE is 0", RecordPatches);
         ExpectRefusal(target, ShaderStage::TessellationEvaluation, DomainRelativeData, "GE_CNTL.PRIM_GRP_SIZE is 0", RecordPatches);
+        ExpectRefusal(target, ShaderStage::TessellationControl, HullRelativeData, "GE_CNTL.BREAK_WAVE_AT_EOI is clear", {{3u, 3u, 1u, 2u, 2u, 1.0f, 64.0f, 3u, 3u}, Indices});
+        ExpectRefusal(target, ShaderStage::TessellationEvaluation, DomainRelativeData, "GE_CNTL.BREAK_WAVE_AT_EOI is clear", {{3u, 3u, 1u, 2u, 2u, 1.0f, 64.0f, 3u, 3u}, Indices});
         ExpectRefusal(target, ShaderStage::TessellationControl, HullCode, "outside its patch's quad factors", {{3u, 3u, 2u, 2u, 2u}, Indices});
         ExpectRefusal(target, ShaderStage::TessellationControl, HullDescendingRecords, "not affine");
         ExpectRefusal(target, ShaderStage::TessellationControl, HullDescendingRecords, "not affine", {{3u, 3u, 1u, 2u, 2u, 1.0f, 64.0f, 158u}, Indices});

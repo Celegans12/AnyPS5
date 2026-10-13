@@ -110,6 +110,7 @@ private:
         if (request.shader.stage == ShaderStage::Local) return;
         append(key, tessellation->patchesPerGroup);
         append(key, tessellation->primitiveGroupSize);
+        append(key, tessellation->breakAtInstance);
         if (request.shader.stage != ShaderStage::TessellationControl) return;
         for (const auto level : {tessellation->minLevel, tessellation->maxLevel}) append(key, std::bit_cast<std::uint32_t>(level));
     }
