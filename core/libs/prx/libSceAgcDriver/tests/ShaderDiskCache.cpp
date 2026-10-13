@@ -1585,7 +1585,7 @@ void verifyBufferAlignmentSpecialization() {
 }
 
 struct PresenceRequest : ComputeRequest {
-    std::vector<std::uint32_t> presenceCode{0xe0700000u, 0x80000000u, 0xbf800005u, 0xbf810000u};
+    std::vector<std::uint32_t> presenceCode{0xe0700010u, 0x80000000u, 0xbf800005u, 0xbf810000u};
 
     explicit PresenceRequest(const std::array<std::uint32_t, 4>& descriptor) : ComputeRequest(true) {
         request.shader.code = presenceCode;

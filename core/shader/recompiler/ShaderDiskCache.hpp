@@ -50,7 +50,7 @@ void EncodeResult(const RecompileResult& result, std::vector<std::byte>& out);
 void Store(std::vector<std::byte> key, std::shared_ptr<const CompiledVariant> variant);
 void Flush();
 
-[[nodiscard]] std::shared_ptr<BufferSubstituteTable> OpenSubstitutes(std::span<const std::byte> key, std::size_t slots);
+[[nodiscard]] std::shared_ptr<BufferSubstituteTable> OpenSubstitutes(std::span<const std::uint32_t> genericSpirv, std::size_t slots);
 [[nodiscard]] Counters Totals();
 
 }

@@ -1055,6 +1055,13 @@ void makeColdForPublication(SharedSpirv& spirv, bool diskLoaded) noexcept {
     }
 }
 
+void attachSubstitutes(CompiledVariant& variant) {
+    if (variant.info.info.buffers.empty()) return;
+    const auto words = variant.artifact.spirv.ReadTransient();
+    if (!words) throw std::runtime_error("compiled variant has no SPIR-V");
+    variant.substitutes = ShaderDiskCache::OpenSubstitutes(*words, variant.info.info.buffers.size());
+}
+
 std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source, const RecompileRequest& request, bool& cacheHit, ShaderPreparationContext* preparation = nullptr) {
     if (source.plan == nullptr && FailureMemo() && source.planFailure) std::rethrow_exception(source.planFailure);
     for (const auto& candidate : source.variants) {
@@ -1077,7 +1084,7 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
         if (ShaderDiskCache::Load(diskKey, loaded)) {
             loaded.layout = request.layout;
             loaded.artifact.variantId = nextVariantId();
-            loaded.substitutes = ShaderDiskCache::OpenSubstitutes(diskKey, loaded.info.info.buffers.size());
+            attachSubstitutes(loaded);
             if (coldSpirv) makeColdForPublication(loaded.artifact.spirv, true);
             variant = std::make_shared<const CompiledVariant>(std::move(loaded));
         }
@@ -1089,7 +1096,7 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
         std::exception_ptr emissionFailure;
         try {
             auto compiled = compileVariant(request, std::move(program), &emissionFailure);
-            compiled.substitutes = disk ? ShaderDiskCache::OpenSubstitutes(diskKey, compiled.info.info.buffers.size()) : std::make_shared<BufferSubstituteTable>(std::vector<BufferSubstitute>(compiled.info.info.buffers.size()), BufferSubstituteTable::Persist{});
+            attachSubstitutes(compiled);
             if (coldSpirv) makeColdForPublication(compiled.artifact.spirv, false);
             variant = std::make_shared<const CompiledVariant>(std::move(compiled));
         } catch (...) {

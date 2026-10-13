@@ -23,6 +23,7 @@
 #include <deque>
 #include <exception>
 #include <fstream>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -1058,11 +1059,19 @@ void Flush() {
     if (instance.Enabled()) instance.Flush();
 }
 
-std::shared_ptr<BufferSubstituteTable> OpenSubstitutes(std::span<const std::byte> key, std::size_t slots) {
-    auto& instance = store();
-    if (!instance.Enabled()) return std::make_shared<BufferSubstituteTable>(std::vector<BufferSubstitute>(slots), BufferSubstituteTable::Persist{});
+std::shared_ptr<BufferSubstituteTable> OpenSubstitutes(std::span<const std::uint32_t> genericSpirv, std::size_t slots) {
+    std::vector<std::byte> key(std::as_bytes(genericSpirv).begin(), std::as_bytes(genericSpirv).end());
+    const auto count = static_cast<std::uint64_t>(slots);
+    const auto countBytes = std::as_bytes(std::span(&count, 1));
+    key.insert(key.end(), countBytes.begin(), countBytes.end());
     auto name = EntryName(key);
     name.replace(name.size() - 4u, 4u, ".slots");
+    static std::mutex tablesMutex;
+    static std::map<std::string, std::shared_ptr<BufferSubstituteTable>> tables;
+    std::lock_guard tablesLock(tablesMutex);
+    if (const auto found = tables.find(name); found != tables.end()) return found->second;
+    auto& instance = store();
+    if (!instance.Enabled()) return tables.emplace(name, std::make_shared<BufferSubstituteTable>(std::vector<BufferSubstitute>(slots), BufferSubstituteTable::Persist{})).first->second;
     const auto path = instance.Directory() / name;
     const auto keyHash = HashBytes(key);
     const auto read = [path, keyHash, slots] {
@@ -1110,7 +1119,7 @@ std::shared_ptr<BufferSubstituteTable> OpenSubstitutes(std::span<const std::byte
         }
         if (!WriteFileAtomically(path, bytes)) std::fprintf(stderr, "[shader-disk-cache] cannot write buffer substitutes %s\n", path.string().c_str());
     };
-    return std::make_shared<BufferSubstituteTable>(read(), std::move(persist));
+    return tables.emplace(name, std::make_shared<BufferSubstituteTable>(read(), std::move(persist))).first->second;
 }
 
 Counters Totals() {
