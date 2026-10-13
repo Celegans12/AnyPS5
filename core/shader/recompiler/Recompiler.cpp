@@ -452,11 +452,20 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
     targetOptions.registrationModules = registration;
     targetOptions.fragmentDescriptorSet = request.target.registrationModules;
     targetOptions.float16DenormPreserve = request.target.float16DenormPreserve;
+    static const bool spannedWaves = std::getenv("APS5_SPANNED_WAVE") != nullptr;
+    targetOptions.spannedWaves = spannedWaves;
 
     constexpr SpirvEmitter spirvEmitter;
     CompiledShaderArtifact result;
     result.variantId = nextVariantId();
-    result.spirv = spirvEmitter.Emit(program, inputInfo, bindings, targetOptions);
+    try {
+        result.spirv = spirvEmitter.Emit(program, inputInfo, bindings, targetOptions);
+    } catch (const std::exception& error) {
+        if (!targetOptions.spannedWaves) throw;
+        std::fprintf(stderr, "[spanned-wave] 0x%llx falls back to two lanes per invocation: %s\n", static_cast<unsigned long long>(request.shader.codeAddress), error.what());
+        targetOptions.spannedWaves = false;
+        result.spirv = spirvEmitter.Emit(program, inputInfo, bindings, targetOptions);
+    }
     if (registration && result.spirv.size() > request.target.registrationWordLimit) {
         registration = false;
         program.Metadata().bindingLayoutComplete = false;
