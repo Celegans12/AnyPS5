@@ -2673,7 +2673,9 @@ void verifyVertexInfoVersion19() {
     std::size_t flagOffset = 0;
     while (flagOffset < legacyPixel.size() && legacyPixel[flagOffset] == exportedBytes[flagOffset]) ++flagOffset;
     require(flagOffset < legacyPixel.size(), "the pixel layer export flag is not serialized");
-    legacyPixel.erase(legacyPixel.begin() + static_cast<std::ptrdiff_t>(flagOffset));
+    const std::size_t localPixelBytes = 1u + pixel.context.pixel->targetBlend.size() * 5u;
+    require(flagOffset + localPixelBytes <= legacyPixel.size(), "the pixel target blend bytes do not follow the layer export flag");
+    legacyPixel.erase(legacyPixel.begin() + static_cast<std::ptrdiff_t>(flagOffset), legacyPixel.begin() + static_cast<std::ptrdiff_t>(flagOffset + localPixelBytes));
     for (const auto version : {19u, 20u, 21u, 22u}) {
         legacyPixel[4] = static_cast<std::uint8_t>(version);
         const auto replayPixel = serializer.Deserialize(encodeBase64(legacyPixel));
