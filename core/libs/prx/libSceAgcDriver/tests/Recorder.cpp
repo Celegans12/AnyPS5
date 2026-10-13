@@ -139,6 +139,9 @@ public:
                 selectedRank = rank;
             }
             Require(context.physical != VK_NULL_HANDLE, "no Vulkan 1.1 device");
+            VkPhysicalDeviceProperties selected{};
+            physicalProperties(context.physical, &selected);
+            std::cout << "Vulkan device: " << selected.deviceName << '\n';
             const auto extensions = function<PFN_vkEnumerateDeviceExtensionProperties>("vkEnumerateDeviceExtensionProperties");
             Check(extensions(context.physical, nullptr, &count, nullptr), "vkEnumerateDeviceExtensionProperties");
             std::vector<VkExtensionProperties> available(count);
@@ -943,6 +946,128 @@ void remappedImportTests(const Device& device) {
         mutation.Remove(block);
     }
     HostImportFor(context, address, bytes);
+}
+
+void hostImportRetirementTests(const Device& device) {
+    const auto& context = device.GetContext();
+    constexpr std::size_t UnitBytes = 65536;
+    constexpr std::size_t AllocationBytes = 4 * UnitBytes;
+    constexpr std::size_t CopyBytes = 256;
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, AllocationBytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(UnitBytes, AllocationBytes);
+#endif
+    Require(block != nullptr, "cannot allocate the host import retirement block");
+    const auto release = [](void* pointer) {
+#ifdef _WIN32
+        VirtualFree(pointer, 0, MEM_RELEASE);
+#else
+        std::free(pointer);
+#endif
+    };
+    std::unique_ptr<void, decltype(release)> allocation(block, release);
+    auto* memory = static_cast<std::byte*>(block);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    std::unique_lock gpu(GpuMutex());
+    PrepareImportWatch(context);
+    Recorder recorder(context);
+    recorder.Activate();
+    Buffer readback(context, CopyBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    std::array<bool, 4> registered{};
+    const auto cleanup = [&] {
+        if (!gpu.owns_lock()) gpu.lock();
+        recorder.Sync();
+        recorder.FlushDeferredReleases();
+        ClearHostImports(context.device);
+        GuestAllocations::Mutation mutation;
+        for (std::size_t index = 0; index < registered.size(); ++index) {
+            if (!registered[index]) continue;
+            mutation.Remove(memory + index * UnitBytes);
+            registered[index] = false;
+        }
+        SetHostImportWindow(0);
+    };
+    const auto add = [&](std::size_t index) {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(memory + index * UnitBytes, UnitBytes, true, true, true);
+        registered[index] = true;
+    };
+    const auto mapped = [&](std::size_t index) {
+        GuestAllocations::Mapped result;
+        for (const auto& range : GuestAllocations::GuestAllocationsAcquire_nid_postfix()) {
+            if (range->address == address + index * UnitBytes) result.push_back(range);
+        }
+        Require(result.size() == 1, "host import retirement lost its registered range");
+        return result;
+    };
+    bool deferredEveryRetirement = true;
+    bool preservedEveryRecorder = true;
+    try {
+        const std::array<const char*, 3> shapes{"same-base growth", "earlier-base overlap", "predecessor split"};
+        for (std::size_t shape = 0; shape < shapes.size(); ++shape) {
+            SetHostImportWindow(0);
+            Require(ImportMappedRanges(context, {}, GuestAllocations::GuestAllocationsGeneration_nid_postfix(), true), "host import retirement could not adopt the device");
+            const std::size_t first = shape == 1 ? 1 : 0;
+            add(first);
+            if (shape == 2) add(1);
+            for (std::size_t index = 0; index < AllocationBytes; ++index) memory[index] = static_cast<std::byte>((index * 37u + shape * 19u + 11u) & 0xffu);
+            const auto initial = mapped(first);
+            const auto initialGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+            gpu.unlock();
+            const bool fresh = ImportMappedRanges(context, initial, initialGeneration, false);
+            const bool unchanged = ImportMappedRanges(context, initial, initialGeneration, false);
+            gpu.lock();
+            Require(fresh && unchanged, "host import retirement blocked a fresh or unchanged fast import");
+            const auto sourceAddress = address + (shape == 2 ? UnitBytes : first * UnitBytes);
+            const auto* imported = HostImportFor(context, sourceAddress, CopyBytes);
+            Require(imported != nullptr, "host import retirement could not import its source");
+            const auto source = imported->buffer;
+            const auto sourceOffset = sourceAddress - imported->base;
+            std::array<std::byte, CopyBytes> expected{};
+            std::memcpy(expected.data(), reinterpret_cast<const void*>(sourceAddress), CopyBytes);
+            recorder.Commands();
+            recorder.Submit();
+            device.WaitQueue();
+            Require(!recorder.Recording() && recorder.InFlightBatches() == 1, "host import retirement requires a submitted batch without an open batch");
+            std::size_t changed = 0;
+            if (shape == 0) {
+                changed = 1;
+                add(changed);
+            } else if (shape == 1) {
+                add(changed);
+            } else {
+                SetHostImportWindow(UnitBytes);
+                add(3);
+                changed = 1;
+            }
+            const auto ranges = mapped(changed);
+            const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+            gpu.unlock();
+            const bool deferred = !ImportMappedRanges(context, ranges, generation, false);
+            gpu.lock();
+            const bool preserved = !recorder.Recording() && recorder.InFlightBatches() == 1;
+            const auto commands = recorder.Commands();
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+            CopyBuffer(context, commands, source, sourceOffset, readback.Handle(), 0, CopyBytes);
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+            Require(ImportMappedRanges(context, ranges, generation, true), "host import retirement refused its retry under the GPU lock");
+            Require(HostImportFor(context, sourceAddress, CopyBytes) != nullptr, "host import retirement lost the replacement import");
+            recorder.Sync();
+            readback.Invalidate();
+            Require(std::equal(expected.begin(), expected.end(), readback.Bytes().begin()), "host import retirement changed bytes copied from the retired import");
+            std::cout << "host import retirement: " << shapes[shape] << " GPU readback verified; deferred=" << deferred << "; recorder preserved=" << preserved << '\n';
+            deferredEveryRetirement = deferredEveryRetirement && deferred;
+            preservedEveryRecorder = preservedEveryRecorder && preserved;
+            cleanup();
+        }
+    } catch (...) {
+        cleanup();
+        throw;
+    }
+    Require(deferredEveryRetirement, "unlocked mapping retired an import instead of requesting the GPU lock");
+    Require(preservedEveryRecorder, "unlocked mapping changed recorder batches");
+    std::cout << "Host import retirement locking and GPU readback tests passed\n";
 }
 
 void movedMetadataTests(const Device& device, Recorder& recorder) {
@@ -5056,6 +5181,15 @@ int main(int argc, char** argv) {
             return 77;
         }
         Device& device = *created;
+        if (argc == 2 && std::string_view(argv[1]) == "--host-import-retirement-only") {
+            const auto alignment = device.GetContext().hostImportAlignment;
+            if (alignment == 0 || alignment > 65536) {
+                std::cout << "skipped, host import retirement requires host imports aligned within 64 KiB; alignment=" << alignment << '\n';
+                return 77;
+            }
+            hostImportRetirementTests(device);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--pipeline-library-only") {
             pipelineLibraryTests(device);
             return 0;

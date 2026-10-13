@@ -615,6 +615,18 @@ bool sameRun(const HostImport& entry, const ImportRun& run) {
     return true;
 }
 
+bool wouldRetireImport(const HostImports& state, const ImportRun& run) {
+    if (run.ranges.empty()) return false;
+    const auto next = state.imports.lower_bound(run.base);
+    if (next != state.imports.end()) {
+        if (next->first == run.base && sameRun(next->second, run)) return false;
+        if (next->first < run.base + run.bytes) return true;
+    }
+    if (next == state.imports.begin()) return false;
+    const auto& previous = std::prev(next)->second;
+    return previous.base + previous.bytes > run.base;
+}
+
 bool sameRange(const HostImport& entry, const GuestAllocations::Lease& lease) {
     return sameRun(entry, importRun(lease, entry.base));
 }
@@ -2035,6 +2047,7 @@ bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& 
         const auto range = mapped.lock();
         if (range == nullptr || leasedRangeOwner(current, range->address) != range) continue;
         try {
+            if (!GuestMemory::GpuMutex().HeldByThisThread() && wouldRetireImport(state, importRun(current, range->address))) return false;
             if (importAllocation(context, state, range->address, current) == nullptr && GuestAllocations::GuestAllocationsGeneration_nid_postfix() != generation) state.failed.erase(importRun(current, range->address).base);
         } catch (const std::exception& error) {
             std::fprintf(stderr, "[gpu] import of GPU memory mapped at 0x%llx+0x%zx failed: %s\n", static_cast<unsigned long long>(range->address), range->bytes, error.what());
