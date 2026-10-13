@@ -402,7 +402,7 @@ bool admitTexture(TextureCache& cache, const TextureKey& key, std::uint64_t inco
 // Before a new snapshot is made: while every device-local sampled image (in the cache or not) and
 // the new one would pass the share, evicts the entries no holder or recorded batch uses, least
 // recently used first. False when that is not enough (what is left is in use): the snapshot then
-// goes to system memory rather than past the share (APS5_NO_TEXTURE_SPILL=1 keeps it device-local).
+// goes to system memory rather than past the share where it can (APS5_NO_TEXTURE_SPILL=1 keeps it device-local).
 bool makeRoom(TextureCache& cache, std::uint64_t incoming, const TextureCacheBudgets& budgets) {
     const auto live = SampledTextureMemory();
     if (budgets.share == 0 || live + incoming <= budgets.share) return true;
@@ -745,8 +745,8 @@ TextureCacheBudgets currentBudgets(const Context& context) {
     properties.pNext = &reported;
     context.memoryProperties2(context.physical, &properties);
     const TextureMemoryUse use{SampledTextureMemory(), SampledCachedBytes().load(std::memory_order_relaxed), storageCacheBytes()};
-    const auto budgets = TextureCacheBudgetsFor(context.memory, &reported, use);
     const bool fresh = state.device != context.physical;
+    const auto budgets = TextureCacheBudgetsFor(context.memory, &reported, use, fresh ? 0u : state.budgets.target);
     if (const auto heap = largestDeviceLocalHeap(context.memory); heap && (fresh || SampledBudgetReportDue(state.reportedBudget, budgets.sampled, now - state.reportedAt))) {
         char was[48] = "";
         if (!fresh) std::snprintf(was, sizeof(was), " (was %llu MiB)", static_cast<unsigned long long>(state.reportedBudget >> 20u));
@@ -1226,7 +1226,7 @@ std::uint64_t TextureCacheBudget(const VkPhysicalDeviceMemoryProperties& memory)
     return std::max<std::uint64_t>(2048ull << 20u, heap ? memory.memoryHeaps[*heap].size / 4u : 0u);
 }
 
-TextureCacheBudgets TextureCacheBudgetsFor(const VkPhysicalDeviceMemoryProperties& memory, const VkPhysicalDeviceMemoryBudgetPropertiesEXT* reported, const TextureMemoryUse& use) {
+TextureCacheBudgets TextureCacheBudgetsFor(const VkPhysicalDeviceMemoryProperties& memory, const VkPhysicalDeviceMemoryBudgetPropertiesEXT* reported, const TextureMemoryUse& use, std::uint64_t previousTarget) {
     constexpr std::uint64_t MiB = 1ull << 20u;
     const auto fixed = TextureCacheBudget(memory);
     const auto heap = largestDeviceLocalHeap(memory);
@@ -1237,7 +1237,8 @@ TextureCacheBudgets TextureCacheBudgetsFor(const VkPhysicalDeviceMemoryPropertie
     const auto usage = reported->heapUsage[*heap];
     const auto other = usage - std::min<std::uint64_t>(usage, use.sampled + use.storageCached);
     const auto reserved = headroom + other;
-    const auto target = std::max<std::uint64_t>(limit > reserved ? limit - reserved : 0u, std::min<std::uint64_t>(limit / 16u, 512 * MiB));
+    auto target = std::max<std::uint64_t>(limit > reserved ? limit - reserved : 0u, std::min<std::uint64_t>(limit / 16u, 512 * MiB));
+    if (previousTarget != 0 && (target > previousTarget ? target - previousTarget : previousTarget - target) <= std::max<std::uint64_t>(previousTarget / 64u, 64 * MiB)) target = previousTarget;
     const auto storage = std::min<std::uint64_t>(fixed, std::max<std::uint64_t>(target / 2u, 256 * MiB));
     const auto outside = use.sampled - std::min(use.sampled, use.sampledCached);
     const auto taken = std::max<std::uint64_t>(storage, use.storageCached) + outside;

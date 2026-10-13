@@ -161,12 +161,21 @@ std::shared_ptr<BufferPool> GetBufferPool(const Context& context);
 // vkAllocateMemory with the out-of-memory recovery of BufferPool::AllocateMemory (the context's pool
 // trimmed, then sampled textures reclaimed, then one retry); throws with `operation` on failure.
 // With `memoryTypeBits` (the resource's memory requirements) and `inHostMemory`: when the allocation
-// still fails after that recovery, one more try in a memory type outside the device-local heaps
-// (HostMemoryType), which then sets *inHostMemory; an allocation made in such a type already sets it.
+// still fails after that recovery, one more try in OverflowMemoryType; *inHostMemory then says
+// whether the memory is outside the device-local heap's usage (SystemMemoryType), as it does for an
+// allocation made in a system memory type to begin with.
 VkDeviceMemory AllocateDeviceMemory(const Context& context, VkMemoryAllocateInfo allocation, const char* operation, std::uint32_t memoryTypeBits = 0, bool* inHostMemory = nullptr);
-// A memory type of `memoryTypeBits` on a heap that is not device-local, preferring one the host
-// cannot map (system memory the device reads over the bus); none on devices whose every heap is.
-std::optional<std::uint32_t> HostMemoryType(const VkPhysicalDeviceMemoryProperties& memory, std::uint32_t memoryTypeBits);
+// A memory type of `memoryTypeBits` that keeps an image in system memory: host-visible, on a heap
+// that is not device-local, preferring one the host does not cache (the device reads it without
+// snooping). A type without host access on such a heap is not one: NVIDIA's (the only type besides
+// the device-local one that optimal-tiled images may use there) is charged to the device-local
+// heap's VK_EXT_memory_budget usage like VRAM (agc_driver_texture_memory_placement).
+std::optional<std::uint32_t> SystemMemoryType(const VkPhysicalDeviceMemoryProperties& memory, std::uint32_t memoryTypeBits);
+// The last resort for an allocation the device-local heap refused: a memory type of
+// `memoryTypeBits` on a heap that is not device-local, preferring one the host cannot map. On
+// NVIDIA that type still counts as VRAM but may pass the heap's size (the driver moves its pages
+// to system memory), where a device-local allocation fails.
+std::optional<std::uint32_t> OverflowMemoryType(const VkPhysicalDeviceMemoryProperties& memory, std::uint32_t memoryTypeBits);
 
 }
 

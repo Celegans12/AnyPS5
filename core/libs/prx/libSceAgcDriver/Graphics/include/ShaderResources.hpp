@@ -45,8 +45,11 @@ struct TextureMemoryUse {
 // down to `sampled` (four fifths of it). `target` is the share (0 without VK_EXT_memory_budget: the
 // static budgets of before, the ceiling a quarter over the sampled budget). `share` is what every
 // device-local sampled image together may take, in the cache or not (the ceiling plus the images
-// outside the cache when the budgets were read): a new snapshot past it goes to system memory.
+// outside the cache when the budgets were read): a new snapshot past it goes to system memory where it can (see Texture).
 // APS5_TEXTURE_CACHE_MIB forces both caches' budgets (and the share to the ceiling).
+// `previousTarget` (the share of the last read, 0: none) is kept while the new one is within a
+// sixty-fourth of it or 64 MiB: the reported usage moves by a few MiB as the driver frees memory
+// late (images a retired batch held) or allocates for itself, and the budgets should not follow.
 struct TextureCacheBudgets {
     std::uint64_t sampled = 0;
     std::uint64_t ceiling = 0;
@@ -54,7 +57,7 @@ struct TextureCacheBudgets {
     std::uint64_t target = 0;
     std::uint64_t share = 0;
 };
-TextureCacheBudgets TextureCacheBudgetsFor(const VkPhysicalDeviceMemoryProperties& memory, const VkPhysicalDeviceMemoryBudgetPropertiesEXT* reported, const TextureMemoryUse& use);
+TextureCacheBudgets TextureCacheBudgetsFor(const VkPhysicalDeviceMemoryProperties& memory, const VkPhysicalDeviceMemoryBudgetPropertiesEXT* reported, const TextureMemoryUse& use, std::uint64_t previousTarget = 0);
 bool SampledBudgetReportDue(std::uint64_t reported, std::uint64_t budget, std::chrono::steady_clock::duration sinceReport);
 struct TextureCacheUse {
     std::size_t sampledEntries = 0;

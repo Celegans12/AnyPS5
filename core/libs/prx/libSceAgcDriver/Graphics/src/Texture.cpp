@@ -215,6 +215,13 @@ VkImageViewType ViewTypeFor(TextureDimension dimension, [[maybe_unused]] std::ui
     throw std::runtime_error("AGC graphics: Texture encountered an unknown guest texture dimension");
 }
 
+bool LinearSystemImageAvailable(const Context& context, const VkImageCreateInfo& info) {
+    if (context.imageFormatProperties == nullptr || info.imageType != VK_IMAGE_TYPE_2D || info.mipLevels != 1 || info.arrayLayers != 1 || info.flags != 0) return false;
+    VkImageFormatProperties limits{};
+    if (context.imageFormatProperties(context.physical, info.format, info.imageType, VK_IMAGE_TILING_LINEAR, info.usage, info.flags, &limits) != VK_SUCCESS) return false;
+    return limits.maxMipLevels >= 1 && limits.maxArrayLayers >= 1 && info.extent.width <= limits.maxExtent.width && info.extent.height <= limits.maxExtent.height;
+}
+
 }
 
 namespace {
@@ -246,6 +253,11 @@ std::uint64_t SampledTextureMemory() {
 
 std::uint64_t SampledTextureHostMemory() {
     return SampledHostMemoryCounter().load(std::memory_order_relaxed);
+}
+
+VkDeviceSize ImageAllocationOverhead(VkDeviceSize bytes) {
+    constexpr VkDeviceSize granularity = VkDeviceSize{64} << 10u;
+    return (granularity - bytes % granularity) % granularity;
 }
 
 Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare, bool hostMemory) : context(context) {
@@ -295,12 +307,37 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
 
         VkMemoryRequirements requirements{};
         context.Function<PFN_vkGetImageMemoryRequirements>("vkGetImageMemoryRequirements")(context.device, image, &requirements);
+        auto systemType = hostMemory ? SystemMemoryType(context.memory, requirements.memoryTypeBits) : std::nullopt;
+        // Optimal-tiled images may have no memory type in system memory (NVIDIA's other type is
+        // charged to the VRAM): a snapshot with one level and one layer then goes to system memory
+        // as a linear-tiled image where the device samples the format so.
+        if (hostMemory && !systemType && LinearSystemImageAvailable(context, imageInfo)) {
+            auto linearInfo = imageInfo;
+            linearInfo.tiling = VK_IMAGE_TILING_LINEAR;
+            VkImage linearImage = VK_NULL_HANDLE;
+            Check(context.Function<PFN_vkCreateImage>("vkCreateImage")(context.device, &linearInfo, nullptr, &linearImage), "vkCreateImage linear");
+            auto linearOwned = std::make_shared<OwnedImage>(context, linearImage, VK_NULL_HANDLE);
+            VkMemoryRequirements linearRequirements{};
+            context.Function<PFN_vkGetImageMemoryRequirements>("vkGetImageMemoryRequirements")(context.device, linearImage, &linearRequirements);
+            if (const auto linearType = SystemMemoryType(context.memory, linearRequirements.memoryTypeBits)) {
+                owned = std::move(linearOwned);
+                image = linearImage;
+                requirements = linearRequirements;
+                systemType = linearType;
+            }
+        }
+        // Otherwise it stays in VRAM, in the overflow type once the reported usage reaches the
+        // heap's size: there a device-local allocation fails (after the pool's trim and the cache's
+        // reclaim) where the overflow type's still succeeds.
+        std::optional<std::uint32_t> overflowType;
+        if (hostMemory && !systemType && context.bufferPool) {
+            const auto vram = context.bufferPool->Vram().Report();
+            if (vram.heapBytes != 0 && vram.usage + requirements.size + vram.heapBytes / 64u >= vram.heapBytes) overflowType = OverflowMemoryType(context.memory, requirements.memoryTypeBits);
+        }
         VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         allocation.allocationSize = requirements.size;
-        allocationBytes = requirements.size;
-        const auto hostType = HostMemoryType(context.memory, requirements.memoryTypeBits);
-        allocation.memoryTypeIndex = hostMemory && hostType ? *hostType : context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        inHostMemory = hostMemory && hostType;
+        allocationBytes = requirements.size + ImageAllocationOverhead(requirements.size);
+        allocation.memoryTypeIndex = systemType ? *systemType : overflowType ? *overflowType : context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         owned->memory = AllocateDeviceMemory(context, allocation, "vkAllocateMemory texture", requirements.memoryTypeBits, &inHostMemory);
         Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, owned->memory, 0), "vkBindImageMemory");
 
@@ -522,7 +559,7 @@ Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& 
         context.Function<PFN_vkGetImageMemoryRequirements>("vkGetImageMemoryRequirements")(context.device, image, &requirements);
         VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         allocation.allocationSize = requirements.size;
-        allocationBytes = requirements.size;
+        allocationBytes = requirements.size + ImageAllocationOverhead(requirements.size);
         allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         owned->memory = AllocateDeviceMemory(context, allocation, "vkAllocateMemory depth copy");
         Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, owned->memory, 0), "vkBindImageMemory depth copy");
@@ -938,7 +975,7 @@ StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, 
         context.Function<PFN_vkGetImageMemoryRequirements>("vkGetImageMemoryRequirements")(context.device, image, &requirements);
         VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         allocation.allocationSize = requirements.size;
-        memoryBytes = requirements.size;
+        memoryBytes = requirements.size + ImageAllocationOverhead(requirements.size);
         allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         memory = AllocateDeviceMemory(context, allocation, "vkAllocateMemory storage texture");
         Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, memory, 0), "vkBindImageMemory storage");

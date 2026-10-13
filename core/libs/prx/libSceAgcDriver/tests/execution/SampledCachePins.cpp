@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -11,6 +12,7 @@
 #endif
 #include <windows.h>
 #endif
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -174,12 +176,20 @@ int main() {
             // Dispatches whose work is still recorded use their textures: those are not evicted,
             // new ones past the ceiling are refused, and a refused texture's set stays out of the
             // resource cache, so it goes when its work completes.
-            for (std::size_t surface = retired; surface < retired + capacity + 4u; ++surface) Sample(*device, sampled, target, surface);
+            const auto burstValue = [](std::size_t surface) { return 0x3f800000u + static_cast<std::uint32_t>(surface); };
+            for (std::size_t surface = retired; surface < retired + capacity + 4u; ++surface) {
+                auto* texels = reinterpret_cast<std::uint32_t*>(sampled.Address(surface * SurfaceBytes));
+                std::fill(texels, texels + SurfaceBytes / 4u, burstValue(surface));
+                Sample(*device, sampled, target, surface);
+            }
             const auto recorded = SampledCacheCounters();
             const auto recordedLive = SampledTextureMemory() - baseline;
             std::printf("the burst recorded, not yet waited for: %s of device-local sampled images, %llu snapshots placed in system memory\n", MiB(recordedLive).c_str(), static_cast<unsigned long long>(recorded.spilled - afterRetired.spilled));
             if (recorded.spilled != afterRetired.spilled) Require(recordedLive <= Ceiling, "with snapshots going to system memory, the recorded burst still took " + MiB(recordedLive) + " of device-local sampled images, past the " + MiB(Ceiling) + " ceiling");
             device->WaitIdle();
+            AgcDriver::GuestMemory::FlushGpuWrites(target.Address(), TargetBytes);
+            const auto stored = *reinterpret_cast<const std::uint32_t*>(target.Address());
+            Require(stored == burstValue(retired + capacity + 3u), "the burst's last dispatch stored " + std::to_string(stored) + ", not the texel of its surface " + std::to_string(burstValue(retired + capacity + 3u)) + (recorded.spilled != afterRetired.spilled ? " (snapshots in system memory)" : ""));
             const auto afterBurst = SampledCacheCounters();
             const auto burstLive = SampledTextureMemory() - baseline;
             std::printf("a burst of %zu dispatches before one wait: %s alive afterwards; %llu refused, %llu evicted, %llu sets not cached for binding a refused texture\n", capacity + 4u, MiB(burstLive).c_str(), static_cast<unsigned long long>(afterBurst.refused - afterRetired.refused), static_cast<unsigned long long>(afterBurst.evicted - afterRetired.evicted), static_cast<unsigned long long>(afterBurst.refusedSets - afterRetired.refusedSets));

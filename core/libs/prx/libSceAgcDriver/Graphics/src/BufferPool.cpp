@@ -81,7 +81,19 @@ VkDeviceMemory BufferPool::AllocateMemory(const VkMemoryAllocateInfo& allocation
     return VK_NULL_HANDLE;
 }
 
-std::optional<std::uint32_t> HostMemoryType(const VkPhysicalDeviceMemoryProperties& memory, std::uint32_t memoryTypeBits) {
+std::optional<std::uint32_t> SystemMemoryType(const VkPhysicalDeviceMemoryProperties& memory, std::uint32_t memoryTypeBits) {
+    std::optional<std::uint32_t> cached;
+    for (std::uint32_t type = 0; type < std::min<std::uint32_t>(memory.memoryTypeCount, VK_MAX_MEMORY_TYPES); ++type) {
+        if ((memoryTypeBits & (1u << type)) == 0) continue;
+        const auto& properties = memory.memoryTypes[type];
+        if ((properties.propertyFlags & (VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) != VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT || properties.heapIndex >= memory.memoryHeapCount || (memory.memoryHeaps[properties.heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0) continue;
+        if ((properties.propertyFlags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) == 0) return type;
+        if (!cached) cached = type;
+    }
+    return cached;
+}
+
+std::optional<std::uint32_t> OverflowMemoryType(const VkPhysicalDeviceMemoryProperties& memory, std::uint32_t memoryTypeBits) {
     std::optional<std::uint32_t> mappable;
     for (std::uint32_t type = 0; type < std::min<std::uint32_t>(memory.memoryTypeCount, VK_MAX_MEMORY_TYPES); ++type) {
         if ((memoryTypeBits & (1u << type)) == 0) continue;
@@ -106,21 +118,22 @@ VkDeviceMemory AllocateDeviceMemory(const Context& context, VkMemoryAllocateInfo
         Check(result, operation);
         return memory;
     };
-    const auto hostType = inHostMemory != nullptr ? HostMemoryType(context.memory, memoryTypeBits) : std::nullopt;
-    if (!hostType || allocation.memoryTypeIndex == *hostType) {
-        if (inHostMemory != nullptr) *inHostMemory = hostType && allocation.memoryTypeIndex == *hostType;
-        return attempt();
-    }
+    const auto inSystemMemory = [&](std::uint32_t type) {
+        const auto system = SystemMemoryType(context.memory, 1u << type);
+        return system && *system == type;
+    };
+    if (inHostMemory != nullptr) *inHostMemory = inSystemMemory(allocation.memoryTypeIndex);
+    const auto overflowType = inHostMemory != nullptr ? OverflowMemoryType(context.memory, memoryTypeBits) : std::nullopt;
+    if (!overflowType || allocation.memoryTypeIndex == *overflowType || (context.memory.memoryTypes[allocation.memoryTypeIndex].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0) return attempt();
     try {
-        *inHostMemory = false;
         return attempt();
     } catch (const std::exception& error) {
-        allocation.memoryTypeIndex = *hostType;
+        allocation.memoryTypeIndex = *overflowType;
         VkDeviceMemory memory = VK_NULL_HANDLE;
         if (allocate(context.device, &allocation, nullptr, &memory) != VK_SUCCESS) throw;
+        *inHostMemory = inSystemMemory(*overflowType);
         static std::atomic<std::uint64_t> reports{0};
-        if (reports.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[bufferpool] %s placed %llu bytes in system memory (memory type %u) after: %s\n", operation, static_cast<unsigned long long>(allocation.allocationSize), *hostType, error.what());
-        *inHostMemory = true;
+        if (reports.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[bufferpool] %s placed %llu bytes in memory type %u outside the device-local heap (%s) after: %s\n", operation, static_cast<unsigned long long>(allocation.allocationSize), *overflowType, *inHostMemory ? "system memory" : "still charged to the device-local heap's usage", error.what());
         return memory;
     }
 }

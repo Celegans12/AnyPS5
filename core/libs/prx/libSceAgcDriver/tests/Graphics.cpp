@@ -2981,6 +2981,17 @@ void sampledTextureBudgetTests() {
     const auto shared = TextureCacheBudgetsFor(memory, &reported, use);
     expect(shared, 5184 * MiB, 4 * GiB, 10304 * MiB, "a 15 GiB budget with 4 GiB used outside the texture caches");
     Require(shared.ceiling + shared.storage + (use.sampled - use.sampledCached) + 4 * GiB + 960 * MiB == 15 * GiB, "the texture caches, the sampled images outside them, the other users and the headroom do not add up to the device's budget");
+    // The reported usage moving by less than a sixty-fourth of the share (161 MiB here) keeps the
+    // share of the last read; the caches' own bytes still move the ceiling at once.
+    reported.heapUsage[2] = 9 * GiB + 150 * MiB;
+    expect(TextureCacheBudgetsFor(memory, &reported, use, shared.target), 5184 * MiB, 4 * GiB, 10304 * MiB, "150 MiB more reported usage moved a 10304 MiB share");
+    reported.heapUsage[2] = 9 * GiB - 150 * MiB;
+    expect(TextureCacheBudgetsFor(memory, &reported, use, shared.target), 5184 * MiB, 4 * GiB, 10304 * MiB, "150 MiB less reported usage moved a 10304 MiB share");
+    expect(TextureCacheBudgetsFor(memory, &reported, {3 * GiB, 1 * GiB, 2 * GiB}, shared.target), 4160 * MiB, 4 * GiB, 10304 * MiB, "a GiB more of sampled images outside the cache did not take the ceiling down under a kept share");
+    reported.heapUsage[2] = 9 * GiB + 200 * MiB;
+    expect(TextureCacheBudgetsFor(memory, &reported, use, shared.target), 4984 * MiB, 4 * GiB, 10104 * MiB, "200 MiB more reported usage did not take the share down");
+    reported.heapUsage[2] = 9 * GiB - 64 * MiB;
+    expect(TextureCacheBudgetsFor(memory, &reported, use, 1024 * MiB), 5248 * MiB, 4 * GiB, 10368 * MiB, "a share 9 GiB above the last one was held at the last one");
     reported.heapUsage[2] = 3 * GiB;
     expect(TextureCacheBudgetsFor(memory, &reported, use), 9280 * MiB, 4 * GiB, 14400 * MiB, "usage below the texture bytes is not read as no other device memory in use");
     reported.heapUsage[2] = 9 * GiB;

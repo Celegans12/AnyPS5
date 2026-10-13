@@ -47,6 +47,7 @@ struct MockDevice {
     VkDeviceSize heapBudget = 0;
     VkDeviceSize otherUsage = 0;
     std::uint64_t budgetQueries = 0;
+    std::uint32_t lastType = 0;
 };
 
 MockDevice mock;
@@ -65,6 +66,7 @@ VKAPI_ATTR void VKAPI_CALL mockGetBufferMemoryRequirements(VkDevice, VkBuffer bu
 
 VKAPI_ATTR VkResult VKAPI_CALL mockAllocateMemory(VkDevice, const VkMemoryAllocateInfo* info, const VkAllocationCallbacks*, VkDeviceMemory* memory) {
     ++mock.attempts;
+    mock.lastType = info->memoryTypeIndex;
     auto result = VK_SUCCESS;
     if (!mock.results.empty()) {
         result = mock.results.front();
@@ -435,6 +437,55 @@ void Slabs() {
     Expect(mock.liveBytes == 0, "slab blocks outlived their pool");
 }
 
+// NVIDIA's memory types (RTX 3080 Laptop, Windows): optimal-tiled images may use types 0 and 1,
+// linear-tiled ones 0, 1, 3, 4 and 5; type 0 is charged to heap 0's usage like VRAM.
+VkPhysicalDeviceMemoryProperties nvidiaMemory() {
+    VkPhysicalDeviceMemoryProperties memory{};
+    memory.memoryHeapCount = 2;
+    memory.memoryHeaps[0] = {16ull << 30u, VK_MEMORY_HEAP_DEVICE_LOCAL_BIT};
+    memory.memoryHeaps[1] = {16ull << 30u, 0};
+    memory.memoryTypeCount = 6;
+    memory.memoryTypes[0] = {0, 1};
+    memory.memoryTypes[1] = {VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0};
+    memory.memoryTypes[2] = {VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0};
+    memory.memoryTypes[3] = {HostVisible, 1};
+    memory.memoryTypes[4] = {HostVisible | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, 1};
+    memory.memoryTypes[5] = {VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | HostVisible, 0};
+    return memory;
+}
+
+void SystemAndOverflowTypes() {
+    const auto memory = nvidiaMemory();
+    Expect(!SystemMemoryType(memory, 0x3).has_value(), "an optimal-tiled image's type without host access outside the device-local heap was taken for system memory");
+    Expect(SystemMemoryType(memory, 0x3b) == 3u, "a linear-tiled image does not go to the uncached host-visible system memory type");
+    Expect(SystemMemoryType(memory, 0x13) == 4u, "the cached host-visible type is not taken when it is the only system memory type");
+    Expect(!SystemMemoryType(memory, 0x20).has_value(), "a host-visible device-local type was taken for system memory");
+    Expect(OverflowMemoryType(memory, 0x3) == 0u, "an optimal-tiled image does not overflow into the type outside the device-local heap");
+    Expect(OverflowMemoryType(memory, 0x3b) == 0u, "the overflow does not prefer the type the host cannot map");
+    Expect(!OverflowMemoryType(memory, 0x26).has_value(), "the overflow took a type of the device-local heap");
+}
+
+void OverflowAllocation() {
+    mock = MockDevice{};
+    auto context = mockContext();
+    context.memory = nvidiaMemory();
+    VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    allocation.allocationSize = 4 * MiB;
+    allocation.memoryTypeIndex = 1;
+    bool inHostMemory = true;
+    mock.results = {VK_ERROR_OUT_OF_DEVICE_MEMORY};
+    const auto overflow = AllocateDeviceMemory(context, allocation, "test", 0x3, &inHostMemory);
+    Expect(mock.lastType == 0 && !inHostMemory, "a device-local allocation the heap refused did not overflow into type 0 as memory still charged to the device-local heap");
+    allocation.memoryTypeIndex = 3;
+    const auto system = AllocateDeviceMemory(context, allocation, "test", 0x3b, &inHostMemory);
+    Expect(mock.lastType == 3 && inHostMemory, "an allocation in the system memory type is not reported as system memory");
+    allocation.memoryTypeIndex = 1;
+    const auto local = AllocateDeviceMemory(context, allocation, "test", 0x3, &inHostMemory);
+    Expect(mock.lastType == 1 && !inHostMemory, "a device-local allocation that succeeded is reported as system memory");
+    for (const auto memory : {overflow, system, local}) mockFreeMemory(VK_NULL_HANDLE, memory, nullptr);
+    Expect(mock.liveBytes == 0, "the allocations leaked");
+}
+
 void AllocationRecovery(VkResult pressureResult, bool host) {
     mock = MockDevice{};
     {
@@ -601,6 +652,8 @@ int main() {
         AllocationFailure(VK_ERROR_OUT_OF_DEVICE_MEMORY, VK_ERROR_DEVICE_LOST, true);
         SuccessfulAllocationKeepsPool();
         PartialSlabDoesNotRetry();
+        SystemAndOverflowTypes();
+        OverflowAllocation();
         VramTargets();
         VramUnderTargetPools();
         VramOverTargetReleases();

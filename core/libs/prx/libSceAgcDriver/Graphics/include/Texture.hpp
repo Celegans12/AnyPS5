@@ -41,6 +41,13 @@ bool StorageClearAvailable(const Context& context, std::uint32_t guestFormat, Dc
 // count), and in system memory (snapshots made past the sampled share, see cachedTexture).
 std::uint64_t SampledTextureMemory();
 std::uint64_t SampledTextureHostMemory();
+// What an image with an allocation of its own takes in its heap beyond its memory requirements: the
+// allocation rounded up to 64 KiB (NVIDIA on Windows: a 16 KiB image takes 64 KiB of the reported
+// usage, 64 and 256 KiB ones nothing more, images without memory and views nothing; see
+// agc_driver_texture_memory_placement). Counted in the texture caches' bytes so thousands of small
+// images cannot pass their share unseen; where the driver rounds less, the next read of the heap's
+// reported usage (once a second) gives the difference back to the caches.
+VkDeviceSize ImageAllocationOverhead(VkDeviceSize bytes);
 bool ClearKeepsDenormals(const Context& context, VkFormat format);
 
 // A sampled texture's own VkImage with its memory, shared with the recorder while a recorded upload
@@ -60,7 +67,7 @@ struct OwnedImage {
 
 class Texture {
 public:
-    // `hostMemory`: the image goes to a memory type outside the device-local heaps when the device
+    // `hostMemory`: the image goes to system memory (SystemMemoryType; a linear-tiled image for one level and layer when the optimal-tiled one has no such type) when the device
     // has one for it (sampling it then reads over the bus); InHostMemory says where it went.
     Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare = false, bool hostMemory = false);
     Texture(const Context& context, const std::shared_ptr<ResidentColor>& source, const GuestTextureResource& descriptor, VkComponentMapping components);
@@ -96,6 +103,7 @@ public:
     ViewRange SampledViewRange(bool firstLayer) const { return firstLayer ? firstLayerRange : viewRange; }
     // The layout the image is kept in while sampled.
     VkImageLayout Layout() const { return layout; }
+    // The device memory the image takes: its allocation and ImageAllocationOverhead.
     VkDeviceSize AllocationBytes() const { return allocationBytes; }
     bool InHostMemory() const { return inHostMemory; }
     VkFormat ViewFormat() const { return viewFormat; }
