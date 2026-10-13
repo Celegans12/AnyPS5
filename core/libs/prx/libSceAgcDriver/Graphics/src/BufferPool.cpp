@@ -123,7 +123,7 @@ VkDeviceMemory AllocateDeviceMemory(const Context& context, VkMemoryAllocateInfo
         return system && *system == type;
     };
     if (inHostMemory != nullptr) *inHostMemory = inSystemMemory(allocation.memoryTypeIndex);
-    const auto overflowType = inHostMemory != nullptr ? OverflowMemoryType(context.memory, memoryTypeBits) : std::nullopt;
+    const auto overflowType = memoryTypeBits != 0 ? OverflowMemoryType(context.memory, memoryTypeBits) : std::nullopt;
     if (!overflowType || allocation.memoryTypeIndex == *overflowType || (context.memory.memoryTypes[allocation.memoryTypeIndex].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0) return attempt();
     try {
         return attempt();
@@ -131,9 +131,10 @@ VkDeviceMemory AllocateDeviceMemory(const Context& context, VkMemoryAllocateInfo
         allocation.memoryTypeIndex = *overflowType;
         VkDeviceMemory memory = VK_NULL_HANDLE;
         if (allocate(context.device, &allocation, nullptr, &memory) != VK_SUCCESS) throw;
-        *inHostMemory = inSystemMemory(*overflowType);
+        const bool system = inSystemMemory(*overflowType);
+        if (inHostMemory != nullptr) *inHostMemory = system;
         static std::atomic<std::uint64_t> reports{0};
-        if (reports.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[bufferpool] %s placed %llu bytes in memory type %u outside the device-local heap (%s) after: %s\n", operation, static_cast<unsigned long long>(allocation.allocationSize), *overflowType, *inHostMemory ? "system memory" : "still charged to the device-local heap's usage", error.what());
+        if (reports.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[bufferpool] %s placed %llu bytes in memory type %u outside the device-local heap (%s) after: %s\n", operation, static_cast<unsigned long long>(allocation.allocationSize), *overflowType, system ? "system memory" : "still charged to the device-local heap's usage", error.what());
         return memory;
     }
 }

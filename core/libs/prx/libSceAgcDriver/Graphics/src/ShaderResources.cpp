@@ -957,7 +957,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 texture->NoteUse(useSerial());
                 CachedTexture entry{key, address, guestBytes, std::move(oneOff.hashes), texture, *keys, generation};
                 entry.accounted = texture->AllocationBytes();
-                if (!texture->InHostMemory() && admitTexture(cache, key, entry.accounted, budgets)) {
+                if (!texture->Spilled() && admitTexture(cache, key, entry.accounted, budgets)) {
                     cache.oneOffs.erase(found);
                     insert(std::move(entry), texture);
                 } else {
@@ -998,7 +998,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         }
         const bool spill = SpillEnabled() && !makeRoom(cache, bytes, budgets);
         entry.texture = std::make_shared<Texture>(context, *context.detiler, resource, components, snapshot, depthCompare, spill);
-        if (entry.texture->InHostMemory()) {
+        if (entry.texture->Spilled()) {
             ++cache.counts.spilled;
             ++cache.totals.spilled;
             cache.counts.spilledBytes += entry.texture->AllocationBytes();
@@ -1013,7 +1013,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     }
     auto texture = entry.texture;
     texture->NoteUse(useSerial());
-    if (texture->InHostMemory() || !admitTexture(cache, key, entry.accounted, budgets)) {
+    if (texture->Spilled() || !admitTexture(cache, key, entry.accounted, budgets)) {
         texture->SetSampledCacheState(Texture::CacheState::Released);
         if (source == nullptr) rememberOneOff(cache, key, texture, guestBytes, std::move(entry.hashes), *keys, generation);
         logLookup({texture.get(), resource, guestBytes, *keys, generation, source.get()});

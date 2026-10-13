@@ -1107,8 +1107,10 @@ if(BUILD_TESTING)
     set_tests_properties(agc_driver_storage_cache_budget PROPERTIES TIMEOUT 30)
     add_test(NAME agc_driver_sampled_cache_budget_memory COMMAND agc_driver_sampled_cache_budget_tests memory)
     set_tests_properties(agc_driver_sampled_cache_budget_memory PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77)
+    add_test(NAME agc_driver_sampled_cache_burst_overflow COMMAND agc_driver_sampled_cache_budget_tests burst-overflow)
+    set_tests_properties(agc_driver_sampled_cache_burst_overflow PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_TEXTURE_CACHE_MIB=1" SKIP_RETURN_CODE 77 TIMEOUT 60)
     if(WIN32)
-        set_tests_properties(agc_driver_sampled_cache_budget_memory PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_driver_sampled_cache_budget_memory agc_driver_sampled_cache_burst_overflow PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test(NAME agc_driver_pm4_failure COMMAND agc_driver_pm4_tests failure)

@@ -326,14 +326,12 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
                 systemType = linearType;
             }
         }
-        // Otherwise it stays in VRAM, in the overflow type once the reported usage reaches the
-        // heap's size: there a device-local allocation fails (after the pool's trim and the cache's
-        // reclaim) where the overflow type's still succeeds.
-        std::optional<std::uint32_t> overflowType;
-        if (hostMemory && !systemType && context.bufferPool) {
-            const auto vram = context.bufferPool->Vram().Report();
-            if (vram.heapBytes != 0 && vram.usage + requirements.size + vram.heapBytes / 64u >= vram.heapBytes) overflowType = OverflowMemoryType(context.memory, requirements.memoryTypeBits);
-        }
+        // Otherwise it goes to the overflow type, still VRAM by the reported usage (and counted as
+        // such) but movable to system memory by the driver: device-local snapshots past the share
+        // filled the heap in lean-x21 until a device buffer allocation failed, where the overflow
+        // type let lean-x19 and x20 pass the same burst.
+        const auto overflowType = hostMemory && !systemType ? OverflowMemoryType(context.memory, requirements.memoryTypeBits) : std::nullopt;
+        spilled = systemType.has_value() || overflowType.has_value();
         VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         allocation.allocationSize = requirements.size;
         allocationBytes = requirements.size + ImageAllocationOverhead(requirements.size);
@@ -561,7 +559,7 @@ Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& 
         allocation.allocationSize = requirements.size;
         allocationBytes = requirements.size + ImageAllocationOverhead(requirements.size);
         allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        owned->memory = AllocateDeviceMemory(context, allocation, "vkAllocateMemory depth copy");
+        owned->memory = AllocateDeviceMemory(context, allocation, "vkAllocateMemory depth copy", requirements.memoryTypeBits);
         Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, owned->memory, 0), "vkBindImageMemory depth copy");
 
         const auto viewLevelCount = std::min(descriptor.lastLevel, descriptor.mipCount - 1u) - descriptor.baseLevel + 1u;
@@ -977,7 +975,7 @@ StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, 
         allocation.allocationSize = requirements.size;
         memoryBytes = requirements.size + ImageAllocationOverhead(requirements.size);
         allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        memory = AllocateDeviceMemory(context, allocation, "vkAllocateMemory storage texture");
+        memory = AllocateDeviceMemory(context, allocation, "vkAllocateMemory storage texture", requirements.memoryTypeBits);
         Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, memory, 0), "vkBindImageMemory storage");
         uploadReason = "first";
         upload();

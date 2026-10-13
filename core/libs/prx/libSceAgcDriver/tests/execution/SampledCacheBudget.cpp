@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/BdaFeatures.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
@@ -45,7 +46,7 @@ constexpr std::uint64_t Ceiling = Budget + Budget / 4u;
 
 class Device {
 public:
-    Device() {
+    explicit Device(bool discrete = false) {
 #ifdef _WIN32
         library = SDL_LoadObject("vulkan-1.dll");
 #else
@@ -67,6 +68,14 @@ public:
             std::vector<VkPhysicalDevice> devices(count);
             Check(enumerate(instance, &count, devices.data()), "vkEnumeratePhysicalDevices");
             context.physical = devices.front();
+            for (const auto candidate : devices) {
+                VkPhysicalDeviceProperties properties{};
+                function<PFN_vkGetPhysicalDeviceProperties>("vkGetPhysicalDeviceProperties")(candidate, &properties);
+                if (discrete && properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
+                    context.physical = candidate;
+                    break;
+                }
+            }
             const auto extensions = function<PFN_vkEnumerateDeviceExtensionProperties>("vkEnumerateDeviceExtensionProperties");
             Check(extensions(context.physical, nullptr, &count, nullptr), "vkEnumerateDeviceExtensionProperties");
             std::vector<VkExtensionProperties> available(count);
@@ -543,11 +552,138 @@ void memoryTests(Context context) {
     Require(SampledTextureMemory() == before, "a released texture still counts as sampled texture memory");
 }
 
+// A device-local heap that is full past `limit` bytes of device-local allocations made through the
+// wrapped device functions (the test's stand-in for VRAM running out under a burst).
+struct HeapLimit {
+    PFN_vkGetDeviceProcAddr real = nullptr;
+    PFN_vkAllocateMemory allocate = nullptr;
+    PFN_vkFreeMemory free = nullptr;
+    VkPhysicalDeviceMemoryProperties memory{};
+    std::mutex mutex;
+    std::unordered_map<VkDeviceMemory, VkDeviceSize> local;
+    VkDeviceSize used = 0;
+    VkDeviceSize limit = ~VkDeviceSize{0};
+    std::uint64_t refused = 0;
+};
+
+HeapLimit& Limit() {
+    static HeapLimit limit;
+    return limit;
+}
+
+VkResult VKAPI_PTR LimitedAllocate(VkDevice device, const VkMemoryAllocateInfo* info, const VkAllocationCallbacks* callbacks, VkDeviceMemory* memory) {
+    auto& limit = Limit();
+    const bool local = (limit.memory.memoryTypes[info->memoryTypeIndex].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
+    {
+        std::lock_guard lock(limit.mutex);
+        if (local && limit.used + info->allocationSize > limit.limit) {
+            ++limit.refused;
+            return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+        }
+    }
+    const auto result = limit.allocate(device, info, callbacks, memory);
+    if (result == VK_SUCCESS && local) {
+        std::lock_guard lock(limit.mutex);
+        limit.local[*memory] = info->allocationSize;
+        limit.used += info->allocationSize;
+    }
+    return result;
+}
+
+void VKAPI_PTR LimitedFree(VkDevice device, VkDeviceMemory memory, const VkAllocationCallbacks* callbacks) {
+    auto& limit = Limit();
+    {
+        std::lock_guard lock(limit.mutex);
+        if (const auto found = limit.local.find(memory); found != limit.local.end()) {
+            limit.used -= found->second;
+            limit.local.erase(found);
+        }
+    }
+    limit.free(device, memory, callbacks);
+}
+
+PFN_vkVoidFunction VKAPI_PTR LimitedProc(VkDevice device, const char* name) {
+    if (std::strcmp(name, "vkAllocateMemory") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&LimitedAllocate);
+    if (std::strcmp(name, "vkFreeMemory") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&LimitedFree);
+    return Limit().real(device, name);
+}
+
+// A loading-screen burst (lean-x21): one build holds mipmapped snapshots (no linear image in system
+// memory for them) far past the sampled share while the device-local heap fills, then the build
+// allocates a device buffer. The snapshots past the share go to the overflow type, a snapshot the
+// full heap refuses does too, and so does the buffer, instead of the build failing.
+int burstOverflowTests(Context context) {
+    if (!OverflowMemoryType(context.memory, ~0u)) {
+        std::puts("skipped: the device has no memory type outside its device-local heaps");
+        return VulkanTestSkipped;
+    }
+    auto& limit = Limit();
+    limit.real = context.deviceProc;
+    limit.allocate = reinterpret_cast<PFN_vkAllocateMemory>(context.deviceProc(context.device, "vkAllocateMemory"));
+    limit.free = reinterpret_cast<PFN_vkFreeMemory>(context.deviceProc(context.device, "vkFreeMemory"));
+    limit.memory = context.memory;
+    context.deviceProc = &LimitedProc;
+    TextureDetiler detiler(context);
+    context.detiler = &detiler;
+    constexpr std::size_t Stride = std::size_t{1} << 20u;
+    constexpr std::size_t Count = 24;
+    constexpr std::uint32_t LastMip = 8;
+#ifdef _WIN32
+    void* memory = VirtualAlloc(nullptr, Stride * Count, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* memory = std::aligned_alloc(65536, Stride * Count);
+#endif
+    Require(memory != nullptr, "cannot allocate the burst's surfaces");
+    std::memset(memory, 0x5a, Stride * Count);
+    GuestAllocations::Mutation().Add(memory, Stride * Count, true, true, true);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    const auto before = SampledTextureMemory();
+    std::vector<std::shared_ptr<Texture>> held;
+    std::size_t overflowed = 0, system = 0;
+    {
+        std::lock_guard lock(limit.mutex);
+        limit.limit = limit.used + 2 * Stride;
+    }
+    for (std::size_t surface = 0; surface < Count; ++surface) {
+        auto words = Descriptor(base + surface * Stride);
+        words[3] |= LastMip << 16u;
+        words[5] |= LastMip << 4u;
+        held.push_back(CachedSampledTexture(context, words));
+        overflowed += held.back()->Spilled() && !held.back()->InHostMemory();
+        system += held.back()->InHostMemory();
+    }
+    std::uint64_t counted = 0;
+    for (const auto& texture : held) counted += texture->InHostMemory() ? 0u : texture->AllocationBytes();
+    const auto sampled = SampledTextureMemory() - before;
+    {
+        std::lock_guard lock(limit.mutex);
+        limit.limit = limit.used;
+    }
+    const auto refusedBefore = limit.refused;
+    DeviceBuffer buffer(context, 2621440, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    std::printf("a build holding %zu mipmapped snapshots past a 1 MiB budget with a full device-local heap: %zu in the overflow type, %zu in system memory, %llu KiB counted as device-local sampled memory, %llu device-local allocations refused; a 2.5 MiB device buffer allocated after %llu refusals\n", Count, overflowed, system, static_cast<unsigned long long>(sampled >> 10u), static_cast<unsigned long long>(refusedBefore), static_cast<unsigned long long>(limit.refused - refusedBefore));
+    Require(system == 0, "a mipmapped snapshot went to system memory");
+    Require(overflowed + 4u >= Count, "only " + std::to_string(overflowed) + " of the " + std::to_string(Count) + " snapshots past the share went to the overflow type");
+    Require(sampled == counted, "the snapshots in the overflow type are not counted as device-local sampled memory");
+    Require(limit.refused > refusedBefore, "the device buffer did not meet the full heap");
+    held.clear();
+    ClearCachedTextures(context.device);
+    GuestAllocations::Mutation().Remove(memory);
+#ifdef _WIN32
+    VirtualFree(memory, 0, MEM_RELEASE);
+#else
+    std::free(memory);
+#endif
+    std::puts("sampled texture burst overflow tests passed");
+    return 0;
+}
+
 }
 
 int main(int argc, char** argv) {
     try {
         const bool memory = argc > 1 && std::string(argv[1]) == "memory";
+        const bool burst = argc > 1 && std::string(argv[1]) == "burst-overflow";
 #ifdef _WIN32
         if (!memory) _putenv_s("APS5_TEXTURE_CACHE_MIB", "1");
 #else
@@ -555,11 +691,15 @@ int main(int argc, char** argv) {
 #endif
         std::unique_ptr<Device> device;
         try {
-            device = std::make_unique<Device>();
+            device = std::make_unique<Device>(burst);
         } catch (const std::exception& error) {
             if (std::getenv("ANYPS5_REQUIRE_VULKAN") != nullptr) throw;
             std::printf("skipped, no usable Vulkan device: %s\n", error.what());
             return VulkanTestSkipped;
+        }
+        if (burst) {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            return burstOverflowTests(device->GetContext());
         }
         auto context = device->GetContext();
         TextureDetiler detiler(context);

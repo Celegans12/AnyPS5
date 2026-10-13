@@ -4,6 +4,8 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
 #include <exception>
 
 namespace AgcDriver::Graphics {
@@ -189,7 +191,19 @@ DeviceBuffer::DeviceBuffer(const Context& context, std::size_t size, VkBufferUsa
         allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         {
             const MemoryStats::PoolTierScope tier(MemoryStats::Owner::PoolDevice);
-            memory = cache->AllocateMemory(allocation, "vkAllocateMemory device buffer");
+            try {
+                memory = cache->AllocateMemory(allocation, "vkAllocateMemory device buffer");
+            } catch (const std::runtime_error& error) {
+                // The device-local heap is out and nothing could be reclaimed (lean-x21: a build
+                // held every sampled texture): the overflow type, which the driver may move to
+                // system memory, rather than the build failing.
+                const auto overflow = OverflowMemoryType(context.memory, requirements.memoryTypeBits);
+                if (!overflow || *overflow == allocation.memoryTypeIndex) throw;
+                allocation.memoryTypeIndex = *overflow;
+                memory = cache->AllocateMemory(allocation, "vkAllocateMemory device buffer");
+                static std::atomic<std::uint64_t> reports{0};
+                if (reports.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[bufferpool] device buffer of %llu bytes placed in memory type %u outside the device-local heap after: %s\n", static_cast<unsigned long long>(allocation.allocationSize), *overflow, error.what());
+            }
         }
         Check(context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, buffer, memory, 0), "vkBindBufferMemory device");
     } catch (...) {

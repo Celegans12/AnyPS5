@@ -160,9 +160,9 @@ private:
 std::shared_ptr<BufferPool> GetBufferPool(const Context& context);
 // vkAllocateMemory with the out-of-memory recovery of BufferPool::AllocateMemory (the context's pool
 // trimmed, then sampled textures reclaimed, then one retry); throws with `operation` on failure.
-// With `memoryTypeBits` (the resource's memory requirements) and `inHostMemory`: when the allocation
-// still fails after that recovery, one more try in OverflowMemoryType; *inHostMemory then says
-// whether the memory is outside the device-local heap's usage (SystemMemoryType), as it does for an
+// With `memoryTypeBits` (the resource's memory requirements): when a device-local allocation still
+// fails after that recovery, one more try in OverflowMemoryType. `inHostMemory` then says whether
+// the memory is outside the device-local heap's usage (SystemMemoryType), as it does for an
 // allocation made in a system memory type to begin with.
 VkDeviceMemory AllocateDeviceMemory(const Context& context, VkMemoryAllocateInfo allocation, const char* operation, std::uint32_t memoryTypeBits = 0, bool* inHostMemory = nullptr);
 // A memory type of `memoryTypeBits` that keeps an image in system memory: host-visible, on a heap

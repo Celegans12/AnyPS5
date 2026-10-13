@@ -106,6 +106,9 @@ public:
     // The device memory the image takes: its allocation and ImageAllocationOverhead.
     VkDeviceSize AllocationBytes() const { return allocationBytes; }
     bool InHostMemory() const { return inHostMemory; }
+    // Placed outside the device-local memory type for being past the sampled share: in system
+    // memory (InHostMemory) or in the overflow type (OverflowMemoryType, counted as VRAM).
+    bool Spilled() const { return spilled; }
     VkFormat ViewFormat() const { return viewFormat; }
     // Whether this texture is a view of a storage image (no snapshot of its own).
     bool ViewsStorageImage() const { return storageSource != nullptr; }
@@ -158,6 +161,7 @@ private:
     VkDeviceSize allocationBytes = 0;
     VkDeviceSize countedBytes = 0;
     bool inHostMemory = false;
+    bool spilled = false;
     VkFormat viewFormat = VK_FORMAT_UNDEFINED;
     std::shared_ptr<ResidentColor> source;
     std::shared_ptr<StorageTexture> storageSource;
