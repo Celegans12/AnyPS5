@@ -34,6 +34,7 @@ constexpr std::uint32_t Format32UInt = 20;
 constexpr std::uint32_t Type2D = 9;
 constexpr std::uint32_t SwizzleZ64KBX = 24;
 constexpr std::uint32_t SwizzleR64KBX = 27;
+constexpr std::uint32_t SwizzleS4KBX = 21;
 constexpr std::uint8_t ClearStencil = 0x01;
 constexpr std::uint8_t Written = 0x10;
 constexpr std::uint8_t Mark = 0x04;
@@ -339,6 +340,24 @@ void RequireCoverage(const std::vector<bool>& covered, const std::vector<bool>& 
     }
 }
 
+std::uint32_t ZOfR(std::uint32_t pixel) {
+    const auto x = pixel % Width;
+    const auto y = pixel / Width;
+    const auto zx = (x & ~7u) | (x & 1u) | (((x >> 2u) & 1u) << 1u) | ((y & 1u) << 2u);
+    const auto zy = (y & ~1u) | ((x >> 1u) & 1u);
+    return zy * Width + zx;
+}
+
+std::vector<bool> ViewedAcrossSwizzles(const std::vector<bool>& plane, bool rViewOfZ) {
+    std::vector<bool> viewed(plane.size());
+    for (std::uint32_t pixel = 0; pixel < Width * Height; ++pixel) {
+        if (rViewOfZ) viewed[pixel] = plane[ZOfR(pixel)];
+        else viewed[ZOfR(pixel)] = plane[pixel];
+    }
+    Require(viewed != plane, "the SW_64KB_Z_X/SW_64KB_R_X fixture must move some texels across the triangle edge");
+    return viewed;
+}
+
 void RequireRefused(AgcDriver::VulkanDevice& device, std::uint64_t address, std::uint32_t swizzle, const std::string& reason, const std::string& what) {
     std::string refusal;
     try {
@@ -356,6 +375,7 @@ int main() {
         GuestBlock block;
         GuestBlock tiled;
         GuestBlock mixed;
+        GuestBlock remapped;
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         const auto shaders = CompileDraw(*device, false);
@@ -416,7 +436,15 @@ int main() {
         RequireCoverage(Draw(*device, screen, mixedTarget, VK_COMPARE_OP_EQUAL, VK_STENCIL_OP_KEEP, ClearStencil | Mark), outside, "conflicting stencil table refusal preserves outside stencil");
         std::puts("conflicting stencil table refused before shader writes; stencil and depth unchanged");
 
-        RequireRefused(*device, target.stencilAddress, SwizzleR64KBX, "storage image access to the stencil plane", "an 8_UINT view in SW_64KB_R_X of a SW_64KB_Z_X stencil plane");
+        const auto remapTarget = Target(remapped, false);
+        RequireCoverage(Draw(*device, shaders, remapTarget, VK_COMPARE_OP_ALWAYS, VK_STENCIL_OP_REPLACE, Written, 1), inside, "SW_64KB_Z_X stencil seed coverage");
+        MarkPlane(*device, remapTarget.stencilAddress, SwizzleR64KBX);
+        RequireRead(ViewedAcrossSwizzles(inside, true), Written, ClearStencil, "image_load in SW_64KB_R_X of a SW_64KB_Z_X stencil plane");
+        RequireCoverage(Draw(*device, screen, remapTarget, VK_COMPARE_OP_EQUAL, VK_STENCIL_OP_KEEP, Written | Mark), inside, "image_store OR 0x04 in SW_64KB_R_X lands on the SW_64KB_Z_X stencil texels inside the triangle");
+        RequireCoverage(Draw(*device, screen, remapTarget, VK_COMPARE_OP_EQUAL, VK_STENCIL_OP_KEEP, ClearStencil | Mark), outside, "image_store OR 0x04 in SW_64KB_R_X lands on the SW_64KB_Z_X stencil texels outside the triangle");
+        RequireCoverage(Draw(*device, screen, remapTarget, VK_COMPARE_OP_ALWAYS, VK_STENCIL_OP_KEEP, 0, 2), inside, "a SW_64KB_R_X stencil view preserves depth EQUAL 0.5");
+        std::puts("SW_64KB_R_X view of a SW_64KB_Z_X stencil plane: read and write-back follow the address equations");
+        RequireRefused(*device, target.stencilAddress, SwizzleS4KBX, "storage image access to the stencil plane", "an 8_UINT view in SW_4KB_S_X of a SW_64KB_Z_X stencil plane");
         const auto htile = Target(tiled, true, SwizzleZ64KBX, HalfDepth);
         Draw(*device, shaders, htile, VK_COMPARE_OP_ALWAYS, VK_STENCIL_OP_REPLACE, Written);
         RequireRefused(*device, htile.stencilAddress, SwizzleZ64KBX, "kept in HTILE", "storage access to a stencil plane kept in HTILE");
@@ -427,7 +455,8 @@ int main() {
         Draw(*device, shaders, rebound, VK_COMPARE_OP_ALWAYS, VK_STENCIL_OP_REPLACE, Written);
         MarkPlane(*device, rebound.stencilAddress, SwizzleR64KBX);
         RequireRead(inside, Written, ClearStencil, "image_load in SW_64KB_R_X of the stencil plane rebound with that SW_MODE");
-        RequireRefused(*device, rebound.stencilAddress, SwizzleZ64KBX, "storage image access to the stencil plane", "an 8_UINT view in SW_64KB_Z_X of a stencil plane rebound in SW_64KB_R_X");
+        MarkPlane(*device, rebound.stencilAddress, SwizzleZ64KBX);
+        RequireRead(ViewedAcrossSwizzles(inside, false), Written | Mark, ClearStencil | Mark, "image_load in SW_64KB_Z_X of a stencil plane rebound in SW_64KB_R_X");
         std::puts("stencil plane storage tests passed");
         return 0;
     } catch (const std::exception& error) {

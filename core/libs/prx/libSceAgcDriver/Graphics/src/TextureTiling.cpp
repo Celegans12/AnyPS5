@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureSwizzleEquations.hpp"
 #include <string>
 #include <algorithm>
 #include <bit>
@@ -273,6 +274,40 @@ std::array<std::uint32_t, 3> ThickBlockExtent(TextureTileMode tileMode, std::uin
 std::array<std::uint32_t, 3> ThinBlockLayout(TextureTileMode tileMode, std::uint32_t bytesPerElement) {
     const auto block = GetBlockLayout(tileMode, bytesPerElement);
     return {block.blockSize, block.blockWidth, block.blockHeight};
+}
+
+std::array<std::uint32_t, 2> SwizzleRemapTile(TextureTileMode stored, TextureTileMode viewed, std::uint32_t bytesPerElement, std::uint32_t viewedPipeBankXor) {
+    const auto storedMode = EquationSwizzleMode(stored);
+    const auto viewedMode = EquationSwizzleMode(viewed);
+    if (storedMode == 0 || viewedMode == 0) return {0u, 0u};
+    const auto* storedEquation = FindTextureSwizzleEquation(storedMode, bytesPerElement);
+    const auto* viewedEquation = FindTextureSwizzleEquation(viewedMode, bytesPerElement);
+    const auto block = ThinBlockLayout(stored, bytesPerElement);
+    if (storedEquation == nullptr || viewedEquation == nullptr || ThinBlockLayout(viewed, bytesPerElement) != block || viewedPipeBankXor >= block[0] || viewedPipeBankXor % bytesPerElement != 0) return {0u, 0u};
+    const auto offset = [](const TextureSwizzleEquation& equation, std::uint32_t x, std::uint32_t y) {
+        std::uint32_t result = 0;
+        for (std::uint32_t bit = 0; bit < 16; ++bit) result |= static_cast<std::uint32_t>(std::popcount((x & equation.bits[bit] & 0xfffu) | ((y << 12u) & equation.bits[bit] & 0xfff000u)) & 1) << bit;
+        return result;
+    };
+    std::vector<std::uint32_t> element(block[0] / bytesPerElement, 0xffffffffu);
+    for (std::uint32_t y = 0; y < block[2]; ++y) {
+        for (std::uint32_t x = 0; x < block[1]; ++x) {
+            const auto at = offset(*storedEquation, x, y);
+            if (at >= block[0] || at % bytesPerElement != 0 || element[at / bytesPerElement] != 0xffffffffu) return {0u, 0u};
+            element[at / bytesPerElement] = (y << 16u) | x;
+        }
+    }
+    std::uint32_t columns = 0;
+    std::uint32_t rows = 0;
+    for (std::uint32_t y = 0; y < block[2]; ++y) {
+        for (std::uint32_t x = 0; x < block[1]; ++x) {
+            const auto at = offset(*viewedEquation, x, y) ^ viewedPipeBankXor;
+            if (at >= block[0] || at % bytesPerElement != 0 || element[at / bytesPerElement] == 0xffffffffu) return {0u, 0u};
+            columns |= x ^ (element[at / bytesPerElement] & 0xffffu);
+            rows |= y ^ (element[at / bytesPerElement] >> 16u);
+        }
+    }
+    return {std::bit_ceil(columns + 1u), std::bit_ceil(rows + 1u)};
 }
 
 std::vector<std::pair<std::uint64_t, std::uint64_t>> CoveredMipBytes(TextureTileMode tileMode, std::uint32_t bytesPerElement, const TileMipLayout& mip) {

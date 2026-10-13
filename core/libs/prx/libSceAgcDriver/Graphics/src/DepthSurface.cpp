@@ -3,7 +3,9 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "RdnaDecoder/include/RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include <algorithm>
@@ -14,6 +16,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <vector>
@@ -132,17 +135,47 @@ public:
                           static_cast<unsigned>(resource.tileMode), static_cast<int>(resource.dimension), resource.baseLevel, resource.lastLevel, resource.baseArray, key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7]);
             throw std::runtime_error(text);
         }
+        if (stencil && !target.htileStencil && target.address != target.stencilAddress && XorSwizzleMode(resource.tileMode) != target.stencilSwizzle) {
+            if (const auto remap = StencilRemap(resource)) return RemappedStencil(resource, components, key, *remap);
+        }
         auto texture = std::make_shared<Texture>(context, image, target.format, stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT, components);
         textures.emplace(key, texture);
         return texture;
     }
 
-    void RequireStencilLayout(const StorageTexture& storage) const {
+    std::shared_ptr<Texture> RemappedStencil(const GuestTextureResource& resource, VkComponentMapping components, const std::array<std::uint32_t, 12>& key, TextureTileMode remap) {
+        const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::DepthPlaneStorage);
+        auto& plane = sampledStencil;
+        const auto& held = plane.storage != nullptr ? plane.storage->Descriptor() : resource;
+        if (plane.storage == nullptr || held.format != resource.format || held.tileMode != resource.tileMode || held.pipeBankXor != resource.pipeBankXor) {
+            plane.storage = std::make_shared<StorageTexture>(context, *context.detiler, resource, 0);
+            plane.remap = remap;
+            sampledStencilTexture.reset();
+        }
+        if (sampledStencilTexture == nullptr || sampledStencilKey != key) {
+            sampledStencilTexture = std::make_shared<Texture>(context, plane.storage, resource, components);
+            sampledStencilKey = key;
+        }
+        copyPlane(plane, true, true);
+        return sampledStencilTexture;
+    }
+
+    std::optional<TextureTileMode> StencilRemap(const GuestTextureResource& descriptor) const {
+        if (target.stencilSwizzle == 0 || XorSwizzleMode(descriptor.tileMode) == target.stencilSwizzle) return std::nullopt;
+        for (const auto mode : {TextureTileMode::kZ64KBX, TextureTileMode::kS64KBX, TextureTileMode::kD64KBX, TextureTileMode::kR64KBX, TextureTileMode::kS64KBT, TextureTileMode::kD64KBT, TextureTileMode::kS4KBX, TextureTileMode::kD4KBX}) {
+            if (XorSwizzleMode(mode) != target.stencilSwizzle) continue;
+            const auto tile = SwizzleRemapTile(mode, descriptor.tileMode, 1u, descriptor.pipeBankXor);
+            if (tile[0] != 0 && target.extent.width % tile[0] == 0 && target.extent.height % tile[1] == 0) return mode;
+        }
+        return std::nullopt;
+    }
+
+    void RequireStencilLayout(const StorageTexture& storage, bool remapped = false) const {
         const auto& descriptor = storage.Descriptor();
         const auto storageFormat = storage.StorageFormat();
         const bool bytes = storageFormat == VK_FORMAT_R8_UINT || storageFormat == VK_FORMAT_R8_UNORM || storageFormat == VK_FORMAT_R8_SINT || storageFormat == VK_FORMAT_R8_SNORM;
         const bool oneSlice = descriptor.dimension == TextureDimension::k2D || (descriptor.dimension == TextureDimension::k2DArray && descriptor.depthOrLastArray == 0);
-        if (bytes && target.address != target.stencilAddress && !target.htileStencil && target.stencilSwizzle != 0 && XorSwizzleMode(descriptor.tileMode) == target.stencilSwizzle && descriptor.width == target.extent.width && descriptor.height == target.extent.height && descriptor.mipCount == 1 && oneSlice && descriptor.baseArray == 0) return;
+        if (bytes && target.address != target.stencilAddress && !target.htileStencil && target.stencilSwizzle != 0 && (remapped || XorSwizzleMode(descriptor.tileMode) == target.stencilSwizzle) && descriptor.width == target.extent.width && descriptor.height == target.extent.height && descriptor.mipCount == 1 && oneSlice && descriptor.baseArray == 0) return;
         char text[384];
         std::snprintf(text, sizeof(text), "AGC graphics: storage image access to the stencil plane 0x%llx of depth surface 0x%llx (%ux%u, SW_MODE %u%s) as a %ux%u image of vk format %d, tile mode %u (SW_MODE %u), dimension %d, %u mips, base slice %u is not implemented", static_cast<unsigned long long>(target.stencilAddress), static_cast<unsigned long long>(target.address), target.extent.width, target.extent.height, target.stencilSwizzle, target.htileStencil ? ", kept in HTILE" : "", descriptor.width, descriptor.height, static_cast<int>(storageFormat), static_cast<unsigned>(descriptor.tileMode), XorSwizzleMode(descriptor.tileMode), static_cast<int>(descriptor.dimension), descriptor.mipCount, descriptor.baseArray);
         throw std::runtime_error(text);
@@ -225,9 +258,12 @@ public:
         TakeWrites(stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT);
         auto& plane = stencil ? stencilPlane : depthPlane;
         const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::DepthPlaneStorage);
-        if (plane.storage == nullptr || plane.storage->Descriptor().format != resource.format || plane.storage->Descriptor().tileMode != resource.tileMode || plane.storage->Descriptor().baseAddress != resource.baseAddress) plane.storage = std::make_shared<StorageTexture>(context, *context.detiler, resource, 0);
+        if (plane.storage == nullptr || plane.storage->Descriptor().format != resource.format || plane.storage->Descriptor().tileMode != resource.tileMode || plane.storage->Descriptor().baseAddress != resource.baseAddress || plane.storage->Descriptor().pipeBankXor != resource.pipeBankXor) {
+            plane.storage = std::make_shared<StorageTexture>(context, *context.detiler, resource, 0);
+            plane.remap = stencil ? StencilRemap(plane.storage->Descriptor()) : std::nullopt;
+        }
         // A stencil plane whose layout the target programs (SW_MODE, HTILE) keeps the alias rules.
-        if (stencil && (target.stencilSwizzle != 0 || target.htileStencil)) RequireStencilLayout(*plane.storage);
+        if (stencil && (target.stencilSwizzle != 0 || target.htileStencil)) RequireStencilLayout(*plane.storage, plane.remap.has_value());
         copyPlane(plane, stencil, true);
         return plane.storage;
     }
@@ -256,11 +292,17 @@ private:
     struct PlaneStorage {
         std::shared_ptr<StorageTexture> storage;
         std::unique_ptr<DeviceBuffer> staging;
+        std::optional<TextureTileMode> remap;
+        std::unique_ptr<DeviceBuffer> remapLinear;
+        std::unique_ptr<DeviceBuffer> remapTiled;
     };
     std::map<std::array<std::uint32_t, 12>, std::shared_ptr<Texture>> textures;
     std::unique_ptr<DeviceBuffer> transferBuffer;
     PlaneStorage depthPlane;
     PlaneStorage stencilPlane;
+    PlaneStorage sampledStencil;
+    std::shared_ptr<Texture> sampledStencilTexture;
+    std::array<std::uint32_t, 12> sampledStencilKey{};
 
     void copyPlane(PlaneStorage& plane, bool stencil, bool toStorage) {
         auto* recorder = RecorderFor(context);
@@ -269,7 +311,7 @@ private:
         const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
         const auto bytes = static_cast<std::size_t>(target.extent.width) * target.extent.height * (stencil ? 1u : d16 ? 2u : 4u);
         const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::DepthPlaneStorage);
-        if (plane.staging == nullptr) plane.staging = std::make_unique<DeviceBuffer>(context, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        if (!(stencil && plane.remap.has_value()) && plane.staging == nullptr) plane.staging = std::make_unique<DeviceBuffer>(context, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
         const auto commands = recorder != nullptr ? recorder->Commands() : batch->Handle();
         if (recorder != nullptr) recorder->Keep(plane.storage);
         const auto timing = recorder != nullptr ? recorder->BeginGpuTiming(Recorder::CommandClass::Copy) : 0u;
@@ -279,21 +321,51 @@ private:
         const auto sourceImage = toStorage ? image : plane.storage->Image();
         const auto destinationImage = toStorage ? plane.storage->Image() : image;
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-        context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, sourceImage, VK_IMAGE_LAYOUT_GENERAL, plane.staging->Handle(), 1, toStorage ? &planeRegion : &colorRegion);
-        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
-        context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, plane.staging->Handle(), destinationImage, VK_IMAGE_LAYOUT_GENERAL, 1, toStorage ? &colorRegion : &planeRegion);
+        const bool remap = stencil && plane.remap.has_value();
+        if (remap) {
+            remapStencil(plane, commands, toStorage, planeRegion, colorRegion);
+        } else {
+            context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, sourceImage, VK_IMAGE_LAYOUT_GENERAL, plane.staging->Handle(), 1, toStorage ? &planeRegion : &colorRegion);
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+            context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, plane.staging->Handle(), destinationImage, VK_IMAGE_LAYOUT_GENERAL, 1, toStorage ? &colorRegion : &planeRegion);
+        }
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
         if (batch) {
             batch->SubmitAndWait();
             return;
         }
-        Recorder::CountBarriers(Recorder::CommandClass::Copy, 3);
+        Recorder::CountBarriers(Recorder::CommandClass::Copy, remap ? 5 : 3);
         recorder->EndGpuTiming(timing, bytes);
+    }
+
+    void remapStencil(PlaneStorage& plane, VkCommandBuffer commands, bool toStorage, VkBufferImageCopy planeRegion, VkBufferImageCopy colorRegion) {
+        const auto& descriptor = plane.storage->Descriptor();
+        const auto layout = ComputeElementMipLayout(*plane.remap, 1u, target.extent.width, target.extent.height, 1u).front();
+        if (plane.remapLinear == nullptr || plane.remapLinear->Size() < layout.linearSize) plane.remapLinear = std::make_unique<DeviceBuffer>(context, static_cast<std::size_t>(layout.linearSize), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        if (plane.remapTiled == nullptr || plane.remapTiled->Size() < layout.tiledSize) plane.remapTiled = std::make_unique<DeviceBuffer>(context, static_cast<std::size_t>(layout.tiledSize), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        planeRegion.bufferRowLength = layout.pitchBytes;
+        colorRegion.bufferRowLength = layout.pitchBytes;
+        const auto linear = plane.remapLinear->Handle();
+        const auto tiled = plane.remapTiled->Handle();
+        const auto retileMode = toStorage ? *plane.remap : descriptor.tileMode;
+        const auto detileMode = toStorage ? descriptor.tileMode : *plane.remap;
+        const auto retileXor = toStorage ? 0u : descriptor.pipeBankXor;
+        const auto detileXor = toStorage ? descriptor.pipeBankXor : 0u;
+        context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, toStorage ? image : plane.storage->Image(), VK_IMAGE_LAYOUT_GENERAL, linear, 1, toStorage ? &planeRegion : &colorRegion);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        context.detiler->BeginBatch();
+        context.detiler->Dispatch(commands, retileMode, 1u, linear, 0, tiled, 0, layout, true, 0, false, {.pipeBankXor = retileXor});
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        context.detiler->Dispatch(commands, detileMode, 1u, tiled, 0, linear, 0, layout, false, 0, false, {.pipeBankXor = detileXor});
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, linear, toStorage ? plane.storage->Image() : image, VK_IMAGE_LAYOUT_GENERAL, 1, toStorage ? &colorRegion : &planeRegion);
     }
 
     void release() noexcept {
         depthPlane = {};
         stencilPlane = {};
+        sampledStencilTexture.reset();
+        sampledStencil = {};
         textures.clear();
         if (view) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, view, nullptr);
         if (image) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);

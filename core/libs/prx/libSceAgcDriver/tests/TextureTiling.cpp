@@ -368,6 +368,28 @@ void RunTextureTilingTests() {
         Require(dense.pitchBytes == 1024 && CoveredMipBytes(TextureTileMode::kLinear, 4, dense) == std::vector<std::pair<std::uint64_t, std::uint64_t>>{{0, 3072}}, "linear rows without padding are not one range");
     }
 
+    {
+        using Tile = std::array<std::uint32_t, 2>;
+        Require(SwizzleRemapTile(TextureTileMode::kZ64KBX, TextureTileMode::kR64KBX, 1, 0) == Tile{8, 2}, "an 8 bpp SW_64KB_R_X view of SW_64KB_Z_X memory must stay inside aligned 8x2 element tiles");
+        Require(SwizzleRemapTile(TextureTileMode::kR64KBX, TextureTileMode::kZ64KBX, 1, 0) == Tile{8, 2}, "an 8 bpp SW_64KB_Z_X view of SW_64KB_R_X memory must stay inside aligned 8x2 element tiles");
+        Require(SwizzleRemapTile(TextureTileMode::kZ64KBX, TextureTileMode::kZ64KBX, 1, 0) == Tile{1, 1}, "a view in the stored swizzle must address the stored elements");
+        Require(SwizzleRemapTile(TextureTileMode::kZ64KBX, TextureTileMode::kZ64KBX, 1, 0x100) == Tile{1, 16}, "a view with pipe/bank XOR 0x100 of SW_64KB_Z_X memory must move y bit 3");
+        Require(SwizzleRemapTile(TextureTileMode::kZ64KBX, TextureTileMode::kS64KBX, 1, 0) == Tile{32, 32}, "an 8 bpp SW_64KB_S_X view of SW_64KB_Z_X memory must stay inside aligned 32x32 element tiles");
+        Require(SwizzleRemapTile(TextureTileMode::kZ64KBX, TextureTileMode::kS4KBX, 1, 0) == Tile{0, 0}, "views with another block size must not be remapped");
+        Require(SwizzleRemapTile(TextureTileMode::kZ64KBX, TextureTileMode::kStandard64KB, 1, 0) == Tile{0, 0}, "views without an address equation must not be remapped");
+        Require(SwizzleRemapTile(TextureTileMode::kZ64KBX, TextureTileMode::kR64KBX, 1, 65536) == Tile{0, 0}, "a pipe/bank XOR outside the block must not be remapped");
+        const auto* z = FindTextureSwizzleEquation(24, 1);
+        const auto* r = FindTextureSwizzleEquation(27, 1);
+        Require(z != nullptr && r != nullptr, "the 8 bpp SW_64KB_Z_X and SW_64KB_R_X equations exist");
+        for (std::uint32_t y = 0; y < 256; ++y) {
+            for (std::uint32_t x = 0; x < 256; ++x) {
+                const auto zx = (x & ~7u) | (x & 1u) | (((x >> 2u) & 1u) << 1u) | ((y & 1u) << 2u);
+                const auto zy = (y & ~1u) | ((x >> 1u) & 1u);
+                Require(equationOffset(*r, x, y, 0) == equationOffset(*z, zx, zy, 0), "the 8 bpp SW_64KB_R_X element (" + std::to_string(x) + ", " + std::to_string(y) + ") is not the SW_64KB_Z_X element (" + std::to_string(zx) + ", " + std::to_string(zy) + ")");
+            }
+        }
+    }
+
     reject([] { ComputeSurfaceSize({}, 1); }, "empty mip chain");
     reject([] { ComputeSurfaceSize(ComputeMipLayout(TextureTileMode::kLinear, 1, 4, 4, 1), 0); }, "zero array layers");
 }

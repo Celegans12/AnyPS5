@@ -40,6 +40,7 @@ std::array<std::uint32_t, 3> ThinBlockLayout(TextureTileMode tileMode, std::uint
 // without the pitch padding when linear. A tail mip has none (its block also holds the other tail
 // levels and their padding). A retile of the mip writes every byte of these and no other.
 std::vector<std::pair<std::uint64_t, std::uint64_t>> CoveredMipBytes(TextureTileMode tileMode, std::uint32_t bytesPerElement, const TileMipLayout& mip);
+std::array<std::uint32_t, 2> SwizzleRemapTile(TextureTileMode stored, TextureTileMode viewed, std::uint32_t bytesPerElement, std::uint32_t viewedPipeBankXor);
 
 // 3D surface. Each slab holds the whole mip chain: the mip tail block, if any, then the other levels from the
 // smallest to level 0. Depth slice z of a level is detiled from slab z / blockDepth (slabBytes apart) with the
