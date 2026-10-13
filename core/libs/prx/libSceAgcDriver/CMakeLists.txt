@@ -1131,6 +1131,7 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME agc_driver_draw_cache_reuse_off COMMAND agc_driver_draw_cache_reuse_tests)
     set_tests_properties(agc_driver_draw_cache_reuse_off PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_GPL=1" SKIP_RETURN_CODE 77)
+    set_tests_properties(agc_driver_draw_cache_reuse agc_driver_draw_cache_reuse_off PROPERTIES FAIL_REGULAR_EXPRESSION "FATAL:")
     if(WIN32)
         set_tests_properties(agc_driver_draw_cache_reuse_off PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
