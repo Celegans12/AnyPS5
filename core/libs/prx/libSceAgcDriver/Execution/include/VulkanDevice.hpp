@@ -231,6 +231,7 @@ public:
     // precollect, presync, stage A (the driver's 'prepare:' rows).
     static std::span<const double, 5> PreparePhaseMs(const PreparedDispatch& prepared);
     double WarmComputePipeline(const ShaderRecompiler::RecompileResult& shader, std::uint64_t programAddress = 0, bool verifyDispatchLayout = false);
+    std::vector<std::uint32_t> PlannedComputeLayoutKey(const ShaderRecompiler::RecompileResult& shader);
     // `recipe`, when given, receives the Recipe a successful call built for its dispatch-cache
     // variant (design_cpu_final M4): only when the resource cache served or took the object
     // (reusable, cacheable) and recipes are on (APS5_NO_DISPATCH_RECIPE=1 builds none); else null.

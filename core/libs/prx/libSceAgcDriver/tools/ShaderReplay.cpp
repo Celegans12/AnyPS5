@@ -167,7 +167,7 @@ std::string Hex(std::uint64_t value) {
 
 // The components of `result` that differ from the sidecar's, with the first differing values; empty
 // when the sidecar has no component hashes (requests saved before they were recorded).
-std::string DescribeDifference(const Sidecar& sidecar, const ShaderRecompiler::RecompileResult& result, const AgcDriver::ComputePipelineComponents& components) {
+std::string DescribeDifference(const Sidecar& sidecar, const ShaderRecompiler::RecompileResult& result, const AgcDriver::ComputePipelineComponents& components, std::span<const std::uint32_t> layout) {
     const std::pair<const char*, std::uint64_t> parts[] = {{"spirv", components.spirv}, {"specialization", components.specialization}, {"subgroup", components.subgroup}, {"workgroup_memory", components.workgroupMemory}, {"push", components.push}, {"bindings", components.bindings}};
     std::string text;
     for (const auto& [name, value] : parts) {
@@ -177,7 +177,7 @@ std::string DescribeDifference(const Sidecar& sidecar, const ShaderRecompiler::R
         text += text.empty() ? "" : ", ";
         text += name;
     }
-    std::istringstream mine(AgcDriver::ComputePipelineDescription(result, components));
+    std::istringstream mine(AgcDriver::ComputePipelineDescription(result, components, layout));
     std::vector<std::string> specs;
     std::vector<std::string> bindings;
     std::map<std::string, std::string> values;
@@ -188,7 +188,7 @@ std::string DescribeDifference(const Sidecar& sidecar, const ShaderRecompiler::R
         else if (key == "binding") bindings.push_back(line.substr(space + 1));
         else values[key] = line.substr(space + 1);
     }
-    for (const char* key : {"spirv_words", "subgroup", "workgroup_memory", "push", "specialization_id", "variant_id"}) {
+    for (const char* key : {"spirv_words", "subgroup", "workgroup_memory", "push", "specialization_id", "variant_id", "layout"}) {
         const auto game = sidecar.values.find(key);
         if (game != sidecar.values.end() && game->second != values[key]) text += std::string("; ") + key + " game " + game->second + " replay " + values[key];
     }
@@ -209,18 +209,19 @@ std::string DescribeDifference(const Sidecar& sidecar, const ShaderRecompiler::R
     return text;
 }
 
-void PrintComponents(const char* label, const ShaderRecompiler::RecompileResult& result, const Sidecar& sidecar) {
-    const auto components = AgcDriver::ComputePipelineFingerprintComponents(result);
+void PrintComponents(const char* label, const ShaderRecompiler::RecompileResult& result, const Sidecar& sidecar, AgcDriver::VulkanDevice& device) {
+    const auto layout = device.PlannedComputeLayoutKey(result);
+    const auto components = AgcDriver::ComputePipelineFingerprintComponents(result, layout);
     const auto game = sidecar.values.find("fingerprint");
     const bool match = game != sidecar.values.end() && game->second == Hex(components.whole);
     std::printf("  %-28s fingerprint %s%s spirv %s spec %s(%zu, id %llx) subgroup %s(%u) wgmem %s(%u) push %s bindings %s(%zu)\n", label, Hex(components.whole).c_str(), match ? " = GAME" : "", Hex(components.spirv).c_str(), Hex(components.specialization).c_str(), result.specialization.size(),
                 static_cast<unsigned long long>(result.specializationId), Hex(components.subgroup).c_str(), result.hostSubgroupSize, Hex(components.workgroupMemory).c_str(), result.workgroupMemoryDwords, Hex(components.push).c_str(), Hex(components.bindings).c_str(), result.bindings.size());
     if (!match && sidecar.present) {
-        const auto difference = DescribeDifference(sidecar, result, components);
+        const auto difference = DescribeDifference(sidecar, result, components, layout);
         if (!difference.empty()) std::printf("    differs from the game in: %s\n", difference.c_str());
     }
     if (g_describe) {
-        std::istringstream lines(AgcDriver::ComputePipelineDescription(result, components));
+        std::istringstream lines(AgcDriver::ComputePipelineDescription(result, components, layout));
         for (std::string line; std::getline(lines, line);) std::printf("    | %s\n", line.c_str());
     }
 }
@@ -307,15 +308,16 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> MaterializePrepared(con
 // --pipeline-only: each request needs a reference, the byte-exact SPIR-V of an ordinary replay (--expect-spv,
 // one request) or the .fp sidecar the driver saved with it (APS5_PIPELINE_REQUESTS), whose fingerprint covers
 // everything the pipeline create info takes from the recompile. Returns a refusal text, empty when it matches.
-std::string CheckPipelineReference(const char* path, const ShaderRecompiler::RecompileResult& result) {
+std::string CheckPipelineReference(const char* path, const ShaderRecompiler::RecompileResult& result, AgcDriver::VulkanDevice& device) {
     const auto sidecar = ReadSidecar(path);
-    const auto components = AgcDriver::ComputePipelineFingerprintComponents(result);
+    const auto layout = device.PlannedComputeLayoutKey(result);
+    const auto components = AgcDriver::ComputePipelineFingerprintComponents(result, layout);
     std::printf("  pipeline fingerprint: %s\n", Hex(components.whole).c_str());
     if (sidecar.present) {
         const auto found = sidecar.values.find("fingerprint");
         if (found == sidecar.values.end()) return "sidecar of " + std::string(path) + " has no fingerprint";
         if (found->second != Hex(components.whole)) {
-            const auto difference = DescribeDifference(sidecar, result, components);
+            const auto difference = DescribeDifference(sidecar, result, components, layout);
             return "fingerprint differs from the game's (" + found->second + " in the .fp of " + path + ")" + (difference.empty() ? std::string() : ": " + difference);
         }
         std::printf("  game fingerprint matches\n");
@@ -441,12 +443,13 @@ bool Replay(const char* path, std::unique_ptr<AgcDriver::VulkanDevice>& device) 
             // request, against the game's sidecar.
             const auto sidecar = ReadSidecar(path);
             if (sidecar.present) std::printf("  game sidecar: fingerprint %s\n", sidecar.values.count("fingerprint") ? sidecar.values.at("fingerprint").c_str() : "?");
-            PrintComponents("Recompile(request)", ShaderRecompiler::Recompile(request.request), sidecar);
+            if (!device) device = std::make_unique<AgcDriver::VulkanDevice>();
+            PrintComponents("Recompile(request)", ShaderRecompiler::Recompile(request.request), sidecar, *device);
             const char* labels[] = {"prepared+capture", "prepared, all pending", "prepared, all accessible", "prepared, page accessible", "prepared, game's probes"};
             for (int mode = 0; mode < 5; ++mode) {
                 if (mode == 4 && sidecar.probes.empty()) continue;
                 try {
-                    PrintComponents(labels[mode], *MaterializePrepared(request.request, mode, &sidecar), sidecar);
+                    PrintComponents(labels[mode], *MaterializePrepared(request.request, mode, &sidecar), sidecar, *device);
                     if (mode == 4) std::printf("    %llu probes the game did not record\n", static_cast<unsigned long long>(t_unrecordedProbes));
                 } catch (const std::exception& error) {
                     std::printf("  %-28s failed: %s\n", labels[mode], FirstLine(error.what()).c_str());
@@ -461,13 +464,20 @@ bool Replay(const char* path, std::unique_ptr<AgcDriver::VulkanDevice>& device) 
         const auto pipelineSidecar = g_pipelineOnly ? ReadSidecar(path) : Sidecar{};
         const auto materialized = g_pipelineOnly ? MaterializePrepared(request.request, pipelineSidecar.probes.empty() ? 3 : 4, &pipelineSidecar) : std::make_shared<const ShaderRecompiler::RecompileResult>(ShaderRecompiler::Recompile(request.request));
         const auto& result = *materialized;
+        {
+            AgcDriver::PipelineFingerprintDetail::Fnv spirvHash;
+            if (const auto words = result.spirv.ReadTransient()) {
+                for (const auto word : *words) spirvHash.Mix(word);
+            }
+            std::printf("  spirv hash %016llx specialization %016llx\n", static_cast<unsigned long long>(spirvHash.hash), static_cast<unsigned long long>(result.PipelineVariantId()));
+        }
         std::printf("  recompiled: %zu SPIR-V words%s\n", result.spirv.size(), !g_pipelineOnly ? "" : pipelineSidecar.probes.empty() ? " (prepared invocation, page-granular accessibility)" : " (prepared invocation, the game's recorded probes)");
         if (g_pipelineOnly) {
-            if (const auto refusal = CheckPipelineReference(path, result); !refusal.empty()) throw std::runtime_error("pipeline-only " + refusal);
+            if (!device) device = std::make_unique<AgcDriver::VulkanDevice>();
+            if (const auto refusal = CheckPipelineReference(path, result, *device); !refusal.empty()) throw std::runtime_error("pipeline-only " + refusal);
         }
         InspectSpirv(path, result.spirv);
         if (g_pipelineOnly) {
-            if (!device) device = std::make_unique<AgcDriver::VulkanDevice>();
             auto nativeRequest = request.request;
             nativeRequest.target = device->ComputeTarget(request.request.context.waveSize);
             const ShaderRecompiler::RequestSerializer serializer;
@@ -477,7 +487,7 @@ bool Replay(const char* path, std::unique_ptr<AgcDriver::VulkanDevice>& device) 
             std::fflush(stdout);
             const auto elapsed = device->WarmComputePipeline(result, request.request.shader.codeAddress);
             std::printf("  native pipeline complete: %.3f ms; no guest resources or dispatch\n", elapsed);
-            std::printf("PIPELINE-RESULT %s words=%zu fingerprint=%016llx create_ms=%.3f\n", path, result.spirv.size(), static_cast<unsigned long long>(AgcDriver::ComputePipelineFingerprint(result)), elapsed);
+            std::printf("PIPELINE-RESULT %s words=%zu fingerprint=%016llx create_ms=%.3f\n", path, result.spirv.size(), static_cast<unsigned long long>(AgcDriver::ComputePipelineFingerprint(result, device->PlannedComputeLayoutKey(result))), elapsed);
             std::fflush(stdout);
         }
         if (g_memory) {

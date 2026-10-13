@@ -6,13 +6,16 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <span>
 #include <string>
 
 namespace AgcDriver {
 
 // What decides a compute pipeline's create info apart from the device, hashed (FNV-1a) as a whole and
 // per component: the SPIR-V words, the specialization constants, the host subgroup size, the
-// workgroup memory set, the push range and the descriptor bindings. A pipeline request the driver
+// workgroup memory set, the push range and the descriptor set layout the dispatch path plans for the
+// bindings (VulkanDevice::PlannedComputeLayoutKey: image tables at their device capacity, not at a
+// dispatch's element count). A pipeline request the driver
 // saves (APS5_PIPELINE_REQUESTS) carries the game's values in its .fp sidecar; agc_shader_replay
 // --pipeline-only recomputes them from its own recompile and refuses a difference, naming the
 // components that differ, so a precompiled pipeline is the one the game will look up in its
@@ -39,7 +42,7 @@ struct Fnv {
 };
 }
 
-inline ComputePipelineComponents ComputePipelineFingerprintComponents(const ShaderRecompiler::RecompileResult& shader) {
+inline ComputePipelineComponents ComputePipelineFingerprintComponents(const ShaderRecompiler::RecompileResult& shader, std::span<const std::uint32_t> plannedLayout) {
     using PipelineFingerprintDetail::Fnv;
     Fnv whole;
     Fnv part;
@@ -67,25 +70,22 @@ inline ComputePipelineComponents ComputePipelineFingerprintComponents(const Shad
     close(components.workgroupMemory);
     both(shader.pushConstants.empty() ? 0u : 1u);
     close(components.push);
-    both(shader.bindings.size());
-    for (const auto& binding : shader.bindings) {
-        both((static_cast<std::uint64_t>(binding.kind) << 32u) | static_cast<std::uint64_t>(binding.role));
-        both((static_cast<std::uint64_t>(binding.descriptorSet) << 32u) | binding.binding);
-        both((static_cast<std::uint64_t>(binding.count) << 1u) | (binding.readOnly ? 1u : 0u));
-    }
+    both(plannedLayout.size());
+    for (const auto word : plannedLayout) both(word);
     close(components.bindings);
     components.whole = whole.hash;
     return components;
 }
 
-inline std::uint64_t ComputePipelineFingerprint(const ShaderRecompiler::RecompileResult& shader) {
-    return ComputePipelineFingerprintComponents(shader).whole;
+inline std::uint64_t ComputePipelineFingerprint(const ShaderRecompiler::RecompileResult& shader, std::span<const std::uint32_t> plannedLayout) {
+    return ComputePipelineFingerprintComponents(shader, plannedLayout).whole;
 }
 
 // The .fp sidecar body after the fingerprint line: one "<component> <hash>" line per component, then
 // the values themselves ("spec <id> <value>", "binding <set> <binding> <kind> <role> <count> <readOnly>",
-// "subgroup", "workgroup_memory", "push", "spirv_words", "specialization_id") for a diff.
-inline std::string ComputePipelineDescription(const ShaderRecompiler::RecompileResult& shader, const ComputePipelineComponents& components) {
+// "layout <binding> <type> <count> <stages> [<flags>]...", "subgroup", "workgroup_memory", "push",
+// "spirv_words", "specialization_id") for a diff.
+inline std::string ComputePipelineDescription(const ShaderRecompiler::RecompileResult& shader, const ComputePipelineComponents& components, std::span<const std::uint32_t> plannedLayout) {
     std::string text;
     char line[160];
     const auto add = [&](const char* name, std::uint64_t value) {
@@ -109,6 +109,9 @@ inline std::string ComputePipelineDescription(const ShaderRecompiler::RecompileR
         std::snprintf(line, sizeof(line), "binding %u %u %u %u %u %u\n", binding.descriptorSet, binding.binding, static_cast<unsigned>(binding.kind), static_cast<unsigned>(binding.role), binding.count, binding.readOnly ? 1u : 0u);
         text += line;
     }
+    text += "layout";
+    for (const auto word : plannedLayout) text += " " + std::to_string(word);
+    text += "\n";
     return text;
 }
 

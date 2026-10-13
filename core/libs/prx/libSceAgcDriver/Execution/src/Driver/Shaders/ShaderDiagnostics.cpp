@@ -110,7 +110,7 @@ bool Driver::pipelineRequestsEnabled() {
     return PipelineRequestDirectory() != nullptr;
 }
 
-void Driver::capturePipelineRequest(std::uint64_t address, const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::RecompileResult& result, std::span<const ShaderMemory::Probe> probes) noexcept {
+void Driver::capturePipelineRequest(std::uint64_t address, const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::RecompileResult& result, std::span<const ShaderMemory::Probe> probes, VulkanDevice& device) noexcept {
     const char* directory = PipelineRequestDirectory();
     if (directory == nullptr || request.shader.stage != ShaderRecompiler::ShaderStage::Compute || request.graphics.has_value()) return;
     static const std::size_t minimum = [] {
@@ -122,7 +122,8 @@ void Driver::capturePipelineRequest(std::uint64_t address, const ShaderRecompile
     try {
         const auto words = result.spirv.size();
         if (words < minimum) return;
-        const auto components = ComputePipelineFingerprintComponents(result);
+        const auto layout = device.PlannedComputeLayoutKey(result);
+        const auto components = ComputePipelineFingerprintComponents(result, layout);
         const auto fingerprint = components.whole;
         {
             std::lock_guard lock(savedMutex);
@@ -145,7 +146,7 @@ void Driver::capturePipelineRequest(std::uint64_t address, const ShaderRecompile
         };
         char sidecar[192];
         std::snprintf(sidecar, sizeof(sidecar), "fingerprint %016llx\nwords %zu\naddress 0x%llx\nvariant %016llx\n", static_cast<unsigned long long>(fingerprint), words, static_cast<unsigned long long>(address), static_cast<unsigned long long>(result.PipelineVariantId()));
-        std::string text = std::string(sidecar) + ComputePipelineDescription(result, components);
+        std::string text = std::string(sidecar) + ComputePipelineDescription(result, components, layout);
         std::set<std::tuple<bool, std::uint64_t, std::uint64_t>> asked;
         for (const auto& probe : probes) {
             if (!asked.insert({probe.pending, probe.address, probe.bytes}).second) continue;

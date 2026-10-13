@@ -3775,6 +3775,10 @@ PlannedComputeLayout planComputeLayout(const Graphics::Context& context, const S
 
 }
 
+std::vector<std::uint32_t> VulkanDevice::PlannedComputeLayoutKey(const ShaderRecompiler::RecompileResult& shader) {
+    return planComputeLayout(graphicsContext(), shader).key;
+}
+
 double VulkanDevice::WarmComputePipeline(const ShaderRecompiler::RecompileResult& shader, std::uint64_t programAddress, bool verifyDispatchLayout) {
     ShaderRecompiler::RuntimeAbi::RequireVersion(shader.runtimeAbiVersion);
     Graphics::Require(shader.spirv.size() >= 5u && shader.spirv[0] == 0x07230203u, "pipeline-only: invalid SPIR-V");
