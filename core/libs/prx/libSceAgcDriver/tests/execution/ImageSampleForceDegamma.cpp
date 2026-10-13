@@ -165,11 +165,11 @@ int main() {
         FillInput(true);
         const auto unormPoint = Sample(*device, Format8888UNorm, FilterPoint, ForceDegamma);
         RequireDecoded(unormPoint, "8_8_8_8_UNORM");
-        RequireSame(unormPoint, forcedPoint, "8_8_8_8_UNORM, point", "through FORCE_DEGAMMA", "as 8_8_8_8_SRGB");
+        RequireSame(unormPoint, forcedPoint, "8_8_8_8_UNORM, point, through FORCE_DEGAMMA, as 8_8_8_8_SRGB");
         const auto unormPlain = Sample(*device, Format8888UNorm, FilterPoint, 0u);
         Require(unormPlain[0] != unormPoint[0] || unormPlain[4] != unormPoint[4], "8_8_8_8_UNORM without FORCE_DEGAMMA sampled the decoded values");
         FillInput(false);
-        RequireSame(Sample(*device, Format8888UNorm, FilterBilinear, ForceDegamma), forcedBilinear, "8_8_8_8_UNORM, bilinear", "through FORCE_DEGAMMA", "as 8_8_8_8_SRGB");
+        RequireSame(Sample(*device, Format8888UNorm, FilterBilinear, ForceDegamma), forcedBilinear, "8_8_8_8_UNORM, bilinear, through FORCE_DEGAMMA, as 8_8_8_8_SRGB");
         Reject(*device, Format32Float, "guest format 22, which is not sRGB and has no sRGB view, is sampled through a sampler that forces sRGB decoding");
         std::puts("image sample force degamma tests passed");
         return 0;
