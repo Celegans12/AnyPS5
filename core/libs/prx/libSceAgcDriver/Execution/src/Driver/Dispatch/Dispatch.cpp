@@ -274,6 +274,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
         captureMs += phaseTiming.Elapsed();
     } else if (!fromAhead) {
         shaderMemory = std::make_shared<ShaderMemory>(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter());
+        if (pipelineRequestsEnabled()) shaderMemory->RecordProbes();
         std::uint64_t forgetAtCapture = 0;
 
         static const bool dumpShaders = std::getenv("APS5_DUMP_SHADERS") != nullptr;
@@ -304,7 +305,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
             static double totalMs = 0;
             totalMs += elapsed;
             if (profile && elapsed > 200) std::fprintf(stderr, "[gpu] compute shader 0x%llx recompile took %.0f ms (%zu SPIR-V words, %zu captured regions, total %.1f s)\n", static_cast<unsigned long long>(address), elapsed, compiledResult->spirv.size(), captured.size(), totalMs / 1000);
-            capturePipelineRequest(address, request, *compiledResult);
+            capturePipelineRequest(address, request, *compiledResult, shaderMemory->Probes());
         } catch (const std::exception& error) {
             if (dumpShaders) {
                 try {

@@ -11,6 +11,7 @@
 #include <iterator>
 #include <stdexcept>
 #include <string_view>
+#include <tuple>
 
 namespace AgcDriver::DriverDetail {
 
@@ -95,11 +96,22 @@ std::string Driver::dumpRequest(std::uint64_t address, const ShaderRecompiler::R
     return name;
 }
 
-void Driver::capturePipelineRequest(std::uint64_t address, const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::RecompileResult& result) noexcept {
+namespace {
+const char* PipelineRequestDirectory() {
     static const char* directory = [] {
         const char* value = std::getenv("APS5_PIPELINE_REQUESTS");
         return value != nullptr && *value != '\0' ? value : nullptr;
     }();
+    return directory;
+}
+}
+
+bool Driver::pipelineRequestsEnabled() {
+    return PipelineRequestDirectory() != nullptr;
+}
+
+void Driver::capturePipelineRequest(std::uint64_t address, const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::RecompileResult& result, std::span<const ShaderMemory::Probe> probes) noexcept {
+    const char* directory = PipelineRequestDirectory();
     if (directory == nullptr || request.shader.stage != ShaderRecompiler::ShaderStage::Compute || request.graphics.has_value()) return;
     static const std::size_t minimum = [] {
         const char* value = std::getenv("APS5_PIPELINE_REQUESTS_MIN_WORDS");
@@ -110,7 +122,8 @@ void Driver::capturePipelineRequest(std::uint64_t address, const ShaderRecompile
     try {
         const auto words = result.spirv.size();
         if (words < minimum) return;
-        const auto fingerprint = ComputePipelineFingerprint(result);
+        const auto components = ComputePipelineFingerprintComponents(result);
+        const auto fingerprint = components.whole;
         {
             std::lock_guard lock(savedMutex);
             if (!saved.insert(fingerprint).second) return;
@@ -132,7 +145,15 @@ void Driver::capturePipelineRequest(std::uint64_t address, const ShaderRecompile
         };
         char sidecar[192];
         std::snprintf(sidecar, sizeof(sidecar), "fingerprint %016llx\nwords %zu\naddress 0x%llx\nvariant %016llx\n", static_cast<unsigned long long>(fingerprint), words, static_cast<unsigned long long>(address), static_cast<unsigned long long>(result.PipelineVariantId()));
-        write(folder / (std::string(stem) + ".fp"), sidecar);
+        std::string text = std::string(sidecar) + ComputePipelineDescription(result, components);
+        std::set<std::tuple<bool, std::uint64_t, std::uint64_t>> asked;
+        for (const auto& probe : probes) {
+            if (!asked.insert({probe.pending, probe.address, probe.bytes}).second) continue;
+            char line[96];
+            std::snprintf(line, sizeof(line), "probe %c %llx %llx %u\n", probe.pending ? 'p' : 'a', static_cast<unsigned long long>(probe.address), static_cast<unsigned long long>(probe.bytes), probe.answer ? 1u : 0u);
+            text += line;
+        }
+        write(folder / (std::string(stem) + ".fp"), text);
         write(target, ShaderRecompiler::RequestSerializer{}.Serialize(request));
         std::fprintf(stderr, "[pipeline-requests] saved %s.req (%zu SPIR-V words, program 0x%llx)\n", stem, words, static_cast<unsigned long long>(address));
     } catch (const std::exception& error) {

@@ -5,6 +5,7 @@
 #include "ControlFlow/Structurizer.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include "Optimization/RequestMemoryView.hpp"
 #include "Recompiler.hpp"
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
@@ -20,6 +21,9 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <map>
+#include <set>
+#include <tuple>
 #include <memory>
 #include <span>
 #include <sstream>
@@ -57,6 +61,8 @@ bool g_prepareOnly = false;
 bool g_pipelineOnly = false;
 int g_requests = 0;
 bool g_noReference = false;
+bool g_variants = false;
+bool g_describe = false;
 std::string g_expectedSpirv;
 
 void ConfigurePipelineReplay(int argc, char** argv) {
@@ -67,6 +73,8 @@ void ConfigurePipelineReplay(int argc, char** argv) {
         const std::string option(argv[i]);
         if (option == "--pipeline-only") g_pipelineOnly = true;
         if (option == "--no-reference") g_noReference = true;
+        if (option == "--fingerprint-variants") g_variants = true;
+        if (option == "--describe") g_describe = true;
         if (option == "--prepare-only") prepare = true;
         if (option == "--maintenance8") maintenance = true;
         if (option == "--expect-spv") {
@@ -113,25 +121,205 @@ void CheckExpectedSpirv(std::span<const std::uint32_t> words) {
     std::printf("  expected SPIR-V matches: %zu bytes\n", words.size_bytes());
 }
 
+// The .fp sidecar APS5_PIPELINE_REQUESTS saved next to a request: "key value" lines (fingerprint, the
+// per-component hashes, counts) and the game's specialization constants and bindings.
+struct Sidecar {
+    bool present = false;
+    std::map<std::string, std::string> values;
+    std::vector<std::string> specs;
+    std::vector<std::string> bindings;
+    // "probe a|p <address> <bytes> <answer>": the dispatch's accessibility and pending-write probes.
+    std::map<std::tuple<char, std::uint64_t, std::uint64_t>, bool> probes;
+};
+
+Sidecar ReadSidecar(const char* path) {
+    Sidecar sidecar;
+    std::filesystem::path file(path);
+    file.replace_extension(".fp");
+    std::ifstream in(file);
+    if (!in) return sidecar;
+    sidecar.present = true;
+    std::string line;
+    while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        const auto space = line.find(' ');
+        if (space == std::string::npos) continue;
+        const auto key = line.substr(0, space);
+        if (key == "spec") sidecar.specs.push_back(line.substr(space + 1));
+        else if (key == "binding") sidecar.bindings.push_back(line.substr(space + 1));
+        else if (key == "probe") {
+            std::istringstream fields(line.substr(space + 1));
+            char kind = 0;
+            std::string address;
+            std::string bytes;
+            unsigned answer = 0;
+            if (fields >> kind >> address >> bytes >> answer) sidecar.probes[{kind, std::stoull(address, nullptr, 16), std::stoull(bytes, nullptr, 16)}] = answer != 0;
+        } else sidecar.values[key] = line.substr(space + 1);
+    }
+    return sidecar;
+}
+
+std::string Hex(std::uint64_t value) {
+    char text[24];
+    std::snprintf(text, sizeof(text), "%016llx", static_cast<unsigned long long>(value));
+    return text;
+}
+
+// The components of `result` that differ from the sidecar's, with the first differing values; empty
+// when the sidecar has no component hashes (requests saved before they were recorded).
+std::string DescribeDifference(const Sidecar& sidecar, const ShaderRecompiler::RecompileResult& result, const AgcDriver::ComputePipelineComponents& components) {
+    const std::pair<const char*, std::uint64_t> parts[] = {{"spirv", components.spirv}, {"specialization", components.specialization}, {"subgroup", components.subgroup}, {"workgroup_memory", components.workgroupMemory}, {"push", components.push}, {"bindings", components.bindings}};
+    std::string text;
+    for (const auto& [name, value] : parts) {
+        const auto found = sidecar.values.find(std::string("hash_") + name);
+        if (found == sidecar.values.end()) return {};
+        if (found->second == Hex(value)) continue;
+        text += text.empty() ? "" : ", ";
+        text += name;
+    }
+    std::istringstream mine(AgcDriver::ComputePipelineDescription(result, components));
+    std::vector<std::string> specs;
+    std::vector<std::string> bindings;
+    std::map<std::string, std::string> values;
+    for (std::string line; std::getline(mine, line);) {
+        const auto space = line.find(' ');
+        const auto key = line.substr(0, space);
+        if (key == "spec") specs.push_back(line.substr(space + 1));
+        else if (key == "binding") bindings.push_back(line.substr(space + 1));
+        else values[key] = line.substr(space + 1);
+    }
+    for (const char* key : {"spirv_words", "subgroup", "workgroup_memory", "push", "specialization_id", "variant_id"}) {
+        const auto game = sidecar.values.find(key);
+        if (game != sidecar.values.end() && game->second != values[key]) text += std::string("; ") + key + " game " + game->second + " replay " + values[key];
+    }
+    const auto listDiff = [&](const char* name, const std::vector<std::string>& game, const std::vector<std::string>& replay) {
+        if (game == replay) return;
+        text += std::string("; ") + name + ": game " + std::to_string(game.size()) + " replay " + std::to_string(replay.size());
+        int shown = 0;
+        for (std::size_t i = 0; i < std::max(game.size(), replay.size()) && shown < 6; ++i) {
+            const auto g = i < game.size() ? game[i] : std::string("-");
+            const auto r = i < replay.size() ? replay[i] : std::string("-");
+            if (g == r) continue;
+            text += " [" + std::to_string(i) + "] game '" + g + "' replay '" + r + "'";
+            ++shown;
+        }
+    };
+    listDiff("spec", sidecar.specs, specs);
+    listDiff("bindings", sidecar.bindings, bindings);
+    return text;
+}
+
+void PrintComponents(const char* label, const ShaderRecompiler::RecompileResult& result, const Sidecar& sidecar) {
+    const auto components = AgcDriver::ComputePipelineFingerprintComponents(result);
+    const auto game = sidecar.values.find("fingerprint");
+    const bool match = game != sidecar.values.end() && game->second == Hex(components.whole);
+    std::printf("  %-28s fingerprint %s%s spirv %s spec %s(%zu, id %llx) subgroup %s(%u) wgmem %s(%u) push %s bindings %s(%zu)\n", label, Hex(components.whole).c_str(), match ? " = GAME" : "", Hex(components.spirv).c_str(), Hex(components.specialization).c_str(), result.specialization.size(),
+                static_cast<unsigned long long>(result.specializationId), Hex(components.subgroup).c_str(), result.hostSubgroupSize, Hex(components.workgroupMemory).c_str(), result.workgroupMemoryDwords, Hex(components.push).c_str(), Hex(components.bindings).c_str(), result.bindings.size());
+    if (!match && sidecar.present) {
+        const auto difference = DescribeDifference(sidecar, result, components);
+        if (!difference.empty()) std::printf("    differs from the game in: %s\n", difference.c_str());
+    }
+    if (g_describe) {
+        std::istringstream lines(AgcDriver::ComputePipelineDescription(result, components));
+        for (std::string line; std::getline(lines, line);) std::printf("    | %s\n", line.c_str());
+    }
+}
+
+// The 4 KiB guest pages that hold a captured word. The game's accessibility probe (ShaderMemory::accessible)
+// asks the guest mapping, page by page; a request only carries the words the capture read, so
+// RequestMemoryView's probe (every byte captured) says no to a range of a mapped page with unread words,
+// e.g. the gaps of a strided image-table key scan, and the materializer then skips what the game did.
+// A page with a captured word was mapped when the game read it.
+thread_local const std::set<std::uint64_t>* t_capturedPages = nullptr;
+thread_local const std::map<std::tuple<char, std::uint64_t, std::uint64_t>, bool>* t_probes = nullptr;
+thread_local std::uint64_t t_unrecordedProbes = 0;
+
+bool CapturedPageAccessible(void*, std::uint64_t address, std::uint64_t bytes) {
+    if (t_capturedPages == nullptr || bytes == 0 || address > ~std::uint64_t{0} - bytes) return false;
+    for (auto page = address & ~std::uint64_t{0xfff}; page < address + bytes; page += 0x1000) {
+        if (!t_capturedPages->contains(page)) return false;
+    }
+    return true;
+}
+
+// mode 4: the answers the game's capture got (the sidecar's probe lines); a probe it did not record falls
+// back to the page rule (accessibility) or "no pending write", and is counted.
+bool RecordedAccessible(void* context, std::uint64_t address, std::uint64_t bytes) {
+    if (t_probes != nullptr) {
+        if (const auto found = t_probes->find({'a', address, bytes}); found != t_probes->end()) return found->second;
+    }
+    ++t_unrecordedProbes;
+    return CapturedPageAccessible(context, address, bytes);
+}
+
+bool RecordedPending(void*, std::uint64_t address, std::uint64_t bytes) {
+    if (t_probes != nullptr) {
+        if (const auto found = t_probes->find({'p', address, bytes}); found != t_probes->end()) return found->second;
+    }
+    ++t_unrecordedProbes;
+    return false;
+}
+
+std::set<std::uint64_t> CapturedPages(std::span<const ShaderRecompiler::MemoryRegion> regions) {
+    std::set<std::uint64_t> pages;
+    for (const auto& region : regions) {
+        if (region.bytes.empty()) continue;
+        for (auto page = region.guestAddress & ~std::uint64_t{0xfff}; page < region.guestAddress + region.bytes.size(); page += 0x1000) pages.insert(page);
+    }
+    return pages;
+}
+
+// The dispatch path's materialization: the shader prepared from the request, a prepared invocation, a
+// capture over the request's memory and Materialize (Recompile(request) materializes inside one call).
+// mode 0: RequestMemoryView's probes (every byte captured); mode 1: every pending-write probe says yes;
+// mode 2: no accessibility probe; mode 3: page-granular accessibility like the game's (CapturedPageAccessible);
+// mode 4: the game's recorded probe answers (RecordedAccessible, RecordedPending).
+std::shared_ptr<const ShaderRecompiler::RecompileResult> MaterializePrepared(const ShaderRecompiler::RecompileRequest& request, int mode, const Sidecar* sidecar = nullptr) {
+    const auto handle = ShaderRecompiler::PrepareShader(request);
+    if (!handle) throw std::runtime_error("prepared shader handle is absent");
+    auto invocationRequest = request;
+    invocationRequest.shader.code = ShaderRecompiler::GetPreparedCode(*handle);
+    auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(invocationRequest, handle);
+    if (!invocation) throw std::runtime_error("the prepared shader does not match its invocation");
+    ShaderRecompiler::RequestMemoryView memory(request.context.memory);
+    auto runtime = memory.MakeRuntime(request.context.userData, request.shader.codeAddress);
+    if (mode == 1) runtime.pendingWrite = +[](void*, std::uint64_t, std::uint64_t) { return true; };
+    if (mode == 2) runtime.accessible = nullptr;
+    const auto pages = CapturedPages(request.context.memory);
+    if (mode == 3) runtime.accessible = &CapturedPageAccessible;
+    if (mode == 4) {
+        runtime.accessible = &RecordedAccessible;
+        runtime.pendingWrite = &RecordedPending;
+    }
+    t_capturedPages = &pages;
+    t_probes = sidecar != nullptr ? &sidecar->probes : nullptr;
+    t_unrecordedProbes = 0;
+    struct Reset {
+        ~Reset() {
+            t_capturedPages = nullptr;
+            t_probes = nullptr;
+        }
+    } reset;
+    const auto capture = invocation->Capture(runtime);
+    return invocation->Materialize(*capture);
+}
+
 // --pipeline-only: each request needs a reference, the byte-exact SPIR-V of an ordinary replay (--expect-spv,
 // one request) or the .fp sidecar the driver saved with it (APS5_PIPELINE_REQUESTS), whose fingerprint covers
 // everything the pipeline create info takes from the recompile. Returns a refusal text, empty when it matches.
 std::string CheckPipelineReference(const char* path, const ShaderRecompiler::RecompileResult& result) {
-    std::filesystem::path sidecar(path);
-    sidecar.replace_extension(".fp");
-    const auto fingerprint = AgcDriver::ComputePipelineFingerprint(result);
-    std::printf("  pipeline fingerprint: %016llx\n", static_cast<unsigned long long>(fingerprint));
-    if (std::filesystem::exists(sidecar)) {
-        std::ifstream file(sidecar);
-        std::string key;
-        std::string value;
-        while (file >> key >> value) {
-            if (key != "fingerprint") continue;
-            if (std::stoull(value, nullptr, 16) != fingerprint) return "fingerprint differs from the game's (" + value + " in " + sidecar.string() + ")";
-            std::printf("  game fingerprint matches: %s\n", sidecar.string().c_str());
-            return {};
+    const auto sidecar = ReadSidecar(path);
+    const auto components = AgcDriver::ComputePipelineFingerprintComponents(result);
+    std::printf("  pipeline fingerprint: %s\n", Hex(components.whole).c_str());
+    if (sidecar.present) {
+        const auto found = sidecar.values.find("fingerprint");
+        if (found == sidecar.values.end()) return "sidecar of " + std::string(path) + " has no fingerprint";
+        if (found->second != Hex(components.whole)) {
+            const auto difference = DescribeDifference(sidecar, result, components);
+            return "fingerprint differs from the game's (" + found->second + " in the .fp of " + path + ")" + (difference.empty() ? std::string() : ": " + difference);
         }
-        return "sidecar " + sidecar.string() + " has no fingerprint";
+        std::printf("  game fingerprint matches\n");
+        return {};
     }
     if (g_noReference) {
         std::printf("  no reference (--no-reference): this replay's own SPIR-V; only a hit in the game's cache proves it is the game's pipeline\n");
@@ -248,8 +436,32 @@ bool Replay(const char* path, std::unique_ptr<AgcDriver::VulkanDevice>& device) 
             InspectSpirv(path, *words);
             return true;
         }
-        const auto result = ShaderRecompiler::Recompile(request.request);
-        std::printf("  recompiled: %zu SPIR-V words\n", result.spirv.size());
+        if (g_variants) {
+            // --fingerprint-variants: the pipeline fingerprint components of each way to materialize the
+            // request, against the game's sidecar.
+            const auto sidecar = ReadSidecar(path);
+            if (sidecar.present) std::printf("  game sidecar: fingerprint %s\n", sidecar.values.count("fingerprint") ? sidecar.values.at("fingerprint").c_str() : "?");
+            PrintComponents("Recompile(request)", ShaderRecompiler::Recompile(request.request), sidecar);
+            const char* labels[] = {"prepared+capture", "prepared, all pending", "prepared, all accessible", "prepared, page accessible", "prepared, game's probes"};
+            for (int mode = 0; mode < 5; ++mode) {
+                if (mode == 4 && sidecar.probes.empty()) continue;
+                try {
+                    PrintComponents(labels[mode], *MaterializePrepared(request.request, mode, &sidecar), sidecar);
+                    if (mode == 4) std::printf("    %llu probes the game did not record\n", static_cast<unsigned long long>(t_unrecordedProbes));
+                } catch (const std::exception& error) {
+                    std::printf("  %-28s failed: %s\n", labels[mode], FirstLine(error.what()).c_str());
+                }
+            }
+            return true;
+        }
+        // --pipeline-only materializes the way the dispatch path does (a prepared invocation and a capture),
+        // with the game's accessibility and pending-write answers when the sidecar recorded them, else
+        // page-granular accessibility like ShaderMemory's. RequestMemoryView's own probe (every byte
+        // captured) refuses the unread words of mapped pages, which changed image-table bindings.
+        const auto pipelineSidecar = g_pipelineOnly ? ReadSidecar(path) : Sidecar{};
+        const auto materialized = g_pipelineOnly ? MaterializePrepared(request.request, pipelineSidecar.probes.empty() ? 3 : 4, &pipelineSidecar) : std::make_shared<const ShaderRecompiler::RecompileResult>(ShaderRecompiler::Recompile(request.request));
+        const auto& result = *materialized;
+        std::printf("  recompiled: %zu SPIR-V words%s\n", result.spirv.size(), !g_pipelineOnly ? "" : pipelineSidecar.probes.empty() ? " (prepared invocation, page-granular accessibility)" : " (prepared invocation, the game's recorded probes)");
         if (g_pipelineOnly) {
             if (const auto refusal = CheckPipelineReference(path, result); !refusal.empty()) throw std::runtime_error("pipeline-only " + refusal);
         }
@@ -289,7 +501,7 @@ bool Replay(const char* path, std::unique_ptr<AgcDriver::VulkanDevice>& device) 
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] [--code] [--maintenance8] [--prepare-only | --pipeline-only --pipeline-cache DIR [--expect-spv FILE | --no-reference]] <shader.req>...\n  --prepare-only plans and compiles without materializing runtime memory\n  --pipeline-only recompiles captured compute inputs and creates the native pipeline without guest resources or dispatch\n  --pipeline-cache selects an existing private cache directory; __GL_SHADER_DISK_CACHE_PATH must select a separate fresh empty directory\n  --expect-spv requires byte equality with an ordinary replay before device creation (one request); without it each\n    request needs the .fp sidecar APS5_PIPELINE_REQUESTS saved next to it, and its pipeline fingerprint must match\n  --no-reference skips that check (requests from older runs); a hit in the game's pipeline cache then proves the match\n  several requests share one device and cache; each success prints a PIPELINE-RESULT line\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set\n");
+        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] [--code] [--maintenance8] [--prepare-only | --pipeline-only --pipeline-cache DIR [--expect-spv FILE | --no-reference]] <shader.req>...\n  --prepare-only plans and compiles without materializing runtime memory\n  --pipeline-only recompiles captured compute inputs and creates the native pipeline without guest resources or dispatch\n  --pipeline-cache selects an existing private cache directory; __GL_SHADER_DISK_CACHE_PATH must select a separate fresh empty directory\n  --expect-spv requires byte equality with an ordinary replay before device creation (one request); without it each\n    request needs the .fp sidecar APS5_PIPELINE_REQUESTS saved next to it, and its pipeline fingerprint must match\n  --no-reference skips that check (requests from older runs); a hit in the game's pipeline cache then proves the match\n  several requests share one device and cache; each success prints a PIPELINE-RESULT line\n  --fingerprint-variants prints the pipeline fingerprint components of each way to materialize a request against its .fp\n    (--describe adds the values: specialization constants, bindings)\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set\n");
         return 2;
     }
     try {
@@ -306,7 +518,7 @@ int main(int argc, char** argv) {
     std::unique_ptr<AgcDriver::VulkanDevice> device;
     int failures = 0;
     for (int i = 1; i < argc; ++i) {
-        if (std::string(argv[i]) == "--pipeline-only" || std::string(argv[i]) == "--no-reference") continue;
+        if (std::string(argv[i]) == "--pipeline-only" || std::string(argv[i]) == "--no-reference" || std::string(argv[i]) == "--fingerprint-variants" || std::string(argv[i]) == "--describe") continue;
         if (std::string(argv[i]) == "--pipeline-cache" || std::string(argv[i]) == "--expect-spv") {
             ++i;
             continue;

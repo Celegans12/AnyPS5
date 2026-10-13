@@ -209,6 +209,12 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
 
 bool ShaderMemory::accessible(void* context, std::uint64_t address, std::uint64_t bytes) {
     auto& self = *static_cast<ShaderMemory*>(context);
+    const bool answer = accessibleProbe(self, address, bytes);
+    if (self.recordProbes) self.probes.push_back({address, bytes, false, answer});
+    return answer;
+}
+
+bool ShaderMemory::accessibleProbe(ShaderMemory& self, std::uint64_t address, std::uint64_t bytes) {
     if (bytes == 0 || address > std::numeric_limits<std::uint64_t>::max() - bytes) return false;
     const auto end = address + bytes;
     while (address < end) {
@@ -231,9 +237,14 @@ bool ShaderMemory::accessible(void* context, std::uint64_t address, std::uint64_
 
 bool ShaderMemory::pending(void* context, std::uint64_t address, std::uint64_t bytes) {
     const auto& self = *static_cast<const ShaderMemory*>(context);
-    if (self.pendingWrite == nullptr || bytes == 0) return false;
+    if (self.pendingWrite == nullptr || bytes == 0) {
+        if (self.recordProbes) self.probes.push_back({address, bytes, true, false});
+        return false;
+    }
     const auto policy = self.pendingWrite(address, static_cast<std::size_t>(bytes), {});
-    return policy == PendingWrite::Sync || policy == PendingWrite::VerifyRaw || policy == PendingWrite::VerifyKnownValue;
+    const bool answer = policy == PendingWrite::Sync || policy == PendingWrite::VerifyRaw || policy == PendingWrite::VerifyKnownValue;
+    if (self.recordProbes) self.probes.push_back({address, bytes, true, answer});
+    return answer;
 }
 
 ShaderMemory::KnownValueCounts ShaderMemory::KnownValues() {
