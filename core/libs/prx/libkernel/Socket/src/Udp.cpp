@@ -14,6 +14,7 @@
 #endif
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libkernel/Socket/include/SocketRuntime.hpp"
 #include "prx/libkernel/Equeue/Equeue.hpp"
 #include "prx/libkernel/Time/include/TimedWait.hpp"
@@ -147,8 +148,8 @@ struct Waker {
     }
 };
 Waker& ThreadWaker() {
-    thread_local Waker waker;
-    return waker;
+    struct WakerTag {};
+    return HostThreadLocal<Waker, WakerTag>();
 }
 std::mutex socketsMutex;
 std::map<int, std::shared_ptr<Socket>> sockets;
