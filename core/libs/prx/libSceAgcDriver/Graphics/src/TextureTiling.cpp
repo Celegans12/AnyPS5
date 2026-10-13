@@ -7,6 +7,8 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <map>
+#include <mutex>
 #include <stdexcept>
 
 namespace AgcDriver::Graphics {
@@ -276,7 +278,9 @@ std::array<std::uint32_t, 3> ThinBlockLayout(TextureTileMode tileMode, std::uint
     return {block.blockSize, block.blockWidth, block.blockHeight};
 }
 
-std::array<std::uint32_t, 2> SwizzleRemapTile(TextureTileMode stored, TextureTileMode viewed, std::uint32_t bytesPerElement, std::uint32_t viewedPipeBankXor) {
+namespace {
+
+std::array<std::uint32_t, 2> ComputeSwizzleRemapTile(TextureTileMode stored, TextureTileMode viewed, std::uint32_t bytesPerElement, std::uint32_t viewedPipeBankXor) {
     const auto storedMode = EquationSwizzleMode(stored);
     const auto viewedMode = EquationSwizzleMode(viewed);
     if (storedMode == 0 || viewedMode == 0) return {0u, 0u};
@@ -308,6 +312,22 @@ std::array<std::uint32_t, 2> SwizzleRemapTile(TextureTileMode stored, TextureTil
         }
     }
     return {std::bit_ceil(columns + 1u), std::bit_ceil(rows + 1u)};
+}
+
+}
+
+std::array<std::uint32_t, 2> SwizzleRemapTile(TextureTileMode stored, TextureTileMode viewed, std::uint32_t bytesPerElement, std::uint32_t viewedPipeBankXor) {
+    static std::mutex mutex;
+    static std::map<std::array<std::uint32_t, 4>, std::array<std::uint32_t, 2>> tiles;
+    const std::array<std::uint32_t, 4> key{static_cast<std::uint32_t>(stored), static_cast<std::uint32_t>(viewed), bytesPerElement, viewedPipeBankXor};
+    {
+        std::lock_guard lock(mutex);
+        if (const auto found = tiles.find(key); found != tiles.end()) return found->second;
+    }
+    const auto tile = ComputeSwizzleRemapTile(stored, viewed, bytesPerElement, viewedPipeBankXor);
+    std::lock_guard lock(mutex);
+    tiles.emplace(key, tile);
+    return tile;
 }
 
 std::vector<std::pair<std::uint64_t, std::uint64_t>> CoveredMipBytes(TextureTileMode tileMode, std::uint32_t bytesPerElement, const TileMipLayout& mip) {

@@ -12,6 +12,8 @@
 #endif
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -272,6 +274,14 @@ void RequireRead(const std::vector<bool>& inside, std::uint32_t in, std::uint32_
     }
 }
 
+void RequireUnormRead(const std::vector<bool>& inside, std::uint32_t in, std::uint32_t out, const std::string& what) {
+    for (std::uint32_t pixel = 0; pixel < Width * Height; ++pixel) {
+        const std::uint32_t expected = inside[pixel] ? in : out;
+        const auto value = std::bit_cast<float>(Output[pixel]);
+        Require(std::isfinite(value) && std::lround(value * 255.0f) == static_cast<long>(expected), what + ": texel (" + std::to_string(pixel % Width) + ", " + std::to_string(pixel / Width) + ") read " + std::to_string(value * 255.0f) + "/255, expected " + std::to_string(expected) + "/255");
+    }
+}
+
 void MixedMarkPlane(AgcDriver::VulkanDevice& device, std::uint64_t address, const std::vector<bool>& inside, bool conflictingTable = false) {
     TableOutput.fill(0xdeadbeefu);
     alignas(256) std::array<std::uint32_t, 12> table{};
@@ -376,6 +386,7 @@ int main() {
         GuestBlock tiled;
         GuestBlock mixed;
         GuestBlock remapped;
+        GuestBlock aliased;
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         const auto shaders = CompileDraw(*device, false);
@@ -444,6 +455,14 @@ int main() {
         RequireCoverage(Draw(*device, screen, remapTarget, VK_COMPARE_OP_EQUAL, VK_STENCIL_OP_KEEP, ClearStencil | Mark), outside, "image_store OR 0x04 in SW_64KB_R_X lands on the SW_64KB_Z_X stencil texels outside the triangle");
         RequireCoverage(Draw(*device, screen, remapTarget, VK_COMPARE_OP_ALWAYS, VK_STENCIL_OP_KEEP, 0, 2), inside, "a SW_64KB_R_X stencil view preserves depth EQUAL 0.5");
         std::puts("SW_64KB_R_X view of a SW_64KB_Z_X stencil plane: read and write-back follow the address equations");
+        const auto aliasTarget = Target(aliased, false);
+        RequireCoverage(Draw(*device, shaders, aliasTarget, VK_COMPARE_OP_ALWAYS, VK_STENCIL_OP_REPLACE, Written, 1), inside, "SW_64KB_Z_X stencil seed coverage for an 8_UNORM view");
+        MarkPlane(*device, aliasTarget.stencilAddress, SwizzleR64KBX, Format8UNorm);
+        RequireUnormRead(ViewedAcrossSwizzles(inside, true), Written, ClearStencil, "8_UNORM image_load in SW_64KB_R_X of a SW_64KB_Z_X stencil plane");
+        RequireCoverage(Draw(*device, screen, aliasTarget, VK_COMPARE_OP_EQUAL, VK_STENCIL_OP_KEEP, Written), inside, "an 8_UNORM SW_64KB_R_X image_store lands on the SW_64KB_Z_X stencil texels inside the triangle");
+        RequireCoverage(Draw(*device, screen, aliasTarget, VK_COMPARE_OP_EQUAL, VK_STENCIL_OP_KEEP, ClearStencil), outside, "an 8_UNORM SW_64KB_R_X image_store lands on the SW_64KB_Z_X stencil texels outside the triangle");
+        RequireCoverage(Draw(*device, screen, aliasTarget, VK_COMPARE_OP_ALWAYS, VK_STENCIL_OP_KEEP, 0, 2), inside, "an 8_UNORM SW_64KB_R_X stencil view preserves depth EQUAL 0.5");
+        std::puts("8_UNORM SW_64KB_R_X view of a SW_64KB_Z_X stencil plane: read and write-back follow the address equations");
         RequireRefused(*device, target.stencilAddress, SwizzleS4KBX, "storage image access to the stencil plane", "an 8_UINT view in SW_4KB_S_X of a SW_64KB_Z_X stencil plane");
         const auto htile = Target(tiled, true, SwizzleZ64KBX, HalfDepth);
         Draw(*device, shaders, htile, VK_COMPARE_OP_ALWAYS, VK_STENCIL_OP_REPLACE, Written);
