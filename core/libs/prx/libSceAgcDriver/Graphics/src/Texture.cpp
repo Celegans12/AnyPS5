@@ -13,6 +13,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "RdnaDecoder/include/RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -291,7 +292,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
         const auto linearBytes = sliceLinearBytes * arrayLayers;
 
         VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-        imageInfo.flags = (descriptor.dimension == TextureDimension::kCube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0u) | (SrgbTwinFormat(vkFormat) != VK_FORMAT_UNDEFINED ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0u);
+        imageInfo.flags = (descriptor.dimension == TextureDimension::kCube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0u) | (SrgbTwinFormat(context, vkFormat) != VK_FORMAT_UNDEFINED ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0u);
         imageInfo.imageType = ImageTypeFor(descriptor.dimension);
         imageInfo.format = vkFormat;
         imageInfo.extent = {descriptor.width, descriptor.height, geometry.imageDepth};
@@ -751,7 +752,7 @@ void Texture::prepareBaseLevelView(const GuestTextureResource& descriptor, VkIma
 }
 
 void Texture::prepareSrgbView(const GuestTextureResource& descriptor, VkImageViewCreateInfo viewInfo) {
-    const auto format = SrgbTwinFormat(viewInfo.format);
+    const auto format = SrgbTwinFormat(context, viewInfo.format);
     if (format == VK_FORMAT_UNDEFINED) return;
     viewInfo.pNext = nullptr;
     viewInfo.format = format;
@@ -941,10 +942,13 @@ bool StorageClearAvailable(const Context& context, std::uint32_t guestFormat, Dc
     return IsDccClear(keys) && StorageFormatAvailable(context, guestFormat) && ClearColorFor(StorageFormatForGuest(context, guestFormat), keys, clear);
 }
 
-VkFormat SrgbTwinFormat(VkFormat format) {
+VkFormat SrgbTwinFormat(const Context& context, VkFormat format) {
+    // Devices that decode 8_SRGB or 8_8_SRGB in the shader cannot sample R8_SRGB or R8G8_SRGB (or are forced
+    // not to), so those formats keep no sRGB twin and a FORCE_DEGAMMA sampler on them stays refused.
+    const auto decoded = [&](ShaderRecompiler::IrBufferFormat srgb) { return (context.srgbDecodeFormats & ShaderRecompiler::SrgbDecodeBit(srgb)) != 0u; };
     switch (format) {
-        case VK_FORMAT_R8_UNORM: return VK_FORMAT_R8_SRGB;
-        case VK_FORMAT_R8G8_UNORM: return VK_FORMAT_R8G8_SRGB;
+        case VK_FORMAT_R8_UNORM: return decoded(ShaderRecompiler::IrBufferFormat::Format8Srgb) ? VK_FORMAT_UNDEFINED : VK_FORMAT_R8_SRGB;
+        case VK_FORMAT_R8G8_UNORM: return decoded(ShaderRecompiler::IrBufferFormat::Format8_8Srgb) ? VK_FORMAT_UNDEFINED : VK_FORMAT_R8G8_SRGB;
         case VK_FORMAT_R8G8B8A8_UNORM: return VK_FORMAT_R8G8B8A8_SRGB;
         case VK_FORMAT_B8G8R8A8_UNORM: return VK_FORMAT_B8G8R8A8_SRGB;
         case VK_FORMAT_A8B8G8R8_UNORM_PACK32: return VK_FORMAT_A8B8G8R8_SRGB_PACK32;

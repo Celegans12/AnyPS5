@@ -181,7 +181,7 @@ private:
 };
 
 VkFormat AttachmentProxyFormat(const Context& context, VkFormat format);
-VkFormat SrgbTwinFormat(VkFormat format);
+VkFormat SrgbTwinFormat(const Context& context, VkFormat format);
 
 // A guest texture a shader writes through a storage image. It is uploaded like a sampled texture;
 // after the GPU work completes its results are stored to guest memory (retiled, changed bytes only),
