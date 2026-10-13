@@ -284,6 +284,49 @@ void snapshotTests(const Context& context) {
 
 // A snapshot is validated by block hashes of its guest bytes: an unchanged surface hits its entry,
 // and one changed byte anywhere (either end, either side of a 64 KiB block boundary) makes it again.
+// A loading screen (lean-x13): the present counter stands still while one build binds thousands of
+// textures and holds them all until it is recorded. The cache's textures from seconds ago must make
+// room instead of every new texture becoming a one-off; a texture the build binds twice is made
+// once; and the device-local sampled images stay within the cache's ceiling however many the build
+// holds (past it, new textures go to system memory when the device has a memory type for that).
+void burstTests(const Context& context) {
+    Block block(context);
+    ClearCachedTextures(context.device);
+    Recorder::CountPresent();
+    const auto deviceBefore = SampledTextureMemory();
+    const auto bytes = Sampled(context, block.Surface(0))->AllocationBytes();
+    const auto capacity = static_cast<std::size_t>(Budget / bytes);
+    Require(capacity >= 2u && 2u * capacity + 2u <= Surfaces, "a snapshot of the 256 KiB surface holds " + std::to_string(bytes) + " bytes, which the test's 1 MiB budget does not fit as planned");
+    std::vector<std::weak_ptr<Texture>> stale{Sampled(context, block.Surface(0))};
+    for (std::size_t surface = 1; surface < capacity; ++surface) stale.push_back(Sampled(context, block.Surface(surface)));
+    Require(TextureCacheUsage().sampledEntries == capacity, "the stale frame did not fill the cache");
+    std::this_thread::sleep_for(std::chrono::milliseconds(2100));
+    std::vector<std::shared_ptr<Texture>> build;
+    std::size_t madeTwice = 0;
+    for (std::size_t surface = capacity; surface < Surfaces; ++surface) build.push_back(Sampled(context, block.Surface(surface)));
+    std::size_t staleLeft = 0;
+    for (const auto& texture : stale) staleLeft += !texture.expired();
+    for (std::size_t surface = capacity; surface < Surfaces; ++surface) {
+        auto again = Sampled(context, block.Surface(surface));
+        madeTwice += again != build[surface - capacity];
+        build.push_back(std::move(again));
+    }
+    const auto device = SampledTextureMemory() - deviceBefore;
+    std::printf("a build holding %zu textures after 2 s without a present: %zu made twice, %zu of the %zu stale textures left, %llu KiB of device-local sampled images (ceiling %llu KiB)\n", Surfaces - capacity, madeTwice, staleLeft, capacity, static_cast<unsigned long long>(device >> 10u), static_cast<unsigned long long>(Ceiling >> 10u));
+    Require(madeTwice == 0, std::to_string(madeTwice) + " textures the build binds twice were made twice");
+    Require(staleLeft == 0, std::to_string(staleLeft) + " textures last used seconds before kept the cache from the build's textures");
+    bool hostType = false;
+    for (std::uint32_t type = 0; type < context.memory.memoryTypeCount; ++type) hostType |= (context.memory.memoryHeaps[context.memory.memoryTypes[type].heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0;
+    if (!hostType) {
+        std::puts("no memory type outside the device-local heaps: the spill to system memory is not tested");
+        return;
+    }
+    Require(device <= Ceiling, "a build holding " + std::to_string(Surfaces - capacity) + " textures took " + std::to_string(device >> 10u) + " KiB of device-local sampled images, past the " + std::to_string(Ceiling >> 10u) + " KiB ceiling");
+    build.clear();
+    ClearCachedTextures(context.device);
+    Require(SampledTextureMemory() == deviceBefore, "the burst's textures outlived the build and the cache");
+}
+
 void snapshotChangeTests(const Context& context) {
     Block block(context);
     ClearCachedTextures(context.device);
@@ -540,6 +583,7 @@ int main(int argc, char** argv) {
             earlyMissTests(context);
             collidingKeyTests(context);
             snapshotChangeTests(context);
+            burstTests(context);
             ClearCachedTextures(context.device);
         }
         std::puts("sampled texture cache budget tests passed");

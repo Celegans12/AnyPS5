@@ -43,13 +43,16 @@ struct TextureMemoryUse {
 // TextureCacheBudget); the sampled cache admits up to `ceiling`, what is left after the storage
 // budget and the sampled images alive outside the cache (in recorded work, in builds), and evicts
 // down to `sampled` (four fifths of it). `target` is the share (0 without VK_EXT_memory_budget: the
-// static budgets of before, the ceiling a quarter over the sampled budget). APS5_TEXTURE_CACHE_MIB
-// forces both caches' budgets.
+// static budgets of before, the ceiling a quarter over the sampled budget). `share` is what every
+// device-local sampled image together may take, in the cache or not (the ceiling plus the images
+// outside the cache when the budgets were read): a new snapshot past it goes to system memory.
+// APS5_TEXTURE_CACHE_MIB forces both caches' budgets (and the share to the ceiling).
 struct TextureCacheBudgets {
     std::uint64_t sampled = 0;
     std::uint64_t ceiling = 0;
     std::uint64_t storage = 0;
     std::uint64_t target = 0;
+    std::uint64_t share = 0;
 };
 TextureCacheBudgets TextureCacheBudgetsFor(const VkPhysicalDeviceMemoryProperties& memory, const VkPhysicalDeviceMemoryBudgetPropertiesEXT* reported, const TextureMemoryUse& use);
 bool SampledBudgetReportDue(std::uint64_t reported, std::uint64_t budget, std::chrono::steady_clock::duration sinceReport);
@@ -71,6 +74,9 @@ struct SampledCacheCounts {
     std::uint64_t refusedSets = 0;
     std::uint64_t reclaims = 0;
     std::uint64_t reclaimedBytes = 0;
+    std::uint64_t spilled = 0;
+    std::uint64_t spilledBytes = 0;
+    std::uint64_t oneOffReuses = 0;
 };
 SampledCacheCounts SampledCacheCounters();
 std::shared_ptr<Texture> CachedSampledTexture(const Context& context, std::span<const std::uint32_t> words);

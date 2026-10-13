@@ -233,13 +233,22 @@ std::atomic<std::uint64_t>& SampledMemoryCounter() {
     return bytes;
 }
 
+std::atomic<std::uint64_t>& SampledHostMemoryCounter() {
+    static std::atomic<std::uint64_t> bytes{0};
+    return bytes;
+}
+
 }
 
 std::uint64_t SampledTextureMemory() {
     return SampledMemoryCounter().load(std::memory_order_relaxed);
 }
 
-Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare) : context(context) {
+std::uint64_t SampledTextureHostMemory() {
+    return SampledHostMemoryCounter().load(std::memory_order_relaxed);
+}
+
+Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare, bool hostMemory) : context(context) {
     const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::SampledTexture);
 
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -289,8 +298,10 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
         VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         allocation.allocationSize = requirements.size;
         allocationBytes = requirements.size;
-        allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        owned->memory = AllocateDeviceMemory(context, allocation, "vkAllocateMemory texture");
+        const auto hostType = HostMemoryType(context.memory, requirements.memoryTypeBits);
+        allocation.memoryTypeIndex = hostMemory && hostType ? *hostType : context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        inHostMemory = hostMemory && hostType;
+        owned->memory = AllocateDeviceMemory(context, allocation, "vkAllocateMemory texture", requirements.memoryTypeBits, &inHostMemory);
         Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, owned->memory, 0), "vkBindImageMemory");
 
         {
@@ -456,7 +467,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
             if (++totals.count % 200 == 0) std::fprintf(stderr, "[texture] %llu textures (%llu copied from storage images, %llu uploads recorded): allocate+image %.0f ms, guest read %.0f ms, detile+copy %.0f ms, view+buffer release %.0f ms\n", static_cast<unsigned long long>(totals.count), static_cast<unsigned long long>(totals.fromStorage), static_cast<unsigned long long>(totals.recordedUploads), totals.allocate, totals.read, totals.gpu, totals.view);
         }
         countedBytes = allocationBytes;
-        SampledMemoryCounter().fetch_add(countedBytes, std::memory_order_relaxed);
+        (inHostMemory ? SampledHostMemoryCounter() : SampledMemoryCounter()).fetch_add(countedBytes, std::memory_order_relaxed);
     } catch (...) {
         release();
         throw;
@@ -720,7 +731,7 @@ void Texture::release() noexcept {
     // The image and its memory go with the last holder: this texture, or the batch still uploading it.
     owned.reset();
     image = VK_NULL_HANDLE;
-    SampledMemoryCounter().fetch_sub(std::exchange(countedBytes, 0), std::memory_order_relaxed);
+    (inHostMemory ? SampledHostMemoryCounter() : SampledMemoryCounter()).fetch_sub(std::exchange(countedBytes, 0), std::memory_order_relaxed);
 }
 
 VkImageView Texture::View() const {

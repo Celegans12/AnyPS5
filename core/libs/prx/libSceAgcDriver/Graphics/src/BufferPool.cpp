@@ -6,7 +6,9 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <atomic>
 #include <limits>
+#include <optional>
 
 namespace AgcDriver::Graphics {
 
@@ -79,17 +81,48 @@ VkDeviceMemory BufferPool::AllocateMemory(const VkMemoryAllocateInfo& allocation
     return VK_NULL_HANDLE;
 }
 
-VkDeviceMemory AllocateDeviceMemory(const Context& context, const VkMemoryAllocateInfo& allocation, const char* operation) {
-    if (context.bufferPool) return context.bufferPool->AllocateMemory(allocation, operation);
-    const auto allocate = context.Function<PFN_vkAllocateMemory>("vkAllocateMemory");
-    VkDeviceMemory memory = VK_NULL_HANDLE;
-    auto result = allocate(context.device, &allocation, nullptr, &memory);
-    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && ReclaimTextureMemory(context.device, allocation.allocationSize) != 0) {
-        memory = VK_NULL_HANDLE;
-        result = allocate(context.device, &allocation, nullptr, &memory);
+std::optional<std::uint32_t> HostMemoryType(const VkPhysicalDeviceMemoryProperties& memory, std::uint32_t memoryTypeBits) {
+    std::optional<std::uint32_t> mappable;
+    for (std::uint32_t type = 0; type < std::min<std::uint32_t>(memory.memoryTypeCount, VK_MAX_MEMORY_TYPES); ++type) {
+        if ((memoryTypeBits & (1u << type)) == 0) continue;
+        const auto& properties = memory.memoryTypes[type];
+        if ((properties.propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 || properties.heapIndex >= memory.memoryHeapCount || (memory.memoryHeaps[properties.heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0) continue;
+        if ((properties.propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0) return type;
+        if (!mappable) mappable = type;
     }
-    Check(result, operation);
-    return memory;
+    return mappable;
+}
+
+VkDeviceMemory AllocateDeviceMemory(const Context& context, VkMemoryAllocateInfo allocation, const char* operation, std::uint32_t memoryTypeBits, bool* inHostMemory) {
+    const auto allocate = context.Function<PFN_vkAllocateMemory>("vkAllocateMemory");
+    const auto attempt = [&] {
+        if (context.bufferPool) return context.bufferPool->AllocateMemory(allocation, operation);
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        auto result = allocate(context.device, &allocation, nullptr, &memory);
+        if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && ReclaimTextureMemory(context.device, allocation.allocationSize) != 0) {
+            memory = VK_NULL_HANDLE;
+            result = allocate(context.device, &allocation, nullptr, &memory);
+        }
+        Check(result, operation);
+        return memory;
+    };
+    const auto hostType = inHostMemory != nullptr ? HostMemoryType(context.memory, memoryTypeBits) : std::nullopt;
+    if (!hostType || allocation.memoryTypeIndex == *hostType) {
+        if (inHostMemory != nullptr) *inHostMemory = hostType && allocation.memoryTypeIndex == *hostType;
+        return attempt();
+    }
+    try {
+        *inHostMemory = false;
+        return attempt();
+    } catch (const std::exception& error) {
+        allocation.memoryTypeIndex = *hostType;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        if (allocate(context.device, &allocation, nullptr, &memory) != VK_SUCCESS) throw;
+        static std::atomic<std::uint64_t> reports{0};
+        if (reports.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[bufferpool] %s placed %llu bytes in system memory (memory type %u) after: %s\n", operation, static_cast<unsigned long long>(allocation.allocationSize), *hostType, error.what());
+        *inHostMemory = true;
+        return memory;
+    }
 }
 
 bool BufferPool::SlabEligible(std::size_t capacity, VkDeviceSize alignment, VkDeviceSize size, VkDeviceSize atom) {

@@ -37,7 +37,10 @@ bool StorageFormatAvailable(const Context& context, std::uint32_t guestFormat);
 // Whether a storage image of the guest format takes DCC clear `keys` as a GPU clear (see
 // StorageTexture::upload); false for integer formats and non-clear keys.
 bool StorageClearAvailable(const Context& context, std::uint32_t guestFormat, DccKeys keys);
+// Live sampled textures' own images: in device-local memory (what the texture caches' budgets
+// count), and in system memory (snapshots made past the sampled share, see cachedTexture).
 std::uint64_t SampledTextureMemory();
+std::uint64_t SampledTextureHostMemory();
 bool ClearKeepsDenormals(const Context& context, VkFormat format);
 
 // A sampled texture's own VkImage with its memory, shared with the recorder while a recorded upload
@@ -57,7 +60,9 @@ struct OwnedImage {
 
 class Texture {
 public:
-    Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare = false);
+    // `hostMemory`: the image goes to a memory type outside the device-local heaps when the device
+    // has one for it (sampling it then reads over the bus); InHostMemory says where it went.
+    Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare = false, bool hostMemory = false);
     Texture(const Context& context, const std::shared_ptr<ResidentColor>& source, const GuestTextureResource& descriptor, VkComponentMapping components);
     // A view of a storage image's own VkImage: the sampled texture follows the image's content, so a
     // compute pass writing it and the next pass sampling it share one image and copy nothing.
@@ -92,6 +97,7 @@ public:
     // The layout the image is kept in while sampled.
     VkImageLayout Layout() const { return layout; }
     VkDeviceSize AllocationBytes() const { return allocationBytes; }
+    bool InHostMemory() const { return inHostMemory; }
     VkFormat ViewFormat() const { return viewFormat; }
     // Whether this texture is a view of a storage image (no snapshot of its own).
     bool ViewsStorageImage() const { return storageSource != nullptr; }
@@ -143,6 +149,7 @@ private:
     VkImageLayout layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     VkDeviceSize allocationBytes = 0;
     VkDeviceSize countedBytes = 0;
+    bool inHostMemory = false;
     VkFormat viewFormat = VK_FORMAT_UNDEFINED;
     std::shared_ptr<ResidentColor> source;
     std::shared_ptr<StorageTexture> storageSource;

@@ -175,6 +175,10 @@ int main() {
             // new ones past the ceiling are refused, and a refused texture's set stays out of the
             // resource cache, so it goes when its work completes.
             for (std::size_t surface = retired; surface < retired + capacity + 4u; ++surface) Sample(*device, sampled, target, surface);
+            const auto recorded = SampledCacheCounters();
+            const auto recordedLive = SampledTextureMemory() - baseline;
+            std::printf("the burst recorded, not yet waited for: %s of device-local sampled images, %llu snapshots placed in system memory\n", MiB(recordedLive).c_str(), static_cast<unsigned long long>(recorded.spilled - afterRetired.spilled));
+            if (recorded.spilled != afterRetired.spilled) Require(recordedLive <= Ceiling, "with snapshots going to system memory, the recorded burst still took " + MiB(recordedLive) + " of device-local sampled images, past the " + MiB(Ceiling) + " ceiling");
             device->WaitIdle();
             const auto afterBurst = SampledCacheCounters();
             const auto burstLive = SampledTextureMemory() - baseline;

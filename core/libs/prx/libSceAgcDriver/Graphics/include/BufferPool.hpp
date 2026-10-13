@@ -160,7 +160,13 @@ private:
 std::shared_ptr<BufferPool> GetBufferPool(const Context& context);
 // vkAllocateMemory with the out-of-memory recovery of BufferPool::AllocateMemory (the context's pool
 // trimmed, then sampled textures reclaimed, then one retry); throws with `operation` on failure.
-VkDeviceMemory AllocateDeviceMemory(const Context& context, const VkMemoryAllocateInfo& allocation, const char* operation);
+// With `memoryTypeBits` (the resource's memory requirements) and `inHostMemory`: when the allocation
+// still fails after that recovery, one more try in a memory type outside the device-local heaps
+// (HostMemoryType), which then sets *inHostMemory; an allocation made in such a type already sets it.
+VkDeviceMemory AllocateDeviceMemory(const Context& context, VkMemoryAllocateInfo allocation, const char* operation, std::uint32_t memoryTypeBits = 0, bool* inHostMemory = nullptr);
+// A memory type of `memoryTypeBits` on a heap that is not device-local, preferring one the host
+// cannot map (system memory the device reads over the bus); none on devices whose every heap is.
+std::optional<std::uint32_t> HostMemoryType(const VkPhysicalDeviceMemoryProperties& memory, std::uint32_t memoryTypeBits);
 
 }
 
