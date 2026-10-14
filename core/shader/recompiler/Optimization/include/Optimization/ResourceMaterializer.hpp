@@ -61,7 +61,6 @@ public:
     static void PrepareDirectImageRefusals(IrProgram& program, bool faultAbi);
     static void ValidateDirectImageRefusals(const ShaderInfo& info, IrShaderStage stage, const ResourceSnapshot& snapshot, bool allowRefusal);
     static void PrepareImageModes(ShaderInfo& info);
-    static ResolvedImageTables ResolveImageTables(const ShaderInfo& info, const ResourceSnapshot& snapshot, std::uint64_t memoKey = 0);
     static const char* UnnormalizedSampleMismatch(const ImageResource& image);
     static ResolvedImageTables ResolveImageTables(const ShaderInfo& info, const ResourceSnapshot& snapshot, std::uint64_t memoKey = 0);
     [[nodiscard]] IrResourcePlan ExtractPlan(const IrProgram& program) const;

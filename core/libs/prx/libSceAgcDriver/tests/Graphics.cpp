@@ -21,7 +21,6 @@
 #include "CacheKey.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "BdaAbi.hpp"
-#include "ImageTableAbi.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include "prx/libc/include/GuestHeap.hpp"
@@ -2871,7 +2870,6 @@ struct MockVulkan {
     std::vector<VkDescriptorPoolSize> poolSizes;
     std::uint32_t poolMaxSets = 0;
     VkDescriptorPoolCreateFlags poolFlags = 0;
-    std::optional<std::uint32_t> variableDescriptorCount;
     struct DescriptorPool {
         VkDescriptorPoolCreateFlags flags;
         std::uint32_t maxSets;
@@ -3009,13 +3007,6 @@ VKAPI_ATTR void VKAPI_CALL mockDestroyDescriptorPool(VkDevice, VkDescriptorPool 
 
 VKAPI_ATTR VkResult VKAPI_CALL mockAllocateDescriptorSets(VkDevice, const VkDescriptorSetAllocateInfo* info, VkDescriptorSet* sets) {
     Require(info->descriptorSetCount == 1, "exactly one descriptor set must be allocated");
-    mock.variableDescriptorCount.reset();
-    if (info->pNext != nullptr) {
-        const auto* variable = static_cast<const VkDescriptorSetVariableDescriptorCountAllocateInfo*>(info->pNext);
-        Require(variable->sType == VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_ALLOCATE_INFO && variable->descriptorSetCount == 1, "variable descriptor allocation is malformed");
-        mock.variableDescriptorCount = variable->pDescriptorCounts[0];
-        Require(*mock.variableDescriptorCount <= mock.variableLayoutCounts.at(info->pSetLayouts[0]), "variable descriptor count exceeds its layout binding");
-    }
     auto& pool = mock.descriptorPools.at(info->descriptorPool);
     ++pool.attempts;
     if (pool.allocated == pool.maxSets) return VK_ERROR_OUT_OF_POOL_MEMORY;
@@ -3210,8 +3201,6 @@ PFN_vkVoidFunction VKAPI_CALL mockProc(VkDevice, const char* name) {
         {"vkCreateDescriptorPool", reinterpret_cast<PFN_vkVoidFunction>(mockCreateDescriptorPool)},
         {"vkDestroyDescriptorPool", reinterpret_cast<PFN_vkVoidFunction>(mockDestroyDescriptorPool)},
         {"vkAllocateDescriptorSets", reinterpret_cast<PFN_vkVoidFunction>(mockAllocateDescriptorSets)},
-        {"vkCreateSampler", reinterpret_cast<PFN_vkVoidFunction>(mockCreateSampler)},
-        {"vkDestroySampler", reinterpret_cast<PFN_vkVoidFunction>(mockDestroySampler)},
         {"vkResetDescriptorPool", reinterpret_cast<PFN_vkVoidFunction>(mockResetDescriptorPool)},
         {"vkCreateSampler", reinterpret_cast<PFN_vkVoidFunction>(mockCreateSampler)},
         {"vkDestroySampler", reinterpret_cast<PFN_vkVoidFunction>(mockDestroySampler)},

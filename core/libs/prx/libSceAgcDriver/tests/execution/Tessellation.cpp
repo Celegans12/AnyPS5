@@ -356,17 +356,6 @@ alignas(256) constexpr std::array<std::uint16_t, 12> QuadIndices{
     Corner(2, 0, 0), Corner(2, 2, 0), Corner(2, 2, 2), Corner(2, 0, 2),
 };
 
-alignas(256) constexpr std::array<std::uint16_t, 24> LatePatchIndices{
-    Corner(1, 0, 0), Corner(1, 2, 0), Corner(1, 1, 2),
-    Corner(1, 0, 0), Corner(1, 2, 0), Corner(1, 1, 2),
-    Corner(1, 0, 0), Corner(1, 2, 0), Corner(1, 1, 2),
-    Corner(1, 0, 0), Corner(1, 2, 0), Corner(1, 1, 2),
-    Corner(1, 0, 0), Corner(1, 2, 0), Corner(1, 1, 2),
-    Corner(1, 0, 0), Corner(1, 2, 0), Corner(1, 1, 2),
-    Corner(2, 0, 0), Corner(2, 2, 0), Corner(2, 1, 2),
-    Corner(0, 0, 0), Corner(0, 2, 0), Corner(0, 1, 2),
-};
-
 struct PatchDraw {
     TessellationConfiguration configuration;
     std::span<const std::uint16_t> indices;

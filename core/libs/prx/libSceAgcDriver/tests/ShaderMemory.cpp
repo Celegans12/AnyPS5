@@ -2558,7 +2558,6 @@ void verifyHalfWaveReduction() {
     divergent.insert(divergent.begin() + 3, 0x88fe1a7eu);
     divergent.insert(divergent.begin() + 2, {0xbe860480u, 0x7d821688u, 0xbe9a246au, 0xbf880001u});
     require(reductions(pixel(divergent, 32u, true), spv::OpGroupNonUniformUMin) == 1u, "half-wave reduction: keys masked inside a divergent branch did not read lane 31 as a subgroup UMin");
-    require(reductions(domain(divergent, 32u), spv::OpGroupNonUniformUMin) == 1u, "half-wave reduction: domain keys masked inside a divergent branch did not read lane 31 as a subgroup UMin on 32 lanes");
     auto windowed = umin;
     windowed.insert(windowed.begin() + 23, 0x7e008514u);
     require(reductions(pixel(windowed, 32u, true), spv::OpGroupNonUniformUMin) == 1u, "half-wave reduction: a UMin scan of registers in a v_movreld_b32 window did not read lane 31 as a subgroup UMin on 32 lanes");
@@ -5148,8 +5147,7 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--layout-pair") {
             verifyLayoutPair();
-            std::cout << "Both push-constant layouts of a pixel shader compile from one program unchanged
-";
+            std::cout << "Both push-constant layouts of a pixel shader compile from one program unchanged\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--bindless") {

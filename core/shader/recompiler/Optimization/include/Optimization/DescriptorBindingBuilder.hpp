@@ -15,7 +15,6 @@ struct PreparedDescriptorBinding {
     std::vector<std::uint32_t> resources;
     std::vector<bool> identityImageSwizzle;
     std::vector<std::uint32_t> samplerFilterElements;
-    std::vector<std::uint32_t> tableSamplerMasks;
     std::vector<bool> inactive;
     std::vector<std::uint32_t> tableSamplerMasks;
     std::size_t writtenBuffers = 0;
