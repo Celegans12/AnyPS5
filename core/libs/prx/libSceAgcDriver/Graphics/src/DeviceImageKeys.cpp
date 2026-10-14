@@ -37,7 +37,7 @@ std::optional<DeviceImageValue> DeviceImageKeys::Find(const Key& key) const {
     for (std::uint32_t step = 0; step < Abi::ProbeSteps; ++step) {
         const auto* at = words.data() + static_cast<std::size_t>((home + step) & mask) * Abi::BucketWords;
         if (at[Abi::StateWord] != Abi::LiveState) return std::nullopt;
-        if (std::equal(key.begin(), key.end(), at)) return DeviceImageValue{at[Abi::SlotWord], at[Abi::ModeWord], at[Abi::FaultWord]};
+        if (std::equal(key.begin(), key.end(), at)) return DeviceImageValue{at[Abi::SlotWord], at[Abi::ModeWord], at[Abi::FaultWord], at[Abi::SamplerSlotWord]};
     }
     return std::nullopt;
 }
@@ -71,6 +71,7 @@ DeviceImageKeys::Insertion DeviceImageKeys::Insert(const Key& key, const DeviceI
         at[Abi::SlotWord] = value.slot;
         at[Abi::ModeWord] = value.mode;
         at[Abi::FaultWord] = value.fault;
+        at[Abi::SamplerSlotWord] = value.samplerSlot;
         changed.push_back(bucket);
     };
     bool found = false;

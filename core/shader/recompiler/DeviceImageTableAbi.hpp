@@ -6,17 +6,20 @@
 
 namespace ShaderRecompiler::DeviceImageTableAbi {
 
-inline constexpr std::uint32_t Version = 1;
+inline constexpr std::uint32_t Version = 2;
 
 inline constexpr std::uint32_t DescriptorWords = 8;
 inline constexpr std::uint32_t InterfaceWord = 8;
 inline constexpr std::uint32_t SamplerClassWord = 10;
-inline constexpr std::uint32_t KeyWords = 11;
-inline constexpr std::uint32_t StateWord = 11;
-inline constexpr std::uint32_t SlotWord = 12;
-inline constexpr std::uint32_t ModeWord = 13;
-inline constexpr std::uint32_t FaultWord = 14;
-inline constexpr std::uint32_t BucketWords = 16;
+inline constexpr std::uint32_t SamplerWord = 11;
+inline constexpr std::uint32_t SamplerWords = 4;
+inline constexpr std::uint32_t KeyWords = 15;
+inline constexpr std::uint32_t StateWord = 15;
+inline constexpr std::uint32_t SlotWord = 16;
+inline constexpr std::uint32_t ModeWord = 17;
+inline constexpr std::uint32_t FaultWord = 18;
+inline constexpr std::uint32_t SamplerSlotWord = 19;
+inline constexpr std::uint32_t BucketWords = 20;
 inline constexpr std::uint32_t BucketBytes = BucketWords * 4u;
 inline constexpr std::uint32_t EmptyState = 0;
 inline constexpr std::uint32_t LiveState = 1;
@@ -34,7 +37,7 @@ inline constexpr std::uint32_t HeaderWords = 16;
 inline constexpr std::uint32_t RingCountWord = 0;
 inline constexpr std::uint32_t RingRecordsWord = 4;
 inline constexpr std::uint32_t RecordWords = 16;
-inline constexpr std::uint32_t RecordPcWord = 11;
+inline constexpr std::uint32_t RecordPcWord = 15;
 
 inline constexpr std::uint32_t FaultFlag = 0x40000000u;
 
@@ -45,6 +48,7 @@ inline constexpr std::uint32_t SamplerFloatBorder = 1u << 3u;
 inline constexpr std::uint32_t SamplerIntegerBorder = 1u << 4u;
 inline constexpr std::uint32_t SamplerAnisoOverride = 1u << 5u;
 inline constexpr std::uint32_t SamplerReduction = 1u << 6u;
+inline constexpr std::uint32_t RuntimeSampler = 1u << 31u;
 
 inline constexpr std::uint32_t HashSeed = 0x9747b28cu;
 inline constexpr std::uint32_t HashC1 = 0xcc9e2d51u;

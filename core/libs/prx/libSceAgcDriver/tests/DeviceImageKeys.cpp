@@ -39,10 +39,11 @@ std::vector<DeviceImageKeys::Key> SameHome(std::uint32_t buckets, std::size_t co
 }
 
 void testHash() {
-    Expect(Abi::Hash(DeviceImageKeys::Key{}) == 0xd8d2c065u, "the hash of the zero key is MurmurHash3_x86_32 of 44 zero bytes with seed 0x9747b28c");
-    Expect(Abi::Hash(DeviceImageKeys::Key{1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u, 9u, 10u, 11u}) == 0xdda41851u, "the hash of 1..11 matches the reference");
-    Expect(Abi::Hash(DeviceImageKeys::Key{0x00123400u, 0x01600000u, 0x8000c03fu, 0x9000fac0u, 0u, 0u, 0u, 0u, 0x89abcdefu, 0x01234567u, 5u}) == 0xbd82641cu, "the hash of a T# key matches the reference");
-    Expect(Abi::Hash(DeviceImageKeys::Key{0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu}) == 0x18787eddu, "the hash of all ones matches the reference");
+    Expect(Abi::Hash(DeviceImageKeys::Key{}) == 0xfa15124cu, "the hash of the zero key is MurmurHash3_x86_32 of 60 zero bytes with seed 0x9747b28c");
+    Expect(Abi::Hash(DeviceImageKeys::Key{1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u, 9u, 10u, 11u, 12u, 13u, 14u, 15u}) == 0x1c73aadcu, "the hash of 1..15 matches the reference");
+    Expect(Abi::Hash(DeviceImageKeys::Key{0x00123400u, 0x01600000u, 0x8000c03fu, 0x9000fac0u, 0u, 0u, 0u, 0u, 0x89abcdefu, 0x01234567u, 5u, 0u, 0u, 0u, 0u}) == 0x4dbc4501u, "the hash of a T# key matches the reference");
+    Expect(Abi::Hash(DeviceImageKeys::Key{0x00123400u, 0x01600000u, 0x8000c03fu, 0x9000fac0u, 0u, 0u, 0u, 0u, 0x89abcdefu, 0x01234567u, Abi::RuntimeSampler, 0x92u, 0x400000u, 0x500000u, 0u}) == 0xd28701c6u, "the hash of a T# and S# key matches the reference");
+    Expect(Abi::Hash(DeviceImageKeys::Key{0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu}) == 0x1f3adfbdu, "the hash of all ones matches the reference");
     auto changed = MakeKey(7u);
     const auto original = Abi::Hash(changed);
     for (std::uint32_t word = 0; word < changed.size(); ++word) {
@@ -63,8 +64,8 @@ void testInsertFind() {
         Expect(found.has_value() && found->slot == seed && found->mode == seed % 3u && found->fault == 0u, "every inserted key is found with its value");
     }
     Expect(!keys.Find(MakeKey(21u)).has_value(), "a key never inserted is not found");
-    Expect(keys.Insert(MakeKey(5u), {99u, 7u, 3u}) == DeviceImageKeys::Insertion::Updated && keys.Entries() == 20u, "inserting a present key rewrites its value without a new entry");
-    Expect(keys.Find(MakeKey(5u)) == DeviceImageValue{99u, 7u, 3u}, "the rewritten value is found");
+    Expect(keys.Insert(MakeKey(5u), {99u, 7u, 3u, 42u}) == DeviceImageKeys::Insertion::Updated && keys.Entries() == 20u, "inserting a present key rewrites its value without a new entry");
+    Expect(keys.Find(MakeKey(5u)) == DeviceImageValue{99u, 7u, 3u, 42u}, "the rewritten value, sampler slot included, is found");
     std::size_t live = 0;
     keys.ForEach([&](const DeviceImageKeys::Key& key, const DeviceImageValue& value) {
         ++live;
@@ -76,11 +77,11 @@ void testInsertFind() {
 void testLayout() {
     DeviceImageKeys keys(16u, 16u);
     const auto key = MakeKey(3u);
-    Expect(keys.Insert(key, {11u, 2u, 5u}) == DeviceImageKeys::Insertion::Inserted, "the layout key is inserted");
+    Expect(keys.Insert(key, {11u, 2u, 5u, 9u}) == DeviceImageKeys::Insertion::Inserted, "the layout key is inserted");
     const auto bucket = Home(key, 16u);
     const auto* at = keys.Words().data() + bucket * Abi::BucketWords;
     Expect(std::equal(key.begin(), key.end(), at), "the key words lie at the start of the home bucket");
-    Expect(at[Abi::StateWord] == Abi::LiveState && at[Abi::SlotWord] == 11u && at[Abi::ModeWord] == 2u && at[Abi::FaultWord] == 5u && at[15] == 0u, "the bucket holds the state, slot, mode and fault words");
+    Expect(at[Abi::StateWord] == Abi::LiveState && at[Abi::SlotWord] == 11u && at[Abi::ModeWord] == 2u && at[Abi::FaultWord] == 5u && at[Abi::SamplerSlotWord] == 9u, "the bucket holds the state, slot, mode, fault and sampler slot words");
     std::size_t nonzero = 0;
     for (std::size_t word = 0; word < keys.Words().size(); ++word) nonzero += (word / Abi::BucketWords != bucket && keys.Words()[word] != 0u) ? 1u : 0u;
     Expect(nonzero == 0u, "the other buckets stay zero");

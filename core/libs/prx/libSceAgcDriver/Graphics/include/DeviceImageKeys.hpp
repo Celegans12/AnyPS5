@@ -13,6 +13,7 @@ struct DeviceImageValue {
     std::uint32_t slot = 0;
     std::uint32_t mode = 0;
     std::uint32_t fault = 0;
+    std::uint32_t samplerSlot = 0;
 
     bool operator==(const DeviceImageValue& other) const = default;
 };
@@ -44,7 +45,7 @@ public:
             if (at[Abi::StateWord] != Abi::LiveState) continue;
             Key key{};
             for (std::uint32_t word = 0; word < Abi::KeyWords; ++word) key[word] = at[word];
-            visit(key, DeviceImageValue{at[Abi::SlotWord], at[Abi::ModeWord], at[Abi::FaultWord]});
+            visit(key, DeviceImageValue{at[Abi::SlotWord], at[Abi::ModeWord], at[Abi::FaultWord], at[Abi::SamplerSlotWord]});
         }
     }
 
