@@ -116,22 +116,6 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         pending.tailAt = phaseLap;
         return DrawVerdict::Drawn;
     };
-    auto drawParameters = Pm4::ResolveDraw(packet, queue);
-    const bool pipelined = DrawPipeline::Active();
-    const bool pipelineIndirect = pipelined && drawParameters.indirect && DrawPipeline::PipelineIndirect();
-    static const bool pipelinedIndirect = std::getenv("APS5_NO_PIPELINED_INDIRECT") == nullptr && !DrawPipeline::PipelineIndirect();
-    if (pipelined && drawParameters.indirect && !pipelineIndirect) {
-        const auto& indirect = *drawParameters.indirect;
-        auto& pipeline = DrawPipeline::Queue0();
-        const bool overlaps = pipeline.Busy() && (pipeline.Overlaps(indirect.arguments, static_cast<std::size_t>(std::max<std::uint64_t>(indirect.RangeBytes(), indirect.recordBytes))) || (indirect.countIndirect && pipeline.Overlaps(indirect.countAddress, 4)));
-        if (!pipelinedIndirect || overlaps) pipeline.Drain(DrawPipeline::DrainReason::Indirect);
-    }
-    const auto drainBeforeInline = [&] {
-        if (pipelined && pipelinedIndirect && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Indirect);
-    };
-    bool traceIndirect = false;
-    if (const auto verdict = precheckDraw(queue, submission, packet, drawParameters, rejected, traceIndirect)) return *verdict;
-    phaseTiming.Phase(DrawRowPrecheck);
     using Stage = ShaderRecompiler::ShaderStage;
     using Role = ShaderRecompiler::ProgramRole;
 
@@ -140,8 +124,37 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     static const std::uint64_t dumpSlot1 = [] { const char* text = std::getenv("APS5_DUMP_DRAW_SLOT1"); return text ? std::strtoull(text, nullptr, 16) : 0ull; }();
 
     static const bool lockedPrepare = std::getenv("APS5_LOCKED_DRAW_PREPARE") != nullptr;
-    std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
+    const bool useDrawEntries = drawEntries() && !ShaderRecompiler::DebugProbeActive() && dumpTarget == 0 && dumpSlot1 == 0;
+    const bool registerKey = useDrawEntries && registerKeyEnabled();
     std::shared_ptr<VulkanDevice> localDevice;
+    const bool pipelined = DrawPipeline::Active();
+    static const bool pipelinedIndirect = std::getenv("APS5_NO_PIPELINED_INDIRECT") == nullptr && !DrawPipeline::PipelineIndirect();
+    const auto drainBeforeInline = [&] {
+        if (pipelined && pipelinedIndirect && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Indirect);
+    };
+    const PublishedDraw* published = nullptr;
+    if (drawAhead != nullptr && registerKey && !lockedPrepare && !verifyDrawRecipe() && !verifyDrawEntries() && (localDevice = device.Load()) != nullptr) published = drawAhead->Find(submission, packet, queue, localDevice->Serial());
+    Pm4::DrawParameters drawParameters{};
+    bool traceIndirect = false;
+    if (published != nullptr) {
+        drawParameters = published->parameters;
+        if (drawParameters.indexed) GuestMemory::CheckRange(reinterpret_cast<const void*>(drawParameters.indexAddress), static_cast<std::size_t>(drawParameters.indexCount) * drawParameters.indexSize, drawParameters.indexSize);
+        if (published->precheck == DrawPrecheckOutcome::Nothing) return DrawVerdict::Nothing;
+        traceIndirect = TraceIndirectDraws();
+    } else {
+        drawParameters = Pm4::ResolveDraw(packet, queue);
+        const bool pipelineIndirect = pipelined && drawParameters.indirect && DrawPipeline::PipelineIndirect();
+        if (pipelined && drawParameters.indirect && !pipelineIndirect) {
+            const auto& indirect = *drawParameters.indirect;
+            auto& pipeline = DrawPipeline::Queue0();
+            const bool overlaps = pipeline.Busy() && (pipeline.Overlaps(indirect.arguments, static_cast<std::size_t>(std::max<std::uint64_t>(indirect.RangeBytes(), indirect.recordBytes))) || (indirect.countIndirect && pipeline.Overlaps(indirect.countAddress, 4)));
+            if (!pipelinedIndirect || overlaps) pipeline.Drain(DrawPipeline::DrainReason::Indirect);
+        }
+        if (const auto verdict = precheckDraw(queue, submission, packet, drawParameters, rejected, traceIndirect)) return *verdict;
+    }
+    phaseTiming.Phase(DrawRowPrecheck);
+
+    std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
     if (lockedPrepare) {
 
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
@@ -153,7 +166,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
 
         recordLabelsForPacket(localDevice.get(), submission.queue);
         phaseTiming.Phase(DrawRowLabels);
-    } else if ((localDevice = device.Load()) == nullptr) {
+    } else if (localDevice == nullptr && (localDevice = device.Load()) == nullptr) {
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
         std::lock_guard createLock(GuestMemory::GpuMutex());
         if (device == nullptr) device = std::make_shared<VulkanDevice>();
@@ -162,8 +175,6 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     timing.Mark("device_setup");
     phaseTiming.Phase(DrawRowVectors);
 
-    const bool useDrawEntries = drawEntries() && !ShaderRecompiler::DebugProbeActive() && dumpTarget == 0 && dumpSlot1 == 0;
-    const bool registerKey = useDrawEntries && registerKeyEnabled();
     std::uint64_t drawKey = 0;
     DrawKeyComponents drawKeyComponents;
     std::shared_ptr<DrawEntry> entry;
@@ -178,12 +189,26 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         bool aliasFirst = false;
         // One registry pass feeds the identity key, the shader-set key and the register-key tail; the exact key does
         // not depend on any cache state, so it is built before the single drawCacheMutex acquisition of the lookup.
+        // A draw-ahead record (#6188) carries the identity, shape and register key the scan built the same way.
         DrawRegistryWalk registryWalk;
-        WalkDrawRegistry(queue, *submission.shaders, registryWalk);
+        bool walked = false;
+        const auto walk = [&]() -> const DrawRegistryWalk* {
+            if (!walked) {
+                WalkDrawRegistry(queue, *submission.shaders, registryWalk);
+                walked = true;
+            }
+            return &registryWalk;
+        };
         const bool relocating = drawRelocationEnabled();
-        if (relocating) drawIdentity = drawIdentityKey(registryWalk);
-        drawKey = drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), &shapeKey, traceDrawCache() || profile ? &drawKeyComponents : nullptr, nullptr, nullptr, &registryWalk);
-        if (GpuIndirectArgs() && drawParameters.indirect) drawKey = GpuParameterKey(drawKey, *drawParameters.indirect);
+        const bool usePublished = published != nullptr && !traceDrawCache();
+        if (relocating) drawIdentity = usePublished ? published->identity : drawIdentityKey(*walk());
+        if (usePublished) {
+            shapeKey = published->shape;
+            drawKey = published->key;
+        } else {
+            drawKey = drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), &shapeKey, traceDrawCache() || profile ? &drawKeyComponents : nullptr, nullptr, nullptr, walk());
+            if (GpuIndirectArgs() && drawParameters.indirect) drawKey = GpuParameterKey(drawKey, *drawParameters.indirect);
+        }
         std::unique_lock cacheLock(drawCacheMutex);
         if (relocating) {
             learnPendingRelocation();
@@ -198,7 +223,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         if (aliasFirst) {
             // The alias reads guest memory (relocatedContentKey), so it is computed outside the lock as before.
             cacheLock.unlock();
-            drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), nullptr, nullptr, relocation.get(), &drawAlias, &registryWalk);
+            drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), nullptr, nullptr, relocation.get(), &drawAlias, walk());
             if (GpuIndirectArgs() && drawParameters.indirect) drawAlias = GpuParameterKey(drawAlias, *drawParameters.indirect);
             cacheLock.lock();
         }
@@ -213,7 +238,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             ++drawEntryCounters.absent;
             if (relocation != nullptr && !aliasFirst) {
                 cacheLock.unlock();
-                drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), nullptr, nullptr, relocation.get(), &drawAlias, &registryWalk);
+                drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), nullptr, nullptr, relocation.get(), &drawAlias, walk());
                 if (GpuIndirectArgs() && drawParameters.indirect) drawAlias = GpuParameterKey(drawAlias, *drawParameters.indirect);
                 cacheLock.lock();
             }

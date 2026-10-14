@@ -325,6 +325,10 @@ void Driver::execute(const Submission& submission) {
         state = &queues[submission.queue];
     }
     auto& queue = *state;
+    if (submission.queue == 0 && drawEntries() && registerKeyEnabled()) {
+        if (drawAhead == nullptr) drawAhead = std::make_unique<DrawAhead>(*this);
+        drawAhead->Post(submission, queue);
+    }
     static const bool traceGpu = std::getenv("APS5_TRACE_GPU") != nullptr;
     if (traceGpu) std::fprintf(stderr, "[gpu] %.1f execute serial=%llu queue=0x%x dwords=%zu\n", TraceMs(), static_cast<unsigned long long>(submission.serial), submission.queue, submission.commands.size());
 
@@ -602,6 +606,7 @@ void Driver::execute(const Submission& submission) {
                 }
             }
         } else if (drawPacket) {
+            if (submission.queue == 0 && drawAhead != nullptr) drawAhead->Progress(submission.serial, cursor);
             landPendingWaits(submission.queue);
             packetCounters.CountDraw();
             drawnSinceSeal() = true;
