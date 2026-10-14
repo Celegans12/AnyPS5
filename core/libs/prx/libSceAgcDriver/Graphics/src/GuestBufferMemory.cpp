@@ -111,6 +111,8 @@ struct GuestBufferMemory::AddressSpace {
     std::vector<ImageMirror*> sparseMirrors;
     std::unique_ptr<std::atomic<std::uint64_t>[]> verified;
     std::vector<CopiedRange> copied;
+    mutable std::mutex copiedMutex;
+    mutable std::vector<GuestMemory::Commitment> copiedCommitted;
     // The BDA table entries of `base`, in its order.
     std::vector<ShaderRecompiler::BdaAbi::Range> ranges;
     std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> directReads;
@@ -197,6 +199,7 @@ struct HostImports {
 #endif
     std::uint64_t useCounter = 0;
     std::uint64_t buildFloor = 0;
+    std::map<std::uint64_t, std::uint64_t> spaceUses;
 };
 
 HostImports& Imports() {
@@ -914,13 +917,19 @@ bool sameRange(const HostImport& entry, const GuestAllocations::Lease& lease) {
     return sameRun(entry, entry.joined ? joinedRun(lease, entry.base, entry.base + entry.bytes) : importRun(lease, entry.base));
 }
 
+std::uint64_t effectiveUse(const HostImports& state, const HostImport& entry) {
+    if (entry.spaceSerial == 0) return entry.lastUse;
+    const auto found = state.spaceUses.find(entry.spaceSerial);
+    return found == state.spaceUses.end() ? entry.lastUse : std::max(entry.lastUse, found->second);
+}
+
 bool pointerHeld(const HostImports& state, const HostImport& entry) {
-    return entry.lastUse >= state.buildFloor;
+    return effectiveUse(state, entry) >= state.buildFloor;
 }
 
 bool evictable(const HostImports& state, const HostImport& entry) {
     constexpr std::uint64_t protectedUses = 256;
-    return !pointerHeld(state, entry) && entry.lastUse + protectedUses < state.useCounter;
+    return !pointerHeld(state, entry) && effectiveUse(state, entry) + protectedUses < state.useCounter;
 }
 
 std::uint64_t retireLeastRecent(const Context& context, HostImports& state, const GuestAllocations::Lease& lease, std::uint64_t wanted) {
@@ -928,7 +937,7 @@ std::uint64_t retireLeastRecent(const Context& context, HostImports& state, cons
     while (freed < wanted) {
         auto oldest = state.imports.end();
         for (auto it = state.imports.begin(); it != state.imports.end(); ++it) {
-            if (evictable(state, it->second) && (oldest == state.imports.end() || it->second.lastUse < oldest->second.lastUse)) oldest = it;
+            if (evictable(state, it->second) && (oldest == state.imports.end() || effectiveUse(state, it->second) < effectiveUse(state, oldest->second))) oldest = it;
         }
         if (oldest == state.imports.end()) break;
         freed += oldest->second.bytes;
@@ -2790,9 +2799,17 @@ void GuestBufferMemory::AcquireRegistered() {
             importFloor = state.useCounter + 1;
             if (hit) {
                 const auto stamp = ++state.useCounter;
-                for (const auto& region : current->base) {
-                    if (region.direct != nullptr) region.direct->lastUse = stamp;
+                static const bool stampOnce = std::getenv("APS5_NO_SPACE_STAMP_ONCE") == nullptr;
+                auto& spaceUse = state.spaceUses[current->serial];
+                if (!stampOnce || spaceUse == 0) {
+                    for (const auto& region : current->base) {
+                        if (region.direct == nullptr) continue;
+                        region.direct->lastUse = stamp;
+                        if (stampOnce) region.direct->spaceSerial = current->serial;
+                    }
                 }
+                spaceUse = stamp;
+                while (state.spaceUses.size() > 64) state.spaceUses.erase(state.spaceUses.begin());
             }
         }
         if (hit) {
@@ -2808,7 +2825,17 @@ void GuestBufferMemory::AcquireRegistered() {
             spaces.hits.fetch_add(1, std::memory_order_relaxed);
             space = std::move(current);
             lap(timing.leaseUs, at);
-            for (const auto& range : space->copied) addCopiedRange(range);
+            static const bool commitMemo = std::getenv("APS5_NO_SPACE_COMMIT_MEMO") == nullptr;
+            if (commitMemo) {
+                std::lock_guard copiedLock(space->copiedMutex);
+                if (space->copiedCommitted.size() != space->copied.size()) {
+                    space->copiedCommitted.clear();
+                    for (const auto& range : space->copied) space->copiedCommitted.push_back(GuestMemory::DescribeCommitted(range.begin, range.end - range.begin));
+                }
+                for (std::size_t index = 0; index < space->copied.size(); ++index) addCopiedRange(space->copied[index], &space->copiedCommitted[index]);
+            } else {
+                for (const auto& range : space->copied) addCopiedRange(range);
+            }
             regionsSorted = sortedLookup;
             lap(timing.importsUs, at);
             // Writable mirrors are compared with guest memory per build, as acquireMirror does for
@@ -2994,17 +3021,24 @@ void GuestBufferMemory::validate(std::uint64_t address, std::size_t bytes) const
     Require(bytes <= std::numeric_limits<std::uint64_t>::max() - address, "guest memory range overflow");
 }
 
-void GuestBufferMemory::addCopiedRange(const CopiedRange& range) {
+void GuestBufferMemory::addCopiedRange(const CopiedRange& range, const GuestMemory::Commitment* known) {
     validate(range.begin, range.end - range.begin);
     Region region{range.begin, range.end, range.writable, {}, nullptr};
     // Read-only ranges are read from live guest memory at Upload: the lease pins them and the guest
     // cannot write them, so that equals a snapshot taken now without the extra copy. Reserved heaps
     // are registered whole while the guest commits pages on demand: committed pages only.
     region.hostBacked = !range.writable;
-    auto committed = GuestMemory::DescribeCommitted(range.begin, range.end - range.begin);
-    if (!committed.whole) {
-        region.sparse = true;
-        region.backed = std::move(committed.ranges);
+    if (known != nullptr) {
+        if (!known->whole) {
+            region.sparse = true;
+            region.backed = known->ranges;
+        }
+    } else {
+        auto committed = GuestMemory::DescribeCommitted(range.begin, range.end - range.begin);
+        if (!committed.whole) {
+            region.sparse = true;
+            region.backed = std::move(committed.ranges);
+        }
     }
     regions.push_back(std::move(region));
 }
