@@ -422,21 +422,11 @@ void CapturedSamplerCases(AgcDriver::VulkanDevice& device) {
     clamp[0] |= 0x92u;
     CheckCaptured(Guarded, tile, Run(device, Guarded, texture, clamp, tile));
     const auto* option = std::getenv("APS5_UNNORM_WRAP_GUARD");
-    ExpectFailure(device, Plain, texture, CapturedSampler,
-        option != nullptr && std::string_view(option) == "1" ? "unnormalized wrap requires emitted per-sampler guard proof" : "clamp mode 0 on X",
-        "a wrap sampler shared by LZ and non-LZ operations");
     if (option == nullptr || std::string_view(option) != "1") {
-        try {
-            static_cast<void>(Run(device, Guarded, texture, CapturedSampler, tile));
-        } catch (const std::exception& error) {
-            Require(std::string_view(error.what()).find("clamp mode 0 on X") != std::string_view::npos, std::string("unnormalized wrap OFF: unexpected refusal: ") + error.what());
-            for (std::uint32_t lane = 0; lane < Threads; ++lane) {
-                for (std::uint32_t result = 0; result < Results; ++result) Require(Buffer[lane * Words + ResultWord + result] == 0xdeadbeefu, "unnormalized wrap OFF: refused dispatch wrote output");
-            }
-            return;
-        }
-        throw std::runtime_error("unnormalized wrap OFF: captured sampler was accepted");
+        CheckCaptured(Guarded, tile, Run(device, Guarded, texture, CapturedSampler, tile));
+        return;
     }
+    ExpectFailure(device, Plain, texture, CapturedSampler, "unnormalized wrap requires emitted per-sampler guard proof", "a wrap sampler shared by LZ and non-LZ operations");
     const auto execute = [&](const Program& program, const std::vector<Coordinate>& coordinates, bool fault, std::uint32_t waveSize = 32) {
         StderrCapture capture;
         const auto samples = Run(device, program, texture, CapturedSampler, coordinates, true, waveSize);

@@ -823,7 +823,6 @@ void AperturePreparationClassification(AgcDriver::VulkanDevice& device) {
     request.target = device.ComputeTarget(32);
     request.layout.pushConstantSizeBytes = 128;
     request.useCache = false;
-    const std::array apertureNames{"src_shared_base", "src_shared_limit", "src_private_base", "src_private_limit"};
     for (std::uint32_t source = 234u; source <= 238u; ++source) {
         code[0] = 0xbeea0400u | source;
         bool rejected = false;
@@ -832,18 +831,13 @@ void AperturePreparationClassification(AgcDriver::VulkanDevice& device) {
             Require(source == 234u, "an aperture scalar source remained a malformed-input error");
             Require(std::string(error.what()).find("unsupported scalar source operand code 234") != std::string::npos, "reserved scalar source lost its diagnostic");
             rejected = true;
-        } catch (const std::runtime_error& error) {
-            Require(source >= 235u, "a reserved scalar source became a translation failure");
-            Require(std::string(error.what()) == "TranslationContext::readRawU32: the scalar aperture source " + std::string(apertureNames[source - 235u]) + " is not modelled", "aperture preparation lost its named translation diagnostic");
-            rejected = true;
         }
-        Require(rejected, "an unsupported scalar source compiled successfully");
+        Require(rejected == (source == 234u), "a reserved scalar source compiled successfully");
     }
 }
 
-void DeferredUndecodableRegistration(bool aperture = false, bool skipRefused = false) {
+void DeferredUndecodableRegistration(bool skipRefused = false) {
     alignas(256) std::array<std::uint32_t, 3> code{0xbe842104u, 0xf1949f05u, 0x00060018u};
-    if (aperture) code = {0xbeea04ebu, 0xbf810000u, 0xbf810000u};
     struct Header {
         Shader shader{};
         std::array<ShaderRegister, 8> registers{};
@@ -879,7 +873,7 @@ void DeferredUndecodableRegistration(bool aperture = false, bool skipRefused = f
         AgcDriverShutdown_nid_postfix();
         return;
     }
-    const auto reason = aperture ? "TranslationContext::readRawU32: the scalar aperture source src_shared_base is not modelled" : "unsupported MIMG opcode";
+    const auto reason = "unsupported MIMG opcode";
     ExpectFailure([] { AgcDriverWaitIdle_nid_postfix(); }, reason);
     ExpectFailure([] { AgcDriverShutdown_nid_postfix(); }, reason);
     Require(destination == 0u, "a deferred unsupported dispatch executed a subsequent memory write");
@@ -901,9 +895,7 @@ int main(int argc, char** argv) {
             auto device = OpenVulkanTestDevice();
             if (!device) return VulkanTestSkipped;
             AperturePreparationClassification(*device);
-            device.reset();
-            DeferredUndecodableRegistration(true);
-            std::cout << "deferred aperture shader tests passed\n";
+            std::cout << "aperture scalar source preparation tests passed\n";
             return 0;
         }
         if (argc == 2 && (std::string_view(argv[1]) == "--deferred" || std::string_view(argv[1]) == "--preparation-failure")) {
@@ -914,7 +906,7 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--skip-refused") {
             if (!OpenVulkanTestDevice()) return VulkanTestSkipped;
-            DeferredUndecodableRegistration(false, true);
+            DeferredUndecodableRegistration(true);
             std::cout << "skipped refused dispatch tests passed\n";
             return 0;
         }

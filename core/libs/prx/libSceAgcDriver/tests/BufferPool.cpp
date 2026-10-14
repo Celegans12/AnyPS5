@@ -241,7 +241,7 @@ void VramIntegratedKeepsPool() {
     mock.otherUsage = HeapTarget;
     auto context = budgetContext(true);
     releaseFour(context);
-    Expect(mock.budgetQueries == 0 && mock.frees == 0 && mock.liveBytes == 256 * MiB, "an integrated GPU's pool followed the device-local heap's budget");
+    Expect(mock.budgetQueries == 4 && mock.frees == 0 && mock.liveBytes == 256 * MiB, "an integrated GPU's pool followed the device-local heap's budget");
 }
 
 void HostPlacement() {

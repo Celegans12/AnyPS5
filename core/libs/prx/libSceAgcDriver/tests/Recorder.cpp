@@ -7195,8 +7195,8 @@ void Run(Context context) {
         Require(HostImportFor(context, address, SurfaceBytes) != nullptr, "snapshot fixture requires a host import");
         Require(AgcDriver::GuestMemory::Watched(address, SurfaceBytes) == watched, "host import changed the fixture's write tracking");
         auto image = StorageTexture::Create(context, *context.detiler, Resource(address), 0);
-        const auto expectedBytes = watched ? 0u : SurfaceBytes;
-        Require(image->OriginalSnapshotBytes() == expectedBytes, "watched GPU-direct upload retained an unnecessary CPU surface snapshot");
+        const std::size_t expectedBytes = 0;
+        Require(image->OriginalSnapshotBytes() == expectedBytes, "a host-imported upload kept a CPU byte snapshot instead of block hashes");
         const auto readPixel = [&] {
             Buffer result(context, 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
             CommandBatch batch(context);
@@ -7237,7 +7237,7 @@ void Run(Context context) {
             Require(!AgcDriver::GuestMemory::Watched(address, SurfaceBytes), "snapshot fixture is still write-watched");
             std::memset(reinterpret_cast<void*>(address), 0x8d, SurfaceBytes);
             image->Refresh();
-            Require(image->OriginalSnapshotBytes() == SurfaceBytes, "unwatched refresh did not allocate its comparison snapshot");
+            Require(image->OriginalSnapshotBytes() == 0, "unwatched refresh of a host-imported surface kept a byte copy instead of block hashes");
             Require(readPixel() == 0x8d8d8d8du, "unwatched refresh returned incorrect GPU texels");
         }
         image.reset();

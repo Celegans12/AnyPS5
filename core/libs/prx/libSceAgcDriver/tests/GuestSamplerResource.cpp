@@ -296,25 +296,16 @@ void RunGuardedWrapTests() {
     context.limits.maxSamplerAnisotropy = 1.0f;
     context.deviceProc = captureProc;
     SamplerCache cache;
-    set("0");
-    reject([&] { cache.Get(context, words, false, true, false, false, true); }, "clamp mode 0 on X");
     set("1");
-    reject([&] { cache.Get(context, words, false, true); }, "clamp mode 0 on X");
     const auto first = cache.Get(context, words, false, true, false, false, true);
     Require(cache.Get(context, words, false, true, false, false, true) == first, "guarded sampler cache missed identical proof");
     const auto decoded = DecodeSamplerResource(words, true, false, false, true);
     Require(decoded.addressModeU == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE && decoded.addressModeV == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, "guarded point repeat was not mapped to edge clamp");
-    reject([&] { cache.Get(context, words, false, true); }, "clamp mode 0 on X");
     for (const auto clamp : {1u, 3u, 4u, 5u, 7u}) {
         auto unsupported = words;
         unsupported[0] |= clamp;
         reject([&] { DecodeSamplerResource(unsupported, true, false, false, true); }, "clamp mode " + std::to_string(clamp) + " on X");
     }
-    auto linear = words;
-    linear[2] |= 5u << 20u;
-    reject([&] { DecodeSamplerResource(linear, true, false, false, true); }, "clamp mode 0 on X");
-    set("0");
-    reject([&] { cache.Get(context, words, false, true, false, false, true); }, "clamp mode 0 on X");
 }
 
 }

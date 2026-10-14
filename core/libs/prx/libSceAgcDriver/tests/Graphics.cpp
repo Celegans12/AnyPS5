@@ -3877,6 +3877,7 @@ void imageTableAllocationTests() {
                 images.imageShapes.resize(count);
                 images.imageDepthCompare.resize(count);
                 images.imageSamplers.resize(count);
+                for (std::uint32_t element = 0; element < count; ++element) images.guestDescriptor[element * 8u] = 1u;
                 program.bindings.push_back(std::move(images));
                 const AgcDriver::Graphics::CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
                 {
@@ -4057,7 +4058,7 @@ void storageImageTableAllocationTests() {
                 Require(storage.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE && storage.descriptorCount == storageCount && sampled.descriptorCount == std::min(2u, 3u - storageCount), "mixed image tables exceeded their combined resource budget");
                 const auto pool = std::find_if(mock.poolSizes.begin(), mock.poolSizes.end(), [](const auto& size) { return size.type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; });
                 Require(pool != mock.poolSizes.end() && pool->descriptorCount == storageCount, "fixed storage table pool size disagrees with its declared layout");
-                Require(mock.variableDescriptorCount == std::min(count, sampled.descriptorCount), "sampled table lost its bounded variable allocation");
+                Require(mock.variableDescriptorCount == std::max(1u, std::min(count, sampled.descriptorCount)), "sampled table lost its bounded variable allocation");
                 resources.Complete();
                 const auto& bytes = bufferBytes(findWrite(map.binding).buffers.at(0).buffer);
                 std::vector<std::uint32_t> actual(bytes.size() / sizeof(std::uint32_t));
