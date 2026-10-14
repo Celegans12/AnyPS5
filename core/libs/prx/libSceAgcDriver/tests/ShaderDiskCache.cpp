@@ -111,6 +111,7 @@ void requireSameResult(const RecompileResult& left, const RecompileResult& right
     require(left.poisonedSrtReads == right.poisonedSrtReads, prefix + "poisoned SRT read counts differ");
     require(left.hasDeferredDirectImage == right.hasDeferredDirectImage, prefix + "deferred direct image flag differs");
     require(left.hasGuardedUnnormalizedWrap == right.hasGuardedUnnormalizedWrap, prefix + "guarded unnormalized wrap flag differs");
+    require(left.shaderDataUserWords == right.shaderDataUserWords, prefix + "shader-data user words differ");
     require(left.imageTableRanges == right.imageTableRanges && left.imageTableShader == right.imageTableShader && left.imageTableFaults == right.imageTableFaults && left.imageTablePoison.size() == right.imageTablePoison.size(), prefix + "image table invocation data differs");
     require(left.imageTableReadRanges == right.imageTableReadRanges, prefix + "image table read ranges differ");
     for (std::size_t i = 0; i < left.imageTablePoison.size(); ++i) {
@@ -211,6 +212,7 @@ RecompileResult sampleResult() {
     result.stencilReplaySafe = true;
     result.stencilReferenceDword = 23u;
     result.poisonedSrtReads = 3;
+    result.shaderDataUserWords = {2u, 0xffffffffu, 9u};
     result.barycentricEmulation = {true, false, true};
     result.variantId = 99;
     result.imageTablePoison = {{{1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u}, 8u, 2u, 6u}, {{9u, 0u, 0u, 0u, 0u, 0u, 0u, 0u}, 4u, 0xffffffffu, 19u}};
