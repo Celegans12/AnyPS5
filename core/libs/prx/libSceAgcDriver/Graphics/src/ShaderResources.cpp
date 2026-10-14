@@ -2801,7 +2801,7 @@ void VisitContentKey(const CompiledShader& shader, bool dataWords, bool movableB
 std::vector<std::uint32_t> ShaderResources::ContentKey(const CompiledShader& shader, bool dataWords, bool movableBuffers) {
     Require(shader.program != nullptr, "missing compiled shader");
     std::vector<std::uint32_t> key;
-    std::size_t words = 5;
+    std::size_t words = 7;
     const auto addWords = [&](std::size_t count) {
         if (count > key.max_size() - words) throw std::length_error("resource content key exceeds vector limits");
         words += count;

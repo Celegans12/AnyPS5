@@ -747,7 +747,7 @@ PlaneOwners& stencilOwners() {
 void takePlane(DepthSurface& surface, PlaneOwners& owners, std::uint64_t address, VkImageAspectFlagBits aspect) {
     auto& entry = owners[{surface.context.device, address}];
     auto* owner = entry.surface;
-    if (owner != nullptr && owner != &surface && owner->target.format == surface.target.format && owner->target.samples == surface.target.samples && owner->target.extent.width == surface.target.extent.width && owner->target.extent.height == surface.target.extent.height) {
+    if (owner != nullptr && owner != &surface && owner->target.format == surface.target.format && owner->target.samples == surface.target.samples && owner->target.extent.width == surface.target.extent.width && owner->target.extent.height == surface.target.extent.height && (aspect != VK_IMAGE_ASPECT_STENCIL_BIT || owner->target.stencilSwizzle == surface.target.stencilSwizzle)) {
         owner->TakeWrites(aspect);
         if ((owner->pendingClear & aspect) != 0) surface.pendingClear |= aspect;
         else surface.CopyAspectFrom(*owner, aspect);

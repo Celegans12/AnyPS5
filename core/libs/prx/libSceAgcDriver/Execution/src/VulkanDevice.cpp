@@ -4355,7 +4355,6 @@ PlannedComputeLayout planComputeLayout(const Graphics::Context& context, const S
         plan.bindings.push_back({binding, type, count, VK_SHADER_STAGE_COMPUTE_BIT, nullptr});
         plan.flags.push_back(flags);
         plan.key.insert(plan.key.end(), {binding, static_cast<std::uint32_t>(type), count, VK_SHADER_STAGE_COMPUTE_BIT});
-        if (flags != 0) plan.key.push_back(flags);
         flagged = flagged || flags != 0;
         if (type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) storageBuffers += count;
         if (type != VK_DESCRIPTOR_TYPE_SAMPLER) resources += count;
