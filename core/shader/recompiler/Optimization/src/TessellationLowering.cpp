@@ -589,9 +589,12 @@ private:
             for (IrValue* inst : block->Instructions()) {
                 const auto words = LaneBitWords(inst, program.WaveSize());
                 if (!words) continue;
-                if (IrValue* bit = laneBits.Of(*words)) inst->ReplaceAllUsesWith(bit);
+                if (IrValue* bit = laneBits.Of(*words)) inst->ReplaceUsesWith(bit, true);
             }
         }
+        ResolveControlFlowIdentities(program);
+        constexpr DeadCodeEliminator identities;
+        identities.RemoveIdentities(program);
     }
 
     void collect() {
