@@ -7,6 +7,7 @@
 #include <cstring>
 #include <initializer_list>
 #include <limits>
+#include <memory>
 #include <set>
 #include <string>
 #include <utility>
@@ -213,6 +214,129 @@ static void RunBdaDwordWriteTests(const Context& context) {
     write(guest + 0x7c, 2, 8, static_cast<Abi::FaultReason>(0), 64);
 }
 
+static void RunBdaAnchorTests(const Context& context) {
+    namespace Abi = ShaderRecompiler::BdaAbi;
+    constexpr std::uint64_t guest = 0x7fff12340001ULL;
+    constexpr std::uint64_t limit = 0xffffffff00000000ULL;
+    constexpr std::uint64_t highest = 0xffffffffffffff00ULL;
+    constexpr std::uint32_t lanes = 64;
+    const auto usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    Buffer first(context, 3, usage);
+    Buffer second(context, 2, usage);
+    Buffer words(context, 16, usage);
+    Buffer shifted(context, 20, usage);
+    Buffer large(context, 1024, usage);
+    Buffer top(context, 16, usage);
+    Buffer above(context, 16, usage);
+    std::uint32_t seed = 0x11;
+    for (auto* buffer : {&first, &second, &words, &shifted, &large, &top, &above}) {
+        for (std::size_t index = 0; index < buffer->Bytes().size(); ++index) buffer->Bytes()[index] = std::byte(static_cast<std::uint8_t>(seed + index * 7u));
+        seed += 0x33;
+    }
+    for (std::uint32_t index = 0; index < 16u; ++index) words.Bytes()[index] = std::byte(static_cast<std::uint8_t>(0xa0u + index));
+    for (std::uint32_t index = 0; index < 20u; ++index) shifted.Bytes()[index] = std::byte(static_cast<std::uint8_t>(0xc0u + index));
+    const std::array<Abi::Range, 7> ranges{{{guest, guest + 3, first.DeviceAddress(), Abi::Read, 0},
+        {guest + 3, guest + 5, second.DeviceAddress(), Abi::Read, 0},
+        {guest + 0x100, guest + 0x110, words.DeviceAddress(), Abi::Read, 0},
+        {guest + 0x200, guest + 0x210, shifted.DeviceAddress() + 1u, Abi::Read, 0},
+        {guest + 0x400, guest + 0x800, large.DeviceAddress(), Abi::Read, 0},
+        {limit - 0x10, limit, top.DeviceAddress(), Abi::Read, 0},
+        {highest, highest + 0x10, above.DeviceAddress(), Abi::Read, 0}}};
+    Require(Abi::RangesOrdered(ranges.data(), ranges.size()), "the BDA anchor test table is not ascending and disjoint");
+    Buffer table(context, sizeof(Abi::Header) + sizeof(ranges), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    Buffer fault(context, sizeof(Abi::Fault), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    Buffer output(context, (BdaAnchoredReadInputWord + 3u + lanes) * sizeof(std::uint32_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    struct Outcome {
+        Abi::Fault fault{};
+        std::array<std::uint32_t, BdaAnchoredReadInputWord> values{};
+    };
+    std::uint32_t count = static_cast<std::uint32_t>(ranges.size());
+    std::uint32_t permissions = Abi::Read;
+    const auto run = [&](Pipeline& pipeline, std::uint32_t read, std::uint64_t anchor, const std::vector<std::uint32_t>& lows) {
+        auto copy = ranges;
+        copy[2].permissions = permissions;
+        const Abi::Header header{Abi::Version, count, sizeof(Abi::Range), 0};
+        std::memcpy(table.Bytes().data(), &header, sizeof(header));
+        std::memcpy(table.Bytes().data() + sizeof(header), copy.data(), sizeof(copy));
+        std::memset(fault.Bytes().data(), 0, fault.Bytes().size());
+        std::memset(output.Bytes().data(), 0xa5, BdaAnchoredReadInputWord * sizeof(std::uint32_t));
+        std::vector<std::uint32_t> inputs{static_cast<std::uint32_t>(anchor), static_cast<std::uint32_t>(anchor >> 32u), read};
+        inputs.insert(inputs.end(), lows.begin(), lows.end());
+        std::memcpy(output.Bytes().data() + BdaAnchoredReadInputWord * sizeof(std::uint32_t), inputs.data(), inputs.size() * sizeof(std::uint32_t));
+        pipeline.Run(1);
+        Outcome outcome;
+        std::memcpy(&outcome.fault, fault.Bytes().data(), sizeof(outcome.fault));
+        std::memcpy(outcome.values.data(), output.Bytes().data(), sizeof(outcome.values));
+        return outcome;
+    };
+    struct Programs {
+        Programs(const Context& context, const BdaAnchoredReadProgram& reads, const std::array<Buffer*, 3>& buffers) : reads(reads), plain(context, MakeBdaAnchoredReadTestShader(reads, false), buffers), anchored(context, MakeBdaAnchoredReadTestShader(reads, true), buffers) {}
+        BdaAnchoredReadProgram reads;
+        Pipeline plain;
+        Pipeline anchored;
+    };
+    const auto build = [&](const BdaAnchoredReadProgram& reads) { return std::make_unique<Programs>(context, reads, std::array<Buffer*, 3>{&table, &fault, &output}); };
+    const auto compare = [&](Programs& programs, std::initializer_list<std::uint64_t> anchors, const std::vector<std::uint32_t>& lows) {
+        std::vector<std::vector<std::uint32_t>> batches;
+        if (programs.reads.lanes == 1u) {
+            for (const auto low : lows) batches.push_back({low});
+        } else {
+            batches.push_back(lows);
+            batches.back().resize(programs.reads.lanes, lows.back());
+        }
+        for (std::uint32_t index = 0; index < programs.reads.reads.size(); ++index) {
+            const auto& read = programs.reads.reads[index];
+            for (const auto anchor : anchors) {
+                for (const auto& batch : batches) {
+                    const auto expected = run(programs.plain, index, anchor, batch);
+                    const auto actual = run(programs.anchored, index, anchor, batch);
+                    const bool faultsMatch = programs.reads.lanes == 1u ? std::memcmp(&expected.fault, &actual.fault, sizeof(expected.fault)) == 0 : expected.fault.state == actual.fault.state;
+                    Require(faultsMatch && expected.values == actual.values, "an anchored BDA read differs from the same read through the lookups at anchor 0x" + std::to_string(anchor) + " + " + std::to_string(batch[0]) + " + (" + std::to_string(read.immediate) + "), " + std::to_string(read.bits) + " bits, " + std::to_string(read.dwords) + " dwords");
+                }
+            }
+        }
+    };
+    std::vector<BdaAnchoredRead> reads;
+    for (const std::int32_t immediate : {0, 4, -1, -8, 0x7ffffff0, std::numeric_limits<std::int32_t>::min()}) {
+        for (const auto& [bits, dwords, used] : std::initializer_list<std::array<std::uint32_t, 3>>{{8, 1, 1}, {16, 1, 1}, {32, 1, 1}, {32, 4, 15}, {32, 4, 10}, {32, 3, 4}}) reads.push_back({immediate, bits, dwords, used});
+    }
+    const auto anchors = {guest + 0x100, guest + 0x108, guest, guest + 3, guest + 0x200, guest - 1, guest + 0x110, guest + 0x400, limit - 0x10, limit - 4, highest, highest + 8, std::numeric_limits<std::uint64_t>::max() - 2};
+    std::vector<std::uint32_t> lows{0u, 1u, 2u, 3u, 4u, 8u, 0xcu, 0xdu, 0xeu, 0xfu, 0x10u, 0x14u, 0x100u, 0x108u, 0x10cu, 0x1fcu, 0x200u, 0x20eu, 0x3f0u, 0x3fcu, 0x400u, 0x7fffu, 0x7fffffffu, 0x80000000u, 0xfffffff0u, 0xfffffffcu, 0xffffffffu};
+    for (std::uint32_t lane = 0; lane < 32u; ++lane) lows.push_back(lane * 0x24u);
+    std::vector<std::uint32_t> strided;
+    for (std::uint32_t lane = 0; lane < lanes; ++lane) strided.push_back(lane * 16u);
+    auto continuing = build({reads, false, false, false, lanes});
+    compare(*continuing, anchors, lows);
+    compare(*continuing, {guest + 0x400}, strided);
+    auto elected = build({reads, false, true, false, lanes});
+    compare(*elected, anchors, lows);
+    compare(*elected, {guest + 0x400}, strided);
+    auto coherent = build({{reads[0], reads[2], reads[9], reads[16], reads[22]}, false, false, true, lanes});
+    compare(*coherent, anchors, lows);
+    auto stopping = build({reads, true, true, false, 1});
+    compare(*stopping, anchors, {0u, 0x80000000u, 0xfffffffcu});
+    const auto check = [&](std::uint32_t read, std::uint64_t anchor, std::uint32_t low) { return run(stopping->anchored, read, anchor, {low}); };
+    const auto wide = check(3, guest + 0x100, 0);
+    Require(wide.fault.state == Abi::FaultState::Empty && wide.values[0] == 0xa3a2a1a0u && wide.values[1] == 0xa7a6a5a4u && wide.values[2] == 0xabaaa9a8u && wide.values[3] == 0xafaeadacu, "an anchored span read returned wrong data");
+    const auto some = check(4, guest + 0x100, 0);
+    Require(some.fault.state == Abi::FaultState::Empty && some.values[0] == 0u && some.values[1] == 0xa7a6a5a4u && some.values[2] == 0u && some.values[3] == 0xafaeadacu, "an anchored read of some dwords returned wrong data");
+    const auto odd = check(2, guest + 0x200, 0);
+    Require(odd.fault.state == Abi::FaultState::Empty && odd.values[0] == 0xc4c3c2c1u, "an anchored read of an odd device address returned wrong data");
+    const auto byte = check(0, guest + 0x200, 0xd);
+    Require(byte.fault.state == Abi::FaultState::Empty && byte.values[0] == 0xceu, "an anchored byte read returned wrong data");
+    const auto below = check(20, guest + 0x108, 4);
+    Require(below.fault.state == Abi::FaultState::Empty && below.values[0] == 0xa7a6a5a4u, "an anchored read below its base returned wrong data");
+    const auto unmapped = check(2, guest + 0x100, 0x10);
+    Require(unmapped.fault.state == Abi::FaultState::Ready && unmapped.fault.reason == Abi::FaultReason::Unmapped && unmapped.fault.address == guest + 0x110 && unmapped.fault.instruction == 0x1234 && unmapped.values[0] == 0xa5a5a5a5u, "an anchored read past its range did not fault");
+    permissions = 0;
+    compare(*stopping, {guest + 0x100}, {0u, 4u});
+    compare(*elected, {guest + 0x100}, lows);
+    permissions = Abi::Read;
+    count = 3;
+    compare(*stopping, {guest + 0x100, guest}, {0u, 4u});
+    compare(*elected, {guest + 0x100, guest}, lows);
+}
+
 void RunBdaExecutionTests(const Context& context) {
     namespace Abi = ShaderRecompiler::BdaAbi;
     Buffer first(context, 3, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
@@ -333,6 +457,7 @@ void RunBdaExecutionTests(const Context& context) {
     ranges[0].permissions = 0;
     run(guest, 8, 0, Abi::FaultReason::Permission);
     RunBdaDwordWriteTests(context);
+    RunBdaAnchorTests(context);
 }
 
 void RunBdaStoreExecutionTests(const Context& context) {

@@ -1316,6 +1316,7 @@ void EmitProgram(SpirvEmitterState& state) {
     for (const auto written : state.blendTargetWritten) {
         if (written != 0u) state.module.AddFunction(spv::OpStore, written, ConstantU32(state, 0u));
     }
+    EmitBdaAnchors(state);
     if (OrderedPixelShader(state)) {
         state.module.AddFunction(spv::OpBeginInvocationInterlockEXT);
     }

@@ -5,6 +5,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <initializer_list>
 
 namespace {
 
@@ -128,4 +129,9 @@ void RunBdaContractTests() {
         check(0);
         check(~std::uint64_t{0});
     }
+    const auto ordered = [](std::initializer_list<BdaAbi::Range> ranges) { return BdaAbi::RangesOrdered(ranges.begin(), ranges.size()); };
+    AgcDriver::Graphics::Require(ordered({}) && ordered({{0x1000, 0x2000, 1, 1, 0}, {0x2000, 0x2000, 1, 1, 0}, {0x2000, 0x3000, 1, 1, 0}, {0x4000, 0x5000, 1, 1, 0}}), "ascending disjoint BDA ranges were refused");
+    AgcDriver::Graphics::Require(!ordered({{0x1000, 0x3000, 1, 1, 0}, {0x2000, 0x2100, 1, 1, 0}}), "overlapping BDA ranges were accepted");
+    AgcDriver::Graphics::Require(!ordered({{0x4000, 0x5000, 1, 1, 0}, {0x1000, 0x2000, 1, 1, 0}}), "unsorted BDA ranges were accepted");
+    AgcDriver::Graphics::Require(!ordered({{0x2000, 0x1000, 1, 1, 0}}), "a BDA range ending before its begin was accepted");
 }
