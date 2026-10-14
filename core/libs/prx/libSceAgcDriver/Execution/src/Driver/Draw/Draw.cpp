@@ -234,6 +234,17 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         if (found != drawCache.end()) {
             entry = found->second;
             decode = entry->decode;
+        } else if (auto ahead = findAheadEntry(drawKey); ahead != nullptr) {
+            entry = std::move(ahead);
+            decode = entry->decode;
+            if (drawIdentity != 0) {
+                if (relocation != nullptr && !aliasFirst) {
+                    cacheLock.unlock();
+                    drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), nullptr, nullptr, relocation.get(), &drawAlias);
+                    cacheLock.lock();
+                }
+                drawRelocationPending = {drawKey, drawAlias, drawIdentity};
+            }
         } else {
             ++drawEntryCounters.absent;
             if (relocation != nullptr && !aliasFirst) {

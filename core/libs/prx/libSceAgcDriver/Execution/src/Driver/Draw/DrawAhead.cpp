@@ -1,10 +1,14 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawAhead.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
 #include <algorithm>
+#include <cstdio>
 #include <exception>
+#include <limits>
 #include <stdexcept>
+#include <unordered_set>
 #ifndef _WIN32
 #include <pthread.h>
 #endif
@@ -13,7 +17,8 @@ namespace AgcDriver::DriverDetail {
 
 namespace {
 
-constexpr std::size_t MaxQueuedScans = 8;
+constexpr std::size_t MaxQueuedJobs = 4096;
+std::atomic<bool> compileAheadEnabled{true};
 
 void NameThread(const char* name) {
 #if defined(__APPLE__)
@@ -184,52 +189,129 @@ bool DrawScan::Matches(const PublishedDraw& record, const QueueState& queue) {
     });
 }
 
-DrawAhead::DrawAhead(Driver& owner) : driver(owner) {
-    thread = std::jthread([this](std::stop_token token) {
+DrawAhead::Speculation::Speculation(DrawAhead& owner, std::uint64_t segment, std::size_t offset) : owner(owner), segment(segment), offset(offset) {}
+
+void DrawAhead::Speculation::Enter() {
+    if (!owner.pin(segment, offset)) throw std::runtime_error("draw-ahead speculation outlived its draw");
+}
+
+void DrawAhead::SetCompileAhead(bool enabled) {
+    compileAheadEnabled.store(enabled, std::memory_order_release);
+}
+
+void DrawAhead::Speculation::Leave() {
+    owner.unpin(segment, offset);
+}
+
+bool DrawAhead::Speculation::Passed() const {
+    return owner.passed(segment, offset);
+}
+
+bool DrawAhead::Speculation::Commit(const std::function<void()>& action) {
+    if (!owner.pin(segment, offset)) return false;
+    struct Unpin {
+        DrawAhead& owner;
+        std::uint64_t segment;
+        std::size_t offset;
+        ~Unpin() { owner.unpin(segment, offset); }
+    } unpin{owner, segment, offset};
+    action();
+    return true;
+}
+
+std::size_t DrawAhead::Workers() {
+    if (!GuestMemory::SpeculativeReadsSupported()) return 0;
+    return std::clamp<std::size_t>(std::thread::hardware_concurrency() / 4, 1, 4);
+}
+
+bool DrawAhead::HasDirectDraws(std::span<const std::uint32_t> commands) {
+    for (std::size_t cursor = 0; cursor < commands.size();) {
+        const auto header = commands[cursor];
+        if (Pm4::FillerPacket(header)) {
+            ++cursor;
+            continue;
+        }
+        const auto opcode = (header >> 8u) & 0xffu;
+        if (Pm4::DrawOpcode(opcode) && !Pm4::IndirectDrawOpcode(opcode)) return true;
+        cursor += Pm4::PacketWords(header);
+    }
+    return false;
+}
+
+bool DrawAhead::CompilesAhead(const Graphics::State& state, const Pm4::DrawParameters& parameters) {
+    return !state.stages.mesh && !parameters.indirect && !(state.stages.tessellation && parameters.instanceCount > 1u);
+}
+
+DrawAhead::DrawAhead(Driver& owner, std::size_t workers) : driver(owner), workerCount(workers) {
+    threads.emplace_back([this](std::stop_token token) {
         NameThread("agcdrawscan");
         scanLoop(token);
     });
+    for (std::size_t index = 0; index < workers; ++index) {
+        threads.emplace_back([this, index](std::stop_token token) {
+            char name[16];
+            std::snprintf(name, sizeof(name), "agcdraw%zu", index);
+            NameThread(name);
+            workLoop(token);
+        });
+    }
 }
 
 DrawAhead::~DrawAhead() {
-    thread.request_stop();
+    for (auto& thread : threads) thread.request_stop();
     scansReady.notify_all();
-    if (thread.joinable()) thread.join();
+    jobsReady.notify_all();
+    threads.clear();
 }
 
-void DrawAhead::Post(const Submission& submission, const QueueState& state) {
+std::uint64_t DrawAhead::Post(const Submission& submission, const QueueState& state) {
+    const auto segment = ++segments;
+    current.reset();
+    {
+        std::lock_guard lock(mutex);
+        if ((scanning && scanningSegment > retiredSegment) || !scans.empty()) return segment;
+    }
     Scan work;
-    work.serial = submission.serial;
+    work.segment = segment;
     work.commands = submission.commands;
     work.registerLists = submission.registerLists;
     work.conditionalEnds = submission.conditionalEnds;
     work.shaders = submission.shaders;
     work.state = std::make_unique<QueueState>(state);
     auto publication = std::make_shared<Publication>();
-    publication->serial = submission.serial;
     publication->commands = submission.commands.data();
     publication->shaders = submission.shaders.get();
     work.publication = publication;
     current = std::move(publication);
-    progressCursor.store(0, std::memory_order_relaxed);
-    progressSerial.store(submission.serial, std::memory_order_relaxed);
     {
         std::lock_guard lock(mutex);
-        if (scans.size() >= MaxQueuedScans) scans.pop_front();
         scans.push_back(std::move(work));
     }
     scansReady.notify_one();
+    return segment;
 }
 
-void DrawAhead::Progress(std::uint64_t serial, std::size_t cursor) {
-    progressSerial.store(serial, std::memory_order_relaxed);
-    progressCursor.store(cursor, std::memory_order_relaxed);
+void DrawAhead::Progress(std::uint64_t segment, std::size_t cursor) {
+    pass(segment, cursor + 1);
+}
+
+void DrawAhead::Retire(std::uint64_t segment) {
+    pass(segment, std::numeric_limits<std::size_t>::max());
+    std::size_t dropped = 0;
+    {
+        std::lock_guard lock(mutex);
+        retiredSegment = std::max(retiredSegment, segment);
+        dropped = static_cast<std::size_t>(std::erase_if(jobs, [&](const Job& job) { return job.segment <= segment; }));
+        std::erase_if(scans, [&](const Scan& scan) { return scan.segment <= segment; });
+    }
+    driver.drawAheadCounts.dropped.fetch_add(dropped, std::memory_order_relaxed);
+    current.reset();
 }
 
 const PublishedDraw* DrawAhead::Find(const Submission& submission, std::span<const std::uint32_t> packet, const QueueState& queue, std::uint64_t deviceSerial) {
     auto* publication = current.get();
     const auto* commands = submission.commands.data();
-    if (publication == nullptr || publication->serial != submission.serial || publication->commands != commands || publication->shaders != submission.shaders.get()) return nullptr;
+    if (publication == nullptr || publication->commands != commands || publication->shaders != submission.shaders.get()) return nullptr;
     if (packet.data() < commands || packet.data() >= commands + submission.commands.size()) return nullptr;
     const auto offset = static_cast<std::size_t>(packet.data() - commands);
     const auto ready = publication->published.load(std::memory_order_acquire);
@@ -238,12 +320,40 @@ const PublishedDraw* DrawAhead::Find(const Submission& submission, std::span<con
     if (cursor == ready) return nullptr;
     const auto& record = publication->records[cursor];
     if (record.offset != offset || !record.certain || record.deviceSerial != deviceSerial || !DrawScan::Matches(record, queue)) return nullptr;
+    driver.drawAheadCounts.used.fetch_add(1, std::memory_order_relaxed);
     return &record;
 }
 
-bool DrawAhead::passed(std::uint64_t serial, std::size_t offset) const {
-    const auto at = progressSerial.load(std::memory_order_relaxed);
-    return serial < at || (serial == at && offset <= progressCursor.load(std::memory_order_relaxed));
+bool DrawAhead::passed(std::uint64_t segment, std::size_t offset) {
+    std::lock_guard lock(gateMutex);
+    return segment < passedSegment || (segment == passedSegment && offset < passedEnd);
+}
+
+bool DrawAhead::pin(std::uint64_t segment, std::size_t offset) {
+    std::lock_guard lock(gateMutex);
+    if (segment < passedSegment || (segment == passedSegment && offset < passedEnd)) return false;
+    pinned.emplace_back(segment, offset);
+    return true;
+}
+
+void DrawAhead::unpin(std::uint64_t segment, std::size_t offset) {
+    {
+        std::lock_guard lock(gateMutex);
+        const auto found = std::find(pinned.begin(), pinned.end(), std::pair{segment, offset});
+        if (found == pinned.end()) throw std::runtime_error("draw-ahead unpinned a speculation it never pinned");
+        pinned.erase(found);
+    }
+    gateLeft.notify_all();
+}
+
+void DrawAhead::pass(std::uint64_t segment, std::size_t end) {
+    std::unique_lock lock(gateMutex);
+    if (segment < passedSegment || (segment == passedSegment && end <= passedEnd)) return;
+    passedSegment = segment;
+    passedEnd = end;
+    gateLeft.wait(lock, [&] {
+        return std::none_of(pinned.begin(), pinned.end(), [&](const auto& entry) { return entry.first < segment || (entry.first == segment && entry.second < end); });
+    });
 }
 
 void DrawAhead::scanLoop(std::stop_token token) {
@@ -254,21 +364,36 @@ void DrawAhead::scanLoop(std::stop_token token) {
             if (!scansReady.wait(lock, token, [&] { return !scans.empty(); })) return;
             work = std::move(scans.front());
             scans.pop_front();
+            scanning = true;
+            scanningSegment = work.segment;
         }
         try {
             scan(work, token);
         } catch (const std::exception&) {
         }
+        std::lock_guard lock(mutex);
+        scanning = false;
     }
+}
+
+void DrawAhead::queueJob(Job job) {
+    {
+        std::lock_guard lock(mutex);
+        if (jobs.size() >= MaxQueuedJobs) return;
+        jobs.push_back(std::move(job));
+    }
+    jobsReady.notify_one();
 }
 
 void DrawAhead::scan(Scan& work, std::stop_token token) {
     const auto device = driver.device.Load();
     if (device == nullptr || work.shaders == nullptr) return;
     const auto deviceSerial = device->Serial();
+    const auto context = device->graphicsContext();
     const bool listRestart = device->PrimitiveListRestart();
     const auto& commands = work.commands;
     auto& publication = *work.publication;
+    if (passed(work.segment, std::numeric_limits<std::size_t>::max() - 1)) return;
     std::size_t draws = 0;
     for (std::size_t cursor = 0; cursor < commands.size();) {
         const auto header = commands[cursor];
@@ -278,16 +403,26 @@ void DrawAhead::scan(Scan& work, std::stop_token token) {
     }
     publication.records = std::make_unique<PublishedDraw[]>(draws);
     publication.capacity = draws;
+    const bool compileAhead = workerCount != 0 && compileAheadEnabled.load(std::memory_order_acquire) && !Driver::insertCompare() && !Driver::traceDrawCache() && !work.shaders->empty();
+    std::unordered_set<std::uint64_t> queued;
     std::string rejected;
     std::size_t index = 0;
     DrawScan scanner(commands, work.registerLists, work.conditionalEnds, *work.state);
     scanner.Next([&](const DrawScan::Draw& draw) {
-        if (token.stop_requested() || passed(work.serial, commands.size())) return false;
+        if (token.stop_requested() || !pin(work.segment, commands.size())) return false;
+        struct Unpin {
+            DrawAhead& owner;
+            std::uint64_t segment;
+            std::size_t end;
+            ~Unpin() { owner.unpin(segment, end); }
+        } unpin{*this, work.segment, commands.size()};
         if (index >= publication.capacity) throw std::runtime_error("draw-ahead scan found more draws than it counted");
         auto& record = publication.records[index];
         record.offset = draw.offset;
         const auto opcode = (draw.packet[0] >> 8u) & 0xffu;
-        if (!Pm4::IndirectDrawOpcode(opcode) && !passed(work.serial, draw.offset)) {
+        Speculation speculation(*this, work.segment, draw.offset);
+        if (!Pm4::IndirectDrawOpcode(opcode) && !speculation.Passed()) {
+            const GuestMemory::SpeculativeReadScope speculative(speculation);
             bool resolved = false;
             try {
                 record.parameters = Pm4::ResolveDraw(draw.packet, draw.state);
@@ -303,10 +438,45 @@ void DrawAhead::scan(Scan& work, std::stop_token token) {
             record.instanceCount = draw.state.instanceCount;
             record.certain = resolved && draw.certain && (record.precheck == DrawPrecheckOutcome::Proceed || record.precheck == DrawPrecheckOutcome::Nothing);
             if (record.certain) scanner.Capture(record.checks);
+            if (compileAhead && resolved && record.precheck == DrawPrecheckOutcome::Proceed && queued.insert(record.key).second) {
+                bool cached = false;
+                {
+                    std::lock_guard cacheLock(driver.drawCacheMutex);
+                    cached = driver.drawCache.contains(record.key);
+                }
+                if (!cached && driver.findAheadEntry(record.key) == nullptr) {
+                    try {
+                        queueJob({work.segment, draw.offset, record.key, record.shape, driver.decodeDraw(draw.state, *work.shaders, context), record.parameters, device});
+                    } catch (const std::exception&) {
+                        driver.drawAheadCounts.dropped.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            }
         }
         publication.published.store(++index, std::memory_order_release);
+        driver.drawAheadCounts.published.fetch_add(1, std::memory_order_relaxed);
         return true;
     });
 }
 
+void DrawAhead::workLoop(std::stop_token token) {
+    while (!token.stop_requested()) {
+        Job job;
+        {
+            std::unique_lock lock(mutex);
+            if (!jobsReady.wait(lock, token, [&] { return !jobs.empty(); })) return;
+            job = std::move(jobs.front());
+            jobs.pop_front();
+        }
+        Speculation speculation(*this, job.segment, job.offset);
+        bool inserted = false;
+        if (!speculation.Passed()) {
+            try {
+                inserted = driver.compileDrawAhead(job.key, job.shape, job.decode, job.parameters, job.device, speculation);
+            } catch (const std::exception&) {
+            }
+        }
+        (inserted ? driver.drawAheadCounts.compiled : driver.drawAheadCounts.dropped).fetch_add(1, std::memory_order_relaxed);
+    }
+}
 }

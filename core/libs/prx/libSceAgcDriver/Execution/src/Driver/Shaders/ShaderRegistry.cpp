@@ -186,6 +186,7 @@ std::shared_ptr<const ShaderRecompiler::SourceHandle> PrepareShaderWithDiagnosti
 }
 
 std::shared_ptr<const ShaderSnapshot> ReadRawShader(std::uint64_t address) {
+    if (GuestMemory::SpeculativeReader()) throw std::runtime_error("AGC driver: a raw shader program is not available to a speculative reader");
     const auto drain = [](std::uint64_t first, std::size_t bytes) {
         if (!DrawPipeline::Active()) return;
         auto& pipeline = DrawPipeline::Queue0();
@@ -282,6 +283,7 @@ std::map<std::uint64_t, std::uint64_t> rawGraphicsRanges;
 }
 
 void NoteRawGraphicsDraw(const ShaderSnapshot& snapshot) {
+    if (GuestMemory::SpeculativeReader()) throw std::runtime_error("AGC driver: a raw graphics draw is not noted by a speculative reader");
     if (snapshot.rawGraphicsNoted->load(std::memory_order_acquire)) return;
     auto begin = snapshot.codeAddress;
     auto end = snapshot.codeAddress + snapshot.code.size() * sizeof(std::uint32_t);

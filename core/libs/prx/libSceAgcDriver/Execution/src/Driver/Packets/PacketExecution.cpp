@@ -325,10 +325,21 @@ void Driver::execute(const Submission& submission) {
         state = &queues[submission.queue];
     }
     auto& queue = *state;
-    if (submission.queue == 0 && drawEntries() && registerKeyEnabled()) {
-        if (drawAhead == nullptr) drawAhead = std::make_unique<DrawAhead>(*this);
-        drawAhead->Post(submission, queue);
+    DrawAhead* ahead = nullptr;
+    std::uint64_t aheadSegment = 0;
+    if (submission.queue == 0 && drawEntries() && registerKeyEnabled() && DrawAhead::HasDirectDraws(submission.commands)) {
+        if (drawAhead == nullptr) drawAhead = std::make_unique<DrawAhead>(*this, DrawAhead::Workers());
+        ahead = drawAhead.get();
+        aheadSegment = ahead->Post(submission, queue);
     }
+    struct RetireDrawAhead {
+        DrawAhead* drawAhead;
+        std::uint64_t segment;
+        void Retire() {
+            if (drawAhead != nullptr) std::exchange(drawAhead, nullptr)->Retire(segment);
+        }
+        ~RetireDrawAhead() { Retire(); }
+    } retireDrawAhead{ahead, aheadSegment};
     static const bool traceGpu = std::getenv("APS5_TRACE_GPU") != nullptr;
     if (traceGpu) std::fprintf(stderr, "[gpu] %.1f execute serial=%llu queue=0x%x dwords=%zu\n", TraceMs(), static_cast<unsigned long long>(submission.serial), submission.queue, submission.commands.size());
 
@@ -606,7 +617,7 @@ void Driver::execute(const Submission& submission) {
                 }
             }
         } else if (drawPacket) {
-            if (submission.queue == 0 && drawAhead != nullptr) drawAhead->Progress(submission.serial, cursor);
+            if (ahead != nullptr) ahead->Progress(aheadSegment, cursor);
             landPendingWaits(submission.queue);
             packetCounters.CountDraw();
             drawnSinceSeal() = true;
@@ -705,6 +716,7 @@ void Driver::execute(const Submission& submission) {
         else timing.Finish();
         cursor = nextCursor;
     }
+    retireDrawAhead.Retire();
 
     PerformanceContext endContext(submission.queue == 0 ? frameTiming() : FrameTiming::Async());
     PerformanceTimer endTiming("Driver.EndSubmission");

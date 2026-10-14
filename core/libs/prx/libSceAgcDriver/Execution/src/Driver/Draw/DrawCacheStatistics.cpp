@@ -37,6 +37,13 @@ void Driver::reportDrawCache(DrawEntryCounters& counters, bool profile) {
         if (!profile) text += drawKeyChangeLine(counters);
     }
     if (profile) text += profileDrawCacheLines(counters);
+    if (profile) {
+        const auto now = DrawAheadStatistics();
+        char line[256];
+        std::snprintf(line, sizeof(line), "[draw-ahead] 10 s: %llu draw records published, %llu used by the queue; %llu entries compiled ahead, %llu jobs dropped\n", count(now.published - drawAheadReported.published), count(now.used - drawAheadReported.used), count(now.compiled - drawAheadReported.compiled), count(now.dropped - drawAheadReported.dropped));
+        text += line;
+        drawAheadReported = now;
+    }
     AgcDriver::ProfilePrint_nid_no_patch("%s", text.c_str());
     counters = DrawEntryCounters{};
 }
@@ -64,6 +71,12 @@ std::string Driver::drawKeyChangeLine(const DrawEntryCounters& counters) {
     return line;
 }
 
+Driver::DrawCacheOccupancy Driver::DrawCacheState() {
+    std::lock_guard cacheLock(drawCacheMutex);
+    std::lock_guard aheadLock(drawAheadMutex);
+    return {drawOrder.size(), drawAheadEntries.size(), releasedDrawEntries.size()};
+}
+
 std::string Driver::profileDrawCacheLines(const DrawEntryCounters& counters) {
     std::string text;
     const auto append = [&](const char* format, auto... values) {
@@ -85,6 +98,10 @@ std::string Driver::profileDrawCacheLines(const DrawEntryCounters& counters) {
     text += drawKeyChangeLine(counters);
     append("[draw-cache] stage data hits (10 s): %llu stages (%llu words refreshed), verified %llu; stage inserts with data positions %llu (%.1f positions each)\n", count(counters.stageDataHits), count(counters.stageDataWords), count(counters.stageDataVerified), count(counters.stageDataInserts), counters.stageDataInserts != 0 ? static_cast<double>(counters.stageDataPositions) / static_cast<double>(counters.stageDataInserts) : 0.0);
     return text;
+}
+
+DrawAheadCounters Driver::DrawAheadStatistics() const {
+    return {drawAheadCounts.published.load(std::memory_order_relaxed), drawAheadCounts.used.load(std::memory_order_relaxed), drawAheadCounts.compiled.load(std::memory_order_relaxed), drawAheadCounts.dropped.load(std::memory_order_relaxed)};
 }
 
 }

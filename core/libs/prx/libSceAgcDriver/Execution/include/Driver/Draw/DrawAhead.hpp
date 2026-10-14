@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawCache.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/Submission.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/QueueState.hpp"
 #include <atomic>
@@ -81,20 +82,45 @@ private:
     bool lost = false;
 };
 
+struct DrawAheadCounters {
+    std::uint64_t published = 0;
+    std::uint64_t used = 0;
+    std::uint64_t compiled = 0;
+    std::uint64_t dropped = 0;
+};
+
 class DrawAhead {
 public:
-    explicit DrawAhead(Driver& driver);
+    class Speculation final : public GuestMemory::ISpeculativeReadGate {
+    public:
+        Speculation(DrawAhead& owner, std::uint64_t segment, std::size_t offset);
+        void Enter() override;
+        void Leave() override;
+        bool Passed() const;
+        bool Commit(const std::function<void()>& action);
+
+    private:
+        DrawAhead& owner;
+        std::uint64_t segment;
+        std::size_t offset;
+    };
+
+    DrawAhead(Driver& driver, std::size_t workers);
     ~DrawAhead();
     DrawAhead(const DrawAhead&) = delete;
     DrawAhead& operator=(const DrawAhead&) = delete;
 
-    void Post(const Submission& submission, const QueueState& state);
-    void Progress(std::uint64_t serial, std::size_t cursor);
+    static void SetCompileAhead(bool enabled);
+    static std::size_t Workers();
+    static bool HasDirectDraws(std::span<const std::uint32_t> commands);
+    static bool CompilesAhead(const Graphics::State& state, const Pm4::DrawParameters& parameters);
+    std::uint64_t Post(const Submission& submission, const QueueState& state);
+    void Progress(std::uint64_t segment, std::size_t cursor);
+    void Retire(std::uint64_t segment);
     const PublishedDraw* Find(const Submission& submission, std::span<const std::uint32_t> packet, const QueueState& queue, std::uint64_t deviceSerial);
 
 private:
     struct Publication {
-        std::uint64_t serial = 0;
         const std::uint32_t* commands = nullptr;
         const ShaderRegistry* shaders = nullptr;
         std::unique_ptr<PublishedDraw[]> records;
@@ -104,7 +130,7 @@ private:
     };
 
     struct Scan {
-        std::uint64_t serial = 0;
+        std::uint64_t segment = 0;
         std::vector<std::uint32_t> commands;
         std::map<std::size_t, std::vector<std::uint32_t>> registerLists;
         std::map<std::size_t, std::size_t> conditionalEnds;
@@ -113,20 +139,44 @@ private:
         std::shared_ptr<Publication> publication;
     };
 
-    bool passed(std::uint64_t serial, std::size_t offset) const;
+    struct Job {
+        std::uint64_t segment = 0;
+        std::size_t offset = 0;
+        std::uint64_t key = 0;
+        std::uint64_t shape = 0;
+        std::shared_ptr<const DrawDecode> decode;
+        Pm4::DrawParameters parameters{};
+        std::shared_ptr<VulkanDevice> device;
+    };
+
+    bool passed(std::uint64_t segment, std::size_t offset);
+    bool pin(std::uint64_t segment, std::size_t offset);
+    void unpin(std::uint64_t segment, std::size_t offset);
+    void pass(std::uint64_t segment, std::size_t end);
     void scanLoop(std::stop_token token);
+    void workLoop(std::stop_token token);
     void scan(Scan& work, std::stop_token token);
+    void queueJob(Job job);
 
     Driver& driver;
+    std::size_t workerCount;
     std::mutex mutex;
     std::condition_variable_any scansReady;
+    std::condition_variable_any jobsReady;
     std::deque<Scan> scans;
-    std::atomic<std::uint64_t> progressSerial{0};
-    std::atomic<std::size_t> progressCursor{0};
+    bool scanning = false;
+    std::uint64_t scanningSegment = 0;
+    std::uint64_t retiredSegment = 0;
+    std::uint64_t segments = 0;
+    std::deque<Job> jobs;
+    std::mutex gateMutex;
+    std::condition_variable gateLeft;
+    std::uint64_t passedSegment = 0;
+    std::size_t passedEnd = 0;
+    std::vector<std::pair<std::uint64_t, std::size_t>> pinned;
     std::shared_ptr<Publication> current;
-    std::jthread thread;
+    std::vector<std::jthread> threads;
 };
-
 }
 
 #endif

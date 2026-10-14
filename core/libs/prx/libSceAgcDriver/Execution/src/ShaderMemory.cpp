@@ -236,10 +236,15 @@ ShaderMemory::Page& ShaderMemory::page(std::uint64_t base) {
             return page;
         }
         const auto started = CaptureProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        GuestMemory::GuardRead(base, PageBytes);
-        GuestMemory::FlushGpuWrites(base, PageBytes);
+        if (GuestMemory::SpeculativeReader()) {
+            GuestMemory::Read(base, std::as_writable_bytes(std::span(page.words)), sizeof(std::uint32_t));
+            page.valid.SetAll();
+        } else {
+            GuestMemory::GuardRead(base, PageBytes);
+            GuestMemory::FlushGpuWrites(base, PageBytes);
+            page.lazy = true;
+        }
         if (CaptureProfiled()) CaptureTotals().pageReadNanoseconds += NanosecondsSince(started);
-        page.lazy = true;
     }
     return page;
 }
@@ -430,6 +435,7 @@ bool ShaderMemory::pending(void* context, std::uint64_t address, std::uint64_t b
 
 ShaderRecompiler::SrtWriteStamp ShaderMemory::stampWrites(void* context, std::uint64_t address, std::uint64_t bytes) {
     const auto& self = *static_cast<const ShaderMemory*>(context);
+    if (GuestMemory::SpeculativeReader()) return {};
     if (bytes == 0 || address > std::numeric_limits<std::uint64_t>::max() - bytes || self.overlapsInitial(address, address + bytes)) return {};
     const auto fetched = self.pageAtOrAfter(address & ~static_cast<std::uint64_t>(PageBytes - 1));
     if (fetched != self.pages.size() && self.pages[fetched].first < address + bytes) return {};
@@ -443,6 +449,7 @@ ShaderRecompiler::SrtWriteStamp ShaderMemory::stampWrites(void* context, std::ui
 
 bool ShaderMemory::Vouched(PendingWriteQuery pending, std::uint64_t address, std::uint64_t bytes, const ShaderRecompiler::SrtWriteStamp& stamp) {
     CaptureTotals().vouchCalls.fetch_add(1, std::memory_order_relaxed);
+    if (GuestMemory::SpeculativeReader()) return false;
     if (stamp.generation == 0 || bytes == 0 || address > std::numeric_limits<std::uint64_t>::max() - bytes || stamp.layout != GuestAllocations::GuestAllocationsGeneration_nid_postfix()) return false;
     if (pending != nullptr && pending(address, static_cast<std::size_t>(bytes), {}) != PendingWrite::None) return false;
     GuestMemory::FlushGpuWrites(address, static_cast<std::size_t>(bytes));
