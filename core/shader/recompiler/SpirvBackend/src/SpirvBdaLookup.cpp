@@ -155,8 +155,11 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
         {binary(spv::OpULessThanEqual, boolean, deviceEnd, result), BdaAbi::FaultReason::Overflow},
     });
     if (rangeResult) {
+        const auto last = binary(spv::OpUGreaterThanEqual, boolean, index, count);
+        const auto next = BdaLoadAddress(state, binary(spv::OpIAdd, u32, constant(4), binary(spv::OpIMul, u32, Select(state, u32, last, binary(spv::OpISub, u32, index, constant(1)), index), constant(8))));
+        const auto bound = Select(state, u64, binary(spv::OpLogicalOr, boolean, last, binary(spv::OpULessThan, boolean, finish, next)), finish, next);
         const auto range = state.module.AllocateId();
-        state.module.AddFunction(spv::OpCompositeConstruct, rangeType, range, begin, finish, base);
+        state.module.AddFunction(spv::OpCompositeConstruct, rangeType, range, begin, bound, base);
         state.module.AddFunction(spv::OpReturnValue, range);
         state.module.AddFunction(spv::OpFunctionEnd);
         return function;

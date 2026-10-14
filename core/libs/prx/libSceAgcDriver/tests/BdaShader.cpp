@@ -204,6 +204,10 @@ std::vector<std::uint32_t> MakeBdaAnchoredReadTestShader(const BdaAnchoredReadPr
         }
         EmitIfCondition(state, Binary(state, spv::OpIEqual, TypeBool(state), selector, ConstantU32(state, index)), [&] {
             const auto lookup = [&] {
+                if (reads.sentinel) {
+                    const auto sentinel = ConstantU32(state, BdaAnchoredReadSentinel);
+                    return std::array<std::uint32_t, 4>{sentinel, sentinel, sentinel, sentinel};
+                }
                 const auto address = AddBdaAddress(ctx, instruction, base, Unary(state, spv::OpUConvert, u64, low), false);
                 if (read.bits == 32u) return EmitBdaDwordReads(ctx, instruction, address, static_cast<std::uint32_t>(read.immediate), read.dwords);
                 return std::array<std::uint32_t, 4>{EmitBdaRead(ctx, instruction, AddBdaImmediate(ctx, instruction, address, read.immediate), read.bits)};

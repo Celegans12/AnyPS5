@@ -24,7 +24,9 @@ struct BdaAnchoredReadProgram {
     bool elect = false;
     bool coherent = false;
     std::uint32_t lanes = 1;
+    bool sentinel = false;
 };
+inline constexpr std::uint32_t BdaAnchoredReadSentinel = 0xdeadbeefu;
 std::vector<std::uint32_t> MakeBdaAnchoredReadTestShader(const BdaAnchoredReadProgram& reads, bool anchored);
 void RunBdaStoreExecutionTests(const AgcDriver::Graphics::Context& context);
 void RunBdaExecutionTests(const AgcDriver::Graphics::Context& context);
