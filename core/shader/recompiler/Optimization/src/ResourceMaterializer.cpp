@@ -494,35 +494,38 @@ private:
     }
 
     void Narrow(const TableColumn& column, ColumnRecords& records) {
-        const auto& domain = *column.keyDomain;
         const auto skip = [&] {
             tableCounters().narrowSkipped.fetch_add(1, std::memory_order_relaxed);
         };
-        const auto keyBuffer = EvaluateBuffer(domain.source);
-        if (keyBuffer.Type() != 0u) {
-            skip();
-            return;
-        }
-        const auto base = keyBuffer.Base48();
-        const auto size = keyBuffer.GetSize();
-        const std::uint64_t first = domain.offset & ~3u;
-        const std::uint64_t positions = size >= first + 4u ? (size - first - 4u) / domain.stride + 1u : 0u;
-        if (positions > TableKeyScanLimit() || first > 0xffffffffull) {
-            skip();
-            return;
-        }
-        if (positions != 0u && runtime.pendingWrite != nullptr && runtime.pendingWrite(runtime.userContext, base + first, size - first)) {
-            skip();
-            return;
-        }
         std::vector<std::uint32_t> values{0u};
-        for (std::uint64_t index = 0; index < positions; index++) {
-            const auto address = base + first + index * domain.stride;
-            if (!PageAccessible(address, base, base + size)) {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> scanned;
+        for (const auto& domain : column.keyDomains) {
+            const auto keyBuffer = EvaluateBuffer(domain.source);
+            if (keyBuffer.Type() != 0u) {
                 skip();
                 return;
             }
-            values.push_back(Read(address));
+            const auto base = keyBuffer.Base48();
+            const auto size = keyBuffer.GetSize();
+            const std::uint64_t first = domain.offset & ~3u;
+            const std::uint64_t positions = size >= first + 4u ? (size - first - 4u) / domain.stride + 1u : 0u;
+            if (positions > TableKeyScanLimit() || first > 0xffffffffull) {
+                skip();
+                return;
+            }
+            if (positions != 0u && runtime.pendingWrite != nullptr && runtime.pendingWrite(runtime.userContext, base + first, size - first)) {
+                skip();
+                return;
+            }
+            for (std::uint64_t index = 0; index < positions; index++) {
+                const auto address = base + first + index * domain.stride;
+                if (!PageAccessible(address, base, base + size)) {
+                    skip();
+                    return;
+                }
+                values.push_back(Read(address));
+            }
+            if (positions != 0u) scanned.emplace_back(base, size);
         }
         records.states.assign(records.keys, RecordState::OutsideDomain);
         records.outside = false;
@@ -538,7 +541,7 @@ private:
             else if (column.recordPointer.has_value()) records.outsidePointer = true;
         }
         records.narrowed = true;
-        if (positions != 0u) tables.ranges.emplace_back(base, size);
+        for (const auto& [base, size] : scanned) tables.ranges.emplace_back(base, size);
         tableCounters().narrowed.fetch_add(1, std::memory_order_relaxed);
     }
 
@@ -605,7 +608,7 @@ private:
         records.keys = std::min(records.records, ImageTableAbi::MaxKeys);
         records.outside = records.keys < records.records;
         records.states.assign(records.keys, RecordState::Read);
-        if (column.keyDomain.has_value() && records.keys != 0u) {
+        if (!column.keyDomains.empty() && records.keys != 0u) {
             Narrow(column, records);
         }
         records.words.assign(records.keys, 0u);

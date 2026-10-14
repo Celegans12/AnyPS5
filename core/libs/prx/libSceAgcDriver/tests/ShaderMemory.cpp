@@ -901,6 +901,10 @@ constexpr std::uint32_t TableType2D = 9;
 constexpr std::uint32_t TableType3D = 10;
 
 const std::vector<std::uint32_t> TableMaterialCode{0xf4080100u, 0xfa000000u, 0xf4080200u, 0xfa000010u, 0xf4080300u, 0xfa000020u, 0xf4080700u, 0xfa000030u, 0x7e200500u, 0x93109010u, 0xf4200406u, 0x20000004u, 0x8f108510u, 0xf42c0502u, 0x20000000u, 0xf09c0f08u, 0x00450000u, 0xe0700000u, 0x80070000u, 0xbf810000u};
+const std::vector<std::uint32_t> TableTwoKeyCode{0xf4080100u, 0xfa000000u, 0xf4080200u, 0xfa000010u, 0xf4080300u, 0xfa000020u, 0xf4080700u, 0xfa000030u, 0x7e240500u, 0x93129012u, 0xf4200406u, 0x24000004u, 0xf4200446u, 0x24000008u, 0x8f108510u, 0x8f118511u, 0xf42c0502u, 0x20000000u, 0xf42c0902u, 0x22000000u, 0xf09c0f08u, 0x00450000u, 0xf09c0f08u, 0x00490400u, 0x06000900u, 0xe0700000u, 0x80070000u, 0xbf810000u};
+const std::vector<std::uint32_t> TableLateKeyCode{0xf4080100u, 0xfa000000u, 0xf4080200u, 0xfa000010u, 0xf4080300u, 0xfa000020u, 0xf4080700u, 0xfa000030u, 0x7e240500u, 0x93129012u, 0xf4200406u, 0x24000004u, 0x8f108510u, 0xf42c0502u, 0x20000000u, 0xf09c0f08u, 0x00450000u, 0xf4200446u, 0x24000008u, 0x8f118511u, 0xf42c0902u, 0x22000000u, 0xf09c0f08u, 0x00490400u, 0x06000900u, 0xe0700000u, 0x80070000u, 0xbf810000u};
+const std::vector<std::uint32_t> TableMixedKeyCode{0xf4080100u, 0xfa000000u, 0xf4080200u, 0xfa000010u, 0xf4080300u, 0xfa000020u, 0xf4080700u, 0xfa000030u, 0x7e240500u, 0x93129012u, 0xf4200406u, 0x24000008u, 0x34020084u, 0xbf8cc07fu, 0xe0301004u, 0x80030101u, 0x8f108510u, 0xf42c0502u, 0x20000000u, 0xbf8c3f70u, 0x7e220501u, 0x8f118511u, 0xf42c0902u, 0x22000000u, 0xbf8cc07fu, 0xf09c0f08u, 0x00450000u, 0xf09c0f08u, 0x00490400u, 0xbf8c3f70u, 0x06000900u, 0xe0700000u, 0x80070000u, 0xbf810000u};
+const std::vector<std::uint32_t> TableMixedKeyFirstCode{0xf4080100u, 0xfa000000u, 0xf4080200u, 0xfa000010u, 0xf4080300u, 0xfa000020u, 0xf4080700u, 0xfa000030u, 0x7e240500u, 0x93129012u, 0xf4200406u, 0x24000008u, 0x34020084u, 0xbf8cc07fu, 0xe0301004u, 0x80030101u, 0xbf8c3f70u, 0x7e220501u, 0x8f118511u, 0xf42c0902u, 0x22000000u, 0xbf8cc07fu, 0xf09c0f08u, 0x00490400u, 0x8f108510u, 0xf42c0502u, 0x20000000u, 0xbf8cc07fu, 0xf09c0f08u, 0x00450000u, 0xbf8c3f70u, 0x06000900u, 0xe0700000u, 0x80070000u, 0xbf810000u};
 const std::vector<std::uint32_t> TableWholeCode{0xf4080100u, 0xfa000000u, 0xf4080200u, 0xfa000010u, 0xf4080300u, 0xfa000020u, 0xf4080700u, 0xfa000030u, 0x7e200500u, 0x8f108510u, 0xf42c0502u, 0x20000000u, 0xf09c0f08u, 0x00450000u, 0xe0700000u, 0x80070000u, 0xbf810000u};
 
 std::vector<std::uint32_t> TableLoadCode(std::vector<std::uint32_t> code) {
@@ -1036,7 +1040,7 @@ void verifyImageTables() {
     require(plan->info.images.size() == 1u && plan->info.images[0].table == 0u && plan->info.images[0].tableOperation == TableOperation::Supported, "image tables: the T# was not planned as a table");
     const auto& column = plan->descriptorSources.at(plan->info.images[0].source).tableColumn;
     require(column.has_value() && column->stride == 32u && column->addend == 0u && column->offset == 0u && column->dwordCount == 8u && !column->sampler, "image tables: the column is wrong");
-    require(column->keyDomain.has_value() && column->keyDomain->offset == 4u && column->keyDomain->stride == 16u, "image tables: the material key domain was not recorded");
+    require(column->keyDomains.size() == 1u && !column->unkeyed && column->keyDomains[0].offset == 4u && column->keyDomains[0].stride == 16u, "image tables: the material key domain was not recorded");
     auto staticRequest = request;
     const std::array<std::uint32_t, 2> absentResources{};
     staticRequest.context.userData = absentResources;
@@ -1099,7 +1103,7 @@ void verifyImageTables() {
 
     const auto whole = CompileTable(TableRequest(TableWholeCode, userData));
     const auto& wholePlan = *whole.capture->plan;
-    require(!wholePlan.descriptorSources.at(wholePlan.info.images.at(0).source).tableColumn->keyDomain.has_value(), "image tables: a key domain was recorded without a material read");
+    require(wholePlan.descriptorSources.at(wholePlan.info.images.at(0).source).tableColumn->keyDomains.empty(), "image tables: a key domain was recorded without a material read");
     const auto wholeCodes = TableCodes(TableMap(*whole.result), 0);
     require(wholeCodes.size() == 4u && wholeCodes[0] == wholeCodes[3] && wholeCodes[2] == Abi::NullCode && wholeCodes[1] != wholeCodes[0], "image tables: the whole table map is wrong");
 
@@ -1199,13 +1203,80 @@ void verifyImageTableMaskedOffset() {
     require(plan->info.images.size() == 1u && plan->info.images[0].table == 0u && plan->info.images[0].tableOperation == TableOperation::Supported, "image table masked offset: the T# was not planned as a table");
     const auto& column = plan->descriptorSources.at(plan->info.images[0].source).tableColumn;
     require(column.has_value() && column->stride == 32u && column->addend == 0u && column->offset == 0u && column->dwordCount == 8u, "image table masked offset: the column is wrong");
-    require(!column->keyDomain.has_value(), "image table masked offset: the masked key was narrowed by its unmasked value");
+    require(column->keyDomains.empty() && column->unkeyed, "image table masked offset: the masked key was narrowed by its unmasked value");
     const auto compiled = CompileTable(request);
     const auto& snapshot = compiled.capture->snapshot.tables.tables.at(0);
     const auto outside = Abi::PoisonCode(static_cast<std::uint32_t>(Abi::PoisonReason::OutsideDomain));
     require(snapshot.records == 4u && snapshot.keys == 4u && snapshot.codes.size() == 4u && std::none_of(snapshot.codes.begin(), snapshot.codes.end(), [&](std::uint32_t entry) { return entry == outside; }), "image table masked offset: a record was left outside the domain");
     const auto codes = TableCodes(TableMap(*compiled.result), 0);
     require(codes.size() == 4u && codes[0] == codes[3] && codes[2] == Abi::NullCode && codes[1] != codes[0] && (codes[1] & Abi::PoisonFlag) == 0u, "image table masked offset: the whole table map is wrong");
+}
+
+void verifyImageTableKeyUnion() {
+    for (const auto* code : {&TableTwoKeyCode, &TableLateKeyCode}) {
+        using namespace ShaderRecompiler;
+        namespace Abi = ImageTableAbi;
+        const std::string name = code == &TableTwoKeyCode ? "image table key union" : "image table late key";
+        static TableTexture textures[3];
+        alignas(4096) static TableGuest guest;
+        auto& heap = guest.heap;
+        std::fill(heap.begin(), heap.end(), std::array<std::uint32_t, 8>{});
+        heap[0] = TableT(textures[0].bytes.data(), TableFormat8888UNorm, TableType2D);
+        heap[1] = TableT(textures[1].bytes.data(), TableFormat32UInt, TableType2D);
+        heap[2] = heap[1];
+        heap[3] = TableT(textures[2].bytes.data(), TableFormat8888UNorm, TableType2D);
+        guest.materials = {};
+        guest.materials[0][1] = 1u;
+        guest.materials[0][2] = 3u;
+        FillTableSrt(guest, heap.data(), 32u, 4u);
+        const auto userData = TableUserData(guest);
+        const auto request = TableRequest(*code, userData);
+        const auto plan = GetResourcePlan(request);
+        require(plan->info.images.size() == 1u && plan->info.images[0].table == 0u, (name + ": two keyed reads of one table were not planned as one image of one column").c_str());
+        const auto& column = plan->descriptorSources.at(plan->info.images[0].source).tableColumn;
+        require(column.has_value() && column->keyDomains.size() == 2u && !column->unkeyed && column->keyDomains[0] != column->keyDomains[1], (name + ": the column does not carry both key domains").c_str());
+        const auto compiled = CompileTable(request);
+        const auto& snapshot = compiled.capture->snapshot.tables.tables.at(0);
+        const auto outside = Abi::PoisonCode(static_cast<std::uint32_t>(Abi::PoisonReason::OutsideDomain));
+        require(compiled.capture->snapshot.tables.tables.size() == 1u && snapshot.keys == 4u && (snapshot.codes[0] & Abi::PoisonFlag) == 0u && (snapshot.codes[1] & Abi::PoisonFlag) == 0u && snapshot.codes[2] == outside && (snapshot.codes[3] & Abi::PoisonFlag) == 0u, (name + ": the snapshot does not hold the union of the two keys' records").c_str());
+        const auto* images = TableBinding(*compiled.result, DescriptorRole::ImageTable);
+        require(images != nullptr && images->count == 3u, (name + ": the binding does not hold the three distinct images of the selected records").c_str());
+        guest.materials[0][2] = 2u;
+        const auto moved = CompileTable(request);
+        const auto& movedSnapshot = moved.capture->snapshot.tables.tables.at(0);
+        require((movedSnapshot.codes[2] & Abi::PoisonFlag) == 0u && movedSnapshot.codes[3] == outside && (movedSnapshot.codes[1] & Abi::PoisonFlag) == 0u && moved.result->spirv == compiled.result->spirv, (name + ": a changed second key did not move the union or changed the module").c_str());
+    }
+}
+
+void verifyImageTableUnkeyedAccess() {
+    for (const auto* code : {&TableMixedKeyCode, &TableMixedKeyFirstCode}) {
+        using namespace ShaderRecompiler;
+        namespace Abi = ImageTableAbi;
+        static TableTexture textures[4];
+        alignas(4096) static TableGuest guest;
+        auto& heap = guest.heap;
+        std::fill(heap.begin(), heap.end(), std::array<std::uint32_t, 8>{});
+        heap[0] = TableT(textures[0].bytes.data(), TableFormat8888UNorm, TableType2D);
+        heap[1] = TableT(textures[1].bytes.data(), TableFormat32UInt, TableType2D);
+        heap[2] = TableT(textures[2].bytes.data(), TableFormat8888UNorm, TableType2D);
+        heap[3] = TableT(textures[3].bytes.data(), TableFormat32UInt, TableType2D);
+        guest.materials = {};
+        guest.materials[0][1] = 3u;
+        guest.materials[0][2] = 1u;
+        FillTableSrt(guest, heap.data(), 32u, 4u);
+        const auto userData = TableUserData(guest);
+        const auto request = TableRequest(*code, userData);
+        const auto plan = GetResourcePlan(request);
+        require(!plan->info.images.empty() && std::all_of(plan->info.images.begin(), plan->info.images.end(), [](const ImageResource& image) { return image.table == 0u; }), "image table unkeyed access: the two reads were not planned as one table");
+        const auto& column = plan->descriptorSources.at(plan->info.images[0].source).tableColumn;
+        require(column.has_value() && column->unkeyed && column->keyDomains.empty(), "image table unkeyed access: a column shared with a read that has no key domain kept a key domain");
+        const auto compiled = CompileTable(request);
+        const auto& snapshot = compiled.capture->snapshot.tables.tables.at(0);
+        const auto outside = Abi::PoisonCode(static_cast<std::uint32_t>(Abi::PoisonReason::OutsideDomain));
+        require(snapshot.keys == 4u && std::none_of(snapshot.codes.begin(), snapshot.codes.end(), [&](std::uint32_t entry) { return entry == outside; }), "image table unkeyed access: the shared column was narrowed by the keyed read");
+        const auto* images = TableBinding(*compiled.result, DescriptorRole::ImageTable);
+        require(images != nullptr && images->count == 4u, "image table unkeyed access: the binding does not hold the whole domain");
+    }
 }
 
 void verifyImageTableRegistration() {
@@ -1346,7 +1417,7 @@ void verifyPointerImageTable() {
     const auto plan = GetResourcePlan(masked);
     require(plan->info.images.size() == 1u && plan->info.images[0].table == 0u, "pointer image table: the T# was not planned as a table");
     const auto& column = *plan->descriptorSources.at(plan->info.images[0].source).tableColumn;
-    require(column.address && column.stride == 32u && column.addend == 0u && column.offset == Palette && column.dwordCount == 8u && column.maxKey == 0xffu && !column.keyDomain.has_value(), "pointer image table: the column is wrong");
+    require(column.address && column.stride == 32u && column.addend == 0u && column.offset == Palette && column.dwordCount == 8u && column.maxKey == 0xffu && column.keyDomains.empty() && column.unkeyed, "pointer image table: the column is wrong");
     require(plan->descriptorSources.at(column.heapSource).dwordCount == 2u, "pointer image table: the table base is not a 64-bit pointer");
     std::uint32_t planningOnly = 0;
     for (const auto& memory : plan->memoryInfo) {
@@ -1405,7 +1476,7 @@ void verifyPointerImageTable() {
     const auto wide = request(wideCode, 0x34000u);
     const auto widePlan = GetResourcePlan(wide);
     const auto& wideColumn = *widePlan->descriptorSources.at(widePlan->info.images.at(0).source).tableColumn;
-    require(wideColumn.maxKey == 0xffffffffu && !wideColumn.keyDomain.has_value(), "pointer image table: a lane key has a bound or a key domain");
+    require(wideColumn.maxKey == 0xffffffffu && wideColumn.keyDomains.empty() && wideColumn.unkeyed, "pointer image table: a lane key has a bound or a key domain");
     const auto wideTable = CompileTable(wide);
     const auto& wideSnapshot = wideTable.capture->snapshot.tables.tables.at(0);
     constexpr std::uint32_t mapped = static_cast<std::uint32_t>((Committed - Palette) / 32u);
@@ -1420,7 +1491,7 @@ void verifyPointerImageTable() {
     const auto narrow = request(narrowCode, 0x35000u);
     const auto narrowPlan = GetResourcePlan(narrow);
     const auto& narrowColumn = *narrowPlan->descriptorSources.at(narrowPlan->info.images.at(0).source).tableColumn;
-    require(narrowColumn.keyDomain.has_value() && narrowColumn.maxKey == 0xffffffffu, "pointer image table: a key read from a V# has no key domain");
+    require(narrowColumn.keyDomains.size() == 1u && !narrowColumn.unkeyed && narrowColumn.maxKey == 0xffffffffu, "pointer image table: a key read from a V# has no key domain");
     const auto narrowTable = CompileTable(narrow);
     const auto& narrowSnapshot = narrowTable.capture->snapshot.tables.tables.at(0);
     const auto outsideDomain = Abi::PoisonCode(static_cast<std::uint32_t>(Abi::PoisonReason::OutsideDomain));
@@ -1528,7 +1599,7 @@ void verifyRecordPointerTables() {
     const auto& samplerColumn = *first->plan->descriptorSources.at(info.samplers.at(0).source).tableColumn;
     require(column.recordPointer && samplerColumn.recordPointer && column.stride == Stride && column.recordPointer->immediate == 0x3d0u && samplerColumn.recordPointer->immediate == 0x3f8u,
         "record pointer: plan lost the record stride or nonzero leaf offsets");
-    require(column.heapSource == samplerColumn.heapSource && column.keyDomain == samplerColumn.keyDomain, "record pointer: shared image/sampler record key diverged");
+    require(column.heapSource == samplerColumn.heapSource && column.keyDomains == samplerColumn.keyDomains && column.unkeyed == samplerColumn.unkeyed, "record pointer: shared image/sampler record key diverged");
     const auto& snapshot = first->snapshot.tables.tables.at(table);
     require(snapshot.addresses.at(0) == Leaf + 0x3d0u && snapshot.addresses.at(1) == Leaf + 0x3d0u && snapshot.codes.at(0) == snapshot.codes.at(1), "record pointer: aliased leaf address or words differ");
     const auto covered = [](const auto& ranges, std::uint64_t address, std::uint64_t bytes) {
@@ -4313,6 +4384,8 @@ int main(int argc, char** argv) {
             verifyImageTableKeys();
             verifyImageTables();
             verifyImageTableMaskedOffset();
+            verifyImageTableKeyUnion();
+            verifyImageTableUnkeyedAccess();
             verifyImageTableRegistration();
             verifyScalarAddressRule();
             verifyPointerImageTable();
@@ -4335,6 +4408,9 @@ int main(int argc, char** argv) {
         verifyPureFlatSlots();
         verifyImageTableKeys();
         verifyImageTables();
+        verifyImageTableMaskedOffset();
+        verifyImageTableKeyUnion();
+        verifyImageTableUnkeyedAccess();
         verifyImageTableRegistration();
         verifyScalarAddressRule();
         verifyPointerImageTable();
