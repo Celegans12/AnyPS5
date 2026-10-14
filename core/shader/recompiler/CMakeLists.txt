@@ -225,6 +225,7 @@ function(add_shader_recompiler target runtimeTarget)
             UnnormalizedWrapEnabled
             UnnormalizedWrapAxes
             DirectImageLoopGuardEnabled
+            BdaAbi::RangesOrdered
             BuildBarycentricGeometryShader
             BdaAbi::DirectImageFaultReason
             BdaAbi::DirectImageFaultResource

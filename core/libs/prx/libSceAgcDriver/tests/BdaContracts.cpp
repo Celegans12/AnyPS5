@@ -5,6 +5,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <initializer_list>
 
 namespace {
 
@@ -76,4 +77,9 @@ void RunBdaContractTests() {
         const auto loops = CallSites(shader, "write_bda_bytes");
         AgcDriver::Graphics::Require(loops == 1u && lookups == (bits == 32u ? 2u : 1u), "a runtime V# write of " + std::to_string(bits) + " bits has " + std::to_string(lookups) + " write lookups and " + std::to_string(loops) + " byte-loop calls, not its byte path through write_bda_bytes");
     }
+    const auto ordered = [](std::initializer_list<BdaAbi::Range> ranges) { return BdaAbi::RangesOrdered(ranges.begin(), ranges.size()); };
+    AgcDriver::Graphics::Require(ordered({}) && ordered({{0x1000, 0x2000, 1, 1, 0}, {0x2000, 0x2000, 1, 1, 0}, {0x2000, 0x3000, 1, 1, 0}, {0x4000, 0x5000, 1, 1, 0}}), "ascending disjoint BDA ranges were refused");
+    AgcDriver::Graphics::Require(!ordered({{0x1000, 0x3000, 1, 1, 0}, {0x2000, 0x2100, 1, 1, 0}}), "overlapping BDA ranges were accepted");
+    AgcDriver::Graphics::Require(!ordered({{0x4000, 0x5000, 1, 1, 0}, {0x1000, 0x2000, 1, 1, 0}}), "unsorted BDA ranges were accepted");
+    AgcDriver::Graphics::Require(!ordered({{0x2000, 0x1000, 1, 1, 0}}), "a BDA range ending before its begin was accepted");
 }
