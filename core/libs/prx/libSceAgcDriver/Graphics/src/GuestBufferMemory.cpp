@@ -2732,6 +2732,11 @@ void GuestBufferMemory::dissolveSpace(bool resolve) {
         // Both sorted and disjoint (UploadPrepare merged this build's regions; the space's are
         // registered ranges), so the merge keeps the order Descriptor searches.
         std::merge(space->base.begin(), space->base.end(), std::make_move_iterator(regions.begin()), std::make_move_iterator(regions.end()), std::back_inserter(merged), [](const Region& left, const Region& right) { return left.begin < right.begin; });
+        std::uint64_t reached = 0;
+        for (const auto& region : merged) {
+            regionsOverlap = regionsOverlap || region.begin < reached;
+            reached = std::max(reached, region.end);
+        }
     } else {
         merged.assign(space->base.begin(), space->base.end());
         merged.insert(merged.end(), std::make_move_iterator(regions.begin()), std::make_move_iterator(regions.end()));
@@ -2749,12 +2754,19 @@ void GuestBufferMemory::dissolveSpace(bool resolve) {
 }
 
 const GuestBufferMemory::Region* GuestBufferMemory::owner(std::uint64_t address, std::uint64_t end) const {
-    const auto candidate = [address](const std::vector<Region>& list) -> const Region* {
+    const auto candidate = [address, end](const std::vector<Region>& list, bool overlapping) -> const Region* {
         const auto found = std::upper_bound(list.begin(), list.end(), address, [](std::uint64_t value, const Region& region) { return value < region.begin; });
-        return found == list.begin() ? nullptr : &*std::prev(found);
+        if (found == list.begin()) return nullptr;
+        if (overlapping) {
+            for (auto it = found; it != list.begin();) {
+                --it;
+                if (end <= it->end) return &*it;
+            }
+        }
+        return &*std::prev(found);
     };
-    const auto* own = candidate(regions);
-    const auto* shared = space != nullptr ? candidate(space->base) : nullptr;
+    const auto* own = candidate(regions, regionsOverlap);
+    const auto* shared = space != nullptr ? candidate(space->base, false) : nullptr;
     const auto holds = [end](const Region* region) { return region != nullptr && end <= region->end; };
     if (holds(own) != holds(shared)) return holds(own) ? own : shared;
     if (own == nullptr || (shared != nullptr && shared->begin > own->begin)) return shared;

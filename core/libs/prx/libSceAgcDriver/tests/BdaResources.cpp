@@ -696,12 +696,14 @@ void spaceReadsAcrossImportsMergedTests(const Context& context, const BdaTestAcc
     const std::uint64_t lowerBytes = 512;
     const std::uint64_t upper = second + 128;
     const std::uint64_t upperBytes = third + 256 - upper;
-    for (int build = 0; build < 2; ++build) {
+    for (int build = 0; build < 3; ++build) {
         GuestBufferMemory leased(importing);
         leased.AcquireRegistered();
         leased.AddReadable(lower, lowerBytes);
         leased.AddReadable(upper, upperBytes);
-        leased.Upload(true);
+        leased.UploadPrepare(true);
+        if (build == 2) ClearHostImports(importing.device);
+        leased.UploadFinish(true);
         for (const auto& [address, bytes] : {std::pair{lower, lowerBytes}, std::pair{upper, upperBytes}}) {
             std::uint32_t adjustment = 0;
             const auto view = leased.Descriptor(address, bytes, adjustment);
