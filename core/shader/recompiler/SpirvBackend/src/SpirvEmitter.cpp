@@ -274,8 +274,14 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
     }
     state.waveLdsScope = WaveLdsScope(program, workgroup, state.laneCount);
     if (const char* guard = std::getenv("APS5_LOOP_GUARD")) state.loopGuardLimit = static_cast<std::uint32_t>(std::strtoul(guard, nullptr, 0));
-    // Stopped invocations would leave the wave LDS barriers incomplete.
-    state.bdaStopsInvocations = state.waveLdsScope == 0 && BdaInvocationsMayStop(program) && program.Resources().stage != IrShaderStage::Mesh;
+    // Stopped invocations would leave the wave LDS barriers incomplete. They also break every
+    // wave-level operation of the invocations still running: a lane mask saved in an SGPR before the
+    // stop keeps the stopped lanes' bits, and a waterfall that clears a lane only by its own ballot
+    // vote (s_ff1, v_readlane, s_andn2, s_cbranch_scc1) then never ends. Two lanes per invocation
+    // also stop a lane that did not fault. So only programs whose invocations never look at each
+    // other stop; the others continue with the faulting read's zero, the fault still reported.
+    const bool waveOperations = state.laneCount != 1u || state.requirements.subgroupBallot || state.requirements.subgroupShuffle;
+    state.bdaStopsInvocations = state.waveLdsScope == 0 && !waveOperations && BdaInvocationsMayStop(program) && program.Resources().stage != IrShaderStage::Mesh;
     EmitModuleHeader(state, bindings);
     EmitProgram(state);
     state.module.EmitEntryPoint(ExecutionModelForStage(state.program.Resources().stage), state.mainFunc, "main", state.interfaceVariables);
