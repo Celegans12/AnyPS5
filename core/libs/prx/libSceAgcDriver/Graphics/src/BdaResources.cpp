@@ -199,7 +199,7 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
             ++it;
         }
     }
-    Require(ShaderRecompiler::BdaAbi::RangesOrdered(ranges.data(), ranges.size()), "BDA table ranges are not ascending and disjoint");
+    Require(ShaderRecompiler::BdaAbi::RangesOrdered(ranges.data(), ranges.size()), "BDA table ranges do not ascend by begin");
     for (const auto& range : ranges) Require((range.permissions & ShaderRecompiler::BdaAbi::Write) == 0 || range.end <= ShaderRecompiler::BdaAbi::WrittenAddressLimit, "a writable BDA range ends past the addresses the written-page record can hold");
     const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::Bda);
     table = std::make_shared<Buffer>(context, tableBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);

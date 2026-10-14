@@ -5038,7 +5038,7 @@ void verifyBdaAnchors() {
     };
     for (const std::uint32_t stride : {4u, 32u}) {
         for (const std::uint32_t loads : {0u, 1u, 2u, 4u}) {
-            const bool anchored = loads >= 2u;
+            const bool anchored = stride == 32u && loads >= 2u;
             const auto words = compile(loads, stride);
             std::map<std::uint32_t, std::string> names;
             std::string function;

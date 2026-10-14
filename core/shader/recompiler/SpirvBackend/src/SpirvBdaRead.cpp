@@ -105,23 +105,6 @@ std::uint32_t EmitBdaBytes(SpirvEmitterState& state, std::uint32_t address, std:
     return EmitBdaByteLoop(state, address, ConstantU32(state, bytes), instruction, accessMask);
 }
 
-// The dwords of a wide load that the program extracts (all of them when the composite is used
-// whole). Dead-code elimination has dropped the unused extracts, as it dropped unused dword loads
-// when every dword was its own instruction.
-std::uint32_t UsedBdaDwords(const IrValue& inst, std::uint32_t dwords) {
-    const auto all = (1u << dwords) - 1u;
-    if (dwords == 1u) return all;
-    std::uint32_t used = 0;
-    for (const IrValue* user : inst.Uses()) {
-        const auto opcode = user->Opcode();
-        if (opcode != IrOpcode::CompositeExtractU32x2 && opcode != IrOpcode::CompositeExtractU32x3 && opcode != IrOpcode::CompositeExtractU32x4) return all;
-        const IrValue* index = user->ArgumentCount() > 1u ? user->Argument(1) : nullptr;
-        if (index == nullptr || !index->HasImmediate() || index->ImmediateU32() >= dwords) return all;
-        used |= 1u << index->ImmediateU32();
-    }
-    return used;
-}
-
 void EmitBdaStoreAt(SpirvEmitterState& state, std::uint32_t address, std::uint32_t bytes, std::uint32_t pointerType, std::uint32_t value, std::uint32_t instruction, std::uint32_t accessMask) {
     const auto physical = state.module.AllocateId();
     state.module.AddFunction(spv::OpFunctionCall, TypeScalarU64(state), physical, state.bdaWritePointerFunction, address, ConstantU32(state, bytes), instruction);
@@ -379,6 +362,24 @@ bool BdaByteReadsForced() {
     return forced;
 }
 
+std::uint32_t UsedBdaDwords(const IrValue& inst, std::uint32_t dwords) {
+    const auto all = (1u << dwords) - 1u;
+    if (dwords == 1u) return all;
+    std::uint32_t used = 0;
+    for (const IrValue* user : inst.Uses()) {
+        const auto opcode = user->Opcode();
+        if (opcode != IrOpcode::CompositeExtractU32x2 && opcode != IrOpcode::CompositeExtractU32x3 && opcode != IrOpcode::CompositeExtractU32x4) return all;
+        const IrValue* index = user->ArgumentCount() > 1u ? user->Argument(1) : nullptr;
+        if (index == nullptr || !index->HasImmediate() || index->ImmediateU32() >= dwords) return all;
+        used |= 1u << index->ImmediateU32();
+    }
+    return used;
+}
+
+bool RoutesApertures(const SpirvEmitterState& state, const MemoryInfo& mem) {
+    return mem.kind == ResourceKind::Flat && state.program.Resources().stage == IrShaderStage::Compute;
+}
+
 std::uint32_t BdaInstructionPc(SpirvEmitterState& state, const IrValue& inst) {
     return state.bdaPcOverride != 0u ? state.bdaPcOverride : ConstantU32(state, inst.Flags<MemoryFlags>().pc);
 }
@@ -425,15 +426,16 @@ namespace {
 
 constexpr std::size_t MaxBdaAnchors = 4;
 constexpr std::uint64_t BdaAnchorAddressLimit = ~std::uint64_t{0} << 32u;
+constexpr std::uint64_t BdaAnchorSpanLimit = std::uint64_t{1} << 62u;
 
-std::optional<std::pair<std::uint32_t, std::uint32_t>> UserDataBase(const IrProgram& program, const IrValue& inst) {
+std::optional<std::pair<std::uint32_t, std::uint32_t>> UserDataBase(const SpirvEmitterState& state, const IrValue& inst) {
     if (AddressOpcodeInfoOf(inst.Opcode()).access != AddressAccess::Read || inst.ArgumentCount() < 2u) return std::nullopt;
     const auto index = inst.Flags<MemoryFlags>().index;
-    const auto& memory = program.Resources().memoryInfo;
+    const auto& memory = state.program.Resources().memoryInfo;
     if (index >= memory.size()) return std::nullopt;
     const auto& info = memory[index];
     if (info.kind != ResourceKind::ScalarAddress && info.kind != ResourceKind::Flat && info.kind != ResourceKind::Global) return std::nullopt;
-    if (info.planningOnly || info.addressIsFull || (info.kind == ResourceKind::Flat && program.Resources().stage == IrShaderStage::Compute)) return std::nullopt;
+    if (info.planningOnly || info.addressIsFull || RoutesApertures(state, info)) return std::nullopt;
     const IrValue* handle = inst.Argument(0) != nullptr ? inst.Argument(0)->Resolve() : nullptr;
     if (handle == nullptr || handle->Opcode() != IrOpcode::GetAddressResource || handle->ArgumentCount() != 2u) return std::nullopt;
     const auto userData = [](const IrValue* value) -> std::optional<std::uint32_t> {
@@ -495,14 +497,12 @@ void CollectBdaAnchors(SpirvEmitterState& state) {
     state.bdaAnchors.clear();
     if (!state.program.Info().usesDma || state.bdaProbeFunction == 0) return;
     std::vector<std::pair<std::pair<std::uint32_t, std::uint32_t>, std::size_t>> bases;
-    for (const IrBlock* block : state.program.BlockOrder()) {
-        for (const IrValue* inst : block->Instructions()) {
-            const auto base = UserDataBase(state.program, *inst);
-            if (!base) continue;
-            const auto found = std::find_if(bases.begin(), bases.end(), [&](const auto& entry) { return entry.first == *base; });
-            if (found != bases.end()) ++found->second;
-            else bases.push_back({*base, 1u});
-        }
+    for (const IrValue* inst : BdaReadSites(state)) {
+        const auto base = UserDataBase(state, *inst);
+        if (!base) continue;
+        const auto found = std::find_if(bases.begin(), bases.end(), [&](const auto& entry) { return entry.first == *base; });
+        if (found != bases.end()) ++found->second;
+        else bases.push_back({*base, 1u});
     }
     std::stable_sort(bases.begin(), bases.end(), [](const auto& left, const auto& right) { return left.second > right.second; });
     for (const auto& [base, reads] : bases) {
@@ -536,6 +536,7 @@ void EmitBdaAnchorRange(SpirvEmitterState& state, SpirvEmitterState::BdaAnchor& 
     const auto deviceEnd = Binary(state, spv::OpIAdd, u64, anchor.device, span);
     auto usable = Binary(state, spv::OpLogicalAnd, boolean, Binary(state, spv::OpINotEqual, boolean, anchor.device, BdaConstant(state, 0u)), Binary(state, spv::OpUGreaterThan, boolean, deviceEnd, anchor.device));
     usable = Binary(state, spv::OpLogicalAnd, boolean, usable, Binary(state, spv::OpULessThanEqual, boolean, end, BdaConstant(state, BdaAnchorAddressLimit)));
+    usable = Binary(state, spv::OpLogicalAnd, boolean, usable, Binary(state, spv::OpULessThanEqual, boolean, span, BdaConstant(state, BdaAnchorSpanLimit)));
     anchor.size = Select(state, u64, usable, span, BdaConstant(state, 0u));
 }
 
@@ -550,10 +551,11 @@ void EmitBdaAnchors(SpirvEmitterState& state) {
 
 const SpirvEmitterState::BdaAnchor* FindBdaAnchor(const SpirvEmitterState& state, const IrValue& inst) {
     if (state.bdaAnchors.empty()) return nullptr;
-    const auto base = UserDataBase(state.program, inst);
+    const auto base = UserDataBase(state, inst);
     if (!base) return nullptr;
     for (const auto& anchor : state.bdaAnchors) {
-        if (anchor.lowRegister == base->first && anchor.highRegister == base->second && anchor.size != 0u) return &anchor;
+        const bool emitted = anchor.size != 0u;
+        if (emitted && anchor.lowRegister == base->first && anchor.highRegister == base->second) return &anchor;
     }
     return nullptr;
 }

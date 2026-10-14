@@ -228,22 +228,24 @@ static void RunBdaAnchorTests(const Context& context) {
     Buffer large(context, 1024, usage);
     Buffer top(context, 16, usage);
     Buffer above(context, 16, usage);
+    Buffer overlap(context, 0x200, usage);
     std::uint32_t seed = 0x11;
-    for (auto* buffer : {&first, &second, &words, &shifted, &large, &top, &above}) {
+    for (auto* buffer : {&first, &second, &words, &shifted, &large, &top, &above, &overlap}) {
         for (std::size_t index = 0; index < buffer->Bytes().size(); ++index) buffer->Bytes()[index] = std::byte(static_cast<std::uint8_t>(seed + index * 7u));
         seed += 0x33;
     }
     for (std::uint32_t index = 0; index < 16u; ++index) words.Bytes()[index] = std::byte(static_cast<std::uint8_t>(0xa0u + index));
     for (std::uint32_t index = 0; index < 20u; ++index) shifted.Bytes()[index] = std::byte(static_cast<std::uint8_t>(0xc0u + index));
-    const std::array<Abi::Range, 7> ranges{{{guest, guest + 3, first.DeviceAddress(), Abi::Read, 0},
+    std::vector<Abi::Range> ranges{{guest, guest + 3, first.DeviceAddress(), Abi::Read, 0},
         {guest + 3, guest + 5, second.DeviceAddress(), Abi::Read, 0},
         {guest + 0x100, guest + 0x110, words.DeviceAddress(), Abi::Read, 0},
         {guest + 0x200, guest + 0x210, shifted.DeviceAddress() + 1u, Abi::Read, 0},
         {guest + 0x400, guest + 0x800, large.DeviceAddress(), Abi::Read, 0},
+        {guest + 0x700, guest + 0x900, overlap.DeviceAddress(), Abi::Read, 0},
         {limit - 0x10, limit, top.DeviceAddress(), Abi::Read, 0},
-        {highest, highest + 0x10, above.DeviceAddress(), Abi::Read, 0}}};
-    Require(Abi::RangesOrdered(ranges.data(), ranges.size()), "the BDA anchor test table is not ascending and disjoint");
-    Buffer table(context, sizeof(Abi::Header) + sizeof(ranges), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        {highest, highest + 0x10, above.DeviceAddress(), Abi::Read, 0}};
+    Require(Abi::RangesOrdered(ranges.data(), ranges.size()), "the BDA anchor test table does not ascend by begin");
+    Buffer table(context, sizeof(Abi::Header) + ranges.size() * sizeof(Abi::Range), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     Buffer fault(context, sizeof(Abi::Fault), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     Buffer output(context, (BdaAnchoredReadInputWord + 3u + lanes) * sizeof(std::uint32_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     struct Outcome {
@@ -254,10 +256,10 @@ static void RunBdaAnchorTests(const Context& context) {
     std::uint32_t permissions = Abi::Read;
     const auto run = [&](Pipeline& pipeline, std::uint32_t read, std::uint64_t anchor, const std::vector<std::uint32_t>& lows) {
         auto copy = ranges;
-        copy[2].permissions = permissions;
+        if (copy.size() > 2u) copy[2].permissions = permissions;
         const Abi::Header header{Abi::Version, count, sizeof(Abi::Range), 0};
         std::memcpy(table.Bytes().data(), &header, sizeof(header));
-        std::memcpy(table.Bytes().data() + sizeof(header), copy.data(), sizeof(copy));
+        std::memcpy(table.Bytes().data() + sizeof(header), copy.data(), copy.size() * sizeof(Abi::Range));
         std::memset(fault.Bytes().data(), 0, fault.Bytes().size());
         std::memset(output.Bytes().data(), 0xa5, BdaAnchoredReadInputWord * sizeof(std::uint32_t));
         std::vector<std::uint32_t> inputs{static_cast<std::uint32_t>(anchor), static_cast<std::uint32_t>(anchor >> 32u), read};
@@ -300,7 +302,7 @@ static void RunBdaAnchorTests(const Context& context) {
     for (const std::int32_t immediate : {0, 4, -1, -8, 0x7ffffff0, std::numeric_limits<std::int32_t>::min()}) {
         for (const auto& [bits, dwords, used] : std::initializer_list<std::array<std::uint32_t, 3>>{{8, 1, 1}, {16, 1, 1}, {32, 1, 1}, {32, 4, 15}, {32, 4, 10}, {32, 3, 4}}) reads.push_back({immediate, bits, dwords, used});
     }
-    const auto anchors = {guest + 0x100, guest + 0x108, guest, guest + 3, guest + 0x200, guest - 1, guest + 0x110, guest + 0x400, limit - 0x10, limit - 4, highest, highest + 8, std::numeric_limits<std::uint64_t>::max() - 2};
+    const auto anchors = {guest + 0x100, guest + 0x108, guest, guest + 3, guest + 0x200, guest - 1, guest + 0x110, guest + 0x400, guest + 0x6f0, guest + 0x700, guest + 0x800, limit - 0x10, limit - 4, highest, highest + 8, std::numeric_limits<std::uint64_t>::max() - 2};
     std::vector<std::uint32_t> lows{0u, 1u, 2u, 3u, 4u, 8u, 0xcu, 0xdu, 0xeu, 0xfu, 0x10u, 0x14u, 0x100u, 0x108u, 0x10cu, 0x1fcu, 0x200u, 0x20eu, 0x3f0u, 0x3fcu, 0x400u, 0x7fffu, 0x7fffffffu, 0x80000000u, 0xfffffff0u, 0xfffffffcu, 0xffffffffu};
     for (std::uint32_t lane = 0; lane < 32u; ++lane) lows.push_back(lane * 0x24u);
     std::vector<std::uint32_t> strided;
@@ -316,6 +318,39 @@ static void RunBdaAnchorTests(const Context& context) {
     auto stopping = build({reads, true, true, false, 1});
     compare(*stopping, anchors, {0u, 0x80000000u, 0xfffffffcu});
     const auto check = [&](std::uint32_t read, std::uint64_t anchor, std::uint32_t low) { return run(stopping->anchored, read, anchor, {low}); };
+    auto direct = std::make_unique<Pipeline>(context, MakeBdaAnchoredReadTestShader({reads, true, false, false, 1, true}, true), std::array<Buffer*, 3>{&table, &fault, &output});
+    const auto dword = [](Buffer& buffer, std::size_t offset) {
+        std::uint32_t value = 0;
+        std::memcpy(&value, buffer.Bytes().data() + offset, sizeof(value));
+        return value;
+    };
+    const auto loads = [&](std::uint32_t read, std::uint64_t anchor, std::uint32_t low, std::initializer_list<std::uint32_t> values) {
+        const auto outcome = run(*direct, read, anchor, {low});
+        Require(outcome.fault.state == Abi::FaultState::Empty && std::equal(values.begin(), values.end(), outcome.values.begin()), "a read the anchor holds did not load directly at anchor 0x" + std::to_string(anchor) + " + " + std::to_string(low) + ", read " + std::to_string(read));
+    };
+    const auto misses = [&](std::uint32_t read, std::uint64_t anchor, std::uint32_t low) {
+        const auto outcome = run(*direct, read, anchor, {low});
+        Require(outcome.fault.state == Abi::FaultState::Empty && outcome.values[0] == BdaAnchoredReadSentinel, "a read the anchor does not hold did not take the lookup path at anchor 0x" + std::to_string(anchor) + " + " + std::to_string(low) + ", read " + std::to_string(read));
+    };
+    loads(2, guest + 0x100, 0, {dword(words, 0)});
+    loads(2, guest + 0x100, 0xc, {dword(words, 0xc)});
+    loads(3, guest + 0x100, 0, {dword(words, 0), dword(words, 4), dword(words, 8), dword(words, 0xc)});
+    loads(0, guest + 0x200, 0xd, {0xceu});
+    loads(0, guest + 3, 1, {static_cast<std::uint32_t>(second.Bytes()[1])});
+    loads(1, guest, 1, {static_cast<std::uint32_t>(first.Bytes()[1]) | static_cast<std::uint32_t>(first.Bytes()[2]) << 8u});
+    loads(2, guest + 0x400, 0x2fc, {dword(large, 0x2fc)});
+    loads(2, guest + 0x700, 0x1fc, {dword(overlap, 0x1fc)});
+    loads(2, limit - 0x10, 0xc, {dword(top, 0xc)});
+    misses(2, guest + 0x100, 0xd);
+    misses(3, guest + 0x100, 4);
+    misses(2, guest + 0x200, 0);
+    misses(1, guest + 2, 0);
+    misses(0, guest + 3, 2);
+    misses(2, guest + 0x400, 0x300);
+    misses(2, guest + 0x400, 0x2fd);
+    misses(2, limit - 0x10, 0xd);
+    misses(2, highest, 0);
+    misses(2, guest - 1, 1);
     const auto wide = check(3, guest + 0x100, 0);
     Require(wide.fault.state == Abi::FaultState::Empty && wide.values[0] == 0xa3a2a1a0u && wide.values[1] == 0xa7a6a5a4u && wide.values[2] == 0xabaaa9a8u && wide.values[3] == 0xafaeadacu, "an anchored span read returned wrong data");
     const auto some = check(4, guest + 0x100, 0);
@@ -329,12 +364,18 @@ static void RunBdaAnchorTests(const Context& context) {
     const auto unmapped = check(2, guest + 0x100, 0x10);
     Require(unmapped.fault.state == Abi::FaultState::Ready && unmapped.fault.reason == Abi::FaultReason::Unmapped && unmapped.fault.address == guest + 0x110 && unmapped.fault.instruction == 0x1234 && unmapped.values[0] == 0xa5a5a5a5u, "an anchored read past its range did not fault");
     permissions = 0;
+    misses(2, guest + 0x100, 0);
     compare(*stopping, {guest + 0x100}, {0u, 4u});
     compare(*elected, {guest + 0x100}, lows);
     permissions = Abi::Read;
     count = 3;
+    misses(2, guest + 0x100, 0);
+    misses(0, guest, 0);
     compare(*stopping, {guest + 0x100, guest}, {0u, 4u});
     compare(*elected, {guest + 0x100, guest}, lows);
+    ranges = {{0, limit, large.DeviceAddress(), Abi::Read, 0}};
+    count = 1;
+    compare(*stopping, {limit - 1}, {0xffffffffu});
 }
 
 void RunBdaExecutionTests(const Context& context) {

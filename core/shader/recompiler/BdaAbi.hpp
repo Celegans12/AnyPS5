@@ -28,9 +28,8 @@ struct Range {
 };
 
 inline bool RangesOrdered(const Range* ranges, std::size_t count) {
-    for (std::size_t index = 0; index < count; ++index) {
-        if (ranges[index].end < ranges[index].begin) return false;
-        if (index != 0 && ranges[index].begin < ranges[index - 1].end) return false;
+    for (std::size_t index = 1; index < count; ++index) {
+        if (ranges[index].begin < ranges[index - 1].begin) return false;
     }
     return true;
 }
