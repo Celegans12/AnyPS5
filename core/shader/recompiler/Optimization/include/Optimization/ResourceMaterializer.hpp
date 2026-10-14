@@ -63,6 +63,7 @@ public:
     static void PrepareImageModes(ShaderInfo& info);
     static ResolvedImageTables ResolveImageTables(const ShaderInfo& info, const ResourceSnapshot& snapshot, std::uint64_t memoKey = 0);
     static const char* UnnormalizedSampleMismatch(const ImageResource& image);
+    static ResolvedImageTables ResolveImageTables(const ShaderInfo& info, const ResourceSnapshot& snapshot, std::uint64_t memoKey = 0);
     [[nodiscard]] IrResourcePlan ExtractPlan(const IrProgram& program) const;
     void Materialize(const IrResourcePlan& program, const SrtRuntime& runtime, ResourceSnapshot& snapshot, bool allowDirectImageRefusal = false) const;
     static std::uint64_t SpecializationNanoseconds();

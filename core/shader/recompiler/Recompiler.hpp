@@ -3,6 +3,7 @@
 
 #include "RuntimeAbi.hpp"
 #include "PipelineSpecialization.hpp"
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -161,6 +162,7 @@ struct ShaderPixelStageInfo {
     bool stencilRefExportEnable;
     RasterPrimitive rasterPrimitive = RasterPrimitive::Triangle;
     bool layerExported = false;
+    bool ditheredAlphaToCoverage = false;
     std::array<ColorTargetBlend, 8> targetBlend;
 };
 
@@ -481,6 +483,7 @@ public:
 
     [[nodiscard]] const std::vector<std::uint32_t>& Words() const;
     [[nodiscard]] std::shared_ptr<const std::vector<std::uint32_t>> ReadTransient() const;
+    [[nodiscard]] std::vector<std::uint32_t> Copy() const { return *ReadTransient(); }
     [[nodiscard]] bool TryMakeCold() noexcept;
     [[nodiscard]] bool TryUseCacheFile(const std::filesystem::path& path, std::uint64_t spirvOffset,
                                        std::span<const std::byte> verifiedEntry) const noexcept;

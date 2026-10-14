@@ -117,6 +117,8 @@ struct State {
     bool negativeOneToOne;
     bool depthClamp = false;
     bool alphaToCoverage = false;
+    bool ditheredAlphaToCoverage = false;
+    bool perSampleShading = false;
     VkConservativeRasterizationModeEXT conservativeRasterization = VK_CONSERVATIVE_RASTERIZATION_MODE_DISABLED_EXT;
     VkRect2D scissor;
     VkCullModeFlags cullMode;
@@ -125,8 +127,9 @@ struct State {
     VkPipelineColorBlendAttachmentState blend;
     std::array<float, 4> blendConstants;
     std::uint32_t samples = 1;
-    std::array<std::uint8_t, 8> sampleLocations{};
+    std::array<std::uint8_t, 32> sampleLocations{};
     bool customSampleLocations = false;
+    bool sampleLocationGrid = false;
     std::uint32_t paClVsOutCntl = 0;
 };
 
@@ -136,7 +139,8 @@ inline constexpr std::uint32_t PositionExportLayoutBits = 0xffffu | (1u << 21u) 
 
 ShaderStages DecodeShaderStages(const QueueState& queue, bool vertexWorkgroup = false);
 State DecodeState(const QueueState& queue, bool vertexWorkgroup = false);
-std::array<VkSampleLocationEXT, 8> SampleLocations(const State& state);
+std::array<VkSampleLocationEXT, 32> SampleLocations(const State& state);
+VkExtent2D SampleLocationGrid(const State& state);
 std::array<std::uint8_t, 8> ExportMappings(const State& state);
 std::array<ShaderRecompiler::ColorExportPacking, 8> ExportPackings(const State& state);
 ShaderRecompiler::RasterPrimitive RasterPrimitiveOf(const State& state);

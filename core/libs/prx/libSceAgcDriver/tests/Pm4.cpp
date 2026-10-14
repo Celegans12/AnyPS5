@@ -66,7 +66,7 @@ void testCatalog() {
         const auto reason = AgcDriver::Pm4::UnsupportedReason(packet[0]);
         if (!reason.empty()) expectFailure([&] { AgcDriver::Pm4::Validate(packet, 0); }, std::string(reason).c_str());
     }
-    check(values.size() == 55, "reference opcode catalog is incomplete");
+    check(values.size() == 56, "reference opcode catalog is incomplete");
     expectFailure([] { AgcDriver::Pm4::Validate(makePacket(0xff, {0}), 0); }, "not known");
     const std::array<std::pair<std::uint32_t, const char*>, 11> custom{{
         {5, "DRAW_RESET"}, {6, "WAIT_FLIP_DONE"}, {9, "DISPATCH_RESET"}, {11, "PUSH_MARKER"},
@@ -168,6 +168,9 @@ void testRegisterFile() {
 
 void testContextAndBases() {
     AgcDriver::QueueState state;
+    for (const auto offset : {0x10bu, 0x10cu, 0x10du}) execute(state, makePacket(0x69, {offset, 0xffffffffu}));
+    execute(state, makePacket(0x12, {0}));
+    for (const auto offset : {0x10bu, 0x10cu, 0x10du}) check(state.context.at(offset) == 0, "CLEAR_STATE did not restore stencil defaults");
     execute(state, makePacket(0x69, {0x10, 17}));
     execute(state, makePacket(0x76, {0x20c, 2}));
     execute(state, makePacket(0x10, {3, 0}, 0x68));
@@ -352,6 +355,89 @@ void testIndirectDraw() {
     expectFailure([&] { AgcDriver::Pm4::ReadDrawCount(*local.indirect); }, "count address");
 }
 
+bool sameDraw(const AgcDriver::Pm4::DrawParameters& left, const AgcDriver::Pm4::DrawParameters& right) {
+    return left.indexAddress == right.indexAddress && left.indexCount == right.indexCount && left.indexSize == right.indexSize && left.instanceCount == right.instanceCount &&
+        left.flags == right.flags && left.indexed == right.indexed && left.firstVertex == right.firstVertex && left.indirect.has_value() == right.indirect.has_value();
+}
+
+void testIndexAttributesIndirect() {
+    check(AgcDriver::Pm4::Name(0xc0029100u) == "INDEX_ATTRIBUTES_INDIRECT" && AgcDriver::Pm4::UnsupportedReason(0xc0029100u).empty(), "INDEX_ATTRIBUTES_INDIRECT is not executed");
+    check(AgcDriver::Pm4::AccessesMemory(0xc0029100u), "INDEX_ATTRIBUTES_INDIRECT must synchronize guest memory");
+    alignas(4) static std::array<std::uint16_t, 32> indices{};
+    const auto indexAddress = reinterpret_cast<std::uintptr_t>(indices.data()) + 4;
+    alignas(16) static std::array<std::uint32_t, 12> records{};
+    records.fill(0xdeadbeefu);
+    records[4] = static_cast<std::uint32_t>(indexAddress);
+    records[5] = static_cast<std::uint32_t>(indexAddress >> 32u);
+    records[6] = 12;
+    records[7] = 1;
+    const auto packetFor = [](const void* base, std::uint32_t index) { return makePacket(0x91, {low(base), high(base), index}); };
+    const auto packet = packetFor(records.data(), 1);
+    AgcDriver::QueueState loaded;
+    loaded.indexBase = 0x1234;
+    loaded.indexBufferSize = 77;
+    loaded.indexType = 2;
+    execute(loaded, packet);
+    check(loaded.indexBase == indexAddress && loaded.indexBufferSize == 12 && loaded.indexType == 1, "INDEX_ATTRIBUTES_INDIRECT did not load INDEX_BASE, INDEX_BUFFER_SIZE and INDEX_TYPE from its record");
+    AgcDriver::QueueState direct;
+    execute(direct, makePacket(0x26, {static_cast<std::uint32_t>(indexAddress), static_cast<std::uint32_t>(indexAddress >> 32u)}));
+    execute(direct, makePacket(0x13, {12}));
+    execute(direct, makePacket(0x2a, {1}));
+    const auto offsetDraw = makePacket(0x35, {12, 1, 5, 0});
+    const auto fromRecord = AgcDriver::Pm4::ResolveDraw(offsetDraw, loaded);
+    check(sameDraw(fromRecord, AgcDriver::Pm4::ResolveDraw(offsetDraw, direct)) && fromRecord.indexAddress == indexAddress + 4 && fromRecord.indexSize == 4 && fromRecord.indexCount == 5, "an indexed draw after INDEX_ATTRIBUTES_INDIRECT differs from the same draw after the direct packets");
+    execute(loaded, makePacket(0x11, {1, low(records.data()), high(records.data())}));
+    execute(direct, makePacket(0x11, {1, low(records.data()), high(records.data())}));
+    const auto indirectDraw = makePacket(0x25, {0, 0x8c, 0x280, 0});
+    const auto indirectFromRecord = AgcDriver::Pm4::ResolveDraw(indirectDraw, loaded);
+    check(sameDraw(indirectFromRecord, AgcDriver::Pm4::ResolveDraw(indirectDraw, direct)) && indirectFromRecord.indexAddress == indexAddress && indirectFromRecord.indexCount == 12 && indirectFromRecord.indexSize == 4, "an indexed indirect draw after INDEX_ATTRIBUTES_INDIRECT differs from the same draw after the direct packets");
+    records[6] = 0x7fffffffu;
+    execute(loaded, packet);
+    expectFailure([&] { AgcDriver::Pm4::ResolveDraw(indirectDraw, loaded); }, "guest");
+    records[6] = 12;
+
+    static std::size_t flushed = 0;
+    flushed = 0;
+    struct FlushHookReset {
+        ~FlushHookReset() { AgcDriver::GuestMemory::SetFlushHook(nullptr); }
+    } reset;
+    AgcDriver::GuestMemory::SetFlushHook([](std::uint64_t address, std::size_t bytes) {
+        check(address == reinterpret_cast<std::uintptr_t>(records.data() + 4) && bytes == 16, "INDEX_ATTRIBUTES_INDIRECT synchronized an unrelated range");
+        records[6] = 9;
+        ++flushed;
+    });
+    execute(loaded, packet);
+    check(flushed == 1 && loaded.indexBufferSize == 9, "INDEX_ATTRIBUTES_INDIRECT read its record before the GPU work that writes it");
+    AgcDriver::GuestMemory::SetFlushHook(nullptr);
+    records[6] = 12;
+
+    const auto unchanged = [&](const std::vector<std::uint32_t>& rejected, const char* text) {
+        AgcDriver::QueueState state;
+        state.indexBase = 0x40;
+        state.indexBufferSize = 3;
+        state.indexType = 2;
+        expectFailure([&] { execute(state, rejected); }, text);
+        check(state.indexBase == 0x40 && state.indexBufferSize == 3 && state.indexType == 2, "a rejected INDEX_ATTRIBUTES_INDIRECT changed the index state");
+    };
+    unchanged(makePacket(0x91, {low(records.data()) | 1u, high(records.data()), 1}), "indirect mode");
+    unchanged(makePacket(0x91, {low(records.data()) | 4u, high(records.data()), 1}), "16-byte aligned");
+    unchanged(makePacket(0x91, {low(records.data()), high(records.data()), 0x10001u}), "reserved attribute index bits");
+    unchanged(makePacket(0x91, {low(records.data()), high(records.data())}), "packet size");
+    unchanged(packetFor(nullptr, 0), "null or misaligned");
+    unchanged(packetFor(reinterpret_cast<const void*>(0x1000), 0), "guest");
+    unchanged(makePacket(0x91, {0xfffffff0u, 0xffffffffu, 1}), "record address overflow");
+    expectFailure([&] { AgcDriver::Pm4::Validate(packet, 0x20); }, "compute queue");
+    records[7] = 4;
+    unchanged(packet, "has index type 0x4");
+    char named[64];
+    std::snprintf(named, sizeof(named), "record at 0x%llx", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(records.data() + 4)));
+    unchanged(packet, named);
+    records[7] = 3;
+    execute(loaded, packet);
+    expectFailure([&] { AgcDriver::Pm4::ResolveDraw(offsetDraw, loaded); }, "unsupported index type");
+    records[7] = 1;
+}
+
 void testMemory() {
     AgcDriver::QueueState state;
     std::array<std::uint32_t, 4> data{0, 0, 0, 0};
@@ -465,6 +551,21 @@ void testCopies() {
     } catch (...) { VirtualFree(memory, 0, MEM_RELEASE); throw; }
     check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 #endif
+}
+
+void testTraceRegisterWrites() {
+    AgcDriver::QueueState state;
+    const auto repeated = makePacket(0x37, {0x06010000u, 0xc343u, 0u, 0x1234u, 0x5678u});
+    check(!AgcDriver::Pm4::DecodeLabelWrite(repeated), "trace register payload was decoded as a guest memory label");
+    execute(state, repeated);
+    check(state.userConfig.at(0x343u) == 0x5678u, "one-address trace write did not retain the last register value");
+    execute(state, makePacket(0x37, {0x06000000u, 0xc340u, 0u, 1u, 2u, 3u}));
+    check(state.userConfig.at(0x340u) == 1u && state.userConfig.at(0x341u) == 2u && state.userConfig.at(0x342u) == 3u, "sequential trace write did not advance the register address");
+    execute(state, makePacket(0x37, {0x06010000u, 0xc347u, 0u, 4u, 5u}));
+    check(state.userConfig.at(0x347u) == 5u, "one-address trace write crossed the register range");
+    for (const auto& invalid : {makePacket(0x37, {0x06000000u, 0xc347u, 0u, 1u, 2u}), makePacket(0x37, {0x06010000u, 0xc348u, 0u, 1u}), makePacket(0x37, {0x06010000u, 0xc343u, 1u, 1u})}) {
+        expectFailure([&] { execute(state, invalid); }, "register destination outside");
+    }
 }
 
 void testMemoryCopyDecode() {
@@ -836,6 +937,23 @@ void testRegisterListsReadAtSubmission() {
     check(std::atomic_ref<std::uint32_t>(done).load() == 1, "register list rewritten after submission was read by the worker");
 }
 
+void testIndexAttributesReadAtExecution() {
+    alignas(8) static std::uint32_t gate = 0;
+    static std::uint32_t done = 0;
+    alignas(16) static std::array<std::uint32_t, 4> record{0, 0, 0, 4};
+    gate = 0;
+    done = 0;
+    auto words = joinPackets({
+        makePacket(0x3c, {0x13, low(&gate), high(&gate), 1, 0xffffffffu, 0x19}),
+        makePacket(0x91, {low(record.data()), high(record.data()), 0}),
+        writeWord(done, 1)});
+    submitWords(words);
+    record = {0x1000, 0, 6, 0};
+    std::atomic_ref<std::uint32_t>(gate).store(1);
+    AgcDriverWaitIdle_nid_postfix();
+    check(std::atomic_ref<std::uint32_t>(done).load() == 1, "INDEX_ATTRIBUTES_INDIRECT did not read its record when the packet ran");
+}
+
 void testSuspendPointWritesQueuedLabels() {
     alignas(8) static std::uint32_t gate = 0, marker = 0;
     gate = 0;
@@ -1136,7 +1254,9 @@ int main(int argc, char** argv) {
         testIndexedDraw();
         testAutoDraw();
         testIndirectDraw();
+        testIndexAttributesIndirect();
         testMemory();
+        testTraceRegisterWrites();
         testCopies();
         testMemoryCopyDecode();
         testMemorySynchronization();
@@ -1150,6 +1270,7 @@ int main(int argc, char** argv) {
         testUnwrittenUserData();
         testDriverSubmission();
         testRegisterListsReadAtSubmission();
+        testIndexAttributesReadAtExecution();
         testPredicatedSubmission();
         testConditionalSubmission();
         testSuspendPointWritesQueuedLabels();

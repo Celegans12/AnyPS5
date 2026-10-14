@@ -207,6 +207,7 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
     }
 
     const auto lastError = reserve(4);
+    const auto unresolvedCount = reserve(4);
     const auto errorDigits = reserve(11);
     const auto errorMessage = reserve(ErrorMessageCapacity);
     const auto loading = addString("Loading PRX: ");
@@ -215,6 +216,7 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
     const auto failedModule = addString("Failed to load module: ");
     const auto skippedModule = addString(" -> not found; nothing is imported from it, continuing without it\n");
     const auto errorPrefix = addString("GetLastError: ");
+    const auto moduleNotFoundHint = addString("hint: the module or one of its dependent DLLs was not found; a self-built libs/ also needs libgcc_s_seh-1.dll, libstdc++-6.dll and libwinpthread-1.dll from the toolchain's mingw64/bin next to it\n");
     const auto messageSeparator = addString(" - ");
     const auto newline = addString("\n");
     const auto searched = addString("Searched libraries:\n");
@@ -486,6 +488,11 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
         writeString(resolvedPaths[index], true);
         writeString(newline, true);
         writeLastError();
+        code.Rip({0x8b, 0x05}, lastError);
+        code.Emit({0x83, 0xf8, 0x7e});
+        const auto notModuleNotFound = code.Branch({0x0f, 0x85});
+        writeString(moduleNotFoundHint, true);
+        code.PatchBranch(notModuleNotFound, code.GetRva());
         if (dependencyDiagnostics) {
             code.Rip({0x48, 0x8d, 0x0d}, resolvedPaths[index]);
             code.Rip({0x48, 0x8d, 0x15}, programText);
@@ -522,6 +529,7 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
     };
 
     std::vector<std::size_t> unresolvedBranches;
+    bool anyUnresolvable = false;
     std::vector<std::size_t> lazyUnresolvedImports;
     std::vector<std::size_t> tlsResolverAddresses;
     for (std::size_t index = 0; index < imports.size(); ++index) {
@@ -573,7 +581,8 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
         }
         captureLastError();
         writeString(errorRvas.at(3 + index), true);
-        unresolvedBranches.push_back(code.Branch({0xe9}));
+        code.Rip({0xff, 0x05}, unresolvedCount);
+        const auto nextImport = code.Branch({0xe9});
         code.PatchBranch(resolved, code.GetRva());
         if (imports[index].RelocationType == 16) code.Emit({0x48, 0x8b, 0x00});
         if (imports[index].RelocationType == 17) code.Emit({0x48, 0x8b, 0x40, 8});
@@ -584,8 +593,15 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
         }
         trace(imports[index], symbolNames[index]);
         guestStartup.WriteImport(code, imports[index], handles);
+        code.PatchBranch(nextImport, code.GetRva());
+        anyUnresolvable = true;
     }
 
+    if (anyUnresolvable) {
+        code.Rip({0x8b, 0x05}, unresolvedCount);
+        code.Emit({0x85, 0xc0});
+        unresolvedBranches.push_back(code.Branch({0x0f, 0x85}));
+    }
     guestStartup.Initialize(code, guestModules, handles);
     writeString(enteringElf);
     code.Rip({0x48, 0x8d, 0x0d}, shellLibrary);

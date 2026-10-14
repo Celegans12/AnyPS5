@@ -15,6 +15,11 @@ namespace Nid {
 namespace {
 
 
+void RequireElfRange(const std::vector<std::uint8_t>& elf, std::uint64_t offset, std::uint64_t size, const char* table) {
+    if (offset > elf.size() || size > elf.size() - offset)
+        throw std::runtime_error(std::string("invalid ELF ") + table + " range");
+}
+
 std::uint32_t GnuHash(const std::string& name) {
     std::uint32_t h = 5381u;
     for (const unsigned char c : name)
@@ -317,6 +322,9 @@ void ElfNidPatcher::PatchNids(std::vector<std::uint8_t>& elf, const std::string&
     if (elf[4] != 2) throw std::runtime_error("not ELF64");
 
     const auto ehdr = Read<Elf64_Ehdr>(elf, 0u);
+    if (ehdr.e_ident[5] != 1 || ehdr.e_shentsize != sizeof(Elf64_Shdr))
+        throw std::runtime_error("unsupported ELF byte order or section header size");
+    RequireElfRange(elf, ehdr.e_shoff, std::uint64_t{ehdr.e_shnum} * sizeof(Elf64_Shdr), "section table");
 
     std::size_t dynSymOffset = 0u, dynSymSize = 0u;
     std::size_t gnuHashOffset = 0u, gnuHashSize = 0u;
@@ -327,6 +335,9 @@ void ElfNidPatcher::PatchNids(std::vector<std::uint8_t>& elf, const std::string&
         const std::size_t shOffset = static_cast<std::size_t>(ehdr.e_shoff) + i * sizeof(Elf64_Shdr);
         const auto shdr = Read<Elf64_Shdr>(elf, shOffset);
         if (shdr.sh_type == kShtDynsym) {
+            if (shdr.sh_entsize != sizeof(Elf64_Sym) || shdr.sh_size % sizeof(Elf64_Sym) || shdr.sh_link >= ehdr.e_shnum)
+                throw std::runtime_error("invalid ELF dynsym layout");
+            RequireElfRange(elf, shdr.sh_offset, shdr.sh_size, "dynsym");
             dynSymOffset = static_cast<std::size_t>(shdr.sh_offset);
             dynSymSize = static_cast<std::size_t>(shdr.sh_size);
             dynSymSectionIndex = i;
@@ -363,6 +374,8 @@ void ElfNidPatcher::PatchNids(std::vector<std::uint8_t>& elf, const std::string&
     {
         const std::size_t shOffset = static_cast<std::size_t>(ehdr.e_shoff) + dynStrSectionLink * sizeof(Elf64_Shdr);
         const auto shdr = Read<Elf64_Shdr>(elf, shOffset);
+        if (shdr.sh_type != 3) throw std::runtime_error("invalid ELF dynstr section type");
+        RequireElfRange(elf, shdr.sh_offset, shdr.sh_size, "dynstr");
         dynStrOffset = static_cast<std::size_t>(shdr.sh_offset);
         dynStrSize = static_cast<std::size_t>(shdr.sh_size);
     }

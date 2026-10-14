@@ -333,15 +333,16 @@ void BdaResources::markWrittenPages() const {
     Require(words[Abi::WrittenOverflowWord] == 0, "more than " + std::to_string(Abi::WrittenPageSlots) + " chunks of " + std::to_string(Abi::WrittenChunkPages) + " pages stored to through the BDA table in one use are not implemented");
     const auto count = words[Abi::WrittenCountWord];
     if (count == 0) return;
-    Require(Abi::ForEachWrittenRange(words, [this](std::uint64_t address, std::size_t bytes) {
+    Require(Abi::ForEachWrittenRange(words, [&](std::uint64_t begin, std::size_t bytes) {
+        const auto end = begin + bytes;
         for (const auto& [base, size] : imageTableRanges) {
-            if (size != 0 && address < base + size && base < address + bytes) {
+            if (size != 0 && begin < base + size && base < end) {
                 std::ostringstream message;
                 message << "image table at 0x" << std::hex << base << " is written by its own dispatch";
                 Require(false, message.str());
             }
         }
-        GuestMemory::MarkWritten(address, bytes);
+        GuestMemory::MarkWritten(begin, bytes);
     }), "invalid BDA written-page record");
     for (std::uint32_t claim = 0; claim < count; ++claim) {
         const auto slot = words[Abi::WrittenListWord + claim];

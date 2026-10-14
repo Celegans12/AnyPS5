@@ -4,11 +4,15 @@
 #ifndef VK_NO_PROTOTYPES
 #define VK_NO_PROTOTYPES
 #endif
+#include <mutex>
 #include <vulkan/vulkan.h>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <functional>
 #include <memory>
+#include <mutex>
+#include <shared_mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -27,12 +31,42 @@ class DescriptorCache;
 class SamplerCache;
 class ShaderResources;
 class PlaceholderImages;
+class VertexInputCache;
+
+class PipelineCacheSynchronization {
+public:
+    using PipelineUseLock = std::shared_lock<std::shared_mutex>;
+    using SnapshotLock = std::unique_lock<std::shared_mutex>;
+
+    PipelineUseLock LockForPipelineUse() const { return PipelineUseLock(mutex); }
+    SnapshotLock LockForSnapshot() const { return SnapshotLock(mutex); }
+    SnapshotLock TryLockForSnapshot() const { return SnapshotLock(mutex, std::try_to_lock); }
+
+private:
+    mutable std::shared_mutex mutex;
+};
 
 inline void Require(bool condition, const std::string& reason) {
     if (!condition) throw std::runtime_error("AGC graphics: " + reason);
 }
 
+inline std::function<void()>& DeviceLostHook() {
+    static std::function<void()> hook;
+    return hook;
+}
+
+inline const void*& DeviceLostOwner() {
+    static const void* owner = nullptr;
+    return owner;
+}
+
+inline void ReportDeviceLost() {
+    static std::atomic<bool> reported{false};
+    if (DeviceLostHook() && !reported.exchange(true)) DeviceLostHook()();
+}
+
 inline void Check(VkResult result, const char* operation) {
+    if (result == VK_ERROR_DEVICE_LOST) ReportDeviceLost();
     if (result != VK_SUCCESS) throw std::runtime_error(std::string("AGC graphics: ") + operation + ": Vulkan result " + std::to_string(result));
 }
 
@@ -127,6 +161,11 @@ struct Context {
     // Nonzero when VK_EXT_external_memory_host is enabled: the required host pointer alignment.
     VkDeviceSize hostImportAlignment = 0;
     bool dmaBufImport = false;
+    bool sparseBinding = false;
+    std::uint32_t queueFamily = 0;
+    std::uint32_t sparseFamily = VK_QUEUE_FAMILY_IGNORED;
+    VkQueue sparseQueue = VK_NULL_HANDLE;
+    std::mutex* sparseQueueMutex = nullptr;
     PFN_vkGetPhysicalDeviceMemoryProperties2 memoryProperties2 = nullptr;
     bool integratedGpu = false;
     RenderCache* renderCache = nullptr;
@@ -186,6 +225,13 @@ struct Context {
     bool provokingVertexModePerPipeline = false;
     bool singlePassStorage = false;
     VkSampleCountFlags sampleLocationSampleCounts = 0;
+    VkSampleCountFlags sampleLocationGridSampleCounts = 0;
+    PipelineCacheSynchronization* pipelineCacheSynchronization = nullptr;
+
+    PipelineCacheSynchronization::PipelineUseLock LockPipelineCacheForUse() const {
+        return pipelineCacheSynchronization != nullptr ? pipelineCacheSynchronization->LockForPipelineUse() : PipelineCacheSynchronization::PipelineUseLock{};
+    }
+    VertexInputCache* vertexInputs = nullptr;
 
     template<typename TFunction>
     TFunction Function(const char* name) const {
@@ -208,6 +254,33 @@ struct Context {
             if ((mask & (1u << i)) != 0 && (memory.memoryTypes[i].propertyFlags & flags) == flags) return i;
         }
         throw std::runtime_error("AGC graphics: required Vulkan memory type is unavailable");
+    }
+
+    std::uint32_t BufferMemoryType(std::uint32_t mask, VkMemoryPropertyFlags flags, VkDeviceSize bytes) const {
+        constexpr VkMemoryPropertyFlags coherent = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        auto type = MemoryType(mask, flags);
+        if (flags == coherent) {
+            for (std::uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
+                if ((mask & (1u << i)) != 0 && (memory.memoryTypes[i].propertyFlags & (coherent | VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) == (coherent | VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) {
+                    type = i;
+                    break;
+                }
+            }
+        }
+        if ((flags & coherent) != coherent || memoryProperties2 == nullptr || physical == VK_NULL_HANDLE) return type;
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT reported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+        VkPhysicalDeviceMemoryProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &reported};
+        memoryProperties2(physical, &properties);
+        const auto heap = memory.memoryTypes[type].heapIndex;
+        const auto fits = [&](std::uint32_t candidate) {
+            return reported.heapBudget[candidate] != 0 && reported.heapUsage[candidate] < reported.heapBudget[candidate] && bytes <= reported.heapBudget[candidate] - reported.heapUsage[candidate];
+        };
+        if (reported.heapBudget[heap] == 0 || fits(heap)) return type;
+        for (std::uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
+            const auto& candidate = memory.memoryTypes[i];
+            if ((mask & (1u << i)) != 0 && (candidate.propertyFlags & flags) == flags && candidate.heapIndex != heap && fits(candidate.heapIndex)) return i;
+        }
+        return type;
     }
 
     std::uint32_t DeviceMemoryType(std::uint32_t mask, VkDeviceSize bytes, const char* what) const {

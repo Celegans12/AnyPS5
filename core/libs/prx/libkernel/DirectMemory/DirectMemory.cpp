@@ -302,6 +302,7 @@ public:
 
     ~PhysicalBacking() {
 #ifdef _WIN32
+        GuestArena::GuestArenaForgetSection_nid_postfix(section);
         CloseHandle(section);
 #else
         if (hostWriteView != nullptr) ::munmap(hostWriteView, bytes);
@@ -313,7 +314,7 @@ public:
 
     void Map(std::uintptr_t address, std::size_t bytes, std::uint64_t offset, int protection) const {
 #ifdef _WIN32
-        GuestArena::GuestArenaMap_nid_postfix(reinterpret_cast<void*>(address), bytes, section, offset, WinProtFromPosix(protection));
+        GuestArena::GuestArenaMapDirect_nid_postfix(reinterpret_cast<void*>(address), bytes, section, offset, WinProtFromPosix(protection));
 #else
         if (::mmap(reinterpret_cast<void*>(address), bytes, protection, MAP_SHARED | MAP_FIXED, file, static_cast<off_t>(fileOffset + offset)) == MAP_FAILED) throw std::system_error(errno, std::generic_category(), "map direct memory backing");
 #endif
@@ -552,11 +553,44 @@ void AddMapping(std::uintptr_t address, std::size_t len, std::uint64_t phys, int
 #endif
 }
 
+void RequireResidentUnpinned(GuestAllocations::Mutation& mutation, std::uintptr_t address, std::size_t len) {
+#ifdef _WIN32
+    std::uintptr_t start = 0;
+    std::uintptr_t end = 0;
+    if (GuestArena::GuestArenaResidentSpan_nid_postfix(address, len, &start, &end)) mutation.RequireUnpinned(reinterpret_cast<const void*>(start), end - start);
+#else
+    static_cast<void>(mutation);
+    static_cast<void>(address);
+    static_cast<void>(len);
+#endif
+}
+
+void RequireAliasesUnpinned(GuestAllocations::Mutation& mutation, std::uint64_t phys, std::size_t len) {
+#ifdef _WIN32
+    std::vector<std::pair<std::uintptr_t, std::size_t>> aliases;
+    {
+        std::lock_guard lock(g_directLock);
+        for (const auto& [base, mapping] : g_directMappings) {
+            const auto first = std::max(phys, mapping.phys);
+            const auto last = std::min(phys + len, mapping.phys + (mapping.end - base));
+            if (first < last) aliases.emplace_back(base + (first - mapping.phys), last - first);
+        }
+    }
+    for (const auto& [address, bytes] : aliases) RequireResidentUnpinned(mutation, address, bytes);
+#else
+    static_cast<void>(mutation);
+    static_cast<void>(phys);
+    static_cast<void>(len);
+#endif
+}
+
 bool RemapFixedIntoRegistered(GuestAllocations::Mutation& mutation, void* addr, size_t len, int prot, int flags, int64_t physStart = -1) {
     constexpr int GuestMapFixed = 0x10;
     constexpr int GuestMapNoOverwrite = 0x80;
     if (addr == nullptr || (flags & GuestMapFixed) == 0 || (flags & GuestMapNoOverwrite) != 0 || !mutation.Covers(addr, len)) return false;
     ValidateRange(addr, len, PS5_PAGE_SIZE);
+    RequireResidentUnpinned(mutation, reinterpret_cast<std::uintptr_t>(addr), len);
+    if (physStart >= 0) RequireAliasesUnpinned(mutation, static_cast<std::uint64_t>(physStart), len);
     Trace("remap fixed %p+0x%zx prot=0x%x phys=0x%llx", addr, len, prot, static_cast<long long>(physStart));
     const auto nativeProtection = LinuxProtFromSce(prot);
     mutation.Protect(addr, len, (prot & 3) != 0, (prot & 2) != 0, (prot & GuestProtGpuReadWrite) != 0, [&] {
@@ -798,6 +832,7 @@ bool Reserved(const void* addr, size_t len) {
 }
 
 void UnmapRegistered(GuestAllocations::Mutation& mutation, void* addr, size_t len) {
+    RequireResidentUnpinned(mutation, reinterpret_cast<std::uintptr_t>(addr), len);
     mutation.Unmap(addr, len, [&](const void* piece, std::size_t pieceBytes, const void* allocation, bool last) {
         auto* pieceAddress = const_cast<void*>(piece);
         std::lock_guard lock(g_directLock);
@@ -847,6 +882,7 @@ int DoMapDirect(void** addr, size_t len, int prot, int flags, int64_t physStart,
         return 0;
     }
     ReplaceFixedOverlap(mutation, *addr, len, flags);
+    RequireAliasesUnpinned(mutation, static_cast<std::uint64_t>(physStart), len);
     std::lock_guard lock(g_directLock);
     ValidatePhysicalRange(static_cast<std::uint64_t>(physStart), len);
     void* mapped = MapAligned(*addr, len, PROT_NONE, flags, alignment);
@@ -866,10 +902,11 @@ int DoMapDirect(void** addr, size_t len, int prot, int flags, int64_t physStart,
     return 0;
 }
 
-int DoMapAnon(void** addr, size_t len, int prot, int flags, size_t alignment) {
+int DoMapAnon(void** addr, size_t len, int prot, int flags, size_t alignment, bool exclusive) {
     ValidateOutput(addr);
     if (len == 0 || (len & (PS5_PAGE_SIZE - 1)) != 0) return SCE_KERNEL_ERROR_EINVAL;
     GuestAllocations::Mutation mutation;
+    if (exclusive && mutation.Overlaps(*addr, len)) return SCE_KERNEL_ERROR_ENOMEM;
     flags = PlaceHintInReservation(*addr, len, flags);
     if (FixedNoOverwriteConflict(mutation, *addr, len, flags)) return SCE_KERNEL_ERROR_ENOMEM;
     if (RemapFixedIntoRegistered(mutation, *addr, len, prot, flags)) {
@@ -957,19 +994,17 @@ int DoMapShared(void** addr, size_t len, int prot, HostSharedMemory object) {
 
 #ifdef _WIN32
 static bool IsGuestModuleImage(const void* base) {
-    std::wstring path(MAX_PATH, L'\0');
-    for (;;) {
-        const auto length = GetModuleFileNameW(static_cast<HMODULE>(const_cast<void*>(base)), path.data(), static_cast<DWORD>(path.size()));
-        if (length == 0) return false;
-        if (length < path.size()) {
-            path.resize(length);
-            break;
-        }
-        path.resize(path.size() * 2);
+    const auto address = reinterpret_cast<std::uintptr_t>(base);
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(address);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0) return false;
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(address + static_cast<std::uintptr_t>(dos->e_lfanew));
+    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return false;
+    const auto* sections = IMAGE_FIRST_SECTION(nt);
+    const auto sectionCount = nt->FileHeader.NumberOfSections;
+    for (unsigned i = 0; i < sectionCount; ++i) {
+        if (std::strncmp(reinterpret_cast<const char*>(sections[i].Name), ".elf0", IMAGE_SIZEOF_SHORT_NAME) == 0) return true;
     }
-    constexpr std::wstring_view suffix = L".guest.prx";
-    if (path.size() < suffix.size()) return false;
-    return std::equal(suffix.begin(), suffix.end(), path.end() - static_cast<std::ptrdiff_t>(suffix.size()), [](wchar_t expected, wchar_t actual) { return std::towlower(actual) == expected; });
+    return false;
 }
 #endif
 
@@ -1132,6 +1167,20 @@ bool GuestProtection(uintptr_t addr, int* prot) {
     if (addr >= containing->second.end) return false;
     *prot = containing->second.prot;
     return true;
+}
+
+void GuestPageTableUsage(std::uint64_t granularity, std::uint64_t* cpuEntries, std::uint64_t* gpuEntries) {
+    std::uint64_t cpu = 0;
+    std::uint64_t gpu = 0;
+    std::lock_guard lock(g_protectionLock);
+    for (const auto& [start, range] : g_protections) {
+        if (range.end <= start) continue;
+        const auto entries = (range.end - 1) / granularity - start / granularity + 1;
+        if (range.prot & 0x7) cpu += entries;
+        if (range.prot & GuestProtGpuReadWrite) gpu += entries;
+    }
+    *cpuEntries = cpu;
+    *gpuEntries = gpu;
 }
 
 bool QueryDirectMapping(std::uintptr_t address, std::uintptr_t* start, std::uintptr_t* end, std::uint64_t* offset, int* memoryType) {

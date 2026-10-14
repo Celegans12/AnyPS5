@@ -69,8 +69,8 @@ struct ResourceSnapshot {
     std::vector<std::uint32_t> userData;
     UniformFill uniformFill;
     std::vector<SrtReadPoison> srtPoison;
-    ImageTableSnapshot tables;
     std::uint32_t nullRootReads = 0;
+    ImageTableSnapshot tables;
 };
 
 struct UniformFillPlan {

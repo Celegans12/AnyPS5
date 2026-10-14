@@ -9,6 +9,8 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <tuple>
+#include <vector>
 
 namespace {
 
@@ -35,10 +37,13 @@ THandle newHandle() {
 }
 
 VkFormat lastImageFormat = VK_FORMAT_UNDEFINED;
+std::vector<VkImage> createdImages;
+std::vector<std::tuple<VkImage, VkImage, VkImageAspectFlags>> imageCopies;
 
 VKAPI_ATTR VkResult VKAPI_CALL createImage(VkDevice, const VkImageCreateInfo* info, const VkAllocationCallbacks*, VkImage* image) {
     lastImageFormat = info->format;
     *image = newHandle<VkImage>();
+    createdImages.push_back(*image);
     return VK_SUCCESS;
 }
 
@@ -97,6 +102,9 @@ VKAPI_ATTR void VKAPI_CALL destroyImage(VkDevice, VkImage, const VkAllocationCal
 VKAPI_ATTR void VKAPI_CALL freeMemory(VkDevice, VkDeviceMemory, const VkAllocationCallbacks*) {}
 VKAPI_ATTR void VKAPI_CALL cmdPipelineBarrier(VkCommandBuffer, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags, std::uint32_t, const VkMemoryBarrier*, std::uint32_t, const VkBufferMemoryBarrier*, std::uint32_t, const VkImageMemoryBarrier*) {}
 VKAPI_ATTR void VKAPI_CALL cmdClearDepthStencilImage(VkCommandBuffer, VkImage, VkImageLayout, const VkClearDepthStencilValue*, std::uint32_t, const VkImageSubresourceRange*) {}
+VKAPI_ATTR void VKAPI_CALL cmdCopyImage(VkCommandBuffer, VkImage source, VkImageLayout, VkImage destination, VkImageLayout, std::uint32_t count, const VkImageCopy* regions) {
+    for (std::uint32_t i = 0; i < count; ++i) imageCopies.emplace_back(source, destination, regions[i].dstSubresource.aspectMask);
+}
 
 VKAPI_ATTR void VKAPI_CALL formatProperties(VkPhysicalDevice, VkFormat, VkFormatProperties* properties) {
     *properties = {};
@@ -133,7 +141,8 @@ PFN_vkVoidFunction VKAPI_CALL deviceProc(VkDevice, const char* name) {
         {"vkDestroyImage", reinterpret_cast<PFN_vkVoidFunction>(destroyImage)},
         {"vkFreeMemory", reinterpret_cast<PFN_vkVoidFunction>(freeMemory)},
         {"vkCmdPipelineBarrier", reinterpret_cast<PFN_vkVoidFunction>(cmdPipelineBarrier)},
-        {"vkCmdClearDepthStencilImage", reinterpret_cast<PFN_vkVoidFunction>(cmdClearDepthStencilImage)}
+        {"vkCmdClearDepthStencilImage", reinterpret_cast<PFN_vkVoidFunction>(cmdClearDepthStencilImage)},
+        {"vkCmdCopyImage", reinterpret_cast<PFN_vkVoidFunction>(cmdCopyImage)}
     };
     const auto it = table.find(name);
     return it == table.end() ? nullptr : it->second;
@@ -275,6 +284,29 @@ void RunDepthSurfaceReuseTests() {
     Require(storageAliasesDepth(context, {depth16, FormatR16Unorm, 128, 128}), "the newest depth extent must still reject actual storage access");
     Require(storageAliasesDepth(context, {stencil16, FormatR8Uint, 128, 128}), "storage access to the actual stencil plane must remain rejected");
     Require(!storageAliasesDepth(context, {stencil16, FormatR11G11B10Float, 128, 128}), "a stencil address reused for color is not a stencil storage alias");
+
+    constexpr std::uint64_t shared = 0x70000000;
+    constexpr std::uint64_t stencilA = 0x71000000;
+    constexpr std::uint64_t stencilB = 0x72000000;
+    constexpr std::uint64_t otherDepth = 0x73000000;
+    const auto pairing = [&](std::uint64_t depth, std::uint64_t stencil) {
+        const auto before = createdImages.size();
+        DepthSurfaceView(context, {depth, stencil, {256, 256}, VK_FORMAT_D32_SFLOAT_S8_UINT, 1.0f, 0});
+        return createdImages.size() != before ? createdImages[before] : VK_NULL_HANDLE;
+    };
+    const auto withA = pairing(shared, stencilA);
+    imageCopies.clear();
+    const auto withB = pairing(shared, stencilB);
+    Require(withA != VK_NULL_HANDLE && withB != VK_NULL_HANDLE && withA != withB, "each depth/stencil pairing must have its own image");
+    Require(imageCopies.size() == 1 && imageCopies[0] == std::make_tuple(withA, withB, static_cast<VkImageAspectFlags>(VK_IMAGE_ASPECT_DEPTH_BIT)), "a depth plane paired with another stencil plane must carry its depth over");
+    imageCopies.clear();
+    pairing(shared, stencilB);
+    Require(imageCopies.empty(), "drawing again with the same pairing must not copy");
+    pairing(shared, stencilA);
+    Require(imageCopies.size() == 1 && imageCopies[0] == std::make_tuple(withB, withA, static_cast<VkImageAspectFlags>(VK_IMAGE_ASPECT_DEPTH_BIT)), "returning to the first pairing must carry the depth written through the second");
+    imageCopies.clear();
+    const auto otherWithA = pairing(otherDepth, stencilA);
+    Require(imageCopies.size() == 1 && imageCopies[0] == std::make_tuple(withA, otherWithA, static_cast<VkImageAspectFlags>(VK_IMAGE_ASPECT_STENCIL_BIT)), "a stencil plane paired with another depth plane must carry its stencil over");
 
     ClearDepthSurfaces(context.device);
 }

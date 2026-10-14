@@ -38,6 +38,7 @@ struct MockDevice {
     std::uint64_t destroyedBuffers = 0;
     VkDeviceSize liveBytes = 0;
     std::map<VkDeviceMemory, VkDeviceSize> memoryBytes;
+    std::map<VkDeviceMemory, std::uint32_t> memoryTypes;
     std::map<VkBuffer, std::pair<VkDeviceMemory, VkDeviceSize>> bound;
     std::set<VkBuffer> liveBuffers;
     std::deque<VkResult> results;
@@ -80,6 +81,7 @@ VKAPI_ATTR VkResult VKAPI_CALL mockAllocateMemory(VkDevice, const VkMemoryAlloca
     *memory = reinterpret_cast<VkDeviceMemory>(static_cast<std::uintptr_t>(mock.next++));
     if (info->memoryTypeIndex == 1) mock.hostMemory[*memory].resize(info->allocationSize);
     mock.memoryBytes[*memory] = info->allocationSize;
+    mock.memoryTypes[*memory] = info->memoryTypeIndex;
     mock.liveBytes += info->allocationSize;
     ++mock.allocations;
     return VK_SUCCESS;
@@ -240,6 +242,38 @@ void VramIntegratedKeepsPool() {
     auto context = budgetContext(true);
     releaseFour(context);
     Expect(mock.budgetQueries == 0 && mock.frees == 0 && mock.liveBytes == 256 * MiB, "an integrated GPU's pool followed the device-local heap's budget");
+}
+
+void HostPlacement() {
+    mock = MockDevice{};
+    auto context = mockContext();
+    context.physical = reinterpret_cast<VkPhysicalDevice>(std::uintptr_t{1});
+    context.memoryProperties2 = mockMemoryProperties2;
+    context.memory.memoryHeapCount = 2;
+    context.memory.memoryHeaps[0] = {2048 * MiB, VK_MEMORY_HEAP_DEVICE_LOCAL_BIT};
+    context.memory.memoryHeaps[1] = {16384 * MiB, 0};
+    context.memory.memoryTypes[0].heapIndex = 0;
+    context.memory.memoryTypes[1].heapIndex = 1;
+    constexpr auto usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    mock.heapBudget = 1620 * MiB;
+    mock.otherUsage = 1600 * MiB;
+    VkDeviceMemory placed = VK_NULL_HANDLE;
+    {
+        DeviceBuffer large(context, 176 * MiB, usage);
+        placed = MemoryOf(large.Handle());
+        Expect(mock.memoryTypes.at(placed) == 1, "a device buffer over the device-local budget was not placed in the host memory type");
+    }
+    Expect(!mock.memoryBytes.contains(placed) && mock.liveBuffers.empty(), "a device buffer placed in host memory was kept in the device pool after its release");
+    mock.otherUsage = 200 * MiB;
+    VkDeviceMemory device = VK_NULL_HANDLE;
+    {
+        DeviceBuffer large(context, 176 * MiB, usage);
+        device = MemoryOf(large.Handle());
+        Expect(mock.memoryTypes.at(device) == 0, "a device buffer within the device-local budget was not placed in device-local memory");
+    }
+    Expect(mock.memoryBytes.contains(device), "a device-local buffer was not kept in the device pool after its release");
+    DeviceBuffer again(context, 176 * MiB, usage);
+    Expect(MemoryOf(again.Handle()) == device, "a retained device-local buffer was not reused");
 }
 
 void SizeClassesAndDirections() {
@@ -659,6 +693,7 @@ int main() {
         VramOverTargetReleases();
         VramTrimsPool();
         VramIntegratedKeepsPool();
+        HostPlacement();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;

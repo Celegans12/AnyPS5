@@ -3,6 +3,7 @@
 #include <relinker/domain/Types.hpp>
 #include <algorithm>
 #include <cstring>
+#include <utility>
 
 namespace Relinker {
 
@@ -23,6 +24,10 @@ ElfReader::ElfReader(std::vector<std::uint8_t> fileBuffer)
 
 const std::vector<std::uint8_t>& ElfReader::GetRawBytes() const {
     return _fileBuffer;
+}
+
+std::vector<std::uint8_t> ElfReader::TakeBytes() {
+    return std::move(_fileBuffer);
 }
 
 std::string ElfReader::formatMagic() const {
@@ -129,6 +134,9 @@ std::vector<ProgramHeader> ElfReader::ReadProgramHeaders() const {
         ph.FileSize = _readU64At(offset + 0x20);
         ph.MemorySize = _readU64At(offset + 0x28);
         ph.Alignment = _readU64At(offset + 0x30);
+
+        if (ph.Type == PT_LOAD && ph.FileSize > ph.MemorySize)
+            throw RelinkerException("PT_LOAD file size exceeds memory size", ph.Offset);
 
         headers.push_back(ph);
         offset += header.ProgramHeaderEntrySize;

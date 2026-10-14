@@ -1,4 +1,5 @@
 #include "Translation/TranslationContext.hpp"
+#include "RdnaDecoder/RdnaInstructionDecoder.hpp"
 #include <array>
 #include <bit>
 #include <cstdint>
@@ -19,6 +20,10 @@ std::array<IrU32, 2> TranslationContext::readU32Pair(const RdnaOperand& operand)
             const auto bits = std::bit_cast<std::uint64_t>(static_cast<double>(std::bit_cast<float>(operand.value)));
             return {IrU32(ir.Constant(static_cast<std::uint32_t>(bits))), IrU32(ir.Constant(static_cast<std::uint32_t>(bits >> 32u)))};
         }
+        case RdnaOperandKind::SrcSharedBase:
+        case RdnaOperandKind::SrcSharedLimit:
+        case RdnaOperandKind::SrcPrivateBase:
+        case RdnaOperandKind::SrcPrivateLimit: return {readU32(operand), IrU32(ir.Constant(static_cast<std::uint32_t>(RdnaApertureSourceValue(operand) >> 32u)))};
         default: return {readU32(operand), readU32(offsetOperand(operand, 1u))};
     }
 }

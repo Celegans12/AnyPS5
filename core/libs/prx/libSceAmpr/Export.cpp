@@ -898,15 +898,9 @@ int APS5_VABI sceAmprAmmWaitCommandBufferCompletion(std::uint32_t id) {
     return AmmSubmitted_nid_no_patch(id) ? 0 : SCE_KERNEL_ERROR_ESRCH;
 }
 
-int APS5_VABI _ZNSt8ios_base7_AddstdEPS__nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
 [[noreturn]] void APS5_VABI _ZSt16_Throw_Cpp_errori_nid_postfix(int code) {
     ThrowCppError_nid_no_patch(code);
 }
-
 int APS5_VABI _Thrd_join_nid_postfix(Pthread thread, int* code) {
     void* result = nullptr;
     if (pthread_join_nid_postfix(thread, &result) != 0) return ThrdError;
@@ -957,14 +951,9 @@ void APS5_VABI _ZNSt4_Pad7_LaunchEPP7pthread_nid_postfix(GuestPad* pad, Pthread*
     if (created != 0) ThrowCppError_nid_no_patch(CppResourceUnavailableTryAgain);
     while (!pad->started) RequireThrd(_Cnd_wait_nid_postfix(&pad->condition, &pad->mutex), "_Pad::_Launch: _Cnd_wait");
 }
-
 int APS5_VABI _ZNSt7num_getIcSt19istreambuf_iteratorIcSt11char_traitsIcEEE2idE_nid_postfix(void) {
     NotImplemented_nid_no_patch(__func__);
     return 0;
-}
-
-int APS5_VABI _Cnd_signal_nid_postfix(void** handle) {
-    return SignalCondition_nid_no_patch(handle);
 }
 
 void APS5_VABI _Unlock_shared_ptr_spin_lock_nid_postfix(void) {
@@ -973,11 +962,6 @@ void APS5_VABI _Unlock_shared_ptr_spin_lock_nid_postfix(void) {
 
 int APS5_VABI _Cnd_init_with_name_nid_postfix(void** handle, const char*) {
     return _Cnd_init_nid_postfix(handle);
-}
-
-int APS5_VABI _ZTVN10__cxxabiv120__function_type_infoE_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
 }
 
 int APS5_VABI _ZTVSt7num_getIcSt19istreambuf_iteratorIcSt11char_traitsIcEEE_nid_postfix(void) {
@@ -991,11 +975,6 @@ int APS5_VABI _ZNKSt8time_getIcSt19istreambuf_iteratorIcSt11char_traitsIcEEE3get
 }
 
 int APS5_VABI _ZNSt8time_getIcSt19istreambuf_iteratorIcSt11char_traitsIcEEE2idE_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI _ZTVN10__cxxabiv119__pointer_type_infoE_nid_postfix(void) {
     NotImplemented_nid_no_patch(__func__);
     return 0;
 }

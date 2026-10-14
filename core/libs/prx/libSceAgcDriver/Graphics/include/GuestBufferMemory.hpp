@@ -41,6 +41,7 @@ struct HostImport {
     bool dmaBuf = false;
     bool joined = false;
     std::shared_ptr<void> chunk;
+    mutable std::uint64_t lastUse = 0;
 };
 
 enum class ImportWatch : std::uint8_t { Watch, Unwatch };
@@ -65,6 +66,10 @@ void SetImportWatch(const Context& context, ImportWatch watch);
 // the import's buffer.
 const HostImport* HostImportFor(const Context& context, std::uint64_t address, std::size_t bytes);
 void SetHostImportWindow(std::uint64_t bytes);
+// Tests: the window of one large registered range (64 MiB) and the import budget (0: the configured one).
+void SetHostImportRangeWindow(std::uint64_t bytes);
+void SetHostImportBudget(std::uint64_t bytes);
+std::uint64_t HostImportLiveBytes();
 bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& ranges, std::uint64_t generation, bool adoptDevice);
 // Whether an existing import covers [address, address + bytes), without reconciling the imports
 // with the registry or making one (HostImportFor may take a registry lease): a hint for choices
@@ -266,11 +271,22 @@ public:
     // through a device-local staging copy of the import (nothing was copied through the CPU, so the
     // upload can serve a later identical build), else nothing.
     std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> DirectRegions() const;
+    struct CutRegion {
+        std::uint64_t begin;
+        std::uint64_t end;
+        std::uint64_t committedEnd;
+    };
+    std::vector<CutRegion> CutRegions() const;
     // Every region the recorded work reads in place through a host import, as [begin, end): the
     // regions bound in place (`direct`), an address-based build's leased heaps included. A region
     // the GPU copies out of an import (gpuCopy) notes its read itself when the copy is recorded.
     // For the recorder's read tracking (ShaderResources::MarkGpuWrites); nothing once committed.
     std::vector<std::pair<std::uint64_t, std::uint64_t>> InPlaceReads() const;
+    struct SplitReads {
+        std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> space;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> own;
+    };
+    std::optional<SplitReads> SplitInPlaceReads() const;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> DeviceReads() const;
 
 private:
@@ -293,6 +309,7 @@ private:
         // memory; the rest reads as zeros and is never stored.
         bool sparse = false;
         bool sparseHeap = false;
+        bool runCut = false;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> backed {};
         std::uint64_t lastView = 0;
         std::uint64_t bufferEnd = 0;
@@ -348,11 +365,12 @@ private:
     // The BDA table entry of an uploaded region.
     static ShaderRecompiler::BdaAbi::Range addressRange(const Region& region);
     static std::uint64_t servedEnd(const Region& region);
+    static std::uint64_t inPlaceEnd(const Region& region);
     void validate(std::uint64_t address, std::size_t bytes) const;
     // The region of a descriptor-bound range (AddWritable/AddReadable), committed pages only. A
     // range inside a base region of the space adds nothing: the region serves it, as today's merge
     // of the two did.
-    void addDescriptorRegion(std::uint64_t address, std::size_t bytes, bool atomic, bool swept);
+    void addDescriptorRegion(std::uint64_t address, std::size_t bytes, bool atomic, bool swept, bool readOnly);
     static bool servesView(const Region& region, std::uint64_t view);
     static bool sparseHeapCandidate(const Region& region);
     bool bindSparseMirror(Region& region, const GuestAllocations::Lease& lease);
@@ -385,11 +403,13 @@ private:
     // Import registry epoch when `direct` pointers were taken at acquire time; they are reused while
     // no import was destroyed since.
     std::uint64_t importsEpoch = 0;
+    std::uint64_t importFloor = 0;
     std::vector<Region> regions;
     // Whether `regions` is in ascending address order (true right after AcquireRegistered, whose
     // regions follow the registry's order), so AddSnapshot can search instead of scanning.
     bool regionsSorted = false;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> readsOverBase;
     std::vector<std::pair<std::uint64_t, std::vector<std::byte>>> heapReferences;
     // UploadPrepare ran (regions are frozen); `uploaded` once UploadFinish ran.
     bool prepared = false;

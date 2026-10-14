@@ -33,6 +33,7 @@ std::stop_source shutdownSource;
 std::atomic<bool> exitRequested{false};
 std::atomic<bool> exitStarted{false};
 using GuestExitCallback = void (APS5_VABI*)();
+thread_local bool runningExit = false;
 
 void ReportGuestExit(const char* how, int code, void* caller) {
 #ifdef _WIN32
@@ -120,8 +121,12 @@ extern "C" {
 
 [[noreturn]] void LibcExit_nid_no_patch(int code) {
     exitRequested.store(true);
-    if (exitStarted.exchange(true)) LibcAwaitExit_nid_postfix();
-    LibcRunShutdown_nid_postfix();
+    if (exitStarted.exchange(true)) {
+        if (!runningExit) LibcAwaitExit_nid_postfix();
+    } else {
+        runningExit = true;
+        LibcRunShutdown_nid_postfix();
+    }
     CxaFinalize_nid_no_patch(nullptr);
     std::exit(code);
 }

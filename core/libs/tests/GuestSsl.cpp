@@ -12,7 +12,12 @@ int APS5_VABI sceSslFreeCaCerts(int, void*);
 int APS5_VABI sceSslGetCaList(int, void*);
 int APS5_VABI sceSslFreeCaList(int, void*);
 int APS5_VABI sceSslUnloadCert(int);
-int APS5_VABI sceSslSetVerifyCallback(void);
+int APS5_VABI sceSslCreateConnection(int, int, const char*);
+int APS5_VABI sceSslDeleteConnection(int);
+int APS5_VABI sceSslSetVerifyCallback(int, int (APS5_VABI *)(int, unsigned int, void**, int, void*), void*);
+int APS5_VABI sceSslConnect(int);
+int APS5_VABI sceSslRead(int, void*, std::size_t, int);
+int APS5_VABI sceSslWrite(int, void*, std::size_t, int);
 }
 
 struct SslMemoryPoolStats {
@@ -36,6 +41,8 @@ static bool Throws(TCall call) {
     return false;
 }
 
+static int APS5_VABI VerifyCallback(int, unsigned int, void**, int, void*) { return 0; }
+
 struct SslCaCerts {
     void* certs;
     std::size_t num;
@@ -51,8 +58,6 @@ int main() {
     constexpr int notFound = static_cast<int>(0x8095F004);
     constexpr int invalidArg = static_cast<int>(0x8095177A);
     int marker = 0;
-    Require(Throws([] { sceSslSetVerifyCallback(); }));
-
     const int context = sceSslInit_nid_postfix(0x10000);
     Require(context > 0);
     SslMemoryPoolStats stats{1, 1, 1, 1};
@@ -90,7 +95,29 @@ int main() {
     Require(sceSslGetCaList(context, &list) == notFound);
     Require(list.certs == nullptr && list.num == 0);
 
+    constexpr int invalidId = static_cast<int>(0x8095F006);
+    Require(Throws([&] { sceSslCreateConnection(context, 0, nullptr); }));
+    Require(sceSslCreateConnection(context + 1000, 0, "example.com") == invalidId);
+
+    const int connection = sceSslCreateConnection(context, 0, "example.com");
+    Require(connection > 0 && connection != context);
+    Require(sceSslSetVerifyCallback(connection, VerifyCallback, &marker) == 0);
+    Require(sceSslSetVerifyCallback(connection, nullptr, nullptr) == 0);
+    char buffer[4]{};
+    Require(Throws([&] { sceSslConnect(connection); }));
+    Require(Throws([&] { sceSslRead(connection, buffer, sizeof(buffer), 0); }));
+    Require(Throws([&] { sceSslWrite(connection, buffer, sizeof(buffer), 0); }));
+
+    const int unknown = connection + 1000;
+    Require(Throws([&] { sceSslSetVerifyCallback(unknown, nullptr, nullptr); }));
+    Require(Throws([&] { sceSslDeleteConnection(unknown); }));
+
     Require(sceSslTerm_nid_postfix(context) == 0);
+    Require(Throws([&] { sceSslSetVerifyCallback(connection, nullptr, nullptr); }));
+    Require(sceSslCreateConnection(context, 0, "example.com") == invalidId);
+    Require(sceSslDeleteConnection(connection) == 0);
+    Require(Throws([&] { sceSslDeleteConnection(connection); }));
+
     Require(sceSslGetCaList(context, nullptr) == invalidArg);
     Require(sceSslFreeCaList(context, nullptr) == invalidArg);
     list = {&handle, 3};

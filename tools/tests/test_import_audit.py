@@ -2,7 +2,9 @@ import contextlib
 import io
 import json
 import os
+import stat
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -102,6 +104,13 @@ def exporting(*names):
     return build_elf([(name, 1, GLOBAL_FUNCTION) for name in names])
 
 
+def with_elf_symbol_table_range(image, offset, size):
+    image = bytearray(image)
+    section_offset = struct.unpack_from("<Q", image, 40)[0] + 64
+    struct.pack_into("<QQ", image, section_offset + 24, offset, size)
+    return bytes(image)
+
+
 def build_pe(names):
     section_rva, raw_offset = 0x1000, 0x200
     strings, rvas = b"", []
@@ -162,6 +171,153 @@ class ImportAuditTests(unittest.TestCase):
     def setUp(self):
         self.work = Workspace()
         self.addCleanup(self.work.close)
+
+    def test_failed_json_write_preserves_existing_report_and_leaves_no_partial_report(self):
+        work = self.work
+        (work.libs / "libSceA.prx").write_bytes(exporting("AAAAAAAAAAA"))
+        registry = work.root / "game.json"
+        write_registry(registry, [("AAAAAAAAAAA", "libSceA.prx")])
+        output = work.root / "audit.json"
+        previous = b'{"previous": "complete report"}\n'
+
+        def disk_full(path, content, **kwargs):
+            with path.open("w", encoding="utf-8") as handle:
+                handle.write(content[:24])
+            raise OSError(28, "No space left on device", str(path))
+
+        for exists in (True, False):
+            with self.subTest(existing_report=exists):
+                if exists:
+                    output.write_bytes(previous)
+                else:
+                    output.unlink(missing_ok=True)
+                files = set(work.root.iterdir())
+                with patch.object(Path, "write_text", disk_full):
+                    code, out, err = work.run(registry, "--json", str(output))
+                self.assertEqual((code, out), (2, ""))
+                self.assertIn("No space left on device", err)
+                self.assertEqual(set(work.root.iterdir()), files)
+                if exists:
+                    self.assertEqual(output.read_bytes(), previous)
+                else:
+                    self.assertFalse(output.exists())
+
+    def test_failed_json_replacement_preserves_report_and_cleans_staging(self):
+        work = self.work
+        (work.libs / "libSceA.prx").write_bytes(exporting("AAAAAAAAAAA"))
+        registry = work.root / "game.json"
+        write_registry(registry, [("AAAAAAAAAAA", "libSceA.prx")])
+        output = work.root / "audit.json"
+        previous = b'{"previous": "complete report"}\n'
+        output.write_bytes(previous)
+        files = set(work.root.iterdir())
+        with patch.object(Path, "replace", side_effect=PermissionError(13, "Permission denied", str(output))):
+            code, out, err = work.run(registry, "--json", str(output))
+        self.assertEqual((code, out), (2, ""))
+        self.assertIn("Permission denied", err)
+        self.assertEqual(output.read_bytes(), previous)
+        self.assertEqual(set(work.root.iterdir()), files)
+
+    def test_successful_json_write_replaces_complete_report_without_staging_files(self):
+        work = self.work
+        (work.libs / "libSceA.prx").write_bytes(exporting("AAAAAAAAAAA"))
+        registry = work.root / "game.json"
+        write_registry(registry, [("AAAAAAAAAAA", "libSceA.prx")])
+        output = work.root / "audit.json"
+        output.write_text("old report", encoding="utf-8")
+        files = set(work.root.iterdir())
+        code, _, err = work.run(registry, "--json", str(output))
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(json.loads(output.read_text(encoding="utf-8"))["unique_by_class"]["implemented"], 1)
+        self.assertEqual(set(work.root.iterdir()), files)
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows read-only replacement behavior")
+    def test_read_only_json_report_stays_intact_without_a_read_only_temporary(self):
+        work = self.work
+        (work.libs / "libSceA.prx").write_bytes(exporting("AAAAAAAAAAA"))
+        registry = work.root / "game.json"
+        write_registry(registry, [("AAAAAAAAAAA", "libSceA.prx")])
+        output = work.root / "audit.json"
+        previous = b'{"previous": "complete report"}\n'
+        output.write_bytes(previous)
+        files = set(work.root.iterdir())
+        output.chmod(0o444)
+        try:
+            code, out, err = work.run(registry, "--json", str(output))
+            self.assertEqual((code, out), (2, ""))
+            self.assertIn("FAIL:", err)
+            self.assertEqual(output.read_bytes(), previous)
+            self.assertEqual(set(work.root.iterdir()), files)
+        finally:
+            output.chmod(0o666)
+
+    def test_json_report_symlink_keeps_its_target(self):
+        work = self.work
+        (work.libs / "libSceA.prx").write_bytes(exporting("AAAAAAAAAAA"))
+        registry = work.root / "game.json"
+        write_registry(registry, [("AAAAAAAAAAA", "libSceA.prx")])
+        target = work.root / "actual-report.json"
+        target.write_text("old report", encoding="utf-8")
+        output = work.root / "audit.json"
+        try:
+            output.symlink_to(target.name)
+        except (OSError, NotImplementedError) as error:
+            self.skipTest(str(error))
+        files = set(work.root.iterdir())
+        code, _, err = work.run(registry, "--json", str(output))
+        self.assertEqual((code, err), (0, ""))
+        self.assertTrue(output.is_symlink())
+        self.assertEqual(json.loads(target.read_text(encoding="utf-8"))["unique_imports"], 1)
+        self.assertEqual(set(work.root.iterdir()), files)
+
+    def test_json_directory_error_preserves_the_supplied_path(self):
+        work = self.work
+        (work.libs / "libSceA.prx").write_bytes(exporting("AAAAAAAAAAA"))
+        registry = work.root / "game.json"
+        write_registry(registry, [("AAAAAAAAAAA", "libSceA.prx")])
+        output = work.modules / ".." / work.modules.name
+        self.assertNotEqual(str(output), str(output.resolve()))
+        files = set(work.root.iterdir())
+        code, out, err = work.run(registry, "--json", str(output))
+        self.assertEqual((code, out), (2, ""))
+        self.assertEqual(err, f"FAIL: {output}: JSON output is a directory\n")
+        self.assertEqual(set(work.root.iterdir()), files)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX report permissions")
+    def test_new_json_report_permissions_follow_the_process_umask(self):
+        script = "\n".join([
+            "import os, sys",
+            "from pathlib import Path",
+            "sys.path.insert(0, sys.argv[1])",
+            "import import_audit",
+            "os.umask(int(sys.argv[4], 8))",
+            "Path(sys.argv[3]).write_text('{}\\n', encoding='utf-8')",
+            "import_audit.write_json(Path(sys.argv[2]), {'complete': True})",
+        ])
+        for mask, mode in ((0o022, 0o644), (0o002, 0o664), (0o077, 0o600)):
+            with self.subTest(umask=oct(mask)):
+                output = self.work.root / f"audit-{mask:o}.json"
+                reference = self.work.root / f"plain-{mask:o}.json"
+                files = set(self.work.root.iterdir())
+                completed = subprocess.run([sys.executable, "-c", script, str(import_audit.ROOT / "tools"), str(output), str(reference), oct(mask)], capture_output=True, text=True)
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertEqual(stat.S_IMODE(output.stat().st_mode), mode)
+                self.assertEqual(stat.S_IMODE(output.stat().st_mode), stat.S_IMODE(reference.stat().st_mode))
+                self.assertEqual(json.loads(output.read_text(encoding="utf-8")), {"complete": True})
+                self.assertEqual(set(self.work.root.iterdir()), files | {output, reference})
+
+    @unittest.skipUnless(os.name == "posix", "POSIX report permissions")
+    def test_existing_json_report_permissions_are_preserved(self):
+        output = self.work.root / "audit.json"
+        for mode in (0o600, 0o640, 0o664):
+            with self.subTest(mode=oct(mode)):
+                output.write_text("old report", encoding="utf-8")
+                output.chmod(mode)
+                files = set(self.work.root.iterdir())
+                import_audit.write_json(output, {"complete": True})
+                self.assertEqual(stat.S_IMODE(output.stat().st_mode), mode)
+                self.assertEqual(json.loads(output.read_text(encoding="utf-8")), {"complete": True})
+                self.assertEqual(set(self.work.root.iterdir()), files)
 
     def test_classification_accounts_for_every_reference(self):
         work = self.work
@@ -368,6 +524,57 @@ class ImportAuditTests(unittest.TestCase):
         records, _ = import_audit.audit([(nid, "libB.prx")], exports, stubs, {"libA.prx", "libB.prx"}, set())
         self.assertEqual(records[0]["class"], "implemented")
 
+    def test_cmake_shared_library_preserves_stub_names_and_implemented_exports(self):
+        work = self.work
+        owner, library = "libZOwner", "libAOwner.native"
+        pending, runtime, live = "scePending", "printf_nid_postfix", "sceLive"
+        alias_nid, alias_name = "AAAAAAAAAAA", "sceOwnerUnknown"
+        write_source(work.source, owner, STUB_SOURCE.format(name=pending) + STUB_SOURCE.format(name=runtime)
+                     + f'APS5_EXPORT("{alias_nid}", {alias_name});\n' + STUB_SOURCE.format(name=alias_name)
+                     + DONE_SOURCE.format(name=live))
+        shared = work.source / library
+        shared.mkdir()
+        (shared / "CMakeLists.txt").write_text(f'include(${{CMAKE_CURRENT_SOURCE_DIR}}/../{owner}/OwnerLibrary.cmake)\n')
+        expected = {nid_names.compute_nid(pending): pending, nid_names.compute_nid("printf"): runtime, alias_nid: alias_name}
+        live_nid = nid_names.compute_nid(live)
+        (work.libs / (library + ".prx")).write_bytes(exporting(*expected, live_nid))
+        registry, result = work.root / "game.json", work.root / "audit.json"
+        write_registry(registry, [(nid, library + ".prx") for nid in [*expected, live_nid]])
+        code, _, err = work.run(registry, "--json", str(result))
+        self.assertEqual((code, err), (0, ""))
+        records = {record["nid"]: record for record in json.loads(result.read_text())["imports"]}
+        self.assertEqual({nid: (records[nid]["class"], records[nid]["name"]) for nid in expected},
+                         {nid: ("stub", name) for nid, name in expected.items()})
+        self.assertEqual((records[live_nid]["class"], records[live_nid]["name"]), ("implemented", None))
+
+    def test_source_include_shared_library_preserves_stubs(self):
+        source = self.work.source
+        write_source(source, "libOwner", STUB_SOURCE.format(name="scePending"))
+        write_source(source, "libShared", '#include "prx/libOwner/Export.cpp"\n')
+        nid = nid_names.compute_nid("scePending")
+        self.assertEqual(import_audit.source_stubs(source), {
+            ("libOwner.prx", nid): "scePending", ("libShared.prx", nid): "scePending"})
+
+    def test_transitive_shared_library_preserves_stubs(self):
+        source = self.work.source
+        write_source(source, "libZOwner", STUB_SOURCE.format(name="scePending"))
+        for library, owner in (("libA", "libB"), ("libB", "libZOwner")):
+            shared = source / library
+            shared.mkdir()
+            (shared / "CMakeLists.txt").write_text(f'include(${{CMAKE_CURRENT_SOURCE_DIR}}/../{owner}/OwnerLibrary.cmake)\n')
+        nid = nid_names.compute_nid("scePending")
+        self.assertEqual(import_audit.source_stubs(source), {
+            (library + ".prx", nid): "scePending" for library in ("libA", "libB", "libZOwner")})
+
+    def test_shared_source_cycle_fails(self):
+        source = self.work.source
+        for library, owner in (("libA", "libB"), ("libB", "libA")):
+            shared = source / library
+            shared.mkdir()
+            (shared / "CMakeLists.txt").write_text(f'include(${{CMAKE_CURRENT_SOURCE_DIR}}/../{owner}/OwnerLibrary.cmake)\n')
+        with self.assertRaisesRegex(import_audit.AuditError, "shared source cycle.*libA.*libB"):
+            import_audit.source_stubs(source)
+
     def test_formatted_export_aliases_remain_stubs(self):
         work = self.work
         nid = "AAAAAAAAAAA"
@@ -446,6 +653,35 @@ class ImportAuditTests(unittest.TestCase):
         for cut in (10, 64, len(image) - 5):
             with self.assertRaisesRegex(import_audit.AuditError, "mod.prx"):
                 import_audit.elf_imports(path, image[:cut])
+
+    def test_elf_dynamic_symbol_table_rejects_ranges_outside_file(self):
+        image = exporting("alpha")
+        for offset, size in ((len(image) + 1, 0), (2**64 - 1, 0), (len(image) - 23, 24), (len(image), 24), (len(image) + 1, 24)):
+            with self.subTest(offset=offset, size=size):
+                with self.assertRaisesRegex(import_audit.AuditError, r"lib.prx: .*outside the file"):
+                    import_audit.elf_exports(Path("lib.prx"), with_elf_symbol_table_range(image, offset, size))
+
+    def test_elf_dynamic_symbol_table_accepts_ranges_ending_at_eof(self):
+        image = exporting("alpha")
+        self.assertEqual(import_audit.elf_exports(Path("lib.prx"), with_elf_symbol_table_range(image, len(image), 0)), set())
+        table_offset = struct.unpack_from("<Q", image, struct.unpack_from("<Q", image, 40)[0] + 64 + 24)[0]
+        table = image[table_offset:table_offset + 48]
+        relocated = with_elf_symbol_table_range(image + table, len(image), len(table))
+        self.assertEqual(import_audit.elf_exports(Path("lib.prx"), relocated), {"alpha"})
+
+    def test_invalid_elf_dynamic_symbol_table_exits_two(self):
+        work = self.work
+        library = work.libs / "libSceA.prx"
+        image = exporting("AAAAAAAAAAA")
+        library.write_bytes(with_elf_symbol_table_range(image, len(image) + 1, 0))
+        registry = work.root / "game.json"
+        write_registry(registry, [("AAAAAAAAAAA", "libSceA.prx")])
+        result = work.root / "audit.json"
+        code, out, err = work.run(registry, "--json", str(result))
+        self.assertEqual((code, out), (2, ""))
+        self.assertIn(f"FAIL: {library}: dynamic symbol table", err)
+        self.assertIn("outside the file", err)
+        self.assertFalse(result.exists())
 
     def test_pe_reader(self):
         path = Path("lib.prx")
@@ -704,6 +940,49 @@ class ImportAuditTests(unittest.TestCase):
             code, out, err = work.run(registry)
         self.assertEqual((code, out), (2, ""))
         self.assertIn(f"FAIL: Permission denied: {library}", err)
+
+
+class StrictProviderTests(unittest.TestCase):
+    def test_named_provider_mismatch_is_optional_failure(self):
+        work = Workspace()
+        self.addCleanup(work.close)
+        (work.libs / "libSceExpected.prx").write_bytes(build_pe(["BBBBBBBBBBB"]))
+        (work.libs / "libSceOther.prx").write_bytes(build_pe(["AAAAAAAAAAA"]))
+        registry = work.root / "registry.json"
+        write_registry(registry, [("AAAAAAAAAAA", "libSceExpected.prx")])
+        result = work.root / "audit.json"
+        self.assertEqual(work.run(registry)[0], 0)
+        code, out, err = work.run(registry, "--strict-providers", "--json", str(result))
+        self.assertEqual((code, err), (1, ""))
+        report = json.loads(result.read_text())
+        self.assertEqual(report["library_mismatch"], 1)
+        self.assertEqual(report["imports"][0]["providers"], ["libSceOther.prx"])
+        self.assertIn("only by a library other than", out)
+
+    def test_matching_provider_passes(self):
+        work = Workspace()
+        self.addCleanup(work.close)
+        (work.libs / "libSceExpected.prx").write_bytes(build_pe(["AAAAAAAAAAA"]))
+        registry = work.root / "registry.json"
+        write_registry(registry, [("AAAAAAAAAAA", "libSceExpected.prx")])
+        self.assertEqual(work.run(registry, "--strict-providers")[0], 0)
+
+    def test_shared_libc_provider_remains_valid(self):
+        work = Workspace()
+        self.addCleanup(work.close)
+        (work.libs / "libSceExpected.prx").write_bytes(build_pe([]))
+        (work.libs / "libc.prx").write_bytes(build_pe(["AAAAAAAAAAA"]))
+        registry = work.root / "registry.json"
+        write_registry(registry, [("AAAAAAAAAAA", "libSceExpected.prx")])
+        self.assertEqual(work.run(registry, "--strict-providers")[0], 0)
+
+    def test_missing_provider_file_still_fails(self):
+        work = Workspace()
+        self.addCleanup(work.close)
+        (work.libs / "libc.prx").write_bytes(build_pe(["AAAAAAAAAAA"]))
+        registry = work.root / "registry.json"
+        write_registry(registry, [("AAAAAAAAAAA", "libSceMissing.prx")])
+        self.assertEqual(work.run(registry, "--strict-providers")[0], 1)
 
 
 if __name__ == "__main__":

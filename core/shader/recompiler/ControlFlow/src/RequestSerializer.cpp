@@ -5,7 +5,7 @@ namespace ShaderRecompiler {
 
 namespace {
 
-constexpr std::uint32_t CurrentVersion = 24u;
+constexpr std::uint32_t CurrentVersion = 26u;
 constexpr std::uint32_t LocalFeatures = 22u;
 constexpr char kBase64Alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -154,6 +154,8 @@ public:
     }
 
     bool ReadBool() { return ReadU8() != 0u; }
+
+    std::uint64_t Remaining() const { return m_data.size() - m_offset; }
 
     std::uint32_t ReadU32() {
         std::uint32_t value = 0u;
@@ -340,6 +342,7 @@ void writePixelInfo(Writer& writer, const ShaderPixelStageInfo& info) {
     writer.WriteBool(info.stencilRefExportEnable);
     writer.WriteU8(static_cast<std::uint8_t>(info.rasterPrimitive));
     writer.WriteBool(info.layerExported);
+    writer.WriteBool(info.ditheredAlphaToCoverage);
     for (const ColorTargetBlend& blend : info.targetBlend) {
         writer.WriteBool(blend.enable);
         writer.WriteU8(blend.sourceFactor);
@@ -398,6 +401,7 @@ ShaderPixelStageInfo readPixelInfo(Reader& reader, std::uint32_t version, std::u
     if (version >= 17u) info.stencilRefExportEnable = reader.ReadBool();
     if (version >= 19u) info.rasterPrimitive = readRasterPrimitive(reader);
     if (version >= 23u) info.layerExported = reader.ReadBool();
+    if (version >= 25u) info.ditheredAlphaToCoverage = reader.ReadBool();
     if (local >= 20u) {
         for (ColorTargetBlend& blend : info.targetBlend) {
             blend.enable = reader.ReadBool();
@@ -559,8 +563,8 @@ TessellationConfiguration readTessellationConfiguration(Reader& reader, std::uin
         static_cast<void>(reader.ReadU32());
     }
     if (version >= 22u || local >= 18u) configuration.patchesPerGroup = reader.ReadU32();
-    if (local >= 19u) configuration.primitiveGroupSize = reader.ReadU32();
-    if (local >= 21u) configuration.breakAtInstance = reader.ReadBool();
+    if (version >= 24u || local >= 19u) configuration.primitiveGroupSize = reader.ReadU32();
+    if (version >= 24u || local >= 21u) configuration.breakAtInstance = reader.ReadBool();
     return configuration;
 }
 
@@ -801,7 +805,16 @@ DeserializedRequest deserialize(std::string_view decoded, std::uint32_t version,
     if (version >= 17u) result.request.target.registrationModules = reader.ReadBool();
     if (version >= 17u) result.request.target.registrationWordLimit = reader.ReadU32();
     if (version >= 18u) result.request.target.vertexSubgroups = reader.ReadBool();
-    if (version >= 21u) result.request.target.float16DenormPreserve = reader.ReadBool();
+    if (version >= 21u) {
+        if (version >= 22u) reader.Require(1u);
+        if (reader.Remaining() == 1u) {
+            const auto float16DenormPreserve = reader.ReadU8();
+            if (float16DenormPreserve > 1u) throw std::runtime_error("RequestSerializer: invalid float16DenormPreserve value");
+            result.request.target.float16DenormPreserve = float16DenormPreserve != 0u;
+        } else if (reader.Remaining() != 0u) {
+            throw std::runtime_error("RequestSerializer: unexpected trailing data");
+        }
+    }
     if (exact && !reader.Done()) throw std::runtime_error("RequestSerializer: trailing data");
     return result;
 }
@@ -845,7 +858,15 @@ DeserializedRequest RequestSerializer::Deserialize(std::string_view text) const 
     if (reader.ReadU32() != 0x41505335u) throw std::runtime_error("invalid recompile request signature");
     const auto version = reader.ReadU32();
     if (version < 1u || version > CurrentVersion) throw std::runtime_error("unsupported recompile request serialization version");
-    if (version < 17u || version > 21u) return deserialize(decoded, version, version >= CurrentVersion ? LocalFeatures : 0u, false);
+    if (version >= CurrentVersion) return deserialize(decoded, version, LocalFeatures, false);
+    if (version == 24u) {
+        try {
+            return deserialize(decoded, version, LocalFeatures, true);
+        } catch (const std::exception&) {
+        }
+        return deserialize(decoded, version, 0u, false);
+    }
+    if (version < 17u || version > 21u) return deserialize(decoded, version, 0u, false);
     try {
         return deserialize(decoded, 16u, version, true);
     } catch (const std::exception&) {

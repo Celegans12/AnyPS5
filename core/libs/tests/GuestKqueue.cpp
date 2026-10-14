@@ -330,7 +330,9 @@ static void RenameAndDeleteWatchedFile() {
     Require(close_nid_postfix(file) == 0);
     Require(close_nid_postfix(kq) == 0);
 }
+#endif
 
+#if !defined(_WIN32) && !defined(__APPLE__)
 static std::uint32_t NotesThrough(int kq, std::uintptr_t ident, std::uint32_t last) {
     std::uint32_t notes = 0;
     KernelEvent events[4]{};
@@ -400,6 +402,24 @@ static void DirectoryWatch() {
     Require(std::filesystem::remove_all(path) == 1);
 }
 
+static void DeleteWatchedFile() {
+    const auto path = TemporaryName("deleted");
+    const int file = open_nid_postfix(path.c_str(), ReadWrite | Create, 0644);
+    Require(file >= 0);
+    const int kq = kqueue_nid_postfix();
+    KernelEvent events[4]{};
+    const auto ident = static_cast<std::uintptr_t>(file);
+    Require(Apply(kq, Change(ident, EvfiltVnode, EvAdd | EvClear, NoteDelete | NoteWrite | NoteRename)) == 0);
+    Require(Poll(kq, events, 4) == 0);
+    Require(unlink_nid_postfix(path.c_str()) == 0);
+    Require(Wait(kq, events, 4) == 1 && events[0].ident == ident && events[0].fflags == NoteDelete);
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    Require(Poll(kq, events, 4) == 0);
+    Require(close_nid_postfix(file) == 0);
+    Require(close_nid_postfix(kq) == 0);
+    Require(!std::filesystem::exists(path));
+}
+
 static void Timeout() {
     const int kq = kqueue_nid_postfix();
     KernelEvent event{};
@@ -420,9 +440,12 @@ int main() {
     FileWatch();
 #ifndef _WIN32
     RenameAndDeleteWatchedFile();
+#endif
+#if !defined(_WIN32) && !defined(__APPLE__)
     MoveDirectoryEntries();
 #endif
     DirectoryWatch();
+    DeleteWatchedFile();
     Timeout();
     return 0;
 }

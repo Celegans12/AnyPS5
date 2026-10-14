@@ -34,6 +34,27 @@ static constexpr int MAX_CALLBACKS = 8;
 
 static std::mutex g_callbackLock;
 static NetCtlCallback g_callbacks[MAX_CALLBACKS] = {};
+static NetCtlCallback g_callbacksV6[MAX_CALLBACKS] = {};
+
+static int RegisterCallback(NetCtlCallback (&callbacks)[MAX_CALLBACKS], NetCtlCallback func, int* cid) {
+    if (!func || !cid) return SCE_NET_CTL_ERROR_INVALID_ADDR;
+    std::lock_guard lock(g_callbackLock);
+    for (int index = 0; index < MAX_CALLBACKS; ++index) {
+        if (!callbacks[index]) {
+            callbacks[index] = func;
+            *cid = index;
+            return 0;
+        }
+    }
+    return SCE_NET_CTL_ERROR_CALLBACK_MAX;
+}
+
+static int UnregisterCallback(NetCtlCallback (&callbacks)[MAX_CALLBACKS], int cid) {
+    if (cid < 0 || cid >= MAX_CALLBACKS) return SCE_NET_CTL_ERROR_INVALID_ID;
+    std::lock_guard lock(g_callbackLock);
+    callbacks[cid] = nullptr;
+    return 0;
+}
 
 static bool HostHasAddress(int family) {
 #ifdef _WIN32
@@ -169,26 +190,22 @@ int APS5_VABI sceNetCtlInit(void) {
 }
 
 int APS5_VABI sceNetCtlRegisterCallback(NetCtlCallback func, void* arg, int* cid) {
-    if (!func || !cid) return SCE_NET_CTL_ERROR_INVALID_ADDR;
-    std::lock_guard lock(g_callbackLock);
-    for (int index = 0; index < MAX_CALLBACKS; ++index) {
-        if (!g_callbacks[index]) {
-            g_callbacks[index] = func;
-            *cid = index;
-            return 0;
-        }
-    }
-    return SCE_NET_CTL_ERROR_CALLBACK_MAX;
+    return RegisterCallback(g_callbacks, func, cid);
+}
+
+int APS5_VABI sceNetCtlRegisterCallbackV6(NetCtlCallback func, void* arg, int* cid) {
+    return RegisterCallback(g_callbacksV6, func, cid);
 }
 
 void APS5_VABI sceNetCtlTerm(void) {
 }
 
 int APS5_VABI sceNetCtlUnregisterCallback(int cid) {
-    if (cid < 0 || cid >= MAX_CALLBACKS) return SCE_NET_CTL_ERROR_INVALID_ID;
-    std::lock_guard lock(g_callbackLock);
-    g_callbacks[cid] = nullptr;
-    return 0;
+    return UnregisterCallback(g_callbacks, cid);
+}
+
+int APS5_VABI sceNetCtlUnregisterCallbackV6(int cid) {
+    return UnregisterCallback(g_callbacksV6, cid);
 }
 
 }

@@ -82,6 +82,9 @@ public:
     Texture(const Context& context, const std::shared_ptr<StorageTexture>& source, const GuestTextureResource& descriptor, VkComponentMapping components, DepthCopyTag);
     static VkFormat DepthCopyFormat(VkFormat colorFormat);
     static bool CanDepthCopyFrom(const StorageTexture& source, const GuestTextureResource& descriptor);
+    struct BlockCopyTag {};
+    Texture(const Context& context, const std::shared_ptr<StorageTexture>& source, const GuestTextureResource& descriptor, VkComponentMapping components, BlockCopyTag);
+    static bool CanBlockCopyFrom(const StorageTexture& source, const GuestTextureResource& descriptor);
     bool IsDepthCopy() const { return perUseCopy == PerUseCopy::RefreshedOnReuse; }
     bool RefreshDepthCopy();
     struct DepthCopyCounts {
@@ -149,6 +152,7 @@ private:
     std::atomic<std::uint32_t> resourcePins{0};
     std::atomic<std::uint64_t> lastUse{0};
     void release() noexcept;
+    bool refreshBlockCopy();
     void createFirstLayerView(const GuestTextureResource& descriptor, VkImageViewCreateInfo viewInfo);
     void prepareBaseLevelView(const GuestTextureResource& descriptor, VkImageViewCreateInfo viewInfo);
     void prepareSrgbView(const GuestTextureResource& descriptor, VkImageViewCreateInfo viewInfo);
@@ -183,6 +187,7 @@ private:
     bool copiedOnce = false;
     std::uint64_t copiedVersion = 0;
     VkFormat depthFormat = VK_FORMAT_UNDEFINED;
+    VkFormat blockFormat = VK_FORMAT_UNDEFINED;
     std::uint32_t copyWidth = 0, copyHeight = 0, copyLevels = 0, copyLayers = 0, copyElementBytes = 0;
 };
 
@@ -220,6 +225,7 @@ public:
     void WriteBack();
     // Deferred write-back (APS5_EAGER_WRITEBACK=1 stores at once instead).
     void MarkDirty();
+    void MarkSliceDirty(std::uint32_t slice);
     void Flush();
     // Stores every pending image overlapping the range, except `except`; returns whether any was.
     // Stores into host-imported memory are recorded (not waited for): a CPU reader syncs afterwards.
@@ -230,9 +236,11 @@ public:
     // overlapping pending image, as before).
     static bool FlushPending(std::uint64_t address, std::size_t bytes, const StorageTexture* except = nullptr, const char* reason = "memory access", PublishScope scope = PublishScope::Whole, bool* published = nullptr);
     static void FlushAllPending(const char* reason);
+    static void SaveBeforeUnwatch(std::uint64_t address, std::size_t bytes);
     static bool AnyPending();
     static void FlushDumpSelected(const char* reason);
     static bool StoreAtFlipRequested(const char* value);
+    static bool StoreAtLabelRequested(const char* value);
     // See PendingSerial: a change of a surface's source outside the registry (a unit shadow
     // retile) moves it too.
     static void BumpPendingSerial();
@@ -305,6 +313,7 @@ public:
     // contains a descriptor of its first mips), if any; the caller decides whether the geometry fits
     // (Texture::CanCopyFrom, ResidentPresentable).
     static std::shared_ptr<StorageTexture> FindPending(std::uint64_t address, std::uint64_t bytes);
+    static std::shared_ptr<StorageTexture> FindPendingSlice(std::uint64_t address, std::uint64_t bytes);
     // How a buffer fill of [address, address + bytes) (Driver.cpp's fill HLE) meets the storage
     // images alive: none of them; a whole surface (Exact) or one array layer of a surface (Layer),
     // `image` and `layer` naming it, whatever other images lie over the range (`others`, of which
@@ -339,7 +348,7 @@ public:
     // captures, snapshots) takes the bytes through the flush hook, and this image alone is current.
     // False, naming why in `refusal`, when the fill must be stored as before.
     static constexpr std::uint32_t WholeImage = ~0u;
-    bool FillClear(std::span<const std::uint32_t, 4> pattern, std::uint32_t layer, const char*& refusal);
+    bool FillClear(std::span<const std::uint32_t, 4> pattern, std::uint32_t layer, const char*& refusal, bool allowRegisterClear = false);
     // The cached, live image whose surface is exactly [address, address + bytes), if any (the newest
     // of several: see ClassifyFill).
     static std::shared_ptr<StorageTexture> FindLive(std::uint64_t address, std::uint64_t bytes);
@@ -379,7 +388,9 @@ public:
     bool Refresh();
     static std::uint64_t SinglePassMoves();
     static std::uint64_t RefreshesProved();
+    static std::uint64_t UntrackedCompares();
     std::uint64_t GuestBytes() const;
+    std::size_t OriginalSnapshotBytes() const { return original.capacity(); }
     VkDeviceSize AllocationBytes() const { return memoryBytes; }
 
 private:
@@ -390,6 +401,7 @@ private:
     // upload everything).
     void upload(const std::vector<bool>* layers = nullptr);
     void captureGuestBytes(const std::vector<bool>* layers);
+    void holdGuestBytes(const std::vector<bool>& selected);
     bool originalHolds(std::uint64_t address, std::size_t bytes) const;
     // The guest bytes the image matches in the units `layerOriginal` holds: a byte copy
     // (`original`) where a CPU round trip stores from it (no host import), else one ContentHash per
@@ -410,6 +422,12 @@ private:
     void writeBack(std::uint64_t address, std::size_t bytes);
     void writeBackLayers(const std::vector<bool>& layers);
     bool unchangedSinceBaseline(std::uint64_t from, std::uint64_t to) const;
+    void saveBeforeUnwatch();
+    void forgetKeptAtUnwatch(std::uint32_t unit);
+    bool keptAtUnwatchHolds(std::uint64_t from, std::uint32_t unit) const;
+    // Drops the saved guest bytes of the units over [address, address + bytes) (another image's fill
+    // or copy supersedes them there); the other units' bytes stay valid.
+    void forgetSavedOver(std::uint64_t address, std::size_t bytes);
     bool guestBytesSettled() const;
     // Tracked units as 64 KiB write-stamp blocks (`blockUnits`: a thin tiled surface at a 64 KiB
     // aligned base; APS5_NO_BLOCK_TRACKING=1 tracks array layers as above instead): a fill of one
@@ -546,7 +564,7 @@ private:
     SurfaceGeometry geometry;
     std::vector<std::byte> original;
     std::vector<ContentHash::Hash128> originalHashes;
-    mutable std::array<std::uint64_t, 4> comparedGuestBytes{};
+    mutable std::array<std::uint64_t, 5> comparedGuestBytes{};
     // Block hashes of the guest bytes at the layers' generations (surfaces up to 1 MiB).
     std::vector<ContentHash::Hash128> generationBaseline;
     std::int64_t accountedCopies = 0;
@@ -612,6 +630,7 @@ private:
     std::uint64_t version = 0;
     // `original` holds the guest bytes; false after a GPU-side clear, which never read them.
     std::vector<bool> layerOriginal;
+    std::map<std::uint64_t, std::uint64_t> keptAtUnwatch;
     // The storage cache let the image go (Flush): a lookup makes a new image of the surface, so
     // no fill may put results into this one (guarded by the live-image registry lock).
     bool released = false;

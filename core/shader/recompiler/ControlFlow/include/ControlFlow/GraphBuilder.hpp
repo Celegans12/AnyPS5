@@ -10,6 +10,15 @@
 
 namespace ShaderRecompiler {
 
+struct UserDataTail {
+    std::uint32_t programCounter;
+    std::uint32_t userDataRegister;
+    std::optional<std::uint32_t> constantHigh;
+};
+
+[[nodiscard]] std::optional<UserDataTail> FindUserDataTail(const RdnaProgram& program, std::uint32_t userDataBase, std::uint32_t userDataCount);
+[[nodiscard]] std::vector<std::uint32_t> LinkUserDataTail(const RdnaProgram& program, const UserDataTail& tail, const RdnaProgram& continuation);
+
 struct SwappcInfo {
     bool fetchCallAllowed = false;
     std::uint32_t userDataBaseRegister = 0;

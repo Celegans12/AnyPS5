@@ -9,6 +9,12 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 endif()
 
+if(APPLE)
+    set(ANYPS5_PRX_RPATH "@loader_path")
+else()
+    set(ANYPS5_PRX_RPATH "$ORIGIN")
+endif()
+
 add_executable(nid_patcher
         ${CMAKE_CURRENT_SOURCE_DIR}/nid/src/Sha1.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/nid/src/NidCompute.cpp
@@ -76,7 +82,7 @@ set_target_properties(libc PROPERTIES
         LIBRARY_OUTPUT_DIRECTORY ${UNPATCHED_DIR}
         ARCHIVE_OUTPUT_DIRECTORY ${IMPLIB_DIR}
         BUILD_WITH_INSTALL_RPATH ON
-        INSTALL_RPATH "$ORIGIN"
+        INSTALL_RPATH "${ANYPS5_PRX_RPATH}"
 )
 
 set(LIBC_UNPATCHED ${UNPATCHED_DIR}/libc.prx)
@@ -131,7 +137,7 @@ foreach(LIB_DIR ${LIBS_DIRS})
                 LIBRARY_OUTPUT_DIRECTORY ${UNPATCHED_DIR}
                 ARCHIVE_OUTPUT_DIRECTORY ${IMPLIB_DIR}
                 BUILD_WITH_INSTALL_RPATH ON
-                INSTALL_RPATH "$ORIGIN"
+                INSTALL_RPATH "${ANYPS5_PRX_RPATH}"
         )
 
         set(UNPATCHED_FILE ${UNPATCHED_DIR}/${LIB_NAME}.prx)
@@ -209,6 +215,10 @@ if(BUILD_TESTING)
         target_link_options(patched_libraries_tests PRIVATE -static -static-libgcc -static-libstdc++)
     endif()
     add_test(NAME patched_libraries COMMAND patched_libraries_tests ${PATCHED_DIR})
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME nid_elf_layout COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/nid/tests/test_elf_layout.py $<TARGET_FILE:nid_patcher>)
+    endif()
     add_test_executable(guest_kernel_sys_tests tests/GuestKernelSys.cpp)
     target_include_directories(guest_kernel_sys_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(guest_kernel_sys_tests PRIVATE libkernel_sys libkernel libc)
@@ -234,6 +244,14 @@ if(BUILD_TESTING)
         endif()
         add_test(NAME windows_write_watch COMMAND windows_write_watch_tests)
         set_tests_properties(windows_write_watch PROPERTIES TIMEOUT 20)
+    endif()
+
+    if(WIN32)
+        add_test_executable(undeliverable_host_exception_tests tests/UndeliverableHostException.cpp)
+        add_dependencies(undeliverable_host_exception_tests libc)
+        add_test(NAME undeliverable_host_exception COMMAND undeliverable_host_exception_tests $<TARGET_FILE:libc>)
+        set_tests_properties(undeliverable_host_exception PROPERTIES
+            PASS_REGULAR_EXPRESSION "C\\+\\+ exception St9bad_alloc raised on thread [0-9]+ cannot be delivered: 0x[0-9a-f]+ undeliverable_host_exception_tests\\.exe\\+0x[0-9a-f]+ has no unwind data")
     endif()
 
     add_test_executable(guest_offline_imports_tests tests/GuestOfflineImports.cpp)

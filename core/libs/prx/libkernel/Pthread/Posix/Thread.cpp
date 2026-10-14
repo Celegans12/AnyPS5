@@ -163,6 +163,21 @@ int APS5_VABI pthread_getaffinity_np_nid_postfix(Pthread thread, std::size_t cpu
     return 0;
 }
 
+int APS5_VABI pthread_setaffinity_np_nid_postfix(Pthread thread, std::size_t cpusetSize, const void* cpuset) {
+    constexpr int GuestEdeadlk = 11;
+    if (thread != scePthreadSelf()) {
+        if (!thread) return PosixThread::GUEST_EINVAL;
+        if (!GuestThreadIsLive(thread)) return PosixThread::GUEST_ESRCH;
+    }
+    if (cpusetSize != GUEST_CPUSET_BYTES) return GUEST_ERANGE;
+    if (!cpuset) return PosixThread::GUEST_EFAULT;
+    KernelCpumask requested = 0;
+    std::memcpy(&requested, cpuset, sizeof(requested));
+    const KernelCpumask affinity = requested & sceKernelGetAvailableCpumask();
+    if (affinity == 0) return GuestEdeadlk;
+    return PosixThread::ToErrno(scePthreadSetaffinity(thread, affinity));
+}
+
 int APS5_VABI pthread_join_nid_postfix(Pthread thread, void** value) {
     return PosixThread::ToErrno(scePthreadJoin(thread, value));
 }

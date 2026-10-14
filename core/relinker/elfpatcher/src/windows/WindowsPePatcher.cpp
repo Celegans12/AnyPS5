@@ -35,7 +35,7 @@ WindowsPePatcher::WindowsPePatcher(const bool windowsGui, std::optional<std::vec
 
 const std::string& WindowsPePatcher::GetDiagnostics() const { return diagnostics; }
 
-std::vector<std::uint8_t> WindowsPePatcher::Patch(const std::vector<std::uint8_t>& sourceElf, const std::vector<Domain::ProgramHeader>& originalHeaders, const Domain::SysVDynamicSection& dynamicSection, const std::uint64_t originalPltGotVaddr, const std::string& runPath, const bool lazyBinding, const bool dependencyDiagnostics, const std::vector<Codegen::TrampolineSite>& trampolines) {
+std::vector<std::uint8_t> WindowsPePatcher::Patch(std::vector<std::uint8_t> sourceElf, const std::vector<Domain::ProgramHeader>& originalHeaders, const Domain::SysVDynamicSection& dynamicSection, const std::uint64_t originalPltGotVaddr, const std::string& runPath, const bool lazyBinding, const bool dependencyDiagnostics, const std::vector<Codegen::TrampolineSite>& trampolines) {
     const auto report = [&](std::uint64_t completed) { if (progress) progress(completed, 10000); };
     report(0);
     diagnostics.clear();
@@ -44,7 +44,7 @@ std::vector<std::uint8_t> WindowsPePatcher::Patch(const std::vector<std::uint8_t
         image.GetRva(originalPltGotVaddr, 8);
     report(500);
     const WindowsRelocationBuilder relocationBuilder;
-    auto relocations = relocationBuilder.Apply(image, dynamicSection);
+    auto relocations = relocationBuilder.Apply(image, dynamicSection, originalHeaders);
     report(1000);
     auto sections = image.BuildSections();
     report(1500);
@@ -110,7 +110,7 @@ std::vector<std::uint8_t> WindowsPePatcher::Patch(const std::vector<std::uint8_t
     }
     directories[2] = icon ? WindowsIconResourceBuilder().Build(*icon, iconName, sections, nextRva) : PeDirectory{};
     report(9500);
-    auto result = WindowsPeWriter().Write(sections, entryRva, directories, windowsGui, fixedBase ? std::optional<std::uint64_t>(image.GetImageBase()) : std::nullopt);
+    auto result = WindowsPeWriter().Write(sections, entryRva, directories, windowsGui, fixedBase ? std::optional<std::uint64_t>(image.GetImageBase()) : std::nullopt, false);
     report(10000);
     return result;
 }

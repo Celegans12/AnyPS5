@@ -21,6 +21,8 @@ int APS5_VABI setcontext_nid_postfix(const UserUcontext* context);
 void APS5_VABI makecontext_nid_postfix(UserUcontext* context, ContextEntry entry, int count, ...);
 [[gnu::returns_twice]] int APS5_VABI setjmp_nid_postfix(std::uint64_t* buffer);
 [[noreturn]] void APS5_VABI longjmp_nid_postfix(std::uint64_t* buffer, int value);
+[[gnu::returns_twice]] int APS5_VABI sigsetjmp_nid_postfix(std::uint64_t* buffer, int saveMask);
+[[noreturn]] void APS5_VABI siglongjmp_nid_postfix(std::uint64_t* buffer, int value);
 int APS5_VABI sigprocmask_nid_postfix(int how, const void* set, void* previousSet);
 int* APS5_VABI __error_nid_postfix();
 
@@ -61,9 +63,9 @@ asm(".text\n"
     "    movabsq $0xcccccccccccccccc, %r11\n"
     "    movabsq $0xdddddddddddddddd, %rdx\n"
     "    movabsq $0xeeeeeeeeeeeeeeee, %rax\n"
-    "    mov %rsp, CapturedStackPointer(%rip)\n"
+    "    mov %rsp, " APS5_ASM_SYMBOL("CapturedStackPointer") "(%rip)\n"
     "    stc\n"
-    "    call getcontext_nid_postfix\n"
+    "    call " APS5_ASM_SYMBOL("getcontext_nid_postfix") "\n"
     APS5_ASM_FUNCTION("CaptureReturnAddress")
     "    add $8, %rsp\n"
     "    pop %r15\n"
@@ -75,50 +77,50 @@ asm(".text\n"
     "    ret\n"
     APS5_ASM_FUNCTION("RecordRegisters")
     "    pushfq\n"
-    "    mov %rax, RecordedRegisters+0x00(%rip)\n"
+    "    mov %rax, " APS5_ASM_SYMBOL("RecordedRegisters") "+0x00(%rip)\n"
     "    pop %rax\n"
-    "    mov %rax, RecordedRegisters+0x88(%rip)\n"
-    "    mov %rbx, RecordedRegisters+0x08(%rip)\n"
-    "    mov %rcx, RecordedRegisters+0x10(%rip)\n"
-    "    mov %rdx, RecordedRegisters+0x18(%rip)\n"
-    "    mov %rsi, RecordedRegisters+0x20(%rip)\n"
-    "    mov %rdi, RecordedRegisters+0x28(%rip)\n"
-    "    mov %rbp, RecordedRegisters+0x30(%rip)\n"
-    "    mov %rsp, RecordedRegisters+0x38(%rip)\n"
-    "    mov %r8, RecordedRegisters+0x40(%rip)\n"
-    "    mov %r9, RecordedRegisters+0x48(%rip)\n"
-    "    mov %r10, RecordedRegisters+0x50(%rip)\n"
-    "    mov %r11, RecordedRegisters+0x58(%rip)\n"
-    "    mov %r12, RecordedRegisters+0x60(%rip)\n"
-    "    mov %r13, RecordedRegisters+0x68(%rip)\n"
-    "    mov %r14, RecordedRegisters+0x70(%rip)\n"
-    "    mov %r15, RecordedRegisters+0x78(%rip)\n"
-    "    stmxcsr RecordedMxcsr(%rip)\n"
-    "    fnstcw RecordedControlWord(%rip)\n"
-    "    movdqu %xmm0, RecordedXmm+0x00(%rip)\n"
-    "    movdqu %xmm1, RecordedXmm+0x10(%rip)\n"
-    "    movdqu %xmm2, RecordedXmm+0x20(%rip)\n"
-    "    movdqu %xmm3, RecordedXmm+0x30(%rip)\n"
-    "    movdqu %xmm4, RecordedXmm+0x40(%rip)\n"
-    "    movdqu %xmm5, RecordedXmm+0x50(%rip)\n"
-    "    movdqu %xmm6, RecordedXmm+0x60(%rip)\n"
-    "    movdqu %xmm7, RecordedXmm+0x70(%rip)\n"
-    "    movdqu %xmm8, RecordedXmm+0x80(%rip)\n"
-    "    movdqu %xmm9, RecordedXmm+0x90(%rip)\n"
-    "    movdqu %xmm10, RecordedXmm+0xa0(%rip)\n"
-    "    movdqu %xmm11, RecordedXmm+0xb0(%rip)\n"
-    "    movdqu %xmm12, RecordedXmm+0xc0(%rip)\n"
-    "    movdqu %xmm13, RecordedXmm+0xd0(%rip)\n"
-    "    movdqu %xmm14, RecordedXmm+0xe0(%rip)\n"
-    "    movdqu %xmm15, RecordedXmm+0xf0(%rip)\n"
+    "    mov %rax, " APS5_ASM_SYMBOL("RecordedRegisters") "+0x88(%rip)\n"
+    "    mov %rbx, " APS5_ASM_SYMBOL("RecordedRegisters") "+0x08(%rip)\n"
+    "    mov %rcx, " APS5_ASM_SYMBOL("RecordedRegisters") "+0x10(%rip)\n"
+    "    mov %rdx, " APS5_ASM_SYMBOL("RecordedRegisters") "+0x18(%rip)\n"
+    "    mov %rsi, " APS5_ASM_SYMBOL("RecordedRegisters") "+0x20(%rip)\n"
+    "    mov %rdi, " APS5_ASM_SYMBOL("RecordedRegisters") "+0x28(%rip)\n"
+    "    mov %rbp, " APS5_ASM_SYMBOL("RecordedRegisters") "+0x30(%rip)\n"
+    "    mov %rsp, " APS5_ASM_SYMBOL("RecordedRegisters") "+0x38(%rip)\n"
+    "    mov %r8, " APS5_ASM_SYMBOL("RecordedRegisters") "+0x40(%rip)\n"
+    "    mov %r9, " APS5_ASM_SYMBOL("RecordedRegisters") "+0x48(%rip)\n"
+    "    mov %r10, " APS5_ASM_SYMBOL("RecordedRegisters") "+0x50(%rip)\n"
+    "    mov %r11, " APS5_ASM_SYMBOL("RecordedRegisters") "+0x58(%rip)\n"
+    "    mov %r12, " APS5_ASM_SYMBOL("RecordedRegisters") "+0x60(%rip)\n"
+    "    mov %r13, " APS5_ASM_SYMBOL("RecordedRegisters") "+0x68(%rip)\n"
+    "    mov %r14, " APS5_ASM_SYMBOL("RecordedRegisters") "+0x70(%rip)\n"
+    "    mov %r15, " APS5_ASM_SYMBOL("RecordedRegisters") "+0x78(%rip)\n"
+    "    stmxcsr " APS5_ASM_SYMBOL("RecordedMxcsr") "(%rip)\n"
+    "    fnstcw " APS5_ASM_SYMBOL("RecordedControlWord") "(%rip)\n"
+    "    movdqu %xmm0, " APS5_ASM_SYMBOL("RecordedXmm") "+0x00(%rip)\n"
+    "    movdqu %xmm1, " APS5_ASM_SYMBOL("RecordedXmm") "+0x10(%rip)\n"
+    "    movdqu %xmm2, " APS5_ASM_SYMBOL("RecordedXmm") "+0x20(%rip)\n"
+    "    movdqu %xmm3, " APS5_ASM_SYMBOL("RecordedXmm") "+0x30(%rip)\n"
+    "    movdqu %xmm4, " APS5_ASM_SYMBOL("RecordedXmm") "+0x40(%rip)\n"
+    "    movdqu %xmm5, " APS5_ASM_SYMBOL("RecordedXmm") "+0x50(%rip)\n"
+    "    movdqu %xmm6, " APS5_ASM_SYMBOL("RecordedXmm") "+0x60(%rip)\n"
+    "    movdqu %xmm7, " APS5_ASM_SYMBOL("RecordedXmm") "+0x70(%rip)\n"
+    "    movdqu %xmm8, " APS5_ASM_SYMBOL("RecordedXmm") "+0x80(%rip)\n"
+    "    movdqu %xmm9, " APS5_ASM_SYMBOL("RecordedXmm") "+0x90(%rip)\n"
+    "    movdqu %xmm10, " APS5_ASM_SYMBOL("RecordedXmm") "+0xa0(%rip)\n"
+    "    movdqu %xmm11, " APS5_ASM_SYMBOL("RecordedXmm") "+0xb0(%rip)\n"
+    "    movdqu %xmm12, " APS5_ASM_SYMBOL("RecordedXmm") "+0xc0(%rip)\n"
+    "    movdqu %xmm13, " APS5_ASM_SYMBOL("RecordedXmm") "+0xd0(%rip)\n"
+    "    movdqu %xmm14, " APS5_ASM_SYMBOL("RecordedXmm") "+0xe0(%rip)\n"
+    "    movdqu %xmm15, " APS5_ASM_SYMBOL("RecordedXmm") "+0xf0(%rip)\n"
     "    cld\n"
-    "    lea ReturnContext(%rip), %rdi\n"
+    "    lea " APS5_ASM_SYMBOL("ReturnContext") "(%rip), %rdi\n"
     "    and $-16, %rsp\n"
-    "    call setcontext_nid_postfix\n"
+    "    call " APS5_ASM_SYMBOL("setcontext_nid_postfix") "\n"
     "    ud2\n"
     APS5_ASM_FUNCTION("EntryThunk")
-    "    mov %rsp, EntryStackPointer(%rip)\n"
-    "    jmp ContextBody\n");
+    "    mov %rsp, " APS5_ASM_SYMBOL("EntryStackPointer") "(%rip)\n"
+    "    jmp " APS5_ASM_SYMBOL("ContextBody") "\n");
 
 namespace {
 
@@ -150,6 +152,7 @@ int g_entries = 0;
 Fibre g_dispatcher = {};
 Fibre g_job = {};
 int g_jobRuns = 0;
+bool g_signalJumps = false;
 
 void Require(bool value, const char* what) {
     if (!value) {
@@ -348,6 +351,14 @@ namespace {
 
 [[gnu::noinline]] void Switch(Fibre* from, Fibre* to) {
     from->started = 1;
+    if (g_signalJumps) {
+        if (sigsetjmp_nid_postfix(from->jump, 1) == 0) {
+            if (to->started) siglongjmp_nid_postfix(to->jump, 1);
+            setcontext_nid_postfix(&to->context);
+            Require(false, "setcontext into the job returned");
+        }
+        return;
+    }
     if (setjmp_nid_postfix(from->jump) == 0) {
         if (to->started) longjmp_nid_postfix(to->jump, 1);
         setcontext_nid_postfix(&to->context);
@@ -360,7 +371,7 @@ namespace {
 extern "C" void APS5_VABI JobEntry() {
     for (;;) {
         ++g_jobRuns;
-        CheckStackBounds(&g_jobStack, "the stack bounds follow longjmp onto the job stack");
+        CheckStackBounds(&g_jobStack, g_signalJumps ? "the stack bounds follow siglongjmp onto the job stack" : "the stack bounds follow longjmp onto the job stack");
         ThrowAndCatch();
         Switch(&g_job, &g_dispatcher);
     }
@@ -402,7 +413,11 @@ void CheckMakecontext() {
 #endif
 }
 
-void CheckJumpBuffers() {
+void CheckJumpBuffers(bool signalJumps) {
+    g_signalJumps = signalJumps;
+    g_jobRuns = 0;
+    g_dispatcher = {};
+    g_job = {};
 #ifdef _WIN32
     ULONG_PTR threadLow = 0;
     ULONG_PTR threadHigh = 0;
@@ -420,7 +435,7 @@ void CheckJumpBuffers() {
         ULONG_PTR low = 0;
         ULONG_PTR high = 0;
         GetCurrentThreadStackLimits(&low, &high);
-        Require(low == threadLow && high == threadHigh, "the stack bounds follow longjmp back to the thread stack");
+        Require(low == threadLow && high == threadHigh, signalJumps ? "the stack bounds follow siglongjmp back to the thread stack" : "the stack bounds follow longjmp back to the thread stack");
 #endif
     }
 }
@@ -466,7 +481,8 @@ int main(int argc, char** argv) {
     CheckSignalMask();
     std::thread([] {
         CheckMakecontext();
-        CheckJumpBuffers();
+        CheckJumpBuffers(false);
+        CheckJumpBuffers(true);
         GrowStack(32);
     }).join();
     return 0;

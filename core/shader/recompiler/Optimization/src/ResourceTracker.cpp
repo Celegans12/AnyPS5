@@ -496,8 +496,31 @@ private:
         return MatchScale(scaled, key, stride) && std::has_single_bit(stride) && stride >= 4u && (mask & ~(stride - 1u)) != 0u && key->Type() == IrType::U32;
     }
 
+    static bool ReadsThroughDescriptor(const IrValue* value) {
+        std::vector<const IrValue*> pending{value};
+        std::vector<const IrValue*> seen;
+        while (!pending.empty()) {
+            const IrValue* current = pending.back()->Resolve();
+            pending.pop_back();
+            if (std::find(seen.begin(), seen.end(), current) != seen.end()) continue;
+            seen.push_back(current);
+            if (current->Opcode() == IrOpcode::ReadConstBuffer || current->Opcode() == IrOpcode::LoadAddressU32) return true;
+            for (std::size_t index = 0; index < current->ArgumentCount(); index++) pending.push_back(current->Argument(index));
+        }
+        return false;
+    }
+
     std::optional<KeyDomain> MatchKeyDomain(IrValue* key) {
         key = key->Resolve();
+        DescriptorSource direct;
+        direct.dwordCount = 1u;
+        direct.dwords[0] = key;
+        std::uint32_t badDword = 0;
+        if (ValidateSource(direct, badDword) && !ReadsThroughDescriptor(key)) {
+            KeyDomain domain{InternSource(direct), 0u, 4u};
+            domain.value = true;
+            return domain;
+        }
         std::uint32_t memoryIndex = 0;
         const MemoryInfo* memory = ScalarReadMemory(*key, memoryIndex);
         if (memory == nullptr) {
@@ -1527,15 +1550,6 @@ private:
         DescriptorSource descriptor;
         MakeSource(*handle, width, sampler, sampleAdjust, descriptor);
         std::uint32_t badDword = 0;
-        if (expected == IrOpcode::GetImageResource) {
-            for (; badDword < descriptor.dwordCount; badDword++) {
-                const IrValue* value2 = descriptor.dwords[badDword]->Resolve();
-                if (value2->Opcode() == IrOpcode::ReadConstBuffer) {
-                    fail(std::string(IrOpcodeName(expected)) + " dword " + std::to_string(badDword) + " is not a valid runtime value; chain: " + describeValueChain(descriptor.dwords[badDword], 8u));
-                }
-            }
-            badDword = 0;
-        }
         if (!ValidateSource(descriptor, badDword)) {
             fail(std::string(IrOpcodeName(expected)) + " dword " + std::to_string(badDword) + " is not a valid runtime value; chain: " + describeValueChain(descriptor.dwords[badDword], 8u));
         }
@@ -1869,11 +1883,11 @@ private:
     std::vector<MemoryPatch> m_memoryPatches;
     // APS5_TRACE_BDA: address accesses seen by Collect (the first bdaTraceLimit are printed).
     unsigned m_bdaTraces = 0;
+    std::unordered_map<std::uint32_t, std::vector<const IrValue*>> m_memoryUsers;
+    bool m_memoryUsersIndexed = false;
     std::vector<TableColumnPlan> m_tableColumns;
     std::vector<const IrValue*> m_tablePlanningReads;
     std::vector<std::uint32_t> m_tablePlanningMemory;
-    std::unordered_map<std::uint32_t, std::vector<const IrValue*>> m_memoryUsers;
-    bool m_memoryUsersIndexed = false;
     struct EdgeSelectorEntry {
         IrBlock* block = nullptr;
         std::vector<bool> edges;

@@ -14,6 +14,7 @@
 #endif
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -64,9 +65,46 @@ alignas(256) constexpr std::array<std::uint32_t, 54> HullCompareBranch{
     0x16161690, 0x4c1616ff, 0x00008000, 0xe0741000, 0x0202070b, 0xbf810000,
 };
 
+alignas(256) constexpr std::array<std::uint32_t, 49> HullSingleInput{
+    0xd7650000, 0x000100c1, 0xd7660000, 0x000200c1, 0xbf8a0000, 0x7da206f9, 0x81060000, 0xd5480014,
+    0x02151101, 0x362402ff, 0x000000ff, 0x160028a0, 0xd5430015, 0x022224ff, 0x00000020, 0xdbfc0000,
+    0x02000015, 0x162c2890, 0xd5430016, 0x045a24ff, 0x00000030, 0xbf8cc07f, 0xe0781000, 0x02020216,
+    0x7da82881, 0xbe94047e, 0xb06a0020, 0x162602f9, 0x0086066a, 0xd8d80008, 0x06000013, 0xd8dc0201,
+    0x07000013, 0xbf8cc07f, 0x7e300306, 0x7e320306, 0x7e340306, 0x7e360306, 0x34142484, 0xbefe0414,
+    0xe0781000, 0x0403180a, 0x4a162481, 0x16161690, 0x4c1616ff, 0x00008000, 0xe0741000, 0x0202070b,
+    0xbf810000,
+};
+
+alignas(256) constexpr std::array<std::uint32_t, 49> HullSingleOutput{
+    0xd7650000, 0x000100c1, 0xd7660000, 0x000200c1, 0xbf8a0000, 0x7da206f9, 0x81060000, 0xd5480014,
+    0x02151101, 0x362402ff, 0x000000ff, 0x160028a0, 0xd5430015, 0x022224ff, 0x00000020, 0xdbfc0000,
+    0x02000015, 0x7e2c0280, 0xd5430016, 0x045a24ff, 0x00000010, 0xbf8cc07f, 0xe0781000, 0x02020216,
+    0xbf800000, 0xbe94047e, 0xb06a0020, 0x162602f9, 0x0086066a, 0xd8d80008, 0x06000013, 0xd8dc0201,
+    0x07000013, 0xbf8cc07f, 0x7e300306, 0x7e320306, 0x7e340306, 0x7e360306, 0x34142484, 0xbefe0414,
+    0xe0781000, 0x0403180a, 0x4a162481, 0x16161690, 0x4c1616ff, 0x00008000, 0xe0741000, 0x0202070b,
+    0xbf810000,
+};
+
 alignas(256) constexpr std::array<std::uint32_t, 51> HullRestoredExecSaved{
     0xd7650000, 0x000100c1, 0xd7660000, 0x000200c1, 0xbf8a0000, 0x7da206f9, 0x81060000, 0xd5480014,
     0x02151101, 0x362402ff, 0x000000ff, 0x160028a0, 0xd5430015, 0x040224ff, 0x00000060, 0xdbfc0000,
+    0x02000015, 0x162c2890, 0xd5430016, 0x045a24ff, 0x00000030, 0xbf8cc07f, 0xe0781000, 0x02020216,
+    0x7da82881, 0xbe94047e, 0xb06a0060, 0x162602f9, 0x0086066a, 0xd8d80008, 0x06000013, 0xd8dc1008,
+    0x07000013, 0xbf8cc07f, 0x7e300306, 0x7e320306, 0x7e340306, 0x7e360306, 0x34142484, 0xbefe0414,
+    0xbe94047e, 0xbefe0414, 0xe0781000, 0x0403180a, 0x4a162481, 0x16161690, 0x4c1616ff, 0x00008000,
+    0xe0741000, 0x0202070b, 0xbf810000,
+};
+
+alignas(256) constexpr std::array<std::uint32_t, 29> LocalCodeStride24{
+    0xd5480004, 0x02090502, 0xd5480005, 0x02090102, 0xd5480006, 0x02110902, 0xd5480007, 0x02111102,
+    0x7e080d04, 0x7e0a0d05, 0x7e0c0d06, 0x7e0e0d07, 0x10100cff, 0x3f19999a, 0x061010ff, 0xbf666666,
+    0x3e1008ff, 0x3e800000, 0xd54b0009, 0x03c5e105, 0x16140698, 0xd9340000, 0x0000080a, 0xd8340008,
+    0x0000070a, 0xd8340010, 0x0000070a, 0xbf8cc07f, 0xbefd2106,
+};
+
+alignas(256) constexpr std::array<std::uint32_t, 51> HullNextInput{
+    0xd7650000, 0x000100c1, 0xd7660000, 0x000200c1, 0xbf8a0000, 0x7da206f9, 0x81060000, 0xd5480014,
+    0x02151101, 0x362402ff, 0x000000ff, 0x16002898, 0xd5430015, 0x040224ff, 0x00000060, 0xdbfc0018,
     0x02000015, 0x162c2890, 0xd5430016, 0x045a24ff, 0x00000030, 0xbf8cc07f, 0xe0781000, 0x02020216,
     0x7da82881, 0xbe94047e, 0xb06a0060, 0x162602f9, 0x0086066a, 0xd8d80008, 0x06000013, 0xd8dc1008,
     0x07000013, 0xbf8cc07f, 0x7e300306, 0x7e320306, 0x7e340306, 0x7e360306, 0x34142484, 0xbefe0414,
@@ -301,6 +339,17 @@ alignas(256) constexpr std::array<std::uint16_t, 9> Indices{
     Corner(2, 0, 0), Corner(2, 2, 0), Corner(2, 1, 2),
 };
 
+alignas(256) constexpr std::array<std::uint16_t, 24> LatePatchIndices{
+    Corner(1, 0, 0), Corner(1, 2, 0), Corner(1, 1, 2),
+    Corner(1, 0, 0), Corner(1, 2, 0), Corner(1, 1, 2),
+    Corner(1, 0, 0), Corner(1, 2, 0), Corner(1, 1, 2),
+    Corner(1, 0, 0), Corner(1, 2, 0), Corner(1, 1, 2),
+    Corner(1, 0, 0), Corner(1, 2, 0), Corner(1, 1, 2),
+    Corner(1, 0, 0), Corner(1, 2, 0), Corner(1, 1, 2),
+    Corner(2, 0, 0), Corner(2, 2, 0), Corner(2, 1, 2),
+    Corner(0, 0, 0), Corner(0, 2, 0), Corner(0, 1, 2),
+};
+
 alignas(256) constexpr std::array<std::uint16_t, 12> QuadIndices{
     Corner(0, 0, 0), Corner(0, 2, 0), Corner(0, 2, 2), Corner(0, 0, 2),
     Corner(1, 0, 0), Corner(1, 2, 0), Corner(1, 2, 2), Corner(1, 0, 2),
@@ -327,7 +376,14 @@ struct PatchDraw {
     std::uint32_t firstInstance = 0;
 };
 
+alignas(256) constexpr std::array<std::uint16_t, 12> NextInputIndices{
+    Corner(0, 0, 0), Corner(0, 0, 0), Corner(0, 2, 0), Corner(0, 1, 2),
+    Corner(1, 0, 0), Corner(1, 0, 0), Corner(1, 2, 0), Corner(1, 1, 2),
+    Corner(2, 0, 0), Corner(2, 0, 0), Corner(2, 2, 0), Corner(2, 1, 2),
+};
+
 const PatchDraw Triangles{Patches, Indices};
+const PatchDraw NextInputTriangles{{4u, 3u, 1u, 2u, 2u}, NextInputIndices};
 
 struct Stages {
     ShaderRecompiler::RecompileResult local;
@@ -453,10 +509,10 @@ std::uint32_t CoveredPixels(std::uint32_t patch, bool interior) {
     return count;
 }
 
-void RequirePatches(AgcDriver::VulkanDevice& device, const ShaderRecompiler::SpirvTarget& target, std::span<const std::uint32_t> hull, const std::string& program, const PatchDraw& patches = Triangles) {
+void RequirePatches(AgcDriver::VulkanDevice& device, const ShaderRecompiler::SpirvTarget& target, std::span<const std::uint32_t> hull, const std::string& program, const PatchDraw& patches = Triangles, std::span<const std::uint32_t> local = LocalCode) {
     std::uint32_t cursor = 0;
     const Stages stages{
-        Compile(target, ShaderStage::Local, LocalCode, cursor, patches),
+        Compile(target, ShaderStage::Local, local, cursor, patches),
         Compile(target, ShaderStage::TessellationControl, hull, cursor, patches),
         Compile(target, ShaderStage::TessellationEvaluation, DomainCode, cursor, patches),
         Compile(target, ShaderStage::Fragment, PixelCode, cursor, patches),
@@ -493,9 +549,29 @@ void RequireCounterClockwise(AgcDriver::VulkanDevice& device, const ShaderRecomp
     Require(CoveredPixels(0, false) > 100 && CoveredPixels(2, false) > 100, "counter-clockwise output did not reverse the control points' winding");
 }
 
+bool HasInstruction(std::span<const std::uint32_t> words, spv::Op opcode, std::uint32_t length, std::uint32_t operand, std::uint32_t value) {
+    for (std::size_t cursor = 5; cursor < words.size();) {
+        const auto count = words[cursor] >> 16u;
+        Require(count != 0 && cursor + count <= words.size(), "malformed SPIR-V while scanning a tessellation module");
+        if ((words[cursor] & 0xffffu) == opcode && count == length && words[cursor + operand] == value) return true;
+        cursor += count;
+    }
+    return false;
+}
+
+bool HasSpacing(const ShaderRecompiler::RecompileResult& domain, spv::ExecutionMode spacing) {
+    return HasInstruction(domain.spirv.Words(), spv::OpExecutionMode, 3u, 2u, static_cast<std::uint32_t>(spacing));
+}
+
+bool HasLevelBound(const ShaderRecompiler::RecompileResult& hull, float bound) {
+    return HasInstruction(hull.spirv.Words(), spv::OpConstant, 4u, 3u, std::bit_cast<std::uint32_t>(bound));
+}
+
 void RequireLevelClamps(AgcDriver::VulkanDevice& device, const ShaderRecompiler::SpirvTarget& target) {
     const auto center = Row(-0.5f + 1.0f / 3.0f);
     const auto stages = CompileTriangles(target, Triangles);
+    Require(HasSpacing(stages.domain, spv::ExecutionModeSpacingFractionalOdd) && !HasSpacing(stages.domain, spv::ExecutionModeSpacingEqual), "fractional-odd partitioning did not compile to fractional-odd spacing");
+    Require(HasLevelBound(stages.hull, 63.0f) && !HasLevelBound(stages.hull, 64.0f), "fractional-odd partitioning did not bound its tessellation factors at 63");
     const PatchDraw flattened{Patches, Indices, 1.0f, 1.0f};
     Draw(device, stages, VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE, flattened);
     Require(CoveredPixels(2, false) > 100 && CoveredPixels(2, true) == 0, "VGT_HOS_MAX_TESS_LEVEL 1 did not flatten the level-5 patch, centre " + PixelText(PixelAt(Column(2, 0.25f), center)));
@@ -525,6 +601,18 @@ void RequirePatchConstants(AgcDriver::VulkanDevice& device, const ShaderRecompil
         Require(pixel[0] == 255 && std::abs(pixel[2] - blue) <= 1, "patch " + std::to_string(patch) + " did not take its blue channel from the patch constant its hull wrote, " + PixelText(pixel));
     }
     Require(PixelAt(Column(1, 0.25f), center) == Background, "the patch with level 0 was not culled");
+}
+
+void RequireIntegerPartitioning(AgcDriver::VulkanDevice& device, const ShaderRecompiler::SpirvTarget& target) {
+    const auto center = Row(-0.5f + 1.0f / 3.0f);
+    const PatchDraw patches{{3u, 3u, 1u, 0u, 2u}, Indices};
+    const auto stages = CompileTriangles(target, patches);
+    Require(HasSpacing(stages.domain, spv::ExecutionModeSpacingEqual) && !HasSpacing(stages.domain, spv::ExecutionModeSpacingFractionalOdd), "integer partitioning did not compile to equal spacing");
+    Require(HasLevelBound(stages.hull, 64.0f) && !HasLevelBound(stages.hull, 63.0f), "integer partitioning did not bound its tessellation factors at 64");
+    Draw(device, stages, VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE, patches);
+    Require(CoveredPixels(0, false) > 100 && CoveredPixels(0, true) == 0, "integer partitioning: the level-1 patch was not drawn as one flat triangle, centre " + PixelText(PixelAt(Column(0, 0.25f), center)));
+    Require(CoveredPixels(1, false) == 0, "integer partitioning: the patch with level 0 was not culled");
+    Require(CoveredPixels(2, false) > 100 && PixelAt(Column(2, 0.25f), center)[1] > 32, "integer partitioning: the level-5 patch has no interior domain points at its centre, " + PixelText(PixelAt(Column(2, 0.25f), center)));
 }
 
 void RequireRelativePatches(AgcDriver::VulkanDevice& device, const ShaderRecompiler::SpirvTarget& target) {
@@ -715,6 +803,24 @@ void RequireRegisteredStages() {
     AgcDriverShutdown_nid_postfix();
 }
 
+ShaderRecompiler::RecompileResult CompileHull(const ShaderRecompiler::SpirvTarget& target, std::span<const std::uint32_t> code, const ShaderRecompiler::TessellationConfiguration& configuration) {
+    static const std::array<std::uint32_t, 16> userData{0x1000u};
+    const std::array<ShaderRecompiler::MemoryRegion, 1> memory{{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)}}};
+    const ShaderRecompiler::RecompileRequest request{
+        {ShaderStage::TessellationControl, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}},
+        {64, 0u, userData, std::nullopt, std::nullopt, ShaderRecompiler::ShaderVertexStageInfo{}, memory},
+        target,
+        ShaderRecompiler::BindingLayout{0, 0, 0, AgcDriver::Graphics::PipelinePushSlotBytes},
+        ShaderRecompiler::GraphicsCompileContext{0u, {}, std::nullopt, configuration, {reinterpret_cast<std::uintptr_t>(Indices.data()), static_cast<std::uint32_t>(Indices.size()), 2, 1}},
+    };
+    return ShaderRecompiler::Recompile(request);
+}
+
+void RequireSingleControlPointHulls(const ShaderRecompiler::SpirvTarget& target) {
+    Require(!CompileHull(target, HullSingleInput, {1u, 3u, 1u, 2u, 2u}).spirv.empty(), "a hull that reads only the one input control point of its patch was not compiled");
+    Require(!CompileHull(target, HullSingleOutput, {1u, 1u, 1u, 2u, 2u}).spirv.empty(), "a hull with one output control point and unguarded patch outputs was not compiled");
+}
+
 }
 
 // sceAgcCreatePrimState resolves the hull and domain programs on the title's thread, inside the
@@ -773,6 +879,7 @@ int main(int argc, char** argv) {
             RequireRegisteredRefusal();
             return 0;
         }
+        RequireSingleControlPointHulls(target);
         ExpectRefusal(target, ShaderStage::TessellationControl, HullUnguardedFactors, "not written by control point 0 alone");
         ExpectRefusal(target, ShaderStage::TessellationControl, HullSquaredAddress, "not a whole number of control points");
         ExpectRefusal(target, ShaderStage::TessellationControl, HullHalfSlotIndex, "not a whole number of control points");
@@ -791,12 +898,14 @@ int main(int argc, char** argv) {
 
         RequirePatches(*device, target, HullCode, "hull program");
         RequirePatches(*device, target, HullRestoredExecSaved, "hull program saving its restored exec");
+        RequirePatches(*device, target, HullNextInput, "hull program reading the next of 4 input control points of 24 bytes", NextInputTriangles, LocalCodeStride24);
         RequirePatches(*device, target, HullDynamicIndex, "hull program reading a control point at a computed index");
         RequirePatches(*device, target, HullAndSaveexec, "hull program narrowing exec with s_and_saveexec_b64");
         RequirePatches(*device, target, HullSaveexecLoop, "hull program restoring exec through loop phis");
         RequirePatches(*device, target, HullDescendingRecords, "hull program with descending patch records in 128-patch groups", {{3u, 3u, 1u, 2u, 2u, 128u}, Indices});
         RequireCounterClockwise(*device, target);
         RequireLevelClamps(*device, target);
+        RequireIntegerPartitioning(*device, target);
         RequireQuads(*device, target);
         RequirePatchConstants(*device, target);
         RequireRelativePatches(*device, target);

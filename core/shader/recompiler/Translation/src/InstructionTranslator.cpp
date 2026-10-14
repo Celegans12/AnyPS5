@@ -340,7 +340,8 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
         const auto* ps = options.inputInfo.pixel;
         const auto vgpr = [&](PixelInput input) { return ps->psInputVgpr[static_cast<std::uint32_t>(input)]; };
         const auto loaded = [&](PixelInput input) { return vgpr(input) != ShaderPixelInputInfo::NoPixelInputVgpr; };
-        for (const auto [input, kind] : {std::pair{PixelInput::PerspectiveCenter, StageInputKind::BaryCoordSmooth}, std::pair{PixelInput::PerspectiveCentroid, StageInputKind::BaryCoordSmooth},
+        for (const auto [input, kind] : {std::pair{PixelInput::PerspectiveSample, StageInputKind::BaryCoordSmooth}, std::pair{PixelInput::PerspectiveCenter, StageInputKind::BaryCoordSmooth},
+                                         std::pair{PixelInput::PerspectiveCentroid, StageInputKind::BaryCoordSmooth}, std::pair{PixelInput::LinearSample, StageInputKind::BaryCoordNoPerspective},
                                          std::pair{PixelInput::LinearCenter, StageInputKind::BaryCoordNoPerspective}, std::pair{PixelInput::LinearCentroid, StageInputKind::BaryCoordNoPerspective}}) {
             if (!loaded(input)) continue;
             setVector(static_cast<VectorReg>(vgpr(input)), builtin(kind, 0u));
@@ -379,6 +380,7 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
         if (options.userDataBaseRegister >= 8u) {
             const auto hostLanes = options.inputInfo.vertex->hostSubgroupSize;
             const std::uint32_t lanes = hostLanes == 1u ? 1u : options.waveSize == 64u && hostLanes == 32u ? 32u : options.waveSize;
+            entryIr.SetScalarReg(static_cast<ScalarReg>(2), entryIr.Constant((lanes << 12u) | (lanes << 22u)));
             entryIr.SetScalarReg(static_cast<ScalarReg>(3), entryIr.Constant(lanes | (lanes << 8u)));
         }
         setVector(static_cast<VectorReg>(5), drawIndex(StageInputKind::VertexIndex));
@@ -516,12 +518,14 @@ IrProgram InstructionTranslator::Translate(const RdnaProgram& decoded, const Con
         }
     }
 
+    const auto entryRounding = ComputeEntryRounding(cfg, decoded, options.floatMode.has_value() ? options.floatMode->floatMode : 0u);
     for (const auto& cfgBlock : cfg.blocks) {
         const auto typedIndex = blockIndices.at(cfgBlock.id);
         TranslationContext context(program, *blocks[typedIndex], vectorLimit);
         context.SetPixelInput(options.inputInfo.pixel, options.fragmentShaderBarycentricEnabled);
         context.SetFloatMode(options.floatMode);
         context.SetNativeFloat16(options.nativeFloat16);
+        context.SetEntryRounding(entryRounding.at(cfgBlock.id));
         for (std::uint32_t index = cfgBlock.instructionBegin; index < cfgBlock.instructionEnd; index++) {
             const auto& instruction = decoded.instructions[index];
             if (isCodeTableLoad(cfg, instruction.programCounter)) {

@@ -62,7 +62,10 @@ class JitObject {
 public:
 #ifdef _WIN32
     JitObject(std::size_t bytes, HANDLE section) : bytes(bytes), section(section) {}
-    ~JitObject() { CloseHandle(section); }
+    ~JitObject() {
+        GuestArena::GuestArenaForgetSection_nid_postfix(section);
+        CloseHandle(section);
+    }
 #else
     explicit JitObject(std::size_t bytes) : bytes(bytes) {}
 #endif

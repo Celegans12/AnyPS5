@@ -17,6 +17,11 @@
 #include <windows.h>
 #include <io.h>
 #include "prx/libkernel/File/include/DirectoryDescriptor.hpp"
+#elif defined(__APPLE__)
+#include <fcntl.h>
+#include <sys/event.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #else
 #include <dirent.h>
 #include <fcntl.h>
@@ -32,12 +37,17 @@ namespace {
 
 constexpr int GUEST_EBADF = 9;
 constexpr int GUEST_EINVAL = 22;
+#ifdef __APPLE__
+static_assert(NOTE_DELETE == 0x0001 && NOTE_WRITE == 0x0002 && NOTE_EXTEND == 0x0004 && NOTE_ATTRIB == 0x0008 &&
+    NOTE_LINK == 0x0010 && NOTE_RENAME == 0x0020);
+#else
 constexpr std::uint32_t NOTE_DELETE = 0x0001;
 constexpr std::uint32_t NOTE_WRITE = 0x0002;
 constexpr std::uint32_t NOTE_EXTEND = 0x0004;
 constexpr std::uint32_t NOTE_ATTRIB = 0x0008;
 constexpr std::uint32_t NOTE_LINK = 0x0010;
 constexpr std::uint32_t NOTE_RENAME = 0x0020;
+#endif
 constexpr std::uint32_t MAPPED_NOTES = NOTE_DELETE | NOTE_WRITE | NOTE_EXTEND | NOTE_ATTRIB | NOTE_LINK | NOTE_RENAME;
 
 class VnodeWatch {
@@ -48,6 +58,15 @@ public:
         if (stopEvent == nullptr) {
             throw std::runtime_error("EVFILT_VNODE: CreateEvent failed, error=" + std::to_string(::GetLastError()));
         }
+#elif defined(__APPLE__)
+        int ends[2];
+        if (::pipe(ends) != 0) {
+            throw std::runtime_error("EVFILT_VNODE: pipe failed, errno=" + std::to_string(errno));
+        }
+        stopEvent = ends[0];
+        stopSignal = ends[1];
+        ::fcntl(stopEvent, F_SETFD, FD_CLOEXEC);
+        ::fcntl(stopSignal, F_SETFD, FD_CLOEXEC);
 #else
         stopEvent = ::eventfd(0, EFD_CLOEXEC);
         if (stopEvent < 0) {
@@ -59,6 +78,9 @@ public:
     ~VnodeWatch() {
 #ifdef _WIN32
         ::CloseHandle(stopEvent);
+#elif defined(__APPLE__)
+        ::close(stopEvent);
+        ::close(stopSignal);
 #else
         ::close(stopEvent);
 #endif
@@ -71,6 +93,10 @@ public:
         stopped.store(true);
 #ifdef _WIN32
         ::SetEvent(stopEvent);
+#elif defined(__APPLE__)
+        const char one = 1;
+        const auto written = ::write(stopSignal, &one, sizeof(one));
+        static_cast<void>(written);
 #else
         const std::uint64_t one = 1;
         const auto written = ::write(stopEvent, &one, sizeof(one));
@@ -96,6 +122,9 @@ private:
     std::atomic<bool> stopped{false};
 #ifdef _WIN32
     HANDLE stopEvent = nullptr;
+#elif defined(__APPLE__)
+    int stopEvent = -1;
+    int stopSignal = -1;
 #else
     int stopEvent = -1;
 #endif
@@ -162,6 +191,10 @@ bool TakeSnapshot(HANDLE handle, Snapshot& snapshot) {
     return true;
 }
 
+bool IsDeleted(const Snapshot& snapshot) {
+    return snapshot.deletePending || snapshot.links == 0;
+}
+
 std::vector<std::uint32_t> SnapshotHints(const Snapshot& before, const Snapshot& after, bool directory) {
     std::vector<std::uint32_t> hints;
     if (!directory) {
@@ -182,7 +215,7 @@ std::vector<std::uint32_t> SnapshotHints(const Snapshot& before, const Snapshot&
     if ((after.deletePending && !before.deletePending) || after.links < before.links) {
         hints.push_back(NOTE_DELETE);
     }
-    if (!after.path.empty() && after.path != before.path) {
+    if (!after.path.empty() && after.path != before.path && !IsDeleted(after)) {
         hints.push_back(NOTE_RENAME);
     }
     return hints;
@@ -276,7 +309,9 @@ void RunHostWatch(std::shared_ptr<VnodeWatch> watch, HostWatch host) {
             }
             if (current.path != host.last.path) {
                 CloseChange(host.parent);
-                host.parent = WatchParent(current.path);
+                if (!IsDeleted(current)) {
+                    host.parent = WatchParent(current.path);
+                }
             }
             host.last = std::move(current);
         }
@@ -323,6 +358,80 @@ int OpenHostWatch(int descriptor, std::uint32_t notes, HostWatch& host) {
     } catch (...) {
         CloseHostWatch(host);
         throw;
+    }
+    return 0;
+}
+
+#elif defined(__APPLE__)
+
+struct HostWatch {
+    int notify = -1;
+    int target = -1;
+};
+
+void CloseHostWatch(HostWatch& host) {
+    for (int* descriptor : {&host.notify, &host.target}) {
+        if (*descriptor >= 0) {
+            ::close(*descriptor);
+            *descriptor = -1;
+        }
+    }
+}
+
+void RunHostWatch(std::shared_ptr<VnodeWatch> watch, HostWatch host) {
+    struct kevent stop {};
+    EV_SET(&stop, watch->StopEvent(), EVFILT_READ, EV_ADD, 0, 0, nullptr);
+    if (::kevent(host.notify, &stop, 1, nullptr, 0, nullptr) < 0) {
+        const int error = errno;
+        CloseHostWatch(host);
+        throw std::runtime_error("EVFILT_VNODE: registering the stop event failed, errno=" + std::to_string(error));
+    }
+    for (;;) {
+        struct kevent event {};
+        if (::kevent(host.notify, nullptr, 0, &event, 1, nullptr) < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            const int error = errno;
+            CloseHostWatch(host);
+            throw std::runtime_error("EVFILT_VNODE: kevent failed, errno=" + std::to_string(error));
+        }
+        if (event.filter != EVFILT_VNODE) {
+            break;
+        }
+        auto notes = event.fflags & MAPPED_NOTES;
+        if ((notes & NOTE_DELETE) != 0) {
+            notes &= ~NOTE_LINK;
+        }
+        watch->Deliver(notes);
+    }
+    CloseHostWatch(host);
+}
+
+int OpenHostWatch(int descriptor, std::uint32_t, HostWatch& host) {
+    struct stat status {};
+    if (::fstat(descriptor, &status) != 0) {
+        return GUEST_EBADF;
+    }
+    if (S_ISFIFO(status.st_mode) || S_ISSOCK(status.st_mode)) {
+        return GUEST_EINVAL;
+    }
+    if (!S_ISREG(status.st_mode) && !S_ISDIR(status.st_mode)) {
+        NotImplemented_nid_no_patch("EVFILT_VNODE: a descriptor that is not a file or a directory");
+    }
+    host.target = ::fcntl(descriptor, F_DUPFD_CLOEXEC, 0);
+    if (host.target < 0) {
+        const int error = errno;
+        CloseHostWatch(host);
+        throw std::runtime_error("EVFILT_VNODE: duplicating the watched descriptor failed, errno=" + std::to_string(error));
+    }
+    host.notify = ::kqueue();
+    struct kevent change {};
+    EV_SET(&change, host.target, EVFILT_VNODE, EV_ADD | EV_CLEAR, MAPPED_NOTES, 0, nullptr);
+    if (host.notify < 0 || ::kevent(host.notify, &change, 1, nullptr, 0, nullptr) < 0) {
+        const int error = errno;
+        CloseHostWatch(host);
+        throw std::runtime_error("EVFILT_VNODE: kqueue failed, errno=" + std::to_string(error));
     }
     return 0;
 }

@@ -23,6 +23,7 @@ char* APS5_VABI asctime_nid_postfix(const GuestTm*);
 std::int64_t APS5_VABI mktime_nid_postfix(GuestTm*);
 std::size_t APS5_VABI strftime_nid_postfix(char*, std::size_t, const char*, const GuestTm*);
 void APS5_VABI tzset_nid_postfix(void);
+extern char* tzname_nid_postfix[2];
 char* APS5_VABI ctime_nid_postfix(const std::int64_t*);
 int* APS5_VABI __error_nid_postfix();
 double APS5_VABI libc_difftime_nid_postfix(std::int64_t, std::int64_t);
@@ -400,4 +401,14 @@ int main() {
     GuestTm shifted{};
     Require(localtime_s_nid_postfix(&epoch, &shifted) == &shifted && shifted.tm_hour == 5 && shifted.tm_gmtoff == 18000,
         "tzset did not pick up the new TZ");
+    Require(tzname_nid_postfix[0] != nullptr && std::strcmp(tzname_nid_postfix[0], "UTC") == 0 && tzname_nid_postfix[1] != nullptr,
+        "tzname does not name the zone tzset set");
+#ifdef _WIN32
+    _putenv_s("TZ", "EST5EDT");
+#else
+    setenv("TZ", "EST5EDT", 1);
+#endif
+    tzset_nid_postfix();
+    Require(std::strcmp(tzname_nid_postfix[0], "EST") == 0 && std::strcmp(tzname_nid_postfix[1], "EDT") == 0,
+        "tzname does not name the standard and daylight zones");
 }

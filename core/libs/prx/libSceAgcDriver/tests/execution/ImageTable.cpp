@@ -173,6 +173,19 @@ alignas(256) constexpr std::array<std::uint32_t, 17> ReadDirect256Code{
     0xbf810000u,
 };
 
+alignas(256) constexpr std::array<std::uint32_t, 22> ReadTableCounterLoopCode{
+    0xf4080100u, 0xfa000000u, 0xf4080700u, 0xfa000020u, 0x360200bfu, 0x7e040280u, 0xbea80380u, 0x9312b028u,
+    0xf42c0802u, 0x24000000u, 0xf0008f08u, 0x00090401u, 0x7e120228u, 0x34101286u, 0x4a101100u, 0x34101084u,
+    0xe0781000u, 0x80070408u, 0x80288128u, 0xbf0a8328u, 0xbf85fff2u, 0xbf810000u,
+};
+
+alignas(256) constexpr std::array<std::uint32_t, 28> ReadTableSetBitLoopCode{
+    0xf4080100u, 0xfa000000u, 0xf4080200u, 0xfa000010u, 0xf4080700u, 0xfa000020u, 0xf4200a44u, 0xfa000000u,
+    0x360200bfu, 0x7e040280u, 0xbea80380u, 0xbeaa1329u, 0x9312b02au, 0xf42c0802u, 0x24000000u, 0xf0008f08u,
+    0x00090401u, 0x7e120228u, 0x34101286u, 0x4a101100u, 0x34101084u, 0xe0781000u, 0x80070408u, 0x80288128u,
+    0xbea91b2au, 0xbf078029u, 0xbf85fff0u, 0xbf810000u,
+};
+
 alignas(256) constexpr std::array<std::uint32_t, 17> StoreTableCode{
     0xf4080100u, 0xfa000000u, 0xf4080200u, 0xfa000010u, 0x8f108202u, 0xf4200444u, 0x20000000u, 0x9312b011u,
     0xf42c0802u, 0x24000000u, 0x360200bfu, 0x7e040202u, 0x7e0802ffu, 0x00003e00u, 0xf0202108u, 0x80080401u,
@@ -635,6 +648,41 @@ void RunBorderSwizzleTests(AgcDriver::VulkanDevice& device) {
     Require(Holds(cut.samplerTable, opaqueBlack), "image table border: the EXEC-clear opaque-black S# was not included in the snapshot");
     Require(!Faulted(cut), "image table border: an opaque-black S# selected with EXEC clear faulted:\n" + cut.log);
     Require(std::all_of(cut.words.begin(), cut.words.end(), [](std::uint32_t word) { return word == 0xdeadbeefu; }), "image table border: the EXEC-clear shader wrote output");
+    for (const std::uint32_t border : {0u, 2u}) {
+        auto sampler = opaqueBlack;
+        sampler[3] = border << 30u;
+        const auto name = "image table border numeric class " + std::to_string(border);
+        const auto direct = RunDirect(device, sampler, floatImage);
+        Require(!Faulted(direct), name + ": the direct float-border control faulted");
+        RequireRed(direct, 0, Lanes, [](std::uint32_t x) { return std::bit_cast<std::uint32_t>(FloatTexels[x]); }, name + " direct float texels");
+        SetRecord(0, PointClamp, floatImage);
+        SetRecord(1, PointClamp, Image(UintTexels.data(), Format32UInt));
+        Keys[0] = 0;
+        Keys[1] = 1;
+        const auto inactiveImage = RunDirectCode(device, TableDirectSamplerCode, sampler, floatImage);
+        Require(inactiveImage.imageTableCount == 2u, name + ": the inactive integer T# was not included in the snapshot");
+        Require(!Faulted(inactiveImage) && Group(inactiveImage, 0) == Group(direct, 0), name + ": an inactive integer T# poisoned the float-border pair:\n" + inactiveImage.log);
+        Keys[0] = 1;
+        Keys[1] = 0;
+        requireFault(RunDirectCode(device, TableDirectSamplerCode, sampler, floatImage), "border color numeric class disagrees", name + " active integer T#");
+        SetRecord(0, PointClamp, floatImage);
+        SetRecord(1, sampler, floatImage);
+        for (const bool tableImage : {false, true}) {
+            const auto pair = name + (tableImage ? " table T#/table S#" : " direct T#/table S#");
+            Keys[0] = 0;
+            Keys[1] = 1;
+            const auto inactiveSampler = tableImage ? RunDirectCode(device, TableCode, PointClamp, floatImage) : RunDirectCode(device, TableSamplerCode, PointClamp, floatImage);
+            Require(Holds(inactiveSampler.samplerTable, sampler), pair + ": the inactive border S# was not included in the snapshot");
+            Require(!Faulted(inactiveSampler) && Group(inactiveSampler, 0) == Group(direct, 0), pair + ": an inactive rejected S# poisoned the active pair:\n" + inactiveSampler.log);
+            Keys[0] = 1;
+            Keys[1] = 0;
+            const auto activeSampler = tableImage ? RunDirectCode(device, TableCode, PointClamp, floatImage) : RunDirectCode(device, TableSamplerCode, PointClamp, floatImage);
+            requireFault(activeSampler, "sampler table entry with a border needs dynamic texture numeric-class pairing", pair);
+        }
+        const auto inactiveExec = Run(device, TableCutCode, 1, Lanes, 64);
+        Require(Holds(inactiveExec.samplerTable, sampler), name + ": the EXEC-clear border S# was not included in the snapshot");
+        Require(!Faulted(inactiveExec) && std::all_of(inactiveExec.words.begin(), inactiveExec.words.end(), [](std::uint32_t word) { return word == 0xdeadbeefu; }), name + ": the EXEC-clear border S# faulted or wrote output:\n" + inactiveExec.log);
+    }
 }
 
 void RunAnisoOverrideTests(AgcDriver::VulkanDevice& device) {
@@ -793,8 +841,7 @@ void RunTests(AgcDriver::VulkanDevice& device) {
     Require(!Faulted(unmappedUnused) && Group(unmappedUnused, 0) == Group(classes, 0), "image table: an unreferenced unmapped entry changed the result:\n" + unmappedUnused.log);
     Keys[0] = 8;
     const auto unmappedUsed = Run(device, TableCode, 1, Lanes, 64);
-    const auto unmappedControl = RunDirect(device, PointClamp, unmappedImage);
-    Require(Faulted(unmappedUsed) ? unmappedUsed.log.find("rejected by the driver") != std::string::npos || unmappedUsed.log.find("unmapped") != std::string::npos : Group(unmappedUsed, 0) == Group(unmappedControl, 0), "image table: an unmapped entry neither faulted nor matched the direct binding:\n" + unmappedUsed.log);
+    Require(Faulted(unmappedUsed) && unmappedUsed.log.find("rejected by the driver") != std::string::npos && unmappedUsed.log.find("is not mapped") != std::string::npos && Zeros(unmappedUsed), "image table: an entry whose surface is not mapped was bound instead of faulting when selected:\n" + unmappedUsed.log);
     SetRecord(8, PointClamp, floatImage);
 #ifdef _WIN32
     VirtualFree(reserved, 0, MEM_RELEASE);
@@ -913,6 +960,31 @@ void RunReadTests(AgcDriver::VulkanDevice& device) {
     RequireRed(halves, 1, Lanes, [](std::uint32_t x) { return UintTexels[x] & 0xffffu; }, "image table d16 read: uint texels");
 
     RunWaveKeys(device, ReadTableWave32Code, "image table read");
+}
+
+void RequireIterations(const Outcome& outcome, std::span<const std::uint32_t> records, const std::string& what) {
+    Require(!Faulted(outcome) && outcome.imageTableCount != 0u, what + ": the loop did not read through the table:\n" + outcome.log);
+    for (std::uint32_t iteration = 0; iteration < records.size(); ++iteration) {
+        for (std::uint32_t lane = 0; lane < Lanes; ++lane) {
+            const auto* texel = Output.data() + (iteration * Lanes + lane) * 4u;
+            const auto record = records[iteration];
+            const auto expected = record == 0u ? std::bit_cast<std::uint32_t>(FloatTexels[lane]) : record == 1u ? UintTexels[lane] : record == 2u ? static_cast<std::uint32_t>(SintTexels[lane]) : 0u;
+            Require(texel[0] == expected && (record != 6u || std::all_of(texel, texel + 4, [](std::uint32_t word) { return word == 0u; })), what + ": iteration " + std::to_string(iteration) + " read " + Hex(texel[0]) + " at lane " + std::to_string(lane) + ", expected record " + std::to_string(record) + "'s " + Hex(expected));
+        }
+    }
+}
+
+void RunLoopKeyTests(AgcDriver::VulkanDevice& device) {
+    SetClassRecords();
+    Keys = {};
+    const std::array<std::uint32_t, 3> counted{0u, 1u, 2u};
+    RequireIterations(Run(device, ReadTableCounterLoopCode, 1, Lanes, 64), counted, "image table loop counter key");
+    Keys[0] = 0x45u;
+    const std::array<std::uint32_t, 3> setBits{0u, 2u, 6u};
+    RequireIterations(Run(device, ReadTableSetBitLoopCode, 1, Lanes, 64), setBits, "image table set-bit key");
+    Keys[0] = 0x6u;
+    const std::array<std::uint32_t, 2> otherBits{1u, 2u};
+    RequireIterations(Run(device, ReadTableSetBitLoopCode, 1, Lanes, 64), otherBits, "image table set-bit key after the mask changed");
 }
 
 void RunGuardedTableTests(AgcDriver::VulkanDevice& device) {
@@ -1645,6 +1717,7 @@ int main(int argc, char** argv) {
         RunBorderSwizzleTests(*device);
         RunAnisoOverrideTests(*device);
         RunReadTests(*device);
+        RunLoopKeyTests(*device);
         RunGuardedTableTests(*device);
         RunModeTests(*device);
         RunStoreTests(*device);

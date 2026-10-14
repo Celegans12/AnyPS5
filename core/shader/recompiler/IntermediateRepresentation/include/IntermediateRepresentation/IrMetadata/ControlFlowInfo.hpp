@@ -23,6 +23,7 @@ struct KeyDomain {
     std::uint32_t source = 0;
     std::uint32_t offset = 0;
     std::uint32_t stride = 4;
+    bool value = false;
 
     bool operator==(const KeyDomain& other) const = default;
 };

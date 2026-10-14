@@ -21,6 +21,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <stdexcept>
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
@@ -120,6 +121,7 @@ struct CachedTexture {
     std::uint64_t sourceVersion = 0;
     std::uint64_t accounted = 0;
     std::uint64_t present = 0;
+    std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> committed;
 };
 
 // Entries in use order (front = most recent) with a hash index by key: a lookup is O(1) and the
@@ -949,7 +951,8 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     // memory first.
     const bool depthCopy = depthCompare && guestBytes >= DepthCopyMinBytes() && Texture::DepthCopyFormat(ResolveTextureFormat(resource.format)) != VK_FORMAT_UNDEFINED && resource.dimension != TextureDimension::k3D;
     auto source = StorageTexture::FindPending(address, guestBytes);
-    if (source != nullptr && (depthCompare ? !depthCopy || !Texture::CanDepthCopyFrom(*source, resource) : !Texture::CanCopyFrom(*source, resource))) source.reset();
+    const bool blockCopy = source != nullptr && !depthCompare && Texture::CanBlockCopyFrom(*source, resource);
+    if (source != nullptr && !blockCopy && (depthCompare ? !depthCopy || !Texture::CanDepthCopyFrom(*source, resource) : !Texture::CanCopyFrom(*source, resource))) source.reset();
     if (source != nullptr && MetadataMoved(*source, resource)) source.reset();
     std::optional<DccKeys> keys;
     bool clearThroughKeys = false;
@@ -1021,10 +1024,24 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             texture->RefreshDepthCopy();
             return texture;
         }
+        if (source != nullptr && blockCopy) {
+            auto texture = std::make_shared<Texture>(context, source, resource, components, Texture::BlockCopyTag{});
+            texture->RefreshDepthCopy();
+            return texture;
+        }
         if (source != nullptr) return std::make_shared<Texture>(context, source, resource, components);
         std::vector<std::byte> snapshot(bytes);
         ReadTextureSurface(resource, *keys, snapshot);
         return std::make_shared<Texture>(context, *context.detiler, resource, components, snapshot, depthCompare);
+    }
+    auto snapshotGeneration = generation;
+    std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> committed;
+    if (source == nullptr && generation == 0) {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+        if (const auto partial = GuestMemory::CollectCommittedWrites(address, bytes, ranges); partial != 0) {
+            snapshotGeneration = partial;
+            committed = std::move(ranges);
+        }
     }
     auto& cache = Textures();
     const auto key = MakeTextureKey(context.device, words, components, depthCompare);
@@ -1059,8 +1076,13 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 GuestMemory::FlushGpuWrites(address, bytes);
                 return GuestMemory::CommittedBlocksMatch(address, bytes, it->hashes);
             };
-            if ((*keys != DccKeys::Uncompressed && *keys != DccKeys::ClearSingle) || GuestMemory::UnchangedSince(address, bytes, it->generation) || equalsCommitted()) {
-                it->generation = generation;
+            const auto unchanged = [&] {
+                if (it->committed != committed) return false;
+                return committed.has_value() ? !Recorder::SnapshotWriteOverlaps(address, bytes) && GuestMemory::UnchangedCommittedSince(*committed, it->generation) : GuestMemory::UnchangedSince(address, bytes, it->generation);
+            };
+            if ((*keys != DccKeys::Uncompressed && *keys != DccKeys::ClearSingle) || unchanged() || equalsCommitted()) {
+                it->generation = snapshotGeneration;
+                it->committed = std::move(committed);
                 touchTexture(cache, it);
                 logLookup({it->texture.get(), resource, guestBytes, *keys, generation, nullptr});
                 reportTextureCounters();
@@ -1125,12 +1147,16 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             eraseOneOff(cache, found);
         }
     }
-    CachedTexture entry{key, address, source != nullptr ? 0u : guestBytes, {}, nullptr, *keys, generation};
+    CachedTexture entry{key, address, source != nullptr ? 0u : guestBytes, {}, nullptr, *keys, snapshotGeneration};
+    entry.committed = std::move(committed);
     if (source != nullptr) {
         entry.source = source;
         entry.sourceVersion = source->Version();
         if (depthCompare) {
             entry.texture = std::make_shared<Texture>(context, source, resource, components, Texture::DepthCopyTag{});
+            entry.texture->RefreshDepthCopy();
+        } else if (blockCopy) {
+            entry.texture = std::make_shared<Texture>(context, source, resource, components, Texture::BlockCopyTag{});
             entry.texture->RefreshDepthCopy();
         } else {
             entry.texture = std::make_shared<Texture>(context, source, resource, components);
@@ -2131,7 +2157,6 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
             for (const auto& binding : shader.program->bindings) {
                 Require(binding.descriptorSet == ShaderRecompiler::RuntimeAbi::DescriptorSet || (shader.stage == ShaderRecompiler::ShaderStage::Fragment && binding.descriptorSet == ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet), "unexpected descriptor set: a shader resource must use its stage's descriptor set");
                 if (binding.role == ShaderRecompiler::DescriptorRole::ImageTable) {
-                    Require(binding.descriptorSet == ShaderRecompiler::RuntimeAbi::DescriptorSet, "image tables bind in descriptor set zero in every stage");
                     const bool storage = binding.kind == ShaderRecompiler::DescriptorKind::StorageImage;
                     Require((storage || binding.kind == ShaderRecompiler::DescriptorKind::SampledImage) && binding.binding == (storage ? ShaderRecompiler::RuntimeAbi::StorageImageTableBinding : ShaderRecompiler::RuntimeAbi::ImageTableBinding) && binding.guestDescriptor.size() == static_cast<std::size_t>(binding.count) * 8u && binding.imageShapes.size() == binding.count && binding.imageDepthCompare.size() == binding.count && binding.imageSamplers.size() == binding.count && (!storage || (!binding.readOnly && binding.imageWritten.size() == binding.count)), "image table binding is malformed");
                     auto& table = tableStage(shader);
@@ -2230,8 +2255,9 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
                 if (table.program == shader.program && table.images != nullptr) table.samplerCount = samplers.size() - table.firstSampler;
             }
         }
-        VkShaderStageFlags tableFlags = 0;
-        VkShaderStageFlags storageTableFlags = 0;
+        splitSets = SplitsSets(context, shaders);
+        std::array<VkShaderStageFlags, 2> tableFlags{};
+        std::array<VkShaderStageFlags, 2> storageTableFlags{};
         for (auto& table : tableStages) {
             Require(table.mapAllocation != std::numeric_limits<std::size_t>::max(), "an image table stage has no map");
             const auto& map = table.map;
@@ -2243,24 +2269,28 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
             const auto samplerFaults = map[ShaderRecompiler::ImageTableAbi::HeaderSamplerFaults];
             Require(static_cast<std::uint64_t>(faults) + elements <= map.size() && static_cast<std::uint64_t>(samplerFaults) + map[ShaderRecompiler::ImageTableAbi::HeaderSamplerCount] / 4u <= map.size(), "image table map is truncated");
             if (table.images == nullptr && table.storageImages == nullptr) continue;
-            table.elementBase = tableElements;
+            const auto* tableBinding = table.images != nullptr ? table.images : table.storageImages;
+            table.set = tableBinding->descriptorSet == ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet ? 1u : 0u;
+            table.elementBase = tableElements[table.set];
             table.map[ShaderRecompiler::ImageTableAbi::HeaderElementBase] = table.elementBase;
-            tableElements += elements;
-            if (table.images != nullptr) tableFlags |= VulkanStage(table.stage);
-            if (table.storageImages != nullptr) storageTableFlags |= VulkanStage(table.stage);
+            tableElements[table.set] += elements;
+            if (table.images != nullptr) tableFlags[table.set] |= VulkanStage(table.stage);
+            if (table.storageImages != nullptr) storageTableFlags[table.set] |= VulkanStage(table.stage);
         }
-        std::uint32_t storageTableDescriptors = 0;
-        if (storageTableFlags != 0) {
-            storageTableDescriptors = StorageImageTableDescriptorCount(context, tableElements, tableFlags != 0);
-            Require(storageTableDescriptors != 0, "storage image tables exceed device descriptor limits or require unavailable descriptor indexing features");
-            bindings.push_back({{ShaderRecompiler::RuntimeAbi::StorageImageTableBinding, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, storageTableDescriptors, storageTableFlags, nullptr}, {}, {}, VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT});
-            storageTableBinding = bindings.size() - 1u;
-        }
-        if (tableFlags != 0) {
-            sampledTableCapacity = storageTableDescriptors == 0 ? context.imageTableCapacity : std::min(context.imageTableCapacity, ImageTableCapacity(context, storageTableDescriptors));
-            Require(sampledTableCapacity != 0, "image tables exceed device descriptor limits or require unavailable descriptor indexing features");
-            bindings.push_back({{ShaderRecompiler::RuntimeAbi::ImageTableBinding, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, sampledTableCapacity, tableFlags, nullptr}, {}, {}, VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT});
-            tableBinding = bindings.size() - 1u;
+        for (std::uint32_t set = 0; set < tableFlags.size(); ++set) {
+            std::uint32_t storageTableDescriptors = 0;
+            if (storageTableFlags[set] != 0) {
+                storageTableDescriptors = StorageImageTableDescriptorCount(context, tableElements[set], tableFlags[set] != 0);
+                Require(storageTableDescriptors != 0, "storage image tables exceed device descriptor limits or require unavailable descriptor indexing features");
+                bindings.push_back({{ShaderRecompiler::RuntimeAbi::StorageImageTableBinding, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, storageTableDescriptors, storageTableFlags[set], nullptr}, {}, {}, VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT, static_cast<std::int32_t>(set)});
+                storageTableBindings[set] = bindings.size() - 1u;
+            }
+            if (tableFlags[set] == 0) continue;
+            Require(context.imageTableCapacity != 0, "image tables need runtimeDescriptorArray, descriptorBindingPartiallyBound and descriptorBindingVariableDescriptorCount, which the device lacks");
+            sampledTableCapacity[set] = storageTableDescriptors == 0 ? context.imageTableCapacity : std::min(context.imageTableCapacity, ImageTableCapacity(context, storageTableDescriptors));
+            Require(sampledTableCapacity[set] != 0, "image tables exceed device descriptor limits or require unavailable descriptor indexing features");
+            bindings.push_back({{ShaderRecompiler::RuntimeAbi::ImageTableBinding, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, sampledTableCapacity[set], tableFlags[set], nullptr}, {}, {}, VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT, static_cast<std::int32_t>(set)});
+            tableBindings[set] = bindings.size() - 1u;
         }
         if (storageBuffers > context.limits.maxDescriptorSetStorageBuffers) {
             Require(storageBuffers <= context.descriptorIndexingLimits.maxDescriptorSetUpdateAfterBindStorageBuffers, "pipeline descriptors exceed device limits");
@@ -2281,7 +2311,6 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
             (set == 0 ? layoutBindingFlags : fragmentBindingFlags).push_back(binding.flags | (updateAfterBind && binding.layout.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ? VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT : 0));
             auto& key = set == 0 ? layoutKey : fragmentLayoutKey;
             key.insert(key.end(), {binding.layout.binding, static_cast<std::uint32_t>(binding.layout.descriptorType), binding.layout.descriptorCount, binding.layout.stageFlags});
-            if (binding.flags != 0) key.push_back(binding.flags);
         }
         if (updateAfterBind) {
             layoutKey.push_back(VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT);
@@ -2289,6 +2318,32 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
         }
         static const bool noLayoutCache = std::getenv("APS5_NO_LAYOUT_CACHE") != nullptr;
         static const bool noPoolCache = std::getenv("APS5_NO_POOL_CACHE") != nullptr;
+        const auto tableDescriptorCount = [&](std::size_t set) { return std::max(1u, std::min(tableElements[set], sampledTableCapacity[set])); };
+        const auto tableVariableCount = [&](std::size_t set) { return tableBindings[set] != std::numeric_limits<std::size_t>::max() ? std::optional<std::uint32_t>(tableDescriptorCount(set)) : std::nullopt; };
+        const auto splitPoolSizes = [&](std::size_t set) {
+            std::map<VkDescriptorType, std::uint32_t> counts;
+            for (std::size_t index = 0; index < bindings.size(); ++index) {
+                if (setOf(bindings[index]) != set) continue;
+                counts[bindings[index].layout.descriptorType] += index == tableBindings[set] ? tableDescriptorCount(set) : bindings[index].layout.descriptorCount;
+            }
+            std::vector<VkDescriptorPoolSize> sizes;
+            for (const auto& [type, count] : counts) sizes.push_back({type, count});
+            return sizes;
+        };
+        const auto allocateVariableSet = [&](VkDescriptorPool from, VkDescriptorSetLayout layout, std::optional<std::uint32_t> variableCount) {
+            const std::uint32_t variable = variableCount.value_or(0u);
+            VkDescriptorSetVariableDescriptorCountAllocateInfoEXT variableInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_ALLOCATE_INFO_EXT};
+            variableInfo.descriptorSetCount = 1;
+            variableInfo.pDescriptorCounts = &variable;
+            VkDescriptorSetAllocateInfo allocation{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+            allocation.pNext = variableCount.has_value() ? &variableInfo : nullptr;
+            allocation.descriptorPool = from;
+            allocation.descriptorSetCount = 1;
+            allocation.pSetLayouts = &layout;
+            VkDescriptorSet set = VK_NULL_HANDLE;
+            Check(context.Function<PFN_vkAllocateDescriptorSets>("vkAllocateDescriptorSets")(context.device, &allocation, &set), "vkAllocateDescriptorSets");
+            return set;
+        };
         const auto createLayout = [&](const std::vector<std::uint32_t>& key, const std::vector<VkDescriptorSetLayoutBinding>& description, const std::vector<VkDescriptorBindingFlags>& flags, bool& owns) {
             if (context.descriptorCache != nullptr && !noLayoutCache) return context.descriptorCache->Layout(key, description, updateAfterBind, flags);
             ValidateDescriptorLayout(context, description, updateAfterBind);
@@ -2296,53 +2351,48 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
             return CreateSetLayout(context, description, updateAfterBind, flags);
         };
         _layout = createLayout(layoutKey, descriptions[0], layoutBindingFlags, ownsLayout);
-        // The image tables (a variable-count binding) live in set zero; the split sets size every other
-        // binding from its layout.
-        const auto tableDescriptors = std::min(tableElements, sampledTableCapacity);
-        const auto variableCount = tableBinding != std::numeric_limits<std::size_t>::max() ? std::optional<std::uint32_t>(tableDescriptors) : std::nullopt;
-        const auto splitSizes = [&](std::uint32_t set) {
-            std::map<VkDescriptorType, std::uint32_t> counts;
-            for (const auto& binding : bindings) {
-                if (setOf(binding) == set) counts[binding.layout.descriptorType] += (binding.flags & VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT) != 0 ? tableDescriptors : binding.layout.descriptorCount;
-            }
-            std::vector<VkDescriptorPoolSize> sizes;
-            for (const auto& [type, count] : counts) {
-                if (count != 0) sizes.push_back({type, count});
-            }
-            return sizes;
-        };
         if (splitSets) {
             fragment.layout = createLayout(fragmentLayoutKey, descriptions[1], fragmentBindingFlags, fragment.ownsLayout);
-            const auto sizes = splitSizes(1);
-            if (context.descriptorCache != nullptr && !noPoolCache) {
-                fragment.cacheAllocation = context.descriptorCache->Allocate(fragment.layout, sizes, updateAfterBind);
-                fragment.set = fragment.cacheAllocation.set;
-            }
-            if (fragment.set == VK_NULL_HANDLE) {
-                fragment.pool = CreateSetPool(context, sizes, updateAfterBind);
-                VkDescriptorSetAllocateInfo allocation{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-                allocation.descriptorPool = fragment.pool;
-                allocation.descriptorSetCount = 1;
-                allocation.pSetLayouts = &fragment.layout;
-                Check(context.Function<PFN_vkAllocateDescriptorSets>("vkAllocateDescriptorSets")(context.device, &allocation, &fragment.set), "vkAllocateDescriptorSets");
+            {
+                const auto sizes = splitPoolSizes(1);
+                const auto variableCount = tableVariableCount(1);
+                if (context.descriptorCache != nullptr && !noPoolCache) {
+                    fragment.cacheAllocation = context.descriptorCache->Allocate(fragment.layout, sizes, updateAfterBind, variableCount);
+                    fragment.set = fragment.cacheAllocation.set;
+                }
+                if (fragment.set == VK_NULL_HANDLE) {
+                    fragment.pool = CreateSetPool(context, sizes, updateAfterBind);
+                    fragment.set = allocateVariableSet(fragment.pool, fragment.layout, variableCount);
+                }
             }
         }
-        if (splitSets || !bindings.empty()) {
-            // Unsplit, the set is sized from the plan: every image element becomes exactly one
-            // descriptor when stage B looks it up.
-            std::vector<VkDescriptorPoolSize> sizes;
-            if (splitSets) {
-                sizes = splitSizes(0);
-            } else {
-                if (storageBuffers != 0) sizes.push_back({VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, static_cast<std::uint32_t>(storageBuffers)});
-                if (plannedSampledImages + tableDescriptors != 0) sizes.push_back({VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, plannedSampledImages + tableDescriptors});
-                if (plannedStorageImages + storageTableDescriptors != 0) sizes.push_back({VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, plannedStorageImages + storageTableDescriptors});
-                std::uint32_t samplerDescriptors = 0;
-                for (const auto& binding : bindings) {
-                    if (binding.layout.descriptorType == VK_DESCRIPTOR_TYPE_SAMPLER) samplerDescriptors += binding.layout.descriptorCount;
-                }
-                if (samplerDescriptors != 0) sizes.push_back({VK_DESCRIPTOR_TYPE_SAMPLER, samplerDescriptors});
+        if (splitSets) {
+            const auto sizes = splitPoolSizes(0);
+            const auto variableCount = tableVariableCount(0);
+            if (context.descriptorCache != nullptr && !noPoolCache) {
+                cacheAllocation = context.descriptorCache->Allocate(_layout, sizes, updateAfterBind, variableCount);
+                _set = cacheAllocation.set;
             }
+            if (_set == VK_NULL_HANDLE) {
+                pool = CreateSetPool(context, sizes, updateAfterBind);
+                _set = allocateVariableSet(pool, _layout, variableCount);
+            }
+        }
+        if (!splitSets && !bindings.empty()) {
+            // The set is sized from the plan: every image element becomes exactly one descriptor
+            // when stage B looks it up.
+            std::vector<VkDescriptorPoolSize> sizes;
+            if (storageBuffers != 0) sizes.push_back({VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, static_cast<std::uint32_t>(storageBuffers)});
+            const auto tableDescriptors = tableBindings[0] != std::numeric_limits<std::size_t>::max() ? tableDescriptorCount(0) : 0u;
+            if (plannedSampledImages + tableDescriptors != 0) sizes.push_back({VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, plannedSampledImages + tableDescriptors});
+            const auto storageTableDescriptors = storageTableBindings[0] != std::numeric_limits<std::size_t>::max() ? bindings[storageTableBindings[0]].layout.descriptorCount : 0u;
+            if (plannedStorageImages + storageTableDescriptors != 0) sizes.push_back({VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, plannedStorageImages + storageTableDescriptors});
+            std::uint32_t samplerDescriptors = 0;
+            for (const auto& binding : bindings) {
+                if (binding.layout.descriptorType == VK_DESCRIPTOR_TYPE_SAMPLER) samplerDescriptors += binding.layout.descriptorCount;
+            }
+            if (samplerDescriptors != 0) sizes.push_back({VK_DESCRIPTOR_TYPE_SAMPLER, samplerDescriptors});
+            const auto variableCount = tableVariableCount(0);
             if (context.descriptorCache != nullptr && !noPoolCache) {
                 const auto allocated = context.descriptorCache->Allocate(_layout, sizes, updateAfterBind, variableCount);
                 _set = allocated.set;
@@ -2384,6 +2434,10 @@ DescribedSetLayouts DescribeSetLayouts(const Context& context, std::span<const C
     DescribedSetLayouts result;
     std::array<std::vector<VkDescriptorSetLayoutBinding>, 2> descriptions;
     const bool split = SplitsSets(context, shaders);
+    std::array<std::vector<VkDescriptorBindingFlags>, 2> bindingFlags;
+    std::array<VkShaderStageFlags, 2> tableFlags{};
+    std::array<VkShaderStageFlags, 2> storageTableFlags{};
+    std::array<std::uint32_t, 2> tableElements{};
     bool updateAfterBind = false;
     std::uint64_t storageBuffers = 0;
     for (const auto& shader : shaders) {
@@ -2391,7 +2445,21 @@ DescribedSetLayouts DescribeSetLayouts(const Context& context, std::span<const C
         const VkShaderStageFlags flags = VulkanStage(shader.stage);
         std::uint64_t stageStorageBuffers = 0;
         std::uint64_t stageResources = 0;
+        std::uint32_t stageTableElements = 0;
+        std::size_t tableSet = 0;
         for (const auto& binding : shader.program->bindings) {
+            const auto set = binding.descriptorSet == ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet ? 1 : 0;
+            if (binding.role == ShaderRecompiler::DescriptorRole::ImageTable) {
+                tableSet = static_cast<std::size_t>(set);
+                (binding.kind == ShaderRecompiler::DescriptorKind::StorageImage ? storageTableFlags : tableFlags)[tableSet] |= flags;
+                stageTableElements = std::max(stageTableElements, binding.count);
+                continue;
+            }
+            if (binding.role == ShaderRecompiler::DescriptorRole::SamplerTable) {
+                descriptions[set].push_back({binding.binding, VK_DESCRIPTOR_TYPE_SAMPLER, context.samplerTableCapacity, flags, nullptr});
+                bindingFlags[set].push_back(VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT);
+                continue;
+            }
             const bool image = binding.role == ShaderRecompiler::DescriptorRole::GuestImages || binding.role == ShaderRecompiler::DescriptorRole::GuestSamplers;
             const auto type = !image ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : binding.kind == ShaderRecompiler::DescriptorKind::StorageImage ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : binding.kind == ShaderRecompiler::DescriptorKind::SampledImage ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLER;
             if (type != VK_DESCRIPTOR_TYPE_SAMPLER) stageResources += binding.count;
@@ -2400,18 +2468,37 @@ DescribedSetLayouts DescribeSetLayouts(const Context& context, std::span<const C
                 storageBuffers += binding.count;
             }
             if (stageStorageBuffers > context.limits.maxPerStageDescriptorStorageBuffers || stageResources > context.limits.maxPerStageResources) updateAfterBind = true;
-            descriptions[binding.descriptorSet == ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet ? 1 : 0].push_back({binding.binding, type, binding.count, flags, nullptr});
+            descriptions[set].push_back({binding.binding, type, binding.count, flags, nullptr});
+            bindingFlags[set].push_back(0);
         }
+        tableElements[tableSet] += stageTableElements;
+    }
+    for (std::size_t set = 0; set < tableFlags.size(); ++set) {
+        std::uint32_t storageTableDescriptors = 0;
+        if (storageTableFlags[set] != 0) {
+            storageTableDescriptors = StorageImageTableDescriptorCount(context, tableElements[set], tableFlags[set] != 0);
+            descriptions[set].push_back({ShaderRecompiler::RuntimeAbi::StorageImageTableBinding, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, storageTableDescriptors, storageTableFlags[set], nullptr});
+            bindingFlags[set].push_back(VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT);
+        }
+        if (tableFlags[set] == 0) continue;
+        const auto capacity = storageTableDescriptors == 0 ? context.imageTableCapacity : std::min(context.imageTableCapacity, ImageTableCapacity(context, storageTableDescriptors));
+        descriptions[set].push_back({ShaderRecompiler::RuntimeAbi::ImageTableBinding, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, capacity, tableFlags[set], nullptr});
+        bindingFlags[set].push_back(VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT);
     }
     if (storageBuffers > context.limits.maxDescriptorSetStorageBuffers) updateAfterBind = true;
+    for (std::size_t set = 0; set < descriptions.size(); ++set) {
+        for (std::size_t index = 0; index < descriptions[set].size(); ++index) {
+            if (updateAfterBind && descriptions[set][index].descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) bindingFlags[set][index] |= VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT;
+        }
+    }
     for (std::size_t set = 0; set < descriptions.size(); ++set) {
         auto& key = set == 0 ? result.mainKey : result.fragmentKey;
         for (const auto& binding : descriptions[set]) key.insert(key.end(), {binding.binding, static_cast<std::uint32_t>(binding.descriptorType), binding.descriptorCount, binding.stageFlags});
         if (updateAfterBind && (set == 0 || split)) key.push_back(VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT);
     }
     result.layouts.split = split;
-    result.layouts.main = context.descriptorCache->Layout(result.mainKey, descriptions[0], updateAfterBind);
-    if (split) result.layouts.fragment = context.descriptorCache->Layout(result.fragmentKey, descriptions[1], updateAfterBind);
+    result.layouts.main = context.descriptorCache->Layout(result.mainKey, descriptions[0], updateAfterBind, bindingFlags[0]);
+    if (split) result.layouts.fragment = context.descriptorCache->Layout(result.fragmentKey, descriptions[1], updateAfterBind, bindingFlags[1]);
     return result;
 }
 
@@ -2610,7 +2697,7 @@ void ShaderResources::noteReusable() {
     captureValidation();
     reusable = false;
     directRegions.clear();
-    if (storageTableBinding != std::numeric_limits<std::size_t>::max()) return;
+    if (storageTableBindings[0] != std::numeric_limits<std::size_t>::max() || storageTableBindings[1] != std::numeric_limits<std::size_t>::max()) return;
     if (guestMemory.HasCopiedWrites() || HoldsLease() || usesBda || (bda != nullptr && LoopGuardEnabled())) return;
     if (std::any_of(storageTextures.begin(), storageTextures.end(), [](const auto& texture) { return texture != nullptr && DepthSurfaceAt(texture->Descriptor().baseAddress); })) return;
     if (std::any_of(textures.begin(), textures.end(), [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->RefreshedPerUse(); })) return;
@@ -2626,6 +2713,13 @@ void ShaderResources::noteReusable() {
         if (serial == 0) serial = ImageMirrorSerial(context, begin, static_cast<std::size_t>(end - begin));
         if (serial == 0) return;
         directRegions.push_back({begin, end, serial});
+    }
+    for (const auto& cut : guestMemory.CutRegions()) {
+        for (auto& region : directRegions) {
+            if (region.begin != cut.begin) continue;
+            region.regionEnd = cut.end;
+            region.committedEnd = cut.committedEnd;
+        }
     }
     reusable = true;
 }
@@ -2707,9 +2801,115 @@ void VisitContentKey(const CompiledShader& shader, bool dataWords, bool movableB
 std::vector<std::uint32_t> ShaderResources::ContentKey(const CompiledShader& shader, bool dataWords, bool movableBuffers) {
     Require(shader.program != nullptr, "missing compiled shader");
     std::vector<std::uint32_t> key;
-    key.reserve(8u + shader.program->bindings.size() * 12u);
+    std::size_t words = 5;
+    const auto addWords = [&](std::size_t count) {
+        if (count > key.max_size() - words) throw std::length_error("resource content key exceeds vector limits");
+        words += count;
+    };
+    for (const auto& binding : shader.program->bindings) {
+        addWords(19);
+        addWords(binding.imageSamplers.size());
+        addWords(binding.imageShapes.size());
+        if ((dataWords && !movableBuffers) || !DataRole(binding.role)) addWords(binding.guestDescriptor.size());
+        for (const auto* bits : {&binding.imageWritten, &binding.samplerDepthCompare, &binding.imageDepthCompare, &binding.imageAtomic, &binding.samplerUnnormalized, &binding.samplerIntegerBorder, &binding.imageUnnormalized, &binding.imageUnnormalizedBaseLevel, &binding.bufferWritten}) addWords(bits->size() / 32u + (bits->size() % 32u != 0 ? 1u : 0u));
+    }
+    key.reserve(words);
     VisitContentKey(shader, dataWords, movableBuffers, [&](std::uint32_t word) { key.push_back(word); });
     return key;
+}
+
+namespace {
+
+using Component = ContentKeyComponent;
+
+bool LabelShaderKey(std::span<const std::uint32_t> key, std::size_t at, std::size_t end, bool movable, std::vector<std::uint8_t>& labels) {
+    const auto label = [&](std::size_t first, std::size_t count, Component component) {
+        if (first + count > end) return false;
+        std::fill(labels.begin() + static_cast<std::ptrdiff_t>(first), labels.begin() + static_cast<std::ptrdiff_t>(first + count), static_cast<std::uint8_t>(component));
+        return true;
+    };
+    if (!label(at, 5, Component::Layout)) return false;
+    const bool dataWords = key[at] != 0;
+    const auto bindings = key[at + 4];
+    at += 5;
+    for (std::uint32_t binding = 0; binding < bindings; ++binding) {
+        if (!label(at, 8, Component::Layout)) return false;
+        const auto role = static_cast<ShaderRecompiler::DescriptorRole>(key[at + 1]);
+        const auto size = key[at + 7];
+        at += 8;
+        const auto words = DataRole(role) && !(dataWords && !movable) ? 0u : size;
+        if (at + words > end) return false;
+        for (std::uint32_t i = 0; i < words; ++i) {
+            auto component = Component::Other;
+            if (role == ShaderRecompiler::DescriptorRole::GuestBuffers) component = static_cast<Component>(static_cast<std::size_t>(Component::BufferWord0) + i % 4u);
+            else if (role == ShaderRecompiler::DescriptorRole::GuestImages || role == ShaderRecompiler::DescriptorRole::ImageTable) component = Component::Image;
+            else if (role == ShaderRecompiler::DescriptorRole::GuestSamplers || role == ShaderRecompiler::DescriptorRole::SamplerTable) component = Component::Sampler;
+            else if (DataRole(role)) component = Component::ShaderData;
+            labels[at + i] = static_cast<std::uint8_t>(component);
+        }
+        at += words;
+        for (int flags = 0; flags < 9; ++flags) {
+            if (at >= end) return false;
+            const auto count = 1 + (static_cast<std::size_t>(key[at]) + 31) / 32;
+            if (!label(at, count, Component::Other)) return false;
+            at += count;
+        }
+        if (at >= end) return false;
+        const auto samplers = static_cast<std::size_t>(key[at]);
+        if (!label(at, 1 + samplers, Component::Sampler)) return false;
+        at += 1 + samplers;
+        if (at >= end) return false;
+        const auto shapes = static_cast<std::size_t>(key[at]);
+        if (!label(at, 1 + shapes, Component::Image)) return false;
+        at += 1 + shapes;
+    }
+    return at == end;
+}
+
+bool LabelContentKey(std::span<const std::uint32_t> key, bool draw, bool movable, std::vector<std::uint8_t>& labels) {
+    labels.assign(key.size(), static_cast<std::uint8_t>(Component::Layout));
+    if (!draw) {
+        if (LabelShaderKey(key, 0, key.size(), movable, labels)) return true;
+        if (key.size() < 2) return false;
+        labels.assign(key.size(), static_cast<std::uint8_t>(Component::Layout));
+        if (!LabelShaderKey(key, 0, key.size() - 2, movable, labels)) return false;
+        labels[key.size() - 2] = static_cast<std::uint8_t>(Component::Other);
+        labels[key.size() - 1] = static_cast<std::uint8_t>(Component::Other);
+        return true;
+    }
+    if (key.size() < 4) return false;
+    std::fill(labels.begin() + 1, labels.begin() + 3, static_cast<std::uint8_t>(Component::Other));
+    std::size_t at = 4;
+    for (std::uint32_t stage = 0; stage < key[3]; ++stage) {
+        if (at >= key.size()) return false;
+        const auto size = static_cast<std::size_t>(key[at]);
+        ++at;
+        if (at + size > key.size() || !LabelShaderKey(key, at, at + size, movable, labels)) return false;
+        at += size;
+    }
+    if (at >= key.size()) return false;
+    for (auto tail = at + 1; tail < key.size(); ++tail) labels[tail] = static_cast<std::uint8_t>(Component::DrawTarget);
+    return true;
+}
+
+}
+
+bool ShaderResources::DiffContentKeys(std::span<const std::uint32_t> previous, std::span<const std::uint32_t> key, bool draw, ContentKeyDiff& diff) {
+    diff = {};
+    std::vector<std::uint8_t> labels;
+    bool labelled = false;
+    for (const bool movable : {draw, false}) {
+        labelled = LabelContentKey(key, draw, movable, labels);
+        if (labelled) break;
+    }
+    if (!labelled || previous.size() != key.size()) {
+        diff[static_cast<std::size_t>(Component::Layout)] = true;
+        return false;
+    }
+    for (std::size_t i = 0; i < key.size(); ++i) {
+        if (previous[i] != key[i]) diff[labels[i]] = true;
+    }
+    return true;
 }
 
 bool MatchesContentKey(const CompiledShader& shader, std::span<const std::uint32_t> key) {
@@ -3423,6 +3623,10 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             auto serial = HostImportSerial(context, region.begin, static_cast<std::size_t>(region.end - region.begin), true);
             if (serial == 0) serial = ImageMirrorSerial(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
             if (serial != region.serial) return false;
+            if (region.regionEnd != 0) {
+                const auto committed = GuestMemory::DescribeCommitted(region.begin, static_cast<std::size_t>(region.regionEnd - region.begin));
+                if (committed.ranges.size() != 1 || committed.ranges.front().first != region.begin || committed.ranges.front().second != region.committedEnd) return false;
+            }
         }
         return true;
     };
@@ -3480,6 +3684,14 @@ namespace {
 // seen for the same shader variant(s) and the first differing word is charged to its binding's role
 // (and to its index within the V# or T# element), printed as [rescache] every 10 s: it says whether
 // V# bases of ring allocations, SRT words or image descriptors churn.
+struct KeyMissWindow {
+    std::uint64_t compared = 0;
+    std::uint64_t noCandidate = 0;
+    std::uint64_t unlabelled = 0;
+    std::uint64_t identical = 0;
+    std::array<std::uint64_t, static_cast<std::size_t>(ContentKeyComponent::Count)> differing{};
+};
+
 struct ChurnCounts {
     std::array<std::uint64_t, 8> roles{};
     std::array<std::uint64_t, 4> bufferWords{};
@@ -3488,6 +3700,7 @@ struct ChurnCounts {
     std::uint64_t sameKey = 0;
     std::uint64_t layout = 0;
     std::uint64_t drawWords = 0;
+    KeyMissWindow window;
 };
 
 // Dispatch keys and draw keys are counted apart: what churns a draw's key decides the draw steps.
@@ -3496,8 +3709,20 @@ struct ChurnProfile {
     std::unordered_map<std::uint64_t, ResourceCache::Key> lastByVariant;
     ChurnCounts dispatch;
     ChurnCounts draws;
+    std::unordered_map<std::uint64_t, std::uint32_t> tracedByVariant;
+    std::size_t tracedLines = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
+
+constexpr std::size_t MaxTracedLines = 256;
+constexpr std::uint32_t MaxTracedLinesPerVariant = 4;
+
+const char* componentName(std::size_t component) {
+    constexpr std::array<const char*, static_cast<std::size_t>(ContentKeyComponent::Count)> names{"layout", "V# word 0", "V# word 1", "V# word 2", "V# word 3", "image", "sampler", "shader-data", "other", "draw target/index"};
+    return names[component];
+}
+
+void traceMiss(ChurnProfile& churn, bool draw, std::uint64_t variants, const ContentKeyDiff* parts);
 
 ChurnProfile& Churn() {
     static ChurnProfile profile;
@@ -3561,9 +3786,28 @@ std::shared_ptr<ShaderResources> ResourceCache::Find(const Key& key) {
     return found->second->second;
 }
 
+namespace {
+
+void traceMiss(ChurnProfile& churn, bool draw, std::uint64_t variants, const ContentKeyDiff* parts) {
+    if (churn.tracedLines >= MaxTracedLines || ++churn.tracedByVariant[variants] > MaxTracedLinesPerVariant) return;
+    ++churn.tracedLines;
+    std::string changed = parts == nullptr ? "first-seen" : "";
+    for (std::size_t i = 0; parts != nullptr && i < parts->size(); ++i) {
+        if (!(*parts)[i]) continue;
+        if (!changed.empty()) changed += ", ";
+        changed += componentName(i);
+    }
+    if (changed.empty()) changed = "no-component-change";
+    const auto hashed = (variants ^ 0x9e3779b97f4a7c15ull) * 0xff51afd7ed558ccdull;
+    AgcDriver::ProfilePrint_nid_no_patch("[keymiss] resource-content %s shader set %016llx: %s\n", draw ? "draw" : "dispatch", static_cast<unsigned long long>(hashed ^ (hashed >> 33u)), changed.c_str());
+}
+
+}
+
 void ResourceCache::noteMiss(const Key& key) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    if (!profile || key.size() < 5) return;
+    static const bool trace = std::getenv("APS5_TRACE_RESOURCE_KEY_MISSES") != nullptr;
+    if ((!profile && !trace) || key.size() < 5) return;
     // The variant(s) the key belongs to: a compute key starts with the data-words flag, the stage
     // and its variant, a draw key with a marker, the device and its stages' keys (Draw.cpp
     // DrawResourceKey).
@@ -3584,6 +3828,8 @@ void ResourceCache::noteMiss(const Key& key) {
     const auto found = churn.lastByVariant.find(variants);
     if (found == churn.lastByVariant.end()) {
         ++counts.firstSeen;
+        ++counts.window.noCandidate;
+        if (trace) traceMiss(churn, draw, variants, nullptr);
         churn.lastByVariant.emplace(variants, key);
     } else {
         const auto& previous = found->second;
@@ -3603,6 +3849,19 @@ void ResourceCache::noteMiss(const Key& key) {
         } else {
             std::size_t at = 0;
             if (!chargeShaderKey(counts, key, at, diff)) ++counts.layout;
+        }
+        if (trace) {
+            ContentKeyDiff parts;
+            ++counts.window.compared;
+            if (!ShaderResources::DiffContentKeys(previous, key, draw, parts)) ++counts.window.unlabelled;
+            bool anyPart = false;
+            for (std::size_t i = 0; i < parts.size(); ++i) {
+                if (!parts[i]) continue;
+                ++counts.window.differing[i];
+                anyPart = true;
+            }
+            if (!anyPart) ++counts.window.identical;
+            traceMiss(churn, draw, variants, &parts);
         }
         found->second = key;
     }
@@ -3628,8 +3887,20 @@ void ResourceCache::noteMiss(const Key& key) {
         line += item;
         AgcDriver::ProfilePrint_nid_no_patch("%s\n", line.c_str());
     };
-    report("dispatch", churn.dispatch);
-    report("draws", churn.draws);
+    if (profile) {
+        report("dispatch", churn.dispatch);
+        report("draws", churn.draws);
+    }
+    const auto keyMiss = [](const char* what, KeyMissWindow& window) {
+        const auto count = [](std::uint64_t value) { return static_cast<unsigned long long>(value); };
+        const auto part = [&](ContentKeyComponent component) { return count(window.differing[static_cast<std::size_t>(component)]); };
+        AgcDriver::ProfilePrint_nid_no_patch("[keymiss] resource-content %s (10 s): misses %llu; differing: layout %llu, V# word0 %llu, V# word1 %llu, V# word2 %llu, V# word3 %llu, image %llu, sampler %llu, shader-data %llu, other %llu, draw target/index %llu; no-candidate %llu; identical %llu; not comparable %llu\n", what, count(window.compared + window.noCandidate), part(ContentKeyComponent::Layout), part(ContentKeyComponent::BufferWord0), part(ContentKeyComponent::BufferWord1), part(ContentKeyComponent::BufferWord2), part(ContentKeyComponent::BufferWord3), part(ContentKeyComponent::Image), part(ContentKeyComponent::Sampler), part(ContentKeyComponent::ShaderData), part(ContentKeyComponent::Other), part(ContentKeyComponent::DrawTarget), count(window.noCandidate), count(window.identical), count(window.unlabelled));
+        window = KeyMissWindow{};
+    };
+    if (trace) {
+        keyMiss("dispatch", churn.dispatch.window);
+        keyMiss("draw", churn.draws.window);
+    }
 }
 
 void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> resources, std::vector<std::shared_ptr<ShaderResources>>* evicted) {
@@ -3653,6 +3924,19 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
         return static_cast<std::size_t>(parsed != 0 ? parsed : 1024ull);
     }();
     while (entries.size() > capacity) drop(std::prev(entries.end()), evicted);
+    if (entries.front().second->TableElements() == 0) return;
+    std::uint64_t tables = 0;
+    for (const auto& entry : entries) tables += entry.second->TableElements();
+    for (auto it = std::prev(entries.end()); tables > TableElementBudget() && it != entries.begin();) {
+        const auto elements = it->second->TableElements();
+        if (elements == 0) {
+            --it;
+            continue;
+        }
+        tables -= elements;
+        const auto victim = it--;
+        drop(victim, evicted);
+    }
 }
 
 void ResourceCache::Remove(const Key& key, const ShaderResources* object) {
@@ -3747,6 +4031,22 @@ void ResourceCache::Clear() {
 std::size_t ResourceCache::Size() const {
     std::lock_guard lock(mutex);
     return entries.size();
+}
+
+std::uint64_t ResourceCache::TableElementBudget() {
+    static const std::uint64_t elements = [] {
+        const char* value = std::getenv("APS5_RESOURCE_CACHE_TABLE_ELEMENTS");
+        const auto parsed = value ? std::strtoull(value, nullptr, 10) : 65536ull;
+        return static_cast<std::uint64_t>(parsed != 0 ? parsed : 65536ull);
+    }();
+    return elements;
+}
+
+std::uint64_t ResourceCache::TableElements() const {
+    std::lock_guard lock(mutex);
+    std::uint64_t tables = 0;
+    for (const auto& entry : entries) tables += entry.second->TableElements();
+    return tables;
 }
 
 void ResourceCache::erase(const Key& key) {
@@ -4246,7 +4546,7 @@ bool ShaderResources::precollectImages() {
 }
 
 std::shared_ptr<Texture> ShaderResources::fastTexture(const ImageRecord& record) {
-    if (record.texture == nullptr || record.texture->RefreshedPerUse()) return nullptr;
+    if (record.texture == nullptr || record.texture->RefreshedPerUse() || record.texture->IsDepthCopy()) return nullptr;
     struct Outcome {
         bool profile;
         std::chrono::steady_clock::time_point start;
@@ -4293,7 +4593,7 @@ std::shared_ptr<Texture> ShaderResources::fastTexture(const ImageRecord& record)
     auto& cache = Textures();
     std::lock_guard lock(cache.mutex);
     const auto it = findSampledEntry(cache, context.device, record.words, record.components);
-    if (it == cache.entries.end() || it->texture != record.texture) return nullptr;
+    if (it == cache.entries.end() || it->texture != record.texture || it->committed.has_value()) return nullptr;
     if (it->source == nullptr) it->generation = record.generation;
     touchTexture(cache, it);
     logLookup({record.texture.get(), record.resource, record.guestBytes, keys, record.source != nullptr ? 0 : record.generation, record.source.get()});
@@ -4512,8 +4812,11 @@ void ShaderResources::addSamplerTable(const ShaderRecompiler::DescriptorBinding&
         for (std::uint32_t element = first; rejected.empty() && element < first + Abi::SamplerEntryElements; ++element) {
             try {
                 const auto elementWords = std::span<const std::uint32_t, 4>(binding.guestDescriptor.data() + static_cast<std::size_t>(element) * 4u, 4u);
-                const auto resource = DecodeSamplerResource(elementWords);
+                auto resource = DecodeSamplerResource(elementWords);
+                resource.compareEnable = binding.samplerDepthCompare.at(element);
+                Sampler::Validate(context, resource);
                 Require(!Sampler::ReadsOpaqueBlackBorder(resource), "a sampler table entry with an opaque black border needs dynamic texture BC-swizzle pairing, which is not implemented");
+                Require(resource.addressModeU != VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER && resource.addressModeV != VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER && resource.addressModeW != VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER, "a sampler table entry with a border needs dynamic texture numeric-class pairing, which is not implemented");
                 Require(!resource.nonSeamlessCube || context.nonSeamlessCubeMap, "a sampler table entry that disables seamless cube filtering needs VK_EXT_non_seamless_cube_map because dynamic texture/sampler pairing is not implemented");
                 Require(!SingleLevelSamplerWords(elementWords, true, false).has_value(), "a sampler table entry with anisotropic ANISO_OVERRIDE needs dynamic texture mip-level pairing, which is not implemented");
             } catch (const std::runtime_error& error) {
@@ -4544,12 +4847,13 @@ void ShaderResources::addSamplerTable(const ShaderRecompiler::DescriptorBinding&
 }
 
 void ShaderResources::resolveStorageImageTables() {
-    if (storageTableBinding == std::numeric_limits<std::size_t>::max()) return;
-    auto& item = bindings[storageTableBinding];
-    const auto capacity = item.layout.descriptorCount;
-    item.imageAllocations.assign(capacity, std::numeric_limits<std::size_t>::max());
+    for (const auto index : storageTableBindings) {
+        if (index != std::numeric_limits<std::size_t>::max()) bindings[index].imageAllocations.assign(bindings[index].layout.descriptorCount, std::numeric_limits<std::size_t>::max());
+    }
     for (auto& table : tableStages) {
         if (table.storageImages == nullptr) continue;
+        auto& item = bindings[storageTableBindings[table.set]];
+        const auto capacity = item.layout.descriptorCount;
         const auto& binding = *table.storageImages;
         const auto faults = table.map[ShaderRecompiler::ImageTableAbi::HeaderElementFaults];
         for (std::uint32_t element = 0; element < binding.count; ++element) {
@@ -4582,25 +4886,34 @@ void ShaderResources::resolveStorageImageTables() {
 }
 
 void ShaderResources::resolveImageTables() {
-    if (tableBinding == std::numeric_limits<std::size_t>::max()) return;
+    if (tableBindings[0] == std::numeric_limits<std::size_t>::max() && tableBindings[1] == std::numeric_limits<std::size_t>::max()) return;
     auto& counters = TextureCounts();
-    auto& item = bindings[tableBinding];
-    item.imageAllocations.assign(std::min(tableElements, sampledTableCapacity), std::numeric_limits<std::size_t>::max());
+    for (std::size_t set = 0; set < tableBindings.size(); ++set) {
+        if (tableBindings[set] != std::numeric_limits<std::size_t>::max()) bindings[tableBindings[set]].imageAllocations.assign(std::min(tableElements[set], sampledTableCapacity[set]), std::numeric_limits<std::size_t>::max());
+    }
     for (auto& table : tableStages) {
         if (table.images == nullptr) continue;
+        auto& item = bindings[tableBindings[table.set]];
+        const auto tableCapacity = sampledTableCapacity[table.set];
         const auto& binding = *table.images;
         const auto faults = table.map[ShaderRecompiler::ImageTableAbi::HeaderElementFaults];
         const auto stageSamplers = std::span<const std::shared_ptr<Sampler>>(samplers).subspan(table.firstSampler, table.samplerCount);
         table.elementTextures.assign(binding.count, std::numeric_limits<std::size_t>::max());
-        const auto capacityMessage = [&] { return "the image table exceeds the device's capacity of " + std::to_string(sampledTableCapacity) + " images"; };
+        const auto capacityMessage = [&] { return "the image table exceeds the device's capacity of " + std::to_string(tableCapacity) + " images"; };
         const auto bind = [&](std::uint32_t element, std::span<const std::uint32_t> words, std::shared_ptr<Texture> texture, const GuestTextureResource& resource, std::uint64_t guestBytes, bool firstLayer) {
             try {
                 RequireFilterMinmax(context, texture->ViewFormat(), binding.imageSamplers.at(element), stageSamplers);
                 RequireBorderSwizzle(resource.bcSwizzle, binding.imageSamplers.at(element), stageSamplers);
                 RequireNonSeamlessCube(resource.dimension == TextureDimension::kCube, binding.imageSamplers.at(element), stageSamplers);
+                const auto numeric = ShaderRecompiler::DepthBitsTextureWidth(words[1], words[3]) != 0u ? ShaderRecompiler::IrTextureNumericClass::Float : ShaderRecompiler::SampledTextureNumericClass(static_cast<ShaderRecompiler::IrBufferFormat>(resource.format));
+                const bool integerImage = numeric == ShaderRecompiler::IrTextureNumericClass::Uint || numeric == ShaderRecompiler::IrTextureNumericClass::Sint;
                 for (std::uint32_t sampler = 0; sampler < stageSamplers.size() && sampler < 32u; ++sampler) {
                     if (((binding.imageSamplers.at(element) >> sampler) & 1u) == 0) continue;
-                    Require(!SingleLevelSamplerWords(samplerSources.at(table.firstSampler + sampler).words, true, false).has_value(), "an image table entry paired with anisotropic ANISO_OVERRIDE needs dynamic texture mip-level pairing, which is not implemented");
+                    const auto& source = samplerSources.at(table.firstSampler + sampler);
+                    const auto descriptor = DecodeSamplerResource(source.words, source.unnormalized, true, source.integerBorder);
+                    const bool border = descriptor.addressModeU == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER || descriptor.addressModeV == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER || descriptor.addressModeW == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+                    Require(!border || source.integerBorder == integerImage, "an image table entry's sampler border color numeric class disagrees with its sampled image class, which needs dynamic pairing and is not implemented");
+                    Require(!SingleLevelSamplerWords(source.words, true, false).has_value(), "an image table entry paired with anisotropic ANISO_OVERRIDE needs dynamic texture mip-level pairing, which is not implemented");
                 }
             } catch (const std::runtime_error& error) {
                 table.map[faults + element] = rejectTableElement(table, words, error.what());
@@ -4619,12 +4932,13 @@ void ShaderResources::resolveImageTables() {
             for (std::uint32_t element = 0; element < binding.count; ++element) {
                 const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 8u, 8u);
                 const auto& entry = reused->elements[element];
-                if (static_cast<std::uint64_t>(table.elementBase) + element >= sampledTableCapacity) {
+                if (static_cast<std::uint64_t>(table.elementBase) + element >= tableCapacity) {
                     if (!entry.rejected) ++next;
                     table.map[faults + element] = rejectTableElement(table, words, capacityMessage());
                 } else if (entry.rejected) {
                     table.map[faults + element] = rejectTableElement(table, words, entry.message);
                 } else {
+                    CompletePendingCpuWrites(context, entry.resource.baseAddress, static_cast<std::size_t>(entry.guestBytes));
                     bind(element, words, std::move(*next++), entry.resource, entry.guestBytes, entry.firstLayer);
                 }
             }
@@ -4640,7 +4954,7 @@ void ShaderResources::resolveImageTables() {
                 continue;
             }
             const auto absolute = static_cast<std::uint64_t>(table.elementBase) + element;
-            if (absolute >= sampledTableCapacity) {
+            if (absolute >= tableCapacity) {
                 table.map[faults + element] = rejectTableElement(table, words, capacityMessage());
                 reusable = false;
                 continue;
@@ -4654,12 +4968,15 @@ void ShaderResources::resolveImageTables() {
                 firstLayer = shape == ShaderRecompiler::DescriptorImageShape::Image2D && resource.dimension == TextureDimension::k2DArray;
                 if (!firstLayer && !MatchesGuestDimension(shape, resource.dimension)) throw std::runtime_error("AGC graphics: guest texture dimension disagrees with the table entry's image shape (shape " + std::to_string(static_cast<int>(shape)) + ", dimension " + std::to_string(static_cast<int>(resource.dimension)) + ")");
                 guestBytes = DescribeSurface(resource).guestBytes;
+                if (!GuestMemory::Accessible(reinterpret_cast<const void*>(resource.baseAddress), static_cast<std::size_t>(guestBytes)) && GuestMemory::CommittedRanges(resource.baseAddress, static_cast<std::size_t>(guestBytes), false).empty()) throw std::runtime_error("AGC graphics: the table entry's surface at 0x" + HexText(resource.baseAddress) + " (0x" + HexText(guestBytes) + " bytes) is not mapped");
                 static_cast<void>(ResolveTextureFormat(resource.format));
             } catch (const std::runtime_error& error) {
                 table.map[faults + element] = rejectTableElement(table, words, error.what());
                 if (reusable) fresh.elements.push_back({{}, {}, {}, 0, false, true, error.what()});
                 continue;
             }
+            CompletePendingCpuWrites(context, resource.baseAddress, static_cast<std::size_t>(guestBytes));
+            if (resource.dccAddress != 0) CompletePendingCpuWrites(context, resource.dccAddress, DccKeyBytes(guestBytes));
             std::shared_ptr<Texture> texture;
             const auto components = ViewComponents(resource);
             const bool depthCompare = binding.imageDepthCompare.at(element);
@@ -4824,6 +5141,7 @@ void ShaderResources::release() noexcept {
 
 std::uint32_t ShaderResources::setOf(const Binding& binding) const {
     constexpr auto count = static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Count);
+    if (binding.set >= 0) return static_cast<std::uint32_t>(binding.set);
     return splitSets && binding.layout.binding / count == static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Stage::Fragment) ? 1u : 0u;
 }
 
@@ -4903,7 +5221,7 @@ std::size_t ShaderResources::MaxDrawSnapshotBytes() {
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const {
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return {};
     const auto reads = guestMemory.InPlaceReads();
-    const auto maxSnapshotBytes = MaxDrawSnapshotBytes();
+    const auto maxSnapshotBytes = maxDrawSnapshotBytes;
     std::size_t totalSnapshotBytes = 0;
     auto result = std::make_shared<DrawBindings>();
     std::vector<std::size_t> selected;
@@ -4951,46 +5269,50 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     if (selected.empty()) return {};
     Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
     std::array<std::vector<VkDescriptorSetLayoutBinding>, 2> descriptions;
-    for (const auto& binding : bindings) descriptions[setOf(binding)].push_back(binding.layout);
-    const auto snapshotSizes = [&](std::uint32_t set) {
-        std::map<VkDescriptorType, std::uint32_t> counts;
-        for (const auto& binding : bindings) {
-            if (setOf(binding) == set) counts[binding.layout.descriptorType] += (binding.flags & VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT) != 0 ? static_cast<std::uint32_t>(binding.imageAllocations.size()) : binding.layout.descriptorCount;
-        }
+    std::array<std::map<VkDescriptorType, std::uint32_t>, 2> counts;
+    for (const auto& binding : bindings) {
+        const auto set = setOf(binding);
+        descriptions[set].push_back(binding.layout);
+        counts[set][binding.layout.descriptorType] += (binding.flags & VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT) != 0 ? std::max(1u, static_cast<std::uint32_t>(binding.imageAllocations.size())) : binding.layout.descriptorCount;
+    }
+    const auto sizesOf = [&](std::size_t set) {
         std::vector<VkDescriptorPoolSize> sizes;
-        for (const auto& [type, count] : counts) {
+        for (const auto& [type, count] : counts[set]) {
             if (count != 0) sizes.push_back({type, count});
         }
         return sizes;
     };
+    const auto variableOf = [&](std::size_t set) { return tableBindings[set] != std::numeric_limits<std::size_t>::max() ? std::optional<std::uint32_t>(std::max(1u, static_cast<std::uint32_t>(bindings[tableBindings[set]].imageAllocations.size()))) : std::nullopt; };
     result->cache = context.descriptorCache;
     if (!descriptions[0].empty() || splitSets) {
-        result->allocation = result->cache->Allocate(_layout, snapshotSizes(0), updateAfterBind, tableBinding != std::numeric_limits<std::size_t>::max() ? std::optional<std::uint32_t>(static_cast<std::uint32_t>(bindings[tableBinding].imageAllocations.size())) : std::nullopt);
+        result->allocation = result->cache->Allocate(_layout, sizesOf(0), updateAfterBind, variableOf(0));
         Require(result->allocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
     }
     if (!descriptions[1].empty() || splitSets) {
-        result->fragmentAllocation = result->cache->Allocate(fragment.layout, snapshotSizes(1), updateAfterBind);
+        result->fragmentAllocation = result->cache->Allocate(fragment.layout, sizesOf(1), updateAfterBind, variableOf(1));
         Require(result->fragmentAllocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
     }
     auto buffers = descriptorBuffers;
     auto writes = descriptorWrites;
     std::vector<std::size_t> snapshotIndices(allocations.size(), selected.size());
     for (std::size_t index = 0; index < selected.size(); ++index) snapshotIndices[selected[index]] = index;
-    for (auto& write : writes) {
-        const auto binding = std::find_if(bindings.begin(), bindings.end(), [&](const Binding& item) { return item.layout.binding == write.dstBinding; });
-        Require(binding != bindings.end(), "draw snapshot write has no binding");
-        write.dstSet = setOf(*binding) == 0 ? result->allocation.set : result->fragmentAllocation.set;
-        if (write.pBufferInfo == nullptr) continue;
-        Require(binding->allocations.size() == write.descriptorCount, "draw snapshot buffer write disagrees with its binding");
-        const auto offset = static_cast<std::size_t>(write.pBufferInfo - descriptorBuffers.data());
-        write.pBufferInfo = buffers.data() + offset;
-        for (std::size_t element = 0; element < binding->allocations.size(); ++element) {
-            const auto snapshotIndex = snapshotIndices[binding->allocations[element]];
-            if (snapshotIndex == selected.size()) continue;
-            const auto& snapshot = result->snapshots[snapshotIndex];
-            buffers[offset + element] = {snapshot.buffer->Handle(), 0, snapshot.buffer->Bytes().size()};
+    auto nextWrite = writes.begin();
+    for (const auto& binding : bindings) {
+        while (nextWrite != writes.end() && nextWrite->dstBinding == binding.layout.binding) {
+            auto& write = *nextWrite++;
+            write.dstSet = setOf(binding) == 0 ? result->allocation.set : result->fragmentAllocation.set;
+            if (binding.allocations.empty()) continue;
+            const auto offset = static_cast<std::size_t>(write.pBufferInfo - descriptorBuffers.data());
+            write.pBufferInfo = buffers.data() + offset;
+            for (std::size_t element = 0; element < binding.allocations.size(); ++element) {
+                const auto snapshotIndex = snapshotIndices[binding.allocations[element]];
+                if (snapshotIndex == selected.size()) continue;
+                const auto& snapshot = result->snapshots[snapshotIndex];
+                buffers[offset + element] = {snapshot.buffer->Handle(), 0, snapshot.buffer->Bytes().size()};
+            }
         }
     }
+    Require(nextWrite == writes.end(), "draw snapshot writes disagree with their descriptor bindings");
     context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
     recorder.Keep(result);
     for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
@@ -5024,7 +5346,13 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     // The ranges this use reads in place through their host imports (read-only and written elements
     // alike, and an address-based build's whole leased heaps), before the writes: a CPU store into
     // one of them (the copy HLE) must not land before the recorded work read it.
-    recorder.NotePendingReads(guestMemory.InPlaceReads(), guestMemory.HoldsLease() ? Recorder::ReadKind::AddressBased : Recorder::ReadKind::DispatchElement);
+    const auto kind = guestMemory.HoldsLease() ? Recorder::ReadKind::AddressBased : Recorder::ReadKind::DispatchElement;
+    if (auto split = guestMemory.SplitInPlaceReads()) {
+        recorder.NotePendingReadList(std::move(split->space), kind);
+        recorder.NotePendingReads(split->own, kind);
+    } else {
+        recorder.NotePendingReads(guestMemory.InPlaceReads(), kind);
+    }
     if (SkipWriteBack()) return;
     for (std::size_t index = 0; index < storageTextures.size(); ++index) {
         if (!storageWritten[index]) continue;

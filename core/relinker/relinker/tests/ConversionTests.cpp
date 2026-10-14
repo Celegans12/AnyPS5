@@ -3,6 +3,7 @@
 #include <relinker/analysis/SyscallScanner.hpp>
 #include <relinker/analysis/CodeInstructionCollector.hpp>
 #include <io/BufferUtils.hpp>
+#include <io/NativePath.hpp>
 #include <codegen/IAmd64OnlyConverter.hpp>
 #include <algorithm>
 #include <array>
@@ -118,6 +119,24 @@ void convert() {
     require(progress.Events.back().Completed != 1 || progress.Events.back().Stage != Domain::ProgressStage::Executable, "Failed conversion reported completion");
 }
 
+void fixedBase() {
+    TestProgress progress;
+    const Relinker::Conversion converter(progress);
+    auto source = input();
+    source.Modules.push_back({"virtual/title/sce_module/plugin.prx", fixture()});
+    const auto plain = converter.Convert(source, {});
+    Relinker::ConversionOptions options;
+    options.LinuxFixedBase = 0x400000000;
+    const auto fixed = converter.Convert(source, options);
+    require(Io::ReadU16(plain.Executable, 16) == 3 && Io::ReadU16(fixed.Executable, 16) == 2, "Fixed base did not select ET_EXEC");
+    require(Io::ReadU64(fixed.Executable, 24) == Io::ReadU64(plain.Executable, 24) + *options.LinuxFixedBase, "Fixed entry was not rebased above 4 GiB");
+    require(fixed.Modules.front().Bytes == plain.Modules.front().Bytes, "Executable fixed base changed a bundled module");
+    for (const auto target : {Relinker::TargetSystem::Windows, Relinker::TargetSystem::MacOs}) {
+        options.Target = target;
+        reject([&] { converter.Convert(source, options); });
+    }
+}
+
 void scanning() {
     TestProgress progress;
     const auto scanner = Relinker::MakeSyscallScanner(progress);
@@ -162,6 +181,33 @@ void scanning() {
     require(progress.Events.back().Completed < progress.Events.back().Total, "Failed scan reported completion");
 }
 
+class FailingProgress final : public Domain::IProgress {
+public:
+    std::string InputPath;
+    void Report(const Domain::ProgressEvent&) override {
+        Domain::RelinkerException error("diagnostic context", 0x1234);
+        error.InputPath = InputPath;
+        throw error;
+    }
+    void Message(std::string_view) override {}
+};
+
+void diagnosticContext() {
+    for (const bool specific : {false, true}) {
+        FailingProgress progress;
+        if (specific) progress.InputPath = "virtual/title/sce_module/plugin.prx";
+        const auto source = input();
+        try { Relinker::Conversion(progress).Convert(source, {}); }
+        catch (const Domain::RelinkerException& error) {
+            require(error.InputPath == (specific ? progress.InputPath : Io::Utf8Path(source.InputPath)), "Wrong diagnostic input path");
+            require(error.FailureOffset == 0x1234, "Diagnostic offset changed");
+            require(std::string(error.what()) == "diagnostic context", "Diagnostic message changed");
+            continue;
+        }
+        throw std::runtime_error("Diagnostic failure was swallowed");
+    }
+}
+
 class CancellingProgress final : public Domain::IProgress {
 public:
     Domain::ProgressStage Stage = Domain::ProgressStage::Decode;
@@ -191,7 +237,9 @@ void cancellation() {
 int main() {
     try {
         convert();
+        fixedBase();
         scanning();
+        diagnosticContext();
         cancellation();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

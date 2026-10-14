@@ -107,6 +107,9 @@ std::optional<std::filesystem::path> ResolveAlias(const std::string& guestPath) 
         if (!HasPrefix(relative, prefix)) continue;
         if (relative.size() == prefix.size()) return std::filesystem::path(host).make_preferred();
         std::filesystem::path result = ResolveHostPath(host, relative.substr(prefix.size() + 1));
+#ifndef _WIN32
+        if (guestPath.back() == '/') result /= "";
+#endif
         return result.make_preferred();
     }
     return std::nullopt;
@@ -384,7 +387,16 @@ extern "C" std::filesystem::path RelinkedModulePath_nid_no_patch(const std::file
     auto relinked = path;
     relinked += ".guest.prx";
     std::error_code error;
-    return std::filesystem::is_regular_file(relinked, error) ? relinked : path;
+    if (std::filesystem::is_regular_file(relinked, error)) return relinked;
+    const auto name = relinked.filename().string();
+    std::optional<std::filesystem::path> matched;
+    std::filesystem::directory_iterator entry(relinked.parent_path().empty() ? "." : relinked.parent_path(), error), end;
+    for (; !error && entry != end; entry.increment(error)) {
+        if (!SameName(entry->path().filename().string(), name)) continue;
+        if (matched) throw std::runtime_error("Ambiguous case-insensitive guest path: " + relinked.string());
+        matched = entry->path();
+    }
+    return matched && std::filesystem::is_regular_file(*matched, error) ? *matched : path;
 }
 
 extern "C" int SetWorkingDirectory_nid_no_patch(const char* resolved) {

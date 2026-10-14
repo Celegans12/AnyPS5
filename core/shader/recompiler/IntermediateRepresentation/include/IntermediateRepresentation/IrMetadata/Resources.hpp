@@ -126,8 +126,8 @@ struct SamplerResource {
     bool forcePointFiltering = false;
     bool depthCompare = false;
     std::uint16_t uses = 0;
-    std::uint32_t table = NoTable;
     bool foldTexelOffsetsOnly = false;
+    std::uint32_t table = NoTable;
 
     bool operator==(const SamplerResource& other) const = default;
 };

@@ -23,6 +23,7 @@ struct DrawProgram {
 
     std::shared_ptr<const ShaderSnapshot> snapshot;
     std::size_t codeOffset = 0;
+    std::shared_ptr<const ShaderSnapshot> tailContinuation;
 };
 
 struct DrawDecode {
@@ -73,6 +74,19 @@ struct DrawEntryCounters {
     std::uint64_t registerKeyLookups = 0, registerKeyHits = 0, decodeSkipped = 0, decodePartial = 0, facadeMismatches = 0, verifyDecodes = 0, verifyDecodeMismatches = 0;
     double keyUs = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+};
+
+class DrawKeySightings {
+public:
+    static constexpr std::size_t Ways = 4;
+    explicit DrawKeySightings(std::size_t keys);
+    bool SeenBefore(std::uint64_t key);
+
+private:
+    std::vector<std::uint64_t> keys;
+    std::vector<std::uint8_t> filled;
+    std::vector<std::uint8_t> next;
+    std::size_t bucketMask = 0;
 };
 
 enum class DrawVerdict { Drawn, Nothing, Rejected };

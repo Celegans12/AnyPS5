@@ -2,6 +2,8 @@
 #include <cstddef>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/PreciseWait.hpp"
+#include "prx/libkernel/File/include/File.hpp"
 #include "prx/libkernel/File/include/RandomDevice.hpp"
 #include "prx/libkernel/Socket/include/SocketPoll.hpp"
 #include "prx/libkernel/Socket/include/SocketSelectDeadline.hpp"
@@ -11,7 +13,6 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
-#include <thread>
 #include <string>
 #include <vector>
 
@@ -21,6 +22,7 @@
 
 namespace {
 
+constexpr int GuestEbadf = 9;
 constexpr int GuestEinval = 22;
 constexpr int SelectDescriptorLimit = 1024;
 constexpr int SelectPollSliceMilliseconds = 10;
@@ -38,8 +40,8 @@ bool DescriptorSet(const void* set, int descriptor) {
     return set != nullptr && ((static_cast<const std::uint64_t*>(set)[descriptor / 64] >> (descriptor % 64)) & 1u) != 0;
 }
 
-void UnknownDescriptor(int descriptor, bool polled) {
-    const auto what = "select on descriptor " + std::to_string(descriptor) + (polled ? " (not a libSceNet socket)" : " (libSceNet is not loaded)");
+void UnknownDescriptor(int descriptor) {
+    const auto what = "select on descriptor " + std::to_string(descriptor) + " (not a libSceNet socket)";
     NotImplemented_nid_no_patch(what.c_str());
 }
 
@@ -89,6 +91,25 @@ int HostPoll(KernelSocketPoll::Entry* descriptors, int count, int timeoutMillise
         descriptors[index].revents = KernelEventFlags(native[index].revents);
     }
     return result;
+}
+
+#else
+
+int HostPoll(KernelSocketPoll::Entry* descriptors, int count, int timeoutMilliseconds) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMilliseconds);
+    for (;;) {
+        int ready = 0;
+        for (int index = 0; index < count; ++index) {
+            auto& entry = descriptors[index];
+            if (!DescriptorIsOpen_nid_no_patch(entry.descriptor)) return -GuestEbadf;
+            if (!GuestSockets::PipeReady(entry.descriptor, entry.events, entry.revents)) {
+                NotImplemented_nid_no_patch(("select on descriptor " + std::to_string(entry.descriptor) + " (neither a socket nor a pipe)").c_str());
+            }
+            if (entry.revents != 0) ++ready;
+        }
+        if (ready > 0 || std::chrono::steady_clock::now() >= deadline) return ready;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
 }
 
 #endif
@@ -165,10 +186,7 @@ int APS5_VABI select_nid_postfix(int nfds, void* readfds, void* writefds, void* 
     std::vector<PollGroup> groups;
     if (!kernel.entries.empty()) groups.push_back(std::move(kernel));
     if (!net.entries.empty()) {
-        PollGroup hosts{nullptr, {}, {}};
-#ifndef _WIN32
-        hosts.poll = &HostPoll;
-#endif
+        PollGroup hosts{&HostPoll, {}, {}};
         net.poll = g_socketPoller.load();
         if (net.poll != nullptr) {
             for (auto& socket : net.entries) socket.revents = 0;
@@ -184,7 +202,6 @@ int APS5_VABI select_nid_postfix(int nfds, void* readfds, void* writefds, void* 
                 continue;
             }
             const int descriptor = net.entries[index].descriptor;
-            if (hosts.poll == nullptr) UnknownDescriptor(descriptor, net.poll != nullptr);
             hosts.entries.push_back({descriptor, net.entries[index].events, 0});
             hosts.slots.push_back(net.slots[index]);
             net.entries.erase(net.entries.begin() + static_cast<std::ptrdiff_t>(index));
@@ -205,7 +222,7 @@ int APS5_VABI select_nid_postfix(int nfds, void* readfds, void* writefds, void* 
         }
         if (devicesReady) waitMilliseconds = 0;
         if (groups.empty()) {
-            if (waitMilliseconds > 0) std::this_thread::sleep_for(std::chrono::milliseconds(waitMilliseconds));
+            if (waitMilliseconds > 0) PreciseSleepUntil(std::min(deadline, std::chrono::steady_clock::now() + std::chrono::milliseconds(waitMilliseconds)));
         } else {
             const int slice = groups.size() == 1 ? waitMilliseconds : std::min(waitMilliseconds, SelectPollSliceMilliseconds);
             const auto sliceEnd = std::chrono::steady_clock::now() + std::chrono::milliseconds(waitMilliseconds);
@@ -226,7 +243,7 @@ int APS5_VABI select_nid_postfix(int nfds, void* readfds, void* writefds, void* 
         }
         int ready = 0;
         for (const auto& entry : requested) {
-            if ((entry.revents & KernelSocketPoll::Unknown) != 0) UnknownDescriptor(entry.descriptor, true);
+            if ((entry.revents & KernelSocketPoll::Unknown) != 0) UnknownDescriptor(entry.descriptor);
             const bool readable = (entry.events & KernelSocketPoll::Readable) != 0 && (entry.revents & (KernelSocketPoll::Readable | KernelSocketPoll::HangUp | KernelSocketPoll::Error)) != 0;
             const bool writable = (entry.events & KernelSocketPoll::Writable) != 0 && (entry.revents & (KernelSocketPoll::Writable | KernelSocketPoll::Error)) != 0;
             const bool urgent = (entry.events & KernelSocketPoll::Urgent) != 0 && (entry.revents & KernelSocketPoll::Urgent) != 0;

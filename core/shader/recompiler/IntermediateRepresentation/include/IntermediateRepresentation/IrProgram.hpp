@@ -28,6 +28,7 @@ public:
     const IrResourcePlan& Resources() const;
     IrProgramMetadata& Metadata();
     const IrProgramMetadata& Metadata() const;
+    [[nodiscard]] CompiledShaderInfo CompiledInfo() const&;
     CompiledShaderInfo TakeCompiledInfo() &&;
     IrValue& CreateValue(IrOpcode opcode, IrType type, std::uint64_t flags);
     void SetEntryBlock(IrBlock& block);

@@ -3,6 +3,7 @@
 #include <tlhelp32.h>
 #include "prx/libc/include/CallTrace.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -277,6 +278,50 @@ void TraceSse4a(std::uint64_t rip, const sse4a::Instruction& instruction, const 
     Report("[sse4a] #%llu %s %s (length %u, index %u, %u bytes) at %s on thread %lu\n", count, mnemonic, operands, field.length, field.index, static_cast<unsigned>(instruction.size), line, GetCurrentThreadId());
 }
 
+constexpr DWORD GccExceptionMask = 0x20ffffffu;
+constexpr DWORD GccException = 0x20474343u;
+constexpr std::uint64_t GccExceptionClass = 0x474e5543432b2b00ull;
+constexpr std::uint64_t CxaExceptionTypeOffset = 80;
+
+std::uint64_t FrameWithoutUnwindData(const CONTEXT& start) {
+    const HMODULE runtime[] = {GetModuleHandleA("KERNELBASE.dll"), GetModuleHandleA("libgcc_s_seh-1.dll"), GetModuleHandleA("libstdc++-6.dll")};
+    CONTEXT context = start;
+    for (int depth = 0; depth < 64 && context.Rip != 0; ++depth) {
+        HMODULE module = nullptr;
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCSTR>(context.Rip), &module);
+        DWORD64 imageBase = 0;
+        const auto entry = RtlLookupFunctionEntry(context.Rip, &imageBase, nullptr);
+        if (module == nullptr || std::find(std::begin(runtime), std::end(runtime), module) == std::end(runtime)) return entry == nullptr ? context.Rip : 0;
+        if (entry == nullptr) return 0;
+        PVOID handlerData = nullptr;
+        DWORD64 establisher = 0;
+        RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, context.Rip, entry, &context, &handlerData, &establisher, nullptr);
+    }
+    return 0;
+}
+
+bool ReadWord(std::uint64_t address, std::uint64_t* value) {
+    return ReadCode(address, reinterpret_cast<std::uint8_t*>(value), sizeof(*value)) == sizeof(*value);
+}
+
+void ReportUndeliverableException(const EXCEPTION_POINTERS* info, std::uint64_t frame) {
+    const auto* record = info->ExceptionRecord;
+    char type[256] = "of unknown type";
+    const auto header = record->NumberParameters >= 1 ? static_cast<std::uint64_t>(record->ExceptionInformation[0]) : 0;
+    std::uint64_t exceptionClass = 0;
+    std::uint64_t typeInfo = 0;
+    std::uint64_t namePointer = 0;
+    if (ReadWord(header, &exceptionClass) && exceptionClass == GccExceptionClass && ReadWord(header - CxaExceptionTypeOffset, &typeInfo) && ReadWord(typeInfo + 8, &namePointer)) {
+        std::uint8_t name[sizeof(type)];
+        const auto copied = ReadCode(namePointer, name, sizeof(name));
+        if (const auto* end = static_cast<const std::uint8_t*>(std::memchr(name, 0, copied))) std::memcpy(type, name, static_cast<std::size_t>(end - name) + 1);
+    }
+    char line[MAX_PATH + 64];
+    DescribeAddress(frame, line, sizeof(line));
+    Report("\nFATAL: C++ exception %s raised on thread %lu cannot be delivered: %s has no unwind data\n", type, GetCurrentThreadId(), line);
+    ReportStackCandidates(info->ContextRecord->Rsp, 32, 0x4000);
+}
+
 bool HandleSse4a(EXCEPTION_POINTERS* info) {
     if (!g_sse4aEmulation) return false;
     const auto* record = info->ExceptionRecord;
@@ -296,9 +341,14 @@ bool HandleSse4a(EXCEPTION_POINTERS* info) {
 LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
     const auto* fault = info->ExceptionRecord;
     if (fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fault->NumberParameters >= 2 && fault->ExceptionInformation[0] == 1 && GuestArena::GuestArenaHandleWrite_nid_postfix(fault->ExceptionInformation[1])) return EXCEPTION_CONTINUE_EXECUTION;
+    if (fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fault->NumberParameters >= 2 && fault->ExceptionInformation[0] == 0 && GuestArena::GuestArenaHandleRead_nid_postfix(fault->ExceptionInformation[1])) return EXCEPTION_CONTINUE_EXECUTION;
     if (HandleWatch(info)) return EXCEPTION_CONTINUE_EXECUTION;
     if (HandleSse4a(info)) return EXCEPTION_CONTINUE_EXECUTION;
     const auto* record = info->ExceptionRecord;
+    if ((record->ExceptionCode & GccExceptionMask) == GccException) {
+        if (const auto frame = FrameWithoutUnwindData(*info->ContextRecord)) ReportUndeliverableException(info, frame);
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
     if (!IsFatal(record->ExceptionCode)) {
         if (record->ExceptionCode >= 0xc0000000u || record->ExceptionCode == EXCEPTION_BREAKPOINT) NoteUnlistedException(record, info->ContextRecord->Rip);
         return EXCEPTION_CONTINUE_SEARCH;
@@ -336,11 +386,24 @@ LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
     Report("  r12 %016llx r13 %016llx r14 %016llx r15 %016llx\n", context->R12, context->R13, context->R14, context->R15);
     // The words each register points at, to recognise which structure a bad pointer came from.
     {
+        const DWORD indirectLength = GetEnvironmentVariableA("APS5_CRASH_INDIRECT_MEMORY", nullptr, 0);
+        const bool indirectMemory = indirectLength > 1;
         const std::pair<const char*, std::uint64_t> pointers[] = {{"rax", context->Rax}, {"rbx", context->Rbx}, {"rcx", context->Rcx}, {"rdx", context->Rdx}, {"rsi", context->Rsi}, {"rdi", context->Rdi}, {"r12", context->R12}, {"r13", context->R13}, {"r14", context->R14}, {"r15", context->R15}};
         for (const auto& [name, value] : pointers) {
             if (value < 0x10000 || (value & 7) != 0 || !IsReadable(value) || !IsReadable(value + 0x38)) continue;
             const auto* words = reinterpret_cast<const std::uint64_t*>(value);
             Report("  [%s] %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx\n", name, words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
+            if (!indirectMemory) continue;
+            for (std::size_t i = 0; i < 8; ++i) {
+                const auto address = words[i];
+                if (address < 0x10000 || IsExecutable(address)) continue;
+                std::uint64_t content[8]{};
+                SIZE_T copied = 0;
+                if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(address), content, sizeof(content), &copied) || copied != sizeof(content)) continue;
+                Report("  [[%s+0x%llx]] @%016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx\n",
+                    name, static_cast<unsigned long long>(i * sizeof(*words)), static_cast<unsigned long long>(address),
+                    content[0], content[1], content[2], content[3], content[4], content[5], content[6], content[7]);
+            }
         }
     }
     Report("  frame pointer chain:\n");

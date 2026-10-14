@@ -21,7 +21,7 @@
 #ifdef _WIN32
 #include <io.h>
 #include <windows.h>
-#include <winternl.h>
+#include "prx/libc/include/WindowsDescriptor.hpp"
 #else
 #include <fcntl.h>
 #include <sys/ioctl.h>
@@ -31,9 +31,6 @@
 
 extern "C" int* APS5_VABI __error_nid_postfix();
 extern "C" int APS5_VABI dup2_nid_postfix(int from, int to);
-#ifdef _WIN32
-extern "C" _invalid_parameter_handler _set_thread_local_invalid_parameter_handler(_invalid_parameter_handler);
-#endif
 
 namespace {
 
@@ -89,6 +86,8 @@ constexpr std::int16_t FromStart = 0;
 constexpr std::int16_t FromCurrent = 1;
 constexpr std::int16_t FromEnd = 2;
 
+constexpr std::uint32_t CloseOnExecRequest = 0x20006601;
+constexpr std::uint32_t KeepOnExecRequest = 0x20006602;
 constexpr std::uint32_t NonblockingRequest = 0x8004667e;
 constexpr std::uint32_t ReadableRequest = 0x4004667f;
 constexpr std::uint32_t RequestIn = 0x80000000u;
@@ -137,20 +136,11 @@ const char* KindName(Kind kind) {
 }
 
 #ifdef _WIN32
-void IgnoreInvalidParameter(const wchar_t*, const wchar_t*, const wchar_t*, unsigned int, std::uintptr_t) {}
-
-HANDLE NativeHandle(int fd) {
-    const auto previous = _set_thread_local_invalid_parameter_handler(IgnoreInvalidParameter);
-    const auto handle = ::_get_osfhandle(fd);
-    _set_thread_local_invalid_parameter_handler(previous);
-    return reinterpret_cast<HANDLE>(handle);
-}
-
 std::optional<Kind> Classify(int fd, const char* function) {
     if (fd < 0 || !DescriptorIsOpen_nid_no_patch(fd)) return std::nullopt;
     if (File::DirectoryDescriptorPath(fd)) return Kind::Directory;
     if (File::IsRandomDevice(fd)) return Kind::RandomDevice;
-    switch (::GetFileType(NativeHandle(fd))) {
+    switch (::GetFileType(WindowsDescriptorHandle_nid_no_patch(fd))) {
         case FILE_TYPE_DISK: return Kind::File;
         case FILE_TYPE_PIPE: return Kind::Pipe;
         case FILE_TYPE_CHAR: return Kind::Device;
@@ -159,36 +149,25 @@ std::optional<Kind> Classify(int fd, const char* function) {
 }
 
 int AccessMode(int fd, const char* function) {
-    using QueryObject = NTSTATUS(NTAPI*)(HANDLE, OBJECT_INFORMATION_CLASS, PVOID, ULONG, PULONG);
-    static const auto query = reinterpret_cast<QueryObject>(reinterpret_cast<void*>(::GetProcAddress(::GetModuleHandleW(L"ntdll.dll"), "NtQueryObject")));
-    PUBLIC_OBJECT_BASIC_INFORMATION information{};
-    const NTSTATUS status = query == nullptr ? -1 : query(NativeHandle(fd), ObjectBasicInformation, &information, sizeof(information), nullptr);
-    if (status < 0)
-        throw std::runtime_error(std::string(function) + ": cannot read the access of descriptor " + std::to_string(fd) + ", status=" + std::to_string(status));
-    const bool read = (information.GrantedAccess & FILE_READ_DATA) != 0;
-    const bool write = (information.GrantedAccess & (FILE_WRITE_DATA | FILE_APPEND_DATA)) != 0;
-    if (read && write) return ReadWrite;
-    if (write) return WriteOnly;
-    if (read) return ReadOnly;
-    throw std::runtime_error(std::string(function) + ": descriptor " + std::to_string(fd) + " grants neither read nor write access");
+    return WindowsDescriptorAccess_nid_no_patch(WindowsDescriptorHandle_nid_no_patch(fd), fd, function);
 }
 
 DWORD PipeState(int fd, const char* function) {
     DWORD state = 0;
-    if (!::GetNamedPipeHandleStateW(NativeHandle(fd), &state, nullptr, nullptr, nullptr, nullptr, 0))
+    if (!::GetNamedPipeHandleStateW(WindowsDescriptorHandle_nid_no_patch(fd), &state, nullptr, nullptr, nullptr, nullptr, 0))
         throw std::runtime_error(std::string(function) + ": cannot read the mode of pipe descriptor " + std::to_string(fd) + ", error=" + std::to_string(::GetLastError()));
     return state;
 }
 
 void SetPipeNonblocking(int fd, bool nonblocking, const char* function) {
     DWORD mode = (PipeState(fd, function) & PIPE_READMODE_MESSAGE) | (nonblocking ? PIPE_NOWAIT : PIPE_WAIT);
-    if (!::SetNamedPipeHandleState(NativeHandle(fd), &mode, nullptr, nullptr))
+    if (!::SetNamedPipeHandleState(WindowsDescriptorHandle_nid_no_patch(fd), &mode, nullptr, nullptr))
         throw std::runtime_error(std::string(function) + ": cannot change the mode of pipe descriptor " + std::to_string(fd) + ", error=" + std::to_string(::GetLastError()));
 }
 
 Entry InitialEntry(int fd) {
     int status = 0;
-    if (::GetFileType(NativeHandle(fd)) == FILE_TYPE_PIPE && (PipeState(fd, "fcntl") & PIPE_NOWAIT) != 0) status |= Nonblocking;
+    if (::GetFileType(WindowsDescriptorHandle_nid_no_patch(fd)) == FILE_TYPE_PIPE && (PipeState(fd, "fcntl") & PIPE_NOWAIT) != 0) status |= Nonblocking;
     return {false, std::make_shared<int>(status)};
 }
 
@@ -208,7 +187,7 @@ int Readable(int fd, Kind kind, const char* function) {
     }
     if (AccessMode(fd, function) == WriteOnly) return 0;
     DWORD available = 0;
-    if (!::PeekNamedPipe(NativeHandle(fd), nullptr, 0, nullptr, &available, nullptr)) {
+    if (!::PeekNamedPipe(WindowsDescriptorHandle_nid_no_patch(fd), nullptr, 0, nullptr, &available, nullptr)) {
         const DWORD error = ::GetLastError();
         if (error == ERROR_BROKEN_PIPE) return 0;
         throw std::runtime_error(std::string(function) + ": cannot peek pipe descriptor " + std::to_string(fd) + ", error=" + std::to_string(error));
@@ -532,6 +511,10 @@ int Ioctl(int fd, std::uint64_t request, void* argument) {
     if ((command & RequestIn) && length != 0 && argument == nullptr) return Fail(GuestEfault);
     const auto kind = Classify(fd, "ioctl");
     if (!kind) return Fail(GuestEbadf);
+    if (command == CloseOnExecRequest || command == KeepOnExecRequest) {
+        SetCloseOnExec(fd, command == CloseOnExecRequest);
+        return 0;
+    }
     if (command == NonblockingRequest) {
         const bool enable = *static_cast<const int*>(argument) != 0;
         return ChangeStatus(fd, *kind, Nonblocking, enable ? Nonblocking : 0, "ioctl");
@@ -565,6 +548,7 @@ void ShareDescriptor(int from, int to) {
     auto status = Materialize(from).status;
     g_entries[to] = Entry{false, std::move(status)};
 #ifdef _WIN32
+    File::SharePositionedTransfer(from, to);
     GuestFileLockShare_nid_no_patch(from, to);
 #endif
 }

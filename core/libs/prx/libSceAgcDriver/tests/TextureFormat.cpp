@@ -169,6 +169,15 @@ void RunTextureFormatTests() {
     Require(!IsBlockCompressed(1), "format 1 must not be block compressed");
     Require(BlockWidth(1) == 1u && BlockHeight(1) == 1u, "format 1 must have a one-texel block");
 
+    Require(ResolveTextureFormat(50) == VK_FORMAT_A2B10G10R10_UNORM_PACK32, "format 50 must resolve to A2B10G10R10_UNORM");
+    Require(ResolveTextureFormat(51) == VK_FORMAT_A2B10G10R10_SNORM_PACK32, "format 51 must resolve to A2B10G10R10_SNORM");
+    Require(ResolveTextureFormat(54) == VK_FORMAT_A2B10G10R10_UINT_PACK32, "format 54 must resolve to A2B10G10R10_UINT");
+    Require(ResolveTextureFormat(55) == VK_FORMAT_A2B10G10R10_SINT_PACK32, "format 55 must resolve to A2B10G10R10_SINT");
+    for (const std::uint32_t format : {50u, 51u, 54u, 55u}) Require(BytesPerElement(format) == 4u && !IsBlockCompressed(format), "packed 10-bit format " + std::to_string(format) + " must be four bytes and not block compressed");
+    Require(ShaderRecompiler::SampledTextureNumericClass(ShaderRecompiler::IrBufferFormat::Format10_10_10_2SNorm) == ShaderRecompiler::IrTextureNumericClass::Float, "format 51 must sample as float");
+    Require(ShaderRecompiler::SampledTextureNumericClass(ShaderRecompiler::IrBufferFormat::Format10_10_10_2SInt) == ShaderRecompiler::IrTextureNumericClass::Sint, "format 55 must sample as signed integer");
+    Require(ShaderRecompiler::SampledTextureNumericClass(ShaderRecompiler::IrBufferFormat::Format10_10_10_2UInt) == ShaderRecompiler::IrTextureNumericClass::Uint, "format 54 must sample as unsigned integer");
+
     Require(ResolveTextureFormat(56) == VK_FORMAT_R8G8B8A8_UNORM, "format 56 must resolve to R8G8B8A8_UNORM");
     Require(BytesPerElement(56) == 4u, "format 56 must be four bytes wide");
 

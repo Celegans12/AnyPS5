@@ -207,6 +207,43 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
     return true;
 }
 
+bool ShaderMemory::overlapsInitial(std::uint64_t begin, std::uint64_t end) const {
+    if (initial.empty()) return false;
+    const auto after = initial.lower_bound(begin);
+    if (after != initial.end() && after->first < end) return true;
+    return after != initial.begin() && std::prev(after)->first + std::prev(after)->second.size() > begin;
+}
+
+bool ShaderMemory::readWords(void* context, std::uint64_t address, std::uint32_t* values, std::uint64_t count) {
+    auto& self = *static_cast<ShaderMemory*>(context);
+    while (count != 0) {
+        const auto base = address & ~static_cast<std::uint64_t>(PageBytes - 1);
+        const auto index = static_cast<std::size_t>((address % PageBytes) / sizeof(std::uint32_t));
+        const auto words = static_cast<std::size_t>(std::min<std::uint64_t>(count, PageWords - index));
+        const auto bytes = static_cast<std::uint64_t>(words) * sizeof(std::uint32_t);
+        Page* page = nullptr;
+        if (address % sizeof(std::uint32_t) == 0 && address <= std::numeric_limits<std::uint64_t>::max() - bytes && !self.overlapsInitial(address, address + bytes)) page = &self.page(base);
+        if (page != nullptr && page->valid.all()) {
+            std::memcpy(values, page->words.data() + index, bytes);
+            std::bitset<PageWords> mask;
+            mask.set();
+            mask >>= PageWords - words;
+            mask <<= index;
+            page->read |= mask;
+            page->recent |= mask;
+            CaptureTotals().reads += words;
+        } else {
+            for (std::size_t word = 0; word < words; ++word) {
+                if (!read(context, address + word * sizeof(std::uint32_t), values + word)) return false;
+            }
+        }
+        address += bytes;
+        values += words;
+        count -= words;
+    }
+    return true;
+}
+
 bool ShaderMemory::accessible(void* context, std::uint64_t address, std::uint64_t bytes) {
     auto& self = *static_cast<ShaderMemory*>(context);
     const bool answer = accessibleProbe(self, address, bytes);
@@ -281,6 +318,7 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::capture(c
     runtime.readSpecializationMemory = &read;
     runtime.accessible = &accessible;
     runtime.pendingWrite = &pending;
+    runtime.readWords = &readWords;
     auto capture = invocation != nullptr ? invocation->Capture(runtime) : handle != nullptr ? ShaderRecompiler::CaptureResources(request, runtime, *handle) : ShaderRecompiler::CaptureResources(request, runtime);
     if (profile) {
         totals.captureNanoseconds += NanosecondsSince(started);

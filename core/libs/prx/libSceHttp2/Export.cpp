@@ -75,7 +75,6 @@ static void EraseCompletions(const std::vector<int>& ids) {
 }
 
 static int CompleteAsync(const char* function, int req_id, const Http2AsyncOption* kqueue_option, const void* option) {
-    if (kqueue_option == nullptr) NotImplemented_nid_no_patch(function);
     if (option != nullptr) NotImplemented_nid_no_patch(function);
     bool queued = false;
     {
@@ -90,6 +89,7 @@ static int CompleteAsync(const char* function, int req_id, const Http2AsyncOptio
         }
     }
     if (!queued) return ERROR_INVALID_ID;
+    if (kqueue_option == nullptr) return 0;
     if (EqueueTriggerEvent_nid_postfix(kqueue_option->equeue, static_cast<uintptr_t>(kqueue_option->user_event_id), EVFILT_USER, kqueue_option->user_data) != 0) {
         {
             std::lock_guard lock(g_completionsMutex);
@@ -402,6 +402,11 @@ int APS5_VABI sceHttp2WebSocketSendDataMessageAsync() {
 }
 
 int APS5_VABI sceHttp2WebSocketSetPingInterval() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceHttp2WebSocketSetPingTimeout() {
     NotImplemented_nid_no_patch(__func__);
     return 0;
 }

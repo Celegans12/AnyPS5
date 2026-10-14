@@ -14,6 +14,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <span>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -167,6 +168,10 @@ private:
     Stats stats;
 };
 
+enum class ContentKeyComponent : std::size_t { Layout, BufferWord0, BufferWord1, BufferWord2, BufferWord3, Image, Sampler, ShaderData, Other, DrawTarget, Count };
+
+using ContentKeyDiff = std::array<bool, static_cast<std::size_t>(ContentKeyComponent::Count)>;
+
 struct ImageTableReuseCounts {
     std::uint64_t reused = 0;
     std::uint64_t resolved = 0;
@@ -245,6 +250,7 @@ public:
     std::vector<std::pair<std::uint64_t, std::uint64_t>> DeviceReads() const { return guestMemory.DeviceReads(); }
     bool ReadsImage(const StorageTexture* image) const;
     bool HasCachedStorageImages() const;
+    std::uint32_t TableElements() const { return tableElements[0] + tableElements[1]; }
     const std::vector<std::uint32_t>& LayoutKey() const { return layoutKey; }
     const std::vector<std::uint32_t>& FragmentLayoutKey() const { return fragmentLayoutKey; }
     // Debug aid: each bound guest resource with the fraction of sampled bytes that are nonzero.
@@ -262,6 +268,7 @@ public:
     // (their count and size remain): a compute template then serves dispatches whose constants
     // differ, and the hit refreshes its data buffers with the dispatch's words (RefreshData).
     static std::vector<std::uint32_t> ContentKey(const CompiledShader& shader, bool dataWords = true, bool movableBuffers = false);
+    static bool DiffContentKeys(std::span<const std::uint32_t> previous, std::span<const std::uint32_t> key, bool draw, ContentKeyDiff& diff);
     // Records the shader's ShaderData and FlattenedSrt words into this object's data buffers
     // (vkCmdUpdateBuffer, a transfer write the caller's pre-dispatch barrier makes visible; a
     // buffer already holding the words is left alone). Returns whether anything was recorded. With
@@ -375,6 +382,7 @@ private:
         std::vector<std::size_t> allocations;
         std::vector<std::size_t> imageAllocations;
         VkDescriptorBindingFlags flags = 0;
+        std::int32_t set = -1;
     };
 
     struct TableStage {
@@ -387,16 +395,17 @@ private:
         std::vector<ShaderRecompiler::ImageTableEntryPoison> poison;
         std::vector<std::string> messages;
         std::uint32_t elementBase = 0;
+        std::uint32_t set = 0;
         std::size_t firstSampler = 0;
         std::size_t samplerCount = 0;
         std::vector<std::size_t> elementTextures;
         std::vector<std::pair<std::uint32_t, std::uint32_t>> samplerRejections;
     };
     std::vector<TableStage> tableStages;
-    std::size_t tableBinding = std::numeric_limits<std::size_t>::max();
-    std::size_t storageTableBinding = std::numeric_limits<std::size_t>::max();
-    std::uint32_t sampledTableCapacity = 0;
-    std::uint32_t tableElements = 0;
+    std::array<std::size_t, 2> tableBindings{std::numeric_limits<std::size_t>::max(), std::numeric_limits<std::size_t>::max()};
+    std::array<std::size_t, 2> storageTableBindings{std::numeric_limits<std::size_t>::max(), std::numeric_limits<std::size_t>::max()};
+    std::array<std::uint32_t, 2> sampledTableCapacity{};
+    std::array<std::uint32_t, 2> tableElements{};
     TableStage& tableStage(const CompiledShader& shader);
     static const ShaderRecompiler::DescriptorBinding* tableImages(std::span<const CompiledShader> shaders, ShaderRecompiler::ShaderStage stage);
     std::uint32_t rejectTableElement(TableStage& table, std::span<const std::uint32_t> words, const std::string& message);
@@ -410,6 +419,8 @@ private:
         std::uint64_t begin;
         std::uint64_t end;
         std::uint64_t serial;
+        std::uint64_t regionEnd = 0;
+        std::uint64_t committedEnd = 0;
     };
 
     // The build is two stages. A (buildPrepare, no device lock): the binding plan with its layout
@@ -535,6 +546,7 @@ private:
     Context context;
     std::vector<std::uint32_t> layoutKey;
     GuestBufferMemory guestMemory;
+    std::size_t maxDrawSnapshotBytes = MaxDrawSnapshotBytes();
     std::unique_ptr<BdaResources> bda;
     bool usesBda = false;
     bool usesFaultBuffer = false;
@@ -671,6 +683,8 @@ public:
     static std::uint64_t Touches();
     void Clear();
     std::size_t Size() const;
+    std::uint64_t TableElements() const;
+    static std::uint64_t TableElementBudget();
 
 private:
     void erase(const Key& key);

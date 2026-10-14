@@ -12,6 +12,7 @@ int APS5_VABI sceAudioOut2MasteringInit(std::uint32_t);
 int APS5_VABI sceAudioOut2MasteringTerm();
 int APS5_VABI sceAudioOut2MasteringSetParam(const void*, std::uint32_t, std::uint32_t);
 int APS5_VABI sceAudioOut2EnableChat();
+int APS5_VABI sceAudioOut2DisableChat();
 }
 
 static void Require(bool value, const char* message) {
@@ -64,6 +65,9 @@ void TestMasteringSetParam() {
 void TestEnableChat() {
     Require(sceAudioOut2EnableChat() == 0, "enabling chat must be accepted");
     Require(sceAudioOut2EnableChat() == 0, "enabling chat again must be accepted");
+    Require(sceAudioOut2DisableChat() == 0, "disabling chat must be accepted");
+    Require(sceAudioOut2DisableChat() == 0, "disabling chat again must be accepted");
+    Require(sceAudioOut2EnableChat() == 0, "enabling chat after disabling it must be accepted");
 }
 
 }

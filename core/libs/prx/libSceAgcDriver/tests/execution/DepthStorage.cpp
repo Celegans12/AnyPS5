@@ -255,10 +255,9 @@ void Run(Context context, std::uint8_t* block) {
     layeredStencil.depthOrLastArray = 1;
     Require(DepthSurfaceStorage(context, {}, layeredStencil, 0) == nullptr, "a two-layer 2D array view of the stencil plane was taken for the plane's own storage image");
     layeredDepth.depthOrLastArray = 1;
-    Require(DepthSurfaceStorage(context, {}, layeredDepth, 0) == nullptr, "a two-layer 2D array view of the depth plane was taken for the plane's own storage image");
-    layeredDepth.depthOrLastArray = 0;
+    ExpectFailure([&] { static_cast<void>(DepthSurfaceStorage(context, {}, layeredDepth, 0)); }, "with a layer pitch of", "a two-layer 2D array view of the depth plane with a layer pitch other than the depth slice size was accepted");
     layeredDepth.baseArray = 1;
-    Require(DepthSurfaceStorage(context, {}, layeredDepth, 0) == nullptr, "a 2D array view of layer 1 of the depth plane was taken for the plane's own storage image");
+    ExpectFailure([&] { static_cast<void>(DepthSurfaceStorage(context, {}, layeredDepth, 0)); }, "with a layer pitch of", "a 2D array view of layer 1 of the depth plane with a layer pitch other than the depth slice size was accepted");
 }
 
 }

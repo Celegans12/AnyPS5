@@ -19,6 +19,10 @@
 #include <link.h>
 #endif
 
+#ifdef _WIN32
+extern "C" void ForgetUnloadedUnwindImages_nid_no_patch();
+#endif
+
 namespace {
 
 std::mutex rtldHeapMutex;
@@ -69,7 +73,9 @@ int releaseThreadAtexitImage(const void* address, const char* caller) {
     }
     if (!handle) return 0;
 #ifdef _WIN32
-    if (!FreeLibrary(static_cast<HMODULE>(handle)))
+    const bool released = FreeLibrary(static_cast<HMODULE>(handle));
+    ForgetUnloadedUnwindImages_nid_no_patch();
+    if (!released)
 #else
     if (dlclose(handle) != 0)
 #endif

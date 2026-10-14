@@ -1181,7 +1181,7 @@ struct ImeEvent {
     ImeEventParam param;
 };
 
-using EventHandler = void (*)(void* arg, const ImeEvent* event);
+using EventHandler = void (APS5_VABI *)(void* arg, const ImeEvent* event);
 
 struct Param {
     std::int32_t user_id;

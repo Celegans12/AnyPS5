@@ -100,6 +100,9 @@ public:
                 const auto section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, BlockBytes, nullptr);
                 Require(section != nullptr, "cannot create shared test memory");
                 GuestArena::GuestArenaMap_nid_postfix(block, BlockBytes, section, 0, PAGE_READWRITE);
+                twin = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(BlockBytes, 65536));
+                Require(twin != nullptr, "cannot reserve the second mapping of shared test memory");
+                GuestArena::GuestArenaMap_nid_postfix(twin, BlockBytes, section, 0, PAGE_READWRITE);
                 CloseHandle(section);
             } else if (block != nullptr) GuestArena::GuestArenaCommit_nid_postfix(block, BlockBytes, PAGE_READWRITE, BlockBytes);
         } else {
@@ -130,6 +133,10 @@ public:
     ~GuestBlock() {
         GuestAllocations::Mutation().Remove(block);
 #ifdef _WIN32
+        if (twin != nullptr) {
+            GuestArena::GuestArenaReset_nid_postfix(twin, BlockBytes);
+            GuestArena::GuestArenaRelease_nid_postfix(twin, BlockBytes);
+        }
         if (watched) {
             GuestArena::GuestArenaReset_nid_postfix(block, BlockBytes);
             GuestArena::GuestArenaRelease_nid_postfix(block, BlockBytes);
@@ -154,6 +161,7 @@ public:
 private:
     bool watched;
     std::uint8_t* block = nullptr;
+    std::uint8_t* twin = nullptr;
 };
 
 std::array<std::uint32_t, 8> TextureDescriptor(const std::uint8_t* texels, const std::uint8_t* keys) {
@@ -337,18 +345,37 @@ void Run(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
     }
     readPending(DccKeys::Uncompressed, false, "a pending fill of the keys with 0x5a, which is no clear code");
     Require(fill(0, KeyBytes, 0x10), "the comp-to-single fill of the keys was not recorded");
-    readPending(DccKeys::ClearSingle, true, "a pending comp-to-single fill of the keys");
+    readPending(DccKeys::ClearSingle, false, "a pending comp-to-single fill of the keys");
+    RequireKeys(keys, 0x10, "the keys after a pending comp-to-single fill landed");
     Require(fill(0, KeyBytes / 2, 0x00) && fill(KeyBytes / 2, KeyBytes / 2, 0x00), "the 0000 fills of the key halves were not recorded");
-    readPending(DccKeys::Clear0000, true, "pending 0000 fills over both halves of the keys");
+    readPending(DccKeys::Clear0000, false, "pending 0000 fills over both halves of the keys");
+    RequireKeys(keys, 0x00, "the keys after pending 0000 fills over both halves landed");
+    Require(fill(0, KeyBytes / 2, 0x00) && fill(KeyBytes / 2, KeyBytes / 2, 0x40), "the 0000 and 0001 fills of the key halves were not recorded");
+    readPending(DccKeys::Uncompressed, false, "a pending 0000 fill and a pending 0001 fill over the halves of the keys");
     Require(fill(0, KeyBytes / 2, 0x40), "the 0001 fill of the first key half was not recorded");
     Dispatch(device, ClearKeysCode, clearTailData, false);
     readPending(DccKeys::Uncompressed, true, "a pending 0001 fill over half the keys and a kernel's 0000 store over the other half");
+    Require(fill(0, KeyBytes, 0x40), "the 0001 fill of the keys was not recorded");
+    Dispatch(device, ClearKeysCode, clearTailData, false);
+    Require(fill(0, KeyBytes / 2, 0x40), "the 0001 fill of the first key half over the kernel's store was not recorded");
+    readPending(DccKeys::Uncompressed, true, "a pending 0001 fill over half the keys, whose other half a kernel stored over an earlier 0001 fill");
     Require(fill(0, KeyBytes, 0x10) && fill(0, KeyBytes, 0x00), "the 0x10 and 0000 fills of the keys were not recorded");
-    readPending(DccKeys::Clear0000, true, "a pending 0x10 fill of the keys overwritten by a pending 0000 fill");
+    readPending(DccKeys::Clear0000, false, "a pending 0x10 fill of the keys overwritten by a pending 0000 fill");
+    RequireKeys(keys, 0x00, "the keys after a pending 0x10 fill and a pending 0000 fill landed");
+    Require(fill(0, KeyBytes, 0x10), "the 0x10 fill of the keys under a kernel's store was not recorded");
+    Dispatch(device, ClearKeysCode, clearData, false);
+    Require(fill(0, KeyBytes, 0x40), "the 0001 fill over the kernel's store was not recorded");
+    readPending(DccKeys::Clear0001, false, "a pending 0001 fill of the keys over a kernel's 0000 store over a pending 0x10 fill");
+    RequireKeys(keys, 0x40, "the keys after a 0x10 fill, a kernel's 0000 store and a 0001 fill landed");
     Require(fill(KeyBytes / 2, KeyBytes / 2, 0x10), "the 0x10 fill of the second key half was not recorded");
     device.WaitIdle();
     Require(fill(0, KeyBytes / 2, 0x00), "the 0000 fill of the first key half was not recorded");
     readPending(DccKeys::Uncompressed, false, "a pending 0000 fill over half the keys whose other half holds 0x10");
+    Require(fill(KeyBytes / 2, KeyBytes / 2, 0xc0), "the 1111 fill of the second key half was not recorded");
+    device.WaitIdle();
+    Require(fill(0, KeyBytes / 2, 0xc0), "the 1111 fill of the first key half was not recorded");
+    readPending(DccKeys::Clear1111, false, "a pending 1111 fill over half the keys whose other half holds 1111");
+    RequireKeys(keys, 0xc0, "the keys after a pending 1111 fill over a half that holds 1111 landed");
     Require(fill(0, KeyBytes, 0x10), "the 0x10 fill of the keys was not recorded");
     device.WaitIdle();
     Require(fill(0, KeyBytes / 2, 0x00) && fill(KeyBytes / 2, KeyBytes / 2, 0x00), "the 0000 fills of the key halves were not recorded");
@@ -651,6 +678,77 @@ void RunImportWindow(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
 #endif
 
 #ifdef _WIN32
+void RunHintedImport(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
+    using namespace AgcDriver::GuestMemory;
+    const auto address = AddressOf(block);
+    std::memset(block, 0x55, BlockBytes);
+    auto descriptor = TextureDescriptor(block, nullptr);
+    descriptor[2] = ((Side - 1u) >> 2u) | ((2 * Side - 1u) << 14u);
+    descriptor[6] = 0;
+    descriptor[7] = 0;
+    std::vector<std::uint32_t> userData(16, 0u);
+    std::copy(descriptor.begin(), descriptor.end(), userData.begin() + 4);
+    std::lock_guard gpu(GpuMutex());
+    BumpCollectEpoch();
+    Dispatch(device, WriteCode, userData);
+    const auto image = StorageTexture::FindPending(address, BlockBytes);
+    Require(image != nullptr && image->GuestBytes() == BlockBytes, "hinted import: the two-block image has no pending results");
+    if (Watched(address, BlockBytes)) {
+        std::puts("the write-watched image stayed watched: its untracked hint is not tested");
+        StorageTexture::FlushPending(address, BlockBytes, nullptr, "test hinted import");
+        device.WaitIdle();
+        return;
+    }
+    StorageTexture::FlushPending(address, BlockBytes, nullptr, "test hinted import");
+    device.WaitIdle();
+    for (int settle = 0; settle < 2; ++settle) {
+        BumpCollectEpoch();
+        image->Refresh();
+    }
+    const auto version = image->Version();
+    const auto compares = StorageTexture::UntrackedCompares();
+    for (int epoch = 0; epoch < 50; ++epoch) {
+        BumpCollectEpoch();
+        Require(image->Refresh() && image->Version() == version, "hinted import: an unchanged image was uploaded again");
+    }
+    char message[192];
+    std::snprintf(message, sizeof(message), "hinted import: 50 collect epochs without a store compared the image %llu times", static_cast<unsigned long long>(StorageTexture::UntrackedCompares() - compares));
+    Require(StorageTexture::UntrackedCompares() == compares, message);
+    block[SurfaceBytes + 0x100] = 0x33;
+    BumpCollectEpoch();
+    Require(!image->Refresh() && image->Version() != version, "hinted import: a CPU store into the imported image was missed");
+    const auto stored = StorageTexture::UntrackedCompares();
+    Require(stored > compares, "hinted import: the CPU store was found without a compare");
+    BumpCollectEpoch();
+    Require(image->Refresh() && StorageTexture::UntrackedCompares() - stored <= 1, "hinted import: the stored image did not settle");
+    const auto settled = image->Version();
+    block[SurfaceBytes + 0x200] = 0x44;
+    std::array<void*, 1> marked{};
+    std::size_t count = marked.size();
+    Require(GuestArena::GuestArenaCollectWrites_nid_postfix(static_cast<std::uintptr_t>(address + SurfaceBytes), 4096, marked.data(), &count, true) && count == 1, "hinted import: the store to hide was not marked");
+    MarkWritten(address + SurfaceBytes + 0x200, 1);
+    BumpCollectEpoch();
+    Require(!image->Refresh() && image->Version() != settled, "hinted import: a recorded store without a write-watch mark was missed");
+    Dispatch(device, WriteCode, userData);
+    Require(StorageTexture::FindPending(address, BlockBytes) == image, "hinted import: the second write left no pending results");
+    BumpCollectEpoch();
+    image->Refresh();
+    const auto pendingVersion = image->Version();
+    const auto beforeRewrite = StorageTexture::UntrackedCompares();
+    auto* rewritten = reinterpret_cast<volatile std::uint8_t*>(block + SurfaceBytes + 0x2000);
+    *rewritten = *rewritten;
+    BumpCollectEpoch();
+    Require(image->Refresh() && image->Version() == pendingVersion, "hinted import: a store of the bytes already there uploaded the image");
+    Require(StorageTexture::UntrackedCompares() - beforeRewrite == 1, "hinted import: a store of the bytes already there did not cost exactly one compare");
+    Require(StorageTexture::FindPending(address, BlockBytes) == image, "hinted import: a store of the bytes already there dropped the pending results");
+    BumpCollectEpoch();
+    Require(image->Refresh() && StorageTexture::UntrackedCompares() - beforeRewrite == 1, "hinted import: the image was compared again without a store");
+    StorageTexture::FlushPending(address, BlockBytes, nullptr, "test hinted import");
+    device.WaitIdle();
+    Require(Count(block, SurfaceBytes, 0xff) == Threads * 4u, "hinted import: the pending results were lost");
+    Require(block[SurfaceBytes + 0x100] == 0x33 && block[SurfaceBytes + 0x200] == 0x44, "hinted import: the write-back lost the CPU store");
+}
+
 void RunSharedImport(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
     using namespace AgcDriver::GuestMemory;
     const auto address = AddressOf(block);
@@ -691,6 +789,7 @@ int main() {
         std::optional<GuestBlock> shared;
         std::optional<GuestBlock> window;
         std::optional<GuestBlock> pendingSingle;
+        std::optional<GuestBlock> hinted;
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         block.emplace(false);
@@ -734,6 +833,9 @@ int main() {
 #ifndef _WIN32
             window.emplace(true);
             RunImportWindow(*device, window->Data());
+#else
+            hinted.emplace(true);
+            RunHintedImport(*device, hinted->Data());
 #endif
         } else {
             std::puts("guest memory has no write watch: a write-watched surface is not tested");

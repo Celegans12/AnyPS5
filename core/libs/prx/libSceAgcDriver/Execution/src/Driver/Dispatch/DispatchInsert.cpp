@@ -117,10 +117,13 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
             }
 
             static const bool lru = std::getenv("APS5_NO_DISPATCH_LRU") == nullptr;
-            if (dispatchCache.size() > dispatchCacheEntries()) {
+            const auto over = [&] { return dispatchCache.size() > dispatchCacheEntries() || (dispatchCache.size() > 1 && dispatchCacheVariantBytes > DispatchCacheBytes()); };
+            if (over()) {
                 if (lru) {
-                    eraseDispatchEntry(dispatchCache.find(dispatchOrder.back()));
-                    ++dispatchCacheEvictions;
+                    while (over()) {
+                        eraseDispatchEntry(dispatchCache.find(dispatchOrder.back()));
+                        ++dispatchCacheEvictions;
+                    }
                 } else {
                     dispatchCacheEvictions += dispatchCache.size();
                     dispatchCache.clear();

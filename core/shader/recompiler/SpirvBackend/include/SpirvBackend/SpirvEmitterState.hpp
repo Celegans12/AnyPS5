@@ -139,6 +139,7 @@ struct SpirvEmitterState {
     std::uint32_t dot2F32F16Function = 0;
     std::array<std::array<std::uint32_t, 2>, 2> bdaDwordReadFunctions {};
     std::array<std::array<std::uint32_t, 2>, 2> bdaSpanReadFunctions {};
+    std::unordered_map<const IrValue*, std::pair<std::uint32_t, std::uint32_t>> bdaGroupedLoads;
     std::uint32_t bdaStopValue = 0;
     std::uint32_t bdaPcOverride = 0;
     // False for programs with workgroup barriers: faulting BDA accesses then continue (see BdaInvocationsMayStop).

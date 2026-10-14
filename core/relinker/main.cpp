@@ -60,6 +60,7 @@ ConvertedExecutable Convert(const Cli::Args& args, const std::string& inputPath,
     options.TraceImports = args.traceImports;
     options.WindowsFixedBase = mainExecutable ? args.windowsFixedBase : std::nullopt;
     options.WindowsDiagnostics = args.windowsDiagnostics && mainExecutable;
+    options.LinuxFixedBase = args.linuxFixedBase;
     options.ExcludedModules = args.excludedSceModules;
     progress.IncludeFile(Io::Utf8Path(input.InputPath));
     progress.IncludeFile(Io::Utf8Path(input.OutputPath));
@@ -91,6 +92,8 @@ int Run(const int argc, char* argv[]) {
 
         if (std::filesystem::exists(Io::NativePath(args.inputPath)) && std::filesystem::exists(Io::NativePath(args.outputPath)) && std::filesystem::equivalent(Io::NativePath(args.inputPath), Io::NativePath(args.outputPath)))
             throw Domain::RelinkerException("Executable output would overwrite the input executable");
+        if (Io::NativePath(args.outputPath).filename().empty() || std::filesystem::is_directory(Io::NativePath(args.outputPath)))
+            throw Domain::RelinkerException("Executable output is a directory: " + args.outputPath);
         const std::string absPath = Io::Utf8Path(std::filesystem::absolute(Io::NativePath(args.outputPath)));
 
         struct ExtraExecutable {

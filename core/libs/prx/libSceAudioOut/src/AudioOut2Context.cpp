@@ -14,6 +14,8 @@
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/PreciseWait.hpp"
 #include "AudioOut2Internal.hpp"
+#include "prx/libSceAudioOut/include/AudioOutSdl.hpp"
+#include "prx/libScePad/include/PadState.hpp"
 
 // An AudioOut2 context is the hardware output queue: every push appends a grain (num_grains samples)
 // to a queue of queue_depth grains that plays in real time. Titles pace their mixer on that queue, so
@@ -106,7 +108,7 @@ static std::uint32_t QueueLevel(AudioOut2Context& context, Clock::time_point now
 static void DeviceCallback(void* userdata, Uint8* stream, int length);
 
 static void OpenDevice(AudioOut2Context& context) {
-    if (SDL_InitSubSystem(SDL_INIT_AUDIO) < 0) {
+    if (InitializeSdlAudio_nid_no_patch() < 0) {
         AUDIOOUT2_TRACE("SDL audio init failed: %s\n", SDL_GetError());
         return;
     }
@@ -134,7 +136,7 @@ static void CloseDevice(SDL_AudioDeviceID device) {
 }
 
 static void OpenPadDevice(AudioOut2Context& context) {
-    if (SDL_WasInit(SDL_INIT_AUDIO) == 0 && SDL_InitSubSystem(SDL_INIT_AUDIO) < 0) return;
+    if (SDL_WasInit(SDL_INIT_AUDIO) == 0 && InitializeSdlAudio_nid_no_patch() < 0) return;
     const int count = SDL_GetNumAudioDevices(0);
     for (int index = 0; index < count; index++) {
         const char* listed = SDL_GetAudioDeviceName(index, 0);
@@ -174,7 +176,7 @@ static void ClosePadDevice(AudioOut2Context& context) {
 
 static void UpdatePadDevice(AudioOut2Context& context, Clock::time_point now) {
     if (context.padDevice != 0 && SDL_GetAudioDeviceStatus(context.padDevice) == SDL_AUDIO_STOPPED) {
-        APS5_LOG_CHARS_OUT("AudioOut2: the controller sound card went away; its ports play in the main mix");
+        APS5_LOG_CHARS_OUT("AudioOut2: the controller sound card went away; speaker audio falls back to the main mix, haptic audio stays muted");
         ClosePadDevice(context);
         context.nextPadProbe = now + PAD_PROBE_INTERVAL;
     }
@@ -200,7 +202,8 @@ static void QueuePadGrain(AudioOut2Context& context) {
 
 static void Render(AudioOut2Context& context, const AudioOut2Grain& grain) {
     float* pad = nullptr;
-    if (context.padDevice != 0) {
+    if (context.padDevice != 0 || AudioOut2HasPadPorts(context)) {
+        context.padMix.resize(static_cast<std::size_t>(context.grain) * AUDIO_OUT2_PAD_CHANNELS);
         std::fill(context.padMix.begin(), context.padMix.end(), 0.0f);
         pad = context.padMix.data();
     }
@@ -212,7 +215,11 @@ static void Render(AudioOut2Context& context, const AudioOut2Grain& grain) {
     }
     if (pad != nullptr) {
         AudioOut2FinishPadMix(pad, context.grain);
-        QueuePadGrain(context);
+        if (context.padDevice != 0) QueuePadGrain(context);
+        else {
+            const auto rumble = AudioOut2RumbleFromPadFrames(pad, context.grain);
+            PadSubmitAudioHaptics_nid_postfix(rumble[0], rumble[1]);
+        }
     }
 }
 
