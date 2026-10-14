@@ -174,8 +174,19 @@ std::uint32_t EmitBranchCondition(SpirvValueEmitContext& ctx, const BlockInfo& i
     state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), high, ballot, 1u);
     const auto kind = info.terminator.condition;
     const bool zero = kind == BranchCondition::ExecZero || kind == BranchCondition::VccZero || kind == BranchCondition::SccZero;
+    // A zero condition must hold on both lanes of every invocation still running, so the halves' AND is
+    // compared with a ballot of those invocations, not with all 32 bits: an invocation that left early
+    // (StopBdaInvocationIf after a recorded fault) drops out of every later ballot, and a loop leaving on
+    // execz, vccz or scc0 then never left (a GPU hang instead of the fault report).
+    std::uint32_t expected = ConstantU32(state, 0u);
+    if (zero) {
+        const auto active = state.module.AllocateId();
+        EmitSubgroupBallot(state, active, ConstantBool(state, true));
+        expected = state.module.AllocateId();
+        state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), expected, active, 0u);
+    }
     const auto combined = EmitBinaryU32(state, zero ? spv::OpBitwiseAnd : spv::OpBitwiseOr, low, high);
-    state.module.AddFunction(zero ? spv::OpIEqual : spv::OpINotEqual, TypeBool(state), result, combined, ConstantU32(state, zero ? ~0u : 0u));
+    state.module.AddFunction(zero ? spv::OpIEqual : spv::OpINotEqual, TypeBool(state), result, combined, expected);
     return result;
 }
 
