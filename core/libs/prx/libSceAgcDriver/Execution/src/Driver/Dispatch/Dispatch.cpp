@@ -64,6 +64,12 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
     }
     auto compute = Graphics::DecodeComputeStageInfo(queue.shader, snapshot.header);
     const bool resolving = resolvingAhead();
+    if (SkipRefusedShaders() && SkipListedShader(address)) {
+        if (resolving) return;
+        char where[96];
+        std::snprintf(where, sizeof(where), "compute shader 0x%llx: ", static_cast<unsigned long long>(address));
+        throw ShaderRefusal(std::string(where) + "listed in the diagnostic skip list");
+    }
     std::vector<ShaderRecompiler::MemoryRegion> memory{{snapshot.codeAddress, std::as_bytes(std::span(snapshot.code))}};
     if (!snapshot.header.empty()) memory.push_back({snapshot.headerAddress, snapshot.header});
 

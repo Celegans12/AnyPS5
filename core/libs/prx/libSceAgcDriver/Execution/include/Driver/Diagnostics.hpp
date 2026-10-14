@@ -33,6 +33,7 @@ public:
 };
 
 bool SkipRefusedShaders();
+bool SkipListedShader(std::uint64_t address);
 
 // "<stage> shader 0x<address>" for refusal reports; stage is a ShaderRecompiler::ShaderStage.
 std::string RefusedShaderSubject(std::uint32_t stage, std::uint64_t address);

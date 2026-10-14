@@ -63,6 +63,24 @@ bool SkipRefusedShaders() {
     return skip;
 }
 
+bool SkipListedShader(std::uint64_t address) {
+    static constexpr char variable[] = "APS5" "_SKIP_SHADER_LIST";
+    static const std::vector<std::uint64_t> listed = [] {
+        std::vector<std::uint64_t> addresses;
+        const char* text = std::getenv(variable);
+        if (text == nullptr) return addresses;
+        const std::string list(text);
+        std::size_t begin = 0;
+        while (begin < list.size()) {
+            const auto end = std::min(list.find(',', begin), list.size());
+            if (end > begin) addresses.push_back(std::strtoull(list.substr(begin, end - begin).c_str(), nullptr, 16));
+            begin = end + 1;
+        }
+        return addresses;
+    }();
+    return !listed.empty() && std::find(listed.begin(), listed.end(), address) != listed.end();
+}
+
 std::string RefusedShaderSubject(std::uint32_t stage, std::uint64_t address) {
     static constexpr const char* stageNames[] = {"compute", "vertex", "hull", "domain", "geometry", "pixel", "local", "mesh"};
     char text[64];
