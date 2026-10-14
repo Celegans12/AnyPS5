@@ -160,6 +160,67 @@ void snapshotTableTests(const Context& context, const BdaTestAccess& access) {
     ::operator delete(block, std::align_val_t{piece});
 }
 
+void spaceReuseTests(const Context& context) {
+    constexpr std::size_t piece = 65536;
+    auto* block = static_cast<std::byte*>(::operator new(2 * piece, std::align_val_t{piece}));
+    std::memset(block, 0x5a, 2 * piece);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    auto importing = context;
+    importing.hostImportAlignment = piece;
+    const auto change = [&](std::byte* range, bool add) {
+        auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
+        if (add) GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, range, piece, true, true, true);
+        else GuestAllocations::GuestAllocationsRemove_nid_postfix(mutation, range);
+        GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
+    };
+    change(block, true);
+    alignas(256) static std::array<std::byte, 64> captured{};
+    captured.fill(std::byte{0x21});
+    std::array<std::byte, 16> liveBytes{};
+    std::memcpy(liveBytes.data(), block + 128, liveBytes.size());
+    const std::array<GuestMemorySnapshot, 2> snapshots{{{reinterpret_cast<std::uint64_t>(captured.data()), captured}, {address + 128, liveBytes}}};
+    auto otherCapture = captured;
+    otherCapture[3] = std::byte{0x22};
+    const std::array<GuestMemorySnapshot, 2> otherCopied{{{reinterpret_cast<std::uint64_t>(captured.data()), otherCapture}, snapshots[1]}};
+    const std::array<GuestMemorySnapshot, 1> fewer{{snapshots[0]}};
+    {
+        GuestBufferMemory memory(importing);
+        memory.AcquireRegistered();
+        for (const auto& snapshot : snapshots) memory.AddSnapshot(snapshot);
+        memory.AddWritable(address + 256, 64);
+        memory.Upload(true);
+        if (AddressSpaceCounters().enabled && memory.CopiedBytes() != captured.size()) {
+            Require(!memory.SpaceRegions().has_value(), "an upload with ranges copied per build offered its regions for reuse");
+            std::cout << "registered ranges are copied per build here: address space reuse not tested\n";
+            memory.WriteBack();
+        } else if (AddressSpaceCounters().enabled) {
+            const auto regions = memory.SpaceRegions();
+            Require(regions.has_value() && regions->empty(), "an upload over the address space with only a snapshot copy of its own was refused reuse");
+            const auto written = memory.DirectWrites();
+            Require(written.size() == 1 && written.front() == std::pair{address + 256, address + 320}, "the written range served in place by the address space is not its direct write");
+            Require(memory.SameSnapshots(snapshots), "an upload refused the snapshots it was built from");
+            Require(!memory.SameSnapshots(otherCopied) && !memory.SameSnapshots(fewer), "an upload took snapshots with other copied bytes, or fewer of them");
+            memory.SuspendSpace();
+            Require(!memory.HoldsLease(), "a suspended upload still holds its address space");
+            Require(memory.ResumeSpace() && memory.HoldsLease() && memory.SpaceImportsCurrent(), "an upload could not take its unchanged address space again");
+            memory.SuspendSpace();
+            block[128] ^= std::byte{0xff};
+            Require(!memory.SameSnapshots(snapshots), "an upload took a snapshot that no longer equals the registered memory it covers");
+            block[128] ^= std::byte{0xff};
+            change(block + piece, true);
+            Require(!memory.ResumeSpace() && !memory.HoldsLease(), "an upload took its address space again after another range was registered");
+            change(block + piece, false);
+            Require(!memory.ResumeSpace(), "an upload took a replaced address space again");
+        } else {
+            Require(!memory.SpaceRegions().has_value(), "an upload without the cached address space offered its regions for reuse");
+            memory.WriteBack();
+        }
+    }
+    ClearSnapshotCopies(importing.device);
+    change(block, false);
+    ::operator delete(block, std::align_val_t{piece});
+}
+
 void importCrossingTests(const Context& context, const BdaTestAccess& access) {
     constexpr std::size_t half = 65536;
     void* block = ::operator new(2 * half, std::align_val_t{half});
@@ -1790,6 +1851,44 @@ void sparseHeapMirrorTests(const Context& context, const BdaTestAccess& access) 
 #endif
 }
 
+void addressMovedBufferTests(const Context& context) {
+    alignas(64) static std::array<std::uint32_t, 16> first{};
+    alignas(64) static std::array<std::uint32_t, 16> second{};
+    const auto vsharp = [](const void* data) {
+        const auto address = reinterpret_cast<std::uint64_t>(data);
+        return std::vector<std::uint32_t>{static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32) & 0xffffu, static_cast<std::uint32_t>(sizeof(first)), 0x31000000u};
+    };
+    ShaderRecompiler::RecompileResult vertex;
+    auto buffer = binding(Role::GuestBuffers, 6);
+    buffer.guestDescriptor = vsharp(first.data());
+    buffer.bufferWritten = {false};
+    auto data = binding(Role::FlattenedSrt, 7);
+    data.guestDescriptor = {7u, 8u, 9u, 10u};
+    vertex.bindings = {buffer, data};
+    ShaderRecompiler::RecompileResult fragment;
+    fragment.bdaAbiVersion = ShaderRecompiler::BdaAbi::Version;
+    fragment.bindings = {binding(Role::BdaPagetable, 4), binding(Role::FaultBuffer, 5)};
+    auto moved = vertex;
+    moved.bindings[0].guestDescriptor = vsharp(second.data());
+    auto rewritten = vertex;
+    rewritten.bindings[1].guestDescriptor = {7u, 8u, 9u, 11u};
+    const std::array<CompiledShader, 2> built{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}}};
+    const std::array<CompiledShader, 2> movedStages{{{ShaderRecompiler::ShaderStage::Vertex, &moved, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}}};
+    const std::array<CompiledShader, 2> rewrittenStages{{{ShaderRecompiler::ShaderStage::Vertex, &rewritten, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}}};
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    Recorder recorder(context);
+    {
+        ShaderResources resources(context, built, ColorTarget{}, 0, 0, 0, {});
+        Require(resources.UsesAddressTable(), "a draw build with a BDA table stage does not use the BDA table");
+        const auto unchanged = resources.MovedReadOnlyBuffers(built, recorder);
+        Require(unchanged.has_value() && unchanged->empty(), "an address-based draw build found a buffer moved in the stages it was built from");
+        Require(!resources.MovedReadOnlyBuffers(movedStages, recorder).has_value(), "an address-based draw build would serve a draw whose read-only buffer moved, which it cannot bind per draw");
+        Require(!resources.MovedReadOnlyBuffers(rewrittenStages, recorder).has_value(), "an address-based draw build would serve a draw with other data words, which it cannot bind per draw");
+        resources.WriteBack();
+    }
+    recorder.Sync();
+}
+
 void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     directImageFaultTests(context, access);
     bindlessFaultTests(context, access);
@@ -1870,7 +1969,8 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     }
     {
         ShaderResources resources(context, compiled, snapshots);
-        Require(ShaderResources::NeverReusable(std::span<const CompiledShader>(&compiled, 1)) && !resources.Reusable(), "an address-based build is reusable");
+        Require(!ShaderResources::NeverReusable(std::span<const CompiledShader>(&compiled, 1)), "address-based stages are refused the resource cache");
+        Require(!resources.Reusable() && !resources.InUse(), "an address-based dispatch build is reusable");
         Require(resources.UsesAddressTable(), "an address-based build does not use the BDA table");
         ShaderRecompiler::RecompileResult plain;
         plain.bindings = {binding(Role::GuestBuffers, 6)};
@@ -1995,6 +2095,8 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     importCrossingTests(context, access);
     addressTableKeyTests();
     snapshotTableTests(context, access);
+    spaceReuseTests(context);
+    addressMovedBufferTests(context);
     importSpanTests(context);
     failedImportRemapTests(context, access);
     spaceImportRunTests(context);

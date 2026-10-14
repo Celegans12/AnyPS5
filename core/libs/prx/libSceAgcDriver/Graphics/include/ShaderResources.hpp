@@ -8,6 +8,7 @@
 #include "Recompiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <limits>
 #include <list>
@@ -311,6 +312,10 @@ public:
     void PinTextures(bool pin) const;
     bool ChecksFaults() const { return bda != nullptr; }
     void CheckFaults(std::uint64_t shaderAddress = 0) const;
+    bool InUse() const { return usesInFlight.load(std::memory_order_acquire) != 0; }
+    std::shared_ptr<const void> BeginUse();
+    void CompleteUse();
+    void EndUse() noexcept;
     // `shaders` are the stages the object was built from, in build order (a recorded draw's vertex
     // and fragment stages, or one compute stage): their bindings are walked like the build did.
     // How a Revalidate proved (or refused) the object, for the [recipe] line: the proof path taken
@@ -321,7 +326,7 @@ public:
         ProofPath path = ProofPath::Fast;
         ProofFailure failure = ProofFailure::None;
     };
-    bool Revalidate(std::span<const CompiledShader> shaders, ProofReport* report = nullptr);
+    bool Revalidate(std::span<const CompiledShader> shaders, ProofReport* report = nullptr, std::span<const GuestMemorySnapshot> snapshots = {});
     bool Revalidate(const CompiledShader& shader, ProofReport* report = nullptr) { return Revalidate(std::span<const CompiledShader>(&shader, 1), report); }
     // The proof a recipe hit runs on its template (design_cpu_final M4): Revalidate by that name.
     bool ProveCurrent(std::span<const CompiledShader> shaders, ProofReport* report = nullptr) { return Revalidate(shaders, report); }
@@ -513,6 +518,7 @@ private:
     void prepareAddressBindings(std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots);
     VkDescriptorBufferInfo descriptor(Allocation& allocation);
     void noteReusable();
+    bool proveBuild(std::span<const CompiledShader> shaders, ProofReport* report);
     void reportDescriptorCaches() const;
     // What a sampled texture was proved current against when the build (or the last full Revalidate)
     // looked it up, so the next Revalidate can repeat the proof from write stamps and the DCC keys
@@ -639,6 +645,9 @@ private:
     };
     std::vector<SamplerSource> samplerSources;
     bool reusable = false;
+    bool addressReuse = false;
+    std::atomic<std::uint32_t> usesInFlight{0};
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> addressWrites;
     std::vector<DirectRegion> directRegions;
     std::vector<ValidatedSurface> validatedTextures;
     std::vector<std::array<std::uint64_t, 4>> storageUntracked;
