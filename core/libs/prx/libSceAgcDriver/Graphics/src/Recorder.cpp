@@ -1406,6 +1406,11 @@ void Recorder::LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool
     open->passHazards.Add(access);
 }
 
+PassBinding& Recorder::PassBound() {
+    Require(open != nullptr, "no batch is open for the render pass");
+    return open->renderPass.bound;
+}
+
 void Recorder::endOpenRenderPass(bool barrier) {
     auto& pass = open->renderPass;
     if (open->segmentActive) endSegment(*open);
