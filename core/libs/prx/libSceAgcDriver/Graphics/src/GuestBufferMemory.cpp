@@ -2748,15 +2748,15 @@ void GuestBufferMemory::dissolveSpace(bool resolve) {
     space.reset();
 }
 
-const GuestBufferMemory::Region* GuestBufferMemory::owner(std::uint64_t address) const {
-    // The region with the greatest begin at or below the address, as the one merged list gave;
-    // the caller checks the end, as before.
+const GuestBufferMemory::Region* GuestBufferMemory::owner(std::uint64_t address, std::uint64_t end) const {
     const auto candidate = [address](const std::vector<Region>& list) -> const Region* {
         const auto found = std::upper_bound(list.begin(), list.end(), address, [](std::uint64_t value, const Region& region) { return value < region.begin; });
         return found == list.begin() ? nullptr : &*std::prev(found);
     };
     const auto* own = candidate(regions);
     const auto* shared = space != nullptr ? candidate(space->base) : nullptr;
+    const auto holds = [end](const Region* region) { return region != nullptr && end <= region->end; };
+    if (holds(own) != holds(shared)) return holds(own) ? own : shared;
     if (own == nullptr || (shared != nullptr && shared->begin > own->begin)) return shared;
     return own;
 }
@@ -3824,7 +3824,7 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
 VkDescriptorBufferInfo GuestBufferMemory::Descriptor(std::uint64_t address, std::size_t bytes, std::uint32_t& adjustment) const {
     Require(uploaded && !committed, "guest GPU memory is not available");
     Require(bytes != 0 && bytes <= std::numeric_limits<std::uint64_t>::max() - address, "invalid guest buffer view");
-    const auto* found = owner(address);
+    const auto* found = owner(address, address + bytes);
     Require(found != nullptr, "guest buffer has no GPU owner");
     const auto& region = *found;
     const auto describe = [&](const char* what) {
@@ -3904,7 +3904,7 @@ std::vector<ShaderRecompiler::BdaAbi::Range> GuestBufferMemory::AddressRanges() 
             part.end = end;
             part.deviceAddress += cursor - range.begin;
             if (written) {
-                const auto* region = owner(cursor);
+                const auto* region = owner(cursor, end);
                 Require(region != nullptr && region->writable && (region->mirror == nullptr || region->mirror->writable), "runtime buffer write has no writable GPU owner");
                 part.permissions |= ShaderRecompiler::BdaAbi::Write;
             }
@@ -3950,7 +3950,7 @@ std::optional<GuestBufferMemory::CachedTable> GuestBufferMemory::CachedAddressTa
 
 bool GuestBufferMemory::HasCopiedWrites() const {
     for (const auto& [begin, end] : writes) {
-        const auto* found = owner(begin);
+        const auto* found = owner(begin, end);
         if (found == nullptr) continue;
         const auto& region = *found;
         if (region.direct != nullptr) continue;
@@ -3970,7 +3970,7 @@ bool GuestBufferMemory::CopiedWritesOverlap(std::uint64_t address, std::size_t b
     if (bytes == 0) return false;
     for (const auto& [begin, end] : writes) {
         if (!(address < end && begin < address + bytes)) continue;
-        const auto* found = owner(begin);
+        const auto* found = owner(begin, end);
         if (found == nullptr) continue;
         const auto& region = *found;
         if (region.direct != nullptr) continue;
@@ -3983,7 +3983,7 @@ bool GuestBufferMemory::CopiedWritesOverlap(std::uint64_t address, std::size_t b
 
 void GuestBufferMemory::MarkDirectWrites() const {
     for (const auto& [begin, end] : writes) {
-        const auto* found = owner(begin);
+        const auto* found = owner(begin, end);
         if (found == nullptr) continue;
         const auto& region = *found;
         if (region.direct != nullptr || (region.gpuCopy && region.copiedBack)) GuestMemory::MarkWritten(begin, static_cast<std::size_t>(end - begin));
@@ -4050,7 +4050,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> mergeWrites(std::vector<std
 void GuestBufferMemory::takeHeapReferences() {
     heapReferences.clear();
     for (const auto& [begin, end] : mergeWrites(writes)) {
-        const auto* found = owner(begin);
+        const auto* found = owner(begin, end);
         if (found == nullptr || found->mirror == nullptr || !found->mirror->heap || !found->mirror->writable) continue;
         Require(end <= found->end, "written range exceeds its heap mirror");
         const auto& mirror = *found->mirror;
@@ -4067,7 +4067,7 @@ void GuestBufferMemory::WriteBack() {
     // The CPU keeps running while the GPU works, so storing whole ranges would roll back its writes to
     // bytes the shader never touched. Only runs that differ from the uploaded copy are stored.
     for (const auto& [begin, end] : merged) {
-        const auto* found = owner(begin);
+        const auto* found = owner(begin, end);
         Require(found != nullptr, "write-back range has no GPU owner");
         const auto& region = *found;
         // Every branch below but the direct, copied-back and staged ones stores from the CPU.

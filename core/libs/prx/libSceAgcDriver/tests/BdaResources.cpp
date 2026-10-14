@@ -672,6 +672,52 @@ void spaceReadAcrossImportsWrittenTests(const Context& context) {
     ::operator delete(block, std::align_val_t{window});
 }
 
+void spaceReadsAcrossImportsMergedTests(const Context& context, const BdaTestAccess& access) {
+    constexpr std::size_t piece = 65536;
+    constexpr std::size_t window = 2 * piece;
+    constexpr std::size_t pieces = 6;
+    void* block = ::operator new(pieces * piece, std::align_val_t{window});
+    auto* guest = static_cast<std::uint8_t*>(block);
+    const auto first = reinterpret_cast<std::uintptr_t>(block);
+    for (std::size_t index = 0; index < pieces; ++index) std::memset(guest + index * piece, static_cast<int>(0x10 + index), piece);
+    auto importing = context;
+    importing.hostImportAlignment = piece;
+    SetHostImportWindow(window);
+    const auto change = [&](std::uint8_t* range, bool add) {
+        auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
+        if (add) GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, range, piece, true, false, true);
+        else GuestAllocations::GuestAllocationsRemove_nid_postfix(mutation, range);
+        GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
+    };
+    for (std::size_t index = 0; index < pieces; ++index) change(guest + index * piece, true);
+    const auto second = first + window;
+    const auto third = first + 2 * window;
+    const std::uint64_t lower = second - 256;
+    const std::uint64_t lowerBytes = 512;
+    const std::uint64_t upper = second + 128;
+    const std::uint64_t upperBytes = third + 256 - upper;
+    for (int build = 0; build < 2; ++build) {
+        GuestBufferMemory leased(importing);
+        leased.AcquireRegistered();
+        leased.AddReadable(lower, lowerBytes);
+        leased.AddReadable(upper, upperBytes);
+        leased.Upload(true);
+        for (const auto& [address, bytes] : {std::pair{lower, lowerBytes}, std::pair{upper, upperBytes}}) {
+            std::uint32_t adjustment = 0;
+            const auto view = leased.Descriptor(address, bytes, adjustment);
+            Require(view.buffer != VK_NULL_HANDLE && view.range == bytes + adjustment, "a read-only V# over imports, merged with another one, has no descriptor of its size");
+            const auto mapped = access.bytes(view.buffer);
+            const auto at = static_cast<std::size_t>(view.offset + adjustment);
+            const auto expected = [&](std::uint64_t guestAddress) { return std::byte{static_cast<unsigned char>(0x10 + (guestAddress - first) / piece)}; };
+            Require(at + bytes <= mapped.size() && mapped[at] == expected(address) && mapped[at + bytes - 1] == expected(address + bytes - 1), "a read-only V# over imports, merged with another one, maps other bytes than its own");
+        }
+        leased.WriteBack();
+    }
+    for (std::size_t index = 0; index < pieces; ++index) change(guest + index * piece, false);
+    SetHostImportWindow(0);
+    ::operator delete(block, std::align_val_t{window});
+}
+
 ShaderRecompiler::DescriptorBinding binding(Role role, std::uint32_t slot) {
     return {ShaderRecompiler::DescriptorKind::StorageBuffer, role, 0, slot, 1, {}, false};
 }
@@ -1807,6 +1853,7 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     importWindowTests(context);
     spaceReadAcrossImportsTests(context, access);
     spaceReadAcrossImportsWrittenTests(context);
+    spaceReadsAcrossImportsMergedTests(context, access);
     importJoinTests(context);
     importWholeRangeOverWindowTests(context);
     importRefusedWholeRangeTests(context);

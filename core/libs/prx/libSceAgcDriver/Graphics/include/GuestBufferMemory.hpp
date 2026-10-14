@@ -353,7 +353,7 @@ private:
     void dissolveSpace(bool resolve);
     // The region containing `address`: this build's own regions (sorted after UploadPrepare) or
     // the space's base regions, or null.
-    const Region* owner(std::uint64_t address) const;
+    const Region* owner(std::uint64_t address, std::uint64_t end) const;
     // Builds this build's regions from a lease as the per-build path always did: `base` gets the
     // ranges served in place (imports, mirrors), `copied` the ones copied per build.
     struct CopiedRange {
