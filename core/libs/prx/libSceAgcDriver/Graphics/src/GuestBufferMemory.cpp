@@ -1828,6 +1828,48 @@ std::vector<std::pair<std::size_t, std::uint64_t>> refreshHeapRuns(const GuestBu
     return checked;
 }
 
+enum class SpaceMiss { None, First, Device, Generation, Epoch };
+
+SpaceMiss spaceMiss(const Context& context, const GuestBufferMemory::AddressSpace* current, std::uint64_t generation, const HostImports& state) {
+    if (current == nullptr) return SpaceMiss::First;
+    if (current->device != context.device) return SpaceMiss::Device;
+    if (current->generation != generation) return SpaceMiss::Generation;
+    if (current->importsEpoch != state.epoch) return SpaceMiss::Epoch;
+    return SpaceMiss::None;
+}
+
+void stampSpaceImports(const GuestBufferMemory::AddressSpace& space, HostImports& state) {
+    const auto stamp = ++state.useCounter;
+    static const bool stampOnce = std::getenv("APS5_NO_SPACE_STAMP_ONCE") == nullptr;
+    auto& spaceUse = state.spaceUses[space.serial];
+    if (!stampOnce || spaceUse == 0) {
+        for (const auto& region : space.base) {
+            if (region.direct == nullptr) continue;
+            region.direct->lastUse = stamp;
+            if (stampOnce) region.direct->spaceSerial = space.serial;
+        }
+    }
+    spaceUse = stamp;
+    while (state.spaceUses.size() > 64) state.spaceUses.erase(state.spaceUses.begin());
+}
+
+bool refreshSparseMirrors(std::shared_ptr<const GuestBufferMemory::AddressSpace>& current, std::vector<RefreshBlock>& blocks) {
+    for (auto* mirror : current->sparseMirrors) {
+        if (refreshSparseMirror(*mirror, blocks)) continue;
+        blocks.clear();
+        Spaces().current.compare_exchange_strong(current, std::shared_ptr<const GuestBufferMemory::AddressSpace>{});
+        return false;
+    }
+    return true;
+}
+
+void appendWritableMirrors(const GuestBufferMemory::AddressSpace& space, std::vector<RefreshBlock>& blocks) {
+    for (const auto index : space.writableMirrors) {
+        const auto& region = space.base[index];
+        if (prepareRefresh(*region.mirror, region.begin, region.end - region.begin)) appendBlocks(blocks, *region.mirror, region.begin, region.end - region.begin);
+    }
+}
+
 // The mirror for a leased image range: the existing one, or a new one when none exists or the
 // registered Range object changed (a protection change). Null when the range cannot be mirrored. An
 // existing writable mirror's blocks are appended to `blocks` for the caller's one compare of every
@@ -2791,36 +2833,17 @@ void GuestBufferMemory::AcquireRegistered() {
         {
             auto& state = Imports();
             std::lock_guard lock(state.mutex);
-            if (current == nullptr) (spaces.droppedByWaiter.exchange(false, std::memory_order_relaxed) ? spaces.rebuiltWaiterDrop : spaces.rebuiltFirst).fetch_add(1, std::memory_order_relaxed);
-            else if (current->device != context.device) spaces.rebuiltDevice.fetch_add(1, std::memory_order_relaxed);
-            else if (current->generation != generation) spaces.rebuiltGeneration.fetch_add(1, std::memory_order_relaxed);
-            else if (current->importsEpoch != state.epoch) spaces.rebuiltEpoch.fetch_add(1, std::memory_order_relaxed);
-            else hit = true;
+            switch (spaceMiss(context, current.get(), generation, state)) {
+                case SpaceMiss::First: (spaces.droppedByWaiter.exchange(false, std::memory_order_relaxed) ? spaces.rebuiltWaiterDrop : spaces.rebuiltFirst).fetch_add(1, std::memory_order_relaxed); break;
+                case SpaceMiss::Device: spaces.rebuiltDevice.fetch_add(1, std::memory_order_relaxed); break;
+                case SpaceMiss::Generation: spaces.rebuiltGeneration.fetch_add(1, std::memory_order_relaxed); break;
+                case SpaceMiss::Epoch: spaces.rebuiltEpoch.fetch_add(1, std::memory_order_relaxed); break;
+                case SpaceMiss::None: hit = true; break;
+            }
             importFloor = state.useCounter + 1;
-            if (hit) {
-                const auto stamp = ++state.useCounter;
-                static const bool stampOnce = std::getenv("APS5_NO_SPACE_STAMP_ONCE") == nullptr;
-                auto& spaceUse = state.spaceUses[current->serial];
-                if (!stampOnce || spaceUse == 0) {
-                    for (const auto& region : current->base) {
-                        if (region.direct == nullptr) continue;
-                        region.direct->lastUse = stamp;
-                        if (stampOnce) region.direct->spaceSerial = current->serial;
-                    }
-                }
-                spaceUse = stamp;
-                while (state.spaceUses.size() > 64) state.spaceUses.erase(state.spaceUses.begin());
-            }
+            if (hit) stampSpaceImports(*current, state);
         }
-        if (hit) {
-            for (auto* mirror : current->sparseMirrors) {
-                if (refreshSparseMirror(*mirror, blocks)) continue;
-                hit = false;
-                blocks.clear();
-                spaces.current.compare_exchange_strong(current, std::shared_ptr<const AddressSpace>{});
-                break;
-            }
-        }
+        if (hit) hit = refreshSparseMirrors(current, blocks);
         if (hit) {
             spaces.hits.fetch_add(1, std::memory_order_relaxed);
             space = std::move(current);
@@ -2844,10 +2867,7 @@ void GuestBufferMemory::AcquireRegistered() {
             // before any of them is dereferenced.
             served = true;
             mirrored = space->mirrored;
-            for (const auto index : space->writableMirrors) {
-                const auto& region = space->base[index];
-                if (prepareRefresh(*region.mirror, region.begin, region.end - region.begin)) appendBlocks(blocks, *region.mirror, region.begin, region.end - region.begin);
-            }
+            appendWritableMirrors(*space, blocks);
             lap(timing.mirrorsUs, at);
         }
     }
