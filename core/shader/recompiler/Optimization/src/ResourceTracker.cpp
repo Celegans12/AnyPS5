@@ -478,6 +478,23 @@ private:
         return matched && stride >= 4u && stride % 4u == 0u && key->Type() == IrType::U32;
     }
 
+    static bool MatchMaskedOffset(IrValue* value, IrValue*& key, std::uint32_t& stride) {
+        value = value->Resolve();
+        if (value->Opcode() != IrOpcode::BitwiseAnd32 || value->ArgumentCount() != 2u) {
+            return false;
+        }
+        std::uint32_t mask = 0;
+        IrValue* scaled = nullptr;
+        if (immediateU32(value->Argument(1), mask)) {
+            scaled = value->Argument(0);
+        } else if (immediateU32(value->Argument(0), mask)) {
+            scaled = value->Argument(1);
+        } else {
+            return false;
+        }
+        return MatchScale(scaled, key, stride) && std::has_single_bit(stride) && stride >= 4u && (mask & ~(stride - 1u)) != 0u && key->Type() == IrType::U32;
+    }
+
     std::optional<KeyDomain> MatchKeyDomain(IrValue* key) {
         key = key->Resolve();
         std::uint32_t memoryIndex = 0;
@@ -607,9 +624,15 @@ private:
         }
         IrValue* key = nullptr;
         TableColumn column;
+        bool masked = false;
         if (!address || !TryRecordPointer(*heapHandle, offset, first, plan, column, key)) {
             DescriptorSource heapSource;
-            if (!MatchAffineOffset(offset, key, column.stride, column.addend) || !MakeRuntimeSource(*heapHandle, address ? IrOpcode::GetAddressResource : IrOpcode::GetBufferResource, address ? 2u : 4u, column.heapSource, heapSource)) return false;
+            if (!MatchAffineOffset(offset, key, column.stride, column.addend)) {
+                if (!MatchMaskedOffset(offset, key, column.stride)) return false;
+                column.addend = 0;
+                masked = true;
+            }
+            if (!MakeRuntimeSource(*heapHandle, address ? IrOpcode::GetAddressResource : IrOpcode::GetBufferResource, address ? 2u : 4u, column.heapSource, heapSource)) return false;
             column.offset = first;
             column.address = address;
             plan.offset = offset;
@@ -617,7 +640,7 @@ private:
         column.dwordCount = words;
         column.maxKey = possibleU32Bits(key);
         column.sampler = sampler;
-        column.keyDomain = MatchKeyDomain(key);
+        if (!masked) column.keyDomain = MatchKeyDomain(key);
         DescriptorSource columnSource = m_sources[column.heapSource];
         columnSource.tableColumn = column;
         plan.handle = &handle;
