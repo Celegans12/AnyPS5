@@ -15,9 +15,6 @@ public:
     void Fold(IrProgram& program, std::span<IrBlock* const> blocks) const;
 
     [[nodiscard]] bool ComposePackedAncillary(IrProgram& program) const;
-
-private:
-    [[nodiscard]] bool tryFoldValue(IrProgram& program, IrValue& value) const;
 };
 
 }
