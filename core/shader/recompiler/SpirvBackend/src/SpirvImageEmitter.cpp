@@ -770,7 +770,8 @@ std::uint32_t PackImageTexel(SpirvValueEmitContext& ctx, const ImageEmitAccess& 
         state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), value, texel, component);
         auto clamped = value;
         if (unorm) {
-            clamped = EmitFormatStoreComponent(state, info, component, value);
+            if (access.mem.dataBits == 16u) clamped = Unary(state, spv::OpBitcast, TypeU32(state), EmitF16BitsToF32(state, value));
+            clamped = EmitFormatStoreComponent(state, info, component, clamped);
         } else {
             const auto maximum = ConstantU32(state, info.componentBits[component] == 32u ? UINT32_MAX : (1u << info.componentBits[component]) - 1u);
             const auto within = Binary(state, spv::OpULessThan, TypeBool(state), value, maximum);
@@ -804,7 +805,6 @@ std::uint32_t StoreTexel(SpirvValueEmitContext& ctx, const ImageEmitAccess& acce
     if (sint.format != IrBufferFormat::Invalid && mem.dataBits == 16u) {
         ctx.Fail(access.inst, "stores 16-bit data to an image of a SINT format");
     }
-    const bool packedUnorm = access.image.conversionFormat != IrBufferFormat::Invalid && RemapStorageTextureFormat(access.image.conversionFormat) == IrBufferFormat::Format16UInt;
     std::uint32_t values[4] = {};
     const auto dmask = EffectiveDmask(mem);
     for (std::uint32_t component = 0; component < 4u; component++) {
@@ -825,7 +825,6 @@ std::uint32_t StoreTexel(SpirvValueEmitContext& ctx, const ImageEmitAccess& acce
             }
             raw = Select(state, TypeU32(state), Binary(state, spv::OpIEqual, TypeBool(state), RuntimeImageSwizzle(state, mem.resource, source), ConstantU32(state, component + 4u)), candidate, raw);
         }
-        if (packedUnorm && mem.dataBits == 16u) raw = Unary(state, spv::OpBitcast, TypeU32(state), EmitF16BitsToF32(state, raw));
         values[component] = integer ? raw : mem.dataBits == 16u ? EmitF16BitsToF32(state, raw) : Unary(state, spv::OpBitcast, TypeF32(state), raw);
         if (component < sint.componentCount) {
             values[component] = EmitFormatStoreComponent(state, sint, component, values[component]);
