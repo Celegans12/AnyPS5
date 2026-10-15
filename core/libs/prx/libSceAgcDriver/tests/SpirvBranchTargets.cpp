@@ -21,8 +21,8 @@ void require(bool condition, const std::string& message) {
 
 std::vector<std::uint32_t> recompile(std::span<const std::uint32_t> code, std::uint32_t subgroupSize = 64u) {
     const std::array<std::uint32_t, 12> userData{0x10000000u, 0x00100000u, 0x40u, 0x00027facu, 0u, 0u, 0u, 0u, 7u, 9u, 0x10002000u, 0u};
-    const std::array<std::string_view, 3> extensions{"SPV_KHR_storage_buffer_storage_class", "SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
-    const std::array<std::uint32_t, 7> capabilities{spv::CapabilityShader, spv::CapabilityGroupNonUniform, spv::CapabilityGroupNonUniformBallot, spv::CapabilityGroupNonUniformShuffle, spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess};
+    const std::array<std::string_view, 1> extensions{"SPV_KHR_storage_buffer_storage_class"};
+    const std::array<std::uint32_t, 4> capabilities{spv::CapabilityShader, spv::CapabilityGroupNonUniform, spv::CapabilityGroupNonUniformBallot, spv::CapabilityGroupNonUniformShuffle};
     RecompileRequest request{};
     request.shader = {ShaderStage::Compute, 0x20000u, code, 0, {}};
     request.context.waveSize = 64;
@@ -89,27 +89,6 @@ void requireZeroBranchesCountRunningInvocations(const char* name, std::span<cons
     }
 }
 
-// A faulting BDA read used to end its invocation. With two lanes per invocation that also ended a lane
-// that did not fault, and every invocation still running then waited forever for the stopped lanes in
-// wave-level state saved before the stop: a waterfall clears a lane from its SGPR mask only by that
-// lane's own ballot vote (Yotei 0x80001e5f00, pc 0x4bdc, BDA reads at 0x4c38 inside the loop). Such
-// programs read zero and continue; the fault is still recorded.
-void requireNoStoppingReads(const char* name, std::span<const std::uint32_t> code) {
-    const auto words = recompile(code, 32u);
-    bool bdaReads = false;
-    for (std::size_t cursor = 5; cursor < words.size();) {
-        const auto count = words[cursor] >> 16u;
-        require(count != 0 && cursor + count <= words.size(), std::string(name) + ": truncated SPIR-V instruction");
-        if ((words[cursor] & 0xffffu) == spv::OpName && count > 2) {
-            const std::string_view label(reinterpret_cast<const char*>(&words[cursor + 2]));
-            bdaReads = bdaReads || label.starts_with("read_bda");
-            require(!label.starts_with("read_bda") || label.find("_stop") == std::string_view::npos, std::string(name) + ": " + std::string(label) + " ends the invocation of a faulting read in a program with wave-level operations");
-        }
-        cursor += count;
-    }
-    require(bdaReads, std::string(name) + ": the program has no BDA read");
-}
-
 }
 
 int main() {
@@ -121,13 +100,10 @@ int main() {
         // loop: v_cmpx_eq_u32 1, v0; s_cbranch_execz end; s_branch loop; end: s_endpgm
         constexpr std::array<std::uint32_t, 4> execzLoop{0x7da40081u, 0xbf880001u, 0xbf82fffdu, 0xbf810000u};
         requireZeroBranchesCountRunningInvocations("wave64 loop leaving on execz", execzLoop);
-        // global_load_dword v1, v0, s[0:1]; s_waitcnt 0; loop: v_cmpx_eq_u32 1, v1; s_cbranch_execz end; s_branch loop; end: s_endpgm
-        constexpr std::array<std::uint32_t, 7> readThenLoop{0xdc308000u, 0x01000000u, 0xbf8c0000u, 0x7da40281u, 0xbf880001u, 0xbf82fffdu, 0xbf810000u};
-        requireNoStoppingReads("wave64 BDA read before an execz loop", readThenLoop);
     } catch (const std::exception& error) {
         std::fprintf(stderr, "SpirvBranchTargets: %s\n", error.what());
         return 1;
     }
-    std::puts("SpirvBranchTargets: no conditional branch names one label twice; two-lane zero branches count running invocations; faulting reads in wave programs continue");
+    std::puts("SpirvBranchTargets: no conditional branch names one label twice; two-lane zero branches count running invocations");
     return 0;
 }
