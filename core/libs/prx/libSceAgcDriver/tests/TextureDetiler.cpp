@@ -184,6 +184,12 @@ void RunTextureDetilerTests(const Context& context, const TextureDetilerTestAcce
         reject([] { ComputeColorTargetMipLayout(ColorTileMode::RenderTarget, 4, 1024, 1024, 11, 11); }, "outside its surface");
     }
 
+    {
+        const auto pools = access.descriptorPoolCount();
+        for (int dispatch = 0; dispatch < 3 * 64; ++dispatch) detiler.Dispatch(commands, TextureTileMode::kStandard4KB, 4, source, 0, destination, 0, makeLayout(8, 8, 32, 2, 32, 32), 0);
+        Require(access.descriptorPoolCount() == pools, "a full descriptor pool whose batches completed must be reset and reused, not joined by a new pool");
+    }
+
     reject([&] { detiler.Dispatch(VK_NULL_HANDLE, TextureTileMode::kStandard4KB, 4, source, 0, destination, 0, layout, 0); }, "active command buffer");
     reject([&] { detiler.Dispatch(commands, TextureTileMode::kStandard4KB, 4, VK_NULL_HANDLE, 0, destination, 0, layout, 0); }, "source and destination buffers");
     reject([&] { detiler.Dispatch(commands, TextureTileMode::kStandard4KB, 4, source, 0, VK_NULL_HANDLE, 0, layout, 0); }, "source and destination buffers");
