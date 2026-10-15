@@ -26,6 +26,30 @@ namespace AgcDriver::Graphics {
 
 class Buffer;
 
+struct PassLibraryState {
+    VkCullModeFlags cullMode;
+    VkFrontFace frontFace;
+    std::array<float, 3> depthBias;
+    std::array<float, 2> depthBounds;
+    VkBool32 depthTest;
+    VkBool32 depthWrite;
+    VkCompareOp depthCompare;
+    VkBool32 boundsTest;
+    VkBool32 stencilTest;
+    VkStencilOpState stencilFront;
+    VkStencilOpState stencilBack;
+};
+
+struct PassBinding {
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkViewport viewport{};
+    VkRect2D scissor{};
+    std::array<float, 3> depthBias{};
+    std::array<float, 2> depthBounds{};
+    bool hasLibrary = false;
+    PassLibraryState library{};
+};
+
 // Accumulates GPU work across guest commands so the CPU does not wait for each one. Dispatches and the
 // copies that feed them record into one open batch; Submit sends it to the queue without waiting and
 // Sync waits for every batch, then runs its completion actions (write-backs) in order. Objects handed
@@ -68,6 +92,7 @@ public:
     };
     DrawPassStart StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access);
     void LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(VkCommandBuffer)> afterPass = {});
+    PassBinding& PassBound();
     // DCC "uncompressed" key stores (DccMetadata.cpp StoreUncompressedOnGpu): queued on the open
     // batch and recorded as one run (one barrier pair for every queued fill) at Submit, before a
     // label store (RecordStore), or before a command that writes or reads a queued range (the
@@ -648,6 +673,7 @@ private:
             bool fenced = false;
             std::uint64_t key = 0;
             std::uint32_t timing = NoTiming;
+            PassBinding bound;
             std::function<void(VkCommandBuffer)> afterPass;
         } renderPass;
         PassHazards passHazards;
