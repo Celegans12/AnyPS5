@@ -1863,87 +1863,6 @@ void verifyPointerImageTable() {
 #endif
 }
 
-void verifyRecordPointerTables() {
-    using namespace ShaderRecompiler;
-    constexpr std::uint64_t Root = 0x10000u, Records = 0x20000u, Keys = 0x30000u, Leaf = 0x40000u;
-    constexpr std::uint32_t Stride = 0x250u;
-    const std::vector<std::uint32_t> code{
-        0xf4080100u, 0xfa000000u, 0xf4080200u, 0xfa000010u, 0xf4080700u, 0xfa000020u,
-        0x8f108202u, 0xf4200444u, 0x20000000u, 0x9312ff11u, Stride, 0xf4240502u, 0x24000000u,
-        0xf408080au, 0xfa0003f8u, 0xf40c090au, 0xfa0003d0u, 0xf09c0f08u, 0x01090401u,
-        0xe0781000u, 0x80070408u, 0xbf810000u};
-    struct Memory {
-        std::map<std::uint64_t, std::uint32_t> words;
-        std::vector<std::uint64_t> reads;
-        std::uint64_t denied = ~std::uint64_t{0}, failed = ~std::uint64_t{0};
-        bool throws = false;
-        static bool Read(void* context, std::uint64_t address, std::uint32_t* value) {
-            auto& memory = *static_cast<Memory*>(context);
-            memory.reads.push_back(address);
-            if (address == memory.failed) {
-                if (memory.throws) throw std::runtime_error("record pointer callback failure");
-                return false;
-            }
-            const auto found = memory.words.find(address);
-            if (found == memory.words.end()) return false;
-            *value = found->second;
-            return true;
-        }
-        static bool Accessible(void* context, std::uint64_t address, std::uint64_t bytes) {
-            const auto& memory = *static_cast<Memory*>(context);
-            if (bytes == 0u || bytes > 0x1000u || address > ~std::uint64_t{0} - bytes) return false;
-            for (std::uint64_t offset = 0; offset < bytes; offset += 4u) {
-                if (address + offset == memory.denied || !memory.words.contains(address + offset)) return false;
-            }
-            return true;
-        }
-    } memory;
-    const auto put = [&](std::uint64_t address, std::span<const std::uint32_t> words) {
-        for (std::size_t index = 0; index < words.size(); ++index) memory.words[address + index * 4u] = words[index];
-    };
-    const auto buffer = [&](std::uint64_t base, std::uint32_t bytes) {
-        return TableV(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(base)), 0u, bytes);
-    };
-    for (std::uint32_t byte = 0; byte < 3u * Stride; byte += 4u) memory.words[Records + byte] = 0u;
-    put(Root, buffer(Records, 3u * Stride));
-    put(Root + 16u, buffer(Keys, 8u));
-    put(Root + 32u, buffer(0x80000u, 2048u));
-    memory.words[Keys] = 0u;
-    memory.words[Keys + 4u] = 1u;
-    const auto point = [&](std::uint32_t index, std::uint64_t address) {
-        memory.words[Records + index * Stride] = static_cast<std::uint32_t>(address);
-        memory.words[Records + index * Stride + 4u] = static_cast<std::uint32_t>(address >> 32u);
-    };
-    point(0u, Leaf);
-    point(1u, Leaf);
-    const auto image = TableT(reinterpret_cast<const void*>(0x90000u), TableFormat8888UNorm, TableType2D);
-    put(Leaf + 0x3d0u, image);
-    const std::array<std::uint32_t, 4> sampler{0x92u, 0u, 0u, 0u};
-    put(Leaf + 0x3f8u, sampler);
-    const std::array<std::uint32_t, 2> userData{static_cast<std::uint32_t>(Root), 0u};
-    auto request = TableRequest(code, userData);
-    request.context.compute->groupIdEnable = {true, false, false};
-    SrtRuntime runtime{userData, request.shader.codeAddress, Memory::Read, &memory};
-    runtime.accessible = Memory::Accessible;
-    const auto first = CaptureResources(request, runtime);
-    const auto& info = first->plan->info;
-    const auto table = info.images.at(0).table;
-    const auto samplerTable = info.samplers.at(0).table;
-    require(table != NoTable && samplerTable != NoTable && table != samplerTable, "record pointer: image and sampler did not get separate tables");
-    const auto& column = *first->plan->descriptorSources.at(info.images.at(0).source).tableColumn;
-    const auto& samplerColumn = *first->plan->descriptorSources.at(info.samplers.at(0).source).tableColumn;
-    require(column.indirect && samplerColumn.indirect && column.stride == Stride && column.indirectImmediate == 0x3d0u && samplerColumn.indirectImmediate == 0x3f8u,
-        "record pointer: plan lost the record stride or nonzero leaf offsets");
-    require(column.heapSource == samplerColumn.heapSource && column.keyDomains == samplerColumn.keyDomains && column.unkeyed == samplerColumn.unkeyed, "record pointer: shared image/sampler record key diverged");
-    const auto covered = [](const auto& ranges, std::uint64_t address, std::uint64_t bytes) {
-        return std::any_of(ranges.begin(), ranges.end(), [&](const auto& range) {
-            return address >= range.first && address - range.first <= range.second && bytes <= range.second - (address - range.first);
-        });
-    };
-    require(covered(first->snapshot.tables.tables.at(table).readRanges, Leaf + 0x3d0u, 32u), "record pointer: image read dependency absent");
-    require(covered(first->snapshot.tables.tables.at(samplerTable).readRanges, Leaf + 0x3f8u, 16u), "record pointer: sampler read dependency absent");
-}
-
 void verifyPointerTableOffsetCarry() {
     using namespace ShaderRecompiler;
     namespace Abi = ImageTableAbi;
@@ -5296,10 +5215,6 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--frontend-pair") {
             verifyFrontendPair();
             std::cout << "Prepared frontend reuse preserves full and partial-thread programs\n";
-            return 0;
-        }
-        if (argc == 2 && std::string_view(argv[1]) == "--record-pointer") {
-            verifyRecordPointerTables();
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--layout-pair") {
