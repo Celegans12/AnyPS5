@@ -1128,8 +1128,19 @@ void ValidateStorageDepthWrites(const Context& context, std::span<const std::sha
     for (const auto& image : storage) {
         ForStorageDepth(context, *image, [&](DepthSurface& surface, std::uint32_t layer, VkImageAspectFlagBits aspect) {
             const auto found = std::find_if(writes.begin(), writes.end(), [&](const auto& write) { return write.surface == &surface && write.aspect == aspect; });
-            Require(found == writes.end() || (found->storage == image.get() && found->layer == layer) || (surface.PlaneView(found->storage) && surface.PlaneView(image.get())), "conflicting writable storage images alias the same depth/stencil plane");
-            if (found == writes.end()) writes.push_back({&surface, image.get(), layer, aspect});
+            if (found == writes.end()) {
+                writes.push_back({&surface, image.get(), layer, aspect});
+                return;
+            }
+            if ((found->storage == image.get() && found->layer == layer) || (surface.PlaneView(found->storage) && surface.PlaneView(image.get()))) return;
+            const auto& first = found->storage->Descriptor();
+            const auto& second = image->Descriptor();
+            char text[512];
+            std::snprintf(text, sizeof(text), "AGC graphics: conflicting writable storage images alias the same depth/stencil plane (the %s plane of depth surface 0x%llx, %ux%u: 0x%llx guest format %u tile mode %d dimension %d layer %u as %s, and 0x%llx guest format %u tile mode %d dimension %d layer %u as %s)",
+                aspect == VK_IMAGE_ASPECT_STENCIL_BIT ? "stencil" : "depth", static_cast<unsigned long long>(surface.target.address), surface.target.extent.width, surface.target.extent.height,
+                static_cast<unsigned long long>(first.baseAddress), first.format, static_cast<int>(first.tileMode), static_cast<int>(first.dimension), found->layer, surface.PlaneView(found->storage) ? "the plane's storage" : "an alias",
+                static_cast<unsigned long long>(second.baseAddress), second.format, static_cast<int>(second.tileMode), static_cast<int>(second.dimension), layer, surface.PlaneView(image.get()) ? "the plane's storage" : "an alias");
+            throw std::runtime_error(text);
         }, false);
     }
 }

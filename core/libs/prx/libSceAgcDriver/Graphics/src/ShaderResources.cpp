@@ -4895,6 +4895,10 @@ void ShaderResources::resolveStorageImageTables() {
     for (const auto index : storageTableBindings) {
         if (index != std::numeric_limits<std::size_t>::max()) bindings[index].imageAllocations.assign(bindings[index].layout.descriptorCount, std::numeric_limits<std::size_t>::max());
     }
+    std::vector<std::shared_ptr<StorageTexture>> depthWrites;
+    for (std::size_t index = 0; index < storageTextures.size(); ++index) {
+        if (storageWritten[index] && storageTextures[index] != nullptr && DepthSurfaceAt(storageTextures[index]->Descriptor().baseAddress)) depthWrites.push_back(storageTextures[index]);
+    }
     for (auto& table : tableStages) {
         if (table.storageImages == nullptr) continue;
         auto& item = bindings[storageTableBindings[table.set]];
@@ -4914,6 +4918,12 @@ void ShaderResources::resolveStorageImageTables() {
                 Require(resource.minLod <= mip * 256u, "guest storage texture descriptor clamps its minimum LOD above the level it addresses, which is not implemented");
                 const auto guestBytes = DescribeSurface(resource).guestBytes;
                 auto texture = cachedStorageTexture(context, words, resource, mip, guestBytes);
+                if (texture != nullptr && DepthSurfaceAt(texture->Descriptor().baseAddress)) {
+                    auto claimed = depthWrites;
+                    claimed.push_back(texture);
+                    ValidateStorageDepthWrites(context, claimed);
+                    depthWrites = std::move(claimed);
+                }
                 storageTextures.push_back(std::move(texture));
                 storageMips.push_back(mip);
                 storageKeys.push_back(resource.dccAddress);
