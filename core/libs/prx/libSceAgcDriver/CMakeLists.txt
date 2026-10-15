@@ -337,6 +337,17 @@ if(BUILD_TESTING)
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 
+    add_test_executable(agc_async_log_tests tests/AsyncLog.cpp)
+    target_include_directories(agc_async_log_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_async_log_tests PRIVATE libc)
+    configure_windows_unwind(agc_async_log_tests)
+    add_test(NAME agc_async_log COMMAND agc_async_log_tests)
+    set_tests_properties(agc_async_log PROPERTIES TIMEOUT 20)
+    if(WIN32)
+        set_tests_properties(agc_async_log PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+
     add_test_executable(agc_stack_walk_tests tests/StackWalk.cpp)
     target_include_directories(agc_stack_walk_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(agc_stack_walk_tests PRIVATE libc)
