@@ -3,7 +3,9 @@
 
 #include "PipelineSpecialization.hpp"
 #include "Recompiler.hpp"
+#include <array>
 #include <cstring>
+#include <initializer_list>
 #include <limits>
 #include <map>
 #include <set>
@@ -17,23 +19,30 @@
 namespace ShaderRecompiler {
 
 inline std::vector<std::uint32_t> SpecializeFragmentOutputs(std::vector<std::uint32_t> words, std::span<const PipelineSpecializationConstant> constants, const std::set<std::uint32_t>& specializedIds) {
+    namespace Code = ReversedBlendCode;
     std::set<std::uint32_t> packed;
-    std::set<std::uint32_t> blended;
+    std::set<std::uint32_t> blendTargets;
     bool dualSource = false;
+    std::uint32_t reversed = 0;
     for (const auto& constant : constants) {
         if (constant.id == PipelineSpecialization::DualSourceBlend) {
             if (constant.value > 1u) throw std::runtime_error("invalid prepared dual-source blend flag");
             dualSource = constant.value != 0u;
         }
         if (constant.id >= PipelineSpecialization::ExportBlendBase && constant.id < PipelineSpecialization::ExportBlendBase + 8u) {
-            if ((constant.value & 1u) != 0u) blended.insert(constant.id - PipelineSpecialization::ExportBlendBase);
+            if ((constant.value & 1u) != 0u) blendTargets.insert(constant.id - PipelineSpecialization::ExportBlendBase);
             continue;
+        }
+        if (constant.id == PipelineSpecialization::ReversedBlend) {
+            const auto known = Code::Enable | (Code::Routes << Code::ColorShift) | (Code::Routes << Code::SecondShift);
+            if ((constant.value & ~known) != 0u || (constant.value != 0u && (constant.value & Code::Enable) == 0u)) throw std::runtime_error("invalid prepared reversed-order blend");
+            reversed = constant.value;
         }
         if (constant.id < PipelineSpecialization::ExportPackingBase || constant.id >= PipelineSpecialization::ExportPackingBase + 8u) continue;
         if (constant.value > static_cast<std::uint32_t>(ColorExportPacking::Unorm10_11_11)) throw std::runtime_error("invalid prepared fragment export packing");
         if (constant.value != static_cast<std::uint32_t>(ColorExportPacking::None)) packed.insert(constant.id - PipelineSpecialization::ExportPackingBase);
     }
-    if (packed.empty() && blended.empty() && !dualSource) return words;
+    if (packed.empty() && blendTargets.empty() && !dualSource && reversed == 0u) return words;
     if (words.size() < 5u || words[0] != spv::MagicNumber) throw std::runtime_error("invalid fragment output specialization module");
     std::map<std::uint32_t, std::uint32_t> locations;
     std::set<std::uint32_t> indexed;
@@ -112,7 +121,7 @@ inline std::vector<std::uint32_t> SpecializeFragmentOutputs(std::vector<std::uin
         retyped.insert(variable);
     }
     std::set<std::uint32_t> privatized;
-    for (const auto location : blended) {
+    for (const auto location : blendTargets) {
         const auto variable = output(location);
         if (variable == 0u) continue;
         if (!specializedIds.contains(PipelineSpecialization::ExportBlendBase + location)) throw std::runtime_error("fragment output " + std::to_string(location) + " has no 10_11_11 unorm blend path");
@@ -122,7 +131,16 @@ inline std::vector<std::uint32_t> SpecializeFragmentOutputs(std::vector<std::uin
     const auto secondSource = dualSource ? output(1u) : 0u;
     if (retyped.contains(secondSource)) throw std::runtime_error("the second dual-source blend color cannot be packed");
     if (privatized.contains(secondSource)) throw std::runtime_error("the second dual-source blend color cannot be blended into a 10_11_11 unorm target");
-    if (retyped.empty() && privatized.empty() && secondSource == 0u) return words;
+    std::uint32_t blended = 0;
+    if (reversed != 0u) {
+        if (dualSource) throw std::runtime_error("reversed-order blending cannot be combined with dual-source blending");
+        blended = output(0u);
+        if (blended == 0u || retyped.contains(blended) || privatized.contains(blended) || !floatVectorPointer(outputs.at(blended))) throw std::runtime_error("reversed-order blending needs a float4 MRT0 output");
+        for (const auto& [id, pointer] : outputs) {
+            if (id != blended && locations.contains(id)) throw std::runtime_error("reversed-order blending needs MRT0 to be the only color output");
+        }
+    }
+    if (retyped.empty() && privatized.empty() && secondSource == 0u && blended == 0u) return words;
     if (!privatized.empty() && entry == 0u) throw std::runtime_error("fragment output specialization module has no entry point");
     auto bound = words[3];
     const auto allocate = [&] {
@@ -160,8 +178,22 @@ inline std::vector<std::uint32_t> SpecializeFragmentOutputs(std::vector<std::uin
     const bool orderedMode = modes.contains(spv::ExecutionModePixelInterlockOrderedEXT) || modes.contains(spv::ExecutionModePixelInterlockUnorderedEXT) || modes.contains(spv::ExecutionModeSampleInterlockOrderedEXT) || modes.contains(spv::ExecutionModeSampleInterlockUnorderedEXT) || modes.contains(spv::ExecutionModeShadingRateInterlockOrderedEXT) || modes.contains(spv::ExecutionModeShadingRateInterlockUnorderedEXT);
     if (interlock && !orderedMode) pendingModes.insert(pendingModes.end(), {(3u << 16u) | spv::OpExecutionMode, entry, spv::ExecutionModePixelInterlockOrderedEXT});
     if (!privatized.empty() && !modes.contains(spv::ExecutionModeEarlyFragmentTests)) pendingModes.insert(pendingModes.end(), {(3u << 16u) | spv::OpExecutionMode, entry, spv::ExecutionModeEarlyFragmentTests});
+    const auto colorType = blended == 0u ? 0u : key(outputs.at(blended))[2];
+    const auto floatType = blended == 0u ? 0u : key(colorType)[1];
+    const auto zero = blended == 0u ? 0u : allocate();
+    const auto one = blended == 0u ? 0u : allocate();
+    const auto secondColor = blended == 0u ? 0u : allocate();
     std::vector<std::uint32_t> result(words.begin(), words.begin() + 5);
     std::vector<std::vector<std::uint32_t>> variables;
+    if (blended != 0u) {
+        declarations.push_back({(4u << 16u) | spv::OpConstant, floatType, zero, 0u});
+        declarations.push_back({(4u << 16u) | spv::OpConstant, floatType, one, 0x3f800000u});
+        variables.push_back({(4u << 16u) | spv::OpVariable, outputs.at(blended), secondColor, spv::StorageClassOutput});
+    }
+    const auto emit = [&](spv::Op opcode, std::initializer_list<std::uint32_t> operands) {
+        result.push_back((static_cast<std::uint32_t>(operands.size() + 1u) << 16u) | opcode);
+        result.insert(result.end(), operands);
+    };
     bool inserted = false;
     bool inEntry = false;
     bool labelled = false;
@@ -210,6 +242,19 @@ inline std::vector<std::uint32_t> SpecializeFragmentOutputs(std::vector<std::uin
             cursor += count;
             continue;
         }
+        if (op == spv::OpDecorate && count == 4u && blended != 0u && operand(1u) == blended && operand(2u) == spv::DecorationLocation) {
+            result.insert(result.end(), words.begin() + cursor, words.begin() + cursor + count);
+            result.insert(result.end(), {(4u << 16u) | spv::OpDecorate, secondColor, spv::DecorationLocation, 0u, (4u << 16u) | spv::OpDecorate, secondColor, spv::DecorationIndex, 1u});
+            cursor += count;
+            continue;
+        }
+        if (op == spv::OpEntryPoint && secondColor != 0u) {
+            result.push_back(((count + 1u) << 16u) | spv::OpEntryPoint);
+            result.insert(result.end(), words.begin() + cursor + 1u, words.begin() + cursor + count);
+            result.push_back(secondColor);
+            cursor += count;
+            continue;
+        }
         if (op == spv::OpFunction && !inserted) {
             for (const auto& declaration : declarations) result.insert(result.end(), declaration.begin(), declaration.end());
             for (const auto& variable : variables) result.insert(result.end(), variable.begin(), variable.end());
@@ -250,10 +295,39 @@ inline std::vector<std::uint32_t> SpecializeFragmentOutputs(std::vector<std::uin
             cursor += count;
             continue;
         }
-        const auto special = [&](std::uint32_t id) { return retyped.contains(id) || privatized.contains(id); };
-        const bool pointerUse = ((op == spv::OpAccessChain || op == spv::OpInBoundsAccessChain || op == spv::OpPtrAccessChain || op == spv::OpInBoundsPtrAccessChain || op == spv::OpCopyObject) && special(operand(3u))) ||
-            ((op == spv::OpCopyMemory || op == spv::OpCopyMemorySized) && (special(operand(1u)) || special(operand(2u))));
-        if (pointerUse) throw std::runtime_error("a specialized fragment output is accessed other than by whole loads and stores");
+        if (op == spv::OpStore && count >= 3u && blended != 0u && operand(1u) == blended) {
+            std::array<std::uint32_t, 4> source{};
+            for (std::uint32_t component = 0; component < source.size(); ++component) {
+                source[component] = allocate();
+                emit(spv::OpCompositeExtract, {floatType, source[component], operand(2u), component});
+            }
+            const auto routed = [&](std::uint32_t shift) {
+                std::array<std::uint32_t, 4> picked{};
+                for (std::uint32_t component = 0; component < picked.size(); ++component) {
+                    switch ((reversed >> (shift + Code::RouteBits * component)) & Code::RouteMask) {
+                        case Code::Own: picked[component] = source[component]; break;
+                        case Code::Component0: picked[component] = source[0]; break;
+                        case Code::Zero: picked[component] = zero; break;
+                        default: picked[component] = one; break;
+                    }
+                }
+                const auto value = allocate();
+                emit(spv::OpCompositeConstruct, {colorType, value, picked[0], picked[1], picked[2], picked[3]});
+                return value;
+            };
+            emit(spv::OpStore, {secondColor, routed(Code::SecondShift)});
+            const auto stored = ((reversed >> Code::ColorShift) & Code::Routes) == 0u ? operand(2u) : routed(Code::ColorShift);
+            result.insert(result.end(), words.begin() + cursor, words.begin() + cursor + count);
+            result[result.size() - count + 2u] = stored;
+            cursor += count;
+            continue;
+        }
+        const auto pointerUse = [&](auto&& matches) {
+            return ((op == spv::OpLoad || op == spv::OpAccessChain || op == spv::OpInBoundsAccessChain || op == spv::OpPtrAccessChain || op == spv::OpInBoundsPtrAccessChain || op == spv::OpCopyObject) && matches(operand(3u))) ||
+                ((op == spv::OpCopyMemory || op == spv::OpCopyMemorySized) && (matches(operand(1u)) || matches(operand(2u))));
+        };
+        if (op != spv::OpLoad && pointerUse([&](std::uint32_t id) { return retyped.contains(id) || privatized.contains(id); })) throw std::runtime_error("a specialized fragment output is accessed other than by whole loads and stores");
+        if (blended != 0u && pointerUse([&](std::uint32_t id) { return id == blended; })) throw std::runtime_error("a reversed-order blended fragment output is accessed other than by whole stores");
         result.insert(result.end(), words.begin() + cursor, words.begin() + cursor + count);
         cursor += count;
     }

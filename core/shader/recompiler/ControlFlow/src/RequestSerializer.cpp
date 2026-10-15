@@ -5,7 +5,7 @@ namespace ShaderRecompiler {
 
 namespace {
 
-constexpr std::uint32_t CurrentVersion = 30u;
+constexpr std::uint32_t CurrentVersion = 31u;
 constexpr std::uint32_t LocalFeatures = 22u;
 constexpr char kBase64Alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -346,6 +346,7 @@ void writePixelInfo(Writer& writer, const ShaderPixelStageInfo& info) {
     writer.WriteBool(info.frontFaceAllBits);
     writer.WriteU8(info.quadPixelMask);
     for (const std::uint16_t mask : info.quadSampleMask) writer.WriteU32(mask);
+    writer.WriteU32(info.reversedBlend);
     for (const ColorTargetBlend& blend : info.targetBlend) {
         writer.WriteBool(blend.enable);
         writer.WriteU8(blend.sourceFactor);
@@ -414,6 +415,7 @@ ShaderPixelStageInfo readPixelInfo(Reader& reader, std::uint32_t version, std::u
             mask = static_cast<std::uint16_t>(value);
         }
     }
+    if (version >= 30u) info.reversedBlend = reader.ReadU32();
     if (local >= 20u) {
         for (ColorTargetBlend& blend : info.targetBlend) {
             blend.enable = reader.ReadBool();
@@ -875,9 +877,9 @@ DeserializedRequest RequestSerializer::Deserialize(std::string_view text) const 
     const auto version = reader.ReadU32();
     if (version < 1u || version > CurrentVersion) throw std::runtime_error("unsupported recompile request serialization version");
     if (version >= CurrentVersion) return deserialize(decoded, version, LocalFeatures, false);
-    if (version == 24u || version == 26u) {
+    if (version == 24u || version == 26u || version == 30u) {
         try {
-            return deserialize(decoded, version == 26u ? 25u : version, LocalFeatures, true);
+            return deserialize(decoded, version == 26u ? 25u : version == 30u ? 29u : version, LocalFeatures, true);
         } catch (const std::exception&) {
         }
         return deserialize(decoded, version, 0u, false);

@@ -106,7 +106,6 @@ struct Socket {
     int family;
     int type;
     std::mutex modeMutex;
-    bool nonblocking = false;
     GuestSockets::SocketOptionState options;
     bool receiveShut = false;
     bool sendShut = false;
@@ -557,8 +556,12 @@ int SetNonBlocking(Socket& socket) {
     int value = 1;
     if (::ioctl(socket.value, FIONBIO, &value)) return Fail(NativeError());
 #endif
-    socket.nonblocking = true;
+    socket.options.nonblocking = true;
     return 0;
+}
+int SocketSendFlags(Socket& socket, int flags) {
+    std::lock_guard lock(socket.modeMutex);
+    return NativeSendFlags(socket.options.noSignal ? flags | GuestNoSignal : flags);
 }
 #ifdef _WIN32
 bool LoopbackName(NativeSocket socket, sockaddr_in& name) {
@@ -795,7 +798,7 @@ int APS5_VABI fcntl_nid_postfix(int descriptor, int command, ...) {
         else closeOnExecDescriptors.erase(descriptor);
         return 0;
     }
-    if (command == 3) return 2 | (socket->nonblocking ? 4 : 0); // F_GETFL, O_RDWR
+    if (command == 3) return 2 | (socket->options.nonblocking ? 4 : 0); // F_GETFL, O_RDWR
     if (command != 4) return Fail(22);
 #ifdef _WIN32
     __builtin_sysv_va_list arguments;
@@ -816,7 +819,7 @@ int APS5_VABI fcntl_nid_postfix(int descriptor, int command, ...) {
     int enabled = (flags & 4) != 0;
     if (::ioctl(socket->value, FIONBIO, &enabled)) return Fail(NativeError());
 #endif
-    socket->nonblocking = enabled != 0;
+    socket->options.nonblocking = enabled != 0;
     return 0;
 }
 int APS5_VABI setsockopt_nid_postfix(int descriptor, int level, int option,
@@ -827,19 +830,23 @@ int APS5_VABI setsockopt_nid_postfix(int descriptor, int level, int option,
     }
     const auto socket = Lookup(descriptor);
     if (!socket) return -1;
-    if (level != 0xffff) return Fail(42);
+    if (level != 0xffff && level != 6) return Fail(42);
     std::lock_guard lock(socket->modeMutex);
-    const int error = GuestSockets::SetSocketLevelOption(static_cast<std::uintptr_t>(socket->value), socket->options, option, value, length);
+    const auto native = static_cast<std::uintptr_t>(socket->value);
+    const int error = level == 6 ? GuestSockets::SetTcpLevelOption(native, socket->family != GuestUnix && socket->type == 1, option, value, length)
+                                 : GuestSockets::SetSocketLevelOption(native, socket->options, option, value, length);
     return error == 0 ? 0 : Fail(error);
 }
 int APS5_VABI getsockopt_nid_postfix(int descriptor, int level, int option,
                                     void* value, std::uint32_t* length) {
     const auto socket = Lookup(descriptor);
     if (!socket) return -1;
-    if (level != 0xffff) return Fail(42);
+    if (level != 0xffff && level != 6) return Fail(42);
     if (!length) return Fail(22);
     std::lock_guard lock(socket->modeMutex);
-    const int error = GuestSockets::GetSocketLevelOption(static_cast<std::uintptr_t>(socket->value), socket->options, socket->type, option, value, length);
+    const auto native = static_cast<std::uintptr_t>(socket->value);
+    const int error = level == 6 ? GuestSockets::GetTcpLevelOption(native, socket->family != GuestUnix && socket->type == 1, option, value, length)
+                                 : GuestSockets::GetSocketLevelOption(native, socket->options, socket->type, option, value, length);
     return error == 0 ? 0 : Fail(error);
 }
 int APS5_VABI socket_nid_postfix(int family, int type, int protocol) {
@@ -950,7 +957,8 @@ int APS5_VABI accept_nid_postfix(int descriptor, void* address, std::uint32_t* l
         bool inheritNonblocking;
         {
             std::lock_guard modeLock(listener->modeMutex);
-            inheritNonblocking = listener->nonblocking;
+            inheritNonblocking = listener->options.nonblocking;
+            accepted->options.noSignal = listener->options.noSignal;
         }
         if (inheritNonblocking && SetNonBlocking(*accepted)) return -1;
         const int acceptedDescriptor = Install(std::move(accepted));
@@ -967,7 +975,7 @@ std::int64_t APS5_VABI send_nid_postfix(int descriptor, const void* buffer, std:
     if ((flags & ~GuestSendFlags) != 0) return Fail(45);
     if (length > INT_MAX) return Fail(40);
     if (!buffer && length) return Fail(14);
-    const auto result = ::send(socket->value, static_cast<const char*>(buffer), static_cast<int>(length), NativeSendFlags(flags));
+    const auto result = ::send(socket->value, static_cast<const char*>(buffer), static_cast<int>(length), SocketSendFlags(*socket, flags));
     return result < 0 ? Fail(SendError(socket->type)) : result;
 }
 std::int64_t APS5_VABI recv_nid_postfix(int descriptor, void* buffer, std::uint64_t length, int flags) {
@@ -1050,7 +1058,7 @@ int APS5_VABI ioctl_nid_postfix(int descriptor, std::uint64_t request, void* arg
     value = static_cast<unsigned long>(nativeValue);
 #endif
     if (result) return Fail(NativeError());
-    if (request == 0x8004667e) socket->nonblocking = value != 0;
+    if (request == 0x8004667e) socket->options.nonblocking = value != 0;
     if (request == 0x4004667f) *static_cast<int*>(argument) = static_cast<int>(value);
     return 0;
 }
@@ -1067,13 +1075,13 @@ std::int64_t APS5_VABI sendto_nid_postfix(int descriptor, const void* buffer, st
     int result;
     if (!address) {
         if (addressLength != 0) return Fail(22);
-        result = ::send(socket->value, static_cast<const char*>(buffer), static_cast<int>(length), NativeSendFlags(flags));
+        result = ::send(socket->value, static_cast<const char*>(buffer), static_cast<int>(length), SocketSendFlags(*socket, flags));
     } else {
         sockaddr_storage native{};
         socklen_t size;
         if (!Address(address, addressLength, native, size)) return -1;
         if (native.ss_family != (socket->family == 2 ? AF_INET : AF_INET6)) return Fail(47);
-        result = static_cast<int>(::sendto(socket->value, static_cast<const char*>(buffer), static_cast<int>(length), NativeSendFlags(flags),
+        result = static_cast<int>(::sendto(socket->value, static_cast<const char*>(buffer), static_cast<int>(length), SocketSendFlags(*socket, flags),
             reinterpret_cast<sockaddr*>(&native), size));
     }
     return result < 0 ? Fail(SendError(socket->type)) : result;

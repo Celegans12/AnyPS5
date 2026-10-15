@@ -757,8 +757,7 @@ std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledSh
     std::set<std::uint32_t> specializedIds;
     std::set<std::uint32_t> pushTypes;
     std::optional<std::uint32_t> replaySlotBytes;
-    const auto pinned = source.ReadTransient();
-    const auto& words = *pinned;
+    const auto words = source.Words();
     if (words.size() < 5u || words[0] != spv::MagicNumber) throw std::runtime_error("invalid prepared specialization module");
     for (std::size_t cursor = 5; cursor < words.size();) {
         const auto count = words[cursor] >> 16u;
@@ -981,17 +980,14 @@ std::shared_ptr<const std::set<std::uint32_t>> declaredSpecializationIds(const C
         if (const auto found = declared.find(artifact.variantId); found != declared.end()) return found->second;
     }
     auto ids = std::make_shared<std::set<std::uint32_t>>();
-    const auto pinned = artifact.spirv.ReadTransient();
-    if (pinned) {
-        const auto& words = *pinned;
-        for (std::size_t cursor = 5; cursor < words.size();) {
-            const auto count = words[cursor] >> 16u;
-            const auto op = static_cast<spv::Op>(words[cursor] & 0xffffu);
-            if (count == 0u || count > words.size() - cursor) throw std::runtime_error("truncated prepared specialization instruction");
-            if (op == spv::OpDecorate && count == 4u && words[cursor + 2u] == spv::DecorationSpecId) ids->insert(words[cursor + 3u]);
-            if (op == spv::OpFunction) break;
-            cursor += count;
-        }
+    const auto words = artifact.spirv.Words();
+    for (std::size_t cursor = 5; cursor < words.size();) {
+        const auto count = words[cursor] >> 16u;
+        const auto op = static_cast<spv::Op>(words[cursor] & 0xffffu);
+        if (count == 0u || count > words.size() - cursor) throw std::runtime_error("truncated prepared specialization instruction");
+        if (op == spv::OpDecorate && count == 4u && words[cursor + 2u] == spv::DecorationSpecId) ids->insert(words[cursor + 3u]);
+        if (op == spv::OpFunction) break;
+        cursor += count;
     }
     std::lock_guard lock(mutex);
     return declared.emplace(artifact.variantId, std::move(ids)).first->second;
@@ -1077,6 +1073,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         validateTargetBlends(request);
         for (std::uint32_t target = 0; target < request.context.pixel->targetExportPacking.size(); ++target) moduleKey.push_back(request.context.pixel->targetBlend[target].enable ? static_cast<std::uint32_t>(ColorExportPacking::None) : static_cast<std::uint32_t>(request.context.pixel->targetExportPacking[target]));
         moduleKey.push_back(request.context.pixel->dualSourceBlend ? 1u : 0u);
+        moduleKey.push_back(request.context.pixel->reversedBlend);
         if (variant.info.info.rasterPrimitive) moduleKey.push_back(static_cast<std::uint32_t>(request.context.pixel->rasterPrimitive));
         if (variant.info.info.layerExported) moduleKey.push_back(request.context.pixel->layerExported ? 1u : 0u);
         for (const auto& blend : request.context.pixel->targetBlend) moduleKey.push_back(targetBlendWord(blend));
@@ -1127,6 +1124,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
             if (request.context.pixel) {
                 for (std::uint32_t target = 0; target < request.context.pixel->targetExportPacking.size(); ++target) constants.push_back({PipelineSpecialization::ExportPackingBase + target, moduleKey[index++]});
                 constants.push_back({PipelineSpecialization::DualSourceBlend, moduleKey[index++]});
+                constants.push_back({PipelineSpecialization::ReversedBlend, moduleKey[index++]});
                 if (variant.info.info.rasterPrimitive) constants.push_back({PipelineSpecialization::RasterPrimitive, moduleKey[index++]});
                 if (variant.info.info.layerExported) constants.push_back({PipelineSpecialization::LayerExported, moduleKey[index++]});
                 for (std::uint32_t target = 0; target < request.context.pixel->targetBlend.size(); ++target) constants.push_back({PipelineSpecialization::ExportBlendBase + target, moduleKey[index++]});
@@ -1226,42 +1224,11 @@ bool sameLayout(const BindingLayout& left, const BindingLayout& right) {
     return left.descriptorSet == right.descriptorSet && left.firstBinding == right.firstBinding && left.pushConstantOffsetBytes == right.pushConstantOffsetBytes && left.pushConstantSizeBytes == right.pushConstantSizeBytes;
 }
 
-void makeColdForPublication(SharedSpirv& spirv, bool diskLoaded) noexcept {
-    try {
-        const auto before = spirv.InspectStorage();
-        const bool demoted = spirv.TryMakeCold();
-        const auto after = spirv.InspectStorage();
-        struct Totals {
-            std::mutex mutex;
-            unsigned long long variants = 0, diskLoads = 0, eligible = 0, cold = 0, exposed = 0, cache = 0, cacheBytes = 0;
-            unsigned long long logicalBytes = 0, rawBytes = 0, rawCapacityBytes = 0, coldBytes = 0, coldCapacityBytes = 0;
-        };
-        static Totals totals;
-        std::lock_guard lock(totals.mutex);
-        ++totals.variants;
-        totals.diskLoads += diskLoaded;
-        totals.eligible += before.eligible;
-        totals.cold += demoted;
-        totals.exposed += before.exposed;
-        totals.logicalBytes += after.logicalBytes;
-        totals.rawBytes += after.residentBytes;
-        totals.rawCapacityBytes += after.residentCapacityBytes;
-        totals.coldBytes += after.coldBytes;
-        totals.coldCapacityBytes += after.coldCapacityBytes;
-        totals.cache += after.cacheBytes != 0;
-        totals.cacheBytes += after.cacheBytes;
-        if (totals.variants == 1 || totals.variants % 256u == 0 || (!demoted && after.cacheBytes == 0 && before.logicalBytes >= 16u * 1024u * 1024u)) {
-            std::fprintf(stderr, "[cold-spirv] publication_totals variants=%llu disk=%llu eligible=%llu cold=%llu exposed=%llu logical_bytes=%llu raw_bytes=%llu raw_capacity_bytes=%llu cold_bytes=%llu cold_capacity_bytes=%llu cache=%llu cache_bytes=%llu\n", totals.variants, totals.diskLoads, totals.eligible, totals.cold, totals.exposed, totals.logicalBytes, totals.rawBytes, totals.rawCapacityBytes, totals.coldBytes, totals.coldCapacityBytes, totals.cache, totals.cacheBytes);
-        }
-    } catch (...) {
-    }
-}
-
 void attachSubstitutes(CompiledVariant& variant) {
     if (variant.info.info.buffers.empty()) return;
-    const auto words = variant.artifact.spirv.ReadTransient();
-    if (!words) throw std::runtime_error("compiled variant has no SPIR-V");
-    variant.substitutes = ShaderDiskCache::OpenSubstitutes(*words, variant.info.info.buffers.size());
+    const auto words = variant.artifact.spirv.Words();
+    if (words.empty()) throw std::runtime_error("compiled variant has no SPIR-V");
+    variant.substitutes = ShaderDiskCache::OpenSubstitutes(words, variant.info.info.buffers.size());
 }
 
 }
@@ -1300,7 +1267,6 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
     }
     cacheHit = false;
     const bool disk = ShaderDiskCache::Enabled() && !DebugProbeActive();
-    static const bool coldSpirv = [] { const auto* value = std::getenv("APS5_COLD_SPIRV"); return value != nullptr && std::string_view(value) == "1"; }();
     std::vector<std::byte> diskKey;
     std::shared_ptr<const CompiledVariant> variant;
     if (disk) {
@@ -1310,7 +1276,6 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
             loaded.layout = request.layout;
             loaded.artifact.variantId = nextVariantId();
             attachSubstitutes(loaded);
-            if (coldSpirv) makeColdForPublication(loaded.artifact.spirv, true);
             variant = std::make_shared<const CompiledVariant>(std::move(loaded));
         }
     }
@@ -1326,13 +1291,15 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
                 return compileVariant(request, std::move(program), &emissionFailure);
             }();
             attachSubstitutes(compiled);
-            if (coldSpirv) makeColdForPublication(compiled.artifact.spirv, false);
             variant = std::make_shared<const CompiledVariant>(std::move(compiled));
         } catch (...) {
             if (emissionFailure != nullptr && FailureMemo()) source.emissionFailures.push_back({request.shader.codeAddress, request.layout, emissionFailure});
             throw;
         }
-        if (disk) ShaderDiskCache::Store(std::move(diskKey), variant);
+        if (disk) {
+            if (auto persisted = ShaderDiskCache::Persist(diskKey, *variant)) variant = std::move(persisted);
+            else ShaderDiskCache::Store(std::move(diskKey), variant);
+        }
     }
     source.program.reset();
     source.variants.push_back(variant);
@@ -1425,6 +1392,7 @@ std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapsh
         mix(values.size());
         for (const auto& value : values) {
             mix(value.dwordCount);
+            mix(value.availableDwordMask);
             for (std::uint32_t i = 0; i < value.dwordCount && i < value.dwords.size(); ++i) mix(value.dwords[i]);
         }
     };
@@ -1467,6 +1435,7 @@ std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapsh
         for (const auto mapping : request.context.pixel->targetExportMapping) mix(mapping);
         for (const auto packing : request.context.pixel->targetExportPacking) mix(static_cast<std::uint64_t>(packing));
         mix(request.context.pixel->dualSourceBlend);
+        mix(request.context.pixel->reversedBlend);
         mix(static_cast<std::uint64_t>(request.context.pixel->rasterPrimitive));
         mix(request.context.pixel->layerExported);
         for (const auto& blend : request.context.pixel->targetBlend) mix(targetBlendWord(blend));

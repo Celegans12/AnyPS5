@@ -55,11 +55,9 @@ inline ComputePipelineComponents ComputePipelineFingerprintComponents(const Shad
         out = part.hash;
         part = Fnv{};
     };
-    const auto words = shader.spirv.ReadTransient();
-    both(words ? words->size() : 0u);
-    if (words) {
-        for (const auto word : *words) both(word);
-    }
+    const auto words = shader.spirv.Words();
+    both(words.size());
+    for (const auto word : words) both(word);
     close(components.spirv);
     both(shader.specialization.size());
     for (const auto& constant : shader.specialization) both((static_cast<std::uint64_t>(constant.id) << 32u) | constant.value);

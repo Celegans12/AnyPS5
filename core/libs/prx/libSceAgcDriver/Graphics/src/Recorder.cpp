@@ -182,7 +182,7 @@ constexpr std::uint32_t SegmentFoldCapacity = 1024;
 constexpr std::uint32_t DumpFoldCapacity = 1024;
 constexpr std::uint32_t SampleDumpBytes = 15 * 16 + 8;
 constexpr VkDeviceSize DumpListOffset = 16 + 8 * SegmentFoldCapacity;
-constexpr std::uint32_t SampleDumpPushBytes = 32;
+constexpr std::uint32_t SampleDumpPushBytes = 40;
 std::atomic<std::uint64_t> dumpsQueued{0}, dumpsQueuedInPass{0}, dumpsAtOnce{0}, segmentsClosed{0}, dumpFolds{0};
 
 struct SamplePoolCache {
@@ -1677,7 +1677,7 @@ bool Recorder::closeStoreRun(bool atSubmit) {
             }
             const auto before = dumpIndex;
             foldQueuedDumps(commands, stores, first, end, dumpIndex, consumed);
-            if (dumpIndex != before) ++barriers;
+            if (dumpIndex != before) barriers += 3;
             first = end;
         }
         if (dumps) {
@@ -2171,10 +2171,22 @@ void Recorder::dispatchDumps(VkCommandBuffer commands, std::uint32_t firstDump, 
         std::uint32_t dumps;
         std::uint32_t firstSegment;
         std::uint32_t lastSegment;
-    } parameters{sampleCounter->DeviceAddress(), sampleCounter->DeviceAddress() + DumpListOffset, firstDump, dumps, firstSegment, lastSegment};
+        std::uint32_t phase;
+    } parameters{sampleCounter->DeviceAddress(), sampleCounter->DeviceAddress() + DumpListOffset, firstDump, dumps, firstSegment, lastSegment, 0u};
     static_assert(sizeof(parameters) == SampleDumpPushBytes);
-    function(cmdPushConstants, "vkCmdPushConstants")(commands, dumpLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, SampleDumpPushBytes, &parameters);
-    function(cmdDispatch, "vkCmdDispatch")(commands, 1, 1, 1);
+    const auto push = function(cmdPushConstants, "vkCmdPushConstants");
+    const auto dispatch = function(cmdDispatch, "vkCmdDispatch");
+    push(commands, dumpLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, SampleDumpPushBytes, &parameters);
+    dispatch(commands, 1, 1, 1);
+    if (dumps == 0) return;
+    const auto publish = [&](std::uint32_t phase) {
+        recordBarrier(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
+        parameters.phase = phase;
+        push(commands, dumpLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, SampleDumpPushBytes, &parameters);
+        dispatch(commands, 1, 1, 1);
+    };
+    publish(1u);
+    publish(2u);
 }
 
 void Recorder::foldQueuedDumps(VkCommandBuffer commands, std::span<const Batch::StoreRun::Queued> writes, std::size_t first, std::size_t end, std::uint32_t& dumpIndex, std::uint32_t& consumed) {
@@ -2237,9 +2249,19 @@ void Recorder::foldSamples(Batch& batch, VkDeviceAddress target) {
         static_assert(sizeof(parameters) == SampleCounterPushBytes);
         push(commands, sampleLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, SampleCounterPushBytes, &parameters);
         dispatch(commands, 1, 1, 1);
+        if (parameters.store == 1u) {
+            const auto publish = [&](std::uint32_t store) {
+                recordBarrier(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
+                parameters.store = store;
+                push(commands, sampleLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, SampleCounterPushBytes, &parameters);
+                dispatch(commands, 1, 1, 1);
+            };
+            publish(3u);
+            publish(2u);
+        }
     } while (done < pendingSamples.size());
     recordBarrier(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_HOST_READ_BIT);
-    CountBarriers(CommandClass::Copy, 2);
+    CountBarriers(CommandClass::Copy, target != 0 ? 4u : 2u);
     pendingSamples.clear();
 }
 

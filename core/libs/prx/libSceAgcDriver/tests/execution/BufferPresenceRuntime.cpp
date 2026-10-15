@@ -78,7 +78,7 @@ Outcome Run(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> code
     }
     Outcome outcome;
     outcome.pipeline = result.PipelineVariantId();
-    if (const auto words = result.spirv.ReadTransient()) outcome.spirv.assign(words->begin(), words->end());
+    outcome.spirv = result.spirv.Copy();
     Require(outcome.pipeline != 0u && !outcome.spirv.empty(), name + ": no specialized module");
     return outcome;
 }

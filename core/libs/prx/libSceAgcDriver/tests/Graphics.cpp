@@ -440,14 +440,18 @@ void stateTests() {
     // the draw key otherwise), and nothing is recorded without a log pointer.
     queue = makeState();
     std::vector<AgcDriver::Graphics::RegisterRead> log;
-    AgcDriver::Graphics::RegisterReadLog() = &log;
-    queue.context[0x1b3] = 2;
-    queue.context[0x1b4] = 2;
-    state = AgcDriver::Graphics::DecodeState(queue);
-    Require(AgcDriver::Graphics::DrawRejection(queue, true).empty(), "precheck rejected the reference state");
-    static_cast<void>(AgcDriver::Graphics::DecodePixelStageInfo(queue.context, AgcDriver::Graphics::ExportMappings(state)));
-    AgcDriver::Graphics::RegisterReadLog() = nullptr;
+    {
+        const AgcDriver::Graphics::RegisterReadLogScope logScope(&log);
+        queue.context[0x1b3] = 2;
+        queue.context[0x1b4] = 2;
+        state = AgcDriver::Graphics::DecodeState(queue);
+        Require(AgcDriver::Graphics::DrawRejection(queue, true).empty(), "precheck rejected the reference state");
+        static_cast<void>(AgcDriver::Graphics::DecodePixelStageInfo(queue.context, AgcDriver::Graphics::ExportMappings(state)));
+    }
     Require(!log.empty(), "the register facade recorded nothing");
+    const auto recorded = log.size();
+    static_cast<void>(AgcDriver::Graphics::DecodeState(queue));
+    Require(log.size() == recorded, "the register facade recorded without an open log");
     for (const auto read : log) Require(AgcDriver::Graphics::DrawKeyCovers(read), "DrawKeyRegisters lacks a register the decoders read: " + std::string(AgcDriver::Graphics::RegisterBankName(read.bank)) + " " + std::to_string(read.offset));
     Require(!AgcDriver::Graphics::DrawKeyCovers({AgcDriver::Graphics::RegisterBank::Context, 0x100}) && AgcDriver::Graphics::DrawKeyCovers({AgcDriver::Graphics::RegisterBank::Shader, 0xab}) && !AgcDriver::Graphics::DrawKeyCovers({AgcDriver::Graphics::RegisterBank::Shader, 0xac}), "DrawKeyRegisters coverage changed");
     log.clear();
@@ -762,6 +766,12 @@ void ShaderStageTests() {
     auto stages = AgcDriver::Graphics::DecodeState(queue).stages;
     Require(stages.path == AgcDriver::Graphics::ShaderPath::Geometry && stages.mesh && stages.mesh->primitivesPerGroup == 21 && stages.mesh->verticesPerGroup == 63, "geometry assembly changed");
     Require(stages.mesh->maxVertices == 64 && stages.mesh->maxPrimitives == 21 && stages.mesh->threadsPerGroup == 64 && stages.mesh->esgsItemSize == 4, "geometry subgroup outputs changed");
+    queue.shader[0x8a] = 0x222c0007u;
+    queue.shader[0x8b] = 0x00c00010u;
+    stages = AgcDriver::Graphics::DecodeState(queue).stages;
+    Require(stages.path == AgcDriver::Graphics::ShaderPath::Geometry && stages.mesh && stages.mesh->primitivesPerGroup == 21 && stages.mesh->esgsItemSize == 4, "a geometry program with fewer GS and ES input VGPRs did not decode");
+    queue.shader[0x8a] = 3u << 29u;
+    queue.shader[0x8b] = 3u << 16u;
     {
         auto fan = makeState();
         fan.userConfig[0x242] = 5;
@@ -838,9 +848,10 @@ void ShaderStageTests() {
     queue.context[0x2d5] = 0x0200210d;
     {
         std::vector<AgcDriver::Graphics::RegisterRead> tessellationLog;
-        AgcDriver::Graphics::RegisterReadLog() = &tessellationLog;
-        stages = AgcDriver::Graphics::DecodeState(queue).stages;
-        AgcDriver::Graphics::RegisterReadLog() = nullptr;
+        {
+            const AgcDriver::Graphics::RegisterReadLogScope logScope(&tessellationLog);
+            stages = AgcDriver::Graphics::DecodeState(queue).stages;
+        }
         for (const auto read : tessellationLog) Require(AgcDriver::Graphics::DrawKeyCovers(read), "DrawKeyRegisters lacks a tessellation register the decoder reads: " + std::to_string(read.offset));
     }
     Require(stages.path == AgcDriver::Graphics::ShaderPath::Tessellation && stages.tessellation, "tessellation routing changed");
@@ -1326,6 +1337,11 @@ void DisabledColorTests() {
     queue.context[0x00b] = std::bit_cast<std::uint32_t>(1.0f);
     const auto depthOnly = AgcDriver::Graphics::DecodeState(queue);
     Require(!depthOnly.hasColorTarget && depthOnly.depth && depthOnly.depthTest && depthOnly.depthWrite && depthOnly.renderExtent.height == 64, "COLOR_INVALID discarded a depth-only draw");
+    Require(depthOnly.depth->firstSlice == 0, "a depth view of slice 0 decoded another slice");
+    queue.context[0x002] = 3;
+    const auto thirdSlice = AgcDriver::Graphics::DecodeState(queue);
+    Require(thirdSlice.depth && thirdSlice.depth->firstSlice == 3 && thirdSlice.depth->address == depthOnly.depth->address + 3u * AgcDriver::Graphics::DepthSliceBytes(depthOnly.depth->extent, 4u), "a depth view of slice 3 lost its slice or its Z offset");
+    queue.context[0x002] = 0;
     for (const auto colorControl : {0x0u, 0xcc0000u}) {
         queue = makeState();
         queue.context[0x202] = colorControl;
@@ -1412,12 +1428,213 @@ void ReversedComponentOrderTests() {
         Require(state.colors.size() == 1 && state.colors[0].format == VK_FORMAT_R8G8B8A8_UNORM && state.colors[0].componentMapping == mapping, "an 8_8_8_8 target with a reversed component order did not map exports onto RGBA8");
         Require(AgcDriver::Graphics::ExportMappings(state)[0] == mapping && state.blends[0].colorWriteMask == 0xfu, "a reversed 8_8_8_8 target did not write all four channels through its export mapping");
         queue.context[0x1e0] = 0x40010001u;
-        expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "reversed component order");
+        for (const auto offset : {0x105u, 0x106u, 0x107u, 0x108u}) queue.context[offset] = 0;
+        const auto blended = AgcDriver::Graphics::DecodeState(queue);
+        Require(blended.blends[0].blendEnable && blended.blends[0].srcColorBlendFactor == VK_BLEND_FACTOR_ONE && blended.blends[0].dstColorBlendFactor == VK_BLEND_FACTOR_ZERO && blended.blends[0].srcAlphaBlendFactor == VK_BLEND_FACTOR_ONE && blended.blends[0].dstAlphaBlendFactor == VK_BLEND_FACTOR_ZERO && blended.reversedBlend == 0u && !blended.dualSourceBlend, "a ONE + ZERO blend into a reversed 8_8_8_8 target did not stay a plain Vulkan blend");
         queue.context[0x1e0] = 0;
         queue.context[0x31c] = (queue.context[0x31c] & ~((0x1fu << 2u) | (7u << 8u))) | (12u << 2u) | (7u << 8u);
         const auto wide = AgcDriver::Graphics::DecodeState(queue);
         Require(wide.colors.size() == 1 && wide.colors[0].format == VK_FORMAT_R16G16B16A16_SFLOAT && wide.colors[0].componentMapping == mapping && wide.blends[0].colorWriteMask == 0xfu, "a 16_16_16_16 float target with a reversed component order did not map exports onto RGBA16");
     }
+}
+
+AgcDriver::QueueState reversedBlendQueue(std::uint32_t format, std::uint32_t number, std::uint32_t swap, std::uint32_t control) {
+    auto queue = makeState();
+    queue.context[0x31c] = (queue.context[0x31c] & ~0x1f7cu) | (format << 2u) | (number << 8u) | (swap << 11u);
+    const auto address = reinterpret_cast<std::uintptr_t>(sliceMemory.data());
+    queue.context[0x318] = static_cast<std::uint32_t>(address >> 8u);
+    queue.context[0x390] = static_cast<std::uint32_t>(address >> 40u);
+    queue.context[0x1b3] = 2;
+    queue.context[0x1b4] = 2;
+    queue.context[0x1e0] = control;
+    for (std::uint32_t i = 0; i < 4; ++i) queue.context[0x105 + i] = 0;
+    return queue;
+}
+
+void ReversedComponentOrderBlendTests() {
+    using AgcDriver::Graphics::DecodeState;
+    struct Target {
+        std::uint32_t format;
+        std::uint32_t number;
+        VkFormat vkFormat;
+    };
+    struct Case {
+        std::uint32_t control;
+        VkBlendFactor source;
+        VkBlendFactor destination;
+        VkBlendFactor sourceAlpha;
+        VkBlendFactor destinationAlpha;
+        VkBlendOp operation;
+        std::uint32_t code;
+        bool opaqueDestination;
+    };
+    const std::array<Target, 3> targets{{
+        {10u, 0u, VK_FORMAT_R8G8B8A8_UNORM}, {12u, 7u, VK_FORMAT_R16G16B16A16_SFLOAT}, {12u, 0u, VK_FORMAT_R16G16B16A16_UNORM}
+    }};
+    const std::array<Case, 10> cases{{
+        {0x65010504u, VK_BLEND_FACTOR_SRC1_COLOR, VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA, VK_BLEND_FACTOR_SRC1_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA, VK_BLEND_OP_ADD, 0x570001u, false},
+        {0x65810584u, VK_BLEND_FACTOR_SRC1_COLOR, VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA, VK_BLEND_FACTOR_SRC1_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA, VK_BLEND_OP_REVERSE_SUBTRACT, 0x570001u, false},
+        {0x40000501u, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE_MINUS_SRC1_COLOR, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA, VK_BLEND_OP_ADD, 0x540001u, false},
+        {0x61000104u, VK_BLEND_FACTOR_SRC1_COLOR, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_SRC1_ALPHA, VK_BLEND_FACTOR_ONE, VK_BLEND_OP_ADD, 0x560001u, false},
+        {0x61020302u, VK_BLEND_FACTOR_SRC_COLOR, VK_BLEND_FACTOR_ONE_MINUS_SRC1_COLOR, VK_BLEND_FACTOR_SRC_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, VK_BLEND_OP_ADD, 0x020001u, false},
+        {0x61010504u, VK_BLEND_FACTOR_SRC1_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_SRC1_COLOR, VK_BLEND_FACTOR_SRC1_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA, VK_BLEND_OP_ADD, 0x560301u, false},
+        {0x60060008u, VK_BLEND_FACTOR_DST_COLOR, VK_BLEND_FACTOR_ZERO, VK_BLEND_FACTOR_DST_ALPHA, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD, 0u, false},
+        {0x40000101u, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE, VK_BLEND_OP_ADD, 0u, false},
+        {0x40000141u, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE, VK_BLEND_OP_MIN, 0u, false},
+        {0x40000706u, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD, 0u, true},
+    }};
+    const std::array<std::pair<std::uint32_t, const char*>, 10> refused{{
+        {0x40000706u, "with a factor of the destination alpha in the color equation"},
+        {0x4000000au, "with a factor of the destination alpha in the color equation"},
+        {0x61000008u, "with factors the host blend cannot form from copies of the export is not implemented"},
+        {0x61000501u, "with factors the host blend cannot form from copies of the export is not implemented"},
+        {0x65050302u, "with factors the host blend cannot form from copies of the export is not implemented"},
+        {0x4000000du, "with a constant blend factor"},
+        {0x40000013u, "with a constant blend factor"},
+        {0x4000000fu, "with a second-source factor is not implemented, as dual-source blending into a component-swapped color target is unsupported"},
+        {0x65240504u, "with different color and alpha operations"},
+        {0x40000544u, "with a MIN or MAX operation whose factors are not ONE"},
+    }};
+    for (const auto& [swap, mapping] : {std::pair{2u, std::uint8_t{0x1bu}}, std::pair{3u, std::uint8_t{0x93u}}}) {
+        for (const auto& target : targets) {
+            for (const auto& test : cases) {
+                auto queue = reversedBlendQueue(target.format, target.number, swap, test.control);
+                if (test.opaqueDestination) queue.context[0x31d] = 0x20000u;
+                const auto state = DecodeState(queue);
+                const auto code = test.code;
+                char what[128];
+                std::snprintf(what, sizeof(what), "CB_BLEND0_CONTROL 0x%08x into color format %u number type %u with component mapping 0x%02x", test.control, target.format, target.number, mapping);
+                Require(state.colors.size() == 1 && state.colors[0].format == target.vkFormat && state.colors[0].componentMapping == mapping, std::string(what) + ": the target decoded differently");
+                const auto& blend = state.blends.at(0);
+                Require(blend.blendEnable && blend.srcColorBlendFactor == test.source && blend.dstColorBlendFactor == test.destination && blend.srcAlphaBlendFactor == test.sourceAlpha && blend.dstAlphaBlendFactor == test.destinationAlpha && blend.colorBlendOp == test.operation && blend.alphaBlendOp == test.operation && blend.colorWriteMask == 0xfu, std::string(what) + ": wrong Vulkan blend state");
+                Require(state.reversedBlend == code && !state.dualSourceBlend, std::string(what) + ": wrong pixel shader blend code " + std::to_string(state.reversedBlend));
+                Require(AgcDriver::Graphics::DecodePixelStageInfo(queue.context, AgcDriver::Graphics::ExportMappings(state)).targetExportMapping[0] == mapping, std::string(what) + ": the export mapping changed");
+                const auto direct = AgcDriver::Graphics::TranslateReversedBlend(test.control, mapping, target.vkFormat, test.opaqueDestination);
+                Require(direct.shaderCode == code && direct.blend.srcColorBlendFactor == blend.srcColorBlendFactor && direct.blend.dstColorBlendFactor == blend.dstColorBlendFactor && direct.blend.srcAlphaBlendFactor == blend.srcAlphaBlendFactor && direct.blend.dstAlphaBlendFactor == blend.dstAlphaBlendFactor && direct.blend.colorBlendOp == blend.colorBlendOp && direct.blend.alphaBlendOp == blend.alphaBlendOp, std::string(what) + ": TranslateReversedBlend disagrees with DecodeState");
+            }
+        }
+        for (const auto& [control, reason] : refused) {
+            const auto queue = reversedBlendQueue(10u, 0u, swap, control);
+            expectFailure([&] { DecodeState(queue); }, std::string("blending into a color target with a reversed component order ") + reason);
+        }
+        char registers[96];
+        std::snprintf(registers, sizeof(registers), "(CB_BLEND_CONTROL 0x65010504, component mapping 0x%02x, VkFormat %d)", mapping, static_cast<int>(VK_FORMAT_R8G8B8A8_SRGB));
+        expectFailure([&] { DecodeState(reversedBlendQueue(10u, 6u, swap, 0x65010504u)); }, std::string("reversed component order is not implemented for sRGB targets ") + registers);
+        expectFailure([&] { DecodeState(reversedBlendQueue(10u, 1u, swap, 0x65010504u)); }, "reversed component order is not implemented for signed normalized targets");
+        expectFailure([&] { DecodeState(reversedBlendQueue(12u, 1u, swap, 0x65010504u)); }, "reversed component order is not implemented for signed normalized targets");
+        expectFailure([&] { DecodeState(reversedBlendQueue(12u, 4u, swap, 0x65010504u)); }, "reversed component order is not implemented for integer targets");
+        auto masked = reversedBlendQueue(10u, 0u, swap, 0x65010504u);
+        masked.context[0x8e] = 7u;
+        Require(DecodeState(masked).blends.at(0).colorWriteMask == 0xeu, "a reversed target's blend did not keep the export-order write mask of its first three exports");
+        auto twoTargets = reversedBlendQueue(10u, 0u, swap, 0x65010504u);
+        for (const auto offset : {0x318u, 0x31bu, 0x31cu, 0x31du}) twoTargets.context[offset + 0xfu] = twoTargets.context.at(offset);
+        for (const auto offset : {0x390u, 0x3b0u, 0x3b8u}) twoTargets.context[offset + 1u] = twoTargets.context.at(offset);
+        twoTargets.context[0x31c + 0xfu] &= ~(3u << 11u);
+        twoTargets.context[0x1c5] = 0x99u;
+        twoTargets.context[0x8e] = 0xffu;
+        twoTargets.context[0x8f] = 0xffu;
+        twoTargets.context[0x1e1] = 0;
+        expectFailure([&] { DecodeState(twoTargets); }, "reversed component order through a second source color needs that target to be the shader's only color export");
+        twoTargets.context[0x1e0] = 0x40000101u;
+        const auto two = DecodeState(twoTargets);
+        Require(two.colors.size() == 2 && two.reversedBlend == 0u && two.blends.at(0).srcColorBlendFactor == VK_BLEND_FACTOR_ONE && two.blends.at(0).dstColorBlendFactor == VK_BLEND_FACTOR_ONE, "a reversed target blended by Vulkan alone was refused next to a second target");
+        twoTargets.context[0x31c + 0xfu] |= swap << 11u;
+        twoTargets.context[0x1e0] = 0x65010504u;
+        twoTargets.context[0x1e1] = 0x40000101u;
+        expectFailure([&] { DecodeState(twoTargets); }, "reversed component order through a second source color needs that target to be the shader's only color export");
+    }
+}
+
+void ReversedBlendRoutingTests() {
+    namespace Code = ShaderRecompiler::ReversedBlendCode;
+    using Term = std::pair<bool, std::uint32_t>;
+    constexpr Term zero{false, 0u};
+    constexpr Term one{true, 0u};
+    const auto flip = [](Term term) { return Term{!term.first, term.second}; };
+    const auto guest = [&](std::uint32_t factor, std::uint32_t component) -> std::optional<Term> {
+        const std::uint32_t exported = 10u + component;
+        const std::uint32_t stored = 20u + component;
+        switch (factor) {
+            case 0: return zero;
+            case 1: return one;
+            case 2: return Term{false, exported};
+            case 3: return Term{true, exported};
+            case 4: return Term{false, 10u};
+            case 5: return Term{true, 10u};
+            case 6: return Term{false, 20u};
+            case 7: return Term{true, 20u};
+            case 8: return Term{false, stored};
+            case 9: return Term{true, stored};
+            default: return component == 0u ? std::optional<Term>{one} : std::nullopt;
+        }
+    };
+    const auto product = [&](Term first, Term second) {
+        if (first == zero || second == zero) return std::vector<Term>{zero};
+        std::vector<Term> factors;
+        for (const auto term : {first, second}) {
+            if (term != one) factors.push_back(term);
+        }
+        std::sort(factors.begin(), factors.end());
+        return factors;
+    };
+    std::uint32_t routed = 0;
+    std::uint32_t native = 0;
+    for (std::uint32_t factors = 0; factors < 11u * 11u * 11u * 11u; ++factors) {
+        const std::array<std::uint32_t, 4> guestFactors{factors % 11u, factors / 11u % 11u, factors / 121u % 11u, factors / 1331u};
+        const auto control = guestFactors[0] | (guestFactors[1] << 8u) | (guestFactors[2] << 16u) | (guestFactors[3] << 24u) | 0x20000000u;
+        std::optional<AgcDriver::Graphics::ReversedBlend> translated;
+        try {
+            translated = AgcDriver::Graphics::TranslateReversedBlend(control, 0x1bu, VK_FORMAT_R8G8B8A8_UNORM, false);
+        } catch (const std::runtime_error& error) {
+            Require(std::string(error.what()).find("reversed component order with") != std::string::npos, std::string("an unexpected reversed-order blend refusal: ") + error.what());
+            continue;
+        }
+        const auto code = translated->shaderCode;
+        Require(code == 0u || (code & Code::Enable) != 0u, "a routed reversed-order blend code lacks its enable bit");
+        const auto route = [&](std::uint32_t shift, std::uint32_t component) {
+            switch ((code >> (shift + Code::RouteBits * component)) & Code::RouteMask) {
+                case Code::Own: return Term{false, 10u + component};
+                case Code::Component0: return Term{false, 10u};
+                case Code::Zero: return zero;
+                default: return one;
+            }
+        };
+        const auto host = [&](VkBlendFactor factor, std::uint32_t component) -> std::optional<Term> {
+            switch (factor) {
+                case VK_BLEND_FACTOR_ZERO: return zero;
+                case VK_BLEND_FACTOR_ONE: return one;
+                case VK_BLEND_FACTOR_SRC_COLOR: return route(Code::ColorShift, component);
+                case VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR: return flip(route(Code::ColorShift, component));
+                case VK_BLEND_FACTOR_SRC_ALPHA: return route(Code::ColorShift, 3u);
+                case VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA: return flip(route(Code::ColorShift, 3u));
+                case VK_BLEND_FACTOR_DST_COLOR: return Term{false, 20u + component};
+                case VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR: return Term{true, 20u + component};
+                case VK_BLEND_FACTOR_DST_ALPHA: return Term{false, 23u};
+                case VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA: return Term{true, 23u};
+                case VK_BLEND_FACTOR_SRC1_COLOR: return route(Code::SecondShift, component);
+                case VK_BLEND_FACTOR_ONE_MINUS_SRC1_COLOR: return flip(route(Code::SecondShift, component));
+                case VK_BLEND_FACTOR_SRC1_ALPHA: return route(Code::SecondShift, 3u);
+                case VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA: return flip(route(Code::SecondShift, 3u));
+                default: return std::nullopt;
+            }
+        };
+        const auto& blend = translated->blend;
+        const auto secondColor = [](VkBlendFactor factor) { return factor == VK_BLEND_FACTOR_SRC1_COLOR || factor == VK_BLEND_FACTOR_ONE_MINUS_SRC1_COLOR || factor == VK_BLEND_FACTOR_SRC1_ALPHA || factor == VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA; };
+        Require(code != 0u || !(secondColor(blend.srcColorBlendFactor) || secondColor(blend.dstColorBlendFactor) || secondColor(blend.srcAlphaBlendFactor) || secondColor(blend.dstAlphaBlendFactor)), "a reversed-order blend without a second color reads one");
+        for (std::uint32_t component = 0; component < 4; ++component) {
+            const auto wantedSource = guest(guestFactors[component == 0u ? 2u : 0u], component);
+            const auto wantedDestination = guest(guestFactors[component == 0u ? 3u : 1u], component);
+            const auto source = host(component == 3u ? blend.srcAlphaBlendFactor : blend.srcColorBlendFactor, component);
+            const auto destination = host(component == 3u ? blend.dstAlphaBlendFactor : blend.dstColorBlendFactor, component);
+            Require(wantedSource && wantedDestination && source && destination, "a reversed-order blend was accepted with a factor the routing check cannot express");
+            char what[160];
+            std::snprintf(what, sizeof(what), "CB_BLEND_CONTROL 0x%08x, code 0x%06x, component %u", control, code, component);
+            Require(product(route(Code::ColorShift, component), *source) == product(Term{false, 10u + component}, *wantedSource), std::string(what) + ": the routed source term differs from the guest's");
+            Require(*destination == *wantedDestination, std::string(what) + ": the routed destination factor differs from the guest's");
+        }
+        ++(code == 0u ? native : routed);
+    }
+    Require(native == 121u && routed == 932u, "the reversed-order blend routing accepts " + std::to_string(native) + " native and " + std::to_string(routed) + " routed factor combinations, not 121 and 932");
 }
 
 void Color1555TargetTests() {
@@ -1514,9 +1731,10 @@ void DepthStencilTests() {
     queue.context[0x10d] = 0x01000001;
     queue.context[0x200] = 0x00700711;
     std::vector<AgcDriver::Graphics::RegisterRead> log;
-    AgcDriver::Graphics::RegisterReadLog() = &log;
-    auto state = AgcDriver::Graphics::DecodeState(queue);
-    AgcDriver::Graphics::RegisterReadLog() = nullptr;
+    auto state = [&] {
+        const AgcDriver::Graphics::RegisterReadLogScope logScope(&log);
+        return AgcDriver::Graphics::DecodeState(queue);
+    }();
     for (const auto read : log) Require(AgcDriver::Graphics::DrawKeyCovers(read), "DrawKeyRegisters lacks a depth register the decoder reads: " + std::to_string(read.offset));
     queue.context[0x1b3] = 2;
     queue.context[0x1b4] = 2;
@@ -1574,9 +1792,10 @@ void DepthStencilTests() {
     queue.context[0x005] = 0x300;
     queue.context[0x01e] = 0x01;
     log.clear();
-    AgcDriver::Graphics::RegisterReadLog() = &log;
-    state = AgcDriver::Graphics::DecodeState(queue);
-    AgcDriver::Graphics::RegisterReadLog() = nullptr;
+    {
+        const AgcDriver::Graphics::RegisterReadLogScope logScope(&log);
+        state = AgcDriver::Graphics::DecodeState(queue);
+    }
     for (const auto read : log) Require(AgcDriver::Graphics::DrawKeyCovers(read), "DrawKeyRegisters lacks an HTILE register the decoder reads: " + std::to_string(read.offset));
     Require(state.depth->htileAddress == (0x30000ull | (1ull << 40u)), "the HTILE address was not decoded from DB_HTILE_DATA_BASE and its high byte");
     {
@@ -2206,9 +2425,10 @@ void cmaskTests() {
     const auto target = DecodeColorBuffer(queue.context, 0);
     Require(target.cmaskAddress == cmaskAddress && target.cmaskBytes == cmaskMemory.size(), "the fast-clear target lost its CMASK");
     std::vector<AgcDriver::Graphics::RegisterRead> log;
-    AgcDriver::Graphics::RegisterReadLog() = &log;
-    static_cast<void>(DecodeColorBuffer(queue.context, 0));
-    AgcDriver::Graphics::RegisterReadLog() = nullptr;
+    {
+        const AgcDriver::Graphics::RegisterReadLogScope logScope(&log);
+        static_cast<void>(DecodeColorBuffer(queue.context, 0));
+    }
     Require(!log.empty(), "the register facade recorded nothing for a fast-clear target");
     for (const auto read : log) Require(AgcDriver::Graphics::DrawKeyCovers(read), "DrawKeyRegisters lacks a register the fast-clear target decode reads: " + std::to_string(read.offset));
     Require(DecodeColorBuffer(makeState().context, 0).cmaskAddress == 0, "a target without FAST_CLEAR got a CMASK");
@@ -2508,10 +2728,10 @@ void multisampleTests() {
             queue.context[0x2ff + pixel * 4u] = log2 == 3 ? 0x9773f95bu : 0u;
         }
         std::vector<AgcDriver::Graphics::RegisterRead> sampleReads;
-        AgcDriver::Graphics::RegisterReadLog() = &sampleReads;
+        std::optional<AgcDriver::Graphics::RegisterReadLogScope> sampleLog(std::in_place, &sampleReads);
         const auto coveredCenter = DecodeState(queue);
         const auto coveredRejection = AgcDriver::Graphics::DrawRejection(queue, false);
-        AgcDriver::Graphics::RegisterReadLog() = nullptr;
+        sampleLog.reset();
         Require(coveredCenter.samples == (1u << log2) && !coveredCenter.customSampleLocations, "covered-centroid mode changed the sample count or locations without centroid inputs");
         for (const auto read : sampleReads) Require(AgcDriver::Graphics::DrawKeyCovers(read), "DrawKeyRegisters lacks a covered-centroid register");
         Require(coveredRejection.empty(), "covered-centroid mode without centroid inputs was refused: " + coveredRejection);
@@ -2585,9 +2805,10 @@ void multisampleTests() {
     queue.context[0x31c] |= 0x2000;
     setCmaskAddress(queue);
     std::vector<AgcDriver::Graphics::RegisterRead> reads;
-    AgcDriver::Graphics::RegisterReadLog() = &reads;
-    static_cast<void>(DecodeState(queue));
-    AgcDriver::Graphics::RegisterReadLog() = nullptr;
+    {
+        const AgcDriver::Graphics::RegisterReadLogScope logScope(&reads);
+        static_cast<void>(DecodeState(queue));
+    }
     for (const auto read : reads) Require(AgcDriver::Graphics::DrawKeyCovers(read), "DrawKeyRegisters lacks a CMASK register the decoder reads: " + std::to_string(read.offset));
 
     queue = multisampled();
@@ -2610,6 +2831,16 @@ void multisampleTests() {
     for (std::uint32_t pixel = 0; pixel < 4; ++pixel) queue.context[0x2fe + pixel * 4u] = 0x622ae6aeu;
     expectFailure([&] { DecodeColorMetadataPass(queue); }, "differs from the rasterizer's");
     queue = rasterizedResolve;
+    std::vector<std::byte> resolvedBlock(2u * 65536u);
+    const auto resolvedAddress = (reinterpret_cast<std::uintptr_t>(resolvedBlock.data()) + 65535u) / 65536u * 65536u;
+    for (const auto mode : {AgcDriver::Graphics::ColorTileMode::Standard4KB, AgcDriver::Graphics::ColorTileMode::Standard64KB, AgcDriver::Graphics::ColorTileMode::RenderTarget}) {
+        auto tiled = queue;
+        tiled.context[0x327] = static_cast<std::uint32_t>(resolvedAddress >> 8u);
+        tiled.context[0x391] = static_cast<std::uint32_t>(resolvedAddress >> 40u);
+        tiled.context[0x3b9] = (tiled.context[0x3b9] & ~(0x1fu << 14u)) | (static_cast<std::uint32_t>(mode) << 14u);
+        const auto tiledPass = DecodeColorMetadataPass(tiled);
+        Require(tiledPass.has_value() && tiledPass->mode == ColorMetadataPass::Mode::Resolve && tiledPass->targets.size() == 1 && tiledPass->targets[0].tileMode == mode && tiledPass->targets[0].samples == 1, "a CB resolve into a tile mode " + std::to_string(static_cast<std::uint32_t>(mode)) + " destination did not decode");
+    }
     queue.context[0x32b] = queue.context[0x31c] ^ (1u << 8u);
     expectFailure([&] { DecodeColorMetadataPass(queue); }, "different formats or extents");
     queue = rasterizedResolve;
@@ -5771,6 +6002,153 @@ void stencilRefExportTests() {
     static_cast<void>(AgcDriver::Graphics::DecodeState(queue));
 }
 
+bool stencilComparison(VkCompareOp op, std::uint32_t reference, std::uint32_t stencil) {
+    switch (op) {
+        case VK_COMPARE_OP_NEVER: return false;
+        case VK_COMPARE_OP_LESS: return reference < stencil;
+        case VK_COMPARE_OP_EQUAL: return reference == stencil;
+        case VK_COMPARE_OP_LESS_OR_EQUAL: return reference <= stencil;
+        case VK_COMPARE_OP_GREATER: return reference > stencil;
+        case VK_COMPARE_OP_NOT_EQUAL: return reference != stencil;
+        case VK_COMPARE_OP_GREATER_OR_EQUAL: return reference >= stencil;
+        case VK_COMPARE_OP_ALWAYS: return true;
+        default: throw std::runtime_error("invalid stencil comparison in the reference oracle");
+    }
+}
+
+std::pair<std::uint32_t, bool> stencilReferenceOutcome(const AgcDriver::Graphics::State& state, const VkStencilOpState& face, std::uint32_t reference, std::uint32_t stencil, bool depthPass, bool boundsPass) {
+    if (state.depthBoundsTest && !boundsPass) return {stencil, false};
+    const bool stencilPass = stencilComparison(face.compareOp, reference & face.compareMask & 0xffu, stencil & face.compareMask & 0xffu);
+    if (!state.depthTest || state.depthCompare == VK_COMPARE_OP_ALWAYS) depthPass = true;
+    if (state.depthTest && state.depthCompare == VK_COMPARE_OP_NEVER) depthPass = false;
+    const auto op = !stencilPass ? face.failOp : !depthPass ? face.depthFailOp : face.passOp;
+    auto updated = stencil;
+    switch (op) {
+        case VK_STENCIL_OP_KEEP: break;
+        case VK_STENCIL_OP_ZERO: updated = 0; break;
+        case VK_STENCIL_OP_REPLACE: updated = reference; break;
+        case VK_STENCIL_OP_INCREMENT_AND_CLAMP: updated = std::min(stencil + 1u, 255u); break;
+        case VK_STENCIL_OP_DECREMENT_AND_CLAMP: updated = stencil == 0 ? 0 : stencil - 1u; break;
+        case VK_STENCIL_OP_INVERT: updated = ~stencil; break;
+        case VK_STENCIL_OP_INCREMENT_AND_WRAP: updated = stencil + 1u; break;
+        case VK_STENCIL_OP_DECREMENT_AND_WRAP: updated = stencil - 1u; break;
+        default: throw std::runtime_error("invalid stencil operation in the reference oracle");
+    }
+    const auto writeMask = face.writeMask & 0xffu;
+    return {((stencil & ~writeMask) | (updated & writeMask)) & 0xffu, stencilPass && depthPass};
+}
+
+void stencilReferenceUnusedTests() {
+    using AgcDriver::Graphics::StencilReferenceUnused;
+    AgcDriver::Graphics::State state{};
+    state.depth.emplace();
+    state.depth->format = VK_FORMAT_D32_SFLOAT_S8_UINT;
+    state.stencilTest = true;
+    state.stencilFront = {VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_COMPARE_OP_ALWAYS, 0xffu, 0xffu, 37u};
+    state.stencilBack = state.stencilFront;
+    std::size_t accepted = 0;
+    std::size_t countermodels = 0;
+    const auto verify = [&](const auto& candidate, bool unused, bool witness, std::string_view name) {
+        Require(StencilReferenceUnused(candidate) == unused, "wrong unused stencil reference decision for " + std::string(name));
+        bool changed = false;
+        for (const auto& face : {candidate.stencilFront, candidate.stencilBack}) {
+            for (std::uint32_t stencil = 0; stencil < 256u; ++stencil) {
+                for (const bool depthPass : {false, true}) {
+                    for (const bool boundsPass : {false, true}) {
+                        const auto fixed = stencilReferenceOutcome(candidate, face, face.reference, stencil, depthPass, boundsPass);
+                        for (std::uint32_t reference = 0; reference < 256u; ++reference) {
+                            changed |= stencilReferenceOutcome(candidate, face, reference, stencil, depthPass, boundsPass) != fixed;
+                        }
+                    }
+                }
+            }
+        }
+        Require(!unused || !changed, "dropping the stencil reference changes a sample outcome for " + std::string(name));
+        Require(!witness || changed, "the dependent stencil reference has no countermodel for " + std::string(name));
+        accepted += unused;
+        countermodels += witness;
+    };
+    verify(state, true, false, "ALWAYS with KEEP");
+    for (const auto op : {VK_STENCIL_OP_ZERO, VK_STENCIL_OP_INCREMENT_AND_CLAMP, VK_STENCIL_OP_DECREMENT_AND_CLAMP, VK_STENCIL_OP_INVERT, VK_STENCIL_OP_INCREMENT_AND_WRAP, VK_STENCIL_OP_DECREMENT_AND_WRAP}) {
+        auto independent = state;
+        independent.stencilFront.passOp = op;
+        independent.stencilBack = independent.stencilFront;
+        verify(independent, true, false, "reference-independent update");
+    }
+    for (std::uint32_t comparison = 0; comparison < 8u; ++comparison) {
+        auto masked = state;
+        masked.stencilFront.compareOp = static_cast<VkCompareOp>(comparison);
+        masked.stencilFront.compareMask = 0x100u;
+        masked.stencilBack = masked.stencilFront;
+        verify(masked, true, false, "effective zero compare mask");
+        if (comparison != VK_COMPARE_OP_ALWAYS && comparison != VK_COMPARE_OP_NEVER) {
+            auto dependent = masked;
+            dependent.stencilBack.compareMask = 0x80u;
+            dependent.stencilBack.writeMask = 0;
+            verify(dependent, false, true, "dependent back-face comparison with no writes");
+        }
+    }
+    auto replace = state;
+    replace.stencilFront.passOp = VK_STENCIL_OP_REPLACE;
+    verify(replace, false, true, "reachable front pass REPLACE");
+    replace.stencilFront.passOp = VK_STENCIL_OP_KEEP;
+    replace.stencilBack.failOp = VK_STENCIL_OP_REPLACE;
+    verify(replace, true, false, "unreachable back fail REPLACE");
+    replace.stencilBack.compareOp = VK_COMPARE_OP_NEVER;
+    verify(replace, false, true, "reachable back fail REPLACE");
+    replace.stencilBack.failOp = VK_STENCIL_OP_KEEP;
+    replace.stencilBack.passOp = VK_STENCIL_OP_REPLACE;
+    replace.stencilBack.depthFailOp = VK_STENCIL_OP_REPLACE;
+    verify(replace, true, false, "NEVER with unreachable depth operations");
+    replace = state;
+    replace.stencilBack.passOp = VK_STENCIL_OP_REPLACE;
+    replace.stencilBack.writeMask = 0x100u;
+    verify(replace, true, false, "effective zero write mask");
+    replace.stencilBack.writeMask = 0x80u;
+    verify(replace, false, true, "partially writable REPLACE");
+    replace = state;
+    replace.stencilBack.depthFailOp = VK_STENCIL_OP_REPLACE;
+    verify(replace, true, false, "disabled depth test");
+    replace.depthTest = true;
+    replace.depthCompare = VK_COMPARE_OP_ALWAYS;
+    verify(replace, true, false, "always passing depth test");
+    replace.depthCompare = VK_COMPARE_OP_LESS;
+    verify(replace, false, true, "possibly failing depth test");
+    replace.depthCompare = VK_COMPARE_OP_NEVER;
+    verify(replace, false, true, "always failing depth test");
+    replace.stencilBack.depthFailOp = VK_STENCIL_OP_KEEP;
+    replace.stencilBack.passOp = VK_STENCIL_OP_REPLACE;
+    verify(replace, true, false, "unreachable depth pass REPLACE");
+    replace = state;
+    replace.depthBoundsTest = true;
+    verify(replace, true, false, "bounds with reference-independent operations");
+    replace.stencilBack.depthFailOp = VK_STENCIL_OP_REPLACE;
+    Require(!StencilReferenceUnused(replace), "depth bounds admitted an unchecked REPLACE operation");
+    auto clear = state;
+    clear.stencilFront = {VK_STENCIL_OP_REPLACE, VK_STENCIL_OP_REPLACE, VK_STENCIL_OP_REPLACE, VK_COMPARE_OP_ALWAYS, 0xffu, 0xffu, 7u};
+    clear.stencilBack = clear.stencilFront;
+    verify(clear, false, true, "clear replacement state");
+    for (const bool front : {false, true}) {
+        auto invalid = state;
+        (front ? invalid.stencilFront : invalid.stencilBack).compareOp = static_cast<VkCompareOp>(8u);
+        Require(!StencilReferenceUnused(invalid), "an unknown stencil comparison lost its export");
+        invalid = state;
+        (front ? invalid.stencilFront : invalid.stencilBack).passOp = static_cast<VkStencilOp>(8u);
+        Require(!StencilReferenceUnused(invalid), "an unknown stencil operation lost its export");
+    }
+    auto invalidDepth = state;
+    invalidDepth.depthTest = true;
+    invalidDepth.depthCompare = static_cast<VkCompareOp>(8u);
+    Require(!StencilReferenceUnused(invalidDepth), "an unknown depth comparison lost its stencil export");
+    auto inactive = clear;
+    inactive.stencilTest = false;
+    Require(StencilReferenceUnused(inactive), "a disabled stencil test retained the export");
+    inactive.stencilTest = true;
+    inactive.depth.reset();
+    Require(StencilReferenceUnused(inactive), "an absent attachment retained the export");
+    std::cout << "Unused stencil reference sample equivalence passed: " << accepted << " accepted states, " << countermodels << " dependent countermodels\n";
+}
+
 std::set<std::string> bufferViews(std::span<const std::uint32_t> words) {
     std::set<std::string> views;
     for (std::size_t at = 5; at < words.size() && (words[at] >> 16u) != 0; at += words[at] >> 16u) {
@@ -5892,6 +6270,20 @@ void ProvokingVertexTests() {
     const std::array<CompiledShader, 1> flatP10Shaders{{{ShaderRecompiler::ShaderStage::Fragment, &flatP10Pixel, 0}}};
     ValidateProvokingVertex(supported, last, flatP10Shaders);
     expectFailure([&] { ValidateProvokingVertex(supported, first, flatP10Shaders); }, "v_interp_mov p10 of a flat input with the first provoking vertex is not measured");
+    auto lastStrip = last;
+    lastStrip.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+    auto lastList = last;
+    lastList.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    const std::array<std::uint32_t, 11> smoothColor{0xc8100000u, 0xc8110001u, 0xc8140100u, 0xc8150101u, 0xc8180200u, 0xc8190201u, 0xc81c0300u, 0xc81d0301u, 0xf800180fu, 0x07060504u, 0xbf810000u};
+    const auto smoothPixel = recompilePixel({0x0u}, smoothColor);
+    Require(smoothPixel.fragmentParameters.size() == 1 && smoothPixel.fragmentParameters[0].perVertex && !smoothPixel.fragmentParameters[0].vertexOrder, "v_interp_p1/p2 of a smooth input was recorded as reading a vertex slot");
+    const std::array<CompiledShader, 1> smoothShaders{{{ShaderRecompiler::ShaderStage::Fragment, &smoothPixel, 0}}};
+    ValidateProvokingVertex(supported, lastStrip, smoothShaders);
+    const auto slotPixel = recompilePixel({0x0u}, flatP10Color);
+    Require(slotPixel.fragmentParameters.size() == 1 && slotPixel.fragmentParameters[0].perVertex && slotPixel.fragmentParameters[0].vertexOrder, "v_interp_mov P10 of a smooth input was not recorded as reading a vertex slot");
+    const std::array<CompiledShader, 1> slotShaders{{{ShaderRecompiler::ShaderStage::Fragment, &slotPixel, 0}}};
+    expectFailure([&] { ValidateProvokingVertex(supported, lastStrip, slotShaders); }, "last provoking vertex with explicit per-vertex triangle-strip interpolation is unsupported");
+    ValidateProvokingVertex(supported, lastList, slotShaders);
     ShaderRecompiler::RecompileResult fragment{};
     const std::array<CompiledShader, 1> shaders{{{ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}}};
     for (const auto topology : {VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN}) {
@@ -5899,16 +6291,19 @@ void ProvokingVertexTests() {
         state.topology = topology;
         for (const auto flat : {false, true}) {
             for (const auto perVertex : {false, true}) {
-                fragment.fragmentParameters = {{0, 0, flat, perVertex}};
-                auto firstState = state;
-                firstState.provokingVertexMode = VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT;
-                ValidateProvokingVertex(unsupported, firstState, shaders);
-                if (flat && perVertex) {
-                    expectFailure([&] { ValidateProvokingVertex(supported, state, shaders); }, "last provoking vertex with explicit per-vertex flat interpolation is unsupported");
-                } else if (perVertex && topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP) {
-                    expectFailure([&] { ValidateProvokingVertex(supported, state, shaders); }, "last provoking vertex with explicit per-vertex triangle-strip interpolation is unsupported");
-                } else {
-                    ValidateProvokingVertex(supported, state, shaders);
+                for (const auto vertexOrder : {false, true}) {
+                    if (vertexOrder && !perVertex) continue;
+                    fragment.fragmentParameters = {{0, 0, flat, perVertex, false, false, vertexOrder}};
+                    auto firstState = state;
+                    firstState.provokingVertexMode = VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT;
+                    ValidateProvokingVertex(unsupported, firstState, shaders);
+                    if (flat && perVertex) {
+                        expectFailure([&] { ValidateProvokingVertex(supported, state, shaders); }, "last provoking vertex with explicit per-vertex flat interpolation is unsupported");
+                    } else if (vertexOrder && topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP) {
+                        expectFailure([&] { ValidateProvokingVertex(supported, state, shaders); }, "last provoking vertex with explicit per-vertex triangle-strip interpolation is unsupported");
+                    } else {
+                        ValidateProvokingVertex(supported, state, shaders);
+                    }
                 }
             }
         }
@@ -6461,6 +6856,74 @@ void unorm10_11_11BlendTests() {
     expectFailure([&] { static_cast<void>(ShaderRecompiler::Recompile(depthExport)); }, "exports depth or a sample mask cannot blend");
 }
 
+void ReversedBlendShaderTests() {
+    const auto queue = reversedBlendQueue(10u, 0u, 2u, 0x65010504u);
+    const auto state = AgcDriver::Graphics::DecodeState(queue);
+    Require(state.reversedBlend == 0x570001u && !state.dualSourceBlend && state.blends.size() == 1, "the reversed-order source-alpha blend did not decode to a pixel shader blend code");
+    constexpr std::array<std::uint32_t, 3> code{0xf800180fu, 0x07060504u, 0xbf810000u};
+    auto request = packedExportRequest(queue, state, code);
+    request.context.pixel->reversedBlend = state.reversedBlend;
+    auto plain = request;
+    plain.context.pixel->reversedBlend = 0u;
+    const ShaderRecompiler::RequestSerializer serializer;
+    Require(serializer.Deserialize(serializer.Serialize(request)).request.context.pixel->reversedBlend == 0x570001u, "the reversed-order blend code was lost in serialization");
+    std::vector<std::uint64_t> key;
+    std::vector<std::uint64_t> plainKey;
+    ShaderRecompiler::BuildPreparedShaderKey(request, key);
+    ShaderRecompiler::BuildPreparedShaderKey(plain, plainKey);
+    Require(key == plainKey, "the reversed-order blend code entered the static shader ABI");
+    const auto prepared = ShaderRecompiler::PrepareShader(plain);
+    Require(ShaderRecompiler::MatchesPreparedShader(request, *prepared), "a reversed-order blended draw did not match the registered pixel shader");
+    const auto reversed = ShaderRecompiler::Recompile(request);
+    const auto single = ShaderRecompiler::Recompile(plain);
+    Require(reversed.variantId == single.variantId && reversed.variantId == ShaderRecompiler::GetPreparedArtifact(*prepared).variantId, "the reversed-order blended draw did not reuse the registered artifact");
+    Require(reversed.PipelineVariantId() != single.PipelineVariantId() && ShaderRecompiler::Recompile(request).PipelineVariantId() == reversed.PipelineVariantId(), "the reversed-order blend code did not key its own specialization");
+    const auto arithmetic = [](std::span<const std::uint32_t> words) {
+        std::size_t count = 0;
+        for (std::size_t at = 5; at < words.size() && (words[at] >> 16u) != 0; at += words[at] >> 16u) {
+            const auto op = static_cast<spv::Op>(words[at] & 0xffffu);
+            if (op == spv::OpFAdd || op == spv::OpFSub || op == spv::OpFMul || op == spv::OpFDiv || op == spv::OpFNegate || op == spv::OpExtInst || op == spv::OpSelect) ++count;
+        }
+        return count;
+    };
+    for (const auto shaderCode : {0x570001u, 0x540001u, 0x560001u, 0x020001u, 0x560301u, 0xffff01u}) {
+        auto changed = request;
+        changed.context.pixel->reversedBlend = shaderCode;
+        const auto specialized = ShaderRecompiler::Recompile(changed);
+        const auto words = specialized.spirv.Words();
+        const auto outputs = outputDecorations(words);
+        Require(outputs.locations.size() == 2 && std::all_of(outputs.locations.begin(), outputs.locations.end(), [](const auto& entry) { return entry.second == 0u; }) && outputs.indices.size() == 1 && outputs.indices.begin()->second == 1u, "blend code " + std::to_string(shaderCode) + " did not add a second color at location 0 index 1");
+        Require(arithmetic(words) == arithmetic(single.spirv.Words()), "blend code " + std::to_string(shaderCode) + " computed in the pixel shader instead of copying the export");
+    }
+    const auto singleOutputs = outputDecorations(single.spirv.Words());
+    Require(singleOutputs.locations.size() == 1 && singleOutputs.locations.begin()->second == 0u && singleOutputs.indices.empty(), "a pixel shader without a reversed-order blend code changed its outputs");
+    ShaderRecompiler::RecompileResult vertex;
+    vertex.spirv = makeModule({});
+    const VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+    const auto validate = [&](const ShaderRecompiler::RecompileResult& pixel, const AgcDriver::Graphics::State& target) {
+        const std::array<AgcDriver::Graphics::CompiledShader, 2> shaders{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &pixel, 0}}};
+        return AgcDriver::Graphics::ValidateShaders(shaders, target, subgroup, false);
+    };
+    Require(validate(reversed, state) == std::set<std::uint32_t>{0u}, "the reversed-order blended shader did not validate against its draw");
+    expectFailure([&] { validate(single, state); }, "needs a float4 second color at location 0 index 1");
+    auto plainState = state;
+    plainState.reversedBlend = 0u;
+    expectFailure([&] { validate(reversed, plainState); }, "Index decoration");
+    for (const auto invalid : {0x2u, 0x80u, 0x100u, 0x10000u, 0x1000001u, 0x80000001u}) {
+        auto changed = request;
+        changed.context.pixel->reversedBlend = invalid;
+        expectFailure([&] { static_cast<void>(ShaderRecompiler::Recompile(changed)); }, "invalid prepared reversed-order blend");
+    }
+    const auto twoQueue = dualSourceQueue();
+    const auto twoState = AgcDriver::Graphics::DecodeState(twoQueue);
+    constexpr std::array<std::uint32_t, 5> twoExports{0xf800000fu, 0x07060504u, 0xf800181fu, 0x0b0a0908u, 0xbf810000u};
+    auto both = packedExportRequest(twoQueue, twoState, twoExports);
+    both.context.pixel->reversedBlend = 0x570001u;
+    expectFailure([&] { static_cast<void>(ShaderRecompiler::Recompile(both)); }, "reversed-order blending needs MRT0 to be the only color output");
+    both.context.pixel->dualSourceBlend = true;
+    expectFailure([&] { static_cast<void>(ShaderRecompiler::Recompile(both)); }, "reversed-order blending cannot be combined with dual-source blending");
+}
+
 void validationTests() {
     AgcDriver::Graphics::State state{};
     state.stages.path = AgcDriver::Graphics::ShaderPath::Vertex;
@@ -6805,6 +7268,16 @@ void stagingPoolBudgetTests() {
     Require(AgcDriver::Graphics::BufferPool::DeviceBudget(memory) == VkDeviceSize{512} << 20u, "the staging pool budget fell below 512 MiB");
     memory.memoryHeapCount = 1;
     Require(AgcDriver::Graphics::BufferPool::DeviceBudget(memory) == VkDeviceSize{512} << 20u, "a host heap sized the staging pool budget");
+    memory.memoryHeapCount = 2;
+    memory.memoryHeaps[1].size = VkDeviceSize{16} << 30u;
+    memory.memoryTypeCount = 2;
+    memory.memoryTypes[0] = {VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0};
+    memory.memoryTypes[1] = {VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 1};
+    Require(AgcDriver::Graphics::BufferPool::DeviceBudget(memory) == VkDeviceSize{256} << 20u, "the staging pool budget on a 16 GiB heap of system memory is not a sixty-fourth of it");
+    memory.memoryHeaps[1].size = VkDeviceSize{4} << 30u;
+    Require(AgcDriver::Graphics::BufferPool::DeviceBudget(memory) == VkDeviceSize{128} << 20u, "the staging pool budget on system memory fell below 128 MiB");
+    memory.memoryTypes[0] = {VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 1};
+    Require(AgcDriver::Graphics::BufferPool::DeviceBudget(memory) == VkDeviceSize{512} << 20u, "a heap with a device-only memory type was taken for system memory");
 }
 
 void meshArgumentTests() {
@@ -7081,6 +7554,10 @@ int main(int argc, char** argv) {
     setenv("APS5_HEAP_MIRROR_MIB", "4", 1);
 #endif
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--unused-stencil-reference") {
+            stencilReferenceUnusedTests();
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--sparse-buffer-holes") {
             bool passed = false;
             {
@@ -7210,6 +7687,7 @@ int main(int argc, char** argv) {
         earlyFragmentTestsTests();
         orderedPixelShaderTests();
         stencilRefExportTests();
+        stencilReferenceUnusedTests();
         aliasedBufferViewTests();
         LineStripTests();
         ProvokingVertexTests();
@@ -7221,8 +7699,11 @@ int main(int argc, char** argv) {
         BlendBypassTests();
         CompactedExportTests();
         ReversedComponentOrderTests();
+        ReversedComponentOrderBlendTests();
+        ReversedBlendRoutingTests();
         ShadersWriteMemoryTests();
         DualSourceBlendTests();
+        ReversedBlendShaderTests();
         metadataPassTests();
         cmaskTests();
         uint16ExportTests();
@@ -7354,7 +7835,12 @@ int main(int argc, char** argv) {
             },
             [] { return mock.pipelineCreateCount; },
             [] { return mock.pipelineSpecializations.back(); },
-            [] { return mock.descriptorPools.size(); }
+            [] { return mock.descriptorPools.size(); },
+            [] {
+                std::uint32_t resets = 0;
+                for (const auto& [handle, pool] : mock.descriptorPools) resets += pool.resets;
+                return resets;
+            }
         });
         std::cout << "Graphics validation tests passed\n";
         return 0;

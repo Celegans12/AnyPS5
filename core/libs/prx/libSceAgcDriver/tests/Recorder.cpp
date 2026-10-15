@@ -43,7 +43,9 @@
 #endif
 #include <windows.h>
 #else
+#include <fcntl.h>
 #include <sys/mman.h>
+#include <unistd.h>
 #endif
 #include <functional>
 #include <algorithm>
@@ -3938,7 +3940,11 @@ void importWatchTests(const Device& device) {
     Require(probe.failure == nullptr, std::string("(u) the import probe failed at ") + (probe.failure != nullptr ? probe.failure : "") + " (" + std::to_string(static_cast<int>(probe.result)) + ")");
     std::cout << "import probe: " << probe.writtenAfterSubmit << " of " << probe.pages << " scratch pages written after a GPU read, " << probe.writtenAfterFill << " after a GPU write, " << probe.writtenAtImport << " after the import\n";
     Require(probe.writtenByCpu != 0, "(u) a CPU store after the import probe's GPU read was not collected");
-    if (context.dmaBufImport) {
+    const int udmabuf = context.dmaBufImport ? open("/dev/udmabuf", O_RDWR | O_CLOEXEC) : -1;
+    if (udmabuf >= 0) close(udmabuf);
+    if (context.dmaBufImport && udmabuf < 0) {
+        std::cout << "/dev/udmabuf is not accessible: the dma-buf import probe not tested\n";
+    } else if (context.dmaBufImport) {
         const auto dmaBuf = ProbeDmaBufImportWriteProtection(context);
         Require(dmaBuf.failure == nullptr, std::string("(u) the dma-buf import probe failed at ") + (dmaBuf.failure != nullptr ? dmaBuf.failure : "") + " (" + std::to_string(static_cast<int>(dmaBuf.result)) + ")");
         Require(dmaBuf.writtenByCpu != 0, "(u) a CPU store into a dma-buf imported scratch range was not collected");
@@ -5821,8 +5827,13 @@ void pendingKeyStoreTests(const Device& device, Recorder& recorder) {
     recorder.NotePendingWrite(address, keyCount);
     NoteKeysFillOnGpu(address, keyCount, DccKeys::Clear0001);
     Require(CurrentDccKeys(address, surfaceBytes) == DccKeys::Clear0001 && recorder.PendingWriteOverlaps(address, keyCount), "the keys of a pending fill did not read as its keys without a wait");
+    Require(KnownPendingDccKeys(address, surfaceBytes) == DccKeys::Clear0001 && recorder.PendingWriteOverlaps(address, keyCount), "the keys of a pending fill were not known without a wait");
+    Require(KnownPendingDccKeys(address + 16, surfaceBytes / 2) == DccKeys::Clear0001, "a key range inside a pending fill was not known");
+    Require(!KnownPendingDccKeys(address, 2 * surfaceBytes).has_value() && recorder.PendingWriteOverlaps(address, keyCount), "a range wider than the pending fill was known, or waited for");
     recorder.NotePendingWrite(address, 2 * keyCount);
+    Require(!KnownPendingDccKeys(address, surfaceBytes).has_value() && recorder.PendingWriteOverlaps(address, keyCount), "the keys under a later writer over a pending fill were known");
     Require(CurrentDccKeys(address, surfaceBytes) == DccKeys::Uncompressed && !recorder.PendingWriteOverlaps(address, keyCount), "a later wider writer over a pending fill was not waited for");
+    Require(!KnownPendingDccKeys(address, surfaceBytes).has_value(), "keys nothing writes were known as pending keys");
     recorder.NotePendingFill(address, keyCount / 2, 0x40);
     recorder.NotePendingFill(address + keyCount / 2, keyCount / 2, 0x40);
     Require(CurrentDccKeys(address, surfaceBytes) == DccKeys::Clear0001 && recorder.PendingWriteOverlaps(address, keyCount), "the keys of pending 0001 fills over both halves did not read as 0001 without a wait");
@@ -6221,6 +6232,25 @@ void metadataPassTests(const Device& device, Recorder& recorder) {
     const auto keyed = StorageTexture::FindPending(address, surfaceBytes);
     Require(keyed != nullptr && keyed != unkeyed && keyed->Descriptor().dccAddress == color.dccAddress, "a pass over a resident image under other keys did not remake it under the target's keys");
     Require(keysUncompressed() && memoryHolds({0xff, 0xff, 0xff, 0xff}), "a pass over a remade resident image did not store the 1111 value");
+    {
+        const auto* import = HostImportFor(base, address, bytes);
+        Require(import != nullptr, "the metadata pass block lost its import");
+        const auto commands = recorder.Commands();
+        context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, import->buffer, color.dccAddress - import->base, keyCount, 0x20202020u);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_HOST_READ_BIT);
+        recorder.NotePendingWrite(color.dccAddress, keyCount);
+        NoteKeysFillOnGpu(color.dccAddress, keyCount, DccKeys::ClearRegister);
+    }
+    Require(KnownPendingDccKeys(color.dccAddress, surfaceBytes) == DccKeys::ClearRegister, "the keys of a pending register clear store were not known");
+    const std::array<std::uint32_t, 4> clearPattern{0x80402010u, 0x80402010u, 0x80402010u, 0x80402010u};
+    const char* refusal = nullptr;
+    Require(!keyed->FillClear(clearPattern, StorageTexture::WholeImage, refusal) && refusal != nullptr && std::strcmp(refusal, "keys pending") == 0, "a clear over pending keys was not refused without the proof");
+    refusal = nullptr;
+    Require(keyed->FillClear(clearPattern, StorageTexture::WholeImage, refusal, true), "a clear over known pending keys was refused");
+    Require(recorder.PendingWriteOverlaps(color.dccAddress, keyCount) && keys[0] == 0xff, "the clear over known pending keys waited for the key store");
+    MarkDccUncompressed(context, color.dccAddress, surfaceBytes);
+    Require(memoryHolds({0x10, 0x20, 0x40, 0x80}), "the clear recorded behind a pending key store did not store CB_COLOR_CLEAR_WORD");
+    Require(std::all_of(keys, keys + keyCount, [](std::uint8_t key) { return key == 0xff; }), "the keys after a clear behind a pending key store are not uncompressed");
 }
 
 // The data word positions of a dispatch-cache variant (Driver.cpp's data-only hits): leaves
@@ -6743,6 +6773,103 @@ void fmaskDecompressMsaaTests(const Device& device, Recorder& recorder) {
     AgcDriver::GuestMemory::Read(destAddress2, std::as_writable_bytes(std::span(resolved2)));
     Require(std::ranges::all_of(resolved2, [](auto word) { return word == 0x11223344u; }), "subsequent FMASK decompress re-cleared the multisampled target");
     std::cout << "FMASK decompress MSAA clear and resolve tests passed\n";
+}
+
+void tiledResolveTests(const Device& device, Recorder& recorder) {
+    namespace GuestMemory = AgcDriver::GuestMemory;
+    auto context = device.GetContext();
+    if ((context.limits.framebufferColorSampleCounts & VK_SAMPLE_COUNT_4_BIT) == 0 || !device.Graphics()) {
+        std::cout << "4x color targets or graphics unavailable: CB resolves into tiled targets not tested\n";
+        return;
+    }
+    context.hostImportAlignment = 0;
+    TextureDetiler detiler(context);
+    context.detiler = &detiler;
+    constexpr std::uint32_t side = 128;
+    constexpr std::size_t targetBytes = side * side * 4u;
+    constexpr std::size_t sourceBytes = targetBytes * 4u;
+    constexpr std::size_t bytes = targetBytes + sourceBytes + 65536u;
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(65536, bytes);
+#endif
+    Require(block != nullptr, "cannot allocate the tiled resolve block");
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Release {
+        const Context& context;
+        void* block;
+        ~Release() {
+            ClearMultisampleTargets(context.device);
+            ClearCachedTextures(context.device);
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+#ifdef _WIN32
+            VirtualFree(block, 0, MEM_RELEASE);
+#else
+            std::free(block);
+#endif
+        }
+    } release{context, block};
+    ColorTarget source{};
+    source.address = address + targetBytes;
+    source.surfaceAddress = source.address;
+    source.extent = {side, side};
+    source.surfaceExtent = source.extent;
+    source.format = VK_FORMAT_R8G8B8A8_UNORM;
+    source.bytes = targetBytes;
+    source.componentMapping = 0xe4u;
+    source.tileMode = ColorTileMode::RenderTarget;
+    source.samples = 4;
+    source.cmaskAddress = address + targetBytes + sourceBytes;
+    source.cmaskBytes = 4096;
+    source.cmaskFastClear = true;
+    const std::array<std::pair<ColorTileMode, std::uint32_t>, 3> modes{{{ColorTileMode::Standard4KB, 0x80402010u}, {ColorTileMode::Standard64KB, 0x10204080u}, {ColorTileMode::RenderTarget, 0x40801020u}}};
+    for (const auto& [mode, clear] : modes) {
+        const auto name = std::to_string(static_cast<std::uint32_t>(mode));
+        std::memset(block, 0x55, targetBytes);
+        std::memset(static_cast<std::byte*>(block) + targetBytes + sourceBytes, 0, 4096);
+        ColorTarget destination{};
+        destination.address = address;
+        destination.surfaceAddress = address;
+        destination.extent = {side, side};
+        destination.surfaceExtent = destination.extent;
+        destination.format = VK_FORMAT_R8G8B8A8_UNORM;
+        destination.bytes = targetBytes;
+        destination.componentMapping = 0xe4u;
+        destination.tileMode = mode;
+        source.clearWords = {clear, 0};
+        RunColorMetadataPass(context, {ColorMetadataPass::Mode::Resolve, {destination}, source});
+        std::vector<std::uint32_t> resolved(targetBytes / 4);
+        GuestMemory::Read(address, std::as_writable_bytes(std::span(resolved)));
+        const auto texels = std::ranges::count(resolved, clear);
+        Require(texels == static_cast<std::ptrdiff_t>(resolved.size()), "a CB resolve into a tile mode " + name + " target left " + std::to_string(resolved.size() - static_cast<std::size_t>(texels)) + " texels without the resolved color");
+        recorder.Sync();
+        ClearMultisampleTargets(context.device);
+        ClearCachedTextures(context.device);
+    }
+    {
+        ColorTarget destination{};
+        destination.address = address;
+        destination.extent = {side, side};
+        destination.format = VK_FORMAT_R8G8B8A8_UNORM;
+        destination.bytes = targetBytes;
+        destination.tileMode = ColorTileMode::Linear;
+        std::string message;
+        try {
+            RunColorMetadataPass(context, {ColorMetadataPass::Mode::Resolve, {destination}, source});
+        } catch (const std::exception& error) {
+            message = error.what();
+        }
+        Require(message.find("without a resident image is not implemented") != std::string::npos, "a CB resolve into a linear target did not throw: " + message);
+    }
+    recorder.Sync();
 }
 
 void depthSurfaceProofTests(const Device& device, Recorder& recorder) {
@@ -8210,6 +8337,15 @@ int main(int argc, char** argv) {
             storageUploadLifetimeTests(device, recorder, std::string_view(argv[1]) == "--storage-upload-failure-only");
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--tiled-resolve-only") {
+            if ((device.GetContext().limits.framebufferColorSampleCounts & VK_SAMPLE_COUNT_4_BIT) == 0 || !device.Graphics()) {
+                std::cout << "skipped, the device lacks 4x color targets or a graphics queue\n";
+                return 77;
+            }
+            tiledResolveTests(device, recorder);
+            std::cout << "CB resolves into tiled targets tests passed\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--cube-only") {
             singleCubeTests(device, recorder);
             std::cout << "Single cube snapshot and storage sampling tests passed\n";
@@ -8308,6 +8444,19 @@ int main(int argc, char** argv) {
             std::cout << "Pending DCC key store tests passed\n";
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--sample-dumps-only") {
+            if (device.GetContext().hostImportAlignment == 0) {
+                std::cout << "skipped, host imports are unavailable\n";
+                return 77;
+            }
+            if (!device.GetContext().bufferDeviceAddress) {
+                std::cout << "skipped, the device lacks buffer device addresses\n";
+                return 77;
+            }
+            sampleDumpTests(device, recorder);
+            std::cout << "Occlusion counter dump tests passed\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--shadowed-key-stores-only") {
             if (!shadowedKeyStoreTests(device, recorder)) {
                 std::cout << "skipped, the device imports no watched host memory under a unit shadow\n";
@@ -8379,6 +8528,7 @@ int main(int argc, char** argv) {
         readWrittenStagingTests(device, recorder);
         depthSurfaceProofTests(device, recorder);
         multisampleGuestAccessTests(device, recorder);
+        tiledResolveTests(device, recorder);
         fmaskDecompressMsaaTests(device, recorder);
         misalignedSnapshotTests(device, recorder);
         misalignedRegionTests(device, recorder);

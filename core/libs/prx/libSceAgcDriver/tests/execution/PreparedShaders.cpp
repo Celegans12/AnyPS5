@@ -103,11 +103,13 @@ void RegisteredMemoryCensus(const std::shared_ptr<const ShaderRecompiler::Source
     std::vector<std::uint32_t> words{1u, 2u, 3u};
     words.reserve(128u);
     raw->artifact.spirv = std::move(words);
-    auto cold = std::make_shared<ShaderRecompiler::CompiledVariant>();
-    cold->artifact.spirv = std::vector<std::uint32_t>(16u * 1024u, 0u);
-    Require(cold->artifact.spirv.TryMakeCold(), "census fixture could not make storage cold");
-    const auto rawBefore = raw->artifact.spirv.InspectStorage();
-    const auto coldBefore = cold->artifact.spirv.InspectStorage();
+    const auto backing = std::make_shared<const std::vector<std::uint32_t>>(16u * 1024u, 0u);
+    auto mapped = std::make_shared<ShaderRecompiler::CompiledVariant>();
+    mapped->artifact.spirv = ShaderRecompiler::SharedSpirv(backing, std::span<const std::uint32_t>(*backing));
+    Require(mapped->artifact.spirv.Mapped() && mapped->artifact.spirv.HeapBytes() == 0u && !raw->artifact.spirv.Mapped(), "census fixture storage kinds are wrong");
+    const auto rawBytes = raw->artifact.spirv.size() * sizeof(std::uint32_t);
+    const auto rawCapacity = raw->artifact.spirv.HeapBytes();
+    const auto mappedBytes = backing->size() * sizeof(std::uint32_t);
     const auto handleFor = [&](const std::shared_ptr<ShaderRecompiler::CompiledVariant>& artifact) {
         auto handle = std::make_shared<ShaderRecompiler::SourceHandle>();
         handle->source = source->source;
@@ -116,14 +118,14 @@ void RegisteredMemoryCensus(const std::shared_ptr<const ShaderRecompiler::Source
     };
     const auto rawHandle = handleFor(raw);
     const auto rawAlias = handleFor(raw);
-    const auto coldHandle = handleFor(cold);
+    const auto mappedHandle = handleFor(mapped);
     auto first = std::make_shared<ShaderSnapshot>(ShaderSnapshot{1u, 11u, 0u, {1u, 2u}, {std::byte{1}}});
     auto second = std::make_shared<ShaderSnapshot>(ShaderSnapshot{1u, 12u, 0u, {1u, 2u}, {std::byte{2}}});
     first->code.reserve(64u);
     first->header.reserve(128u);
     second->code.reserve(32u);
     second->header.reserve(64u);
-    first->prepared->entries = {{0u, rawHandle}, {0u, rawAlias}, {0u, coldHandle}};
+    first->prepared->entries = {{0u, rawHandle}, {0u, rawAlias}, {0u, mappedHandle}};
     second->prepared->entries = {{0u, rawHandle}, {0u, nullptr}};
     second->prepared->pending = true;
     second->prepared->failure = std::make_exception_ptr(std::runtime_error("census fixture"));
@@ -132,26 +134,20 @@ void RegisteredMemoryCensus(const std::shared_ptr<const ShaderRecompiler::Source
     const auto census = InspectRegisteredShaderMemory(registry);
     Require(census.registryEntries == 3u && census.snapshots == 2u && census.pending == 1u && census.failed == 1u, "census lost registration status or counted an aliased snapshot twice");
     Require(census.entryReferences == 5u && census.handles == 3u && census.sources == 1u && census.artifacts == 2u && census.missingArtifacts == 1u && census.excludedRectangles == 1u, "census did not deduplicate shared source/artifact owners or disclose omitted records");
-    Require(census.rawArtifacts == 1u && census.coldArtifacts == 1u && census.exposedArtifacts == 0u, "census storage state counts are wrong");
-    Require(census.logicalBytes == rawBefore.logicalBytes + coldBefore.logicalBytes && census.rawBytes == rawBefore.residentBytes && census.rawCapacityBytes == rawBefore.residentCapacityBytes && census.coldBytes == coldBefore.coldBytes && census.coldCapacityBytes == coldBefore.coldCapacityBytes, "census conflated logical bytes, backing size or capacity");
+    Require(census.rawArtifacts == 1u && census.cacheArtifacts == 1u, "census storage state counts are wrong");
+    Require(census.logicalBytes == rawBytes + mappedBytes && census.rawBytes == rawBytes && census.rawCapacityBytes == rawCapacity && census.cacheBytes == mappedBytes, "census conflated logical bytes, heap capacity or mapped bytes");
     Require(census.rawCapacityBytes > census.rawBytes && census.codeBytes == 4u * sizeof(std::uint32_t) && census.codeCapacityBytes == (first->code.capacity() + second->code.capacity()) * sizeof(std::uint32_t) && census.headerBytes == 2u && census.headerCapacityBytes == first->header.capacity() + second->header.capacity(), "census registry capacity accounting is wrong");
     Require(InspectRegisteredShaderMemory(registry) == census, "repeated census changed the sampled storage");
-    const auto coldAfter = cold->artifact.spirv.InspectStorage();
-    Require(coldAfter.residentBytes == 0u && coldAfter.coldBytes == coldBefore.coldBytes && coldAfter.coldCapacityBytes == coldBefore.coldCapacityBytes && !coldAfter.exposed, "census hydrated or exposed cold storage");
+    Require(mapped->artifact.spirv.Mapped() && mapped->artifact.spirv.HeapBytes() == 0u, "census copied mapped SPIR-V to the heap");
 
-    // DEBUG: distinct artifact objects can alias the same backing. This upper-bound fixture
-    // verifies why the diagnostic must not call its artifact-deduplicated sum physical memory.
-    const auto backingAlias = std::make_shared<ShaderRecompiler::CompiledVariant>(*cold);
-    first->prepared->entries.push_back({0u, handleFor(backingAlias)});
+    const auto mappedAlias = std::make_shared<ShaderRecompiler::CompiledVariant>(*mapped);
+    first->prepared->entries.push_back({0u, handleFor(mappedAlias)});
     const auto aliased = InspectRegisteredShaderMemory(registry);
-    Require(aliased.artifacts == 3u && aliased.sources == 1u && aliased.coldArtifacts == 2u && aliased.coldBytes == 2u * coldBefore.coldBytes, "census hid the distinct-artifact shared-backing limit");
-    const ShaderRecompiler::SharedSpirv& explicitRead = cold->artifact.spirv;
-    Require(explicitRead.Words().size() == 16u * 1024u, "census fixture hydration lost words");
-    const auto hydrated = cold->artifact.spirv.InspectStorage();
-    const auto exposed = InspectRegisteredShaderMemory(registry);
-    Require(exposed.coldArtifacts == 0u && exposed.coldBytes == 0u && exposed.coldCapacityBytes == 0u && exposed.rawArtifacts == 3u && exposed.exposedArtifacts == 2u, "census reports publication-time storage instead of current exposed storage");
-    Require(exposed.rawBytes == rawBefore.residentBytes + 2u * hydrated.residentBytes && exposed.rawCapacityBytes == rawBefore.residentCapacityBytes + 2u * hydrated.residentCapacityBytes, "census current raw backing totals are wrong");
-    std::cout << "registered shader memory census preserves cold storage and deduplicates artifact references\n";
+    Require(aliased.artifacts == 3u && aliased.sources == 1u && aliased.cacheArtifacts == 2u && aliased.cacheBytes == 2u * mappedBytes, "census hid the distinct-artifact shared-mapping limit");
+    static_cast<void>(mappedAlias->artifact.spirv.data());
+    const auto written = InspectRegisteredShaderMemory(registry);
+    Require(written.cacheArtifacts == 1u && written.rawArtifacts == 2u && written.rawBytes == rawBytes + mappedBytes && written.rawCapacityBytes == rawCapacity + mappedAlias->artifact.spirv.HeapBytes(), "census reports mapped storage for a module copied on write");
+    std::cout << "registered shader memory census reports mapped SPIR-V and deduplicates artifact references\n";
 }
 
 void Run(AgcDriver::VulkanDevice& device) {

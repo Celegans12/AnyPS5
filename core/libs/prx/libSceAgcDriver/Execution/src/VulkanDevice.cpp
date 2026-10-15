@@ -2111,6 +2111,8 @@ bool VulkanDevice::AfterRecordedWork(std::function<void()> action, bool reapFirs
 }
 
 bool VulkanDevice::DumpSamplesOnGpu(std::uint64_t address) {
+    static const bool syncDumps = std::getenv("APS5_SYNC_SAMPLE_DUMPS") != nullptr || std::getenv("APS5_NO_GPU_SAMPLE_DUMPS") != nullptr;
+    if (syncDumps) return false;
     if (!state->recorder) return false;
     auto& recorder = *state->recorder;
     constexpr std::size_t bytes = Pm4::SampleDumpBytes;

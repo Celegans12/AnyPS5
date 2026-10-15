@@ -476,10 +476,10 @@ bool Replay(const char* path, std::unique_ptr<AgcDriver::VulkanDevice>& device) 
         if (g_prepareOnly) {
             const auto prepared = ShaderRecompiler::PrepareShader(request.request);
             if (!prepared) throw std::runtime_error("prepared shader handle is absent");
-            const auto words = ShaderRecompiler::GetPreparedArtifact(*prepared).spirv.ReadTransient();
-            if (!words || words->empty()) throw std::runtime_error("prepared shader has no SPIR-V");
-            std::printf("  prepared only: %zu SPIR-V words; runtime memory not materialized\n", words->size());
-            InspectSpirv(path, *words);
+            const auto words = ShaderRecompiler::GetPreparedArtifact(*prepared).spirv.Words();
+            if (words.empty()) throw std::runtime_error("prepared shader has no SPIR-V");
+            std::printf("  prepared only: %zu SPIR-V words; runtime memory not materialized\n", words.size());
+            InspectSpirv(path, words);
             return true;
         }
         if (g_variants) {
@@ -510,9 +510,7 @@ bool Replay(const char* path, std::unique_ptr<AgcDriver::VulkanDevice>& device) 
         const auto& result = *materialized;
         {
             AgcDriver::PipelineFingerprintDetail::Fnv spirvHash;
-            if (const auto words = result.spirv.ReadTransient()) {
-                for (const auto word : *words) spirvHash.Mix(word);
-            }
+            for (const auto word : result.spirv.Words()) spirvHash.Mix(word);
             std::printf("  spirv hash %016llx specialization %016llx\n", static_cast<unsigned long long>(spirvHash.hash), static_cast<unsigned long long>(result.PipelineVariantId()));
         }
         std::printf("  recompiled: %zu SPIR-V words%s\n", result.spirv.size(), !g_pipelineOnly ? "" : pipelineSidecar.probes.empty() ? " (prepared invocation, page-granular accessibility)" : " (prepared invocation, the game's recorded probes)");

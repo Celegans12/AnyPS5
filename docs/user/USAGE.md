@@ -118,9 +118,10 @@ On Linux, when the Vulkan driver imports dma-buf memory (not the NVIDIA propriet
 Linux:
 
 ```sh
-chmod +x app.elf
 ./app.elf
 ```
+
+The relinker writes `app.elf` and each `Executable file:` it lists with execute permission. A copy that lost its file mode, such as a browser download, needs `chmod +x` on each of them first; without it a title that starts another executable stops with `sceSystemServiceLoadExec: execv failed: Permission denied`.
 
 Windows PowerShell:
 
@@ -143,7 +144,7 @@ python3 tools/pad_input.py /tmp/anyps5-pad release --left-stick 128 0 --hold-ms 
 python3 tools/pad_input.py /tmp/anyps5-pad cross --left-stick 255 128 --right-stick 0 128
 ```
 
-Run the helper in a second terminal. Commands are polled at most every 100 ms during controller reads, and their buttons add to physical controller input. A press lasts 300 ms by default, starting when the application reads it, and releases automatically; `--hold-ms` accepts 1–5000 ms. `--left-stick X Y` and `--right-stick X Y` hold the sticks for the same time: each axis is 0-255, 128 is the centre, X grows to the right and Y grows downward. While such a command is active both sticks come from it instead of the physical controller, and a stick that was not named stays centred. Wait for the application to observe a release before sending another press. The file holds only the latest command; rapid commands can replace one another. Commands left over when the application first reads the controller are ignored. Without the environment variable, file input is disabled.
+Run the helper in a second terminal. Commands are polled at most every 100 ms during controller reads, and their buttons add to physical controller input. A press lasts 300 ms by default, starting when the application reads it, and releases automatically; `--hold-ms` accepts 1–5000 ms. `--left-stick X Y` and `--right-stick X Y` hold the sticks for the same time: each axis is 0-255, 128 is the centre, X grows to the right and Y grows downward. While such a command is active both sticks come from it instead of the physical controller, and a stick that was not named stays centred. Wait for the application to observe a release before sending another press. The file holds only the latest command; rapid commands can replace one another. On POSIX, replacing an existing command file retains its permission mode; a privileged helper also retains its owner and group so the game user can still read it. Commands left over when the application first reads the controller are ignored. Without the environment variable, file input is disabled.
 
 ### System fonts
 

@@ -7,7 +7,6 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <filesystem>
 #include <initializer_list>
 #include <memory>
 #include <optional>
@@ -131,6 +130,21 @@ struct ColorTargetBlend {
     bool operator==(const ColorTargetBlend&) const = default;
 };
 
+namespace ReversedBlendCode {
+
+inline constexpr std::uint32_t Enable = 1u;
+inline constexpr std::uint32_t ColorShift = 8u;
+inline constexpr std::uint32_t SecondShift = 16u;
+inline constexpr std::uint32_t RouteBits = 2u;
+inline constexpr std::uint32_t RouteMask = 3u;
+inline constexpr std::uint32_t Routes = 0xffu;
+inline constexpr std::uint32_t Own = 0u;
+inline constexpr std::uint32_t Component0 = 1u;
+inline constexpr std::uint32_t Zero = 2u;
+inline constexpr std::uint32_t One = 3u;
+
+}
+
 struct ShaderPixelStageInfo {
     std::uint32_t interpolatorCount;
     std::array<std::uint32_t, 32> interpolatorSettings;
@@ -167,6 +181,7 @@ struct ShaderPixelStageInfo {
     std::uint8_t quadPixelMask = 0xf;
     std::array<std::uint16_t, 4> quadSampleMask{0xffffu, 0xffffu, 0xffffu, 0xffffu};
     std::array<ColorTargetBlend, 8> targetBlend;
+    std::uint32_t reversedBlend = 0;
 };
 
 struct ShaderVertexBufferResource {
@@ -445,6 +460,7 @@ struct FragmentParameter {
     bool perVertex;
     bool custom = false;
     bool flatP10 = false;
+    bool vertexOrder = false;
 };
 
 struct BarycentricEmulation {
@@ -470,54 +486,47 @@ struct BarycentricEmulationLayout {
 // reference, or the per-dispatch copy this class removes comes back without a compiler hint.
 class SharedSpirv {
 public:
-    struct StorageInfo {
-        std::size_t logicalBytes = 0;
-        std::size_t residentBytes = 0;
-        std::size_t residentCapacityBytes = 0;
-        std::size_t coldBytes = 0;
-        std::size_t coldCapacityBytes = 0;
-        std::size_t fileBytes = 0;
-        std::size_t cacheBytes = 0;
-        bool exposed = false;
-        bool eligible = false;
-    };
-
     SharedSpirv() = default;
-    SharedSpirv(std::vector<std::uint32_t> words);
-    SharedSpirv& operator=(std::vector<std::uint32_t> other);
+    SharedSpirv(std::vector<std::uint32_t> words) : words(std::make_shared<std::vector<std::uint32_t>>(std::move(words))) {}
+    SharedSpirv(std::shared_ptr<const void> owner, std::span<const std::uint32_t> view) : owner(std::move(owner)), view(view) {}
+    SharedSpirv& operator=(std::vector<std::uint32_t> other) {
+        words = std::make_shared<std::vector<std::uint32_t>>(std::move(other));
+        owner.reset();
+        view = {};
+        return *this;
+    }
 
-    [[nodiscard]] const std::vector<std::uint32_t>& Words() const;
-    [[nodiscard]] std::shared_ptr<const std::vector<std::uint32_t>> ReadTransient() const;
-    [[nodiscard]] std::vector<std::uint32_t> Copy() const { return *ReadTransient(); }
-    [[nodiscard]] bool TryMakeCold() noexcept;
-    [[nodiscard]] bool TryUseCacheFile(const std::filesystem::path& path, std::uint64_t spirvOffset,
-                                       std::span<const std::byte> verifiedEntry) const noexcept;
-    [[nodiscard]] std::size_t ColdBytes() const;
-    [[nodiscard]] StorageInfo InspectStorage() const;
-    operator const std::vector<std::uint32_t>&() const { return Words(); }
-    [[nodiscard]] std::size_t size() const;
-    [[nodiscard]] bool empty() const { return size() == 0; }
+    [[nodiscard]] std::span<const std::uint32_t> Words() const { return words ? std::span<const std::uint32_t>(*words) : view; }
+    [[nodiscard]] std::vector<std::uint32_t> Copy() const { return {Words().begin(), Words().end()}; }
+    [[nodiscard]] std::size_t size() const { return Words().size(); }
+    [[nodiscard]] bool empty() const { return Words().empty(); }
+    [[nodiscard]] bool Mapped() const { return words == nullptr && owner != nullptr; }
+    [[nodiscard]] std::size_t HeapBytes() const { return words != nullptr ? words->capacity() * sizeof(std::uint32_t) : 0; }
     [[nodiscard]] const std::uint32_t* data() const { return Words().data(); }
     [[nodiscard]] std::uint32_t* data() { return Mutable().data(); }
     [[nodiscard]] const std::uint32_t& operator[](std::size_t index) const { return Words()[index]; }
     [[nodiscard]] std::uint32_t& operator[](std::size_t index) { return Mutable()[index]; }
-    [[nodiscard]] std::vector<std::uint32_t>::const_iterator begin() const { return Words().begin(); }
-    [[nodiscard]] std::vector<std::uint32_t>::const_iterator end() const { return Words().end(); }
+    [[nodiscard]] std::span<const std::uint32_t>::iterator begin() const { return Words().begin(); }
+    [[nodiscard]] std::span<const std::uint32_t>::iterator end() const { return Words().end(); }
     [[nodiscard]] std::vector<std::uint32_t>::iterator begin() { return Mutable().begin(); }
     [[nodiscard]] std::vector<std::uint32_t>::iterator end() { return Mutable().end(); }
     void resize(std::size_t count) { Mutable().resize(count); }
-    std::vector<std::uint32_t>::iterator insert(std::vector<std::uint32_t>::const_iterator where, std::initializer_list<std::uint32_t> values);
-    friend bool operator==(const SharedSpirv& left, const SharedSpirv& right) { return left.storage == right.storage || left.Words() == right.Words(); }
+    std::vector<std::uint32_t>::iterator insert(std::vector<std::uint32_t>::const_iterator where, std::initializer_list<std::uint32_t> values) { return Mutable().insert(where, values); }
+    friend bool operator==(const SharedSpirv& left, const SharedSpirv& right) { return std::ranges::equal(left.Words(), right.Words()); }
 
 private:
-    static const std::vector<std::uint32_t>& Empty() {
-        static const std::vector<std::uint32_t> empty;
-        return empty;
+    std::vector<std::uint32_t>& Mutable() {
+        if (words == nullptr || words.use_count() != 1) {
+            words = std::make_shared<std::vector<std::uint32_t>>(Copy());
+            owner.reset();
+            view = {};
+        }
+        return *words;
     }
-    std::vector<std::uint32_t>& Mutable();
 
-    struct Storage;
-    std::shared_ptr<Storage> storage;
+    std::shared_ptr<std::vector<std::uint32_t>> words;
+    std::shared_ptr<const void> owner;
+    std::span<const std::uint32_t> view;
 };
 
 struct VertexInput {

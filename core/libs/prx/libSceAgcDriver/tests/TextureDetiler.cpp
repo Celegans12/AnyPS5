@@ -1,5 +1,7 @@
 #include "GraphicsTests.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include <cstring>
 #include <string>
@@ -186,7 +188,23 @@ void RunTextureDetilerTests(const Context& context, const TextureDetilerTestAcce
 
     {
         const auto pools = access.descriptorPoolCount();
+        const auto resets = access.descriptorPoolResets();
         for (int dispatch = 0; dispatch < 3 * 64; ++dispatch) detiler.Dispatch(commands, TextureTileMode::kStandard4KB, 4, source, 0, destination, 0, makeLayout(8, 8, 32, 2, 32, 32), 0);
+        Require(access.descriptorPoolResets() == resets, "a descriptor pool was reset with no recorder to tell that its sets were no longer recorded");
+        Require(access.descriptorPoolCount() >= pools + 2, "full descriptor pools with no recorder must be joined by new pools");
+    }
+
+    {
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        Recorder recorder(context);
+        recorder.Activate();
+        std::size_t pools = 0;
+        for (int batch = 0; batch < 4; ++batch) {
+            const auto batchCommands = recorder.Commands();
+            for (int dispatch = 0; dispatch < 64; ++dispatch) detiler.Dispatch(batchCommands, TextureTileMode::kStandard4KB, 4, source, 0, destination, 0, makeLayout(8, 8, 32, 2, 32, 32), 0);
+            recorder.Sync();
+            if (batch == 0) pools = access.descriptorPoolCount();
+        }
         Require(access.descriptorPoolCount() == pools, "a full descriptor pool whose batches completed must be reset and reused, not joined by a new pool");
     }
 

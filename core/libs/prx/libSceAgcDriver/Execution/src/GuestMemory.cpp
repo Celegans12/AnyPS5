@@ -883,6 +883,20 @@ struct WriteTracker {
         std::uint32_t dropped = 0;
         std::uint32_t next = 0;
         std::array<DriverPiece, 4> pieces{};
+
+        bool covers(std::uint32_t begin, std::uint32_t end, std::uint64_t generation) const {
+            if (generation == 0 || begin >= end || dropped > generation) return false;
+            if (whole > generation) return true;
+            while (begin < end) {
+                auto covered = begin;
+                for (const auto& piece : pieces) {
+                    if (piece.generation > generation && piece.begin <= begin && piece.end > covered) covered = piece.end;
+                }
+                if (covered == begin) return false;
+                begin = covered;
+            }
+            return true;
+        }
     };
     std::unordered_map<std::uint64_t, DriverPieces> driverPieces;
 
@@ -909,10 +923,9 @@ struct WriteTracker {
         const auto from = static_cast<std::uint32_t>(std::max(address, begin) - begin);
         const auto to = static_cast<std::uint32_t>(std::min<std::uint64_t>(end, begin + WriteBlockBytes) - begin);
         if (from == 0 && to == WriteBlockBytes) {
-            if (const auto found = driverPieces.find(block); found != driverPieces.end()) {
-                found->second = DriverPieces{};
-                found->second.whole = stampGeneration;
-            }
+            auto& entry = driverPieces[block];
+            entry = DriverPieces{};
+            entry.whole = stampGeneration;
             return;
         }
         auto& entry = driverPieces[block];
@@ -1070,6 +1083,26 @@ struct ThreadCollectMemo {
 };
 thread_local ThreadCollectMemo threadCollectMemo;
 
+struct EpochCollectMap {
+    std::uint64_t epoch = 0;
+    std::unordered_map<std::uintptr_t, WriteTracker::Memo> ranges;
+};
+
+EpochCollectMap& epochCollectMap(std::uint64_t epoch) {
+    thread_local EpochCollectMap* slot = nullptr;
+    auto& map = ShaderRecompiler::ThreadOwned(slot);
+    if (map.epoch != epoch) {
+        map.ranges.clear();
+        map.epoch = epoch;
+    }
+    return map;
+}
+
+bool epochCollectMapEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_EPOCH_COLLECT_MAP") == nullptr;
+    return enabled;
+}
+
 bool sharedCollectMemo() {
     static const bool shared = std::getenv("APS5_SHARED_COLLECT_MEMO") != nullptr;
     return shared;
@@ -1155,6 +1188,13 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     if (useMemo && !sharedCollectMemo()) {
         // An entry exists only for a completed walk of an in-arena range, so the tracker is
         // initialized and watched; nothing below the lock needs asking.
+        if (epochCollectMapEnabled()) {
+            const auto& map = epochCollectMap(epoch);
+            if (const auto found = map.ranges.find(first); found != map.ranges.end() && found->second.unwatched == unwatched && stop <= found->second.end) {
+                collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+                return tracker.generation.load(std::memory_order_relaxed);
+            }
+        }
         for (const auto& entry : threadCollectMemo.entries) {
             if (entry.epoch == epoch && entry.unwatched == unwatched && entry.begin <= first && stop <= entry.end) {
                 // The current generation, not the memoized one: blocks stamped since (MarkWritten, an
@@ -1193,7 +1233,13 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     if (collectMemoEnabled()) {
         const auto serial = unwatchSerial.load(std::memory_order_relaxed);
         if (sharedCollectMemo()) tracker.memo[tracker.nextMemo++ % tracker.memo.size()] = {first, stop, epoch, serial};
-        else threadCollectMemo.entries[threadCollectMemo.next++ % threadCollectMemo.entries.size()] = {first, stop, epoch, serial};
+        else {
+            threadCollectMemo.entries[threadCollectMemo.next++ % threadCollectMemo.entries.size()] = {first, stop, epoch, serial};
+            if (epochCollectMapEnabled()) {
+                auto& entry = epochCollectMap(epoch).ranges[first];
+                if (entry.unwatched != serial || entry.end < stop) entry = {first, stop, epoch, serial};
+            }
+        }
     }
     return tracker.generation;
 }
@@ -1234,7 +1280,21 @@ namespace {
 std::atomic<void (*)(std::uint64_t, std::size_t)> unwatchHook{nullptr};
 
 void beforeUnwatch(std::uint64_t address, std::size_t bytes) {
-    if (const auto hook = unwatchHook.load(std::memory_order_acquire)) hook(address, bytes);
+    const auto hook = unwatchHook.load(std::memory_order_acquire);
+    if (hook == nullptr) return;
+#ifdef _WIN32
+    std::uint64_t begin = 0;
+    std::uint64_t end = 0;
+    {
+        auto& tracker = Tracker();
+        const auto lock = lockTracker(tracker);
+        tracker.initialize();
+        if (!tracker.watched || !tracker.coverage.ExcludedSpan(address, bytes, &begin, &end)) return;
+    }
+    hook(begin, static_cast<std::size_t>(end - begin));
+#else
+    hook(address, bytes);
+#endif
 }
 
 void unwatchLocked(WriteTracker& tracker, std::uint64_t address, std::size_t bytes) {
@@ -1494,6 +1554,33 @@ bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generati
         }
     }
     return false;
+}
+
+bool StoredAllSince_nid_no_patch(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
+    if (generation == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
+    auto& tracker = Tracker();
+    const auto lock = lockTracker(tracker);
+    tracker.initialize();
+    if (!tracker.watched || !tracker.covers(address, bytes)) return false;
+    const auto end = address + bytes;
+    if (!tracker.unstampedStores.empty()) {
+        const auto first = address / WriteBlockBytes;
+        const auto last = (end - 1u) / WriteBlockBytes;
+        if (last - first >= WriteTracker::UnstampedSlots) {
+            if (std::ranges::any_of(tracker.unstampedStores, [&](auto stamp) { return stamp > generation; })) return false;
+        } else {
+            for (auto block = first; block <= last; ++block) if (tracker.unstampedStores[block % WriteTracker::UnstampedSlots] > generation) return false;
+        }
+    }
+    for (auto block = tracker.blockOf(address); block <= tracker.blockOf(end - 1u); ++block) {
+        const auto found = tracker.driverPieces.find(block);
+        if (found == tracker.driverPieces.end()) return false;
+        const auto start = tracker.blockBegin(block);
+        const auto from = static_cast<std::uint32_t>(std::max(address, start) - start);
+        const auto to = static_cast<std::uint32_t>(std::min<std::uint64_t>(end, start + WriteBlockBytes) - start);
+        if (!found->second.covers(from, to, generation)) return false;
+    }
+    return true;
 }
 
 std::uint64_t TrackerGeneration() {

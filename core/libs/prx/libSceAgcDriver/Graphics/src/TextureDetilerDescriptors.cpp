@@ -26,7 +26,7 @@ VkDescriptorSet TextureDetiler::allocateFrom(DescriptorRing& ring, VkDescriptorS
     constexpr std::uint32_t setsPerPool = 64;
     const auto* recorder = Recorder::Active();
     if (ring.pools.empty() || ring.used == setsPerPool) {
-        const auto completed = recorder != nullptr ? recorder->CompletedThrough() : std::numeric_limits<std::uint64_t>::max();
+        const auto completed = recorder != nullptr ? recorder->CompletedThrough() : 0;
         auto next = ring.pools.size();
         for (std::size_t step = 1; step <= ring.pools.size(); ++step) {
             const auto index = (ring.current + step) % ring.pools.size();
@@ -59,7 +59,7 @@ VkDescriptorSet TextureDetiler::allocateFrom(DescriptorRing& ring, VkDescriptorS
     VkDescriptorSet set = VK_NULL_HANDLE;
     Check(context.Function<PFN_vkAllocateDescriptorSets>("vkAllocateDescriptorSets")(context.device, &allocation, &set), allocateWhat);
     ++ring.used;
-    ring.serials[ring.current] = recorder != nullptr ? recorder->OpenSerial() : 0;
+    ring.serials[ring.current] = recorder != nullptr ? recorder->OpenSerial() : std::numeric_limits<std::uint64_t>::max();
     return set;
 }
 

@@ -1467,7 +1467,13 @@ struct SaveDataSearchInfo {
     std::uint8_t reserved[32];
 };
 static_assert(sizeof(SaveDataSearchInfo) == 48);
-struct SaveDataMemoryData { void* buf; std::size_t buf_size; std::size_t offset; };
+struct SaveDataMemoryData {
+    void* buf;
+    std::size_t buf_size;
+    std::size_t offset;
+    std::uint8_t reserved[40];
+};
+static_assert(sizeof(SaveDataMemoryData) == 64);
 
 struct SaveDataMount3 {
     int user_id;
