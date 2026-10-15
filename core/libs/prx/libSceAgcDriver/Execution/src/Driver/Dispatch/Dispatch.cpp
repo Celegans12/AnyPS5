@@ -278,6 +278,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
         cached = ahead.cached;
         validated = ahead.validated;
         ++groupStats.adopted;
+        ++dispatchesAdoptedAhead;
         const auto age = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ahead.resolvedAt).count();
         groupStats.ageMs += age;
         groupStats.ageMaxMs = std::max(groupStats.ageMaxMs, age);
