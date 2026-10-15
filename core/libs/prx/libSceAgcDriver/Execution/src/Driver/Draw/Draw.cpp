@@ -280,7 +280,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     const auto relocatedDecode = decode;
     if (!userPatches.empty()) {
         std::lock_guard cacheLock(drawCacheMutex);
-        if (drawHit) {
+        if (drawHit || verifyHit) {
             ++drawRelocationCounters.hits;
             ++drawRelocationTrials[drawIdentity].hits;
         }
