@@ -229,6 +229,38 @@ void CheckTwoLaneShuffle() {
     }
 }
 
+void CheckTwoLaneBallot(std::uint32_t lowMask, std::uint32_t highMask, bool uniform) {
+    IrProgram program;
+    program.SetWaveSize(64);
+    SpirvEmitterState state(program, {});
+    SpirvValueEmitContext low(state);
+    SpirvValueEmitContext high(state);
+    low.otherHalf = &high;
+    high.otherHalf = &low;
+    high.half = 1u;
+    IrValue predicate(IrOpcode::GetExec, IrType::Bool, 1);
+    if (uniform) predicate.SetImmediateBool(true);
+    const auto lowPredicate = low.Def(&predicate);
+    const auto highPredicate = high.Def(&predicate);
+    const auto ballot = high.Ballot(&predicate);
+    Subgroup subgroup(32);
+    Lanes lowLanes(32), highLanes(32);
+    for (std::uint32_t lane = 0; lane < 32; ++lane) {
+        lowLanes[lane][0] = (lowMask >> lane) & 1u;
+        highLanes[lane][0] = (highMask >> lane) & 1u;
+    }
+    if (!uniform) {
+        subgroup.Set(lowPredicate, lowLanes);
+        subgroup.Set(highPredicate, highLanes);
+    }
+    const auto code = state.module.Finalize();
+    subgroup.Execute(code);
+    Require(CountOpcode(code, spv::OpGroupNonUniformBallot) == (uniform ? 1u : 2u), "a wave64 ballot of one predicate for both halves was not issued once");
+    for (std::uint32_t lane = 0; lane < 32; ++lane) {
+        Require(subgroup.Get(ballot)[lane] == Value{lowMask, highMask, 0, 0}, "wave64 ballot halves mixed up");
+    }
+}
+
 }
 
 int main() {
@@ -239,6 +271,9 @@ int main() {
             }
         }
         CheckTwoLaneShuffle();
+        CheckTwoLaneBallot(0xffffffffu, 0xffffffffu, true);
+        CheckTwoLaneBallot(0x12345678u, 0xfedcba98u, false);
+        CheckTwoLaneBallot(0u, 0xffffffffu, false);
         std::puts("wave32 wide subgroup tests passed");
         return 0;
     } catch (const std::exception& error) {
