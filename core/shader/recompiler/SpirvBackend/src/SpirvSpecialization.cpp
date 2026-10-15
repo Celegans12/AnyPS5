@@ -697,7 +697,14 @@ private:
             const auto bits = type.width == 32u ? *result : *result & ((1u << type.width) - 1u);
             values[instruction[2]] = bits;
             const auto [existing, created] = canonical.emplace(std::pair{instruction[1], bits}, instruction[2]);
-            if (!created) aliases.emplace(instruction[2], existing->second);
+            if (op == spv::OpCopyObject) {
+                const auto* source = aliases.find(instruction[3]);
+                const auto target = source != nullptr ? *source : instruction[3];
+                aliases.emplace(instruction[2], target);
+                if (created) existing->second = target;
+            } else if (!created) {
+                aliases.emplace(instruction[2], existing->second);
+            }
             constants.push_back(type.boolean ? Make(bits != 0u ? spv::OpConstantTrue : spv::OpConstantFalse, {instruction[1], instruction[2]}) : Make(spv::OpConstant, {instruction[1], instruction[2], bits}));
             instruction.clear();
             changed = true;
