@@ -2107,7 +2107,7 @@ void verifyImageTableColumnMemo() {
     };
     for (const auto index : {0u, 1u, 2u, 125u, 126u, 127u, 253u, 254u, 255u}) place(index, image(index));
     const std::array<std::uint32_t, 2> pointerUserData{static_cast<std::uint32_t>(base), static_cast<std::uint32_t>(base >> 32u)};
-    const std::vector<std::uint32_t> pointerCode{0xf4080200u, 0xfa000000u, 0xf4080700u, 0xfa000010u, 0xf4080800u, 0xfa000020u, 0x7e200500u, 0x8f108210u,
+    const std::vector<std::uint32_t> pointerCode{0xbf800000u, 0xf4080200u, 0xfa000000u, 0xf4080700u, 0xfa000010u, 0xf4080800u, 0xfa000020u, 0x7e200500u, 0x8f108210u,
         0xf4200444u, 0x20000000u, 0x8711ff11u, 0x000000ffu, 0x8f128511u, 0xf40c0900u, 0x24000040u, 0xf09c0f08u, 0x01090000u, 0xe0700000u, 0x80070000u, 0xbf810000u};
     const auto pointerRequest = TableRequest(pointerCode, pointerUserData);
     const auto first = CompileTableCounted(pointerRequest, TableMemoUse::Miss, "image table column memo: a pointer column seen for the first time was not a miss");
