@@ -252,8 +252,8 @@ Outcome RunSecondStore(const char* name) {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
         while (true) {
             hold.lock();
-            const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> range{{{address, address + SurfaceBytes}}};
-            if (StorageTexture::FindLive(address, SurfaceBytes) != nullptr && StorageTexture::AnyPendingOverlaps(range)) return true;
+            const auto image = StorageTexture::FindLive(address, SurfaceBytes);
+            if (image != nullptr && StorageTexture::FindPending(address, SurfaceBytes) == image) return true;
             hold.unlock();
             if (Holds(surface.Texels(), result)) return false;
             Require(std::chrono::steady_clock::now() < deadline, "store over untracked: the result neither became pending nor reached guest memory");
