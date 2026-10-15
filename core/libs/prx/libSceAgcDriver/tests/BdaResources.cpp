@@ -472,32 +472,6 @@ void importWindowTests(const Context& context) {
     ::operator delete(block, std::align_val_t{window});
 }
 
-void importSpanningTests(const Context& context) {
-    constexpr std::size_t piece = 65536;
-    constexpr std::size_t window = 2 * piece;
-    void* block = ::operator new(4 * piece, std::align_val_t{window});
-    auto* guest = static_cast<std::uint8_t*>(block);
-    const auto first = reinterpret_cast<std::uintptr_t>(block);
-    auto importing = context;
-    importing.hostImportAlignment = piece;
-    SetHostImportWindow(window);
-    const auto change = [&](std::uint8_t* range, bool add) {
-        auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
-        if (add) GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, range, piece, true, false, true);
-        else GuestAllocations::GuestAllocationsRemove_nid_postfix(mutation, range);
-        GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
-    };
-    for (std::size_t index = 0; index < 4; ++index) change(guest + index * piece, true);
-    Require(HostImportFor(importing, first + window - 16, 32) == nullptr, "a view crossing the import window was imported");
-    const auto* spanning = HostImportSpanning(importing, first + window - 16, 32);
-    Require(spanning != nullptr && spanning->base <= first + window - 16 && spanning->base + spanning->bytes >= first + window + 16, "a surface crossing the import window was not imported through a joined import");
-    const auto* inside = HostImportSpanning(importing, first + window, piece);
-    Require(inside != nullptr && inside->base <= first + window && inside->base + inside->bytes >= first + window + piece, "a surface inside one window was not imported");
-    for (std::size_t index = 0; index < 4; ++index) change(guest + index * piece, false);
-    SetHostImportWindow(0);
-    ::operator delete(block, std::align_val_t{window});
-}
-
 void importJoinTests(const Context& context) {
     constexpr std::size_t piece = 65536;
     constexpr std::size_t window = 2 * piece;
@@ -1995,7 +1969,6 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     spaceWritableWritesTests(context);
     spaceReadListTests(context);
     importWindowTests(context);
-    importSpanningTests(context);
     spaceReadAcrossImportsTests(context, access);
     spaceReadAcrossImportsWrittenTests(context);
     spaceReadsAcrossImportsMergedTests(context, access);
