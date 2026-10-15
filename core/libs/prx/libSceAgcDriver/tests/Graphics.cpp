@@ -6713,9 +6713,10 @@ void unorm10_11_11BlendTests() {
     queue.context[0x1e0] = 0x40010504u;
     for (std::uint32_t i = 0; i < 4; ++i) queue.context[0x105 + i] = 0;
     std::vector<AgcDriver::Graphics::RegisterRead> log;
-    AgcDriver::Graphics::RegisterReadLog() = &log;
-    const auto state = AgcDriver::Graphics::DecodeState(queue);
-    AgcDriver::Graphics::RegisterReadLog() = nullptr;
+    const auto state = [&] {
+        const AgcDriver::Graphics::RegisterReadLogScope logScope(&log);
+        return AgcDriver::Graphics::DecodeState(queue);
+    }();
     for (const auto read : log) Require(AgcDriver::Graphics::DrawKeyCovers(read), "DrawKeyRegisters lacks a register the blend decode reads: " + std::to_string(read.offset));
     Require(std::any_of(log.begin(), log.end(), [](const AgcDriver::Graphics::RegisterRead& read) { return read.offset == 0x1d6u; }), "the blend decode did not read SX_BLEND_OPT_EPSILON");
     Require(std::any_of(log.begin(), log.end(), [](const AgcDriver::Graphics::RegisterRead& read) { return read.offset == 0x001u; }), "the blend decode did not read DB_COUNT_CONTROL");
