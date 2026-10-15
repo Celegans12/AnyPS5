@@ -51,6 +51,7 @@ inline constexpr std::uint32_t SamplerAnisoOverride = 1u << 5u;
 inline constexpr std::uint32_t SamplerReduction = 1u << 6u;
 inline constexpr std::uint32_t SamplerExactAtBase = 1u << 7u;
 inline constexpr std::uint32_t SamplerUnnormalized = 1u << 15u;
+inline constexpr std::uint32_t ModeCompareShift = 16u;
 inline constexpr std::uint32_t RuntimeSampler = 1u << 31u;
 
 inline constexpr std::uint32_t HashSeed = 0x9747b28cu;
