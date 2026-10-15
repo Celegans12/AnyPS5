@@ -190,9 +190,19 @@ DeviceBuffer::DeviceBuffer(const Context& context, std::size_t size, VkBufferUsa
                 // held every sampled texture): the overflow type, which the driver may move to
                 // system memory, rather than the build failing.
                 const auto overflow = OverflowMemoryType(context.memory, requirements.memoryTypeBits);
-                if (!overflow || *overflow == allocation.memoryTypeIndex) throw;
-                allocation.memoryTypeIndex = *overflow;
-                memory = cache->AllocateMemory(allocation, "vkAllocateMemory device buffer");
+                const auto system = SystemMemoryType(context.memory, requirements.memoryTypeBits);
+                bool placed = false;
+                for (const auto type : {overflow, system}) {
+                    if (!type || *type == allocation.memoryTypeIndex) continue;
+                    allocation.memoryTypeIndex = *type;
+                    try {
+                        memory = cache->AllocateMemory(allocation, "vkAllocateMemory device buffer");
+                        placed = true;
+                        break;
+                    } catch (const std::runtime_error&) {
+                    }
+                }
+                if (!placed) throw;
                 static std::atomic<std::uint64_t> reports{0};
                 if (reports.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[bufferpool] device buffer of %llu bytes placed in memory type %u outside the device-local heap after: %s\n", static_cast<unsigned long long>(allocation.allocationSize), *overflow, error.what());
             }
