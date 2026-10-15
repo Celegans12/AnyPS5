@@ -534,6 +534,7 @@ private:
         bool depth = false;
         bool valid = false;
         std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> committed;
+        std::array<std::uint64_t, 4> untracked{};
     };
     void captureValidation();
     // A surface of this object the fast proof found a foreign image pending over: the element
@@ -640,6 +641,7 @@ private:
     bool reusable = false;
     std::vector<DirectRegion> directRegions;
     std::vector<ValidatedSurface> validatedTextures;
+    std::vector<std::array<std::uint64_t, 4>> storageUntracked;
     // The pending registry's serial at the last Revalidate that proved this object, taken before
     // its checks and kept only when unchanged after them (0: none): while it is still the serial,
     // no image other than the object's own sources has results pending over its surfaces and
