@@ -70,6 +70,7 @@ struct Expectation {
     std::uint32_t pc = 0;
     std::uint32_t image = 0;
     std::uint32_t mapSampler = NoMapSampler;
+    bool candidate = false;
 
     bool operator==(const Expectation& other) const = default;
 };
