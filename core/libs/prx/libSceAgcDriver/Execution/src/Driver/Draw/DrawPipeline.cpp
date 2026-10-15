@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
+#include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -146,6 +147,7 @@ void DrawPipeline::run() {
     PerformanceTrace::BindThread("draw committer");
     for (;;) {
         Commit* commit = nullptr;
+        SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
         {
             std::unique_lock lock(mutex);
             committerWaiting = true;
@@ -222,6 +224,7 @@ void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
     if (!Busy()) return;
     if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline drain under the GPU lock (reason " + std::to_string(static_cast<unsigned>(reason)) + ", opcode " + std::to_string(opcode) + ")");
     const auto start = std::chrono::steady_clock::now();
+    SpinUntil(HandoffSpinWindow() * 2, [&] { return !Busy(); });
     std::unique_lock lock(mutex);
     ++idleWaiters;
     idle.wait(lock, [&] { return items.empty(); });
