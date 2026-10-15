@@ -192,8 +192,31 @@ void testConstruction() {
 
 }
 
+void testRetain() {
+    DeviceImageKeys keys(64u, 64u);
+    const auto colliding = SameHome(64u, 6u);
+    for (std::uint32_t index = 0; index < colliding.size(); ++index) Expect(keys.Insert(colliding[index], {index + 1u, 0u, 0u}) == DeviceImageKeys::Insertion::Inserted, "a colliding key is inserted");
+    for (std::uint32_t seed = 5000; seed < 5010; ++seed) Expect(keys.Insert(MakeKey(seed), {seed, 1u, 0u}) == DeviceImageKeys::Insertion::Inserted, "a spread key is inserted");
+    static_cast<void>(keys.TakeChanged());
+    const auto dropped = keys.Retain([&](const DeviceImageKeys::Key& key) { return key != colliding[0] && key != colliding[2] && key != MakeKey(5004u); });
+    Expect(dropped == 3u && keys.Entries() == 13u, "Retain drops the keys it is not asked to keep and counts the rest");
+    Expect(!keys.Find(colliding[0]).has_value() && !keys.Find(colliding[2]).has_value() && !keys.Find(MakeKey(5004u)).has_value(), "a dropped key is no longer found");
+    for (std::uint32_t index : {1u, 3u, 4u, 5u}) {
+        const auto found = keys.Find(colliding[index]);
+        Expect(found.has_value() && found->slot == index + 1u, "a kept key behind a dropped one in its probe sequence is still found with its value");
+    }
+    for (std::uint32_t seed = 5000; seed < 5010; ++seed) {
+        if (seed == 5004u) continue;
+        const auto found = keys.Find(MakeKey(seed));
+        Expect(found.has_value() && found->slot == seed, "a kept spread key is found with its value");
+    }
+    Expect(keys.Rebuilt() && keys.TakeChanged().empty(), "Retain rebuilds the table, which uploads it whole");
+    Expect(keys.Retain([](const DeviceImageKeys::Key&) { return true; }) == 0u && keys.Entries() == 13u, "keeping every key drops none");
+}
+
 int main() {
     testHash();
+    testRetain();
     testInsertFind();
     testLayout();
     testCollisions();

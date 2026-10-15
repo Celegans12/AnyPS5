@@ -3,6 +3,7 @@
 
 #include "DeviceImageTableAbi.hpp"
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <span>
 #include <vector>
@@ -30,6 +31,7 @@ public:
     enum class Insertion { Inserted, Updated, Full };
     Insertion Insert(const Key& key, const DeviceImageValue& value);
     void Clear();
+    std::uint32_t Retain(const std::function<bool(const Key&)>& keep);
 
     std::uint32_t Buckets() const { return static_cast<std::uint32_t>(words.size() / ShaderRecompiler::DeviceImageTableAbi::BucketWords); }
     std::uint32_t Entries() const { return entries; }
