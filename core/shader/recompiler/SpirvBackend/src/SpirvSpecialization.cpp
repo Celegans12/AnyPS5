@@ -591,6 +591,7 @@ private:
         if (instruction.size() < 4u) return std::nullopt;
         const auto* type = types.find(instruction[1]);
         if (type == nullptr || type->width > 32u) return std::nullopt;
+        if (op == spv::OpIMul && instruction.size() == 5u && (value(instruction[3]) == 0u || value(instruction[4]) == 0u)) return 0u;
         const auto left = value(instruction[3]);
         if (!left) return std::nullopt;
         if (op == spv::OpCopyObject) return left;
