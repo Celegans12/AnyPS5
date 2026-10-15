@@ -181,14 +181,13 @@ DeviceBuffer::DeviceBuffer(const Context& context, std::size_t size, VkBufferUsa
         allocation.allocationSize = ClassAllocationBytes(requirements, capacity);
         allocationBytes = allocation.allocationSize;
         allocation.memoryTypeIndex = context.DeviceMemoryType(requirements.memoryTypeBits, allocation.allocationSize, "device buffer");
+        const auto deviceType = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        std::uint32_t allocatedType = allocation.memoryTypeIndex;
         {
             const MemoryStats::PoolTierScope tier(MemoryStats::Owner::PoolDevice);
             try {
-                memory = cache->AllocateMemory(allocation, "vkAllocateMemory device buffer");
+                memory = cache->AllocateMemory(allocation, "vkAllocateMemory device buffer", allocation.memoryTypeIndex == deviceType ? context.HostMemoryType(requirements.memoryTypeBits) : std::nullopt, &allocatedType);
             } catch (const std::runtime_error& error) {
-                // The device-local heap is out and nothing could be reclaimed (lean-x21: a build
-                // held every sampled texture): the overflow type, which the driver may move to
-                // system memory, rather than the build failing.
                 const auto overflow = OverflowMemoryType(context.memory, requirements.memoryTypeBits);
                 const auto system = SystemMemoryType(context.memory, requirements.memoryTypeBits);
                 bool placed = false;
@@ -197,6 +196,7 @@ DeviceBuffer::DeviceBuffer(const Context& context, std::size_t size, VkBufferUsa
                     allocation.memoryTypeIndex = *type;
                     try {
                         memory = cache->AllocateMemory(allocation, "vkAllocateMemory device buffer");
+                        allocatedType = *type;
                         placed = true;
                         break;
                     } catch (const std::runtime_error&) {
@@ -207,7 +207,7 @@ DeviceBuffer::DeviceBuffer(const Context& context, std::size_t size, VkBufferUsa
                 if (reports.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[bufferpool] device buffer of %llu bytes placed in memory type %u outside the device-local heap after: %s\n", static_cast<unsigned long long>(allocation.allocationSize), *overflow, error.what());
             }
         }
-        hostPlaced = allocation.memoryTypeIndex != context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        hostPlaced = allocatedType != deviceType;
         Check(context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, buffer, memory, 0), "vkBindBufferMemory device");
     } catch (...) {
         release();
@@ -320,7 +320,7 @@ RenderTarget::RenderTarget(const Context& context, const ColorTarget& target, bo
         VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         allocation.allocationSize = requirements.size;
         allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &memory), "vkAllocateMemory render target");
+        memory = AllocateAttachmentMemory(context, allocation, requirements.memoryTypeBits, "vkAllocateMemory render target");
         Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, memory, 0), "vkBindImageMemory");
         VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         viewInfo.image = image;
