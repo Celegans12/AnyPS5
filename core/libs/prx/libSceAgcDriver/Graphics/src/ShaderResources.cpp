@@ -1453,6 +1453,11 @@ std::shared_ptr<StorageTexture> lookupStorageTexture(const Context& context, std
             }
         }
     }
+    if (!evicted.empty()) {
+        auto& sampled = Textures();
+        std::lock_guard lock(sampled.mutex);
+        dropUncachedViews(sampled);
+    }
     return texture;
 }
 
