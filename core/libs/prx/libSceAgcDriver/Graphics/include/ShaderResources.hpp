@@ -29,6 +29,7 @@ class Recorder;
 
 void FlushCachedTextures(VkDevice device);
 void ClearCachedTextures(VkDevice device);
+std::uint64_t ReleaseTextureCaches(std::uint64_t bytes);
 std::uint64_t TextureCacheBudget(const VkPhysicalDeviceMemoryProperties& memory);
 // What the texture caches hold: every live sampled texture's own image (SampledTextureMemory), the
 // part of it the sampled cache's snapshot entries account, the storage image cache's bytes, and the

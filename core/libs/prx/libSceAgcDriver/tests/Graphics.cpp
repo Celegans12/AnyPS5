@@ -7316,6 +7316,16 @@ void stagingPoolBudgetTests() {
     Require(AgcDriver::Graphics::BufferPool::DeviceBudget(memory) == VkDeviceSize{128} << 20u, "the staging pool budget on system memory fell below 128 MiB");
     memory.memoryTypes[0] = {VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 1};
     Require(AgcDriver::Graphics::BufferPool::DeviceBudget(memory) == VkDeviceSize{512} << 20u, "a heap with a device-only memory type was taken for system memory");
+    memory.memoryHeaps[1].size = VkDeviceSize{16} << 30u;
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT reported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    Require(AgcDriver::Graphics::BufferPool::DeviceBudget(memory, &reported) == VkDeviceSize{2} << 30u, "a zero reported budget did not fall back to an eighth of the heap");
+    reported.heapBudget[0] = VkDeviceSize{1} << 30u;
+    reported.heapBudget[1] = VkDeviceSize{10} << 30u;
+    Require(AgcDriver::Graphics::BufferPool::DeviceBudget(memory, &reported) == VkDeviceSize{1280} << 20u, "a 10 GiB budget on the 16 GiB heap does not limit the staging pool to an eighth of the budget");
+    reported.heapBudget[1] = VkDeviceSize{2} << 30u;
+    Require(AgcDriver::Graphics::BufferPool::DeviceBudget(memory, &reported) == VkDeviceSize{512} << 20u, "a 2 GiB budget does not keep the 512 MiB floor");
+    reported.heapBudget[1] = VkDeviceSize{40} << 30u;
+    Require(AgcDriver::Graphics::BufferPool::DeviceBudget(memory, &reported) == VkDeviceSize{2} << 30u, "a budget above the heap size raised the staging pool past an eighth of the heap");
 }
 
 void meshArgumentTests() {

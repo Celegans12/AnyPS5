@@ -3375,6 +3375,12 @@ void StorageTexture::reconcilePending() {
     BumpPendingSerial();
 }
 
+bool StorageTexture::Dirty() const {
+    auto& pending = Pending();
+    std::lock_guard lock(pending.mutex);
+    return dirty;
+}
+
 void StorageTexture::Flush() {
     {
         auto& live = Live();

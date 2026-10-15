@@ -1845,6 +1845,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         state->functionsReady = true;
     }
     Graphics::PrepareImportWatch(graphicsContext());
+    Graphics::BufferPool::SetCacheReclaim(Graphics::ReleaseTextureCaches);
     state->bufferPool = std::make_shared<Graphics::BufferPool>(graphicsContext());
     state->emptyBuffer = std::make_unique<Graphics::Buffer>(graphicsContext(), Graphics::EmptyBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     state->pipelineCache = std::make_unique<Graphics::PipelineCache>(graphicsContext(), state->properties, window != nullptr || compileOnly);
