@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <chrono>
 #include <cstdio>
@@ -124,18 +125,27 @@ VkDeviceMemory AllocateDeviceMemory(const Context& context, VkMemoryAllocateInfo
     };
     if (inHostMemory != nullptr) *inHostMemory = inSystemMemory(allocation.memoryTypeIndex);
     const auto overflowType = memoryTypeBits != 0 ? OverflowMemoryType(context.memory, memoryTypeBits) : std::nullopt;
-    if (!overflowType || allocation.memoryTypeIndex == *overflowType || (context.memory.memoryTypes[allocation.memoryTypeIndex].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0) return attempt();
+    const auto systemType = memoryTypeBits != 0 ? SystemMemoryType(context.memory, memoryTypeBits) : std::nullopt;
+    std::array<std::uint32_t, 2> fallbacks{};
+    std::size_t fallbackCount = 0;
+    if (overflowType && allocation.memoryTypeIndex != *overflowType && (context.memory.memoryTypes[allocation.memoryTypeIndex].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0) fallbacks[fallbackCount++] = *overflowType;
+    if (systemType && allocation.memoryTypeIndex != *systemType && !inSystemMemory(allocation.memoryTypeIndex) && (fallbackCount == 0 || fallbacks[0] != *systemType)) fallbacks[fallbackCount++] = *systemType;
+    if (fallbackCount == 0) return attempt();
     try {
         return attempt();
     } catch (const std::exception& error) {
-        allocation.memoryTypeIndex = *overflowType;
-        VkDeviceMemory memory = VK_NULL_HANDLE;
-        if (allocate(context.device, &allocation, nullptr, &memory) != VK_SUCCESS) throw;
-        const bool system = inSystemMemory(*overflowType);
-        if (inHostMemory != nullptr) *inHostMemory = system;
-        static std::atomic<std::uint64_t> reports{0};
-        if (reports.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[bufferpool] %s placed %llu bytes in memory type %u outside the device-local heap (%s) after: %s\n", operation, static_cast<unsigned long long>(allocation.allocationSize), *overflowType, system ? "system memory" : "still charged to the device-local heap's usage", error.what());
-        return memory;
+        for (std::size_t index = 0; index < fallbackCount; ++index) {
+            const auto type = fallbacks[index];
+            allocation.memoryTypeIndex = type;
+            VkDeviceMemory memory = VK_NULL_HANDLE;
+            if (allocate(context.device, &allocation, nullptr, &memory) != VK_SUCCESS) continue;
+            const bool system = inSystemMemory(type);
+            if (inHostMemory != nullptr) *inHostMemory = system;
+            static std::atomic<std::uint64_t> reports{0};
+            if (reports.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[bufferpool] %s placed %llu bytes in memory type %u outside the device-local heap (%s) after: %s\n", operation, static_cast<unsigned long long>(allocation.allocationSize), type, system ? "system memory" : "still charged to the device-local heap's usage", error.what());
+            return memory;
+        }
+        throw;
     }
 }
 

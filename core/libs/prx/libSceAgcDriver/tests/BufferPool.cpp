@@ -516,7 +516,14 @@ void OverflowAllocation() {
     allocation.memoryTypeIndex = 1;
     const auto local = AllocateDeviceMemory(context, allocation, "test", 0x3, &inHostMemory);
     Expect(mock.lastType == 1 && !inHostMemory, "a device-local allocation that succeeded is reported as system memory");
-    for (const auto memory : {overflow, system, local}) mockFreeMemory(VK_NULL_HANDLE, memory, nullptr);
+    mock.results = {VK_ERROR_OUT_OF_DEVICE_MEMORY, VK_ERROR_OUT_OF_DEVICE_MEMORY};
+    const auto spilled = AllocateDeviceMemory(context, allocation, "test", 0x3b, &inHostMemory);
+    Expect(mock.lastType == 3 && inHostMemory, "a buffer the device-local heap and type 0 both refused did not go to host-visible system memory");
+    allocation.memoryTypeIndex = 0;
+    mock.results = {VK_ERROR_OUT_OF_DEVICE_MEMORY};
+    const auto fromOverflow = AllocateDeviceMemory(context, allocation, "test", 0x3b, &inHostMemory);
+    Expect(mock.lastType == 3 && inHostMemory, "a type 0 allocation the device refused did not go to host-visible system memory");
+    for (const auto memory : {overflow, system, local, spilled, fromOverflow}) mockFreeMemory(VK_NULL_HANDLE, memory, nullptr);
     Expect(mock.liveBytes == 0, "the allocations leaked");
 }
 
