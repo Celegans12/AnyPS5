@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstring>
 #include <iostream>
+#include <memory>
 #include <span>
 #include <string>
 #include <vector>
@@ -32,11 +33,13 @@ struct Case {
     std::uint32_t baseOffset;
     std::uint32_t records;
     bool present;
+    std::uint32_t stride;
+    bool sameModule;
 };
 
-std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t bytes) {
+std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t bytes, std::uint32_t stride = 0) {
     const auto address = reinterpret_cast<std::uintptr_t>(data);
-    return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu), bytes, 0x31016facu};
+    return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu) | (stride << 16u), bytes, 0x31016facu};
 }
 
 std::string Hex(std::uint32_t value) {
@@ -63,18 +66,20 @@ void Run(AgcDriver::VulkanDevice& device, bool registrationModules) {
     target.registrationModules = registrationModules;
     const auto request = Request(userData, target, memory);
     const auto handle = ShaderRecompiler::PrepareShader(request);
-    const std::array<Case, 7> cases{{
-        {"aligned", 0, 128, true},
-        {"base +1", 1, 128, true},
-        {"base +2", 2, 128, true},
-        {"base +3", 3, 128, true},
-        {"records 37", 0, 37, true},
-        {"records 64 base +2", 2, 64, true},
-        {"absent", 0, 128, false},
+    const std::array<Case, 8> cases{{
+        {"aligned", 0, 128, true, 0, true},
+        {"base +1", 1, 128, true, 0, false},
+        {"base +2", 2, 128, true, 0, false},
+        {"base +3", 3, 128, true, 0, false},
+        {"records 37", 0, 37, true, 0, true},
+        {"records 64 base +2", 2, 64, true, 0, false},
+        {"stride 16", 0, 128, true, 16, true},
+        {"absent", 0, 128, false, 0, true},
     }};
+    std::shared_ptr<const ShaderRecompiler::RecompileResult> reference;
     for (const auto& test : cases) {
         Output.fill(Fill);
-        const auto input = test.present ? BufferDescriptor(Input.data() + test.baseOffset, test.records) : std::array<std::uint32_t, 4>{0u, 0u, 0u, 0x31016facu};
+        const auto input = test.present ? BufferDescriptor(Input.data() + test.baseOffset, test.records, test.stride) : std::array<std::uint32_t, 4>{0u, 0u, 0u, 0x31016facu};
         const auto output = BufferDescriptor(Output.data(), sizeof(Output));
         std::copy(input.begin(), input.end(), userData.begin());
         std::copy(output.begin(), output.end(), userData.begin() + 4);
@@ -83,6 +88,11 @@ void Run(AgcDriver::VulkanDevice& device, bool registrationModules) {
         const auto capture = ShaderRecompiler::CaptureResources(request, runtime, *handle);
         const auto result = ShaderRecompiler::MaterializeShader(request, *capture, *handle);
         Require(!result->registrationModule, "buffer descriptor runtime, " + mode + ", " + test.name + ": a compute shader was emitted in registration form");
+        if (reference == nullptr) reference = result;
+        if (test.sameModule) {
+            Require(result->spirv == reference->spirv, "buffer descriptor runtime, " + mode + ", " + test.name + ": the stride, record count or presence of the V# changed the compute module");
+            Require(result->PipelineVariantId() == reference->PipelineVariantId(), "buffer descriptor runtime, " + mode + ", " + test.name + ": the stride, record count or presence of the V# changed the pipeline variant");
+        }
         device.Dispatch(*result, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(Code.data()));
         device.WaitIdle();
         for (std::uint32_t lane = 0; lane < Lanes; ++lane) {
