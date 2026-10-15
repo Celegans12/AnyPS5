@@ -28,13 +28,6 @@ struct KeyDomain {
     bool operator==(const KeyDomain& other) const = default;
 };
 
-struct RecordPointer {
-    std::uint32_t offset = 0;
-    std::uint32_t immediate = 0;
-
-    bool operator==(const RecordPointer& other) const = default;
-};
-
 struct TableColumn {
     std::uint32_t heapSource = 0;
     std::uint32_t stride = 0;
@@ -46,10 +39,14 @@ struct TableColumn {
     bool address = false;
     std::vector<KeyDomain> keyDomains;
     bool unkeyed = false;
-    std::optional<RecordPointer> recordPointer;
+    bool indirect = false;
+    std::uint32_t indirectOffset = 0;
+    std::uint32_t indirectImmediate = 0;
+    std::uint32_t foldedAddend = 0;
+    std::uint32_t foldedCarry = 0;
 
     bool operator==(const TableColumn& other) const {
-        return heapSource == other.heapSource && stride == other.stride && addend == other.addend && offset == other.offset && dwordCount == other.dwordCount && sampler == other.sampler && address == other.address && recordPointer == other.recordPointer;
+        return heapSource == other.heapSource && stride == other.stride && addend == other.addend && offset == other.offset && dwordCount == other.dwordCount && sampler == other.sampler && address == other.address && indirect == other.indirect && indirectOffset == other.indirectOffset && indirectImmediate == other.indirectImmediate && foldedAddend == other.foldedAddend && foldedCarry == other.foldedCarry;
     }
 };
 

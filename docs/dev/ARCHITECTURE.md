@@ -43,7 +43,7 @@ flowchart LR
 ```
 
 - [`core/relinker/main.cpp`](../../core/relinker/main.cpp) runs the steps in this order. `--to-intel` is optional, see [USAGE.md](../user/USAGE.md).
-- Each library in [`core/libs/prx`](../../core/libs/prx) builds as a shared library. After the build, `nid_patcher` ([`core/libs/nid`](../../core/libs/nid)) renames every export to its NID, computed from the function name. `APS5_EXPORT("<nid>", func)` sets the NID directly when the name is unknown.
+- Each library in [`core/libs/prx`](../../core/libs/prx) builds as a shared library. After the build, `nid_patcher` ([`core/libs/nid`](../../core/libs/nid)) renames every export to its NID, computed from the function name. `APS5_EXPORT("<nid>", func)` sets the NID directly when the name is unknown. Every other library keeps the names libc exports; it reads them from `libc.exports`, which `nid_patcher --write-export-list` rewrites only when that list changes. On Windows the link writes each import library with `SOURCE_DATE_EPOCH=0` and `ranlib -D` and replaces it only when its bytes change. A source edit that keeps the exports therefore relinks and re-patches only its own library.
 
 ## Windows deferred module initialization
 
@@ -94,7 +94,7 @@ flowchart LR
 ```
 
 - [`Recompiler.cpp`](../../core/shader/recompiler/Recompiler.cpp) runs the stages in this order. With `ANYPS5_ENABLE_SPIRV_TOOLS`, the SPIR-V is also validated and optimized with SPIRV-Tools.
-- `ShaderRecompiler::Recompile` keeps compiled variants in memory, and `ShaderDiskCache` stores them on disk so later runs reuse them.
+- `ShaderRecompiler::Recompile` keeps compiled variants in memory, and `ShaderDiskCache` stores them on disk so later runs reuse them. Before the writable cache, a miss is also looked up in read-only prebuilt packs and loose entry folders under `shader_cache/prebuilt`; pack entries are ordinary encoded cache entries behind a sorted key-hash index, validated by magic, compiler source version and index checksum when mapped, and a miss or rejected entry falls through to the writable cache and the compiler. Cache format 35 also stores the finite stencil-reference set, its replay-safety proof and reserved push-data word in the artifact and binding layouts. Entries from formats 31 to 34 are rejected.
 - A compute shader whose LDS plus its lock dword exceeds the host's `maxComputeSharedMemorySize` is not given a `Workgroup` array. `Recompile` sets `ShaderInfo::sharedMemoryBytes` for it and the SPIR-V backend addresses the LDS in a coherent storage buffer at descriptor set 1 (`WorkgroupMemoryDescriptorSet`), with a slice of `RecompileResult::workgroupMemoryDwords` per workgroup, indexed by `WorkgroupID` and `NumWorkGroups`. `VulkanDevice` keeps one such buffer, sized from the dispatch dimensions, and binds it after the resource set; programs that fit keep using shared memory.
 - `Driver::RegisterShader` splits shader preparation in two. `PlanRegistered` runs on the registering guest thread: it validates the registers and entry point, decodes the code and builds the recompile request, so invalid registrations still fail there. The RDNA to IR translation and resource plan (`PrepareShader`) run on a background pool of `hardware_concurrency() / 2` detached threads (at least 2, 64 MiB stacks).
 - The shader registry maps a code address to every header registered for that code, in registration order. Static, graphics and rectangle ABI resolution pick the header at the bound address (or one equal to it, `SameHeader`, which also takes a hull header fused by `sceAgcFuseShaderHalves` (type 3) as the registered back half (type 7) it copies, the fused registers aside; graphics ABI resolution then uses the fused header's shader registers); draws and dispatches pick the program by the stage's binary type (`RegisteredProgram`), and a front entry matching both type 2 and type 4 throws. Within a type the last registration wins; re-registering an identical earlier header makes its snapshot current again without preparing it again, and changed code drops the older headers.
@@ -127,6 +127,13 @@ A storage image over guest memory that the write watch does not cover (a host-po
 - the recorder's newest pending GPU write note over the surface.
 
 The comparison runs again when any of them changes. A CPU store into unwatched memory is therefore seen at the next ordering point, the same bound the collect memo gives watched memory. Driver stores into unwatched memory are recorded per 64 KiB block in a fixed table of 65,536 slots indexed by block number modulo the table size, each slot holding the newest generation stored to any of its blocks. A collision can only raise a surface's stamp, which costs one comparison and never skips one. `agc_driver_dcc_keys_first_write` (`RunUntrackedReuse`) checks that a CPU edit to an unwatched image is uploaded after the next epoch, and `agc_write_tracking` (`CheckNewestStamp`) checks which stores advance `NewestStamp`.
+
+### Resource plans
+
+A cached shader keeps an `IrResourcePlan` (`ResourceMaterializer::ExtractPlan` in [`ResourceMaterializer.cpp`](../../core/shader/recompiler/Optimization/src/ResourceMaterializer.cpp)) for as long as it is registered: a copy of the IR values its descriptor sources, SRT reads, uniform fill and control-flow conditions depend on, which every capture walks to read the shader's resources from guest memory. The copy is sized to what the walk can use:
+
+- A control-flow condition is kept only when `Detail::Evaluator::MayEvaluate` finds a runtime it could be evaluated for. A condition that depends on a vector register, or on an opcode the evaluator does not evaluate, takes both successors whatever the runtime holds, so the plan stores it as no condition and does not copy its operands. Such conditions are most of a shader's IR when the masked-lane code feeds its branches.
+- The copied values are allocated in one `IrValueArena` and hold no use lists: the walk only follows arguments.
 
 ### Shader MODE register access
 

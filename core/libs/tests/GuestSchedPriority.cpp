@@ -1,5 +1,6 @@
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include <cstdlib>
+#include <initializer_list>
 #include <stdexcept>
 extern "C" int* APS5_VABI __error_nid_postfix();
 extern "C" {

@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/LiveSnapshotRetry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Memory/BufferCopy.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
@@ -116,9 +117,12 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
     const bool partialLastGroup = partialGroups != std::array<std::uint32_t, 3>{};
     if (resolving) {
         if (!partialLastGroup && matchesFillKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute)) return;
-        if (!partialLastGroup && indirectArguments == 0 && matchesCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute)) return;
+        if (!partialLastGroup && indirectArguments == 0 && (matchesCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) || MatchesStreamCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute))) return;
     } else {
-        if (const auto htile = Graphics::HtileDepthClearAddress(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads); htile != 0) Graphics::NoteHtileDepthClear(htile);
+        if (const auto htile = Graphics::HtileDepthClearAddress(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads); htile != 0) {
+            const auto threads = (packet[4] & 0x20u) != 0 ? static_cast<std::uint64_t>(packet[1]) : static_cast<std::uint64_t>(packet[1]) * compute.numThreads[0];
+            Graphics::NoteHtileDepthClear(htile, static_cast<std::size_t>(threads * 16u));
+        }
         if (indirectArguments == 0 && (packet[4] & 0x20u) == 0) {
             if (const auto fill = Graphics::MatchMemoryValueFill(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads, {packet[1], packet[2], packet[3]})) Graphics::NoteMemoryValueFill(*fill);
         }
@@ -429,7 +433,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
         std::shared_ptr<PreparedDispatch> prepared;
         if (recipeHit == nullptr || VulkanDevice::VerifyRecipes()) {
             try {
-                prepared = localDevice->PrepareDispatch(compiled, snapshots, dispatchThreads);
+                prepared = localDevice->PrepareDispatch(compiled, snapshots, dispatchThreads, address);
             } catch (const Graphics::LiveSnapshotInvalidated&) {
                 throw;
             } catch (const std::exception& error) {

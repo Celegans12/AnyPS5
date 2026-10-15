@@ -5,7 +5,7 @@ namespace ShaderRecompiler {
 
 namespace {
 
-constexpr std::uint32_t CurrentVersion = 26u;
+constexpr std::uint32_t CurrentVersion = 30u;
 constexpr std::uint32_t LocalFeatures = 22u;
 constexpr char kBase64Alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -343,6 +343,9 @@ void writePixelInfo(Writer& writer, const ShaderPixelStageInfo& info) {
     writer.WriteU8(static_cast<std::uint8_t>(info.rasterPrimitive));
     writer.WriteBool(info.layerExported);
     writer.WriteBool(info.ditheredAlphaToCoverage);
+    writer.WriteBool(info.frontFaceAllBits);
+    writer.WriteU8(info.quadPixelMask);
+    for (const std::uint16_t mask : info.quadSampleMask) writer.WriteU32(mask);
     for (const ColorTargetBlend& blend : info.targetBlend) {
         writer.WriteBool(blend.enable);
         writer.WriteU8(blend.sourceFactor);
@@ -402,6 +405,15 @@ ShaderPixelStageInfo readPixelInfo(Reader& reader, std::uint32_t version, std::u
     if (version >= 19u) info.rasterPrimitive = readRasterPrimitive(reader);
     if (version >= 23u) info.layerExported = reader.ReadBool();
     if (version >= 25u) info.ditheredAlphaToCoverage = reader.ReadBool();
+    if (version >= 27u) info.frontFaceAllBits = reader.ReadBool();
+    if (version >= 28u) info.quadPixelMask = reader.ReadU8();
+    if (version >= 29u) {
+        for (std::uint16_t& mask : info.quadSampleMask) {
+            const auto value = reader.ReadU32();
+            if (value > 0xffffu) throw std::runtime_error("invalid recompile request quad sample mask");
+            mask = static_cast<std::uint16_t>(value);
+        }
+    }
     if (local >= 20u) {
         for (ColorTargetBlend& blend : info.targetBlend) {
             blend.enable = reader.ReadBool();
@@ -807,14 +819,17 @@ DeserializedRequest deserialize(std::string_view decoded, std::uint32_t version,
     if (version >= 18u) result.request.target.vertexSubgroups = reader.ReadBool();
     if (version >= 21u) {
         if (version >= 22u) reader.Require(1u);
-        if (reader.Remaining() == 1u) {
+        if (reader.Remaining() != 0u) {
             const auto float16DenormPreserve = reader.ReadU8();
             if (float16DenormPreserve > 1u) throw std::runtime_error("RequestSerializer: invalid float16DenormPreserve value");
             result.request.target.float16DenormPreserve = float16DenormPreserve != 0u;
-        } else if (reader.Remaining() != 0u) {
-            throw std::runtime_error("RequestSerializer: unexpected trailing data");
         }
     }
+    if (version >= 26u) {
+        result.linkedCallFallbacks = reader.ReadU32Vector();
+        result.request.context.linkedCallFallbacks = result.linkedCallFallbacks;
+    }
+    if (version >= 21u && reader.Remaining() != 0u) throw std::runtime_error("RequestSerializer: unexpected trailing data");
     if (exact && !reader.Done()) throw std::runtime_error("RequestSerializer: trailing data");
     return result;
 }
@@ -849,6 +864,7 @@ std::string RequestSerializer::Serialize(const RecompileRequest& request) const 
     writer.WriteU32(request.target.registrationWordLimit);
     writer.WriteBool(request.target.vertexSubgroups);
     writer.WriteBool(request.target.float16DenormPreserve);
+    writer.WriteU32Span(request.context.linkedCallFallbacks);
     return base64Encode(buffer);
 }
 
@@ -859,9 +875,9 @@ DeserializedRequest RequestSerializer::Deserialize(std::string_view text) const 
     const auto version = reader.ReadU32();
     if (version < 1u || version > CurrentVersion) throw std::runtime_error("unsupported recompile request serialization version");
     if (version >= CurrentVersion) return deserialize(decoded, version, LocalFeatures, false);
-    if (version == 24u) {
+    if (version == 24u || version == 26u) {
         try {
-            return deserialize(decoded, version, LocalFeatures, true);
+            return deserialize(decoded, version == 26u ? 25u : version, LocalFeatures, true);
         } catch (const std::exception&) {
         }
         return deserialize(decoded, version, 0u, false);

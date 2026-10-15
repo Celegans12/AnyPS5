@@ -35,6 +35,8 @@ struct GuestTimeval {
 std::atomic<KernelSocketPoll::Poller> g_socketPoller{nullptr};
 std::atomic<KernelSocketPoll::Closer> g_socketCloser{nullptr};
 std::atomic<KernelSocketPoll::OptionSetter> g_socketOptionSetter{nullptr};
+std::atomic<KernelSocketPoll::StatusControl> g_socketStatusControl{nullptr};
+std::atomic<KernelSocketPoll::NativeLookup> g_socketNativeLookup{nullptr};
 
 bool DescriptorSet(const void* set, int descriptor) {
     return set != nullptr && ((static_cast<const std::uint64_t*>(set)[descriptor / 64] >> (descriptor % 64)) & 1u) != 0;
@@ -151,6 +153,24 @@ void KernelSetSocketOptionSetter_nid_no_patch(KernelSocketPoll::OptionSetter set
 bool KernelSetSocketOption_nid_no_patch(int descriptor, int level, int option, const void* value, std::uint32_t length, int* error) {
     const auto setter = g_socketOptionSetter.load();
     return setter != nullptr && setter(descriptor, level, option, value, length, error);
+}
+
+void KernelSetSocketStatusControl_nid_no_patch(KernelSocketPoll::StatusControl control) {
+    g_socketStatusControl.store(control);
+}
+
+bool KernelControlSocketStatus_nid_no_patch(int descriptor, int command, int flags, int* result, int* error) {
+    const auto control = g_socketStatusControl.load();
+    return control != nullptr && control(descriptor, command, flags, result, error);
+}
+
+void KernelSetSocketNativeLookup_nid_no_patch(KernelSocketPoll::NativeLookup lookup) {
+    g_socketNativeLookup.store(lookup);
+}
+
+bool KernelFindSocketNative_nid_no_patch(int descriptor, std::shared_ptr<void>* owner, std::uintptr_t* native) {
+    const auto lookup = g_socketNativeLookup.load();
+    return lookup != nullptr && lookup(descriptor, owner, native);
 }
 
 int APS5_VABI select_nid_postfix(int nfds, void* readfds, void* writefds, void* exceptfds, const void* timeout) {

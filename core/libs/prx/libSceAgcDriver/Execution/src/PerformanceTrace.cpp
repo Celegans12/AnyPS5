@@ -221,6 +221,7 @@ void PerformanceTrace::Present(std::uint32_t width, std::uint32_t height, const 
         {
             std::lock_guard gpu(gpuMutex);
             gpuRanges.clear();
+            gpuLost = 0;
             gpuRanges.reserve(GpuRangeCapacity);
         }
         state.presents.push_back(now);
@@ -256,7 +257,7 @@ void PerformanceTrace::Present(std::uint32_t width, std::uint32_t height, const 
     if (state.gpuClock && device != nullptr && device->CalibrateClock(clock.gpuNs, clock.cpu)) {
         std::lock_guard gpu(gpuMutex);
         gpuSlices = TraceFormat::GpuSlices(gpuRanges, *state.gpuClock, clock, state.presents.front());
-        snapshots.push_back({"gpu", gpuSlices, {}, gpuDropped});
+        snapshots.push_back({"gpu", gpuSlices, {}, gpuLost != 0, gpuLost});
     }
     const auto process = processId();
     auto summary = identity(width, height, device);

@@ -737,6 +737,23 @@ static void CheckHintedVirtualReservation() {
     Require(sceKernelMunmap(placed, page * 2) == 0);
 }
 
+static void CheckReservationHintWithoutRoomAbove() {
+    constexpr std::size_t page = 0x4000;
+    std::uintptr_t base = 0;
+    std::size_t size = 0;
+    GuestArena::GuestArenaRange_nid_postfix(&base, &size);
+    const auto end = base + size;
+    void* aboveTheArena = reinterpret_cast<void*>(end + 0x40000000);
+    Require(sceKernelReserveVirtualRange(&aboveTheArena, page * 2, 0, 0) == 0);
+    Require(GuestArena::GuestArenaContains_nid_postfix(aboveTheArena, page * 2));
+    void* const lastPage = reinterpret_cast<void*>(end - page);
+    void* belowTheHint = lastPage;
+    Require(sceKernelReserveVirtualRange(&belowTheHint, page * 2, 0, 0) == 0);
+    Require(belowTheHint < lastPage && GuestArena::GuestArenaContains_nid_postfix(belowTheHint, page * 2));
+    Require(sceKernelMunmap(belowTheHint, page * 2) == 0);
+    Require(sceKernelMunmap(aboveTheArena, page * 2) == 0);
+}
+
 static void CheckFixedVirtualReservation() {
     constexpr std::size_t page = 0x4000;
     void* probe = nullptr;
@@ -2558,6 +2575,7 @@ int main(int argc, char** argv) {
     CheckGpuMapsAreObserved();
     CheckClearingTheObserverWaitsForItsCalls();
     CheckHintedVirtualReservation();
+    CheckReservationHintWithoutRoomAbove();
     CheckFixedVirtualReservation();
     CheckReservedRangeIsNotCommitted();
     CheckHintInsideReservation();

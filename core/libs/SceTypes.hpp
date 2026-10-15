@@ -1750,23 +1750,29 @@ struct JpegEncOutputInfo {
 };
 
 struct JpegDecCreateParam {
-    std::uint32_t size;
+    std::uint32_t this_size;
     std::uint32_t attribute;
+    std::uint32_t max_image_width;
 };
 
 struct JpegDecParseParam {
     const void* jpeg_mem_addr;
     std::uint32_t jpeg_mem_size;
-    std::uint32_t reserved0;
+    std::uint16_t decode_mode;
+    std::uint16_t down_scale;
 };
 
 struct JpegDecDecodeParam {
     const void* jpeg_mem_addr;
     void* image_mem_addr;
+    void* coefficient_mem_addr;
     std::uint32_t jpeg_mem_size;
     std::uint32_t image_mem_size;
+    std::uint32_t coefficient_mem_size;
+    std::uint16_t decode_mode;
+    std::uint16_t down_scale;
     std::uint16_t pixel_format;
-    std::uint16_t reserved0;
+    std::uint16_t alpha_value;
     std::uint32_t image_pitch;
 };
 
@@ -1774,8 +1780,13 @@ struct JpegDecImageInfo {
     std::uint32_t image_width;
     std::uint32_t image_height;
     std::uint16_t color_space;
-    std::uint16_t bit_depth;
-    std::uint32_t image_flag;
+    std::uint16_t component_number;
+    std::uint8_t component_id[4];
+    std::uint8_t sampling_factor[4];
+    std::uint32_t coefficient_mem_size;
+    std::uint32_t suitable_csc_attribute;
+    std::uint32_t output_image_width;
+    std::uint32_t output_image_height;
 };
 
 struct PlayGoInitParams {

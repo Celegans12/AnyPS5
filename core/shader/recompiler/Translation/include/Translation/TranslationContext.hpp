@@ -27,6 +27,7 @@ public:
     void SetNativeFloat16(bool enabled) { nativeFloat16 = enabled; }
     void AddBranchCondition(const BasicBlock& source, BlockInfo& info);
     void TranslateCodeTableLoad(const RdnaInstruction& instruction, const ControlFlowGraph::CodeTableLoad& table);
+    void TranslateUnlinkedCall(const RdnaInstruction& instruction);
 
 private:
     struct AddressOperands {
@@ -152,6 +153,7 @@ private:
     bool dsAtomic64(const RdnaInstruction& inst, IrOpcode opcode, bool returnsValue);
     bool dsCondxchg32(const RdnaInstruction& inst);
     bool dsAppendConsume(const RdnaInstruction& inst, IrOpcode opcode);
+    bool dsOrderedCount(const RdnaInstruction& inst);
     bool dsAddtid(const RdnaInstruction& inst, bool write);
     bool globalAddtid(const RdnaInstruction& inst, bool write);
     bool dsSwizzleB32(const RdnaInstruction& inst);

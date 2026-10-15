@@ -101,6 +101,7 @@ struct SysVDynamicSection {
     std::map<VirtualAddress, std::string> ImportModules;
     std::set<VirtualAddress> FunctionImports;
     std::set<std::string> UnmatchedImportModules;
+    std::vector<std::string> NeededLibraries;
 };
 
 struct CallRegistryEntry {
@@ -112,6 +113,7 @@ struct CallRegistryEntry {
     FileByteOffset TargetOffset;
     std::vector<FileByteOffset> CallSites;
     bool CallSitesResolved;
+    bool Weak = false;
 };
 
 }

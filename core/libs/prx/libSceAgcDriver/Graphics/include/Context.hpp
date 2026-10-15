@@ -215,6 +215,8 @@ struct Context {
     bool bufferInt64Atomics = false;
     const PlaceholderImages* placeholderImages = nullptr;
     bool viewportIndexLayer = false;
+    bool demoteToHelperInvocation = false;
+    bool earlyFragmentSampleMaskTestBeforeSampleCounting = false;
     bool primitiveListRestart = false;
     bool imageViewMinLod = false;
     bool pipelineExecutableInfo = false;

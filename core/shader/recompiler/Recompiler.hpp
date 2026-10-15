@@ -143,6 +143,7 @@ struct ShaderPixelStageInfo {
     bool posZ;
     bool posW;
     bool frontFace;
+    bool frontFaceAllBits;
     bool ancillary;
     bool sampleShading;
     bool noPerspective;
@@ -163,6 +164,8 @@ struct ShaderPixelStageInfo {
     RasterPrimitive rasterPrimitive = RasterPrimitive::Triangle;
     bool layerExported = false;
     bool ditheredAlphaToCoverage = false;
+    std::uint8_t quadPixelMask = 0xf;
+    std::array<std::uint16_t, 4> quadSampleMask{0xffffu, 0xffffu, 0xffffu, 0xffffu};
     std::array<ColorTargetBlend, 8> targetBlend;
 };
 
@@ -211,6 +214,7 @@ struct GuestContext {
     std::optional<ShaderVertexStageInfo> vertex;
     std::span<const MemoryRegion> memory;
     std::optional<ShaderFloatMode> floatMode;
+    std::span<const std::uint32_t> linkedCallFallbacks;
 };
 
 struct MeshTargetLimits {
@@ -367,7 +371,8 @@ enum class DescriptorImageShape {
     Image2DArray,
     ImageCube,
     Image3D,
-    Image1DArray
+    Image1DArray,
+    Image2DMultisample
 };
 
 enum class DescriptorRole {
@@ -554,6 +559,9 @@ struct CompiledShaderArtifact {
     std::vector<std::uint32_t> parameterExports;
     std::vector<FragmentParameter> fragmentParameters;
     BarycentricEmulation barycentricEmulation;
+    std::vector<std::uint32_t> stencilReferences;
+    bool stencilReplaySafe = false;
+    std::uint32_t stencilReferenceDword = 0xffffffffu;
     std::uint64_t variantId = 0;
 };
 

@@ -267,12 +267,20 @@ std::vector<Vp9Unit> ParseVp9Packet(std::span<const std::uint8_t> bytes, std::ar
     return result;
 }
 
+struct Crop {
+    std::uint32_t left = 0;
+    std::uint32_t right = 0;
+    std::uint32_t top = 0;
+    std::uint32_t bottom = 0;
+};
+
 struct Picture {
     std::uint64_t pts = 0;
     std::uint64_t dts = 0;
     std::uint64_t attached = 0;
     bool idr = false;
     Vp9PictureInfo vp9{};
+    Crop crop{};
 };
 
 struct FrameDeleter {
@@ -356,6 +364,7 @@ void OpenCodec(Decoder& decoder) {
     decoder.context->err_recognition = AV_EF_EXPLODE;
     decoder.context->thread_count = 0;
     decoder.context->thread_type = FF_THREAD_SLICE;
+    decoder.context->apply_cropping = 0;
     if (avcodec_open2(decoder.context, codec, nullptr) < 0) {
         avcodec_free_context(&decoder.context);
         throw std::runtime_error("Videodec2: cannot open decoder");
@@ -443,6 +452,7 @@ void EmitDecoded(std::uint64_t handle, Decoder& decoder, FrameBuffer* frame, Out
     auto timestamps = found->second;
     decoder.inputs.erase(found);
     timestamps.idr = (picture->flags & AV_FRAME_FLAG_KEY) != 0;
+    timestamps.crop = {static_cast<std::uint32_t>(picture->crop_left), static_cast<std::uint32_t>(picture->crop_right), static_cast<std::uint32_t>(picture->crop_top), static_cast<std::uint32_t>(picture->crop_bottom)};
     decoder.width = static_cast<std::uint32_t>(picture->width);
     decoder.height = static_cast<std::uint32_t>(picture->height);
     if (decoder.context->profile > 0) decoder.profile = static_cast<std::uint32_t>(decoder.context->profile) & 0xffu;
@@ -672,6 +682,17 @@ int APS5_VABI sceVideodec2GetVp9PictureInfo_nid_postfix(const OutputInfo* output
     }
     info->isValid = false;
     return 0;
+}
+
+void Videodec2PictureCrop_nid_no_patch(std::uint64_t handle, const void* frameBuffer, Crop* crop) {
+    if (!crop) throw std::runtime_error("Videodec2: invalid argument pointer");
+    const auto found = FindDecoder(handle);
+    if (!found) throw std::runtime_error("Videodec2: invalid decoder handle");
+    auto& decoder = *found;
+    std::lock_guard guard(decoder.mutex);
+    const auto picture = decoder.pictures.find(frameBuffer);
+    if (picture == decoder.pictures.end()) throw std::runtime_error("Videodec2: unknown frame buffer");
+    *crop = picture->second.crop;
 }
 
 }

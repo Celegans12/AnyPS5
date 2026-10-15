@@ -10,6 +10,10 @@
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <optional>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 namespace ShaderRecompiler::Detail {
 
@@ -176,6 +180,150 @@ bool Evaluator::EvaluateRawRead(IrValue& inst, std::uint64_t& result) {
     }
     result = word;
     return true;
+}
+
+namespace {
+
+std::optional<std::size_t> evaluatedArguments(IrOpcode opcode) {
+    switch (opcode) {
+        case IrOpcode::BitCastU32F32:
+        case IrOpcode::BitCastF32U32:
+        case IrOpcode::ConvertF32U32:
+        case IrOpcode::ConvertU32F32:
+        case IrOpcode::FPTrunc32:
+        case IrOpcode::FPIsNan32:
+        case IrOpcode::BitwiseNot32:
+        case IrOpcode::LogicalNot: return 1u;
+        case IrOpcode::CompositeConstructU64:
+        case IrOpcode::IAdd32:
+        case IrOpcode::IAdd64:
+        case IrOpcode::ISub32:
+        case IrOpcode::ISub64:
+        case IrOpcode::IMul32:
+        case IrOpcode::IMul64:
+        case IrOpcode::SMin32:
+        case IrOpcode::UMin32:
+        case IrOpcode::FPMul32:
+        case IrOpcode::FPOrdLessThanEqual32:
+        case IrOpcode::FPOrdGreaterThanEqual32:
+        case IrOpcode::BitwiseAnd32:
+        case IrOpcode::BitwiseAnd64:
+        case IrOpcode::BitwiseOr32:
+        case IrOpcode::BitwiseXor32:
+        case IrOpcode::ShiftLeftLogical32:
+        case IrOpcode::ShiftLeftLogical64:
+        case IrOpcode::ShiftRightLogical32:
+        case IrOpcode::ShiftRightLogical64:
+        case IrOpcode::ShiftRightArithmetic32:
+        case IrOpcode::ShiftRightArithmetic64:
+        case IrOpcode::IEqual32:
+        case IrOpcode::INotEqual32:
+        case IrOpcode::SLessThan32:
+        case IrOpcode::ULessThan32:
+        case IrOpcode::UGreaterThan32:
+        case IrOpcode::LogicalAnd:
+        case IrOpcode::LogicalOr:
+        case IrOpcode::LogicalXor: return 2u;
+        case IrOpcode::BitFieldUExtract:
+        case IrOpcode::BitFieldSExtract:
+        case IrOpcode::SelectU32:
+        case IrOpcode::SelectU1:
+        case IrOpcode::SelectF32: return 3u;
+        case IrOpcode::BitFieldInsert: return 4u;
+        default: return std::nullopt;
+    }
+}
+
+std::optional<bool> evaluableAlone(const IrResourcePlan& program, const IrValue& value) {
+    if (value.HasImmediate()) {
+        switch (value.Type()) {
+            case IrType::Bool:
+            case IrType::U8:
+            case IrType::U16:
+            case IrType::U32:
+            case IrType::U64:
+            case IrType::F32: return true;
+            default: return false;
+        }
+    }
+    switch (value.Opcode()) {
+        case IrOpcode::GetUserData:
+        case IrOpcode::GetShaderBase:
+        case IrOpcode::ReadFirstLane:
+        case IrOpcode::ReadConst: return true;
+        case IrOpcode::LoadAddressU32:
+        case IrOpcode::ReadConstBuffer: return IsRawRead(program, value);
+        case IrOpcode::Phi: return std::nullopt;
+        case IrOpcode::CompositeExtractU64:
+        case IrOpcode::CompositeExtractU32x2: {
+            if (value.ArgumentCount() < 2) return true;
+            const auto* index = value.Argument(1) != nullptr ? value.Argument(1)->Resolve() : nullptr;
+            if (index == nullptr || !index->HasImmediate() || index->Type() != IrType::U32 || index->ImmediateU32() >= 2u) return false;
+            if (value.Opcode() == IrOpcode::CompositeExtractU64) return std::nullopt;
+            const auto* source = value.Argument(0) != nullptr ? value.Argument(0)->Resolve() : nullptr;
+            if (source == nullptr || (source->Opcode() != IrOpcode::CompositeConstructU32x2 && source->Opcode() != IrOpcode::IAddCarry32)) return false;
+            return std::nullopt;
+        }
+        default: break;
+    }
+    const auto arguments = evaluatedArguments(value.Opcode());
+    if (!arguments) return false;
+    if (value.ArgumentCount() < *arguments) return true;
+    return std::nullopt;
+}
+
+}
+
+bool Evaluator::MayEvaluate(const IrResourcePlan& program, IrValue* value) {
+    std::unordered_map<const IrValue*, bool> known;
+    const auto requirements = [&program](IrValue* current) {
+        std::vector<IrValue*> required;
+        if (current->IsPhi()) {
+            required.push_back(ResolveInvariantPhi(program, current));
+            return required;
+        }
+        const auto resolved = [](IrValue* value) { return value != nullptr ? value->Resolve() : nullptr; };
+        if (current->Opcode() == IrOpcode::CompositeExtractU64) {
+            required.push_back(resolved(current->Argument(0)));
+            return required;
+        }
+        if (current->Opcode() == IrOpcode::CompositeExtractU32x2) {
+            auto* source = current->Argument(0)->Resolve();
+            if (source->Opcode() == IrOpcode::CompositeConstructU32x2) {
+                required.push_back(resolved(source->Argument(current->Argument(1)->Resolve()->ImmediateU32())));
+            } else {
+                required.push_back(resolved(source->Argument(0)));
+                required.push_back(resolved(source->Argument(1)));
+            }
+            return required;
+        }
+        const auto arguments = *evaluatedArguments(current->Opcode());
+        for (std::size_t index = 0; index < arguments; ++index) {
+            auto* argument = current->Argument(index);
+            required.push_back(argument != nullptr ? argument->Resolve() : nullptr);
+        }
+        return required;
+    };
+    std::vector<std::pair<IrValue*, bool>> pending{{value->Resolve(), false}};
+    while (!pending.empty()) {
+        const auto [current, expanded] = pending.back();
+        pending.pop_back();
+        if (known.contains(current)) continue;
+        if (const auto alone = evaluableAlone(program, *current)) {
+            known.emplace(current, *alone);
+            continue;
+        }
+        const auto required = requirements(current);
+        if (!expanded) {
+            pending.emplace_back(current, true);
+            for (auto* argument : required) {
+                if (argument != nullptr) pending.emplace_back(argument, false);
+            }
+            continue;
+        }
+        known.emplace(current, std::ranges::all_of(required, [&known](const IrValue* argument) { return argument != nullptr && known.at(argument); }));
+    }
+    return known.at(value->Resolve());
 }
 
 bool Evaluator::EvaluateInst(IrValue& inst, std::uint64_t& result) {

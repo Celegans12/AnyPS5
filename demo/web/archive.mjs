@@ -18,7 +18,7 @@ class BoundedBlobReader extends BlobReader {
 export function validPath(name) {
   if (!name || name.includes("\\") || /[\x00-\x1f<>:"|?*]/u.test(name)) throw new Error(`Unsafe ZIP path: ${name}`);
   const parts = name.replace(/\/$/u, "").split("/");
-  if (parts.some(part => !part || part === "." || part === ".." || /[. ]$/u.test(part) || /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/iu.test(part))) throw new Error(`Unsafe ZIP path: ${name}`);
+  if (parts.some(part => !part || part === "." || part === ".." || /[. ]$/u.test(part) || /^(con|prn|aux|nul|com[1-9\u00b9\u00b2\u00b3]|lpt[1-9\u00b9\u00b2\u00b3])(?:\.|$)/iu.test(part))) throw new Error(`Unsafe ZIP path: ${name}`);
   return name;
 }
 
@@ -27,8 +27,8 @@ function safeSize(value) {
   return value;
 }
 
-async function signature(entry) {
-  if (entry.uncompressedSize < 4) return false;
+async function headerBytes(entry) {
+  if (entry.uncompressedSize < 4) return null;
   const stop = new AbortController();
   const header = new Uint8Array(4);
   let filled = 0;
@@ -44,7 +44,20 @@ async function signature(entry) {
   } catch (error) {
     if (!stop.signal.aborted || filled !== 4) throw error;
   }
-  return header[0] === 0x7f && header[1] === 69 && header[2] === 76 && header[3] === 70;
+  return header;
+}
+
+const SELF_MAGICS = [
+  [0x4f, 0x15, 0x3d, 0x1d],
+  [0x54, 0x14, 0xf5, 0xee]
+];
+
+function isElf(header) {
+  return header !== null && header[0] === 0x7f && header[1] === 69 && header[2] === 76 && header[3] === 70;
+}
+
+function isSelf(header) {
+  return header !== null && SELF_MAGICS.some(magic => magic.every((byte, index) => header[index] === byte));
 }
 
 async function boundedBytes(entry, limit) {
@@ -119,41 +132,60 @@ export class Archive {
     const files = this.entries.filter(entry => !entry.directory);
     while (files.every(entry => entry.filename.slice(prefix.length).includes("/"))) {
       const first = files[0].filename.slice(prefix.length).split("/")[0];
-      if (["sce_sys", "sce_module"].includes(first) || !this.entries.every(entry => entry.filename === prefix || entry.filename.startsWith(prefix + first + "/"))) break;
+      if (["sce_sys", "sce_module"].includes(first) || !this.entries.every(entry => (entry.directory && prefix.startsWith(entry.filename)) || entry.filename.startsWith(prefix + first + "/"))) break;
       prefix += first + "/";
     }
     this.prefix = prefix;
     this.files = this.entries.filter(entry => entry.filename.startsWith(prefix) && entry.filename !== prefix).map(entry => ({ entry, name: entry.filename.slice(prefix.length) }));
     const executables = [];
     this.modules = [];
+    const selfContainers = [];
+    const selfModules = [];
     for (let index = 0; index < this.files.length; index++) {
       const item = this.files[index];
       report({ phase: "Inspecting files", input: item.name, completed: index, total: this.files.length });
       if (item.entry.directory || item.name.startsWith("sce_sys/")) continue;
       if (!item.name.startsWith("sce_module/") && item.name.includes("/")) continue;
       if (item.name.startsWith("sce_module/") && item.name.endsWith(".guest.prx")) continue;
-      const elf = await signature(item.entry);
+      const header = await headerBytes(item.entry);
       if (item.name.startsWith("sce_module/")) {
-        if (elf) this.modules.push(item);
-      } else if (elf) executables.push(item);
+        if (isElf(header)) this.modules.push(item);
+        else if (isSelf(header)) selfModules.push(item.name);
+      } else if (isElf(header)) {
+        executables.push(item);
+      } else if (isSelf(header)) {
+        selfContainers.push(item.name);
+      }
     }
-    if (executables.length !== 1) throw new Error(`Expected exactly one executable ELF in the app root; found ${executables.length}`);
+    if (executables.length !== 1) {
+      if (selfContainers.length > 0) throw new Error(`${selfContainers.join(", ")} is a SELF container, not an ELF: unwrap the app before converting it`);
+      throw new Error(`Expected exactly one executable ELF in the app root; found ${executables.length}`);
+    }
     this.executable = executables[0];
     if (this.executable.name.includes("/")) throw new Error("Place the executable next to sce_sys and sce_module, not inside another folder");
     this.icon = this.files.find(item => item.name === "sce_sys/icon0.png" && !item.entry.directory);
-    if (this.icon && this.icon.entry.uncompressedSize > ICON_LIMIT) throw new Error("sce_sys/icon0.png exceeds 16 MiB");
-    this.selectedBytes = [this.executable, ...this.modules, ...(this.icon ? [this.icon] : [])].reduce((sum, item) => sum + item.entry.uncompressedSize, 0);
-    if (this.selectedBytes > CONVERSION_LIMIT) throw new Error("Executable, modules and icon exceed the 256 MiB conversion limit. Use the native relinker for this app.");
+    this.selectedBytes = [this.executable, ...this.modules].reduce((sum, item) => sum + item.entry.uncompressedSize, 0);
+    this.windowsSelectedBytes = this.selectedBytes + (this.icon?.entry.uncompressedSize ?? 0);
+    if (this.selectedBytes > CONVERSION_LIMIT) throw new Error("Executable and modules exceed the 256 MiB conversion limit. Use the native relinker for this app.");
     const warnings = [];
     if (!this.files.some(item => item.name.startsWith("sce_sys/"))) warnings.push("sce_sys is missing. The Windows executable will have no app icon.");
     else if (!this.icon) warnings.push("sce_sys/icon0.png is missing. The Windows executable will have no app icon.");
     if (!this.files.some(item => item.name.startsWith("sce_module/"))) warnings.push("sce_module is missing. If the original app included this folder, leaving it out can prevent the app from starting.");
+    if (selfModules.length > 0) warnings.push(`${selfModules.join(", ")} is a SELF container and was skipped: unwrap it to include that module.`);
     this.totalBytes = total;
-    return { name: this.executable.name, files: files.length, modules: this.modules.length, totalBytes: total, selectedBytes: this.selectedBytes, root: prefix, warnings };
+    return { name: this.executable.name, files: files.length, modules: this.modules.length, totalBytes: total, selectedBytes: this.selectedBytes, windowsSelectedBytes: this.windowsSelectedBytes, windowsIconTooLarge: (this.icon?.entry.uncompressedSize ?? 0) > ICON_LIMIT, root: prefix, warnings };
+  }
+
+  selectedBytesForTarget(target) {
+    if (target !== "linux" && target !== "windows") throw new Error(`Unsupported conversion target: ${target}`);
+    if (target === "windows" && (this.icon?.entry.uncompressedSize ?? 0) > ICON_LIMIT) throw new Error("sce_sys/icon0.png exceeds 16 MiB");
+    return target === "windows" ? this.windowsSelectedBytes : this.selectedBytes;
   }
 
   async conversionInput(target, toIntel, report) {
     let remaining = CONVERSION_LIMIT;
+    const selectedBytes = this.selectedBytesForTarget(target);
+    if (selectedBytes > CONVERSION_LIMIT) throw new Error(`Selected ${target} conversion input exceeds the 256 MiB conversion limit. Use the native relinker for this app.`);
     const read = async item => {
       report({ phase: "Reading conversion input", input: item.name });
       const bytes = await boundedBytes(item.entry, remaining);

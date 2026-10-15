@@ -74,6 +74,13 @@ int APS5_VABI socket_nid_postfix(int, int, int);
 int APS5_VABI bind_nid_postfix(int, const void*, std::uint32_t);
 int APS5_VABI close_nid_postfix(int);
 int APS5_VABI setsockopt_nid_postfix(int, int, int, const void*, std::uint32_t);
+int APS5_VABI fcntl_nid_postfix(int, int, ...);
+struct GuestPollEntry {
+    int descriptor;
+    short events;
+    short revents;
+};
+int APS5_VABI poll_nid_postfix(GuestPollEntry*, std::uint32_t, int);
 int* APS5_VABI __error_nid_postfix();
 int APS5_VABI sceNetInetPton(int, const char*, void*);
 const char* APS5_VABI sceNetInetNtop(int, const void*, char*, std::uint32_t);
@@ -506,6 +513,26 @@ static void CheckKernelTimeouts() {
     Require(sceNetSocketClose(descriptor) == 0);
 }
 
+static void CheckKernelStatusFlags() {
+    const int descriptor = sceNetSocket("kernel-status", 2, 1, 6);
+    Require(descriptor >= 0);
+    Require(fcntl_nid_postfix(descriptor, 3) == 2);
+    Require(fcntl_nid_postfix(descriptor, 4, 2 | 4) == 0);
+    Require(fcntl_nid_postfix(descriptor, 3) == (2 | 4));
+    int enabled = 0;
+    std::uint32_t length = sizeof(enabled);
+    Require(sceNetGetsockopt(descriptor, 0xffff, 0x1200, &enabled, &length) == 0 && enabled == 1);
+    Require(fcntl_nid_postfix(descriptor, 4, 2) == 0);
+    Require(fcntl_nid_postfix(descriptor, 3) == 2);
+    length = sizeof(enabled);
+    Require(sceNetGetsockopt(descriptor, 0xffff, 0x1200, &enabled, &length) == 0 && enabled == 0);
+    *__error_nid_postfix() = 0;
+    Require(fcntl_nid_postfix(descriptor, 4, 0x100) == -1 && *__error_nid_postfix() == 45);
+    *__error_nid_postfix() = 0;
+    Require(fcntl_nid_postfix(descriptor, 1) == -1 && *__error_nid_postfix() == 22);
+    Require(close_nid_postfix(descriptor) == 0);
+}
+
 static void CheckAddressText(int family, const char* text) {
     std::array<std::uint8_t, 16> address{};
     Require(sceNetInetPton(family, text, address.data()) == 1);
@@ -669,6 +696,23 @@ static void CheckStreamAddressLengths() {
         Require(std::memcmp(peer.data(), clientAddress.data(), copied) == 0 && Untouched(peer, copied));
     }
     for (const int descriptor : {accepted, client, listener}) Require(sceNetSocketClose(descriptor) == 0);
+}
+
+static void CheckBufferSizes() {
+    const int socket = sceNetSocket("buffer-sizes", 2, 2, 17);
+    Require(socket >= 0);
+    for (const int option : {0x1001, 0x1002}) {
+        int value = -1;
+        std::uint32_t size = sizeof(value);
+        Require(sceNetGetsockopt(socket, 0xffff, option, &value, &size) == 0 && size == sizeof(value) && value > 0);
+    }
+    for (const auto [option, requested] : {std::array{0x1001, 32768}, std::array{0x1002, 65536}}) {
+        Require(sceNetSetsockopt(socket, 0xffff, option, &requested, sizeof(requested)) == 0);
+        int value = -1;
+        std::uint32_t size = sizeof(value);
+        Require(sceNetGetsockopt(socket, 0xffff, option, &value, &size) == 0 && size == sizeof(value) && value == requested);
+    }
+    Require(sceNetSocketClose(socket) == 0);
 }
 
 static void CheckUnspecifiedIpv6() {
@@ -844,6 +888,7 @@ int main() {
     Require(Failed(sceNetSocketClose(closed), 9));
     CheckKernelTimeouts();
     CheckSocketError();
+    CheckKernelStatusFlags();
 
     const int listener = sceNetSocket(nullptr, 2, 1, 6);
     Require(listener >= 0);
@@ -876,6 +921,7 @@ int main() {
     CheckDatagramAddressLengths(2);
     CheckDatagramAddressLengths(28);
     CheckStreamAddressLengths();
+    CheckBufferSizes();
 
     const int epoll = sceNetEpollCreate("guest-sce-net", 0);
     Require(epoll >= 0);
@@ -986,6 +1032,13 @@ int main() {
     Require(select_nid_postfix(std::max(kernel_socket, udp_sender) + 1, nullptr, mixed_writable, nullptr, wait_second) == 2);
     Require(((mixed_writable[kernel_socket / 64] >> (kernel_socket % 64)) & 1u) != 0);
     Require(((mixed_writable[udp_sender / 64] >> (udp_sender % 64)) & 1u) != 0);
+    GuestPollEntry net_read{udp_receiver, 1, 0};
+    Require(poll_nid_postfix(&net_read, 1, 0) == 0 && net_read.revents == 0);
+    Require(sceNetSendto(udp_sender, datagram, sizeof(datagram), 0, address.data(), address.size()) == sizeof(datagram));
+    Require(poll_nid_postfix(&net_read, 1, 1000) == 1 && net_read.revents == 1);
+    Require(sceNetRecvfrom(udp_receiver, datagram_result, sizeof(datagram_result), 0, nullptr, nullptr) == sizeof(datagram_result));
+    GuestPollEntry mixed_poll[2]{{kernel_socket, 4, 0}, {udp_sender, 4, 0}};
+    Require(poll_nid_postfix(mixed_poll, 2, 1000) == 2 && mixed_poll[0].revents == 4 && mixed_poll[1].revents == 4);
     Require(close_nid_postfix(kernel_socket) == 0);
     std::uint64_t stdio_readable[16]{1};
     std::uint64_t stdio_writable[16]{6};

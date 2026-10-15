@@ -14,6 +14,7 @@ struct MacOsBind {
     std::string Symbol;
     std::uint32_t Rva;
     std::int64_t Addend = 0;
+    bool Weak = false;
 };
 
 struct MacOsExport {
@@ -60,6 +61,7 @@ std::uint64_t GuestTlsBlockSize(const Domain::ProgramHeader& tls);
 std::vector<std::uint8_t> WriteMacOsImage(MacOsImageInput& input);
 
 std::string MachOLoadPath(const std::string& path, const std::string& origin);
+std::vector<std::string> MachORunPaths(const std::string& paths, const std::string& origin);
 
 std::string MachODependency(const std::string& name, const std::string& origin);
 

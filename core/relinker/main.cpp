@@ -14,6 +14,7 @@
 #include <filesystem>
 #include <iostream>
 #include <memory>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -40,7 +41,7 @@ ConvertedExecutable Convert(const Cli::Args& args, const std::string& inputPath,
     input.InputPath = std::filesystem::absolute(Io::NativePath(inputPath)).lexically_normal();
     input.OutputPath = Io::NativePath(absPath);
     if (!args.skipSceModule) {
-        auto modules = Cli::ReadModules(input.InputPath, Io::NativePath(args.sceModulePath), args.excludedSceModules, args.moduleDirectories);
+        auto modules = Cli::ReadModules(std::filesystem::absolute(Io::NativePath(args.inputPath)).lexically_normal(), Io::NativePath(args.sceModulePath), args.excludedSceModules, args.moduleDirectories);
         input.ModuleRoot = std::move(modules.Root);
         input.Modules = std::move(modules.Modules);
         input.RuntimeDirectories = std::move(modules.RuntimeDirectories);
@@ -67,6 +68,100 @@ ConvertedExecutable Convert(const Cli::Args& args, const std::string& inputPath,
     for (const auto& module : input.Modules) progress.IncludeFile(Io::Utf8Path(module.Path));
     auto converted = Relinker::Conversion(progress).Convert(std::move(input), options);
     return {inputPath, absPath, std::move(converted.Analysis), std::move(converted.Modules), std::move(converted.Executable), std::move(converted.WindowsDiagnostics)};
+}
+
+#ifdef _WIN32
+
+class OutputIdentityDirectory {
+public:
+    OutputIdentityDirectory(const OutputIdentityDirectory&) = delete;
+    OutputIdentityDirectory& operator=(const OutputIdentityDirectory&) = delete;
+
+    explicit OutputIdentityDirectory(const std::filesystem::path& parent) {
+        std::random_device random;
+        for (unsigned attempt = 0; attempt < 64; ++attempt) {
+            const auto candidate = parent / (".anyps5-output-identity-" + std::to_string(random()) + "-" + std::to_string(random()));
+            std::error_code error;
+            if (std::filesystem::create_directory(candidate, error)) {
+                directory = candidate;
+                return;
+            }
+            if (error && error != std::errc::file_exists)
+                throw std::filesystem::filesystem_error("Cannot create output identity directory", candidate, error);
+        }
+        throw Domain::RelinkerException("Cannot reserve an output identity directory in " + Io::Utf8Path(parent));
+    }
+
+    ~OutputIdentityDirectory() {
+        if (directory.empty()) return;
+        try {
+            Remove();
+        } catch (const std::exception& error) {
+            std::cerr << "FAIL: Output identity cleanup: " << error.what() << '\n';
+        }
+    }
+
+    std::filesystem::path GetPath() const { return directory / "file"; }
+    const std::filesystem::path& GetDirectory() const { return directory; }
+
+    void Remove() {
+        std::filesystem::remove(GetPath());
+        std::filesystem::remove(directory);
+        directory.clear();
+    }
+
+private:
+    std::filesystem::path directory;
+};
+
+#endif
+
+bool SameOutputFile(const std::filesystem::path& first, const std::filesystem::path& second) {
+    if (std::filesystem::equivalent(first, second)) return true;
+#ifdef _WIN32
+    if (std::filesystem::status(first).permissions() != std::filesystem::status(second).permissions() &&
+        std::filesystem::hard_link_count(first) > 1 && std::filesystem::hard_link_count(second) > 1) {
+        for (const auto& path : {first, second}) {
+            if ((std::filesystem::status(path).permissions() & std::filesystem::perms::owner_write) == std::filesystem::perms::none)
+                throw Domain::RelinkerException("Cannot compare read-only output identities: " + Io::Utf8Path(path));
+        }
+        OutputIdentityDirectory firstDirectory(first.parent_path());
+        OutputIdentityDirectory secondDirectory(second.parent_path());
+        std::filesystem::create_hard_link(first, firstDirectory.GetPath());
+        std::filesystem::create_hard_link(second, secondDirectory.GetPath());
+        const bool same = std::filesystem::equivalent(firstDirectory.GetPath(), secondDirectory.GetPath());
+        secondDirectory.Remove();
+        firstDirectory.Remove();
+        return same;
+    }
+#endif
+    return false;
+}
+
+bool SameOutputDestination(const std::filesystem::path& first, const std::filesystem::path& second) {
+    const auto firstPath = std::filesystem::weakly_canonical(first);
+    const auto secondPath = std::filesystem::weakly_canonical(second);
+    if (firstPath == secondPath) return true;
+    if (std::filesystem::exists(first) && std::filesystem::exists(second)) return SameOutputFile(first, second);
+#ifdef _WIN32
+    auto firstName = Io::Utf8Path(firstPath.filename());
+    auto secondName = Io::Utf8Path(secondPath.filename());
+    for (auto* name : {&firstName, &secondName})
+        for (auto& character : *name)
+            if (character >= 'A' && character <= 'Z') character = static_cast<char>(character + ('a' - 'A'));
+    if (firstName == secondName && std::filesystem::exists(firstPath.parent_path()) &&
+        std::filesystem::exists(secondPath.parent_path()) && std::filesystem::equivalent(firstPath.parent_path(), secondPath.parent_path())) {
+        OutputIdentityDirectory probe(firstPath.parent_path());
+        auto alternateName = Io::Utf8Path(probe.GetDirectory().filename());
+        for (auto& character : alternateName)
+            if (character >= 'a' && character <= 'z') character = static_cast<char>(character - ('a' - 'A'));
+        const auto alternate = firstPath.parent_path() / Io::NativePath(alternateName);
+        const bool same = std::filesystem::exists(alternate) && std::filesystem::equivalent(probe.GetDirectory(), alternate);
+        probe.Remove();
+        return same;
+    }
+#endif
+    return false;
 }
 
 int Run(const int argc, char* argv[]) {
@@ -170,6 +265,7 @@ int Run(const int argc, char* argv[]) {
             checkOutputInputs(std::filesystem::absolute("windows-diagnostics-imports.txt"), "Windows import diagnostics");
 
         std::vector<std::filesystem::path> registryPaths;
+        std::vector<std::filesystem::path> neededPaths;
         if (args.writeRegistry) {
             for (const auto& executable : executables) {
                 const std::filesystem::path outFsPath = Io::NativePath(executable.OutputPath);
@@ -179,10 +275,34 @@ int Run(const int argc, char* argv[]) {
             for (const auto& artifact : guestArtifacts)
                 registryPaths.push_back(outFsPath.parent_path() / Io::NativePath(Io::Utf8Path(outFsPath.stem()) + "." + Io::Utf8Path(artifact.Path.filename()) + ".registry.json"));
             for (const auto& path : registryPaths) checkOutputInputs(path, "Registry");
+            for (const auto& path : registryPaths) {
+                auto name = Io::Utf8Path(path.filename());
+                name.resize(name.size() - std::string(".registry.json").size());
+                neededPaths.push_back(path.parent_path() / Io::NativePath(name + ".needed.json"));
+            }
+            for (const auto& path : neededPaths) checkOutputInputs(path, "Needed libraries");
         }
 
         checkOutputInputs(Io::NativePath(absPath), "Executable");
         for (const auto& artifact : guestArtifacts) checkOutputInputs(artifact.Path, "Guest module");
+
+        std::vector<std::filesystem::path> outputPaths;
+        for (const auto& executable : executables) outputPaths.push_back(Io::NativePath(executable.OutputPath));
+        for (const auto& artifact : guestArtifacts) outputPaths.push_back(artifact.Path);
+        outputPaths.insert(outputPaths.end(), registryPaths.begin(), registryPaths.end());
+        if (desktopEntry) {
+            outputPaths.push_back(desktopEntry->IconPath);
+            outputPaths.push_back(desktopEntry->EntryPath);
+        }
+        if (args.windowsDiagnostics) outputPaths.push_back(std::filesystem::absolute("windows-diagnostics-imports.txt"));
+        for (std::size_t index = 0; index < outputPaths.size(); ++index) {
+            for (std::size_t previous = 0; previous < index; ++previous) {
+                const auto& first = outputPaths[index];
+                const auto& second = outputPaths[previous];
+                if (SameOutputDestination(first, second))
+                    throw Domain::RelinkerException("Output paths collide: " + Io::Utf8Path(first) + " and " + Io::Utf8Path(second));
+            }
+        }
 
         if (args.windowsDiagnostics) fileWriter.Write("windows-diagnostics-imports.txt", executables.front().Diagnostics);
         const auto outputCount = guestArtifacts.size() + executables.size();
@@ -199,10 +319,14 @@ int Run(const int argc, char* argv[]) {
         }
         if (args.writeRegistry) {
             const auto registryWriter = std::make_shared<Relinker::CallRegistryWriter>();
-            for (std::size_t index = 0; index < executables.size(); ++index)
+            for (std::size_t index = 0; index < executables.size(); ++index) {
                 fileWriter.Write(Io::Utf8Path(registryPaths[index]), registryWriter->WriteCallRegistry(executables[index].Result.RegistryEntries));
-            for (std::size_t index = 0; index < guestArtifacts.size(); ++index)
+                fileWriter.Write(Io::Utf8Path(neededPaths[index]), registryWriter->WriteNeededLibraries(executables[index].Result.DynamicSection.NeededLibraries));
+            }
+            for (std::size_t index = 0; index < guestArtifacts.size(); ++index) {
                 fileWriter.Write(Io::Utf8Path(registryPaths[executables.size() + index]), registryWriter->WriteModuleImports(guestArtifacts[index].Imports));
+                fileWriter.Write(Io::Utf8Path(neededPaths[executables.size() + index]), registryWriter->WriteNeededLibraries(guestArtifacts[index].NeededLibraries));
+            }
         }
         progress.Finish();
         if (desktopEntry) std::cout << "Desktop entry: " << Io::Utf8Path(desktopEntryWriter.Write(*desktopEntry)) << '\n';

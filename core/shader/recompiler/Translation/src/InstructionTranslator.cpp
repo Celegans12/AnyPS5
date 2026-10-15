@@ -86,6 +86,10 @@ const ShaderWorkgroupInputInfo* shaderWorkgroupInput(ShaderStageKind stage, cons
     }
 }
 
+bool isUnlinkedCall(const ControlFlowGraph& cfg, std::uint32_t programCounter) {
+    return std::find(cfg.unlinkedCallProgramCounters.begin(), cfg.unlinkedCallProgramCounters.end(), programCounter) != cfg.unlinkedCallProgramCounters.end();
+}
+
 bool isCodeTableLoad(const ControlFlowGraph& cfg, std::uint32_t programCounter) {
     return std::find(cfg.codeTableLoadProgramCounters.begin(), cfg.codeTableLoadProgramCounters.end(), programCounter) != cfg.codeTableLoadProgramCounters.end();
 }
@@ -231,7 +235,7 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
             const std::uint32_t waves = std::min((totalThreads + waveSize - 1u) / waveSize, 0x3fu);
             IrValue& localIndex = builtin(StageInputKind::LocalInvocationIndex);
             IrValue& waveId = entryIr.Emit(IrOpcode::UDiv32, IrOpcodeType(IrOpcode::UDiv32), {&localIndex, &entryIr.Constant(waveSize)});
-            IrValue& waveBits = entryIr.ShiftLeftLogical(waveId, entryIr.Constant(20u));
+            IrValue& waveBits = entryIr.BitwiseOr(entryIr.ShiftLeftLogical(waveId, entryIr.Constant(6u)), entryIr.ShiftLeftLogical(waveId, entryIr.Constant(20u)));
             IrValue& firstBit = entryIr.Select(entryIr.IEqual(waveId, entryIr.Constant(0u)), entryIr.Constant(0x80000000u), entryIr.Constant(0u));
             entryIr.SetScalarReg(static_cast<ScalarReg>(cs->workgroupRegister + regOffset), entryIr.BitwiseOr(entryIr.BitwiseOr(waveBits, entryIr.Constant(waves)), firstBit));
         }
@@ -363,7 +367,9 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
             setVector(static_cast<VectorReg>(vgpr(PixelInput::PositionW)), entryIr.BitCastU32(w));
         }
         if (loaded(PixelInput::FrontFace)) {
-            setVector(static_cast<VectorReg>(vgpr(PixelInput::FrontFace)), builtin(StageInputKind::FrontFacing));
+            // The front value under FRONT_FACE_ALL_BITS is not measured (docs/dev/debt/shader.md).
+            IrValue& facing = builtin(StageInputKind::FrontFacing);
+            setVector(static_cast<VectorReg>(vgpr(PixelInput::FrontFace)), ps->psFrontFaceAllBits ? entryIr.Select(entryIr.IEqual(facing, entryIr.Constant(0x3f800000u)), entryIr.Constant(0xffffffffu), entryIr.Constant(0u)) : facing);
         }
         if (loaded(PixelInput::Ancillary)) {
             setVector(static_cast<VectorReg>(vgpr(PixelInput::Ancillary)), builtin(StageInputKind::PackedAncillary));
@@ -532,6 +538,10 @@ IrProgram InstructionTranslator::Translate(const RdnaProgram& decoded, const Con
                 const auto table = std::find_if(cfg.codeTableLoads.begin(), cfg.codeTableLoads.end(), [&](const auto& entry) { return entry.programCounter == instruction.programCounter; });
                 if (table == cfg.codeTableLoads.end()) throw std::runtime_error("missing shader code table values");
                 context.TranslateCodeTableLoad(instruction, *table);
+                continue;
+            }
+            if (isUnlinkedCall(cfg, instruction.programCounter)) {
+                context.TranslateUnlinkedCall(instruction);
                 continue;
             }
             if (options.embeddedFetch != nullptr) {

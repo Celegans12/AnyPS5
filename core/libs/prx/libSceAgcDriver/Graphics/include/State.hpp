@@ -100,6 +100,7 @@ struct State {
     bool stencilTest = false;
     VkStencilOpState stencilFront{};
     VkStencilOpState stencilBack{};
+    std::optional<std::uint32_t> stencilReplayReference;
     ColorTarget color;
     std::vector<ColorTarget> colors;
     std::vector<ColorTarget> blendedColors;
@@ -131,6 +132,8 @@ struct State {
     bool customSampleLocations = false;
     bool sampleLocationGrid = false;
     std::uint32_t paClVsOutCntl = 0;
+    std::array<std::uint16_t, 4> quadSampleMask{0xffffu, 0xffffu, 0xffffu, 0xffffu};
+    bool pixelEarlyZ = false;
 };
 
 // PA_CL_VS_OUT_CNTL bits that place position exports (clip and cull distances, the misc and the two
@@ -144,13 +147,18 @@ VkExtent2D SampleLocationGrid(const State& state);
 std::array<std::uint8_t, 8> ExportMappings(const State& state);
 std::array<ShaderRecompiler::ColorExportPacking, 8> ExportPackings(const State& state);
 ShaderRecompiler::RasterPrimitive RasterPrimitiveOf(const State& state);
-ColorTarget DecodeColorBuffer(const Registers& context, std::uint32_t slot);
+bool PartialSampleMask(const State& state);
+bool UniformSampleMask(const State& state);
+VkSampleMask HostSampleMask(const State& state);
+std::uint8_t QuadPixelMask(const State& state);
+std::array<std::uint16_t, 4> QuadSampleMasks(const State& state);
+ColorTarget DecodeColorBuffer(const Registers& context, std::uint32_t slot, bool allowMultisampleDcc = false);
 std::size_t CmaskBytes(std::uint32_t width, std::uint32_t height);
 std::uint32_t ColorWriteMask(const Registers& context);
 GuestTextureResource SurfaceForTarget(const ColorTarget& color);
 
 struct ColorMetadataPass {
-    enum class Mode { EliminateFastClear, DccDecompress, Resolve };
+    enum class Mode { EliminateFastClear, DccDecompress, Resolve, FmaskDecompress };
     Mode mode;
     std::vector<ColorTarget> targets;
     std::optional<ColorTarget> source;
@@ -198,7 +206,9 @@ struct DrawKeyRange {
 inline constexpr std::array<DrawKeyRange, 49> DrawKeyRegisters{{
     {RegisterBank::Context, 0x000, 3}, {RegisterBank::Context, 0x005, 1}, {RegisterBank::Context, 0x007, 7}, {RegisterBank::Context, 0x010, 6}, {RegisterBank::Context, 0x01a, 5},
     {RegisterBank::Context, 0x080, 4}, {RegisterBank::Context, 0x08c, 4}, {RegisterBank::Context, 0x090, 2}, {RegisterBank::Context, 0x094, 2}, {RegisterBank::Context, 0x0b4, 2}, {RegisterBank::Context, 0x105, 4}, {RegisterBank::Context, 0x10b, 3}, {RegisterBank::Context, 0x10f, 6},
-    {RegisterBank::Context, 0x191, 32}, {RegisterBank::Context, 0x1b3, 2}, {RegisterBank::Context, 0x1b6, 1}, {RegisterBank::Context, 0x1c3, 3}, {RegisterBank::Context, 0x1d5, 3}, {RegisterBank::Context, 0x1e0, 8}, {RegisterBank::Context, 0x1ff, 1},
+    // SPI_PS_INPUT_CNTL_0..31, SPI_PS_INPUT_ENA/ADDR, SPI_PS_IN_CONTROL .. SPI_BARYC_CNTL, SPI_SHADER_POS/Z/COL_FORMAT,
+    // CB_BLEND0..7_CONTROL, GE_MAX_OUTPUT_PER_SUBGROUP.
+    {RegisterBank::Context, 0x191, 32}, {RegisterBank::Context, 0x1b3, 2}, {RegisterBank::Context, 0x1b6, 3}, {RegisterBank::Context, 0x1c3, 3}, {RegisterBank::Context, 0x1d5, 3}, {RegisterBank::Context, 0x1e0, 8}, {RegisterBank::Context, 0x1ff, 1},
     // DB_DEPTH_CONTROL .. PA_CL_VS_OUT_CNTL, PA_SC_MODE_CNTL_0/1, VGT_GS_MODE, VGT_GS_VERT_ITEMSIZE,
     // PA_SU_VTX_CNTL, the sample masks, PA_SC_CONSERVATIVE_RASTERIZATION_CNTL.
     {RegisterBank::Context, 0x200, 8}, {RegisterBank::Context, 0x286, 2}, {RegisterBank::Context, 0x292, 2}, {RegisterBank::Context, 0x29b, 1}, {RegisterBank::Context, 0x2ab, 1}, {RegisterBank::Context, 0x2ce, 1}, {RegisterBank::Context, 0x2d5, 2}, {RegisterBank::Context, 0x2db, 2}, {RegisterBank::Context, 0x2de, 6}, {RegisterBank::Context, 0x2f8, 2}, {RegisterBank::Context, 0x2fe, 16}, {RegisterBank::Context, 0x30e, 2}, {RegisterBank::Context, 0x313, 1},

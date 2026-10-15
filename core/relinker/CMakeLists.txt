@@ -484,6 +484,9 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_guest_symbol_names.py $<TARGET_FILE:relinker>)
         add_test(NAME guest_registry COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_guest_registry.py $<TARGET_FILE:relinker>)
+        add_test(NAME needed_libraries COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_needed_libraries.py $<TARGET_FILE:relinker>)
+        set_tests_properties(needed_libraries PROPERTIES TIMEOUT 30)
         add_test(NAME macos_output COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_macos_output.py $<TARGET_FILE:relinker>)
         add_test(NAME guest_host_libc COMMAND ${Python3_EXECUTABLE}
@@ -551,6 +554,10 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_input_magic.py $<TARGET_FILE:relinker>)
         add_test(NAME input_preservation COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_input_preservation.py $<TARGET_FILE:relinker>)
+        add_test(NAME output_collisions COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_output_collisions.py $<TARGET_FILE:relinker>)
+        add_test(NAME secondary_output_collisions COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_secondary_output_collisions.py $<TARGET_FILE:relinker>)
         add_test(NAME input_file COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_input_file.py $<TARGET_FILE:relinker>)
         add_test(NAME null_symbol_relocations COMMAND ${Python3_EXECUTABLE}

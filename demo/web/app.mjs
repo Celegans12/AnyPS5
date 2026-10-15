@@ -1,11 +1,15 @@
+import { abortAndDiscardOutput, OutputDirectoryTransaction } from "./output-directory.mjs";
+
 const $ = id => document.getElementById(id);
 const stages = ["Converting executable", "Converting PRX modules", "Scanning syscalls", "Scanning instructions", "Converting instructions", "Analysing imports", "Building output image", "Writing output"];
 let worker;
 let file;
 let summary;
 let working = false;
+let failing = false;
 let sink;
 let outputDirectory;
+let outputTransaction;
 let downloadUrl;
 let logs = [];
 let release;
@@ -29,15 +33,20 @@ function update() {
   folderOption.disabled = !canStream || target === "windows";
   folderOption.textContent = target === "windows" ? "Save to folder · unavailable for Windows (DLL restrictions)" : "Save to folder · uncompressed";
   const libraryBytes = release?.platforms[target]?.expandedBytes;
-  const estimate = summary && libraryBytes !== undefined ? Math.ceil(summary.totalBytes * 1.02) + summary.selectedBytes * 4 + libraryBytes + summary.files * 1024 + 8 * 1024 * 1024 : null;
+  const selectedBytes = summary ? target === "windows" ? summary.windowsSelectedBytes : summary.selectedBytes : null;
+  const conversionTooLarge = selectedBytes !== null && selectedBytes > 256 * 1024 * 1024;
+  const iconTooLarge = target === "windows" && Boolean(summary?.windowsIconTooLarge);
+  const conversionBlocked = conversionTooLarge || iconTooLarge;
+  const estimate = summary && libraryBytes !== undefined ? Math.ceil(summary.totalBytes * 1.02) + selectedBytes * 4 + libraryBytes + summary.files * 1024 + 8 * 1024 * 1024 : null;
   const tooLarge = estimate !== null && estimate > 256 * 1024 * 1024;
   $("save").querySelector('[value="memory"]').disabled = Boolean(tooLarge);
   const memoryBlocked = $("save").value === "memory" && tooLarge;
-  $("save-note").textContent = $("save").value === "disk" ? "Creates a subfolder with the executable, libs and app0. No ZIP compression. Browsers may block DLL and other restricted files; use ZIP for those apps." : $("save").value === "zip" ? "Writes a compressed ZIP directly to disk without holding the whole archive in memory." : "Up to 256 MiB including expanded files and output overhead.";
-  $("browser-note").hidden = supported && canStream && canSaveZip && !memoryBlocked && !folderBlocked;
-  $("browser-note").textContent = !supported ? "This browser or connection does not support the converter. Use a current browser over HTTPS, or use the native relinker." : folderBlocked ? "Browsers block direct DLL creation. Windows output requires ZIP. Choose Save ZIP to disk or Download in memory." : memoryBlocked ? "This archive exceeds the memory-download limit. Choose Save ZIP to disk. If that option is unavailable, open this page in desktop Chrome or Edge." : "Some direct disk saving options are unavailable in this browser or context. Small apps can still be downloaded in memory. For larger apps, use desktop Chrome or Edge over HTTPS.";
-  $("convert").disabled = !supported || working || !summary || !release || memoryBlocked || folderBlocked || (summary.warnings.length > 0 && !$("acknowledge").checked);
-  $("ready-note").textContent = summary ? (folderBlocked ? "Choose a ZIP save mode for Windows." : memoryBlocked ? "A direct disk save is required for this archive." : release ? `Libraries: ${release.tag} · ${$("save").value === "disk" ? "Uncompressed folder" : "ZIP compression level 9"}` : "Loading release information…") : "Choose a ZIP or folder to get started.";
+  if (summary) $("archive-info").textContent = `${summary.files} files · ${bytes(summary.totalBytes)} expanded · ${summary.modules} modules · ${bytes(selectedBytes)} ${target} conversion input` + (summary.root ? ` · Root: ${summary.root}` : "");
+  $("save-note").textContent = $("save").value === "disk" ? "Creates a subfolder with the executable, libs and app0. No ZIP compression. Incomplete output folders are removed after cancellation or failure. Browsers may block DLL and other restricted files; use ZIP for those apps." : $("save").value === "zip" ? "Writes a compressed ZIP directly to disk without holding the whole archive in memory." : "Up to 256 MiB including expanded files and output overhead.";
+  $("browser-note").hidden = supported && canStream && canSaveZip && !memoryBlocked && !folderBlocked && !conversionBlocked;
+  $("browser-note").textContent = !supported ? "This browser or connection does not support the converter. Use a current browser over HTTPS, or use the native relinker." : folderBlocked ? "Browsers block direct DLL creation. Windows output requires ZIP. Choose Save ZIP to disk or Download in memory." : iconTooLarge ? "The Windows icon exceeds 16 MiB. Choose Linux or use the native relinker." : conversionTooLarge ? `This ${target} conversion input exceeds 256 MiB. Use the native relinker for this app.` : memoryBlocked ? "This archive exceeds the memory-download limit. Choose Save ZIP to disk. If that option is unavailable, open this page in desktop Chrome or Edge." : "Some direct disk saving options are unavailable in this browser or context. Small apps can still be downloaded in memory. For larger apps, use desktop Chrome or Edge over HTTPS.";
+  $("convert").disabled = !supported || working || !summary || !release || conversionBlocked || memoryBlocked || folderBlocked || (summary.warnings.length > 0 && !$("acknowledge").checked);
+  $("ready-note").textContent = summary ? (folderBlocked ? "Choose a ZIP save mode for Windows." : iconTooLarge ? "The Windows icon exceeds 16 MiB. Choose Linux or use the native relinker." : conversionTooLarge ? `The ${target} conversion input exceeds 256 MiB. Use the native relinker.` : memoryBlocked ? "A direct disk save is required for this archive." : release ? `Libraries: ${release.tag} · ${$("save").value === "disk" ? "Uncompressed folder" : "ZIP compression level 9"}` : "Loading release information…") : "Choose a ZIP or folder to get started.";
 }
 
 function lock(value) {
@@ -45,22 +54,30 @@ function lock(value) {
 }
 
 async function fail(message) {
+  if (failing) return;
+  failing = true;
   worker?.terminate();
   worker = null;
-  working = false;
+  working = true;
   summary = null;
-  if (sink) {
-    const active = sink;
-    sink = null;
-    try { await active.abort(); } catch (error) { message += `\nCould not discard the output file: ${error.message}`; }
+  const transaction = outputTransaction;
+  outputTransaction = null;
+  outputDirectory = null;
+  if (transaction) {
+    $("status").hidden = false;
+    $("phase").textContent = "Removing incomplete output folder";
   }
-  if (outputDirectory) { message += `\nIncomplete files remain in ${outputDirectory.name}/.`; outputDirectory = null; }
+  const activeSink = sink;
+  sink = null;
+  for (const failure of await abortAndDiscardOutput(transaction, activeSink)) message += `\n${failure}`;
   $("error").textContent = message;
   $("error").hidden = false;
   $("status").hidden = true;
   $("cancel").hidden = true;
   $("drop").hidden = false;
   $("file").value = "";
+  working = false;
+  failing = false;
   lock(false);
   update();
 }
@@ -90,7 +107,6 @@ async function onMessage({ data }) {
       $("selection").hidden = false;
       $("drop").hidden = true;
       $("archive-name").textContent = file.name;
-      $("archive-info").textContent = `${summary.files} files · ${bytes(summary.totalBytes)} expanded · ${summary.modules} modules · ${bytes(summary.selectedBytes)} conversion input` + (summary.root ? ` · Root: ${summary.root}` : "");
       $("warning-list").replaceChildren(...summary.warnings.map(message => { const item = document.createElement("li"); item.textContent = message; return item; }));
       $("warnings").hidden = !summary.warnings.length;
       $("status").hidden = true;
@@ -137,11 +153,13 @@ async function onMessage({ data }) {
       } else if (data.mode === "zip") {
         $("result-info").textContent += " · ZIP saved to disk";
       } else {
-        $("result-info").textContent += ` · Saved in ${outputDirectory.name}/`;
+        $("result-info").textContent += ` · Saved in ${outputTransaction.name}/`;
         if (document.querySelector('input[name="target"]:checked').value === "linux") $("result-info").textContent += ` · On Linux, run chmod +x "${data.outputName}" before launching.`;
       }
       $("result-note").hidden = data.mode === "disk";
       outputDirectory = null;
+      outputTransaction?.commit();
+      outputTransaction = null;
       summary = null;
       worker.terminate();
       worker = null;
@@ -202,11 +220,8 @@ $("convert").onclick = async () => {
     } else if ($("save").value === "disk") {
       const parent = await window.showDirectoryPicker({ mode: "readwrite" });
       const name = file.name.replace(/\.zip$/iu, "") + "-" + document.querySelector('input[name="target"]:checked').value;
-      let exists = false;
-      try { await parent.getDirectoryHandle(name); exists = true; }
-      catch (error) { if (error.name !== "NotFoundError") throw error; }
-      if (exists) throw new Error(`The folder ${name} already exists. Choose another destination or rename the existing folder.`);
-      outputDirectory = await parent.getDirectoryHandle(name, { create: true });
+      outputTransaction = await OutputDirectoryTransaction.create(parent, name);
+      outputDirectory = outputTransaction.directory;
     }
     $("status").hidden = false;
     $("cancel").hidden = false;

@@ -41,8 +41,8 @@ struct Registry {
 };
 
 Registry& registry() {
-    static Registry value;
-    return value;
+    static auto* value = new Registry;
+    return *value;
 }
 
 std::atomic<std::uint64_t> generation{1};
@@ -378,6 +378,33 @@ bool GuestAllocationsOverlaps_nid_postfix(void*, const void* pointer, std::size_
     return false;
 }
 
+bool GuestAllocationsForRegistered_nid_postfix(void*, const void* pointer, std::size_t bytes, const std::function<void(const void*, std::size_t)>& visit) {
+    const auto address = reinterpret_cast<std::uintptr_t>(pointer);
+    require(address != 0 && bytes != 0 && bytes <= std::numeric_limits<std::uint64_t>::max() - address, "invalid guest allocation range");
+    const auto end = address + bytes;
+    const auto& ranges = registry().ranges;
+    auto it = ranges.upper_bound(address);
+    if (it != ranges.begin()) --it;
+    std::uintptr_t first = 0;
+    std::uintptr_t last = 0;
+    bool any = false;
+    for (; it != ranges.end() && it->first < end; ++it) {
+        const auto base = std::max<std::uintptr_t>(it->first, address);
+        const auto finish = std::min<std::uintptr_t>(it->first + it->second->bytes, end);
+        if (finish <= base) continue;
+        if (any && base == last) {
+            last = finish;
+            continue;
+        }
+        if (any) visit(reinterpret_cast<const void*>(first), last - first);
+        first = base;
+        last = finish;
+        any = true;
+    }
+    if (any) visit(reinterpret_cast<const void*>(first), last - first);
+    return any;
+}
+
 bool GuestAllocationsCovers_nid_postfix(void*, const void* pointer, std::size_t bytes) {
     const auto address = reinterpret_cast<std::uintptr_t>(pointer);
     require(address != 0 && bytes != 0 && bytes <= std::numeric_limits<std::uint64_t>::max() - address, "invalid guest allocation range");
@@ -456,10 +483,10 @@ RangePatch replaceRange(const void* pointer, std::size_t bytes, bool remove, boo
         const auto insert = [&](std::uint64_t first, std::uint64_t last, bool canRead, bool canWrite, bool gpuMapped) {
             if (first < last) patch.inserted.emplace_back(first, std::make_shared<const Range>(Range{first, static_cast<std::size_t>(last - first), canRead, canWrite, range.allocationAddress, range.allocationBytes, range.releasable, gpuMapped}));
         };
-        insert(base, std::max(base, address), range.readable, range.writable, range.gpu);
-        if (!remove) insert(std::max(base, address), std::min(finish, end), readable, writable, gpu);
-        insert(std::min(finish, end), finish, range.readable, range.writable, range.gpu);
-        cursor = std::min(finish, end);
+        insert(base, std::max<std::uint64_t>(base, address), range.readable, range.writable, range.gpu);
+        if (!remove) insert(std::max<std::uint64_t>(base, address), std::min<std::uint64_t>(finish, end), readable, writable, gpu);
+        insert(std::min<std::uint64_t>(finish, end), finish, range.readable, range.writable, range.gpu);
+        cursor = std::min<std::uint64_t>(finish, end);
     }
     require(cursor == end, "guest protection or unmap range is not registered");
     return patch;

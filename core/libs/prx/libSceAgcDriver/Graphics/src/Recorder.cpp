@@ -29,6 +29,7 @@
 #include <string>
 #include <thread>
 #include <tuple>
+#include "prx/libc/include/general/AtomicSharedPtr.hpp"
 
 namespace AgcDriver::Graphics {
 
@@ -633,7 +634,7 @@ using WriteRanges = Recorder::WriteRanges;
 // work. A range leaves the snapshot only after its batch's completions (CPU write-backs) ran, so a
 // reader that sees no overlap either precedes the note (the queues are unordered then, as on the
 // GPU) or follows the write-back.
-std::atomic<std::shared_ptr<const WriteRanges>> pendingWrites;
+AtomicSharedPtr<const WriteRanges> pendingWrites;
 
 bool HookSnapshotEnabled() {
     // Debug aid: APS5_NO_HOOK_SNAPSHOT=1 takes the GpuMutex on every access as before.
@@ -2526,6 +2527,31 @@ void Recorder::eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterat
     drawSnapshots.erase(entry);
 }
 
+void Recorder::retireUnwrittenSnapshots(const std::array<std::uint64_t, 3>& stamp) {
+    if (stamp == unwrittenStamp) return;
+    unwrittenSnapshots.clear();
+    unwrittenBytes = 0;
+    unwrittenStamp = stamp;
+}
+
+std::shared_ptr<Buffer> Recorder::UnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp) {
+    retireUnwrittenSnapshots(stamp);
+    const auto found = unwrittenSnapshots.find(address);
+    if (found == unwrittenSnapshots.end() || found->second.bytes != bytes) return {};
+    return found->second.buffer;
+}
+
+void Recorder::NoteUnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp, std::shared_ptr<Buffer> buffer) {
+    retireUnwrittenSnapshots(stamp);
+    if (const auto found = unwrittenSnapshots.find(address); found != unwrittenSnapshots.end()) {
+        unwrittenBytes -= found->second.bytes;
+        unwrittenSnapshots.erase(found);
+    }
+    if (unwrittenSnapshots.size() >= UnwrittenSnapshotEntries || bytes > DrawSnapshotBudget - unwrittenBytes) return;
+    unwrittenSnapshots.emplace(address, UnwrittenSnapshot{bytes, std::move(buffer)});
+    unwrittenBytes += bytes;
+}
+
 std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint32_t* derived, std::uint64_t generation) {
     auto found = use == SnapshotUse::Vertex ? drawSnapshots.lower_bound({address, use, bytes}) : drawSnapshots.find({address, use, bytes});
     if (found == drawSnapshots.end() || std::get<0>(found->first) != address || std::get<1>(found->first) != use) return {};
@@ -2849,6 +2875,12 @@ std::vector<Recorder::PendingWrite> Recorder::PendingWritesOver(std::uint64_t ad
     if (open != nullptr) scan(*open);
     for (const auto& batch : inFlight) scan(*batch);
     return found;
+}
+
+void Recorder::PendingWriteRanges(std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) const {
+    ranges.clear();
+    if (open != nullptr) ranges.insert(ranges.end(), open->writes.begin(), open->writes.end());
+    for (const auto& batch : inFlight) ranges.insert(ranges.end(), batch->writes.begin(), batch->writes.end());
 }
 
 bool Recorder::ReadTracking() {

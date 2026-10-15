@@ -75,6 +75,7 @@ class Evaluator {
 public:
     Evaluator(const IrResourcePlan& program, const SrtRuntime& runtime, std::span<const std::uint8_t> cleanFlatSlots = {}, Evaluator* cleanEvaluator = nullptr, IrValue* activeMask = nullptr) : _program(program), _runtime(runtime), _cleanFlatSlots(cleanFlatSlots), _cleanEvaluator(cleanEvaluator), _activeMask(activeMask != nullptr ? activeMask->Resolve() : nullptr) {}
 
+    static bool MayEvaluate(const IrResourcePlan& program, IrValue* value);
     bool Evaluate(IrValue* value, std::uint32_t& result);
     bool EvaluateWide(IrValue* raw, std::uint64_t& result);
     void ReportInaccessibleReads(InaccessibleRead* sink) { _inaccessible = sink; }

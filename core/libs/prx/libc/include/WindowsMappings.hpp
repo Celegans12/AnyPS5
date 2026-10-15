@@ -24,8 +24,8 @@ public:
     enum class Collection { All, Armed, Fresh };
 
     static WindowsMappings& Get() {
-        static WindowsMappings mappings;
-        return mappings;
+        static auto* mappings = new WindowsMappings;
+        return *mappings;
     }
 
     void* Reserve(void* address, std::size_t bytes) {
@@ -334,6 +334,12 @@ public:
             }
         } else if (clear && !collectable(address, end)) return false;
         auto position = views.lower_bound(address & ~(pageBytes - 1));
+        std::uintptr_t cleanStart = 0;
+        std::uintptr_t cleanEnd = 0;
+        const auto flushClean = [&] {
+            if (cleanEnd > cleanStart) rememberClean(cleanStart, cleanEnd);
+            cleanStart = cleanEnd = 0;
+        };
         for (auto cursor = address; cursor < end;) {
             const auto nextClean = cleanRanges.upper_bound(cursor);
             if (nextClean != cleanRanges.begin()) {
@@ -346,6 +352,7 @@ public:
             const auto base = cursor & ~(pageBytes - 1);
             const auto found = viewAt(base, position);
             if (found != views.end() && found->second.resident) {
+                flushClean();
                 if (!watchResident) return false;
                 const auto available = capacity - *count;
                 if (available == 0) return true;
@@ -371,7 +378,10 @@ public:
                         }
                     }
                 }
-                if (view.protection == PAGE_NOACCESS) return false;
+                if (view.protection == PAGE_NOACCESS) {
+                    flushClean();
+                    return false;
+                }
                 const bool pinned = view.page->pins != 0;
                 std::uint8_t settled = 0;
                 auto settledEnd = cursor;
@@ -414,24 +424,25 @@ public:
                         other.armed |= arming;
                     }
                     const auto tracked = static_cast<std::uint8_t>(settled & ~untracked);
-                    auto cleanFrom = cursor;
-                    auto cleanTo = cursor;
                     for (std::size_t sub = 0; sub < subpages; ++sub) {
                         if ((tracked & (1u << sub)) == 0) continue;
                         const auto from = std::max(cursor, base + sub * subpageBytes);
                         const auto to = std::min(settledEnd, base + (sub + 1) * subpageBytes);
                         if (from == base + sub * subpageBytes && to == base + (sub + 1) * subpageBytes) view.seen[sub] = view.page->generation[sub];
-                        if (from != cleanTo) {
-                            if (cleanFrom != cleanTo) rememberClean(cleanFrom, cleanTo);
-                            cleanFrom = from;
+                        if (from != cleanEnd) {
+                            flushClean();
+                            cleanStart = from;
                         }
-                        cleanTo = to;
+                        cleanEnd = to;
                     }
-                    if (cleanFrom != cleanTo) rememberClean(cleanFrom, cleanTo);
                 }
-                if (full) return true;
+                if (full) {
+                    flushClean();
+                    return true;
+                }
                 cursor = stop;
             } else {
+                flushClean();
                 if (collection == Collection::Fresh) {
                     const auto next = views.lower_bound(cursor);
                     cursor = next == views.end() ? end : std::min(end, next->first);
@@ -450,6 +461,7 @@ public:
                 cursor = stop;
             }
         }
+        flushClean();
         return true;
     }
 

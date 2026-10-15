@@ -4,7 +4,6 @@ Entries about one library or component are in [debt](debt/), one file per librar
 
 ### Build
 
-- The bundled [SPIRV-Tools build](../../core/shader/recompiler/PatchSpirvTools.cmake) replaces the redundancy-elimination source with a build-directory copy that releases processed traversal maps. Remove this patch when the pinned revision includes [SPIRV-Tools #6962](https://github.com/KhronosGroup/SPIRV-Tools/pull/6962). System-dependency builds need the fix in their installed SPIRV-Tools package.
 - Building on Windows requires a specific version of mingw - MinGW-w64 GCC 15.2.0 (`winlibs-gcc15`, `x86_64-ucrt-posix-seh`)
 - Even compiled prx libraries on Windows require nearby (static linking of these dependencies causes conflicts):
   - libgcc_s_seh-1.dll

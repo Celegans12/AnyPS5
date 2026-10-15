@@ -1,6 +1,7 @@
 #include "SceTypes.hpp"
 #include <cstdint>
 #include <cstdlib>
+#include <initializer_list>
 #include <stdexcept>
 
 extern "C" {

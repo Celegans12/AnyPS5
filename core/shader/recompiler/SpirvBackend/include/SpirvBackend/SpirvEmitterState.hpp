@@ -137,6 +137,7 @@ struct SpirvEmitterState {
     bool nativeF16ModesEmitted = false;
     bool f16DenormPreserveEmitted = false;
     std::uint32_t dot2F32F16Function = 0;
+    std::map<std::pair<bool, std::uint32_t>, std::uint32_t> interpolateFunctions;
     std::array<std::array<std::uint32_t, 2>, 2> bdaDwordReadFunctions {};
     std::array<std::array<std::uint32_t, 2>, 2> bdaSpanReadFunctions {};
     std::unordered_map<const IrValue*, std::pair<std::uint32_t, std::uint32_t>> bdaGroupedLoads;
@@ -183,6 +184,9 @@ struct SpirvEmitterState {
     std::array<std::uint32_t, 8> blendTargetImages {};
     std::array<std::uint32_t, 8> blendTargetWritten {};
     std::uint32_t blendFragCoordVariable = 0;
+    std::uint32_t quadPixelUncovered = 0;
+    std::uint32_t sampleMaskInputVariable = 0;
+    std::uint32_t quadSampleCoverage = 0;
     std::uint32_t subgroupLocalInvocationIdVariable = 0;
     std::uint32_t perVertexVariable = 0;
     std::uint32_t pointSizeVariable = 0;
@@ -194,6 +198,7 @@ struct SpirvEmitterState {
     std::uint32_t depthVariable = 0;
     std::uint32_t sampleMaskVariable = 0;
     std::uint32_t stencilRefVariable = 0;
+    bool stencilReplay = false;
     std::vector<SpirvInputBinding> inputs;
     std::vector<SpirvOutputBinding> outputs;
     std::vector<std::uint32_t> interfaceVariables;

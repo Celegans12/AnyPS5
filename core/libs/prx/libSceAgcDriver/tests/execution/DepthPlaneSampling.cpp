@@ -1,9 +1,13 @@
+#include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "DepthFastClearHarness.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "Recompiler.hpp"
 #include "VulkanTestDevice.hpp"
 #ifdef _WIN32
@@ -16,6 +20,7 @@
 #endif
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -26,6 +31,14 @@
 #include <string>
 #include <vector>
 
+namespace AgcDriver {
+
+struct VulkanDeviceTestAccess {
+    static Graphics::Context ContextOf(const VulkanDevice& device) { return device.graphicsContext(); }
+};
+
+}
+
 namespace {
 
 using AgcDriver::Graphics::Require;
@@ -35,6 +48,7 @@ using DepthFastClearHarness::VertexCode;
 using ShaderRecompiler::ShaderStage;
 
 constexpr std::uint32_t Threads = 32;
+constexpr std::uint32_t Format16Unorm = 7;
 constexpr std::uint32_t Format16Uint = 11;
 constexpr std::uint32_t Format32Float = 22;
 constexpr std::uint32_t Type2D = 9;
@@ -43,7 +57,7 @@ constexpr std::uint32_t Type2DArray = 13;
 constexpr std::uint32_t Swizzle64KbS = 9;
 constexpr std::uint32_t Swizzle64KbZX = 24;
 constexpr std::uint64_t SliceBytes = 65536;
-constexpr std::size_t BlockBytes = 2u << 20u;
+constexpr std::size_t BlockBytes = 8u << 20u;
 constexpr std::size_t OutputOffset = 0;
 constexpr std::size_t ArrayOffset = 0x10000;
 constexpr std::size_t CubeOffset = 0x40000;
@@ -51,17 +65,18 @@ constexpr std::size_t IntegerOffset = 0xa0000;
 constexpr std::size_t DepthBitsOffset = 0xb0000;
 constexpr std::size_t OneSliceOffset = 0xd0000;
 constexpr std::size_t FirstSliceOffset = 0xe0000;
+constexpr std::size_t PaddedCubeOffset = 0x120000;
+constexpr std::size_t SmallCubeOffset = 0x180000;
+constexpr std::size_t LargeCubeOffset = 0x200000;
 constexpr float DrawnDepth = 0.25f;
 constexpr float DrawnD16Depth = 0.2f;
 constexpr std::uint32_t DrawnD16Bits = 13107;
 
-// image_load of row 0, one texel per thread (x = thread id), slice / face from user data, stored as a dword per
-// thread into the buffer at s[0:3]. The T# is s[4:11], the slice s12.
 constexpr std::array<std::uint32_t, 3> LoadDims{1u, 3u, 5u};
 
 std::array<std::uint32_t, 11> LoadCode(std::uint32_t dim) {
     return {
-        0x7e020280,                        // v_mov_b32 v1, 0 (y)
+        0x7e02020d,
         0x7e04020c,                        // v_mov_b32 v2, s12 (slice or face)
         0xf0001100u | (dim << 3u),         // image_load v3, v[0:2], s[4:11] dmask:0x1 unorm, dim 2D / CUBE / 2D_ARRAY
         0x00010300,
@@ -79,7 +94,7 @@ alignas(256) std::array<std::uint32_t, 11> Load2D = LoadCode(LoadDims[0]);
 alignas(256) std::array<std::uint32_t, 11> LoadCube = LoadCode(LoadDims[1]);
 alignas(256) std::array<std::uint32_t, 11> LoadArray = LoadCode(LoadDims[2]);
 
-alignas(256) std::array<std::byte, 256 * 128 * 4> Pixels{};
+alignas(256) std::array<std::byte, 320 * 320 * 4> Pixels{};
 
 class GuestBlock {
 public:
@@ -196,7 +211,7 @@ void DrawDepth(AgcDriver::VulkanDevice& device, std::uint64_t address, VkExtent2
     }};
     AgcDriver::Graphics::State state{};
     state.stages = {AgcDriver::Graphics::ShaderPath::Vertex, 0u, 32u, 32u, std::nullopt, std::nullopt};
-    state.color = {reinterpret_cast<std::uintptr_t>(Pixels.data()), extent, VK_FORMAT_R8G8B8A8_UNORM, static_cast<std::size_t>(extent.width) * extent.height * 4u, 0xe4u};
+    state.color = {reinterpret_cast<std::uintptr_t>(Pixels.data()), extent, VK_FORMAT_R8G8B8A8_UNORM, AgcDriver::Graphics::ColorTargetLayout(extent.width, extent.height, AgcDriver::Graphics::ColorTileMode::Linear).Bytes(), 0xe4u};
     state.colors = {state.color};
     state.hasColorTarget = true;
     state.depth = AgcDriver::Graphics::DepthTarget{address, 0, extent, format, 1.0f, 0};
@@ -218,9 +233,7 @@ void DrawDepth(AgcDriver::VulkanDevice& device, std::uint64_t address, VkExtent2
     device.WaitIdle();
 }
 
-// Loads row 0 of `slice` of the texture `shape` describes at `texels` into `output` (one dword per thread). With
-// `shaderImage2D` the shader declares a 2D image whatever the T#'s type is.
-void Load(AgcDriver::VulkanDevice& device, std::uint8_t* texels, const Shape& shape, std::uint32_t slice, std::span<std::uint32_t> output, bool shaderImage2D = false) {
+void Load(AgcDriver::VulkanDevice& device, std::uint8_t* texels, const Shape& shape, std::uint32_t slice, std::span<std::uint32_t> output, bool shaderImage2D = false, std::uint32_t row = 0) {
     const auto& code = shaderImage2D ? Load2D : shape.type == TypeCube ? LoadCube : shape.type == Type2DArray ? LoadArray : Load2D;
     std::vector<std::uint32_t> userData(16, 0u);
     const auto out = std::array<std::uint32_t, 4>{static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(output.data())), static_cast<std::uint32_t>((reinterpret_cast<std::uintptr_t>(output.data()) >> 32u) & 0xffffu), static_cast<std::uint32_t>(output.size_bytes()), 0x31016facu};
@@ -228,6 +241,7 @@ void Load(AgcDriver::VulkanDevice& device, std::uint8_t* texels, const Shape& sh
     std::copy(out.begin(), out.end(), userData.begin());
     std::copy(texture.begin(), texture.end(), userData.begin() + 4);
     userData[12] = slice;
+    userData[13] = row;
     const std::array<ShaderRecompiler::MemoryRegion, 1> memory{{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(std::span(code))}}};
     const ShaderRecompiler::ShaderComputeStageInfo compute{{Threads, 1, 1}, 0u, {false, false, false}, false, 1};
     ShaderRecompiler::RecompileRequest request{
@@ -303,6 +317,13 @@ void DepthBitsArrayCase(AgcDriver::VulkanDevice& device, GuestBlock& block, std:
 
 // A 2D shader image over a 2D-array T# reads the array's first slice: a one-slice array, which samples the depth
 // image itself, and a 3-slice array, which samples the plane copy.
+void DepthBitsBaseSliceCase(AgcDriver::VulkanDevice& device, GuestBlock& block, std::span<std::uint32_t> output) {
+    Shape shape{Format16Uint, 256, 128, Type2DArray, 1, Swizzle64KbZX};
+    shape.baseArray = 1;
+    Load(device, block.At(DepthBitsOffset), shape, 0, output);
+    Expect(output, 0x1234u, "D16 depth-bits array from base slice 1");
+}
+
 void FirstSliceCase(AgcDriver::VulkanDevice& device, GuestBlock& block, std::span<std::uint32_t> output) {
     auto* one = block.At(OneSliceOffset);
     DrawDepth(device, reinterpret_cast<std::uintptr_t>(one), {128, 128}, VK_FORMAT_D32_SFLOAT, DrawnDepth);
@@ -316,20 +337,87 @@ void FirstSliceCase(AgcDriver::VulkanDevice& device, GuestBlock& block, std::spa
     Expect(output, Bits(DrawnDepth), "3-slice D32 2D array through a 2D shader image");
 }
 
-// A plane array from a later base slice is still refused (its slice offsets are not modeled here).
-void RefusalCase(AgcDriver::VulkanDevice& device, GuestBlock& block, std::span<std::uint32_t> output) {
-    bool refused = false;
-    try {
-        Shape shape{Format32Float, 128, 128, Type2DArray, 2, Swizzle64KbZX};
-        shape.baseArray = 1;
-        Load(device, block.At(ArrayOffset), shape, 0, output);
-    } catch (const std::runtime_error& error) {
-        refused = std::string(error.what()).find("sampling the depth planes of depth surface") != std::string::npos;
-        if (!refused) throw;
+void PaddedCubeCase(AgcDriver::VulkanDevice& device, GuestBlock& block, std::span<std::uint32_t> output) {
+    auto* base = block.At(PaddedCubeOffset);
+    DrawDepth(device, reinterpret_cast<std::uintptr_t>(base), {128, 128}, VK_FORMAT_D16_UNORM, DrawnD16Depth);
+    for (std::uint32_t face = 1; face < 6u; ++face) FillSlice(base + face * SliceBytes, SliceBytes, 0x1000u + face, 2u);
+    const Shape shape{Format16Uint, 128, 128, TypeCube, 0, Swizzle64KbZX};
+    for (std::uint32_t face = 0; face < 6u; ++face) {
+        Load(device, base, shape, face, output);
+        Expect(output, face == 0 ? DrawnD16Bits : 0x1000u + face, "D16 cube with padded rows, face " + std::to_string(face));
     }
-    Require(refused, "a depth plane array from base slice 1 was not refused");
 }
 
+void SmallD16CubeCase(AgcDriver::VulkanDevice& device, GuestBlock& block, std::span<std::uint32_t> output) {
+    auto* base = block.At(SmallCubeOffset);
+    DrawDepth(device, reinterpret_cast<std::uintptr_t>(base), {32, 32}, VK_FORMAT_D16_UNORM, DrawnD16Depth);
+    for (std::uint32_t face = 1; face < 6u; ++face) FillSlice(base + face * SliceBytes, SliceBytes, 0x1230u + face, 2u);
+    const Shape shape{Format16Uint, 32, 32, TypeCube, 0, Swizzle64KbZX};
+    for (std::uint32_t face = 0; face < 6u; ++face) {
+        Load(device, base, shape, face, output);
+        Expect(output, face == 0 ? DrawnD16Bits : 0x1230u + face, "small D16 cube face " + std::to_string(face));
+    }
+}
+
+void PaddedD16CubeCase(AgcDriver::VulkanDevice& device, GuestBlock& block, std::span<std::uint32_t> output) {
+    constexpr std::uint32_t side = 320;
+    const auto mips = AgcDriver::Graphics::ComputeElementMipLayout(AgcDriver::Graphics::TextureTileMode::kZ64KBX, 2u, side, side, 1u);
+    Require(mips.size() == 1 && mips.front().pitchBytes == 1024 && mips.front().linearSize == 327680 && mips.front().tiledSize == 393216, "the 320 D16 regression must have a padded row pitch and face stride");
+    const auto stride = AgcDriver::Graphics::DepthSliceBytes({side, side}, 2u);
+    Require(stride == 393216 && LargeCubeOffset + 6u * stride <= BlockBytes, "the 320 D16 cube must fit its actual tiled face stride");
+    auto* base = block.At(LargeCubeOffset);
+    DrawDepth(device, reinterpret_cast<std::uintptr_t>(base), {side, side}, VK_FORMAT_D16_UNORM, DrawnD16Depth);
+    for (std::uint32_t face = 1; face < 6; ++face) FillSlice(base + face * stride, stride, 0x1000u + face * 0x1000u, 2u);
+    const Shape shape{Format16Unorm, side, side, TypeCube, 5u, Swizzle64KbZX};
+    const auto check = [&](std::uint32_t face, std::uint32_t row, bool rewritten) {
+        Load(device, base, shape, face, output, false, row);
+        const auto bits = face == 0 ? DrawnD16Bits : rewritten && face == 3 ? 0x7000u : 0x1000u + face * 0x1000u;
+        const auto expected = static_cast<float>(bits) / 65535.0f;
+        for (std::uint32_t tid = 0; tid < Threads; ++tid) {
+            float actual = 0;
+            std::memcpy(&actual, &output[tid], sizeof actual);
+            char message[160];
+            std::snprintf(message, sizeof message, "320 D16 cube face %u row %u texel %u: got %.8f, expected %.8f", face, row, tid, actual, expected);
+            Require(std::abs(actual - expected) <= 2.0f / 65535.0f, message);
+        }
+    };
+    for (std::uint32_t face = 0; face < 6; ++face) {
+        for (const auto row : {0u, 1u, 127u, 319u}) check(face, row, false);
+    }
+    FillSlice(base + 3u * stride, stride, 0x7000u, 2u);
+    for (std::uint32_t face = 0; face < 6; ++face) check(face, 319u, true);
+}
+
+void BaseSliceCase(AgcDriver::VulkanDevice& device, GuestBlock& block, std::span<std::uint32_t> output) {
+    auto* base = block.At(ArrayOffset);
+    Shape shape{Format32Float, 128, 128, Type2DArray, 2, Swizzle64KbZX};
+    shape.baseArray = 1;
+    Load(device, base, shape, 0, output);
+    Expect(output, Bits(0.5f), "D32 2D array from base slice 1, slice 0");
+    Load(device, base, shape, 1, output);
+    Expect(output, Bits(0.75f), "D32 2D array from base slice 1, slice 1");
+    Load(device, base, shape, 0, output, true);
+    Expect(output, Bits(0.5f), "D32 2D array from base slice 1 through a 2D shader image");
+}
+
+void ExpectRefusal(AgcDriver::VulkanDevice& device, GuestBlock& block, std::size_t offset, const Shape& shape, std::uint32_t baseArray, const std::string& expected, const std::string& what) {
+    const auto words = TextureDescriptor(block.At(offset), shape);
+    auto resource = AgcDriver::Graphics::DecodeTextureResource(words);
+    resource.baseArray = baseArray;
+    try {
+        static_cast<void>(AgcDriver::Graphics::DepthSurfaceTexture(AgcDriver::VulkanDeviceTestAccess::ContextOf(device), words, resource, {}));
+    } catch (const std::runtime_error& error) {
+        Require(std::string(error.what()).find(expected) != std::string::npos, what + " was refused with an unexpected message: " + error.what());
+        return;
+    }
+    Require(false, what + " was not refused");
+}
+
+void RefusalCase(AgcDriver::VulkanDevice& device, GuestBlock& block) {
+    ExpectRefusal(device, block, ArrayOffset, {Format32Float, 128, 128, Type2DArray, 2, Swizzle64KbZX}, 3, "base slice 3 is not implemented", "a depth plane array whose base slice is past its last slice");
+    ExpectRefusal(device, block, CubeOffset, {Format32Float, 128, 128, TypeCube, 5, Swizzle64KbZX}, 1, "base slice 1 is not implemented", "a depth plane cube from base slice 1");
+    ExpectRefusal(device, block, ArrayOffset, {Format32Float, 128, 128, Type2D, 0, Swizzle64KbZX}, 1, "slice 1 is not implemented", "a 2D depth plane view with a base slice");
+}
 }
 
 int main() {
@@ -342,8 +430,13 @@ int main() {
         CubeCase(*device, block, output);
         IntegerCase(*device, block, output);
         DepthBitsArrayCase(*device, block, output);
+        DepthBitsBaseSliceCase(*device, block, output);
         FirstSliceCase(*device, block, output);
-        RefusalCase(*device, block, output);
+        PaddedCubeCase(*device, block, output);
+        SmallD16CubeCase(*device, block, output);
+        PaddedD16CubeCase(*device, block, output);
+        BaseSliceCase(*device, block, output);
+        RefusalCase(*device, block);
         std::puts("depth plane sampling tests passed");
         return 0;
     } catch (const std::exception& error) {

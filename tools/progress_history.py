@@ -35,7 +35,11 @@ def measure(sha):
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         try:
-            tarfile.open(fileobj=io.BytesIO(git("archive", sha, "--", *paths))).extractall(root, filter="data")
+            archive = tarfile.open(fileobj=io.BytesIO(git("archive", sha, "--", *paths)))
+            if hasattr(tarfile, "data_filter"):
+                archive.extractall(root, filter="data")
+            else:
+                archive.extractall(root)
         except subprocess.CalledProcessError:
             return None
         saved = progress.PRX, progress.OPCODES

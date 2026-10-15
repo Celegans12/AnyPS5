@@ -6,11 +6,14 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/Shutdown.hpp"
 #include "AudioOut2Internal.hpp"
 #include "AudioOut2PadMix.hpp"
+#include "AudioOutShutdown.hpp"
 
 static constexpr std::uint16_t OUTPUT_MAIN = 1;
 static constexpr std::int16_t VOLUME_MAX = 127;
@@ -74,15 +77,15 @@ static void ReadFrame(const AudioOut2Port& port, const void* data, std::uint32_t
     }
 }
 
-static void AccumulatePadPort(const AudioOut2Port& port, const void* data, AudioOut2Route route, float* out, std::uint32_t frames) {
+static void AccumulatePadPort(const AudioOut2Port& port, const void* data, AudioOut2Route route, float* out, std::uint32_t frames, const float* volume) {
     float in[AUDIO_OUT2_PORT_CHANNELS_MAX];
     for (std::uint32_t frame = 0; frame < frames; frame++) {
         ReadFrame(port, data, frame, in);
-        AudioOut2AccumulatePadFrame(route, in, port.channels, port.volume, out + static_cast<std::size_t>(frame) * AUDIO_OUT2_PAD_CHANNELS);
+        AudioOut2AccumulatePadFrame(route, in, port.channels, volume, out + static_cast<std::size_t>(frame) * AUDIO_OUT2_PAD_CHANNELS);
     }
 }
 
-static void AccumulatePort(const AudioOut2Port& port, const void* data, float* out, std::uint32_t frames) {
+static void AccumulatePort(const AudioOut2Port& port, const void* data, float* out, std::uint32_t frames, const float* volume) {
     const auto& fold = *port.fold;
     float in[AUDIO_OUT2_PORT_CHANNELS_MAX];
     for (std::uint32_t frame = 0; frame < frames; frame++) {
@@ -90,7 +93,7 @@ static void AccumulatePort(const AudioOut2Port& port, const void* data, float* o
         float left = 0.0f;
         float right = 0.0f;
         for (std::uint32_t c = 0; c < port.channels; c++) {
-            const float sample = in[c] * port.volume[c];
+            const float sample = in[c] * volume[c];
             if (fold.left[c] != 0.0f) left += sample * fold.left[c];
             if (fold.right[c] != 0.0f) right += sample * fold.right[c];
         }
@@ -99,7 +102,7 @@ static void AccumulatePort(const AudioOut2Port& port, const void* data, float* o
     }
 }
 
-AudioOut2Grain AudioOut2CaptureGrain(const AudioOut2Context& context) {
+AudioOut2Grain AudioOut2CaptureGrain(const AudioOut2Context& context, bool snapshot) {
     std::lock_guard lock(g_portsLock);
     AudioOut2Grain grain;
     for (std::size_t index = 0; index < g_ports.size(); index++) {
@@ -110,7 +113,15 @@ AudioOut2Grain AudioOut2CaptureGrain(const AudioOut2Context& context) {
             data = port.queuedData.front();
             port.queuedData.pop_front();
         }
-        if (data != nullptr) grain.push_back({index, port.generation, data});
+        if (data != nullptr) {
+            AudioOut2CapturedPort captured{index, port.generation, data};
+            if (snapshot) {
+                captured.pcm.resize(static_cast<std::size_t>(context.grain) * port.channels * (port.int16 ? sizeof(std::int16_t) : sizeof(float)));
+                std::memcpy(captured.pcm.data(), data, captured.pcm.size());
+                std::copy_n(port.volume, port.channels, captured.volume.begin());
+            }
+            grain.push_back(std::move(captured));
+        }
     }
     return grain;
 }
@@ -118,13 +129,17 @@ AudioOut2Grain AudioOut2CaptureGrain(const AudioOut2Context& context) {
 std::uint32_t AudioOut2MixPorts(const AudioOut2Context& context, const AudioOut2Grain& grain, float* out, float* padOut, std::uint32_t frames) {
     std::lock_guard lock(g_portsLock);
     std::uint32_t mixed = 0;
-    for (const auto& [index, generation, data] : grain) {
+    for (const auto& captured : grain) {
+        const auto index = captured.index;
+        const auto generation = captured.generation;
+        const void* data = captured.pcm.empty() ? captured.data : captured.pcm.data();
         if (index >= g_ports.size()) continue;
         const auto& port = g_ports[index];
         if (!port.used || port.generation != generation || port.context != &context || port.channels == 0) continue;
         const auto route = AudioOut2RouteForPort(port.type, port.channels);
-        if (route == AudioOut2Route::Main || (context.padDevice == 0 && route == AudioOut2Route::PadSpeaker)) AccumulatePort(port, data, out, frames);
-        else if (padOut != nullptr) AccumulatePadPort(port, data, route, padOut, frames);
+        const float* volume = captured.pcm.empty() ? port.volume : captured.volume.data();
+        if (route == AudioOut2Route::Main || (context.padDevice == 0 && route == AudioOut2Route::PadSpeaker)) AccumulatePort(port, data, out, frames, volume);
+        else if (padOut != nullptr) AccumulatePadPort(port, data, route, padOut, frames, volume);
         mixed++;
     }
     return mixed;
@@ -165,7 +180,8 @@ static void TraceAttribute(AudioOut2PortHandle handle, const AudioOut2Port& port
 
 extern "C" {
 
-int APS5_VABI sceAudioOut2PortCreate(AudioOut2ContextHandle ctx, const AudioOut2PortParam* params, AudioOut2PortHandle* port) {
+int APS5_VABI sceAudioOut2PortCreate(AudioOut2ContextHandle ctx, const AudioOut2PortParam* params, AudioOut2PortHandle* port) try {
+    const AudioOutCall call;
     if (!ctx) return SCE_AUDIO_OUT2_ERROR_INVALID_HANDLE;
     if (!params || !port) return SCE_AUDIO_OUT2_ERROR_INVALID_ARGUMENT;
     const auto channels = (params->data_format >> FORMAT_CHANNELS_SHIFT) & FORMAT_CHANNELS_MASK;
@@ -206,30 +222,39 @@ int APS5_VABI sceAudioOut2PortCreate(AudioOut2ContextHandle ctx, const AudioOut2
         AudioOut2TraceSeconds(), static_cast<unsigned long long>(ctx), static_cast<unsigned long long>(*port), params->port_type, params->data_format,
         entry.channels, params->sampling_freq, params->flags, static_cast<unsigned long long>(params->user_handle));
     return 0;
+} catch (const ProcessShutdown&) {
+    LibcAwaitExit_nid_postfix();
 }
 
-int APS5_VABI sceAudioOut2PortDestroy(AudioOut2PortHandle port) {
+int APS5_VABI sceAudioOut2PortDestroy(AudioOut2PortHandle port) try {
+    const AudioOutCall call;
     std::lock_guard lock(g_portsLock);
     auto* entry = FromHandle(port);
     if (!entry) return SCE_AUDIO_OUT2_ERROR_INVALID_HANDLE;
     AUDIOOUT2_TRACE("t=%.3f PortDestroy port %llu (data sets %llu)\n", AudioOut2TraceSeconds(), static_cast<unsigned long long>(port), static_cast<unsigned long long>(entry->dataSets));
     *entry = AudioOut2Port{};
     return 0;
+} catch (const ProcessShutdown&) {
+    LibcAwaitExit_nid_postfix();
 }
 
-int APS5_VABI sceAudioOut2PortGetState(AudioOut2PortHandle port, AudioOut2PortState* state) {
+int APS5_VABI sceAudioOut2PortGetState(AudioOut2PortHandle port, AudioOut2PortState* state) try {
+    const AudioOutCall call;
     std::lock_guard lock(g_portsLock);
-    if (!FromHandle(port)) return SCE_AUDIO_OUT2_ERROR_INVALID_HANDLE;
+    const auto* entry = FromHandle(port);
+    if (!entry) return SCE_AUDIO_OUT2_ERROR_INVALID_HANDLE;
     if (!state) return SCE_AUDIO_OUT2_ERROR_INVALID_ARGUMENT;
+    *state = AudioOut2PortState{};
     state->output = OUTPUT_MAIN;
-    state->num_channels = AUDIO_OUT2_OUTPUT_CHANNELS;
+    state->num_channels = static_cast<std::uint8_t>(entry->channels);
     state->volume = VOLUME_MAX;
-    state->reroute_counter = 0;
-    state->flags = 0;
     return 0;
+} catch (const ProcessShutdown&) {
+    LibcAwaitExit_nid_postfix();
 }
 
-int APS5_VABI sceAudioOut2PortSetAttributes(AudioOut2PortHandle port, const AudioOut2Attribute* attributes, uint32_t num) {
+int APS5_VABI sceAudioOut2PortSetAttributes(AudioOut2PortHandle port, const AudioOut2Attribute* attributes, uint32_t num) try {
+    const AudioOutCall call;
     std::lock_guard lock(g_portsLock);
     auto* entry = FromHandle(port);
     if (!entry) return SCE_AUDIO_OUT2_ERROR_INVALID_HANDLE;
@@ -255,6 +280,8 @@ int APS5_VABI sceAudioOut2PortSetAttributes(AudioOut2PortHandle port, const Audi
         if (traces < ATTRIBUTE_TRACE_FULL || traces % ATTRIBUTE_TRACE_EVERY == 0) TraceAttribute(port, *entry, attribute, verdict);
     }
     return 0;
+} catch (const ProcessShutdown&) {
+    LibcAwaitExit_nid_postfix();
 }
 
 }

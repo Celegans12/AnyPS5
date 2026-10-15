@@ -50,6 +50,8 @@ def elf_sections(path, data):
     ident, section_offset, section_size, section_count = header[0], header[6], header[11], header[12]
     if ident[4] != 2 or ident[5] != 1 or section_size != 64:
         raise AuditError(f"{path}: only little-endian ELF64 with 64-byte section headers is supported (class {ident[4]}, data {ident[5]}, shentsize {section_size})")
+    if ident[6] != 1 or header[3] != 1:
+        raise AuditError(f"{path}: unsupported ELF version (identification {ident[6]}, object {header[3]})")
     if not section_offset:
         raise AuditError(f"{path}: ELF file without a section header table is not supported")
     if not section_count:
@@ -61,6 +63,8 @@ def elf_sections(path, data):
 def elf_program_dynamic_symbols(path, data):
     header = unpack("<16sHHIQQQIHHHHHH", data, 0, path, "ELF header")
     ident, program_offset, program_size, program_count = header[0], header[5], header[9], header[10]
+    if ident[6] != 1 or header[3] != 1:
+        raise AuditError(f"{path}: unsupported ELF version (identification {ident[6]}, object {header[3]})")
     if ident[4] != 2 or ident[5] != 1 or program_size != 56 or not program_offset or not program_count:
         raise AuditError(f"{path}: sectionless ELF needs little-endian ELF64 program headers")
     take(data, program_offset, program_count * program_size, path, "program header table")
@@ -104,11 +108,12 @@ def elf_program_dynamic_symbols(path, data):
     if 4 in dynamic:
         hash_offset = file_offset(dynamic[4], 8, "SysV hash table")
         buckets, chains = unpack("<II", data, hash_offset, path, "SysV hash header")
-        take(data, hash_offset, 8 + 4 * (buckets + chains), path, "SysV hash table")
+        file_offset(dynamic[4], 8 + 4 * (buckets + chains), "SysV hash table")
         symbol_count = chains
     elif 0x6ffffef5 in dynamic:
         hash_offset = file_offset(dynamic[0x6ffffef5], 16, "GNU hash header")
         buckets, first_symbol, bloom_count, _ = unpack("<IIII", data, hash_offset, path, "GNU hash header")
+        file_offset(dynamic[0x6ffffef5], 16 + bloom_count * 8 + buckets * 4, "GNU hash prefix")
         bucket_offset = hash_offset + 16 + bloom_count * 8
         bucket_data = take(data, bucket_offset, buckets * 4, path, "GNU hash buckets")
         chain_offset = bucket_offset + buckets * 4
@@ -208,6 +213,8 @@ def elf_imports(path, data):
             take(data, strings_offset, strings_size, path, "dynamic string table")
             for position in range(0, size, 16):
                 tag, value = unpack("<qQ", data, offset + position, path, "dynamic entry")
+                if tag == 0:
+                    break
                 if tag == 1:
                     needed.add(cstring(data, strings_offset + value, strings_offset + strings_size, path, "needed library name"))
     return symbols, needed
@@ -320,12 +327,31 @@ def built_libraries(directories):
     return {name: sorted(files) for name, files in exports.items()}, libraries
 
 
+def module_files(directory):
+    for file in directory_files(directory, "*"):
+        with file.open("rb") as handle:
+            magic = handle.read(4)
+        if magic == b"\x7fELF":
+            yield file
+        elif (file.suffix.lower() in (".prx", ".sprx", ".suprx", ".debug_prx", ".elf")
+              or magic.startswith(b"MZ") or magic in (b"\x4f\x15\x3d\x1d", b"\x54\x14\xf5\xee")):
+            raise AuditError(f"{file}: expected ELF module (first bytes {magic!r})")
+
+
 def read_modules(directories):
     imports = {}
     exports = defaultdict(set)
+    images = {}
     for directory in directories:
-        for file in directory_files(directory, "*"):
+        for file in module_files(directory):
             data = file.read_bytes()
+            digest = hashlib.sha256(data).digest()
+            if file.name in images:
+                previous, fingerprint = images[file.name]
+                if digest != fingerprint:
+                    raise AuditError(f"ambiguous guest module {file.name}: {previous} and {file} have different contents")
+                continue
+            images[file.name] = (file, digest)
             own = elf_imports(file, data)
             symbols, needed = own
             imports[file.name] = (sorted(symbols), sorted(needed))
@@ -385,8 +411,22 @@ def read_registry(path):
         nid = entry["nid"].split("#", 1)[0]
         if not NID.fullmatch(nid):
             raise AuditError(f"{path}: entry {index} has an invalid NID {entry['nid']!r}")
-        imports.append((nid, entry["library"]))
+        imports.append((nid, entry["library"], bool(entry.get("weak", False))))
     return imports
+
+
+def needed_registry_path(path):
+    return path.with_name(path.name.removesuffix(".registry.json") + ".needed.json")
+
+
+def read_needed_registry(path):
+    try:
+        libraries = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise AuditError(f"{path}: cannot read needed libraries: {error}") from error
+    if not isinstance(libraries, list) or any(not isinstance(library, str) or not library for library in libraries):
+        raise AuditError(f"{path}: needed libraries must be a JSON list of nonempty strings")
+    return libraries
 
 
 def check_conservation(references, records):
@@ -406,14 +446,15 @@ def classify(nid, library, providers, stubs, modules):
     return "implemented"
 
 
-def audit(imports, exports, stubs, libraries, modules, module_imports=None, module_exports=None):
+def audit(imports, exports, stubs, libraries, modules, module_imports=None, module_exports=None, *, needed_libraries=()):
     records = {}
-    for nid, library in imports:
-        record = records.setdefault((nid, library), {"nid": nid, "library": library, "references": 0})
+    for nid, library, weak in imports:
+        record = records.setdefault((nid, library), {"nid": nid, "library": library, "references": 0, "weak": weak})
         record["references"] += 1
+        record["weak"] = weak
     for module, (symbols, needed) in (module_imports or {}).items():
         for nid in symbols:
-            record = records.setdefault((nid, None, module), {"nid": nid, "library": None, "module": module, "references": 0})
+            record = records.setdefault((nid, None, module), {"nid": nid, "library": None, "module": module, "references": 0, "weak": False})
             record["references"] += 1
     for record in records.values():
         nid, library = record["nid"], record["library"]
@@ -428,6 +469,9 @@ def audit(imports, exports, stubs, libraries, modules, module_imports=None, modu
     ordered = sorted(records.values(), key=lambda record: (record["class"], record["library"] or "", record.get("module") or "", record["nid"]))
     check_conservation(len(imports) + sum(len(symbols) for symbols, _ in (module_imports or {}).values()), ordered)
     missing = defaultdict(int)
+    for library in needed_libraries:
+        if library not in libraries and library not in modules:
+            missing[library] = 0
     for record in ordered:
         library = record["library"]
         if library and library not in libraries and library not in modules:
@@ -440,9 +484,11 @@ def audit(imports, exports, stubs, libraries, modules, module_imports=None, modu
 
 
 def current_stop(imports, records):
-    """The first import the loader cannot resolve, in registry order."""
+    """The first import the loader cannot resolve, in registry order; a weak import resolves to null instead."""
     classes = {(record["nid"], record["library"]): record for record in records}
-    for nid, library in imports:
+    for nid, library, weak in imports:
+        if weak:
+            continue
         record = classes.get((nid, library))
         if record is not None and record["class"] == "absent":
             return record
@@ -536,6 +582,8 @@ def render(summary, records, missing, stops):
         lines.append("")
         lines.append(f"Needed libraries with no file in --libs or --modules ({len(missing)})")
         lines.extend(f"  {library}: {count} imports" for library, count in missing.items())
+        if any(count == 0 for count in missing.values()):
+            lines.append("  Libraries with 0 imports are declared dependencies; Windows can skip them if no import needs them")
     if summary["library_mismatch"]:
         lines.append("")
         lines.append(f"{summary['library_mismatch']} imports are exported only by a library other than the one they name: they resolve on Linux and can fail on Windows")
@@ -553,8 +601,10 @@ def main(argv=None):
     parser.add_argument("--strict-providers", action="store_true", help="fail when a named import is provided only by another library; retains the existing libc and title-module rules")
     args = parser.parse_args(argv)
     try:
+        dependency_registries = [needed_registry_path(path) for path in args.registries if path.name.endswith(".registry.json")]
+        dependency_registries = [path for path in dependency_registries if path.exists()]
         if args.json:
-            inputs = args.registries + ([Path(args.names)] if args.names else [])
+            inputs = args.registries + dependency_registries + ([Path(args.names)] if args.names else [])
             inputs += [file for directory in args.libs for file in directory_files(directory, "*.prx")]
             inputs += [file for directory in args.modules for file in directory_files(directory, "*")]
             inputs += list(Path(args.source).rglob("*.cpp"))
@@ -563,9 +613,10 @@ def main(argv=None):
                 raise AuditError(f"{args.json}: JSON output would overwrite an input file")
         registries = [(registry, read_registry(registry)) for registry in args.registries]
         imports = [entry for _, entries in registries for entry in entries]
+        needed = sorted({library for path in dependency_registries for library in read_needed_registry(path)})
         exports, libraries = built_libraries(args.libs)
         module_imports, module_exports = read_modules(args.modules)
-        records, missing = audit(imports, exports, source_stubs(args.source), libraries, set(module_imports), module_imports, module_exports)
+        records, missing = audit(imports, exports, source_stubs(args.source), libraries, set(module_imports), module_imports, module_exports, needed_libraries=needed)
         if args.names:
             attach_names(records, load_names(args.names))
         summary = summarize(records, sum(record["references"] for record in records), missing)
@@ -576,7 +627,7 @@ def main(argv=None):
                            "nid": entry["stop"]["nid"] if entry["stop"] else None,
                            "library": entry["stop"]["library"] if entry["stop"] else None,
                            "name": entry["stop"]["name"] if entry["stop"] else None} for entry in stops]
-            result = {"source_commit": commit, "source_dirty": dirty, "registries": [str(path) for path in args.registries], **summary, "stops": json_stops, "imports": records}
+            result = {"source_commit": commit, "source_dirty": dirty, "registries": [str(path) for path in args.registries], "dependency_registries": [str(path) for path in dependency_registries], "needed_libraries": needed, **summary, "stops": json_stops, "imports": records}
             write_json(args.json, result)
     except AuditError as error:
         print(f"FAIL: {error}", file=sys.stderr)

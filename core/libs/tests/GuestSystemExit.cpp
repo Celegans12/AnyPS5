@@ -1,6 +1,7 @@
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include "prx/libc/include/Shutdown.hpp"
 #include "prx/libSceSystemService/SystemService.hpp"
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -26,14 +27,31 @@ using GuestQuickExitCallback = void (APS5_VABI*)();
 extern "C" int APS5_VABI at_quick_exit_nid_postfix(GuestQuickExitCallback);
 extern "C" void APS5_VABI quick_exit_nid_postfix(int);
 namespace {
-bool cleaned = false;
-bool finalized = false;
-void Cleanup() { cleaned = true; }
-void APS5_VABI Finalize(void*) { finalized = true; }
-void VerifyExit() {
-    if (!cleaned || !finalized) std::_Exit(1);
-    std::puts("Guest shutdown and atexit completed");
+std::atomic<bool> awaiting{false};
+void AwaitExit() {
+    awaiting = true;
+    awaiting.notify_one();
+    try {
+        LibcAwaitExit_nid_postfix();
+    } catch (const ProcessShutdown&) {
+        std::puts("Guest thread resumed during exit");
+        std::fflush(stdout);
+        std::_Exit(6);
+    }
 }
+void Cleanup() {
+    std::thread(AwaitExit).detach();
+    awaiting.wait(false);
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    std::puts("Guest shutdown completed");
+    std::fflush(stdout);
+}
+void ExitHandlerRan() {
+    std::puts("Guest exit handler ran");
+    std::fflush(stdout);
+    std::_Exit(5);
+}
+void APS5_VABI UnexpectedFinalizer(void*) { ExitHandlerRan(); }
 int quickOrder = 0;
 void APS5_VABI QuickSecond() { quickOrder = 1; }
 void APS5_VABI QuickFirst() {
@@ -140,7 +158,8 @@ int DriveRelaunch() {
 }
 }
 int main(int argc, char** argv) {
-    if (argc > 1 && std::strcmp(argv[1], "--immediate") == 0) {
+    const int firstArgument = argc > 0 && std::strncmp(argv[0], "--", 2) == 0 ? 0 : 1;
+    if (argc > firstArgument && std::strcmp(argv[firstArgument], "--immediate") == 0) {
         LibcRegisterShutdown_nid_postfix(UnexpectedCleanup);
         Require(std::atexit(UnexpectedCleanup) == 0);
 #ifdef _WIN32
@@ -150,54 +169,54 @@ int main(int argc, char** argv) {
         _Exit_nid_postfix(0);
         return 2;
     }
-    if (argc > 1 && std::strcmp(argv[1], "--return-from-main") == 0) {
+    if (argc > firstArgument && std::strcmp(argv[firstArgument], "--return-from-main") == 0) {
         catchReturnFromMain_nid_postfix(0);
         return 2;
     }
-    if (argc > 1 && std::strcmp(argv[1], "--quick-exit") == 0) {
+    if (argc > firstArgument && std::strcmp(argv[firstArgument], "--quick-exit") == 0) {
         Require(at_quick_exit_nid_postfix(QuickFirst) == 0);
         Require(at_quick_exit_nid_postfix(QuickSecond) == 0);
         quick_exit_nid_postfix(0);
         return 2;
     }
-    if (argc > 1 && std::strcmp(argv[1], "--nested-exit-driver") == 0) {
+    if (argc > firstArgument && std::strcmp(argv[firstArgument], "--nested-exit-driver") == 0) {
         return DriveNestedExit();
     }
-    if (argc > 1 && std::strcmp(argv[1], "--nested-exit") == 0) {
+    if (argc > firstArgument && std::strcmp(argv[firstArgument], "--nested-exit") == 0) {
         Require(__cxa_atexit_nid_postfix(RemainingHandler, nullptr, nullptr) == 0);
         Require(__cxa_atexit_nid_postfix(ExitingHandler, nullptr, nullptr) == 0);
         exit_nid_postfix(0);
         return 2;
     }
-    if (argc > 1 && std::strcmp(argv[1], "--relaunch-driver") == 0) {
+    if (argc > firstArgument && std::strcmp(argv[firstArgument], "--relaunch-driver") == 0) {
         return DriveRelaunch();
     }
-    if (argc > 1 && std::strcmp(argv[1], "--relaunch") == 0) {
+    if (argc > firstArgument && std::strcmp(argv[firstArgument], "--relaunch") == 0) {
         LibcRegisterShutdown_nid_postfix(MainShutdown);
         const char* const arguments[] = {"--secondary", "two words", "quote\"d\\", "", nullptr};
         sceSystemServiceLoadExec("/app0/picker/picker.bin", arguments);
         return 2;
     }
-    if (argc > 1 && std::strcmp(argv[1], "--secondary") == 0) {
+    if (argc > firstArgument && std::strcmp(argv[firstArgument], "--secondary") == 0) {
         Require(OwnExecutable().filename().string().starts_with("picker.picker.bin"));
         std::string received = "arguments:";
-        for (int index = 1; index < argc; ++index) received += std::string(index == 1 ? " " : "|") + argv[index];
+        for (int index = firstArgument; index < argc; ++index) received += std::string(index == firstArgument ? " " : "|") + argv[index];
         AppendMarker(received);
         LibcRegisterShutdown_nid_postfix(SecondaryShutdown);
         const char* const arguments[] = {"--relaunched", nullptr};
         sceSystemServiceLoadExec("/app0/eboot.bin", arguments);
         return 2;
     }
-    if (argc > 1 && std::strcmp(argv[1], "--relaunched") == 0) {
+    if (argc > firstArgument && std::strcmp(argv[firstArgument], "--relaunched") == 0) {
         const char* main = std::getenv(MainExecutable);
         Require(main != nullptr && std::filesystem::equivalent(OwnExecutable(), main));
         AppendMarker("relaunched");
         return 0;
     }
-    if (argc > 1) {
+    if (argc > firstArgument) {
         LibcRegisterShutdown_nid_postfix(Cleanup);
-        Require(__cxa_atexit_nid_postfix(Finalize, nullptr, nullptr) == 0);
-        Require(std::atexit(VerifyExit) == 0);
+        Require(__cxa_atexit_nid_postfix(UnexpectedFinalizer, nullptr, nullptr) == 0);
+        Require(std::atexit(ExitHandlerRan) == 0);
         sceSystemServiceLoadExec("exit", nullptr);
         return 2;
     }
@@ -206,7 +225,7 @@ int main(int argc, char** argv) {
     for (const char* path : {"/app0/another.bin", "/data/eboot.bin", "/app0/../eboot.bin", "/app0//eboot.bin"}) {
         bool rejected = false;
         try { sceSystemServiceLoadExec(path, nullptr); }
-        catch (const std::runtime_error&) { rejected = true; }
+        catch (const std::runtime_error& error) { rejected = std::string(error.what()).find(path) != std::string::npos; }
         Require(rejected);
     }
 #ifdef _WIN32

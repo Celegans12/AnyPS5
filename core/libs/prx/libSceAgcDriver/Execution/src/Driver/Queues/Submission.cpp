@@ -298,6 +298,7 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue) {
     if (APS5_ENABLE_TIMING_LOG) submission.validatedAt = std::chrono::steady_clock::now();
     waitForFlipRoom(submission);
     holdFlipBehindWorker(submission);
+    AwaitRegistrationPreparation();
     if (APS5_ENABLE_TIMING_LOG) submission.roomReadyAt = std::chrono::steady_clock::now();
     static const bool trace = std::getenv("APS5_TRACE_GPU") != nullptr;
     if (trace) std::fprintf(stderr, "[gpu] %.1f submit queue=0x%x dwords=%zu at %p\n", TraceMs(), queue, submission.commands.size(), static_cast<const void*>(descriptor.addr));

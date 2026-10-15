@@ -162,6 +162,9 @@ public:
         std::span<const Slice> slices;
         std::vector<Total> totals;
         bool dropped = false;
+        std::uint64_t eventsLost = 0;
+        std::optional<Clock::time_point> eventsFullAt;
+        bool totalsFull = false;
     };
 
     inline static const std::atomic<bool> AlwaysBuffering{true};
@@ -195,7 +198,10 @@ public:
             if (scope == nullptr) continue;
             snapshot.totals.push_back({scope, entry.stage.load(std::memory_order_relaxed), Clock::duration(entry.length.load(std::memory_order_relaxed)), entry.count.load(std::memory_order_relaxed)});
         }
-        snapshot.dropped = dropped.load(std::memory_order_relaxed);
+        snapshot.eventsLost = lost.load(std::memory_order_acquire);
+        if (snapshot.eventsLost != 0) snapshot.eventsFullAt = Clock::time_point(Clock::duration(firstLost.load(std::memory_order_relaxed)));
+        snapshot.totalsFull = totalsFull.load(std::memory_order_relaxed);
+        snapshot.dropped = snapshot.eventsLost != 0 || snapshot.totalsFull;
         return snapshot;
     }
 
@@ -210,7 +216,9 @@ private:
     void append(const Slice& slice) {
         const auto index = used.load(std::memory_order_relaxed);
         if (index == capacity) {
-            dropped.store(true, std::memory_order_relaxed);
+            const auto count = lost.load(std::memory_order_relaxed);
+            if (count == 0) firstLost.store(slice.begin.time_since_epoch().count(), std::memory_order_relaxed);
+            lost.store(count + 1, std::memory_order_release);
             return;
         }
         slices[index] = slice;
@@ -233,7 +241,7 @@ private:
             entry.count.store(entry.count.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
             return;
         }
-        dropped.store(true, std::memory_order_relaxed);
+        totalsFull.store(true, std::memory_order_relaxed);
     }
 
     const std::string name;
@@ -242,7 +250,9 @@ private:
     const std::unique_ptr<Slice[]> slices;
     const std::size_t capacity;
     std::atomic<std::size_t> used{0};
-    std::atomic<bool> dropped{false};
+    std::atomic<std::uint64_t> lost{0};
+    std::atomic<Clock::rep> firstLost{0};
+    std::atomic<bool> totalsFull{false};
     std::array<Entry, 512> entries;
     bool sampled = false;
     std::uint64_t sampledPresent = 0;
@@ -344,6 +354,10 @@ public:
                 }
                 output += text;
             }
+            if (thread.eventsFullAt) {
+                event("trace buffer full", "i", *thread.eventsFullAt, tid);
+                output += ",\"s\":\"t\",\"args\":{\"events_lost\":" + std::to_string(thread.eventsLost) + "}}";
+            }
         }
         for (std::size_t index = 0; index + 1 < presents.size(); ++index) {
             event("present", "i", presents[index], presenter + 1);
@@ -423,8 +437,22 @@ public:
         bool firstWorker = true;
         std::map<std::string, Clock::duration> phases;
         bool dropped = false;
+        struct DroppedThread {
+            std::string name;
+            std::uint64_t eventsLost = 0;
+            std::optional<Clock::time_point> eventsFullAt;
+            bool totalsFull = false;
+        };
+        std::vector<DroppedThread> droppedList;
         for (const auto& thread : threads) {
             dropped = dropped || thread.dropped;
+            if (thread.eventsLost != 0 || thread.totalsFull) {
+                auto entry = std::find_if(droppedList.begin(), droppedList.end(), [&](const DroppedThread& candidate) { return candidate.name == thread.name; });
+                if (entry == droppedList.end()) entry = droppedList.insert(droppedList.end(), DroppedThread{thread.name});
+                entry->eventsLost += thread.eventsLost;
+                if (thread.eventsLost != 0 && thread.eventsFullAt && (!entry->eventsFullAt || *thread.eventsFullAt < *entry->eventsFullAt)) entry->eventsFullAt = thread.eventsFullAt;
+                entry->totalsFull = entry->totalsFull || thread.totalsFull;
+            }
             Clock::duration busy{};
             for (const auto& total : thread.totals) {
                 const std::string_view scope = total.scope;
@@ -447,6 +475,20 @@ public:
         }
         output += "},\"trace_dropped\":";
         output += dropped ? "true" : "false";
+        if (!droppedList.empty()) {
+            std::string droppedThreads;
+            for (const auto& entry : droppedList) {
+                if (!droppedThreads.empty()) droppedThreads += ',';
+                AppendString(droppedThreads, entry.name);
+                droppedThreads += ":{";
+                if (entry.eventsLost != 0) {
+                    if (entry.eventsFullAt && !presents.empty() && *entry.eventsFullAt >= presents.front() && *entry.eventsFullAt <= presents.back()) droppedThreads += "\"events_full_after_s\":" + number(std::chrono::duration<double>(*entry.eventsFullAt - presents.front()).count()) + ",";
+                    droppedThreads += "\"events_lost\":" + std::to_string(entry.eventsLost) + ",";
+                }
+                droppedThreads += std::string("\"totals_full\":") + (entry.totalsFull ? "true" : "false") + "}";
+            }
+            output += ",\"trace_dropped_threads\":{" + droppedThreads + "}";
+        }
         output += ",\"trace\":";
         AppendString(output, summary.trace);
         output += "}\n";
@@ -483,7 +525,7 @@ public:
         if (!buffering.load(std::memory_order_relaxed)) return;
         std::lock_guard lock(gpuMutex);
         if (gpuRanges.size() == gpuRanges.capacity()) {
-            gpuDropped = true;
+            ++gpuLost;
             return;
         }
         gpuRanges.push_back({name, beginNs, endNs, batch});
@@ -509,7 +551,7 @@ private:
     inline static thread_local TraceThread* local = nullptr;
     inline static std::mutex gpuMutex;
     inline static std::vector<TraceGpuRange> gpuRanges;
-    inline static bool gpuDropped = false;
+    inline static std::uint64_t gpuLost = 0;
 };
 
 }

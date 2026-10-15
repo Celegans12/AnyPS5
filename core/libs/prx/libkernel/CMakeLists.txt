@@ -14,6 +14,7 @@ add_library(libkernel SHARED EXCLUDE_FROM_ALL
         ${CMAKE_CURRENT_SOURCE_DIR}/File/src/OpenFileLimit.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/File/src/SharedMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/File/src/RandomDevice.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/File/src/HostStreams.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/File/src/Stdio.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../libc/src/Rename.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Semaphore/src/Semaphore.cpp
@@ -85,6 +86,16 @@ endif()
 configure_windows_unwind(libkernel)
 
 if(BUILD_TESTING)
+    if(NOT WIN32)
+        add_library(guest_memory_lifetime_module MODULE ${LIBS_INCLUDE_DIR}/tests/GuestMemoryLifetimeModule.cpp)
+        target_include_directories(guest_memory_lifetime_module PRIVATE ${LIBS_INCLUDE_DIR})
+        target_link_libraries(guest_memory_lifetime_module PRIVATE libkernel libc)
+        add_test_executable(guest_memory_lifetime_tests ${LIBS_INCLUDE_DIR}/tests/GuestMemoryLifetime.cpp)
+        target_link_libraries(guest_memory_lifetime_tests PRIVATE ${CMAKE_DL_LIBS})
+        add_dependencies(guest_memory_lifetime_tests guest_memory_lifetime_module)
+        add_test(NAME guest_memory_lifetime COMMAND guest_memory_lifetime_tests $<TARGET_FILE:guest_memory_lifetime_module>)
+        set_tests_properties(guest_memory_lifetime PROPERTIES TIMEOUT 25)
+    endif()
     add_test_executable(download_data_mount_tests ${LIBS_INCLUDE_DIR}/tests/GuestDownloadDataMount.cpp)
     target_include_directories(download_data_mount_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(download_data_mount_tests PRIVATE libkernel libc)
@@ -533,6 +544,16 @@ if(BUILD_TESTING)
     set_tests_properties(guest_thread_cpu_clock PROPERTIES TIMEOUT 30)
     if(WIN32)
         set_tests_properties(guest_thread_cpu_clock PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+    endif()
+    add_test_executable(guest_socket_descriptor_flags_tests ${LIBS_INCLUDE_DIR}/tests/GuestSocketDescriptorFlags.cpp)
+    target_include_directories(guest_socket_descriptor_flags_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_socket_descriptor_flags_tests PRIVATE libkernel libc)
+    configure_windows_unwind(guest_socket_descriptor_flags_tests)
+    add_test(NAME guest_socket_descriptor_flags COMMAND guest_socket_descriptor_flags_tests)
+    set_tests_properties(guest_socket_descriptor_flags PROPERTIES TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(guest_socket_descriptor_flags PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
     endif()
     add_test_executable(guest_nanosleep_tests ${LIBS_INCLUDE_DIR}/tests/GuestNanosleep.cpp)
@@ -1135,6 +1156,7 @@ if(BUILD_TESTING)
     add_test(NAME guest_kqueue COMMAND guest_kqueue_tests)
     set_tests_properties(guest_kqueue PROPERTIES TIMEOUT 20)
     if(WIN32)
+        target_link_libraries(guest_kqueue_tests PRIVATE advapi32)
         set_tests_properties(guest_kqueue PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
     endif()
@@ -1146,6 +1168,16 @@ if(BUILD_TESTING)
     set_tests_properties(guest_socket_descriptors PROPERTIES TIMEOUT 20)
     if(WIN32)
         set_tests_properties(guest_socket_descriptors PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+    endif()
+    add_test_executable(guest_host_stream_tests ${LIBS_INCLUDE_DIR}/tests/GuestHostStreams.cpp)
+    target_include_directories(guest_host_stream_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_host_stream_tests PRIVATE libkernel libc)
+    configure_windows_unwind(guest_host_stream_tests)
+    add_test(NAME guest_host_streams COMMAND guest_host_stream_tests)
+    set_tests_properties(guest_host_streams PROPERTIES TIMEOUT 20)
+    if(WIN32)
+        set_tests_properties(guest_host_streams PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
     endif()
     add_test_executable(guest_socket_event_tests ${LIBS_INCLUDE_DIR}/tests/GuestSocketEvents.cpp)
@@ -1207,6 +1239,16 @@ if(BUILD_TESTING)
     add_test(NAME guest_mmap_fixed_anonymous COMMAND guest_memory_tests fixed-anonymous)
     if(WIN32)
         set_tests_properties(guest_memory guest_mmap_fixed_anonymous PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+    endif()
+    add_test_executable(guest_mprotect_unmapped_tests ${LIBS_INCLUDE_DIR}/tests/GuestMprotectUnmapped.cpp)
+    target_include_directories(guest_mprotect_unmapped_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_mprotect_unmapped_tests PRIVATE libkernel libc)
+    configure_windows_unwind(guest_mprotect_unmapped_tests)
+    add_test(NAME guest_mprotect_unmapped COMMAND guest_mprotect_unmapped_tests)
+    set_tests_properties(guest_mprotect_unmapped PROPERTIES TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(guest_mprotect_unmapped PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
     endif()
     add_test_executable(guest_flexible_memory_budget_tests ${LIBS_INCLUDE_DIR}/tests/GuestFlexibleMemoryBudget.cpp)

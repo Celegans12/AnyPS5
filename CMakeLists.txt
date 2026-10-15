@@ -87,6 +87,10 @@ if(BUILD_TESTING)
     set_tests_properties(request_serializer PROPERTIES TIMEOUT 20)
     find_package(Python3 QUIET COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)
+        add_test(NAME shader_cache_native_paths COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/core/shader/recompiler/tests/test_shader_cache_native_paths.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/core/shader/recompiler/ShaderCacheVersion.cmake ${CMAKE_COMMAND})
+        set_tests_properties(shader_cache_native_paths PROPERTIES TIMEOUT 20)
         add_test(NAME pr_overlap_encoding COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_pr_overlap_encoding.py)
         add_test(NAME pr_overlap_dependencies COMMAND ${Python3_EXECUTABLE}
@@ -115,6 +119,8 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_check_conventions_wrapped_declarations.py)
         add_test(NAME conventions_ci_gate COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_check_conventions_ci_gate.py)
+        add_test(NAME conventions_doc_links COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_check_conventions_doc_links.py)
         add_test(NAME test_registration COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_test_registration.py)
         add_test(NAME check_skips COMMAND ${Python3_EXECUTABLE}
@@ -142,11 +148,17 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_nid_names.py)
         add_test(NAME release_package COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_package_release.py)
+        add_test(NAME web_library_assets COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_build_web.py)
+        set_tests_properties(web_library_assets PROPERTIES TIMEOUT 20)
         add_test(NAME pad_input COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_pad_input.py)
         set_tests_properties(pad_input PROPERTIES TIMEOUT 20)
         add_test(NAME trace_digest COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_trace_digest.py)
+        add_test(NAME conventions_bom_shebang COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_check_conventions_bom_shebang.py)
+        set_tests_properties(conventions_bom_shebang PROPERTIES TIMEOUT 20)
         add_test(NAME conventions_body_bom COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_check_conventions_body_bom.py)
         add_test(NAME conventions_blob_reads COMMAND ${Python3_EXECUTABLE}

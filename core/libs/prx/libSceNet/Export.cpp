@@ -249,6 +249,8 @@ struct Sock {
     int rcv_timeout_us = 0;
     int snd_timeout_us = 0;
     int reported_error = 0;
+    int snd_buffer = 0;
+    int rcv_buffer = 0;
 };
 
 #ifdef _WIN32
@@ -594,6 +596,52 @@ bool SetSocketOptionForKernel(int descriptor, int level, int option, const void*
 }
 
 const bool g_socketOptionSetterRegistered = (KernelSetSocketOptionSetter_nid_no_patch(&SetSocketOptionForKernel), true);
+
+constexpr int GuestFcntlGetStatus = 3;
+constexpr int GuestFcntlSetStatus = 4;
+constexpr int GuestReadWrite = 2;
+constexpr int GuestNonblocking = 4;
+constexpr int GuestStatusFlagsMask = 7;
+
+bool ControlSocketStatusForKernel(int descriptor, int command, int flags, int* result, int* error) {
+    bool nonblock = false;
+    {
+        std::lock_guard lk(g_mutex);
+        const auto it = g_socks.find(descriptor);
+        if (it == g_socks.end()) return false;
+        nonblock = it->second.nonblock;
+    }
+    *result = 0;
+    *error = 0;
+    if (command == GuestFcntlGetStatus) {
+        *result = GuestReadWrite | (nonblock ? GuestNonblocking : 0);
+        return true;
+    }
+    if (command != GuestFcntlSetStatus) {
+        *error = NET_EINVAL;
+        return true;
+    }
+    if ((flags & ~GuestStatusFlagsMask) != 0) {
+        *error = NET_EOPNOTSUPP;
+        return true;
+    }
+    const int enabled = (flags & GuestNonblocking) != 0 ? 1 : 0;
+    if (sceNetSetsockopt(descriptor, NET_SOL_SOCKET, NET_SO_NBIO, &enabled, sizeof(enabled)) != 0) *error = *errno_slot();
+    return true;
+}
+
+const bool g_socketStatusControlRegistered = (KernelSetSocketStatusControl_nid_no_patch(&ControlSocketStatusForKernel), true);
+
+bool FindSocketNativeForKernel(int descriptor, std::shared_ptr<void>* owner, std::uintptr_t* native) {
+    std::lock_guard lk(g_mutex);
+    const auto it = g_socks.find(descriptor);
+    if (it == g_socks.end() || !it->second.native) return false;
+    *native = static_cast<std::uintptr_t>(it->second.native->value);
+    *owner = it->second.native;
+    return true;
+}
+
+const bool g_socketNativeLookupRegistered = (KernelSetSocketNativeLookup_nid_no_patch(&FindSocketNativeForKernel), true);
 
 int APS5_VABI sceNetInit_nid_postfix(void) {
     std::lock_guard lk(g_mutex);
@@ -1038,6 +1086,8 @@ int APS5_VABI sceNetSetsockopt(int s, int level, int optname, const void* optval
         if (optname == NET_SO_NBIO) it->second.nonblock = value != 0;
         if (optname == NET_SO_RCVTIMEO) it->second.rcv_timeout_us = value;
         if (optname == NET_SO_SNDTIMEO) it->second.snd_timeout_us = value;
+        if (optname == NET_SO_SNDBUF) it->second.snd_buffer = value;
+        if (optname == NET_SO_RCVBUF) it->second.rcv_buffer = value;
     }
     return 0;
 }
@@ -1072,6 +1122,16 @@ int APS5_VABI sceNetGetsockopt(int s, int level, int optname, void* optval, uint
             else if (pending != 0) it->second.reported_error = pending;
 #endif
             value = pending == 0 ? 0 : net_error(pending);
+            break;
+        }
+        case NET_SO_SNDBUF:
+        case NET_SO_RCVBUF: {
+            const bool send = optname == NET_SO_SNDBUF;
+            value = send ? socket.snd_buffer : socket.rcv_buffer;
+            if (value != 0) break;
+            NativeLength size = sizeof(value);
+            if (::getsockopt(socket.native->value, SOL_SOCKET, send ? SO_SNDBUF : SO_RCVBUF, reinterpret_cast<char*>(&value), &size) != 0)
+                return fail(native_error());
             break;
         }
         default: return fail(NET_EOPNOTSUPP);

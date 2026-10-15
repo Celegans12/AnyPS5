@@ -302,6 +302,10 @@ void BdaResources::CheckFault(std::uint64_t shaderAddress) const {
         throw std::runtime_error(message.str());
     }
     std::ostringstream message;
+    if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::UnlinkedCall) {
+        message << "shader stage " << report.stage << " called address 0x" << std::hex << report.address << " at program counter 0x" << report.instruction << ", which no linked callee of that call matches";
+        throw std::runtime_error(message.str());
+    }
     message << "BDA access failed: address=0x" << std::hex << report.address << " instruction=0x" << report.instruction << std::dec << " bytes=" << report.bytes << " stage=" << report.stage << " reason=" << static_cast<std::uint32_t>(report.reason);
     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::Permission && table != nullptr) {
         const auto bytes = table->Bytes();

@@ -11,7 +11,8 @@
 #include <array>
 #include <cstdint>
 #include <memory>
-#include <optional>
+#include <new>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -45,9 +46,6 @@ struct ImageTableColumnSnapshot {
     bool outside = false;
     std::vector<std::uint32_t> codes;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> readRanges;
-    std::vector<std::uint64_t> addresses;
-    std::optional<std::uint32_t> outsideCode;
-    std::uint64_t outsideAddress = 0;
 
     bool operator==(const ImageTableColumnSnapshot& other) const = default;
 };
@@ -81,13 +79,64 @@ struct UniformFillPlan {
 inline constexpr std::uint32_t NativePushSlotSize = sizeof(PushData);
 inline constexpr std::uint32_t NativePushConstantSize = 2u * NativePushSlotSize;
 
+class IrValueArena {
+public:
+    IrValueArena() = default;
+    IrValueArena(const IrValueArena&) = delete;
+    IrValueArena& operator=(const IrValueArena&) = delete;
+    IrValueArena(IrValueArena&& other) noexcept : values(std::exchange(other.values, nullptr)), count(std::exchange(other.count, 0)), capacity(std::exchange(other.capacity, 0)) {}
+    IrValueArena& operator=(IrValueArena&& other) noexcept {
+        if (this != &other) {
+            release();
+            values = std::exchange(other.values, nullptr);
+            count = std::exchange(other.count, 0);
+            capacity = std::exchange(other.capacity, 0);
+        }
+        return *this;
+    }
+    ~IrValueArena() { release(); }
+
+    void Reserve(std::size_t size) {
+        if (values != nullptr) throw std::runtime_error("IrValueArena::Reserve called twice");
+        if (size == 0) return;
+        values = static_cast<IrValue*>(::operator new(size * sizeof(IrValue), std::align_val_t{alignof(IrValue)}));
+        capacity = size;
+    }
+    IrValue* Create(IrOpcode opcode, IrType type, std::uint32_t id) {
+        if (count == capacity) throw std::runtime_error("IrValueArena::Create exceeds the reserved size");
+        auto* value = new (values + count) IrValue(opcode, type, id);
+        ++count;
+        return value;
+    }
+    [[nodiscard]] std::size_t Size() const { return count; }
+    [[nodiscard]] IrValue& operator[](std::size_t index) { return values[index]; }
+    [[nodiscard]] const IrValue& operator[](std::size_t index) const { return values[index]; }
+    [[nodiscard]] IrValue* begin() { return values; }
+    [[nodiscard]] IrValue* end() { return values + count; }
+    [[nodiscard]] const IrValue* begin() const { return values; }
+    [[nodiscard]] const IrValue* end() const { return values + count; }
+
+private:
+    void release() {
+        if (values == nullptr) return;
+        for (std::size_t index = count; index > 0; --index) values[index - 1].~IrValue();
+        ::operator delete(values, std::align_val_t{alignof(IrValue)});
+        values = nullptr;
+        count = 0;
+        capacity = 0;
+    }
+    IrValue* values = nullptr;
+    std::size_t count = 0;
+    std::size_t capacity = 0;
+};
+
 struct IrResourcePlan {
     IrShaderStage stage = IrShaderStage::Unknown;
     std::uint64_t shaderHash = 0;
     std::uint32_t userDataBase = 0;
     std::uint32_t userDataCount = 64;
     std::uint32_t srgbDecodeFormats = 0;
-    std::vector<std::unique_ptr<IrValue>> valueStorage;
+    IrValueArena valueStorage;
     std::vector<std::unique_ptr<IrBlock>> blockStorage;
     std::vector<MemoryInfo> memoryInfo;
     std::vector<DescriptorSource> descriptorSources;

@@ -42,8 +42,8 @@ struct PathAliases {
 };
 
 PathAliases& Aliases() {
-    static PathAliases aliases;
-    return aliases;
+    static auto* aliases = new PathAliases;
+    return *aliases;
 }
 
 std::string TrimSlashes(const char* path) {
@@ -120,7 +120,10 @@ struct WorkingDirectory {
     const std::filesystem::path root = std::filesystem::canonical(std::filesystem::current_path());
     std::filesystem::path current = root;
 };
-WorkingDirectory& Directories() { static WorkingDirectory state; return state; }
+WorkingDirectory& Directories() {
+    static auto* state = new WorkingDirectory;
+    return *state;
+}
 std::filesystem::path HostPath(WorkingDirectory& state, const std::filesystem::path& guest) {
     if (auto aliased = ResolveAlias(guest.relative_path().generic_string())) return *aliased;
     return ResolveHostPath(state.root, guest.relative_path()).make_preferred();

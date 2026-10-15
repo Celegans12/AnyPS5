@@ -137,7 +137,7 @@ void DefineModule(SpirvEmitterState& state) {
         state.module.EmitCapability(spv::CapabilityGroupNonUniformShuffle);
     }
     if (state.requirements.computeDerivatives && StageOf(state) == IrShaderStage::Compute) {
-        state.module.EmitCapability(spv::CapabilityComputeDerivativeGroupQuadsKHR);
+        state.module.EmitCapability(spv::CapabilityComputeDerivativeGroupLinearKHR);
         state.module.EmitExtension("SPV_KHR_compute_shader_derivatives");
     }
     if (std::any_of(state.inputs.begin(), state.inputs.end(), [](const SpirvInputBinding& input) { return input.kind == StageInputKind::BaseInstance; })) {
@@ -173,10 +173,6 @@ void DefineModule(SpirvEmitterState& state) {
             localX = ((localX * localY * localZ + 63u) / 64u) * 32u;
             localY = 1u;
             localZ = 1u;
-            if (state.requirements.computeDerivatives) {
-                localY = localX / 2u;
-                localX = 2u;
-            }
         }
         state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeLocalSize, localX, localY, localZ);
     }
@@ -192,7 +188,7 @@ void DefineModule(SpirvEmitterState& state) {
                 state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeDepthGreater);
             }
         }
-        if (state.stencilRefVariable != 0) {
+        if (state.stencilRefVariable != 0 && !state.stencilReplay) {
             if (std::find(state.supportedCapabilities.begin(), state.supportedCapabilities.end(), static_cast<std::uint32_t>(spv::CapabilityStencilExportEXT)) == state.supportedCapabilities.end()) {
                 throw std::runtime_error("a pixel shader that exports the stencil reference needs VK_EXT_shader_stencil_export, which the device lacks");
             }
@@ -200,7 +196,7 @@ void DefineModule(SpirvEmitterState& state) {
             state.module.EmitExtension("SPV_EXT_shader_stencil_export");
             state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeStencilRefReplacingEXT);
         }
-        if (pixel.psEarlyZ && !pixel.psAlphaToCoverage) {
+        if (pixel.psEarlyZ && !pixel.psAlphaToCoverage && !pixel.QuadMasked()) {
             state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeEarlyFragmentTests);
         }
         if (pixel.psOrderedPixelShader) {
@@ -213,7 +209,7 @@ void DefineModule(SpirvEmitterState& state) {
         }
     }
     if (state.requirements.computeDerivatives && StageOf(state) == IrShaderStage::Compute) {
-        state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeDerivativeGroupQuadsKHR);
+        state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeDerivativeGroupLinearKHR);
     }
     state.module.AddName(state.mainFunc, "main");
     if (state.requirements.functionLds) {

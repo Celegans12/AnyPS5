@@ -272,6 +272,7 @@ void Driver::execute(const Submission& submission) {
                     reportSkip("dispatch", refusal.what());
                 }
             });
+            Pm4::NoteDispatchRegisters(packet, queue);
             Graphics::Recorder::CountRecordedWork();
             finishDispatchPacket(opcode == 0x16);
         } else if (opcode == 0x3c || opcode == 0x93) {

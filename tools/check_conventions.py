@@ -32,7 +32,10 @@ RULES = {
 CPP = {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".inl", ".ipp"}
 IMAGES = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", ".webp", ".ico", ".tga", ".dds"}
 NOTES = {".md", ".markdown", ".rst", ".log", ".patch", ".diff"}
-AGENT_FILES = {"agents.md", "claude.md", "gemini.md", ".cursorrules", "copilot-instructions.md"}
+AGENT_FILES = {
+    "agents.md", "claude.md", "gemini.md", ".cursorrules", "copilot-instructions.md",
+    ".windsurfrules", "windsurf.md", "chatgpt.md", ".chatgptrules", ".aider.conf.yml",
+}
 DEBT = "docs/dev/TechnicalDebt.md"
 DEBT_DIR = "docs/dev/debt/"
 DEBT_TARGET = re.compile(r"\]\((?:\.\./)+(core/[^)#\s]+)")
@@ -46,7 +49,9 @@ STUB_BODY = re.compile(r"^(?:\(void\)\s*\w+\s*;|static_cast<void>\(\s*\w+\s*\)\s
 SYSTEM_DEPENDENCY = re.compile(r"\b(find_package\s*\((?!\s*(Python3|Threads|Git)\b)|pkg_check_modules\b|pkg_search_module\b|find_(library|path|program|file)\b)", re.I)
 TITLE = re.compile(r"\b(PPSA|CUSA)\d{5}\b")
 EXTENSION = re.compile(r"__attribute__|__declspec|#\s*pragma\s+(?!once\b)")
-LINK = re.compile(r"\]\(([^)\s]+)")
+LINK = re.compile(r"\[[^\]]+\]\(([^)\s]+)")
+FENCE = re.compile(r"^ {0,3}(```|~~~).*?^ {0,3}\1[ \t]*$|^ {0,3}(?:```|~~~).*\Z", re.S | re.M)
+INLINE = re.compile(r"`[^`\n]*`")
 SECTION = re.compile(r"^###(?!#)\s*(.+?)\s*$", re.M)
 KEY = re.compile(r"^( *)([A-Za-z0-9_-]+|'[^']*'|\"[^\"]*\"):(?:\s+(.*?))?\s*$")
 
@@ -71,17 +76,23 @@ class Check:
         self.blobs = {}
         self.tree = set(self.modes)
         self.dirs = {str(parent) for path in self.tree for parent in PurePosixPath(path).parents}
-        statuses = git("diff", "--name-status", "--no-renames", "-z", self.base, head).split("\0")
-        for status, path in zip(statuses[::2], statuses[1::2]):
-            self.status[path] = status
-        for line in git("diff", "--numstat", "--no-renames", "-z", self.base, head).split("\0"):
-            if not line:
-                continue
+        diff = ("--find-renames", "-l0", self.base, head)
+        statuses = iter(git("diff", "--name-status", "-z", *diff).split("\0")[:-1])
+        for status in statuses:
+            path = next(statuses)
+            if status.startswith("R"):
+                path = next(statuses)
+            self.status[path] = status[0]
+        statistics = iter(git("diff", "--numstat", "-z", *diff).split("\0")[:-1])
+        for line in statistics:
             added, deleted, path = line.split("\t", 2)
+            if not path:
+                next(statistics)
+                path = next(statistics)
             self.numstat[path] = (added, deleted)
-        paths = iter(self.status)
+        paths = iter([path for path, status in self.status.items() for _ in range(2 if status == "T" else 1)])
         path, number = None, None
-        for line in git("diff", "-U0", "--no-color", "--no-renames", self.base, head).split("\n"):
+        for line in git("diff", "-U0", "--no-color", *diff).split("\n"):
             if line.startswith("diff --git "):
                 path, number = next(paths), None
             elif line.startswith("@@"):
@@ -149,7 +160,8 @@ class Check:
         self.duplicates(exports)
         for path, lines in self.files(lambda p: p.suffix in (".py", ".cmake") or p.name == "CMakeLists.txt"):
             for number, text in lines:
-                if "#" in STRINGS.sub('""', text) and not text.startswith("#!"):
+                shebang = text.startswith("#!") or (number == 1 and text.startswith("\ufeff#!"))
+                if "#" in STRINGS.sub('""', text) and not shebang:
                     self.report("comment", path, number)
         if any(is_debt(path) for path in self.status):
             self.findings = [finding for finding in self.findings if finding[0] != "comment"]
@@ -200,15 +212,22 @@ class Check:
             suffix = PurePosixPath(path).suffix.lower()
             if self.status.get(path) != "D" and (added == "-" or suffix in IMAGES or not utf8(self.blob(path))):
                 self.report("binary", path, 0)
-            if self.status.get(path) == "A" and allowed_notes(path) is False:
+            if self.status.get(path) in ("A", "R") and allowed_notes(path) is False:
                 self.report("notes-file", path, 0)
 
     def docs(self):
-        for path, lines in self.files(lambda p: p.suffix == ".md"):
+        files = dict(self.files(lambda p: p.suffix == ".md"))
+        for path, status in self.status.items():
+            if status == "R" and not path.startswith("3rdparty/") and PurePosixPath(path).suffix == ".md":
+                files[path] = list(enumerate(self.show(path).split("\n"), 1))
+        for path, lines in files.items():
+            fenced = fenced_lines(self.show(path))
             for number, text in lines:
                 name = debt_name(text) if is_debt(path) and text.startswith("- ") else None
                 if name and path != f"{DEBT_DIR}{name}.md":
                     self.report("debt-file", path, number, f"{DEBT_DIR}{name}.md")
+                if number in fenced:
+                    continue
                 for target, resolved in links(path, text):
                     if resolved not in self.tree and resolved not in self.dirs:
                         self.report("doc-link", path, number, target)
@@ -258,8 +277,17 @@ def utf8(data):
     return True
 
 
+def fenced_lines(text):
+    inside = set()
+    for match in FENCE.finditer(text):
+        first = text.count("\n", 0, match.start()) + 1
+        inside.update(range(first, first + match.group(0).count("\n") + 1))
+    return inside
+
+
 def links(path, text):
     result = []
+    text = INLINE.sub("", FENCE.sub("", text))
     for target in LINK.findall(text):
         if re.match(r"[A-Za-z][A-Za-z0-9+.-]*:|//|#", target):
             continue
