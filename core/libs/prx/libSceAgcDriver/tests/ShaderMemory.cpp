@@ -754,7 +754,7 @@ void verifyScalarBufferBounds() {
         Detail::Evaluator evaluator(plan, runtime);
         evaluator.ReportInaccessibleReads(&inaccessible);
         std::uint32_t result = 0xdeadbeefu;
-        const bool evaluated = evaluator.Evaluate(&read, result);
+        const bool evaluated = evaluator.Evaluate(Detail::IrNode(&read), result);
         require(evaluated && result == (entry.inRange ? 0x12345678u : 0u), entry.inRange ? "scalar buffer bounds: in-range read changed" : "scalar buffer bounds: out-of-range read was not zero");
         require(callbacks.probes == unsigned(entry.inRange) && callbacks.reads == unsigned(entry.inRange), "scalar buffer bounds: out-of-range read called memory callbacks");
         require(trace.otherReads.empty() && trace.leaves.size() == std::size_t(entry.inRange) && inaccessible.read == nullptr, "scalar buffer bounds: out-of-range read was traced or poisoned");
@@ -770,8 +770,8 @@ void verifyScalarBufferBounds() {
         callbacks.failure = failure;
         Detail::Evaluator evaluator(plan, runtime);
         std::uint32_t result = 0u;
-        if (failure == 1u) require(!evaluator.Evaluate(&read, result), "scalar buffer bounds: failed in-range callback was accepted");
-        else expectFailure([&] { evaluator.Evaluate(&read, result); }, "scalar buffer callback failure", "scalar buffer bounds: callback exception was swallowed");
+        if (failure == 1u) require(!evaluator.Evaluate(Detail::IrNode(&read), result), "scalar buffer bounds: failed in-range callback was accepted");
+        else expectFailure([&] { evaluator.Evaluate(Detail::IrNode(&read), result); }, "scalar buffer callback failure", "scalar buffer bounds: callback exception was swallowed");
     }
     callbacks = {};
     callbacks.address = 0x1000u;
@@ -794,7 +794,7 @@ void verifyScalarBufferBounds() {
     runtime.accessible = nullptr;
     Detail::Evaluator noCallbacks(plan, runtime);
     std::uint32_t result = 0xdeadbeefu;
-    require(noCallbacks.Evaluate(&read, result) && result == 0u, "scalar buffer bounds: out-of-range read dereferenced guest memory");
+    require(noCallbacks.Evaluate(Detail::IrNode(&read), result) && result == 0u, "scalar buffer bounds: out-of-range read dereferenced guest memory");
 }
 
 void verifyTypeZeroImageMaterialization() {

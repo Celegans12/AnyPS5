@@ -28,6 +28,7 @@ void RetireDepthSurfaces(VkDevice device, std::uint64_t address, std::uint64_t b
 bool DepthSurfaceAt(std::uint64_t address);
 bool DepthSurfaceAt(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource);
 void SeedStorageFromDepth(const Context& context, const std::shared_ptr<StorageTexture>& storage);
+bool DepthSurfaceServesStorage(const Context& context, const StorageTexture& storage);
 void ValidateStorageDepthWrites(const Context& context, std::span<const std::shared_ptr<StorageTexture>> storage);
 void MarkStorageDepthWrites(const Context& context, const std::shared_ptr<StorageTexture>& storage);
 std::uint64_t HtileDepthClearAddress(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const std::array<std::uint32_t, 3>& numThreads);

@@ -45,7 +45,6 @@
 #include "prx/libc/include/GuestAllocations.hpp"
 
 namespace AgcDriver::Graphics {
-bool DepthSurfaceServesStorage(const Context& context, const StorageTexture& storage);
 namespace {
 
 bool overlap(std::uint64_t first, std::size_t firstSize, std::uint64_t second, std::size_t secondSize) {
