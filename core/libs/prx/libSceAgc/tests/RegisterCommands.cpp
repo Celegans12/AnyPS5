@@ -196,6 +196,7 @@ void testDirectList() {
         Storage empty;
         empty.words.fill(sentinel);
         check(writers[i](&empty.buffer, nullptr, 0) == empty.words.data() && empty.buffer.cursor_up == empty.words.data() && empty.words.front() == sentinel, "an empty register list wrote a packet");
+        expectFailure([&] { writers[i](nullptr, nullptr, 0); });
         check(sizes[i](0x15555555u) == 0xfffffffcu, "largest register list size mismatch");
         for (const auto count : {0x15555556u, 0x40000000u, 0xffffffffu}) {
             expectFailure([&] { sizes[i](count); });
