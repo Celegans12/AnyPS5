@@ -202,6 +202,12 @@ Limits are listed in the [libc](../dev/debt/libc.md) and [relinker](../dev/debt/
 
 Set `APS5_CRASH_INDIRECT_MEMORY=1` before launching the executable to include up to 64 bytes from each pointer found in the register memory dump. The report labels each block with its register, pointer offset and target address. Inaccessible, incomplete and executable targets are skipped. This additional dump is disabled when the variable is unset or empty.
 
+### GPU submission rings and stall dumps
+
+Each GPU queue keeps its last 16 command buffer submissions: when each was submitted, its serial, size and guest address, and a copy of its first 512 dwords after indirect buffers are inlined. `APS5_PM4_RING=<n>` keeps the last `n` instead, from 0 to 4096; 0 keeps none, and any other value stops the title at its first submission. The rings are printed to stderr, one line per submission and one per decoded packet, when the Windows crash report runs: an unhandled exception, `abort()`, an invalid CRT parameter or the timed dump of `APS5_HANG_DUMP_SECS`.
+
+With `APS5_STALL_WATCHDOG_SECS=<n>`, a queue that has waited `n` seconds without progress in a `WAIT_REG_MEM`, a `REWIND` or behind queue 0 prints the rings once for that wait, and the title keeps running. A `WAIT_REG_MEM` progresses while any other packet runs or completes, as for `APS5_GPU_WAIT_TIMEOUT_MS`. `n` is from 0 to 86400 and 0, the default, disables the watchdog; any other value stops the title at its first submission, as for `APS5_PM4_RING`. While the rings are printed for a queue held behind queue 0, new submissions and the other queues wait.
+
 ## Exit codes
 
 `0`: conversion succeeded or help was displayed. `1`: invalid arguments. `2`: conversion failed; the error is printed to stderr. With `--autorun`, successful conversion returns the launched application's exit code.
