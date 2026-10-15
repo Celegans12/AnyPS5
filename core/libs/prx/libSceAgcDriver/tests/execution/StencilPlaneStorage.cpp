@@ -404,7 +404,7 @@ int main() {
         MarkPlane(*device, target.stencilAddress, SwizzleZ64KBX);
         RequireRead(inside, Written, ClearStencil, "image_load of the stencil plane after a stencil draw");
         RequireCoverage(Draw(*device, screen, target, VK_COMPARE_OP_ALWAYS, VK_STENCIL_OP_KEEP, 0, 2), inside, "depth EQUAL 0.5 preserved after stencil image_store OR 0x04");
-        AgcDriver::Graphics::NoteHtileDepthClear(target.htileAddress);
+        AgcDriver::Graphics::NoteHtileDepthClear(target.htileAddress, ((Width + 1023u) / 1024u) * ((Height + 511u) / 512u) * 32768u);
         RequireCoverage(Draw(*device, screen, target, VK_COMPARE_OP_EQUAL, VK_STENCIL_OP_KEEP, Written | Mark), inside, "stencil EQUAL 0x14 after image_store OR 0x04 and a depth fast clear");
         RequireCoverage(Draw(*device, screen, target, VK_COMPARE_OP_EQUAL, VK_STENCIL_OP_KEEP, ClearStencil | Mark), outside, "stencil EQUAL 0x05 after image_store OR 0x04");
         RequireCoverage(Draw(*device, screen, target, VK_COMPARE_OP_EQUAL, VK_STENCIL_OP_KEEP, Written), std::vector<bool>(inside.size(), false), "stencil EQUAL 0x10 after image_store OR 0x04");

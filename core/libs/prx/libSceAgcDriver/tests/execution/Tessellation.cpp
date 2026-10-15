@@ -865,7 +865,7 @@ void RequireRegisteredRefusal() {
     const std::array<ShaderRegister, 3> primitive{{{0x25bu, 0u}, {0x262u, 0u}, {0x242u, 9u}}};
     std::string refusal;
     {
-        AgcDriver::ShaderPreparationScope scope;
+        AgcDriver::ShaderPreparationScope scope{&hull.shader, &domain.shader};
         try {
             AgcDriverResolveGraphicsStagesAbi_nid_postfix(stages, context, primitive);
             AgcDriverResolveGraphicsStagesAbi_nid_postfix(stages, context, primitive);
