@@ -7915,6 +7915,10 @@ int pipelineCacheFileTests(const Device& device) {
     const auto cacheFile = [&] {
         std::vector<std::filesystem::path> found;
         for (const auto& entry : std::filesystem::directory_iterator(directory)) found.push_back(entry.path());
+        Require(found.size() == 1 && std::filesystem::is_directory(found.front()), "the pipeline cache file does not live in the shader cache version's directory alone");
+        const auto version = found.front();
+        found.clear();
+        for (const auto& entry : std::filesystem::directory_iterator(version)) found.push_back(entry.path());
         Require(found.size() == 1 && found.front().filename().string().starts_with("vk-pipelines-"), "the pipeline cache directory does not hold exactly one cache file");
         return found.front();
     };
