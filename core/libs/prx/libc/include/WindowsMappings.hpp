@@ -5,6 +5,7 @@
 #include <windows.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstddef>
 #include <cstdint>
@@ -16,6 +17,7 @@
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <utility>
 
 namespace GuestArena {
 
@@ -116,7 +118,7 @@ public:
                     const auto shared = pageOf(*slot);
                     if (slot->saved) {
                         std::memcpy(reinterpret_cast<void*>(base + at), slot->saved->bytes + slot->savedOffset, pageBytes);
-                        slot->saved.reset();
+                        restored(*slot);
                     }
                     shared->aliases.push_back(base + at);
                     views.emplace(base + at, View{shared, protection, {}, 0, owned, offset + done + at, 0, 0, true, slot});
@@ -246,6 +248,10 @@ public:
             --it->second.hostWrites;
             invalidate(*it->second.page, subpagesOf(it->first, address, end));
         }
+    }
+
+    std::pair<std::uint64_t, std::uint64_t> SavedMemory() const {
+        return {savedBytes.load(std::memory_order_relaxed), savedBlocks.load(std::memory_order_relaxed)};
     }
 
     void* MapAlias(std::uintptr_t address, std::size_t bytes) {
@@ -507,12 +513,19 @@ private:
         Section& operator=(const Section&) = delete;
         ~Section() { CloseHandle(handle); }
     };
+    static inline std::atomic<std::uint64_t> savedBytes{0};
+    static inline std::atomic<std::uint64_t> savedBlocks{0};
     struct Saved {
         unsigned char* bytes;
-        explicit Saved(unsigned char* bytes) : bytes(bytes) {}
+        std::size_t committed = 0;
+        explicit Saved(unsigned char* bytes) : bytes(bytes) { savedBlocks.fetch_add(1, std::memory_order_relaxed); }
         Saved(const Saved&) = delete;
         Saved& operator=(const Saved&) = delete;
-        ~Saved() { VirtualFree(bytes, 0, MEM_RELEASE); }
+        ~Saved() {
+            VirtualFree(bytes, 0, MEM_RELEASE);
+            savedBytes.fetch_sub(committed, std::memory_order_relaxed);
+            savedBlocks.fetch_sub(1, std::memory_order_relaxed);
+        }
     };
     struct Physical {
         std::weak_ptr<SharedPage> page;
@@ -611,6 +624,15 @@ private:
         if (!VirtualProtect(page, pageBytes, protection, &previous)) fail("protect shared guest page");
     }
 
+    static void restored(Physical& slot) {
+        if (slot.saved.use_count() > 1) {
+            if (!VirtualFree(slot.saved->bytes + slot.savedOffset, pageBytes, MEM_DECOMMIT)) fail("drop the saved copy of remapped direct memory");
+            slot.saved->committed -= pageBytes;
+            savedBytes.fetch_sub(pageBytes, std::memory_order_relaxed);
+        }
+        slot.saved.reset();
+    }
+
     static bool blank(std::uintptr_t page) {
         const auto* words = reinterpret_cast<const std::uint64_t*>(page);
         for (std::size_t i = 0; i < pageBytes / sizeof(std::uint64_t); ++i) {
@@ -671,6 +693,8 @@ private:
                     saved = std::make_shared<Saved>(bytes);
                 }
                 if (!VirtualAlloc(saved->bytes + (page - start), pageBytes, MEM_COMMIT, PAGE_READWRITE)) fail("keep unmapped direct memory");
+                saved->committed += pageBytes;
+                savedBytes.fetch_add(pageBytes, std::memory_order_relaxed);
                 std::memcpy(saved->bytes + (page - start), reinterpret_cast<const void*>(page), pageBytes);
                 view.slot->saved = saved;
                 view.slot->savedOffset = page - start;
