@@ -54,6 +54,7 @@
 #include "Translation/include/Translation/ShaderInputInfoBuilder.hpp"
 #include <exception>
 #include <stdexcept>
+#include <type_traits>
 #include <string>
 #include <ControlFlow/RequestSerializer.hpp>
 
@@ -313,6 +314,7 @@ struct ResultMemoEntry {
     std::uint64_t variantId;
     std::uint64_t hash;
     std::shared_ptr<const RecompileResult> result;
+    std::uint64_t bytes = 0;
 };
 
 struct EmissionFailure {
@@ -341,6 +343,7 @@ struct SourceEntry : std::enable_shared_from_this<SourceEntry> {
     // The result memo, most recently used first, at most ResultMemoEntries (under mutex).
     std::list<ResultMemoEntry> memo;
     std::unordered_map<std::uint64_t, std::list<ResultMemoEntry>::iterator> memoIndex;
+    std::uint64_t memoBytes = 0;
 };
 
 namespace {
@@ -1375,8 +1378,29 @@ constexpr std::size_t ResultMemoEntries = 256;
 
 struct ResultMemoCounters {
     std::atomic<std::uint64_t> hits{0}, misses{0}, evictions{0}, populateNanoseconds{0};
+    std::atomic<std::uint64_t> liveEntries{0}, liveBytes{0}, totalEvictions{0}, evictedBytes{0};
     std::atomic<std::int64_t> lastReport{0};
 };
+
+std::uint64_t defaultResultMemoSourceBytes() {
+    const char* text = std::getenv("APS5_RESULT_MEMO_SOURCE_MIB");
+    if (text == nullptr) return std::uint64_t{64} << 20u;
+    char* end = nullptr;
+    const auto mebibytes = std::strtoull(text, &end, 10);
+    if (end == text || *end != '\0' || mebibytes == 0 || mebibytes > (std::uint64_t{1} << 20u)) throw std::runtime_error(std::string("APS5_RESULT_MEMO_SOURCE_MIB=") + text + ": expected a size in MiB from 1 to 1048576");
+    return mebibytes << 20u;
+}
+
+std::atomic<std::uint64_t>& resultMemoSourceBytes() {
+    static std::atomic<std::uint64_t> bytes{defaultResultMemoSourceBytes()};
+    return bytes;
+}
+
+template<typename TValue, typename TAllocator>
+std::uint64_t vectorHeapBytes(const std::vector<TValue, TAllocator>& values) {
+    if constexpr (std::is_same_v<TValue, bool>) return (values.capacity() + 7u) / 8u;
+    else return values.capacity() * sizeof(TValue);
+}
 
 ResultMemoCounters& resultMemoCounters() {
     static ResultMemoCounters counters;
@@ -1398,7 +1422,7 @@ void reportResultMemo() {
     const auto misses = counters.misses.exchange(0, std::memory_order_relaxed);
     const auto evictions = counters.evictions.exchange(0, std::memory_order_relaxed);
     const auto populate = counters.populateNanoseconds.exchange(0, std::memory_order_relaxed);
-    std::fprintf(stderr, "[recompile] result memo (10 s): %llu hits, %llu misses (%.1f%% hits), Populate %.1f us per miss / %.1f ms in total, %llu evictions\n", static_cast<unsigned long long>(hits), static_cast<unsigned long long>(misses), hits + misses != 0 ? 100.0 * static_cast<double>(hits) / static_cast<double>(hits + misses) : 0.0, misses != 0 ? static_cast<double>(populate) / 1000.0 / static_cast<double>(misses) : 0.0, static_cast<double>(populate) / 1e6, static_cast<unsigned long long>(evictions));
+    std::fprintf(stderr, "[recompile] result memo (10 s): %llu hits, %llu misses (%.1f%% hits), Populate %.1f us per miss / %.1f ms in total, %llu evictions; live %llu results, %.1f MiB (%.0f MiB per source at most)\n", static_cast<unsigned long long>(hits), static_cast<unsigned long long>(misses), hits + misses != 0 ? 100.0 * static_cast<double>(hits) / static_cast<double>(hits + misses) : 0.0, misses != 0 ? static_cast<double>(populate) / 1000.0 / static_cast<double>(misses) : 0.0, static_cast<double>(populate) / 1e6, static_cast<unsigned long long>(evictions), static_cast<unsigned long long>(counters.liveEntries.load(std::memory_order_relaxed)), static_cast<double>(counters.liveBytes.load(std::memory_order_relaxed)) / 1048576.0, static_cast<double>(resultMemoSourceBytes().load(std::memory_order_relaxed)) / 1048576.0);
 }
 
 // Everything materializeResult reads besides the variant: the snapshot (the descriptor words, the
@@ -1512,24 +1536,37 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
     std::shared_ptr<const RecompileResult> shared = std::move(result);
     {
         std::lock_guard lock(source.mutex);
+        const auto drop = [&](std::list<ResultMemoEntry>::iterator entry) {
+            source.memoBytes -= entry->bytes;
+            counters.liveEntries.fetch_sub(1, std::memory_order_relaxed);
+            counters.liveBytes.fetch_sub(entry->bytes, std::memory_order_relaxed);
+            source.memo.erase(entry);
+        };
         const auto found = source.memoIndex.find(index);
         if (found != source.memoIndex.end()) {
             if (found->second->variantId == variant->artifact.variantId && found->second->hash == hash) {
                 source.memo.splice(source.memo.begin(), source.memo, found->second);
                 shared = found->second->result;
             } else {
-                source.memo.erase(found->second);
+                drop(found->second);
                 source.memoIndex.erase(found);
             }
         }
         if (source.memoIndex.find(index) == source.memoIndex.end()) {
-            source.memo.push_front({variant->artifact.variantId, hash, shared});
+            const auto bytes = ResultHeapBytes(*shared);
+            source.memo.push_front({variant->artifact.variantId, hash, shared, bytes});
             source.memoIndex.emplace(index, source.memo.begin());
-            while (source.memo.size() > ResultMemoEntries) {
-                const auto& last = source.memo.back();
-                source.memoIndex.erase((last.variantId * 0x9e3779b97f4a7c15ull) ^ last.hash);
-                source.memo.pop_back();
+            source.memoBytes += bytes;
+            counters.liveEntries.fetch_add(1, std::memory_order_relaxed);
+            counters.liveBytes.fetch_add(bytes, std::memory_order_relaxed);
+            const auto budget = resultMemoSourceBytes().load(std::memory_order_relaxed);
+            while (source.memo.size() > ResultMemoEntries || (source.memo.size() > 1u && source.memoBytes > budget)) {
+                const auto last = std::prev(source.memo.end());
+                source.memoIndex.erase((last->variantId * 0x9e3779b97f4a7c15ull) ^ last->hash);
                 counters.evictions.fetch_add(1, std::memory_order_relaxed);
+                counters.totalEvictions.fetch_add(1, std::memory_order_relaxed);
+                counters.evictedBytes.fetch_add(last->bytes, std::memory_order_relaxed);
+                drop(last);
             }
         }
     }
@@ -1757,6 +1794,37 @@ std::shared_ptr<const ResourceCapture> CaptureResources(const RecompileRequest& 
 
 RecompileResult Recompile(const RecompileRequest& request) {
     return recompileReporting(request, [&] { return RecompileImpl(request); });
+}
+
+std::uint64_t ResultHeapBytes(const RecompileResult& result) {
+    std::uint64_t bytes = sizeof(result);
+    bytes += vectorHeapBytes(result.vertexInputPatches) + vectorHeapBytes(result.runtimeImageResources) + vectorHeapBytes(result.vertexInputs);
+    bytes += vectorHeapBytes(result.parameterExports) + vectorHeapBytes(result.fragmentParameters) + vectorHeapBytes(result.stencilReferences);
+    bytes += vectorHeapBytes(result.specialization) + vectorHeapBytes(result.bindings) + vectorHeapBytes(result.pushConstants) + vectorHeapBytes(result.vertexAttributes);
+    bytes += vectorHeapBytes(result.imageTablePoison) + vectorHeapBytes(result.imageTableRanges) + vectorHeapBytes(result.imageTableReadRanges) + vectorHeapBytes(result.bindlessTables);
+    for (const auto& binding : result.bindings) {
+        bytes += vectorHeapBytes(binding.guestDescriptor) + vectorHeapBytes(binding.samplerDepthCompare) + vectorHeapBytes(binding.imageWritten);
+        bytes += vectorHeapBytes(binding.imageDepthCompare) + vectorHeapBytes(binding.imageAtomic) + vectorHeapBytes(binding.imageAtomic64) + vectorHeapBytes(binding.imageShapes);
+        bytes += vectorHeapBytes(binding.bufferAtomic) + vectorHeapBytes(binding.bufferWritten) + vectorHeapBytes(binding.samplerUnnormalized) + vectorHeapBytes(binding.samplerIntegerBorder);
+        bytes += vectorHeapBytes(binding.imageUnnormalized) + vectorHeapBytes(binding.imageUnnormalizedBaseLevel) + vectorHeapBytes(binding.imageSamplers) + vectorHeapBytes(binding.bufferRead);
+    }
+    for (const auto& ranges : result.imageTableReadRanges) bytes += vectorHeapBytes(ranges);
+    for (const auto& table : result.bindlessTables) bytes += vectorHeapBytes(table.uses);
+    return bytes;
+}
+
+ResultMemoFootprint ResultMemoTotals() {
+    const auto& counters = resultMemoCounters();
+    return {counters.liveEntries.load(std::memory_order_relaxed), counters.liveBytes.load(std::memory_order_relaxed), counters.totalEvictions.load(std::memory_order_relaxed), counters.evictedBytes.load(std::memory_order_relaxed)};
+}
+
+void SetResultMemoSourceBytes(std::uint64_t bytes) {
+    if (bytes == 0) throw std::invalid_argument("SetResultMemoSourceBytes: the per-source result memo budget must be positive");
+    resultMemoSourceBytes().store(bytes, std::memory_order_relaxed);
+}
+
+std::uint64_t ResultMemoSourceBytes() {
+    return resultMemoSourceBytes().load(std::memory_order_relaxed);
 }
 
 std::shared_ptr<const RecompileResult> Recompile(const RecompileRequest& request, const ResourceCapture& capture, bool* memoHit) {

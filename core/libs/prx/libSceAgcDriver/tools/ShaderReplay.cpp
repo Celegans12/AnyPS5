@@ -506,7 +506,7 @@ bool Replay(const char* path, std::unique_ptr<AgcDriver::VulkanDevice>& device) 
                 std::printf("  materialized: %zu SPIR-V words\n", result->spirv.size());
                 std::uint64_t largest = 0;
                 for (const auto& binding : result->bindings) largest = std::max<std::uint64_t>(largest, AgcDriver::DriverDetail::VectorHeapBytes(binding.guestDescriptor));
-                std::printf("  result heap: %llu bytes, %zu bindings, largest guest descriptor %llu bytes\n", static_cast<unsigned long long>(AgcDriver::DriverDetail::ResultHeapBytes(*result)), result->bindings.size(), static_cast<unsigned long long>(largest));
+                std::printf("  result heap: %llu bytes, %zu bindings, largest guest descriptor %llu bytes\n", static_cast<unsigned long long>(ShaderRecompiler::ResultHeapBytes(*result)), result->bindings.size(), static_cast<unsigned long long>(largest));
             }
             return true;
         } catch (const std::exception& error) {

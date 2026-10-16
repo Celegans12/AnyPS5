@@ -1525,6 +1525,36 @@ void verifyInvocationIsolation() {
     require(rejected, "an unsupported buffer descriptor type was accepted");
 }
 
+void verifyResultMemoBudget() {
+    ComputeRequest request(true);
+    const auto handle = PrepareShader(request.request);
+    const auto materialize = [&](std::uint32_t address) {
+        request.userData[0] = address;
+        SrtRuntime runtime{};
+        runtime.userData = request.userData;
+        return MaterializeShader(request.request, *CaptureResources(request.request, runtime, *handle), *handle);
+    };
+    const auto budget = ResultMemoSourceBytes();
+    const auto first = materialize(0x10000000u);
+    require(materialize(0x10000000u) == first, "the result memo did not reuse a result within its budget");
+    const auto before = ResultMemoTotals();
+    SetResultMemoSourceBytes(1u);
+    const auto second = materialize(0x10010000u);
+    const auto after = ResultMemoTotals();
+    require(after.evictions == before.evictions + 1u && after.evictedBytes - before.evictedBytes == ResultHeapBytes(*first) && after.entries == before.entries, "a source over its result memo budget did not evict exactly its older result");
+    const auto again = materialize(0x10000000u);
+    require(again != first, "an evicted result was still served from the memo");
+    requireSameResult(*first, *again, "a result rematerialized after its memo eviction");
+    require(materialize(0x10000000u) == again, "the budget evicted the newest result");
+    require(materialize(0x10010000u) != second, "a result evicted under the budget was still served from the memo");
+    SetResultMemoSourceBytes(budget);
+    bool refused = false;
+    try { SetResultMemoSourceBytes(0u); }
+    catch (const std::invalid_argument&) { refused = true; }
+    require(refused && ResultMemoSourceBytes() == budget, "a zero result memo budget was accepted");
+    std::cout << "result memo: per-source byte budget evicts older results, rematerializes them exactly and keeps the newest\n";
+}
+
 void verifyBufferAlignmentSpecialization() {
     ComputeRequest request(true);
     request.request.context.waveSize = 32u;
@@ -2895,6 +2925,7 @@ int main(int argc, char** argv) {
         verifyEmissionFailureMemo();
         verifyFailureMemoSwitch(argv[0]);
         verifyInvocationIsolation();
+        verifyResultMemoBudget();
         verifyBufferAlignmentSpecialization();
         verifyBufferPresenceSubstitutes(argv[0]);
         verifyBindingPlanSelection();

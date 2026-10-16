@@ -603,6 +603,7 @@ struct RecompileResult : CompiledShaderArtifact, ShaderInvocation {
 };
 
 [[nodiscard]] RecompileResult Recompile(const RecompileRequest& request);
+[[nodiscard]] std::uint64_t ResultHeapBytes(const RecompileResult& result);
 
 struct ResourceCapture;
 [[nodiscard]] std::shared_ptr<const RecompileResult> Recompile(const RecompileRequest& request, const ResourceCapture& capture, bool* memoHit = nullptr);
