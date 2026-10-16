@@ -14,6 +14,7 @@
 #if ANYPS5_ENABLE_SPIRV_TOOLS
 #include "spirv-tools/libspirv.hpp"
 #endif
+#include <spirv/unified1/spirv.hpp>
 
 #include <algorithm>
 #include <cstdio>
@@ -21,6 +22,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <list>
 #include <map>
 #include <set>
 #include <tuple>
@@ -393,6 +395,14 @@ bool Replay(const char* path, std::unique_ptr<AgcDriver::VulkanDevice>& device) 
     if (g_bindless) {
         request.request.target.bindlessImages = true;
         std::printf("  bindless images (--bindless or APS5_BINDLESS_IMAGES=1): table images read through the descriptor heap\n");
+        const auto capabilities = request.request.target.supportedCapabilities;
+        if (request.request.shader.stage == ShaderRecompiler::ShaderStage::Fragment && std::ranges::find(capabilities, static_cast<std::uint32_t>(spv::CapabilityGroupNonUniformQuad)) == capabilities.end()) {
+            static std::list<std::vector<std::uint32_t>> extended;
+            auto& quad = extended.emplace_back(capabilities.begin(), capabilities.end());
+            quad.push_back(spv::CapabilityGroupNonUniformQuad);
+            request.request.target.supportedCapabilities = quad;
+            std::printf("  bindless images: the fragment target gains GroupNonUniformQuad, as a bindless device with fragment quad operations adds it\n");
+        }
     }
     if (g_pipelineOnly) {
         if (!g_expectedSpirv.empty() && g_requests > 1) throw std::runtime_error("--expect-spv takes one request; several requests need their .fp sidecars");

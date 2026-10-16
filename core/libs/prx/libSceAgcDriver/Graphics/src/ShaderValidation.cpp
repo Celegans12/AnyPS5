@@ -1,3 +1,4 @@
+#include "BindlessImageAbi.hpp"
 #include "BdaAbi.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineSpecialization.hpp"
@@ -212,6 +213,7 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
                     case spv::CapabilityGroupNonUniformBallot: subgroupOperations = VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_BALLOT_BIT; break;
                     case spv::CapabilityGroupNonUniformShuffle: subgroupOperations = VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_SHUFFLE_BIT; break;
                     case spv::CapabilityGroupNonUniformArithmetic: subgroupOperations = VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_ARITHMETIC_BIT; break;
+                    case spv::CapabilityGroupNonUniformQuad: subgroupOperations = VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_QUAD_BIT; break;
                     default: break;
                 }
                 const bool isSubgroupCapability = subgroupOperations != 0;
@@ -538,6 +540,11 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
             Require(mesh, "workgroup memory outside a mesh shader");
         } else if (variable.storage == spv::StorageClassUniformConstant) {
             Require(decoration.set && decoration.binding, "unbound shader resource");
+            if (shader.bindlessHeap && *decoration.set == ShaderRecompiler::BindlessImageAbi::HeapDescriptorSet) {
+                Require(*decoration.binding == ShaderRecompiler::BindlessImageAbi::SamplerBinding || *decoration.binding == ShaderRecompiler::BindlessImageAbi::SampledImageBinding, "a bindless heap resource uses a binding other than the heap's samplers or sampled images");
+                Require((type[0] & 0xffffu) == spv::OpTypeRuntimeArray, "a bindless heap resource must be declared as a runtime descriptor array");
+                continue;
+            }
             if (fragment && *decoration.set == ShaderRecompiler::RuntimeAbi::BlendedTargetDescriptorSet) {
                 const auto exportIndex = *decoration.binding;
                 Require(std::any_of(state.blendedColors.begin(), state.blendedColors.end(), [&](const ColorTarget& color) { return color.exportIndex == exportIndex; }), "fragment shader blends into an export that has no blended 10_11_11 unorm target");
@@ -561,6 +568,10 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
             Require(binding->count != 0u && binding->count <= capacity && count != module.constants.end() && count->second == binding->count, "typed heap array length disagrees with compact binding");
         } else {
             Require(variable.storage == spv::StorageClassStorageBuffer && decoration.set && decoration.binding, "unsupported or unbound shader resource");
+            if (shader.bindlessHeap && *decoration.set == ShaderRecompiler::BindlessImageAbi::HeapDescriptorSet) {
+                Require(*decoration.binding == ShaderRecompiler::BindlessImageAbi::HeaderBinding, "a bindless heap buffer uses a binding other than the heap's header");
+                continue;
+            }
             const auto key = std::make_pair(*decoration.set, *decoration.binding);
             const auto binding = std::find_if(shader.bindings.begin(), shader.bindings.end(), [&](const auto& item) { return item.descriptorSet == key.first && item.binding == key.second; });
             const bool array = binding != shader.bindings.end() && binding->role == ShaderRecompiler::DescriptorRole::GuestBuffers;

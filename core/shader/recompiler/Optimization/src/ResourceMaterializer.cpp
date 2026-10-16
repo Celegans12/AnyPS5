@@ -1522,7 +1522,7 @@ BindlessInterfaceRegistry& bindlessInterfaces() {
 }
 
 bool ResourceMaterializer::BindlessImage(const ShaderInfo& info, IrShaderStage stage, std::uint32_t resource) {
-    if (stage != IrShaderStage::Compute || resource >= info.images.size() || resource >= info.runtimeImageModes.size()) return false;
+    if (stage == IrShaderStage::Unknown || stage == IrShaderStage::Fetch || resource >= info.images.size() || resource >= info.runtimeImageModes.size()) return false;
     const auto& image = info.images[resource];
     return image.table != NoTable && image.resourceClass == ImageResourceClass::Sampled && image.tableOperation == TableOperation::Supported && !info.runtimeImageModes[resource].empty();
 }

@@ -1,11 +1,13 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BindlessTable.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineSpecialization.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
+#include "BindlessImageAbi.hpp"
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -192,7 +194,7 @@ void appendKey(std::vector<std::byte>& key, const TValue& value) {
 
 bool libraryKeys(PipelineLibraryKeys& keys, const Context& context, const State& state, const VertexInputLayout& input, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders) {
     using Stage = ShaderRecompiler::ShaderStage;
-    if (!context.graphicsPipelineLibrary || context.pipelineExecutableInfo || state.depthBiasPerFace || state.rectList || SplitsAlternateAlpha(state) || !state.blendedColors.empty()) return false;
+    if (!context.graphicsPipelineLibrary || context.pipelineExecutableInfo || state.depthBiasPerFace || state.rectList || SplitsAlternateAlpha(state) || !state.blendedColors.empty() || BindlessHeapStages(shaders) != 0u) return false;
     keys = {};
     for (const auto& shader : shaders) {
         if (shader.stage == Stage::Geometry || shader.program->PipelineVariantId() == 0) return false;
@@ -353,7 +355,7 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         }
         // A descriptor set layout with the same bindings as this one is compatible with the pipeline
         // layout, so later draws bind their own ShaderResources' set under it.
-        std::array<VkDescriptorSetLayout, 3> setLayouts{resources.main, resources.fragment, VK_NULL_HANDLE};
+        std::array<VkDescriptorSetLayout, 4> setLayouts{resources.main, resources.fragment, VK_NULL_HANDLE, VK_NULL_HANDLE};
         if (!state.blendedColors.empty()) {
             Require(state.blendedColors.size() <= context.limits.maxPerStageDescriptorStorageImages, "blended color targets exceed per-stage storage image limits");
             Require(context.descriptorCache != nullptr, "blended color targets need the descriptor cache");
@@ -371,6 +373,16 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         layoutInfo.flags = resources.split ? VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT : 0;
         layoutInfo.setLayoutCount = blendedLayout != VK_NULL_HANDLE ? ShaderRecompiler::RuntimeAbi::BlendedTargetDescriptorSet + 1u : resources.split ? 2u : 1u;
+        heapStages = BindlessHeapStages(shaders);
+        if (heapStages != 0u) {
+            Require(context.bindlessTable != nullptr, "a bindless image draw needs the device's descriptor heap (APS5_BINDLESS_IMAGES=1 on a device that supports it)");
+            auto& heap = context.bindlessTable->Heap();
+            for (std::uint32_t set = 0; set < ShaderRecompiler::BindlessImageAbi::HeapDescriptorSet; ++set) {
+                if (setLayouts[set] == VK_NULL_HANDLE) setLayouts[set] = heap.EmptyLayout();
+            }
+            setLayouts[ShaderRecompiler::BindlessImageAbi::HeapDescriptorSet] = heap.Layout(heapStages);
+            layoutInfo.setLayoutCount = ShaderRecompiler::BindlessImageAbi::HeapDescriptorSet + 1u;
+        }
         layoutInfo.pSetLayouts = setLayouts.data();
         layoutInfo.pushConstantRangeCount = dynamicRendering ? static_cast<std::uint32_t>(slots.size()) : pushStages != 0 ? 1 : 0;
         layoutInfo.pPushConstantRanges = dynamicRendering ? slots.data() : pushStages != 0 ? &push : nullptr;
@@ -577,6 +589,7 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
 
 bool Pipeline::Prebuild(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders) {
     if (std::ranges::any_of(shaders, [](const CompiledShader& shader) { return !shader.program->stencilReferences.empty(); })) return false;
+    if (BindlessHeapStages(shaders) != 0u) return false;
     struct Scope {
         Scope() { prebuilding = true; prebuilt = false; }
         ~Scope() { prebuilding = false; }
@@ -850,6 +863,7 @@ void pipelineKey(std::vector<std::byte>& key, const Context& context, const Stat
         append(key, shader.pushConstantOffset);
     }
     append(key, PushConstantStages(shaders));
+    append(key, BindlessHeapStages(shaders));
     append(key, input.bindings.size());
     for (const auto& binding : input.bindings) {
         append(key, binding.binding);

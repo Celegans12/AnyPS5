@@ -1807,6 +1807,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             descriptorIndexingFeatures.descriptorBindingStorageImageUpdateAfterBind = VK_TRUE;
             descriptorIndexingFeatures.descriptorBindingUpdateUnusedWhilePending = VK_TRUE;
             state->bindlessImages = true;
+            if ((state->subgroup.supportedOperations & VK_SUBGROUP_FEATURE_QUAD_BIT) != 0 && (state->subgroup.supportedStages & VK_SHADER_STAGE_FRAGMENT_BIT) != 0) state->capabilities.push_back(spv::CapabilityGroupNonUniformQuad);
         }
     }
     deviceInfo.pNext = &bdaFeatures;
@@ -4174,6 +4175,14 @@ std::uint64_t VulkanDevice::presync(std::span<const std::pair<std::uint64_t, std
         if (nowMs - last >= 10000 && counters.lastReport.compare_exchange_strong(last, nowMs)) AgcDriver::ProfilePrint_nid_no_patch("[presync] %llu dispatches checked, %llu pre-syncs waited %.0f ms (cumulative)\n", static_cast<unsigned long long>(counters.checked.load()), static_cast<unsigned long long>(counters.presyncs.load()), counters.waitedUs.load() / 1000.0);
     }
     return serial;
+}
+
+void VulkanDevice::PrimeBindlessDraw(std::span<const Graphics::CompiledShader> shaders) const {
+    if (Graphics::BindlessHeapStages(shaders) == 0u) return;
+    const auto context = graphicsContext();
+    for (const auto& shader : shaders) {
+        if (shader.program->bindlessHeap) Graphics::PrimeBindlessTables(context, shader.program->bindlessTables);
+    }
 }
 
 std::shared_ptr<PreparedDispatch> VulkanDevice::PrepareDispatch(const ShaderRecompiler::RecompileResult& shader, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t dispatchThreads, std::uint64_t programAddress) {

@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "DeviceImageTableAbi.hpp"
+#include <algorithm>
 #include <array>
 #include <cstdlib>
 #include <cstring>
@@ -151,6 +152,13 @@ void BindlessTable::Publish(Recorder& recorder) {
 }
 
 void BindlessTable::drain(const std::shared_ptr<Rings>& rings, const std::shared_ptr<Buffer>& drained) {
+    {
+        std::lock_guard lock(rings->mutex);
+        if (rings->holds.contains(drained.get())) {
+            rings->deferred.push_back(drained);
+            return;
+        }
+    }
     drained->Invalidate();
     const auto bytes = drained->Bytes();
     const auto decoded = DecodeDeviceImageRing(std::span<const std::uint32_t>(reinterpret_cast<const std::uint32_t*>(bytes.data()), RingWords), RingCapacity);
@@ -160,6 +168,30 @@ void BindlessTable::drain(const std::shared_ptr<Rings>& rings, const std::shared
     rings->dropped += decoded.dropped;
     rings->misses.insert(rings->misses.end(), decoded.misses.begin(), decoded.misses.end());
     rings->free.push_back(drained);
+}
+
+void BindlessTable::release(const std::shared_ptr<Rings>& rings, const std::shared_ptr<Buffer>& held) {
+    {
+        std::lock_guard lock(rings->mutex);
+        const auto found = rings->holds.find(held.get());
+        if (found == rings->holds.end() || --found->second != 0u) return;
+        rings->holds.erase(found);
+        const auto deferred = std::find(rings->deferred.begin(), rings->deferred.end(), held);
+        if (deferred == rings->deferred.end()) return;
+        rings->deferred.erase(deferred);
+    }
+    drain(rings, held);
+}
+
+std::shared_ptr<void> BindlessTable::HoldRing() {
+    std::lock_guard lock(mutex);
+    Require(ring != nullptr, "no miss ring is published to hold");
+    auto held = ring;
+    {
+        std::lock_guard ringLock(rings->mutex);
+        ++rings->holds[held.get()];
+    }
+    return std::shared_ptr<void>(held.get(), [shared = rings, held](void*) { release(shared, held); });
 }
 
 std::vector<DeviceImageMiss> BindlessTable::TakeMisses() {
