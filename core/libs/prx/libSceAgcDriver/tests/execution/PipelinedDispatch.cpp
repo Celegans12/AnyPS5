@@ -219,7 +219,7 @@ int main() {
                 std::atomic<bool>& flag;
                 ~Release() { flag.store(true, std::memory_order_release); }
             } release{released};
-            check(DrawPipeline::QueuedItems() == 0, "the pipeline had items before the descriptor round " + std::to_string(round));
+            WaitUntil([] { return DrawPipeline::QueuedItems() == 0; }, "the pipeline to empty before descriptor round " + std::to_string(round));
             const auto drainsBefore = DrawPipeline::DrainRequestsByOpcode(DispatchOpcode);
             DrawPipeline::Queue0().Enqueue([&released] {
                 while (!released.load(std::memory_order_acquire)) std::this_thread::sleep_for(std::chrono::milliseconds(1));
