@@ -1899,10 +1899,12 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     state->context = buildContext();
     state->contextReady = true;
     if (state->bindlessTable) {
-        const auto options = Graphics::TextureService::OptionsFromEnvironment(Graphics::SampledTextureCacheBudget(state->context) / 2u);
+        auto options = Graphics::TextureService::OptionsFromEnvironment(Graphics::SampledTextureCacheBudget(state->context) / 2u);
+        const bool liveBudget = std::getenv("APS5_BINDLESS_BUDGET_MIB") == nullptr;
+        if (liveBudget) options.budgetSource = [context = &state->context] { return Graphics::CurrentTextureCacheBudgets(*context).share; };
         state->textureService = std::make_unique<Graphics::TextureService>(*state->bindlessTable, std::make_shared<Graphics::DriverBindlessResolver>(state->context), std::make_shared<Graphics::GuestBindlessMemory>(), options);
         state->context.textureService = state->textureService.get();
-        std::fprintf(stderr, "[bindless] texture service: %s, budget %llu MiB, idle after %llu submits, commit chunk %u\n", options.lazy ? "lazy (misses only, measurement mode)" : "exact (tables primed before use)", static_cast<unsigned long long>(options.budgetBytes >> 20u), static_cast<unsigned long long>(options.idleSubmits), options.commitChunk);
+        std::fprintf(stderr, "[bindless] texture service: %s, budget %llu MiB%s, idle after %llu submits, commit chunk %u\n", options.lazy ? "lazy (misses only, measurement mode)" : "exact (tables primed before use)", static_cast<unsigned long long>((liveBudget ? Graphics::CurrentTextureCacheBudgets(state->context).share : options.budgetBytes) >> 20u), liveBudget ? " (the sampled textures' share of the VRAM, read at each present)" : " (APS5_BINDLESS_BUDGET_MIB)", static_cast<unsigned long long>(options.idleSubmits), options.commitChunk);
     }
     if (window != nullptr) {
         require(window->getDrawableSize != nullptr, "missing window drawable size query");
