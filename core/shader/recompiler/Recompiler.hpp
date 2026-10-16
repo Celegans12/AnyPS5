@@ -278,6 +278,7 @@ struct SpirvTarget {
     bool vertexSubgroups = true;
     bool float16DenormPreserve = false;
     bool bindlessImages = false;
+    bool spannedWaves = false;
 };
 
 struct BindingLayout {
@@ -567,6 +568,7 @@ struct CompiledShaderArtifact {
     bool vertexOffsetConflict = false;
     bool instanceOffsetConflict = false;
     std::uint32_t hostSubgroupSize = 0;
+    bool fullSubgroups = false;
     std::vector<std::uint32_t> parameterExports;
     std::vector<FragmentParameter> fragmentParameters;
     BarycentricEmulation barycentricEmulation;

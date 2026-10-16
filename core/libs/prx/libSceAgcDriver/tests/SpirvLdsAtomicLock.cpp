@@ -49,6 +49,7 @@ std::vector<std::uint32_t> RecompileProgram(std::span<const std::uint32_t> code,
     request.target.spirvVersion = 0x00010600u;
     request.target.subgroupSize = 32;
     request.target.bdaAbiVersion = 1;
+    request.target.spannedWaves = true;
     request.target.supportedCapabilities = capabilities;
     request.target.supportedExtensions = extensions;
     request.target.maxWorkgroupSize = {1024u, 1024u, 64u};
@@ -147,11 +148,6 @@ void CheckSpannedLockVotesInItsSubgroup() {
 }
 
 int main() {
-#ifdef _WIN32
-    _putenv_s("APS5_SPANNED_WAVE", "1");
-#else
-    setenv("APS5_SPANNED_WAVE", "1", 1);
-#endif
     try {
         CheckSpannedLockVotesInItsSubgroup();
         Check64BitOnlyLocks();

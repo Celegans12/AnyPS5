@@ -587,17 +587,16 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program)
     targetOptions.registrationModules = registration;
     targetOptions.fragmentDescriptorSet = request.target.registrationModules;
     targetOptions.float16DenormPreserve = request.target.float16DenormPreserve;
-    static const bool spannedWaves = std::getenv("APS5_SPANNED_WAVE") != nullptr;
-    targetOptions.spannedWaves = spannedWaves;
+    targetOptions.spannedWaves = request.target.spannedWaves;
     targetOptions.bindlessImages = request.target.bindlessImages;
 
     constexpr SpirvEmitter spirvEmitter;
     CompiledShaderArtifact result;
     result.variantId = nextVariantId();
+    SpirvEmitInfo emitted;
     try {
-        result.spirv = spirvEmitter.Emit(program, inputInfo, bindings, targetOptions);
-    } catch (const std::exception& error) {
-        if (!targetOptions.spannedWaves) throw;
+        result.spirv = spirvEmitter.Emit(program, inputInfo, bindings, targetOptions, &emitted);
+    } catch (const SpannedWaveUnsupported& error) {
         std::fprintf(stderr, "[spanned-wave] 0x%llx falls back to two lanes per invocation: %s\n", static_cast<unsigned long long>(request.shader.codeAddress), error.what());
         targetOptions.spannedWaves = false;
         result.spirv = spirvEmitter.Emit(program, inputInfo, bindings, targetOptions);
@@ -624,6 +623,7 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program)
     result.imageMetadataDword = bindings.layout.ImageMetadataDword();
     result.runtimeImageCount = bindings.layout.runtimeImageCount;
     result.hostSubgroupSize = HostSubgroupSize(request);
+    result.fullSubgroups = emitted.fullSubgroups;
     result.vertexOffsetSgpr = program.Info().vertexOffsetSgpr;
     result.instanceOffsetSgpr = program.Info().instanceOffsetSgpr;
     result.vertexOffsetShared = program.Info().vertexOffsetShared;
@@ -1068,6 +1068,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         .vertexOffsetConflict = artifact.vertexOffsetConflict,
         .instanceOffsetConflict = artifact.instanceOffsetConflict,
         .hostSubgroupSize = artifact.hostSubgroupSize,
+        .fullSubgroups = artifact.fullSubgroups,
         .parameterExports = artifact.parameterExports,
         .fragmentParameters = artifact.fragmentParameters,
         .barycentricEmulation = artifact.barycentricEmulation,

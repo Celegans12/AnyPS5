@@ -66,7 +66,7 @@ namespace ShaderRecompiler
 
         void SpannedShuffle(SpirvEmitterState& state, std::uint32_t type, std::uint32_t result, std::uint32_t value, std::uint32_t lane) {
             const bool boolean = type == TypeBool(state);
-            if (!boolean && type != TypeU32(state) && type != TypeF32(state)) FailEmit("a spanned wave shuffles only 32-bit and boolean values");
+            if (!boolean && type != TypeU32(state) && type != TypeF32(state)) throw SpannedWaveUnsupported("a spanned wave shuffles only 32-bit and boolean values");
             std::uint32_t word = value;
             if (boolean) word = Select(state, TypeU32(state), value, ConstantU32(state, 1u), ConstantU32(state, 0u));
             else if (type != TypeU32(state)) word = Unary(state, spv::OpBitcast, TypeU32(state), value);

@@ -362,6 +362,7 @@ std::string TargetDifference(const ShaderRecompiler::SpirvTarget& captured, cons
     differs("narrowSubgroupClock", captured.narrowSubgroupClock != native.narrowSubgroupClock);
     differs("float64DenormPreserve", captured.float64DenormPreserve != native.float64DenormPreserve);
     differs("bindlessImages", captured.bindlessImages != native.bindlessImages);
+    differs("spannedWaves", captured.spannedWaves != native.spannedWaves);
     return text;
 }
 
@@ -392,6 +393,11 @@ bool Replay(const char* path, std::unique_ptr<AgcDriver::VulkanDevice>& device) 
         const auto difference = TargetDifference(request.request.target, native);
         std::printf("  native target (--native-target): %s%s\n", difference.empty() ? "the captured target matches" : "replaced the captured target's", difference.c_str());
         request.request.target = native;
+    }
+    // Requests do not carry the lane mode: APS5_SPANNED_WAVE selects it here as the driver does from it at device creation.
+    if (std::getenv("APS5_SPANNED_WAVE") != nullptr && !request.request.target.spannedWaves) {
+        request.request.target.spannedWaves = true;
+        std::printf("  spanned waves (APS5_SPANNED_WAVE): a single-wave wave64 compute program spans two full 32-lane subgroups\n");
     }
     if (g_bindless) {
         request.request.target.bindlessImages = true;
