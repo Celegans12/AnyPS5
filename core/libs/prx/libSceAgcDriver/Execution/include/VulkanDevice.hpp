@@ -10,7 +10,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ComputePipelineCapture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
-#include "prx/libSceAgcDriver/Graphics/include/DeviceImageKeys.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include <chrono>
 #include <functional>
@@ -51,8 +50,6 @@ public:
     const std::uint32_t* WorkGroupCountLimit() const;
     std::uint32_t VendorId() const;
     bool BindlessImagesEnabled() const;
-    std::uint32_t BindlessEntries() const;
-    std::vector<Graphics::DeviceImageMiss> TakeBindlessMisses();
     bool TextureServiceRunning() const;
     const Graphics::TextureService* BindlessService() const;
     void BindlessPresentWait();

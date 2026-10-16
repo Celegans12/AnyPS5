@@ -1774,7 +1774,7 @@ int main(int argc, char** argv) {
         RunPointerStorageWriteTests(*device);
         if (BindlessHeap()) RunBindlessOldPathTests(*device);
         RunGraphicsTests(*device);
-        if (BindlessHeap()) Require(device->BindlessEntries() != 0u, "image table: the bindless run put no entry into the device table");
+        if (BindlessHeap()) Require(device->BindlessService() != nullptr && device->BindlessService()->Totals().entries != 0u, "image table: the bindless run put no entry into the texture service");
         std::puts("image table tests passed");
         return 0;
     } catch (const std::exception& error) {

@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "BindlessImageAbi.hpp"
+#include "Recompiler.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -50,6 +51,18 @@ std::uint64_t BindlessOldPathNanoseconds() {
 
 void AddBindlessOldPathNanoseconds(std::uint64_t nanoseconds) {
     oldPathNanoseconds.fetch_add(nanoseconds, std::memory_order_relaxed);
+}
+
+std::vector<std::pair<std::uint64_t, std::uint64_t>> BindlessReadableRanges(const ShaderRecompiler::RecompileResult& program) {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    if (!program.bindlessHeap) return ranges;
+    for (const auto& [base, bytes] : program.imageTableRanges) {
+        if (bytes != 0u) ranges.emplace_back(base, bytes);
+    }
+    for (const auto& table : program.bindlessTables) {
+        if (table.records != 0u) ranges.emplace_back(table.base, static_cast<std::uint64_t>(table.records - 1u) * table.stride + table.dwords * 4u);
+    }
+    return ranges;
 }
 
 void PrimeBindlessTables(const Context& context, std::span<const BindlessTableRegistration> tables) {

@@ -3481,15 +3481,6 @@ bool VulkanDevice::BindlessImagesEnabled() const {
     return state->bindlessTable != nullptr;
 }
 
-std::uint32_t VulkanDevice::BindlessEntries() const {
-    return state->bindlessTable != nullptr ? state->bindlessTable->Totals().entries : 0u;
-}
-
-std::vector<Graphics::DeviceImageMiss> VulkanDevice::TakeBindlessMisses() {
-    require(state->bindlessTable != nullptr, "bindless images are not enabled on this device");
-    return state->bindlessTable->TakeMisses();
-}
-
 bool VulkanDevice::TextureServiceRunning() const {
     return state->textureService != nullptr;
 }

@@ -2331,11 +2331,7 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
             Require(shader.program != nullptr, "missing compiled shader");
             ShaderRecompiler::RuntimeAbi::RequireVersion(shader.program->runtimeAbiVersion);
             const VkShaderStageFlags flags = VulkanStage(shader.stage);
-            if (shader.program->bindlessHeap) {
-                for (const auto& [base, bytes] : shader.program->imageTableRanges) {
-                    if (bytes != 0u) guestMemory.AddReadable(base, static_cast<std::size_t>(bytes));
-                }
-            }
+            for (const auto& [base, bytes] : BindlessReadableRanges(*shader.program)) guestMemory.AddReadable(base, static_cast<std::size_t>(bytes));
             std::uint64_t stageStorageBuffers = 0;
             std::uint64_t stageResources = shader.stage == ShaderRecompiler::ShaderStage::Fragment ? colorAttachments : 0;
             Require(stageResources <= context.limits.maxPerStageResources, "shader descriptors exceed per-stage limits");

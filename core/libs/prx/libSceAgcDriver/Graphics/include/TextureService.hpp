@@ -21,6 +21,10 @@
 #include <unordered_map>
 #include <vector>
 
+namespace ShaderRecompiler {
+struct RecompileResult;
+}
+
 namespace AgcDriver::Graphics {
 
 class Recorder;
@@ -239,6 +243,7 @@ private:
     std::thread worker;
 };
 
+std::vector<std::pair<std::uint64_t, std::uint64_t>> BindlessReadableRanges(const ShaderRecompiler::RecompileResult& program);
 void PrimeBindlessTables(const Context& context, std::span<const BindlessTableRegistration> tables);
 void ServeBindlessTables(const Context& context, Recorder& recorder, std::span<const BindlessTableRegistration> tables);
 std::uint64_t BindlessOldPathNanoseconds();
