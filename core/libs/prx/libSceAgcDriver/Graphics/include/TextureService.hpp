@@ -134,6 +134,11 @@ public:
         std::uint64_t imageSlots = 0;
         std::uint64_t samplerSlots = 0;
         std::uint64_t pinnedBytes = 0;
+        std::uint64_t tables = 0;
+        std::uint64_t tableHostBytes = 0;
+        std::uint64_t entryHostBytes = 0;
+        std::uint64_t rejections = 0;
+        std::uint64_t rejectionHostBytes = 0;
     };
 
     TextureService(BindlessTable& table, std::shared_ptr<BindlessResolver> resolver, std::shared_ptr<BindlessMemory> memory, Options options);
@@ -226,6 +231,7 @@ private:
     void checkMapping(Recorder& recorder);
     void retireNow(Recorder& recorder);
     std::size_t queueDepth() const;
+    void hostBytes(Counts& counts) const;
 
     BindlessTable& table;
     std::shared_ptr<BindlessResolver> resolver;

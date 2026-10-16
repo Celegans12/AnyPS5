@@ -10,6 +10,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <stdexcept>
+#include <string>
 #include <string_view>
 #include <thread>
 #include <unordered_map>
@@ -320,6 +322,18 @@ void Append(std::string& line, const char* format, auto... args) {
 }
 
 #ifdef _WIN32
+unsigned CrtCensusEvery() {
+    static const unsigned every = [] {
+        const char* value = std::getenv("APS5_MEM_STATS_CRT_EVERY");
+        if (value == nullptr) return 6u;
+        char* end = nullptr;
+        const auto parsed = std::strtoul(value, &end, 10);
+        if (end == value || *end != '\0' || parsed > 1000ul) throw std::runtime_error(std::string("APS5_MEM_STATS_CRT_EVERY=") + value + ": expected a report count from 0 (off) to 1000");
+        return static_cast<unsigned>(parsed);
+    }();
+    return every;
+}
+
 void AppendProcess(std::string& line) {
     PROCESS_MEMORY_COUNTERS_EX counters{};
     counters.cb = sizeof(counters);
@@ -345,6 +359,39 @@ void AppendProcess(std::string& line) {
         largestOther = std::max<std::uint64_t>(largestOther, summary.cbCommitted);
     }
     Append(line, " other_heaps=%.0fMB(%zu) other_heaps_committed=%.0fMB largest_other_heap=%.0fMB", otherAllocated / MiB, heaps.size() > 0 ? heaps.size() - 1 : 0, otherCommitted / MiB, largestOther / MiB);
+    static unsigned census = 0;
+    if (CrtCensusEvery() != 0u && census++ % CrtCensusEvery() == 0u && HeapLock(crt)) {
+        const auto heapStarted = std::chrono::steady_clock::now();
+        std::unordered_map<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>> sizes;
+        std::uint64_t largeBytes = 0, largeBlocks = 0, smallBytes = 0, smallBlocks = 0;
+        PROCESS_HEAP_ENTRY entry{};
+        while (HeapWalk(crt, &entry)) {
+            if ((entry.wFlags & PROCESS_HEAP_ENTRY_BUSY) == 0) continue;
+            if (entry.cbData < (1ull << 20u)) {
+                smallBytes += entry.cbData;
+                ++smallBlocks;
+                continue;
+            }
+            largeBytes += entry.cbData;
+            ++largeBlocks;
+            auto& bucket = sizes[(entry.cbData + 0xffffu) >> 16u];
+            bucket.first += entry.cbData;
+            ++bucket.second;
+        }
+        HeapUnlock(crt);
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> top;
+        for (const auto& [granules, bucket] : sizes) top.emplace_back(bucket.first, granules);
+        const auto shown = std::min<std::size_t>(top.size(), 8);
+        std::partial_sort(top.begin(), top.begin() + static_cast<std::ptrdiff_t>(shown), top.end(), std::greater<>());
+        Append(line, " crt_small=%.0fMB(%llu) crt_large=%.0fMB(%llu) crt_large_top=", smallBytes / MiB, static_cast<unsigned long long>(smallBlocks), largeBytes / MiB, static_cast<unsigned long long>(largeBlocks));
+        for (std::size_t i = 0; i < shown; ++i) Append(line, "%s%.2fMBx%llu", i == 0 ? "" : ",", static_cast<double>(top[i].second << 16u) / MiB, static_cast<unsigned long long>(sizes[top[i].second].second));
+        Append(line, " crt_ms=%lld", static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - heapStarted).count()));
+    }
+    if (GuestArena::GuestArenaAvailable_nid_postfix()) {
+        std::uint64_t savedBytes = 0, savedBlocks = 0;
+        GuestArena::GuestArenaSavedMemory_nid_postfix(&savedBytes, &savedBlocks);
+        Append(line, " guest_saved=%.0fMB(%llu)", savedBytes / MiB, static_cast<unsigned long long>(savedBlocks));
+    }
 
     const auto started = std::chrono::steady_clock::now();
     const auto deadline = started + std::chrono::milliseconds(500);
@@ -537,7 +584,7 @@ void Start() {
         if (state.started || state.stopping) return;
         state.started = true;
     }
-    std::fprintf(stderr, "[mem] reporter every %u s (APS5_MEM_STATS); fields: process_* from GetProcessMemoryInfo, other_heaps from HeapSummary (the CRT heap is not walked: HeapSummary holds its lock for seconds once it reaches GBs), vq_* from a VirtualQuery walk (committed bytes), vk_* from the device's vkAllocateMemory/vkFreeMemory, devmem_/hostmem_/importmem_<owner> charge each allocation to the owner scope it was made in (pool_* = the buffer pool's own allocations), img_/buf_<owner> count live VkImages/VkBuffers by owner, pooled_<owner> = live pooled buffer objects by the owner that asked, vk_device_unattributed = device memory made outside every owner scope, the other fields are live MB(objects)\n", PeriodSeconds());
+    std::fprintf(stderr, "[mem] reporter every %u s (APS5_MEM_STATS); fields: process_* from GetProcessMemoryInfo, other_heaps from HeapSummary (the CRT heap is not summarized: HeapSummary holds its lock for seconds once it reaches GBs), crt_small/crt_large/crt_large_top from a HeapWalk of the CRT heap every APS5_MEM_STATS_CRT_EVERY reports (default 6, 0 = off; it holds the heap lock for crt_ms), guest_saved = private copies of unmapped resident direct memory, vq_* from a VirtualQuery walk (committed bytes), vk_* from the device's vkAllocateMemory/vkFreeMemory, devmem_/hostmem_/importmem_<owner> charge each allocation to the owner scope it was made in (pool_* = the buffer pool's own allocations), img_/buf_<owner> count live VkImages/VkBuffers by owner, pooled_<owner> = live pooled buffer objects by the owner that asked, vk_device_unattributed = device memory made outside every owner scope, the other fields are live MB(objects)\n", PeriodSeconds());
     std::thread([] {
         auto& state = Get();
         std::unique_lock lock(state.reportMutex);
