@@ -251,7 +251,8 @@ private:
     static bool pollReapAll();
     static bool pollTryEach();
     static bool traceLateLabels();
-    void waitMemory(std::span<const std::uint32_t> packet, std::uint32_t queue, const PacketHistory& context, std::uint64_t received, bool heldAtSubmit, bool requireMemory = false);
+    bool waitMemory(std::span<const std::uint32_t> packet, std::uint32_t queue, const PacketHistory& context, std::uint64_t received, bool heldAtSubmit, bool requireMemory = false, bool tryOnly = false);
+    bool landOnTimeline(std::span<const std::uint32_t> packet, std::uint64_t awaited, std::size_t bytes);
     struct PendingWait {
         std::array<std::uint32_t, 8> words;
         std::size_t count;

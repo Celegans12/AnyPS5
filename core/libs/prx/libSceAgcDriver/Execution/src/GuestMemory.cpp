@@ -2098,6 +2098,14 @@ GpuMutexType& GpuMutex() {
     return mutex;
 }
 
+std::uint64_t GpuMutexHeldNs() {
+    std::uint64_t total = 0;
+    for (const auto& column : Holders().heldNs) {
+        for (const auto& site : column) total += site.load(std::memory_order_relaxed);
+    }
+    return total;
+}
+
 void TagGpuLockThread(std::uint32_t queue) {
     LockStats().tag = queue;
 }

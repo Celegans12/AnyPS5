@@ -194,10 +194,22 @@ void Driver::execute(const Submission& submission) {
             const std::uint64_t awaited = packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u);
             if (const auto value = DrawPipeline::Queue0().PendingLabel(awaited, Pm4::WaitAwaitedBytes(packet)); value.has_value() && Pm4::WaitComparesValue(packet, *value)) {
                 ++waitOutcomes().fromRecorderSameQueue;
+                NoteWaitClass(WaitClass::PipelineLabel, 0);
                 gateOpened() = true;
                 recent.Record(cursor);
                 cursor = nextCursor;
                 continue;
+            }
+            if (GpuWaits() && !DrawPipeline::Queue0().Overlaps(awaited, Pm4::WaitAwaitedBytes(packet))) {
+                bool passed = false;
+                timed(&WorkerProfile::waitMs, [&] { passed = waitMemory(packet, submission.queue, recent, submission.received, submission.heldAtSubmit.contains(cursor), false, true); });
+                if (passed) {
+                    NoteWaitDrainSkipped();
+                    gateOpened() = true;
+                    recent.Record(cursor);
+                    cursor = nextCursor;
+                    continue;
+                }
             }
         }
         if (pipelined && DrawPipeline::Queue0().Busy() && !keepsDrawPipeline(packet, header, opcode)) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, header == FlipPacketHeader ? 0xffu : opcode);

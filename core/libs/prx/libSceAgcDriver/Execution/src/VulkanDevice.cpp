@@ -2035,6 +2035,14 @@ bool VulkanDevice::RecordedWritesSettled(std::uint64_t address, std::size_t byte
     return Graphics::Recorder::PendingCompletionLabels() == 0 || !recorder.CompletionLabelIn(address, bytes);
 }
 
+std::uint64_t VulkanDevice::PendingWriterSerial(std::uint64_t address, std::size_t bytes) const {
+    return state->recorder ? state->recorder->PendingWriterSerial(address, bytes) : 0;
+}
+
+std::uint64_t VulkanDevice::OpenSerial() const {
+    return state->recorder ? state->recorder->OpenSerial() : 0;
+}
+
 bool VulkanDevice::StoresPendingOver(std::uint64_t address, std::size_t bytes) const {
     const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> range{{{address, address + bytes}}};
     if (Graphics::StorageTexture::AnyPendingOverlaps(range) || Graphics::AnyShadowedOverlaps(range) || state->CopiedWriterOverlaps(address, bytes)) return true;

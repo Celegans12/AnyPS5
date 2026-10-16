@@ -92,7 +92,12 @@ void Driver::landPendingWaits(std::uint32_t queue) {
         ++stats.lands;
         if (Pm4::WaitSatisfiedUnchecked(packet)) continue;
         const auto started = std::chrono::steady_clock::now();
-        waitMemory(packet, queue, none, wait.received, false, true);
+        const std::uint64_t awaited = packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u);
+        if (GpuWaits() && landOnTimeline(packet, awaited, Pm4::WaitAwaitedBytes(packet))) {
+            NoteWaitClass(WaitClass::LandedTimeline, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
+        } else {
+            waitMemory(packet, queue, none, wait.received, false, true);
+        }
         const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
         ++stats.waited;
         stats.waitedMs += ms;
@@ -105,7 +110,38 @@ void Driver::landPendingWaits(std::uint32_t queue) {
     }
 }
 
-void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t queue, const PacketHistory& context, std::uint64_t received, bool heldAtSubmit, bool requireMemory) {
+bool Driver::landOnTimeline(std::span<const std::uint32_t> packet, std::uint64_t awaited, std::size_t bytes) {
+    std::shared_ptr<VulkanDevice> waiting;
+    std::uint64_t serial = 0;
+    {
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Wait);
+        std::lock_guard gpuLock(GuestMemory::GpuMutex());
+        waiting = device.Load();
+        if (waiting != nullptr && waiting->CanWaitUnlocked()) serial = waiting->PendingWriterSerial(awaited, bytes);
+        if (serial == 0) {
+            waiting.reset();
+            return false;
+        }
+        if (serial == waiting->OpenSerial()) waiting->SubmitRecorded(false);
+    }
+    try {
+        waiting->WaitRecorded(serial);
+    } catch (...) {
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Wait);
+        std::lock_guard gpuLock(GuestMemory::GpuMutex());
+        waiting.reset();
+        throw;
+    }
+    {
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Wait);
+        std::lock_guard gpuLock(GuestMemory::GpuMutex());
+        waiting->ReapRecorded(serial);
+        waiting.reset();
+    }
+    return Pm4::WaitSatisfiedUnchecked(packet);
+}
+
+bool Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t queue, const PacketHistory& context, std::uint64_t received, bool heldAtSubmit, bool requireMemory, bool tryOnly) {
 
     auto start = std::chrono::steady_clock::now();
     auto lastDone = packetsDone.load();
@@ -133,16 +169,33 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             if (bump) bumpEpoch(&EpochBumps::waits);
         }
     } epochPoint;
+    struct ClassNote {
+        WaitClass which;
+        bool record;
+        std::chrono::steady_clock::time_point begin;
+        ~ClassNote() {
+            if (record) NoteWaitClass(which, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count());
+        }
+    } classNote{requireMemory ? WaitClass::Landed : WaitClass::MemoryCpu, true, start};
+    const auto classify = [&](WaitClass which) {
+        if (!requireMemory) classNote.which = which;
+    };
+    bool sawGpuWriter = false;
     GuestMemory::CheckRange(reinterpret_cast<const void*>(awaited), awaitedBytes, awaitedBytes);
     if (Pm4::WaitSatisfiedUnchecked(packet)) {
         ++outcomes.atEntry;
-        return;
+        classify(WaitClass::Entry);
+        return true;
     }
-    if (heldAtSubmit) return;
+    if (heldAtSubmit) {
+        classify(WaitClass::HeldAtSubmit);
+        return true;
+    }
     if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, &writer)) {
         if (writer != queue) notePendingWait(packet, queue, received);
         else epochPoint.bump = false;
-        return;
+        classify(writer == queue ? WaitClass::HistorySameQueue : WaitClass::HistoryCrossQueue);
+        return true;
     }
 
     static const bool labelShortcut = std::getenv("APS5_NO_LABEL_SHORTCUT") == nullptr;
@@ -162,6 +215,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     };
     const auto takeLabel = [&](const std::optional<Graphics::Recorder::LabelHit>& hit, Graphics::Recorder::LabelRefusal refusal, bool polling, bool unlockedHit) {
         behindCompletion = refusal == Graphics::Recorder::LabelRefusal::BehindCompletion;
+        if (refusal != Graphics::Recorder::LabelRefusal::None) sawGpuWriter = true;
         const bool trace = traceLateLabels() && (refusal != Graphics::Recorder::LabelRefusal::None || (hit.has_value() && hit->late));
         if (!hit.has_value() || !Pm4::WaitComparesValue(packet, hit->value)) {
             if (trace) traceLate(hit.has_value() ? "value mismatch" : "refused by the table", hit, refusal);
@@ -180,6 +234,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         }
         ++(polling ? outcomes.fromRecorderPolling : outcomes.fromRecorder);
         if (unlockedHit) ++outcomes.fromRecorderUnlocked;
+        classify(hit->queue == queue ? (polling ? WaitClass::GpuLaterSameQueue : WaitClass::GpuSameQueue) : (polling ? WaitClass::GpuLaterCrossQueue : WaitClass::GpuCrossQueue));
         if (hit->queue == queue) {
             ++outcomes.fromRecorderSameQueue;
             if (!hit->late) epochPoint.bump = false;
@@ -195,8 +250,13 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     if (unlocked) {
         if (labelTable) {
             Graphics::Recorder::LabelRefusal refusal{};
-            if (takeLabel(Graphics::Recorder::LookupLabel(awaited, awaitedBytes, received, &refusal), refusal, false, true)) return;
+            if (takeLabel(Graphics::Recorder::LookupLabel(awaited, awaitedBytes, received, &refusal), refusal, false, true)) return true;
         }
+    }
+    if (tryOnly) {
+        epochPoint.bump = false;
+        classNote.record = false;
+        return false;
     }
     const bool lockedEntry = !unlocked || Graphics::Recorder::SnapshotWriteOverlaps(awaited, awaitedBytes);
     if (!lockedEntry) ++outcomes.entriesUnlocked;
@@ -218,9 +278,10 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
 
             if (labelTable) {
                 Graphics::Recorder::LabelRefusal refusal{};
-                if (takeLabel(localDevice->PendingLabel(awaited, awaitedBytes, received, &refusal), refusal, false, false)) return;
+                if (takeLabel(localDevice->PendingLabel(awaited, awaitedBytes, received, &refusal), refusal, false, false)) return true;
             }
 
+            if (localDevice->OpenWriteOverlaps(awaited, awaitedBytes)) sawGpuWriter = true;
             if (!overlapSubmit || localDevice->OpenWriteOverlaps(awaited, awaitedBytes)) localDevice->SubmitRecorded(false);
         }
     }
@@ -254,6 +315,12 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
                 return true;
             }
             pollRefused(refusal);
+            if (GpuWaits() && !labelDue && !reap && !Graphics::Recorder::SnapshotWriteOverlaps(awaited, awaitedBytes)) {
+                seenGeneration = generation;
+                recheck = false;
+                NoteWaitTrySkipped();
+                return false;
+            }
         }
         if (pollProfile) ++poll.tries;
         std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::try_to_lock);
@@ -295,6 +362,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             if (localDevice->OpenWriteOverlaps(awaited, awaitedBytes)) {
                 localDevice->SubmitRecorded(false);
                 submitted = true;
+                sawGpuWriter = true;
             }
         }
         if (labelDue && !submitted && Graphics::Recorder::PendingLabelSince().has_value()) {
@@ -318,7 +386,8 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         return false;
     };
 
-    if (entryTryFailed && pollService(false)) return;
+    if (entryTryFailed && pollService(false)) return true;
+    if (!sawGpuWriter && Graphics::Recorder::SnapshotWriteOverlaps(awaited, awaitedBytes)) sawGpuWriter = true;
 
     noteWaitBlocked(queue, awaited, true);
     struct BlockedWait {
@@ -336,9 +405,11 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, &writer)) {
             if (writer != queue) notePendingWait(packet, queue, received);
             else epochPoint.bump = false;
-            return;
+            classify(writer == queue ? WaitClass::HistorySameQueue : WaitClass::HistoryCrossQueue);
+            return true;
         }
         ++polls;
+        if (!sawGpuWriter && (polls & 63u) == 0 && Graphics::Recorder::SnapshotWriteOverlaps(awaited, awaitedBytes)) sawGpuWriter = true;
         if (spinning) {
             _mm_pause();
             if ((polls & 63u) != 0) continue;
@@ -349,12 +420,12 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             std::this_thread::yield();
         }
         CheckFailure();
-        if (pollService(!spinning)) return;
+        if (pollService(!spinning)) return true;
         noteAwaitingTitle(queue, awaited);
         if (requireMemory && (polls & 15u) == 0) {
             std::unique_lock settleLock(GuestMemory::GpuMutex(), std::try_to_lock);
             if (settleLock.owns_lock()) {
-                if (const auto localDevice = device.Load(); localDevice != nullptr && localDevice->RecordedWritesSettled(awaited, awaitedBytes)) return;
+                if (const auto localDevice = device.Load(); localDevice != nullptr && localDevice->RecordedWritesSettled(awaited, awaitedBytes)) return true;
             }
         }
         if (const auto done = packetsDone.load(); done != lastDone || (!requireMemory && packetsInFlight.load() != 0)) {
@@ -401,6 +472,8 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         }
     }
     ++outcomes.polled;
+    classify(sawGpuWriter ? WaitClass::MemoryGpu : WaitClass::MemoryCpu);
+    return true;
 }
 
 }

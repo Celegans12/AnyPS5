@@ -45,6 +45,25 @@ struct EpochBumps {
     std::uint64_t submissions = 0, waits = 0, drains = 0, reaps = 0, packets = 0;
 };
 
+enum class WaitClass : std::uint8_t { Entry = 0, HeldAtSubmit, HistorySameQueue, HistoryCrossQueue, GpuSameQueue, GpuCrossQueue, GpuLaterSameQueue, GpuLaterCrossQueue, PipelineLabel, MemoryGpu, MemoryCpu, Landed, LandedTimeline, Count };
+
+inline constexpr std::size_t WaitClassCount = static_cast<std::size_t>(WaitClass::Count);
+
+inline constexpr const char* WaitClassNames[WaitClassCount] = {"entry", "held-at-submit", "history-same", "history-cross", "gpu-same", "gpu-cross", "gpu-later-same", "gpu-later-cross", "pipeline-label", "memory-gpu", "memory-cpu", "landed", "landed-timeline"};
+
+struct WaitClassTotals {
+    std::array<std::uint64_t, WaitClassCount> count{};
+    std::array<double, WaitClassCount> ms{};
+    std::uint64_t drainsSkipped = 0, triesSkipped = 0;
+};
+
+bool GpuWaits();
+void NoteWaitClass(WaitClass which, double ms);
+void NoteWaitDrainSkipped();
+void NoteWaitTrySkipped();
+WaitClassTotals& ThreadWaitClasses();
+WaitClassTotals WaitClassCounts();
+
 void PollSleep();
 
 }
