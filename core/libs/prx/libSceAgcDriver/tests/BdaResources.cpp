@@ -1948,6 +1948,38 @@ void addressRejectedTableElementTests(const Context& context) {
 #endif
 }
 
+void addressFailedSubmissionTests(const Context& context, const BdaTestAccess& access) {
+    ShaderRecompiler::RecompileResult vertex;
+    ShaderRecompiler::RecompileResult fragment;
+    fragment.bdaAbiVersion = ShaderRecompiler::BdaAbi::Version;
+    fragment.bindings = {binding(Role::BdaPagetable, 4), binding(Role::FaultBuffer, 5)};
+    const std::array<CompiledShader, 2> stages{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}}};
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    Recorder recorder(context);
+    {
+        auto resources = std::make_shared<ShaderResources>(context, stages, ColorTarget{}, 0, 0, 0, std::span<const GuestMemorySnapshot>{});
+        Require(resources->UsesAddressTable() && resources->Reusable(), "an address-based draw build is not reusable");
+        recorder.OnComplete([resources, hold = resources->BeginUse()]() mutable {
+            const auto held = std::move(hold);
+            resources->CompleteUse();
+        });
+        resources->EndUse();
+        Require(resources->InUse(), "an address-based draw build taken by a recorded batch is not in use");
+        access.submitResult(VK_ERROR_OUT_OF_HOST_MEMORY);
+        bool failed = false;
+        try {
+            recorder.Submit();
+        } catch (const std::exception&) {
+            failed = true;
+        }
+        access.submitResult(VK_SUCCESS);
+        Require(failed, "a batch whose submission failed did not report it");
+        Require(!resources->InUse(), "an address-based draw build stayed in use after the batch that took it failed to submit");
+        resources->WriteBack();
+    }
+    recorder.Sync();
+}
+
 void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     directImageFaultTests(context, access);
     bindlessFaultTests(context, access);
@@ -2157,6 +2189,7 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     spaceReuseTests(context);
     addressMovedBufferTests(context);
     addressRejectedTableElementTests(context);
+    addressFailedSubmissionTests(context, access);
     importSpanTests(context);
     failedImportRemapTests(context, access);
     spaceImportRunTests(context);

@@ -313,7 +313,7 @@ public:
     void PinTextures(bool pin) const;
     bool ChecksFaults() const { return bda != nullptr; }
     void CheckFaults(std::uint64_t shaderAddress = 0) const;
-    bool InUse() const { return usesInFlight.load(std::memory_order_acquire) != 0; }
+    bool InUse() const { return usesInFlight->load(std::memory_order_acquire) != 0; }
     std::shared_ptr<const void> BeginUse();
     void CompleteUse();
     void EndUse() noexcept;
@@ -647,7 +647,7 @@ private:
     std::vector<SamplerSource> samplerSources;
     bool reusable = false;
     bool addressReuse = false;
-    std::atomic<std::uint32_t> usesInFlight{0};
+    std::shared_ptr<std::atomic<std::uint32_t>> usesInFlight = std::make_shared<std::atomic<std::uint32_t>>(0u);
     std::vector<std::pair<std::uint64_t, std::uint64_t>> addressWrites;
     std::vector<DirectRegion> directRegions;
     std::vector<ValidatedSurface> validatedTextures;
