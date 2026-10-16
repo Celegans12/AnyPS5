@@ -702,6 +702,19 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
     bool writersNoted = false;
     const bool noteWrites = writeEvidenceEnabled() || traceCapSync();
 
+    std::optional<Graphics::DepthPlaneClear> depthPlaneClear;
+    if (indirectArguments == 0 && !partialLastGroup) {
+        if (const auto clear = Graphics::MatchStorageImageClear(std::span(snapshot.code).subspan(codeOffset), userData, compute, groups)) {
+            const auto clearAddress = Graphics::StorageImageClearAddress(*clear);
+            if (clearAddress != 0 && Graphics::DepthSurfaceAt(clearAddress)) {
+                GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Dispatch);
+                std::lock_guard clearLock(GuestMemory::GpuMutex());
+                recordLabelsForPacket(localDevice.get(), submission.queue);
+                depthPlaneClear.emplace(*clear);
+            }
+        }
+    }
+
     for (;;) {
 
         std::shared_ptr<PreparedDispatch> prepared;
