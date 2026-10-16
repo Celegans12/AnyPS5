@@ -4,6 +4,9 @@
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
@@ -34,6 +37,14 @@
 #include <span>
 #include <string>
 #include <vector>
+
+namespace AgcDriver {
+
+struct VulkanDeviceTestAccess {
+    static Graphics::Context ContextOf(const VulkanDevice& device) { return device.graphicsContext(); }
+};
+
+}
 
 namespace {
 
@@ -475,6 +486,74 @@ void OversizedVertexBuffer(AgcDriver::VulkanDevice& device) {
     Require(Builds() == before, "address draw reuse: a draw whose vertex buffer descriptor reaches past its allocation built its resources again");
 }
 
+void ThrowingProof(AgcDriver::VulkanDevice& device) {
+    const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
+    if ((context.limits.framebufferColorSampleCounts & VK_SAMPLE_COUNT_4_BIT) == 0) {
+        std::puts("address draw reuse: a throwing reuse proof not tested, the device has no 4x color targets");
+        return;
+    }
+    constexpr std::uint32_t format32UInt = 20;
+    constexpr std::uint32_t type2D = 9;
+    Pages surface{BlockBytes};
+    surface.Register(0, BlockBytes, true);
+    struct ClearTargets {
+        AgcDriver::VulkanDevice& device;
+        VkDevice handle;
+        ~ClearTargets() {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            device.SubmitRecorded(true);
+            device.WaitIdle();
+            AgcDriver::Graphics::ClearMultisampleTargets(handle);
+            AgcDriver::Graphics::ClearCachedTextures(handle);
+        }
+    } clearTargets{device, context.device};
+    const auto address = surface.Address();
+    ShaderRecompiler::DescriptorBinding image{};
+    image.kind = ShaderRecompiler::DescriptorKind::SampledImage;
+    image.role = ShaderRecompiler::DescriptorRole::GuestImages;
+    image.binding = ShaderRecompiler::RuntimeAbi::FirstImageBinding + AgcDriver::Graphics::PlaceholderDimensionsPerClass + 2u;
+    image.count = 1;
+    image.imageShape = ShaderRecompiler::DescriptorImageShape::Image2D;
+    image.imageSamplers = {0u};
+    image.guestDescriptor = {static_cast<std::uint32_t>(address >> 8u), static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (format32UInt << 20u) | (((Width - 1u) & 3u) << 30u), ((Width - 1u) >> 2u) | ((Height - 1u) << 14u), 0xfacu | (type2D << 28u), 0u, 0u, 0u, 0u};
+    ShaderRecompiler::RecompileResult vertex;
+    ShaderRecompiler::RecompileResult fragment;
+    fragment.bdaAbiVersion = ShaderRecompiler::BdaAbi::Version;
+    fragment.bindings = {
+        {ShaderRecompiler::DescriptorKind::StorageBuffer, ShaderRecompiler::DescriptorRole::BdaPagetable, 0, static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::BdaPagetable), 1, {}, false},
+        {ShaderRecompiler::DescriptorKind::StorageBuffer, ShaderRecompiler::DescriptorRole::FaultBuffer, 0, static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::FaultBuffer), 1, {}, false},
+        image,
+    };
+    const std::array<AgcDriver::Graphics::CompiledShader, 2> stages{{{ShaderStage::Vertex, &vertex, 0}, {ShaderStage::Fragment, &fragment, 0}}};
+    AgcDriver::Graphics::ColorTarget target{};
+    target.address = address;
+    target.surfaceAddress = address;
+    target.extent = {Width, Height};
+    target.surfaceExtent = target.extent;
+    target.format = VK_FORMAT_R8G8B8A8_UNORM;
+    target.tileMode = ColorTileMode::RenderTarget;
+    target.elementBytes = 4;
+    target.bytes = BlockBytes / 4;
+    target.samples = 4;
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    AgcDriver::Graphics::ShaderResources resources(context, stages, AgcDriver::Graphics::ColorTarget{}, 0, 0, 0, {});
+    Require(resources.UsesAddressTable() && resources.Reusable(), "address draw reuse: an address-based draw build that samples an image is not reusable");
+    resources.EndUse();
+    Require(AgcDriver::Graphics::MultisampleTargetView(context, target) != VK_NULL_HANDLE, "address draw reuse: the multisampled target over the sampled image has no view");
+    device.SubmitRecorded(true);
+    device.WaitIdle();
+    bool threw = false;
+    bool reused = false;
+    try {
+        reused = resources.Revalidate(stages, nullptr, {});
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    Require(!threw, "address draw reuse: the reuse proof of an address-based draw build whose sampled image's memory became a multisampled target threw instead of refusing the reuse");
+    Require(!reused, "address draw reuse: an address-based draw build whose sampled image's memory became a multisampled target was reused");
+    resources.WriteBack();
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -496,6 +575,7 @@ int main(int argc, char** argv) {
             scene.Wait();
         }
         OversizedVertexBuffer(*device);
+        ThrowingProof(*device);
         std::printf("address draw reuse tests passed (%zu extra registered ranges)\n", ranges);
         return 0;
     } catch (const std::exception& error) {

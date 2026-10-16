@@ -1889,6 +1889,65 @@ void addressMovedBufferTests(const Context& context) {
     recorder.Sync();
 }
 
+void addressRejectedTableElementTests(const Context& context) {
+    namespace Abi = ShaderRecompiler::ImageTableAbi;
+    constexpr std::size_t surfaceBytes = 65536;
+    constexpr std::uint32_t width = 64;
+    constexpr std::uint32_t height = 4;
+    constexpr std::uint32_t format32Float = 22;
+    constexpr std::uint32_t type2D = 9;
+#ifdef _WIN32
+    auto* surface = static_cast<std::byte*>(VirtualAlloc(nullptr, surfaceBytes, MEM_RESERVE, PAGE_NOACCESS));
+#else
+    void* mapped = mmap(nullptr, surfaceBytes, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    auto* surface = mapped == MAP_FAILED ? nullptr : static_cast<std::byte*>(mapped);
+#endif
+    Require(surface != nullptr, "cannot reserve an image table element's surface");
+    const auto address = reinterpret_cast<std::uint64_t>(surface);
+    auto tableContext = context;
+    tableContext.hostImportAlignment = 65536;
+    tableContext.imageTableCapacity = 2;
+    tableContext.limits.maxDescriptorSetSampledImages = 2;
+    tableContext.limits.maxPerStageDescriptorSampledImages = 2;
+    ShaderRecompiler::RecompileResult vertex;
+    ShaderRecompiler::RecompileResult fragment;
+    fragment.bdaAbiVersion = ShaderRecompiler::BdaAbi::Version;
+    auto map = binding(Role::ImageTableMap, static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::ImageTableMap));
+    map.guestDescriptor.assign(Abi::HeaderWords + 1u, 0u);
+    map.guestDescriptor[Abi::HeaderVersion] = Abi::Version;
+    map.guestDescriptor[Abi::HeaderElementCount] = 1u;
+    map.guestDescriptor[Abi::HeaderElementFaults] = Abi::HeaderWords;
+    map.guestDescriptor[Abi::HeaderSamplerFaults] = Abi::HeaderWords + 1u;
+    auto images = binding(Role::ImageTable, ShaderRecompiler::RuntimeAbi::ImageTableBinding);
+    images.kind = ShaderRecompiler::DescriptorKind::SampledImage;
+    images.guestDescriptor = {static_cast<std::uint32_t>(address >> 8u), static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (format32Float << 20u) | (((width - 1u) & 3u) << 30u), ((width - 1u) >> 2u) | ((height - 1u) << 14u) | (1u << 31u), 0xfacu | (type2D << 28u), 0u, 0u, 0u, 0u};
+    images.imageShapes = {ShaderRecompiler::DescriptorImageShape::Image2D};
+    images.imageDepthCompare = {false};
+    images.imageSamplers = {0u};
+    fragment.bindings = {binding(Role::BdaPagetable, 4), binding(Role::FaultBuffer, 5), map, images};
+    const std::array<CompiledShader, 2> stages{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}}};
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    Recorder recorder(tableContext);
+    {
+        ShaderResources resources(tableContext, stages, ColorTarget{}, 0, 0, 0, {});
+        Require(resources.UsesAddressTable(), "a draw build with a BDA table stage and an image table does not use the BDA table");
+#ifdef _WIN32
+        Require(VirtualAlloc(surface, surfaceBytes, MEM_COMMIT, PAGE_READWRITE) != nullptr, "cannot commit the image table element's surface");
+#else
+        Require(mprotect(surface, surfaceBytes, PROT_READ | PROT_WRITE) == 0, "cannot commit the image table element's surface");
+#endif
+        resources.EndUse();
+        Require(!resources.Revalidate(stages, nullptr, {}), "an address-based draw build whose image table element was rejected as unmapped was reused after the element's surface was committed");
+        resources.WriteBack();
+    }
+    recorder.Sync();
+#ifdef _WIN32
+    VirtualFree(surface, 0, MEM_RELEASE);
+#else
+    munmap(surface, surfaceBytes);
+#endif
+}
+
 void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     directImageFaultTests(context, access);
     bindlessFaultTests(context, access);
@@ -2097,6 +2156,7 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     snapshotTableTests(context, access);
     spaceReuseTests(context);
     addressMovedBufferTests(context);
+    addressRejectedTableElementTests(context);
     importSpanTests(context);
     failedImportRemapTests(context, access);
     spaceImportRunTests(context);
