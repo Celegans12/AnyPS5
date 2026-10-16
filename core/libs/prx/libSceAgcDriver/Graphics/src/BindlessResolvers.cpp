@@ -165,7 +165,8 @@ BindlessResolution DriverBindlessResolver::Commit(const BindlessPrepared& prepar
     resolution.address = prepared.address;
     resolution.bytes = prepared.bytes;
     resolution.generation = prepared.generation;
-    resolution.perUse = texture->IsDepthCopy() || texture->RefreshedPerUse();
+    resolution.dcc = state->resource.dccAddress != 0u;
+    resolution.perUse = texture->IsDepthCopy() || texture->RefreshedPerUse() || resolution.dcc;
     if (state->samplerClass != Heap::NoSamplerClass) {
         const bool table = state->samplerClass == Heap::TableSamplerClass;
         const bool integerBorder = !table && state->integerBorder;

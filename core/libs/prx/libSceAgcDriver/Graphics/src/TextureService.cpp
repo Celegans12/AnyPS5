@@ -214,6 +214,7 @@ void TextureService::readTable(Tracked& tracked) {
     tracked.oldest = generation;
     tracked.pending = std::move(prepared);
     tracked.unmapped = !mapped;
+    tracked.perUseEpoch = ~std::uint64_t{0};
     tracked.state = TableState::Prepared;
     tracked.primerNanoseconds += Elapsed(started);
     totals.primedRecords += registration.records;
@@ -414,7 +415,7 @@ void TextureService::place(const DeviceImageKeys::Key& key, BindlessResolution r
     const bool perUse = resolution.perUse;
     entries[key] = Entry{value, std::move(resolution), lastUsed};
     ++surfaceEpoch;
-    if (perUse) perUseKeys.insert(key);
+    if (perUse && perUseKeys.insert(key).second) ++perUseEpoch;
 }
 
 BindlessResolution TextureService::take(const DeviceImageKeys::Key& key) {
@@ -423,7 +424,7 @@ BindlessResolution TextureService::take(const DeviceImageKeys::Key& key) {
     auto resolution = std::move(found->second.resolution);
     entries.erase(found);
     ++surfaceEpoch;
-    perUseKeys.erase(key);
+    if (perUseKeys.erase(key) != 0u) ++perUseEpoch;
     return resolution;
 }
 
@@ -459,16 +460,20 @@ void TextureService::replace(const DeviceImageKeys::Key& key, Recorder& recorder
         auto& kept = found->second.resolution;
         kept.generation = fresh.generation;
         kept.perUse = fresh.perUse;
-        if (!kept.perUse) perUseKeys.erase(key);
+        kept.dcc = fresh.dcc;
+        if (!kept.perUse && perUseKeys.erase(key) != 0u) ++perUseEpoch;
         return;
     }
     const auto lastUsed = found->second.lastUsed;
+    const bool wasPerUse = perUseKeys.contains(key);
+    const auto epoch = perUseEpoch;
     const auto old = take(key);
     if (!refusal.empty()) {
         fresh = {};
         fresh.value.fault = refuse(key, refusal);
     }
     place(key, std::move(fresh), recorder, lastUsed);
+    if (perUseKeys.contains(key) == wasPerUse) perUseEpoch = epoch;
     releaseResolution(old, recorder);
 }
 
@@ -565,6 +570,7 @@ void TextureService::redecode(Tracked& tracked, Recorder& recorder, Lock& lock) 
     totals.pagesChanged += pagesChanged;
     totals.recordsRead += recordsRead;
     std::set<DeviceImageKeys::Key> wanted;
+    if (!rewritten.empty()) tracked.perUseEpoch = ~std::uint64_t{0};
     for (auto& [record, words] : rewritten) {
         std::copy(words.begin(), words.end(), tracked.words.begin() + static_cast<std::ptrdiff_t>(record) * Abi::DescriptorWords);
         ++totals.recordsChanged;
@@ -654,10 +660,29 @@ void TextureService::resolveMisses(Recorder& recorder, Lock& lock) {
     commitPrepared(prepared, recorder, lock);
 }
 
-void TextureService::refreshPerUse(Recorder& recorder, Lock& lock) {
-    const std::vector<DeviceImageKeys::Key> keys(perUseKeys.begin(), perUseKeys.end());
+void TextureService::refreshPerUse(std::span<const std::uint64_t> served, Recorder& recorder, Lock& lock) {
+    if (perUseKeys.empty()) return;
+    std::set<DeviceImageKeys::Key> keys;
+    for (const auto id : served) {
+        auto found = tables.find(id);
+        if (found == tables.end()) continue;
+        auto& tracked = found->second;
+        if (tracked.perUseEpoch != perUseEpoch) {
+            tracked.perUse.clear();
+            for (std::uint32_t record = 0; record < tracked.registration.records; ++record) {
+                for (const auto& key : recordKeys(tracked, record)) {
+                    if (perUseKeys.contains(key)) tracked.perUse.push_back(key);
+                }
+            }
+            tracked.perUseEpoch = perUseEpoch;
+        }
+        keys.insert(tracked.perUse.begin(), tracked.perUse.end());
+    }
     for (const auto& key : keys) {
+        const auto found = entries.find(key);
+        if (found == entries.end() || !found->second.resolution.perUse) continue;
         ++totals.refreshed;
+        if (found->second.resolution.dcc) ++totals.dccRefreshed;
         replace(key, recorder, lock);
     }
 }
@@ -753,7 +778,7 @@ void TextureService::Serve(std::span<const std::uint64_t> served, Recorder& reco
             revalidateServed(tracked, recorder, lock);
         }
         resolveMisses(recorder, lock);
-        refreshPerUse(recorder, lock);
+        refreshPerUse(served, recorder, lock);
         retireNow(recorder);
         ++totals.serves;
     }
@@ -868,8 +893,8 @@ std::string TextureService::TakeFrameLine(std::uint64_t oldPathNanoseconds) {
     reportedOldPath = oldPathNanoseconds;
     const auto delta = [](std::uint64_t current, std::uint64_t previous) { return static_cast<unsigned long long>(current - previous); };
     char text[1024];
-    std::snprintf(text, sizeof(text), "[bindless] frame %llu: misses %llu (%llu dropped), created %llu, refused %llu, primed %llu tables (%llu records, %llu new keys, primer %.1f ms), re-decoded %llu pages (%llu records changed), served-checked %llu (%llu stale), queue %llu, revalidated %llu (%llu stale, %llu per-use), retired %llu (%llu unmapped, %llu evicted, %llu full), serve %.1f ms over %llu calls, present wait %.1f ms, entries %llu, slots %llu+%llu, pinned %.1f MiB, old-path resolve %.1f ms",
-        static_cast<unsigned long long>(frame), delta(now.misses, reported.misses), static_cast<unsigned long long>(dropped), delta(now.created, reported.created), delta(now.refused, reported.refused), delta(now.primed, reported.primed), delta(now.primedRecords, reported.primedRecords), delta(now.primedKeys, reported.primedKeys), Milliseconds(now.primerNanoseconds - reported.primerNanoseconds), delta(now.pagesChanged, reported.pagesChanged), delta(now.recordsChanged, reported.recordsChanged), delta(now.servedChecked, reported.servedChecked), delta(now.servedStale, reported.servedStale), static_cast<unsigned long long>(now.queued), delta(now.revalidated, reported.revalidated), delta(now.stale, reported.stale), delta(now.refreshed, reported.refreshed), delta(now.retired, reported.retired), delta(now.unmapped, reported.unmapped), delta(now.evicted, reported.evicted), delta(now.fullEvictions, reported.fullEvictions), Milliseconds(now.serveNanoseconds - reported.serveNanoseconds), delta(now.serves, reported.serves), Milliseconds(now.presentWaitNanoseconds - reported.presentWaitNanoseconds), static_cast<unsigned long long>(now.entries), static_cast<unsigned long long>(now.imageSlots), static_cast<unsigned long long>(now.samplerSlots), static_cast<double>(now.pinnedBytes) / static_cast<double>(1u << 20u), Milliseconds(oldPath));
+    std::snprintf(text, sizeof(text), "[bindless] frame %llu: misses %llu (%llu dropped), created %llu, refused %llu, primed %llu tables (%llu records, %llu new keys, primer %.1f ms), re-decoded %llu pages (%llu records changed), served-checked %llu (%llu stale), queue %llu, revalidated %llu (%llu stale, %llu per-use, %llu dcc), retired %llu (%llu unmapped, %llu evicted, %llu full), serve %.1f ms over %llu calls, present wait %.1f ms, entries %llu, slots %llu+%llu, pinned %.1f MiB, old-path resolve %.1f ms",
+        static_cast<unsigned long long>(frame), delta(now.misses, reported.misses), static_cast<unsigned long long>(dropped), delta(now.created, reported.created), delta(now.refused, reported.refused), delta(now.primed, reported.primed), delta(now.primedRecords, reported.primedRecords), delta(now.primedKeys, reported.primedKeys), Milliseconds(now.primerNanoseconds - reported.primerNanoseconds), delta(now.pagesChanged, reported.pagesChanged), delta(now.recordsChanged, reported.recordsChanged), delta(now.servedChecked, reported.servedChecked), delta(now.servedStale, reported.servedStale), static_cast<unsigned long long>(now.queued), delta(now.revalidated, reported.revalidated), delta(now.stale, reported.stale), delta(now.refreshed, reported.refreshed), delta(now.dccRefreshed, reported.dccRefreshed), delta(now.retired, reported.retired), delta(now.unmapped, reported.unmapped), delta(now.evicted, reported.evicted), delta(now.fullEvictions, reported.fullEvictions), Milliseconds(now.serveNanoseconds - reported.serveNanoseconds), delta(now.serves, reported.serves), Milliseconds(now.presentWaitNanoseconds - reported.presentWaitNanoseconds), static_cast<unsigned long long>(now.entries), static_cast<unsigned long long>(now.imageSlots), static_cast<unsigned long long>(now.samplerSlots), static_cast<double>(now.pinnedBytes) / static_cast<double>(1u << 20u), Milliseconds(oldPath));
     reported = now;
     return text;
 }

@@ -531,6 +531,8 @@ public:
         resolution.address = prepared.address;
         resolution.bytes = prepared.bytes;
         resolution.generation = prepared.generation;
+        resolution.dcc = dcc.contains(image);
+        resolution.perUse = resolution.dcc;
         return resolution;
     }
     bool Current(const BindlessResolution&) override { return true; }
@@ -539,6 +541,7 @@ public:
     std::atomic<std::uint64_t> prepares{0};
     std::atomic<std::uint64_t> commits{0};
     std::set<std::uint32_t> reused;
+    std::set<std::uint32_t> dcc;
 
 private:
     const Images& images;
@@ -835,6 +838,41 @@ void fullTests(const Device& device) {
     std::cout << "full key table: " << afterSecond.evicted << " idle entries evicted for the served table, the evicted table completed again on its next use, an oversized table refused\n";
 }
 
+void perUseTests(const Device& device) {
+    Fixture fixture(device);
+    Recorder recorder(fixture.context, device.Timeline());
+    recorder.Activate();
+    TextureService::Options options;
+    options.worker = false;
+    TextureService service(*fixture.table, fixture.resolver, fixture.memory, options);
+    fixture.resolver->dcc = {5u, 70u, 80u};
+    std::unique_lock gpu(AgcDriver::GuestMemory::GpuMutex());
+    const std::array<std::uint64_t, 1> first{service.Register(fixture.Registration(0u, 64u))};
+    const std::array<std::uint64_t, 1> second{service.Register(fixture.Registration(64u, 64u))};
+    service.Serve(first, recorder);
+    service.Serve(second, recorder);
+    const auto served = [&](std::span<const std::uint64_t> tables, bool resolvedOnlyRefreshes = true) {
+        const auto before = service.Totals();
+        const auto commits = fixture.resolver->commits.load();
+        service.Serve(tables, recorder);
+        const auto after = service.Totals();
+        Require(after.refreshed - before.refreshed == after.dccRefreshed - before.dccRefreshed, "a per-use refresh of a DCC entry was not counted as one");
+        Require(!resolvedOnlyRefreshes || fixture.resolver->commits.load() - commits == after.refreshed - before.refreshed, "a per-use refresh did not resolve its entry again");
+        return after.dccRefreshed - before.dccRefreshed;
+    };
+    Require(served(first) == 1u, "serving the first table did not refresh exactly its DCC entry");
+    Require(served(second) == 2u, "serving the second table did not refresh exactly its two DCC entries");
+    const std::array<std::uint64_t, 2> both{first[0], second[0]};
+    Require(served(both) == 3u, "serving both tables did not refresh each DCC entry once");
+    fixture.records[5].image = 6u;
+    fixture.write(5u, true);
+    Require(served(first, false) == 0u, "a rewritten record kept its old DCC entry in the table's refresh list");
+    Advance(recorder);
+    Present(service, recorder);
+    recorder.Sync();
+    std::cout << "per-use refresh: DCC entries re-resolved for the tables being served only (1, 2, 3 of 3), none after the record moved off its DCC surface\n";
+}
+
 void budgetTests(const Device& device) {
     Fixture fixture(device);
     Recorder recorder(fixture.context, device.Timeline());
@@ -1025,6 +1063,7 @@ int main(int argc, char** argv) {
         serviceTests(*device);
         lazyTests(*device);
         fullTests(*device);
+        perUseTests(*device);
         budgetTests(*device);
         return 0;
     } catch (const std::exception& error) {

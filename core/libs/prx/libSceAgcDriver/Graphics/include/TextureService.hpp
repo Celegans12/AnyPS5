@@ -53,6 +53,7 @@ struct BindlessResolution {
     std::uint64_t bytes = 0;
     std::uint64_t generation = 0;
     bool perUse = false;
+    bool dcc = false;
 };
 
 class BindlessResolver {
@@ -105,6 +106,7 @@ public:
         std::uint64_t servedChecked = 0;
         std::uint64_t servedStale = 0;
         std::uint64_t refreshed = 0;
+        std::uint64_t dccRefreshed = 0;
         std::uint64_t retired = 0;
         std::uint64_t unmapped = 0;
         std::uint64_t evicted = 0;
@@ -162,6 +164,8 @@ private:
         std::uint64_t registeredAt = 0;
         std::uint64_t primerNanoseconds = 0;
         bool unmapped = false;
+        std::vector<DeviceImageKeys::Key> perUse;
+        std::uint64_t perUseEpoch = ~std::uint64_t{0};
     };
     struct Entry {
         DeviceImageValue value;
@@ -204,7 +208,7 @@ private:
     void reverify(Tracked& table, Recorder& recorder, Lock& lock);
     void revalidateServed(Tracked& table, Recorder& recorder, Lock& lock);
     void resolveMisses(Recorder& recorder, Lock& lock);
-    void refreshPerUse(Recorder& recorder, Lock& lock);
+    void refreshPerUse(std::span<const std::uint64_t> served, Recorder& recorder, Lock& lock);
     void checkMapping(Recorder& recorder);
     void retireNow(Recorder& recorder);
     std::size_t queueDepth() const;
@@ -229,6 +233,7 @@ private:
     std::map<DeviceImageKeys::Key, std::uint32_t> rejectionIndex;
     std::uint64_t nextId = 1;
     std::uint64_t evictionEpoch = 0;
+    std::uint64_t perUseEpoch = 0;
     std::uint64_t mappingSerial = 0;
     std::uint64_t surfaceEpoch = 0;
     std::uint64_t pinnedBytes = 0;
