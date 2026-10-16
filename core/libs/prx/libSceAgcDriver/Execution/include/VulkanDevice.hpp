@@ -52,6 +52,8 @@ public:
     bool BindlessImagesEnabled() const;
     std::uint32_t BindlessEntries() const;
     std::vector<Graphics::DeviceImageMiss> TakeBindlessMisses();
+    bool TextureServiceRunning() const;
+    void BindlessPresentWait();
     ShaderRecompiler::SpirvTarget ComputeTarget(std::uint32_t waveSize) const;
     // Distinguishes this device from every earlier one in the process (a memo keyed by the device
     // cannot rely on the pointer, which a replacement may reuse).

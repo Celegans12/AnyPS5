@@ -35,6 +35,7 @@ class PlaceholderImages;
 class VertexInputCache;
 class BindlessTable;
 class BindlessPrimer;
+class TextureService;
 
 class PipelineCacheSynchronization {
 public:
@@ -223,6 +224,7 @@ struct Context {
     const PlaceholderImages* placeholderImages = nullptr;
     BindlessTable* bindlessTable = nullptr;
     BindlessPrimer* bindlessPrimer = nullptr;
+    TextureService* textureService = nullptr;
     bool viewportIndexLayer = false;
     bool demoteToHelperInvocation = false;
     bool earlyFragmentSampleMaskTestBeforeSampleCounting = false;

@@ -23,6 +23,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BindlessTable.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BindlessPrimer.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BindlessResolvers.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureService.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DisplayFormat.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HostHdr.hpp"
@@ -302,6 +304,7 @@ struct VulkanDevice::State {
     bool bindlessImages = false;
     std::unique_ptr<Graphics::BindlessTable> bindlessTable;
     std::unique_ptr<Graphics::BindlessPrimer> bindlessPrimer;
+    std::unique_ptr<Graphics::TextureService> textureService;
     VkPhysicalDeviceDescriptorIndexingPropertiesEXT descriptorIndexingProperties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_PROPERTIES_EXT};
     bool imageInt64Atomics = false;
     bool bufferInt64Atomics = false;
@@ -717,6 +720,7 @@ struct VulkanDevice::State {
                 }
             }
             Graphics::DestroyShadows(device);
+            textureService.reset();
             recorder.reset();
             bindlessPrimer.reset();
             bindlessTable.reset();
@@ -1897,6 +1901,12 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     }
     state->context = buildContext();
     state->contextReady = true;
+    if (state->bindlessTable) {
+        const auto options = Graphics::TextureService::OptionsFromEnvironment(Graphics::SampledTextureCacheBudget(state->context) / 2u);
+        state->textureService = std::make_unique<Graphics::TextureService>(*state->bindlessTable, std::make_shared<Graphics::DriverBindlessResolver>(state->context), std::make_shared<Graphics::GuestBindlessMemory>(), options);
+        state->context.textureService = state->textureService.get();
+        std::fprintf(stderr, "[bindless] texture service: %s, budget %llu MiB, idle after %llu submits, commit chunk %u\n", options.lazy ? "lazy (misses only, measurement mode)" : "exact (tables primed before use)", static_cast<unsigned long long>(options.budgetBytes >> 20u), static_cast<unsigned long long>(options.idleSubmits), options.commitChunk);
+    }
     if (window != nullptr) {
         require(window->getDrawableSize != nullptr, "missing window drawable size query");
         std::uint32_t drawableWidth = 0;
@@ -3482,6 +3492,30 @@ std::uint32_t VulkanDevice::BindlessEntries() const {
 std::vector<Graphics::DeviceImageMiss> VulkanDevice::TakeBindlessMisses() {
     require(state->bindlessTable != nullptr, "bindless images are not enabled on this device");
     return state->bindlessTable->TakeMisses();
+}
+
+bool VulkanDevice::TextureServiceRunning() const {
+    return state->textureService != nullptr;
+}
+
+void VulkanDevice::BindlessPresentWait() {
+    if (!state->textureService || !state->recorder) return;
+    const auto started = std::chrono::steady_clock::now();
+    std::uint64_t serial = 0;
+    {
+        std::lock_guard lock(GuestMemory::GpuMutex());
+        serial = state->textureService->PresentSerial(*state->recorder);
+        if (serial != 0 && !state->recorder->HasTimeline()) state->recorder->Sync();
+    }
+    if (serial != 0 && state->recorder->HasTimeline()) state->recorder->WaitSerial(serial);
+    const auto waited = serial != 0 ? static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()) : 0u;
+    std::lock_guard lock(GuestMemory::GpuMutex());
+    if (serial != 0 && state->recorder->HasTimeline()) {
+        Graphics::Recorder::AnnounceSyncSite(__builtin_return_address(0));
+        state->recorder->FinishUpTo(serial);
+    }
+    state->textureService->AfterPresentWait(*state->recorder, waited);
+    if (Graphics::BindlessStatsRequested()) std::fprintf(stderr, "%s\n", state->textureService->TakeFrameLine(Graphics::BindlessOldPathNanoseconds()).c_str());
 }
 
 Graphics::Context VulkanDevice::graphicsContext() const {

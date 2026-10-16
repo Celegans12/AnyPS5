@@ -1,0 +1,807 @@
+#include "prx/libSceAgcDriver/Graphics/include/TextureService.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "BindlessImageAbi.hpp"
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <stdexcept>
+#include <string_view>
+#include <utility>
+
+namespace AgcDriver::Graphics {
+
+namespace {
+
+namespace Abi = ShaderRecompiler::DeviceImageTableAbi;
+namespace Heap = ShaderRecompiler::BindlessImageAbi;
+
+std::atomic<std::uint64_t> oldPathNanoseconds{0};
+
+std::uint64_t Elapsed(std::chrono::steady_clock::time_point started) {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
+}
+
+std::uint64_t EnvironmentNumber(const char* name, std::uint64_t fallback) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || *value == '\0') return fallback;
+    char* end = nullptr;
+    const auto parsed = std::strtoull(value, &end, 10);
+    Require(end != nullptr && *end == '\0', std::string(name) + " is not a decimal number: " + value);
+    return parsed;
+}
+
+
+double Milliseconds(std::uint64_t nanoseconds) {
+    return static_cast<double>(nanoseconds) / 1.0e6;
+}
+
+}
+
+std::size_t TextureService::KeyHash::operator()(const DeviceImageKeys::Key& key) const noexcept {
+    return Abi::Hash(key);
+}
+
+std::uint64_t BindlessOldPathNanoseconds() {
+    return oldPathNanoseconds.load(std::memory_order_relaxed);
+}
+
+void AddBindlessOldPathNanoseconds(std::uint64_t nanoseconds) {
+    oldPathNanoseconds.fetch_add(nanoseconds, std::memory_order_relaxed);
+}
+
+void PrimeBindlessTables(const Context& context, std::span<const BindlessTableRegistration> tables) {
+    if (context.textureService == nullptr) return;
+    for (const auto& registration : tables) static_cast<void>(context.textureService->Register(registration));
+}
+
+void ServeBindlessTables(const Context& context, Recorder& recorder, std::span<const BindlessTableRegistration> tables) {
+    if (context.textureService == nullptr) return;
+    std::vector<std::uint64_t> served;
+    served.reserve(tables.size());
+    for (const auto& registration : tables) served.push_back(context.textureService->Register(registration));
+    context.textureService->Serve(served, recorder);
+}
+
+bool BindlessStatsRequested() {
+    static const bool requested = std::getenv("APS5_BINDLESS_STATS") != nullptr || std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return requested;
+}
+
+TextureService::Options TextureService::OptionsFromEnvironment(std::uint64_t defaultBudgetBytes) {
+    Options options;
+    const char* lazy = std::getenv("APS5_BINDLESS_LAZY");
+    options.lazy = lazy != nullptr && std::string_view(lazy) == "1";
+    options.commitChunk = static_cast<std::uint32_t>(std::max<std::uint64_t>(1u, EnvironmentNumber("APS5_BINDLESS_COMMIT_CHUNK", options.commitChunk)));
+    options.budgetBytes = EnvironmentNumber("APS5_BINDLESS_BUDGET_MIB", defaultBudgetBytes >> 20u) << 20u;
+    options.idleSubmits = EnvironmentNumber("APS5_BINDLESS_IDLE_SUBMITS", options.idleSubmits);
+    return options;
+}
+
+TextureService::TextureService(BindlessTable& table, std::shared_ptr<BindlessResolver> resolver, std::shared_ptr<BindlessMemory> memory, Options options) : table(table), resolver(std::move(resolver)), memory(std::move(memory)), options(options) {
+    Require(this->resolver != nullptr && this->memory != nullptr, "the texture service needs a resolver and a guest memory view");
+    mappingSerial = this->memory->MappingSerial();
+    if (options.worker) worker = std::thread([this] { workerLoop(); });
+}
+
+TextureService::~TextureService() {
+    {
+        std::lock_guard lock(mutex);
+        stopping = true;
+    }
+    changed.notify_all();
+    if (worker.joinable()) worker.join();
+}
+
+std::uint64_t TextureService::Register(const BindlessTableRegistration& registration) {
+    Require(registration.records != 0 && registration.stride >= Abi::DescriptorWords * 4u && registration.stride % 4u == 0u && !registration.uses.empty(), "a bindless table registration needs records, a stride of at least one T# in whole dwords and at least one use");
+    std::lock_guard lock(mutex);
+    if (const auto found = ids.find(registration); found != ids.end()) return found->second;
+    const auto id = nextId++;
+    auto& tracked = tables[id];
+    tracked.id = id;
+    tracked.registration = registration;
+    tracked.span = static_cast<std::uint64_t>(registration.records - 1u) * registration.stride + Abi::DescriptorWords * 4u;
+    tracked.firstPage = registration.base & ~(PageBytes - 1u);
+    tracked.registeredAt = static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
+    tracked.evictionEpoch = evictionEpoch;
+    ids.emplace(registration, id);
+    ++totals.registered;
+    if (options.lazy) {
+        tracked.state = TableState::Done;
+        return id;
+    }
+    queue.push_back(id);
+    changed.notify_all();
+    return id;
+}
+
+bool TextureService::Primed(std::uint64_t id) const {
+    std::lock_guard lock(mutex);
+    const auto found = tables.find(id);
+    return found != tables.end() && found->second.state == TableState::Done;
+}
+
+bool TextureService::WaitPrimed(std::uint64_t id, std::uint32_t milliseconds) {
+    Lock lock(mutex);
+    return changed.wait_for(lock, std::chrono::milliseconds(milliseconds), [&] {
+        const auto found = tables.find(id);
+        return found == tables.end() || found->second.state == TableState::Done;
+    });
+}
+
+std::vector<DeviceImageKeys::Key> TextureService::recordKeys(const Tracked& tracked, std::uint32_t record) const {
+    if (tracked.words.size() < (static_cast<std::size_t>(record) + 1u) * Abi::DescriptorWords) return {};
+    const auto words = std::span<const std::uint32_t>(tracked.words).subspan(static_cast<std::size_t>(record) * Abi::DescriptorWords, Abi::DescriptorWords);
+    std::vector<DeviceImageKeys::Key> keys;
+    keys.reserve(tracked.registration.uses.size());
+    const auto descriptor = std::span<const std::uint32_t, Abi::DescriptorWords>(words.data(), Abi::DescriptorWords);
+    for (const auto& use : tracked.registration.uses) keys.push_back(Heap::MakeKey(descriptor, use.interfaceId, use.samplerClass, use.sampler));
+    return keys;
+}
+
+BindlessPrepared TextureService::prepare(const DeviceImageKeys::Key& key) {
+    if (Abi::NullDescriptor(key[0], key[1])) {
+        BindlessPrepared null;
+        null.key = key;
+        null.settled = DeviceImageValue{};
+        return null;
+    }
+    try {
+        auto prepared = resolver->Prepare(key);
+        prepared.key = key;
+        return prepared;
+    } catch (const std::runtime_error& error) {
+        BindlessPrepared refused;
+        refused.key = key;
+        refused.refusal = error.what();
+        return refused;
+    }
+}
+
+void TextureService::readTable(Tracked& tracked) {
+    const auto started = std::chrono::steady_clock::now();
+    const auto& registration = tracked.registration;
+    const auto pages = static_cast<std::size_t>((registration.base + tracked.span - tracked.firstPage + PageBytes - 1u) / PageBytes);
+    std::vector<std::uint32_t> words(static_cast<std::size_t>(registration.records) * Abi::DescriptorWords, 0u);
+    const auto generation = memory->Collect(registration.base, static_cast<std::size_t>(tracked.span));
+    bool mapped = true;
+    if (registration.stride == Abi::DescriptorWords * 4u) {
+        mapped = memory->Read(registration.base, words);
+    } else {
+        for (std::uint32_t record = 0; mapped && record < registration.records; ++record) mapped = memory->Read(registration.base + static_cast<std::uint64_t>(record) * registration.stride, std::span<std::uint32_t>(words).subspan(static_cast<std::size_t>(record) * Abi::DescriptorWords, Abi::DescriptorWords));
+    }
+    if (!mapped) std::fill(words.begin(), words.end(), 0u);
+    Tracked shape;
+    shape.registration = registration;
+    shape.words = std::move(words);
+    std::vector<DeviceImageKeys::Key> wanted;
+    {
+        std::set<DeviceImageKeys::Key> seen;
+        for (std::uint32_t record = 0; record < registration.records; ++record) {
+            for (const auto& key : recordKeys(shape, record)) {
+                if (seen.insert(key).second) wanted.push_back(key);
+            }
+        }
+    }
+    {
+        std::lock_guard lock(mutex);
+        std::erase_if(wanted, [&](const DeviceImageKeys::Key& key) { return entries.contains(key); });
+    }
+    std::vector<BindlessPrepared> prepared;
+    prepared.reserve(wanted.size());
+    for (const auto& key : wanted) prepared.push_back(prepare(key));
+    std::lock_guard lock(mutex);
+    tracked.words = std::move(shape.words);
+    tracked.pageGenerations.assign(pages, generation);
+    tracked.oldest = generation;
+    tracked.pending = std::move(prepared);
+    tracked.unmapped = !mapped;
+    tracked.state = TableState::Prepared;
+    tracked.primerNanoseconds += Elapsed(started);
+    totals.primedRecords += registration.records;
+    totals.primedKeys += tracked.pending.size();
+    changed.notify_all();
+}
+
+void TextureService::workerLoop() {
+    while (true) {
+        Lock lock(mutex);
+        changed.wait_for(lock, std::chrono::milliseconds(4), [&] { return stopping || !queue.empty(); });
+        if (stopping) return;
+        if (!queue.empty()) {
+            const auto id = queue.front();
+            queue.pop_front();
+            auto found = tables.find(id);
+            if (found == tables.end() || found->second.state != TableState::Queued) continue;
+            found->second.state = TableState::Reading;
+            lock.unlock();
+            readTable(found->second);
+            lock.lock();
+            ++totals.workerPrepared;
+            continue;
+        }
+        takingMisses = true;
+        lock.unlock();
+        auto misses = table.TakeMisses();
+        std::vector<BindlessPrepared> prepared;
+        for (const auto& miss : misses) prepared.push_back(prepare(miss.key));
+        lock.lock();
+        totals.misses += misses.size();
+        missPending.insert(missPending.end(), std::make_move_iterator(prepared.begin()), std::make_move_iterator(prepared.end()));
+        takingMisses = false;
+        changed.notify_all();
+        const bool work = !missPending.empty() || std::any_of(tables.begin(), tables.end(), [](const auto& item) { return item.second.state == TableState::Prepared; });
+        lock.unlock();
+        if (!work) continue;
+        auto& gpu = GuestMemory::GpuMutex();
+        if (!gpu.try_lock()) continue;
+        try {
+            if (auto* recorder = Recorder::Active(); recorder != nullptr) {
+                lock.lock();
+                bool committed = false;
+                for (auto& [id, tracked] : tables) {
+                    if (tracked.state != TableState::Prepared) continue;
+                    const auto before = tracked.pending.size();
+                    commitTable(tracked, *recorder, lock, options.commitChunk);
+                    totals.workerCommitted += before - tracked.pending.size();
+                    committed = true;
+                    break;
+                }
+                if (!committed && !missPending.empty()) {
+                    auto prepared = std::exchange(missPending, {});
+                    totals.missesResolved += prepared.size();
+                    totals.workerCommitted += prepared.size();
+                    commitPrepared(prepared, *recorder, lock);
+                }
+                lock.unlock();
+            }
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "[bindless] texture service worker: %s\n", error.what());
+        }
+        gpu.unlock();
+    }
+}
+
+BindlessResolution TextureService::settle(const BindlessPrepared& prepared) {
+    if (!prepared.refusal.empty()) {
+        BindlessResolution refused;
+        refused.value.fault = 1u;
+        return refused;
+    }
+    if (prepared.settled.has_value()) {
+        BindlessResolution settled;
+        settled.value = *prepared.settled;
+        return settled;
+    }
+    return resolver->Commit(prepared);
+}
+
+std::uint32_t TextureService::refuse(const DeviceImageKeys::Key& key, const std::string& message) {
+    if (const auto found = rejectionIndex.find(key); found != rejectionIndex.end()) {
+        rejections[found->second] = message;
+        return found->second + 1u;
+    }
+    Require(rejections.size() + 1u < Abi::FaultFlag, "the texture service holds more refusals than a fault record can name");
+    rejections.push_back(message);
+    rejectionIndex.emplace(key, static_cast<std::uint32_t>(rejections.size() - 1u));
+    ++totals.refused;
+    return static_cast<std::uint32_t>(rejections.size());
+}
+
+std::uint32_t TextureService::acquireImage(VkImageView view, VkImageLayout layout) {
+    if (view == VK_NULL_HANDLE) return 0u;
+    auto& ref = imageSlots[view];
+    if (ref.references++ == 0u) {
+        try {
+            ref.slot = table.Heap().AllocateImage(DescriptorHeap::Array::SampledImages, view, layout);
+        } catch (...) {
+            imageSlots.erase(view);
+            throw;
+        }
+    }
+    return ref.slot;
+}
+
+std::uint32_t TextureService::acquireSampler(VkSampler sampler) {
+    if (sampler == VK_NULL_HANDLE) return 0u;
+    auto& ref = samplerSlots[sampler];
+    if (ref.references++ == 0u) {
+        try {
+            ref.slot = table.Heap().AllocateSampler(sampler);
+        } catch (...) {
+            samplerSlots.erase(sampler);
+            throw;
+        }
+    }
+    return ref.slot;
+}
+
+void TextureService::discard(const BindlessResolution& resolution, Recorder& recorder) {
+    if (resolution.owner != nullptr) recorder.Keep(resolution.owner);
+    if (resolution.samplerOwner != nullptr) recorder.Keep(resolution.samplerOwner);
+}
+
+void TextureService::releaseResolution(const BindlessResolution& resolution, Recorder& recorder) {
+    const auto serial = recorder.OpenSerial();
+    if (resolution.view != VK_NULL_HANDLE) {
+        auto found = imageSlots.find(resolution.view);
+        Require(found != imageSlots.end() && found->second.references != 0u, "a bindless entry released an image slot it did not hold");
+        if (--found->second.references == 0u) {
+            table.Heap().Release(DescriptorHeap::Array::SampledImages, found->second.slot, serial);
+            imageSlots.erase(found);
+        }
+    }
+    if (resolution.sampler != VK_NULL_HANDLE) {
+        auto found = samplerSlots.find(resolution.sampler);
+        Require(found != samplerSlots.end() && found->second.references != 0u, "a bindless entry released a sampler slot it did not hold");
+        if (--found->second.references == 0u) {
+            table.Heap().Release(DescriptorHeap::Array::Samplers, found->second.slot, serial);
+            samplerSlots.erase(found);
+        }
+    }
+    if (resolution.owner != nullptr) {
+        auto found = owners.find(resolution.owner.get());
+        if (found != owners.end() && --found->second.references == 0u) {
+            pinnedBytes -= std::min(pinnedBytes, found->second.bytes);
+            owners.erase(found);
+        }
+        recorder.Keep(resolution.owner);
+    }
+    if (resolution.samplerOwner != nullptr) recorder.Keep(resolution.samplerOwner);
+}
+
+void TextureService::insertValue(const DeviceImageKeys::Key& key, const DeviceImageValue& value, Recorder& recorder) {
+    if (table.Insert(key, value) != DeviceImageKeys::Insertion::Full) return;
+    ++totals.fullEvictions;
+    const auto wanted = std::max<std::size_t>(1u, entries.size() / 4u);
+    if (evictIdle(recorder, wanted, recorder.OpenSerial(), 0u) && table.Insert(key, value) != DeviceImageKeys::Insertion::Full) return;
+    const auto counts = table.Totals();
+    throw std::runtime_error("AGC graphics: the bindless key table is full (" + std::to_string(counts.entries) + " entries in " + std::to_string(counts.buckets) + " buckets) and every entry is used by the batch being recorded");
+}
+
+void TextureService::place(const DeviceImageKeys::Key& key, BindlessResolution resolution, Recorder& recorder, std::uint64_t lastUsed) {
+    auto value = resolution.value;
+    value.slot = acquireImage(resolution.view, resolution.layout);
+    try {
+        value.samplerSlot = acquireSampler(resolution.sampler);
+    } catch (...) {
+        auto partial = resolution;
+        partial.sampler = VK_NULL_HANDLE;
+        partial.owner.reset();
+        releaseResolution(partial, recorder);
+        throw;
+    }
+    try {
+        insertValue(key, value, recorder);
+    } catch (...) {
+        auto partial = resolution;
+        partial.owner.reset();
+        releaseResolution(partial, recorder);
+        throw;
+    }
+    if (resolution.owner != nullptr) {
+        auto& owner = owners[resolution.owner.get()];
+        if (owner.references++ == 0u) {
+            owner.bytes = resolution.bytes;
+            pinnedBytes += resolution.bytes;
+        }
+    }
+    const bool perUse = resolution.perUse;
+    entries[key] = Entry{value, std::move(resolution), lastUsed};
+    if (perUse) perUseKeys.insert(key);
+}
+
+BindlessResolution TextureService::take(const DeviceImageKeys::Key& key) {
+    auto found = entries.find(key);
+    Require(found != entries.end(), "the texture service dropped an entry it does not hold");
+    auto resolution = std::move(found->second.resolution);
+    entries.erase(found);
+    perUseKeys.erase(key);
+    return resolution;
+}
+
+void TextureService::install(const DeviceImageKeys::Key& key, BindlessResolution resolution, Recorder& recorder) {
+    if (entries.contains(key)) {
+        discard(resolution, recorder);
+        return;
+    }
+    place(key, std::move(resolution), recorder, recorder.OpenSerial());
+    ++totals.created;
+}
+
+void TextureService::replace(const DeviceImageKeys::Key& key, Recorder& recorder, Lock& lock) {
+    lock.unlock();
+    auto prepared = prepare(key);
+    BindlessResolution fresh;
+    std::string refusal = prepared.refusal;
+    if (refusal.empty()) {
+        try {
+            fresh = settle(prepared);
+        } catch (const std::runtime_error& error) {
+            refusal = error.what();
+            fresh = {};
+        }
+    }
+    lock.lock();
+    auto found = entries.find(key);
+    if (found == entries.end()) {
+        discard(fresh, recorder);
+        return;
+    }
+    if (refusal.empty() && fresh.view == found->second.resolution.view && fresh.sampler == found->second.resolution.sampler && fresh.owner == found->second.resolution.owner && fresh.value == found->second.resolution.value) {
+        auto& kept = found->second.resolution;
+        kept.generation = fresh.generation;
+        kept.perUse = fresh.perUse;
+        if (!kept.perUse) perUseKeys.erase(key);
+        return;
+    }
+    const auto lastUsed = found->second.lastUsed;
+    const auto old = take(key);
+    if (!refusal.empty()) {
+        fresh = {};
+        fresh.value.fault = refuse(key, refusal);
+    }
+    place(key, std::move(fresh), recorder, lastUsed);
+    releaseResolution(old, recorder);
+}
+
+void TextureService::commitPrepared(std::vector<BindlessPrepared>& prepared, Recorder& recorder, Lock& lock) {
+    for (auto& item : prepared) {
+        if (entries.contains(item.key)) continue;
+        lock.unlock();
+        BindlessResolution resolution;
+        std::string refusal = item.refusal;
+        if (refusal.empty()) {
+            try {
+                resolution = settle(item);
+            } catch (const std::runtime_error& error) {
+                refusal = error.what();
+                resolution = {};
+            }
+        }
+        lock.lock();
+        if (!refusal.empty()) {
+            resolution = {};
+            resolution.value.fault = refuse(item.key, refusal);
+        }
+        install(item.key, std::move(resolution), recorder);
+    }
+    prepared.clear();
+}
+
+void TextureService::commitTable(Tracked& tracked, Recorder& recorder, Lock& lock, std::size_t limit) {
+    const auto started = std::chrono::steady_clock::now();
+    while (!tracked.pending.empty() && limit != 0) {
+        const auto count = std::min(limit, tracked.pending.size());
+        std::vector<BindlessPrepared> batch(std::make_move_iterator(tracked.pending.end() - static_cast<std::ptrdiff_t>(count)), std::make_move_iterator(tracked.pending.end()));
+        tracked.pending.resize(tracked.pending.size() - count);
+        limit -= count;
+        commitPrepared(batch, recorder, lock);
+    }
+    tracked.primerNanoseconds += Elapsed(started);
+    if (!tracked.pending.empty() || tracked.state != TableState::Prepared) return;
+    tracked.state = TableState::Done;
+    ++totals.primed;
+    totals.primerNanoseconds += tracked.primerNanoseconds;
+    changed.notify_all();
+}
+
+void TextureService::completeTable(Tracked& tracked, Recorder& recorder, Lock& lock) {
+    if (tracked.state == TableState::Queued) {
+        std::erase(queue, tracked.id);
+        tracked.state = TableState::Reading;
+        lock.unlock();
+        readTable(tracked);
+        lock.lock();
+    }
+    changed.wait(lock, [&] { return tracked.state != TableState::Reading; });
+    if (tracked.state == TableState::Prepared) commitTable(tracked, recorder, lock, tracked.pending.size());
+}
+
+void TextureService::redecode(Tracked& tracked, Recorder& recorder, Lock& lock) {
+    const auto& registration = tracked.registration;
+    if (tracked.unmapped || tracked.pageGenerations.empty()) return;
+    lock.unlock();
+    memory->Collect(registration.base, static_cast<std::size_t>(tracked.span));
+    const bool unchanged = memory->Unchanged(registration.base, static_cast<std::size_t>(tracked.span), tracked.oldest);
+    if (unchanged) {
+        lock.lock();
+        return;
+    }
+    const auto end = registration.base + tracked.span;
+    std::vector<std::pair<std::uint32_t, std::vector<std::uint32_t>>> rewritten;
+    std::vector<std::uint64_t> generations = tracked.pageGenerations;
+    std::uint64_t pagesChanged = 0;
+    std::uint64_t recordsRead = 0;
+    for (std::size_t page = 0; page < generations.size(); ++page) {
+        const auto first = std::max(registration.base, tracked.firstPage + page * PageBytes);
+        const auto last = std::min(end, tracked.firstPage + (page + 1u) * PageBytes);
+        if (first >= last || memory->Unchanged(first, static_cast<std::size_t>(last - first), generations[page])) continue;
+        ++pagesChanged;
+        generations[page] = memory->Collect(first, static_cast<std::size_t>(last - first));
+        const auto firstRecord = static_cast<std::uint32_t>(first - registration.base < Abi::DescriptorWords * 4u ? 0u : (first - registration.base - Abi::DescriptorWords * 4u) / registration.stride + 1u);
+        for (auto record = firstRecord; record < registration.records; ++record) {
+            const auto address = registration.base + static_cast<std::uint64_t>(record) * registration.stride;
+            if (address >= last) break;
+            if (address + Abi::DescriptorWords * 4u <= first) continue;
+            std::vector<std::uint32_t> words(Abi::DescriptorWords, 0u);
+            ++recordsRead;
+            if (!memory->Read(address, words)) std::fill(words.begin(), words.end(), 0u);
+            if (std::equal(words.begin(), words.end(), tracked.words.begin() + static_cast<std::ptrdiff_t>(record) * Abi::DescriptorWords)) continue;
+            rewritten.emplace_back(record, std::move(words));
+        }
+    }
+    lock.lock();
+    tracked.pageGenerations = std::move(generations);
+    tracked.oldest = *std::min_element(tracked.pageGenerations.begin(), tracked.pageGenerations.end());
+    totals.pagesChanged += pagesChanged;
+    totals.recordsRead += recordsRead;
+    std::set<DeviceImageKeys::Key> wanted;
+    for (auto& [record, words] : rewritten) {
+        std::copy(words.begin(), words.end(), tracked.words.begin() + static_cast<std::ptrdiff_t>(record) * Abi::DescriptorWords);
+        ++totals.recordsChanged;
+        for (const auto& key : recordKeys(tracked, record)) {
+            if (!entries.contains(key)) wanted.insert(key);
+        }
+    }
+    if (wanted.empty()) return;
+    std::vector<BindlessPrepared> prepared;
+    lock.unlock();
+    for (const auto& key : wanted) prepared.push_back(prepare(key));
+    lock.lock();
+    commitPrepared(prepared, recorder, lock);
+}
+
+void TextureService::reverify(Tracked& tracked, Recorder& recorder, Lock& lock) {
+    tracked.evictionEpoch = evictionEpoch;
+    std::set<DeviceImageKeys::Key> wanted;
+    for (std::uint32_t record = 0; record < tracked.registration.records; ++record) {
+        for (const auto& key : recordKeys(tracked, record)) {
+            if (!entries.contains(key)) wanted.insert(key);
+        }
+    }
+    if (wanted.empty()) return;
+    std::vector<BindlessPrepared> prepared;
+    lock.unlock();
+    for (const auto& key : wanted) prepared.push_back(prepare(key));
+    lock.lock();
+    commitPrepared(prepared, recorder, lock);
+}
+
+void TextureService::resolveMisses(Recorder& recorder, Lock& lock) {
+    changed.wait(lock, [&] { return !takingMisses; });
+    lock.unlock();
+    const auto misses = table.TakeMisses();
+    std::vector<BindlessPrepared> prepared;
+    for (const auto& miss : misses) prepared.push_back(prepare(miss.key));
+    lock.lock();
+    totals.misses += misses.size();
+    prepared.insert(prepared.end(), std::make_move_iterator(missPending.begin()), std::make_move_iterator(missPending.end()));
+    missPending.clear();
+    totals.missesResolved += prepared.size();
+    commitPrepared(prepared, recorder, lock);
+}
+
+void TextureService::refreshPerUse(Recorder& recorder, Lock& lock) {
+    const std::vector<DeviceImageKeys::Key> keys(perUseKeys.begin(), perUseKeys.end());
+    for (const auto& key : keys) {
+        ++totals.refreshed;
+        replace(key, recorder, lock);
+    }
+}
+
+bool TextureService::evictIdle(Recorder& recorder, std::size_t wanted, std::uint64_t idleBefore, std::uint64_t targetBytes) {
+    std::set<DeviceImageKeys::Key> protectedKeys;
+    for (const auto& [id, tracked] : tables) {
+        if (tracked.lastUsed < idleBefore) continue;
+        for (std::uint32_t record = 0; record < tracked.registration.records; ++record) {
+            for (const auto& key : recordKeys(tracked, record)) protectedKeys.insert(key);
+        }
+    }
+    std::vector<std::pair<std::uint64_t, DeviceImageKeys::Key>> idle;
+    for (const auto& [key, entry] : entries) {
+        if (entry.lastUsed >= idleBefore || protectedKeys.contains(key) || retiring.contains(key)) continue;
+        idle.emplace_back(entry.lastUsed, key);
+    }
+    std::sort(idle.begin(), idle.end());
+    std::uint64_t projected = pinnedBytes;
+    std::map<const void*, std::uint32_t> dropping;
+    std::size_t taken = 0;
+    for (const auto& [used, key] : idle) {
+        if (targetBytes != 0 ? projected <= targetBytes : taken >= wanted) break;
+        retiring.insert(key);
+        ++taken;
+        ++totals.evicted;
+        const auto& owner = entries.at(key).resolution.owner;
+        if (owner == nullptr) continue;
+        const auto found = owners.find(owner.get());
+        if (found != owners.end() && ++dropping[owner.get()] == found->second.references) projected -= std::min(projected, found->second.bytes);
+    }
+    if (taken == 0) return false;
+    retireNow(recorder);
+    return true;
+}
+
+void TextureService::retireNow(Recorder& recorder) {
+    if (retiring.empty()) return;
+    const auto dropped = table.Retire([&](const DeviceImageKeys::Key& key, const DeviceImageValue&) { return retiring.contains(key); });
+    static_cast<void>(dropped);
+    for (const auto& key : retiring) {
+        if (!entries.contains(key)) continue;
+        releaseResolution(take(key), recorder);
+        ++totals.retired;
+    }
+    retiring.clear();
+    ++evictionEpoch;
+}
+
+void TextureService::checkMapping(Recorder& recorder) {
+    const auto serial = memory->MappingSerial();
+    if (serial == mappingSerial) return;
+    mappingSerial = serial;
+    for (auto it = tables.begin(); it != tables.end();) {
+        auto& tracked = it->second;
+        if (tracked.state == TableState::Done && !memory->Mapped(tracked.registration.base, static_cast<std::size_t>(tracked.span))) {
+            ids.erase(tracked.registration);
+            it = tables.erase(it);
+            ++totals.unmapped;
+            continue;
+        }
+        ++it;
+    }
+    for (const auto& [key, entry] : entries) {
+        if (entry.value.fault != 0u) {
+            retiring.insert(key);
+            continue;
+        }
+        if (entry.resolution.bytes == 0 || memory->Mapped(entry.resolution.address, static_cast<std::size_t>(entry.resolution.bytes))) continue;
+        retiring.insert(key);
+        ++totals.unmapped;
+    }
+    retireNow(recorder);
+}
+
+void TextureService::Serve(std::span<const std::uint64_t> served, Recorder& recorder) {
+    Require(GuestMemory::GpuMutex().HeldByThisThread(), "the texture service publishes only under the GPU lock");
+    const auto started = std::chrono::steady_clock::now();
+    {
+        Lock lock(mutex);
+        const auto serial = recorder.OpenSerial();
+        for (const auto id : served) {
+            auto found = tables.find(id);
+            Require(found != tables.end(), "the texture service was asked to serve a table it does not hold (unregistered or unmapped)");
+            auto& tracked = found->second;
+            tracked.lastUsed = serial;
+            if (tracked.state != TableState::Done) {
+                completeTable(tracked, recorder, lock);
+                continue;
+            }
+            redecode(tracked, recorder, lock);
+            if (tracked.evictionEpoch != evictionEpoch) reverify(tracked, recorder, lock);
+        }
+        resolveMisses(recorder, lock);
+        refreshPerUse(recorder, lock);
+        retireNow(recorder);
+        ++totals.serves;
+    }
+    table.Publish(recorder);
+    std::lock_guard lock(mutex);
+    totals.serveNanoseconds += Elapsed(started);
+}
+
+std::uint64_t TextureService::PresentSerial(Recorder& recorder) {
+    const auto counts = table.Totals();
+    std::lock_guard lock(mutex);
+    if (counts.rings == lastRings) return 0u;
+    lastRings = counts.rings;
+    recorder.Submit();
+    return recorder.Submissions();
+}
+
+void TextureService::Revalidate(Recorder& recorder) {
+    Lock lock(mutex);
+    checkMapping(recorder);
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    for (const auto& [key, entry] : entries) {
+        if (entry.resolution.bytes != 0 && entry.resolution.owner != nullptr) ranges.emplace_back(entry.resolution.address, entry.resolution.address + entry.resolution.bytes);
+    }
+    std::sort(ranges.begin(), ranges.end());
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> merged;
+    for (const auto& range : ranges) {
+        if (!merged.empty() && range.first <= merged.back().second) merged.back().second = std::max(merged.back().second, range.second);
+        else merged.push_back(range);
+    }
+    lock.unlock();
+    for (const auto& [begin, end] : merged) memory->Collect(begin, static_cast<std::size_t>(end - begin));
+    lock.lock();
+    std::vector<DeviceImageKeys::Key> stale;
+    for (const auto& [key, entry] : entries) {
+        if (entry.resolution.owner == nullptr) continue;
+        ++totals.revalidated;
+        const bool unchanged = entry.resolution.bytes == 0 || memory->Unchanged(entry.resolution.address, static_cast<std::size_t>(entry.resolution.bytes), entry.resolution.generation);
+        if (unchanged && resolver->Current(entry.resolution)) continue;
+        stale.push_back(key);
+    }
+    for (const auto& key : stale) {
+        if (!entries.contains(key)) continue;
+        ++totals.stale;
+        replace(key, recorder, lock);
+    }
+    if (options.budgetBytes != 0 && pinnedBytes > options.budgetBytes) {
+        const auto open = recorder.OpenSerial();
+        const auto idleBefore = open > options.idleSubmits ? open - options.idleSubmits : 0u;
+        if (idleBefore != 0) evictIdle(recorder, 0u, idleBefore, options.budgetBytes / 4u * 3u);
+    }
+    retireNow(recorder);
+}
+
+void TextureService::AfterPresentWait(Recorder& recorder, std::uint64_t waitedNanoseconds) {
+    {
+        std::lock_guard lock(mutex);
+        ++frame;
+        if (waitedNanoseconds != 0) {
+            ++totals.presentWaits;
+            totals.presentWaitNanoseconds += waitedNanoseconds;
+        }
+    }
+    Revalidate(recorder);
+    Publish(recorder);
+}
+
+std::optional<DeviceImageValue> TextureService::Find(const DeviceImageKeys::Key& key) const {
+    std::lock_guard lock(mutex);
+    const auto found = entries.find(key);
+    if (found == entries.end()) return std::nullopt;
+    return found->second.value;
+}
+
+std::shared_ptr<void> TextureService::Owner(const DeviceImageKeys::Key& key) const {
+    std::lock_guard lock(mutex);
+    const auto found = entries.find(key);
+    if (found == entries.end()) return nullptr;
+    return found->second.resolution.owner;
+}
+
+std::optional<std::string> TextureService::Rejection(std::uint32_t fault) const {
+    std::lock_guard lock(mutex);
+    if (fault == 0u || fault > rejections.size()) return std::nullopt;
+    return rejections[fault - 1u];
+}
+
+std::size_t TextureService::queueDepth() const {
+    std::size_t depth = queue.size() + missPending.size();
+    for (const auto& [id, tracked] : tables) depth += tracked.pending.size() + (tracked.state == TableState::Reading ? 1u : 0u);
+    return depth;
+}
+
+TextureService::Counts TextureService::Totals() const {
+    std::lock_guard lock(mutex);
+    auto counts = totals;
+    counts.queued = queueDepth();
+    counts.entries = entries.size();
+    counts.imageSlots = imageSlots.size();
+    counts.samplerSlots = samplerSlots.size();
+    counts.pinnedBytes = pinnedBytes;
+    return counts;
+}
+
+std::string TextureService::TakeFrameLine(std::uint64_t oldPathNanoseconds) {
+    const auto ring = table.Totals();
+    const auto now = Totals();
+    std::lock_guard lock(mutex);
+    const auto dropped = ring.dropped - lastDropped;
+    lastDropped = ring.dropped;
+    const auto oldPath = oldPathNanoseconds - std::min(oldPathNanoseconds, reportedOldPath);
+    reportedOldPath = oldPathNanoseconds;
+    const auto delta = [](std::uint64_t current, std::uint64_t previous) { return static_cast<unsigned long long>(current - previous); };
+    char text[1024];
+    std::snprintf(text, sizeof(text), "[bindless] frame %llu: misses %llu (%llu dropped), created %llu, refused %llu, primed %llu tables (%llu records, %llu new keys, primer %.1f ms), re-decoded %llu pages (%llu records changed), queue %llu, revalidated %llu (%llu stale, %llu per-use), retired %llu (%llu unmapped, %llu evicted, %llu full), serve %.1f ms over %llu calls, present wait %.1f ms, entries %llu, slots %llu+%llu, pinned %.1f MiB, old-path resolve %.1f ms",
+        static_cast<unsigned long long>(frame), delta(now.misses, reported.misses), static_cast<unsigned long long>(dropped), delta(now.created, reported.created), delta(now.refused, reported.refused), delta(now.primed, reported.primed), delta(now.primedRecords, reported.primedRecords), delta(now.primedKeys, reported.primedKeys), Milliseconds(now.primerNanoseconds - reported.primerNanoseconds), delta(now.pagesChanged, reported.pagesChanged), delta(now.recordsChanged, reported.recordsChanged), static_cast<unsigned long long>(now.queued), delta(now.revalidated, reported.revalidated), delta(now.stale, reported.stale), delta(now.refreshed, reported.refreshed), delta(now.retired, reported.retired), delta(now.unmapped, reported.unmapped), delta(now.evicted, reported.evicted), delta(now.fullEvictions, reported.fullEvictions), Milliseconds(now.serveNanoseconds - reported.serveNanoseconds), delta(now.serves, reported.serves), Milliseconds(now.presentWaitNanoseconds - reported.presentWaitNanoseconds), static_cast<unsigned long long>(now.entries), static_cast<unsigned long long>(now.imageSlots), static_cast<unsigned long long>(now.samplerSlots), static_cast<double>(now.pinnedBytes) / static_cast<double>(1u << 20u), Milliseconds(oldPath));
+    reported = now;
+    return text;
+}
+
+}
