@@ -1058,21 +1058,103 @@ void EmitRuntimeBufferStore(SpirvValueEmitContext& context, const IrValue& instr
     });
 }
 
+// The dwords of one s_buffer_load_dwordxN through a GPU V# that are still in the program: the ReadConstBuffer
+// instructions right after `instruction` in its block with the same V#, offset operand and pc, at increasing
+// offsets less than 64 bytes past the first.
+std::vector<const IrValue*> scalarRun(SpirvValueEmitContext& context, const IrValue& instruction) {
+    std::vector<const IrValue*> run{&instruction};
+    const IrBlock* block = instruction.Parent();
+    if (block == nullptr) return run;
+    const auto& instructions = block->Instructions();
+    auto at = std::find(instructions.begin(), instructions.end(), &instruction);
+    if (at == instructions.end()) return run;
+    const auto& first = context.Memory(instruction);
+    const auto pc = instruction.Flags<MemoryFlags>().pc;
+    for (++at; at != instructions.end(); ++at) {
+        const IrValue& next = **at;
+        if (next.Opcode() != IrOpcode::ReadConstBuffer || next.ArgumentCount() != 2u || next.Flags<MemoryFlags>().pc != pc) break;
+        if (next.Argument(0)->Resolve() != instruction.Argument(0)->Resolve() || next.Argument(1)->Resolve() != instruction.Argument(1)->Resolve()) break;
+        const auto& memory = context.Memory(next);
+        const auto previous = context.Memory(*run.back()).offset;
+        if (memory.kind != ResourceKind::ScalarBuffer || !memory.gpuDescriptor || memory.planningOnly || memory.resource != first.resource || memory.coherent != first.coherent) break;
+        if (memory.offset <= previous || memory.offset - first.offset >= 64u || (memory.offset - first.offset) % 4u != 0u) break;
+        run.push_back(&next);
+    }
+    return run;
+}
+
 std::uint32_t EmitRuntimeScalarBufferLoad(SpirvValueEmitContext& context, const IrValue& instruction) {
     auto& state = context.state;
+    // A later dword of a run the first dword already read (below): its value dominates it when nothing was
+    // emitted in between, so it is still the block the run ended in.
+    if (const auto found = context.scalarRunValues.find(&instruction); found != context.scalarRunValues.end()) {
+        const auto [value, label] = found->second;
+        context.scalarRunValues.erase(found);
+        if (label == state.currentLabel && state.runtimeBufferLabel == state.currentLabel) return value;
+    }
     if (std::ranges::find(state.supportedCapabilities, spv::CapabilityInt64) == state.supportedCapabilities.end()) context.Fail(instruction, "scalar buffer bounds require shaderInt64");
     state.module.EmitCapability(spv::CapabilityInt64);
+    // Before the descriptor check, whose fault branch ends the block: whether this load is emitted where its block's
+    // instructions are, not inside a guard of its own.
+    const bool hoisted = state.runtimeBufferLabel != 0u && state.currentLabel == state.runtimeBufferLabel;
     const auto resource = descriptor(context, instruction);
     checkDescriptor(context, instruction, resource);
     const auto u64 = TypeScalarU64(state);
     const auto size = Select(state, u64, equal(state, resource.stride, ConstantU32(state, 0u)), Unary(state, spv::OpUConvert, u64, resource.records), Binary(state, spv::OpIMul, u64, Unary(state, spv::OpUConvert, u64, resource.stride), Unary(state, spv::OpUConvert, u64, resource.records)));
-    const auto address = EmitAddU32(state, context.Arg(instruction, 1u), ConstantU32(state, context.Memory(instruction).offset));
-    const auto noCarry = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), address, context.Arg(instruction, 1u));
-    const auto byte = EmitAndConstant(state, address, ~3u);
-    const auto offset = Unary(state, spv::OpUConvert, u64, byte);
-    const auto inBounds = both(state, noCarry, both(state, resource.valid, Binary(state, spv::OpULessThanEqual, TypeBool(state), Binary(state, spv::OpIAdd, u64, offset, BdaConstant(state, 4u)), size)));
-    if (!context.Memory(instruction).gpuDescriptor) return EmitValueOrZeroIfCondition(state, inBounds, [&] { return readBuffer(context, instruction, byte, 32u); });
-    return EmitValueOrZeroIfCondition(state, inBounds, [&] { return readBuffer(context, instruction, AddBdaAddress(context, instruction, resource.base, offset, false), 32u); });
+    struct DwordBounds {
+        std::uint32_t byte;
+        std::uint32_t offset;
+        std::uint32_t inBounds;
+    };
+    const auto bounds = [&](const IrValue& dword) {
+        const auto address = EmitAddU32(state, context.Arg(dword, 1u), ConstantU32(state, context.Memory(dword).offset));
+        const auto noCarry = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), address, context.Arg(dword, 1u));
+        const auto byte = EmitAndConstant(state, address, ~3u);
+        const auto offset = Unary(state, spv::OpUConvert, u64, byte);
+        return DwordBounds{byte, offset, both(state, noCarry, both(state, resource.valid, Binary(state, spv::OpULessThanEqual, TypeBool(state), Binary(state, spv::OpIAdd, u64, offset, BdaConstant(state, 4u)), size)))};
+    };
+    if (context.Memory(instruction).gpuDescriptor && hoisted && HasBdaSpanReads(state, instruction)) {
+        const auto run = scalarRun(context, instruction);
+        if (run.size() > 1u) {
+            // One span read per 4 dwords instead of a guarded read per dword. The in-bounds dwords of the run are a
+            // prefix of it (a dword is in bounds when its end fits the V# range and its offset add did not wrap, and
+            // both only get harder at higher offsets), and an in-bounds dword sits 4 bytes per dword past the first
+            // one's byte, so a run-time mask of the in-bounds dwords reads exactly the dwords the per-dword reads
+            // did, in the same order, with the same lookups and faults; the others read 0 as before.
+            const auto u32 = TypeU32(state);
+            const auto first = context.Memory(instruction).offset;
+            std::array<DwordBounds, 16> dwords{};
+            for (const IrValue* dword : run) dwords[(context.Memory(*dword).offset - first) / 4u] = bounds(*dword);
+            const auto base = Binary(state, spv::OpIAdd, u64, resource.base, dwords[0].offset);
+            const auto zeros = state.module.Constant(spv::OpConstantComposite, TypeU32Vector(state, 4), ConstantU32(state, 0u), ConstantU32(state, 0u), ConstantU32(state, 0u), ConstantU32(state, 0u));
+            std::array<std::uint32_t, 4> reads{};
+            for (std::uint32_t chunk = 0; chunk < 4u; ++chunk) {
+                std::uint32_t used = 0;
+                for (const IrValue* dword : run) {
+                    const auto index = (context.Memory(*dword).offset - first) / 4u;
+                    if (index / 4u != chunk) continue;
+                    const auto bit = Select(state, u32, dwords[index].inBounds, ConstantU32(state, 1u << (index % 4u)), ConstantU32(state, 0u));
+                    used = used == 0u ? bit : Binary(state, spv::OpBitwiseOr, u32, used, bit);
+                }
+                if (used == 0u) continue;
+                reads[chunk] = EmitValueIfElse(state, nonzero(state, used), TypeU32Vector(state, 4), [&] {
+                    return EmitBdaSpanRead(context, instruction, base, ConstantU32(state, chunk * 16u), used);
+                }, [&] { return zeros; });
+            }
+            std::uint32_t result = 0;
+            for (const IrValue* dword : run) {
+                const auto index = (context.Memory(*dword).offset - first) / 4u;
+                const auto value = state.module.AllocateId();
+                state.module.AddFunction(spv::OpCompositeExtract, u32, value, reads[index / 4u], index % 4u);
+                if (dword == &instruction) result = value;
+                else context.scalarRunValues[dword] = {value, state.currentLabel};
+            }
+            return result;
+        }
+    }
+    const auto dword = bounds(instruction);
+    if (!context.Memory(instruction).gpuDescriptor) return EmitValueOrZeroIfCondition(state, dword.inBounds, [&] { return readBuffer(context, instruction, dword.byte, 32u); });
+    return EmitValueOrZeroIfCondition(state, dword.inBounds, [&] { return readBuffer(context, instruction, AddBdaAddress(context, instruction, resource.base, dword.offset, false), 32u); });
 }
 
 std::uint32_t EmitRuntimeBufferAtomic(SpirvValueEmitContext& context, const IrValue& instruction, std::uint32_t bits, std::uint32_t active, const std::function<std::uint32_t(std::uint32_t)>& operation) {

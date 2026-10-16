@@ -37,6 +37,11 @@ std::uint32_t EmitBdaAtomic(SpirvValueEmitContext& ctx, const IrValue& inst, std
 // table lookup for the whole span; the per-byte lookups of EmitBdaRead remain the fallback (and
 // the only path under APS5_BDA_BYTE_READS=1). Dwords the program never extracts are neither read
 std::array<std::uint32_t, 4> EmitBdaDwordReads(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::uint32_t offset, std::uint32_t dwords, bool everyDword = false, std::uint32_t usedDwords = 0u);
+// The span read of EmitBdaDwordReads with a run-time mask: one read_bda_span call for the dwords set
+// in `used` (nonzero) at address + offset + 4 * dword, a vector of 4 dwords in which the others are 0.
+// HasBdaSpanReads tells whether the module has the span read it needs.
+bool HasBdaSpanReads(const SpirvEmitterState& state, const IrValue& inst);
+std::uint32_t EmitBdaSpanRead(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::uint32_t offset, std::uint32_t used);
 bool BdaByteReadsForced();
 std::uint32_t AddBdaAddress(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::uint32_t offset, bool subtract);
 std::uint32_t AddBdaImmediate(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::int32_t immediate);

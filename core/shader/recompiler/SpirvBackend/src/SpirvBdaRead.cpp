@@ -694,4 +694,23 @@ std::array<std::uint32_t, 4> EmitBdaDwordReads(SpirvValueEmitContext& ctx, const
     return values;
 }
 
+bool HasBdaSpanReads(const SpirvEmitterState& state, const IrValue& inst) {
+    return state.bdaProbeFunction != 0 && state.bdaSpanReadFunctions[state.bdaStopsInvocations][BdaCoherent(state, inst)] != 0;
+}
+
+std::uint32_t EmitBdaSpanRead(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::uint32_t offset, std::uint32_t used) {
+    auto& state = ctx.state;
+    const auto function = state.bdaSpanReadFunctions[state.bdaStopsInvocations][BdaCoherent(state, inst)];
+    if (state.bdaProbeFunction == 0 || function == 0) ctx.Fail(inst, "BDA span read function is missing");
+    const auto read = state.module.AllocateId();
+    state.module.AddFunction(spv::OpFunctionCall, BdaSpanReadResultType(state), read, function, address, offset, used, BdaInstructionPc(state, inst));
+    if (!state.bdaStopsInvocations) return read;
+    const auto stopped = state.module.AllocateId();
+    state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), stopped, read, 1u);
+    StopBdaInvocationIf(state, Binary(state, spv::OpINotEqual, TypeBool(state), stopped, ConstantU32(state, 0u)));
+    const auto values = state.module.AllocateId();
+    state.module.AddFunction(spv::OpCompositeExtract, TypeU32Vector(state, 4), values, read, 0u);
+    return values;
+}
+
 }

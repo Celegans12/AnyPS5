@@ -262,6 +262,9 @@ struct SpirvValueEmitContext {
     std::uint32_t scratchU32Variable = 0;
     SpirvValueEmitContext* otherHalf = nullptr;
     std::uint32_t half = 0;
+    // The later dwords of a scalar buffer load whose first dword read them all (see
+    // EmitRuntimeScalarBufferLoad): their value and the label it was defined in.
+    std::unordered_map<const IrValue*, std::pair<std::uint32_t, std::uint32_t>> scalarRunValues;
 };
 
 struct SpirvDeferredPhiPatch {
