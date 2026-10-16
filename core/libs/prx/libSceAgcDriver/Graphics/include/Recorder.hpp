@@ -706,6 +706,7 @@ private:
         bool behindCompletion = false;
     };
     void readGpuTiming(Batch& batch);
+    std::string runningRanges(const Batch& batch);
     void beginSamples(Batch& batch);
     void readSamples(Batch& batch);
     bool gpuSampleCounter();

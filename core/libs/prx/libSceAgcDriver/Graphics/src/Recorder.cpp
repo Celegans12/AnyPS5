@@ -2440,6 +2440,40 @@ void Recorder::readSamples(Batch& batch) {
     samplesPassed.fetch_add(samples, std::memory_order_acq_rel);
 }
 
+std::string Recorder::runningRanges(const Batch& batch) {
+    if (batch.queries == VK_NULL_HANDLE || batch.timedKeys.empty()) return "no timed ranges (APS5_PROFILE_GPU=1 names the running program)";
+    const auto count = batch.timedKeys.size();
+    std::vector<std::uint64_t> values(count * 4);
+    const auto result = context.Function<PFN_vkGetQueryPoolResults>("vkGetQueryPoolResults")(context.device, batch.queries, 0, static_cast<std::uint32_t>(count * 2), values.size() * sizeof(std::uint64_t), values.data(), 2 * sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+    if (result != VK_SUCCESS && result != VK_NOT_READY) return "timed ranges unreadable (Vulkan result " + std::to_string(result) + ")";
+    const auto name = [&](std::size_t index) {
+        const auto key = batch.timedKeys[index];
+        char text[48];
+        if (key == BatchTimingKey) std::snprintf(text, sizeof(text), "batch");
+        else if (key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count)) std::snprintf(text, sizeof(text), "%s", CommandClassNames[key - ClassKey(CommandClass::DispatchLeading)]);
+        else std::snprintf(text, sizeof(text), "0x%llx", static_cast<unsigned long long>(key));
+        return std::string(text);
+    };
+    std::string running;
+    std::string waiting;
+    std::size_t finished = 0, started = 0, pending = 0;
+    std::optional<std::size_t> lastFinished;
+    for (std::size_t index = 0; index < count; ++index) {
+        if (index == batch.batchTiming) continue;
+        const bool begun = values[index * 4 + 1] != 0;
+        const bool ended = values[index * 4 + 3] != 0;
+        if (begun && ended) {
+            ++finished;
+            lastFinished = index;
+        } else if (begun) {
+            if (started++ < 8) running += " " + name(index) + " (range " + std::to_string(index) + ")";
+        } else if (pending++ < 8) {
+            waiting += " " + name(index);
+        }
+    }
+    return std::to_string(count) + " timed ranges; started, not finished:" + (running.empty() ? std::string(" none") : running) + "; finished " + std::to_string(finished) + (lastFinished ? " (last " + name(*lastFinished) + ")" : std::string()) + "; not started " + std::to_string(pending) + (waiting.empty() ? std::string() : " (first:" + waiting + ")");
+}
+
 void Recorder::readGpuTiming(Batch& batch) {
     if (batch.queries == VK_NULL_HANDLE || batch.timedKeys.empty()) return;
     std::vector<std::uint64_t> stamps(batch.timedKeys.size() * 2);
@@ -3870,6 +3904,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
         for (int waited = 5; result == VK_TIMEOUT; waited += 5) {
             // A batch still running after 5 s is reported (every 5 s) so a GPU-side hang is visible.
             std::fprintf(stderr, "[gpu] recorded batch still running on the GPU after %d s\n", waited);
+            if (waited == 10) std::fprintf(stderr, "[gpu] recorded batch %llu still running: %s\n", static_cast<unsigned long long>(batch->serial), runningRanges(*batch).c_str());
             result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
         }
         if (result != VK_SUCCESS && result != VK_ERROR_DEVICE_LOST) {
