@@ -22,7 +22,13 @@ alignas(256) std::array<std::uint32_t, 7> CounterCode{0xf4080200u, 0xfa000000u, 
 
 constexpr std::size_t BlockBytes = 65536;
 constexpr std::uint32_t ArgumentsOffset = 4;
-alignas(BlockBytes) std::array<std::uint8_t, BlockBytes> Block{};
+std::array<std::uint8_t, 2 * BlockBytes> BlockStorage{};
+struct AlignedBlock {
+    std::uint8_t* data() const {
+        const auto start = reinterpret_cast<std::uintptr_t>(BlockStorage.data());
+        return reinterpret_cast<std::uint8_t*>((start + BlockBytes - 1u) & ~static_cast<std::uintptr_t>(BlockBytes - 1u));
+    }
+} Block;
 alignas(256) std::array<std::uint32_t, 4> WriterDescriptor{};
 alignas(256) std::array<std::uint32_t, 4> Counter{};
 alignas(256) std::array<std::uint32_t, 4> CounterDescriptor{};
