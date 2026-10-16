@@ -357,8 +357,8 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
         parked.keepVariant = keepVariant;
         parked.attachVariant = attachVariant;
         parked.shaderMemory = shaderMemory;
-        parked.captured = captured;
-        parked.liveWords = liveWords;
+        parked.captured = std::move(captured);
+        parked.liveWords = std::move(liveWords);
         parked.capture = capture;
         parked.dataHit = dataHit;
         parked.cached = cached;
