@@ -484,7 +484,16 @@ bool GuestArenaWriteWatched_nid_postfix() {
     return Arena::Get().WriteWatched();
 }
 
+namespace {
+std::atomic<void (*)(void*, std::size_t)> hostWriteObserver{nullptr};
+}
+
+void GuestArenaSetHostWriteObserver_nid_postfix(void (*observer)(void* pointer, std::size_t bytes)) {
+    hostWriteObserver.store(observer, std::memory_order_release);
+}
+
 bool GuestArenaBeginHostWrite_nid_postfix(void* pointer, std::size_t bytes) {
+    if (const auto observer = hostWriteObserver.load(std::memory_order_acquire); observer != nullptr && bytes != 0) observer(pointer, bytes);
 #ifdef _WIN32
     return WindowsMappings::Get().BeginHostWrite(reinterpret_cast<std::uintptr_t>(pointer), bytes);
 #else

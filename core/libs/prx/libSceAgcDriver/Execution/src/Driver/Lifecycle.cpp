@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/GuestArena.hpp"
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -86,6 +87,7 @@ Driver& Driver::Get() {
 }
 
 Driver::~Driver() {
+    GuestArena::GuestArenaSetHostWriteObserver_nid_postfix(nullptr);
     GuestAllocations::GuestAllocationsSetGpuMapObserver_nid_postfix(nullptr);
     stop();
 }
@@ -138,6 +140,7 @@ Driver::Driver() {
         stop();
         throw;
     }
+    GuestArena::GuestArenaSetHostWriteObserver_nid_postfix(&GuestMemory::FlushBeforeHostWrite);
     GuestAllocations::GuestAllocationsSetGpuMapObserver_nid_postfix([](const GuestAllocations::Mapped& ranges, std::uint64_t generation) {
         const auto import = [&] {
             try {
