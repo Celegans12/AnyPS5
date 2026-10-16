@@ -3056,6 +3056,16 @@ bool AddressReuseEnabled() {
     return enabled;
 }
 
+void CompleteSnapshotWrites(std::span<const GuestMemorySnapshot> snapshots) {
+    auto* recorder = Recorder::Active();
+    if (recorder == nullptr || Recorder::InCompletion()) return;
+    for (const auto& snapshot : snapshots) {
+        if (snapshot.bytes.empty() || !recorder->PendingWriteOverlaps(snapshot.address, snapshot.bytes.size())) continue;
+        Recorder::CountSync(4);
+        recorder->SyncThrough(snapshot.address, snapshot.bytes.size());
+    }
+}
+
 }
 
 void ShaderResources::noteReusable() {
@@ -3888,6 +3898,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     outcome = {ProofPath::Full, ProofFailure::Other};
     if (!reusable) return refuse(AddressReuse::NotReusable);
     if (InUse()) return refuse(AddressReuse::InUse);
+    CompleteSnapshotWrites(snapshots);
     if (!guestMemory.SameSnapshots(snapshots)) return refuse(AddressReuse::Snapshots);
     struct Suspend {
         GuestBufferMemory& memory;

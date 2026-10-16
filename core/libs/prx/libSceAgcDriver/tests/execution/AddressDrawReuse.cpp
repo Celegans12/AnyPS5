@@ -455,6 +455,49 @@ void GuestWrite(Scene& scene) {
     }
 }
 
+void PendingSnapshotWrite(Scene& scene) {
+    using AgcDriver::Graphics::AddressReuse;
+    constexpr std::size_t RewrittenOffset = 32;
+    const std::array<std::uint64_t, 1> captured{scene.guest.Address(ValueOffset)};
+    const std::array<AgcDriver::Graphics::GuestMemorySnapshot, 3> snapshots{{
+        scene.snapshots[0],
+        scene.snapshots[1],
+        {scene.guest.Address(PointerOffset), std::as_bytes(std::span(captured))},
+    }};
+    const auto draw = [&] {
+        const AgcDriver::Pm4::DrawParameters parameters{0, static_cast<std::uint32_t>(Triangle.size()), 0, 1, 0, false};
+        scene.device.Draw(scene.state, parameters, scene.shaders, snapshots);
+    };
+    Scene::Store(scene.guest, RewrittenOffset, Zero);
+    scene.Point(scene.guest.Address(ValueOffset));
+    for (int warm = 0; warm < 2; ++warm) {
+        {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            draw();
+        }
+        scene.Wait();
+    }
+    Require(scene.Color() == 255, "address draw reuse: the draw with a captured pointer did not read the guest value");
+    const auto rewritten = scene.guest.Address(RewrittenOffset);
+    const std::array<std::uint32_t, 4> pattern{static_cast<std::uint32_t>(rewritten), static_cast<std::uint32_t>(rewritten >> 32u), 0u, 0u};
+    const auto before = AgcDriver::Graphics::AddressReuseCounters();
+    const auto built = Builds();
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        Require(scene.device.FillBuffer(scene.guest.Address(PointerOffset), 16, pattern), "address draw reuse: the fill over the captured pointer was not recorded on the GPU");
+        draw();
+    }
+    const auto color = scene.Color();
+    const auto after = AgcDriver::Graphics::AddressReuseCounters();
+    const auto reused = Counted(after, AddressReuse::Reused) - Counted(before, AddressReuse::Reused);
+    Require(color == 0, "address draw reuse: a draw after a recorded fill rewrote its captured pointer read the old pointer");
+    Require(Counted(after, AddressReuse::Snapshots) == Counted(before, AddressReuse::Snapshots) + 1 && reused == 0 && Builds() == built + 1, "address draw reuse: a draw whose captured snapshot a pending GPU write changed was not refused for a changed snapshot and rebuilt (" + std::to_string(reused) + " reuses, " + std::to_string(Builds() - built) + " builds)");
+    scene.Point(scene.guest.Address(ValueOffset));
+    scene.Clear();
+    scene.Draw();
+    Require(scene.Color() == 255 && scene.Stored() == Bits(One), "address draw reuse: the draw after the captured pointer was restored did not read the guest value");
+}
+
 void Fault(Scene& scene) {
     void* reserved = nullptr;
 #ifdef _WIN32
@@ -740,6 +783,7 @@ int main(int argc, char** argv) {
                 Synthetic(scene, draws);
                 ReuseCounters(scene);
                 GuestWrite(scene);
+                PendingSnapshotWrite(scene);
                 Fault(scene);
                 Remap(scene);
                 scene.Wait();
