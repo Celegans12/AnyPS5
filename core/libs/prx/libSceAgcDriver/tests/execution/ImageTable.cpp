@@ -368,7 +368,7 @@ std::vector<std::array<std::uint32_t, 4>> SamplerWords(const std::vector<std::ui
 }
 
 Outcome Execute(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> span, const void* root, std::span<const ShaderRecompiler::MemoryRegion> memory, std::uint32_t groups, std::uint32_t threads, std::uint32_t waveSize,
-    std::shared_ptr<const ShaderRecompiler::ResourceCapture>* snapshot = nullptr) {
+    std::shared_ptr<const ShaderRecompiler::ResourceCapture>* snapshot = nullptr, bool wait = true) {
     const auto rootAddress = reinterpret_cast<std::uintptr_t>(root);
     const std::array<std::uint32_t, 2> userData{static_cast<std::uint32_t>(rootAddress), static_cast<std::uint32_t>(rootAddress >> 32u)};
     std::fill(Output.begin(), Output.end(), 0xdeadbeefu);
@@ -457,7 +457,7 @@ Outcome Execute(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> 
     StderrCapture capture;
     try {
         device.Dispatch(result, groups, 1, 1, {}, reinterpret_cast<std::uintptr_t>(span.data()));
-        device.WaitIdle();
+        if (wait) device.WaitIdle();
     } catch (...) {
         static_cast<void>(capture.Finish());
         throw;
@@ -1685,6 +1685,66 @@ void RunBindlessMissTests(AgcDriver::VulkanDevice& device) {
     Require(matched == 3u, "bindless miss: the driver registered " + std::to_string(matched) + " of the 3 missed keys");
 }
 
+void RunBindlessStorageWriteTests(AgcDriver::VulkanDevice& device) {
+    alignas(256) static std::array<std::uint32_t, 256u * 8u> writerRecords{};
+    alignas(256) static std::array<std::uint32_t, 256u * 8u> readerRecords{};
+    alignas(256) static std::array<float, Width * Height> written{};
+    alignas(256) static std::array<float, Width * Height> scratch{};
+    struct Registration {
+        void* data;
+        Registration(void* data, std::size_t bytes) : data(data) { GuestAllocations::Mutation().Add(data, bytes, true, true, true); }
+        ~Registration() { GuestAllocations::Mutation().Remove(data); }
+    } registeredWriter(writerRecords.data(), sizeof(writerRecords)), registeredReader(readerRecords.data(), sizeof(readerRecords)), registeredWritten(written.data(), sizeof(written)), registeredScratch(scratch.data(), sizeof(scratch));
+    Fill();
+    const auto stage = [&](std::array<std::uint32_t, 256u * 8u>& records, const void* sampled, const void* stored, bool wait) {
+        records.fill(0u);
+        const auto image = Image(sampled, Format32Float);
+        std::copy(image.begin(), image.end(), records.begin());
+        const auto keys = Buffer(Keys.data(), static_cast<std::uint32_t>(sizeof(Keys)));
+        const auto output = Buffer(Output.data(), static_cast<std::uint32_t>(sizeof(Output)));
+        const auto storage = Image(stored, Format32Float);
+        Srt.fill(0u);
+        std::copy(keys.begin(), keys.end(), Srt.begin());
+        std::copy(output.begin(), output.end(), Srt.begin() + 4);
+        std::copy(PointClamp.begin(), PointClamp.end(), Srt.begin() + 8);
+        const auto pointer = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(records.data())) + 0x100u;
+        Srt[12] = static_cast<std::uint32_t>(pointer);
+        Srt[13] = static_cast<std::uint32_t>(pointer >> 32u);
+        std::copy(storage.begin(), storage.end(), Srt.begin() + 16);
+        Keys.fill(0u);
+        const std::span<const std::uint32_t> code(PointerStorageWriteCode);
+        const std::array<ShaderRecompiler::MemoryRegion, 4> memory{{
+            {reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)},
+            {reinterpret_cast<std::uintptr_t>(Srt.data()), std::as_bytes(std::span(Srt))},
+            {reinterpret_cast<std::uintptr_t>(records.data()), std::as_bytes(std::span(records))},
+            {reinterpret_cast<std::uintptr_t>(Keys.data()), std::as_bytes(std::span(Keys))},
+        }};
+        return Execute(device, code, Srt.data(), memory, 1u, Lanes, 64u, nullptr, wait);
+    };
+    const auto row = [](std::uint32_t x) { return std::bit_cast<std::uint32_t>(FloatTexels[x]); };
+    for (std::uint32_t x = 0; x < written.size(); ++x) written[x] = -1.0f - static_cast<float>(x);
+    const auto writer = stage(writerRecords, FloatTexels.data(), written.data(), false);
+    const auto reader = stage(readerRecords, written.data(), scratch.data(), true);
+    AgcDriver::Graphics::StorageTexture::FlushPending(reinterpret_cast<std::uintptr_t>(written.data()), sizeof(written), nullptr, "test");
+    AgcDriver::Graphics::StorageTexture::FlushPending(reinterpret_cast<std::uintptr_t>(scratch.data()), sizeof(scratch), nullptr, "test");
+    device.WaitIdle();
+    Require(writer.bindlessHeap && reader.bindlessHeap, "bindless storage write: the dispatches were not served from the descriptor heap");
+    Require(!Faulted(writer) && !Faulted(reader), "bindless storage write: a dispatch faulted:\n" + writer.log + reader.log);
+    RequireRed(reader, 0, Lanes, row, "bindless storage write: the heap read of an image a preceding dispatch of the batch stored");
+    for (std::uint32_t x = 0; x < Width; ++x) Require(std::bit_cast<std::uint32_t>(written[x]) == row(x), "bindless storage write: the stored image does not hold the sampled texels at x " + std::to_string(x));
+    for (std::uint32_t x = 0; x < written.size(); ++x) written[x] = -1.0f - static_cast<float>(x);
+    const auto stale = [&](std::uint32_t x) { return std::bit_cast<std::uint32_t>(-1.0f - static_cast<float>(x)); };
+    const auto earlier = stage(readerRecords, written.data(), scratch.data(), true);
+    RequireRed(earlier, 0, Lanes, stale, "bindless storage write: the heap read of the image before the store");
+    const auto again = stage(writerRecords, FloatTexels.data(), written.data(), false);
+    const auto later = stage(readerRecords, written.data(), scratch.data(), true);
+    AgcDriver::Graphics::StorageTexture::FlushPending(reinterpret_cast<std::uintptr_t>(written.data()), sizeof(written), nullptr, "test");
+    AgcDriver::Graphics::StorageTexture::FlushPending(reinterpret_cast<std::uintptr_t>(scratch.data()), sizeof(scratch), nullptr, "test");
+    device.WaitIdle();
+    Require(!Faulted(again) && !Faulted(later), "bindless storage write: a dispatch over an entry served before the store faulted:\n" + again.log + later.log);
+    RequireRed(later, 0, Lanes, row, "bindless storage write: the heap read of an entry served before a preceding dispatch of the batch stored its image");
+}
+
 void RunBindlessOldPathTests(AgcDriver::VulkanDevice& device) {
     Fill();
     SetClassRecords();
@@ -1773,6 +1833,7 @@ int main(int argc, char** argv) {
         RunSplitRecordTests(*device);
         RunPointerStorageWriteTests(*device);
         if (BindlessHeap()) RunBindlessOldPathTests(*device);
+        if (BindlessHeap()) RunBindlessStorageWriteTests(*device);
         RunGraphicsTests(*device);
         if (BindlessHeap()) Require(device->BindlessService() != nullptr && device->BindlessService()->Totals().entries != 0u, "image table: the bindless run put no entry into the texture service");
         std::puts("image table tests passed");

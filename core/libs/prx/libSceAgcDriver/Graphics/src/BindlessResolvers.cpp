@@ -160,6 +160,7 @@ BindlessResolution DriverBindlessResolver::Commit(const BindlessPrepared& prepar
     resolution.view = state->firstLayer ? texture->FirstLayerView() : texture->View();
     Require(resolution.view != VK_NULL_HANDLE, "a bindless entry's texture has no view of the shape its mode reads");
     resolution.layout = texture->Layout();
+    Require(resolution.layout == VK_IMAGE_LAYOUT_GENERAL || resolution.layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, "a bindless entry's texture is in image layout " + std::to_string(static_cast<int>(resolution.layout)) + ", which the heap's sampled descriptors cannot read");
     resolution.value = DeviceImageValue{0u, state->mode, 0u, 0u};
     resolution.address = prepared.address;
     resolution.bytes = prepared.bytes;
