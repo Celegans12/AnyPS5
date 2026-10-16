@@ -77,6 +77,15 @@ void recordChange(void* mutation, const void* pointer, std::size_t bytes) {
     if (mutation != nullptr && bytes != 0) static_cast<MutationState*>(mutation)->changed.emplace_back(reinterpret_cast<std::uintptr_t>(pointer), bytes);
 }
 
+void publishChanges(MutationState& state) {
+    if (state.changed.empty()) return;
+    generation.fetch_add(1, std::memory_order_release);
+    if (const auto callback = invalidator.load(std::memory_order_acquire)) {
+        for (const auto& [address, bytes] : state.changed) callback(address, bytes);
+    }
+    state.changed.clear();
+}
+
 #ifndef _WIN32
 std::vector<std::pair<std::uintptr_t, std::size_t>> fileBackedWritableImage() {
     const auto image = std::filesystem::read_symlink("/proc/self/exe").string();
@@ -338,6 +347,7 @@ void GuestAllocationsRequireUnpinned_nid_postfix(void* mutation, const void* poi
         const auto waiter = pinWaiter.load(std::memory_order_acquire);
         bool progressed = false;
         if (state != nullptr && state->lock.owns_lock()) {
+            publishChanges(*state);
             state->lock.unlock();
             if (waiter != nullptr) progressed = waiter(address, bytes);
             else std::this_thread::yield();

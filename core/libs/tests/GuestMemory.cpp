@@ -1886,6 +1886,78 @@ static void CheckReadsIntoSharedWriteTracking() {
 #endif
 }
 
+static std::atomic<std::size_t> g_batchMapObservations{0};
+
+static void ObserveBatchMapWithLease(const GuestAllocations::Mapped& ranges, std::uint64_t) {
+    const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+    Require(!ranges.empty() && !lease.empty());
+    g_batchMapObservations.fetch_add(1);
+}
+
+struct BatchMapCost {
+    double mapSeconds = std::numeric_limits<double>::max();
+    double unmapSeconds = std::numeric_limits<double>::max();
+};
+
+static BatchMapCost MeasureBatchMap(std::int64_t phys, std::size_t entries, const std::vector<void*>& background) {
+    constexpr std::size_t page = 0x4000;
+    constexpr int gpuReadWrite = 0x33;
+    constexpr int mapFixed = 0x10;
+    constexpr int mapDirect = 0;
+    constexpr int unmap = 1;
+    BatchMapCost cost;
+    for (int attempt = 0; attempt < 5; ++attempt) {
+        void* reserved = nullptr;
+        Require(sceKernelReserveVirtualRange(&reserved, page * entries, 0, 0) == 0);
+        std::vector<KernelBatchMapEntry> batch(entries);
+        for (std::size_t index = 0; index < entries; ++index) batch[index] = KernelBatchMapEntry{static_cast<unsigned char*>(reserved) + page * index, static_cast<std::uint64_t>(phys) + page * index, page, gpuReadWrite, 0, 0, mapDirect};
+        const auto observed = g_batchMapObservations.load();
+        int processed = -1;
+        auto before = std::chrono::steady_clock::now();
+        Require(sceKernelBatchMap2(batch.data(), static_cast<int>(entries), &processed, mapFixed) == 0 && processed == static_cast<int>(entries));
+        cost.mapSeconds = std::min(cost.mapSeconds, std::chrono::duration<double>(std::chrono::steady_clock::now() - before).count());
+        Require(g_batchMapObservations.load() == observed + 1);
+        for (std::size_t index = 0; index < entries; ++index) {
+            Require(batch[index].start == static_cast<unsigned char*>(reserved) + page * index);
+            static_cast<volatile unsigned char*>(batch[index].start)[index % page] = static_cast<unsigned char>(index + 1);
+        }
+        for (std::size_t index = 0; index < entries && index < background.size(); ++index) Require(static_cast<unsigned char*>(background[index * 2])[index % page] == static_cast<unsigned char>(index + 1));
+        for (auto& entry : batch) entry.operation = unmap;
+        before = std::chrono::steady_clock::now();
+        Require(sceKernelBatchMap2(batch.data(), static_cast<int>(entries), &processed, mapFixed) == 0 && processed == static_cast<int>(entries));
+        cost.unmapSeconds = std::min(cost.unmapSeconds, std::chrono::duration<double>(std::chrono::steady_clock::now() - before).count());
+    }
+    return cost;
+}
+
+static void CheckBatchMapCostFollowsTheBatch() {
+    constexpr std::size_t page = 0x4000;
+    constexpr std::size_t entries = 64;
+    constexpr std::size_t few = 512;
+    constexpr std::size_t many = few * 16;
+    constexpr int gpuReadWrite = 0x33;
+    std::int64_t phys = 0;
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, page * many, 0, 0, &phys) == 0);
+    GuestAllocations::GuestAllocationsSetGpuMapObserver_nid_postfix(&ObserveBatchMapWithLease);
+    std::vector<void*> background;
+    const auto grow = [&](std::size_t pages) {
+        while (background.size() < pages * 2) {
+            void* mapped = nullptr;
+            Require(sceKernelMapDirectMemory(&mapped, page, gpuReadWrite, 0, phys + static_cast<std::int64_t>(page * (background.size() / 2)), 0) == 0);
+            background.push_back(mapped);
+        }
+    };
+    grow(few);
+    const auto small = MeasureBatchMap(phys, entries, background);
+    grow(many);
+    const auto large = MeasureBatchMap(phys, entries, background);
+    std::printf("batch map of %zu entries: %.1f / %.1f us per mapped entry and %.1f / %.1f us per unmapped entry beside %zu / %zu direct mappings\n", entries, small.mapSeconds * 1e6 / entries, large.mapSeconds * 1e6 / entries, small.unmapSeconds * 1e6 / entries, large.unmapSeconds * 1e6 / entries, few * 2, many * 2);
+    for (auto* mapped : background) Require(sceKernelMunmap(mapped, page) == 0);
+    GuestAllocations::GuestAllocationsSetGpuMapObserver_nid_postfix(nullptr);
+    Require(sceKernelReleaseDirectMemory(phys, page * many) == 0);
+    Require(large.mapSeconds <= small.mapSeconds * 4 && large.unmapSeconds <= small.unmapSeconds * 4);
+}
+
 #if defined(__linux__)
 using PageRuns = std::vector<std::pair<std::uintptr_t, std::uintptr_t>>;
 
@@ -2648,6 +2720,7 @@ int main(int argc, char** argv) {
     CheckFailedCollectKeepsWrites();
     CheckSingleDirectMappingTracksWritesWithoutFaults();
     CheckSecondDirectMappingWaitsForLeases();
+    CheckBatchMapCostFollowsTheBatch();
     CheckBreakingAResidentRunKeepsConcurrentAccesses();
     CheckRemappedDirectMemoryIsChargedOnce();
 #if defined(__linux__)
