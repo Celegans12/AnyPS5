@@ -1,7 +1,9 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_HANDOFFSPIN_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_HANDOFFSPIN_HPP
 
+#include "prx/libc/include/CpuTopology.hpp"
 #include <algorithm>
+#include <bitset>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -18,16 +20,21 @@ inline void SpinPause() {
 #endif
 }
 
-inline std::chrono::nanoseconds HandoffSpinWindowFor(const char* configured, unsigned logicalProcessors) {
+inline unsigned UsableProcessors() {
+    const auto count = static_cast<unsigned>(std::bitset<64>(CpuTopology::Get().process).count());
+    return count != 0 ? count : std::thread::hardware_concurrency();
+}
+
+inline std::chrono::nanoseconds HandoffSpinWindowFor(const char* configured, unsigned usableProcessors) {
     constexpr std::chrono::microseconds automaticWindow{150};
-    constexpr unsigned automaticProcessors = 8;
+    constexpr unsigned automaticProcessorsAbove = 8;
     constexpr long long longestWindowUs = 10000;
     if (configured != nullptr) return std::chrono::microseconds(std::clamp<long long>(std::strtoll(configured, nullptr, 10), 0, longestWindowUs));
-    return logicalProcessors >= automaticProcessors ? std::chrono::nanoseconds(automaticWindow) : std::chrono::nanoseconds::zero();
+    return usableProcessors > automaticProcessorsAbove ? std::chrono::nanoseconds(automaticWindow) : std::chrono::nanoseconds::zero();
 }
 
 inline std::chrono::nanoseconds HandoffSpinWindow() {
-    static const std::chrono::nanoseconds window = HandoffSpinWindowFor(std::getenv("APS5_HANDOFF_SPIN_US"), std::thread::hardware_concurrency());
+    static const std::chrono::nanoseconds window = HandoffSpinWindowFor(std::getenv("APS5_HANDOFF_SPIN_US"), UsableProcessors());
     return window;
 }
 

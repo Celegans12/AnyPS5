@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -21,15 +22,22 @@ void Require(bool condition, const std::string& message) {
 }
 
 void CheckWindowPolicy() {
-    Require(HandoffSpinWindowFor(nullptr, 20) == 150us, "20 logical processors do not spin for 150 us");
-    Require(HandoffSpinWindowFor(nullptr, 8) == 150us, "8 logical processors do not spin for 150 us");
-    Require(HandoffSpinWindowFor(nullptr, 7) == 0ns, "7 logical processors spin");
+    Require(HandoffSpinWindowFor(nullptr, 20) == 150us, "20 usable processors do not spin for 150 us");
+    Require(HandoffSpinWindowFor(nullptr, 9) == 150us, "9 usable processors do not spin for 150 us");
+    Require(HandoffSpinWindowFor(nullptr, 8) == 0ns, "8 usable processors spin");
+    Require(HandoffSpinWindowFor(nullptr, 4) == 0ns, "4 usable processors spin");
     Require(HandoffSpinWindowFor(nullptr, 0) == 0ns, "an unknown processor count spins");
     Require(HandoffSpinWindowFor("0", 20) == 0ns, "APS5_HANDOFF_SPIN_US=0 still spins");
     Require(HandoffSpinWindowFor("400", 2) == 400us, "APS5_HANDOFF_SPIN_US=400 does not set 400 us on 2 logical processors");
     Require(HandoffSpinWindowFor("-5", 20) == 0ns, "a negative window spins");
     Require(HandoffSpinWindowFor("text", 20) == 0ns, "a window that is no number spins");
     Require(HandoffSpinWindowFor("99999999999", 20) == 10000us, "a huge window is not limited to 10000 us");
+}
+
+void CheckUsableProcessors() {
+    const unsigned usable = AgcDriver::UsableProcessors();
+    Require(usable >= 1, "no usable processor was counted");
+    Require(usable <= (std::max)(std::thread::hardware_concurrency(), 64u), "more usable processors than the machine has");
 }
 
 void CheckSpinUntil() {
@@ -109,6 +117,7 @@ void CheckRecursion() {
 int main() {
     try {
         CheckWindowPolicy();
+        CheckUsableProcessors();
         CheckSpinUntil();
         Contend<std::mutex>(0ns, "plain lock");
         Contend<std::mutex>(50us, "spin 50 us");
