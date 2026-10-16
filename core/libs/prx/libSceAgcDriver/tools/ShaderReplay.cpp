@@ -537,6 +537,27 @@ bool Replay(const char* path, std::unique_ptr<AgcDriver::VulkanDevice>& device) 
             std::printf("  spirv hash %016llx specialization %016llx\n", static_cast<unsigned long long>(spirvHash.hash), static_cast<unsigned long long>(result.PipelineVariantId()));
         }
         std::printf("  recompiled: %zu SPIR-V words%s\n", result.spirv.size(), !g_pipelineOnly ? "" : pipelineSidecar.probes.empty() ? " (prepared invocation, page-granular accessibility)" : " (prepared invocation, the game's recorded probes)");
+        if (result.bindlessHeap) {
+            std::set<std::uint32_t> constants;
+            const auto words = result.spirv.Words();
+            for (std::size_t cursor = 5; cursor < words.size();) {
+                const auto count = words[cursor] >> 16u;
+                if (count == 0u || cursor + count > words.size()) throw std::runtime_error("bindless images: the SPIR-V is malformed");
+                if ((words[cursor] & 0xffffu) == 43u && count == 4u) constants.insert(words[cursor + 3u]);
+                cursor += count;
+            }
+            std::set<std::uint64_t> interfaces;
+            std::uint64_t records = 0;
+            for (const auto& table : result.bindlessTables) {
+                records += table.records;
+                for (const auto& use : table.uses) {
+                    if (ShaderRecompiler::ResourceMaterializer::FindBindlessInterface(use.interfaceId) == nullptr) throw std::runtime_error("bindless images: the registered interface id " + std::to_string(use.interfaceId) + " was not registered by the compile");
+                    if (!constants.contains(static_cast<std::uint32_t>(use.interfaceId)) || !constants.contains(static_cast<std::uint32_t>(use.interfaceId >> 32u))) throw std::runtime_error("bindless images: the SPIR-V does not embed the interface id " + std::to_string(use.interfaceId) + " the driver registers");
+                    interfaces.insert(use.interfaceId);
+                }
+            }
+            std::printf("  bindless: %zu table registrations, %llu records, %zu interface ids, every id embedded in the SPIR-V\n", result.bindlessTables.size(), static_cast<unsigned long long>(records), interfaces.size());
+        }
         if (g_pipelineOnly) {
             if (!device) device = std::make_unique<AgcDriver::VulkanDevice>();
             if (const auto refusal = CheckPipelineReference(path, result, *device); !refusal.empty()) throw std::runtime_error("pipeline-only " + refusal);

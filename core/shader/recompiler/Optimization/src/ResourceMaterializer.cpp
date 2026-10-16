@@ -414,6 +414,7 @@ struct ColumnRecords {
     std::vector<RecordState> states;
     std::vector<std::uint32_t> words;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> readRanges;
+    std::vector<std::uint64_t> addresses;
 };
 
 struct TableTrace {
@@ -627,6 +628,7 @@ private:
         records.words.assign(records.keys, 0u);
         const auto end = records.base + records.size;
         if (column.indirect) {
+            records.addresses.assign(records.keys, 0u);
             for (std::uint32_t record = 0; record < records.keys; record++) {
                 if (records.states[record] != RecordState::Read) continue;
                 const auto offset = column.addend + record * column.stride;
@@ -655,6 +657,7 @@ private:
                 }
                 if (records.states[record] != RecordState::Read) continue;
                 records.words[record] = WordsIndex(value);
+                records.addresses[record] = first;
                 tables.ranges.emplace_back(first, past - first);
             }
             return records;
@@ -973,6 +976,13 @@ private:
         out.outside = records.outside;
         out.codes.assign(records.keys, 0u);
         out.readRanges = records.readRanges;
+        out.pointer = column.address;
+        out.indirect = column.indirect;
+        out.addend = column.addend;
+        out.stride = column.stride;
+        out.offset = column.offset;
+        out.dwords = column.dwordCount;
+        out.addresses = records.addresses;
         TableTrace trace{records.base, records.size, records.records, records.keys, 0u, records.narrowed};
         auto& counters = tableCounters();
         if (records.fault != 0u) counters.poison[records.fault & ~ImageTableAbi::PoisonFlag].fetch_add(1, std::memory_order_relaxed);
@@ -1509,8 +1519,6 @@ BindlessInterfaceRegistry& bindlessInterfaces() {
     return registry;
 }
 
-constexpr std::size_t BindlessPrimerLimit = 1u << 20u;
-
 }
 
 bool ResourceMaterializer::BindlessImage(const ShaderInfo& info, IrShaderStage stage, std::uint32_t resource) {
@@ -1526,6 +1534,10 @@ bool ResourceMaterializer::UsesBindlessImages(const ShaderInfo& info, IrShaderSt
     return false;
 }
 
+bool ResourceMaterializer::RequiresPointSampler(const ImageResource& mode) {
+    return requiresPointSampler(mode);
+}
+
 std::uint64_t ResourceMaterializer::BindlessInterfaceId(const ImageResource& image, std::span<const ImageResource> modes) {
     auto hash = mixBindlessInterface(0xcbf29ce484222325ull, bindlessInterfaceImage(image));
     hash = (hash ^ modes.size()) * 0x100000001b3ull;
@@ -1533,30 +1545,33 @@ std::uint64_t ResourceMaterializer::BindlessInterfaceId(const ImageResource& ima
     return hash;
 }
 
+std::uint64_t ResourceMaterializer::RegisterBindlessInterface(const ImageResource& source, std::span<const ImageResource> modes) {
+    const auto image = bindlessInterfaceImage(source);
+    const auto id = BindlessInterfaceId(image, modes);
+    const auto same = [&](const BindlessInterface& entry) {
+        if (entry.image != image || entry.modes.size() != modes.size()) return false;
+        for (std::size_t index = 0; index < modes.size(); ++index) {
+            if (entry.modes[index] != bindlessInterfaceImage(modes[index])) return false;
+        }
+        return true;
+    };
+    auto& registry = bindlessInterfaces();
+    std::lock_guard lock(registry.mutex);
+    if (const auto found = registry.interfaces.find(id); found != registry.interfaces.end()) {
+        if (!same(*found->second)) throw std::runtime_error("bindless images: two image interfaces share the id 0x" + hexText(id));
+        return id;
+    }
+    auto entry = std::make_shared<BindlessInterface>();
+    entry->id = id;
+    entry->image = image;
+    for (const auto& mode : modes) entry->modes.push_back(bindlessInterfaceImage(mode));
+    registry.interfaces.emplace(id, std::move(entry));
+    return id;
+}
+
 void ResourceMaterializer::RegisterBindlessInterfaces(const ShaderInfo& info, IrShaderStage stage) {
     for (std::uint32_t resource = 0; resource < info.images.size(); ++resource) {
-        if (!BindlessImage(info, stage, resource)) continue;
-        const auto image = bindlessInterfaceImage(info.images[resource]);
-        const auto& modes = info.runtimeImageModes[resource];
-        const auto id = BindlessInterfaceId(image, modes);
-        const auto same = [&](const BindlessInterface& entry) {
-            if (entry.image != image || entry.modes.size() != modes.size()) return false;
-            for (std::size_t index = 0; index < modes.size(); ++index) {
-                if (entry.modes[index] != bindlessInterfaceImage(modes[index])) return false;
-            }
-            return true;
-        };
-        auto& registry = bindlessInterfaces();
-        std::lock_guard lock(registry.mutex);
-        if (const auto found = registry.interfaces.find(id); found != registry.interfaces.end()) {
-            if (!same(*found->second)) throw std::runtime_error("bindless images: two image interfaces share the id 0x" + hexText(id));
-            continue;
-        }
-        auto entry = std::make_shared<BindlessInterface>();
-        entry->id = id;
-        entry->image = image;
-        for (const auto& mode : modes) entry->modes.push_back(bindlessInterfaceImage(mode));
-        registry.interfaces.emplace(id, std::move(entry));
+        if (BindlessImage(info, stage, resource)) static_cast<void>(RegisterBindlessInterface(info.images[resource], info.runtimeImageModes[resource]));
     }
 }
 
@@ -1567,86 +1582,92 @@ std::shared_ptr<const BindlessInterface> ResourceMaterializer::FindBindlessInter
     return found != registry.interfaces.end() ? found->second : nullptr;
 }
 
-std::vector<BindlessImageAbi::PrimerEntry> ResourceMaterializer::BindlessPrimer(const ShaderInfo& info, IrShaderStage stage, const ResourceSnapshot& snapshot, const ResolvedImageTables& tables, std::span<const std::uint32_t> directSamplers) {
+std::vector<BindlessImageAbi::TableRegistration> ResourceMaterializer::BindlessTables(const ShaderInfo& info, IrShaderStage stage, const ResourceSnapshot& snapshot) {
     namespace Abi = ImageTableAbi;
     namespace Bindless = BindlessImageAbi;
-    std::vector<Bindless::PrimerEntry> out;
-    if (tables.map.empty()) return out;
-    const auto& map = tables.map;
-    struct Record {
-        std::array<std::uint32_t, 8> words{};
-        std::uint32_t flags = 0;
-        std::uint32_t element = 0;
+    constexpr std::uint32_t DescriptorBytes = Bindless::Table::DescriptorWords * 4u;
+    const auto& columns = snapshot.tables.tables;
+    const auto readable = [&](const ImageTableColumnSnapshot& column, std::uint32_t key, std::uint32_t dwords) -> const DescriptorValue* {
+        const auto code = column.codes[key];
+        if ((code & Abi::PoisonFlag) != 0u || code >= snapshot.tables.words.size()) return nullptr;
+        const auto& value = snapshot.tables.words[code];
+        const auto mask = static_cast<std::uint8_t>((1u << dwords) - 1u);
+        return (value.availableDwordMask & mask) == mask ? &value : nullptr;
     };
-    const auto records = [&](std::uint32_t table, bool sampler) {
-        std::vector<Record> found;
-        const auto header = Abi::TableHeader(table);
-        if (map.at(header + Abi::TableFault) != 0u) return found;
-        const auto start = map.at(header + Abi::TableMapStart);
-        const auto& column = snapshot.tables.tables.at(table);
-        std::set<std::uint32_t> seen;
-        for (std::uint32_t key = 0; key < map.at(header + Abi::TableKeyCount); ++key) {
-            const auto record = map.at(start + key);
-            const auto code = column.codes.at(key);
-            if (record == Abi::NullCode || (record & Abi::PoisonFlag) != 0u || (code & Abi::PoisonFlag) != 0u || !seen.insert(record).second) continue;
-            const auto& value = snapshot.tables.words.at(code);
-            Record entry;
-            std::copy_n(value.dwords.begin(), sampler ? 4u : 8u, entry.words.begin());
-            entry.flags = map.at(record + (sampler ? Abi::SamplerRecordFlags : Abi::ImageRecordFlags));
-            entry.element = map.at(record + (sampler ? Abi::SamplerRecordElement : Abi::ImageRecordElement));
-            found.push_back(entry);
+    const auto address = [](const ImageTableColumnSnapshot& column, std::uint32_t key) -> std::optional<std::uint64_t> {
+        if (column.indirect) return key < column.addresses.size() && column.addresses[key] != 0u ? std::optional<std::uint64_t>(column.addresses[key]) : std::nullopt;
+        const std::uint32_t offset = column.addend + key * column.stride;
+        if (column.pointer) {
+            const auto found = Abi::ScalarAddressDword(column.base, offset, column.offset);
+            return found.has_value() && (*found & 3u) == 0u ? found : std::nullopt;
         }
-        return found;
+        const auto dword = Abi::ScalarBufferDword(offset, column.offset, column.size);
+        return dword.has_value() ? std::optional<std::uint64_t>(column.base + *dword) : std::nullopt;
     };
-    const auto fault = [](std::uint32_t flags) { return (flags & Abi::PoisonFlag) != 0u ? (flags & ~Abi::PoisonFlag) + 1u : 0u; };
+    std::map<std::uint32_t, std::set<Bindless::TableUse>> uses;
     for (std::uint32_t resource = 0; resource < info.images.size(); ++resource) {
         if (!BindlessImage(info, stage, resource)) continue;
         const auto& image = info.images[resource];
-        const auto& modes = info.runtimeImageModes[resource];
-        const auto id = BindlessInterfaceId(image, modes);
-        const auto images = records(image.table, false);
-        const auto add = [&](const Record& entry, std::uint32_t samplerClass, const std::array<std::uint32_t, 4>& samplerWords, const Record* sampler, std::uint32_t direct) {
-            if (out.size() >= BindlessPrimerLimit) throw std::runtime_error("bindless images: the image table primer needs more than " + std::to_string(BindlessPrimerLimit) + " entries, which is not implemented");
-            Bindless::PrimerEntry primed;
-            primed.key = Bindless::MakeKey(std::span<const std::uint32_t, 8>(entry.words), id, samplerClass, std::span<const std::uint32_t, 4>(samplerWords));
-            primed.fault = fault(entry.flags);
-            if (primed.fault == 0u) {
-                primed.mode = (entry.flags >> Abi::ModeShift) & Abi::ModeMask;
-                primed.element = entry.element;
-            }
-            if (sampler != nullptr && primed.fault == 0u) {
-                primed.fault = fault(sampler->flags);
-                if (primed.fault == 0u) {
-                    const auto& mode = modes.at(primed.mode);
-                    primed.samplerElement = sampler->element + (mode.depthCompare ? 2u : 0u) + (requiresPointSampler(mode) ? 1u : 0u);
-                }
-            }
-            if (direct != Bindless::NoSamplerElement && primed.fault == 0u) {
-                primed.samplerElement = direct + (requiresPointSampler(modes.at(primed.mode)) ? 1u : 0u);
-                primed.directSampler = true;
-            }
-            out.push_back(primed);
-        };
-        const std::array<std::uint32_t, 4> none{};
-        for (const auto& entry : images) add(entry, Bindless::NoSamplerClass, none, nullptr, Bindless::NoSamplerElement);
+        if (image.table >= columns.size() || columns[image.table].fault != 0u) continue;
+        const auto id = BindlessInterfaceId(image, info.runtimeImageModes[resource]);
+        auto& tableUses = uses[image.table];
+        bool paired = false;
         for (const auto& pair : info.sampledPairs) {
             if (pair.image != resource) continue;
+            paired = true;
             const auto& sampler = info.samplers.at(pair.sampler);
             if (sampler.table == NoTable) {
-                std::array<std::uint32_t, 4> direct{};
-                std::copy_n(snapshot.samplers.at(pair.sampler).dwords.begin(), 4u, direct.begin());
-                const auto element = std::find(directSamplers.begin(), directSamplers.end(), pair.sampler);
-                if (element == directSamplers.end()) throw std::runtime_error("bindless images: a direct sampler paired with a table image is absent from the sampler binding");
-                for (const auto& entry : images) add(entry, Bindless::DirectSamplerClass, direct, nullptr, static_cast<std::uint32_t>(element - directSamplers.begin()));
+                Bindless::TableUse use{id, Bindless::DirectSamplerClass, {}};
+                std::copy_n(snapshot.samplers.at(pair.sampler).dwords.begin(), use.sampler.size(), use.sampler.begin());
+                tableUses.insert(use);
                 continue;
             }
-            for (const auto& samplerRecord : records(sampler.table, true)) {
-                std::array<std::uint32_t, 4> samplerWords{};
-                std::copy_n(samplerRecord.words.begin(), 4u, samplerWords.begin());
-                for (const auto& entry : images) add(entry, Bindless::TableSamplerClass, samplerWords, &samplerRecord, Bindless::NoSamplerElement);
+            if (sampler.table >= columns.size() || columns[sampler.table].fault != 0u) continue;
+            const auto& samplerColumn = columns[sampler.table];
+            for (std::uint32_t key = 0; key < samplerColumn.codes.size(); ++key) {
+                const auto* words = readable(samplerColumn, key, Bindless::Table::SamplerWords);
+                if (words == nullptr) continue;
+                Bindless::TableUse use{id, Bindless::TableSamplerClass, {}};
+                std::copy_n(words->dwords.begin(), use.sampler.size(), use.sampler.begin());
+                tableUses.insert(use);
             }
         }
+        const bool unsampled = (image.levelUses & (ImageLevelUseQuery | ImageLevelUseLoad | ImageLevelUseMipLoad)) != 0u || image.byElements != 0u;
+        if (!paired || unsampled) tableUses.insert(Bindless::TableUse{id, Bindless::NoSamplerClass, {}});
     }
+    std::map<std::tuple<std::uint64_t, std::uint32_t, std::uint32_t, std::uint32_t>, std::set<Bindless::TableUse>> runs;
+    for (const auto& [table, tableUses] : uses) {
+        if (tableUses.empty()) continue;
+        const auto& column = columns[table];
+        const auto dwords = column.dwords;
+        if (dwords == 0u || dwords > Bindless::Table::DescriptorWords) continue;
+        const bool linear = !column.indirect && column.stride >= dwords * 4u && column.stride % 4u == 0u;
+        const auto stride = linear ? column.stride : DescriptorBytes;
+        std::uint64_t first = 0;
+        std::uint32_t count = 0;
+        const auto flush = [&] {
+            if (count != 0u) runs[{first, count, stride, dwords}].insert(tableUses.begin(), tableUses.end());
+            count = 0;
+        };
+        for (std::uint32_t key = 0; key < column.codes.size(); ++key) {
+            const auto at = readable(column, key, dwords) != nullptr ? address(column, key) : std::nullopt;
+            if (!at.has_value()) {
+                flush();
+                continue;
+            }
+            if (count != 0u && *at == first + static_cast<std::uint64_t>(count) * stride) {
+                ++count;
+                continue;
+            }
+            flush();
+            first = *at;
+            count = 1;
+        }
+        flush();
+    }
+    std::vector<Bindless::TableRegistration> out;
+    out.reserve(runs.size());
+    for (const auto& [run, runUses] : runs) out.push_back({std::get<0>(run), std::get<1>(run), std::get<2>(run), std::vector<Bindless::TableUse>(runUses.begin(), runUses.end()), std::get<3>(run)});
     return out;
 }
 

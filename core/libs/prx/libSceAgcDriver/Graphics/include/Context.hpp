@@ -34,7 +34,6 @@ class ShaderResources;
 class PlaceholderImages;
 class VertexInputCache;
 class BindlessTable;
-class BindlessPrimer;
 class TextureService;
 
 class PipelineCacheSynchronization {
@@ -223,7 +222,6 @@ struct Context {
     bool bufferInt64Atomics = false;
     const PlaceholderImages* placeholderImages = nullptr;
     BindlessTable* bindlessTable = nullptr;
-    BindlessPrimer* bindlessPrimer = nullptr;
     TextureService* textureService = nullptr;
     bool viewportIndexLayer = false;
     bool demoteToHelperInvocation = false;

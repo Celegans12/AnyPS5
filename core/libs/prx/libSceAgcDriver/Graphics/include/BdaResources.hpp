@@ -57,6 +57,7 @@ private:
     std::size_t tableBytes = 0;
     std::vector<ImageTableFaults> imageTables;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> imageTableRanges;
+    const TextureService* textureService = nullptr;
 };
 
 }

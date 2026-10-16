@@ -592,13 +592,16 @@ void encodeInvocation(Writer& writer, const ShaderInvocation& invocation) {
     writer.Value(invocation.imageTableFaults);
     writer.Value(invocation.hasDeferredDirectImage);
     writer.Value(invocation.hasGuardedUnnormalizedWrap);
-    writer.List(invocation.bindlessPrimer, [](Writer& out, const BindlessImageAbi::PrimerEntry& entry) {
-        for (const auto word : entry.key) out.Value(word);
-        out.Value(entry.element);
-        out.Value(entry.mode);
-        out.Value(entry.fault);
-        out.Value(entry.samplerElement);
-        out.Value(entry.directSampler);
+    writer.List(invocation.bindlessTables, [](Writer& out, const BindlessImageAbi::TableRegistration& table) {
+        out.Value(table.base);
+        out.Value(table.records);
+        out.Value(table.stride);
+        out.List(table.uses, [](Writer& use, const BindlessImageAbi::TableUse& entry) {
+            use.Value(entry.interfaceId);
+            use.Value(entry.samplerClass);
+            for (const auto word : entry.sampler) use.Value(word);
+        });
+        out.Value(table.dwords);
     });
 }
 
@@ -641,13 +644,16 @@ void decodeInvocation(Reader& reader, ShaderInvocation& invocation) {
     reader.Value(invocation.imageTableFaults);
     reader.Value(invocation.hasDeferredDirectImage);
     reader.Value(invocation.hasGuardedUnnormalizedWrap);
-    reader.List(invocation.bindlessPrimer, 77, [](Reader& in, BindlessImageAbi::PrimerEntry& entry) {
-        for (auto& word : entry.key) in.Value(word);
-        in.Value(entry.element);
-        in.Value(entry.mode);
-        in.Value(entry.fault);
-        in.Value(entry.samplerElement);
-        in.Value(entry.directSampler);
+    reader.List(invocation.bindlessTables, 24, [](Reader& in, BindlessImageAbi::TableRegistration& table) {
+        in.Value(table.base);
+        in.Value(table.records);
+        in.Value(table.stride);
+        in.List(table.uses, 28, [](Reader& use, BindlessImageAbi::TableUse& entry) {
+            use.Value(entry.interfaceId);
+            use.Value(entry.samplerClass);
+            for (auto& word : entry.sampler) use.Value(word);
+        });
+        in.Value(table.dwords);
     });
 }
 

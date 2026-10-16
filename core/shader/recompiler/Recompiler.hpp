@@ -591,7 +591,7 @@ struct ShaderInvocation {
     std::uint32_t imageTableFaults = 0;
     bool hasDeferredDirectImage = false;
     bool hasGuardedUnnormalizedWrap = false;
-    std::vector<BindlessImageAbi::PrimerEntry> bindlessPrimer;
+    std::vector<BindlessImageAbi::TableRegistration> bindlessTables;
 };
 
 struct RecompileResult : CompiledShaderArtifact, ShaderInvocation {

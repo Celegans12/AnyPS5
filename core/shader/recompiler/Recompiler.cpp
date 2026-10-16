@@ -1250,13 +1250,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         result.imageTableShader = snapshot.tables.shader;
         result.imageTableFaults = tables.faults;
     }
-    if (artifact.bindlessHeap) {
-        std::span<const std::uint32_t> directSamplers;
-        for (const auto& binding : bindingPlan->bindings) {
-            if (binding.descriptor.role == DescriptorRole::GuestSamplers) directSamplers = binding.resources;
-        }
-        result.bindlessPrimer = ResourceMaterializer::BindlessPrimer(variant.info.info, variant.info.stage, snapshot, tables, directSamplers);
-    }
+    if (artifact.bindlessHeap) result.bindlessTables = ResourceMaterializer::BindlessTables(variant.info.info, variant.info.stage, snapshot);
     return result;
 }
 

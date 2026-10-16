@@ -22,7 +22,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BindlessTable.hpp"
-#include "prx/libSceAgcDriver/Graphics/include/BindlessPrimer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BindlessResolvers.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureService.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
@@ -303,7 +302,6 @@ struct VulkanDevice::State {
     bool updateUnusedWhilePending = false;
     bool bindlessImages = false;
     std::unique_ptr<Graphics::BindlessTable> bindlessTable;
-    std::unique_ptr<Graphics::BindlessPrimer> bindlessPrimer;
     std::unique_ptr<Graphics::TextureService> textureService;
     VkPhysicalDeviceDescriptorIndexingPropertiesEXT descriptorIndexingProperties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_PROPERTIES_EXT};
     bool imageInt64Atomics = false;
@@ -722,7 +720,6 @@ struct VulkanDevice::State {
             Graphics::DestroyShadows(device);
             textureService.reset();
             recorder.reset();
-            bindlessPrimer.reset();
             bindlessTable.reset();
             // Cached graphics pipelines (with their framebuffers, modules, render passes and layouts)
             // belong to this device and must be destroyed while it lives.
@@ -1897,7 +1894,6 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         const auto& limits = state->descriptorIndexingProperties;
         std::fprintf(stderr, "[bindless] heap: %u sampled images, %u storage images, %u samplers (update-after-bind limits per stage: %u sampled, %u storage, %u samplers, %u resources; per set: %u sampled, %u storage, %u samplers; maxSamplerAllocationCount %u)\n", capacities.sampledImages, capacities.storageImages, capacities.samplers, limits.maxPerStageDescriptorUpdateAfterBindSampledImages, limits.maxPerStageDescriptorUpdateAfterBindStorageImages, limits.maxPerStageDescriptorUpdateAfterBindSamplers, limits.maxPerStageUpdateAfterBindResources, limits.maxDescriptorSetUpdateAfterBindSampledImages, limits.maxDescriptorSetUpdateAfterBindStorageImages, limits.maxDescriptorSetUpdateAfterBindSamplers, state->properties.limits.maxSamplerAllocationCount);
         state->bindlessTable = std::make_unique<Graphics::BindlessTable>(context, capacities);
-        state->bindlessPrimer = std::make_unique<Graphics::BindlessPrimer>(*state->bindlessTable);
     }
     state->context = buildContext();
     state->contextReady = true;
@@ -3498,6 +3494,10 @@ bool VulkanDevice::TextureServiceRunning() const {
     return state->textureService != nullptr;
 }
 
+const Graphics::TextureService* VulkanDevice::BindlessService() const {
+    return state->textureService.get();
+}
+
 void VulkanDevice::BindlessPresentWait() {
     if (!state->textureService || !state->recorder) return;
     const auto started = std::chrono::steady_clock::now();
@@ -3602,7 +3602,7 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.bufferInt64Atomics = state->bufferInt64Atomics;
     context.placeholderImages = state->placeholderImages.get();
     context.bindlessTable = state->bindlessTable.get();
-    context.bindlessPrimer = state->bindlessPrimer.get();
+    context.textureService = state->textureService.get();
     context.viewportIndexLayer = state->viewportIndexLayer;
     context.demoteToHelperInvocation = state->demoteToHelperInvocation;
     context.earlyFragmentSampleMaskTestBeforeSampleCounting = state->earlyFragmentSampleMaskTestBeforeSampleCounting;
@@ -4194,6 +4194,7 @@ std::shared_ptr<PreparedDispatch> VulkanDevice::PrepareDispatch(const ShaderReco
     const auto start = std::chrono::steady_clock::now();
     const Graphics::CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &shader, 0};
     const auto context = graphicsContext();
+    if (shader.bindlessHeap) Graphics::PrimeBindlessTables(context, shader.bindlessTables);
     auto prepared = std::make_shared<PreparedDispatch>();
     prepared->dispatchThreads = dispatchThreads;
     // A cached build (the map locks itself) is revalidated under the mutex by the dispatch, which
@@ -4405,9 +4406,10 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     VkAccessFlags covered = 0;
     const auto commands = recorder.Commands(&covered);
     if (record.shader->program->bindlessHeap) {
-        require(context.bindlessTable != nullptr && context.bindlessPrimer != nullptr, "a bindless image dispatch needs the device's descriptor heap");
-        resources.PrimeBindless(*context.bindlessPrimer);
-        context.bindlessTable->Publish(recorder);
+        require(context.bindlessTable != nullptr && context.textureService != nullptr, "a bindless image dispatch needs the device's descriptor heap and texture service");
+        std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
+        if (!GuestMemory::GpuMutex().HeldByThisThread()) gpuLock.lock();
+        Graphics::ServeBindlessTables(context, recorder, record.shader->program->bindlessTables);
         covered = 0;
     }
     recordStep(PhaseRecordCommands);

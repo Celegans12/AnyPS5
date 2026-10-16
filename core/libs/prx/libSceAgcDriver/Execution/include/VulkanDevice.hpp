@@ -22,6 +22,7 @@ namespace AgcDriver {
 
 namespace Graphics {
 class StorageTexture;
+class TextureService;
 }
 
 // Stage A of a dispatch's resource build (see VulkanDevice::PrepareDispatch); opaque to callers.
@@ -53,6 +54,7 @@ public:
     std::uint32_t BindlessEntries() const;
     std::vector<Graphics::DeviceImageMiss> TakeBindlessMisses();
     bool TextureServiceRunning() const;
+    const Graphics::TextureService* BindlessService() const;
     void BindlessPresentWait();
     ShaderRecompiler::SpirvTarget ComputeTarget(std::uint32_t waveSize) const;
     // Distinguishes this device from every earlier one in the process (a memo keyed by the device

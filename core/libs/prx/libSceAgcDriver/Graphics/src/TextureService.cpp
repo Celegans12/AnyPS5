@@ -96,14 +96,14 @@ TextureService::~TextureService() {
 }
 
 std::uint64_t TextureService::Register(const BindlessTableRegistration& registration) {
-    Require(registration.records != 0 && registration.stride >= Abi::DescriptorWords * 4u && registration.stride % 4u == 0u && !registration.uses.empty(), "a bindless table registration needs records, a stride of at least one T# in whole dwords and at least one use");
+    Require(registration.records != 0 && registration.dwords != 0u && registration.dwords <= Abi::DescriptorWords && registration.stride >= registration.dwords * 4u && registration.stride % 4u == 0u && !registration.uses.empty(), "a bindless table registration needs records, 1-8 T# dwords, a stride of at least those dwords in whole dwords and at least one use");
     std::lock_guard lock(mutex);
     if (const auto found = ids.find(registration); found != ids.end()) return found->second;
     const auto id = nextId++;
     auto& tracked = tables[id];
     tracked.id = id;
     tracked.registration = registration;
-    tracked.span = static_cast<std::uint64_t>(registration.records - 1u) * registration.stride + Abi::DescriptorWords * 4u;
+    tracked.span = static_cast<std::uint64_t>(registration.records - 1u) * registration.stride + registration.dwords * 4u;
     tracked.firstPage = registration.base & ~(PageBytes - 1u);
     tracked.registeredAt = static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
     tracked.evictionEpoch = evictionEpoch;
@@ -167,13 +167,15 @@ void TextureService::readTable(Tracked& tracked) {
     const auto pages = static_cast<std::size_t>((registration.base + tracked.span - tracked.firstPage + PageBytes - 1u) / PageBytes);
     std::vector<std::uint32_t> words(static_cast<std::size_t>(registration.records) * Abi::DescriptorWords, 0u);
     const auto generation = memory->Collect(registration.base, static_cast<std::size_t>(tracked.span));
-    bool mapped = true;
-    if (registration.stride == Abi::DescriptorWords * 4u) {
-        mapped = memory->Read(registration.base, words);
-    } else {
-        for (std::uint32_t record = 0; mapped && record < registration.records; ++record) mapped = memory->Read(registration.base + static_cast<std::uint64_t>(record) * registration.stride, std::span<std::uint32_t>(words).subspan(static_cast<std::size_t>(record) * Abi::DescriptorWords, Abi::DescriptorWords));
+    bool mapped = registration.dwords == Abi::DescriptorWords && registration.stride == Abi::DescriptorWords * 4u && memory->Read(registration.base, words);
+    if (!mapped) {
+        std::fill(words.begin(), words.end(), 0u);
+        for (std::uint32_t record = 0; record < registration.records; ++record) {
+            const auto slot = std::span<std::uint32_t>(words).subspan(static_cast<std::size_t>(record) * Abi::DescriptorWords, registration.dwords);
+            if (memory->Read(registration.base + static_cast<std::uint64_t>(record) * registration.stride, slot)) mapped = true;
+            else std::fill(slot.begin(), slot.end(), 0u);
+        }
     }
-    if (!mapped) std::fill(words.begin(), words.end(), 0u);
     Tracked shape;
     shape.registration = registration;
     shape.words = std::move(words);
@@ -279,7 +281,14 @@ BindlessResolution TextureService::settle(const BindlessPrepared& prepared) {
     return resolver->Commit(prepared);
 }
 
-std::uint32_t TextureService::refuse(const DeviceImageKeys::Key& key, const std::string& message) {
+std::uint32_t TextureService::refuse(const DeviceImageKeys::Key& key, const std::string& reason) {
+    std::string message = "(words";
+    for (std::uint32_t word = 0; word < Abi::DescriptorWords; ++word) {
+        char text[12];
+        std::snprintf(text, sizeof(text), " %08x", key[word]);
+        message += text;
+    }
+    message += "): rejected by the driver: " + reason;
     if (const auto found = rejectionIndex.find(key); found != rejectionIndex.end()) {
         rejections[found->second] = message;
         return found->second + 1u;
@@ -391,6 +400,7 @@ void TextureService::place(const DeviceImageKeys::Key& key, BindlessResolution r
     }
     const bool perUse = resolution.perUse;
     entries[key] = Entry{value, std::move(resolution), lastUsed};
+    ++surfaceEpoch;
     if (perUse) perUseKeys.insert(key);
 }
 
@@ -399,6 +409,7 @@ BindlessResolution TextureService::take(const DeviceImageKeys::Key& key) {
     Require(found != entries.end(), "the texture service dropped an entry it does not hold");
     auto resolution = std::move(found->second.resolution);
     entries.erase(found);
+    ++surfaceEpoch;
     perUseKeys.erase(key);
     return resolution;
 }
@@ -522,14 +533,15 @@ void TextureService::redecode(Tracked& tracked, Recorder& recorder, Lock& lock) 
         if (first >= last || memory->Unchanged(first, static_cast<std::size_t>(last - first), generations[page])) continue;
         ++pagesChanged;
         generations[page] = memory->Collect(first, static_cast<std::size_t>(last - first));
-        const auto firstRecord = static_cast<std::uint32_t>(first - registration.base < Abi::DescriptorWords * 4u ? 0u : (first - registration.base - Abi::DescriptorWords * 4u) / registration.stride + 1u);
+        const auto recordBytes = registration.dwords * 4u;
+        const auto firstRecord = static_cast<std::uint32_t>(first - registration.base < recordBytes ? 0u : (first - registration.base - recordBytes) / registration.stride + 1u);
         for (auto record = firstRecord; record < registration.records; ++record) {
             const auto address = registration.base + static_cast<std::uint64_t>(record) * registration.stride;
             if (address >= last) break;
-            if (address + Abi::DescriptorWords * 4u <= first) continue;
+            if (address + recordBytes <= first) continue;
             std::vector<std::uint32_t> words(Abi::DescriptorWords, 0u);
             ++recordsRead;
-            if (!memory->Read(address, words)) std::fill(words.begin(), words.end(), 0u);
+            if (!memory->Read(address, std::span<std::uint32_t>(words).first(registration.dwords))) std::fill(words.begin(), words.end(), 0u);
             if (std::equal(words.begin(), words.end(), tracked.words.begin() + static_cast<std::ptrdiff_t>(record) * Abi::DescriptorWords)) continue;
             rewritten.emplace_back(record, std::move(words));
         }
@@ -569,6 +581,50 @@ void TextureService::reverify(Tracked& tracked, Recorder& recorder, Lock& lock) 
     for (const auto& key : wanted) prepared.push_back(prepare(key));
     lock.lock();
     commitPrepared(prepared, recorder, lock);
+}
+
+void TextureService::revalidateServed(Tracked& tracked, Recorder& recorder, Lock& lock) {
+    if (tracked.surfaceEpoch != surfaceEpoch) {
+        tracked.surfaceKeys.clear();
+        tracked.surfaces.clear();
+        std::set<DeviceImageKeys::Key> seen;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+        for (std::uint32_t record = 0; record < tracked.registration.records; ++record) {
+            for (const auto& key : recordKeys(tracked, record)) {
+                if (!seen.insert(key).second) continue;
+                const auto found = entries.find(key);
+                if (found == entries.end() || found->second.resolution.owner == nullptr || found->second.resolution.bytes == 0u) continue;
+                tracked.surfaceKeys.push_back(key);
+                ranges.emplace_back(found->second.resolution.address, found->second.resolution.address + found->second.resolution.bytes);
+            }
+        }
+        std::sort(ranges.begin(), ranges.end());
+        for (const auto& range : ranges) {
+            if (!tracked.surfaces.empty() && range.first <= tracked.surfaces.back().second) tracked.surfaces.back().second = std::max(tracked.surfaces.back().second, range.second);
+            else tracked.surfaces.push_back(range);
+        }
+        tracked.surfaceEpoch = surfaceEpoch;
+    }
+    if (tracked.surfaceKeys.empty()) return;
+    const auto surfaces = tracked.surfaces;
+    const auto keys = tracked.surfaceKeys;
+    lock.unlock();
+    for (const auto& [begin, end] : surfaces) memory->Collect(begin, static_cast<std::size_t>(end - begin));
+    lock.lock();
+    std::vector<DeviceImageKeys::Key> stale;
+    for (const auto& key : keys) {
+        const auto found = entries.find(key);
+        if (found == entries.end() || found->second.resolution.owner == nullptr) continue;
+        const auto& resolution = found->second.resolution;
+        ++totals.servedChecked;
+        if (resolution.bytes == 0u || (memory->Unchanged(resolution.address, static_cast<std::size_t>(resolution.bytes), resolution.generation) && resolver->Current(resolution))) continue;
+        stale.push_back(key);
+    }
+    for (const auto& key : stale) {
+        if (!entries.contains(key)) continue;
+        ++totals.servedStale;
+        replace(key, recorder, lock);
+    }
 }
 
 void TextureService::resolveMisses(Recorder& recorder, Lock& lock) {
@@ -677,10 +733,11 @@ void TextureService::Serve(std::span<const std::uint64_t> served, Recorder& reco
             tracked.lastUsed = serial;
             if (tracked.state != TableState::Done) {
                 completeTable(tracked, recorder, lock);
-                continue;
+            } else {
+                redecode(tracked, recorder, lock);
+                if (tracked.evictionEpoch != evictionEpoch) reverify(tracked, recorder, lock);
             }
-            redecode(tracked, recorder, lock);
-            if (tracked.evictionEpoch != evictionEpoch) reverify(tracked, recorder, lock);
+            revalidateServed(tracked, recorder, lock);
         }
         resolveMisses(recorder, lock);
         refreshPerUse(recorder, lock);
@@ -798,8 +855,8 @@ std::string TextureService::TakeFrameLine(std::uint64_t oldPathNanoseconds) {
     reportedOldPath = oldPathNanoseconds;
     const auto delta = [](std::uint64_t current, std::uint64_t previous) { return static_cast<unsigned long long>(current - previous); };
     char text[1024];
-    std::snprintf(text, sizeof(text), "[bindless] frame %llu: misses %llu (%llu dropped), created %llu, refused %llu, primed %llu tables (%llu records, %llu new keys, primer %.1f ms), re-decoded %llu pages (%llu records changed), queue %llu, revalidated %llu (%llu stale, %llu per-use), retired %llu (%llu unmapped, %llu evicted, %llu full), serve %.1f ms over %llu calls, present wait %.1f ms, entries %llu, slots %llu+%llu, pinned %.1f MiB, old-path resolve %.1f ms",
-        static_cast<unsigned long long>(frame), delta(now.misses, reported.misses), static_cast<unsigned long long>(dropped), delta(now.created, reported.created), delta(now.refused, reported.refused), delta(now.primed, reported.primed), delta(now.primedRecords, reported.primedRecords), delta(now.primedKeys, reported.primedKeys), Milliseconds(now.primerNanoseconds - reported.primerNanoseconds), delta(now.pagesChanged, reported.pagesChanged), delta(now.recordsChanged, reported.recordsChanged), static_cast<unsigned long long>(now.queued), delta(now.revalidated, reported.revalidated), delta(now.stale, reported.stale), delta(now.refreshed, reported.refreshed), delta(now.retired, reported.retired), delta(now.unmapped, reported.unmapped), delta(now.evicted, reported.evicted), delta(now.fullEvictions, reported.fullEvictions), Milliseconds(now.serveNanoseconds - reported.serveNanoseconds), delta(now.serves, reported.serves), Milliseconds(now.presentWaitNanoseconds - reported.presentWaitNanoseconds), static_cast<unsigned long long>(now.entries), static_cast<unsigned long long>(now.imageSlots), static_cast<unsigned long long>(now.samplerSlots), static_cast<double>(now.pinnedBytes) / static_cast<double>(1u << 20u), Milliseconds(oldPath));
+    std::snprintf(text, sizeof(text), "[bindless] frame %llu: misses %llu (%llu dropped), created %llu, refused %llu, primed %llu tables (%llu records, %llu new keys, primer %.1f ms), re-decoded %llu pages (%llu records changed), served-checked %llu (%llu stale), queue %llu, revalidated %llu (%llu stale, %llu per-use), retired %llu (%llu unmapped, %llu evicted, %llu full), serve %.1f ms over %llu calls, present wait %.1f ms, entries %llu, slots %llu+%llu, pinned %.1f MiB, old-path resolve %.1f ms",
+        static_cast<unsigned long long>(frame), delta(now.misses, reported.misses), static_cast<unsigned long long>(dropped), delta(now.created, reported.created), delta(now.refused, reported.refused), delta(now.primed, reported.primed), delta(now.primedRecords, reported.primedRecords), delta(now.primedKeys, reported.primedKeys), Milliseconds(now.primerNanoseconds - reported.primerNanoseconds), delta(now.pagesChanged, reported.pagesChanged), delta(now.recordsChanged, reported.recordsChanged), delta(now.servedChecked, reported.servedChecked), delta(now.servedStale, reported.servedStale), static_cast<unsigned long long>(now.queued), delta(now.revalidated, reported.revalidated), delta(now.stale, reported.stale), delta(now.refreshed, reported.refreshed), delta(now.retired, reported.retired), delta(now.unmapped, reported.unmapped), delta(now.evicted, reported.evicted), delta(now.fullEvictions, reported.fullEvictions), Milliseconds(now.serveNanoseconds - reported.serveNanoseconds), delta(now.serves, reported.serves), Milliseconds(now.presentWaitNanoseconds - reported.presentWaitNanoseconds), static_cast<unsigned long long>(now.entries), static_cast<unsigned long long>(now.imageSlots), static_cast<unsigned long long>(now.samplerSlots), static_cast<double>(now.pinnedBytes) / static_cast<double>(1u << 20u), Milliseconds(oldPath));
     reported = now;
     return text;
 }

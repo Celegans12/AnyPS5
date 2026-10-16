@@ -3,8 +3,10 @@
 
 #include "DeviceImageTableAbi.hpp"
 #include <array>
+#include <compare>
 #include <cstdint>
 #include <span>
+#include <vector>
 
 namespace ShaderRecompiler::BindlessImageAbi {
 
@@ -66,17 +68,25 @@ inline constexpr std::uint32_t HeaderBinding = 3u;
 inline constexpr std::uint32_t NoSamplerClass = 0u;
 inline constexpr std::uint32_t DirectSamplerClass = 1u << 30u;
 inline constexpr std::uint32_t TableSamplerClass = Table::RuntimeSampler;
-inline constexpr std::uint32_t NoSamplerElement = 0xffffffffu;
 
-struct PrimerEntry {
-    Table::Key key{};
-    std::uint32_t element = 0;
-    std::uint32_t mode = 0;
-    std::uint32_t fault = 0;
-    std::uint32_t samplerElement = NoSamplerElement;
-    bool directSampler = false;
+struct TableUse {
+    std::uint64_t interfaceId = 0;
+    std::uint32_t samplerClass = 0;
+    std::array<std::uint32_t, Table::SamplerWords> sampler{};
 
-    bool operator==(const PrimerEntry& other) const = default;
+    bool operator==(const TableUse& other) const = default;
+    auto operator<=>(const TableUse& other) const = default;
+};
+
+struct TableRegistration {
+    std::uint64_t base = 0;
+    std::uint32_t records = 0;
+    std::uint32_t stride = Table::DescriptorWords * 4u;
+    std::vector<TableUse> uses;
+    std::uint32_t dwords = Table::DescriptorWords;
+
+    bool operator==(const TableRegistration& other) const = default;
+    auto operator<=>(const TableRegistration& other) const = default;
 };
 
 }

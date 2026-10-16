@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/BindlessTable.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DeviceImageKeys.hpp"
+#include "BindlessImageAbi.hpp"
 #include "DeviceImageTableAbi.hpp"
 #include <array>
 #include <atomic>
@@ -24,24 +25,8 @@ namespace AgcDriver::Graphics {
 
 class Recorder;
 
-struct BindlessUse {
-    std::uint64_t interfaceId = 0;
-    std::uint32_t samplerClass = 0;
-    std::array<std::uint32_t, ShaderRecompiler::DeviceImageTableAbi::SamplerWords> sampler{};
-
-    bool operator==(const BindlessUse& other) const = default;
-    auto operator<=>(const BindlessUse& other) const = default;
-};
-
-struct BindlessTableRegistration {
-    std::uint64_t base = 0;
-    std::uint32_t records = 0;
-    std::uint32_t stride = ShaderRecompiler::DeviceImageTableAbi::DescriptorWords * 4u;
-    std::vector<BindlessUse> uses;
-
-    bool operator==(const BindlessTableRegistration& other) const = default;
-    auto operator<=>(const BindlessTableRegistration& other) const = default;
-};
+using BindlessUse = ShaderRecompiler::BindlessImageAbi::TableUse;
+using BindlessTableRegistration = ShaderRecompiler::BindlessImageAbi::TableRegistration;
 
 struct BindlessPrepared {
     DeviceImageKeys::Key key{};
@@ -113,6 +98,8 @@ public:
         std::uint64_t recordsChanged = 0;
         std::uint64_t revalidated = 0;
         std::uint64_t stale = 0;
+        std::uint64_t servedChecked = 0;
+        std::uint64_t servedStale = 0;
         std::uint64_t refreshed = 0;
         std::uint64_t retired = 0;
         std::uint64_t unmapped = 0;
@@ -165,6 +152,9 @@ private:
         std::vector<BindlessPrepared> pending;
         std::uint64_t lastUsed = 0;
         std::uint64_t evictionEpoch = 0;
+        std::uint64_t surfaceEpoch = ~std::uint64_t{0};
+        std::vector<DeviceImageKeys::Key> surfaceKeys;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> surfaces;
         std::uint64_t registeredAt = 0;
         std::uint64_t primerNanoseconds = 0;
         bool unmapped = false;
@@ -199,7 +189,7 @@ private:
     BindlessResolution take(const DeviceImageKeys::Key& key);
     void replace(const DeviceImageKeys::Key& key, Recorder& recorder, Lock& lock);
     BindlessResolution settle(const BindlessPrepared& prepared);
-    std::uint32_t refuse(const DeviceImageKeys::Key& key, const std::string& message);
+    std::uint32_t refuse(const DeviceImageKeys::Key& key, const std::string& reason);
     std::uint32_t acquireImage(VkImageView view, VkImageLayout layout);
     std::uint32_t acquireSampler(VkSampler sampler);
     void releaseResolution(const BindlessResolution& resolution, Recorder& recorder);
@@ -208,6 +198,7 @@ private:
     bool evictIdle(Recorder& recorder, std::size_t wanted, std::uint64_t idleBefore, std::uint64_t targetBytes);
     void redecode(Tracked& table, Recorder& recorder, Lock& lock);
     void reverify(Tracked& table, Recorder& recorder, Lock& lock);
+    void revalidateServed(Tracked& table, Recorder& recorder, Lock& lock);
     void resolveMisses(Recorder& recorder, Lock& lock);
     void refreshPerUse(Recorder& recorder, Lock& lock);
     void checkMapping(Recorder& recorder);
@@ -235,6 +226,7 @@ private:
     std::uint64_t nextId = 1;
     std::uint64_t evictionEpoch = 0;
     std::uint64_t mappingSerial = 0;
+    std::uint64_t surfaceEpoch = 0;
     std::uint64_t pinnedBytes = 0;
     std::uint64_t lastRings = 0;
     std::uint64_t lastDropped = 0;

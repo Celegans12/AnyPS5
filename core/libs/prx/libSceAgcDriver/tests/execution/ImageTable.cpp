@@ -3,9 +3,11 @@
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureService.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "Recompiler.hpp"
 #include "ImageTableAbi.hpp"
+#include "Optimization/ResourceMaterializer.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "VulkanTestDevice.hpp"
 #include <algorithm>
@@ -19,6 +21,7 @@
 #include <iostream>
 #include <iterator>
 #include <memory>
+#include <set>
 #include <span>
 #include <string>
 #include <string_view>
@@ -351,7 +354,7 @@ struct Outcome {
     bool guardedWrap = false;
     bool faultBuffer = false;
     bool bindlessHeap = false;
-    std::size_t bindlessPrimer = 0;
+    std::vector<ShaderRecompiler::BindlessImageAbi::TableRegistration> bindlessTables;
     std::vector<std::array<std::uint32_t, 4>> samplers;
     std::vector<std::array<std::uint32_t, 4>> samplerTable;
     std::vector<std::vector<std::pair<std::uint64_t, std::uint64_t>>> imageTableReadRanges;
@@ -391,7 +394,24 @@ Outcome Execute(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> 
     outcome.cacheable = AgcDriver::DriverDetail::CacheableResult(result);
     outcome.imageTableReadRanges = result.imageTableReadRanges;
     outcome.bindlessHeap = result.bindlessHeap;
-    outcome.bindlessPrimer = result.bindlessPrimer.size();
+    outcome.bindlessTables = result.bindlessTables;
+    if (result.bindlessHeap) {
+        std::set<std::uint32_t> constants;
+        const auto words = result.spirv.Words();
+        for (std::size_t cursor = 5; cursor < words.size();) {
+            const auto count = words[cursor] >> 16u;
+            Require(count != 0u && cursor + count <= words.size(), "bindless heap: the SPIR-V is malformed");
+            if ((words[cursor] & 0xffffu) == 43u && count == 4u) constants.insert(words[cursor + 3u]);
+            cursor += count;
+        }
+        Require(!result.bindlessTables.empty(), "bindless heap: the dispatch registered no table with the texture service");
+        for (const auto& table : result.bindlessTables) {
+            for (const auto& use : table.uses) {
+                Require(ShaderRecompiler::ResourceMaterializer::FindBindlessInterface(use.interfaceId) != nullptr, "bindless heap: the driver registered an interface id that no compiled program registered");
+                Require(constants.contains(static_cast<std::uint32_t>(use.interfaceId)) && constants.contains(static_cast<std::uint32_t>(use.interfaceId >> 32u)), "bindless heap: the shader does not embed the interface id the driver registers");
+            }
+        }
+    }
     for (const auto& binding : result.bindings) {
         if (binding.role == ShaderRecompiler::DescriptorRole::ImageTable) {
             outcome.imageTableCount = binding.count;
@@ -1633,33 +1653,35 @@ std::pair<std::uint64_t, std::uint64_t> DrawTables(AgcDriver::VulkanDevice& devi
 
 void RunBindlessMissTests(AgcDriver::VulkanDevice& device) {
     namespace Bindless = ShaderRecompiler::BindlessImageAbi;
-    Require(BindlessHeap() && device.BindlessImagesEnabled(), "bindless miss: the device has no bindless descriptor heap");
+    Require(BindlessHeap() && device.BindlessImagesEnabled() && device.BindlessService() != nullptr, "bindless miss: the device has no bindless descriptor heap or texture service");
+    const auto& service = *device.BindlessService();
     Fill();
     SetClassRecords();
     Keys = {};
     for (std::uint32_t group = 0; group < 3u; ++group) Keys[group] = group;
-    static_cast<void>(device.TakeBindlessMisses());
+    const auto before = service.Totals();
     const auto missed = Run(device, TableCode, 3, Lanes, 64);
     Require(missed.bindlessHeap, "bindless miss: the table program was not compiled for the descriptor heap");
     Require(!Faulted(missed) && Zeros(missed), "bindless miss: unprimed keys did not sample zeros without a fault:\n" + missed.log);
-    const auto misses = device.TakeBindlessMisses();
-    Require(device.BindlessEntries() == 0u, "bindless miss: the table held entries although the primer was off");
+    Require(service.Totals().primed == before.primed, "bindless miss: the lazy service primed a table");
+    const auto served = Run(device, TableCode, 3, Lanes, 64);
+    Require(!Faulted(served) && !Zeros(served), "bindless miss: the keys missed by the first batch were not served to the second:\n" + served.log);
+    const auto after = service.Totals();
+    Require(after.misses - before.misses == 3u && after.created - before.created == 3u, "bindless miss: expected 3 distinct misses and 3 entries, got " + std::to_string(after.misses - before.misses) + " misses and " + std::to_string(after.created - before.created) + " entries");
+    std::uint32_t matched = 0;
     for (std::uint32_t record = 0; record < 3u; ++record) {
         const auto* words = Table.data() + record * (Stride / 4u);
-        const auto found = std::any_of(misses.begin(), misses.end(), [&](const AgcDriver::Graphics::DeviceImageMiss& miss) {
-            for (std::uint32_t word = 0; word < 8u; ++word) {
-                if (miss.key[word] != Bindless::MaskedDescriptorWord(word, words[4u + word])) return false;
+        for (const auto& table : missed.bindlessTables) {
+            if (table.base > reinterpret_cast<std::uint64_t>(words + 4u) || (reinterpret_cast<std::uint64_t>(words + 4u) - table.base) % table.stride != 0u || (reinterpret_cast<std::uint64_t>(words + 4u) - table.base) / table.stride >= table.records) continue;
+            for (const auto& use : table.uses) {
+                if (use.samplerClass != Bindless::TableSamplerClass || !std::equal(use.sampler.begin(), use.sampler.end(), words)) continue;
+                const auto key = Bindless::MakeKey(std::span<const std::uint32_t, 8>(words + 4u, 8u), use.interfaceId, use.samplerClass, std::span<const std::uint32_t, 4>(use.sampler));
+                Require(service.Find(key).has_value(), "bindless miss: the driver-computed key of record " + std::to_string(record) + " is not the key the shader missed (interface id 0x" + std::to_string(use.interfaceId) + ")");
+                ++matched;
             }
-            for (std::uint32_t word = 0; word < 4u; ++word) {
-                if (miss.key[Bindless::Table::SamplerWord + word] != words[word]) return false;
-            }
-            return miss.key[Bindless::Table::SamplerClassWord] == Bindless::TableSamplerClass && miss.pc != 0u;
-        });
-        Require(found, "bindless miss: the miss ring did not name record " + std::to_string(record) + " (" + std::to_string(misses.size()) + " distinct misses)");
+        }
     }
-    Require(misses.size() == 3u, "bindless miss: the miss ring named " + std::to_string(misses.size()) + " distinct keys, expected 3");
-    const auto again = Run(device, TableCode, 3, Lanes, 64);
-    Require(!Faulted(again) && Zeros(again) && device.TakeBindlessMisses().size() == 3u, "bindless miss: the keys did not miss again in the next batch");
+    Require(matched == 3u, "bindless miss: the driver registered " + std::to_string(matched) + " of the 3 missed keys");
 }
 
 void RunGraphicsTests(AgcDriver::VulkanDevice& device) {

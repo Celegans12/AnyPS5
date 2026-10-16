@@ -237,6 +237,7 @@ function(add_shader_recompiler target runtimeTarget)
             ImageTableAbi::PoisonReasonName
             ImageTableAbi::TableHeader
             PixelInput
+            PointFilteredSamplerWord
             PixelInputBit
             RayTracingStrict
             RayTracingMiss
@@ -253,6 +254,7 @@ function(add_shader_recompiler target runtimeTarget)
             RegistrationResult
             ResolveSource
             ResourceMaterializer::EvaluateNanoseconds
+            ResourceMaterializer::FindBindlessInterface
             ResourceMaterializer::MaterializeNanoseconds
             ReleaseUndrawnResourcePlan
             ResourceMaterializer::SpecializationNanoseconds

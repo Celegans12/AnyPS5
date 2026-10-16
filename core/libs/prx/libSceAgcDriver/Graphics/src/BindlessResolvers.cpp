@@ -7,7 +7,9 @@
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
+#include "Optimization/DescriptorBindingBuilder.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
+#include "BindlessImageAbi.hpp"
 #include "DeviceImageTableAbi.hpp"
 #include "ImageTableAbi.hpp"
 #include <algorithm>
@@ -22,16 +24,7 @@ namespace AgcDriver::Graphics {
 namespace {
 
 namespace Abi = ShaderRecompiler::DeviceImageTableAbi;
-
-struct Interfaces {
-    std::mutex mutex;
-    std::map<std::uint64_t, std::shared_ptr<const BindlessInterface>> entries;
-};
-
-Interfaces& Registry() {
-    static Interfaces registry;
-    return registry;
-}
+namespace Heap = ShaderRecompiler::BindlessImageAbi;
 
 struct Prepared {
     std::array<std::uint32_t, Abi::DescriptorWords> words{};
@@ -40,7 +33,9 @@ struct Prepared {
     bool firstLayer = false;
     bool depthCompare = false;
     std::uint32_t mode = 0;
-    bool runtimeSampler = false;
+    std::uint32_t samplerClass = 0;
+    bool integerImage = false;
+    bool integerBorder = false;
     std::array<std::uint32_t, Abi::SamplerWords> sampler{};
 };
 
@@ -67,24 +62,6 @@ ShaderRecompiler::DescriptorImageShape ShapeOf(ShaderRecompiler::RdnaImageDimens
 
 }
 
-void RegisterBindlessInterface(std::uint64_t id, BindlessInterface registered) {
-    auto& registry = Registry();
-    std::lock_guard lock(registry.mutex);
-    auto& slot = registry.entries[id];
-    if (slot != nullptr) {
-        Require(slot->image == registered.image && slot->modes == registered.modes, "two different image interfaces share the bindless interface id " + Hex(id));
-        return;
-    }
-    slot = std::make_shared<const BindlessInterface>(std::move(registered));
-}
-
-std::shared_ptr<const BindlessInterface> FindBindlessInterface(std::uint64_t id) {
-    auto& registry = Registry();
-    std::lock_guard lock(registry.mutex);
-    const auto found = registry.entries.find(id);
-    return found == registry.entries.end() ? nullptr : found->second;
-}
-
 bool GuestBindlessMemory::Read(std::uint64_t address, std::span<std::uint32_t> words) {
     const auto bytes = words.size() * sizeof(std::uint32_t);
     if (!GuestMemory::Accessible(reinterpret_cast<const void*>(address), bytes)) return false;
@@ -108,8 +85,7 @@ bool GuestBindlessMemory::Mapped(std::uint64_t address, std::size_t bytes) {
     return GuestMemory::Accessible(reinterpret_cast<const void*>(address), bytes) || !GuestMemory::CommittedRanges(address, bytes).empty();
 }
 
-DriverBindlessResolver::DriverBindlessResolver(const Context& context, InterfaceLookup lookup) : context(context), lookup(std::move(lookup)) {
-    Require(this->lookup != nullptr, "the bindless resolver needs an interface lookup");
+DriverBindlessResolver::DriverBindlessResolver(const Context& context, InterfaceLookup lookup) : context(context), lookup(lookup != nullptr ? std::move(lookup) : InterfaceLookup(&ShaderRecompiler::ResourceMaterializer::FindBindlessInterface)) {
 }
 
 BindlessPrepared DriverBindlessResolver::Prepare(const DeviceImageKeys::Key& key) {
@@ -148,8 +124,26 @@ BindlessPrepared DriverBindlessResolver::Prepare(const DeviceImageKeys::Key& key
     if (!GuestMemory::Accessible(reinterpret_cast<const void*>(address), bytes) && GuestMemory::CommittedRanges(address, bytes, false).empty()) throw std::runtime_error("AGC graphics: the bindless entry's surface at " + Hex(address) + " (" + Hex(state->guestBytes) + " bytes) is not mapped");
     state->depthCompare = mode.depthCompare;
     state->mode = *match.mode;
-    state->runtimeSampler = (key[Abi::SamplerClassWord] & Abi::RuntimeSampler) != 0u;
+    state->samplerClass = key[Abi::SamplerClassWord];
+    const auto integer = [](const ShaderRecompiler::ImageResource& candidate) { return candidate.numericClass == ShaderRecompiler::IrTextureNumericClass::Uint || candidate.numericClass == ShaderRecompiler::IrTextureNumericClass::Sint; };
+    state->integerImage = integer(mode);
+    bool integerModes = false;
+    bool floatModes = false;
+    for (const auto& candidate : found->modes) {
+        if (Materializer::RequiresPointSampler(candidate) != Materializer::RequiresPointSampler(mode)) continue;
+        (integer(candidate) ? integerModes : floatModes) = true;
+    }
+    state->integerBorder = integerModes && !floatModes;
     std::copy_n(key.begin() + Abi::SamplerWord, Abi::SamplerWords, state->sampler.begin());
+    if (state->samplerClass != Heap::NoSamplerClass) {
+        if (state->samplerClass == Heap::TableSamplerClass) {
+            if ((state->sampler[0] & (1u << 15u)) != 0u) throw std::runtime_error("AGC graphics: a sampler table entry with unnormalized coordinates is not implemented for table images");
+            if (((state->sampler[0] >> 29u) & 3u) != 0u) throw std::runtime_error("AGC graphics: a sampler table entry with a min or max reduction is not implemented for table images");
+        } else if (state->samplerClass != Heap::DirectSamplerClass) {
+            throw std::runtime_error("AGC graphics: a bindless key names the unknown sampler class " + Hex(state->samplerClass));
+        }
+        if (Materializer::RequiresPointSampler(mode)) state->sampler[2] = ShaderRecompiler::PointFilteredSamplerWord(state->sampler[0], state->sampler[2]);
+    }
     prepared.address = address;
     prepared.bytes = state->guestBytes;
     prepared.generation = GuestMemory::CollectWrites(address, bytes);
@@ -171,15 +165,25 @@ BindlessResolution DriverBindlessResolver::Commit(const BindlessPrepared& prepar
     resolution.bytes = prepared.bytes;
     resolution.generation = prepared.generation;
     resolution.perUse = texture->IsDepthCopy() || texture->RefreshedPerUse();
-    if (state->runtimeSampler) {
-        std::shared_ptr<Sampler> sampler;
-        if (context.samplerCache != nullptr) {
-            sampler = context.samplerCache->Get(context, state->sampler, state->depthCompare);
-        } else {
-            auto resource = DecodeSamplerResource(state->sampler);
-            resource.compareEnable = state->depthCompare;
-            sampler = std::make_shared<Sampler>(context, resource);
+    if (state->samplerClass != Heap::NoSamplerClass) {
+        const bool table = state->samplerClass == Heap::TableSamplerClass;
+        const bool integerBorder = !table && state->integerBorder;
+        auto descriptor = DecodeSamplerResource(state->sampler, false, !table, integerBorder);
+        descriptor.compareEnable = state->depthCompare;
+        if (table) {
+            Sampler::Validate(context, descriptor);
+            Require(!Sampler::ReadsOpaqueBlackBorder(descriptor), "a sampler table entry with an opaque black border needs dynamic texture BC-swizzle pairing, which is not implemented");
+            Require(descriptor.addressModeU != VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER && descriptor.addressModeV != VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER && descriptor.addressModeW != VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER, "a sampler table entry with a border needs dynamic texture numeric-class pairing, which is not implemented");
+            Require(!descriptor.nonSeamlessCube || context.nonSeamlessCubeMap, "a sampler table entry that disables seamless cube filtering needs VK_EXT_non_seamless_cube_map because dynamic texture/sampler pairing is not implemented");
         }
+        const bool border = descriptor.addressModeU == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER || descriptor.addressModeV == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER || descriptor.addressModeW == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+        Require(!border || integerBorder == state->integerImage, "an image table entry's sampler border color numeric class disagrees with its sampled image class, which needs dynamic pairing and is not implemented");
+        Require(!SingleLevelSamplerWords(state->sampler, true, false).has_value(), "an image table entry paired with anisotropic ANISO_OVERRIDE needs dynamic texture mip-level pairing, which is not implemented");
+        std::shared_ptr<Sampler> sampler = context.samplerCache != nullptr ? context.samplerCache->Get(context, state->sampler, state->depthCompare, false, !table, integerBorder) : std::make_shared<Sampler>(context, descriptor);
+        const std::array<std::shared_ptr<Sampler>, 1> paired{sampler};
+        RequireFilterMinmax(context, texture->ViewFormat(), 1u, paired);
+        RequireBorderSwizzle(state->resource.bcSwizzle, 1u, paired);
+        RequireNonSeamlessCube(state->resource.dimension == TextureDimension::kCube, 1u, paired);
         resolution.sampler = sampler->Handle();
         resolution.samplerOwner = std::move(sampler);
     }

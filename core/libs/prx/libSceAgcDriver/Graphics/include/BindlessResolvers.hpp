@@ -3,21 +3,15 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureService.hpp"
-#include "IntermediateRepresentation/IrMetadata/Resources.hpp"
 #include <cstdint>
 #include <functional>
 #include <memory>
-#include <vector>
+
+namespace ShaderRecompiler {
+struct BindlessInterface;
+}
 
 namespace AgcDriver::Graphics {
-
-struct BindlessInterface {
-    ShaderRecompiler::ImageResource image;
-    std::vector<ShaderRecompiler::ImageResource> modes;
-};
-
-void RegisterBindlessInterface(std::uint64_t id, BindlessInterface registered);
-std::shared_ptr<const BindlessInterface> FindBindlessInterface(std::uint64_t id);
 
 class GuestBindlessMemory final : public BindlessMemory {
 public:
@@ -30,8 +24,8 @@ public:
 
 class DriverBindlessResolver final : public BindlessResolver {
 public:
-    using InterfaceLookup = std::function<std::shared_ptr<const BindlessInterface>(std::uint64_t)>;
-    explicit DriverBindlessResolver(const Context& context, InterfaceLookup lookup = &FindBindlessInterface);
+    using InterfaceLookup = std::function<std::shared_ptr<const ShaderRecompiler::BindlessInterface>(std::uint64_t)>;
+    explicit DriverBindlessResolver(const Context& context, InterfaceLookup lookup = {});
     BindlessPrepared Prepare(const DeviceImageKeys::Key& key) override;
     BindlessResolution Commit(const BindlessPrepared& prepared) override;
     bool Current(const BindlessResolution& resolution) override;

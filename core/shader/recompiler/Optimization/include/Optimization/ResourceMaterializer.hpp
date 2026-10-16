@@ -86,10 +86,12 @@ public:
     static ResolvedImageTables ResolveImageTables(const ShaderInfo& info, const ResourceSnapshot& snapshot, std::uint64_t memoKey = 0);
     static bool BindlessImage(const ShaderInfo& info, IrShaderStage stage, std::uint32_t resource);
     static bool UsesBindlessImages(const ShaderInfo& info, IrShaderStage stage);
+    static bool RequiresPointSampler(const ImageResource& mode);
     static std::uint64_t BindlessInterfaceId(const ImageResource& image, std::span<const ImageResource> modes);
+    static std::uint64_t RegisterBindlessInterface(const ImageResource& image, std::span<const ImageResource> modes);
     static void RegisterBindlessInterfaces(const ShaderInfo& info, IrShaderStage stage);
     static std::shared_ptr<const BindlessInterface> FindBindlessInterface(std::uint64_t id);
-    static std::vector<BindlessImageAbi::PrimerEntry> BindlessPrimer(const ShaderInfo& info, IrShaderStage stage, const ResourceSnapshot& snapshot, const ResolvedImageTables& tables, std::span<const std::uint32_t> directSamplers);
+    static std::vector<BindlessImageAbi::TableRegistration> BindlessTables(const ShaderInfo& info, IrShaderStage stage, const ResourceSnapshot& snapshot);
     [[nodiscard]] IrResourcePlan ExtractPlan(const IrProgram& program) const;
     static void CompactPlan(IrResourcePlan& plan);
     void Materialize(const IrResourcePlan& program, const SrtRuntime& runtime, ResourceSnapshot& snapshot, bool allowDirectImageRefusal = false) const;

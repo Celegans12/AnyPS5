@@ -921,8 +921,8 @@ void driverTests(const Device& device) {
     image.dimension = ShaderRecompiler::RdnaImageDimension::Dim2D;
     image.read = true;
     const auto modes = ResourceMaterializer::RuntimeImageModes(image);
-    constexpr std::uint64_t Interface = 0x5eedf00dcafe0001ull;
-    AgcDriver::Graphics::RegisterBindlessInterface(Interface, {image, modes});
+    const std::uint64_t Interface = ResourceMaterializer::RegisterBindlessInterface(image, modes);
+    Require(Interface == ResourceMaterializer::BindlessInterfaceId(image, modes) && ResourceMaterializer::FindBindlessInterface(Interface) != nullptr, "the registered interface id differs from the one the emitter embeds");
     constexpr std::uint32_t Records = 20u;
     constexpr std::uint32_t Unmapped = 19u;
     std::vector<std::uint32_t> words(static_cast<std::size_t>(Records) * 8u, 0u);
