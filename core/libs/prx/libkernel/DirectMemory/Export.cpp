@@ -454,15 +454,17 @@ int APS5_VABI sceKernelBatchMap2(KernelBatchMapEntry* entries, int num_entries, 
  constexpr int OpTypeProtect = 4;
  int processed = 0;
  int result = 0;
+ std::optional<GuestAllocations::Mutation> mapping;
  for (; processed < num_entries; ++processed) {
   auto& entry = entries[processed];
   if (entry.length == 0 || entry.operation < OpMapDirect || entry.operation > OpTypeProtect) {
    result = SCE_KERNEL_ERROR_EINVAL;
    break;
   }
+  if (entry.operation != OpMapDirect) mapping.reset();
   switch (entry.operation) {
   case OpMapDirect:
-   result = DoMapDirect(&entry.start, entry.length, static_cast<uint8_t>(entry.protection), flags, static_cast<int64_t>(entry.offset), 0);
+   result = DoMapDirect(mapping, &entry.start, entry.length, static_cast<uint8_t>(entry.protection), flags, static_cast<int64_t>(entry.offset), 0);
    break;
   case OpUnmap:
    result = sceKernelMunmap(reinterpret_cast<uint64_t>(entry.start), entry.length);

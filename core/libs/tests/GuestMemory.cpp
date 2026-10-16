@@ -1886,6 +1886,94 @@ static void CheckReadsIntoSharedWriteTracking() {
 #endif
 }
 
+static std::atomic<std::size_t> g_batchMapObservations{0};
+
+static void ObserveBatchMapWithLease(const GuestAllocations::Mapped& ranges, std::uint64_t) {
+    constexpr std::uint64_t window = 8ull << 20u;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> spans;
+    for (const auto& mapped : ranges) {
+        if (const auto range = mapped.lock()) spans.emplace_back(range->address / window * window, std::max(range->address / window * window + window, range->address + range->bytes));
+    }
+    const auto lease = GuestAllocations::GuestAllocationsAcquireSpans_nid_postfix(spans);
+    Require(!ranges.empty() && !lease.empty());
+    g_batchMapObservations.fetch_add(1);
+}
+
+struct BatchMapCost {
+    double mapSeconds = std::numeric_limits<double>::max();
+    double unmapSeconds = std::numeric_limits<double>::max();
+};
+
+static BatchMapCost MeasureBatchMap(std::int64_t phys, std::size_t entries, std::size_t perCall, const std::vector<void*>& background) {
+    constexpr std::size_t page = 0x4000;
+    constexpr int gpuReadWrite = 0x33;
+    constexpr int mapFixed = 0x10;
+    constexpr int mapDirect = 0;
+    constexpr int unmap = 1;
+    BatchMapCost cost;
+    const auto run = [&](std::vector<KernelBatchMapEntry>& batch) {
+        for (std::size_t start = 0; start < entries; start += perCall) {
+            int processed = -1;
+            Require(sceKernelBatchMap2(batch.data() + start, static_cast<int>(perCall), &processed, mapFixed) == 0 && processed == static_cast<int>(perCall));
+        }
+    };
+    for (int attempt = 0; attempt < 5; ++attempt) {
+        void* reserved = nullptr;
+        Require(sceKernelReserveVirtualRange(&reserved, page * entries, 0, 0) == 0);
+        std::vector<KernelBatchMapEntry> batch(entries);
+        for (std::size_t index = 0; index < entries; ++index) batch[index] = KernelBatchMapEntry{static_cast<unsigned char*>(reserved) + page * index, static_cast<std::uint64_t>(phys) + page * index, page, gpuReadWrite, 0, 0, mapDirect};
+        const auto observed = g_batchMapObservations.load();
+        auto before = std::chrono::steady_clock::now();
+        run(batch);
+        cost.mapSeconds = std::min(cost.mapSeconds, std::chrono::duration<double>(std::chrono::steady_clock::now() - before).count());
+        Require(g_batchMapObservations.load() == observed + entries / perCall);
+        for (std::size_t index = 0; index < entries; ++index) {
+            Require(batch[index].start == static_cast<unsigned char*>(reserved) + page * index);
+            static_cast<volatile unsigned char*>(batch[index].start)[index % page] = static_cast<unsigned char>(index + 1);
+        }
+        for (std::size_t index = 0; index < entries && index < background.size(); ++index) Require(static_cast<unsigned char*>(background[index * 2])[index % page] == static_cast<unsigned char>(index + 1));
+        for (auto& entry : batch) entry.operation = unmap;
+        before = std::chrono::steady_clock::now();
+        run(batch);
+        cost.unmapSeconds = std::min(cost.unmapSeconds, std::chrono::duration<double>(std::chrono::steady_clock::now() - before).count());
+    }
+    return cost;
+}
+
+static void CheckBatchMapCostFollowsTheBatch() {
+    constexpr std::size_t page = 0x4000;
+    constexpr std::size_t entries = 64;
+    constexpr std::size_t few = 512;
+    constexpr std::size_t many = few * 16;
+    constexpr int gpuReadWrite = 0x33;
+    std::int64_t phys = 0;
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, page * many, 0, 0, &phys) == 0);
+    GuestAllocations::GuestAllocationsSetGpuMapObserver_nid_postfix(&ObserveBatchMapWithLease);
+    std::vector<void*> background;
+    const auto grow = [&](std::size_t pages) {
+        while (background.size() < pages * 2) {
+            void* mapped = nullptr;
+            Require(sceKernelMapDirectMemory(&mapped, page, gpuReadWrite, 0, phys + static_cast<std::int64_t>(page * (background.size() / 2)), 0) == 0);
+            background.push_back(mapped);
+        }
+    };
+    grow(few);
+    const auto small = MeasureBatchMap(phys, entries, entries, background);
+    const auto smallSingle = MeasureBatchMap(phys, entries, 1, background);
+    grow(many);
+    const auto large = MeasureBatchMap(phys, entries, entries, background);
+    const auto largeSingle = MeasureBatchMap(phys, entries, 1, background);
+    const auto print = [&](const char* shape, const BatchMapCost& low, const BatchMapCost& high) {
+        std::printf("%s: %.1f / %.1f us per mapped entry and %.1f / %.1f us per unmapped entry beside %zu / %zu direct mappings\n", shape, low.mapSeconds * 1e6 / entries, high.mapSeconds * 1e6 / entries, low.unmapSeconds * 1e6 / entries, high.unmapSeconds * 1e6 / entries, few * 2, many * 2);
+    };
+    print("batch map of 64 entries", small, large);
+    print("batch map of 1 entry", smallSingle, largeSingle);
+    for (auto* mapped : background) Require(sceKernelMunmap(mapped, page) == 0);
+    GuestAllocations::GuestAllocationsSetGpuMapObserver_nid_postfix(nullptr);
+    Require(sceKernelReleaseDirectMemory(phys, page * many) == 0);
+    for (const auto& [low, high] : {std::pair{small, large}, std::pair{smallSingle, largeSingle}}) Require(high.mapSeconds <= low.mapSeconds * 6 && high.unmapSeconds <= low.unmapSeconds * 6);
+}
+
 #if defined(__linux__)
 using PageRuns = std::vector<std::pair<std::uintptr_t, std::uintptr_t>>;
 
@@ -2330,6 +2418,67 @@ static void CheckMappingCostFollowsTheMappingCount() {
 }
 #endif
 
+// The overlap queries must start at the range that reaches into the queried address,
+// not at the first range whose base is above it: a query landing inside a registered
+// range is the case these two functions exist to report.
+static void CheckOverlapQueriesSeeRangesStartingBelowTheAddress() {
+    constexpr std::size_t page = 0x4000;
+    constexpr std::size_t many = 4096;
+    constexpr std::uintptr_t first = 0x7f0000000000ull;
+    for (std::size_t index = 0; index < many; ++index) {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(reinterpret_cast<void*>(first + page * 2 * index), page, true, true, false);
+    }
+    const auto last = first + page * 2 * (many - 1);
+    const auto inside = reinterpret_cast<const void*>(last + page / 2);
+    const auto atBase = reinterpret_cast<const void*>(last);
+    const auto before = reinterpret_cast<const void*>(last - page / 2);
+    Require(GuestAllocations::GuestAllocationsOverlaps_nid_postfix(nullptr, inside, 1));
+    Require(GuestAllocations::GuestAllocationsOverlaps_nid_postfix(nullptr, atBase, 1));
+    Require(!GuestAllocations::GuestAllocationsOverlaps_nid_postfix(nullptr, before, 1));
+    bool refused = false;
+    try {
+        GuestAllocations::GuestAllocationsRequireAvailable_nid_postfix(nullptr, inside, 1);
+    } catch (const std::exception&) {
+        refused = true;
+    }
+    Require(refused);
+    refused = false;
+    try {
+        GuestAllocations::GuestAllocationsRequireAvailable_nid_postfix(nullptr, before, 1);
+    } catch (const std::exception&) {
+        refused = true;
+    }
+    Require(!refused);
+    for (std::size_t index = 0; index < many; ++index) {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(reinterpret_cast<const void*>(first + page * 2 * index));
+    }
+}
+
+static void CheckSpanLeaseHoldsTheRangesItTouches() {
+    constexpr std::size_t page = 0x4000;
+    constexpr std::uintptr_t first = 0x7e0000000000ull;
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(reinterpret_cast<void*>(first), page, true, true, true);
+        mutation.Add(reinterpret_cast<void*>(first + page), page, false, false, false);
+        mutation.Add(reinterpret_cast<void*>(first + page * 2), page * 2, true, false, false);
+        mutation.Add(reinterpret_cast<void*>(first + page * 8), page, true, true, false);
+    }
+    {
+        const auto shared = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+        const auto lease = GuestAllocations::GuestAllocationsAcquireSpans_nid_postfix({{first + page * 3, first + page * 3 + 1}, {first + page / 2, first + page * 3}, {first + page * 4, first + page * 8}});
+        Require(lease.size() == 2 && lease[0]->address == first && lease[1]->address == first + page * 2 && lease[1]->bytes == page * 2);
+        Require(GuestAllocations::GuestAllocationsAcquireSpans_nid_postfix({{first + page * 8, first + page * 9}}).size() == 1);
+        Require(GuestAllocations::GuestAllocationsAcquireSpans_nid_postfix({{first + page * 4, first + page * 8}}).empty());
+        const auto again = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+        Require(!shared.empty() && &shared[0] == &again[0]);
+    }
+    GuestAllocations::Mutation mutation;
+    for (const auto offset : {std::size_t{0}, page, page * 2, page * 8}) mutation.Remove(reinterpret_cast<const void*>(first + offset));
+}
+
 static void CheckVirtualQuerySplitFlexibleRanges() {
     constexpr std::size_t page = 0x4000;
     void* mapped = nullptr;
@@ -2548,6 +2697,8 @@ int main(int argc, char** argv) {
     }
     Require(argc == 1);
     CheckAvailableDirectMemoryIsLargestFreeBlock();
+    CheckOverlapQueriesSeeRangesStartingBelowTheAddress();
+    CheckSpanLeaseHoldsTheRangesItTouches();
     CheckVirtualQuerySplitFlexibleRanges();
     CheckVirtualQueryForNonReadableGuestRange();
     CheckReleaseFlexibleMemory();
@@ -2609,6 +2760,7 @@ int main(int argc, char** argv) {
     CheckFailedCollectKeepsWrites();
     CheckSingleDirectMappingTracksWritesWithoutFaults();
     CheckSecondDirectMappingWaitsForLeases();
+    CheckBatchMapCostFollowsTheBatch();
     CheckBreakingAResidentRunKeepsConcurrentAccesses();
     CheckRemappedDirectMemoryIsChargedOnce();
 #if defined(__linux__)

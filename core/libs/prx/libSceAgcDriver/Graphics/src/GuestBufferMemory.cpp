@@ -2613,6 +2613,32 @@ const HostImport* HostImportFor(const Context& context, std::uint64_t address, s
     return importAccess(context, state, address, address + bytes, lease);
 }
 
+namespace {
+
+GuestAllocations::Lease mappedRangesLease(const HostImports& state, const GuestAllocations::Mapped& ranges) {
+    const auto window = importWindow.load(std::memory_order_relaxed);
+    if (window == 0) return GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> spans;
+    for (const auto& mapped : ranges) {
+        const auto range = mapped.lock();
+        if (range == nullptr) continue;
+        auto low = range->address / window * window;
+        auto high = std::max(low + window, range->address + range->bytes);
+        auto it = state.imports.upper_bound(low);
+        if (it != state.imports.begin() && std::prev(it)->second.base + std::prev(it)->second.bytes > low) --it;
+        const auto runEnd = high;
+        for (; it != state.imports.end() && it->first < runEnd; ++it) {
+            low = std::min(low, it->second.base);
+            high = std::max(high, it->second.base + it->second.bytes);
+        }
+        Require(high <= std::numeric_limits<std::uint64_t>::max() - window, "mapped guest range lease span overflows");
+        spans.emplace_back(low / window * window, (high + window - 1) / window * window);
+    }
+    return GuestAllocations::GuestAllocationsAcquireSpans_nid_postfix(spans);
+}
+
+}
+
 bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& ranges, std::uint64_t generation, bool adoptDevice) {
     if (context.hostImportAlignment == 0) return true;
     ensurePinWaiter();
@@ -2627,7 +2653,7 @@ bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& 
     } else if (state.refreshedGeneration > generation) {
         return true;
     }
-    if (!adopting) current = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+    if (!adopting) current = mappedRangesLease(state, ranges);
     for (const auto& mapped : ranges) {
         const auto range = mapped.lock();
         if (range == nullptr || leasedRangeOwner(current, range->address) != range) continue;

@@ -476,8 +476,9 @@ void ErasePhysMappings(std::uint64_t first, std::uint64_t last) {
 }
 
 void ValidatePhysicalRange(std::uint64_t phys, std::size_t len) {
-    for (std::size_t offset = 0; offset < len; offset += PS5_PAGE_SIZE) {
-        if (!g_physPages.contains(phys + offset)) {
+    auto page = g_physPages.lower_bound(phys);
+    for (std::size_t offset = 0; offset < len; offset += PS5_PAGE_SIZE, ++page) {
+        if (page == g_physPages.end() || page->first != phys + offset) {
             char message[160];
             std::snprintf(message, sizeof(message), "direct memory range 0x%llx+0x%zx references unallocated physical page 0x%llx", static_cast<unsigned long long>(phys), len, static_cast<unsigned long long>(phys + offset));
             throw std::invalid_argument(message);
@@ -566,11 +567,12 @@ bool WriteSharedBacking(std::uintptr_t address, const void* source, std::size_t 
 void AddMapping(std::uintptr_t address, std::size_t len, std::uint64_t phys, int nativeProt) {
     ValidatePhysicalRange(phys, len);
     EraseMappings(address, address + len);
+    auto cursor = g_physPages.find(phys);
     for (std::size_t offset = 0; offset < len;) {
-        const auto& page = g_physPages.at(phys + offset);
+        const auto& page = cursor->second;
         std::size_t bytes = PS5_PAGE_SIZE;
-        while (offset + bytes < len) {
-            const auto& next = g_physPages.at(phys + offset + bytes);
+        for (++cursor; offset + bytes < len; ++cursor) {
+            const auto& next = cursor->second;
             if (next.backing != page.backing || next.offset != page.offset + bytes) break;
             bytes += PS5_PAGE_SIZE;
         }
@@ -600,7 +602,8 @@ void RequireAliasesUnpinned(GuestAllocations::Mutation& mutation, std::uint64_t 
     std::vector<std::pair<std::uintptr_t, std::size_t>> aliases;
     {
         std::lock_guard lock(g_directLock);
-        for (const auto& [base, mapping] : g_directMappings) {
+        for (const auto base : MappingsSharingPhys(phys, phys + len)) {
+            const auto& mapping = g_directMappings.at(base);
             const auto first = std::max(phys, mapping.phys);
             const auto last = std::min(phys + len, mapping.phys + (mapping.end - base));
             if (first < last) aliases.emplace_back(base + (first - mapping.phys), last - first);
@@ -887,13 +890,14 @@ int PlaceHintInReservation(void* addr, size_t len, int flags) {
     return flags | GuestMapFixedFlag;
 }
 
-int DoMapDirect(void** addr, size_t len, int prot, int flags, int64_t physStart, size_t alignment) {
+int DoMapDirect(std::optional<GuestAllocations::Mutation>& batch, void** addr, size_t len, int prot, int flags, int64_t physStart, size_t alignment) {
     ValidateOutput(addr);
     if (len == 0 || (len & (PS5_PAGE_SIZE - 1)) != 0) return SCE_KERNEL_ERROR_EINVAL;
     if (physStart < 0 || (static_cast<std::uint64_t>(physStart) & (PS5_PAGE_SIZE - 1)) != 0 || static_cast<std::uint64_t>(physStart) >= DIRECT_MEMORY_SIZE || len > DIRECT_MEMORY_SIZE - static_cast<std::uint64_t>(physStart)) {
         return SCE_KERNEL_ERROR_EINVAL;
     }
-    GuestAllocations::Mutation mutation;
+    if (!batch) batch.emplace();
+    auto& mutation = *batch;
     flags = PlaceHintInReservation(*addr, len, flags);
     if (FixedNoOverwriteConflict(mutation, *addr, len, flags)) return SCE_KERNEL_ERROR_ENOMEM;
     if (RemapFixedIntoRegistered(mutation, *addr, len, prot, flags, physStart)) {
@@ -920,6 +924,11 @@ int DoMapDirect(void** addr, size_t len, int prot, int flags, int64_t physStart,
     RecordProtection(mapped, len, prot);
     Trace("map direct %p+0x%zx phys=0x%llx prot=0x%x flags=0x%x align=0x%zx", mapped, len, static_cast<unsigned long long>(physStart), prot, flags, alignment);
     return 0;
+}
+
+int DoMapDirect(void** addr, size_t len, int prot, int flags, int64_t physStart, size_t alignment) {
+    std::optional<GuestAllocations::Mutation> mutation;
+    return DoMapDirect(mutation, addr, len, prot, flags, physStart, alignment);
 }
 
 int DoMapAnon(void** addr, size_t len, int prot, int flags, size_t alignment, bool exclusive) {
