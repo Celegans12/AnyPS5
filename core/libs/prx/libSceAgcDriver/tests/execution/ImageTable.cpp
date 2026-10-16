@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchCache.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureService.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -683,7 +684,7 @@ void RunBorderSwizzleTests(AgcDriver::VulkanDevice& device) {
         Keys[0] = 0;
         Keys[1] = 1;
         const auto inactiveImage = RunDirectCode(device, TableDirectSamplerCode, opaqueBlack, image);
-        Require(inactiveImage.imageTableCount == 2u, name + ": the inactive alpha-moving T# was not included in the snapshot");
+        Require(BindlessHeap() || inactiveImage.imageTableCount == 2u, name + ": the inactive alpha-moving T# was not included in the snapshot");
         Require(!Faulted(inactiveImage) && Group(inactiveImage, 0) == Group(directOpaque, 0), name + ": an inactive rejected table T# poisoned the active T#/direct S# pair:\n" + inactiveImage.log);
         Keys[0] = 1;
         Keys[1] = 0;
@@ -697,7 +698,7 @@ void RunBorderSwizzleTests(AgcDriver::VulkanDevice& device) {
             Keys[0] = 0;
             Keys[1] = 1;
             const auto inactiveSampler = tableImage ? RunDirectCode(device, TableCode, PointClamp, image) : RunDirectCode(device, TableSamplerCode, PointClamp, image);
-            Require(Holds(inactiveSampler.samplerTable, opaqueBlack), pair + ": the inactive opaque-black S# was not included in the snapshot");
+            Require(BindlessHeap() || Holds(inactiveSampler.samplerTable, opaqueBlack), pair + ": the inactive opaque-black S# was not included in the snapshot");
             Require(!Faulted(inactiveSampler) && Group(inactiveSampler, 0) == Group(control, 0), pair + ": an inactive rejected S# poisoned the active pair:\n" + inactiveSampler.log);
             Keys[0] = 1;
             Keys[1] = 0;
@@ -706,7 +707,7 @@ void RunBorderSwizzleTests(AgcDriver::VulkanDevice& device) {
         }
     }
     const auto cut = Run(device, TableCutCode, 1, Lanes, 64);
-    Require(Holds(cut.samplerTable, opaqueBlack), "image table border: the EXEC-clear opaque-black S# was not included in the snapshot");
+    Require(BindlessHeap() || Holds(cut.samplerTable, opaqueBlack), "image table border: the EXEC-clear opaque-black S# was not included in the snapshot");
     Require(!Faulted(cut), "image table border: an opaque-black S# selected with EXEC clear faulted:\n" + cut.log);
     Require(std::all_of(cut.words.begin(), cut.words.end(), [](std::uint32_t word) { return word == 0xdeadbeefu; }), "image table border: the EXEC-clear shader wrote output");
     for (const std::uint32_t border : {0u, 2u}) {
@@ -721,7 +722,7 @@ void RunBorderSwizzleTests(AgcDriver::VulkanDevice& device) {
         Keys[0] = 0;
         Keys[1] = 1;
         const auto inactiveImage = RunDirectCode(device, TableDirectSamplerCode, sampler, floatImage);
-        Require(inactiveImage.imageTableCount == 2u, name + ": the inactive integer T# was not included in the snapshot");
+        Require(BindlessHeap() || inactiveImage.imageTableCount == 2u, name + ": the inactive integer T# was not included in the snapshot");
         Require(!Faulted(inactiveImage) && Group(inactiveImage, 0) == Group(direct, 0), name + ": an inactive integer T# poisoned the float-border pair:\n" + inactiveImage.log);
         Keys[0] = 1;
         Keys[1] = 0;
@@ -733,7 +734,7 @@ void RunBorderSwizzleTests(AgcDriver::VulkanDevice& device) {
             Keys[0] = 0;
             Keys[1] = 1;
             const auto inactiveSampler = tableImage ? RunDirectCode(device, TableCode, PointClamp, floatImage) : RunDirectCode(device, TableSamplerCode, PointClamp, floatImage);
-            Require(Holds(inactiveSampler.samplerTable, sampler), pair + ": the inactive border S# was not included in the snapshot");
+            Require(BindlessHeap() || Holds(inactiveSampler.samplerTable, sampler), pair + ": the inactive border S# was not included in the snapshot");
             Require(!Faulted(inactiveSampler) && Group(inactiveSampler, 0) == Group(direct, 0), pair + ": an inactive rejected S# poisoned the active pair:\n" + inactiveSampler.log);
             Keys[0] = 1;
             Keys[1] = 0;
@@ -741,7 +742,7 @@ void RunBorderSwizzleTests(AgcDriver::VulkanDevice& device) {
             requireFault(activeSampler, "sampler table entry with a border needs dynamic texture numeric-class pairing", pair);
         }
         const auto inactiveExec = Run(device, TableCutCode, 1, Lanes, 64);
-        Require(Holds(inactiveExec.samplerTable, sampler), name + ": the EXEC-clear border S# was not included in the snapshot");
+        Require(BindlessHeap() || Holds(inactiveExec.samplerTable, sampler), name + ": the EXEC-clear border S# was not included in the snapshot");
         Require(!Faulted(inactiveExec) && std::all_of(inactiveExec.words.begin(), inactiveExec.words.end(), [](std::uint32_t word) { return word == 0xdeadbeefu; }), name + ": the EXEC-clear border S# faulted or wrote output:\n" + inactiveExec.log);
     }
 }
@@ -778,7 +779,7 @@ void RunAnisoOverrideTests(AgcDriver::VulkanDevice& device) {
             Keys[0] = 0;
             Keys[1] = 1;
             const auto inactive = tableImages ? RunDirectCode(device, TableCode, PointClamp, image) : RunDirectCode(device, TableSamplerCode, PointClamp, image);
-            Require(Holds(inactive.samplerTable, sampler), pair + ": the inactive sampler was not captured");
+            Require(BindlessHeap() || Holds(inactive.samplerTable, sampler), pair + ": the inactive sampler was not captured");
             Require(!Faulted(inactive) && Group(inactive, 0) == Group(control, 0), pair + ": the inactive entry changed the selected texels");
             Keys[0] = 1;
             Keys[1] = 0;
@@ -793,7 +794,7 @@ void RunAnisoOverrideTests(AgcDriver::VulkanDevice& device) {
             cutCode[22] = 0x00001000u;
             std::copy(TableDirectSamplerCode.begin() + 21u, TableDirectSamplerCode.end(), cutCode.begin() + 23u);
             const auto cut = RunDirectCode(device, cutCode, sampler, image);
-            Require(cut.imageTableCount == 1u && !Faulted(cut), "image table ANISO_OVERRIDE: an EXEC-clear table T#/direct S# access faulted");
+            Require((BindlessHeap() || cut.imageTableCount == 1u) && !Faulted(cut), "image table ANISO_OVERRIDE: an EXEC-clear table T#/direct S# access faulted");
             Require(std::all_of(cut.words.begin(), cut.words.end(), [](std::uint32_t word) { return word == 0xdeadbeefu; }), "image table ANISO_OVERRIDE: EXEC-clear sampling wrote output");
         }
     }
@@ -817,7 +818,7 @@ void RunPipelineOnlyTests(AgcDriver::VulkanDevice& device) {
     Keys = {};
     for (std::uint32_t group = 0; group < 3u; ++group) Keys[group] = group;
     const auto table = Run(device, TableCode, 3, Lanes, 64);
-    Require(table.imageTableCount == 3u && !Faulted(table), "pipeline-only: typed image table did not bind all three classes");
+    Require((BindlessHeap() || table.imageTableCount == 3u) && !Faulted(table), "pipeline-only: typed image table did not bind all three classes");
     for (std::uint32_t group = 0; group < 3u; ++group) {
         Require(Group(table, group) == Group(baseline[group], 0), "pipeline-only: table dispatch changed a typed result");
         const auto warmed = direct(group);
@@ -825,7 +826,7 @@ void RunPipelineOnlyTests(AgcDriver::VulkanDevice& device) {
     }
     for (std::uint32_t record = 0; record < Records; ++record) SetRecord(record, PointClamp, {});
     const auto nullTable = Run(device, TableCode, 3, Lanes, 64);
-    Require(nullTable.imageTableBinding && nullTable.imageTableCount == 0u && !Faulted(nullTable), "pipeline-only: all-null table did not retain its zero-element binding");
+    Require((BindlessHeap() || (nullTable.imageTableBinding && nullTable.imageTableCount == 0u)) && !Faulted(nullTable), "pipeline-only: all-null table did not retain its zero-element binding");
     Require(std::all_of(nullTable.words.begin(), nullTable.words.end(), [](std::uint32_t word) { return word == 0u; }), "pipeline-only: all-null table did not sample exact zeros");
     RunStoreTests(device);
     for (std::uint32_t record = 0; record < Records; ++record) SetWideRecord(record, {});
@@ -846,7 +847,7 @@ void RunTests(AgcDriver::VulkanDevice& device) {
     for (std::uint32_t group = 0; group < 6; ++group) Keys[group] = group;
     const auto classes = Run(device, TableCode, 6, Lanes, 64);
     Require(!Faulted(classes), "image table: valid entries faulted:\n" + classes.log);
-    Require(classes.imageTableCount == 3u, "image table: the table binding does not hold one element per distinct T# (" + std::to_string(classes.imageTableCount) + ")");
+    Require(BindlessHeap() || classes.imageTableCount == 3u, "image table: the table binding does not hold one element per distinct T# (" + std::to_string(classes.imageTableCount) + ")");
     for (std::uint32_t group = 0; group < 6; ++group) {
         if (group == 4u) continue;
         const auto* words = Table.data() + group * (Stride / 4u);
@@ -876,7 +877,7 @@ void RunTests(AgcDriver::VulkanDevice& device) {
     Keys = {};
     const auto unused = Run(device, TableCode, 1, Lanes, 64);
     Require(!Faulted(unused) && Group(unused, 0) == Group(classes, 0), "image table: an unreferenced invalid entry changed the result");
-    Require(unused.imageTableCount == 1u, "image table: a narrowed table bound records its keys cannot select");
+    Require(BindlessHeap() || unused.imageTableCount == 1u, "image table: a narrowed table bound records its keys cannot select");
     Keys[0] = 7;
     const auto cut = Run(device, TableCutCode, 1, Lanes, 64);
     Require(!Faulted(cut), "image table: an invalid entry selected with EXEC clear faulted:\n" + cut.log);
@@ -957,14 +958,14 @@ void RunTests(AgcDriver::VulkanDevice& device) {
     Keys[0] = 1;
     const auto uintLinear = Run(device, TableDirectSamplerCode, 2, Lanes, 64);
     Require(!Faulted(uintLinear), "image table: a direct sampler with float and uint table T#s faulted:\n" + uintLinear.log);
-    Require(Holds(uintLinear.samplers, LinearWrap) && Holds(uintLinear.samplers, PointWrap), "image table: a linear direct S# with float and uint table T#s has no point-filtered copy");
+    Require(BindlessHeap() || (Holds(uintLinear.samplers, LinearWrap) && Holds(uintLinear.samplers, PointWrap)), "image table: a linear direct S# with float and uint table T#s has no point-filtered copy");
     Require(Group(uintLinear, 1) == Group(floatControl, 0), "image table: a float entry under a linear direct S# differs from the direct binding");
     RequireRed(uintLinear, 0, Lanes, [](std::uint32_t x) { return UintTexels[x]; }, "uint texels beside float texels through a linear direct sampler");
 
     Keys[0] = 4;
     const auto uintTable = Run(device, TableCode, 1, Lanes, 64);
     Require(!Faulted(uintTable), "image table: a table S# with float and uint table T#s faulted:\n" + uintTable.log);
-    Require(TablePointCopy(uintTable, LinearWrap, PointWrap), "image table: a linear table S# has no point-filtered copy");
+    Require(BindlessHeap() || TablePointCopy(uintTable, LinearWrap, PointWrap), "image table: a linear table S# has no point-filtered copy");
     RequireRed(uintTable, 0, Lanes, [](std::uint32_t x) { return UintTexels[x]; }, "uint texels through a linear table sampler");
 
     std::copy(uintImage.begin(), uintImage.end(), Srt.begin() + 16);
@@ -1024,7 +1025,7 @@ void RunReadTests(AgcDriver::VulkanDevice& device) {
 }
 
 void RequireIterations(const Outcome& outcome, std::span<const std::uint32_t> records, const std::string& what) {
-    Require(!Faulted(outcome) && outcome.imageTableCount != 0u, what + ": the loop did not read through the table:\n" + outcome.log);
+    Require(!Faulted(outcome) && (BindlessHeap() || outcome.imageTableCount != 0u), what + ": the loop did not read through the table:\n" + outcome.log);
     for (std::uint32_t iteration = 0; iteration < records.size(); ++iteration) {
         for (std::uint32_t lane = 0; lane < Lanes; ++lane) {
             const auto* texel = Output.data() + (iteration * Lanes + lane) * 4u;
@@ -1057,12 +1058,12 @@ void RunGuardedTableTests(AgcDriver::VulkanDevice& device) {
     Srt[29] = static_cast<std::uint32_t>(pointer >> 32u);
     Srt[30] = 0x12345678u;
     const auto mapped = Run(device, GuardedTableCode, 1, Lanes, 64);
-    Require(mapped.imageTableCount != 0u && mapped.imageTableFaults == 0u && mapped.poisonedSrtReads == 0u && mapped.cacheable && mapped.log.find("BDA access failed") == std::string::npos, "image table guard: a mapped nested read faulted or left the caches:\n" + mapped.log);
+    Require((BindlessHeap() || mapped.imageTableCount != 0u) && mapped.imageTableFaults == 0u && mapped.poisonedSrtReads == 0u && mapped.cacheable && mapped.log.find("BDA access failed") == std::string::npos, "image table guard: a mapped nested read faulted or left the caches:\n" + mapped.log);
     RequireRed(mapped, 0, Lanes, [](std::uint32_t) { return 0x12345678u; }, "image table guard: mapped nested payload");
     Srt[28] = 0u;
     Srt[29] = 0u;
     const auto poisoned = Run(device, GuardedTableCode, 1, Lanes, 64);
-    Require(poisoned.imageTableCount != 0u && poisoned.imageTableFaults == 0u && poisoned.poisonedSrtReads == 1u && !poisoned.cacheable, "image table guard: a poisoned nested read was not captured or stayed cacheable");
+    Require((BindlessHeap() || poisoned.imageTableCount != 0u) && poisoned.imageTableFaults == 0u && poisoned.poisonedSrtReads == 1u && !poisoned.cacheable, "image table guard: a poisoned nested read was not captured or stayed cacheable");
     Require(poisoned.artifactId == mapped.artifactId && poisoned.variantId == mapped.variantId, "image table guard: a poisoned nested read changed the pipeline");
     Require(poisoned.log.find("BDA access failed") != std::string::npos && poisoned.log.find("address=0x0 instruction=0x24 bytes=4") != std::string::npos, "image table guard: a valid table suppressed the nested read's completion fault:\n" + poisoned.log);
     SetClassRecords();
@@ -1222,7 +1223,7 @@ void RunStoreTests(AgcDriver::VulkanDevice& device) {
     mixedCode[18] = 0x00080401u;
     std::copy(ReadTable256Code.begin() + 16u, ReadTable256Code.end(), mixedCode.begin() + 19u);
     const auto mixed = Run(device, mixedCode, 1, Lanes, 64);
-    if (pipelineOnly) Require(mixed.storageTableBinding && mixed.sampledTableBinding && mixed.imageTableCount != 0u, "pipeline-only: the mixed shader did not use both table classes");
+    if (pipelineOnly) Require(mixed.storageTableBinding && (BindlessHeap() || mixed.sampledTableBinding) && mixed.imageTableCount != 0u, "pipeline-only: the mixed shader did not use both table classes");
     Require(!Faulted(mixed), "image table store: mixed sampled/storage bindings faulted:\n" + mixed.log);
     RequireRed(mixed, 0u, Lanes, [](std::uint32_t) { return std::bit_cast<std::uint32_t>(2.5f); }, "image table store: sampled alias did not read the prior store");
     flush();
@@ -1457,7 +1458,7 @@ void RunPointerRecordTests(AgcDriver::VulkanDevice& device) {
     }
     const auto indirect = RunIndirectRecords(device, IndirectRecordCode, 3);
     Require(!Faulted(indirect), "image table: a T# behind a pointer in its record faulted:\n" + indirect.log);
-    Require(indirect.imageTableCount == 3u, "image table: T#s behind pointers in their records do not hold one element per distinct T# (" + std::to_string(indirect.imageTableCount) + ")");
+    Require(BindlessHeap() || indirect.imageTableCount == 3u, "image table: T#s behind pointers in their records do not hold one element per distinct T# (" + std::to_string(indirect.imageTableCount) + ")");
     for (std::uint32_t group = 0; group < 3; ++group) RequireRed(indirect, group, Lanes, texels[2u - group], std::string(names[2u - group]) + " texels of a T# behind a pointer in its record");
 
     const auto entry = Indirect.data() + 16u;
@@ -1485,7 +1486,7 @@ void RunSplitRecordTests(AgcDriver::VulkanDevice& device) {
     for (std::uint32_t group = 0; group < 3; ++group) Keys[group] = 2u - group;
     const auto split = Run(device, SplitRecordCode, 3, Lanes, 64);
     Require(!Faulted(split), "image table: a T# read by two loads of its record faulted:\n" + split.log);
-    Require(split.imageTableCount == 3u, "image table: a T# read by two loads of its record does not hold one element per distinct T# (" + std::to_string(split.imageTableCount) + ")");
+    Require(BindlessHeap() || split.imageTableCount == 3u, "image table: a T# read by two loads of its record does not hold one element per distinct T# (" + std::to_string(split.imageTableCount) + ")");
     for (std::uint32_t group = 0; group < 3; ++group) RequireRed(split, group, Lanes, texels[2u - group], std::string(names[2u - group]) + " texels of a T# read by two loads of its record");
 }
 
@@ -1684,6 +1685,26 @@ void RunBindlessMissTests(AgcDriver::VulkanDevice& device) {
     Require(matched == 3u, "bindless miss: the driver registered " + std::to_string(matched) + " of the 3 missed keys");
 }
 
+void RunBindlessOldPathTests(AgcDriver::VulkanDevice& device) {
+    Fill();
+    SetClassRecords();
+    Keys = {};
+    for (std::uint32_t group = 0; group < 3u; ++group) Keys[group] = group;
+    const auto reusesBefore = AgcDriver::Graphics::ImageTableReuses();
+    const auto oldPathBefore = AgcDriver::Graphics::BindlessOldPathNanoseconds();
+    const auto served = Run(device, TableCode, 3, Lanes, 64);
+    const auto reusesAfter = AgcDriver::Graphics::ImageTableReuses();
+    const auto oldPathAfter = AgcDriver::Graphics::BindlessOldPathNanoseconds();
+    Require(served.bindlessHeap && !served.bindlessTables.empty(), "bindless old path: the table program was not served from the descriptor heap");
+    Require(!served.imageTableBinding, "bindless old path: the heap-served sampled table kept its image table binding");
+    Require(reusesAfter.resolved == reusesBefore.resolved && reusesAfter.reused == reusesBefore.reused, "bindless old path: the old table path resolved or reused a heap-served table");
+    Require(oldPathAfter == oldPathBefore, "bindless old path: the old table path spent " + std::to_string(oldPathAfter - oldPathBefore) + " ns on a heap-served table");
+    Require(!Faulted(served), "bindless old path: the heap-served table faulted:\n" + served.log);
+    RequireRed(served, 0, Lanes, [](std::uint32_t x) { return std::bit_cast<std::uint32_t>(FloatTexels[x]); }, "bindless old path float texels");
+    RequireRed(served, 1, Lanes, [](std::uint32_t x) { return UintTexels[x]; }, "bindless old path uint texels");
+    RequireRed(served, 2, Lanes, [](std::uint32_t x) { return static_cast<std::uint32_t>(SintTexels[x]); }, "bindless old path sint texels");
+}
+
 void RunGraphicsTests(AgcDriver::VulkanDevice& device) {
     const auto floatImage = Image(FloatTexels.data(), Format32Float);
     const auto uintImage = Image(UintTexels.data(), Format32UInt);
@@ -1751,6 +1772,7 @@ int main(int argc, char** argv) {
         RunPointerRecordTests(*device);
         RunSplitRecordTests(*device);
         RunPointerStorageWriteTests(*device);
+        if (BindlessHeap()) RunBindlessOldPathTests(*device);
         RunGraphicsTests(*device);
         if (BindlessHeap()) Require(device->BindlessEntries() != 0u, "image table: the bindless run put no entry into the device table");
         std::puts("image table tests passed");

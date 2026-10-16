@@ -1132,7 +1132,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
             if (artifact.registrationModule) runtimeSelectors.at(input.location / RuntimeAbi::VertexSelectorsPerDword) |= (selectors & 0xfffu) << (input.location % RuntimeAbi::VertexSelectorsPerDword * 16u);
         }
     }
-    if (!plan->bindings.specialization.empty() || variant.bindings.layout.UsesPushData() || !artifact.vertexInputPatches.empty() || request.context.pixel) {
+    if (!plan->bindings.specialization.empty() || variant.bindings.layout.UsesPushData() || !artifact.vertexInputPatches.empty() || request.context.pixel || artifact.bindlessHeap) {
         {
             std::shared_lock lock(plan->mutex);
             if (const auto found = plan->modules.find(moduleKey); found != plan->modules.end()) entry = found->second;
@@ -1172,14 +1172,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
             }
             const auto module = artifact.registrationModule && plan->bindings.specialization.empty() ? registrationModule(artifact.variantId, moduleKey, [&] { return specializeModule(variant.artifact, variant.bindings.layout, vertexClasses, constants, request.target); }) : specializeModule(variant.artifact, variant.bindings.layout, vertexClasses, constants, request.target);
             if (variant.bindings.layout.UsesPushData() && !module->pushData) throw std::runtime_error("specialization removed the prepared push constant interface");
-            auto moduleBindings = module->bindings;
-            if (artifact.bindlessHeap) {
-                for (const auto& binding : plan->bindings.bindings) {
-                    const auto role = binding.descriptor.role;
-                    if (role == DescriptorRole::ImageTable || role == DescriptorRole::SamplerTable || role == DescriptorRole::ImageTableMap || role == DescriptorRole::GuestSamplers) moduleBindings.push_back(binding.descriptor.binding);
-                }
-            }
-            auto selected = DescriptorBindingBuilder{}.Select(plan->bindings, moduleBindings);
+            auto selected = DescriptorBindingBuilder{}.Select(plan->bindings, module->bindings);
             entry->bindings = std::move(selected);
             entry->module = module;
         };
