@@ -222,6 +222,16 @@ std::uint64_t Builds() {
     return counters.hits + counters.misses;
 }
 
+std::uint64_t Counted(const AgcDriver::Graphics::AddressReuseStats& stats, AgcDriver::Graphics::AddressReuse outcome) {
+    return stats.outcomes[static_cast<std::size_t>(outcome)];
+}
+
+std::uint64_t Refusals(const AgcDriver::Graphics::AddressReuseStats& stats) {
+    std::uint64_t refusals = 0;
+    for (const auto count : stats.outcomes) refusals += count;
+    return refusals - Counted(stats, AgcDriver::Graphics::AddressReuse::Reused);
+}
+
 struct Scene {
     AgcDriver::VulkanDevice& device;
     Pages pixels{TargetLayout.Bytes()};
@@ -232,6 +242,7 @@ struct Scene {
     std::size_t ranges;
     std::vector<std::uint32_t> vertexUserData;
     std::vector<std::uint32_t> pixelUserData;
+    std::array<std::uint32_t, PixelCode.size()> pixelProgram = PixelCode;
     ShaderRecompiler::RecompileResult vertexResult;
     ShaderRecompiler::RecompileResult pixelResult;
     std::array<AgcDriver::Graphics::CompiledShader, 2> shaders{};
@@ -278,7 +289,7 @@ struct Scene {
         pixelResult = ShaderRecompiler::Recompile(fragment);
         Require(std::any_of(pixelResult.bindings.begin(), pixelResult.bindings.end(), [](const auto& binding) { return binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable; }), "address draw reuse: the pixel shader does not reach guest memory through the BDA table");
         shaders = {{{ShaderStage::Vertex, &vertexResult, 0}, {ShaderStage::Fragment, &pixelResult, PixelPushOffset(vertexPush, target)}}};
-        snapshots = {{{AddressOf(VertexCode.data()), std::as_bytes(std::span(VertexCode))}, {AddressOf(PixelCode.data()), std::as_bytes(std::span(PixelCode))}}};
+        snapshots = {{{AddressOf(VertexCode.data()), std::as_bytes(std::span(VertexCode))}, {AddressOf(PixelCode.data()), std::as_bytes(std::span(pixelProgram))}}};
         state.stages = {AgcDriver::Graphics::ShaderPath::Vertex, 0u, 64u, 64u, std::nullopt, std::nullopt};
         state.color = {pixels.Address(), {Width, Height}, VK_FORMAT_R8G8B8A8_UNORM, TargetLayout.Bytes(), 0xe4u, ColorTileMode::RenderTarget};
         state.colors = {state.color};
@@ -389,6 +400,38 @@ void Synthetic(Scene& scene, std::size_t draws) {
     Require(waited.builds == 0, "address draw reuse: " + std::to_string(waited.builds) + " of " + std::to_string(draws) + " repeated address-based draws with unchanged inputs built their resources again");
 }
 
+void ReuseCounters(Scene& scene) {
+    using AgcDriver::Graphics::AddressReuse;
+    using AgcDriver::Graphics::AddressReuseCounters;
+    constexpr std::uint64_t Repeats = 4;
+    scene.Clear();
+    scene.Draw();
+    scene.Wait();
+    auto before = AddressReuseCounters();
+    for (std::uint64_t draw = 0; draw < Repeats; ++draw) {
+        scene.Draw();
+        scene.Wait();
+    }
+    auto after = AddressReuseCounters();
+    const auto reused = Counted(after, AddressReuse::Reused) - Counted(before, AddressReuse::Reused);
+    Require(reused == Repeats && after.proofs - before.proofs == Repeats && Refusals(after) == Refusals(before), "address draw reuse: " + std::to_string(Repeats) + " repeated draws with unchanged inputs counted " + std::to_string(reused) + " reuses, " + std::to_string(after.proofs - before.proofs) + " proofs and " + std::to_string(Refusals(after) - Refusals(before)) + " refusals");
+    before = after;
+    scene.Draw();
+    scene.Draw();
+    scene.Wait();
+    after = AddressReuseCounters();
+    Require(Counted(after, AddressReuse::InUse) - Counted(before, AddressReuse::InUse) == 1 && Counted(after, AddressReuse::Reused) - Counted(before, AddressReuse::Reused) == 1 && Refusals(after) - Refusals(before) == 1, "address draw reuse: a draw repeated before the previous one completed was not counted as one refusal in use");
+    before = after;
+    scene.pixelProgram.back() ^= 1u;
+    scene.Draw();
+    scene.Wait();
+    after = AddressReuseCounters();
+    Require(Counted(after, AddressReuse::Snapshots) - Counted(before, AddressReuse::Snapshots) == 1 && Refusals(after) - Refusals(before) == 1 && Counted(after, AddressReuse::Reused) == Counted(before, AddressReuse::Reused), "address draw reuse: a draw after the guest rewrote its pixel program was not counted as one refusal for a changed snapshot");
+    scene.pixelProgram = PixelCode;
+    scene.Draw();
+    scene.Wait();
+}
+
 void GuestWrite(Scene& scene) {
     scene.Clear();
     scene.Draw();
@@ -396,10 +439,13 @@ void GuestWrite(Scene& scene) {
     Scene::Store(scene.guest, ValueOffset, Zero);
     scene.Clear();
     const auto before = Builds();
+    const auto counted = AgcDriver::Graphics::AddressReuseCounters();
     scene.Draw();
     Require(scene.Color() == 0, "address draw reuse: a draw after a guest write rendered the stale value");
     Require(scene.Stored() == Bits(Zero), "address draw reuse: a draw after a guest write stored the stale value through the BDA table");
     Require(Builds() == before, "address draw reuse: a guest write into memory the draw reads in place made it build its resources again");
+    const auto after = AgcDriver::Graphics::AddressReuseCounters();
+    Require(Counted(after, AgcDriver::Graphics::AddressReuse::Reused) == Counted(counted, AgcDriver::Graphics::AddressReuse::Reused) + 1 && Refusals(after) == Refusals(counted), "address draw reuse: a draw after a guest write into memory it reads in place was not counted as one reuse");
     Scene::Store(scene.guest, ValueOffset, One);
     for (int draw = 0; draw < 3; ++draw) {
         scene.Clear();
@@ -443,9 +489,12 @@ void Fault(Scene& scene) {
     scene.Point(scene.guest.Address(ValueOffset));
     scene.Clear();
     const auto afterFault = Builds();
+    const auto counted = AgcDriver::Graphics::AddressReuseCounters();
     scene.Draw();
     Require(scene.Color() == 255 && scene.Stored() == Bits(One), "address draw reuse: the draw after a fault did not read the guest value");
     Require(Builds() == afterFault + 1, "address draw reuse: a build whose draw faulted served the next draw");
+    const auto refused = AgcDriver::Graphics::AddressReuseCounters();
+    Require(Counted(refused, AgcDriver::Graphics::AddressReuse::NotReusable) == Counted(counted, AgcDriver::Graphics::AddressReuse::NotReusable) + 1 && Refusals(refused) == Refusals(counted) + 1, "address draw reuse: the draw after a fault was not counted as one refusal of a build that is no longer reusable");
 #ifdef _WIN32
     VirtualFree(reserved, 0, MEM_RELEASE);
 #else
@@ -563,6 +612,7 @@ void ThrowingProof(AgcDriver::VulkanDevice& device) {
     device.WaitIdle();
     bool threw = false;
     bool reused = false;
+    const auto counted = AgcDriver::Graphics::AddressReuseCounters();
     try {
         reused = resources.Revalidate(stages, nullptr, {});
     } catch (const std::runtime_error&) {
@@ -570,6 +620,8 @@ void ThrowingProof(AgcDriver::VulkanDevice& device) {
     }
     Require(!threw, "address draw reuse: the reuse proof of an address-based draw build whose sampled image's memory became a multisampled target threw instead of refusing the reuse");
     Require(!reused, "address draw reuse: an address-based draw build whose sampled image's memory became a multisampled target was reused");
+    const auto refused = AgcDriver::Graphics::AddressReuseCounters();
+    Require(refused.proofs == counted.proofs + 1 && Counted(refused, AgcDriver::Graphics::AddressReuse::Threw) == Counted(counted, AgcDriver::Graphics::AddressReuse::Threw) + 1 && Refusals(refused) == Refusals(counted) + 1 && Counted(refused, AgcDriver::Graphics::AddressReuse::Reused) == Counted(counted, AgcDriver::Graphics::AddressReuse::Reused), "address draw reuse: a reuse proof that threw was not counted as one refusal that threw");
     resources.WriteBack();
 }
 
@@ -686,6 +738,7 @@ int main(int argc, char** argv) {
                     return VulkanTestSkipped;
                 }
                 Synthetic(scene, draws);
+                ReuseCounters(scene);
                 GuestWrite(scene);
                 Fault(scene);
                 Remap(scene);

@@ -152,6 +152,33 @@ AddressSpaceCache& Spaces() {
     return cache;
 }
 
+struct AddressReuseCounts {
+    std::atomic<std::uint64_t> proofs{0};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(AddressReuse::Count)> outcomes{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(SpaceResumeMiss::Count)> resumeMisses{};
+    std::atomic<std::uint64_t> refusedProofNs{0};
+    std::atomic<std::uint64_t> reusedHolds{0};
+    std::atomic<std::uint64_t> budgetRefusals{0};
+    std::atomic<std::uint64_t> budgetRefusalsHeld{0};
+    std::atomic<std::uint64_t> heldImportRefusals{0};
+    std::atomic<std::uint64_t> heldImportRefusalsHeld{0};
+};
+
+AddressReuseCounts& ReuseCounts() {
+    static AddressReuseCounts counts;
+    return counts;
+}
+
+void countResumeMiss(SpaceResumeMiss miss) {
+    ReuseCounts().resumeMisses[static_cast<std::size_t>(miss)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void countImportRefusal(std::atomic<std::uint64_t> AddressReuseCounts::*all, std::atomic<std::uint64_t> AddressReuseCounts::*held) {
+    auto& counts = ReuseCounts();
+    (counts.*all).fetch_add(1, std::memory_order_relaxed);
+    if (counts.reusedHolds.load(std::memory_order_relaxed) != 0) (counts.*held).fetch_add(1, std::memory_order_relaxed);
+}
+
 bool addressSpaceCacheEnabled() {
     static const bool disabled = std::getenv("APS5_NO_ADDRESS_SPACE_CACHE") != nullptr;
     return !disabled;
@@ -1079,7 +1106,10 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
         return !expandedWindow || Recorder::Active() == nullptr;
     };
     for (auto it = first; it != state.imports.end() && it->first < base + bytes; ++it) {
-        if (held(it->second)) return nullptr;
+        if (held(it->second)) {
+            countImportRefusal(&AddressReuseCounts::heldImportRefusals, &AddressReuseCounts::heldImportRefusalsHeld);
+            return nullptr;
+        }
         replaced += it->second.bytes;
     }
     const auto budget = importBudget(context);
@@ -1094,6 +1124,7 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
             lastReport = std::chrono::steady_clock::now();
             std::fprintf(stderr, "[gpu] host import budget: %llu MiB live of %llu MiB (APS5_HOST_IMPORT_MIB); %llu imports (%llu MiB) refused so far, last 0x%llx+0x%llx\n", static_cast<unsigned long long>(state.liveBytes >> 20u), static_cast<unsigned long long>(budget >> 20u), static_cast<unsigned long long>(refused), static_cast<unsigned long long>(refusedBytes >> 20u), static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes));
         }
+        countImportRefusal(&AddressReuseCounts::budgetRefusals, &AddressReuseCounts::budgetRefusalsHeld);
         return nullptr;
     }
     for (auto it = first; it != state.imports.end() && it->first < base + bytes;) {
@@ -2302,6 +2333,38 @@ AddressSpaceStats AddressSpaceCounters() {
     const auto& cache = Spaces();
     const auto load = [](const std::atomic<std::uint64_t>& counter) { return counter.load(std::memory_order_relaxed); };
     return {addressSpaceCacheEnabled(), load(cache.hits), load(cache.rebuiltFirst), load(cache.rebuiltGeneration), load(cache.rebuiltEpoch), load(cache.rebuiltDevice), load(cache.rebuiltWaiterDrop), load(cache.unpublished), load(cache.dissolvedOverlap), load(cache.dissolvedImports), load(cache.waiterDrops)};
+}
+
+void CountAddressReuseProof() {
+    ReuseCounts().proofs.fetch_add(1, std::memory_order_relaxed);
+}
+
+void CountAddressReuse(AddressReuse outcome, std::uint64_t proofNs) {
+    auto& counts = ReuseCounts();
+    counts.outcomes[static_cast<std::size_t>(outcome)].fetch_add(1, std::memory_order_relaxed);
+    if (outcome != AddressReuse::Reused && proofNs != 0) counts.refusedProofNs.fetch_add(proofNs, std::memory_order_relaxed);
+}
+
+void HoldReusedSpace(bool held) {
+    auto& holds = ReuseCounts().reusedHolds;
+    if (held) holds.fetch_add(1, std::memory_order_relaxed);
+    else holds.fetch_sub(1, std::memory_order_relaxed);
+}
+
+AddressReuseStats AddressReuseCounters() {
+    const auto& counts = ReuseCounts();
+    const auto load = [](const std::atomic<std::uint64_t>& counter) { return counter.load(std::memory_order_relaxed); };
+    AddressReuseStats stats;
+    stats.proofs = load(counts.proofs);
+    for (std::size_t index = 0; index < stats.outcomes.size(); ++index) stats.outcomes[index] = load(counts.outcomes[index]);
+    for (std::size_t index = 0; index < stats.resumeMisses.size(); ++index) stats.resumeMisses[index] = load(counts.resumeMisses[index]);
+    stats.refusedProofNs = load(counts.refusedProofNs);
+    stats.reusedHolds = load(counts.reusedHolds);
+    stats.budgetRefusals = load(counts.budgetRefusals);
+    stats.budgetRefusalsHeld = load(counts.budgetRefusalsHeld);
+    stats.heldImportRefusals = load(counts.heldImportRefusals);
+    stats.heldImportRefusalsHeld = load(counts.heldImportRefusalsHeld);
+    return stats;
 }
 
 std::string AddressCopyOverflow(std::vector<AddressCopy> copies, std::uint64_t limit) {
@@ -4676,17 +4739,30 @@ void GuestBufferMemory::SuspendSpace() noexcept {
 
 bool GuestBufferMemory::ResumeSpace() {
     SuspendSpace();
-    if (!uploaded || committed || !lease.empty() || suspendedSpace == 0) return false;
+    if (!uploaded || committed || !lease.empty() || suspendedSpace == 0) {
+        countResumeMiss(SpaceResumeMiss::State);
+        return false;
+    }
     const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     auto current = Spaces().current.load();
     {
         auto& state = Imports();
         std::lock_guard lock(state.mutex);
-        if (current == nullptr || current->serial != suspendedSpace || spaceMiss(context, current.get(), generation, state) != SpaceMiss::None) return false;
+        if (current == nullptr || current->serial != suspendedSpace) {
+            countResumeMiss(SpaceResumeMiss::Replaced);
+            return false;
+        }
+        if (const auto miss = spaceMiss(context, current.get(), generation, state); miss != SpaceMiss::None) {
+            countResumeMiss(miss == SpaceMiss::Device ? SpaceResumeMiss::Device : miss == SpaceMiss::Generation ? SpaceResumeMiss::Generation : miss == SpaceMiss::Epoch ? SpaceResumeMiss::Epoch : SpaceResumeMiss::Replaced);
+            return false;
+        }
         stampSpaceImports(*current, state);
     }
     std::vector<RefreshBlock> blocks;
-    if (!refreshSparseMirrors(current, blocks)) return false;
+    if (!refreshSparseMirrors(current, blocks)) {
+        countResumeMiss(SpaceResumeMiss::Mirrors);
+        return false;
+    }
     appendWritableMirrors(*current, blocks);
     const auto checked = refreshHeapRuns(*current, blocks);
     compareBlocks(blocks);

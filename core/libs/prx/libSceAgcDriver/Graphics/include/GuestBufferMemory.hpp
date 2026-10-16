@@ -5,6 +5,7 @@
 #include "BdaAbi.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -191,6 +192,24 @@ struct AddressSpaceStats {
     std::uint64_t waiterDrops = 0;
 };
 AddressSpaceStats AddressSpaceCounters();
+
+enum class AddressReuse : std::uint8_t { Reused, NotReusable, InUse, Snapshots, Space, Proof, Imports, Threw, Moved, Count };
+enum class SpaceResumeMiss : std::uint8_t { State, Replaced, Device, Generation, Epoch, Mirrors, Count };
+struct AddressReuseStats {
+    std::uint64_t proofs = 0;
+    std::array<std::uint64_t, static_cast<std::size_t>(AddressReuse::Count)> outcomes{};
+    std::array<std::uint64_t, static_cast<std::size_t>(SpaceResumeMiss::Count)> resumeMisses{};
+    std::uint64_t refusedProofNs = 0;
+    std::uint64_t reusedHolds = 0;
+    std::uint64_t budgetRefusals = 0;
+    std::uint64_t budgetRefusalsHeld = 0;
+    std::uint64_t heldImportRefusals = 0;
+    std::uint64_t heldImportRefusalsHeld = 0;
+};
+void CountAddressReuseProof();
+void CountAddressReuse(AddressReuse outcome, std::uint64_t proofNs = 0);
+void HoldReusedSpace(bool held);
+AddressReuseStats AddressReuseCounters();
 
 struct MirrorStats {
     std::uint64_t heapMirrors = 0;

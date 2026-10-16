@@ -3876,8 +3876,19 @@ bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std
 
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report, std::span<const GuestMemorySnapshot> snapshots) {
     if (!addressReuse) return proveBuild(shaders, report);
-    if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
-    if (!reusable || InUse() || !guestMemory.SameSnapshots(snapshots)) return false;
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto refuse = [&](AddressReuse reason) {
+        CountAddressReuse(reason, profile ? static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()) : 0);
+        return false;
+    };
+    CountAddressReuseProof();
+    ProofReport proof;
+    auto& outcome = report != nullptr ? *report : proof;
+    outcome = {ProofPath::Full, ProofFailure::Other};
+    if (!reusable) return refuse(AddressReuse::NotReusable);
+    if (InUse()) return refuse(AddressReuse::InUse);
+    if (!guestMemory.SameSnapshots(snapshots)) return refuse(AddressReuse::Snapshots);
     struct Suspend {
         GuestBufferMemory& memory;
         bool armed = true;
@@ -3886,17 +3897,19 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         }
     } suspend{guestMemory};
     try {
-        if (!guestMemory.ResumeSpace()) return false;
-        const bool proved = proveBuild(shaders, report);
-        if (proved && guestMemory.SpaceImportsCurrent()) {
-            suspend.armed = false;
-            return true;
+        if (!guestMemory.ResumeSpace()) return refuse(AddressReuse::Space);
+        if (!proveBuild(shaders, &outcome)) return refuse(outcome.failure == ProofFailure::Imports ? AddressReuse::Imports : AddressReuse::Proof);
+        if (!guestMemory.SpaceImportsCurrent()) {
+            outcome.failure = ProofFailure::Imports;
+            return refuse(AddressReuse::Imports);
         }
-        if (proved && report != nullptr) report->failure = ProofFailure::Imports;
     } catch (const std::exception&) {
-        if (report != nullptr) report->failure = ProofFailure::Other;
+        outcome.failure = ProofFailure::Other;
+        return refuse(AddressReuse::Threw);
     }
-    return false;
+    suspend.armed = false;
+    reuseProved = true;
+    return true;
 }
 
 bool ShaderResources::proveBuild(std::span<const CompiledShader> shaders, ProofReport* report) {
@@ -6029,12 +6042,19 @@ void ShaderResources::CheckFaults(std::uint64_t shaderAddress) const {
 std::shared_ptr<const void> ShaderResources::BeginUse() {
     if (!addressReuse) return {};
     struct Use {
-        Use(std::shared_ptr<std::atomic<std::uint32_t>> counter, std::shared_ptr<const void> hold) : uses(std::move(counter)), space(std::move(hold)) { uses->fetch_add(1, std::memory_order_acq_rel); }
-        ~Use() { uses->fetch_sub(1, std::memory_order_acq_rel); }
+        Use(std::shared_ptr<std::atomic<std::uint32_t>> counter, std::shared_ptr<const void> hold, bool reusedSpace) : uses(std::move(counter)), space(std::move(hold)), reused(reusedSpace) {
+            uses->fetch_add(1, std::memory_order_acq_rel);
+            if (reused) HoldReusedSpace(true);
+        }
+        ~Use() {
+            if (reused) HoldReusedSpace(false);
+            uses->fetch_sub(1, std::memory_order_acq_rel);
+        }
         std::shared_ptr<std::atomic<std::uint32_t>> uses;
         std::shared_ptr<const void> space;
+        bool reused;
     };
-    return std::make_shared<const Use>(usesInFlight, guestMemory.SpaceHold());
+    return std::make_shared<const Use>(usesInFlight, guestMemory.SpaceHold(), std::exchange(reuseProved, false));
 }
 
 void ShaderResources::CompleteUse() {
@@ -6053,7 +6073,9 @@ void ShaderResources::CompleteUse() {
 }
 
 void ShaderResources::EndUse() noexcept {
-    if (addressReuse) guestMemory.SuspendSpace();
+    if (!addressReuse) return;
+    reuseProved = false;
+    guestMemory.SuspendSpace();
 }
 
 void ShaderResources::WriteBackBuffers(std::uint64_t shaderAddress) {

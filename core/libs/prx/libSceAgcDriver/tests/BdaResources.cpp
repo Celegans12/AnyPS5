@@ -1956,15 +1956,21 @@ void addressFailedSubmissionTests(const Context& context, const BdaTestAccess& a
     const std::array<CompiledShader, 2> stages{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}}};
     std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
     Recorder recorder(context);
-    {
+    for (const bool reuse : {false, true}) {
         auto resources = std::make_shared<ShaderResources>(context, stages, ColorTarget{}, 0, 0, 0, std::span<const GuestMemorySnapshot>{});
         Require(resources->UsesAddressTable() && resources->Reusable(), "an address-based draw build is not reusable");
+        if (reuse) {
+            resources->EndUse();
+            Require(resources->Revalidate(stages, nullptr, {}), "an unchanged address-based draw build was not proved reusable");
+        }
+        const auto holds = AddressReuseCounters().reusedHolds;
         recorder.OnComplete([resources, hold = resources->BeginUse()]() mutable {
             const auto held = std::move(hold);
             resources->CompleteUse();
         });
         resources->EndUse();
         Require(resources->InUse(), "an address-based draw build taken by a recorded batch is not in use");
+        Require(AddressReuseCounters().reusedHolds == holds + (reuse ? 1u : 0u), reuse ? "a reused address-based draw did not count its hold of the space" : "a built address-based draw counted a reused hold of the space");
         access.submitResult(VK_ERROR_OUT_OF_HOST_MEMORY);
         bool failed = false;
         try {
@@ -1975,6 +1981,7 @@ void addressFailedSubmissionTests(const Context& context, const BdaTestAccess& a
         access.submitResult(VK_SUCCESS);
         Require(failed, "a batch whose submission failed did not report it");
         Require(!resources->InUse(), "an address-based draw build stayed in use after the batch that took it failed to submit");
+        Require(AddressReuseCounters().reusedHolds == holds, "a reused address-based draw's hold of its space stayed counted after the batch that took it failed to submit");
         resources->WriteBack();
     }
     recorder.Sync();
