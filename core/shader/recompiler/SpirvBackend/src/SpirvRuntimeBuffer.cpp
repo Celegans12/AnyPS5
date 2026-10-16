@@ -824,14 +824,14 @@ std::uint32_t formattedGpuCall(SpirvValueEmitContext& context, const IrValue& in
         state.module.AddName(id, std::string(store ? "store" : "load") + "_formatted_gpu_buffer_x" + std::to_string(components));
         state.module.AddFunction(spv::OpFunction, resultType, id, spv::FunctionControlDontInlineMask, functionType);
         const std::array<std::uint32_t, 11> types{u64, u32, u32, u32, boolean, u32, boolean, u32, u32, u32, valueType};
-        std::array<std::uint32_t, 10> parameters{};
-        for (std::uint32_t index = 0; index < parameters.size(); ++index) {
+        std::array<std::uint32_t, 11> parameters{};
+        for (std::uint32_t index = 0; index < (store ? 11u : 10u); ++index) {
             parameters[index] = state.module.AllocateId();
             state.module.AddFunction(spv::OpFunctionParameter, types[index], parameters[index]);
         }
         EmitLabel(state, state.module.AllocateId());
         const auto zero = components == 1u ? ConstantU32(state, 0u) : ConstantU32CompositeZero(state, components);
-        if (stops) state.bdaStopValue = state.module.Constant(spv::OpConstantComposite, resultType, zero, ConstantU32(state, 1u));
+        if (stops) state.bdaStopValue = store ? ConstantU32(state, 1u) : state.module.Constant(spv::OpConstantComposite, resultType, zero, ConstantU32(state, 1u));
         state.bdaPcOverride = parameters[9];
         const RuntimeDescriptor shared{parameters[0], parameters[1], parameters[2], parameters[3], parameters[4], parameters[5], parameters[6], parameters[7], parameters[8]};
         const auto value = formatSwitch(context, instruction, shared, components, store, store ? parameters[10] : 0u);
@@ -850,9 +850,14 @@ std::uint32_t formattedGpuCall(SpirvValueEmitContext& context, const IrValue& in
     }
     const auto offset = Binary(state, spv::OpIAdd, u32, context.Arg(instruction, 2u), ConstantU32(state, memory.offset));
     std::vector<std::uint32_t> call{spv::OpFunctionCall, resultType, state.module.AllocateId(), function->second, resource.base, resource.records, resource.stride, resource.word3, resource.swizzle, resource.index, resource.valid, offset, context.Arg(instruction, 3u), BdaInstructionPc(state, instruction)};
+    if (store) call.push_back(data);
     state.module.AddFunction(call);
     const auto result = call[2];
-    if (!stops) return result;
+    if (!stops) return store ? ConstantU32(state, 0u) : result;
+    if (store) {
+        StopBdaInvocationIf(state, Binary(state, spv::OpINotEqual, boolean, result, ConstantU32(state, 0u)));
+        return ConstantU32(state, 0u);
+    }
     const auto stopped = state.module.AllocateId();
     state.module.AddFunction(spv::OpCompositeExtract, u32, stopped, result, 1u);
     StopBdaInvocationIf(state, Binary(state, spv::OpINotEqual, boolean, stopped, ConstantU32(state, 0u)));

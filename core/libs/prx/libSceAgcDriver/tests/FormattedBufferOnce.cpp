@@ -3,11 +3,13 @@
 #include <array>
 #include <cstdio>
 #include <exception>
+#include <map>
 #include <span>
 #include <spirv/unified1/spirv.hpp>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -38,6 +40,36 @@ struct Counts {
     std::size_t compareExchanges = 0;
 };
 
+void CheckFunctions(std::span<const std::uint32_t> words) {
+    std::map<std::uint32_t, std::size_t> typeParameters;
+    std::map<std::uint32_t, std::size_t> functionParameters;
+    std::vector<std::pair<std::size_t, std::size_t>> calls;
+    std::uint32_t function = 0;
+    std::size_t expected = 0;
+    for (std::size_t offset = 5; offset < words.size();) {
+        const auto count = words[offset] >> spv::WordCountShift;
+        const auto opcode = words[offset] & spv::OpCodeMask;
+        if (opcode == spv::OpTypeFunction) typeParameters[words[offset + 1]] = count - 3u;
+        if (opcode == spv::OpFunction) {
+            function = words[offset + 2];
+            expected = typeParameters.at(words[offset + 4]);
+            functionParameters[function] = 0;
+        }
+        if (opcode == spv::OpFunctionParameter) ++functionParameters.at(function);
+        if (opcode == spv::OpFunctionEnd) {
+            Check(functionParameters.at(function) == expected, "formatted buffer once: function %" + std::to_string(function) + " declares " + std::to_string(functionParameters.at(function)) + " parameters, its type has " + std::to_string(expected));
+            function = 0;
+        }
+        if (opcode == spv::OpFunctionCall) calls.emplace_back(offset, count);
+        offset += count;
+    }
+    for (const auto& [offset, count] : calls) {
+        const auto callee = words[offset + 3];
+        Check(functionParameters.contains(callee) && functionParameters.at(callee) == count - 4u, "formatted buffer once: a call passes " + std::to_string(count - 4u) + " arguments to %" + std::to_string(callee));
+        for (std::size_t operand = 4; operand < count; ++operand) Check(words[offset + operand] < words[3], "formatted buffer once: a call to %" + std::to_string(callee) + " passes the id " + std::to_string(words[offset + operand]) + ", past the module bound " + std::to_string(words[3]));
+    }
+}
+
 Counts Count(std::span<const std::uint32_t> words) {
     Check(words.size() >= 5 && words[0] == spv::MagicNumber, "formatted buffer once: missing SPIR-V module");
     Counts counts{words.size()};
@@ -54,12 +86,14 @@ Counts Count(std::span<const std::uint32_t> words) {
         }
         offset += count;
     }
+    CheckFunctions(words);
     return counts;
 }
 
-Counts Compile(std::size_t loads, bool formattedStores = false, bool gpu = false, bool vertex = false, bool registration = false) {
+Counts Compile(std::size_t loads, bool formattedStores = false, bool gpu = false, bool vertex = false, bool registration = false, bool gpuStores = false, bool wave64Bindless = false) {
     std::vector<std::uint32_t> code;
     if (gpu) code.push_back(0x7e160500u);
+    if (gpuStores) code.push_back(0x7e0e0500u);
     for (std::uint32_t load = 0; load < loads; ++load) code.insert(code.end(), {0xe0000000u | (load * 4u), 0x80020000u | ((10u + load) << 8u)});
     code.push_back(0xbf8c3f70u);
     for (std::uint32_t load = 0; load < loads; ++load) code.insert(code.end(), {(formattedStores ? 0xe0100000u : 0xe0700000u) | (load * 4u), 0x80010000u | ((10u + load) << 8u)});
@@ -72,12 +106,13 @@ Counts Compile(std::size_t loads, bool formattedStores = false, bool gpu = false
     request.shader = {vertex ? ShaderStage::Vertex : ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), words, 0, {}};
     request.target = Target();
     request.target.registrationModules = registration;
+    request.target.bindlessImages = wave64Bindless;
     request.layout = {0, 0, 0, 128};
-    request.context.waveSize = 32;
+    request.context.waveSize = wave64Bindless ? 64u : 32u;
     request.context.userDataBaseRegister = 0;
     request.context.userData = userData;
     if (vertex) request.context.vertex = ShaderVertexStageInfo{};
-    else request.context.compute = ShaderComputeStageInfo{{32u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
+    else request.context.compute = ShaderComputeStageInfo{{wave64Bindless ? 64u : 32u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
     request.context.memory = memory;
     request.useCache = false;
     return Count(Recompile(request).spirv.Words());
@@ -110,6 +145,11 @@ int main() {
         Check(gpuThree.switches == gpuOne.switches, "formatted buffer once: two more formatted loads from a GPU-selected descriptor emitted " + std::to_string(gpuThree.switches - gpuOne.switches) + " more format switches");
         Check(gpuThree.words - gpuOne.words < gpuOne.words / 10u, "formatted buffer once: 2 more formatted loads from a GPU-selected descriptor added " + std::to_string(gpuThree.words - gpuOne.words) + " SPIR-V words to a " + std::to_string(gpuOne.words) + "-word module");
         Check(gpuOne.words < 40000u, "formatted buffer once: a formatted load from a GPU-selected descriptor takes " + std::to_string(gpuOne.words) + " SPIR-V words, expected under 40000 since every driver that inlines the shared function copies all of it");
+        const auto gpuStoreOne = Compile(1, true, true, false, false, true);
+        const auto gpuStoreThree = Compile(3, true, true, false, false, true);
+        const auto gpuStoreWave64 = Compile(3, true, true, false, false, true, true);
+        Check(gpuStoreOne.functions > gpuOne.functions, "formatted buffer once: a formatted store through a GPU-selected descriptor emitted no shared store function");
+        Check(gpuStoreThree.functions == gpuStoreOne.functions && gpuStoreThree.calls > gpuStoreOne.calls && gpuStoreWave64.functions == gpuStoreOne.functions, "formatted buffer once: two more formatted stores through a GPU-selected descriptor emitted " + std::to_string(gpuStoreThree.functions - gpuStoreOne.functions) + " more functions (wave64 with bindless images " + std::to_string(gpuStoreWave64.functions) + " of " + std::to_string(gpuStoreOne.functions) + "), expected calls to the shared one");
         std::printf("formatted buffer once tests passed (%zu words for 1 load, %zu for 3; GPU-selected %zu and %zu; vertex %zu specialized, %zu registration)\n", one.words, three.words, gpuOne.words, gpuThree.words, vertexSpecialized.words, vertexRegistration.words);
         return 0;
     } catch (const std::exception& error) {
