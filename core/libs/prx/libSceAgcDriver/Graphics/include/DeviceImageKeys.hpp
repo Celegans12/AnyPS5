@@ -23,7 +23,7 @@ class DeviceImageKeys {
 public:
     using Key = ShaderRecompiler::DeviceImageTableAbi::Key;
     static constexpr std::uint32_t InitialBuckets = 4096u;
-    static constexpr std::uint32_t MaxBuckets = 1u << 19u;
+    static constexpr std::uint32_t MaxBuckets = 1u << 21u;
 
     explicit DeviceImageKeys(std::uint32_t buckets = InitialBuckets, std::uint32_t maxBuckets = MaxBuckets);
 
