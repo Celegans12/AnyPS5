@@ -27,6 +27,8 @@
 namespace GuestArena {
 namespace {
 
+std::atomic<void (*)(std::uintptr_t, std::size_t)> hostWriteHook{nullptr};
+
 #ifdef _WIN32
 std::atomic<std::uint64_t> commitGeneration{1};
 std::atomic<void (*)(std::uintptr_t, std::size_t, std::uint64_t)> privateMappingObserver{nullptr};
@@ -484,16 +486,12 @@ bool GuestArenaWriteWatched_nid_postfix() {
     return Arena::Get().WriteWatched();
 }
 
-namespace {
-std::atomic<void (*)(void*, std::size_t)> hostWriteObserver{nullptr};
-}
-
-void GuestArenaSetHostWriteObserver_nid_postfix(void (*observer)(void* pointer, std::size_t bytes)) {
-    hostWriteObserver.store(observer, std::memory_order_release);
+void GuestArenaSetHostWriteHook_nid_no_patch(void (*hook)(std::uintptr_t, std::size_t)) {
+    hostWriteHook.store(hook, std::memory_order_release);
 }
 
 bool GuestArenaBeginHostWrite_nid_postfix(void* pointer, std::size_t bytes) {
-    if (const auto observer = hostWriteObserver.load(std::memory_order_acquire); observer != nullptr && bytes != 0) observer(pointer, bytes);
+    if (const auto hook = hostWriteHook.load(std::memory_order_acquire); hook != nullptr && bytes != 0) hook(reinterpret_cast<std::uintptr_t>(pointer), bytes);
 #ifdef _WIN32
     return WindowsMappings::Get().BeginHostWrite(reinterpret_cast<std::uintptr_t>(pointer), bytes);
 #else

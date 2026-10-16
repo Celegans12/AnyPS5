@@ -87,7 +87,7 @@ Driver& Driver::Get() {
 }
 
 Driver::~Driver() {
-    GuestArena::GuestArenaSetHostWriteObserver_nid_postfix(nullptr);
+    GuestArena::GuestArenaSetHostWriteHook_nid_no_patch(nullptr);
     GuestAllocations::GuestAllocationsSetGpuMapObserver_nid_postfix(nullptr);
     stop();
 }
@@ -140,7 +140,7 @@ Driver::Driver() {
         stop();
         throw;
     }
-    GuestArena::GuestArenaSetHostWriteObserver_nid_postfix(&GuestMemory::FlushBeforeHostWrite);
+    GuestArena::GuestArenaSetHostWriteHook_nid_no_patch(&GuestMemory::PrepareHostWrite);
     GuestAllocations::GuestAllocationsSetGpuMapObserver_nid_postfix([](const GuestAllocations::Mapped& ranges, std::uint64_t generation) {
         const auto import = [&] {
             try {

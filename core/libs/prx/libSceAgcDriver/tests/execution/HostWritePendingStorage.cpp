@@ -242,9 +242,9 @@ void HostWriteCost(std::size_t rounds) {
         double bare = 1e300;
         for (int pass = 0; pass < 5; ++pass) {
             hooked = std::min(hooked, HostWriteNanoseconds(idle.Data(), rounds));
-            GuestArena::GuestArenaSetHostWriteObserver_nid_postfix(nullptr);
+            GuestArena::GuestArenaSetHostWriteHook_nid_no_patch(nullptr);
             bare = std::min(bare, HostWriteNanoseconds(idle.Data(), rounds));
-            GuestArena::GuestArenaSetHostWriteObserver_nid_postfix(&AgcDriver::GuestMemory::FlushBeforeHostWrite);
+            GuestArena::GuestArenaSetHostWriteHook_nid_no_patch(&AgcDriver::GuestMemory::PrepareHostWrite);
         }
         std::printf("host write cost, %s: %.1f ns per 64 KiB host write with the flush before it, %.1f ns without (best of 5 x %zu)\n", state, hooked, bare, rounds);
     };

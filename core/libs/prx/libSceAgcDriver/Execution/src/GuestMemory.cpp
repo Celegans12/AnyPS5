@@ -2139,10 +2139,10 @@ void FlushGpuWrites(std::uint64_t address, std::size_t bytes) {
     if (const auto hook = flushHook.load(std::memory_order_acquire)) hook(address, bytes);
 }
 
-void FlushBeforeHostWrite(void* pointer, std::size_t bytes) {
+void PrepareHostWrite(std::uintptr_t address, std::size_t bytes) {
     if (ownHostWrite || bytes == 0) return;
     const ReadSiteScope site(ReadSite::Store);
-    FlushGpuWrites(reinterpret_cast<std::uint64_t>(pointer), bytes);
+    FlushGpuWrites(address, bytes);
 }
 
 void Read(std::uint64_t address, std::span<std::byte> destination, std::size_t alignment) {
