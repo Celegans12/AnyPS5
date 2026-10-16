@@ -325,7 +325,7 @@ void Append(std::string& line, const char* format, auto... args) {
 unsigned CrtCensusEvery() {
     static const unsigned every = [] {
         const char* value = std::getenv("APS5_MEM_STATS_CRT_EVERY");
-        if (value == nullptr) return 6u;
+        if (value == nullptr) return 30u;
         char* end = nullptr;
         const auto parsed = std::strtoul(value, &end, 10);
         if (end == value || *end != '\0' || parsed > 1000ul) throw std::runtime_error(std::string("APS5_MEM_STATS_CRT_EVERY=") + value + ": expected a report count from 0 (off) to 1000");
@@ -363,6 +363,7 @@ void AppendProcess(std::string& line) {
     if (CrtCensusEvery() != 0u && census++ % CrtCensusEvery() == 0u && HeapLock(crt)) {
         const auto heapStarted = std::chrono::steady_clock::now();
         std::unordered_map<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>> sizes;
+        std::unordered_map<std::uint64_t, std::uint64_t> smallSizes;
         std::uint64_t largeBytes = 0, largeBlocks = 0, smallBytes = 0, smallBlocks = 0;
         PROCESS_HEAP_ENTRY entry{};
         while (HeapWalk(crt, &entry)) {
@@ -370,6 +371,7 @@ void AppendProcess(std::string& line) {
             if (entry.cbData < (1ull << 20u)) {
                 smallBytes += entry.cbData;
                 ++smallBlocks;
+                ++smallSizes[entry.cbData];
                 continue;
             }
             largeBytes += entry.cbData;
@@ -385,6 +387,12 @@ void AppendProcess(std::string& line) {
         std::partial_sort(top.begin(), top.begin() + static_cast<std::ptrdiff_t>(shown), top.end(), std::greater<>());
         Append(line, " crt_small=%.0fMB(%llu) crt_large=%.0fMB(%llu) crt_large_top=", smallBytes / MiB, static_cast<unsigned long long>(smallBlocks), largeBytes / MiB, static_cast<unsigned long long>(largeBlocks));
         for (std::size_t i = 0; i < shown; ++i) Append(line, "%s%.2fMBx%llu", i == 0 ? "" : ",", static_cast<double>(top[i].second << 16u) / MiB, static_cast<unsigned long long>(sizes[top[i].second].second));
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> smallTop;
+        for (const auto& [bytes, count] : smallSizes) smallTop.emplace_back(bytes * count, bytes);
+        const auto smallShown = std::min<std::size_t>(smallTop.size(), 8);
+        std::partial_sort(smallTop.begin(), smallTop.begin() + static_cast<std::ptrdiff_t>(smallShown), smallTop.end(), std::greater<>());
+        line += " crt_small_top=";
+        for (std::size_t i = 0; i < smallShown; ++i) Append(line, "%s%lluBx%llu", i == 0 ? "" : ",", static_cast<unsigned long long>(smallTop[i].second), static_cast<unsigned long long>(smallSizes[smallTop[i].second]));
         Append(line, " crt_ms=%lld", static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - heapStarted).count()));
     }
     if (GuestArena::GuestArenaAvailable_nid_postfix()) {
@@ -394,7 +402,7 @@ void AppendProcess(std::string& line) {
     }
 
     const auto started = std::chrono::steady_clock::now();
-    const auto deadline = started + std::chrono::milliseconds(500);
+    const auto deadline = started + std::chrono::milliseconds(1500);
     std::uintptr_t arenaBase = 0;
     std::size_t arenaBytes = 0;
     if (GuestArena::GuestArenaAvailable_nid_postfix()) GuestArena::GuestArenaRange_nid_postfix(&arenaBase, &arenaBytes);
@@ -402,8 +410,8 @@ void AppendProcess(std::string& line) {
         const auto value = reinterpret_cast<std::uintptr_t>(address);
         return value >= arenaBase && value - arenaBase < arenaBytes;
     };
-    std::uint64_t privateCommitted = 0, mappedCommitted = 0, imageCommitted = 0, regions = 0, privateGuest = 0, mappedGuest = 0;
-    std::unordered_map<std::uintptr_t, std::uint64_t> privateByAllocation;
+    std::uint64_t privateCommitted = 0, mappedCommitted = 0, imageCommitted = 0, regions = 0, privateGuest = 0, mappedGuest = 0, hostWriteCombined = 0;
+    std::unordered_map<std::uintptr_t, std::uint64_t> privateByAllocation, hostByAllocation;
     bool partial = false;
     MEMORY_BASIC_INFORMATION info;
     for (auto* address = static_cast<const char*>(nullptr); VirtualQuery(address, &info, sizeof(info)) == sizeof(info);) {
@@ -411,6 +419,10 @@ void AppendProcess(std::string& line) {
             if (info.Type == MEM_PRIVATE) {
                 privateCommitted += info.RegionSize;
                 if (inArena(info.BaseAddress)) privateGuest += info.RegionSize;
+                else {
+                    hostByAllocation[reinterpret_cast<std::uintptr_t>(info.AllocationBase)] += info.RegionSize;
+                    if ((info.Protect & PAGE_WRITECOMBINE) != 0) hostWriteCombined += info.RegionSize;
+                }
                 privateByAllocation[reinterpret_cast<std::uintptr_t>(info.AllocationBase)] += info.RegionSize;
             } else if (info.Type == MEM_MAPPED) {
                 mappedCommitted += info.RegionSize;
@@ -441,6 +453,21 @@ void AppendProcess(std::string& line) {
     Append(line, " vq_private=%.0fMB vq_mapped=%.0fMB vq_image=%.0fMB vq_private_allocs=%zu vq_private_ge64MB=%.0fMB(%zu) vq_private_lt1MB=%.0fMB",
            privateCommitted / MiB, mappedCommitted / MiB, imageCommitted / MiB, privateByAllocation.size(), over64 / MiB, over64Count, under1 / MiB);
     Append(line, " vq_private_guest_arena=%.0fMB vq_private_host=%.0fMB vq_mapped_guest_arena=%.0fMB", privateGuest / MiB, (privateCommitted - privateGuest) / MiB, mappedGuest / MiB);
+    std::uint64_t hostSmall = 0, hostMid = 0, hostLarge = 0;
+    std::size_t hostSmallCount = 0, hostMidCount = 0, hostLargeCount = 0;
+    for (const auto& [base, bytes] : hostByAllocation) {
+        if (bytes < (1ull << 20u)) {
+            hostSmall += bytes;
+            ++hostSmallCount;
+        } else if (bytes < (64ull << 20u)) {
+            hostMid += bytes;
+            ++hostMidCount;
+        } else {
+            hostLarge += bytes;
+            ++hostLargeCount;
+        }
+    }
+    Append(line, " vq_host_lt1MB=%.0fMB(%zu) vq_host_1to64MB=%.0fMB(%zu) vq_host_ge64MB=%.0fMB(%zu) vq_host_write_combined=%.0fMB", hostSmall / MiB, hostSmallCount, hostMid / MiB, hostMidCount, hostLarge / MiB, hostLargeCount, hostWriteCombined / MiB);
     line += " vq_top=";
     for (std::size_t i = 0; i < top; ++i) Append(line, "%s0x%llx:%.0fMB", i == 0 ? "" : ",", static_cast<unsigned long long>(largest[i].second), largest[i].first / MiB);
     Append(line, " vq_ms=%lld%s", static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count()), partial ? " vq_partial=1" : "");
@@ -584,7 +611,7 @@ void Start() {
         if (state.started || state.stopping) return;
         state.started = true;
     }
-    std::fprintf(stderr, "[mem] reporter every %u s (APS5_MEM_STATS); fields: process_* from GetProcessMemoryInfo, other_heaps from HeapSummary (the CRT heap is not summarized: HeapSummary holds its lock for seconds once it reaches GBs), crt_small/crt_large/crt_large_top from a HeapWalk of the CRT heap every APS5_MEM_STATS_CRT_EVERY reports (default 6, 0 = off; it holds the heap lock for crt_ms), guest_saved = private copies of unmapped resident direct memory, vq_* from a VirtualQuery walk (committed bytes), vk_* from the device's vkAllocateMemory/vkFreeMemory, devmem_/hostmem_/importmem_<owner> charge each allocation to the owner scope it was made in (pool_* = the buffer pool's own allocations), img_/buf_<owner> count live VkImages/VkBuffers by owner, pooled_<owner> = live pooled buffer objects by the owner that asked, vk_device_unattributed = device memory made outside every owner scope, the other fields are live MB(objects)\n", PeriodSeconds());
+    std::fprintf(stderr, "[mem] reporter every %u s (APS5_MEM_STATS); fields: process_* from GetProcessMemoryInfo, other_heaps from HeapSummary (the CRT heap is not summarized: HeapSummary holds its lock for seconds once it reaches GBs), crt_small/crt_large/crt_large_top/crt_small_top from a HeapWalk of the process heap, which the Vulkan driver's allocations share, every APS5_MEM_STATS_CRT_EVERY reports (default 30, 0 = off; it holds the heap lock for crt_ms), guest_saved = private copies of unmapped resident direct memory, vq_* from a VirtualQuery walk (committed bytes; vq_private_lt1MB/ge64MB count guest arena mappings too, vq_host_* only allocations outside the arena, vq_host_write_combined = write-combined private memory, which the Vulkan driver commits for device-local allocations), vk_* from the device's vkAllocateMemory/vkFreeMemory, devmem_/hostmem_/importmem_<owner> charge each allocation to the owner scope it was made in (pool_* = the buffer pool's own allocations), img_/buf_<owner> count live VkImages/VkBuffers by owner, pooled_<owner> = live pooled buffer objects by the owner that asked, vk_device_unattributed = device memory made outside every owner scope, the other fields are live MB(objects)\n", PeriodSeconds());
     std::thread([] {
         auto& state = Get();
         std::unique_lock lock(state.reportMutex);
