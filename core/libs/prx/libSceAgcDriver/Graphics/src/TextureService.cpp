@@ -4,6 +4,7 @@
 #include "BindlessImageAbi.hpp"
 #include "Recompiler.hpp"
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -39,6 +40,39 @@ double Milliseconds(std::uint64_t nanoseconds) {
     return static_cast<double>(nanoseconds) / 1.0e6;
 }
 
+constexpr std::array<const char*, static_cast<std::size_t>(BindlessRefusalKind::Count)> RefusalKindNames{"storage", "msaa", "compare", "unmapped", "no-mode", "sampler", "interface", "other"};
+
+std::string NormalizedReason(std::string_view reason) {
+    std::string normalized;
+    for (std::size_t index = 0; index < reason.size();) {
+        if (reason.substr(index, 2) == "0x") {
+            index += 2u;
+            while (index < reason.size() && std::isxdigit(static_cast<unsigned char>(reason[index])) != 0) ++index;
+            normalized += '#';
+            continue;
+        }
+        if (std::isdigit(static_cast<unsigned char>(reason[index])) != 0) {
+            while (index < reason.size() && std::isdigit(static_cast<unsigned char>(reason[index])) != 0) ++index;
+            normalized += '#';
+            continue;
+        }
+        normalized += reason[index++];
+    }
+    return normalized;
+}
+
+}
+
+BindlessRefusalKind ClassifyBindlessRefusal(std::string_view reason) {
+    const auto has = [&](std::string_view text) { return reason.find(text) != std::string_view::npos; };
+    if (has("storage image read or written through the bindless heap")) return BindlessRefusalKind::Storage;
+    if (has("multisampled image read through the bindless heap")) return BindlessRefusalKind::Multisample;
+    if (has("comparison sampling of a color texture")) return BindlessRefusalKind::ColorCompare;
+    if (has("is not mapped")) return BindlessRefusalKind::Unmapped;
+    if (has("matches no runtime mode")) return BindlessRefusalKind::NoMode;
+    if (has("which no compiled program registered")) return BindlessRefusalKind::Interface;
+    if (has("sampler") || has("ANISO_OVERRIDE")) return BindlessRefusalKind::Sampler;
+    return BindlessRefusalKind::Other;
 }
 
 std::size_t TextureService::KeyHash::operator()(const DeviceImageKeys::Key& key) const noexcept {
@@ -166,6 +200,12 @@ BindlessPrepared TextureService::prepare(const DeviceImageKeys::Key& key) {
         auto prepared = resolver->Prepare(key);
         prepared.key = key;
         return prepared;
+    } catch (const BindlessKeyRefusal& error) {
+        BindlessPrepared refused;
+        refused.key = key;
+        refused.refusal = error.what();
+        refused.permanent = true;
+        return refused;
     } catch (const std::runtime_error& error) {
         BindlessPrepared refused;
         refused.key = key;
@@ -295,7 +335,12 @@ BindlessResolution TextureService::settle(const BindlessPrepared& prepared) {
     return resolver->Commit(prepared);
 }
 
-std::uint32_t TextureService::refuse(const DeviceImageKeys::Key& key, const std::string& reason) {
+std::uint32_t TextureService::refuse(const DeviceImageKeys::Key& key, const std::string& reason, bool permanent) {
+    ++totals.refusals[static_cast<std::size_t>(ClassifyBindlessRefusal(reason))];
+    if (permanent) permanentRefusals.insert(key);
+    if (BindlessStatsRequested()) {
+        if (auto normalized = NormalizedReason(reason); reportedReasons.insert(normalized).second) std::fprintf(stderr, "[bindless] refusal reason (first of its kind, %s, %s): %s\n", RefusalKindNames[static_cast<std::size_t>(ClassifyBindlessRefusal(reason))], permanent ? "kept" : "retried on mapping changes", normalized.c_str());
+    }
     std::string message = "(words";
     for (std::uint32_t word = 0; word < Abi::DescriptorWords; ++word) {
         char text[12];
@@ -442,6 +487,7 @@ void TextureService::replace(const DeviceImageKeys::Key& key, Recorder& recorder
     auto prepared = prepare(key);
     BindlessResolution fresh;
     std::string refusal = prepared.refusal;
+    const bool permanent = prepared.permanent;
     if (refusal.empty()) {
         try {
             fresh = settle(prepared);
@@ -470,7 +516,7 @@ void TextureService::replace(const DeviceImageKeys::Key& key, Recorder& recorder
     const auto old = take(key);
     if (!refusal.empty()) {
         fresh = {};
-        fresh.value.fault = refuse(key, refusal);
+        fresh.value.fault = refuse(key, refusal, permanent);
     }
     place(key, std::move(fresh), recorder, lastUsed);
     if (perUseKeys.contains(key) == wasPerUse) perUseEpoch = epoch;
@@ -494,7 +540,7 @@ void TextureService::commitPrepared(std::vector<BindlessPrepared>& prepared, Rec
         lock.lock();
         if (!refusal.empty()) {
             resolution = {};
-            resolution.value.fault = refuse(item.key, refusal);
+            resolution.value.fault = refuse(item.key, refusal, item.permanent && refusal == item.refusal);
         }
         install(item.key, std::move(resolution), recorder);
     }
@@ -748,7 +794,8 @@ void TextureService::checkMapping(Recorder& recorder) {
     }
     for (const auto& [key, entry] : entries) {
         if (entry.value.fault != 0u) {
-            retiring.insert(key);
+            if (permanentRefusals.contains(key)) ++totals.keptRefusals;
+            else retiring.insert(key);
             continue;
         }
         if (entry.resolution.bytes == 0 || memory->Mapped(entry.resolution.address, static_cast<std::size_t>(entry.resolution.bytes))) continue;
@@ -892,9 +939,16 @@ std::string TextureService::TakeFrameLine(std::uint64_t oldPathNanoseconds) {
     const auto oldPath = oldPathNanoseconds - std::min(oldPathNanoseconds, reportedOldPath);
     reportedOldPath = oldPathNanoseconds;
     const auto delta = [](std::uint64_t current, std::uint64_t previous) { return static_cast<unsigned long long>(current - previous); };
-    char text[1024];
-    std::snprintf(text, sizeof(text), "[bindless] frame %llu: misses %llu (%llu dropped), created %llu, refused %llu, primed %llu tables (%llu records, %llu new keys, primer %.1f ms), re-decoded %llu pages (%llu records changed), served-checked %llu (%llu stale), queue %llu, revalidated %llu (%llu stale, %llu per-use, %llu dcc), retired %llu (%llu unmapped, %llu evicted, %llu full), serve %.1f ms over %llu calls, present wait %.1f ms, entries %llu, slots %llu+%llu, pinned %.1f MiB, old-path resolve %.1f ms",
-        static_cast<unsigned long long>(frame), delta(now.misses, reported.misses), static_cast<unsigned long long>(dropped), delta(now.created, reported.created), delta(now.refused, reported.refused), delta(now.primed, reported.primed), delta(now.primedRecords, reported.primedRecords), delta(now.primedKeys, reported.primedKeys), Milliseconds(now.primerNanoseconds - reported.primerNanoseconds), delta(now.pagesChanged, reported.pagesChanged), delta(now.recordsChanged, reported.recordsChanged), delta(now.servedChecked, reported.servedChecked), delta(now.servedStale, reported.servedStale), static_cast<unsigned long long>(now.queued), delta(now.revalidated, reported.revalidated), delta(now.stale, reported.stale), delta(now.refreshed, reported.refreshed), delta(now.dccRefreshed, reported.dccRefreshed), delta(now.retired, reported.retired), delta(now.unmapped, reported.unmapped), delta(now.evicted, reported.evicted), delta(now.fullEvictions, reported.fullEvictions), Milliseconds(now.serveNanoseconds - reported.serveNanoseconds), delta(now.serves, reported.serves), Milliseconds(now.presentWaitNanoseconds - reported.presentWaitNanoseconds), static_cast<unsigned long long>(now.entries), static_cast<unsigned long long>(now.imageSlots), static_cast<unsigned long long>(now.samplerSlots), static_cast<double>(now.pinnedBytes) / static_cast<double>(1u << 20u), Milliseconds(oldPath));
+    std::string refusals;
+    for (std::size_t kind = 0; kind < RefusalKindNames.size(); ++kind) {
+        refusals += kind == 0u ? "" : ", ";
+        refusals += RefusalKindNames[kind];
+        refusals += ' ';
+        refusals += std::to_string(now.refusals[kind] - reported.refusals[kind]);
+    }
+    char text[1536];
+    std::snprintf(text, sizeof(text), "[bindless] frame %llu: misses %llu (%llu dropped), created %llu, refused %llu, primed %llu tables (%llu records, %llu new keys, primer %.1f ms), re-decoded %llu pages (%llu records changed), served-checked %llu (%llu stale), queue %llu, revalidated %llu (%llu stale, %llu per-use, %llu dcc), retired %llu (%llu unmapped, %llu evicted, %llu full), serve %.1f ms over %llu calls, present wait %.1f ms, entries %llu, slots %llu+%llu, pinned %.1f MiB, old-path resolve %.1f ms, refusals (%s), kept refusals %llu",
+        static_cast<unsigned long long>(frame), delta(now.misses, reported.misses), static_cast<unsigned long long>(dropped), delta(now.created, reported.created), delta(now.refused, reported.refused), delta(now.primed, reported.primed), delta(now.primedRecords, reported.primedRecords), delta(now.primedKeys, reported.primedKeys), Milliseconds(now.primerNanoseconds - reported.primerNanoseconds), delta(now.pagesChanged, reported.pagesChanged), delta(now.recordsChanged, reported.recordsChanged), delta(now.servedChecked, reported.servedChecked), delta(now.servedStale, reported.servedStale), static_cast<unsigned long long>(now.queued), delta(now.revalidated, reported.revalidated), delta(now.stale, reported.stale), delta(now.refreshed, reported.refreshed), delta(now.dccRefreshed, reported.dccRefreshed), delta(now.retired, reported.retired), delta(now.unmapped, reported.unmapped), delta(now.evicted, reported.evicted), delta(now.fullEvictions, reported.fullEvictions), Milliseconds(now.serveNanoseconds - reported.serveNanoseconds), delta(now.serves, reported.serves), Milliseconds(now.presentWaitNanoseconds - reported.presentWaitNanoseconds), static_cast<unsigned long long>(now.entries), static_cast<unsigned long long>(now.imageSlots), static_cast<unsigned long long>(now.samplerSlots), static_cast<double>(now.pinnedBytes) / static_cast<double>(1u << 20u), Milliseconds(oldPath), refusals.c_str(), delta(now.keptRefusals, reported.keptRefusals));
     reported = now;
     return text;
 }

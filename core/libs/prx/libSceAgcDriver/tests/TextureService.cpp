@@ -66,6 +66,7 @@ constexpr std::uint32_t DistinctImages = 256u;
 constexpr std::uint32_t Remapped = 128u;
 constexpr std::uint64_t InterfaceId = 0x0123456789abcdefull;
 constexpr std::uint32_t RefusedMode = 0x1ffu;
+constexpr std::uint32_t PermanentMode = 0x1feu;
 constexpr VkBufferUsageFlags AddressUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 
 struct Push {
@@ -511,6 +512,7 @@ public:
         const auto image = key[0] & 0xffffu;
         Require(image < DistinctImages, "the test T# names no test image");
         if (key[2] == RefusedMode) throw std::runtime_error("AGC graphics: the test resolver refuses this T#");
+        if (key[2] == PermanentMode) throw AgcDriver::Graphics::BindlessKeyRefusal("AGC graphics: the test resolver refuses this T# for any mapping");
         BindlessPrepared prepared;
         prepared.address = Surface(image);
         prepared.bytes = TextureService::PageBytes;
@@ -614,7 +616,7 @@ struct Fixture {
             const auto record = (id * 7u) & (Records - 1u);
             const auto& item = records[record];
             const auto image = resolver->reused.contains(item.image) ? (item.image + Remapped) % DistinctImages : item.image;
-            const auto want = !served(record) || !item.present || item.mode == RefusedMode ? 0u : Images::Texel(image, record & 63u, (record >> 6u) & 63u) + (item.mode & 0xffu);
+            const auto want = !served(record) || !item.present || item.mode == RefusedMode || item.mode == PermanentMode ? 0u : Images::Texel(image, record & 63u, (record >> 6u) & 63u) + (item.mode & 0xffu);
             if (words[id] == want) continue;
             if (mismatches < 4u) std::cerr << what << ": record " << record << " read " << words[id] << ", expected " << want << '\n';
             ++mismatches;
@@ -657,8 +659,8 @@ void serviceTests(const Device& device) {
     Recorder recorder(fixture.context, device.Timeline());
     recorder.Activate();
     constexpr std::uint32_t Refused = 3000u;
-    for (std::uint32_t record = Refused; record < Refused + 4u; ++record) {
-        fixture.records[record].mode = RefusedMode;
+    for (std::uint32_t record = Refused; record < Refused + 8u; ++record) {
+        fixture.records[record].mode = record < Refused + 4u ? RefusedMode : PermanentMode;
         fixture.write(record, false);
     }
     fixture.records[17].present = false;
@@ -668,7 +670,7 @@ void serviceTests(const Device& device) {
     Require(service.Register(fixture.Registration()) == id, "registering the same table twice made two tables");
     Require(service.WaitPrimed(id, 60000u), "the service worker did not prime the table off the GPU lock");
     const auto primed = service.Totals();
-    Require(primed.primed == 1u && primed.workerPrepared == 1u && primed.workerCommitted == Fixture::Records && primed.created == Fixture::Records && primed.refused == 4u, "the worker primer did not create every table entry off the GPU lock: created " + std::to_string(primed.created) + ", worker committed " + std::to_string(primed.workerCommitted) + ", refused " + std::to_string(primed.refused));
+    Require(primed.primed == 1u && primed.workerPrepared == 1u && primed.workerCommitted == Fixture::Records && primed.created == Fixture::Records && primed.refused == 8u && primed.refusals[static_cast<std::size_t>(AgcDriver::Graphics::BindlessRefusalKind::Other)] == 8u, "the worker primer did not create every table entry off the GPU lock: created " + std::to_string(primed.created) + ", worker committed " + std::to_string(primed.workerCommitted) + ", refused " + std::to_string(primed.refused));
     Require(primed.imageSlots == DistinctImages, "the heap slots were not shared per image view: " + std::to_string(primed.imageSlots));
     const std::array<std::uint32_t, Table::DescriptorWords> nullWords{};
     const auto nullValue = service.Find(Abi::MakeKey(nullWords, InterfaceId, 0u));
@@ -735,7 +737,7 @@ void serviceTests(const Device& device) {
     fixture.resolver->reused.insert(5u);
     service.Revalidate(recorder);
     const auto afterReuse = service.Totals();
-    const auto usingFive = static_cast<std::uint64_t>(std::count_if(fixture.records.begin(), fixture.records.end(), [](const Record& item) { return item.present && item.image == 5u && item.mode != RefusedMode; }));
+    const auto usingFive = static_cast<std::uint64_t>(std::count_if(fixture.records.begin(), fixture.records.end(), [](const Record& item) { return item.present && item.image == 5u && item.mode != RefusedMode && item.mode != PermanentMode; }));
     Require(afterReuse.stale - beforeReuse.stale == usingFive, "rewriting a surface did not re-resolve exactly its " + std::to_string(usingFive) + " entries: " + std::to_string(afterReuse.stale - beforeReuse.stale));
     service.Serve(served, recorder);
     fixture.Dispatch(recorder, 0x400u);
@@ -748,9 +750,11 @@ void serviceTests(const Device& device) {
     fixture.memory->Unmap(fixture.resolver->Surface(6u), TextureService::PageBytes);
     service.Revalidate(recorder);
     const auto afterUnmap = service.Totals();
-    const auto usingSix = static_cast<std::uint64_t>(std::count_if(fixture.records.begin(), fixture.records.end(), [](const Record& item) { return item.present && item.image == 6u && item.mode != RefusedMode; }));
+    const auto usingSix = static_cast<std::uint64_t>(std::count_if(fixture.records.begin(), fixture.records.end(), [](const Record& item) { return item.present && item.image == 6u && item.mode != RefusedMode && item.mode != PermanentMode; }));
     Require(afterUnmap.unmapped - beforeUnmap.unmapped == usingSix && afterUnmap.retired - beforeUnmap.retired >= usingSix && !service.Find(fixture.Key(6u)).has_value(), "unmapping a surface did not retire its " + std::to_string(usingSix) + " entries");
     Require(fixture.table->Heap().PendingReleases() != 0u, "the unmapped entries' slot was not released through the retire serial");
+    Require(!service.Find(fixture.Key(Refused)).has_value(), "a refusal that may depend on the mapping was not retried after the mapping changed");
+    Require(afterUnmap.keptRefusals - beforeUnmap.keptRefusals == 4u && service.Find(fixture.Key(Refused + 4u)).value_or(DeviceImageValue{}).fault != 0u, "a refusal fixed by its T# was retired by a mapping change: kept " + std::to_string(afterUnmap.keptRefusals - beforeUnmap.keptRefusals));
     service.Serve(served, recorder);
     fixture.Dispatch(recorder, 0x500u);
     recorder.Submit();

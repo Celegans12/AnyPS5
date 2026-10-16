@@ -99,7 +99,7 @@ BindlessPrepared DriverBindlessResolver::Prepare(const DeviceImageKeys::Key& key
     const auto match = Materializer::TryRuntimeImageMode(found->image, descriptor, found->modes);
     if (!match.mode.has_value()) {
         const auto reason = ShaderRecompiler::ImageTableAbi::PoisonReasonName(match.reason);
-        throw std::runtime_error("AGC graphics: the T# matches no runtime mode of its image interface (" + std::string(reason) + (match.detail.empty() ? std::string() : ": " + match.detail) + ")");
+        throw BindlessKeyRefusal("AGC graphics: the T# matches no runtime mode of its image interface (" + std::string(reason) + (match.detail.empty() ? std::string() : ": " + match.detail) + ")");
     }
     const auto& mode = found->modes.at(*match.mode);
     BindlessPrepared prepared;
@@ -108,15 +108,15 @@ BindlessPrepared DriverBindlessResolver::Prepare(const DeviceImageKeys::Key& key
         prepared.settled = DeviceImageValue{0u, *match.mode, 0u, 0u};
         return prepared;
     }
-    if (found->image.resourceClass == ShaderRecompiler::ImageResourceClass::Storage) throw std::runtime_error("AGC graphics: a storage image read or written through the bindless heap is not implemented (storage tables stay on their per-draw binding)");
-    if (mode.dimension == ShaderRecompiler::RdnaImageDimension::Dim2DMsaa || mode.dimension == ShaderRecompiler::RdnaImageDimension::Dim2DMsaaArray) throw std::runtime_error("AGC graphics: a multisampled image read through the bindless heap is not implemented");
-    if ((mode.emulatedCompare & ShaderRecompiler::EmulatedCompare::Enabled) != 0u) throw std::runtime_error("AGC graphics: comparison sampling of a color texture through the bindless heap is not implemented");
+    if (found->image.resourceClass == ShaderRecompiler::ImageResourceClass::Storage) throw BindlessKeyRefusal("AGC graphics: a storage image read or written through the bindless heap is not implemented (storage tables stay on their per-draw binding)");
+    if (mode.dimension == ShaderRecompiler::RdnaImageDimension::Dim2DMsaa || mode.dimension == ShaderRecompiler::RdnaImageDimension::Dim2DMsaaArray) throw BindlessKeyRefusal("AGC graphics: a multisampled image read through the bindless heap is not implemented");
+    if ((mode.emulatedCompare & ShaderRecompiler::EmulatedCompare::Enabled) != 0u) throw BindlessKeyRefusal("AGC graphics: comparison sampling of a color texture through the bindless heap is not implemented");
     auto state = std::make_shared<Prepared>();
     std::copy_n(key.begin(), Abi::DescriptorWords, state->words.begin());
     state->resource = DecodeTextureResource(state->words);
     const auto shape = ShapeOf(mode.dimension);
     state->firstLayer = shape == ShaderRecompiler::DescriptorImageShape::Image2D && state->resource.dimension == TextureDimension::k2DArray;
-    if (!state->firstLayer && !MatchesGuestDimension(shape, state->resource.dimension)) throw std::runtime_error("AGC graphics: guest texture dimension disagrees with the bindless mode's image shape (shape " + std::to_string(static_cast<int>(shape)) + ", dimension " + std::to_string(static_cast<int>(state->resource.dimension)) + ")");
+    if (!state->firstLayer && !MatchesGuestDimension(shape, state->resource.dimension)) throw BindlessKeyRefusal("AGC graphics: guest texture dimension disagrees with the bindless mode's image shape (shape " + std::to_string(static_cast<int>(shape)) + ", dimension " + std::to_string(static_cast<int>(state->resource.dimension)) + ")");
     static_cast<void>(ResolveTextureFormat(state->resource.format));
     state->guestBytes = DescribeSurface(state->resource).guestBytes;
     const auto address = state->resource.baseAddress;
@@ -137,10 +137,10 @@ BindlessPrepared DriverBindlessResolver::Prepare(const DeviceImageKeys::Key& key
     std::copy_n(key.begin() + Abi::SamplerWord, Abi::SamplerWords, state->sampler.begin());
     if (state->samplerClass != Heap::NoSamplerClass) {
         if (state->samplerClass == Heap::TableSamplerClass) {
-            if ((state->sampler[0] & (1u << 15u)) != 0u) throw std::runtime_error("AGC graphics: a sampler table entry with unnormalized coordinates is not implemented for table images");
-            if (((state->sampler[0] >> 29u) & 3u) != 0u) throw std::runtime_error("AGC graphics: a sampler table entry with a min or max reduction is not implemented for table images");
+            if ((state->sampler[0] & (1u << 15u)) != 0u) throw BindlessKeyRefusal("AGC graphics: a sampler table entry with unnormalized coordinates is not implemented for table images");
+            if (((state->sampler[0] >> 29u) & 3u) != 0u) throw BindlessKeyRefusal("AGC graphics: a sampler table entry with a min or max reduction is not implemented for table images");
         } else if (state->samplerClass != Heap::DirectSamplerClass) {
-            throw std::runtime_error("AGC graphics: a bindless key names the unknown sampler class " + Hex(state->samplerClass));
+            throw BindlessKeyRefusal("AGC graphics: a bindless key names the unknown sampler class " + Hex(state->samplerClass));
         }
         if (Materializer::RequiresPointSampler(mode)) state->sampler[2] = ShaderRecompiler::PointFilteredSamplerWord(state->sampler[0], state->sampler[2]);
     }

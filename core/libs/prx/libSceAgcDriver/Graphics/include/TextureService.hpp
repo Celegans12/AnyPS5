@@ -16,7 +16,9 @@
 #include <optional>
 #include <set>
 #include <span>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -32,10 +34,20 @@ class Recorder;
 using BindlessUse = ShaderRecompiler::BindlessImageAbi::TableUse;
 using BindlessTableRegistration = ShaderRecompiler::BindlessImageAbi::TableRegistration;
 
+class BindlessKeyRefusal : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
+enum class BindlessRefusalKind : std::uint32_t { Storage, Multisample, ColorCompare, Unmapped, NoMode, Sampler, Interface, Other, Count };
+
+BindlessRefusalKind ClassifyBindlessRefusal(std::string_view reason);
+
 struct BindlessPrepared {
     DeviceImageKeys::Key key{};
     std::optional<DeviceImageValue> settled;
     std::string refusal;
+    bool permanent = false;
     std::uint64_t address = 0;
     std::uint64_t bytes = 0;
     std::uint64_t generation = 0;
@@ -96,6 +108,8 @@ public:
         std::uint64_t workerCommitted = 0;
         std::uint64_t created = 0;
         std::uint64_t refused = 0;
+        std::array<std::uint64_t, static_cast<std::size_t>(BindlessRefusalKind::Count)> refusals{};
+        std::uint64_t keptRefusals = 0;
         std::uint64_t misses = 0;
         std::uint64_t missesResolved = 0;
         std::uint64_t pagesChanged = 0;
@@ -197,7 +211,7 @@ private:
     BindlessResolution take(const DeviceImageKeys::Key& key);
     void replace(const DeviceImageKeys::Key& key, Recorder& recorder, Lock& lock);
     BindlessResolution settle(const BindlessPrepared& prepared);
-    std::uint32_t refuse(const DeviceImageKeys::Key& key, const std::string& reason);
+    std::uint32_t refuse(const DeviceImageKeys::Key& key, const std::string& reason, bool permanent);
     std::uint32_t acquireImage(VkImageView view, VkImageLayout layout);
     std::uint32_t acquireSampler(VkSampler sampler);
     void releaseResolution(const BindlessResolution& resolution, Recorder& recorder);
@@ -229,6 +243,8 @@ private:
     std::map<const void*, OwnerRef> owners;
     std::set<DeviceImageKeys::Key> retiring;
     std::set<DeviceImageKeys::Key> perUseKeys;
+    std::set<DeviceImageKeys::Key> permanentRefusals;
+    std::set<std::string> reportedReasons;
     std::vector<std::string> rejections;
     std::map<DeviceImageKeys::Key, std::uint32_t> rejectionIndex;
     std::uint64_t nextId = 1;
