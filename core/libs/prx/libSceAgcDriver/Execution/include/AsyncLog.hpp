@@ -156,6 +156,17 @@ public:
         idle.wait_for(lock, std::chrono::seconds(2), [&] { return pending.empty() && !writing; });
     }
 
+    bool FlushFor(std::chrono::milliseconds limit) {
+        if (!asynchronous) return true;
+        const auto target = queued.load(std::memory_order_acquire);
+        const auto deadline = Clock::now() + limit;
+        while (finished.load(std::memory_order_acquire) < target) {
+            if (Clock::now() >= deadline) return false;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return true;
+    }
+
 private:
     struct Window {
         Clock::time_point first;
@@ -169,6 +180,7 @@ private:
     static constexpr std::chrono::seconds CoalesceWindow{10};
     static constexpr std::chrono::seconds StatsWindow{10};
     static constexpr std::chrono::milliseconds Tick{500};
+    static constexpr std::chrono::milliseconds EndFlushLimit{2000};
 
     AsyncLog() {
         asynchronous = std::getenv("APS5_LOG_SYNC") == nullptr;
@@ -177,8 +189,14 @@ private:
         lastStats = Clock::now();
         if (!asynchronous) return;
         LogSink().store(&AsyncLog::Sink, std::memory_order_release);
-        std::atexit([] { Get().Flush(); });
+        std::atexit(&AsyncLog::FlushAtEnd);
         std::thread([this] { Run(); }).detach();
+    }
+
+    static void FlushAtEnd() {
+        auto& log = Get();
+        if (log.abandoned.load(std::memory_order_acquire)) return;
+        if (!log.FlushFor(EndFlushLimit)) log.abandoned.store(true, std::memory_order_release);
     }
 
     static int Sink(std::FILE* stream, const char* text, std::size_t length) {
@@ -216,6 +234,7 @@ private:
             bytes += entry.cost;
             peak = std::max(peak, bytes);
             pending.push_back(std::move(entry));
+            queued.fetch_add(1, std::memory_order_release);
             notify = sleeping;
             sleeping = false;
         }
@@ -237,6 +256,7 @@ private:
             }
             space.notify_all();
             if (!batch.empty()) {
+                const auto count = batch.size();
                 const auto start = Clock::now();
                 try {
                     Drain(batch, buffer);
@@ -249,6 +269,7 @@ private:
                     std::lock_guard lock(mutex);
                     writing = false;
                 }
+                finished.fetch_add(count, std::memory_order_release);
                 idle.notify_all();
             }
             try {
@@ -339,6 +360,9 @@ private:
     std::size_t peak = 0;
     bool sleeping = false;
     bool writing = false;
+    std::atomic<std::uint64_t> queued{0};
+    std::atomic<std::uint64_t> finished{0};
+    std::atomic<bool> abandoned{false};
     std::mutex coalesceMutex;
     std::map<std::string, Window> windows;
     Clock::time_point lastStats;
