@@ -129,7 +129,7 @@ std::uint32_t SpirvValueEmitContext::Ballot(const IrValue* predicate) {
     const auto lowWord = state.module.AllocateId();
     const auto highWord = state.module.AllocateId();
     const auto ballot = state.module.AllocateId();
-    if (high != low) state.module.AddFunction(spv::OpGroupNonUniformBallot, ballotType, high, scope, highPredicate);
+    if (high != low) state.module.AddSubgroupBallot(ballotType, high, scope, highPredicate);
     state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), lowWord, low, 0u);
     state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), highWord, high, 0u);
     state.module.AddFunction(spv::OpCompositeConstruct, ballotType, ballot, lowWord, highWord, ConstantU32(state, 0u), ConstantU32(state, 0u));
