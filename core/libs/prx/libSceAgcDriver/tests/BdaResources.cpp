@@ -1394,6 +1394,34 @@ void directImageFaultTests(const Context& context, const BdaTestAccess& access) 
     Require(guest[0] == changed, "cleared direct image fault lost copied guest writes");
 }
 
+void bindlessFaultTests(const Context& context, const BdaTestAccess& access) {
+    namespace Abi = ShaderRecompiler::BdaAbi;
+    auto map = binding(Role::ImageTableMap, 4);
+    map.guestDescriptor.resize(ShaderRecompiler::ImageTableAbi::HeaderWords);
+    map.guestDescriptor[ShaderRecompiler::ImageTableAbi::HeaderVersion] = ShaderRecompiler::ImageTableAbi::Version;
+    ShaderRecompiler::RecompileResult shader;
+    shader.bdaAbiVersion = Abi::Version;
+    shader.hasDeferredDirectImage = true;
+    shader.bindings = {map, binding(Role::FaultBuffer, 5)};
+    CompiledShader compiled{ShaderRecompiler::ShaderStage::Compute, &shader, 0};
+    auto faultOnly = context;
+    faultOnly.bufferDeviceAddress = false;
+    ShaderResources resources(faultOnly, compiled);
+    const auto fault = access.bytes(access.descriptor(5).buffer);
+    auto report = Abi::Fault{Abi::FaultState::Ready, Abi::FaultReason::BindlessMiss, 0u, 1024u, 4u, 0x2a0u, 0u};
+    std::memcpy(fault.data(), &report, sizeof(report));
+    reject([&] { resources.WriteBackBuffers(0x80003aa700ULL); }, "bindless images: shader 0x80003aa700 stage 4 pc 0x2a0 missed in the device image table while its miss ring was full (1024 records)");
+    report.reason = Abi::FaultReason::BindlessRefused;
+    report.bytes = 7u;
+    std::memcpy(fault.data(), &report, sizeof(report));
+    reject([&] { resources.WriteBackBuffers(); }, "bindless images: shader address unavailable stage 4 pc 0x2a0 selected the refused device image table entry 7");
+    report.address = 0x1000u;
+    std::memcpy(fault.data(), &report, sizeof(report));
+    reject([&] { resources.WriteBackBuffers(); }, "invalid bindless image fault payload");
+    std::memset(fault.data(), 0, fault.size());
+    resources.WriteBackBuffers();
+}
+
 void guardedWrapFaultTests(const Context& context, const BdaTestAccess& access) {
     namespace Abi = ShaderRecompiler::BdaAbi;
     const auto* old = std::getenv("APS5_UNNORM_WRAP_GUARD");
@@ -1761,6 +1789,7 @@ void sparseHeapMirrorTests(const Context& context, const BdaTestAccess& access) 
 
 void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     directImageFaultTests(context, access);
+    bindlessFaultTests(context, access);
     guardedWrapFaultTests(context, access);
     alignas(64) std::array<std::uint32_t, 16> guest{};
     guest[0] = 123;

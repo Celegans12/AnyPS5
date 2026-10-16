@@ -301,6 +301,17 @@ void BdaResources::CheckFault(std::uint64_t shaderAddress) const {
         }
         throw std::runtime_error(message.str());
     }
+    if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::BindlessMiss || report.reason == ShaderRecompiler::BdaAbi::FaultReason::BindlessRefused) {
+        Require(report.address == 0u, "invalid bindless image fault payload");
+        std::ostringstream message;
+        message << "bindless images: shader ";
+        if (shaderAddress != 0u) message << "0x" << std::hex << shaderAddress << std::dec;
+        else message << "address unavailable";
+        message << " stage " << report.stage << " pc 0x" << std::hex << report.instruction << std::dec;
+        if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::BindlessMiss) message << " missed in the device image table while its miss ring was full (" << report.bytes << " records), so the descriptor was not recorded";
+        else message << " selected the refused device image table entry " << report.bytes;
+        throw std::runtime_error(message.str());
+    }
     std::ostringstream message;
     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::UnlinkedCall) {
         message << "shader stage " << report.stage << " called address 0x" << std::hex << report.address << " at program counter 0x" << report.instruction << ", which no linked callee of that call matches";
