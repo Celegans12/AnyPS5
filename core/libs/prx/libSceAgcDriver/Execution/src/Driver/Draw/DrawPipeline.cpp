@@ -176,6 +176,12 @@ void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
     rethrowFailure();
 }
 
+std::size_t DrawPipeline::QueuedItems() {
+    auto& pipeline = Queue0();
+    std::lock_guard lock(pipeline.mutex);
+    return pipeline.items.size();
+}
+
 bool DrawPipeline::HeldReads(std::uint64_t address, std::size_t bytes) {
     if (bytes == 0 || std::getenv("APS5_NO_QUEUED_DRAW_READ_ORDER") != nullptr) return false;
     const auto end = address + bytes;
