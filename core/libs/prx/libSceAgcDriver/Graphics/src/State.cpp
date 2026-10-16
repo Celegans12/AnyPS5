@@ -1281,6 +1281,11 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
             Require(addition(state.colorBlendOp) && addition(state.alphaBlendOp), "dual-source blending with a MIN or MAX operation is unsupported");
             result.dualSourceBlend = true;
         }
+        if (const auto info = read(cx, 0x31c + slot * 0xfu); state.blendEnable && (info & 0x8000u) == 0 && ((info >> 8u) & 7u) <= 1u) {
+            char detail[80];
+            std::snprintf(detail, sizeof(detail), " (CB_COLOR_INFO 0x%08x, CB_BLEND%u_CONTROL 0x%08x)", info, slot, blend);
+            throw std::runtime_error(std::string("AGC graphics: blending unclamped normalized color is not implemented") + detail);
+        }
         result.blends[color.exportIndex] = state;
     }
     for (std::uint32_t i = 0; i < 3; ++i) {
@@ -1456,7 +1461,7 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot, bool allo
     Require(allowMultisampleDcc || color.samples == 1 || (info & 0x10000000u) == 0, "DCC over a multisampled color target is unsupported");
     // ROUND_MODE (bit 18) only affects unorm rounding. With DCC_ENABLE (bit 28) the target is written
     if ((info & ~(0x00039f7cu | 0x00040000u | 0x10000000u | 0x00002000u | multisampleInfo)) != 0) throw std::runtime_error("AGC graphics: color compression, DCC, endian conversion, nonstandard rounding or color optimization is unsupported (CB_COLOR_INFO 0x" + [&] { char text[16]; std::snprintf(text, sizeof(text), "%08x", info); return std::string(text); }() + ")");
-    Require((info & 0x8000u) != 0 || number == 7 || number == 4 || number == 5, "unclamped normalized color is unsupported");
+    Require((info & 0x8000u) != 0 || number <= 1u || number == 7 || number == 4 || number == 5, "unclamped normalized color is unsupported");
     const auto view = read(cx, 0x31b + stride);
     Require((view & ~0x3fffffffu) == 0, "reserved CB_COLOR_VIEW bits are set");
     const auto slice = view & 0x1fffu;

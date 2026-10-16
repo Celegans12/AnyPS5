@@ -1282,6 +1282,48 @@ void BlendBypassTests() {
     Require(!bypassed.blends.at(0).blendEnable && bypassed.blends.at(0).colorWriteMask != 0, "a target with BLEND_BYPASS still blends");
 }
 
+void UnclampedNormalizedColorTests() {
+    using AgcDriver::Graphics::DecodeState;
+    constexpr std::uint32_t blending = (1u << 30u) | 4u | (5u << 8u);
+    const auto target = [](std::uint32_t info) {
+        auto queue = makeState();
+        for (std::uint32_t constant = 0x105; constant < 0x109; ++constant) queue.context[constant] = 0;
+        queue.context[0x31c] = info;
+        queue.context[0x1b3] = 2;
+        queue.context[0x1b4] = 2;
+        return queue;
+    };
+    auto queue = target(0x0000000cu);
+    auto state = DecodeState(queue);
+    Require(state.colors.size() == 1 && state.colors[0].format == VK_FORMAT_R8G8_UNORM && !state.blends.at(0).blendEnable && state.blends.at(0).colorWriteMask != 0, "an 8_8 UNORM target with BLEND_CLAMP clear (CB_COLOR_INFO 0x0000000c, PPSA26344) was refused without blending");
+    const auto rejection = AgcDriver::Graphics::DrawRejection(queue, false);
+    Require(rejection.empty(), "the precheck refused an unclamped UNORM target that does not blend: " + rejection);
+    Require(AgcDriver::Graphics::DecodeColorBuffer(queue.context, 0).format == VK_FORMAT_R8G8_UNORM, "an unclamped UNORM target was refused outside a draw");
+    auto eliminate = target(0x0000000cu);
+    eliminate.context[0x0] = 0;
+    eliminate.context[0x202] = 0xcc0020;
+    const auto pass = AgcDriver::Graphics::DecodeColorMetadataPass(eliminate);
+    Require(pass.has_value() && pass->mode == AgcDriver::Graphics::ColorMetadataPass::Mode::EliminateFastClear && pass->targets.size() == 1 && pass->targets[0].format == VK_FORMAT_R8G8_UNORM, "a fast-clear eliminate over an unclamped UNORM target was refused");
+    queue.context[0x1e0] = blending;
+    expectFailure([&] { DecodeState(queue); }, "blending unclamped normalized color is not implemented (CB_COLOR_INFO 0x0000000c, CB_BLEND0_CONTROL 0x40000504)");
+    queue.context[0x31c] |= 0x10000u;
+    state = DecodeState(queue);
+    Require(!state.blends.at(0).blendEnable && state.blends.at(0).colorWriteMask != 0, "an unclamped UNORM target with BLEND_BYPASS was refused or blended");
+    queue = target(0x0000010cu);
+    Require(DecodeState(queue).colors.at(0).format == VK_FORMAT_R8G8_SNORM, "an unclamped SNORM target that does not blend was refused");
+    queue.context[0x1e0] = blending;
+    expectFailure([&] { DecodeState(queue); }, "blending unclamped normalized color is not implemented");
+    queue = target(0x00000604u);
+    expectFailure([&] { DecodeState(queue); }, "unclamped normalized color is unsupported");
+    queue = target(0x0000800cu);
+    queue.context[0x1e0] = blending;
+    Require(DecodeState(queue).blends.at(0).blendEnable, "a clamped UNORM target stopped blending");
+    queue = target(0x00000708u);
+    queue.context[0x1e0] = blending;
+    state = DecodeState(queue);
+    Require(state.colors.at(0).format == VK_FORMAT_R16_SFLOAT && state.blends.at(0).blendEnable, "a 16 float target, which keeps BLEND_CLAMP clear, stopped blending");
+}
+
 void OpaqueDestinationAlphaTests() {
     auto queue = makeState();
     for (std::uint32_t constant = 0x105; constant < 0x109; ++constant) queue.context[constant] = 0;
@@ -7754,6 +7796,7 @@ int main(int argc, char** argv) {
         OpaqueDestinationAlphaTests();
         Color1555TargetTests();
         BlendBypassTests();
+        UnclampedNormalizedColorTests();
         CompactedExportTests();
         ReversedComponentOrderTests();
         ReversedComponentOrderBlendTests();
