@@ -597,6 +597,30 @@ Lease GuestAllocationsAcquire_nid_postfix() {
     return Lease(std::move(ranges));
 }
 
+Lease GuestAllocationsAcquireSpans_nid_postfix(const std::vector<std::pair<std::uint64_t, std::uint64_t>>& spans) {
+    auto merged = spans;
+    for (const auto& [begin, end] : merged) require(begin <= end, "invalid guest allocation lease span");
+    std::sort(merged.begin(), merged.end());
+    std::size_t kept = 0;
+    for (const auto& span : merged) {
+        if (kept != 0 && span.first <= merged[kept - 1].second) merged[kept - 1].second = std::max(merged[kept - 1].second, span.second);
+        else merged[kept++] = span;
+    }
+    merged.resize(kept);
+    std::lock_guard lock(registry().mutex);
+    const auto& ranges = registry().ranges;
+    auto selected = std::make_shared<Lease::Ranges>();
+    for (const auto& [begin, end] : merged) {
+        auto it = ranges.upper_bound(begin);
+        if (it != ranges.begin()) --it;
+        for (; it != ranges.end() && it->first < end; ++it) {
+            const auto& range = it->second;
+            if (range->readable && range->bytes != 0 && range->address + range->bytes > begin && (selected->empty() || selected->back() != range)) selected->push_back(range);
+        }
+    }
+    return Lease(std::move(selected));
+}
+
 std::shared_ptr<const Range> GuestAllocationsLookup_nid_postfix(std::uintptr_t address, bool next) {
     std::lock_guard lock(registry().mutex);
     const auto& ranges = registry().ranges;
