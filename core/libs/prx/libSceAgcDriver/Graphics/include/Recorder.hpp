@@ -524,6 +524,18 @@ public:
     };
     static bool BarrierValidate();
     void NoteAccess(CommandClass which, const Access& access);
+    static bool BatchBarriers();
+    VkCommandBuffer CommandsHoldingBarrier(VkAccessFlags* coveredAccess);
+    void HoldBarrier(CommandClass which, VkPipelineStageFlags sourceStage, VkPipelineStageFlags destinationStage, VkAccessFlags sourceAccess, VkAccessFlags destinationAccess);
+    void HoldTrailingBarrier(CommandClass which, VkPipelineStageFlags sourceStage, VkPipelineStageFlags destinationStage, VkAccessFlags sourceAccess, VkAccessFlags destinationAccess, const Access& access);
+    void ResolveHeldBarrier(const Access& next);
+    void FlushHeldBarrier();
+    struct BatchedBarrierStatistics {
+        std::uint64_t held;
+        std::uint64_t recorded;
+        std::uint64_t keptAcross;
+    };
+    static BatchedBarrierStatistics BatchedBarrierCounts();
     // A range timed outside the recorder's batches (the presenter's blit, stamped into its own
     // pool and read after its fence): enters the class totals like a recorded one.
     static void AddGpuTiming(CommandClass which, double nanoseconds, std::uint64_t bytes);
@@ -689,6 +701,19 @@ private:
             std::uint64_t end;
         };
         std::vector<KeyStore> keyStores;
+        struct HeldBarrier {
+            bool active = false;
+            bool beforeNextCommand = false;
+            VkPipelineStageFlags sourceStage = 0;
+            VkPipelineStageFlags destinationStage = 0;
+            VkAccessFlags sourceAccess = 0;
+            VkAccessFlags destinationAccess = 0;
+            CommandClass first = CommandClass::DispatchTrailing;
+            std::array<std::uint32_t, static_cast<std::size_t>(CommandClass::Count)> logical{};
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
+            std::vector<std::pair<VkImage, bool>> images;
+        } held;
     };
     struct LabelEntry {
         std::uint32_t value;
@@ -775,6 +800,9 @@ private:
     void dropStaleHoldKept();
     // Records the run's pending store (vkCmdUpdateBuffer), if any.
     void flushPendingStore();
+    void holdBarrier(CommandClass which, VkPipelineStageFlags sourceStage, VkPipelineStageFlags destinationStage, VkAccessFlags sourceAccess, VkAccessFlags destinationAccess);
+    void flushHeld();
+    VkCommandBuffer commandsKeepingHeld();
     // Records the pending store and the run's trailing barrier; the next store starts a new run.
     // Per-batch runs: records the queued stores with their barriers (`atSubmit`: the batch-end
     // form, toward the host only); returns whether the batch's host-read barrier was included.
