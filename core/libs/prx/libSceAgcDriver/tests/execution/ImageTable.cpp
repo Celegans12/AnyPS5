@@ -2104,6 +2104,40 @@ void RunPixelMissTests(AgcDriver::VulkanDevice& device) {
     std::puts("bindless pixel miss: zero on a miss, exact after the drain passed");
 }
 
+void RunPixelRefusalTests(AgcDriver::VulkanDevice& device) {
+    using Kind = AgcDriver::Graphics::BindlessRefusalKind;
+    const auto& service = *device.BindlessService();
+    FillSampleTextures();
+    auto invalid = SampleDescriptor(SampleTexels[2].data());
+    invalid[3] = (invalid[3] & ~(0xfu << 28u)) | (1u << 28u);
+    std::copy(invalid.begin(), invalid.end(), SampleTable.begin() + 2u * 8u);
+    const auto scale = 1.0f / static_cast<float>(SampleSize);
+    const auto kinds = [](const auto& totals) {
+        std::uint64_t sum = 0;
+        for (const auto count : totals.refusals) sum += count;
+        return sum;
+    };
+    const auto refusedDraw = [&] {
+        try {
+            static_cast<void>(DrawPixelTable(device, PixelSampleTableCode, SampleTable, 2u, SamplePointSampler, scale, scale));
+        } catch (const std::exception& error) {
+            return std::string(error.what());
+        }
+        return std::string();
+    };
+    const auto noMode = static_cast<std::size_t>(Kind::NoMode);
+    const auto before = service.Totals();
+    const auto first = refusedDraw();
+    Require(first.find("through the bindless heap") != std::string::npos && first.find("rejected by the driver") != std::string::npos && first.find("matches no runtime mode") != std::string::npos, "bindless pixel refusal: a pixel draw that selected a refused entry did not fault with its reason: " + first);
+    const auto after = service.Totals();
+    Require(after.refused > before.refused && after.refusals[noMode] > before.refusals[noMode] && kinds(after) - kinds(before) == after.refusals[noMode] - before.refusals[noMode], "bindless pixel refusal: the draw's refusal was not counted as no-mode: refused " + std::to_string(after.refused - before.refused) + ", by kind " + std::to_string(kinds(after) - kinds(before)) + ", no-mode " + std::to_string(after.refusals[noMode] - before.refusals[noMode]));
+    const auto second = refusedDraw();
+    const auto again = service.Totals();
+    Require(second.find("matches no runtime mode") != std::string::npos && kinds(again) == kinds(after) && again.created == after.created, "bindless pixel refusal: a second draw did not fault on the cached refusal, or refused the key again: " + second);
+    FillSampleTextures();
+    std::puts("bindless pixel refusal: a pixel draw that selected a key-determined refusal faulted with its reason, counted once as no-mode, then cached");
+}
+
 void RunGraphicsTests(AgcDriver::VulkanDevice& device) {
     const auto floatImage = Image(FloatTexels.data(), Format32Float);
     const auto uintImage = Image(UintTexels.data(), Format32UInt);
@@ -2145,6 +2179,7 @@ int main(int argc, char** argv) {
             RunPixelSampleTests(*device);
             RunPixelStorageTests(*device);
             RunGraphicsTests(*device);
+            if (BindlessHeap()) RunPixelRefusalTests(*device);
             if (BindlessHeap()) Require(device->BindlessService() != nullptr && device->BindlessService()->Totals().misses == 0u, "image table graphics: the exact bindless run missed in the device image table");
             std::puts("image table graphics tests passed");
             return 0;
