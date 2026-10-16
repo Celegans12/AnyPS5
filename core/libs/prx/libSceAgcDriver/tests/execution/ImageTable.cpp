@@ -1,4 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchCache.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
@@ -1765,6 +1767,77 @@ void RunBindlessOldPathTests(AgcDriver::VulkanDevice& device) {
     RequireRed(served, 2, Lanes, [](std::uint32_t x) { return static_cast<std::uint32_t>(SintTexels[x]); }, "bindless old path sint texels");
 }
 
+void RunBindlessServeSubmitTests(AgcDriver::VulkanDevice& device) {
+    Require(BindlessHeap() && device.BindlessService() != nullptr, "bindless serve submit: needs APS5_BINDLESS_IMAGES=1 and the device's texture service");
+    constexpr std::uint32_t Rounds = 2u;
+    constexpr std::uint32_t BigSide = 8192u;
+    constexpr std::size_t BigTexels = static_cast<std::size_t>(BigSide) * BigSide;
+    constexpr std::size_t SmallOffset = BigTexels + 1024u;
+    constexpr std::size_t Floats = SmallOffset + static_cast<std::size_t>(Rounds) * Width * Height;
+    std::vector<float> storage(Floats + 64u);
+    auto* base = reinterpret_cast<float*>((reinterpret_cast<std::uintptr_t>(storage.data()) + 255u) & ~std::uintptr_t{255u});
+    struct Registration {
+        void* data;
+        Registration(void* data, std::size_t bytes) : data(data) { GuestAllocations::Mutation().Add(data, bytes, true, true, true); }
+        ~Registration() { GuestAllocations::Mutation().Remove(data); }
+    } registered(base, Floats * sizeof(float));
+    for (std::uint32_t row = 0; row < BigSide; ++row) {
+        for (std::uint32_t column = 0; column < BigSide; ++column) base[static_cast<std::size_t>(row) * BigSide + column] = 7.0f + static_cast<float>(column / (BigSide / Width));
+    }
+    const auto bigImage = [&](std::uint32_t height) {
+        const auto address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(base));
+        return std::array<std::uint32_t, 4>{static_cast<std::uint32_t>(address >> 8u), static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (Format32Float << 20u) | (((BigSide - 1u) & 3u) << 30u), ((BigSide - 1u) >> 2u) | ((height - 1u) << 14u) | (1u << 31u), 0xfacu | (Type2D << 28u)};
+    };
+    Fill();
+    SetClassRecords();
+    Keys = {};
+    for (std::uint32_t group = 0; group < 3u; ++group) Keys[group] = group;
+    const auto table = Buffer(Table.data(), static_cast<std::uint32_t>(sizeof(Table)));
+    const auto keys = Buffer(Keys.data(), static_cast<std::uint32_t>(sizeof(Keys)));
+    const auto output = Buffer(Output.data(), static_cast<std::uint32_t>(sizeof(Output)));
+    const std::span<const std::uint32_t> code(TableCode);
+    const std::array<ShaderRecompiler::MemoryRegion, 4> memory{{
+        {reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)},
+        {reinterpret_cast<std::uintptr_t>(Srt.data()), std::as_bytes(std::span(Srt))},
+        {reinterpret_cast<std::uintptr_t>(Table.data()), std::as_bytes(std::span(Table))},
+        {reinterpret_cast<std::uintptr_t>(Keys.data()), std::as_bytes(std::span(Keys))},
+    }};
+    for (std::uint32_t round = 0; round < Rounds; ++round) {
+        auto* small = base + SmallOffset + static_cast<std::size_t>(round) * Width * Height;
+        for (std::uint32_t index = 0; index < Width * Height; ++index) small[index] = FloatTexels[index] + 1000.0f * static_cast<float>(round + 1u);
+        const auto big = bigImage(BigSide - 4u * round);
+        const auto later = Image(small, Format32Float);
+        Require(big[0] < later[0], "bindless serve submit: the small texture's key does not sort after the large one, so its serve does not follow the large upload");
+        SetRecord(0, PointClamp, big);
+        SetRecord(1, PointClamp, later);
+        std::copy(table.begin(), table.end(), Srt.begin());
+        std::copy(keys.begin(), keys.end(), Srt.begin() + 4);
+        std::copy(output.begin(), output.end(), Srt.begin() + 8);
+        const auto created = device.BindlessService()->Totals().created;
+        Outcome outcome;
+        std::uint64_t submitted = 0;
+        {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            auto* recorder = AgcDriver::Graphics::Recorder::Active();
+            Require(recorder != nullptr, "bindless serve submit: the device has no active recorder");
+            static_cast<void>(recorder->Commands());
+            const auto before = recorder->Submissions();
+            outcome = Execute(device, code, Srt.data(), memory, 3, Lanes, 64, nullptr, false);
+            submitted = recorder->Submissions() - before;
+        }
+        device.WaitIdle();
+        Require(outcome.bindlessHeap, "bindless serve submit: the table program was not served from the descriptor heap");
+        Require(!Faulted(outcome), "bindless serve submit: round " + std::to_string(round) + " faulted:\n" + outcome.log);
+        Require(device.BindlessService()->Totals().created >= created + 2u, "bindless serve submit: round " + std::to_string(round) + " did not create entries for its two new textures");
+        Require(submitted != 0u, "bindless serve submit: round " + std::to_string(round) + " did not submit the open batch while it was served (kept bytes under the budget), so the case is not covered");
+        outcome.words.assign(Output.begin(), Output.begin() + 3u * Lanes * 4u);
+        RequireRed(outcome, 0, Lanes, [](std::uint32_t x) { return std::bit_cast<std::uint32_t>(7.0f + static_cast<float>(x)); }, "bindless serve submit: round " + std::to_string(round) + " large texture uploaded before the batch was submitted");
+        RequireRed(outcome, 1, Lanes, [&](std::uint32_t x) { return std::bit_cast<std::uint32_t>(small[x]); }, "bindless serve submit: round " + std::to_string(round) + " small texture uploaded after the batch was submitted");
+        RequireRed(outcome, 2, Lanes, [](std::uint32_t x) { return static_cast<std::uint32_t>(SintTexels[x]); }, "bindless serve submit: round " + std::to_string(round) + " sint texels");
+    }
+    std::puts("bindless serve submit: dispatches whose serve submitted the open batch (kept bytes over the budget) recorded into the next batch and read exact texels");
+}
+
 void RunGraphicsTests(AgcDriver::VulkanDevice& device) {
     const auto floatImage = Image(FloatTexels.data(), Format32Float);
     const auto uintImage = Image(UintTexels.data(), Format32UInt);
@@ -1799,6 +1872,10 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--bindless-miss") {
             RunBindlessMissTests(*device);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--bindless-serve-submit") {
+            RunBindlessServeSubmitTests(*device);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--pipeline-only") {

@@ -660,6 +660,64 @@ void gpuTests(const Device& device) {
     recorder.FlushDeferredReleases();
 }
 
+void growthTests(const Device& device) {
+    constexpr std::uint32_t Present = 1000u;
+    constexpr std::uint32_t Grown = 33000u;
+    constexpr std::uint32_t Middle = 17000u;
+    constexpr std::uint32_t Groups = 64u;
+    constexpr std::uint32_t Threads = Groups * 64u;
+    constexpr std::uint32_t Iterations = 4u;
+    std::unique_lock gpu(AgcDriver::GuestMemory::GpuMutex());
+    Fixture fixture(device, Present, Grown - Present, 1u << 16u);
+    auto& table = *fixture.table;
+    Recorder recorder(fixture.context, device.Timeline());
+    recorder.Activate();
+    std::vector<std::uint32_t> imageOf(fixture.total, ~0u);
+    std::vector<std::uint32_t> modeOf(fixture.total, 0u);
+    for (std::uint32_t record = 0; record < Present; ++record) {
+        imageOf[record] = record % DistinctImages;
+        modeOf[record] = RecordMode(record);
+    }
+    std::array<std::shared_ptr<Buffer>, 3> results;
+    for (auto& result : results) result = std::make_shared<Buffer>(fixture.context, Threads * 4u, AddressUsage);
+    table.Publish(recorder);
+    const auto bucketsAtFirst = table.Totals().buckets;
+    fixture.pipeline->Record(recorder.Commands(), table.Heap(), fixture.MakePush(2u, Iterations, *results[0], 0x711u), Groups);
+    recorder.Submit();
+    auto grownImage = imageOf;
+    auto grownMode = modeOf;
+    std::vector<std::uint32_t> middleImage;
+    std::vector<std::uint32_t> middleMode;
+    std::uint32_t bucketsAtMiddle = 0;
+    for (std::uint32_t record = Present; record < Grown; ++record) {
+        const auto slot = table.Heap().AllocateImage(DescriptorHeap::Array::SampledImages, fixture.images->View(record % DistinctImages), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        Require(table.Insert(RecordKey(record), DeviceImageValue{slot, RecordMode(record), 0u, 0u}) == DeviceImageKeys::Insertion::Inserted, "a bindless record inserted while earlier batches were in flight was not inserted");
+        grownImage[record] = record % DistinctImages;
+        grownMode[record] = RecordMode(record);
+        if (record + 1u != Middle) continue;
+        table.Publish(recorder);
+        bucketsAtMiddle = table.Totals().buckets;
+        fixture.pipeline->Record(recorder.Commands(), table.Heap(), fixture.MakePush(2u, Iterations, *results[1], 0x722u), Groups);
+        recorder.Submit();
+        middleImage = grownImage;
+        middleMode = grownMode;
+    }
+    table.Publish(recorder);
+    const auto bucketsAtEnd = table.Totals().buckets;
+    fixture.pipeline->Record(recorder.Commands(), table.Heap(), fixture.MakePush(2u, Iterations, *results[2], 0x733u), Groups);
+    recorder.Submit();
+    recorder.Sync();
+    Require(bucketsAtFirst < bucketsAtMiddle && bucketsAtMiddle < bucketsAtEnd, "the key table did not grow between the publications: " + std::to_string(bucketsAtFirst) + ", " + std::to_string(bucketsAtMiddle) + ", " + std::to_string(bucketsAtEnd) + " buckets");
+    std::uint32_t failures = 0;
+    failures += Mismatches(results[0]->Bytes(), Threads, [&](std::uint32_t id) { return fixture.Expected(id, Iterations, false, imageOf, modeOf); }, "lookup before the growth");
+    failures += Mismatches(results[1]->Bytes(), Threads, [&](std::uint32_t id) { return fixture.Expected(id, Iterations, false, middleImage, middleMode); }, "lookup after a growth published while the first batch was in flight");
+    failures += Mismatches(results[2]->Bytes(), Threads, [&](std::uint32_t id) { return fixture.Expected(id, Iterations, false, grownImage, grownMode); }, "lookup after a second growth");
+    Require(failures == 0u, std::to_string(failures) + " invocations read wrong bindless results across key table growth");
+    std::cout << "key table growth across batches in flight passed: " << bucketsAtFirst << " -> " << bucketsAtMiddle << " -> " << bucketsAtEnd << " buckets\n";
+    recorder.Sync();
+    recorder.FlushDeferredReleases();
+}
+
 double Benchmark(const Device& device, std::uint32_t records, std::uint32_t workingSet) {
     constexpr std::uint32_t Groups = 16384u;
     constexpr std::uint32_t Threads = Groups * 64u;
@@ -774,6 +832,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         gpuTests(*device);
+        growthTests(*device);
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "bindless table test failed: " << error.what() << '\n';
