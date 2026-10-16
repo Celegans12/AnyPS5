@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureService.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "Recompiler.hpp"
@@ -1765,6 +1766,261 @@ void RunBindlessOldPathTests(AgcDriver::VulkanDevice& device) {
     RequireRed(served, 2, Lanes, [](std::uint32_t x) { return static_cast<std::uint32_t>(SintTexels[x]); }, "bindless old path sint texels");
 }
 
+alignas(256) constexpr std::array<std::uint32_t, 6> PlainVertexCode{
+    0xe0382000u, 0x80000005u, 0xbf8c3f70u, 0xf80008cfu, 0x03020100u, 0xbf810000u,
+};
+
+alignas(256) constexpr std::array<std::uint32_t, 13> PixelSampleTableCode{
+    0xbefe0a7eu, 0x8f058504u, 0xf42c0600u, 0x0a000000u, 0x10040010u, 0x10060211u, 0xbf8cc07fu,
+    0xf0800f08u, 0x00660402u, 0xbf8c3f70u, 0xf800180fu, 0x07060504u, 0xbf810000u,
+};
+
+alignas(256) constexpr std::array<std::uint32_t, 24> PixelSampleWaterfallCode{
+    0xbefe0a7eu, 0x7e100f00u, 0x2c101082u, 0x36101081u, 0x4a101004u, 0x10040010u, 0x10060211u, 0xbea8047eu,
+    0x7e280508u, 0x7d841014u, 0xbeaa246au, 0x8f158514u, 0xf42c0600u, 0x2a000000u, 0xbf8cc07fu, 0xf0800f08u,
+    0x00660402u, 0x8afe6a2au, 0xbf89fff5u, 0xbefe0428u, 0xbf8c3f70u, 0xf800180fu, 0x07060504u, 0xbf810000u,
+};
+
+constexpr std::uint32_t SampleSize = 64;
+constexpr std::uint32_t SampleMips = 4;
+constexpr std::uint32_t SampleTextures = 3;
+constexpr std::uint32_t Format8888UNorm = 56;
+alignas(4096) std::array<std::array<std::uint8_t, 65536>, SampleTextures> SampleTexels{};
+alignas(256) std::array<std::uint32_t, SampleTextures * 8> SampleTable{};
+constexpr std::array<std::uint32_t, 4> SamplePointSampler{0u, 0xfffu << 12u, 1u << 26u, 0u};
+
+std::uint8_t SampleLevelMark(std::uint32_t level) {
+    return static_cast<std::uint8_t>(10u + 40u * level);
+}
+
+std::uint8_t SampleTextureMark(std::uint32_t texture) {
+    return static_cast<std::uint8_t>(40u + 50u * texture);
+}
+
+std::array<std::uint32_t, 8> SampleDescriptor(const void* texels) {
+    const auto address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(texels));
+    return {
+        static_cast<std::uint32_t>(address >> 8u),
+        static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (Format8888UNorm << 20u) | (((SampleSize - 1u) & 3u) << 30u),
+        ((SampleSize - 1u) >> 2u) | ((SampleSize - 1u) << 14u),
+        0xfacu | ((SampleMips - 1u) << 16u) | (Type2D << 28u),
+        0u,
+        (SampleMips - 1u) << 4u,
+        0u,
+        0u,
+    };
+}
+
+void FillSampleTextures() {
+    for (std::uint32_t texture = 0; texture < SampleTextures; ++texture) {
+        auto& bytes = SampleTexels[texture];
+        const auto descriptor = SampleDescriptor(bytes.data());
+        const auto geometry = AgcDriver::Graphics::DescribeSurface(AgcDriver::Graphics::DecodeTextureResource(descriptor));
+        Require(geometry.guestBytes <= bytes.size() && geometry.mips.size() == SampleMips, "image table pixel sampling: the mipped texture does not fit its storage");
+        std::fill(bytes.begin(), bytes.end(), std::uint8_t{0xee});
+        for (std::uint32_t level = 0; level < SampleMips; ++level) {
+            const auto& mip = geometry.mips[level];
+            for (std::uint64_t offset = 0; offset + 4u <= mip.tiledSize; offset += 4u) {
+                auto* texel = &bytes[geometry.GuestLayerOffset(0) + mip.tiledOffset + offset];
+                texel[0] = SampleLevelMark(level);
+                texel[1] = SampleTextureMark(texture);
+                texel[2] = 7u;
+                texel[3] = 255u;
+            }
+        }
+        std::copy(descriptor.begin(), descriptor.end(), SampleTable.begin() + texture * 8u);
+    }
+}
+
+struct PixelDraw {
+    bool vertexHeap = false;
+    bool pixelHeap = false;
+    bool pixelTableBinding = false;
+};
+
+PixelDraw DrawPixelTable(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> pixelCode, std::span<const std::uint32_t> table, std::uint32_t key, const std::array<std::uint32_t, 4>& sampler, float scaleU, float scaleV) {
+    const auto target = device.Target();
+    std::fill(Pixels.begin(), Pixels.end(), std::byte{0xa5});
+    std::vector<std::uint32_t> vertexUserData(4, 0u);
+    const auto vertices = VertexBuffer(Triangle.data(), 16u, static_cast<std::uint32_t>(Triangle.size()));
+    std::copy(vertices.begin(), vertices.end(), vertexUserData.begin());
+    const std::array<ShaderRecompiler::MemoryRegion, 1> vertexMemory{{{reinterpret_cast<std::uintptr_t>(PlainVertexCode.data()), std::as_bytes(std::span(PlainVertexCode))}}};
+    ShaderRecompiler::RecompileRequest vertex{
+        {ShaderStage::Vertex, reinterpret_cast<std::uintptr_t>(PlainVertexCode.data()), PlainVertexCode, 0, {}},
+        {64, 0, vertexUserData, std::nullopt, std::nullopt, ShaderRecompiler::ShaderVertexStageInfo{}, vertexMemory},
+        target,
+        {0, 0, 0, 64}
+    };
+    const auto vertexResult = ShaderRecompiler::Recompile(vertex);
+    const auto vertexPush = static_cast<std::uint32_t>(vertexResult.pushConstants.size());
+    ShaderRecompiler::ShaderPixelStageInfo pixel{};
+    pixel.wave32 = false;
+    pixel.inputAddr = ShaderRecompiler::PixelInputBit(ShaderRecompiler::PixelInput::PositionX) | ShaderRecompiler::PixelInputBit(ShaderRecompiler::PixelInput::PositionY);
+    pixel.posX = true;
+    pixel.posY = true;
+    pixel.targetOutputMode[0] = 9;
+    pixel.targetExportMapping.fill(0xe4u);
+    std::vector<std::uint32_t> pixelUserData(18, 0u);
+    const auto tableBuffer = Buffer(table.data(), static_cast<std::uint32_t>(table.size_bytes()));
+    std::copy(tableBuffer.begin(), tableBuffer.end(), pixelUserData.begin());
+    pixelUserData[4] = key;
+    std::copy(sampler.begin(), sampler.end(), pixelUserData.begin() + 12);
+    pixelUserData[16] = std::bit_cast<std::uint32_t>(scaleU);
+    pixelUserData[17] = std::bit_cast<std::uint32_t>(scaleV);
+    const std::array<ShaderRecompiler::MemoryRegion, 2> pixelMemory{{{reinterpret_cast<std::uintptr_t>(pixelCode.data()), std::as_bytes(pixelCode)}, {reinterpret_cast<std::uintptr_t>(table.data()), std::as_bytes(table)}}};
+    ShaderRecompiler::RecompileRequest fragment{
+        {ShaderStage::Fragment, reinterpret_cast<std::uintptr_t>(pixelCode.data()), pixelCode, 0, {}},
+        {64, 0, pixelUserData, std::nullopt, pixel, std::nullopt, pixelMemory},
+        target,
+        PixelPushLayout(vertexPush, target)
+    };
+    const auto pixelResult = ShaderRecompiler::Recompile(fragment);
+    const std::array<AgcDriver::Graphics::CompiledShader, 2> shaders{{
+        {ShaderStage::Vertex, &vertexResult, 0},
+        {ShaderStage::Fragment, &pixelResult, PixelPushOffset(vertexPush, target)}
+    }};
+    AgcDriver::Graphics::State state{};
+    state.stages = {AgcDriver::Graphics::ShaderPath::Vertex, 0u, 64u, 64u, std::nullopt, std::nullopt};
+    state.color = {reinterpret_cast<std::uintptr_t>(Pixels.data()), {TargetWidth, TargetHeight}, VK_FORMAT_R8G8B8A8_UNORM, Pixels.size(), 0xe4u};
+    state.colors = {state.color};
+    state.hasColorTarget = true;
+    state.renderExtent = {TargetWidth, TargetHeight};
+    state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    state.viewport = {0, static_cast<float>(TargetHeight), static_cast<float>(TargetWidth), -static_cast<float>(TargetHeight), 0, 1};
+    state.negativeOneToOne = false;
+    state.scissor = {{0, 0}, {TargetWidth, TargetHeight}};
+    state.cullMode = VK_CULL_MODE_NONE;
+    state.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    state.blend.colorWriteMask = 15;
+    state.blends = {state.blend};
+    state.blendConstants = {};
+    const AgcDriver::Pm4::DrawParameters draw{0, static_cast<std::uint32_t>(Triangle.size()), 0, 1, 0, false};
+    device.Draw(state, draw, shaders);
+    device.WaitIdle();
+    PixelDraw result;
+    result.vertexHeap = vertexResult.bindlessHeap;
+    result.pixelHeap = pixelResult.bindlessHeap;
+    result.pixelTableBinding = std::any_of(pixelResult.bindings.begin(), pixelResult.bindings.end(), [](const auto& binding) { return binding.role == ShaderRecompiler::DescriptorRole::ImageTable; });
+    return result;
+}
+
+void RequirePixelHeap(const PixelDraw& drawn, const std::string& what) {
+    Require(drawn.pixelHeap == BindlessHeap(), what + ": the pixel shader was " + (drawn.pixelHeap ? "" : "not ") + "lowered to the descriptor heap");
+    Require(!drawn.vertexHeap, what + ": the table-free vertex shader was lowered to the descriptor heap");
+    Require(!BindlessHeap() || !drawn.pixelTableBinding, what + ": the heap-served pixel table kept its image table binding");
+}
+
+std::array<std::uint32_t, 4> PixelAt(std::uint32_t x, std::uint32_t y) {
+    std::array<std::uint32_t, 4> value{};
+    for (std::uint32_t component = 0; component < 4u; ++component) value[component] = std::to_integer<std::uint32_t>(Pixels[(y * TargetWidth + x) * 4u + component]);
+    return value;
+}
+
+void RequirePixels(const std::function<std::array<std::uint32_t, 4>(std::uint32_t, std::uint32_t)>& expected, const std::string& what) {
+    for (std::uint32_t y = 0; y < TargetHeight; ++y) {
+        for (std::uint32_t x = 0; x < TargetWidth; ++x) {
+            const auto value = PixelAt(x, y);
+            const auto wanted = expected(x, y);
+            if (value == wanted) continue;
+            Require(false, what + ": pixel " + std::to_string(x) + "," + std::to_string(y) + " is (" + std::to_string(value[0]) + ", " + std::to_string(value[1]) + ", " + std::to_string(value[2]) + ", " + std::to_string(value[3]) + "), expected (" + std::to_string(wanted[0]) + ", " + std::to_string(wanted[1]) + ", " + std::to_string(wanted[2]) + ", " + std::to_string(wanted[3]) + ")");
+        }
+    }
+}
+
+struct PixelRegistration {
+    void* data;
+    PixelRegistration(void* data, std::size_t bytes) : data(data) { GuestAllocations::Mutation().Add(data, bytes, true, true, true); }
+    ~PixelRegistration() { GuestAllocations::Mutation().Remove(data); }
+};
+
+void RunPixelSampleTests(AgcDriver::VulkanDevice& device) {
+    FillSampleTextures();
+    for (std::uint32_t texture = 0; texture < SampleTextures; ++texture) {
+        for (std::uint32_t level = 0; level < 3u; ++level) {
+            const auto scale = static_cast<float>(1u << level) / static_cast<float>(SampleSize);
+            const auto what = "image table pixel sampling: texture " + std::to_string(texture) + " at implicit level " + std::to_string(level);
+            const auto drawn = DrawPixelTable(device, PixelSampleTableCode, SampleTable, texture, SamplePointSampler, scale, scale);
+            RequirePixelHeap(drawn, what);
+            RequirePixels([&](std::uint32_t, std::uint32_t) { return std::array<std::uint32_t, 4>{SampleLevelMark(level), SampleTextureMark(texture), 7u, 255u}; }, what);
+        }
+    }
+    for (std::uint32_t base = 0; base + 1u < SampleTextures; ++base) {
+        for (std::uint32_t level = 0; level < 2u; ++level) {
+            const auto scale = static_cast<float>(1u << level) / static_cast<float>(SampleSize);
+            const auto what = "image table pixel sampling: per-pixel texture " + std::to_string(base) + " or " + std::to_string(base + 1u) + " at implicit level " + std::to_string(level);
+            const auto drawn = DrawPixelTable(device, PixelSampleWaterfallCode, SampleTable, base, SamplePointSampler, scale, scale);
+            RequirePixelHeap(drawn, what);
+            RequirePixels([&](std::uint32_t x, std::uint32_t) { return std::array<std::uint32_t, 4>{SampleLevelMark(level), SampleTextureMark(base + ((x >> 2u) & 1u)), 7u, 255u}; }, what);
+        }
+    }
+    std::puts("image table pixel sampling: implicit LOD and per-pixel textures passed");
+}
+
+void RunPixelStorageTests(AgcDriver::VulkanDevice& device) {
+    alignas(256) static std::array<std::uint32_t, 256u * 8u> writerRecords{};
+    alignas(256) static std::array<float, Width * Height> source{};
+    alignas(256) static std::array<float, Width * Height> written{};
+    alignas(256) static std::array<std::uint32_t, 8> pixelTable{};
+    PixelRegistration registeredWriter(writerRecords.data(), sizeof(writerRecords)), registeredSource(source.data(), sizeof(source)), registeredWritten(written.data(), sizeof(written));
+    const auto write = [&](std::uint32_t bias) {
+        for (std::uint32_t y = 0; y < Height; ++y) {
+            for (std::uint32_t x = 0; x < Width; ++x) source[y * Width + x] = static_cast<float>(x + 3u * y + bias) / 255.0f;
+        }
+        written.fill(0.0f);
+        writerRecords.fill(0u);
+        const auto image = Image(source.data(), Format32Float);
+        std::copy(image.begin(), image.end(), writerRecords.begin());
+        const auto keys = Buffer(Keys.data(), static_cast<std::uint32_t>(sizeof(Keys)));
+        const auto output = Buffer(Output.data(), static_cast<std::uint32_t>(sizeof(Output)));
+        const auto storage = Image(written.data(), Format32Float);
+        Srt.fill(0u);
+        std::copy(keys.begin(), keys.end(), Srt.begin());
+        std::copy(output.begin(), output.end(), Srt.begin() + 4);
+        std::copy(PointClamp.begin(), PointClamp.end(), Srt.begin() + 8);
+        const auto pointer = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(writerRecords.data())) + 0x100u;
+        Srt[12] = static_cast<std::uint32_t>(pointer);
+        Srt[13] = static_cast<std::uint32_t>(pointer >> 32u);
+        std::copy(storage.begin(), storage.end(), Srt.begin() + 16);
+        Keys.fill(0u);
+        const std::span<const std::uint32_t> code(PointerStorageWriteCode);
+        const std::array<ShaderRecompiler::MemoryRegion, 4> memory{{
+            {reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)},
+            {reinterpret_cast<std::uintptr_t>(Srt.data()), std::as_bytes(std::span(Srt))},
+            {reinterpret_cast<std::uintptr_t>(writerRecords.data()), std::as_bytes(std::span(writerRecords))},
+            {reinterpret_cast<std::uintptr_t>(Keys.data()), std::as_bytes(std::span(Keys))},
+        }};
+        const auto writer = Execute(device, code, Srt.data(), memory, 1u, Lanes, 64u, nullptr, false);
+        Require(!Faulted(writer), "image table pixel storage: the writing dispatch faulted:\n" + writer.log);
+    };
+    const auto image = Image(written.data(), Format32Float);
+    pixelTable.fill(0u);
+    std::copy(image.begin(), image.end(), pixelTable.begin());
+    const auto scaleU = 1.0f / static_cast<float>(TargetWidth);
+    const auto scaleV = 1.0f / static_cast<float>(TargetHeight);
+    for (const std::uint32_t bias : {0u, 2u}) {
+        write(bias);
+        const auto drawn = DrawPixelTable(device, PixelSampleTableCode, pixelTable, 0u, SamplePointSampler, scaleU, scaleV);
+        RequirePixelHeap(drawn, "image table pixel storage");
+        RequirePixels([&](std::uint32_t x, std::uint32_t y) { return std::array<std::uint32_t, 4>{y * Height / TargetHeight == 0u ? x + bias : 0u, 0u, 0u, 255u}; }, "image table pixel storage: a draw sampling an image the preceding dispatch of the batch stored (pass " + std::to_string(bias) + ")");
+    }
+    std::puts("image table pixel storage: dispatch-written images sampled by a draw passed");
+}
+
+void RunPixelMissTests(AgcDriver::VulkanDevice& device) {
+    const auto& service = *device.BindlessService();
+    FillSampleTextures();
+    const auto scale = 1.0f / static_cast<float>(SampleSize);
+    const auto before = service.Totals();
+    const auto missed = DrawPixelTable(device, PixelSampleTableCode, SampleTable, 2u, SamplePointSampler, scale, scale);
+    RequirePixelHeap(missed, "bindless pixel miss");
+    RequirePixels([](std::uint32_t, std::uint32_t) { return std::array<std::uint32_t, 4>{}; }, "bindless pixel miss: an unprimed key did not sample zero");
+    static_cast<void>(DrawPixelTable(device, PixelSampleTableCode, SampleTable, 2u, SamplePointSampler, scale, scale));
+    RequirePixels([](std::uint32_t, std::uint32_t) { return std::array<std::uint32_t, 4>{SampleLevelMark(0), SampleTextureMark(2), 7u, 255u}; }, "bindless pixel miss: the key the first draw missed was not served to the second");
+    const auto after = service.Totals();
+    Require(after.misses - before.misses == 1u && after.created - before.created == 1u, "bindless pixel miss: expected 1 distinct miss and 1 entry, got " + std::to_string(after.misses - before.misses) + " misses and " + std::to_string(after.created - before.created) + " entries");
+    std::puts("bindless pixel miss: zero on a miss, exact after the drain passed");
+}
+
 void RunGraphicsTests(AgcDriver::VulkanDevice& device) {
     const auto floatImage = Image(FloatTexels.data(), Format32Float);
     const auto uintImage = Image(UintTexels.data(), Format32UInt);
@@ -1799,6 +2055,15 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--bindless-miss") {
             RunBindlessMissTests(*device);
+            RunPixelMissTests(*device);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--graphics") {
+            RunPixelSampleTests(*device);
+            RunPixelStorageTests(*device);
+            RunGraphicsTests(*device);
+            if (BindlessHeap()) Require(device->BindlessService() != nullptr && device->BindlessService()->Totals().misses == 0u, "image table graphics: the exact bindless run missed in the device image table");
+            std::puts("image table graphics tests passed");
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--pipeline-only") {

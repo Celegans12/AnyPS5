@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DeviceImageKeys.hpp"
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -50,6 +51,7 @@ public:
     std::uint32_t Retire(const std::function<bool(const Key&, const DeviceImageValue&)>& drop);
     void Publish(Recorder& recorder);
     std::vector<DeviceImageMiss> TakeMisses();
+    std::shared_ptr<void> HoldRing();
 
     struct Counts {
         std::uint64_t publications = 0;
@@ -73,8 +75,11 @@ private:
         std::uint64_t drained = 0;
         std::uint64_t written = 0;
         std::uint64_t dropped = 0;
+        std::map<const Buffer*, std::uint32_t> holds;
+        std::vector<std::shared_ptr<Buffer>> deferred;
     };
     static void drain(const std::shared_ptr<Rings>& rings, const std::shared_ptr<Buffer>& ring);
+    static void release(const std::shared_ptr<Rings>& rings, const std::shared_ptr<Buffer>& ring);
 
     Context context;
     DescriptorHeap heap;

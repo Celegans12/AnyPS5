@@ -2,6 +2,7 @@
 #include "BindlessImageAbi.hpp"
 #include <algorithm>
 #include <string>
+#include <vector>
 
 namespace AgcDriver::Graphics {
 
@@ -133,7 +134,18 @@ const DescriptorHeap::View& DescriptorHeap::view(VkShaderStageFlags stages) {
         Check(result, "vkAllocateDescriptorSets descriptor heap");
     }
     const auto& added = views.emplace_back(created);
-    for (std::size_t index = 0; index < arrays.size(); ++index) write(added, static_cast<Array>(index), 0, static_cast<std::uint32_t>(arrays[index].entries.size()));
+    for (std::size_t index = 0; index < arrays.size(); ++index) {
+        const auto& slots = arrays[index];
+        std::vector<VkDescriptorImageInfo> current(slots.entries.size());
+        for (std::size_t slot = 0; slot < current.size(); ++slot) current[slot] = slot == Abi::NullSlot || slots.live[slot] ? slots.entries[slot] : slots.entries[Abi::NullSlot];
+        VkWriteDescriptorSet update{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        update.dstSet = added.set;
+        update.dstBinding = static_cast<std::uint32_t>(index);
+        update.descriptorCount = static_cast<std::uint32_t>(current.size());
+        update.descriptorType = slots.type;
+        update.pImageInfo = current.data();
+        context.Function<PFN_vkUpdateDescriptorSets>("vkUpdateDescriptorSets")(context.device, 1, &update, 0, nullptr);
+    }
     writeHeader(added);
     return added;
 }
