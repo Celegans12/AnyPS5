@@ -1417,6 +1417,9 @@ void bindlessFaultTests(const Context& context, const BdaTestAccess& access) {
     reject([&] { resources.WriteBackBuffers(); }, "bindless images: shader address unavailable stage 4 pc 0x2a0 selected the refused device image table entry 7");
     report.address = 0x1000u;
     std::memcpy(fault.data(), &report, sizeof(report));
+    reject([&] { resources.WriteBackBuffers(); }, "bindless images: shader address unavailable stage 4 pc 0x2a0 selected the refused device image table entry 7 (descriptor at 0x1000)");
+    report.reason = Abi::FaultReason::BindlessMiss;
+    std::memcpy(fault.data(), &report, sizeof(report));
     reject([&] { resources.WriteBackBuffers(); }, "invalid bindless image fault payload");
     std::memset(fault.data(), 0, fault.size());
     resources.WriteBackBuffers();

@@ -350,6 +350,8 @@ struct Outcome {
     bool cacheable = false;
     bool guardedWrap = false;
     bool faultBuffer = false;
+    bool bindlessHeap = false;
+    std::size_t bindlessPrimer = 0;
     std::vector<std::array<std::uint32_t, 4>> samplers;
     std::vector<std::array<std::uint32_t, 4>> samplerTable;
     std::vector<std::vector<std::pair<std::uint64_t, std::uint64_t>>> imageTableReadRanges;
@@ -388,6 +390,8 @@ Outcome Execute(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> 
     outcome.poisonedSrtReads = result.poisonedSrtReads;
     outcome.cacheable = AgcDriver::DriverDetail::CacheableResult(result);
     outcome.imageTableReadRanges = result.imageTableReadRanges;
+    outcome.bindlessHeap = result.bindlessHeap;
+    outcome.bindlessPrimer = result.bindlessPrimer.size();
     for (const auto& binding : result.bindings) {
         if (binding.role == ShaderRecompiler::DescriptorRole::ImageTable) {
             outcome.imageTableCount = binding.count;
@@ -524,6 +528,23 @@ std::vector<std::uint32_t> Group(const Outcome& outcome, std::uint32_t group, st
 
 bool Faulted(const Outcome& outcome) {
     return outcome.log.find("image table:") != std::string::npos;
+}
+
+bool BindlessHeap() {
+    const char* value = std::getenv("APS5_BINDLESS_IMAGES");
+    return value != nullptr && std::string_view(value) == "1";
+}
+
+void RequireSnapshotFault(const Outcome& outcome, const char* reason, const std::string& what, bool unmapped = false) {
+    if (!BindlessHeap()) {
+        Require(Faulted(outcome) && outcome.log.find(reason) != std::string::npos, what + ":\n" + outcome.log);
+        return;
+    }
+    if (unmapped) {
+        Require(!Faulted(outcome) && outcome.log.find("BDA access failed") != std::string::npos && outcome.log.find("reason=1") != std::string::npos, what + " (bindless heap: the descriptor read did not fault as unmapped):\n" + outcome.log);
+        return;
+    }
+    Require(!Faulted(outcome), what + " (bindless heap: the live descriptor read faulted):\n" + outcome.log);
 }
 
 bool Holds(const std::vector<std::array<std::uint32_t, 4>>& samplers, const std::array<std::uint32_t, 4>& sampler) {
@@ -830,7 +851,7 @@ void RunTests(AgcDriver::VulkanDevice& device) {
 
     Keys[0] = 0x05555556u;
     const auto wrapped = Run(device, TableCode, 1, Lanes, 64);
-    Require(Faulted(wrapped) && wrapped.log.find("outside the snapshot") != std::string::npos, "image table: a mid-record key did not fault as outside the snapshot:\n" + wrapped.log);
+    RequireSnapshotFault(wrapped, "outside the snapshot", "image table: a mid-record key did not fault as outside the snapshot");
 
     Keys = {};
     const auto unused = Run(device, TableCode, 1, Lanes, 64);
@@ -939,7 +960,7 @@ void RunTests(AgcDriver::VulkanDevice& device) {
 
     Keys = {};
     const auto aliased = Run(device, TableCode, 1, Lanes, 64, true);
-    Require(Faulted(aliased) && aliased.log.find("is written by its own dispatch") != std::string::npos, "image table: a dispatch storing into its own table did not fault on use:\n" + aliased.log);
+    RequireSnapshotFault(aliased, "is written by its own dispatch", "image table: a dispatch storing into its own table did not fault on use");
     SetClassRecords();
 }
 
@@ -1261,12 +1282,16 @@ void RunPointerTests(AgcDriver::VulkanDevice& device) {
     Keys[1] = 0x08000000u;
     const auto unbounded = RunPointer(device, UnboundedPointerCode, 2);
     Require(!Faulted(unbounded) && Group(unbounded, 0) == Group(palette, 2) && Group(unbounded, 1) == Group(palette, 0), "pointer image table: an unmasked key, or one whose offset wraps to entry 0, sampled the wrong entry:\n" + unbounded.log);
-    Keys[0] = 300;
-    const auto past = RunPointer(device, UnboundedPointerCode, 1);
-    Require(Faulted(past) && past.log.find("unmapped") != std::string::npos, "pointer image table: an entry past the captured palette did not fault as unmapped:\n" + past.log);
-    Keys[0] = 0x10000u;
-    const auto capped = RunPointer(device, UnboundedPointerCode, 1);
-    Require(Faulted(capped) && capped.log.find("outside the snapshot") != std::string::npos, "pointer image table: a key past the key cap did not fault as outside the snapshot:\n" + capped.log);
+    if (BindlessHeap() && device.VendorId() == 0x10005u) {
+        std::puts("pointer image table: unmapped descriptor reads through the bindless heap skipped on llvmpipe, which runs the BDA byte load of an unmapped address under an empty mask");
+    } else {
+        Keys[0] = 300;
+        const auto past = RunPointer(device, UnboundedPointerCode, 1);
+        RequireSnapshotFault(past, "unmapped", "pointer image table: an entry past the captured palette did not fault as unmapped", true);
+        Keys[0] = 0x10000u;
+        const auto capped = RunPointer(device, UnboundedPointerCode, 1);
+        RequireSnapshotFault(capped, "outside the snapshot", "pointer image table: a key past the key cap did not fault as outside the snapshot", true);
+    }
 
     const std::array<std::uint32_t, 5> readKeys{0u, 1u, 2u, 3u, 0x1ffu};
     Keys = {};
@@ -1494,8 +1519,8 @@ void RunPointerStorageWriteTests(AgcDriver::VulkanDevice& device) {
     Require(!Faulted(separate), "pointer image table: a separate storage image write faulted:\n" + separate.log);
     RequireRed(separate, 0, Lanes, [](std::uint32_t x) { return std::bit_cast<std::uint32_t>(FloatTexels[x]); }, "pointer image table with a separate storage image write");
     const auto aliased = run(PointerStorageWriteCode, true);
-    Require(Faulted(aliased) && aliased.log.find("is written by its own dispatch") != std::string::npos, "pointer image table: an overlapping storage image write did not fault:\n" + aliased.log);
-    Require(Zeros(aliased), "pointer image table: an overlapping storage image write did not suppress the sampled value");
+    RequireSnapshotFault(aliased, "is written by its own dispatch", "pointer image table: an overlapping storage image write did not fault");
+    Require(BindlessHeap() || Zeros(aliased), "pointer image table: an overlapping storage image write did not suppress the sampled value");
     const auto isolated = run(PointerStorageIsolationCode, true, 32u);
     Require(isolated.imageTableReadRanges.size() == 2u && !isolated.imageTableReadRanges[0].empty() && !isolated.imageTableReadRanges[1].empty(), "pointer image table isolation: both tables were not captured");
     for (const auto& [first, firstBytes] : isolated.imageTableReadRanges[0]) {
@@ -1510,8 +1535,8 @@ void RunPointerStorageWriteTests(AgcDriver::VulkanDevice& device) {
     }
     const auto selected = run(PointerStorageIsolationCode, true, 32u, 32u);
     Require(selected.imageTableReadRanges == isolated.imageTableReadRanges, "pointer image table isolation: selecting the written table changed the captured ranges");
-    Require(Faulted(selected) && selected.log.find("is written by its own dispatch") != std::string::npos, "pointer image table isolation: selecting the written table did not fault:\n" + selected.log);
-    Require(Zeros(selected), "pointer image table isolation: selecting the written table did not suppress the sampled value");
+    RequireSnapshotFault(selected, "is written by its own dispatch", "pointer image table isolation: selecting the written table did not fault");
+    Require(BindlessHeap() || Zeros(selected), "pointer image table isolation: selecting the written table did not suppress the sampled value");
 }
 
 std::array<std::uint32_t, 4> VertexBuffer(const void* data, std::uint32_t stride, std::uint32_t count) {
@@ -1606,6 +1631,37 @@ std::pair<std::uint64_t, std::uint64_t> DrawTables(AgcDriver::VulkanDevice& devi
     return {vertexResult.PipelineVariantId(), pixelResult.PipelineVariantId()};
 }
 
+void RunBindlessMissTests(AgcDriver::VulkanDevice& device) {
+    namespace Bindless = ShaderRecompiler::BindlessImageAbi;
+    Require(BindlessHeap() && device.BindlessImagesEnabled(), "bindless miss: the device has no bindless descriptor heap");
+    Fill();
+    SetClassRecords();
+    Keys = {};
+    for (std::uint32_t group = 0; group < 3u; ++group) Keys[group] = group;
+    static_cast<void>(device.TakeBindlessMisses());
+    const auto missed = Run(device, TableCode, 3, Lanes, 64);
+    Require(missed.bindlessHeap, "bindless miss: the table program was not compiled for the descriptor heap");
+    Require(!Faulted(missed) && Zeros(missed), "bindless miss: unprimed keys did not sample zeros without a fault:\n" + missed.log);
+    const auto misses = device.TakeBindlessMisses();
+    Require(device.BindlessEntries() == 0u, "bindless miss: the table held entries although the primer was off");
+    for (std::uint32_t record = 0; record < 3u; ++record) {
+        const auto* words = Table.data() + record * (Stride / 4u);
+        const auto found = std::any_of(misses.begin(), misses.end(), [&](const AgcDriver::Graphics::DeviceImageMiss& miss) {
+            for (std::uint32_t word = 0; word < 8u; ++word) {
+                if (miss.key[word] != Bindless::MaskedDescriptorWord(word, words[4u + word])) return false;
+            }
+            for (std::uint32_t word = 0; word < 4u; ++word) {
+                if (miss.key[Bindless::Table::SamplerWord + word] != words[word]) return false;
+            }
+            return miss.key[Bindless::Table::SamplerClassWord] == Bindless::TableSamplerClass && miss.pc != 0u;
+        });
+        Require(found, "bindless miss: the miss ring did not name record " + std::to_string(record) + " (" + std::to_string(misses.size()) + " distinct misses)");
+    }
+    Require(misses.size() == 3u, "bindless miss: the miss ring named " + std::to_string(misses.size()) + " distinct keys, expected 3");
+    const auto again = Run(device, TableCode, 3, Lanes, 64);
+    Require(!Faulted(again) && Zeros(again) && device.TakeBindlessMisses().size() == 3u, "bindless miss: the keys did not miss again in the next batch");
+}
+
 void RunGraphicsTests(AgcDriver::VulkanDevice& device) {
     const auto floatImage = Image(FloatTexels.data(), Format32Float);
     const auto uintImage = Image(UintTexels.data(), Format32UInt);
@@ -1634,6 +1690,14 @@ int main(int argc, char** argv) {
 #endif
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
+        if (BindlessHeap() && !device->BindlessImagesEnabled()) {
+            std::puts("image table: the device cannot hold the bindless descriptor heap, skipped");
+            return VulkanTestSkipped;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--bindless-miss") {
+            RunBindlessMissTests(*device);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--pipeline-only") {
             RunPipelineOnlyTests(*device);
             return 0;
@@ -1666,6 +1730,7 @@ int main(int argc, char** argv) {
         RunSplitRecordTests(*device);
         RunPointerStorageWriteTests(*device);
         RunGraphicsTests(*device);
+        if (BindlessHeap()) Require(device->BindlessEntries() != 0u, "image table: the bindless run put no entry into the device table");
         std::puts("image table tests passed");
         return 0;
     } catch (const std::exception& error) {

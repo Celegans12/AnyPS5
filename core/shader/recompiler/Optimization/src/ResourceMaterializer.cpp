@@ -1464,6 +1464,192 @@ ResolvedImageTables ResourceMaterializer::ResolveImageTables(const ShaderInfo& i
     return out;
 }
 
+namespace {
+
+ImageResource bindlessInterfaceImage(const ImageResource& image) {
+    auto normalized = image;
+    normalized.source = 0u;
+    normalized.firstUsePc = 0u;
+    if (normalized.table != NoTable) normalized.table = 0u;
+    return normalized;
+}
+
+std::uint64_t mixBindlessInterface(std::uint64_t hash, const ImageResource& image) {
+    const auto mix = [&](std::uint64_t value) {
+        hash ^= value;
+        hash *= 0x100000001b3ull;
+    };
+    mix(static_cast<std::uint64_t>(image.resourceClass));
+    mix(static_cast<std::uint64_t>(image.numericClass));
+    mix(static_cast<std::uint64_t>(image.dimension));
+    mix(static_cast<std::uint64_t>(image.mipMode));
+    mix(image.mipCount);
+    mix(static_cast<std::uint64_t>(image.conversionFormat));
+    mix(image.shaderSwizzle);
+    mix((image.read ? 1u : 0u) | (image.written ? 2u : 0u) | (image.atomic ? 4u : 0u) | (image.atomic64 ? 8u : 0u) | (image.depthCompare ? 16u : 0u) | (image.cube ? 32u : 0u) | (image.r128 ? 64u : 0u) | (image.srgbDecode ? 128u : 0u));
+    mix((image.srgbDecodeCompatible ? 1u : 0u) | (image.depthBits ? 2u : 0u) | (image.depthUnorm16 ? 4u : 0u) | (image.packed ? 8u : 0u) | (image.fmaskCompatible ? 16u : 0u) | (image.depthBitsCompatible ? 32u : 0u) | (image.constantSwizzle ? 64u : 0u) | (image.constantSwizzleCompatible ? 128u : 0u));
+    mix((image.flatVolumeCompatible ? 1u : 0u) | (image.flatLineCompatible ? 2u : 0u) | (image.foldTexelOffsetsOnly ? 4u : 0u) | (image.table != NoTable ? 8u : 0u) | (image.cubeFaceCompatible ? 16u : 0u) | (image.singleMipPlaneBiasCompatible ? 32u : 0u) | (image.flatVolumeLineCompatible ? 64u : 0u));
+    mix(image.srgbDecodeFormats);
+    mix(image.byElements);
+    mix(image.byComponents);
+    mix(static_cast<std::uint64_t>(image.packedFormat));
+    mix(image.emulatedCompare);
+    mix(static_cast<std::uint64_t>(image.tableOperation));
+    mix(image.levelUses);
+    return hash;
+}
+
+struct BindlessInterfaceRegistry {
+    std::mutex mutex;
+    std::unordered_map<std::uint64_t, std::shared_ptr<const BindlessInterface>> interfaces;
+};
+
+BindlessInterfaceRegistry& bindlessInterfaces() {
+    static BindlessInterfaceRegistry registry;
+    return registry;
+}
+
+constexpr std::size_t BindlessPrimerLimit = 1u << 20u;
+
+}
+
+bool ResourceMaterializer::BindlessImage(const ShaderInfo& info, IrShaderStage stage, std::uint32_t resource) {
+    if (stage != IrShaderStage::Compute || resource >= info.images.size() || resource >= info.runtimeImageModes.size()) return false;
+    const auto& image = info.images[resource];
+    return image.table != NoTable && image.resourceClass == ImageResourceClass::Sampled && image.tableOperation == TableOperation::Supported && !info.runtimeImageModes[resource].empty();
+}
+
+bool ResourceMaterializer::UsesBindlessImages(const ShaderInfo& info, IrShaderStage stage) {
+    for (std::uint32_t resource = 0; resource < info.images.size(); ++resource) {
+        if (BindlessImage(info, stage, resource)) return true;
+    }
+    return false;
+}
+
+std::uint64_t ResourceMaterializer::BindlessInterfaceId(const ImageResource& image, std::span<const ImageResource> modes) {
+    auto hash = mixBindlessInterface(0xcbf29ce484222325ull, bindlessInterfaceImage(image));
+    hash = (hash ^ modes.size()) * 0x100000001b3ull;
+    for (const auto& mode : modes) hash = mixBindlessInterface(hash, bindlessInterfaceImage(mode));
+    return hash;
+}
+
+void ResourceMaterializer::RegisterBindlessInterfaces(const ShaderInfo& info, IrShaderStage stage) {
+    for (std::uint32_t resource = 0; resource < info.images.size(); ++resource) {
+        if (!BindlessImage(info, stage, resource)) continue;
+        const auto image = bindlessInterfaceImage(info.images[resource]);
+        const auto& modes = info.runtimeImageModes[resource];
+        const auto id = BindlessInterfaceId(image, modes);
+        const auto same = [&](const BindlessInterface& entry) {
+            if (entry.image != image || entry.modes.size() != modes.size()) return false;
+            for (std::size_t index = 0; index < modes.size(); ++index) {
+                if (entry.modes[index] != bindlessInterfaceImage(modes[index])) return false;
+            }
+            return true;
+        };
+        auto& registry = bindlessInterfaces();
+        std::lock_guard lock(registry.mutex);
+        if (const auto found = registry.interfaces.find(id); found != registry.interfaces.end()) {
+            if (!same(*found->second)) throw std::runtime_error("bindless images: two image interfaces share the id 0x" + hexText(id));
+            continue;
+        }
+        auto entry = std::make_shared<BindlessInterface>();
+        entry->id = id;
+        entry->image = image;
+        for (const auto& mode : modes) entry->modes.push_back(bindlessInterfaceImage(mode));
+        registry.interfaces.emplace(id, std::move(entry));
+    }
+}
+
+std::shared_ptr<const BindlessInterface> ResourceMaterializer::FindBindlessInterface(std::uint64_t id) {
+    auto& registry = bindlessInterfaces();
+    std::lock_guard lock(registry.mutex);
+    const auto found = registry.interfaces.find(id);
+    return found != registry.interfaces.end() ? found->second : nullptr;
+}
+
+std::vector<BindlessImageAbi::PrimerEntry> ResourceMaterializer::BindlessPrimer(const ShaderInfo& info, IrShaderStage stage, const ResourceSnapshot& snapshot, const ResolvedImageTables& tables, std::span<const std::uint32_t> directSamplers) {
+    namespace Abi = ImageTableAbi;
+    namespace Bindless = BindlessImageAbi;
+    std::vector<Bindless::PrimerEntry> out;
+    if (tables.map.empty()) return out;
+    const auto& map = tables.map;
+    struct Record {
+        std::array<std::uint32_t, 8> words{};
+        std::uint32_t flags = 0;
+        std::uint32_t element = 0;
+    };
+    const auto records = [&](std::uint32_t table, bool sampler) {
+        std::vector<Record> found;
+        const auto header = Abi::TableHeader(table);
+        if (map.at(header + Abi::TableFault) != 0u) return found;
+        const auto start = map.at(header + Abi::TableMapStart);
+        const auto& column = snapshot.tables.tables.at(table);
+        std::set<std::uint32_t> seen;
+        for (std::uint32_t key = 0; key < map.at(header + Abi::TableKeyCount); ++key) {
+            const auto record = map.at(start + key);
+            const auto code = column.codes.at(key);
+            if (record == Abi::NullCode || (record & Abi::PoisonFlag) != 0u || (code & Abi::PoisonFlag) != 0u || !seen.insert(record).second) continue;
+            const auto& value = snapshot.tables.words.at(code);
+            Record entry;
+            std::copy_n(value.dwords.begin(), sampler ? 4u : 8u, entry.words.begin());
+            entry.flags = map.at(record + (sampler ? Abi::SamplerRecordFlags : Abi::ImageRecordFlags));
+            entry.element = map.at(record + (sampler ? Abi::SamplerRecordElement : Abi::ImageRecordElement));
+            found.push_back(entry);
+        }
+        return found;
+    };
+    const auto fault = [](std::uint32_t flags) { return (flags & Abi::PoisonFlag) != 0u ? (flags & ~Abi::PoisonFlag) + 1u : 0u; };
+    for (std::uint32_t resource = 0; resource < info.images.size(); ++resource) {
+        if (!BindlessImage(info, stage, resource)) continue;
+        const auto& image = info.images[resource];
+        const auto& modes = info.runtimeImageModes[resource];
+        const auto id = BindlessInterfaceId(image, modes);
+        const auto images = records(image.table, false);
+        const auto add = [&](const Record& entry, std::uint32_t samplerClass, const std::array<std::uint32_t, 4>& samplerWords, const Record* sampler, std::uint32_t direct) {
+            if (out.size() >= BindlessPrimerLimit) throw std::runtime_error("bindless images: the image table primer needs more than " + std::to_string(BindlessPrimerLimit) + " entries, which is not implemented");
+            Bindless::PrimerEntry primed;
+            primed.key = Bindless::MakeKey(std::span<const std::uint32_t, 8>(entry.words), id, samplerClass, std::span<const std::uint32_t, 4>(samplerWords));
+            primed.fault = fault(entry.flags);
+            if (primed.fault == 0u) {
+                primed.mode = (entry.flags >> Abi::ModeShift) & Abi::ModeMask;
+                primed.element = entry.element;
+            }
+            if (sampler != nullptr && primed.fault == 0u) {
+                primed.fault = fault(sampler->flags);
+                if (primed.fault == 0u) {
+                    const auto& mode = modes.at(primed.mode);
+                    primed.samplerElement = sampler->element + (mode.depthCompare ? 2u : 0u) + (requiresPointSampler(mode) ? 1u : 0u);
+                }
+            }
+            if (direct != Bindless::NoSamplerElement && primed.fault == 0u) {
+                primed.samplerElement = direct + (requiresPointSampler(modes.at(primed.mode)) ? 1u : 0u);
+                primed.directSampler = true;
+            }
+            out.push_back(primed);
+        };
+        const std::array<std::uint32_t, 4> none{};
+        for (const auto& entry : images) add(entry, Bindless::NoSamplerClass, none, nullptr, Bindless::NoSamplerElement);
+        for (const auto& pair : info.sampledPairs) {
+            if (pair.image != resource) continue;
+            const auto& sampler = info.samplers.at(pair.sampler);
+            if (sampler.table == NoTable) {
+                std::array<std::uint32_t, 4> direct{};
+                std::copy_n(snapshot.samplers.at(pair.sampler).dwords.begin(), 4u, direct.begin());
+                const auto element = std::find(directSamplers.begin(), directSamplers.end(), pair.sampler);
+                if (element == directSamplers.end()) throw std::runtime_error("bindless images: a direct sampler paired with a table image is absent from the sampler binding");
+                for (const auto& entry : images) add(entry, Bindless::DirectSamplerClass, direct, nullptr, static_cast<std::uint32_t>(element - directSamplers.begin()));
+                continue;
+            }
+            for (const auto& samplerRecord : records(sampler.table, true)) {
+                std::array<std::uint32_t, 4> samplerWords{};
+                std::copy_n(samplerRecord.words.begin(), 4u, samplerWords.begin());
+                for (const auto& entry : images) add(entry, Bindless::TableSamplerClass, samplerWords, &samplerRecord, Bindless::NoSamplerElement);
+            }
+        }
+    }
+    return out;
+}
+
 std::vector<ImageResource> ResourceMaterializer::RuntimeImageModes(const ImageResource& image) {
     const bool table = image.table != NoTable;
     if (table && image.tableOperation == TableOperation::Unsupported) return {};

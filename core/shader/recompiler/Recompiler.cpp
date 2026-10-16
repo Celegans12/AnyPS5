@@ -298,7 +298,7 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
     dumpIr("srt");
 
     constexpr ResourceTracker resourceTracker;
-    resourceTracker.Track(program);
+    resourceTracker.Track(program, request.target.bindlessImages);
     deadCodeEliminator.Eliminate(program);
     dumpIr("resources");
     program.Resources().srgbDecodeFormats = request.target.srgbDecodeFormats;
@@ -560,6 +560,10 @@ void prepareInterface(const RecompileRequest& request, IrProgram& program) {
             if (ResourceMaterializer::CanGuardUnnormalizedWrap(program, index)) program.Info().usesFaultBuffer = true;
         }
     }
+    if (request.target.bindlessImages && ResourceMaterializer::UsesBindlessImages(program.Info(), program.Resources().stage)) {
+        program.Info().usesDma = true;
+        program.Info().usesFaultBuffer = true;
+    }
 }
 
 CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program) {
@@ -585,6 +589,7 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program)
     targetOptions.float16DenormPreserve = request.target.float16DenormPreserve;
     static const bool spannedWaves = std::getenv("APS5_SPANNED_WAVE") != nullptr;
     targetOptions.spannedWaves = spannedWaves;
+    targetOptions.bindlessImages = request.target.bindlessImages;
 
     constexpr SpirvEmitter spirvEmitter;
     CompiledShaderArtifact result;
@@ -605,6 +610,8 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program)
         result.spirv = spirvEmitter.Emit(program, inputInfo, bindings, targetOptions);
     }
     result.registrationModule = registration;
+    result.bindlessHeap = request.target.bindlessImages && ResourceMaterializer::UsesBindlessImages(program.Info(), program.Resources().stage);
+    if (result.bindlessHeap) ResourceMaterializer::RegisterBindlessInterfaces(program.Info(), program.Resources().stage);
     result.stencilReplaySafe = (request.shader.stage == ShaderStage::Vertex || stencilReplay) && StencilReplaySafe(program);
     if (stencilReplay) {
         result.stencilReferences = StencilReferenceValues(program);
@@ -855,14 +862,15 @@ std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledSh
 #endif
     auto module = std::make_shared<SpecializedModule>();
     std::map<std::uint32_t, std::uint32_t> bindingNumbers;
-    std::set<std::uint32_t> blendedTargets;
+    std::set<std::uint32_t> otherSets;
     for (std::size_t cursor = 5; cursor < materialized.size();) {
         const auto count = materialized[cursor] >> 16u;
         const auto op = static_cast<spv::Op>(materialized[cursor] & 0xffffu);
-        if (op == spv::OpDecorate && count == 4u && materialized[cursor + 2u] == spv::DecorationDescriptorSet && materialized[cursor + 3u] == RuntimeAbi::BlendedTargetDescriptorSet) blendedTargets.insert(materialized[cursor + 1u]);
+        if (op == spv::OpDecorate && count == 4u && materialized[cursor + 2u] == spv::DecorationDescriptorSet && materialized[cursor + 3u] == RuntimeAbi::BlendedTargetDescriptorSet) otherSets.insert(materialized[cursor + 1u]);
+        if (op == spv::OpDecorate && count == 4u && materialized[cursor + 2u] == spv::DecorationDescriptorSet && materialized[cursor + 3u] == BindlessImageAbi::HeapDescriptorSet) otherSets.insert(materialized[cursor + 1u]);
         if (op == spv::OpDecorate && count == 4u && materialized[cursor + 2u] == spv::DecorationBinding) bindingNumbers.emplace(materialized[cursor + 1u], materialized[cursor + 3u]);
         if (op == spv::OpVariable && count >= 4u) {
-            if (const auto found = bindingNumbers.find(materialized[cursor + 2u]); found != bindingNumbers.end() && !blendedTargets.contains(found->first)) module->bindings.push_back(found->second);
+            if (const auto found = bindingNumbers.find(materialized[cursor + 2u]); found != bindingNumbers.end() && !otherSets.contains(found->first)) module->bindings.push_back(found->second);
             module->pushData |= materialized[cursor + 3u] == spv::StorageClassPushConstant;
         }
         cursor += count;
@@ -1066,6 +1074,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         .stencilReferences = artifact.stencilReferences,
         .stencilReplaySafe = artifact.stencilReplaySafe,
         .stencilReferenceDword = artifact.stencilReferenceDword,
+        .bindlessHeap = artifact.bindlessHeap,
         .variantId = artifact.variantId
     };
     const auto plan = preparedBindingPlan(variant, snapshot, request.context.pixel ? std::span<const std::uint8_t>(request.context.pixel->targetExportMapping) : std::span<const std::uint8_t>{}, request.target.registrationModules);
@@ -1163,7 +1172,14 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
             }
             const auto module = artifact.registrationModule && plan->bindings.specialization.empty() ? registrationModule(artifact.variantId, moduleKey, [&] { return specializeModule(variant.artifact, variant.bindings.layout, vertexClasses, constants, request.target); }) : specializeModule(variant.artifact, variant.bindings.layout, vertexClasses, constants, request.target);
             if (variant.bindings.layout.UsesPushData() && !module->pushData) throw std::runtime_error("specialization removed the prepared push constant interface");
-            auto selected = DescriptorBindingBuilder{}.Select(plan->bindings, module->bindings);
+            auto moduleBindings = module->bindings;
+            if (artifact.bindlessHeap) {
+                for (const auto& binding : plan->bindings.bindings) {
+                    const auto role = binding.descriptor.role;
+                    if (role == DescriptorRole::ImageTable || role == DescriptorRole::SamplerTable || role == DescriptorRole::ImageTableMap || role == DescriptorRole::GuestSamplers) moduleBindings.push_back(binding.descriptor.binding);
+                }
+            }
+            auto selected = DescriptorBindingBuilder{}.Select(plan->bindings, moduleBindings);
             entry->bindings = std::move(selected);
             entry->module = module;
         };
@@ -1234,6 +1250,13 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         result.imageTableShader = snapshot.tables.shader;
         result.imageTableFaults = tables.faults;
     }
+    if (artifact.bindlessHeap) {
+        std::span<const std::uint32_t> directSamplers;
+        for (const auto& binding : bindingPlan->bindings) {
+            if (binding.descriptor.role == DescriptorRole::GuestSamplers) directSamplers = binding.resources;
+        }
+        result.bindlessPrimer = ResourceMaterializer::BindlessPrimer(variant.info.info, variant.info.stage, snapshot, tables, directSamplers);
+    }
     return result;
 }
 
@@ -1291,6 +1314,7 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
         CompiledVariant loaded;
         if (ShaderDiskCache::Load(diskKey, loaded)) {
             loaded.layout = request.layout;
+            if (loaded.artifact.bindlessHeap) ResourceMaterializer::RegisterBindlessInterfaces(loaded.info.info, loaded.info.stage);
             loaded.artifact.variantId = nextVariantId();
             attachSubstitutes(loaded);
             variant = std::make_shared<const CompiledVariant>(std::move(loaded));

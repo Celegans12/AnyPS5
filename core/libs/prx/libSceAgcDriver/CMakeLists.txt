@@ -244,6 +244,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/DeviceImageKeys.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/DescriptorHeap.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/BindlessTable.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/BindlessPrimer.cpp
         ${agcTextureDetileShaderHeader}
         ${agcCmaskClearShaderHeader}
         ${agcMeshArgumentsShaderHeader}
@@ -1593,6 +1594,15 @@ if(BUILD_TESTING)
     set_tests_properties(agc_driver_descriptor_waterfall_guard PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_UNNORM_WRAP_GUARD=1")
     if(WIN32)
         set_tests_properties(agc_driver_descriptor_waterfall agc_driver_descriptor_waterfall_guard PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    add_test(NAME agc_driver_image_table_heap COMMAND agc_driver_image_table_tests)
+    add_test(NAME agc_driver_descriptor_waterfall_heap COMMAND agc_driver_image_table_tests --descriptor-waterfall)
+    add_test(NAME agc_driver_pipeline_only_heap COMMAND agc_driver_image_table_tests --pipeline-only)
+    add_test(NAME agc_driver_bindless_miss COMMAND agc_driver_image_table_tests --bindless-miss)
+    set_tests_properties(agc_driver_image_table_heap agc_driver_descriptor_waterfall_heap agc_driver_pipeline_only_heap PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_BINDLESS_IMAGES=1" WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" SKIP_RETURN_CODE 77 TIMEOUT 120)
+    set_tests_properties(agc_driver_bindless_miss PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_BINDLESS_IMAGES=1;APS5_BINDLESS_NO_PRIMER=1" WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" SKIP_RETURN_CODE 77 TIMEOUT 120)
+    if(WIN32)
+        set_tests_properties(agc_driver_image_table_heap agc_driver_descriptor_waterfall_heap agc_driver_pipeline_only_heap agc_driver_bindless_miss PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test(NAME agc_shader_bindless COMMAND agc_shader_memory_tests --bindless)
     set_tests_properties(agc_shader_bindless PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")

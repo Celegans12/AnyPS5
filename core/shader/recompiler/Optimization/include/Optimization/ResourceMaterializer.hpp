@@ -4,9 +4,12 @@
 #include "IntermediateRepresentation/IrProgram.hpp"
 #include "Optimization/SrtWalker.hpp"
 #include "ImageTableAbi.hpp"
+#include "BindlessImageAbi.hpp"
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -59,6 +62,12 @@ struct ViewLevelsPastChain {
     bool base = false;
 };
 
+struct BindlessInterface {
+    std::uint64_t id = 0;
+    ImageResource image;
+    std::vector<ImageResource> modes;
+};
+
 class ResourceMaterializer {
 public:
     static ViewLevelsPastChain LevelsPastChain(const DescriptorValue& descriptor);
@@ -75,6 +84,12 @@ public:
     static void PrepareImageModes(ShaderInfo& info);
     static const char* UnnormalizedSampleMismatch(const ImageResource& image);
     static ResolvedImageTables ResolveImageTables(const ShaderInfo& info, const ResourceSnapshot& snapshot, std::uint64_t memoKey = 0);
+    static bool BindlessImage(const ShaderInfo& info, IrShaderStage stage, std::uint32_t resource);
+    static bool UsesBindlessImages(const ShaderInfo& info, IrShaderStage stage);
+    static std::uint64_t BindlessInterfaceId(const ImageResource& image, std::span<const ImageResource> modes);
+    static void RegisterBindlessInterfaces(const ShaderInfo& info, IrShaderStage stage);
+    static std::shared_ptr<const BindlessInterface> FindBindlessInterface(std::uint64_t id);
+    static std::vector<BindlessImageAbi::PrimerEntry> BindlessPrimer(const ShaderInfo& info, IrShaderStage stage, const ResourceSnapshot& snapshot, const ResolvedImageTables& tables, std::span<const std::uint32_t> directSamplers);
     [[nodiscard]] IrResourcePlan ExtractPlan(const IrProgram& program) const;
     static void CompactPlan(IrResourcePlan& plan);
     void Materialize(const IrResourcePlan& program, const SrtRuntime& runtime, ResourceSnapshot& snapshot, bool allowDirectImageRefusal = false) const;

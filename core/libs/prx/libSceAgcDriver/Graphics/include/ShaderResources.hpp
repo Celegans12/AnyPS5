@@ -26,6 +26,7 @@ namespace AgcDriver { class VulkanDevice; }
 namespace AgcDriver::Graphics {
 
 class Recorder;
+class BindlessPrimer;
 
 void FlushCachedTextures(VkDevice device);
 void ClearCachedTextures(VkDevice device);
@@ -207,6 +208,7 @@ public:
     bool SplitSets() const { return splitSets; }
     PipelineSetLayouts SetLayouts() const { return {_layout, fragment.layout, splitSets, layoutKey, fragmentLayoutKey}; }
     void Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const;
+    void PrimeBindless(BindlessPrimer& primer) const;
     struct DrawBindings {
         DrawBindings() = default;
         DrawBindings(const DrawBindings&) = delete;

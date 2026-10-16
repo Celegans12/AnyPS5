@@ -99,7 +99,7 @@ std::uint32_t byteExtent(const MemoryInfo& memory) {
 
 class Tracker {
 public:
-    explicit Tracker(IrProgram& program) : m_program(program), m_info(program.Resources().info), m_builder(program) {
+    Tracker(IrProgram& program, bool bindlessHandles) : m_program(program), m_info(program.Resources().info), m_builder(program), m_bindlessHandles(bindlessHandles) {
         m_info.buffers.clear();
         m_info.images.clear();
         m_info.samplers.clear();
@@ -153,10 +153,12 @@ public:
             }
             const auto& column = *m_sources[plan.source].tableColumn;
             KeepSourceAlive(*plan.handle, m_sources[column.heapSource], referenced);
+            if (m_bindlessHandles) KeepBindlessWords(*plan.handle, plan.heap);
             if (plan.keyDomain.has_value()) {
                 KeepSourceAlive(*plan.handle, m_sources[plan.keyDomain->source], referenced);
             }
         }
+        for (const auto& [handle, words] : m_directSamplerWords) KeepBindlessWords(*handle, words);
         for (const auto index : m_tablePlanningMemory) {
             m_program.Resources().memoryInfo[index].planningOnly = true;
         }
@@ -189,6 +191,7 @@ private:
         std::vector<std::uint32_t> memory;
         std::vector<const IrValue*> reads;
         std::optional<KeyDomain> keyDomain;
+        std::vector<IrValue*> heap;
     };
 
     void MakeSource(const IrValue& handle, std::uint32_t width, bool sampler, bool sampleAdjust, DescriptorSource& descriptor) {
@@ -641,6 +644,8 @@ private:
         if (!MakeRuntimeSource(*heapHandle, address ? IrOpcode::GetAddressResource : IrOpcode::GetBufferResource, address ? 2u : 4u, heapIndex, heapSource)) {
             return false;
         }
+        plan.heap.clear();
+        for (std::uint32_t dword = 0; dword < heapHandle->ArgumentCount(); dword++) plan.heap.push_back(heapHandle->Argument(dword)->Resolve());
         TableColumn column;
         column.heapSource = heapIndex;
         column.stride = stride;
@@ -703,6 +708,8 @@ private:
         if (!MakeRuntimeSource(*bufferHandle, IrOpcode::GetBufferResource, 4u, heapIndex, heapSource)) {
             return false;
         }
+        plan.heap.clear();
+        for (std::uint32_t dword = 0; dword < bufferHandle->ArgumentCount(); dword++) plan.heap.push_back(bufferHandle->Argument(dword)->Resolve());
         TableColumn column;
         column.heapSource = heapIndex;
         column.stride = stride;
@@ -1513,6 +1520,15 @@ private:
         m_memoryUsers.clear();
     }
 
+    void KeepBindlessWords(IrValue& handle, const std::vector<IrValue*>& words) {
+        std::vector<IrValue*> references;
+        for (auto* word : words) {
+            const std::array<IrValue*, 1> arguments{word};
+            references.push_back(EmitBefore(handle, IrOpcode::ReferenceU32, IrType::Void, arguments));
+        }
+        m_program.Metadata().bindlessHandleWords[&handle] = std::move(references);
+    }
+
     void KeepSourceAlive(IrValue& position, const DescriptorSource& source, std::vector<const IrValue*>& referenced) {
         for (std::uint32_t dword = 0; dword < source.dwordCount; dword++) {
             IrValue* value = source.dwords[dword]->Resolve();
@@ -1881,6 +1897,11 @@ private:
             } else {
                 const bool sampleAdjust = (memory.imageSampleFlags & RdnaImageSampleFlagAdjust) != 0;
                 GetHandle(inst.Argument(1), IrOpcode::GetSamplerResource, 4, samplerHandle, samplerSource, true, sampleAdjust);
+                if (m_bindlessHandles && !m_directSamplerWords.contains(samplerHandle)) {
+                    DescriptorSource local;
+                    MakeSource(*samplerHandle, 4u, true, sampleAdjust, local);
+                    m_directSamplerWords.emplace(samplerHandle, std::vector<IrValue*>(local.dwords.begin(), local.dwords.begin() + 4));
+                }
             }
             sampler = AddSampler(samplerSource, flags.pc);
             if (sampler == std::numeric_limits<std::uint32_t>::max()) {
@@ -1922,6 +1943,8 @@ private:
     IrProgram& m_program;
     ShaderInfo m_info;
     IrBuilder m_builder;
+    bool m_bindlessHandles = false;
+    std::map<IrValue*, std::vector<IrValue*>> m_directSamplerWords;
     std::vector<DescriptorSource> m_sources;
     std::vector<std::vector<std::uint32_t>> m_blockSources;
     std::vector<std::vector<std::uint32_t>> m_blockImages;
@@ -1945,8 +1968,8 @@ private:
 
 }
 
-void ResourceTracker::Track(IrProgram& program) const {
-    Tracker(program).Run();
+void ResourceTracker::Track(IrProgram& program, bool bindlessHandles) const {
+    Tracker(program, bindlessHandles).Run();
 }
 
 }

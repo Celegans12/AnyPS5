@@ -22,6 +22,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BindlessTable.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BindlessPrimer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DisplayFormat.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HostHdr.hpp"
@@ -300,6 +301,7 @@ struct VulkanDevice::State {
     bool updateUnusedWhilePending = false;
     bool bindlessImages = false;
     std::unique_ptr<Graphics::BindlessTable> bindlessTable;
+    std::unique_ptr<Graphics::BindlessPrimer> bindlessPrimer;
     VkPhysicalDeviceDescriptorIndexingPropertiesEXT descriptorIndexingProperties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_PROPERTIES_EXT};
     bool imageInt64Atomics = false;
     bool bufferInt64Atomics = false;
@@ -716,6 +718,7 @@ struct VulkanDevice::State {
             }
             Graphics::DestroyShadows(device);
             recorder.reset();
+            bindlessPrimer.reset();
             bindlessTable.reset();
             // Cached graphics pipelines (with their framebuffers, modules, render passes and layouts)
             // belong to this device and must be destroyed while it lives.
@@ -1890,6 +1893,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         const auto& limits = state->descriptorIndexingProperties;
         std::fprintf(stderr, "[bindless] heap: %u sampled images, %u storage images, %u samplers (update-after-bind limits per stage: %u sampled, %u storage, %u samplers, %u resources; per set: %u sampled, %u storage, %u samplers; maxSamplerAllocationCount %u)\n", capacities.sampledImages, capacities.storageImages, capacities.samplers, limits.maxPerStageDescriptorUpdateAfterBindSampledImages, limits.maxPerStageDescriptorUpdateAfterBindStorageImages, limits.maxPerStageDescriptorUpdateAfterBindSamplers, limits.maxPerStageUpdateAfterBindResources, limits.maxDescriptorSetUpdateAfterBindSampledImages, limits.maxDescriptorSetUpdateAfterBindStorageImages, limits.maxDescriptorSetUpdateAfterBindSamplers, state->properties.limits.maxSamplerAllocationCount);
         state->bindlessTable = std::make_unique<Graphics::BindlessTable>(context, capacities);
+        state->bindlessPrimer = std::make_unique<Graphics::BindlessPrimer>(*state->bindlessTable);
     }
     state->context = buildContext();
     state->contextReady = true;
@@ -3420,6 +3424,7 @@ ShaderRecompiler::SpirvTarget VulkanDevice::buildTarget() const {
     target.narrowSubgroupClock = state->narrowSubgroupClock;
     target.float64DenormPreserve = state->float64DenormPreserve;
     target.float16DenormPreserve = state->float16DenormPreserve;
+    target.bindlessImages = state->bindlessImages;
     target.fixedPushSlots = state->graphicsPipelineLibrary;
     target.registrationModules = state->graphicsPipelineLibrary;
     target.srgbDecodeFormats = state->srgbDecodeFormats;
@@ -3468,6 +3473,15 @@ bool VulkanDevice::GraphicsPipelineLibraries() const {
 
 bool VulkanDevice::BindlessImagesEnabled() const {
     return state->bindlessTable != nullptr;
+}
+
+std::uint32_t VulkanDevice::BindlessEntries() const {
+    return state->bindlessTable != nullptr ? state->bindlessTable->Totals().entries : 0u;
+}
+
+std::vector<Graphics::DeviceImageMiss> VulkanDevice::TakeBindlessMisses() {
+    require(state->bindlessTable != nullptr, "bindless images are not enabled on this device");
+    return state->bindlessTable->TakeMisses();
 }
 
 Graphics::Context VulkanDevice::graphicsContext() const {
@@ -3554,6 +3568,7 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.bufferInt64Atomics = state->bufferInt64Atomics;
     context.placeholderImages = state->placeholderImages.get();
     context.bindlessTable = state->bindlessTable.get();
+    context.bindlessPrimer = state->bindlessPrimer.get();
     context.viewportIndexLayer = state->viewportIndexLayer;
     context.demoteToHelperInvocation = state->demoteToHelperInvocation;
     context.earlyFragmentSampleMaskTestBeforeSampleCounting = state->earlyFragmentSampleMaskTestBeforeSampleCounting;
@@ -4355,6 +4370,12 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     if (recorder.HasQueuedStores() && (resources.HoldsLease() || recorder.AnyQueuedStore(touches))) recorder.FlushStores();
     VkAccessFlags covered = 0;
     const auto commands = recorder.Commands(&covered);
+    if (record.shader->program->bindlessHeap) {
+        require(context.bindlessTable != nullptr && context.bindlessPrimer != nullptr, "a bindless image dispatch needs the device's descriptor heap");
+        resources.PrimeBindless(*context.bindlessPrimer);
+        context.bindlessTable->Publish(recorder);
+        covered = 0;
+    }
     recordStep(PhaseRecordCommands);
     recorder.Keep(record.objects);
     if (record.resources != nullptr) record.resources->KeepStorageImageBytes(recorder);
@@ -4420,6 +4441,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     }
     context.Resolved(&Graphics::DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->pipeline);
     resources.Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout);
+    if (record.shader->program->bindlessHeap) context.bindlessTable->Heap().Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout, VK_SHADER_STAGE_COMPUTE_BIT);
     if (const auto dwords = record.shader->program->workgroupMemoryDwords; dwords != 0) {
         auto memory = state->WorkgroupMemoryFor(context, record.x, record.y, record.z, dwords);
         context.Resolved(&Graphics::DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout, ShaderRecompiler::WorkgroupMemoryDescriptorSet, 1, &memory->set, 0, nullptr);
@@ -4597,6 +4619,17 @@ double VulkanDevice::WarmComputePipeline(const ShaderRecompiler::RecompileResult
     return elapsed;
 }
 
+std::vector<VkDescriptorSetLayout> VulkanDevice::computeSetLayouts(const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, VkDescriptorSetLayout setLayout) const {
+    std::vector<VkDescriptorSetLayout> layouts{setLayout};
+    if (shader.workgroupMemoryDwords != 0) layouts.push_back(state->workgroupMemoryLayout);
+    if (!shader.bindlessHeap) return layouts;
+    require(context.bindlessTable != nullptr, "a bindless image program needs the device's descriptor heap (APS5_BINDLESS_IMAGES=1 on a device that supports it)");
+    auto& heap = context.bindlessTable->Heap();
+    while (layouts.size() < ShaderRecompiler::BindlessImageAbi::HeapDescriptorSet) layouts.push_back(heap.EmptyLayout());
+    layouts.push_back(heap.Layout(VK_SHADER_STAGE_COMPUTE_BIT));
+    return layouts;
+}
+
 std::shared_ptr<ComputePipelineObjects> VulkanDevice::createComputePipeline(const ShaderRecompiler::RecompileResult& shader, const Graphics::Context& context, VkDescriptorSetLayout setLayout, bool pushes, std::uint64_t programAddress, PerformanceTimer* timing) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     auto objects = std::make_shared<ComputePipelineObjects>();
@@ -4609,10 +4642,10 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::createComputePipeline(cons
     moduleInfo.pCode = shader.spirv.data();
     check(state->DeviceFunction<PFN_vkCreateShaderModule>("vkCreateShaderModule")(state->device, &moduleInfo, nullptr, &objects->module), "vkCreateShaderModule");
     if (timing != nullptr) timing->Mark("validate_shader_module");
-    const std::array<VkDescriptorSetLayout, 2> setLayouts{setLayout, shader.workgroupMemoryDwords != 0 ? state->workgroupMemoryLayout : VK_NULL_HANDLE};
+    const auto setLayouts = computeSetLayouts(context, shader, setLayout);
     const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::ComputePushConstantBytes};
     VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-    layoutInfo.setLayoutCount = shader.workgroupMemoryDwords != 0 ? ShaderRecompiler::WorkgroupMemoryDescriptorSet + 1 : 1;
+    layoutInfo.setLayoutCount = static_cast<std::uint32_t>(setLayouts.size());
     layoutInfo.pSetLayouts = setLayouts.data();
     layoutInfo.pushConstantRangeCount = pushes ? 1 : 0;
     layoutInfo.pPushConstantRanges = pushes ? &push : nullptr;
@@ -4666,10 +4699,10 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::computePipeline(const Grap
         moduleInfo.codeSize = shader.spirv.size() * sizeof(std::uint32_t);
         moduleInfo.pCode = shader.spirv.data();
         check(state->DeviceFunction<PFN_vkCreateShaderModule>("vkCreateShaderModule")(state->device, &moduleInfo, nullptr, &objects->module), "vkCreateShaderModule");
-        const std::array<VkDescriptorSetLayout, 2> setLayouts{setLayout, shader.workgroupMemoryDwords != 0 ? state->workgroupMemoryLayout : VK_NULL_HANDLE};
+        const auto setLayouts = computeSetLayouts(context, shader, setLayout);
         const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::ComputePushConstantBytes};
         VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-        layoutInfo.setLayoutCount = shader.workgroupMemoryDwords != 0 ? ShaderRecompiler::WorkgroupMemoryDescriptorSet + 1 : 1;
+        layoutInfo.setLayoutCount = static_cast<std::uint32_t>(setLayouts.size());
         layoutInfo.pSetLayouts = setLayouts.data();
         layoutInfo.pushConstantRangeCount = pushStages != 0 ? 1 : 0;
         layoutInfo.pPushConstantRanges = pushStages != 0 ? &push : nullptr;

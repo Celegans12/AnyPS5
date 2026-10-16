@@ -51,6 +51,7 @@ std::optional<std::string> BindlessUnsupported(const BindlessFeatureSupport& sup
 BindlessTable::BindlessTable(const Context& context, DescriptorHeap::Capacities capacities, std::uint32_t buckets, std::uint32_t maxBuckets) : context(context), heap(context, capacities), keys(buckets, maxBuckets), rings(std::make_shared<Rings>()) {
     Require(context.bufferDeviceAddress, "the bindless image table needs buffer device addresses");
     header = std::make_shared<Buffer>(context, Abi::HeaderWords * sizeof(std::uint32_t), DeviceUsage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    heap.SetHeader(header->Handle(), Abi::HeaderWords * sizeof(std::uint32_t));
 }
 
 BindlessTable::~BindlessTable() = default;

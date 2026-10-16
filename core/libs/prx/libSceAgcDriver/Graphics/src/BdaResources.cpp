@@ -279,30 +279,31 @@ void BdaResources::CheckFault(std::uint64_t shaderAddress) const {
         message << " stage " << report.stage << " pc 0x" << std::hex << report.instruction << std::dec << " resource " << resource << ": dimension";
         throw std::runtime_error(message.str());
     }
-    if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::ImageTable) {
-        const auto table = std::find_if(imageTables.begin(), imageTables.end(), [&](const ImageTableFaults& candidate) { return candidate.stage == report.stage; });
-        const auto* tables = table != imageTables.end() ? &*table : imageTables.size() == 1 ? &imageTables.front() : nullptr;
+    const auto stageTable = std::find_if(imageTables.begin(), imageTables.end(), [&](const ImageTableFaults& candidate) { return candidate.stage == report.stage; });
+    const auto* stageTables = stageTable != imageTables.end() ? &*stageTable : imageTables.size() == 1 ? &imageTables.front() : nullptr;
+    const bool refusedEntry = report.reason == ShaderRecompiler::BdaAbi::FaultReason::BindlessRefused && stageTables != nullptr && report.bytes < stageTables->poison.size();
+    if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::ImageTable || refusedEntry) {
         std::ostringstream message;
-        message << "image table: shader 0x" << std::hex << (tables != nullptr ? tables->shader : 0u) << std::dec << " stage " << report.stage << " pc 0x" << std::hex << report.instruction;
+        message << "image table: shader 0x" << std::hex << (stageTables != nullptr ? stageTables->shader : 0u) << std::dec << " stage " << report.stage << " pc 0x" << std::hex << report.instruction;
         if (report.address == ShaderRecompiler::ImageTableAbi::UnknownDescriptorAddress) message << " selected a descriptor whose address was not captured";
         else message << " selected the descriptor at 0x" << report.address;
         message << std::dec;
-        if (tables != nullptr && report.bytes < tables->poison.size()) {
-            const auto& poison = tables->poison[report.bytes];
+        if (stageTables != nullptr && report.bytes < stageTables->poison.size()) {
+            const auto& poison = stageTables->poison[report.bytes];
             if (poison.dwordCount != 0) {
                 message << " (words";
                 for (std::uint32_t index = 0; index < poison.dwordCount && index < poison.words.size(); ++index) message << ' ' << std::hex << std::setw(8) << std::setfill('0') << poison.words[index];
                 message << std::dec << ")";
             }
             message << ": " << ShaderRecompiler::ImageTableAbi::PoisonReasonName(static_cast<ShaderRecompiler::ImageTableAbi::PoisonReason>(poison.reason));
-            if (report.bytes < tables->messages.size() && !tables->messages[report.bytes].empty()) message << ": " << tables->messages[report.bytes];
+            if (report.bytes < stageTables->messages.size() && !stageTables->messages[report.bytes].empty()) message << ": " << stageTables->messages[report.bytes];
         } else {
             message << ": poison entry " << report.bytes;
         }
         throw std::runtime_error(message.str());
     }
     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::BindlessMiss || report.reason == ShaderRecompiler::BdaAbi::FaultReason::BindlessRefused) {
-        Require(report.address == 0u, "invalid bindless image fault payload");
+        Require(report.reason == ShaderRecompiler::BdaAbi::FaultReason::BindlessRefused || report.address == 0u, "invalid bindless image fault payload");
         std::ostringstream message;
         message << "bindless images: shader ";
         if (shaderAddress != 0u) message << "0x" << std::hex << shaderAddress << std::dec;
@@ -310,6 +311,7 @@ void BdaResources::CheckFault(std::uint64_t shaderAddress) const {
         message << " stage " << report.stage << " pc 0x" << std::hex << report.instruction << std::dec;
         if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::BindlessMiss) message << " missed in the device image table while its miss ring was full (" << report.bytes << " records), so the descriptor was not recorded";
         else message << " selected the refused device image table entry " << report.bytes;
+        if (report.address != 0u) message << " (descriptor at 0x" << std::hex << report.address << std::dec << ")";
         throw std::runtime_error(message.str());
     }
     std::ostringstream message;

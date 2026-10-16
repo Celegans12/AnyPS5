@@ -37,8 +37,9 @@ DescriptorHeap::DescriptorHeap(const Context& context, Capacities capacities) : 
         arrays[index].type = types[index].second;
     }
     try {
-        std::array<VkDescriptorPoolSize, static_cast<std::size_t>(Array::Count)> sizes{};
+        std::array<VkDescriptorPoolSize, static_cast<std::size_t>(Array::Count) + 1u> sizes{};
         for (std::size_t index = 0; index < arrays.size(); ++index) sizes[index] = {arrays[index].type, arrays[index].capacity * MaxViews};
+        sizes.back() = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, MaxViews};
         VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
         poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT;
         poolInfo.maxSets = MaxViews;
@@ -70,6 +71,8 @@ DescriptorHeap::~DescriptorHeap() {
 void DescriptorHeap::release() noexcept {
     if (pool != VK_NULL_HANDLE) context.Function<PFN_vkDestroyDescriptorPool>("vkDestroyDescriptorPool")(context.device, pool, nullptr);
     for (const auto& item : views) context.Function<PFN_vkDestroyDescriptorSetLayout>("vkDestroyDescriptorSetLayout")(context.device, item.layout, nullptr);
+    if (emptyLayout != VK_NULL_HANDLE) context.Function<PFN_vkDestroyDescriptorSetLayout>("vkDestroyDescriptorSetLayout")(context.device, emptyLayout, nullptr);
+    emptyLayout = VK_NULL_HANDLE;
     if (nullSampler != VK_NULL_HANDLE) context.Function<PFN_vkDestroySampler>("vkDestroySampler")(context.device, nullSampler, nullptr);
     pool = VK_NULL_HANDLE;
     views.clear();
@@ -88,18 +91,31 @@ void DescriptorHeap::write(const View& target, Array array, std::uint32_t first,
     context.Function<PFN_vkUpdateDescriptorSets>("vkUpdateDescriptorSets")(context.device, 1, &update, 0, nullptr);
 }
 
+void DescriptorHeap::writeHeader(const View& target) {
+    if (header.buffer == VK_NULL_HANDLE) return;
+    VkWriteDescriptorSet update{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    update.dstSet = target.set;
+    update.dstBinding = Abi::HeaderBinding;
+    update.descriptorCount = 1;
+    update.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    update.pBufferInfo = &header;
+    context.Function<PFN_vkUpdateDescriptorSets>("vkUpdateDescriptorSets")(context.device, 1, &update, 0, nullptr);
+}
+
 const DescriptorHeap::View& DescriptorHeap::view(VkShaderStageFlags stages) {
     for (const auto& item : views) {
         if (item.stages == stages) return item;
     }
     Require(views.size() < MaxViews, "the descriptor heap has a view for every one of " + std::to_string(MaxViews) + " stage combinations");
     View created{stages, VK_NULL_HANDLE, VK_NULL_HANDLE};
-    std::array<VkDescriptorSetLayoutBinding, static_cast<std::size_t>(Array::Count)> bindings{};
-    std::array<VkDescriptorBindingFlags, static_cast<std::size_t>(Array::Count)> flags{};
+    std::array<VkDescriptorSetLayoutBinding, static_cast<std::size_t>(Array::Count) + 1u> bindings{};
+    std::array<VkDescriptorBindingFlags, static_cast<std::size_t>(Array::Count) + 1u> flags{};
     for (std::size_t index = 0; index < arrays.size(); ++index) {
         bindings[index] = {static_cast<std::uint32_t>(index), arrays[index].type, arrays[index].capacity, stages, nullptr};
         flags[index] = VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT | VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
     }
+    bindings.back() = {Abi::HeaderBinding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, stages, nullptr};
+    flags.back() = 0;
     VkDescriptorSetLayoutBindingFlagsCreateInfo bindingFlags{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
     bindingFlags.bindingCount = static_cast<std::uint32_t>(flags.size());
     bindingFlags.pBindingFlags = flags.data();
@@ -118,7 +134,23 @@ const DescriptorHeap::View& DescriptorHeap::view(VkShaderStageFlags stages) {
     }
     const auto& added = views.emplace_back(created);
     for (std::size_t index = 0; index < arrays.size(); ++index) write(added, static_cast<Array>(index), 0, static_cast<std::uint32_t>(arrays[index].entries.size()));
+    writeHeader(added);
     return added;
+}
+
+VkDescriptorSetLayout DescriptorHeap::EmptyLayout() {
+    std::lock_guard lock(mutex);
+    if (emptyLayout != VK_NULL_HANDLE) return emptyLayout;
+    VkDescriptorSetLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    Check(context.Function<PFN_vkCreateDescriptorSetLayout>("vkCreateDescriptorSetLayout")(context.device, &layoutInfo, nullptr, &emptyLayout), "vkCreateDescriptorSetLayout descriptor heap empty set");
+    return emptyLayout;
+}
+
+void DescriptorHeap::SetHeader(VkBuffer buffer, VkDeviceSize bytes) {
+    std::lock_guard lock(mutex);
+    Require(buffer != VK_NULL_HANDLE && bytes != 0u, "the descriptor heap header needs a buffer");
+    header = {buffer, 0, bytes};
+    for (const auto& item : views) writeHeader(item);
 }
 
 VkDescriptorSetLayout DescriptorHeap::Layout(VkShaderStageFlags stages) {

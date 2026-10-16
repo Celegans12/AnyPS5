@@ -62,6 +62,23 @@ constexpr Table::Key MakeKey(std::span<const std::uint32_t, Table::DescriptorWor
     return MakeKey(descriptor, interfaceId, samplerClass, none);
 }
 
+inline constexpr std::uint32_t HeaderBinding = 3u;
+inline constexpr std::uint32_t NoSamplerClass = 0u;
+inline constexpr std::uint32_t DirectSamplerClass = 1u << 30u;
+inline constexpr std::uint32_t TableSamplerClass = Table::RuntimeSampler;
+inline constexpr std::uint32_t NoSamplerElement = 0xffffffffu;
+
+struct PrimerEntry {
+    Table::Key key{};
+    std::uint32_t element = 0;
+    std::uint32_t mode = 0;
+    std::uint32_t fault = 0;
+    std::uint32_t samplerElement = NoSamplerElement;
+    bool directSampler = false;
+
+    bool operator==(const PrimerEntry& other) const = default;
+};
+
 }
 
 #endif

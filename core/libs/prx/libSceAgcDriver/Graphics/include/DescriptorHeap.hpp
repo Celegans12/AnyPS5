@@ -27,6 +27,8 @@ public:
 
     static Capacities DeviceCapacities(const Context& context);
     VkDescriptorSetLayout Layout(VkShaderStageFlags stages);
+    VkDescriptorSetLayout EmptyLayout();
+    void SetHeader(VkBuffer buffer, VkDeviceSize bytes);
     VkDescriptorSet Set(VkShaderStageFlags stages);
     std::uint32_t Capacity(Array array) const { return arrays[static_cast<std::size_t>(array)].capacity; }
     std::uint32_t AllocateSampler(VkSampler sampler);
@@ -60,11 +62,14 @@ private:
     const View& view(VkShaderStageFlags stages);
     std::uint32_t allocate(Array array, const VkDescriptorImageInfo& entry);
     void write(const View& target, Array array, std::uint32_t first, std::uint32_t count);
+    void writeHeader(const View& target);
     void release() noexcept;
 
     Context context;
     VkDescriptorPool pool = VK_NULL_HANDLE;
     VkSampler nullSampler = VK_NULL_HANDLE;
+    VkDescriptorSetLayout emptyLayout = VK_NULL_HANDLE;
+    VkDescriptorBufferInfo header{VK_NULL_HANDLE, 0, 0};
     mutable std::mutex mutex;
     std::deque<View> views;
     std::array<Slots, static_cast<std::size_t>(Array::Count)> arrays;

@@ -10,6 +10,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ComputePipelineCapture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DeviceImageKeys.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include <chrono>
 #include <functional>
@@ -49,6 +50,8 @@ public:
     const std::uint32_t* WorkGroupCountLimit() const;
     std::uint32_t VendorId() const;
     bool BindlessImagesEnabled() const;
+    std::uint32_t BindlessEntries() const;
+    std::vector<Graphics::DeviceImageMiss> TakeBindlessMisses();
     ShaderRecompiler::SpirvTarget ComputeTarget(std::uint32_t waveSize) const;
     // Distinguishes this device from every earlier one in the process (a memo keyed by the device
     // cannot rely on the pointer, which a replacement may reuse).
@@ -322,6 +325,7 @@ private:
     Graphics::Context graphicsContext() const;
     ShaderRecompiler::SpirvTarget buildTarget() const;
     Graphics::Context buildContext() const;
+    std::vector<VkDescriptorSetLayout> computeSetLayouts(const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, VkDescriptorSetLayout setLayout) const;
     std::shared_ptr<ComputePipelineObjects> createComputePipeline(const ShaderRecompiler::RecompileResult& shader, const Graphics::Context& context, VkDescriptorSetLayout setLayout, bool pushes, std::uint64_t programAddress, PerformanceTimer* timing);
     // Body of Dispatch and DispatchIndirect: `arguments` 0 dispatches x, y, z groups.
     IndirectOutcome dispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t programAddress, std::shared_ptr<PreparedDispatch> prepared, std::shared_ptr<const Recipe>* recipe);

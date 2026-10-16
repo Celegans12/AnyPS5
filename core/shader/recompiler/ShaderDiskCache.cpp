@@ -505,6 +505,7 @@ void encodeArtifact(Writer& writer, const CompiledShaderArtifact& result) {
     writer.Values(std::span<const std::uint32_t>(result.stencilReferences));
     writer.Value(result.stencilReplaySafe);
     writer.Value(result.stencilReferenceDword);
+    writer.Value(result.bindlessHeap);
 }
 
 void decodeArtifact(Reader& reader, CompiledShaderArtifact& result) {
@@ -551,6 +552,7 @@ void decodeArtifact(Reader& reader, CompiledShaderArtifact& result) {
     reader.Values(result.stencilReferences);
     reader.Value(result.stencilReplaySafe);
     reader.Value(result.stencilReferenceDword);
+    reader.Value(result.bindlessHeap);
     result.variantId = 0;
 }
 
@@ -590,6 +592,14 @@ void encodeInvocation(Writer& writer, const ShaderInvocation& invocation) {
     writer.Value(invocation.imageTableFaults);
     writer.Value(invocation.hasDeferredDirectImage);
     writer.Value(invocation.hasGuardedUnnormalizedWrap);
+    writer.List(invocation.bindlessPrimer, [](Writer& out, const BindlessImageAbi::PrimerEntry& entry) {
+        for (const auto word : entry.key) out.Value(word);
+        out.Value(entry.element);
+        out.Value(entry.mode);
+        out.Value(entry.fault);
+        out.Value(entry.samplerElement);
+        out.Value(entry.directSampler);
+    });
 }
 
 void decodeInvocation(Reader& reader, ShaderInvocation& invocation) {
@@ -631,6 +641,14 @@ void decodeInvocation(Reader& reader, ShaderInvocation& invocation) {
     reader.Value(invocation.imageTableFaults);
     reader.Value(invocation.hasDeferredDirectImage);
     reader.Value(invocation.hasGuardedUnnormalizedWrap);
+    reader.List(invocation.bindlessPrimer, 77, [](Reader& in, BindlessImageAbi::PrimerEntry& entry) {
+        for (auto& word : entry.key) in.Value(word);
+        in.Value(entry.element);
+        in.Value(entry.mode);
+        in.Value(entry.fault);
+        in.Value(entry.samplerElement);
+        in.Value(entry.directSampler);
+    });
 }
 
 void encodeLayout(Writer& writer, const IrBindingLayout& layout) {

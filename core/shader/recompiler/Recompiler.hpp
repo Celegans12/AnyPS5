@@ -2,6 +2,7 @@
 #define CORE_SHADER_RECOMPILIER_INCLUDE_SHADER_RECOMPILIER_RECOMPILER_HPP
 
 #include "RuntimeAbi.hpp"
+#include "BindlessImageAbi.hpp"
 #include "PipelineSpecialization.hpp"
 #include <algorithm>
 #include <array>
@@ -276,6 +277,7 @@ struct SpirvTarget {
     std::uint32_t registrationWordLimit = 200000u;
     bool vertexSubgroups = true;
     bool float16DenormPreserve = false;
+    bool bindlessImages = false;
 };
 
 struct BindingLayout {
@@ -571,6 +573,7 @@ struct CompiledShaderArtifact {
     std::vector<std::uint32_t> stencilReferences;
     bool stencilReplaySafe = false;
     std::uint32_t stencilReferenceDword = 0xffffffffu;
+    bool bindlessHeap = false;
     std::uint64_t variantId = 0;
 };
 
@@ -588,6 +591,7 @@ struct ShaderInvocation {
     std::uint32_t imageTableFaults = 0;
     bool hasDeferredDirectImage = false;
     bool hasGuardedUnnormalizedWrap = false;
+    std::vector<BindlessImageAbi::PrimerEntry> bindlessPrimer;
 };
 
 struct RecompileResult : CompiledShaderArtifact, ShaderInvocation {
