@@ -543,7 +543,7 @@ void EmitBdaStore(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t
     });
 }
 
-void EmitBdaDwordWrites(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::uint32_t offset, std::uint32_t dwords, std::uint32_t value) {
+void EmitBdaDwordWrites(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::uint32_t offset, std::uint32_t dwords, std::uint32_t value, bool unchecked) {
     auto& state = ctx.state;
     if (dwords < 2u || dwords > 4u) ctx.Fail(inst, "unsupported BDA dword store count");
     if (state.bdaWritePointerFunction == 0 || state.bdaNoteWriteFunction == 0) ctx.Fail(inst, "BDA write functions are missing");
@@ -555,7 +555,7 @@ void EmitBdaDwordWrites(SpirvValueEmitContext& ctx, const IrValue& inst, std::ui
     for (std::uint32_t dword = 0; dword < dwords; ++dword) {
         values[dword] = state.module.AllocateId();
         state.module.AddFunction(spv::OpCompositeExtract, u32, values[dword], value, dword);
-        addresses[dword] = AddBdaImmediate(ctx, inst, address, static_cast<std::int32_t>(offset + dword * 4u));
+        addresses[dword] = unchecked && offset + dword * 4u != 0u ? Binary(state, spv::OpIAdd, u64, address, BdaConstant(state, offset + dword * 4u)) : AddBdaImmediate(ctx, inst, address, static_cast<std::int32_t>(offset + dword * 4u));
     }
     const auto storeDwords = [&] {
         for (std::uint32_t dword = 0; dword < dwords; ++dword) EmitBdaStore(ctx, inst, addresses[dword], values[dword], 32u);
