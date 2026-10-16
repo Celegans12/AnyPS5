@@ -44,6 +44,7 @@
 #include <unordered_set>
 #include <utility>
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureService.hpp"
 
 namespace AgcDriver::Graphics {
 namespace {
@@ -1711,6 +1712,12 @@ std::shared_ptr<Texture> CachedSampledTexture(const Context& context, std::span<
     return cachedTexture(context, words, resource, ViewComponents(resource));
 }
 
+std::shared_ptr<Texture> CachedTableTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, std::uint64_t guestBytes, bool depthCompare) {
+    CompletePendingCpuWrites(context, resource.baseAddress, static_cast<std::size_t>(guestBytes));
+    if (resource.dccAddress != 0) CompletePendingCpuWrites(context, resource.dccAddress, DccKeyBytes(guestBytes));
+    return cachedTexture(context, words, resource, ViewComponents(resource), guestBytes, depthCompare);
+}
+
 bool SampledTexturesShareEntry(std::span<const std::uint32_t> first, std::span<const std::uint32_t> second) {
     Require(first.size() == 8 && second.size() == 8, "sampled texture keys take eight descriptor words");
     const VkComponentMapping components{VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_G, VK_COMPONENT_SWIZZLE_B, VK_COMPONENT_SWIZZLE_A};
@@ -2707,7 +2714,9 @@ void ShaderResources::buildComplete() {
         nextImageRecord = 0;
         Require(textures.size() == plannedSampledImages && storageTextures.size() == plannedStorageImages, "image lookups disagree with the descriptor plan");
         resolveStorageImageTables();
+        const auto tablesStart = std::chrono::steady_clock::now();
         resolveImageTables();
+        if (!tableStages.empty()) AddBindlessOldPathNanoseconds(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - tablesStart).count()));
         std::vector<std::shared_ptr<StorageTexture>> depthWrites;
         for (std::size_t index = 0; index < storageTextures.size(); ++index) {
             if (storageWritten[index] && storageTextures[index] != nullptr && DepthSurfaceAt(storageTextures[index]->Descriptor().baseAddress)) depthWrites.push_back(storageTextures[index]);
