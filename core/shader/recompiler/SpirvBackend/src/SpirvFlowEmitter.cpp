@@ -748,6 +748,7 @@ void EmitStructuredInstruction(SpirvValueEmitContext& ctx, StructuredFunctionSta
 void EmitStructuredBlock(SpirvValueEmitContext& ctx, StructuredFunctionState& functionState, const IrBlock* block) {
     auto& state = ctx.state;
     state.currentBlock = block;
+    state.runtimeBufferValues.clear();
     EmitLabel(state, ctx.Label(block));
     bool emittedNonPhi = false;
     // Wave LDS ordering (see WaveLdsScope): a barrier separates an LDS write from the next LDS access
@@ -792,7 +793,9 @@ void EmitStructuredBlock(SpirvValueEmitContext& ctx, StructuredFunctionState& fu
             SpirvValueEmitContext& lane = half == 0 ? ctx : *ctx.otherHalf;
             state.laneHalf = half;
             if (half == 0 || (inst->Opcode() != IrOpcode::Barrier && inst->Opcode() != IrOpcode::MeshAllocate)) {
+                state.runtimeBufferLabel = state.currentLabel;
                 EmitStructuredInstruction(lane, functionState, *inst);
+                state.runtimeBufferLabel = 0;
             }
         }
         state.laneHalf = 0;
