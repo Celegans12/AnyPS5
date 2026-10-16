@@ -1763,7 +1763,7 @@ void Driver::AppendMemoryStats(std::string& line) {
         if (variant.shader != nullptr && snapshots.insert(variant.shader.get()).second) snapshotBytes += variant.shader->code.capacity() * sizeof(std::uint32_t) + variant.shader->header.capacity();
         const auto* result = variant.compiled.get();
         if (result == nullptr || !results.insert(result).second) return;
-        resultBytes += ResultHeapBytes(*result);
+        resultBytes += ShaderRecompiler::ResultHeapBytes(*result);
         const auto module = result->specializationId != 0 ? result->specializationId : (result->variantId | (1ull << 63u));
         if (!modules.insert(module).second) return;
         logicalSpirv += result->spirv.size() * sizeof(std::uint32_t);
@@ -1807,6 +1807,9 @@ void Driver::AppendMemoryStats(std::string& line) {
     MemoryStats::AppendCount(line, "cache_variants", variantCount);
     MemoryStats::AppendCount(line, "cache_results", results.size());
     MemoryStats::AppendMiB(line, "cache_result_bytes", resultBytes, results.size());
+    const auto memo = ShaderRecompiler::ResultMemoTotals();
+    MemoryStats::AppendMiB(line, "result_memo", memo.bytes, memo.entries);
+    MemoryStats::AppendMiB(line, "result_memo_evicted", memo.evictedBytes, memo.evictions);
     MemoryStats::AppendMiB(line, "cache_snapshot_code", snapshotBytes, snapshots.size());
     MemoryStats::AppendMiB(line, "cache_spirv_logical", logicalSpirv, modules.size());
     MemoryStats::AppendMiB(line, "cache_spirv_resident", residentSpirv, residentModules);

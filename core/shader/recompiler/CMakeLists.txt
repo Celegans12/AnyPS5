@@ -251,6 +251,8 @@ function(add_shader_recompiler target runtimeTarget)
             MatchesPreparedShader
             GetPreparedArtifact
             MaterializeShader
+            ResultMemoTotals
+            ResultHeapBytes
             RegistrationResult
             ResolveSource
             ResourceMaterializer::EvaluateNanoseconds

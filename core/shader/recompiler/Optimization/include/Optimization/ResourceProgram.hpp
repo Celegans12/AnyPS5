@@ -83,6 +83,16 @@ void BuildPreparedShaderKey(const RecompileRequest& request, std::vector<std::ui
 void ReleaseUndrawnResourcePlan(const SourceHandle& handle);
 [[nodiscard]] std::shared_ptr<const ResourceCapture> CaptureResources(const RecompileRequest& request, const SrtRuntime& runtime, const SourceHandle& handle);
 
+struct ResultMemoFootprint {
+    std::uint64_t entries = 0;
+    std::uint64_t bytes = 0;
+    std::uint64_t evictions = 0;
+    std::uint64_t evictedBytes = 0;
+};
+[[nodiscard]] ResultMemoFootprint ResultMemoTotals();
+void SetResultMemoSourceBytes(std::uint64_t bytes);
+[[nodiscard]] std::uint64_t ResultMemoSourceBytes();
+
 }
 
 #endif
