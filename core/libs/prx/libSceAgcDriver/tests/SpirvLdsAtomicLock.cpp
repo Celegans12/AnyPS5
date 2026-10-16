@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <span>
 #include <stdexcept>
@@ -34,13 +35,13 @@ void Require(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error(message);
 }
 
-std::vector<std::uint32_t> RecompileProgram(std::span<const std::uint32_t> code) {
+std::vector<std::uint32_t> RecompileProgram(std::span<const std::uint32_t> code, std::uint32_t waveSize = 32) {
     const std::array<std::uint32_t, 7> capabilities{spv::CapabilityShader, spv::CapabilityGroupNonUniform, spv::CapabilityGroupNonUniformBallot, spv::CapabilityGroupNonUniformShuffle, spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess};
     const std::array<std::uint32_t, 4> userData{};
     const std::array<std::string_view, 2> extensions{"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
     RecompileRequest request{};
     request.shader = {ShaderStage::Compute, 0x20000u, code, 0, {}};
-    request.context.waveSize = 32;
+    request.context.waveSize = waveSize;
     request.context.userDataBaseRegister = 0;
     request.context.userData = userData;
     request.context.compute = ShaderComputeStageInfo{{64u, 1u, 1u}, 4u, {false, false, false}, false, 1u};
@@ -125,10 +126,34 @@ void Check32BitOnlyIsUnchanged() {
     Require(inc.elects == 0 && inc.releases == 0, "a program with only ds_inc_u32 got a workgroup lock: elect " + std::to_string(inc.elects) + ", lock release " + std::to_string(inc.releases));
 }
 
+void CheckSpannedLockVotesInItsSubgroup() {
+    std::vector<std::uint32_t> code{0x7e020280u, 0x7e0402c1u, 0x7e060280u, 0x7e080281u, 0x7e020500u, 0x7e020201u, DsAddU64, DsOperands, 0xbf8cc07fu, 0xbf810000u};
+    const auto words = RecompileProgram(code, 64u);
+    std::size_t barriersBefore = 0, barriersInLock = 0;
+    bool elected = false;
+    for (std::size_t cursor = 5; cursor < words.size();) {
+        const auto count = words[cursor] >> spv::WordCountShift;
+        const auto op = static_cast<spv::Op>(words[cursor] & spv::OpCodeMask);
+        Require(count != 0 && cursor + count <= words.size(), "truncated SPIR-V instruction");
+        if (op == spv::OpGroupNonUniformElect) elected = true;
+        if (op == spv::OpControlBarrier) ++(elected ? barriersInLock : barriersBefore);
+        cursor += count;
+    }
+    Require(elected, "the spanned ds_add_u64 program took no workgroup lock");
+    Require(barriersBefore != 0, "the wave64 program was not emitted as a spanned wave (its v_readfirstlane has no workgroup exchange)");
+    Require(barriersInLock == 0, "the lock loop of a spanned wave votes with " + std::to_string(barriersInLock) + " workgroup barriers: the lanes that are inactive or out of bounds never reach them");
+}
+
 }
 
 int main() {
+#ifdef _WIN32
+    _putenv_s("APS5_SPANNED_WAVE", "1");
+#else
+    setenv("APS5_SPANNED_WAVE", "1", 1);
+#endif
     try {
+        CheckSpannedLockVotesInItsSubgroup();
         Check64BitOnlyLocks();
         Check32BitTakesLockWith64Bit();
         CheckOtherUpdatePathTakesLock();
@@ -139,6 +164,6 @@ int main() {
         std::fprintf(stderr, "SpirvLdsAtomicLock: %s\n", error.what());
         return 1;
     }
-    std::puts("SpirvLdsAtomicLock: 32-bit LDS atomics take the 64-bit workgroup lock only in programs with a 64-bit LDS atomic");
+    std::puts("SpirvLdsAtomicLock: 32-bit LDS atomics take the 64-bit workgroup lock only in programs with a 64-bit LDS atomic; a spanned wave's lock loop votes in its own subgroup");
     return 0;
 }
