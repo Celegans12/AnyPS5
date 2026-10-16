@@ -2,6 +2,7 @@
 #include "Recompiler.hpp"
 #include <array>
 #include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <map>
 #include <span>
@@ -27,8 +28,11 @@ SpirvTarget Target() {
     static constexpr std::array<std::string_view, 4> extensions{
         "SPV_EXT_descriptor_indexing", "SPV_KHR_8bit_storage", "SPV_KHR_float_controls", "SPV_KHR_physical_storage_buffer",
     };
-    return {0x00401000u, 0x00010300u, 32, BdaAbi::Version, capabilities, extensions, false,
+    SpirvTarget target{0x00401000u, 0x00010300u, 32, BdaAbi::Version, capabilities, extensions, false,
             {1024, 1024, 64}, 1024, 32768, {}, {}};
+    // The spanned ctest variant: the driver sets this from APS5_SPANNED_WAVE, so this target does too.
+    target.spannedWaves = std::getenv("APS5_SPANNED_WAVE") != nullptr;
+    return target;
 }
 
 struct Counts {
