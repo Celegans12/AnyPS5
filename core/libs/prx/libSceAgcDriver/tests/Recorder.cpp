@@ -53,6 +53,7 @@
 #include <atomic>
 #include <cmath>
 #include <chrono>
+#include <future>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -7727,6 +7728,25 @@ int pipelineCacheFileTests(const Device& device) {
     {
         PipelineCache reloaded(context, properties);
         Require(holds(reloaded.Handle(), 1), "an invalid cache file was not replaced by the saving object's pipelines");
+    }
+    std::filesystem::remove_all(directory);
+    {
+        PipelineCache busy(context, properties);
+        build(busy.Handle(), 0);
+        auto creating = busy.Synchronization().LockForPipelineUse();
+        auto periodic = std::async(std::launch::async, [&] { return busy.SaveUnlessCreating(); });
+        const bool waited = periodic.wait_for(std::chrono::seconds(5)) == std::future_status::timeout;
+        creating.unlock();
+        const bool saved = periodic.get();
+        Require(!waited, "a periodic pipeline cache save waited for a pipeline creation in progress (other creations would queue behind it)");
+        Require(!saved, "a periodic pipeline cache save ran during a pipeline creation");
+        Require(!std::filesystem::exists(directory) || std::filesystem::is_empty(directory), "a skipped periodic save wrote the cache file");
+        Require(busy.SaveUnlessCreating(), "a periodic pipeline cache save was skipped with no pipeline creation in progress");
+        cacheFile();
+    }
+    {
+        PipelineCache reloaded(context, properties);
+        Require(holds(reloaded.Handle(), 0), "the cache file lost the pipeline of a cache saved after a skipped periodic save");
     }
     std::cout << "Pipeline cache file merge tests passed\n";
     return 0;
