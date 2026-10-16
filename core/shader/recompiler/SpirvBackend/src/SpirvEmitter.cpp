@@ -167,8 +167,18 @@ std::uint32_t SpirvValueEmitContext::Shuffle(const IrValue& inst, std::size_t in
     const auto high = state.module.AllocateId();
     const auto inHigh = state.module.AllocateId();
     const auto value = state.module.AllocateId();
-    state.module.AddFunction(spv::OpGroupNonUniformShuffle, type, low, scope, HalfArg(inst, index, 0u), physicalLane);
-    state.module.AddFunction(spv::OpGroupNonUniformShuffle, type, high, scope, HalfArg(inst, index, 1u), physicalLane);
+    if (IsVectorType(inst.Argument(index)->Type())) {
+        state.module.AddFunction(spv::OpGroupNonUniformShuffle, type, low, scope, HalfArg(inst, index, 0u), physicalLane);
+        state.module.AddFunction(spv::OpGroupNonUniformShuffle, type, high, scope, HalfArg(inst, index, 1u), physicalLane);
+    } else {
+        const auto pairType = state.module.Type(spv::OpTypeVector, type, 2u);
+        const auto halves = state.module.AllocateId();
+        const auto shuffled = state.module.AllocateId();
+        state.module.AddFunction(spv::OpCompositeConstruct, pairType, halves, HalfArg(inst, index, 0u), HalfArg(inst, index, 1u));
+        state.module.AddFunction(spv::OpGroupNonUniformShuffle, pairType, shuffled, scope, halves, physicalLane);
+        state.module.AddFunction(spv::OpCompositeExtract, type, low, shuffled, 0u);
+        state.module.AddFunction(spv::OpCompositeExtract, type, high, shuffled, 1u);
+    }
     state.module.AddFunction(spv::OpINotEqual, TypeBool(state), inHigh, EmitBinaryU32(state, spv::OpBitwiseAnd, lane, ConstantU32(state, 32u)), ConstantU32(state, 0u));
     state.module.AddFunction(spv::OpSelect, type, value, inHigh, high, low);
     return value;
