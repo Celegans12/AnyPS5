@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -132,7 +133,11 @@ int main() {
         Round(0x11112222u, "the first dispatch");
         const std::array<std::uint32_t, 4> values{0x33334444u, 0x55556666u, 0x7a7b7c7du, 0x0f1e2d3cu};
         for (std::size_t round = 0; round < values.size(); ++round) {
-            Round(values[round], "data hit " + std::to_string(round + 1) + ", resolved ahead on the compute queue");
+            const auto mismatches = AgcDriver::Graphics::SnapshotMismatches();
+            const auto what = "data hit " + std::to_string(round + 1) + ", resolved ahead on the compute queue";
+            Round(values[round], what);
+            const auto added = AgcDriver::Graphics::SnapshotMismatches() - mismatches;
+            check(added == 0, what + ": its snapshots differ from the registered memory serving them (" + std::to_string(added) + " snapshot mismatches)");
         }
         std::printf("dispatch data hit words: %zu data hits resolved ahead read their own live words\n", values.size());
 
