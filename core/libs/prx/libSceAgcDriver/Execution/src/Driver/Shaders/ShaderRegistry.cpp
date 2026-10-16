@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderMemoryCensus.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ResultFootprint.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -1756,12 +1757,13 @@ void Driver::AppendMemoryStats(std::string& line) {
     std::unordered_set<const ShaderSnapshot*> snapshots;
     std::unordered_set<std::uint64_t> modules;
     std::uint64_t residentSpirv = 0, logicalSpirv = 0, residentModules = 0, snapshotBytes = 0, variantCount = 0;
-    std::uint64_t specialized = 0, specializedBytes = 0;
+    std::uint64_t specialized = 0, specializedBytes = 0, resultBytes = 0;
     const auto visit = [&](const DispatchVariant& variant) {
         ++variantCount;
         if (variant.shader != nullptr && snapshots.insert(variant.shader.get()).second) snapshotBytes += variant.shader->code.capacity() * sizeof(std::uint32_t) + variant.shader->header.capacity();
         const auto* result = variant.compiled.get();
         if (result == nullptr || !results.insert(result).second) return;
+        resultBytes += ResultHeapBytes(*result);
         const auto module = result->specializationId != 0 ? result->specializationId : (result->variantId | (1ull << 63u));
         if (!modules.insert(module).second) return;
         logicalSpirv += result->spirv.size() * sizeof(std::uint32_t);
@@ -1804,6 +1806,7 @@ void Driver::AppendMemoryStats(std::string& line) {
     MemoryStats::AppendMiB(line, "draw_cache_counted", drawVariantBytes + drawUserData, drawEntries);
     MemoryStats::AppendCount(line, "cache_variants", variantCount);
     MemoryStats::AppendCount(line, "cache_results", results.size());
+    MemoryStats::AppendMiB(line, "cache_result_bytes", resultBytes, results.size());
     MemoryStats::AppendMiB(line, "cache_snapshot_code", snapshotBytes, snapshots.size());
     MemoryStats::AppendMiB(line, "cache_spirv_logical", logicalSpirv, modules.size());
     MemoryStats::AppendMiB(line, "cache_spirv_resident", residentSpirv, residentModules);

@@ -426,6 +426,12 @@ bool GuestArenaResidentSpan_nid_postfix(std::uintptr_t address, std::size_t byte
 void GuestArenaForgetSection_nid_postfix(void* section) {
     WindowsMappings::Get().ForgetSection(section);
 }
+
+void GuestArenaSavedMemory_nid_postfix(std::uint64_t* bytes, std::uint64_t* blocks) {
+    const auto [saved, count] = WindowsMappings::Get().SavedMemory();
+    *bytes = saved;
+    *blocks = count;
+}
 #endif
 
 #if defined(__linux__)

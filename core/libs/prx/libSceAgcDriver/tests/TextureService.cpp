@@ -672,6 +672,8 @@ void serviceTests(const Device& device) {
     const auto primed = service.Totals();
     Require(primed.primed == 1u && primed.workerPrepared == 1u && primed.workerCommitted == Fixture::Records && primed.created == Fixture::Records && primed.refused == 8u && primed.refusals[static_cast<std::size_t>(AgcDriver::Graphics::BindlessRefusalKind::Other)] == 8u, "the worker primer did not create every table entry off the GPU lock: created " + std::to_string(primed.created) + ", worker committed " + std::to_string(primed.workerCommitted) + ", refused " + std::to_string(primed.refused));
     Require(primed.imageSlots == DistinctImages, "the heap slots were not shared per image view: " + std::to_string(primed.imageSlots));
+    Require(primed.tables == 1u && primed.tableHostBytes >= Fixture::Records * Table::DescriptorWords * sizeof(std::uint32_t) && primed.entryHostBytes >= primed.entries * sizeof(DeviceImageKeys::Key), "the host bytes of the primed table and its entries are not counted: " + std::to_string(primed.tableHostBytes));
+    Require(primed.rejections != 0u && primed.rejectionHostBytes != 0u, "the host bytes of the refusal reasons are not counted");
     const std::array<std::uint32_t, Table::DescriptorWords> nullWords{};
     const auto nullValue = service.Find(Abi::MakeKey(nullWords, InterfaceId, 0u));
     Require(nullValue.has_value() && nullValue->slot == 0u && nullValue->fault == 0u && nullValue->mode == 0u, "a null T# record is not a null-slot entry");
