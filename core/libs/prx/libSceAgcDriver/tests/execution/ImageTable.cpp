@@ -1781,6 +1781,8 @@ alignas(256) constexpr std::array<std::uint32_t, 24> PixelSampleWaterfallCode{
     0x00660402u, 0x8afe6a2au, 0xbf89fff5u, 0xbefe0428u, 0xbf8c3f70u, 0xf800180fu, 0x07060504u, 0xbf810000u,
 };
 
+constexpr std::uint32_t SpirvGroupNonUniformQuad = 68u;
+constexpr std::uint32_t SpirvQuadBroadcast = 365u;
 constexpr std::uint32_t SampleSize = 64;
 constexpr std::uint32_t SampleMips = 4;
 constexpr std::uint32_t SampleTextures = 3;
@@ -1836,6 +1838,7 @@ struct PixelDraw {
     bool vertexHeap = false;
     bool pixelHeap = false;
     bool pixelTableBinding = false;
+    std::uint32_t quadBroadcasts = 0;
 };
 
 PixelDraw DrawPixelTable(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> pixelCode, std::span<const std::uint32_t> table, std::uint32_t key, const std::array<std::uint32_t, 4>& sampler, float scaleU, float scaleV) {
@@ -1875,6 +1878,8 @@ PixelDraw DrawPixelTable(AgcDriver::VulkanDevice& device, std::span<const std::u
         PixelPushLayout(vertexPush, target)
     };
     const auto pixelResult = ShaderRecompiler::Recompile(fragment);
+    static std::set<const std::uint32_t*> reported;
+    if (reported.insert(pixelCode.data()).second) std::printf("image table pixel shader of %zu code words: %zu SPIR-V words (%s)\n", pixelCode.size(), pixelResult.spirv.size(), pixelResult.bindlessHeap ? "bindless heap" : "old table path");
     const std::array<AgcDriver::Graphics::CompiledShader, 2> shaders{{
         {ShaderStage::Vertex, &vertexResult, 0},
         {ShaderStage::Fragment, &pixelResult, PixelPushOffset(vertexPush, target)}
@@ -1900,11 +1905,16 @@ PixelDraw DrawPixelTable(AgcDriver::VulkanDevice& device, std::span<const std::u
     PixelDraw result;
     result.vertexHeap = vertexResult.bindlessHeap;
     result.pixelHeap = pixelResult.bindlessHeap;
+    const auto words = pixelResult.spirv.Words();
+    for (std::size_t cursor = 5; cursor < words.size() && (words[cursor] >> 16u) != 0u; cursor += words[cursor] >> 16u) result.quadBroadcasts += (words[cursor] & 0xffffu) == SpirvQuadBroadcast ? 1u : 0u;
     result.pixelTableBinding = std::any_of(pixelResult.bindings.begin(), pixelResult.bindings.end(), [](const auto& binding) { return binding.role == ShaderRecompiler::DescriptorRole::ImageTable; });
     return result;
 }
 
-void RequirePixelHeap(const PixelDraw& drawn, const std::string& what) {
+void RequirePixelHeap(const PixelDraw& drawn, const std::string& what, AgcDriver::VulkanDevice& device) {
+    const auto capabilities = device.Target().supportedCapabilities;
+    const bool quad = std::find(capabilities.begin(), capabilities.end(), SpirvGroupNonUniformQuad) != capabilities.end();
+    Require((drawn.quadBroadcasts != 0u) == (BindlessHeap() && quad), what + ": the implicit-LOD heap sample has " + std::to_string(drawn.quadBroadcasts) + " quad broadcasts");
     Require(drawn.pixelHeap == BindlessHeap(), what + ": the pixel shader was " + (drawn.pixelHeap ? "" : "not ") + "lowered to the descriptor heap");
     Require(!drawn.vertexHeap, what + ": the table-free vertex shader was lowered to the descriptor heap");
     Require(!BindlessHeap() || !drawn.pixelTableBinding, what + ": the heap-served pixel table kept its image table binding");
@@ -1940,7 +1950,7 @@ void RunPixelSampleTests(AgcDriver::VulkanDevice& device) {
             const auto scale = static_cast<float>(1u << level) / static_cast<float>(SampleSize);
             const auto what = "image table pixel sampling: texture " + std::to_string(texture) + " at implicit level " + std::to_string(level);
             const auto drawn = DrawPixelTable(device, PixelSampleTableCode, SampleTable, texture, SamplePointSampler, scale, scale);
-            RequirePixelHeap(drawn, what);
+            RequirePixelHeap(drawn, what, device);
             RequirePixels([&](std::uint32_t, std::uint32_t) { return std::array<std::uint32_t, 4>{SampleLevelMark(level), SampleTextureMark(texture), 7u, 255u}; }, what);
         }
     }
@@ -1949,7 +1959,7 @@ void RunPixelSampleTests(AgcDriver::VulkanDevice& device) {
             const auto scale = static_cast<float>(1u << level) / static_cast<float>(SampleSize);
             const auto what = "image table pixel sampling: per-pixel texture " + std::to_string(base) + " or " + std::to_string(base + 1u) + " at implicit level " + std::to_string(level);
             const auto drawn = DrawPixelTable(device, PixelSampleWaterfallCode, SampleTable, base, SamplePointSampler, scale, scale);
-            RequirePixelHeap(drawn, what);
+            RequirePixelHeap(drawn, what, device);
             RequirePixels([&](std::uint32_t x, std::uint32_t) { return std::array<std::uint32_t, 4>{SampleLevelMark(level), SampleTextureMark(base + ((x >> 2u) & 1u)), 7u, 255u}; }, what);
         }
     }
@@ -2000,7 +2010,7 @@ void RunPixelStorageTests(AgcDriver::VulkanDevice& device) {
     for (const std::uint32_t bias : {0u, 2u}) {
         write(bias);
         const auto drawn = DrawPixelTable(device, PixelSampleTableCode, pixelTable, 0u, SamplePointSampler, scaleU, scaleV);
-        RequirePixelHeap(drawn, "image table pixel storage");
+        RequirePixelHeap(drawn, "image table pixel storage", device);
         RequirePixels([&](std::uint32_t x, std::uint32_t y) { return std::array<std::uint32_t, 4>{y * Height / TargetHeight == 0u ? x + bias : 0u, 0u, 0u, 255u}; }, "image table pixel storage: a draw sampling an image the preceding dispatch of the batch stored (pass " + std::to_string(bias) + ")");
     }
     std::puts("image table pixel storage: dispatch-written images sampled by a draw passed");
@@ -2012,7 +2022,7 @@ void RunPixelMissTests(AgcDriver::VulkanDevice& device) {
     const auto scale = 1.0f / static_cast<float>(SampleSize);
     const auto before = service.Totals();
     const auto missed = DrawPixelTable(device, PixelSampleTableCode, SampleTable, 2u, SamplePointSampler, scale, scale);
-    RequirePixelHeap(missed, "bindless pixel miss");
+    RequirePixelHeap(missed, "bindless pixel miss", device);
     RequirePixels([](std::uint32_t, std::uint32_t) { return std::array<std::uint32_t, 4>{}; }, "bindless pixel miss: an unprimed key did not sample zero");
     static_cast<void>(DrawPixelTable(device, PixelSampleTableCode, SampleTable, 2u, SamplePointSampler, scale, scale));
     RequirePixels([](std::uint32_t, std::uint32_t) { return std::array<std::uint32_t, 4>{SampleLevelMark(0), SampleTextureMark(2), 7u, 255u}; }, "bindless pixel miss: the key the first draw missed was not served to the second");
