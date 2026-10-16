@@ -819,7 +819,7 @@ ResourceCache::Key DrawResourceKey(const Context& context, std::span<const Compi
 // addGuestBuffer), repeated for a cached build whose own checks compared the buffers against
 // another draw's render target and index buffer. The same conditions and messages, so a draw that
 // would have failed its build fails its hit.
-void CheckBufferAliases(std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint64_t indexAddress, std::uint64_t indexBytes) {
+void CheckBufferAliases(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint64_t indexAddress, std::uint64_t indexBytes) {
     const auto overlap = [](std::uint64_t first, std::uint64_t firstSize, std::uint64_t second, std::uint64_t secondSize) { return first < second + secondSize && second < first + firstSize; };
     for (const auto& shader : shaders) {
         for (const auto& binding : shader.program->bindings) {
@@ -828,7 +828,7 @@ void CheckBufferAliases(std::span<const CompiledShader> shaders, const ColorTarg
             for (std::size_t offset = 0; offset + 4 <= words.size(); offset += 4) {
                 const ShaderRecompiler::ShaderBufferResource descriptor{{words[offset], words[offset + 1], words[offset + 2], words[offset + 3]}};
                 const auto address = descriptor.Base48();
-                const auto size = descriptor.GetSize();
+                const auto size = ShaderResources::GuestBufferBytes(context, std::span<const std::uint32_t>(words).subspan(offset, 4));
                 if (size == 0 || address == 0) continue;
                 const auto element = offset / 4;
                 const bool written = element >= binding.bufferWritten.size() || binding.bufferWritten[element];
@@ -1369,7 +1369,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                 resolved.resources = std::move(cached);
                 resolved.use.resources = resolved.resources;
                 resolved.moved = std::move(*moved);
-                if (trimKey) CheckBufferAliases(shaders, state.color, draw.indexAddress, indexBytes);
+                if (trimKey) CheckBufferAliases(context, shaders, state.color, draw.indexAddress, indexBytes);
                 outcome.kind = KindTemplateHit;
                 countCache(&DrawProfile::cacheHits);
             } else if (valid) {
@@ -2800,7 +2800,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         timer.phase(PhaseLookup);
         return miss(DrawRecipeMiss::Proof);
     }
-    CheckBufferAliases(shaders, state.color, draw.indexAddress, inputs.indexBytes);
+    CheckBufferAliases(context, shaders, state.color, draw.indexAddress, inputs.indexBytes);
     SharedResourceCache().Touch(recipe.key);
     countCache(&DrawProfile::cacheHits);
     timer.phase(PhaseLookup);

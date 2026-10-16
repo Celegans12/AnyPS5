@@ -4683,7 +4683,7 @@ DescriptorCache::Stats DescriptorCache::Counters() const {
     return stats;
 }
 
-std::uint64_t ShaderResources::guestBufferBytes(std::span<const std::uint32_t> words) const {
+std::uint64_t ShaderResources::GuestBufferBytes(const Context& context, std::span<const std::uint32_t> words) {
     const ShaderRecompiler::ShaderBufferResource descriptor{{words[0], words[1], words[2], words[3]}};
     const auto address = descriptor.Base48();
     auto byteSize = descriptor.GetSize();
@@ -4703,6 +4703,10 @@ std::uint64_t ShaderResources::guestBufferBytes(std::span<const std::uint32_t> w
         }
     }
     return byteSize;
+}
+
+std::uint64_t ShaderResources::guestBufferBytes(std::span<const std::uint32_t> words) const {
+    return GuestBufferBytes(context, words);
 }
 
 std::size_t ShaderResources::addGuestBuffer(std::span<const std::uint32_t> words, const ColorTarget* target, std::uint64_t indexAddress, std::size_t indexBytes, bool written, bool atomic, bool read) {
@@ -5720,7 +5724,7 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
                 const auto* words = binding.guestDescriptor.data() + static_cast<std::size_t>(element) * 4u;
                 const ShaderRecompiler::ShaderBufferResource descriptor{{words[0], words[1], words[2], words[3]}};
                 const auto address = descriptor.Base48();
-                const auto size = descriptor.GetSize();
+                const auto size = GuestBufferBytes(context, std::span<const std::uint32_t>(words, 4));
                 const auto index = kept->allocations[element];
                 const auto& item = allocations[index];
                 const bool empty = size == 0 || address == 0;

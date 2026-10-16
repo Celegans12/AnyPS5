@@ -303,6 +303,7 @@ public:
     const std::vector<std::uint64_t>& MultisampleSources() const { return multisampleSources; }
     static bool NeverReusable(std::span<const CompiledShader> shaders);
     static std::uint64_t DepthGuardRefusals();
+    static std::uint64_t GuestBufferBytes(const Context& context, std::span<const std::uint32_t> words);
     const std::vector<std::shared_ptr<Texture>>& SampledTextures() const { return textures; }
     // Whether a sampled texture of the set left the sampled cache (evicted, replaced, or made for
     // one use and never admitted): such a set is not kept by the resource cache, whose entries may

@@ -208,7 +208,7 @@ struct Scene {
     std::array<AgcDriver::Graphics::GuestMemorySnapshot, 2> snapshots{};
     AgcDriver::Graphics::State state{};
 
-    Scene(AgcDriver::VulkanDevice& device, std::size_t ranges) : device(device), extra(std::max<std::size_t>(ranges, 1) * 2 * PageBytes), ranges(ranges) {
+    Scene(AgcDriver::VulkanDevice& device, std::size_t ranges, std::uint32_t vertexRecords = static_cast<std::uint32_t>(BlockBytes / 16u)) : device(device), extra(std::max<std::size_t>(ranges, 1) * 2 * PageBytes), ranges(ranges) {
         pixels.Register(0, TargetLayout.Bytes(), true);
         std::memcpy(vertices.Data(), Triangle.data(), sizeof(Triangle));
         vertices.Register(0, BlockBytes, false);
@@ -218,7 +218,7 @@ struct Scene {
         Store(guest, ValueOffset, One);
         const auto target = device.Target();
         const auto vertexAddress = vertices.Address();
-        vertexUserData = {static_cast<std::uint32_t>(vertexAddress), static_cast<std::uint32_t>((vertexAddress >> 32u) & 0xffffu) | (16u << 16u), static_cast<std::uint32_t>(BlockBytes / 16u), 0x01016facu};
+        vertexUserData = {static_cast<std::uint32_t>(vertexAddress), static_cast<std::uint32_t>((vertexAddress >> 32u) & 0xffffu) | (16u << 16u), vertexRecords, 0x01016facu};
         const std::array<ShaderRecompiler::MemoryRegion, 1> vertexMemory{{{AddressOf(VertexCode.data()), std::as_bytes(std::span(VertexCode))}}};
         ShaderRecompiler::RecompileRequest vertex{
             {ShaderStage::Vertex, AddressOf(VertexCode.data()), VertexCode, 0, {}},
@@ -454,6 +454,27 @@ void Remap(Scene& scene) {
     Require(Builds() == before + 1, "address draw reuse: a draw reused resources whose BDA table maps an unmapped range");
 }
 
+void OversizedVertexBuffer(AgcDriver::VulkanDevice& device) {
+    Scene scene(device, 0, 0xffffffffu);
+    Pages later{TargetLayout.Bytes()};
+    const bool pixelsAbove = scene.pixels.Address() > scene.vertices.Address();
+    auto& target = pixelsAbove ? scene.pixels : later;
+    if (!pixelsAbove) later.Register(0, TargetLayout.Bytes(), true);
+    Require(target.Address() >= scene.vertices.Address() + BlockBytes, "address draw reuse: no render target lies above the vertex buffer");
+    scene.state.color.address = target.Address();
+    scene.state.colors = {scene.state.color};
+    scene.Clear();
+    scene.Draw();
+    scene.Wait();
+    Require(scene.Stored() == Bits(One), "address draw reuse: the draw whose vertex buffer descriptor reaches past its allocation did not store through the BDA table");
+    const auto before = Builds();
+    scene.Clear();
+    scene.Draw();
+    scene.Wait();
+    Require(scene.Stored() == Bits(One), "address draw reuse: the reused draw whose vertex buffer descriptor reaches past its allocation did not store through the BDA table");
+    Require(Builds() == before, "address draw reuse: a draw whose vertex buffer descriptor reaches past its allocation built its resources again");
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -474,6 +495,7 @@ int main(int argc, char** argv) {
             Remap(scene);
             scene.Wait();
         }
+        OversizedVertexBuffer(*device);
         std::printf("address draw reuse tests passed (%zu extra registered ranges)\n", ranges);
         return 0;
     } catch (const std::exception& error) {
