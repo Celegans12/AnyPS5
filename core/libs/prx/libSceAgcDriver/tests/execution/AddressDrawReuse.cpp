@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
@@ -8,6 +9,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
@@ -31,11 +33,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 #include <iostream>
 #include <memory>
 #include <mutex>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace AgcDriver {
@@ -78,6 +82,21 @@ alignas(256) constexpr std::array<std::uint32_t, 14> PixelCode{
     0xf800180fu, 0x01010101u,
     0xbf810000u,
 };
+
+alignas(256) constexpr std::array<std::uint32_t, 13> FullScreenVertexCode{
+    0x7e000d05u, 0x080200f4u, 0x10020300u, 0x100202f4u, 0x060202f3u, 0x060400f3u, 0x10040500u, 0x060404f3u,
+    0x7e060280u, 0x7e0802f2u, 0xf80008cfu, 0x04030201u, 0xbf810000u,
+};
+
+alignas(256) std::array<std::uint32_t, 128> SubmittedCode{};
+
+struct ShaderHeader {
+    Shader shader{};
+    ShaderUserData userData{};
+};
+
+alignas(8) ShaderHeader SubmittedPixelHeader{};
+alignas(8) ShaderHeader SubmittedVertexHeader{};
 
 constexpr std::array<std::array<float, 4>, 3> Triangle{{
     {-1.0f, -1.0f, 0.5f, 1.0f}, {3.0f, -1.0f, 0.5f, 1.0f}, {-1.0f, 3.0f, 0.5f, 1.0f}
@@ -554,32 +573,134 @@ void ThrowingProof(AgcDriver::VulkanDevice& device) {
     resources.WriteBack();
 }
 
+void RegisterShader(ShaderHeader& header, const std::uint32_t* code, std::size_t bytes, std::uint8_t type) {
+    header.shader.file_header = 0x34333231u;
+    header.shader.version = 0x18u;
+    header.shader.header_size = sizeof(ShaderHeader);
+    header.shader.shader_size = static_cast<std::uint32_t>(bytes);
+    header.shader.code = code;
+    header.shader.type = type;
+    header.shader.user_data = &header.userData;
+    AgcDriverRegisterShader_nid_postfix(&header.shader);
+}
+
+void Append(std::vector<std::uint32_t>& commands, std::uint32_t opcode, std::initializer_list<std::uint32_t> payload) {
+    commands.push_back(0xc0000000u | (static_cast<std::uint32_t>(payload.size() - 1) << 16u) | (opcode << 8u));
+    commands.insert(commands.end(), payload);
+}
+
+std::vector<std::uint32_t> SubmittedDraw(const std::uint32_t* vertexCode, const std::uint32_t* pixelCode, std::uint64_t color, std::uint64_t pointer, std::uint64_t label) {
+    const auto vertex = AddressOf(vertexCode);
+    const auto pixel = AddressOf(pixelCode);
+    const std::vector<std::pair<std::uint32_t, std::uint32_t>> context{
+        {0x2d5, 0x2000},
+        {0x1b6, 0}, {0x207, 0}, {0x200, 0}, {0x203, 0x800},
+        {0x2dc, 0xaa00}, {0x2f8, 0}, {0x292, 2}, {0x293, 0},
+        {0x80, 0}, {0x8d, 0}, {0x83, 0xffff}, {0x8c, 0xa},
+        {0x2f9, 0x2d}, {0x313, 0x6000}, {0x30e, 0xffffffff}, {0x30f, 0xffffffff},
+        {0x206, 0x43f}, {0x204, 0x80000}, {0x205, 0x240},
+        {0x8e, 0xf}, {0x8f, 0xf}, {0x202, 0xcc0010},
+        {0x1c4, 0}, {0x1c5, 9}, {0x1c3, 4}, {0x31c, 0x28028},
+        {0x31b, 0}, {0x31d, 0}, {0x3b0, (63u << 14u) | 3u},
+        {0x3b8, 0x9000000u | (static_cast<std::uint32_t>(ColorTileMode::RenderTarget) << 14u)}, {0x1e0, 0},
+        {0xc, 0}, {0xd, 0x40040},
+        {0x81, 0x80000000}, {0x82, 0x40040},
+        {0x90, 0x80000000}, {0x91, 0x40040},
+        {0x94, 0x80000000}, {0x95, 0x40040},
+        {0x318, static_cast<std::uint32_t>(color >> 8u)}, {0x390, static_cast<std::uint32_t>(color >> 40u)},
+        {0x10f, Bits(32.0f)}, {0x110, Bits(32.0f)},
+        {0x111, Bits(-2.0f)}, {0x112, Bits(2.0f)},
+        {0x113, Bits(1.0f)}, {0x114, 0},
+        {0xb4, 0}, {0xb5, Bits(1.0f)},
+        {0x2fe, 0}, {0x302, 0}, {0x306, 0}, {0x30a, 0},
+    };
+    const std::vector<std::pair<std::uint32_t, std::uint32_t>> shader{
+        {0xc8, static_cast<std::uint32_t>(vertex >> 8u)}, {0xc9, static_cast<std::uint32_t>(vertex >> 40u)}, {0x8b, 0}, {0x8c, 0},
+        {0x008, static_cast<std::uint32_t>(pixel >> 8u)}, {0x009, static_cast<std::uint32_t>(pixel >> 40u)}, {0x00b, 2u << 1u},
+        {0x00c, static_cast<std::uint32_t>(pointer)}, {0x00d, static_cast<std::uint32_t>(pointer >> 32u)},
+    };
+    std::vector<std::uint32_t> commands;
+    Append(commands, 0x79, {0x242, 4});
+    for (const auto& [offset, value] : context) Append(commands, 0x69, {offset, value});
+    for (const auto& [offset, value] : shader) Append(commands, 0x76, {offset, value});
+    Append(commands, 0x2d, {3, 2});
+    Append(commands, 0x49, {0x14u | (5u << 8u), 1u << 29u, static_cast<std::uint32_t>(label), static_cast<std::uint32_t>(label >> 32u), 1u, 0u, 0u});
+    return commands;
+}
+
+void DecodeCacheHit() {
+    auto* pixelCode = SubmittedCode.data();
+    auto* vertexCode = SubmittedCode.data() + SubmittedCode.size() / 2;
+    std::memcpy(pixelCode, PixelCode.data(), sizeof(PixelCode));
+    std::memcpy(vertexCode, FullScreenVertexCode.data(), sizeof(FullScreenVertexCode));
+    RegisterShader(SubmittedPixelHeader, pixelCode, sizeof(PixelCode), 1);
+    RegisterShader(SubmittedVertexHeader, vertexCode, sizeof(FullScreenVertexCode), 2);
+    Pages color{BlockBytes};
+    color.Register(0, BlockBytes, true);
+    Pages guest{BlockBytes};
+    guest.Register(0, BlockBytes, true);
+    const auto value = guest.Address(ValueOffset);
+    std::memcpy(guest.Data() + PointerOffset, &value, sizeof(value));
+    Scene::Store(guest, ValueOffset, One);
+    constexpr std::size_t labelWord = 8;
+    auto commands = SubmittedDraw(vertexCode, pixelCode, color.Address(), guest.Address(), guest.Address(labelWord * sizeof(std::uint32_t)));
+    const auto submit = [&] {
+        std::memcpy(guest.Data() + StoreOffset, &Sentinel, sizeof(Sentinel));
+        std::memset(guest.Data() + labelWord * sizeof(std::uint32_t), 0, sizeof(std::uint32_t));
+        Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
+        Require(sceAgcDriverSubmitDcb(&packet) == 0, "address draw reuse: the submitted draw failed");
+        AgcDriverWaitIdle_nid_postfix();
+        std::array<std::uint32_t, labelWord + 1> words{};
+        AgcDriver::GuestMemory::Read(guest.Address(), std::as_writable_bytes(std::span(words)), 4);
+        Require(words[labelWord] == 1u, "address draw reuse: the label after the submitted draw did not land");
+        Require(words[StoreOffset / sizeof(std::uint32_t)] == Bits(One), "address draw reuse: the submitted draw did not store through the BDA table");
+    };
+    auto& driver = AgcDriver::DriverDetail::Driver::Get();
+    submit();
+    const auto built = Builds();
+    submit();
+    Require(Builds() == built, "address draw reuse: a second decode miss of a submitted draw built its resources again");
+    const auto before = driver.DrawCacheCounters();
+    submit();
+    const auto after = driver.DrawCacheCounters();
+    if (after.hits == before.hits) {
+        std::puts("address draw reuse: reuse across a decode-cache hit not tested, the third submitted draw did not hit the decode cache");
+        return;
+    }
+    Require(Builds() == built, "address draw reuse: a submitted draw that hit the decode cache built its resources again after a decode miss of the same draw");
+}
+
 }
 
 int main(int argc, char** argv) {
     try {
         const std::size_t ranges = argc > 1 ? std::strtoull(argv[1], nullptr, 10) : 512;
         const std::size_t draws = argc > 2 ? std::strtoull(argv[2], nullptr, 10) : 64;
-        const auto device = OpenVulkanTestDevice();
-        if (!device) return VulkanTestSkipped;
         {
-            Scene scene(*device, ranges);
-            if (!Imported(scene)) {
-                std::puts("skipped, host imports are unavailable: a store through the BDA table needs one");
-                return VulkanTestSkipped;
+            const auto device = OpenVulkanTestDevice();
+            if (!device) return VulkanTestSkipped;
+            {
+                Scene scene(*device, ranges);
+                if (!Imported(scene)) {
+                    std::puts("skipped, host imports are unavailable: a store through the BDA table needs one");
+                    return VulkanTestSkipped;
+                }
+                Synthetic(scene, draws);
+                GuestWrite(scene);
+                Fault(scene);
+                Remap(scene);
+                scene.Wait();
             }
-            Synthetic(scene, draws);
-            GuestWrite(scene);
-            Fault(scene);
-            Remap(scene);
-            scene.Wait();
+            OversizedVertexBuffer(*device);
+            ThrowingProof(*device);
         }
-        OversizedVertexBuffer(*device);
-        ThrowingProof(*device);
+        DecodeCacheHit();
+        AgcDriverShutdown_nid_postfix();
         std::printf("address draw reuse tests passed (%zu extra registered ranges)\n", ranges);
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
+        AgcDriverShutdown_nid_postfix();
         return 1;
     }
 }

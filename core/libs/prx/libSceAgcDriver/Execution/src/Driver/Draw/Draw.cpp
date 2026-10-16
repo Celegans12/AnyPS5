@@ -474,6 +474,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     const auto snapshot = [&] {
         snapshots.clear();
         for (const auto& region : memory) snapshots.push_back({region.guestAddress, region.bytes});
+        std::sort(snapshots.begin(), snapshots.end(), [](const Graphics::GuestMemorySnapshot& left, const Graphics::GuestMemorySnapshot& right) { return left.address != right.address ? left.address < right.address : left.bytes.size() < right.bytes.size(); });
     };
     snapshot();
     localDevice->PrimeBindlessDraw(stages);
