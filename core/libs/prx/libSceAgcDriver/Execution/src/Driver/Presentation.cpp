@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/Driver/ProgramStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
@@ -58,6 +59,9 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
     if (PerformanceTrace::Configured()) PerformanceTrace::Present(window.width, window.height, device.Load().get());
     PerformanceContext timingContext(window.timing.get());
     PerformanceTimer timing("Driver.Present");
+    if (auto& stats = ProgramStats::Global(); stats.Enabled()) {
+        for (const auto& line : stats.Present()) std::fprintf(stderr, "%s\n", line.c_str());
+    }
     static thread_local bool pinned = false;
     if (!pinned) {
         pinned = true;

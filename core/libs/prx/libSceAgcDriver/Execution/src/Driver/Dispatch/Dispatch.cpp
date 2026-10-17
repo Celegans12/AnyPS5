@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/ProgramStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/BufferCopy.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DwordPatternFill.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
@@ -142,6 +143,10 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
         explicit OriginScope(std::uint64_t program) { Graphics::Recorder::SetWriteOrigin(program); }
         ~OriginScope() { Graphics::Recorder::SetWriteOrigin(0); }
     } originScope(address);
+    if (ListedProgram(SkippedComputePrograms(), address)) {
+        if (!resolvingAhead()) ProgramStats::Global().NoteDispatch(address, {}, true);
+        return;
+    }
     auto registeredShader = RegisteredProgram(*submission.shaders, address, {0});
     if (!registeredShader) registeredShader = ReadRawShader(address);
     const auto& snapshot = *registeredShader;
@@ -566,6 +571,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
     }
     phaseTiming.Phase(PhaseQueuedLabels);
     const auto& compiled = *compiledResult;
+    if (auto& stats = ProgramStats::Global(); stats.Enabled()) stats.NoteDispatch(address, ProgramStatsImages(compiled, true), false);
     std::vector<Graphics::GuestMemorySnapshot> snapshots;
     for (const auto& region : captured) snapshots.push_back({region.guestAddress, region.bytes});
     std::array<std::uint32_t, 3> groups{packet[1], packet[2], packet[3]};
