@@ -5072,6 +5072,29 @@ void verifyBdaAnchors() {
             require(directLoads == (anchored ? loads : 0u), "BDA anchors: an anchored read does not load its dwords directly");
         }
     }
+    RecompileRequest plain{};
+    const std::vector<std::uint32_t> endOnly{0xbf810000u};
+    plain.shader = {ShaderStage::Compute, 0x60000u, endOnly, 0, {}};
+    plain.context.waveSize = 32;
+    plain.context.userDataBaseRegister = 0;
+    plain.context.userData = userData;
+    plain.context.compute = ShaderComputeStageInfo{{32u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
+    plain.target.vulkanVersion = 0x00401000u;
+    plain.target.spirvVersion = 0x00010300u;
+    plain.target.subgroupSize = 32;
+    plain.target.bdaAbiVersion = BdaAbi::Version;
+    plain.target.fragmentShaderBarycentricEnabled = false;
+    plain.layout.pushConstantSizeBytes = 128;
+    plain.useCache = false;
+    const auto plainWords = Recompile(plain).spirv;
+    for (std::size_t cursor = 5; cursor < plainWords.size();) {
+        const auto length = plainWords[cursor] >> 16u;
+        require(length != 0 && length <= plainWords.size() - cursor, "BDA anchors: truncated SPIR-V instruction");
+        const auto op = plainWords[cursor] & 0xffffu;
+        require(!(op == spv::OpTypeInt && plainWords[cursor + 2] == 64u), "BDA anchors: a program without anchors declares a 64-bit integer type");
+        require(!(op == spv::OpCapability && plainWords[cursor + 1] == spv::CapabilityInt64), "BDA anchors: a program without anchors requires Int64");
+        cursor += length;
+    }
 }
 
 void verifyFunctionLdsBound() {
