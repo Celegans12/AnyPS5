@@ -266,6 +266,7 @@ function(add_shader_recompiler target runtimeTarget)
             SampledTextureNumericClass
             SetDebugProbeActive
             ShaderCacheDirectory
+            ShaderDiskCache::SourceVersion
             ShaderStage
             SrgbDecodeBit
             SrgbUnormFormat
