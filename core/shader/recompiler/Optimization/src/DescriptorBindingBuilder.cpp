@@ -296,6 +296,14 @@ BufferSubstitute BufferSpecializationFields(const DescriptorValue& descriptor) {
     return {descriptor.dwords[1] & 0xffff0000u, descriptor.dwords[3], descriptor.dwords[0] & 3u, true};
 }
 
+BufferSubstitute SpecializedBufferFields(const BufferResource& buffer, IrShaderStage stage, const BufferSubstitute& fields) {
+    if (buffer.descriptorFormatted) return fields;
+    constexpr std::uint32_t shapeBits = 0xf0e00000u;
+    constexpr std::uint32_t formatPresent = 1u << 12u;
+    const auto word3 = !fields.known ? formatPresent : (fields.word3 & shapeBits) | (((fields.word3 >> 12u) & 0x7fu) != 0u ? formatPresent : 0u);
+    return {stage == IrShaderStage::Compute ? 0u : fields.word1, word3, fields.misalignment, true};
+}
+
 DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& layout, const ShaderInfo& info, IrShaderStage stage, const ResourceSnapshot& snapshot, std::span<const std::uint8_t> exportMappings, bool registrationModules, bool fragmentDescriptorSet, std::span<const BufferSubstitute> substitutes) const {
     if (stage == IrShaderStage::Pixel && exportMappings.size() != 8u) fail("fragment runtime export mappings are missing");
     if (info.images.size() > ShaderInfo::MaxImages) fail("runtime image count exceeds the static capacity");
@@ -326,7 +334,7 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
         if (descriptor.dwordCount != 4u) fail("buffer specialization requires four descriptor words");
         const auto& buffer = info.buffers[index];
         const bool present = BufferDescriptorPresent(descriptor);
-        const auto fields = present ? BufferSpecializationFields(descriptor) : index < substitutes.size() && substitutes[index].known ? substitutes[index] : BufferSubstitute{};
+        const auto fields = SpecializedBufferFields(buffer, stage, present ? BufferSpecializationFields(descriptor) : index < substitutes.size() && substitutes[index].known ? substitutes[index] : BufferSubstitute{});
         const auto format = (fields.word3 >> 12u) & 0x7fu;
         if (buffer.descriptorFormatted && (format > static_cast<std::uint32_t>(IrBufferFormat::Format32_32_32_32Float) || (fields.known && format == 0u))) fail("buffer specialization has an unsupported format");
         const auto misalignment = fields.misalignment;

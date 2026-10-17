@@ -952,7 +952,7 @@ std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& 
     for (std::size_t index = 0; index < variant.info.info.buffers.size(); ++index) {
         const auto& descriptor = snapshot.buffers.at(index);
         key.push_back(descriptor.dwordCount);
-        const auto fields = BufferDescriptorPresent(descriptor) ? BufferSpecializationFields(descriptor) : index < substitutes.size() && substitutes[index].known ? substitutes[index] : BufferSubstitute{};
+        const auto fields = SpecializedBufferFields(variant.info.info.buffers[index], variant.info.stage, BufferDescriptorPresent(descriptor) ? BufferSpecializationFields(descriptor) : index < substitutes.size() && substitutes[index].known ? substitutes[index] : BufferSubstitute{});
         key.push_back(fields.word1);
         key.push_back(fields.word3);
         key.push_back(fields.known ? 4u | fields.misalignment : 0u);
