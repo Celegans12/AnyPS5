@@ -116,6 +116,13 @@ void ConfigurePipelineReplay(int argc, char** argv) {
     const auto error = setenv("ANYPS5_SHADER_CACHE_DIR", selected.c_str(), 1);
 #endif
     if (error != 0) throw std::runtime_error("could not select the private pipeline cache directory");
+    // The tool's device is headless, which since d65cc07a1 starts with an empty VkPipelineCache: load the
+    // private directory's file so a pipeline the game already has is a hit, as before.
+#ifdef _WIN32
+    if (_putenv_s("APS5_PIPELINE_CACHE_LOAD", "1") != 0) throw std::runtime_error("could not request the pipeline cache load");
+#else
+    if (setenv("APS5_PIPELINE_CACHE_LOAD", "1", 1) != 0) throw std::runtime_error("could not request the pipeline cache load");
+#endif
     std::printf("pipeline-only cache: %s\nNVIDIA cache: %s\n", selected.c_str(), driverDirectory.string().c_str());
 }
 

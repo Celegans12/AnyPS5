@@ -1885,7 +1885,10 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     Graphics::BufferPool::SetCacheReclaim(Graphics::ReleaseTextureCaches);
     state->bufferPool = std::make_shared<Graphics::BufferPool>(graphicsContext());
     state->emptyBuffer = std::make_unique<Graphics::Buffer>(graphicsContext(), Graphics::EmptyBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    state->pipelineCache = std::make_unique<Graphics::PipelineCache>(graphicsContext(), state->properties, window != nullptr || compileOnly);
+    // A headless device starts with an empty cache (d65cc07a1), except for agc_shader_replay --pipeline-only, which
+    // precompiles against the game's file and must see its entries (APS5_PIPELINE_CACHE_LOAD=1, set by the tool).
+    const char* loadCache = std::getenv("APS5_PIPELINE_CACHE_LOAD");
+    state->pipelineCache = std::make_unique<Graphics::PipelineCache>(graphicsContext(), state->properties, window != nullptr || compileOnly || (loadCache != nullptr && std::string_view(loadCache) == "1"));
     state->detiler = std::make_unique<Graphics::TextureDetiler>(graphicsContext());
     state->textureCache = std::make_unique<Graphics::TextureCache>(graphicsContext());
     state->colorTransfer = std::make_unique<Graphics::GpuColorTransfer>(graphicsContext());
