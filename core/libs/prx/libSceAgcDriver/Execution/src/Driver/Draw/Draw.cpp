@@ -163,16 +163,27 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         ApplyBlendTint(state.blends, state.blendConstants, formats);
         decode = std::move(tinted);
     }
+    bool skipDepthOnly = false;
+    if (const auto item = DepthScheduleItem()) {
+        const auto& state = decode->state;
+        if (*item == 'p') {
+            skipDepthOnly = state.colors.empty() && !state.hasColorTarget && state.depth && ListedProgram(filterTargets, state.depth->address);
+        } else if (filtered && !filterTargets.empty() && state.depthTest && state.depthCompare == VK_COMPARE_OP_EQUAL) {
+            auto relaxed = std::make_shared<DrawDecode>(*decode);
+            relaxed->state.depthCompare = static_cast<VkCompareOp>(*item - '0');
+            decode = std::move(relaxed);
+        }
+    }
     if (auto& stats = ProgramStats::Global(); stats.Enabled()) {
         const auto& state = decode->state;
         std::vector<StatsTarget> colors;
         for (const auto& color : state.colors) colors.push_back({color.address, color.extent.width, color.extent.height, static_cast<std::uint32_t>(color.format), color.samples});
         if (colors.empty() && state.hasColorTarget) colors.push_back({state.color.address, state.color.extent.width, state.color.extent.height, static_cast<std::uint32_t>(state.color.format), state.color.samples});
         std::optional<StatsTarget> depth;
-        if (state.depth) depth = StatsTarget{state.depth->address, state.depth->extent.width, state.depth->extent.height, static_cast<std::uint32_t>(state.depth->format), state.depth->samples};
-        stats.NoteDraw(pixelProgram, vertexProgram, colors, depth, skipPixel, tintPixel);
+        if (state.depth) depth = StatsTarget{state.depth->address, state.depth->extent.width, state.depth->extent.height, static_cast<std::uint32_t>(state.depth->format), state.depth->samples, StatsDepthMode(state.depthTest, state.depthWrite, static_cast<std::uint32_t>(state.depthCompare))};
+        stats.NoteDraw(pixelProgram, vertexProgram, colors, depth, skipPixel || skipDepthOnly, tintPixel);
     }
-    if (skipPixel) return drawn();
+    if (skipPixel || skipDepthOnly) return drawn();
     const auto& graphics = decode->state;
     auto pixel = decode->pixel;
     std::vector<DrawProgram> programs = decode->programs;
