@@ -1402,6 +1402,10 @@ std::uint64_t vectorHeapBytes(const std::vector<TValue, TAllocator>& values) {
     else return values.capacity() * sizeof(TValue);
 }
 
+std::uint64_t vectorHeapBytes(const ElementFlags& flags) {
+    return flags.HeapBytes();
+}
+
 ResultMemoCounters& resultMemoCounters() {
     static ResultMemoCounters counters;
     return counters;

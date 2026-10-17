@@ -498,6 +498,8 @@ public:
         }
         while (count < size) push_back(flag);
     }
+    // Heap bytes held (the spill past the inline word), for the result memo's footprint.
+    std::size_t HeapBytes() const { return (spill.capacity() + 7u) / 8u; }
     const_iterator begin() const { return {this, 0}; }
     const_iterator end() const { return {this, count}; }
     bool operator==(const ElementFlags& other) const {
