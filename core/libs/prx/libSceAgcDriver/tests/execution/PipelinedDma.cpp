@@ -104,7 +104,8 @@ int main(int argc, char** argv) {
         for (const auto word : first) check(word == 0x5eed1234u, "the immediate fill did not land");
         for (std::size_t i = 0; i < second.size(); ++i) check(second[i] == (i < 128 ? 0x5eed1234u : 0u), "the copy did not see the fill before it, or wrote past its bytes");
         const auto stores = storesOnCpu.load() + storesOnGpu.load() + storesBehindCompletions.load() - cpuBefore;
-        check(stores == 2, "the DMA_DATA packets were not committed (" + std::to_string(stores) + " committed stores)");
+        // The worker path (APS5_NO_PIPELINE_DMA=1) stores without these commit counters; the data checks above hold.
+        if (!legacy) check(stores == 2, "the DMA_DATA packets were not committed (" + std::to_string(stores) + " committed stores)");
         if (!legacy) check(storesDrained.load() == drainedBefore, "a DMA_DATA packet still drained");
 
         const auto source = reinterpret_cast<std::uint64_t>(first.data());
