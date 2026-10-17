@@ -37,6 +37,9 @@ bool ListedProgram(const ProgramList& list, std::uint64_t address);
 const ProgramList& SkippedPixelPrograms();
 const ProgramList& TintedPixelPrograms();
 const ProgramList& SkippedComputePrograms();
+// APS5_PROGRAM_TARGETS=<hex[-hex],...>: when set, the pixel skip and tint lists only apply to draws with a colour
+// target at a listed address.
+const ProgramList& ProgramFilterTargets();
 
 bool BlendableAttachmentFormat(VkFormat format);
 // Each blend state whose attachment format (formats[i], VK_FORMAT_UNDEFINED for none) is blendable and whose

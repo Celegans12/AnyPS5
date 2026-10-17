@@ -109,6 +109,11 @@ const ProgramList& TintedPixelPrograms() {
     return list;
 }
 
+const ProgramList& ProgramFilterTargets() {
+    static const auto& list = listFromEnvironment("APS5_PROGRAM_TARGETS");
+    return list;
+}
+
 const ProgramList& SkippedComputePrograms() {
     static const auto& list = listFromEnvironment("APS5_SKIP_COMPUTE_PROGRAMS");
     return list;
