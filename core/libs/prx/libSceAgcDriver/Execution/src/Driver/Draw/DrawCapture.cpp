@@ -104,7 +104,11 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     phaseTiming.Phase(DrawRowRecompile);
     return stageCapture.compiled;
 } catch (const std::exception& error) {
-    if (!SkipRefusedShaders() || dynamic_cast<const Graphics::LiveSnapshotInvalidated*>(&error) != nullptr) throw;
+    if (dynamic_cast<const Graphics::LiveSnapshotInvalidated*>(&error) != nullptr) throw;
+    if (!SkipRefusedShaders()) {
+        if (dynamic_cast<const ShaderRefusal*>(&error) != nullptr || !SkipRefusedGraphicsRecompile(static_cast<std::uint32_t>(programs[i].binary.stage), error.what())) throw;
+        throw ShaderRefusal(RefusedShaderSubject(static_cast<std::uint32_t>(programs[i].binary.stage), programs[i].binary.codeAddress) + ": skipping its draws: " + error.what());
+    }
     std::string reason = error.what();
     if (const auto newline = reason.find('\n'); newline != std::string::npos) reason.resize(newline);
     throw ShaderRefusal(RefusedShaderSubject(static_cast<std::uint32_t>(programs[i].binary.stage), programs[i].binary.codeAddress) + ": " + reason);

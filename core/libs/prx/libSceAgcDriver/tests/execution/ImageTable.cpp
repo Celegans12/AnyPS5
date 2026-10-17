@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchCache.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
@@ -2227,6 +2228,9 @@ void RunPixelRuntimeAddressTests(AgcDriver::VulkanDevice& device) {
             reason = error.what();
         }
         Require(reason.find("GetImageResource dword 0 is not a valid runtime value") != std::string::npos, "runtime image address pixel: without the bindless heap the T# behind a waterfall pointer was not refused: " + reason);
+        Require(AgcDriver::DriverDetail::SkipRefusedGraphicsRecompile(static_cast<std::uint32_t>(ShaderStage::Fragment), reason.c_str()), "runtime image address pixel: the refused pixel shader would fail its queue instead of skipping its draws");
+        Require(!AgcDriver::DriverDetail::SkipRefusedGraphicsRecompile(static_cast<std::uint32_t>(ShaderStage::Compute), reason.c_str()), "runtime image address pixel: a refused compute shader would be skipped by default");
+        Require(!AgcDriver::DriverDetail::SkipRefusedGraphicsRecompile(static_cast<std::uint32_t>(ShaderStage::Fragment), "AGC graphics: vkQueueSubmit recorder: Vulkan result -4"), "runtime image address pixel: a device failure would be skipped as a recompiler refusal");
         std::puts("runtime image address pixel: refused without the bindless heap");
         return;
     }

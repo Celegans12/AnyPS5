@@ -5,6 +5,7 @@
 #include "ControlFlow/RequestSerializer.hpp"
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -61,6 +62,11 @@ void Driver::reportSkip(const char* kind, const std::string& what) {
 bool SkipRefusedShaders() {
     static const bool skip = [] { const char* text = std::getenv("APS5_SKIP_REFUSED_SHADERS"); return text != nullptr && std::atoi(text) != 0; }();
     return skip;
+}
+
+bool SkipRefusedGraphicsRecompile(std::uint32_t stage, const char* what) {
+    static const bool strict = [] { const char* text = std::getenv("APS5_STRICT_SHADER_REFUSALS"); return text != nullptr && std::atoi(text) != 0; }();
+    return !strict && stage != static_cast<std::uint32_t>(ShaderRecompiler::ShaderStage::Compute) && what != nullptr && std::strstr(what, "ShaderRecompiler::Recompile: ") != nullptr;
 }
 
 bool SkipListedShader(std::uint64_t address) {
