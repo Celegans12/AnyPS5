@@ -329,6 +329,16 @@ std::string CheckPipelineReference(const char* path, const ShaderRecompiler::Rec
     const auto layout = device.PlannedComputeLayoutKey(result);
     const auto components = AgcDriver::ComputePipelineFingerprintComponents(result, layout);
     std::printf("  pipeline fingerprint: %s\n", Hex(components.whole).c_str());
+    if (g_noReference) {
+        if (sidecar.present) {
+            const auto found = sidecar.values.find("fingerprint");
+            const bool same = found != sidecar.values.end() && found->second == Hex(components.whole);
+            const auto difference = same ? std::string() : DescribeDifference(sidecar, result, components, layout);
+            std::printf("  game sidecar (not checked, --no-reference): %s%s%s\n", same ? "fingerprint matches" : "fingerprint differs", difference.empty() ? "" : ": ", difference.c_str());
+        }
+        std::printf("  no reference (--no-reference): this replay's own SPIR-V; only a hit in the game's cache proves it is the game's pipeline\n");
+        return {};
+    }
     if (sidecar.present) {
         const auto found = sidecar.values.find("fingerprint");
         if (found == sidecar.values.end()) return "sidecar of " + std::string(path) + " has no fingerprint";
@@ -337,10 +347,6 @@ std::string CheckPipelineReference(const char* path, const ShaderRecompiler::Rec
             return "fingerprint differs from the game's (" + found->second + " in the .fp of " + path + ")" + (difference.empty() ? std::string() : ": " + difference);
         }
         std::printf("  game fingerprint matches\n");
-        return {};
-    }
-    if (g_noReference) {
-        std::printf("  no reference (--no-reference): this replay's own SPIR-V; only a hit in the game's cache proves it is the game's pipeline\n");
         return {};
     }
     if (g_expectedSpirv.empty()) return "no reference: give --expect-spv or --no-reference, or keep the request's .fp sidecar next to it";
