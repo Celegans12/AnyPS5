@@ -64,6 +64,13 @@ void Tint() {
     Check(ApplyBlendTint(none, untouched, formats) == 0 && untouched[0] == 0.25f, "a draw with nothing to tint changes its constants");
 }
 
+void Bisect() {
+    Check(!BisectBitForPresent(0, 84, 10) && !BisectBitForPresent(849, 84, 10) && !BisectBitForPresent(853, 84, 10), "frames up to the reference dump skip");
+    Check(BisectBitForPresent(854, 84, 10) == 0u && BisectBitForPresent(859, 84, 10) == 0u && BisectBitForPresent(863, 84, 10) == 0u, "frame dump 85 (drawn at present 859) is not bit 0");
+    Check(BisectBitForPresent(949, 84, 10) == 9u && !BisectBitForPresent(954, 84, 10), "the last bit or the trailing reference is wrong");
+    Check(ProgramBisectHash(0x80233b7000ull) != ProgramBisectHash(0x80233b7100ull) && ProgramBisectHash(0x80233b7000ull) == ProgramBisectHash(0x80233b7000ull), "the hash does not separate neighbouring programs");
+}
+
 void Stats() {
     ProgramStats off(0);
     off.NoteDraw(1, 2, {}, std::nullopt, false, false);
@@ -106,6 +113,7 @@ int main() {
     try {
         Lists();
         Tint();
+        Bisect();
         Stats();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
