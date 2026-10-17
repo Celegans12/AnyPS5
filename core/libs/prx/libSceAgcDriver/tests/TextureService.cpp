@@ -1131,6 +1131,76 @@ void driverTests(const Device& device) {
     recorder.FlushDeferredReleases();
 }
 
+void r128Tests(const Device& device) {
+    using ShaderRecompiler::ResourceMaterializer;
+    auto context = device.GetContext();
+    AgcDriver::Graphics::TextureDetiler detiler(context);
+    context.detiler = &detiler;
+    GuestBlock block;
+    ShaderRecompiler::ImageResource image{};
+    image.resourceClass = ShaderRecompiler::ImageResourceClass::Sampled;
+    image.dimension = ShaderRecompiler::RdnaImageDimension::Dim2D;
+    image.read = true;
+    auto wide = image;
+    image.r128 = true;
+    const auto modes = ResourceMaterializer::RuntimeImageModes(image);
+    const auto wideModes = ResourceMaterializer::RuntimeImageModes(wide);
+    const std::uint64_t Interface = ResourceMaterializer::RegisterBindlessInterface(image, modes);
+    const std::uint64_t WideInterface = ResourceMaterializer::RegisterBindlessInterface(wide, wideModes);
+    Require(Interface != WideInterface, "a 128-bit image interface shares its id with the 256-bit one");
+    constexpr std::uint32_t StreamedSide = 512u;
+    constexpr std::uint32_t StreamedBase = 2u;
+    constexpr std::uint32_t StreamedLast = 9u;
+    auto streamed = GuestDescriptor(block.Surface(0u), StreamedSide);
+    streamed[3] |= (StreamedBase << 12u) | (StreamedLast << 16u);
+    auto chain = GuestDescriptor(block.Surface(4u), GuestBlock::SurfaceSide);
+    chain[3] |= 7u << 16u;
+    const auto residentBytes = AgcDriver::Graphics::DescribeSurface(AgcDriver::Graphics::DecodeTextureResource(AgcDriver::Graphics::R128TextureWords(streamed))).guestBytes;
+    auto fullWords = streamed;
+    fullWords[3] &= ~(0xfu << 12u);
+    const auto fullBytes = AgcDriver::Graphics::DescribeSurface(AgcDriver::Graphics::DecodeTextureResource(AgcDriver::Graphics::R128TextureWords(fullWords))).guestBytes;
+    Require(residentBytes <= GuestBlock::SurfaceBytes * 4u && fullBytes > GuestBlock::Bytes, "the streamed T#'s resident levels must fit the guest block and its whole chain must not");
+    std::vector<std::uint32_t> words(16u, 0u);
+    std::copy(streamed.begin(), streamed.end(), words.begin());
+    std::copy(chain.begin(), chain.end(), words.begin() + 8);
+    struct ClearTextures {
+        VkDevice device;
+        ~ClearTextures() { AgcDriver::Graphics::ClearCachedTextures(device); }
+    } clearTextures{context.device};
+    const auto capacities = DescriptorHeap::DeviceCapacities(context);
+    BindlessTable table(context, DescriptorHeap::Capacities{std::min(capacities.samplers, 64u), std::min(capacities.sampledImages, 1024u), std::min(capacities.storageImages, 64u)});
+    Recorder recorder(context, device.Timeline());
+    recorder.Activate();
+    std::unique_lock gpu(AgcDriver::GuestMemory::GpuMutex());
+    {
+        TextureService::Options options;
+        options.worker = false;
+        TextureService service(table, std::make_shared<AgcDriver::Graphics::DriverBindlessResolver>(context), std::make_shared<AgcDriver::Graphics::GuestBindlessMemory>(), options);
+        auto serving = context;
+        serving.textureService = &service;
+        const std::array<BindlessTableRegistration, 1> tables{BindlessTableRegistration{reinterpret_cast<std::uint64_t>(words.data()), 2u, 32u, {BindlessUse{Interface, 0u, {}}, BindlessUse{WideInterface, 0u, {}}}}};
+        AgcDriver::Graphics::PrimeBindlessTables(serving, tables);
+        AgcDriver::Graphics::ServeBindlessTables(serving, recorder, tables);
+        const auto levels = [&](const std::array<std::uint32_t, 8>& descriptor, std::uint64_t id, const char* name) {
+            const auto key = Abi::MakeKey(std::span<const std::uint32_t, 8>(descriptor.data(), 8u), id, 0u);
+            const auto value = service.Find(key);
+            Require(value.has_value() && value->fault == 0u, std::string(name) + " was refused: " + (value.has_value() ? service.Rejection(value->fault).value_or("") : std::string("no entry")));
+            const auto texture = std::static_pointer_cast<AgcDriver::Graphics::Texture>(service.Owner(key));
+            Require(texture != nullptr && table.Heap().Live(DescriptorHeap::Array::SampledImages, value->slot), std::string(name) + " has no live texture");
+            return std::make_pair(texture, texture->SampledViewRange(false).levels);
+        };
+        const auto [streamedTexture, streamedLevels] = levels(streamed, Interface, "a 128-bit T# of levels 2..9 of a 512x512 chain whose levels 0 and 1 are not resident");
+        Require(streamedLevels == StreamedLast - StreamedBase + 1u && streamedTexture.get() == AgcDriver::Graphics::CachedSampledTexture(context, AgcDriver::Graphics::R128TextureWords(streamed)).get(), "the streamed 128-bit T# did not read as the 128x128 chain of its 8 resident levels: " + std::to_string(streamedLevels) + " levels");
+        const auto [chainTexture, chainLevels] = levels(chain, Interface, "a 128-bit T# of levels 0..7");
+        const auto [wideTexture, wideLevels] = levels(chain, WideInterface, "a 256-bit T# of levels 0..7 with MAX_MIP 0");
+        Require(chainLevels == 8u && wideLevels == 1u && chainTexture != wideTexture, "a 128-bit T# must take its 8 levels from LAST_LEVEL while the same 256-bit T# keeps MAX_MIP's one level: " + std::to_string(chainLevels) + " and " + std::to_string(wideLevels) + " levels");
+        recorder.Sync();
+        std::cout << "128-bit T#s: a streamed T# past MAX_MIP reads its " << streamedLevels << " resident levels, a full one its " << chainLevels << " levels from LAST_LEVEL\n";
+    }
+    recorder.Sync();
+    recorder.FlushDeferredReleases();
+}
+
 int flagTests(bool on) {
     const auto device = [] {
         try {
@@ -1165,6 +1235,7 @@ int main(int argc, char** argv) {
         }
         if (mode == "--driver") {
             driverTests(*device);
+            r128Tests(*device);
             return 0;
         }
         serviceTests(*device);
