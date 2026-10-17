@@ -169,12 +169,12 @@ void Expect(const std::uint32_t* input, const std::uint32_t* output, std::uint32
 }
 
 struct Step {
-    std::uint64_t checked, exact, moved, refused;
+    std::uint64_t checked, exact, moved, refused, rebuilt, kept, served;
 };
 
 Step Since(const AgcDriver::VulkanDevice::DispatchMoveCount& before) {
     const auto now = AgcDriver::VulkanDevice::DispatchMoveCounts();
-    return {now.checked - before.checked, now.exact - before.exact, now.moved - before.moved, now.refused - before.refused};
+    return {now.checked - before.checked, now.exact - before.exact, now.moved - before.moved, now.refused - before.refused, now.rebuilt - before.rebuilt, now.kept - before.kept, now.served - before.served};
 }
 
 void Print(const char* what, const Step& step) {
@@ -236,11 +236,33 @@ bool RunTests(AgcDriver::VulkanDevice& device, const GuestBlock& guest) {
     Expect(guest.InputA(), guest.OutputO(), 2u * Constant, "an input moved onto a range a recorded dispatch still writes");
     const auto refused = Since(refusals);
     Print("two inputs moved onto written ranges", refused);
-    if (templates) Require(refused.refused == 2, "dispatch move: the inputs moved onto written ranges were not both refused");
+    if (templates) {
+        Require(refused.refused == 2, "dispatch move: the inputs moved onto written ranges were not both refused");
+        Require(refused.rebuilt == 2 && refused.kept == 2 && refused.served == 0, "dispatch move: the two refusals were not two rebuilds inserted beside the template");
+    }
 
+    const auto afterRefusals = AgcDriver::VulkanDevice::DispatchMoveCounts();
     Reset(guest.OutputO());
     Run(device, compiled, guest.InputA(), Bytes, guest.OutputO(), true);
     Expect(guest.InputA(), guest.OutputO(), Constant, "the input moved back after the refusals");
+    const auto back = Since(afterRefusals);
+    Print("the input back after the refusals", back);
+    if (templates) Require(back.checked == 1 && back.exact == 1 && back.moved == 0 && back.refused == 0 && back.rebuilt == 0, "dispatch move: the input back at the template's address was not an exact hit after the refusals");
+
+    for (int round = 0; round < 2; ++round) {
+        const auto alternating = AgcDriver::VulkanDevice::DispatchMoveCounts();
+        Reset(guest.OutputO());
+        Reset(guest.OutputP());
+        Run(device, compiled, guest.InputA(), Bytes, guest.OutputP(), false);
+        Run(device, compiled, guest.OutputP(), Bytes, guest.OutputO(), true);
+        Expect(guest.InputA(), guest.OutputO(), 2u * Constant, "an input refused again while A alternates");
+        Reset(guest.OutputO());
+        Run(device, compiled, guest.InputA(), Bytes, guest.OutputO(), true);
+        Expect(guest.InputA(), guest.OutputO(), Constant, "the input at A after the refused one");
+        const auto step = Since(alternating);
+        Print("A alternating with a refused input", step);
+        if (templates) Require(step.refused == 1 && step.served == 1 && step.rebuilt == 0 && step.exact == 2 && step.moved == 0, "dispatch move: a refused input rebuilt, or evicted the template of A, while A alternated with it");
+    }
     const auto total = AgcDriver::VulkanDevice::DispatchMoveCounts();
     std::printf("dispatch move: in total: checked %llu, exact %llu, moved %llu, refused %llu, dropped by stage A %llu\n", static_cast<unsigned long long>(total.checked), static_cast<unsigned long long>(total.exact), static_cast<unsigned long long>(total.moved), static_cast<unsigned long long>(total.refused), static_cast<unsigned long long>(total.filtered));
     return templates;
