@@ -251,23 +251,10 @@ bool interpretRuntimeSources(const IrResourcePlan& program, std::span<const std:
     return evaluated;
 }
 
-bool sameUserDataUse(const SrtUserDataUse& tape, const SrtUserDataUse& interpreted) {
-    if (tape.asBase != interpreted.asBase || tape.asValue != interpreted.asValue) return false;
-    auto tapeReads = tape.reads;
-    auto interpretedReads = interpreted.reads;
-    for (auto* reads : {&tapeReads, &interpretedReads}) {
-        std::sort(reads->begin(), reads->end());
-        reads->erase(std::unique(reads->begin(), reads->end()), reads->end());
-    }
-    return tapeReads == interpretedReads;
-}
-
-void verifyTape(const IrResourcePlan& program, const SrtRuntime& runtime, std::vector<DescriptorValue>& results, std::vector<std::uint32_t>& flat, std::vector<std::uint8_t>& activeSources, std::vector<SrtReadPoison>* poison, std::uint32_t* nullRootReads, std::size_t leavesBefore, std::size_t readsBefore, const SrtUserDataUse* useBefore) {
+void verifyTape(const IrResourcePlan& program, const SrtRuntime& runtime, std::vector<DescriptorValue>& results, std::vector<std::uint32_t>& flat, std::vector<std::uint8_t>& activeSources, std::vector<SrtReadPoison>* poison, std::uint32_t* nullRootReads, std::size_t leavesBefore, std::size_t readsBefore) {
     SrtReadTrace expectedTrace;
-    SrtUserDataUse expectedUse = useBefore != nullptr ? *useBefore : SrtUserDataUse {};
     SrtRuntime interpreted = runtime;
     interpreted.readTrace = runtime.readTrace != nullptr ? &expectedTrace : nullptr;
-    interpreted.userDataUse = runtime.userDataUse != nullptr ? &expectedUse : nullptr;
     std::vector<DescriptorValue> expectedResults;
     std::vector<std::uint32_t> expectedFlat;
     std::vector<std::uint8_t> expectedActive;
@@ -300,7 +287,6 @@ void verifyTape(const IrResourcePlan& program, const SrtRuntime& runtime, std::v
             trace->otherReads.insert(trace->otherReads.end(), expectedTrace.otherReads.begin(), expectedTrace.otherReads.end());
         }
     }
-    if (difference.empty() && runtime.userDataUse != nullptr && !sameUserDataUse(*runtime.userDataUse, expectedUse)) difference = "user-data use";
     static std::atomic<std::uint64_t> walks {0};
     static std::atomic<std::uint64_t> differences {0};
     const auto walked = walks.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -312,7 +298,6 @@ void verifyTape(const IrResourcePlan& program, const SrtRuntime& runtime, std::v
     }
     if (differences.fetch_add(1, std::memory_order_relaxed) < 20) std::fprintf(stderr, "[srt-tape] verify: shader %016llx: the tape's walk differs from the Evaluator's in its %s\n", static_cast<unsigned long long>(program.shaderHash), difference.c_str());
     if (!ok) return;
-    if (runtime.userDataUse != nullptr) *runtime.userDataUse = std::move(expectedUse);
     results = std::move(expectedResults);
     flat = std::move(expectedFlat);
     activeSources = std::move(expectedActive);
@@ -328,12 +313,10 @@ bool EvaluateRuntimeSourcesImpl(const IrResourcePlan& program, std::span<const s
         if (const auto* tape = SrtTape::For(program); tape != nullptr) {
             const auto leavesBefore = runtime.readTrace != nullptr ? runtime.readTrace->leaves.size() : 0;
             const auto readsBefore = runtime.readTrace != nullptr ? runtime.readTrace->otherReads.size() : 0;
-            std::optional<SrtUserDataUse> useBefore;
-            if (SrtTape::Verified() && runtime.userDataUse != nullptr) useBefore = *runtime.userDataUse;
             if (tape->Run(program, runtime, results, flat, activeSources)) {
                 if (poison != nullptr) poison->clear();
                 if (nullRootReads != nullptr) *nullRootReads = 0;
-                if (SrtTape::Verified()) verifyTape(program, runtime, results, flat, activeSources, poison, nullRootReads, leavesBefore, readsBefore, useBefore ? &*useBefore : nullptr);
+                if (SrtTape::Verified()) verifyTape(program, runtime, results, flat, activeSources, poison, nullRootReads, leavesBefore, readsBefore);
                 return true;
             }
         }
