@@ -4633,7 +4633,8 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         }
     }
     context.Resolved(&Graphics::DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->pipeline);
-    if (record.bindings != nullptr && record.bindings->allocation.set != VK_NULL_HANDLE) context.Resolved(&Graphics::DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout, 0, 1, &record.bindings->allocation.set, 0, nullptr);
+    if (record.bindings != nullptr) Graphics::Require(record.bindings->allocation.set != VK_NULL_HANDLE, "dispatch overlay has no descriptor set");
+    if (record.bindings != nullptr) context.Resolved(&Graphics::DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout, 0, 1, &record.bindings->allocation.set, 0, nullptr);
     else resources.Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout);
     if (record.shader->program->bindlessHeap) context.bindlessTable->Heap().Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout, VK_SHADER_STAGE_COMPUTE_BIT);
     if (const auto dwords = record.shader->program->workgroupMemoryDwords; dwords != 0) {
@@ -5082,6 +5083,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
                     moves.checked.fetch_add(1, std::memory_order_relaxed);
                     if (moved.has_value() && !moved->empty()) {
                         overlay = cached->PrepareDrawBindings(*state->recorder, *moved, true);
+                        if (overlay != nullptr && overlay->allocation.set == VK_NULL_HANDLE) overlay.reset();
                         if (overlay == nullptr) {
                             proof.refusal = Graphics::ShaderResources::MoveRefusal::Bindings;
                             moved.reset();
