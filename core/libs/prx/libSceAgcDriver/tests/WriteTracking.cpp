@@ -10,6 +10,7 @@
 #else
 #include <sys/mman.h>
 #endif
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdint>
@@ -1195,6 +1196,66 @@ void CheckBlocksMatchSinceCommitted() {
     Require(!matches(synced) && match.hashed >= 1, "a decommitted block still matches its old bytes");
 }
 
+void CheckUntrackedBlocks() {
+    using AgcDriver::ContentHash::Hash128;
+    constexpr std::size_t Blocks = 3;
+    void* watched = AllocateWatched(Blocks * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(watched);
+    auto* bytes = static_cast<std::uint8_t*>(watched);
+    std::vector<std::uint8_t> stale(Blocks);
+    const std::vector<std::uint8_t> none(Blocks, 0);
+    UntrackedBlocks kinds;
+    const auto staleCount = [&] { return static_cast<std::size_t>(std::count(stale.begin(), stale.end(), std::uint8_t{1})); };
+    auto since = WalkUntrackedBlocks(base, Blocks * Block, 0, stale, &kinds);
+    Require(since != 0 && staleCount() == Blocks && kinds.covered == Blocks, "a first untracked walk trusted a block");
+    auto next = WalkUntrackedBlocks(base, Blocks * Block, since, stale, &kinds);
+    Require(next >= since && staleCount() == 0, "an untouched watched block read as stale");
+    StoreSame(bytes + Block + 77);
+    const auto stored = WalkUntrackedBlocks(base, Blocks * Block, next, stale, &kinds);
+    Require(stale[0] == 0 && stale[1] == 1 && stale[2] == 0 && stored > next, "a CPU store did not make exactly its block stale");
+    std::vector<Hash128> hashes(HashBlockCount(base, Blocks * Block));
+    HashCommittedBlocks(base, Blocks * Block, hashes);
+    BlockMatch match;
+    Require(CommittedBlocksMatchMarked(base, Blocks * Block, hashes, stale, &match) && match.hashed == 1 && match.skipped == Blocks - 1, "a marked compare hashed other blocks");
+    bytes[2 * Block + 3] ^= 0x10;
+    Require(CommittedBlocksMatchMarked(base, Blocks * Block, hashes, none, &match) && match.hashed == 0, "an unmarked compare hashed a block");
+    std::vector<std::uint8_t> last(Blocks, 0);
+    last[2] = 1;
+    Require(!CommittedBlocksMatchMarked(base, Blocks * Block, hashes, last, &match), "a marked changed block still matches");
+    bytes[2 * Block + 3] ^= 0x10;
+    std::array<std::uint8_t, 64> host{};
+    std::vector<std::uint8_t> hostStale(1);
+    WalkUntrackedBlocks(reinterpret_cast<std::uint64_t>(host.data()), host.size(), stored, hostStale, &kinds);
+    Require(hostStale[0] == 1 && kinds.covered == 0 && kinds.hinted == 0, "memory outside the watch was trusted");
+#ifdef _WIN32
+    constexpr std::size_t mixedBytes = 4 * Block;
+    auto* memory = static_cast<volatile std::uint8_t*>(AllocateWatched(mixedBytes));
+    const auto mixed = reinterpret_cast<std::uint64_t>(memory);
+    for (std::size_t offset = 0; offset < mixedBytes; offset += 4096) memory[offset] = 0x21;
+    CollectNow(mixed, mixedBytes);
+    Unwatch(mixed + Block, 2 * Block);
+    Require(UntrackedHint(mixed, mixedBytes) == 0 && CollectWrites(mixed, mixedBytes) == 0, "the mixed range is tracked as a whole");
+    std::vector<std::uint8_t> mixedStale(4);
+    since = WalkUntrackedBlocks(mixed, mixedBytes, 0, mixedStale, &kinds);
+    Require(since != 0 && kinds.covered == 2 && kinds.hinted == 2, "the mixed range's blocks were not classified");
+    next = WalkUntrackedBlocks(mixed, mixedBytes, since, mixedStale, &kinds);
+    Require(std::count(mixedStale.begin(), mixedStale.end(), std::uint8_t{1}) == 0, "an untouched mixed range read as stale");
+    memory[2 * Block + 4096 + 9] = memory[2 * Block + 4096 + 9];
+    auto after = WalkUntrackedBlocks(mixed, mixedBytes, next, mixedStale, &kinds);
+    Require(mixedStale[0] == 0 && mixedStale[1] == 0 && mixedStale[2] == 1 && mixedStale[3] == 0, "a CPU store into a hinted block did not make exactly it stale");
+    memory[3 * Block + 5] = memory[3 * Block + 5];
+    after = WalkUntrackedBlocks(mixed, mixedBytes, after, mixedStale, &kinds);
+    Require(mixedStale[0] == 0 && mixedStale[1] == 0 && mixedStale[2] == 0 && mixedStale[3] == 1, "a CPU store into a watched block of the mixed range did not make exactly it stale");
+    Require(MarkWritten(mixed + Block + 64, 8) == 0, "a driver store into an unwatched block was stamped");
+    WalkUntrackedBlocks(mixed, mixedBytes, after, mixedStale, &kinds);
+    Require(mixedStale[1] == 1, "a driver store into an unwatched block did not make it stale");
+    after = WalkUntrackedBlocks(mixed, mixedBytes, 0, mixedStale, &kinds);
+    Unwatch(mixed, Block);
+    WalkUntrackedBlocks(mixed, mixedBytes, after, mixedStale, &kinds);
+    Require(mixedStale[0] == 1 && kinds.hinted == 3, "a block leaving the watch was trusted");
+#endif
+}
+
 void BenchBlocksMatchSince() {
     using AgcDriver::ContentHash::Hash128;
     constexpr std::size_t Bytes = 4u << 20u;
@@ -1236,6 +1297,30 @@ void BenchBlocksMatchSince() {
     time("every block written", [&](int) {
         for (std::size_t at = 0; at < Bytes; at += Block) StoreSame(bytes + at);
     });
+#ifdef _WIN32
+    Unwatch(base, Bytes / 2);
+    double fullUs = 0.0;
+    double walkUs = 0.0;
+    std::size_t hashed = 0;
+    std::vector<std::uint8_t> stale(hashes.size());
+    auto since = WalkUntrackedBlocks(base, Bytes, 0, stale);
+    for (int round = 0; round < Rounds; ++round) {
+        StoreSame(bytes + static_cast<std::size_t>(round) * 9973u % Bytes);
+        const auto first = std::chrono::steady_clock::now();
+        const bool full = CommittedBlocksMatch(base, Bytes, hashes);
+        const auto second = std::chrono::steady_clock::now();
+        const auto next = WalkUntrackedBlocks(base, Bytes, since, stale);
+        BlockMatch match;
+        const bool marked = CommittedBlocksMatchMarked(base, Bytes, hashes, stale, &match);
+        const auto third = std::chrono::steady_clock::now();
+        Require(full && marked && next != 0, "the untracked benchmark surface changed");
+        since = next;
+        fullUs += std::chrono::duration<double, std::micro>(second - first).count();
+        walkUs += std::chrono::duration<double, std::micro>(third - second).count();
+        hashed += match.hashed;
+    }
+    std::cout << "[bench] half unwatched (hinted), one CPU store: 4 MiB snapshot check, full hash " << fullUs / Rounds << " us, block walk + written blocks " << walkUs / Rounds << " us (" << static_cast<double>(hashed) / Rounds << " of " << hashes.size() << " blocks hashed)\n";
+#endif
 }
 
 int main(int argc, char** argv) {
@@ -1282,6 +1367,7 @@ int main(int argc, char** argv) {
         CheckCommittedRanges();
         CheckBlocksMatchSince();
         CheckBlocksMatchSinceCommitted();
+        CheckUntrackedBlocks();
     } catch (const std::exception& error) {
         std::cerr << "write tracking test failed: " << error.what() << "\n";
         return 1;

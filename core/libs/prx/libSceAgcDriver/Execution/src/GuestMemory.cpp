@@ -1717,6 +1717,77 @@ std::uint64_t UntrackedHint(std::uint64_t address, std::size_t bytes) {
 #endif
 }
 
+std::uint64_t WalkUntrackedBlocks(std::uint64_t address, std::size_t bytes, std::uint64_t previous, std::span<std::uint8_t> stale, UntrackedBlocks* kinds) {
+    std::fill(stale.begin(), stale.end(), std::uint8_t{1});
+    if (kinds != nullptr) *kinds = {};
+    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || stale.size() != HashBlockCount(address, bytes)) return 0;
+    enum class Kind : std::uint8_t { Covered, Hinted, Outside, HostRegion, Unhinted, Refused };
+    thread_local std::vector<Kind>* kindSlot = nullptr;
+    auto& blockKinds = ShaderRecompiler::ThreadOwned(kindSlot);
+    blockKinds.assign(stale.size(), Kind::Unhinted);
+    constexpr std::uint64_t page = 4096;
+    const auto end = address + bytes;
+    const auto blockRange = [&](std::size_t index) {
+        const auto begin = index == 0 ? address : (address / HashBlockBytes + index) * HashBlockBytes;
+        return std::pair<std::uint64_t, std::uint64_t>{begin, std::min<std::uint64_t>(end, (address / HashBlockBytes + index + 1) * HashBlockBytes)};
+    };
+    auto& tracker = Tracker();
+    const auto lock = lockTracker(tracker);
+    tracker.initialize();
+    if (!tracker.watched) return 0;
+    for (std::size_t index = 0; index < stale.size(); ++index) {
+        const auto [begin, stop] = blockRange(index);
+        const auto first = begin & ~(page - 1);
+        const auto last = (stop + page - 1) & ~(page - 1);
+        auto& kind = blockKinds[index];
+        if (tracker.covers(first, static_cast<std::size_t>(last - first))) kind = Kind::Covered;
+#ifdef _WIN32
+        else if (first < tracker.base || last > tracker.base + tracker.size) kind = Kind::Outside;
+        else if (GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(last - first))) kind = Kind::HostRegion;
+        else if (tracker.hinted(first, last)) kind = Kind::Hinted;
+#endif
+    }
+    for (std::size_t index = 0; index < stale.size();) {
+        const auto kind = blockKinds[index];
+        auto next = index + 1;
+        while (next < stale.size() && blockKinds[next] == kind) ++next;
+        if (kind == Kind::Covered || kind == Kind::Hinted) {
+            const auto first = blockRange(index).first & ~(page - 1);
+            const auto last = (blockRange(next - 1).second + page - 1) & ~(page - 1);
+            bool walked = false;
+            if (kind == Kind::Covered) walked = walkWrites(tracker, first, last, StampKind::Cpu);
+#ifdef _WIN32
+            else walked = walkHints(tracker, first, last);
+#endif
+            if (!walked) {
+                for (auto k = index; k < next; ++k) blockKinds[k] = Kind::Refused;
+            }
+        }
+        index = next;
+    }
+    for (std::size_t index = 0; index < stale.size(); ++index) {
+        const auto kind = blockKinds[index];
+        if (kinds != nullptr) {
+            switch (kind) {
+                case Kind::Covered: ++kinds->covered; break;
+                case Kind::Hinted: ++kinds->hinted; break;
+                case Kind::Outside: ++kinds->outside; break;
+                case Kind::HostRegion: ++kinds->hostRegion; break;
+                case Kind::Unhinted: ++kinds->unhinted; break;
+                case Kind::Refused: ++kinds->refused; break;
+            }
+        }
+        if (previous == 0 || (kind != Kind::Covered && kind != Kind::Hinted)) continue;
+        const auto [begin, stop] = blockRange(index);
+        if (tracker.newestStamp(begin, stop) > previous) continue;
+#ifdef _WIN32
+        if (kind == Kind::Hinted && tracker.newestHint(begin & ~(page - 1), (stop + page - 1) & ~(page - 1)) > previous) continue;
+#endif
+        stale[index] = 0;
+    }
+    return tracker.generation.load(std::memory_order_relaxed);
+}
+
 bool UnchangedSinceCollected(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
     if (CollectWritesUncached(address, bytes) == 0) return false;
     auto& tracker = Tracker();
@@ -2413,6 +2484,32 @@ bool sameClippedRuns(const std::vector<std::pair<std::uint64_t, std::uint64_t>>*
     return fits && leftCount == rightCount && std::equal(left.begin(), left.begin() + static_cast<std::ptrdiff_t>(leftCount), right.begin());
 }
 
+}
+
+bool CommittedBlocksMatchMarked(std::uint64_t address, std::size_t bytes, std::span<const ContentHash::Hash128> expected, std::span<const std::uint8_t> marked, BlockMatch* match) {
+    if (match != nullptr) *match = {};
+    if (expected.size() != HashBlockCount(address, bytes) || marked.size() != expected.size()) return false;
+    if (bytes == 0) return true;
+    std::uint64_t markedBytes = 0;
+    forEachHashBlock(address, bytes, [&](std::size_t index, std::uint64_t, std::size_t length) {
+        if (marked[index] != 0) markedBytes += length;
+        return true;
+    });
+    const TimedAccess timed(CounterCompare, markedBytes);
+    CommittedHasher hash(address, bytes);
+    BlockMatch counted;
+    const bool equal = forEachHashBlock(address, bytes, [&](std::size_t index, std::uint64_t begin, std::size_t length) {
+        if (marked[index] == 0) {
+            ++counted.skipped;
+            counted.skippedBytes += length;
+            return true;
+        }
+        ++counted.hashed;
+        counted.hashedBytes += length;
+        return hash(begin, length) == expected[index];
+    });
+    if (match != nullptr) *match = counted;
+    return equal;
 }
 
 bool CommittedBlocksMatchSince(std::uint64_t address, std::size_t bytes, std::span<const ContentHash::Hash128> expected, std::uint64_t generation, const std::vector<std::pair<std::uint64_t, std::uint64_t>>* before, std::span<const std::uint8_t> pending, BlockMatch* match) {

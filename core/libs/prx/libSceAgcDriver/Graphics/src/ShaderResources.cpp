@@ -127,6 +127,8 @@ struct CachedTexture {
     // The untrackedKey the snapshot was last read or compared equal at, for a surface outside the
     // write watch; zero when none was taken.
     std::array<std::uint64_t, 4> untracked{};
+    std::uint64_t blockSince = 0;
+    std::array<std::uint64_t, 2> blockGuard{};
 };
 
 // Entries in use order (front = most recent) with a hash index by key: a lookup is O(1) and the
@@ -702,6 +704,7 @@ struct SnapshotCompareCounters {
     std::atomic<std::uint64_t> skippedBlocks{0};
     std::atomic<std::uint64_t> hashedBytes{0};
     std::atomic<std::uint64_t> skippedBytes{0};
+    std::array<std::atomic<std::uint64_t>, 6> untrackedKinds{};
     std::atomic<std::int64_t> lastReport{0};
 };
 
@@ -720,47 +723,33 @@ bool BlockRevalidateEnabled() {
     return !disabled;
 }
 
-bool snapshotStillMatches(std::uint64_t address, std::size_t bytes, std::span<const ContentHash::Hash128> hashes, std::uint64_t since, const std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>>& before, SnapshotCompare reason) {
+bool UntrackedBlocksEnabled() {
+    static const bool disabled = std::getenv("APS5_NO_UNTRACKED_BLOCKS") != nullptr;
+    return !disabled && BlockRevalidateEnabled();
+}
+
+bool SnapshotComparesProfiled() {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    const bool narrow = since != 0 && BlockRevalidateEnabled() && hashes.size() == GuestMemory::HashBlockCount(address, bytes);
-    thread_local std::vector<std::uint8_t>* pendingSlot = nullptr;
-    auto& pending = ShaderRecompiler::ThreadOwned(pendingSlot);
-    pending.clear();
-    const auto writes = Recorder::PendingWriteSnapshot();
-    const bool overlapping = Recorder::SnapshotOverlaps(writes.get(), address, bytes);
-    if (overlapping) TextureCounts().pendingReads.fetch_add(1, std::memory_order_relaxed);
-    if (narrow && overlapping) {
-        pending.assign(hashes.size(), 0);
-        std::size_t index = 0;
-        const auto end = address + bytes;
-        for (auto at = address; at < end; ++index) {
-            const auto stop = std::min<std::uint64_t>(end, (at / GuestMemory::HashBlockBytes + 1) * GuestMemory::HashBlockBytes);
-            pending[index] = Recorder::SnapshotOverlaps(writes.get(), at, static_cast<std::size_t>(stop - at)) ? 1 : 0;
-            at = stop;
-        }
-    }
-    const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureCompare);
-    GuestMemory::FlushGpuWrites(address, bytes);
-    GuestMemory::BlockMatch match;
-    const bool equal = narrow ? GuestMemory::CommittedBlocksMatchSince(address, bytes, hashes, since, before.has_value() ? &*before : nullptr, pending, &match) : GuestMemory::CommittedBlocksMatch(address, bytes, hashes);
-    if (!profile) return equal;
+    return profile;
+}
+
+void noteSnapshotCompare(SnapshotCompare reason, bool equal, bool narrowed, const GuestMemory::BlockMatch& match, const GuestMemory::UntrackedBlocks* kinds) {
     auto& counters = SnapshotCompares();
     const auto slot = static_cast<std::size_t>(reason);
     counters.compares[slot].fetch_add(1, std::memory_order_relaxed);
     if (!equal) counters.differed[slot].fetch_add(1, std::memory_order_relaxed);
-    if (narrow) {
-        counters.narrowed.fetch_add(1, std::memory_order_relaxed);
-        counters.hashedBlocks.fetch_add(match.hashed, std::memory_order_relaxed);
-        counters.skippedBlocks.fetch_add(match.skipped, std::memory_order_relaxed);
-        counters.hashedBytes.fetch_add(match.hashedBytes, std::memory_order_relaxed);
-        counters.skippedBytes.fetch_add(match.skippedBytes, std::memory_order_relaxed);
-    } else {
-        counters.hashedBlocks.fetch_add(hashes.size(), std::memory_order_relaxed);
-        counters.hashedBytes.fetch_add(bytes, std::memory_order_relaxed);
+    if (narrowed) counters.narrowed.fetch_add(1, std::memory_order_relaxed);
+    counters.hashedBlocks.fetch_add(match.hashed, std::memory_order_relaxed);
+    counters.skippedBlocks.fetch_add(match.skipped, std::memory_order_relaxed);
+    counters.hashedBytes.fetch_add(match.hashedBytes, std::memory_order_relaxed);
+    counters.skippedBytes.fetch_add(match.skippedBytes, std::memory_order_relaxed);
+    if (kinds != nullptr) {
+        const std::array<std::size_t, 6> values{kinds->covered, kinds->hinted, kinds->outside, kinds->hostRegion, kinds->unhinted, kinds->refused};
+        for (std::size_t i = 0; i < values.size(); ++i) counters.untrackedKinds[i].fetch_add(values[i], std::memory_order_relaxed);
     }
     const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
     auto last = counters.lastReport.load();
-    if (nowMs - last < 10000 || !counters.lastReport.compare_exchange_strong(last, nowMs)) return equal;
+    if (nowMs - last < 10000 || !counters.lastReport.compare_exchange_strong(last, nowMs)) return;
     std::string reasons;
     for (std::size_t i = 0; i < SnapshotCompareNames.size(); ++i) {
         const auto count = counters.compares[i].exchange(0, std::memory_order_relaxed);
@@ -768,7 +757,88 @@ bool snapshotStillMatches(std::uint64_t address, std::size_t bytes, std::span<co
         if (count == 0) continue;
         reasons += " " + std::string(SnapshotCompareNames[i]) + " " + std::to_string(count) + " (" + std::to_string(changed) + " changed)";
     }
-    AgcDriver::ProfilePrint_nid_no_patch("[texhash] snapshot compares (10 s) by reason:%s; %llu narrowed to written blocks; blocks hashed %llu (%.1f MiB), skipped %llu (%.1f MiB)\n", reasons.c_str(), static_cast<unsigned long long>(counters.narrowed.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.hashedBlocks.exchange(0, std::memory_order_relaxed)), static_cast<double>(counters.hashedBytes.exchange(0, std::memory_order_relaxed)) / 1048576.0, static_cast<unsigned long long>(counters.skippedBlocks.exchange(0, std::memory_order_relaxed)), static_cast<double>(counters.skippedBytes.exchange(0, std::memory_order_relaxed)) / 1048576.0);
+    const auto take = [&](std::size_t i) { return static_cast<unsigned long long>(counters.untrackedKinds[i].exchange(0, std::memory_order_relaxed)); };
+    const auto covered = take(0);
+    const auto hinted = take(1);
+    const auto outside = take(2);
+    const auto hostRegion = take(3);
+    const auto unhinted = take(4);
+    const auto refused = take(5);
+    AgcDriver::ProfilePrint_nid_no_patch("[texhash] snapshot compares (10 s) by reason:%s; %llu narrowed to written blocks; blocks hashed %llu (%.1f MiB), skipped %llu (%.1f MiB); untracked ranges' blocks: write-watched %llu, hinted %llu, outside the arena %llu, host region %llu, unwatched without hint %llu, walk refused %llu\n", reasons.c_str(), static_cast<unsigned long long>(counters.narrowed.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.hashedBlocks.exchange(0, std::memory_order_relaxed)), static_cast<double>(counters.hashedBytes.exchange(0, std::memory_order_relaxed)) / 1048576.0, static_cast<unsigned long long>(counters.skippedBlocks.exchange(0, std::memory_order_relaxed)), static_cast<double>(counters.skippedBytes.exchange(0, std::memory_order_relaxed)) / 1048576.0, covered, hinted, outside, hostRegion, unhinted, refused);
+}
+
+const std::vector<std::uint8_t>& pendingBlocks(std::uint64_t address, std::size_t bytes, std::size_t count) {
+    thread_local std::vector<std::uint8_t>* pendingSlot = nullptr;
+    auto& pending = ShaderRecompiler::ThreadOwned(pendingSlot);
+    pending.clear();
+    const auto writes = Recorder::PendingWriteSnapshot();
+    const bool overlapping = Recorder::SnapshotOverlaps(writes.get(), address, bytes);
+    if (overlapping) TextureCounts().pendingReads.fetch_add(1, std::memory_order_relaxed);
+    if (!overlapping || count == 0) return pending;
+    pending.assign(count, 0);
+    std::size_t index = 0;
+    const auto end = address + bytes;
+    for (auto at = address; at < end && index < count; ++index) {
+        const auto stop = std::min<std::uint64_t>(end, (at / GuestMemory::HashBlockBytes + 1) * GuestMemory::HashBlockBytes);
+        pending[index] = Recorder::SnapshotOverlaps(writes.get(), at, static_cast<std::size_t>(stop - at)) ? 1 : 0;
+        at = stop;
+    }
+    return pending;
+}
+
+bool snapshotStillMatches(std::uint64_t address, std::size_t bytes, std::span<const ContentHash::Hash128> hashes, std::uint64_t since, const std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>>& before, SnapshotCompare reason) {
+    const bool narrow = since != 0 && BlockRevalidateEnabled() && hashes.size() == GuestMemory::HashBlockCount(address, bytes);
+    const auto& pending = pendingBlocks(address, bytes, narrow ? hashes.size() : 0);
+    const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureCompare);
+    GuestMemory::FlushGpuWrites(address, bytes);
+    GuestMemory::BlockMatch match;
+    const bool equal = narrow ? GuestMemory::CommittedBlocksMatchSince(address, bytes, hashes, since, before.has_value() ? &*before : nullptr, pending, &match) : GuestMemory::CommittedBlocksMatch(address, bytes, hashes);
+    if (!SnapshotComparesProfiled()) return equal;
+    if (!narrow) match = {hashes.size(), 0, bytes, 0};
+    noteSnapshotCompare(reason, equal, narrow, match, nullptr);
+    return equal;
+}
+
+std::array<std::uint64_t, 2> untrackedGuard(std::uint64_t address, std::size_t bytes) {
+    const auto* recorder = Recorder::Active();
+    return {GuestMemory::ForgetSerial(), recorder != nullptr ? recorder->NewestWriteNote(address, bytes) : 0};
+}
+
+std::uint64_t untrackedBaseline(std::uint64_t address, std::size_t bytes) {
+    if (!UntrackedBlocksEnabled()) return 0;
+    thread_local std::vector<std::uint8_t>* staleSlot = nullptr;
+    auto& stale = ShaderRecompiler::ThreadOwned(staleSlot);
+    stale.assign(GuestMemory::HashBlockCount(address, bytes), 1);
+    return GuestMemory::WalkUntrackedBlocks(address, bytes, 0, stale);
+}
+
+bool untrackedStillMatches(std::uint64_t address, std::size_t bytes, std::span<const ContentHash::Hash128> hashes, std::uint64_t& since, std::array<std::uint64_t, 2>& guard, SnapshotCompare reason) {
+    const auto count = hashes.size();
+    if (!UntrackedBlocksEnabled() || count != GuestMemory::HashBlockCount(address, bytes)) {
+        since = 0;
+        return snapshotStillMatches(address, bytes, hashes, 0, std::nullopt, reason);
+    }
+    const auto now = untrackedGuard(address, bytes);
+    const bool trusted = since != 0 && (now[0] & 1u) == 0 && now == guard;
+    thread_local std::vector<std::uint8_t>* staleSlot = nullptr;
+    auto& stale = ShaderRecompiler::ThreadOwned(staleSlot);
+    stale.assign(count, 1);
+    GuestMemory::UntrackedBlocks kinds;
+    const auto walked = GuestMemory::WalkUntrackedBlocks(address, bytes, trusted ? since : 0, stale, &kinds);
+    const auto& pending = pendingBlocks(address, bytes, count);
+    const bool pendingAny = std::any_of(pending.begin(), pending.end(), [](std::uint8_t flag) { return flag != 0; });
+    for (std::size_t i = 0; i < pending.size() && i < stale.size(); ++i) stale[i] = static_cast<std::uint8_t>(stale[i] | pending[i]);
+    const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureCompare);
+    GuestMemory::FlushGpuWrites(address, bytes);
+    GuestMemory::BlockMatch match;
+    const bool equal = GuestMemory::CommittedBlocksMatchMarked(address, bytes, hashes, stale, &match);
+    if (equal && walked != 0 && (now[0] & 1u) == 0 && !pendingAny) {
+        since = walked;
+        guard = now;
+    } else {
+        since = 0;
+    }
+    if (SnapshotComparesProfiled()) noteSnapshotCompare(reason, equal, trusted, match, &kinds);
     return equal;
 }
 
@@ -1223,6 +1293,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                     }
                     return untracked[0] == 0 ? SnapshotCompare::Untracked : SnapshotCompare::HintMoved;
                 }();
+                if (!collected && *keys == DccKeys::Uncompressed) return untrackedStillMatches(address, bytes, it->hashes, it->blockSince, it->blockGuard, reason);
                 return snapshotStillMatches(address, bytes, it->hashes, collected ? it->generation : 0, it->committed, reason);
             };
             const auto unchanged = [&] {
@@ -1320,6 +1391,10 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         // Snapshot before the upload so a write racing with it is caught by the next comparison.
         const bool pending = *keys == DccKeys::Uncompressed && Recorder::SnapshotWriteOverlaps(address, bytes);
         if (pending) counters.pendingReads.fetch_add(1, std::memory_order_relaxed);
+        if (!pending && generation == 0 && !entry.committed.has_value() && *keys == DccKeys::Uncompressed) {
+            entry.blockGuard = untrackedGuard(address, bytes);
+            entry.blockSince = (entry.blockGuard[0] & 1u) == 0 ? untrackedBaseline(address, bytes) : 0;
+        }
         std::vector<std::byte> snapshot(bytes);
         ReadTextureSurface(resource, *keys, snapshot);
         if (!pending) entry.untracked = untracked;
