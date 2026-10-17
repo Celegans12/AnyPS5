@@ -147,6 +147,8 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/HostHdr.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/DeviceAccess.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Diagnostics.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/ProgramStats.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/ProgramStatsImages.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/DataHitVerification.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/Dispatch.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/DispatchAhead.cpp
@@ -330,6 +332,26 @@ if(BUILD_TESTING)
     if(MINGW)
         target_link_libraries(agc_driver_draw_program_trace_tests PRIVATE libc)
         set_tests_properties(agc_driver_draw_program_trace PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
+if(BUILD_TESTING)
+    add_test_executable(agc_driver_program_stats_tests
+            tests/ProgramStats.cpp
+            Execution/src/Driver/ProgramStats.cpp
+    )
+    target_include_directories(agc_driver_program_stats_tests PRIVATE
+            ${LIBS_INCLUDE_DIR}
+            ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR}
+    )
+    set_target_properties(agc_driver_program_stats_tests PROPERTIES CXX_EXTENSIONS OFF)
+    configure_windows_unwind(agc_driver_program_stats_tests)
+    add_test(NAME agc_driver_program_stats COMMAND agc_driver_program_stats_tests)
+    set_tests_properties(agc_driver_program_stats PROPERTIES TIMEOUT 20)
+    if(MINGW)
+        target_link_libraries(agc_driver_program_stats_tests PRIVATE libc)
+        set_tests_properties(agc_driver_program_stats PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()

@@ -1,0 +1,251 @@
+#include "prx/libSceAgcDriver/Execution/include/Driver/ProgramStats.hpp"
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <stdexcept>
+
+namespace AgcDriver::DriverDetail {
+
+std::vector<std::uint64_t> ParseProgramList(const char* text) {
+    std::vector<std::uint64_t> list;
+    if (text == nullptr) return list;
+    const std::string value(text);
+    std::size_t begin = 0;
+    while (begin <= value.size()) {
+        auto end = value.find(',', begin);
+        if (end == std::string::npos) end = value.size();
+        auto item = value.substr(begin, end - begin);
+        while (!item.empty() && item.front() == ' ') item.erase(item.begin());
+        while (!item.empty() && item.back() == ' ') item.pop_back();
+        if (!item.empty()) {
+            const auto digits = item.size() > 2 && item[0] == '0' && (item[1] == 'x' || item[1] == 'X') ? item.substr(2) : item;
+            if (digits.empty() || digits.size() > 16 || digits.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos) {
+                throw std::runtime_error("a program list entry is not a hexadecimal address: '" + item + "'");
+            }
+            const auto address = std::strtoull(digits.c_str(), nullptr, 16);
+            if (address == 0) throw std::runtime_error("a program list entry is address 0");
+            list.push_back(address);
+        }
+        begin = end + 1;
+    }
+    std::sort(list.begin(), list.end());
+    list.erase(std::unique(list.begin(), list.end()), list.end());
+    return list;
+}
+
+std::uint32_t ParseStatsInterval(const char* text) {
+    if (text == nullptr || *text == '\0') return 0;
+    char* end = nullptr;
+    const auto value = std::strtoul(text, &end, 10);
+    if (end == nullptr || *end != '\0' || value > 1000000ul) throw std::runtime_error("APS5_DRAW_PROGRAM_STATS must be a present interval between 0 and 1000000");
+    return static_cast<std::uint32_t>(value);
+}
+
+bool ListedProgram(std::span<const std::uint64_t> list, std::uint64_t address) {
+    return address != 0 && std::binary_search(list.begin(), list.end(), address);
+}
+
+namespace {
+
+const std::vector<std::uint64_t>& listFromEnvironment(const char* name) {
+    static std::mutex mutex;
+    static std::map<std::string, std::vector<std::uint64_t>> lists;
+    std::lock_guard lock(mutex);
+    const auto found = lists.find(name);
+    if (found != lists.end()) return found->second;
+    auto list = ParseProgramList(std::getenv(name));
+    if (!list.empty()) {
+        std::string text;
+        for (const auto address : list) {
+            char item[24];
+            std::snprintf(item, sizeof(item), "%s0x%llx", text.empty() ? "" : ",", static_cast<unsigned long long>(address));
+            text += item;
+        }
+        std::fprintf(stderr, "[progstats] %s: %zu programs (%s)\n", name, list.size(), text.c_str());
+    }
+    return lists.emplace(name, std::move(list)).first->second;
+}
+
+std::string targetText(const StatsTarget& target) {
+    char text[80];
+    if (target.samples > 1) std::snprintf(text, sizeof(text), "0x%llx:%ux%u:f%u:s%u", static_cast<unsigned long long>(target.address), target.width, target.height, target.format, target.samples);
+    else std::snprintf(text, sizeof(text), "0x%llx:%ux%u:f%u", static_cast<unsigned long long>(target.address), target.width, target.height, target.format);
+    return text;
+}
+
+}
+
+const std::vector<std::uint64_t>& SkippedPixelPrograms() {
+    static const auto& list = listFromEnvironment("APS5_SKIP_PIXEL_PROGRAMS");
+    return list;
+}
+
+const std::vector<std::uint64_t>& TintedPixelPrograms() {
+    static const auto& list = listFromEnvironment("APS5_TINT_PIXEL_PROGRAMS");
+    return list;
+}
+
+const std::vector<std::uint64_t>& SkippedComputePrograms() {
+    static const auto& list = listFromEnvironment("APS5_SKIP_COMPUTE_PROGRAMS");
+    return list;
+}
+
+bool BlendableAttachmentFormat(VkFormat format) {
+    switch (format) {
+        case VK_FORMAT_UNDEFINED:
+        case VK_FORMAT_R8_UINT: case VK_FORMAT_R8_SINT: case VK_FORMAT_R8G8_UINT: case VK_FORMAT_R8G8_SINT:
+        case VK_FORMAT_R8G8B8_UINT: case VK_FORMAT_R8G8B8_SINT: case VK_FORMAT_B8G8R8_UINT: case VK_FORMAT_B8G8R8_SINT:
+        case VK_FORMAT_R8G8B8A8_UINT: case VK_FORMAT_R8G8B8A8_SINT: case VK_FORMAT_B8G8R8A8_UINT: case VK_FORMAT_B8G8R8A8_SINT:
+        case VK_FORMAT_A8B8G8R8_UINT_PACK32: case VK_FORMAT_A8B8G8R8_SINT_PACK32:
+        case VK_FORMAT_A2R10G10B10_UINT_PACK32: case VK_FORMAT_A2R10G10B10_SINT_PACK32:
+        case VK_FORMAT_A2B10G10R10_UINT_PACK32: case VK_FORMAT_A2B10G10R10_SINT_PACK32:
+        case VK_FORMAT_R16_UINT: case VK_FORMAT_R16_SINT: case VK_FORMAT_R16G16_UINT: case VK_FORMAT_R16G16_SINT:
+        case VK_FORMAT_R16G16B16_UINT: case VK_FORMAT_R16G16B16_SINT: case VK_FORMAT_R16G16B16A16_UINT: case VK_FORMAT_R16G16B16A16_SINT:
+        case VK_FORMAT_R32_UINT: case VK_FORMAT_R32_SINT: case VK_FORMAT_R32G32_UINT: case VK_FORMAT_R32G32_SINT:
+        case VK_FORMAT_R32G32B32_UINT: case VK_FORMAT_R32G32B32_SINT: case VK_FORMAT_R32G32B32A32_UINT: case VK_FORMAT_R32G32B32A32_SINT:
+        case VK_FORMAT_R64_UINT: case VK_FORMAT_R64_SINT: case VK_FORMAT_R64G64_UINT: case VK_FORMAT_R64G64_SINT:
+        case VK_FORMAT_R64G64B64_UINT: case VK_FORMAT_R64G64B64_SINT: case VK_FORMAT_R64G64B64A64_UINT: case VK_FORMAT_R64G64B64A64_SINT:
+        case VK_FORMAT_R64_SFLOAT: case VK_FORMAT_R64G64_SFLOAT: case VK_FORMAT_R64G64B64_SFLOAT: case VK_FORMAT_R64G64B64A64_SFLOAT:
+            return false;
+        default:
+            return true;
+    }
+}
+
+std::size_t ApplyBlendTint(std::span<VkPipelineColorBlendAttachmentState> blends, std::array<float, 4>& constants, std::span<const VkFormat> formats) {
+    std::size_t tinted = 0;
+    for (std::size_t i = 0; i < blends.size(); ++i) {
+        auto& blend = blends[i];
+        if (blend.colorWriteMask == 0 || i >= formats.size() || !BlendableAttachmentFormat(formats[i])) continue;
+        blend.blendEnable = VK_TRUE;
+        blend.srcColorBlendFactor = VK_BLEND_FACTOR_CONSTANT_COLOR;
+        blend.dstColorBlendFactor = VK_BLEND_FACTOR_ZERO;
+        blend.colorBlendOp = VK_BLEND_OP_ADD;
+        blend.srcAlphaBlendFactor = VK_BLEND_FACTOR_CONSTANT_ALPHA;
+        blend.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+        blend.alphaBlendOp = VK_BLEND_OP_ADD;
+        ++tinted;
+    }
+    if (tinted != 0) constants = {1.0f, 0.0f, 1.0f, 1.0f};
+    return tinted;
+}
+
+void ProgramStats::NoteDraw(std::uint64_t pixel, std::uint64_t vertex, std::span<const StatsTarget> colors, std::optional<StatsTarget> depth, bool skipped, bool tinted) {
+    if (!Enabled()) return;
+    Group group{{colors.begin(), colors.end()}, depth};
+    std::lock_guard lock(mutex);
+    auto& count = groups[group][{pixel, vertex}];
+    ++count.draws;
+    if (skipped) ++count.skipped;
+    if (tinted) ++count.tinted;
+    ++draws;
+}
+
+void ProgramStats::NoteDrawSampled(std::uint64_t pixel, std::span<const std::uint64_t> addresses) {
+    if (!Enabled() || addresses.empty()) return;
+    std::lock_guard lock(mutex);
+    for (const auto address : addresses) {
+        auto& programs = sampled[address];
+        if (programs.size() < 8) programs.insert(pixel);
+    }
+}
+
+void ProgramStats::NoteDispatch(std::uint64_t program, std::span<const StatsImage> written, bool skipped) {
+    if (!Enabled()) return;
+    std::lock_guard lock(mutex);
+    auto& count = compute[program];
+    ++count.dispatches;
+    if (skipped) ++count.skipped;
+    for (const auto& image : written) {
+        if (count.written.size() < 16) count.written.insert(image);
+    }
+}
+
+std::vector<std::string> ProgramStats::Present() {
+    std::vector<std::string> lines;
+    if (!Enabled()) return lines;
+    std::lock_guard lock(mutex);
+    ++presents;
+    if (presents % every == 0) {
+        std::uint64_t dispatches = 0;
+        for (const auto& [program, count] : compute) dispatches += count.dispatches;
+        char head[192];
+        std::snprintf(head, sizeof(head), "[progstats] present %llu: %llu draws into %zu attachment groups, %llu dispatches of %zu compute programs",
+            static_cast<unsigned long long>(presents), static_cast<unsigned long long>(draws), groups.size(), static_cast<unsigned long long>(dispatches), compute.size());
+        lines.emplace_back(head);
+        std::vector<std::pair<std::uint64_t, const decltype(groups)::value_type*>> ordered;
+        for (const auto& entry : groups) {
+            std::uint64_t total = 0;
+            for (const auto& [programs, count] : entry.second) total += count.draws;
+            ordered.emplace_back(total, &entry);
+        }
+        std::stable_sort(ordered.begin(), ordered.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+        constexpr std::size_t MaxGroups = 64;
+        constexpr std::size_t MaxPrograms = 32;
+        for (std::size_t g = 0; g < ordered.size() && g < MaxGroups; ++g) {
+            const auto& [group, programs] = *ordered[g].second;
+            std::string line = "[progstats] present " + std::to_string(presents) + " color";
+            if (group.colors.empty()) line += " none";
+            for (const auto& color : group.colors) line += " " + targetText(color);
+            if (group.depth) line += " depth " + targetText(*group.depth);
+            line += " | " + std::to_string(ordered[g].first) + " draws:";
+            std::vector<std::pair<std::pair<std::uint64_t, std::uint64_t>, PixelCount>> pixels(programs.begin(), programs.end());
+            std::stable_sort(pixels.begin(), pixels.end(), [](const auto& a, const auto& b) { return a.second.draws > b.second.draws; });
+            for (std::size_t p = 0; p < pixels.size() && p < MaxPrograms; ++p) {
+                const auto& [key, count] = pixels[p];
+                char item[160];
+                std::snprintf(item, sizeof(item), " ps 0x%llx (vs 0x%llx) x%llu", static_cast<unsigned long long>(key.first), static_cast<unsigned long long>(key.second), static_cast<unsigned long long>(count.draws));
+                line += item;
+                if (count.skipped != 0) line += " skipped " + std::to_string(count.skipped);
+                if (count.tinted != 0) line += " tinted " + std::to_string(count.tinted);
+                line += p + 1 < pixels.size() && p + 1 < MaxPrograms ? "," : "";
+            }
+            if (pixels.size() > MaxPrograms) line += " (+" + std::to_string(pixels.size() - MaxPrograms) + " more programs)";
+            lines.push_back(std::move(line));
+        }
+        if (ordered.size() > MaxGroups) lines.push_back("[progstats] present " + std::to_string(presents) + " (+" + std::to_string(ordered.size() - MaxGroups) + " more attachment groups)");
+        std::vector<std::pair<std::uint64_t, const ComputeCount*>> programs;
+        for (const auto& [program, count] : compute) programs.emplace_back(program, &count);
+        std::stable_sort(programs.begin(), programs.end(), [](const auto& a, const auto& b) { return a.second->dispatches > b.second->dispatches; });
+        std::string plain = "[progstats] present " + std::to_string(presents) + " compute without image writes seen:";
+        bool anyPlain = false;
+        for (const auto& [program, count] : programs) {
+            char item[96];
+            std::snprintf(item, sizeof(item), " 0x%llx x%llu", static_cast<unsigned long long>(program), static_cast<unsigned long long>(count->dispatches));
+            std::string text = item;
+            if (count->skipped != 0) text += " skipped " + std::to_string(count->skipped);
+            if (count->written.empty()) {
+                plain += text;
+                anyPlain = true;
+                continue;
+            }
+            std::string line = "[progstats] present " + std::to_string(presents) + " compute" + text + " writes";
+            for (const auto& image : count->written) {
+                line += " " + targetText({image.address, image.width, image.height, image.format, 1});
+                if (const auto found = sampled.find(image.address); found != sampled.end()) {
+                    line += " (sampled by ps";
+                    for (const auto pixel : found->second) {
+                        char ps[24];
+                        std::snprintf(ps, sizeof(ps), " 0x%llx", static_cast<unsigned long long>(pixel));
+                        line += ps;
+                    }
+                    line += ")";
+                }
+            }
+            lines.push_back(std::move(line));
+        }
+        if (anyPlain) lines.push_back(std::move(plain));
+    }
+    groups.clear();
+    compute.clear();
+    sampled.clear();
+    draws = 0;
+    return lines;
+}
+
+ProgramStats& ProgramStats::Global() {
+    static ProgramStats stats(ParseStatsInterval(std::getenv("APS5_DRAW_PROGRAM_STATS")));
+    return stats;
+}
+
+}

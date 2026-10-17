@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawProgramTrace.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/ProgramStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -142,6 +143,34 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         decode = std::move(refreshed);
     }
     resolveDrawDecode(queue, submission, decode, registerKey, drawKey, profile);
+    std::uint64_t pixelProgram = 0;
+    std::uint64_t vertexProgram = 0;
+    for (const auto& program : decode->programs) {
+        if (program.binary.stage == Stage::Fragment) pixelProgram = program.binary.codeAddress;
+        else if (vertexProgram == 0) vertexProgram = program.binary.codeAddress;
+    }
+    const bool skipPixel = ListedProgram(SkippedPixelPrograms(), pixelProgram);
+    const bool tintPixel = !skipPixel && ListedProgram(TintedPixelPrograms(), pixelProgram);
+    if (tintPixel) {
+        auto tinted = std::make_shared<DrawDecode>(*decode);
+        auto& state = tinted->state;
+        std::vector<VkFormat> formats(state.blends.size(), VK_FORMAT_UNDEFINED);
+        for (const auto& color : state.colors) {
+            if (color.exportIndex < formats.size() && !color.uintExport) formats[color.exportIndex] = color.format;
+        }
+        ApplyBlendTint(state.blends, state.blendConstants, formats);
+        decode = std::move(tinted);
+    }
+    if (auto& stats = ProgramStats::Global(); stats.Enabled()) {
+        const auto& state = decode->state;
+        std::vector<StatsTarget> colors;
+        for (const auto& color : state.colors) colors.push_back({color.address, color.extent.width, color.extent.height, static_cast<std::uint32_t>(color.format), color.samples});
+        if (colors.empty() && state.hasColorTarget) colors.push_back({state.color.address, state.color.extent.width, state.color.extent.height, static_cast<std::uint32_t>(state.color.format), state.color.samples});
+        std::optional<StatsTarget> depth;
+        if (state.depth) depth = StatsTarget{state.depth->address, state.depth->extent.width, state.depth->extent.height, static_cast<std::uint32_t>(state.depth->format), state.depth->samples};
+        stats.NoteDraw(pixelProgram, vertexProgram, colors, depth, skipPixel, tintPixel);
+    }
+    if (skipPixel) return drawn();
     const auto& graphics = decode->state;
     auto pixel = decode->pixel;
     std::vector<DrawProgram> programs = decode->programs;
@@ -507,6 +536,14 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         return drawn();
     }
 
+    if (auto& stats = ProgramStats::Global(); stats.Enabled()) {
+        for (const auto& stage : stages) {
+            if (stage.stage != Stage::Fragment || stage.program == nullptr) continue;
+            std::vector<std::uint64_t> addresses;
+            for (const auto& image : ProgramStatsImages(*stage.program, false)) addresses.push_back(image.address);
+            stats.NoteDrawSampled(pixelProgram, addresses);
+        }
+    }
     std::vector<std::shared_ptr<DispatchVariant>> recipeStages;
     if (registerKey && !drawParameters.indirect && !patchedStages && Graphics::DrawRecipes()) {
         recipeStages.reserve(programs.size());
