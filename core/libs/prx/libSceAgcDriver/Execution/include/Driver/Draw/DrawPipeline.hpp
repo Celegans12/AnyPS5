@@ -68,6 +68,7 @@ private:
         std::uint64_t labelAddress = 0;
         std::vector<std::byte> labelBytes;
         std::vector<Range> reads;
+        std::int64_t pushedNs = 0;
     };
     DrawPipeline() = default;
     template<typename TRanges, typename TBounds>
@@ -123,6 +124,15 @@ private:
     std::array<std::uint64_t, 257> drainOpcodes{};
     std::array<std::atomic<std::uint64_t>, 257> drainRequests{};
     std::uint64_t depthSum = 0;
+    std::int64_t lastPopNs = 0;
+    std::int64_t lastFinishNs = 0;
+    std::uint64_t roomWaits = 0;
+    std::uint64_t roomWakeNs = 0;
+    std::uint64_t drainWaits = 0;
+    std::uint64_t drainWakeNs = 0;
+    std::uint64_t committerIdles = 0;
+    std::uint64_t committerIdleNs = 0;
+    std::uint64_t committerWakeNs = 0;
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(Event::Count)> events{};
     std::array<std::uint64_t, static_cast<std::size_t>(Event::Count)> reportedEvents{};
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();

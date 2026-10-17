@@ -695,6 +695,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             return DrawVerdict::Rejected;
         }
     }
+    timing.Mark("recipe_and_rejection");
     if (pipelined && (!drawParameters.indirect || pipelineIndirect) && deferredLabels().labels.empty()) {
         phaseTiming.Phase(DrawRowVectors);
         auto writes = drawWriteRanges(graphics, stages);
@@ -712,6 +713,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             const auto bytes = static_cast<std::uint64_t>(drawParameters.indexCount) * drawParameters.indexSize;
             if (bytes != 0 && drawParameters.indexAddress <= std::numeric_limits<std::uint64_t>::max() - bytes) reads.emplace_back(drawParameters.indexAddress, drawParameters.indexAddress + bytes);
         }
+        timing.Mark("write_ranges_and_commit");
         DrawPipeline::Queue0().Enqueue([held] { (*held)(); }, std::move(writes), 0, {}, std::move(reads));
         if (pipelineIndirect) DrawPipeline::Queue0().Note(DrawPipeline::Event::IndirectCommit);
         phaseTiming.Phase(DrawRowLockWait);
