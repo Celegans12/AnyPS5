@@ -567,9 +567,9 @@ struct Fixture {
     static constexpr std::uint32_t Records = 4096u;
     static constexpr std::uint32_t Groups = Records / 64u;
 
-    Fixture(const Device& device, std::uint32_t buckets = DeviceImageKeys::InitialBuckets, std::uint32_t maxBuckets = DeviceImageKeys::MaxBuckets) : context(device.GetContext()) {
+    Fixture(const Device& device, std::uint32_t buckets = DeviceImageKeys::InitialBuckets, std::uint32_t maxBuckets = DeviceImageKeys::MaxBuckets, std::uint32_t ringCapacity = BindlessTable::DefaultRingCapacity) : context(device.GetContext()) {
         const auto capacities = DescriptorHeap::DeviceCapacities(context);
-        table = std::make_unique<BindlessTable>(context, DescriptorHeap::Capacities{std::min(capacities.samplers, 64u), std::min(capacities.sampledImages, 16384u), std::min(capacities.storageImages, 64u)}, buckets, maxBuckets);
+        table = std::make_unique<BindlessTable>(context, DescriptorHeap::Capacities{std::min(capacities.samplers, 64u), std::min(capacities.sampledImages, 16384u), std::min(capacities.storageImages, 64u)}, buckets, maxBuckets, ringCapacity);
         images = std::make_unique<Images>(context, DistinctImages);
         pipeline = std::make_unique<LookupPipeline>(context, table->Heap(), images->View(0));
         descriptors = std::make_shared<Buffer>(context, static_cast<std::size_t>(Records) * 32u, AddressUsage);
@@ -605,7 +605,7 @@ struct Fixture {
     }
 
     void Dispatch(Recorder& recorder, std::uint32_t pc) {
-        const Push push{table->HeaderAddress(), descriptors->DeviceAddress(), indices->DeviceAddress(), results->DeviceAddress(), slotList->DeviceAddress(), static_cast<std::uint32_t>(InterfaceId), static_cast<std::uint32_t>(InterfaceId >> 32u), 2u, 1u, Records - 1u, pc};
+        const Push push{table->HeaderAddress(), descriptors->DeviceAddress(), indices->DeviceAddress(), results->DeviceAddress(), slotList->DeviceAddress(), static_cast<std::uint32_t>(InterfaceId), static_cast<std::uint32_t>(InterfaceId >> 32u), 2u, 1u, mask, pc};
         pipeline->Record(recorder.Commands(), table->Heap(), push, Groups);
     }
 
@@ -613,7 +613,7 @@ struct Fixture {
         const auto* words = reinterpret_cast<const std::uint32_t*>(results->Bytes().data());
         std::uint32_t mismatches = 0;
         for (std::uint32_t id = 0; id < Records; ++id) {
-            const auto record = (id * 7u) & (Records - 1u);
+            const auto record = (id * 7u) & mask;
             const auto& item = records[record];
             const auto image = resolver->reused.contains(item.image) ? (item.image + Remapped) % DistinctImages : item.image;
             const auto want = !served(record) || !item.present || item.mode == RefusedMode || item.mode == PermanentMode ? 0u : Images::Texel(image, record & 63u, (record >> 6u) & 63u) + (item.mode & 0xffu);
@@ -637,6 +637,9 @@ struct Fixture {
     std::shared_ptr<HostMemory> memory;
     std::shared_ptr<TestResolver> resolver;
     std::vector<Record> records;
+    // Invocation id reads record (id * 7) & mask: Records - 1 gives every invocation its own key,
+    // a smaller mask makes many invocations read the same few keys.
+    std::uint32_t mask = Records - 1u;
 };
 
 std::uint32_t DistinctPages(std::uint64_t first, std::uint64_t last) {
@@ -793,7 +796,7 @@ void lazyTests(const Device& device) {
     Present(service, recorder);
     Require(fixture.Check("lazy first touch", [](std::uint32_t) { return false; }) == 0u, "a lazy first touch read anything but misses");
     const auto first = service.Totals();
-    Require(first.created == first.misses && first.misses == std::min<std::uint64_t>(Fixture::Records, BindlessTable::RingCapacity), "the lazy mode did not create every distinct key its ring caught: " + std::to_string(first.created) + " created, " + std::to_string(first.misses) + " misses");
+    Require(first.created == first.misses && first.misses == std::min<std::uint64_t>(Fixture::Records, fixture.table->RingCapacity()), "the lazy mode did not create every distinct key its ring caught: " + std::to_string(first.created) + " created, " + std::to_string(first.misses) + " misses");
     std::uint32_t frames = 1;
     while (service.Totals().created < Fixture::Records && frames < 16u) {
         service.Serve(served, recorder);
@@ -806,7 +809,74 @@ void lazyTests(const Device& device) {
     fixture.Dispatch(recorder, 0x700u);
     Present(service, recorder);
     Require(service.Totals().created == Fixture::Records && service.Totals().misses == misses && fixture.Check("lazy after convergence", [](std::uint32_t) { return true; }) == 0u, "the lazy mode did not converge to an exact frame");
-    std::cout << "lazy first touch: " << misses << " misses over " << frames << " frames (ring capacity " << BindlessTable::RingCapacity << "), then exact with 0 misses\n";
+    std::cout << "lazy first touch: " << misses << " misses over " << frames << " frames (ring capacity " << fixture.table->RingCapacity() << "), then exact with 0 misses\n";
+}
+
+// Lazy mode under a first-touch storm: the GPU reports each missing key once (many invocations and
+// two dispatches per frame read each key), a storm larger than the ring is created over frames, and
+// the frame after the fill is exact.
+void stormTests(const Device& device) {
+    {
+        Fixture fixture(device, DeviceImageKeys::InitialBuckets, DeviceImageKeys::MaxBuckets, 64u);
+        fixture.mask = 15u;
+        Recorder recorder(fixture.context, device.Timeline());
+        recorder.Activate();
+        TextureService::Options options;
+        options.lazy = true;
+        options.worker = false;
+        TextureService service(*fixture.table, fixture.resolver, fixture.memory, options);
+        std::unique_lock gpu(AgcDriver::GuestMemory::GpuMutex());
+        const std::array<std::uint64_t, 1> served{service.Register(fixture.Registration())};
+        const auto before = fixture.table->Totals();
+        service.Serve(served, recorder);
+        fixture.Dispatch(recorder, 0x800u);
+        fixture.Dispatch(recorder, 0x801u);
+        Present(service, recorder);
+        const auto ring = fixture.table->Totals();
+        Require(ring.misses - before.misses == 16u && ring.dropped == before.dropped, "few keys: " + std::to_string(Fixture::Records * 2u) + " invocations missing 16 keys appended " + std::to_string(ring.misses - before.misses) + " ring records (" + std::to_string(ring.dropped - before.dropped) + " dropped), expected each key once");
+        Require(service.Totals().created == 16u && service.Totals().misses == 16u, "few keys: the present did not create the 16 missed keys");
+        Require(fixture.Check("few keys first touch", [](std::uint32_t) { return false; }) == 0u, "few keys: a first touch read anything but misses");
+        service.Serve(served, recorder);
+        fixture.Dispatch(recorder, 0x802u);
+        Present(service, recorder);
+        Require(fixture.Check("few keys after the fill", [](std::uint32_t) { return true; }) == 0u && fixture.table->Totals().misses == ring.misses, "few keys: the frame after the fill was not exact");
+        std::cout << "lazy few keys: " << Fixture::Records * 2u << " invocations missing 16 keys -> 16 ring records, exact on the next frame\n";
+    }
+    constexpr std::uint32_t Ring = 256u;
+    Fixture fixture(device, DeviceImageKeys::InitialBuckets, DeviceImageKeys::MaxBuckets, Ring);
+    Recorder recorder(fixture.context, device.Timeline());
+    recorder.Activate();
+    TextureService::Options options;
+    options.lazy = true;
+    options.worker = false;
+    TextureService service(*fixture.table, fixture.resolver, fixture.memory, options);
+    std::unique_lock gpu(AgcDriver::GuestMemory::GpuMutex());
+    const std::array<std::uint64_t, 1> served{service.Register(fixture.Registration())};
+    std::uint64_t remaining = Fixture::Records;
+    std::uint32_t frames = 0;
+    while (remaining != 0u) {
+        Require(frames < 2u * Fixture::Records / Ring, "the miss storm did not converge: " + std::to_string(remaining) + " keys left after " + std::to_string(frames) + " frames");
+        const auto before = fixture.table->Totals();
+        const auto createdBefore = service.Totals().created;
+        service.Serve(served, recorder);
+        fixture.Dispatch(recorder, 0x900u + frames * 2u);
+        fixture.Dispatch(recorder, 0x901u + frames * 2u);
+        Present(service, recorder);
+        const auto after = fixture.table->Totals();
+        const auto created = service.Totals().created - createdBefore;
+        const auto caught = std::min<std::uint64_t>(remaining, Ring);
+        Require(after.misses - before.misses == remaining, "storm frame " + std::to_string(frames) + ": " + std::to_string(after.misses - before.misses) + " ring records for " + std::to_string(remaining) + " missing keys read by two dispatches, expected each key once");
+        Require(after.dropped - before.dropped == remaining - caught && created == caught, "storm frame " + std::to_string(frames) + ": " + std::to_string(created) + " created and " + std::to_string(after.dropped - before.dropped) + " dropped, expected " + std::to_string(caught) + " and " + std::to_string(remaining - caught));
+        remaining -= created;
+        ++frames;
+    }
+    Require(frames == Fixture::Records / Ring, "the storm took " + std::to_string(frames) + " frames, expected " + std::to_string(Fixture::Records / Ring));
+    const auto misses = fixture.table->Totals().misses;
+    service.Serve(served, recorder);
+    fixture.Dispatch(recorder, 0xa00u);
+    Present(service, recorder);
+    Require(service.Totals().created == Fixture::Records && fixture.table->Totals().misses == misses && fixture.Check("storm after the fill", [](std::uint32_t) { return true; }) == 0u, "the frame after the miss storm was filled was not exact");
+    std::cout << "lazy miss storm: " << Fixture::Records << " keys through a " << Ring << "-record ring, each reported once per frame, created over " << frames << " frames, then exact\n";
 }
 
 void fullTests(const Device& device) {
@@ -1099,6 +1169,7 @@ int main(int argc, char** argv) {
         }
         serviceTests(*device);
         lazyTests(*device);
+        stormTests(*device);
         fullTests(*device);
         perUseTests(*device);
         budgetTests(*device);

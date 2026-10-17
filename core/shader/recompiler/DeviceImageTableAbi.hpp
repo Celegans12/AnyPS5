@@ -33,7 +33,19 @@ inline constexpr std::uint32_t HeaderMask = 3;
 inline constexpr std::uint32_t HeaderRingLow = 4;
 inline constexpr std::uint32_t HeaderRingHigh = 5;
 inline constexpr std::uint32_t HeaderRingCapacity = 6;
+// The reported-miss set: one word per slot, 0 = free, else the key's SeenTag. A missing invocation
+// appends its key to the ring only if it is the first to claim the tag (compare-exchange 0 -> tag)
+// in the HeaderSeenSlots-slot window starting at Hash(key); a full window appends unconditionally.
+// The driver zeroes the set (vkCmdFillBuffer) before a publication after a present, a dropped ring
+// record or a retirement, so a key is reported at most once per clear and never lost: a set tag
+// always has its ring record (or a counted drop) since the last clear.
+inline constexpr std::uint32_t HeaderSeenLow = 7;
+inline constexpr std::uint32_t HeaderSeenHigh = 8;
+inline constexpr std::uint32_t HeaderSeenSlots = 9;
 inline constexpr std::uint32_t HeaderWords = 16;
+inline constexpr std::uint32_t SeenProbeSteps = 8;
+inline constexpr std::uint32_t SeenTagSeed = 0x811c9dc5u;
+inline constexpr std::uint32_t SeenTagPrime = 0x01000193u;
 
 inline constexpr std::uint32_t RingCountWord = 0;
 inline constexpr std::uint32_t RingRecordsWord = 4;
@@ -105,6 +117,12 @@ constexpr std::uint32_t Hash(const Key& key) {
     auto hash = HashSeed;
     for (const auto word : key) hash = HashWord(hash, word);
     return HashFinish(hash);
+}
+
+constexpr std::uint32_t SeenTag(const Key& key) {
+    auto tag = SeenTagSeed;
+    for (const auto word : key) tag = (tag ^ word) * SeenTagPrime;
+    return tag | 1u;
 }
 
 constexpr bool NullDescriptor(std::uint32_t word0, std::uint32_t word1) {

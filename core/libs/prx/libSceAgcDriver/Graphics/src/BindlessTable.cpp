@@ -4,6 +4,7 @@
 #include "DeviceImageTableAbi.hpp"
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstdlib>
 #include <cstring>
 #include <span>
@@ -17,14 +18,25 @@ namespace {
 namespace Abi = ShaderRecompiler::DeviceImageTableAbi;
 
 constexpr VkBufferUsageFlags DeviceUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
-constexpr std::size_t RingWords = Abi::RingRecordsWord + static_cast<std::size_t>(BindlessTable::RingCapacity) * Abi::RecordWords;
 constexpr std::size_t UpdateBufferBytes = 65536u;
+
+std::size_t RingWords(std::uint32_t capacity) {
+    return Abi::RingRecordsWord + static_cast<std::size_t>(capacity) * Abi::RecordWords;
+}
 
 }
 
 bool BindlessImagesRequested() {
     const char* value = std::getenv("APS5_BINDLESS_IMAGES");
     return value != nullptr && std::string_view(value) == "1";
+}
+
+std::uint32_t BindlessRingRecords() {
+    const char* value = std::getenv("APS5_BINDLESS_RING_RECORDS");
+    if (value == nullptr || *value == '\0') return BindlessTable::DefaultRingCapacity;
+    const auto records = std::strtoull(value, nullptr, 0);
+    Require(records >= 64u && records <= (1u << 20u) && std::has_single_bit(records), "APS5_BINDLESS_RING_RECORDS must be a power of two from 64 to 1048576");
+    return static_cast<std::uint32_t>(records);
 }
 
 std::optional<std::string> BindlessUnsupported(const BindlessFeatureSupport& support) {
@@ -49,8 +61,12 @@ std::optional<std::string> BindlessUnsupported(const BindlessFeatureSupport& sup
     return missing;
 }
 
-BindlessTable::BindlessTable(const Context& context, DescriptorHeap::Capacities capacities, std::uint32_t buckets, std::uint32_t maxBuckets) : context(context), heap(context, capacities), keys(buckets, maxBuckets), rings(std::make_shared<Rings>()) {
+BindlessTable::BindlessTable(const Context& context, DescriptorHeap::Capacities capacities, std::uint32_t buckets, std::uint32_t maxBuckets, std::uint32_t ringCapacity) : context(context), heap(context, capacities), keys(buckets, maxBuckets), ringCapacity(ringCapacity), rings(std::make_shared<Rings>()) {
     Require(context.bufferDeviceAddress, "the bindless image table needs buffer device addresses");
+    Require(ringCapacity != 0u && ringCapacity <= (1u << 20u), "the bindless miss ring capacity must be 1 to 1048576 records");
+    seenSlots = std::max<std::uint32_t>(MinSeenSlots, std::bit_ceil(ringCapacity * 4u));
+    rings->capacity = ringCapacity;
+    seen = std::make_shared<Buffer>(context, static_cast<std::size_t>(seenSlots) * sizeof(std::uint32_t), DeviceUsage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     header = std::make_shared<Buffer>(context, Abi::HeaderWords * sizeof(std::uint32_t), DeviceUsage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     heap.SetHeader(header->Handle(), Abi::HeaderWords * sizeof(std::uint32_t));
 }
@@ -79,6 +95,10 @@ std::uint32_t BindlessTable::Retire(const std::function<bool(const Key&, const D
         return !drop(key, *value);
     });
     totals.retired += dropped;
+    if (dropped != 0u) {
+        std::lock_guard ringLock(rings->mutex);
+        rings->clearSeen = true;
+    }
     return dropped;
 }
 
@@ -92,9 +112,20 @@ void BindlessTable::Publish(Recorder& recorder) {
     const bool grown = table == nullptr || keys.Buckets() != tableBuckets;
     const bool rebuilt = grown || keys.Rebuilt();
     const auto changed = keys.TakeChanged();
+    bool clear = false;
+    {
+        std::lock_guard ringLock(rings->mutex);
+        clear = std::exchange(rings->clearSeen, false);
+    }
     ++totals.publications;
-    if (!assign && !rebuilt && changed.empty()) return;
+    if (!assign && !rebuilt && changed.empty() && !clear) return;
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    if (clear) {
+        // Ordered after every earlier lookup by the barrier above and before every later one by the
+        // barrier at the end: a key missed after this point is reported again.
+        context.Resolved(&DeviceFunctions::cmdFillBuffer, "vkCmdFillBuffer")(commands, seen->Handle(), 0, VK_WHOLE_SIZE, 0u);
+        ++totals.seenClears;
+    }
     const auto words = keys.Words();
     const auto bytes = words.size() * sizeof(std::uint32_t);
     if (grown) {
@@ -127,7 +158,7 @@ void BindlessTable::Publish(Recorder& recorder) {
                     ring = std::move(rings->free.back());
                     rings->free.pop_back();
                 } else {
-                    ring = std::make_shared<Buffer>(context, RingWords * sizeof(std::uint32_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+                    ring = std::make_shared<Buffer>(context, RingWords(ringCapacity) * sizeof(std::uint32_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
                 }
             }
             std::memset(ring->Bytes().data(), 0, Abi::RingRecordsWord * sizeof(std::uint32_t));
@@ -145,7 +176,11 @@ void BindlessTable::Publish(Recorder& recorder) {
         fields[Abi::HeaderMask] = keys.Buckets() - 1u;
         fields[Abi::HeaderRingLow] = static_cast<std::uint32_t>(ringAddress);
         fields[Abi::HeaderRingHigh] = static_cast<std::uint32_t>(ringAddress >> 32u);
-        fields[Abi::HeaderRingCapacity] = RingCapacity;
+        fields[Abi::HeaderRingCapacity] = ringCapacity;
+        const auto seenAddress = seen->DeviceAddress();
+        fields[Abi::HeaderSeenLow] = static_cast<std::uint32_t>(seenAddress);
+        fields[Abi::HeaderSeenHigh] = static_cast<std::uint32_t>(seenAddress >> 32u);
+        fields[Abi::HeaderSeenSlots] = seenSlots;
         context.Resolved(&DeviceFunctions::cmdUpdateBuffer, "vkCmdUpdateBuffer")(commands, header->Handle(), 0, sizeof(fields), fields.data());
     }
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
@@ -161,9 +196,12 @@ void BindlessTable::drain(const std::shared_ptr<Rings>& rings, const std::shared
     }
     drained->Invalidate();
     const auto bytes = drained->Bytes();
-    const auto decoded = DecodeDeviceImageRing(std::span<const std::uint32_t>(reinterpret_cast<const std::uint32_t*>(bytes.data()), RingWords), RingCapacity);
+    const auto decoded = DecodeDeviceImageRing(std::span<const std::uint32_t>(reinterpret_cast<const std::uint32_t*>(bytes.data()), RingWords(rings->capacity)), rings->capacity);
     std::lock_guard lock(rings->mutex);
     ++rings->drained;
+    // A dropped record's key is marked reported but never reached the service: zero the set at the
+    // next publication so it is reported again.
+    if (decoded.dropped != 0u) rings->clearSeen = true;
     rings->written += decoded.written;
     rings->dropped += decoded.dropped;
     rings->misses.insert(rings->misses.end(), decoded.misses.begin(), decoded.misses.end());
@@ -192,6 +230,11 @@ std::shared_ptr<void> BindlessTable::HoldRing() {
         ++rings->holds[held.get()];
     }
     return std::shared_ptr<void>(held.get(), [shared = rings, held](void*) { release(shared, held); });
+}
+
+void BindlessTable::ForgetReportedMisses() {
+    std::lock_guard lock(rings->mutex);
+    rings->clearSeen = true;
 }
 
 std::vector<DeviceImageMiss> BindlessTable::TakeMisses() {

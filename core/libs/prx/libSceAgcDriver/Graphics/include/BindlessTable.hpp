@@ -33,13 +33,23 @@ struct BindlessFeatureSupport {
 };
 
 std::optional<std::string> BindlessUnsupported(const BindlessFeatureSupport& support);
+// Miss ring records per batch: APS5_BINDLESS_RING_RECORDS (a power of two, 64..1048576), default
+// BindlessTable::DefaultRingCapacity.
+std::uint32_t BindlessRingRecords();
 
 class BindlessTable {
 public:
     using Key = DeviceImageKeys::Key;
-    static constexpr std::uint32_t RingCapacity = 1024u;
+    // The GPU reports each missing key once per clear of the reported-miss set, so a ring holds
+    // distinct keys: 65,536 records (4 MiB of host memory per batch in flight) take a scene's
+    // first-touch storm in a few batches.
+    static constexpr std::uint32_t DefaultRingCapacity = 65536u;
+    // The reported-miss set (device local) holds every key claimed since its last clear, which can be
+    // all the keys a scene misses before the first drain, not just a ring's worth: 4M slots (16 MiB)
+    // keep the 8-slot windows of a ~1M-key storm at <= 25% load. A full window reports anyway.
+    static constexpr std::uint32_t MinSeenSlots = 1u << 22u;
 
-    BindlessTable(const Context& context, DescriptorHeap::Capacities capacities, std::uint32_t buckets = DeviceImageKeys::InitialBuckets, std::uint32_t maxBuckets = DeviceImageKeys::MaxBuckets);
+    BindlessTable(const Context& context, DescriptorHeap::Capacities capacities, std::uint32_t buckets = DeviceImageKeys::InitialBuckets, std::uint32_t maxBuckets = DeviceImageKeys::MaxBuckets, std::uint32_t ringCapacity = DefaultRingCapacity);
     ~BindlessTable();
     BindlessTable(const BindlessTable&) = delete;
     BindlessTable& operator=(const BindlessTable&) = delete;
@@ -52,6 +62,11 @@ public:
     void Publish(Recorder& recorder);
     std::vector<DeviceImageMiss> TakeMisses();
     std::shared_ptr<void> HoldRing();
+    // Zero the reported-miss set at the next Publish, so keys missed after it are reported again
+    // (the service calls it after each present wait; drops and retirements request it themselves).
+    void ForgetReportedMisses();
+    std::uint32_t RingCapacity() const { return ringCapacity; }
+    std::uint32_t SeenSlots() const { return seenSlots; }
 
     struct Counts {
         std::uint64_t publications = 0;
@@ -62,6 +77,7 @@ public:
         std::uint64_t misses = 0;
         std::uint64_t dropped = 0;
         std::uint64_t retired = 0;
+        std::uint64_t seenClears = 0;
         std::uint32_t entries = 0;
         std::uint32_t buckets = 0;
     };
@@ -77,6 +93,8 @@ private:
         std::uint64_t dropped = 0;
         std::map<const Buffer*, std::uint32_t> holds;
         std::vector<std::shared_ptr<Buffer>> deferred;
+        std::uint32_t capacity = 0;
+        bool clearSeen = true;
     };
     static void drain(const std::shared_ptr<Rings>& rings, const std::shared_ptr<Buffer>& ring);
     static void release(const std::shared_ptr<Rings>& rings, const std::shared_ptr<Buffer>& ring);
@@ -88,6 +106,9 @@ private:
     std::shared_ptr<Buffer> header;
     std::shared_ptr<Buffer> table;
     std::uint32_t tableBuckets = 0;
+    std::uint32_t ringCapacity = 0;
+    std::uint32_t seenSlots = 0;
+    std::shared_ptr<Buffer> seen;
     std::shared_ptr<Buffer> ring;
     std::uint64_t ringBatch = 0;
     std::shared_ptr<Rings> rings;

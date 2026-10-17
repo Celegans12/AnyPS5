@@ -1686,6 +1686,21 @@ void RunBindlessMissTests(AgcDriver::VulkanDevice& device) {
         }
     }
     Require(matched == 3u, "bindless miss: the driver registered " + std::to_string(matched) + " of the 3 missed keys");
+    // Eight workgroups miss three new keys: the GPU appends each key to the miss ring once.
+    SetRecord(8, PointClamp, Image(OtherFloatTexels.data(), Format32Float));
+    SetRecord(9, LinearWrap, Image(OtherFloatTexels.data(), Format32Float));
+    SetRecord(10, LinearWrap, Image(FloatTexels.data(), Format32Float));
+    for (std::uint32_t group = 0; group < MaxGroups; ++group) Keys[group] = 8u + group % 3u;
+    const auto ringBefore = service.Table().Totals();
+    const auto storm = Run(device, TableCode, MaxGroups, Lanes, 64);
+    Require(!Faulted(storm) && Zeros(storm), "bindless miss dedup: unprimed keys did not sample zeros without a fault:\n" + storm.log);
+    const auto ringAfter = service.Table().Totals();
+    Require(ringAfter.misses - ringBefore.misses == 3u && ringAfter.dropped == ringBefore.dropped, "bindless miss dedup: " + std::to_string(MaxGroups) + " workgroups missing 3 keys appended " + std::to_string(ringAfter.misses - ringBefore.misses) + " ring records, expected each key once");
+    const auto stormServed = Run(device, TableCode, MaxGroups, Lanes, 64);
+    Require(!Faulted(stormServed), "bindless miss dedup: the served keys faulted:\n" + stormServed.log);
+    for (std::uint32_t group = 0; group < MaxGroups; group += 3u) RequireRed(stormServed, group, Lanes, [](std::uint32_t x) { return std::bit_cast<std::uint32_t>(OtherFloatTexels[x]); }, "bindless miss dedup: workgroup " + std::to_string(group) + " after the fill");
+    Require(service.Table().Totals().misses == ringAfter.misses, "bindless miss dedup: the frame after the fill missed again");
+    std::printf("bindless miss dedup: %u workgroups missing 3 keys appended %llu ring records\n", MaxGroups, static_cast<unsigned long long>(ringAfter.misses - ringBefore.misses));
 }
 
 void RunBindlessStorageWriteTests(AgcDriver::VulkanDevice& device) {

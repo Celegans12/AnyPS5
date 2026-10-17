@@ -152,6 +152,7 @@ public:
     static Options OptionsFromEnvironment(std::uint64_t defaultBudgetBytes);
 
     BindlessTable& Table() { return table; }
+    const BindlessTable& Table() const { return table; }
     std::uint64_t Register(const BindlessTableRegistration& registration);
     bool Primed(std::uint64_t id) const;
     bool WaitPrimed(std::uint64_t id, std::uint32_t milliseconds);
@@ -231,6 +232,7 @@ private:
     void reverify(Tracked& table, Recorder& recorder, Lock& lock);
     void revalidateServed(Tracked& table, Recorder& recorder, Lock& lock);
     void resolveMisses(Recorder& recorder, Lock& lock);
+    std::vector<DeviceImageMiss> unresolved(std::span<const DeviceImageMiss> misses) const;
     void refreshPerUse(std::span<const std::uint64_t> served, Recorder& recorder, Lock& lock);
     void checkMapping(Recorder& recorder);
     void retireNow(Recorder& recorder);
@@ -266,6 +268,8 @@ private:
     std::uint64_t budgetBytes = 0;
     std::uint64_t lastRings = 0;
     std::uint64_t lastDropped = 0;
+    std::uint64_t lastRecords = 0;
+    std::uint64_t lastSeenClears = 0;
     std::uint64_t frame = 0;
     Counts totals;
     Counts reported;

@@ -283,8 +283,11 @@ void TextureService::workerLoop() {
         takingMisses = true;
         lock.unlock();
         auto misses = table.TakeMisses();
+        lock.lock();
+        const auto fresh = unresolved(misses);
+        lock.unlock();
         std::vector<BindlessPrepared> prepared;
-        for (const auto& miss : misses) prepared.push_back(prepare(miss.key));
+        for (const auto& miss : fresh) prepared.push_back(prepare(miss.key));
         lock.lock();
         totals.misses += misses.size();
         missPending.insert(missPending.end(), std::make_move_iterator(prepared.begin()), std::make_move_iterator(prepared.end()));
@@ -693,12 +696,24 @@ void TextureService::revalidateServed(Tracked& tracked, Recorder& recorder, Lock
     }
 }
 
+std::vector<DeviceImageMiss> TextureService::unresolved(std::span<const DeviceImageMiss> misses) const {
+    std::vector<DeviceImageMiss> fresh;
+    fresh.reserve(misses.size());
+    for (const auto& miss : misses) {
+        if (!entries.contains(miss.key)) fresh.push_back(miss);
+    }
+    return fresh;
+}
+
 void TextureService::resolveMisses(Recorder& recorder, Lock& lock) {
     changed.wait(lock, [&] { return !takingMisses; });
     lock.unlock();
     const auto misses = table.TakeMisses();
+    lock.lock();
+    const auto fresh = unresolved(misses);
+    lock.unlock();
     std::vector<BindlessPrepared> prepared;
-    for (const auto& miss : misses) prepared.push_back(prepare(miss.key));
+    for (const auto& miss : fresh) prepared.push_back(prepare(miss.key));
     lock.lock();
     totals.misses += misses.size();
     prepared.insert(prepared.end(), std::make_move_iterator(missPending.begin()), std::make_move_iterator(missPending.end()));
@@ -899,6 +914,7 @@ void TextureService::AfterPresentWait(Recorder& recorder, std::uint64_t waitedNa
         }
     }
     Revalidate(recorder);
+    table.ForgetReportedMisses();
     Publish(recorder);
 }
 
@@ -961,6 +977,10 @@ std::string TextureService::TakeFrameLine(std::uint64_t oldPathNanoseconds) {
     std::lock_guard lock(mutex);
     const auto dropped = ring.dropped - lastDropped;
     lastDropped = ring.dropped;
+    const auto records = ring.misses - lastRecords;
+    lastRecords = ring.misses;
+    const auto clears = ring.seenClears - lastSeenClears;
+    lastSeenClears = ring.seenClears;
     const auto oldPath = oldPathNanoseconds - std::min(oldPathNanoseconds, reportedOldPath);
     reportedOldPath = oldPathNanoseconds;
     const auto delta = [](std::uint64_t current, std::uint64_t previous) { return static_cast<unsigned long long>(current - previous); };
@@ -971,9 +991,9 @@ std::string TextureService::TakeFrameLine(std::uint64_t oldPathNanoseconds) {
         refusals += ' ';
         refusals += std::to_string(now.refusals[kind] - reported.refusals[kind]);
     }
-    char text[1536];
-    std::snprintf(text, sizeof(text), "[bindless] frame %llu: misses %llu (%llu dropped), created %llu, refused %llu, primed %llu tables (%llu records, %llu new keys, primer %.1f ms), re-decoded %llu pages (%llu records changed), served-checked %llu (%llu stale), queue %llu, revalidated %llu (%llu stale, %llu per-use, %llu dcc), retired %llu (%llu unmapped, %llu evicted, %llu full), serve %.1f ms over %llu calls, present wait %.1f ms, entries %llu, slots %llu+%llu, pinned %.1f MiB of a %llu MiB budget, old-path resolve %.1f ms, refusals (%s), kept refusals %llu, host: tables %llu (%.1f MiB), entries %.1f MiB, rejections %llu (%.1f MiB)",
-        static_cast<unsigned long long>(frame), delta(now.misses, reported.misses), static_cast<unsigned long long>(dropped), delta(now.created, reported.created), delta(now.refused, reported.refused), delta(now.primed, reported.primed), delta(now.primedRecords, reported.primedRecords), delta(now.primedKeys, reported.primedKeys), Milliseconds(now.primerNanoseconds - reported.primerNanoseconds), delta(now.pagesChanged, reported.pagesChanged), delta(now.recordsChanged, reported.recordsChanged), delta(now.servedChecked, reported.servedChecked), delta(now.servedStale, reported.servedStale), static_cast<unsigned long long>(now.queued), delta(now.revalidated, reported.revalidated), delta(now.stale, reported.stale), delta(now.refreshed, reported.refreshed), delta(now.dccRefreshed, reported.dccRefreshed), delta(now.retired, reported.retired), delta(now.unmapped, reported.unmapped), delta(now.evicted, reported.evicted), delta(now.fullEvictions, reported.fullEvictions), Milliseconds(now.serveNanoseconds - reported.serveNanoseconds), delta(now.serves, reported.serves), Milliseconds(now.presentWaitNanoseconds - reported.presentWaitNanoseconds), static_cast<unsigned long long>(now.entries), static_cast<unsigned long long>(now.imageSlots), static_cast<unsigned long long>(now.samplerSlots), static_cast<double>(now.pinnedBytes) / static_cast<double>(1u << 20u), static_cast<unsigned long long>(now.budgetBytes >> 20u), Milliseconds(oldPath), refusals.c_str(), delta(now.keptRefusals, reported.keptRefusals), static_cast<unsigned long long>(now.tables), static_cast<double>(now.tableHostBytes) / static_cast<double>(1u << 20u), static_cast<double>(now.entryHostBytes) / static_cast<double>(1u << 20u), static_cast<unsigned long long>(now.rejections), static_cast<double>(now.rejectionHostBytes) / static_cast<double>(1u << 20u));
+    char text[1664];
+    std::snprintf(text, sizeof(text), "[bindless] frame %llu: misses %llu (%llu dropped), created %llu, refused %llu, primed %llu tables (%llu records, %llu new keys, primer %.1f ms), re-decoded %llu pages (%llu records changed), served-checked %llu (%llu stale), queue %llu, revalidated %llu (%llu stale, %llu per-use, %llu dcc), retired %llu (%llu unmapped, %llu evicted, %llu full), serve %.1f ms over %llu calls, present wait %.1f ms, entries %llu, slots %llu+%llu, pinned %.1f MiB of a %llu MiB budget, old-path resolve %.1f ms, refusals (%s), kept refusals %llu, host: tables %llu (%.1f MiB), entries %.1f MiB, rejections %llu (%.1f MiB), miss ring: %llu records, %llu set clears",
+        static_cast<unsigned long long>(frame), delta(now.misses, reported.misses), static_cast<unsigned long long>(dropped), delta(now.created, reported.created), delta(now.refused, reported.refused), delta(now.primed, reported.primed), delta(now.primedRecords, reported.primedRecords), delta(now.primedKeys, reported.primedKeys), Milliseconds(now.primerNanoseconds - reported.primerNanoseconds), delta(now.pagesChanged, reported.pagesChanged), delta(now.recordsChanged, reported.recordsChanged), delta(now.servedChecked, reported.servedChecked), delta(now.servedStale, reported.servedStale), static_cast<unsigned long long>(now.queued), delta(now.revalidated, reported.revalidated), delta(now.stale, reported.stale), delta(now.refreshed, reported.refreshed), delta(now.dccRefreshed, reported.dccRefreshed), delta(now.retired, reported.retired), delta(now.unmapped, reported.unmapped), delta(now.evicted, reported.evicted), delta(now.fullEvictions, reported.fullEvictions), Milliseconds(now.serveNanoseconds - reported.serveNanoseconds), delta(now.serves, reported.serves), Milliseconds(now.presentWaitNanoseconds - reported.presentWaitNanoseconds), static_cast<unsigned long long>(now.entries), static_cast<unsigned long long>(now.imageSlots), static_cast<unsigned long long>(now.samplerSlots), static_cast<double>(now.pinnedBytes) / static_cast<double>(1u << 20u), static_cast<unsigned long long>(now.budgetBytes >> 20u), Milliseconds(oldPath), refusals.c_str(), delta(now.keptRefusals, reported.keptRefusals), static_cast<unsigned long long>(now.tables), static_cast<double>(now.tableHostBytes) / static_cast<double>(1u << 20u), static_cast<double>(now.entryHostBytes) / static_cast<double>(1u << 20u), static_cast<unsigned long long>(now.rejections), static_cast<double>(now.rejectionHostBytes) / static_cast<double>(1u << 20u), static_cast<unsigned long long>(records), static_cast<unsigned long long>(clears));
     reported = now;
     return text;
 }

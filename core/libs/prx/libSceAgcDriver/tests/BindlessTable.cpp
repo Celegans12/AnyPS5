@@ -16,6 +16,7 @@
 #include <exception>
 #include <functional>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -24,6 +25,8 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <tuple>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -455,10 +458,10 @@ void keyTests() {
 }
 
 struct Fixture {
-    Fixture(const Device& device, std::uint32_t records, std::uint32_t missing, std::uint32_t list, std::uint32_t workingSet = 0u) : context(device.GetContext()) {
+    Fixture(const Device& device, std::uint32_t records, std::uint32_t missing, std::uint32_t list, std::uint32_t workingSet = 0u, std::uint32_t ringCapacity = BindlessTable::DefaultRingCapacity) : context(device.GetContext()) {
         const auto capacities = DescriptorHeap::DeviceCapacities(context);
         Require(capacities.sampledImages > records, "the device's update-after-bind sampled image limit is below the test's records: " + std::to_string(capacities.sampledImages));
-        table = std::make_unique<BindlessTable>(context, DescriptorHeap::Capacities{std::min(capacities.samplers, 64u), capacities.sampledImages, std::min(capacities.storageImages, 64u)});
+        table = std::make_unique<BindlessTable>(context, DescriptorHeap::Capacities{std::min(capacities.samplers, 64u), capacities.sampledImages, std::min(capacities.storageImages, 64u)}, DeviceImageKeys::InitialBuckets, DeviceImageKeys::MaxBuckets, ringCapacity);
         images = std::make_unique<Images>(context, DistinctImages);
         pipeline = std::make_unique<LookupPipeline>(context, table->Heap(), images->View(0));
         total = records + missing;
@@ -611,7 +614,8 @@ void gpuTests(const Device& device) {
     Require(gotMisses == wantedMisses, "the miss ring returned " + std::to_string(gotMisses.size()) + " distinct keys, expected " + std::to_string(wantedMisses.size()));
     Require(!pcs.empty() && std::all_of(pcs.begin(), pcs.end(), [](std::uint32_t pc) { return pc == 0x111u || pc == 0x222u; }), "the miss ring records name other program counters than the two dispatches that missed");
     const auto totals = table.Totals();
-    Require(totals.drained == 1u && totals.rings == 1u && totals.dropped == 0u && totals.misses >= gotMisses.size(), "the miss ring was not drained once after its batch");
+    Require(totals.drained == 1u && totals.rings == 1u && totals.dropped == 0u, "the miss ring was not drained once after its batch");
+    Require(totals.misses == gotMisses.size(), "the GPU appended " + std::to_string(totals.misses) + " ring records for " + std::to_string(gotMisses.size()) + " distinct missing keys: a key missed by many invocations and two dispatches must be reported once");
     Require(table.TakeMisses().empty(), "taken misses came back");
     std::cout << "miss ring round trip passed: " << totals.misses << " records, " << gotMisses.size() << " distinct keys, " << wantedWithLate.size() << " still missing after the late insert\n";
 
@@ -656,6 +660,92 @@ void gpuTests(const Device& device) {
     Require(Abi::SlotIndex(reused) == retiredIndex && Abi::SlotGeneration(reused) == Abi::SlotGeneration(retiredSlot) + 1u, "the freed slot was not reused with the next generation");
     Require(table.Heap().Live(DescriptorHeap::Array::SampledImages, reused) && !table.Heap().Live(DescriptorHeap::Array::SampledImages, retiredSlot), "slot generations do not tell the reused slot from the retired one");
     std::cout << "retire and generation reuse tests passed\n";
+    recorder.Sync();
+    recorder.FlushDeferredReleases();
+}
+
+// The reported-miss set (DeviceImageTableAbi HeaderSeen*): many invocations miss the same keys, the
+// ring is smaller than the distinct misses, entries are retired, and nobody presents in between.
+void dedupTests(const Device& device) {
+    constexpr std::uint32_t Records = 256u;
+    constexpr std::uint32_t Missing = 64u;
+    constexpr std::uint32_t Ring = 16u;
+    constexpr std::uint32_t Groups = 16u;
+    constexpr std::uint32_t Threads = Groups * 64u;
+    constexpr std::uint32_t Iterations = 4u;
+    std::unique_lock gpu(AgcDriver::GuestMemory::GpuMutex());
+    Fixture fixture(device, Records, Missing, 1u << 10u, 0u, Ring);
+    auto& table = *fixture.table;
+    Require(table.RingCapacity() == Ring && table.SeenSlots() >= 64u, "the miss ring capacity was not taken from the constructor");
+    Recorder recorder(fixture.context, device.Timeline());
+    recorder.Activate();
+    std::vector<std::uint32_t> imageOf(fixture.total, ~0u);
+    std::vector<std::uint32_t> modeOf(fixture.total, 0u);
+    for (std::uint32_t record = 0; record < Records; ++record) {
+        imageOf[record] = record % DistinctImages;
+        modeOf[record] = RecordMode(record);
+    }
+    std::set<std::uint32_t> missing;
+    for (std::uint32_t id = 0; id < Threads; ++id) {
+        for (std::uint32_t iteration = 0; iteration < Iterations; ++iteration) {
+            const auto record = fixture.order[(id * 7u + iteration * 131u) & fixture.listMask];
+            if (record >= Records) missing.insert(record);
+        }
+    }
+    Require(missing.size() > 2u * Ring, "the test's index list touches too few missing records: " + std::to_string(missing.size()));
+    auto result = std::make_shared<Buffer>(fixture.context, Threads * 4u, AddressUsage);
+    const auto batch = [&](std::uint32_t pc) {
+        const auto before = table.Totals();
+        table.Publish(recorder);
+        fixture.pipeline->Record(recorder.Commands(), table.Heap(), fixture.MakePush(2u, Iterations, *result, pc), Groups);
+        fixture.pipeline->Record(recorder.Commands(), table.Heap(), fixture.MakePush(2u, Iterations, *result, pc + 1u), Groups);
+        recorder.Submit();
+        recorder.Sync();
+        const auto after = table.Totals();
+        return std::pair{after.misses - before.misses, after.dropped - before.dropped};
+    };
+    std::map<Table::Key, std::uint32_t> recordOf;
+    for (const auto record : missing) recordOf.emplace(RecordKey(record), record);
+    std::uint32_t batches = 0;
+    for (auto remaining = missing.size(); remaining != 0u; ++batches) {
+        Require(batches < missing.size(), "the miss storm did not converge");
+        const auto [written, dropped] = batch(0x900u + batches * 2u);
+        Require(written == remaining, "batch " + std::to_string(batches) + ": the GPU appended " + std::to_string(written) + " ring records for " + std::to_string(remaining) + " distinct missing keys (2 dispatches, about " + std::to_string(Threads * Iterations * 2u / fixture.total) + " reads per key)");
+        Require(dropped == remaining - std::min<std::uint64_t>(remaining, Ring), "batch " + std::to_string(batches) + ": " + std::to_string(dropped) + " ring records dropped, expected " + std::to_string(remaining - std::min<std::uint64_t>(remaining, Ring)));
+        const auto taken = table.TakeMisses();
+        Require(taken.size() == std::min<std::uint64_t>(remaining, Ring), "batch " + std::to_string(batches) + ": took " + std::to_string(taken.size()) + " distinct keys from a ring of " + std::to_string(Ring));
+        for (const auto& miss : taken) {
+            const auto found = recordOf.find(miss.key);
+            Require(found != recordOf.end(), "the miss ring returned a key no invocation missed");
+            const auto record = found->second;
+            recordOf.erase(found);
+            const auto slot = table.Heap().AllocateImage(DescriptorHeap::Array::SampledImages, fixture.images->View(record % DistinctImages), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            Require(table.Insert(RecordKey(record), DeviceImageValue{slot, RecordMode(record), 0u, 0u}) == DeviceImageKeys::Insertion::Inserted, "a reported key was not inserted");
+            imageOf[record] = record % DistinctImages;
+            modeOf[record] = RecordMode(record);
+        }
+        remaining -= taken.size();
+    }
+    Require(recordOf.empty() && batches == (missing.size() + Ring - 1u) / Ring, "every missing key was reported, but over " + std::to_string(batches) + " batches");
+    const auto [quiet, quietDropped] = batch(0xa00u);
+    Require(quiet == 0u && quietDropped == 0u, "a batch after the fill still missed");
+    auto failures = Mismatches(result->Bytes(), Threads, [&](std::uint32_t id) { return fixture.Expected(id, Iterations, false, imageOf, modeOf); }, "lookup after the miss storm was filled");
+    Require(failures == 0u, std::to_string(failures) + " invocations read wrong results after the miss storm was filled");
+    // A retired entry misses again and is reported again, without a present in between.
+    const auto victim = *missing.begin();
+    Require(table.Retire([&](const Table::Key& key, const DeviceImageValue&) { return key == RecordKey(victim); }) == 1u, "the victim entry was not retired");
+    auto [again, againDropped] = batch(0xb00u);
+    Require(again == 1u && againDropped == 0u && table.TakeMisses().size() == 1u, "a key missed after its entry was retired was not reported again (" + std::to_string(again) + " records)");
+    // Within one clear of the set a still-missing key is reported once; after a clear, again.
+    std::tie(again, againDropped) = batch(0xc00u);
+    Require(again == 0u, "a key reported since the last clear of the reported-miss set was appended again");
+    table.ForgetReportedMisses();
+    std::tie(again, againDropped) = batch(0xd00u);
+    Require(again == 1u && table.TakeMisses().size() == 1u, "a key still missing after ForgetReportedMisses was not reported again");
+    imageOf[victim] = ~0u;
+    failures = Mismatches(result->Bytes(), Threads, [&](std::uint32_t id) { return fixture.Expected(id, Iterations, false, imageOf, modeOf); }, "lookup with the retired entry");
+    Require(failures == 0u, std::to_string(failures) + " invocations read wrong results around the retired entry");
+    std::cout << "miss dedup passed: " << missing.size() << " missing keys read about " << Threads * Iterations * 2u / fixture.total << " times per batch, each reported once per batch through a " << Ring << "-record ring over " << batches << " batches; retire and clear re-report; " << table.Totals().seenClears << " set clears\n";
     recorder.Sync();
     recorder.FlushDeferredReleases();
 }
@@ -832,6 +922,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         gpuTests(*device);
+        dedupTests(*device);
         growthTests(*device);
         return 0;
     } catch (const std::exception& error) {

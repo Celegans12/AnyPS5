@@ -12,6 +12,7 @@ layout(set = 3, binding = 1) uniform utexture2D heapImages[];
 
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint words[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) coherent buffer Ring { uint count; uint reserved0; uint reserved1; uint reserved2; uint records[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) coherent buffer Seen { uint words[]; };
 
 layout(push_constant) uniform Parameters {
     uint64_t header;
@@ -69,6 +70,27 @@ uvec2 lookup(uint key[15]) {
         for (uint word = 0u; word < KeyWords; ++word) equal = equal && bucket.words[word] == key[word];
         if (equal) return uvec2(bucket.words[SlotWord], bucket.words[ModeWord]);
     }
+    // Report each missing key once per clear of the reported-miss set (the same protocol as the
+    // recompiler's bindless_lookup: claim the key's tag in an 8-slot window, a full window reports).
+    uint seenSlots = header.words[9];
+    bool report = true;
+    if (seenSlots != 0u) {
+        Seen seen = Seen(packUint2x32(uvec2(header.words[7], header.words[8])));
+        uint tag = 0x811c9dc5u;
+        for (uint word = 0u; word < KeyWords; ++word) tag = (tag ^ key[word]) * 0x01000193u;
+        tag |= 1u;
+        bool settled = false;
+        for (uint step = 0u; step < 8u && !settled; ++step) {
+            uint index = (hash + step) & (seenSlots - 1u);
+            uint current = atomicAdd(seen.words[index], 0u);
+            if (current == 0u) current = atomicCompSwap(seen.words[index], 0u, tag);
+            if (current == 0u || current == tag) {
+                report = current == 0u;
+                settled = true;
+            }
+        }
+    }
+    if (!report) return uvec2(0u);
     Ring ring = Ring(packUint2x32(uvec2(header.words[4], header.words[5])));
     uint at = atomicAdd(ring.count, 1u);
     if (at < header.words[6]) {

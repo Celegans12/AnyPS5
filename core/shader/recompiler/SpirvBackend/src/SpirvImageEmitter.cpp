@@ -2213,6 +2213,15 @@ std::uint32_t DefineBindlessLookup(SpirvEmitterState& state, bool full, bool add
     state.module.AddFunction(spv::OpVariable, TypePointer(state, spv::StorageClassFunction, u32), stepVariable, spv::StorageClassFunction);
     state.module.AddFunction(spv::OpVariable, TypePointer(state, spv::StorageClassFunction, boolean), doneVariable, spv::StorageClassFunction);
     state.module.AddFunction(spv::OpVariable, TypePointer(state, spv::StorageClassFunction, uvec4), foundVariable, spv::StorageClassFunction);
+    const auto hashVariable = full ? state.module.AllocateId() : 0u;
+    const auto claimVariable = full ? state.module.AllocateId() : 0u;
+    const auto settledVariable = full ? state.module.AllocateId() : 0u;
+    if (full) {
+        state.module.AddFunction(spv::OpVariable, TypePointer(state, spv::StorageClassFunction, u32), hashVariable, spv::StorageClassFunction);
+        state.module.AddFunction(spv::OpVariable, TypePointer(state, spv::StorageClassFunction, boolean), claimVariable, spv::StorageClassFunction);
+        state.module.AddFunction(spv::OpVariable, TypePointer(state, spv::StorageClassFunction, boolean), settledVariable, spv::StorageClassFunction);
+        state.module.AddFunction(spv::OpStore, hashVariable, constant(0u));
+    }
     const auto counts = BindlessExtract(state, extra, 3u);
     const auto imageCount = binary(spv::OpBitwiseAnd, u32, counts, constant(0xfu));
     const auto samplerCount = binary(spv::OpBitwiseAnd, u32, binary(spv::OpShiftRightLogical, u32, counts, constant(4u)), constant(0xfu));
@@ -2278,6 +2287,7 @@ std::uint32_t DefineBindlessLookup(SpirvEmitterState& state, bool full, bool add
     state.module.AddFunction(spv::OpStore, foundVariable, ConstantU32CompositeZero(state, 4u));
     EmitIfCondition(state, both(negate(slow), negate(null)), [&] {
         const auto hash = BindlessHash(state, key);
+        if (full) state.module.AddFunction(spv::OpStore, hashVariable, hash);
         const auto table = BindlessPair(state, BindlessHeaderWord(state, Table::HeaderTableLow), BindlessHeaderWord(state, Table::HeaderTableHigh));
         const auto mask = BindlessHeaderWord(state, Table::HeaderMask);
         const auto home = binary(spv::OpBitwiseAnd, u32, hash, mask);
@@ -2322,17 +2332,61 @@ std::uint32_t DefineBindlessLookup(SpirvEmitterState& state, bool full, bool add
     status = Select(state, u32, slow, constant(BindlessSlow), status);
     if (full) {
         EmitIfCondition(state, both(record, equal(status, constant(BindlessMiss))), [&] {
-            const auto ring = BindlessPair(state, BindlessHeaderWord(state, Table::HeaderRingLow), BindlessHeaderWord(state, Table::HeaderRingHigh));
-            const auto capacity = BindlessHeaderWord(state, Table::HeaderRingCapacity);
-            const auto index = state.module.AllocateId();
-            state.module.AddFunction(spv::OpAtomicIAdd, u32, index, BindlessPhysicalPointer(state, ring, constant(Table::RingCountWord)), constant(spv::ScopeDevice), constant(spv::MemorySemanticsMaskNone), constant(1u));
-            EmitIfCondition(state, binary(spv::OpULessThan, boolean, index, capacity), [&] {
-                const auto first = binary(spv::OpIAdd, u32, constant(Table::RingRecordsWord), binary(spv::OpIMul, u32, index, constant(Table::RecordWords)));
-                const auto store = [&](std::uint32_t word, std::uint32_t value) {
-                    state.module.AddFunction(spv::OpStore, BindlessPhysicalPointer(state, ring, binary(spv::OpIAdd, u32, first, constant(word))), value, spv::MemoryAccessAlignedMask, 4u);
-                };
-                for (std::uint32_t word = 0; word < Table::KeyWords; ++word) store(word, key[word]);
-                store(Table::RecordPcWord, pc);
+            // Report each missing key once per clear of the reported-miss set (DeviceImageTableAbi
+            // HeaderSeen*): the first invocation to claim the key's tag appends it, the others skip.
+            const auto seen = BindlessPair(state, BindlessHeaderWord(state, Table::HeaderSeenLow), BindlessHeaderWord(state, Table::HeaderSeenHigh));
+            const auto seenSlots = BindlessHeaderWord(state, Table::HeaderSeenSlots);
+            auto tag = constant(Table::SeenTagSeed);
+            for (const auto word : key) tag = binary(spv::OpIMul, u32, binary(spv::OpBitwiseXor, u32, tag, word), constant(Table::SeenTagPrime));
+            tag = binary(spv::OpBitwiseOr, u32, tag, constant(1u));
+            const auto unset = equal(seenSlots, constant(0u));
+            state.module.AddFunction(spv::OpStore, claimVariable, unset);
+            state.module.AddFunction(spv::OpStore, settledVariable, unset);
+            state.module.AddFunction(spv::OpStore, stepVariable, constant(0u));
+            const auto seenHash = load(hashVariable, u32);
+            const auto seenMask = binary(spv::OpISub, u32, seenSlots, constant(1u));
+            const auto seenHeader = state.module.AllocateId();
+            const auto seenBody = state.module.AllocateId();
+            const auto seenContinue = state.module.AllocateId();
+            const auto seenMerge = state.module.AllocateId();
+            state.module.AddFunction(spv::OpBranch, seenHeader);
+            EmitLabel(state, seenHeader);
+            const auto seenStep = load(stepVariable, u32);
+            const auto settled = load(settledVariable, boolean);
+            const auto probing = both(negate(settled), binary(spv::OpULessThan, boolean, seenStep, constant(Table::SeenProbeSteps)));
+            state.module.AddFunction(spv::OpLoopMerge, seenMerge, seenContinue, spv::LoopControlMaskNone);
+            state.module.AddFunction(spv::OpBranchConditional, probing, seenBody, seenMerge);
+            EmitLabel(state, seenBody);
+            const auto slotIndex = binary(spv::OpBitwiseAnd, u32, binary(spv::OpIAdd, u32, seenHash, seenStep), seenMask);
+            const auto current = state.module.AllocateId();
+            state.module.AddFunction(spv::OpAtomicLoad, u32, current, BindlessPhysicalPointer(state, seen, slotIndex), constant(spv::ScopeDevice), constant(spv::MemorySemanticsMaskNone));
+            const auto previous = EmitValueOrDefaultIfCondition(state, equal(current, constant(0u)), u32, current, [&] {
+                const auto exchanged = state.module.AllocateId();
+                state.module.AddFunction(spv::OpAtomicCompareExchange, u32, exchanged, BindlessPhysicalPointer(state, seen, slotIndex), constant(spv::ScopeDevice), constant(spv::MemorySemanticsMaskNone), constant(spv::MemorySemanticsMaskNone), tag, constant(0u));
+                return exchanged;
+            });
+            const auto won = equal(previous, constant(0u));
+            state.module.AddFunction(spv::OpStore, claimVariable, won);
+            state.module.AddFunction(spv::OpStore, settledVariable, either(won, equal(previous, tag)));
+            state.module.AddFunction(spv::OpBranch, seenContinue);
+            EmitLabel(state, seenContinue);
+            state.module.AddFunction(spv::OpStore, stepVariable, binary(spv::OpIAdd, u32, seenStep, constant(1u)));
+            state.module.AddFunction(spv::OpBranch, seenHeader);
+            EmitLabel(state, seenMerge);
+            const auto report = either(load(claimVariable, boolean), negate(load(settledVariable, boolean)));
+            EmitIfCondition(state, report, [&] {
+                const auto ring = BindlessPair(state, BindlessHeaderWord(state, Table::HeaderRingLow), BindlessHeaderWord(state, Table::HeaderRingHigh));
+                const auto capacity = BindlessHeaderWord(state, Table::HeaderRingCapacity);
+                const auto index = state.module.AllocateId();
+                state.module.AddFunction(spv::OpAtomicIAdd, u32, index, BindlessPhysicalPointer(state, ring, constant(Table::RingCountWord)), constant(spv::ScopeDevice), constant(spv::MemorySemanticsMaskNone), constant(1u));
+                EmitIfCondition(state, binary(spv::OpULessThan, boolean, index, capacity), [&] {
+                    const auto first = binary(spv::OpIAdd, u32, constant(Table::RingRecordsWord), binary(spv::OpIMul, u32, index, constant(Table::RecordWords)));
+                    const auto store = [&](std::uint32_t word, std::uint32_t value) {
+                        state.module.AddFunction(spv::OpStore, BindlessPhysicalPointer(state, ring, binary(spv::OpIAdd, u32, first, constant(word))), value, spv::MemoryAccessAlignedMask, 4u);
+                    };
+                    for (std::uint32_t word = 0; word < Table::KeyWords; ++word) store(word, key[word]);
+                    store(Table::RecordPcWord, pc);
+                });
             });
         });
         EmitIfCondition(state, both(record, equal(status, constant(BindlessRefused))), [&] {
