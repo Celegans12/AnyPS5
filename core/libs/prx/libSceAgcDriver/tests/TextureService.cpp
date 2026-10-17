@@ -906,6 +906,37 @@ void budgetTests(const Device& device) {
     std::cout << "budget eviction: " << counts.evicted << " idle entries evicted to " << counts.pinnedBytes / TextureService::PageBytes << " pinned surfaces\n";
 }
 
+void liveBudgetTests(const Device& device) {
+    Fixture fixture(device);
+    Recorder recorder(fixture.context, device.Timeline());
+    recorder.Activate();
+    std::uint64_t live = 64u * TextureService::PageBytes;
+    TextureService::Options options;
+    options.worker = false;
+    options.budgetBytes = 8u * TextureService::PageBytes;
+    options.budgetSource = [&live] { return live; };
+    options.idleSubmits = 1u;
+    TextureService service(*fixture.table, fixture.resolver, fixture.memory, options);
+    std::unique_lock gpu(AgcDriver::GuestMemory::GpuMutex());
+    const std::array<std::uint64_t, 1> served{service.Register(fixture.Registration(0u, 40u))};
+    service.Serve(served, recorder);
+    Advance(recorder);
+    Advance(recorder);
+    service.Revalidate(recorder);
+    auto counts = service.Totals();
+    Require(counts.evicted == 0u && counts.budgetBytes == 64u * TextureService::PageBytes, "idle entries under the live budget were evicted by the fixed fallback budget: " + std::to_string(counts.evicted) + " evicted, budget " + std::to_string(counts.budgetBytes));
+    live = 16u * TextureService::PageBytes;
+    service.Revalidate(recorder);
+    counts = service.Totals();
+    Require(counts.evicted == 28u && counts.pinnedBytes == 12u * TextureService::PageBytes && counts.budgetBytes == live, "a smaller live budget did not evict the oldest idle entries down to three quarters of it: " + std::to_string(counts.evicted) + " evicted, " + std::to_string(counts.pinnedBytes) + " bytes pinned");
+    live = 0u;
+    service.Revalidate(recorder);
+    Require(service.Totals().budgetBytes == 16u * TextureService::PageBytes, "a live budget source with no reading did not keep the last budget");
+    recorder.Sync();
+    service.Publish(recorder);
+    std::cout << "live budget: nothing evicted under 64 surfaces, " << counts.evicted << " idle entries evicted when it fell to 16\n";
+}
+
 struct GuestBlock {
     static constexpr std::uint32_t Surfaces = 8u;
     static constexpr std::uint32_t SurfaceSide = 128u;
@@ -1071,6 +1102,7 @@ int main(int argc, char** argv) {
         fullTests(*device);
         perUseTests(*device);
         budgetTests(*device);
+        liveBudgetTests(*device);
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "texture service test failed: " << error.what() << '\n';

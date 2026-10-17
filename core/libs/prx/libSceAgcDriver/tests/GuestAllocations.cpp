@@ -52,7 +52,13 @@ void leaseSnapshotTests() {
         const auto third = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
         Require(&third[0] != &first[0] && std::any_of(third.begin(), third.end(), [&](const auto& range) { return range->address == address + 64; }), "a lease taken after a registry change still shares the old snapshot");
     }
-    Require(held.use_count() == 1, "a snapshot outlived its leases");
+    const auto* kept = &GuestAllocations::GuestAllocationsAcquire_nid_postfix()[0];
+    Require(&GuestAllocations::GuestAllocationsAcquire_nid_postfix()[0] == kept, "a lease taken after the others ended, without a registry change, rebuilt the snapshot");
+    Require(held.use_count() == 2, "the kept snapshot does not hold the range once");
+    {
+        GuestAllocations::Mutation mutation;
+    }
+    Require(held.use_count() == 1, "a snapshot outlived a registry change");
     GuestAllocations::Mutation mutation;
     mutation.Remove(memory.data());
     mutation.Remove(memory.data() + 64);

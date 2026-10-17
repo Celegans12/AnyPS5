@@ -10,6 +10,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -95,6 +96,7 @@ public:
         bool worker = true;
         std::uint32_t commitChunk = 256u;
         std::uint64_t budgetBytes = 0;
+        std::function<std::uint64_t()> budgetSource;
         std::uint64_t idleSubmits = 64u;
     };
 
@@ -134,6 +136,7 @@ public:
         std::uint64_t imageSlots = 0;
         std::uint64_t samplerSlots = 0;
         std::uint64_t pinnedBytes = 0;
+        std::uint64_t budgetBytes = 0;
         std::uint64_t tables = 0;
         std::uint64_t tableHostBytes = 0;
         std::uint64_t entryHostBytes = 0;
@@ -223,6 +226,7 @@ private:
     static void discard(const BindlessResolution& resolution, Recorder& recorder);
     void insertValue(const DeviceImageKeys::Key& key, const DeviceImageValue& value, Recorder& recorder);
     bool evictIdle(Recorder& recorder, std::size_t wanted, std::uint64_t idleBefore, std::uint64_t targetBytes);
+    std::uint64_t currentBudget();
     void redecode(Tracked& table, Recorder& recorder, Lock& lock);
     void reverify(Tracked& table, Recorder& recorder, Lock& lock);
     void revalidateServed(Tracked& table, Recorder& recorder, Lock& lock);
@@ -259,6 +263,7 @@ private:
     std::uint64_t mappingSerial = 0;
     std::uint64_t surfaceEpoch = 0;
     std::uint64_t pinnedBytes = 0;
+    std::uint64_t budgetBytes = 0;
     std::uint64_t lastRings = 0;
     std::uint64_t lastDropped = 0;
     std::uint64_t frame = 0;

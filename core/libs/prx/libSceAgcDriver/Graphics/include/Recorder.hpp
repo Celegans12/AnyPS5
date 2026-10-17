@@ -793,6 +793,8 @@ private:
     bool syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int source, const void* site);
     // `source` is the CountSync source the wait is attributed to.
     void finish(std::unique_ptr<Batch> batch, bool wait, int source, bool releaseNow = false);
+    void discard(std::unique_ptr<Batch> batch) noexcept;
+    void removeLabels(Batch& batch);
     void release(Batch& batch) noexcept;
     static bool overlaps(const Batch& batch, std::uint64_t address, std::uint64_t end);
     static std::optional<ReadKind> readOverlap(const Batch& batch, std::uint64_t address, std::uint64_t end, std::optional<ReadKind> only = std::nullopt);
@@ -848,6 +850,7 @@ private:
     // Batches popped from inFlight whose completions have not run yet: their writes stay in the
     // snapshot (a rebuild from inside a completion must not drop them) until finish returns.
     std::vector<const Batch*> finishing;
+    mutable std::shared_ptr<const WriteRanges> published;
     std::uint64_t submissions = 0;
     std::atomic<std::uint64_t> submittedSerial{0};
     std::atomic<std::uint64_t> retiredSerial{0};

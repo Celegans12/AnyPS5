@@ -130,6 +130,7 @@ TextureService::Options TextureService::OptionsFromEnvironment(std::uint64_t def
 TextureService::TextureService(BindlessTable& table, std::shared_ptr<BindlessResolver> resolver, std::shared_ptr<BindlessMemory> memory, Options options) : table(table), resolver(std::move(resolver)), memory(std::move(memory)), options(options) {
     Require(this->resolver != nullptr && this->memory != nullptr, "the texture service needs a resolver and a guest memory view");
     mappingSerial = this->memory->MappingSerial();
+    budgetBytes = this->options.budgetBytes;
     if (options.worker) worker = std::thread([this] { workerLoop(); });
 }
 
@@ -733,6 +734,13 @@ void TextureService::refreshPerUse(std::span<const std::uint64_t> served, Record
     }
 }
 
+std::uint64_t TextureService::currentBudget() {
+    if (options.budgetSource) {
+        if (const auto live = options.budgetSource(); live != 0) budgetBytes = live;
+    }
+    return budgetBytes;
+}
+
 bool TextureService::evictIdle(Recorder& recorder, std::size_t wanted, std::uint64_t idleBefore, std::uint64_t targetBytes) {
     std::set<DeviceImageKeys::Key> protectedKeys;
     for (const auto& [id, tracked] : tables) {
@@ -872,10 +880,11 @@ void TextureService::Revalidate(Recorder& recorder) {
         ++totals.stale;
         replace(key, recorder, lock);
     }
-    if (options.budgetBytes != 0 && pinnedBytes > options.budgetBytes) {
+    const auto budget = currentBudget();
+    if (budget != 0 && pinnedBytes > budget) {
         const auto open = recorder.OpenSerial();
         const auto idleBefore = open > options.idleSubmits ? open - options.idleSubmits : 0u;
-        if (idleBefore != 0) evictIdle(recorder, 0u, idleBefore, options.budgetBytes / 4u * 3u);
+        if (idleBefore != 0) evictIdle(recorder, 0u, idleBefore, budget / 4u * 3u);
     }
     retireNow(recorder);
 }
@@ -941,6 +950,7 @@ TextureService::Counts TextureService::Totals() const {
     counts.imageSlots = imageSlots.size();
     counts.samplerSlots = samplerSlots.size();
     counts.pinnedBytes = pinnedBytes;
+    counts.budgetBytes = budgetBytes;
     hostBytes(counts);
     return counts;
 }
@@ -962,8 +972,8 @@ std::string TextureService::TakeFrameLine(std::uint64_t oldPathNanoseconds) {
         refusals += std::to_string(now.refusals[kind] - reported.refusals[kind]);
     }
     char text[1536];
-    std::snprintf(text, sizeof(text), "[bindless] frame %llu: misses %llu (%llu dropped), created %llu, refused %llu, primed %llu tables (%llu records, %llu new keys, primer %.1f ms), re-decoded %llu pages (%llu records changed), served-checked %llu (%llu stale), queue %llu, revalidated %llu (%llu stale, %llu per-use, %llu dcc), retired %llu (%llu unmapped, %llu evicted, %llu full), serve %.1f ms over %llu calls, present wait %.1f ms, entries %llu, slots %llu+%llu, pinned %.1f MiB, old-path resolve %.1f ms, refusals (%s), kept refusals %llu, host: tables %llu (%.1f MiB), entries %.1f MiB, rejections %llu (%.1f MiB)",
-        static_cast<unsigned long long>(frame), delta(now.misses, reported.misses), static_cast<unsigned long long>(dropped), delta(now.created, reported.created), delta(now.refused, reported.refused), delta(now.primed, reported.primed), delta(now.primedRecords, reported.primedRecords), delta(now.primedKeys, reported.primedKeys), Milliseconds(now.primerNanoseconds - reported.primerNanoseconds), delta(now.pagesChanged, reported.pagesChanged), delta(now.recordsChanged, reported.recordsChanged), delta(now.servedChecked, reported.servedChecked), delta(now.servedStale, reported.servedStale), static_cast<unsigned long long>(now.queued), delta(now.revalidated, reported.revalidated), delta(now.stale, reported.stale), delta(now.refreshed, reported.refreshed), delta(now.dccRefreshed, reported.dccRefreshed), delta(now.retired, reported.retired), delta(now.unmapped, reported.unmapped), delta(now.evicted, reported.evicted), delta(now.fullEvictions, reported.fullEvictions), Milliseconds(now.serveNanoseconds - reported.serveNanoseconds), delta(now.serves, reported.serves), Milliseconds(now.presentWaitNanoseconds - reported.presentWaitNanoseconds), static_cast<unsigned long long>(now.entries), static_cast<unsigned long long>(now.imageSlots), static_cast<unsigned long long>(now.samplerSlots), static_cast<double>(now.pinnedBytes) / static_cast<double>(1u << 20u), Milliseconds(oldPath), refusals.c_str(), delta(now.keptRefusals, reported.keptRefusals), static_cast<unsigned long long>(now.tables), static_cast<double>(now.tableHostBytes) / static_cast<double>(1u << 20u), static_cast<double>(now.entryHostBytes) / static_cast<double>(1u << 20u), static_cast<unsigned long long>(now.rejections), static_cast<double>(now.rejectionHostBytes) / static_cast<double>(1u << 20u));
+    std::snprintf(text, sizeof(text), "[bindless] frame %llu: misses %llu (%llu dropped), created %llu, refused %llu, primed %llu tables (%llu records, %llu new keys, primer %.1f ms), re-decoded %llu pages (%llu records changed), served-checked %llu (%llu stale), queue %llu, revalidated %llu (%llu stale, %llu per-use, %llu dcc), retired %llu (%llu unmapped, %llu evicted, %llu full), serve %.1f ms over %llu calls, present wait %.1f ms, entries %llu, slots %llu+%llu, pinned %.1f MiB of a %llu MiB budget, old-path resolve %.1f ms, refusals (%s), kept refusals %llu, host: tables %llu (%.1f MiB), entries %.1f MiB, rejections %llu (%.1f MiB)",
+        static_cast<unsigned long long>(frame), delta(now.misses, reported.misses), static_cast<unsigned long long>(dropped), delta(now.created, reported.created), delta(now.refused, reported.refused), delta(now.primed, reported.primed), delta(now.primedRecords, reported.primedRecords), delta(now.primedKeys, reported.primedKeys), Milliseconds(now.primerNanoseconds - reported.primerNanoseconds), delta(now.pagesChanged, reported.pagesChanged), delta(now.recordsChanged, reported.recordsChanged), delta(now.servedChecked, reported.servedChecked), delta(now.servedStale, reported.servedStale), static_cast<unsigned long long>(now.queued), delta(now.revalidated, reported.revalidated), delta(now.stale, reported.stale), delta(now.refreshed, reported.refreshed), delta(now.dccRefreshed, reported.dccRefreshed), delta(now.retired, reported.retired), delta(now.unmapped, reported.unmapped), delta(now.evicted, reported.evicted), delta(now.fullEvictions, reported.fullEvictions), Milliseconds(now.serveNanoseconds - reported.serveNanoseconds), delta(now.serves, reported.serves), Milliseconds(now.presentWaitNanoseconds - reported.presentWaitNanoseconds), static_cast<unsigned long long>(now.entries), static_cast<unsigned long long>(now.imageSlots), static_cast<unsigned long long>(now.samplerSlots), static_cast<double>(now.pinnedBytes) / static_cast<double>(1u << 20u), static_cast<unsigned long long>(now.budgetBytes >> 20u), Milliseconds(oldPath), refusals.c_str(), delta(now.keptRefusals, reported.keptRefusals), static_cast<unsigned long long>(now.tables), static_cast<double>(now.tableHostBytes) / static_cast<double>(1u << 20u), static_cast<double>(now.entryHostBytes) / static_cast<double>(1u << 20u), static_cast<unsigned long long>(now.rejections), static_cast<double>(now.rejectionHostBytes) / static_cast<double>(1u << 20u));
     reported = now;
     return text;
 }

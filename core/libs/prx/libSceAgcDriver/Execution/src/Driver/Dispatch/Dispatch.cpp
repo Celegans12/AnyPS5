@@ -102,11 +102,10 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
         resolved = ahead.packet;
         packet = resolved;
         indirectArguments = ahead.indirectArguments;
-    } else if (indirectArguments != 0 && matchesFillKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute)) {
-
-        recordQueuedLabelsBeforeRead(submission.queue);
+    } else if (indirectArguments != 0 && !resolving && matchesFillKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute)) {
+        indirectSource().path = IndirectFillKernel;
         const auto readStart = std::chrono::steady_clock::now();
-        resolved = Pm4::ReadDispatchArguments(indirectArguments, packet[4]);
+        resolved = readDispatchArguments(submission.queue, indirectArguments, packet[4]);
         countIndirect(IndirectFillKernel, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - readStart).count());
         packet = resolved;
         indirectArguments = 0;
@@ -278,6 +277,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
         cached = ahead.cached;
         validated = ahead.validated;
         ++groupStats.adopted;
+        ++dispatchesAdoptedAhead;
         const auto age = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ahead.resolvedAt).count();
         groupStats.ageMs += age;
         groupStats.ageMaxMs = std::max(groupStats.ageMaxMs, age);
@@ -356,8 +356,8 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
         parked.keepVariant = keepVariant;
         parked.attachVariant = attachVariant;
         parked.shaderMemory = shaderMemory;
-        parked.captured = captured;
-        parked.liveWords = liveWords;
+        parked.captured = std::move(captured);
+        parked.liveWords = std::move(liveWords);
         parked.capture = capture;
         parked.dataHit = dataHit;
         parked.cached = cached;
@@ -416,7 +416,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
         }
         char where[64];
         std::snprintf(where, sizeof(where), "compute shader 0x%llx: ", static_cast<unsigned long long>(address));
-        throw std::runtime_error(where + message);
+        throw std::runtime_error(where + message + describeIndirectSource());
     };
     phaseTiming.Phase(PhaseSnapshots);
 
