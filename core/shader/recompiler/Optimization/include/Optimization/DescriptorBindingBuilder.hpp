@@ -38,6 +38,7 @@ struct BufferSubstitute {
 
 bool BufferDescriptorPresent(const DescriptorValue& descriptor);
 BufferSubstitute BufferSpecializationFields(const DescriptorValue& descriptor);
+BufferSubstitute SpecializedBufferFields(const BufferResource& buffer, IrShaderStage stage, const BufferSubstitute& fields);
 
 struct DescriptorBindingPlan {
     std::vector<PreparedDescriptorBinding> bindings;

@@ -1667,6 +1667,23 @@ void verifyBufferPresenceSubstitutes(const char* self) {
     require(std::system(command.c_str()) == 0, "the process loading the persisted substitutes failed");
 }
 
+void verifyRawBufferShape() {
+    const auto replay = [](const std::array<std::uint32_t, 4>& descriptor) {
+        PresenceRequest request(descriptor);
+        request.presenceCode[0] = 0xe0700020u;
+        request.request.shader.code = request.presenceCode;
+        return Recompile(request.request);
+    };
+    const auto absent = replay(PresenceNull);
+    const auto bound = replay(PresenceBound);
+    const auto otherFormat = replay({0x10000000u, 0x00000000u, 0x40u, 0x00001204u});
+    require(absent.specializationId == bound.specializationId && spirvWords(absent) == spirvWords(bound), "a raw slot's first null V# did not share the bound slot's module");
+    require(otherFormat.specializationId == bound.specializationId && spirvWords(otherFormat) == spirvWords(bound), "a raw slot's format and selectors changed its module");
+    const auto rawMode = replay({0x10000000u, 0x00000000u, 0x40u, 0x30027facu});
+    require(rawMode.specializationId != bound.specializationId && spirvWords(rawMode) != spirvWords(bound), "a raw slot's out-of-range mode did not specialize its module");
+    std::cout << "raw buffer slots: a first null V#, other formats and selectors share one module; the out-of-range mode specializes it\n";
+}
+
 int runPresenceSubstituteProcess() {
     PresenceRequest absent(PresenceNull);
     const auto result = Recompile(absent.request);
@@ -2963,6 +2980,7 @@ int main(int argc, char** argv) {
         verifyResultMemoBudget();
         verifyBufferAlignmentSpecialization();
         verifyBufferPresenceSubstitutes(argv[0]);
+        verifyRawBufferShape();
         verifyBindingPlanSelection();
         verifyVertexTypeSpecialization();
         verifyBuiltinSpecialization();
