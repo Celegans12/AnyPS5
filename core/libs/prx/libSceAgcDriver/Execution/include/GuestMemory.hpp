@@ -70,7 +70,7 @@ struct BlockMatch {
     std::uint64_t hashedBytes = 0;
     std::uint64_t skippedBytes = 0;
 };
-bool CommittedBlocksMatchMarked(std::uint64_t address, std::size_t bytes, std::span<const ContentHash::Hash128> expected, std::span<const std::uint8_t> marked, BlockMatch* match = nullptr);
+bool CommittedBlocksMatchMarked(std::uint64_t address, std::size_t bytes, std::span<const ContentHash::Hash128> expected, std::span<const std::uint8_t> marked, BlockMatch* match = nullptr, const Commitment* layout = nullptr);
 struct UntrackedBlocks {
     std::size_t covered = 0;
     std::size_t hinted = 0;
@@ -78,8 +78,11 @@ struct UntrackedBlocks {
     std::size_t hostRegion = 0;
     std::size_t unhinted = 0;
     std::size_t refused = 0;
+    std::size_t partial = 0;
+    std::size_t layoutChanged = 0;
 };
-std::uint64_t WalkUntrackedBlocks(std::uint64_t address, std::size_t bytes, std::uint64_t previous, std::span<std::uint8_t> stale, UntrackedBlocks* kinds = nullptr);
+bool UntrackedLayoutWalks();
+std::uint64_t WalkUntrackedBlocks(std::uint64_t address, std::size_t bytes, std::uint64_t previous, std::span<std::uint8_t> stale, UntrackedBlocks* kinds = nullptr, const Commitment* before = nullptr, Commitment* now = nullptr);
 bool CommittedBlocksMatchSince(std::uint64_t address, std::size_t bytes, std::span<const ContentHash::Hash128> expected, std::uint64_t generation, const std::vector<std::pair<std::uint64_t, std::uint64_t>>* before, std::span<const std::uint8_t> pending, BlockMatch* match = nullptr);
 
 // Write tracking. The guest arena is reserved with page write watching, so CollectWrites learns which

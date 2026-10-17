@@ -725,6 +725,8 @@ std::uint64_t ForgetSerial() {
 }
 
 std::uint64_t ForgetStamp(std::uint64_t address, std::size_t bytes) {
+    static const bool disabled = std::getenv("APS5_NO_FORGET_STAMPS") != nullptr;
+    if (disabled) return forgetSerial.load(std::memory_order_acquire);
     if (bytes == 0) return 0;
     const auto first = address / ForgetBlockBytes;
     const auto last = (address + bytes - 1) / ForgetBlockBytes;
@@ -1743,9 +1745,21 @@ std::uint64_t UntrackedHint(std::uint64_t address, std::size_t bytes) {
 #endif
 }
 
-std::uint64_t WalkUntrackedBlocks(std::uint64_t address, std::size_t bytes, std::uint64_t previous, std::span<std::uint8_t> stale, UntrackedBlocks* kinds) {
+namespace {
+
+bool sameClippedRuns(const std::vector<std::pair<std::uint64_t, std::uint64_t>>* before, const std::vector<std::pair<std::uint64_t, std::uint64_t>>* now, std::uint64_t address, std::size_t bytes, std::uint64_t begin, std::uint64_t end);
+
+}
+
+bool UntrackedLayoutWalks() {
+    static const bool disabled = std::getenv("APS5_NO_UNTRACKED_LAYOUT") != nullptr;
+    return !disabled;
+}
+
+std::uint64_t WalkUntrackedBlocks(std::uint64_t address, std::size_t bytes, std::uint64_t previous, std::span<std::uint8_t> stale, UntrackedBlocks* kinds, const Commitment* before, Commitment* now) {
     std::fill(stale.begin(), stale.end(), std::uint8_t{1});
     if (kinds != nullptr) *kinds = {};
+    if (now != nullptr) *now = {};
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || stale.size() != HashBlockCount(address, bytes)) return 0;
     enum class Kind : std::uint8_t { Covered, Hinted, Outside, HostRegion, Unhinted, Refused };
     thread_local std::vector<Kind>* kindSlot = nullptr;
@@ -1757,6 +1771,10 @@ std::uint64_t WalkUntrackedBlocks(std::uint64_t address, std::size_t bytes, std:
         const auto begin = index == 0 ? address : (address / HashBlockBytes + index) * HashBlockBytes;
         return std::pair<std::uint64_t, std::uint64_t>{begin, std::min<std::uint64_t>(end, (address / HashBlockBytes + index + 1) * HashBlockBytes)};
     };
+    const bool layoutWalk = now != nullptr && UntrackedLayoutWalks();
+    if (layoutWalk) *now = DescribeCommitted(address, bytes);
+    const auto* nowRuns = layoutWalk && !now->whole ? &now->ranges : nullptr;
+    const auto* beforeRuns = before != nullptr && !before->whole ? &before->ranges : nullptr;
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
     tracker.initialize();
@@ -1773,6 +1791,14 @@ std::uint64_t WalkUntrackedBlocks(std::uint64_t address, std::size_t bytes, std:
         else if (tracker.hinted(first, last)) kind = Kind::Hinted;
 #endif
     }
+    const auto walkRun = [&](Kind kind, std::uint64_t first, std::uint64_t last) {
+        if (kind == Kind::Covered) return walkWrites(tracker, first, last, StampKind::Cpu);
+#ifdef _WIN32
+        return walkHints(tracker, first, last);
+#else
+        return false;
+#endif
+    };
     for (std::size_t index = 0; index < stale.size();) {
         const auto kind = blockKinds[index];
         auto next = index + 1;
@@ -1780,11 +1806,19 @@ std::uint64_t WalkUntrackedBlocks(std::uint64_t address, std::size_t bytes, std:
         if (kind == Kind::Covered || kind == Kind::Hinted) {
             const auto first = blockRange(index).first & ~(page - 1);
             const auto last = (blockRange(next - 1).second + page - 1) & ~(page - 1);
-            bool walked = false;
-            if (kind == Kind::Covered) walked = walkWrites(tracker, first, last, StampKind::Cpu);
-#ifdef _WIN32
-            else walked = walkHints(tracker, first, last);
-#endif
+            bool walked = true;
+            if (nowRuns == nullptr) {
+                walked = walkRun(kind, first, last);
+            } else {
+                for (const auto& [from, to] : *nowRuns) {
+                    const auto low = std::max<std::uint64_t>(from & ~(page - 1), first);
+                    const auto high = std::min<std::uint64_t>((to + page - 1) & ~(page - 1), last);
+                    if (low < high && !walkRun(kind, low, high)) {
+                        walked = false;
+                        break;
+                    }
+                }
+            }
             if (!walked) {
                 for (auto k = index; k < next; ++k) blockKinds[k] = Kind::Refused;
             }
@@ -1793,6 +1827,9 @@ std::uint64_t WalkUntrackedBlocks(std::uint64_t address, std::size_t bytes, std:
     }
     for (std::size_t index = 0; index < stale.size(); ++index) {
         const auto kind = blockKinds[index];
+        const auto [begin, stop] = blockRange(index);
+        const bool partial = nowRuns != nullptr && !sameClippedRuns(nullptr, nowRuns, address, bytes, begin, stop);
+        const bool layoutChanged = layoutWalk && previous != 0 && (before == nullptr || !sameClippedRuns(beforeRuns, nowRuns, address, bytes, begin, stop));
         if (kinds != nullptr) {
             switch (kind) {
                 case Kind::Covered: ++kinds->covered; break;
@@ -1802,9 +1839,11 @@ std::uint64_t WalkUntrackedBlocks(std::uint64_t address, std::size_t bytes, std:
                 case Kind::Unhinted: ++kinds->unhinted; break;
                 case Kind::Refused: ++kinds->refused; break;
             }
+            if (partial) ++kinds->partial;
+            if (layoutChanged) ++kinds->layoutChanged;
         }
         if (previous == 0 || (kind != Kind::Covered && kind != Kind::Hinted)) continue;
-        const auto [begin, stop] = blockRange(index);
+        if (layoutChanged) continue;
         if (tracker.newestStamp(begin, stop) > previous) continue;
 #ifdef _WIN32
         if (kind == Kind::Hinted && tracker.newestHint(begin & ~(page - 1), (stop + page - 1) & ~(page - 1)) > previous) continue;
@@ -2512,7 +2551,7 @@ bool sameClippedRuns(const std::vector<std::pair<std::uint64_t, std::uint64_t>>*
 
 }
 
-bool CommittedBlocksMatchMarked(std::uint64_t address, std::size_t bytes, std::span<const ContentHash::Hash128> expected, std::span<const std::uint8_t> marked, BlockMatch* match) {
+bool CommittedBlocksMatchMarked(std::uint64_t address, std::size_t bytes, std::span<const ContentHash::Hash128> expected, std::span<const std::uint8_t> marked, BlockMatch* match, const Commitment* layout) {
     if (match != nullptr) *match = {};
     if (expected.size() != HashBlockCount(address, bytes) || marked.size() != expected.size()) return false;
     if (bytes == 0) return true;
@@ -2522,7 +2561,7 @@ bool CommittedBlocksMatchMarked(std::uint64_t address, std::size_t bytes, std::s
         return true;
     });
     const TimedAccess timed(CounterCompare, markedBytes);
-    CommittedHasher hash(address, bytes);
+    CommittedHasher hash = layout != nullptr ? CommittedHasher(*layout) : CommittedHasher(address, bytes);
     BlockMatch counted;
     const bool equal = forEachHashBlock(address, bytes, [&](std::size_t index, std::uint64_t begin, std::size_t length) {
         if (marked[index] == 0) {

@@ -1323,6 +1323,66 @@ void BenchBlocksMatchSince() {
 #endif
 }
 
+#ifdef _WIN32
+void CheckUntrackedLayout() {
+    using AgcDriver::ContentHash::Hash128;
+    PartlyCommitted range;
+    const auto base = range.Address();
+    constexpr auto Bytes = PartlyCommitted::Bytes;
+    range.Commit(0);
+    range.Commit(1);
+    range.Commit(3);
+    std::memset(range.Data(), 0x51, Block);
+    std::memset(range.Data() + Block, 0x62, Block);
+    std::memset(range.Data() + 3 * Block, 0x73, Block);
+    CollectNow(range.Address(0), 2 * Block);
+    CollectNow(range.Address(3), Block);
+    Unwatch(range.Address(1), Block);
+    Require(CollectWrites(base, Bytes) == 0 && UntrackedHint(base, Bytes) == 0, "the partly committed mixed range is tracked as a whole");
+    std::vector<std::uint8_t> stale(4);
+    UntrackedBlocks kinds;
+    const auto staleCount = [&] { return static_cast<std::size_t>(std::count(stale.begin(), stale.end(), std::uint8_t{1})); };
+    auto plain = WalkUntrackedBlocks(base, Bytes, 0, stale, &kinds);
+    plain = WalkUntrackedBlocks(base, Bytes, plain, stale, &kinds);
+    Require(kinds.refused == 2 && stale[2] == 1 && stale[3] == 1, "a walk over the uncommitted block was not refused without the layout");
+    Commitment layout;
+    Commitment now;
+    auto since = WalkUntrackedBlocks(base, Bytes, 0, stale, &kinds, nullptr, &layout);
+    Require(since != 0 && staleCount() == 4 && !layout.whole && layout.ranges.size() == 2, "the baseline walk did not describe the layout");
+    auto next = WalkUntrackedBlocks(base, Bytes, since, stale, &kinds, &layout, &now);
+    Require(staleCount() == 0 && kinds.refused == 0 && kinds.partial == 1 && kinds.layoutChanged == 0 && kinds.covered == 3 && kinds.hinted == 1, "an untouched partly committed mixed range read as stale");
+    std::vector<Hash128> hashes(HashBlockCount(base, Bytes));
+    HashCommittedBlocks(base, Bytes, hashes);
+    BlockMatch match;
+    Require(CommittedBlocksMatchMarked(base, Bytes, hashes, stale, &match, &now) && match.hashed == 0 && match.skipped == 4, "a clean partly committed range was hashed");
+    StoreSame(range.Data() + 3 * Block + 40);
+    next = WalkUntrackedBlocks(base, Bytes, next, stale, &kinds, &layout, &now);
+    Require(stale[0] == 0 && stale[1] == 0 && stale[2] == 0 && stale[3] == 1, "a CPU store beside the uncommitted block did not make exactly its block stale");
+    StoreSame(range.Data() + Block + 9);
+    next = WalkUntrackedBlocks(base, Bytes, next, stale, &kinds, &layout, &now);
+    Require(stale[0] == 0 && stale[1] == 1 && stale[2] == 0 && stale[3] == 0, "a CPU store into the hinted block did not make exactly it stale");
+    const Commitment other{{{range.Address(0), range.Address(2)}}, false};
+    WalkUntrackedBlocks(base, Bytes, next, stale, &kinds, &other, &now);
+    Require(stale[3] == 1 && stale[0] == 0 && stale[1] == 0 && stale[2] == 0 && kinds.layoutChanged == 1, "a block whose committed runs differ from the baseline's was trusted");
+    WalkUntrackedBlocks(base, Bytes, next, stale, &kinds, nullptr, &now);
+    Require(staleCount() == 4, "a walk without a baseline layout trusted a block");
+    next = WalkUntrackedBlocks(base, Bytes, next, stale, &kinds, &layout, &now);
+    range.Commit(2);
+    auto committed = WalkUntrackedBlocks(base, Bytes, next, stale, &kinds, &layout, &now);
+    Require(stale[2] == 1 && now.whole, "a newly committed block was trusted");
+    Require(CommittedBlocksMatchMarked(base, Bytes, hashes, stale, &match, &now), "the zeros of a newly committed block differ from its uncommitted hash");
+    range.Data()[2 * Block + 8] = 0x01;
+    std::swap(layout, now);
+    WalkUntrackedBlocks(base, Bytes, committed, stale, &kinds, &layout, &now);
+    Require(stale[2] == 1 && !CommittedBlocksMatchMarked(base, Bytes, hashes, stale, &match, &now), "a write into a newly committed block still matches");
+    range.Data()[2 * Block + 8] = 0;
+    committed = WalkUntrackedBlocks(base, Bytes, 0, stale, &kinds, nullptr, &layout);
+    range.Decommit(3);
+    WalkUntrackedBlocks(base, Bytes, committed, stale, &kinds, &layout, &now);
+    Require(stale[3] == 1 && kinds.layoutChanged >= 1 && !CommittedBlocksMatchMarked(base, Bytes, hashes, stale, &match, &now), "a decommitted block still matches its old bytes");
+}
+#endif
+
 int main(int argc, char** argv) {
     try {
         if (argc > 1 && std::string_view(argv[1]) == "--bench") {
@@ -1368,6 +1428,9 @@ int main(int argc, char** argv) {
         CheckBlocksMatchSince();
         CheckBlocksMatchSinceCommitted();
         CheckUntrackedBlocks();
+#ifdef _WIN32
+        CheckUntrackedLayout();
+#endif
     } catch (const std::exception& error) {
         std::cerr << "write tracking test failed: " << error.what() << "\n";
         return 1;

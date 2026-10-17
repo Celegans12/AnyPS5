@@ -129,6 +129,7 @@ struct CachedTexture {
     std::array<std::uint64_t, 4> untracked{};
     std::uint64_t blockSince = 0;
     std::array<std::uint64_t, 2> blockGuard{};
+    GuestMemory::Commitment blockLayout;
 };
 
 // Entries in use order (front = most recent) with a hash index by key: a lookup is O(1) and the
@@ -704,7 +705,7 @@ struct SnapshotCompareCounters {
     std::atomic<std::uint64_t> skippedBlocks{0};
     std::atomic<std::uint64_t> hashedBytes{0};
     std::atomic<std::uint64_t> skippedBytes{0};
-    std::array<std::atomic<std::uint64_t>, 6> untrackedKinds{};
+    std::array<std::atomic<std::uint64_t>, 8> untrackedKinds{};
     std::atomic<std::int64_t> lastReport{0};
 };
 
@@ -744,7 +745,7 @@ void noteSnapshotCompare(SnapshotCompare reason, bool equal, bool narrowed, cons
     counters.hashedBytes.fetch_add(match.hashedBytes, std::memory_order_relaxed);
     counters.skippedBytes.fetch_add(match.skippedBytes, std::memory_order_relaxed);
     if (kinds != nullptr) {
-        const std::array<std::size_t, 6> values{kinds->covered, kinds->hinted, kinds->outside, kinds->hostRegion, kinds->unhinted, kinds->refused};
+        const std::array<std::size_t, 8> values{kinds->covered, kinds->hinted, kinds->outside, kinds->hostRegion, kinds->unhinted, kinds->refused, kinds->partial, kinds->layoutChanged};
         for (std::size_t i = 0; i < values.size(); ++i) counters.untrackedKinds[i].fetch_add(values[i], std::memory_order_relaxed);
     }
     const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -764,7 +765,9 @@ void noteSnapshotCompare(SnapshotCompare reason, bool equal, bool narrowed, cons
     const auto hostRegion = take(3);
     const auto unhinted = take(4);
     const auto refused = take(5);
-    AgcDriver::ProfilePrint_nid_no_patch("[texhash] snapshot compares (10 s) by reason:%s; %llu narrowed to written blocks; blocks hashed %llu (%.1f MiB), skipped %llu (%.1f MiB); untracked ranges' blocks: write-watched %llu, hinted %llu, outside the arena %llu, host region %llu, unwatched without hint %llu, walk refused %llu\n", reasons.c_str(), static_cast<unsigned long long>(counters.narrowed.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.hashedBlocks.exchange(0, std::memory_order_relaxed)), static_cast<double>(counters.hashedBytes.exchange(0, std::memory_order_relaxed)) / 1048576.0, static_cast<unsigned long long>(counters.skippedBlocks.exchange(0, std::memory_order_relaxed)), static_cast<double>(counters.skippedBytes.exchange(0, std::memory_order_relaxed)) / 1048576.0, covered, hinted, outside, hostRegion, unhinted, refused);
+    const auto partial = take(6);
+    const auto layoutChanged = take(7);
+    AgcDriver::ProfilePrint_nid_no_patch("[texhash] snapshot compares (10 s) by reason:%s; %llu narrowed to written blocks; blocks hashed %llu (%.1f MiB), skipped %llu (%.1f MiB); untracked ranges' blocks: write-watched %llu, hinted %llu, outside the arena %llu, host region %llu, unwatched without hint %llu, walk refused %llu; partly readable %llu, layout changed %llu\n", reasons.c_str(), static_cast<unsigned long long>(counters.narrowed.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.hashedBlocks.exchange(0, std::memory_order_relaxed)), static_cast<double>(counters.hashedBytes.exchange(0, std::memory_order_relaxed)) / 1048576.0, static_cast<unsigned long long>(counters.skippedBlocks.exchange(0, std::memory_order_relaxed)), static_cast<double>(counters.skippedBytes.exchange(0, std::memory_order_relaxed)) / 1048576.0, covered, hinted, outside, hostRegion, unhinted, refused, partial, layoutChanged);
 }
 
 const std::vector<std::uint8_t>& pendingBlocks(std::uint64_t address, std::size_t bytes, std::size_t count) {
@@ -804,15 +807,16 @@ std::array<std::uint64_t, 2> untrackedGuard(std::uint64_t address, std::size_t b
     return {GuestMemory::ForgetSerial(), recorder != nullptr ? recorder->NewestWriteNote(address, bytes) : 0};
 }
 
-std::uint64_t untrackedBaseline(std::uint64_t address, std::size_t bytes) {
+std::uint64_t untrackedBaseline(std::uint64_t address, std::size_t bytes, GuestMemory::Commitment& layout) {
+    layout = {};
     if (!UntrackedBlocksEnabled()) return 0;
     thread_local std::vector<std::uint8_t>* staleSlot = nullptr;
     auto& stale = ShaderRecompiler::ThreadOwned(staleSlot);
     stale.assign(GuestMemory::HashBlockCount(address, bytes), 1);
-    return GuestMemory::WalkUntrackedBlocks(address, bytes, 0, stale);
+    return GuestMemory::WalkUntrackedBlocks(address, bytes, 0, stale, nullptr, nullptr, &layout);
 }
 
-bool untrackedStillMatches(std::uint64_t address, std::size_t bytes, std::span<const ContentHash::Hash128> hashes, std::uint64_t& since, std::array<std::uint64_t, 2>& guard, SnapshotCompare reason) {
+bool untrackedStillMatches(std::uint64_t address, std::size_t bytes, std::span<const ContentHash::Hash128> hashes, std::uint64_t& since, std::array<std::uint64_t, 2>& guard, GuestMemory::Commitment& layout, SnapshotCompare reason) {
     const auto count = hashes.size();
     if (!UntrackedBlocksEnabled() || count != GuestMemory::HashBlockCount(address, bytes)) {
         since = 0;
@@ -824,17 +828,21 @@ bool untrackedStillMatches(std::uint64_t address, std::size_t bytes, std::span<c
     auto& stale = ShaderRecompiler::ThreadOwned(staleSlot);
     stale.assign(count, 1);
     GuestMemory::UntrackedBlocks kinds;
-    const auto walked = GuestMemory::WalkUntrackedBlocks(address, bytes, trusted ? since : 0, stale, &kinds);
+    thread_local GuestMemory::Commitment* layoutSlot = nullptr;
+    auto& current = ShaderRecompiler::ThreadOwned(layoutSlot);
+    const bool layoutWalk = GuestMemory::UntrackedLayoutWalks();
+    const auto walked = GuestMemory::WalkUntrackedBlocks(address, bytes, trusted ? since : 0, stale, &kinds, layoutWalk ? &layout : nullptr, layoutWalk ? &current : nullptr);
     const auto& pending = pendingBlocks(address, bytes, count);
     const bool pendingAny = std::any_of(pending.begin(), pending.end(), [](std::uint8_t flag) { return flag != 0; });
     for (std::size_t i = 0; i < pending.size() && i < stale.size(); ++i) stale[i] = static_cast<std::uint8_t>(stale[i] | pending[i]);
     const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureCompare);
     GuestMemory::FlushGpuWrites(address, bytes);
     GuestMemory::BlockMatch match;
-    const bool equal = GuestMemory::CommittedBlocksMatchMarked(address, bytes, hashes, stale, &match);
+    const bool equal = GuestMemory::CommittedBlocksMatchMarked(address, bytes, hashes, stale, &match, layoutWalk ? &current : nullptr);
     if (equal && walked != 0 && (now[0] & 1u) == 0 && !pendingAny) {
         since = walked;
         guard = now;
+        if (layoutWalk) std::swap(layout, current);
     } else {
         since = 0;
     }
@@ -1293,7 +1301,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                     }
                     return untracked[0] == 0 ? SnapshotCompare::Untracked : SnapshotCompare::HintMoved;
                 }();
-                if (!collected && *keys == DccKeys::Uncompressed) return untrackedStillMatches(address, bytes, it->hashes, it->blockSince, it->blockGuard, reason);
+                if (!collected && *keys == DccKeys::Uncompressed) return untrackedStillMatches(address, bytes, it->hashes, it->blockSince, it->blockGuard, it->blockLayout, reason);
                 return snapshotStillMatches(address, bytes, it->hashes, collected ? it->generation : 0, it->committed, reason);
             };
             const auto unchanged = [&] {
@@ -1393,7 +1401,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         if (pending) counters.pendingReads.fetch_add(1, std::memory_order_relaxed);
         if (!pending && generation == 0 && !entry.committed.has_value() && *keys == DccKeys::Uncompressed) {
             entry.blockGuard = untrackedGuard(address, bytes);
-            entry.blockSince = (entry.blockGuard[0] & 1u) == 0 ? untrackedBaseline(address, bytes) : 0;
+            entry.blockSince = (entry.blockGuard[0] & 1u) == 0 ? untrackedBaseline(address, bytes, entry.blockLayout) : 0;
         }
         std::vector<std::byte> snapshot(bytes);
         ReadTextureSurface(resource, *keys, snapshot);
@@ -3483,6 +3491,8 @@ bool touchSampledTextures(const std::vector<std::shared_ptr<Texture>>& textures)
 namespace {
 
 std::array<std::uint64_t, 4> untrackedRangeStamp(std::uint64_t address, std::size_t bytes) {
+    static const bool disabled = std::getenv("APS5_NO_UNTRACKED_FAST_PROOF") != nullptr;
+    if (disabled) return {};
     const auto epoch = GuestMemory::CollectEpoch();
     if (epoch == 0 || bytes == 0 || (GuestMemory::ForgetSerial() & 1u) != 0) return {};
     const auto* recorder = Recorder::Active();
