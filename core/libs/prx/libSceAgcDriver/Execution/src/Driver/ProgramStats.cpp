@@ -2,35 +2,56 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <iterator>
 #include <stdexcept>
 
 namespace AgcDriver::DriverDetail {
 
-std::vector<std::uint64_t> ParseProgramList(const char* text) {
-    std::vector<std::uint64_t> list;
+namespace {
+
+std::uint64_t parseAddress(const std::string& item, const std::string& entry) {
+    const auto digits = item.size() > 2 && item[0] == '0' && (item[1] == 'x' || item[1] == 'X') ? item.substr(2) : item;
+    if (digits.empty() || digits.size() > 16 || digits.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos) {
+        throw std::runtime_error("a program list entry is not a hexadecimal address or address range: '" + entry + "'");
+    }
+    const auto address = std::strtoull(digits.c_str(), nullptr, 16);
+    if (address == 0) throw std::runtime_error("a program list entry is address 0: '" + entry + "'");
+    return address;
+}
+
+std::string trimmed(std::string item) {
+    while (!item.empty() && item.front() == ' ') item.erase(item.begin());
+    while (!item.empty() && item.back() == ' ') item.pop_back();
+    return item;
+}
+
+}
+
+ProgramList ParseProgramList(const char* text) {
+    ProgramList list;
     if (text == nullptr) return list;
     const std::string value(text);
     std::size_t begin = 0;
     while (begin <= value.size()) {
         auto end = value.find(',', begin);
         if (end == std::string::npos) end = value.size();
-        auto item = value.substr(begin, end - begin);
-        while (!item.empty() && item.front() == ' ') item.erase(item.begin());
-        while (!item.empty() && item.back() == ' ') item.pop_back();
+        const auto item = trimmed(value.substr(begin, end - begin));
         if (!item.empty()) {
-            const auto digits = item.size() > 2 && item[0] == '0' && (item[1] == 'x' || item[1] == 'X') ? item.substr(2) : item;
-            if (digits.empty() || digits.size() > 16 || digits.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos) {
-                throw std::runtime_error("a program list entry is not a hexadecimal address: '" + item + "'");
-            }
-            const auto address = std::strtoull(digits.c_str(), nullptr, 16);
-            if (address == 0) throw std::runtime_error("a program list entry is address 0");
-            list.push_back(address);
+            const auto dash = item.find('-');
+            const auto low = parseAddress(trimmed(item.substr(0, dash)), item);
+            const auto high = dash == std::string::npos ? low : parseAddress(trimmed(item.substr(dash + 1)), item);
+            if (high < low) throw std::runtime_error("a program list range ends before it starts: '" + item + "'");
+            list.emplace_back(low, high);
         }
         begin = end + 1;
     }
     std::sort(list.begin(), list.end());
-    list.erase(std::unique(list.begin(), list.end()), list.end());
-    return list;
+    ProgramList merged;
+    for (const auto& range : list) {
+        if (!merged.empty() && range.first <= merged.back().second + 1) merged.back().second = std::max(merged.back().second, range.second);
+        else merged.push_back(range);
+    }
+    return merged;
 }
 
 std::uint32_t ParseStatsInterval(const char* text) {
@@ -41,27 +62,30 @@ std::uint32_t ParseStatsInterval(const char* text) {
     return static_cast<std::uint32_t>(value);
 }
 
-bool ListedProgram(std::span<const std::uint64_t> list, std::uint64_t address) {
-    return address != 0 && std::binary_search(list.begin(), list.end(), address);
+bool ListedProgram(const ProgramList& list, std::uint64_t address) {
+    if (address == 0 || list.empty()) return false;
+    const auto after = std::upper_bound(list.begin(), list.end(), address, [](std::uint64_t value, const std::pair<std::uint64_t, std::uint64_t>& range) { return value < range.first; });
+    return after != list.begin() && address <= std::prev(after)->second;
 }
 
 namespace {
 
-const std::vector<std::uint64_t>& listFromEnvironment(const char* name) {
+const ProgramList& listFromEnvironment(const char* name) {
     static std::mutex mutex;
-    static std::map<std::string, std::vector<std::uint64_t>> lists;
+    static std::map<std::string, ProgramList> lists;
     std::lock_guard lock(mutex);
     const auto found = lists.find(name);
     if (found != lists.end()) return found->second;
     auto list = ParseProgramList(std::getenv(name));
     if (!list.empty()) {
         std::string text;
-        for (const auto address : list) {
-            char item[24];
-            std::snprintf(item, sizeof(item), "%s0x%llx", text.empty() ? "" : ",", static_cast<unsigned long long>(address));
+        for (const auto& [low, high] : list) {
+            char item[48];
+            if (low == high) std::snprintf(item, sizeof(item), "%s0x%llx", text.empty() ? "" : ",", static_cast<unsigned long long>(low));
+            else std::snprintf(item, sizeof(item), "%s0x%llx-0x%llx", text.empty() ? "" : ",", static_cast<unsigned long long>(low), static_cast<unsigned long long>(high));
             text += item;
         }
-        std::fprintf(stderr, "[progstats] %s: %zu programs (%s)\n", name, list.size(), text.c_str());
+        std::fprintf(stderr, "[progstats] %s: %zu ranges (%s)\n", name, list.size(), text.c_str());
     }
     return lists.emplace(name, std::move(list)).first->second;
 }
@@ -75,17 +99,17 @@ std::string targetText(const StatsTarget& target) {
 
 }
 
-const std::vector<std::uint64_t>& SkippedPixelPrograms() {
+const ProgramList& SkippedPixelPrograms() {
     static const auto& list = listFromEnvironment("APS5_SKIP_PIXEL_PROGRAMS");
     return list;
 }
 
-const std::vector<std::uint64_t>& TintedPixelPrograms() {
+const ProgramList& TintedPixelPrograms() {
     static const auto& list = listFromEnvironment("APS5_TINT_PIXEL_PROGRAMS");
     return list;
 }
 
-const std::vector<std::uint64_t>& SkippedComputePrograms() {
+const ProgramList& SkippedComputePrograms() {
     static const auto& list = listFromEnvironment("APS5_SKIP_COMPUTE_PROGRAMS");
     return list;
 }
@@ -180,8 +204,8 @@ std::vector<std::string> ProgramStats::Present() {
             ordered.emplace_back(total, &entry);
         }
         std::stable_sort(ordered.begin(), ordered.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
-        constexpr std::size_t MaxGroups = 64;
-        constexpr std::size_t MaxPrograms = 32;
+        constexpr std::size_t MaxGroups = 96;
+        constexpr std::size_t MaxPrograms = 256;
         for (std::size_t g = 0; g < ordered.size() && g < MaxGroups; ++g) {
             const auto& [group, programs] = *ordered[g].second;
             std::string line = "[progstats] present " + std::to_string(presents) + " color";

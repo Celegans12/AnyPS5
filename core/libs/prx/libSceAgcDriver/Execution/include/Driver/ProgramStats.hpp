@@ -11,6 +11,7 @@
 #include <span>
 #include <string>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 namespace ShaderRecompiler { struct RecompileResult; }
@@ -21,18 +22,21 @@ namespace AgcDriver::DriverDetail {
 // - APS5_DRAW_PROGRAM_STATS=<n>: every n-th present, the draws since the previous present grouped by the
 //   attachments they render into (pixel program / vertex program and draw count per group), and the compute
 //   programs dispatched with the storage images they write (the ones a draw of the frame sampled are marked);
-// - APS5_SKIP_PIXEL_PROGRAMS=<hex,...>: draws whose pixel program is listed are not drawn;
-// - APS5_TINT_PIXEL_PROGRAMS=<hex,...>: draws whose pixel program is listed write a constant magenta through the
+// Lists take addresses and inclusive address ranges.
+// - APS5_SKIP_PIXEL_PROGRAMS=<hex[-hex],...>: draws whose pixel program is listed are not drawn;
+// - APS5_TINT_PIXEL_PROGRAMS=<hex[-hex],...>: draws whose pixel program is listed write a constant magenta through the
 //   blend state (constant colour, zero destination) to every blendable attachment the program writes;
-// - APS5_SKIP_COMPUTE_PROGRAMS=<hex,...>: dispatches of a listed compute program are not dispatched.
+// - APS5_SKIP_COMPUTE_PROGRAMS=<hex[-hex],...>: dispatches of a listed compute program are not dispatched.
 
-std::vector<std::uint64_t> ParseProgramList(const char* text);
+using ProgramList = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
+
+ProgramList ParseProgramList(const char* text);
 std::uint32_t ParseStatsInterval(const char* text);
-bool ListedProgram(std::span<const std::uint64_t> list, std::uint64_t address);
+bool ListedProgram(const ProgramList& list, std::uint64_t address);
 
-const std::vector<std::uint64_t>& SkippedPixelPrograms();
-const std::vector<std::uint64_t>& TintedPixelPrograms();
-const std::vector<std::uint64_t>& SkippedComputePrograms();
+const ProgramList& SkippedPixelPrograms();
+const ProgramList& TintedPixelPrograms();
+const ProgramList& SkippedComputePrograms();
 
 bool BlendableAttachmentFormat(VkFormat format);
 // Each blend state whose attachment format (formats[i], VK_FORMAT_UNDEFINED for none) is blendable and whose
