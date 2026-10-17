@@ -85,9 +85,15 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         const auto keyStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         std::shared_ptr<const DrawRelocation> relocation;
         bool aliasFirst = false;
-        if (drawRelocationEnabled()) {
-            drawIdentity = drawIdentityKey(queue, *submission.shaders);
-            std::lock_guard cacheLock(drawCacheMutex);
+        // One registry pass feeds the identity key, the shader-set key and the register-key tail; the exact key does
+        // not depend on any cache state, so it is built before the single drawCacheMutex acquisition of the lookup.
+        DrawRegistryWalk registryWalk;
+        WalkDrawRegistry(queue, *submission.shaders, registryWalk);
+        const bool relocating = drawRelocationEnabled();
+        if (relocating) drawIdentity = drawIdentityKey(registryWalk);
+        drawKey = drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), &shapeKey, traceDrawCache() || profile ? &drawKeyComponents : nullptr, nullptr, nullptr, &registryWalk);
+        std::unique_lock cacheLock(drawCacheMutex);
+        if (relocating) {
             learnPendingRelocation();
             const auto known = drawRelocations.find(drawIdentity);
             if (known != drawRelocations.end()) {
@@ -97,8 +103,12 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 aliasFirst = relocation != nullptr && trial.productive;
             }
         }
-        drawKey = drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), &shapeKey, traceDrawCache() || profile ? &drawKeyComponents : nullptr, aliasFirst ? relocation.get() : nullptr, aliasFirst ? &drawAlias : nullptr);
-        std::unique_lock cacheLock(drawCacheMutex);
+        if (aliasFirst) {
+            // The alias reads guest memory (relocatedContentKey), so it is computed outside the lock as before.
+            cacheLock.unlock();
+            drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), nullptr, nullptr, relocation.get(), &drawAlias, &registryWalk);
+            cacheLock.lock();
+        }
         ++drawEntryCounters.lookups;
         ++drawEntryCounters.registerKeyLookups;
         if (profile) drawEntryCounters.keyUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - keyStart).count();
@@ -110,7 +120,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             ++drawEntryCounters.absent;
             if (relocation != nullptr && !aliasFirst) {
                 cacheLock.unlock();
-                drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), nullptr, nullptr, relocation.get(), &drawAlias);
+                drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), nullptr, nullptr, relocation.get(), &drawAlias, &registryWalk);
                 cacheLock.lock();
             }
             if (drawIdentity != 0) drawRelocationPending = {drawKey, drawAlias, drawIdentity};
@@ -139,7 +149,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 if (dataEntry != nullptr) ++drawEntryCounters.dataHits;
             }
         }
-        if (traceDrawCache() || profile) traceDrawKeyLookup(drawKeyComponents, found == drawCache.end());
+        if (traceDrawCache() || profile) traceDrawKeyLookup(queue, drawKeyComponents, found == drawCache.end());
         if (traceDrawCache()) {
             traceInsert(traceKeysSeen, drawKey);
             traceInsert(traceShapes, shapeKey);
