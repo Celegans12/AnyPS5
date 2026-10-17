@@ -92,10 +92,15 @@ const ProgramList& listFromEnvironment(const char* name) {
 }
 
 std::string targetText(const StatsTarget& target) {
-    char text[80];
+    char text[112];
     if (target.samples > 1) std::snprintf(text, sizeof(text), "0x%llx:%ux%u:f%u:s%u", static_cast<unsigned long long>(target.address), target.width, target.height, target.format, target.samples);
     else std::snprintf(text, sizeof(text), "0x%llx:%ux%u:f%u", static_cast<unsigned long long>(target.address), target.width, target.height, target.format);
-    return text;
+    std::string result = text;
+    if (target.depthMode != 0) {
+        std::snprintf(text, sizeof(text), ":test%u:write%u:cmp%u", (target.depthMode >> 8u) & 1u, (target.depthMode >> 4u) & 1u, target.depthMode & 0xfu);
+        result += text;
+    }
+    return result;
 }
 
 }
@@ -179,6 +184,39 @@ bool BisectSkipsProgram(std::uint64_t address) {
     if (!setting.active || address == 0) return false;
     const auto bit = BisectBitForPresent(presentCount.load(std::memory_order_relaxed), setting.frame, setting.bits);
     return bit && ((ProgramBisectHash(address) >> *bit) & 1u) != 0;
+}
+
+std::uint32_t StatsDepthMode(bool test, bool write, std::uint32_t compare) {
+    return 0x80000000u | (test ? 0x100u : 0u) | (write ? 0x10u : 0u) | (compare & 0xfu);
+}
+
+std::optional<char> DepthScheduleItem() {
+    struct Schedule {
+        bool active = false;
+        std::uint32_t frame = 0;
+        std::string items;
+    };
+    static const Schedule schedule = [] {
+        Schedule parsed;
+        const char* text = std::getenv("APS5_DEPTH_SCHEDULE");
+        if (text == nullptr || *text == '\0') return parsed;
+        char* end = nullptr;
+        parsed.frame = static_cast<std::uint32_t>(std::strtoul(text, &end, 10));
+        if (end == nullptr || *end != ':') throw std::runtime_error("APS5_DEPTH_SCHEDULE must be <frame>:<item>,...");
+        for (const char* cursor = end + 1; *cursor != '\0'; ++cursor) {
+            if (*cursor == ',') continue;
+            if (*cursor != '-' && *cursor != 'p' && (*cursor < '0' || *cursor > '7')) throw std::runtime_error("APS5_DEPTH_SCHEDULE items are '-', 'p' or a VkCompareOp digit 0-7");
+            parsed.items.push_back(*cursor);
+        }
+        if (parsed.items.empty()) throw std::runtime_error("APS5_DEPTH_SCHEDULE has no items");
+        parsed.active = true;
+        std::fprintf(stderr, "[progstats] APS5_DEPTH_SCHEDULE: frame dumps %u..%zu apply '%s'\n", parsed.frame + 1, parsed.frame + parsed.items.size(), parsed.items.c_str());
+        return parsed;
+    }();
+    if (!schedule.active) return std::nullopt;
+    const auto index = BisectBitForPresent(presentCount.load(std::memory_order_relaxed), schedule.frame, static_cast<std::uint32_t>(schedule.items.size()));
+    if (!index || schedule.items[*index] == '-') return std::nullopt;
+    return schedule.items[*index];
 }
 
 bool BlendableAttachmentFormat(VkFormat format) {

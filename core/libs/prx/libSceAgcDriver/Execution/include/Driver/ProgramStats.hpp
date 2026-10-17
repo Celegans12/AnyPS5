@@ -48,6 +48,11 @@ std::uint32_t ProgramBisectHash(std::uint64_t address);
 std::optional<std::uint32_t> BisectBitForPresent(std::uint64_t present, std::uint32_t frame, std::uint32_t bits);
 bool BisectSkipsProgram(std::uint64_t address);
 void CountPresent();
+// APS5_DEPTH_SCHEDULE=<frame>:<item>,...: frame dump <frame> + 1 + i applies item i: '-' nothing, 'p' skips depth-only
+// draws into a depth target listed in APS5_PROGRAM_TARGETS, a digit 0-7 draws the draws into a listed colour target
+// that test depth with VK_COMPARE_OP_EQUAL with that VkCompareOp instead.
+std::optional<char> DepthScheduleItem();
+std::uint32_t StatsDepthMode(bool test, bool write, std::uint32_t compare);
 
 bool BlendableAttachmentFormat(VkFormat format);
 // Each blend state whose attachment format (formats[i], VK_FORMAT_UNDEFINED for none) is blendable and whose
@@ -61,6 +66,7 @@ struct StatsTarget {
     std::uint32_t height = 0;
     std::uint32_t format = 0;
     std::uint32_t samples = 1;
+    std::uint32_t depthMode = 0;
     auto operator<=>(const StatsTarget&) const = default;
 };
 
