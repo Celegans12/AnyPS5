@@ -8,6 +8,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace AgcDriver::DriverDetail {
 
@@ -175,6 +176,14 @@ void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
     ++drainOpcodes[std::min<std::uint32_t>(opcode, 0x100)];
     drainWaitNs[index] += elapsedNs(start);
     rethrowFailure();
+}
+
+bool DrawPipeline::DmaItems() {
+    static const bool items = [] {
+        const char* value = std::getenv("APS5_NO_PIPELINE_DMA");
+        return value == nullptr || *value == '\0' || std::string_view(value) == "0";
+    }();
+    return items;
 }
 
 std::uint64_t DrawPipeline::DrainRequestsByOpcode(std::uint32_t opcode) {

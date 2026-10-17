@@ -34,6 +34,10 @@ public:
     void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {});
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100);
     static std::uint64_t DrainRequestsByOpcode(std::uint32_t opcode);
+    // DMA_DATA as pipeline items, and SET_PREDICATION, NOP sub-ops and non-overlapping DMA_DATA kept
+    // without a drain (upstream #6208). LOCAL A/B: APS5_NO_PIPELINE_DMA=1 (any value but 0) restores
+    // the behaviour before it: DMA_DATA runs on the worker after a drain.
+    static bool DmaItems();
     bool Busy() const { return outstanding.load(std::memory_order_acquire) != 0; }
     std::size_t Outstanding() const { return outstanding.load(std::memory_order_acquire); }
     bool Overlaps(std::uint64_t address, std::size_t bytes);

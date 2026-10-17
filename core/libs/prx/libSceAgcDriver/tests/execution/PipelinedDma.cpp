@@ -71,13 +71,16 @@ void ExpectNoDrain(std::uint32_t opcode, std::uint64_t before, const char* what)
 
 }
 
-int main() {
+int main(int argc, char** argv) {
+    // --legacy: APS5_NO_PIPELINE_DMA=1, the local A/B switch back to the behaviour before #6208.
+    const bool legacy = argc == 2 && std::string(argv[1]) == "--legacy";
 #ifdef _WIN32
     _putenv_s("APS5_PIPELINED_DRAWS", "1");
-    _putenv_s("APS5_NO_PIPELINE_DMA", "");
+    _putenv_s("APS5_NO_PIPELINE_DMA", legacy ? "1" : "");
 #else
     setenv("APS5_PIPELINED_DRAWS", "1", 1);
-    unsetenv("APS5_NO_PIPELINE_DMA");
+    if (legacy) setenv("APS5_NO_PIPELINE_DMA", "1", 1);
+    else unsetenv("APS5_NO_PIPELINE_DMA");
 #endif
     try {
         alignas(256) static std::array<std::uint32_t, 1024> first{};
@@ -102,11 +105,33 @@ int main() {
         for (std::size_t i = 0; i < second.size(); ++i) check(second[i] == (i < 128 ? 0x5eed1234u : 0u), "the copy did not see the fill before it, or wrote past its bytes");
         const auto stores = storesOnCpu.load() + storesOnGpu.load() + storesBehindCompletions.load() - cpuBefore;
         check(stores == 2, "the DMA_DATA packets were not committed (" + std::to_string(stores) + " committed stores)");
-        check(storesDrained.load() == drainedBefore, "a DMA_DATA packet still drained");
+        if (!legacy) check(storesDrained.load() == drainedBefore, "a DMA_DATA packet still drained");
 
         const auto source = reinterpret_cast<std::uint64_t>(first.data());
         const auto held = reinterpret_cast<std::uint64_t>(pending.data());
         const auto other = reinterpret_cast<std::uint64_t>(elsewhere.data());
+        if (legacy) {
+            {
+                Gate gate;
+                Hold(gate, held, sizeof(pending));
+                words.clear();
+                Append(words, DmaData(false, source, 0, other, 16));
+                ExpectDrains(words, 0x50, gate, "with APS5_NO_PIPELINE_DMA=1 a copy off the pending range did not drain");
+            }
+            AgcDriverWaitIdle_nid_postfix();
+            for (std::size_t i = 0; i < elsewhere.size(); ++i) check(elsewhere[i] == 0x5eed1234u, "with APS5_NO_PIPELINE_DMA=1 the copy did not land");
+            {
+                Gate gate;
+                Hold(gate, held, sizeof(pending));
+                words.clear();
+                Append(words, std::array<std::uint32_t, 4>{0xc0022000u, 0x31100u, static_cast<std::uint32_t>(other), static_cast<std::uint32_t>(other >> 32u)});
+                ExpectDrains(words, 0x20, gate, "with APS5_NO_PIPELINE_DMA=1 SET_PREDICATION did not drain");
+            }
+            AgcDriverWaitIdle_nid_postfix();
+            LibcRunShutdown_nid_postfix();
+            std::puts("pipelined DMA legacy (APS5_NO_PIPELINE_DMA=1) tests passed");
+            return 0;
+        }
         {
             Gate gate;
             Hold(gate, held, sizeof(pending));
