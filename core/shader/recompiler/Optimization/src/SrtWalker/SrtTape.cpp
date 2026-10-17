@@ -209,6 +209,13 @@ private:
                 node.clean = current.clean;
                 node.loaded = LoadedFromMemory(*handle);
                 node.source = value;
+                if (IrValue* low = handle->Argument(0); low != nullptr) {
+                    low = low->Resolve();
+                    if (!low->HasImmediate() && low->Opcode() == IrOpcode::GetUserData && low->ArgumentCount() >= 1 && low->Argument(0) != nullptr) {
+                        const auto reg = RegIndex(static_cast<ScalarReg>(low->Argument(0)->Register().index));
+                        if (reg >= plan.userDataBase && reg - plan.userDataBase < SrtUserDataUse::TrackedWords) node.baseWord = static_cast<std::int32_t>(reg - plan.userDataBase);
+                    }
+                }
                 const auto immediate = static_cast<std::int64_t>(static_cast<std::int32_t>(memory.offset));
                 node.immediate = static_cast<std::uint64_t>(immediate);
                 node.arguments[0] = compile(handle->Argument(0), context, depth + 1);
@@ -337,7 +344,14 @@ bool SrtTape::evaluate(Frame& frame, std::uint32_t index, std::uint64_t& result)
 
 bool SrtTape::compute(Frame& frame, const Node& node, std::uint64_t& result) const {
     std::array<std::uint64_t, 5> operand{};
+    std::int32_t origin = -1;
     for (std::uint8_t index = 0; index < node.argumentCount; ++index) {
+        if (index == 0 && node.baseWord >= 0 && frame.runtime.userDataUse != nullptr && static_cast<std::size_t>(node.baseWord) < frame.runtime.userData.size()) {
+            origin = node.baseWord;
+            operand[0] = frame.runtime.userData[static_cast<std::size_t>(origin)];
+            frame.runtime.userDataUse->asBase |= std::uint64_t {1} << origin;
+            continue;
+        }
         if (!evaluate(frame, node.arguments[index], operand[index])) return false;
     }
     const auto a = operand[0];
@@ -349,6 +363,7 @@ bool SrtTape::compute(Frame& frame, const Node& node, std::uint64_t& result) con
         case Op::Const: result = node.immediate; return true;
         case Op::UserData:
             if (node.immediate >= frame.runtime.userData.size()) return false;
+            if (frame.runtime.userDataUse != nullptr) frame.runtime.userDataUse->asValue |= node.immediate < SrtUserDataUse::TrackedWords ? std::uint64_t {1} << node.immediate : ~std::uint64_t {0};
             result = frame.runtime.userData[static_cast<std::size_t>(node.immediate)];
             return true;
         case Op::ShaderBase: result = frame.runtime.shaderBase; return true;
@@ -376,6 +391,7 @@ bool SrtTape::compute(Frame& frame, const Node& node, std::uint64_t& result) con
                 frame.nullRoot = true;
                 return false;
             }
+            if (frame.runtime.userDataUse != nullptr) frame.runtime.userDataUse->reads.emplace_back(address, origin);
             if (node.loaded && frame.runtime.accessible != nullptr && !frame.runtime.accessible(frame.runtime.userContext, address, sizeof(std::uint32_t))) return false;
             if (auto* trace = frame.runtime.readTrace; trace != nullptr) {
                 if (node.source == trace->leaf) trace->leaves.emplace_back(trace->leafSlot, address);
@@ -483,11 +499,20 @@ bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::ve
     auto* trace = runtime.readTrace;
     const auto leavesBefore = trace != nullptr ? trace->leaves.size() : 0;
     const auto readsBefore = trace != nullptr ? trace->otherReads.size() : 0;
+    auto* use = runtime.userDataUse;
+    const auto baseBefore = use != nullptr ? use->asBase : 0;
+    const auto valueBefore = use != nullptr ? use->asValue : 0;
+    const auto useReadsBefore = use != nullptr ? use->reads.size() : 0;
     const auto refuse = [&] {
         if (trace != nullptr) {
             trace->leaves.resize(leavesBefore);
             trace->otherReads.resize(readsBefore);
             trace->leaf = nullptr;
+        }
+        if (use != nullptr) {
+            use->asBase = baseBefore;
+            use->asValue = valueBefore;
+            use->reads.resize(useReadsBefore);
         }
         return false;
     };

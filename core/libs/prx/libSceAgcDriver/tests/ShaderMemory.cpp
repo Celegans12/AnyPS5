@@ -1082,12 +1082,17 @@ void verifySrtTape() {
         std::uint32_t nullRoots = 0;
         std::vector<std::pair<std::uint32_t, std::uint64_t>> leaves;
         std::vector<std::uint64_t> reads;
+        std::uint64_t asBase = 0;
+        std::uint64_t asValue = 0;
+        std::vector<std::pair<std::uint64_t, std::int32_t>> userDataReads;
         bool operator==(const Walk&) const = default;
     };
     const auto walk = [](const IrResourcePlan& plan, SrtRuntime runtime, bool tape) {
         Walk out;
         SrtReadTrace trace;
+        SrtUserDataUse use;
         runtime.readTrace = &trace;
+        runtime.userDataUse = &use;
         const std::vector<std::uint32_t> sources(plan.materializationSources.begin(), plan.materializationSources.end());
         const std::vector<std::uint8_t> clean(plan.cleanFlatSlots.begin(), plan.cleanFlatSlots.end());
         const auto sourceSpan = tape ? std::span<const std::uint32_t>(plan.materializationSources) : std::span<const std::uint32_t>(sources);
@@ -1100,6 +1105,11 @@ void verifySrtTape() {
         std::sort(out.leaves.begin(), out.leaves.end());
         std::sort(out.reads.begin(), out.reads.end());
         out.reads.erase(std::unique(out.reads.begin(), out.reads.end()), out.reads.end());
+        out.asBase = use.asBase;
+        out.asValue = use.asValue;
+        out.userDataReads = use.reads;
+        std::sort(out.userDataReads.begin(), out.userDataReads.end());
+        out.userDataReads.erase(std::unique(out.userDataReads.begin(), out.userDataReads.end()), out.userDataReads.end());
         return out;
     };
     const auto answers = [](const IrResourcePlan& plan, const SrtRuntime& runtime) {
@@ -1163,6 +1173,7 @@ void verifySrtTape() {
         const auto tape = walk(*guardedPlan, runtime, true);
         require(tape == walk(*guardedPlan, runtime, false), "SRT tape: the tape's walk differs from the Evaluator's on the guarded program");
         require(tape.ok && tape.active.size() == imageActivity + 1u && tape.active[imageActivity] == mode, "SRT tape: the image behind the branch has the wrong activity");
+        require(tape.asBase != 0u && tape.asValue != 0u && !tape.userDataReads.empty(), "SRT tape: the guarded program's walk reported no user-data use");
     }
 
     const auto nullRuntime = runtimeFor(nullUserData);
