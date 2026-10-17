@@ -162,6 +162,7 @@ void DrawPipeline::run() {
 }
 
 void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
+    drainRequests[std::min<std::uint32_t>(opcode, 0x100)].fetch_add(1, std::memory_order_relaxed);
     if (!Busy()) return;
     if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline drain under the GPU lock (reason " + std::to_string(static_cast<unsigned>(reason)) + ", opcode " + std::to_string(opcode) + ")");
     const auto start = std::chrono::steady_clock::now();
@@ -174,6 +175,10 @@ void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
     ++drainOpcodes[std::min<std::uint32_t>(opcode, 0x100)];
     drainWaitNs[index] += elapsedNs(start);
     rethrowFailure();
+}
+
+std::uint64_t DrawPipeline::DrainRequestsByOpcode(std::uint32_t opcode) {
+    return Queue0().drainRequests[std::min<std::uint32_t>(opcode, 0x100)].load(std::memory_order_relaxed);
 }
 
 std::size_t DrawPipeline::QueuedItems() {
