@@ -21,6 +21,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -250,6 +251,19 @@ std::uint32_t Parameter(const char* name, std::uint32_t fallback) {
 int main(int argc, char** argv) {
     try {
         const bool bench = argc > 1 && std::string(argv[1]) == "--bench";
+        if (bench && std::getenv("APS5_PROFILE_GPU") != nullptr) {
+            std::cerr << "gpu skinning loop: --bench does not run with APS5_PROFILE_GPU (the profiler's wait hangs this harness)\n";
+            return 2;
+        }
+        if (bench) {
+            const auto limit = Parameter("GPUCOST_TIMEOUT", 300u);
+            std::thread([limit] {
+                std::this_thread::sleep_for(std::chrono::seconds(limit));
+                std::fprintf(stderr, "gpu skinning loop: --bench exceeded %u s, exiting without waiting for the device\n", limit);
+                std::fflush(stderr);
+                std::_Exit(3);
+            }).detach();
+        }
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         const auto groups = bench ? Parameter("GPUCOST_GROUPS", 2048u) : 4u;
