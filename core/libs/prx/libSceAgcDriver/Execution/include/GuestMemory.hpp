@@ -64,6 +64,13 @@ void HashCommittedBlocks(std::uint64_t address, std::size_t bytes, std::span<Con
 void HashBlocksOf(std::uint64_t address, std::span<const std::byte> bytes, std::span<ContentHash::Hash128> out);
 // Whether every block of the range still hashes to `expected` (stops at the first differing block).
 bool CommittedBlocksMatch(std::uint64_t address, std::size_t bytes, std::span<const ContentHash::Hash128> expected);
+struct BlockMatch {
+    std::size_t hashed = 0;
+    std::size_t skipped = 0;
+    std::uint64_t hashedBytes = 0;
+    std::uint64_t skippedBytes = 0;
+};
+bool CommittedBlocksMatchSince(std::uint64_t address, std::size_t bytes, std::span<const ContentHash::Hash128> expected, std::uint64_t generation, const std::vector<std::pair<std::uint64_t, std::uint64_t>>* before, std::span<const std::uint8_t> pending, BlockMatch* match = nullptr);
 
 // Write tracking. The guest arena is reserved with page write watching, so CollectWrites learns which
 // pages of a range the CPU wrote since they were last collected, stamps their 64 KiB blocks with a new

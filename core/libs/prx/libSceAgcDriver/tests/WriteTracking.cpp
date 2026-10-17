@@ -11,6 +11,7 @@
 #include <sys/mman.h>
 #endif
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <span>
 #include <cstring>
@@ -1088,8 +1089,162 @@ void CheckCommittedRanges() {
     Require(!UnchangedCommittedSince(first, 0), "an unknown generation was accepted for the committed parts");
 }
 
-int main() {
+void StoreSame(std::uint8_t* at) {
+    auto* place = reinterpret_cast<volatile std::uint8_t*>(at);
+    *place = *place;
+}
+
+std::uint64_t CollectNow(std::uint64_t address, std::size_t bytes) {
+    BumpCollectEpoch();
+    return CollectWrites(address, bytes);
+}
+
+void CheckBlocksMatchSince() {
+    using AgcDriver::ContentHash::Hash128;
+    constexpr std::size_t Blocks = 4;
+    constexpr std::size_t Bytes = Blocks * Block;
+    void* memory = AllocateWatched(Bytes);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    auto* bytes = static_cast<std::uint8_t*>(memory);
+    for (std::size_t i = 0; i < Bytes; ++i) bytes[i] = static_cast<std::uint8_t>((i * 131u + 7u) ^ (i >> 11));
+    auto since = CollectNow(base, Bytes);
+    Require(since != 0, "the block-match surface is not collected");
+    std::vector<Hash128> hashes(HashBlockCount(base, Bytes));
+    HashCommittedBlocks(base, Bytes, hashes);
+    const std::vector<std::uint8_t> none;
+    BlockMatch match;
+    const auto matches = [&](std::uint64_t generation, std::span<const std::uint8_t> pending = {}) { return CommittedBlocksMatchSince(base, Bytes, hashes, generation, nullptr, pending, &match); };
+
+    Require(matches(since) && match.hashed == 0 && match.skipped == Blocks && match.skippedBytes == Bytes, "an untouched surface was hashed");
+    Require(matches(0) && match.hashed == Blocks, "an unknown generation did not hash every block");
+
+    StoreSame(bytes + 2 * Block + 9);
+    Require(CollectNow(base, Bytes) > since, "a CPU store was not stamped");
+    Require(matches(since) && match.hashed == 1 && match.skipped == Blocks - 1 && match.hashedBytes == Block, "a CPU store of the same bytes did not re-hash exactly its block");
+
+    bytes[Block + 5] ^= 0x5a;
+    Require(CollectNow(base, Bytes) > since, "a CPU write was not stamped");
+    Require(!matches(since) && match.hashed == 1, "a CPU write that changed a byte still matches");
+    bytes[Block + 5] ^= 0x5a;
+    Require(matches(since) && match.hashed == 2, "restored bytes do not match after the CPU write");
+    Require(CommittedBlocksMatch(base, Bytes, hashes), "the full compare disagrees with the block compare");
+
+    since = CollectNow(base, Bytes);
+    Require(matches(since) && match.hashed == 0, "a collect after the writes leaves blocks stale");
+    Require(MarkWritten(base + 3 * Block + 16, 4) != 0 && matches(since) && match.hashed == 1, "a reported GPU store did not re-hash its block");
+    since = CollectNow(base, Bytes);
+    bytes[64] ^= 0x01;
+    Require(MarkWritten(base + 64, 1) != 0 && !matches(since) && match.hashed == 1, "a reported GPU write that changed a byte still matches");
+    bytes[64] ^= 0x01;
+    since = CollectNow(base, Bytes);
+
+    std::vector<std::uint8_t> pending(Blocks, 0);
+    pending[1] = 1;
+    Require(matches(since, pending) && match.hashed == 1 && match.skipped == Blocks - 1, "a block with a pending GPU write was not hashed");
+    pending[1] = 0;
+    Require(matches(since, pending) && match.hashed == 0, "pending flags of nothing hashed a block");
+
+    const auto offset = base + 0x1234;
+    const std::size_t offsetBytes = 2 * Block;
+    std::vector<Hash128> offsetHashes(HashBlockCount(offset, offsetBytes));
+    HashCommittedBlocks(offset, offsetBytes, offsetHashes);
+    since = CollectNow(base, Bytes);
+    Require(CommittedBlocksMatchSince(offset, offsetBytes, offsetHashes, since, nullptr, none, &match) && match.hashed == 0 && match.skipped == 3, "an unaligned range was hashed although untouched");
+    StoreSame(bytes + 0x1234 + Block + 3);
+    CollectNow(base, Bytes);
+    Require(CommittedBlocksMatchSince(offset, offsetBytes, offsetHashes, since, nullptr, none, &match) && match.hashed == 1 && match.hashedBytes == Block, "an unaligned range did not re-hash exactly the written block");
+
+    since = CollectNow(base, Bytes);
+    Unwatch(base + 2 * Block, Block);
+    Require(matches(since) && match.hashed == 1, "an unwatched block was trusted");
+    Require(!Watched(base + 2 * Block, Block), "the unwatched block is still watched");
+}
+
+void CheckBlocksMatchSinceCommitted() {
+    using AgcDriver::ContentHash::Hash128;
+    PartlyCommitted range;
+    const auto base = range.Address();
+    range.Commit(0);
+    range.Commit(2);
+    std::memset(range.Data(), 0x31, Block);
+    std::memset(range.Data() + 2 * Block, 0x42, Block);
+    Runs runs;
+    const auto synced = CollectCommitted(range, runs);
+    const Runs layout{{range.Address(0), range.Address(1)}, {range.Address(2), range.Address(3)}};
+    Require(synced != 0 && runs == layout, "the partly committed surface was not collected");
+    std::vector<Hash128> hashes(HashBlockCount(base, PartlyCommitted::Bytes));
+    HashCommittedBlocks(base, PartlyCommitted::Bytes, hashes);
+    BlockMatch match;
+    const std::vector<std::uint8_t> none;
+    const auto matches = [&](std::uint64_t generation) { return CommittedBlocksMatchSince(base, PartlyCommitted::Bytes, hashes, generation, &layout, none, &match); };
+    Require(matches(synced) && match.hashed == 0 && match.skipped == 4, "an untouched partly committed surface was hashed");
+
+    StoreSame(range.Data() + 2 * Block + 100);
+    Require(CollectCommitted(range, runs) > synced && matches(synced) && match.hashed == 1, "a store into a committed block did not re-hash exactly that block");
+
+    range.Commit(3);
+    Require(CollectCommitted(range, runs) != 0 && runs != layout, "the newly committed block is not described");
+    Require(matches(synced) && match.hashed == 2, "a newly committed block was not hashed");
+    range.Data()[3 * Block + 8] = 0x01;
+    CollectCommitted(range, runs);
+    Require(!matches(synced), "a write into a newly committed block still matches");
+    range.Decommit(3);
+
+    range.Decommit(2);
+    CollectCommitted(range, runs);
+    Require(!matches(synced) && match.hashed >= 1, "a decommitted block still matches its old bytes");
+}
+
+void BenchBlocksMatchSince() {
+    using AgcDriver::ContentHash::Hash128;
+    constexpr std::size_t Bytes = 4u << 20u;
+    constexpr int Rounds = 400;
+    void* memory = AllocateWatched(Bytes);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    auto* bytes = static_cast<std::uint8_t*>(memory);
+    for (std::size_t i = 0; i < Bytes; ++i) bytes[i] = static_cast<std::uint8_t>(i * 7u);
+    std::vector<Hash128> hashes(HashBlockCount(base, Bytes));
+    HashCommittedBlocks(base, Bytes, hashes);
+    const std::vector<std::uint8_t> none;
+    const auto time = [&](const char* name, auto&& touch) {
+        double fullUs = 0.0;
+        double sinceUs = 0.0;
+        std::size_t hashed = 0;
+        for (int round = 0; round < Rounds; ++round) {
+            const auto since = CollectNow(base, Bytes);
+            touch(round);
+            CollectNow(base, Bytes);
+            const auto first = std::chrono::steady_clock::now();
+            const bool full = CommittedBlocksMatch(base, Bytes, hashes);
+            const auto second = std::chrono::steady_clock::now();
+            BlockMatch match;
+            const bool narrowed = CommittedBlocksMatchSince(base, Bytes, hashes, since, nullptr, none, &match);
+            const auto third = std::chrono::steady_clock::now();
+            Require(full && narrowed, "the benchmark surface changed");
+            fullUs += std::chrono::duration<double, std::micro>(second - first).count();
+            sinceUs += std::chrono::duration<double, std::micro>(third - second).count();
+            hashed += match.hashed;
+        }
+        std::cout << "[bench] " << name << ": 4 MiB snapshot check, full hash " << fullUs / Rounds << " us, written blocks only " << sinceUs / Rounds << " us (" << static_cast<double>(hashed) / Rounds << " of " << hashes.size() << " blocks hashed)\n";
+    };
+    time("nothing written", [](int) {});
+    time("one CPU store", [&](int round) {
+        const auto at = static_cast<std::size_t>(round) * 9973u % Bytes;
+        StoreSame(bytes + at);
+    });
+    time("one reported GPU store", [&](int round) { MarkWritten(base + static_cast<std::size_t>(round) * 65599u % (Bytes - 8), 8); });
+    time("every block written", [&](int) {
+        for (std::size_t at = 0; at < Bytes; at += Block) StoreSame(bytes + at);
+    });
+}
+
+int main(int argc, char** argv) {
     try {
+        if (argc > 1 && std::string_view(argv[1]) == "--bench") {
+            if (!WriteWatched()) return 77;
+            BenchBlocksMatchSince();
+            return 0;
+        }
         CheckContentHashes();
         if (!WriteWatched()) {
             std::cout << "no write watching: skipped\n";
@@ -1125,6 +1280,8 @@ int main() {
         CheckImportWindowOverUnwatchedPart();
         CheckUnwatchedImport();
         CheckCommittedRanges();
+        CheckBlocksMatchSince();
+        CheckBlocksMatchSinceCommitted();
     } catch (const std::exception& error) {
         std::cerr << "write tracking test failed: " << error.what() << "\n";
         return 1;

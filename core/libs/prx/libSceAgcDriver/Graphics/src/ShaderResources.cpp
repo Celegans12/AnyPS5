@@ -691,6 +691,87 @@ TextureCounters& TextureCounts() {
     return counters;
 }
 
+enum class SnapshotCompare : std::size_t { Stamped, Layout, CommittedStamped, Pending, Untracked, HintMoved, OneOff, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(SnapshotCompare::Count)> SnapshotCompareNames{"stamped", "committed runs moved", "committed stamped", "pending write", "untracked without hint", "hint moved", "one-off"};
+
+struct SnapshotCompareCounters {
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(SnapshotCompare::Count)> compares{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(SnapshotCompare::Count)> differed{};
+    std::atomic<std::uint64_t> narrowed{0};
+    std::atomic<std::uint64_t> hashedBlocks{0};
+    std::atomic<std::uint64_t> skippedBlocks{0};
+    std::atomic<std::uint64_t> hashedBytes{0};
+    std::atomic<std::uint64_t> skippedBytes{0};
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+SnapshotCompareCounters& SnapshotCompares() {
+    static SnapshotCompareCounters counters;
+    return counters;
+}
+
+bool CommittedProofEnabled() {
+    static const bool disabled = std::getenv("APS5_NO_COMMITTED_PROOF") != nullptr;
+    return !disabled;
+}
+
+bool BlockRevalidateEnabled() {
+    static const bool disabled = std::getenv("APS5_NO_BLOCK_REVALIDATE") != nullptr;
+    return !disabled;
+}
+
+bool snapshotStillMatches(std::uint64_t address, std::size_t bytes, std::span<const ContentHash::Hash128> hashes, std::uint64_t since, const std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>>& before, SnapshotCompare reason) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    const bool narrow = since != 0 && BlockRevalidateEnabled() && hashes.size() == GuestMemory::HashBlockCount(address, bytes);
+    thread_local std::vector<std::uint8_t>* pendingSlot = nullptr;
+    auto& pending = ShaderRecompiler::ThreadOwned(pendingSlot);
+    pending.clear();
+    const auto writes = Recorder::PendingWriteSnapshot();
+    const bool overlapping = Recorder::SnapshotOverlaps(writes.get(), address, bytes);
+    if (overlapping) TextureCounts().pendingReads.fetch_add(1, std::memory_order_relaxed);
+    if (narrow && overlapping) {
+        pending.assign(hashes.size(), 0);
+        std::size_t index = 0;
+        const auto end = address + bytes;
+        for (auto at = address; at < end; ++index) {
+            const auto stop = std::min<std::uint64_t>(end, (at / GuestMemory::HashBlockBytes + 1) * GuestMemory::HashBlockBytes);
+            pending[index] = Recorder::SnapshotOverlaps(writes.get(), at, static_cast<std::size_t>(stop - at)) ? 1 : 0;
+            at = stop;
+        }
+    }
+    const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureCompare);
+    GuestMemory::FlushGpuWrites(address, bytes);
+    GuestMemory::BlockMatch match;
+    const bool equal = narrow ? GuestMemory::CommittedBlocksMatchSince(address, bytes, hashes, since, before.has_value() ? &*before : nullptr, pending, &match) : GuestMemory::CommittedBlocksMatch(address, bytes, hashes);
+    if (!profile) return equal;
+    auto& counters = SnapshotCompares();
+    const auto slot = static_cast<std::size_t>(reason);
+    counters.compares[slot].fetch_add(1, std::memory_order_relaxed);
+    if (!equal) counters.differed[slot].fetch_add(1, std::memory_order_relaxed);
+    if (narrow) {
+        counters.narrowed.fetch_add(1, std::memory_order_relaxed);
+        counters.hashedBlocks.fetch_add(match.hashed, std::memory_order_relaxed);
+        counters.skippedBlocks.fetch_add(match.skipped, std::memory_order_relaxed);
+        counters.hashedBytes.fetch_add(match.hashedBytes, std::memory_order_relaxed);
+        counters.skippedBytes.fetch_add(match.skippedBytes, std::memory_order_relaxed);
+    } else {
+        counters.hashedBlocks.fetch_add(hashes.size(), std::memory_order_relaxed);
+        counters.hashedBytes.fetch_add(bytes, std::memory_order_relaxed);
+    }
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = counters.lastReport.load();
+    if (nowMs - last < 10000 || !counters.lastReport.compare_exchange_strong(last, nowMs)) return equal;
+    std::string reasons;
+    for (std::size_t i = 0; i < SnapshotCompareNames.size(); ++i) {
+        const auto count = counters.compares[i].exchange(0, std::memory_order_relaxed);
+        const auto changed = counters.differed[i].exchange(0, std::memory_order_relaxed);
+        if (count == 0) continue;
+        reasons += " " + std::string(SnapshotCompareNames[i]) + " " + std::to_string(count) + " (" + std::to_string(changed) + " changed)";
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[texhash] snapshot compares (10 s) by reason:%s; %llu narrowed to written blocks; blocks hashed %llu (%.1f MiB), skipped %llu (%.1f MiB)\n", reasons.c_str(), static_cast<unsigned long long>(counters.narrowed.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.hashedBlocks.exchange(0, std::memory_order_relaxed)), static_cast<double>(counters.hashedBytes.exchange(0, std::memory_order_relaxed)) / 1048576.0, static_cast<unsigned long long>(counters.skippedBlocks.exchange(0, std::memory_order_relaxed)), static_cast<double>(counters.skippedBytes.exchange(0, std::memory_order_relaxed)) / 1048576.0);
+    return equal;
+}
+
 void reportTextureCounters() {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (!profile) return;
@@ -715,6 +796,8 @@ struct LookupRecord {
     std::uint64_t generation;
     const StorageTexture* source;
     bool depth = false;
+    std::uint64_t committedGeneration = 0;
+    std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> committed;
 };
 
 thread_local std::vector<LookupRecord>* lookupLogSlot = nullptr;
@@ -1131,10 +1214,16 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             // pages. The compare goes through the flush hook: it waits for recorded work over the
             // surface (counted, and named for the [hooksync] line).
             const auto equalsCommitted = [&] {
-                if (Recorder::SnapshotWriteOverlaps(address, bytes)) counters.pendingReads.fetch_add(1, std::memory_order_relaxed);
-                const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureCompare);
-                GuestMemory::FlushGpuWrites(address, bytes);
-                return GuestMemory::CommittedBlocksMatch(address, bytes, it->hashes);
+                const bool collected = generation != 0 || committed.has_value();
+                const auto reason = [&] {
+                    if (generation != 0) return it->committed.has_value() ? SnapshotCompare::Layout : SnapshotCompare::Stamped;
+                    if (committed.has_value()) {
+                        if (it->committed != committed) return SnapshotCompare::Layout;
+                        return Recorder::SnapshotWriteOverlaps(address, bytes) ? SnapshotCompare::Pending : SnapshotCompare::CommittedStamped;
+                    }
+                    return untracked[0] == 0 ? SnapshotCompare::Untracked : SnapshotCompare::HintMoved;
+                }();
+                return snapshotStillMatches(address, bytes, it->hashes, collected ? it->generation : 0, it->committed, reason);
             };
             const auto unchanged = [&] {
                 if (it->committed != committed) return false;
@@ -1151,7 +1240,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 it->committed = std::move(committed);
                 it->untracked = untracked;
                 touchTexture(cache, it);
-                logLookup({it->texture.get(), resource, guestBytes, *keys, generation, nullptr});
+                logLookup({it->texture.get(), resource, guestBytes, *keys, generation, nullptr, false, it->committed.has_value() ? snapshotGeneration : 0, it->committed});
                 reportTextureCounters();
                 if (profile) LookupOutcomes::Add(LookupOutcomes::SampledHitSnapshot, start);
                 return it->texture;
@@ -1182,10 +1271,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             auto texture = oneOff.texture.lock();
             const auto current = [&] {
                 if (*keys != DccKeys::Uncompressed || GuestMemory::UnchangedSince(address, bytes, oneOff.generation)) return true;
-                if (Recorder::SnapshotWriteOverlaps(address, bytes)) counters.pendingReads.fetch_add(1, std::memory_order_relaxed);
-                const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureCompare);
-                GuestMemory::FlushGpuWrites(address, bytes);
-                return GuestMemory::CommittedBlocksMatch(address, bytes, oneOff.hashes);
+                return snapshotStillMatches(address, bytes, oneOff.hashes, generation != 0 ? oneOff.generation : 0, std::nullopt, SnapshotCompare::OneOff);
             };
             if (texture != nullptr && oneOff.bytes == guestBytes && oneOff.keys == *keys && current()) {
                 ++cache.counts.oneOffReuses;
@@ -1272,7 +1358,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         if (profile) LookupOutcomes::Add(source != nullptr ? LookupOutcomes::SampledMadeView : LookupOutcomes::SampledMadeSnapshot, start);
         return texture;
     }
-    logLookup({texture.get(), resource, guestBytes, *keys, generation, source.get()});
+    logLookup({texture.get(), resource, guestBytes, *keys, generation, source.get(), false, source == nullptr && entry.committed.has_value() ? snapshotGeneration : 0, source == nullptr ? entry.committed : std::nullopt});
     insert(std::move(entry), texture);
     reportCacheCounts(cache, budgets);
     reportTextureCounters();
@@ -3128,7 +3214,7 @@ namespace {
 // of the reused ones, fast = every image proved current from stamps, full = the lookups were repeated.
 // Why the fast path left an object to the full walk (the "fast-fail by reason" counts).
 using FastFail = ShaderResources::FastFail;
-constexpr std::array<const char*, static_cast<std::size_t>(FastFail::Count)> FastFailNames{"no record", "collect", "pending image", "evicted image", "memory changed", "keys", "cleared view", "storage keys", "depth surface"};
+constexpr std::array<const char*, static_cast<std::size_t>(FastFail::Count)> FastFailNames{"no record", "collect", "pending image", "evicted image", "memory changed", "keys", "cleared view", "storage keys", "depth surface", "committed parts changed"};
 using OwnRefreshFallback = ShaderResources::OwnRefreshFallback;
 constexpr std::array<const char*, static_cast<std::size_t>(OwnRefreshFallback::Count)> OwnRefreshFallbackNames{"disabled", "snapshot texture", "cleared view", "foreign view", "surface key", "not imported", "uncached", "re-run failed"};
 
@@ -3298,7 +3384,7 @@ void ShaderResources::captureValidation() {
     };
     validatedTextures.assign(textures.size(), {});
     for (std::size_t i = 0; i < textures.size(); ++i) {
-        if (const auto* found = record(textures[i].get())) validatedTextures[i] = {found->resource, found->bytes, found->keys, found->generation, 0, found->source, found->depth, true};
+        if (const auto* found = record(textures[i].get())) validatedTextures[i] = {found->resource, found->bytes, found->keys, found->committed.has_value() ? found->committedGeneration : found->generation, 0, found->source, found->depth, true, found->committed};
     }
     lookupLog().clear();
 }
@@ -3361,7 +3447,15 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         const auto address = surface.resource.baseAddress;
         const auto bytes = static_cast<std::size_t>(surface.bytes);
         surface.collected = GuestMemory::CollectWrites(address, bytes);
-        if (surface.collected == 0) return fail(FastFail::Collect);
+        bool committedProof = false;
+        if (surface.collected == 0) {
+            if (surface.source != nullptr || !surface.committed.has_value() || !CommittedProofEnabled()) return fail(FastFail::Collect);
+            thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* runsSlot = nullptr;
+            auto& runs = ShaderRecompiler::ThreadOwned(runsSlot);
+            surface.collected = GuestMemory::CollectCommittedWrites(address, bytes, runs);
+            if (surface.collected == 0 || runs != *surface.committed || Recorder::SnapshotWriteOverlaps(address, bytes) || !GuestMemory::UnchangedCommittedSince(runs, surface.generation)) return fail(FastFail::Committed);
+            committedProof = true;
+        }
         const auto* source = surface.source;
         if (!keyProofs) {
             // Without proofs the keys are compared with the record's (a cleared view's identity
@@ -3401,7 +3495,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
             if (!source->Cached()) return fail(FastFail::Evicted);
             queries.push_back({address, bytes, source->Generation()});
             images.push_back(source);
-        } else {
+        } else if (!committedProof) {
             queries.push_back({address, bytes, surface.generation});
         }
     }
@@ -4769,6 +4863,7 @@ bool ShaderResources::precollectImages() {
                         record.source = it->source;
                         record.entryKeys = it->keys;
                         record.entryGeneration = it->generation;
+                        if (record.generation == 0 && it->source == nullptr && it->committed.has_value() && CommittedProofEnabled()) record.entryCommitted = it->committed;
                         counters.records.fetch_add(1, std::memory_order_relaxed);
                     }
                 }
@@ -4800,7 +4895,14 @@ std::shared_ptr<Texture> ShaderResources::fastTexture(const ImageRecord& record)
     const auto address = record.resource.baseAddress;
     const auto bytes = static_cast<std::size_t>(record.guestBytes);
     if (DepthSurfaceAt(address)) return nullptr;
-    if (GuestMemory::CollectWrites(address, bytes) == 0) return nullptr;
+    thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* runsSlot = nullptr;
+    auto& runs = ShaderRecompiler::ThreadOwned(runsSlot);
+    std::uint64_t committedGeneration = 0;
+    if (GuestMemory::CollectWrites(address, bytes) == 0) {
+        if (record.source != nullptr || !record.entryCommitted.has_value()) return nullptr;
+        committedGeneration = GuestMemory::CollectCommittedWrites(address, bytes, runs);
+        if (committedGeneration == 0 || runs != *record.entryCommitted) return nullptr;
+    }
     if (PendingStorageOverlaps(address, bytes, record.source.get())) return nullptr;
     auto keys = record.keys;
     if (record.resource.dccAddress != 0) {
@@ -4819,18 +4921,19 @@ std::shared_ptr<Texture> ShaderResources::fastTexture(const ImageRecord& record)
         // Under fast-clear keys the view holds only while its image's results are still pending over
         // the surface; flushed, the clear the image cannot see makes the lookup take a snapshot.
         if (keys != DccKeys::Uncompressed && StorageTexture::FindPending(address, record.guestBytes) != record.source) return nullptr;
-    } else if ((keys == DccKeys::Uncompressed || keys == DccKeys::ClearSingle) && !GuestMemory::UnchangedSince(address, bytes, record.entryGeneration)) {
-        return nullptr;
+    } else if (keys == DccKeys::Uncompressed || keys == DccKeys::ClearSingle) {
+        if (committedGeneration != 0 ? Recorder::SnapshotWriteOverlaps(address, bytes) || !GuestMemory::UnchangedCommittedSince(runs, record.entryGeneration) : !GuestMemory::UnchangedSince(address, bytes, record.entryGeneration)) return nullptr;
     }
     // The entry must still be the cache's, holding this object (an evicted object is not reused: the
     // next lookup would make another), and it takes the stage-A generation like a hit would.
     auto& cache = Textures();
     std::lock_guard lock(cache.mutex);
     const auto it = findSampledEntry(cache, context.device, record.words, record.components);
-    if (it == cache.entries.end() || it->texture != record.texture || it->committed.has_value()) return nullptr;
-    if (it->source == nullptr) it->generation = record.generation;
+    if (it == cache.entries.end() || it->texture != record.texture || (committedGeneration != 0 ? it->committed != runs : it->committed.has_value())) return nullptr;
+    if (it->source == nullptr) it->generation = committedGeneration != 0 ? committedGeneration : record.generation;
     touchTexture(cache, it);
-    logLookup({record.texture.get(), record.resource, record.guestBytes, keys, record.source != nullptr ? 0 : record.generation, record.source.get()});
+    if (committedGeneration != 0) logLookup({record.texture.get(), record.resource, record.guestBytes, keys, 0, nullptr, false, committedGeneration, runs});
+    else logLookup({record.texture.get(), record.resource, record.guestBytes, keys, record.source != nullptr ? 0 : record.generation, record.source.get()});
     outcome.hit = true;
     return record.texture;
 }

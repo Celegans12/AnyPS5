@@ -2318,6 +2318,7 @@ public:
     CommittedHasher(std::uint64_t address, std::size_t bytes) : whole(Accessible(reinterpret_cast<const void*>(address), bytes)) {
         if (!whole) ranges = CommittedRanges(address, bytes);
     }
+    explicit CommittedHasher(Commitment commitment) : whole(commitment.whole), ranges(std::move(commitment.ranges)) {}
     ContentHash::Hash128 operator()(std::uint64_t begin, std::size_t length) {
         if (whole) return ContentHash::Of(reinterpret_cast<const void*>(begin), length);
         thread_local std::vector<std::byte>* scratchSlot = nullptr;
@@ -2369,6 +2370,97 @@ bool CommittedBlocksMatch(std::uint64_t address, std::size_t bytes, std::span<co
     const TimedAccess timed(CounterCompare, bytes);
     CommittedHasher hash(address, bytes);
     return forEachHashBlock(address, bytes, [&](std::size_t index, std::uint64_t begin, std::size_t length) { return hash(begin, length) == expected[index]; });
+}
+
+namespace {
+
+template <class Visit>
+void forEachClippedRun(const std::vector<std::pair<std::uint64_t, std::uint64_t>>* runs, std::uint64_t address, std::size_t bytes, std::uint64_t begin, std::uint64_t end, Visit&& visit) {
+    if (runs == nullptr) {
+        const auto low = std::max<std::uint64_t>(address, begin);
+        const auto high = std::min<std::uint64_t>(address + bytes, end);
+        if (low < high) visit(low, high);
+        return;
+    }
+    for (const auto& [from, to] : *runs) {
+        const auto low = std::max<std::uint64_t>(from, begin);
+        const auto high = std::min<std::uint64_t>(to, end);
+        if (low < high) visit(low, high);
+    }
+}
+
+bool sameClippedRuns(const std::vector<std::pair<std::uint64_t, std::uint64_t>>* before, const std::vector<std::pair<std::uint64_t, std::uint64_t>>* now, std::uint64_t address, std::size_t bytes, std::uint64_t begin, std::uint64_t end) {
+    std::array<std::pair<std::uint64_t, std::uint64_t>, 16> left{};
+    std::array<std::pair<std::uint64_t, std::uint64_t>, 16> right{};
+    std::size_t leftCount = 0;
+    std::size_t rightCount = 0;
+    bool fits = true;
+    const auto collect = [&](auto& out, std::size_t& count) {
+        return [&](std::uint64_t low, std::uint64_t high) {
+            if (count != 0 && out[count - 1].second == low) {
+                out[count - 1].second = high;
+                return;
+            }
+            if (count == out.size()) {
+                fits = false;
+                return;
+            }
+            out[count++] = {low, high};
+        };
+    };
+    forEachClippedRun(before, address, bytes, begin, end, collect(left, leftCount));
+    forEachClippedRun(now, address, bytes, begin, end, collect(right, rightCount));
+    return fits && leftCount == rightCount && std::equal(left.begin(), left.begin() + static_cast<std::ptrdiff_t>(leftCount), right.begin());
+}
+
+}
+
+bool CommittedBlocksMatchSince(std::uint64_t address, std::size_t bytes, std::span<const ContentHash::Hash128> expected, std::uint64_t generation, const std::vector<std::pair<std::uint64_t, std::uint64_t>>* before, std::span<const std::uint8_t> pending, BlockMatch* match) {
+    if (match != nullptr) *match = {};
+    if (expected.size() != HashBlockCount(address, bytes)) return false;
+    if (bytes == 0) return true;
+    auto now = DescribeCommitted(address, bytes);
+    thread_local std::vector<std::uint8_t>* staleSlot = nullptr;
+    auto& stale = ShaderRecompiler::ThreadOwned(staleSlot);
+    stale.assign(expected.size(), 1);
+    if (generation != 0 && bytes <= std::numeric_limits<std::uint64_t>::max() - address) {
+        const auto* nowRuns = now.whole ? nullptr : &now.ranges;
+        auto& tracker = Tracker();
+        const auto lock = lockTracker(tracker);
+        tracker.initialize();
+        if (tracker.watched) {
+            forEachHashBlock(address, bytes, [&](std::size_t index, std::uint64_t begin, std::size_t length) {
+                const auto end = begin + length;
+                if (index < pending.size() && pending[index] != 0) return true;
+                if (!sameClippedRuns(before, nowRuns, address, bytes, begin, end)) return true;
+                bool covered = true;
+                forEachClippedRun(nowRuns, address, bytes, begin, end, [&](std::uint64_t low, std::uint64_t high) { covered = covered && tracker.covers(low, static_cast<std::size_t>(high - low)); });
+                if (!covered || tracker.newestStamp(begin, end) > generation) return true;
+                stale[index] = 0;
+                return true;
+            });
+        }
+    }
+    std::uint64_t staleBytes = 0;
+    forEachHashBlock(address, bytes, [&](std::size_t index, std::uint64_t, std::size_t length) {
+        if (stale[index] != 0) staleBytes += length;
+        return true;
+    });
+    const TimedAccess timed(CounterCompare, staleBytes);
+    CommittedHasher hash(std::move(now));
+    BlockMatch counted;
+    const bool equal = forEachHashBlock(address, bytes, [&](std::size_t index, std::uint64_t begin, std::size_t length) {
+        if (stale[index] == 0) {
+            ++counted.skipped;
+            counted.skippedBytes += length;
+            return true;
+        }
+        ++counted.hashed;
+        counted.hashedBytes += length;
+        return hash(begin, length) == expected[index];
+    });
+    if (match != nullptr) *match = counted;
+    return equal;
 }
 
 void Write(std::uint64_t address, std::span<const std::byte> source, std::size_t alignment) {
