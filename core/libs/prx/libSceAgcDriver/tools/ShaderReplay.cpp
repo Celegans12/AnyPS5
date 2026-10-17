@@ -18,6 +18,7 @@
 #include <spirv/unified1/spirv.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
@@ -620,9 +621,84 @@ bool Replay(const char* path, std::unique_ptr<AgcDriver::VulkanDevice>& device) 
     }
 }
 
+
+// --make-request <target.req> <shader.bin> <shader.env> <code-address> <out.req>: a standalone compute
+// request from raw guest code and its registration environment (sweep/programs/*.env), with the target
+// (device features, lane mode inputs) of a captured compute request of the same wave size. The header
+// is omitted and user data is zero, so it measures front-end and planning cost, not a game capture.
+int MakeRequest(int argc, char** argv) {
+    if (argc != 7) {
+        std::fprintf(stderr, "usage: agc_shader_replay --make-request <target.req> <shader.bin> <shader.env> <code-address> <out.req>\n");
+        return 2;
+    }
+    try {
+        std::map<std::string, std::string> environment;
+        {
+            std::ifstream file(argv[4]);
+            if (!file) throw std::runtime_error("cannot open shader environment");
+            for (std::string line; std::getline(file, line);) {
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                const auto space = line.find(' ');
+                if (space != std::string::npos) environment.emplace(line.substr(0, space), line.substr(space + 1));
+            }
+        }
+        const auto number = [](const std::string& text) {
+            std::size_t consumed = 0;
+            const auto value = std::stoull(text, &consumed, 0);
+            if (text.empty() || text.front() == '-' || consumed != text.size()) throw std::runtime_error("invalid unsigned value " + text);
+            return value;
+        };
+        const auto value = [&](const char* key) { return static_cast<std::uint32_t>(number(environment.at(key))); };
+        if (environment.at("stage") != "Compute") throw std::runtime_error("--make-request needs a compute environment");
+        std::array<std::uint32_t, 3> threads{};
+        std::istringstream threadText(environment.at("threads"));
+        if (!(threadText >> threads[0] >> threads[1] >> threads[2]) || threads[0] == 0 || threads[1] == 0 || threads[2] == 0) throw std::runtime_error("invalid compute thread counts");
+        std::ifstream file(argv[3], std::ios::binary | std::ios::ate);
+        if (!file) throw std::runtime_error("cannot open shader binary");
+        const auto bytes = file.tellg();
+        if (bytes <= 0 || bytes > 64 * 1024 * 1024 || bytes % 4 != 0) throw std::runtime_error("shader binary must hold whole dwords");
+        std::vector<std::uint32_t> code(static_cast<std::size_t>(bytes) / 4u);
+        file.seekg(0);
+        if (!file.read(reinterpret_cast<char*>(code.data()), static_cast<std::streamsize>(bytes))) throw std::runtime_error("cannot read shader binary");
+        const auto rsrc1 = value("rsrc1");
+        const auto rsrc2 = value("rsrc2");
+        const auto wave = value("wave");
+        const auto userCount = value("user_sgprs");
+        if ((wave != 32u && wave != 64u) || userCount > 32u || userCount != ((rsrc2 >> 1u) & 0x1fu)) throw std::runtime_error("invalid compute wave or user SGPR count");
+        const auto donor = ShaderRecompiler::RequestSerializer{}.Deserialize(ReadText(argv[2]));
+        if (donor.request.shader.stage != ShaderRecompiler::ShaderStage::Compute || !donor.request.context.compute || donor.request.graphics || donor.request.context.waveSize != wave) throw std::runtime_error("the target request must be a standalone compute request of the same wave size");
+        const auto firstUser = value("first_user_sgpr");
+        const auto scratch = (rsrc2 & 1u) != 0 ? value("scratch_dw_per_thread") : 0u;
+        const auto address = number(argv[5]);
+        std::vector<std::uint32_t> userData(userCount, 0u);
+        const std::vector<ShaderRecompiler::MemoryRegion> memory{{address, std::as_bytes(std::span<const std::uint32_t>(code))}};
+        ShaderRecompiler::RecompileRequest request{};
+        request.shader = {ShaderRecompiler::ShaderStage::Compute, address, code, 0, {}};
+        request.target = donor.request.target;
+        request.context.userData = userData;
+        request.context.memory = memory;
+        request.context.waveSize = wave;
+        request.context.userDataBaseRegister = firstUser;
+        request.context.compute = ShaderRecompiler::ShaderComputeStageInfo{threads, std::min(((rsrc2 >> 15u) & 0x1ffu) * 128u, 16384u), {((rsrc2 >> 7u) & 1u) != 0, ((rsrc2 >> 8u) & 1u) != 0, ((rsrc2 >> 9u) & 1u) != 0}, ((rsrc2 >> 10u) & 1u) != 0, ((rsrc2 >> 11u) & 3u) + 1u, {}, scratch};
+        request.context.floatMode = ShaderRecompiler::ShaderFloatMode{(rsrc1 >> 12u) & 0xffu, ((rsrc1 >> 21u) & 1u) != 0, ((rsrc1 >> 23u) & 1u) != 0, ((rsrc1 >> 26u) & 1u) != 0};
+        request.layout = donor.request.layout;
+        request.useCache = true;
+        std::ofstream out(argv[6], std::ios::binary);
+        out << ShaderRecompiler::RequestSerializer{}.Serialize(request);
+        out.close();
+        if (!out) throw std::runtime_error("cannot write the request");
+        std::printf("request %s: compute 0x%llx, %zu code bytes, wave %u, %ux%ux%u threads, %u user SGPRs, target from %s\n", argv[6], static_cast<unsigned long long>(address), code.size() * 4u, wave, threads[0], threads[1], threads[2], userCount, argv[2]);
+        return 0;
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "--make-request: %s\n", FirstLine(error.what()).c_str());
+        return 1;
+    }
+}
+
 }
 
 int main(int argc, char** argv) {
+    if (argc >= 2 && std::string(argv[1]) == "--make-request") return MakeRequest(argc, argv);
     if (argc < 2) {
         std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] [--prepare] [--materialize] [--code] [--maintenance8] [--bindless] [--prepare-only | --pipeline-only --pipeline-cache DIR [--expect-spv FILE | --no-reference]] <shader.req>...\n  --prepare replays the request as a prepared artifact\n  --materialize also captures the resources from the request memory and materializes the prepared invocation\n  --prepare-only plans and compiles without materializing runtime memory\n  --pipeline-only recompiles captured compute inputs and creates the native pipeline without guest resources or dispatch\n  --pipeline-cache selects an existing private cache directory; __GL_SHADER_DISK_CACHE_PATH must select a separate fresh empty directory\n  --expect-spv requires byte equality with an ordinary replay before device creation (one request); without it each\n    request needs the .fp sidecar APS5_PIPELINE_REQUESTS saved next to it, and its pipeline fingerprint must match\n  --no-reference skips that check (requests from older runs); a hit in the game's pipeline cache then proves the match\n  several requests share one device and cache; each success prints a PIPELINE-RESULT line\n  --fingerprint-variants prints the pipeline fingerprint components of each way to materialize a request against its .fp\n    (--describe adds the values: specialization constants, bindings)\n  --native-target replaces a captured compute target with this device's (requests from builds with another target) and names the fields that differed\n  --bindless (or APS5_BINDLESS_IMAGES=1) compiles table images through the bindless descriptor heap; a device made for --pipeline-only enables it too\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set\n");
         return 2;
