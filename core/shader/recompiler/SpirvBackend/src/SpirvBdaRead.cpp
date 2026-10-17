@@ -541,6 +541,7 @@ void EmitBdaAnchorRange(SpirvEmitterState& state, SpirvEmitterState::BdaAnchor& 
 }
 
 void EmitBdaAnchors(SpirvEmitterState& state) {
+    if (state.bdaAnchors.empty()) return;
     const auto u64 = TypeScalarU64(state);
     for (auto& anchor : state.bdaAnchors) {
         const auto low = Unary(state, spv::OpUConvert, u64, EmitGetUserData(state, static_cast<ScalarReg>(anchor.lowRegister)));
