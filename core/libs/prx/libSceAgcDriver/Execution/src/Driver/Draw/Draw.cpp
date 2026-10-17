@@ -164,10 +164,11 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         decode = std::move(tinted);
     }
     bool skipDepthOnly = false;
+    if (decode->state.depth && decode->state.depthWrite && !(filtered && !filterTargets.empty()) && VertexScheduleSkips(vertexProgram)) skipDepthOnly = true;
     if (const auto item = DepthScheduleItem()) {
         const auto& state = decode->state;
         if (*item == 'p') {
-            skipDepthOnly = state.colors.empty() && !state.hasColorTarget && state.depth && ListedProgram(filterTargets, state.depth->address);
+            skipDepthOnly = skipDepthOnly || (state.colors.empty() && !state.hasColorTarget && state.depth && ListedProgram(filterTargets, state.depth->address));
         } else if (filtered && !filterTargets.empty() && state.depthTest && state.depthCompare == VK_COMPARE_OP_EQUAL) {
             auto relaxed = std::make_shared<DrawDecode>(*decode);
             relaxed->state.depthCompare = static_cast<VkCompareOp>(*item - '0');
@@ -182,7 +183,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         std::optional<StatsTarget> depth;
         if (state.depth) depth = StatsTarget{state.depth->address, state.depth->extent.width, state.depth->extent.height, static_cast<std::uint32_t>(state.depth->format), state.depth->samples, StatsDepthMode(state.depthTest, state.depthWrite, static_cast<std::uint32_t>(state.depthCompare))};
         stats.NoteDraw(pixelProgram, vertexProgram, colors, depth, skipPixel || skipDepthOnly, tintPixel);
-        if (drawParameters.indexed && !drawParameters.indirect) stats.NoteMesh(drawParameters.indexAddress, drawParameters.indexCount, drawParameters.instanceCount, vertexProgram, depth ? depth->depthMode : 0u, colors.empty() ? 0u : colors.front().address);
+        if (drawParameters.indexed && !drawParameters.indirect) stats.NoteMesh(drawParameters.indexAddress, drawParameters.indexCount, drawParameters.firstVertex, drawParameters.instanceCount, depth ? depth->address : 0u, vertexProgram, depth ? depth->depthMode : 0u, colors.empty() ? 0u : colors.front().address);
     }
     if (skipPixel || skipDepthOnly) return drawn();
     const auto& graphics = decode->state;

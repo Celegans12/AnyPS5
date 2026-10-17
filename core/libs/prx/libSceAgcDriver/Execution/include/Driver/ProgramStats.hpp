@@ -54,6 +54,11 @@ void CountPresent();
 std::optional<char> DepthScheduleItem();
 // APS5_DUMP_DRAW_PROGRAMS=<hex[-hex],...>: the first capture of a listed draw program writes shader_<address>.req.
 const ProgramList& DumpedDrawPrograms();
+// APS5_SKIP_VERTEX_SCHEDULE=<frame>:<list>;<list>;...: frame dump <frame> + 1 + i skips the depth-writing draws whose
+// vertex program is in list i ('-' = none) and whose colour targets include none of APS5_PROGRAM_TARGETS (the
+// pre-passes, not the G-buffer draws).
+std::vector<ProgramList> ParseVertexSchedule(const char* text, std::uint32_t& frame);
+bool VertexScheduleSkips(std::uint64_t vertex);
 std::uint32_t StatsDepthMode(bool test, bool write, std::uint32_t compare);
 
 bool BlendableAttachmentFormat(VkFormat format);
@@ -90,7 +95,7 @@ public:
     void NoteDrawSampled(std::uint64_t pixel, std::span<const std::uint64_t> addresses);
     // One indexed draw of a mesh (index buffer, count, instances); the report lists the sets of (vertex program, depth
     // mode, first colour target) that drew the same mesh in one frame.
-    void NoteMesh(std::uint64_t indexAddress, std::uint32_t indexCount, std::uint32_t instances, std::uint64_t vertex, std::uint32_t depthMode, std::uint64_t color);
+    void NoteMesh(std::uint64_t indexAddress, std::uint32_t indexCount, std::uint32_t firstVertex, std::uint32_t instances, std::uint64_t depth, std::uint64_t vertex, std::uint32_t depthMode, std::uint64_t color);
     void NoteDispatch(std::uint64_t program, std::span<const StatsImage> written, bool skipped);
     // Counts a present; on every n-th one returns the report lines of the draws and dispatches since the previous
     // present (otherwise none) and starts a new frame.
@@ -121,7 +126,7 @@ private:
     std::map<Group, std::map<std::pair<std::uint64_t, std::uint64_t>, PixelCount>> groups;
     std::map<std::uint64_t, ComputeCount> compute;
     std::map<std::uint64_t, std::set<std::uint64_t>> sampled;
-    std::map<std::tuple<std::uint64_t, std::uint32_t, std::uint32_t>, std::set<std::tuple<std::uint64_t, std::uint32_t, std::uint64_t>>> meshes;
+    std::map<std::tuple<std::uint64_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint64_t>, std::set<std::tuple<std::uint64_t, std::uint32_t, std::uint64_t>>> meshes;
 };
 
 }
