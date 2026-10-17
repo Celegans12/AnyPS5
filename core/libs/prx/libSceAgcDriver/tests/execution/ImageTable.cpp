@@ -79,6 +79,7 @@ constexpr std::uint32_t PaletteOffset = 0x40;
 constexpr std::uint32_t PaletteBytes = PaletteOffset + 256u * 32u;
 std::vector<std::uint32_t> Root(0x100000u);
 bool pipelineOnly = false;
+bool expectBindlessTables = true;
 
 alignas(256) constexpr std::array<std::uint32_t, 28> TableCode{
     0xf4080100u, 0xfa000000u, 0xf4080200u, 0xfa000010u, 0xf4080700u, 0xfa000020u, 0x8f108202u, 0xf4200444u,
@@ -252,6 +253,14 @@ alignas(256) constexpr std::array<std::uint32_t, 25> ReadPointerCode{
     0xbf810000u,
 };
 
+alignas(256) constexpr std::array<std::uint32_t, 37> RuntimePointerCode{
+    0xf4080200u, 0xfa000000u, 0xf4080700u, 0xfa000010u, 0xf4080800u, 0xfa000020u, 0x8f108202u, 0xf4200444u,
+    0x20000000u, 0x8711ff11u, 0x000000ffu, 0x8f128511u, 0x361c0081u, 0x341c1c83u, 0xe03410f0u, 0x80020c0eu,
+    0xbf8c0070u, 0x7e28050cu, 0x7e2a050du, 0xf40c090au, 0x24000000u, 0x360200bfu, 0x7e020d01u, 0x060202f0u,
+    0x100202ffu, 0x3c800000u, 0x7e0402ffu, 0x3e000000u, 0xf09c0f08u, 0x01090401u, 0x7e120202u, 0x34101286u,
+    0x4a101100u, 0x34101084u, 0xe0781000u, 0x80070408u, 0xbf810000u,
+};
+
 alignas(256) constexpr std::array<std::uint32_t, 30> SplitRecordCode{
     0xf4080100u, 0xfa000000u, 0xf4080200u, 0xfa000010u, 0xf4080700u, 0xfa000020u, 0x8f108202u, 0xf4200444u,
     0x20000000u, 0x9312b011u, 0xf42c0802u, 0x24000000u, 0xf4280a02u, 0x24000020u, 0x360200bfu, 0x7e020d01u,
@@ -408,7 +417,7 @@ Outcome Execute(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> 
             if ((words[cursor] & 0xffffu) == 43u && count == 4u) constants.insert(words[cursor + 3u]);
             cursor += count;
         }
-        Require(!result.bindlessTables.empty(), "bindless heap: the dispatch registered no table with the texture service");
+        Require(!expectBindlessTables || !result.bindlessTables.empty(), "bindless heap: the dispatch registered no table with the texture service");
         for (const auto& table : result.bindlessTables) {
             for (const auto& use : table.uses) {
                 Require(ShaderRecompiler::ResourceMaterializer::FindBindlessInterface(use.interfaceId) != nullptr, "bindless heap: the driver registered an interface id that no compiled program registered");
@@ -1335,6 +1344,81 @@ void RunPointerTests(AgcDriver::VulkanDevice& device) {
     RequireRed(reads, 4, Lanes, [](std::uint32_t x) { return UintTexels[x]; }, "pointer image table read: key 0x1ff masked to entry 255");
 }
 
+Outcome RunRuntimePointer(AgcDriver::VulkanDevice& device, std::uint32_t groups, std::uint64_t palette) {
+    for (std::uint32_t copy = 0; copy < 2u; ++copy) {
+        Keys[60u + copy * 2u] = static_cast<std::uint32_t>(palette);
+        Keys[61u + copy * 2u] = static_cast<std::uint32_t>(palette >> 32u);
+    }
+    return RunPointer(device, RuntimePointerCode, groups);
+}
+
+void RunRuntimeAddressTests(AgcDriver::VulkanDevice& device) {
+    Fill();
+    const auto floatImage = Image(FloatTexels.data(), Format32Float);
+    const auto uintImage = Image(UintTexels.data(), Format32UInt);
+    const auto sintImage = Image(SintTexels.data(), Format32SInt);
+    const std::array<std::uint32_t, 4> invalid{0x1234u, 0x5678u, 0x9abcu, 0x1000ffacu};
+    const std::array<std::function<std::uint32_t(std::uint32_t)>, 3> texels{
+        [](std::uint32_t x) { return std::bit_cast<std::uint32_t>(FloatTexels[x]); },
+        [](std::uint32_t x) { return UintTexels[x]; },
+        [](std::uint32_t x) { return static_cast<std::uint32_t>(SintTexels[x]); },
+    };
+    std::fill(Root.begin(), Root.end(), 0u);
+    SetEntry(0, floatImage);
+    SetEntry(1, uintImage);
+    SetEntry(2, sintImage);
+    SetEntry(7, invalid);
+    SetEntry(8, sintImage);
+    SetEntry(9, floatImage);
+    SetEntry(10, uintImage);
+    Keys = {};
+    for (std::uint32_t group = 0; group < 3u; ++group) Keys[group] = group;
+    const auto palette = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(Root.data())) + PaletteOffset;
+    if (!BindlessHeap()) {
+        std::string reason;
+        try {
+            static_cast<void>(RunRuntimePointer(device, 3, palette));
+        } catch (const std::exception& error) {
+            reason = error.what();
+        }
+        Require(reason.find("GetImageResource dword 0 is not a valid runtime value") != std::string::npos, "runtime image address: without the bindless heap the T# behind a pointer read from a vector register was not refused: " + reason);
+        std::puts("runtime image address: refused without the bindless heap");
+        return;
+    }
+    struct Registration {
+        void* data;
+        Registration(void* data, std::size_t bytes) : data(data) { GuestAllocations::Mutation().Add(data, bytes, true, true, true); }
+        ~Registration() { GuestAllocations::Mutation().Remove(data); }
+    } registeredRoot(Root.data(), Root.size() * sizeof(std::uint32_t)), registeredKeys(Keys.data(), sizeof(Keys));
+    Require(device.BindlessService() != nullptr, "runtime image address: the device has no texture service");
+    const auto& service = *device.BindlessService();
+    expectBindlessTables = false;
+    const auto before = service.Totals();
+    const auto first = RunRuntimePointer(device, 3, palette);
+    Require(first.bindlessHeap && first.bindlessTables.empty() && !first.imageTableBinding, "runtime image address: the T# behind a runtime pointer was not read through the bindless heap without a table");
+    Require(!Faulted(first), "runtime image address: the first dispatch faulted:\n" + first.log);
+    const auto served = RunRuntimePointer(device, 3, palette);
+    Require(!Faulted(served), "runtime image address: the served dispatch faulted:\n" + served.log);
+    for (std::uint32_t group = 0; group < 3u; ++group) RequireRed(served, group, Lanes, texels[group], "runtime image address: entry " + std::to_string(group));
+    Require(service.Totals().misses - before.misses == 3u, "runtime image address: expected the 3 T#s to arrive through the miss ring, got " + std::to_string(service.Totals().misses - before.misses));
+
+    const auto moved = palette + 8u * 32u;
+    static_cast<void>(RunRuntimePointer(device, 3, moved));
+    const auto movedServed = RunRuntimePointer(device, 3, moved);
+    Require(!Faulted(movedServed) && movedServed.variantId == served.variantId, "runtime image address: a moved pointer faulted or specialized another module:\n" + movedServed.log);
+    for (std::uint32_t group = 0; group < 3u; ++group) RequireRed(movedServed, group, Lanes, texels[(group + 2u) % 3u], "runtime image address: moved pointer, entry " + std::to_string(group));
+
+    Keys[0] = 7;
+    static_cast<void>(RunRuntimePointer(device, 1, palette));
+    const auto selected = RunRuntimePointer(device, 1, palette);
+    char address[32];
+    std::snprintf(address, sizeof(address), "0x%llx", static_cast<unsigned long long>(palette + 7u * 32u));
+    Require(Faulted(selected) && selected.log.find("not an image") != std::string::npos && selected.log.find(address) != std::string::npos && selected.log.find("00001234") != std::string::npos, "runtime image address: an invalid T# did not report its address, words and reason:\n" + selected.log);
+    Require(Zeros(selected), "runtime image address: a refused T# did not sample zeros");
+    expectBindlessTables = true;
+    std::puts("runtime image address: T#s behind a runtime pointer are served through the miss ring");
+}
+
 std::vector<std::uint32_t> DescriptorWaterfallCode(std::uint32_t waveSize) {
     std::vector<std::uint32_t> code{
         0xf4080700u, 0xfa000020u, 0xf40c0200u, 0xfa000040u, 0xf4080400u, 0xfa000030u,
@@ -2119,6 +2203,47 @@ void RunPixelMissTests(AgcDriver::VulkanDevice& device) {
     std::puts("bindless pixel miss: zero on a miss, exact after the drain passed");
 }
 
+alignas(256) constexpr std::array<std::uint32_t, 31> PixelRuntimePointerCode{
+    0xbefe0a7eu, 0x7e100f00u, 0x2c101082u, 0x36101081u, 0x4a101004u, 0x10040010u, 0x10060211u, 0x361c1081u,
+    0x341c1c83u, 0xe0341000u, 0x80000c0eu, 0xbf8c0070u, 0xbea8047eu, 0x7e280508u, 0x7e2c050cu, 0x7e2e050du,
+    0x7d841014u, 0xbeaa246au, 0x8f158514u, 0xf40c060bu, 0x2a000000u, 0xbf8cc07fu, 0xf0800f08u, 0x00660402u,
+    0x8afe6a2au, 0xbf89fff3u, 0xbefe0428u, 0xbf8c3f70u, 0xf800180fu, 0x07060504u, 0xbf810000u,
+};
+
+void RunPixelRuntimeAddressTests(AgcDriver::VulkanDevice& device) {
+    alignas(256) static std::array<std::uint32_t, 8> pointers{};
+    FillSampleTextures();
+    const auto table = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(SampleTable.data()));
+    for (std::uint32_t copy = 0; copy < 2u; ++copy) {
+        pointers[copy * 2u] = static_cast<std::uint32_t>(table);
+        pointers[copy * 2u + 1u] = static_cast<std::uint32_t>(table >> 32u);
+    }
+    const auto scale = 1.0f / static_cast<float>(SampleSize);
+    if (!BindlessHeap()) {
+        std::string reason;
+        try {
+            static_cast<void>(DrawPixelTable(device, PixelRuntimePointerCode, pointers, 0u, SamplePointSampler, scale, scale));
+        } catch (const std::exception& error) {
+            reason = error.what();
+        }
+        Require(reason.find("GetImageResource dword 0 is not a valid runtime value") != std::string::npos, "runtime image address pixel: without the bindless heap the T# behind a waterfall pointer was not refused: " + reason);
+        std::puts("runtime image address pixel: refused without the bindless heap");
+        return;
+    }
+    PixelRegistration registeredTable(SampleTable.data(), sizeof(SampleTable));
+    const auto& service = *device.BindlessService();
+    for (std::uint32_t base = 0; base + 1u < SampleTextures; ++base) {
+        const auto what = "runtime image address pixel: per-pixel texture " + std::to_string(base) + " or " + std::to_string(base + 1u) + " behind a waterfall pointer";
+        const auto before = service.Totals();
+        const auto first = DrawPixelTable(device, PixelRuntimePointerCode, pointers, base, SamplePointSampler, scale, scale);
+        RequirePixelHeap(first, what, device);
+        static_cast<void>(DrawPixelTable(device, PixelRuntimePointerCode, pointers, base, SamplePointSampler, scale, scale));
+        RequirePixels([&](std::uint32_t x, std::uint32_t) { return std::array<std::uint32_t, 4>{SampleLevelMark(0), SampleTextureMark(base + ((x >> 2u) & 1u)), 7u, 255u}; }, what);
+        Require(service.Totals().misses - before.misses <= 2u, what + ": more than its 2 T#s missed");
+    }
+    std::puts("runtime image address pixel: T#s behind a waterfall pointer are served through the miss ring");
+}
+
 void RunPixelRefusalTests(AgcDriver::VulkanDevice& device) {
     using Kind = AgcDriver::Graphics::BindlessRefusalKind;
     const auto& service = *device.BindlessService();
@@ -2201,6 +2326,11 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--bindless-serve-submit") {
             RunBindlessServeSubmitTests(*device);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--runtime-address") {
+            RunRuntimeAddressTests(*device);
+            RunPixelRuntimeAddressTests(*device);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--pipeline-only") {
