@@ -135,6 +135,7 @@ public:
         if (m_bdaTraces > bdaTraceLimit) std::fprintf(stderr, "[bda] %u more address accesses in this program not shown\n", m_bdaTraces - bdaTraceLimit);
         CheckTableStores();
         AssignTables();
+        RequireRuntimeAddressesLowered();
         LinkImageAliases();
         for (const auto& patch : m_handlePatches) {
             patch.handle->SetFlags<std::uint32_t>(patch.resource);
@@ -192,6 +193,7 @@ private:
         std::vector<const IrValue*> reads;
         std::optional<KeyDomain> keyDomain;
         std::vector<IrValue*> heap;
+        bool dynamic = false;
     };
 
     void MakeSource(const IrValue& handle, std::uint32_t width, bool sampler, bool sampleAdjust, DescriptorSource& descriptor) {
@@ -555,7 +557,7 @@ private:
         return value;
     }
 
-    bool TryMakeTableColumn(IrValue& handle, bool sampler, bool r128, TableColumnPlan& plan) {
+    bool TryMakeTableColumn(IrValue& handle, bool sampler, bool r128, bool dynamic, TableColumnPlan& plan) {
         const auto expected = sampler ? IrOpcode::GetSamplerResource : IrOpcode::GetImageResource;
         const std::uint32_t width = sampler ? 4u : 8u;
         if (handle.Opcode() != expected || handle.ArgumentCount() != width) {
@@ -630,19 +632,26 @@ private:
         std::uint32_t addend = 0;
         bool masked = false;
         std::uint32_t descriptorOffset = 0;
+        const auto runtimeAddress = [&] {
+            if (!dynamic) return false;
+            DescriptorSource direct;
+            MakeSource(handle, width, sampler, false, direct);
+            std::uint32_t badDword = 0;
+            return !ValidateSource(direct, badDword) && MakeDynamicColumn(handle, *heapHandle, sampler, words, first, address, offset, folded ? baseAddend : 0u, folded ? carry : 0u, plan);
+        };
         if (address && immediateU32(offset, descriptorOffset)) {
-            return TryMakeIndirectColumn(handle, *heapHandle, sampler, words, descriptorOffset, first, plan);
+            return TryMakeIndirectColumn(handle, *heapHandle, sampler, words, descriptorOffset, first, plan) || runtimeAddress();
         }
         if (!MatchAffineOffset(offset, key, stride, addend)) {
             if (!MatchMaskedOffset(offset, key, stride)) {
-                return false;
+                return runtimeAddress();
             }
             masked = true;
         }
         DescriptorSource heapSource;
         std::uint32_t heapIndex = 0;
         if (!MakeRuntimeSource(*heapHandle, address ? IrOpcode::GetAddressResource : IrOpcode::GetBufferResource, address ? 2u : 4u, heapIndex, heapSource)) {
-            return false;
+            return runtimeAddress();
         }
         plan.heap.clear();
         for (std::uint32_t dword = 0; dword < heapHandle->ArgumentCount(); dword++) plan.heap.push_back(heapHandle->Argument(dword)->Resolve());
@@ -739,6 +748,40 @@ private:
         return true;
     }
 
+    bool MakeDynamicColumn(IrValue& handle, IrValue& heapHandle, bool sampler, std::uint32_t words, std::uint32_t first, bool address, IrValue* offset, std::uint32_t foldedAddend, std::uint32_t foldedCarry, TableColumnPlan& plan) {
+        const auto heapOpcode = address ? IrOpcode::GetAddressResource : IrOpcode::GetBufferResource;
+        const std::uint32_t heapWords = address ? 2u : 4u;
+        if (heapHandle.Opcode() != heapOpcode || heapHandle.ArgumentCount() != heapWords || offset == nullptr || offset->Type() != IrType::U32) {
+            return false;
+        }
+        plan.heap.clear();
+        for (std::uint32_t dword = 0; dword < heapWords; dword++) {
+            IrValue* word = heapHandle.Argument(dword)->Resolve();
+            if (word->Type() != IrType::U32) {
+                return false;
+            }
+            plan.heap.push_back(word);
+        }
+        TableColumn column;
+        column.heapSource = InternSource(DescriptorSource{});
+        column.offset = first;
+        column.dwordCount = words;
+        column.sampler = sampler;
+        column.address = address;
+        column.unkeyed = true;
+        column.foldedAddend = foldedAddend;
+        column.foldedCarry = foldedCarry;
+        column.dynamic = true;
+        DescriptorSource columnSource;
+        columnSource.tableColumn = column;
+        plan.handle = &handle;
+        plan.source = InternSource(columnSource);
+        plan.keyDomain.reset();
+        plan.offset = offset;
+        plan.dynamic = true;
+        return true;
+    }
+
     const TableColumnPlan* FindTableColumn(const IrValue& handle) const {
         const auto found = std::ranges::find_if(m_tableColumns, [&](const TableColumnPlan& plan) {
             return plan.handle == &handle;
@@ -746,12 +789,12 @@ private:
         return found == m_tableColumns.end() ? nullptr : &*found;
     }
 
-    bool PlanTableColumn(IrValue& handle, bool sampler, bool r128) {
+    bool PlanTableColumn(IrValue& handle, bool sampler, bool r128, bool dynamic) {
         if (FindTableColumn(handle) != nullptr) {
             return true;
         }
         TableColumnPlan plan;
-        if (!TryMakeTableColumn(handle, sampler, r128, plan)) {
+        if (!TryMakeTableColumn(handle, sampler, r128, dynamic, plan)) {
             return false;
         }
         m_tableColumns.push_back(std::move(plan));
@@ -1498,9 +1541,10 @@ private:
                     continue;
                 }
                 const auto memory = m_program.Resources().memoryInfo[flags.index];
-                static_cast<void>(PlanTableColumn(*inst->Argument(0)->Resolve(), false, memory.imageR128));
+                const bool dynamic = m_bindlessHandles && imageInfo.resourceClass == ImageResourceClass::Sampled;
+                static_cast<void>(PlanTableColumn(*inst->Argument(0)->Resolve(), false, memory.imageR128, dynamic));
                 if (imageInfo.needsSampler && inst->ArgumentCount() > 1u && !DirectSampler(*inst->Argument(1)->Resolve())) {
-                    static_cast<void>(PlanTableColumn(*inst->Argument(1)->Resolve(), true, false));
+                    static_cast<void>(PlanTableColumn(*inst->Argument(1)->Resolve(), true, false, dynamic));
                 }
             }
         }
@@ -1590,6 +1634,44 @@ private:
         for (auto& sampler : m_info.samplers) {
             if (TableSource(sampler.source)) {
                 sampler.table = next++;
+            }
+        }
+    }
+
+    bool DynamicSource(std::uint32_t source) const {
+        return TableSource(source) && m_sources[source].tableColumn->dynamic;
+    }
+
+    bool LoweredImage(const ImageResource& image) const {
+        const auto stage = m_program.Resources().stage;
+        return image.table != NoTable && DynamicLoweringStage(stage) && image.resourceClass == ImageResourceClass::Sampled && image.tableOperation == TableOperation::Supported;
+    }
+
+    static bool DynamicLoweringStage(IrShaderStage stage) {
+        return stage != IrShaderStage::Unknown && stage != IrShaderStage::Fetch;
+    }
+
+    [[noreturn]] void FailRuntimeAddress(std::uint32_t source) {
+        for (const auto& plan : m_tableColumns) {
+            if (plan.source != source) continue;
+            const bool sampler = m_sources[source].tableColumn->sampler;
+            DescriptorSource descriptor;
+            MakeSource(*plan.handle, sampler ? 4u : 8u, sampler, false, descriptor);
+            std::uint32_t badDword = 0;
+            static_cast<void>(ValidateSource(descriptor, badDword));
+            fail(std::string(IrOpcodeName(sampler ? IrOpcode::GetSamplerResource : IrOpcode::GetImageResource)) + " dword " + std::to_string(badDword) + " is not a valid runtime value; chain: " + describeValueChain(descriptor.dwords[badDword], 8u) + " (its descriptor address is known only at run time, which only a sampled image on the bindless heap can read)");
+        }
+        fail("a runtime descriptor address column has no handle");
+    }
+
+    void RequireRuntimeAddressesLowered() {
+        for (const auto& image : m_info.images) {
+            if (DynamicSource(image.source) && !LoweredImage(image)) FailRuntimeAddress(image.source);
+        }
+        for (std::uint32_t sampler = 0; sampler < m_info.samplers.size(); sampler++) {
+            if (!DynamicSource(m_info.samplers[sampler].source)) continue;
+            for (const auto& pair : m_info.sampledPairs) {
+                if (pair.sampler == sampler && (pair.image >= m_info.images.size() || !LoweredImage(m_info.images[pair.image]))) FailRuntimeAddress(m_info.samplers[sampler].source);
             }
         }
     }

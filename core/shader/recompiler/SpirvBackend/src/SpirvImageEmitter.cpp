@@ -1647,6 +1647,7 @@ TableWord EmitTableWord(SpirvValueEmitContext& ctx, const IrValue& inst, std::ui
     const auto& sources = state.program.Resources().descriptorSources;
     if (handle->ArgumentCount() == 0u || source >= sources.size() || !sources[source].tableColumn.has_value()) ctx.Fail(inst, "has an image table handle without its column");
     const auto& column = *sources[source].tableColumn;
+    if (column.dynamic) ctx.Fail(inst, "reads a descriptor whose address is known only at run time outside the bindless heap");
     const auto offset = ctx.Def(handle->Argument(0));
     const auto u32 = TypeU32(state);
     const auto boolean = TypeBool(state);
@@ -1817,7 +1818,8 @@ BindlessColumn BindlessColumnOf(SpirvValueEmitContext& ctx, const IrValue& inst,
     if (column.heapSource >= sources.size()) ctx.Fail(inst, "has a bindless table column without its heap source");
     const auto& kept = ctx.state.program.Metadata().bindlessHandleWords;
     const auto words = kept.find(handle);
-    if (handle->ArgumentCount() != width || words == kept.end() || words->second.size() != sources[column.heapSource].dwordCount) ctx.Fail(inst, "has a bindless table handle without its local heap dwords");
+    const auto heapWords = column.dynamic ? (column.address ? 2u : 4u) : sources[column.heapSource].dwordCount;
+    if (handle->ArgumentCount() != width || words == kept.end() || words->second.size() != heapWords) ctx.Fail(inst, "has a bindless table handle without its local heap dwords");
     BindlessColumn found{&column, handle->Argument(0), {}};
     for (const auto* reference : words->second) found.heap.push_back(reference->Argument(0));
     return found;
