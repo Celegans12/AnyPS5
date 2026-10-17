@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -20,6 +21,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -60,6 +62,11 @@ std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t by
 }
 
 int main() {
+#ifdef _WIN32
+    _putenv_s("APS5_NO_OPPORTUNISTIC_REAP", "1");
+#else
+    setenv("APS5_NO_OPPORTUNISTIC_REAP", "1", 1);
+#endif
     try {
         {
             const auto device = OpenVulkanTestDevice();
@@ -92,18 +99,34 @@ int main() {
         const auto labelAddress = reinterpret_cast<std::uintptr_t>(label);
         const auto in = BufferDescriptor(input, BufferBytes);
         const auto out = BufferDescriptor(output, BufferBytes);
-        std::vector<std::uint32_t> words{
+        std::vector<std::uint32_t> dispatch{
             0xc0027600u, 0x20cu, static_cast<std::uint32_t>(codeAddress >> 8u), static_cast<std::uint32_t>(codeAddress >> 40u),
             0xc0037600u, 0x207u, Lanes, 1u, 1u,
             0xc0017600u, 0x213u, 8u << 1u,
             0xc0087600u, 0x240u, in[0], in[1], in[2], in[3], out[0], out[1], out[2], out[3],
             0xc0031500u, 1u, 1u, 1u, 0x8041u,
-            0xc0064900u, 0x06000528u, (2u << 29u) | (2u << 24u) | (1u << 16u), static_cast<std::uint32_t>(labelAddress), static_cast<std::uint32_t>(labelAddress >> 32u), 1u, 0u, 0u,
         };
-        Packet packet{words.data(), static_cast<std::uint32_t>(words.size()), 0, {}};
-
+        std::vector<std::uint32_t> release{0xc0064900u, 0x06000528u, (2u << 29u) | (2u << 24u) | (1u << 16u), static_cast<std::uint32_t>(labelAddress), static_cast<std::uint32_t>(labelAddress >> 32u), 1u, 0u, 0u};
+        const auto submit = [](std::vector<std::uint32_t>& words) {
+            Packet packet{words.data(), static_cast<std::uint32_t>(words.size()), 0, {}};
+            check(sceAgcDriverSubmitDcb(&packet) == 0, "submission failed");
+        };
+        const auto waitFor = [](const auto& done, const char* what) {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            while (!done() && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            check(done(), what);
+        };
         const auto dormant = [] { return AgcDriver::DriverDetail::queue0Dormant.load(std::memory_order_relaxed); };
-        check(sceAgcDriverSubmitDcb(&packet) == 0, "submission failed");
+        auto& pipeline = AgcDriver::DriverDetail::DrawPipeline::Queue0();
+
+        submit(dispatch);
+        waitFor([&] { return dormant() && pipeline.Outstanding() == 0; }, "queue 0 did not wait for work after the dispatch");
+        {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            submit(release);
+            waitFor([&] { return pipeline.Outstanding() != 0; }, "queue 0 did not hand the end-of-pipe label to the draw pipeline");
+            waitFor(dormant, "queue 0 did not wait for work while the draw pipeline held the end-of-pipe label");
+        }
 
         std::array<KernelEvent, 1> events{};
         int delivered = 0;
