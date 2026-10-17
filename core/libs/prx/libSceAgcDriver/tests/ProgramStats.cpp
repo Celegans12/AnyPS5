@@ -23,9 +23,12 @@ bool Throws(const char* text) {
 void Lists() {
     Check(ParseProgramList(nullptr).empty() && ParseProgramList("").empty(), "an unset list is not empty");
     const auto list = ParseProgramList("0x80001c0d00, 8000394600,0X141D55D00,0x80001c0d00,");
-    Check(list.size() == 3 && list[0] == 0x141d55d00ull && list[1] == 0x80001c0d00ull && list[2] == 0x8000394600ull, "the list is not the sorted unique addresses");
-    Check(ListedProgram(list, 0x8000394600ull) && !ListedProgram(list, 0x8000394700ull) && !ListedProgram(list, 0), "membership is wrong");
-    Check(Throws("0x80001c0d00,zz") && Throws("0x") && Throws("0") && Throws("12345678901234567"), "a malformed entry is accepted");
+    Check(list.size() == 3 && list[0].first == 0x141d55d00ull && list[1].first == 0x80001c0d00ull && list[2] == std::pair<std::uint64_t, std::uint64_t>{0x8000394600ull, 0x8000394600ull}, "the list is not the sorted unique addresses");
+    Check(ListedProgram(list, 0x8000394600ull) && !ListedProgram(list, 0x8000394700ull) && !ListedProgram(list, 0x141d55cffull) && !ListedProgram(list, 0), "membership is wrong");
+    const auto ranges = ParseProgramList("0x8023000000-0x8023ffffff,0x8020000000 - 0x8020ffffff,0x8023800000-0x8024000000,0x80003aa700");
+    Check(ranges.size() == 3 && ranges[1] == std::pair<std::uint64_t, std::uint64_t>{0x8020000000ull, 0x8020ffffffull} && ranges[2] == std::pair<std::uint64_t, std::uint64_t>{0x8023000000ull, 0x8024000000ull}, "ranges are not merged");
+    Check(ListedProgram(ranges, 0x80233b7000ull) && ListedProgram(ranges, 0x8024000000ull) && !ListedProgram(ranges, 0x8024000100ull) && ListedProgram(ranges, 0x8020000000ull) && !ListedProgram(ranges, 0x801fffff00ull) && ListedProgram(ranges, 0x80003aa700ull) && !ListedProgram(ranges, 0x80003aa800ull), "range membership is wrong");
+    Check(Throws("0x80001c0d00,zz") && Throws("0x") && Throws("0") && Throws("12345678901234567") && Throws("0x200-0x100") && Throws("0x100-") && Throws("-0x100"), "a malformed entry is accepted");
     Check(ParseStatsInterval(nullptr) == 0 && ParseStatsInterval("10") == 10, "the interval is misread");
     bool threw = false;
     try {
