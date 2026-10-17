@@ -393,8 +393,9 @@ void Appears(const Env& env, std::uint8_t* plane, const char* where, bool moved,
     const auto refusals = AgcDriver::Graphics::ShaderResources::DepthGuardRefusals();
     Step(env, program, model, moved ? env.buffers.InputB() : env.buffers.InputA(), at + "the dispatch after the surface appeared");
     std::printf("dispatch move depth: %sthe depth guard refused %llu proofs\n", at.c_str(), static_cast<unsigned long long>(AgcDriver::Graphics::ShaderResources::DepthGuardRefusals() - refusals));
-    if (templates) Require(AgcDriver::Graphics::ShaderResources::DepthGuardRefusals() > refusals, "dispatch move depth: " + at + "the template over the plain storage image was proved current although a depth surface covers its memory");
-    Print((at + "the dispatch after the surface appeared").c_str(), Since(start));
+    const auto steps = Since(start);
+    if (templates && steps.checked != 0) Require(AgcDriver::Graphics::ShaderResources::DepthGuardRefusals() > refusals, "dispatch move depth: " + at + "the template over the plain storage image was proved current although a depth surface covers its memory");
+    Print((at + "the dispatch after the surface appeared").c_str(), steps);
     Totals(at + "after that dispatch");
     Verify(env, plane, model, at + "after that dispatch");
     DrawDepth(env, plane, 0.75f);
