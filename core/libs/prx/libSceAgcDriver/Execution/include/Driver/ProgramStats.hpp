@@ -40,6 +40,14 @@ const ProgramList& SkippedComputePrograms();
 // APS5_PROGRAM_TARGETS=<hex[-hex],...>: when set, the pixel skip and tint lists only apply to draws with a colour
 // target at a listed address.
 const ProgramList& ProgramFilterTargets();
+// APS5_SKIP_PIXEL_BITS=<frame>:<bits>: a bisect over frame dumps (one every 10 presents). Frame dump <frame> + 1 + b
+// (b < bits) skips the pixel programs whose ProgramBisectHash has bit b set (with APS5_PROGRAM_TARGETS, only draws
+// into those targets); frame dump <frame> and the ones after the last bit skip nothing. A frame dump's setting holds
+// from 5 presents before its present to 5 after, so a present of lag does not mix settings.
+std::uint32_t ProgramBisectHash(std::uint64_t address);
+std::optional<std::uint32_t> BisectBitForPresent(std::uint64_t present, std::uint32_t frame, std::uint32_t bits);
+bool BisectSkipsProgram(std::uint64_t address);
+void CountPresent();
 
 bool BlendableAttachmentFormat(VkFormat format);
 // Each blend state whose attachment format (formats[i], VK_FORMAT_UNDEFINED for none) is blendable and whose

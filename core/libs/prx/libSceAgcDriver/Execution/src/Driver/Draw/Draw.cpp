@@ -151,7 +151,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
     const auto& filterTargets = ProgramFilterTargets();
     const bool filtered = filterTargets.empty() || std::any_of(decode->state.colors.begin(), decode->state.colors.end(), [&](const Graphics::ColorTarget& color) { return ListedProgram(filterTargets, color.address); });
-    const bool skipPixel = filtered && ListedProgram(SkippedPixelPrograms(), pixelProgram);
+    const bool skipPixel = filtered && (ListedProgram(SkippedPixelPrograms(), pixelProgram) || BisectSkipsProgram(pixelProgram));
     const bool tintPixel = filtered && !skipPixel && ListedProgram(TintedPixelPrograms(), pixelProgram);
     if (tintPixel) {
         auto tinted = std::make_shared<DrawDecode>(*decode);

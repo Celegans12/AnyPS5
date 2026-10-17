@@ -59,6 +59,7 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
     if (PerformanceTrace::Configured()) PerformanceTrace::Present(window.width, window.height, device.Load().get());
     PerformanceContext timingContext(window.timing.get());
     PerformanceTimer timing("Driver.Present");
+    CountPresent();
     if (auto& stats = ProgramStats::Global(); stats.Enabled()) {
         for (const auto& line : stats.Present()) std::fprintf(stderr, "%s\n", line.c_str());
     }

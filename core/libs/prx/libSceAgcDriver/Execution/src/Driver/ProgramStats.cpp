@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/ProgramStats.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <iterator>
@@ -117,6 +118,67 @@ const ProgramList& ProgramFilterTargets() {
 const ProgramList& SkippedComputePrograms() {
     static const auto& list = listFromEnvironment("APS5_SKIP_COMPUTE_PROGRAMS");
     return list;
+}
+
+std::uint32_t ProgramBisectHash(std::uint64_t address) {
+    auto value = address + 0x9e3779b97f4a7c15ull;
+    value = (value ^ (value >> 30u)) * 0xbf58476d1ce4e5b9ull;
+    value = (value ^ (value >> 27u)) * 0x94d049bb133111ebull;
+    return static_cast<std::uint32_t>(value ^ (value >> 31u));
+}
+
+std::optional<std::uint32_t> BisectBitForPresent(std::uint64_t present, std::uint32_t frame, std::uint32_t bits) {
+    if (present < 4) return std::nullopt;
+    const auto dump = (present - 4) / 10;
+    if (dump <= frame || dump > static_cast<std::uint64_t>(frame) + bits) return std::nullopt;
+    return static_cast<std::uint32_t>(dump - frame - 1);
+}
+
+namespace {
+
+std::atomic<std::uint64_t> presentCount{0};
+
+struct BisectSetting {
+    bool active = false;
+    std::uint32_t frame = 0;
+    std::uint32_t bits = 0;
+};
+
+const BisectSetting& bisectSetting() {
+    static const BisectSetting setting = [] {
+        BisectSetting parsed;
+        const char* text = std::getenv("APS5_SKIP_PIXEL_BITS");
+        if (text == nullptr || *text == '\0') return parsed;
+        char* end = nullptr;
+        parsed.frame = static_cast<std::uint32_t>(std::strtoul(text, &end, 10));
+        if (end == nullptr || *end != ':') throw std::runtime_error("APS5_SKIP_PIXEL_BITS must be <frame>:<bits>");
+        parsed.bits = static_cast<std::uint32_t>(std::strtoul(end + 1, &end, 10));
+        if (end == nullptr || *end != '\0' || parsed.bits == 0 || parsed.bits > 32) throw std::runtime_error("APS5_SKIP_PIXEL_BITS must be <frame>:<bits> with 1 to 32 bits");
+        parsed.active = true;
+        std::fprintf(stderr, "[progstats] APS5_SKIP_PIXEL_BITS: frame dumps %u..%u skip hash bits 0..%u\n", parsed.frame + 1, parsed.frame + parsed.bits, parsed.bits - 1);
+        return parsed;
+    }();
+    return setting;
+}
+
+}
+
+void CountPresent() {
+    const auto present = presentCount.fetch_add(1, std::memory_order_relaxed) + 1;
+    const auto& setting = bisectSetting();
+    if (!setting.active) return;
+    const auto before = BisectBitForPresent(present - 1, setting.frame, setting.bits);
+    const auto now = BisectBitForPresent(present, setting.frame, setting.bits);
+    if (before == now) return;
+    if (now) std::fprintf(stderr, "[progstats] present %llu: skipping pixel programs with hash bit %u (frame dump %u)\n", static_cast<unsigned long long>(present), *now, setting.frame + 1 + *now);
+    else std::fprintf(stderr, "[progstats] present %llu: hash-bit skipping off\n", static_cast<unsigned long long>(present));
+}
+
+bool BisectSkipsProgram(std::uint64_t address) {
+    const auto& setting = bisectSetting();
+    if (!setting.active || address == 0) return false;
+    const auto bit = BisectBitForPresent(presentCount.load(std::memory_order_relaxed), setting.frame, setting.bits);
+    return bit && ((ProgramBisectHash(address) >> *bit) & 1u) != 0;
 }
 
 bool BlendableAttachmentFormat(VkFormat format) {
