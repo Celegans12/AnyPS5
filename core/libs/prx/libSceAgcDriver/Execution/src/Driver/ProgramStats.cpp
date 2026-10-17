@@ -115,6 +115,11 @@ const ProgramList& TintedPixelPrograms() {
     return list;
 }
 
+const ProgramList& DumpedDrawPrograms() {
+    static const auto& list = listFromEnvironment("APS5_DUMP_DRAW_PROGRAMS");
+    return list;
+}
+
 const ProgramList& ProgramFilterTargets() {
     static const auto& list = listFromEnvironment("APS5_PROGRAM_TARGETS");
     return list;
@@ -279,6 +284,13 @@ void ProgramStats::NoteDrawSampled(std::uint64_t pixel, std::span<const std::uin
     }
 }
 
+void ProgramStats::NoteMesh(std::uint64_t indexAddress, std::uint32_t indexCount, std::uint32_t instances, std::uint64_t vertex, std::uint32_t depthMode, std::uint64_t color) {
+    if (!Enabled() || indexAddress == 0) return;
+    std::lock_guard lock(mutex);
+    auto& users = meshes[{indexAddress, indexCount, instances}];
+    if (users.size() < 8) users.insert({vertex, depthMode, color});
+}
+
 void ProgramStats::NoteDispatch(std::uint64_t program, std::span<const StatsImage> written, bool skipped) {
     if (!Enabled()) return;
     std::lock_guard lock(mutex);
@@ -364,10 +376,27 @@ std::vector<std::string> ProgramStats::Present() {
             lines.push_back(std::move(line));
         }
         if (anyPlain) lines.push_back(std::move(plain));
+        std::map<std::string, std::uint64_t> sets;
+        for (const auto& [mesh, users] : meshes) {
+            std::set<std::uint64_t> programs;
+            for (const auto& user : users) programs.insert(std::get<0>(user));
+            if (programs.size() < 2) continue;
+            std::string text;
+            for (const auto& [vertex, mode, color] : users) {
+                char item[96];
+                std::snprintf(item, sizeof(item), "%svs 0x%llx@0x%llx:test%u:write%u:cmp%u", text.empty() ? "" : " + ", static_cast<unsigned long long>(vertex), static_cast<unsigned long long>(color), (mode >> 8u) & 1u, (mode >> 4u) & 1u, mode & 0xfu);
+                text += item;
+            }
+            ++sets[text];
+        }
+        std::vector<std::pair<std::string, std::uint64_t>> orderedSets(sets.begin(), sets.end());
+        std::stable_sort(orderedSets.begin(), orderedSets.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+        for (std::size_t i = 0; i < orderedSets.size() && i < 160; ++i) lines.push_back("[progstats] present " + std::to_string(presents) + " mesh x" + std::to_string(orderedSets[i].second) + ": " + orderedSets[i].first);
     }
     groups.clear();
     compute.clear();
     sampled.clear();
+    meshes.clear();
     draws = 0;
     return lines;
 }

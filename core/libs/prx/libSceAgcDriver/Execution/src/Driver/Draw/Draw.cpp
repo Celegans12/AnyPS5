@@ -182,6 +182,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         std::optional<StatsTarget> depth;
         if (state.depth) depth = StatsTarget{state.depth->address, state.depth->extent.width, state.depth->extent.height, static_cast<std::uint32_t>(state.depth->format), state.depth->samples, StatsDepthMode(state.depthTest, state.depthWrite, static_cast<std::uint32_t>(state.depthCompare))};
         stats.NoteDraw(pixelProgram, vertexProgram, colors, depth, skipPixel || skipDepthOnly, tintPixel);
+        if (drawParameters.indexed && !drawParameters.indirect) stats.NoteMesh(drawParameters.indexAddress, drawParameters.indexCount, drawParameters.instanceCount, vertexProgram, depth ? depth->depthMode : 0u, colors.empty() ? 0u : colors.front().address);
     }
     if (skipPixel || skipDepthOnly) return drawn();
     const auto& graphics = decode->state;
