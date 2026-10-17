@@ -71,6 +71,20 @@ void Bisect() {
     Check(ProgramBisectHash(0x80233b7000ull) != ProgramBisectHash(0x80233b7100ull) && ProgramBisectHash(0x80233b7000ull) == ProgramBisectHash(0x80233b7000ull), "the hash does not separate neighbouring programs");
 }
 
+void VertexSchedule() {
+    std::uint32_t frame = 0;
+    const auto items = ParseVertexSchedule("84:0x8023613b00,0x8020244800;-;0x80003d9600-0x80003d96ff", frame);
+    Check(frame == 84 && items.size() == 3 && ListedProgram(items[0], 0x8020244800ull) && items[1].empty() && ListedProgram(items[2], 0x80003d9600ull), "the vertex schedule is misread");
+    Check(ParseVertexSchedule(nullptr, frame).empty(), "an unset vertex schedule is not empty");
+    bool threw = false;
+    try {
+        static_cast<void>(ParseVertexSchedule("84;0x10", frame));
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    Check(threw, "a vertex schedule without a frame is accepted");
+}
+
 void Stats() {
     ProgramStats off(0);
     off.NoteDraw(1, 2, {}, std::nullopt, false, false);
@@ -114,6 +128,7 @@ int main() {
         Lists();
         Tint();
         Bisect();
+        VertexSchedule();
         Stats();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

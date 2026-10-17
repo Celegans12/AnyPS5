@@ -224,6 +224,37 @@ std::optional<char> DepthScheduleItem() {
     return schedule.items[*index];
 }
 
+std::vector<ProgramList> ParseVertexSchedule(const char* text, std::uint32_t& frame) {
+    std::vector<ProgramList> items;
+    if (text == nullptr || *text == '\0') return items;
+    char* end = nullptr;
+    frame = static_cast<std::uint32_t>(std::strtoul(text, &end, 10));
+    if (end == nullptr || *end != ':') throw std::runtime_error("APS5_SKIP_VERTEX_SCHEDULE must be <frame>:<list>;<list>;...");
+    std::string rest(end + 1);
+    std::size_t begin = 0;
+    while (begin <= rest.size()) {
+        auto stop = rest.find(';', begin);
+        if (stop == std::string::npos) stop = rest.size();
+        const auto item = rest.substr(begin, stop - begin);
+        items.push_back(item == "-" || item.empty() ? ProgramList{} : ParseProgramList(item.c_str()));
+        begin = stop + 1;
+    }
+    if (items.empty() || items.size() > 64) throw std::runtime_error("APS5_SKIP_VERTEX_SCHEDULE needs 1 to 64 items");
+    return items;
+}
+
+bool VertexScheduleSkips(std::uint64_t vertex) {
+    static std::uint32_t frame = 0;
+    static const auto items = [] {
+        auto parsed = ParseVertexSchedule(std::getenv("APS5_SKIP_VERTEX_SCHEDULE"), frame);
+        if (!parsed.empty()) std::fprintf(stderr, "[progstats] APS5_SKIP_VERTEX_SCHEDULE: frame dumps %u..%zu skip listed pre-pass vertex programs\n", frame + 1, frame + parsed.size());
+        return parsed;
+    }();
+    if (items.empty() || vertex == 0) return false;
+    const auto index = BisectBitForPresent(presentCount.load(std::memory_order_relaxed), frame, static_cast<std::uint32_t>(items.size()));
+    return index && ListedProgram(items[*index], vertex);
+}
+
 bool BlendableAttachmentFormat(VkFormat format) {
     switch (format) {
         case VK_FORMAT_UNDEFINED:
@@ -284,10 +315,10 @@ void ProgramStats::NoteDrawSampled(std::uint64_t pixel, std::span<const std::uin
     }
 }
 
-void ProgramStats::NoteMesh(std::uint64_t indexAddress, std::uint32_t indexCount, std::uint32_t instances, std::uint64_t vertex, std::uint32_t depthMode, std::uint64_t color) {
+void ProgramStats::NoteMesh(std::uint64_t indexAddress, std::uint32_t indexCount, std::uint32_t firstVertex, std::uint32_t instances, std::uint64_t depth, std::uint64_t vertex, std::uint32_t depthMode, std::uint64_t color) {
     if (!Enabled() || indexAddress == 0) return;
     std::lock_guard lock(mutex);
-    auto& users = meshes[{indexAddress, indexCount, instances}];
+    auto& users = meshes[{indexAddress, indexCount, firstVertex, instances, depth}];
     if (users.size() < 8) users.insert({vertex, depthMode, color});
 }
 
@@ -381,10 +412,12 @@ std::vector<std::string> ProgramStats::Present() {
             std::set<std::uint64_t> programs;
             for (const auto& user : users) programs.insert(std::get<0>(user));
             if (programs.size() < 2) continue;
-            std::string text;
+            char depthText[40];
+            std::snprintf(depthText, sizeof(depthText), "depth 0x%llx: ", static_cast<unsigned long long>(std::get<4>(mesh)));
+            std::string text = depthText;
             for (const auto& [vertex, mode, color] : users) {
                 char item[96];
-                std::snprintf(item, sizeof(item), "%svs 0x%llx@0x%llx:test%u:write%u:cmp%u", text.empty() ? "" : " + ", static_cast<unsigned long long>(vertex), static_cast<unsigned long long>(color), (mode >> 8u) & 1u, (mode >> 4u) & 1u, mode & 0xfu);
+                std::snprintf(item, sizeof(item), "%svs 0x%llx@0x%llx:test%u:write%u:cmp%u", text.back() == ' ' ? "" : " + ", static_cast<unsigned long long>(vertex), static_cast<unsigned long long>(color), (mode >> 8u) & 1u, (mode >> 4u) & 1u, mode & 0xfu);
                 text += item;
             }
             ++sets[text];
