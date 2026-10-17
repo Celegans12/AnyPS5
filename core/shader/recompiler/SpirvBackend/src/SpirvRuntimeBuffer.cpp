@@ -262,6 +262,12 @@ std::uint32_t byteOffset(SpirvEmitterState& state, const RuntimeDescriptor& reso
     return add(Select(state, u32, resource.swizzle, swizzled, add(range.linearBase, offset)), range.soffset);
 }
 
+RuntimeDescriptor withBounds(SpirvValueEmitContext& context, const IrValue& instruction, const RuntimeDescriptor& resource) {
+    auto prepared = resource;
+    if (prepared.bounds.enabled == 0u) prepared.bounds = bounds(context.state, resource, shape(context.state, resource), resource.soffset != 0u ? resource.soffset : context.Arg(instruction, 3u));
+    return prepared;
+}
+
 RuntimeAddress byteAddress(SpirvValueEmitContext& context, const IrValue& instruction, const RuntimeDescriptor& resource, std::uint32_t offset, std::uint32_t bytes) {
     auto& state = context.state;
     auto prepared = resource;
@@ -452,8 +458,9 @@ std::array<std::uint32_t, 4> storeValues(SpirvEmitterState& state, std::uint32_t
     return result;
 }
 
-std::uint32_t formatted(SpirvValueEmitContext& context, const IrValue& instruction, const RuntimeDescriptor& resource, const SpirvBufferFormatInfo& info, std::uint32_t components, bool store, std::uint32_t data) {
+std::uint32_t formatted(SpirvValueEmitContext& context, const IrValue& instruction, const RuntimeDescriptor& unbounded, const SpirvBufferFormatInfo& info, std::uint32_t components, bool store, std::uint32_t data) {
     auto& state = context.state;
+    const auto resource = withBounds(context, instruction, unbounded);
     const auto& memory = context.Memory(instruction);
     const auto u32 = TypeU32(state);
     std::array<std::uint32_t, 4> values{};
@@ -520,46 +527,54 @@ std::uint32_t formatted(SpirvValueEmitContext& context, const IrValue& instructi
     return composite(state, components, outputs);
 }
 
-std::uint32_t formatTable(SpirvEmitterState& state, std::uint32_t formats) {
-    if (state.bufferFormatTable != 0u) return state.bufferFormatTable;
-    const auto u32 = TypeU32(state);
-    const auto arrayType = state.module.Type(spv::OpTypeArray, u32, ConstantU32(state, 3u * (formats + 1u)));
-    std::vector<std::uint32_t> elements;
-    for (std::uint32_t index = 0; index <= formats; ++index) {
-        std::array<std::uint32_t, 3> entry{};
-        if (index != 0u) {
-            const auto info = GetFormatInfo(static_cast<IrBufferFormat>(index));
-            entry[0] = info.componentCount | (info.packedBitfield ? 8u : 0u) | (static_cast<std::uint32_t>(info.type) << 4u);
-            for (std::uint32_t component = 0; component < info.componentCount; ++component) {
-                entry[0] |= info.componentBits[component] << (8u + component * 6u);
-                entry[1] |= GetFormatComponentByteOffset(info, component) << (component * 8u);
-                entry[2] |= info.componentBitOffset[component] << (component * 8u);
-            }
-        }
-        for (const auto word : entry) elements.push_back(ConstantU32(state, word));
+std::array<std::uint32_t, 3> FormatTableEntry(std::uint32_t index) {
+    std::array<std::uint32_t, 3> entry{};
+    if (index == 0u) return entry;
+    const auto info = GetFormatInfo(static_cast<IrBufferFormat>(index));
+    entry[0] = info.componentCount | (info.packedBitfield ? 8u : 0u) | (static_cast<std::uint32_t>(info.type) << 4u);
+    for (std::uint32_t component = 0; component < info.componentCount; ++component) {
+        entry[0] |= info.componentBits[component] << (8u + component * 6u);
+        entry[1] |= GetFormatComponentByteOffset(info, component) << (component * 8u);
+        entry[2] |= info.componentBitOffset[component] << (component * 8u);
     }
-    const auto table = state.module.Constant(spv::OpConstantComposite, arrayType, elements);
-    state.bufferFormatTable = state.module.DefineInitializedGlobalVariable(TypePointer(state, spv::StorageClassPrivate, arrayType), spv::StorageClassPrivate, table);
-    return state.bufferFormatTable;
+    return entry;
 }
 
-std::uint32_t genericFormattedLoad(SpirvValueEmitContext& context, const IrValue& instruction, const RuntimeDescriptor& resource, std::uint32_t components, std::uint32_t format, std::uint32_t formats) {
+std::uint32_t genericFormattedLoad(SpirvValueEmitContext& context, const IrValue& instruction, const RuntimeDescriptor& unbounded, std::uint32_t components, std::uint32_t format, std::uint32_t formats) {
     auto& state = context.state;
+    const auto resource = withBounds(context, instruction, unbounded);
     const auto& memory = context.Memory(instruction);
     const auto u32 = TypeU32(state);
     const auto boolean = TypeBool(state);
     const auto constant = [&](std::uint32_t value) { return ConstantU32(state, value); };
-    const auto table = formatTable(state, formats);
-    const auto entry = [&](std::uint32_t word) {
-        const auto pointer = state.module.AllocateId();
-        state.module.AddFunction(spv::OpAccessChain, TypePointer(state, spv::StorageClassPrivate, u32), pointer, table, Binary(state, spv::OpIAdd, u32, Binary(state, spv::OpIMul, u32, format, constant(3u)), constant(word)));
-        const auto value = state.module.AllocateId();
-        state.module.AddFunction(spv::OpLoad, u32, value, pointer);
-        return value;
-    };
-    const auto layout = entry(0u);
-    const auto byteOffsets = entry(1u);
-    const auto bitOffsets = entry(2u);
+    std::array<std::uint32_t, 3> entries{};
+    const auto merge = state.module.AllocateId();
+    const auto none = state.module.AllocateId();
+    std::vector<std::uint32_t> branch{spv::OpSwitch, format, none};
+    std::array<std::vector<std::uint32_t>, 3> phis;
+    for (std::uint32_t word = 0; word < 3u; ++word) {
+        entries[word] = state.module.AllocateId();
+        phis[word] = {spv::OpPhi, u32, entries[word]};
+    }
+    std::vector<std::uint32_t> labels;
+    for (std::uint32_t index = 1; index <= formats; ++index) {
+        labels.push_back(state.module.AllocateId());
+        branch.insert(branch.end(), {index, labels.back()});
+    }
+    state.module.AddFunction(spv::OpSelectionMerge, merge, spv::SelectionControlMaskNone);
+    state.module.AddFunction(branch);
+    for (std::uint32_t index = 0; index <= formats; ++index) {
+        const auto label = index == 0u ? none : labels[index - 1u];
+        EmitLabel(state, label);
+        const auto words = FormatTableEntry(index);
+        for (std::uint32_t word = 0; word < 3u; ++word) phis[word].insert(phis[word].end(), {constant(words[word]), label});
+        state.module.AddFunction(spv::OpBranch, merge);
+    }
+    EmitLabel(state, merge);
+    for (const auto& phi : phis) state.module.AddFunction(phi);
+    const auto layout = entries[0];
+    const auto byteOffsets = entries[1];
+    const auto bitOffsets = entries[2];
     const auto componentCount = field(state, layout, 0u, 3u);
     const auto packed = nonzero(state, field(state, layout, 3u, 1u));
     const auto type = field(state, layout, 4u, 4u);
@@ -616,21 +631,44 @@ std::uint32_t genericFormattedLoad(SpirvValueEmitContext& context, const IrValue
             state.module.AddFunction(spv::OpBitFieldSExtract, TypeI32(state), signedField, Unary(state, spv::OpBitcast, TypeI32(state), raw), bitOffset, bits[component]);
             const auto extracted = Select(state, u32, equal(state, bits[component], constant(32u)), raw, Select(state, u32, signedType, Unary(state, spv::OpBitcast, u32, signedField), unsignedField));
             std::vector<std::pair<SpirvFormatComponentType, std::uint32_t>> conversions;
+            std::vector<std::vector<std::uint32_t>> cases;
             for (std::uint32_t index = 1; index <= formats; ++index) {
                 const auto info = GetFormatInfo(static_cast<IrBufferFormat>(index));
                 if (component >= info.componentCount) continue;
                 const std::pair<SpirvFormatComponentType, std::uint32_t> key{info.type, info.componentBits[component]};
-                if (std::find(conversions.begin(), conversions.end(), key) == conversions.end()) conversions.push_back(key);
+                if (std::find(conversions.begin(), conversions.end(), key) == conversions.end()) {
+                    conversions.push_back(key);
+                    cases.emplace_back();
+                }
+                cases[static_cast<std::size_t>(std::find(conversions.begin(), conversions.end(), key) - conversions.begin())].push_back(index);
             }
-            auto value = constant(0u);
-            for (const auto& [conversionType, conversionBits] : conversions) {
+            const auto merge = state.module.AllocateId();
+            const auto none = state.module.AllocateId();
+            std::vector<std::uint32_t> labels;
+            std::vector<std::uint32_t> branch{spv::OpSwitch, format, none};
+            for (const auto& indices : cases) {
+                labels.push_back(state.module.AllocateId());
+                for (const auto index : indices) branch.insert(branch.end(), {index, labels.back()});
+            }
+            const auto value = state.module.AllocateId();
+            std::vector<std::uint32_t> phi{spv::OpPhi, u32, value};
+            state.module.AddFunction(spv::OpSelectionMerge, merge, spv::SelectionControlMaskNone);
+            state.module.AddFunction(branch);
+            for (std::size_t conversion = 0; conversion < conversions.size(); ++conversion) {
+                EmitLabel(state, labels[conversion]);
                 SpirvBufferFormatInfo info{};
-                info.type = conversionType;
+                info.type = conversions[conversion].first;
                 info.componentCount = 1u;
-                info.componentBits[0] = conversionBits;
+                info.componentBits[0] = conversions[conversion].second;
                 const auto converted = memory.d16 ? EmitD16FormatComponent(state, info, 0u, extracted) : NormalizeFormatComponent(state, info, 0u, extracted);
-                value = Select(state, u32, both(state, isType(conversionType), equal(state, bits[component], constant(conversionBits))), converted, value);
+                phi.insert(phi.end(), {converted, state.currentLabel});
+                state.module.AddFunction(spv::OpBranch, merge);
             }
+            EmitLabel(state, none);
+            phi.insert(phi.end(), {constant(0u), none});
+            state.module.AddFunction(spv::OpBranch, merge);
+            EmitLabel(state, merge);
+            state.module.AddFunction(phi);
             return value;
         });
     }
