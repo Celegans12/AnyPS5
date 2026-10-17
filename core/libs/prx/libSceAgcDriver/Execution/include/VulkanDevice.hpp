@@ -180,6 +180,10 @@ public:
         std::uint64_t created, underGpuMutex;
     };
     static ComputePipelineCreation ComputePipelineCounts();
+    struct DispatchMoveCount {
+        std::uint64_t checked, exact, moved, refused, filtered;
+    };
+    static DispatchMoveCount DispatchMoveCounts();
     void ResolveMemory(std::uint64_t address, std::size_t bytes, bool writable);
     void* Window() const;
     void Resize(std::uint32_t width, std::uint32_t height);

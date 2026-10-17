@@ -231,12 +231,18 @@ public:
         std::size_t size;
         std::vector<std::uint32_t> words;
     };
-    std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}) const;
+    std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, bool movedOnly = false) const;
     std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const;
+    enum class MoveRefusal : std::size_t { None, Shape, NotGuest, Written, Limit, Inaccessible, Overlap, Bindings, Count };
+    struct MoveProof {
+        MoveRefusal refusal = MoveRefusal::None;
+        std::size_t buffers = 0;
+        std::size_t bytes = 0;
+    };
+    static const char* MoveRefusalName(MoveRefusal refusal);
+    std::optional<std::vector<MovedBuffer>> MovedDispatchBuffers(const CompiledShader& shader, Recorder* recorder, std::size_t maxBytes, MoveProof& proof) const;
     static std::size_t MaxDrawSnapshotBytes();
     void WriteBack();
-    // Deferred completion: MarkGpuWrites registers the results the recorded work leaves on the GPU
-    // (storage images stay there; buffer ranges are noted so CPU reads wait); WriteBackBuffers runs
     // once the work completed.
     void MarkGpuWrites(Recorder& recorder);
     void WriteBackBuffers(std::uint64_t shaderAddress = 0);
@@ -293,6 +299,7 @@ public:
     void KeepStorageImageBytes(Recorder& recorder) const;
     const std::vector<std::uint64_t>& MultisampleSources() const { return multisampleSources; }
     static bool NeverReusable(std::span<const CompiledShader> shaders);
+    static std::uint64_t DepthGuardRefusals();
     const std::vector<std::shared_ptr<Texture>>& SampledTextures() const { return textures; }
     // Whether a sampled texture of the set left the sampled cache (evicted, replaced, or made for
     // one use and never admitted): such a set is not kept by the resource cache, whose entries may

@@ -26,6 +26,7 @@ void RequireNoNativeDepthFeedback_nid_no_patch(const Context& context, const Dep
 void ClearDepthSurfaces(VkDevice device);
 void RetireDepthSurfaces(VkDevice device, std::uint64_t address, std::uint64_t bytes);
 bool DepthSurfaceAt(std::uint64_t address);
+bool DepthSurfaceOverlaps(VkDevice device, std::uint64_t address, std::uint64_t bytes);
 bool DepthSurfaceAt(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource);
 void SeedStorageFromDepth(const Context& context, const std::shared_ptr<StorageTexture>& storage);
 bool DepthSurfaceServesStorage(const Context& context, const StorageTexture& storage);
