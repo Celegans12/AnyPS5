@@ -454,6 +454,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         };
         std::vector<ExpandedDraw> expanded;
         std::vector<DrawPipeline::Range> writes;
+        std::vector<DrawPipeline::Range> reads;
         std::vector<const ShaderRecompiler::RecompileResult*> current(programResults.begin(), programResults.end());
         const auto enqueueExpanded = [&] {
             if (expanded.empty()) return;
@@ -467,7 +468,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 for (const auto& item : expanded) commitDraw(localDevice, commitQueue, decode->state, item.direct, item.stages, item.snapshots, nullptr, {}, 0);
             };
             auto held = std::make_shared<decltype(commit)>(std::move(commit));
-            pipeline.Enqueue([held] { (*held)(); }, std::move(writes));
+            pipeline.Enqueue([held] { (*held)(); }, std::move(writes), 0, {}, std::move(reads));
             pipeline.Note(DrawPipeline::Event::IndirectCommit);
             phaseTiming.Phase(DrawRowLockWait);
         };
@@ -528,6 +529,10 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             }
             const auto recordWrites = drawWriteRanges(graphics, item.stages);
             writes.insert(writes.end(), recordWrites.begin(), recordWrites.end());
+            if (item.direct.indexed && item.direct.indexSize != 0 && item.direct.indexCount != 0) {
+                const auto bytes = static_cast<std::uint64_t>(item.direct.indexCount) * item.direct.indexSize;
+                if (item.direct.indexAddress <= std::numeric_limits<std::uint64_t>::max() - bytes) reads.emplace_back(item.direct.indexAddress, item.direct.indexAddress + bytes);
+            }
             expanded.push_back(std::move(item));
         }
         enqueueExpanded();
