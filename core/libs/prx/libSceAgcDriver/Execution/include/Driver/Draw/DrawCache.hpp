@@ -79,6 +79,17 @@ struct StageDataHit {
     std::shared_ptr<const ShaderRecompiler::RecompileResult> compiled;
 };
 
+struct DrawKeyComponents {
+    std::uint64_t stable = 0;
+    std::array<std::uint64_t, 3> userData{};
+    std::uint64_t auxiliary = 0;
+    std::uint64_t device = 0;
+    std::uint64_t shaderSet = 0;
+    std::array<std::uint64_t, Graphics::DrawKeyRegisters.size()> ranges{};
+};
+
+enum class DrawKeyChange : std::size_t { Stable, PixelUserData, VertexUserData, HullUserData, Auxiliary, Device, NewShaderSet, Unchanged, Count };
+
 enum class DrawMiss : std::size_t { FrontDiffering, FragmentDiffering, OtherDiffering, Layout, Gate, Stages, Count };
 
 struct DrawEntryCounters {
@@ -90,7 +101,8 @@ struct DrawEntryCounters {
     std::uint64_t registerKeyLookups = 0, registerKeyHits = 0, decodeSkipped = 0, decodePartial = 0, facadeMismatches = 0, verifyDecodes = 0, verifyDecodeMismatches = 0;
     double keyUs = 0;
     std::uint64_t absentNewRegisters = 0, absentUserWords = 0, absentEvicted = 0, absentNeverInserted = 0, evictions = 0;
-    std::array<std::uint64_t, 6> registerKeyMissChanges{};
+    std::array<std::uint64_t, static_cast<std::size_t>(DrawKeyChange::Count)> registerKeyMissChanges{};
+    std::array<std::uint64_t, Graphics::DrawKeyRegisters.size()> stableRangeChanges{};
     std::uint64_t differingSameRuns = 0, differingWords = 0, differingRunsChanged = 0;
     std::uint64_t dataHits = 0, dataStagesReused = 0, dataStagesCompiled = 0, dataVerified = 0;
     std::uint64_t stageDataHits = 0, stageDataWords = 0, stageDataVerified = 0, stageDataInserts = 0, stageDataPositions = 0;

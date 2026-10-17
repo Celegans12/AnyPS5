@@ -57,14 +57,19 @@ std::uint64_t RegisterStateKey(const QueueState& queue, bool allUserWords, bool 
             mixPart(part, it->second);
         }
     };
+    std::array<std::uint64_t, 3> byStage{};
+    std::size_t stage = 0;
     for (const auto base : {0x00cu, 0x08cu, 0x10cu}) {
         const auto resources = queue.shader.find(base - 1);
         const auto count = resources == queue.shader.end() ? 0u : ((resources->second >> 1u) & 0x1fu) | (((resources->second >> 27u) & 1u) << 5u);
-        words(base, allUserWords ? 32u : std::min(count, 32u), userData);
+        auto& part = byStage[stage++];
+        part = 0xcbf29ce484222325ull;
+        words(base, allUserWords ? 32u : std::min(count, 32u), part);
+        mixPart(userData, part);
     }
     words(0x082u, 2, auxiliary);
     words(0x102u, 2, auxiliary);
-    if (parts != nullptr) *parts = {shape, userData, auxiliary};
+    if (parts != nullptr) *parts = {shape, userData, auxiliary, byStage};
     return exact;
 }
 
@@ -86,7 +91,7 @@ std::uint64_t DrawShaderSetKey(const QueueState& queue, const ShaderRegistry& re
     return key;
 }
 
-std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial, std::uint64_t* shape, std::array<std::uint64_t, 5>* components) {
+std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial, std::uint64_t* shape, DrawKeyComponents* components) {
     static const bool allUserWords = std::getenv("APS5_DRAW_KEY_ALL_USER_WORDS") != nullptr;
     static const bool verify = std::getenv("APS5_VERIFY_REGISTER_KEYS") != nullptr;
     std::uint64_t shapeKey = 0;
@@ -100,11 +105,24 @@ std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegis
         shapeKey *= 0x100000001b3ull;
     };
     if (components != nullptr) {
-        (*components)[0] = parts.stableRegisters;
-        (*components)[1] = parts.userDataRegisters;
-        (*components)[2] = parts.auxiliaryRegisters;
-        (*components)[3] = deviceSerial;
-        (*components)[4] = DrawShaderSetKey(queue, registry);
+        components->stable = parts.stableRegisters;
+        components->userData = parts.userDataByStage;
+        components->auxiliary = parts.auxiliaryRegisters;
+        components->device = deviceSerial;
+        components->shaderSet = DrawShaderSetKey(queue, registry);
+        const auto& masks = registerMasks();
+        for (std::size_t r = 0; r < Graphics::DrawKeyRegisters.size(); ++r) {
+            const auto& range = Graphics::DrawKeyRegisters[r];
+            const auto& registers = range.bank == Graphics::RegisterBank::Context ? queue.context : range.bank == Graphics::RegisterBank::Shader ? queue.shader : queue.userConfig;
+            const auto& mask = *masks[static_cast<std::size_t>(range.bank)];
+            std::uint64_t hash = 0xcbf29ce484222325ull;
+            for (auto it = registers.lower_bound(range.first); it != registers.end() && it->first < range.first + range.count; ++it) {
+                if (!mask.Contains(it->first)) continue;
+                hash = (hash ^ it->first) * 0x100000001b3ull;
+                hash = (hash ^ it->second) * 0x100000001b3ull;
+            }
+            components->ranges[r] = hash;
+        }
     }
     mix(deviceSerial);
     for (const auto base : {0x008u, 0x088u, 0x0c8u, 0x108u, 0x148u}) {
@@ -128,23 +146,40 @@ std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegis
     return key;
 }
 
-void Driver::traceDrawKeyLookup(const std::array<std::uint64_t, 5>& components, bool cacheMiss) {
-    if (!traceDrawCache()) return;
-    struct Previous { std::array<std::uint64_t, 4> parts{}; };
+void Driver::traceDrawKeyLookup(const DrawKeyComponents& components, bool cacheMiss) {
     struct PreviousStorage {};
-    auto& previous = HostThreadLocal<std::unordered_map<std::uint64_t, Previous>, PreviousStorage>();
-    const auto shaderSet = components[4];
-    if (previous.size() >= 2048 && previous.find(shaderSet) == previous.end()) previous.clear();
+    auto& previous = HostThreadLocal<std::unordered_map<std::uint64_t, DrawKeyComponents>, PreviousStorage>();
+    const auto shaderSet = components.shaderSet;
+    if (previous.size() >= 4096 && previous.find(shaderSet) == previous.end()) previous.clear();
     const auto [it, inserted] = previous.try_emplace(shaderSet);
-    if (!cacheMiss) { it->second.parts = {components[0], components[1], components[2], components[3]}; return; }
-    auto& counters = drawEntryCounters;
-    if (inserted) ++counters.registerKeyMissChanges[4];
-    else {
-        bool changed = false;
-        for (std::size_t i = 0; i < 4; ++i) if (it->second.parts[i] != components[i]) { ++counters.registerKeyMissChanges[i]; changed = true; }
-        if (!changed) ++counters.registerKeyMissChanges[5];
+    if (cacheMiss) {
+        auto& counters = drawEntryCounters;
+        const auto note = [&](DrawKeyChange change) { ++counters.registerKeyMissChanges[static_cast<std::size_t>(change)]; };
+        if (inserted) {
+            note(DrawKeyChange::NewShaderSet);
+        } else {
+            const auto& last = it->second;
+            bool changed = false;
+            const auto compare = [&](bool differs, DrawKeyChange change) {
+                if (!differs) return;
+                note(change);
+                changed = true;
+            };
+            compare(last.stable != components.stable, DrawKeyChange::Stable);
+            compare(last.userData[0] != components.userData[0], DrawKeyChange::PixelUserData);
+            compare(last.userData[1] != components.userData[1], DrawKeyChange::VertexUserData);
+            compare(last.userData[2] != components.userData[2], DrawKeyChange::HullUserData);
+            compare(last.auxiliary != components.auxiliary, DrawKeyChange::Auxiliary);
+            compare(last.device != components.device, DrawKeyChange::Device);
+            if (!changed) note(DrawKeyChange::Unchanged);
+            for (std::size_t r = 0; r < components.ranges.size(); ++r) {
+                if (last.ranges[r] == components.ranges[r]) continue;
+                ++counters.stableRangeChanges[r];
+                break;
+            }
+        }
     }
-    it->second.parts = {components[0], components[1], components[2], components[3]};
+    it->second = components;
 }
 
 bool Driver::sameVertexInfo(const ShaderRecompiler::ShaderVertexStageInfo& a, const ShaderRecompiler::ShaderVertexStageInfo& b) {

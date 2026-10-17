@@ -156,8 +156,9 @@ private:
     void maybeReportDrawCache(bool profile);
     void reportDrawCache(DrawEntryCounters& counters, bool profile);
     std::string profileDrawCacheLines(const DrawEntryCounters& counters);
-    static std::uint64_t drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial, std::uint64_t* shape = nullptr, std::array<std::uint64_t, 5>* components = nullptr);
-    void traceDrawKeyLookup(const std::array<std::uint64_t, 5>& components, bool cacheMiss);
+    std::string drawKeyChangeLine(const DrawEntryCounters& counters);
+    static std::uint64_t drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial, std::uint64_t* shape = nullptr, DrawKeyComponents* components = nullptr);
+    void traceDrawKeyLookup(const DrawKeyComponents& components, bool cacheMiss);
     static bool sameVertexInfo(const ShaderRecompiler::ShaderVertexStageInfo& a, const ShaderRecompiler::ShaderVertexStageInfo& b);
     static bool sameDecode(const DrawDecode& a, const DrawDecode& b);
     std::shared_ptr<DrawDecode> decodeDraw(const QueueState& queue, const Submission& submission);

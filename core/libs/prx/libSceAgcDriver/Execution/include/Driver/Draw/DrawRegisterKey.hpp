@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Execution/include/QueueState.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
+#include <array>
 
 namespace AgcDriver::DriverDetail {
 
@@ -10,6 +11,7 @@ struct RegisterStateKeyParts {
     std::uint64_t stableRegisters = 0;
     std::uint64_t userDataRegisters = 0;
     std::uint64_t auxiliaryRegisters = 0;
+    std::array<std::uint64_t, 3> userDataByStage{};
 };
 
 std::uint64_t RegisterStateKey(const QueueState& queue, bool allUserWords = false, bool incremental = true, std::uint64_t* shapeKey = nullptr, RegisterStateKeyParts* parts = nullptr);
