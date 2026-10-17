@@ -52,6 +52,8 @@ void CountPresent();
 // draws into a depth target listed in APS5_PROGRAM_TARGETS, a digit 0-7 draws the draws into a listed colour target
 // that test depth with VK_COMPARE_OP_EQUAL with that VkCompareOp instead.
 std::optional<char> DepthScheduleItem();
+// APS5_DUMP_DRAW_PROGRAMS=<hex[-hex],...>: the first capture of a listed draw program writes shader_<address>.req.
+const ProgramList& DumpedDrawPrograms();
 std::uint32_t StatsDepthMode(bool test, bool write, std::uint32_t compare);
 
 bool BlendableAttachmentFormat(VkFormat format);
@@ -86,6 +88,9 @@ public:
     bool Enabled() const { return every != 0; }
     void NoteDraw(std::uint64_t pixel, std::uint64_t vertex, std::span<const StatsTarget> colors, std::optional<StatsTarget> depth, bool skipped, bool tinted);
     void NoteDrawSampled(std::uint64_t pixel, std::span<const std::uint64_t> addresses);
+    // One indexed draw of a mesh (index buffer, count, instances); the report lists the sets of (vertex program, depth
+    // mode, first colour target) that drew the same mesh in one frame.
+    void NoteMesh(std::uint64_t indexAddress, std::uint32_t indexCount, std::uint32_t instances, std::uint64_t vertex, std::uint32_t depthMode, std::uint64_t color);
     void NoteDispatch(std::uint64_t program, std::span<const StatsImage> written, bool skipped);
     // Counts a present; on every n-th one returns the report lines of the draws and dispatches since the previous
     // present (otherwise none) and starts a new frame.
@@ -116,6 +121,7 @@ private:
     std::map<Group, std::map<std::pair<std::uint64_t, std::uint64_t>, PixelCount>> groups;
     std::map<std::uint64_t, ComputeCount> compute;
     std::map<std::uint64_t, std::set<std::uint64_t>> sampled;
+    std::map<std::tuple<std::uint64_t, std::uint32_t, std::uint32_t>, std::set<std::tuple<std::uint64_t, std::uint32_t, std::uint64_t>>> meshes;
 };
 
 }
