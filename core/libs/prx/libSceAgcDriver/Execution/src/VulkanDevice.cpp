@@ -3385,8 +3385,40 @@ double VulkanDevice::FinishPresent() {
     return RetirePresents(0);
 }
 
+namespace {
+
+void TriggerRenderDocCaptureAtPresent() {
+#ifdef _WIN32
+    static const long long wanted = [] {
+        const char* value = std::getenv("APS5_RENDERDOC_CAPTURE_PRESENT");
+        return value != nullptr ? std::atoll(value) : -1ll;
+    }();
+    if (wanted < 0) return;
+    static std::atomic<long long> presents{0};
+    if (presents.fetch_add(1, std::memory_order_relaxed) + 1 != wanted) return;
+    const auto module = GetModuleHandleA("renderdoc.dll");
+    if (module == nullptr) {
+        std::fprintf(stderr, "[renderdoc] capture at present %lld requested, but renderdoc.dll is not loaded\n", wanted);
+        return;
+    }
+    using GetApi = int (*)(int, void**);
+    const auto getApi = reinterpret_cast<GetApi>(reinterpret_cast<void*>(GetProcAddress(module, "RENDERDOC_GetAPI")));
+    void** api = nullptr;
+    if (getApi == nullptr || getApi(10102, reinterpret_cast<void**>(&api)) != 1 || api == nullptr) {
+        std::fprintf(stderr, "[renderdoc] RENDERDOC_GetAPI 1.1.2 failed\n");
+        return;
+    }
+    if (const char* path = std::getenv("APS5_RENDERDOC_CAPTURE_PATH"); path != nullptr) reinterpret_cast<void (*)(const char*)>(api[11])(path);
+    reinterpret_cast<void (*)()>(api[15])();
+    std::fprintf(stderr, "[renderdoc] capture triggered at present %lld\n", wanted);
+#endif
+}
+
+}
+
 void VulkanDevice::QueuePresent() {
     if (!state->queuePending) return;
+    TriggerRenderDocCaptureAtPresent();
     PerformanceTimer timing("Vulkan.QueuePresent");
     state->queuePending = false;
     const auto index = state->queueIndex;

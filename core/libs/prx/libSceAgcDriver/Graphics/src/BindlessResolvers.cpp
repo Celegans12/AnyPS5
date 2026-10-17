@@ -13,7 +13,9 @@
 #include "DeviceImageTableAbi.hpp"
 #include "ImageTableAbi.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <mutex>
 #include <stdexcept>
@@ -113,6 +115,15 @@ BindlessPrepared DriverBindlessResolver::Prepare(const DeviceImageKeys::Key& key
     if ((mode.emulatedCompare & ShaderRecompiler::EmulatedCompare::Enabled) != 0u) throw BindlessKeyRefusal("AGC graphics: comparison sampling of a color texture through the bindless heap is not implemented");
     auto state = std::make_shared<Prepared>();
     std::copy_n(key.begin(), Abi::DescriptorWords, state->words.begin());
+    if (found->image.r128) {
+        state->words = R128TextureWords(state->words);
+        static const bool stats = [] { const char* value = std::getenv("APS5_BINDLESS_STATS"); return value != nullptr && value[0] != '\0' && value[0] != '0'; }();
+        static std::atomic<std::uint32_t> reports{0};
+        if (stats && reports.fetch_add(1u, std::memory_order_relaxed) < 16u) {
+            std::fprintf(stderr, "[bindless] 128-bit T# %08x %08x %08x %08x read as %08x %08x %08x %08x 0 %08x 0 0 (MAX_MIP from LAST_LEVEL%s)\n",
+                key[0], key[1], key[2], key[3], state->words[0], state->words[1], state->words[2], state->words[3], state->words[5], state->words[3] != key[3] ? ", rebased to the view's base level" : "");
+        }
+    }
     state->resource = DecodeTextureResource(state->words);
     const auto shape = ShapeOf(mode.dimension);
     state->firstLayer = shape == ShaderRecompiler::DescriptorImageShape::Image2D && state->resource.dimension == TextureDimension::k2DArray;
