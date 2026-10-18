@@ -2027,13 +2027,13 @@ void OneDimensionalColorTests() {
 // group size, mixed masks or an indirect dispatch.
 void htileBufferMaskClearTests() {
     static constexpr std::array<std::uint32_t, 16> kernel{0xd7460004u, 0x04010c0cu, 0xe00c2000u, 0x80000004u, 0xbf8c3f70u, 0xd7710000u, 0x00120008u, 0xd7710001u, 0x00160209u, 0xd7710002u, 0x001a040au, 0xd7710003u, 0x001e060bu, 0xe01c2000u, 0x80000004u, 0xbf810000u};
-    AgcDriver::ShaderRecompiler::ShaderComputeStageInfo compute{};
+    ShaderRecompiler::ShaderComputeStageInfo compute{};
     compute.numThreads = {64u, 1u, 1u};
     compute.groupIdEnable = {true, false, false};
     compute.threadIdComponentCount = 1u;
     const std::array<std::uint32_t, 12> userData{0x8e350000u, 0x00100050u, 0x00004000u, 0x0004bfacu, 0u, 0u, 0u, 0u, 0x3f0u, 0x3f0u, 0x3f0u, 0x3f0u};
     const std::array<std::uint32_t, 5> packet{0u, 0x4000u, 1u, 1u, 0x61u};
-    const auto match = [&](std::span<const std::uint32_t> code, std::span<const std::uint32_t> words, const AgcDriver::ShaderRecompiler::ShaderComputeStageInfo& info, std::span<const std::uint32_t> dispatch, std::uint64_t indirect) {
+    const auto match = [&](std::span<const std::uint32_t> code, std::span<const std::uint32_t> words, const ShaderRecompiler::ShaderComputeStageInfo& info, std::span<const std::uint32_t> dispatch, std::uint64_t indirect) {
         return AgcDriver::Graphics::MatchHtileBufferMaskClear(code, words, info, dispatch, indirect);
     };
     const auto found = match(kernel, userData, compute, packet, 0);
