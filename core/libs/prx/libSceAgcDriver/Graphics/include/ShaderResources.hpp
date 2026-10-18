@@ -192,6 +192,9 @@ struct PresyncSurface {
     bool dccKeys;
 };
 
+// S1: the tag of the two-stage draw build (see ShaderResources).
+struct DeferredDrawBuild {};
+
 class ShaderResources {
 public:
     ShaderResources(const Context& context, const ShaderRecompiler::RecompileResult& vertex, const ShaderRecompiler::RecompileResult& fragment, const ColorTarget& target, std::uint64_t indexAddress, std::size_t indexBytes);
@@ -204,6 +207,14 @@ public:
     // reconciles imports and refreshes mirrors, which needs the lock.
     ShaderResources(const Context& context, const CompiledShader& compute, std::span<const GuestMemorySnapshot> snapshots, bool deferred, std::uint64_t dispatchThreads = 0);
     void Complete();
+    // S1 (APS5_NO_SPLIT_DRAW_BUILD=1 off): the draw build in two stages, as for dispatches: the
+    // constructor runs stage A only (no device lock; no guest bytes are read: host copies wait for
+    // stage B), CompleteDraw() stage B under GuestMemory::GpuMutex. Address-based stages are refused
+    // (their lease and mirrors need the lock): callers check UsesAddressTables first. `shaders` must
+    // outlive CompleteDraw().
+    ShaderResources(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::size_t indexBytes, DeferredDrawBuild);
+    void CompleteDraw();
+    static bool StagesUseAddressTables(std::span<const CompiledShader> shaders);
     bool Completed() const { return completed; }
     ~ShaderResources();
     ShaderResources(const ShaderResources&) = delete;
@@ -699,8 +710,10 @@ private:
     bool lockedBuild = false;
     // Stage A runs without the device lock (a deferred, non-address-based build).
     bool unlockedPrepare = false;
+    bool deferredDraw = false;
     bool completed = false;
     std::chrono::steady_clock::time_point phaseStart;
+    double phaseWaited = 0;
 };
 
 // Built ShaderResources by the content the build consumed (see ShaderResources::ContentKey), so a
@@ -722,6 +735,8 @@ class ResourceCache {
 public:
     using Key = std::vector<std::uint32_t>;
     std::shared_ptr<ShaderResources> Find(const Key& key);
+    // The entry without touching it or counting a miss (the S1 preparer's look ahead).
+    std::shared_ptr<ShaderResources> Peek(const Key& key);
     // `evicted`, when given, receives the objects the insert displaces (the entry replaced under the
     // key, the ones over the bound) instead of their being destroyed here: a caller under the GPU
     // mutex hands them to the recorder so the destruction runs off the lock (VulkanDevice::dispatch).

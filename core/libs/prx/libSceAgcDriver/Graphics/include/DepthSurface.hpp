@@ -16,6 +16,10 @@ class Texture;
 class StorageTexture;
 
 VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target);
+// Under GuestMemory::GpuMutex: the HTILE bytes whose store-back read in DepthSurfaceView would wait
+// for a pending GPU write (no GPU expansion knows the words), 0 when it would not. The draw's
+// HTILE pre-sync (S1) waits for that writer without the mutex first.
+std::size_t HtileStoreBackWaits(const Context& context, const DepthTarget& target);
 bool SampleLocationsCompatibleDepth(const Context& context, VkFormat format, std::uint32_t samples);
 std::uint64_t DepthSurfacesSerial();
 std::uint64_t DepthSliceBytes(VkExtent2D extent, std::uint32_t bytesPerTexel);
@@ -34,6 +38,8 @@ bool DepthSurfaceServesStorage(const Context& context, const StorageTexture& sto
 void ValidateStorageDepthWrites(const Context& context, std::span<const std::shared_ptr<StorageTexture>> storage);
 void MarkStorageDepthWrites(const Context& context, const std::shared_ptr<StorageTexture>& storage);
 std::uint64_t HtileDepthClearAddress(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const std::array<std::uint32_t, 3>& numThreads);
+// Whether the code starts with the HTILE mask kernel (whatever its user data): the [htile] writer attribution.
+bool HtileMaskKernelCode(std::span<const std::uint32_t> code);
 std::size_t HtileDepthClearBytes_nid_no_patch(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const ShaderRecompiler::ShaderComputeStageInfo& compute, std::span<const std::uint32_t> packet, std::uint64_t indirectArguments);
 void NoteHtileDepthClear(std::uint64_t htileAddress, std::size_t bytes, std::size_t nativeBytes = 0u);
 class Recorder;

@@ -3745,7 +3745,7 @@ bool VulkanDevice::PrebuildGraphicsLibraries(const Graphics::ShaderStages& stage
     return Graphics::Pipeline::Prebuild(context, state, Graphics::VertexInputLayout{}, layouts.View(), group);
 }
 
-void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipe) {
+void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipe, Graphics::PreparedDraw* prepared) {
     for (const auto& shader : shaders) {
         require(shader.program != nullptr, "missing compiled shader");
         ShaderRecompiler::RuntimeAbi::RequireVersion(shader.program->runtimeAbiVersion);
@@ -3755,8 +3755,75 @@ void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParamete
     static const bool trace = std::getenv("APS5_TRACE_DRAWS") != nullptr;
     if (trace) APS5_LOG_OUT("VulkanDevice::Draw indices=%u instances=%u indexSize=%u address=0x%llx shaders=%zu colorTarget=%u", draw.indexCount, draw.instanceCount, draw.indexSize, static_cast<unsigned long long>(draw.indexAddress), shaders.size(), static_cast<unsigned>(graphics.hasColorTarget));
     const auto context = graphicsContext();
-    Graphics::Draw(context, graphics, draw, shaders, snapshots, recipe);
+    Graphics::Draw(context, graphics, draw, shaders, snapshots, recipe, prepared);
     if (trace) APS5_LOG_CHARS_OUT("VulkanDevice::Draw complete");
+}
+
+std::shared_ptr<Graphics::PreparedDraw> VulkanDevice::PrepareDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders) {
+    for (const auto& shader : shaders) {
+        if (shader.program == nullptr) return nullptr;
+        ShaderRecompiler::RuntimeAbi::RequireVersion(shader.program->runtimeAbiVersion);
+    }
+    return Graphics::PrepareDraw(graphicsContext(), graphics, draw, shaders);
+}
+
+namespace {
+
+struct DepthPresyncCounters {
+    std::atomic<std::uint64_t> checked{0};
+    std::atomic<std::uint64_t> pending{0};
+    std::atomic<std::uint64_t> waited{0};
+    std::atomic<std::uint64_t> waitedUs{0};
+    std::atomic<std::uint64_t> submitted{0};
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+DepthPresyncCounters& DepthPresyncs() {
+    static auto* counters = new DepthPresyncCounters();
+    return *counters;
+}
+
+}
+
+std::uint64_t VulkanDevice::PresyncDrawDepth(const Graphics::State& graphics) {
+    static const bool disabled = std::getenv("APS5_NO_HTILE_PRESYNC") != nullptr;
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (disabled || !graphics.depth || graphics.depth->htileAddress == 0 || !CanWaitUnlocked()) return 0;
+    auto& counters = DepthPresyncs();
+    counters.checked.fetch_add(1, std::memory_order_relaxed);
+    const auto& depth = *graphics.depth;
+    // Lock-free first: no recorded batch writes anything near the HTILE range.
+    if (!Graphics::Recorder::SnapshotWriteOverlaps(depth.htileAddress, static_cast<std::size_t>(Graphics::HtileMetadataBytes(depth.extent)))) return 0;
+    std::uint64_t serial = 0;
+    {
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Wait);
+        std::lock_guard lock(GuestMemory::GpuMutex());
+        if (!state->recorder) return 0;
+        const auto context = graphicsContext();
+        const auto bytes = Graphics::HtileStoreBackWaits(context, depth);
+        if (bytes == 0) return 0;
+        counters.pending.fetch_add(1, std::memory_order_relaxed);
+        const auto info = state->recorder->DescribePendingWrite(depth.htileAddress, bytes);
+        if (!info.has_value()) return 0;
+        serial = info->serial;
+        if (info->open) {
+            serial = state->recorder->SubmitAndEpoch();
+            counters.submitted.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    if (serial == 0) return 0;
+    const auto start = std::chrono::steady_clock::now();
+    WaitRecorded(serial);
+    counters.waited.fetch_add(1, std::memory_order_relaxed);
+    counters.waitedUs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+    if (profile) {
+        const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        auto last = counters.lastReport.load();
+        if (nowMs - last >= 10000 && counters.lastReport.compare_exchange_strong(last, nowMs)) {
+            AgcDriver::ProfilePrint_nid_no_patch("[htile-presync] (cumulative) %llu depth draws checked, %llu would wait in the store-back, %llu pre-synced (%llu submitted the open batch) waiting %.0f ms without the GPU mutex\n", static_cast<unsigned long long>(counters.checked.load()), static_cast<unsigned long long>(counters.pending.load()), static_cast<unsigned long long>(counters.waited.load()), static_cast<unsigned long long>(counters.submitted.load()), counters.waitedUs.load() / 1000.0);
+        }
+    }
+    return serial;
 }
 
 namespace {

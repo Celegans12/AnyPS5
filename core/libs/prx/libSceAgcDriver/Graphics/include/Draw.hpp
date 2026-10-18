@@ -17,7 +17,16 @@ struct HostImport;
 // `recipe`, when given, receives the DrawRecipe a recorded, cacheable, reusable, non-indirect draw
 // built for its draw-cache entry (design_cpu_final M8; null otherwise, and always under
 // APS5_NO_DRAW_RECIPE=1).
-void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr);
+// S1 (APS5_NO_SPLIT_DRAW_BUILD=1 off): what a draw's resource build can do before the draw without
+// the device lock, made from the draw's own inputs by the draw pipeline's preparer: the resource
+// key, whether the resource cache held an entry for it then, and stage A of a fresh build (see
+// ShaderResources' DeferredDrawBuild). Draw uses it only when its own lookup misses and the
+// stamps taken before the preparation (ForgetSerial, the registry generation, the device) are
+// unchanged; otherwise it builds under the lock as before.
+struct PreparedDraw;
+bool SplitDrawBuild();
+std::shared_ptr<PreparedDraw> PrepareDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders);
+void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, PreparedDraw* prepared = nullptr);
 std::optional<std::string> KnownValidationFailure(const Context& context, std::span<const CompiledShader> shaders, const State& state);
 std::uint64_t DrawRenderPassKey(const Context& context, const State& state, std::span<const VkImageView> targetViews);
 

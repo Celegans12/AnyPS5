@@ -21,6 +21,8 @@
 #include <limits>
 #include <shared_mutex>
 #include <cstdio>
+#include <cstring>
+#include <string>
 #include <iterator>
 #include <map>
 #include <memory>
@@ -1191,6 +1193,9 @@ struct HtileSyncCounters {
     std::atomic<std::uint64_t> cleared{0};
     std::atomic<std::uint64_t> waitNs{0};
     std::atomic<std::int64_t> lastReport{0};
+    // The newest pending writer of each waiting read (Recorder::OriginOfNote): count and wait.
+    std::mutex writersMutex;
+    std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> writers;
 };
 
 HtileSyncCounters& HtileSyncs() {
@@ -1215,7 +1220,19 @@ void reportHtileSyncs() {
     const auto cleared = take(counters.cleared);
     const auto waitMs = static_cast<double>(take(counters.waitNs)) / 1e6;
     auto& gpu = HtileGpu();
-    AgcDriver::ProfilePrint_nid_no_patch("[htile] store-back reads (10 s): %llu, %llu over pending GPU writes waiting %.1f ms (writer batch open %llu, signaled %llu, batches finished %llu; writer range = htile %llu, larger %llu, partial %llu); %llu found cleared; expanded on the GPU without a read (cumulative) %llu, over a pending expansion %llu, mask clear with unknown bits %llu\n", reads, pending, waitMs, open, signaled, batches, exact, larger, partial, cleared, static_cast<unsigned long long>(gpu.expanded.load(std::memory_order_relaxed)), static_cast<unsigned long long>(gpu.skipped.load(std::memory_order_relaxed)), static_cast<unsigned long long>(gpu.unknown.load(std::memory_order_relaxed)));
+    std::string writerText;
+    {
+        std::lock_guard lock(counters.writersMutex);
+        std::vector<std::pair<std::string, std::pair<std::uint64_t, std::uint64_t>>> sorted(counters.writers.begin(), counters.writers.end());
+        counters.writers.clear();
+        std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.second.second > b.second.second; });
+        for (std::size_t i = 0; i < sorted.size() && i < 6; ++i) {
+            char item[224];
+            std::snprintf(item, sizeof(item), " [%s: %llu, %.0f ms]", sorted[i].first.c_str(), static_cast<unsigned long long>(sorted[i].second.first), static_cast<double>(sorted[i].second.second) / 1e6);
+            writerText += item;
+        }
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[htile] store-back reads (10 s): %llu, %llu over pending GPU writes waiting %.1f ms (writer batch open %llu, signaled %llu, batches finished %llu; writer range = htile %llu, larger %llu, partial %llu); %llu found cleared; expanded on the GPU without a read (cumulative) %llu, over a pending expansion %llu, mask clear with unknown bits %llu\n", reads, pending, waitMs, open, signaled, batches, exact, larger, partial, cleared, static_cast<unsigned long long>(gpu.expanded.load(std::memory_order_relaxed)), static_cast<unsigned long long>(gpu.skipped.load(std::memory_order_relaxed)), static_cast<unsigned long long>(gpu.unknown.load(std::memory_order_relaxed)), writerText.c_str());
 }
 
 
@@ -1303,6 +1320,7 @@ VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarg
     auto& syncs = HtileSyncs();
     const auto readStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto writer = profile && recorder != nullptr ? recorder->DescribePendingWrite(target.htileAddress, bytes) : std::nullopt;
+    const auto origin = writer.has_value() ? Recorder::OriginOfNote(recorder->NewestWriteNote(target.htileAddress, bytes)) : std::nullopt;
     GuestMemory::Read(target.htileAddress, std::as_writable_bytes(std::span(words)), 4);
     const bool uniform = std::all_of(words.begin(), words.end(), [&](std::uint32_t word) { return word == words.front(); });
     VkImageAspectFlags cleared = target.firstSlice == 0 || uniform ? VK_IMAGE_ASPECT_DEPTH_BIT | (target.htileStencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u) : 0u;
@@ -1317,6 +1335,22 @@ VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarg
             syncs.batches.fetch_add(writer->batchesToFinish, std::memory_order_relaxed);
             const bool covers = writer->rangeBegin <= target.htileAddress && writer->rangeEnd >= target.htileAddress + bytes;
             (covers && writer->rangeBegin == target.htileAddress && writer->rangeEnd == target.htileAddress + bytes ? syncs.exact : covers ? syncs.larger : syncs.partial).fetch_add(1, std::memory_order_relaxed);
+            char key[192];
+            if (origin.has_value()) {
+                const bool whole = origin->begin <= target.htileAddress && origin->end >= target.htileAddress + bytes;
+                std::snprintf(key, sizeof(key), "q0x%x op 0x%02x prog 0x%llx %s 0x%llx+0x%llx", origin->queue, origin->opcode & 0xffffu, static_cast<unsigned long long>(origin->program), whole ? "whole" : "part", static_cast<unsigned long long>(origin->begin), static_cast<unsigned long long>(origin->end - origin->begin));
+                if (origin->kernel) {
+                    const auto length = std::strlen(key);
+                    std::snprintf(key + length, sizeof(key) - length, " mask-kernel m 0x%x v 0x%x", origin->mask, origin->value);
+                }
+            } else {
+                std::snprintf(key, sizeof(key), "unattributed");
+            }
+            const auto waited = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - readStart).count());
+            std::lock_guard lock(syncs.writersMutex);
+            auto& entry = syncs.writers[key];
+            ++entry.first;
+            entry.second += waited;
         }
         if (cleared != 0) syncs.cleared.fetch_add(1, std::memory_order_relaxed);
         reportHtileSyncs();
@@ -1432,6 +1466,32 @@ float HostDepthBiasConstant(const Context& context, VkFormat format, float const
     return constant * 256.0f;
 }
 
+std::size_t HtileStoreBackWaits(const Context& context, const DepthTarget& target) {
+    if (target.htileAddress == 0 || RoutesToNativeDepthOwner(target)) return 0;
+    const auto bytes = static_cast<std::size_t>(HtileMetadataBytes(target.extent));
+    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(target.htileAddress), bytes, true)) return 0;
+    auto* recorder = RecorderFor(context);
+    if (recorder == nullptr || !recorder->PendingWriteOverlaps(target.htileAddress, bytes)) return 0;
+    if (HtileGpuExpansion() && bytes % 16u == 0 && target.htileAddress % 16u == 0) {
+        const auto newest = recorder->NewestWriteNote(target.htileAddress, bytes);
+        if (newest != 0) {
+            auto& gpu = HtileGpu();
+            std::optional<HtileMaskWrite> write;
+            bool fill = false;
+            {
+                std::lock_guard lock(gpu.mutex);
+                if (const auto found = gpu.expansions.find(target.htileAddress); found != gpu.expansions.end() && found->second == newest) return 0;
+                for (const auto& mask : gpu.masks) {
+                    if (mask.note == newest && mask.begin <= target.htileAddress && mask.end >= target.htileAddress + bytes) write = mask;
+                }
+                if (const auto found = gpu.fills.find(recorder); found != gpu.fills.end()) fill = static_cast<bool>(found->second);
+            }
+            if (write.has_value() && fill && KnownHtileExpansion(*write, target).has_value()) return 0;
+        }
+    }
+    return bytes;
+}
+
 VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) {
     const auto htileCleared = RoutesToNativeDepthOwner(target) ? VkImageAspectFlags{0} : storeBackClearedHtile(context, target);
     std::lock_guard gpu(GuestMemory::GpuMutex());
@@ -1500,10 +1560,17 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) 
     return surface->view;
 }
 
+namespace {
+constexpr std::array<std::uint32_t, 17> HtileMaskKernel{0xd7460000u, 0x04010c06u, 0x34000084u, 0xdc388000u, 0x04020000u, 0xbf8c3f70u, 0xd7710008u, 0x00120805u, 0xd7710009u, 0x00120a05u, 0xd771000au, 0x00120c05u, 0xd771000bu, 0x00120e05u, 0xdc788000u, 0x00020800u, 0xbf810000u};
+}
+
+bool HtileMaskKernelCode(std::span<const std::uint32_t> code) {
+    return code.size() >= HtileMaskKernel.size() && std::equal(HtileMaskKernel.begin(), HtileMaskKernel.end(), code.begin());
+}
+
 std::uint64_t HtileDepthClearAddress(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const std::array<std::uint32_t, 3>& numThreads) {
-    static constexpr std::array<std::uint32_t, 17> htileMaskKernel{0xd7460000u, 0x04010c06u, 0x34000084u, 0xdc388000u, 0x04020000u, 0xbf8c3f70u, 0xd7710008u, 0x00120805u, 0xd7710009u, 0x00120a05u, 0xd771000au, 0x00120c05u, 0xd771000bu, 0x00120e05u, 0xdc788000u, 0x00020800u, 0xbf810000u};
     if (userData.size() < 6 || numThreads[0] != 64 || numThreads[1] != 1 || numThreads[2] != 1) return 0;
-    if (code.size() < htileMaskKernel.size() || !std::equal(htileMaskKernel.begin(), htileMaskKernel.end(), code.begin())) return 0;
+    if (!HtileMaskKernelCode(code)) return 0;
     if ((userData[5] & 0xfu) != 0 || (userData[4] & 0xfu) != 0) return 0;
     return userData[2] | (static_cast<std::uint64_t>(userData[3]) << 32u);
 }
