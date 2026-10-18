@@ -1,4 +1,5 @@
 #include "BdaTests.hpp"
+#include "EnvironmentGuards.hpp"
 #include "ImageTableAbi.hpp"
 #include "IntermediateRepresentation/IrMetadata/ShaderInfo.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
@@ -1496,6 +1497,7 @@ void guardedWrapFaultTests(const Context& context, const BdaTestAccess& access) 
 #else
         if (value) setenv("APS5_UNNORM_WRAP_GUARD", value, 1); else unsetenv("APS5_UNNORM_WRAP_GUARD");
 #endif
+        ShaderRecompiler::RefreshEnvironmentGuards();
     };
     struct Restore { decltype(set)& action; const char* value; ~Restore() { action(value); } } restore{set, old ? previous.c_str() : nullptr};
     set("1");

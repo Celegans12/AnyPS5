@@ -1050,6 +1050,141 @@ std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderAr
     return entry->module;
 }
 
+// APS5_NO_TABLE_RESOLVE_MEMO=1: every materialization resolves its image tables and bindless registrations again.
+bool TableResolveMemo() {
+    static const bool enabled = std::getenv("APS5_NO_TABLE_RESOLVE_MEMO") == nullptr;
+    return enabled;
+}
+
+struct ResolvedTablesEntry {
+    ImageTableSnapshot tables;
+    std::vector<std::array<std::uint32_t, 4>> directSamplers;
+    ResolvedImageTables resolved;
+    std::vector<BindlessImageAbi::TableRegistration> bindless;
+    bool bindlessResolved = false;
+    std::size_t bytes = 0;
+};
+
+struct ResolvedTablesMemo {
+    std::mutex mutex;
+    std::unordered_map<std::uint64_t, std::vector<std::shared_ptr<const ResolvedTablesEntry>>> entries;
+    std::size_t count = 0;
+    std::size_t bytes = 0;
+    std::atomic<std::uint64_t> hits{0}, misses{0}, clears{0};
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+constexpr std::size_t ResolvedTablesPerVariant = 8;
+constexpr std::size_t ResolvedTablesBytes = std::size_t{128} << 20u;
+
+ResolvedTablesMemo& resolvedTablesMemo() {
+    static ResolvedTablesMemo memo;
+    return memo;
+}
+
+template<typename T>
+std::size_t resolvedVectorBytes(const std::vector<T>& values) {
+    return values.capacity() * sizeof(T);
+}
+
+std::size_t resolvedTablesBytes(const ResolvedTablesEntry& entry) {
+    std::size_t bytes = sizeof(entry) + resolvedVectorBytes(entry.tables.tables) + resolvedVectorBytes(entry.tables.words) + resolvedVectorBytes(entry.tables.ranges) + resolvedVectorBytes(entry.directSamplers);
+    for (const auto& table : entry.tables.tables) bytes += resolvedVectorBytes(table.codes) + resolvedVectorBytes(table.readRanges) + resolvedVectorBytes(table.addresses);
+    bytes += resolvedVectorBytes(entry.resolved.map) + resolvedVectorBytes(entry.resolved.elements) + resolvedVectorBytes(entry.resolved.samplers) + resolvedVectorBytes(entry.resolved.poison) + resolvedVectorBytes(entry.bindless);
+    for (const auto& table : entry.bindless) bytes += resolvedVectorBytes(table.uses);
+    return bytes;
+}
+
+void reportResolvedTablesMemo(ResolvedTablesMemo& memo) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile) return;
+    const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = memo.lastReport.load(std::memory_order_relaxed);
+    if (last == 0) {
+        memo.lastReport.compare_exchange_strong(last, now, std::memory_order_relaxed);
+        return;
+    }
+    if (now - last < 10'000'000'000ll || !memo.lastReport.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
+    const auto hits = memo.hits.exchange(0, std::memory_order_relaxed);
+    const auto misses = memo.misses.exchange(0, std::memory_order_relaxed);
+    const auto clears = memo.clears.exchange(0, std::memory_order_relaxed);
+    std::size_t count = 0, bytes = 0;
+    {
+        std::lock_guard lock(memo.mutex);
+        count = memo.count;
+        bytes = memo.bytes;
+    }
+    std::fprintf(stderr, "[image-table] resolve memo (10 s): %llu hits, %llu misses (%.1f%% hits), %llu clears; live %zu entries, %.1f MiB\n", static_cast<unsigned long long>(hits), static_cast<unsigned long long>(misses), hits + misses != 0 ? 100.0 * static_cast<double>(hits) / static_cast<double>(hits + misses) : 0.0, static_cast<unsigned long long>(clears), count, static_cast<double>(bytes) / 1048576.0);
+}
+
+std::shared_ptr<const ResolvedTablesEntry> resolveTables(const CompiledVariant& variant, const ResourceSnapshot& snapshot) {
+    const auto& info = variant.info.info;
+    const bool bindless = variant.artifact.bindlessHeap;
+    const auto compute = [&](std::vector<std::array<std::uint32_t, 4>> directSamplers) {
+        auto entry = std::make_shared<ResolvedTablesEntry>();
+        entry->resolved = ResourceMaterializer::ResolveImageTables(info, snapshot, variant.artifact.variantId);
+        if (bindless) entry->bindless = ResourceMaterializer::BindlessTables(info, variant.info.stage, snapshot);
+        entry->bindlessResolved = bindless;
+        entry->directSamplers = std::move(directSamplers);
+        return entry;
+    };
+    const bool tabled = std::ranges::any_of(info.images, [](const ImageResource& image) { return image.table != NoTable; }) || std::ranges::any_of(info.samplers, [](const SamplerResource& sampler) { return sampler.table != NoTable; });
+    if (!TableResolveMemo() || !tabled || snapshot.tables.tables.empty()) return compute({});
+    std::vector<std::array<std::uint32_t, 4>> directSamplers;
+    directSamplers.reserve(info.sampledPairs.size());
+    for (const auto& pair : info.sampledPairs) {
+        if (pair.sampler >= info.samplers.size() || info.samplers[pair.sampler].table != NoTable || pair.sampler >= snapshot.samplers.size()) continue;
+        const auto& words = snapshot.samplers[pair.sampler].dwords;
+        directSamplers.push_back({words[0], words[1], words[2], words[3]});
+    }
+    auto& memo = resolvedTablesMemo();
+    const auto variantId = variant.artifact.variantId;
+    {
+        std::lock_guard lock(memo.mutex);
+        if (const auto found = memo.entries.find(variantId); found != memo.entries.end()) {
+            auto& list = found->second;
+            for (std::size_t index = 0; index < list.size(); ++index) {
+                const auto& candidate = *list[index];
+                if (candidate.bindlessResolved != bindless || candidate.directSamplers != directSamplers || candidate.tables != snapshot.tables) continue;
+                auto hit = list[index];
+                if (index != 0u) std::rotate(list.begin(), list.begin() + static_cast<std::ptrdiff_t>(index), list.begin() + static_cast<std::ptrdiff_t>(index) + 1);
+                memo.hits.fetch_add(1, std::memory_order_relaxed);
+                return hit;
+            }
+        }
+    }
+    auto entry = compute(std::move(directSamplers));
+    entry->tables = snapshot.tables;
+    entry->bytes = resolvedTablesBytes(*entry);
+    memo.misses.fetch_add(1, std::memory_order_relaxed);
+    std::vector<std::shared_ptr<const ResolvedTablesEntry>> released;
+    {
+        std::lock_guard lock(memo.mutex);
+        if (memo.bytes + entry->bytes > ResolvedTablesBytes) {
+            for (auto& [id, list] : memo.entries) released.insert(released.end(), list.begin(), list.end());
+            memo.entries.clear();
+            memo.count = 0;
+            memo.bytes = 0;
+            memo.clears.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (entry->bytes <= ResolvedTablesBytes) {
+            auto& list = memo.entries[variantId];
+            list.insert(list.begin(), entry);
+            memo.count++;
+            memo.bytes += entry->bytes;
+            while (list.size() > ResolvedTablesPerVariant) {
+                memo.bytes -= list.back()->bytes;
+                memo.count--;
+                released.push_back(std::move(list.back()));
+                list.pop_back();
+            }
+        }
+    }
+    released.clear();
+    reportResolvedTablesMemo(memo);
+    return entry;
+}
+
 RecompileResult materializeResult(const CompiledVariant& variant, const RecompileRequest& request, const ResourceSnapshot& snapshot, bool registrationDefaults = false) {
     ResourceMaterializer::ValidateDirectImageRefusals(variant.info.info, variant.info.stage, snapshot, request.target.bdaAbiVersion == BdaAbi::Version && variant.artifact.bdaAbiVersion == BdaAbi::Version);
     RecompileResult result;
@@ -1195,7 +1330,8 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
     } else {
         result.spirv = artifact.spirv;
     }
-    const auto tables = ResourceMaterializer::ResolveImageTables(variant.info.info, snapshot, artifact.variantId);
+    const auto resolvedTables = resolveTables(variant, snapshot);
+    const auto& tables = resolvedTables->resolved;
     BindingAllocationResult bindings;
     DescriptorBindingBuilder{}.Populate(bindings, variant.bindings, *bindingPlan, variant.info.userDataBase, snapshot, partialThreads(request), &tables);
     result.workgroupMemoryDwords = WorkgroupMemoryStrideDwords(variant.info.info);
@@ -1248,7 +1384,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         result.imageTableShader = snapshot.tables.shader;
         result.imageTableFaults = tables.faults;
     }
-    if (artifact.bindlessHeap) result.bindlessTables = ResourceMaterializer::BindlessTables(variant.info.info, variant.info.stage, snapshot);
+    if (artifact.bindlessHeap) result.bindlessTables = resolvedTables->bindless;
     return result;
 }
 
@@ -1836,6 +1972,40 @@ std::uint64_t ResultMemoSourceBytes() {
 std::shared_ptr<const RecompileResult> Recompile(const RecompileRequest& request, const ResourceCapture& capture, bool* memoHit) {
     if (memoHit != nullptr) *memoHit = false;
     return recompileReporting(request, [&] { return RecompileImpl(request, capture, memoHit); });
+}
+
+
+namespace {
+
+bool readEnvironmentGuard(EnvironmentGuard guard) {
+    if (guard == EnvironmentGuard::LoopGuard) {
+        const auto* value = std::getenv("APS5_LOOP_GUARD");
+        return value != nullptr && static_cast<std::uint32_t>(std::strtoul(value, nullptr, 0)) != 0u;
+    }
+    const auto* value = std::getenv("APS5_UNNORM_WRAP_GUARD");
+    return value != nullptr && std::string_view(value) == "1";
+}
+
+std::array<std::atomic<std::uint8_t>, static_cast<std::size_t>(EnvironmentGuard::Count)>& environmentGuardStates() {
+    static std::array<std::atomic<std::uint8_t>, static_cast<std::size_t>(EnvironmentGuard::Count)> states{};
+    return states;
+}
+
+}
+
+bool EnvironmentGuardEnabled(EnvironmentGuard guard) {
+    static const bool uncached = std::getenv("APS5_NO_ENV_GUARD_CACHE") != nullptr;
+    if (uncached) return readEnvironmentGuard(guard);
+    auto& state = environmentGuardStates()[static_cast<std::size_t>(guard)];
+    const auto known = state.load(std::memory_order_relaxed);
+    if (known != 0u) return known == 2u;
+    const bool enabled = readEnvironmentGuard(guard);
+    state.store(enabled ? 2u : 1u, std::memory_order_relaxed);
+    return enabled;
+}
+
+void RefreshEnvironmentGuards() {
+    for (auto& state : environmentGuardStates()) state.store(0u, std::memory_order_relaxed);
 }
 
 }

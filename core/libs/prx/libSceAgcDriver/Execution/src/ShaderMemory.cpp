@@ -64,6 +64,11 @@ bool WordwisePages() {
     return wordwise;
 }
 
+bool FastLazyWords() {
+    static const bool fast = std::getenv("APS5_NO_FAST_CAPTURE_WORDS") == nullptr;
+    return fast;
+}
+
 bool CaptureProfiled() {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     return profile;
@@ -306,7 +311,15 @@ bool ShaderMemory::readWords(void* context, std::uint64_t address, std::uint32_t
         const auto bytes = static_cast<std::uint64_t>(words) * sizeof(std::uint32_t);
         Page* page = nullptr;
         if (address % sizeof(std::uint32_t) == 0 && address <= std::numeric_limits<std::uint64_t>::max() - bytes && !self.overlapsInitial(address, address + bytes)) page = &self.page(base);
-        if (page != nullptr && page->valid.All()) {
+        if (page != nullptr && page->lazy && !page->valid.All() && FastLazyWords()) {
+            for (auto block = index / BlockWords; block * BlockWords < index + words; ++block) {
+                const auto first = block * BlockWords;
+                if (page->valid.Test(first)) continue;
+                std::memcpy(&page->words[first], reinterpret_cast<const void*>(base + first * sizeof(std::uint32_t)), BlockWords * sizeof(std::uint32_t));
+                page->valid.SetBlock(first);
+            }
+        }
+        if (page != nullptr && (page->valid.All() || (page->lazy && FastLazyWords()))) {
             std::memcpy(values, page->words.data() + index, bytes);
             page->read.SetRun(index, words);
             page->recent.SetRun(index, words);

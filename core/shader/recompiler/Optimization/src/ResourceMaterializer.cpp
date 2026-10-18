@@ -9,6 +9,7 @@
 #include "DirectImageRefusal.hpp"
 #include "UnnormalizedWrap.hpp"
 #include "PipelineSpecialization.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -586,10 +587,41 @@ private:
         tableCounters().narrowed.fetch_add(1, std::memory_order_relaxed);
     }
 
+    static bool FlatWordsIndex() {
+        static const bool flat = std::getenv("APS5_NO_FAST_TABLE_SNAPSHOT") == nullptr;
+        return flat;
+    }
+
+    static std::size_t WordsSlot(const DescriptorValue& value) {
+        return WordsHash{}(WordsHash::Key{value.dwords, value.dwordCount, value.availableDwordMask});
+    }
+
     std::uint32_t WordsIndex(const DescriptorValue& value) {
-        const auto [found, inserted] = wordsIndex.try_emplace({value.dwords, value.dwordCount, value.availableDwordMask}, static_cast<std::uint32_t>(tables.words.size()));
-        if (inserted) tables.words.push_back(value);
-        return found->second;
+        if (!FlatWordsIndex()) {
+            const auto [found, inserted] = wordsIndex.try_emplace({value.dwords, value.dwordCount, value.availableDwordMask}, static_cast<std::uint32_t>(tables.words.size()));
+            if (inserted) tables.words.push_back(value);
+            return found->second;
+        }
+        if ((tables.words.size() + 1u) * 2u > wordSlots.size()) {
+            wordSlots.assign(std::max<std::size_t>(64u, wordSlots.size() * 2u), 0u);
+            const auto mask = wordSlots.size() - 1u;
+            for (std::size_t index = 0; index < tables.words.size(); ++index) {
+                auto slot = WordsSlot(tables.words[index]) & mask;
+                while (wordSlots[slot] != 0u) slot = (slot + 1u) & mask;
+                wordSlots[slot] = static_cast<std::uint32_t>(index + 1u);
+            }
+        }
+        const auto mask = wordSlots.size() - 1u;
+        auto slot = WordsSlot(value) & mask;
+        while (wordSlots[slot] != 0u) {
+            const auto index = wordSlots[slot] - 1u;
+            if (tables.words[index] == value) return index;
+            slot = (slot + 1u) & mask;
+        }
+        const auto index = static_cast<std::uint32_t>(tables.words.size());
+        tables.words.push_back(value);
+        wordSlots[slot] = index + 1u;
+        return index;
     }
 
     ColumnRecords& Column(std::uint32_t source) {
@@ -672,7 +704,17 @@ private:
         auto narrowed = std::move(records.states);
         records.states = layout->states;
         records.readRanges = layout->readRanges;
-        std::vector<std::uint32_t> read(layout->total);
+        struct ReadScratchStorage {};
+        std::vector<std::uint32_t> ownedRead;
+        std::span<std::uint32_t> read;
+        if (FlatWordsIndex()) {
+            auto& scratch = HostThreadLocal<std::vector<std::uint32_t>, ReadScratchStorage>();
+            if (scratch.size() < layout->total) scratch.resize(layout->total);
+            read = std::span<std::uint32_t>(scratch).first(layout->total);
+        } else {
+            ownedRead.assign(layout->total, 0u);
+            read = ownedRead;
+        }
         std::uint32_t at = 0;
         for (const auto& [address, count] : layout->runs) {
             if (runtime.readWords != nullptr) {
@@ -682,7 +724,7 @@ private:
             }
             at += count;
         }
-        if (memo != nullptr && memo->read == read) {
+        if (memo != nullptr && std::ranges::equal(memo->read, read)) {
             std::vector<std::uint32_t> global(memo->distinct.size());
             for (std::size_t index = 0; index < memo->distinct.size(); index++) global[index] = WordsIndex(memo->distinct[index]);
             for (std::uint32_t record = 0; record < records.keys; record++) {
@@ -729,7 +771,7 @@ private:
                 stored->local[record] = locals[global];
             }
             if (stored != nullptr) {
-                stored->read = std::move(read);
+                stored->read.assign(read.begin(), read.end());
                 stored->bytes = MemoBytes(*stored);
                 StoreColumnMemo(key, std::move(stored));
             }
@@ -790,7 +832,15 @@ private:
         }
     };
 
-    static constexpr std::size_t ColumnMemoEntries = 512u;
+    static std::size_t ColumnMemoEntries() {
+        static const std::size_t entries = [] {
+            const char* text = std::getenv("APS5_TABLE_COLUMN_MEMO_ENTRIES");
+            if (text == nullptr || *text == '\0') return std::size_t{2048};
+            const auto value = std::strtoull(text, nullptr, 10);
+            return value == 0u ? std::size_t{512} : static_cast<std::size_t>(value);
+        }();
+        return entries;
+    }
     static constexpr std::size_t ColumnMemoBytes = std::size_t{256} << 20u;
     static constexpr std::size_t ColumnSightings = 4096u;
 
@@ -860,7 +910,7 @@ private:
         }
         store.bytes += memo->bytes;
         entry = {std::move(memo), ++store.clock};
-        while (store.entries.size() > ColumnMemoEntries || store.bytes > ColumnMemoBytes) {
+        while (store.entries.size() > ColumnMemoEntries() || store.bytes > ColumnMemoBytes) {
             auto oldest = store.entries.begin();
             for (auto candidate = store.entries.begin(); candidate != store.entries.end(); ++candidate) {
                 if (candidate->second.second < oldest->second.second) oldest = candidate;
@@ -1026,6 +1076,7 @@ private:
         }
     };
     std::unordered_map<WordsHash::Key, std::uint32_t, WordsHash> wordsIndex;
+    std::vector<std::uint32_t> wordSlots;
     std::unordered_map<std::uint64_t, bool> pages;
     std::unordered_map<std::uint64_t, bool> wholePages;
 };
@@ -1295,8 +1346,89 @@ DecodeMemo& decodeMemo() {
 constexpr std::uint32_t DecodeMemoEntries = 1u << 20u;
 constexpr std::uint32_t DecodeFailed = 0x80000000u;
 
+bool FastTableResolve() {
+    static const bool fast = std::getenv("APS5_NO_FAST_TABLE_RESOLVE") == nullptr;
+    return fast;
+}
+
+constexpr std::size_t FlatDecodeEntries = std::size_t{1} << 19u;
+
+struct FlatDecodeSlot {
+    DecodeMemoKey key;
+    std::uint32_t value = 0;
+    std::uint32_t used = 0;
+};
+
+struct FlatDecodeMemo {
+    std::mutex mutex;
+    std::vector<FlatDecodeSlot> slots;
+    std::size_t count = 0;
+};
+
+FlatDecodeMemo& flatDecodeMemo() {
+    static FlatDecodeMemo memo;
+    return memo;
+}
+
+std::uint64_t flatDecodeHash(const DecodeMemoKey& key) {
+    const auto mix = [](std::uint64_t value) {
+        value ^= value >> 33u;
+        value *= 0xff51afd7ed558ccdull;
+        value ^= value >> 33u;
+        value *= 0xc4ceb9fe1a85ec53ull;
+        value ^= value >> 33u;
+        return value;
+    };
+    auto hash = mix(key.artifact ^ (static_cast<std::uint64_t>(key.resource) << 56u));
+    for (std::size_t word = 0; word < key.words.size(); word += 2u) hash = mix(hash ^ (static_cast<std::uint64_t>(key.words[word]) | (static_cast<std::uint64_t>(key.words[word + 1u]) << 32u)));
+    return hash;
+}
+
+const FlatDecodeSlot* flatDecodeFind(const FlatDecodeMemo& memo, const DecodeMemoKey& key, std::uint64_t hash) {
+    if (memo.slots.empty()) return nullptr;
+    const auto mask = memo.slots.size() - 1u;
+    for (auto slot = static_cast<std::size_t>(hash) & mask;; slot = (slot + 1u) & mask) {
+        const auto& entry = memo.slots[slot];
+        if (entry.used == 0u) return nullptr;
+        if (entry.key == key) return &entry;
+    }
+}
+
+void flatDecodePlace(std::vector<FlatDecodeSlot>& slots, const DecodeMemoKey& key, std::uint64_t hash, std::uint32_t value) {
+    const auto mask = slots.size() - 1u;
+    auto slot = static_cast<std::size_t>(hash) & mask;
+    while (slots[slot].used != 0u) slot = (slot + 1u) & mask;
+    slots[slot] = {key, value, 1u};
+}
+
 std::uint32_t decodeTableEntry(const ImageResource& image, std::span<const ImageResource> modes, const DescriptorValue& words, std::uint64_t memoKey, std::uint32_t resource) {
     DecodeMemoKey key{memoKey, resource, words.dwords};
+    if (memoKey != 0u && FastTableResolve()) {
+        const auto hash = flatDecodeHash(key);
+        auto& memo = flatDecodeMemo();
+        {
+            std::lock_guard lock(memo.mutex);
+            if (const auto* found = flatDecodeFind(memo, key, hash)) return found->value;
+        }
+        const auto match = ResourceMaterializer::TryRuntimeImageMode(image, words, modes);
+        const auto value = match.mode.has_value() ? *match.mode : DecodeFailed | static_cast<std::uint32_t>(match.reason);
+        std::lock_guard lock(memo.mutex);
+        if (flatDecodeFind(memo, key, hash) != nullptr) return value;
+        if (memo.count >= FlatDecodeEntries) {
+            std::fill(memo.slots.begin(), memo.slots.end(), FlatDecodeSlot{});
+            memo.count = 0;
+        }
+        if ((memo.count + 1u) * 2u > memo.slots.size()) {
+            std::vector<FlatDecodeSlot> grown(std::max<std::size_t>(4096u, memo.slots.size() * 2u));
+            for (const auto& entry : memo.slots) {
+                if (entry.used != 0u) flatDecodePlace(grown, entry.key, flatDecodeHash(entry.key), entry.value);
+            }
+            memo.slots = std::move(grown);
+        }
+        flatDecodePlace(memo.slots, key, hash, value);
+        memo.count++;
+        return value;
+    }
     if (memoKey != 0u) {
         auto& memo = decodeMemo();
         std::lock_guard lock(memo.mutex);
@@ -1333,16 +1465,47 @@ ResolvedImageTables ResourceMaterializer::ResolveImageTables(const ShaderInfo& i
     out.map[Abi::HeaderVersion] = Abi::Version;
     out.poison.push_back({{}, 0u, NoTable, PoisonReason::OutsideSnapshot});
     out.poison.push_back({{}, 0u, NoTable, PoisonReason::OutsideDomain});
-    std::map<std::tuple<std::uint32_t, PoisonReason, std::array<std::uint32_t, 8>, std::uint32_t>, std::uint32_t> poisonIndex;
+    static const bool fastResolve = std::getenv("APS5_NO_FAST_TABLE_RESOLVE") == nullptr;
+    using PoisonKey = std::tuple<std::uint32_t, PoisonReason, std::array<std::uint32_t, 8>, std::uint32_t>;
+    using ElementKey = std::tuple<std::array<std::uint32_t, 8>, RdnaImageDimension, bool, DescriptorBindingKind>;
+    struct ResolveKeyHash {
+        static std::uint64_t Mix(std::uint64_t hash, std::uint64_t value) { return (hash ^ value) * 0x100000001b3ull; }
+        std::size_t operator()(const PoisonKey& key) const noexcept {
+            auto hash = Mix(Mix(0xcbf29ce484222325ull, std::get<0>(key)), static_cast<std::uint64_t>(std::get<1>(key)));
+            for (const auto word : std::get<2>(key)) hash = Mix(hash, word);
+            return static_cast<std::size_t>(Mix(hash, std::get<3>(key)));
+        }
+        std::size_t operator()(const ElementKey& key) const noexcept {
+            auto hash = 0xcbf29ce484222325ull;
+            for (const auto word : std::get<0>(key)) hash = Mix(hash, word);
+            hash = Mix(Mix(Mix(hash, static_cast<std::uint64_t>(std::get<1>(key))), std::get<2>(key) ? 1u : 0u), static_cast<std::uint64_t>(std::get<3>(key)));
+            return static_cast<std::size_t>(hash ^ (hash >> 29u));
+        }
+    };
+    std::map<PoisonKey, std::uint32_t> poisonIndex;
+    std::unordered_map<PoisonKey, std::uint32_t, ResolveKeyHash> poisonHash;
     std::set<std::uint32_t> expected;
+    std::vector<bool> expectedMarks;
+    std::size_t expectedCount = 0;
     const auto poison = [&](std::uint32_t resource, PoisonReason reason, const DescriptorValue* words) {
         const auto value = words != nullptr ? *words : DescriptorValue{};
-        const auto [found, inserted] = poisonIndex.try_emplace({resource, reason, value.dwords, value.dwordCount}, static_cast<std::uint32_t>(out.poison.size()));
+        const auto index = static_cast<std::uint32_t>(out.poison.size());
+        const PoisonKey key{resource, reason, value.dwords, value.dwordCount};
+        const auto [found, inserted] = fastResolve ? [&] { const auto [at, added] = poisonHash.try_emplace(key, index); return std::pair<std::uint32_t, bool>{at->second, added}; }() : [&] { const auto [at, added] = poisonIndex.try_emplace(key, index); return std::pair<std::uint32_t, bool>{at->second, added}; }();
         if (inserted) out.poison.push_back({value.dwords, value.dwordCount, resource, reason});
-        expected.insert(found->second);
-        return Abi::PoisonCode(found->second);
+        if (fastResolve) {
+            if (found >= expectedMarks.size()) expectedMarks.resize(static_cast<std::size_t>(found) + 1u, false);
+            if (!expectedMarks[found]) {
+                expectedMarks[found] = true;
+                ++expectedCount;
+            }
+        } else {
+            expected.insert(found);
+        }
+        return Abi::PoisonCode(found);
     };
-    std::map<std::tuple<std::array<std::uint32_t, 8>, RdnaImageDimension, bool, DescriptorBindingKind>, std::uint32_t> elementIndex;
+    std::map<ElementKey, std::uint32_t> elementIndex;
+    std::unordered_map<ElementKey, std::uint32_t, ResolveKeyHash> elementHash;
     std::vector<std::uint32_t> directSamplers(info.images.size(), 0u);
     std::vector<bool> reducingSampler(info.images.size(), false);
     for (const auto& pair : info.sampledPairs) {
@@ -1375,15 +1538,28 @@ ResolvedImageTables ResourceMaterializer::ResolveImageTables(const ShaderInfo& i
                 auto element = words.dwords;
                 if (mode.conversionFormat != IrBufferFormat::Invalid || mode.depthBits) element[3] = (element[3] & ~0xfffu) | ShaderImageIdentitySwizzle;
                 const auto kind = DescriptorBindingForImage(mode);
-                const auto [found, inserted] = elementIndex.try_emplace({element, mode.dimension, mode.depthCompare, kind}, static_cast<std::uint32_t>(out.elements.size()));
+                const ElementKey key{element, mode.dimension, mode.depthCompare, kind};
+                const auto next = static_cast<std::uint32_t>(out.elements.size());
+                std::uint32_t found = 0;
+                bool inserted = false;
+                if (fastResolve) {
+                    const auto [at, added] = elementHash.try_emplace(key, next);
+                    found = at->second;
+                    inserted = added;
+                    if (inserted && out.elements.size() >= Abi::ImageElementBudget) elementHash.erase(at);
+                } else {
+                    const auto [at, added] = elementIndex.try_emplace(key, next);
+                    found = at->second;
+                    inserted = added;
+                    if (inserted && out.elements.size() >= Abi::ImageElementBudget) elementIndex.erase(at);
+                }
                 if (inserted && out.elements.size() >= Abi::ImageElementBudget) {
-                    elementIndex.erase(found);
                     record[Abi::ImageRecordFlags] = poison(resource, PoisonReason::Budget, &words);
                 } else {
                     if (inserted) out.elements.push_back({element, mode.dimension, mode.depthCompare, kind, 0u});
-                    out.elements[found->second].samplers |= directSamplers[resource];
+                    out.elements[found].samplers |= directSamplers[resource];
                     record[Abi::ImageRecordFlags] = decoded << Abi::ModeShift;
-                    record[Abi::ImageRecordElement] = found->second;
+                    record[Abi::ImageRecordElement] = found;
                 }
             }
         }
@@ -1417,6 +1593,7 @@ ResolvedImageTables ResourceMaterializer::ResolveImageTables(const ShaderInfo& i
         return offset;
     };
     std::vector<bool> outside(count, false);
+    std::vector<std::uint32_t> codeMapped;
     const auto fill = [&](std::uint32_t resource, std::uint32_t table, bool sampler) {
         const auto& column = tables.tables.at(table);
         const auto header = Abi::TableHeader(table);
@@ -1436,19 +1613,35 @@ ResolvedImageTables ResourceMaterializer::ResolveImageTables(const ShaderInfo& i
         out.map[header + Abi::TableMapStart] = mapStart;
         out.map.resize(out.map.size() + column.keys, 0u);
         std::unordered_map<std::uint32_t, std::uint32_t> records;
+        constexpr std::uint32_t Unmapped = std::numeric_limits<std::uint32_t>::max();
+        if (fastResolve) codeMapped.assign(tables.words.size(), Unmapped);
+        std::array<std::uint32_t, PoisonReasonCount> reasonCodes{};
         for (std::uint32_t key = 0; key < column.keys; key++) {
             const auto code = column.codes[key];
             std::uint32_t mapped = Abi::NullCode;
             if ((code & Abi::PoisonFlag) != 0u) {
                 const auto reason = static_cast<PoisonReason>(code & ~Abi::PoisonFlag);
-                mapped = reason == PoisonReason::OutsideDomain ? Abi::PoisonCode(Abi::OutsideDomainPoison) : poison(resource, reason, nullptr);
+                const auto slot = static_cast<std::size_t>(reason);
+                if (reason == PoisonReason::OutsideDomain) mapped = Abi::PoisonCode(Abi::OutsideDomainPoison);
+                else if (fastResolve && slot < reasonCodes.size() && reasonCodes[slot] != 0u) mapped = reasonCodes[slot];
+                else {
+                    mapped = poison(resource, reason, nullptr);
+                    if (fastResolve && slot < reasonCodes.size()) reasonCodes[slot] = mapped;
+                }
+            } else if (fastResolve && out.map[header + Abi::TableFault] == 0u && code < codeMapped.size() && codeMapped[code] != Unmapped) {
+                mapped = codeMapped[code];
             } else if (out.map[header + Abi::TableFault] == 0u) {
                 const auto& words = tables.words.at(code);
                 if (sampler || (words.availableDwordMask & (1u << 3u)) == 0u || !nullImageDescriptor(info.images[resource], words)) {
-                    const auto [found, inserted] = records.try_emplace(code, 0u);
-                    if (inserted) found->second = sampler ? samplerRecord(resource, words) : imageRecord(resource, words);
-                    mapped = found->second;
+                    if (fastResolve && code < codeMapped.size()) {
+                        mapped = sampler ? samplerRecord(resource, words) : imageRecord(resource, words);
+                    } else {
+                        const auto [found, inserted] = records.try_emplace(code, 0u);
+                        if (inserted) found->second = sampler ? samplerRecord(resource, words) : imageRecord(resource, words);
+                        mapped = found->second;
+                    }
                 }
+                if (fastResolve && code < codeMapped.size()) codeMapped[code] = mapped;
             }
             out.map[mapStart + key] = mapped;
         }
@@ -1472,7 +1665,7 @@ ResolvedImageTables ResourceMaterializer::ResolveImageTables(const ShaderInfo& i
     out.map.resize(out.map.size() + out.elements.size(), 0u);
     out.map[Abi::HeaderSamplerFaults] = static_cast<std::uint32_t>(out.map.size());
     out.map.resize(out.map.size() + out.samplers.size() / Abi::SamplerEntryElements, 0u);
-    out.faults = static_cast<std::uint32_t>(expected.size() + static_cast<std::size_t>(std::count(outside.begin(), outside.end(), true)));
+    out.faults = static_cast<std::uint32_t>((fastResolve ? expectedCount : expected.size()) + static_cast<std::size_t>(std::count(outside.begin(), outside.end(), true)));
     return out;
 }
 
