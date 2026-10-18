@@ -1151,6 +1151,34 @@ bool RoutesToNativeDepthOwner(const DepthTarget& target) {
     return std::ranges::any_of(depthGuards(), [&](const auto& range) { return range.active->load(std::memory_order_acquire) && target.htileAddress < range.address + range.bytes && range.address < target.htileAddress + bytes; });
 }
 
+struct HtileMaskWrite {
+    std::uint64_t begin;
+    std::uint64_t end;
+    std::uint32_t mask;
+    std::uint32_t value;
+    std::uint64_t note;
+};
+
+struct HtileGpuState {
+    std::mutex mutex;
+    std::vector<HtileMaskWrite> masks;
+    std::map<std::uint64_t, std::uint64_t> expansions;
+    std::map<const Recorder*, HtileFillOnGpu> fills;
+    std::atomic<std::uint64_t> expanded{0};
+    std::atomic<std::uint64_t> skipped{0};
+    std::atomic<std::uint64_t> unknown{0};
+};
+
+HtileGpuState& HtileGpu() {
+    static auto* state = new HtileGpuState();
+    return *state;
+}
+
+bool HtileGpuExpansion() {
+    static const bool enabled = std::getenv("APS5_NO_HTILE_GPU_EXPANSION") == nullptr;
+    return enabled;
+}
+
 struct HtileSyncCounters {
     std::atomic<std::uint64_t> reads{0};
     std::atomic<std::uint64_t> pending{0};
@@ -1190,33 +1218,6 @@ void reportHtileSyncs() {
     AgcDriver::ProfilePrint_nid_no_patch("[htile] store-back reads (10 s): %llu, %llu over pending GPU writes waiting %.1f ms (writer batch open %llu, signaled %llu, batches finished %llu; writer range = htile %llu, larger %llu, partial %llu); %llu found cleared; expanded on the GPU without a read (cumulative) %llu, over a pending expansion %llu, mask clear with unknown bits %llu\n", reads, pending, waitMs, open, signaled, batches, exact, larger, partial, cleared, static_cast<unsigned long long>(gpu.expanded.load(std::memory_order_relaxed)), static_cast<unsigned long long>(gpu.skipped.load(std::memory_order_relaxed)), static_cast<unsigned long long>(gpu.unknown.load(std::memory_order_relaxed)));
 }
 
-struct HtileMaskWrite {
-    std::uint64_t begin;
-    std::uint64_t end;
-    std::uint32_t mask;
-    std::uint32_t value;
-    std::uint64_t note;
-};
-
-struct HtileGpuState {
-    std::mutex mutex;
-    std::vector<HtileMaskWrite> masks;
-    std::map<std::uint64_t, std::uint64_t> expansions;
-    std::map<const Recorder*, HtileFillOnGpu> fills;
-    std::atomic<std::uint64_t> expanded{0};
-    std::atomic<std::uint64_t> skipped{0};
-    std::atomic<std::uint64_t> unknown{0};
-};
-
-HtileGpuState& HtileGpu() {
-    static auto* state = new HtileGpuState();
-    return *state;
-}
-
-bool HtileGpuExpansion() {
-    static const bool enabled = std::getenv("APS5_NO_HTILE_GPU_EXPANSION") == nullptr;
-    return enabled;
-}
 
 // The HTILE words after the newest pending write when that write is a noted mask clear covering the whole range and the
 // bits the store-back looks at do not depend on the words before it: the cleared aspects and the expanded word.
