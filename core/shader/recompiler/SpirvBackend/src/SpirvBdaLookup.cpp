@@ -69,15 +69,42 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     const auto count = BdaLoadWord(state, constant(1));
     const auto available = binary(spv::OpISub, u32, length, constant(4));
     const auto end = binary(spv::OpIAdd, u64, address, Unary(state, spv::OpUConvert, u64, bytes));
+    // A plain table is exactly its ranges; an indexed one (BdaAbi::IndexedTable) has its index
+    // header and `buckets + 1` start words after them. Every index word read here and below stays
+    // inside the table whatever it holds (the reads of a table that fails a check go to word 0).
+    const auto reserved = BdaLoadWord(state, constant(3));
+    const auto indexed = binary(spv::OpIEqual, boolean, reserved, constant(BdaAbi::IndexedTable));
+    const auto countFits = binary(spv::OpULessThanEqual, boolean, count, binary(spv::OpShiftRightLogical, u32, available, constant(3)));
+    const auto rangeWords = binary(spv::OpIMul, u32, Select(state, u32, countFits, count, constant(0)), constant(8));
+    const auto indexWords = binary(spv::OpISub, u32, available, rangeWords);
+    constexpr auto indexHeaderWords = static_cast<std::uint32_t>(sizeof(BdaAbi::IndexHeader) / sizeof(std::uint32_t));
+    const auto headerFits = binary(spv::OpLogicalAnd, boolean, binary(spv::OpLogicalAnd, boolean, indexed, countFits), binary(spv::OpUGreaterThanEqual, boolean, indexWords, constant(indexHeaderWords + 1u)));
+    const auto indexAt = Select(state, u32, headerFits, binary(spv::OpIAdd, u32, constant(4), rangeWords), constant(0));
+    const auto indexBase = BdaLoadAddress(state, indexAt);
+    const auto buckets = BdaLoadWord(state, binary(spv::OpIAdd, u32, indexAt, constant(2)));
+    const auto shift = BdaLoadWord(state, binary(spv::OpIAdd, u32, indexAt, constant(3)));
+    const auto plainBad = binary(spv::OpLogicalOr, boolean, binary(spv::OpINotEqual, boolean, binary(spv::OpBitwiseAnd, u32, available, constant(7)), constant(0)), binary(spv::OpINotEqual, boolean, count, binary(spv::OpShiftRightLogical, u32, available, constant(3))));
+    const auto indexBad = binary(spv::OpLogicalOr, boolean, Unary(state, spv::OpLogicalNot, boolean, headerFits), binary(spv::OpLogicalOr, boolean, binary(spv::OpINotEqual, boolean, binary(spv::OpISub, u32, indexWords, constant(indexHeaderWords + 1u)), buckets), binary(spv::OpLogicalOr, boolean, binary(spv::OpUGreaterThan, boolean, shift, constant(63)), binary(spv::OpIEqual, boolean, buckets, constant(0)))));
     failFirst({
         {binary(spv::OpINotEqual, boolean, BdaLoadWord(state, constant(0)), constant(BdaAbi::Version)), BdaAbi::FaultReason::InvalidTable},
         {binary(spv::OpINotEqual, boolean, BdaLoadWord(state, constant(2)), constant(sizeof(BdaAbi::Range))), BdaAbi::FaultReason::InvalidTable},
-        {binary(spv::OpINotEqual, boolean, BdaLoadWord(state, constant(3)), constant(0)), BdaAbi::FaultReason::InvalidTable},
-        {binary(spv::OpINotEqual, boolean, binary(spv::OpBitwiseAnd, u32, available, constant(7)), constant(0)), BdaAbi::FaultReason::InvalidTable},
-        {binary(spv::OpINotEqual, boolean, count, binary(spv::OpShiftRightLogical, u32, available, constant(3))), BdaAbi::FaultReason::InvalidTable},
+        {binary(spv::OpLogicalAnd, boolean, binary(spv::OpINotEqual, boolean, reserved, constant(0)), Unary(state, spv::OpLogicalNot, boolean, indexed)), BdaAbi::FaultReason::InvalidTable},
+        {Select(state, boolean, indexed, indexBad, plainBad), BdaAbi::FaultReason::InvalidTable},
         {binary(spv::OpIEqual, boolean, bytes, constant(0)), BdaAbi::FaultReason::Overflow},
         {binary(spv::OpULessThanEqual, boolean, end, address), BdaAbi::FaultReason::Overflow},
     });
+    // The search's starting bounds: [0, count) for a plain table, the address's bucket for an
+    // indexed one (clamped to [0, count], so even a wrong index reads no entry past the table).
+    const auto below = binary(spv::OpULessThan, boolean, address, indexBase);
+    const auto bucket = binary(spv::OpShiftRightLogical, u64, binary(spv::OpISub, u64, address, indexBase), Unary(state, spv::OpUConvert, u64, shift));
+    const auto beyond = binary(spv::OpUGreaterThanEqual, boolean, bucket, Unary(state, spv::OpUConvert, u64, buckets));
+    const auto inBucket = binary(spv::OpLogicalAnd, boolean, indexed, Unary(state, spv::OpLogicalNot, boolean, binary(spv::OpLogicalOr, boolean, below, beyond)));
+    const auto startAt = Select(state, u32, inBucket, binary(spv::OpIAdd, u32, binary(spv::OpIAdd, u32, indexAt, constant(indexHeaderWords)), Unary(state, spv::OpUConvert, u32, bucket)), constant(0));
+    const auto outside = Select(state, u32, below, constant(0), count);
+    const auto startHigh = Select(state, u32, indexed, Select(state, u32, inBucket, BdaLoadWord(state, binary(spv::OpIAdd, u32, startAt, constant(1))), outside), count);
+    const auto searchHigh = Select(state, u32, binary(spv::OpULessThan, boolean, count, startHigh), count, startHigh);
+    const auto startLow = Select(state, u32, indexed, Select(state, u32, inBucket, BdaLoadWord(state, startAt), outside), constant(0));
+    const auto searchLow = Select(state, u32, binary(spv::OpULessThan, boolean, searchHigh, startLow), searchHigh, startLow);
     const auto header = state.module.AllocateId();
     const auto body = state.module.AllocateId();
     const auto continuation = state.module.AllocateId();
@@ -89,8 +116,8 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     const auto upper = state.module.AllocateId();
     const auto newLow = state.module.AllocateId();
     const auto newHigh = state.module.AllocateId();
-    state.module.AddFunction(spv::OpPhi, u32, lower, constant(0), entryLabel, newLow, continuation);
-    state.module.AddFunction(spv::OpPhi, u32, upper, count, entryLabel, newHigh, continuation);
+    state.module.AddFunction(spv::OpPhi, u32, lower, searchLow, entryLabel, newLow, continuation);
+    state.module.AddFunction(spv::OpPhi, u32, upper, searchHigh, entryLabel, newHigh, continuation);
     const auto search = binary(spv::OpULessThan, boolean, lower, upper);
     state.module.AddFunction(spv::OpLoopMerge, merge, continuation, spv::LoopControlMaskNone);
     state.module.AddFunction(spv::OpBranchConditional, search, body, merge);

@@ -4,7 +4,9 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <type_traits>
+#include <vector>
 
 namespace ShaderRecompiler::BdaAbi {
 
@@ -26,6 +28,48 @@ struct Range {
     std::uint32_t permissions;
     std::uint32_t reserved;
 };
+
+// Range index (APS5_NO_BDA_INDEX=1 leaves it out): a table whose Header::reserved is IndexedTable
+// carries, after its ranges, an IndexHeader and `buckets + 1` words start[0..buckets], start[j] being
+// the number of ranges whose begin lies below base + (j << shift). The lookup's binary search for the
+// count of ranges beginning at or below an address (the upper bound) then starts from
+// [start[j], start[j + 1]] for the address's bucket j = (address - base) >> shift instead of
+// [0, count): every range in front of the bucket begins below the address, every range behind it
+// above. Below `base` the bound is 0, at or past bucket `buckets` it is `count`. Exact: the same
+// upper bound, so the same range or fault, as the search over the whole table.
+inline constexpr std::uint32_t IndexedTable = 1;
+struct IndexHeader {
+    std::uint64_t base;
+    std::uint32_t buckets;
+    std::uint32_t shift;
+};
+inline constexpr std::uint32_t IndexMinRanges = 16;
+inline constexpr std::uint64_t IndexMaxBuckets = std::uint64_t{1} << 16u;
+
+// The index words (IndexHeader, then the starts) of `count` ranges ascending by begin; empty for a
+// table too small to gain from one.
+inline std::vector<std::uint32_t> BuildRangeIndex(const Range* ranges, std::size_t count) {
+    if (count < IndexMinRanges || count > (std::size_t{1} << 24u)) return {};
+    const auto base = ranges[0].begin;
+    const auto span = ranges[count - 1].begin - base;
+    const auto wanted = IndexMaxBuckets < 2u * count ? IndexMaxBuckets : std::uint64_t{2u * count};
+    std::uint32_t shift = 0;
+    while (shift < 63u && (span >> shift) >= wanted) ++shift;
+    const auto buckets = static_cast<std::uint32_t>((span >> shift) + 1u);
+    constexpr auto headerWords = sizeof(IndexHeader) / sizeof(std::uint32_t);
+    std::vector<std::uint32_t> words(headerWords + buckets + 1u);
+    const IndexHeader header{base, buckets, shift};
+    std::memcpy(words.data(), &header, sizeof(header));
+    std::size_t next = 0;
+    for (std::uint32_t bucket = 0; bucket < buckets; ++bucket) {
+        // bucket << shift <= span: no overflow.
+        const auto limit = base + (std::uint64_t{bucket} << shift);
+        while (next < count && ranges[next].begin < limit) ++next;
+        words[headerWords + bucket] = static_cast<std::uint32_t>(next);
+    }
+    words.back() = static_cast<std::uint32_t>(count);
+    return words;
+}
 
 enum class FaultState : std::uint32_t { Empty, Writing, Ready };
 enum class FaultReason : std::uint32_t { Unmapped = 1, Permission, Overflow, InvalidTable, InvalidRectangle, LoopLimit, Unaligned, InvalidDescriptor, ImageTable, UnlinkedCall, UnnormalizedWrap = 11, DirectImage = 12, BindlessMiss = 13, BindlessRefused = 14 };
@@ -57,6 +101,7 @@ struct Fault {
 static_assert(std::is_standard_layout_v<Header> && std::is_trivially_copyable_v<Header> && sizeof(Header) == 16);
 static_assert(std::is_standard_layout_v<Range> && std::is_trivially_copyable_v<Range> && sizeof(Range) == 32);
 static_assert(offsetof(Range, deviceAddress) == 16 && offsetof(Range, permissions) == 24);
+static_assert(std::is_standard_layout_v<IndexHeader> && sizeof(IndexHeader) == 16 && offsetof(IndexHeader, buckets) == 8 && offsetof(IndexHeader, shift) == 12);
 static_assert(std::is_standard_layout_v<Fault> && std::is_trivially_copyable_v<Fault> && sizeof(Fault) == 32);
 static_assert(offsetof(Fault, address) == 8 && offsetof(Fault, instruction) == 24);
 
