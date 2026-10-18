@@ -1203,6 +1203,17 @@ HtileSyncCounters& HtileSyncs() {
     return counters;
 }
 
+struct HtileWriterState {
+    std::mutex mutex;
+    std::set<std::uint64_t> programs;
+    std::map<std::uint64_t, std::uint64_t> pendingReads;
+    std::map<std::string, std::uint64_t> outcomes;
+};
+HtileWriterState& HtileWriters() {
+    static auto* state = new HtileWriterState();
+    return *state;
+}
+
 void reportHtileSyncs() {
     auto& counters = HtileSyncs();
     const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -1491,19 +1502,6 @@ float HostDepthBiasConstant(const Context& context, VkFormat format, float const
     if (constant == 0.0f || host == format) return constant;
     Require(host == VK_FORMAT_D24_UNORM_S8_UINT, "a constant depth bias on a 16-bit depth target with stencil that the device stores as 32-bit float depth is not implemented");
     return constant * 256.0f;
-}
-
-namespace {
-struct HtileWriterState {
-    std::mutex mutex;
-    std::set<std::uint64_t> programs;
-    std::map<std::uint64_t, std::uint64_t> pendingReads;
-    std::map<std::string, std::uint64_t> outcomes;
-};
-HtileWriterState& HtileWriters() {
-    static auto* state = new HtileWriterState();
-    return *state;
-}
 }
 
 void NoteHtileWriter(std::uint64_t program, std::uint64_t htileAddress) {
