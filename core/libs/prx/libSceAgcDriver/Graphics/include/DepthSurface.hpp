@@ -129,6 +129,7 @@ struct DepthClearStatistics {
 };
 DepthClearStatistics DepthClearCounts();
 void SetDepthPlaneClearForTest(bool enabled);
+bool DepthPlaneClearEnabled();
 void SetDepthClearDispatchSkipForTest(bool enabled);
 bool DepthClearDispatchSkipActive();
 bool PlanDepthClearDispatchSkip(const Context& context, VkImage mirror);

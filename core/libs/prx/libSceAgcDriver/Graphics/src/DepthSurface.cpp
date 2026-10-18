@@ -128,7 +128,8 @@ DepthSamplingState prepareDepthSampling(const Context& context, const DepthTarge
     return state;
 }
 
-std::atomic<bool> depthPlaneClearEnabled{true};
+// APS5_NO_DEPTH_PLANE_CLEAR=1: the plane copies around the image clear kernel stay (#7178 off; #7449 then has nothing to replace).
+std::atomic<bool> depthPlaneClearEnabled{std::getenv("APS5_NO_DEPTH_PLANE_CLEAR") == nullptr};
 std::atomic<bool> depthClearDispatchSkipEnabled{std::getenv("APS5_NO_DEPTH_CLEAR_DISPATCH_SKIP") == nullptr};
 
 enum DepthClearDecline : std::size_t { DeclineLayers, DeclineFormat, DeclineValue, DeclineColor, DeclinePending, DeclineCoverage, DeclineSize, DeclineCount };
@@ -1923,6 +1924,10 @@ DepthClearStatistics DepthClearCounts() {
 
 void SetDepthPlaneClearForTest(bool enabled) {
     depthPlaneClearEnabled.store(enabled, std::memory_order_relaxed);
+}
+
+bool DepthPlaneClearEnabled() {
+    return depthPlaneClearEnabled.load(std::memory_order_relaxed);
 }
 
 void SetDepthClearDispatchSkipForTest(bool enabled) {

@@ -703,7 +703,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
     const bool noteWrites = writeEvidenceEnabled() || traceCapSync();
 
     std::optional<Graphics::DepthPlaneClear> depthPlaneClear;
-    if (indirectArguments == 0 && !partialLastGroup) {
+    if (indirectArguments == 0 && !partialLastGroup && Graphics::DepthPlaneClearEnabled()) {
         if (const auto clear = Graphics::MatchStorageImageClear(std::span(snapshot.code).subspan(codeOffset), userData, compute, groups)) {
             const auto clearAddress = Graphics::StorageImageClearAddress(*clear);
             if (clearAddress != 0 && Graphics::DepthSurfaceAt(clearAddress)) {
