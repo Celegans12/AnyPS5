@@ -1,14 +1,15 @@
 <h1 align="center">Ghost of Yōtei on AnyPS5</h1>
 
 <p align="center"><b>A test branch of <a href="https://github.com/boykopovar/AnyPS5">AnyPS5</a> that runs Ghost of Yōtei (PPSA26344) into the open world.</b><br>
-<sub>Branch <code>yotei/best</code> on Celegans12/AnyPS5 · progress thread: <a href="https://github.com/boykopovar/AnyPS5/discussions/675">discussion #675</a> · details: <a href="YOTEI.md">YOTEI.md</a></sub></p>
+<sub>Branch <code>yotei/best</code> on Celegans12/AnyPS5 · progress thread: <a href="https://github.com/boykopovar/AnyPS5/discussions/675">discussion #675</a> · <a href="#run-it">run it</a> · <a href="#updates">updates</a></sub></p>
 
 <p align="center"><img src="https://raw.githubusercontent.com/Celegans12/AnyPS5/bringup-media/yotei/2026-10-19/open-world-async-lane.png" alt="Atsu at the Nupur river in the open world of Ghost of Yōtei on AnyPS5, frame read back 747 s after launch" width="880"></p>
 
 > [!NOTE]
-> This is a work-in-progress test branch, not upstream code. It is based on `main` from 2026-10-15 and carries local
-> rewrites that haven't been reviewed upstream. It moves forward only when a build renders our 60-frame title reference
-> exactly and runs faster in the open world than the build before it.
+> This is a work-in-progress test branch, not upstream code. It is based on `main` from 2026-10-15 (`a5e2a80c6`), is not
+> synced with current `main`, and carries local rewrites that haven't been reviewed upstream, plus diagnostics. It moves
+> forward only when a build renders our 60-frame title reference exactly and runs faster in the open world than the build
+> before it. Fixes that apply to `main` go upstream as separate PRs.
 
 ## Where it stands (2026-10-19)
 
@@ -18,7 +19,8 @@
 | **Time to the world** | about 10 minutes from a save near Teshio Ridge (warm shader cache) |
 | **Frame rate in the world** | about **0.5 fps** (5.0 presents per 10 s) |
 | **Stability** | 25 minutes in the world without a crash on earlier builds of this line |
-| **Tested on** | Windows 11, RTX 3080 Laptop GPU 16 GB (driver 610.62), 32 GB RAM, MinGW-w64 GCC 15.2.0 |
+| **Tested on** | Windows 11, RTX 3080 Laptop GPU 16 GB (driver 610.62), 32 GB RAM, MinGW-w64 GCC 15.2.0, Release |
+| **Build** | `8ba98278a` + docs, shader-cache SourceVersion `63a364723a2373f6` |
 
 <table>
 <tr>
@@ -57,6 +59,7 @@ APS5_SPANNED_WAVE=1 APS5_BINDLESS_IMAGES=1 APS5_BINDLESS_LAZY=1 APS5_NO_RESULT_M
 APS5_STAGING_DIFF=1 APS5_PIPELINE_INDIRECT=1 APS5_NO_ADDRESS_DRAW_REUSE=1 APS5_ASYNC_LANE=51
 ```
 
+- `APS5_ASYNC_LANE=51` records the cloth compute ring (queue 0x51) on a second Vulkan queue.
 - The first run on a new shader-cache version compiles shaders cold; it can take 30-60 minutes to reach the world.
 - Leave `APS5_PIPELINE_REQUESTS` unset when you measure: it costs about 12 % of a frame here.
 - Every local change has an off switch (`APS5_NO_...`), named in its commit message.
@@ -65,7 +68,27 @@ APS5_STAGING_DIFF=1 APS5_PIPELINE_INDIRECT=1 APS5_NO_ADDRESS_DRAW_REUSE=1 APS5_A
 
 - Black shapes on some rocks and terrain (the depth pre-pass and the G-buffer pass disagree on depth). Cause not found yet.
 - Process memory reaches about 34 GB in the world, so 32 GB of RAM is tight.
-- About 0.5 fps is far from playable. What limits a frame now, and what's next, is in [YOTEI.md](YOTEI.md) and #675.
+- One compute program (0x8000361f00) is still refused by the recompiler at registration (non-fatal so far).
+- About 0.5 fps is far from playable. What limits a frame now, and what's next, is in [discussion #675](https://github.com/boykopovar/AnyPS5/discussions/675).
+
+## What it carries on top of `main` 2026-10-15
+
+- Upstream PRs adopted before they merged, among them #4943, #7183, #4288, #3557, #6771, #7044, #6617, #6566, #1896,
+  #6763, #6632, #6631, #6501, #7134, #6187, #6192, #6636, #7212 and #7218.
+- Local work:
+  - image tables resolved on the GPU through a bindless descriptor heap, including T#s loaded from run-time addresses;
+  - a cheaper draw-miss path (resolve memo, faster table snapshots);
+  - texture revalidation that walks only the readable parts of partly committed memory;
+  - the HTILE mask-clear kernel's buffer-descriptor form recognized;
+  - a draw preparer thread with a two-phase draw build;
+  - device-local buffers for address-based compute builds (the cloth programs);
+  - copy-backs that store only the changed dwords;
+  - dispatch overlap;
+  - the async compute queue.
+
+## Updates
+
+- 2026-10-19: branch created at `8ba98278a` (async compute queue), 5.0 presents per 10 s in the world.
 
 ---
 
