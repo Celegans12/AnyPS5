@@ -45,6 +45,18 @@ void MarkStorageDepthWrites(const Context& context, const std::shared_ptr<Storag
 std::uint64_t HtileDepthClearAddress(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const std::array<std::uint32_t, 3>& numThreads);
 // Whether the code starts with the HTILE mask kernel (whatever its user data): the [htile] writer attribution.
 bool HtileMaskKernelCode(std::span<const std::uint32_t> code);
+// The buffer-descriptor variant of the HTILE mask kernel (the game's 0x141d4c500): each thread loads one 16-byte
+// record through a 32_32_32_32_UINT structured buffer (s[0:3], stride 16, index = group * 64 + thread), stores
+// (record & mask) | value with the mask in s[8:11] and the value in s[4:7], all four words alike. The range it
+// rewrites and its mask/value, when the dispatch is exactly that kernel with a plain descriptor
+// (APS5_NO_HTILE_BUFFER_KERNEL=1: never).
+struct HtileBufferMaskClear {
+    std::uint64_t address = 0;
+    std::size_t bytes = 0;
+    std::uint32_t mask = 0;
+    std::uint32_t value = 0;
+};
+std::optional<HtileBufferMaskClear> MatchHtileBufferMaskClear(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const ShaderRecompiler::ShaderComputeStageInfo& compute, std::span<const std::uint32_t> packet, std::uint64_t indirectArguments);
 std::size_t HtileDepthClearBytes_nid_no_patch(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const ShaderRecompiler::ShaderComputeStageInfo& compute, std::span<const std::uint32_t> packet, std::uint64_t indirectArguments);
 void NoteHtileDepthClear(std::uint64_t htileAddress, std::size_t bytes, std::size_t nativeBytes = 0u);
 class Recorder;

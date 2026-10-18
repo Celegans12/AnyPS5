@@ -229,6 +229,11 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
             const auto nativeBytes = Graphics::HtileDepthClearBytes_nid_no_patch(std::span(snapshot.code).subspan(codeOffset), userData, compute, packet, indirectArguments);
             Graphics::NoteHtileDepthClear(htile, static_cast<std::size_t>(threads * 16u), nativeBytes);
             if (nativeBytes != 0u && userData.size() >= 6u) htileMask = {htile, nativeBytes, userData[5], userData[4]};
+        } else if (const auto buffered = Graphics::MatchHtileBufferMaskClear(std::span(snapshot.code).subspan(codeOffset), userData, compute, packet, indirectArguments); buffered.has_value() && (buffered->mask & 0xfu) == 0u && (buffered->value & 0xfu) == 0u) {
+            // S1: the buffer variant of the mask kernel, read the same way (zmask cleared: a depth clear).
+            if (pipelineCandidate && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+            Graphics::NoteHtileDepthClear(buffered->address, buffered->bytes, buffered->bytes);
+            htileMask = {buffered->address, buffered->bytes, buffered->mask, buffered->value};
         }
         if (!partialLastGroup && indirectArguments == 0 && copyBuffer(queue, submission.queue, packet, std::span(snapshot.code).subspan(codeOffset), userData, compute, localDevice, address)) {
             pendingDispatchPhases().outcome = DispatchOutcome::CopyHle;
