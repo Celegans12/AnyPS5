@@ -372,6 +372,8 @@ private:
         // APS5_STAGING_DIFF=1: a device-local copy of a staged shadow's bytes right after its copy-in,
         // so the copy-back stores only the dwords the work changed (RecordCopyBacks).
         std::shared_ptr<Buffer> pristine {};
+        // This use's copy-in recorded the pristine copy (APS5_STAGING_DIFF=alt may skip it).
+        bool diffUse = false;
         // An element the shader updates atomically lies inside (AddWritable's `atomic`).
         bool atomic = false;
         bool swept = false;

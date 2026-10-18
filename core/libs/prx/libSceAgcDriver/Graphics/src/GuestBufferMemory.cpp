@@ -3379,6 +3379,22 @@ bool stagingDiffEnabled(const Context& context) {
     return enabled && context.bufferDeviceAddress;
 }
 
+// APS5_STAGING_DIFF=alt (an in-run A/B for [gputime]): the diff copy-backs run in alternate
+// 60 s phases from the first staged copy-in, whole copies in between; each phase change prints
+// "[buffers] staging diff phase on|off". Any other value: always on. Decided per use at its copy-in.
+bool stagingDiffActive() {
+    static const bool alternate = [] {
+        const char* value = std::getenv("APS5_STAGING_DIFF");
+        return value != nullptr && std::string_view(value) == "alt";
+    }();
+    if (!alternate) return true;
+    static const auto start = std::chrono::steady_clock::now();
+    static std::atomic<int> shown{-1};
+    const auto phase = static_cast<int>((std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start).count() / 60) % 2);
+    if (shown.exchange(phase, std::memory_order_relaxed) != phase) AgcDriver::ProfilePrint_nid_no_patch("[buffers] staging diff phase %s\n", phase == 0 ? "on" : "off");
+    return phase == 0;
+}
+
 std::uint64_t kibSetting(const char* name, std::uint64_t defaultKib) {
     const char* value = std::getenv(name);
     return (value != nullptr ? std::strtoull(value, nullptr, 10) : defaultKib) << 10u;
@@ -4131,7 +4147,10 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
     if (stagingDiffEnabled(context)) {
         // The pristine copies of the staged shadows (APS5_STAGING_DIFF), after the copy-ins.
         std::vector<Region*> diffed;
+        const bool active = stagingDiffActive();
         for (auto* region : copies) {
+            region->diffUse = false;
+            if (!active) continue;
             if (!region->deviceLocal || region->buffer == nullptr || region->buffer->DeviceAddress() == 0 || region->copySourceAddress == 0) {
                 region->pristine.reset();
                 continue;
@@ -4142,6 +4161,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
                 region->pristine.reset();
                 continue;
             }
+            region->diffUse = true;
             diffed.push_back(region);
         }
         if (!diffed.empty()) {
@@ -4203,7 +4223,7 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
             // unaligned edges copy whole.
             auto whole = from;
             auto wholeEnd = to;
-            if (diff && region.deviceLocal && region.pristine != nullptr && region.copySourceAddress != 0 && region.buffer->DeviceAddress() != 0 && region.begin % 4u == 0 && region.copySourceBase % 4u == 0 && region.copySourceAddress % 4u == 0) {
+            if (diff && region.diffUse && region.deviceLocal && region.pristine != nullptr && region.copySourceAddress != 0 && region.buffer->DeviceAddress() != 0 && region.begin % 4u == 0 && region.copySourceBase % 4u == 0 && region.copySourceAddress % 4u == 0) {
                 const auto alignedFrom = (from + 3u) & ~std::uint64_t{3};
                 const auto alignedTo = to & ~std::uint64_t{3};
                 if (alignedFrom < alignedTo && (alignedTo - alignedFrom) / 4u <= std::numeric_limits<std::uint32_t>::max()) {
