@@ -1603,10 +1603,11 @@ void Recorder::flushDeferredDispatch(std::size_t site) {
     for (auto& work : after) work(*this);
 }
 
-VkCommandBuffer Recorder::RunCommands(std::uint32_t queueKey, const void* owner, bool& inRun) {
+VkCommandBuffer Recorder::RunCommands(std::uint32_t queueKey, const void* owner, bool& inRun, VkAccessFlags* coveredAccess) {
     inRun = queueKey != 0 && open != nullptr && open->deferredDispatchQueue == queueKey && !open->renderPass.open && !open->run.open && std::find(open->deferredRun.begin(), open->deferredRun.end(), owner) == open->deferredRun.end();
-    if (!inRun) return Commands();
+    if (!inRun) return Commands(coveredAccess);
     GuestMemory::AssertGpuLockHeld("Recorder::RunCommands");
+    if (coveredAccess != nullptr) *coveredAccess = 0;
     return open->commands;
 }
 
@@ -2125,6 +2126,13 @@ void Recorder::CountBarriers(CommandClass which, std::uint32_t count) {
 bool Recorder::MergeBarriers() {
     static const bool merge = std::getenv("APS5_FULL_BARRIERS") == nullptr && std::getenv("APS5_NO_BARRIER_ELISION") == nullptr;
     return merge;
+}
+
+bool Recorder::ElideCovered(CommandClass which, const BarrierMask& wanted, VkAccessFlags covered) {
+    static const bool batch = std::getenv("APS5_NO_BARRIER_BATCH") == nullptr;
+    if (!batch || !MergeBarriers() || !OrderedByTrailing(covered, wanted)) return false;
+    CountMerged(which);
+    return true;
 }
 
 void Recorder::CountMerged(CommandClass which) {

@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_RECORDER_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_RECORDER_HPP
 
+#include "prx/libSceAgcDriver/Graphics/include/BarrierBatch.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PassHazards.hpp"
 #include <unordered_map>
@@ -153,8 +154,8 @@ public:
     // recordGpuCopies): the command buffer without recording the deferred barrier when a run of
     // `queueKey` is open and `owner` (the build's guest memory, whose shadows the copies fill) takes
     // no part in it yet; `inRun` then says the copies need no leading barrier (the run's first
-    // dispatch ordered everything before the run for transfers too). Else Commands().
-    VkCommandBuffer RunCommands(std::uint32_t queueKey, const void* owner, bool& inRun);
+    // dispatch ordered everything before the run for transfers too). Else Commands(coveredAccess).
+    VkCommandBuffer RunCommands(std::uint32_t queueKey, const void* owner, bool& inRun, VkAccessFlags* coveredAccess = nullptr);
     // Opens a batch when none is open, recording nothing (no deferred dispatch barrier either).
     void OpenBatch() { ensureOpen(); }
     // Work an overlapping dispatch owes after itself (its staged copy-backs): recorded right after
@@ -610,6 +611,7 @@ public:
     // (or APS5_NO_BARRIER_ELISION=1) records every leading barrier, as before.
     static bool MergeBarriers();
     static void CountMerged(CommandClass which);
+    static bool ElideCovered(CommandClass which, const BarrierMask& wanted, VkAccessFlags covered);
     // Hazard tracker, counting mode (APS5_BARRIER_VALIDATE=1): every command tells the tracker
     // what it reads and writes (guest ranges through host imports, images) with its stage before
     // it is recorded; the tracker simulates barriers emitted only on a hazard against the accesses
