@@ -208,6 +208,8 @@ void Driver::timed(double WorkerProfile::*bucket, TWork&& work) {
 }
 
 void Driver::execute(const Submission& submission) {
+    // The async compute ring records into the recorder's second lane (Recorder::AsyncLaneRing).
+    const Graphics::Recorder::LaneScope laneScope(Graphics::Recorder::LaneOfQueue(submission.queue));
     auto* submissionTiming = includeTimingSubmission(submission, true);
     struct FlipHold {
         Driver& driver;

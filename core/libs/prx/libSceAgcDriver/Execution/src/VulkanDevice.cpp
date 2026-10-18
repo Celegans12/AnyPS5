@@ -336,6 +336,9 @@ struct VulkanDevice::State {
     VkQueue sparseQueue = VK_NULL_HANDLE;
     std::mutex sparseQueueMutex;
     VkQueue settleQueue = VK_NULL_HANDLE;
+    // Graphics family queue index 2 for the async compute lane (Recorder lanes, APS5_ASYNC_LANE).
+    VkQueue asyncQueue = VK_NULL_HANDLE;
+    bool asyncQueueWanted = false;
     std::uint32_t settleFamily = 0;
     VkCommandPool settlePool = VK_NULL_HANDLE;
     std::mutex settleQueueMutex;
@@ -1455,7 +1458,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     queueInfo.queueCount = 1;
     queueInfo.pQueuePriorities = &priority;
 #ifdef _WIN32
-    const float priorities[2]{1.0f, 1.0f};
+    const float priorities[3]{1.0f, 1.0f, 1.0f};
     bool settleQueue = false;
     std::uint32_t settleFamily = family;
     std::uint32_t families = 0;
@@ -1467,6 +1470,10 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         queueInfo.queueCount = 2;
         queueInfo.pQueuePriorities = priorities;
         settleQueue = true;
+        if (Graphics::Recorder::AsyncLaneRing() != 0 && queues[family].queueCount >= 3 && !compileOnly) {
+            queueInfo.queueCount = 3;
+            state->asyncQueueWanted = true;
+        }
     } else {
         const auto copies = [&](std::uint32_t index) { return index != family && queues[index].queueCount != 0 && (queues[index].queueFlags & (VK_QUEUE_TRANSFER_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_GRAPHICS_BIT)) != 0; };
         for (std::uint32_t i = 0; i < families && !settleQueue; ++i) {
@@ -1858,6 +1865,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     }
     state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, family, 0, &state->queue);
     state->queueFamily = family;
+    if (state->asyncQueueWanted) state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, family, 2, &state->asyncQueue);
 #ifdef _WIN32
     if (settleQueue) {
         state->settleFamily = settleFamily;
@@ -2128,6 +2136,8 @@ bool VulkanDevice::StoresPendingOver(std::uint64_t address, std::size_t bytes) c
 }
 
 int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, bool reapFirst) {
+    // A label lands after its own queue's recorded work: into that queue's lane, whichever thread records it.
+    const Graphics::Recorder::LaneScope laneScope(Graphics::Recorder::LaneOfQueue(queue));
     static const bool storeAtLabel = Graphics::StorageTexture::StoreAtLabelRequested(std::getenv("APS5_STORE_AT_LABEL"));
     if (storeAtLabel) Graphics::StorageTexture::FlushAllPending("label");
     if (!state->recorder || bytes.empty() || bytes.size() > 65536 || address % 4 != 0 || bytes.size() % 4 != 0) return 4;
@@ -3638,6 +3648,7 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.sparseQueue = state->sparseQueue;
     context.sparseQueueMutex = &state->sparseQueueMutex;
     context.settleQueue = state->settlePool != VK_NULL_HANDLE ? state->settleQueue : VK_NULL_HANDLE;
+    context.asyncQueue = state->asyncQueue;
     context.settlePool = state->settlePool;
     context.settleFamily = state->settleFamily;
     context.settleQueueMutex = &state->settleQueueMutex;

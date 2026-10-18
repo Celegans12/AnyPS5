@@ -96,6 +96,47 @@ public:
     // runs, sample dumps, Submit) records the deferred barrier first, so nothing else ever sees the
     // dispatches' writes unordered. The leading barrier of the first dispatch of such a run orders
     // everything recorded before the run, for all of them.
+    // Async compute lane (APS5_ASYNC_LANE=<ring>, hex, e.g. 51; off by default). The work a guest
+    // compute ring records goes to a second open batch (lane 1) submitted to its own VkQueue with
+    // its own timeline, so queue 0's later batches and the CPU waits for them do not queue behind
+    // it on the GPU. One global serial per batch; each batch knows its lane. GPU order between the
+    // lanes: a lane-1 batch waits for everything lane 0 submitted before it opened (the main open
+    // batch is submitted first), and a lane consuming a label the other lane stored (a WAIT_REG_MEM
+    // answered from the label table, NoteConsumedLabel) waits for that batch. Everything else the two
+    // lanes do is unordered, as two rings are on the hardware unless the title synchronizes them.
+    // Scans of pending work (writes, reads, labels) cover both lanes; prefix waits (Sync,
+    // WaitSerial, FinishUpTo) wait for both lanes up to the serial; the flush hook's targeted waits
+    // (SyncThrough) and Reap progress per lane. Keep() holds an object for both lanes' batches.
+    static std::uint32_t AsyncLaneRing();
+    static int LaneOfQueue(std::uint32_t queue);
+    struct LaneScope {
+        int previous;
+        explicit LaneScope(int lane);
+        ~LaneScope();
+        LaneScope(const LaneScope&) = delete;
+        LaneScope& operator=(const LaneScope&) = delete;
+    };
+    // A WAIT_REG_MEM of the calling thread answered from the label table: the thread's lane's next
+    // GPU work waits for the other lane's batches that stored those dwords (applied at the next
+    // batch open or command, under the mutex).
+    static void NoteConsumedLabel(std::uint64_t address, std::size_t bytes);
+    // Records the calling thread's work into `lane` until destroyed, with the GPU edges a switch
+    // needs: the lane left is submitted and the lane entered waits for it, and back at the end
+    // (a dispatch of the async ring that touches images goes to the main lane this way).
+    struct LaneSwitch {
+        Recorder* recorder;
+        int from;
+        int to;
+        LaneSwitch(Recorder* recorder, int lane);
+        ~LaneSwitch() noexcept(false);
+        LaneSwitch(const LaneSwitch&) = delete;
+        LaneSwitch& operator=(const LaneSwitch&) = delete;
+    };
+    // The calling thread's lane as LaneScope set it (0 unless the async lane runs it).
+    static int ThreadLane();
+    bool AsyncLaneActive() const { return asyncTimeline != VK_NULL_HANDLE; }
+    // Submits the open batches of both lanes (a deadline flush, a drain).
+    void SubmitAllLanes();
     static bool DispatchOverlapEnabled();
     static void SetDispatchOrder(std::uint32_t queueKey, bool unordered);
     // The order the packet loop set for this thread's next dispatch, cleared: the queue key (0 =
@@ -147,7 +188,7 @@ public:
     void FlushKeyStores();
     void FlushKeyStoresOverlapping(std::uint64_t address, std::size_t bytes) { if (HasQueuedKeyStores() && QueuedKeyStoreOverlaps(address, bytes)) FlushKeyStores(); }
     bool Recording() const { return open != nullptr; }
-    bool Idle() const { return open == nullptr && inFlight.empty(); }
+    bool Idle() const { return lanes[0] == nullptr && lanes[1] == nullptr && inFlight.empty(); }
     std::uint64_t OpenSerial() const { return submissions + 1; }
     std::uint64_t CompletedThrough() const { return inFlight.empty() ? submissions : inFlight.front()->serial - 1; }
     // Whether recorded work still has completion actions (write-backs the CPU must see) to run.
@@ -649,6 +690,9 @@ private:
         std::vector<ReadListNote> readLists;
         // Submission number (1-based): identifies a batch after its allocation may have been reused.
         std::uint64_t serial = 0;
+        // Its lane (see AsyncLaneRing), and the other lane's serial it waits for on the GPU (0: none).
+        int lane = 0;
+        std::uint64_t waitOther = 0;
         std::uint64_t traceId = 0;
         bool submitted = false;
         // The GpuMutex queue tag of the thread that opened the batch, and when it was submitted
@@ -920,7 +964,51 @@ private:
     // labels.size(), readable without the table mutex: a noted write skips the mutex while the
     // table is empty (most of the time between label groups).
     std::atomic<std::size_t> recordedLabels{0};
-    std::unique_ptr<Batch> open;
+    // The open batch of each lane, and `open`: the calling thread's lane's slot (the thread's lane,
+    // see LaneScope, while the async lane is active; else lane 0), used like the one open batch.
+    std::array<std::unique_ptr<Batch>, 2> lanes;
+    int currentLane() const;
+    struct OpenSlot {
+        Recorder* owner;
+        std::unique_ptr<Batch>& slot() const { return owner->lanes[static_cast<std::size_t>(owner->currentLane())]; }
+        Batch* get() const { return slot().get(); }
+        Batch* operator->() const { return get(); }
+        Batch& operator*() const { return *get(); }
+        explicit operator bool() const { return get() != nullptr; }
+        bool operator==(std::nullptr_t) const { return get() == nullptr; }
+        bool operator!=(std::nullptr_t) const { return get() != nullptr; }
+    };
+    OpenSlot open{this};
+    template<typename TFunction>
+    bool anyOpen(TFunction&& function) const {
+        for (const auto& batch : lanes) {
+            if (batch != nullptr && function(*batch)) return true;
+        }
+        return false;
+    }
+    template<typename TFunction>
+    void forEachOpen(TFunction&& function) const {
+        for (const auto& batch : lanes) {
+            if (batch != nullptr) function(*batch);
+        }
+    }
+    VkSemaphore asyncTimeline = VK_NULL_HANDLE;
+    // The newest serial submitted to each lane.
+    std::array<std::uint64_t, 2> laneSubmitted{};
+    // The other lane's serial the next batch of each lane must wait for (LaneSwitch).
+    std::array<std::uint64_t, 2> laneOwed{};
+    void switchEdge(int from, int to);
+    // Submits `lane`'s open batch (from any thread's lane).
+    void submitLane(int lane);
+    // The edges this thread's consumed labels owe (NoteConsumedLabel), applied to the open batch.
+    void applyConsumedLabels();
+    // The newest in-flight batch of `lane`, or null.
+    Batch* newestInFlight(int lane) const;
+    // Finishes, in serial order, the in-flight batches of `lane` with serial <= `target` (first the
+    // other lane's batches each of them waits for), waiting for their fences when `wait`.
+    void finishLaneThrough(int lane, std::uint64_t target, bool wait, int source);
+    // The newest serial of `lane` <= `serial` still in flight (0: none).
+    std::uint64_t laneTargetAtOrBefore(int lane, std::uint64_t serial) const;
     std::vector<std::shared_ptr<void>> holdKept;
     std::uint64_t holdKeptSerial = 0;
     std::deque<std::unique_ptr<Batch>> inFlight;

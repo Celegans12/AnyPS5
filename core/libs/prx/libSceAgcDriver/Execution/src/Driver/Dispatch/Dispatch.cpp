@@ -18,12 +18,27 @@
 #include <string>
 #include <cstdlib>
 #include <functional>
+#include <optional>
 #include <stdexcept>
 #include <thread>
 
 namespace AgcDriver::DriverDetail {
 
 namespace {
+
+// Whether a compiled compute program binds images or samplers (directly, through image tables, or
+// the bindless heap): such a dispatch of the async compute ring is recorded into the main lane.
+bool DispatchUsesImages(const ShaderRecompiler::RecompileResult& compiled) {
+    if (compiled.bindlessHeap) return true;
+    using Role = ShaderRecompiler::DescriptorRole;
+    for (const auto& binding : compiled.bindings) {
+        switch (binding.role) {
+            case Role::GuestImages: case Role::GuestSamplers: case Role::ImageTable: case Role::SamplerTable: case Role::ImageTableMap: return true;
+            default: break;
+        }
+    }
+    return false;
+}
 
 bool DispatchItemsEnabled() {
     static const bool enabled = [] {
@@ -718,6 +733,11 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
         GuestMemory::TagGpuLockSite(indirectArguments != 0 ? GuestMemory::GpuLockSite::Indirect : GuestMemory::GpuLockSite::Dispatch);
         std::lock_guard gpuLock(GuestMemory::GpuMutex());
         phaseTiming.Phase(PhaseLockWait);
+        // The async compute lane takes buffer-only dispatches: one that binds images (texture cache
+        // uploads, storage images, bindless tables shared with queue 0's work) is recorded into the
+        // main lane, ordered after the ring's earlier work and before its later work (LaneSwitch).
+        std::optional<Graphics::Recorder::LaneSwitch> laneSwitch;
+        if (Graphics::Recorder::ThreadLane() != 0 && DispatchUsesImages(compiled)) laneSwitch.emplace(Graphics::Recorder::Active(), 0);
 
         recordLabelsForPacket(localDevice.get(), submission.queue);
         phaseTiming.Phase(PhaseLabels);

@@ -180,6 +180,9 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         }
         ++(polling ? outcomes.fromRecorderPolling : outcomes.fromRecorder);
         if (unlockedHit) ++outcomes.fromRecorderUnlocked;
+        // Answered from the label table before the store ran on the GPU: with the async compute lane,
+        // a store recorded in the other lane must also precede this queue's later work there.
+        if (Graphics::Recorder::LaneOfQueue(hit->queue) != Graphics::Recorder::LaneOfQueue(queue)) Graphics::Recorder::NoteConsumedLabel(awaited, awaitedBytes);
         if (hit->queue == queue) {
             ++outcomes.fromRecorderSameQueue;
             if (!hit->late) epochPoint.bump = false;

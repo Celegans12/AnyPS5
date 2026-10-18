@@ -15,6 +15,7 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
@@ -456,6 +457,36 @@ int main(int argc, char** argv) {
                 for (const auto& copy : copyList) one(*copy.shader);
             }
         };
+        // BENCH_ASYNC_PROBE=1 (with BENCH_COPIES > 1; APS5_ASYNC_LANE=<ring> on or off): the copies go to the async
+        // lane (submitted), then the original dispatch to the main lane, whose result the CPU waits for by its range
+        // (Recorder::SyncThrough, the flush hook's wait): with one lane that wait is behind every copy on the queue,
+        // with the async lane only behind the original. Prints a PROBE line (median wait).
+        const bool asyncProbe = std::getenv("BENCH_ASYNC_PROBE") != nullptr && !copyList.empty();
+        std::vector<double> probeTimes;
+        const auto probeRound = [&] {
+            {
+                const AgcDriver::Graphics::Recorder::LaneScope async(1);
+                for (const auto& copy : copyList) device->Dispatch(*copy.shader, groups[0], groups[1], groups[2], {}, request.request.shader.codeAddress);
+                device->SubmitRecorded(false);
+            }
+            const AgcDriver::Graphics::Recorder::LaneScope main(0);
+            device->Dispatch(shader, groups[0], groups[1], groups[2], {}, request.request.shader.codeAddress);
+            device->SubmitRecorded(false);
+            const BufferUse* target = nullptr;
+            for (const auto& buffer : buffers) {
+                if (buffer.written) {
+                    target = &buffer;
+                    break;
+                }
+            }
+            if (target == nullptr) return;
+            const auto start = std::chrono::steady_clock::now();
+            {
+                std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+                if (auto* recorder = AgcDriver::Graphics::Recorder::Active()) recorder->SyncThrough(target->base, static_cast<std::size_t>(target->bytes));
+            }
+            probeTimes.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+        };
         std::vector<double> times;
         std::uint64_t firstHash = 0;
         bool stable = true;
@@ -484,7 +515,8 @@ int main(int argc, char** argv) {
         for (std::uint64_t repeat = 0; repeat < repeats || std::chrono::steady_clock::now() - loopStart < std::chrono::seconds(seconds); ++repeat) {
             restore();
             const auto started = std::chrono::steady_clock::now();
-            dispatchRound();
+            if (asyncProbe) probeRound();
+            else dispatchRound();
             device->WaitIdle();
             times.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
             // Hash on the first repeat, then every 16th (images are large); the last one is hashed after the loop.
@@ -510,6 +542,10 @@ int main(int argc, char** argv) {
         auto sorted = times;
         std::sort(sorted.begin(), sorted.end());
         std::printf("BENCH batch=%llu copies=%llu request=%s words=%zu groups=%u,%u,%u fill=%s best_ms=%.3f median_ms=%.3f hash=%016llx stable=%d\n", static_cast<unsigned long long>(batchCount), static_cast<unsigned long long>(copies), argv[1], shader.spirv.size(), groups[0], groups[1], groups[2], fill.c_str(), sorted.front(), sorted[sorted.size() / 2], static_cast<unsigned long long>(firstHash), stable ? 1 : 0);
+        if (asyncProbe && !probeTimes.empty()) {
+            std::sort(probeTimes.begin(), probeTimes.end());
+            std::printf("PROBE async_lane=%s main-lane result wait median_ms=%.3f best_ms=%.3f\n", std::getenv("APS5_ASYNC_LANE") != nullptr ? std::getenv("APS5_ASYNC_LANE") : "off", probeTimes[probeTimes.size() / 2], probeTimes.front());
+        }
         std::fflush(stdout);
         std::fflush(nullptr);
         TerminateProcess(GetCurrentProcess(), 0);  // no DLL detach: ExitProcess after APS5_PROFILE_GPU hung in teardown
