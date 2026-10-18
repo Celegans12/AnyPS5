@@ -6,6 +6,7 @@ namespace ShaderRecompiler {
 namespace {
 
 constexpr std::uint32_t CurrentVersion = 31u;
+constexpr std::uint32_t DrawParameterBlockTag = 0x31504447u;
 constexpr std::uint32_t LocalFeatures = 22u;
 constexpr char kBase64Alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -831,6 +832,11 @@ DeserializedRequest deserialize(std::string_view decoded, std::uint32_t version,
         result.linkedCallFallbacks = reader.ReadU32Vector();
         result.request.context.linkedCallFallbacks = result.linkedCallFallbacks;
     }
+    if (version >= 26u && reader.Remaining() == 12u && result.request.context.vertex.has_value()) {
+        if (reader.ReadU32() != DrawParameterBlockTag) throw std::runtime_error("RequestSerializer: unexpected trailing data");
+        result.request.context.vertex->drawBaseVertexSgpr = reader.ReadI32();
+        result.request.context.vertex->drawStartInstanceSgpr = reader.ReadI32();
+    }
     if (version >= 21u && reader.Remaining() != 0u) throw std::runtime_error("RequestSerializer: unexpected trailing data");
     if (exact && !reader.Done()) throw std::runtime_error("RequestSerializer: trailing data");
     return result;
@@ -867,6 +873,13 @@ std::string RequestSerializer::Serialize(const RecompileRequest& request) const 
     writer.WriteBool(request.target.vertexSubgroups);
     writer.WriteBool(request.target.float16DenormPreserve);
     writer.WriteU32Span(request.context.linkedCallFallbacks);
+    // Optional trailing block (no version bump, so requests without it serialize as before): the
+    // GPU-side indirect draw parameter SGPRs of a vertex stage.
+    if (request.context.vertex.has_value() && (request.context.vertex->drawBaseVertexSgpr >= 0 || request.context.vertex->drawStartInstanceSgpr >= 0)) {
+        writer.WriteU32(DrawParameterBlockTag);
+        writer.WriteI32(request.context.vertex->drawBaseVertexSgpr);
+        writer.WriteI32(request.context.vertex->drawStartInstanceSgpr);
+    }
     return base64Encode(buffer);
 }
 

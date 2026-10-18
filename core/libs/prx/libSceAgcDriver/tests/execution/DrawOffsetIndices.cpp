@@ -236,8 +236,12 @@ public:
         return userData;
     }
 
-    ShaderRecompiler::RecompileResult Vertex(std::span<const std::uint32_t> code, const std::vector<std::uint32_t>& userData) const {
+    ShaderRecompiler::RecompileResult Vertex(std::span<const std::uint32_t> code, const std::vector<std::uint32_t>& userData, bool gpuParameters = false) const {
         ShaderRecompiler::ShaderVertexStageInfo info{};
+        if (gpuParameters) {
+            info.drawBaseVertexSgpr = static_cast<std::int32_t>(BaseVertexSgpr);
+            info.drawStartInstanceSgpr = static_cast<std::int32_t>(StartInstanceSgpr);
+        }
         info.resourcesNum = 2;
         info.resources[0].fields = {BufferTable[0], BufferTable[1], BufferTable[2], BufferTable[3]};
         info.resources[1].fields = {BufferTable[4], BufferTable[5], BufferTable[6], BufferTable[7]};
@@ -346,8 +350,8 @@ std::string PathName(const std::optional<Path>& path) {
     return path ? "the CPU path (" + std::string(AgcDriver::Graphics::IndirectDrawPathName(*path)) + ")" : std::string("the GPU");
 }
 
-std::string Classified(Fixture& fixture, const std::string& what, const ShaderRecompiler::RecompileResult& vertex, const std::vector<std::uint32_t>& userData, AgcDriver::Pm4::DrawParameters& draw, std::optional<Path> expectedPath, Rule expectedRule) {
-    const auto path = AgcDriver::DriverDetail::Driver::ClassifyIndirectDraw(vertex, fixture.State(), Program(userData), fixture.device, draw, false);
+std::string Classified(Fixture& fixture, const std::string& what, const ShaderRecompiler::RecompileResult& vertex, const std::vector<std::uint32_t>& userData, AgcDriver::Pm4::DrawParameters& draw, std::optional<Path> expectedPath, Rule expectedRule, bool gpuParameters = false) {
+    const auto path = AgcDriver::DriverDetail::Driver::ClassifyIndirectDraw(vertex, fixture.State(), Program(userData), fixture.device, draw, false, gpuParameters);
     const auto& indirect = *draw.indirect;
     const bool rules = expectedPath || (indirect.vertexRule == expectedRule && indirect.instanceRule == expectedRule);
     std::cout << what << ": classified to " << PathName(path) << '\n';
@@ -460,6 +464,51 @@ std::string Run(Fixture& fixture) {
             fixture.Place(indexedRecord[3], bufferIndices, indexedRecord[4]);
             fixture.Draw(vertex, draw);
             failures += fixture.Check(what + ", drawn in place on the GPU", bufferIndices, indexedRecord[3], indexedRecord[4], false);
+        }
+        // gpuind: the program that copies v5/v8 before its fetch adds (the CPU path's "patched SGPR
+        // not folded") compiled with GPU-side draw parameters: s16/s17 read BaseVertex /
+        // BaseInstance and v5/v8 are VertexIndex - BaseVertex / InstanceIndex - BaseInstance, so the
+        // draw reads its record in place and every raw index and fetch sum matches the guest's.
+        {
+            const std::string what = "indexed indirect record whose program copies v5/v8 before its fetch adds, with GPU-side draw parameters, vertex offset 700, start instance 59455";
+            const auto vertex = fixture.Vertex(VertexCode, staleUserData, true);
+            AgcDriver::Pm4::DrawParameters draw{indexAddress, static_cast<std::uint32_t>(Indices.size()), 2, 0, 0, true, 0, 0};
+            draw.indirect = indexedIndirect;
+            failures += Classified(fixture, what, vertex, staleUserData, draw, std::nullopt, Rule::InPlace, true);
+            Require(AgcDriver::DriverDetail::Driver::GpuParametersDrawSide(fixture.Vertex(VertexCode, staleUserData), fixture.State(), Program(staleUserData), fixture.device, draw), "a NotFolded program was not predicted to draw GPU side with GPU-side draw parameters");
+            fixture.Place(indexedRecord[3], bufferIndices, indexedRecord[4]);
+            fixture.Draw(vertex, draw);
+            failures += fixture.Check(what + ", drawn in place on the GPU", bufferIndices, indexedRecord[3], indexedRecord[4], true);
+        }
+        {
+            const std::string what = "auto indirect record whose program copies v5/v8 before its fetch adds, with GPU-side draw parameters, start vertex 300, start instance 7";
+            const std::array<std::uint32_t, 4> record{Vertices, Instances, 300, 7};
+            std::copy(record.begin(), record.end(), fixture.Records() + 32);
+            AgcDriver::Pm4::DrawParameters::IndirectDraw indirect{reinterpret_cast<std::uintptr_t>(fixture.Records() + 32), 0x24u, 16u, 16u, 1u, false, 0u, 0x10u, 0x11u, NoLocation, false, 0u};
+            indirect.baseVertexSgpr = static_cast<std::int32_t>(BaseVertexSgpr);
+            indirect.startInstanceSgpr = static_cast<std::int32_t>(StartInstanceSgpr);
+            AgcDriver::Pm4::DrawParameters draw{0, 0, 0, 0, 0, false, 0, 0};
+            draw.indirect = indirect;
+            const auto vertex = fixture.Vertex(VertexCode, staleUserData, true);
+            failures += Classified(fixture, what, vertex, staleUserData, draw, std::nullopt, Rule::InPlace, true);
+            fixture.Place(300u, autoIndices, 7u);
+            fixture.Draw(vertex, draw);
+            failures += fixture.Check(what + ", drawn in place on the GPU", autoIndices, 300u, 7u, true);
+            // GE_INDX_OFFSET still needs the CPU path: the guest's index starts there, Vulkan's at the record's first vertex.
+            auto offset = draw;
+            offset.indirect->indxOffset = 5u;
+            failures += Classified(fixture, what + ", GE_INDX_OFFSET 5", vertex, staleUserData, offset, Path::IndxOffset, Rule::InPlace, true);
+        }
+        {
+            // The CP writes the base vertex into s18, but the fetch adds s16: the fixed-function fetch
+            // would start at the record's base vertex, not at s16, so GPU-side parameters do not help.
+            const std::string what = "indexed indirect record whose base vertex SGPR is not the fetch's, with GPU-side draw parameters";
+            const auto vertex = fixture.Vertex(VertexCode, staleUserData, true);
+            AgcDriver::Pm4::DrawParameters draw{indexAddress, static_cast<std::uint32_t>(Indices.size()), 2, 0, 0, true, 0, 0};
+            draw.indirect = indexedIndirect;
+            draw.indirect->baseVertexLocation = 0x12u;
+            draw.indirect->baseVertexSgpr = 18;
+            failures += Classified(fixture, what, vertex, staleUserData, draw, Path::NotFolded, Rule::InPlace, true);
         }
         {
             const std::string what = "indexed indirect record whose packet names no register for its offsets, user data s16 0x51, s17 0x62";

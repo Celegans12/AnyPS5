@@ -10,12 +10,90 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
+#include <spirv/unified1/spirv.hpp>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <atomic>
 #include <limits>
+#include <mutex>
+#include <unordered_map>
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+
+// gpuind: GPU-side indirect draw parameters (APS5_NO_GPU_INDIRECT_ARGS=1 turns them off). A
+// vertex-path indirect draw whose CP-written base vertex / start instance SGPRs the stage uses
+// beyond the folded fetch offset ("patched SGPR not folded") compiles its front stage with those
+// SGPRs read from BaseVertex / BaseInstance, so the records stay on the GPU.
+bool GpuIndirectArgs() {
+    static const bool enabled = std::getenv("APS5_NO_GPU_INDIRECT_ARGS") == nullptr;
+    return enabled;
+}
+
+// An indirect draw's draw-cache keys carry its SGPR locations: a cached front stage compiled with
+// GPU-side draw parameters must not serve a direct draw with the same registers, or the reverse.
+std::uint64_t GpuParameterKey(std::uint64_t key, const Pm4::DrawParameters::IndirectDraw& indirect) {
+    if (key == 0) return 0;
+    std::uint64_t mixed = key ^ (0x6770756964726177ull + (static_cast<std::uint64_t>(indirect.baseVertexLocation) << 32u) + (static_cast<std::uint64_t>(indirect.startInstanceLocation) << 8u) + 1u);
+    mixed *= 0x9e3779b97f4a7c15ull;
+    mixed ^= mixed >> 31u;
+    return mixed == 0 ? 1 : mixed;
+}
+
+// Learned per (front shader, base vertex SGPR, start instance SGPR): 1 = its GPU-parameter stage
+// takes the GPU path (compile it so from the start), 2 = it does not (or it was refused).
+struct GpuParameterMemo {
+    std::mutex mutex;
+    std::unordered_map<std::uint64_t, std::uint8_t> states;
+    static std::uint64_t Key(std::uint64_t address, std::int32_t baseVertex, std::int32_t startInstance) { return address * 0x100000001b3ull ^ (static_cast<std::uint64_t>(static_cast<std::uint32_t>(baseVertex) & 0xffu) << 8u) ^ (static_cast<std::uint32_t>(startInstance) & 0xffu); }
+    std::uint8_t Get(std::uint64_t key) {
+        std::lock_guard lock(mutex);
+        const auto found = states.find(key);
+        return found == states.end() ? 0 : found->second;
+    }
+    void Set(std::uint64_t key, std::uint8_t state) {
+        std::lock_guard lock(mutex);
+        auto& slot = states[key];
+        if (slot != 2) slot = state;
+    }
+};
+GpuParameterMemo& GpuParameterStates() {
+    static GpuParameterMemo memo;
+    return memo;
+}
+
+struct GpuParameterCounters {
+    std::atomic<std::uint64_t> compiled{0}, learned{0}, gpuSide{0}, fellBack{0}, refused{0};
+};
+GpuParameterCounters& GpuParameterCount() {
+    static GpuParameterCounters counters;
+    return counters;
+}
+
+// Under APS5_PROFILE_DRAW, every 10 s: `[gpuind]` draws whose front stage read the draw parameters
+// on the GPU, shapes learned, fallbacks to the CPU path, refusals, memo sizes.
+void ReportGpuParameters() {
+    static std::atomic<std::int64_t> last{0};
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto previous = last.load(std::memory_order_relaxed);
+    if (previous == 0) {
+        last.compare_exchange_strong(previous, now);
+        return;
+    }
+    if (now - previous < 10 || !last.compare_exchange_strong(previous, now)) return;
+    auto& counters = GpuParameterCount();
+    std::size_t good = 0, bad = 0;
+    {
+        auto& memo = GpuParameterStates();
+        std::lock_guard lock(memo.mutex);
+        for (const auto& [key, state] : memo.states) (state == 1 ? good : bad) += 1;
+    }
+    std::fprintf(stderr, "[gpuind] %lld s: gpu-parameter draws %llu (shapes learned %llu), fell back to the CPU path %llu, refused %llu; shapes gpu %zu / cpu %zu\n", static_cast<long long>(now - previous), static_cast<unsigned long long>(counters.gpuSide.exchange(0)), static_cast<unsigned long long>(counters.learned.exchange(0)), static_cast<unsigned long long>(counters.fellBack.exchange(0)), static_cast<unsigned long long>(counters.refused.exchange(0)), good, bad);
+}
+
+}
 
 DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected) {
     PerformanceTimer timing("Driver.Draw");
@@ -94,6 +172,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         const bool relocating = drawRelocationEnabled();
         if (relocating) drawIdentity = drawIdentityKey(registryWalk);
         drawKey = drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), &shapeKey, traceDrawCache() || profile ? &drawKeyComponents : nullptr, nullptr, nullptr, &registryWalk);
+        if (GpuIndirectArgs() && drawParameters.indirect) drawKey = GpuParameterKey(drawKey, *drawParameters.indirect);
         std::unique_lock cacheLock(drawCacheMutex);
         if (relocating) {
             learnPendingRelocation();
@@ -109,6 +188,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             // The alias reads guest memory (relocatedContentKey), so it is computed outside the lock as before.
             cacheLock.unlock();
             drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), nullptr, nullptr, relocation.get(), &drawAlias, &registryWalk);
+            if (GpuIndirectArgs() && drawParameters.indirect) drawAlias = GpuParameterKey(drawAlias, *drawParameters.indirect);
             cacheLock.lock();
         }
         ++drawEntryCounters.lookups;
@@ -123,6 +203,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             if (relocation != nullptr && !aliasFirst) {
                 cacheLock.unlock();
                 drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), nullptr, nullptr, relocation.get(), &drawAlias, &registryWalk);
+                if (GpuIndirectArgs() && drawParameters.indirect) drawAlias = GpuParameterKey(drawAlias, *drawParameters.indirect);
                 cacheLock.lock();
             }
             if (drawIdentity != 0) drawRelocationPending = {drawKey, drawAlias, drawIdentity};
@@ -235,6 +316,28 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         indirect.startInstanceSgpr = sgprOf(indirect.startInstanceLocation);
         indirect.drawIndexSgpr = sgprOf(indirect.drawIndexLocation);
     }
+    // gpuind: whether the front stage may be compiled with GPU-side draw parameters, and whether
+    // it is (learned per shader and SGPRs; a draw it does not suit falls back below).
+    bool gpuParametersEligible = false;
+    bool gpuParameters = false;
+    std::uint64_t gpuParameterKey = 0;
+    if (GpuIndirectArgs() && drawParameters.indirect && !programs.empty() && programs.front().binary.stage == Stage::Vertex && graphics.stages.path == Graphics::ShaderPath::Vertex && !graphics.rectList && !graphics.stages.mesh && !graphics.stages.tessellation && (drawParameters.indirect->baseVertexSgpr >= 0 || drawParameters.indirect->startInstanceSgpr >= 0)) {
+        static const bool drawParametersCapability = [&] {
+            const auto target = localDevice->Target();
+            return std::ranges::find(target.supportedCapabilities, static_cast<std::uint32_t>(spv::CapabilityDrawParameters)) != target.supportedCapabilities.end();
+        }();
+        if (drawParametersCapability) {
+            gpuParameterKey = GpuParameterMemo::Key(programs.front().binary.codeAddress, drawParameters.indirect->baseVertexSgpr, drawParameters.indirect->startInstanceSgpr);
+            const auto state = GpuParameterStates().Get(gpuParameterKey);
+            gpuParametersEligible = state != 2;
+            gpuParameters = state == 1;
+        }
+    }
+    const auto applyGpuParameters = [&](std::optional<ShaderRecompiler::ShaderVertexStageInfo>& info) {
+        if (!info) return;
+        info->drawBaseVertexSgpr = gpuParameters ? drawParameters.indirect->baseVertexSgpr : -1;
+        info->drawStartInstanceSgpr = gpuParameters ? drawParameters.indirect->startInstanceSgpr : -1;
+    };
     std::vector<ShaderRecompiler::MemoryRegion> memory;
     std::vector<ShaderRecompiler::LinkedProgram> linked;
     for (std::size_t i = 0; i < programs.size(); ++i) {
@@ -260,6 +363,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             vertexInfos[i] = Graphics::DecodeVertexStageInfo(program.binary.header, program.binary.headerAddress, program.userData, &decodeReads[i], false, 8u - program.firstUserSgpr);
         }
         if (vertexInfos[i]) vertexInfos[i]->paClVsOutCntl = PositionExportLayout(program.snapshot.get(), program.codeOffset, program.binary.code, readRegister(queue.context, 0x207), program.tailContinuation.get()) | graphics.layerExports;
+        if (i == 0 && gpuParametersEligible) applyGpuParameters(vertexInfos[i]);
     };
     if (!registerKey) {
         for (std::size_t i = 0; i < programs.size(); ++i) decodeVertexInfo(i);
@@ -416,12 +520,68 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             if (dataEntry != nullptr && reused[i]) ++dataStagesReused;
             else if (dataEntry != nullptr) ++dataStagesCompiled;
         }
-        const auto& result = *programResults[i];
         if (i == 0 && drawParameters.indirect) {
-            indirectCpu = ClassifyIndirectDraw(result, graphics, programs.front(), localDevice, drawParameters, traceIndirect);
-        } else if (i == 0) {
-            fold(result, drawParameters);
+            // gpuind: the front stage as compiled (or served by a hit) says whether it reads the
+            // draw parameters on the GPU. A GPU-parameter stage only ever draws GPU side (or through
+            // the recorder's per-record fallback, which passes the records as BaseVertex /
+            // BaseInstance too); the CPU path here patches the user words, so it needs the old stage.
+            gpuParameters = vertexInfos[0] && (vertexInfos[0]->drawBaseVertexSgpr >= 0 || vertexInfos[0]->drawStartInstanceSgpr >= 0);
+            const auto rematerialize = [&](bool withGpuParameters) {
+                gpuParameters = withGpuParameters;
+                applyGpuParameters(vertexInfos[0]);
+                compiledStages.push_back(materializeDrawStage(0, pushCursorBytes, queue, submission, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, *shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected));
+                programResults[0] = compiledStages.back().get();
+            };
+            indirectCpu = ClassifyIndirectDraw(*programResults[0], graphics, programs.front(), localDevice, drawParameters, traceIndirect, gpuParameters);
+            auto& counters = GpuParameterCount();
+            if (profile) ReportGpuParameters();
+            if (gpuParameters && indirectCpu) {
+                ++counters.fellBack;
+                rematerialize(false);
+                if (!rejected.empty()) return DrawVerdict::Rejected;
+                indirectCpu = ClassifyIndirectDraw(*programResults[0], graphics, programs.front(), localDevice, drawParameters, traceIndirect, false);
+            } else if (gpuParameters) {
+                ++counters.gpuSide;
+            } else if (gpuParametersEligible && indirectCpu == Graphics::IndirectDrawPath::NotFolded) {
+                if (!GpuParametersDrawSide(*programResults[0], graphics, programs.front(), localDevice, drawParameters)) {
+                    GpuParameterStates().Set(gpuParameterKey, 2);
+                } else {
+                    bool refused = false;
+                    try {
+                        rematerialize(true);
+                    } catch (const Graphics::LiveSnapshotInvalidated&) {
+                        throw;
+                    } catch (const std::exception& error) {
+                        refused = true;
+                        ++counters.refused;
+                        static std::atomic<std::uint64_t> reports{0};
+                        if (reports.fetch_add(1) < 16) std::fprintf(stderr, "[gpuind] shader 0x%llx: GPU-side draw parameters refused, its indirect draws read the records on the CPU: %s\n", static_cast<unsigned long long>(programs.front().binary.codeAddress), error.what());
+                    }
+                    if (!refused && !rejected.empty()) {
+                        refused = true;
+                        ++counters.refused;
+                        static std::atomic<std::uint64_t> reports{0};
+                        if (reports.fetch_add(1) < 16) std::fprintf(stderr, "[gpuind] shader 0x%llx: GPU-side draw parameters rejected, its indirect draws read the records on the CPU: %s\n", static_cast<unsigned long long>(programs.front().binary.codeAddress), rejected.c_str());
+                        rejected.clear();
+                    }
+                    const auto fresh = refused ? std::optional<Graphics::IndirectDrawPath>(Graphics::IndirectDrawPath::NotFolded) : ClassifyIndirectDraw(*programResults[0], graphics, programs.front(), localDevice, drawParameters, traceIndirect, true);
+                    if (fresh) {
+                        GpuParameterStates().Set(gpuParameterKey, 2);
+                        rejected.clear();
+                        rematerialize(false);
+                        if (!rejected.empty()) return DrawVerdict::Rejected;
+                        indirectCpu = ClassifyIndirectDraw(*programResults[0], graphics, programs.front(), localDevice, drawParameters, traceIndirect, false);
+                    } else {
+                        GpuParameterStates().Set(gpuParameterKey, 1);
+                        ++counters.learned;
+                        ++counters.gpuSide;
+                        indirectCpu.reset();
+                    }
+                }
+            }
         }
+        const auto& result = *programResults[i];
+        if (i == 0 && !drawParameters.indirect) fold(result, drawParameters);
         const auto slotEnd = (pushCursorBytes / Graphics::PipelinePushSlotBytes + 1u) * Graphics::PipelinePushSlotBytes;
         require(result.pushConstants.size() <= slotEnd - pushCursorBytes, "stage push constants exceed the pipeline push constant block");
         stages.push_back({program.binary.stage, &result, result.pushConstants.empty() ? 0u : pushCursorBytes});

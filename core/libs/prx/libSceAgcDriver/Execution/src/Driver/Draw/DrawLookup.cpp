@@ -51,6 +51,8 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                 mix(vertex.fetchBufferReg);
                 mix(vertex.fetchEmbedded);
                 mix(vertex.paClVsOutCntl);
+                mix(static_cast<std::uint32_t>(vertex.drawBaseVertexSgpr));
+                mix(static_cast<std::uint32_t>(vertex.drawStartInstanceSgpr));
                 for (std::uint32_t r = 0; r < vertex.resourcesNum; ++r) {
                     for (const auto field : vertex.resources[r].fields) mix(field);
                     const auto& destination = vertex.resourcesDst[r];

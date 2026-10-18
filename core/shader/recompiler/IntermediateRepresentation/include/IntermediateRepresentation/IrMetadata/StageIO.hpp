@@ -49,6 +49,7 @@ enum class StageInputKind {
     RasterPrimitive,
     LayerExported,
     BaseInstance,
+    BaseVertex,
 };
 
 enum class StageOutputKind {
