@@ -1615,6 +1615,30 @@ namespace {
 constexpr std::array<std::uint32_t, 17> HtileMaskKernel{0xd7460000u, 0x04010c06u, 0x34000084u, 0xdc388000u, 0x04020000u, 0xbf8c3f70u, 0xd7710008u, 0x00120805u, 0xd7710009u, 0x00120a05u, 0xd771000au, 0x00120c05u, 0xd771000bu, 0x00120e05u, 0xdc788000u, 0x00020800u, 0xbf810000u};
 }
 
+std::optional<HtileBufferMaskClear> MatchHtileBufferMaskClear(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const ShaderRecompiler::ShaderComputeStageInfo& compute, std::span<const std::uint32_t> packet, std::uint64_t indirectArguments) {
+    static const bool disabled = std::getenv("APS5_NO_HTILE_BUFFER_KERNEL") != nullptr;
+    static constexpr std::array<std::uint32_t, 16> kernel{0xd7460004u, 0x04010c0cu, 0xe00c2000u, 0x80000004u, 0xbf8c3f70u, 0xd7710000u, 0x00120008u, 0xd7710001u, 0x00160209u, 0xd7710002u, 0x001a040au, 0xd7710003u, 0x001e060bu, 0xe01c2000u, 0x80000004u, 0xbf810000u};
+    if (disabled || userData.size() != 12u || packet.size() < 5u || indirectArguments != 0u) return std::nullopt;
+    if (code.size() < kernel.size() || !std::equal(kernel.begin(), kernel.end(), code.begin())) return std::nullopt;
+    if (compute.numThreads != std::array<std::uint32_t, 3>{64u, 1u, 1u} || !compute.groupIdEnable[0] || compute.threadIdComponentCount == 0u || compute.threadIdComponentCount > 3u) return std::nullopt;
+    if (packet[1] == 0u || packet[2] != 1u || packet[3] != 1u || (packet[4] & 0x3u) != 0x1u) return std::nullopt;
+    for (std::size_t i = 1; i < 4; ++i) {
+        if (userData[4 + i] != userData[4] || userData[8 + i] != userData[8]) return std::nullopt;
+    }
+    const auto stride = (userData[1] >> 16u) & 0x3fffu;
+    const bool swizzled = ((userData[1] >> 31u) & 1u) != 0u;
+    const bool addTid = ((userData[3] >> 23u) & 1u) != 0u;
+    const auto type = userData[3] >> 30u;
+    const auto format = (userData[3] >> 12u) & 0x7fu;
+    const auto selects = userData[3] & 0xfffu;
+    if (stride != 16u || swizzled || addTid || type != 0u || format != 75u || selects != 0xfacu) return std::nullopt;
+    const auto address = userData[0] | (static_cast<std::uint64_t>(userData[1] & 0xffffu) << 32u);
+    const std::uint64_t threads = (packet[4] & 0x20u) != 0u ? packet[1] : static_cast<std::uint64_t>(packet[1]) * 64u;
+    const auto records = std::min<std::uint64_t>(threads, userData[2]);
+    if (address == 0u || (address & 15u) != 0u || records == 0u || records > 0x400000u) return std::nullopt;
+    return HtileBufferMaskClear{address, static_cast<std::size_t>(records * 16u), userData[8], userData[4]};
+}
+
 bool HtileMaskKernelCode(std::span<const std::uint32_t> code) {
     return code.size() >= HtileMaskKernel.size() && std::equal(HtileMaskKernel.begin(), HtileMaskKernel.end(), code.begin());
 }
