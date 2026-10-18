@@ -105,7 +105,9 @@ public:
     // batches are retired first, and it waits only for stores a batch's completion makes on the
     // CPU (a copied buffer's write-back, a deferred label). Debug aid: APS5_FILL_SYNC=1 waits for
     // every recorded store over the range.
-    bool FillBuffer(std::uint64_t address, std::size_t bytes, std::span<const std::uint32_t, 4> pattern);
+    bool FillBuffer(std::uint64_t address, std::size_t bytes, std::span<const std::uint32_t, 4> pattern, bool reap = true);
+    // Graphics::NoteHtileMaskOnGpu for a recorded HTILE mask clear kernel (under the GPU lock).
+    void NoteHtileMask(std::uint64_t address, std::size_t bytes, std::uint32_t mask, std::uint32_t value) const;
     bool DumpSamplesOnGpu(std::uint64_t address);
     // Copies `bytes` of guest memory from `source` to `destination` (disjoint ranges) in place of the
     // engine's memcpy kernel (Driver.cpp copyBuffer). `path` 0: copied on the CPU at once, when

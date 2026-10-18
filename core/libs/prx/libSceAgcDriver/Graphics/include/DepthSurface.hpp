@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -35,6 +36,14 @@ void MarkStorageDepthWrites(const Context& context, const std::shared_ptr<Storag
 std::uint64_t HtileDepthClearAddress(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const std::array<std::uint32_t, 3>& numThreads);
 std::size_t HtileDepthClearBytes_nid_no_patch(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const ShaderRecompiler::ShaderComputeStageInfo& compute, std::span<const std::uint32_t> packet, std::uint64_t indirectArguments);
 void NoteHtileDepthClear(std::uint64_t htileAddress, std::size_t bytes, std::size_t nativeBytes = 0u);
+class Recorder;
+// The HTILE mask clear kernel (HtileDepthClearAddress) recorded over [address, address + bytes): every word becomes
+// (word & mask) | value on the GPU. Noted under the GPU lock right after the dispatch is recorded, with the recorder's
+// write note, so a depth store-back can know the HTILE words without reading them back (APS5_NO_HTILE_GPU_EXPANSION=1: off).
+void NoteHtileMaskOnGpu(const Context& context, std::uint64_t address, std::size_t bytes, std::uint32_t mask, std::uint32_t value);
+// The device's GPU fill of a uniform dword over guest memory (VulkanDevice::FillBuffer), per recorder; null removes it.
+using HtileFillOnGpu = std::function<bool(std::uint64_t address, std::size_t bytes, std::uint32_t word)>;
+void SetHtileFillOnGpu(const Recorder* recorder, HtileFillOnGpu fill);
 struct MemoryValueFill {
     std::uint64_t address;
     std::size_t bytes;

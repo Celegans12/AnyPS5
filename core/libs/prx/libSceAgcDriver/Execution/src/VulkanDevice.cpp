@@ -1911,6 +1911,10 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     }
     state->recorder = std::make_unique<Graphics::Recorder>(graphicsContext(), state->timelineSemaphores);
     state->recorder->Activate();
+    Graphics::SetHtileFillOnGpu(state->recorder.get(), [this](std::uint64_t address, std::size_t bytes, std::uint32_t word) {
+        const std::array<std::uint32_t, 4> pattern{word, word, word, word};
+        return FillBuffer(address, bytes, pattern, false);
+    });
     if (state->bindlessImages) {
         const auto context = graphicsContext();
         const auto capacities = Graphics::DescriptorHeap::DeviceCapacities(context);
@@ -2000,7 +2004,9 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     }
 }
 
-VulkanDevice::~VulkanDevice() = default;
+VulkanDevice::~VulkanDevice() {
+    if (state != nullptr && state->recorder != nullptr) Graphics::SetHtileFillOnGpu(state->recorder.get(), nullptr);
+}
 
 std::uint32_t VulkanDevice::computeSubgroupSize(const ShaderRecompiler::RecompileResult& shader) const {
     return state->computeWave32 && (shader.hostSubgroupSize == 32u || shader.hostSubgroupSize > state->maxComputeSubgroupSize) ? std::min(shader.hostSubgroupSize, state->maxComputeSubgroupSize) : 0u;
@@ -2211,14 +2217,18 @@ bool VulkanDevice::DumpSamplesOnGpu(std::uint64_t address) {
     return true;
 }
 
-bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::span<const std::uint32_t, 4> pattern) {
+void VulkanDevice::NoteHtileMask(std::uint64_t address, std::size_t bytes, std::uint32_t mask, std::uint32_t value) const {
+    Graphics::NoteHtileMaskOnGpu(graphicsContext(), address, bytes, mask, value);
+}
+
+bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::span<const std::uint32_t, 4> pattern, bool reap) {
     if (!state->recorder || bytes == 0 || bytes % 16 != 0 || address % 16 != 0) return false;
     auto& recorder = *state->recorder;
     // Finished batches are retired first (one fence status check, as WriteLabelOnGpu does): their
     // completion labels landed and their copied writers are delisted, so a batch the idle GPU already
     // finished does not force a wait below. Before the import lookup: a completion may refresh the
     // import table. Debug aid: APS5_NO_OPPORTUNISTIC_REAP=1 skips it.
-    if (OpportunisticReap()) recorder.Reap();
+    if (reap && OpportunisticReap()) recorder.Reap();
     const auto context = graphicsContext();
     const Graphics::HostImport* import = Graphics::HostImportFor(context, address, bytes);
     if (import == nullptr) return false;

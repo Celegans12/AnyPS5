@@ -1186,7 +1186,87 @@ void reportHtileSyncs() {
     const auto partial = take(counters.partial);
     const auto cleared = take(counters.cleared);
     const auto waitMs = static_cast<double>(take(counters.waitNs)) / 1e6;
-    AgcDriver::ProfilePrint_nid_no_patch("[htile] store-back reads (10 s): %llu, %llu over pending GPU writes waiting %.1f ms (writer batch open %llu, signaled %llu, batches finished %llu; writer range = htile %llu, larger %llu, partial %llu); %llu found cleared\n", reads, pending, waitMs, open, signaled, batches, exact, larger, partial, cleared);
+    auto& gpu = HtileGpu();
+    AgcDriver::ProfilePrint_nid_no_patch("[htile] store-back reads (10 s): %llu, %llu over pending GPU writes waiting %.1f ms (writer batch open %llu, signaled %llu, batches finished %llu; writer range = htile %llu, larger %llu, partial %llu); %llu found cleared; expanded on the GPU without a read (cumulative) %llu, over a pending expansion %llu, mask clear with unknown bits %llu\n", reads, pending, waitMs, open, signaled, batches, exact, larger, partial, cleared, static_cast<unsigned long long>(gpu.expanded.load(std::memory_order_relaxed)), static_cast<unsigned long long>(gpu.skipped.load(std::memory_order_relaxed)), static_cast<unsigned long long>(gpu.unknown.load(std::memory_order_relaxed)));
+}
+
+struct HtileMaskWrite {
+    std::uint64_t begin;
+    std::uint64_t end;
+    std::uint32_t mask;
+    std::uint32_t value;
+    std::uint64_t note;
+};
+
+struct HtileGpuState {
+    std::mutex mutex;
+    std::vector<HtileMaskWrite> masks;
+    std::map<std::uint64_t, std::uint64_t> expansions;
+    std::map<const Recorder*, HtileFillOnGpu> fills;
+    std::atomic<std::uint64_t> expanded{0};
+    std::atomic<std::uint64_t> skipped{0};
+    std::atomic<std::uint64_t> unknown{0};
+};
+
+HtileGpuState& HtileGpu() {
+    static auto* state = new HtileGpuState();
+    return *state;
+}
+
+bool HtileGpuExpansion() {
+    static const bool enabled = std::getenv("APS5_NO_HTILE_GPU_EXPANSION") == nullptr;
+    return enabled;
+}
+
+// The HTILE words after the newest pending write when that write is a noted mask clear covering the whole range and the
+// bits the store-back looks at do not depend on the words before it: the cleared aspects and the expanded word.
+std::optional<std::pair<VkImageAspectFlags, std::uint32_t>> KnownHtileExpansion(const HtileMaskWrite& write, const DepthTarget& target) {
+    const auto mask = write.mask;
+    const auto value = write.value;
+    if ((mask & 0xfu) != 0 || (value & 0xfu) != 0) return std::nullopt;
+    if (target.firstSlice != 0 && mask != 0) return std::nullopt;
+    if (!target.htileStencil) return std::pair<VkImageAspectFlags, std::uint32_t>{VK_IMAGE_ASPECT_DEPTH_BIT, 0xfffc000fu};
+    if ((mask & 0x300u) != 0) return std::nullopt;
+    if (((value >> 8u) & 0x3u) == 0) return std::pair<VkImageAspectFlags, std::uint32_t>{VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, 0xfffff3ffu};
+    if ((mask & 0x3f0u) != 0) return std::nullopt;
+    return std::pair<VkImageAspectFlags, std::uint32_t>{VK_IMAGE_ASPECT_DEPTH_BIT, (value & 0x3f0u) | 0xfffff00fu};
+}
+
+// The store-back of a target whose HTILE a recorded mask clear is still writing: the expansion is recorded as a GPU fill
+// ordered after the clear instead of a CPU read (which waits for the GPU) and a CPU write. A later store-back over this
+// expansion, still pending, finds the expanded words: nothing cleared. Returns nullopt when the words are not known.
+std::optional<VkImageAspectFlags> expandHtileOnGpu(Recorder& recorder, const DepthTarget& target, std::size_t bytes) {
+    if (!HtileGpuExpansion() || bytes % 16u != 0 || target.htileAddress % 16u != 0) return std::nullopt;
+    const auto newest = recorder.NewestWriteNote(target.htileAddress, bytes);
+    if (newest == 0) return std::nullopt;
+    auto& gpu = HtileGpu();
+    std::optional<HtileMaskWrite> write;
+    HtileFillOnGpu fill;
+    {
+        std::lock_guard lock(gpu.mutex);
+        if (const auto found = gpu.expansions.find(target.htileAddress); found != gpu.expansions.end() && found->second == newest) {
+            gpu.skipped.fetch_add(1, std::memory_order_relaxed);
+            return VkImageAspectFlags{0};
+        }
+        for (const auto& mask : gpu.masks) {
+            if (mask.note == newest && mask.begin <= target.htileAddress && mask.end >= target.htileAddress + bytes) write = mask;
+        }
+        if (const auto found = gpu.fills.find(&recorder); found != gpu.fills.end()) fill = found->second;
+    }
+    if (!write.has_value() || !fill) return std::nullopt;
+    const auto known = KnownHtileExpansion(*write, target);
+    if (!known.has_value()) {
+        gpu.unknown.fetch_add(1, std::memory_order_relaxed);
+        return std::nullopt;
+    }
+    if (!fill(target.htileAddress, bytes, known->second)) return std::nullopt;
+    const auto note = recorder.NewestWriteNote(target.htileAddress, bytes);
+    {
+        std::lock_guard lock(gpu.mutex);
+        gpu.expansions[target.htileAddress] = note;
+    }
+    gpu.expanded.fetch_add(1, std::memory_order_relaxed);
+    return known->first;
 }
 
 VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarget& target) {
@@ -1199,6 +1279,14 @@ VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarg
         std::lock_guard lock(htileReadsMutex());
         const auto found = htileReads().find(target.htileAddress);
         if (found != htileReads().end() && found->second != 0 && GuestMemory::UnchangedSince(target.htileAddress, bytes, found->second)) return 0;
+    }
+    if (recorder != nullptr) {
+        if (const auto gpuCleared = expandHtileOnGpu(*recorder, target, bytes)) {
+            const auto generation = GuestMemory::CollectWrites(target.htileAddress, bytes);
+            std::lock_guard lock(htileReadsMutex());
+            htileReads()[target.htileAddress] = generation;
+            return *gpuCleared;
+        }
     }
     std::vector<std::uint32_t> words(bytes / 4u);
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -1442,6 +1530,35 @@ std::size_t HtileDepthClearBytes_nid_no_patch(std::span<const std::uint32_t> cod
     if (address == 0u || (address & 15u) != 0u) return 0u;
     const auto bytes = static_cast<std::uint64_t>(packet[1]) * 1024u;
     return address <= std::numeric_limits<std::uint64_t>::max() - bytes ? static_cast<std::size_t>(bytes) : 0u;
+}
+
+void NoteHtileMaskOnGpu(const Context& context, std::uint64_t address, std::size_t bytes, std::uint32_t mask, std::uint32_t value) {
+    if (!HtileGpuExpansion() || bytes == 0) return;
+    auto* recorder = RecorderFor(context);
+    if (recorder == nullptr) return;
+    const auto end = address + bytes;
+    std::uint64_t note = 0;
+    bool covers = false;
+    for (const auto& write : recorder->PendingWritesOver(address, bytes)) {
+        if (write.note <= note) continue;
+        note = write.note;
+        covers = write.begin <= address && write.end >= end;
+    }
+    if (!covers) note = 0;
+    auto& gpu = HtileGpu();
+    std::lock_guard lock(gpu.mutex);
+    std::erase_if(gpu.masks, [&](const HtileMaskWrite& write) { return address < write.end && write.begin < end; });
+    if (note == 0) return;
+    constexpr std::size_t KeptMasks = 64;
+    if (gpu.masks.size() >= KeptMasks) gpu.masks.erase(gpu.masks.begin());
+    gpu.masks.push_back({address, end, mask, value, note});
+}
+
+void SetHtileFillOnGpu(const Recorder* recorder, HtileFillOnGpu fill) {
+    auto& gpu = HtileGpu();
+    std::lock_guard lock(gpu.mutex);
+    if (fill) gpu.fills[recorder] = std::move(fill);
+    else gpu.fills.erase(recorder);
 }
 
 void NoteHtileDepthClear(std::uint64_t htileAddress, std::size_t bytes, std::size_t nativeBytes) {
