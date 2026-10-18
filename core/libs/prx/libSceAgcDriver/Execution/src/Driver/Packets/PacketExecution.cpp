@@ -10,6 +10,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
 #include <cstdlib>
 #include <functional>
@@ -211,7 +212,21 @@ void Driver::execute(const Submission& submission) {
                 continue;
             }
         }
-        if (pipelined && DrawPipeline::Queue0().Busy() && !keepsDrawPipeline(packet, header, opcode)) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, header == FlipPacketHeader ? 0xffu : opcode);
+        // S1: a WAIT_REG_MEM whose memory already passes, which no queued item writes or labels and
+        // no recorded batch has pending writes over, passes at its entry after a drain as well
+        // (waitMemory's WaitSatisfiedUnchecked): the draw pipeline keeps running.
+        // APS5_NO_SATISFIED_WAIT_KEEP=1 drains as before.
+        static const bool satisfiedWaitKeep = std::getenv("APS5_NO_SATISFIED_WAIT_KEEP") == nullptr;
+        bool keptForWait = false;
+        if (pipelined && satisfiedWaitKeep && !predicated && (opcode == 0x3c || opcode == 0x93) && header != RenderingWaitPacketHeader && DrawPipeline::Queue0().Busy() && packet.size() >= 6) {
+            const std::uint64_t awaited = packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u);
+            const auto bytes = Pm4::WaitAwaitedBytes(packet);
+            if (GuestMemory::Accessible(reinterpret_cast<const void*>(awaited), bytes) && Pm4::WaitSatisfiedUnchecked(packet) && !DrawPipeline::Queue0().Overlaps(awaited, bytes) && !DrawPipeline::Queue0().PendingLabel(awaited, bytes).has_value() && !Graphics::Recorder::SnapshotWriteOverlaps(awaited, bytes)) {
+                keptForWait = true;
+                DrawPipeline::Queue0().Note(DrawPipeline::Event::SatisfiedWaitKept);
+            }
+        }
+        if (pipelined && !keptForWait && DrawPipeline::Queue0().Busy() && !keepsDrawPipeline(packet, header, opcode)) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, header == FlipPacketHeader ? 0xffu : opcode);
         if (pipelined && predicated && DrawPipeline::Queue0().Busy() && DrawPipeline::Queue0().Overlaps(queue.predication.address, queue.predication.operation == 3 ? 8 : 4)) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, opcode);
         std::shared_lock deviceUse(deviceReplacement, std::defer_lock);
         if (opcode != 0x3c && opcode != 0x93 && header != RenderingWaitPacketHeader && header != FlipPacketHeader) deviceUse.lock();
