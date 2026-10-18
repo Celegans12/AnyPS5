@@ -248,8 +248,10 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
     }
     if (partialLastGroup) compute.partialThreads = partialGroups;
     // One workgroup (direct, 1x1x1 groups, or a thread count inside one group): workgroup-scope
-    // coherence for its glc reads (ShaderComputeStageInfo::singleWorkgroup). APS5_NO_SINGLE_GROUP_COHERENCE=1 off.
-    static const bool singleGroupCoherence = std::getenv("APS5_NO_SINGLE_GROUP_COHERENCE") == nullptr;
+    // coherence for its glc reads (ShaderComputeStageInfo::singleWorkgroup). Opt-in, APS5_SINGLE_GROUP_COHERENCE=1:
+    // with the BDA overlays (device-local buffers) it saves ~2 % of 0x80001c0d00 on the request bench, and one
+    // of four bench runs gave an unstable output hash, so it is not shown to be exact.
+    static const bool singleGroupCoherence = std::getenv("APS5_SINGLE_GROUP_COHERENCE") != nullptr;
     if (singleGroupCoherence && indirectArguments == 0) {
         const bool threads = (packet[4] & 0x20u) != 0;
         bool single = true;

@@ -57,7 +57,7 @@ struct ShaderComputeStageInfo {
     // writer of the buffer that can run beside them is an invocation of the same workgroup on the
     // same SM (other dispatches are ordered by the barriers between them). The SPIR-V reads them
     // through the L1-cached binding and s_barrier also orders buffer memory (SpirvRuntimeBuffer,
-    // SpirvFlowEmitter). APS5_NO_SINGLE_GROUP_COHERENCE=1 (driver) leaves it unset.
+    // SpirvFlowEmitter). Set only with APS5_SINGLE_GROUP_COHERENCE=1 (driver, opt-in: not shown exact).
     bool singleWorkgroup = false;
 
     [[nodiscard]] bool PartialGroups() const {
