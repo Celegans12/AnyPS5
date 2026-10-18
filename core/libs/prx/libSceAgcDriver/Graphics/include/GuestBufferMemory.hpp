@@ -260,6 +260,9 @@ public:
     // calls RecordCopyBacks (a dispatch), since a staged region's results reach guest memory by
     // that copy alone. Call before Upload.
     void AllowDeviceStaging() { stagingAllowed = true; }
+    // An address-based build whose dispatch is too small for its BDA overlays' copies to pay off
+    // (see resolveOverlays): its written elements stay in the imports.
+    void DisallowAddressStaging() { addressStaging = false; }
     void AllowAdjustedRegions() { adjustedRegions = true; }
     // Records the copy-in of every staged region anew for another use of this upload (a resource
     // cache hit, from ShaderResources::Revalidate, under GuestMemory::GpuMutex, once the imports
@@ -415,6 +418,11 @@ private:
         // The device refused the shadow (memory or allocations exhausted): the region takes the
         // path it would take without staging, in both upload stages.
         bool unstaged = false;
+        // A written descriptor range of an address-based build that lies inside one of the space's
+        // import regions, given a region of its own so it can be staged device-local (see
+        // resolveOverlays); the BDA table sends its guest addresses to this region's buffer instead
+        // of the import (AddressRanges). APS5_NO_BDA_STAGING=1 serves it from the import as before.
+        bool overlay = false;
     };
 
     // How [begin, end) lies against the space's base regions.
@@ -460,6 +468,12 @@ private:
     // and an atomic element or a size within the written-shadow window. Independent of the import,
     // so UploadPrepare and UploadFinish decide alike.
     bool stagingEligible(const Region& region, bool addressable) const;
+    // Whether a written descriptor range inside the space's base region `inside` becomes an
+    // overlay region (Region::overlay), and the UploadPrepare pass that keeps only the overlay
+    // clusters that can be staged exactly (one import region, within the staging window, no other
+    // descriptor range or own region crossing them).
+    bool overlayCandidate(const Region& inside, bool readOnly) const;
+    void resolveOverlays();
     bool bindableInPlace(std::uint64_t offset, bool addressable) const;
     // Records the import-to-buffer copies of the given gpuCopy regions into the open batch, with
     // the barriers that order them after earlier recorded writes and before the shaders reading them.
@@ -467,6 +481,7 @@ private:
     void takeHeapReferences();
     Context context;
     bool stagingAllowed = false;
+    bool addressStaging = true;
     bool adjustedRegions = false;
     GuestAllocations::Lease lease;
     // The cached address space this build maps through (its lease pins the ranges); `regions` then
@@ -485,6 +500,9 @@ private:
     bool regionsOverlap = false;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> readsOverBase;
+    // Descriptor ranges inside the space's base regions that its regions serve in place while
+    // overlays are possible (see resolveOverlays): an overlay crossing one is not staged.
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> servedInsideBase;
     std::vector<std::pair<std::uint64_t, std::vector<std::byte>>> heapReferences;
     std::vector<SnapshotUse> snapshotUses;
     std::uint64_t suspendedSpace = 0;
