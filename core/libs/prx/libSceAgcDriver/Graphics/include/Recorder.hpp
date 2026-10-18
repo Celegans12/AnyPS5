@@ -101,8 +101,23 @@ public:
     // The order the packet loop set for this thread's next dispatch, cleared: the queue key (0 =
     // none) and whether the title left it unordered after the queue's previous dispatch.
     static std::uint32_t TakeDispatchOrder(bool& unordered);
-    VkCommandBuffer OverlapCommands(std::uint32_t queueKey, VkAccessFlags* coveredAccess, bool& overlapped);
-    void DeferDispatchBarrier(std::uint32_t queueKey);
+    // The order set for this thread's next dispatch without taking it: its queue key when the title
+    // left it unordered, else 0 (a build's copy-ins recorded before that dispatch, see RunCommands).
+    static std::uint32_t PeekUnorderedDispatch();
+    // `owner`: the dispatch's resources object; a run never takes the same one twice (a template's
+    // data refresh would overwrite words an earlier dispatch of the run may still read).
+    VkCommandBuffer OverlapCommands(std::uint32_t queueKey, std::span<const void* const> owners, VkAccessFlags* coveredAccess, bool& overlapped);
+    void DeferDispatchBarrier(std::uint32_t queueKey, std::span<const void* const> owners);
+    // The copy-ins of an unordered dispatch joining an open run of its ring (GuestBufferMemory::
+    // recordGpuCopies): the command buffer without recording the deferred barrier when a run of
+    // `queueKey` is open and `owner` (the build's guest memory, whose shadows the copies fill) takes
+    // no part in it yet; `inRun` then says the copies need no leading barrier (the run's first
+    // dispatch ordered everything before the run for transfers too). Else Commands().
+    VkCommandBuffer RunCommands(std::uint32_t queueKey, const void* owner, bool& inRun);
+    // Work an overlapping dispatch owes after itself (its staged copy-backs): recorded right after
+    // the deferred barrier, wherever that is recorded. Only while a run is open.
+    void AfterRun(std::function<void(Recorder&)> work);
+    bool RunOpen() const { return open != nullptr && open->deferredDispatchQueue != 0; }
     // APS5_PROFILE_DRAW: deferred barriers recorded, by the path that recorded them (Commands, a draw
     // pass, key stores, a label store, the store run, sample dumps, Submit), cumulative.
     static constexpr std::size_t DeferredFlushSites = 7;
@@ -683,6 +698,10 @@ private:
         // See DeferDispatchBarrier: the guest queue key of the dispatch whose trailing barrier is
         // still owed (0: none).
         std::uint32_t deferredDispatchQueue = 0;
+        // The resources objects of the dispatches of the open run (see OverlapCommands).
+        std::vector<const void*> deferredRun;
+        // See AfterRun.
+        std::vector<std::function<void(Recorder&)>> afterRun;
         // The hazard tracker's accesses since its last simulated barrier (see NoteAccess).
         struct Tracker {
             struct Range {

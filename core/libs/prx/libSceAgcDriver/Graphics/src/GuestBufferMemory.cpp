@@ -4257,15 +4257,22 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         recorder->FlushKeyStoresOverlapping(region->begin, static_cast<std::size_t>(region->end - region->begin));
         recorder->FlushStoresOverlapping(region->begin, static_cast<std::size_t>(region->end - region->begin));
     }
-    const auto commands = recorder->Commands();
+    // The copy-ins of an unordered dispatch joining an open run of its ring (dispatch overlap, see
+    // Recorder::RunCommands) record no leading barrier: the run's first dispatch ordered everything
+    // before the run for transfers too, and the run's dispatches the title leaves unordered with this
+    // one (their copy-backs wait for the run's end, Recorder::AfterRun).
+    bool inRun = false;
+    const auto commands = Recorder::DispatchOverlapEnabled() ? recorder->RunCommands(Recorder::PeekUnorderedDispatch(), this, inRun) : recorder->Commands();
     const auto timing = recorder->BeginGpuTiming(StagingCopyInKey);
     if (Recorder::BarrierValidate()) {
         std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
         for (const auto* region : copies) reads.emplace_back(region->begin, region->end);
         recorder->NoteAccess(Recorder::CommandClass::StagingIn, Recorder::Access{reads, {}, {}, VK_PIPELINE_STAGE_TRANSFER_BIT});
     }
-    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-    Recorder::CountBarriers(Recorder::CommandClass::StagingIn);
+    if (!inRun) {
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        Recorder::CountBarriers(Recorder::CommandClass::StagingIn);
+    }
     bool stagedAny = false;
     std::uint64_t copiedBytes = 0;
     for (auto* region : copies) {

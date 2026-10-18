@@ -4591,11 +4591,10 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     bool unordered = false;
     const auto overlapQueue = Graphics::Recorder::TakeDispatchOrder(unordered);
     const auto* groupLimit = state->properties.limits.maxComputeWorkGroupCount;
-    const bool overlapCapable = overlapQueue != 0 && Graphics::Recorder::DispatchOverlapEnabled() && arguments == 0 && argumentImport == nullptr && record.shader->program->workgroupMemoryDwords == 0 && record.dataRefresh == RecordedDispatch::DataRefresh::None && state->checkpointMarker == nullptr && record.x <= groupLimit[0] && record.y <= groupLimit[1] && record.z <= groupLimit[2];
+    const bool overlapCapable = overlapQueue != 0 && Graphics::Recorder::DispatchOverlapEnabled() && arguments == 0 && argumentImport == nullptr && record.shader->program->workgroupMemoryDwords == 0 && state->checkpointMarker == nullptr && record.x <= groupLimit[0] && record.y <= groupLimit[1] && record.z <= groupLimit[2];
     if (timer.profile && overlapQueue != 0) {
         if (!overlapCapable) {
             if (arguments != 0 || argumentImport != nullptr) ++d.notIndirect;
-            else if (record.dataRefresh != RecordedDispatch::DataRefresh::None) ++d.notRefresh;
             else if (record.shader->program->workgroupMemoryDwords != 0) ++d.notLds;
             else ++d.notOther;
         }
@@ -4604,7 +4603,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         if (now - d.overlapReport >= std::chrono::seconds(10)) {
             d.overlapReport = now;
             const auto flushes = Graphics::Recorder::DeferredFlushCounts();
-            AgcDriver::ProfilePrint_nid_no_patch("[overlap] compute-ring dispatches (cumulative): %llu after an ordering packet, %llu unordered (%llu overlapped, %llu found no open deferred barrier); not deferring: indirect %llu, data refresh %llu, device LDS %llu, other %llu; %llu trailing barriers deferred, recorded by: commands %llu, draw pass %llu, key stores %llu, label store %llu, store run %llu, samples %llu, submit %llu\n", static_cast<unsigned long long>(d.orderedSeen), static_cast<unsigned long long>(d.unorderedSeen), static_cast<unsigned long long>(d.overlapped), static_cast<unsigned long long>(d.unorderedLost), static_cast<unsigned long long>(d.notIndirect), static_cast<unsigned long long>(d.notRefresh), static_cast<unsigned long long>(d.notLds), static_cast<unsigned long long>(d.notOther), static_cast<unsigned long long>(d.trailingDeferred), static_cast<unsigned long long>(flushes[0]), static_cast<unsigned long long>(flushes[1]), static_cast<unsigned long long>(flushes[2]), static_cast<unsigned long long>(flushes[3]), static_cast<unsigned long long>(flushes[4]), static_cast<unsigned long long>(flushes[5]), static_cast<unsigned long long>(flushes[6]));
+            AgcDriver::ProfilePrint_nid_no_patch("[overlap] compute-ring dispatches (cumulative): %llu after an ordering packet, %llu unordered (%llu overlapped, %llu found no open deferred barrier); not deferring: indirect %llu, (overlapped with a data refresh %llu), device LDS %llu, other %llu; %llu trailing barriers deferred, recorded by: commands %llu, draw pass %llu, key stores %llu, label store %llu, store run %llu, samples %llu, submit %llu\n", static_cast<unsigned long long>(d.orderedSeen), static_cast<unsigned long long>(d.unorderedSeen), static_cast<unsigned long long>(d.overlapped), static_cast<unsigned long long>(d.unorderedLost), static_cast<unsigned long long>(d.notIndirect), static_cast<unsigned long long>(d.notRefresh), static_cast<unsigned long long>(d.notLds), static_cast<unsigned long long>(d.notOther), static_cast<unsigned long long>(d.trailingDeferred), static_cast<unsigned long long>(flushes[0]), static_cast<unsigned long long>(flushes[1]), static_cast<unsigned long long>(flushes[2]), static_cast<unsigned long long>(flushes[3]), static_cast<unsigned long long>(flushes[4]), static_cast<unsigned long long>(flushes[5]), static_cast<unsigned long long>(flushes[6]));
         }
     }
     // The record phase split (APS5_PROFILE_DRAW, rows "record: ..." of the [dispatch] totals):
@@ -4641,7 +4640,8 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     }
     VkAccessFlags covered = 0;
     bool overlapped = false;
-    const auto commands = overlapCapable && unordered ? recorder.OverlapCommands(overlapQueue, &covered, overlapped) : recorder.Commands(&covered);
+    const std::array<const void*, 2> runOwners{record.resources.get(), record.resources != nullptr ? record.resources->MemoryOwner() : nullptr};
+    const auto commands = overlapCapable && unordered ? recorder.OverlapCommands(overlapQueue, runOwners, &covered, overlapped) : recorder.Commands(&covered);
     if (timer.profile && overlapCapable && unordered && !overlapped) ++d.unorderedLost;
     // The first dispatch of a run that may overlap records its leading barrier in full (bindless
     // heap writes included), whatever the previous command covered: it orders everything before the
@@ -4697,7 +4697,13 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     if (overlapped) {
         // The previous dispatch of this ring (unordered against this one by the title) is still
         // owed its trailing barrier; this one runs beside it, ordered after everything earlier by
-        // the leading barrier of the run's first dispatch.
+        // the leading barrier of the run's first dispatch. Its template data refresh (other buffers
+        // than any dispatch of the run reads: OverlapCommands) needs only the transfer's own barrier.
+        if (record.refreshed) {
+            Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT);
+            Graphics::Recorder::CountBarriers(CommandClass::TemplateDataRefresh);
+            ++d.notRefresh;
+        }
         ++d.overlapped;
     } else if ((covered & shaderAccess) == shaderAccess && barrierElision) {
         ++d.preBarriersSkipped;
@@ -4705,7 +4711,11 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     } else {
         const auto timing = recorder.BeginGpuTiming(CommandClass::DispatchLeading);
         const VkAccessFlags heapWrites = record.shader->program->bindlessHeap || overlapCapable ? VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT : 0u;
-        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT | heapWrites, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        // A run's first dispatch also orders the transfers recorded later in the run (the template
+        // data refreshes of its other dispatches) after everything before it.
+        const VkPipelineStageFlags leadingStages = overlapCapable ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+        const VkAccessFlags leadingAccess = overlapCapable ? VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT : VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, leadingStages, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT | heapWrites, leadingAccess);
         Graphics::Recorder::CountBarriers(CommandClass::DispatchLeading);
         recorder.EndGpuTiming(timing);
         ++d.preBarriersRecorded;
@@ -4770,7 +4780,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     recorder.EndGpuTiming(gpuTiming);
     if (overlapCapable) {
         // Recorded by the next command that is not an unordered dispatch of this ring.
-        recorder.DeferDispatchBarrier(overlapQueue);
+        recorder.DeferDispatchBarrier(overlapQueue, runOwners);
         ++d.trailingDeferred;
     } else {
         const auto trailingTiming = recorder.BeginGpuTiming(CommandClass::DispatchTrailing);
@@ -4781,7 +4791,8 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         recorder.MarkCovered(dispatchedAccess);
     }
     recordStep(PhaseRecordBind);
-    resources.MarkGpuWrites(recorder);
+    if (overlapCapable) resources.MarkGpuWritesInRun(recorder, record.resources);
+    else resources.MarkGpuWrites(recorder);
     recordStep(PhaseRecordMarks);
     // Only copied written buffers (and BDA fault checks) need work once the GPU is done; without them
     // the batch can signal its labels from the GPU.

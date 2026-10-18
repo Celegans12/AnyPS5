@@ -6061,6 +6061,36 @@ void ShaderResources::WriteBack() {
     }
 }
 
+void ShaderResources::MarkGpuWritesInRun(Recorder& recorder, const std::shared_ptr<ShaderResources>& self) {
+    if (!recorder.RunOpen() || !guestMemory.HasGpuCopies()) {
+        MarkGpuWrites(recorder);
+        return;
+    }
+    // As MarkGpuWrites, with the copy-backs (and the marks of the ranges they store) after the run.
+    const auto kind = guestMemory.HoldsLease() ? Recorder::ReadKind::AddressBased : Recorder::ReadKind::DispatchElement;
+    if (auto split = guestMemory.SplitInPlaceReads()) {
+        recorder.NotePendingReadList(std::move(split->space), kind);
+        recorder.NotePendingReads(split->own, kind);
+    } else {
+        recorder.NotePendingReads(guestMemory.InPlaceReads(), kind);
+    }
+    if (SkipWriteBack()) return;
+    for (std::size_t index = 0; index < storageTextures.size(); ++index) {
+        if (!storageWritten[index]) continue;
+        storageTextures[index]->MarkDirty();
+        if (!DepthSurfaceStoreBack(context, *storageTextures[index])) MarkStorageDepthWrites(context, storageTextures[index]);
+    }
+    // A storage store-back above may have recorded a command, which closed the run: then as MarkGpuWrites.
+    if (!recorder.RunOpen()) guestMemory.RecordCopyBacks(recorder);
+    recorder.NotePendingWrites(guestMemory.Writes());
+    guestMemory.MarkDirectWrites();
+    if (!recorder.RunOpen()) return;
+    recorder.AfterRun([self](Recorder& after) {
+        self->guestMemory.RecordCopyBacks(after);
+        self->guestMemory.MarkDirectWrites();
+    });
+}
+
 void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     // The ranges this use reads in place through their host imports (read-only and written elements
     // alike, and an address-based build's whole leased heaps), before the writes: a CPU store into

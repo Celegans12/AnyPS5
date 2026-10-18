@@ -254,6 +254,13 @@ public:
     // (storage images stay there; buffer ranges are noted so CPU reads wait); WriteBackBuffers runs
     // once the work completed.
     void MarkGpuWrites(Recorder& recorder);
+    // As MarkGpuWrites for a dispatch that left its trailing barrier deferred (Recorder::
+    // DeferDispatchBarrier): its staged copy-backs (and the direct-write marks they complete) are
+    // recorded after the run's deferred barrier (Recorder::AfterRun); `self` keeps the object.
+    void MarkGpuWritesInRun(Recorder& recorder, const std::shared_ptr<ShaderResources>& self);
+    // The guest memory whose staged shadows this object's uses fill (a dispatch run member, see
+    // Recorder::RunCommands).
+    const void* MemoryOwner() const { return &guestMemory; }
     void WriteBackBuffers(std::uint64_t shaderAddress = 0);
     // Whether WriteBackBuffers has anything the CPU must see (copied written buffers, BDA faults).
     bool NeedsCompletion() const { return (bda != nullptr && faultChecks) || guestMemory.HasCopiedWrites(); }
