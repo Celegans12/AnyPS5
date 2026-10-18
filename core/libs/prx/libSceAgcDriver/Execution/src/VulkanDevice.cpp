@@ -3577,6 +3577,7 @@ const Graphics::TextureService* VulkanDevice::BindlessService() const {
 
 void VulkanDevice::BindlessPresentWait() {
     if (!state->textureService || !state->recorder) return;
+    PerformanceTimer timing("Vulkan.BindlessPresentWait");
     const auto started = std::chrono::steady_clock::now();
     std::uint64_t serial = 0;
     {
@@ -3584,16 +3585,21 @@ void VulkanDevice::BindlessPresentWait() {
         serial = state->textureService->PresentSerial(*state->recorder);
         if (serial != 0 && !state->recorder->HasTimeline()) state->recorder->Sync();
     }
+    timing.Mark("present_serial");
     if (serial != 0 && state->recorder->HasTimeline()) state->recorder->WaitSerial(serial);
+    timing.Mark("wait_serial");
     const auto waited = serial != 0 ? static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()) : 0u;
     // Without the GPU lock: prepare the entries the revalidation will most likely find stale (see
     // TextureService::PrepareRevalidation; APS5_NO_EARLY_REVALIDATE=1 off).
     state->textureService->PrepareRevalidation();
+    timing.Mark("early_prepare");
     std::lock_guard lock(GuestMemory::GpuMutex());
+    timing.Mark("gpu_mutex_wait");
     if (serial != 0 && state->recorder->HasTimeline()) {
         Graphics::Recorder::AnnounceSyncSite(__builtin_return_address(0));
         state->recorder->FinishUpTo(serial);
     }
+    timing.Mark("finish_up_to");
     // The revalidation is one collect epoch (GuestMemory::EndCollectEpoch; APS5_NO_PRESENT_COLLECT_EPOCH=1:
     // a fresh epoch for every collect as before).
     static const bool presentEpoch = std::getenv("APS5_NO_PRESENT_COLLECT_EPOCH") == nullptr;
@@ -3605,7 +3611,9 @@ void VulkanDevice::BindlessPresentWait() {
         throw;
     }
     if (presentEpoch) GuestMemory::EndCollectEpoch();
+    timing.Mark("after_present_wait");
     if (Graphics::BindlessStatsRequested()) std::fprintf(stderr, "%s\n", state->textureService->TakeFrameLine(Graphics::BindlessOldPathNanoseconds()).c_str());
+    timing.Mark("frame_line");
 }
 
 Graphics::Context VulkanDevice::graphicsContext() const {
