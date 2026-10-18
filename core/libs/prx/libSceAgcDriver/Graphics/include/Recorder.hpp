@@ -85,6 +85,24 @@ public:
     // destination access mask.
     void MarkCovered(VkAccessFlags access);
     void MarkShaderReadsCovered() { MarkCovered(VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT); }
+    // Dispatch overlap (APS5_NO_DISPATCH_OVERLAP=1 off). A guest compute ring may run two of its
+    // dispatches at once unless the title orders them (a CS partial flush, a cache action, a release
+    // event, a wait, or any other packet between them); the packet loop says so per dispatch
+    // (SetDispatchOrder, thread-local, read once by the next recorded dispatch of the thread). A
+    // dispatch that may overlap the next one leaves its trailing barrier deferred
+    // (DeferDispatchBarrier, keyed by its guest queue); the next dispatch of the same queue that the
+    // title left unordered records into the same batch without a leading barrier (OverlapCommands),
+    // and every other path that records a command (Commands, StartDrawPass, the label and key store
+    // runs, sample dumps, Submit) records the deferred barrier first, so nothing else ever sees the
+    // dispatches' writes unordered. The leading barrier of the first dispatch of such a run orders
+    // everything recorded before the run, for all of them.
+    static bool DispatchOverlapEnabled();
+    static void SetDispatchOrder(std::uint32_t queueKey, bool unordered);
+    // The order the packet loop set for this thread's next dispatch, cleared: the queue key (0 =
+    // none) and whether the title left it unordered after the queue's previous dispatch.
+    static std::uint32_t TakeDispatchOrder(bool& unordered);
+    VkCommandBuffer OverlapCommands(std::uint32_t queueKey, VkAccessFlags* coveredAccess, bool& overlapped);
+    void DeferDispatchBarrier(std::uint32_t queueKey);
     struct DrawPassStart {
         VkCommandBuffer commands = VK_NULL_HANDLE;
         bool continued = false;
@@ -658,6 +676,9 @@ private:
         } run;
         // See Commands(): the accesses the last recorded command's trailing barrier covers.
         VkAccessFlags coveredAccess = 0;
+        // See DeferDispatchBarrier: the guest queue key of the dispatch whose trailing barrier is
+        // still owed (0: none).
+        std::uint32_t deferredDispatchQueue = 0;
         // The hazard tracker's accesses since its last simulated barrier (see NoteAccess).
         struct Tracker {
             struct Range {
@@ -785,6 +806,8 @@ private:
     void recordBarrier(VkCommandBuffer commands, VkPipelineStageFlags sourceStage, VkPipelineStageFlags destinationStage, VkAccessFlags sourceAccess, VkAccessFlags destinationAccess) const;
     // Opens a batch when none is open, without closing a store run (Commands() does both).
     void ensureOpen();
+    // Records a deferred dispatch trailing barrier (see DeferDispatchBarrier), if any.
+    void flushDeferredDispatch();
     void dropStaleHoldKept();
     // Records the run's pending store (vkCmdUpdateBuffer), if any.
     void flushPendingStore();

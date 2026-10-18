@@ -11,13 +11,141 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
+#include <algorithm>
 #include <cstdlib>
 #include <functional>
+#include <map>
+#include <mutex>
 #include <shared_mutex>
+#include <string>
 
 namespace AgcDriver::DriverDetail {
 
 namespace {
+
+// APS5_DISPATCH_GAPS=1 (diagnostic): per queue, which packets lie between two consecutive dispatches
+// of that queue (a submission boundary counts as one), so the dispatches the title leaves unordered
+// (no CS_PARTIAL_FLUSH, cache action, label or wait between them) can be counted. Printed as
+// "[dispatch-gaps]" every 10 s, the most frequent gap kinds per queue first.
+struct DispatchGaps {
+    std::mutex mutex;
+    std::map<std::uint32_t, std::map<std::string, std::uint64_t>> kinds;
+    std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
+};
+
+DispatchGaps& Gaps() {
+    static DispatchGaps gaps;
+    return gaps;
+}
+
+bool dispatchGapsEnabled() {
+    static const bool enabled = std::getenv("APS5_DISPATCH_GAPS") != nullptr;
+    return enabled;
+}
+
+void noteDispatchGap(std::uint32_t queueId, std::uint64_t serial, std::uint32_t opcode, std::span<const std::uint32_t> packet) {
+    struct Seen {
+        std::uint32_t queue = 0xffffffffu;
+        std::uint64_t serial = 0;
+        std::uint32_t mask = 0;
+        bool afterDispatch = false;
+    };
+    thread_local Seen seen;
+    if (seen.queue != queueId) seen = Seen{queueId};
+    // Bits: 0 submission boundary, 1 SET_SH_REG, 2 NOP, 3 CS_PARTIAL_FLUSH, 4 other EVENT_WRITE,
+    // 5 ACQUIRE_MEM, 6 RELEASE_MEM, 7 WAIT_REG_MEM, 8 WRITE_DATA, 9 DMA_DATA, 10 COND_EXEC,
+    // 11 SET_UCONFIG/CONFIG/CONTEXT, 12 other.
+    static constexpr const char* names[] = {"submit", "sh", "nop", "cspf", "event", "acquire", "release", "wait", "write", "dma", "cond", "uconfig", "other"};
+    if (seen.serial != serial) {
+        seen.serial = serial;
+        seen.mask |= 1u;
+    }
+    if (opcode == 0x15 || opcode == 0x16) {
+        if (seen.afterDispatch) {
+            std::string key;
+            for (std::uint32_t bit = 0; bit < 13; ++bit) {
+                if ((seen.mask & (1u << bit)) == 0) continue;
+                if (!key.empty()) key += '+';
+                key += names[bit];
+            }
+            if (key.empty()) key = "none";
+            if (opcode == 0x16) key += " (indirect)";
+            auto& gaps = Gaps();
+            std::lock_guard lock(gaps.mutex);
+            ++gaps.kinds[queueId][key];
+            const auto now = std::chrono::steady_clock::now();
+            if (now - gaps.reported >= std::chrono::seconds(10)) {
+                gaps.reported = now;
+                std::string text = "[dispatch-gaps] packets between consecutive dispatches of a queue (cumulative):";
+                for (const auto& [queue, counts] : gaps.kinds) {
+                    std::vector<std::pair<std::uint64_t, std::string>> sorted;
+                    for (const auto& [name, count] : counts) sorted.emplace_back(count, name);
+                    std::sort(sorted.rbegin(), sorted.rend());
+                    char head[32];
+                    std::snprintf(head, sizeof(head), "\n  queue 0x%x:", queue);
+                    text += head;
+                    for (std::size_t index = 0; index < sorted.size() && index < 10; ++index) text += " " + sorted[index].second + " " + std::to_string(sorted[index].first) + ";";
+                }
+                text += "\n";
+                AgcDriver::ProfilePrint_nid_no_patch("%s", text.c_str());
+            }
+        }
+        seen.afterDispatch = true;
+        seen.mask = 0;
+        return;
+    }
+    std::uint32_t bit = 12;
+    switch (opcode) {
+        case 0x76: bit = 1; break;
+        case 0x10: {
+            // Custom packets: the cache action and release event of the AGC wrappers count as such.
+            const auto custom = packet.empty() ? 0u : packet[0];
+            const auto sub = (custom >> 2u) & 0x3fu;
+            if ((custom & 0xfcu) == 0 || sub == 0x0b || sub == 0x0c) bit = 2;
+            else if (sub == 0x14) bit = 5;
+            else if (sub == 0x18) bit = 6;
+            else if (sub == 0x15) bit = 8;
+            else if (sub == 0x19) bit = 9;
+            break;
+        }
+        case 0x46: bit = packet.size() >= 2 && (packet[1] & 0x3fu) == 0x07u ? 3 : 4; break;
+        case 0x58: bit = 5; break;
+        case 0x49: bit = 6; break;
+        case 0x3c: case 0x93: bit = 7; break;
+        case 0x37: bit = 8; break;
+        case 0x50: bit = 9; break;
+        case 0x22: bit = 10; break;
+        case 0x68: case 0x69: case 0x79: bit = 11; break;
+        default: break;
+    }
+    seen.mask |= 1u << bit;
+}
+
+// Dispatch overlap (Graphics::Recorder::SetDispatchOrder): per compute ring, whether the title put
+// anything between this dispatch and the ring's previous one. Only SET_SH_REG and NOPs (markers
+// included) leave two dispatches unordered, as on the hardware, where nothing else separates them
+// without a CS partial flush; a submission boundary, a cache action, a release event, a wait, a
+// write and any other packet order them. Queue 0 (graphics) is never overlapped.
+struct RingOrder {
+    std::uint32_t queue = 0xffffffffu;
+    std::uint64_t serial = 0;
+    bool afterDispatch = false;
+};
+
+thread_local RingOrder ringOrder;
+
+void noteRingPacket(std::uint32_t queueId, std::uint64_t serial, std::uint32_t opcode, std::uint32_t header) {
+    if (ringOrder.queue != queueId || ringOrder.serial != serial) {
+        ringOrder = {queueId, serial, false};
+    }
+    if (opcode == 0x15 || opcode == 0x16) return;
+    if (opcode == 0x76) return;
+    if (opcode == 0x10) {
+        const auto sub = (header >> 2u) & 0x3fu;
+        if ((header & 0xfcu) == 0 || sub == 0x0b || sub == 0x0c) return;
+    }
+    ringOrder.afterDispatch = false;
+}
 
 bool orderedFills() {
     static const bool ordered = std::getenv("APS5_PIPELINE_DRAIN_FILLS") == nullptr;
@@ -191,6 +319,8 @@ void Driver::execute(const Submission& submission) {
         const auto packet = std::span(submission.commands).subspan(cursor, count);
         const auto opcode = (header >> 8u) & 0xffu;
         auto nextCursor = cursor + count;
+        if (dispatchGapsEnabled()) noteDispatchGap(submission.queue, submission.serial, opcode, packet);
+        if (submission.queue != 0 && Graphics::Recorder::DispatchOverlapEnabled()) noteRingPacket(submission.queue, submission.serial, opcode, header);
         if (APS5_ENABLE_TIMING_LOG && submission.queue == 0 && pendingFrameTiming == nullptr) includeTimingSubmission(submission, false);
         PerformanceContext timingContext(submission.queue == 0 ? pendingFrameTiming.get() : FrameTiming::Async());
         PerformanceTimer timing("Driver.Packet");
@@ -342,6 +472,13 @@ void Driver::execute(const Submission& submission) {
                     timed(&WorkerProfile::dispatchMs, [&] { resolveGroupAhead(submission, queue, cursor); });
                 }
             }
+            const bool ringOverlap = submission.queue != 0 && Graphics::Recorder::DispatchOverlapEnabled();
+            if (ringOverlap) Graphics::Recorder::SetDispatchOrder(submission.queue + 1u, ringOrder.afterDispatch);
+            struct ClearOrder {
+                bool active;
+                ~ClearOrder() { if (active) Graphics::Recorder::SetDispatchOrder(0, false); }
+            } clearOrder{ringOverlap};
+            if (ringOverlap) ringOrder.afterDispatch = true;
             timed(&WorkerProfile::dispatchMs, [&] {
                 try {
                     if (opcode == 0x15) dispatch(queue, packet, submission);

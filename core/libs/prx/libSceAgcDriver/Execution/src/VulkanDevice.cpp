@@ -3987,6 +3987,9 @@ struct DispatchCounters {
     std::uint64_t cacheHits = 0, cacheMisses = 0, cacheInvalidated = 0, templateRefreshed = 0, templateSameWords = 0;
     double templateRevalidateMs = 0;
     std::uint64_t procLookups = 0, preBarriersRecorded = 0, preBarriersSkipped = 0;
+    // Dispatch overlap (Recorder::DeferDispatchBarrier): trailing barriers deferred, and dispatches
+    // recorded without a leading barrier after an unordered one of their queue.
+    std::uint64_t trailingDeferred = 0, overlapped = 0;
     std::chrono::steady_clock::time_point cacheReport = std::chrono::steady_clock::now();
 };
 
@@ -4575,6 +4578,15 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     auto& resources = *record.resources;
     const auto arguments = record.arguments;
     const auto* argumentImport = record.argumentImport;
+    // Dispatch overlap (see Recorder::DeferDispatchBarrier): a direct dispatch of a guest compute
+    // ring that records nothing of its own around it (no indirect arguments, template data
+    // refresh, bindless heap service, device-memory LDS, split grid or checkpoint) may leave its
+    // trailing barrier deferred, and one the title left unordered after the previous such dispatch
+    // of its ring records without a leading barrier.
+    bool unordered = false;
+    const auto overlapQueue = Graphics::Recorder::TakeDispatchOrder(unordered);
+    const auto* groupLimit = state->properties.limits.maxComputeWorkGroupCount;
+    const bool overlapCapable = overlapQueue != 0 && Graphics::Recorder::DispatchOverlapEnabled() && arguments == 0 && argumentImport == nullptr && !record.shader->program->bindlessHeap && record.shader->program->workgroupMemoryDwords == 0 && record.dataRefresh == RecordedDispatch::DataRefresh::None && state->checkpointMarker == nullptr && record.x <= groupLimit[0] && record.y <= groupLimit[1] && record.z <= groupLimit[2];
     // The record phase split (APS5_PROFILE_DRAW, rows "record: ..." of the [dispatch] totals):
     // opening the batch, the keeps, the data refresh, the barriers with the bind and the dispatch
     // itself, the pending-write notes and marks (MarkGpuWrites), and the completion registration.
@@ -4608,7 +4620,8 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         Graphics::ServeBindlessTables(context, recorder, record.shader->program->bindlessTables);
     }
     VkAccessFlags covered = 0;
-    const auto commands = recorder.Commands(&covered);
+    bool overlapped = false;
+    const auto commands = overlapCapable && unordered ? recorder.OverlapCommands(overlapQueue, &covered, overlapped) : recorder.Commands(&covered);
     if (record.shader->program->bindlessHeap) covered = 0;
     recordStep(PhaseRecordCommands);
     recorder.Keep(record.objects);
@@ -4657,7 +4670,12 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     }
     // Results of earlier recorded work are visible to this dispatch, its own to everything after.
     constexpr VkAccessFlags shaderAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-    if ((covered & shaderAccess) == shaderAccess && barrierElision) {
+    if (overlapped) {
+        // The previous dispatch of this ring (unordered against this one by the title) is still
+        // owed its trailing barrier; this one runs beside it, ordered after everything earlier by
+        // the leading barrier of the run's first dispatch.
+        ++d.overlapped;
+    } else if ((covered & shaderAccess) == shaderAccess && barrierElision) {
         ++d.preBarriersSkipped;
         Graphics::Recorder::CountMerged(CommandClass::DispatchLeading);
     } else {
@@ -4726,12 +4744,18 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         }
     }
     recorder.EndGpuTiming(gpuTiming);
-    const auto trailingTiming = recorder.BeginGpuTiming(CommandClass::DispatchTrailing);
-    constexpr VkAccessFlags dispatchedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
-    Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, dispatchedAccess);
-    Graphics::Recorder::CountBarriers(CommandClass::DispatchTrailing);
-    recorder.EndGpuTiming(trailingTiming);
-    recorder.MarkCovered(dispatchedAccess);
+    if (overlapCapable) {
+        // Recorded by the next command that is not an unordered dispatch of this ring.
+        recorder.DeferDispatchBarrier(overlapQueue);
+        ++d.trailingDeferred;
+    } else {
+        const auto trailingTiming = recorder.BeginGpuTiming(CommandClass::DispatchTrailing);
+        constexpr VkAccessFlags dispatchedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, dispatchedAccess);
+        Graphics::Recorder::CountBarriers(CommandClass::DispatchTrailing);
+        recorder.EndGpuTiming(trailingTiming);
+        recorder.MarkCovered(dispatchedAccess);
+    }
     recordStep(PhaseRecordBind);
     resources.MarkGpuWrites(recorder);
     recordStep(PhaseRecordMarks);
@@ -5213,7 +5237,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         d.cacheReport = std::chrono::steady_clock::now();
         AgcDriver::ProfilePrint_nid_no_patch("[rescache] %llu hits, %llu misses, %llu invalidated, %zu entries (dispatch + draw); template hits: %llu refreshed the data buffers (revalidate %.1f ms), %llu had the same words; Find calls %llu, Touch calls %llu\n", static_cast<unsigned long long>(d.cacheHits), static_cast<unsigned long long>(d.cacheMisses), static_cast<unsigned long long>(d.cacheInvalidated), state->resourceCache.Size(), static_cast<unsigned long long>(d.templateRefreshed), d.templateRevalidateMs, static_cast<unsigned long long>(d.templateSameWords), static_cast<unsigned long long>(ResourceCache::Finds()), static_cast<unsigned long long>(ResourceCache::Touches()));
         const auto gate = Graphics::PipelineCreationGate::Shared().Totals();
-        AgcDriver::ProfilePrint_nid_no_patch("[vk] deviceProc lookups inside the device call: %llu (%.2f per dispatch); pre-dispatch barriers recorded %llu, skipped %llu; compute pipelines created %llu (%llu under the GPU mutex); creation gate: %llu waited %.1f s, %llu past the budget without waiting, peak %llu at once / %llu MiB estimated of a %llu MiB budget\n", static_cast<unsigned long long>(d.procLookups), d.profiledDispatches != 0 ? static_cast<double>(d.procLookups) / static_cast<double>(d.profiledDispatches) : 0.0, static_cast<unsigned long long>(d.preBarriersRecorded), static_cast<unsigned long long>(d.preBarriersSkipped), static_cast<unsigned long long>(computePipelinesCreated.load(std::memory_order_relaxed)), static_cast<unsigned long long>(computePipelinesCreatedLocked.load(std::memory_order_relaxed)), static_cast<unsigned long long>(gate.waited), static_cast<double>(gate.waitNanoseconds) / 1e9, static_cast<unsigned long long>(gate.unwaited), static_cast<unsigned long long>(gate.peakInFlight), static_cast<unsigned long long>(gate.peakBytes >> 20u), static_cast<unsigned long long>(gate.budgetBytes >> 20u));
+        AgcDriver::ProfilePrint_nid_no_patch("[vk] deviceProc lookups inside the device call: %llu (%.2f per dispatch); pre-dispatch barriers recorded %llu, skipped %llu; overlap: %llu trailing barriers deferred, %llu dispatches overlapped; compute pipelines created %llu (%llu under the GPU mutex); creation gate: %llu waited %.1f s, %llu past the budget without waiting, peak %llu at once / %llu MiB estimated of a %llu MiB budget\n", static_cast<unsigned long long>(d.procLookups), d.profiledDispatches != 0 ? static_cast<double>(d.procLookups) / static_cast<double>(d.profiledDispatches) : 0.0, static_cast<unsigned long long>(d.preBarriersRecorded), static_cast<unsigned long long>(d.preBarriersSkipped), static_cast<unsigned long long>(d.trailingDeferred), static_cast<unsigned long long>(d.overlapped), static_cast<unsigned long long>(computePipelinesCreated.load(std::memory_order_relaxed)), static_cast<unsigned long long>(computePipelinesCreatedLocked.load(std::memory_order_relaxed)), static_cast<unsigned long long>(gate.waited), static_cast<double>(gate.waitNanoseconds) / 1e9, static_cast<unsigned long long>(gate.unwaited), static_cast<unsigned long long>(gate.peakInFlight), static_cast<unsigned long long>(gate.peakBytes >> 20u), static_cast<unsigned long long>(gate.budgetBytes >> 20u));
         reportRecipes();
         reportDispatchMove();
     }

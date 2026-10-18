@@ -30,8 +30,10 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <tuple>
+#include <utility>
 #include "prx/libc/include/general/AtomicSharedPtr.hpp"
 
 namespace AgcDriver::Graphics {
@@ -1369,8 +1371,61 @@ std::uint64_t Recorder::ReapsWithWork() {
     return holdCounters.reapsWithWork;
 }
 
+namespace {
+
+struct DispatchOrder {
+    std::uint32_t queueKey = 0;
+    bool unordered = false;
+};
+
+thread_local DispatchOrder nextDispatchOrder;
+
+}
+
+bool Recorder::DispatchOverlapEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_DISPATCH_OVERLAP") == nullptr;
+    return enabled;
+}
+
+void Recorder::SetDispatchOrder(std::uint32_t queueKey, bool unordered) {
+    nextDispatchOrder = {queueKey, unordered};
+}
+
+std::uint32_t Recorder::TakeDispatchOrder(bool& unordered) {
+    const auto order = std::exchange(nextDispatchOrder, DispatchOrder{});
+    unordered = order.unordered;
+    return order.queueKey;
+}
+
+void Recorder::flushDeferredDispatch() {
+    if (open == nullptr || open->deferredDispatchQueue == 0) return;
+    open->deferredDispatchQueue = 0;
+    // The trailing barrier recordDispatch (VulkanDevice.cpp) leaves out of an overlapping run.
+    constexpr VkAccessFlags dispatchedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
+    recordBarrier(open->commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, dispatchedAccess);
+    CountBarriers(CommandClass::DispatchTrailing);
+    open->coveredAccess = dispatchedAccess;
+}
+
+VkCommandBuffer Recorder::OverlapCommands(std::uint32_t queueKey, VkAccessFlags* coveredAccess, bool& overlapped) {
+    overlapped = queueKey != 0 && open != nullptr && open->deferredDispatchQueue == queueKey && !open->renderPass.open && !open->run.open;
+    if (!overlapped) return Commands(coveredAccess);
+    GuestMemory::AssertGpuLockHeld("Recorder::OverlapCommands");
+    if (coveredAccess != nullptr) *coveredAccess = 0;
+    // The barrier stays owed (any other command recorded before this dispatch's own still records
+    // it first); the dispatch then defers its own trailing barrier, which covers both.
+    return open->commands;
+}
+
+void Recorder::DeferDispatchBarrier(std::uint32_t queueKey) {
+    Require(open != nullptr && queueKey != 0, "a deferred dispatch barrier has no batch");
+    open->deferredDispatchQueue = queueKey;
+    open->coveredAccess = 0;
+}
+
 VkCommandBuffer Recorder::Commands(VkAccessFlags* coveredAccess) {
     ensureOpen();
+    flushDeferredDispatch();
     // Work recorded after a draw's render pass or an inline store run must see their writes: the
     // pass's end and the run's trailing barrier go in first (a per-batch run waits for Submit, or
     // for a caller whose ranges overlap a queued store: FlushStores).
@@ -1387,6 +1442,7 @@ void Recorder::MarkCovered(VkAccessFlags access) {
 
 Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access) {
     ensureOpen();
+    flushDeferredDispatch();
     auto& pass = open->renderPass;
     if (!pass.open || forced || (countingSamples && segmentMode() && !segmentSlotReady(*open))) {
         const auto commands = Commands();
@@ -1471,6 +1527,7 @@ bool Recorder::AnyQueuedKeyStore(const std::function<bool(std::uint64_t, std::ui
 
 void Recorder::FlushKeyStores() {
     if (open == nullptr || open->keyStores.empty()) return;
+    flushDeferredDispatch();
     recordKeyStores(true);
 }
 
@@ -1551,6 +1608,7 @@ void Recorder::ensureOpen() {
 void Recorder::RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const std::byte> bytes, std::uint64_t address) {
     if (bytes.empty()) return;
     ensureOpen();
+    flushDeferredDispatch();
     auto& run = open->run;
     const VkDeviceSize end = offset + bytes.size();
     storeCount.fetch_add(1, std::memory_order_relaxed);
@@ -1743,6 +1801,7 @@ bool Recorder::AnyQueuedStore(const std::function<bool(std::uint64_t, std::uint6
 
 void Recorder::FlushStores() {
     if (open == nullptr || open->run.queued.empty()) return;
+    flushDeferredDispatch();
     closeStoreRun(false);
 }
 
@@ -1828,7 +1887,11 @@ void reportBarriers() {
 }
 
 bool Recorder::GpuTimingEnabled() {
-    static const bool enabled = std::getenv("APS5_PROFILE_GPU") != nullptr;
+    // APS5_PROFILE_GPU=0 is off (a later --env of a run script can then clear an earlier =1).
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_PROFILE_GPU");
+        return value != nullptr && std::string_view(value) != "0" && *value != '\0';
+    }();
     return enabled;
 }
 
@@ -2141,6 +2204,7 @@ void Recorder::PrepareSampleSlot() {
     GuestMemory::AssertGpuLockHeld("Recorder::PrepareSampleSlot");
     if (!countingSamples || !segmentMode()) return;
     ensureOpen();
+    flushDeferredDispatch();
     Require(!open->renderPass.open, "a sample slot is prepared inside a render pass");
     if (!segmentSlotReady(*open)) takeSegmentPool(*open);
 }
@@ -2331,6 +2395,7 @@ bool Recorder::DumpSamples(VkDeviceAddress target, std::uint64_t address) {
     GuestMemory::AssertGpuLockHeld("Recorder::DumpSamples");
     if (target == 0 || !gpuSampleCounter()) return false;
     countingSamples = true;
+    flushDeferredDispatch();
     if (segmentMode()) {
         ensureOpen();
         if (address != 0 && LabelRunsPerBatch() && pendingSamples.size() < SegmentFoldCapacity && open->queuedDumps < DumpFoldCapacity) {
@@ -3493,6 +3558,7 @@ void Recorder::Submit() {
     dropStaleHoldKept();
     if (open == nullptr) return;
     GuestMemory::AssertGpuLockHeld("Recorder::Submit");
+    flushDeferredDispatch();
     if (!open->keyStores.empty()) recordKeyStores(false);
     if (open->renderPass.open) endOpenRenderPass();
     const bool segments = segmentMode();
