@@ -31,11 +31,21 @@ bool DispatchItemsEnabled() {
     return enabled;
 }
 
+bool DispatchMissItemsEnabled() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_PIPELINE_DISPATCH_MISSES");
+        return DispatchItemsEnabled() && text != nullptr && text[0] != '\0' && text[0] != '0';
+    }();
+    return enabled;
+}
+
 enum class ItemFallback : std::size_t { Miss, Reads, NoRecipe, Writes, Verify, Count };
 constexpr std::array<const char*, static_cast<std::size_t>(ItemFallback::Count)> ItemFallbackNames{"miss", "reads", "no recipe", "writes", "verify"};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ItemFallback::Count)> itemFallbacks{};
 std::atomic<std::uint64_t> itemCommits{0};
 std::atomic<std::uint64_t> itemRebuilds{0};
+std::atomic<std::uint64_t> missItemCommits{0};
+std::atomic<std::uint64_t> missItemRefusals{0};
 
 void NoteItemFallback(ItemFallback reason) {
     itemFallbacks[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
@@ -53,7 +63,7 @@ void ReportDispatchItems(bool profile) {
         std::snprintf(item, sizeof(item), " %s %llu", ItemFallbackNames[i], static_cast<unsigned long long>(itemFallbacks[i].load(std::memory_order_relaxed)));
         drained += item;
     }
-    std::fprintf(stderr, "[dispatch-item] %llu commit items (%llu recipes rebuilt on the committer); drained instead, cumulative:%s\n", static_cast<unsigned long long>(itemCommits.load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemRebuilds.load(std::memory_order_relaxed)), drained.c_str());
+    std::fprintf(stderr, "[dispatch-item] %llu commit items (%llu recipes rebuilt on the committer), %llu miss items (%llu refused on the committer); drained instead, cumulative:%s\n", static_cast<unsigned long long>(itemCommits.load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemRebuilds.load(std::memory_order_relaxed)), static_cast<unsigned long long>(missItemCommits.load(std::memory_order_relaxed)), static_cast<unsigned long long>(missItemRefusals.load(std::memory_order_relaxed)), drained.c_str());
 }
 
 }
@@ -320,7 +330,9 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
                 for (const auto& variant : found->second->variants) appendEntryRegions(*variant, reads);
             }
         }
-        if (!entryFound || noDispatchCache || stampValidate()) {
+        if (!entryFound && !noDispatchCache && !stampValidate() && DispatchMissItemsEnabled()) {
+            readsClear = true;
+        } else if (!entryFound || noDispatchCache || stampValidate()) {
             NoteItemFallback(ItemFallback::Miss);
         } else if (verifyDataHits()) {
             NoteItemFallback(ItemFallback::Verify);
@@ -353,16 +365,19 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
     timing.Mark("lookup_cache");
     std::vector<DrawPipeline::Range> itemWrites;
     bool pipelined = false;
+    bool missItem = false;
     if (readsClear) {
         if (cached && keepVariant != nullptr && keepVariant->recipe.load(std::memory_order_acquire) != nullptr) {
             bool bounded = false;
             itemWrites = DispatchWriteRanges(*compiledResult, bounded);
             pipelined = bounded;
             if (!bounded) NoteItemFallback(ItemFallback::Writes);
+        } else if (DispatchMissItemsEnabled()) {
+            missItem = true;
         } else {
             NoteItemFallback(ItemFallback::NoRecipe);
         }
-        if (!pipelined && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+        if (!pipelined && !missItem && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
     }
     if (cached) {
         require(keepVariant != nullptr && keepVariant->shader == registeredShader, "dispatch cache belongs to another registered shader");
@@ -450,6 +465,15 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
     if (recordQueuedLabelsAfterCapture(submission.queue, captured)) {
         dispatchAttempt(queue, packet, submission, indirectArguments, forceFresh);
         return;
+    }
+    if (missItem) {
+        bool bounded = false;
+        itemWrites = DispatchWriteRanges(*compiledResult, bounded);
+        if (!bounded || !deferredLabels().labels.empty()) {
+            missItem = false;
+            NoteItemFallback(ItemFallback::Writes);
+            if (DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+        }
     }
     phaseTiming.Phase(PhaseQueuedLabels);
     const auto& compiled = *compiledResult;
@@ -546,6 +570,50 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
                     keepVariant->recipe.store(std::move(builtRecipe), std::memory_order_release);
                     VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Attach, false);
                 }
+            } catch (const std::exception& error) {
+                char where[64];
+                std::snprintf(where, sizeof(where), "compute shader 0x%llx: ", static_cast<unsigned long long>(address));
+                throw std::runtime_error(where + std::string(error.what()));
+            }
+        }, std::move(itemWrites));
+        ReportDispatchItems(profile);
+        return;
+    }
+    if (missItem) {
+        const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
+        const auto queueId = submission.queue;
+        auto attachTo = keepVariant != nullptr ? keepVariant : attachVariant;
+        missItemCommits.fetch_add(1, std::memory_order_relaxed);
+        DrawPipeline::Queue0().Enqueue([this, localDevice = std::move(localDevice), result = compiledResult, captured = std::move(captured), shaderMemory, registeredShader, groups, address, queueId, dispatchThreads, attachTo = std::move(attachTo), keepVariant, dataHit, epoch] {
+            DrawPipeline::FollowEpoch(epoch);
+            GuestMemory::SetCurrentPacket(0x15, queueId);
+            const auto& compiledCommit = *result;
+            std::vector<Graphics::GuestMemorySnapshot> commitSnapshots;
+            commitSnapshots.reserve(captured.size());
+            for (const auto& region : captured) commitSnapshots.push_back({region.guestAddress, region.bytes});
+            const bool noteWrites = writeEvidenceEnabled() || traceCapSync();
+            try {
+                auto prepared = localDevice->PrepareDispatch(compiledCommit, commitSnapshots, dispatchThreads, address);
+                std::shared_ptr<const Recipe> builtRecipe;
+                {
+                    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Dispatch);
+                    std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                    recordLabelsForPacket(localDevice.get(), queueId);
+                    if (noteWrites && writerKeyedEvidence()) noteWrittenBuffers(address, queueId, compiledCommit);
+                    localDevice->Dispatch(compiledCommit, groups[0], groups[1], groups[2], commitSnapshots, address, std::move(prepared), attachTo != nullptr ? &builtRecipe : nullptr);
+                }
+                if (noteWrites && !writerKeyedEvidence()) noteWrittenBuffers(address, queueId, compiledCommit);
+                if (builtRecipe != nullptr) {
+                    if (dataHit && keepVariant != nullptr) {
+                        auto own = std::make_shared<Recipe>(*builtRecipe);
+                        own->dataWordsHash = Graphics::ShaderResources::DataWordsHash({ShaderRecompiler::ShaderStage::Compute, keepVariant->compiled.get(), 0});
+                        builtRecipe = std::move(own);
+                    }
+                    attachTo->recipe.store(std::move(builtRecipe), std::memory_order_release);
+                    VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Attach, false);
+                }
+            } catch (const ShaderRefusal&) {
+                missItemRefusals.fetch_add(1, std::memory_order_relaxed);
             } catch (const std::exception& error) {
                 char where[64];
                 std::snprintf(where, sizeof(where), "compute shader 0x%llx: ", static_cast<unsigned long long>(address));
