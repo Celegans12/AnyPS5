@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
+#include <optional>
 #include <array>
 #include <atomic>
 #include <cstdio>
@@ -228,6 +229,9 @@ void recordCopies(const UnitShadow& shadow, const std::vector<SlabCopies>& copie
     const auto& context = shadow.context;
     using CommandClass = Recorder::CommandClass;
     auto* recorder = Recorder::Active();
+    // Shared driver state (the shadows serve every queue): recorded into the main lane (see Recorder::LaneSwitch).
+    std::optional<Recorder::LaneSwitch> laneSwitch;
+    if (recorder != nullptr && Recorder::ThreadLane() != 0) laneSwitch.emplace(recorder, 0);
     std::unique_ptr<CommandBatch> batch;
     VkCommandBuffer commands = VK_NULL_HANDLE;
     VkAccessFlags covered = 0;
