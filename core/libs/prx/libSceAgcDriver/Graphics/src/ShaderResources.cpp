@@ -129,6 +129,7 @@ struct CachedTexture {
     std::array<std::uint64_t, 4> untracked{};
     std::uint64_t blockSince = 0;
     std::array<std::uint64_t, 2> blockGuard{};
+    GuestMemory::Commitment blockLayout;
 };
 
 // Entries in use order (front = most recent) with a hash index by key: a lookup is O(1) and the
@@ -704,7 +705,7 @@ struct SnapshotCompareCounters {
     std::atomic<std::uint64_t> skippedBlocks{0};
     std::atomic<std::uint64_t> hashedBytes{0};
     std::atomic<std::uint64_t> skippedBytes{0};
-    std::array<std::atomic<std::uint64_t>, 6> untrackedKinds{};
+    std::array<std::atomic<std::uint64_t>, 8> untrackedKinds{};
     std::atomic<std::int64_t> lastReport{0};
 };
 
@@ -744,7 +745,7 @@ void noteSnapshotCompare(SnapshotCompare reason, bool equal, bool narrowed, cons
     counters.hashedBytes.fetch_add(match.hashedBytes, std::memory_order_relaxed);
     counters.skippedBytes.fetch_add(match.skippedBytes, std::memory_order_relaxed);
     if (kinds != nullptr) {
-        const std::array<std::size_t, 6> values{kinds->covered, kinds->hinted, kinds->outside, kinds->hostRegion, kinds->unhinted, kinds->refused};
+        const std::array<std::size_t, 8> values{kinds->covered, kinds->hinted, kinds->outside, kinds->hostRegion, kinds->unhinted, kinds->refused, kinds->partial, kinds->layoutChanged};
         for (std::size_t i = 0; i < values.size(); ++i) counters.untrackedKinds[i].fetch_add(values[i], std::memory_order_relaxed);
     }
     const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -764,7 +765,9 @@ void noteSnapshotCompare(SnapshotCompare reason, bool equal, bool narrowed, cons
     const auto hostRegion = take(3);
     const auto unhinted = take(4);
     const auto refused = take(5);
-    AgcDriver::ProfilePrint_nid_no_patch("[texhash] snapshot compares (10 s) by reason:%s; %llu narrowed to written blocks; blocks hashed %llu (%.1f MiB), skipped %llu (%.1f MiB); untracked ranges' blocks: write-watched %llu, hinted %llu, outside the arena %llu, host region %llu, unwatched without hint %llu, walk refused %llu\n", reasons.c_str(), static_cast<unsigned long long>(counters.narrowed.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.hashedBlocks.exchange(0, std::memory_order_relaxed)), static_cast<double>(counters.hashedBytes.exchange(0, std::memory_order_relaxed)) / 1048576.0, static_cast<unsigned long long>(counters.skippedBlocks.exchange(0, std::memory_order_relaxed)), static_cast<double>(counters.skippedBytes.exchange(0, std::memory_order_relaxed)) / 1048576.0, covered, hinted, outside, hostRegion, unhinted, refused);
+    const auto partial = take(6);
+    const auto layoutChanged = take(7);
+    AgcDriver::ProfilePrint_nid_no_patch("[texhash] snapshot compares (10 s) by reason:%s; %llu narrowed to written blocks; blocks hashed %llu (%.1f MiB), skipped %llu (%.1f MiB); untracked ranges' blocks: write-watched %llu, hinted %llu, outside the arena %llu, host region %llu, unwatched without hint %llu, walk refused %llu; partly readable %llu, layout changed %llu\n", reasons.c_str(), static_cast<unsigned long long>(counters.narrowed.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.hashedBlocks.exchange(0, std::memory_order_relaxed)), static_cast<double>(counters.hashedBytes.exchange(0, std::memory_order_relaxed)) / 1048576.0, static_cast<unsigned long long>(counters.skippedBlocks.exchange(0, std::memory_order_relaxed)), static_cast<double>(counters.skippedBytes.exchange(0, std::memory_order_relaxed)) / 1048576.0, covered, hinted, outside, hostRegion, unhinted, refused, partial, layoutChanged);
 }
 
 const std::vector<std::uint8_t>& pendingBlocks(std::uint64_t address, std::size_t bytes, std::size_t count) {
@@ -804,15 +807,16 @@ std::array<std::uint64_t, 2> untrackedGuard(std::uint64_t address, std::size_t b
     return {GuestMemory::ForgetSerial(), recorder != nullptr ? recorder->NewestWriteNote(address, bytes) : 0};
 }
 
-std::uint64_t untrackedBaseline(std::uint64_t address, std::size_t bytes) {
+std::uint64_t untrackedBaseline(std::uint64_t address, std::size_t bytes, GuestMemory::Commitment& layout) {
+    layout = {};
     if (!UntrackedBlocksEnabled()) return 0;
     thread_local std::vector<std::uint8_t>* staleSlot = nullptr;
     auto& stale = ShaderRecompiler::ThreadOwned(staleSlot);
     stale.assign(GuestMemory::HashBlockCount(address, bytes), 1);
-    return GuestMemory::WalkUntrackedBlocks(address, bytes, 0, stale);
+    return GuestMemory::WalkUntrackedBlocks(address, bytes, 0, stale, nullptr, nullptr, &layout);
 }
 
-bool untrackedStillMatches(std::uint64_t address, std::size_t bytes, std::span<const ContentHash::Hash128> hashes, std::uint64_t& since, std::array<std::uint64_t, 2>& guard, SnapshotCompare reason) {
+bool untrackedStillMatches(std::uint64_t address, std::size_t bytes, std::span<const ContentHash::Hash128> hashes, std::uint64_t& since, std::array<std::uint64_t, 2>& guard, GuestMemory::Commitment& layout, SnapshotCompare reason) {
     const auto count = hashes.size();
     if (!UntrackedBlocksEnabled() || count != GuestMemory::HashBlockCount(address, bytes)) {
         since = 0;
@@ -824,17 +828,41 @@ bool untrackedStillMatches(std::uint64_t address, std::size_t bytes, std::span<c
     auto& stale = ShaderRecompiler::ThreadOwned(staleSlot);
     stale.assign(count, 1);
     GuestMemory::UntrackedBlocks kinds;
-    const auto walked = GuestMemory::WalkUntrackedBlocks(address, bytes, trusted ? since : 0, stale, &kinds);
+    thread_local GuestMemory::Commitment* layoutSlot = nullptr;
+    auto& current = ShaderRecompiler::ThreadOwned(layoutSlot);
+    const bool layoutWalk = GuestMemory::UntrackedLayoutWalks();
+    const auto walked = GuestMemory::WalkUntrackedBlocks(address, bytes, trusted ? since : 0, stale, &kinds, layoutWalk ? &layout : nullptr, layoutWalk ? &current : nullptr);
     const auto& pending = pendingBlocks(address, bytes, count);
     const bool pendingAny = std::any_of(pending.begin(), pending.end(), [](std::uint8_t flag) { return flag != 0; });
     for (std::size_t i = 0; i < pending.size() && i < stale.size(); ++i) stale[i] = static_cast<std::uint8_t>(stale[i] | pending[i]);
     const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureCompare);
     GuestMemory::FlushGpuWrites(address, bytes);
     GuestMemory::BlockMatch match;
-    const bool equal = GuestMemory::CommittedBlocksMatchMarked(address, bytes, hashes, stale, &match);
+    const bool equal = GuestMemory::CommittedBlocksMatchMarked(address, bytes, hashes, stale, &match, layoutWalk ? &current : nullptr);
+    static const bool verifyBlocks = std::getenv("APS5_VERIFY_UNTRACKED_BLOCKS") != nullptr;
+    if (verifyBlocks && equal) {
+        static std::atomic<std::uint64_t> checked{0}, differed{0}, compares{0};
+        thread_local std::vector<std::uint8_t>* cleanSlot = nullptr;
+        auto& clean = ShaderRecompiler::ThreadOwned(cleanSlot);
+        clean.assign(count, 0);
+        std::size_t cleanBlocks = 0;
+        for (std::size_t i = 0; i < count && i < stale.size(); ++i) {
+            if (stale[i] != 0) continue;
+            clean[i] = 1;
+            ++cleanBlocks;
+        }
+        if (cleanBlocks != 0) {
+            GuestMemory::BlockMatch verify;
+            const bool still = GuestMemory::CommittedBlocksMatchMarked(address, bytes, hashes, clean, &verify);
+            checked.fetch_add(cleanBlocks, std::memory_order_relaxed);
+            if (!still) differed.fetch_add(1, std::memory_order_relaxed);
+            if (compares.fetch_add(1, std::memory_order_relaxed) % 20000 == 19999 || !still) std::fprintf(stderr, "[texhash] verify: %llu compares, %llu blocks proved clean re-hashed, %llu compares with a clean block that differs%c", static_cast<unsigned long long>(compares.load()), static_cast<unsigned long long>(checked.load()), static_cast<unsigned long long>(differed.load()), 10);
+        }
+    }
     if (equal && walked != 0 && (now[0] & 1u) == 0 && !pendingAny) {
         since = walked;
         guard = now;
+        if (layoutWalk) std::swap(layout, current);
     } else {
         since = 0;
     }
@@ -1293,7 +1321,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                     }
                     return untracked[0] == 0 ? SnapshotCompare::Untracked : SnapshotCompare::HintMoved;
                 }();
-                if (!collected && *keys == DccKeys::Uncompressed) return untrackedStillMatches(address, bytes, it->hashes, it->blockSince, it->blockGuard, reason);
+                if (!collected && *keys == DccKeys::Uncompressed) return untrackedStillMatches(address, bytes, it->hashes, it->blockSince, it->blockGuard, it->blockLayout, reason);
                 return snapshotStillMatches(address, bytes, it->hashes, collected ? it->generation : 0, it->committed, reason);
             };
             const auto unchanged = [&] {
@@ -1393,7 +1421,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         if (pending) counters.pendingReads.fetch_add(1, std::memory_order_relaxed);
         if (!pending && generation == 0 && !entry.committed.has_value() && *keys == DccKeys::Uncompressed) {
             entry.blockGuard = untrackedGuard(address, bytes);
-            entry.blockSince = (entry.blockGuard[0] & 1u) == 0 ? untrackedBaseline(address, bytes) : 0;
+            entry.blockSince = (entry.blockGuard[0] & 1u) == 0 ? untrackedBaseline(address, bytes, entry.blockLayout) : 0;
         }
         std::vector<std::byte> snapshot(bytes);
         ReadTextureSurface(resource, *keys, snapshot);
@@ -3051,19 +3079,38 @@ bool LoopGuardEnabled() {
     return enabled;
 }
 
+bool AddressReuseEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_ADDRESS_DRAW_REUSE") == nullptr;
+    return enabled;
+}
+
+void CompleteSnapshotWrites(std::span<const GuestMemorySnapshot> snapshots) {
+    auto* recorder = Recorder::Active();
+    if (recorder == nullptr || Recorder::InCompletion()) return;
+    for (const auto& snapshot : snapshots) {
+        if (snapshot.bytes.empty() || !recorder->PendingWriteOverlaps(snapshot.address, snapshot.bytes.size())) continue;
+        Recorder::CountSync(4);
+        recorder->SyncThrough(snapshot.address, snapshot.bytes.size());
+    }
+}
+
 }
 
 void ShaderResources::noteReusable() {
     // Taken whether or not the object turns out reusable: the lookups' records are this build's.
     captureValidation();
     reusable = false;
+    addressReuse = false;
     directRegions.clear();
+    addressWrites.clear();
     if (storageTableBindings[0] != std::numeric_limits<std::size_t>::max() || storageTableBindings[1] != std::numeric_limits<std::size_t>::max()) return;
-    if (guestMemory.HasCopiedWrites() || HoldsLease() || usesBda || !multisampleSources.empty() || (bda != nullptr && LoopGuardEnabled())) return;
+    const bool addressBased = usesBda && drawBuild && AddressReuseEnabled();
+    if (guestMemory.HasCopiedWrites() || (!addressBased && (HoldsLease() || usesBda)) || !multisampleSources.empty() || (bda != nullptr && LoopGuardEnabled())) return;
     if (std::any_of(storageTextures.begin(), storageTextures.end(), [](const auto& texture) { return texture != nullptr && DepthSurfaceAt(texture->Descriptor().baseAddress); })) return;
+    if (addressBased && std::any_of(tableStages.begin(), tableStages.end(), [](const TableStage& table) { return std::find(table.elementTextures.begin(), table.elementTextures.end(), std::numeric_limits<std::size_t>::max()) != table.elementTextures.end(); })) return;
     if (std::any_of(textures.begin(), textures.end(), [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->RefreshedPerUse(); })) return;
     if (TemplateDataRefresh() && std::any_of(allocations.begin(), allocations.end(), [](const Allocation& allocation) { return allocation.buffer != nullptr && !allocation.guest && allocation.role != ShaderRecompiler::DescriptorRole::ImageTableMap && allocation.size > MaxRefreshBytes; })) return;
-    const auto regions = guestMemory.DirectRegions();
+    const auto regions = addressBased ? guestMemory.SpaceRegions() : guestMemory.DirectRegions();
     if (!regions.has_value()) return;
     for (const auto& [begin, end] : *regions) {
         // No reconcile here: the upload just took these imports, and the set is about to be recorded
@@ -3082,7 +3129,9 @@ void ShaderResources::noteReusable() {
             region.committedEnd = cut.committedEnd;
         }
     }
+    if (addressBased) addressWrites = guestMemory.DirectWrites();
     reusable = true;
+    addressReuse = addressBased;
 }
 
 std::uint64_t ShaderResources::DepthGuardRefusals() {
@@ -3091,8 +3140,9 @@ std::uint64_t ShaderResources::DepthGuardRefusals() {
 
 bool ShaderResources::NeverReusable(std::span<const CompiledShader> shaders) {
     const bool loopGuard = LoopGuardEnabled();
-    return std::any_of(shaders.begin(), shaders.end(), [loopGuard](const CompiledShader& shader) {
-        return shader.program != nullptr && std::any_of(shader.program->bindings.begin(), shader.program->bindings.end(), [loopGuard](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable || (loopGuard && binding.role == ShaderRecompiler::DescriptorRole::FaultBuffer); });
+    const bool addressReuse = AddressReuseEnabled();
+    return std::any_of(shaders.begin(), shaders.end(), [loopGuard, addressReuse](const CompiledShader& shader) {
+        return shader.program != nullptr && std::any_of(shader.program->bindings.begin(), shader.program->bindings.end(), [loopGuard, addressReuse](const ShaderRecompiler::DescriptorBinding& binding) { return (binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable && !addressReuse) || (loopGuard && binding.role == ShaderRecompiler::DescriptorRole::FaultBuffer); });
     });
 }
 
@@ -3458,6 +3508,19 @@ bool touchSampledTextures(const std::vector<std::shared_ptr<Texture>>& textures)
 
 // Turns the lookups' records into this object's per-texture validation records (see
 // ValidatedSurface); the last record of an object is the freshest.
+namespace {
+
+std::array<std::uint64_t, 4> untrackedRangeStamp(std::uint64_t address, std::size_t bytes) {
+    static const bool disabled = std::getenv("APS5_NO_UNTRACKED_FAST_PROOF") != nullptr;
+    if (disabled) return {};
+    const auto epoch = GuestMemory::CollectEpoch();
+    if (epoch == 0 || bytes == 0 || (GuestMemory::ForgetSerial() & 1u) != 0) return {};
+    const auto* recorder = Recorder::Active();
+    return {epoch, GuestMemory::NewestStamp(address, bytes), GuestMemory::ForgetStamp(address, bytes), recorder != nullptr ? recorder->NewestWriteNote(address, bytes) : 0};
+}
+
+}
+
 void ShaderResources::captureValidation() {
     const auto record = [](const void* object) -> const LookupRecord* {
         const auto& log = lookupLog();
@@ -3469,6 +3532,16 @@ void ShaderResources::captureValidation() {
     validatedTextures.assign(textures.size(), {});
     for (std::size_t i = 0; i < textures.size(); ++i) {
         if (const auto* found = record(textures[i].get())) validatedTextures[i] = {found->resource, found->bytes, found->keys, found->committed.has_value() ? found->committedGeneration : found->generation, 0, found->source, found->depth, true, found->committed};
+        auto& surface = validatedTextures[i];
+        if (surface.valid && !surface.depth && GuestMemory::CollectWrites(surface.resource.baseAddress, static_cast<std::size_t>(surface.bytes)) == 0) surface.untracked = untrackedRangeStamp(surface.resource.baseAddress, static_cast<std::size_t>(surface.bytes));
+    }
+    storageUntracked.assign(storageTextures.size(), {});
+    for (std::size_t i = 0; i < storageTextures.size(); ++i) {
+        const auto* image = storageTextures[i].get();
+        if (image == nullptr) continue;
+        const auto address = image->Descriptor().baseAddress;
+        const auto bytes = static_cast<std::size_t>(image->GuestBytes());
+        if (GuestMemory::CollectWrites(address, bytes) == 0) storageUntracked[i] = untrackedRangeStamp(address, bytes);
     }
     lookupLog().clear();
 }
@@ -3532,13 +3605,18 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         const auto bytes = static_cast<std::size_t>(surface.bytes);
         surface.collected = GuestMemory::CollectWrites(address, bytes);
         bool committedProof = false;
+        bool untracked = false;
         if (surface.collected == 0) {
-            if (surface.source != nullptr || !surface.committed.has_value() || !CommittedProofEnabled()) return fail(FastFail::Collect);
-            thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* runsSlot = nullptr;
-            auto& runs = ShaderRecompiler::ThreadOwned(runsSlot);
-            surface.collected = GuestMemory::CollectCommittedWrites(address, bytes, runs);
-            if (surface.collected == 0 || runs != *surface.committed || Recorder::SnapshotWriteOverlaps(address, bytes) || !GuestMemory::UnchangedCommittedSince(runs, surface.generation)) return fail(FastFail::Committed);
-            committedProof = true;
+            if (surface.source == nullptr && surface.committed.has_value() && CommittedProofEnabled()) {
+                thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* runsSlot = nullptr;
+                auto& runs = ShaderRecompiler::ThreadOwned(runsSlot);
+                surface.collected = GuestMemory::CollectCommittedWrites(address, bytes, runs);
+                if (surface.collected == 0 || runs != *surface.committed || Recorder::SnapshotWriteOverlaps(address, bytes) || !GuestMemory::UnchangedCommittedSince(runs, surface.generation)) return fail(FastFail::Committed);
+                committedProof = true;
+            } else {
+                if (surface.untracked[0] == 0 || untrackedRangeStamp(address, bytes) != surface.untracked) return fail(FastFail::Collect);
+                untracked = true;
+            }
         }
         const auto* source = surface.source;
         if (!keyProofs) {
@@ -3577,9 +3655,9 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         }
         if (source != nullptr) {
             if (!source->Cached()) return fail(FastFail::Evicted);
-            queries.push_back({address, bytes, source->Generation()});
+            if (!untracked) queries.push_back({address, bytes, source->Generation()});
             images.push_back(source);
-        } else if (!committedProof) {
+        } else if (!committedProof && !untracked) {
             queries.push_back({address, bytes, surface.generation});
         }
     }
@@ -3595,7 +3673,11 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
             depthGuardRefusals.fetch_add(1, std::memory_order_relaxed);
             return fail(FastFail::Depth);
         }
-        if (GuestMemory::CollectWrites(address, bytes) == 0) return fail(FastFail::Collect);
+        bool untracked = false;
+        if (GuestMemory::CollectWrites(address, bytes) == 0) {
+            if (i >= storageUntracked.size() || storageUntracked[i][0] == 0 || untrackedRangeStamp(address, bytes) != storageUntracked[i]) return fail(FastFail::Collect);
+            untracked = true;
+        }
         if (own.dccAddress != 0) {
             // Refresh's unchanged branch (its key compare against the keys the content was
             // uploaded under, through the image's proof; the memory query below), minus its
@@ -3605,7 +3687,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         }
         if (!unchanged) query(address, address + bytes, image, nullptr, {i, true, false});
         if (!image->Cached()) return fail(FastFail::Evicted);
-        queries.push_back({address, bytes, image->Generation()});
+        if (!untracked) queries.push_back({address, bytes, image->Generation()});
         images.push_back(image);
     }
     if (!pending.empty()) {
@@ -3832,7 +3914,46 @@ bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std
     return false;
 }
 
-bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
+bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report, std::span<const GuestMemorySnapshot> snapshots) {
+    if (!addressReuse) return proveBuild(shaders, report);
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto refuse = [&](AddressReuse reason) {
+        CountAddressReuse(reason, profile ? static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()) : 0);
+        return false;
+    };
+    CountAddressReuseProof();
+    ProofReport proof;
+    auto& outcome = report != nullptr ? *report : proof;
+    outcome = {ProofPath::Full, ProofFailure::Other};
+    if (!reusable) return refuse(AddressReuse::NotReusable);
+    if (InUse()) return refuse(AddressReuse::InUse);
+    CompleteSnapshotWrites(snapshots);
+    if (!guestMemory.SameSnapshots(snapshots)) return refuse(AddressReuse::Snapshots);
+    struct Suspend {
+        GuestBufferMemory& memory;
+        bool armed = true;
+        ~Suspend() {
+            if (armed) memory.SuspendSpace();
+        }
+    } suspend{guestMemory};
+    try {
+        if (!guestMemory.ResumeSpace()) return refuse(AddressReuse::Space);
+        if (!proveBuild(shaders, &outcome)) return refuse(outcome.failure == ProofFailure::Imports ? AddressReuse::Imports : AddressReuse::Proof);
+        if (!guestMemory.SpaceImportsCurrent()) {
+            outcome.failure = ProofFailure::Imports;
+            return refuse(AddressReuse::Imports);
+        }
+    } catch (const std::exception&) {
+        outcome.failure = ProofFailure::Other;
+        return refuse(AddressReuse::Threw);
+    }
+    suspend.armed = false;
+    reuseProved = true;
+    return true;
+}
+
+bool ShaderResources::proveBuild(std::span<const CompiledShader> shaders, ProofReport* report) {
     if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
     if (!reusable || shaders.empty()) return false;
     if (std::any_of(storageTextures.begin(), storageTextures.end(), [](const auto& texture) { return texture != nullptr && DepthSurfaceAt(texture->Descriptor().baseAddress); })) return false;
@@ -3940,6 +4061,19 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     FastFail reason = FastFail::Count;
     bool accepted = false;
     bool fast = !noFast && fastRevalidate(serialBefore, refreshed, reason, overlapping, accepted);
+    {
+        static const bool verifyUntracked = std::getenv("APS5_VERIFY_UNTRACKED_PROOFS") != nullptr;
+        const bool anyUntracked = std::any_of(validatedTextures.begin(), validatedTextures.end(), [](const ValidatedSurface& surface) { return surface.untracked[0] != 0; }) || std::any_of(storageUntracked.begin(), storageUntracked.end(), [](const auto& stamp) { return stamp[0] != 0; });
+        if (verifyUntracked && fast && anyUntracked) {
+            static std::atomic<std::uint64_t> checked{0}, disagreed{0};
+            const auto saved = validatedTextures;
+            const auto savedStorage = storageUntracked;
+            if (!fullWalk()) disagreed.fetch_add(1, std::memory_order_relaxed);
+            validatedTextures = saved;
+            storageUntracked = savedStorage;
+            if (checked.fetch_add(1, std::memory_order_relaxed) % 100000 == 99999) std::fprintf(stderr, "[verify-untracked] %llu fast proofs over untracked memory checked by the full walk, %llu disagreed%c", static_cast<unsigned long long>(checked.load()), static_cast<unsigned long long>(disagreed.load()), 10);
+        }
+    }
     // T1 (design_cpu_final M3, rule RT1): a Pending failure whose overlapping images are foreign
     // to the surfaces is resolved by the own objects' refresh (what the walk's lookups would do to
     // them) and the fast proof run again, which is then authoritative (it accepts what stays
@@ -4608,7 +4742,7 @@ DescriptorCache::Stats DescriptorCache::Counters() const {
     return stats;
 }
 
-std::uint64_t ShaderResources::guestBufferBytes(std::span<const std::uint32_t> words) const {
+std::uint64_t ShaderResources::GuestBufferBytes(const Context& context, std::span<const std::uint32_t> words) {
     const ShaderRecompiler::ShaderBufferResource descriptor{{words[0], words[1], words[2], words[3]}};
     const auto address = descriptor.Base48();
     auto byteSize = descriptor.GetSize();
@@ -4628,6 +4762,10 @@ std::uint64_t ShaderResources::guestBufferBytes(std::span<const std::uint32_t> w
         }
     }
     return byteSize;
+}
+
+std::uint64_t ShaderResources::guestBufferBytes(std::span<const std::uint32_t> words) const {
+    return GuestBufferBytes(context, words);
 }
 
 std::size_t ShaderResources::addGuestBuffer(std::span<const std::uint32_t> words, const ColorTarget* target, std::uint64_t indexAddress, std::size_t indexBytes, bool written, bool atomic, bool read) {
@@ -5634,7 +5772,7 @@ ShaderResources::DrawBindings::~DrawBindings() {
 
 std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const {
     std::vector<MovedBuffer> moved;
-    if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return moved;
+    if (_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) return moved;
     for (const auto& shader : shaders) {
         if (shader.program == nullptr) return std::nullopt;
         for (const auto& binding : shader.program->bindings) {
@@ -5658,7 +5796,7 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
                 const auto* words = binding.guestDescriptor.data() + static_cast<std::size_t>(element) * 4u;
                 const ShaderRecompiler::ShaderBufferResource descriptor{{words[0], words[1], words[2], words[3]}};
                 const auto address = descriptor.Base48();
-                const auto size = descriptor.GetSize();
+                const auto size = GuestBufferBytes(context, std::span<const std::uint32_t>(words, 4));
                 const auto index = kept->allocations[element];
                 const auto& item = allocations[index];
                 const bool empty = size == 0 || address == 0;
@@ -5677,6 +5815,7 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
             }
         }
     }
+    if (usesBda && !moved.empty()) return std::nullopt;
     return moved;
 }
 
@@ -5952,6 +6091,45 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
 
 void ShaderResources::CheckFaults(std::uint64_t shaderAddress) const {
     if (bda) bda->CheckFault(shaderAddress);
+}
+
+std::shared_ptr<const void> ShaderResources::BeginUse() {
+    if (!addressReuse) return {};
+    struct Use {
+        Use(std::shared_ptr<std::atomic<std::uint32_t>> counter, std::shared_ptr<const void> hold, bool reusedSpace) : uses(std::move(counter)), space(std::move(hold)), reused(reusedSpace) {
+            uses->fetch_add(1, std::memory_order_acq_rel);
+            if (reused) HoldReusedSpace(true);
+        }
+        ~Use() {
+            if (reused) HoldReusedSpace(false);
+            uses->fetch_sub(1, std::memory_order_acq_rel);
+        }
+        std::shared_ptr<std::atomic<std::uint32_t>> uses;
+        std::shared_ptr<const void> space;
+        bool reused;
+    };
+    return std::make_shared<const Use>(usesInFlight, guestMemory.SpaceHold(), std::exchange(reuseProved, false));
+}
+
+void ShaderResources::CompleteUse() {
+    if (!addressReuse) {
+        CheckFaults();
+        return;
+    }
+    try {
+        CheckFaults();
+    } catch (...) {
+        reusable = false;
+        throw;
+    }
+    if (SkipWriteBack()) return;
+    for (const auto& [begin, end] : addressWrites) GuestMemory::MarkWritten(begin, static_cast<std::size_t>(end - begin));
+}
+
+void ShaderResources::EndUse() noexcept {
+    if (!addressReuse) return;
+    reuseProved = false;
+    guestMemory.SuspendSpace();
 }
 
 void ShaderResources::WriteBackBuffers(std::uint64_t shaderAddress) {

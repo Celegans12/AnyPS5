@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -15,6 +16,8 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
+#include <cstdlib>
 #include <limits>
 #include <shared_mutex>
 #include <cstdio>
@@ -1148,6 +1151,44 @@ bool RoutesToNativeDepthOwner(const DepthTarget& target) {
     return std::ranges::any_of(depthGuards(), [&](const auto& range) { return range.active->load(std::memory_order_acquire) && target.htileAddress < range.address + range.bytes && range.address < target.htileAddress + bytes; });
 }
 
+struct HtileSyncCounters {
+    std::atomic<std::uint64_t> reads{0};
+    std::atomic<std::uint64_t> pending{0};
+    std::atomic<std::uint64_t> open{0};
+    std::atomic<std::uint64_t> signaled{0};
+    std::atomic<std::uint64_t> batches{0};
+    std::atomic<std::uint64_t> exact{0};
+    std::atomic<std::uint64_t> larger{0};
+    std::atomic<std::uint64_t> partial{0};
+    std::atomic<std::uint64_t> cleared{0};
+    std::atomic<std::uint64_t> waitNs{0};
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+HtileSyncCounters& HtileSyncs() {
+    static HtileSyncCounters counters;
+    return counters;
+}
+
+void reportHtileSyncs() {
+    auto& counters = HtileSyncs();
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = counters.lastReport.load();
+    if (nowMs - last < 10000 || !counters.lastReport.compare_exchange_strong(last, nowMs)) return;
+    const auto take = [](std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.exchange(0, std::memory_order_relaxed)); };
+    const auto reads = take(counters.reads);
+    const auto pending = take(counters.pending);
+    const auto open = take(counters.open);
+    const auto signaled = take(counters.signaled);
+    const auto batches = take(counters.batches);
+    const auto exact = take(counters.exact);
+    const auto larger = take(counters.larger);
+    const auto partial = take(counters.partial);
+    const auto cleared = take(counters.cleared);
+    const auto waitMs = static_cast<double>(take(counters.waitNs)) / 1e6;
+    AgcDriver::ProfilePrint_nid_no_patch("[htile] store-back reads (10 s): %llu, %llu over pending GPU writes waiting %.1f ms (writer batch open %llu, signaled %llu, batches finished %llu; writer range = htile %llu, larger %llu, partial %llu); %llu found cleared\n", reads, pending, waitMs, open, signaled, batches, exact, larger, partial, cleared);
+}
+
 VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarget& target) {
     if (target.htileAddress == 0) return 0;
     const auto bytes = static_cast<std::size_t>(HtileMetadataBytes(target.extent));
@@ -1160,10 +1201,28 @@ VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarg
         if (found != htileReads().end() && found->second != 0 && GuestMemory::UnchangedSince(target.htileAddress, bytes, found->second)) return 0;
     }
     std::vector<std::uint32_t> words(bytes / 4u);
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    auto& syncs = HtileSyncs();
+    const auto readStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto writer = profile && recorder != nullptr ? recorder->DescribePendingWrite(target.htileAddress, bytes) : std::nullopt;
     GuestMemory::Read(target.htileAddress, std::as_writable_bytes(std::span(words)), 4);
     const bool uniform = std::all_of(words.begin(), words.end(), [&](std::uint32_t word) { return word == words.front(); });
     VkImageAspectFlags cleared = target.firstSlice == 0 || uniform ? VK_IMAGE_ASPECT_DEPTH_BIT | (target.htileStencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u) : 0u;
     for (const auto word : words) cleared &= HtileFillClears(word, target.htileStencil);
+    if (profile) {
+        syncs.reads.fetch_add(1, std::memory_order_relaxed);
+        if (writer.has_value()) {
+            syncs.pending.fetch_add(1, std::memory_order_relaxed);
+            syncs.waitNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - readStart).count()), std::memory_order_relaxed);
+            if (writer->open) syncs.open.fetch_add(1, std::memory_order_relaxed);
+            if (writer->signaled) syncs.signaled.fetch_add(1, std::memory_order_relaxed);
+            syncs.batches.fetch_add(writer->batchesToFinish, std::memory_order_relaxed);
+            const bool covers = writer->rangeBegin <= target.htileAddress && writer->rangeEnd >= target.htileAddress + bytes;
+            (covers && writer->rangeBegin == target.htileAddress && writer->rangeEnd == target.htileAddress + bytes ? syncs.exact : covers ? syncs.larger : syncs.partial).fetch_add(1, std::memory_order_relaxed);
+        }
+        if (cleared != 0) syncs.cleared.fetch_add(1, std::memory_order_relaxed);
+        reportHtileSyncs();
+    }
     auto generation = collected;
     if (cleared != 0) {
         for (auto& word : words) word = expandedHtileWord(word, target.htileStencil, cleared);
