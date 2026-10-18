@@ -39,6 +39,11 @@ bool DispatchMissItemsEnabled() {
     return enabled;
 }
 
+bool DrainAfterDispatchItems() {
+    static const bool drain = std::getenv("APS5_PIPELINE_DISPATCH_ITEM_DRAIN") != nullptr;
+    return drain;
+}
+
 enum class ItemFallback : std::size_t { Miss, Reads, NoRecipe, Writes, Verify, Count };
 constexpr std::array<const char*, static_cast<std::size_t>(ItemFallback::Count)> ItemFallbackNames{"miss", "reads", "no recipe", "writes", "verify"};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ItemFallback::Count)> itemFallbacks{};
@@ -576,6 +581,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
                 throw std::runtime_error(where + std::string(error.what()));
             }
         }, std::move(itemWrites));
+        if (DrainAfterDispatchItems()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
         ReportDispatchItems(profile);
         return;
     }
@@ -620,6 +626,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
                 throw std::runtime_error(where + std::string(error.what()));
             }
         }, std::move(itemWrites));
+        if (DrainAfterDispatchItems()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
         ReportDispatchItems(profile);
         return;
     }

@@ -705,7 +705,17 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, commitQueue, commitPacket, epoch, programs = std::move(programs), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData)] {
             DrawPipeline::FollowEpoch(epoch);
             GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
-            commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey);
+            try {
+                commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey);
+            } catch (const std::runtime_error& error) {
+                std::string where = "draw commit (programs";
+                for (const auto& program : programs) {
+                    char text[24];
+                    std::snprintf(text, sizeof(text), " 0x%llx", static_cast<unsigned long long>(program.binary.codeAddress));
+                    where += text;
+                }
+                throw std::runtime_error(where + "): " + error.what());
+            }
         };
         auto held = std::make_shared<decltype(commit)>(std::move(commit));
         std::vector<DrawPipeline::Range> reads;
