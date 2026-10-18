@@ -64,6 +64,7 @@
 #include <set>
 #include <algorithm>
 #include <cstring>
+#include <map>
 #include <deque>
 #include <limits>
 #include <list>
@@ -3776,6 +3777,9 @@ struct DepthPresyncCounters {
     std::atomic<std::uint64_t> waitedUs{0};
     std::atomic<std::uint64_t> submitted{0};
     std::atomic<std::int64_t> lastReport{0};
+    // The newest pending writer of the HTILE range at each pre-sync (Recorder::OriginOfNote).
+    std::mutex writersMutex;
+    std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> writers;
 };
 
 DepthPresyncCounters& DepthPresyncs() {
@@ -3805,6 +3809,22 @@ std::uint64_t VulkanDevice::PresyncDrawDepth(const Graphics::State& graphics) {
         counters.pending.fetch_add(1, std::memory_order_relaxed);
         const auto info = state->recorder->DescribePendingWrite(depth.htileAddress, bytes);
         if (!info.has_value()) return 0;
+        if (profile) {
+            const auto origin = Graphics::Recorder::OriginOfNote(state->recorder->NewestWriteNote(depth.htileAddress, bytes));
+            char key[224];
+            if (origin.has_value()) {
+                const bool exact = origin->begin == depth.htileAddress && origin->end == depth.htileAddress + bytes;
+                std::snprintf(key, sizeof(key), "q0x%x op 0x%02x prog 0x%llx %s 0x%llx+0x%llx%s", origin->queue, origin->opcode & 0xffffu, static_cast<unsigned long long>(origin->program), exact ? "exact" : "other", static_cast<unsigned long long>(origin->begin), static_cast<unsigned long long>(origin->end - origin->begin), info->open ? " open" : "");
+                if (origin->kernel) {
+                    const auto length = std::strlen(key);
+                    std::snprintf(key + length, sizeof(key) - length, " mask-kernel m 0x%x v 0x%x", origin->mask, origin->value);
+                }
+            } else {
+                std::snprintf(key, sizeof(key), "unattributed%s", info->open ? " open" : "");
+            }
+            std::lock_guard writersLock(counters.writersMutex);
+            ++counters.writers[key].first;
+        }
         serial = info->serial;
         if (info->open) {
             serial = state->recorder->SubmitAndEpoch();
@@ -3820,7 +3840,15 @@ std::uint64_t VulkanDevice::PresyncDrawDepth(const Graphics::State& graphics) {
         const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
         auto last = counters.lastReport.load();
         if (nowMs - last >= 10000 && counters.lastReport.compare_exchange_strong(last, nowMs)) {
-            AgcDriver::ProfilePrint_nid_no_patch("[htile-presync] (cumulative) %llu depth draws checked, %llu would wait in the store-back, %llu pre-synced (%llu submitted the open batch) waiting %.0f ms without the GPU mutex\n", static_cast<unsigned long long>(counters.checked.load()), static_cast<unsigned long long>(counters.pending.load()), static_cast<unsigned long long>(counters.waited.load()), static_cast<unsigned long long>(counters.submitted.load()), counters.waitedUs.load() / 1000.0);
+            std::string writerText;
+            {
+                std::lock_guard writersLock(counters.writersMutex);
+                std::vector<std::pair<std::string, std::pair<std::uint64_t, std::uint64_t>>> sorted(counters.writers.begin(), counters.writers.end());
+                counters.writers.clear();
+                std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.second.first > b.second.first; });
+                for (std::size_t i = 0; i < sorted.size() && i < 8; ++i) writerText += " [" + sorted[i].first + ": " + std::to_string(sorted[i].second.first) + "]";
+            }
+            AgcDriver::ProfilePrint_nid_no_patch("[htile-presync] (cumulative) %llu depth draws checked, %llu would wait in the store-back, %llu pre-synced (%llu submitted the open batch) waiting %.0f ms without the GPU mutex; newest writers (10 s):%s\n", static_cast<unsigned long long>(counters.checked.load()), static_cast<unsigned long long>(counters.pending.load()), static_cast<unsigned long long>(counters.waited.load()), static_cast<unsigned long long>(counters.submitted.load()), counters.waitedUs.load() / 1000.0, writerText.c_str());
         }
     }
     return serial;
