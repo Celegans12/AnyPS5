@@ -1129,10 +1129,13 @@ std::shared_ptr<PreparedDraw> PrepareDraw(const Context& context, const State& s
     if (cacheable) {
         prepared->contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, prepared->indexBytes, !trimKey);
         prepared->keyed = true;
+        // An entry found now often cannot serve the draw (its buffers moved: a miss after all), so
+        // stage A is made anyway unless APS5_SPLIT_DRAW_CACHED=0; a draw the cache serves drops it.
+        static const bool buildCached = [] { const char* text = std::getenv("APS5_SPLIT_DRAW_CACHED"); return text == nullptr || std::strcmp(text, "0") != 0; }();
         if (const auto cached = SharedResourceCache().Peek(prepared->contentKey); cached != nullptr && !cached->InUse()) {
             prepared->cachedAtPrepare = true;
             counters.cachedAtPrepare.fetch_add(1, std::memory_order_relaxed);
-            return prepared;
+            if (!buildCached) return prepared;
         }
     }
     if (ShaderResources::StagesUseAddressTables(shaders)) {
