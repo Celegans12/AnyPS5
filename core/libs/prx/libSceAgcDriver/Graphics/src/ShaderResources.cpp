@@ -2157,6 +2157,25 @@ ShaderResources::ShaderResources(const Context& context, std::span<const Compile
     build(shaders, &target, colorAttachments, indexAddress, indexBytes);
 }
 
+ShaderResources::ShaderResources(DeferredDrawBuild, const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::size_t indexBytes) : context(context), guestMemory(context) {
+    drawBuild = true;
+    deferredDraw = true;
+    unlockedPrepare = true;
+    Require(!StagesUseAddressTables(shaders), "a deferred draw build cannot map address tables");
+    guestMemory.DeferHostCopies();
+    prepareAddressBindings(shaders, {});
+    buildPrepare(shaders, &target, colorAttachments, indexAddress, indexBytes);
+}
+
+void ShaderResources::CompleteDraw() {
+    Require(deferredDraw && !completed, "shader resources were not prepared for a deferred draw or were already completed");
+    buildComplete();
+}
+
+bool ShaderResources::StagesUseAddressTables(std::span<const CompiledShader> shaders) {
+    return std::any_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && std::any_of(shader.program->bindings.begin(), shader.program->bindings.end(), [](const auto& binding) { return binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable; }); });
+}
+
 ShaderResources::ShaderResources(const Context& context, const CompiledShader& compute, std::span<const GuestMemorySnapshot> snapshots) : ShaderResources(context, compute, snapshots, false) {}
 
 namespace {
@@ -2325,7 +2344,13 @@ double ShaderResources::phase(BuildPhase which) {
     const auto now = std::chrono::steady_clock::now();
     const auto ms = std::chrono::duration<double, std::milli>(now - phaseStart).count();
     addBuildPhase(which, ms);
-    if (ms > 50) AgcDriver::ProfilePrint_nid_no_patch("[resources] %s took %.0f ms (%zu textures, %zu storage images, %zu buffers, bda %d)\n", BuildPhaseNames[static_cast<std::size_t>(which)], ms, textures.size(), storageTextures.size(), allocations.size(), usesBda ? 1 : 0);
+    const auto waited = Recorder::ThreadWaitedMs();
+    if (ms > (drawBuild ? 5.0 : 50.0)) {
+        const auto tag = GuestMemory::CurrentPacket();
+        const auto storage = !storageTextures.empty() && storageTextures.front() != nullptr ? storageTextures.front()->Descriptor().baseAddress : 0ull;
+        AgcDriver::ProfilePrint_nid_no_patch("[resources] %s took %.0f ms (%zu textures, %zu storage images, %zu buffers, bda %d; %s, queue 0x%x packet 0x%x, GPU waits %.0f ms; storage image 0x%llx)\n", BuildPhaseNames[static_cast<std::size_t>(which)], ms, textures.size(), storageTextures.size(), allocations.size(), usesBda ? 1 : 0, drawBuild ? "draw" : "dispatch", tag.queue, tag.opcode & 0xffffu, waited - phaseWaited, static_cast<unsigned long long>(storage));
+    }
+    phaseWaited = waited;
     phaseStart = now;
     return ms;
 }
@@ -2508,6 +2533,7 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
     PerformanceTimer frameTiming("Resources.Prepare");
     const auto stageStart = std::chrono::steady_clock::now();
     phaseStart = stageStart;
+    if (BuildProfiled()) phaseWaited = Recorder::ThreadWaitedMs();
     if (BuildProfiled()) {
         auto& profile = ThreadBuilds();
         if (++profile.builds % 1000 == 0) profile.merge();
@@ -2892,6 +2918,7 @@ void ShaderResources::buildComplete() {
     Require(!completed, "cannot update a published descriptor heap");
     const auto stageStart = std::chrono::steady_clock::now();
     phaseStart = stageStart;
+    if (BuildProfiled()) phaseWaited = Recorder::ThreadWaitedMs();
     try {
         // The lookups run in plan order: Revalidate walks the bindings the same way, and consecutive
         // storage elements of one mip chain share the previous element's image.
@@ -4293,6 +4320,12 @@ bool chargeShaderKey(ChurnCounts& profile, const ResourceCache::Key& key, std::s
     return false;
 }
 
+}
+
+std::shared_ptr<ShaderResources> ResourceCache::Peek(const Key& key) {
+    std::lock_guard lock(mutex);
+    const auto found = index.find(key);
+    return found == index.end() ? nullptr : found->second->second;
 }
 
 std::shared_ptr<ShaderResources> ResourceCache::Find(const Key& key) {

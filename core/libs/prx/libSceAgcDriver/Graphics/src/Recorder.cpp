@@ -45,6 +45,33 @@ bool DrawProfiled() {
     return profiled;
 }
 
+struct ThreadWriteOrigin {
+    std::uint64_t program = 0;
+    std::uint32_t mask = 0;
+    std::uint32_t value = 0;
+    bool kernel = false;
+};
+thread_local ThreadWriteOrigin threadWriteOrigin;
+
+struct WriteOriginRing {
+    std::mutex mutex;
+    std::array<Recorder::WriteOrigin, 16384> entries{};
+};
+
+WriteOriginRing& writeOrigins() {
+    static auto* ring = new WriteOriginRing();
+    return *ring;
+}
+
+void noteWriteOrigin(std::uint64_t note, std::uint64_t begin, std::uint64_t end) {
+    if (!DrawProfiled()) return;
+    const auto tag = GuestMemory::CurrentPacket();
+    const auto& origin = threadWriteOrigin;
+    auto& ring = writeOrigins();
+    std::lock_guard lock(ring.mutex);
+    ring.entries[note % ring.entries.size()] = {note, begin, end, origin.program, tag.opcode, tag.queue, origin.mask, origin.value, origin.kernel};
+}
+
 std::uint64_t syncCounts[5] = {};
 // Fence wait time by sync source (APS5_PROFILE_DRAW), and the source CountSync announced for the
 // Sync/SyncThrough that follows it on this thread.
@@ -2885,6 +2912,7 @@ bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel
     const auto end = address + bytes;
     open->writes.emplace_back(address, end);
     open->writeNotes.push_back(++writeNoteCount);
+    noteWriteOrigin(writeNoteCount, address, end);
     if (published != nullptr && !SnapshotCovers(published.get(), address, end)) published = nullptr;
     open->writeValues.push_back(static_cast<std::int16_t>(value));
     if (!ownLabel) markOverwritten(address, end);
@@ -2913,6 +2941,7 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
     // moves as well, so a poller re-consults the label table for a completion label.
     batch.writes.emplace_back(address, address + bytes);
     batch.writeNotes.push_back(++writeNoteCount);
+    noteWriteOrigin(writeNoteCount, address, address + bytes);
     if (published != nullptr && !SnapshotCovers(published.get(), address, address + bytes)) published = nullptr;
     batch.writeValues.push_back(-1);
     if (!ownLabel) markOverwritten(address, address + bytes);
@@ -3215,6 +3244,25 @@ Recorder::ReadStatistics Recorder::ReadCounts() {
     ReadStatistics counts{readsNoted.load(std::memory_order_relaxed), readQueries.load(std::memory_order_relaxed), readStaleIgnored.load(std::memory_order_relaxed), {}};
     for (std::size_t kind = 0; kind < ReadKinds; ++kind) counts.hits[kind] = readHits[kind].load(std::memory_order_relaxed);
     return counts;
+}
+
+void Recorder::SetWriteOrigin(std::uint64_t program) {
+    threadWriteOrigin = {program, 0, 0, false};
+}
+
+void Recorder::SetWriteOriginKernel(std::uint32_t mask, std::uint32_t value) {
+    threadWriteOrigin.mask = mask;
+    threadWriteOrigin.value = value;
+    threadWriteOrigin.kernel = true;
+}
+
+std::optional<Recorder::WriteOrigin> Recorder::OriginOfNote(std::uint64_t note) {
+    if (note == 0 || !DrawProfiled()) return std::nullopt;
+    auto& ring = writeOrigins();
+    std::lock_guard lock(ring.mutex);
+    const auto& entry = ring.entries[note % ring.entries.size()];
+    if (entry.note != note) return std::nullopt;
+    return entry;
 }
 
 std::optional<Recorder::PendingWriteInfo> Recorder::DescribePendingWrite(std::uint64_t address, std::size_t bytes) const {

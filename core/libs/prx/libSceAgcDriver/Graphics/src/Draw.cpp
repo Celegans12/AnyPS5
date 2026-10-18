@@ -1037,6 +1037,124 @@ InPlaceIndices InPlaceIndexRange(Recorder& recorder, std::uint64_t address, std:
     return indices;
 }
 
+struct PreparedDraw {
+    VkDevice device = VK_NULL_HANDLE;
+    std::uint64_t indexBytes = 0;
+    bool trimmed = true;
+    bool keyed = false;
+    ResourceCache::Key contentKey;
+    bool cachedAtPrepare = false;
+    std::shared_ptr<ShaderResources> resources;
+    std::uint64_t forgetSerial = 0;
+    std::uint64_t registryGeneration = 0;
+};
+
+namespace {
+
+// S1 counters (the [split] line, APS5_PROFILE_DRAW): preparations by outcome, and at the draw how
+// each prepared build was used or why it was discarded.
+struct SplitCounters {
+    std::atomic<std::uint64_t> prepared{0};
+    std::atomic<std::uint64_t> cachedAtPrepare{0};
+    std::atomic<std::uint64_t> addressTables{0};
+    std::atomic<std::uint64_t> forgetInChange{0};
+    std::atomic<std::uint64_t> stageA{0};
+    std::atomic<std::uint64_t> stageAFailed{0};
+    std::atomic<std::uint64_t> stageANs{0};
+    std::atomic<std::uint64_t> used{0};
+    std::atomic<std::uint64_t> servedByCache{0};
+    std::atomic<std::uint64_t> staleForget{0};
+    std::atomic<std::uint64_t> staleRegistry{0};
+    std::atomic<std::uint64_t> staleOther{0};
+    std::atomic<std::uint64_t> lockedBuilds{0};
+    std::atomic<std::uint64_t> keyReused{0};
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+SplitCounters& Splits() {
+    static auto* counters = new SplitCounters();
+    return *counters;
+}
+
+void reportSplits() {
+    auto& c = Splits();
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = c.lastReport.load();
+    if (nowMs - last < 10000 || !c.lastReport.compare_exchange_strong(last, nowMs)) return;
+    const auto take = [](std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.exchange(0, std::memory_order_relaxed)); };
+    const auto prepared = take(c.prepared);
+    const auto cached = take(c.cachedAtPrepare);
+    const auto address = take(c.addressTables);
+    const auto inChange = take(c.forgetInChange);
+    const auto stageA = take(c.stageA);
+    const auto failed = take(c.stageAFailed);
+    const auto stageAMs = static_cast<double>(take(c.stageANs)) / 1e6;
+    const auto used = take(c.used);
+    const auto served = take(c.servedByCache);
+    const auto forget = take(c.staleForget);
+    const auto registry = take(c.staleRegistry);
+    const auto other = take(c.staleOther);
+    const auto locked = take(c.lockedBuilds);
+    const auto keys = take(c.keyReused);
+    std::fprintf(stderr, "[split] draws prepared (10 s): %llu (cache entry then %llu, address tables %llu, forget serial in change %llu); stage A built %llu in %.1f ms (%llu refused); at the draw: %llu builds completed from stage A, %llu served by the cache instead, discarded as stale %llu (forget serial %llu, registry %llu, other %llu); %llu builds made under the lock; %llu keys reused\n", prepared, cached, address, inChange, stageA, stageAMs, failed, used, served, forget + registry + other, forget, registry, other, locked, keys);
+}
+
+}
+
+bool SplitDrawBuild() {
+    static const bool enabled = std::getenv("APS5_NO_SPLIT_DRAW_BUILD") == nullptr;
+    return enabled;
+}
+
+std::shared_ptr<PreparedDraw> PrepareDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders) {
+    if (!SplitDrawBuild()) return nullptr;
+    auto& counters = Splits();
+    counters.prepared.fetch_add(1, std::memory_order_relaxed);
+    auto prepared = std::make_shared<PreparedDraw>();
+    prepared->device = context.device;
+    // The stamps first: whatever they guard is read after them.
+    prepared->forgetSerial = GuestMemory::ForgetSerial();
+    prepared->registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    if ((prepared->forgetSerial & 1u) != 0) {
+        counters.forgetInChange.fetch_add(1, std::memory_order_relaxed);
+        return prepared;
+    }
+    prepared->indexBytes = static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize;
+    if (std::any_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program == nullptr; })) return prepared;
+    static const bool noDrawResourceCache = std::getenv("APS5_NO_DRAW_RESOURCE_CACHE") != nullptr;
+    static const bool noTextureCache = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
+    static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
+    prepared->trimmed = trimKey;
+    const bool cacheable = !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program->PipelineVariantId() != 0; }) && !ShaderResources::NeverReusable(shaders);
+    if (cacheable) {
+        prepared->contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, prepared->indexBytes, !trimKey);
+        prepared->keyed = true;
+        // An entry found now often cannot serve the draw (its buffers moved: a miss after all), so
+        // stage A is made anyway unless APS5_SPLIT_DRAW_CACHED=0; a draw the cache serves drops it.
+        static const bool buildCached = [] { const char* text = std::getenv("APS5_SPLIT_DRAW_CACHED"); return text == nullptr || std::strcmp(text, "0") != 0; }();
+        if (const auto cached = SharedResourceCache().Peek(prepared->contentKey); cached != nullptr && !cached->InUse()) {
+            prepared->cachedAtPrepare = true;
+            counters.cachedAtPrepare.fetch_add(1, std::memory_order_relaxed);
+            if (!buildCached) return prepared;
+        }
+    }
+    if (ShaderResources::StagesUseAddressTables(shaders)) {
+        counters.addressTables.fetch_add(1, std::memory_order_relaxed);
+        return prepared;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    try {
+        prepared->resources = std::make_shared<ShaderResources>(DeferredDrawBuild{}, context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(prepared->indexBytes));
+        counters.stageA.fetch_add(1, std::memory_order_relaxed);
+    } catch (...) {
+        // The draw builds under the lock and reports the refusal in order.
+        prepared->resources.reset();
+        counters.stageAFailed.fetch_add(1, std::memory_order_relaxed);
+    }
+    counters.stageANs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+    return prepared;
+}
+
 namespace {
 
 // The draw's inputs before its resources (prepareDrawInputs): the validated parameters, the index
@@ -1355,8 +1473,12 @@ struct ResolvedResources {
     ResourceUse use;
 };
 
-ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, DrawOutcome& outcome, DrawTimer& timer) {
+ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, DrawOutcome& outcome, DrawTimer& timer, PreparedDraw* prepared = nullptr) {
     ResolvedResources resolved;
+    if (prepared != nullptr && (prepared->device != context.device || prepared->indexBytes != indexBytes)) {
+        if (prepared->resources != nullptr) Splits().staleOther.fetch_add(1, std::memory_order_relaxed);
+        prepared = nullptr;
+    }
     APS5_LOG_CHARS_OUT_DEBUG("Creating ShaderResources");
     // A recordable draw whose stages' compiled content repeats an earlier one binds that build's
     // descriptor set when it is still valid (see ResourceCache; the dispatch path does the same).
@@ -1371,7 +1493,13 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
     resolved.cacheable = recordable && !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; }) && !ShaderResources::NeverReusable(shaders);
     if (resolved.cacheable) {
-        resolved.contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
+        if (prepared != nullptr && prepared->keyed && prepared->trimmed == trimKey) {
+            resolved.contentKey = std::move(prepared->contentKey);
+            prepared->keyed = false;
+            Splits().keyReused.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            resolved.contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
+        }
         auto cached = SharedResourceCache().Find(resolved.contentKey);
         const bool inUse = cached != nullptr && cached->InUse();
         if (inUse) CountAddressReuse(AddressReuse::InUse);
@@ -1404,14 +1532,38 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     }
     timer.phase(PhaseLookup);
     if (resolved.resources == nullptr) {
-        resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots);
+        // S1: stage A made ahead of the draw, when nothing it read can have moved since (the stamps
+        // were taken before it); else the build runs here as before.
+        if (prepared != nullptr && prepared->resources != nullptr) {
+            auto& counters = Splits();
+            if (GuestMemory::ForgetSerial() != prepared->forgetSerial) {
+                counters.staleForget.fetch_add(1, std::memory_order_relaxed);
+            } else if (GuestAllocations::GuestAllocationsGeneration_nid_postfix() != prepared->registryGeneration) {
+                counters.staleRegistry.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                resolved.resources = std::move(prepared->resources);
+                resolved.resources->CompleteDraw();
+                counters.used.fetch_add(1, std::memory_order_relaxed);
+            }
+            prepared->resources.reset();
+        }
+        if (resolved.resources == nullptr) {
+            resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots);
+            if (SplitDrawBuild()) Splits().lockedBuilds.fetch_add(1, std::memory_order_relaxed);
+        }
         resolved.use.resources = resolved.resources;
         resolved.built = &resolved.resources->Timing();
         outcome.addressBased = resolved.resources->HoldsLease();
         outcome.kind = outcome.addressBased ? KindBda : KindBuild;
         if (resolved.cacheable) countCache(&DrawProfile::cacheMisses);
     }
+    if (prepared != nullptr && prepared->resources != nullptr) {
+        // A cache hit served the draw: the prepared build is not needed.
+        Splits().servedByCache.fetch_add(1, std::memory_order_relaxed);
+        prepared->resources.reset();
+    }
     timer.phase(PhaseResources);
+    if (timer.profile && SplitDrawBuild()) reportSplits();
     APS5_LOG_CHARS_OUT_DEBUG("ShaderResources created");
     return resolved;
 }
@@ -2048,7 +2200,7 @@ std::optional<std::string> KnownValidationFailure(const Context& context, std::s
     return std::nullopt;
 }
 
-void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut) {
+void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, PreparedDraw* prepared) {
     std::vector<std::uint32_t> stencilReferences;
     for (const auto& shader : shaders) {
         if (shader.program != nullptr && !shader.program->stencilReferences.empty()) {
@@ -2221,7 +2373,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     const bool recordDraws = RecordDraws();
     auto* recorder = Recorder::Active();
     bool recordable = recordDraws && recorder != nullptr && dumpLimit == 0 && std::all_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.resident != nullptr || binding.multisampled; });
-    auto resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, outcome, timer);
+    auto resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, outcome, timer, prepared);
     auto& resources = resolved.resources;
     if (!stencilReferences.empty() && resources->ChecksFaults()) recordable = false;
     if (!stencilReferences.empty()) {

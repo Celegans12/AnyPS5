@@ -22,6 +22,7 @@ namespace AgcDriver {
 namespace Graphics {
 class StorageTexture;
 class TextureService;
+struct PreparedDraw;
 }
 
 // Stage A of a dispatch's resource build (see VulkanDevice::PrepareDispatch); opaque to callers.
@@ -312,7 +313,15 @@ public:
     static void NoteDrawRecipeMiss(DrawRecipePrecheck miss);
     // `recipe`, when given, receives the DrawRecipe a recorded, cacheable, reusable, direct draw
     // built for its draw-cache entry (design_cpu_final M8); null otherwise.
-    void Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr);
+    void Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, Graphics::PreparedDraw* prepared = nullptr);
+    // S1: the unlocked part of a draw's resource build, made ahead of the draw (Graphics::PrepareDraw).
+    std::shared_ptr<Graphics::PreparedDraw> PrepareDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders);
+    // The draw's HTILE pre-sync (APS5_NO_HTILE_PRESYNC=1 off): when the depth target's store-back
+    // read would wait for a pending GPU write (Graphics::HtileStoreBackWaits), the newest such batch
+    // is learned under the mutex (the open batch is submitted when it is that batch) and waited for
+    // without it. Returns the serial waited for (0: none); the draw reaps up to it under its lock,
+    // so the read then finds the writes landed. Only a wait: results are unchanged.
+    std::uint64_t PresyncDrawDepth(const Graphics::State& graphics);
     std::optional<std::string> KnownDrawRejection(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders) const;
     void ColorMetadataPass(const Graphics::ColorMetadataPass& pass);
     // A draw-cache hit recorded from its recipe (Graphics::DrawWithRecipe), under the mutex after
