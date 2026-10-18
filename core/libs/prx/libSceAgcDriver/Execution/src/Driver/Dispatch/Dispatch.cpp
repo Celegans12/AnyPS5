@@ -527,7 +527,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
         const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
         const auto queueId = submission.queue;
         itemCommits.fetch_add(1, std::memory_order_relaxed);
-        DrawPipeline::Queue0().Enqueue([this, localDevice = std::move(localDevice), result = compiledResult, snapshots = std::move(snapshots), groups, address, queueId, recipe, keepVariant, dataHit, epoch] {
+        DrawPipeline::Queue0().Enqueue([this, localDevice = std::move(localDevice), result = compiledResult, snapshots = std::move(snapshots), captured = std::move(captured), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant, dataHit, epoch] {
             DrawPipeline::FollowEpoch(epoch);
             GuestMemory::SetCurrentPacket(0x15, queueId);
             const auto& compiledCommit = *result;
@@ -584,7 +584,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
         const auto queueId = submission.queue;
         auto attachTo = keepVariant != nullptr ? keepVariant : attachVariant;
         missItemCommits.fetch_add(1, std::memory_order_relaxed);
-        DrawPipeline::Queue0().Enqueue([this, localDevice = std::move(localDevice), result = compiledResult, captured = std::move(captured), shaderMemory, registeredShader, groups, address, queueId, dispatchThreads, attachTo = std::move(attachTo), keepVariant, dataHit, epoch] {
+        DrawPipeline::Queue0().Enqueue([this, localDevice = std::move(localDevice), result = compiledResult, captured = std::move(captured), liveWords = std::move(liveWords), capture, shaderMemory, registeredShader, groups, address, queueId, dispatchThreads, attachTo = std::move(attachTo), keepVariant, dataHit, epoch] {
             DrawPipeline::FollowEpoch(epoch);
             GuestMemory::SetCurrentPacket(0x15, queueId);
             const auto& compiledCommit = *result;
