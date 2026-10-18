@@ -1,6 +1,7 @@
 #ifndef CORE_SHADER_RECOMPILER_DIRECTIMAGEREFUSAL_HPP
 #define CORE_SHADER_RECOMPILER_DIRECTIMAGEREFUSAL_HPP
 
+#include "EnvironmentGuards.hpp"
 #include "IntermediateRepresentation/IrMetadata/Resources.hpp"
 #include <cstdint>
 #include <cstdlib>
@@ -17,8 +18,7 @@ inline bool CanDeferDirectImage(const ImageResource& image, IrShaderStage stage)
 }
 
 inline bool DirectImageLoopGuardEnabled() {
-    const auto* value = std::getenv("APS5_LOOP_GUARD");
-    return value != nullptr && static_cast<std::uint32_t>(std::strtoul(value, nullptr, 0)) != 0u;
+    return EnvironmentGuardEnabled(EnvironmentGuard::LoopGuard);
 }
 
 }

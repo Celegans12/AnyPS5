@@ -1,6 +1,7 @@
 #ifndef CORE_SHADER_RECOMPILER_UNNORMALIZEDWRAP_HPP
 #define CORE_SHADER_RECOMPILER_UNNORMALIZEDWRAP_HPP
 
+#include "EnvironmentGuards.hpp"
 #include "IntermediateRepresentation/IrMetadata/Resources.hpp"
 #include <cstdlib>
 #include <span>
@@ -9,8 +10,7 @@
 namespace ShaderRecompiler {
 
 inline bool UnnormalizedWrapEnabled() {
-    const auto* value = std::getenv("APS5_UNNORM_WRAP_GUARD");
-    return value != nullptr && std::string_view(value) == "1";
+    return EnvironmentGuardEnabled(EnvironmentGuard::UnnormalizedWrapGuard);
 }
 
 inline bool UnnormalizedWrapCandidate(const SamplerResource& sampler, IrShaderStage stage) {

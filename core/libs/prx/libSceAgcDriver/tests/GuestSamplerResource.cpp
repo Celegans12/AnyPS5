@@ -1,4 +1,5 @@
 #include "GraphicsTests.hpp"
+#include "EnvironmentGuards.hpp"
 #include "Optimization/DescriptorBindingBuilder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestSamplerResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
@@ -289,6 +290,7 @@ void RunGuardedWrapTests() {
 #else
         if (value) setenv("APS5_UNNORM_WRAP_GUARD", value, 1); else unsetenv("APS5_UNNORM_WRAP_GUARD");
 #endif
+        ShaderRecompiler::RefreshEnvironmentGuards();
     };
     struct Restore { decltype(set)& action; const char* value; ~Restore() { action(value); } } restore{set, value ? previous.c_str() : nullptr};
     const std::array<std::uint32_t, 4> words{0x8000u, 0xfff000u, 0x05000000u, 0u};

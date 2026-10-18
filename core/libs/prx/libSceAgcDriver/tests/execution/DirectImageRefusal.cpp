@@ -1,4 +1,5 @@
 #include "VulkanTestDevice.hpp"
+#include "EnvironmentGuards.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
 #include "PipelineSpecialization.hpp"
@@ -80,6 +81,7 @@ private:
 #else
         if (value == nullptr) unsetenv("APS5_LOOP_GUARD"); else setenv("APS5_LOOP_GUARD", value, 1);
 #endif
+        ShaderRecompiler::RefreshEnvironmentGuards();
     }
     bool present = false;
     std::string previous;

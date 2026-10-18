@@ -1,4 +1,5 @@
 #include "ShaderDiskCache.hpp"
+#include "EnvironmentGuards.hpp"
 #include "BdaAbi.hpp"
 #include "CacheKey.hpp"
 #include "ShaderCachePack.hpp"
@@ -62,6 +63,7 @@ void setEnvironment(const char* name, const std::string& value) {
 #else
     setenv(name, value.c_str(), 1);
 #endif
+    ShaderRecompiler::RefreshEnvironmentGuards();
 }
 
 bool sameBinding(const DescriptorBinding& left, const DescriptorBinding& right) {
@@ -967,6 +969,7 @@ private:
             unsetenv(name);
 #endif
         }
+        ShaderRecompiler::RefreshEnvironmentGuards();
     }
     bool present = false;
     std::string previous;

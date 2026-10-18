@@ -1399,6 +1399,52 @@ void verifyImageTableKeys() {
     }
 }
 
+void verifyImageTableResolveMemo() {
+    using namespace ShaderRecompiler;
+    constexpr std::uint32_t Entries = 600;
+    static TableTexture textures[4];
+    alignas(4096) static TableGuest guest;
+    alignas(4096) static std::array<std::array<std::uint32_t, 8>, Entries> large{};
+    std::fill(guest.heap.begin(), guest.heap.end(), std::array<std::uint32_t, 8>{});
+    guest.heap[0] = TableT(textures[0].bytes.data(), TableFormat8888UNorm, TableType2D);
+    guest.heap[1] = TableT(textures[1].bytes.data(), TableFormat32UInt, TableType2D);
+    for (std::uint32_t entry = 0; entry < Entries; entry++) large[entry] = TableT(textures[entry % 4u].bytes.data(), TableFormat8888UNorm, TableType2D, entry);
+    const auto userData = TableUserData(guest);
+    const auto request = TableRequest(TableWholeCode, userData);
+    const auto small = [&] {
+        guest.materials = {{{0u, 1u, 0u, 0u}, {0u, 0u, 0u, 0u}, {0u, 1u, 0u, 0u}}};
+        FillTableSrt(guest, guest.heap.data(), 32u, 3u);
+        return CompileTable(request);
+    };
+    const auto big = [&] {
+        guest.materials = {{{0u, 3u, 0u, 0u}, {0u, 4u, 0u, 0u}, {0u, 599u, 0u, 0u}}};
+        FillTableSrt(guest, large.data(), 32u, Entries);
+        return CompileTable(request);
+    };
+    const auto same = [](const RecompileResult& a, const RecompileResult& b) {
+        if (a.bindings.size() != b.bindings.size() || a.imageTablePoison.size() != b.imageTablePoison.size() || a.imageTableFaults != b.imageTableFaults || a.bindlessTables.size() != b.bindlessTables.size()) return false;
+        for (std::size_t index = 0; index < a.bindings.size(); ++index) {
+            if (a.bindings[index].role != b.bindings[index].role || a.bindings[index].guestDescriptor != b.bindings[index].guestDescriptor || a.bindings[index].count != b.bindings[index].count) return false;
+        }
+        for (std::size_t index = 0; index < a.bindlessTables.size(); ++index) {
+            if (a.bindlessTables[index].base != b.bindlessTables[index].base || a.bindlessTables[index].records != b.bindlessTables[index].records || a.bindlessTables[index].uses.size() != b.bindlessTables[index].uses.size()) return false;
+        }
+        return true;
+    };
+    const auto first = small();
+    const auto second = big();
+    const auto third = small();
+    const auto fourth = big();
+    require(!same(*first.result, *second.result), "image table resolve memo: two tables resolved alike");
+    require(same(*first.result, *third.result) && same(*second.result, *fourth.result), "image table resolve memo: the same table resolved differently");
+    large[17] = TableT(textures[1].bytes.data(), TableFormat32UInt, TableType2D, 17u);
+    const auto changed = big();
+    require(!same(*fourth.result, *changed.result), "image table resolve memo: a changed record kept the earlier resolution");
+    large[17] = TableT(textures[17 % 4u].bytes.data(), TableFormat8888UNorm, TableType2D, 17u);
+    const auto restored = big();
+    require(same(*fourth.result, *restored.result), "image table resolve memo: a restored record did not resolve as before");
+}
+
 struct CountingMemory {
     std::uint64_t begin = 0;
     std::uint64_t end = 0;
@@ -5662,6 +5708,7 @@ int main(int argc, char** argv) {
             verifyPointerImageTable();
             verifyPointerTableOffsetCarry();
             verifyImageTableColumnMemo();
+            verifyImageTableResolveMemo();
             std::cout << "Image table keys, maps, records and registration passed\n";
             return 0;
         }
@@ -5699,6 +5746,7 @@ int main(int argc, char** argv) {
         verifyGuardedDescriptorSources();
         verifyPointerTableOffsetCarry();
         verifyImageTableColumnMemo();
+        verifyImageTableResolveMemo();
         verifyDescriptorPhis();
         verifyUniformTableImage();
         verifyLaneSelectedDescriptors();
