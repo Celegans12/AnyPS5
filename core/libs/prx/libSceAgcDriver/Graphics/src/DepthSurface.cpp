@@ -1224,6 +1224,11 @@ void reportHtileSyncs() {
 std::optional<std::pair<VkImageAspectFlags, std::uint32_t>> KnownHtileExpansion(const HtileMaskWrite& write, const DepthTarget& target) {
     const auto mask = write.mask;
     const auto value = write.value;
+    if (mask == 0) {
+        auto cleared = VK_IMAGE_ASPECT_DEPTH_BIT | (target.htileStencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
+        cleared &= HtileFillClears(value, target.htileStencil);
+        return std::pair<VkImageAspectFlags, std::uint32_t>{cleared, cleared != 0 ? expandedHtileWord(value, target.htileStencil, cleared) : value};
+    }
     if ((mask & 0xfu) != 0 || (value & 0xfu) != 0) return std::nullopt;
     if (target.firstSlice != 0 && mask != 0) return std::nullopt;
     if (!target.htileStencil) return std::pair<VkImageAspectFlags, std::uint32_t>{VK_IMAGE_ASPECT_DEPTH_BIT, 0xfffc000fu};
@@ -1259,6 +1264,10 @@ std::optional<VkImageAspectFlags> expandHtileOnGpu(Recorder& recorder, const Dep
     if (!known.has_value()) {
         gpu.unknown.fetch_add(1, std::memory_order_relaxed);
         return std::nullopt;
+    }
+    if (known->first == 0) {
+        gpu.skipped.fetch_add(1, std::memory_order_relaxed);
+        return VkImageAspectFlags{0};
     }
     if (!fill(target.htileAddress, bytes, known->second)) return std::nullopt;
     const auto note = recorder.NewestWriteNote(target.htileAddress, bytes);
@@ -1550,7 +1559,7 @@ void NoteHtileMaskOnGpu(const Context& context, std::uint64_t address, std::size
     std::lock_guard lock(gpu.mutex);
     std::erase_if(gpu.masks, [&](const HtileMaskWrite& write) { return address < write.end && write.begin < end; });
     if (note == 0) return;
-    constexpr std::size_t KeptMasks = 64;
+    constexpr std::size_t KeptMasks = 256;
     if (gpu.masks.size() >= KeptMasks) gpu.masks.erase(gpu.masks.begin());
     gpu.masks.push_back({address, end, mask, value, note});
 }

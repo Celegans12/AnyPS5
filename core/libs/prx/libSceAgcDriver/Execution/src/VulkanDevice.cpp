@@ -2398,6 +2398,7 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
     phase(recordMs);
     if (uniform && pattern[0] == (pattern[0] & 0xffu) * 0x01010101u) recorder.NotePendingFill(address, bytes, static_cast<std::uint8_t>(pattern[0]));
     else recorder.NotePendingWrite(address, bytes);
+    if (uniform) Graphics::NoteHtileMaskOnGpu(context, address, bytes, 0u, pattern[0]);
     GuestMemory::MarkWritten(address, bytes);
     phase(notesMs);
     return true;
