@@ -2273,6 +2273,80 @@ void readWrittenStagingTests(const Device& device, Recorder& recorder) {
     HostImportFor(context, address, bytes);
 }
 
+// A staged written element's copy-back (APS5_STAGING_DIFF=1 when `diff`): the dwords the work
+// changed reach the import; the ones it rewrote with their own value or left alone are not stored,
+// so a CPU store made after the copy-in into such a dword keeps its value, where the whole copy
+// (diff off) rolls it back.
+void stagingDiffTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    const bool diff = std::getenv("APS5_STAGING_DIFF") != nullptr && context.bufferDeviceAddress;
+    if (context.hostImportAlignment == 0) {
+        std::cout << "host imports unavailable: staging copy-backs not tested\n";
+        return;
+    }
+    constexpr std::size_t bytes = 4u << 20u;
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(65536, bytes);
+#endif
+    Require(block != nullptr, "cannot allocate the test block");
+    std::memset(block, 0x11, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    if (HostImportFor(context, address, bytes) == nullptr) {
+        std::cout << "host import of the test block refused: staging copy-backs not tested\n";
+        return;
+    }
+    auto* words = static_cast<std::uint32_t*>(block);
+    const auto fill = context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer");
+    const auto element = address + 4096;
+    constexpr std::size_t elementBytes = 256u << 10u;
+    constexpr std::size_t first = 4096 / 4;
+    GuestBufferMemory memory(context);
+    memory.AllowDeviceStaging();
+    memory.AddWritable(element, elementBytes, false, true);
+    memory.Upload(false);
+    Require(memory.InPlaceReads().empty(), "a read and written 256 KiB element was not staged");
+    std::uint32_t adjustment = 0;
+    const auto view = memory.Descriptor(element, elementBytes, adjustment);
+    recorder.Sync();
+    // After the copy-in ran, CPU stores: into dwords the work leaves alone (4096..4111), into ones it
+    // rewrites with the copy-in value (128..131) and into one it changes (200).
+    for (std::size_t index = 4096; index < 4112; ++index) words[first + index] = 0x33333333u;
+    for (std::size_t index = 128; index < 132; ++index) words[first + index] = 0x88888888u;
+    words[first + 200] = 0x44444444u;
+    // The work, on the shadow: new values at dwords 64..79 and 200, the copy-in value at 128..143.
+    const auto shadow = [&](std::size_t index) { return view.offset + adjustment + std::uint64_t{index} * 4u; };
+    auto commands = recorder.Commands();
+    fill(commands, view.buffer, shadow(64), 64, 0x22222222u);
+    fill(commands, view.buffer, shadow(128), 64, 0x11111111u);
+    fill(commands, view.buffer, shadow(200), 4, 0x55555555u);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+    memory.RecordCopyBacks(recorder);
+    recorder.Sync();
+    std::size_t wrong = 0;
+    for (std::size_t index = 0; index < bytes / 4u; ++index) {
+        auto expected = 0x11111111u;
+        const auto at = index >= first ? index - first : bytes;
+        if (at >= 64 && at < 80) expected = 0x22222222u;
+        else if (at == 200) expected = 0x55555555u;
+        else if (at >= 128 && at < 132) expected = diff ? 0x88888888u : 0x11111111u;
+        else if (at >= 4096 && at < 4112) expected = diff ? 0x33333333u : 0x11111111u;
+        if (words[index] != expected && wrong++ < 8) std::cout << "staging copy-back dword " << index << " holds 0x" << std::hex << words[index] << ", expected 0x" << expected << std::dec << "\n";
+    }
+    Require(wrong == 0, "a staged copy-back left the wrong guest bytes");
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(block);
+    }
+    HostImportFor(context, address, bytes);
+    std::cout << "staging copy-back tests passed (" << (diff ? "diff" : "whole copies") << ")\n";
+}
+
 bool sparseRunImportTests(const Device& device, bool copied) {
     const auto& context = device.GetContext();
     constexpr std::size_t unit = 65536;
@@ -8698,6 +8772,11 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--written-buffer-order-only") {
             if (!writtenBufferOrderTests(device, recorder)) return 77;
             std::cout << "written buffer order tests passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--staging-diff-only") {
+            stagingDiffTests(device, recorder);
+            readWrittenStagingTests(device, recorder);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--read-list-only") {

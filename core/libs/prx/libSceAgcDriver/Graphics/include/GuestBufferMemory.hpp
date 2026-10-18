@@ -366,7 +366,12 @@ private:
         bool gpuCopy = false;
         VkBuffer copySource = VK_NULL_HANDLE;
         std::uint64_t copySourceBase = 0;
+        // The import's device address (0 when it has none): APS5_STAGING_DIFF copy-backs store into it.
+        VkDeviceAddress copySourceAddress = 0;
         bool copiedBack = false;
+        // APS5_STAGING_DIFF=1: a device-local copy of a staged shadow's bytes right after its copy-in,
+        // so the copy-back stores only the dwords the work changed (RecordCopyBacks).
+        std::shared_ptr<Buffer> pristine {};
         // An element the shader updates atomically lies inside (AddWritable's `atomic`).
         bool atomic = false;
         bool swept = false;

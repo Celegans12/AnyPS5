@@ -232,6 +232,11 @@ public:
     void Sync();
     void CountSamples();
     bool RecordMeshArguments(VkCommandBuffer commands, VkDeviceAddress record, VkDeviceAddress arguments, std::span<const std::uint32_t, 7> rules);
+    // APS5_STAGING_DIFF=1 (GuestBufferMemory::RecordCopyBacks): stores into `target` the dwords of
+    // `result` that differ from `pristine` (all three device addresses, `dwords` long), with the
+    // stored count added to StagingDiffStoredDwords when `count`. False when the kernel is unavailable.
+    bool RecordStagingDiff(VkCommandBuffer commands, VkDeviceAddress result, VkDeviceAddress pristine, VkDeviceAddress target, std::uint32_t dwords, bool count);
+    std::uint64_t StagingDiffStoredDwords();
     std::uint64_t SamplesTotal();
     bool DumpSamples(VkDeviceAddress target, std::uint64_t address = 0);
     void NoteSampledDraw(VkCommandBuffer commands);
@@ -733,6 +738,12 @@ private:
     int meshArgumentState = 0;
     VkPipelineLayout meshArgumentLayout = VK_NULL_HANDLE;
     VkPipeline meshArgumentPipeline = VK_NULL_HANDLE;
+    int stagingDiffState = 0;
+    VkPipelineLayout stagingDiffLayout = VK_NULL_HANDLE;
+    VkPipeline stagingDiffPipeline = VK_NULL_HANDLE;
+    std::unique_ptr<Buffer> stagingDiffCounter;
+    std::uint64_t stagingDiffStored = 0;
+    std::uint32_t stagingDiffSeen = 0;
     int sampleCounterState = 0;
     std::unique_ptr<Buffer> sampleCounter;
     VkPipelineLayout sampleLayout = VK_NULL_HANDLE;

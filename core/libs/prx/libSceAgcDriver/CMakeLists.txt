@@ -70,6 +70,19 @@ add_custom_command(
         VERBATIM
 )
 
+set(agcStagingDiffShaderSource ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/StagingDiffCopyBack.comp)
+set(agcStagingDiffShaderSpv ${agcTextureDetileGeneratedDir}/StagingDiffCopyBack.spv)
+set(agcStagingDiffShaderHeader ${agcTextureDetileGeneratedDir}/StagingDiffCopyBack_spv.h)
+add_custom_command(
+        OUTPUT "${agcStagingDiffShaderHeader}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${agcTextureDetileGeneratedDir}"
+        COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -o "${agcStagingDiffShaderSpv}" "${agcStagingDiffShaderSource}"
+        COMMAND ${CMAKE_COMMAND} -DINPUT=${agcStagingDiffShaderSpv} -DOUTPUT=${agcStagingDiffShaderHeader}
+        -DSYMBOL=STAGING_DIFF_COPY_BACK_SPV -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
+        DEPENDS "${agcStagingDiffShaderSource}" glslang-standalone
+        VERBATIM
+)
+
 set(agcCmaskClearShaderSource ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/CmaskClear.comp)
 set(agcCmaskClearShaderSpv ${agcTextureDetileGeneratedDir}/CmaskClear.spv)
 set(agcCmaskClearShaderHeader ${agcTextureDetileGeneratedDir}/CmaskClear_spv.h)
@@ -251,6 +264,7 @@ set(agcDriverSources
         ${agcTextureDetileShaderHeader}
         ${agcCmaskClearShaderHeader}
         ${agcMeshArgumentsShaderHeader}
+        ${agcStagingDiffShaderHeader}
         ${agcTextureDetileImageShaderHeader}
         ${agcDispatchArgumentsShaderHeader}
         ${agcSampleCounterShaderHeader}
@@ -1188,6 +1202,10 @@ if(BUILD_TESTING)
         set_tests_properties(agc_copied_direct_ordering PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    add_test(NAME agc_staging_copy_back COMMAND agc_driver_recorder_tests --staging-diff-only)
+    set_tests_properties(agc_staging_copy_back PROPERTIES TIMEOUT 60)
+    add_test(NAME agc_staging_copy_back_diff COMMAND agc_driver_recorder_tests --staging-diff-only)
+    set_tests_properties(agc_staging_copy_back_diff PROPERTIES TIMEOUT 60 ENVIRONMENT "APS5_STAGING_DIFF=1")
     add_test(NAME agc_recorder_read_list COMMAND agc_driver_recorder_tests --read-list-only)
     set_tests_properties(agc_recorder_read_list PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
     add_test(NAME agc_space_pending_writes COMMAND agc_driver_recorder_tests --space-pending-writes-only)
@@ -1243,7 +1261,7 @@ if(BUILD_TESTING)
     add_test(NAME agc_metadata_pass COMMAND agc_driver_recorder_tests --metadata-pass-only)
     set_tests_properties(agc_metadata_pass PROPERTIES SKIP_RETURN_CODE 77)
     if(WIN32)
-        set_tests_properties(agc_recorder_read_list agc_host_import_unmap agc_parked_import_unmap agc_host_import_retirement agc_host_import_retirement_stress agc_sparse_run_import agc_sparse_run_import_copied agc_unit_shadow agc_descriptor_pool_recycling agc_draw_snapshot_cap agc_draw_snapshot_epoch agc_multisample_guest_access agc_draw_inputs_in_place agc_draw_inputs_copied agc_resident_present agc_slice_dirty agc_queued_write_groups agc_metadata_pass agc_tiled_resolve PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_recorder_read_list agc_staging_copy_back agc_staging_copy_back_diff agc_host_import_unmap agc_parked_import_unmap agc_host_import_retirement agc_host_import_retirement_stress agc_sparse_run_import agc_sparse_run_import_copied agc_unit_shadow agc_descriptor_pool_recycling agc_draw_snapshot_cap agc_draw_snapshot_epoch agc_multisample_guest_access agc_draw_inputs_in_place agc_draw_inputs_copied agc_resident_present agc_slice_dirty agc_queued_write_groups agc_metadata_pass agc_tiled_resolve PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         add_test(NAME agc_host_import_second_mapping COMMAND agc_driver_recorder_tests --host-import-second-mapping-only)
         set_tests_properties(agc_host_import_second_mapping PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT_MODIFICATION
