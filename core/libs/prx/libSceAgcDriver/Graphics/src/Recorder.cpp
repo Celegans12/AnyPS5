@@ -1380,6 +1380,14 @@ struct DispatchOrder {
 
 thread_local DispatchOrder nextDispatchOrder;
 
+std::array<std::atomic<std::uint64_t>, Recorder::DeferredFlushSites> deferredFlushes{};
+
+}
+
+std::array<std::uint64_t, Recorder::DeferredFlushSites> Recorder::DeferredFlushCounts() {
+    std::array<std::uint64_t, DeferredFlushSites> counts{};
+    for (std::size_t site = 0; site < DeferredFlushSites; ++site) counts[site] = deferredFlushes[site].load(std::memory_order_relaxed);
+    return counts;
 }
 
 bool Recorder::DispatchOverlapEnabled() {
@@ -1397,9 +1405,10 @@ std::uint32_t Recorder::TakeDispatchOrder(bool& unordered) {
     return order.queueKey;
 }
 
-void Recorder::flushDeferredDispatch() {
+void Recorder::flushDeferredDispatch(std::size_t site) {
     if (open == nullptr || open->deferredDispatchQueue == 0) return;
     open->deferredDispatchQueue = 0;
+    deferredFlushes[site].fetch_add(1, std::memory_order_relaxed);
     // The trailing barrier recordDispatch (VulkanDevice.cpp) leaves out of an overlapping run.
     constexpr VkAccessFlags dispatchedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
     recordBarrier(open->commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, dispatchedAccess);
@@ -1425,7 +1434,7 @@ void Recorder::DeferDispatchBarrier(std::uint32_t queueKey) {
 
 VkCommandBuffer Recorder::Commands(VkAccessFlags* coveredAccess) {
     ensureOpen();
-    flushDeferredDispatch();
+    flushDeferredDispatch(0);
     // Work recorded after a draw's render pass or an inline store run must see their writes: the
     // pass's end and the run's trailing barrier go in first (a per-batch run waits for Submit, or
     // for a caller whose ranges overlap a queued store: FlushStores).
@@ -1442,7 +1451,7 @@ void Recorder::MarkCovered(VkAccessFlags access) {
 
 Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access) {
     ensureOpen();
-    flushDeferredDispatch();
+    flushDeferredDispatch(1);
     auto& pass = open->renderPass;
     if (!pass.open || forced || (countingSamples && segmentMode() && !segmentSlotReady(*open))) {
         const auto commands = Commands();
@@ -1527,7 +1536,7 @@ bool Recorder::AnyQueuedKeyStore(const std::function<bool(std::uint64_t, std::ui
 
 void Recorder::FlushKeyStores() {
     if (open == nullptr || open->keyStores.empty()) return;
-    flushDeferredDispatch();
+    flushDeferredDispatch(2);
     recordKeyStores(true);
 }
 
@@ -1608,7 +1617,7 @@ void Recorder::ensureOpen() {
 void Recorder::RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const std::byte> bytes, std::uint64_t address) {
     if (bytes.empty()) return;
     ensureOpen();
-    flushDeferredDispatch();
+    flushDeferredDispatch(3);
     auto& run = open->run;
     const VkDeviceSize end = offset + bytes.size();
     storeCount.fetch_add(1, std::memory_order_relaxed);
@@ -1801,7 +1810,7 @@ bool Recorder::AnyQueuedStore(const std::function<bool(std::uint64_t, std::uint6
 
 void Recorder::FlushStores() {
     if (open == nullptr || open->run.queued.empty()) return;
-    flushDeferredDispatch();
+    flushDeferredDispatch(4);
     closeStoreRun(false);
 }
 
@@ -2204,7 +2213,7 @@ void Recorder::PrepareSampleSlot() {
     GuestMemory::AssertGpuLockHeld("Recorder::PrepareSampleSlot");
     if (!countingSamples || !segmentMode()) return;
     ensureOpen();
-    flushDeferredDispatch();
+    flushDeferredDispatch(5);
     Require(!open->renderPass.open, "a sample slot is prepared inside a render pass");
     if (!segmentSlotReady(*open)) takeSegmentPool(*open);
 }
@@ -2395,7 +2404,7 @@ bool Recorder::DumpSamples(VkDeviceAddress target, std::uint64_t address) {
     GuestMemory::AssertGpuLockHeld("Recorder::DumpSamples");
     if (target == 0 || !gpuSampleCounter()) return false;
     countingSamples = true;
-    flushDeferredDispatch();
+    flushDeferredDispatch(5);
     if (segmentMode()) {
         ensureOpen();
         if (address != 0 && LabelRunsPerBatch() && pendingSamples.size() < SegmentFoldCapacity && open->queuedDumps < DumpFoldCapacity) {
@@ -3558,7 +3567,7 @@ void Recorder::Submit() {
     dropStaleHoldKept();
     if (open == nullptr) return;
     GuestMemory::AssertGpuLockHeld("Recorder::Submit");
-    flushDeferredDispatch();
+    flushDeferredDispatch(6);
     if (!open->keyStores.empty()) recordKeyStores(false);
     if (open->renderPass.open) endOpenRenderPass();
     const bool segments = segmentMode();

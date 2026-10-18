@@ -103,6 +103,10 @@ public:
     static std::uint32_t TakeDispatchOrder(bool& unordered);
     VkCommandBuffer OverlapCommands(std::uint32_t queueKey, VkAccessFlags* coveredAccess, bool& overlapped);
     void DeferDispatchBarrier(std::uint32_t queueKey);
+    // APS5_PROFILE_DRAW: deferred barriers recorded, by the path that recorded them (Commands, a draw
+    // pass, key stores, a label store, the store run, sample dumps, Submit), cumulative.
+    static constexpr std::size_t DeferredFlushSites = 7;
+    static std::array<std::uint64_t, DeferredFlushSites> DeferredFlushCounts();
     struct DrawPassStart {
         VkCommandBuffer commands = VK_NULL_HANDLE;
         bool continued = false;
@@ -807,7 +811,7 @@ private:
     // Opens a batch when none is open, without closing a store run (Commands() does both).
     void ensureOpen();
     // Records a deferred dispatch trailing barrier (see DeferDispatchBarrier), if any.
-    void flushDeferredDispatch();
+    void flushDeferredDispatch(std::size_t site);
     void dropStaleHoldKept();
     // Records the run's pending store (vkCmdUpdateBuffer), if any.
     void flushPendingStore();
