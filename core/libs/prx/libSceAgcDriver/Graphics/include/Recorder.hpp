@@ -611,6 +611,7 @@ public:
     // (or APS5_NO_BARRIER_ELISION=1) records every leading barrier, as before.
     static bool MergeBarriers();
     static void CountMerged(CommandClass which);
+    static bool BarrierBatch();
     static bool ElideCovered(CommandClass which, const BarrierMask& wanted, VkAccessFlags covered);
     // Hazard tracker, counting mode (APS5_BARRIER_VALIDATE=1): every command tells the tracker
     // what it reads and writes (guest ranges through host imports, images) with its stage before
