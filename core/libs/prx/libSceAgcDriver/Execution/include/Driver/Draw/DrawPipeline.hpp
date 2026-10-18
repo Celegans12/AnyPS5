@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <memory>
 #include <exception>
 #include <functional>
 #include <mutex>
@@ -23,9 +24,28 @@ namespace AgcDriver::DriverDetail {
 class DrawPipeline {
 public:
     using Commit = std::function<void()>;
+    // S1 (APS5_NO_SPLIT_DRAW_BUILD=1 off): an item's preparation, run by the preparer thread ahead
+    // of the committer for items not yet committed (at most PrepareAhead() from the front). It
+    // shares a PrepareSlot with the item's commit: the first of the two to claim the slot decides,
+    // so a commit either takes the finished preparation, waits for one in progress, or runs alone.
+    using Prepare = std::function<void()>;
+    class PrepareSlot {
+    public:
+        // The preparer: claims the slot (false when the commit took it first).
+        bool Begin();
+        void Finish(std::shared_ptr<void> result);
+        // The commit: the prepared result (waiting while the preparation runs), null when none ran.
+        std::shared_ptr<void> Take();
+    private:
+        std::mutex mutex;
+        std::condition_variable done;
+        int state = 0;
+        std::shared_ptr<void> result;
+    };
+    static std::size_t PrepareAhead();
     using Range = std::pair<std::uint64_t, std::uint64_t>;
     enum class DrainReason : std::uint8_t { Packet, Flush, Labels, Capture, Indirect, Submission, Count };
-    enum class Event : std::uint8_t { IndirectCommit, IndirectArgsDrain, Count };
+    enum class Event : std::uint8_t { IndirectCommit, IndirectArgsDrain, SatisfiedWaitKept, Count };
 
     static DrawPipeline& Queue0();
     static std::size_t Depth();
@@ -36,7 +56,7 @@ public:
     static std::atomic<std::uint64_t>& EpochToken();
     static void FollowEpoch(std::uint64_t token);
 
-    void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {});
+    void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, Prepare prepare = {});
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100);
     static std::uint64_t DrainRequestsByOpcode(std::uint32_t opcode);
     // DMA_DATA as pipeline items, and SET_PREDICATION, NOP sub-ops and non-overlapping DMA_DATA kept
@@ -69,6 +89,8 @@ private:
         std::vector<std::byte> labelBytes;
         std::vector<Range> reads;
         std::int64_t pushedNs = 0;
+        Prepare prepare;
+        bool prepareTaken = false;
     };
     DrawPipeline() = default;
     template<typename TRanges, typename TBounds>
@@ -94,6 +116,8 @@ private:
         return false;
     }
     void run();
+    void prepareLoop();
+    Item* nextPrepare();
     void retire(Item&& item);
     void reap();
     void rethrowFailure();
@@ -109,6 +133,9 @@ private:
     bool committerWaiting = false;
     bool stopped = false;
     std::thread thread;
+    std::thread preparer;
+    std::condition_variable prepareWake;
+    bool preparerWaiting = false;
     std::mutex retireMutex;
     std::condition_variable reapWake;
     std::deque<Item> retired;

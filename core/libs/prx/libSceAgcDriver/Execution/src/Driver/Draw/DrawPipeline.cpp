@@ -30,6 +30,14 @@ void traceWait(const char* scope, const char* stage, std::chrono::steady_clock::
     if (auto* trace = PerformanceTrace::Thread()) trace->Add(scope, stage, start, std::chrono::steady_clock::now());
 }
 
+// S1 preparer counters (the [draw] pipelined line): preparations run and their time, slots the
+// commit claimed first, commits that waited for a running preparation and how long.
+std::atomic<std::uint64_t> preparedItems{0};
+std::atomic<std::uint64_t> prepareNs{0};
+std::atomic<std::uint64_t> prepareWaits{0};
+std::atomic<std::uint64_t> prepareWaitNs{0};
+std::atomic<std::uint64_t> prepareLost{0};
+
 std::atomic<std::uint64_t> heldReadRanges{0};
 std::atomic<std::uint64_t> heldReadQueries{0};
 std::atomic<std::uint64_t> heldReadHits{0};
@@ -51,6 +59,83 @@ std::size_t DrawPipeline::Depth() {
         return value == 0 ? std::size_t{0} : value == 1 ? standard : static_cast<std::size_t>(std::min<unsigned long long>(value, 256));
     }();
     return depth;
+}
+
+std::size_t DrawPipeline::PrepareAhead() {
+    static const std::size_t ahead = [] {
+        const char* text = std::getenv("APS5_SPLIT_DRAW_AHEAD");
+        const auto value = text != nullptr ? std::strtoull(text, nullptr, 10) : 16ull;
+        return static_cast<std::size_t>(std::clamp<unsigned long long>(value, 1ull, 256ull));
+    }();
+    return ahead;
+}
+
+bool DrawPipeline::PrepareSlot::Begin() {
+    std::lock_guard lock(mutex);
+    if (state != 0) {
+        prepareLost.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    state = 1;
+    return true;
+}
+
+void DrawPipeline::PrepareSlot::Finish(std::shared_ptr<void> prepared) {
+    {
+        std::lock_guard lock(mutex);
+        result = std::move(prepared);
+        state = 2;
+    }
+    done.notify_all();
+}
+
+std::shared_ptr<void> DrawPipeline::PrepareSlot::Take() {
+    std::unique_lock lock(mutex);
+    if (state == 0) {
+        state = 3;
+        return nullptr;
+    }
+    if (state == 1) {
+        const auto start = std::chrono::steady_clock::now();
+        done.wait(lock, [&] { return state == 2; });
+        prepareWaits.fetch_add(1, std::memory_order_relaxed);
+        prepareWaitNs.fetch_add(elapsedNs(start), std::memory_order_relaxed);
+        traceWait("DrawPipeline", "prepare_wait", start);
+    }
+    state = 3;
+    return std::move(result);
+}
+
+DrawPipeline::Item* DrawPipeline::nextPrepare() {
+    std::size_t index = 0;
+    for (auto& item : items) {
+        if (index++ >= PrepareAhead()) break;
+        if (item.prepare && !item.prepareTaken) return &item;
+    }
+    return nullptr;
+}
+
+void DrawPipeline::prepareLoop() {
+    PerformanceTrace::BindThread("draw preparer");
+    for (;;) {
+        Prepare job;
+        {
+            std::unique_lock lock(mutex);
+            preparerWaiting = true;
+            prepareWake.wait(lock, [&] { return nextPrepare() != nullptr; });
+            preparerWaiting = false;
+            auto* item = nextPrepare();
+            item->prepareTaken = true;
+            job = item->prepare;
+        }
+        const auto start = std::chrono::steady_clock::now();
+        try {
+            job();
+        } catch (...) {
+        }
+        preparedItems.fetch_add(1, std::memory_order_relaxed);
+        prepareNs.fetch_add(elapsedNs(start), std::memory_order_relaxed);
+    }
 }
 
 bool DrawPipeline::PipelineIndirect() {
@@ -89,7 +174,7 @@ void DrawPipeline::rethrowFailure() {
     std::rethrow_exception(error);
 }
 
-void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes, std::vector<Range> reads) {
+void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes, std::vector<Range> reads, Prepare prepare) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     std::unique_lock lock(mutex);
     rethrowFailure();
@@ -108,10 +193,15 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     depthSum += items.size();
     ++enqueued;
     heldReadRanges.fetch_add(reads.size(), std::memory_order_relaxed);
-    items.push_back({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), std::move(reads), nowNs()});
+    const bool prepared = static_cast<bool>(prepare);
+    items.push_back({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), std::move(reads), nowNs(), std::move(prepare)});
     outstanding.fetch_add(1, std::memory_order_release);
     if (!thread.joinable()) thread = std::thread([this] { run(); });
     if (committerWaiting) wake.notify_one();
+    if (prepared) {
+        if (!preparer.joinable()) preparer = std::thread([this] { prepareLoop(); });
+        if (preparerWaiting) prepareWake.notify_one();
+    }
     if (!profile) return;
     const auto now = std::chrono::steady_clock::now();
     if (now - lastReport >= std::chrono::seconds(10)) report(now);
@@ -153,6 +243,12 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     char handoffs[256];
     std::snprintf(handoffs, sizeof(handoffs), "; hand-offs: %llu room waits woken %.1f us after the pop, %llu drains woken %.1f us after the last pop, committer idle %.1f ms in %llu gaps woken %.1f us after the push", static_cast<unsigned long long>(roomWaits), average(roomWakeNs, roomWaits), static_cast<unsigned long long>(drainWaits), average(drainWakeNs, drainWaits), static_cast<double>(committerIdleNs) / 1e6, static_cast<unsigned long long>(committerIdles), average(committerWakeNs, committerIdles));
     drainText += handoffs;
+    char kept[96];
+    std::snprintf(kept, sizeof(kept), "; satisfied waits kept the pipeline %llu", static_cast<unsigned long long>(counted[static_cast<std::size_t>(Event::SatisfiedWaitKept)]));
+    drainText += kept;
+    char prepares[224];
+    std::snprintf(prepares, sizeof(prepares), "; preparer: %llu prepared in %.1f ms, %llu claimed by the commit first, commits waited for %llu (%.1f ms)", static_cast<unsigned long long>(preparedItems.exchange(0, std::memory_order_relaxed)), static_cast<double>(prepareNs.exchange(0, std::memory_order_relaxed)) / 1e6, static_cast<unsigned long long>(prepareLost.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(prepareWaits.exchange(0, std::memory_order_relaxed)), static_cast<double>(prepareWaitNs.exchange(0, std::memory_order_relaxed)) / 1e6);
+    drainText += prepares;
     std::fprintf(stderr, "[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer (%.1f %% busy), %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room;%s; indirect commits %llu, indirect drains (args overlap) %llu; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, busy, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, reads, static_cast<unsigned long long>(counted[0]), static_cast<unsigned long long>(counted[1]), drainText.c_str());
     commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = 0;
     roomWaits = roomWakeNs = drainWaits = drainWakeNs = committerIdles = committerIdleNs = committerWakeNs = 0;
@@ -171,6 +267,7 @@ void DrawPipeline::run() {
             wake.wait(lock, [&] { return !items.empty(); });
             committerWaiting = false;
             commit = stopped ? nullptr : &items.front().commit;
+            items.front().prepareTaken = true;
             const auto begun = nowNs();
             if (lastFinishNs != 0 && items.front().pushedNs > lastFinishNs) {
                 ++committerIdles;
@@ -211,6 +308,7 @@ void DrawPipeline::run() {
             lastPopNs = lastFinishNs = nowNs();
             outstanding.fetch_sub(1, std::memory_order_release);
             if (idleWaiters != 0) idle.notify_all();
+            if (preparerWaiting) prepareWake.notify_one();
         }
         retire(std::move(done));
     }

@@ -214,6 +214,24 @@ public:
         std::size_t batchesToFinish;
     };
     std::optional<PendingWriteInfo> DescribePendingWrite(std::uint64_t address, std::size_t bytes) const;
+    // APS5_PROFILE_DRAW attribution of pending-write notes (the [htile] writer list): the thread
+    // that notes a write names the program it records (SetWriteOrigin, 0 = none) and, for a
+    // dispatch of the HTILE mask kernel's code, its mask and value words; each note keeps the
+    // packet tag, the origin and its range in a ring that OriginOfNote reads back.
+    struct WriteOrigin {
+        std::uint64_t note = 0;
+        std::uint64_t begin = 0;
+        std::uint64_t end = 0;
+        std::uint64_t program = 0;
+        std::uint32_t opcode = 0;
+        std::uint32_t queue = 0;
+        std::uint32_t mask = 0;
+        std::uint32_t value = 0;
+        bool kernel = false;
+    };
+    static void SetWriteOrigin(std::uint64_t program);
+    static void SetWriteOriginKernel(std::uint32_t mask, std::uint32_t value);
+    static std::optional<WriteOrigin> OriginOfNote(std::uint64_t note);
     // Ends and submits the open batch without waiting.
     void Submit();
     // Submits the open batch and returns the serial of the newest submitted batch (0 when nothing was

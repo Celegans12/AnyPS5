@@ -17,6 +17,7 @@
 #endif
 #include <algorithm>
 #include <array>
+#include <thread>
 #include <bit>
 #include <cstdio>
 #include <cstdlib>
@@ -1987,7 +1988,60 @@ void addressFailedSubmissionTests(const Context& context, const BdaTestAccess& a
     recorder.Sync();
 }
 
+// S1: a draw build made in two stages (DeferredDrawBuild: stage A on another thread without the
+// device lock, CompleteDraw() under it) binds the same layout and buffers as the one-step build;
+// stage A reads no guest bytes, so a store between the stages reaches the GPU; address tables are
+// refused; CompleteDraw runs once.
+void splitDrawBuildTests(const Context& context, const BdaTestAccess& access) {
+    alignas(64) std::array<std::uint32_t, 16> guest{};
+    guest[0] = 11;
+    const auto address = reinterpret_cast<std::uintptr_t>(guest.data());
+    ShaderRecompiler::RecompileResult vertex;
+    ShaderRecompiler::RecompileResult fragment;
+    auto buffer = binding(Role::GuestBuffers, 6);
+    buffer.guestDescriptor = {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32) & 0xffffu, sizeof(guest), 0x31000000u};
+    buffer.bufferWritten = {false};
+    buffer.bufferRead = {true};
+    fragment.bindings = {buffer};
+    const std::array<CompiledShader, 2> stages{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}}};
+    Require(!ShaderResources::StagesUseAddressTables(stages), "a draw without BDA tables counts as address-based");
+    std::vector<std::uint32_t> lockedKey;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> lockedReads;
+    bool lockedReusable = false;
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        ShaderResources locked(context, stages, ColorTarget{}, 0, 0, 0, {});
+        lockedKey = locked.LayoutKey();
+        lockedReads = locked.InPlaceReads();
+        lockedReusable = locked.Reusable();
+    }
+    std::unique_ptr<ShaderResources> split;
+    std::thread preparer([&] { split = std::make_unique<ShaderResources>(context, stages, ColorTarget{}, 0, 0, 0, DeferredDrawBuild{}); });
+    preparer.join();
+    Require(split != nullptr && !split->Completed(), "a deferred draw build completed in stage A");
+    guest[0] = 22;
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        split->CompleteDraw();
+        Require(split->Completed(), "CompleteDraw left the draw build incomplete");
+        Require(split->LayoutKey() == lockedKey, "the two-stage draw build has another set layout than the one-step build");
+        Require(split->InPlaceReads() == lockedReads && split->Reusable() == lockedReusable, "the two-stage draw build binds its buffers differently from the one-step build");
+        const auto bound = access.descriptor(6);
+        std::uint32_t seen = 0;
+        std::memcpy(&seen, access.bytes(bound.buffer).data() + bound.offset, sizeof(seen));
+        Require(seen == 22, "a store between the stages of a draw build did not reach the bound buffer (stage A read guest bytes)");
+        reject([&] { split->CompleteDraw(); }, "already completed");
+    }
+    ShaderRecompiler::RecompileResult addressed;
+    addressed.bdaAbiVersion = ShaderRecompiler::BdaAbi::Version;
+    addressed.bindings = {binding(Role::BdaPagetable, 4), binding(Role::FaultBuffer, 5)};
+    const std::array<CompiledShader, 2> addressStages{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &addressed, 0}}};
+    Require(ShaderResources::StagesUseAddressTables(addressStages), "a draw with a BDA table does not count as address-based");
+    reject([&] { ShaderResources refused(context, addressStages, ColorTarget{}, 0, 0, 0, DeferredDrawBuild{}); }, "cannot map address tables");
+}
+
 void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
+    splitDrawBuildTests(context, access);
     directImageFaultTests(context, access);
     bindlessFaultTests(context, access);
     guardedWrapFaultTests(context, access);
