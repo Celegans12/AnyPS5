@@ -1007,8 +1007,12 @@ private:
     // Finishes, in serial order, the in-flight batches of `lane` with serial <= `target` (first the
     // other lane's batches each of them waits for), waiting for their fences when `wait`.
     void finishLaneThrough(int lane, std::uint64_t target, bool wait, int source);
-    // The newest serial of `lane` <= `serial` still in flight (0: none).
+    // The newest serial of `lane` <= `serial` not yet retired (0: none). Callable without the GPU
+    // mutex (WaitSerial waits unlocked): it reads `laneLog` under its own mutex.
     std::uint64_t laneTargetAtOrBefore(int lane, std::uint64_t serial) const;
+    // (serial, lane) of every submitted batch not yet below the retired serial (async lane only).
+    mutable std::mutex laneLogMutex;
+    std::deque<std::pair<std::uint64_t, int>> laneLog;
     std::vector<std::shared_ptr<void>> holdKept;
     std::uint64_t holdKeptSerial = 0;
     std::deque<std::unique_ptr<Batch>> inFlight;

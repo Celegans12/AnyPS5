@@ -1378,10 +1378,11 @@ Recorder::Batch* Recorder::newestInFlight(int lane) const {
 }
 
 std::uint64_t Recorder::laneTargetAtOrBefore(int lane, std::uint64_t serial) const {
+    std::lock_guard logLock(laneLogMutex);
     std::uint64_t target = 0;
-    for (const auto& batch : inFlight) {
-        if (batch->serial > serial) break;
-        if (batch->lane == lane) target = batch->serial;
+    for (const auto& [submitted, submittedLane] : laneLog) {
+        if (submitted > serial) break;
+        if (submittedLane == lane) target = submitted;
     }
     return target;
 }
@@ -3878,6 +3879,10 @@ void Recorder::Submit() {
     batch->submitted = true;
     batch->serial = ++submissions;
     laneSubmitted[static_cast<std::size_t>(batch->lane)] = batch->serial;
+    if (asyncTimeline != VK_NULL_HANDLE) {
+        std::lock_guard logLock(laneLogMutex);
+        laneLog.emplace_back(batch->serial, batch->lane);
+    }
     submittedSerial.store(submissions, std::memory_order_release);
     batch->submittedAt = std::chrono::steady_clock::now();
     if (DrawProfiled()) {
@@ -4379,6 +4384,12 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
     // older one of the other lane, so the bound is the oldest still in flight.
     const auto retiredBound = inFlight.empty() ? batch->serial : std::min(batch->serial, inFlight.front()->serial - 1);
     for (auto seen = retiredSerial.load(std::memory_order_relaxed); seen < retiredBound && !retiredSerial.compare_exchange_weak(seen, retiredBound, std::memory_order_acq_rel);) {
+    }
+    if (asyncTimeline != VK_NULL_HANDLE) {
+        // Batches at or below the retired serial need no wait any more.
+        const auto retired = retiredSerial.load(std::memory_order_acquire);
+        std::lock_guard logLock(laneLogMutex);
+        while (!laneLog.empty() && laneLog.front().first <= retired) laneLog.pop_front();
     }
     readGpuTiming(*batch);
     readSamples(*batch);
