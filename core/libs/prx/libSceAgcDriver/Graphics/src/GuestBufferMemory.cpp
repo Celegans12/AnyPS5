@@ -4112,7 +4112,8 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             // in the same batch. The batch is opened first so that an import the flush's own
             // reconcile retires is handed to it (retireImport keeps nothing while the recorder is
             // idle) and outlives the copy.
-            static_cast<void>(recorder->Commands());
+            // (OpenBatch, not Commands: an open dispatch run of the ring stays open, see Recorder::RunCommands.)
+            recorder->OpenBatch();
             StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(bytes), nullptr, "copied buffer region");
             region.gpuCopy = true;
             gpuCopies.push_back(&region);

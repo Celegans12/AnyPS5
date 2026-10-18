@@ -114,6 +114,8 @@ public:
     // no part in it yet; `inRun` then says the copies need no leading barrier (the run's first
     // dispatch ordered everything before the run for transfers too). Else Commands().
     VkCommandBuffer RunCommands(std::uint32_t queueKey, const void* owner, bool& inRun);
+    // Opens a batch when none is open, recording nothing (no deferred dispatch barrier either).
+    void OpenBatch() { ensureOpen(); }
     // Work an overlapping dispatch owes after itself (its staged copy-backs): recorded right after
     // the deferred barrier, wherever that is recorded. Only while a run is open.
     void AfterRun(std::function<void(Recorder&)> work);
