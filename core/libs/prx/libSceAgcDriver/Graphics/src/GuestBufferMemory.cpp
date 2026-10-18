@@ -2757,13 +2757,15 @@ const HostImport* HostImportFor(const Context& context, std::uint64_t address, s
 
 // HostImportFor answered from the import a caller's previous lookup of the same range returned,
 // while no import was dropped (epoch) or added (inserts) since and the registry is unchanged since
-// the imports were reconciled; the same last-use stamp as a hit of the full lookup.
+// the imports were reconciled; the same last-use stamps as a hit of the full lookup.
 const HostImport* HostImportForCached(const Context& context, std::uint64_t address, std::size_t bytes, HostImportLookupCache& cache) {
     if (context.hostImportAlignment == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return nullptr;
     ensurePinWaiter();
     auto& state = Imports();
     std::lock_guard lock(state.mutex);
     if (cache.import != nullptr && cache.address == address && cache.bytes == bytes && cache.epoch == state.epoch && cache.inserts == state.inserts && !importsStale(context, state)) {
+        // Two stamps, as a hit of the full lookup (findImport, then hostImportLocked's own).
+        cache.import->lastUse = ++state.useCounter;
         cache.import->lastUse = ++state.useCounter;
         return cache.import;
     }
