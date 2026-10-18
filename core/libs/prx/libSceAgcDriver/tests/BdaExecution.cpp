@@ -376,6 +376,20 @@ static void RunBdaAnchorTests(const Context& context) {
     ranges = {{0, limit, large.DeviceAddress(), Abi::Read, 0}};
     count = 1;
     compare(*stopping, {limit - 1}, {0xffffffffu});
+    ranges = {{0x100000, 0x100010, top.DeviceAddress(), Abi::Read, 0}};
+    for (std::uint64_t index = 1; index < 8u; ++index) ranges.push_back({0x10000000 + index * 0x1000, 0x10000010 + index * 0x1000, above.DeviceAddress(), Abi::Read, 0});
+    count = static_cast<std::uint32_t>(ranges.size());
+    std::vector<std::uint32_t> mixed(lanes, 0x100u);
+    mixed[26] = 0x1u;
+    mixed[31] = 0x110u;
+    mixed[40] = 0x10cu;
+    const auto divergent = run(continuing->plain, 2, 0xfff00, mixed);
+    Require(divergent.fault.state == Abi::FaultState::Ready && divergent.fault.reason == Abi::FaultReason::Unmapped, "a subgroup reading below the first range, past a range's end and inside it did not record the unmapped read");
+    for (std::uint32_t lane = 0; lane < lanes; ++lane) {
+        const auto expected = lane == 26u || lane == 31u ? 0u : dword(top, lane == 40u ? 0xcu : 0u);
+        Require(divergent.values[lane * 4u] == expected, "a subgroup reading below the first range, past a range's end and inside it returned a wrong value in lane " + std::to_string(lane));
+    }
+    compare(*continuing, {0xfff00}, mixed);
 }
 
 void RunBdaExecutionTests(const Context& context) {
