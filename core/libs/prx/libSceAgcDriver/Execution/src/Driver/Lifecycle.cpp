@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
@@ -37,7 +38,8 @@ void PrintFailure(std::exception_ptr error) {
     try {
         std::rethrow_exception(error);
     } catch (const std::exception& cause) {
-        std::fprintf(stderr, "[gpu] driver failure: %s\n", cause.what());
+        const auto packet = GuestMemory::CurrentPacket();
+        std::fprintf(stderr, "[gpu] driver failure: %s (packet 0x%x queue 0x%x, %s)\n", cause.what(), packet.opcode, packet.queue, DrawPipeline::Active() ? "queue-0 worker" : "not the queue-0 worker");
     } catch (...) {
         std::fprintf(stderr, "[gpu] driver failure with a non-standard exception\n");
     }
