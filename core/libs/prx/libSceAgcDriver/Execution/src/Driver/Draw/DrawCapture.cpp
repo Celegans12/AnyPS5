@@ -84,8 +84,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
         static std::mutex mutex;
         static std::set<std::uint64_t> printed;
         std::lock_guard lock(mutex);
-        if (printed.insert(program.binary.codeAddress).second) std::fprintf(stderr, "[indirect-shader] 0x%llx %s: base sgpr %d inst sgpr %d firstUser %u srt asBase 0x%llx asValue 0x%llx reads %zu
-", static_cast<unsigned long long>(program.binary.codeAddress), name.c_str(), drawParameters.indirect->baseVertexSgpr, drawParameters.indirect->startInstanceSgpr, program.firstUserSgpr, static_cast<unsigned long long>(capture->userDataUse.asBase), static_cast<unsigned long long>(capture->userDataUse.asValue), capture->userDataUse.reads.size());
+        if (printed.insert(program.binary.codeAddress).second) std::fprintf(stderr, "[indirect-shader] 0x%llx %s: base sgpr %d inst sgpr %d firstUser %u srt asBase 0x%llx asValue 0x%llx reads %zu\n", static_cast<unsigned long long>(program.binary.codeAddress), name.c_str(), drawParameters.indirect->baseVertexSgpr, drawParameters.indirect->startInstanceSgpr, program.firstUserSgpr, static_cast<unsigned long long>(capture->userDataUse.asBase), static_cast<unsigned long long>(capture->userDataUse.asValue), capture->userDataUse.reads.size());
     }
     if (dumpTarget != 0) {
 

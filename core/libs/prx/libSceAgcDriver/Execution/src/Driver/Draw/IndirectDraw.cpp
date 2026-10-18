@@ -70,8 +70,7 @@ std::optional<Graphics::IndirectDrawPath> Driver::ClassifyIndirectDraw(const Sha
         std::snprintf(key, sizeof(key), "vs 0x%llx op 0x%x rec %u stride %u count %u%s idx %d base s%d inst s%d draw s%d%s analyzer v=%d i=%d shared=%d/%d conflict=%d/%d indx=%u fetch attrs %zu firstUser %u userWords %zu -> %s", static_cast<unsigned long long>(frontProgram.binary.codeAddress), indirect.opcode, indirect.recordBytes, indirect.stride, indirect.count, indirect.countIndirect ? " (count indirect)" : "", drawParameters.indexed ? 1 : 0, indirect.baseVertexSgpr, indirect.startInstanceSgpr, indirect.drawIndexSgpr, indirect.drawIndexEnabled ? " (enabled)" : "", result.vertexOffsetSgpr, result.instanceOffsetSgpr, result.vertexOffsetShared ? 1 : 0, result.instanceOffsetShared ? 1 : 0, result.vertexOffsetConflict ? 1 : 0, result.instanceOffsetConflict ? 1 : 0, indirect.indxOffset, result.vertexAttributes.size(), frontProgram.firstUserSgpr, frontProgram.userData.size(), Graphics::IndirectDrawPathName(*indirectCpu));
         std::lock_guard lock(mutex);
         const auto hits = ++seen[key];
-        if ((hits & (hits - 1)) == 0) std::fprintf(stderr, "[not-folded] %s (seen %llu)
-", key, static_cast<unsigned long long>(hits));
+        if ((hits & (hits - 1)) == 0) std::fprintf(stderr, "[not-folded] %s (seen %llu)\n", key, static_cast<unsigned long long>(hits));
     }
     if (traceIndirect) {
         const auto location = [](std::uint32_t value, std::int32_t sgpr) { char text[24]; if (value == 0x280u) std::snprintf(text, sizeof(text), "none"); else std::snprintf(text, sizeof(text), "0x%x(s%d)", value, sgpr); return std::string(text); };
