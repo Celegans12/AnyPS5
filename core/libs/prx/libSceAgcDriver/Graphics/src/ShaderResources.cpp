@@ -839,6 +839,26 @@ bool untrackedStillMatches(std::uint64_t address, std::size_t bytes, std::span<c
     GuestMemory::FlushGpuWrites(address, bytes);
     GuestMemory::BlockMatch match;
     const bool equal = GuestMemory::CommittedBlocksMatchMarked(address, bytes, hashes, stale, &match, layoutWalk ? &current : nullptr);
+    static const bool verifyBlocks = std::getenv("APS5_VERIFY_UNTRACKED_BLOCKS") != nullptr;
+    if (verifyBlocks && equal) {
+        static std::atomic<std::uint64_t> checked{0}, differed{0}, compares{0};
+        thread_local std::vector<std::uint8_t>* cleanSlot = nullptr;
+        auto& clean = ShaderRecompiler::ThreadOwned(cleanSlot);
+        clean.assign(count, 0);
+        std::size_t cleanBlocks = 0;
+        for (std::size_t i = 0; i < count && i < stale.size(); ++i) {
+            if (stale[i] != 0) continue;
+            clean[i] = 1;
+            ++cleanBlocks;
+        }
+        if (cleanBlocks != 0) {
+            GuestMemory::BlockMatch verify;
+            const bool still = GuestMemory::CommittedBlocksMatchMarked(address, bytes, hashes, clean, &verify);
+            checked.fetch_add(cleanBlocks, std::memory_order_relaxed);
+            if (!still) differed.fetch_add(1, std::memory_order_relaxed);
+            if (compares.fetch_add(1, std::memory_order_relaxed) % 20000 == 19999 || !still) std::fprintf(stderr, "[texhash] verify: %llu compares, %llu blocks proved clean re-hashed, %llu compares with a clean block that differs%c", static_cast<unsigned long long>(compares.load()), static_cast<unsigned long long>(checked.load()), static_cast<unsigned long long>(differed.load()), 10);
+        }
+    }
     if (equal && walked != 0 && (now[0] & 1u) == 0 && !pendingAny) {
         since = walked;
         guard = now;
