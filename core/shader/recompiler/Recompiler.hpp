@@ -52,6 +52,13 @@ struct ShaderComputeStageInfo {
     std::uint32_t threadIdComponentCount;
     std::array<std::uint32_t, 3> partialThreads;
     std::uint32_t scratchDwords = 0;
+    // The dispatch runs exactly one workgroup (a direct dispatch of 1x1x1 groups, set by the driver):
+    // the guest's glc buffer loads then only need workgroup-scope coherence, since every other
+    // writer of the buffer that can run beside them is an invocation of the same workgroup on the
+    // same SM (other dispatches are ordered by the barriers between them). The SPIR-V reads them
+    // through the L1-cached binding and s_barrier also orders buffer memory (SpirvRuntimeBuffer,
+    // SpirvFlowEmitter). APS5_NO_SINGLE_GROUP_COHERENCE=1 (driver) leaves it unset.
+    bool singleWorkgroup = false;
 
     [[nodiscard]] bool PartialGroups() const {
         return partialThreads != std::array<std::uint32_t, 3>{};
@@ -281,6 +288,9 @@ struct SpirvTarget {
     bool float16DenormPreserve = false;
     bool bindlessImages = false;
     bool spannedWaves = false;
+    // GLSL.std.450 Fma is a fused multiply-add on the device (the driver's startup probe, VulkanDevice
+    // FusedFmaProbe): v_fma_mix* then takes an exact f32 path instead of the f64 helper.
+    bool fusedFma = false;
 };
 
 struct BindingLayout {

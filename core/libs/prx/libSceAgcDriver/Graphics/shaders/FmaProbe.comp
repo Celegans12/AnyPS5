@@ -1,0 +1,16 @@
+#version 450
+// Startup probe (VulkanDevice, FusedFmaProbe): whether GLSL.std.450 Fma is a fused multiply-add on this device.
+// Each invocation stores fma(a, b, c) for its triple; the host compares every result bit for bit with std::fma.
+// `precise` makes glslang decorate the arithmetic NoContraction, as the recompiler's exact f16 mix path does.
+layout(local_size_x = 64) in;
+layout(std430, set = 0, binding = 0) readonly buffer Inputs { vec4 triples[]; };
+layout(std430, set = 0, binding = 1) writeonly buffer Outputs { uint results[]; };
+layout(push_constant) uniform Count { uint count; };
+
+void main() {
+    const uint index = gl_GlobalInvocationID.x;
+    if (index >= count) return;
+    const vec4 triple = triples[index];
+    precise float fused = fma(triple.x, triple.y, triple.z);
+    results[index] = floatBitsToUint(fused);
+}

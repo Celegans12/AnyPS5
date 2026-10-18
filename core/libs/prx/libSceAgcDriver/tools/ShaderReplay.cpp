@@ -413,6 +413,24 @@ bool Replay(const char* path, std::unique_ptr<AgcDriver::VulkanDevice>& device) 
         request.request.target.spannedWaves = true;
         std::printf("  spanned waves (APS5_SPANNED_WAVE): a single-wave wave64 compute program spans two full 32-lane subgroups\n");
     }
+    // Requests captured before the single-workgroup flag (serializer version 32) lack it: APS5_REPLAY_SINGLE_GROUP=
+    // <program>[,<program>...] (hex addresses, low 36 bits compared) replays those programs' compute requests as the
+    // driver records their 1x1x1 dispatches (ShaderComputeStageInfo::singleWorkgroup), e.g. to precompile them.
+    if (const char* programs = std::getenv("APS5_REPLAY_SINGLE_GROUP"); programs != nullptr && request.request.context.compute.has_value() && !request.request.context.compute->singleWorkgroup) {
+        const auto address = request.request.shader.codeAddress & 0xfffffffffull;
+        for (const char* cursor = programs; *cursor != '\0';) {
+            char* end = nullptr;
+            const auto listed = std::strtoull(cursor, &end, 16);
+            if (end == cursor) break;
+            if ((listed & 0xfffffffffull) == address) {
+                request.compute->singleWorkgroup = true;
+                request.request.context.compute = request.compute;
+                std::printf("  single workgroup (APS5_REPLAY_SINGLE_GROUP): replayed as a 1x1x1 dispatch\n");
+                break;
+            }
+            cursor = *end == ',' ? end + 1 : end;
+        }
+    }
     if (g_bindless) {
         request.request.target.bindlessImages = true;
         std::printf("  bindless images (--bindless or APS5_BINDLESS_IMAGES=1): table images read through the descriptor heap\n");

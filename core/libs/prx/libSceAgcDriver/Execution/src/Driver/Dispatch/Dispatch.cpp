@@ -247,6 +247,15 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
         }
     }
     if (partialLastGroup) compute.partialThreads = partialGroups;
+    // One workgroup (direct, 1x1x1 groups, or a thread count inside one group): workgroup-scope
+    // coherence for its glc reads (ShaderComputeStageInfo::singleWorkgroup). APS5_NO_SINGLE_GROUP_COHERENCE=1 off.
+    static const bool singleGroupCoherence = std::getenv("APS5_NO_SINGLE_GROUP_COHERENCE") == nullptr;
+    if (singleGroupCoherence && indirectArguments == 0) {
+        const bool threads = (packet[4] & 0x20u) != 0;
+        bool single = true;
+        for (std::uint32_t axis = 0; axis < 3; ++axis) single = single && (threads ? packet[1 + axis] <= compute.numThreads[axis] : packet[1 + axis] == 1u);
+        compute.singleWorkgroup = single && packet[1] != 0 && packet[2] != 0 && packet[3] != 0;
+    }
     ShaderRecompiler::RecompileRequest request{
         {ShaderRecompiler::ShaderStage::Compute, address, std::span(snapshot.code).subspan(codeOffset), snapshot.headerAddress, snapshot.header},
         {(packet[4] & 0x8000u) != 0 ? 32u : 64u, 0, userData, compute, std::nullopt, std::nullopt, memory, DispatchFloatMode(snapshot, queue.shader)},
@@ -296,6 +305,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
     mix(address);
     mix(packet[4] & 0x8000u);
     for (const auto threads : compute.partialThreads) mix(threads);
+    mix(compute.singleWorkgroup ? 0x51u : 0u);
     for (const auto word : userData) mix(word);
 
     static const bool keyHygiene = std::getenv("APS5_NO_DISPATCH_KEY_HYGIENE") == nullptr;

@@ -83,6 +83,19 @@ add_custom_command(
         VERBATIM
 )
 
+set(agcFmaProbeShaderSource ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/FmaProbe.comp)
+set(agcFmaProbeShaderSpv ${agcTextureDetileGeneratedDir}/FmaProbe.spv)
+set(agcFmaProbeShaderHeader ${agcTextureDetileGeneratedDir}/FmaProbe_spv.h)
+add_custom_command(
+        OUTPUT "${agcFmaProbeShaderHeader}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${agcTextureDetileGeneratedDir}"
+        COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -o "${agcFmaProbeShaderSpv}" "${agcFmaProbeShaderSource}"
+        COMMAND ${CMAKE_COMMAND} -DINPUT=${agcFmaProbeShaderSpv} -DOUTPUT=${agcFmaProbeShaderHeader}
+        -DSYMBOL=FMA_PROBE_SPV -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
+        DEPENDS "${agcFmaProbeShaderSource}" glslang-standalone
+        VERBATIM
+)
+
 set(agcCmaskClearShaderSource ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/CmaskClear.comp)
 set(agcCmaskClearShaderSpv ${agcTextureDetileGeneratedDir}/CmaskClear.spv)
 set(agcCmaskClearShaderHeader ${agcTextureDetileGeneratedDir}/CmaskClear_spv.h)
@@ -265,6 +278,7 @@ set(agcDriverSources
         ${agcCmaskClearShaderHeader}
         ${agcMeshArgumentsShaderHeader}
         ${agcStagingDiffShaderHeader}
+        ${agcFmaProbeShaderHeader}
         ${agcTextureDetileImageShaderHeader}
         ${agcDispatchArgumentsShaderHeader}
         ${agcSampleCounterShaderHeader}

@@ -5,7 +5,7 @@ namespace ShaderRecompiler {
 
 namespace {
 
-constexpr std::uint32_t CurrentVersion = 31u;
+constexpr std::uint32_t CurrentVersion = 32u;
 constexpr std::uint32_t LocalFeatures = 22u;
 constexpr char kBase64Alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -831,6 +831,10 @@ DeserializedRequest deserialize(std::string_view decoded, std::uint32_t version,
         result.linkedCallFallbacks = reader.ReadU32Vector();
         result.request.context.linkedCallFallbacks = result.linkedCallFallbacks;
     }
+    if (version >= 32u && result.request.context.compute.has_value()) {
+        result.compute->singleWorkgroup = reader.ReadBool();
+        result.request.context.compute = result.compute;
+    }
     if (version >= 21u && reader.Remaining() != 0u) throw std::runtime_error("RequestSerializer: unexpected trailing data");
     if (exact && !reader.Done()) throw std::runtime_error("RequestSerializer: trailing data");
     return result;
@@ -867,6 +871,7 @@ std::string RequestSerializer::Serialize(const RecompileRequest& request) const 
     writer.WriteBool(request.target.vertexSubgroups);
     writer.WriteBool(request.target.float16DenormPreserve);
     writer.WriteU32Span(request.context.linkedCallFallbacks);
+    if (request.context.compute.has_value()) writer.WriteBool(request.context.compute->singleWorkgroup);
     return base64Encode(buffer);
 }
 
@@ -877,6 +882,8 @@ DeserializedRequest RequestSerializer::Deserialize(std::string_view text) const 
     const auto version = reader.ReadU32();
     if (version < 1u || version > CurrentVersion) throw std::runtime_error("unsupported recompile request serialization version");
     if (version >= CurrentVersion) return deserialize(decoded, version, LocalFeatures, false);
+    // The previous current version (31) took the current path; it only lacks the single-workgroup flag.
+    if (version == 31u) return deserialize(decoded, version, LocalFeatures, false);
     if (version == 24u || version == 26u || version == 30u) {
         try {
             return deserialize(decoded, version == 26u ? 25u : version == 30u ? 29u : version, LocalFeatures, true);

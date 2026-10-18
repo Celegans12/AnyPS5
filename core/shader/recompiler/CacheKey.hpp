@@ -161,6 +161,7 @@ private:
         append(key, value.threadIdComponentCount);
         append(key, value.PartialGroups());
         append(key, value.scratchDwords);
+        append(key, value.singleWorkgroup);
     }
 
     static void append(std::vector<std::uint64_t>& key, const ShaderPixelStageInfo& value) {
@@ -263,6 +264,7 @@ private:
         append(key, value.float16DenormPreserve);
         append(key, value.bindlessImages);
         append(key, value.spannedWaves);
+        append(key, value.fusedFma);
     }
 };
 

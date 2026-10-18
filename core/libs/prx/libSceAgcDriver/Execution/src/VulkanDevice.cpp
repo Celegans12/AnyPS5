@@ -16,6 +16,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PipelineLinkOptimization.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DrawInputsInPlace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/SubgroupClock.hpp"
+#include "prx/libSceAgcDriver/Graphics/shaders/FmaProbe_spv.h"
 #include "prx/libSceAgcDriver/Execution/include/ShaderDeviceProfile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PresentMode.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PresentationPass.hpp"
@@ -47,6 +48,8 @@
 #include <windows.h>
 #endif
 #include <atomic>
+#include <bit>
+#include <cmath>
 #include <chrono>
 #include <charconv>
 #include <condition_variable>
@@ -291,6 +294,8 @@ struct VulkanDevice::State {
     bool shaderClock = false;
     bool narrowSubgroupClock = false;
     bool float64DenormPreserve = false;
+    // Startup probe (fusedFmaProbe): GLSL.std.450 Fma is fused on this device (SpirvTarget::fusedFma).
+    bool fusedFma = false;
     bool float16DenormPreserve = false;
     bool demoteToHelperInvocation = false;
     bool earlyFragmentSampleMaskTestBeforeSampleCounting = false;
@@ -1831,11 +1836,12 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         }
     }
     deviceInfo.pNext = &bdaFeatures;
-    auto shaderProfile = std::make_unique<const ShaderDeviceProfile>(buildTarget(), deviceInfo, state->properties.limits);
     check(state->InstanceFunction<PFN_vkCreateDevice>("vkCreateDevice")(selected, &deviceInfo, nullptr, &state->device), "vkCreateDevice");
     state->deviceProc = MemoryStats::TrackDevice(state->device, selected, state->memoryProperties, state->deviceProc,
         state->memoryBudget ? state->InstanceFunction<PFN_vkGetPhysicalDeviceMemoryProperties2>("vkGetPhysicalDeviceMemoryProperties2") : nullptr);
-    state->shaderProfile = std::move(shaderProfile);
+    // Before the profile (its target carries the result into every recompile and cache key).
+    state->fusedFma = fusedFmaProbe(*state, family);
+    state->shaderProfile = std::make_unique<const ShaderDeviceProfile>(buildTarget(), deviceInfo, state->properties.limits);
     if (compileOnly) return;
     if (calibratedTimestamps != nullptr) {
         const bool khr = std::strcmp(calibratedTimestamps, VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) == 0;
@@ -3507,6 +3513,184 @@ ShaderRecompiler::SpirvTarget VulkanDevice::Target() const {
     return state->shaderProfile->Target();
 }
 
+// Whether GLSL.std.450 Fma is a fused multiply-add here (one rounding), which the recompiler's exact f32
+// path for v_fma_mix* needs (SpirvTarget::fusedFma; Vulkan does not promise it). One dispatch of
+// FmaProbe.comp over 4,096 triples whose fused and unfused results differ (c = -round(a * b), so a
+// fused fma returns the product's rounding error and an unfused one 0) plus random ones, compared
+// bit for bit with std::fma. Any Vulkan failure or mismatch answers false (the f64 helper as
+// before); APS5_NO_MIX_F32=1 skips the f32 path in the recompiler whatever the probe found.
+bool VulkanDevice::fusedFmaProbe(const State& device, std::uint32_t family) {
+    constexpr std::uint32_t Count = 4096;
+    std::vector<float> triples(Count * 4u);
+    std::uint64_t seed = 0x9e3779b97f4a7c15ull;
+    const auto next = [&] {
+        seed ^= seed << 13u;
+        seed ^= seed >> 7u;
+        seed ^= seed << 17u;
+        return seed;
+    };
+    const auto unit = [&](int exponent) {
+        // A float in [2^exponent, 2^(exponent + 1)) with a random 23-bit mantissa and sign.
+        const auto word = (static_cast<std::uint32_t>(exponent + 127) << 23u) | static_cast<std::uint32_t>(next() & 0x7fffffu) | (next() & 1u ? 0x80000000u : 0u);
+        return std::bit_cast<float>(word);
+    };
+    std::vector<std::uint32_t> expected(Count);
+    for (std::uint32_t index = 0; index < Count; ++index) {
+        const float a = unit(static_cast<int>(next() % 40u) - 20);
+        const float b = unit(static_cast<int>(next() % 40u) - 20);
+        const float c = index % 2u == 0 ? -(a * b) : unit(static_cast<int>(next() % 40u) - 20);
+        triples[index * 4u + 0] = a;
+        triples[index * 4u + 1] = b;
+        triples[index * 4u + 2] = c;
+        triples[index * 4u + 3] = 0.0f;
+        expected[index] = std::bit_cast<std::uint32_t>(std::fma(a, b, c));
+    }
+    const auto fn = [&](const char* name) { return device.deviceProc(device.device, name); };
+    const auto vk = [&](const char* name) {
+        auto function = fn(name);
+        if (function == nullptr) throw std::runtime_error(std::string("FMA probe: missing ") + name);
+        return function;
+    };
+    VkDevice handle = device.device;
+    VkBuffer buffers[2]{};
+    VkDeviceMemory memories[2]{};
+    VkShaderModule module = VK_NULL_HANDLE;
+    VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    VkCommandPool commandPool = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+    bool fused = false;
+    const char* failure = nullptr;
+    try {
+        const VkDeviceSize sizes[2]{triples.size() * sizeof(float), Count * sizeof(std::uint32_t)};
+        void* mapped[2]{};
+        for (int index = 0; index < 2; ++index) {
+            VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+            info.size = sizes[index];
+            info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+            if (reinterpret_cast<PFN_vkCreateBuffer>(vk("vkCreateBuffer"))(handle, &info, nullptr, &buffers[index]) != VK_SUCCESS) throw std::runtime_error("FMA probe: vkCreateBuffer");
+            VkMemoryRequirements requirements{};
+            reinterpret_cast<PFN_vkGetBufferMemoryRequirements>(vk("vkGetBufferMemoryRequirements"))(handle, buffers[index], &requirements);
+            constexpr VkMemoryPropertyFlags flags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+            std::uint32_t type = device.memoryProperties.memoryTypeCount;
+            for (std::uint32_t candidate = 0; candidate < device.memoryProperties.memoryTypeCount; ++candidate) {
+                if ((requirements.memoryTypeBits & (1u << candidate)) != 0 && (device.memoryProperties.memoryTypes[candidate].propertyFlags & flags) == flags) {
+                    type = candidate;
+                    break;
+                }
+            }
+            if (type == device.memoryProperties.memoryTypeCount) throw std::runtime_error("FMA probe: no host-coherent memory");
+            VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            allocation.allocationSize = requirements.size;
+            allocation.memoryTypeIndex = type;
+            if (reinterpret_cast<PFN_vkAllocateMemory>(vk("vkAllocateMemory"))(handle, &allocation, nullptr, &memories[index]) != VK_SUCCESS) throw std::runtime_error("FMA probe: vkAllocateMemory");
+            if (reinterpret_cast<PFN_vkBindBufferMemory>(vk("vkBindBufferMemory"))(handle, buffers[index], memories[index], 0) != VK_SUCCESS) throw std::runtime_error("FMA probe: vkBindBufferMemory");
+            if (reinterpret_cast<PFN_vkMapMemory>(vk("vkMapMemory"))(handle, memories[index], 0, VK_WHOLE_SIZE, 0, &mapped[index]) != VK_SUCCESS) throw std::runtime_error("FMA probe: vkMapMemory");
+        }
+        std::memcpy(mapped[0], triples.data(), sizes[0]);
+        std::memset(mapped[1], 0, sizes[1]);
+        VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        moduleInfo.codeSize = sizeof(FMA_PROBE_SPV);
+        moduleInfo.pCode = FMA_PROBE_SPV;
+        if (reinterpret_cast<PFN_vkCreateShaderModule>(vk("vkCreateShaderModule"))(handle, &moduleInfo, nullptr, &module) != VK_SUCCESS) throw std::runtime_error("FMA probe: vkCreateShaderModule");
+        VkDescriptorSetLayoutBinding bindings[2]{};
+        for (std::uint32_t index = 0; index < 2; ++index) bindings[index] = {index, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        VkDescriptorSetLayoutCreateInfo setInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        setInfo.bindingCount = 2;
+        setInfo.pBindings = bindings;
+        if (reinterpret_cast<PFN_vkCreateDescriptorSetLayout>(vk("vkCreateDescriptorSetLayout"))(handle, &setInfo, nullptr, &setLayout) != VK_SUCCESS) throw std::runtime_error("FMA probe: vkCreateDescriptorSetLayout");
+        const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, 4};
+        VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        layoutInfo.setLayoutCount = 1;
+        layoutInfo.pSetLayouts = &setLayout;
+        layoutInfo.pushConstantRangeCount = 1;
+        layoutInfo.pPushConstantRanges = &push;
+        if (reinterpret_cast<PFN_vkCreatePipelineLayout>(vk("vkCreatePipelineLayout"))(handle, &layoutInfo, nullptr, &layout) != VK_SUCCESS) throw std::runtime_error("FMA probe: vkCreatePipelineLayout");
+        VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        pipelineInfo.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, module, "main", nullptr};
+        pipelineInfo.layout = layout;
+        if (reinterpret_cast<PFN_vkCreateComputePipelines>(vk("vkCreateComputePipelines"))(handle, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipeline) != VK_SUCCESS) throw std::runtime_error("FMA probe: vkCreateComputePipelines");
+        const VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2};
+        VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        poolInfo.maxSets = 1;
+        poolInfo.poolSizeCount = 1;
+        poolInfo.pPoolSizes = &poolSize;
+        if (reinterpret_cast<PFN_vkCreateDescriptorPool>(vk("vkCreateDescriptorPool"))(handle, &poolInfo, nullptr, &pool) != VK_SUCCESS) throw std::runtime_error("FMA probe: vkCreateDescriptorPool");
+        VkDescriptorSetAllocateInfo setAllocation{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        setAllocation.descriptorPool = pool;
+        setAllocation.descriptorSetCount = 1;
+        setAllocation.pSetLayouts = &setLayout;
+        VkDescriptorSet set = VK_NULL_HANDLE;
+        if (reinterpret_cast<PFN_vkAllocateDescriptorSets>(vk("vkAllocateDescriptorSets"))(handle, &setAllocation, &set) != VK_SUCCESS) throw std::runtime_error("FMA probe: vkAllocateDescriptorSets");
+        VkDescriptorBufferInfo bufferInfos[2]{{buffers[0], 0, VK_WHOLE_SIZE}, {buffers[1], 0, VK_WHOLE_SIZE}};
+        VkWriteDescriptorSet writes[2]{};
+        for (std::uint32_t index = 0; index < 2; ++index) {
+            writes[index] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            writes[index].dstSet = set;
+            writes[index].dstBinding = index;
+            writes[index].descriptorCount = 1;
+            writes[index].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[index].pBufferInfo = &bufferInfos[index];
+        }
+        reinterpret_cast<PFN_vkUpdateDescriptorSets>(vk("vkUpdateDescriptorSets"))(handle, 2, writes, 0, nullptr);
+        VkCommandPoolCreateInfo commandPoolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        commandPoolInfo.queueFamilyIndex = family;
+        if (reinterpret_cast<PFN_vkCreateCommandPool>(vk("vkCreateCommandPool"))(handle, &commandPoolInfo, nullptr, &commandPool) != VK_SUCCESS) throw std::runtime_error("FMA probe: vkCreateCommandPool");
+        VkCommandBufferAllocateInfo commandAllocation{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        commandAllocation.commandPool = commandPool;
+        commandAllocation.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        commandAllocation.commandBufferCount = 1;
+        VkCommandBuffer commands = VK_NULL_HANDLE;
+        if (reinterpret_cast<PFN_vkAllocateCommandBuffers>(vk("vkAllocateCommandBuffers"))(handle, &commandAllocation, &commands) != VK_SUCCESS) throw std::runtime_error("FMA probe: vkAllocateCommandBuffers");
+        VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        reinterpret_cast<PFN_vkBeginCommandBuffer>(vk("vkBeginCommandBuffer"))(commands, &begin);
+        reinterpret_cast<PFN_vkCmdBindPipeline>(vk("vkCmdBindPipeline"))(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+        reinterpret_cast<PFN_vkCmdBindDescriptorSets>(vk("vkCmdBindDescriptorSets"))(commands, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, nullptr);
+        const std::uint32_t count = Count;
+        reinterpret_cast<PFN_vkCmdPushConstants>(vk("vkCmdPushConstants"))(commands, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 4, &count);
+        reinterpret_cast<PFN_vkCmdDispatch>(vk("vkCmdDispatch"))(commands, Count / 64u, 1, 1);
+        VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT};
+        reinterpret_cast<PFN_vkCmdPipelineBarrier>(vk("vkCmdPipelineBarrier"))(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+        if (reinterpret_cast<PFN_vkEndCommandBuffer>(vk("vkEndCommandBuffer"))(commands) != VK_SUCCESS) throw std::runtime_error("FMA probe: vkEndCommandBuffer");
+        VkQueue queue = VK_NULL_HANDLE;
+        reinterpret_cast<PFN_vkGetDeviceQueue>(vk("vkGetDeviceQueue"))(handle, family, 0, &queue);
+        VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        if (reinterpret_cast<PFN_vkCreateFence>(vk("vkCreateFence"))(handle, &fenceInfo, nullptr, &fence) != VK_SUCCESS) throw std::runtime_error("FMA probe: vkCreateFence");
+        VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        submit.commandBufferCount = 1;
+        submit.pCommandBuffers = &commands;
+        if (reinterpret_cast<PFN_vkQueueSubmit>(vk("vkQueueSubmit"))(queue, 1, &submit, fence) != VK_SUCCESS) throw std::runtime_error("FMA probe: vkQueueSubmit");
+        if (reinterpret_cast<PFN_vkWaitForFences>(vk("vkWaitForFences"))(handle, 1, &fence, VK_TRUE, 10'000'000'000ull) != VK_SUCCESS) throw std::runtime_error("FMA probe: vkWaitForFences");
+        const auto* results = static_cast<const std::uint32_t*>(mapped[1]);
+        std::uint32_t mismatches = 0;
+        for (std::uint32_t index = 0; index < Count; ++index) mismatches += results[index] != expected[index] ? 1u : 0u;
+        fused = mismatches == 0;
+        std::fprintf(stderr, "[fma-probe] GLSL.std.450 Fma %s on this device (%u of %u results differ from std::fma)\n", fused ? "is fused: v_fma_mix takes the exact f32 path" : "is not fused: v_fma_mix keeps the f64 helper", mismatches, Count);
+    } catch (const std::exception& error) {
+        failure = error.what();
+    }
+    if (failure != nullptr) std::fprintf(stderr, "[fma-probe] %s: v_fma_mix keeps the f64 helper\n", failure);
+    const auto destroy = [&](const char* name, auto object, auto type) {
+        if (object == VK_NULL_HANDLE) return;
+        if (auto function = reinterpret_cast<decltype(type)>(fn(name)); function != nullptr) function(handle, object, nullptr);
+    };
+    destroy("vkDestroyFence", fence, PFN_vkDestroyFence{});
+    destroy("vkDestroyCommandPool", commandPool, PFN_vkDestroyCommandPool{});
+    destroy("vkDestroyDescriptorPool", pool, PFN_vkDestroyDescriptorPool{});
+    destroy("vkDestroyPipeline", pipeline, PFN_vkDestroyPipeline{});
+    destroy("vkDestroyPipelineLayout", layout, PFN_vkDestroyPipelineLayout{});
+    destroy("vkDestroyDescriptorSetLayout", setLayout, PFN_vkDestroyDescriptorSetLayout{});
+    destroy("vkDestroyShaderModule", module, PFN_vkDestroyShaderModule{});
+    for (int index = 0; index < 2; ++index) {
+        destroy("vkDestroyBuffer", buffers[index], PFN_vkDestroyBuffer{});
+        destroy("vkFreeMemory", memories[index], PFN_vkFreeMemory{});
+    }
+    return fused;
+}
+
 ShaderRecompiler::SpirvTarget VulkanDevice::buildTarget() const {
     const auto& limits = state->properties.limits;
     ShaderRecompiler::SpirvTarget target{VK_API_VERSION_1_1, state->meshShader ? 0x00010400u : 0x00010300u, state->subgroup.subgroupSize, ShaderRecompiler::BdaAbi::Version, state->capabilities, state->spirvExtensions, false, {limits.maxComputeWorkGroupSize[0], limits.maxComputeWorkGroupSize[1], limits.maxComputeWorkGroupSize[2]}, limits.maxComputeWorkGroupInvocations, limits.maxComputeSharedMemorySize, {}, {}};
@@ -3514,6 +3698,7 @@ ShaderRecompiler::SpirvTarget VulkanDevice::buildTarget() const {
     target.nonConstantImageOffsets = state->maintenance8;
     target.narrowSubgroupClock = state->narrowSubgroupClock;
     target.float64DenormPreserve = state->float64DenormPreserve;
+    target.fusedFma = state->fusedFma;
     target.float16DenormPreserve = state->float16DenormPreserve;
     target.bindlessImages = state->bindlessImages;
     target.spannedWaves = state->spannedWaves;
