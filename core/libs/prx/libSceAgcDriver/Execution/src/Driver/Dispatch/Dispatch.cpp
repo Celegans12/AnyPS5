@@ -39,6 +39,11 @@ bool DispatchMissItemsEnabled() {
     return enabled;
 }
 
+bool NoDispatchItems() {
+    static const bool none = std::getenv("APS5_PIPELINE_DISPATCH_NO_ITEMS") != nullptr;
+    return none;
+}
+
 bool DrainAfterDispatchItems() {
     static const bool drain = std::getenv("APS5_PIPELINE_DISPATCH_ITEM_DRAIN") != nullptr;
     return drain;
@@ -187,6 +192,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
         }
         if (DrawPipeline::Active() && !pipelineCandidate) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
         if (const auto htile = Graphics::HtileDepthClearAddress(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads); htile != 0) {
+            if (pipelineCandidate && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
             const auto threads = (packet[4] & 0x20u) != 0 ? static_cast<std::uint64_t>(packet[1]) : static_cast<std::uint64_t>(packet[1]) * compute.numThreads[0];
             const auto nativeBytes = Graphics::HtileDepthClearBytes_nid_no_patch(std::span(snapshot.code).subspan(codeOffset), userData, compute, packet, indirectArguments);
             Graphics::NoteHtileDepthClear(htile, static_cast<std::size_t>(threads * 16u), nativeBytes);
@@ -375,9 +381,9 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
         if (cached && keepVariant != nullptr && keepVariant->recipe.load(std::memory_order_acquire) != nullptr) {
             bool bounded = false;
             itemWrites = DispatchWriteRanges(*compiledResult, bounded);
-            pipelined = bounded;
+            pipelined = bounded && !NoDispatchItems();
             if (!bounded) NoteItemFallback(ItemFallback::Writes);
-        } else if (DispatchMissItemsEnabled()) {
+        } else if (DispatchMissItemsEnabled() && !NoDispatchItems()) {
             missItem = true;
         } else {
             NoteItemFallback(ItemFallback::NoRecipe);

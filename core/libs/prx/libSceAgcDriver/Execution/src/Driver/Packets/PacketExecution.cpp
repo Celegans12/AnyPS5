@@ -336,7 +336,8 @@ void Driver::execute(const Submission& submission) {
             currentPacketOffset() = cursor;
             if (gateOpened()) {
                 gateOpened() = false;
-                if (!pipelineDispatch() || submission.queue != 0) {
+                static const bool gateDrain = std::getenv("APS5_PIPELINE_DISPATCH_GATE_DRAIN") != nullptr;
+                if (!pipelineDispatch() || submission.queue != 0 || gateDrain) {
                     if (pipelined && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, opcode);
                     timed(&WorkerProfile::dispatchMs, [&] { resolveGroupAhead(submission, queue, cursor); });
                 }
