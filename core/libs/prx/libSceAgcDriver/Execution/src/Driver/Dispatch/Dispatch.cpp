@@ -15,6 +15,7 @@
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
 #include <atomic>
+#include <string>
 #include <cstdlib>
 #include <functional>
 #include <stdexcept>
@@ -154,6 +155,25 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
     }
     const auto codeOffset = static_cast<std::size_t>((address - snapshot.codeAddress) / sizeof(std::uint32_t));
     if (userData.size() >= 6 && Graphics::HtileMaskKernelCode(std::span(snapshot.code).subspan(codeOffset))) Graphics::Recorder::SetWriteOriginKernel(userData[5], userData[4]);
+    static const bool profileWriters = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (profileWriters && Graphics::HtileWriterProgram(address)) {
+        static std::atomic<int> dumped{0};
+        if (dumped.fetch_add(1) < 6) {
+            std::string text;
+            char item[24];
+            const auto code = std::span(snapshot.code).subspan(codeOffset);
+            for (std::size_t i = 0; i < code.size() && i < 160; ++i) {
+                std::snprintf(item, sizeof(item), " %08x", code[i]);
+                text += item;
+            }
+            std::string user;
+            for (const auto word : userData) {
+                std::snprintf(item, sizeof(item), " %08x", word);
+                user += item;
+            }
+            std::fprintf(stderr, "[htile-writer] queue 0x%x program 0x%llx packet %08x %08x %08x %08x threads %u %u %u user data:%s; code (%zu words):%s\n", submission.queue, static_cast<unsigned long long>(address), packet.size() > 1 ? packet[1] : 0u, packet.size() > 2 ? packet[2] : 0u, packet.size() > 3 ? packet[3] : 0u, packet.size() > 4 ? packet[4] : 0u, compute.numThreads[0], compute.numThreads[1], compute.numThreads[2], user.c_str(), code.size(), text.c_str());
+        }
+    }
     std::array<std::uint32_t, 5> resolved{};
     ResolvedDispatch ahead;
     bool fromAhead = false;

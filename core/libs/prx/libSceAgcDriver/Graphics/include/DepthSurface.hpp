@@ -20,6 +20,11 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target);
 // for a pending GPU write (no GPU expansion knows the words), 0 when it would not. The draw's
 // HTILE pre-sync (S1) waits for that writer without the mutex first.
 std::size_t HtileStoreBackWaits(const Context& context, const DepthTarget& target);
+// APS5_PROFILE_DRAW diagnostics of the HTILE writers the pre-sync waits for: the program is remembered
+// (HtileWriterProgram: its next dispatches print their code and user data, Dispatch.cpp), and the
+// store-back read after the wait reports the words it found for that writer ([htile] line).
+void NoteHtileWriter(std::uint64_t program, std::uint64_t htileAddress);
+bool HtileWriterProgram(std::uint64_t program);
 bool SampleLocationsCompatibleDepth(const Context& context, VkFormat format, std::uint32_t samples);
 std::uint64_t DepthSurfacesSerial();
 std::uint64_t DepthSliceBytes(VkExtent2D extent, std::uint32_t bytesPerTexel);
