@@ -16,6 +16,15 @@ class Texture;
 class StorageTexture;
 
 VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target);
+// Under GuestMemory::GpuMutex: the HTILE bytes whose store-back read in DepthSurfaceView would wait
+// for a pending GPU write (no GPU expansion knows the words), 0 when it would not. The draw's
+// HTILE pre-sync (S1) waits for that writer without the mutex first.
+std::size_t HtileStoreBackWaits(const Context& context, const DepthTarget& target);
+// APS5_PROFILE_DRAW diagnostics of the HTILE writers the pre-sync waits for: the program is remembered
+// (HtileWriterProgram: its next dispatches print their code and user data, Dispatch.cpp), and the
+// store-back read after the wait reports the words it found for that writer ([htile] line).
+void NoteHtileWriter(std::uint64_t program, std::uint64_t htileAddress);
+bool HtileWriterProgram(std::uint64_t program);
 bool SampleLocationsCompatibleDepth(const Context& context, VkFormat format, std::uint32_t samples);
 std::uint64_t DepthSurfacesSerial();
 std::uint64_t DepthSliceBytes(VkExtent2D extent, std::uint32_t bytesPerTexel);
@@ -34,6 +43,20 @@ bool DepthSurfaceServesStorage(const Context& context, const StorageTexture& sto
 void ValidateStorageDepthWrites(const Context& context, std::span<const std::shared_ptr<StorageTexture>> storage);
 void MarkStorageDepthWrites(const Context& context, const std::shared_ptr<StorageTexture>& storage);
 std::uint64_t HtileDepthClearAddress(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const std::array<std::uint32_t, 3>& numThreads);
+// Whether the code starts with the HTILE mask kernel (whatever its user data): the [htile] writer attribution.
+bool HtileMaskKernelCode(std::span<const std::uint32_t> code);
+// The buffer-descriptor variant of the HTILE mask kernel (the game's 0x141d4c500): each thread loads one 16-byte
+// record through a 32_32_32_32_UINT structured buffer (s[0:3], stride 16, index = group * 64 + thread), stores
+// (record & mask) | value with the mask in s[8:11] and the value in s[4:7], all four words alike. The range it
+// rewrites and its mask/value, when the dispatch is exactly that kernel with a plain descriptor
+// (APS5_NO_HTILE_BUFFER_KERNEL=1: never).
+struct HtileBufferMaskClear {
+    std::uint64_t address = 0;
+    std::size_t bytes = 0;
+    std::uint32_t mask = 0;
+    std::uint32_t value = 0;
+};
+std::optional<HtileBufferMaskClear> MatchHtileBufferMaskClear(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const ShaderRecompiler::ShaderComputeStageInfo& compute, std::span<const std::uint32_t> packet, std::uint64_t indirectArguments);
 std::size_t HtileDepthClearBytes_nid_no_patch(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const ShaderRecompiler::ShaderComputeStageInfo& compute, std::span<const std::uint32_t> packet, std::uint64_t indirectArguments);
 void NoteHtileDepthClear(std::uint64_t htileAddress, std::size_t bytes, std::size_t nativeBytes = 0u);
 class Recorder;

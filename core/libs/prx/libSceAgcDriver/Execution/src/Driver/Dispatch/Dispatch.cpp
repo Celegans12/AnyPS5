@@ -11,9 +11,11 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
 #include <atomic>
+#include <string>
 #include <cstdlib>
 #include <functional>
 #include <stdexcept>
@@ -119,6 +121,10 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
     PerformanceTimer timing("Driver.Dispatch");
     const auto address = (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20c)) << 8u) | (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20d) & 0xffu) << 40u);
     if (address == SkippedShader() && address != 0) return;
+    struct OriginScope {
+        explicit OriginScope(std::uint64_t program) { Graphics::Recorder::SetWriteOrigin(program); }
+        ~OriginScope() { Graphics::Recorder::SetWriteOrigin(0); }
+    } originScope(address);
     auto registeredShader = RegisteredProgram(*submission.shaders, address, {0});
     if (!registeredShader) registeredShader = ReadRawShader(address);
     const auto& snapshot = *registeredShader;
@@ -148,6 +154,26 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
         localDevice = device;
     }
     const auto codeOffset = static_cast<std::size_t>((address - snapshot.codeAddress) / sizeof(std::uint32_t));
+    if (userData.size() >= 6 && Graphics::HtileMaskKernelCode(std::span(snapshot.code).subspan(codeOffset))) Graphics::Recorder::SetWriteOriginKernel(userData[5], userData[4]);
+    static const bool profileWriters = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (profileWriters && Graphics::HtileWriterProgram(address)) {
+        static std::atomic<int> dumped{0};
+        if (dumped.fetch_add(1) < 6) {
+            std::string text;
+            char item[24];
+            const auto code = std::span(snapshot.code).subspan(codeOffset);
+            for (std::size_t i = 0; i < code.size() && i < 160; ++i) {
+                std::snprintf(item, sizeof(item), " %08x", code[i]);
+                text += item;
+            }
+            std::string user;
+            for (const auto word : userData) {
+                std::snprintf(item, sizeof(item), " %08x", word);
+                user += item;
+            }
+            std::fprintf(stderr, "[htile-writer] queue 0x%x program 0x%llx packet %08x %08x %08x %08x threads %u %u %u user data:%s; code (%zu words):%s\n", submission.queue, static_cast<unsigned long long>(address), packet.size() > 1 ? packet[1] : 0u, packet.size() > 2 ? packet[2] : 0u, packet.size() > 3 ? packet[3] : 0u, packet.size() > 4 ? packet[4] : 0u, compute.numThreads[0], compute.numThreads[1], compute.numThreads[2], user.c_str(), code.size(), text.c_str());
+        }
+    }
     std::array<std::uint32_t, 5> resolved{};
     ResolvedDispatch ahead;
     bool fromAhead = false;
@@ -203,6 +229,11 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
             const auto nativeBytes = Graphics::HtileDepthClearBytes_nid_no_patch(std::span(snapshot.code).subspan(codeOffset), userData, compute, packet, indirectArguments);
             Graphics::NoteHtileDepthClear(htile, static_cast<std::size_t>(threads * 16u), nativeBytes);
             if (nativeBytes != 0u && userData.size() >= 6u) htileMask = {htile, nativeBytes, userData[5], userData[4]};
+        } else if (const auto buffered = Graphics::MatchHtileBufferMaskClear(std::span(snapshot.code).subspan(codeOffset), userData, compute, packet, indirectArguments); buffered.has_value() && (buffered->mask & 0xfu) == 0u && (buffered->value & 0xfu) == 0u) {
+            // S1: the buffer variant of the mask kernel, read the same way (zmask cleared: a depth clear).
+            if (pipelineCandidate && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+            Graphics::NoteHtileDepthClear(buffered->address, buffered->bytes, buffered->bytes);
+            htileMask = {buffered->address, buffered->bytes, buffered->mask, buffered->value};
         }
         if (!partialLastGroup && indirectArguments == 0 && copyBuffer(queue, submission.queue, packet, std::span(snapshot.code).subspan(codeOffset), userData, compute, localDevice, address)) {
             pendingDispatchPhases().outcome = DispatchOutcome::CopyHle;

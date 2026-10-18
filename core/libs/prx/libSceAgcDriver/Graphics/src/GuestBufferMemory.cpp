@@ -3909,7 +3909,7 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
     // GuestMemory::Read stores pending GPU results first (the flush hook locks for itself).
     for (auto& region : regions) {
         if (region.pending || region.mirror != nullptr || region.direct != nullptr) continue;
-        if (sparseHeapCandidate(region) || (region.writable && WritesOverlap(region.begin, static_cast<std::size_t>(region.end - region.begin)))) {
+        if (deferHostCopies || sparseHeapCandidate(region) || (region.writable && WritesOverlap(region.begin, static_cast<std::size_t>(region.end - region.begin)))) {
             region.pending = true;
             continue;
         }

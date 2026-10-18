@@ -264,6 +264,9 @@ public:
     // (see resolveOverlays): its written elements stay in the imports.
     void DisallowAddressStaging() { addressStaging = false; }
     void AllowAdjustedRegions() { adjustedRegions = true; }
+    // S1: UploadPrepare copies nothing from guest memory (a region it would copy waits for
+    // UploadFinish), so a stage A made ahead of the draw reads no guest bytes.
+    void DeferHostCopies() { deferHostCopies = true; }
     // Records the copy-in of every staged region anew for another use of this upload (a resource
     // cache hit, from ShaderResources::Revalidate, under GuestMemory::GpuMutex, once the imports
     // were confirmed unchanged): the previous use's copy-back left the shadow behind, and the next
@@ -514,6 +517,7 @@ private:
     // UploadPrepare ran (regions are frozen); `uploaded` once UploadFinish ran.
     bool prepared = false;
     bool uploaded = false;
+    bool deferHostCopies = false;
     bool committed = false;
 };
 

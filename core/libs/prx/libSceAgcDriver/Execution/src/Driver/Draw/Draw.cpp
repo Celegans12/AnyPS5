@@ -6,6 +6,8 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
 #include <cstdlib>
@@ -710,11 +712,35 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         const auto commitQueue = submission.queue;
         const auto commitPacket = (packet[0] >> 8u) & 0xffu;
         const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
-        auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, commitQueue, commitPacket, epoch, programs = std::move(programs), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData)] {
+        // S1: the preparation the preparer thread may make for this commit (see DrawPipeline::Prepare).
+        // It runs with copies of the draw's inputs; the stage pointers stay valid because the
+        // preparation holds the commit (which owns the compiled programs).
+        static const bool splitBuild = Graphics::SplitDrawBuild();
+        static const bool htilePresync = std::getenv("APS5_NO_HTILE_PRESYNC") == nullptr;
+        const bool prepareDraw = (splitBuild || (htilePresync && decode->state.depth.has_value())) && recipe == nullptr;
+        auto slot = prepareDraw ? std::make_shared<DrawPipeline::PrepareSlot>() : nullptr;
+        struct PreparedCommit {
+            std::shared_ptr<Graphics::PreparedDraw> draw;
+            std::uint64_t presyncSerial = 0;
+        };
+        const auto program = programs.empty() ? std::uint64_t{0} : programs.back().binary.codeAddress;
+        auto preparedStages = prepareDraw ? stages : std::vector<Graphics::CompiledShader>{};
+        auto prepareDevice = prepareDraw ? localDevice : nullptr;
+        auto prepareDecode = prepareDraw ? decode : nullptr;
+        auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, commitQueue, commitPacket, epoch, programs = std::move(programs), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData), slot, program] {
             DrawPipeline::FollowEpoch(epoch);
             GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
+            struct OriginScope {
+                explicit OriginScope(std::uint64_t address) { Graphics::Recorder::SetWriteOrigin(address); }
+                ~OriginScope() { Graphics::Recorder::SetWriteOrigin(0); }
+            } originScope(program);
             try {
-                commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey);
+                std::shared_ptr<PreparedCommit> prepared = slot != nullptr ? std::static_pointer_cast<PreparedCommit>(slot->Take()) : nullptr;
+                std::uint64_t presyncSerial = prepared != nullptr ? prepared->presyncSerial : 0;
+                // The pre-sync again, now that every earlier draw is recorded: still without the
+                // GPU mutex, so the other queues are not held while this commit waits for the GPU.
+                if (htilePresync && decode->state.depth.has_value()) presyncSerial = std::max(presyncSerial, localDevice->PresyncDrawDepth(decode->state));
+                commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey, prepared != nullptr ? prepared->draw.get() : nullptr, presyncSerial);
             } catch (const std::runtime_error& error) {
                 std::string where = "draw commit (programs";
                 for (const auto& program : programs) {
@@ -726,13 +752,29 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             }
         };
         auto held = std::make_shared<decltype(commit)>(std::move(commit));
+        DrawPipeline::Prepare prepare;
+        if (slot != nullptr) {
+            prepare = [held, slot, device = std::move(prepareDevice), decode = std::move(prepareDecode), stages = std::move(preparedStages), drawParameters, epoch, commitPacket, commitQueue] {
+                if (!slot->Begin()) return;
+                auto prepared = std::make_shared<PreparedCommit>();
+                try {
+                    DrawPipeline::FollowEpoch(epoch);
+                    GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
+                    if (htilePresync && decode->state.depth.has_value()) prepared->presyncSerial = device->PresyncDrawDepth(decode->state);
+                    if (splitBuild) prepared->draw = device->PrepareDraw(decode->state, drawParameters, stages);
+                } catch (...) {
+                    prepared->draw = nullptr;
+                }
+                slot->Finish(std::move(prepared));
+            };
+        }
         std::vector<DrawPipeline::Range> reads;
         if (drawParameters.indexed && drawParameters.indexSize != 0 && drawParameters.indexCount != 0) {
             const auto bytes = static_cast<std::uint64_t>(drawParameters.indexCount) * drawParameters.indexSize;
             if (bytes != 0 && drawParameters.indexAddress <= std::numeric_limits<std::uint64_t>::max() - bytes) reads.emplace_back(drawParameters.indexAddress, drawParameters.indexAddress + bytes);
         }
         timing.Mark("write_ranges_and_commit");
-        DrawPipeline::Queue0().Enqueue([held] { (*held)(); }, std::move(writes), 0, {}, std::move(reads));
+        DrawPipeline::Queue0().Enqueue([held] { (*held)(); }, std::move(writes), 0, {}, std::move(reads), std::move(prepare));
         if (pipelineIndirect) DrawPipeline::Queue0().Note(DrawPipeline::Event::IndirectCommit);
         phaseTiming.Phase(DrawRowLockWait);
         timing.Mark("draw_enqueued");
@@ -758,10 +800,16 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     return drawn();
 }
 
-void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey) {
+void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, Graphics::PreparedDraw* prepared, std::uint64_t presyncSerial) {
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
-    if (auto current = device.Load(); current != nullptr && current != localDevice) localDevice = std::move(current);
+    if (auto current = device.Load(); current != nullptr && current != localDevice) {
+        localDevice = std::move(current);
+        prepared = nullptr;
+        presyncSerial = 0;
+    }
+    // The batches the HTILE pre-sync waited for: their completions land before the store-back reads.
+    if (presyncSerial != 0) localDevice->ReapRecorded(presyncSerial);
     struct SubmitDue {
         Driver& driver;
         const std::shared_ptr<VulkanDevice>& device;
@@ -776,7 +824,7 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
         VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
     }
     std::shared_ptr<const DrawRecipe> built;
-    localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built);
+    localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, prepared);
     if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, std::move(built));
 }
 
