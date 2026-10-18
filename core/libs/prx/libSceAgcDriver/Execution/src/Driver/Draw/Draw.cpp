@@ -65,7 +65,7 @@ GpuParameterMemo& GpuParameterStates() {
 }
 
 struct GpuParameterCounters {
-    std::atomic<std::uint64_t> compiled{0}, learned{0}, gpuSide{0}, fellBack{0}, refused{0};
+    std::atomic<std::uint64_t> compiled{0}, learned{0}, gpuSide{0}, fellBack{0}, refused{0}, notPending{0};
 };
 GpuParameterCounters& GpuParameterCount() {
     static GpuParameterCounters counters;
@@ -90,7 +90,7 @@ void ReportGpuParameters() {
         std::lock_guard lock(memo.mutex);
         for (const auto& [key, state] : memo.states) (state == 1 ? good : bad) += 1;
     }
-    std::fprintf(stderr, "[gpuind] %lld s: gpu-parameter draws %llu (shapes learned %llu), fell back to the CPU path %llu, refused %llu; shapes gpu %zu / cpu %zu\n", static_cast<long long>(now - previous), static_cast<unsigned long long>(counters.gpuSide.exchange(0)), static_cast<unsigned long long>(counters.learned.exchange(0)), static_cast<unsigned long long>(counters.fellBack.exchange(0)), static_cast<unsigned long long>(counters.refused.exchange(0)), good, bad);
+    std::fprintf(stderr, "[gpuind] %lld s: gpu-parameter draws %llu (shapes learned %llu), fell back to the CPU path %llu, refused %llu, records without a pending writer (CPU path) %llu; shapes gpu %zu / cpu %zu\n", static_cast<long long>(now - previous), static_cast<unsigned long long>(counters.gpuSide.exchange(0)), static_cast<unsigned long long>(counters.learned.exchange(0)), static_cast<unsigned long long>(counters.fellBack.exchange(0)), static_cast<unsigned long long>(counters.refused.exchange(0)), static_cast<unsigned long long>(counters.notPending.exchange(0)), good, bad);
 }
 
 }
@@ -326,11 +326,26 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             const auto target = localDevice->Target();
             return std::ranges::find(target.supportedCapabilities, static_cast<std::uint32_t>(spv::CapabilityDrawParameters)) != target.supportedCapabilities.end();
         }();
-        if (drawParametersCapability) {
+        // Only a draw whose records recorded or queued GPU work still writes takes the GPU-side
+        // parameters: reading those records waits for the GPU (the indirect-args waits). Records
+        // nothing pending writes are read at once, and the CPU path's per-record direct draws bind
+        // just the index and vertex ranges the records use, where a GPU-side draw binds (and
+        // copies or scans) the whole index buffer and vertex descriptor ranges (long34: +2.5 s of
+        // draw input work per 10 s when every such draw went GPU side).
+        // APS5_GPU_INDIRECT_ARGS_ALWAYS=1: every eligible draw goes GPU side.
+        static const bool always = std::getenv("APS5_GPU_INDIRECT_ARGS_ALWAYS") != nullptr;
+        const auto& args = *drawParameters.indirect;
+        const auto pendingWriter = [&](std::uint64_t address, std::uint64_t bytes) {
+            return bytes != 0 && ((pipelined && DrawPipeline::Queue0().Overlaps(address, static_cast<std::size_t>(bytes))) || Graphics::Recorder::SnapshotWriteOverlaps(address, static_cast<std::size_t>(bytes)));
+        };
+        const bool pending = always || pendingWriter(args.arguments, args.RangeBytes()) || (args.countIndirect && pendingWriter(args.countAddress, 4));
+        if (drawParametersCapability && pending) {
             gpuParameterKey = GpuParameterMemo::Key(programs.front().binary.codeAddress, drawParameters.indirect->baseVertexSgpr, drawParameters.indirect->startInstanceSgpr);
             const auto state = GpuParameterStates().Get(gpuParameterKey);
             gpuParametersEligible = state != 2;
             gpuParameters = state == 1;
+        } else if (drawParametersCapability) {
+            ++GpuParameterCount().notPending;
         }
     }
     const auto applyGpuParameters = [&](std::optional<ShaderRecompiler::ShaderVertexStageInfo>& info) {
