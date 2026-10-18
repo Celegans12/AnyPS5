@@ -1,0 +1,37 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+// The copy-back of a device-local staging shadow (GuestBufferMemory, APS5_STAGING_DIFF=1): a
+// dword goes back into the host import only where the shader's result differs from the bytes the
+// copy-in gave it (`pristine`, a device-local copy of the shadow taken right after the copy-in).
+// Every dword the shader changed reaches the import as before; a dword it left alone is not
+// rewritten, so the import keeps whatever it holds (the copy-in value, or a newer store).
+// `counter`, when set, counts the dwords stored (statistics only, one atomic per subgroup).
+layout(local_size_x = 64) in;
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint words[]; };
+layout(push_constant) uniform Parameters {
+    Words result;
+    Words pristine;
+    Words target;
+    Words counter;
+    uint count;
+    uint unused;
+} parameters;
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    uint stored = 0u;
+    if (index < parameters.count) {
+        uint value = parameters.result.words[index];
+        if (value != parameters.pristine.words[index]) {
+            parameters.target.words[index] = value;
+            stored = 1u;
+        }
+    }
+    if (uint64_t(parameters.counter) == 0ul) return;
+    uint total = subgroupAdd(stored);
+    if (subgroupElect() && total != 0u) atomicAdd(parameters.counter.words[0], total);
+}

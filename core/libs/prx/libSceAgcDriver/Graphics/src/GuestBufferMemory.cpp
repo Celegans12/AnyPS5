@@ -3456,6 +3456,18 @@ bool atomicStagingEnabled() {
     return !disabled;
 }
 
+// APS5_STAGING_DIFF=1: a staged region's copy-back stores only the dwords its work changed. The
+// copy-in also copies the shadow into a device-local `pristine` buffer (VRAM to VRAM), and the
+// copy-back runs Recorder::RecordStagingDiff over each written range: a dword whose result equals
+// the pristine copy is not stored. The import then holds exactly the bytes the whole copy would
+// leave there, except where it changed after the copy-in while the work left the dword alone (a
+// CPU store the whole copy rolls back keeps its value instead). The PCIe writes of the copy-back
+// shrink to the changed dwords. Unaligned edges and imports without a device address copy whole.
+bool stagingDiffEnabled(const Context& context) {
+    static const bool enabled = std::getenv("APS5_STAGING_DIFF") != nullptr;
+    return enabled && context.bufferDeviceAddress;
+}
+
 std::uint64_t kibSetting(const char* name, std::uint64_t defaultKib) {
     const char* value = std::getenv(name);
     return (value != nullptr ? std::strtoull(value, nullptr, 10) : defaultKib) << 10u;
@@ -3505,6 +3517,11 @@ struct CopyStats {
     std::atomic<std::uint64_t> stagedOutBytes{0};
     std::atomic<std::uint64_t> stagedLost{0};
     std::atomic<std::uint64_t> stagingRefused{0};
+    // APS5_STAGING_DIFF: written ranges copied back by the diff kernel (their dwords), and the
+    // ranges/bytes that still took a whole copy (unaligned edges, no device address).
+    std::atomic<std::uint64_t> diffRanges{0};
+    std::atomic<std::uint64_t> diffBytes{0};
+    std::atomic<std::uint64_t> diffWholeBytes{0};
     std::atomic<std::int64_t> lastStagingReport{0};
 };
 
@@ -3554,6 +3571,19 @@ void reportStaging() {
     lastStaged = staged;
     lastIn = in;
     lastOut = out;
+    if (stats.diffRanges.load() == 0) return;
+    static std::uint64_t lastRanges = 0, lastDiff = 0, lastWhole = 0, lastStored = 0;
+    auto* recorder = Recorder::Active();
+    const auto ranges = stats.diffRanges.load();
+    const auto diff = stats.diffBytes.load();
+    const auto whole = stats.diffWholeBytes.load();
+    const auto stored = recorder != nullptr ? recorder->StagingDiffStoredDwords() * 4u : lastStored;
+    const auto compared = diff - lastDiff;
+    AgcDriver::ProfilePrint_nid_no_patch("[buffers] staging diff (APS5_STAGING_DIFF), last 10 s: %llu written ranges, %.0f KiB compared, %.0f KiB stored (%.1f%%), %.0f KiB copied whole (edges, no device address)\n", static_cast<unsigned long long>(ranges - lastRanges), compared / 1024.0, (stored - lastStored) / 1024.0, compared != 0 ? 100.0 * static_cast<double>(stored - lastStored) / static_cast<double>(compared) : 0.0, (whole - lastWhole) / 1024.0);
+    lastRanges = ranges;
+    lastDiff = diff;
+    lastWhole = whole;
+    lastStored = stored;
 }
 
 }
@@ -3718,7 +3748,7 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
             const bool misaligned = !bindableInPlace(region.begin - entry->base, addressable);
             if (staged) {
                 const auto allocateStart = std::chrono::steady_clock::now();
-                region.buffer = stagingBuffer(context, static_cast<std::size_t>(region.end - region.begin), gpuCopyUsage(addressable));
+                region.buffer = stagingBuffer(context, static_cast<std::size_t>(region.end - region.begin), gpuCopyUsage(addressable) | (stagingDiffEnabled(context) ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0u));
                 if (profile) allocateUs.fetch_add(microsecondsSince(allocateStart), std::memory_order_relaxed);
                 if (region.buffer == nullptr) {
                     // No shadow to be had: in place when aligned, else the host copy below.
@@ -3937,6 +3967,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
                 region.deviceLocal = staged;
                 region.copySource = entry->buffer;
                 region.copySourceBase = entry->base;
+                region.copySourceAddress = entry->address;
             }
         }
         if (region.direct != nullptr) {
@@ -4116,7 +4147,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         if (region->buffer == nullptr) {
             // Not made by UploadPrepare (the registry was stale then): made here, under the lock.
             const auto allocateStart = std::chrono::steady_clock::now();
-            if (region->deviceLocal) region->buffer = stagingBuffer(context, static_cast<std::size_t>(bytes), gpuCopyUsage(addressable));
+            if (region->deviceLocal) region->buffer = stagingBuffer(context, static_cast<std::size_t>(bytes), gpuCopyUsage(addressable) | (stagingDiffEnabled(context) ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0u));
             if (region->buffer == nullptr) {
                 // Or no shadow to be had: a host copy serves the region instead, aligned or not.
                 region->deviceLocal = false;
@@ -4186,6 +4217,31 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
             }
         }
     }
+    if (stagingDiffEnabled(context)) {
+        // The pristine copies of the staged shadows (APS5_STAGING_DIFF), after the copy-ins.
+        std::vector<Region*> diffed;
+        for (auto* region : copies) {
+            if (!region->deviceLocal || region->buffer == nullptr || region->buffer->DeviceAddress() == 0 || region->copySourceAddress == 0) {
+                region->pristine.reset();
+                continue;
+            }
+            const auto bytes = static_cast<std::size_t>(region->end - region->begin);
+            if (region->pristine == nullptr) region->pristine = stagingBuffer(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+            if (region->pristine == nullptr || region->pristine->DeviceAddress() == 0) {
+                region->pristine.reset();
+                continue;
+            }
+            diffed.push_back(region);
+        }
+        if (!diffed.empty()) {
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+            Recorder::CountBarriers(Recorder::CommandClass::StagingIn);
+            for (auto* region : diffed) {
+                CopyBuffer(context, commands, region->buffer->Handle(), 0, region->pristine->Handle(), 0, region->end - region->begin);
+                recorder->Keep(region->pristine);
+            }
+        }
+    }
     if (stagedAny) reportStaging();
     // The copied bytes are visible to the shaders bound to the buffers, which may also store into
     // them. Every stage: dispatches and draws share this path, and draws run mesh, task and
@@ -4199,6 +4255,8 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
 void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
     if (!uploaded || committed) return;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    const bool diff = stagingDiffEnabled(context);
+    bool diffed = false;
     // The written ranges, merged: a V# bound twice would otherwise copy the same bytes twice.
     std::vector<std::pair<std::uint64_t, std::uint64_t>> merged;
     bool recording = false;
@@ -4222,14 +4280,41 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
             if (!recording) {
                 commands = recorder.Commands();
                 timing = recorder.BeginGpuTiming(StagingCopyBackKey);
-                // The shader's stores into the buffer (whichever stage made them) precede the copy.
-                RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+                // The shader's stores into the buffer (whichever stage made them) precede the copy
+                // (and the APS5_STAGING_DIFF kernel's reads).
+                RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | (diff ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : 0u), VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | (diff ? VK_ACCESS_SHADER_READ_BIT : 0u));
                 Recorder::CountBarriers(Recorder::CommandClass::StagingOut);
                 recording = true;
             }
             // Exactly the sub-range the shader may write, in place in the import: what the shader
-            // would have stored there itself had the range been bindable.
-            CopyBuffer(context, commands, region.buffer->Handle(), from - region.begin, region.copySource, from - region.copySourceBase, to - from);
+            // would have stored there itself had the range been bindable. A staged shadow with a
+            // pristine copy (APS5_STAGING_DIFF) stores only the dwords that differ from it; the
+            // unaligned edges copy whole.
+            auto whole = from;
+            auto wholeEnd = to;
+            if (diff && region.deviceLocal && region.pristine != nullptr && region.copySourceAddress != 0 && region.buffer->DeviceAddress() != 0 && region.begin % 4u == 0 && region.copySourceBase % 4u == 0 && region.copySourceAddress % 4u == 0) {
+                const auto alignedFrom = (from + 3u) & ~std::uint64_t{3};
+                const auto alignedTo = to & ~std::uint64_t{3};
+                if (alignedFrom < alignedTo && (alignedTo - alignedFrom) / 4u <= std::numeric_limits<std::uint32_t>::max()) {
+                    const auto at = alignedFrom - region.begin;
+                    if (recorder.RecordStagingDiff(commands, region.buffer->DeviceAddress() + at, region.pristine->DeviceAddress() + at, region.copySourceAddress + (alignedFrom - region.copySourceBase), static_cast<std::uint32_t>((alignedTo - alignedFrom) / 4u), profile)) {
+                        diffed = true;
+                        recorder.Keep(region.pristine);
+                        if (from < alignedFrom) CopyBuffer(context, commands, region.buffer->Handle(), from - region.begin, region.copySource, from - region.copySourceBase, alignedFrom - from);
+                        if (alignedTo < to) CopyBuffer(context, commands, region.buffer->Handle(), alignedTo - region.begin, region.copySource, alignedTo - region.copySourceBase, to - alignedTo);
+                        if (profile) {
+                            Copies().diffRanges.fetch_add(1, std::memory_order_relaxed);
+                            Copies().diffBytes.fetch_add(alignedTo - alignedFrom, std::memory_order_relaxed);
+                            Copies().diffWholeBytes.fetch_add((alignedFrom - from) + (to - alignedTo), std::memory_order_relaxed);
+                        }
+                        whole = wholeEnd;
+                    }
+                }
+            }
+            if (whole < wholeEnd) {
+                CopyBuffer(context, commands, region.buffer->Handle(), whole - region.begin, region.copySource, whole - region.copySourceBase, wholeEnd - whole);
+                if (diff && profile && region.deviceLocal) Copies().diffWholeBytes.fetch_add(wholeEnd - whole, std::memory_order_relaxed);
+            }
             copiedBytes += to - from;
             recorder.Keep(region.buffer);
             if (profile) {
@@ -4249,7 +4334,7 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
     // indirect dispatch's arguments) and to the host once the batch completed; the caller's
     // pending-write note makes CPU readers wait for that.
     constexpr VkAccessFlags copiedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_HOST_READ_BIT;
-    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, copiedAccess);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT | (diffed ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : 0u), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | (diffed ? VK_ACCESS_SHADER_WRITE_BIT : 0u), copiedAccess);
     Recorder::CountBarriers(Recorder::CommandClass::StagingOut);
     recorder.MarkCovered(copiedAccess);
     recorder.EndGpuTiming(timing, copiedBytes);
