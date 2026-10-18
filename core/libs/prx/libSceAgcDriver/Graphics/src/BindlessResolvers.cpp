@@ -204,6 +204,15 @@ BindlessResolution DriverBindlessResolver::Commit(const BindlessPrepared& prepar
     return resolution;
 }
 
+// Prepare takes the generation last, after its mapping check: CollectWrites over the surface's guest bytes.
+// A settled entry (constant swizzle) has no surface and keeps generation 0.
+bool DriverBindlessResolver::RefreshGeneration(BindlessPrepared& prepared) {
+    if (prepared.settled.has_value() || !prepared.refusal.empty()) return prepared.refusal.empty();
+    if (prepared.state == nullptr || prepared.bytes == 0u) return false;
+    prepared.generation = GuestMemory::CollectWrites(prepared.address, static_cast<std::size_t>(prepared.bytes));
+    return true;
+}
+
 bool DriverBindlessResolver::Current(const BindlessResolution& resolution) {
     const auto texture = std::static_pointer_cast<Texture>(resolution.owner);
     return texture == nullptr || texture->SampledCacheState() != Texture::CacheState::Released;

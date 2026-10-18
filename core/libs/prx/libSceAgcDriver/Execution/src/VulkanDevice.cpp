@@ -3585,12 +3585,25 @@ void VulkanDevice::BindlessPresentWait() {
     }
     if (serial != 0 && state->recorder->HasTimeline()) state->recorder->WaitSerial(serial);
     const auto waited = serial != 0 ? static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()) : 0u;
+    // Without the GPU lock: prepare the entries the revalidation will most likely find stale (see
+    // TextureService::PrepareRevalidation; APS5_NO_EARLY_REVALIDATE=1 off).
+    state->textureService->PrepareRevalidation();
     std::lock_guard lock(GuestMemory::GpuMutex());
     if (serial != 0 && state->recorder->HasTimeline()) {
         Graphics::Recorder::AnnounceSyncSite(__builtin_return_address(0));
         state->recorder->FinishUpTo(serial);
     }
-    state->textureService->AfterPresentWait(*state->recorder, waited);
+    // The revalidation is one collect epoch (GuestMemory::EndCollectEpoch; APS5_NO_PRESENT_COLLECT_EPOCH=1:
+    // a fresh epoch for every collect as before).
+    static const bool presentEpoch = std::getenv("APS5_NO_PRESENT_COLLECT_EPOCH") == nullptr;
+    if (presentEpoch) GuestMemory::BumpCollectEpoch();
+    try {
+        state->textureService->AfterPresentWait(*state->recorder, waited);
+    } catch (...) {
+        if (presentEpoch) GuestMemory::EndCollectEpoch();
+        throw;
+    }
+    if (presentEpoch) GuestMemory::EndCollectEpoch();
     if (Graphics::BindlessStatsRequested()) std::fprintf(stderr, "%s\n", state->textureService->TakeFrameLine(Graphics::BindlessOldPathNanoseconds()).c_str());
 }
 
