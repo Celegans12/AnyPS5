@@ -3811,6 +3811,7 @@ std::uint64_t VulkanDevice::PresyncDrawDepth(const Graphics::State& graphics) {
         if (!info.has_value()) return 0;
         if (profile) {
             const auto origin = Graphics::Recorder::OriginOfNote(state->recorder->NewestWriteNote(depth.htileAddress, bytes));
+            Graphics::NoteHtileWriter(origin.has_value() ? origin->program : 0, depth.htileAddress);
             char key[224];
             if (origin.has_value()) {
                 const bool exact = origin->begin == depth.htileAddress && origin->end == depth.htileAddress + bytes;

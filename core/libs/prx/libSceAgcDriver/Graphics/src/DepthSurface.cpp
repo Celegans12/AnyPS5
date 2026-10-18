@@ -1222,6 +1222,16 @@ void reportHtileSyncs() {
     auto& gpu = HtileGpu();
     std::string writerText;
     {
+        auto& state = HtileWriters();
+        std::lock_guard lock(state.mutex);
+        std::size_t shown = 0;
+        for (const auto& [key, count] : state.outcomes) {
+            if (shown++ >= 6) break;
+            writerText += " {after pre-sync: " + key + " x" + std::to_string(count) + "}";
+        }
+        state.outcomes.clear();
+    }
+    {
         std::lock_guard lock(counters.writersMutex);
         std::vector<std::pair<std::string, std::pair<std::uint64_t, std::uint64_t>>> sorted(counters.writers.begin(), counters.writers.end());
         counters.writers.clear();
@@ -1323,6 +1333,23 @@ VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarg
     const auto origin = writer.has_value() ? Recorder::OriginOfNote(recorder->NewestWriteNote(target.htileAddress, bytes)) : std::nullopt;
     GuestMemory::Read(target.htileAddress, std::as_writable_bytes(std::span(words)), 4);
     const bool uniform = std::all_of(words.begin(), words.end(), [&](std::uint32_t word) { return word == words.front(); });
+    if (profile) {
+        auto& state = HtileWriters();
+        std::lock_guard lock(state.mutex);
+        if (const auto found = state.pendingReads.find(target.htileAddress); found != state.pendingReads.end()) {
+            std::map<std::uint32_t, std::size_t> histogram;
+            for (const auto word : words) ++histogram[word];
+            std::uint32_t common = 0;
+            std::size_t commonCount = 0;
+            for (const auto& [word, count] : histogram) {
+                if (count > commonCount) { common = word; commonCount = count; }
+            }
+            char key[192];
+            std::snprintf(key, sizeof(key), "prog 0x%llx %s 0x%x (%zu of %zu words, %zu distinct)%s", static_cast<unsigned long long>(found->second), uniform ? "uniform" : "mixed, most", common, commonCount, words.size(), histogram.size(), target.htileStencil ? " stencil" : "");
+            ++state.outcomes[key];
+            state.pendingReads.erase(found);
+        }
+    }
     VkImageAspectFlags cleared = target.firstSlice == 0 || uniform ? VK_IMAGE_ASPECT_DEPTH_BIT | (target.htileStencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u) : 0u;
     for (const auto word : words) cleared &= HtileFillClears(word, target.htileStencil);
     if (profile) {
@@ -1464,6 +1491,32 @@ float HostDepthBiasConstant(const Context& context, VkFormat format, float const
     if (constant == 0.0f || host == format) return constant;
     Require(host == VK_FORMAT_D24_UNORM_S8_UINT, "a constant depth bias on a 16-bit depth target with stencil that the device stores as 32-bit float depth is not implemented");
     return constant * 256.0f;
+}
+
+namespace {
+struct HtileWriterState {
+    std::mutex mutex;
+    std::set<std::uint64_t> programs;
+    std::map<std::uint64_t, std::uint64_t> pendingReads;
+    std::map<std::string, std::uint64_t> outcomes;
+};
+HtileWriterState& HtileWriters() {
+    static auto* state = new HtileWriterState();
+    return *state;
+}
+}
+
+void NoteHtileWriter(std::uint64_t program, std::uint64_t htileAddress) {
+    auto& state = HtileWriters();
+    std::lock_guard lock(state.mutex);
+    if (program != 0) state.programs.insert(program);
+    state.pendingReads[htileAddress] = program;
+}
+
+bool HtileWriterProgram(std::uint64_t program) {
+    auto& state = HtileWriters();
+    std::lock_guard lock(state.mutex);
+    return state.programs.contains(program);
 }
 
 std::size_t HtileStoreBackWaits(const Context& context, const DepthTarget& target) {
