@@ -2658,7 +2658,11 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
         // collects cost the same wherever they run.
         if (precollectImages()) phase(BuildPhase::Precollect);
         if (drawBuild && !usesBda && std::all_of(allocations.begin(), allocations.end(), [&](const Allocation& allocation) { return !allocation.guest || allocation.pushByte >= 0 || (allocation.dataAllocation >= 0 && allocation.dataByte < allocations[static_cast<std::size_t>(allocation.dataAllocation)].size); })) guestMemory.AllowAdjustedRegions();
-        guestMemory.UploadPrepare(usesBda);
+        // Design probe (local/design-gpu, bench only): APS5_BENCH_STAGE_BDA=1 lets an address-based build stage its
+        // written buffers device-local like any other build (its BDA reads still see the host imports: inexact when a
+        // buffer is reached both ways).
+        static const bool stageBda = std::getenv("APS5_BENCH_STAGE_BDA") != nullptr;
+        guestMemory.UploadPrepare(usesBda && !stageBda);
         timing.uploadMs = phase(BuildPhase::Upload);
         splitSets = SplitsSets(context, shaders);
         std::array<std::vector<VkDescriptorSetLayoutBinding>, 2> descriptions;

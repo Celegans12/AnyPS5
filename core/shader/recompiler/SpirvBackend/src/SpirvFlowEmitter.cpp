@@ -890,7 +890,8 @@ void EmitBarrier(SpirvValueEmitContext& ctx, const IrValue& inst) {
     }
     const bool tessellation = state.program.Resources().stage == IrShaderStage::TessellationControl;
     const auto memoryScope = tessellation ? spv::ScopeInvocation : spv::ScopeWorkgroup;
-    const std::uint32_t semantics = tessellation ? static_cast<std::uint32_t>(spv::MemorySemanticsMaskNone) : spv::MemorySemanticsAcquireReleaseMask | LdsMemorySemantics(state);
+    static const bool bufferBarriers = [] { const char* text = std::getenv("APS5_TRUST_BUFFERS"); return text != nullptr && (std::strtoul(text, nullptr, 0) & 8u) != 0u; }();
+    const std::uint32_t semantics = tessellation ? static_cast<std::uint32_t>(spv::MemorySemanticsMaskNone) : spv::MemorySemanticsAcquireReleaseMask | LdsMemorySemantics(state) | (bufferBarriers ? spv::MemorySemanticsUniformMemoryMask : 0u);
     state.module.AddFunction(spv::OpControlBarrier, ConstantU32(state, spv::ScopeWorkgroup), ConstantU32(state, memoryScope), ConstantU32(state, semantics));
 }
 

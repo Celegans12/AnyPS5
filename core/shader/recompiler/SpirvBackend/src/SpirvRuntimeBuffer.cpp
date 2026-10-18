@@ -12,6 +12,7 @@
 #include <utility>
 #include <string>
 #include <vector>
+#include <cstdlib>
 
 namespace ShaderRecompiler {
 namespace {
@@ -237,7 +238,16 @@ RuntimeDescriptor bounded(SpirvValueEmitContext& context, const IrValue& instruc
     return resource;
 }
 
+// Design probe (local/design-gpu only): APS5_TRUST_BUFFERS bit 1 treats every V# access as inside its
+// records (no guest bounds), bit 2 drops the descriptor-array length checks, bit 4 drops the Volatile access
+// of coherent direct buffers (the Coherent decoration stays).
+unsigned TrustBuffers() {
+    static const unsigned bits = [] { const char* text = std::getenv("APS5_TRUST_BUFFERS"); return text ? static_cast<unsigned>(std::strtoul(text, nullptr, 0)) : 0u; }();
+    return bits;
+}
+
 std::uint32_t inBounds(SpirvEmitterState& state, const RuntimeDescriptor& resource, std::uint32_t offset, std::uint32_t bytes) {
+    if ((TrustBuffers() & 1u) != 0u) return ConstantBool(state, true);
     const auto u32 = TypeU32(state);
     const auto boolean = TypeBool(state);
     const auto& range = resource.bounds;
@@ -291,7 +301,11 @@ std::uint32_t guestAddress(SpirvEmitterState& state, const RuntimeDescriptor& re
 MemoryResourceAccess directAccess(SpirvValueEmitContext& context, const IrValue& instruction, bool wide = false, bool plainLoad = false) {
     auto& state = context.state;
     const auto& memory = context.Memory(instruction);
-    const auto variable = wide ? state.storageBufferU64Variable : plainLoad || state.storageBufferCoherentVariable == 0u ? state.storageBufferVariable : state.storageBufferCoherentVariable;
+    // Design probe: APS5_TRUST_BUFFERS bit 8 reads coherent (glc) buffers through the plain, L1-cached variable
+    // (workgroup-scope coherence; exact only when the dispatch is one workgroup, as the cloth solvers are), with
+    // s_barrier ordering buffer memory too (SpirvFlowEmitter.cpp EmitBarrier).
+    const bool plain = plainLoad || ((TrustBuffers() & 8u) != 0u && BufferAccessOf(instruction.Opcode()) == BufferAccess::Read);
+    const auto variable = wide ? state.storageBufferU64Variable : plain || state.storageBufferCoherentVariable == 0u ? state.storageBufferVariable : state.storageBufferCoherentVariable;
     if (variable == 0u) context.Fail(instruction, "direct buffer descriptor array is missing");
     const auto element = ResourceForDescriptor(state, DescriptorBindingKind::Buffers, memory.resource);
     MemoryResourceAccess access;
@@ -299,7 +313,7 @@ MemoryResourceAccess directAccess(SpirvValueEmitContext& context, const IrValue&
     access.objectPointer = state.module.AllocateId();
     state.module.AddFunction(spv::OpAccessChain, wide ? TypeStorageBufferU64Pointer(state) : TypeStorageBufferPointer(state), access.objectPointer, variable, ConstantU32(state, element));
     access.byteOffset = state.memoryByteOffsets.at(element);
-    access.memoryAccess = memory.coherent ? spv::MemoryAccessVolatileMask : 0u;
+    access.memoryAccess = memory.coherent && (TrustBuffers() & 4u) == 0u ? spv::MemoryAccessVolatileMask : 0u;
     access.length = state.module.AllocateId();
     state.module.AddFunction(spv::OpArrayLength, TypeU32(state), access.length, access.objectPointer, 0u);
     return access;

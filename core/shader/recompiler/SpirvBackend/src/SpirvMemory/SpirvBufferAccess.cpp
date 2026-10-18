@@ -1,4 +1,5 @@
 #include "PipelineSpecialization.hpp"
+#include <cstdlib>
 #include "SpirvBackend/SpirvMemory/SpirvBufferAccess.hpp"
 #include "SpirvBackend/SpirvEmitterHelpers.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvTypes.hpp"
@@ -162,6 +163,9 @@ std::uint32_t EmitMemoryElementIndex(SpirvEmitterState& state, const MemoryResou
 }
 
 std::uint32_t EmitMemoryElementInBounds(SpirvEmitterState& state, const MemoryResourceAccess& access, std::uint32_t index) {
+    // Design probe: APS5_TRUST_BUFFERS bit 2 (see SpirvRuntimeBuffer.cpp) relies on robustBufferAccess instead.
+    static const bool trusted = [] { const char* text = std::getenv("APS5_TRUST_BUFFERS"); return text != nullptr && (std::strtoul(text, nullptr, 0) & 2u) != 0u; }();
+    if (trusted && access.kind == ResourceKind::Buffer) return ConstantBool(state, true);
     const auto last = access.misalignment != 0u ? EmitAddU32(state, index, ConstantU32(state, 1u)) : index;
     const auto inBounds = state.module.AllocateId();
     state.module.AddFunction(spv::OpULessThan, TypeBool(state), inBounds, last, access.length);
