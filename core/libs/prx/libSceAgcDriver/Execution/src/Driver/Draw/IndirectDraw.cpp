@@ -2,6 +2,9 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include <cstdlib>
+#include <map>
+#include <mutex>
+#include <string>
 
 namespace AgcDriver::DriverDetail {
 
@@ -56,6 +59,19 @@ std::optional<Graphics::IndirectDrawPath> Driver::ClassifyIndirectDraw(const Sha
         const auto stride = (attribute.resource.fields[1] >> 16u) & 0x3fffu;
         const auto extent = stride == 0 ? static_cast<std::uint64_t>(attribute.resource.fields[2]) : static_cast<std::uint64_t>(attribute.resource.fields[2]) * stride;
         if (extent > vertexCap) fail(Path::VertexRange);
+    }
+    static const bool traceNotFolded = std::getenv("APS5_TRACE_NOT_FOLDED") != nullptr;
+    if (traceNotFolded && indirectCpu) {
+        // Once per distinct shape (shader, SGPRs, analyzer verdict), then at powers of two: which
+        // stages need their indirect records on the CPU and why (the gpuind lane's attribution).
+        static std::mutex mutex;
+        static std::map<std::string, std::uint64_t> seen;
+        char key[320];
+        std::snprintf(key, sizeof(key), "vs 0x%llx op 0x%x rec %u stride %u count %u%s idx %d base s%d inst s%d draw s%d%s analyzer v=%d i=%d shared=%d/%d conflict=%d/%d indx=%u fetch attrs %zu firstUser %u userWords %zu -> %s", static_cast<unsigned long long>(frontProgram.binary.codeAddress), indirect.opcode, indirect.recordBytes, indirect.stride, indirect.count, indirect.countIndirect ? " (count indirect)" : "", drawParameters.indexed ? 1 : 0, indirect.baseVertexSgpr, indirect.startInstanceSgpr, indirect.drawIndexSgpr, indirect.drawIndexEnabled ? " (enabled)" : "", result.vertexOffsetSgpr, result.instanceOffsetSgpr, result.vertexOffsetShared ? 1 : 0, result.instanceOffsetShared ? 1 : 0, result.vertexOffsetConflict ? 1 : 0, result.instanceOffsetConflict ? 1 : 0, indirect.indxOffset, result.vertexAttributes.size(), frontProgram.firstUserSgpr, frontProgram.userData.size(), Graphics::IndirectDrawPathName(*indirectCpu));
+        std::lock_guard lock(mutex);
+        const auto hits = ++seen[key];
+        if ((hits & (hits - 1)) == 0) std::fprintf(stderr, "[not-folded] %s (seen %llu)
+", key, static_cast<unsigned long long>(hits));
     }
     if (traceIndirect) {
         const auto location = [](std::uint32_t value, std::int32_t sgpr) { char text[24]; if (value == 0x280u) std::snprintf(text, sizeof(text), "none"); else std::snprintf(text, sizeof(text), "0x%x(s%d)", value, sgpr); return std::string(text); };
