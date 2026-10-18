@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ContentHash.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
@@ -627,6 +628,7 @@ private:
     std::weak_ptr<StorageTexture> borrowedFrom;
     std::uint64_t borrowedVersion = 0;
     std::vector<bool> borrowedUnits;
+    HostImportLookupCache importLookup;
     // Units of this image were borrowed since it was last written: the borrower's proofs
     // (the resource cache's serial memo) hold only while this image's version does, so the next
     // write here bumps the pending serial although the image was pending already.

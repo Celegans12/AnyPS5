@@ -210,6 +210,8 @@ struct HostImports {
     // Bumped whenever an import is dropped, so HostImport pointers taken under the lock earlier can be
     // reused while it is unchanged.
     std::uint64_t epoch = 1;
+    // Imports added (HostImportForCached: a cached answer holds while none was added or dropped).
+    std::uint64_t inserts = 0;
     VkDevice watchDevice = VK_NULL_HANDLE;
     bool unwatchImports = false;
     bool unwatchDmaBufImports = false;
@@ -1251,6 +1253,7 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
     if (trace) std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx ok (%zu live, %.1f MiB live, %.1f MiB ever)%s\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), state.imports.size() + 1, state.liveBytes / 1048576.0, importedBytes / 1048576.0, joined ? ", joined at bind" : "");
     entry.joined = joined;
     entry.lastUse = ++state.useCounter;
+    ++state.inserts;
     return &state.imports.emplace(base, entry).first->second;
 }
 
@@ -2731,11 +2734,7 @@ std::uint64_t HostImportLiveBytes() {
     return state.liveBytes;
 }
 
-const HostImport* HostImportFor(const Context& context, std::uint64_t address, std::size_t bytes) {
-    if (context.hostImportAlignment == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return nullptr;
-    ensurePinWaiter();
-    auto& state = Imports();
-    std::lock_guard lock(state.mutex);
+static const HostImport* hostImportLocked(const Context& context, HostImports& state, std::uint64_t address, std::size_t bytes) {
     // A hit is only valid while the registry has not changed since the imports were reconciled.
     if (!importsStale(context, state)) {
         if (const auto* entry = findImport(state, address, address + bytes)) {
@@ -2746,6 +2745,32 @@ const HostImport* HostImportFor(const Context& context, std::uint64_t address, s
     const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
     refreshImports(context, state, lease);
     return importAccess(context, state, address, address + bytes, lease);
+}
+
+const HostImport* HostImportFor(const Context& context, std::uint64_t address, std::size_t bytes) {
+    if (context.hostImportAlignment == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return nullptr;
+    ensurePinWaiter();
+    auto& state = Imports();
+    std::lock_guard lock(state.mutex);
+    return hostImportLocked(context, state, address, bytes);
+}
+
+// HostImportFor answered from the import a caller's previous lookup of the same range returned,
+// while no import was dropped (epoch) or added (inserts) since and the registry is unchanged since
+// the imports were reconciled; the same last-use stamp as a hit of the full lookup.
+const HostImport* HostImportForCached(const Context& context, std::uint64_t address, std::size_t bytes, HostImportLookupCache& cache) {
+    if (context.hostImportAlignment == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return nullptr;
+    ensurePinWaiter();
+    auto& state = Imports();
+    std::lock_guard lock(state.mutex);
+    if (cache.import != nullptr && cache.address == address && cache.bytes == bytes && cache.epoch == state.epoch && cache.inserts == state.inserts && !importsStale(context, state)) {
+        cache.import->lastUse = ++state.useCounter;
+        return cache.import;
+    }
+    const auto* entry = hostImportLocked(context, state, address, bytes);
+    if (entry != nullptr && !importsStale(context, state)) cache = {entry, address, bytes, state.epoch, state.inserts};
+    else cache = {};
+    return entry;
 }
 
 namespace {

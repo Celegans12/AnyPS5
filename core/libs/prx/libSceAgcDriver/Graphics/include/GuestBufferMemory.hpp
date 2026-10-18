@@ -78,6 +78,15 @@ void SetImportWatch(const Context& context, ImportWatch watch);
 // (alignment and budget permitting), or null. Bytes at `address` are at `address - import->base` in
 // the import's buffer.
 const HostImport* HostImportFor(const Context& context, std::uint64_t address, std::size_t bytes);
+// A caller's memo of its last HostImportFor answer (HostImportForCached).
+struct HostImportLookupCache {
+    const HostImport* import = nullptr;
+    std::uint64_t address = 0;
+    std::uint64_t bytes = 0;
+    std::uint64_t epoch = 0;
+    std::uint64_t inserts = 0;
+};
+const HostImport* HostImportForCached(const Context& context, std::uint64_t address, std::size_t bytes, HostImportLookupCache& cache);
 void SetHostImportWindow(std::uint64_t bytes);
 // Tests: the window of one large registered range (64 MiB) and the import budget (0: the configured one).
 void SetHostImportRangeWindow(std::uint64_t bytes);

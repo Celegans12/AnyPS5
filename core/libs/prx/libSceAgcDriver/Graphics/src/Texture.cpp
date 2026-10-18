@@ -2015,7 +2015,7 @@ bool StorageTexture::Refresh() {
         }
         // Only the direct path uploads the selected layers alone (see upload); the others replace
         // the whole image, so every pending layer's results are stored first.
-        direct = keys == DccKeys::Uncompressed && HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) != nullptr;
+        direct = keys == DccKeys::Uncompressed && (RefreshLookupsEnabled() ? HostImportForCached(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes), importLookup) : HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) != nullptr;
         if (alias != nullptr && direct) {
             // The alias's pending units that nothing stamped since its generation (a CPU store or a
             // driver store there wins over its results, as at its own write-back) are taken from
