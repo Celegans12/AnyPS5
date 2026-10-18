@@ -141,17 +141,33 @@ void Driver::capturePipelineRequest(std::uint64_t address, const ShaderRecompile
         const char* value = std::getenv("APS5_PIPELINE_REQUESTS_MIN_WORDS");
         return value != nullptr && *value != '\0' ? static_cast<std::size_t>(std::strtoull(value, nullptr, 10)) : std::size_t{500000};
     }();
+    // Precheck (APS5_NO_PIPELINE_REQUEST_PRECHECK=1 off): the inputs of every fingerprint already in `saved`,
+    // by pipeline variant. A materialization whose inputs match is saved already (its fingerprint would be the
+    // one recorded, and `saved` only grows), so it returns before the layout plan and the two SPIR-V hashes.
+    static const bool precheck = std::getenv("APS5_NO_PIPELINE_REQUEST_PRECHECK") == nullptr;
+    static constexpr std::size_t PrecheckEntries = 1024;
     static std::mutex savedMutex;
     static std::set<std::uint64_t> saved;
+    static std::map<std::uint64_t, ComputePipelineInputs> savedInputs;
     try {
         const auto words = result.spirv.size();
         if (words < minimum) return;
+        const auto variant = result.PipelineVariantId();
+        if (precheck) {
+            std::lock_guard lock(savedMutex);
+            if (const auto found = savedInputs.find(variant); found != savedInputs.end() && found->second.Matches(result)) return;
+        }
         const auto layout = device.PlannedComputeLayoutKey(result);
         const auto components = ComputePipelineFingerprintComponents(result, layout);
         const auto fingerprint = components.whole;
         {
             std::lock_guard lock(savedMutex);
-            if (!saved.insert(fingerprint).second) return;
+            const bool inserted = saved.insert(fingerprint).second;
+            if (precheck) {
+                if (savedInputs.size() >= PrecheckEntries && !savedInputs.contains(variant)) savedInputs.clear();
+                savedInputs.insert_or_assign(variant, ComputePipelineInputs::Of(result));
+            }
+            if (!inserted) return;
         }
         char stem[96];
         std::snprintf(stem, sizeof(stem), "c_%07zu_%llx_%016llx", words, static_cast<unsigned long long>(address), static_cast<unsigned long long>(fingerprint));
