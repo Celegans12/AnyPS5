@@ -193,7 +193,9 @@ struct PresyncSurface {
 };
 
 // S1: the tag of the two-stage draw build (see ShaderResources).
-struct DeferredDrawBuild {};
+struct DeferredDrawBuild {
+    explicit DeferredDrawBuild() = default;
+};
 
 class ShaderResources {
 public:
@@ -212,7 +214,7 @@ public:
     // stage B), CompleteDraw() stage B under GuestMemory::GpuMutex. Address-based stages are refused
     // (their lease and mirrors need the lock): callers check UsesAddressTables first. `shaders` must
     // outlive CompleteDraw().
-    ShaderResources(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::size_t indexBytes, DeferredDrawBuild);
+    ShaderResources(DeferredDrawBuild, const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::size_t indexBytes);
     void CompleteDraw();
     static bool StagesUseAddressTables(std::span<const CompiledShader> shaders);
     bool Completed() const { return completed; }

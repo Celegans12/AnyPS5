@@ -2016,7 +2016,7 @@ void splitDrawBuildTests(const Context& context, const BdaTestAccess& access) {
         lockedReusable = locked.Reusable();
     }
     std::unique_ptr<ShaderResources> split;
-    std::thread preparer([&] { split = std::make_unique<ShaderResources>(context, stages, ColorTarget{}, 0, 0, 0, DeferredDrawBuild{}); });
+    std::thread preparer([&] { split = std::make_unique<ShaderResources>(DeferredDrawBuild{}, context, stages, ColorTarget{}, 0, 0, 0); });
     preparer.join();
     Require(split != nullptr && !split->Completed(), "a deferred draw build completed in stage A");
     guest[0] = 22;
@@ -2037,7 +2037,7 @@ void splitDrawBuildTests(const Context& context, const BdaTestAccess& access) {
     addressed.bindings = {binding(Role::BdaPagetable, 4), binding(Role::FaultBuffer, 5)};
     const std::array<CompiledShader, 2> addressStages{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &addressed, 0}}};
     Require(ShaderResources::StagesUseAddressTables(addressStages), "a draw with a BDA table does not count as address-based");
-    reject([&] { ShaderResources refused(context, addressStages, ColorTarget{}, 0, 0, 0, DeferredDrawBuild{}); }, "cannot map address tables");
+    reject([&] { ShaderResources refused(DeferredDrawBuild{}, context, addressStages, ColorTarget{}, 0, 0, 0); }, "cannot map address tables");
 }
 
 void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {

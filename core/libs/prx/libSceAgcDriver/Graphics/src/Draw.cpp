@@ -1141,7 +1141,7 @@ std::shared_ptr<PreparedDraw> PrepareDraw(const Context& context, const State& s
     }
     const auto start = std::chrono::steady_clock::now();
     try {
-        prepared->resources = std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(prepared->indexBytes), DeferredDrawBuild{});
+        prepared->resources = std::make_shared<ShaderResources>(DeferredDrawBuild{}, context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(prepared->indexBytes));
         counters.stageA.fetch_add(1, std::memory_order_relaxed);
     } catch (...) {
         // The draw builds under the lock and reports the refusal in order.
