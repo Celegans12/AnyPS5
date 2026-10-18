@@ -4710,8 +4710,21 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     // of its ring records without a leading barrier.
     bool unordered = false;
     const auto overlapQueue = Graphics::Recorder::TakeDispatchOrder(unordered);
+    // The depth clear HLE (#7449): the image clear kernel over a depth plane's mirror is replaced by
+    // a transfer clear of the mirror (APS5_NO_DEPTH_CLEAR_DISPATCH_SKIP=1 records the dispatch); a
+    // transfer never joins a dispatch overlap run.
+    VkImage clearedMirror = VK_NULL_HANDLE;
+    if (argumentImport == nullptr && Graphics::DepthClearDispatchSkipActive()) {
+        for (const auto& [image, written] : resources.StorageImages()) {
+            if (written && Graphics::PlanDepthClearDispatchSkip(context, image)) {
+                clearedMirror = image;
+                break;
+            }
+        }
+    }
+    const bool mirrorCleared = clearedMirror != VK_NULL_HANDLE;
     const auto* groupLimit = state->properties.limits.maxComputeWorkGroupCount;
-    const bool overlapCapable = overlapQueue != 0 && Graphics::Recorder::DispatchOverlapEnabled() && arguments == 0 && argumentImport == nullptr && record.shader->program->workgroupMemoryDwords == 0 && state->checkpointMarker == nullptr && record.x <= groupLimit[0] && record.y <= groupLimit[1] && record.z <= groupLimit[2];
+    const bool overlapCapable = !mirrorCleared && overlapQueue != 0 && Graphics::Recorder::DispatchOverlapEnabled() && arguments == 0 && argumentImport == nullptr && record.shader->program->workgroupMemoryDwords == 0 && state->checkpointMarker == nullptr && record.x <= groupLimit[0] && record.y <= groupLimit[1] && record.z <= groupLimit[2];
     if (timer.profile && overlapQueue != 0) {
         if (!overlapCapable) {
             if (arguments != 0 || argumentImport != nullptr) ++d.notIndirect;
@@ -4825,16 +4838,16 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
             ++d.notRefresh;
         }
         ++d.overlapped;
-    } else if ((covered & shaderAccess) == shaderAccess && barrierElision) {
+    } else if ((covered & shaderAccess) == shaderAccess && barrierElision && !mirrorCleared) {
         ++d.preBarriersSkipped;
         Graphics::Recorder::CountMerged(CommandClass::DispatchLeading);
     } else {
         const auto timing = recorder.BeginGpuTiming(CommandClass::DispatchLeading);
         const VkAccessFlags heapWrites = record.shader->program->bindlessHeap || overlapCapable ? VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT : 0u;
-        // A run's first dispatch also orders the transfers recorded later in the run (the template
+        // A mirror clear in place of the dispatch is a transfer write. A run's first dispatch also orders the transfers recorded later in the run (the template
         // data refreshes of its other dispatches) after everything before it.
-        const VkPipelineStageFlags leadingStages = overlapCapable ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-        const VkAccessFlags leadingAccess = overlapCapable ? VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT : VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        const VkPipelineStageFlags leadingStages = mirrorCleared ? VK_PIPELINE_STAGE_TRANSFER_BIT : overlapCapable ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+        const VkAccessFlags leadingAccess = mirrorCleared ? VK_ACCESS_TRANSFER_WRITE_BIT : overlapCapable ? VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT : VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
         Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, leadingStages, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT | heapWrites, leadingAccess);
         Graphics::Recorder::CountBarriers(CommandClass::DispatchLeading);
         recorder.EndGpuTiming(timing);
@@ -4865,7 +4878,9 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     }
     const auto gpuTiming = recorder.BeginGpuTiming(record.programAddress != 0 ? record.programAddress : record.shader->program->variantId);
     if (state->checkpointMarker != nullptr) state->checkpointMarker(commands, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(record.programAddress)));
-    if (argumentImport != nullptr) {
+    if (mirrorCleared) {
+        Graphics::RecordDepthClearDispatchSkip(context, commands, clearedMirror);
+    } else if (argumentImport != nullptr) {
         context.Resolved(&Graphics::DeviceFunctions::cmdDispatchIndirect, "vkCmdDispatchIndirect")(commands, indirectBuffer, indirectOffset);
     } else {
         const auto* limit = state->properties.limits.maxComputeWorkGroupCount;
@@ -4905,7 +4920,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     } else {
         const auto trailingTiming = recorder.BeginGpuTiming(CommandClass::DispatchTrailing);
         constexpr VkAccessFlags dispatchedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
-        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, dispatchedAccess);
+        Graphics::RecordMemoryBarrier(context, commands, mirrorCleared ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, mirrorCleared ? VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT : VK_ACCESS_SHADER_WRITE_BIT, dispatchedAccess);
         Graphics::Recorder::CountBarriers(CommandClass::DispatchTrailing);
         recorder.EndGpuTiming(trailingTiming);
         recorder.MarkCovered(dispatchedAccess);
