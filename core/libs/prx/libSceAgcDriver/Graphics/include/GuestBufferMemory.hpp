@@ -490,6 +490,7 @@ private:
     Context context;
     bool stagingAllowed = false;
     bool addressStaging = true;
+    bool bdaStaging = true;
     bool adjustedRegions = false;
     GuestAllocations::Lease lease;
     // The cached address space this build maps through (its lease pins the ranges); `regions` then

@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
@@ -1177,8 +1178,7 @@ HtileGpuState& HtileGpu() {
 }
 
 bool HtileGpuExpansion() {
-    static const bool enabled = std::getenv("APS5_NO_HTILE_GPU_EXPANSION") == nullptr;
-    return enabled;
+    return !RuntimeSwitches::Set(RuntimeSwitch::NoHtileGpuExpansion);
 }
 
 struct HtileSyncCounters {
