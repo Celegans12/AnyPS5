@@ -1574,6 +1574,9 @@ struct BatchedCounters {
     std::atomic<std::uint64_t> lostNoRun{0}, lostOtherQueue{0}, lostRenderPass{0}, lostStoreRun{0}, lostOwner{0};
 };
 BatchedCounters batchedCounters;
+std::mutex runCloseMutex;
+std::map<std::tuple<std::string, std::size_t, std::uint32_t, std::uint32_t>, std::uint64_t> runCloses;
+std::map<std::uint32_t, std::array<std::uint64_t, 3>> overlapByRing;
 bool DrawOrGpuProfiled();
 
 }
@@ -1590,6 +1593,35 @@ bool Recorder::DispatchOverlapEnabled() {
 
 bool Recorder::BatchedStagingEnabled() {
     return !RuntimeSwitches::Set(RuntimeSwitch::NoBatchedStaging);
+}
+
+std::string Recorder::OverlapByRing() {
+    std::string text;
+    std::lock_guard lock(runCloseMutex);
+    for (const auto& [queue, counts] : overlapByRing) {
+        char row[128];
+        std::snprintf(row, sizeof(row), "%s0x%x %llu overlapped / %llu no open run / %llu other", text.empty() ? "" : "; ", queue - 1u, static_cast<unsigned long long>(counts[0]), static_cast<unsigned long long>(counts[1]), static_cast<unsigned long long>(counts[2]));
+        text += row;
+    }
+    return text;
+}
+
+std::vector<std::pair<std::string, std::uint64_t>> Recorder::RunCloseSites(std::size_t limit, std::uint32_t ring) {
+    static constexpr std::array<const char*, DeferredFlushSites> paths{"commands", "draw pass", "key stores", "label store", "store run", "samples", "submit"};
+    std::vector<std::pair<std::string, std::uint64_t>> sites;
+    {
+        std::lock_guard lock(runCloseMutex);
+        for (const auto& [key, count] : runCloses) {
+            const auto& [where, site, queue, thread] = key;
+            if (ring != ~0u && queue - 1u != ring) continue;
+            char text[256];
+            std::snprintf(text, sizeof(text), "%s %s run 0x%x by 0x%x", where.c_str(), site < paths.size() ? paths[site] : "?", queue - 1u, thread);
+            sites.emplace_back(text, count);
+        }
+    }
+    std::sort(sites.begin(), sites.end(), [](const auto& left, const auto& right) { return left.second > right.second; });
+    if (sites.size() > limit) sites.resize(limit);
+    return sites;
 }
 
 Recorder::BatchedStagingStats Recorder::BatchedStagingCounts() {
@@ -1711,8 +1743,14 @@ std::uint32_t Recorder::TakeDispatchOrder(bool& unordered) {
     return order.queueKey;
 }
 
-void Recorder::flushDeferredDispatch(std::size_t site) {
+void Recorder::flushDeferredDispatch(std::size_t site, const std::source_location& where) {
     if (open == nullptr || open->deferredDispatchQueue == 0) return;
+    if (DrawOrGpuProfiled()) {
+        std::string_view file = where.file_name();
+        if (const auto slash = file.find_last_of("/\\"); slash != std::string_view::npos) file.remove_prefix(slash + 1);
+        std::lock_guard lock(runCloseMutex);
+        ++runCloses[{std::string(file) + ":" + std::to_string(where.line()), site, open->deferredDispatchQueue, GuestMemory::GpuLockThreadTag()}];
+    }
     open->deferredDispatchQueue = 0;
     open->deferredRun.clear();
     auto after = std::move(open->afterRun);
@@ -1763,6 +1801,10 @@ void Recorder::AfterRun(std::function<void(Recorder&)> work) {
 
 VkCommandBuffer Recorder::OverlapCommands(std::uint32_t queueKey, std::span<const void* const> owners, VkAccessFlags* coveredAccess, bool& overlapped) {
     overlapped = queueKey != 0 && open != nullptr && open->deferredDispatchQueue == queueKey && !open->renderPass.open && !open->run.open && std::none_of(owners.begin(), owners.end(), [&](const void* owner) { return std::find(open->deferredRun.begin(), open->deferredRun.end(), owner) != open->deferredRun.end(); });
+    if (queueKey != 0 && DrawOrGpuProfiled()) {
+        std::lock_guard lock(runCloseMutex);
+        ++overlapByRing[queueKey][overlapped ? 0 : open == nullptr || open->deferredDispatchQueue == 0 ? 1 : 2];
+    }
     if (!overlapped && queueKey != 0 && DrawOrGpuProfiled()) {
         auto& c = batchedCounters;
         auto& counter = open == nullptr || open->deferredDispatchQueue == 0 ? c.lostNoRun : open->deferredDispatchQueue != queueKey ? c.lostOtherQueue : open->renderPass.open ? c.lostRenderPass : open->run.open ? c.lostStoreRun : c.lostOwner;
@@ -1784,9 +1826,9 @@ void Recorder::DeferDispatchBarrier(std::uint32_t queueKey, std::span<const void
     open->coveredAccess = 0;
 }
 
-VkCommandBuffer Recorder::Commands(VkAccessFlags* coveredAccess) {
+VkCommandBuffer Recorder::Commands(VkAccessFlags* coveredAccess, std::source_location where) {
     ensureOpen();
-    flushDeferredDispatch(0);
+    flushDeferredDispatch(0, where);
     // Work recorded after a draw's render pass or an inline store run must see their writes: the
     // pass's end and the run's trailing barrier go in first (a per-batch run waits for Submit, or
     // for a caller whose ranges overlap a queued store: FlushStores).
@@ -1801,9 +1843,9 @@ void Recorder::MarkCovered(VkAccessFlags access) {
     if (open != nullptr) open->coveredAccess = access;
 }
 
-Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access) {
+Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access, std::source_location where) {
     ensureOpen();
-    flushDeferredDispatch(1);
+    flushDeferredDispatch(1, where);
     auto& pass = open->renderPass;
     if (!pass.open || forced || (countingSamples && segmentMode() && !segmentSlotReady(*open))) {
         const auto commands = Commands();
@@ -1886,9 +1928,9 @@ bool Recorder::AnyQueuedKeyStore(const std::function<bool(std::uint64_t, std::ui
     return std::any_of(open->keyStores.begin(), open->keyStores.end(), [&](const Batch::KeyStore& store) { return overlaps(store.begin, store.end); });
 }
 
-void Recorder::FlushKeyStores() {
+void Recorder::FlushKeyStores(std::source_location where) {
     if (open == nullptr || open->keyStores.empty()) return;
-    flushDeferredDispatch(2);
+    flushDeferredDispatch(2, where);
     recordKeyStores(true);
 }
 
@@ -1974,10 +2016,10 @@ void Recorder::ensureOpen() {
     if (!ConsumedLabels().empty()) applyConsumedLabels();
 }
 
-void Recorder::RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const std::byte> bytes, std::uint64_t address) {
+void Recorder::RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const std::byte> bytes, std::uint64_t address, std::source_location where) {
     if (bytes.empty()) return;
     ensureOpen();
-    flushDeferredDispatch(3);
+    flushDeferredDispatch(3, where);
     auto& run = open->run;
     const VkDeviceSize end = offset + bytes.size();
     storeCount.fetch_add(1, std::memory_order_relaxed);
@@ -2175,9 +2217,9 @@ bool Recorder::AnyQueuedStore(const std::function<bool(std::uint64_t, std::uint6
     return std::any_of(open->run.queued.begin(), open->run.queued.end(), [&](const Batch::StoreRun::Queued& store) { return overlaps(store.address, store.End()); });
 }
 
-void Recorder::FlushStores() {
+void Recorder::FlushStores(std::source_location where) {
     if (open == nullptr || open->run.queued.empty()) return;
-    flushDeferredDispatch(4);
+    flushDeferredDispatch(4, where);
     closeStoreRun(false);
 }
 
