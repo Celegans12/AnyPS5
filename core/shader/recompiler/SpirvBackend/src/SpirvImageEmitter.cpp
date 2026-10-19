@@ -1951,18 +1951,25 @@ BindlessAddress EmitBindlessAddress(SpirvValueEmitContext& ctx, const IrValue& i
     }
     const auto [aligned, count] = inRange(info.offset);
     const auto readable = Binary(state, spv::OpLogicalAnd, boolean, Unary(state, spv::OpLogicalNot, boolean, invalid), Binary(state, spv::OpUGreaterThanEqual, boolean, count, BdaConstant(state, 2u)));
-    const auto pair = EmitValueOrDefaultIfCondition(state, readable, TypeU32Vector(state, 2u), state.module.Constant(spv::OpConstantComposite, TypeU32Vector(state, 2u), ConstantU32(state, 0u), ConstantU32(state, 0u)), [&] {
-        const auto read = EmitBdaDwordReads(ctx, inst, Binary(state, spv::OpIAdd, u64, base, aligned), 0u, 2u, true);
-        const auto value = state.module.AllocateId();
-        state.module.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 2u), value, read[0], read[1]);
-        return value;
-    });
+    const auto readPointer = [&](std::uint32_t at) {
+        return EmitValueOrDefaultIfCondition(state, readable, TypeU32Vector(state, 2u), state.module.Constant(spv::OpConstantComposite, TypeU32Vector(state, 2u), ConstantU32(state, 0u), ConstantU32(state, 0u)), [&] {
+            const auto read = EmitBdaDwordReads(ctx, inst, at, 0u, 2u, true);
+            const auto value = state.module.AllocateId();
+            state.module.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 2u), value, read[0], read[1]);
+            return value;
+        });
+    };
+    auto pair = readPointer(Binary(state, spv::OpIAdd, u64, base, aligned));
     const auto part = [&](std::uint32_t index) {
         const auto value = state.module.AllocateId();
         state.module.AddFunction(spv::OpCompositeExtract, u32, value, pair, index);
         return value;
     };
     auto address = BindlessPair(state, part(0u), part(1u));
+    for (const auto& hop : info.pointerHops) {
+        pair = readPointer(BindlessAddSigned(state, Binary(state, spv::OpIAdd, u64, address, BdaConstant(state, hop.offset & ~3u)), hop.immediate));
+        address = BindlessPair(state, part(0u), part(1u));
+    }
     address = BindlessAddSigned(state, Binary(state, spv::OpIAdd, u64, address, BdaConstant(state, info.indirectOffset & ~3u)), info.indirectImmediate);
     return {address, Select(state, u32, readable, ConstantU32(state, info.dwordCount), ConstantU32(state, 0u)), invalid, base};
 }
