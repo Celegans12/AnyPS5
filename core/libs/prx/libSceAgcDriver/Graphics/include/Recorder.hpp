@@ -17,6 +17,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <source_location>
 #include <span>
 #include <tuple>
 #include <unordered_set>
@@ -81,7 +82,7 @@ public:
     // so a dispatch, fill or copy whose leading barrier asks for a subset of them may skip it
     // (the [barriers] line counts the merges). The call clears the mask (whatever the caller
     // records is assumed uncovered until it marks); a new batch starts uncovered.
-    VkCommandBuffer Commands(VkAccessFlags* coveredAccess = nullptr);
+    VkCommandBuffer Commands(VkAccessFlags* coveredAccess = nullptr, std::source_location where = std::source_location::current());
     // After a trailing barrier with ALL_COMMANDS as its destination stage: `access` is its
     // destination access mask.
     void MarkCovered(VkAccessFlags access);
@@ -192,6 +193,12 @@ public:
         std::uint64_t lostNoRun, lostOtherQueue, lostRenderPass, lostStoreRun, lostOwner;
     };
     static BatchedStagingStats BatchedStagingCounts();
+    // APS5_PROFILE_DRAW: the call sites that closed open runs, cumulative, most frequent first: one
+    // text per site (file:line, flush path, run ring, closing thread's ring) and its count.
+    // `ring`: only runs of that guest queue (~0u: all).
+    static std::vector<std::pair<std::string, std::uint64_t>> RunCloseSites(std::size_t limit, std::uint32_t ring = ~0u);
+    // APS5_PROFILE_DRAW: unordered dispatches by guest queue: overlapped, and not (no open run, other).
+    static std::string OverlapByRing();
     // APS5_PROFILE_DRAW: deferred barriers recorded, by the path that recorded them (Commands, a draw
     // pass, key stores, a label store, the store run, sample dumps, Submit), cumulative.
     static constexpr std::size_t DeferredFlushSites = 7;
@@ -201,7 +208,7 @@ public:
         bool continued = false;
         bool barrier = true;
     };
-    DrawPassStart StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access);
+    DrawPassStart StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access, std::source_location where = std::source_location::current());
     void LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(VkCommandBuffer)> afterPass = {});
     PassBinding& PassBound();
     // DCC "uncompressed" key stores (DccMetadata.cpp StoreUncompressedOnGpu): queued on the open
@@ -216,7 +223,7 @@ public:
     bool QueuedKeyStoreOverlaps(std::uint64_t address, std::size_t bytes) const;
     // Whether `overlaps(begin, end)` holds for a queued store's range.
     bool AnyQueuedKeyStore(const std::function<bool(std::uint64_t, std::uint64_t)>& overlaps) const;
-    void FlushKeyStores();
+    void FlushKeyStores(std::source_location where = std::source_location::current());
     void FlushKeyStoresOverlapping(std::uint64_t address, std::size_t bytes) { if (HasQueuedKeyStores() && QueuedKeyStoreOverlaps(address, bytes)) FlushKeyStores(); }
     bool Recording() const { return open != nullptr; }
     bool Idle() const { return lanes[0] == nullptr && lanes[1] == nullptr && inFlight.empty(); }
@@ -424,12 +431,12 @@ public:
     // transfer-to-transfer barrier first (WAW). Debug aids: APS5_LABEL_RUNS_INLINE=1 records the
     // stores at once and closes the run at the next command (Commands()) or at Submit, as
     // before; APS5_NO_LABEL_RUNS=1 gives every store barriers of its own.
-    void RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const std::byte> bytes, std::uint64_t address);
+    void RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const std::byte> bytes, std::uint64_t address, std::source_location where = std::source_location::current());
     bool HasQueuedStores() const { return open != nullptr && !open->run.queued.empty(); }
     bool QueuedStoreOverlaps(std::uint64_t address, std::size_t bytes) const;
     // Whether `overlaps(begin, end)` holds for a queued store's guest range.
     bool AnyQueuedStore(const std::function<bool(std::uint64_t, std::uint64_t)>& overlaps) const;
-    void FlushStores();
+    void FlushStores(std::source_location where = std::source_location::current());
     void FlushStoresOverlapping(std::uint64_t address, std::size_t bytes) { if (HasQueuedStores() && QueuedStoreOverlaps(address, bytes)) FlushStores(); }
 
     // Pending-label table. A GPU label (RELEASE_MEM/WRITE_DATA recorded as a store into the batch)
@@ -949,7 +956,8 @@ private:
     // Opens a batch when none is open, without closing a store run (Commands() does both).
     void ensureOpen();
     // Records a deferred dispatch trailing barrier (see DeferDispatchBarrier), if any.
-    void flushDeferredDispatch(std::size_t site);
+    // `where`: the caller that closes the run (APS5_PROFILE_DRAW: [run-close] counts by call site).
+    void flushDeferredDispatch(std::size_t site, const std::source_location& where = std::source_location::current());
     void dropStaleHoldKept();
     // Records the run's pending store (vkCmdUpdateBuffer), if any.
     void flushPendingStore();
