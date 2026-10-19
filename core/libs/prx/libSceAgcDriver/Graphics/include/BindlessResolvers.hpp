@@ -29,6 +29,7 @@ public:
     BindlessPrepared Prepare(const DeviceImageKeys::Key& key) override;
     BindlessResolution Commit(const BindlessPrepared& prepared) override;
     bool Current(const BindlessResolution& resolution) override;
+    bool RefreshGeneration(BindlessPrepared& prepared) override;
 
 private:
     Context context;

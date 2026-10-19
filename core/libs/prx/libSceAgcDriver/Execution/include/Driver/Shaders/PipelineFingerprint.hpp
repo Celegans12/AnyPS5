@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <span>
 #include <string>
+#include <vector>
 
 namespace AgcDriver {
 
@@ -78,6 +79,58 @@ inline ComputePipelineComponents ComputePipelineFingerprintComponents(const Shad
 inline std::uint64_t ComputePipelineFingerprint(const ShaderRecompiler::RecompileResult& shader, std::span<const std::uint32_t> plannedLayout) {
     return ComputePipelineFingerprintComponents(shader, plannedLayout).whole;
 }
+
+// Everything a compute result's fingerprint is a function of on one device, kept by the pipeline-request
+// capture (APS5_PIPELINE_REQUESTS) so a later materialization with the same inputs is known to be saved
+// already without planning its layout and hashing its SPIR-V again (each costs a pass over up to 1.3M words).
+// - The SPIR-V is compared by storage. The kept copy holds that storage, so it cannot be freed and reused at
+//   the same address while the entry lives, and a shared module is copied before it is written. Equal storage
+//   means equal words; another storage with equal words only misses here, and the fingerprint decides.
+// - The planned layout (VulkanDevice::planComputeLayout) is a function of the device and of each binding's
+//   set, number, kind, role, count and read-only flag, so those are compared instead of the layout.
+// - The specialization, the host subgroup size, the workgroup memory and the push flag are compared as the
+//   fingerprint mixes them.
+struct ComputePipelineInputs {
+    struct Binding {
+        std::uint32_t set = 0;
+        std::uint32_t binding = 0;
+        std::uint32_t kind = 0;
+        std::uint32_t role = 0;
+        std::uint32_t count = 0;
+        bool readOnly = false;
+        bool operator==(const Binding&) const = default;
+    };
+    ShaderRecompiler::SharedSpirv spirv;
+    std::vector<ShaderRecompiler::PipelineSpecializationConstant> specialization;
+    std::uint32_t hostSubgroupSize = 0;
+    std::uint32_t workgroupMemoryDwords = 0;
+    bool push = false;
+    std::vector<Binding> bindings;
+
+    static Binding BindingOf(const ShaderRecompiler::DescriptorBinding& binding) {
+        return {binding.descriptorSet, binding.binding, static_cast<std::uint32_t>(binding.kind), static_cast<std::uint32_t>(binding.role), binding.count, binding.readOnly};
+    }
+    static ComputePipelineInputs Of(const ShaderRecompiler::RecompileResult& shader) {
+        ComputePipelineInputs inputs;
+        inputs.spirv = shader.spirv;
+        inputs.specialization = shader.specialization;
+        inputs.hostSubgroupSize = shader.hostSubgroupSize;
+        inputs.workgroupMemoryDwords = shader.workgroupMemoryDwords;
+        inputs.push = !shader.pushConstants.empty();
+        inputs.bindings.reserve(shader.bindings.size());
+        for (const auto& binding : shader.bindings) inputs.bindings.push_back(BindingOf(binding));
+        return inputs;
+    }
+    [[nodiscard]] bool Matches(const ShaderRecompiler::RecompileResult& shader) const {
+        if (spirv.data() != shader.spirv.data() || spirv.size() != shader.spirv.size() || specialization != shader.specialization) return false;
+        if (hostSubgroupSize != shader.hostSubgroupSize || workgroupMemoryDwords != shader.workgroupMemoryDwords || push != !shader.pushConstants.empty()) return false;
+        if (bindings.size() != shader.bindings.size()) return false;
+        for (std::size_t index = 0; index < bindings.size(); ++index) {
+            if (!(bindings[index] == BindingOf(shader.bindings[index]))) return false;
+        }
+        return true;
+    }
+};
 
 // The .fp sidecar body after the fingerprint line: one "<component> <hash>" line per component, then
 // the values themselves ("spec <id> <value>", "binding <set> <binding> <kind> <role> <count> <readOnly>",

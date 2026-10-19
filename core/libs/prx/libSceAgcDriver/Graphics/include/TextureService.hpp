@@ -75,6 +75,13 @@ public:
     virtual BindlessPrepared Prepare(const DeviceImageKeys::Key& key) = 0;
     virtual BindlessResolution Commit(const BindlessPrepared& prepared) = 0;
     virtual bool Current(const BindlessResolution& resolution) = 0;
+    // Takes the guest write generation of an entry prepared ahead of the present's revalidation again,
+    // just before it is committed, as Prepare would have taken it then. False when this resolver cannot:
+    // the entry is prepared again instead.
+    virtual bool RefreshGeneration(BindlessPrepared& prepared) {
+        static_cast<void>(prepared);
+        return false;
+    }
 };
 
 class BindlessMemory {
@@ -142,6 +149,18 @@ public:
         std::uint64_t entryHostBytes = 0;
         std::uint64_t rejections = 0;
         std::uint64_t rejectionHostBytes = 0;
+        // The present's revalidation (AfterPresentWait, under the GPU lock) and the part of it prepared
+        // ahead without the lock (PrepareRevalidation).
+        std::uint64_t revalidateNanoseconds = 0;
+        std::uint64_t revalidateCollectNanoseconds = 0;
+        std::uint64_t revalidateCheckNanoseconds = 0;
+        std::uint64_t replacePrepareNanoseconds = 0;
+        std::uint64_t replaceCommitNanoseconds = 0;
+        std::uint64_t publishNanoseconds = 0;
+        std::uint64_t earlyNanoseconds = 0;
+        std::uint64_t earlyPrepared = 0;
+        std::uint64_t earlyUsed = 0;
+        std::uint64_t earlyDropped = 0;
     };
 
     TextureService(BindlessTable& table, std::shared_ptr<BindlessResolver> resolver, std::shared_ptr<BindlessMemory> memory, Options options);
@@ -160,6 +179,12 @@ public:
     void Publish(Recorder& recorder) { Serve({}, recorder); }
     std::uint64_t PresentSerial(Recorder& recorder);
     void AfterPresentWait(Recorder& recorder, std::uint64_t waitedNanoseconds);
+    // Without the GPU lock, before AfterPresentWait: prepares the entries whose surfaces were written since
+    // their generation (APS5_NO_EARLY_REVALIDATE=1: no-op). The revalidation under the lock then decides
+    // which entries are stale exactly as before and commits a stale entry from its early preparation, its
+    // generation taken again, when the guest mapping did not change in between; any other entry is prepared
+    // under the lock as before.
+    void PrepareRevalidation();
     void Revalidate(Recorder& recorder);
     std::optional<DeviceImageValue> Find(const DeviceImageKeys::Key& key) const;
     std::shared_ptr<void> Owner(const DeviceImageKeys::Key& key) const;
@@ -218,7 +243,7 @@ private:
     void install(const DeviceImageKeys::Key& key, BindlessResolution resolution, Recorder& recorder);
     void place(const DeviceImageKeys::Key& key, BindlessResolution resolution, Recorder& recorder, std::uint64_t lastUsed);
     BindlessResolution take(const DeviceImageKeys::Key& key);
-    void replace(const DeviceImageKeys::Key& key, Recorder& recorder, Lock& lock);
+    void replace(const DeviceImageKeys::Key& key, Recorder& recorder, Lock& lock, const BindlessPrepared* early = nullptr);
     BindlessResolution settle(const BindlessPrepared& prepared);
     std::uint32_t refuse(const DeviceImageKeys::Key& key, const std::string& reason, bool permanent);
     std::uint32_t acquireImage(VkImageView view, VkImageLayout layout);
@@ -274,6 +299,8 @@ private:
     Counts totals;
     Counts reported;
     std::uint64_t reportedOldPath = 0;
+    std::unordered_map<DeviceImageKeys::Key, BindlessPrepared, KeyHash> early;
+    std::uint64_t earlyMapping = 0;
     bool stopping = false;
     bool takingMisses = false;
     std::thread worker;

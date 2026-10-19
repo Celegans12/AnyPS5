@@ -1484,14 +1484,54 @@ ResolvedImageTables ResourceMaterializer::ResolveImageTables(const ShaderInfo& i
     };
     std::map<PoisonKey, std::uint32_t> poisonIndex;
     std::unordered_map<PoisonKey, std::uint32_t, ResolveKeyHash> poisonHash;
+    // Flat poison index (APS5_NO_FLAT_POISON_INDEX=1: the node map above): open addressing over the
+    // indices of out.poison that poison() inserted (slot = index + 1, 0 empty), the key compared with
+    // the record itself. It answers exactly what poisonHash answers: the first index inserted for an
+    // equal (resource, reason, words, dword count), else a new one. Tables of the giant streaming
+    // programs (0x80001e5f00: ~40k records per resolve, almost all poisoned) spent ~1/3 of a resolve
+    // allocating map nodes.
+    static const bool flatPoison = fastResolve && std::getenv("APS5_NO_FLAT_POISON_INDEX") == nullptr;
+    std::vector<std::uint32_t> poisonSlots;
+    std::size_t poisonInserted = 0;
+    const auto poisonKeyHash = [](std::uint32_t resource, PoisonReason reason, const std::array<std::uint32_t, 8>& dwords, std::uint32_t dwordCount) {
+        auto hash = ResolveKeyHash::Mix(ResolveKeyHash::Mix(0xcbf29ce484222325ull, resource), static_cast<std::uint64_t>(reason));
+        for (const auto word : dwords) hash = ResolveKeyHash::Mix(hash, word);
+        hash = ResolveKeyHash::Mix(hash, dwordCount);
+        return hash ^ (hash >> 29u) ^ (hash >> 47u);
+    };
+    const auto flatPoisonIndex = [&](std::uint32_t resource, PoisonReason reason, const DescriptorValue& value, std::uint32_t index) -> std::pair<std::uint32_t, bool> {
+        if ((poisonInserted + 1u) * 2u > poisonSlots.size()) {
+            std::vector<std::uint32_t> grown(std::max<std::size_t>(1024u, poisonSlots.size() * 2u), 0u);
+            const auto mask = grown.size() - 1u;
+            for (const auto slot : poisonSlots) {
+                if (slot == 0u) continue;
+                const auto& record = out.poison[slot - 1u];
+                auto at = static_cast<std::size_t>(poisonKeyHash(record.resource, record.reason, record.words, record.dwordCount)) & mask;
+                while (grown[at] != 0u) at = (at + 1u) & mask;
+                grown[at] = slot;
+            }
+            poisonSlots = std::move(grown);
+        }
+        const auto mask = poisonSlots.size() - 1u;
+        auto at = static_cast<std::size_t>(poisonKeyHash(resource, reason, value.dwords, value.dwordCount)) & mask;
+        while (poisonSlots[at] != 0u) {
+            const auto candidate = poisonSlots[at] - 1u;
+            const auto& record = out.poison[candidate];
+            if (record.resource == resource && record.reason == reason && record.dwordCount == value.dwordCount && record.words == value.dwords) return {candidate, false};
+            at = (at + 1u) & mask;
+        }
+        poisonSlots[at] = index + 1u;
+        ++poisonInserted;
+        return {index, true};
+    };
     std::set<std::uint32_t> expected;
     std::vector<bool> expectedMarks;
     std::size_t expectedCount = 0;
     const auto poison = [&](std::uint32_t resource, PoisonReason reason, const DescriptorValue* words) {
         const auto value = words != nullptr ? *words : DescriptorValue{};
         const auto index = static_cast<std::uint32_t>(out.poison.size());
-        const PoisonKey key{resource, reason, value.dwords, value.dwordCount};
-        const auto [found, inserted] = fastResolve ? [&] { const auto [at, added] = poisonHash.try_emplace(key, index); return std::pair<std::uint32_t, bool>{at->second, added}; }() : [&] { const auto [at, added] = poisonIndex.try_emplace(key, index); return std::pair<std::uint32_t, bool>{at->second, added}; }();
+        // A new index's record is pushed just below, before any later lookup reads it through its slot.
+        const auto [found, inserted] = flatPoison ? flatPoisonIndex(resource, reason, value, index) : fastResolve ? [&] { const PoisonKey key{resource, reason, value.dwords, value.dwordCount}; const auto [at, added] = poisonHash.try_emplace(key, index); return std::pair<std::uint32_t, bool>{at->second, added}; }() : [&] { const PoisonKey key{resource, reason, value.dwords, value.dwordCount}; const auto [at, added] = poisonIndex.try_emplace(key, index); return std::pair<std::uint32_t, bool>{at->second, added}; }();
         if (inserted) out.poison.push_back({value.dwords, value.dwordCount, resource, reason});
         if (fastResolve) {
             if (found >= expectedMarks.size()) expectedMarks.resize(static_cast<std::size_t>(found) + 1u, false);

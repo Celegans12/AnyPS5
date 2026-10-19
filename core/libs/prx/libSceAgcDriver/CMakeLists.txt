@@ -168,6 +168,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/DispatchInsert.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/DispatchLookup.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/DispatchTiming.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/SlowMaterializations.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/IndirectDispatch.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/VariantValidation.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/Draw.cpp
@@ -888,6 +889,20 @@ if(BUILD_TESTING)
     add_test(NAME agc_buffer_pool COMMAND agc_buffer_pool_tests)
     if(WIN32)
         set_tests_properties(agc_buffer_pool PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
+add_test_executable(agc_pipeline_request_precheck_tests EXCLUDE_FROM_ALL tests/PipelineRequestPrecheck.cpp)
+target_include_directories(agc_pipeline_request_precheck_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/core/shader/recompiler ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR})
+target_link_libraries(agc_pipeline_request_precheck_tests PRIVATE libSceAgcDriver libc)
+set_target_properties(agc_pipeline_request_precheck_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_pipeline_request_precheck_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_pipeline_request_precheck_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_pipeline_request_precheck COMMAND agc_pipeline_request_precheck_tests)
+    if(WIN32)
+        set_tests_properties(agc_pipeline_request_precheck PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()

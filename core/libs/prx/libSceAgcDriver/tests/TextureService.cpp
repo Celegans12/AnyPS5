@@ -538,10 +538,18 @@ public:
         return resolution;
     }
     bool Current(const BindlessResolution&) override { return true; }
+    bool RefreshGeneration(BindlessPrepared& prepared) override {
+        ++refreshes;
+        if (prepared.settled.has_value()) return true;
+        if (prepared.state == nullptr) return false;
+        prepared.generation = memory.Collect(prepared.address, static_cast<std::size_t>(prepared.bytes));
+        return true;
+    }
     std::uint64_t Surface(std::uint32_t image) const { return surfaces + static_cast<std::uint64_t>(image) * TextureService::PageBytes; }
 
     std::atomic<std::uint64_t> prepares{0};
     std::atomic<std::uint64_t> commits{0};
+    std::atomic<std::uint64_t> refreshes{0};
     std::set<std::uint32_t> reused;
     std::set<std::uint32_t> dcc;
 
@@ -750,6 +758,58 @@ void serviceTests(const Device& device) {
     recorder.Sync();
     Require(fixture.Check("reused surface", all) == 0u, "entries over reused surface memory were not re-resolved");
     std::cout << "surface reuse: " << usingFive << " entries re-resolved to the new image\n";
+
+    // Early revalidation: the stale entries prepared without the GPU lock are committed under it from that
+    // preparation (generation taken again), with the same stale count and the same served texels.
+    const auto usingImage = [&](std::uint32_t image) {
+        return static_cast<std::uint64_t>(std::count_if(fixture.records.begin(), fixture.records.end(), [&](const Record& item) { return item.present && item.image == image && item.mode != RefusedMode && item.mode != PermanentMode; }));
+    };
+    {
+        const auto before = service.Totals();
+        fixture.memory->Touch(fixture.resolver->Surface(7u), TextureService::PageBytes);
+        fixture.resolver->reused.insert(7u);
+        gpu.unlock();
+        const auto preparesBefore = fixture.resolver->prepares.load();
+        service.PrepareRevalidation();
+        const auto preparedOff = fixture.resolver->prepares.load() - preparesBefore;
+        gpu.lock();
+        service.Revalidate(recorder);
+        const auto after = service.Totals();
+        const auto expected = usingImage(7u);
+        Require(after.stale - before.stale == expected, "early revalidation changed the stale count: " + std::to_string(after.stale - before.stale) + ", expected " + std::to_string(expected));
+        if (std::getenv("APS5_NO_EARLY_REVALIDATE") == nullptr) {
+            Require(preparedOff == expected && fixture.resolver->prepares.load() - preparesBefore == expected, "the stale entries were not prepared off the GPU lock exactly once: " + std::to_string(preparedOff) + " off, " + std::to_string(fixture.resolver->prepares.load() - preparesBefore) + " in total");
+            Require(after.earlyUsed - before.earlyUsed == expected && after.earlyDropped == before.earlyDropped, "the early preparations were not all used");
+        }
+        service.Serve(served, recorder);
+        fixture.Dispatch(recorder, 0x401u);
+        recorder.Submit();
+        recorder.Sync();
+        Require(fixture.Check("early revalidation", all) == 0u, "entries committed from an early preparation read wrong texels");
+        std::cout << "early revalidation: " << expected << " stale entries prepared off the GPU lock, committed exactly\n";
+    }
+    {
+        // A mapping change between the early preparation and the revalidation drops every early preparation.
+        const auto before = service.Totals();
+        fixture.memory->Touch(fixture.resolver->Surface(8u), TextureService::PageBytes);
+        fixture.resolver->reused.insert(8u);
+        gpu.unlock();
+        service.PrepareRevalidation();
+        gpu.lock();
+        fixture.memory->Remap();
+        const auto preparesBefore = fixture.resolver->prepares.load();
+        service.Revalidate(recorder);
+        const auto after = service.Totals();
+        const auto expected = usingImage(8u);
+        Require(after.stale - before.stale == expected && after.earlyUsed == before.earlyUsed, "early preparations were used across a mapping change");
+        if (std::getenv("APS5_NO_EARLY_REVALIDATE") == nullptr) Require(fixture.resolver->prepares.load() - preparesBefore == expected && after.earlyDropped - before.earlyDropped == expected, "the stale entries were not prepared again under the lock after a mapping change");
+        service.Serve(served, recorder);
+        fixture.Dispatch(recorder, 0x402u);
+        recorder.Submit();
+        recorder.Sync();
+        Require(fixture.Check("early revalidation after a mapping change", all) == 0u, "entries prepared again after a mapping change read wrong texels");
+        std::cout << "early revalidation: dropped across a mapping change, " << expected << " entries prepared again under the lock\n";
+    }
 
     const auto beforeUnmap = service.Totals();
     fixture.memory->Unmap(fixture.resolver->Surface(6u), TextureService::PageBytes);
