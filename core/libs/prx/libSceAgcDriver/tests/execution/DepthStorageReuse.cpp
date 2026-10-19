@@ -74,7 +74,7 @@ int main() {
             Read(*device, 22u, format == VK_FORMAT_D16_UNORM ? Width : Width / 2u, false, 0.25f);
             if (format != VK_FORMAT_D32_SFLOAT) continue;
             Read(*device, 22u, Width, true, 0.5f);
-            Read(*device, 20u, Width, false, 0.25f, Height, 25u);
+            Read(*device, 20u, Width, false, 0.25f, 2u * Height, 25u);
             Read(*device, 22u, Width, true, 0.25f);
             Require(DepthFastClearHarness::Draw(*device, shaders, surface, {.depthTest = false, .depthWrite = true}) == DepthFastClearHarness::Covered, "depth producer did not cover the surface");
             Read(*device, 22u, Width, true, 0.5f);
