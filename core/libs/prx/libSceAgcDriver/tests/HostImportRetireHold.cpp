@@ -359,6 +359,39 @@ void BusyRetireOutlivesALaterBatch() {
     Expect(!Live(retired), "the dropped import outlived every batch of its hold");
 }
 
+std::uint64_t nestedImportAddress = 0;
+unsigned nestedImportCallbacks = 0;
+
+void UnwatchReentryUsesExistingImports() {
+    Heap first;
+    Heap second;
+    const auto context = mockContext();
+    nestedImportAddress = first.Address();
+    const auto* existing = HostImportFor(context, nestedImportAddress, 4096);
+    Expect(existing != nullptr, "the callback's existing import was not created");
+    if (existing == nullptr) return;
+    const auto buffer = existing->buffer;
+    struct RestoreHook {
+        ~RestoreHook() { AgcDriver::GuestMemory::SetUnwatchHook(nullptr); }
+    } restore;
+    AgcDriver::GuestMemory::SetUnwatchHook([](std::uint64_t address, std::size_t bytes) {
+        ++nestedImportCallbacks;
+        const auto context = mockContext();
+        const auto before = mock.memories.size();
+        const auto* existing = HostImportFor(context, nestedImportAddress, 4096);
+        Expect(existing != nullptr && existing->base == nestedImportAddress, "unwatch reentry lost an existing import");
+        Expect(HostImportFor(context, address, bytes) == nullptr, "unwatch reentry recursively created its unfinished import");
+        auto otherDevice = context;
+        otherDevice.device = reinterpret_cast<VkDevice>(0x9876);
+        Expect(HostImportFor(otherDevice, nestedImportAddress, 4096) == nullptr, "unwatch reentry used another device's import");
+        Expect(mock.memories.size() == before, "unwatch reentry allocated or retired memory");
+    });
+    const auto* added = HostImportFor(context, second.Address(), 4096);
+    Expect(added != nullptr, "the outer import did not finish after unwatch reentry");
+    Expect(nestedImportCallbacks != 0, "the import did not call the unwatch hook");
+    Expect(Live(buffer) && existing->buffer == buffer, "unwatch reentry invalidated the existing import");
+}
+
 }
 
 int main() {
@@ -369,6 +402,7 @@ int main() {
     setenv("APS5_WRITE_WATCH_IMPORTS", "unwatch", 1);
 #endif
     try {
+        UnwatchReentryUsesExistingImports();
         WindowPromotionOutlivesTheHold();
         IdleRetireOutlivesTheHold();
         BusyRetireOutlivesALaterBatch();

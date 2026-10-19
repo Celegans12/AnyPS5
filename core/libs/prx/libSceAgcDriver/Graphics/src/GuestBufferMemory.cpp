@@ -191,10 +191,36 @@ struct ImportFailure {
     GuestAllocations::Mapped ranges;
 };
 
+class HostImportMutex {
+public:
+    void lock() {
+        mutex.lock();
+        owner.store(token(), std::memory_order_relaxed);
+    }
+
+    void unlock() {
+        owner.store(nullptr, std::memory_order_relaxed);
+        mutex.unlock();
+    }
+
+    bool HeldByThisThread() const {
+        return owner.load(std::memory_order_relaxed) == token();
+    }
+
+private:
+    static const void* token() {
+        thread_local char identity;
+        return &identity;
+    }
+
+    std::mutex mutex;
+    std::atomic<const void*> owner{nullptr};
+};
+
 // Imports persist across draws, keyed by allocation base, and are dropped when their allocation leaves
 // the registered set; a dropped import is destroyed once the recorded work that may read it completed.
 struct HostImports {
-    std::mutex mutex;
+    HostImportMutex mutex;
     VkDevice device = VK_NULL_HANDLE;
     PFN_vkDestroyBuffer destroyBuffer = nullptr;
     PFN_vkFreeMemory freeMemory = nullptr;
@@ -2736,6 +2762,13 @@ const HostImport* HostImportFor(const Context& context, std::uint64_t address, s
     if (context.hostImportAlignment == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return nullptr;
     ensurePinWaiter();
     auto& state = Imports();
+    if (state.mutex.HeldByThisThread()) {
+        if (state.device != context.device) return nullptr;
+        const auto* entry = findImport(state, address, address + bytes);
+        if (entry == nullptr) return nullptr;
+        const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+        return sameRange(*entry, lease) ? entry : nullptr;
+    }
     std::lock_guard lock(state.mutex);
     // A hit is only valid while the registry has not changed since the imports were reconciled.
     if (!importsStale(context, state)) {
