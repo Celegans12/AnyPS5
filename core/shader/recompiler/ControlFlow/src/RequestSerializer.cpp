@@ -833,8 +833,11 @@ DeserializedRequest deserialize(std::string_view decoded, std::uint32_t version,
         result.request.context.linkedCallFallbacks = result.linkedCallFallbacks;
     }
     if (version >= 32u && result.request.context.compute.has_value()) {
-        result.compute->singleWorkgroup = reader.ReadBool();
-        result.request.context.compute = result.compute;
+        // Set the flag on both copies: request.context.compute also holds the fields read after
+        // the compute info (partialThreads, scratchDwords), which result.compute lacks.
+        const bool singleWorkgroup = reader.ReadBool();
+        result.request.context.compute->singleWorkgroup = singleWorkgroup;
+        if (result.compute.has_value()) result.compute->singleWorkgroup = singleWorkgroup;
     }
     if (version >= 26u && reader.Remaining() == 12u && result.request.context.vertex.has_value()) {
         if (reader.ReadU32() != DrawParameterBlockTag) throw std::runtime_error("RequestSerializer: unexpected trailing data");
