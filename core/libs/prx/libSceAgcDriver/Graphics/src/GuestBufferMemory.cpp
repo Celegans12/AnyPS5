@@ -1432,7 +1432,8 @@ std::uint64_t importBudget(const Context& context) {
         return value != nullptr ? std::strtoull(value, nullptr, 10) << 20u : 0u;
     }();
     if (configured != 0) return configured;
-    return HostImportBudget(context.memory, physicalMemoryBytes());
+    static const bool halfHeapReserve = std::getenv("APS5_HOST_IMPORT_HALF_HEAP_RESERVE") != nullptr;
+    return HostImportBudget(context.memory, physicalMemoryBytes(), halfHeapReserve);
 }
 
 std::atomic<std::uint64_t> rangeImportWindow{64ull << 20u};
@@ -3287,13 +3288,13 @@ void SetHostImportDeferredSettles(bool enabled) {
 #endif
 }
 
-std::uint64_t HostImportBudget(const VkPhysicalDeviceMemoryProperties& memory, const std::uint64_t physicalBytes) {
+std::uint64_t HostImportBudget(const VkPhysicalDeviceMemoryProperties& memory, const std::uint64_t physicalBytes, const bool halfHeapReserve) {
     std::uint64_t hostHeap = 0;
     for (std::uint32_t index = 0; index < std::min<std::uint32_t>(memory.memoryHeapCount, VK_MAX_MEMORY_HEAPS); ++index) {
         if ((memory.memoryHeaps[index].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0) hostHeap = std::max<std::uint64_t>(hostHeap, memory.memoryHeaps[index].size);
     }
     const auto fromMemory = std::max<std::uint64_t>(6144ull << 20u, physicalBytes / 2);
-    const auto reserve = std::max<std::uint64_t>(2048ull << 20u, hostHeap / 2);
+    const auto reserve = std::max<std::uint64_t>(2048ull << 20u, halfHeapReserve ? hostHeap / 2 : 0u);
     return hostHeap > reserve ? std::min(fromMemory, hostHeap - reserve) : fromMemory;
 }
 

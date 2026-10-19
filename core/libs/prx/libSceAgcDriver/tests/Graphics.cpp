@@ -6327,6 +6327,7 @@ void hostImportBudgetTests() {
     Require(HostImportBudget(memory, 16 * GiB) == 4064 * MiB, "imports on a 16 GiB machine take more than half its 8128 MiB host heap");
     memory.memoryHeaps[1].size = 16 * GiB;
     Require(HostImportBudget(memory, 32 * GiB) == 8 * GiB, "imports on a 32 GiB machine take more than half its 16 GiB host heap");
+    Require(HostImportBudget(memory, 32 * GiB, false) == 14 * GiB, "without the half-heap reserve, imports on a 32 GiB machine do not keep the 2 GiB reserve budget");
     memory.memoryHeaps[1].size = 32 * GiB;
     Require(HostImportBudget(memory, 64 * GiB) == 16 * GiB, "imports on a 64 GiB machine take more than half its 32 GiB host heap");
     memory.memoryHeaps[1].size = 3 * GiB;
