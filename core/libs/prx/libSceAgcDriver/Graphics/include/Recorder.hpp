@@ -162,6 +162,36 @@ public:
     // the deferred barrier, wherever that is recorded. Only while a run is open.
     void AfterRun(std::function<void(Recorder&)> work);
     bool RunOpen() const { return open != nullptr && open->deferredDispatchQueue != 0; }
+    // Batched staging (APS5_NO_BATCHED_STAGING=1 turns it off; an APS5_AB switch). NVIDIA drains the
+    // GPU at every transfer and barrier recorded between two dispatches, so the staged copy-ins of
+    // the dispatches that join a run go to a prelude command buffer submitted ahead of the run
+    // (one barrier before it, one after), and the run's copy-backs share one trailing barrier.
+    static bool BatchedStagingEnabled();
+    // At a run's first dispatch (VulkanDevice::recordDispatch: overlap capable, not joining a run,
+    // with staged copies of its own): ends the batch's command buffer and continues in a new one,
+    // the run's prelude (PreludeCommands) going between the two. Returns the command buffer to
+    // record into (the old one when the batch cannot split: a sample query is active).
+    VkCommandBuffer SplitForRun();
+    // The copy-ins of a dispatch joining the open run (RunCommands said inRun): the run's prelude,
+    // begun with the barrier that orders it after everything before the run; VK_NULL_HANDLE when
+    // the run has none (its first dispatch did not split), and the copies go inline.
+    VkCommandBuffer PreludeCommands();
+    // A pristine copy (APS5_STAGING_DIFF) of a shadow the prelude fills: recorded at the prelude's
+    // end, after one transfer barrier for all of them.
+    void PreludePristine(VkBuffer shadow, VkBuffer pristine, VkDeviceSize bytes);
+    // The copy-backs a run's deferred barrier records after itself (AfterRun work) while batched
+    // staging is on: they record no barriers of their own, and the run records one after all of
+    // them. AfterRunWrite notes a guest range one writes and returns true when an earlier one of
+    // the run wrote an overlapping range: the caller then records a barrier first (it orders every
+    // earlier copy-back, so the noted ranges restart).
+    bool AfterRunMerging() const { return open != nullptr && open->afterRunMerging; }
+    bool AfterRunWrite(std::uint64_t begin, std::uint64_t end);
+    // APS5_PROFILE_DRAW: batched staging and lost-overlap counts, cumulative.
+    struct BatchedStagingStats {
+        std::uint64_t splits, preludes, preludeCopies, pristineCopies, mergedCopyBacks, copyBackConflicts;
+        std::uint64_t lostNoRun, lostOtherQueue, lostRenderPass, lostStoreRun, lostOwner;
+    };
+    static BatchedStagingStats BatchedStagingCounts();
     // APS5_PROFILE_DRAW: deferred barriers recorded, by the path that recorded them (Commands, a draw
     // pass, key stores, a label store, the store run, sample dumps, Submit), cumulative.
     static constexpr std::size_t DeferredFlushSites = 7;
@@ -660,6 +690,8 @@ public:
         std::uint64_t serial = 0;
         double gpuStartNs = 0;
         double gpuEndNs = 0;
+        // The batch's lane (1: the async compute lane, see AsyncLaneRing).
+        int lane = 0;
         std::chrono::steady_clock::time_point submittedAt{};
         std::chrono::steady_clock::time_point fenceSeenAt{};
         std::uint64_t readGeneration = 0;
@@ -779,6 +811,26 @@ private:
         std::vector<const void*> deferredRun;
         // See AfterRun.
         std::vector<std::function<void(Recorder&)>> afterRun;
+        // Command buffers recorded before `commands`, in submission order (SplitForRun): ended, but
+        // for an open prelude, which sealPrelude ends.
+        std::vector<VkCommandBuffer> chunks;
+        // See SplitForRun: `armed` from a split until the run closes; `commands` once a copy-in used
+        // it (also in `chunks`); the pristine copies it owes at its end.
+        struct Prelude {
+            bool armed = false;
+            VkCommandBuffer commands = VK_NULL_HANDLE;
+            struct Pristine {
+                VkBuffer shadow;
+                VkBuffer pristine;
+                VkDeviceSize bytes;
+            };
+            std::vector<Pristine> pristine;
+        } prelude;
+        // See AfterRunMerging: while the run's copy-backs record, the guest ranges they wrote since
+        // the last barrier, and whether any wrote.
+        bool afterRunMerging = false;
+        bool afterRunWrote = false;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> afterRunWritten;
         // The hazard tracker's accesses since its last simulated barrier (see NoteAccess).
         struct Tracker {
             struct Range {
@@ -1043,6 +1095,10 @@ private:
     // Command buffers and fences of completed batches, reused by later ones (hundreds of batches per
     // frame would otherwise allocate and free their objects each time).
     std::vector<std::pair<VkCommandBuffer, VkFence>> spare;
+    // Extra command buffers of completed batches (SplitForRun, preludes), reused likewise.
+    std::vector<VkCommandBuffer> spareChunks;
+    VkCommandBuffer beginChunk();
+    void sealPrelude();
     std::vector<VkQueryPool> sparePools;
     mutable std::mutex completedMutex;
     std::array<Completed, CompletedRingSize> completed;

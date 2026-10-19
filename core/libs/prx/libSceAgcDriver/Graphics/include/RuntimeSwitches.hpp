@@ -22,6 +22,7 @@ enum class RuntimeSwitch : std::size_t {
     NoGpuIndirectArgs,
     NoBarrierBatch,
     NoEarlyRevalidate,
+    NoBatchedStaging,
     Count,
 };
 
