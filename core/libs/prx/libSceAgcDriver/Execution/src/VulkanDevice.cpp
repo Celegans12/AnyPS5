@@ -257,7 +257,7 @@ struct ComputePipelineKey {
         using Role = ShaderRecompiler::DescriptorRole;
         using Kind = ShaderRecompiler::DescriptorKind;
         auto identity = shader.Identity();
-        static const bool exactCounts = std::getenv("APS5_NO_TABLE_COUNT_NEUTRAL_PIPELINES") != nullptr;
+        static const bool exactCounts = std::getenv("APS5_TABLE_COUNT_NEUTRAL_PIPELINES") == nullptr;
         if (identity.Empty() || exactCounts) return {identity, pushConstants};
         const bool storageTable = std::any_of(shader.bindings.begin(), shader.bindings.end(), [](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == Role::ImageTable && binding.kind == Kind::StorageImage; });
         if (storageTable) return {identity, pushConstants};
