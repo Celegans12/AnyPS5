@@ -228,7 +228,8 @@ bool WritesMemory(IrOpcode opcode) {
 std::vector<std::pair<const IrValue*, std::uint32_t>> AdjacentBdaLoads(SpirvValueEmitContext& ctx, const IrValue& inst, const MemoryInfo& mem) {
     std::vector<std::pair<const IrValue*, std::uint32_t>> members;
     const IrBlock* block = inst.Parent();
-    if (block == nullptr || ctx.state.laneCount != 1u || (mem.offset & 3u) != 0u) return members;
+    static const bool disablePaired = std::getenv("APS5_NO_PAIRED_BDA_SPANS") != nullptr;
+    if (block == nullptr || (ctx.state.laneCount != 1u && (ctx.state.laneCount != 2u || disablePaired)) || (mem.offset & 3u) != 0u) return members;
     const auto& instructions = block->Instructions();
     auto next = std::find(instructions.begin(), instructions.end(), &inst);
     if (next == instructions.end()) return members;
@@ -258,7 +259,7 @@ std::vector<std::pair<const IrValue*, std::uint32_t>> AdjacentBdaLoads(SpirvValu
 std::uint32_t LoadBda(SpirvValueEmitContext& ctx, const IrValue& inst, const MemoryInfo& mem, std::uint32_t bits) {
     auto& state = ctx.state;
     if (bits == 32u) {
-        if (const auto grouped = state.bdaGroupedLoads.find(&inst); grouped != state.bdaGroupedLoads.end()) {
+        if (const auto grouped = ctx.bdaGroupedLoads.find(&inst); grouped != ctx.bdaGroupedLoads.end()) {
             const auto value = state.module.AllocateId();
             state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), value, grouped->second.first, grouped->second.second);
             return value;
@@ -277,7 +278,7 @@ std::uint32_t LoadBda(SpirvValueEmitContext& ctx, const IrValue& inst, const Mem
                 state.module.AddFunction(spv::OpCompositeConstruct, vector, read, values[0], values[1], values[2], values[3]);
                 return read;
             });
-            for (const auto& member : members) state.bdaGroupedLoads[member.first] = {all, member.second};
+            for (const auto& member : members) ctx.bdaGroupedLoads[member.first] = {all, member.second};
             const auto value = state.module.AllocateId();
             state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), value, all, 0u);
             return value;

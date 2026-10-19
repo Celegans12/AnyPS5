@@ -160,7 +160,6 @@ struct SpirvEmitterState {
     std::map<std::pair<bool, std::uint32_t>, std::uint32_t> interpolateFunctions;
     std::array<std::array<std::uint32_t, 2>, 2> bdaDwordReadFunctions {};
     std::array<std::array<std::uint32_t, 2>, 2> bdaSpanReadFunctions {};
-    std::unordered_map<const IrValue*, std::pair<std::uint32_t, std::uint32_t>> bdaGroupedLoads;
     std::uint32_t bdaStopValue = 0;
     std::uint32_t bdaPcOverride = 0;
     // False for programs with workgroup barriers: faulting BDA accesses then continue (see BdaInvocationsMayStop).
@@ -267,6 +266,7 @@ struct SpirvValueEmitContext {
     std::uint32_t half = 0;
     // The later dwords of a scalar buffer load whose first dword read them all (see
     // EmitRuntimeScalarBufferLoad): their value and the label it was defined in.
+    std::unordered_map<const IrValue*, std::pair<std::uint32_t, std::uint32_t>> bdaGroupedLoads;
     std::unordered_map<const IrValue*, std::pair<std::uint32_t, std::uint32_t>> scalarRunValues;
 };
 

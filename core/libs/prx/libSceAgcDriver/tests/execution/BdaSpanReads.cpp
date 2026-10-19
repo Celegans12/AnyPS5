@@ -32,11 +32,14 @@ constexpr std::uint32_t Fill = 0xcdcdcdcdu;
 constexpr std::uint32_t LoadBase = 0x100;
 constexpr std::uint32_t OutputBase = 0x8000;
 
-alignas(256) std::array<std::array<std::uint32_t, 64>, 4> Programs{};
+alignas(256) std::array<std::array<std::uint32_t, 64>, 8> Programs{};
 
-std::span<const std::uint32_t> Code(bool coherent, bool barrier) {
-    auto& program = Programs[(coherent ? 2u : 0u) + (barrier ? 1u : 0u)];
-    std::vector<std::uint32_t> code{0x34040084, 0x4a0404ff, LoadBase, 0x34080081, 0x36080882, 0x4a040504, 0x34060083, 0x4a0606ff, OutputBase, 0xdc388ff8 | (coherent ? 0x10000u : 0u), 0x04000002, 0xbf8c3f70};
+std::span<const std::uint32_t> Code(bool coherent, bool barrier, bool adjacent) {
+    auto& program = Programs[(coherent ? 2u : 0u) + (barrier ? 1u : 0u) + (adjacent ? 4u : 0u)];
+    std::vector<std::uint32_t> code{0x34040084, 0x4a0404ff, LoadBase, 0x34080081, 0x36080882, 0x4a040504, 0x34060083, 0x4a0606ff, OutputBase, 0xbf8c3f70};
+    if (adjacent) {
+        code.insert(code.end(), {0xdc308ffc | (coherent ? 0x10000u : 0u), 0x05000002, 0xdc308004 | (coherent ? 0x10000u : 0u), 0x07000002, 0xbf8c3f70});
+    } else code.insert(code.end(), {0xdc388ff8 | (coherent ? 0x10000u : 0u), 0x04000002, 0xbf8c3f70});
     if (barrier) code.push_back(0xbf8a0000);
     code.insert(code.end(), {0xdc708000, 0x00000503, 0xdc708004, 0x00000703, 0xbf810000});
     std::copy(code.begin(), code.end(), program.begin());
@@ -118,8 +121,8 @@ ShaderRecompiler::RecompileResult Recompile(std::span<const std::uint32_t> code,
     return ShaderRecompiler::Recompile(request);
 }
 
-void Run(AgcDriver::VulkanDevice& device, GuestBlock& guest, bool coherent, bool barrier, std::uint32_t waveSize, const ShaderRecompiler::SpirvTarget& target, const std::string& name) {
-    const auto code = Code(coherent, barrier);
+void Run(AgcDriver::VulkanDevice& device, GuestBlock& guest, bool coherent, bool barrier, std::uint32_t waveSize, const ShaderRecompiler::SpirvTarget& target, const std::string& name, bool adjacent = false) {
+    const auto code = Code(coherent, barrier, adjacent);
     auto memory = Initial();
     std::memcpy(guest.Data(), memory.data(), BlockBytes);
     const auto address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(guest.Data()));
@@ -147,6 +150,7 @@ int main() {
             for (const bool barrier : {false, true}) {
                 Run(*device, guest, coherent, barrier, 32, native, "wave32");
                 Run(*device, guest, coherent, barrier, 64, native, "wave64");
+                Run(*device, guest, coherent, barrier, 64, native, "wave64 adjacent", true);
                 if (split.subgroupSize != native.subgroupSize) Run(*device, guest, coherent, barrier, 64, split, "wave64 split");
             }
         }
