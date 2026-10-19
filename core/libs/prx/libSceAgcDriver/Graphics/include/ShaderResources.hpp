@@ -768,6 +768,16 @@ public:
     std::size_t Size() const;
     std::uint64_t TableElements() const;
     static std::uint64_t TableElementBudget();
+    // Bytes of copied buffers (ShaderResources::CopiedBytes) the entries hold, and the bound on them:
+    // APS5_RESOURCE_CACHE_COPIED_MIB (0 = none, at most 4096), enforced unless APS5_NO_RESOURCE_COPY_BUDGET.
+    std::size_t CopiedBytes() const;
+    static std::size_t CopiedBudget();
+    struct CopyBudgetCounts {
+        std::uint64_t evicted = 0;
+        std::uint64_t evictedBytes = 0;
+        std::uint64_t oversized = 0;
+    };
+    static CopyBudgetCounts CopyBudgetTotals();
 
 private:
     void erase(const Key& key);

@@ -26,6 +26,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_NO_BATCHED_STAGING",
     "APS5_QUIET_PUBLISH",
     "APS5_NO_CLEAR_HAND_OVER",
+    "APS5_NO_RESOURCE_COPY_BUDGET",
 };
 
 struct Refusal {

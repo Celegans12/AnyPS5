@@ -9119,6 +9119,113 @@ void Run(Context context) {
 }
 #endif
 
+void resourceCopiedBudgetTests(const Device& device, bool oversized) {
+    auto context = device.GetContext();
+    context.hostImportAlignment = 0;
+    context.dmaBufImport = false;
+    std::unique_lock gpu(AgcDriver::GuestMemory::GpuMutex());
+    const std::size_t each = (oversized ? 2u : 1u) << 20u;
+    constexpr std::size_t Count = 4;
+    void* block = AllocateWatched(each * Count, 65536);
+    Require(block != nullptr, "cannot allocate copied-cache payload");
+    const auto release = [&](void* pointer) { ReleaseWatched(pointer, each * Count); };
+    std::unique_ptr<void, decltype(release)> allocation(block, release);
+    std::memset(block, 0, each * Count);
+    ResourceCache cache;
+    const auto* budget = std::getenv("APS5_RESOURCE_CACHE_COPIED_MIB");
+    const auto mib = budget ? std::strtoull(budget, nullptr, 10) : 0ull;
+    std::vector<std::weak_ptr<ShaderResources>> owners;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkShaderModule module = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    {
+        Recorder recorder(context);
+        recorder.Activate();
+        ShaderRecompiler::RecompileResult empty;
+        CompiledShader emptyShader{ShaderRecompiler::ShaderStage::Compute, &empty, 0};
+        auto zero = std::make_shared<ShaderResources>(context, emptyShader);
+        Require(zero->CopiedBytes() == 0, "zero-copy fixture owns copies");
+        cache.Insert({999}, zero);
+        zero.reset();
+        for (std::size_t index = 0; index < Count; ++index) {
+            const auto address = reinterpret_cast<std::uint64_t>(block) + index * each;
+            *reinterpret_cast<std::uint32_t*>(address) = 100 + static_cast<std::uint32_t>(index);
+            ShaderRecompiler::DescriptorBinding binding;
+            binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+            binding.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+            binding.descriptorSet = 0;
+            binding.binding = 0;
+            binding.count = 1;
+            binding.guestDescriptor = {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u) & 0xffffu, static_cast<std::uint32_t>(each), 0x31000000u};
+            binding.bufferWritten = {true};
+            ShaderRecompiler::RecompileResult program;
+            program.bindings.push_back(binding);
+            CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+            auto resources = std::make_shared<ShaderResources>(context, shader);
+            Require(resources->HasCopiedWrites() && resources->CopiedBytes() == each, "fixture did not own the expected copied bytes");
+            if (index == 0) {
+                const auto setLayout = resources->Layout();
+                const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(std::uint32_t)};
+                VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+                layoutInfo.setLayoutCount = 1;
+                layoutInfo.pSetLayouts = &setLayout;
+                layoutInfo.pushConstantRangeCount = 1;
+                layoutInfo.pPushConstantRanges = &push;
+                Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &layoutInfo, nullptr, &layout), "copied-cache pipeline layout");
+                VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+                moduleInfo.codeSize = sizeof(BUFFER_UPDATE_SPV);
+                moduleInfo.pCode = BUFFER_UPDATE_SPV;
+                Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &moduleInfo, nullptr, &module), "copied-cache shader module");
+                VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+                pipelineInfo.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, module, "main", nullptr};
+                pipelineInfo.layout = layout;
+                Check(context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipeline), "copied-cache pipeline");
+            }
+            const auto commands = recorder.Commands();
+            recorder.Keep(resources);
+            const std::uint32_t delta = 7;
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+            context.Function<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+            resources->Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, layout);
+            context.Function<PFN_vkCmdPushConstants>("vkCmdPushConstants")(commands, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(delta), &delta);
+            context.Function<PFN_vkCmdDispatch>("vkCmdDispatch")(commands, 1, 1, 1);
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
+            resources->MarkGpuWrites(recorder);
+            recorder.OnComplete([resources] { resources->WriteBackBuffers(); });
+            owners.push_back(resources);
+            std::vector<std::shared_ptr<ShaderResources>> evicted;
+            cache.Insert({static_cast<std::uint32_t>(index)}, resources, &evicted);
+            if (index == 0) cache.Insert({0}, resources, &evicted);
+            resources.reset();
+            evicted.clear();
+            Require(!owners.front().expired(), "cache eviction released a pending GPU owner");
+            if (!oversized && index == 1) Require(cache.Touch({0}), "cannot touch the copied-cache entry");
+            if (!oversized && index == 2 && mib == 2) {
+                Require(cache.Find({1}) == nullptr && cache.Find({0}) != nullptr, "byte eviction ignored LRU touches");
+            }
+        }
+        std::size_t retained = 0;
+        for (std::uint32_t index = 0; index < Count; ++index) {
+            if (auto resources = cache.Find({index})) retained += resources->CopiedBytes();
+        }
+        Require(cache.Find({999}) != nullptr, "byte pressure evicted the zero-copy entry");
+        const auto expected = mib == 0 ? Count * each : std::min<std::size_t>(Count * each, (mib << 20u) / each * each);
+        Require(retained == expected, "copied-byte budget retained the wrong number of bytes");
+        if (!oversized && mib == 2) Require(cache.Find({0}) != nullptr && cache.Find({2}) == nullptr, "byte eviction displaced the recently used entry");
+        std::printf("copied-cache fixture: budget %llu MiB, copied bytes %zu, entries %zu, pending owners %zu\n", mib, retained, cache.Size(), owners.size());
+        cache.Clear();
+        Require(!owners.front().expired(), "cache clear destroyed recorded GPU work");
+        recorder.Sync();
+        for (std::size_t index = 0; index < Count; ++index) {
+            Require(*reinterpret_cast<std::uint32_t*>(static_cast<std::byte*>(block) + index * each) == 107 + index, "cache eviction changed the GPU result");
+        }
+    }
+    for (const auto& owner : owners) Require(owner.expired(), "retired resource survived cache and recorder release");
+    context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, pipeline, nullptr);
+    context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
+    context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, layout, nullptr);
+}
+
 int main(int argc, char** argv) {
     try {
         if (argc == 2 && std::string_view(argv[1]) == "--queued-write-groups-only") {
@@ -9135,6 +9242,10 @@ int main(int argc, char** argv) {
             return 77;
         }
         Device& device = *created;
+        if (argc == 2 && (std::string_view(argv[1]) == "--resource-copy-cache" || std::string_view(argv[1]) == "--resource-copy-cache-oversized")) {
+            resourceCopiedBudgetTests(device, std::string_view(argv[1]) == "--resource-copy-cache-oversized");
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--import-watch-only") {
             importWatchTests(device);
             return 0;
