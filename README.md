@@ -3,7 +3,7 @@
 <p align="center"><b>A test branch of <a href="https://github.com/boykopovar/AnyPS5">AnyPS5</a> that runs Ghost of Yōtei (PPSA26344) into the open world.</b><br>
 <sub>Branch <code>yotei/best</code> on Celegans12/AnyPS5 · progress thread: <a href="https://github.com/boykopovar/AnyPS5/discussions/675">discussion #675</a> · <a href="#run-it">run it</a> · <a href="#updates">updates</a></sub></p>
 
-<p align="center"><img src="https://raw.githubusercontent.com/Celegans12/AnyPS5/bringup-media/yotei/2026-10-19/open-world-combo19.png" alt="Atsu at the Nupur river in the open world of Ghost of Yōtei on AnyPS5, frame read back 603 s after launch" width="880"></p>
+<p align="center"><img src="https://raw.githubusercontent.com/Celegans12/AnyPS5/bringup-media/yotei/2026-10-19/open-world-batchstage.png" alt="The Nupur river and the Ainu village in the open world of Ghost of Yōtei on AnyPS5, frame read back 1,571 s after launch" width="880"></p>
 
 > [!NOTE]
 > This is a work-in-progress test branch, not upstream code. It is based on `main` from 2026-10-15 (`a5e2a80c6`), is not
@@ -20,7 +20,7 @@
 | **Frame rate in the world** | about **0.5 fps** (4.4-5.6 presents per 10 s; this laptop's GPU clocks drift by ~14 % between sessions, so builds are compared back to back in one session) |
 | **Stability** | 25 minutes in the world without a crash on earlier builds of this line |
 | **Tested on** | Windows 11, RTX 3080 Laptop GPU 16 GB (driver 610.62), 32 GB RAM, MinGW-w64 GCC 15.2.0, Release |
-| **Build** | `75dd18755` (combo19) + docs, shader-cache SourceVersion `68f2c78b5d5316b4` |
+| **Build** | `ace5c14cd` (combo19 + batched staging + in-run A/B) + docs, shader-cache SourceVersion `68f2c78b5d5316b4` |
 
 <table>
 <tr>
@@ -49,7 +49,8 @@
 | 10-18 | 4.2 | hand-off PRs from upstream, copy-backs of changed dwords only |
 | 10-18 | 4.6 | draw preparer thread, device-local buffers for the cloth compute programs |
 | 10-19 | 5.0 | the cloth compute ring on its own Vulkan queue |
-| 10-19 | **+5 % presents, -8 % frame time** vs the build above, same session | indirect-draw records read on the GPU, exact f32 path for f16 mix math (one pass 101 -> 27 ms GPU), presenter and barrier trims |
+| 10-19 | +5 % presents, -8 % frame time vs the build above, same session | indirect-draw records read on the GPU, exact f32 path for f16 mix math (one pass 101 -> 27 ms GPU), presenter and barrier trims |
+| 10-19 | **5.1** (+9 % in an in-run A/B, ~2.7 SE) | a dispatch run's staged copy-ins in one prelude with one barrier instead of a barrier per dispatch: the cloth queue's GPU time halves, GPU busy -26 % |
 
 ## Run it
 
@@ -61,7 +62,8 @@ APS5_STAGING_DIFF=1 APS5_PIPELINE_INDIRECT=1 APS5_NO_ADDRESS_DRAW_REUSE=1 APS5_A
 ```
 
 - `APS5_ASYNC_LANE=51` records the cloth compute ring (queue 0x51) on a second Vulkan queue.
-- New off switches in this build: `APS5_NO_GPU_INDIRECT_ARGS=1`, `APS5_NO_MIX_F32=1`, `APS5_NO_BARRIER_BATCH=1`, `APS5_NO_EARLY_REVALIDATE=1`, `APS5_NO_FLAT_POISON_INDEX=1`.
+- New off switches in this build: `APS5_NO_GPU_INDIRECT_ARGS=1`, `APS5_NO_MIX_F32=1`, `APS5_NO_BARRIER_BATCH=1`, `APS5_NO_EARLY_REVALIDATE=1`, `APS5_NO_FLAT_POISON_INDEX=1`, `APS5_NO_BATCHED_STAGING=1`.
+- `APS5_AB=<seconds>:<switch>[,...]` (with `APS5_AB_START=<present>`) alternates two configurations of driver switches in one run, so a comparison needs one run and no run-to-run noise.
 - The first run on a new shader-cache version compiles shaders cold; it can take 30-60 minutes to reach the world.
 - Leave `APS5_PIPELINE_REQUESTS` unset when you measure: it costs about 12 % of a frame here.
 - Every local change has an off switch (`APS5_NO_...`), named in its commit message.
@@ -89,12 +91,15 @@ APS5_STAGING_DIFF=1 APS5_PIPELINE_INDIRECT=1 APS5_NO_ADDRESS_DRAW_REUSE=1 APS5_A
   - the async compute queue;
   - indirect-draw parameters read on the GPU for draws whose records are still being written;
   - an exact f32 path for `v_fma_mix` behind a fused-FMA startup check;
-  - presenter revalidation prepared off the GPU lock, and a cheaper image-table miss path.
+  - presenter revalidation prepared off the GPU lock, and a cheaper image-table miss path;
+  - batched staging: a dispatch run's copy-ins in one prelude ahead of it and its copy-backs behind one barrier (on NVIDIA any barrier between dispatches serializes them);
+  - an in-run A/B switch registry.
 
 ## Updates
 
 - 2026-10-19: branch created at `8ba98278a` (async compute queue), 5.0 presents per 10 s in the world.
 - 2026-10-19: moved to combo19 (`75dd18755`): matches the title reference exactly; against the previous build in the same session +5 % presents, -8 % frame time, -40 % CPU waits for GPU results. New shader-cache version, so the first run compiles cold.
+- 2026-10-19: added batched staging (`ace5c14cd`): T1 exact; in-run A/B in the world 5.12 vs 4.68 presents per 10 s, GPU busy 810 vs 1,096 ms per frame. Same shader cache as combo19.
 
 ---
 
