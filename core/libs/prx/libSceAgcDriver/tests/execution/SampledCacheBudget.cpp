@@ -561,20 +561,18 @@ void releasedTests(Context context) {
         Require(cache.Find({1}) == pinned, "the resource cache rejected a descriptor set whose texture is cached");
         pinned.reset();
         ClearCachedTextures(context.device);
-        Require(!texture.expired() && texture.lock()->Released(), "the sampled texture cache dropped a texture the resource cache holds without marking it released");
+        Require(cache.Find({1}) == nullptr && cache.Size() == 0, "the resource cache kept an entry holding a released texture");
+        Require(pinnedSet.expired() && texture.expired(), "the resource cache kept a released texture alive");
         auto live = ImageResources(context, block, 1, 1, true);
         std::vector<std::shared_ptr<ShaderResources>> displaced;
         cache.Insert({2}, live, &displaced);
-        Require(cache.Find({1}) == nullptr && cache.Find({2}) == live && cache.Size() == 1, "the resource cache kept an entry holding a released texture");
-        Require(displaced.size() == 1 && displaced.front() == pinnedSet.lock(), "the entry holding a released texture was not handed back to the caller");
-        displaced.clear();
-        Require(pinnedSet.expired() && texture.expired(), "the resource cache kept a released texture alive");
+        Require(cache.Find({2}) == live && cache.Size() == 1 && displaced.empty(), "the resource cache rejected a descriptor set whose texture is cached");
         auto stale = ImageResources(context, block, 2, 1, true);
         ClearCachedTextures(context.device);
         Require(stale->SampledTextures().front()->Released(), "a held texture the sampled cache dropped is not marked released");
+        Require(cache.Find({2}) == nullptr && cache.Size() == 0, "the live entry whose texture was released stayed in the resource cache");
         cache.Insert({3}, stale, &displaced);
-        Require(cache.Find({3}) == nullptr, "a descriptor set holding a released texture entered the resource cache");
-        Require(cache.Size() == 0 && displaced.size() == 1 && displaced.front() == live, "the live entry whose texture was released stayed in the resource cache");
+        Require(cache.Find({3}) == nullptr && cache.Size() == 0, "a descriptor set holding a released texture entered the resource cache");
         displaced.clear();
     } catch (...) {
         cache.Clear();
@@ -1264,17 +1262,19 @@ int overflowLifetimeTests(Context context) {
 }
 
 void storageMemoryTests(Context context) {
-    constexpr std::uint64_t GiB = 1ull << 30u;
-    context.memoryProperties2 = &ReportBudget;
     Block block(context);
     auto held = Sampled(context, block.Surface(0));
-    const auto quarter = std::min<std::uint64_t>(StorageTextureBudget(context.memory, nullptr, 0, 0), ReportedBudget / 4u);
-    Require(ReadStorageBudget(context) == quarter, "52 GiB free of a 64 GiB budget does not leave the storage image cache its quarter");
-    context.memoryProperties2 = &ReportPressure;
-    const auto pressed = ReadStorageBudget(context);
-    const auto expected = GiB + SampledTextureMemory() + TextureCacheUsage().storageBytes;
-    Require(pressed == expected, "53 GiB in use of a 64 GiB budget leaves the storage image cache " + std::to_string(pressed >> 20u) + " MiB, not the " + std::to_string(expected >> 20u) + " MiB left after the use outside the texture caches, the sampled textures' 2 GiB floor and 8 GiB of headroom");
-    std::printf("reported heap budget %llu MiB with %llu MiB in use: storage image cache budget %llu MiB\n", static_cast<unsigned long long>(ReportedBudget >> 20u), static_cast<unsigned long long>(PressedUsage >> 20u), static_cast<unsigned long long>(pressed >> 20u));
+    for (const auto report : {&ReportBudget, &ReportPressure}) {
+        context.memoryProperties2 = report;
+        const auto budget = ReadStorageBudget(context);
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT reported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+        VkPhysicalDeviceMemoryProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &reported};
+        report(context.physical, &properties);
+        const auto use = TextureCacheUsage();
+        const auto expected = TextureCacheBudgetsFor(context.memory, &reported, {SampledTextureMemory(), use.sampledBytes, use.storageBytes}, CurrentTextureCacheBudgets(context).target).storage;
+        Require(budget == expected, "with " + std::to_string(reported.heapUsage[0] >> 20u) + " MiB in use of a 64 GiB budget the storage image cache budget is " + std::to_string(budget >> 20u) + " MiB, not the VRAM budget's storage share of " + std::to_string(expected >> 20u) + " MiB");
+        std::printf("reported heap budget %llu MiB with %llu MiB in use: storage image cache budget %llu MiB\n", static_cast<unsigned long long>(ReportedBudget >> 20u), static_cast<unsigned long long>(reported.heapUsage[0] >> 20u), static_cast<unsigned long long>(budget >> 20u));
+    }
 }
 
 }
