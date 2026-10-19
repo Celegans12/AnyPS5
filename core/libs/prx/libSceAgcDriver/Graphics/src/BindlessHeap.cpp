@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
@@ -638,6 +639,40 @@ namespace {
 std::mutex boundHeapsMutex;
 std::unordered_set<VkCommandBuffer> boundHeaps;
 std::atomic<std::uint64_t> heapBinds{0};
+std::atomic<std::uint64_t> heapBindWindow{0};
+std::atomic<std::uint64_t> commandBuffersBegun{0};
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(SetBindSite::Count)> setBinds{};
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(HeapFallback::Count)> heapFallbacks{};
+std::array<std::atomic<std::uint64_t>, 4> heapRecords{};
+constexpr std::array<const char*, static_cast<std::size_t>(SetBindSite::Count)> SetBindSiteNames{"draw", "dispatch", "detiler", "color transfer", "presentation"};
+constexpr std::array<const char*, static_cast<std::size_t>(HeapFallback::Count)> HeapFallbackNames{"draw unmapped", "draw mixed retry", "draw refused pair", "dispatch unmapped"};
+
+std::uint64_t takeCount(std::atomic<std::uint64_t>& counter) {
+    return counter.exchange(0, std::memory_order_relaxed);
+}
+
+void reportHeapStatistics() {
+    static const bool enabled = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    if (!enabled) return;
+    static std::atomic<std::uint64_t> calls{0};
+    if ((calls.fetch_add(1, std::memory_order_relaxed) & 1023u) != 0u) return;
+    static std::mutex reportMutex;
+    static auto last = std::chrono::steady_clock::now();
+    std::unique_lock lock(reportMutex, std::try_to_lock);
+    if (!lock.owns_lock()) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::seconds(10)) return;
+    last = now;
+    std::string binds;
+    for (std::size_t i = 0; i < setBinds.size(); ++i) binds += " " + std::string(SetBindSiteNames[i]) + " " + std::to_string(takeCount(setBinds[i]));
+    std::string fallbacks;
+    for (std::size_t i = 0; i < heapFallbacks.size(); ++i) fallbacks += " " + std::string(HeapFallbackNames[i]) + " " + std::to_string(takeCount(heapFallbacks[i]));
+    const auto heapDraws = takeCount(heapRecords[1]);
+    const auto plainDraws = takeCount(heapRecords[0]);
+    const auto heapDispatches = takeCount(heapRecords[3]);
+    const auto plainDispatches = takeCount(heapRecords[2]);
+    std::fprintf(stderr, "[gpu-heap] (10 s): draws %llu heap / %llu plain, dispatches %llu heap / %llu plain; heap binds %llu over %llu command buffers; set binds:%s; fallbacks:%s\n", static_cast<unsigned long long>(heapDraws), static_cast<unsigned long long>(plainDraws), static_cast<unsigned long long>(heapDispatches), static_cast<unsigned long long>(plainDispatches), static_cast<unsigned long long>(takeCount(heapBindWindow)), static_cast<unsigned long long>(takeCount(commandBuffersBegun)), binds.c_str(), fallbacks.c_str());
+}
 
 void forgetHeapBinding(VkCommandBuffer commands) {
     if (!DescriptorHeapEnabled()) return;
@@ -647,12 +682,23 @@ void forgetHeapBinding(VkCommandBuffer commands) {
 
 }
 
+void NoteHeapRecord(bool compute, bool heap) {
+    heapRecords[(compute ? 2u : 0u) + (heap ? 1u : 0u)].fetch_add(1, std::memory_order_relaxed);
+    reportHeapStatistics();
+}
+
+void NoteHeapFallback(HeapFallback reason) {
+    heapFallbacks[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+}
+
 void NoteCommandBufferBegun(VkCommandBuffer commands) {
+    commandBuffersBegun.fetch_add(1, std::memory_order_relaxed);
     forgetHeapBinding(commands);
 }
 
-void CmdBindDescriptorSets(const Context& context, VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout, std::uint32_t firstSet, std::uint32_t setCount, const VkDescriptorSet* sets) {
+void CmdBindDescriptorSets(const Context& context, VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout, std::uint32_t firstSet, std::uint32_t setCount, const VkDescriptorSet* sets, SetBindSite site) {
     context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, bindPoint, layout, firstSet, setCount, sets, 0, nullptr);
+    setBinds[static_cast<std::size_t>(site)].fetch_add(1, std::memory_order_relaxed);
     forgetHeapBinding(commands);
 }
 
@@ -667,6 +713,7 @@ void BindlessHeap::BindDescriptorHeaps(VkCommandBuffer commands) const {
         if (!boundHeaps.insert(commands).second) return;
     }
     heapBinds.fetch_add(1, std::memory_order_relaxed);
+    heapBindWindow.fetch_add(1, std::memory_order_relaxed);
     VkBindHeapInfoEXT info{VK_STRUCTURE_TYPE_BIND_HEAP_INFO_EXT};
     info.heapRange = {resourceHeap->DeviceAddress(), resourceHeapUsed + context.descriptorHeapProperties.minResourceHeapReservedRange};
     info.reservedRangeOffset = resourceHeapUsed;

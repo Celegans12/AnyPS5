@@ -1035,6 +1035,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     if (const auto verdict = runStages()) return *verdict;
     for (std::uint32_t retry = 0; heapCheck && mixedHeap(); ++retry) {
         require(retry < 2u, "a draw mixes GPU-mode and per-draw stages after taking the per-draw path");
+        Graphics::NoteHeapFallback(retry == 0u ? Graphics::HeapFallback::DrawMixedRetry : Graphics::HeapFallback::DrawRefusedPair);
         if (retry == 1u) RefuseHeapPair(heapPair);
         stages.resize(stagesBefore);
         compiledStages.resize(compiledBefore);

@@ -142,8 +142,12 @@ void NoteDataAddressPush();
 void NoteEmptyResourceSet();
 std::uint64_t EmptyResourceSets();
 std::uint64_t DataAddressPushes();
+enum class SetBindSite : std::uint8_t { Draw, Dispatch, Detiler, ColorTransfer, Presentation, Count };
+enum class HeapFallback : std::uint8_t { DrawUnmapped, DrawMixedRetry, DrawRefusedPair, DispatchUnmapped, Count };
+void NoteHeapRecord(bool compute, bool heap);
+void NoteHeapFallback(HeapFallback reason);
 void NoteCommandBufferBegun(VkCommandBuffer commands);
-void CmdBindDescriptorSets(const Context& context, VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout, std::uint32_t firstSet, std::uint32_t setCount, const VkDescriptorSet* sets);
+void CmdBindDescriptorSets(const Context& context, VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout, std::uint32_t firstSet, std::uint32_t setCount, const VkDescriptorSet* sets, SetBindSite site);
 std::uint64_t DescriptorHeapBinds();
 
 }

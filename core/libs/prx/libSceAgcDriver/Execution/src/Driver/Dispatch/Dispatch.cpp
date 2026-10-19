@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/HeapStages.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BindlessHeap.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/BufferCopy.hpp"
@@ -372,6 +373,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             timing.Mark("capture_resources");
             compiledResult = invocation.Materialize(*capture);
             if (compiledResult->gpuResolvedImages && !HeapStageMappable(*compiledResult, compiledResult->workgroupMemoryDwords != 0)) {
+                Graphics::NoteHeapFallback(Graphics::HeapFallback::DispatchUnmapped);
                 NoteHeapFragment(&snapshot, codeOffset | computeHeapKey, false);
                 request.target.gpuResolvedImages = false;
                 invocation = InvocationFor(snapshot, codeOffset, request);

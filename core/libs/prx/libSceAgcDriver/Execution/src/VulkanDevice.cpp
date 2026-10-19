@@ -5141,11 +5141,12 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         }
     }
     context.Resolved(&Graphics::DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->pipeline);
+    Graphics::NoteHeapRecord(true, record.objects->descriptorHeap);
     if (record.objects->descriptorHeap) {
         Graphics::BindlessHeap::For(context).BindDescriptorHeaps(commands);
     } else if (record.bindings != nullptr) {
         Graphics::Require(record.bindings->allocation.set != VK_NULL_HANDLE && !resources.HeapStage(), "dispatch overlay has no descriptor set");
-        Graphics::CmdBindDescriptorSets(context, commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout, 0, 1, &record.bindings->allocation.set);
+        Graphics::CmdBindDescriptorSets(context, commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout, 0, 1, &record.bindings->allocation.set, Graphics::SetBindSite::Dispatch);
     } else {
         Graphics::Require(!resources.HeapStage(), "a GPU-mode dispatch needs a VK_EXT_descriptor_heap pipeline");
         resources.Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout);
@@ -5161,7 +5162,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
                 context.Function<PFN_vkCmdPushDataEXT>("vkCmdPushDataEXT")(commands, &push);
             }
         } else {
-            Graphics::CmdBindDescriptorSets(context, commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout, workgroupSet, 1, &memory->set);
+            Graphics::CmdBindDescriptorSets(context, commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout, workgroupSet, 1, &memory->set, Graphics::SetBindSite::Dispatch);
         }
         recorder.Keep(std::move(memory));
     }
