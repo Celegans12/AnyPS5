@@ -1385,7 +1385,7 @@ void verifyDirectImageSelection(const RecompileResult& result, bool valid) {
     std::size_t images = 0;
     for (const auto& binding : result.bindings) if (binding.role == DescriptorRole::GuestImages) images += binding.count;
     require(writes == (valid ? 1u : 0u) && images == (valid ? 1u : 0u), "direct image disk invocation retained the wrong image accesses or bindings");
-    require(result.specialization.empty() && result.hasDeferredDirectImage == !valid,
+    require(std::ranges::all_of(result.specialization, [](const PipelineSpecializationConstant& constant) { return PipelineSpecialization::IsWorkgroupOffset(constant.id) && constant.value == 0u; }) && result.hasDeferredDirectImage == !valid,
         "direct image disk invocation lost its valid/refused completion distinction");
     if (!valid) require(result.bdaAbiVersion == BdaAbi::Version && std::any_of(result.bindings.begin(), result.bindings.end(), [](const auto& binding) {
         return binding.role == DescriptorRole::FaultBuffer;
