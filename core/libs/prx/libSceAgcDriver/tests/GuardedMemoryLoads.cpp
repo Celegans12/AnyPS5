@@ -32,7 +32,7 @@ struct LoadCase {
     std::uint32_t components = 1;
 };
 
-std::vector<std::uint32_t> emitLoad(const LoadCase& test, bool active, std::uint32_t offset, std::uint32_t records, bool robust) {
+std::vector<std::uint32_t> emitLoad(const LoadCase& test, bool active, std::uint32_t offset, std::uint32_t records, bool robust, bool valid = true) {
     IrProgram program;
     program.SetWaveSize(32);
     program.Resources().stage = IrShaderStage::Compute;
@@ -76,7 +76,8 @@ std::vector<std::uint32_t> emitLoad(const LoadCase& test, bool active, std::uint
         program.Metadata().bindings.pushDataStartDword = 0;
         program.Metadata().bindings.memoryOffsetCount = 1;
         auto& size = constant(records);
-        auto& handle = emit(IrOpcode::GetBufferResource, IrType::BufferResource, {&zero, &zero, &size, &zero});
+        auto& base = constant(valid ? 0x1000u : 0u);
+        auto& handle = emit(IrOpcode::GetBufferResource, IrType::BufferResource, {&base, &zero, &size, &zero});
         emit(test.opcode, test.type, {&handle, &zero, &address, &zero, &enabled});
     } else {
         if (test.kind == ResourceKind::Gds) program.Metadata().bindings.descriptors.push_back({DescriptorBindingKind::Gds, {0}});
@@ -281,7 +282,7 @@ std::uint32_t ldsLength(const std::vector<std::uint32_t>& words) {
 }
 
 void expectReads(const LoadCase& test, bool robust, bool active, std::uint32_t offset, std::vector<std::uint32_t> expected, std::uint32_t records = 64, std::uint32_t misalignment = 0, bool valid = true) {
-    const auto module = emitLoad(test, active, offset, records, robust);
+    const auto module = emitLoad(test, active, offset, records, robust, valid);
     const auto actual = AccessTrace(module, misalignment, valid).Run();
     if (actual != expected) {
         std::string detail = std::string(robust ? "robust" : "plain") + " guest reads:";
