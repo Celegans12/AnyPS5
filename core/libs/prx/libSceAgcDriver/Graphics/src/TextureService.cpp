@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureService.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "BindlessImageAbi.hpp"
@@ -24,8 +25,7 @@ std::atomic<std::uint64_t> oldPathNanoseconds{0};
 
 // APS5_NO_EARLY_REVALIDATE=1: the present's revalidation prepares every stale entry under the GPU lock (old).
 bool EarlyRevalidation() {
-    static const bool enabled = std::getenv("APS5_NO_EARLY_REVALIDATE") == nullptr;
-    return enabled;
+    return !RuntimeSwitches::Set(RuntimeSwitch::NoEarlyRevalidate);
 }
 
 std::uint64_t Elapsed(std::chrono::steady_clock::time_point started) {

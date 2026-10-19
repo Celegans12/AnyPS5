@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawProgramTrace.hpp"
@@ -28,8 +29,7 @@ namespace {
 // beyond the folded fetch offset ("patched SGPR not folded") compiles its front stage with those
 // SGPRs read from BaseVertex / BaseInstance, so the records stay on the GPU.
 bool GpuIndirectArgs() {
-    static const bool enabled = std::getenv("APS5_NO_GPU_INDIRECT_ARGS") == nullptr;
-    return enabled;
+    return !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoGpuIndirectArgs);
 }
 
 // An indirect draw's draw-cache keys carry its SGPR locations: a cached front stage compiled with

@@ -20,6 +20,9 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_NO_BDA_STAGING",
     "APS5_NO_DISPATCH_OVERLAP",
     "APS5_NO_HTILE_GPU_EXPANSION",
+    "APS5_NO_GPU_INDIRECT_ARGS",
+    "APS5_NO_BARRIER_BATCH",
+    "APS5_NO_EARLY_REVALIDATE",
 };
 
 struct Refusal {

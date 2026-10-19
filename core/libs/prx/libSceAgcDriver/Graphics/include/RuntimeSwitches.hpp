@@ -19,6 +19,9 @@ enum class RuntimeSwitch : std::size_t {
     NoBdaStaging,
     NoDispatchOverlap,
     NoHtileGpuExpansion,
+    NoGpuIndirectArgs,
+    NoBarrierBatch,
+    NoEarlyRevalidate,
     Count,
 };
 
