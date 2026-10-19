@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "ThreadOwned.hpp"
@@ -2836,7 +2837,11 @@ bool HostImportCovers(const Context& context, std::uint64_t address, std::size_t
     return state.device == context.device && findImport(state, address, address + bytes) != nullptr;
 }
 
-GuestBufferMemory::GuestBufferMemory(const Context& context) : context(context) {}
+namespace {
+bool bdaStagingEnabled();
+}
+
+GuestBufferMemory::GuestBufferMemory(const Context& context) : context(context), bdaStaging(bdaStagingEnabled()) {}
 
 bool GuestBufferMemory::WritesOverlap(std::uint64_t address, std::size_t bytes) const {
     return std::any_of(writes.begin(), writes.end(), [&](const auto& range) { return address < range.second && range.first < address + bytes; });
@@ -3200,8 +3205,7 @@ namespace {
 // Device-local staging for address-based compute builds (BDA overlays, see resolveOverlays).
 // APS5_NO_BDA_STAGING=1: their written descriptor ranges stay in the space's imports, as before.
 bool bdaStagingEnabled() {
-    static const bool disabled = std::getenv("APS5_NO_BDA_STAGING") != nullptr;
-    return !disabled;
+    return !RuntimeSwitches::Set(RuntimeSwitch::NoBdaStaging);
 }
 
 template<typename Regions>
@@ -3232,7 +3236,7 @@ void GuestBufferMemory::addDescriptorRegion(std::uint64_t address, std::size_t b
                 overlay = true;
                 break;
             }
-            if (bdaStagingEnabled() && stagingAllowed) servedInsideBase.emplace_back(begin, end);
+            if (bdaStaging && stagingAllowed) servedInsideBase.emplace_back(begin, end);
             return;
         case BaseOverlap::Partial:
             if (readOnly && !mirrorOverlaps(space->base, begin, end) && !WritesOverlap(begin, static_cast<std::size_t>(end - begin))) {
@@ -3661,7 +3665,7 @@ bool GuestBufferMemory::stagingEligible(const Region& region, bool addressable) 
 }
 
 bool GuestBufferMemory::overlayCandidate(const Region& inside, bool readOnly) const {
-    return !readOnly && bdaStagingEnabled() && stagingAllowed && addressStaging && gpuCopiesEnabled() && writtenShadowEnabled() && inside.direct != nullptr && inside.mirror == nullptr && !inside.sparse && Recorder::Active() != nullptr;
+    return !readOnly && bdaStaging && stagingAllowed && addressStaging && gpuCopiesEnabled() && writtenShadowEnabled() && inside.direct != nullptr && inside.mirror == nullptr && !inside.sparse && Recorder::Active() != nullptr;
 }
 
 // Device-local staging for address-based builds (BDA overlays). Such a build binds its written V#
