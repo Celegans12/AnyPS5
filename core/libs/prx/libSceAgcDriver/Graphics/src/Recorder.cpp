@@ -1226,6 +1226,8 @@ Recorder::~Recorder() {
         context.Function<PFN_vkDestroyFence>("vkDestroyFence")(context.device, fence, nullptr);
     }
     spare.clear();
+    for (auto chunk : spareChunks) context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, 1, &chunk);
+    spareChunks.clear();
     for (const auto pool : sparePools) context.Function<PFN_vkDestroyQueryPool>("vkDestroyQueryPool")(context.device, pool, nullptr);
     sparePools.clear();
     // Sync() above waited for every batch, so no submission still signals the timeline.
@@ -1563,6 +1565,14 @@ thread_local DispatchOrder nextDispatchOrder;
 
 std::array<std::atomic<std::uint64_t>, Recorder::DeferredFlushSites> deferredFlushes{};
 
+// Batched staging and lost-overlap counts (Recorder::BatchedStagingCounts).
+struct BatchedCounters {
+    std::atomic<std::uint64_t> splits{0}, preludes{0}, preludeCopies{0}, pristineCopies{0}, mergedCopyBacks{0}, copyBackConflicts{0};
+    std::atomic<std::uint64_t> lostNoRun{0}, lostOtherQueue{0}, lostRenderPass{0}, lostStoreRun{0}, lostOwner{0};
+};
+BatchedCounters batchedCounters;
+bool DrawOrGpuProfiled();
+
 }
 
 std::array<std::uint64_t, Recorder::DeferredFlushSites> Recorder::DeferredFlushCounts() {
@@ -1573,6 +1583,115 @@ std::array<std::uint64_t, Recorder::DeferredFlushSites> Recorder::DeferredFlushC
 
 bool Recorder::DispatchOverlapEnabled() {
     return !RuntimeSwitches::Set(RuntimeSwitch::NoDispatchOverlap);
+}
+
+bool Recorder::BatchedStagingEnabled() {
+    return !RuntimeSwitches::Set(RuntimeSwitch::NoBatchedStaging);
+}
+
+Recorder::BatchedStagingStats Recorder::BatchedStagingCounts() {
+    const auto& c = batchedCounters;
+    constexpr auto relaxed = std::memory_order_relaxed;
+    return {c.splits.load(relaxed), c.preludes.load(relaxed), c.preludeCopies.load(relaxed), c.pristineCopies.load(relaxed), c.mergedCopyBacks.load(relaxed), c.copyBackConflicts.load(relaxed), c.lostNoRun.load(relaxed), c.lostOtherQueue.load(relaxed), c.lostRenderPass.load(relaxed), c.lostStoreRun.load(relaxed), c.lostOwner.load(relaxed)};
+}
+
+VkCommandBuffer Recorder::beginChunk() {
+    VkCommandBuffer commands = VK_NULL_HANDLE;
+    if (!spareChunks.empty()) {
+        commands = spareChunks.back();
+        spareChunks.pop_back();
+    } else {
+        VkCommandBufferAllocateInfo allocation{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        allocation.commandPool = context.pool;
+        allocation.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        allocation.commandBufferCount = 1;
+        Check(context.Function<PFN_vkAllocateCommandBuffers>("vkAllocateCommandBuffers")(context.device, &allocation, &commands), "vkAllocateCommandBuffers recorder chunk");
+    }
+    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    const auto result = function(beginCommandBuffer, "vkBeginCommandBuffer")(commands, &begin);
+    if (result != VK_SUCCESS) {
+        context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, 1, &commands);
+        Check(result, "vkBeginCommandBuffer recorder chunk");
+    }
+    return commands;
+}
+
+VkCommandBuffer Recorder::SplitForRun() {
+    Require(open != nullptr, "a run split has no batch");
+    GuestMemory::AssertGpuLockHeld("Recorder::SplitForRun");
+    // A query begun in the batch's command buffer must end in it (sample counting); an open render
+    // pass or store run cannot span command buffers either (Commands() closed them).
+    if (open->sampleActive || open->segmentActive || open->renderPass.open || open->run.open) return open->commands;
+    sealPrelude();
+    const auto next = beginChunk();
+    const auto ended = function(endCommandBuffer, "vkEndCommandBuffer")(open->commands);
+    if (ended != VK_SUCCESS) {
+        context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, 1, &next);
+        Check(ended, "vkEndCommandBuffer recorder split");
+    }
+    open->chunks.push_back(open->commands);
+    open->commands = next;
+    open->prelude.armed = true;
+    batchedCounters.splits.fetch_add(1, std::memory_order_relaxed);
+    return next;
+}
+
+VkCommandBuffer Recorder::PreludeCommands() {
+    if (open == nullptr || !open->prelude.armed || open->deferredDispatchQueue == 0) return VK_NULL_HANDLE;
+    auto& prelude = open->prelude;
+    if (prelude.commands == VK_NULL_HANDLE) {
+        // Submitted right after the command buffer the split ended, before the run's dispatches:
+        // ordered after everything before the run (its own first command), unordered with the
+        // run's dispatches, as the title leaves the dispatches whose copies it takes.
+        prelude.commands = beginChunk();
+        open->chunks.push_back(prelude.commands);
+        recordBarrier(prelude.commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        CountBarriers(CommandClass::StagingIn);
+        batchedCounters.preludes.fetch_add(1, std::memory_order_relaxed);
+    }
+    batchedCounters.preludeCopies.fetch_add(1, std::memory_order_relaxed);
+    return prelude.commands;
+}
+
+void Recorder::PreludePristine(VkBuffer shadow, VkBuffer pristine, VkDeviceSize bytes) {
+    Require(open != nullptr && open->prelude.commands != VK_NULL_HANDLE, "a pristine copy has no prelude");
+    open->prelude.pristine.push_back({shadow, pristine, bytes});
+}
+
+void Recorder::sealPrelude() {
+    if (open == nullptr) return;
+    auto& prelude = open->prelude;
+    prelude.armed = false;
+    if (prelude.commands == VK_NULL_HANDLE) return;
+    const auto commands = std::exchange(prelude.commands, VK_NULL_HANDLE);
+    if (!prelude.pristine.empty()) {
+        // The pristine copies read the filled shadows (as recordGpuCopies' inline path does).
+        recordBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        CountBarriers(CommandClass::StagingIn);
+        for (const auto& copy : prelude.pristine) CopyBuffer(context, commands, copy.shadow, 0, copy.pristine, 0, copy.bytes);
+        batchedCounters.pristineCopies.fetch_add(prelude.pristine.size(), std::memory_order_relaxed);
+        prelude.pristine.clear();
+    }
+    // The copied bytes are visible to every stage of the run and after it (as the inline path's
+    // trailing barrier), the pristine copies to the copy-backs' diff kernels.
+    recordBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    CountBarriers(CommandClass::StagingIn);
+    Check(function(endCommandBuffer, "vkEndCommandBuffer")(commands), "vkEndCommandBuffer recorder prelude");
+}
+
+bool Recorder::AfterRunWrite(std::uint64_t begin, std::uint64_t end) {
+    Require(open != nullptr && open->afterRunMerging, "a merged copy-back outside a run's end");
+    auto& written = open->afterRunWritten;
+    const bool overlaps = std::any_of(written.begin(), written.end(), [&](const auto& range) { return begin < range.second && range.first < end; });
+    if (overlaps) {
+        written.clear();
+        batchedCounters.copyBackConflicts.fetch_add(1, std::memory_order_relaxed);
+    }
+    written.emplace_back(begin, end);
+    open->afterRunWrote = true;
+    batchedCounters.mergedCopyBacks.fetch_add(1, std::memory_order_relaxed);
+    return overlaps;
 }
 
 void Recorder::SetDispatchOrder(std::uint32_t queueKey, bool unordered) {
@@ -1601,8 +1720,29 @@ void Recorder::flushDeferredDispatch(std::size_t site) {
     recordBarrier(open->commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, dispatchedAccess);
     CountBarriers(CommandClass::DispatchTrailing);
     open->coveredAccess = dispatchedAccess;
-    // The run's staged copy-backs, after every dispatch of it finished.
+    // The run's prelude takes no more copies: what follows is no longer unordered with them.
+    sealPrelude();
+    // The run's staged copy-backs, after every dispatch of it finished; with batched staging they
+    // share one trailing barrier (AfterRunMerging).
+    const bool merge = BatchedStagingEnabled() && !BarrierValidate() && after.size() > 1;
+    open->afterRunMerging = merge;
+    open->afterRunWrote = false;
+    open->afterRunWritten.clear();
+    struct EndMerge {
+        Recorder& recorder;
+        ~EndMerge() {
+            if (recorder.open != nullptr) recorder.open->afterRunMerging = false;
+        }
+    } endMerge{*this};
     for (auto& work : after) work(*this);
+    if (merge && open->afterRunWrote) {
+        // As each copy-back's own: visible to everything recorded after and to the host.
+        constexpr VkAccessFlags copiedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_HOST_READ_BIT;
+        recordBarrier(open->commands, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT, copiedAccess);
+        CountBarriers(CommandClass::StagingOut);
+        open->coveredAccess = copiedAccess;
+    }
+    open->afterRunWritten.clear();
 }
 
 VkCommandBuffer Recorder::RunCommands(std::uint32_t queueKey, const void* owner, bool& inRun, VkAccessFlags* coveredAccess) {
@@ -1620,6 +1760,11 @@ void Recorder::AfterRun(std::function<void(Recorder&)> work) {
 
 VkCommandBuffer Recorder::OverlapCommands(std::uint32_t queueKey, std::span<const void* const> owners, VkAccessFlags* coveredAccess, bool& overlapped) {
     overlapped = queueKey != 0 && open != nullptr && open->deferredDispatchQueue == queueKey && !open->renderPass.open && !open->run.open && std::none_of(owners.begin(), owners.end(), [&](const void* owner) { return std::find(open->deferredRun.begin(), open->deferredRun.end(), owner) != open->deferredRun.end(); });
+    if (!overlapped && queueKey != 0 && DrawOrGpuProfiled()) {
+        auto& c = batchedCounters;
+        auto& counter = open == nullptr || open->deferredDispatchQueue == 0 ? c.lostNoRun : open->deferredDispatchQueue != queueKey ? c.lostOtherQueue : open->renderPass.open ? c.lostRenderPass : open->run.open ? c.lostStoreRun : c.lostOwner;
+        counter.fetch_add(1, std::memory_order_relaxed);
+    }
     if (!overlapped) return Commands(coveredAccess);
     GuestMemory::AssertGpuLockHeld("Recorder::OverlapCommands");
     if (coveredAccess != nullptr) *coveredAccess = 0;
@@ -3829,6 +3974,7 @@ void Recorder::Submit() {
     if (open == nullptr) return;
     GuestMemory::AssertGpuLockHeld("Recorder::Submit");
     flushDeferredDispatch(6);
+    sealPrelude();
     if (!open->keyStores.empty()) recordKeyStores(false);
     if (open->renderPass.open) endOpenRenderPass();
     const bool segments = segmentMode();
@@ -3862,8 +4008,14 @@ void Recorder::Submit() {
     } discardUnsubmitted{*this, batch};
     Check(function(endCommandBuffer, "vkEndCommandBuffer")(batch->commands), "vkEndCommandBuffer recorder");
     VkSubmitInfo submission{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    submission.commandBufferCount = 1;
-    submission.pCommandBuffers = &batch->commands;
+    // The command buffers the batch split into (SplitForRun), in recording order.
+    std::vector<VkCommandBuffer> commandBuffers;
+    if (!batch->chunks.empty()) {
+        commandBuffers = batch->chunks;
+        commandBuffers.push_back(batch->commands);
+    }
+    submission.commandBufferCount = commandBuffers.empty() ? 1u : static_cast<std::uint32_t>(commandBuffers.size());
+    submission.pCommandBuffers = commandBuffers.empty() ? &batch->commands : commandBuffers.data();
     // The timeline reaches this batch's serial when it completes (see WaitSerial).
     const std::uint64_t serial = submissions + 1;
     CaptureTrace::Log("submit batch=%llu reads=%zu writes=%zu", static_cast<unsigned long long>(serial), batch->reads.size(), batch->writes.size());
@@ -4419,6 +4571,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
         entry.serial = batch->serial;
         entry.gpuStartNs = batch->gpuStartNs;
         entry.gpuEndNs = batch->gpuEndNs;
+        entry.lane = batch->lane;
         entry.submittedAt = batch->submittedAt;
         entry.fenceSeenAt = std::chrono::steady_clock::now();
         entry.readGeneration = batch->readGeneration;
@@ -4520,6 +4673,20 @@ void Recorder::release(Batch& batch) noexcept {
     batch.samplePool.reset();
     batch.segments = VK_NULL_HANDLE;
     batch.segmentPool.reset();
+    // Split-off command buffers: a submitted (so completed) batch's are reused; a discarded one's
+    // may still be recording (an open prelude) and are freed.
+    for (auto chunk : batch.chunks) {
+        if (batch.submitted && spareChunks.size() < 256) {
+            try {
+                spareChunks.push_back(chunk);
+                continue;
+            } catch (...) {
+            }
+        }
+        context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, 1, &chunk);
+    }
+    batch.chunks.clear();
+    batch.prelude = {};
     // A completed (or never submitted) batch's objects are kept for reuse: the fence is signaled or
     // untouched, so resetting it cannot block, and the command buffer is no longer pending.
     if (batch.commands != VK_NULL_HANDLE && batch.fence != VK_NULL_HANDLE && spare.size() < 64 && function(resetFences, "vkResetFences")(context.device, 1, &batch.fence) == VK_SUCCESS) {

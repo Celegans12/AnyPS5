@@ -4269,8 +4269,18 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
     // barrier is skipped when the trailing barrier just recorded already orders it (ElideCovered).
     bool inRun = false;
     VkAccessFlags covered = 0;
-    const auto commands = Recorder::DispatchOverlapEnabled() ? recorder->RunCommands(Recorder::PeekUnorderedDispatch(), this, inRun, &covered) : recorder->Commands(&covered);
-    const auto timing = recorder->BeginGpuTiming(StagingCopyInKey);
+    auto commands = Recorder::DispatchOverlapEnabled() ? recorder->RunCommands(Recorder::PeekUnorderedDispatch(), this, inRun, &covered) : recorder->Commands(&covered);
+    // Batched staging (Recorder::SplitForRun): a joining dispatch's copies go to the run's prelude,
+    // submitted ahead of the run's dispatches, whose barriers it records once for the whole run.
+    // Not with the capture's read-backs or the hazard validator (both work per copy).
+    bool prelude = false;
+    if (inRun && Recorder::BatchedStagingEnabled() && !capture && !Recorder::BarrierValidate()) {
+        if (const auto preludeCommands = recorder->PreludeCommands(); preludeCommands != VK_NULL_HANDLE) {
+            commands = preludeCommands;
+            prelude = true;
+        }
+    }
+    const auto timing = prelude ? Recorder::NoTiming : recorder->BeginGpuTiming(StagingCopyInKey);
     if (Recorder::BarrierValidate()) {
         std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
         for (const auto* region : copies) reads.emplace_back(region->begin, region->end);
@@ -4379,7 +4389,13 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
             region->diffUse = true;
             diffed.push_back(region);
         }
-        if (!diffed.empty()) {
+        if (!diffed.empty() && prelude) {
+            // Recorded at the prelude's end, behind one transfer barrier for the whole run.
+            for (auto* region : diffed) {
+                recorder->PreludePristine(region->buffer->Handle(), region->pristine->Handle(), region->end - region->begin);
+                recorder->Keep(region->pristine);
+            }
+        } else if (!diffed.empty()) {
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
             Recorder::CountBarriers(Recorder::CommandClass::StagingIn);
             for (auto* region : diffed) {
@@ -4391,10 +4407,13 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
     if (stagedAny) reportStaging();
     // The copied bytes are visible to the shaders bound to the buffers, which may also store into
     // them. Every stage: dispatches and draws share this path, and draws run mesh, task and
-    // tessellation shaders too (the batch's own barriers around dispatches are as wide).
-    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
-    Recorder::CountBarriers(Recorder::CommandClass::StagingIn);
-    recorder->MarkCovered(VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    // tessellation shaders too (the batch's own barriers around dispatches are as wide). A
+    // prelude's copies get the prelude's barrier at its end (Recorder::sealPrelude).
+    if (!prelude) {
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        Recorder::CountBarriers(Recorder::CommandClass::StagingIn);
+        recorder->MarkCovered(VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    }
     recorder->EndGpuTiming(timing, copiedBytes);
 }
 
@@ -4409,6 +4428,10 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
     VkCommandBuffer commands = VK_NULL_HANDLE;
     auto timing = Recorder::NoTiming;
     std::uint64_t copiedBytes = 0;
+    // A run's copy-backs share one trailing barrier, recorded by the run after all of them; they
+    // need no leading one (the run's deferred barrier just ordered its dispatches' writes) unless
+    // an earlier one of them wrote an overlapping range (Recorder::AfterRunWrite).
+    const bool merging = recorder.AfterRunMerging();
     for (auto& region : regions) {
         if (!region.gpuCopy || region.copiedBack) continue;
         if (merged.empty() && !writes.empty()) {
@@ -4423,6 +4446,17 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
             const auto from = std::max(begin, region.begin);
             const auto to = std::min(end, region.end);
             if (from >= to) continue;
+            if (merging) {
+                if (!recording) {
+                    commands = recorder.Commands();
+                    recording = true;
+                }
+                if (recorder.AfterRunWrite(from, to)) {
+                    // Writes after writes to the same guest bytes stay in recording order.
+                    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT);
+                    Recorder::CountBarriers(Recorder::CommandClass::StagingOut);
+                }
+            }
             if (!recording) {
                 VkAccessFlags covered = 0;
                 commands = recorder.Commands(&covered);
@@ -4479,7 +4513,7 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
         // staging bytes, instead of losing the shader's results.
         region.copiedBack = true;
     }
-    if (!recording) return;
+    if (!recording || merging) return;
     if (Recorder::BarrierValidate()) recorder.NoteAccess(Recorder::CommandClass::StagingOut, Recorder::Access{{}, merged, {}, VK_PIPELINE_STAGE_TRANSFER_BIT});
     // As a GPU label store or fill: visible to everything recorded after (shaders, transfers, an
     // indirect dispatch's arguments) and to the host once the batch completed; the caller's

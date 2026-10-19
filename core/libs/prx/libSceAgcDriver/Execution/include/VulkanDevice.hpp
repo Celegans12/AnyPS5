@@ -244,6 +244,8 @@ public:
     struct PresentStatistics {
         std::uint64_t presents, gpuUnread, batchesAheadOfBlit, batchesAfterFlip, readsChecked, readsOverwritten, acquireDrops;
         double gpuBusyMs, gpuGapMs, lastSubmitAfterFlipMs, blitSubmitAfterFlipMs;
+        // The part of gpuBusyMs in batches of the async compute lane (APS5_ASYNC_LANE).
+        double asyncBusyMs;
     };
     static PresentStatistics PresentCounts();
     struct PresyncStatistics {

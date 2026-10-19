@@ -636,12 +636,13 @@ struct VulkanDevice::State {
             const auto batches = recorder->CompletedBatches(range.afterSerial, range.throughSerial, missing);
             if (missing != 0 && !force && newest < range.afterSerial + Graphics::Recorder::CompletedRingSize / 2) break;
             retiredRanges.pop_front();
-            double busyMs = 0, firstNs = 0, lastNs = 0;
+            double busyMs = 0, asyncBusyMs = 0, firstNs = 0, lastNs = 0;
             bool stamped = false;
             std::uint64_t checked = 0, overwritten = 0;
             for (const auto& batch : batches) {
                 if (batch.gpuEndNs > batch.gpuStartNs) {
                     busyMs += (batch.gpuEndNs - batch.gpuStartNs) / 1e6;
+                    if (batch.lane == 1) asyncBusyMs += (batch.gpuEndNs - batch.gpuStartNs) / 1e6;
                     firstNs = stamped ? std::min(firstNs, batch.gpuStartNs) : batch.gpuStartNs;
                     lastNs = stamped ? std::max(lastNs, batch.gpuEndNs) : batch.gpuEndNs;
                     stamped = true;
@@ -656,6 +657,7 @@ struct VulkanDevice::State {
             const double gapMs = stamped ? (lastNs - firstNs) / 1e6 - busyMs : 0;
             if (auto* frame = PerformanceContext::Current()) frame->NoteRetired(0, busyMs, gapMs);
             presentCounters.gpuBusyMs += busyMs;
+            presentCounters.asyncBusyMs += asyncBusyMs;
             presentCounters.gpuGapMs += gapMs;
             presentCounters.gpuUnread += missing;
             presentCounters.readsChecked += checked;
@@ -4920,6 +4922,8 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
             d.overlapReport = now;
             const auto flushes = Graphics::Recorder::DeferredFlushCounts();
             AgcDriver::ProfilePrint_nid_no_patch("[overlap] compute-ring dispatches (cumulative): %llu after an ordering packet, %llu unordered (%llu overlapped, %llu found no open deferred barrier); not deferring: indirect %llu, (overlapped with a data refresh %llu), device LDS %llu, other %llu; %llu trailing barriers deferred, recorded by: commands %llu, draw pass %llu, key stores %llu, label store %llu, store run %llu, samples %llu, submit %llu\n", static_cast<unsigned long long>(d.orderedSeen), static_cast<unsigned long long>(d.unorderedSeen), static_cast<unsigned long long>(d.overlapped), static_cast<unsigned long long>(d.unorderedLost), static_cast<unsigned long long>(d.notIndirect), static_cast<unsigned long long>(d.notRefresh), static_cast<unsigned long long>(d.notLds), static_cast<unsigned long long>(d.notOther), static_cast<unsigned long long>(d.trailingDeferred), static_cast<unsigned long long>(flushes[0]), static_cast<unsigned long long>(flushes[1]), static_cast<unsigned long long>(flushes[2]), static_cast<unsigned long long>(flushes[3]), static_cast<unsigned long long>(flushes[4]), static_cast<unsigned long long>(flushes[5]), static_cast<unsigned long long>(flushes[6]));
+            const auto batched = Graphics::Recorder::BatchedStagingCounts();
+            AgcDriver::ProfilePrint_nid_no_patch("[batched-staging] (APS5_NO_BATCHED_STAGING %s, cumulative) %llu run splits, %llu preludes with %llu copy-in builds and %llu pristine copies; %llu copy-backs after a run sharing its barrier (%llu after an overlapping one); unordered dispatches not overlapped: no open run %llu, other ring's run %llu, render pass %llu, store run %llu, resources already in the run %llu\n", Graphics::Recorder::BatchedStagingEnabled() ? "unset" : "set", static_cast<unsigned long long>(batched.splits), static_cast<unsigned long long>(batched.preludes), static_cast<unsigned long long>(batched.preludeCopies), static_cast<unsigned long long>(batched.pristineCopies), static_cast<unsigned long long>(batched.mergedCopyBacks), static_cast<unsigned long long>(batched.copyBackConflicts), static_cast<unsigned long long>(batched.lostNoRun), static_cast<unsigned long long>(batched.lostOtherQueue), static_cast<unsigned long long>(batched.lostRenderPass), static_cast<unsigned long long>(batched.lostStoreRun), static_cast<unsigned long long>(batched.lostOwner));
         }
     }
     // The record phase split (APS5_PROFILE_DRAW, rows "record: ..." of the [dispatch] totals):
@@ -4957,8 +4961,12 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     VkAccessFlags covered = 0;
     bool overlapped = false;
     const std::array<const void*, 2> runOwners{record.resources.get(), record.resources != nullptr ? record.resources->MemoryOwner() : nullptr};
-    const auto commands = overlapCapable && unordered ? recorder.OverlapCommands(overlapQueue, runOwners, &covered, overlapped) : recorder.Commands(&covered);
+    auto commands = overlapCapable && unordered ? recorder.OverlapCommands(overlapQueue, runOwners, &covered, overlapped) : recorder.Commands(&covered);
     if (timer.profile && overlapCapable && unordered && !overlapped) ++d.unorderedLost;
+    // Batched staging (Recorder::SplitForRun): a run's first dispatch that copies buffers itself
+    // (so its ring's next dispatches likely do too) records into a new command buffer, so that the
+    // copy-ins of the dispatches joining the run can go to a prelude submitted ahead of this one.
+    if (overlapCapable && !overlapped && resources.HasGpuCopies() && Graphics::Recorder::BatchedStagingEnabled()) commands = recorder.SplitForRun();
     // The first dispatch of a run that may overlap records its leading barrier in full (bindless
     // heap writes included), whatever the previous command covered: it orders everything before the
     // run for every dispatch of it, bindless or not.

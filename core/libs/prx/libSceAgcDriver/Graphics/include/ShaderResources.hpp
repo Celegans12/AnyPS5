@@ -274,6 +274,8 @@ public:
     // The guest memory whose staged shadows this object's uses fill (a dispatch run member, see
     // Recorder::RunCommands).
     const void* MemoryOwner() const { return &guestMemory; }
+    // Whether the build copies buffer regions on the GPU (staged shadows among them).
+    bool HasGpuCopies() const { return guestMemory.HasGpuCopies(); }
     void WriteBackBuffers(std::uint64_t shaderAddress = 0);
     // Whether WriteBackBuffers has anything the CPU must see (copied written buffers, BDA faults).
     bool NeedsCompletion() const { return (bda != nullptr && faultChecks) || guestMemory.HasCopiedWrites(); }
