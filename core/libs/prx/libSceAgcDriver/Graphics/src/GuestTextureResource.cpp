@@ -102,7 +102,7 @@ bool IsNullTextureResource(std::span<const std::uint32_t> words) {
     Require(words.size() == 8, "guest texture descriptor must contain 8 dwords");
     const auto base40 = (static_cast<std::uint64_t>(words[0]) | (static_cast<std::uint64_t>(words[1]) << 32u)) & 0xffffffffffull;
     const auto type = (words[3] >> 28u) & 0xfu;
-    return base40 == 0 || type == 0;
+    return base40 == 0 || type <= 1;
 }
 
 GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words) {
@@ -313,6 +313,7 @@ bool MatchesGuestDimension(ShaderRecompiler::DescriptorImageShape shape, Texture
         case ShaderRecompiler::DescriptorImageShape::Image3D: return dimension == TextureDimension::k3D;
         case ShaderRecompiler::DescriptorImageShape::Image1DArray: return dimension == TextureDimension::k1DArray;
         case ShaderRecompiler::DescriptorImageShape::Image2DMultisample: return dimension == TextureDimension::k2DMsaa;
+        case ShaderRecompiler::DescriptorImageShape::Image2DMultisampleArray: return dimension == TextureDimension::k2DMsaa;
     }
     throw std::runtime_error("AGC graphics: MatchesGuestDimension encountered an unknown descriptor image shape");
 }

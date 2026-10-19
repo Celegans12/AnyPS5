@@ -55,9 +55,11 @@ public:
     static bool& Active();
     static std::atomic<std::uint64_t>& EpochToken();
     static void FollowEpoch(std::uint64_t token);
+    static unsigned Committers();
 
     void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, Prepare prepare = {});
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100);
+    void Stop();
     static std::uint64_t DrainRequestsByOpcode(std::uint32_t opcode);
     // DMA_DATA as pipeline items, and SET_PREDICATION, NOP sub-ops and non-overlapping DMA_DATA kept
     // without a drain (upstream #6208). LOCAL A/B: APS5_NO_PIPELINE_DMA=1 (any value but 0) restores
@@ -132,6 +134,7 @@ private:
     std::uint32_t idleWaiters = 0;
     bool committerWaiting = false;
     bool stopped = false;
+    bool closing = false;
     std::thread thread;
     std::thread preparer;
     std::condition_variable prepareWake;

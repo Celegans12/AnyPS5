@@ -50,7 +50,7 @@ void KernelEqueuePrivate::Close() {
 
 void KernelEqueuePrivate::TriggerExpiredTimers(uint64_t nowNs) {
     for (auto& ev : m_events) {
-        if (ev.deadlineNs != 0 && ev.deadlineNs <= nowNs) {
+        if (ev.enabled && ev.deadlineNs != 0 && ev.deadlineNs <= nowNs) {
             if (ev.event.filter == EVFILT_TIMER) {
                 const uint64_t count = ev.intervalNs == 0
                     ? (ev.triggered ? 0 : 1)
@@ -66,7 +66,7 @@ void KernelEqueuePrivate::TriggerExpiredTimers(uint64_t nowNs) {
 bool KernelEqueuePrivate::NextTimerWaitMicros(uint64_t nowNs, uint32_t* out) const {
     uint64_t nearest = std::numeric_limits<uint64_t>::max();
     for (const auto& ev : m_events) {
-        if (!ev.triggered && ev.deadlineNs != 0) {
+        if (ev.enabled && !ev.triggered && ev.deadlineNs != 0) {
             nearest = std::min(nearest, ev.deadlineNs);
         }
     }
@@ -82,7 +82,7 @@ bool KernelEqueuePrivate::NextTimerWaitMicros(uint64_t nowNs, uint32_t* out) con
 bool KernelEqueuePrivate::PollEvents() {
     bool polled = false;
     for (auto& ev : m_events) {
-        if (ev.filter.pollFunc != nullptr) {
+        if (ev.enabled && ev.filter.pollFunc != nullptr) {
             ev.triggered = ev.filter.pollFunc(&ev);
             polled = true;
         }
@@ -99,7 +99,7 @@ void KernelEqueuePrivate::WakePollers() {
 void KernelEqueuePrivate::WaitForDescriptors(std::unique_lock<std::mutex>& lock, std::uint64_t deadlineNanos) {
     std::vector<GuestSockets::Interest> interests;
     for (const auto& e : m_events) {
-        if (e.filter.pollFunc != nullptr) {
+        if (e.enabled && e.filter.pollFunc != nullptr) {
             interests.push_back({static_cast<int>(e.event.ident), e.event.filter == EVFILT_WRITE});
         }
     }
@@ -121,11 +121,22 @@ int KernelEqueuePrivate::CollectTriggered(KernelEvent* ev, int num) {
     int ret = 0;
     for (auto it = m_events.begin(); it != m_events.end() && ret < num;) {
         auto& e = *it;
+        if (!e.enabled) {
+            ++it;
+            continue;
+        }
         bool erase = false;
         while (e.triggered && ret < num) {
             ev[ret++] = e.event;
             if ((e.event.flags & EV_ONESHOT) != 0) {
                 erase = true;
+                break;
+            }
+            if ((e.event.flags & EV_DISPATCH) != 0) {
+                e.enabled = false;
+                e.triggered = false;
+                e.event.fflags = 0;
+                e.event.data = 0;
                 break;
             }
             if (e.filter.resetFunc != nullptr) {
@@ -152,7 +163,7 @@ int KernelEqueuePrivate::CollectOncePerWait(KernelEvent* ev, int num) {
     std::list<KernelEqueueEvent> requeued;
     for (auto it = m_events.begin(); it != m_events.end() && ret < num;) {
         auto& e = *it;
-        if (!e.triggered) {
+        if (!e.triggered || !e.enabled) {
             ++it;
             continue;
         }
@@ -165,7 +176,12 @@ int KernelEqueuePrivate::CollectOncePerWait(KernelEvent* ev, int num) {
             it = m_events.erase(it);
             continue;
         }
-        if (e.filter.resetFunc != nullptr) {
+        if ((e.event.flags & EV_DISPATCH) != 0) {
+            e.enabled = false;
+            e.triggered = false;
+            e.event.fflags = 0;
+            e.event.data = 0;
+        } else if (e.filter.resetFunc != nullptr) {
             e.filter.resetFunc(&e);
         } else if ((e.event.flags & EV_CLEAR) != 0) {
             e.triggered = false;
@@ -190,6 +206,16 @@ int KernelEqueuePrivate::GetTriggeredEvents(KernelEvent* ev, int num) {
     TriggerExpiredTimers(MonotonicNs());
     PollEvents();
     return CollectTriggered(ev, num);
+}
+
+bool KernelEqueuePrivate::HasTriggeredEvents() {
+    std::unique_lock lock(m_mutex);
+    if (m_closed) {
+        return false;
+    }
+    TriggerExpiredTimers(MonotonicNs());
+    PollEvents();
+    return std::any_of(m_events.begin(), m_events.end(), [](const KernelEqueueEvent& event) { return event.enabled && event.triggered; });
 }
 
 int KernelEqueuePrivate::WaitForEvents(KernelEvent* ev, int num, uint32_t micros) {
@@ -281,10 +307,12 @@ int KernelEqueuePrivate::TriggerEvent(uintptr_t ident, int16_t filter, void* tri
     if (it == m_events.end()) {
         return SCE_KERNEL_ERROR_ENOENT;
     }
-    if (it->filter.triggerFunc != nullptr) {
-        it->filter.triggerFunc(&*it, triggerData);
-    } else {
-        it->triggered = true;
+    if (it->enabled) {
+        if (it->filter.triggerFunc != nullptr) {
+            it->filter.triggerFunc(&*it, triggerData);
+        } else {
+            it->triggered = true;
+        }
     }
     m_cond.NotifyOne();
     WakePollers();
@@ -635,6 +663,9 @@ KernelEqueueEvent EqueueDescriptorEvent(int descriptor, int16_t filter, uint16_t
         std::int64_t data = 0;
         bool eof = false;
         if (!GuestSockets::Ready(static_cast<int>(e->event.ident), e->event.filter == EVFILT_WRITE, &data, &eof)) {
+            return false;
+        }
+        if (!eof && data < e->lowWater && !GuestSockets::Listening(static_cast<int>(e->event.ident))) {
             return false;
         }
         e->event.data = static_cast<intptr_t>(data);

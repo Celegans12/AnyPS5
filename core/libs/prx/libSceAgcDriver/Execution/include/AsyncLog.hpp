@@ -1,5 +1,6 @@
 #pragma once
 
+#include "prx/libc/include/Shutdown.hpp"
 #include "prx/libc/include/general/LogMacros.hpp"
 #include <algorithm>
 #include <atomic>
@@ -9,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
+#include <initializer_list>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -86,6 +88,8 @@ class AsyncLog {
 public:
     using Clock = std::chrono::steady_clock;
 
+    static constexpr std::size_t Capacity = 16u * 1024u * 1024u;
+
     static AsyncLog& Get() {
         static AsyncLog* const instance = new AsyncLog();
         return *instance;
@@ -153,7 +157,8 @@ public:
     void Flush() {
         if (!asynchronous) return;
         std::unique_lock lock(mutex);
-        idle.wait_for(lock, std::chrono::seconds(2), [&] { return pending.empty() && !writing; });
+        const auto target = queued.load(std::memory_order_relaxed);
+        idle.wait(lock, [&] { return finished.load(std::memory_order_relaxed) >= target; });
     }
 
     bool FlushFor(std::chrono::milliseconds limit) {
@@ -167,6 +172,16 @@ public:
         return true;
     }
 
+    static void FlushAtEnd() {
+        auto& log = Get();
+        if (log.abandoned.load(std::memory_order_acquire)) return;
+        if (!log.FlushFor(EndFlushLimit)) log.abandoned.store(true, std::memory_order_release);
+    }
+
+    std::unique_lock<std::mutex> Hold() {
+        return std::unique_lock(mutex);
+    }
+
 private:
     struct Window {
         Clock::time_point first;
@@ -174,7 +189,6 @@ private:
         std::uint64_t suppressed;
     };
 
-    static constexpr std::size_t Capacity = 16u * 1024u * 1024u;
     static constexpr std::size_t CoalesceKeys = 128;
     static constexpr std::uint64_t PrintedRepeats = 3;
     static constexpr std::chrono::seconds CoalesceWindow{10};
@@ -190,13 +204,14 @@ private:
         if (!asynchronous) return;
         LogSink().store(&AsyncLog::Sink, std::memory_order_release);
         std::atexit(&AsyncLog::FlushAtEnd);
+        InitializeWaits();
         std::thread([this] { Run(); }).detach();
+        LibcSetEndFlush_nid_no_patch(&AsyncLog::FlushAtEnd);
     }
 
-    static void FlushAtEnd() {
-        auto& log = Get();
-        if (log.abandoned.load(std::memory_order_acquire)) return;
-        if (!log.FlushFor(EndFlushLimit)) log.abandoned.store(true, std::memory_order_release);
+    void InitializeWaits() {
+        std::unique_lock lock(mutex);
+        for (auto* condition : {&wake, &space, &idle}) static_cast<void>(condition->wait_for(lock, std::chrono::nanoseconds(0)));
     }
 
     static int Sink(std::FILE* stream, const char* text, std::size_t length) {
@@ -252,12 +267,11 @@ private:
                 sleeping = false;
                 batch.swap(pending);
                 bytes = 0;
-                writing = !batch.empty();
             }
             space.notify_all();
             if (!batch.empty()) {
-                const auto count = batch.size();
                 const auto start = Clock::now();
+                const auto count = batch.size();
                 try {
                     Drain(batch, buffer);
                 } catch (...) {
@@ -267,9 +281,8 @@ private:
                 loggerNanoseconds.fetch_add(Elapsed(start), std::memory_order_relaxed);
                 {
                     std::lock_guard lock(mutex);
-                    writing = false;
+                    finished.fetch_add(count, std::memory_order_release);
                 }
-                finished.fetch_add(count, std::memory_order_release);
                 idle.notify_all();
             }
             try {
@@ -359,7 +372,6 @@ private:
     std::size_t bytes = 0;
     std::size_t peak = 0;
     bool sleeping = false;
-    bool writing = false;
     std::atomic<std::uint64_t> queued{0};
     std::atomic<std::uint64_t> finished{0};
     std::atomic<bool> abandoned{false};
@@ -378,9 +390,13 @@ inline void InstallAsyncLog_nid_no_patch() {
     static_cast<void>(AsyncLog::Get());
 }
 
-inline void FlushAsyncLog_nid_no_patch() {
-    AsyncLog::Get().Flush();
+void FlushAsyncLog_nid_no_patch();
+
+inline void FlushAsyncLogAtEnd_nid_no_patch() {
+    AsyncLog::FlushAtEnd();
 }
+
+std::unique_lock<std::mutex> HoldAsyncLog();
 
 template<typename... TArgs>
 void LogCoalescedStderr_nid_no_patch(const char* format, TArgs... args) {

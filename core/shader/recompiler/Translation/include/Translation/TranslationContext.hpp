@@ -25,6 +25,7 @@ public:
     }
     void SetEntryRounding(const RoundingState& state) { setRounding(state); }
     void SetNativeFloat16(bool enabled) { nativeFloat16 = enabled; }
+    void SetFloat32FlushToZero(bool enabled) { float32FlushToZero = enabled; }
     void AddBranchCondition(const BasicBlock& source, BlockInfo& info);
     void TranslateCodeTableLoad(const RdnaInstruction& instruction, const ControlFlowGraph::CodeTableLoad& table);
     void TranslateUnlinkedCall(const RdnaInstruction& instruction);
@@ -74,7 +75,9 @@ private:
     IrU32 flushF16Input(IrU32 bits);
     IrU32 flushF16Result(IrU32 bits);
     IrF32 flushF16InputValue(IrF32 value);
+    IrF32 flushTinyF16Value(IrF32 value, std::uint32_t threshold);
     IrU32 convertF32ToF16Bits(IrF32 value, std::initializer_list<IrValue*> sources);
+    IrU32 flushTinyF16Conversion(IrF32 value, IrU32 bits);
     void writeF16Conversion(const RdnaOperand& operand, IrF32 value, std::initializer_list<IrValue*> sources);
     IrU32 readU32(const RdnaOperand& operand);
     IrU32 flushF32Denormal(IrU32 bits);
@@ -249,6 +252,9 @@ private:
     bool floatCube(const RdnaInstruction& inst, std::uint32_t resultKind);
     bool integer16Shift(const RdnaInstruction& inst, IrOpcode opcode, bool arithmetic);
     bool integer16Binary(const RdnaInstruction& inst, IrOpcode opcode, bool sign);
+    IrU32 readU16Factor(const RdnaOperand& operand, bool highHalf, bool negate);
+    bool vMulLoU16(const RdnaInstruction& inst);
+    bool vPkMulLoU16(const RdnaInstruction& inst);
     bool integer16Mad(const RdnaInstruction& inst, bool sign, bool wide);
     IrU32 saturateU16Result(const RdnaInstruction& inst, const IrU32& value, bool sign);
     IrU32 wideAdd(const RdnaInstruction& inst, const IrU32& low, const IrU32& high, const IrU32& addend, bool sign);
@@ -359,6 +365,7 @@ private:
     void checkRoundingUse(const RdnaInstruction& inst) const;
     bool emitVector(const RdnaInstruction& inst);
     std::uint32_t f32DenormalFlushFor(const RdnaInstruction& inst) const;
+    bool flushesInHardware(const RdnaInstruction& inst) const;
     bool emitInterpolation(const RdnaInstruction& inst);
     bool emitMemory(const RdnaInstruction& inst);
 
@@ -375,6 +382,7 @@ private:
     IrU1 instructionBranchCondition;
     RdnaOpcode currentOpcode = RdnaOpcode::Unknown;
     std::uint32_t f32DenormalFlush = 0u;
+    bool float32FlushToZero = false;
     std::uint32_t currentProgramCounter = 0;
     std::uint32_t currentVectorLimit = 1;
 };

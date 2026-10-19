@@ -26,6 +26,7 @@ CPP_TOKEN = re.compile(
     r"|(?P<code>(?:[0-9]|\.[0-9])[A-Za-z0-9_.']*|[A-Za-z_][A-Za-z0-9_]*|\S)")
 DEFINITION = re.compile(r"\bAPS5_VABI\s+(\w+)\s*\([^;{]*\)\s*(?:noexcept\s*)?(?:try\s*)?\{")
 NID_POSTFIX = "_nid_postfix"
+ASM_FUNCTION_MACROS = {"APS5_ASM_FUNCTION", "APS5_SIGNAL_ASM_FUNCTION"}
 
 
 def compute_nid(symbol):
@@ -92,6 +93,22 @@ def source_definitions(text):
     return DEFINITION.finditer(CPP_TOKEN.sub(mask, text.replace("\\\n", "").replace("\\\r\n", "")))
 
 
+def source_assembly_definitions(text):
+    tokens = [match for match in CPP_TOKEN.finditer(text.replace("\\\n", "").replace("\\\r\n", ""))
+              if match.group("comment") is None]
+    for index, token in enumerate(tokens):
+        if token.group("code") is None or token.group() not in ASM_FUNCTION_MACROS:
+            continue
+        if index + 3 >= len(tokens):
+            continue
+        opening, literal, closing = tokens[index + 1:index + 4]
+        if opening.group() != "(" or closing.group() != ")" or literal.group("string") is None:
+            continue
+        match = re.fullmatch(r'"([A-Za-z_][A-Za-z0-9_]*)"', literal.group("string"))
+        if match is not None:
+            yield match.group(1)
+
+
 def collect_unknowns():
     found = {}
     for path in source_files(PRX):
@@ -108,6 +125,10 @@ def collect_real_names():
         text = path.read_text(encoding="utf-8")
         for match in source_definitions(text):
             name = match.group(1)
+            names.add(name)
+            if name.endswith(NID_POSTFIX):
+                names.add(name[:-len(NID_POSTFIX)])
+        for name in source_assembly_definitions(text):
             names.add(name)
             if name.endswith(NID_POSTFIX):
                 names.add(name[:-len(NID_POSTFIX)])
@@ -163,10 +184,12 @@ def main(argv=None):
     options = [option for action in parser._actions for option in action.option_strings]
     arguments = sys.argv[1:] if argv is None else argv
     args = parser.parse_args(nid_arguments(arguments, options))
-    if args.name:
-        if args.nid:
-            parser.error("--name/--symbol cannot be combined with --nid")
-        rows = [{"name": name, "nid": compute_nid(name)} for name in args.name]
+    requested_options = {option_name(argument, options) for argument in arguments}
+    requested_nids = "--nid" in requested_options
+    if requested_nids and requested_options & {"--name", "--symbol"}:
+        parser.error("--name/--symbol cannot be combined with --nid")
+    if requested_options & {"--name", "--symbol"}:
+        rows = [{"name": name, "nid": compute_nid(name)} for name in (args.name or [])]
         if args.json:
             print(json.dumps({"symbols": rows}, indent=1))
         else:
@@ -174,8 +197,8 @@ def main(argv=None):
             for row in rows:
                 print("%-40s %s" % (row["name"], row["nid"]))
         return 0
-    requested_nids = any(option_name(argument, options) == "--nid" for argument in arguments)
-    for nid in args.nid or []:
+    args.nid = [nid.split("#", 1)[0] for nid in args.nid or []]
+    for nid in args.nid:
         if re.fullmatch(r"[A-Za-z0-9+\-]{11}", nid) is None:
             parser.error(f"invalid NID {nid!r}: expected 11 characters from A-Z, a-z, 0-9, + or -")
 
@@ -220,4 +243,7 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
     sys.exit(main())

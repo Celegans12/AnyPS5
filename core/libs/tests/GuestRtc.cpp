@@ -17,6 +17,8 @@ int APS5_VABI sceRtcGetTickResolution(void);
 int APS5_VABI sceRtcGetTick(const RtcDateTime*, RtcTick*);
 int APS5_VABI sceRtcSetTick(RtcDateTime*, const RtcTick*);
 int APS5_VABI sceRtcGetCurrentTick(RtcTick*);
+int APS5_VABI sceRtcGetCurrentClock(RtcDateTime*, int);
+int APS5_VABI sceRtcGetCurrentClockLocalTime(RtcDateTime*);
 int APS5_VABI sceRtcConvertUtcToLocalTime(const RtcTick*, RtcTick*);
 int APS5_VABI sceRtcConvertLocalTimeToUtc(const RtcTick*, RtcTick*);
 int APS5_VABI sceRtcGetTime_t(const RtcDateTime*, std::int64_t*);
@@ -36,6 +38,11 @@ int APS5_VABI sceRtcTickAddYears(RtcTick*, const RtcTick*, std::int16_t);
 int APS5_VABI sceRtcFormatRFC3339LocalTime(char*, const RtcTick*);
 int APS5_VABI sceRtcFormatRFC2822(char*, const RtcTick*, int);
 int APS5_VABI sceRtcFormatRFC2822LocalTime(char*, const RtcTick*);
+int APS5_VABI sceRtcFormatRFC3339Precise(char*, const RtcTick*, int, int);
+int APS5_VABI sceRtcFormatRFC3339PreciseLocalTime(char*, const RtcTick*, int);
+int APS5_VABI sceRtcCompareTick(const RtcTick*, const RtcTick*);
+int APS5_VABI sceRtcGetCurrentAdNetworkTick(RtcTick*);
+int APS5_VABI sceRtcSetCurrentTick(const RtcTick*);
 }
 
 static void Require(bool value) { if (!value) std::abort(); }
@@ -71,8 +78,12 @@ int main() {
     Require(sceRtcGetTickResolution() == 1000000);
     Require(sceRtcIsLeapYear(2000) == 1 && sceRtcIsLeapYear(1900) == 0 && sceRtcIsLeapYear(2024) == 1);
     Require(sceRtcIsLeapYear(0) == invalidYear);
+    Require(sceRtcIsLeapYear(10000) == 1);
+    Require(sceRtcIsLeapYear(9999) == 0 && sceRtcIsLeapYear(9996) == 1);
     Require(sceRtcGetDaysInMonth(2023, 2) == 28 && sceRtcGetDaysInMonth(2024, 2) == 29 && sceRtcGetDaysInMonth(2024, 4) == 30);
     Require(sceRtcGetDaysInMonth(2024, 13) == invalidMonth);
+    Require(sceRtcGetDaysInMonth(10000, 1) == 31);
+    Require(sceRtcGetDaysInMonth(9999, 1) == 31);
     Require(sceRtcGetDayOfWeek(1, 1, 1) == 1 && sceRtcGetDayOfWeek(2026, 9, 26) == 6);
     Require(sceRtcGetDayOfWeek(2023, 2, 29) == invalidDay);
 
@@ -97,6 +108,13 @@ int main() {
     Require(sceRtcSetTick(&converted, &tick) == 0 && Equal(converted, RtcDateTime{9999, 12, 31, 23, 59, 59, 999999}));
     tick.tick = maxTick + 1;
     Require(sceRtcSetTick(&converted, &tick) == invalidValue);
+
+    Require(sceRtcGetCurrentClock(nullptr, 0) == invalidPointer);
+    Require(sceRtcGetCurrentClock(&converted, 0) == 0 && sceRtcCheckValid(&converted) == 0);
+    Require(sceRtcGetCurrentClock(&converted, 60) == 0 && sceRtcCheckValid(&converted) == 0);
+    Require(sceRtcGetCurrentClock(&converted, -300) == 0 && sceRtcCheckValid(&converted) == 0);
+    Require(sceRtcGetCurrentClockLocalTime(nullptr) == invalidPointer);
+    Require(sceRtcGetCurrentClockLocalTime(&converted) == 0 && sceRtcCheckValid(&converted) == 0);
 
     RtcDateTime epoch{1970, 1, 1, 0, 0, 0, 0};
     std::int64_t seconds = -1;
@@ -481,4 +499,31 @@ int main() {
     Require(sceRtcFormatRFC2822LocalTime(rfc2822, &tick) == 0 && std::strcmp(rfc2822, "Wed, 31 Dec 1969 23:59:59 +0000") == 0);
     SetTimeZone("UTC0");
 #endif
+
+    {
+        char precise[40];
+        RtcTick first{leapDayTick}, second{leapDayTick + 1};
+        Require(sceRtcFormatRFC3339Precise(precise, &first, 0, 0) == 0 && std::strcmp(precise, "2024-02-29T12:34:56Z") == 0);
+        Require(sceRtcFormatRFC3339Precise(precise, &first, 0, 3) == 0 && std::strcmp(precise, "2024-02-29T12:34:56.789Z") == 0);
+        Require(sceRtcFormatRFC3339Precise(precise, &first, 0, 6) == 0 && std::strcmp(precise, "2024-02-29T12:34:56.789000Z") == 0);
+        Require(sceRtcFormatRFC3339Precise(precise, &second, 90, 6) == 0 && std::strcmp(precise, "2024-02-29T14:04:56.789001+01:30") == 0);
+        Require(sceRtcFormatRFC3339Precise(precise, &first, -300, 1) == 0 && std::strcmp(precise, "2024-02-29T07:34:56.7-05:00") == 0);
+        Require(sceRtcFormatRFC3339Precise(precise, &first, 0, 7) == invalidValue);
+        Require(sceRtcFormatRFC3339Precise(precise, &first, 0, -1) == invalidValue);
+        Require(sceRtcFormatRFC3339Precise(precise, &first, 1440, 0) == invalidValue);
+        Require(sceRtcFormatRFC3339Precise(precise, &first, -1440, 0) == invalidValue);
+        Require(sceRtcFormatRFC3339Precise(nullptr, &first, 0, 0) == invalidPointer);
+        Require(sceRtcFormatRFC3339Precise(precise, nullptr, 0, 6) == 0 && precise[4] == '-');
+        SetTimeZone("UTC0");
+        Require(sceRtcFormatRFC3339PreciseLocalTime(precise, &first, 2) == 0 && std::strcmp(precise, "2024-02-29T12:34:56.78Z") == 0);
+        Require(sceRtcFormatRFC3339PreciseLocalTime(precise, &first, 7) == invalidValue);
+        Require(sceRtcFormatRFC3339PreciseLocalTime(nullptr, &first, 0) == invalidPointer);
+        Require(sceRtcCompareTick(&first, &second) == -1 && sceRtcCompareTick(&second, &first) == 1 && sceRtcCompareTick(&first, &first) == 0);
+        Require(sceRtcCompareTick(nullptr, &first) == invalidPointer && sceRtcCompareTick(&first, nullptr) == invalidPointer);
+        RtcTick current{};
+        Require(sceRtcGetCurrentAdNetworkTick(&current) == 0 && current.tick > unixEpochTick);
+        Require(sceRtcGetCurrentAdNetworkTick(nullptr) == invalidPointer);
+        RtcTick tooEarly{unixEpochTick - 1};
+        Require(sceRtcSetCurrentTick(&tooEarly) == invalidValue && sceRtcSetCurrentTick(nullptr) == invalidPointer);
+    }
 }

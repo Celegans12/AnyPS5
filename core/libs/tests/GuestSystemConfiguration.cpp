@@ -67,6 +67,26 @@ static void CheckProcessorCountSysctl() {
     }
     Require(threw);
 }
+static void CheckPageSizeSysctl() {
+    const int mib[] = {6, 7};
+    *__error_nid_postfix() = 13;
+    std::size_t length = 0;
+    Require(sysctl_nid_postfix(mib, 2, nullptr, &length, nullptr, 0) == 0 && length == sizeof(int));
+    int value = 0;
+    length = sizeof(value);
+    Require(sysctl_nid_postfix(mib, 2, &value, &length, nullptr, 0) == 0 && value == 0x4000 && length == sizeof(int));
+    value = 0;
+    length = 16;
+    Require(sysctlbyname_nid_postfix("hw.pagesize", &value, &length, nullptr, 0) == 0 && value == 0x4000 && length == sizeof(int));
+    Require(*__error_nid_postfix() == 13);
+    unsigned char bytes[4] = {0xaa, 0xaa, 0xaa, 0xaa};
+    length = 2;
+    Require(sysctlbyname_nid_postfix("hw.pagesize", bytes, &length, nullptr, 0) == -1 && *__error_nid_postfix() == 12);
+    Require(length == 2 && bytes[2] == 0xaa && bytes[3] == 0xaa);
+    length = sizeof(value);
+    Require(sysctl_nid_postfix(mib, 2, &value, &length, &value, sizeof(value)) == -1 && *__error_nid_postfix() == 1);
+    Require(sysctlbyname_nid_postfix("hw.pagesize", &value, &length, &value, sizeof(value)) == -1 && *__error_nid_postfix() == 1);
+}
 static void CheckPhysicalMemorySysctl(int number, const char* name) {
     const int mib[] = {6, number};
     const std::uint64_t expected = static_cast<std::uint64_t>(sysconf_nid_postfix(121)) * 0x4000;
@@ -177,8 +197,59 @@ static void CheckPathnameSysctl() {
     length = sizeof(buffer);
     Require(sysctl_nid_postfix(mibSelf, 4, buffer, &length, buffer, sizeof(buffer)) == -1 && *__error_nid_postfix() == 1);
 }
+struct SystemString {
+    int mib[2];
+    const char* name;
+    const char* value;
+};
+static const SystemString SystemStrings[] = {
+    {{1, 1}, "kern.ostype", "FreeBSD"},
+    {{1, 2}, "kern.osrelease", "11.4-RELEASE"},
+    {{1, 4}, "kern.version", "FreeBSD 11.4-RELEASE\n"},
+    {{1, 10}, "kern.hostname", "AnyPS5"},
+    {{6, 1}, "hw.machine", "amd64"},
+};
+static void CheckSystemStringSysctl() {
+    for (const auto& entry : SystemStrings) {
+        const std::size_t size = std::strlen(entry.value) + 1;
+        *__error_nid_postfix() = 13;
+        std::size_t length = 0;
+        Require(sysctl_nid_postfix(entry.mib, 2, nullptr, &length, nullptr, 0) == 0 && length == size);
+        char buffer[32];
+        std::memset(buffer, 0xaa, sizeof(buffer));
+        length = sizeof(buffer);
+        Require(sysctl_nid_postfix(entry.mib, 2, buffer, &length, nullptr, 0) == 0 && length == size);
+        Require(std::strcmp(buffer, entry.value) == 0 && buffer[size] == static_cast<char>(0xaa));
+        Require(*__error_nid_postfix() == 13);
+        std::memset(buffer, 0xaa, sizeof(buffer));
+        length = 2;
+        Require(sysctl_nid_postfix(entry.mib, 2, buffer, &length, nullptr, 0) == -1 && *__error_nid_postfix() == 12);
+        Require(length == 2 && std::memcmp(buffer, entry.value, 2) == 0 && buffer[2] == static_cast<char>(0xaa));
+        length = sizeof(buffer);
+        Require(sysctl_nid_postfix(entry.mib, 2, buffer, &length, "Prospero", sizeof("Prospero")) == -1 && *__error_nid_postfix() == 1);
+        const int deeper[] = {entry.mib[0], entry.mib[1], 0};
+        length = sizeof(buffer);
+        Require(sysctl_nid_postfix(deeper, 3, buffer, &length, nullptr, 0) == -1 && *__error_nid_postfix() == 20);
+        Require(length == sizeof(buffer));
+    }
+}
+static void CheckSystemStringNames() {
+    for (const auto& entry : SystemStrings) {
+        *__error_nid_postfix() = 13;
+        char buffer[32];
+        std::memset(buffer, 0xaa, sizeof(buffer));
+        std::size_t length = sizeof(buffer);
+        Require(sysctlbyname_nid_postfix(entry.name, buffer, &length, nullptr, 0) == 0 && length == std::strlen(entry.value) + 1);
+        Require(std::strcmp(buffer, entry.value) == 0 && *__error_nid_postfix() == 13);
+        Require(sysctlbyname_nid_postfix(entry.name, buffer, &length, "Prospero", sizeof("Prospero")) == -1 && *__error_nid_postfix() == 1);
+        int mib[3] = {0x5a5a5a5a, 0x5a5a5a5a, 0x5a5a5a5a};
+        std::size_t size = 3;
+        Require(sysctlnametomib_nid_postfix(entry.name, mib, &size) == 0 && size == 2);
+        Require(mib[0] == entry.mib[0] && mib[1] == entry.mib[1] && mib[2] == 0x5a5a5a5a);
+    }
+}
 static void CheckLeafWithTrailingComponent() {
-    const int leaves[][2] = {{6, 3}, {6, 2}, {6, 5}, {1, 37}};
+    const int leaves[][2] = {{6, 3}, {6, 2}, {6, 5}, {6, 7}, {1, 37}};
     for (const auto& leaf : leaves) {
         const int mib[] = {leaf[0], leaf[1], 0};
         char buffer[8] = {};
@@ -311,6 +382,7 @@ static void CheckNameToMib() {
     const Expected expected[] = {
         {"hw.model", {6, 2}, 2},
         {"hw.ncpu", {6, 3}, 2},
+        {"hw.pagesize", {6, 7}, 2},
         {"hw.physmem", {6, 5}, 2},
         {"hw.realmem", {6, 12}, 2},
         {"kern.arandom", {1, 37}, 2},
@@ -396,6 +468,7 @@ static void CheckNameToMib() {
 }
 int main() {
     CheckProcessorCountSysctl();
+    CheckPageSizeSysctl();
     CheckPhysicalMemorySysctl(5, "hw.physmem");
     CheckPhysicalMemorySysctl(12, "hw.realmem");
 #if defined(__x86_64__) || defined(__i386__)
@@ -404,6 +477,8 @@ int main() {
     CheckTscFrequencySysctl();
     CheckMachdepCachelineSizeSysctl();
     CheckPathnameSysctl();
+    CheckSystemStringSysctl();
+    CheckSystemStringNames();
     CheckLeafWithTrailingComponent();
     CheckSystemSwVersion();
     CheckPseudoRandomSysctl();

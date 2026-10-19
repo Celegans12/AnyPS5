@@ -51,10 +51,13 @@ int APS5_VABI defaultPosixAlign(void** pointer, std::size_t alignment, std::size
     catch (const std::length_error&) { return 12; }
 }
 
+int APS5_VABI defaultStatsFast(void* stats) { return GuestHeap::GuestHeapStatsFast_nid_postfix(stats); }
+
 std::array<void*, 10> defaultApi() {
     return {reinterpret_cast<void*>(defaultAllocate), reinterpret_cast<void*>(defaultFree),
         reinterpret_cast<void*>(defaultCalloc), reinterpret_cast<void*>(defaultReallocate),
-        reinterpret_cast<void*>(defaultAlign), nullptr, reinterpret_cast<void*>(defaultPosixAlign)};
+        reinterpret_cast<void*>(defaultAlign), nullptr, reinterpret_cast<void*>(defaultPosixAlign), nullptr,
+        reinterpret_cast<void*>(defaultStatsFast)};
 }
 
 class CallbackScope {
@@ -200,6 +203,20 @@ void* ApplicationHeapAlign_nid_no_patch(std::size_t alignment, std::size_t bytes
     void* pointer = requireAllocation(align(alignment, bytes));
     if (reinterpret_cast<std::uintptr_t>(pointer) % alignment != 0) throw std::runtime_error("application heap: allocator returned a misaligned pointer");
     return pointer;
+}
+
+extern "C" void* APS5_VABI scriptingGetMem_nid_postfix(std::size_t alignment, std::size_t bytes) {
+    alignment = std::max<std::size_t>(alignment, 16);
+    if ((alignment & (alignment - 1)) != 0) return nullptr;
+    try {
+        return ApplicationHeapAlign_nid_no_patch(alignment, bytes);
+    } catch (const std::bad_alloc&) {
+        return nullptr;
+    }
+}
+
+extern "C" void APS5_VABI scriptingFreeMem_nid_postfix(void* pointer) {
+    ApplicationHeapFree_nid_no_patch(pointer);
 }
 
 void* ApplicationHeapRealign_nid_no_patch(void* pointer, std::size_t bytes, std::size_t alignment) {

@@ -38,8 +38,9 @@ bool DirectMemoryLargestFree(int64_t searchStart, int64_t searchEnd, size_t alig
 size_t DirectMemoryFreeRun(uint64_t offset, uint64_t limit);
 int DoMapDirect(void** addr, size_t len, int prot, int flags, int64_t physStart, size_t alignment);
 int DoMapDirect(std::optional<GuestAllocations::Mutation>& batch, void** addr, size_t len, int prot, int flags, int64_t physStart, size_t alignment);
-int DoMapAnon(void** addr, size_t len, int prot, int flags, size_t alignment = PS5_PAGE_SIZE, bool exclusive = false);
+int DoMapAnon(void** addr, size_t len, int prot, int flags, size_t alignment = PS5_PAGE_SIZE, bool exclusive = false, bool allowStackReplacement = false);
 int DoMapFileBacked_nid_no_patch(void** addr, size_t len, int prot, int flags, int descriptor, std::uint64_t offset, size_t alignment);
+void ReleaseFlexibleMappingRange(std::uintptr_t address, size_t len);
 int DoMapShared(void** addr, size_t len, int prot, HostSharedMemory object);
 int DoMprotect(const void* addr, size_t len, int prot);
 int DoMtypeprotect(const void* addr, size_t len, int type, int prot);

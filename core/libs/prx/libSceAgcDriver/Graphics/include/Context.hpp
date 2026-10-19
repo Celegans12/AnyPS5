@@ -178,6 +178,7 @@ struct Context {
     std::mutex* settleQueueMutex = nullptr;
     PFN_vkGetPhysicalDeviceMemoryProperties2 memoryProperties2 = nullptr;
     bool integratedGpu = false;
+    VkDeviceSize (*cacheReclaim)(VkDeviceSize bytes) = nullptr;
     RenderCache* renderCache = nullptr;
     DrawQueue* drawQueue = nullptr;
     GraphicsPipelineCache* graphicsPipelines = nullptr;
@@ -198,6 +199,7 @@ struct Context {
     bool dualSrcBlend = false;
     bool samplerFilterMinmax = false;
     bool nonSeamlessCubeMap = false;
+    VkSampleCountFlags mergedCoverageSampleCounts = 0;
     bool conservativeRasterization = false;
     bool meshWave32 = false;
     VkBuffer emptyBuffer = VK_NULL_HANDLE;
@@ -217,8 +219,10 @@ struct Context {
     bool variableDescriptorCount = false;
     std::uint32_t imageTableCapacity = 0;
     std::uint32_t samplerTableCapacity = 0;
+    bool individuallyFreeDescriptorSets = false;
     bool geometryShader = false;
     bool sampleRateShading = false;
+    bool storageImageMultisample = false;
     bool shaderClipDistance = false;
     bool shaderCullDistance = false;
     bool nullDescriptors = false;
@@ -235,12 +239,14 @@ struct Context {
     bool graphicsPipelineLibrary = false;
     bool pipelineLinkTimeOptimization = true;
     std::uint32_t srgbDecodeFormats = 0;
+    std::uint32_t srgbCopyFormats = 0;
     bool provokingVertexLast = false;
     bool provokingVertexModePerPipeline = false;
     bool singlePassStorage = false;
     VkSampleCountFlags sampleLocationSampleCounts = 0;
     VkSampleCountFlags sampleLocationGridSampleCounts = 0;
     PipelineCacheSynchronization* pipelineCacheSynchronization = nullptr;
+    bool shaderTerminateInvocation = false;
 
     PipelineCacheSynchronization::PipelineUseLock LockPipelineCacheForUse() const {
         return pipelineCacheSynchronization != nullptr ? pipelineCacheSynchronization->LockForPipelineUse() : PipelineCacheSynchronization::PipelineUseLock{};
@@ -324,26 +330,9 @@ struct Context {
         return std::nullopt;
     }
 
-    std::optional<std::uint32_t> RefusedDeviceMemoryFallback(std::uint32_t mask, std::uint32_t refused, VkDeviceSize bytes, const char* what) const {
+    std::optional<std::uint32_t> RefusedDeviceMemoryFallback(std::uint32_t mask, std::uint32_t refused) const {
         if (refused >= memory.memoryTypeCount || (memory.memoryHeaps[memory.memoryTypes[refused].heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0) return std::nullopt;
-        const auto host = HostMemoryType(mask);
-        if (!host) return std::nullopt;
-        static std::atomic<std::uint64_t> refusals{0}, refusedBytes{0};
-        const auto count = refusals.fetch_add(1) + 1;
-        const auto total = refusedBytes.fetch_add(bytes) + bytes;
-        if (count <= 5 || (count & (count - 1)) == 0) std::fprintf(stderr, "[gpu] %s: device-local memory type %u is out of device memory for %llu bytes; placed in host memory type %u; %llu such allocations, %llu MiB\n", what, refused, static_cast<unsigned long long>(bytes), *host, static_cast<unsigned long long>(count), static_cast<unsigned long long>(total >> 20u));
-        return host;
-    }
-
-    VkResult AllocateDeviceMemory(VkMemoryAllocateInfo& allocation, std::uint32_t mask, VkDeviceMemory& allocated, const char* what) const {
-        const auto allocate = Function<PFN_vkAllocateMemory>("vkAllocateMemory");
-        auto result = allocate(device, &allocation, nullptr, &allocated);
-        if (result != VK_ERROR_OUT_OF_DEVICE_MEMORY) return result;
-        const auto host = RefusedDeviceMemoryFallback(mask, allocation.memoryTypeIndex, allocation.allocationSize, what);
-        if (!host) return result;
-        allocation.memoryTypeIndex = *host;
-        allocated = VK_NULL_HANDLE;
-        return allocate(device, &allocation, nullptr, &allocated);
+        return HostMemoryType(mask);
     }
 };
 

@@ -11,6 +11,7 @@
 static std::atomic<uint64_t> g_coredumpHandler{0};
 static std::atomic<uint64_t> g_coredumpContext{0};
 
+static constexpr int SCE_COREDUMP_ERROR_INVALID_ARGUMENT = static_cast<int>(0x81180000u);
 static constexpr int SCE_COREDUMP_ERROR_NOT_IN_COREDUMP_HANDLER = static_cast<int>(0x81180003u);
 
 static void requireRegionOutsideHandler(const char* function, const void* mem, size_t size) {
@@ -55,9 +56,10 @@ int APS5_VABI sceCoredumpAttachUserFile(uint32_t userValue, const char* path) {
     return SCE_COREDUMP_ERROR_NOT_IN_COREDUMP_HANDLER;
 }
 
-int APS5_VABI sceCoredumpGetStopInfoGpu_Agc(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+int APS5_VABI sceCoredumpGetStopInfoGpu_Agc(void* info, size_t size) {
+    (void)size;
+    if (info == nullptr) return SCE_COREDUMP_ERROR_INVALID_ARGUMENT;
+    return SCE_COREDUMP_ERROR_NOT_IN_COREDUMP_HANDLER;
 }
 
 int APS5_VABI sceCoredumpAttachMemoryRegionAsUserFile(uint32_t userValue, const void* mem, size_t size, const char* name) {
@@ -93,15 +95,19 @@ int APS5_VABI sceCoredumpGetStopInfoCpu(void* info, size_t size) {
 }
 
 int APS5_VABI sceCoredumpGetThreadContextInfo(void* threadContextInfo, size_t threadContextInfoSize) {
-    (void)threadContextInfo;
-    (void)threadContextInfoSize;
-    NotImplemented_nid_no_patch(__func__);
+    const auto address = reinterpret_cast<uintptr_t>(threadContextInfo);
+    if (threadContextInfo == nullptr || threadContextInfoSize != 144 || address % alignof(uint64_t) != 0 || threadContextInfoSize > UINTPTR_MAX - address)
+        throw std::runtime_error(std::string(__func__) + ": null, unaligned, wrapping or unsupported thread context buffer outside the core dump handler");
+    return SCE_COREDUMP_ERROR_NOT_IN_COREDUMP_HANDLER;
+}
+
+int APS5_VABI sceCoredumpWriteUserString(uint32_t first, const char* text, int third) {
+    if (text == nullptr || first > 15 || third < 0 || third > 256) return SCE_COREDUMP_ERROR_INVALID_ARGUMENT;
     return 0;
 }
 
-int APS5_VABI sceCoredumpWriteUserString() {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+int APS5_VABI sceCoredumpConfigDumpMode(int mode) {
+    return mode == 1 ? 0 : SCE_COREDUMP_ERROR_INVALID_ARGUMENT;
 }
 
 int APS5_VABI sceCoredumpAttachUserMemoryFile(uint32_t userValue, const void* mem, size_t size) {

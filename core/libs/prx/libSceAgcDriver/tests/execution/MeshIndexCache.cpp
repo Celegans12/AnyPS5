@@ -6,6 +6,7 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <exception>
 #include <iostream>
 #include <string>
@@ -111,6 +112,10 @@ int main() {
         {
             const auto device = OpenVulkanTestDevice();
             if (!device || !TargetHasCapability(device->Target(), spv::CapabilityMeshShadingEXT)) return VulkanTestSkipped;
+            if (device->DeviceName().starts_with("llvmpipe")) {
+                std::puts("skipped, the device has no mesh shader compiler that handles these programs (llvmpipe)");
+                return VulkanTestSkipped;
+            }
         }
         Register(GeometryHeader, AgcDriver::Test::MeshGeometryCode.data(), sizeof(AgcDriver::Test::MeshGeometryCode), 2);
         Register(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);

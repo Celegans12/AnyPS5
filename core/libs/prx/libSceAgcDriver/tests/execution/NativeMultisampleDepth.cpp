@@ -104,6 +104,7 @@ public:
             function<PFN_vkGetPhysicalDeviceMemoryProperties>("vkGetPhysicalDeviceMemoryProperties")(context.physical, &context.memory);
             context.Function<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(context.device, family, 0u, &context.queue);
             VkCommandPoolCreateInfo pool{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+            pool.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
             pool.queueFamilyIndex = family;
             Check(context.Function<PFN_vkCreateCommandPool>("vkCreateCommandPool")(context.device, &pool, nullptr, &context.pool), "vkCreateCommandPool");
         } catch (...) { release(); throw; }
@@ -194,7 +195,6 @@ void QueueTargetByteWrite(const Context& context, Recorder& recorder, std::uint6
 std::vector<std::uint32_t> FetchShader(std::uint32_t width, std::uint32_t height, std::uint32_t fragments, bool arrayed, bool floating) {
     ShaderRecompiler::SpirvModule module;
     module.EmitCapability(spv::CapabilityShader);
-    if (arrayed) module.EmitCapability(spv::CapabilityImageMSArray);
     module.AddMemoryModel(spv::AddressingModelLogical, spv::MemoryModelGLSL450);
     const auto u32 = module.Type(spv::OpTypeInt, 32u, 0u);
     const auto i32 = module.Type(spv::OpTypeInt, 32u, 1u);
@@ -681,8 +681,10 @@ void CheckDepthTarget(Context context, VkFormat format, std::uint32_t fragments,
     TargetRefuses([&] { RequireNoMultisampleTarget(target.htileAddress + metadataBytes - 1u, 1u, "a DMA copy"); }, "sample-preserving guest publication");
     const auto words = DepthSampleWords(target);
     auto texture = CachedSampledTexture(context, words);
-    Require(texture != nullptr && CachedSampledTexture(context, words) == texture, "native depth sampled view was not reused");
-    Require(DepthSurfaceHolds(context, DecodeTextureResource(words), texture.get()), "native depth sampled view is not held by its attachment");
+    auto arrayTexture = CachedSampledTexture(context, words, VK_IMAGE_VIEW_TYPE_2D_ARRAY);
+    Require(texture != nullptr && CachedSampledTexture(context, words) == texture && texture->SampledViewRange(false).type == VK_IMAGE_VIEW_TYPE_2D, "native depth sampled view was not reused");
+    Require(arrayTexture != nullptr && arrayTexture != texture && CachedSampledTexture(context, words, VK_IMAGE_VIEW_TYPE_2D_ARRAY) == arrayTexture && arrayTexture->SampledViewRange(false).type == VK_IMAGE_VIEW_TYPE_2D_ARRAY, "native depth arrayed sampled view was not created as VK_IMAGE_VIEW_TYPE_2D_ARRAY or reused");
+    Require(DepthSurfaceHolds(context, DecodeTextureResource(words), texture.get()) && DepthSurfaceHolds(context, DecodeTextureResource(words), arrayTexture.get()), "native depth sampled view is not held by its attachment");
     const std::array<std::shared_ptr<Texture>, 1> sampled{texture};
     TargetRefuses([&] { RequireNoNativeDepthFeedback_nid_no_patch(context, target, sampled); }, "sampling a native multisampled depth target the draw attaches");
     const std::array<std::shared_ptr<Texture>, 1> unused{};
@@ -700,6 +702,7 @@ void CheckDepthTarget(Context context, VkFormat format, std::uint32_t fragments,
     const auto count = extent.width * extent.height * fragments;
     Buffer output(context, (count + 2u) * 16u, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     const Fetch fetch(context, *texture, output, FetchShader(extent.width, extent.height, fragments, false, true));
+    const Fetch arrayFetch(context, *arrayTexture, output, FetchShader(extent.width, extent.height, fragments, true, true));
     const auto check = [&](bool rendered, float offset) {
         output.Invalidate();
         for (std::uint32_t index = 0u; index < count; ++index) {
@@ -719,16 +722,30 @@ void CheckDepthTarget(Context context, VkFormat format, std::uint32_t fragments,
         batch.SubmitAndWait();
         check(false, 0.0f);
     }
+    std::memset(output.Bytes().data(), 0xa5, output.Bytes().size());
+    {
+        CommandBatch batch(context);
+        arrayFetch.Run(batch.Handle(), count);
+        RecordMemoryBarrier(context, batch.Handle(), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        batch.SubmitAndWait();
+        check(false, 0.0f);
+    }
     {
         const DepthRaster raster(context, target, view);
         for (const auto offset : {0.0f, 0.25f}) {
-            Require(CachedSampledTexture(context, words) == texture, "native sampled view changed between raster writes");
+            Require(CachedSampledTexture(context, words) == texture && CachedSampledTexture(context, words, VK_IMAGE_VIEW_TYPE_2D_ARRAY) == arrayTexture, "native sampled view changed between raster writes");
             std::memset(output.Bytes().data(), 0xa5, output.Bytes().size());
             CommandBatch batch(context);
             raster.Run(batch.Handle(), offset);
             fetch.Run(batch.Handle(), count);
             RecordMemoryBarrier(context, batch.Handle(), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
             batch.SubmitAndWait();
+            check(true, offset);
+            std::memset(output.Bytes().data(), 0xa5, output.Bytes().size());
+            CommandBatch arrayBatch(context);
+            arrayFetch.Run(arrayBatch.Handle(), count);
+            RecordMemoryBarrier(context, arrayBatch.Handle(), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+            arrayBatch.SubmitAndWait();
             check(true, offset);
         }
         if (clearing) {
@@ -811,6 +828,7 @@ void CheckDepthTarget(Context context, VkFormat format, std::uint32_t fragments,
     TargetRefuses([&] { CachedSampledTexture(context, words); }, "guest writes");
     TargetRefuses([&] { DepthSurfaceHolds(context, resource, texture.get()); }, "guest writes");
     texture.reset();
+    arrayTexture.reset();
     std::printf("Native depth format=%u samples=%u clear=%u: imported, rasterized twice, sampled and refused conflicts\n", static_cast<std::uint32_t>(format), fragments, one);
 }
 
@@ -919,6 +937,8 @@ void CheckEligibility(Context context) {
         auto invalid = target;
         invalid.address = unwatched.Address();
         Require(DepthSurfaceView(context, invalid) != VK_NULL_HANDLE, "unwatched sampling memory must preserve attachment rendering");
+        TargetRefuses([&] { lookup(invalid); }, "watched accessible guest memory");
+        NoteDepthMetadataFill(invalid.htileAddress, HtileMetadataBytes(extent), 0u);
         TargetRefuses([&] { lookup(invalid); }, "watched accessible guest memory");
         clear();
     }

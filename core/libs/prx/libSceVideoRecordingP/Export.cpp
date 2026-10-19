@@ -16,8 +16,29 @@ std::map<int32_t, std::vector<unsigned char>> g_info;
 
 extern "C" {
 
+void APS5_VABI _sceVideoRecordingQueryParam_nid_postfix(void* param) {
+ (void)param;
+ NotImplemented_nid_no_patch("_sceVideoRecordingQueryParam");
+}
+
 int APS5_VABI sceVideoRecordingClose(int discard) {
  (void)discard;
+ NotImplemented_nid_no_patch(__func__);
+ return 0;
+}
+
+int APS5_VABI sceVideoRecordingCloseByHandle(int handle, int discard) {
+ (void)handle;
+ (void)discard;
+ NotImplemented_nid_no_patch(__func__);
+ return 0;
+}
+
+int APS5_VABI sceVideoRecordingCopyBGRAtoNV12(void* dst, const void* src, uint32_t width, uint32_t height) {
+ (void)dst;
+ (void)src;
+ (void)width;
+ (void)height;
  NotImplemented_nid_no_patch(__func__);
  return 0;
 }
@@ -32,7 +53,39 @@ int APS5_VABI sceVideoRecordingGetInfo(int32_t info, void* data, size_t size) {
     return 0;
 }
 
+int APS5_VABI sceVideoRecordingGetInfoByHandle(int handle, int32_t info, void* data, size_t size) {
+ (void)handle;
+ (void)info;
+ (void)data;
+ (void)size;
+ NotImplemented_nid_no_patch(__func__);
+ return 0;
+}
+
 int APS5_VABI sceVideoRecordingGetStatus(void) {
+ NotImplemented_nid_no_patch(__func__);
+ return 0;
+}
+
+int APS5_VABI sceVideoRecordingGetSupportInfo(void* info) {
+ (void)info;
+ NotImplemented_nid_no_patch(__func__);
+ return 0;
+}
+
+int APS5_VABI sceVideoRecordingGetVideoOutMode(void* mode) {
+ (void)mode;
+ NotImplemented_nid_no_patch(__func__);
+ return 0;
+}
+
+int APS5_VABI sceVideoRecordingInit(void) {
+ NotImplemented_nid_no_patch(__func__);
+ return 0;
+}
+
+int APS5_VABI sceVideoRecordingInitialize(void* param) {
+ (void)param;
  NotImplemented_nid_no_patch(__func__);
  return 0;
 }
@@ -46,7 +99,47 @@ int APS5_VABI sceVideoRecordingOpen(const char* path, const void* param, void* h
  return 0;
 }
 
+int APS5_VABI sceVideoRecordingOpen2(const char* path, const void* param, void* heap, int heapSize) {
+ (void)path;
+ (void)param;
+ (void)heap;
+ (void)heapSize;
+ NotImplemented_nid_no_patch(__func__);
+ return 0;
+}
+
+int APS5_VABI sceVideoRecordingQueryHddSize2(const void* param) {
+ (void)param;
+ NotImplemented_nid_no_patch(__func__);
+ return 0;
+}
+
 int APS5_VABI sceVideoRecordingQueryMemSize(const void* param) {
+ (void)param;
+ NotImplemented_nid_no_patch(__func__);
+ return 0;
+}
+
+int APS5_VABI sceVideoRecordingQueryMemSize2(const void* param) {
+ (void)param;
+ NotImplemented_nid_no_patch(__func__);
+ return 0;
+}
+
+int APS5_VABI sceVideoRecordingRestModeProcessGetStatus(void* status) {
+ (void)status;
+ NotImplemented_nid_no_patch(__func__);
+ return 0;
+}
+
+int APS5_VABI sceVideoRecordingRestModeProcessStart(void* param) {
+ (void)param;
+ NotImplemented_nid_no_patch(__func__);
+ return 0;
+}
+
+int APS5_VABI sceVideoRecordingSendCommand(int cmd, const void* param) {
+ (void)cmd;
  (void)param;
  NotImplemented_nid_no_patch(__func__);
  return 0;
@@ -66,6 +159,11 @@ int APS5_VABI sceVideoRecordingStart(void) {
 }
 
 int APS5_VABI sceVideoRecordingStop(void) {
+ NotImplemented_nid_no_patch(__func__);
+ return 0;
+}
+
+int APS5_VABI sceVideoRecordingTerm(void) {
  NotImplemented_nid_no_patch(__func__);
  return 0;
 }

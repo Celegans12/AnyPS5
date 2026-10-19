@@ -22,6 +22,7 @@ struct SpirvTargetOptions {
     bool nonConstantImageOffsets = false;
     bool narrowSubgroupClock = false;
     bool float64DenormPreserve = false;
+    bool depthRangeRemap = false;
     bool registrationModules = false;
     bool fragmentDescriptorSet = false;
     bool float16DenormPreserve = false;
@@ -30,6 +31,8 @@ struct SpirvTargetOptions {
     bool fusedFma = false;
     // ShaderComputeStageInfo::singleWorkgroup of the request.
     bool singleWorkgroup = false;
+    bool robustBufferAccess2 = false;
+    bool float32FlushToZero = false;
 };
 
 struct SpirvEmitInfo {

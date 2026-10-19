@@ -1,3 +1,4 @@
+#include <atomic>
 #include <algorithm>
 #include <cstdint>
 #include <cstddef>
@@ -67,6 +68,7 @@ std::mutex g_keyboardMutex;
 std::set<int32_t> g_openKeyboards;
 std::mutex g_imeMutex;
 std::optional<Session> g_session;
+std::atomic<ImeHostTextSink> g_textSink{nullptr};
 
 void PanelSize(const Param& param, uint32_t* width, uint32_t* height) {
     const uint32_t scale = (param.option & OptionUseOver2K) != 0 ? 2 : 1;
@@ -284,13 +286,31 @@ int ValidateOpen(const Param* param, const ExtendedParam* extended) {
 extern "C" {
 
 void ImePublishInput_nid_postfix(const ImeHostInput& input) {
-    std::lock_guard lock(g_imeMutex);
-    if (g_session) Apply(*g_session, input);
+    {
+        std::lock_guard lock(g_imeMutex);
+        if (g_session) {
+            Apply(*g_session, input);
+            return;
+        }
+    }
+    const ImeHostTextSink sink = g_textSink.load();
+    if (sink == nullptr) return;
+    std::u16string units;
+    if (input.kind == ImeHostInputKind::Text) {
+        std::size_t size = 0;
+        while (size < sizeof(input.text) && input.text[size] != '\0') ++size;
+        units = DecodeUtf8(input.text, size);
+    }
+    sink(input.kind, units.data(), units.size());
 }
 
 bool ImeCapturesKeyboard_nid_postfix() {
     std::lock_guard lock(g_imeMutex);
-    return g_session.has_value();
+    return g_session.has_value() || g_textSink.load() != nullptr;
+}
+
+void ImeSetHostTextSink_nid_no_patch(ImeHostTextSink sink) {
+    g_textSink = sink;
 }
 
 int APS5_VABI sceImeOpen_nid_postfix(const Param* param, const ExtendedParam* extended) {
@@ -346,7 +366,7 @@ int APS5_VABI sceImeGetPanelSize(const Param* param, uint32_t* width, uint32_t* 
 
 int APS5_VABI sceImeKeyboardClose(int32_t user_id) {
  std::lock_guard lock(g_keyboardMutex);
- if (g_openKeyboards.erase(user_id) == 0) throw std::logic_error("sceImeKeyboardClose: keyboard not open for user " + std::to_string(user_id));
+ if (g_openKeyboards.erase(user_id) == 0) return ErrorNotOpened;
  return 0;
 }
 
@@ -369,7 +389,7 @@ int APS5_VABI sceImeKeyboardGetResourceId(int32_t user_id, KeyboardResourceIdArr
 int APS5_VABI sceImeKeyboardOpen(int32_t user_id, const KeyboardParam* param) {
  if (!param) APS5_INVALID_ARG_EX;
  std::lock_guard lock(g_keyboardMutex);
- if (!g_openKeyboards.insert(user_id).second) throw std::logic_error("sceImeKeyboardOpen: keyboard already open for user " + std::to_string(user_id));
+ if (!g_openKeyboards.insert(user_id).second) return ErrorBusy;
  return 0;
 }
 

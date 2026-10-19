@@ -41,7 +41,7 @@ constexpr VkBufferUsageFlags deviceUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | 
 
 }
 
-BufferPool::BufferPool(const Context& context) : device(context.device), unmap(context.Function<PFN_vkUnmapMemory>("vkUnmapMemory")), destroyBuffer(context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")), freeMemory(context.Function<PFN_vkFreeMemory>("vkFreeMemory")), allocateMemory(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")), mapMemory(context.Function<PFN_vkMapMemory>("vkMapMemory")), maxSlots(std::max<std::size_t>(1, std::min<std::size_t>(MaxSlots(), context.limits.maxMemoryAllocationCount / 6u))), vram(context) {
+BufferPool::BufferPool(const Context& context) : device(context.device), unmap(context.Function<PFN_vkUnmapMemory>("vkUnmapMemory")), destroyBuffer(context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")), freeMemory(context.Function<PFN_vkFreeMemory>("vkFreeMemory")), allocateMemory(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")), mapMemory(context.Function<PFN_vkMapMemory>("vkMapMemory")), maxSlots(std::max<std::size_t>(1, std::min<std::size_t>(MaxSlots(), context.limits.maxMemoryAllocationCount / 6u))), cacheReclaim(context.cacheReclaim), vram(context) {
     smallTier.budget = smallBudget;
     largeTier.budget = budget;
     deviceTier.budget = deviceBudget(context);
@@ -74,7 +74,7 @@ VkDeviceMemory BufferPool::AllocateMemory(const VkMemoryAllocateInfo& allocation
         }
     }
     if (exhausted(result)) {
-        if (const auto reclaim = cacheReclaim().load(std::memory_order_acquire); reclaim != nullptr) released = reclaim(ReclaimTarget(allocation.allocationSize));
+        if (cacheReclaim != nullptr) released = cacheReclaim(ReclaimTarget(allocation.allocationSize));
         if (released == 0 && result == VK_ERROR_OUT_OF_DEVICE_MEMORY) released = ReclaimTextureMemory(device, allocation.allocationSize);
         if (released != 0) {
             reclaimed += trim();
@@ -91,9 +91,10 @@ VkDeviceMemory BufferPool::AllocateMemory(const VkMemoryAllocateInfo& allocation
         ++attempts;
         if (result == VK_SUCCESS) {
             if (allocatedType != nullptr) *allocatedType = *hostType;
-            static std::atomic<std::uint64_t> placements{0};
+            static std::atomic<std::uint64_t> placements{0}, placedBytes{0};
             const auto count = placements.fetch_add(1, std::memory_order_relaxed) + 1;
-            if (count <= 5 || (count & (count - 1)) == 0) std::fprintf(stderr, "[bufferpool] %s: memory type %u is out of device memory for %llu bytes after reclaiming %llu; placed in host memory type %u until it is released; %llu such allocations\n", operation, allocation.memoryTypeIndex, static_cast<unsigned long long>(allocation.allocationSize), static_cast<unsigned long long>(reclaimed), *hostType, static_cast<unsigned long long>(count));
+            const auto total = placedBytes.fetch_add(allocation.allocationSize, std::memory_order_relaxed) + allocation.allocationSize;
+            if (count <= 5 || (count & (count - 1)) == 0) std::fprintf(stderr, "[bufferpool] %s: memory type %u is out of device memory for %llu bytes after reclaiming %llu and releasing %llu; placed in host memory type %u until it is released; %llu such allocations, %llu MiB\n", operation, allocation.memoryTypeIndex, static_cast<unsigned long long>(allocation.allocationSize), static_cast<unsigned long long>(reclaimed), static_cast<unsigned long long>(released), *hostType, static_cast<unsigned long long>(count), static_cast<unsigned long long>(total >> 20u));
             return memory;
         }
     }
@@ -174,15 +175,6 @@ VkDeviceMemory AllocateDeviceMemory(const Context& context, VkMemoryAllocateInfo
     }
 }
 
-std::atomic<BufferPool::CacheReclaim>& BufferPool::cacheReclaim() {
-    static std::atomic<CacheReclaim> reclaim{nullptr};
-    return reclaim;
-}
-
-void BufferPool::SetCacheReclaim(CacheReclaim reclaim) {
-    cacheReclaim().store(reclaim, std::memory_order_release);
-}
-
 VkDeviceSize BufferPool::ReclaimTarget(VkDeviceSize bytes) {
     return bytes + std::max<VkDeviceSize>(bytes, VkDeviceSize{256} << 20u);
 }
@@ -218,7 +210,11 @@ SlabSlot BufferPool::TakeSlot(const Context& context, std::uint32_t memoryType, 
         if (!slab.available.empty()) return takeFrom(*slab.available.back(), slab);
     }
     const auto blockBytes = SlabBlockBytes(capacity);
-    auto block = std::make_unique<SlabBlock>();
+    const auto release = [this](SlabBlock* block) noexcept {
+        if (block->memory != VK_NULL_HANDLE) freeBlock(*block);
+        delete block;
+    };
+    std::unique_ptr<SlabBlock, decltype(release)> block(new SlabBlock, release);
     block->slotBytes = capacity;
     block->slab = key;
     VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
@@ -233,7 +229,6 @@ SlabSlot BufferPool::TakeSlot(const Context& context, std::uint32_t memoryType, 
     if ((context.memory.memoryTypes[memoryType].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) {
         void* mapping = nullptr;
         const auto mapped = mapMemory(device, block->memory, 0, VK_WHOLE_SIZE, 0, &mapping);
-        if (mapped != VK_SUCCESS) freeMemory(device, block->memory, nullptr);
         Check(mapped, "vkMapMemory buffer slab");
         block->mapping = static_cast<std::byte*>(mapping);
     }
@@ -242,8 +237,10 @@ SlabSlot BufferPool::TakeSlot(const Context& context, std::uint32_t memoryType, 
     for (std::uint32_t index = slots; index-- != 0;) block->free.push_back(index);
     std::lock_guard lock(slabMutex);
     auto& slab = slabs[key];
+    if (slab.available.size() == slab.available.capacity()) slab.available.reserve(std::max<std::size_t>(1, slab.available.capacity() * 2));
     auto& inserted = *block;
-    slabBlocks.emplace(inserted.memory, std::move(block));
+    const auto owner = slabBlocks.try_emplace(inserted.memory).first;
+    owner->second.reset(block.release());
     slab.available.push_back(&inserted);
     ++slab.emptyBlocks;
     return takeFrom(*slab.available.back(), slab);
@@ -347,7 +344,7 @@ VkBufferUsageFlags BufferPool::Usage(VkBufferUsageFlags usage, VkMemoryPropertyF
 }
 
 BufferPool::Tier& BufferPool::tierFor(std::size_t capacity, VkMemoryPropertyFlags properties) {
-    if (DeviceTiered(properties)) return deviceTier;
+    if (DeviceTiered(properties) && (sharedTiers() || capacity >= classLimit)) return deviceTier;
     return !sharedTiers() && capacity < classLimit ? smallTier : largeTier;
 }
 
@@ -483,8 +480,8 @@ std::shared_ptr<BufferPool> GetBufferPool(const Context& context) {
     return context.bufferPool;
 }
 
-VkDeviceMemory AllocateAttachmentMemory(const Context& context, const VkMemoryAllocateInfo& allocation, std::uint32_t mask, const char* operation) {
-    return GetBufferPool(context)->AllocateMemory(allocation, operation, context.HostMemoryType(mask));
+VkDeviceMemory AllocateImageMemory(const Context& context, const VkMemoryAllocateInfo& allocation, std::uint32_t mask, const char* operation) {
+    return GetBufferPool(context)->AllocateMemory(allocation, operation, context.RefusedDeviceMemoryFallback(mask, allocation.memoryTypeIndex));
 }
 
 }

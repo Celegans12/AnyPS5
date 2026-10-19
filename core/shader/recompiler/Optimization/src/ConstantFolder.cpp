@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <optional>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -587,24 +588,23 @@ bool forwardsWord(const IrUse& use) {
     return use.user->Opcode() == IrOpcode::Identity || use.user->Opcode() == IrOpcode::Phi || (use.user->Opcode() == IrOpcode::SelectU32 && use.operand != 0u);
 }
 
-void collectReaders(IrValue& value, std::vector<IrUse>& readers, std::vector<const IrValue*>& visited) {
-    if (std::ranges::find(visited, &value) != visited.end()) {
-        return;
-    }
-    visited.push_back(&value);
-    const std::vector<IrUse> uses = value.OperandUses();
-    for (const IrUse& use : uses) {
-        if (forwardsWord(use)) {
-            collectReaders(*use.user, readers, visited);
-        } else {
+void collectReaders(IrValue& value, std::vector<IrUse>& readers) {
+    std::unordered_set<const IrValue*> visited{&value};
+    std::vector<std::pair<std::vector<IrUse>, std::size_t>> pending;
+    pending.emplace_back(value.OperandUses(), 0u);
+    while (!pending.empty()) {
+        auto& [uses, next] = pending.back();
+        if (next == uses.size()) {
+            pending.pop_back();
+            continue;
+        }
+        const IrUse use = uses[next++];
+        if (!forwardsWord(use)) {
             readers.push_back(use);
+        } else if (visited.insert(use.user).second) {
+            pending.emplace_back(use.user->OperandUses(), 0u);
         }
     }
-}
-
-void collectReaders(IrValue& value, std::vector<IrUse>& readers) {
-    std::vector<const IrValue*> visited;
-    collectReaders(value, readers, visited);
 }
 
 constexpr std::array<std::pair<std::uint32_t, std::uint32_t>, 2> packedFields {{{8u, 4u}, {16u, 13u}}};
@@ -634,6 +634,10 @@ IrValue& insertBefore(IrProgram& program, IrValue& next, IrOpcode opcode, IrValu
 
 IrValue& insertBuiltin(IrProgram& program, IrBuilder& builder, IrValue& next, StageInputKind kind) {
     return insertBefore(program, next, IrOpcode::GetBuiltin, builder.Constant(static_cast<std::uint32_t>(kind)), builder.Constant(0u));
+}
+
+IrValue& sampleNumber(IrProgram& program, IrBuilder& builder, IrValue& next) {
+    return program.Metadata().pixelIteratesSamples ? insertBuiltin(program, builder, next, StageInputKind::SampleId) : builder.Constant(0u);
 }
 
 void lowerPackedAncillary(IrProgram& program, IrBuilder& builder, IrValue& ancillary) {
@@ -684,7 +688,7 @@ void lowerPackedAncillary(IrProgram& program, IrBuilder& builder, IrValue& ancil
     const auto field = [&](std::size_t index) -> IrValue& {
         if (fields[index] == nullptr && index == 1u) fields[index] = &insertBefore(program, ancillary, IrOpcode::IMul32, insertBuiltin(program, builder, ancillary, StageInputKind::Layer), insertBuiltin(program, builder, ancillary, StageInputKind::LayerExported));
         if (fields[index] == nullptr) {
-            fields[index] = &insertBuiltin(program, builder, ancillary, StageInputKind::SampleId);
+            fields[index] = &sampleNumber(program, builder, ancillary);
         }
         return *fields[index];
     };
@@ -1127,6 +1131,23 @@ void ConstantFolder::Fold(IrProgram& program, std::span<IrBlock* const> blocks) 
             const auto success = tryFoldValue(program, *inst, facts);
         }
     }
+    std::vector<IrValue*> phis;
+    for (IrBlock* block : blocks) {
+        for (IrValue* inst : block->Instructions()) {
+            if (inst->Opcode() == IrOpcode::Phi) {
+                phis.push_back(inst);
+            }
+        }
+    }
+    bool folded = true;
+    while (folded) {
+        folded = false;
+        for (IrValue* phi : phis) {
+            if (phi->Opcode() == IrOpcode::Phi && foldPhi(*phi)) {
+                folded = true;
+            }
+        }
+    }
     std::vector<IrValue*> words;
     for (IrBlock* block : blocks) {
         for (IrValue* inst : block->Instructions()) {
@@ -1145,6 +1166,22 @@ void ConstantFolder::Fold(IrProgram& program) const {
     Fold(program, program.BlockOrder());
 }
 
+bool ConstantFolder::FoldVertexLaneBounds(IrProgram& program, std::uint32_t hostSubgroupSize, std::uint32_t spirvVersion) const {
+    if (program.Resources().stage != IrShaderStage::Vertex || hostSubgroupSize != 32u || spirvVersion < 0x00010000u || spirvVersion >= 0x00010600u) return false;
+    bool changed = false;
+    for (IrBlock* block : program.BlockOrder()) {
+        for (IrValue* value : block->Instructions()) {
+            if (value->Opcode() != IrOpcode::SelectU32 || value->ArgumentCount() != 3u) continue;
+            const auto& half = resolveArg(*value, 0);
+            auto& low = resolveArg(*value, 1);
+            if (half.Opcode() != IrOpcode::ULessThan32 || half.ArgumentCount() != 2u || !isLaneIndex(resolveArg(half, 0)) || !isImmediateU32(resolveArg(half, 1), 32u) || !isImmediate(low, IrType::U32) || !isImmediate(resolveArg(*value, 2), IrType::U32)) continue;
+            replaceWith(*value, low);
+            changed = true;
+        }
+    }
+    return changed;
+}
+
 bool ConstantFolder::ComposePackedAncillary(IrProgram& program) const {
     std::vector<IrValue*> words;
     for (IrBlock* block : program.BlockOrder()) {
@@ -1157,7 +1194,7 @@ bool ConstantFolder::ComposePackedAncillary(IrProgram& program) const {
     IrBuilder builder(program);
     for (IrValue* word : words) {
         IrValue& primitive = insertBuiltin(program, builder, *word, StageInputKind::RasterPrimitive);
-        IrValue& sample = insertBefore(program, *word, IrOpcode::ShiftLeftLogical32, insertBuiltin(program, builder, *word, StageInputKind::SampleId), builder.Constant(8u));
+        IrValue& sample = insertBefore(program, *word, IrOpcode::ShiftLeftLogical32, sampleNumber(program, builder, *word), builder.Constant(8u));
         IrValue& exportedLayer = insertBefore(program, *word, IrOpcode::IMul32, insertBuiltin(program, builder, *word, StageInputKind::Layer), insertBuiltin(program, builder, *word, StageInputKind::LayerExported));
         IrValue& layer = insertBefore(program, *word, IrOpcode::ShiftLeftLogical32, exportedLayer, builder.Constant(16u));
         IrValue& fields = insertBefore(program, *word, IrOpcode::BitwiseOr32, sample, layer);

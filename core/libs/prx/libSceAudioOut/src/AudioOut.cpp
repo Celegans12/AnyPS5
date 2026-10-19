@@ -1,5 +1,3 @@
-#include <cstdlib>
-#include <cstdio>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -26,6 +24,7 @@ static constexpr int PORT_TYPE_VOICE = 2;
 static constexpr int PORT_TYPE_PERSONAL = 3;
 static constexpr int PORT_TYPE_PADSPK = 4;
 static constexpr int PORT_TYPE_EX = 6;
+static constexpr int PORT_TYPE_SYS = 7;
 static constexpr int PORT_TYPE_VIBRATION = 10;
 static constexpr int PORT_TYPE_AUDIO3D = 126;
 static constexpr int PORT_TYPE_AUX = 127;
@@ -46,6 +45,11 @@ static constexpr std::uint32_t EX_CONFIGURE_MODE_DEFAULT = 0xFF;
 static constexpr std::uint32_t EX_CONFIGURE_TARGET_DEFAULT = 0xFF;
 static constexpr int ERROR_EX_INVALID_MODE = -2144993259;
 static constexpr int ERROR_EX_INVALID_CONTROL = -2144960503;
+static constexpr std::uint32_t SYS_OPEN_MODE_TRUEHD = 5;
+static constexpr std::uint32_t SYS_CONFIGURE_TYPE_HDMI = 1;
+static constexpr std::uint32_t SYS_CONFIGURE_TARGET_HDMI = 1;
+static constexpr std::uint32_t SYS_PORT_SAMPLES = 1024;
+static constexpr std::uint32_t SYS_PORT_FRAME_RATE = 192000;
 
 enum class Format {
     Unknown,
@@ -94,6 +98,14 @@ static std::uint32_t bytesPerSample(Format f) {
     return formatIsFloat(f) ? sizeof(float) : sizeof(std::int16_t);
 }
 
+static std::uint32_t checkedBufferSize(std::uint32_t frames, std::uint32_t channels, std::uint32_t bps) {
+    const std::uint64_t size = static_cast<std::uint64_t>(frames) * channels * bps;
+    if (size > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
+        throw std::runtime_error("checkedBufferSize: audio buffer size overflows");
+    }
+    return static_cast<std::uint32_t>(size);
+}
+
 struct Port {
     bool used = false;
     int type = 0;
@@ -110,7 +122,7 @@ struct Port {
 };
 
 static std::mutex g_mutex;
-static std::mutex g_outputMutex;
+static std::array<std::mutex, PORTS_MAX> g_outputMutexes;
 static Port g_ports[PORTS_MAX];
 static bool g_sdlInitialized = false;
 
@@ -160,7 +172,7 @@ static const void* prepareBuffer(const Port& port, const void* data, std::vector
     const auto frames = port.samplesNum;
     const auto ch = static_cast<std::uint32_t>(port.channels);
     const auto bps = bytesPerSample(port.format);
-    const auto size = frames * ch * bps;
+    const auto size = checkedBufferSize(frames, ch, bps);
 
     bool volumeChanged = port.mixLevel != DEFAULT_VOLUME;
     for (std::uint32_t i = 0; i < ch; i++) {
@@ -227,8 +239,8 @@ static void queueAudio(Port& port, const void* data, std::unique_lock<std::mutex
 
     std::vector<std::uint8_t> prepareBuf;
     const void* prepared = prepareBuffer(port, data, prepareBuf);
-    const std::uint32_t preparedSize = port.samplesNum *
-        static_cast<std::uint32_t>(port.channels) * bytesPerSample(port.format);
+    const std::uint32_t preparedSize = checkedBufferSize(port.samplesNum,
+        static_cast<std::uint32_t>(port.channels), bytesPerSample(port.format));
 
     const void* queueData = prepared;
     const std::uint32_t queueSize = preparedSize;
@@ -300,7 +312,7 @@ static int allocatePort(int type, std::uint32_t len, std::uint32_t freq, Format 
             for (int c = 0; c < port.channels; c++) {
                 port.volume[c] = DEFAULT_VOLUME;
             }
-            if (type != PORT_TYPE_VIBRATION && type != PORT_TYPE_EX) {
+            if (type != PORT_TYPE_VIBRATION && type != PORT_TYPE_EX && type != PORT_TYPE_SYS) {
                 openDevice(port);
             }
             static const bool trace = std::getenv("APS5_TRACE_AUDIOOUT") != nullptr;
@@ -351,7 +363,8 @@ int APS5_VABI sceAudioOutOpen(int userId, int type, int index, std::uint32_t len
 }
 
 int APS5_VABI sceAudioOutClose(int handle) {
-    std::lock_guard<std::mutex> outputLock(g_outputMutex);
+    if (handle <= 0 || handle > PORTS_MAX) return -2144993277;
+    std::lock_guard<std::mutex> outputLock(g_outputMutexes[handle - 1]);
     std::lock_guard<std::mutex> lock(g_mutex);
     Port* port = getPort(handle);
     if (port == nullptr) {
@@ -364,7 +377,8 @@ int APS5_VABI sceAudioOutClose(int handle) {
 
 int APS5_VABI sceAudioOutOutput(int handle, const void* ptr) try {
     const AudioOutCall call;
-    std::lock_guard<std::mutex> outputLock(g_outputMutex);
+    if (handle <= 0 || handle > PORTS_MAX) return -2144993277;
+    std::lock_guard<std::mutex> outputLock(g_outputMutexes[handle - 1]);
     std::unique_lock<std::mutex> lock(g_mutex);
     Port* port = getPort(handle);
     if (port == nullptr) {
@@ -383,12 +397,20 @@ int APS5_VABI sceAudioOutOutput(int handle, const void* ptr) try {
 }
 
 int APS5_VABI sceAudioOutOutputs(AudioOutOutputParam* param, std::uint32_t num) try {
+    const AudioOutCall call;
     if (param == nullptr || num == 0) {
         return -2144993276;
     }
 
-    const AudioOutCall call;
-    std::lock_guard<std::mutex> outputLock(g_outputMutex);
+    std::array<bool, PORTS_MAX> selected{};
+    for (std::uint32_t i = 0; i < num; ++i) {
+        if (param[i].handle <= 0 || param[i].handle > PORTS_MAX) return -2144993277;
+        selected[param[i].handle - 1] = true;
+    }
+    std::array<std::unique_lock<std::mutex>, PORTS_MAX> outputLocks;
+    for (int index = 0; index < PORTS_MAX; ++index) {
+        if (selected[index]) outputLocks[index] = std::unique_lock<std::mutex>(g_outputMutexes[index]);
+    }
     std::unique_lock<std::mutex> lock(g_mutex);
 
     for (std::uint32_t i = 0; i < num; i++) {
@@ -502,13 +524,33 @@ int APS5_VABI sceAudioOutDeviceIdOpen() {
     return 0;
 }
 
-int APS5_VABI sceAudioOutSysClose() {
-    NotImplemented_nid_no_patch(__func__);
+int APS5_VABI sceAudioOutSysClose(int handle) {
+    if (handle <= 0 || handle > PORTS_MAX) {
+        throw std::runtime_error("sceAudioOutSysClose: handle " + std::to_string(handle) + " is not an open Sys port");
+    }
+    std::lock_guard<std::mutex> outputLock(g_outputMutexes[handle - 1]);
+    std::lock_guard<std::mutex> lock(g_mutex);
+    Port* port = getPort(handle);
+    if (port == nullptr || port->type != PORT_TYPE_SYS) {
+        throw std::runtime_error("sceAudioOutSysClose: handle " + std::to_string(handle) + " is not an open Sys port");
+    }
+    *port = Port{};
     return 0;
 }
 
-int APS5_VABI sceAudioOutSysConfigureOutput() {
-    NotImplemented_nid_no_patch(__func__);
+int APS5_VABI sceAudioOutSysConfigureOutput(int type, std::uint64_t flags, std::uint32_t mode, std::uint32_t target, std::uint64_t option) {
+    if (type != SYS_CONFIGURE_TYPE_HDMI) {
+        throw std::runtime_error("sceAudioOutSysConfigureOutput: output type " + std::to_string(type) + " not supported");
+    }
+    if (flags != 0 || option != 0) {
+        throw std::runtime_error("sceAudioOutSysConfigureOutput: flags " + std::to_string(flags) + " and option " + std::to_string(option) + " not supported");
+    }
+    if (mode != SYS_OPEN_MODE_TRUEHD) {
+        throw std::runtime_error("sceAudioOutSysConfigureOutput: mode " + std::to_string(mode) + " not supported");
+    }
+    if (target != SYS_CONFIGURE_TARGET_HDMI) {
+        throw std::runtime_error("sceAudioOutSysConfigureOutput: target " + std::to_string(target) + " not supported");
+    }
     return 0;
 }
 
@@ -526,9 +568,12 @@ int APS5_VABI sceAudioOutSysGetHdmiMonitorInfo(int type, void* info, std::uint32
     return 0;
 }
 
-int APS5_VABI sceAudioOutSysOpen() {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+int APS5_VABI sceAudioOutSysOpen(int userId, std::uint32_t mode) {
+    (void)userId;
+    if (mode != SYS_OPEN_MODE_TRUEHD) {
+        throw std::runtime_error("sceAudioOutSysOpen: mode " + std::to_string(mode) + " not supported");
+    }
+    return allocatePort(PORT_TYPE_SYS, SYS_PORT_SAMPLES, SYS_PORT_FRAME_RATE, Format::S16_8Ch);
 }
 
 int APS5_VABI sceAudioOutSetMixLevelPadSpk(int handle, int mixLevel) {
@@ -551,7 +596,10 @@ int APS5_VABI sceAudioOutSetMixLevelPadSpk(int handle, int mixLevel) {
 }
 
 int APS5_VABI sceAudioOutExClose(int handle) {
-    std::lock_guard<std::mutex> outputLock(g_outputMutex);
+    if (handle <= 0 || handle > PORTS_MAX) {
+        throw std::runtime_error("sceAudioOutExClose: handle " + std::to_string(handle) + " is not an open Ex port");
+    }
+    std::lock_guard<std::mutex> outputLock(g_outputMutexes[handle - 1]);
     std::lock_guard<std::mutex> lock(g_mutex);
     Port* port = getPort(handle);
     if (port == nullptr || port->type != PORT_TYPE_EX) {

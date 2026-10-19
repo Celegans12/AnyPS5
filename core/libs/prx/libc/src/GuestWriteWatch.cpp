@@ -90,6 +90,13 @@ public:
         return covers(begin, end);
     }
 
+    bool Overlaps(std::uintptr_t begin, std::uintptr_t end) {
+        if (!Available()) return false;
+        std::shared_lock lock(_lock);
+        const auto next = _ranges.upper_bound(begin);
+        return (next != _ranges.begin() && std::prev(next)->second > begin) || (next != _ranges.end() && next->first < end);
+    }
+
     bool Collect(std::uintptr_t begin, std::uintptr_t end, void (*written)(void*, std::uintptr_t, std::uintptr_t), void* context) {
         if (!Available()) return false;
         begin &= ~(PageBytes - 1);
@@ -330,9 +337,10 @@ public:
     }
 
     void Register(std::uintptr_t begin, std::uintptr_t end) {
+        if (!_available || end <= begin) return;
         begin = pageStart(begin);
         end = pageEnd(end);
-        if (!_available || end <= begin) return;
+        if (end <= begin) return;
         std::vector<std::uint8_t> pages((end - begin) / _page, Written | Fresh);
         std::vector<bool> queried(pages.size(), false);
         const Lock lock(_lock);
@@ -364,9 +372,10 @@ public:
     }
 
     bool Unregister(std::uintptr_t begin, std::uintptr_t end) {
+        if (!_available || end <= begin) return false;
         begin = pageStart(begin);
         end = pageEnd(end);
-        if (!_available || end <= begin) return false;
+        if (end <= begin) return false;
         const Lock lock(_lock);
         return erase(begin, end);
     }
@@ -375,6 +384,13 @@ public:
         if (!_available) return false;
         const Lock lock(_lock);
         return covers(begin, end);
+    }
+
+    bool Overlaps(std::uintptr_t begin, std::uintptr_t end) {
+        if (!_available) return false;
+        const Lock lock(_lock);
+        const auto next = _ranges.upper_bound(begin);
+        return (next != _ranges.begin() && std::prev(next)->second.end > begin) || (next != _ranges.end() && next->first < end);
     }
 
     enum class Take { All, Armed, Fresh };
@@ -407,9 +423,10 @@ public:
     }
 
     void ProtectionChanged(std::uintptr_t begin, std::uintptr_t end, int protection) {
+        if (!_available || end <= begin) return;
         begin = pageStart(begin);
         end = pageEnd(end);
-        if (!_available || end <= begin) return;
+        if (end <= begin) return;
         const Lock lock(_lock);
         forEachPage(begin, end, [&](std::uintptr_t, std::uint8_t& state) {
             state = static_cast<std::uint8_t>(Written | (state & Fresh) | (protection & ProtectionMask));
@@ -417,9 +434,10 @@ public:
     }
 
     void BeginHostWrite(std::uintptr_t begin, std::uintptr_t end) {
+        if (!_available || end <= begin) return;
         begin = pageStart(begin);
         end = pageEnd(end);
-        if (!_available || end <= begin) return;
+        if (end <= begin) return;
         const Lock lock(_lock);
         _hostWrites.emplace_back(begin, end);
         forEachPage(begin, end, [&](std::uintptr_t page, std::uint8_t& state) {
@@ -429,9 +447,10 @@ public:
     }
 
     void EndHostWrite(std::uintptr_t begin, std::uintptr_t end) {
+        if (!_available || end <= begin) return;
         begin = pageStart(begin);
         end = pageEnd(end);
-        if (!_available || end <= begin) return;
+        if (end <= begin) return;
         const Lock lock(_lock);
         const auto found = std::find(_hostWrites.begin(), _hostWrites.end(), std::pair{begin, end});
         if (found != _hostWrites.end()) _hostWrites.erase(found);
@@ -648,6 +667,16 @@ bool GuestWriteWatchUnregister_nid_postfix(const void* pointer, std::size_t byte
 bool GuestWriteWatchCovers_nid_postfix(std::uintptr_t address, std::size_t bytes) {
 #ifdef APS5_GUEST_WRITE_WATCH
     return bytes != 0 && address + bytes > address && Watch::Get().Covers(address, address + bytes);
+#else
+    static_cast<void>(address);
+    static_cast<void>(bytes);
+    return false;
+#endif
+}
+
+bool GuestWriteWatchOverlaps_nid_postfix(std::uintptr_t address, std::size_t bytes) {
+#ifdef APS5_GUEST_WRITE_WATCH
+    return bytes != 0 && address + bytes > address && Watch::Get().Overlaps(address, address + bytes);
 #else
     static_cast<void>(address);
     static_cast<void>(bytes);

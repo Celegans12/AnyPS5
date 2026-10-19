@@ -1,4 +1,5 @@
 #include "prx/libc/include/general/VabiMacros.hpp"
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <initializer_list>
@@ -7,6 +8,7 @@
 #include <vector>
 #ifndef _WIN32
 #include <sys/resource.h>
+#include <unistd.h>
 #endif
 
 struct ResourceLimit {
@@ -75,6 +77,25 @@ static void CheckOpenFileLimit() {
     Require(host.rlim_cur == RLIM_INFINITY ? limit.rlim_cur == GUEST_RLIM_INFINITY : limit.rlim_cur == static_cast<std::int64_t>(host.rlim_cur));
 #endif
     Require(setrlimit_nid_postfix(GUEST_RLIMIT_NOFILE, &limit) == 0);
+    const ResourceLimit lowered{limit.rlim_max > 1 ? limit.rlim_max - 1 : 1, limit.rlim_max};
+    Require(setrlimit_nid_postfix(GUEST_RLIMIT_NOFILE, &lowered) == 0);
+    const ResourceLimit updated = GuestLimit(GUEST_RLIMIT_NOFILE);
+    Require(updated.rlim_cur == lowered.rlim_cur);
+    Require(updated.rlim_max == lowered.rlim_max);
+    Require(setrlimit_nid_postfix(GUEST_RLIMIT_NOFILE, &limit) == 0);
+    const ResourceLimit restored = GuestLimit(GUEST_RLIMIT_NOFILE);
+    Require(restored.rlim_cur == limit.rlim_cur);
+    Require(restored.rlim_max == limit.rlim_max);
+    if (limit.rlim_max != GUEST_RLIM_INFINITY) {
+        const ResourceLimit raised{limit.rlim_cur, limit.rlim_max + 1};
+        bool raisedRejected = false;
+        try {
+            setrlimit_nid_postfix(GUEST_RLIMIT_NOFILE, &raised);
+        } catch (const std::runtime_error&) {
+            raisedRejected = true;
+        }
+        Require(raisedRejected);
+    }
 }
 
 static void RequireError(int resource, ResourceLimit* limit, int error) {
@@ -155,12 +176,14 @@ int main() {
          }) {
         RequireUnsupported(resource);
     }
-    bool unsupported = false;
-    try {
-        getdtablesize_nid_postfix();
-    } catch (const std::runtime_error&) {
-        unsupported = true;
-    }
-    Require(unsupported);
+    const ResourceLimit nofile = GuestLimit(GUEST_RLIMIT_NOFILE);
+    const int tableSize = getdtablesize_nid_postfix();
+    std::int64_t expectedTableSize = nofile.rlim_cur;
+#ifndef _WIN32
+    expectedTableSize = std::min(expectedTableSize, static_cast<std::int64_t>(::getdtablesize()));
+#endif
+    if (expectedTableSize > std::numeric_limits<int>::max())
+        expectedTableSize = std::numeric_limits<int>::max();
+    Require(tableSize == static_cast<int>(expectedTableSize));
     CheckOpenFileLimit();
 }

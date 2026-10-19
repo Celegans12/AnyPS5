@@ -7,6 +7,8 @@ struct SocketOptionState {
     int reportedError = 0;
     bool nonblocking = false;
     bool noSignal = false;
+    std::int64_t sendTimeout = 0;
+    std::int64_t receiveTimeout = 0;
 };
 
 int SetSocketLevelOption(std::uintptr_t native, SocketOptionState& state, int option, const void* value, std::uint32_t length);

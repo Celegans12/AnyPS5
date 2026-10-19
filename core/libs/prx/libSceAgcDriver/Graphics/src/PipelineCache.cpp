@@ -163,6 +163,7 @@ void PipelineCache::load(std::vector<std::byte>& initialData) {
     loadedBytes = initialData.size();
     settledBytes = initialData.size();
     settledFile = file.header;
+    holdsFile = true;
     std::fprintf(stderr, "[pipeline-cache] loaded %.1f KiB from %s\n", static_cast<double>(initialData.size()) / 1024.0, path.string().c_str());
 }
 
@@ -178,7 +179,7 @@ bool PipelineCache::save(bool final) {
     }
     const auto onDisk = readHeader();
     if (liveBytes == settledBytes && onDisk == settledFile) return true;
-    const bool fileUnchanged = settledFile.has_value() && onDisk == settledFile;
+    const bool fileUnchanged = holdsFile && settledFile.has_value() && onDisk == settledFile;
     const auto started = std::chrono::steady_clock::now();
     const auto settle = [&](const std::optional<FileHeader>& file) {
         settledBytes = liveBytes;
@@ -252,6 +253,10 @@ bool PipelineCache::save(bool final) {
     settle(header);
     if (final || profiling()) std::fprintf(stderr, "[pipeline-cache] saved %.1f KiB to %s in %.1f ms%s%s\n", static_cast<double>(size) / 1024.0, path.string().c_str(), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count(), merged != VK_NULL_HANDLE ? " (merged with the file)" : "", final ? " (teardown)" : "");
     return true;
+}
+
+void PipelineCache::SaveNow() {
+    save(false);
 }
 
 void PipelineCache::run() {

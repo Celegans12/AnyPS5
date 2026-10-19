@@ -15,6 +15,7 @@
 #include <codegen/x86/ScalarCompareOperands.hpp>
 #include <codegen/x86/WideStoreLowering.hpp>
 #include <codegen/x86/WideStoreOperands.hpp>
+#include <codegen/x86/AndnLowering.hpp>
 #include <codegen/x86/X64InstructionDecoder.hpp>
 #include <codegen/x86/X64OpcodeConstants.hpp>
 #include <codegen/CodegenException.hpp>
@@ -133,6 +134,13 @@ std::vector<std::uint8_t> _rdpidReplacement(const DecodedInstruction& instr) {
     return bytes;
 }
 
+std::vector<std::uint8_t> _rdtscpReplacement(const DecodedInstruction& instr) {
+    std::vector<std::uint8_t> bytes(instr.Data, instr.Data + instr.Length);
+    bytes.push_back(0xB9);
+    bytes.insert(bytes.end(), 4, 0);
+    return bytes;
+}
+
 bool _validWait(const DecodedInstruction& instr) {
     const auto opcode = instr.Data + instr.OpcodeOffset();
     return instr.Length <= kMaxInstructionLength && std::find(instr.Data, opcode, X64OpcodeConstants::PrefixLock) == opcode;
@@ -217,6 +225,8 @@ Amd64OnlyMatch Amd64OnlyInstructionMatcher::_matchClzero(const DecodedInstructio
 std::optional<Amd64OnlyMatch> Amd64OnlyInstructionMatcher::_matchRosetta(const DecodedInstruction& instr, std::span<const std::uint8_t> trailing) const {
     if (_target != Amd64OnlyTarget::Rosetta)
         return std::nullopt;
+    if (const auto andn = DecodeAndn(instr.Data, instr.Length))
+        return _trampoline("ANDN", instr.Length, _outOfLine(instr.Length, trailing, [&](StubBodyBuilder& body) { EmitAndn(body, *andn); }));
     if (instr.IsRdseed()) {
         std::vector<std::uint8_t> replacement(instr.Data, instr.Data + instr.Length);
         replacement[instr.OpcodeOffset() + 2] &= static_cast<std::uint8_t>(~(1u << X64OpcodeConstants::ModRmRegShift));
@@ -226,6 +236,8 @@ std::optional<Amd64OnlyMatch> Amd64OnlyInstructionMatcher::_matchRosetta(const D
         return _inPlace(kClwb, instr.Length, {});
     if (instr.IsRdpid())
         return _trampoline(kRdpid.Name, instr.Length, _outOfLine(instr.Length, trailing, [&](StubBodyBuilder& body) { body.Raw(_rdpidReplacement(instr)); }), true);
+    if (instr.IsRdtscp())
+        return _trampoline(kRdtscp.Name, instr.Length, _outOfLine(instr.Length, trailing, [&](StubBodyBuilder& body) { body.Raw(_rdtscpReplacement(instr)); }), true);
     if (const auto wide = DecodeVexWideStore(instr.Data, instr.Length))
         return _trampoline(kWideStore.Name, instr.Length, _outOfLine(instr.Length, trailing, [&](StubBodyBuilder& body) { _wideStoreLowering.EmitOutOfLine(body, *wide); }), false, true);
     if (const auto compare = DecodeScalarCompare(instr.Data, instr.Length))
@@ -260,6 +272,14 @@ const char* Amd64OnlyInstructionMatcher::_emitOutOfLine(StubBodyBuilder& body, c
     if (_target == Amd64OnlyTarget::Rosetta && instr.IsRdpid()) {
         body.Raw(_rdpidReplacement(instr));
         return kRdpid.Name;
+    }
+    if (const auto andn = _target == Amd64OnlyTarget::Rosetta ? DecodeAndn(instr.Data, instr.Length) : std::nullopt) {
+        EmitAndn(body, *andn);
+        return "ANDN";
+    }
+    if (_target == Amd64OnlyTarget::Rosetta && instr.IsRdtscp()) {
+        body.Raw(_rdtscpReplacement(instr));
+        return kRdtscp.Name;
     }
     if (const auto wide = _target == Amd64OnlyTarget::Rosetta ? DecodeVexWideStore(instr.Data, instr.Length) : std::nullopt) {
         _wideStoreLowering.EmitOutOfLine(body, *wide);
@@ -297,7 +317,7 @@ std::optional<Amd64OnlyMatch> Amd64OnlyInstructionMatcher::MatchSequence(
     }
     _moveTrailing(body, trailing);
     const DecodedInstruction first{instructions.front().data(), instructions.front().size()};
-    const bool optional = DecodeReciprocal(first.Data, first.Length).has_value() || (_target == Amd64OnlyTarget::Rosetta && first.IsRdpid());
+    const bool optional = DecodeReciprocal(first.Data, first.Length).has_value() || (_target == Amd64OnlyTarget::Rosetta && (first.IsRdpid() || first.IsRdtscp()));
     return _trampoline(name, instructions.front().size(), body.Finish(), optional);
 }
 

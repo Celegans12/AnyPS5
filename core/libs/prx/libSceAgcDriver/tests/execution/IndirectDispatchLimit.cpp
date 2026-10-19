@@ -8,6 +8,7 @@
 #include <cstring>
 #include <iostream>
 #include <new>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -25,6 +26,16 @@ alignas(256) constexpr std::array<std::uint32_t, 5> StoreCode{0x34020082u, 0x7e0
 std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t count) {
     const auto address = reinterpret_cast<std::uintptr_t>(data);
     return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu), count * 4u, 0x31016facu};
+}
+
+std::optional<std::array<std::uint32_t, 3>> OverLimit(const std::uint32_t* limit) {
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+        if (limit[axis] == 0xffffffffu) continue;
+        std::array<std::uint32_t, 3> groups{1u, 1u, 1u};
+        groups[axis] = limit[axis] + 1u;
+        return groups;
+    }
+    return std::nullopt;
 }
 
 int Run(AgcDriver::VulkanDevice& device, std::uint32_t* block, std::array<std::uint32_t, 3> groups) {
@@ -62,11 +73,15 @@ int main() {
         GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
         int failures = 0;
         try {
-            const int invalidPath = Run(*device, block, {0xffffffffu, 1u, 1u});
-            if (invalidPath != 0) {
+            const auto over = OverLimit(device->WorkGroupCountLimit());
+            const int invalidPath = over ? Run(*device, block, *over) : 0;
+            const auto overText = over ? std::to_string((*over)[0]) + "x" + std::to_string((*over)[1]) + "x" + std::to_string((*over)[2]) : std::string();
+            if (!over) {
+                std::puts("skipped, every group count is within the device limits");
+            } else if (invalidPath != 0) {
                 std::printf("skipped, the group counts were read on the CPU (reason %d): the device cannot import the block\n", invalidPath);
             } else {
-                for (std::uint32_t tid = 0; tid < Threads; ++tid) Require(Output[tid] == 0xdeadbeefu, "indirect dispatch limit: thread " + std::to_string(tid) + " ran with 0xffffffff groups");
+                for (std::uint32_t tid = 0; tid < Threads; ++tid) Require(Output[tid] == 0xdeadbeefu, "indirect dispatch limit: thread " + std::to_string(tid) + " ran with " + overText + " groups");
                 Require(Run(*device, block, {1u, 1u, 1u}) == 0, "indirect dispatch limit: valid counts left the GPU path");
                 for (std::uint32_t tid = 0; tid < Threads; ++tid) Require(Output[tid] == 7u, "indirect dispatch limit: thread " + std::to_string(tid) + " stored " + std::to_string(Output[tid]) + " with one group, expected 7");
             }

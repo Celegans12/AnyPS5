@@ -158,8 +158,10 @@ bool Bench(const char* path, int iterations, bool bindless) {
             if (iteration == 0) {
                 first = fingerprint;
                 tables = captured->snapshot.tables.tables.size();
-                for (const auto& table : captured->snapshot.tables.tables) keys += table.keys;
-                words = captured->snapshot.tables.words.size();
+                for (const auto& table : captured->snapshot.tables.tables) {
+                    keys += table.keys;
+                    words += table.words.size();
+                }
                 registrations = result->bindlessTables.size();
                 heap = result->bindlessHeap;
                 for (const auto& binding : result->bindings) {

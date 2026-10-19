@@ -15,7 +15,6 @@
 #include <string>
 #include <thread>
 
-static constexpr int SCE_AMPR_ERROR_BUFFER_FULL = 0x8002001C;
 static constexpr int SCE_KERNEL_ERROR_EINVAL = 0x80020016;
 static constexpr int SCE_KERNEL_ERROR_EPERM = 0x80020001;
 static constexpr int SCE_KERNEL_ERROR_ESRCH = 0x80020003;
@@ -27,7 +26,8 @@ static std::uint32_t RemainingCommandBytes(const Apr::CommandBufferObject& buffe
 }
 
 static int Append(Apr::CommandBufferObject* buffer, const void* command, uint32_t bytes) {
-    if (!buffer->base || bytes > RemainingCommandBytes(*buffer)) return SCE_AMPR_ERROR_BUFFER_FULL;
+    if (!buffer->base) return SCE_KERNEL_ERROR_EPERM;
+    if (bytes > RemainingCommandBytes(*buffer)) return SCE_KERNEL_ERROR_EBUSY;
     std::memcpy(buffer->base + buffer->offset, command, bytes);
     buffer->offset += bytes;
     ++buffer->numCommands;
@@ -93,7 +93,8 @@ static std::uint64_t NopBytes(std::uint32_t dwords) {
 static int AppendNop(Apr::CommandBufferObject* buffer, std::uint32_t dwords, const std::uint32_t* data) {
     if (!buffer) return SCE_KERNEL_ERROR_EINVAL;
     const std::uint64_t bytes = NopBytes(dwords);
-    if (!buffer->base || bytes > RemainingCommandBytes(*buffer)) return SCE_AMPR_ERROR_BUFFER_FULL;
+    if (!buffer->base) return SCE_KERNEL_ERROR_EPERM;
+    if (bytes > RemainingCommandBytes(*buffer)) return SCE_KERNEL_ERROR_EBUSY;
     const Apr::CommandHeader header{Apr::Opcode::Nop, static_cast<std::uint32_t>(bytes)};
     std::uint8_t* destination = buffer->base + buffer->offset;
     std::memset(destination, 0, bytes);
@@ -116,7 +117,8 @@ static std::uint64_t MeasureMarker(const char* text) {
 static int AppendMarker(Apr::CommandBufferObject* buffer, Apr::Opcode opcode, const char* text) {
     if (!buffer || !text) return SCE_KERNEL_ERROR_EINVAL;
     const std::uint64_t bytes = MarkerBytes(text);
-    if (!buffer->base || bytes > RemainingCommandBytes(*buffer)) return SCE_AMPR_ERROR_BUFFER_FULL;
+    if (!buffer->base) return SCE_KERNEL_ERROR_EPERM;
+    if (bytes > RemainingCommandBytes(*buffer)) return SCE_KERNEL_ERROR_EBUSY;
     const Apr::MarkerCommand command{{opcode, static_cast<std::uint32_t>(bytes)}};
     std::uint8_t* destination = buffer->base + buffer->offset;
     std::memset(destination, 0, bytes);
@@ -271,6 +273,7 @@ void APS5_VABI _Cnd_destroy_nid_postfix(void** handle);
 int APS5_VABI _Cnd_wait_nid_postfix(void** condition, void** mutex);
 int APS5_VABI _Cnd_signal_nid_postfix(void** handle);
 int APS5_VABI wcsrtombs_s_nid_postfix(std::size_t* result, char* destination, std::size_t capacity, const std::uint16_t** source, std::size_t limit, void* state);
+[[noreturn]] void APS5_VABI __cxa_call_terminate_nid_postfix(void* exception);
 int APS5_VABI _Cnd_init_nid_postfix(void** handle);
 int SignalCondition_nid_no_patch(void** handle);
 [[noreturn]] void ThrowCppError_nid_no_patch(int code);
@@ -994,9 +997,8 @@ int APS5_VABI wcstombs_s_nid_postfix(std::size_t* result, char* destination, std
     return wcsrtombs_s_nid_postfix(result, destination, capacity, &source, limit, state.data());
 }
 
-int APS5_VABI __cxa_call_unexpected_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+[[noreturn]] void APS5_VABI __cxa_call_unexpected_nid_postfix(void* unwindException) {
+    __cxa_call_terminate_nid_postfix(unwindException);
 }
 
 APS5_EXPORT("0hlfW1O4Aa4", sceAmprLocaleconv);
