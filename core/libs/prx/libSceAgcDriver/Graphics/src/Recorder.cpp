@@ -1279,7 +1279,8 @@ struct ConsumedLabel {
     std::size_t bytes;
 };
 
-thread_local std::vector<ConsumedLabel> consumedLabels;
+struct ConsumedLabelsTag {};
+auto& ConsumedLabels() { return HostThreadLocal<std::vector<ConsumedLabel>, ConsumedLabelsTag>(); }
 
 }
 
@@ -1334,13 +1335,14 @@ Recorder::LaneSwitch::~LaneSwitch() noexcept(false) {
 
 void Recorder::NoteConsumedLabel(std::uint64_t address, std::size_t bytes) {
     if (AsyncLaneRing() == 0 || bytes == 0) return;
-    consumedLabels.push_back({address, bytes});
+    ConsumedLabels().push_back({address, bytes});
 }
 
 void Recorder::applyConsumedLabels() {
-    if (consumedLabels.empty() || open == nullptr) return;
-    auto consumed = std::move(consumedLabels);
-    consumedLabels.clear();
+    auto& pending = ConsumedLabels();
+    if (pending.empty() || open == nullptr) return;
+    auto consumed = std::move(pending);
+    pending.clear();
     const int lane = currentLane();
     const int other = 1 - lane;
     bool otherOpen = false;
@@ -1824,7 +1826,7 @@ void Recorder::ensureOpen() {
         // bottom-of-pipe stamp, so it marks when this batch's execution began.
         if (BatchStampsEnabled()) open->batchTiming = beginTiming(BatchTimingKey);
     }
-    if (!consumedLabels.empty()) applyConsumedLabels();
+    if (!ConsumedLabels().empty()) applyConsumedLabels();
 }
 
 void Recorder::RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const std::byte> bytes, std::uint64_t address) {
