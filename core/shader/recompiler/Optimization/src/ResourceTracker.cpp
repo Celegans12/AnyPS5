@@ -677,7 +677,7 @@ private:
         column.address = address;
         column.foldedAddend = folded ? baseAddend : 0u;
         column.foldedCarry = folded ? carry : 0u;
-        if (!address && !sampler && std::ranges::find(m_unselectedHandles, &handle) == m_unselectedHandles.end()) {
+        if (!dynamic && !address && !sampler && std::ranges::find(m_unselectedHandles, &handle) == m_unselectedHandles.end()) {
             DescriptorSource direct;
             MakeSource(handle, width, false, false, direct);
             DescriptorSource selection;

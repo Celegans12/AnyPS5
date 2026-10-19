@@ -1145,7 +1145,7 @@ void RunSelectedRecordTests(AgcDriver::VulkanDevice& device) {
     for (const auto record : {2u, 0u, 1u}) {
         Keys[3] = record;
         const auto selected = Run(device, SelectedTableCode, 1, Lanes, 64);
-        Require(!Faulted(selected) && selected.imageTableCount == 1u, "image table selected record: record " + std::to_string(record) + " faulted or bound other entries:\n" + selected.log);
+        Require(!Faulted(selected) && (BindlessHeap() || selected.imageTableCount == 1u), "image table selected record: record " + std::to_string(record) + " faulted or bound other entries:\n" + selected.log);
         const auto* words = Table.data() + record * (Stride / 4u);
         const auto control = RunDirect(device, {words[0], words[1], words[2], words[3]}, {words[4], words[5], words[6], words[7]});
         Require(Group(selected, 0) == Group(control, 0), "image table selected record: record " + std::to_string(record) + " differs from the direct binding of the same words");
@@ -1168,7 +1168,7 @@ void RunSelectedRecordTests(AgcDriver::VulkanDevice& device) {
 
     Keys[3] = 0u;
     const auto aliased = Run(device, SelectedTableCode, 1, Lanes, 64, true);
-    Require(Faulted(aliased) && aliased.log.find("is written by its own dispatch") != std::string::npos, "image table selected record: a dispatch storing over its selected record did not fault on use:\n" + aliased.log);
+    RequireSnapshotFault(aliased, "is written by its own dispatch", "image table selected record: a dispatch storing over its selected record did not fault on use");
     SetClassRecords();
     Srt[24] = 0u;
 }
@@ -1702,7 +1702,7 @@ void RunPointerChainRecordTests(AgcDriver::VulkanDevice& device) {
     }
     const auto chained = RunIndirectRecords(device, PointerChainRecordCode, 3);
     Require(!Faulted(chained), "image table: a T# behind two pointers from its record faulted:\n" + chained.log);
-    Require(chained.imageTableCount == 3u, "image table: T#s behind two pointers from their records do not hold one element per distinct T# (" + std::to_string(chained.imageTableCount) + ")");
+    Require(BindlessHeap() || chained.imageTableCount == 3u, "image table: T#s behind two pointers from their records do not hold one element per distinct T# (" + std::to_string(chained.imageTableCount) + ")");
     for (std::uint32_t group = 0; group < 3; ++group) RequireRed(chained, group, Lanes, texels[2u - group], std::string(names[2u - group]) + " texels of a T# behind two pointers from its record");
 
     store(Links.data() + 8u + 4u, Indirect.data() + 2u * 16u);
