@@ -2632,7 +2632,7 @@ void verifyImageTables() {
     heap[1] = heap[0];
     const auto changed = CompileTable(TableRequest(TableWholeCode, userData));
     const auto& changedTables = changed.capture->snapshot.tables;
-    require(changedTables.tables.at(0).codes.at(1) == changedTables.tables.at(0).codes.at(0) && std::none_of(changedTables.words.begin(), changedTables.words.end(), [&](const DescriptorValue& value) { return value.dwords == original; }), "image tables: a column reused a record whose words changed");
+    require(changedTables.tables.at(0).codes.at(1) == changedTables.tables.at(0).codes.at(0) && std::ranges::none_of(changedTables.tables.at(0).words.Span(), [&](const DescriptorValue& value) { return value.dwords == original; }), "image tables: a column reused a record whose words changed");
     heap[1] = original;
     const auto restored = CompileTable(TableRequest(TableWholeCode, userData));
     require(restored.capture->snapshot.tables == whole.capture->snapshot.tables && TableCodes(TableMap(*restored.result), 0) == wholeCodes, "image tables: a column read again after a change differs from its first read");

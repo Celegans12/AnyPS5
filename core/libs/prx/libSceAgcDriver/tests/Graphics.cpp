@@ -8859,7 +8859,8 @@ void unorm10_11_11BlendTests() {
     const auto words = blended.spirv.Words();
     Require(interlockShape(words) == "capability extension ordered begin end end ", "a blending pixel shader declared the wrong pixel interlock: " + interlockShape(words));
     std::size_t kills = 0;
-    const auto exits = interlockExits(words, kills);
+    std::size_t terminates = 0;
+    const auto exits = interlockExits(words, kills, terminates);
     Require(exits.empty(), "a blending pixel shader: " + exits);
     std::size_t reads = 0, writes = 0, early = 0, set1 = 0;
     for (std::size_t at = 5; at < words.size() && (words[at] >> 16u) != 0; at += words[at] >> 16u) {

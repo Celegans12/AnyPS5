@@ -377,7 +377,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         decodeReads[i].clear();
         vertexInfos[i] = Graphics::DecodeVertexStageInfo(program.binary.header, program.binary.headerAddress, program.userData, &decodeReads[i], false, 8u - program.firstUserSgpr);
         static const bool unordered = std::getenv("APS5_NO_DECODE_READ_DRAIN") != nullptr;
-        if (pipelined && !unordered && std::any_of(decodeReads[i].begin(), decodeReads[i].end(), [](const Graphics::DecodeRead& read) { return DrawPipeline::DrainBeforeRead(read.address, read.bytes.size()); })) {
+        if (pipelined && !unordered && std::any_of(decodeReads[i].begin(), decodeReads[i].end(), [](const Graphics::DecodeRead& read) { return DrawPipeline::DrainBeforeRead(read.address, read.size); })) {
             decodeReads[i].clear();
             vertexInfos[i] = Graphics::DecodeVertexStageInfo(program.binary.header, program.binary.headerAddress, program.userData, &decodeReads[i], false, 8u - program.firstUserSgpr);
         }
