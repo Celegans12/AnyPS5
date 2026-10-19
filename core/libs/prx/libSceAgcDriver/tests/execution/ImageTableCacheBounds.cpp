@@ -7,6 +7,7 @@
 #include "Optimization/ResourceMaterializer.hpp"
 #include "Optimization/SrtWalker.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BindlessHeap.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
@@ -141,11 +142,16 @@ void Prepare(const GuestBlock& block) {
 
 void TablesChangingPerDispatch(const GuestBlock& block) {
     auto& cache = AgcDriver::Graphics::SharedResourceCache();
+    const auto heapStages = AgcDriver::Graphics::HeapComputeStages();
     std::uint64_t most = 0;
     for (std::uint32_t dispatch = 0; dispatch < 6; ++dispatch) {
         SetRecord(block, dispatch * 977u % Records, Elements + dispatch % Spare);
         Dispatch(block, 0);
         most = std::max(most, cache.TableElements());
+    }
+    if (AgcDriver::Graphics::DescriptorHeapEnabled()) {
+        Require(AgcDriver::Graphics::HeapComputeStages() > heapStages, "image table cache bounds: the dispatches did not take the descriptor heap");
+        return;
     }
     Require(most >= Elements, "image table cache bounds: no dispatch kept its table in the resource cache");
     Require(most <= AgcDriver::Graphics::ResourceCache::TableElementBudget(), "image table cache bounds: tables that changed every dispatch kept " + std::to_string(most) + " table elements in the resource cache, over its budget of " + std::to_string(AgcDriver::Graphics::ResourceCache::TableElementBudget()));

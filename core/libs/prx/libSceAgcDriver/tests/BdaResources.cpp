@@ -3596,6 +3596,7 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     const std::array<GuestMemorySnapshot, 1> snapshots{{{0x7fff12340000ULL, source}}};
     ShaderRecompiler::RecompileResult shader;
     shader.bindings = {binding(Role::BdaPagetable, 4), binding(Role::FaultBuffer, 5)};
+    shader.bdaStores = true;
     CompiledShader compiled{ShaderRecompiler::ShaderStage::Compute, &shader, 0};
     reject([&] { ShaderResources resources(context, compiled, snapshots); }, "ABI version");
     shader.bdaAbiVersion = ShaderRecompiler::BdaAbi::Version;
