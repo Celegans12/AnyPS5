@@ -107,11 +107,13 @@ void BindlessTable::Publish(Recorder& recorder) {
     std::lock_guard lock(mutex);
     heap.Collect(recorder.CompletedThrough());
     if (recorder.HasQueuedKeyStores()) recorder.FlushKeyStores();
-    // A publication with nothing to record (the common case: every bindless dispatch publishes)
-    // takes the batch's command buffer only once it records: Commands() would record a dispatch
-    // run's deferred barrier and so end the run of the ring's next dispatch (APS5_NO_QUIET_PUBLISH=1:
-    // always, as before).
-    const bool quiet = !RuntimeSwitches::Set(RuntimeSwitch::NoQuietPublish);
+    // APS5_QUIET_PUBLISH=1 (opt-in, an APS5_AB switch): a publication with nothing to record (the
+    // common case: every bindless dispatch publishes) takes the batch's command buffer only once it
+    // records, so it no longer records an open dispatch run's deferred barrier and bindless
+    // dispatches the title leaves unordered overlap. Off by default: the one in-run A/B with it
+    // (bs-ab2, 2026-10-19) lost the device 53 s into an on phase after a 40 s GPU stall, a failure
+    // not seen without it, and showed no gain in its one finished pair.
+    const bool quiet = RuntimeSwitches::Set(RuntimeSwitch::QuietPublish);
     VkCommandBuffer commands = VK_NULL_HANDLE;
     if (quiet) recorder.OpenBatch();
     else commands = recorder.Commands();
