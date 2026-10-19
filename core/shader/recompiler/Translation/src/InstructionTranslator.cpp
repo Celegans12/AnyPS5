@@ -181,6 +181,11 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
     };
     const auto drawIndex = [&entryIr, &options, &builtin](StageInputKind kind) -> IrValue& {
         const auto* fetch = options.embeddedFetch;
+        // A GPU-side indirect draw parameter: the CP writes the record's base vertex / start
+        // instance into the SGPR, and the index VGPR is the raw index; Vulkan's index includes
+        // the draw's base, which is the record's value too.
+        const std::int32_t gpuParameter = kind == StageInputKind::VertexIndex ? options.drawBaseVertexSgpr : options.drawStartInstanceSgpr;
+        if (gpuParameter >= 0) return entryIr.ISub(builtin(kind), builtin(kind == StageInputKind::VertexIndex ? StageInputKind::BaseVertex : StageInputKind::BaseInstance));
         const std::int32_t folded = fetch == nullptr ? -1 : kind == StageInputKind::VertexIndex ? fetch->vertexOffsetSgpr : fetch->instanceOffsetSgpr;
         IrValue& index = builtin(kind);
         return folded < 0 ? index : entryIr.ISub(index, entryIr.GetUserData(static_cast<ScalarReg>(folded)));
@@ -191,7 +196,10 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
 
     for (std::uint32_t index = 0; index < options.userDataCount; index++) {
         const auto reg = static_cast<ScalarReg>(options.userDataBaseRegister + index);
-        IrValue& value = entryIr.GetUserData(reg);
+        const auto sgpr = static_cast<std::int32_t>(options.userDataBaseRegister + index);
+        const bool baseVertex = options.stage == ShaderStageKind::Vertex && sgpr == options.drawBaseVertexSgpr;
+        const bool startInstance = options.stage == ShaderStageKind::Vertex && sgpr == options.drawStartInstanceSgpr;
+        IrValue& value = baseVertex ? builtin(StageInputKind::BaseVertex) : startInstance ? builtin(StageInputKind::BaseInstance) : entryIr.GetUserData(reg);
         entryIr.SetScalarReg(reg, value);
         entryIr.SetScalarMaskTag(reg, entryIr.ConstantBool(false));
     }

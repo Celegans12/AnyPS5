@@ -75,7 +75,11 @@ public:
     void ResolveGraphicsAbi(const Shader* vertex, const Shader* pixel, std::uint32_t primitiveType);
     void SettleShaderPreparations(std::span<const Shader* const> stages);
     static void FoldDrawOffsets(const ShaderRecompiler::RecompileResult& result, const DrawProgram& program, Pm4::DrawParameters& parameters);
-    static std::optional<Graphics::IndirectDrawPath> ClassifyIndirectDraw(const ShaderRecompiler::RecompileResult& result, const Graphics::State& graphics, const DrawProgram& frontProgram, const std::shared_ptr<VulkanDevice>& localDevice, Pm4::DrawParameters& drawParameters, bool traceIndirect);
+    static std::optional<Graphics::IndirectDrawPath> ClassifyIndirectDraw(const ShaderRecompiler::RecompileResult& result, const Graphics::State& graphics, const DrawProgram& frontProgram, const std::shared_ptr<VulkanDevice>& localDevice, Pm4::DrawParameters& drawParameters, bool traceIndirect, bool gpuParameters = false);
+    // Whether a draw's front stage compiled with GPU-side draw parameters (gpuind: base vertex /
+    // start instance SGPRs from BaseVertex / BaseInstance) would take the GPU-side indirect path:
+    // ClassifyIndirectDraw with gpuParameters on a copy of the parameters, without the trace.
+    static bool GpuParametersDrawSide(const ShaderRecompiler::RecompileResult& result, const Graphics::State& graphics, const DrawProgram& frontProgram, const std::shared_ptr<VulkanDevice>& localDevice, const Pm4::DrawParameters& drawParameters);
     static std::string dumpRequest(std::uint64_t address, const ShaderRecompiler::RecompileRequest& request);
     // APS5_PIPELINE_REQUESTS=<dir>: saves the request of each compute variant of at least
     // APS5_PIPELINE_REQUESTS_MIN_WORDS SPIR-V words (default 500000) as c_<words>_<address>_<fingerprint>.req

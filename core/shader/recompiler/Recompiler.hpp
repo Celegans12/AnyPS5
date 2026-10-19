@@ -207,6 +207,13 @@ struct ShaderVertexStageInfo {
     std::uint32_t fetchBufferReg;
     bool fetchEmbedded;
     std::uint32_t paClVsOutCntl = 0;
+    // GPU-side indirect draw parameters (gpuind): the user SGPRs the CP writes a record's base
+    // vertex and start instance into for an indirect draw on the vertex path, or -1. A stage
+    // compiled with one of them set reads that SGPR from BaseVertex / BaseInstance and takes the
+    // vertex / instance index VGPR as VertexIndex - BaseVertex / InstanceIndex - BaseInstance (the
+    // record's raw index), so the driver records vkCmdDraw*Indirect without reading the records.
+    std::int32_t drawBaseVertexSgpr = -1;
+    std::int32_t drawStartInstanceSgpr = -1;
 };
 
 struct ShaderFloatMode {

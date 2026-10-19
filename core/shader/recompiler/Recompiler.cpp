@@ -215,6 +215,10 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
     translateOptions.nativeFloat16 = supports(spv::CapabilityFloat16) && supports(spv::CapabilityRoundingModeRTE) && supports(spv::CapabilityDenormPreserve);
     translateOptions.floatMode = request.context.floatMode;
     translateOptions.inputInfo = inputInfo;
+    if (stageKind == ShaderStageKind::Vertex && request.context.vertex.has_value()) {
+        translateOptions.drawBaseVertexSgpr = request.context.vertex->drawBaseVertexSgpr;
+        translateOptions.drawStartInstanceSgpr = request.context.vertex->drawStartInstanceSgpr;
+    }
 
     constexpr InstructionTranslator translator;
 
