@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/BindlessTable.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "DeviceImageTableAbi.hpp"
 #include <algorithm>
 #include <array>
@@ -106,7 +107,14 @@ void BindlessTable::Publish(Recorder& recorder) {
     std::lock_guard lock(mutex);
     heap.Collect(recorder.CompletedThrough());
     if (recorder.HasQueuedKeyStores()) recorder.FlushKeyStores();
-    const auto commands = recorder.Commands();
+    // A publication with nothing to record (the common case: every bindless dispatch publishes)
+    // takes the batch's command buffer only once it records: Commands() would record a dispatch
+    // run's deferred barrier and so end the run of the ring's next dispatch (APS5_NO_QUIET_PUBLISH=1:
+    // always, as before).
+    const bool quiet = !RuntimeSwitches::Set(RuntimeSwitch::NoQuietPublish);
+    VkCommandBuffer commands = VK_NULL_HANDLE;
+    if (quiet) recorder.OpenBatch();
+    else commands = recorder.Commands();
     const auto batch = recorder.OpenSerial();
     const bool assign = ring == nullptr || ringBatch != batch;
     const bool grown = table == nullptr || keys.Buckets() != tableBuckets;
@@ -119,6 +127,7 @@ void BindlessTable::Publish(Recorder& recorder) {
     }
     ++totals.publications;
     if (!assign && !rebuilt && changed.empty() && !clear) return;
+    if (quiet) commands = recorder.Commands();
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
     if (clear) {
         // Ordered after every earlier lookup by the barrier above and before every later one by the
