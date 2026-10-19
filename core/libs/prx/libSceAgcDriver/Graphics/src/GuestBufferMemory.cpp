@@ -910,7 +910,7 @@ constexpr std::uint64_t settleFloorBytes = 0x100000;
 #ifdef _WIN32
 constexpr std::uint64_t settleBlockBytes = 0x10000;
 constexpr auto settlePollPeriod = std::chrono::microseconds(100);
-std::atomic<bool> deferredSettles{std::getenv("APS5_NO_DEFERRED_SETTLES") == nullptr};
+std::atomic<bool> deferredSettles{std::getenv("APS5_DEFERRED_SETTLES") != nullptr};
 #endif
 
 ImportSettle& settleFor(const Context& context, HostImports& state) {
