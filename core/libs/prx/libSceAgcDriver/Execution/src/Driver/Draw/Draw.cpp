@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawProgramTrace.hpp"
@@ -29,8 +30,7 @@ namespace {
 // beyond the folded fetch offset ("patched SGPR not folded") compiles its front stage with those
 // SGPRs read from BaseVertex / BaseInstance, so the records stay on the GPU.
 bool GpuIndirectArgs() {
-    static const bool enabled = std::getenv("APS5_NO_GPU_INDIRECT_ARGS") == nullptr;
-    return enabled;
+    return !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoGpuIndirectArgs);
 }
 
 // An indirect draw's draw-cache keys carry its SGPR locations: a cached front stage compiled with
@@ -909,7 +909,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         // S1: the preparation the preparer thread may make for this commit (see DrawPipeline::Prepare).
         // It runs with copies of the draw's inputs; the stage pointers stay valid because the
         // preparation holds the commit (which owns the compiled programs).
-        static const bool splitBuild = Graphics::SplitDrawBuild();
+        const bool splitBuild = Graphics::SplitDrawBuild();
         static const bool htilePresync = std::getenv("APS5_NO_HTILE_PRESYNC") == nullptr;
         const bool prepareDraw = (splitBuild || (htilePresync && decode->state.depth.has_value())) && recipe == nullptr;
         auto slot = prepareDraw ? std::make_shared<DrawPipeline::PrepareSlot>() : nullptr;
@@ -948,7 +948,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         auto held = std::make_shared<decltype(commit)>(std::move(commit));
         DrawPipeline::Prepare prepare;
         if (slot != nullptr) {
-            prepare = [held, slot, device = std::move(prepareDevice), decode = std::move(prepareDecode), stages = std::move(preparedStages), drawParameters, epoch, commitPacket, commitQueue] {
+            prepare = [held, slot, device = std::move(prepareDevice), decode = std::move(prepareDecode), stages = std::move(preparedStages), drawParameters, epoch, commitPacket, commitQueue, splitBuild] {
                 if (!slot->Begin()) return;
                 auto prepared = std::make_shared<PreparedCommit>();
                 try {

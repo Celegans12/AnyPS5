@@ -29,6 +29,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PresentationScaler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BindlessTable.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BindlessResolvers.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureService.hpp"
@@ -4279,6 +4280,7 @@ ResourceCache::Key DispatchContentKey(const Graphics::CompiledShader& shader, Vk
     const auto deviceHandle = reinterpret_cast<std::uint64_t>(device);
     key.push_back(static_cast<std::uint32_t>(deviceHandle));
     key.push_back(static_cast<std::uint32_t>(deviceHandle >> 32u));
+    if (const auto salt = Graphics::RuntimeSwitches::KeySalt(); salt != 0) key.push_back(salt);
     return key;
 }
 
@@ -4955,6 +4957,7 @@ std::shared_ptr<RecipeHit> VulkanDevice::PrepareRecipe(const std::shared_ptr<con
     };
     if (!DispatchRecipes() || recipe == nullptr) return miss(MissNoRecipe);
     if (recipe->device != state->device) return miss(MissDevice);
+    if (const auto salt = Graphics::RuntimeSwitches::KeySalt(); salt != 0 && (recipe->key.empty() || recipe->key.back() != salt)) return miss(MissNoRecipe);
     auto hit = std::make_shared<RecipeHit>();
     hit->recipe = recipe;
     hit->indirect = indirect;

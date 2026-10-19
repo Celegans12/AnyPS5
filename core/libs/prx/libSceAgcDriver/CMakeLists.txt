@@ -282,6 +282,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PipelineCache.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PipelineCreationGate.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PipelineJournal.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/RuntimeSwitches.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Resources.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PlaceholderImages.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Recorder.cpp
@@ -444,6 +445,17 @@ if(BUILD_TESTING)
     set_tests_properties(agc_pipeline_creation_gate PROPERTIES TIMEOUT 30)
     if(WIN32)
         set_tests_properties(agc_pipeline_creation_gate PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+
+    add_test_executable(agc_runtime_switches_tests tests/RuntimeSwitches.cpp Graphics/src/RuntimeSwitches.cpp)
+    target_include_directories(agc_runtime_switches_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_runtime_switches_tests PRIVATE libc)
+    configure_windows_unwind(agc_runtime_switches_tests)
+    add_test(NAME agc_runtime_switches COMMAND agc_runtime_switches_tests)
+    set_tests_properties(agc_runtime_switches PROPERTIES TIMEOUT 20)
+    if(WIN32)
+        set_tests_properties(agc_runtime_switches PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 
