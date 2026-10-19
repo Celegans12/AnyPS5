@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetTransfer.hpp"
@@ -1102,8 +1103,7 @@ void reportSplits() {
 }
 
 bool SplitDrawBuild() {
-    static const bool enabled = std::getenv("APS5_NO_SPLIT_DRAW_BUILD") == nullptr;
-    return enabled;
+    return !RuntimeSwitches::Set(RuntimeSwitch::NoSplitDrawBuild);
 }
 
 std::shared_ptr<PreparedDraw> PrepareDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders) {

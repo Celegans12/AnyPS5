@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
@@ -1569,8 +1570,7 @@ std::array<std::uint64_t, Recorder::DeferredFlushSites> Recorder::DeferredFlushC
 }
 
 bool Recorder::DispatchOverlapEnabled() {
-    static const bool enabled = std::getenv("APS5_NO_DISPATCH_OVERLAP") == nullptr;
-    return enabled;
+    return !RuntimeSwitches::Set(RuntimeSwitch::NoDispatchOverlap);
 }
 
 void Recorder::SetDispatchOrder(std::uint32_t queueKey, bool unordered) {
