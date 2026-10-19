@@ -1323,16 +1323,28 @@ public:
 
     void Close() {
         std::vector<pthread_t> joined;
+#ifdef _WIN32
+        std::vector<std::pair<HANDLE, unsigned>> windowsJoined;
+#endif
         {
             std::unique_lock lock(mutex);
             closed = true;
             idle.wait(lock, [&] { return tasks.empty() && running == 0; });
             joined.swap(workers);
+#ifdef _WIN32
+            windowsJoined.swap(windowsWorkers);
+#endif
         }
         ready.notify_all();
         for (const auto worker : joined) {
             if (!pthread_equal(worker, pthread_self())) pthread_join(worker, nullptr);
         }
+#ifdef _WIN32
+        for (const auto& [handle, id] : windowsJoined) {
+            if (id != GetCurrentThreadId()) WaitForSingleObject(handle, INFINITE);
+            CloseHandle(handle);
+        }
+#endif
     }
 
 private:
@@ -1341,10 +1353,12 @@ private:
     explicit RegistrationPreparePool(unsigned count) {
 #ifdef _WIN32
         for (unsigned index = 0; index < count; ++index) {
-            const auto thread = _beginthreadex(nullptr, static_cast<unsigned>(StackBytes), &RegistrationPreparePool::WindowsMain, this, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
+            unsigned id = 0;
+            const auto thread = _beginthreadex(nullptr, static_cast<unsigned>(StackBytes), &RegistrationPreparePool::WindowsMain, this, STACK_SIZE_PARAM_IS_A_RESERVATION, &id);
             if (thread != 0) {
-                CloseHandle(reinterpret_cast<HANDLE>(thread));
+                windowsWorkers.emplace_back(reinterpret_cast<HANDLE>(thread), id);
                 ++threads;
+                liveWorkers.fetch_add(1, std::memory_order_acq_rel);
             }
         }
 #else
@@ -1415,6 +1429,9 @@ private:
     std::condition_variable idle;
     std::deque<Task> tasks;
     std::vector<pthread_t> workers;
+#ifdef _WIN32
+    std::vector<std::pair<HANDLE, unsigned>> windowsWorkers;
+#endif
     unsigned threads = 0;
     inline static std::atomic<unsigned> liveWorkers{0};
     unsigned running = 0;
