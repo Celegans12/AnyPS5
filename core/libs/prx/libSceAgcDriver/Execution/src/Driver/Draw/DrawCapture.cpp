@@ -9,6 +9,8 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 
@@ -73,6 +75,16 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
         const auto waited = std::min(Graphics::Recorder::ThreadWaitedMs() - waitedBefore, phaseMs[DrawRowCapture]);
         phaseMs[DrawRowCapture] -= waited;
         phaseMs[DrawRowCaptureHookWaits] += waited;
+    }
+    static const bool dumpIndirect = std::getenv("APS5_DUMP_INDIRECT_SHADERS") != nullptr;
+    if (dumpIndirect && drawParameters.indirect && i == 0) {
+        // The front stage of every indirect draw once per shader (gpuind lane attribution): the
+        // request for offline replay and which user words the resource walk reads as a base/value.
+        const auto name = dumpRequest(program.binary.codeAddress, request);
+        static std::mutex mutex;
+        static std::set<std::uint64_t> printed;
+        std::lock_guard lock(mutex);
+        if (printed.insert(program.binary.codeAddress).second) std::fprintf(stderr, "[indirect-shader] 0x%llx %s: base sgpr %d inst sgpr %d firstUser %u srt asBase 0x%llx asValue 0x%llx reads %zu\n", static_cast<unsigned long long>(program.binary.codeAddress), name.c_str(), drawParameters.indirect->baseVertexSgpr, drawParameters.indirect->startInstanceSgpr, program.firstUserSgpr, static_cast<unsigned long long>(capture->userDataUse.asBase), static_cast<unsigned long long>(capture->userDataUse.asValue), capture->userDataUse.reads.size());
     }
     if (dumpTarget != 0) {
 

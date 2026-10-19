@@ -369,6 +369,8 @@ private:
     void ensureHdrScaler(VkFormat source);
     void useSurfaceFormat(VkSurfaceFormatKHR format);
     struct State;
+    // The startup probe behind SpirvTarget::fusedFma (VulkanDevice.cpp).
+    static bool fusedFmaProbe(const State& device, std::uint32_t family);
     std::unique_ptr<State> state;
     std::uint64_t serial;
 };

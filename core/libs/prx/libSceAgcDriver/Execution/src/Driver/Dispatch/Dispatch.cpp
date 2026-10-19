@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/LiveSnapshotRetry.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/SlowMaterializations.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
@@ -262,6 +263,17 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
         }
     }
     if (partialLastGroup) compute.partialThreads = partialGroups;
+    // One workgroup (direct, 1x1x1 groups, or a thread count inside one group): workgroup-scope
+    // coherence for its glc reads (ShaderComputeStageInfo::singleWorkgroup). Opt-in, APS5_SINGLE_GROUP_COHERENCE=1:
+    // with the BDA overlays (device-local buffers) it saves ~2 % of 0x80001c0d00 on the request bench, and one
+    // of four bench runs gave an unstable output hash, so it is not shown to be exact.
+    static const bool singleGroupCoherence = std::getenv("APS5_SINGLE_GROUP_COHERENCE") != nullptr;
+    if (singleGroupCoherence && indirectArguments == 0) {
+        const bool threads = (packet[4] & 0x20u) != 0;
+        bool single = true;
+        for (std::uint32_t axis = 0; axis < 3; ++axis) single = single && (threads ? packet[1 + axis] <= compute.numThreads[axis] : packet[1 + axis] == 1u);
+        compute.singleWorkgroup = single && packet[1] != 0 && packet[2] != 0 && packet[3] != 0;
+    }
     ShaderRecompiler::RecompileRequest request{
         {ShaderRecompiler::ShaderStage::Compute, address, std::span(snapshot.code).subspan(codeOffset), snapshot.headerAddress, snapshot.header},
         {(packet[4] & 0x8000u) != 0 ? 32u : 64u, 0, userData, compute, std::nullopt, std::nullopt, memory, DispatchFloatMode(snapshot, queue.shader)},
@@ -311,6 +323,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
     mix(address);
     mix(packet[4] & 0x8000u);
     for (const auto threads : compute.partialThreads) mix(threads);
+    mix(compute.singleWorkgroup ? 0x51u : 0u);
     for (const auto word : userData) mix(word);
 
     static const bool keyHygiene = std::getenv("APS5_NO_DISPATCH_KEY_HYGIENE") == nullptr;
@@ -457,6 +470,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
             timing.Mark("prepared_invocation");
 
             const auto waitedBefore = traceCapSync() ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
+            const auto captureStarted = std::chrono::steady_clock::now();
             forgetAtCapture = GuestMemory::ForgetSerial();
             capture = [&] {
                 const SampledReadScope sampling(evidenceReads);
@@ -469,6 +483,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
             phaseTiming.Phase(PhaseCapture);
             if (dumpShaders) static_cast<void>(dumpRequest(address, request));
             const auto started = std::chrono::steady_clock::now();
+            const auto captureElapsed = std::chrono::duration<double, std::milli>(started - captureStarted).count();
 
 
             timing.Mark("capture_resources");
@@ -478,6 +493,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
             const auto elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
             static double totalMs = 0;
             totalMs += elapsed;
+            if (SlowMaterializationStats()) NoteSlowMaterialization(submission.queue, address, *compiledResult, capture, captureElapsed, elapsed, resolvingAhead());
             if (profile && elapsed > 200) std::fprintf(stderr, "[gpu] compute shader 0x%llx recompile took %.0f ms (%zu SPIR-V words, %zu captured regions, total %.1f s)\n", static_cast<unsigned long long>(address), elapsed, compiledResult->spirv.size(), captured.size(), totalMs / 1000);
             capturePipelineRequest(address, request, *compiledResult, shaderMemory->Probes(), *localDevice);
         } catch (const std::exception& error) {

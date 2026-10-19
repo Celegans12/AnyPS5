@@ -1,7 +1,11 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include <algorithm>
 #include <cstdlib>
+#include <map>
+#include <mutex>
+#include <string>
 
 namespace AgcDriver::DriverDetail {
 
@@ -21,7 +25,7 @@ void Driver::FoldDrawOffsets(const ShaderRecompiler::RecompileResult& result, co
     if (result.instanceOffsetSgpr >= 0) parameters.firstInstance = drawUserWord(program, result.instanceOffsetSgpr);
 }
 
-std::optional<Graphics::IndirectDrawPath> Driver::ClassifyIndirectDraw(const ShaderRecompiler::RecompileResult& result, const Graphics::State& graphics, const DrawProgram& frontProgram, const std::shared_ptr<VulkanDevice>& localDevice, Pm4::DrawParameters& drawParameters, bool traceIndirect) {
+std::optional<Graphics::IndirectDrawPath> Driver::ClassifyIndirectDraw(const ShaderRecompiler::RecompileResult& result, const Graphics::State& graphics, const DrawProgram& frontProgram, const std::shared_ptr<VulkanDevice>& localDevice, Pm4::DrawParameters& drawParameters, bool traceIndirect, bool gpuParameters) {
     std::optional<Graphics::IndirectDrawPath> indirectCpu;
     auto& indirect = *drawParameters.indirect;
     using Rule = Pm4::DrawParameters::IndirectDraw::Rule;
@@ -35,8 +39,20 @@ std::optional<Graphics::IndirectDrawPath> Driver::ClassifyIndirectDraw(const Sha
     if (indirect.drawIndexEnabled && indirect.drawIndexSgpr >= 0) fail(Path::DrawIndex);
     if (indirect.countIndirect && !support.count) fail(Path::FeatureGap);
     if (indirect.countIndirect && indirect.count > 1 && !support.multi) fail(Path::FeatureGap);
-    const auto dimension = [&](std::int32_t k, std::int32_t p, bool shared, bool conflict, std::uint32_t x, Rule& rule, std::uint32_t& constant) {
-        if (p < 0) {
+    // With GPU-side draw parameters (the stage reads the CP-written SGPR from BaseVertex /
+    // BaseInstance and its index VGPR is the raw index), other uses of the SGPR need no CPU value;
+    // only the fixed-function attribute fetch of that rate must start where the guest's fetch
+    // index (index + the folded SGPR k) does, i.e. k == p, or the rate fetches nothing.
+    const auto fetchesRate = [&](std::uint32_t fetchIndex) {
+        return std::any_of(result.vertexAttributes.begin(), result.vertexAttributes.end(), [&](const ShaderRecompiler::VertexAttribute& attribute) { return attribute.fetchIndex == fetchIndex; });
+    };
+    const auto dimension = [&](std::int32_t k, std::int32_t p, bool shared, bool conflict, std::uint32_t x, Rule& rule, std::uint32_t& constant, std::uint32_t fetchIndex) {
+        if (p >= 0 && gpuParameters) {
+            if (conflict) fail(Path::FetchUnknown);
+            else if (k != p && fetchesRate(fetchIndex)) fail(Path::NotFolded);
+            else if (x != 0) fail(Path::IndxOffset);
+            else rule = Rule::InPlace;
+        } else if (p < 0) {
             rule = Rule::Constant;
             const auto offset = k >= 0 ? drawUserWord(frontProgram, k) : 0u;
             require(offset <= std::numeric_limits<std::uint32_t>::max() - x, "draw vertex offset overflow");
@@ -46,8 +62,8 @@ std::optional<Graphics::IndirectDrawPath> Driver::ClassifyIndirectDraw(const Sha
         else if (x != 0) fail(Path::IndxOffset);
         else rule = Rule::InPlace;
     };
-    dimension(result.vertexOffsetSgpr, indirect.baseVertexSgpr, result.vertexOffsetShared, result.vertexOffsetConflict, drawParameters.indexed ? 0u : indirect.indxOffset, indirect.vertexRule, indirect.vertexConstant);
-    dimension(result.instanceOffsetSgpr, indirect.startInstanceSgpr, result.instanceOffsetShared, result.instanceOffsetConflict, 0u, indirect.instanceRule, indirect.instanceConstant);
+    dimension(result.vertexOffsetSgpr, indirect.baseVertexSgpr, result.vertexOffsetShared, result.vertexOffsetConflict, drawParameters.indexed ? 0u : indirect.indxOffset, indirect.vertexRule, indirect.vertexConstant, 0u);
+    dimension(result.instanceOffsetSgpr, indirect.startInstanceSgpr, result.instanceOffsetShared, result.instanceOffsetConflict, 0u, indirect.instanceRule, indirect.instanceConstant, 1u);
     if (!support.firstInstance && (indirect.instanceRule == Rule::InPlace || indirect.instanceConstant != 0)) fail(Path::FeatureGap);
     if ((indirect.vertexRule == Rule::Constant || indirect.instanceRule == Rule::Constant) && indirect.count > 256) fail(Path::FeatureGap);
 
@@ -57,6 +73,18 @@ std::optional<Graphics::IndirectDrawPath> Driver::ClassifyIndirectDraw(const Sha
         const auto extent = stride == 0 ? static_cast<std::uint64_t>(attribute.resource.fields[2]) : static_cast<std::uint64_t>(attribute.resource.fields[2]) * stride;
         if (extent > vertexCap) fail(Path::VertexRange);
     }
+    static const bool traceNotFolded = std::getenv("APS5_TRACE_NOT_FOLDED") != nullptr;
+    if (traceNotFolded && indirectCpu) {
+        // Once per distinct shape (shader, SGPRs, analyzer verdict), then at powers of two: which
+        // stages need their indirect records on the CPU and why (the gpuind lane's attribution).
+        static std::mutex mutex;
+        static std::map<std::string, std::uint64_t> seen;
+        char key[320];
+        std::snprintf(key, sizeof(key), "vs 0x%llx op 0x%x rec %u stride %u count %u%s idx %d base s%d inst s%d draw s%d%s analyzer v=%d i=%d shared=%d/%d conflict=%d/%d indx=%u fetch attrs %zu firstUser %u userWords %zu %s -> %s", static_cast<unsigned long long>(frontProgram.binary.codeAddress), indirect.opcode, indirect.recordBytes, indirect.stride, indirect.count, indirect.countIndirect ? " (count indirect)" : "", drawParameters.indexed ? 1 : 0, indirect.baseVertexSgpr, indirect.startInstanceSgpr, indirect.drawIndexSgpr, indirect.drawIndexEnabled ? " (enabled)" : "", result.vertexOffsetSgpr, result.instanceOffsetSgpr, result.vertexOffsetShared ? 1 : 0, result.instanceOffsetShared ? 1 : 0, result.vertexOffsetConflict ? 1 : 0, result.instanceOffsetConflict ? 1 : 0, indirect.indxOffset, result.vertexAttributes.size(), frontProgram.firstUserSgpr, frontProgram.userData.size(), gpuParameters ? " gpu-parameters" : "", Graphics::IndirectDrawPathName(*indirectCpu));
+        std::lock_guard lock(mutex);
+        const auto hits = ++seen[key];
+        if ((hits & (hits - 1)) == 0) std::fprintf(stderr, "[not-folded] %s (seen %llu)\n", key, static_cast<unsigned long long>(hits));
+    }
     if (traceIndirect) {
         const auto location = [](std::uint32_t value, std::int32_t sgpr) { char text[24]; if (value == 0x280u) std::snprintf(text, sizeof(text), "none"); else std::snprintf(text, sizeof(text), "0x%x(s%d)", value, sgpr); return std::string(text); };
         const auto rule = [](Rule value, std::uint32_t constant) { char text[24]; if (value == Rule::InPlace) std::snprintf(text, sizeof(text), "in-place"); else std::snprintf(text, sizeof(text), "const %u", constant); return std::string(text); };
@@ -64,6 +92,12 @@ std::optional<Graphics::IndirectDrawPath> Driver::ClassifyIndirectDraw(const Sha
         std::fprintf(stderr, "[draw] indirect 0x%x args 0x%llx stride %u count %u%s locs base=%s inst=%s idx=%s%s analyzer v=%d i=%d shared=%d/%d conflict=%d/%d indx=%u -> %s\n", indirect.opcode, static_cast<unsigned long long>(indirect.arguments), indirect.stride, indirect.count, indirect.countIndirect ? " (indirect)" : "", location(indirect.baseVertexLocation, indirect.baseVertexSgpr).c_str(), location(indirect.startInstanceLocation, indirect.startInstanceSgpr).c_str(), location(indirect.drawIndexLocation, indirect.drawIndexSgpr).c_str(), indirect.drawIndexEnabled ? " (enabled)" : "", result.vertexOffsetSgpr, result.instanceOffsetSgpr, result.vertexOffsetShared ? 1 : 0, result.instanceOffsetShared ? 1 : 0, result.vertexOffsetConflict ? 1 : 0, result.instanceOffsetConflict ? 1 : 0, indirect.indxOffset, decision.c_str());
     }
     return indirectCpu;
+}
+
+bool Driver::GpuParametersDrawSide(const ShaderRecompiler::RecompileResult& result, const Graphics::State& graphics, const DrawProgram& frontProgram, const std::shared_ptr<VulkanDevice>& localDevice, const Pm4::DrawParameters& drawParameters) {
+    auto copy = drawParameters;
+    const auto path = ClassifyIndirectDraw(result, graphics, frontProgram, localDevice, copy, false, true);
+    return !path.has_value();
 }
 
 }

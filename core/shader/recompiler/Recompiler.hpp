@@ -52,6 +52,13 @@ struct ShaderComputeStageInfo {
     std::uint32_t threadIdComponentCount;
     std::array<std::uint32_t, 3> partialThreads;
     std::uint32_t scratchDwords = 0;
+    // The dispatch runs exactly one workgroup (a direct dispatch of 1x1x1 groups, set by the driver):
+    // the guest's glc buffer loads then only need workgroup-scope coherence, since every other
+    // writer of the buffer that can run beside them is an invocation of the same workgroup on the
+    // same SM (other dispatches are ordered by the barriers between them). The SPIR-V reads them
+    // through the L1-cached binding and s_barrier also orders buffer memory (SpirvRuntimeBuffer,
+    // SpirvFlowEmitter). Set only with APS5_SINGLE_GROUP_COHERENCE=1 (driver, opt-in: not shown exact).
+    bool singleWorkgroup = false;
 
     [[nodiscard]] bool PartialGroups() const {
         return partialThreads != std::array<std::uint32_t, 3>{};
@@ -207,6 +214,13 @@ struct ShaderVertexStageInfo {
     std::uint32_t fetchBufferReg;
     bool fetchEmbedded;
     std::uint32_t paClVsOutCntl = 0;
+    // GPU-side indirect draw parameters (gpuind): the user SGPRs the CP writes a record's base
+    // vertex and start instance into for an indirect draw on the vertex path, or -1. A stage
+    // compiled with one of them set reads that SGPR from BaseVertex / BaseInstance and takes the
+    // vertex / instance index VGPR as VertexIndex - BaseVertex / InstanceIndex - BaseInstance (the
+    // record's raw index), so the driver records vkCmdDraw*Indirect without reading the records.
+    std::int32_t drawBaseVertexSgpr = -1;
+    std::int32_t drawStartInstanceSgpr = -1;
 };
 
 struct ShaderFloatMode {
@@ -281,6 +295,9 @@ struct SpirvTarget {
     bool float16DenormPreserve = false;
     bool bindlessImages = false;
     bool spannedWaves = false;
+    // GLSL.std.450 Fma is a fused multiply-add on the device (the driver's startup probe, VulkanDevice
+    // FusedFmaProbe): v_fma_mix* then takes an exact f32 path instead of the f64 helper.
+    bool fusedFma = false;
 };
 
 struct BindingLayout {

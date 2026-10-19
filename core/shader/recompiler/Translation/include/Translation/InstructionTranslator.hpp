@@ -37,6 +37,10 @@ struct TranslateOptions {
     std::optional<ShaderFloatMode> floatMode;
     ShaderStageInputInfo inputInfo;
     const EmbeddedFetchPlan* embeddedFetch = nullptr;
+    // GPU-side indirect draw parameters (ShaderVertexStageInfo::drawBaseVertexSgpr): user SGPRs
+    // read from BaseVertex / BaseInstance, with the index VGPRs relative to them; -1 for none.
+    std::int32_t drawBaseVertexSgpr = -1;
+    std::int32_t drawStartInstanceSgpr = -1;
 };
 
 class InstructionTranslator {

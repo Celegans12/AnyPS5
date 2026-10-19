@@ -132,6 +132,11 @@ bool StoredAllSince_nid_no_patch(std::uint64_t address, std::size_t bytes, std::
 // for every collect: nothing is reused without an ordering point. APS5_PACKET_EPOCH=1 makes the
 // workers bump before every packet as before. CollectEpochBumps counts the bumps ([guestmem] line).
 void BumpCollectEpoch();
+// Back to no epoch (a fresh epoch for every collect, as a thread that never bumped): the presenter's
+// revalidation at a present is one epoch (BumpCollectEpoch at its start, this at its end; the present
+// is its ordering point), so a surface it walks for its staleness check, for the entry's generation and
+// for the texture cache's lookup is walked once.
+void EndCollectEpoch();
 std::uint64_t CollectEpoch();
 std::uint64_t CollectEpochBumps();
 std::uint64_t ThreadCollectEpoch();

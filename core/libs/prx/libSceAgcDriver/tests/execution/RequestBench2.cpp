@@ -217,6 +217,12 @@ int main(int argc, char** argv) {
         request.request.target = device->ComputeTarget(request.request.context.waveSize);
         if (std::getenv("APS5_SPANNED_WAVE") != nullptr) request.request.target.spannedWaves = true;
         if (std::getenv("APS5_BINDLESS_IMAGES") != nullptr) request.request.target.bindlessImages = true;
+        // BENCH_SINGLE_GROUP=1: recompile as the driver does for a 1x1x1 dispatch (ShaderComputeStageInfo::singleWorkgroup);
+        // only meaningful with BENCH_GROUPS=1,1,1 (the default).
+        if (std::getenv("BENCH_SINGLE_GROUP") != nullptr && request.request.context.compute.has_value()) {
+            request.compute->singleWorkgroup = true;
+            request.request.context.compute = request.compute;
+        }
         request.request.useCache = false;
         // Truncation profiling: s_endpgm at the given byte offsets.
         {

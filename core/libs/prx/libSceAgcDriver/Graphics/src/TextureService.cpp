@@ -22,6 +22,12 @@ namespace Heap = ShaderRecompiler::BindlessImageAbi;
 
 std::atomic<std::uint64_t> oldPathNanoseconds{0};
 
+// APS5_NO_EARLY_REVALIDATE=1: the present's revalidation prepares every stale entry under the GPU lock (old).
+bool EarlyRevalidation() {
+    static const bool enabled = std::getenv("APS5_NO_EARLY_REVALIDATE") == nullptr;
+    return enabled;
+}
+
 std::uint64_t Elapsed(std::chrono::steady_clock::time_point started) {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
 }
@@ -486,9 +492,17 @@ void TextureService::install(const DeviceImageKeys::Key& key, BindlessResolution
     ++totals.created;
 }
 
-void TextureService::replace(const DeviceImageKeys::Key& key, Recorder& recorder, Lock& lock) {
+void TextureService::replace(const DeviceImageKeys::Key& key, Recorder& recorder, Lock& lock, const BindlessPrepared* early) {
     lock.unlock();
-    auto prepared = prepare(key);
+    const auto started = std::chrono::steady_clock::now();
+    BindlessPrepared prepared;
+    bool reused = false;
+    if (early != nullptr) {
+        prepared = *early;
+        reused = resolver->RefreshGeneration(prepared);
+    }
+    if (!reused) prepared = prepare(key);
+    const auto prepareNanoseconds = Elapsed(started);
     BindlessResolution fresh;
     std::string refusal = prepared.refusal;
     const bool permanent = prepared.permanent;
@@ -500,7 +514,11 @@ void TextureService::replace(const DeviceImageKeys::Key& key, Recorder& recorder
             fresh = {};
         }
     }
+    const auto commitNanoseconds = Elapsed(started) - prepareNanoseconds;
     lock.lock();
+    totals.replacePrepareNanoseconds += prepareNanoseconds;
+    totals.replaceCommitNanoseconds += commitNanoseconds;
+    if (reused) ++totals.earlyUsed;
     auto found = entries.find(key);
     if (found == entries.end()) {
         discard(fresh, recorder);
@@ -866,8 +884,56 @@ std::uint64_t TextureService::PresentSerial(Recorder& recorder) {
     return recorder.Submissions();
 }
 
-void TextureService::Revalidate(Recorder& recorder) {
+void TextureService::PrepareRevalidation() {
+    if (!EarlyRevalidation()) return;
+    const auto started = std::chrono::steady_clock::now();
+    struct Candidate {
+        DeviceImageKeys::Key key;
+        std::uint64_t address = 0;
+        std::uint64_t bytes = 0;
+        std::uint64_t generation = 0;
+    };
+    std::vector<Candidate> candidates;
+    const auto mapping = memory->MappingSerial();
+    {
+        Lock lock(mutex);
+        early.clear();
+        candidates.reserve(entries.size());
+        for (const auto& [key, entry] : entries) {
+            if (entry.resolution.owner == nullptr || entry.resolution.bytes == 0) continue;
+            candidates.push_back({key, entry.resolution.address, entry.resolution.bytes, entry.resolution.generation});
+        }
+    }
+    // Pages written since the last collect are not stamped yet, so this can find fewer stale entries than
+    // the revalidation will; those are prepared under the lock as before.
+    std::erase_if(candidates, [&](const Candidate& candidate) { return memory->Unchanged(candidate.address, static_cast<std::size_t>(candidate.bytes), candidate.generation); });
+    std::vector<BindlessPrepared> prepared;
+    prepared.reserve(candidates.size());
+    for (const auto& candidate : candidates) {
+        auto item = prepare(candidate.key);
+        if (item.refusal.empty()) prepared.push_back(std::move(item));
+    }
     Lock lock(mutex);
+    early.clear();
+    for (auto& item : prepared) {
+        const auto key = item.key;
+        early.insert_or_assign(key, std::move(item));
+    }
+    earlyMapping = mapping;
+    totals.earlyPrepared += early.size();
+    totals.earlyNanoseconds += Elapsed(started);
+}
+
+void TextureService::Revalidate(Recorder& recorder) {
+    const auto started = std::chrono::steady_clock::now();
+    Lock lock(mutex);
+    // Early preparations are used only when the guest mapping is the one they were checked against: a
+    // surface unmapped (or mapped) in between is prepared again under the lock.
+    auto prepared = std::exchange(early, {});
+    if (!prepared.empty() && memory->MappingSerial() != earlyMapping) {
+        totals.earlyDropped += prepared.size();
+        prepared.clear();
+    }
     checkMapping(recorder);
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
     for (const auto& [key, entry] : entries) {
@@ -880,8 +946,12 @@ void TextureService::Revalidate(Recorder& recorder) {
         else merged.push_back(range);
     }
     lock.unlock();
+    const auto collectStarted = std::chrono::steady_clock::now();
     for (const auto& [begin, end] : merged) memory->Collect(begin, static_cast<std::size_t>(end - begin));
+    const auto collectNanoseconds = Elapsed(collectStarted);
     lock.lock();
+    totals.revalidateCollectNanoseconds += collectNanoseconds;
+    const auto checkStarted = std::chrono::steady_clock::now();
     std::vector<DeviceImageKeys::Key> stale;
     for (const auto& [key, entry] : entries) {
         if (entry.resolution.owner == nullptr) continue;
@@ -890,11 +960,20 @@ void TextureService::Revalidate(Recorder& recorder) {
         if (unchanged && resolver->Current(entry.resolution)) continue;
         stale.push_back(key);
     }
+    totals.revalidateCheckNanoseconds += Elapsed(checkStarted);
     for (const auto& key : stale) {
         if (!entries.contains(key)) continue;
         ++totals.stale;
-        replace(key, recorder, lock);
+        const auto found = prepared.find(key);
+        if (found == prepared.end()) {
+            replace(key, recorder, lock);
+            continue;
+        }
+        const auto item = std::move(found->second);
+        prepared.erase(found);
+        replace(key, recorder, lock, &item);
     }
+    totals.earlyDropped += prepared.size();
     const auto budget = currentBudget();
     if (budget != 0 && pinnedBytes > budget) {
         const auto open = recorder.OpenSerial();
@@ -902,6 +981,7 @@ void TextureService::Revalidate(Recorder& recorder) {
         if (idleBefore != 0) evictIdle(recorder, 0u, idleBefore, budget / 4u * 3u);
     }
     retireNow(recorder);
+    totals.revalidateNanoseconds += Elapsed(started);
 }
 
 void TextureService::AfterPresentWait(Recorder& recorder, std::uint64_t waitedNanoseconds) {
@@ -915,7 +995,10 @@ void TextureService::AfterPresentWait(Recorder& recorder, std::uint64_t waitedNa
     }
     Revalidate(recorder);
     table.ForgetReportedMisses();
+    const auto started = std::chrono::steady_clock::now();
     Publish(recorder);
+    std::lock_guard lock(mutex);
+    totals.publishNanoseconds += Elapsed(started);
 }
 
 std::optional<DeviceImageValue> TextureService::Find(const DeviceImageKeys::Key& key) const {
@@ -991,9 +1074,9 @@ std::string TextureService::TakeFrameLine(std::uint64_t oldPathNanoseconds) {
         refusals += ' ';
         refusals += std::to_string(now.refusals[kind] - reported.refusals[kind]);
     }
-    char text[1664];
-    std::snprintf(text, sizeof(text), "[bindless] frame %llu: misses %llu (%llu dropped), created %llu, refused %llu, primed %llu tables (%llu records, %llu new keys, primer %.1f ms), re-decoded %llu pages (%llu records changed), served-checked %llu (%llu stale), queue %llu, revalidated %llu (%llu stale, %llu per-use, %llu dcc), retired %llu (%llu unmapped, %llu evicted, %llu full), serve %.1f ms over %llu calls, present wait %.1f ms, entries %llu, slots %llu+%llu, pinned %.1f MiB of a %llu MiB budget, old-path resolve %.1f ms, refusals (%s), kept refusals %llu, host: tables %llu (%.1f MiB), entries %.1f MiB, rejections %llu (%.1f MiB), miss ring: %llu records, %llu set clears",
-        static_cast<unsigned long long>(frame), delta(now.misses, reported.misses), static_cast<unsigned long long>(dropped), delta(now.created, reported.created), delta(now.refused, reported.refused), delta(now.primed, reported.primed), delta(now.primedRecords, reported.primedRecords), delta(now.primedKeys, reported.primedKeys), Milliseconds(now.primerNanoseconds - reported.primerNanoseconds), delta(now.pagesChanged, reported.pagesChanged), delta(now.recordsChanged, reported.recordsChanged), delta(now.servedChecked, reported.servedChecked), delta(now.servedStale, reported.servedStale), static_cast<unsigned long long>(now.queued), delta(now.revalidated, reported.revalidated), delta(now.stale, reported.stale), delta(now.refreshed, reported.refreshed), delta(now.dccRefreshed, reported.dccRefreshed), delta(now.retired, reported.retired), delta(now.unmapped, reported.unmapped), delta(now.evicted, reported.evicted), delta(now.fullEvictions, reported.fullEvictions), Milliseconds(now.serveNanoseconds - reported.serveNanoseconds), delta(now.serves, reported.serves), Milliseconds(now.presentWaitNanoseconds - reported.presentWaitNanoseconds), static_cast<unsigned long long>(now.entries), static_cast<unsigned long long>(now.imageSlots), static_cast<unsigned long long>(now.samplerSlots), static_cast<double>(now.pinnedBytes) / static_cast<double>(1u << 20u), static_cast<unsigned long long>(now.budgetBytes >> 20u), Milliseconds(oldPath), refusals.c_str(), delta(now.keptRefusals, reported.keptRefusals), static_cast<unsigned long long>(now.tables), static_cast<double>(now.tableHostBytes) / static_cast<double>(1u << 20u), static_cast<double>(now.entryHostBytes) / static_cast<double>(1u << 20u), static_cast<unsigned long long>(now.rejections), static_cast<double>(now.rejectionHostBytes) / static_cast<double>(1u << 20u), static_cast<unsigned long long>(records), static_cast<unsigned long long>(clears));
+    char text[2048];
+    std::snprintf(text, sizeof(text), "[bindless] frame %llu: misses %llu (%llu dropped), created %llu, refused %llu, primed %llu tables (%llu records, %llu new keys, primer %.1f ms), re-decoded %llu pages (%llu records changed), served-checked %llu (%llu stale), queue %llu, revalidated %llu (%llu stale, %llu per-use, %llu dcc), retired %llu (%llu unmapped, %llu evicted, %llu full), serve %.1f ms over %llu calls, present wait %.1f ms, entries %llu, slots %llu+%llu, pinned %.1f MiB of a %llu MiB budget, old-path resolve %.1f ms, refusals (%s), kept refusals %llu, host: tables %llu (%.1f MiB), entries %.1f MiB, rejections %llu (%.1f MiB), miss ring: %llu records, %llu set clears; revalidate %.1f ms under the GPU lock (collect %.1f, check %.1f, prepare %.1f, commit %.1f), publish %.1f ms, early prepare %.1f ms off the lock (%llu prepared, %llu used, %llu dropped)",
+        static_cast<unsigned long long>(frame), delta(now.misses, reported.misses), static_cast<unsigned long long>(dropped), delta(now.created, reported.created), delta(now.refused, reported.refused), delta(now.primed, reported.primed), delta(now.primedRecords, reported.primedRecords), delta(now.primedKeys, reported.primedKeys), Milliseconds(now.primerNanoseconds - reported.primerNanoseconds), delta(now.pagesChanged, reported.pagesChanged), delta(now.recordsChanged, reported.recordsChanged), delta(now.servedChecked, reported.servedChecked), delta(now.servedStale, reported.servedStale), static_cast<unsigned long long>(now.queued), delta(now.revalidated, reported.revalidated), delta(now.stale, reported.stale), delta(now.refreshed, reported.refreshed), delta(now.dccRefreshed, reported.dccRefreshed), delta(now.retired, reported.retired), delta(now.unmapped, reported.unmapped), delta(now.evicted, reported.evicted), delta(now.fullEvictions, reported.fullEvictions), Milliseconds(now.serveNanoseconds - reported.serveNanoseconds), delta(now.serves, reported.serves), Milliseconds(now.presentWaitNanoseconds - reported.presentWaitNanoseconds), static_cast<unsigned long long>(now.entries), static_cast<unsigned long long>(now.imageSlots), static_cast<unsigned long long>(now.samplerSlots), static_cast<double>(now.pinnedBytes) / static_cast<double>(1u << 20u), static_cast<unsigned long long>(now.budgetBytes >> 20u), Milliseconds(oldPath), refusals.c_str(), delta(now.keptRefusals, reported.keptRefusals), static_cast<unsigned long long>(now.tables), static_cast<double>(now.tableHostBytes) / static_cast<double>(1u << 20u), static_cast<double>(now.entryHostBytes) / static_cast<double>(1u << 20u), static_cast<unsigned long long>(now.rejections), static_cast<double>(now.rejectionHostBytes) / static_cast<double>(1u << 20u), static_cast<unsigned long long>(records), static_cast<unsigned long long>(clears), Milliseconds(now.revalidateNanoseconds - reported.revalidateNanoseconds), Milliseconds(now.revalidateCollectNanoseconds - reported.revalidateCollectNanoseconds), Milliseconds(now.revalidateCheckNanoseconds - reported.revalidateCheckNanoseconds), Milliseconds(now.replacePrepareNanoseconds - reported.replacePrepareNanoseconds), Milliseconds(now.replaceCommitNanoseconds - reported.replaceCommitNanoseconds), Milliseconds(now.publishNanoseconds - reported.publishNanoseconds), Milliseconds(now.earlyNanoseconds - reported.earlyNanoseconds), delta(now.earlyPrepared, reported.earlyPrepared), delta(now.earlyUsed, reported.earlyUsed), delta(now.earlyDropped, reported.earlyDropped));
     reported = now;
     return text;
 }
