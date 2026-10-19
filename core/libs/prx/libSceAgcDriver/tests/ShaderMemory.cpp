@@ -6012,7 +6012,7 @@ void verifySpecializedBufferAtomicBindings() {
         atomicElements += static_cast<std::size_t>(std::count(binding.bufferAtomic.begin(), binding.bufferAtomic.end(), true));
     }
     require(tables == 0, "specialized buffer atomic: a buffer_atomic_inc through a V# the program specializes binds the address tables");
-    require(faults == 1 && result.bdaAbiVersion == BdaAbi::Version, "specialized buffer atomic: the program has no fault buffer for its unaligned atomic");
+    require(faults == 0 && result.bdaAbiVersion == 0u, "specialized buffer atomic: a 32-bit atomic that cannot fault kept the fault buffer its specialized module no longer uses");
     require(atomicElements == 1, "specialized buffer atomic: the V# element is not reported as atomic");
     const auto words = result.spirv.Words();
     std::uint32_t faultFunction = 0;
