@@ -1426,7 +1426,8 @@ void EmitProgram(SpirvEmitterState& state) {
             break;
         }
     }
-    if (program.Resources().stage == IrShaderStage::Pixel && state.bdaStopsInvocations && !OrderedPixelShader(state)) {
+    const bool blendable = std::any_of(state.blendTargetImages.begin(), state.blendTargetImages.end(), [](std::uint32_t image) { return image != 0u; });
+    if (program.Resources().stage == IrShaderStage::Pixel && state.bdaStopsInvocations && !OrderedPixelShader(state) && !blendable) {
         state.pixelGuestFunc = state.module.AllocateId();
         state.pixelStopFlag = state.module.DefineGlobalVariable(TypePointer(state, spv::StorageClassPrivate, TypeBool(state)), spv::StorageClassPrivate);
         if (state.spirvVersion >= 0x00010400u) state.interfaceVariables.push_back(state.pixelStopFlag);
