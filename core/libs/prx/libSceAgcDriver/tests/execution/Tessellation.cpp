@@ -846,8 +846,8 @@ void RequireSingleControlPointHulls(const ShaderRecompiler::SpirvTarget& target)
 }
 
 // sceAgcCreatePrimState resolves the hull and domain programs on the title's thread, inside the
-// transaction sceAgcLinkShaders opens. A domain program the recompiler refuses fails that call; with
-// APS5_SKIP_REFUSED_SHADERS the preparation is skipped and the open transaction still commits.
+// transaction sceAgcLinkShaders opens. A domain program the recompiler refuses is deferred to its draw
+// and the open transaction still commits; with APS5_SKIP_REFUSED_SHADERS the preparation is skipped.
 void RequireRegisteredRefusal() {
     const char* skipText = std::getenv("APS5_SKIP_REFUSED_SHADERS");
     const bool skip = skipText != nullptr && std::atoi(skipText) != 0;
@@ -875,11 +875,11 @@ void RequireRegisteredRefusal() {
             refusal = what.substr(0, what.find('\n'));
         }
     }
-    if (skip && refusal.empty()) AgcDriverWaitIdle_nid_postfix();
+    if (refusal.empty()) AgcDriverWaitIdle_nid_postfix();
     AgcDriverShutdown_nid_postfix();
     if (!skip) {
-        Require(refusal.find("ShaderRecompiler::Recompile: tessellation lowering: ") != std::string::npos, "the refused domain program did not stop ABI resolution: " + (refusal.empty() ? std::string("it was prepared") : refusal));
-        std::puts("registered domain refusal stopped ABI resolution");
+        Require(refusal.empty(), "ABI resolution did not defer the refused domain program: " + refusal);
+        std::puts("registered domain refusal deferred at ABI resolution");
         return;
     }
     Require(refusal.empty(), "APS5_SKIP_REFUSED_SHADERS did not skip the refused domain program at ABI resolution: " + refusal);
