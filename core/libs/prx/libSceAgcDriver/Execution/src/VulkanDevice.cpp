@@ -253,7 +253,34 @@ struct ComputePipelineKey {
     ShaderRecompiler::PipelineIdentity identity;
     bool pushConstants = false;
     auto operator<=>(const ComputePipelineKey&) const = default;
-    static ComputePipelineKey Of(const ShaderRecompiler::RecompileResult& shader, bool pushConstants) { return {shader.Identity(), pushConstants}; }
+    static ComputePipelineKey Of(const ShaderRecompiler::RecompileResult& shader, bool pushConstants) {
+        using Role = ShaderRecompiler::DescriptorRole;
+        using Kind = ShaderRecompiler::DescriptorKind;
+        auto identity = shader.Identity();
+        static const bool exactCounts = std::getenv("APS5_NO_TABLE_COUNT_NEUTRAL_PIPELINES") != nullptr;
+        if (identity.Empty() || exactCounts) return {identity, pushConstants};
+        const bool storageTable = std::any_of(shader.bindings.begin(), shader.bindings.end(), [](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == Role::ImageTable && binding.kind == Kind::StorageImage; });
+        if (storageTable) return {identity, pushConstants};
+        const auto hash = shader.spirv.ContentHash();
+        identity = {hash.low, hash.high};
+        const auto mix = [&](std::uint64_t value) {
+            identity.low = (identity.low ^ value) * 0x9e3779b97f4a7c15ull;
+            identity.low ^= identity.low >> 29u;
+            identity.high = (identity.high ^ (value + 0x7f4a7c159e3779b9ull)) * 0xc2b2ae3d27d4eb4full;
+            identity.high ^= identity.high >> 31u;
+        };
+        mix(shader.specialization.size());
+        for (const auto& constant : shader.specialization) mix(constant.id | (static_cast<std::uint64_t>(constant.value) << 32u));
+        mix(shader.hostSubgroupSize | (shader.fullSubgroups ? 0x10000u : 0u) | (static_cast<std::uint64_t>(shader.workgroupMemoryDwords) << 32u));
+        mix(shader.bindings.size());
+        for (const auto& binding : shader.bindings) {
+            const bool variable = binding.role == Role::SamplerTable || (binding.role == Role::ImageTable && binding.kind == Kind::SampledImage);
+            mix(binding.descriptorSet | (static_cast<std::uint64_t>(binding.binding) << 16u) | (static_cast<std::uint64_t>(binding.kind) << 40u) | (variable ? 0u : static_cast<std::uint64_t>(binding.count) << 48u));
+        }
+        mix(0x7461626c65ull);
+        if (identity.Empty()) identity.low = 1;
+        return {identity, pushConstants};
+    }
 };
 
 constexpr std::uint64_t WorkgroupMemoryGranule = 1u << 20u;
