@@ -27,6 +27,9 @@ struct SpirvTargetOptions {
     bool float16DenormPreserve = false;
     bool spannedWaves = false;
     bool bindlessImages = false;
+    bool fusedFma = false;
+    // ShaderComputeStageInfo::singleWorkgroup of the request.
+    bool singleWorkgroup = false;
 };
 
 struct SpirvEmitInfo {

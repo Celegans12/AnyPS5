@@ -291,7 +291,10 @@ std::uint32_t guestAddress(SpirvEmitterState& state, const RuntimeDescriptor& re
 MemoryResourceAccess directAccess(SpirvValueEmitContext& context, const IrValue& instruction, bool wide = false, bool plainLoad = false) {
     auto& state = context.state;
     const auto& memory = context.Memory(instruction);
-    const auto variable = wide ? state.storageBufferU64Variable : plainLoad || state.storageBufferCoherentVariable == 0u ? state.storageBufferVariable : state.storageBufferCoherentVariable;
+    // A single-workgroup dispatch reads glc buffers through the plain, L1-cached binding (workgroup-scope
+    // coherence, see ShaderComputeStageInfo::singleWorkgroup); its stores and atomics keep the coherent one.
+    const bool plain = plainLoad || (state.singleWorkgroup && BufferAccessOf(instruction.Opcode()) == BufferAccess::Read);
+    const auto variable = wide ? state.storageBufferU64Variable : plain || state.storageBufferCoherentVariable == 0u ? state.storageBufferVariable : state.storageBufferCoherentVariable;
     if (variable == 0u) context.Fail(instruction, "direct buffer descriptor array is missing");
     const auto element = ResourceForDescriptor(state, DescriptorBindingKind::Buffers, memory.resource);
     MemoryResourceAccess access;

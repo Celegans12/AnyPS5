@@ -890,7 +890,9 @@ void EmitBarrier(SpirvValueEmitContext& ctx, const IrValue& inst) {
     }
     const bool tessellation = state.program.Resources().stage == IrShaderStage::TessellationControl;
     const auto memoryScope = tessellation ? spv::ScopeInvocation : spv::ScopeWorkgroup;
-    const std::uint32_t semantics = tessellation ? static_cast<std::uint32_t>(spv::MemorySemanticsMaskNone) : spv::MemorySemanticsAcquireReleaseMask | LdsMemorySemantics(state);
+    // A single-workgroup dispatch's barrier also orders buffer memory: its glc reads go through the
+    // L1-cached binding (ShaderComputeStageInfo::singleWorkgroup) and must see the group's stores.
+    const std::uint32_t semantics = tessellation ? static_cast<std::uint32_t>(spv::MemorySemanticsMaskNone) : spv::MemorySemanticsAcquireReleaseMask | LdsMemorySemantics(state) | (state.singleWorkgroup ? spv::MemorySemanticsUniformMemoryMask : 0u);
     state.module.AddFunction(spv::OpControlBarrier, ConstantU32(state, spv::ScopeWorkgroup), ConstantU32(state, memoryScope), ConstantU32(state, semantics));
 }
 

@@ -596,6 +596,8 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program)
     targetOptions.float16DenormPreserve = request.target.float16DenormPreserve;
     targetOptions.spannedWaves = request.target.spannedWaves;
     targetOptions.bindlessImages = request.target.bindlessImages;
+    targetOptions.fusedFma = request.target.fusedFma;
+    targetOptions.singleWorkgroup = request.context.compute.has_value() && request.context.compute->singleWorkgroup;
 
     constexpr SpirvEmitter spirvEmitter;
     CompiledShaderArtifact result;
@@ -1628,6 +1630,7 @@ std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapsh
         mix(size);
     }
     for (const auto threads : partialThreads(request)) mix(threads);
+    if (request.context.compute.has_value() && request.context.compute->singleWorkgroup) mix(0x51u);
     mix(request.layout.pushConstantOffsetBytes);
     if (request.context.pixel) {
         for (const auto mapping : request.context.pixel->targetExportMapping) mix(mapping);

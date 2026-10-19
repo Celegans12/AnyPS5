@@ -121,6 +121,10 @@ struct SpirvEmitterState {
     bool registrationModules = false;
     bool fragmentDescriptorSet = false;
     bool float16DenormPreserve = false;
+    // See SpirvTarget::fusedFma (EmitFPInterpolateF16's exact f32 path).
+    bool fusedFma = false;
+    // See ShaderComputeStageInfo::singleWorkgroup: glc reads through the plain binding, buffer-ordering s_barrier.
+    bool singleWorkgroup = false;
     std::unordered_set<const IrValue*> sharedLaneValues;
     std::uint32_t laneHalf = 0;
     std::uint32_t spirvVersion = 0x00010300u;
