@@ -1,6 +1,10 @@
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryStatsDevice.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include <atomic>
+#include <span>
 #include "prx/libc/include/GuestArena.hpp"
 #include <algorithm>
 #include <array>
@@ -62,6 +66,12 @@ struct DeviceEntry {
     PFN_vkDestroyBuffer destroyBuffer = nullptr;
     PFN_vkBindBufferMemory bindBufferMemory = nullptr;
     PFN_vkGetBufferDeviceAddress getBufferDeviceAddress = nullptr;
+    PFN_vkCmdCopyBuffer cmdCopyBuffer = nullptr;
+    PFN_vkCmdFillBuffer cmdFillBuffer = nullptr;
+    PFN_vkCmdUpdateBuffer cmdUpdateBuffer = nullptr;
+    PFN_vkCmdCopyImageToBuffer cmdCopyImageToBuffer = nullptr;
+    PFN_vkCmdCopyQueryPoolResults cmdCopyQueryPoolResults = nullptr;
+    PFN_vkUpdateDescriptorSets updateDescriptorSets = nullptr;
 };
 
 bool FaultAddressesTracked() {
@@ -115,6 +125,7 @@ void NoteBufferAddress(std::uint64_t buffer, std::uint64_t address) {
     found->second.address = address;
     registry.live[address] = {buffer, found->second.bytes, found->second.usage, found->second.owner, registry.Now()};
 }
+
 
 struct State {
     std::array<Slot, static_cast<std::size_t>(VkClass::Count)> vk;
@@ -396,6 +407,90 @@ VKAPI_ATTR void VKAPI_CALL TrackedDestroyBuffer(VkDevice device, VkBuffer buffer
     entry->destroyBuffer(device, buffer, allocator);
 }
 
+std::atomic<std::uint64_t> writeChecks{0}, writeCheckFailures{0}, nullDescriptors{0};
+
+void ReportWriteCheck(const char* call, const char* problem, VkBuffer buffer, VkDeviceSize offset, VkDeviceSize bytes, VkDeviceSize known) {
+    const auto count = writeCheckFailures.fetch_add(1, std::memory_order_relaxed);
+    if (count >= 64u) return;
+    unsigned long long frames[8] = {};
+    const auto captured = GuestMemory::CaptureCallerOffsets(std::span<unsigned long long>(frames, 8), 1);
+    std::string stack;
+    char part[32];
+    for (std::size_t i = 0; i < captured; ++i) {
+        std::snprintf(part, sizeof(part), " +0x%llx", frames[i]);
+        stack += part;
+    }
+    const auto packet = GuestMemory::CurrentPacket();
+    std::fprintf(stderr, "[write-check] %s: %s (buffer 0x%llx, offset 0x%llx, bytes 0x%llx, buffer size 0x%llx); program 0x%llx, packet 0x%x queue 0x%x; libSceAgcDriver.prx%s\n", call, problem,
+                 static_cast<unsigned long long>(HandleKey(buffer)), static_cast<unsigned long long>(offset), static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(known),
+                 static_cast<unsigned long long>(Graphics::Recorder::CurrentWriteOrigin()), packet.opcode, packet.queue, stack.c_str());
+}
+
+void CheckBufferWrite(const char* call, VkBuffer buffer, VkDeviceSize offset, VkDeviceSize bytes) {
+    writeChecks.fetch_add(1, std::memory_order_relaxed);
+    if (buffer == VK_NULL_HANDLE) {
+        ReportWriteCheck(call, "VK_NULL_HANDLE destination", buffer, offset, bytes, 0);
+        return;
+    }
+    VkDeviceSize known = 0;
+    bool found = false;
+    {
+        auto& registry = Addresses();
+        std::lock_guard lock(registry.mutex);
+        const auto at = registry.created.find(HandleKey(buffer));
+        if (at != registry.created.end()) {
+            found = true;
+            known = at->second.bytes;
+        }
+    }
+    if (!found) ReportWriteCheck(call, "destination is not a live buffer", buffer, offset, bytes, 0);
+    else if (bytes != VK_WHOLE_SIZE && (offset > known || bytes > known - offset)) ReportWriteCheck(call, "write past the buffer's end", buffer, offset, bytes, known);
+}
+
+VKAPI_ATTR void VKAPI_CALL TrackedCmdCopyBuffer(VkCommandBuffer commands, VkBuffer source, VkBuffer destination, std::uint32_t count, const VkBufferCopy* regions) {
+    for (std::uint32_t i = 0; i < count; ++i) CheckBufferWrite("vkCmdCopyBuffer", destination, regions[i].dstOffset, regions[i].size);
+    Get().devices.back().cmdCopyBuffer(commands, source, destination, count, regions);
+}
+
+VKAPI_ATTR void VKAPI_CALL TrackedCmdFillBuffer(VkCommandBuffer commands, VkBuffer destination, VkDeviceSize offset, VkDeviceSize bytes, std::uint32_t data) {
+    CheckBufferWrite("vkCmdFillBuffer", destination, offset, bytes);
+    Get().devices.back().cmdFillBuffer(commands, destination, offset, bytes, data);
+}
+
+VKAPI_ATTR void VKAPI_CALL TrackedCmdUpdateBuffer(VkCommandBuffer commands, VkBuffer destination, VkDeviceSize offset, VkDeviceSize bytes, const void* data) {
+    CheckBufferWrite("vkCmdUpdateBuffer", destination, offset, bytes);
+    Get().devices.back().cmdUpdateBuffer(commands, destination, offset, bytes, data);
+}
+
+VKAPI_ATTR void VKAPI_CALL TrackedCmdCopyImageToBuffer(VkCommandBuffer commands, VkImage image, VkImageLayout layout, VkBuffer destination, std::uint32_t count, const VkBufferImageCopy* regions) {
+    for (std::uint32_t i = 0; i < count; ++i) CheckBufferWrite("vkCmdCopyImageToBuffer", destination, regions[i].bufferOffset, 1);
+    Get().devices.back().cmdCopyImageToBuffer(commands, image, layout, destination, count, regions);
+}
+
+VKAPI_ATTR void VKAPI_CALL TrackedCmdCopyQueryPoolResults(VkCommandBuffer commands, VkQueryPool pool, std::uint32_t first, std::uint32_t count, VkBuffer destination, VkDeviceSize offset, VkDeviceSize stride, VkQueryResultFlags flags) {
+    CheckBufferWrite("vkCmdCopyQueryPoolResults", destination, offset, count == 0 ? 0 : stride * (count - 1u) + ((flags & VK_QUERY_RESULT_64_BIT) != 0 ? 8u : 4u));
+    Get().devices.back().cmdCopyQueryPoolResults(commands, pool, first, count, destination, offset, stride, flags);
+}
+
+VKAPI_ATTR void VKAPI_CALL TrackedUpdateDescriptorSets(VkDevice device, std::uint32_t writeCount, const VkWriteDescriptorSet* writes, std::uint32_t copyCount, const VkCopyDescriptorSet* copies) {
+    for (std::uint32_t i = 0; i < writeCount; ++i) {
+        const auto& write = writes[i];
+        const bool storage = write.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || write.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
+        const bool uniform = write.descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || write.descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+        if ((!storage && !uniform) || write.pBufferInfo == nullptr) continue;
+        for (std::uint32_t d = 0; d < write.descriptorCount; ++d) {
+            const auto& info = write.pBufferInfo[d];
+            if (info.buffer == VK_NULL_HANDLE) {
+                nullDescriptors.fetch_add(1, std::memory_order_relaxed);
+                if (info.range != VK_WHOLE_SIZE || info.offset != 0) ReportWriteCheck(storage ? "storage descriptor" : "uniform descriptor", "VK_NULL_HANDLE with a range", info.buffer, info.offset, info.range, 0);
+                continue;
+            }
+            CheckBufferWrite(storage ? "storage descriptor" : "uniform descriptor", info.buffer, info.offset, info.range);
+        }
+    }
+    Get().devices.back().updateDescriptorSets(device, writeCount, writes, copyCount, copies);
+}
+
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL TrackedDeviceProc(VkDevice device, const char* name) {
     const auto* entry = Find(device);
     if (entry == nullptr || name == nullptr) return nullptr;
@@ -415,6 +510,12 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL TrackedDeviceProc(VkDevice device, cons
     if (view == "vkCreateBuffer") return reinterpret_cast<PFN_vkVoidFunction>(&TrackedCreateBuffer);
     if (view == "vkDestroyBuffer") return reinterpret_cast<PFN_vkVoidFunction>(&TrackedDestroyBuffer);
     if (FaultAddressesTracked() && entry->bindBufferMemory != nullptr && view == "vkBindBufferMemory") return reinterpret_cast<PFN_vkVoidFunction>(&TrackedBindBufferMemory);
+    if (FaultAddressesTracked() && entry->cmdCopyBuffer != nullptr && view == "vkCmdCopyBuffer") return reinterpret_cast<PFN_vkVoidFunction>(&TrackedCmdCopyBuffer);
+    if (FaultAddressesTracked() && entry->cmdFillBuffer != nullptr && view == "vkCmdFillBuffer") return reinterpret_cast<PFN_vkVoidFunction>(&TrackedCmdFillBuffer);
+    if (FaultAddressesTracked() && entry->cmdUpdateBuffer != nullptr && view == "vkCmdUpdateBuffer") return reinterpret_cast<PFN_vkVoidFunction>(&TrackedCmdUpdateBuffer);
+    if (FaultAddressesTracked() && entry->cmdCopyImageToBuffer != nullptr && view == "vkCmdCopyImageToBuffer") return reinterpret_cast<PFN_vkVoidFunction>(&TrackedCmdCopyImageToBuffer);
+    if (FaultAddressesTracked() && entry->cmdCopyQueryPoolResults != nullptr && view == "vkCmdCopyQueryPoolResults") return reinterpret_cast<PFN_vkVoidFunction>(&TrackedCmdCopyQueryPoolResults);
+    if (FaultAddressesTracked() && entry->updateDescriptorSets != nullptr && view == "vkUpdateDescriptorSets") return reinterpret_cast<PFN_vkVoidFunction>(&TrackedUpdateDescriptorSets);
     if (FaultAddressesTracked() && entry->getBufferDeviceAddress != nullptr && (view == "vkGetBufferDeviceAddress" || view == "vkGetBufferDeviceAddressKHR")) return reinterpret_cast<PFN_vkVoidFunction>(&TrackedGetBufferDeviceAddress);
     return real;
 }
@@ -724,7 +825,7 @@ std::vector<std::string> DescribeDeviceAddress(std::uint64_t address, std::uint6
         lowest = registry.live.begin()->first;
         highest = std::prev(registry.live.end())->first + std::prev(registry.live.end())->second.bytes;
     }
-    std::snprintf(text, sizeof(text), "registry: %zu live addressed buffers in 0x%llx..0x%llx, %llu destroyed (last %llu kept)", registry.live.size(), static_cast<unsigned long long>(lowest), static_cast<unsigned long long>(highest), static_cast<unsigned long long>(registry.destroyedTotal), static_cast<unsigned long long>(count));
+    std::snprintf(text, sizeof(text), "registry: %zu live addressed buffers in 0x%llx..0x%llx, %llu destroyed (last %llu kept); write checks %llu, failed %llu, null descriptors %llu", registry.live.size(), static_cast<unsigned long long>(lowest), static_cast<unsigned long long>(highest), static_cast<unsigned long long>(registry.destroyedTotal), static_cast<unsigned long long>(count), static_cast<unsigned long long>(writeChecks.load()), static_cast<unsigned long long>(writeCheckFailures.load()), static_cast<unsigned long long>(nullDescriptors.load()));
     lines.emplace_back(text);
     return lines;
 }
@@ -753,6 +854,12 @@ PFN_vkGetDeviceProcAddr TrackDevice(VkDevice device, VkPhysicalDevice physical, 
     entry.bindBufferMemory = reinterpret_cast<PFN_vkBindBufferMemory>(real(device, "vkBindBufferMemory"));
     entry.getBufferDeviceAddress = reinterpret_cast<PFN_vkGetBufferDeviceAddress>(real(device, "vkGetBufferDeviceAddress"));
     if (entry.getBufferDeviceAddress == nullptr) entry.getBufferDeviceAddress = reinterpret_cast<PFN_vkGetBufferDeviceAddress>(real(device, "vkGetBufferDeviceAddressKHR"));
+    entry.cmdCopyBuffer = reinterpret_cast<PFN_vkCmdCopyBuffer>(real(device, "vkCmdCopyBuffer"));
+    entry.cmdFillBuffer = reinterpret_cast<PFN_vkCmdFillBuffer>(real(device, "vkCmdFillBuffer"));
+    entry.cmdUpdateBuffer = reinterpret_cast<PFN_vkCmdUpdateBuffer>(real(device, "vkCmdUpdateBuffer"));
+    entry.cmdCopyImageToBuffer = reinterpret_cast<PFN_vkCmdCopyImageToBuffer>(real(device, "vkCmdCopyImageToBuffer"));
+    entry.cmdCopyQueryPoolResults = reinterpret_cast<PFN_vkCmdCopyQueryPoolResults>(real(device, "vkCmdCopyQueryPoolResults"));
+    entry.updateDescriptorSets = reinterpret_cast<PFN_vkUpdateDescriptorSets>(real(device, "vkUpdateDescriptorSets"));
     if (entry.allocateMemory == nullptr || entry.freeMemory == nullptr || entry.createShaderModule == nullptr || entry.destroyShaderModule == nullptr ||
         entry.createGraphicsPipelines == nullptr || entry.createComputePipelines == nullptr || entry.destroyPipeline == nullptr ||
         entry.getPipelineCacheData == nullptr || entry.createImage == nullptr || entry.destroyImage == nullptr ||
