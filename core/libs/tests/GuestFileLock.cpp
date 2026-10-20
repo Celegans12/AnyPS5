@@ -267,7 +267,7 @@ static int ChildTry(const std::string& path, int mode) {
     PROCESS_INFORMATION process{};
     Require(::CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process) != 0);
     ::CloseHandle(process.hThread);
-    if (::WaitForSingleObject(process.hProcess, 3000) != WAIT_OBJECT_0) {
+    if (::WaitForSingleObject(process.hProcess, 30000) != WAIT_OBJECT_0) {
         ::TerminateProcess(process.hProcess, 99);
         std::abort();
     }

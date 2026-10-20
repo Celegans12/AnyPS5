@@ -1,4 +1,5 @@
 #include "prx/libSceVideoOut/include/DisplayWindow.hpp"
+#include "prx/libSceVideoOut/include/Telemetry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/AspectFit.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libkernel/AppMetadata/include/AppMetadata.hpp"
@@ -107,7 +108,6 @@ void DisplayWindow::UpdateTitle() {
     require(window != nullptr, "window must exist before updating title");
     static const AppTitle title = GetAppTitle_nid_postfix();
     static std::uint64_t fpsStart = sceKernelGetProcessTimeCounter();
-    static std::uint64_t frameNum = 0;
     static std::uint64_t fpsFrames = 0;
     static double currentFps = 0.0;
     const auto now = sceKernelGetProcessTimeCounter();
@@ -122,6 +122,7 @@ void DisplayWindow::UpdateTitle() {
     char text[160];
     std::snprintf(text, sizeof(text), "%s | FPS: %.2f (%llu)", title.value, currentFps, static_cast<unsigned long long>(frameNum));
     SDL_SetWindowTitle(window, text);
+    if (auto* telemetry = VideoOutTelemetry::Instance(); telemetry != nullptr && (frameNum == 1 || frameNum % 30 == 0)) telemetry->EmitPresent(frameNum, currentFps);
 }
 
 void DisplayWindow::installSubclass() {

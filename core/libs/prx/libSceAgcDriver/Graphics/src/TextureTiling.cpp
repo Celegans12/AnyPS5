@@ -527,6 +527,30 @@ bool LevelsFitAllocation(const GuestTextureResource& surface, std::uint32_t leve
     return true;
 }
 
+bool TracksBlockUnits(const GuestTextureResource& surface, const SurfaceGeometry& geometry) {
+    return !geometry.thick && surface.tileMode != TextureTileMode::kLinear && surface.baseAddress % 65536 == 0 && (surface.dccAddress == 0 || surface.mipCount == 1);
+}
+
+GuestTextureResource ViewedArrayWindow(const GuestTextureResource& viewed) {
+    const bool layered = viewed.dimension == TextureDimension::k2DArray || viewed.dimension == TextureDimension::k1DArray || viewed.dimension == TextureDimension::kCube;
+    if (!layered || viewed.baseArray == 0 || viewed.baseArray > viewed.depthOrLastArray || viewed.dccAddress != 0) return viewed;
+    if (const auto xorMode = XorSwizzleMode(viewed.tileMode); xorMode != 0u) {
+        const auto* equation = FindTextureSwizzleEquation(xorMode, BytesPerElement(viewed.format));
+        if (equation == nullptr) return viewed;
+        std::uint32_t sliceBits = 0;
+        for (const auto bit : equation->bits) sliceBits |= bit >> 24u;
+        const auto sliceMask = sliceBits == 0 ? 0u : (1u << std::bit_width(sliceBits)) - 1u;
+        if ((viewed.baseArray & sliceMask) != 0) return viewed;
+    }
+    const auto geometry = DescribeSurface(viewed);
+    if (geometry.thick || geometry.layers != viewed.depthOrLastArray + 1u) return viewed;
+    auto window = viewed;
+    window.baseAddress = viewed.baseAddress + geometry.GuestLayerOffset(viewed.baseArray);
+    window.depthOrLastArray = viewed.depthOrLastArray - viewed.baseArray;
+    window.baseArray = 0;
+    return window;
+}
+
 std::vector<TileMipLayout> ComputeElementMipLayout(TextureTileMode tileMode, std::uint32_t bytesPerElement, std::uint32_t width, std::uint32_t height, std::uint32_t mipCount) {
     Require(width != 0 && height != 0 && mipCount != 0 && mipCount <= 16u, "invalid surface mip chain");
     if (tileMode == TextureTileMode::kLinear) return ComputeLinearMipLayout(bytesPerElement, 1u, 1u, width, height, mipCount);

@@ -926,6 +926,8 @@ void testEop(bool overlay) {
     const std::uint64_t bits = static_cast<std::uint64_t>(argument);
     std::vector<std::uint32_t> completion{0xc0027900u, 0x342u, 0xc7010107u, static_cast<std::uint32_t>(bus), 0xc0043700u, 0x06010000u, 0xc343u, 0u, static_cast<std::uint32_t>(bits), static_cast<std::uint32_t>(bits >> 32u)};
     completion.push_back(0x80004900u);
+    const std::array<std::uint32_t, 8> nop{0xc0061000u, 0x02000000u, 0u, 0u, 0u, 0u, token, 0u};
+    completion.insert(completion.end(), nop.begin(), nop.end());
     completion.insert(completion.end(), release.begin(), release.end());
     submit(completion);
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);

@@ -11,6 +11,7 @@
 #endif
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include "prx/libkernel/Socket/include/SocketSelectDeadline.hpp"
+#include "prx/libkernel/Time/include/Time.hpp"
 #include "SceTypes.hpp"
 #include <algorithm>
 #include <array>
@@ -89,6 +90,9 @@ struct GuestPollEntry {
 int APS5_VABI poll_nid_postfix(GuestPollEntry*, std::uint32_t, int);
 int* APS5_VABI __error_nid_postfix();
 int APS5_VABI sceNetInetPton(int, const char*, void*);
+int APS5_VABI sceNetInetPtonEx(int, const char*, void*, int);
+int APS5_VABI sceNetUsleep(int);
+void APS5_VABI sceNetGetSystemTime(std::uint64_t*);
 const char* APS5_VABI sceNetInetNtop(int, const void*, char*, std::uint32_t);
 int* APS5_VABI sceNetErrnoLoc(void);
 }
@@ -715,6 +719,79 @@ static void CheckAddressText(int family, const char* text) {
     Require(sceNetInetNtop(family, address.data(), nullptr, output.size()) == nullptr && *sceNetErrnoLoc() == 22);
 }
 
+static void CheckInetPtonRejects(int family, const char* text) {
+    std::array<std::uint8_t, 16> address{};
+    address.fill(0xaa);
+    *sceNetErrnoLoc() = 123;
+    Require(sceNetInetPton(family, text, address.data()) == 0 && *sceNetErrnoLoc() == 123);
+    Require(std::all_of(address.begin(), address.end(), [](std::uint8_t byte) { return byte == 0xaa; }));
+}
+
+static void CheckInetPtonWhitespace() {
+    for (const char* text : {"1.2.3.4 ", "1.2.3.4\t", "1.2.3.4\n", "1.2.3.4\v", "1.2.3.4\f", "1.2.3.4\r", "1.2.3.4 5", "1.2.3.4 x"}) {
+        std::array<std::uint8_t, 16> address{};
+        address.fill(0xaa);
+        *sceNetErrnoLoc() = 123;
+        Require(sceNetInetPton(2, text, address.data()) == 1 && *sceNetErrnoLoc() == 123);
+        Require(address[0] == 1 && address[1] == 2 && address[2] == 3 && address[3] == 4 && address[4] == 0xaa);
+    }
+    for (const char* text : {" 1.2.3.4", "1.2.3.4x", "1.2.3.4.", "1.2.3.4\x01", "1.2.3.4\xa0", "1.2. 3.4", "1.2.3", "1.2.3 ", "01.2.3.4", "256.0.0.1"}) {
+        CheckInetPtonRejects(2, text);
+    }
+    for (const char* text : {"::1 ", "::1\t", " ::1", "::1x"}) {
+        CheckInetPtonRejects(28, text);
+    }
+}
+
+static void CheckInetPtonEx() {
+    std::array<std::uint8_t, 16> address{};
+    Require(sceNetInetPtonEx(2, "192.168.1.20", address.data(), 0) == 1);
+    Require(address[0] == 192 && address[1] == 168 && address[2] == 1 && address[3] == 20);
+    std::array<std::uint8_t, 16> expected{};
+    Require(sceNetInetPton(28, "fe80::1:2", expected.data()) == 1);
+    address.fill(0);
+    Require(sceNetInetPtonEx(28, "fe80::1:2", address.data(), 0) == 1 && address == expected);
+    Require(sceNetInetPtonEx(2, "not an address", address.data(), 0) == 0);
+    Require(Failed(sceNetInetPtonEx(99, "127.0.0.1", address.data(), 0), 47));
+    Require(Failed(sceNetInetPtonEx(2, nullptr, address.data(), 0), 22));
+    Require(Failed(sceNetInetPtonEx(2, "127.0.0.1", nullptr, 0), 22));
+    for (const int flags : {1, -1}) {
+        bool threw = false;
+        try { sceNetInetPtonEx(2, "127.0.0.1", address.data(), flags); } catch (const std::runtime_error&) { threw = true; }
+        Require(threw);
+    }
+}
+
+static void CheckSystemTime() {
+    *sceNetErrnoLoc() = 22;
+    sceNetGetSystemTime(nullptr);
+    Require(*sceNetErrnoLoc() == 22);
+    std::array<std::uint64_t, 3> output{0x123456789abcdef0ULL, UINT64_MAX, 0xfedcba9876543210ULL};
+    std::uint64_t previous = 0;
+    for (int i = 0; i < 64; ++i) {
+        output[1] = UINT64_MAX;
+        const auto before = sceKernelGetProcessTime();
+        sceNetGetSystemTime(&output[1]);
+        const auto after = sceKernelGetProcessTime();
+        Require(before <= output[1] && output[1] <= after && previous <= output[1]);
+        Require(output[0] == 0x123456789abcdef0ULL && output[2] == 0xfedcba9876543210ULL);
+        Require(*sceNetErrnoLoc() == 22);
+        previous = output[1];
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    sceNetGetSystemTime(&output[1]);
+    Require(output[1] > previous);
+}
+
+static void CheckUsleep() {
+    Require(sceNetUsleep(0) == 0);
+    const auto start = std::chrono::steady_clock::now();
+    Require(sceNetUsleep(2000) == 0);
+    Require(std::chrono::steady_clock::now() - start >= std::chrono::microseconds(2000));
+    *sceNetErrnoLoc() = 0;
+    Require(Failed(sceNetUsleep(-1), 22));
+}
+
 static void CheckEpollIdent() {
     std::array<std::uint8_t, 16> address{16, 2, 0, 0, 127, 0, 0, 1};
     const int receiver = sceNetSocket("epoll-ident", 2, 2, 17);
@@ -739,6 +816,27 @@ static void CheckEpollIdent() {
     Require(ready.data.u64 == 0x1122334455667788);
     Require(sceNetEpollDestroy(epoll) == 0);
     Require(sceNetSocketClose(sender) == 0 && sceNetSocketClose(receiver) == 0);
+}
+
+static void CheckTcpNoDelay() {
+    const int stream = sceNetSocket("tcp-nodelay", 2, 1, 6);
+    const int datagram = sceNetSocket("tcp-nodelay-udp", 2, 2, 17);
+    Require(stream >= 0 && datagram >= 0);
+    int value = -1;
+    std::uint32_t size = sizeof(value);
+    Require(sceNetGetsockopt(stream, 6, 1, &value, &size) == 0 && size == sizeof(value) && value == 0);
+    const int on = 1;
+    const int off = 0;
+    Require(sceNetSetsockopt(stream, 6, 1, &on, sizeof(on)) == 0);
+    Require(sceNetGetsockopt(stream, 6, 1, &value, &size) == 0 && value == 4);
+    Require(setsockopt_nid_postfix(stream, 6, 1, &off, sizeof(off)) == 0);
+    Require(sceNetGetsockopt(stream, 6, 1, &value, &size) == 0 && value == 0);
+    Require(Failed(sceNetSetsockopt(stream, 6, 2, &on, sizeof(on)), 42));
+    Require(Failed(sceNetGetsockopt(stream, 6, 2, &value, &size), 42));
+    Require(Failed(sceNetSetsockopt(datagram, 6, 1, &on, sizeof(on)), 22));
+    Require(Failed(sceNetGetsockopt(datagram, 6, 1, &value, &size), 22));
+    Require(Failed(sceNetSetsockopt(datagram, 6, 2, &on, sizeof(on)), 22));
+    Require(sceNetSocketClose(stream) == 0 && sceNetSocketClose(datagram) == 0);
 }
 
 static bool ipv6Unavailable = false;
@@ -1139,7 +1237,12 @@ int main() {
     CheckAddressText(2, "255.255.255.255");
     CheckAddressText(28, "::1");
     CheckAddressText(28, "1234:5678:9abc:def0:1234:5678:9abc:def0");
+    CheckInetPtonWhitespace();
+    CheckInetPtonEx();
+    CheckUsleep();
+    CheckSystemTime();
     CheckEpollIdent();
+    CheckTcpNoDelay();
     CheckLinkLocalAllNodesIpv6();
     CheckUnboundSocketName();
     CheckUnboundDatagramReceive();

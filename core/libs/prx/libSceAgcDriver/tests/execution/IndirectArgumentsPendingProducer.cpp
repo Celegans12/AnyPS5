@@ -1,5 +1,9 @@
 #include "VulkanTestDevice.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include <SDL_loadso.h>
 #include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -12,10 +16,14 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <initializer_list>
 #include <iostream>
 #include <new>
+#include <memory>
+#include <mutex>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -132,6 +140,128 @@ void Submit(std::uint32_t queue, std::vector<std::uint32_t>& words) {
     else Require(sceAgcDriverSubmitAcb(queue, &packet) == 0, "compute submit failed");
 }
 
+ShaderRecompiler::RecompileResult Recompile(AgcDriver::VulkanDevice& device, Slot& slot, std::span<const std::uint32_t> code, std::initializer_list<std::uint32_t> userData) {
+    const std::array<ShaderRecompiler::MemoryRegion, 2> memory{{
+        {reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)},
+        {reinterpret_cast<std::uintptr_t>(slot.counterDescriptor.data()), std::as_bytes(std::span(slot.counterDescriptor))},
+    }};
+    const ShaderRecompiler::ShaderComputeStageInfo compute{{1, 1, 1}, 0, {false, false, false}, false, 1};
+    ShaderRecompiler::RecompileRequest request{
+        {ShaderRecompiler::ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}},
+        {32, 0, std::span(userData.begin(), userData.size()), compute, std::nullopt, std::nullopt, memory},
+        device.ComputeTarget(32),
+        {0, 0, 0, 128}
+    };
+    request.useCache = false;
+    return ShaderRecompiler::Recompile(request);
+}
+
+class ProducerSubmissionGate {
+public:
+    explicit ProducerSubmissionGate(AgcDriver::VulkanDevice& device) : device(device) {
+#ifdef _WIN32
+        constexpr const char* libraryName = "vulkan-1.dll";
+#else
+        constexpr const char* libraryName = "libvulkan.so.1";
+#endif
+        library.reset(SDL_LoadObject(libraryName));
+        Require(library != nullptr, "cannot load Vulkan for the producer submission gate");
+        resolve = reinterpret_cast<PFN_vkGetDeviceProcAddr>(SDL_LoadFunction(library.get(), "vkGetDeviceProcAddr"));
+        Require(resolve != nullptr, "cannot resolve vkGetDeviceProcAddr for the producer submission gate");
+        const auto createEvent = function<PFN_vkCreateEvent>("vkCreateEvent");
+        destroyEvent = function<PFN_vkDestroyEvent>("vkDestroyEvent");
+        setEvent = function<PFN_vkSetEvent>("vkSetEvent");
+        waitEvents = function<PFN_vkCmdWaitEvents>("vkCmdWaitEvents");
+        const VkEventCreateInfo info{VK_STRUCTURE_TYPE_EVENT_CREATE_INFO};
+        Require(createEvent(device.Device(), &info, nullptr, &event) == VK_SUCCESS, "cannot create the producer submission gate");
+    }
+
+    ~ProducerSubmissionGate() {
+        if (worker.joinable()) {
+            worker.request_stop();
+            worker.join();
+        }
+        setEvent(device.Device(), event);
+        try {
+            device.WaitIdle();
+        } catch (...) {
+        }
+        destroyEvent(device.Device(), event, nullptr);
+    }
+
+    void Record(AgcDriver::Graphics::Recorder& recorder) {
+        waitEvents(recorder.Commands(), 1, &event, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, nullptr, 0, nullptr, 0, nullptr);
+    }
+
+    void ReleaseAfterSubmission(AgcDriver::Graphics::Recorder& recorder, std::uint64_t serial) {
+        worker = std::jthread([this, &recorder, serial](std::stop_token stop) {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (!stop.stop_requested() && recorder.NewestSubmitted() < serial && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::microseconds(100));
+            producerSubmitted = recorder.NewestSubmitted() >= serial;
+            releaseResult = setEvent(device.Device(), event);
+            if (!producerSubmitted && !stop.stop_requested()) std::fprintf(stderr, "pending producer gate: watchdog expired with producer batch %llu unsubmitted (vkSetEvent %d)\n", static_cast<unsigned long long>(serial), static_cast<int>(releaseResult));
+        });
+    }
+
+    void Finish() {
+        worker.join();
+        Require(releaseResult == VK_SUCCESS, "cannot release the producer submission gate");
+        Require(producerSubmitted, "the CPU argument read did not submit the later leased producer before waiting for its earlier argument label");
+        device.WaitIdle();
+    }
+
+private:
+    template <typename TFunction>
+    TFunction function(const char* name) const {
+        const auto function = reinterpret_cast<TFunction>(resolve(device.Device(), name));
+        Require(function != nullptr, std::string("cannot resolve ") + name + " for the producer submission gate");
+        return function;
+    }
+
+    AgcDriver::VulkanDevice& device;
+    std::unique_ptr<void, decltype(&SDL_UnloadObject)> library{nullptr, &SDL_UnloadObject};
+    PFN_vkGetDeviceProcAddr resolve = nullptr;
+    PFN_vkDestroyEvent destroyEvent = nullptr;
+    PFN_vkSetEvent setEvent = nullptr;
+    PFN_vkCmdWaitEvents waitEvents = nullptr;
+    VkEvent event = VK_NULL_HANDLE;
+    std::jthread worker;
+    bool producerSubmitted = false;
+    VkResult releaseResult = VK_NOT_READY;
+};
+
+void RunArgumentLabel(Slot& slot) {
+    AgcDriverShutdown_nid_postfix();
+    slot.arguments = {3, 1, 1, 0};
+    const auto device = OpenVulkanTestDevice();
+    Require(device != nullptr, "cannot open the argument-label test device");
+    const auto producer = Recompile(*device, slot, AddressWriterCode, {Low(slot.arguments.data()), High(slot.arguments.data()), Groups, 1, 1});
+    const auto consumer = Recompile(*device, slot, CounterCode, {Low(slot.counterDescriptor.data()), High(slot.counterDescriptor.data())});
+    const auto preparedProducer = device->PrepareDispatch(producer, {}, 1, reinterpret_cast<std::uintptr_t>(AddressWriterCode.data()));
+    const auto preparedConsumer = device->PrepareDispatch(consumer, {}, 0, reinterpret_cast<std::uintptr_t>(CounterCode.data()));
+    std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+    auto* recorder = AgcDriver::Graphics::Recorder::Active();
+    Require(recorder != nullptr, "the argument-label test has no active recorder");
+    ProducerSubmissionGate gate(*device);
+    gate.Record(*recorder);
+    const std::uint32_t labelValue = 2;
+    const auto labelAddress = reinterpret_cast<std::uintptr_t>(&slot.arguments[1]);
+    Require(device->WriteLabelOnGpu(labelAddress, std::as_bytes(std::span(&labelValue, 1)), 1, Graphics, false) == 0, "the argument label was not recorded on the GPU");
+    device->SubmitRecorded(false);
+    const auto producerSerial = recorder->OpenSerial();
+    gate.ReleaseAfterSubmission(*recorder, producerSerial);
+    const auto deferredBefore = AgcDriver::Graphics::LeaseCounters().deferred;
+    device->Dispatch(producer, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(AddressWriterCode.data()), preparedProducer);
+    Require(AgcDriver::Graphics::LeaseCounters().deferred > deferredBefore, "the address-based producer did not defer its registry lease");
+    Require(recorder->Submissions() < producerSerial && recorder->Recording(), "the producer was submitted before the CPU argument decision");
+    Require(recorder->PendingLabel(labelAddress, 4, 0).has_value(), "the earlier argument label retired before the CPU argument decision");
+    const auto outcome = device->DispatchIndirect(consumer, reinterpret_cast<std::uintptr_t>(slot.arguments.data()), {}, reinterpret_cast<std::uintptr_t>(CounterCode.data()), preparedConsumer);
+    Require(outcome.cpuReason == 2, "the indirect dispatch did not take the pending-label CPU fallback (reason " + std::to_string(outcome.cpuReason) + ")");
+    std::fprintf(stderr, "pending producer CPU fallback: cpuReason %d\n", outcome.cpuReason);
+    gate.Finish();
+    slot.done = 1;
+}
+
 void Run(Slot& slot, const Variant& variant) {
     slot.arguments = {Stale[0], Stale[1], Stale[2], 0};
     slot.counter = {};
@@ -187,23 +317,17 @@ void Run(Slot& slot, const Variant& variant) {
         Submit(Compute, second);
         break;
     case Order::ArgumentLabelInEarlierBatch:
-        Spin(first, slot, 8u * SpinDispatches);
-        WriteData(first, &slot.arguments[1], Stale[1] + 1u);
-        Produce(second, slot);
-        Consume(second, slot, variant.initiator);
-        WriteData(second, &slot.done, 1);
-        Submit(Graphics, first);
-        Submit(Graphics, second);
+        RunArgumentLabel(slot);
         break;
     }
-    AgcDriverWaitIdle_nid_postfix();
+    if (variant.order != Order::ArgumentLabelInEarlierBatch) AgcDriverWaitIdle_nid_postfix();
     const auto start = std::chrono::steady_clock::now();
     while (Load(slot.done) == 0) {
         Require(std::chrono::steady_clock::now() - start < std::chrono::seconds(10), std::string(variant.name) + ": the consumer's completion label did not land");
         std::this_thread::sleep_for(std::chrono::microseconds(100));
     }
     Require(Load(slot.arguments[0]) == Groups && Load(slot.arguments[1]) == 1 && Load(slot.arguments[2]) == 1, std::string(variant.name) + ": the producer's address-based store did not write the indirect arguments");
-    Require(Load(slot.counter[0]) == Groups, std::string(variant.name) + ": the indirect dispatch ran " + std::to_string(Load(slot.counter[0])) + " threads, expected the " + std::to_string(Groups) + " its producer's address-based store wrote over {3, 288, 0xffffffff}");
+    Require(Load(slot.counter[0]) == Groups, std::string(variant.name) + ": the indirect dispatch ran " + std::to_string(Load(slot.counter[0])) + " threads, expected the " + std::to_string(Groups) + " its producer's address-based store wrote");
 }
 
 }

@@ -1458,6 +1458,88 @@ class ImportAuditTests(unittest.TestCase):
         self.assertEqual((code, err), (0, ""))
         self.assertNotIn("Host dependencies", out)
 
+    def test_pe_host_dependencies_ignore_library_name_case(self):
+        work = self.work
+        (work.libs / "libSceB.prx").write_bytes(build_pe_with_imports([], ["BBBBBBBBBBB"]))
+        registry, report = work.root / "game.json", work.root / "audit.json"
+        write_registry(registry, [])
+        for dependency in ("LIBSCEB.PRX", "libsceb.prx", "LiBsCeB.PrX"):
+            with self.subTest(dependency=dependency):
+                (work.libs / "libSceA.prx").write_bytes(build_pe_with_imports([dependency], ["AAAAAAAAAAA"]))
+                code, out, err = work.run(registry, "--json", str(report))
+                self.assertEqual((code, err), (0, ""), out)
+                self.assertEqual(json.loads(report.read_text())["missing_host_dependencies"], [])
+
+    def test_pe_host_dependency_case_does_not_hide_a_transitive_gap(self):
+        work = self.work
+        (work.libs / "libSceA.prx").write_bytes(build_pe_with_imports(["LIBSCEB.PRX"]))
+        (work.libs / "libSceB.prx").write_bytes(build_pe_with_imports(["LIBSCEMISSING.PRX"]))
+        registry, report = work.root / "game.json", work.root / "audit.json"
+        write_registry(registry, [])
+        code, _, err = work.run(registry, "--json", str(report))
+        self.assertEqual((code, err), (1, ""))
+        self.assertEqual(json.loads(report.read_text())["missing_host_dependencies"], [
+            {"importer": "libSceA.prx", "chain": ["libSceA.prx", "libSceB.prx", "LIBSCEMISSING.PRX"]},
+            {"importer": "libSceB.prx", "chain": ["libSceB.prx", "LIBSCEMISSING.PRX"]},
+        ])
+
+    def test_pe_host_dependency_can_find_a_module_with_different_case(self):
+        work = self.work
+        (work.libs / "libSceA.prx").write_bytes(build_pe_with_imports(["LIBSCEIME.PRX"]))
+        (work.modules / "libSceIme.prx").write_bytes(exporting())
+        registry = work.root / "game.json"
+        write_registry(registry, [])
+        code, out, err = work.run(registry)
+        self.assertEqual((code, err), (0, ""), out)
+
+    def test_pe_host_dependency_can_find_a_converted_pe_module_with_different_case(self):
+        work = self.work
+        (work.libs / "libSceA.prx").write_bytes(build_pe_with_imports(["LIBSCEIME.PRX"]))
+        (work.modules / "libSceIme.prx.guest.prx").write_bytes(build_pe_with_imports([]))
+        registry, report = work.root / "game.json", work.root / "audit.json"
+        write_registry(registry, [])
+        code, out, err = work.run(registry, "--json", str(report))
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertEqual(json.loads(report.read_text())["missing_host_dependencies"], [])
+
+    def test_elf_host_dependency_case_stays_significant_in_a_mixed_graph(self):
+        work = self.work
+        (work.libs / "libSceA.prx").write_bytes(build_pe_with_imports(["LIBSCEB.PRX"]))
+        (work.libs / "libSceB.prx").write_bytes(build_elf([], ["LIBSCEC.PRX"]))
+        (work.libs / "libSceC.prx").write_bytes(exporting())
+        registry, report = work.root / "game.json", work.root / "audit.json"
+        write_registry(registry, [])
+        code, _, err = work.run(registry, "--json", str(report))
+        self.assertEqual((code, err), (1, ""))
+        self.assertEqual(json.loads(report.read_text())["missing_host_dependencies"], [
+            {"importer": "libSceA.prx", "chain": ["libSceA.prx", "libSceB.prx", "LIBSCEC.PRX"]},
+            {"importer": "libSceB.prx", "chain": ["libSceB.prx", "LIBSCEC.PRX"]},
+        ])
+
+    def test_pe_host_dependency_rejects_ambiguous_case_variants(self):
+        work = self.work
+        other = work.root / "other-libs"
+        other.mkdir()
+        (work.libs / "libSceA.prx").write_bytes(build_pe_with_imports(["LIBSCEB.PRX"]))
+        (work.libs / "libSceB.prx").write_bytes(build_pe_with_imports([], ["AAAAAAAAAAA"]))
+        (other / "LIBSCEB.prx").write_bytes(build_pe_with_imports([], ["BBBBBBBBBBB"]))
+        registry, report = work.root / "game.json", work.root / "audit.json"
+        write_registry(registry, [])
+        report.write_bytes(b"previous complete report")
+        code, out, err = work.run(registry, "--libs", str(other), "--json", str(report))
+        self.assertEqual((code, out), (2, ""))
+        self.assertIn("ambiguous Windows host library", err)
+        self.assertEqual(report.read_bytes(), b"previous complete report")
+
+    def test_pe_host_dependency_cycle_with_different_case_terminates(self):
+        work = self.work
+        (work.libs / "libSceA.prx").write_bytes(build_pe_with_imports(["LIBSCEB.PRX"]))
+        (work.libs / "libSceB.prx").write_bytes(build_pe_with_imports(["LIBSCEA.PRX"]))
+        registry = work.root / "game.json"
+        write_registry(registry, [])
+        code, out, err = work.run(registry)
+        self.assertEqual((code, err), (0, ""), out)
+
     def test_elf_host_dependencies_are_walked(self):
         work = self.work
         (work.libs / "libSceA.prx").write_bytes(build_elf(

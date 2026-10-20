@@ -141,6 +141,44 @@ void CheckSpeculativeRoots() {
     Require(threw, "Malformed mandatory root was treated as speculative");
 }
 
+void CheckTrailingZeroRoots() {
+    const Pointers pointers;
+    const Bytes lone{0x00};
+    bool threw = false;
+    try {
+        BuildControlFlowGraph(lone, TextAddress, TextAddress, {}, pointers);
+    } catch (const Codegen::CodegenException&) {
+        threw = true;
+    }
+    Require(threw, "A lone zero instruction at the entry was not decoded");
+
+    const Bytes trailing{0xc3, 0x00};
+    threw = false;
+    try {
+        BuildControlFlowGraph(trailing, TextAddress, TextAddress, {TextAddress + 1}, pointers);
+    } catch (const Codegen::CodegenException&) {
+        threw = true;
+    }
+    Require(threw, "A zero instruction at an extra entry was not decoded");
+
+    const Bytes jump{0xeb, 0x00, 0x00};
+    threw = false;
+    try {
+        BuildControlFlowGraph(jump, TextAddress, TextAddress, {}, pointers);
+    } catch (const Codegen::CodegenException&) {
+        threw = true;
+    }
+    Require(threw, "A branch into a truncated zero instruction was not decoded");
+
+    const Bytes pair{0x00, 0x00};
+    const auto complete = BuildControlFlowGraph(pair, TextAddress, TextAddress, {}, pointers);
+    RequireOffsets(*complete, {0});
+
+    const Bytes immediate{0xb8, 0x00, 0x00, 0x00, 0x00};
+    const auto zeroImmediate = BuildControlFlowGraph(immediate, TextAddress, TextAddress, {}, pointers);
+    RequireOffsets(*zeroImmediate, {0});
+}
+
 void CheckBorrowedReachability() {
     const Pointers pointers;
     const Bytes text{0x90, 0x90, 0xc3, 0x90, 0xc3};
@@ -223,6 +261,7 @@ int main() {
         CheckRelocatedTransfers();
         CheckCodeAddresses();
         CheckSpeculativeRoots();
+        CheckTrailingZeroRoots();
         CheckBorrowedReachability();
         CheckAddressOverflow();
         CheckHighVirtualAddress();

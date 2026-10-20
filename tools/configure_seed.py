@@ -1,4 +1,5 @@
 import argparse
+import fnmatch
 import re
 import sys
 from pathlib import Path
@@ -28,8 +29,14 @@ def main():
     parser = argparse.ArgumentParser(description="Write the configure check results of a CMake cache as an initial cache file")
     parser.add_argument("cache", help="CMakeCache.txt of a configured tree")
     parser.add_argument("seed", help="file to pass to cmake -C")
+    parser.add_argument("--include", action="append", default=[], metavar="GLOB",
+                        help="seed matching check names only; repeat to include several patterns")
+    parser.add_argument("--exclude", action="append", default=[], metavar="GLOB",
+                        help="omit matching check names after inclusion; patterns are case-sensitive")
     args = parser.parse_args()
-    found = checks(args.cache)
+    found = {name: entry for name, entry in checks(args.cache).items()
+             if (not args.include or any(fnmatch.fnmatchcase(name, pattern) for pattern in args.include))
+             and not any(fnmatch.fnmatchcase(name, pattern) for pattern in args.exclude)}
     Path(args.seed).write_text("".join(f"set({quote(name)} {quote(value)} CACHE INTERNAL {quote(doc)})\n"
                                        for name, (value, doc) in sorted(found.items())), encoding="utf-8")
     print(f"{len(found)} check results")

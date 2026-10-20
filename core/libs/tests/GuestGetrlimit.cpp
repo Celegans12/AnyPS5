@@ -2,13 +2,20 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
+#include <string>
 #include <initializer_list>
 #include <limits>
 #include <stdexcept>
 #include <vector>
-#ifndef _WIN32
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <sys/resource.h>
 #include <unistd.h>
+#endif
+#ifdef __APPLE__
+#include <sys/sysctl.h>
 #endif
 
 struct ResourceLimit {
@@ -22,6 +29,8 @@ extern "C" int APS5_VABI getdtablesize_nid_postfix(void);
 extern "C" int APS5_VABI setrlimit_nid_postfix(int resource, const ResourceLimit* limit);
 extern "C" int APS5_VABI pipe_nid_postfix(int* descriptors);
 extern "C" int APS5_VABI close_nid_postfix(int descriptor);
+extern "C" void* APS5_VABI fopen_nid_postfix(const char* filename, const char* mode);
+extern "C" int APS5_VABI fclose_nid_postfix(void* stream);
 
 static constexpr int GUEST_EFAULT = 14;
 static constexpr int GUEST_EINVAL = 22;
@@ -52,12 +61,9 @@ static ResourceLimit GuestLimit(int resource) {
     return limit;
 }
 
-static void CheckOpenFileLimit() {
+#if defined(_WIN32) || defined(__APPLE__)
+static void RequireDescriptorsEndAt(const ResourceLimit& limit) {
     constexpr int GUEST_EMFILE = 24;
-    const ResourceLimit limit = GuestLimit(GUEST_RLIMIT_NOFILE);
-    Require(limit.rlim_cur == limit.rlim_max);
-#ifdef _WIN32
-    Require(limit.rlim_cur == 8192);
     std::vector<int> descriptors;
     int pair[2]{-1, -1};
     *__error_nid_postfix() = 0;
@@ -70,11 +76,42 @@ static void CheckOpenFileLimit() {
     Require(*__error_nid_postfix() == GUEST_EMFILE);
     Require(descriptors.size() + 64 >= static_cast<std::size_t>(limit.rlim_cur));
     for (const int descriptor : descriptors) Require(close_nid_postfix(descriptor) == 0);
+}
+#endif
+
+#ifdef _WIN32
+static void RequireStreamsOpen() {
+    const auto path = (std::filesystem::temp_directory_path() / ("aps5-open-streams-" + std::to_string(GetCurrentProcessId()))).string();
+    std::vector<void*> streams;
+    for (int index = 0; index < 1024; ++index) {
+        void* stream = fopen_nid_postfix(path.c_str(), "ab");
+        Require(stream != nullptr);
+        streams.push_back(stream);
+    }
+    for (void* stream : streams) Require(fclose_nid_postfix(stream) == 0);
+    std::filesystem::remove(path);
+}
+#endif
+
+static void CheckOpenFileLimit() {
+    const ResourceLimit limit = GuestLimit(GUEST_RLIMIT_NOFILE);
+    Require(limit.rlim_cur == limit.rlim_max);
+#ifdef _WIN32
+    Require(limit.rlim_cur == 8192);
+    RequireDescriptorsEndAt(limit);
+    RequireStreamsOpen();
 #else
     rlimit host{};
     Require(getrlimit(RLIMIT_NOFILE, &host) == 0);
     Require(host.rlim_cur == host.rlim_max);
     Require(host.rlim_cur == RLIM_INFINITY ? limit.rlim_cur == GUEST_RLIM_INFINITY : limit.rlim_cur == static_cast<std::int64_t>(host.rlim_cur));
+#endif
+#ifdef __APPLE__
+    int perProcess = 0;
+    std::size_t size = sizeof(perProcess);
+    Require(sysctlbyname("kern.maxfilesperproc", &perProcess, &size, nullptr, 0) == 0);
+    Require(perProcess > 0 && limit.rlim_cur <= perProcess);
+    RequireDescriptorsEndAt(limit);
 #endif
     Require(setrlimit_nid_postfix(GUEST_RLIMIT_NOFILE, &limit) == 0);
     const ResourceLimit lowered{limit.rlim_max > 1 ? limit.rlim_max - 1 : 1, limit.rlim_max};
@@ -128,17 +165,6 @@ static void LoweredHostLimitIsReported() {
 }
 #endif
 
-static void RequireUnsupported(int resource) {
-    ResourceLimit limit{};
-    bool rejected = false;
-    try {
-        getrlimit_nid_postfix(resource, &limit);
-    } catch (const std::runtime_error&) {
-        rejected = true;
-    }
-    Require(rejected);
-}
-
 int main() {
 #ifdef _WIN32
     GuestLimit(GUEST_RLIMIT_DATA);
@@ -150,6 +176,8 @@ int main() {
              GUEST_RLIMIT_CPU,
              GUEST_RLIMIT_FSIZE,
              GUEST_RLIMIT_CORE,
+             GUEST_RLIMIT_RSS,
+             GUEST_RLIMIT_MEMLOCK,
              GUEST_RLIMIT_SBSIZE,
              GUEST_RLIMIT_AS,
              GUEST_RLIMIT_NPTS,
@@ -168,14 +196,12 @@ int main() {
     RequireError(GUEST_RLIM_NLIMITS, nullptr, GUEST_EINVAL);
     RequireError(-1, nullptr, GUEST_EINVAL);
     RequireError(GUEST_RLIMIT_DATA, nullptr, GUEST_EFAULT);
-    for (int resource : {
-             GUEST_RLIMIT_STACK,
-             GUEST_RLIMIT_RSS,
-             GUEST_RLIMIT_MEMLOCK,
-             GUEST_RLIMIT_NPROC,
-         }) {
-        RequireUnsupported(resource);
-    }
+    const ResourceLimit stack = GuestLimit(GUEST_RLIMIT_STACK);
+    Require(stack.rlim_cur == 0x200000 && stack.rlim_max == 0x200000);
+    RequireError(GUEST_RLIMIT_STACK, nullptr, GUEST_EFAULT);
+    const ResourceLimit processes = GuestLimit(GUEST_RLIMIT_NPROC);
+    Require(processes.rlim_cur == 1604 && processes.rlim_max == 1604);
+    RequireError(GUEST_RLIMIT_NPROC, nullptr, GUEST_EFAULT);
     const ResourceLimit nofile = GuestLimit(GUEST_RLIMIT_NOFILE);
     const int tableSize = getdtablesize_nid_postfix();
     std::int64_t expectedTableSize = nofile.rlim_cur;

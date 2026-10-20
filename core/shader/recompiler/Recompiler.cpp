@@ -4,6 +4,7 @@
 #include "UnnormalizedWrap.hpp"
 #include "StencilReplay.hpp"
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <atomic>
 #include <chrono>
@@ -19,6 +20,7 @@
 #include <list>
 #include <functional>
 #include <map>
+#include <memory>
 #include <set>
 #include <mutex>
 #include <new>
@@ -320,10 +322,11 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
 // shared immutable object every later capture that reproduces the snapshot receives, so Populate
 // and the per-request copy run once per distinct snapshot.
 struct ResultMemoEntry {
-    std::uint64_t variantId;
-    std::uint64_t hash;
+    std::uint64_t variantId = 0;
+    std::uint64_t hash = 0;
     std::shared_ptr<const RecompileResult> result;
     std::uint64_t bytes = 0;
+    std::uint64_t used = 0;
 };
 
 struct EmissionFailure {
@@ -331,6 +334,10 @@ struct EmissionFailure {
     BindingLayout layout;
     std::exception_ptr failure;
 };
+
+constexpr std::size_t ResultMemoSets = 64;
+constexpr std::size_t ResultMemoWays = 4;
+using ResultMemoTable = std::array<ResultMemoEntry, ResultMemoSets * ResultMemoWays>;
 
 struct SourceEntry : std::enable_shared_from_this<SourceEntry> {
     std::mutex mutex;
@@ -353,6 +360,8 @@ struct SourceEntry : std::enable_shared_from_this<SourceEntry> {
     std::list<ResultMemoEntry> memo;
     std::unordered_map<std::uint64_t, std::list<ResultMemoEntry>::iterator> memoIndex;
     std::uint64_t memoBytes = 0;
+    std::unique_ptr<ResultMemoTable> memoTable;
+    std::uint64_t memoClock = 0;
 };
 
 namespace {
@@ -612,6 +621,39 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program)
     targetOptions.singleWorkgroup = request.context.compute.has_value() && request.context.compute->singleWorkgroup;
     targetOptions.robustBufferAccess2 = request.target.robustBufferAccess2;
     targetOptions.float32FlushToZero = request.target.float32FlushToZero;
+    targetOptions.meshBarycentricPixel = request.shader.stage == ShaderStage::Fragment && request.graphics && request.graphics->mesh;
+    if (request.shader.stage == ShaderStage::Mesh && request.graphics && request.graphics->meshBarycentrics) {
+        const auto& paired = *request.graphics->meshBarycentrics;
+        const auto emulated = DescribeEmulatedInterface(paired.parameters, paired.emulation, true);
+        const auto& layout = emulated.layout;
+        targetOptions.meshBarycentricVertex = true;
+        targetOptions.barycentricSmoothLocation = layout.smoothLocation;
+        targetOptions.barycentricLinearLocation = layout.linearLocation;
+        targetOptions.barycentricPositionsLocation = layout.positionsLocation;
+        targetOptions.meshExportedLocations = emulated.passed;
+        for (const auto& parameter : emulated.perVertex) targetOptions.meshPerVertexLocations.emplace_back(parameter.sourceLocation, parameter.location);
+        if (!request.graphics->mesh || !request.target.mesh) throw std::runtime_error("barycentric emulation on the mesh path needs a mesh configuration and a device with mesh shaders");
+        const auto& config = *request.graphics->mesh;
+        const auto& limits = *request.target.mesh;
+        if (config.provokingVertex != 0u) throw std::runtime_error("barycentric emulation on the mesh path is only measured with the first provoking vertex");
+        const std::uint64_t perVertexParameters = emulated.perVertex.size();
+        const std::uint64_t sharedBytes = 16ull * config.maxVertices * (1u + perVertexParameters) + DeviceMemoryLdsBytes(request);
+        if (sharedBytes > limits.maxSharedMemoryBytes) throw std::runtime_error("barycentric emulation on the mesh path needs " + std::to_string(sharedBytes) + " bytes of mesh shared memory for " + std::to_string(config.maxVertices) + " vertices, the device allows " + std::to_string(limits.maxSharedMemoryBytes));
+        MeshOutputUse use;
+        std::set<std::uint32_t> flatLocations;
+        for (const auto& output : program.Info().outputs) {
+            if (output.kind == StageOutputKind::Parameter && std::ranges::find(targetOptions.meshExportedLocations, output.location) != targetOptions.meshExportedLocations.end()) flatLocations.insert(output.location);
+            if (output.kind == StageOutputKind::ClipDistance) use.clipDistances = std::max(use.clipDistances, output.index + 1u);
+            if (output.kind == StageOutputKind::CullDistance) use.cullDistances = std::max(use.cullDistances, output.index + 1u);
+            if (output.kind == StageOutputKind::Layer) use.layer = true;
+        }
+        use.flatParameters = static_cast<std::uint32_t>(flatLocations.size());
+        use.perVertexParameters = static_cast<std::uint32_t>(perVertexParameters);
+        use.clipVaryings = emulated.barycentrics;
+        const auto budget = MeshBarycentricOutputBudget(config, limits, use);
+        if (budget.components > limits.maxOutputComponents) throw std::runtime_error("barycentric emulation on the mesh path needs " + std::to_string(budget.components) + " mesh output components (" + std::to_string(budget.vertexLocations) + " per-vertex and " + std::to_string(budget.primitiveLocations) + " per-primitive locations), the device allows " + std::to_string(limits.maxOutputComponents));
+        if (budget.bytes > limits.maxOutputMemoryBytes) throw std::runtime_error("barycentric emulation on the mesh path needs " + std::to_string(budget.bytes) + " bytes of mesh output memory, the device allows " + std::to_string(limits.maxOutputMemoryBytes));
+    }
 
     constexpr SpirvEmitter spirvEmitter;
     CompiledShaderArtifact result;
@@ -634,9 +676,10 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program)
     result.registrationModule = registration;
     result.bindlessHeap = request.target.bindlessImages && ResourceMaterializer::UsesBindlessImages(program.Info(), program.Resources().stage);
     if (result.bindlessHeap) ResourceMaterializer::RegisterBindlessInterfaces(program.Info(), program.Resources().stage);
+    if (request.shader.stage == ShaderStage::Mesh && request.graphics) result.meshBarycentrics = request.graphics->meshBarycentrics;
     result.stencilReplaySafe = (request.shader.stage == ShaderStage::Vertex || stencilReplay) && StencilReplaySafe(program);
     if (stencilReplay) {
-        result.stencilReferences = StencilReferenceValues(program);
+        result.stencilReferences = StencilReferenceValues(program, request.context.pixel.has_value() && request.context.pixel->stencilOperationValueExport ? 8u : 0u);
         result.stencilReferenceDword = bindings.layout.stencilReferenceDword;
     }
 
@@ -1241,6 +1284,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         .parameterExports = artifact.parameterExports,
         .fragmentParameters = artifact.fragmentParameters,
         .barycentricEmulation = artifact.barycentricEmulation,
+        .meshBarycentrics = artifact.meshBarycentrics,
         .stencilReferences = artifact.stencilReferences,
         .stencilReplaySafe = artifact.stencilReplaySafe,
         .stencilReferenceDword = artifact.stencilReferenceDword,
@@ -1446,6 +1490,26 @@ void attachSubstitutes(CompiledVariant& variant) {
 
 }
 
+MeshOutputBudget MeshBarycentricOutputBudget(const MeshConfiguration& mesh, const MeshTargetLimits& limits, const MeshOutputUse& use) {
+    const auto alignUp = [](std::uint64_t value, std::uint64_t granularity) { return granularity <= 1u ? value : (value + granularity - 1u) / granularity * granularity; };
+    MeshOutputBudget budget;
+    budget.vertexLocations = 1u + use.flatParameters + use.clipVaryings + (use.clipDistances + 3u) / 4u + (use.cullDistances + 3u) / 4u;
+    budget.primitiveLocations = 3u + 3u * use.perVertexParameters + 1u + (use.layer ? 1u : 0u);
+    budget.components = 4ull * (budget.vertexLocations + budget.primitiveLocations);
+    budget.bytes = 16ull * (budget.vertexLocations * alignUp(mesh.maxVertices, limits.outputPerVertexGranularity) + budget.primitiveLocations * alignUp(mesh.maxPrimitives, limits.outputPerPrimitiveGranularity));
+    return budget;
+}
+
+std::optional<MeshBarycentricLayout> MeshBarycentricLayoutOf(const RecompileResult& fragment) {
+    if (!fragment.barycentricEmulation.active) return std::nullopt;
+    MeshBarycentricLayout layout;
+    layout.emulation = fragment.barycentricEmulation;
+    for (const auto& parameter : fragment.fragmentParameters) {
+        layout.parameters.push_back({parameter.location, parameter.sourceLocation, false, parameter.perVertex});
+    }
+    return layout;
+}
+
 struct PreparedInterface {
     static CompiledVariant Compile(SourceEntry& source, const RecompileRequest& request, ShaderPreparationContext& preparation, std::exception_ptr* emissionFailure) {
         if (preparation.interfaceSource.get() != &source || preparation.interfaceProgram->Resources().shaderHash != request.shader.codeAddress) {
@@ -1568,6 +1632,16 @@ bool ResultMemo() {
 }
 
 constexpr std::size_t ResultMemoEntries = 256;
+
+bool ResultMemoSetTable() {
+    static const bool table = std::getenv("APS5_RESULT_MEMO_TABLE") != nullptr;
+    return table;
+}
+
+ResultMemoEntry* memoSet(SourceEntry& source, std::uint64_t index) {
+    if (source.memoTable == nullptr) return nullptr;
+    return source.memoTable->data() + static_cast<std::size_t>((index ^ (index >> 32u)) % ResultMemoSets) * ResultMemoWays;
+}
 
 struct ResultMemoCounters {
     std::atomic<std::uint64_t> hits{0}, misses{0}, evictions{0}, populateNanoseconds{0};
@@ -1714,13 +1788,27 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
     {
         std::lock_guard lock(source.mutex);
         index = (variant->artifact.variantId * 0x9e3779b97f4a7c15ull) ^ hash;
-        const auto found = source.memoIndex.find(index);
-        if (found != source.memoIndex.end() && found->second->variantId == variant->artifact.variantId && found->second->hash == hash) {
-            source.memo.splice(source.memo.begin(), source.memo, found->second);
-            counters.hits.fetch_add(1, std::memory_order_relaxed);
-            if (memoHit != nullptr) *memoHit = true;
-            reportResultMemo();
-            return found->second->result;
+        if (ResultMemoSetTable()) {
+            if (auto* set = memoSet(source, index)) {
+                for (std::size_t way = 0; way < ResultMemoWays; ++way) {
+                    auto& entry = set[way];
+                    if (entry.result == nullptr || entry.variantId != variant->artifact.variantId || entry.hash != hash) continue;
+                    entry.used = ++source.memoClock;
+                    counters.hits.fetch_add(1, std::memory_order_relaxed);
+                    if (memoHit != nullptr) *memoHit = true;
+                    reportResultMemo();
+                    return entry.result;
+                }
+            }
+        } else {
+            const auto found = source.memoIndex.find(index);
+            if (found != source.memoIndex.end() && found->second->variantId == variant->artifact.variantId && found->second->hash == hash) {
+                source.memo.splice(source.memo.begin(), source.memo, found->second);
+                counters.hits.fetch_add(1, std::memory_order_relaxed);
+                if (memoHit != nullptr) *memoHit = true;
+                reportResultMemo();
+                return found->second->result;
+            }
         }
     }
     const auto started = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -1731,6 +1819,28 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
     std::shared_ptr<const RecompileResult> shared = std::move(result);
     {
         std::lock_guard lock(source.mutex);
+        if (ResultMemoSetTable()) {
+            if (source.memoTable == nullptr) source.memoTable = std::make_unique<ResultMemoTable>();
+            auto* set = memoSet(source, index);
+            auto* victim = set;
+            bool present = false;
+            for (std::size_t way = 0; way < ResultMemoWays && !present; ++way) {
+                auto& entry = set[way];
+                if (entry.result != nullptr && entry.variantId == variant->artifact.variantId && entry.hash == hash) {
+                    entry.used = ++source.memoClock;
+                    shared = entry.result;
+                    present = true;
+                } else if (entry.used < victim->used) {
+                    victim = &entry;
+                }
+            }
+            if (!present) {
+                if (victim->result != nullptr) counters.evictions.fetch_add(1, std::memory_order_relaxed);
+                *victim = {variant->artifact.variantId, hash, shared, 0, ++source.memoClock};
+            }
+            reportResultMemo();
+            return shared;
+        }
         const auto drop = [&](std::list<ResultMemoEntry>::iterator entry) {
             source.memoBytes -= entry->bytes;
             counters.liveEntries.fetch_sub(1, std::memory_order_relaxed);
@@ -2007,6 +2117,7 @@ std::uint64_t ResultHeapBytes(const RecompileResult& result) {
     }
     for (const auto& ranges : result.imageTableReadRanges) bytes += vectorHeapBytes(ranges);
     for (const auto& table : result.bindlessTables) bytes += vectorHeapBytes(table.uses);
+    if (result.meshBarycentrics) bytes += vectorHeapBytes(result.meshBarycentrics->parameters);
     return bytes;
 }
 

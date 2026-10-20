@@ -46,4 +46,31 @@ int APS5_VABI sceNpGameIntentTerminate(void) {
  return 0;
 }
 
+int APS5_VABI sceNpGameIntentInitParamInit(NpGameIntentInitParam* param) {
+    if (param == nullptr) {
+        APS5_INVALID_ARG_EX;
+    }
+    std::memset(param, 0, sizeof(NpGameIntentInitParam));
+    param->size = sizeof(NpGameIntentInitParam);
+    return 0;
+}
+
+int APS5_VABI sceNpGameIntentInfoInit(NpGameIntentInfo* info) {
+    if (info == nullptr) {
+        APS5_INVALID_ARG_EX;
+    }
+    std::memset(info, 0, sizeof(NpGameIntentInfo));
+    info->size = sizeof(NpGameIntentInfo);
+    info->user_id = NpGameIntentUserIdInvalid;
+    return 0;
+}
+
+int APS5_VABI sceNpGameIntentVshInitialize(void) {
+    return 0;
+}
+
+int APS5_VABI sceNpGameIntentVshTerminate(void) {
+    return 0;
+}
+
 }

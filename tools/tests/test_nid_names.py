@@ -210,6 +210,29 @@ class NidArgumentTests(unittest.TestCase):
         rows = json.loads(printed.call_args.args[0])["rows"]
         self.assertEqual({row["nid"]: row["suggestion"] for row in rows}, database)
 
+    def test_symbol_files_and_stdin_compute_nids_without_a_database(self):
+        with tempfile.TemporaryDirectory() as directory:
+            names = Path(directory) / "symbols.txt"
+            symbols = ["sceExample", "-leading-dash", "  literal spaces  ", "unicode_Ω", "sceExample"]
+            names.write_bytes(("\ufeff" + "\r\n".join(symbols) + "\r\n\r\n").encode("utf-8"))
+            for source in (str(names), "-"):
+                with self.subTest(source=source), patch("sys.stdin", io.StringIO(names.read_text(encoding="utf-8-sig"))), \
+                        patch.object(nid_names, "load_db", side_effect=AssertionError("database used")), \
+                        contextlib.redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(nid_names.main(["--name", "first", "--from-file", source, "--json"]), 0)
+                rows = json.loads(output.getvalue())["symbols"]
+                self.assertEqual(rows, [{"name": name, "nid": nid_names.compute_nid(name)} for name in ["first", *symbols]])
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as exited:
+                nid_names.main(["--from-file", str(names), "--nid"])
+            self.assertEqual(exited.exception.code, 2)
+            with patch.object(nid_names, "load_db", side_effect=AssertionError("database used")), \
+                    contextlib.redirect_stdout(io.StringIO()) as output, \
+                    contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as exited:
+                nid_names.main(["--from-file", str(names.parent / "missing"), "--json"])
+            self.assertEqual(exited.exception.code, 2)
+            self.assertEqual(output.getvalue(), "")
+
+
 
 class SourceCollectionTests(unittest.TestCase):
     def setUp(self):

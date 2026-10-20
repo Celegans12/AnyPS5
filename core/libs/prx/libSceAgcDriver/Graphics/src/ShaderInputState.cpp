@@ -143,7 +143,9 @@ ShaderRecompiler::ShaderPixelStageInfo DecodePixelStageInfo(const Registers& con
     const bool pixelKillEnable = ((shaderControl >> 6u) & 0x1u) != 0;
     const bool depthExportEnable = (shaderControl & 0x1u) != 0;
     const bool sampleMaskExportEnable = ((shaderControl >> 8u) & 0x1u) != 0;
-    const bool stencilRefExportEnable = ((shaderControl >> 1u) & 0x1u) != 0;
+    const bool stencilOperationValue = !nullProgram && StencilOperationValueReplaces(context);
+    const bool stencilRefExportEnable = ((shaderControl >> 1u) & 0x1u) != 0 || stencilOperationValue;
+    if (stencilOperationValue && PixelEarlyZ(shaderControl)) throw std::runtime_error("AGC graphics: early tests with a pixel shader that exports the stencil operation value are unsupported");
     const auto loaded = [&](PixelInput input) { return (activeInputs & PixelInputBit(input)) != 0; };
     std::uint32_t positionControl = 0;
     if (loaded(PixelInput::PositionX) || loaded(PixelInput::PositionY)) {
@@ -181,6 +183,7 @@ ShaderRecompiler::ShaderPixelStageInfo DecodePixelStageInfo(const Registers& con
         .targetOutputMode = targetOutputMode,
         .targetExportMapping = nullProgram ? std::array<std::uint8_t, 8>{} : exportMappings,
         .stencilRefExportEnable = stencilRefExportEnable,
+        .stencilOperationValueExport = stencilOperationValue,
         .positionLocation = (positionControl & 0x100000u) != 0u ? ShaderRecompiler::PixelPositionLocation::UpperLeft : static_cast<ShaderRecompiler::PixelPositionLocation>(floatLocation)
     };
 }

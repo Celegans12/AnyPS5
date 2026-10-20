@@ -191,6 +191,15 @@ int main() {
     Require(_read_nid_postfix(descriptors[0], pipeBuffer, sizeof(pipeBuffer)) == sizeof(pipeBuffer));
     Require(std::memcmp(pipeBuffer, pipePayload, sizeof(pipePayload)) == 0);
     Require(close_nid_postfix(descriptors[0]) == 0);
+    int capacityDescriptors[2] = {-1, -1};
+    Require(pipe_nid_postfix(capacityDescriptors) == 0);
+    std::string largePayload(8192, 'x');
+    Require(write_nid_postfix(capacityDescriptors[1], largePayload.data(), largePayload.size()) == static_cast<std::int64_t>(largePayload.size()));
+    Require(close_nid_postfix(capacityDescriptors[1]) == 0);
+    std::string largeBuffer(8192, '\0');
+    Require(_read_nid_postfix(capacityDescriptors[0], largeBuffer.data(), largeBuffer.size()) == static_cast<std::int64_t>(largeBuffer.size()));
+    Require(largeBuffer == largePayload);
+    Require(close_nid_postfix(capacityDescriptors[0]) == 0);
 #ifndef _WIN32
     int nonBlockingPipe[2] = {-1, -1};
     Require(pipe_nid_postfix(nonBlockingPipe) == 0);

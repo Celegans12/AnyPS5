@@ -24,6 +24,12 @@
 
 namespace {
 
+std::string Hex(std::uint32_t value) {
+    char text[16];
+    std::snprintf(text, sizeof(text), "0x%08x", value);
+    return text;
+}
+
 using AgcDriver::Graphics::Require;
 
 constexpr std::uint32_t Threads = 64;
@@ -94,7 +100,7 @@ void CheckSplitCoverage(AgcDriver::VulkanDevice& device) {
     device.WaitIdle();
     AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(guest.Data()), guest.Bytes);
     for (std::uint32_t i = 0; i < Stores; ++i) {
-        Require(guest.Data()[i] == Pattern[i % Period], "oversized dispatch: dword " + std::to_string(i) + " is 0x" + std::to_string(guest.Data()[i]) + ", expected 0x" + std::to_string(Pattern[i % Period]));
+        Require(guest.Data()[i] == Pattern[i % Period], "oversized dispatch: dword " + std::to_string(i) + " is " + Hex(guest.Data()[i]) + ", expected " + Hex(Pattern[i % Period]));
     }
 }
 

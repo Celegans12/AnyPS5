@@ -143,8 +143,8 @@ def digest(trace, summary=None, stacks=None, worst=5, top=10):
                         leaders[name] += overlap
                 if is_wait(name) and not nested:
                     waited += overlap
-            if is_wait(name) and not nested:
-                waits.append((dur, name, trace.name(tid), ts))
+            if is_wait(name) and not nested and (overlap > 0 or not frames):
+                waits.append((overlap, name, trace.name(tid), max(ts, frames[0][1]) if frames else ts))
         threads.append({"thread": trace.name(tid), "busy_ms_per_frame": (traced - waited) / 1000.0 / count,
                         "wait_ms_per_frame": waited / 1000.0 / count,
                         "untraced_ms_per_frame": max(span_us - traced, 0.0) / 1000.0 / count,
@@ -289,7 +289,7 @@ def digest_intervals(lines):
                      "trace_dropped": line.get("trace_dropped", False)})
     first = lines[0] if lines else {}
     keys = ("commit", "dirty", "env", "gpu", "driver", "os", "resolution")
-    changed = [index for index, line in enumerate(lines) if any(line.get(key) != first.get(key) for key in keys)]
+    changed = [index for index in range(1, len(lines)) if any(lines[index].get(key) != lines[index - 1].get(key) for key in keys)]
     return {"intervals": rows, "identity": {key: first.get(key) for key in keys}, "identity_changed_at": changed}
 
 

@@ -75,6 +75,7 @@ bool LaneSource(const IrProgram& program, const IrValue& value) {
     case IrOpcode::DataConsume:
     case IrOpcode::LoadVectorWindow:
     case IrOpcode::DataOrderedCount:
+    case IrOpcode::DataOrderedSwap:
         return true;
     case IrOpcode::GetBuiltin: {
         const auto* kind = value.Argument(0)->Resolve();
@@ -344,7 +345,9 @@ SpirvRequirements AnalyzeProgramRequirements(const IrProgram& program) {
             if (IsImageAtomic64Opcode(inst->Opcode())) {
                 requirements.imageInt64Atomics = true;
             }
-            if (IsFloat64Opcode(inst->Opcode())) {
+            if (inst->Opcode() == IrOpcode::FPInterpolateF32 || inst->Opcode() == IrOpcode::FPInterpolateF16) {
+                requirements.float64Interpolation = true;
+            } else if (IsFloat64Opcode(inst->Opcode())) {
                 requirements.float64 = true;
             }
             if (addressAccess != AddressAccess::None) {

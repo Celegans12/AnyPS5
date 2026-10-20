@@ -43,6 +43,7 @@ RECORD_SIZE = 0x20
 RECORD_HAS_SEGMENT = 0x800
 RECORD_SEGMENT_SHIFT = 20
 FIRST_REGION = 0x400
+MAX_EMPTY_LOAD_PADDING = 64 * 1024 * 1024
 PT_LOAD = 1
 PT_NOTE = 4
 ENTROPY_LIMIT = 7.5
@@ -195,8 +196,12 @@ def place_segments(data, headers, records):
                     header["source"] = 0
                     continue
                 raise Refused("segment %d vaddr %#x is in no PT_LOAD" % (header["index"], header["vaddr"]))
+            offset = header["vaddr"] - host["vaddr"]
+            if header["size"] and (offset > host["size"] or header["size"] > host["size"] - offset):
+                raise Refused("segment %d does not fit the file-backed range of PT_LOAD %d"
+                              % (header["index"], host["index"]))
             header["host"] = host
-            header["source"] = host["source"] + (header["vaddr"] - host["vaddr"])
+            header["source"] = host["source"] + offset
             if tail is None or header["offset"] > tail[0]:
                 tail = (header["offset"], header["source"] - header["offset"])
         elif header["size"]:
@@ -273,13 +278,21 @@ def unwrap(path, output, verbose=False):
         region["new"] = placed
         cursor = placed + region["size"]
 
+    empty_end = cursor
+    for header in headers:
+        if header["type"] == PT_LOAD and header["size"] == 0:
+            empty_end = max(empty_end, header["vaddr"] % max(header["align"], 1))
+    if empty_end - cursor > MAX_EMPTY_LOAD_PADDING:
+        raise Refused("empty load alignment requires more than %d bytes of output padding" % MAX_EMPTY_LOAD_PADDING)
+    cursor = empty_end
+
     result = bytearray(cursor)
     for region in regions:
         result[region["new"]:region["new"] + region["size"]] = data[region["old"]:region["old"] + region["size"]]
 
     for header in headers:
         if header["size"] == 0 and (header["type"] == PT_LOAD or header["source"] == 0):
-            header["new"] = 0
+            header["new"] = header["vaddr"] % max(header["align"], 1) if header["type"] == PT_LOAD else 0
             continue
         region = region_for(header["source"], header["size"])
         header["new"] = header["source"] if region is None else region["new"] + (header["source"] - region["old"])
@@ -330,4 +343,6 @@ def main():
 
 
 if __name__ == "__main__":
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
     sys.exit(main())

@@ -95,6 +95,16 @@ void ApplyRangeName(uintptr_t address, VirtualQueryInfo* info) {
  if (next != g_rangeNames.end()) info->end = std::min<uintptr_t>(info->end, next->first);
 }
 
+void ReleaseClaimedDirectMemory(int64_t start, size_t len) {
+ try {
+  UnmapDirectMemoryViews(DirectMemoryViews(start, len));
+ } catch (...) {
+  DirectMemoryAbandonRelease(start, len);
+  throw;
+ }
+ DirectMemoryFinishRelease(start, len);
+}
+
 std::mutex g_prtLock;
 PrtAperture g_prtApertures[PRT_APERTURE_COUNT] = {};
 
@@ -319,9 +329,8 @@ int APS5_VABI sceKernelReleaseDirectMemory(int64_t start, size_t len) {
  if ((static_cast<std::uint64_t>(start) & (PS5_PAGE_SIZE - 1)) != 0 || (len & (PS5_PAGE_SIZE - 1)) != 0 ||
      len > DIRECT_MEMORY_SIZE || static_cast<std::uint64_t>(start) > DIRECT_MEMORY_SIZE - len)
      return SCE_KERNEL_ERROR_EINVAL;
- const auto views = DirectMemoryViews(start, len);
- DirectMemoryFree(start, len);
- UnmapDirectMemoryViews(views);
+ if (!DirectMemoryClaimRelease(start, len, false)) return 0;
+ ReleaseClaimedDirectMemory(start, len);
  return 0;
 }
 
@@ -410,9 +419,8 @@ int APS5_VABI sceKernelVirtualQuery(const void* addr, int flags, VirtualQueryInf
 int APS5_VABI sceKernelCheckedReleaseDirectMemory(int64_t start, size_t len) {
  if (start < 0 || (static_cast<uint64_t>(start) & (PS5_PAGE_SIZE - 1)) != 0 || (len & (PS5_PAGE_SIZE - 1)) != 0) return SCE_KERNEL_ERROR_EINVAL;
  if (len == 0) return 0;
- const auto views = DirectMemoryViews(start, len);
- if (!DirectMemoryCheckedFree(start, len)) return SCE_KERNEL_ERROR_ENOENT;
- UnmapDirectMemoryViews(views);
+ if (!DirectMemoryClaimRelease(start, len, true)) return SCE_KERNEL_ERROR_ENOENT;
+ ReleaseClaimedDirectMemory(start, len);
  return 0;
 }
 
@@ -484,7 +492,7 @@ int APS5_VABI sceKernelClearVirtualRangeName(const void* addr, uint64_t len) {
 int APS5_VABI sceKernelGetPageTableStats(int* cpu_total, int* cpu_available, int* gpu_total, int* gpu_available) {
  if (!cpu_total || !cpu_available || !gpu_total || !gpu_available) return SCE_KERNEL_ERROR_EFAULT;
  constexpr std::uint64_t PageTableGranularity = 2ULL * 1024 * 1024;
- constexpr std::uint64_t PageTablePoolEntries = 2048;
+ constexpr std::uint64_t PageTablePoolEntries = 8192;
  std::uint64_t cpuUsed = 0;
  std::uint64_t gpuUsed = 0;
  GuestPageTableUsage(PageTableGranularity, &cpuUsed, &gpuUsed);

@@ -1570,6 +1570,59 @@ static void CheckSingleDirectMappingTracksWritesWithoutFaults() {
 #endif
 }
 
+static void CheckReleaseKeepsPhysicalUntilViewsUnmapped(decltype(&sceKernelReleaseDirectMemory) release) {
+    constexpr std::size_t page = 0x4000;
+    std::int64_t phys = 0;
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, page * 4, 0, 0, &phys) == 0);
+    void* mapped = nullptr;
+    Require(sceKernelMapDirectMemory(&mapped, page * 4, 3, 0, phys, 0) == 0);
+    auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+    Require(std::count_if(lease.begin(), lease.end(), [&](const auto& range) { return range->address == reinterpret_cast<std::uintptr_t>(mapped); }) == 1);
+    std::atomic<bool> started{false};
+    std::atomic<bool> finished{false};
+    std::thread releaser([&] {
+        started = true;
+        Require(release(phys, page * 4) == 0);
+        finished = true;
+    });
+    while (!started) std::this_thread::yield();
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    Require(!finished);
+    std::int64_t again = 0;
+    Require(sceKernelAllocateDirectMemory(phys, phys + static_cast<std::int64_t>(page * 4), page * 4, 0, 0, &again) != 0);
+    lease.clear();
+    releaser.join();
+    Require(finished);
+    Require(sceKernelAllocateDirectMemory(phys, phys + static_cast<std::int64_t>(page * 4), page * 4, 0, 0, &again) == 0 && again == phys);
+    Require(sceKernelReleaseDirectMemory(again, page * 4) == 0);
+}
+
+static void CheckConcurrentCheckedReleasesUnmapViewsOnce() {
+    constexpr std::size_t page = 0x4000;
+    std::int64_t phys = 0;
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, page * 4, 0, 0, &phys) == 0);
+    void* mapped = nullptr;
+    Require(sceKernelMapDirectMemory(&mapped, page * 4, 3, 0, phys, 0) == 0);
+    auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+    std::atomic<int> started{0};
+    int results[2] = {-1, -1};
+    std::thread releasers[2];
+    for (int index = 0; index < 2; index++) {
+        releasers[index] = std::thread([&, index] {
+            started++;
+            results[index] = sceKernelCheckedReleaseDirectMemory(phys, page * 4);
+        });
+    }
+    while (started != 2) std::this_thread::yield();
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    lease.clear();
+    for (auto& releaser : releasers) releaser.join();
+    Require((results[0] == 0 && results[1] == SCE_KERNEL_ERROR_ENOENT) || (results[0] == SCE_KERNEL_ERROR_ENOENT && results[1] == 0));
+    std::int64_t again = 0;
+    Require(sceKernelAllocateDirectMemory(phys, phys + static_cast<std::int64_t>(page * 4), page * 4, 0, 0, &again) == 0 && again == phys);
+    Require(sceKernelReleaseDirectMemory(again, page * 4) == 0);
+}
+
 static void CheckSecondDirectMappingWaitsForLeases() {
 #ifdef _WIN32
     constexpr std::size_t page = 0x4000;
@@ -3043,6 +3096,9 @@ int main(int argc, char** argv) {
     CheckSingleDirectMappingTracksWritesWithoutFaults();
     CheckSecondDirectMappingWaitsForLeases();
     CheckBatchMapCostFollowsTheBatch();
+    CheckReleaseKeepsPhysicalUntilViewsUnmapped(sceKernelReleaseDirectMemory);
+    CheckReleaseKeepsPhysicalUntilViewsUnmapped(sceKernelCheckedReleaseDirectMemory);
+    CheckConcurrentCheckedReleasesUnmapViewsOnce();
     CheckBreakingAResidentRunKeepsConcurrentAccesses();
     CheckRemappedDirectMemoryIsChargedOnce();
 #if defined(__linux__)

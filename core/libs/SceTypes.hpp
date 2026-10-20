@@ -1439,6 +1439,11 @@ struct NpGameIntentData {
     std::uint8_t padding[7];
 };
 
+struct NpGameIntentInitParam {
+    std::size_t size;
+    std::uint8_t reserved[32];
+};
+
 struct NpGameIntentInfo {
     std::size_t size;
     std::int32_t user_id;
@@ -1935,6 +1940,13 @@ struct SystemGestureTouchRecognizerInformation {
 };
 
 struct SystemGestureTouchEvent { std::uint8_t reserve[168]; };
+
+struct SystemGestureTouchPadData {
+    std::int32_t pad_handle;
+    std::int32_t report_number;
+    const PadData* pad_data_buffer;
+    std::uint8_t reserve[8];
+};
 
 struct UserServiceLoginUserIdList { int user_id[4]; };
 

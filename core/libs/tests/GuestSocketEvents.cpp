@@ -118,11 +118,11 @@ int main() {
     const int reader = accept_nid_postfix(listener, nullptr, nullptr);
     Require(reader >= 0);
     Require(sceKernelAddReadEvent(blocking, reader, 1, nullptr) == SCE_OK);
+    const auto start = std::chrono::steady_clock::now();
     std::thread sender([&] {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
         Require(send_nid_postfix(writer, message, sizeof(message), 0) == sizeof(message));
     });
-    const auto start = std::chrono::steady_clock::now();
     Require(sceKernelWaitEqueue(blocking, events.data(), events.size(), &count, nullptr) == SCE_OK);
     sender.join();
     Require(std::chrono::steady_clock::now() - start >= std::chrono::milliseconds(40));

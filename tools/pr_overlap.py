@@ -40,9 +40,7 @@ def upstream():
 
 def depends_on(body):
     body = re.sub(r"<!--.*?-->", "", body or "", flags=re.S)
-    match = DEPENDS.search(body)
-    if not match or not match.group(1).strip():
-        match = PLAIN_DEPENDS.search(body)
+    match = next((match for match in DEPENDS.finditer(body) if match.group(1).strip()), None) or PLAIN_DEPENDS.search(body)
     return {int(n) for n in re.findall(r"#(\d+)", match.group(1))} if match else set()
 
 

@@ -33,6 +33,8 @@ namespace {
 void buildGraph(std::span<const std::uint8_t> text, VirtualAddress textVaddr, VirtualAddress entryVaddr, const std::vector<VirtualAddress>& extraEntries, const IRelativeRelocationIndex& relativeRelocations, const std::vector<StrictDataRegion>* data, bool followCodeAddresses, std::unordered_set<VirtualAddress>& reachable, const std::function<void(std::uint64_t)>& progress, const std::function<bool(VirtualAddress)>& isData) {
     if (text.size() > std::numeric_limits<VirtualAddress>::max() - textVaddr)
         throw RelinkerException("Text section range exceeds the address space");
+    std::size_t codeSize = text.size();
+    while (codeSize > 0 && text[codeSize - 1] == 0) --codeSize;
     const Codegen::X64InstructionDecoder decoder;
     std::unordered_set<VirtualAddress> visited;
     std::queue<VirtualAddress> worklist;
@@ -68,8 +70,9 @@ void buildGraph(std::span<const std::uint8_t> text, VirtualAddress textVaddr, Vi
 
         VirtualAddress va = worklist.front();
         worklist.pop();
+        const VirtualAddress blockEntry = va;
 
-        while (va >= textVaddr && va - textVaddr < text.size() && !reachable.contains(va) && !(isData && isData(va))) {
+        while (va >= textVaddr && va - textVaddr < text.size() && (va == blockEntry || va - textVaddr < codeSize) && !reachable.contains(va) && !(isData && isData(va))) {
             std::size_t bufOff = static_cast<std::size_t>(va - textVaddr);
             std::size_t available = text.size() - bufOff;
             if (available == 0) throw RelinkerException("CFG: zero available bytes at target", va);

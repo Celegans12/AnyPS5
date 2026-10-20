@@ -255,4 +255,10 @@ void RunBdaContractTests() {
     AgcDriver::Graphics::Require(ordered({}) && ordered({{0x1000, 0x2000, 1, 1, 0}, {0x2000, 0x2000, 1, 1, 0}, {0x2000, 0x3000, 1, 1, 0}, {0x4000, 0x5000, 1, 1, 0}}), "ascending BDA ranges were refused");
     AgcDriver::Graphics::Require(ordered({{0x1000, 0x3000, 1, 1, 0}, {0x2f00, 0x3100, 1, 1, 0}}), "BDA ranges ascending by begin and overlapping were refused");
     AgcDriver::Graphics::Require(!ordered({{0x4000, 0x5000, 1, 1, 0}, {0x1000, 0x2000, 1, 1, 0}}), "unsorted BDA ranges were accepted");
+    for (const std::uint32_t bits : {8u, 16u, 32u}) {
+        const auto shader = MakeBdaWriteTestShader(0x7fff1235fffdULL, 0xa1b2c3d4u, bits, false);
+        const auto lookups = CallSites(shader, "get_bda_write_pointer");
+        const auto loops = CallSites(shader, "write_bda_bytes");
+        AgcDriver::Graphics::Require(loops == 1u && lookups == (bits == 32u ? 2u : 1u), "a runtime V# write of " + std::to_string(bits) + " bits has " + std::to_string(lookups) + " write lookups and " + std::to_string(loops) + " byte-loop calls, not its byte path through write_bda_bytes");
+    }
 }

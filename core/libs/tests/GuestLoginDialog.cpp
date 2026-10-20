@@ -59,4 +59,13 @@ int main() {
     Require(sceLoginDialogTerminate() == 0);
     Require(sceLoginDialogTerminate() == kErrNotInitialized);
     Require(sceLoginDialogGetStatus() == kStatusNone);
+
+    Require(sceLoginDialogInitialize() == 0);
+    Require(sceLoginDialogGetStatus() == kStatusInitialized);
+    Require(sceLoginDialogClose() == 0);
+    Require(sceLoginDialogGetStatus() == kStatusFinished);
+    result[0] = -1;
+    Require(sceLoginDialogGetResult(result) == 0);
+    Require(result[0] == kResultUserCanceled);
+    Require(sceLoginDialogTerminate() == 0);
 }

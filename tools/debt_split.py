@@ -197,7 +197,7 @@ def apply_change(root, base, new, index_text):
         for offset, fresh in enumerate(added):
             if offset in kept_new:
                 continue
-            anchor = after[j1 + offset - 1] if j1 + offset > 0 else None
+            anchor = next((entry for entry in reversed(after[:j1 + offset]) if entry[1] == fresh[1] and entry[3] == fresh[3]), None)
             insert(fresh, anchor)
     for name, sections in files.items():
         write_debt(root, name, sections, order)

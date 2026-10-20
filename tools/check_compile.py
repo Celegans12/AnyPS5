@@ -6,6 +6,8 @@ import shlex
 import shutil
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from pathlib import Path
 
 CPP = (".cpp", ".cc", ".cxx", ".c")
@@ -127,31 +129,47 @@ def syntax_arguments(arguments, directory, source):
     return trimmed
 
 
-def check(root, build, files):
+def check_source(task):
+    source, name, build, configurations = task
+    if configurations is None:
+        return 0, 0, f"{name}: no compile command in {build}\n"
+    failed = False
+    diagnostics = []
+    for entry in configurations:
+        command = (syntax_arguments(entry["arguments"], Path(entry["directory"]), source)
+                   if "arguments" in entry else syntax_only(entry, source))
+        result = subprocess.run(command, cwd=entry["directory"],
+                                capture_output=True, text=True, encoding="utf-8", errors="replace")
+        if result.returncode == 0:
+            continue
+        failed = True
+        output = (result.stdout or "") + (result.stderr or "")
+        diagnostics.append(output if output.endswith("\n") else output + "\n")
+    return 1, int(failed), "".join(diagnostics)
+
+
+def check(root, build, files, jobs=1):
     commands = index(build, root)
-    checked = 0
-    failed = 0
+    tasks = []
     for file in files:
         source = file.resolve()
         name = os.path.relpath(source, root).replace(os.sep, "/")
-        configurations = commands.get(name)
-        if configurations is None:
-            print(f"{name}: no compile command in {build}", file=sys.stderr)
-            continue
-        checked += 1
-        source_failed = False
-        for entry in configurations:
-            command = (syntax_arguments(entry["arguments"], Path(entry["directory"]), source)
-                       if "arguments" in entry else syntax_only(entry, source))
-            result = subprocess.run(command, cwd=entry["directory"],
-                                    capture_output=True, text=True, encoding="utf-8", errors="replace")
-            if result.returncode == 0:
-                continue
-            source_failed = True
-            output = (result.stdout or "") + (result.stderr or "")
-            sys.stderr.write(output if output.endswith("\n") else output + "\n")
-        failed += int(source_failed)
+        tasks.append((source, name, build, commands.get(name)))
+    checked = failed = 0
+    with (ThreadPoolExecutor(max_workers=jobs) if jobs > 1 else nullcontext()) as executor:
+        results = executor.map(check_source, tasks) if executor is not None else map(check_source, tasks)
+        for count, failures, diagnostics in results:
+            checked += count
+            failed += failures
+            sys.stderr.write(diagnostics)
     return checked, failed
+
+
+def positive_integer(value):
+    number = int(value)
+    if number <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return number
 
 
 def main(argv=None):
@@ -162,6 +180,8 @@ def main(argv=None):
         description="compile the changed translation units only, to check a change builds without a full build")
     parser.add_argument("--build", type=Path, default=Path("build"),
                         help="a configured Ninja build directory of this checkout (default: build)")
+    parser.add_argument("--jobs", type=positive_integer, default=1, metavar="N",
+                        help="check up to N translation units concurrently; diagnostics retain input order (default 1)")
     parser.add_argument("--base", default="origin/main",
                         help="branch the change is against (default: origin/main)")
     parser.add_argument("paths", nargs="*", help="translation units to check instead of the changed ones")
@@ -172,7 +192,7 @@ def main(argv=None):
         if not files:
             print(f"no changed translation unit against {args.base}")
             return 0
-        checked, failed = check(root, args.build, files)
+        checked, failed = check(root, args.build, files, args.jobs)
     except (json.JSONDecodeError, OSError, ValueError) as error:
         parser.error(str(error))
     if failed:

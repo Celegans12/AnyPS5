@@ -37,6 +37,7 @@ int APS5_VABI sceWebBrowserDialogTerminate(void) {
 
 int APS5_VABI sceWebBrowserDialogClose(void) {
  if (g_status.load() == COMMON_DIALOG_STATUS_NONE) return COMMON_DIALOG_ERROR_NOT_INITIALIZED;
+ g_status = COMMON_DIALOG_STATUS_FINISHED;
  return 0;
 }
 

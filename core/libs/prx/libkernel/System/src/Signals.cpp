@@ -231,15 +231,16 @@ bool DeliverPendingSignal(int guest) {
 int WaitForPendingInSet(const GuestSignalSet& set, bool waitForever, const GuestTimespec* timeout, int* guest) {
     auto& pending = Pending();
     std::unique_lock lock(pending.lock);
+    std::optional<std::chrono::steady_clock::time_point> deadline;
     for (;;) {
         if (PendingInSet(set, guest)) return 0;
         if (waitForever) {
             pending.changed.wait(lock);
             continue;
         }
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout->seconds) +
+        if (!deadline) deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout->seconds) +
             std::chrono::nanoseconds(timeout->nanoseconds);
-        if (pending.changed.wait_until(lock, deadline) == std::cv_status::no_timeout) continue;
+        if (pending.changed.wait_until(lock, *deadline) == std::cv_status::no_timeout) continue;
         return PendingInSet(set, guest) ? 0 : GuestEagain;
     }
 }
@@ -271,6 +272,7 @@ extern "C" int APS5_VABI _sigprocmask_nid_postfix(int how, const GuestSignalSet*
 }
 
 namespace {
+constexpr std::int64_t MaxItimerSeconds = 0x7fffffff / 2;
 struct AlarmState {
     std::mutex lock;
     std::condition_variable changed;
@@ -347,6 +349,10 @@ void NotifyAlarms(AlarmState& alarms) {
 }
 
 extern "C" unsigned int APS5_VABI GuestAlarm_nid_no_patch(unsigned int seconds) {
+    if (seconds > MaxItimerSeconds) {
+        *__error_nid_postfix() = 22;
+        return static_cast<unsigned int>(-1);
+    }
     auto& alarms = Alarms();
     std::lock_guard lock(alarms.lock);
     const auto now = std::chrono::steady_clock::now();
@@ -399,7 +405,6 @@ extern "C" int APS5_VABI getitimer_nid_postfix(int which, GuestItimerval* output
 namespace {
 constexpr int ItimerReal = 0;
 constexpr int ItimerProf = 2;
-constexpr std::int64_t MaxItimerSeconds = 0x7fffffff / 2;
 constexpr std::int64_t MinExactIntervalMicros = 1000;
 
 bool ValidItimer(const KernelTimeval& time) {

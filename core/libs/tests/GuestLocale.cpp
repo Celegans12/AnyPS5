@@ -24,6 +24,7 @@ struct StreamManipulator {
     std::int32_t argument;
 };
 StreamManipulator APS5_VABI _ZSt4setwi_nid_postfix(std::int32_t width);
+void APS5_VABI _ZNSt8ios_base7_AddstdEPS__nid_postfix(GuestLocale::IosBase* self);
 const short* APS5_VABI _Getpctype_nid_postfix();
 const short* APS5_VABI _Getptolower_nid_postfix();
 const short* APS5_VABI _Getptoupper_nid_postfix();
@@ -176,6 +177,47 @@ static void CheckStreamWidth() {
     RequireException([&] { manipulator.function(nullptr, manipulator.argument); });
 }
 
+static void CheckStandardStreams() {
+    struct GuardedStream {
+        std::uint64_t before = 0x12345678;
+        GuestLocale::IosBase stream{};
+        std::uint64_t after = 0x87654321;
+    } streams[9];
+    auto* classic = &_ZSt21_sceLibcClassicLocale_nid_postfix;
+    for (auto& object : streams) object.stream.locale = classic;
+    RequireException([&] { _ZNSt8ios_base7_AddstdEPS__nid_postfix(nullptr); });
+    _ZNSt8ios_base7_AddstdEPS__nid_postfix(&streams[0].stream);
+    _ZNSt8ios_base7_AddstdEPS__nid_postfix(&streams[1].stream);
+    Require(streams[0].stream.standardStream == 1 && streams[1].stream.standardStream == 2);
+    _ZNSt8ios_base7_AddstdEPS__nid_postfix(&streams[0].stream);
+    Require(streams[0].stream.standardStream == 1);
+    _ZNSt8ios_baseD2Ev_nid_postfix(&streams[0].stream);
+    Require(streams[0].stream.locale == classic && streams[0].stream.standardStream == 1);
+    _ZNSt8ios_baseD2Ev_nid_postfix(&streams[0].stream);
+    Require(streams[0].stream.locale == nullptr && streams[0].stream.standardStream == 1);
+    streams[0].stream.locale = classic;
+    _ZNSt8ios_base7_AddstdEPS__nid_postfix(&streams[0].stream);
+    Require(streams[0].stream.standardStream == 1);
+    _ZNSt8ios_baseD2Ev_nid_postfix(&streams[1].stream);
+    Require(streams[1].stream.locale == nullptr && streams[1].stream.standardStream == 2);
+    for (int index = 2; index < 7; ++index) {
+        _ZNSt8ios_base7_AddstdEPS__nid_postfix(&streams[index].stream);
+        Require(streams[index].stream.standardStream == index + 1);
+    }
+    _ZNSt8ios_base7_AddstdEPS__nid_postfix(&streams[7].stream);
+    _ZNSt8ios_base7_AddstdEPS__nid_postfix(&streams[8].stream);
+    Require(streams[7].stream.standardStream == 8 && streams[8].stream.standardStream == 8);
+    _ZNSt8ios_baseD2Ev_nid_postfix(&streams[7].stream);
+    Require(streams[7].stream.locale == classic);
+    _ZNSt8ios_baseD2Ev_nid_postfix(&streams[8].stream);
+    Require(streams[8].stream.locale == nullptr);
+    for (int index = 2; index < 7; ++index) {
+        _ZNSt8ios_baseD2Ev_nid_postfix(&streams[index].stream);
+        Require(streams[index].stream.locale == nullptr && streams[index].stream.standardStream == index + 1);
+    }
+    for (auto& object : streams) Require(object.before == 0x12345678 && object.after == 0x87654321);
+}
+
 static void CheckWideCaseTranslation() {
     const auto* lower = _Getptolower_nid_postfix();
     const auto* upper = _Getptoupper_nid_postfix();
@@ -205,6 +247,7 @@ int main() {
     CheckCharacterConversions();
     CheckStreamDestruction();
     CheckStreamWidth();
+    CheckStandardStreams();
     CheckWideCaseTranslation();
     _Locksyslock_nid_postfix();
     _Locksyslock_nid_postfix();

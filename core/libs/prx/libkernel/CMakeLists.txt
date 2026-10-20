@@ -2,6 +2,7 @@ add_library(libkernel SHARED EXCLUDE_FROM_ALL
         ${CMAKE_CURRENT_SOURCE_DIR}/Unimplemented.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Apr/src/Apr.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Equeue/Equeue.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Equeue/src/EdgeWatch.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Equeue/src/EventAccessors.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/File/src/ArchivedFile.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/File/src/DescriptorControl.cpp
@@ -106,7 +107,7 @@ if(BUILD_TESTING)
     target_include_directories(guest_apr_read_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(guest_apr_read_tests PRIVATE libkernel libc)
     configure_windows_unwind(guest_apr_read_tests)
-    set(aprReadCases host direct eof errors)
+    set(aprReadCases host direct eof errors streams)
     if(WIN32)
         list(APPEND aprReadCases fault)
     endif()
@@ -807,6 +808,16 @@ if(BUILD_TESTING)
         set_tests_properties(guest_pthread_rwlock PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
     endif()
+    add_test_executable(guest_rwlock_retire_tests ${LIBS_INCLUDE_DIR}/tests/GuestRwlockRetire.cpp)
+    target_include_directories(guest_rwlock_retire_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_rwlock_retire_tests PRIVATE libkernel libc)
+    configure_windows_unwind(guest_rwlock_retire_tests)
+    add_test(NAME guest_rwlock_retire COMMAND guest_rwlock_retire_tests)
+    set_tests_properties(guest_rwlock_retire PROPERTIES TIMEOUT 20)
+    if(WIN32)
+        set_tests_properties(guest_rwlock_retire PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+    endif()
     add_test_executable(guest_pthread_join_self_tests ${LIBS_INCLUDE_DIR}/tests/GuestPthreadJoinSelf.cpp)
     target_include_directories(guest_pthread_join_self_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(guest_pthread_join_self_tests PRIVATE libkernel libc)
@@ -1378,9 +1389,10 @@ if(BUILD_TESTING)
     target_link_libraries(guest_socket_pair_tests PRIVATE libkernel libc)
     configure_windows_unwind(guest_socket_pair_tests)
     add_test(NAME guest_socket_pair COMMAND guest_socket_pair_tests)
-    set_tests_properties(guest_socket_pair PROPERTIES TIMEOUT 20)
+    add_test(NAME guest_recvmsg_memory COMMAND guest_socket_pair_tests recvmsg-memory)
+    set_tests_properties(guest_socket_pair guest_recvmsg_memory PROPERTIES TIMEOUT 20)
     if(WIN32)
-        set_tests_properties(guest_socket_pair PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(guest_socket_pair guest_recvmsg_memory PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
     endif()
     add_test_executable(guest_kernel_app_archive_tests ${LIBS_INCLUDE_DIR}/tests/GuestKernelAppArchive.cpp)
@@ -1515,6 +1527,16 @@ if(BUILD_TESTING)
     set_tests_properties(guest_mprotect_unmapped PROPERTIES TIMEOUT 30)
     if(WIN32)
         set_tests_properties(guest_mprotect_unmapped PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+    endif()
+    add_test_executable(guest_protection_report_tests ${LIBS_INCLUDE_DIR}/tests/GuestProtectionReport.cpp)
+    target_include_directories(guest_protection_report_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_protection_report_tests PRIVATE libkernel libc)
+    configure_windows_unwind(guest_protection_report_tests)
+    add_test(NAME guest_protection_report COMMAND guest_protection_report_tests)
+    set_tests_properties(guest_protection_report PROPERTIES TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(guest_protection_report PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
     endif()
     add_test_executable(guest_flexible_memory_budget_tests ${LIBS_INCLUDE_DIR}/tests/GuestFlexibleMemoryBudget.cpp)
@@ -1738,4 +1760,21 @@ if(BUILD_TESTING)
         set_tests_properties(guest_coredump_user_data PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
     endif()
+endif()
+
+if(BUILD_TESTING)
+    add_test_executable(guest_sleep_cancel_tests ${LIBS_INCLUDE_DIR}/tests/GuestSleepCancel.cpp)
+    target_include_directories(guest_sleep_cancel_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_sleep_cancel_tests PRIVATE libkernel libc)
+    configure_windows_unwind(guest_sleep_cancel_tests)
+    foreach(sleepCase IN ITEMS blocked disabled normal pending)
+        add_test(NAME guest_sleep_cancel_${sleepCase} COMMAND guest_sleep_cancel_tests ${sleepCase})
+        add_test(NAME guest_sleep_cancel_${sleepCase}_coarse COMMAND guest_sleep_cancel_tests ${sleepCase})
+        set_tests_properties(guest_sleep_cancel_${sleepCase} guest_sleep_cancel_${sleepCase}_coarse PROPERTIES TIMEOUT 20)
+        set_tests_properties(guest_sleep_cancel_${sleepCase}_coarse PROPERTIES ENVIRONMENT "APS5_COARSE_TIMED_WAITS=1")
+        if(WIN32)
+            set_tests_properties(guest_sleep_cancel_${sleepCase} guest_sleep_cancel_${sleepCase}_coarse PROPERTIES
+                ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+        endif()
+    endforeach()
 endif()

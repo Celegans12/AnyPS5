@@ -538,6 +538,36 @@ static bool RelocatedRegisters(const ShaderSnapshot& snapshot, Shader used, cons
     return std::memcmp(static_cast<const void*>(bound), snapshot.header.data() + (address - snapshot.headerAddress), bytes) == 0;
 }
 
+// A title can relocate a registered header, and the arrays it points at, into memory of its own and resolve the ABI
+// with that copy. Every array the copy refers to must still hold the registered bytes: the registered header then
+// decodes to the values the copy describes.
+static bool ReferredBytesMatch(const ShaderSnapshot& snapshot, const void* pointer, const void* registeredPointer, std::size_t bytes) {
+    if (bytes == 0 || pointer == registeredPointer) return true;
+    if (pointer == nullptr || registeredPointer == nullptr) return false;
+    const auto address = reinterpret_cast<std::uintptr_t>(registeredPointer);
+    if (address < snapshot.headerAddress) return false;
+    const auto offset = address - snapshot.headerAddress;
+    if (offset > snapshot.header.size() || snapshot.header.size() - offset < bytes) return false;
+    if (!GuestMemory::Accessible(pointer, bytes)) return false;
+    return std::memcmp(static_cast<const void*>(pointer), snapshot.header.data() + offset, bytes) == 0;
+}
+
+static bool RelocatedCopy(const ShaderSnapshot& snapshot, Shader used, const Shader& registered) {
+    Shader masked = used;
+    masked.user_data = registered.user_data;
+    masked.cx_registers = registered.cx_registers;
+    masked.sh_registers = registered.sh_registers;
+    masked.specials = registered.specials;
+    masked.input_semantics = registered.input_semantics;
+    masked.output_semantics = registered.output_semantics;
+    if (std::memcmp(&masked, &registered, offsetof(Shader, num_sh_registers) + sizeof(Shader::num_sh_registers)) != 0) return false;
+    return ReferredBytesMatch(snapshot, used.sh_registers, registered.sh_registers, used.num_sh_registers * sizeof(ShaderRegister))
+        && ReferredBytesMatch(snapshot, used.cx_registers, registered.cx_registers, used.num_cx_registers * sizeof(ShaderRegister))
+        && ReferredBytesMatch(snapshot, used.specials, registered.specials, sizeof(ShaderSpecialRegs))
+        && ReferredBytesMatch(snapshot, used.input_semantics, registered.input_semantics, used.num_input_semantics * sizeof(ShaderSemantic))
+        && ReferredBytesMatch(snapshot, used.output_semantics, registered.output_semantics, used.num_output_semantics * sizeof(ShaderSemantic));
+}
+
 bool SameHeader(const ShaderSnapshot& snapshot, const Shader* shader) {
     if (snapshot.headerAddress == reinterpret_cast<std::uintptr_t>(shader)) return true;
     if (snapshot.header.size() < sizeof(Shader)) return false;
@@ -548,6 +578,7 @@ bool SameHeader(const ShaderSnapshot& snapshot, const Shader* shader) {
     std::memcpy(&registered, snapshot.header.data(), sizeof(Shader));
     used.user_data = registered.user_data;
     if (std::memcmp(&used, &registered, offsetof(Shader, num_sh_registers) + sizeof(Shader::num_sh_registers)) == 0 || RelocatedRegisters(snapshot, used, registered) || FusedHullHeader(snapshot, used, registered)) return true;
+    static const bool relocatedCopies = std::getenv("APS5_RELOCATED_HEADER_COPIES") != nullptr;
     Shader fixed = used;
     fixed.cx_registers = registered.cx_registers;
     fixed.sh_registers = registered.sh_registers;
@@ -572,11 +603,12 @@ bool SameHeader(const ShaderSnapshot& snapshot, const Shader* shader) {
         GuestMemory::CheckRange(bound, bytes, 1);
         return std::memcmp(bound, snapshot.header.data() + offset, bytes) == 0;
     };
-    return same(used.cx_registers, registered.cx_registers, registered.num_cx_registers * sizeof(ShaderRegister))
+    return (same(used.cx_registers, registered.cx_registers, registered.num_cx_registers * sizeof(ShaderRegister))
         && same(used.sh_registers, registered.sh_registers, registered.num_sh_registers * sizeof(ShaderRegister))
         && same(used.specials, registered.specials, std::max<std::size_t>(sizeof(ShaderSpecialRegs), registered.special_sizes_bytes))
         && same(used.input_semantics, registered.input_semantics, registered.num_input_semantics * sizeof(ShaderSemantic))
-        && same(used.output_semantics, registered.output_semantics, registered.num_output_semantics * sizeof(ShaderSemantic));
+        && same(used.output_semantics, registered.output_semantics, registered.num_output_semantics * sizeof(ShaderSemantic)))
+        || (relocatedCopies && RelocatedCopy(snapshot, used, registered));
 }
 
 std::size_t ShaderRegistry::chunkFor(std::uint64_t address) const {

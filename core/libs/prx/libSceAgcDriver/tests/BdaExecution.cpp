@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <cstring>
 #include <initializer_list>
 #include <limits>
@@ -14,6 +15,12 @@
 #include <vector>
 
 namespace {
+
+std::string Hex(std::uint64_t value) {
+    char text[24];
+    std::snprintf(text, sizeof(text), "0x%llx", static_cast<unsigned long long>(value));
+    return text;
+}
 
 using namespace AgcDriver::Graphics;
 
@@ -293,7 +300,7 @@ static void RunBdaAnchorTests(const Context& context) {
                     const auto expected = run(programs.plain, index, anchor, batch);
                     const auto actual = run(programs.anchored, index, anchor, batch);
                     const bool faultsMatch = programs.reads.lanes == 1u ? std::memcmp(&expected.fault, &actual.fault, sizeof(expected.fault)) == 0 : expected.fault.state == actual.fault.state;
-                    Require(faultsMatch && expected.values == actual.values, "an anchored BDA read differs from the same read through the lookups at anchor 0x" + std::to_string(anchor) + " + " + std::to_string(batch[0]) + " + (" + std::to_string(read.immediate) + "), " + std::to_string(read.bits) + " bits, " + std::to_string(read.dwords) + " dwords");
+                    Require(faultsMatch && expected.values == actual.values, "an anchored BDA read differs from the same read through the lookups at anchor " + Hex(anchor) + " + " + std::to_string(batch[0]) + " + (" + std::to_string(read.immediate) + "), " + std::to_string(read.bits) + " bits, " + std::to_string(read.dwords) + " dwords");
                 }
             }
         }
@@ -326,11 +333,11 @@ static void RunBdaAnchorTests(const Context& context) {
     };
     const auto loads = [&](std::uint32_t read, std::uint64_t anchor, std::uint32_t low, std::initializer_list<std::uint32_t> values) {
         const auto outcome = run(*direct, read, anchor, {low});
-        Require(outcome.fault.state == Abi::FaultState::Empty && std::equal(values.begin(), values.end(), outcome.values.begin()), "a read the anchor holds did not load directly at anchor 0x" + std::to_string(anchor) + " + " + std::to_string(low) + ", read " + std::to_string(read));
+        Require(outcome.fault.state == Abi::FaultState::Empty && std::equal(values.begin(), values.end(), outcome.values.begin()), "a read the anchor holds did not load directly at anchor " + Hex(anchor) + " + " + std::to_string(low) + ", read " + std::to_string(read));
     };
     const auto misses = [&](std::uint32_t read, std::uint64_t anchor, std::uint32_t low) {
         const auto outcome = run(*direct, read, anchor, {low});
-        Require(outcome.fault.state == Abi::FaultState::Empty && outcome.values[0] == BdaAnchoredReadSentinel, "a read the anchor does not hold did not take the lookup path at anchor 0x" + std::to_string(anchor) + " + " + std::to_string(low) + ", read " + std::to_string(read));
+        Require(outcome.fault.state == Abi::FaultState::Empty && outcome.values[0] == BdaAnchoredReadSentinel, "a read the anchor does not hold did not take the lookup path at anchor " + Hex(anchor) + " + " + std::to_string(low) + ", read " + std::to_string(read));
     };
     loads(2, guest + 0x100, 0, {dword(words, 0)});
     loads(2, guest + 0x100, 0xc, {dword(words, 0xc)});

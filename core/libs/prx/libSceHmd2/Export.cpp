@@ -1,6 +1,7 @@
 #include "Hmd2.hpp"
 #include "prx/libc/include/ApplicationHeap.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libSceHmd/Hmd.hpp"
 #include "prx/libSceUserService/UserService.hpp"
 #include "SceTypes.hpp"
 
@@ -53,11 +54,8 @@ int APS5_VABI sceHmd2ReprojectionQuerySeeThroughBufferSizeAlign() {
 }
 
 std::int32_t APS5_VABI sceHmd2Initialize(const void* param) {
-    std::lock_guard lock(stateMutex);
-    if (initialized) return Hmd2::AlreadyInitialized;
-    if (!param) return Hmd2::ParameterNull;
-    initialized = true;
-    return 0;
+    (void)param;
+    return Hmd::UnsupportedFeature;
 }
 
 std::int32_t APS5_VABI sceHmd2GetFieldOfView(std::int32_t handle, Hmd2::FieldOfView* fieldOfView) {
@@ -220,6 +218,166 @@ std::int32_t APS5_VABI sceHmd2SetVibration(std::int32_t handle, std::uint32_t le
     (void)level;
     std::lock_guard lock(stateMutex);
     if (handle != openHandle) return Hmd2::InvalidHandle;
+    return 0;
+}
+
+int APS5_VABI sceHmd2GazeGetCalibrationData() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceHmd2GazeGetCalibrationDataMaxSize() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceHmd2ReprojectionClearUserEventEnd() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceHmd2ReprojectionClearUserEventStart() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceHmd2ReprojectionGetCurrentOutput() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceHmd2ReprojectionSetUserEventEnd() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceHmd2ReprojectionSetUserEventStart() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceHmd2GazeActivateGazeTracking() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceHmd2GazeGetDeviceStatus() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceHmd2GazeGetUserCalibrationStatus() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceHmd2GazeInsertRawDataWithHandle() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceHmd2GazeSetEnabledEye() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceHmd2GazeSetUserCalibrationData() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceHmd2GazeSetUserCalibrationPoint() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceHmd2GazeStartUserCalibration() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceHmd2GazeStopUserCalibration() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceHmd2ReprojectionSeeThroughDraw() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceHmd2ReprojectionSeeThroughIC() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceHmd2ReprojectionVideoOutEq() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceHmd2ReprojectionWaitShader() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceHmd2SeeThroughCallbackGetPoseDataFunc() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceHmd2GazeObjectSelectionGetSelectedObject() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceHmd2GazeObjectSelectionInitialize() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceHmd2GazeObjectSelectionQueryMemory() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceHmd2GazeObjectSelectionTerminate() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceHmd2ReprojectionClear() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceHmd2ReprojectionSet() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceHmd2ReprojectionSetEventGpuEnd() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceHmd2ReprojectionSetEventGpuStart() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceHmd2RpeorjectionSetParam() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceHmd2SetFieldOfView() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceHmd2SetIpdOffset() {
+    NotImplemented_nid_no_patch(__func__);
     return 0;
 }
 

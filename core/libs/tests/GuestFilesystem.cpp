@@ -3,6 +3,8 @@
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/FileStream.hpp"
 #include "prx/libkernel/File/include/File.hpp"
+#include "prx/libkernel/File/include/NativeStat.hpp"
+#include "prx/libkernel/KernelErrors.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cerrno>
@@ -96,6 +98,10 @@ std::int64_t APS5_VABI read_nid_postfix(int, void*, std::size_t);
 std::int64_t APS5_VABI write_nid_postfix(int, const void*, std::size_t);
 int APS5_VABI sceKernelDebugOutText(int, const char*);
 }
+#ifdef _WIN32
+static bool g_invalidParameter = false;
+static void RecordInvalidParameter(const wchar_t*, const wchar_t*, const wchar_t*, unsigned, std::uintptr_t) { g_invalidParameter = true; }
+#endif
 static void Check(bool value, int line) {
     if (!value) {
 #ifdef _WIN32
@@ -783,6 +789,17 @@ int main() {
     Require(sceKernelFsync(socket) == static_cast<int>(0x80020009u));
     Require(sceKernelFdatasync(0x7fffffff) == static_cast<int>(0x80020009u));
     Require(sceKernelFsync(0x7fffffff) == static_cast<int>(0x80020009u));
+#ifdef _WIN32
+    const auto previousParameterHandler = _set_invalid_parameter_handler(RecordInvalidParameter);
+#endif
+    FileStat closedStatus{};
+    Require(sceKernelFstat(descriptor, &closedStatus) == static_cast<int>(0x80020009u));
+    Require(sceKernelFstat(socket, &closedStatus) == static_cast<int>(0x80020009u));
+    Require(sceKernelFstat(0x7fffffff, &closedStatus) == static_cast<int>(0x80020009u));
+#ifdef _WIN32
+    _set_invalid_parameter_handler(previousParameterHandler);
+    Require(!g_invalidParameter);
+#endif
     Require(remove_nid_postfix(sized.string().c_str()) == 0);
     const auto present = root / "present.txt";
     const auto presentName = present.string();
@@ -835,6 +852,11 @@ int main() {
     Require(stat_nid_postfix(link.string().c_str(), &status) == 0 && (status.st_mode & 0170000) == 0100000 && status.st_size == 5);
     const auto dangling = root / "dangling";
     std::filesystem::create_symlink("missing.txt", dangling);
+    const auto statLoop = root / "stat-loop";
+    std::filesystem::create_symlink("stat-loop", statLoop);
+    errno = 0;
+    Require(!File::TryFillFileStat(statLoop, &status) && errno == ELOOP);
+    Require(sceKernelStat(statLoop.generic_string().c_str(), &status) == SCE_KERNEL_ERROR_ELOOP);
     Require(lstat_nid_postfix(dangling.string().c_str(), &linkStatus) == 0 && (linkStatus.st_mode & 0170000) == 0120000);
     constexpr int noFollow = 0x100;
     Require(sceKernelOpen(link.string().c_str(), noFollow, 0) == static_cast<int>(0x8002001Fu));
@@ -854,7 +876,8 @@ int main() {
     Require(unlink_nid_postfix(viaMissing.c_str()) == -1 && *__error_nid_postfix() == 2 && std::filesystem::exists(present));
     Require(stat_nid_postfix((presentName + "/..").c_str(), &status) == -1 && *__error_nid_postfix() == 20);
     Require(sceKernelStat((presentName + "/../present.txt").c_str(), &status) == static_cast<int>(0x80020014u));
-    Require(unlink_nid_postfix(link.string().c_str()) == 0 && unlink_nid_postfix(dangling.string().c_str()) == 0);
+    Require(unlink_nid_postfix(link.string().c_str()) == 0 && unlink_nid_postfix(dangling.string().c_str()) == 0 &&
+        unlink_nid_postfix(statLoop.string().c_str()) == 0);
 #else
     const auto fileLink = root / "file-link";
     if (CreateSymbolicLinkW(fileLink.c_str(), L"present.txt", SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE) == 0) {
@@ -871,6 +894,9 @@ int main() {
         Require(CreateSymbolicLinkW(danglingLink.c_str(), L"missing.txt", SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE) != 0);
         Require(CreateSymbolicLinkW(absoluteLink.c_str(), std::filesystem::absolute(present).c_str(),
             SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE) != 0);
+        const auto statLoop = root / "stat-loop";
+        Require(CreateSymbolicLinkW(statLoop.c_str(), L"stat-loop", SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE) != 0);
+        Require(sceKernelStat(statLoop.generic_string().c_str(), &status) == static_cast<int>(0x8002003eu));
         const auto checkRelativeLink = [](const std::filesystem::path& link, std::int64_t targetLength) {
             FileStat own{};
             return lstat_nid_postfix(link.string().c_str(), &own) == 0 && (own.st_mode & 0170000) == 0120000 &&
@@ -890,6 +916,7 @@ int main() {
         Require((absoluteStatus.st_mode & 0170000) == 0120000 && absoluteStatus.st_size > 0 && absoluteStatus.st_nlink == 1);
         Require(stat_nid_postfix(absoluteLink.string().c_str(), &followed) == 0 && followed.st_ino == status.st_ino);
         Require(std::filesystem::remove(fileLink) && std::filesystem::remove(directoryLink) && DeleteFileW(danglingLink.c_str()) != 0 &&
+            DeleteFileW(statLoop.c_str()) != 0 &&
             std::filesystem::remove(absoluteLink) && std::filesystem::remove(targetDirectory));
     }
     const auto junctionTarget = root / "junction-target";
@@ -1026,6 +1053,19 @@ int main() {
     Require(sceKernelOpen(presentName.c_str(), 0x20402, 0) == static_cast<int>(0x80020014u));
     Require(std::filesystem::file_size(present) == 5);
     Require(sceKernelOpen(missingName.c_str(), 0x20000, 0) == static_cast<int>(0x80020002u));
+    const auto invalidFlagsName = (root / "invalid-flags.txt").string();
+    Require(sceKernelOpen(presentName.c_str(), 3, 0) == static_cast<int>(0x80020016u));
+    Require(sceKernelOpen(missingName.c_str(), 0x203, 0600) == static_cast<int>(0x80020016u));
+    Require(open_nid_postfix(presentName.c_str(), 3, 0) == -1 && *__error_nid_postfix() == 22);
+    Require(_open_nid_postfix(presentName.c_str(), 0x403) == -1 && *__error_nid_postfix() == 22);
+    Require(sceKernelOpen(invalidFlagsName.c_str(), 0x20a02, 0600) == static_cast<int>(0x80020016u));
+    Require(open_nid_postfix(invalidFlagsName.c_str(), 0x20a00, 0600) == -1 && *__error_nid_postfix() == 22);
+    Require(!std::filesystem::exists(invalidFlagsName));
+    Require(open_nid_postfix(nullptr, 3, 0) == -1 && *__error_nid_postfix() == 22);
+    Require(open_nid_postfix("", 0x20a00, 0600) == -1 && *__error_nid_postfix() == 22);
+    Require(_open_nid_postfix(nullptr, 0x403) == -1 && *__error_nid_postfix() == 22);
+    Require(_open_nid_postfix("", 3) == -1 && *__error_nid_postfix() == 22);
+    Require(std::filesystem::file_size(present) == 5);
     Require(open_nid_postfix("", 0, 0) == -1 && *__error_nid_postfix() == 2);
     Require(_open_nid_postfix("", 0) == -1 && *__error_nid_postfix() == 2);
     Require(sceKernelOpen("", 0, 0) == static_cast<int>(0x80020002u));
@@ -1120,6 +1160,25 @@ int main() {
     const auto longLeaf = rootName + "/" + std::string(300, 'n');
     Require(sceKernelMkdir(longLeaf.c_str(), 0700) == static_cast<int>(0x8002003fu));
     Require(mkdir_nid_postfix(longLeaf.c_str(), 0700) == -1 && *__error_nid_postfix() == 63);
+    FileStat unreachable{};
+    Require(sceKernelOpen(longLeaf.c_str(), 0, 0) == static_cast<int>(0x8002003fu));
+    Require(sceKernelOpen(longLeaf.c_str(), 0x201, 0600) == static_cast<int>(0x8002003fu));
+    Require(open_nid_postfix(longLeaf.c_str(), 0, 0) == -1 && *__error_nid_postfix() == 63);
+    Require(sceKernelUnlink(longLeaf.c_str()) == static_cast<int>(0x8002003fu));
+    Require(unlink_nid_postfix(longLeaf.c_str()) == -1 && *__error_nid_postfix() == 63);
+    Require(sceKernelStat(longLeaf.c_str(), &unreachable) == static_cast<int>(0x8002003fu));
+    Require(stat_nid_postfix(longLeaf.c_str(), &unreachable) == -1 && *__error_nid_postfix() == 63);
+    const auto loop = root / "loop";
+    std::filesystem::create_symlink("loop", loop);
+    const auto loopName = loop.string();
+    const auto underLoop = loopName + "/leaf";
+    Require(sceKernelOpen(loopName.c_str(), 0, 0) == static_cast<int>(0x8002003eu));
+    Require(open_nid_postfix(loopName.c_str(), 0, 0) == -1 && *__error_nid_postfix() == 62);
+    Require(sceKernelStat(loopName.c_str(), &unreachable) == static_cast<int>(0x8002003eu));
+    Require(stat_nid_postfix(loopName.c_str(), &unreachable) == -1 && *__error_nid_postfix() == 62);
+    Require(sceKernelUnlink(underLoop.c_str()) == static_cast<int>(0x8002003eu));
+    Require(unlink_nid_postfix(underLoop.c_str()) == -1 && *__error_nid_postfix() == 62);
+    Require(unlink_nid_postfix(loopName.c_str()) == 0 && !std::filesystem::is_symlink(loop));
 #endif
     const auto invalidNameUnderFile = presentName + "/a:b/x";
     Require(mkdir_nid_postfix(invalidNameUnderFile.c_str(), 0700) == -1 && *__error_nid_postfix() == 20);

@@ -426,6 +426,11 @@ bool DrawPipeline::HeldReads(std::uint64_t address, std::size_t bytes) {
     return false;
 }
 
+void DrawPipeline::ReleaseRunningReads() {
+    std::lock_guard lock(mutex);
+    if (!items.empty()) items.front().reads.clear();
+}
+
 std::optional<std::uint64_t> DrawPipeline::PendingLabel(std::uint64_t address, std::size_t bytes) {
     if (bytes == 0 || bytes > 8) return std::nullopt;
     const auto end = address + bytes;

@@ -18,6 +18,7 @@
 #include <string>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/RemoveTree.hpp"
 #include "prx/libkernel/AppMetadata/include/AppMetadata.hpp"
 #include "SaveData.hpp"
 #include "prx/libSceSaveData/SaveDataFile.hpp"
@@ -309,6 +310,21 @@ static std::string blocks_path(const std::string& real_path) {
     return real_path + ".blocks";
 }
 
+static bool isMountedDirectory(const std::string& path) {
+    for (const auto& slot : g_slots) {
+        if (!slot.used) continue;
+        if (slot.real_path == path) return true;
+        if (!std::filesystem::exists(path) || !std::filesystem::exists(slot.real_path)) continue;
+        std::error_code error;
+        const bool sameDirectory = std::filesystem::equivalent(slot.real_path, path, error);
+        if (error && error != std::errc::no_such_file_or_directory) {
+            throw std::filesystem::filesystem_error("SaveData: failed to compare save paths", slot.real_path, path, error);
+        }
+        if (sameDirectory) return true;
+    }
+    return false;
+}
+
 static int deleteSave(const SaveDataDelete* del) {
     if (del == nullptr || del->dir_name == nullptr) {
         throw std::runtime_error("sceSaveDataDelete: null argument");
@@ -323,24 +339,9 @@ static int deleteSave(const SaveDataDelete* del) {
     }
     const std::string path = save_root() + "/" + dirName;
     std::lock_guard lock(g_slots_mutex);
-    for (const auto& slot : g_slots) {
-        if (!slot.used) {
-            continue;
-        }
-        if (slot.real_path == path) {
-            return SAVE_DATA_ERROR_BUSY;
-        }
-        std::error_code ec;
-        const bool same_directory = std::filesystem::equivalent(slot.real_path, path, ec);
-        if (ec && ec != std::errc::no_such_file_or_directory) {
-            throw std::filesystem::filesystem_error("sceSaveDataDelete: failed to compare save paths", slot.real_path, path, ec);
-        }
-        if (same_directory) {
-            return SAVE_DATA_ERROR_BUSY;
-        }
-    }
+    if (isMountedDirectory(path)) return SAVE_DATA_ERROR_BUSY;
     if (std::filesystem::is_directory(path)) {
-        std::filesystem::remove_all(path);
+        RemoveTree(path);
     }
     std::error_code ec;
     std::filesystem::remove(param_path(path), ec);
@@ -624,11 +625,7 @@ static int mount3(const SaveDataMount3* mount, SaveDataMountResult* mount_result
     }
     const std::string real_path = save_root() + "/" + dirName;
     std::lock_guard lock(g_slots_mutex);
-    for (const auto& used : g_slots) {
-        if (used.used && used.real_path == real_path) {
-            return SAVE_DATA_ERROR_BUSY;
-        }
-    }
+    if (isMountedDirectory(real_path)) return SAVE_DATA_ERROR_BUSY;
     const bool exists = std::filesystem::is_directory(real_path);
     if (create && exists) {
         return SAVE_DATA_ERROR_EXISTS;
@@ -850,6 +847,9 @@ int APS5_VABI sceSaveDataSetupSaveDataMemory2(const SaveDataMemorySetup2* setup_
 int APS5_VABI sceSaveDataSyncSaveDataMemory(const void* sync_param) {
     if (sync_param == nullptr) {
         return SAVE_DATA_ERROR_PARAMETER;
+    }
+    if (g_initializations == 0) {
+        return SAVE_DATA_ERROR_NOT_INITIALIZED;
     }
     // Every Set already writes straight through to disk; sync only has to confirm the memory exists.
     const std::int32_t user_id = *static_cast<const std::int32_t*>(sync_param);

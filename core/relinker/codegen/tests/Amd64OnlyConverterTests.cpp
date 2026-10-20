@@ -15,6 +15,7 @@
 #include <codegen/x86/X64InstructionRewriter.hpp>
 #include <codegen/IInstructionScanner.hpp>
 #include <elfpatcher/general/EntryStubBuilder.hpp>
+#include <elfpatcher/general/ElfConstants.hpp>
 #include <elfpatcher/general/ProgramHeaderLayoutBuilder.hpp>
 #include <elfpatcher/general/SectionHeaderTableBuilder.hpp>
 #include <elfpatcher/general/SegmentFilter.hpp>
@@ -885,6 +886,14 @@ void converterWideStoreWindows() {
     expected.push_back(0xC3);
     require(returnIsland.Trampolines.size() == 2 && returnIsland.Trampolines[0].Offset == 0x20B && body(returnIsland.Trampolines[0]) == expected, "Instructions moved for an island that end in a return jump back after it");
 
+    const auto intoStore = convert(withStore({0x73, 0x01}, {0xC3}));
+    expected = halves;
+    expected.push_back(0xC3);
+    require(intoStore.Trampolines.size() == 1 && intoStore.Trampolines[0].Offset == 0x202 && intoStore.Trampolines[0].Length == 5 && body(intoStore.Trampolines[0]) == expected, "A branch into the middle of a 256-bit store, where no scanned instruction starts, kept the store");
+
+    const auto intoFollower = convert(withStore({0x73, 0x06}, {0x48, 0x83, 0xC1, 0x01, 0xC3}));
+    require(intoFollower.Trampolines.size() == 1 && intoFollower.Trampolines[0].Offset == 0x202 && intoFollower.Trampolines[0].Length == 8, "A branch into the middle of an instruction moved with a 256-bit store kept the store");
+
     const auto afterBranch = convert(withStore({0x75, 0x10}, {0xFF, 0xD0}));
     expected = {0x0F, 0x85, 0, 0, 0, 0};
     expected.insert(expected.end(), halves.begin(), halves.end());
@@ -1054,10 +1063,15 @@ void converterRosettaScalarCompare() {
     require(site.Offset == 0x20C && site.Length == 5 && site.ReturnBranchOffset == 5 && Bytes(site.Body.begin(), site.Body.begin() + 5) == Bytes(text.begin() + 12, text.begin() + 17) && Bytes(site.Body.begin() + 5, site.Body.begin() + 10) == Bytes{0xE9, 0, 0, 0, 0} && site.Relocations.empty(), "The compare stub does not run the compare unchanged and return");
     require(result.Bytes == file, "Moving the compare changed the file image");
     auto branchInside = file;
-    const Bytes jumped = {0xEB, 0x02, 0xC5, 0xEA, 0xC2, 0xCA, 0x03, 0xC3};
+    const Bytes jumped = {0xEB, 0x01, 0xF3, 0x0F, 0xC2, 0xCA, 0x03, 0xC3};
     std::copy(jumped.begin(), jumped.end(), branchInside.begin() + 0x200);
     const auto kept = converter->Convert(branchInside, {segmentHeader(jumped.size())});
-    require(kept.Trampolines.empty() && kept.KeptCount == 1 && kept.Reports.size() == 1 && kept.Reports[0].Lowering == Codegen::Amd64OnlyLowering::Kept && kept.Bytes == branchInside, "A branch into the compare did not keep it native");
+    require(kept.Trampolines.empty() && kept.KeptCount == 1 && kept.Reports.size() == 1 && kept.Reports[0].Lowering == Codegen::Amd64OnlyLowering::Kept && kept.Bytes == branchInside, "A branch past the prefix of the compare did not keep it native");
+    auto branchIntoVex = file;
+    const Bytes vexJumped = {0xEB, 0x02, 0xC5, 0xEA, 0xC2, 0xCA, 0x03, 0xC3};
+    std::copy(vexJumped.begin(), vexJumped.end(), branchIntoVex.begin() + 0x200);
+    const auto moved = converter->Convert(branchIntoVex, {segmentHeader(vexJumped.size())});
+    require(moved.Trampolines.size() == 1 && moved.Trampolines[0].Offset == 0x202 && moved.KeptCount == 0, "A branch past the VEX prefix of the compare, where no instruction starts, kept the compare native");
     auto ripSource = file;
     const Bytes ripText = {0xC5, 0xEA, 0xC2, 0x0D, 0x00, 0x01, 0x00, 0x00, 0x03, 0xC3};
     std::copy(ripText.begin(), ripText.end(), ripSource.begin() + 0x200);
@@ -1255,9 +1269,10 @@ Elfpatcher::Linux::LinuxElfPatcher linuxPatcher() {
 }
 
 std::uint64_t executableFileOffset(const Bytes& output, const std::uint64_t address) {
+    const auto phOff = read<std::uint64_t>(output, 32);
     const auto phNum = read<std::uint16_t>(output, 56);
     for (std::uint16_t index = 0; index < phNum; ++index) {
-        const auto header = 64 + index * 56;
+        const auto header = phOff + index * 56;
         if (read<std::uint32_t>(output, header) != 1) continue;
         const auto vaddr = read<std::uint64_t>(output, header + 16);
         const auto memSize = read<std::uint64_t>(output, header + 40);
@@ -1303,6 +1318,58 @@ void linuxRipRelativePlacement() {
     const auto bodyOffset = executableFileOffset(output, static_cast<std::uint64_t>(stub));
     const auto operand = stub + static_cast<std::int64_t>(relocation.InstructionEnd) + read<std::int32_t>(output, bodyOffset + relocation.DisplacementOffset);
     require(operand == 0x2040, "Relocated RIP-relative operand does not reach the original address");
+}
+
+std::vector<std::array<std::uint64_t, 8>> stackHeaders(const Bytes& output) {
+    const auto phOff = read<std::uint64_t>(output, 32);
+    const auto phNum = read<std::uint16_t>(output, 56);
+    std::vector<std::array<std::uint64_t, 8>> found;
+    for (std::uint16_t index = 0; index < phNum; ++index) {
+        const auto header = static_cast<std::size_t>(phOff) + index * 56;
+        if (read<std::uint32_t>(output, header) != Elfpatcher::PT_GNU_STACK) continue;
+        found.push_back({read<std::uint32_t>(output, header), read<std::uint32_t>(output, header + 4),
+            read<std::uint64_t>(output, header + 8), read<std::uint64_t>(output, header + 16),
+            read<std::uint64_t>(output, header + 24), read<std::uint64_t>(output, header + 32),
+            read<std::uint64_t>(output, header + 40), read<std::uint64_t>(output, header + 48)});
+    }
+    return found;
+}
+
+void linuxStackSynthesis() {
+    const auto patchOutput = [](std::uint16_t slots, std::vector<Domain::ProgramHeader> headers) {
+        auto elf = elfFixture({0xC3});
+        write<std::uint16_t>(elf, 56, slots);
+        auto patcher = linuxPatcher();
+        return patcher.Patch(std::move(elf), std::move(headers), {}, 0, "$ORIGIN/libs", true, false, {});
+    };
+    const Domain::ProgramHeader inputStack{Elfpatcher::PT_GNU_STACK, 6, 0, 0, 0, 0, 0x20000, 16};
+    const std::vector<std::array<std::uint64_t, 8>> synthetic = {{Elfpatcher::PT_GNU_STACK, 6, 0, 0, 0, 0, 0, 16}};
+    const std::vector<std::array<std::uint64_t, 8>> preserved = {{Elfpatcher::PT_GNU_STACK, 6, 0, 0, 0, 0, 0x20000, 16}};
+
+    const auto exactFit = patchOutput(7, elfHeaders());
+    require(read<std::uint64_t>(exactFit, 32) >= 0x400, "a full input table must move to make room for the synthetic stack");
+    require(read<std::uint16_t>(exactFit, 56) == 8, "the output must use the reserved synthetic stack slot");
+    require(stackHeaders(exactFit) == synthetic, "the synthetic stack must be PT_GNU_STACK with PF_R|PF_W and alignment 16");
+
+    const auto spareSlot = patchOutput(8, elfHeaders());
+    require(read<std::uint64_t>(spareSlot, 32) == 64, "the required count must not move a table that has a free slot");
+    require(read<std::uint16_t>(spareSlot, 56) == 8, "the free slot must be filled by the synthetic stack");
+    require(stackHeaders(spareSlot) == synthetic, "the synthetic stack must be PT_GNU_STACK with PF_R|PF_W and alignment 16");
+
+    const auto roomyTable = patchOutput(9, elfHeaders());
+    require(read<std::uint64_t>(roomyTable, 32) == 64, "the required count must not move a table with spare slots");
+    require(read<std::uint16_t>(roomyTable, 56) == 8, "the output count must match the required count");
+    require(stackHeaders(roomyTable) == synthetic, "the synthetic stack must be PT_GNU_STACK with PF_R|PF_W and alignment 16");
+
+    const auto keptStackExact = patchOutput(8, {elfHeaders()[0], elfHeaders()[1], inputStack});
+    require(read<std::uint64_t>(keptStackExact, 32) == 64, "an input stack must not over-reserve a header slot");
+    require(read<std::uint16_t>(keptStackExact, 56) == 8, "an input stack must not grow the output count");
+    require(stackHeaders(keptStackExact) == preserved, "a kept PT_GNU_STACK must stay unchanged");
+
+    const auto keptStackShort = patchOutput(7, {elfHeaders()[0], elfHeaders()[1], inputStack});
+    require(read<std::uint64_t>(keptStackShort, 32) >= 0x400, "a full input table must move when the kept stack does not fit");
+    require(read<std::uint16_t>(keptStackShort, 56) == 8, "the moved table must carry the kept stack");
+    require(stackHeaders(keptStackShort) == preserved, "a kept PT_GNU_STACK must stay unchanged");
 }
 
 }
@@ -1836,6 +1903,7 @@ int main() {
         converterFailureOffsets();
         linuxPlacement();
         linuxRipRelativePlacement();
+        linuxStackSynthesis();
         scannerZeroTail();
         std::cout << "AMD64-only converter tests passed\n";
     } catch (const std::exception& error) {

@@ -130,6 +130,20 @@ struct SpirvEmitterState {
     bool singleWorkgroup = false;
     bool robustBufferAccess2 = false;
     bool float32FlushToZero = false;
+    bool meshBarycentricPixel = false;
+    bool meshBarycentricVertex = false;
+    std::uint32_t barycentricSmoothLocation = 0xffffffffu;
+    std::uint32_t barycentricLinearLocation = 0xffffffffu;
+    std::uint32_t barycentricPositionsLocation = 0xffffffffu;
+    std::vector<std::uint32_t> meshExportedLocations;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> meshPerVertexLocations;
+    std::vector<std::array<std::uint32_t, 3>> meshVertexParameters;
+    std::uint32_t meshPositionStaging = 0;
+    std::uint32_t meshClipSmooth = 0;
+    std::uint32_t meshClipLinear = 0;
+    std::uint32_t meshFlatPositions = 0;
+    std::uint32_t pixelFlatPositions = 0;
+    std::map<std::pair<std::uint32_t, std::uint32_t>, std::uint32_t> solvedBarycentrics;
     std::unordered_set<const IrValue*> sharedLaneValues;
     std::uint32_t laneHalf = 0;
     std::uint32_t spirvVersion = 0x00010300u;
@@ -163,6 +177,7 @@ struct SpirvEmitterState {
     bool f16DenormPreserveEmitted = false;
     std::uint32_t dot2F32F16Function = 0;
     std::map<std::pair<bool, std::uint32_t>, std::uint32_t> interpolateFunctions;
+    bool integerInterpolation = false;
     std::array<std::array<std::uint32_t, 2>, 2> bdaDwordReadFunctions {};
     std::array<std::array<std::uint32_t, 2>, 2> bdaSpanReadFunctions {};
     std::unordered_map<const IrValue*, std::pair<std::uint32_t, std::uint32_t>> bdaGroupedLoads;
@@ -183,6 +198,7 @@ struct SpirvEmitterState {
     // Execution scope of the barriers that keep one guest wave's LDS accesses in program order across
     // host invocations (see WaveLdsScope); 0 when none are emitted.
     std::uint32_t waveLdsScope = 0;
+    bool insideLdsLock = false;
     // Debug aid (APS5_LOOP_GUARD=<exits>): after that many evaluated loop exits an invocation leaves its
     // loops, and the first loop that ran out is reported as a LoopLimit fault instead of hanging the GPU.
     std::uint32_t loopGuardLimit = 0;

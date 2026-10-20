@@ -82,6 +82,7 @@ struct TextureCacheUse {
     std::uint64_t storageBytes = 0;
 };
 TextureCacheUse TextureCacheUsage();
+void OverrideCacheBudgetForTest(std::uint64_t bytes);
 std::uint64_t SampledTextureCacheBudget(const Context& context);
 TextureCacheBudgets CurrentTextureCacheBudgets(const Context& context);
 // Cumulative sampled-cache counters (the [texture-cache] line reports them per 10 s).
@@ -133,7 +134,7 @@ struct TableDescriptors {
     std::uint32_t binding = 0;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> runs;
     std::vector<VkDescriptorImageInfo> images;
-    std::shared_ptr<const std::vector<std::shared_ptr<Texture>>> textures;
+    std::shared_ptr<const std::vector<std::weak_ptr<Texture>>> textures;
 };
 
 class DescriptorCache {
@@ -364,6 +365,7 @@ public:
     bool BindsReleasedTexture() const;
     // The resource cache's pins on the set's sampled textures (Insert pins, every removal unpins).
     void PinTextures(bool pin) const;
+    static std::size_t LookupLogCapacity();
     bool ChecksFaults() const { return bda != nullptr; }
     void CheckFaults(std::uint64_t shaderAddress = 0) const;
     bool InUse() const { return usesInFlight->load(std::memory_order_acquire) != 0; }
@@ -669,7 +671,7 @@ private:
         std::vector<std::pair<std::uint32_t, std::uint32_t>> runs;
     };
     std::array<TableWrites, 2> tableWrites;
-    std::shared_ptr<const TableDescriptors> keptTable(std::size_t set, std::shared_ptr<const std::vector<std::shared_ptr<Texture>>>& held) noexcept;
+    std::shared_ptr<const TableDescriptors> keptTable(std::size_t set, std::shared_ptr<const std::vector<std::weak_ptr<Texture>>>& held) noexcept;
     std::uint32_t setOf(const Binding& binding) const;
     std::vector<Allocation> allocations;
     std::vector<VkDescriptorBufferInfo> descriptorBuffers;
