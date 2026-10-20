@@ -2,6 +2,7 @@
 #include "execution/VulkanTestDevice.hpp"
 #include "prx/libSceAgcDriver/Execution/include/QueueState.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawCache.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
@@ -594,6 +595,7 @@ void testSmallCopyBehindPendingSource() {
     AgcDriverWaitIdle_nid_postfix();
     check(std::equal(destination, destination + smallWords, produced), "a small copy did not see the GPU copy into its source before it");
     if (std::getenv("APS5_COPY_SYNC") != nullptr) check(AgcDriver::DriverDetail::copiesBehindPendingSources.load() == before, "a small copy that has to wait for a completion store over its source went through the GPU copy");
+    else if (AgcDriver::DriverDetail::DrawPipeline::DmaItems()) check(AgcDriver::DriverDetail::copiesBehindPendingSources.load() == before, "a small copy queued as a DMA_DATA pipeline item went through the GPU copy");
     else check(AgcDriver::DriverDetail::copiesBehindPendingSources.load() == before + 1, "a small copy whose source the GPU still stores into was not recorded on the GPU");
     std::fill(destination, destination + smallWords, 0u);
     const auto settled = AgcDriver::DriverDetail::copiesBehindPendingSources.load();
