@@ -969,9 +969,6 @@ std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledSh
         cursor += count;
     }
     materialized = std::move(compact);
-#if ANYPS5_ENABLE_SPIRV_TOOLS
-    materialized = ValidateAndOptimizeSpirv(materialized, target.vulkanVersion, target.spirvVersion, target.nonConstantImageOffsets, false);
-#endif
     auto module = std::make_shared<SpecializedModule>();
     std::map<std::uint32_t, std::uint32_t> bindingNumbers;
     std::set<std::uint32_t> otherSets;
