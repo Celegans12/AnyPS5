@@ -97,6 +97,24 @@ void viewSlots(const Context& context, VkImageView view) {
     heap.ReleaseViewSlots(&second);
 }
 
+void sweptOwnerReentry(const Context& context, VkImageView view) {
+    auto& heap = BindlessHeap::For(context);
+    const auto kind = Abi::FirstStorageImageBinding + 1u;
+    int released = 0;
+    const auto owner = [&] {
+        return std::shared_ptr<void>(new int(0), [&context, &released](void* pointer) {
+            if (auto* existing = BindlessHeap::Existing(context)) existing->ReleaseViewSlots(pointer);
+            ++released;
+            delete static_cast<int*>(pointer);
+        });
+    };
+    require(heap.StorageSlot(kind, owner(), view).has_value(), "the first storage owner takes the kind's only slot");
+    require(heap.StorageSlot(kind, owner(), view).has_value() && released == 1, "a full kind sweeps an owner whose release calls back into the heap");
+    BindlessHeap::NoteSweepDue();
+    BindlessHeap::SweepIfDue();
+    require(released == 2, "a due sweep releases an owner that calls back into the heap");
+}
+
 void ringSpans(const Context& context) {
     BindlessHeap heap(context);
     BindlessHeap::SpanMark unwritten;
@@ -198,6 +216,7 @@ int main(int argc, char** argv) {
             samplerSlots(context);
             ringSpans(context);
             viewSlots(context, placeholders.View(Abi::FirstStorageImageBinding));
+            sweptOwnerReentry(context, placeholders.View(Abi::FirstStorageImageBinding));
             device->WaitIdle();
         }
         device.reset();

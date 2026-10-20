@@ -134,6 +134,15 @@ BindlessHeap::~BindlessHeap() = default;
 
 namespace {
 
+thread_local std::vector<std::shared_ptr<void>> sweptStorage;
+
+struct SweptStorageRelease {
+    ~SweptStorageRelease() {
+        auto released = std::move(sweptStorage);
+        sweptStorage.clear();
+    }
+};
+
 std::mutex& heapsMutex() {
     static std::mutex mutex;
     return mutex;
@@ -192,6 +201,7 @@ BindlessHeap* BindlessHeap::Existing(const Context& context) {
 std::optional<std::uint32_t> BindlessHeap::TextureSlot(std::uint32_t kind, const std::shared_ptr<Texture>& texture, VkImageView view, VkImageLayout layout) {
     if (kind < Abi::FirstImageBinding || kind >= Abi::FirstStorageImageBinding || texture == nullptr || view == VK_NULL_HANDLE) throw std::runtime_error("AGC bindless heap: invalid texture slot request");
     std::vector<std::shared_ptr<Texture>> dropped;
+    SweptStorageRelease swept;
     std::lock_guard lock(mutex);
     const TextureKey key{kind, texture.get(), view, layout};
     if (const auto found = textureSlots.find(key); found != textureSlots.end()) return found->second;
@@ -222,6 +232,7 @@ std::optional<std::uint32_t> BindlessHeap::TextureSlot(std::uint32_t kind, const
 std::optional<std::uint32_t> BindlessHeap::StorageSlot(std::uint32_t kind, std::shared_ptr<void> owner, VkImageView view) {
     if (!Abi::GpuHeapStorageKind(kind) || owner == nullptr || view == VK_NULL_HANDLE) throw std::runtime_error("AGC bindless heap: invalid storage slot request");
     std::vector<std::shared_ptr<Texture>> dropped;
+    SweptStorageRelease swept;
     std::lock_guard lock(mutex);
     const TextureKey key{kind, owner.get(), view, VK_IMAGE_LAYOUT_GENERAL};
     if (const auto found = textureSlots.find(key); found != textureSlots.end()) return found->second;
@@ -250,6 +261,7 @@ std::optional<std::uint32_t> BindlessHeap::StorageSlot(std::uint32_t kind, std::
 std::optional<std::uint32_t> BindlessHeap::ViewSlot(std::uint32_t kind, const void* owner, VkImageView view) {
     if (!Abi::GpuHeapStorageKind(kind) || owner == nullptr || view == VK_NULL_HANDLE) throw std::runtime_error("AGC bindless heap: invalid view slot request");
     std::vector<std::shared_ptr<Texture>> dropped;
+    SweptStorageRelease swept;
     std::lock_guard lock(mutex);
     const TextureKey key{kind, owner, view, VK_IMAGE_LAYOUT_GENERAL};
     if (const auto found = textureSlots.find(key); found != textureSlots.end()) return found->second;
@@ -313,7 +325,7 @@ void BindlessHeap::sweepLocked(std::vector<std::shared_ptr<Texture>>& dropped) {
             if (owner.storage != nullptr) {
                 if (owner.storage.use_count() > 1) continue;
                 textureSlots.erase(owner.key);
-                owner.storage.reset();
+                sweptStorage.push_back(std::move(owner.storage));
                 owner.key = {};
                 ++owner.generation;
                 slotSerial.fetch_add(1, std::memory_order_release);
@@ -376,6 +388,7 @@ void BindlessHeap::NoteSweepDue() {
 void BindlessHeap::SweepIfDue() {
     if (!sweepDue.load(std::memory_order_relaxed) || !sweepDue.exchange(false, std::memory_order_relaxed)) return;
     std::vector<std::shared_ptr<Texture>> dropped;
+    SweptStorageRelease swept;
     std::vector<std::shared_ptr<Sampler>> droppedSamplers;
     std::lock_guard heapsLock(heapsMutex());
     bool room = true;
