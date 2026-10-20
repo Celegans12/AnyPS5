@@ -30,6 +30,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_NO_RUN_ATOMIC_GUARD",
     "APS5_DRAW_INPUTS_IN_PLACE",
     "APS5_NO_RUN_STAGED_READ_GUARD",
+    "APS5_NO_SMALL_DEVICE_TIER",
 };
 
 struct Refusal {

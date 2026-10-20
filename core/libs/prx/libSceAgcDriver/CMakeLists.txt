@@ -1107,8 +1107,11 @@ if(BUILD_TESTING)
     add_test(NAME agc_buffer_pool_small_device_no_staging COMMAND agc_buffer_pool_tests --small-device-retention)
     set_tests_properties(agc_buffer_pool_small_device_no_staging PROPERTIES ENVIRONMENT
         "APS5_STAGING_POOL_MIB=0")
+    add_test(NAME agc_buffer_pool_no_small_device_tier COMMAND agc_buffer_pool_tests)
+    set_tests_properties(agc_buffer_pool_no_small_device_tier PROPERTIES ENVIRONMENT
+        "APS5_NO_SMALL_DEVICE_TIER=1")
     if(WIN32)
-        set_tests_properties(agc_buffer_pool agc_buffer_pool_small_device_shared agc_buffer_pool_small_device_no_staging PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_buffer_pool agc_buffer_pool_small_device_shared agc_buffer_pool_small_device_no_staging agc_buffer_pool_no_small_device_tier PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()

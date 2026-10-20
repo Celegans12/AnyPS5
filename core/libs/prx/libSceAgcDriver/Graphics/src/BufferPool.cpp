@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -45,10 +46,11 @@ BufferPool::BufferPool(const Context& context) : maxSlots(std::max<std::size_t>(
     smallTier.budget = smallBudget;
     largeTier.budget = budget;
     deviceTier.budget = deviceBudget(context);
+    smallDeviceTier.budget = std::max<VkDeviceSize>(smallBudget, deviceTier.budget / 8u);
 }
 
 BufferPool::~BufferPool() {
-    for (auto* tier : {&smallTier, &largeTier, &deviceTier}) {
+    for (auto* tier : {&smallTier, &largeTier, &deviceTier, &smallDeviceTier}) {
         for (const auto& [key, slots] : tier->free) {
             for (const auto& slot : slots) destroy(slot.allocation);
         }
@@ -359,6 +361,7 @@ VkBufferUsageFlags BufferPool::Usage(VkBufferUsageFlags usage, VkMemoryPropertyF
 
 BufferPool::Tier& BufferPool::tierFor(std::size_t capacity, VkMemoryPropertyFlags properties) {
     if (DeviceTiered(properties) && (sharedTiers() || capacity >= classLimit)) return deviceTier;
+    if (DeviceTiered(properties) && !RuntimeSwitches::Set(RuntimeSwitch::NoSmallDeviceTier)) return smallDeviceTier;
     return !sharedTiers() && capacity < classLimit ? smallTier : largeTier;
 }
 
@@ -372,7 +375,7 @@ std::optional<BufferAllocation> BufferPool::Take(std::size_t bytes, VkBufferUsag
         const auto now = std::chrono::steady_clock::now();
         if (now - lastReport > std::chrono::seconds(10)) {
             lastReport = now;
-            AgcDriver::ProfilePrint_nid_no_patch("[bufferpool] small: %llu hits, %llu misses, %llu evictions, %zu retained (%.0f MiB); large: %llu hits, %llu misses, %llu evictions, %zu retained (%.0f MiB)%s; device: %llu hits, %llu misses, %llu evictions, %zu retained (%.0f MiB of %llu)\n", static_cast<unsigned long long>(smallTier.hits), static_cast<unsigned long long>(smallTier.misses), static_cast<unsigned long long>(smallTier.evictions), smallTier.slots, smallTier.retainedBytes / 1048576.0, static_cast<unsigned long long>(largeTier.hits), static_cast<unsigned long long>(largeTier.misses), static_cast<unsigned long long>(largeTier.evictions), largeTier.slots, largeTier.retainedBytes / 1048576.0, sharedTiers() ? " (shared)" : "", static_cast<unsigned long long>(deviceTier.hits), static_cast<unsigned long long>(deviceTier.misses), static_cast<unsigned long long>(deviceTier.evictions), deviceTier.slots, deviceTier.retainedBytes / 1048576.0, static_cast<unsigned long long>(deviceTier.budget >> 20u));
+            AgcDriver::ProfilePrint_nid_no_patch("[bufferpool] small: %llu hits, %llu misses, %llu evictions, %zu retained (%.0f MiB); large: %llu hits, %llu misses, %llu evictions, %zu retained (%.0f MiB)%s; device: %llu hits, %llu misses, %llu evictions, %zu retained (%.0f MiB of %llu); small device%s: %llu hits, %llu misses, %llu evictions, %zu retained (%.0f MiB of %llu)\n", static_cast<unsigned long long>(smallTier.hits), static_cast<unsigned long long>(smallTier.misses), static_cast<unsigned long long>(smallTier.evictions), smallTier.slots, smallTier.retainedBytes / 1048576.0, static_cast<unsigned long long>(largeTier.hits), static_cast<unsigned long long>(largeTier.misses), static_cast<unsigned long long>(largeTier.evictions), largeTier.slots, largeTier.retainedBytes / 1048576.0, sharedTiers() ? " (shared)" : "", static_cast<unsigned long long>(deviceTier.hits), static_cast<unsigned long long>(deviceTier.misses), static_cast<unsigned long long>(deviceTier.evictions), deviceTier.slots, deviceTier.retainedBytes / 1048576.0, static_cast<unsigned long long>(deviceTier.budget >> 20u), RuntimeSwitches::Set(RuntimeSwitch::NoSmallDeviceTier) ? " (APS5_NO_SMALL_DEVICE_TIER: in the small tier)" : "", static_cast<unsigned long long>(smallDeviceTier.hits), static_cast<unsigned long long>(smallDeviceTier.misses), static_cast<unsigned long long>(smallDeviceTier.evictions), smallDeviceTier.slots, smallDeviceTier.retainedBytes / 1048576.0, static_cast<unsigned long long>(smallDeviceTier.budget >> 20u));
             if (vram.Enabled()) {
                 const auto report = vram.Report();
                 AgcDriver::ProfilePrint_nid_no_patch("[vram] heap %u: budget %llu MiB, usage %llu MiB, target %llu MiB; %llu released device buffers (%.0f MiB) not pooled over the target\n", report.heap, static_cast<unsigned long long>(report.budget >> 20u), static_cast<unsigned long long>(report.usage >> 20u), static_cast<unsigned long long>(report.target >> 20u), static_cast<unsigned long long>(vramDropped), vramDroppedBytes / 1048576.0);
@@ -380,7 +383,7 @@ std::optional<BufferAllocation> BufferPool::Take(std::size_t bytes, VkBufferUsag
         }
     }
     auto& tier = tierFor(capacity, properties);
-    const auto largest = &tier == &deviceTier && !exactSizes() && bytes <= std::numeric_limits<std::size_t>::max() / 2 ? std::max(capacity, bytes * 2) : capacity;
+    const auto largest = (&tier == &deviceTier || &tier == &smallDeviceTier) && !exactSizes() && bytes <= std::numeric_limits<std::size_t>::max() / 2 ? std::max(capacity, bytes * 2) : capacity;
     auto found = tier.free.end();
     for (auto size = capacity; size <= largest && found == tier.free.end(); size = NextCapacity(size)) found = tier.free.find({size, usage, properties});
     if (found == tier.free.end() || found->second.empty()) {
@@ -422,9 +425,10 @@ VkDeviceSize BufferPool::trim() {
     Tier retiredSmall;
     Tier retiredLarge;
     Tier retiredDevice;
+    Tier retiredSmallDevice;
     {
         std::lock_guard lock(mutex);
-        for (const auto& [tier, retired] : {std::pair{&smallTier, &retiredSmall}, std::pair{&largeTier, &retiredLarge}, std::pair{&deviceTier, &retiredDevice}}) {
+        for (const auto& [tier, retired] : {std::pair{&smallTier, &retiredSmall}, std::pair{&largeTier, &retiredLarge}, std::pair{&deviceTier, &retiredDevice}, std::pair{&smallDeviceTier, &retiredSmallDevice}}) {
             tier->free.swap(retired->free);
             tier->evictions += tier->slots;
             tier->retainedBytes = 0;
@@ -432,7 +436,7 @@ VkDeviceSize BufferPool::trim() {
         }
     }
     VkDeviceSize bytes = 0;
-    for (const auto* tier : {&retiredSmall, &retiredLarge, &retiredDevice}) {
+    for (const auto* tier : {&retiredSmall, &retiredLarge, &retiredDevice, &retiredSmallDevice}) {
         for (const auto& [key, slots] : tier->free) {
             for (const auto& slot : slots) bytes += destroy(slot.allocation);
         }
@@ -465,7 +469,7 @@ void BufferPool::Put(const BufferAllocation& allocation) noexcept {
         if (DeviceTiered(allocation.properties)) excess = vram.Excess();
         std::lock_guard lock(mutex);
         auto& tier = tierFor(allocation.bytes, allocation.properties);
-        if (excess != 0 && &tier == &deviceTier) {
+        if (excess != 0 && (&tier == &deviceTier || &tier == &smallDeviceTier)) {
             auto dropped = allocation.allocationBytes;
             while (tier.slots != 0 && dropped < excess) {
                 evictOldest(tier, evicted);

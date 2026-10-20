@@ -148,6 +148,7 @@ private:
     Tier smallTier;
     Tier largeTier;
     Tier deviceTier;
+    Tier smallDeviceTier;
     std::uint64_t clock = 0;
     std::mutex slabMutex;
     std::unordered_map<std::uint64_t, Slab> slabs;
