@@ -830,7 +830,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         return drawn();
     }
     if (drawParameters.indirect && indirectCpu) {
-        if (pipelined) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Indirect);
+        if (pipelined && !pipelinedIndirect) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Indirect);
         const auto indirect = *drawParameters.indirect;
         for (std::size_t i = 0; i < programs.size(); ++i) {
             if (programResults[i] == nullptr) continue;
