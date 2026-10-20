@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/GuestArena.hpp"
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -194,10 +195,17 @@ struct Heap {
     std::byte* base = nullptr;
     bool first = false;
     bool second = false;
+    bool arena = false;
 
-    Heap() {
+    explicit Heap(bool watched = false) {
 #ifdef _WIN32
-        base = static_cast<std::byte*>(VirtualAlloc(nullptr, 2 * RangeBytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        arena = watched && AgcDriver::GuestMemory::WriteWatched();
+        if (arena) {
+            base = static_cast<std::byte*>(GuestArena::GuestArenaAllocate_nid_postfix(2 * RangeBytes, Alignment));
+            if (base != nullptr) GuestArena::GuestArenaCommit_nid_postfix(base, 2 * RangeBytes, PAGE_READWRITE, 2 * RangeBytes);
+        } else {
+            base = static_cast<std::byte*>(VirtualAlloc(nullptr, 2 * RangeBytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        }
 #else
         base = static_cast<std::byte*>(std::aligned_alloc(Alignment, 2 * RangeBytes));
 #endif
@@ -225,7 +233,12 @@ struct Heap {
         } catch (...) {
         }
 #ifdef _WIN32
-        VirtualFree(base, 0, MEM_RELEASE);
+        if (arena) {
+            GuestArena::GuestArenaReset_nid_postfix(base, 2 * RangeBytes);
+            GuestArena::GuestArenaRelease_nid_postfix(base, 2 * RangeBytes);
+        } else {
+            VirtualFree(base, 0, MEM_RELEASE);
+        }
 #else
         std::free(base);
 #endif
@@ -363,8 +376,8 @@ std::uint64_t nestedImportAddress = 0;
 unsigned nestedImportCallbacks = 0;
 
 void UnwatchReentryUsesExistingImports() {
-    Heap first;
-    Heap second;
+    Heap first(true);
+    Heap second(true);
     const auto context = mockContext();
     nestedImportAddress = first.Address();
     const auto* existing = HostImportFor(context, nestedImportAddress, 4096);
