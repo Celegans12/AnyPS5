@@ -162,7 +162,7 @@ void NoteHeapStageReason(HeapStageReason reason);
 void NoteHeapRecord(bool compute, bool heap);
 void NoteHeapFallback(HeapFallback reason);
 void NoteCpuBufferCopy(std::uint64_t bytes);
-enum class HeapCost : std::uint8_t { StagePrepare, HeapStageCall, StageFinish, WalkMemo, Walk, Materialize, TemplateFind, TemplateBuild, Slots, StageData, BufferAddresses, Count };
+enum class HeapCost : std::uint8_t { StagePrepare, HeapStageCall, StageFinish, WalkMemo, Walk, Materialize, TemplateFind, TemplateBuild, Slots, StageData, BufferAddresses, MemoInsert, Guards, Count };
 bool HeapCostTimed();
 void NoteHeapCost(HeapCost cost, std::uint64_t nanoseconds);
 class HeapCostScope {

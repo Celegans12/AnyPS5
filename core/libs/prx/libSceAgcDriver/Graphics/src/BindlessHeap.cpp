@@ -772,7 +772,7 @@ std::uint64_t takeCount(std::atomic<std::uint64_t>& counter) {
 
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(HeapCost::Count)> heapCostNs{};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(HeapCost::Count)> heapCostCalls{};
-constexpr std::array<const char*, static_cast<std::size_t>(HeapCost::Count)> HeapCostNames{"stage prepare", "heap stage call", "stage finish", "walk memo", "walk", "materialize", "template find", "template build", "slots", "stage data", "buffer addresses"};
+constexpr std::array<const char*, static_cast<std::size_t>(HeapCost::Count)> HeapCostNames{"stage prepare", "heap stage call", "stage finish", "walk memo", "walk", "materialize", "template find", "template build", "slots", "stage data", "buffer addresses", "memo insert", "guards"};
 
 void reportHeapStatistics() {
     static const bool enabled = std::getenv("APS5_PIPELINE_STATS") != nullptr;
