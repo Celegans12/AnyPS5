@@ -495,7 +495,8 @@ std::uint32_t BdaAnchorHolds(SpirvEmitterState& state, const SpirvEmitterState::
 
 void CollectBdaAnchors(SpirvEmitterState& state) {
     state.bdaAnchors.clear();
-    if (!state.program.Info().usesDma || state.bdaProbeFunction == 0) return;
+    static const bool anchorsOff = std::getenv("APS5_NO_BDA_ANCHORS") != nullptr;
+    if (anchorsOff || !state.program.Info().usesDma || state.bdaProbeFunction == 0) return;
     std::vector<std::pair<std::pair<std::uint32_t, std::uint32_t>, std::size_t>> bases;
     for (const IrValue* inst : BdaReadSites(state)) {
         const auto base = UserDataBase(state, *inst);
