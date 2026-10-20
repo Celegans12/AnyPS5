@@ -116,6 +116,18 @@ add_custom_command(
         VERBATIM
 )
 
+set(agcTextureDetileAddressedShaderSpv ${agcTextureDetileGeneratedDir}/TextureDetileAddressed.spv)
+set(agcTextureDetileAddressedShaderHeader ${agcTextureDetileGeneratedDir}/TextureDetileAddressed_spv.h)
+add_custom_command(
+        OUTPUT "${agcTextureDetileAddressedShaderHeader}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${agcTextureDetileGeneratedDir}"
+        COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -DADDRESSED=1 -o "${agcTextureDetileAddressedShaderSpv}" "${agcTextureDetileShaderSource}"
+        COMMAND ${CMAKE_COMMAND} -DINPUT=${agcTextureDetileAddressedShaderSpv} -DOUTPUT=${agcTextureDetileAddressedShaderHeader}
+        -DSYMBOL=TEXTURE_DETILE_ADDRESSED_SPV -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
+        DEPENDS "${agcTextureDetileShaderSource}" glslang-standalone
+        VERBATIM
+)
+
 set(agcTextureRepackShaderSource ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/TextureRepack.comp)
 set(agcTextureRepackShaderSpv ${agcTextureDetileGeneratedDir}/TextureRepack.spv)
 set(agcTextureRepackShaderHeader ${agcTextureDetileGeneratedDir}/TextureRepack_spv.h)
@@ -125,6 +137,17 @@ add_custom_command(
         COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -o "${agcTextureRepackShaderSpv}" "${agcTextureRepackShaderSource}"
         COMMAND ${CMAKE_COMMAND} -DINPUT=${agcTextureRepackShaderSpv} -DOUTPUT=${agcTextureRepackShaderHeader}
         -DSYMBOL=TEXTURE_REPACK_SPV -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
+        DEPENDS "${agcTextureRepackShaderSource}" glslang-standalone
+        VERBATIM
+)
+set(agcTextureRepackAddressedShaderSpv ${agcTextureDetileGeneratedDir}/TextureRepackAddressed.spv)
+set(agcTextureRepackAddressedShaderHeader ${agcTextureDetileGeneratedDir}/TextureRepackAddressed_spv.h)
+add_custom_command(
+        OUTPUT "${agcTextureRepackAddressedShaderHeader}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${agcTextureDetileGeneratedDir}"
+        COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -DADDRESSED=1 -o "${agcTextureRepackAddressedShaderSpv}" "${agcTextureRepackShaderSource}"
+        COMMAND ${CMAKE_COMMAND} -DINPUT=${agcTextureRepackAddressedShaderSpv} -DOUTPUT=${agcTextureRepackAddressedShaderHeader}
+        -DSYMBOL=TEXTURE_REPACK_ADDRESSED_SPV -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
         DEPENDS "${agcTextureRepackShaderSource}" glslang-standalone
         VERBATIM
 )
@@ -365,6 +388,8 @@ set(agcDriverSources
         ${agcMeshArgumentsShaderHeader}
         ${agcTextureDetileImageShaderHeader}
         ${agcTextureRepackShaderHeader}
+        ${agcTextureDetileAddressedShaderHeader}
+        ${agcTextureRepackAddressedShaderHeader}
         ${agcDispatchArgumentsShaderHeader}
         ${agcSampleCounterShaderHeader}
         ${agcSampleDumpsShaderHeader}

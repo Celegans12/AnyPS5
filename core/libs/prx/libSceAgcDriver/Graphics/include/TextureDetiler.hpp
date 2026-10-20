@@ -61,7 +61,8 @@ namespace AgcDriver::Graphics {
     private:
         VkPipeline multisampleReadbackPipeline(std::uint32_t elementBytes, bool depth);
         VkPipeline multisampleUploadPipeline(std::uint32_t elementBytes);
-        VkPipeline pipeline(TextureTileMode tileMode, std::uint32_t elementBytes, bool retile, bool thick, bool image = false);
+        VkPipeline pipeline(TextureTileMode tileMode, std::uint32_t elementBytes, bool retile, bool thick, bool image = false, bool addressed = false);
+        VkDeviceAddress bufferAddress(VkBuffer buffer) const;
         void release() noexcept;
         struct DescriptorRing {
             std::vector<VkDescriptorPool> pools;
@@ -90,6 +91,11 @@ namespace AgcDriver::Graphics {
         VkShaderModule imageModule = VK_NULL_HANDLE;
         VkShaderModule repackModule = VK_NULL_HANDLE;
         VkPipeline repackPipeline = VK_NULL_HANDLE;
+        VkPipelineLayout addressedPipelineLayout = VK_NULL_HANDLE;
+        VkPipelineLayout addressedRepackLayout = VK_NULL_HANDLE;
+        VkShaderModule addressedModule = VK_NULL_HANDLE;
+        VkShaderModule addressedRepackModule = VK_NULL_HANDLE;
+        VkPipeline addressedRepackPipeline = VK_NULL_HANDLE;
         DescriptorRing imageDescriptorSets;
         VkDescriptorSetLayout readbackDescriptorLayout = VK_NULL_HANDLE;
         VkPipelineLayout readbackPipelineLayout = VK_NULL_HANDLE;
