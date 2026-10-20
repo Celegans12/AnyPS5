@@ -659,10 +659,15 @@ std::uint32_t genericFormattedLoad(SpirvValueEmitContext& context, const IrValue
         values[component] = EmitValueOrZeroIfCondition(state, both(state, inBounds, required[component]), [&] {
             const auto width = Select(state, u32, packed, constant(32u), bits[component]);
             const auto dword = equal(state, width, constant(32u));
-            const auto raw = EmitValueIfElse(state, dword, u32, [&] { return readBuffer(context, instruction, addresses[component].guest, 32u); }, [&] {
-                return EmitBdaReadBytes(context, instruction, addresses[component].guest, Binary(state, spv::OpShiftRightLogical, u32, width, constant(3u)));
-            });
-            const auto bitOffset = Select(state, u32, packed, field(state, bitOffsets, component * 8u, 8u), constant(0u));
+            const auto raw = memory.gpuDescriptor
+                ? EmitValueIfElse(state, dword, u32, [&] { return readBuffer(context, instruction, addresses[component].guest, 32u); }, [&] {
+                    return EmitBdaReadBytes(context, instruction, addresses[component].guest, Binary(state, spv::OpShiftRightLogical, u32, width, constant(3u)));
+                })
+                : readBuffer(context, instruction, addresses[component].guest, 32u);
+            const auto subwordOffset = memory.gpuDescriptor
+                ? constant(0u)
+                : Binary(state, spv::OpShiftLeftLogical, u32, EmitAndConstant(state, addresses[component].guest, 3u), constant(3u));
+            const auto bitOffset = Select(state, u32, packed, field(state, bitOffsets, component * 8u, 8u), subwordOffset);
             const auto unsignedField = EmitBitFieldUExtract(state, raw, bitOffset, bits[component]);
             const auto signedField = state.module.AllocateId();
             state.module.AddFunction(spv::OpBitFieldSExtract, TypeI32(state), signedField, Unary(state, spv::OpBitcast, TypeI32(state), raw), bitOffset, bits[component]);
@@ -756,15 +761,15 @@ std::uint32_t formatSwitch(SpirvValueEmitContext& context, const IrValue& instru
     const auto& memory = context.Memory(instruction);
     const auto format = field(state, resource.word3, 12u, 7u);
     constexpr std::uint32_t count = static_cast<std::uint32_t>(IrBufferFormat::Format32_32_32_32Float);
-    if (!store && memory.gpuDescriptor) {
+    if (!store) {
         const auto type = components == 1u ? TypeU32(state) : TypeU32Composite(state, components);
         const auto zero = components == 1u ? ConstantU32(state, 0u) : ConstantU32CompositeZero(state, components);
         const auto unsupported = Binary(state, spv::OpLogicalOr, TypeBool(state), equal(state, format, ConstantU32(state, 0u)), Binary(state, spv::OpUGreaterThan, TypeBool(state), format, ConstantU32(state, count)));
         const auto result = EmitValueIfElse(state, unsupported, type, [&] {
-            RecordBdaFault(state, resource.base, ConstantU32(state, 0u), BdaInstructionPc(state, instruction), BdaAbi::FaultReason::InvalidDescriptor);
+            if (memory.gpuDescriptor) RecordBdaFault(state, resource.base, ConstantU32(state, 0u), BdaInstructionPc(state, instruction), BdaAbi::FaultReason::InvalidDescriptor);
             return zero;
         }, [&] { return genericFormattedLoad(context, instruction, resource, components, format, count); });
-        StopBdaInvocationIf(state, unsupported);
+        if (memory.gpuDescriptor) StopBdaInvocationIf(state, unsupported);
         return result;
     }
     const auto merge = state.module.AllocateId();
