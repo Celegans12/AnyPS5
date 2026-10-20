@@ -2020,12 +2020,15 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, settleFamily, settleIndex, &state->settleQueue);
     }
     if (state->sparseFamily != VK_QUEUE_FAMILY_IGNORED) state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, state->sparseFamily, 0, &state->sparseQueue);
-    if (checkpoints) state->checkpointMarker = state->DeviceFunction<PFN_vkCmdSetCheckpointNV>("vkCmdSetCheckpointNV");
+    if (checkpoints) {
+        state->checkpointMarker = state->DeviceFunction<PFN_vkCmdSetCheckpointNV>("vkCmdSetCheckpointNV");
+        Graphics::Recorder::SetCheckpointFunction(state->checkpointMarker);
+    }
     if (deviceFault || checkpoints) {
         const auto faultInfo = deviceFault ? state->DeviceFunction<PFN_vkGetDeviceFaultInfoEXT>("vkGetDeviceFaultInfoEXT") : nullptr;
         const auto checkpointData = checkpoints ? state->DeviceFunction<PFN_vkGetQueueCheckpointDataNV>("vkGetQueueCheckpointDataNV") : nullptr;
         Graphics::DeviceLostHook() = [device = state->device, queue = state->queue, asyncQueue = state->asyncQueue, faultInfo, checkpointData] {
-            for (const auto& line : DeviceFaultReport(device, faultInfo, queue, checkpointData)) std::fprintf(stderr, "%s\n", line.c_str());
+            for (const auto& line : DeviceFaultReport(device, faultInfo, queue, checkpointData, &MemoryStats::DescribeDeviceAddress)) std::fprintf(stderr, "%s\n", line.c_str());
             if (asyncQueue == VK_NULL_HANDLE || checkpointData == nullptr) return;
             std::fprintf(stderr, "[device-fault] async lane queue:\n");
             for (const auto& line : DeviceFaultReport(device, nullptr, asyncQueue, checkpointData)) std::fprintf(stderr, "%s\n", line.c_str());
@@ -2876,6 +2879,7 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
     }
     const auto gpuTiming = recorder.BeginGpuTiming(programAddress);
     const VkBufferCopy region{Graphics::HostImportOffset(*sourceImport, source), Graphics::HostImportOffset(*destinationImport, destination), bytes};
+    Graphics::Recorder::Checkpoint(commands, Graphics::Recorder::CheckpointKind::DmaCopy, destination);
     context.Resolved(&Graphics::DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer")(commands, sourceImport->buffer, destinationImport->buffer, 1, &region);
     recorder.EndGpuTiming(gpuTiming, bytes);
     // The copied bytes are visible to everything recorded after and to the host, as after a fill.

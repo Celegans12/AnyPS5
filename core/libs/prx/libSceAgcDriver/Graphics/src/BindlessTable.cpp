@@ -144,6 +144,7 @@ void BindlessTable::Publish(Recorder& recorder) {
         table = std::make_shared<Buffer>(context, bytes, DeviceUsage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         tableBuckets = keys.Buckets();
     }
+    Recorder::Checkpoint(commands, Recorder::CheckpointKind::BindlessPublish, rebuilt ? 1u : 0u);
     if (rebuilt) {
         auto staging = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
         std::memcpy(staging->Bytes().data(), words.data(), bytes);

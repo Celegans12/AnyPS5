@@ -3893,6 +3893,29 @@ void Recorder::SetWriteOrigin(std::uint64_t program) {
     threadWriteOrigin = {program, 0, 0, false};
 }
 
+std::uint64_t Recorder::CurrentWriteOrigin() {
+    return threadWriteOrigin.program;
+}
+
+namespace {
+std::atomic<PFN_vkCmdSetCheckpointNV> checkpointFunction{nullptr};
+}
+
+void Recorder::SetCheckpointFunction(PFN_vkCmdSetCheckpointNV function) {
+    checkpointFunction.store(function, std::memory_order_release);
+}
+
+bool Recorder::CheckpointsOn() {
+    return checkpointFunction.load(std::memory_order_acquire) != nullptr;
+}
+
+void Recorder::Checkpoint(VkCommandBuffer commands, CheckpointKind kind, std::uint64_t value) {
+    const auto function = checkpointFunction.load(std::memory_order_acquire);
+    if (function == nullptr || commands == VK_NULL_HANDLE) return;
+    const auto marker = (static_cast<std::uint64_t>(kind) << 56u) | (value & ((std::uint64_t{1} << 56u) - 1u));
+    function(commands, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(marker)));
+}
+
 void Recorder::SetWriteOriginKernel(std::uint32_t mask, std::uint32_t value) {
     threadWriteOrigin.mask = mask;
     threadWriteOrigin.value = value;

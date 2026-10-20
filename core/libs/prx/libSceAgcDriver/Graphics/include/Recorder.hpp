@@ -399,6 +399,11 @@ public:
     };
     static void SetWriteOrigin(std::uint64_t program);
     static void SetWriteOriginKernel(std::uint32_t mask, std::uint32_t value);
+    static std::uint64_t CurrentWriteOrigin();
+    enum class CheckpointKind : std::uint64_t { Draw = 0x1, CopyIn = 0xf1, CopyBack = 0xf2, DiffCopyBack = 0xf3, BindlessPublish = 0xf4, DmaCopy = 0xf5, GpuCopies = 0xf6 };
+    static void SetCheckpointFunction(PFN_vkCmdSetCheckpointNV function);
+    static bool CheckpointsOn();
+    static void Checkpoint(VkCommandBuffer commands, CheckpointKind kind, std::uint64_t value);
     static std::optional<WriteOrigin> OriginOfNote(std::uint64_t note);
     // Ends and submits the open batch without waiting.
     void Submit();

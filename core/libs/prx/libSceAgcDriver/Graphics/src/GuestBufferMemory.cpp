@@ -5300,6 +5300,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
                 expected.assign(snapshotBytes.begin(), snapshotBytes.end());
             }
         }
+        Recorder::Checkpoint(commands, Recorder::CheckpointKind::CopyIn, address);
         CopyBuffer(context, commands, copySource, copyOffset, region->buffer->Handle(), 0, bytes);
         if (!expected.empty()) {
             auto readback = std::make_shared<Buffer>(context, expected.size(), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
@@ -5442,6 +5443,7 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
             // would have stored there itself had the range been bindable. A staged shadow with a
             // pristine copy (APS5_STAGING_DIFF) stores only the dwords that differ from it; the
             // unaligned edges copy whole.
+            Recorder::Checkpoint(commands, Recorder::CheckpointKind::CopyBack, from);
             auto whole = from;
             auto wholeEnd = to;
             if (diff && region.diffUse && region.deviceLocal && region.pristine != nullptr && region.copySourceAddress != 0 && region.buffer->DeviceAddress() != 0 && region.begin % 4u == 0 && region.copySourceBase % 4u == 0 && region.copySourceAddress % 4u == 0) {

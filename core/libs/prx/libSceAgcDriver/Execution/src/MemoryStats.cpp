@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -59,7 +60,61 @@ struct DeviceEntry {
     PFN_vkDestroyImage destroyImage = nullptr;
     PFN_vkCreateBuffer createBuffer = nullptr;
     PFN_vkDestroyBuffer destroyBuffer = nullptr;
+    PFN_vkBindBufferMemory bindBufferMemory = nullptr;
+    PFN_vkGetBufferDeviceAddress getBufferDeviceAddress = nullptr;
 };
+
+bool FaultAddressesTracked() {
+    static const bool tracked = std::getenv("APS5_FAULT_ADDRESSES") != nullptr;
+    return tracked;
+}
+
+struct AddressRegistry {
+    struct Live {
+        std::uint64_t buffer;
+        VkDeviceSize bytes;
+        VkBufferUsageFlags usage;
+        Owner owner;
+        double madeMs;
+    };
+    struct Created {
+        VkDeviceSize bytes;
+        VkBufferUsageFlags usage;
+        Owner owner;
+        std::uint64_t address;
+    };
+    struct Destroyed {
+        std::uint64_t address;
+        VkDeviceSize bytes;
+        VkBufferUsageFlags usage;
+        Owner owner;
+        double madeMs;
+        double destroyedMs;
+    };
+    std::mutex mutex;
+    std::unordered_map<std::uint64_t, Created> created;
+    std::map<std::uint64_t, Live> live;
+    std::vector<Destroyed> destroyed = std::vector<Destroyed>(65536);
+    std::size_t destroyedNext = 0;
+    std::uint64_t destroyedTotal = 0;
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    double Now() const { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(); }
+};
+
+AddressRegistry& Addresses() {
+    static auto* registry = new AddressRegistry;
+    return *registry;
+}
+
+void NoteBufferAddress(std::uint64_t buffer, std::uint64_t address) {
+    if (address == 0) return;
+    auto& registry = Addresses();
+    std::lock_guard lock(registry.mutex);
+    const auto found = registry.created.find(buffer);
+    if (found == registry.created.end() || found->second.address == address) return;
+    found->second.address = address;
+    registry.live[address] = {buffer, found->second.bytes, found->second.usage, found->second.owner, registry.Now()};
+}
 
 struct State {
     std::array<Slot, static_cast<std::size_t>(VkClass::Count)> vk;
@@ -273,10 +328,44 @@ VKAPI_ATTR VkResult VKAPI_CALL TrackedCreateBuffer(VkDevice device, const VkBuff
         Bump(Get().buffers, 0, 1);
         const auto owner = CurrentOwner();
         Bump(OwnerAt(owner).buffers, 0, 1);
-        std::lock_guard lock(Get().objectMutex);
-        Get().bufferOwners[HandleKey(*buffer)] = owner;
+        {
+            std::lock_guard lock(Get().objectMutex);
+            Get().bufferOwners[HandleKey(*buffer)] = owner;
+        }
+        if (FaultAddressesTracked() && info != nullptr) {
+            auto& registry = Addresses();
+            std::lock_guard lock(registry.mutex);
+            registry.created[HandleKey(*buffer)] = {info->size, info->usage, owner, 0};
+        }
     }
     return result;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL TrackedBindBufferMemory(VkDevice device, VkBuffer buffer, VkDeviceMemory memory, VkDeviceSize offset) {
+    const auto* entry = Find(device);
+    const auto result = entry->bindBufferMemory(device, buffer, memory, offset);
+    if (result == VK_SUCCESS && FaultAddressesTracked() && entry->getBufferDeviceAddress != nullptr) {
+        bool addressable = false;
+        {
+            auto& registry = Addresses();
+            std::lock_guard lock(registry.mutex);
+            const auto found = registry.created.find(HandleKey(buffer));
+            addressable = found != registry.created.end() && (found->second.usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0;
+        }
+        if (addressable) {
+            VkBufferDeviceAddressInfo info{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+            info.buffer = buffer;
+            NoteBufferAddress(HandleKey(buffer), entry->getBufferDeviceAddress(device, &info));
+        }
+    }
+    return result;
+}
+
+VKAPI_ATTR VkDeviceAddress VKAPI_CALL TrackedGetBufferDeviceAddress(VkDevice device, const VkBufferDeviceAddressInfo* info) {
+    const auto* entry = Find(device);
+    const auto address = entry->getBufferDeviceAddress(device, info);
+    if (FaultAddressesTracked() && info != nullptr) NoteBufferAddress(HandleKey(info->buffer), address);
+    return address;
 }
 
 VKAPI_ATTR void VKAPI_CALL TrackedDestroyBuffer(VkDevice device, VkBuffer buffer, const VkAllocationCallbacks* allocator) {
@@ -287,6 +376,21 @@ VKAPI_ATTR void VKAPI_CALL TrackedDestroyBuffer(VkDevice device, VkBuffer buffer
         if (const auto found = Get().bufferOwners.find(HandleKey(buffer)); found != Get().bufferOwners.end()) {
             Bump(OwnerAt(found->second).buffers, 0, -1);
             Get().bufferOwners.erase(found);
+        }
+    }
+    if (buffer != VK_NULL_HANDLE && FaultAddressesTracked()) {
+        auto& registry = Addresses();
+        std::lock_guard lock(registry.mutex);
+        if (const auto found = registry.created.find(HandleKey(buffer)); found != registry.created.end()) {
+            if (found->second.address != 0) {
+                if (const auto at = registry.live.find(found->second.address); at != registry.live.end() && at->second.buffer == HandleKey(buffer)) {
+                    registry.destroyed[registry.destroyedNext] = {found->second.address, at->second.bytes, at->second.usage, at->second.owner, at->second.madeMs, registry.Now()};
+                    registry.destroyedNext = (registry.destroyedNext + 1u) % registry.destroyed.size();
+                    ++registry.destroyedTotal;
+                    registry.live.erase(at);
+                }
+            }
+            registry.created.erase(found);
         }
     }
     entry->destroyBuffer(device, buffer, allocator);
@@ -310,6 +414,8 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL TrackedDeviceProc(VkDevice device, cons
     if (view == "vkDestroyImage") return reinterpret_cast<PFN_vkVoidFunction>(&TrackedDestroyImage);
     if (view == "vkCreateBuffer") return reinterpret_cast<PFN_vkVoidFunction>(&TrackedCreateBuffer);
     if (view == "vkDestroyBuffer") return reinterpret_cast<PFN_vkVoidFunction>(&TrackedDestroyBuffer);
+    if (FaultAddressesTracked() && entry->bindBufferMemory != nullptr && view == "vkBindBufferMemory") return reinterpret_cast<PFN_vkVoidFunction>(&TrackedBindBufferMemory);
+    if (FaultAddressesTracked() && entry->getBufferDeviceAddress != nullptr && (view == "vkGetBufferDeviceAddress" || view == "vkGetBufferDeviceAddressKHR")) return reinterpret_cast<PFN_vkVoidFunction>(&TrackedGetBufferDeviceAddress);
     return real;
 }
 
@@ -567,6 +673,62 @@ void Report() {
 
 }
 
+std::vector<std::string> DescribeDeviceAddress(std::uint64_t address, std::uint64_t precision) {
+    std::vector<std::string> lines;
+    if (!Enabled() || !FaultAddressesTracked()) return lines;
+    auto& registry = Addresses();
+    std::unique_lock lock(registry.mutex, std::defer_lock);
+    for (int attempt = 0; attempt < 400 && !lock.try_lock(); ++attempt) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    if (!lock.owns_lock()) {
+        lines.emplace_back("address registry busy");
+        return lines;
+    }
+    const auto now = registry.Now();
+    const auto span = precision == 0 ? std::uint64_t{1} : precision;
+    const auto low = address;
+    const auto high = address + span;
+    char text[320];
+    std::size_t shown = 0;
+    auto first = registry.live.upper_bound(low);
+    if (first != registry.live.begin()) --first;
+    for (auto at = first; at != registry.live.end() && at->first < high && shown < 8; ++at) {
+        if (at->first + at->second.bytes <= low) continue;
+        std::snprintf(text, sizeof(text), "live buffer 0x%llx+0x%llx usage 0x%x owner %s, made %.0f ms ago", static_cast<unsigned long long>(at->first), static_cast<unsigned long long>(at->second.bytes), static_cast<unsigned>(at->second.usage), OwnerNames[static_cast<std::size_t>(at->second.owner)], now - at->second.madeMs);
+        lines.emplace_back(text);
+        ++shown;
+    }
+    if (shown == 0) {
+        auto below = registry.live.lower_bound(low);
+        if (below != registry.live.begin()) {
+            --below;
+            std::snprintf(text, sizeof(text), "no live buffer; nearest below 0x%llx+0x%llx owner %s", static_cast<unsigned long long>(below->first), static_cast<unsigned long long>(below->second.bytes), OwnerNames[static_cast<std::size_t>(below->second.owner)]);
+            lines.emplace_back(text);
+        }
+        const auto above = registry.live.lower_bound(low);
+        if (above != registry.live.end()) {
+            std::snprintf(text, sizeof(text), "nearest live above 0x%llx+0x%llx owner %s", static_cast<unsigned long long>(above->first), static_cast<unsigned long long>(above->second.bytes), OwnerNames[static_cast<std::size_t>(above->second.owner)]);
+            lines.emplace_back(text);
+        }
+    }
+    const auto count = std::min<std::uint64_t>(registry.destroyedTotal, registry.destroyed.size());
+    std::size_t recent = 0;
+    for (std::uint64_t back = 1; back <= count && recent < 8; ++back) {
+        const auto& gone = registry.destroyed[(registry.destroyedNext + registry.destroyed.size() - back) % registry.destroyed.size()];
+        if (gone.address >= high || gone.address + gone.bytes <= low) continue;
+        std::snprintf(text, sizeof(text), "destroyed buffer 0x%llx+0x%llx usage 0x%x owner %s, destroyed %.0f ms ago (lived %.0f ms)", static_cast<unsigned long long>(gone.address), static_cast<unsigned long long>(gone.bytes), static_cast<unsigned>(gone.usage), OwnerNames[static_cast<std::size_t>(gone.owner)], now - gone.destroyedMs, gone.destroyedMs - gone.madeMs);
+        lines.emplace_back(text);
+        ++recent;
+    }
+    std::uint64_t lowest = 0, highest = 0;
+    if (!registry.live.empty()) {
+        lowest = registry.live.begin()->first;
+        highest = std::prev(registry.live.end())->first + std::prev(registry.live.end())->second.bytes;
+    }
+    std::snprintf(text, sizeof(text), "registry: %zu live addressed buffers in 0x%llx..0x%llx, %llu destroyed (last %llu kept)", registry.live.size(), static_cast<unsigned long long>(lowest), static_cast<unsigned long long>(highest), static_cast<unsigned long long>(registry.destroyedTotal), static_cast<unsigned long long>(count));
+    lines.emplace_back(text);
+    return lines;
+}
+
 PFN_vkGetDeviceProcAddr TrackDevice(VkDevice device, VkPhysicalDevice physical, const VkPhysicalDeviceMemoryProperties& memory,
                                     PFN_vkGetDeviceProcAddr real, PFN_vkGetPhysicalDeviceMemoryProperties2 budget) {
     if (!Enabled() || real == nullptr || device == VK_NULL_HANDLE) return real;
@@ -588,6 +750,9 @@ PFN_vkGetDeviceProcAddr TrackDevice(VkDevice device, VkPhysicalDevice physical, 
     entry.destroyImage = reinterpret_cast<PFN_vkDestroyImage>(real(device, "vkDestroyImage"));
     entry.createBuffer = reinterpret_cast<PFN_vkCreateBuffer>(real(device, "vkCreateBuffer"));
     entry.destroyBuffer = reinterpret_cast<PFN_vkDestroyBuffer>(real(device, "vkDestroyBuffer"));
+    entry.bindBufferMemory = reinterpret_cast<PFN_vkBindBufferMemory>(real(device, "vkBindBufferMemory"));
+    entry.getBufferDeviceAddress = reinterpret_cast<PFN_vkGetBufferDeviceAddress>(real(device, "vkGetBufferDeviceAddress"));
+    if (entry.getBufferDeviceAddress == nullptr) entry.getBufferDeviceAddress = reinterpret_cast<PFN_vkGetBufferDeviceAddress>(real(device, "vkGetBufferDeviceAddressKHR"));
     if (entry.allocateMemory == nullptr || entry.freeMemory == nullptr || entry.createShaderModule == nullptr || entry.destroyShaderModule == nullptr ||
         entry.createGraphicsPipelines == nullptr || entry.createComputePipelines == nullptr || entry.destroyPipeline == nullptr ||
         entry.getPipelineCacheData == nullptr || entry.createImage == nullptr || entry.destroyImage == nullptr ||
