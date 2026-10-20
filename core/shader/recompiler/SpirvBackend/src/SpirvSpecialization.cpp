@@ -203,6 +203,7 @@ bool PureInstruction(const Instruction& instruction) {
     case spv::OpInBoundsPtrAccessChain:
     case spv::OpArrayLength:
     case spv::OpPhi:
+    case spv::OpExtInst:
         return true;
     case spv::OpLoad:
         return instruction.size() == 4u || (instruction.size() == 5u && instruction[4] == spv::MemoryAccessMaskNone);
@@ -216,6 +217,9 @@ bool VisitInputs(const Instruction& instruction, const TVisitor& visit) {
     std::size_t first = 3u;
     std::size_t end = instruction.size();
     switch (Opcode(instruction)) {
+    case spv::OpExtInst:
+        first = 5u;
+        break;
     case spv::OpVectorShuffle:
     case spv::OpCompositeInsert:
         end = 5u;
