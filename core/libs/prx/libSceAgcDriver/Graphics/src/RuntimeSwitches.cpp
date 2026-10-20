@@ -25,6 +25,11 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_NO_EARLY_REVALIDATE",
     "APS5_NO_BATCHED_STAGING",
     "APS5_QUIET_PUBLISH",
+    "APS5_NO_STAGED_OVERLAP",
+    "APS5_NO_OWED_RUN_CLOSE",
+    "APS5_NO_RUN_ATOMIC_GUARD",
+    "APS5_DRAW_INPUTS_IN_PLACE",
+    "APS5_NO_RUN_STAGED_READ_GUARD",
 };
 
 struct Refusal {

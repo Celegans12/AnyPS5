@@ -1578,7 +1578,15 @@ BatchedCounters batchedCounters;
 std::mutex runCloseMutex;
 std::map<std::tuple<std::string, std::size_t, std::uint32_t, std::uint32_t>, std::uint64_t> runCloses;
 std::map<std::uint32_t, std::array<std::uint64_t, 3>> overlapByRing;
+std::array<std::uint64_t, 12> runConflicts{};
+std::uint64_t runJoinsChecked = 0, runJoinsConflicting = 0;
+std::map<std::tuple<std::uint64_t, std::uint64_t, int>, std::uint64_t> runConflictPairs;
+std::array<std::uint64_t, 3> owedCopyBacks{};
+std::atomic<std::uint64_t> atomicGuardRefusals{0}, owedRunsClosed{0}, stagedReadRefusals{0};
 bool DrawOrGpuProfiled();
+constexpr bool CopiedAtomic(std::uint64_t flags) {
+    return (flags & (Recorder::RunAccessCopied | Recorder::RunAccessAtomic)) == (Recorder::RunAccessCopied | Recorder::RunAccessAtomic);
+}
 
 }
 
@@ -1594,6 +1602,137 @@ bool Recorder::DispatchOverlapEnabled() {
 
 bool Recorder::BatchedStagingEnabled() {
     return !RuntimeSwitches::Set(RuntimeSwitch::NoBatchedStaging);
+}
+
+bool Recorder::StagedOverlapEnabled() {
+    return !RuntimeSwitches::Set(RuntimeSwitch::NoStagedOverlap);
+}
+
+void Recorder::NoteRunAccess(std::uint64_t program, std::span<const std::array<std::uint64_t, 3>> accesses) {
+    if (open == nullptr || open->deferredDispatchQueue == 0) return;
+    for (const auto& access : accesses) {
+        open->runAccess.push_back({access[0], access[1], access[2], program});
+        if (CopiedAtomic(access[2])) open->runCopiedAtomic.emplace_back(access[0], access[1]);
+    }
+}
+
+bool Recorder::RunAtomicConflict(std::span<const std::array<std::uint64_t, 3>> accesses) const {
+    if (open == nullptr || open->deferredDispatchQueue == 0 || accesses.empty()) return false;
+    const auto overlaps = [](std::uint64_t begin, std::uint64_t end, std::uint64_t otherBegin, std::uint64_t otherEnd) { return begin < otherEnd && otherBegin < end; };
+    bool conflict = false;
+    const bool atomicGuard = !RuntimeSwitches::Set(RuntimeSwitch::NoRunAtomicGuard);
+    for (const auto& access : accesses) {
+        if (!atomicGuard) break;
+        if (conflict) break;
+        for (const auto& [begin, end] : open->runCopiedAtomic) {
+            if (!overlaps(access[0], access[1], begin, end)) continue;
+            conflict = true;
+            break;
+        }
+        if (conflict || !CopiedAtomic(access[2])) continue;
+        for (const auto& member : open->runAccess) {
+            if (!overlaps(access[0], access[1], member[0], member[1])) continue;
+            conflict = true;
+            break;
+        }
+    }
+    if (conflict) {
+        atomicGuardRefusals.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+    if (RuntimeSwitches::Set(RuntimeSwitch::NoRunStagedReadGuard)) return false;
+    for (const auto& access : accesses) {
+        if ((access[2] & RunAccessWritten) != 0) continue;
+        for (const auto& member : open->runAccess) {
+            if ((member[2] & RunAccessWritten) == 0 || ((access[2] | member[2]) & RunAccessCopied) == 0) continue;
+            if (!overlaps(access[0], access[1], member[0], member[1])) continue;
+            stagedReadRefusals.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+    }
+    return false;
+}
+
+void Recorder::CheckRunConflicts(std::uint64_t program, std::span<const std::array<std::uint64_t, 3>> accesses) const {
+    if (open == nullptr || open->deferredDispatchQueue == 0) return;
+    std::lock_guard lock(runCloseMutex);
+    ++runJoinsChecked;
+    bool any = false;
+    for (const auto& joiner : accesses) {
+        for (const auto& member : open->runAccess) {
+            if (!(joiner[0] < member[1] && member[0] < joiner[1])) continue;
+            const bool joinerWrites = (joiner[2] & RunAccessWritten) != 0;
+            const bool memberWrites = (member[2] & RunAccessWritten) != 0;
+            if (!joinerWrites && !memberWrites) continue;
+            const int kind = joinerWrites && memberWrites ? 0 : memberWrites ? 1 : 2;
+            const auto both = joiner[2] | member[2];
+            ++runConflicts[static_cast<std::size_t>(kind * 4 + ((both & RunAccessCopied) != 0 ? 2 : 0) + ((both & RunAccessAtomic) != 0 ? 1 : 0))];
+            const int detail = kind * 4 + ((joiner[2] & RunAccessCopied) != 0 ? 2 : 0) + ((member[2] & RunAccessCopied) != 0 ? 1 : 0);
+            ++runConflictPairs[{member[3], program, detail}];
+            any = true;
+        }
+    }
+    if (any) ++runJoinsConflicting;
+}
+
+std::string Recorder::RunConflictReport() {
+    static constexpr std::array<const char*, 3> kinds{"WW", "RAW", "WAR"};
+    std::lock_guard lock(runCloseMutex);
+    char head[512];
+    std::snprintf(head, sizeof(head), "[run-conflicts] (cumulative) joins checked %llu, with an overlapping access %llu; by kind (plain/atomic/copied/copied+atomic):", static_cast<unsigned long long>(runJoinsChecked), static_cast<unsigned long long>(runJoinsConflicting));
+    std::string text = head;
+    for (std::size_t kind = 0; kind < kinds.size(); ++kind) {
+        char row[128];
+        std::snprintf(row, sizeof(row), " %s %llu/%llu/%llu/%llu", kinds[kind], static_cast<unsigned long long>(runConflicts[kind * 4]), static_cast<unsigned long long>(runConflicts[kind * 4 + 1]), static_cast<unsigned long long>(runConflicts[kind * 4 + 2]), static_cast<unsigned long long>(runConflicts[kind * 4 + 3]));
+        text += row;
+    }
+    std::vector<std::pair<std::tuple<std::uint64_t, std::uint64_t, int>, std::uint64_t>> pairs(runConflictPairs.begin(), runConflictPairs.end());
+    std::sort(pairs.begin(), pairs.end(), [](const auto& left, const auto& right) { return left.second > right.second; });
+    text += "; top (member, joiner, kind, joiner copied, member copied):";
+    for (std::size_t index = 0; index < pairs.size() && index < 16; ++index) {
+        const auto& [key, count] = pairs[index];
+        const auto& [member, joiner, detail] = key;
+        char row[160];
+        std::snprintf(row, sizeof(row), " 0x%llx 0x%llx %s%s%s %llu;", static_cast<unsigned long long>(member), static_cast<unsigned long long>(joiner), kinds[static_cast<std::size_t>(detail / 4)], (detail & 2) != 0 ? " Jc" : "", (detail & 1) != 0 ? " Mc" : "", static_cast<unsigned long long>(count));
+        text += row;
+    }
+    return text;
+}
+
+void Recorder::NoteOwedCopyBack(const void* owner) {
+    std::size_t where = 2;
+    for (int lane = 0; lane < 2; ++lane) {
+        const auto* batch = lanes[static_cast<std::size_t>(lane)].get();
+        if (batch == nullptr || batch->deferredDispatchQueue == 0) continue;
+        if (std::find(batch->deferredRun.begin(), batch->deferredRun.end(), owner) == batch->deferredRun.end()) continue;
+        where = lane == currentLane() ? 0 : 1;
+    }
+    std::lock_guard lock(runCloseMutex);
+    ++owedCopyBacks[where];
+}
+
+bool Recorder::CloseRunOwing(const void* owner, std::source_location where) {
+    if (RuntimeSwitches::Set(RuntimeSwitch::NoOwedRunClose)) return false;
+    GuestMemory::AssertGpuLockHeld("Recorder::CloseRunOwing");
+    const int lane = currentLane();
+    bool closed = false;
+    for (int holder = 0; holder < 2; ++holder) {
+        const auto* batch = lanes[static_cast<std::size_t>(holder)].get();
+        if (batch == nullptr || batch->deferredDispatchQueue == 0) continue;
+        if (std::find(batch->deferredRun.begin(), batch->deferredRun.end(), owner) == batch->deferredRun.end()) continue;
+        if (holder == lane) flushDeferredDispatch(0, where);
+        else switchEdge(holder, lane);
+        closed = true;
+    }
+    if (closed) owedRunsClosed.fetch_add(1, std::memory_order_relaxed);
+    return closed;
+}
+
+std::string Recorder::OwedCopyBackReport() {
+    std::lock_guard lock(runCloseMutex);
+    char text[512];
+    std::snprintf(text, sizeof(text), "[run-owed] (cumulative) reused builds whose previous use still owed copy-backs: run on this lane %llu, on the other lane %llu, no open run %llu; runs closed for them %llu (APS5_NO_OWED_RUN_CLOSE %s); joins refused by the atomic guard %llu (APS5_NO_RUN_ATOMIC_GUARD %s), by the staged read guard %llu (APS5_NO_RUN_STAGED_READ_GUARD %s)", static_cast<unsigned long long>(owedCopyBacks[0]), static_cast<unsigned long long>(owedCopyBacks[1]), static_cast<unsigned long long>(owedCopyBacks[2]), static_cast<unsigned long long>(owedRunsClosed.load()), RuntimeSwitches::Set(RuntimeSwitch::NoOwedRunClose) ? "set" : "unset", static_cast<unsigned long long>(atomicGuardRefusals.load()), RuntimeSwitches::Set(RuntimeSwitch::NoRunAtomicGuard) ? "set" : "unset", static_cast<unsigned long long>(stagedReadRefusals.load()), RuntimeSwitches::Set(RuntimeSwitch::NoRunStagedReadGuard) ? "set" : "unset");
+    return text;
 }
 
 std::string Recorder::OverlapByRing() {
@@ -1754,6 +1893,8 @@ void Recorder::flushDeferredDispatch(std::size_t site, const std::source_locatio
     }
     open->deferredDispatchQueue = 0;
     open->deferredRun.clear();
+    open->runAccess.clear();
+    open->runCopiedAtomic.clear();
     auto after = std::move(open->afterRun);
     open->afterRun.clear();
     deferredFlushes[site].fetch_add(1, std::memory_order_relaxed);
@@ -1787,8 +1928,8 @@ void Recorder::flushDeferredDispatch(std::size_t site, const std::source_locatio
     open->afterRunWritten.clear();
 }
 
-VkCommandBuffer Recorder::RunCommands(std::uint32_t queueKey, const void* owner, bool& inRun, VkAccessFlags* coveredAccess) {
-    inRun = queueKey != 0 && open != nullptr && open->deferredDispatchQueue == queueKey && !open->renderPass.open && !open->run.open && std::find(open->deferredRun.begin(), open->deferredRun.end(), owner) == open->deferredRun.end();
+VkCommandBuffer Recorder::RunCommands(std::uint32_t queueKey, const void* owner, bool& inRun, VkAccessFlags* coveredAccess, std::span<const std::array<std::uint64_t, 3>> accesses) {
+    inRun = queueKey != 0 && open != nullptr && open->deferredDispatchQueue == queueKey && !open->renderPass.open && !open->run.open && std::find(open->deferredRun.begin(), open->deferredRun.end(), owner) == open->deferredRun.end() && !RunAtomicConflict(accesses);
     if (!inRun) return Commands(coveredAccess);
     GuestMemory::AssertGpuLockHeld("Recorder::RunCommands");
     if (coveredAccess != nullptr) *coveredAccess = 0;
@@ -1800,8 +1941,8 @@ void Recorder::AfterRun(std::function<void(Recorder&)> work) {
     open->afterRun.push_back(std::move(work));
 }
 
-VkCommandBuffer Recorder::OverlapCommands(std::uint32_t queueKey, std::span<const void* const> owners, VkAccessFlags* coveredAccess, bool& overlapped) {
-    overlapped = queueKey != 0 && open != nullptr && open->deferredDispatchQueue == queueKey && !open->renderPass.open && !open->run.open && std::none_of(owners.begin(), owners.end(), [&](const void* owner) { return std::find(open->deferredRun.begin(), open->deferredRun.end(), owner) != open->deferredRun.end(); });
+VkCommandBuffer Recorder::OverlapCommands(std::uint32_t queueKey, std::span<const void* const> owners, VkAccessFlags* coveredAccess, bool& overlapped, std::span<const std::array<std::uint64_t, 3>> accesses) {
+    overlapped = queueKey != 0 && open != nullptr && open->deferredDispatchQueue == queueKey && !open->renderPass.open && !open->run.open && std::none_of(owners.begin(), owners.end(), [&](const void* owner) { return std::find(open->deferredRun.begin(), open->deferredRun.end(), owner) != open->deferredRun.end(); }) && !RunAtomicConflict(accesses);
     if (queueKey != 0 && DrawOrGpuProfiled()) {
         std::lock_guard lock(runCloseMutex);
         ++overlapByRing[queueKey][overlapped ? 0 : open == nullptr || open->deferredDispatchQueue == 0 ? 1 : 2];
@@ -1821,7 +1962,11 @@ VkCommandBuffer Recorder::OverlapCommands(std::uint32_t queueKey, std::span<cons
 
 void Recorder::DeferDispatchBarrier(std::uint32_t queueKey, std::span<const void* const> owners) {
     Require(open != nullptr && queueKey != 0, "a deferred dispatch barrier has no batch");
-    if (open->deferredDispatchQueue == 0) open->deferredRun.clear();
+    if (open->deferredDispatchQueue == 0) {
+        open->deferredRun.clear();
+        open->runAccess.clear();
+        open->runCopiedAtomic.clear();
+    }
     open->deferredRun.insert(open->deferredRun.end(), owners.begin(), owners.end());
     open->deferredDispatchQueue = queueKey;
     open->coveredAccess = 0;

@@ -5233,7 +5233,10 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
     // barrier is skipped when the trailing barrier just recorded already orders it (ElideCovered).
     bool inRun = false;
     VkAccessFlags covered = 0;
-    auto commands = Recorder::DispatchOverlapEnabled() ? recorder->RunCommands(Recorder::PeekUnorderedDispatch(), this, inRun, &covered) : recorder->Commands(&covered);
+    thread_local std::vector<std::array<std::uint64_t, 3>> runAccesses;
+    runAccesses.clear();
+    if (recorder->RunOpen()) RunAccesses(runAccesses);
+    auto commands = Recorder::DispatchOverlapEnabled() && Recorder::StagedOverlapEnabled() ? recorder->RunCommands(Recorder::PeekUnorderedDispatch(), this, inRun, &covered, runAccesses) : recorder->Commands(&covered);
     // Batched staging (Recorder::SplitForRun): a joining dispatch's copies go to the run's prelude,
     // submitted ahead of the run's dispatches, whose barriers it records once for the whole run.
     // Not with the capture's read-backs or the hazard validator (both work per copy).
@@ -6035,6 +6038,22 @@ std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> GuestBufferM
     return result;
 }
 
+void GuestBufferMemory::RunAccesses(std::vector<std::array<std::uint64_t, 3>>& out) const {
+    out.clear();
+    if (!uploaded || committed) return;
+    for (const auto& region : regions) {
+        if (region.direct != nullptr) out.push_back({region.begin, inPlaceEnd(region), 0});
+        else if (region.gpuCopy) out.push_back({region.begin, region.end, 2u | (region.atomic ? 4u : 0u)});
+    }
+    for (const auto& [begin, end] : mergeWrites(writes)) {
+        const auto* found = owner(begin, end);
+        std::uint64_t flags = 1;
+        if (found != nullptr && found->gpuCopy) flags |= 2;
+        if (found != nullptr && found->atomic) flags |= 4;
+        out.push_back({begin, end, flags});
+    }
+}
+
 std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::DirectWrites() const {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> result;
     for (const auto& [begin, end] : mergeWrites(writes)) {
@@ -6123,12 +6142,18 @@ void GuestBufferMemory::RecordStagingCopies(Recorder& recorder) {
     if (!uploaded || committed) return;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     std::vector<Region*> copies;
+    // A previous use in a dispatch run that is still open owes its copy-backs (Recorder::AfterRun):
+    // the run is closed first, which records them from the shadows before they are refilled.
+    if (std::any_of(regions.begin(), regions.end(), [](const Region& region) { return region.gpuCopy && region.deviceLocal && !region.copiedBack; })) {
+        if (profile) recorder.NoteOwedCopyBack(this);
+        recorder.CloseRunOwing(this);
+    }
     for (auto& region : regions) {
         if (!region.gpuCopy || !region.deviceLocal) continue;
-        // The previous use's copy-back was recorded by its MarkGpuWrites (or never, when that use
-        // threw first: counted); this use records its own after its work, from the shadow this
-        // copy-in refills. The import is the one the region was taken from (the caller checked its
-        // serial), so the copy source still stands.
+        // The previous use's copy-back was recorded by its MarkGpuWrites or by the run it was in
+        // (or never, when that use threw first: counted); this use records its own after its work,
+        // from the shadow this copy-in refills. The import is the one the region was taken from
+        // (the caller checked its serial), so the copy source still stands.
         if (!region.copiedBack && profile) Copies().stagedLost.fetch_add(1, std::memory_order_relaxed);
         region.copiedBack = false;
         copies.push_back(&region);
