@@ -430,6 +430,32 @@ void SmallDeviceOwnTier() {
     Expect(mock.liveBytes == 0 && mock.liveBuffers.empty(), "the small device tier leaked Vulkan objects");
 }
 
+void ExactSizeReuse() {
+    mock = MockDevice{};
+    auto context = mockContext();
+    VkBuffer first = VK_NULL_HANDLE;
+    VkBuffer second = VK_NULL_HANDLE;
+    {
+        auto a = std::make_unique<Buffer>(context, 3000, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, HostVisible);
+        auto b = std::make_unique<Buffer>(context, 4000, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, HostVisible);
+        first = a->Handle();
+        second = b->Handle();
+        a.reset();
+        b.reset();
+    }
+    const auto destroyed = mock.destroyedBuffers;
+    const bool exact = std::getenv("APS5_NO_EXACT_SIZE_REUSE") == nullptr;
+    {
+        Buffer again(context, 3000, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, HostVisible);
+        Expect((again.Handle() == first) == exact, "a pooled buffer of the requested exact size was not preferred as APS5_NO_EXACT_SIZE_REUSE says");
+        Expect(mock.sizes.at(again.Handle()) == 3000 && again.Bytes().size() == 3000, "a reused buffer does not have the requested size");
+        Expect(mock.destroyedBuffers == destroyed + (exact ? 0 : 1), "taking a pooled buffer of the requested size rebuilt a VkBuffer");
+    }
+    Buffer other(context, 4000, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, HostVisible);
+    Expect(!exact || other.Handle() == second, "the other exact size was not kept for its own request");
+    Expect(mock.sizes.at(other.Handle()) == 4000, "a reused buffer of the other size does not have its size");
+}
+
 void LargerClass() {
     mock = MockDevice{};
     auto context = mockContext();
@@ -1080,6 +1106,7 @@ int main(int argc, char** argv) {
         KeptUntilFence();
         SmallDeviceRetention();
         SmallDeviceOwnTier();
+        ExactSizeReuse();
         Budget();
         AddressAndHostUnchanged();
         SmallDeviceClasses();
