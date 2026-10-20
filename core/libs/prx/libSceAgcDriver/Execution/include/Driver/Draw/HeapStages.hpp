@@ -3,6 +3,7 @@
 
 #include "Optimization/ResourceProgram.hpp"
 #include "UserDataUse.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BindlessHeap.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include <cstdint>
 #include <memory>
@@ -16,6 +17,7 @@ namespace AgcDriver::DriverDetail {
 bool HeapFragmentsEnabled();
 bool HeapRefused();
 bool HeapPreRasterStage(ShaderRecompiler::ShaderStage stage);
+Graphics::HeapStageReason HeapStageIneligibility(ShaderRecompiler::ShaderStage stage, const ShaderRecompiler::IrResourcePlan* plan, bool heapVertex);
 bool HeapStageEligible(ShaderRecompiler::ShaderStage stage, const ShaderRecompiler::IrResourcePlan* plan, bool heapVertex);
 std::optional<bool> HeapFragmentKnown(const void* snapshot, std::size_t codeOffset);
 void NoteHeapFragment(const void* snapshot, std::size_t codeOffset, bool eligible);

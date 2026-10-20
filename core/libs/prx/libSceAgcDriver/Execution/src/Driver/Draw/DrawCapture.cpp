@@ -112,18 +112,25 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     };
     auto invocation = invocationFor();
     const auto heapEligible = [&](const std::shared_ptr<const ShaderRecompiler::IrResourcePlan>& plan) { return HeapStageEligible(program.binary.stage, plan.get(), heapVertex); };
+    using StageReason = Graphics::HeapStageReason;
+    StageReason stageReason = StageReason::Heap;
+    if (!heapCandidate) stageReason = !HeapFragmentsEnabled() ? StageReason::Disabled : !heapPartners ? StageReason::PairRefused : StageReason::StageKind;
+    else if (heapKnown == std::optional(false)) stageReason = StageReason::KnownIneligible;
     if (heapKnown.value_or(false) && !heapEligible(invocation.Plan())) {
+        stageReason = HeapStageIneligibility(program.binary.stage, invocation.Plan().get(), heapVertex);
         NoteHeapFragment(program.snapshot.get(), heapKey, false);
         request.target.gpuResolvedImages = false;
         invocation = invocationFor();
     } else if (heapCandidate && !heapKnown.has_value()) {
-        const bool eligible = heapEligible(invocation.Plan());
+        stageReason = HeapStageIneligibility(program.binary.stage, invocation.Plan().get(), heapVertex);
+        const bool eligible = stageReason == StageReason::Heap;
         NoteHeapFragment(program.snapshot.get(), heapKey, eligible);
         if (eligible) {
             request.target.gpuResolvedImages = true;
             invocation = invocationFor();
         }
     }
+    Graphics::NoteHeapStageReason(stageReason);
     timing.Mark("prepared_invocation");
     auto& stageCapture = stageCaptures[i];
     stageCapture.direct = false;

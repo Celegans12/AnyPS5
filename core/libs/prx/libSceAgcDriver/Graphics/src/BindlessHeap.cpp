@@ -641,9 +641,13 @@ std::unordered_set<VkCommandBuffer> boundHeaps;
 std::atomic<std::uint64_t> heapBinds{0};
 std::atomic<std::uint64_t> heapBindWindow{0};
 std::atomic<std::uint64_t> commandBuffersBegun{0};
+std::atomic<std::uint64_t> cpuBufferCopies{0};
+std::atomic<std::uint64_t> cpuBufferCopyBytes{0};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(SetBindSite::Count)> setBinds{};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(HeapFallback::Count)> heapFallbacks{};
 std::array<std::atomic<std::uint64_t>, 4> heapRecords{};
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(HeapStageReason::Count)> heapStageReasons{};
+constexpr std::array<const char*, static_cast<std::size_t>(HeapStageReason::Count)> HeapStageReasonNames{"heap", "disabled", "pair refused", "fragment off heap", "stage kind", "no plan", "plan stage", "unresolved image source", "atomic table image", "known ineligible"};
 constexpr std::array<const char*, static_cast<std::size_t>(SetBindSite::Count)> SetBindSiteNames{"draw", "dispatch", "detiler", "color transfer", "presentation"};
 constexpr std::array<const char*, static_cast<std::size_t>(HeapFallback::Count)> HeapFallbackNames{"draw unmapped", "draw mixed retry", "draw refused pair", "dispatch unmapped"};
 
@@ -667,11 +671,13 @@ void reportHeapStatistics() {
     for (std::size_t i = 0; i < setBinds.size(); ++i) binds += " " + std::string(SetBindSiteNames[i]) + " " + std::to_string(takeCount(setBinds[i]));
     std::string fallbacks;
     for (std::size_t i = 0; i < heapFallbacks.size(); ++i) fallbacks += " " + std::string(HeapFallbackNames[i]) + " " + std::to_string(takeCount(heapFallbacks[i]));
+    std::string stageReasons;
+    for (std::size_t i = 0; i < heapStageReasons.size(); ++i) stageReasons += " " + std::string(HeapStageReasonNames[i]) + " " + std::to_string(takeCount(heapStageReasons[i]));
     const auto heapDraws = takeCount(heapRecords[1]);
     const auto plainDraws = takeCount(heapRecords[0]);
     const auto heapDispatches = takeCount(heapRecords[3]);
     const auto plainDispatches = takeCount(heapRecords[2]);
-    std::fprintf(stderr, "[gpu-heap] (10 s): draws %llu heap / %llu plain, dispatches %llu heap / %llu plain; heap binds %llu over %llu command buffers; set binds:%s; fallbacks:%s\n", static_cast<unsigned long long>(heapDraws), static_cast<unsigned long long>(plainDraws), static_cast<unsigned long long>(heapDispatches), static_cast<unsigned long long>(plainDispatches), static_cast<unsigned long long>(takeCount(heapBindWindow)), static_cast<unsigned long long>(takeCount(commandBuffersBegun)), binds.c_str(), fallbacks.c_str());
+    std::fprintf(stderr, "[gpu-heap] (10 s): draws %llu heap / %llu plain, dispatches %llu heap / %llu plain; heap binds %llu over %llu command buffers; set binds:%s; fallbacks:%s; draw stages:%s; CPU buffer copies %llu (%llu MiB)\n", static_cast<unsigned long long>(heapDraws), static_cast<unsigned long long>(plainDraws), static_cast<unsigned long long>(heapDispatches), static_cast<unsigned long long>(plainDispatches), static_cast<unsigned long long>(takeCount(heapBindWindow)), static_cast<unsigned long long>(takeCount(commandBuffersBegun)), binds.c_str(), fallbacks.c_str(), stageReasons.c_str(), static_cast<unsigned long long>(takeCount(cpuBufferCopies)), static_cast<unsigned long long>(takeCount(cpuBufferCopyBytes) >> 20u));
 }
 
 void forgetHeapBinding(VkCommandBuffer commands) {
@@ -685,6 +691,15 @@ void forgetHeapBinding(VkCommandBuffer commands) {
 void NoteHeapRecord(bool compute, bool heap) {
     heapRecords[(compute ? 2u : 0u) + (heap ? 1u : 0u)].fetch_add(1, std::memory_order_relaxed);
     reportHeapStatistics();
+}
+
+void NoteHeapStageReason(HeapStageReason reason) {
+    heapStageReasons[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void NoteCpuBufferCopy(std::uint64_t bytes) {
+    cpuBufferCopies.fetch_add(1, std::memory_order_relaxed);
+    cpuBufferCopyBytes.fetch_add(bytes, std::memory_order_relaxed);
 }
 
 void NoteHeapFallback(HeapFallback reason) {

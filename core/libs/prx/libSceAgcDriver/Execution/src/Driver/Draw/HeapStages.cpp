@@ -112,9 +112,19 @@ bool HeapPreRasterStage(ShaderRecompiler::ShaderStage stage) {
     return stage == Stage::Vertex || stage == Stage::Local || stage == Stage::TessellationControl || stage == Stage::TessellationEvaluation || stage == Stage::Mesh;
 }
 
+Graphics::HeapStageReason HeapStageIneligibility(ShaderRecompiler::ShaderStage stage, const ShaderRecompiler::IrResourcePlan* plan, bool heapVertex) {
+    using Reason = Graphics::HeapStageReason;
+    if (stage != ShaderRecompiler::ShaderStage::Fragment && !HeapPreRasterStage(stage)) return Reason::StageKind;
+    if (plan == nullptr) return Reason::NoPlan;
+    if (stage != ShaderRecompiler::ShaderStage::Fragment && !heapVertex) return Reason::FragmentOffHeap;
+    if (plan->stage == ShaderRecompiler::IrShaderStage::Unknown || plan->stage == ShaderRecompiler::IrShaderStage::Fetch) return Reason::PlanStage;
+    if (!ShaderRecompiler::HeapFragmentEligible(*plan)) return Reason::UnresolvedImageSource;
+    if (std::any_of(plan->info.images.begin(), plan->info.images.end(), [](const ShaderRecompiler::ImageResource& image) { return image.table != ShaderRecompiler::NoTable && (image.atomic || image.atomic64); })) return Reason::AtomicTableImage;
+    return Reason::Heap;
+}
+
 bool HeapStageEligible(ShaderRecompiler::ShaderStage stage, const ShaderRecompiler::IrResourcePlan* plan, bool heapVertex) {
-    if (plan == nullptr || (stage != ShaderRecompiler::ShaderStage::Fragment && !HeapPreRasterStage(stage))) return false;
-    return (stage == ShaderRecompiler::ShaderStage::Fragment || heapVertex) && ShaderRecompiler::HeapFragmentEligible(*plan) && std::none_of(plan->info.images.begin(), plan->info.images.end(), [](const ShaderRecompiler::ImageResource& image) { return image.table != ShaderRecompiler::NoTable && (image.atomic || image.atomic64); });
+    return HeapStageIneligibility(stage, plan, heapVertex) == Graphics::HeapStageReason::Heap;
 }
 
 namespace {
