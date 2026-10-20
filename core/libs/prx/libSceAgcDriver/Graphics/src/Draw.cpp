@@ -1940,8 +1940,7 @@ void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>
         else residents[index]->MarkDirty();
     }
     for (const auto& resident : residents) {
-        if (resident == nullptr || resident->Descriptor().tileMode != TextureTileMode::kLinear) continue;
-        StorageTexture::FlushPending(resident->Descriptor().baseAddress, static_cast<std::size_t>(resident->GuestBytes()), nullptr, "linear target");
+        if (resident != nullptr) resident->FinishLinearDraw();
     }
 }
 
@@ -2204,6 +2203,9 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const bool unknownWrites = ((addressBased || resources.UsesAddressTable()) && !readOnlyBda) || resources.HasCopiedWrites();
     const PassAccess passAccess{passReads, resources.GpuWrites(), passImages, passAttachments, unknownMemory, unknownWrites};
     const bool fenced = state.depth.has_value() || !record.proxies.empty() || record.blended != nullptr;
+    for (const auto& target : record.targets) {
+        if (target != nullptr) target->PrepareLinearDraw();
+    }
     const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect || record.blended != nullptr || heap, fenced, passAccess);
     for (const auto& target : record.multisampleTargets) KeepMultisampleTarget_nid_no_patch(target);
     const bool continued = start.continued;
@@ -2821,6 +2823,11 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     if (recorded && recorder->HasQueuedKeyStores() && (resources->HoldsLease() || recorder->AnyQueuedKeyStore(touches))) recorder->FlushKeyStores();
     // A queued label store over such memory likewise (Recorder::RecordStore).
     if (recorded && recorder->HasQueuedStores() && (resources->HoldsLease() || recorder->AnyQueuedStore(touches))) recorder->FlushStores();
+    if (recorded) {
+        for (const auto& binding : targets) {
+            if (binding.resident != nullptr) binding.resident->PrepareLinearDraw();
+        }
+    }
     const auto commands = recorded ? recorder->Commands() : batch->Handle();
     if (recorded) recorder->PrepareSampleSlot();
     APS5_LOG_CHARS_OUT_DEBUG("CommandBatch created");
