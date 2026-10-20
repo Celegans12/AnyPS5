@@ -895,7 +895,11 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             require(words->bindings.size() == variant.compiled->bindings.size(), "a ring vertex hit's bindings differ in number from its template");
             for (std::size_t index = 0; index < words->bindings.size(); ++index) {
                 const auto role = variant.compiled->bindings[index].role;
-                if (role == ShaderRecompiler::DescriptorRole::ShaderData || role == ShaderRecompiler::DescriptorRole::FlattenedSrt) words->bindings[index].clear();
+                auto& descriptor = words->bindings[index];
+                if (role == ShaderRecompiler::DescriptorRole::FlattenedSrt) descriptor.clear();
+                if (role != ShaderRecompiler::DescriptorRole::ShaderData || descriptor.empty()) continue;
+                std::copy_n(words->userData.begin(), std::min(words->userData.size(), descriptor.size()), descriptor.begin());
+                if (descriptor == variant.compiled->bindings[index].guestDescriptor) descriptor.clear();
             }
         }
         ShaderRecompiler::CompleteHeapDataWords(*variant.compiled, *words);
