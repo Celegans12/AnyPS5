@@ -3009,11 +3009,6 @@ struct RevalidateProfile {
     std::atomic<std::uint64_t> ownSourceViews{0};
     std::atomic<std::uint64_t> refreshedOverlaps{0};
     std::atomic<std::uint64_t> proofsVerified{0};
-    std::atomic<std::uint64_t> fastNanoseconds{0};
-    std::atomic<std::uint64_t> fullNanoseconds{0};
-    std::atomic<std::uint64_t> storageMetadataMoved{0};
-    std::atomic<std::uint64_t> storageKeysUnproved{0};
-    std::array<std::atomic<std::uint64_t>, 81> storageKeysMoved{};
     std::atomic<std::int64_t> lastReport{0};
 };
 
@@ -3085,9 +3080,7 @@ void countRevalidate(bool fast, bool ok, std::chrono::steady_clock::time_point s
     auto& profile = Revalidations();
     const auto now = std::chrono::steady_clock::now();
     profile.calls.fetch_add(1, std::memory_order_relaxed);
-    const auto elapsed = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count());
-    profile.nanoseconds.fetch_add(elapsed, std::memory_order_relaxed);
-    (fast && ok ? profile.fastNanoseconds : profile.fullNanoseconds).fetch_add(elapsed, std::memory_order_relaxed);
+    profile.nanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count()), std::memory_order_relaxed);
     (!ok ? profile.failed : fast ? profile.fast : profile.full).fetch_add(1, std::memory_order_relaxed);
     const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
     auto last = profile.lastReport.load();
@@ -3104,12 +3097,6 @@ void countRevalidate(bool fast, bool ok, std::chrono::steady_clock::time_point s
     const auto reasons = byReason(profile.fastFails, FastFailNames);
     const auto fullReasons = byReason(profile.fullByReason, FastFailNames);
     const auto fallbacks = byReason(profile.ownFallbacks, OwnRefreshFallbackNames);
-    std::string storageKeys;
-    for (std::size_t i = 0; i < profile.storageKeysMoved.size(); ++i) {
-        const auto count = profile.storageKeysMoved[i].exchange(0, std::memory_order_relaxed);
-        if (count != 0) storageKeys += " " + std::string(DccKeysName(static_cast<DccKeys>(i / 9u))) + "->" + DccKeysName(static_cast<DccKeys>(i % 9u)) + " " + std::to_string(count);
-    }
-    AgcDriver::ProfilePrint_nid_no_patch("[rescache] revalidate time (10 s): fast %.1f ms, full or failed %.1f ms; storage keys fails: metadata moved %llu, no key proofs %llu, uploaded->proved keys:%s\n", profile.fastNanoseconds.exchange(0, std::memory_order_relaxed) / 1e6, profile.fullNanoseconds.exchange(0, std::memory_order_relaxed) / 1e6, static_cast<unsigned long long>(profile.storageMetadataMoved.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.storageKeysUnproved.exchange(0, std::memory_order_relaxed)), storageKeys.c_str());
     AgcDriver::ProfilePrint_nid_no_patch("[rescache] revalidate (10 s): %llu calls %.1f ms: fast %llu, full %llu, failed %llu; fast-fail by reason:%s; full walks: T1 refreshed %llu (%llu storage images, %llu view sources, %llu views served by their own pending source, %llu overlaps left by the refresh accepted), full by reason:%s, T1 fallback by reason:%s, proofs verified %llu; fast-fail pending image: own 0 (the query excepts the own object), foreign %llu, snapshot %llu, T1 eligible %llu; keys proven: %llu sampled, %llu storage; epoch gate: %llu registry scans skipped, %llu import loops skipped; lookup log: %llu builds and full walks kept their records past the bound\n", static_cast<unsigned long long>(profile.calls.exchange(0, std::memory_order_relaxed)), profile.nanoseconds.exchange(0, std::memory_order_relaxed) / 1e6, static_cast<unsigned long long>(profile.fast.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.full.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.failed.exchange(0, std::memory_order_relaxed)), reasons.c_str(), static_cast<unsigned long long>(profile.ownRefreshed.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.ownStorageRefreshes.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.ownViewRefreshes.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.ownSourceViews.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.refreshedOverlaps.exchange(0, std::memory_order_relaxed)), fullReasons.c_str(), fallbacks.c_str(), static_cast<unsigned long long>(profile.proofsVerified.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.pendingForeign.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.pendingSnapshot.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.pendingT1Eligible.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.keysProven.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.storageKeysProven.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.serialSkips.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.importSkips.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(lookupBuildsPastBound.exchange(0, std::memory_order_relaxed)));
 }
 
@@ -3299,10 +3286,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
     }
     bool keysMoved = false;
     for (std::size_t i = 0; i < storageTextures.size(); ++i) {
-        if (storageTextures[i] != nullptr && (i >= storageKeys.size() || !StorageImageServesKeys(*storageTextures[i], storageKeys[i]))) {
-            if (BuildProfiled()) Revalidations().storageMetadataMoved.fetch_add(1, std::memory_order_relaxed);
-            return fail(FastFail::StorageKeys);
-        }
+        if (storageTextures[i] != nullptr && (i >= storageKeys.size() || !StorageImageServesKeys(*storageTextures[i], storageKeys[i]))) return fail(FastFail::StorageKeys);
         if (i != 0 && storageTextures[i] == storageTextures[i - 1]) continue;
         const auto* image = storageTextures[i].get();
         if (image == nullptr) return fail(FastFail::NoRecord);
@@ -3318,12 +3302,8 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
             // Refresh's unchanged branch (its key compare against the keys the content was
             // uploaded under, through the image's proof; the memory query below), minus its
             // byte-compare fallback; the image's generation is left where it is.
-            if (!keyProofs) {
-                if (BuildProfiled()) Revalidations().storageKeysUnproved.fetch_add(1, std::memory_order_relaxed);
-                return fail(FastFail::StorageKeys);
-            }
-            if (const auto proved = image->ProvedKeys(); proved != image->UploadedKeys()) {
-                if (BuildProfiled()) Revalidations().storageKeysMoved[static_cast<std::size_t>(image->UploadedKeys()) * 9u + static_cast<std::size_t>(proved)].fetch_add(1, std::memory_order_relaxed);
+            if (!keyProofs) return fail(FastFail::StorageKeys);
+            if (image->ProvedKeys() != image->UploadedKeys()) {
                 if (!OwnImageRefreshEnabled()) return fail(FastFail::StorageKeys);
                 keysMoved = true;
                 overlapping.push_back({i, true, false});
