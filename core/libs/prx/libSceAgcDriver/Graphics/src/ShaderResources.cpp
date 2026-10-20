@@ -4959,10 +4959,12 @@ DescriptorCache::~DescriptorCache() {
 }
 
 VkDescriptorSetLayout DescriptorCache::Layout(std::span<const std::uint32_t> key, std::span<const VkDescriptorSetLayoutBinding> bindings, bool updateAfterBind, std::span<const VkDescriptorBindingFlags> flags) {
-    Require(flags.empty() || flags.size() == bindings.size(), "descriptor binding flag count differs from layout");
-    std::vector<VkDescriptorBindingFlags> resolved;
-    for (std::size_t index = 0; index < bindings.size(); ++index) resolved.push_back((flags.empty() ? 0 : flags[index]) | (updateAfterBind && bindings[index].descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ? VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT : 0));
-    flags = resolved;
+    std::vector<VkDescriptorBindingFlags> defaults;
+    if (flags.empty()) {
+        for (const auto& binding : bindings) defaults.push_back(updateAfterBind && binding.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ? VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT : 0);
+        flags = defaults;
+    }
+    Require(flags.size() == bindings.size(), "descriptor binding flag count differs from layout");
     std::lock_guard lock(mutex);
     std::vector<std::uint32_t> keyCopy(key.begin(), key.end());
     keyCopy.push_back(static_cast<std::uint32_t>(flags.size()));
