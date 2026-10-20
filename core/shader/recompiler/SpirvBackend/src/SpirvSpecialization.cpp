@@ -584,6 +584,8 @@ public:
         vectorTypes.Reset(bound);
         removed.Reset(bound);
         aliases.Reset(bound);
+        composites.Reset(bound);
+        privateTables.Reset(bound);
         for (std::size_t cursor = 5; cursor < words.size();) {
             const auto count = words[cursor] >> 16u;
             if (count == 0u || count > words.size() - cursor) throw std::runtime_error("truncated prepared SPIR-V instruction");
@@ -600,7 +602,24 @@ public:
             if (op == spv::OpConstant && types.contains(instruction.at(1)) && types.at(instruction[1]).width <= 32u) values.emplace(instruction.at(2), instruction.at(3));
             if (op == spv::OpConstantTrue || op == spv::OpConstantFalse) values.emplace(instruction.at(2), op == spv::OpConstantTrue ? 1u : 0u);
             if ((op == spv::OpConstant || op == spv::OpConstantTrue || op == spv::OpConstantFalse) && values.contains(instruction.at(2))) canonical.emplace(std::pair{instruction.at(1), values.at(instruction[2])}, instruction[2]);
+            if (op == spv::OpConstantComposite && instruction.size() >= 3u) composites.emplace(instruction.at(2), std::vector<std::uint32_t>(instruction.begin() + 3, instruction.end()));
+            if (op == spv::OpVariable && instruction.size() == 5u && instruction[3] == spv::StorageClassPrivate && composites.contains(instruction[4])) privateTables.emplace(instruction.at(2), instruction[4]);
             cursor += count;
+        }
+        IdTable<std::uint32_t> tablePointers;
+        tablePointers.Reset(bound);
+        for (const auto& instruction : instructions) {
+            const auto op = Opcode(instruction);
+            if ((op == spv::OpAccessChain || op == spv::OpInBoundsAccessChain) && instruction.size() == 5u && privateTables.contains(instruction[3])) {
+                tablePointers.emplace(instruction[2], instruction[3]);
+                continue;
+            }
+            if (op == spv::OpLoad && instruction.size() == 4u && tablePointers.contains(instruction[3])) continue;
+            if (op == spv::OpName || op == spv::OpDecorate || op == spv::OpVariable || op == spv::OpEntryPoint) continue;
+            for (std::size_t index = 1; index < instruction.size(); ++index) {
+                privateTables.erase(instruction[index]);
+                if (const auto* table = tablePointers.find(instruction[index])) privateTables.erase(*table);
+            }
         }
     }
 
@@ -642,13 +661,31 @@ private:
         return found != nullptr && *found == type;
     }
 
-    std::optional<std::uint32_t> evaluate(const Instruction& instruction) const {
+    std::optional<std::uint32_t> evaluate(const Instruction& instruction, const IdTable<std::pair<std::uint32_t, std::uint32_t>>& constPointers) const {
         const auto op = Opcode(instruction);
         if (instruction.size() < 4u) return std::nullopt;
         const auto* type = types.find(instruction[1]);
         if (type == nullptr || type->width > 32u) return std::nullopt;
         if (op == spv::OpIMul && instruction.size() == 5u && (value(instruction[3]) == 0u || value(instruction[4]) == 0u)) return 0u;
+        if (op == spv::OpLoad && instruction.size() == 4u) {
+            const auto* pointer = constPointers.find(instruction[3]);
+            if (pointer == nullptr) return std::nullopt;
+            const auto& elements = composites.at(pointer->first);
+            return pointer->second < elements.size() ? value(elements[pointer->second]) : std::nullopt;
+        }
         const auto left = value(instruction[3]);
+        if (op == spv::OpLogicalAnd && instruction.size() == 5u) {
+            const auto right = value(instruction[4]);
+            if ((left && *left == 0u) || (right && *right == 0u)) return 0u;
+            if (left && right) return *left != 0u && *right != 0u;
+            return std::nullopt;
+        }
+        if (op == spv::OpLogicalOr && instruction.size() == 5u) {
+            const auto right = value(instruction[4]);
+            if ((left && *left != 0u) || (right && *right != 0u)) return 1u;
+            if (left && right) return *left != 0u || *right != 0u;
+            return std::nullopt;
+        }
         if (!left) return std::nullopt;
         if (op == spv::OpCopyObject) return left;
         if (op == spv::OpLogicalNot) return *left == 0u;
@@ -696,15 +733,41 @@ private:
         extracts.Reset(bound);
         IdTable<std::uint32_t> bitcasts;
         bitcasts.Reset(bound);
+        IdTable<std::pair<std::uint32_t, std::uint32_t>> constPointers;
+        constPointers.Reset(bound);
         for (auto& instruction : instructions) {
             if (instruction.empty()) continue;
             auto op = Opcode(instruction);
             if (op == spv::OpFunction) function = true;
             if (op == spv::OpFunctionEnd) function = false;
             if (!function) continue;
+            if ((op == spv::OpAccessChain || op == spv::OpInBoundsAccessChain) && instruction.size() == 5u && privateTables.contains(instruction[3])) {
+                if (const auto index = value(instruction[4])) constPointers.emplace(instruction[2], std::pair{privateTables.at(instruction[3]), *index});
+            }
             if (op == spv::OpSelect && instruction.size() == 6u) {
                 if (const auto condition = value(instruction[3])) {
                     instruction = Make(spv::OpCopyObject, {instruction[1], instruction[2], instruction[*condition != 0u ? 4u : 5u]});
+                    changed = true;
+                } else if (instruction[4] == instruction[5]) {
+                    instruction = Make(spv::OpCopyObject, {instruction[1], instruction[2], instruction[4]});
+                    changed = true;
+                }
+            }
+            if (op == spv::OpLogicalAnd && instruction.size() == 5u) {
+                if (const auto left = value(instruction[3]); left && *left != 0u) {
+                    instruction = Make(spv::OpCopyObject, {instruction[1], instruction[2], instruction[4]});
+                    changed = true;
+                } else if (const auto right = value(instruction[4]); right && *right != 0u) {
+                    instruction = Make(spv::OpCopyObject, {instruction[1], instruction[2], instruction[3]});
+                    changed = true;
+                }
+            }
+            if (op == spv::OpLogicalOr && instruction.size() == 5u) {
+                if (const auto left = value(instruction[3]); left && *left == 0u) {
+                    instruction = Make(spv::OpCopyObject, {instruction[1], instruction[2], instruction[4]});
+                    changed = true;
+                } else if (const auto right = value(instruction[4]); right && *right == 0u) {
+                    instruction = Make(spv::OpCopyObject, {instruction[1], instruction[2], instruction[3]});
                     changed = true;
                 }
             }
@@ -748,7 +811,7 @@ private:
                 }
             }
             if (op == spv::OpCopyObject && values.contains(instruction.at(2))) continue;
-            const auto result = evaluate(instruction);
+            const auto result = evaluate(instruction, constPointers);
             if (!result) continue;
             const auto type = types.at(instruction[1]);
             const auto bits = type.width == 32u ? *result : *result & ((1u << type.width) - 1u);
@@ -1153,6 +1216,8 @@ private:
     IdSet vectorTypes;
     IdSet removed;
     IdTable<std::uint32_t> aliases;
+    IdTable<std::vector<std::uint32_t>> composites;
+    IdTable<std::uint32_t> privateTables;
     std::map<std::pair<std::uint32_t, std::uint32_t>, std::uint32_t> canonical;
 };
 
