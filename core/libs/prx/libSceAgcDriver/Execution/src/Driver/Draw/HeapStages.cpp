@@ -218,6 +218,8 @@ constexpr std::size_t HeapWalkWays = 4;
 
 constexpr std::size_t HeapWalkMemoKeys = 16384;
 
+constexpr std::size_t HeapWalkDrain = 2;
+
 struct HeapWalkMemo {
     std::unordered_map<std::uint64_t, std::vector<HeapWalkEntry>> current;
     std::unordered_map<std::uint64_t, std::vector<HeapWalkEntry>> previous;
@@ -234,6 +236,7 @@ struct HeapWalkMemo {
     }
 
     std::vector<HeapWalkEntry>& slot(std::uint64_t key) {
+        for (std::size_t drained = 0; drained < HeapWalkDrain && !previous.empty(); ++drained) previous.erase(previous.begin());
         if (current.size() >= HeapWalkMemoKeys && !current.contains(key)) {
             previous = std::move(current);
             current.clear();
