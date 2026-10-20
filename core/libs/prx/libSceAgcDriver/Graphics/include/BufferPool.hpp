@@ -150,6 +150,8 @@ private:
     Tier deviceTier;
     Tier smallDeviceTier;
     std::uint64_t clock = 0;
+    std::uint64_t exactSizeHits = 0;
+    std::uint64_t resizedHits = 0;
     std::mutex slabMutex;
     std::unordered_map<std::uint64_t, Slab> slabs;
     std::unordered_map<VkDeviceMemory, std::unique_ptr<SlabBlock>> slabBlocks;
@@ -164,6 +166,7 @@ private:
     static constexpr std::size_t classLimit = std::size_t{1} << 20u;
     static constexpr unsigned deviceClassBits = 3;
     static constexpr std::size_t defaultSlots = 4096;
+    static constexpr std::size_t exactSizeScan = 64;
 };
 
 std::shared_ptr<BufferPool> GetBufferPool(const Context& context);

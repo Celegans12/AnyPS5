@@ -1110,8 +1110,11 @@ if(BUILD_TESTING)
     add_test(NAME agc_buffer_pool_no_small_device_tier COMMAND agc_buffer_pool_tests)
     set_tests_properties(agc_buffer_pool_no_small_device_tier PROPERTIES ENVIRONMENT
         "APS5_NO_SMALL_DEVICE_TIER=1")
+    add_test(NAME agc_buffer_pool_no_exact_size_reuse COMMAND agc_buffer_pool_tests)
+    set_tests_properties(agc_buffer_pool_no_exact_size_reuse PROPERTIES ENVIRONMENT
+        "APS5_NO_EXACT_SIZE_REUSE=1")
     if(WIN32)
-        set_tests_properties(agc_buffer_pool agc_buffer_pool_small_device_shared agc_buffer_pool_small_device_no_staging agc_buffer_pool_no_small_device_tier PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_buffer_pool agc_buffer_pool_small_device_shared agc_buffer_pool_small_device_no_staging agc_buffer_pool_no_small_device_tier agc_buffer_pool_no_exact_size_reuse PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()

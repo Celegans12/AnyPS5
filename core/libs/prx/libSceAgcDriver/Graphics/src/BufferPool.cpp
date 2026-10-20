@@ -375,7 +375,7 @@ std::optional<BufferAllocation> BufferPool::Take(std::size_t bytes, VkBufferUsag
         const auto now = std::chrono::steady_clock::now();
         if (now - lastReport > std::chrono::seconds(10)) {
             lastReport = now;
-            AgcDriver::ProfilePrint_nid_no_patch("[bufferpool] small: %llu hits, %llu misses, %llu evictions, %zu retained (%.0f MiB); large: %llu hits, %llu misses, %llu evictions, %zu retained (%.0f MiB)%s; device: %llu hits, %llu misses, %llu evictions, %zu retained (%.0f MiB of %llu); small device%s: %llu hits, %llu misses, %llu evictions, %zu retained (%.0f MiB of %llu)\n", static_cast<unsigned long long>(smallTier.hits), static_cast<unsigned long long>(smallTier.misses), static_cast<unsigned long long>(smallTier.evictions), smallTier.slots, smallTier.retainedBytes / 1048576.0, static_cast<unsigned long long>(largeTier.hits), static_cast<unsigned long long>(largeTier.misses), static_cast<unsigned long long>(largeTier.evictions), largeTier.slots, largeTier.retainedBytes / 1048576.0, sharedTiers() ? " (shared)" : "", static_cast<unsigned long long>(deviceTier.hits), static_cast<unsigned long long>(deviceTier.misses), static_cast<unsigned long long>(deviceTier.evictions), deviceTier.slots, deviceTier.retainedBytes / 1048576.0, static_cast<unsigned long long>(deviceTier.budget >> 20u), RuntimeSwitches::Set(RuntimeSwitch::NoSmallDeviceTier) ? " (APS5_NO_SMALL_DEVICE_TIER: in the small tier)" : "", static_cast<unsigned long long>(smallDeviceTier.hits), static_cast<unsigned long long>(smallDeviceTier.misses), static_cast<unsigned long long>(smallDeviceTier.evictions), smallDeviceTier.slots, smallDeviceTier.retainedBytes / 1048576.0, static_cast<unsigned long long>(smallDeviceTier.budget >> 20u));
+            AgcDriver::ProfilePrint_nid_no_patch("[bufferpool] small: %llu hits, %llu misses, %llu evictions, %zu retained (%.0f MiB); large: %llu hits, %llu misses, %llu evictions, %zu retained (%.0f MiB)%s; device: %llu hits, %llu misses, %llu evictions, %zu retained (%.0f MiB of %llu); small device%s: %llu hits, %llu misses, %llu evictions, %zu retained (%.0f MiB of %llu); hits of the exact size %llu, rebound to another size %llu%s\n", static_cast<unsigned long long>(smallTier.hits), static_cast<unsigned long long>(smallTier.misses), static_cast<unsigned long long>(smallTier.evictions), smallTier.slots, smallTier.retainedBytes / 1048576.0, static_cast<unsigned long long>(largeTier.hits), static_cast<unsigned long long>(largeTier.misses), static_cast<unsigned long long>(largeTier.evictions), largeTier.slots, largeTier.retainedBytes / 1048576.0, sharedTiers() ? " (shared)" : "", static_cast<unsigned long long>(deviceTier.hits), static_cast<unsigned long long>(deviceTier.misses), static_cast<unsigned long long>(deviceTier.evictions), deviceTier.slots, deviceTier.retainedBytes / 1048576.0, static_cast<unsigned long long>(deviceTier.budget >> 20u), RuntimeSwitches::Set(RuntimeSwitch::NoSmallDeviceTier) ? " (APS5_NO_SMALL_DEVICE_TIER: in the small tier)" : "", static_cast<unsigned long long>(smallDeviceTier.hits), static_cast<unsigned long long>(smallDeviceTier.misses), static_cast<unsigned long long>(smallDeviceTier.evictions), smallDeviceTier.slots, smallDeviceTier.retainedBytes / 1048576.0, static_cast<unsigned long long>(smallDeviceTier.budget >> 20u), static_cast<unsigned long long>(exactSizeHits), static_cast<unsigned long long>(resizedHits), RuntimeSwitches::Set(RuntimeSwitch::NoExactSizeReuse) ? " (APS5_NO_EXACT_SIZE_REUSE)" : "");
             if (vram.Enabled()) {
                 const auto report = vram.Report();
                 AgcDriver::ProfilePrint_nid_no_patch("[vram] heap %u: budget %llu MiB, usage %llu MiB, target %llu MiB; %llu released device buffers (%.0f MiB) not pooled over the target\n", report.heap, static_cast<unsigned long long>(report.budget >> 20u), static_cast<unsigned long long>(report.usage >> 20u), static_cast<unsigned long long>(report.target >> 20u), static_cast<unsigned long long>(vramDropped), vramDroppedBytes / 1048576.0);
@@ -390,9 +390,23 @@ std::optional<BufferAllocation> BufferPool::Take(std::size_t bytes, VkBufferUsag
         ++tier.misses;
         return std::nullopt;
     }
-    auto result = found->second.back().allocation;
-    found->second.pop_back();
-    if (found->second.empty()) tier.free.erase(found);
+    auto& slots = found->second;
+    auto chosen = std::prev(slots.end());
+    if (chosen->allocation.bufferBytes != bytes && !RuntimeSwitches::Set(RuntimeSwitch::NoExactSizeReuse)) {
+        std::size_t scanned = 0;
+        for (auto it = chosen; scanned < exactSizeScan; ++scanned) {
+            if (it->allocation.bufferBytes == bytes) {
+                chosen = it;
+                break;
+            }
+            if (it == slots.begin()) break;
+            --it;
+        }
+    }
+    auto result = chosen->allocation;
+    (result.bufferBytes == bytes ? exactSizeHits : resizedHits) += 1;
+    slots.erase(chosen);
+    if (slots.empty()) tier.free.erase(found);
     --tier.slots;
     tier.retainedBytes -= result.allocationBytes;
     ++tier.hits;
