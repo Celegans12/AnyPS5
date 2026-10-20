@@ -355,6 +355,9 @@ public:
     void DeviceReads(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) const;
     std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> SpaceRegions() const;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> DirectWrites() const;
+    // APS5_PROFILE_DRAW (Recorder::NoteRunAccess): {begin, end, flags} of the regions read in place
+    // or copied out of their imports and of the written ranges.
+    void RunAccesses(std::vector<std::array<std::uint64_t, 3>>& out) const;
     bool SameSnapshots(std::span<const GuestMemorySnapshot> snapshots) const;
     void SuspendSpace() noexcept;
     bool ResumeSpace();

@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VramBudget.hpp"
@@ -3105,6 +3106,7 @@ void mixDataWords(std::uint64_t& hash, std::span<const std::uint32_t> words) {
 // ResourceCache::Find and Touch calls (the [rescache] line).
 std::atomic<std::uint64_t> resourceCacheFinds{0};
 std::atomic<std::uint64_t> resourceCacheTouches{0};
+std::atomic<std::uint64_t> copyBudgetEvicted{0}, copyBudgetEvictedBytes{0}, copyBudgetOversized{0};
 std::atomic<std::uint64_t> depthGuardRefusals{0};
 
 }
@@ -4478,6 +4480,11 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
         SampledAtomics().refusedSets.fetch_add(1, std::memory_order_relaxed);
         return;
     }
+    const bool copyBudget = CopiedBudget() != 0 && !RuntimeSwitches::Set(RuntimeSwitch::NoResourceCopyBudget);
+    if (copyBudget && resources->CopiedBytes() > CopiedBudget()) {
+        copyBudgetOversized.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     resources->PinTextures(true);
     entries.emplace_front(key, std::move(resources));
     index.emplace(key, entries.begin());
@@ -4488,6 +4495,22 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
         return static_cast<std::size_t>(parsed != 0 ? parsed : 1024ull);
     }();
     while (entries.size() > capacity) drop(std::prev(entries.end()), evicted);
+    if (copyBudget && entries.front().second->CopiedBytes() != 0) {
+        std::size_t bytes = 0;
+        for (const auto& entry : entries) bytes += entry.second->CopiedBytes();
+        for (auto it = std::prev(entries.end()); bytes > CopiedBudget() && it != entries.begin();) {
+            const auto copied = it->second->CopiedBytes();
+            if (copied == 0) {
+                --it;
+                continue;
+            }
+            bytes -= copied;
+            copyBudgetEvicted.fetch_add(1, std::memory_order_relaxed);
+            copyBudgetEvictedBytes.fetch_add(copied, std::memory_order_relaxed);
+            const auto victim = it--;
+            drop(victim, evicted);
+        }
+    }
     if (entries.front().second->TableElements() == 0) return;
     std::uint64_t tables = 0;
     for (const auto& entry : entries) tables += entry.second->TableElements();
@@ -4604,6 +4627,26 @@ std::uint64_t ResourceCache::TableElementBudget() {
         return static_cast<std::uint64_t>(parsed != 0 ? parsed : 65536ull);
     }();
     return elements;
+}
+
+std::size_t ResourceCache::CopiedBytes() const {
+    std::lock_guard lock(mutex);
+    std::size_t bytes = 0;
+    for (const auto& entry : entries) bytes += entry.second->CopiedBytes();
+    return bytes;
+}
+
+std::size_t ResourceCache::CopiedBudget() {
+    static const std::size_t budget = [] {
+        const char* value = std::getenv("APS5_RESOURCE_CACHE_COPIED_MIB");
+        const auto mib = value ? std::strtoull(value, nullptr, 10) : 0ull;
+        return static_cast<std::size_t>(std::min(mib, 4096ull) << 20u);
+    }();
+    return budget;
+}
+
+ResourceCache::CopyBudgetCounts ResourceCache::CopyBudgetTotals() {
+    return {copyBudgetEvicted.load(std::memory_order_relaxed), copyBudgetEvictedBytes.load(std::memory_order_relaxed), copyBudgetOversized.load(std::memory_order_relaxed)};
 }
 
 std::uint64_t ResourceCache::TableElements() const {

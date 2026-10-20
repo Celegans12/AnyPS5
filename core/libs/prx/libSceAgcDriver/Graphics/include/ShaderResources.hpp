@@ -295,6 +295,7 @@ public:
     void InPlaceReads(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) const { guestMemory.InPlaceReads(out); }
     std::vector<std::pair<VkImage, bool>> StorageImages() const;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> DeviceReads() const { return guestMemory.DeviceReads(); }
+    void RunAccesses(std::vector<std::array<std::uint64_t, 3>>& out) const { guestMemory.RunAccesses(out); }
     void DeviceReads(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) const { guestMemory.DeviceReads(out); }
     bool ReadsImage(const StorageTexture* image) const;
     bool HasCachedStorageImages() const;
@@ -768,6 +769,16 @@ public:
     std::size_t Size() const;
     std::uint64_t TableElements() const;
     static std::uint64_t TableElementBudget();
+    // Bytes of copied buffers (ShaderResources::CopiedBytes) the entries hold, and the bound on them:
+    // APS5_RESOURCE_CACHE_COPIED_MIB (0 = none, at most 4096), enforced unless APS5_NO_RESOURCE_COPY_BUDGET.
+    std::size_t CopiedBytes() const;
+    static std::size_t CopiedBudget();
+    struct CopyBudgetCounts {
+        std::uint64_t evicted = 0;
+        std::uint64_t evictedBytes = 0;
+        std::uint64_t oversized = 0;
+    };
+    static CopyBudgetCounts CopyBudgetTotals();
 
 private:
     void erase(const Key& key);

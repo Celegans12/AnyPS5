@@ -586,6 +586,17 @@ target_link_libraries(agc_shared_write_tests PRIVATE libSceAgcDriver libkernel l
 set_target_properties(agc_shared_write_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_shared_write_tests)
 
+if(BUILD_TESTING AND WIN32)
+    add_test_executable(agc_page_state_tests tests/PageStates.cpp)
+    target_include_directories(agc_page_state_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_page_state_tests PRIVATE libSceAgcDriver libc)
+    configure_windows_unwind(agc_page_state_tests)
+    add_test(NAME agc_page_states COMMAND agc_page_state_tests)
+    add_test(NAME agc_page_state_metadata COMMAND agc_page_state_tests --metadata)
+    set_tests_properties(agc_page_states agc_page_state_metadata PROPERTIES
+        TIMEOUT 30 ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+endif()
+
 add_test_executable(agc_write_tracking_tests EXCLUDE_FROM_ALL
         tests/WriteTracking.cpp
         Execution/src/GuestMemory.cpp
@@ -1185,6 +1196,28 @@ set_target_properties(agc_driver_recorder_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_driver_recorder_tests)
 if(BUILD_TESTING)
     set_target_properties(agc_driver_recorder_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    foreach(copyCacheMode IN ITEMS disabled bounded oversized)
+        if(copyCacheMode STREQUAL "oversized")
+            set(copyCacheArgument --resource-copy-cache-oversized)
+            set(copyCacheMib 1)
+        else()
+            set(copyCacheArgument --resource-copy-cache)
+            if(copyCacheMode STREQUAL "bounded")
+                set(copyCacheMib 2)
+            else()
+                set(copyCacheMib 0)
+            endif()
+        endif()
+        set(copyCacheTest agc_resource_copy_cache_${copyCacheMode})
+        add_test(NAME ${copyCacheTest} COMMAND agc_driver_recorder_tests ${copyCacheArgument})
+        set_tests_properties(${copyCacheTest} PROPERTIES
+            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_RESOURCE_CACHE_COPIED_MIB=${copyCacheMib}"
+            SKIP_RETURN_CODE 77 TIMEOUT 30)
+        if(WIN32)
+            set_tests_properties(${copyCacheTest} PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
     add_test(NAME agc_pipeline_cache COMMAND agc_driver_recorder_tests --pipeline-cache-only)
     add_test(NAME agc_pipeline_cache_file COMMAND agc_driver_recorder_tests --pipeline-cache-file-only)
     add_test(NAME agc_pipeline_library COMMAND agc_driver_recorder_tests --pipeline-library-only)

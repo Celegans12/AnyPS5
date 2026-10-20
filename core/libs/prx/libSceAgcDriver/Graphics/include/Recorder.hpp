@@ -17,6 +17,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <source_location>
 #include <span>
 #include <tuple>
 #include <unordered_set>
@@ -81,7 +82,7 @@ public:
     // so a dispatch, fill or copy whose leading barrier asks for a subset of them may skip it
     // (the [barriers] line counts the merges). The call clears the mask (whatever the caller
     // records is assumed uncovered until it marks); a new batch starts uncovered.
-    VkCommandBuffer Commands(VkAccessFlags* coveredAccess = nullptr);
+    VkCommandBuffer Commands(VkAccessFlags* coveredAccess = nullptr, std::source_location where = std::source_location::current());
     // After a trailing barrier with ALL_COMMANDS as its destination stage: `access` is its
     // destination access mask.
     void MarkCovered(VkAccessFlags access);
@@ -148,14 +149,32 @@ public:
     static std::uint32_t PeekUnorderedDispatch();
     // `owner`: the dispatch's resources object; a run never takes the same one twice (a template's
     // data refresh would overwrite words an earlier dispatch of the run may still read).
-    VkCommandBuffer OverlapCommands(std::uint32_t queueKey, std::span<const void* const> owners, VkAccessFlags* coveredAccess, bool& overlapped);
+    // `accesses`: the dispatch's guest ranges as GuestBufferMemory::RunAccesses gives them (see
+    // RunAtomicConflict).
+    VkCommandBuffer OverlapCommands(std::uint32_t queueKey, std::span<const void* const> owners, VkAccessFlags* coveredAccess, bool& overlapped, std::span<const std::array<std::uint64_t, 3>> accesses = {});
     void DeferDispatchBarrier(std::uint32_t queueKey, std::span<const void* const> owners);
     // The copy-ins of an unordered dispatch joining an open run of its ring (GuestBufferMemory::
     // recordGpuCopies): the command buffer without recording the deferred barrier when a run of
     // `queueKey` is open and `owner` (the build's guest memory, whose shadows the copies fill) takes
     // no part in it yet; `inRun` then says the copies need no leading barrier (the run's first
     // dispatch ordered everything before the run for transfers too). Else Commands(coveredAccess).
-    VkCommandBuffer RunCommands(std::uint32_t queueKey, const void* owner, bool& inRun, VkAccessFlags* coveredAccess = nullptr);
+    VkCommandBuffer RunCommands(std::uint32_t queueKey, const void* owner, bool& inRun, VkAccessFlags* coveredAccess = nullptr, std::span<const std::array<std::uint64_t, 3>> accesses = {});
+    // Atomics in a staged shadow (APS5_NO_RUN_ATOMIC_GUARD=1 off; an APS5_AB switch). The dispatches of
+    // a run may update the same guest dwords atomically, which the hardware keeps coherent; a region
+    // copied into a shadow for one of them is not: its copy-in reads the memory before the run's
+    // other dispatches ran (a prelude copy-in even before the first), and its copy-back stores its
+    // own count over theirs. So a dispatch does not join the open run when one of its ranges overlaps
+    // a copied region with atomics of a dispatch of the run, or a copied region with atomics of its
+    // own overlaps any range of one (the run is closed first, as for an owner it holds already).
+    // Reads across a shadow (APS5_NO_RUN_STAGED_READ_GUARD=1 off; an APS5_AB switch). On the hardware a
+    // dispatch reading what an earlier unordered one writes mostly sees its results: the earlier one
+    // starts first. A shadow hides them for the whole run: a copied region of the joining dispatch is
+    // filled before the run (or before the run's first dispatch, a prelude), and a dispatch of the run
+    // that writes a copied region stores into memory only at the run's end. So a dispatch does not
+    // join when a range it reads (in place or copied) overlaps a range a dispatch of the run writes and
+    // either side of the overlap is a copied region (the run is closed first). Writes over writes stay
+    // (the copy-backs store only the dwords that changed), as do accesses both in place.
+    bool RunAtomicConflict(std::span<const std::array<std::uint64_t, 3>> accesses) const;
     // Opens a batch when none is open, recording nothing (no deferred dispatch barrier either).
     void OpenBatch() { ensureOpen(); }
     // Work an overlapping dispatch owes after itself (its staged copy-backs): recorded right after
@@ -192,6 +211,35 @@ public:
         std::uint64_t lostNoRun, lostOtherQueue, lostRenderPass, lostStoreRun, lostOwner;
     };
     static BatchedStagingStats BatchedStagingCounts();
+    // APS5_PROFILE_DRAW: the call sites that closed open runs, cumulative, most frequent first: one
+    // text per site (file:line, flush path, run ring, closing thread's ring) and its count.
+    // `ring`: only runs of that guest queue (~0u: all).
+    static std::vector<std::pair<std::string, std::uint64_t>> RunCloseSites(std::size_t limit, std::uint32_t ring = ~0u);
+    // APS5_PROFILE_DRAW: unordered dispatches by guest queue: overlapped, and not (no open run, other).
+    static std::string OverlapByRing();
+    // Staged dispatches in runs (APS5_NO_STAGED_OVERLAP=1 off; an APS5_AB switch): a dispatch with
+    // buffers copied out of their imports joins and opens runs like any other.
+    static bool StagedOverlapEnabled();
+    // APS5_PROFILE_DRAW: the guest ranges the dispatches of the open run access, {begin, end, flags}
+    // with RunAccessWritten / RunAccessCopied / RunAccessAtomic (NoteRunAccess, after each
+    // DeferDispatchBarrier), and those of a dispatch joining the run checked against them
+    // (CheckRunConflicts); RunConflictReport is the cumulative tally.
+    static constexpr std::uint64_t RunAccessWritten = 1, RunAccessCopied = 2, RunAccessAtomic = 4;
+    void NoteRunAccess(std::uint64_t program, std::span<const std::array<std::uint64_t, 3>> accesses);
+    void CheckRunConflicts(std::uint64_t program, std::span<const std::array<std::uint64_t, 3>> accesses) const;
+    static std::string RunConflictReport();
+    // APS5_PROFILE_DRAW: a reused build whose previous use still owes its copy-backs (staged regions
+    // not copied back yet): where the run holding them is (this lane, the other lane, none).
+    void NoteOwedCopyBack(const void* owner);
+    static std::string OwedCopyBackReport();
+    // A build reused while an open run still owes the copy-backs of its previous use (staged regions
+    // of `owner`, the build's guest memory, see AfterRun): that run is closed first, so its
+    // copy-backs are recorded from the shadows before the reuse's copy-ins refill them, and the
+    // reuse records its own after its work. A run of the other lane is submitted, and this lane's
+    // open batch waits for it on the GPU. APS5_NO_OWED_RUN_CLOSE=1 (an APS5_AB switch) leaves the
+    // run open as before: the previous use's copy-backs then copy the refilled shadows and the
+    // reuse's own are skipped. Returns whether a run was closed.
+    bool CloseRunOwing(const void* owner, std::source_location where = std::source_location::current());
     // APS5_PROFILE_DRAW: deferred barriers recorded, by the path that recorded them (Commands, a draw
     // pass, key stores, a label store, the store run, sample dumps, Submit), cumulative.
     static constexpr std::size_t DeferredFlushSites = 7;
@@ -201,7 +249,7 @@ public:
         bool continued = false;
         bool barrier = true;
     };
-    DrawPassStart StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access);
+    DrawPassStart StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access, std::source_location where = std::source_location::current());
     void LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(VkCommandBuffer)> afterPass = {});
     PassBinding& PassBound();
     // DCC "uncompressed" key stores (DccMetadata.cpp StoreUncompressedOnGpu): queued on the open
@@ -216,7 +264,7 @@ public:
     bool QueuedKeyStoreOverlaps(std::uint64_t address, std::size_t bytes) const;
     // Whether `overlaps(begin, end)` holds for a queued store's range.
     bool AnyQueuedKeyStore(const std::function<bool(std::uint64_t, std::uint64_t)>& overlaps) const;
-    void FlushKeyStores();
+    void FlushKeyStores(std::source_location where = std::source_location::current());
     void FlushKeyStoresOverlapping(std::uint64_t address, std::size_t bytes) { if (HasQueuedKeyStores() && QueuedKeyStoreOverlaps(address, bytes)) FlushKeyStores(); }
     bool Recording() const { return open != nullptr; }
     bool Idle() const { return lanes[0] == nullptr && lanes[1] == nullptr && inFlight.empty(); }
@@ -424,12 +472,12 @@ public:
     // transfer-to-transfer barrier first (WAW). Debug aids: APS5_LABEL_RUNS_INLINE=1 records the
     // stores at once and closes the run at the next command (Commands()) or at Submit, as
     // before; APS5_NO_LABEL_RUNS=1 gives every store barriers of its own.
-    void RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const std::byte> bytes, std::uint64_t address);
+    void RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const std::byte> bytes, std::uint64_t address, std::source_location where = std::source_location::current());
     bool HasQueuedStores() const { return open != nullptr && !open->run.queued.empty(); }
     bool QueuedStoreOverlaps(std::uint64_t address, std::size_t bytes) const;
     // Whether `overlaps(begin, end)` holds for a queued store's guest range.
     bool AnyQueuedStore(const std::function<bool(std::uint64_t, std::uint64_t)>& overlaps) const;
-    void FlushStores();
+    void FlushStores(std::source_location where = std::source_location::current());
     void FlushStoresOverlapping(std::uint64_t address, std::size_t bytes) { if (HasQueuedStores() && QueuedStoreOverlaps(address, bytes)) FlushStores(); }
 
     // Pending-label table. A GPU label (RELEASE_MEM/WRITE_DATA recorded as a store into the batch)
@@ -801,6 +849,10 @@ private:
         std::vector<const void*> deferredRun;
         // See AfterRun.
         std::vector<std::function<void(Recorder&)>> afterRun;
+        // See NoteRunAccess: {begin, end, flags, program} of the open run's dispatches, and the copied
+        // regions with atomics among them (RunAtomicConflict).
+        std::vector<std::array<std::uint64_t, 4>> runAccess;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> runCopiedAtomic;
         // Command buffers recorded before `commands`, in submission order (SplitForRun): ended, but
         // for an open prelude, which sealPrelude ends.
         std::vector<VkCommandBuffer> chunks;
@@ -949,7 +1001,8 @@ private:
     // Opens a batch when none is open, without closing a store run (Commands() does both).
     void ensureOpen();
     // Records a deferred dispatch trailing barrier (see DeferDispatchBarrier), if any.
-    void flushDeferredDispatch(std::size_t site);
+    // `where`: the caller that closes the run (APS5_PROFILE_DRAW: [run-close] counts by call site).
+    void flushDeferredDispatch(std::size_t site, const std::source_location& where = std::source_location::current());
     void dropStaleHoldKept();
     // Records the run's pending store (vkCmdUpdateBuffer), if any.
     void flushPendingStore();

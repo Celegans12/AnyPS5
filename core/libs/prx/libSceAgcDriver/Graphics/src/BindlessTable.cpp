@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/BindlessTable.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "DeviceImageTableAbi.hpp"
 #include <algorithm>
 #include <array>
@@ -106,7 +107,16 @@ void BindlessTable::Publish(Recorder& recorder) {
     std::lock_guard lock(mutex);
     heap.Collect(recorder.CompletedThrough());
     if (recorder.HasQueuedKeyStores()) recorder.FlushKeyStores();
-    const auto commands = recorder.Commands();
+    // APS5_QUIET_PUBLISH=1 (opt-in, an APS5_AB switch): a publication with nothing to record (the
+    // common case: every bindless dispatch publishes) takes the batch's command buffer only once it
+    // records, so it no longer records an open dispatch run's deferred barrier and bindless
+    // dispatches the title leaves unordered overlap. Off by default: the one in-run A/B with it
+    // (bs-ab2, 2026-10-19) lost the device 53 s into an on phase after a 40 s GPU stall, a failure
+    // not seen without it, and showed no gain in its one finished pair.
+    const bool quiet = RuntimeSwitches::Set(RuntimeSwitch::QuietPublish);
+    VkCommandBuffer commands = VK_NULL_HANDLE;
+    if (quiet) recorder.OpenBatch();
+    else commands = recorder.Commands();
     const auto batch = recorder.OpenSerial();
     const bool assign = ring == nullptr || ringBatch != batch;
     const bool grown = table == nullptr || keys.Buckets() != tableBuckets;
@@ -119,6 +129,7 @@ void BindlessTable::Publish(Recorder& recorder) {
     }
     ++totals.publications;
     if (!assign && !rebuilt && changed.empty() && !clear) return;
+    if (quiet) commands = recorder.Commands();
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
     if (clear) {
         // Ordered after every earlier lookup by the barrier above and before every later one by the

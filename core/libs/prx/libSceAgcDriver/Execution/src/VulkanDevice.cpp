@@ -1886,8 +1886,11 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     if (deviceFault || checkpoints) {
         const auto faultInfo = deviceFault ? state->DeviceFunction<PFN_vkGetDeviceFaultInfoEXT>("vkGetDeviceFaultInfoEXT") : nullptr;
         const auto checkpointData = checkpoints ? state->DeviceFunction<PFN_vkGetQueueCheckpointDataNV>("vkGetQueueCheckpointDataNV") : nullptr;
-        Graphics::DeviceLostHook() = [device = state->device, queue = state->queue, faultInfo, checkpointData] {
+        Graphics::DeviceLostHook() = [device = state->device, queue = state->queue, asyncQueue = state->asyncQueue, faultInfo, checkpointData] {
             for (const auto& line : DeviceFaultReport(device, faultInfo, queue, checkpointData)) std::fprintf(stderr, "%s\n", line.c_str());
+            if (asyncQueue == VK_NULL_HANDLE || checkpointData == nullptr) return;
+            std::fprintf(stderr, "[device-fault] async lane queue:\n");
+            for (const auto& line : DeviceFaultReport(device, nullptr, asyncQueue, checkpointData)) std::fprintf(stderr, "%s\n", line.c_str());
         };
         Graphics::DeviceLostOwner() = state.get();
         state->deviceLostHook = true;
@@ -4893,6 +4896,15 @@ void VulkanDevice::decideIndirect(RecordedDispatch& record, IndirectOutcome& out
     std::snprintf(groupsText, 40, "%ux%ux%u", record.x, record.y, record.z);
 }
 
+namespace {
+
+bool CheckpointsInRuns() {
+    static const bool allowed = std::getenv("APS5_CHECKPOINTS_IN_RUNS") != nullptr;
+    return allowed;
+}
+
+}
+
 void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     auto& d = Dispatches();
     auto& recorder = *state->recorder;
@@ -4909,7 +4921,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     bool unordered = false;
     const auto overlapQueue = Graphics::Recorder::TakeDispatchOrder(unordered);
     const auto* groupLimit = state->properties.limits.maxComputeWorkGroupCount;
-    const bool overlapCapable = overlapQueue != 0 && Graphics::Recorder::DispatchOverlapEnabled() && arguments == 0 && argumentImport == nullptr && record.shader->program->workgroupMemoryDwords == 0 && state->checkpointMarker == nullptr && record.x <= groupLimit[0] && record.y <= groupLimit[1] && record.z <= groupLimit[2];
+    const bool overlapCapable = overlapQueue != 0 && Graphics::Recorder::DispatchOverlapEnabled() && arguments == 0 && argumentImport == nullptr && record.shader->program->workgroupMemoryDwords == 0 && (state->checkpointMarker == nullptr || CheckpointsInRuns()) && record.x <= groupLimit[0] && record.y <= groupLimit[1] && record.z <= groupLimit[2] && (Graphics::Recorder::StagedOverlapEnabled() || !resources.HasGpuCopies());
     if (timer.profile && overlapQueue != 0) {
         if (!overlapCapable) {
             if (arguments != 0 || argumentImport != nullptr) ++d.notIndirect;
@@ -4924,6 +4936,12 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
             AgcDriver::ProfilePrint_nid_no_patch("[overlap] compute-ring dispatches (cumulative): %llu after an ordering packet, %llu unordered (%llu overlapped, %llu found no open deferred barrier); not deferring: indirect %llu, (overlapped with a data refresh %llu), device LDS %llu, other %llu; %llu trailing barriers deferred, recorded by: commands %llu, draw pass %llu, key stores %llu, label store %llu, store run %llu, samples %llu, submit %llu\n", static_cast<unsigned long long>(d.orderedSeen), static_cast<unsigned long long>(d.unorderedSeen), static_cast<unsigned long long>(d.overlapped), static_cast<unsigned long long>(d.unorderedLost), static_cast<unsigned long long>(d.notIndirect), static_cast<unsigned long long>(d.notRefresh), static_cast<unsigned long long>(d.notLds), static_cast<unsigned long long>(d.notOther), static_cast<unsigned long long>(d.trailingDeferred), static_cast<unsigned long long>(flushes[0]), static_cast<unsigned long long>(flushes[1]), static_cast<unsigned long long>(flushes[2]), static_cast<unsigned long long>(flushes[3]), static_cast<unsigned long long>(flushes[4]), static_cast<unsigned long long>(flushes[5]), static_cast<unsigned long long>(flushes[6]));
             const auto batched = Graphics::Recorder::BatchedStagingCounts();
             AgcDriver::ProfilePrint_nid_no_patch("[batched-staging] (APS5_NO_BATCHED_STAGING %s, cumulative) %llu run splits, %llu preludes with %llu copy-in builds and %llu pristine copies; %llu copy-backs after a run sharing its barrier (%llu after an overlapping one); unordered dispatches not overlapped: no open run %llu, other ring's run %llu, render pass %llu, store run %llu, resources already in the run %llu\n", Graphics::Recorder::BatchedStagingEnabled() ? "unset" : "set", static_cast<unsigned long long>(batched.splits), static_cast<unsigned long long>(batched.preludes), static_cast<unsigned long long>(batched.preludeCopies), static_cast<unsigned long long>(batched.pristineCopies), static_cast<unsigned long long>(batched.mergedCopyBacks), static_cast<unsigned long long>(batched.copyBackConflicts), static_cast<unsigned long long>(batched.lostNoRun), static_cast<unsigned long long>(batched.lostOtherQueue), static_cast<unsigned long long>(batched.lostRenderPass), static_cast<unsigned long long>(batched.lostStoreRun), static_cast<unsigned long long>(batched.lostOwner));
+            std::string sites;
+            for (const auto& [site, count] : Graphics::Recorder::RunCloseSites(24)) sites += (sites.empty() ? "" : "; ") + site + " " + std::to_string(count);
+            std::string async;
+            for (const auto& [site, count] : Graphics::Recorder::RunCloseSites(24, 0x51)) async += (async.empty() ? "" : "; ") + site + " " + std::to_string(count);
+            AgcDriver::ProfilePrint_nid_no_patch("[run-close] runs closed by call site (cumulative, ring keys as guest queues): %s\n[run-close] of ring 0x51: %s\n[run-close] unordered dispatches by ring: %s\n", sites.c_str(), async.c_str(), Graphics::Recorder::OverlapByRing().c_str());
+            AgcDriver::ProfilePrint_nid_no_patch("%s (APS5_NO_STAGED_OVERLAP %s)\n%s\n", Graphics::Recorder::RunConflictReport().c_str(), Graphics::Recorder::StagedOverlapEnabled() ? "unset" : "set", Graphics::Recorder::OwedCopyBackReport().c_str());
         }
     }
     // The record phase split (APS5_PROFILE_DRAW, rows "record: ..." of the [dispatch] totals):
@@ -4961,7 +4979,11 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     VkAccessFlags covered = 0;
     bool overlapped = false;
     const std::array<const void*, 2> runOwners{record.resources.get(), record.resources != nullptr ? record.resources->MemoryOwner() : nullptr};
-    auto commands = overlapCapable && unordered ? recorder.OverlapCommands(overlapQueue, runOwners, &covered, overlapped) : recorder.Commands(&covered);
+    thread_local std::vector<std::array<std::uint64_t, 3>> runAccesses;
+    runAccesses.clear();
+    if (overlapCapable) resources.RunAccesses(runAccesses);
+    auto commands = overlapCapable && unordered ? recorder.OverlapCommands(overlapQueue, runOwners, &covered, overlapped, runAccesses) : recorder.Commands(&covered);
+    if (timer.profile && overlapped) recorder.CheckRunConflicts(record.programAddress, runAccesses);
     if (timer.profile && overlapCapable && unordered && !overlapped) ++d.unorderedLost;
     // Batched staging (Recorder::SplitForRun): a run's first dispatch that copies buffers itself
     // (so its ring's next dispatches likely do too) records into a new command buffer, so that the
@@ -5105,6 +5127,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     if (overlapCapable) {
         // Recorded by the next command that is not an unordered dispatch of this ring.
         recorder.DeferDispatchBarrier(overlapQueue, runOwners);
+        recorder.NoteRunAccess(record.programAddress, runAccesses);
         ++d.trailingDeferred;
     } else {
         const auto trailingTiming = recorder.BeginGpuTiming(CommandClass::DispatchTrailing);
@@ -5594,7 +5617,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     }
     if (profile && std::chrono::steady_clock::now() - d.cacheReport > std::chrono::seconds(10)) {
         d.cacheReport = std::chrono::steady_clock::now();
-        AgcDriver::ProfilePrint_nid_no_patch("[rescache] %llu hits, %llu misses, %llu invalidated, %zu entries (dispatch + draw); template hits: %llu refreshed the data buffers (revalidate %.1f ms), %llu had the same words; Find calls %llu, Touch calls %llu\n", static_cast<unsigned long long>(d.cacheHits), static_cast<unsigned long long>(d.cacheMisses), static_cast<unsigned long long>(d.cacheInvalidated), state->resourceCache.Size(), static_cast<unsigned long long>(d.templateRefreshed), d.templateRevalidateMs, static_cast<unsigned long long>(d.templateSameWords), static_cast<unsigned long long>(ResourceCache::Finds()), static_cast<unsigned long long>(ResourceCache::Touches()));
+        AgcDriver::ProfilePrint_nid_no_patch("[rescache] %llu hits, %llu misses, %llu invalidated, %zu entries (dispatch + draw); template hits: %llu refreshed the data buffers (revalidate %.1f ms), %llu had the same words; Find calls %llu, Touch calls %llu; copied buffers retained %.1f MiB (budget %zu MiB%s), budget evictions %llu / %.1f MiB, %llu over the budget not kept\n", static_cast<unsigned long long>(d.cacheHits), static_cast<unsigned long long>(d.cacheMisses), static_cast<unsigned long long>(d.cacheInvalidated), state->resourceCache.Size(), static_cast<unsigned long long>(d.templateRefreshed), d.templateRevalidateMs, static_cast<unsigned long long>(d.templateSameWords), static_cast<unsigned long long>(ResourceCache::Finds()), static_cast<unsigned long long>(ResourceCache::Touches()), static_cast<double>(state->resourceCache.CopiedBytes()) / 1048576.0, ResourceCache::CopiedBudget() >> 20u, Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoResourceCopyBudget) ? ", off" : "", static_cast<unsigned long long>(ResourceCache::CopyBudgetTotals().evicted), static_cast<double>(ResourceCache::CopyBudgetTotals().evictedBytes) / 1048576.0, static_cast<unsigned long long>(ResourceCache::CopyBudgetTotals().oversized));
         const auto gate = Graphics::PipelineCreationGate::Shared().Totals();
         AgcDriver::ProfilePrint_nid_no_patch("[vk] deviceProc lookups inside the device call: %llu (%.2f per dispatch); pre-dispatch barriers recorded %llu, skipped %llu; overlap: %llu trailing barriers deferred, %llu dispatches overlapped; compute pipelines created %llu (%llu under the GPU mutex); creation gate: %llu waited %.1f s, %llu past the budget without waiting, peak %llu at once / %llu MiB estimated of a %llu MiB budget\n", static_cast<unsigned long long>(d.procLookups), d.profiledDispatches != 0 ? static_cast<double>(d.procLookups) / static_cast<double>(d.profiledDispatches) : 0.0, static_cast<unsigned long long>(d.preBarriersRecorded), static_cast<unsigned long long>(d.preBarriersSkipped), static_cast<unsigned long long>(d.trailingDeferred), static_cast<unsigned long long>(d.overlapped), static_cast<unsigned long long>(computePipelinesCreated.load(std::memory_order_relaxed)), static_cast<unsigned long long>(computePipelinesCreatedLocked.load(std::memory_order_relaxed)), static_cast<unsigned long long>(gate.waited), static_cast<double>(gate.waitNanoseconds) / 1e9, static_cast<unsigned long long>(gate.unwaited), static_cast<unsigned long long>(gate.peakInFlight), static_cast<unsigned long long>(gate.peakBytes >> 20u), static_cast<unsigned long long>(gate.budgetBytes >> 20u));
         reportRecipes();
