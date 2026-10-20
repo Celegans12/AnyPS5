@@ -259,7 +259,7 @@ std::optional<std::uint32_t> BindlessHeap::StorageSlot(std::uint32_t kind, std::
 }
 
 std::optional<std::uint32_t> BindlessHeap::ViewSlot(std::uint32_t kind, const void* owner, VkImageView view) {
-    if (!Abi::GpuHeapStorageKind(kind) || owner == nullptr || view == VK_NULL_HANDLE) throw std::runtime_error("AGC bindless heap: invalid view slot request");
+    if (kind < Abi::FirstImageBinding || kind >= static_cast<std::uint32_t>(Abi::Binding::Samplers) || owner == nullptr || view == VK_NULL_HANDLE) throw std::runtime_error("AGC bindless heap: invalid view slot request");
     std::vector<std::shared_ptr<Texture>> dropped;
     SweptStorageRelease swept;
     std::lock_guard lock(mutex);
@@ -275,7 +275,7 @@ std::optional<std::uint32_t> BindlessHeap::ViewSlot(std::uint32_t kind, const vo
         return std::nullopt;
     }
     const VkDescriptorImageInfo image{VK_NULL_HANDLE, view, VK_IMAGE_LAYOUT_GENERAL};
-    const VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, fragmentBinding(kind), *slot, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &image, nullptr, nullptr};
+    const VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, fragmentBinding(kind), *slot, 1, Abi::GpuHeapStorageKind(kind) ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &image, nullptr, nullptr};
     writeDescriptorHeap(write);
     textureSlots.emplace(key, *slot);
     auto& kindOwners = owners[kind];
