@@ -64,6 +64,42 @@ struct HeapImagePush {
     std::uint32_t pad;
 };
 
+struct HeapCmaskPush {
+    std::array<std::uint32_t, 7> push;
+    std::uint32_t pad;
+    std::uint64_t cmask;
+    std::uint64_t errors;
+    std::uint32_t slot;
+    std::uint32_t pad2;
+};
+
+static_assert(offsetof(HeapCmaskPush, cmask) == 32 && offsetof(HeapCmaskPush, errors) == 40 && offsetof(HeapCmaskPush, slot) == 48);
+
+VkDescriptorSetAndBindingMappingEXT PushAddressMapping(std::uint32_t binding, std::uint32_t offset) {
+    VkDescriptorSetAndBindingMappingEXT mapping{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_AND_BINDING_MAPPING_EXT};
+    mapping.descriptorSet = 0;
+    mapping.firstBinding = binding;
+    mapping.bindingCount = 1;
+    mapping.resourceMask = VK_SPIRV_RESOURCE_TYPE_READ_WRITE_STORAGE_BUFFER_BIT_EXT | VK_SPIRV_RESOURCE_TYPE_READ_ONLY_STORAGE_BUFFER_BIT_EXT;
+    mapping.source = VK_DESCRIPTOR_MAPPING_SOURCE_PUSH_ADDRESS_EXT;
+    mapping.sourceData.pushAddressOffset = offset;
+    return mapping;
+}
+
+VkDescriptorSetAndBindingMappingEXT PushIndexMapping(const BindlessHeap& heap, std::uint32_t binding, std::uint32_t kind, std::uint32_t offset) {
+    VkDescriptorSetAndBindingMappingEXT mapping{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_AND_BINDING_MAPPING_EXT};
+    mapping.descriptorSet = 0;
+    mapping.firstBinding = binding;
+    mapping.bindingCount = 1;
+    mapping.resourceMask = VK_SPIRV_RESOURCE_TYPE_READ_WRITE_IMAGE_BIT_EXT;
+    mapping.source = VK_DESCRIPTOR_MAPPING_SOURCE_HEAP_WITH_PUSH_INDEX_EXT;
+    mapping.sourceData.pushIndex.heapOffset = static_cast<std::uint32_t>(heap.ImageHeapOffset(kind));
+    mapping.sourceData.pushIndex.pushOffset = offset;
+    mapping.sourceData.pushIndex.heapIndexStride = static_cast<std::uint32_t>(heap.ImageHeapStride());
+    mapping.sourceData.pushIndex.heapArrayStride = static_cast<std::uint32_t>(heap.ImageHeapStride());
+    return mapping;
+}
+
 constexpr std::uint32_t DetileHeapKind = ShaderRecompiler::RuntimeAbi::FirstStorageImageBinding + 27u;
 
 static_assert(offsetof(AddressedPush, input) == 72 && sizeof(AddressedPush) == 88);
@@ -153,6 +189,7 @@ void TextureDetiler::release() noexcept {
     if (readbackDescriptorLayout) context.Function<PFN_vkDestroyDescriptorSetLayout>("vkDestroyDescriptorSetLayout")(context.device, readbackDescriptorLayout, nullptr);
     for (const auto pool : cmaskDescriptorSets.pools) context.Function<PFN_vkDestroyDescriptorPool>("vkDestroyDescriptorPool")(context.device, pool, nullptr);
     if (cmaskPipeline) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, cmaskPipeline, nullptr);
+    if (cmaskHeapPipeline) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, cmaskHeapPipeline, nullptr);
     if (cmaskPipelineLayout) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, cmaskPipelineLayout, nullptr);
     if (cmaskDescriptorLayout) context.Function<PFN_vkDestroyDescriptorSetLayout>("vkDestroyDescriptorSetLayout")(context.device, cmaskDescriptorLayout, nullptr);
     cmaskErrors.reset();
@@ -246,23 +283,8 @@ VkPipeline TextureDetiler::pipeline(TextureTileMode tileMode, std::uint32_t elem
     if (heap) {
         Require(image && !addressed, "only the image detiler runs on the descriptor heap");
         const auto& bindless = BindlessHeap::For(context);
-        mappings[0] = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_AND_BINDING_MAPPING_EXT};
-        mappings[0].descriptorSet = 0;
-        mappings[0].firstBinding = 0;
-        mappings[0].bindingCount = 1;
-        mappings[0].resourceMask = VK_SPIRV_RESOURCE_TYPE_READ_WRITE_STORAGE_BUFFER_BIT_EXT;
-        mappings[0].source = VK_DESCRIPTOR_MAPPING_SOURCE_PUSH_ADDRESS_EXT;
-        mappings[0].sourceData.pushAddressOffset = offsetof(HeapImagePush, tiled);
-        mappings[1] = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_AND_BINDING_MAPPING_EXT};
-        mappings[1].descriptorSet = 0;
-        mappings[1].firstBinding = 1;
-        mappings[1].bindingCount = 1;
-        mappings[1].resourceMask = VK_SPIRV_RESOURCE_TYPE_READ_WRITE_IMAGE_BIT_EXT;
-        mappings[1].source = VK_DESCRIPTOR_MAPPING_SOURCE_HEAP_WITH_PUSH_INDEX_EXT;
-        mappings[1].sourceData.pushIndex.heapOffset = static_cast<std::uint32_t>(bindless.ImageHeapOffset(DetileHeapKind));
-        mappings[1].sourceData.pushIndex.pushOffset = offsetof(HeapImagePush, slot);
-        mappings[1].sourceData.pushIndex.heapIndexStride = static_cast<std::uint32_t>(bindless.ImageHeapStride());
-        mappings[1].sourceData.pushIndex.heapArrayStride = static_cast<std::uint32_t>(bindless.ImageHeapStride());
+        mappings[0] = PushAddressMapping(0, offsetof(HeapImagePush, tiled));
+        mappings[1] = PushIndexMapping(bindless, 1, DetileHeapKind, offsetof(HeapImagePush, slot));
         mappingInfo.mappingCount = static_cast<std::uint32_t>(mappings.size());
         mappingInfo.pMappings = mappings.data();
         createInfo.stage.pNext = &mappingInfo;
@@ -438,7 +460,7 @@ std::uint32_t TextureDetiler::CmaskErrors() {
     return codes;
 }
 
-void TextureDetiler::DispatchCmaskClear(VkCommandBuffer commands, VkBuffer cmask, std::uint64_t cmaskOffset, std::size_t cmaskBytes, VkImageView view, std::uint32_t width, std::uint32_t height, std::uint32_t elementBytes, const std::array<std::uint32_t, 2>& clearWords, bool write) {
+void TextureDetiler::DispatchCmaskClear(VkCommandBuffer commands, VkBuffer cmask, std::uint64_t cmaskOffset, std::size_t cmaskBytes, VkImageView view, std::uint32_t width, std::uint32_t height, std::uint32_t elementBytes, const std::array<std::uint32_t, 2>& clearWords, bool write, const void* owner) {
     Require(commands != VK_NULL_HANDLE && cmask != VK_NULL_HANDLE && view != VK_NULL_HANDLE, "a CMASK clear needs a command buffer, the CMASK buffer and the target view");
     Require(elementBytes == 1 || elementBytes == 2 || elementBytes == 4 || elementBytes == 8, "a CMASK clear of this element size is not modeled");
     Require(cmaskOffset % 4 == 0 && cmaskBytes % 4 == 0 && cmaskBytes != 0, "a CMASK clear needs a word-aligned CMASK");
@@ -473,30 +495,50 @@ void TextureDetiler::DispatchCmaskClear(VkCommandBuffer commands, VkBuffer cmask
             auto pipelineCacheLock = context.LockPipelineCacheForUse();
             created = context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &cmaskPipeline);
         }
+        if (created == VK_SUCCESS && addressedPipelineLayout != VK_NULL_HANDLE && DescriptorHeapEnabled() && BindlessHeap::For(context).DescriptorHeapMode()) {
+            const auto& bindless = BindlessHeap::For(context);
+            const std::array<VkDescriptorSetAndBindingMappingEXT, 3> mappings{PushAddressMapping(0, offsetof(HeapCmaskPush, cmask)), PushAddressMapping(1, offsetof(HeapCmaskPush, errors)), PushIndexMapping(bindless, 2, DetileHeapKind, offsetof(HeapCmaskPush, slot))};
+            VkShaderDescriptorSetAndBindingMappingInfoEXT mappingInfo{VK_STRUCTURE_TYPE_SHADER_DESCRIPTOR_SET_AND_BINDING_MAPPING_INFO_EXT};
+            mappingInfo.mappingCount = static_cast<std::uint32_t>(mappings.size());
+            mappingInfo.pMappings = mappings.data();
+            VkPipelineCreateFlags2CreateInfoKHR heapFlags{VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR};
+            heapFlags.flags = VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT;
+            auto heapInfo = pipelineInfo;
+            heapInfo.pNext = &heapFlags;
+            heapInfo.stage.pNext = &mappingInfo;
+            heapInfo.layout = VK_NULL_HANDLE;
+            auto pipelineCacheLock = context.LockPipelineCacheForUse();
+            created = context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, context.pipelineCache, 1, &heapInfo, nullptr, &cmaskHeapPipeline);
+        }
         context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, cmaskModule, nullptr);
         Check(created, "vkCreateComputePipelines CMASK clear");
         cmaskErrors = std::make_unique<Buffer>(context, 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         std::memset(cmaskErrors->Bytes().data(), 0, 4);
     }
-    const auto set = allocateFrom(cmaskDescriptorSets, cmaskDescriptorLayout, {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 64 * 2}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 64}}, "vkCreateDescriptorPool CMASK clear", "vkAllocateDescriptorSets CMASK clear", "vkResetDescriptorPool CMASK clear");
+    const auto cmaskAddress = cmaskHeapPipeline != VK_NULL_HANDLE && owner != nullptr ? bufferAddress(cmask) : 0;
+    const auto errorsAddress = cmaskAddress != 0 ? bufferAddress(cmaskErrors->Handle()) : 0;
+    const auto slot = errorsAddress != 0 ? BindlessHeap::For(context).ViewSlot(DetileHeapKind, owner, view) : std::nullopt;
+    const auto set = slot ? VK_NULL_HANDLE : allocateFrom(cmaskDescriptorSets, cmaskDescriptorLayout, {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 64 * 2}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 64}}, "vkCreateDescriptorPool CMASK clear", "vkAllocateDescriptorSets CMASK clear", "vkResetDescriptorPool CMASK clear");
     const auto alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4);
     const auto descriptorOffset = cmaskOffset - cmaskOffset % alignment;
     const auto base = cmaskOffset - descriptorOffset;
-    const VkDescriptorBufferInfo cmaskInfo{cmask, descriptorOffset, base + cmaskBytes};
-    const VkDescriptorBufferInfo errorInfo{cmaskErrors->Handle(), 0, 4};
-    const VkDescriptorImageInfo imageInfo{VK_NULL_HANDLE, view, VK_IMAGE_LAYOUT_GENERAL};
-    std::array<VkWriteDescriptorSet, 3> writes{};
-    for (std::uint32_t index = 0; index < writes.size(); ++index) {
-        writes[index].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[index].dstSet = set;
-        writes[index].dstBinding = index;
-        writes[index].descriptorCount = 1;
-        writes[index].descriptorType = index == 2 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    if (!slot) {
+        const VkDescriptorBufferInfo cmaskInfo{cmask, descriptorOffset, base + cmaskBytes};
+        const VkDescriptorBufferInfo errorInfo{cmaskErrors->Handle(), 0, 4};
+        const VkDescriptorImageInfo imageInfo{VK_NULL_HANDLE, view, VK_IMAGE_LAYOUT_GENERAL};
+        std::array<VkWriteDescriptorSet, 3> writes{};
+        for (std::uint32_t index = 0; index < writes.size(); ++index) {
+            writes[index].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[index].dstSet = set;
+            writes[index].dstBinding = index;
+            writes[index].descriptorCount = 1;
+            writes[index].descriptorType = index == 2 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        }
+        writes[0].pBufferInfo = &cmaskInfo;
+        writes[1].pBufferInfo = &errorInfo;
+        writes[2].pImageInfo = &imageInfo;
+        context.Function<PFN_vkUpdateDescriptorSets>("vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
     }
-    writes[0].pBufferInfo = &cmaskInfo;
-    writes[1].pBufferInfo = &errorInfo;
-    writes[2].pImageInfo = &imageInfo;
-    context.Function<PFN_vkUpdateDescriptorSets>("vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
     const auto barrier = [&](VkPipelineStageFlags source, VkPipelineStageFlags destination, VkAccessFlags sourceAccess, VkAccessFlags destinationAccess) {
         VkMemoryBarrier memory{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         memory.srcAccessMask = sourceAccess;
@@ -506,11 +548,19 @@ void TextureDetiler::DispatchCmaskClear(VkCommandBuffer commands, VkBuffer cmask
     constexpr VkAccessFlags anyWrite = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT;
     constexpr VkAccessFlags anyAccess = anyWrite | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_HOST_READ_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
     barrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, anyWrite, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
-    context.Function<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, cmaskPipeline);
-    CmdBindDescriptorSets(context, commands, VK_PIPELINE_BIND_POINT_COMPUTE, cmaskPipelineLayout, 0, 1, &set, SetBindSite::Detiler);
     const std::uint32_t mask = elementBytes >= 4 ? 0xffffffffu : (1u << (elementBytes * 8u)) - 1u;
     const std::array<std::uint32_t, 7> push{static_cast<std::uint32_t>(base), width, height, (width + 1023u) / 1024u, clearWords[0] & mask, elementBytes == 8 ? clearWords[1] : 0u, write ? 1u : 0u};
-    context.Function<PFN_vkCmdPushConstants>("vkCmdPushConstants")(commands, cmaskPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), push.data());
+    if (slot) {
+        BindlessHeap::For(context).BindDescriptorHeaps(commands);
+        context.Function<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, cmaskHeapPipeline);
+        const HeapCmaskPush pushed{push, 0u, cmaskAddress + descriptorOffset, errorsAddress, *slot, 0u};
+        const VkPushDataInfoEXT data{VK_STRUCTURE_TYPE_PUSH_DATA_INFO_EXT, nullptr, 0, {&pushed, sizeof(pushed)}};
+        context.Function<PFN_vkCmdPushDataEXT>("vkCmdPushDataEXT")(commands, &data);
+    } else {
+        context.Function<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, cmaskPipeline);
+        CmdBindDescriptorSets(context, commands, VK_PIPELINE_BIND_POINT_COMPUTE, cmaskPipelineLayout, 0, 1, &set, SetBindSite::Detiler);
+        context.Function<PFN_vkCmdPushConstants>("vkCmdPushConstants")(commands, cmaskPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), push.data());
+    }
     context.Function<PFN_vkCmdDispatch>("vkCmdDispatch")(commands, (width + 7u) / 8u, (height + 7u) / 8u, 1);
     barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT, anyAccess);
     context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, cmask, cmaskOffset, cmaskBytes, 0xffffffffu);

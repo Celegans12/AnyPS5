@@ -250,6 +250,7 @@ int main() {
         DrawSamplesTheTexture(heap, Mode::VertexTable);
         DrawSamplesTheTexture(heap, Mode::MovedBuffer);
         DrawSamplesTheTexture(heap, Mode::MovedTexture);
+        DrawSamplesTheTexture(heap, Mode::Texture);
         if (heap && std::getenv("APS5_HEAP_SLOT_CAP") != nullptr) Require(AgcDriver::DriverDetail::HeapRefused(), "a draw found the capped heap full and the heap was not refused");
         AgcDriverShutdown_nid_postfix();
         if (heap && AgcDriver::Graphics::DescriptorHeapEnabled() && std::getenv("APS5_HEAP_SLOT_CAP") == nullptr) Require(AgcDriver::Graphics::EmptyResourceSets() != 0, "no heap draw bound without a per-draw resource set");

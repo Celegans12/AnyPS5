@@ -144,7 +144,7 @@ struct SweptStorageRelease {
 };
 
 std::mutex& heapsMutex() {
-    static std::mutex mutex;
+    static auto& mutex = *new std::mutex();
     return mutex;
 }
 

@@ -1677,6 +1677,8 @@ if(BUILD_TESTING)
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test(NAME agc_storage_kept_unit_settle COMMAND agc_driver_recorder_tests --kept-unit-settle-only)
+    add_test(NAME agc_storage_refresh_proofs COMMAND agc_driver_recorder_tests --refresh-proofs-only)
+    set_tests_properties(agc_storage_refresh_proofs PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
     set_tests_properties(agc_storage_kept_unit_settle PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
     if(WIN32)
         set_tests_properties(agc_storage_kept_unit_settle PROPERTIES ENVIRONMENT_MODIFICATION

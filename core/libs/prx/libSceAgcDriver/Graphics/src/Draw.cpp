@@ -468,7 +468,7 @@ void recordCmaskClear(const Context& context, Recorder& recorder, const HostImpo
     const auto commands = recorder.Commands();
     if (resident != nullptr && !resident->Cached()) recorder.KeepBytes(resident.get(), static_cast<std::size_t>(resident->BudgetBytes()));
     recorder.Keep(resident);
-    context.detiler->DispatchCmaskClear(commands, import.buffer, HostImportOffset(import, address), bytes, view, color.extent.width, color.extent.height, color.elementBytes, color.clearWords, color.dccAddress == 0);
+    context.detiler->DispatchCmaskClear(commands, import.buffer, HostImportOffset(import, address), bytes, view, color.extent.width, color.extent.height, color.elementBytes, color.clearWords, color.dccAddress == 0, resident.get());
     recorder.NotePendingWrite(address, bytes);
     proveCmask(address, bytes, GuestMemory::MarkWritten(address, bytes));
 }

@@ -3212,7 +3212,8 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
     overlapping.clear();
     accepted = false;
     if (!EpochRevalidate()) return fastRevalidateEach();
-    const auto fail = [&reason](FastFail why) {
+    const auto fail = [&reason, &overlapping](FastFail why) {
+        if (why != FastFail::StorageKeys && why != FastFail::Pending) overlapping.clear();
         reason = why;
         countFastFail(why);
         return false;
@@ -3296,6 +3297,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
             queries.push_back({address, bytes, surface.generation});
         }
     }
+    bool keysMoved = false;
     for (std::size_t i = 0; i < storageTextures.size(); ++i) {
         if (storageTextures[i] != nullptr && (i >= storageKeys.size() || !StorageImageServesKeys(*storageTextures[i], storageKeys[i]))) {
             if (BuildProfiled()) Revalidations().storageMetadataMoved.fetch_add(1, std::memory_order_relaxed);
@@ -3322,7 +3324,10 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
             }
             if (const auto proved = image->ProvedKeys(); proved != image->UploadedKeys()) {
                 if (BuildProfiled()) Revalidations().storageKeysMoved[static_cast<std::size_t>(image->UploadedKeys()) * 9u + static_cast<std::size_t>(proved)].fetch_add(1, std::memory_order_relaxed);
-                return fail(FastFail::StorageKeys);
+                if (!OwnImageRefreshEnabled()) return fail(FastFail::StorageKeys);
+                keysMoved = true;
+                overlapping.push_back({i, true, false});
+                continue;
             }
             countKeysProven(true);
         }
@@ -3331,6 +3336,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         queries.push_back({address, bytes, image->GenerationFor(address, bytes)});
         images.push_back(image);
     }
+    if (keysMoved) return fail(FastFail::StorageKeys);
     if (!pending.empty()) {
         if (!StorageTexture::ScanPending(pending)) return fail(FastFail::ClearedView);
         // A foreign image over a view under uncompressed keys is no failure while FindPending
