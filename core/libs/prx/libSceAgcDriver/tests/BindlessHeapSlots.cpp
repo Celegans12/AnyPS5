@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BindlessHeap.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "RuntimeAbi.hpp"
@@ -82,6 +83,20 @@ void samplerSlots(const Context& context) {
     require(heap.SamplerGeneration(*slot) != generation, "a freed sampler slot moves its generation");
 }
 
+void viewSlots(const Context& context, VkImageView view) {
+    auto& heap = BindlessHeap::For(context);
+    const auto kind = Abi::FirstStorageImageBinding + 27u;
+    const int first = 0, second = 0;
+    const auto slot = heap.ViewSlot(kind, &first, view);
+    require(slot.has_value() && heap.ViewSlot(kind, &first, view) == slot, "a view keeps its slot");
+    require(!heap.ViewSlot(kind, &second, view).has_value(), "a full kind refuses another owner's view");
+    const auto generation = heap.SlotGeneration(kind, *slot);
+    heap.ReleaseViewSlots(&first);
+    require(heap.SlotGeneration(kind, *slot) != generation, "a released view slot moves its generation");
+    require(heap.ViewSlot(kind, &second, view) == slot, "a released view slot is reused");
+    heap.ReleaseViewSlots(&second);
+}
+
 void ringSpans(const Context& context) {
     BindlessHeap heap(context);
     BindlessHeap::SpanMark unwritten;
@@ -98,6 +113,23 @@ void ringSpans(const Context& context) {
     require(heap.Held(first), "a span stays held while its batch keeps the chunk open");
     const auto counts = heap.Statistics();
     require(counts.spansWritten == 3u && counts.spansKept == 2u, "three spans written and two kept");
+    BindlessHeap::SpanMark third;
+    static_cast<void>(heap.Allocate(chunkWords, third));
+    Recorder recorder(context);
+    heap.Submitted(recorder, 0u);
+    require(heap.Held(first), "a span stays held after its batch is submitted while the ring has not come back to its chunk");
+    BindlessHeap::SpanMark fill;
+    const auto untilWrap = [&] {
+        const auto wraps = heap.Statistics().ringWraps;
+        BindlessHeap::DataSpan last{};
+        while (heap.Statistics().ringWraps == wraps) last = heap.Allocate(chunkWords, fill);
+        return last.offset;
+    };
+    require(untilWrap() == (4u << 20u), "the ring skips a chunk a later batch still reads kept spans from");
+    require(heap.Held(first), "the skipped chunk's kept span is still held");
+    require(heap.Statistics().keptChunksSkipped == 1u, "one kept chunk skipped");
+    heap.Submitted(recorder, 0u);
+    require(untilWrap() == 0u && !heap.Held(first) && heap.Statistics().spansExpired == 1u, "a span the ring wrote over has expired");
 }
 
 }
@@ -165,6 +197,7 @@ int main(int argc, char** argv) {
             textureSlots(context, placeholders.View(Abi::FirstImageBinding));
             samplerSlots(context);
             ringSpans(context);
+            viewSlots(context, placeholders.View(Abi::FirstStorageImageBinding));
             device->WaitIdle();
         }
         device.reset();

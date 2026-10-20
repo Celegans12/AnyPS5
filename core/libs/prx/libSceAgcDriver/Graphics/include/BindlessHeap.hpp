@@ -40,6 +40,8 @@ public:
 
     std::optional<std::uint32_t> TextureSlot(std::uint32_t kind, const std::shared_ptr<Texture>& texture, VkImageView view, VkImageLayout layout);
     std::optional<std::uint32_t> StorageSlot(std::uint32_t kind, std::shared_ptr<void> owner, VkImageView view);
+    std::optional<std::uint32_t> ViewSlot(std::uint32_t kind, const void* owner, VkImageView view);
+    void ReleaseViewSlots(const void* owner);
     std::uint32_t SlotGeneration(std::uint32_t kind, std::uint32_t slot) const;
     const Texture* SlotTexture(std::uint32_t kind, std::uint32_t slot) const;
     std::optional<std::uint32_t> SamplerSlot(const std::shared_ptr<Sampler>& sampler);
@@ -70,7 +72,7 @@ public:
     struct Counts {
         std::uint64_t textures = 0, samplers = 0, full = 0, ringWraps = 0;
         std::uint64_t slotsFreed = 0, slotsReused = 0, sweeps = 0, chunkWaits = 0;
-        std::uint64_t spansWritten = 0, spansKept = 0;
+        std::uint64_t spansWritten = 0, spansKept = 0, spansExpired = 0, keptChunksSkipped = 0;
     };
     Counts Statistics() const;
 
@@ -111,6 +113,7 @@ private:
         std::size_t operator()(const TextureKey& key) const { return std::hash<const void*>{}(key.texture) ^ std::hash<const void*>{}(reinterpret_cast<const void*>(key.view)) ^ (static_cast<std::size_t>(key.kind) << 48u) ^ (static_cast<std::size_t>(key.layout) << 40u); }
     };
     std::unordered_map<TextureKey, std::uint32_t, TextureKeyHash> textureSlots;
+    std::unordered_map<const void*, std::vector<std::pair<std::uint32_t, std::uint32_t>>> viewSlots;
     std::vector<std::uint32_t> nextTextureSlot;
     struct SlotOwner {
         std::shared_ptr<Texture> texture;

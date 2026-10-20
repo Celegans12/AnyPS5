@@ -38,6 +38,7 @@ std::uint32_t fragmentBinding(std::uint32_t kind) {
 
 std::atomic<std::uint64_t> spansWrittenWindow{0};
 std::atomic<std::uint64_t> spansKeptWindow{0};
+std::atomic<std::uint64_t> spansExpiredWindow{0};
 
 }
 
@@ -244,6 +245,49 @@ std::optional<std::uint32_t> BindlessHeap::StorageSlot(std::uint32_t kind, std::
     kindOwners[*slot].key = key;
     ++counts.textures;
     return slot;
+}
+
+std::optional<std::uint32_t> BindlessHeap::ViewSlot(std::uint32_t kind, const void* owner, VkImageView view) {
+    if (!Abi::GpuHeapStorageKind(kind) || owner == nullptr || view == VK_NULL_HANDLE) throw std::runtime_error("AGC bindless heap: invalid view slot request");
+    std::vector<std::shared_ptr<Texture>> dropped;
+    std::lock_guard lock(mutex);
+    const TextureKey key{kind, owner, view, VK_IMAGE_LAYOUT_GENERAL};
+    if (const auto found = textureSlots.find(key); found != textureSlots.end()) return found->second;
+    auto slot = takeSlotLocked(kind);
+    if (!slot) {
+        sweepLocked(dropped);
+        slot = takeSlotLocked(kind);
+    }
+    if (!slot) {
+        ++counts.full;
+        return std::nullopt;
+    }
+    const VkDescriptorImageInfo image{VK_NULL_HANDLE, view, VK_IMAGE_LAYOUT_GENERAL};
+    const VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, fragmentBinding(kind), *slot, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &image, nullptr, nullptr};
+    writeDescriptorHeap(write);
+    textureSlots.emplace(key, *slot);
+    auto& kindOwners = owners[kind];
+    if (kindOwners.size() <= *slot) kindOwners.resize(*slot + 1u);
+    kindOwners[*slot].key = key;
+    viewSlots[owner].emplace_back(kind, *slot);
+    ++counts.textures;
+    return slot;
+}
+
+void BindlessHeap::ReleaseViewSlots(const void* owner) {
+    std::lock_guard lock(mutex);
+    const auto found = viewSlots.find(owner);
+    if (found == viewSlots.end()) return;
+    for (const auto& [kind, slot] : found->second) {
+        auto& entry = owners[kind][slot];
+        textureSlots.erase(entry.key);
+        entry.key = {};
+        ++entry.generation;
+        freeSlots[kind].push_back(slot);
+        ++counts.slotsFreed;
+    }
+    slotSerial.fetch_add(1, std::memory_order_release);
+    viewSlots.erase(found);
 }
 
 std::optional<std::uint32_t> BindlessHeap::takeSlotLocked(std::uint32_t kind) {
@@ -461,8 +505,13 @@ bool BindlessHeap::Held(const SpanMark& mark) {
     const auto last = (mark.offset + static_cast<std::size_t>(mark.words) * sizeof(std::uint32_t) - 1u) / RingChunkBytes;
     if (first != last) return false;
     std::lock_guard lock(mutex);
-    const auto& chunk = ringChunks[first];
-    if (chunk.entries != mark.entry || !(chunk.open || first == ringChunk)) return false;
+    auto& chunk = ringChunks[first];
+    if (chunk.entries != mark.entry) {
+        ++counts.spansExpired;
+        spansExpiredWindow.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    chunk.open = true;
     ++counts.spansKept;
     spansKeptWindow.fetch_add(1, std::memory_order_relaxed);
     return true;
@@ -476,6 +525,21 @@ BindlessHeap::DataSpan BindlessHeap::Allocate(std::size_t words, SpanMark& mark)
     if (offset + bytes > RingBytes) {
         offset = 0;
         ++counts.ringWraps;
+    }
+    const auto keptAhead = [&] {
+        for (auto chunk = offset / RingChunkBytes; chunk <= (offset + std::max<std::size_t>(bytes, 1u) - 1u) / RingChunkBytes; ++chunk) {
+            if (chunk != ringChunk && ringChunks[chunk].open) return true;
+        }
+        return false;
+    };
+    for (std::size_t skipped = 0; keptAhead(); ++skipped) {
+        if (skipped == ringChunks.size()) throw std::runtime_error("AGC bindless heap: one batch's shader data exceeds its ring");
+        offset = (offset / RingChunkBytes + 1u) * RingChunkBytes;
+        if (offset + bytes > RingBytes) {
+            offset = 0;
+            ++counts.ringWraps;
+        }
+        ++counts.keptChunksSkipped;
     }
     ringCursor = offset + bytes;
     for (auto chunk = offset / RingChunkBytes; chunk <= (offset + std::max<std::size_t>(bytes, 1u) - 1u) / RingChunkBytes; ++chunk) enterChunk(ringChunks, chunk, ringChunk, "shader data");
@@ -715,7 +779,7 @@ void reportHeapStatistics() {
     const auto plainDraws = takeCount(heapRecords[0]);
     const auto heapDispatches = takeCount(heapRecords[3]);
     const auto plainDispatches = takeCount(heapRecords[2]);
-    std::fprintf(stderr, "[gpu-heap] (10 s): draws %llu heap / %llu plain, dispatches %llu heap / %llu plain; heap binds %llu over %llu command buffers; set binds:%s; fallbacks:%s; draw stages:%s; CPU buffer copies %llu (%llu MiB); ring spans %llu written / %llu kept\n", static_cast<unsigned long long>(heapDraws), static_cast<unsigned long long>(plainDraws), static_cast<unsigned long long>(heapDispatches), static_cast<unsigned long long>(plainDispatches), static_cast<unsigned long long>(takeCount(heapBindWindow)), static_cast<unsigned long long>(takeCount(commandBuffersBegun)), binds.c_str(), fallbacks.c_str(), stageReasons.c_str(), static_cast<unsigned long long>(takeCount(cpuBufferCopies)), static_cast<unsigned long long>(takeCount(cpuBufferCopyBytes) >> 20u), static_cast<unsigned long long>(takeCount(spansWrittenWindow)), static_cast<unsigned long long>(takeCount(spansKeptWindow)));
+    std::fprintf(stderr, "[gpu-heap] (10 s): draws %llu heap / %llu plain, dispatches %llu heap / %llu plain; heap binds %llu over %llu command buffers; set binds:%s; fallbacks:%s; draw stages:%s; CPU buffer copies %llu (%llu MiB); ring spans %llu written / %llu kept / %llu expired\n", static_cast<unsigned long long>(heapDraws), static_cast<unsigned long long>(plainDraws), static_cast<unsigned long long>(heapDispatches), static_cast<unsigned long long>(plainDispatches), static_cast<unsigned long long>(takeCount(heapBindWindow)), static_cast<unsigned long long>(takeCount(commandBuffersBegun)), binds.c_str(), fallbacks.c_str(), stageReasons.c_str(), static_cast<unsigned long long>(takeCount(cpuBufferCopies)), static_cast<unsigned long long>(takeCount(cpuBufferCopyBytes) >> 20u), static_cast<unsigned long long>(takeCount(spansWrittenWindow)), static_cast<unsigned long long>(takeCount(spansKeptWindow)), static_cast<unsigned long long>(takeCount(spansExpiredWindow)));
 }
 
 void forgetHeapBinding(VkCommandBuffer commands) {
