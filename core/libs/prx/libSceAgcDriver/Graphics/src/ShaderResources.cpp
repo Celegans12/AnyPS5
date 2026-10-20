@@ -6128,10 +6128,17 @@ void ShaderResources::writeHeapTableMap(const CompiledShader& shader, std::size_
         map.push_back(*slot);
     }
     if (map.size() == base) map.push_back(sampledAbsent);
-    auto span = heap.Allocate(map.size());
-    std::memcpy(span.words.data(), map.data(), map.size() * sizeof(std::uint32_t));
-    heapTableMaps[stageIndex] = static_cast<std::uint32_t>(span.offset);
+    heapTableMaps[stageIndex] = heapSpan(heapStages[stageIndex].map, map);
     heapTableMapSet[stageIndex] = true;
+}
+
+std::uint32_t ShaderResources::heapSpan(HeapStageState::KeptSpan& kept, std::span<const std::uint32_t> words) {
+    auto& heap = BindlessHeap::For(context);
+    if (std::ranges::equal(kept.words, words) && heap.Held(kept.mark)) return kept.mark.offset;
+    auto span = heap.Allocate(words.size(), kept.mark);
+    std::memcpy(span.words.data(), words.data(), words.size() * sizeof(std::uint32_t));
+    kept.words.assign(words.begin(), words.end());
+    return span.offset;
 }
 
 void ShaderResources::writeHeapStage(const CompiledShader& shader) {
@@ -6265,10 +6272,8 @@ void ShaderResources::writeHeapStage(const CompiledShader& shader) {
         if (binding.role != ShaderRecompiler::DescriptorRole::ShaderData && binding.role != ShaderRecompiler::DescriptorRole::FlattenedSrt) continue;
         const auto& words = binding.role == ShaderRecompiler::DescriptorRole::FlattenedSrt && shader.heap != nullptr && !shader.heap->flattenedSrt.empty() ? shader.heap->flattenedSrt : DrawGuestWords(shader, binding);
         if (binding.role == ShaderRecompiler::DescriptorRole::ShaderData) ValidateRuntimeResources(shader, words);
-        auto span = heap.Allocate(words.size());
         if (binding.role != ShaderRecompiler::DescriptorRole::ShaderData) {
-            std::memcpy(span.words.data(), words.data(), words.size() * sizeof(std::uint32_t));
-            heapOffsets[flatIndex] = span.offset;
+            heapOffsets[flatIndex] = heapSpan(stageState.flat, words);
             heapSrtDwords[stageIndex] = static_cast<std::uint32_t>(words.size());
             continue;
         }
@@ -6317,8 +6322,7 @@ void ShaderResources::writeHeapStage(const CompiledShader& shader) {
                 stageDataWords[stageIndex].assign(patched.begin(), patched.end());
                 stageDataIndex[stageIndex] = dataIndex;
             }
-            std::memcpy(span.words.data(), patched.data(), patched.size() * sizeof(std::uint32_t));
-            heapOffsets[dataIndex] = span.offset;
+            heapOffsets[dataIndex] = heapSpan(stageState.data, patched);
         }
     }
 }

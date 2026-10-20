@@ -36,6 +36,9 @@ std::uint32_t fragmentBinding(std::uint32_t kind) {
     return Abi::BindingNumber(Abi::Stage::Fragment, static_cast<Abi::Binding>(kind));
 }
 
+std::atomic<std::uint64_t> spansWrittenWindow{0};
+std::atomic<std::uint64_t> spansKeptWindow{0};
+
 }
 
 bool GpuHeapEnabled() {
@@ -448,6 +451,24 @@ std::optional<std::uint32_t> BindlessHeap::SamplerSlot(const std::shared_ptr<Sam
 }
 
 BindlessHeap::DataSpan BindlessHeap::Allocate(std::size_t words) {
+    SpanMark mark;
+    return Allocate(words, mark);
+}
+
+bool BindlessHeap::Held(const SpanMark& mark) {
+    if (mark.entry == 0u || mark.words == 0u) return false;
+    const auto first = mark.offset / RingChunkBytes;
+    const auto last = (mark.offset + static_cast<std::size_t>(mark.words) * sizeof(std::uint32_t) - 1u) / RingChunkBytes;
+    if (first != last) return false;
+    std::lock_guard lock(mutex);
+    const auto& chunk = ringChunks[first];
+    if (chunk.entries != mark.entry || !(chunk.open || first == ringChunk)) return false;
+    ++counts.spansKept;
+    spansKeptWindow.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+BindlessHeap::DataSpan BindlessHeap::Allocate(std::size_t words, SpanMark& mark) {
     const auto bytes = words * sizeof(std::uint32_t);
     if (bytes > RingChunkBytes) throw std::runtime_error("AGC bindless heap: per-draw data exceeds a ring chunk");
     std::lock_guard lock(mutex);
@@ -459,6 +480,9 @@ BindlessHeap::DataSpan BindlessHeap::Allocate(std::size_t words) {
     ringCursor = offset + bytes;
     for (auto chunk = offset / RingChunkBytes; chunk <= (offset + std::max<std::size_t>(bytes, 1u) - 1u) / RingChunkBytes; ++chunk) enterChunk(ringChunks, chunk, ringChunk, "shader data");
     auto* base = reinterpret_cast<std::uint32_t*>(ring->Bytes().data() + offset);
+    ++counts.spansWritten;
+    spansWrittenWindow.fetch_add(1, std::memory_order_relaxed);
+    mark = {static_cast<std::uint32_t>(offset), static_cast<std::uint32_t>(words), ringChunks[offset / RingChunkBytes].entries};
     return {static_cast<std::uint32_t>(offset), std::span<std::uint32_t>(base, words)};
 }
 
@@ -474,6 +498,7 @@ void BindlessHeap::enterChunk(std::vector<Chunk>& chunks, std::size_t index, std
         chunk.serial = 0u;
     }
     chunk.open = true;
+    ++chunk.entries;
 }
 
 VkDeviceSize BindlessHeap::ImageHeapOffset(std::uint32_t kind) const {
@@ -677,7 +702,7 @@ void reportHeapStatistics() {
     const auto plainDraws = takeCount(heapRecords[0]);
     const auto heapDispatches = takeCount(heapRecords[3]);
     const auto plainDispatches = takeCount(heapRecords[2]);
-    std::fprintf(stderr, "[gpu-heap] (10 s): draws %llu heap / %llu plain, dispatches %llu heap / %llu plain; heap binds %llu over %llu command buffers; set binds:%s; fallbacks:%s; draw stages:%s; CPU buffer copies %llu (%llu MiB)\n", static_cast<unsigned long long>(heapDraws), static_cast<unsigned long long>(plainDraws), static_cast<unsigned long long>(heapDispatches), static_cast<unsigned long long>(plainDispatches), static_cast<unsigned long long>(takeCount(heapBindWindow)), static_cast<unsigned long long>(takeCount(commandBuffersBegun)), binds.c_str(), fallbacks.c_str(), stageReasons.c_str(), static_cast<unsigned long long>(takeCount(cpuBufferCopies)), static_cast<unsigned long long>(takeCount(cpuBufferCopyBytes) >> 20u));
+    std::fprintf(stderr, "[gpu-heap] (10 s): draws %llu heap / %llu plain, dispatches %llu heap / %llu plain; heap binds %llu over %llu command buffers; set binds:%s; fallbacks:%s; draw stages:%s; CPU buffer copies %llu (%llu MiB); ring spans %llu written / %llu kept\n", static_cast<unsigned long long>(heapDraws), static_cast<unsigned long long>(plainDraws), static_cast<unsigned long long>(heapDispatches), static_cast<unsigned long long>(plainDispatches), static_cast<unsigned long long>(takeCount(heapBindWindow)), static_cast<unsigned long long>(takeCount(commandBuffersBegun)), binds.c_str(), fallbacks.c_str(), stageReasons.c_str(), static_cast<unsigned long long>(takeCount(cpuBufferCopies)), static_cast<unsigned long long>(takeCount(cpuBufferCopyBytes) >> 20u), static_cast<unsigned long long>(takeCount(spansWrittenWindow)), static_cast<unsigned long long>(takeCount(spansKeptWindow)));
 }
 
 void forgetHeapBinding(VkCommandBuffer commands) {
@@ -747,7 +772,10 @@ VkDeviceAddress BindlessHeap::RingAddress() const {
 void BindlessHeap::Submitted(Recorder& recorder, std::uint64_t serial) {
     std::lock_guard lock(mutex);
     for (std::size_t index = 0; index < ringChunks.size(); ++index) {
-        if (ringChunks[index].open || index == ringChunk) ringChunks[index] = {&recorder, serial, index == ringChunk};
+        if (!ringChunks[index].open && index != ringChunk) continue;
+        ringChunks[index].recorder = &recorder;
+        ringChunks[index].serial = serial;
+        ringChunks[index].open = index == ringChunk;
     }
 }
 

@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BindlessHeap.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
@@ -620,8 +621,14 @@ private:
         std::vector<std::uint32_t> samplerGenerations;
         std::uint64_t slotSerial = 0;
         std::vector<std::pair<std::uint32_t, std::uint32_t>> dataPatches;
+        struct KeptSpan {
+            std::vector<std::uint32_t> words;
+            BindlessHeap::SpanMark mark;
+        };
+        KeptSpan data, flat, map;
     };
     std::array<HeapStageState, ShaderRecompiler::RuntimeAbi::StageCount> heapStages;
+    std::uint32_t heapSpan(HeapStageState::KeptSpan& kept, std::span<const std::uint32_t> words);
     static constexpr std::int64_t HeapRingDataFirst = -2;
     static constexpr std::int64_t HeapRingData(std::size_t stage) { return HeapRingDataFirst - static_cast<std::int64_t>(stage); }
     static constexpr bool IsHeapRingData(std::int64_t allocation) { return allocation <= HeapRingDataFirst && allocation > HeapRingDataFirst - static_cast<std::int64_t>(ShaderRecompiler::RuntimeAbi::StageCount); }

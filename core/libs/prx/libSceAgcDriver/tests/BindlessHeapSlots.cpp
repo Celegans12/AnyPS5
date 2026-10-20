@@ -82,6 +82,24 @@ void samplerSlots(const Context& context) {
     require(heap.SamplerGeneration(*slot) != generation, "a freed sampler slot moves its generation");
 }
 
+void ringSpans(const Context& context) {
+    BindlessHeap heap(context);
+    BindlessHeap::SpanMark unwritten;
+    require(!heap.Held(unwritten), "a span never written is not held");
+    BindlessHeap::SpanMark first;
+    const auto span = heap.Allocate(16u, first);
+    require(first.offset == span.offset && first.words == 16u && heap.Held(first), "a span written in the open chunk is held");
+    constexpr std::size_t chunkWords = (4u << 20u) / sizeof(std::uint32_t);
+    BindlessHeap::SpanMark filler;
+    static_cast<void>(heap.Allocate(chunkWords - 1024u, filler));
+    BindlessHeap::SpanMark crossing;
+    static_cast<void>(heap.Allocate(4096u, crossing));
+    require(!heap.Held(crossing), "a span over two chunks is never kept");
+    require(heap.Held(first), "a span stays held while its batch keeps the chunk open");
+    const auto counts = heap.Statistics();
+    require(counts.spansWritten == 3u && counts.spansKept == 2u, "three spans written and two kept");
+}
+
 }
 
 void heapComesBack(const Context& context, VkImageView view) {
@@ -146,6 +164,7 @@ int main(int argc, char** argv) {
             const PlaceholderImages placeholders(context);
             textureSlots(context, placeholders.View(Abi::FirstImageBinding));
             samplerSlots(context);
+            ringSpans(context);
             device->WaitIdle();
         }
         device.reset();

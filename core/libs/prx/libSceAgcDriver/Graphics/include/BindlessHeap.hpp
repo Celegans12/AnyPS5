@@ -56,6 +56,13 @@ public:
         std::span<std::uint32_t> words;
     };
     DataSpan Allocate(std::size_t words);
+    struct SpanMark {
+        std::uint32_t offset = 0;
+        std::uint32_t words = 0;
+        std::uint64_t entry = 0;
+    };
+    DataSpan Allocate(std::size_t words, SpanMark& mark);
+    bool Held(const SpanMark& mark);
 
     static constexpr std::uint32_t SamplerKind = static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Samplers);
     void Submitted(Recorder& recorder, std::uint64_t serial);
@@ -63,6 +70,7 @@ public:
     struct Counts {
         std::uint64_t textures = 0, samplers = 0, full = 0, ringWraps = 0;
         std::uint64_t slotsFreed = 0, slotsReused = 0, sweeps = 0, chunkWaits = 0;
+        std::uint64_t spansWritten = 0, spansKept = 0;
     };
     Counts Statistics() const;
 
@@ -83,6 +91,7 @@ private:
         Recorder* recorder = nullptr;
         std::uint64_t serial = 0;
         bool open = false;
+        std::uint64_t entries = 0;
     };
     std::vector<Chunk> ringChunks;
     std::size_t ringChunk = ~std::size_t{0};
