@@ -4792,8 +4792,6 @@ struct RecordedDispatch {
     std::uint64_t cpuArguments = 0;
     int cpuReason = 0;
     std::shared_ptr<Graphics::ShaderResources::DrawBindings> bindings{};
-    std::uint64_t cpuArguments = 0;
-    int cpuReason = 0;
 };
 
 VkDevice VulkanDevice::Device() const {

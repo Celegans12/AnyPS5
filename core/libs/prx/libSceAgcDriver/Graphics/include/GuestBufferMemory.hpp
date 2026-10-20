@@ -58,7 +58,6 @@ struct HostImport {
     std::uint64_t pinnedBytes = 0;
     std::uint32_t memoryType = std::numeric_limits<std::uint32_t>::max();
     std::uint64_t backingSerial = 0;
-    mutable std::uint64_t spaceSerial = 0;
 };
 
 inline VkDeviceSize HostImportOffset(const HostImport& import, std::uint64_t address) {
