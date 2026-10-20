@@ -1942,6 +1942,11 @@ void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>
     for (const auto& resident : residents) {
         if (resident != nullptr) resident->FinishLinearDraw();
     }
+    static const bool linearDrawSync = std::getenv("APS5_LINEAR_DRAW_SYNC") != nullptr;
+    if (linearDrawSync && std::any_of(residents.begin(), residents.end(), [](const auto& resident) { return resident != nullptr && resident->Descriptor().tileMode == TextureTileMode::kLinear; })) {
+        Recorder::CountSync(3);
+        recorder.Sync();
+    }
 }
 
 // What recordDraw records from: the recorder, the resources, the pipeline and framebuffer, the
