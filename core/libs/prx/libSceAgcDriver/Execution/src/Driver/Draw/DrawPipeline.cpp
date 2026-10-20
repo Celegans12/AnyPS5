@@ -206,6 +206,10 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     heldReadRanges.fetch_add(reads.size(), std::memory_order_relaxed);
     const bool prepared = static_cast<bool>(prepare);
     items.push_back({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), std::move(reads), nowNs(), std::move(prepare)});
+    for (const auto& [begin, limit] : items.back().reads) {
+        items.back().readBounds.first = std::min(items.back().readBounds.first, begin);
+        items.back().readBounds.second = std::max(items.back().readBounds.second, limit);
+    }
     outstanding.fetch_add(1, std::memory_order_release);
     if (!thread.joinable()) {
         thread = std::thread([this] { run(); });
@@ -416,7 +420,9 @@ bool DrawPipeline::HeldReads(std::uint64_t address, std::size_t bytes) {
     auto& pipeline = Queue0();
     std::lock_guard lock(pipeline.mutex);
     heldReadQueries.fetch_add(1, std::memory_order_relaxed);
+    static const bool bounds = std::getenv("APS5_NO_HELD_READ_BOUNDS") == nullptr;
     for (const auto& item : pipeline.items) {
+        if (bounds && (address >= item.readBounds.second || item.readBounds.first >= end)) continue;
         for (const auto& [begin, limit] : item.reads) {
             if (address >= limit || begin >= end) continue;
             heldReadHits.fetch_add(1, std::memory_order_relaxed);
@@ -428,7 +434,9 @@ bool DrawPipeline::HeldReads(std::uint64_t address, std::size_t bytes) {
 
 void DrawPipeline::ReleaseRunningReads() {
     std::lock_guard lock(mutex);
-    if (!items.empty()) items.front().reads.clear();
+    if (items.empty()) return;
+    items.front().reads.clear();
+    items.front().readBounds = {~std::uint64_t{0}, 0};
 }
 
 std::optional<std::uint64_t> DrawPipeline::PendingLabel(std::uint64_t address, std::size_t bytes) {

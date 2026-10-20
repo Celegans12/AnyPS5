@@ -94,6 +94,8 @@ private:
         std::int64_t pushedNs = 0;
         Prepare prepare;
         bool prepareTaken = false;
+        // The span of `reads` (HeldReads skips an item it misses; APS5_NO_HELD_READ_BOUNDS=1 scans every range).
+        Range readBounds{~std::uint64_t{0}, 0};
     };
     DrawPipeline() = default;
     template<typename TRanges, typename TBounds>
