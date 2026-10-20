@@ -39,6 +39,18 @@ std::uint32_t fragmentBinding(std::uint32_t kind) {
 std::atomic<std::uint64_t> spansWrittenWindow{0};
 std::atomic<std::uint64_t> spansKeptWindow{0};
 std::atomic<std::uint64_t> spansExpiredWindow{0};
+std::atomic<std::uint64_t> ringWrapWindow{0};
+std::atomic<std::uint64_t> chunkWaitWindow{0}, chunkWaitNanoseconds{0}, chunkWaitMaxNanoseconds{0};
+std::atomic<std::uint64_t> sweepWindow{0}, sweepNanoseconds{0}, sweepMaxNanoseconds{0};
+
+void noteTimed(std::atomic<std::uint64_t>& count, std::atomic<std::uint64_t>& total, std::atomic<std::uint64_t>& maximum, std::chrono::steady_clock::time_point start) {
+    const auto elapsed = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+    count.fetch_add(1, std::memory_order_relaxed);
+    total.fetch_add(elapsed, std::memory_order_relaxed);
+    auto seen = maximum.load(std::memory_order_relaxed);
+    while (elapsed > seen && !maximum.compare_exchange_weak(seen, elapsed, std::memory_order_relaxed)) {
+    }
+}
 
 }
 
@@ -317,6 +329,10 @@ std::optional<std::uint32_t> BindlessHeap::takeSlotLocked(std::uint32_t kind) {
 
 void BindlessHeap::sweepLocked(std::vector<std::shared_ptr<Texture>>& dropped) {
     ++counts.sweeps;
+    struct Timed {
+        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+        ~Timed() { noteTimed(sweepWindow, sweepNanoseconds, sweepMaxNanoseconds, start); }
+    } timed;
     const auto firstDropped = dropped.size();
     for (std::uint32_t kind = 0; kind < owners.size(); ++kind) {
         auto& kindOwners = owners[kind];
@@ -538,6 +554,7 @@ BindlessHeap::DataSpan BindlessHeap::Allocate(std::size_t words, SpanMark& mark)
     if (offset + bytes > RingBytes) {
         offset = 0;
         ++counts.ringWraps;
+        ringWrapWindow.fetch_add(1, std::memory_order_relaxed);
     }
     const auto keptAhead = [&] {
         for (auto chunk = offset / RingChunkBytes; chunk <= (offset + std::max<std::size_t>(bytes, 1u) - 1u) / RingChunkBytes; ++chunk) {
@@ -551,6 +568,7 @@ BindlessHeap::DataSpan BindlessHeap::Allocate(std::size_t words, SpanMark& mark)
         if (offset + bytes > RingBytes) {
             offset = 0;
             ++counts.ringWraps;
+            ringWrapWindow.fetch_add(1, std::memory_order_relaxed);
         }
         ++counts.keptChunksSkipped;
     }
@@ -571,7 +589,9 @@ void BindlessHeap::enterChunk(std::vector<Chunk>& chunks, std::size_t index, std
     if (chunk.serial != 0u) {
         ++counts.chunkWaits;
         if (!chunk.recorder->HasTimeline()) throw std::runtime_error(std::string("AGC bindless heap: the ") + what + " ring needs the recorder timeline to wait for a batch");
+        const auto waitStart = std::chrono::steady_clock::now();
         chunk.recorder->WaitSerial(chunk.serial);
+        noteTimed(chunkWaitWindow, chunkWaitNanoseconds, chunkWaitMaxNanoseconds, waitStart);
         chunk.serial = 0u;
     }
     chunk.open = true;
@@ -792,7 +812,7 @@ void reportHeapStatistics() {
     const auto plainDraws = takeCount(heapRecords[0]);
     const auto heapDispatches = takeCount(heapRecords[3]);
     const auto plainDispatches = takeCount(heapRecords[2]);
-    std::fprintf(stderr, "[gpu-heap] (10 s): draws %llu heap / %llu plain, dispatches %llu heap / %llu plain; heap binds %llu over %llu command buffers; set binds:%s; fallbacks:%s; draw stages:%s; CPU buffer copies %llu (%llu MiB); ring spans %llu written / %llu kept / %llu expired\n", static_cast<unsigned long long>(heapDraws), static_cast<unsigned long long>(plainDraws), static_cast<unsigned long long>(heapDispatches), static_cast<unsigned long long>(plainDispatches), static_cast<unsigned long long>(takeCount(heapBindWindow)), static_cast<unsigned long long>(takeCount(commandBuffersBegun)), binds.c_str(), fallbacks.c_str(), stageReasons.c_str(), static_cast<unsigned long long>(takeCount(cpuBufferCopies)), static_cast<unsigned long long>(takeCount(cpuBufferCopyBytes) >> 20u), static_cast<unsigned long long>(takeCount(spansWrittenWindow)), static_cast<unsigned long long>(takeCount(spansKeptWindow)), static_cast<unsigned long long>(takeCount(spansExpiredWindow)));
+    std::fprintf(stderr, "[gpu-heap] (10 s): draws %llu heap / %llu plain, dispatches %llu heap / %llu plain; heap binds %llu over %llu command buffers; set binds:%s; fallbacks:%s; draw stages:%s; CPU buffer copies %llu (%llu MiB); ring spans %llu written / %llu kept / %llu expired, %llu ring wraps; chunk waits %llu (%.2f ms, max %.2f ms); sweeps %llu (%.2f ms, max %.2f ms)\n", static_cast<unsigned long long>(heapDraws), static_cast<unsigned long long>(plainDraws), static_cast<unsigned long long>(heapDispatches), static_cast<unsigned long long>(plainDispatches), static_cast<unsigned long long>(takeCount(heapBindWindow)), static_cast<unsigned long long>(takeCount(commandBuffersBegun)), binds.c_str(), fallbacks.c_str(), stageReasons.c_str(), static_cast<unsigned long long>(takeCount(cpuBufferCopies)), static_cast<unsigned long long>(takeCount(cpuBufferCopyBytes) >> 20u), static_cast<unsigned long long>(takeCount(spansWrittenWindow)), static_cast<unsigned long long>(takeCount(spansKeptWindow)), static_cast<unsigned long long>(takeCount(spansExpiredWindow)), static_cast<unsigned long long>(takeCount(ringWrapWindow)), static_cast<unsigned long long>(takeCount(chunkWaitWindow)), takeCount(chunkWaitNanoseconds) / 1e6, takeCount(chunkWaitMaxNanoseconds) / 1e6, static_cast<unsigned long long>(takeCount(sweepWindow)), takeCount(sweepNanoseconds) / 1e6, takeCount(sweepMaxNanoseconds) / 1e6);
 }
 
 void forgetHeapBinding(VkCommandBuffer commands) {
