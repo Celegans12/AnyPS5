@@ -217,9 +217,35 @@ struct HeapWalkEntry {
 
 constexpr std::size_t HeapWalkWays = 4;
 
-std::unordered_map<std::uint64_t, std::vector<HeapWalkEntry>>& heapWalkMemo() {
+constexpr std::size_t HeapWalkMemoKeys = 16384;
+
+struct HeapWalkMemo {
+    std::unordered_map<std::uint64_t, std::vector<HeapWalkEntry>> current;
+    std::unordered_map<std::uint64_t, std::vector<HeapWalkEntry>> previous;
+
+    std::vector<HeapWalkEntry>* find(std::uint64_t key) {
+        if (const auto found = current.find(key); found != current.end()) return &found->second;
+        const auto old = previous.find(key);
+        if (old == previous.end()) return nullptr;
+        auto moved = std::move(old->second);
+        previous.erase(old);
+        auto& ways = slot(key);
+        ways = std::move(moved);
+        return &ways;
+    }
+
+    std::vector<HeapWalkEntry>& slot(std::uint64_t key) {
+        if (current.size() >= HeapWalkMemoKeys && !current.contains(key)) {
+            previous = std::move(current);
+            current.clear();
+        }
+        return current[key];
+    }
+};
+
+HeapWalkMemo& heapWalkMemo() {
     struct WalkMemoStorage {};
-    auto& memo = HostThreadLocal<std::unordered_map<std::uint64_t, std::vector<HeapWalkEntry>>, WalkMemoStorage>();
+    auto& memo = HostThreadLocal<HeapWalkMemo, WalkMemoStorage>();
     return memo;
 }
 
@@ -254,10 +280,9 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> MaterializeHeapStage(co
         if (memoOn) {
             memoKey = (invocation.VariantId() * 0x9e3779b97f4a7c15ull ^ shaderBase) + invocation.Request().layout.pushConstantOffsetBytes;
             for (const auto word : userData) memoKey = (memoKey ^ word) * 0x100000001b3ull;
-            auto& memo = heapWalkMemo();
-            const auto found = memo.find(memoKey);
-            for (std::size_t way = 0; found != memo.end() && way < found->second.size(); ++way) {
-                const auto& entry = found->second[way];
+            auto* found = heapWalkMemo().find(memoKey);
+            for (std::size_t way = 0; found != nullptr && way < found->size(); ++way) {
+                const auto& entry = (*found)[way];
                 bool equal = entry.variant == invocation.VariantId() && entry.shaderBase == shaderBase && entry.pushOffset == invocation.Request().layout.pushConstantOffsetBytes && std::equal(entry.userData.begin(), entry.userData.end(), userData.begin(), userData.end());
                 if (!equal) continue;
                 std::size_t cursor = 0;
@@ -281,7 +306,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> MaterializeHeapStage(co
                 else *words = *entry.words;
                 if (stageReads != nullptr) *stageReads = {entry.ranges, entry.values, entry.userDataUse, entry.capture, true};
                 auto result = entry.result;
-                if (way != 0) std::rotate(found->second.begin(), found->second.begin() + static_cast<std::ptrdiff_t>(way), found->second.begin() + static_cast<std::ptrdiff_t>(way) + 1);
+                if (way != 0) std::rotate(found->begin(), found->begin() + static_cast<std::ptrdiff_t>(way), found->begin() + static_cast<std::ptrdiff_t>(way) + 1);
                 return result;
             }
         }
@@ -337,9 +362,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> MaterializeHeapStage(co
             auto result = finish(capture);
             if (stageReads != nullptr && !reads.failed && result != nullptr) *stageReads = {ranges, values, capture->userDataUse, capture, true};
             if (memoOn && !reads.failed && result != nullptr) {
-                auto& memo = heapWalkMemo();
-                if (memo.size() >= 16384) memo.clear();
-                auto& ways = memo[memoKey];
+                auto& ways = heapWalkMemo().slot(memoKey);
                 if (ways.size() >= HeapWalkWays) ways.pop_back();
                 ways.emplace(ways.begin());
                 auto& entry = ways.front();
