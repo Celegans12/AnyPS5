@@ -220,9 +220,19 @@ constexpr std::size_t HeapWalkMemoKeys = 16384;
 
 constexpr std::size_t HeapWalkDrain = 2;
 
+constexpr std::size_t HeapWalkSeenKeys = 1u << 16;
+
 struct HeapWalkMemo {
     std::unordered_map<std::uint64_t, std::vector<HeapWalkEntry>> current;
     std::unordered_map<std::uint64_t, std::vector<HeapWalkEntry>> previous;
+    std::vector<std::uint64_t> seen = std::vector<std::uint64_t>(HeapWalkSeenKeys, 0);
+
+    bool admit(std::uint64_t key) {
+        auto& last = seen[(key ^ (key >> 29)) & (HeapWalkSeenKeys - 1u)];
+        if (last == key) return true;
+        last = key;
+        return false;
+    }
 
     std::vector<HeapWalkEntry>* find(std::uint64_t key) {
         if (const auto found = current.find(key); found != current.end()) return &found->second;
@@ -275,15 +285,19 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> MaterializeHeapStage(co
         reads.accessible.clear();
         reads.failed = false;
         reads.page = ~std::uint64_t{0};
+        Graphics::HeapCostScope snapshotCost(Graphics::HeapCost::Guards);
         const auto before = Graphics::Recorder::PendingWriteSnapshot();
+        snapshotCost.Stop();
         const auto generation = GuestMemory::TrackerGeneration();
         const bool memoOn = words != nullptr && !invocation.Request().context.vertex.has_value();
         std::uint64_t memoKey = 0;
+        bool memoKnown = false;
         Graphics::HeapCostScope memoCost(Graphics::HeapCost::WalkMemo);
         if (memoOn) {
             memoKey = (invocation.VariantId() * 0x9e3779b97f4a7c15ull ^ shaderBase) + invocation.Request().layout.pushConstantOffsetBytes;
             for (const auto word : userData) memoKey = (memoKey ^ word) * 0x100000001b3ull;
             auto* found = heapWalkMemo().find(memoKey);
+            memoKnown = found != nullptr;
             for (std::size_t way = 0; found != nullptr && way < found->size(); ++way) {
                 const auto& entry = (*found)[way];
                 bool equal = entry.variant == invocation.VariantId() && entry.shaderBase == shaderBase && entry.pushOffset == invocation.Request().layout.pushConstantOffsetBytes && std::equal(entry.userData.begin(), entry.userData.end(), userData.begin(), userData.end());
@@ -364,12 +378,15 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> MaterializeHeapStage(co
         for (std::size_t i = 0; settled && i < ranges.size(); ++i) settled = GuestMemory::NewestStamp(ranges[i].first, static_cast<std::size_t>(ranges[i].second - ranges[i].first)) <= generation;
         walkCost.Stop();
         if (settled) {
+            Graphics::HeapCostScope guardCost(Graphics::HeapCost::Guards);
             for (const auto& [begin, end] : ranges) GuestMemory::GuardRead(begin, static_cast<std::size_t>(end - begin));
+            guardCost.Stop();
             Graphics::HeapCostScope materializeCost(Graphics::HeapCost::Materialize);
             auto result = finish(capture);
             materializeCost.Stop();
             if (stageReads != nullptr && !reads.failed && result != nullptr) *stageReads = {ranges, values, capture->userDataUse, capture, true};
-            if (memoOn && !reads.failed && result != nullptr) {
+            Graphics::HeapCostScope insertCost(Graphics::HeapCost::MemoInsert);
+            if (memoOn && !reads.failed && result != nullptr && (memoKnown || heapWalkMemo().admit(memoKey))) {
                 auto& ways = heapWalkMemo().slot(memoKey);
                 if (ways.size() >= HeapWalkWays) ways.pop_back();
                 ways.emplace(ways.begin());
