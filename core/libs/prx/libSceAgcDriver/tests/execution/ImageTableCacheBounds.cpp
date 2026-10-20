@@ -65,6 +65,13 @@ constexpr std::size_t WideKernelOffset = 2048;
 constexpr std::size_t WideHeapOffset = 65536;
 constexpr std::array<std::size_t, 3> WideSlots{SrtSlots - 1u, SrtSlots - 2u, SrtSlots - 3u};
 constexpr std::array<std::uint32_t, 17> WideTableCode{0xf4080100u, 0xfa000000u, 0xf4080200u, 0xfa000010u, 0xf4080300u, 0xfa000020u, 0xf4080700u, 0xfa000030u, 0x7e200500u, 0x9310b010u, 0xf42c0502u, 0x20000000u, 0xf09c0f08u, 0x00450000u, 0xe0700000u, 0x80070000u, 0xbf810000u};
+constexpr std::uint32_t Format32UInt = 20;
+constexpr std::uint32_t AtomicRecords = 16;
+constexpr std::uint32_t AtomicWidth = 64;
+constexpr std::size_t AtomicKernelOffset = 1024;
+constexpr std::size_t AtomicSurfaceBytes = AtomicWidth * 4u;
+constexpr std::uint32_t AtomicElement = 5;
+constexpr std::array<std::uint32_t, 24> AtomicTableCode{0xf4080100u, 0xfa000000u, 0xf4080200u, 0xfa000010u, 0xf4080300u, 0xfa000020u, 0xf4080700u, 0xfa000030u, 0x4a220085u, 0x7e200511u, 0x8f108510u, 0xf42c0502u, 0x20000000u, 0x7e020280u, 0x7e040281u, 0x34060082u, 0xbf8c3f70u, 0xf0442108u, 0x00050200u, 0xbf8c3f70u, 0xe0701000u, 0x80070203u, 0xbf8c3f70u, 0xbf810000u};
 constexpr std::array<std::uint32_t, 17> TableCode{0xf4080100u, 0xfa000000u, 0xf4080200u, 0xfa000010u, 0xf4080300u, 0xfa000020u, 0xf4080700u, 0xfa000030u, 0x7e200500u, 0x8f108510u, 0xf42c0502u, 0x20000000u, 0xf09c0f08u, 0x00450000u, 0xe0700000u, 0x80070000u, 0xbf810000u};
 
 class GuestBlock {
@@ -259,6 +266,39 @@ void VouchedLookups(const GuestBlock& block) {
     std::puts("image table vouched lookups passed");
 }
 
+std::uint32_t AtomicStart(std::uint32_t texel) { return texel * 7u + 3u; }
+
+void AtomicTable(const GuestBlock& block) {
+    std::memcpy(block.Bytes(AtomicKernelOffset), AtomicTableCode.data(), sizeof(AtomicTableCode));
+    for (std::uint32_t record = 0; record < AtomicRecords; ++record) {
+        const auto surface = TexturesOffset + static_cast<std::size_t>(record) * AtomicSurfaceBytes;
+        auto* texels = reinterpret_cast<std::uint32_t*>(block.Bytes(surface));
+        for (std::uint32_t texel = 0; texel < AtomicWidth; ++texel) texels[texel] = AtomicStart(texel) + record * 1000u;
+        const auto address = block.At(surface);
+        const std::array<std::uint32_t, 8> words{static_cast<std::uint32_t>(address >> 8u), static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (Format32UInt << 20u) | (((AtomicWidth - 1u) & 3u) << 30u), (AtomicWidth - 1u) >> 2u, 0xfacu | (Type2D << 28u), 0u, 0u, 0u, 0u};
+        std::memcpy(block.Bytes(HeapOffset + static_cast<std::size_t>(record) * Stride), words.data(), sizeof(words));
+    }
+    auto* srt = reinterpret_cast<std::uint32_t*>(block.Bytes(SrtOffset));
+    std::fill(srt, srt + SrtBytes / 4u, 0u);
+    const auto heap = V(block.At(HeapOffset), Stride, AtomicRecords);
+    const auto output = V(block.At(OutputOffset), 0u, 4096u);
+    std::copy(heap.begin(), heap.end(), srt);
+    std::copy(output.begin(), output.end(), srt + 12);
+    const auto heapStages = AgcDriver::Graphics::HeapComputeStages();
+    for (std::uint32_t dispatch = 0; dispatch < 2; ++dispatch) {
+        std::memset(block.Bytes(OutputOffset), 0xee, AtomicWidth * 4u);
+        Dispatch(block, 0, AtomicKernelOffset);
+        std::array<std::uint32_t, AtomicWidth> returned{};
+        AgcDriver::GuestMemory::Read(block.At(OutputOffset), std::as_writable_bytes(std::span(returned)));
+        for (std::uint32_t texel = 0; texel < AtomicWidth; ++texel) {
+            const auto expected = AtomicStart(texel) + AtomicElement * 1000u + dispatch;
+            Require(returned[texel] == expected, "image table atomics: dispatch " + std::to_string(dispatch) + " texel " + std::to_string(texel) + " returned " + std::to_string(returned[texel]) + ", expected " + std::to_string(expected));
+        }
+    }
+    if (AgcDriver::Graphics::DescriptorHeapEnabled()) Require(AgcDriver::Graphics::HeapComputeStages() > heapStages, "image table atomics: the dispatches did not take the descriptor heap");
+    std::puts("image table atomics passed");
+}
+
 struct QueuedDraw {
     std::atomic<bool> release{false};
 
@@ -394,6 +434,11 @@ int main(int argc, char** argv) {
         Prepare(block);
         if (argc == 2 && std::string(argv[1]) == "--vouched-lookups") {
             VouchedLookups(block);
+            AgcDriverShutdown_nid_postfix();
+            return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--atomic-table") {
+            AtomicTable(block);
             AgcDriverShutdown_nid_postfix();
             return 0;
         }

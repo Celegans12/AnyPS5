@@ -103,7 +103,9 @@ std::uint32_t TableStorageImagePointer(SpirvEmitterState& state, DescriptorBindi
     const auto found = std::find_if(state.tableImageVariables.begin(), state.tableImageVariables.end(), [&](const SpirvTableImageVariable& variable) { return variable.kind == kind; });
     if (found == state.tableImageVariables.end() || !state.tableAccess.active) ExitDescriptorBindingFailure(state, kind, resource, "image storage table array was not emitted for the mode");
     const auto pointer = state.module.AllocateId();
-    state.module.AddFunction(spv::OpAccessChain, pointerType, pointer, found->variable, state.tableAccess.heap ? tableHeapSlot(state, 1u, state.tableAccess.element, RuntimeAbi::GpuImageHeapSlots) : state.tableAccess.element);
+    const auto value = static_cast<std::uint32_t>(kind);
+    const auto part = RuntimeAbi::AtomicImageKind(value) ? 3u : RuntimeAbi::Atomic64ImageKind(value) ? 4u : 1u;
+    state.module.AddFunction(spv::OpAccessChain, pointerType, pointer, found->variable, state.tableAccess.heap ? tableHeapSlot(state, part, state.tableAccess.element, RuntimeAbi::GpuImageHeapSlots) : state.tableAccess.element);
     DecorateTableNonUniform(state, pointer);
     return pointer;
 }

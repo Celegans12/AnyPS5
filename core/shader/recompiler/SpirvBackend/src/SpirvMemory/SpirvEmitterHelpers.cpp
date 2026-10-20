@@ -553,7 +553,8 @@ void DefineDescriptors(SpirvEmitterState& state) {
                     if (std::any_of(state.tableImageVariables.begin(), state.tableImageVariables.end(), [&](const SpirvTableImageVariable& variable) { return variable.kind == kind; })) continue;
                     const auto name = "table_images_" + std::to_string(static_cast<std::uint32_t>(kind));
                     if (state.tableHeap) {
-                        const auto heapKind = binding.kind == DescriptorBindingKind::ImageStorageTable ? RuntimeAbi::FirstStorageImageBinding : RuntimeAbi::FirstImageBinding;
+                        const auto value = static_cast<std::uint32_t>(kind);
+                        const auto heapKind = binding.kind != DescriptorBindingKind::ImageStorageTable ? RuntimeAbi::FirstImageBinding : RuntimeAbi::AtomicImageKind(value) ? RuntimeAbi::FirstAtomicImageBinding : RuntimeAbi::Atomic64ImageKind(value) ? RuntimeAbi::FirstAtomic64ImageBinding : RuntimeAbi::FirstStorageImageBinding;
                         const auto type = state.module.Type(spv::OpTypeArray, ImageType(state, mode), ConstantU32(state, RuntimeAbi::GpuImageHeapSlots));
                         const auto variable = state.module.DefineGlobalVariable(TypePointer(state, spv::StorageClassUniformConstant, type), spv::StorageClassUniformConstant);
                         state.module.AddName(variable, name.c_str());

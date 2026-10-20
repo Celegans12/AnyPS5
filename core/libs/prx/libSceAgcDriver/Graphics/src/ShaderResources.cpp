@@ -6156,6 +6156,37 @@ void ShaderResources::writeHeapTableMap(const CompiledShader& shader, std::size_
         Require(slot.has_value(), "the global sampler heap is full");
         map.push_back(*slot);
     }
+    const auto atomicElement = [&](std::size_t element, bool wide) {
+        if (table->images == nullptr) return false;
+        const auto& flags = wide ? table->images->imageAtomic64 : table->images->imageAtomic;
+        return element < flags.size() && flags[element];
+    };
+    const auto anyAtomic = [&](bool wide) {
+        for (std::size_t element = 0; element < elements; ++element) {
+            if (atomicElement(element, wide)) return true;
+        }
+        return false;
+    };
+    if (anyAtomic(false) || anyAtomic(true)) {
+        Require(table->tableSamplers.size() <= elements, "an image table with atomics has more table samplers than elements");
+        map.resize(base + 3u * elements, fallbackSampler);
+        for (const bool wide : {false, true}) {
+            const auto kind = wide ? Abi::FirstAtomic64ImageBinding : Abi::FirstAtomicImageBinding;
+            const auto absent = heap.AbsentSlot(kind, context.nullDescriptors ? VK_NULL_HANDLE : context.placeholderImages->View(kind));
+            for (std::size_t element = 0; element < elements; ++element) {
+                const auto index = element < table->elementStorage.size() ? table->elementStorage[element] : std::numeric_limits<std::size_t>::max();
+                if (!atomicElement(element, wide) || index == std::numeric_limits<std::size_t>::max() || storageTextures[index] == nullptr) {
+                    map.push_back(absent);
+                    continue;
+                }
+                auto& image = *storageTextures[index];
+                const auto view = wide ? image.Atomic64View(storageMips[index], storageFirstLayer[index]) : image.AtomicView(storageMips[index], storageFirstLayer[index]);
+                const auto slot = heap.StorageSlot(kind, storageTextures[index], view);
+                Require(slot.has_value(), "the global atomic image heap is full");
+                map.push_back(*slot);
+            }
+        }
+    }
     if (map.size() == base) map.push_back(sampledAbsent);
     heapTableMaps[stageIndex] = heapSpan(heapStages[stageIndex].map, map);
     heapTableMapSet[stageIndex] = true;

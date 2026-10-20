@@ -19,6 +19,10 @@ inline constexpr std::uint32_t FirstComparisonImageBinding = 22u;
 inline constexpr std::uint32_t FirstStorageImageBinding = 29u;
 inline constexpr std::uint32_t ImageBindingCount = 56u;
 inline constexpr bool GpuHeapStorageKind(std::uint32_t kind) { return kind >= FirstStorageImageBinding && kind < FirstImageBinding + ImageBindingCount; }
+inline constexpr std::uint32_t FirstAtomicImageBinding = FirstStorageImageBinding + 14u;
+inline constexpr std::uint32_t FirstAtomic64ImageBinding = FirstStorageImageBinding + 21u;
+inline constexpr bool AtomicImageKind(std::uint32_t kind) { return kind >= FirstAtomicImageBinding && kind < FirstAtomic64ImageBinding; }
+inline constexpr bool Atomic64ImageKind(std::uint32_t kind) { return kind >= FirstAtomic64ImageBinding && kind < FirstImageBinding + ImageBindingCount; }
 
 enum class Binding : std::uint32_t {
     Buffers = 0u,

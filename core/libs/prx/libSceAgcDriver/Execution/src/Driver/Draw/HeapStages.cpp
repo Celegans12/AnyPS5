@@ -119,7 +119,6 @@ Graphics::HeapStageReason HeapStageIneligibility(ShaderRecompiler::ShaderStage s
     if (stage != ShaderRecompiler::ShaderStage::Fragment && !heapVertex) return Reason::FragmentOffHeap;
     if (plan->stage == ShaderRecompiler::IrShaderStage::Unknown || plan->stage == ShaderRecompiler::IrShaderStage::Fetch) return Reason::PlanStage;
     if (!ShaderRecompiler::HeapFragmentEligible(*plan)) return Reason::UnresolvedImageSource;
-    if (std::any_of(plan->info.images.begin(), plan->info.images.end(), [](const ShaderRecompiler::ImageResource& image) { return image.table != ShaderRecompiler::NoTable && (image.atomic || image.atomic64); })) return Reason::AtomicTableImage;
     return Reason::Heap;
 }
 
