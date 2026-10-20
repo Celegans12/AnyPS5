@@ -6271,6 +6271,12 @@ void ShaderResources::writeHeapStage(const CompiledShader& shader) {
     for (const auto& binding : program.bindings) {
         if (binding.role != ShaderRecompiler::DescriptorRole::ShaderData && binding.role != ShaderRecompiler::DescriptorRole::FlattenedSrt) continue;
         const auto& words = binding.role == ShaderRecompiler::DescriptorRole::FlattenedSrt && shader.heap != nullptr && !shader.heap->flattenedSrt.empty() ? shader.heap->flattenedSrt : DrawGuestWords(shader, binding);
+        const auto userData = shader.heap != nullptr ? std::span<const std::uint32_t>(shader.heap->userData) : std::span<const std::uint32_t>{};
+        const bool sameInput = binding.role == ShaderRecompiler::DescriptorRole::ShaderData && current && stageState.dataInput.size() == words.size() + userData.size() && std::equal(words.begin(), words.end(), stageState.dataInput.begin()) && std::equal(userData.begin(), userData.end(), stageState.dataInput.begin() + static_cast<std::ptrdiff_t>(words.size()));
+        if (sameInput && !verifySlots && heap.Held(stageState.data.mark)) {
+            heapOffsets[dataIndex] = stageState.data.mark.offset;
+            continue;
+        }
         if (binding.role == ShaderRecompiler::DescriptorRole::ShaderData) ValidateRuntimeResources(shader, words);
         if (binding.role != ShaderRecompiler::DescriptorRole::ShaderData) {
             heapOffsets[flatIndex] = heapSpan(stageState.flat, words);
@@ -6322,7 +6328,10 @@ void ShaderResources::writeHeapStage(const CompiledShader& shader) {
                 stageDataWords[stageIndex].assign(patched.begin(), patched.end());
                 stageDataIndex[stageIndex] = dataIndex;
             }
+            if (verifySlots && sameInput && !std::ranges::equal(stageState.data.words, patched)) throw std::runtime_error("AGC graphics: a GPU-mode stage's shader data changed although its inputs and slots did not");
             heapOffsets[dataIndex] = heapSpan(stageState.data, patched);
+            stageState.dataInput.assign(words.begin(), words.end());
+            stageState.dataInput.insert(stageState.dataInput.end(), userData.begin(), userData.end());
         }
     }
 }

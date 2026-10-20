@@ -626,6 +626,7 @@ private:
             BindlessHeap::SpanMark mark;
         };
         KeptSpan data, flat, map;
+        std::vector<std::uint32_t> dataInput;
     };
     std::array<HeapStageState, ShaderRecompiler::RuntimeAbi::StageCount> heapStages;
     std::uint32_t heapSpan(HeapStageState::KeptSpan& kept, std::span<const std::uint32_t> words);
