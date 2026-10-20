@@ -615,11 +615,16 @@ public:
                 continue;
             }
             if (op == spv::OpLoad && instruction.size() == 4u && tablePointers.contains(instruction[3])) continue;
-            if (op == spv::OpName || op == spv::OpDecorate || op == spv::OpVariable || op == spv::OpEntryPoint) continue;
-            for (std::size_t index = 1; index < instruction.size(); ++index) {
+            if (op == spv::OpVariable || op == spv::OpEntryPoint) continue;
+            std::uint32_t switchLiteralWords = 1u;
+            if (op == spv::OpSwitch && instruction.size() > 1u) {
+                const auto* selectorType = resultTypes.find(instruction[1]);
+                if (selectorType != nullptr && types.contains(*selectorType) && types.at(*selectorType).width == 64u) switchLiteralWords = 2u;
+            }
+            VisitIdOperands(instruction, switchLiteralWords, [&](std::size_t index) {
                 privateTables.erase(instruction[index]);
                 if (const auto* table = tablePointers.find(instruction[index])) privateTables.erase(*table);
-            }
+            });
         }
     }
 
