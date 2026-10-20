@@ -942,7 +942,7 @@ void AllocationFailureReportsHeapBudgets() {
         context.memory.memoryHeapCount = 2;
         context.bufferPool = std::make_shared<BufferPool>(context);
         const auto beforeAllocation = diagnosticBudgetQueries;
-        mock.results = {VK_ERROR_DEVICE_LOST};
+        mock.results = {VK_ERROR_DEVICE_LOST, VK_ERROR_DEVICE_LOST};
         try {
             DeviceBuffer buffer(context, 4 * MiB, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         } catch (const std::exception& error) {
@@ -952,7 +952,7 @@ void AllocationFailureReportsHeapBudgets() {
     }
     Expect(failure.find("heap 0 1500/2000 MiB") != std::string::npos, "allocation failure omitted the first heap's memory budget");
     Expect(failure.find("heap 1 2500/3000 MiB") != std::string::npos, "allocation failure omitted a later heap's memory budget");
-    Expect(allocationPathBudgetQueries == 2, "allocation failure did not query the memory budget for both type selection and its diagnostic");
+    Expect(allocationPathBudgetQueries == 3, "allocation failure did not query the memory budget for type selection and the diagnostics of both refused memory types");
 
     mock = MockDevice{};
     diagnosticBudgetQueries = 0;
@@ -961,7 +961,7 @@ void AllocationFailureReportsHeapBudgets() {
         auto context = mockContext();
         context.physical = reinterpret_cast<VkPhysicalDevice>(std::uintptr_t{1});
         context.memory.memoryHeapCount = 2;
-        mock.results = {VK_ERROR_DEVICE_LOST};
+        mock.results = {VK_ERROR_DEVICE_LOST, VK_ERROR_DEVICE_LOST};
         try {
             DeviceBuffer buffer(context, 4 * MiB, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         } catch (const std::exception& error) {
