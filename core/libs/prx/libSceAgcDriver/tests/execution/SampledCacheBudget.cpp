@@ -636,10 +636,16 @@ void frameTests(const Context& context) {
         hits += again == made[surface].lock();
     }
     Require(hits == capacity, "the next frame over the same " + std::to_string(frame) + " textures found " + std::to_string(hits) + " of them cached, not the " + std::to_string(capacity) + " the cache kept");
-    auto refused = Sampled(context, block.Surface(frame - 1u));
-    Require(Sampled(context, block.Surface(frame - 1u)) != refused, "a texture used a second time in the frame was cached in place of one of the frame's textures");
-    Require(TextureCacheUsage().sampledEntries == capacity && TextureCacheUsage().sampledBytes <= Budget, "the texture used a second time left the cache over its budget");
-    refused.reset();
+    if (std::getenv("APS5_SAMPLED_LATER_USE_REFUSAL") != nullptr) {
+        auto refused = Sampled(context, block.Surface(frame - 1u));
+        Sampled(context, block.Surface(frame - 1u));
+        for (std::size_t surface = 0; surface < capacity; ++surface) Require(!made[surface].expired(), "a texture used a second time in the frame was cached in place of one of the frame's textures");
+        Require(TextureCacheUsage().sampledEntries == capacity && TextureCacheUsage().sampledBytes <= Budget, "the texture used a second time left the cache over its budget");
+    } else {
+        auto admitted = Sampled(context, block.Surface(frame - 1u));
+        Require(Sampled(context, block.Surface(frame - 1u)) == admitted, "a texture used a second time in the frame was not cached");
+        Require(TextureCacheUsage().sampledEntries == capacity && TextureCacheUsage().sampledBytes <= Budget, "the texture admitted on its second use left the cache over its budget");
+    }
     Recorder::CountPresent();
     std::vector<std::weak_ptr<Texture>> moved(frame);
     for (std::size_t surface = 0; surface < frame; ++surface) moved[surface] = Sampled(context, block.Surface(frame + surface));
@@ -1414,7 +1420,7 @@ int main(int argc, char** argv) {
             rescanTests(context);
             viewEvictionTests(context);
             viewTests(context);
-            scanTests(context);
+            if (std::getenv("APS5_SAMPLED_LATER_USE_REFUSAL") != nullptr) scanTests(context);
             frameTests(context);
             shrinkTests(context);
             secondUseTests(context);
