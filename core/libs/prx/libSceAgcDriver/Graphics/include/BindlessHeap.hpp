@@ -143,7 +143,7 @@ void NoteEmptyResourceSet();
 std::uint64_t EmptyResourceSets();
 std::uint64_t DataAddressPushes();
 enum class SetBindSite : std::uint8_t { Draw, Dispatch, Detiler, ColorTransfer, Presentation, Count };
-enum class HeapFallback : std::uint8_t { DrawUnmapped, DrawMixedRetry, DrawRefusedPair, DispatchUnmapped, Count };
+enum class HeapFallback : std::uint8_t { DrawUnmapped, DrawMixedRetry, DrawRefusedPair, DrawMixedReused, DispatchUnmapped, Count };
 enum class HeapStageReason : std::uint8_t { Heap, Disabled, PairRefused, FragmentOffHeap, StageKind, NoPlan, PlanStage, UnresolvedImageSource, AtomicTableImage, KnownIneligible, Count };
 void NoteHeapStageReason(HeapStageReason reason);
 void NoteHeapRecord(bool compute, bool heap);

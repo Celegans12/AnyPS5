@@ -649,7 +649,7 @@ std::array<std::atomic<std::uint64_t>, 4> heapRecords{};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(HeapStageReason::Count)> heapStageReasons{};
 constexpr std::array<const char*, static_cast<std::size_t>(HeapStageReason::Count)> HeapStageReasonNames{"heap", "disabled", "pair refused", "fragment off heap", "stage kind", "no plan", "plan stage", "unresolved image source", "atomic table image", "known ineligible"};
 constexpr std::array<const char*, static_cast<std::size_t>(SetBindSite::Count)> SetBindSiteNames{"draw", "dispatch", "detiler", "color transfer", "presentation"};
-constexpr std::array<const char*, static_cast<std::size_t>(HeapFallback::Count)> HeapFallbackNames{"draw unmapped", "draw mixed retry", "draw refused pair", "dispatch unmapped"};
+constexpr std::array<const char*, static_cast<std::size_t>(HeapFallback::Count)> HeapFallbackNames{"draw unmapped", "draw mixed retry", "draw refused pair", "draw mixed reused", "dispatch unmapped"};
 
 std::uint64_t takeCount(std::atomic<std::uint64_t>& counter) {
     return counter.exchange(0, std::memory_order_relaxed);

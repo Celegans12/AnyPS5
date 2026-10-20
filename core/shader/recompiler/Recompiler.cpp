@@ -1868,6 +1868,11 @@ const std::shared_ptr<const IrResourcePlan>& PreparedShaderInvocation::Plan() co
     return handle != nullptr && handle->source != nullptr ? handle->source->plan : none;
 }
 
+std::shared_ptr<const IrResourcePlan> PreparedShaderInvocation::LoadPlan() const {
+    if (handle == nullptr || handle->source == nullptr) return nullptr;
+    return acquirePlan(request, handle->source, false, handle.get());
+}
+
 std::uint64_t PreparedShaderInvocation::VariantId() const {
     return handle != nullptr && handle->artifact != nullptr ? handle->artifact->artifact.variantId : 0u;
 }

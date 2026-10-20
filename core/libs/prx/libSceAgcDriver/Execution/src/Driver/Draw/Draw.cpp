@@ -954,6 +954,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     std::uint64_t heapPair = 0xcbf29ce484222325ull;
     for (const auto& program : programs) heapPair = (heapPair ^ reinterpret_cast<std::uintptr_t>(program.snapshot.get()) ^ (static_cast<std::uint64_t>(program.codeOffset) << 1u)) * 0x100000001b3ull;
     const bool heapPairRefused = heapCheck && HeapPairRefused(heapPair);
+    bool heapRetry = false;
     const auto runStages = [&]() -> std::optional<DrawVerdict> {
         for (std::size_t i = 0; i < programs.size(); ++i) {
             if (roles[i] == Role::GeometryBack) continue;
@@ -966,7 +967,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
                 memory.insert(memory.end(), matchedRegions[i].begin(), matchedRegions[i].end());
                 ringWords(i);
             } else {
-                const bool afterHeap = std::any_of(programResults.begin(), programResults.begin() + static_cast<std::ptrdiff_t>(i), [](const ShaderRecompiler::RecompileResult* earlier) { return earlier != nullptr && earlier->gpuResolvedImages; });
+                const bool afterHeap = heapRetry || std::any_of(programResults.begin(), programResults.begin() + static_cast<std::ptrdiff_t>(i), [](const ShaderRecompiler::RecompileResult* earlier) { return earlier != nullptr && earlier->gpuResolvedImages; });
                 if (reused[i] && afterHeap && !matched[i]->compiled->gpuResolvedImages) {
                     reused[i] = false;
                     matched[i] = nullptr;
@@ -1037,6 +1038,13 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         require(retry < 2u, "a draw mixes GPU-mode and per-draw stages after taking the per-draw path");
         Graphics::NoteHeapFallback(retry == 0u ? Graphics::HeapFallback::DrawMixedRetry : Graphics::HeapFallback::DrawRefusedPair);
         if (retry == 1u) RefuseHeapPair(heapPair);
+        for (std::size_t i = 0; i < programs.size(); ++i) {
+            if (reused[i] && programResults[i] != nullptr && !programResults[i]->gpuResolvedImages) {
+                Graphics::NoteHeapFallback(Graphics::HeapFallback::DrawMixedReused);
+                break;
+            }
+        }
+        heapRetry = retry == 0u;
         stages.resize(stagesBefore);
         compiledStages.resize(compiledBefore);
         pushCursorBytes = pushBefore;
