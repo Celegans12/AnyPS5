@@ -25,7 +25,6 @@ enum class RuntimeSwitch : std::size_t {
     NoEarlyRevalidate,
     NoBatchedStaging,
     QuietPublish,
-    NoClearHandOver,
     NoResourceCopyBudget,
     Count,
 };
