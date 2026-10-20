@@ -68,7 +68,7 @@ std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t st
     return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu) | (stride << 16u), count, 0x01016facu};
 }
 
-std::span<const std::uint32_t> Program(std::uint32_t fixedVgpr, std::uint32_t stippleVgpr) {
+std::span<const std::uint32_t> Program(std::uint32_t fixedVgpr, std::uint32_t stippleVgpr, std::uint32_t blueConstant = 0x80u) {
     Require(programCount < Programs.size(), "too many test programs");
     auto& code = Programs[programCount++];
     std::size_t at = 0;
@@ -77,7 +77,7 @@ std::span<const std::uint32_t> Program(std::uint32_t fixedVgpr, std::uint32_t st
     code[at++] = 0x2c000000u | (21u << 17u) | (fixedVgpr << 9u) | 0x90u;
     code[at++] = 0x7e000c00u | (20u << 17u) | (256u + 20u);
     code[at++] = 0x7e000c00u | (21u << 17u) | (256u + 21u);
-    code[at++] = stippleVgpr == NoInput ? 0x7e000280u | (22u << 17u) : 0x7e000c00u | (22u << 17u) | (256u + stippleVgpr);
+    code[at++] = stippleVgpr == NoInput ? 0x7e000200u | blueConstant | (22u << 17u) : 0x7e000c00u | (22u << 17u) | (256u + stippleVgpr);
     code[at++] = 0x7e0002f2u | (23u << 17u);
     code[at++] = 0xf800180fu;
     code[at++] = 0x17161514u;
@@ -159,7 +159,7 @@ AgcDriver::Graphics::ColorTarget DecodeTarget(const Block& block, std::uint32_t 
     return color;
 }
 
-void Draw(AgcDriver::VulkanDevice& device, const AgcDriver::Graphics::ColorTarget& color, std::uint32_t inputAddr, std::span<const std::uint32_t> pixelCode) {
+void Draw(AgcDriver::VulkanDevice& device, const AgcDriver::Graphics::ColorTarget& color, std::uint32_t inputAddr, std::span<const std::uint32_t> pixelCode, std::uint32_t scissorWidth = Width) {
     const auto target = device.Target();
     constexpr std::uint32_t waveSize = 64;
     std::vector<std::uint32_t> vertexUserData(4, 0u);
@@ -207,7 +207,7 @@ void Draw(AgcDriver::VulkanDevice& device, const AgcDriver::Graphics::ColorTarge
     state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     state.viewport = {0, static_cast<float>(Height), static_cast<float>(Width), -static_cast<float>(Height), 0, 1};
     state.negativeOneToOne = false;
-    state.scissor = {{0, 0}, {Width, Height}};
+    state.scissor = {{0, 0}, {scissorWidth, Height}};
     state.cullMode = VK_CULL_MODE_NONE;
     state.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     state.blends = {blend};
@@ -229,23 +229,91 @@ void Check(const std::vector<std::uint8_t>& stored, const std::string& what) {
     }
 }
 
-bool Expect(AgcDriver::VulkanDevice& device) {
+struct CaseResult {
+    bool imported = false;
+    std::string failure;
+};
+
+constexpr std::size_t TargetBytes = std::size_t{Width} * Height * 16u;
+
+CaseResult SecondDrawCase(AgcDriver::VulkanDevice& device, Block& block, bool seed) {
     using ShaderRecompiler::PixelInput;
     using ShaderRecompiler::PixelInputBit;
-    constexpr std::size_t bytes = std::size_t{Width} * Height * 16u;
-    Block block(bytes);
+    constexpr std::size_t bytes = TargetBytes;
     std::fill(block.data, block.data + bytes, std::uint8_t{0xff});
     const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
-    if (AgcDriver::Graphics::HostImportFor(context, block.Address(), bytes) == nullptr) return false;
+    if (AgcDriver::Graphics::HostImportFor(context, block.Address(), bytes) == nullptr) return {};
     const auto color = DecodeTarget(block, Rgba32FloatInfo);
     Require(color.tileMode == AgcDriver::Graphics::ColorTileMode::Linear && color.bytes == bytes, "the target is not a linear R32G32B32A32 target");
     Draw(device, color, PixelInputBit(PixelInput::PositionFixedPoint), Program(0u, NoInput));
     const auto* recorder = AgcDriver::Graphics::Recorder::Active();
-    Require(recorder != nullptr && !recorder->Idle(), "the draw into an imported linear target waited for the GPU instead of being recorded");
+    const bool resident = std::getenv("APS5_NO_RESIDENT_LINEAR") == nullptr;
+    Require(!resident || (recorder != nullptr && !recorder->Idle()), "the draw into an imported linear target waited for the GPU instead of being recorded");
     device.WaitIdle();
     std::vector<std::uint8_t> stored(bytes);
     std::memcpy(stored.data(), block.data, bytes);
     Check(stored, "after the recorded draw, raw guest read");
+    constexpr std::uint32_t drawn = Width / 2u;
+    constexpr std::size_t rowBytes = std::size_t{Width} * 16u;
+    constexpr std::size_t drawnBytes = std::size_t{drawn} * 16u;
+    constexpr std::uint8_t sentinel = 0x5au;
+    constexpr float secondBlue = 2.0f;
+    const auto secondOutput = [&](std::uint32_t x, std::uint32_t y) {
+        std::array<float, 4> texel{};
+        std::memcpy(texel.data(), block.data + y * rowBytes + std::size_t{x} * 16u, sizeof(texel));
+        return texel == std::array<float, 4>{static_cast<float>(x), static_cast<float>(y), secondBlue, 1.0f};
+    };
+    if (seed) for (std::uint32_t y = 0; y < Height; ++y) std::memset(block.data + y * rowBytes, sentinel, drawnBytes);
+    Draw(device, color, PixelInputBit(PixelInput::PositionFixedPoint), Program(0u, NoInput, 0xf4u), drawn);
+    const auto* second = AgcDriver::Graphics::Recorder::Active();
+    const bool secondRecorded = second != nullptr && !second->Idle();
+    std::size_t landedEarly = 0;
+    for (std::uint32_t y = 0; y < Height; ++y) {
+        for (std::uint32_t x = 0; x < drawn; ++x) landedEarly += secondOutput(x, y) ? 1u : 0u;
+    }
+    for (std::uint32_t y = 0; y < Height; ++y) std::memset(block.data + y * rowBytes + drawnBytes, 0x42, rowBytes - drawnBytes);
+    device.WaitIdle();
+    std::size_t leftLost = 0;
+    std::size_t leftSentinel = 0;
+    std::string firstLost;
+    for (std::uint32_t y = 0; y < Height; ++y) {
+        for (std::uint32_t x = 0; x < drawn; ++x) {
+            if (secondOutput(x, y)) continue;
+            const auto* pixel = block.data + y * rowBytes + std::size_t{x} * 16u;
+            std::array<float, 4> texel{};
+            std::memcpy(texel.data(), pixel, sizeof(texel));
+            ++leftLost;
+            if (std::all_of(pixel, pixel + 16, [](std::uint8_t byte) { return byte == sentinel; })) ++leftSentinel;
+            if (firstLost.empty()) firstLost = "pixel (" + std::to_string(x) + ", " + std::to_string(y) + ") holds (" + std::to_string(texel[0]) + ", " + std::to_string(texel[1]) + ", " + std::to_string(texel[2]) + ", " + std::to_string(texel[3]) + ")";
+        }
+    }
+    std::size_t rightRolledBack = 0;
+    std::string firstRolledBack;
+    for (std::uint32_t y = 0; y < Height; ++y) {
+        const auto* row = block.data + y * rowBytes;
+        const auto bad = static_cast<std::size_t>(std::count_if(row + drawnBytes, row + rowBytes, [](std::uint8_t byte) { return byte != 0x42u; }));
+        rightRolledBack += bad;
+        if (bad != 0 && firstRolledBack.empty()) firstRolledBack = "the store-back of a recorded draw into a linear target overwrote row " + std::to_string(y) + " outside the draw's scissor, which the CPU stored after the draw";
+    }
+    const char* name = seed ? "left half seeded with 0x5a" : "no seed";
+    std::fprintf(stderr, "[8152] %s path, %s, second draw %s: left half %zu/%zu pixels not the second draw's output (%zu still the 0x5a sentinel); right half %zu/%zu bytes not the CPU's 0x42; %zu left pixels already held the second draw's output when Draw returned\n", resident ? "resident" : "APS5_NO_RESIDENT_LINEAR", name, secondRecorded ? "recorded" : "waited for the GPU", leftLost, std::size_t{drawn} * Height, leftSentinel, rightRolledBack, (rowBytes - drawnBytes) * Height, landedEarly);
+    CaseResult result{true, {}};
+    if (leftLost != 0) result.failure = "the second draw's output in the left half was lost (" + std::to_string(leftLost) + " pixels, " + std::to_string(leftSentinel) + " still the CPU's sentinel): " + firstLost;
+    if (!firstRolledBack.empty()) result.failure += (result.failure.empty() ? "" : "; ") + firstRolledBack;
+    if (!result.failure.empty()) result.failure = std::string(name) + ": " + result.failure;
+    return result;
+}
+
+bool Expect(AgcDriver::VulkanDevice& device) {
+    std::string failures;
+    Block seeded(TargetBytes);
+    Block unseeded(TargetBytes);
+    for (const bool seed : {true, false}) {
+        const auto result = SecondDrawCase(device, seed ? seeded : unseeded, seed);
+        if (!result.imported) return false;
+        if (!result.failure.empty()) failures += (failures.empty() ? "" : " | ") + result.failure;
+    }
+    Require(failures.empty(), failures);
     return true;
 }
 
