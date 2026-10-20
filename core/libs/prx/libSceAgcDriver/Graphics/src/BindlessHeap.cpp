@@ -770,6 +770,10 @@ std::uint64_t takeCount(std::atomic<std::uint64_t>& counter) {
     return counter.exchange(0, std::memory_order_relaxed);
 }
 
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(HeapCost::Count)> heapCostNs{};
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(HeapCost::Count)> heapCostCalls{};
+constexpr std::array<const char*, static_cast<std::size_t>(HeapCost::Count)> HeapCostNames{"stage prepare", "heap stage call", "stage finish", "walk memo", "walk", "materialize", "template find", "template build", "slots", "stage data", "buffer addresses"};
+
 void reportHeapStatistics() {
     static const bool enabled = std::getenv("APS5_PIPELINE_STATS") != nullptr;
     if (!enabled) return;
@@ -788,6 +792,15 @@ void reportHeapStatistics() {
     for (std::size_t i = 0; i < heapFallbacks.size(); ++i) fallbacks += " " + std::string(HeapFallbackNames[i]) + " " + std::to_string(takeCount(heapFallbacks[i]));
     std::string stageReasons;
     for (std::size_t i = 0; i < heapStageReasons.size(); ++i) stageReasons += " " + std::string(HeapStageReasonNames[i]) + " " + std::to_string(takeCount(heapStageReasons[i]));
+    std::string costs;
+    for (std::size_t i = 0; i < heapCostNs.size(); ++i) {
+        const auto calls = takeCount(heapCostCalls[i]);
+        const auto ns = takeCount(heapCostNs[i]);
+        char cost[96];
+        std::snprintf(cost, sizeof(cost), " %s %llu x %.2f us = %.0f ms", HeapCostNames[i], static_cast<unsigned long long>(calls), calls != 0 ? static_cast<double>(ns) / static_cast<double>(calls) / 1000.0 : 0.0, static_cast<double>(ns) / 1e6);
+        costs += cost;
+    }
+    if (HeapCostTimed()) std::fprintf(stderr, "[gpu-heap] cost (10 s):%s\n", costs.c_str());
     const auto heapDraws = takeCount(heapRecords[1]);
     const auto plainDraws = takeCount(heapRecords[0]);
     const auto heapDispatches = takeCount(heapRecords[3]);
@@ -810,6 +823,16 @@ void NoteHeapRecord(bool compute, bool heap) {
 
 void NoteHeapStageReason(HeapStageReason reason) {
     heapStageReasons[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+}
+
+bool HeapCostTimed() {
+    static const bool timed = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    return timed;
+}
+
+void NoteHeapCost(HeapCost cost, std::uint64_t nanoseconds) {
+    heapCostNs[static_cast<std::size_t>(cost)].fetch_add(nanoseconds, std::memory_order_relaxed);
+    heapCostCalls[static_cast<std::size_t>(cost)].fetch_add(1, std::memory_order_relaxed);
 }
 
 void NoteCpuBufferCopy(std::uint64_t bytes) {

@@ -6183,6 +6183,7 @@ std::uint32_t ShaderResources::heapSpan(HeapStageState::KeptSpan& kept, std::spa
 
 void ShaderResources::writeHeapStage(const CompiledShader& shader) {
     namespace Abi = ShaderRecompiler::RuntimeAbi;
+    HeapCostScope slotsCost(HeapCost::Slots);
     auto& heap = BindlessHeap::For(context);
     constexpr auto bindingCount = static_cast<std::uint32_t>(Abi::Binding::Count);
     const VkShaderStageFlags stageBit = VulkanStage(shader.stage);
@@ -6304,6 +6305,8 @@ void ShaderResources::writeHeapStage(const CompiledShader& shader) {
         }
         if (checked.load() % 100000u < 8u) std::fprintf(stderr, "[heap-slots] verify: %llu image slots checked, %llu hold another texture\n", static_cast<unsigned long long>(checked.load()), static_cast<unsigned long long>(wrong.load()));
     }
+    slotsCost.Stop();
+    HeapCostScope dataCost(HeapCost::StageData);
     const std::size_t dataIndex = DataOffsetIndex(stageIndex, Abi::Binding::ShaderData);
     const std::size_t flatIndex = DataOffsetIndex(stageIndex, Abi::Binding::FlattenedSrt);
     const auto& program = *shader.program;
@@ -6367,7 +6370,9 @@ void ShaderResources::writeHeapStage(const CompiledShader& shader) {
             Require(slotWords || program.samplerSlotDword + samplerSlots.size() <= patched.size(), "GPU-mode sampler slots exceed the shader data");
             if (!slotWords) std::copy(samplerSlots.begin(), samplerSlots.end(), patched.begin() + program.samplerSlotDword);
             if (addressedBuffers) {
+                HeapCostScope bufferCost(HeapCost::BufferAddresses);
                 writeBufferAddresses(patched, static_cast<std::uint32_t>(stageIndex), nullptr);
+                bufferCost.Stop();
                 stageDataWords[stageIndex].assign(patched.begin(), patched.end());
                 stageDataIndex[stageIndex] = dataIndex;
             }

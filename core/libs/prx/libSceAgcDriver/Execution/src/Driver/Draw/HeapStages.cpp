@@ -279,6 +279,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> MaterializeHeapStage(co
         const auto generation = GuestMemory::TrackerGeneration();
         const bool memoOn = words != nullptr && !invocation.Request().context.vertex.has_value();
         std::uint64_t memoKey = 0;
+        Graphics::HeapCostScope memoCost(Graphics::HeapCost::WalkMemo);
         if (memoOn) {
             memoKey = (invocation.VariantId() * 0x9e3779b97f4a7c15ull ^ shaderBase) + invocation.Request().layout.pushConstantOffsetBytes;
             for (const auto word : userData) memoKey = (memoKey ^ word) * 0x100000001b3ull;
@@ -312,6 +313,8 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> MaterializeHeapStage(co
                 return result;
             }
         }
+        memoCost.Stop();
+        Graphics::HeapCostScope walkCost(Graphics::HeapCost::Walk);
         ShaderRecompiler::SrtRuntime plain;
         plain.userData = userData;
         plain.shaderBase = shaderBase;
@@ -359,9 +362,12 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> MaterializeHeapStage(co
         }
         bool settled = !(DrawPipeline::Active() && DrawPipeline::Queue0().Busy() && DrawPipeline::Queue0().OverlapsAny(ranges)) && Graphics::Recorder::ReadsSettled(ranges, before.get());
         for (std::size_t i = 0; settled && i < ranges.size(); ++i) settled = GuestMemory::NewestStamp(ranges[i].first, static_cast<std::size_t>(ranges[i].second - ranges[i].first)) <= generation;
+        walkCost.Stop();
         if (settled) {
             for (const auto& [begin, end] : ranges) GuestMemory::GuardRead(begin, static_cast<std::size_t>(end - begin));
+            Graphics::HeapCostScope materializeCost(Graphics::HeapCost::Materialize);
             auto result = finish(capture);
+            materializeCost.Stop();
             if (stageReads != nullptr && !reads.failed && result != nullptr) *stageReads = {ranges, values, capture->userDataUse, capture, true};
             if (memoOn && !reads.failed && result != nullptr) {
                 auto& ways = heapWalkMemo().slot(memoKey);

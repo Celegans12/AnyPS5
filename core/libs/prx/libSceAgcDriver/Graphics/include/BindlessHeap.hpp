@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "RuntimeAbi.hpp"
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -161,6 +162,25 @@ void NoteHeapStageReason(HeapStageReason reason);
 void NoteHeapRecord(bool compute, bool heap);
 void NoteHeapFallback(HeapFallback reason);
 void NoteCpuBufferCopy(std::uint64_t bytes);
+enum class HeapCost : std::uint8_t { StagePrepare, HeapStageCall, StageFinish, WalkMemo, Walk, Materialize, TemplateFind, TemplateBuild, Slots, StageData, BufferAddresses, Count };
+bool HeapCostTimed();
+void NoteHeapCost(HeapCost cost, std::uint64_t nanoseconds);
+class HeapCostScope {
+public:
+    explicit HeapCostScope(HeapCost cost) : cost(cost), start(HeapCostTimed() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}) {}
+    ~HeapCostScope() { Stop(); }
+    HeapCostScope(const HeapCostScope&) = delete;
+    HeapCostScope& operator=(const HeapCostScope&) = delete;
+    void Stop() {
+        if (start == std::chrono::steady_clock::time_point{}) return;
+        NoteHeapCost(cost, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()));
+        start = {};
+    }
+
+private:
+    HeapCost cost;
+    std::chrono::steady_clock::time_point start;
+};
 void NoteCommandBufferBegun(VkCommandBuffer commands);
 void CmdBindDescriptorSets(const Context& context, VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout, std::uint32_t firstSet, std::uint32_t setCount, const VkDescriptorSet* sets, SetBindSite site);
 std::uint64_t DescriptorHeapBinds();
