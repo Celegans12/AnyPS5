@@ -61,7 +61,7 @@ APS5_SPANNED_WAVE=1 APS5_BINDLESS_IMAGES=1 APS5_BINDLESS_LAZY=1 APS5_NO_RESULT_M
 APS5_STAGING_DIFF=1 APS5_PIPELINE_INDIRECT=1 APS5_NO_ADDRESS_DRAW_REUSE=1 APS5_ASYNC_LANE=51
 ```
 
-- `APS5_ASYNC_LANE=51` records the cloth compute ring (queue 0x51) on a second Vulkan queue.
+- `APS5_ASYNC_LANE=51` records the cloth compute ring (queue 0x51) on a second Vulkan queue. If the GPU hangs or the device is lost (see known issues), leave it out.
 - Off switches added on this line: `APS5_NO_GPU_INDIRECT_ARGS=1`, `APS5_NO_MIX_F32=1`, `APS5_NO_BARRIER_BATCH=1`, `APS5_NO_EARLY_REVALIDATE=1`, `APS5_NO_FLAT_POISON_INDEX=1`, `APS5_NO_BATCHED_STAGING=1`, and in the latest build `APS5_NO_OWED_RUN_CLOSE=1`, `APS5_NO_RUN_ATOMIC_GUARD=1`, `APS5_NO_RUN_STAGED_READ_GUARD=1` (the three overlap fixes) and `APS5_NO_SPARSE_PAGE_STATES=1`.
 - `APS5_AB=<seconds>:<switch>[,...]` (with `APS5_AB_START=<present>`) alternates two configurations of driver switches in one run, so a comparison needs one run and no run-to-run noise.
 - The first run on a new shader-cache version compiles shaders cold; it can take 30-60 minutes to reach the world.
@@ -70,6 +70,7 @@ APS5_STAGING_DIFF=1 APS5_PIPELINE_INDIRECT=1 APS5_NO_ADDRESS_DRAW_REUSE=1 APS5_A
 
 ## Known issues
 
+- **GPU hangs with `APS5_ASYNC_LANE=51`.** On 2026-10-20 this build hung twice in the world (a queue waits 40 s for the GPU, then the device is lost), 400-510 s after launch. Every hang or GPU write fault we've seen with dispatch overlap on happened with the second queue on. The two runs we've done without it so far (on our merge build) were clean. If you hit this, drop `APS5_ASYNC_LANE=51` from the env. A fix is being worked on.
 - Black shapes on some rocks and terrain (the depth pre-pass and the G-buffer pass disagree on depth). Cause not found yet.
 - Process memory reaches about 34 GB in the world, so 32 GB of RAM is tight.
 - The overlap fixes keep conflicting dispatches out of overlapped runs, which costs about 115 ms of GPU time per frame (+14 %). Frames are CPU-bound, so presents barely move (about 1 % in an in-run A/B), but it will matter once the CPU side gets faster.
@@ -104,6 +105,7 @@ APS5_STAGING_DIFF=1 APS5_PIPELINE_INDIRECT=1 APS5_NO_ADDRESS_DRAW_REUSE=1 APS5_A
 - 2026-10-19: moved to combo19 (`75dd18755`): matches the title reference exactly; against the previous build in the same session +5 % presents, -8 % frame time, -40 % CPU waits for GPU results. New shader-cache version, so the first run compiles cold.
 - 2026-10-19: added batched staging (`ace5c14cd`): T1 exact; in-run A/B in the world 5.12 vs 4.68 presents per 10 s, GPU busy 810 vs 1,096 ms per frame. Same shader cache as combo19.
 - 2026-10-20: added three fixes for dispatch overlap with staged buffers (`3cbec3212`). Each had a test that failed on the previous build: a reused build lost its results, two atomic adds became one, and a read saw data from before the run. Also FardinHaque70's import re-entry fix and Izamaru's sparse page table. T1 exact, same shader cache. Speed is within noise by presents (in-run A/B: about 1 %), GPU busy +14 %. In the same A/B, the only GPU hang came in a phase with the fixes off.
+- 2026-10-21: added a known issue: GPU hangs with `APS5_ASYNC_LANE=51` (twice in the world on this build). Leave it out if you hit them.
 
 ---
 
