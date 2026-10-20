@@ -546,7 +546,7 @@ namespace {
 
 const std::uint32_t GeneratedFaultBinding = Abi::BindingNumber(Abi::Stage::TessellationControl, Abi::Binding::FaultBuffer);
 
-bool heapBindings(std::span<const std::uint32_t> spirv, bool workgroupAddress, bool gdsAddress, bool faultAddress, std::vector<std::uint32_t>& bindings, bool& workgroupMemory, std::uint32_t& gdsBinding, bool& faultMemory) {
+bool heapBindings(std::span<const std::uint32_t> spirv, bool workgroupAddress, bool gdsAddress, bool faultAddress, std::vector<std::uint32_t>& bindings, bool& workgroupMemory, std::uint32_t& gdsBinding, bool& faultMemory, std::pair<std::uint32_t, std::uint32_t>* refused = nullptr) {
     bindings.clear();
     workgroupMemory = false;
     gdsBinding = ~0u;
@@ -582,7 +582,10 @@ bool heapBindings(std::span<const std::uint32_t> spirv, bool workgroupAddress, b
             faultMemory = true;
             continue;
         }
-        if (entry.first != Abi::FragmentDescriptorSet || entry.second < bindingCount + Abi::FirstImageBinding || entry.second > bindingCount + samplerBinding) return false;
+        if (entry.first != Abi::FragmentDescriptorSet || entry.second < bindingCount + Abi::FirstImageBinding || entry.second > bindingCount + samplerBinding) {
+            if (refused != nullptr) *refused = entry;
+            return false;
+        }
         if (std::find(bindings.begin(), bindings.end(), entry.second) == bindings.end()) bindings.push_back(entry.second);
     }
     return (!workgroupAddress || workgroupMemory) && (!faultAddress || faultMemory);
@@ -595,7 +598,17 @@ bool DescriptorHeapMappable(std::span<const std::uint32_t> spirv, bool workgroup
     bool workgroupMemory = false;
     std::uint32_t gdsBinding = ~0u;
     bool faultMemory = false;
-    return heapBindings(spirv, workgroupAddress, gdsAddress, false, bindings, workgroupMemory, gdsBinding, faultMemory);
+    std::pair<std::uint32_t, std::uint32_t> refused{~0u, ~0u};
+    const bool mappable = heapBindings(spirv, workgroupAddress, gdsAddress, false, bindings, workgroupMemory, gdsBinding, faultMemory, &refused);
+    static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    if (!mappable && stats) {
+        static std::mutex causesMutex;
+        static std::map<std::pair<std::uint32_t, std::uint32_t>, std::uint64_t> causes;
+        std::lock_guard lock(causesMutex);
+        const auto count = ++causes[refused];
+        if (count == 1u || (count & (count - 1u)) == 0u) std::fprintf(stderr, "[gpu-heap] unmappable stage: descriptor set %d binding %d (workgroup address %d, gds address %d); %llu stage variants with this cause\n", static_cast<int>(refused.first), static_cast<int>(refused.second), workgroupAddress ? 1 : 0, gdsAddress ? 1 : 0, static_cast<unsigned long long>(count));
+    }
+    return mappable;
 }
 
 bool BindlessHeap::DescriptorHeapMappings(std::span<const std::uint32_t> spirv, std::vector<VkDescriptorSetAndBindingMappingEXT>& mappings, std::uint32_t workgroupAddressOffset, bool rootGds, bool rootFault) const {
