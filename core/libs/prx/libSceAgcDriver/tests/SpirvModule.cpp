@@ -322,8 +322,6 @@ void testPrivateCompositeTableLoadFolding() {
             const auto input = module.DefineGlobalVariable(typeInputPtr, spv::StorageClassInput);
             const auto table = module.DefineInitializedGlobalVariable(typeTablePtr, spv::StorageClassPrivate, initial);
             const auto output = module.DefineGlobalVariable(typePrivatePtr, spv::StorageClassPrivate);
-            const auto glsl = module.Import("GLSL.std.450");
-            const auto customSet = module.Import("NonSemantic.Test");
             const auto mainId = module.AllocateId();
             const auto lane = module.AllocateId();
             const auto rawCond = module.AllocateId();
@@ -341,11 +339,6 @@ void testPrivateCompositeTableLoadFolding() {
                 module.AddFunction(accessOp, typePrivatePtr, writePtr, table, zero);
                 module.AddFunction(spv::OpStore, writePtr, lane);
             }
-            const auto liveGlsl = module.AllocateId();
-            module.AddFunction(spv::OpExtInst, typeU32, module.AllocateId(), glsl, 37u, lane, zero);
-            module.AddFunction(spv::OpExtInst, typeU32, liveGlsl, glsl, 37u, lane, one);
-            module.AddFunction(spv::OpStore, output, liveGlsl);
-            module.AddFunction(spv::OpExtInst, typeU32, module.AllocateId(), customSet, 1u, lane);
             module.AddFunction(spv::OpUGreaterThan, typeBool, rawCond, lane, zero);
             module.AddFunction(spv::OpLogicalOr, typeBool, cond, rawCond, falseVal);
             module.AddFunction(spv::OpIAdd, typeU32, baseIndex, one, one);
@@ -364,16 +357,12 @@ void testPrivateCompositeTableLoadFolding() {
         check(!foldedCounts.contains(spv::OpLogicalOr), "a right-false OpLogicalOr was not simplified");
         check(!foldedCounts.contains(spv::OpSelect), "an identical-arm OpSelect was not simplified");
         check(foldedCounts.contains(spv::OpLoad) && foldedCounts.at(spv::OpLoad) == 1u, "a constant-index private composite table load was not folded");
-        check(foldedCounts.contains(spv::OpExtInst) && foldedCounts.at(spv::OpExtInst) == 2u, "an unused GLSL.std.450 OpExtInst was not removed or a live/non-GLSL.std.450 OpExtInst was removed");
         bool addedThirty = false;
-        bool keptCustomExtInst = false;
         for (std::size_t cursor = 5; cursor < folded.size(); cursor += folded[cursor] >> 16u) {
             if ((folded[cursor] >> 16u) == 0u) break;
             if ((folded[cursor] & 0xffffu) == spv::OpIAdd && folded[cursor + 4u] == expectedConstant) addedThirty = true;
-            if ((folded[cursor] & 0xffffu) == spv::OpExtInst && folded[cursor + 4u] == 1u) keptCustomExtInst = true;
         }
         check(addedThirty, "a constant-index private composite table load did not fold to its element constant");
-        check(keptCustomExtInst, "a non-GLSL.std.450 OpExtInst was not preserved");
 
         const auto [dynamic, unusedDynamic] = build(true, false);
         static_cast<void>(unusedDynamic);

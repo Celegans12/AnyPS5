@@ -100,7 +100,7 @@ private:
     std::vector<std::uint8_t> present;
 };
 
-bool PureInstruction(const Instruction& instruction, const IdSet& glslExtInstSets = {}) {
+bool PureInstruction(const Instruction& instruction) {
     switch (Opcode(instruction)) {
     case spv::OpVectorExtractDynamic:
     case spv::OpVectorInsertDynamic:
@@ -219,8 +219,6 @@ bool PureInstruction(const Instruction& instruction, const IdSet& glslExtInstSet
     case spv::OpArrayLength:
     case spv::OpPhi:
         return true;
-    case spv::OpExtInst:
-        return instruction.size() >= 5u && glslExtInstSets.contains(instruction[3]);
     case spv::OpLoad:
         return instruction.size() == 4u || (instruction.size() == 5u && instruction[4] == spv::MemoryAccessMaskNone);
     default:
@@ -233,9 +231,6 @@ bool VisitInputs(const Instruction& instruction, const TVisitor& visit) {
     std::size_t first = 3u;
     std::size_t end = instruction.size();
     switch (Opcode(instruction)) {
-    case spv::OpExtInst:
-        first = 5u;
-        break;
     case spv::OpVectorShuffle:
     case spv::OpCompositeInsert:
         end = 5u;
@@ -583,7 +578,6 @@ public:
         values.Reset(bound);
         resultTypes.Reset(bound);
         vectorTypes.Reset(bound);
-        glslExtInstSets.Reset(bound);
         removed.Reset(bound);
         aliases.Reset(bound);
         composites.Reset(bound);
@@ -598,7 +592,6 @@ public:
             bool hasType = false;
             spv::HasResultAndType(op, &hasResult, &hasType);
             if (hasResult && hasType) resultTypes.emplace(instruction.at(2), instruction.at(1));
-            if (op == spv::OpExtInstImport && instruction.size() == 6u && instruction[2] == 0x4c534c47u && instruction[3] == 0x6474732eu && instruction[4] == 0x3035342eu && instruction[5] == 0u) glslExtInstSets.insert(instruction.at(1));
             if (op == spv::OpTypeBool) types.emplace(instruction.at(1), ScalarType{1u, true});
             if (op == spv::OpTypeInt) types.emplace(instruction.at(1), ScalarType{instruction.at(2), false});
             if (op == spv::OpTypeVector) vectorTypes.insert(instruction.at(1));
@@ -682,18 +675,6 @@ private:
             return pointer->second < elements.size() ? value(elements[pointer->second]) : std::nullopt;
         }
         const auto left = value(instruction[3]);
-        if (op == spv::OpLogicalAnd && instruction.size() == 5u) {
-            const auto right = value(instruction[4]);
-            if ((left && *left == 0u) || (right && *right == 0u)) return 0u;
-            if (left && right) return *left != 0u && *right != 0u;
-            return std::nullopt;
-        }
-        if (op == spv::OpLogicalOr && instruction.size() == 5u) {
-            const auto right = value(instruction[4]);
-            if ((left && *left != 0u) || (right && *right != 0u)) return 1u;
-            if (left && right) return *left != 0u || *right != 0u;
-            return std::nullopt;
-        }
         if (!left) return std::nullopt;
         if (op == spv::OpCopyObject) return left;
         if (op == spv::OpLogicalNot) return *left == 0u;
@@ -1185,7 +1166,7 @@ private:
                 }
                 continue;
             }
-            if (PureInstruction(instruction, glslExtInstSets)) {
+            if (PureInstruction(instruction)) {
                 definitions.emplace(Result(instruction), index);
                 continue;
             }
@@ -1222,7 +1203,6 @@ private:
     IdTable<std::uint32_t> values;
     IdTable<std::uint32_t> resultTypes;
     IdSet vectorTypes;
-    IdSet glslExtInstSets;
     IdSet removed;
     IdTable<std::uint32_t> aliases;
     IdTable<std::vector<std::uint32_t>> composites;
