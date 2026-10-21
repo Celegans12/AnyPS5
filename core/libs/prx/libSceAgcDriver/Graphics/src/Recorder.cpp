@@ -1325,7 +1325,7 @@ void Recorder::switchEdge(int from, int to) {
 
 namespace {
 
-std::atomic<std::uint64_t> laneHeldCompletions{0}, laneTemplateEdges[2]{};
+std::atomic<std::uint64_t> laneHeldCompletions{0}, laneTemplateEdges[2]{}, laneSerialWaits{0};
 
 }
 
@@ -1353,8 +1353,8 @@ void Recorder::CountTemplateEdge(bool beforeRefresh) {
 }
 
 std::string Recorder::LaneOrderReport() {
-    char text[400];
-    std::snprintf(text, sizeof(text), "[lane-order] (cumulative) completed-through answers lowered by a batch opened before the other lane's submission %llu (APS5_NO_LANE_OPEN_SERIAL %s); cached-template data edges to the other lane: after its refresh %llu, before a refresh over its reads %llu (APS5_NO_LANE_TEMPLATE_EDGE %s)", static_cast<unsigned long long>(laneHeldCompletions.load()), RuntimeSwitches::Set(RuntimeSwitch::NoLaneOpenSerial) ? "set" : "unset", static_cast<unsigned long long>(laneTemplateEdges[1].load()), static_cast<unsigned long long>(laneTemplateEdges[0].load()), RuntimeSwitches::Set(RuntimeSwitch::NoLaneTemplateEdge) ? "set" : "unset");
+    char text[512];
+    std::snprintf(text, sizeof(text), "[lane-order] (cumulative) completed-through answers lowered by a batch opened before the other lane's submission %llu (APS5_NO_LANE_OPEN_SERIAL %s); cached-template data edges to the other lane: after its refresh %llu, before a refresh over its reads %llu (APS5_NO_LANE_TEMPLATE_EDGE %s); batches given a wait for the other lane by APS5_LANE_SERIALIZE %llu (%s)", static_cast<unsigned long long>(laneHeldCompletions.load()), RuntimeSwitches::Set(RuntimeSwitch::NoLaneOpenSerial) ? "set" : "unset", static_cast<unsigned long long>(laneTemplateEdges[1].load()), static_cast<unsigned long long>(laneTemplateEdges[0].load()), RuntimeSwitches::Set(RuntimeSwitch::NoLaneTemplateEdge) ? "set" : "unset", static_cast<unsigned long long>(laneSerialWaits.load()), RuntimeSwitches::Set(RuntimeSwitch::LaneSerialize) ? "set" : "unset");
     return text;
 }
 
@@ -4300,7 +4300,14 @@ void Recorder::Submit() {
     const bool asyncLane = batch->lane == 1;
     VkSemaphore signal = asyncLane ? asyncTimeline : timeline;
     VkSemaphore waitOn = asyncLane ? timeline : asyncTimeline;
-    const std::uint64_t waitValue = batch->waitOther;
+    // APS5_LANE_SERIALIZE=1 (diagnostic, an APS5_AB switch): every batch also waits for everything
+    // the other lane submitted before it, so the GPU runs the two lanes in submission order.
+    std::uint64_t waitValue = batch->waitOther;
+    if (asyncTimeline != VK_NULL_HANDLE && RuntimeSwitches::Set(RuntimeSwitch::LaneSerialize)) {
+        const auto other = laneSubmitted[static_cast<std::size_t>(1 - batch->lane)];
+        if (other > waitValue) laneSerialWaits.fetch_add(1, std::memory_order_relaxed);
+        waitValue = std::max(waitValue, other);
+    }
     const VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
     if (signal != VK_NULL_HANDLE) {
         submission.pNext = &timelineInfo;
