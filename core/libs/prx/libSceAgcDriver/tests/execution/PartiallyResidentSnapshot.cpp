@@ -297,8 +297,11 @@ void LargeTracked(const Context& context, ReservedSurface& surface, std::size_t 
         sample("after a CPU write to its last committed block", true);
         sample("after the upload of the written block", false);
         AgcDriver::GuestMemory::MarkWritten(address + 0x200, 4);
-        sample("after a driver store of the bytes already there, which a snapshot it did not keep cannot tell from a change", true);
-        sample("after the upload that followed the driver store", false);
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        surfaceReads = 0;
+        previous = CachedSampledTexture(context, words);
+        Require(previous != nullptr && surfaceReads.load() != 0, "sampling the large " + layout + " surface after a driver store of the bytes already there did not read the surface again to compare it");
+        sample("after the comparison that followed the driver store", false);
     } catch (...) {
         AgcDriver::GuestMemory::SetFlushHook(nullptr);
         throw;

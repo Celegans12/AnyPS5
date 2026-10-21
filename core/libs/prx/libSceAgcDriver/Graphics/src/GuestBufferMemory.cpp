@@ -5237,7 +5237,8 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
     // barrier is skipped when the trailing barrier just recorded already orders it (ElideCovered).
     bool inRun = false;
     VkAccessFlags covered = 0;
-    thread_local std::vector<std::array<std::uint64_t, 3>> runAccesses;
+    thread_local std::vector<std::array<std::uint64_t, 3>>* runAccessesSlot = nullptr;
+    auto& runAccesses = ShaderRecompiler::ThreadOwned(runAccessesSlot);
     runAccesses.clear();
     if (recorder->RunOpen()) RunAccesses(runAccesses);
     auto commands = Recorder::DispatchOverlapEnabled() && Recorder::StagedOverlapEnabled() ? recorder->RunCommands(Recorder::PeekUnorderedDispatch(), this, inRun, &covered, runAccesses) : recorder->Commands(&covered);

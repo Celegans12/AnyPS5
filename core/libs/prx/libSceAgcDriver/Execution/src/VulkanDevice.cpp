@@ -1,3 +1,4 @@
+#include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryStatsDevice.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
@@ -5278,7 +5279,8 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     VkAccessFlags covered = 0;
     bool overlapped = false;
     const std::array<const void*, 2> runOwners{record.resources.get(), record.resources != nullptr ? record.resources->MemoryOwner() : nullptr};
-    thread_local std::vector<std::array<std::uint64_t, 3>> runAccesses;
+    thread_local std::vector<std::array<std::uint64_t, 3>>* runAccessesSlot = nullptr;
+    auto& runAccesses = ShaderRecompiler::ThreadOwned(runAccessesSlot);
     runAccesses.clear();
     if (overlapCapable) resources.RunAccesses(runAccesses);
     auto commands = overlapCapable && unordered ? recorder.OverlapCommands(overlapQueue, runOwners, &covered, overlapped, runAccesses) : recorder.Commands(&covered);
