@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "Recompiler.hpp"
 #include "VulkanTestDevice.hpp"
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -22,7 +23,8 @@ constexpr std::uint32_t Fill = 0xdeadbeefu;
 constexpr std::uint32_t Format32UInt = 20;
 constexpr std::uint32_t Format16UInt = 11;
 alignas(256) std::array<std::uint32_t, Lanes> Input{};
-alignas(256) std::array<std::uint32_t, Lanes * 2u + 4u> Output{};
+alignas(256) std::array<std::uint32_t, Lanes * 4u + 4u> Output{};
+alignas(256) std::array<std::uint32_t, Lanes> Second{};
 
 constexpr std::array<std::uint32_t, 12> LoadCode(std::uint32_t marker) {
     return {0x34020082u, 0xe0001000u, 0x80000201u, 0xe0301000u, 0x80000301u, 0xbf8c0000u,
@@ -124,6 +126,124 @@ void AbsentThenFormats(AgcDriver::VulkanDevice& device) {
     }
 }
 
+constexpr std::array<std::uint32_t, 8> SingleCode(std::uint32_t marker) {
+    return {0x34020082u, 0xe0001000u, 0x80000201u, 0xbf8c0000u, 0xe0701000u, 0x80010201u, 0xbf800000u | marker, 0xbf810000u};
+}
+
+constexpr std::array<std::uint32_t, 12> TwoCode(std::uint32_t marker) {
+    return {0x34020082u, 0xe0001000u, 0x80000201u, 0xe0001000u, 0x80010301u, 0xbf8c0000u,
+            0xe0701000u, 0x80020201u, 0xe0701080u, 0x80020301u, 0xbf800000u | marker, 0xbf810000u};
+}
+
+constexpr std::array<std::uint32_t, 14> XyzwCode(std::uint32_t marker) {
+    return {0x34020082u, 0xe00c1000u, 0x80000201u, 0xbf8c0000u, 0xe0701000u, 0x80010201u, 0xe0701080u,
+            0x80010301u, 0xe0701100u, 0x80010401u, 0xe0701180u, 0x80010501u, 0xbf800000u | marker, 0xbf810000u};
+}
+
+alignas(256) constexpr auto SingleAbsentCode = SingleCode(10u);
+alignas(256) constexpr auto TwoBuffersCode = TwoCode(12u);
+alignas(256) constexpr auto XyzwRuntimeCode = XyzwCode(13u);
+alignas(256) constexpr auto XyzwIdentityReferenceCode = XyzwCode(14u);
+alignas(256) constexpr auto XyzwSelectReferenceCode = XyzwCode(15u);
+
+struct Wide {
+    Outcome outcome;
+    std::vector<std::uint32_t> words;
+};
+
+Wide Dispatch(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> code, const std::vector<std::array<std::uint32_t, 4>>& slots) {
+    for (std::uint32_t lane = 0; lane < Lanes; ++lane) {
+        Input[lane] = 0x9e3779b9u * (lane + 1u) ^ 0x01234567u;
+        Second[lane] = Input[lane] ^ 0x5a5a5a5au;
+    }
+    Output.fill(Fill);
+    std::vector<std::uint32_t> userData;
+    for (const auto& slot : slots) userData.insert(userData.end(), slot.begin(), slot.end());
+    const auto output = Descriptor(Output.data(), sizeof(Output), Format32UInt);
+    userData.insert(userData.end(), output.begin(), output.end());
+    const std::array<ShaderRecompiler::MemoryRegion, 1> memory{{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)}}};
+    const ShaderRecompiler::ShaderComputeStageInfo compute{{Lanes, 1, 1}, 0u, {false, false, false}, false, 1};
+    ShaderRecompiler::RecompileRequest request{
+        {ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}},
+        {Lanes, 0, userData, compute, std::nullopt, std::nullopt, memory},
+        device.Target(),
+        {0, 0, 0, 128}
+    };
+    request.useCache = true;
+    const auto result = ShaderRecompiler::Recompile(request);
+    device.Dispatch(result, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(code.data()));
+    device.WaitIdle();
+    Wide wide;
+    wide.outcome.pipeline = result.PipelineVariantId();
+    wide.outcome.spirv = result.spirv.Copy();
+    wide.words.assign(Output.begin(), Output.begin() + Lanes * 4u);
+    Require(wide.outcome.pipeline != 0u && !wide.outcome.spirv.empty(), "no specialized module");
+    return wide;
+}
+
+void RequireSameModule(const Wide& left, const Wide& right, const std::string& name) {
+    if (RuntimeFormatEnabled()) Require(left.outcome.pipeline == right.outcome.pipeline && left.outcome.spirv == right.outcome.spirv, name);
+}
+
+void TwoFormattedBuffers(AgcDriver::VulkanDevice& device) {
+    const auto wide = Descriptor(Input.data(), InputBytes, Format32UInt);
+    const auto narrow = Descriptor(Second.data(), 1u, Format16UInt, InputBytes);
+    const auto check = [&](const Wide& run, bool first, bool second, const std::string& name) {
+        for (std::uint32_t lane = 0; lane < Lanes; ++lane) {
+            const auto a = first ? Input[lane] : 0u;
+            const auto b = second ? Second[lane] & 0xffffu : 0u;
+            Require(run.words[lane] == a && run.words[Lanes + lane] == b, name + ": lane " + std::to_string(lane) + " loaded " + Hex(run.words[lane]) + " and " + Hex(run.words[Lanes + lane]) + ", expected " + Hex(a) + " and " + Hex(b));
+        }
+    };
+    const auto none = Dispatch(device, TwoBuffersCode, {GameNull, GameNull});
+    check(none, false, false, "both V# absent");
+    const auto one = Dispatch(device, TwoBuffersCode, {wide, GameNull});
+    check(one, true, false, "first V# present");
+    const auto both = Dispatch(device, TwoBuffersCode, {wide, narrow});
+    check(both, true, true, "both V# present");
+    const auto learned = Dispatch(device, TwoBuffersCode, {ZeroNull, ZeroNull});
+    check(learned, false, false, "both V# learned");
+    RequireSameModule(none, one, "a first V# made another module than the absent pair");
+    RequireSameModule(none, both, "both V# made another module than the absent pair");
+    RequireSameModule(none, learned, "the learned pair made another module than the absent pair");
+    if (!RuntimeFormatEnabled()) Require(none.outcome.pipeline != both.outcome.pipeline, "APS5_NO_ABSENT_RUNTIME_FORMAT shared a module between the absent and the present pair");
+}
+
+std::array<std::uint32_t, 4> WithSelectors(std::array<std::uint32_t, 4> descriptor, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint32_t w) {
+    descriptor[3] = (descriptor[3] & ~0xfffu) | x | (y << 3u) | (z << 6u) | (w << 9u);
+    return descriptor;
+}
+
+void AbsentLoadsZero(AgcDriver::VulkanDevice& device) {
+    const auto identity = Descriptor(Input.data(), InputBytes, Format32UInt);
+    const auto selected = WithSelectors(identity, 0u, 1u, 4u, 0u);
+    const auto absent = Dispatch(device, XyzwRuntimeCode, {GameNull});
+    for (std::uint32_t index = 0; index < absent.words.size(); ++index) Require(absent.words[index] == 0u, "load_format_xyzw through an absent V# returned " + Hex(absent.words[index]) + " at word " + std::to_string(index));
+    const auto referenceIdentity = Dispatch(device, XyzwIdentityReferenceCode, {identity});
+    const auto referenceSelected = Dispatch(device, XyzwSelectReferenceCode, {selected});
+    const auto present = Dispatch(device, XyzwRuntimeCode, {identity});
+    Require(present.words == referenceIdentity.words, "a present V# through the run-time-format module loaded other values than its own module");
+    const auto remapped = Dispatch(device, XyzwRuntimeCode, {selected});
+    Require(remapped.words == referenceSelected.words, "a ONE/ZERO destination select through the run-time-format module loaded other values than its own module");
+    for (std::uint32_t lane = 0; lane < Lanes; ++lane) {
+        Require(remapped.words[lane] == 0u && remapped.words[Lanes + lane] != 0u && remapped.words[Lanes * 2u + lane] == Input[lane] && remapped.words[Lanes * 3u + lane] == 0u, "a ONE/ZERO destination select loaded wrong values at lane " + std::to_string(lane));
+    }
+    RequireSameModule(absent, present, "a present V# made another module than the absent one");
+    RequireSameModule(absent, remapped, "a remapped V# made another module than the absent one");
+}
+
+void MisalignedPresent(AgcDriver::VulkanDevice& device) {
+    const auto absent = Dispatch(device, SingleAbsentCode, {GameNull});
+    Require(std::ranges::all_of(absent.words, [](std::uint32_t word) { return word == 0u || word == Fill; }), "an absent V# loaded a value");
+    const auto misaligned = Descriptor(reinterpret_cast<const std::uint8_t*>(Input.data()) + 2, InputBytes, Format16UInt);
+    const auto shifted = Dispatch(device, SingleAbsentCode, {misaligned});
+    for (std::uint32_t lane = 0; lane < Lanes; ++lane) Require(shifted.words[lane] == ((Input[lane] >> 16u) & 0xffffu), "a misaligned V# loaded " + Hex(shifted.words[lane]) + " at lane " + std::to_string(lane));
+    if (RuntimeFormatEnabled()) Require(shifted.outcome.pipeline != absent.outcome.pipeline, "a misaligned V# reused a module built for an aligned base");
+    const auto aligned = Dispatch(device, SingleAbsentCode, {Descriptor(Input.data(), InputBytes, Format16UInt)});
+    for (std::uint32_t lane = 0; lane < Lanes; ++lane) Require(aligned.words[lane] == (Input[lane] & 0xffffu), "an aligned V# loaded " + Hex(aligned.words[lane]) + " at lane " + std::to_string(lane));
+    RequireSameModule(absent, aligned, "an aligned V# made another module than the absent one");
+}
+
 }
 
 int main() {
@@ -133,6 +253,9 @@ int main() {
         BoundThenNull(*device);
         NullThenBound(*device);
         AbsentThenFormats(*device);
+        TwoFormattedBuffers(*device);
+        AbsentLoadsZero(*device);
+        MisalignedPresent(*device);
         std::puts("buffer presence runtime tests passed");
         return 0;
     } catch (const std::exception& error) {
