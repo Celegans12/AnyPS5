@@ -1163,7 +1163,7 @@ std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderAr
                     alternative[position] = (static_cast<std::uint64_t>(constants[position - 1u].id) << 32u);
                     alternative[position + 1u] = (static_cast<std::uint64_t>(constants[position].id) << 32u) | 1u;
                 }
-                if (const auto found = modules.find(alternative); found != modules.end()) entry = found->second;
+                if (const auto found = modules.find(alternative); found != modules.end() && found->second->built.load(std::memory_order_acquire) && found->second->failure == nullptr) entry = found->second;
             }
         }
         std::unique_lock lock(mutex);

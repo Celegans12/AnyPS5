@@ -833,7 +833,9 @@ std::uint32_t formattedCall(SpirvValueEmitContext& context, const IrValue& instr
             const auto valid = nonzero(state, parameters[8]);
             shared = {ConstantU32(state, 0u), parameters[3], stride, state.module.SpecializationConstant(u32, first + 1u, 0u), swizzle, parameters[0], valid, parameters[1], parameters[2]};
         }
-        const auto value = formatSwitch(context, instruction, shared, components, store, store ? parameters[9] : 0u);
+        const auto runtimeFormat = state.program.Info().buffers.at(memory.resource).descriptorFormatted && state.program.Resources().stage == IrShaderStage::Compute && !state.registrationModules;
+        const auto absentRuntime = runtimeFormat && !store ? both(state, nonzero(state, state.module.SpecializationConstant(u32, first + PipelineSpecialization::BufferRuntimeFormatWord, 0u)), Unary(state, spv::OpLogicalNot, TypeBool(state), shared.valid)) : 0u;
+        const auto value = absentRuntime != 0u ? EmitValueIfElse(state, absentRuntime, valueType, [&] { return components == 1u ? ConstantU32(state, 0u) : ConstantU32CompositeZero(state, components); }, [&] { return formatSwitch(context, instruction, shared, components, store, 0u); }) : formatSwitch(context, instruction, shared, components, store, store ? parameters[9] : 0u);
         if (store) state.module.AddFunction(spv::OpReturn);
         else state.module.AddFunction(spv::OpReturnValue, value);
         state.module.AddFunction(spv::OpFunctionEnd);
