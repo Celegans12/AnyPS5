@@ -5058,6 +5058,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     }
     recordStep(PhaseRecordKeeps);
     if (resources.HeapStage()) {
+        if (record.threadGroup != std::array<std::uint32_t, 3>{}) resources.forgetShaderDataWords(*record.shader);
         resources.RefreshHeapStage(std::span<const Graphics::CompiledShader>(record.shader, 1));
         if (record.bindings != nullptr) resources.RefreshMovedAddresses(*record.bindings);
     }
@@ -5079,10 +5080,10 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     }
     std::shared_ptr<Graphics::Buffer> threadArguments;
     if (record.threadGroup != std::array<std::uint32_t, 3>{}) {
-        const auto data = resources.shaderDataBuffer(*record.shader);
+        const auto [data, dataOffset] = resources.shaderDataLocation(*record.shader, record.bindings.get());
         const auto limitDword = record.shader->program->imageMetadataDword;
         Graphics::Require(data != VK_NULL_HANDLE && limitDword >= 3, "Vulkan dispatch: a thread-dimension dispatch has no ShaderData thread limit");
-        const VkDeviceSize limitByte = static_cast<VkDeviceSize>(limitDword - 3) * sizeof(std::uint32_t);
+        const VkDeviceSize limitByte = dataOffset + static_cast<VkDeviceSize>(limitDword - 3) * sizeof(std::uint32_t);
         Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
         if (argumentImport != nullptr) {
             threadArguments = std::make_shared<Graphics::Buffer>(context, 24, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);

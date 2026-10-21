@@ -114,7 +114,7 @@ BindlessHeap::BindlessHeap(const Context& context) : context(context) {
     samplerHeap = std::make_unique<Buffer>(context, static_cast<std::size_t>(samplerHeapUsed + heapProperties.minSamplerHeapReservedRangeWithEmbedded), heapUsage);
     std::fill(resourceHeap->Bytes().begin(), resourceHeap->Bytes().end(), std::byte{0});
     std::fill(samplerHeap->Bytes().begin(), samplerHeap->Bytes().end(), std::byte{0});
-    constexpr VkBufferUsageFlags ringUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    constexpr VkBufferUsageFlags ringUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     try {
         ring = std::make_unique<Buffer>(context, RingBytes, ringUsage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     } catch (const std::exception&) {
@@ -880,6 +880,10 @@ void BindlessHeap::BindDescriptorHeaps(VkCommandBuffer commands) const {
 
 VkDeviceAddress BindlessHeap::RingAddress() const {
     return ring->DeviceAddress();
+}
+
+VkBuffer BindlessHeap::RingBuffer() const {
+    return ring->Handle();
 }
 
 void BindlessHeap::Submitted(Recorder& recorder, std::uint64_t serial) {

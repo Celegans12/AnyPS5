@@ -38,6 +38,7 @@ public:
     void BindDescriptorHeaps(VkCommandBuffer commands) const;
     bool DescriptorHeapMappings(std::span<const std::uint32_t> spirv, std::vector<VkDescriptorSetAndBindingMappingEXT>& mappings, std::uint32_t workgroupAddressOffset = ~0u, bool rootGds = false, bool rootFault = false) const;
     VkDeviceAddress RingAddress() const;
+    VkBuffer RingBuffer() const;
 
     std::optional<std::uint32_t> TextureSlot(std::uint32_t kind, const std::shared_ptr<Texture>& texture, VkImageView view, VkImageLayout layout);
     std::optional<std::uint32_t> StorageSlot(std::uint32_t kind, std::shared_ptr<void> owner, VkImageView view);

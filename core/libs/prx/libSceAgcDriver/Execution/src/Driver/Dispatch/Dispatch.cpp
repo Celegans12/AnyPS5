@@ -172,7 +172,6 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     };
     constexpr std::size_t computeHeapKey = std::size_t{1} << 61u;
     if (request.target.gpuResolvedImages && HeapFragmentKnown(&snapshot, codeOffset | computeHeapKey) == std::optional(false)) request.target.gpuResolvedImages = false;
-    if (threadGroup != std::array<std::uint32_t, 3>{}) request.target.gpuResolvedImages = false;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     static double captureMs = 0, keyMs = 0, recompileMs = 0, deviceMs = 0;
     static std::uint64_t cacheHits = 0;

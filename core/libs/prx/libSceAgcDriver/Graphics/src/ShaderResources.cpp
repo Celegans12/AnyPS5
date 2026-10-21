@@ -4708,6 +4708,12 @@ VkBuffer ShaderResources::shaderDataBuffer(const CompiledShader& shader) const {
 }
 
 void ShaderResources::forgetShaderDataWords(const CompiledShader& shader) {
+    if (shader.program != nullptr && shader.program->gpuResolvedImages) {
+        auto& stageState = heapStages[HeapStageIndex(shader.stage)];
+        stageState.data.mark.entry = 0;
+        stageState.data.words.clear();
+        stageState.dataInput.clear();
+    }
     if (const auto allocation = shaderDataAllocation(shader)) {
         allocations[*allocation].dataWords.clear();
         rehashDataWords();
@@ -6016,6 +6022,12 @@ std::size_t DataOffsetIndex(std::size_t stage, ShaderRecompiler::RuntimeAbi::Bin
     return stage * 2u + (binding == ShaderRecompiler::RuntimeAbi::Binding::FlattenedSrt ? 1u : 0u);
 }
 
+}
+
+std::pair<VkBuffer, VkDeviceSize> ShaderResources::shaderDataLocation(const CompiledShader& shader, const DrawBindings* rewritten) const {
+    if (!heapStage || shader.program == nullptr || !shader.program->gpuResolvedImages) return {shaderDataBuffer(shader), 0};
+    const auto& offsets = rewritten != nullptr && rewritten->addressOffsets ? rewritten->heapOffsets : heapOffsets;
+    return {BindlessHeap::For(context).RingBuffer(), offsets[DataOffsetIndex(HeapStageIndex(shader.stage), ShaderRecompiler::RuntimeAbi::Binding::ShaderData)]};
 }
 
 void ShaderResources::PatchDataAddresses(std::span<std::byte, PipelinePushConstantBytes> bytes, std::span<const CompiledShader> shaders, const DrawBindings* rewritten) const {
