@@ -450,6 +450,7 @@ void Driver::execute(const Submission& submission) {
             recordQueuedLabelsBeforeRead(submission.queue);
             if (!Pm4::PredicationPasses(queue)) {
                 cursor = opcode == 0x3f ? submission.conditionalEnds.at(cursor) : nextCursor;
+                if (ahead != nullptr) ahead->Skip(aheadSegment, cursor);
                 continue;
             }
         }
@@ -659,7 +660,10 @@ void Driver::execute(const Submission& submission) {
             landPendingWaits(submission.queue);
             recordQueuedLabelsBeforeRead(submission.queue);
             const auto condition = Pm4::ReadCondition(packet);
-            if (condition == 0) nextCursor = submission.conditionalEnds.at(cursor);
+            if (condition == 0) {
+                nextCursor = submission.conditionalEnds.at(cursor);
+                if (ahead != nullptr) ahead->Skip(aheadSegment, nextCursor);
+            }
             if (traceGpu) std::fprintf(stderr, "[gpu] %.1f queue 0x%x COND_EXEC at DWORD %zu reads 0x%x at 0x%llx: %s %zu dwords\n", TraceMs(), submission.queue, cursor, condition, static_cast<unsigned long long>(packet[1] | (static_cast<std::uint64_t>(packet[2]) << 32u)), condition == 0 ? "skips" : "executes", submission.conditionalEnds.at(cursor) - cursor - count);
         } else if (opcode == 0x91) {
             landPendingWaits(submission.queue);

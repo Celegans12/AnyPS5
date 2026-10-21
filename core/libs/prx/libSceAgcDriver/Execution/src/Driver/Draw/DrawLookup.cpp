@@ -177,6 +177,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                     if (rotate) {
                         auto rotated = std::make_shared<DrawEntry>();
                         rotated->decode = entry->decode;
+                        rotated->prepared = entry->prepared;
                         rotated->stages = entry->stages;
                         rotated->shape = entry->shape;
                         rotated->recipes.store(entry->recipes.load());

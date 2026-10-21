@@ -18,6 +18,14 @@ bool DrawRecipeRecord::Matches(const std::vector<std::shared_ptr<DispatchVariant
     return true;
 }
 
+const Graphics::AheadDraw* PreparedDrawRecord::For(const std::vector<std::shared_ptr<DispatchVariant>>& variants, std::size_t shaderCount) const {
+    if (shaderCount != shaders || variants.size() != stages.size()) return nullptr;
+    for (std::size_t i = 0; i < stages.size(); ++i) {
+        if (stages[i].owner_before(variants[i]) || variants[i].owner_before(stages[i])) return nullptr;
+    }
+    return prepared.get();
+}
+
 bool DrawRecipeRecord::Expired() const {
     return std::any_of(stages.begin(), stages.end(), [](const std::weak_ptr<const DispatchVariant>& stage) { return stage.expired(); });
 }
@@ -124,7 +132,7 @@ bool Driver::admitDrawKey(std::uint64_t key, std::uint64_t shape) {
     return drawShapeSightings->SeenBefore(shape);
 }
 
-std::shared_ptr<DrawEntry> BuildAheadEntry(const std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::shared_ptr<const DrawDecode> decode, std::uint64_t shape) {
+std::shared_ptr<DrawEntry> BuildAheadEntry(const std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::shared_ptr<const DrawDecode> decode, std::uint64_t shape, std::shared_ptr<const Graphics::AheadDraw> prepared, std::size_t preparedShaders) {
     auto entry = std::make_shared<DrawEntry>();
     entry->stages.resize(fresh.size());
     entry->decode = std::move(decode);
@@ -133,6 +141,7 @@ std::shared_ptr<DrawEntry> BuildAheadEntry(const std::vector<std::shared_ptr<Dis
     for (std::size_t i = 0; i < fresh.size(); ++i) {
         if (fresh[i] != nullptr) entry->stages[i].push_back(fresh[i]);
     }
+    if (prepared != nullptr) entry->prepared = std::make_shared<const PreparedDrawRecord>(PreparedDrawRecord{{fresh.begin(), fresh.end()}, preparedShaders, std::move(prepared)});
     return entry;
 }
 
@@ -175,6 +184,7 @@ void Driver::admitAheadEntry(std::uint64_t key, const DrawEntry& ahead, std::uin
     std::shared_ptr<DrawEntry> taken;
     auto admitted = std::make_shared<DrawEntry>();
     admitted->decode = ahead.decode;
+    admitted->prepared = ahead.prepared;
     admitted->stages = ahead.stages;
     admitted->shape = shape;
     admitted->recipes.store(ahead.recipes.load());
@@ -223,6 +233,7 @@ void Driver::insertDrawEntry(std::uint64_t key, std::vector<std::shared_ptr<Disp
     if (found != drawCache.end()) {
         if (found->second->stages.size() == fresh.size()) replacement->stages = found->second->stages;
         if (found->second->decode != nullptr) replacement->decode = found->second->decode;
+        replacement->prepared = found->second->prepared;
         replacement->recipes.store(found->second->recipes.load());
     }
     auto resolved = fresh;

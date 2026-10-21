@@ -2885,8 +2885,10 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME agc_driver_draw_ahead_verify COMMAND agc_driver_draw_ahead_tests)
     set_tests_properties(agc_driver_draw_ahead_verify PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_VERIFY_DRAW_ENTRIES=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    add_test(NAME agc_driver_draw_ahead_small_cache COMMAND agc_driver_draw_ahead_tests small-cache)
+    set_tests_properties(agc_driver_draw_ahead_small_cache PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_DRAW_CACHE_ENTRIES=2" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     if(WIN32)
-        set_tests_properties(agc_driver_draw_ahead_verify PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_driver_draw_ahead_verify agc_driver_draw_ahead_small_cache PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 

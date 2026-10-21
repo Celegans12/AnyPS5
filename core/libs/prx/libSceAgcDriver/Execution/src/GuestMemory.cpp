@@ -73,7 +73,7 @@ private:
 };
 
 void requireNotSpeculative(const char* operation) {
-    if (speculativeGate != nullptr) throw std::runtime_error(std::string("guest memory ") + operation + " is not available to a speculative reader");
+    if (speculativeGate != nullptr) throw SpeculativeReadRefused(std::string("guest memory ") + operation + " is not available to a speculative reader");
 }
 
 void require(bool condition, const char* reason) {
@@ -2604,8 +2604,14 @@ void Read(std::uint64_t address, std::span<std::byte> destination, std::size_t a
     GuardRead(address, destination.size());
     if (speculativeGate != nullptr) {
         const SpeculativePin pin;
-        CheckRange(reinterpret_cast<const void*>(address), destination.size(), alignment);
-        require(copyThroughKernel(address, destination), "a speculative guest read found the range unmapped");
+        try {
+            CheckRange(reinterpret_cast<const void*>(address), destination.size(), alignment);
+        } catch (const SpeculativeReadRefused&) {
+            throw;
+        } catch (const std::runtime_error& error) {
+            throw SpeculativeReadRefused(error.what());
+        }
+        if (!copyThroughKernel(address, destination)) throw SpeculativeReadRefused("AGC driver: a speculative guest read found the range unmapped");
         return;
     }
     flushBeforeAccess(address, destination.size());
