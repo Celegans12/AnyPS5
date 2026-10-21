@@ -17,10 +17,10 @@
 |---|---|
 | **Furthest point** | Open world, the Nupur river by the Ainu village, with HUD and quest |
 | **Time to the world** | about 5 minutes from a save near Teshio Ridge (warm shader cache) |
-| **Frame rate in the world** | about **0.5 fps** (5.0-5.3 presents per 10 s in our last same-session pair; this laptop's GPU clocks drift by ~14 % between sessions, so builds are compared back to back in one session) |
-| **Stability** | runs without the second Vulkan queue have been clean so far, the longest about 11 minutes in the world (see known issues) |
+| **Frame rate in the world** | about **0.5-0.6 fps** (5.9 presents per 10 s with the second queue on, 5.45 with it off, in a provisional same-session pair; this laptop's GPU clocks drift by ~14 % between sessions, so builds are compared back to back in one session) |
+| **Stability** | with the second Vulkan queue on its own compute-only queue family, 4 of 4 world runs clean (up to 16 minutes each); see known issues |
 | **Tested on** | Windows 11, RTX 3080 Laptop GPU 16 GB (driver 610.62), 32 GB RAM, MinGW-w64 GCC 15.2.0, Release |
-| **Build** | `020d736b15` (our tree merged with `main` 2026-10-20) + docs, shader-cache SourceVersion `3b35146912b7970c` |
+| **Build** | `63700c68ef` (our tree merged with `main` 2026-10-20, plus the second-queue fixes) + docs, shader-cache SourceVersion `3b35146912b7970c`, title reference T1 exact (`t1-lh6`) |
 
 <table>
 <tr>
@@ -52,6 +52,7 @@
 | 10-19 | +5 % presents, -8 % frame time vs the build above, same session | indirect-draw records read on the GPU, exact f32 path for f16 mix math (one pass 101 -> 27 ms GPU), presenter and barrier trims |
 | 10-19 | **5.1** (+9 % in an in-run A/B, ~2.7 SE) | a dispatch run's staged copy-ins in one prelude with one barrier instead of a barrier per dispatch: the cloth queue's GPU time halves, GPU busy -26 % |
 | 10-21 | **5.0** (the previous build got 4.19 in the same session: +19 % presents, -13 % frame time) | merged with `main` 2026-10-20; three fixes for slowdowns `main` added in the draw committer (buffer pool tiers, exact-size buffer reuse, held-read checks: +18 % in an in-run A/B); the second Vulkan queue off |
+| 10-21 | **5.9** (lane off 5.45 in the same session: +8 % presents, -16 % median frame; provisional) | the cloth compute ring's second Vulkan queue back on, now on a compute-only queue family |
 
 ## Run it
 
@@ -60,11 +61,11 @@ Build as usual ([build instructions](docs/dev/BUILD.md)), then run the game with
 ```
 APS5_SPANNED_WAVE=1 APS5_BINDLESS_IMAGES=1 APS5_BINDLESS_LAZY=1 APS5_NO_RESULT_MEMO=1
 APS5_STAGING_DIFF=1 APS5_PIPELINE_INDIRECT=1 APS5_NO_ADDRESS_DRAW_REUSE=1
-APS5_NO_PIPELINE_JOURNAL=1 APS5_RESOURCE_CACHE_ENTRIES=1024
+APS5_NO_PIPELINE_JOURNAL=1 APS5_RESOURCE_CACHE_ENTRIES=1024 APS5_ASYNC_LANE=51
 ```
 
 - **This build has a new shader-cache version, so the first run compiles cold** and can take 30-60 minutes to reach the world. Later runs start warm.
-- `APS5_ASYNC_LANE=51` (the cloth compute ring on a second Vulkan queue) is **no longer in the env**: it was worth about +13 % presents before the GPU hung (see known issues).
+- `APS5_ASYNC_LANE=51` runs the cloth compute ring on a second Vulkan queue. That queue now comes from a compute-only queue family by default; `APS5_LANE_GRAPHICS_FAMILY=1` goes back to a third queue of the graphics family, which faulted the GPU for us. Without `APS5_ASYNC_LANE`, everything runs on one queue as before.
 - `APS5_NO_PIPELINE_JOURNAL=1` turns off `main`'s startup pipeline replay. `APS5_RESOURCE_CACHE_ENTRIES=1024` is the resource-cache size all our measurements used.
 - `main`'s paths that broke Yōtei on our tree are off here and can be turned back on:
   - `APS5_RESIDENT_LINEAR=1`: resident linear color targets. Wrong spawn, T-pose, camera under water or in the sky (#8152).
@@ -75,17 +76,17 @@ APS5_NO_PIPELINE_JOURNAL=1 APS5_RESOURCE_CACHE_ENTRIES=1024
 - Off switches for the newest local changes:
   - `APS5_NO_SMALL_DEVICE_TIER=1`, `APS5_NO_EXACT_SIZE_REUSE=1`, `APS5_NO_HELD_READ_SKIP=1`, `APS5_NO_HELD_READ_BOUNDS=1`: committer fixes.
   - `APS5_NO_OWED_RUN_CLOSE=1`, `APS5_NO_RUN_ATOMIC_GUARD=1`, `APS5_NO_RUN_STAGED_READ_GUARD=1`: overlap fixes.
-  - `APS5_NO_LANE_OPEN_SERIAL=1`, `APS5_NO_LANE_TEMPLATE_EDGE=1`: second-queue fixes.
+  - `APS5_NO_LANE_OPEN_SERIAL=1`, `APS5_NO_LANE_TEMPLATE_EDGE=1`, `APS5_NO_LANE_LABEL_SCOPE=1`, `APS5_NO_LANE_FORWARD_EDGE=1`, `APS5_NO_LANE_LEASE_WAIT=1`: second-queue fixes.
   - `APS5_NO_DISPATCH_OVERLAP=1`, `APS5_NO_BATCHED_STAGING=1`, `APS5_NO_SPARSE_PAGE_STATES=1`.
   - Every local change has an off switch (`APS5_NO_...`), named in its commit message.
-- Diagnostics: `APS5_GPU_CHECKPOINTS=1`, `APS5_FAULT_ADDRESSES=1` (with `APS5_MEM_STATS=1`), `APS5_LANE_SERIALIZE=1`, `APS5_NO_LANE_OVERLAP=1`.
+- Diagnostics: `APS5_GPU_CHECKPOINTS=1` (`=batch` marks only batch begin/end per queue), `APS5_NV_DIAGNOSTICS=1` (NVIDIA device diagnostics config, so an Nsight Aftermath crash dump can name the fault), `APS5_FAULT_ADDRESSES=1` (with `APS5_MEM_STATS=1`; also reports a buffer destroyed while a pending batch writes it), `APS5_LANE_SERIALIZE=1`, `APS5_NO_LANE_OVERLAP=1`.
 - `APS5_AB=<seconds>:<switch>[,...]` (with `APS5_AB_START=<present>`) alternates two configurations of driver switches in one run, so a comparison needs one run and no run-to-run noise.
 - Leave `APS5_PIPELINE_REQUESTS` unset when you measure: it costs about 12 % of a frame here.
 
 ## Known issues
 
-- **GPU hangs with `APS5_ASYNC_LANE=51`.** With the second queue on, every world run with dispatch overlap hung or hit a GPU write fault within 5-14 minutes: a queue waits 40 s for the GPU, then the device is lost. That held on this build and on the previous one. Three fixes for real cross-queue ordering bugs (each with a test that fails without it) didn't stop it, and neither did serializing the two queues on the GPU. Leave the second queue off until this is found.
-- With the second queue on and dispatch overlap off, we saw one GPU write fault in about 80 minutes of world time.
+- **The second queue needs a compute-only queue family.** On a third queue of the graphics family (the old setup, or a GPU without a compute-only family, where the driver falls back to it), 8 of 9 world runs lost the GPU within 4-14 minutes. An Nsight Aftermath dump showed a DMA page fault inside the second queue's batch. On the compute-only family, 4 of 4 runs were clean. If you hit GPU hangs, leave `APS5_ASYNC_LANE` out.
+- The second queue is tested only on Windows with NVIDIA (RTX 3080 Laptop, driver 610.62). AMD and Linux are untested.
 - A GPU hang can reset NVIDIA's shader store for the game. After that, the saved pipelines no longer load and every run compiles again (long stalls on the last loading screen). If that happens after a hang, expect one slow run.
 - Black shapes on some rocks and terrain (the depth pre-pass and the G-buffer pass disagree on depth). Cause not found yet.
 - Process memory is about 30 GB early in the world, so 32 GB of RAM is tight.
@@ -105,7 +106,7 @@ APS5_NO_PIPELINE_JOURNAL=1 APS5_RESOURCE_CACHE_ENTRIES=1024
   - device-local buffers for address-based compute builds (the cloth programs);
   - copy-backs that store only the changed dwords;
   - dispatch overlap, and dispatch runs that keep staged results and order;
-  - the async compute queue (off in the env above);
+  - the async compute queue on a compute-only queue family, with buffers shared across both families, and fixes for its cross-queue ordering (consumed-label edges, edges that never hold back earlier work, lease waits that cover both queues);
   - indirect-draw parameters read on the GPU for draws whose records are still being written;
   - an exact f32 path for `v_fma_mix` behind a fused-FMA startup check;
   - presenter revalidation prepared off the GPU lock, and a cheaper image-table miss path;
@@ -125,6 +126,7 @@ APS5_NO_PIPELINE_JOURNAL=1 APS5_RESOURCE_CACHE_ENTRIES=1024
 - 2026-10-20: added three fixes for dispatch overlap with staged buffers (`3cbec3212`). Each had a test that failed on the previous build: a reused build lost its results, two atomic adds became one, and a read saw data from before the run. Also FardinHaque70's import re-entry fix and Izamaru's sparse page table. T1 exact, same shader cache. Speed is within noise by presents (in-run A/B: about 1 %), GPU busy +14 %. In the same A/B, the only GPU hang came in a phase with the fixes off.
 - 2026-10-21: added a known issue: GPU hangs with `APS5_ASYNC_LANE=51` (twice in the world on this build). Leave it out if you hit them.
 - 2026-10-21: moved to our tree merged with `main` 2026-10-20 (`020d736b15`). In a same-session pair with the second queue off on both, 4.99 vs 4.19 presents per 10 s (+19 %) and a 2,070 vs 2,372 ms median frame (-13 %). It reaches the world sooner too: frame 85 at 334 s vs 478 s. T1 exact. **New shader-cache version, so the first run compiles cold.** `APS5_ASYNC_LANE=51` is out of the env until its GPU hang is fixed.
+- 2026-10-21: the second queue is back (`63700c68ef`, same shader cache, T1 exact). Its "hang" was a DMA page fault on the GPU tied to the graphics family's third queue: the same work on a compute-only queue family ran clean in 4 of 4 world runs, up to 16 minutes each. The queue now comes from a compute-only family by default, and `APS5_ASYNC_LANE=51` is back in the env. Same-session pair, second queue on vs off: 5.89 vs 5.45 presents per 10 s (+8 %), 1,564 vs 1,852 ms median frame (-16 %). These numbers are **provisional**: an Nsight Aftermath monitor was running during both runs. Also three more cross-queue fixes, each with a test that fails without it.
 
 ---
 
