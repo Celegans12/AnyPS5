@@ -1142,7 +1142,40 @@ std::shared_ptr<const std::set<std::uint32_t>> declaredSpecializationIds(const C
     return declared.emplace(artifact.variantId, std::move(ids)).first->second;
 }
 
-constexpr std::size_t MaxRuntimeFormatReuseBuffers = 6;
+bool RuntimeFormatFlagPosition(const std::vector<std::uint64_t>& key, std::size_t position) {
+    if (position < 2u) return false;
+    const auto id = static_cast<std::uint32_t>(key[position] >> 32u);
+    return id < PipelineSpecialization::ImageBase && id % PipelineSpecialization::BufferWords == PipelineSpecialization::BufferRuntimeFormatWord && static_cast<std::uint32_t>(key[position - 1u] >> 32u) + 1u == id;
+}
+
+struct RuntimeFormatCandidate {
+    std::vector<std::uint64_t> key;
+    std::shared_ptr<SpecializedModuleEntry> entry;
+    std::size_t absent = 0;
+};
+
+std::size_t RuntimeFormatAbsentCount(const std::vector<std::uint64_t>& key) {
+    std::size_t absent = 0;
+    for (std::size_t position = 2; position < key.size(); ++position)
+        if (RuntimeFormatFlagPosition(key, position) && (key[position] & 0xffffffffu) == 1u) ++absent;
+    return absent;
+}
+
+bool RuntimeFormatCompatible(const std::vector<std::uint64_t>& candidate, const std::vector<std::uint64_t>& key) {
+    if (candidate.size() != key.size()) return false;
+    std::vector<bool> swapped(key.size(), false);
+    for (std::size_t position = 1; position < key.size(); ++position) {
+        if ((candidate[position] >> 32u) != (key[position] >> 32u)) return false;
+        if (candidate[position] == key[position] || !RuntimeFormatFlagPosition(key, position)) continue;
+        const auto id = key[position] & ~std::uint64_t{0xffffffffu};
+        if (candidate[position] != (id | 1u) || key[position] != id || (candidate[position - 1u] & 0xffffffffu) != 0u) return false;
+        swapped[position] = true;
+        swapped[position - 1u] = true;
+    }
+    for (std::size_t position = 1; position < key.size(); ++position)
+        if (candidate[position] != key[position] && !swapped[position]) return false;
+    return true;
+}
 
 std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderArtifact& artifact, const IrBindingLayout& layout, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target) {
     struct ModuleKeyStorage {};
@@ -1152,32 +1185,20 @@ std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderAr
     for (const auto& constant : constants) key.push_back((static_cast<std::uint64_t>(constant.id) << 32u) | constant.value);
     static PrimedSharedMutex mutex;
     static std::map<std::vector<std::uint64_t>, std::shared_ptr<SpecializedModuleEntry>> modules;
+    static std::map<std::uint64_t, std::vector<RuntimeFormatCandidate>> runtimeFormats;
     std::shared_ptr<SpecializedModuleEntry> entry;
     {
         std::shared_lock lock(mutex);
         if (const auto found = modules.find(key); found != modules.end()) entry = found->second;
     }
     if (entry == nullptr) {
-        std::vector<std::size_t> formats;
         if (PipelineSpecialization::AbsentRuntimeFormat()) {
-            for (std::size_t position = 1; position < constants.size(); ++position) {
-                const auto& flag = constants[position];
-                if (flag.id >= PipelineSpecialization::ImageBase || flag.id % PipelineSpecialization::BufferWords != PipelineSpecialization::BufferRuntimeFormatWord || flag.value != 0u || constants[position - 1u].id + 1u != flag.id) continue;
-                formats.push_back(position);
-            }
-        }
-        if (!formats.empty() && formats.size() <= MaxRuntimeFormatReuseBuffers) {
-            auto alternative = key;
             std::shared_lock lock(mutex);
-            for (std::size_t mask = 1; mask < (std::size_t{1} << formats.size()) && entry == nullptr; ++mask) {
-                alternative = key;
-                for (std::size_t bit = 0; bit < formats.size(); ++bit) {
-                    if ((mask & (std::size_t{1} << bit)) == 0u) continue;
-                    const auto position = formats[bit];
-                    alternative[position] = (static_cast<std::uint64_t>(constants[position - 1u].id) << 32u);
-                    alternative[position + 1u] = (static_cast<std::uint64_t>(constants[position].id) << 32u) | 1u;
-                }
-                if (const auto found = modules.find(alternative); found != modules.end() && found->second->built.load(std::memory_order_acquire) && found->second->failure == nullptr) entry = found->second;
+            if (const auto list = runtimeFormats.find(artifact.variantId); list != runtimeFormats.end()) {
+                const RuntimeFormatCandidate* best = nullptr;
+                for (const auto& candidate : list->second)
+                    if ((best == nullptr || candidate.absent < best->absent) && RuntimeFormatCompatible(candidate.key, key)) best = &candidate;
+                if (best != nullptr) entry = best->entry;
             }
         }
         std::unique_lock lock(mutex);
@@ -1189,6 +1210,12 @@ std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderAr
             entry->module = buildSpecializedModule(artifact, layout, classes, constants, target);
         } catch (...) {
             entry->failure = std::current_exception();
+        }
+        if (entry->failure == nullptr && PipelineSpecialization::AbsentRuntimeFormat()) {
+            if (const auto absent = RuntimeFormatAbsentCount(key); absent != 0u) {
+                std::unique_lock lock(mutex);
+                runtimeFormats[artifact.variantId].push_back({key, entry, absent});
+            }
         }
     });
     if (entry->failure) std::rethrow_exception(entry->failure);
