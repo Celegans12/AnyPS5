@@ -5162,7 +5162,7 @@ void StorageTexture::blockGenerations(std::vector<std::uint64_t>& generations) c
 namespace {
 
 std::atomic<bool>& ClearHandOverOn() {
-    static std::atomic<bool> on{std::getenv("APS5_NO_CLEAR_HAND_OVER") == nullptr};
+    static std::atomic<bool> on{std::getenv("APS5_CLEAR_HAND_OVER") != nullptr && std::getenv("APS5_NO_CLEAR_HAND_OVER") == nullptr};
     return on;
 }
 

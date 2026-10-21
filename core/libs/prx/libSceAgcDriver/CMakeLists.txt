@@ -1527,7 +1527,7 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME agc_storage_baseline_settled COMMAND agc_driver_recorder_tests --settled-baseline-only)
     add_test(NAME agc_storage_clear_hand_over COMMAND agc_driver_recorder_tests --clear-hand-over-only)
-    set_tests_properties(agc_storage_clear_hand_over PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(agc_storage_clear_hand_over PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "APS5_CLEAR_HAND_OVER=1")
     if(WIN32)
         set_tests_properties(agc_storage_clear_hand_over PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
