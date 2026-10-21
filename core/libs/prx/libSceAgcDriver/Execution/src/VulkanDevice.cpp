@@ -1596,10 +1596,9 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             queueInfo.pQueuePriorities = priorities;
             settleQueue = true;
             settleIndex = 1;
-            const char* computeFamily = std::getenv("APS5_LANE_COMPUTE_FAMILY");
-            if (Graphics::Recorder::AsyncLaneRing() != 0 && !compileOnly && computeFamily != nullptr && std::string_view(computeFamily) == "1") {
-                if (!MemoryStats::Enabled()) std::fprintf(stderr, "[gpu] APS5_LANE_COMPUTE_FAMILY needs APS5_MEM_STATS (its buffer hook shares buffers across the families); the async lane stays in the graphics family\n");
-                for (std::uint32_t i = 0; i < families && MemoryStats::Enabled() && state->asyncFamily == VK_QUEUE_FAMILY_IGNORED; ++i) {
+            const char* graphicsFamily = std::getenv("APS5_LANE_GRAPHICS_FAMILY");
+            if (Graphics::Recorder::AsyncLaneRing() != 0 && !compileOnly && (graphicsFamily == nullptr || std::string_view(graphicsFamily) != "1")) {
+                for (std::uint32_t i = 0; i < families && state->asyncFamily == VK_QUEUE_FAMILY_IGNORED; ++i) {
                     if (i != family && queues[i].queueCount != 0 && (queues[i].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0 && (queues[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) == 0) state->asyncFamily = i;
                 }
             }
@@ -2063,8 +2062,8 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     if (state->asyncQueueWanted) state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, family, 2, &state->asyncQueue);
     if (state->asyncFamily != VK_QUEUE_FAMILY_IGNORED) {
         state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, state->asyncFamily, 0, &state->asyncQueue);
-        MemoryStats::ShareBuffersAcross(family, state->asyncFamily);
-        std::fprintf(stderr, "[gpu] APS5_LANE_COMPUTE_FAMILY: the async lane submits to queue family %u (compute only); buffers are created CONCURRENT across families %u and %u\n", state->asyncFamily, family, state->asyncFamily);
+        state->deviceProc = MemoryStats::ShareBuffersProc(state->device, state->deviceProc, family, state->asyncFamily);
+        std::fprintf(stderr, "[gpu] async compute lane: queue family %u (compute only; APS5_LANE_GRAPHICS_FAMILY=1 uses a third graphics-family queue); buffers are created CONCURRENT across families %u and %u\n", state->asyncFamily, family, state->asyncFamily);
     }
     if (settleQueue) {
         state->settleFamily = settleFamily;
@@ -5215,6 +5214,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     const auto overlapQueue = Graphics::Recorder::TakeDispatchOrder(unordered);
     const auto* groupLimit = state->properties.limits.maxComputeWorkGroupCount;
     // APS5_NO_LANE_OVERLAP=1 (diagnostic, an APS5_AB switch): no dispatch of the async lane (lane 1) overlaps.
+    if (Graphics::Recorder::LaneOwnFamily() && Graphics::Recorder::ThreadLane() == 1) require(!record.shader->program->bindlessHeap && resources.SampledTextures().empty() && resources.StorageImages().empty(), "a dispatch that binds images was recorded into the async lane, whose compute-family queue does not own the images");
     const bool laneOverlap = !recorder.AsyncLaneActive() || Graphics::Recorder::ThreadLane() == 0 || !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoLaneOverlap);
     const bool overlapCapable = laneOverlap && overlapQueue != 0 && Graphics::Recorder::DispatchOverlapEnabled() && arguments == 0 && argumentImport == nullptr && record.shader->program->workgroupMemoryDwords == 0 && (state->checkpointMarker == nullptr || CheckpointsInRuns()) && record.x <= groupLimit[0] && record.y <= groupLimit[1] && record.z <= groupLimit[2] && (Graphics::Recorder::StagedOverlapEnabled() || !resources.HasGpuCopies());
     if (timer.profile && overlapQueue != 0) {

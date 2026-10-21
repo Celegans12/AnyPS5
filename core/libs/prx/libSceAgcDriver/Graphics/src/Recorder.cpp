@@ -42,6 +42,8 @@ namespace AgcDriver::Graphics {
 
 namespace {
 
+std::atomic<bool> laneOwnFamily{false};
+
 Recorder* activeRecorder = nullptr;
 
 bool DrawProfiled() {
@@ -1114,6 +1116,7 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
 }
 
 Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(context), id(nextRecorderId.fetch_add(1)) {
+    laneOwnFamily.store(context.asyncPool != VK_NULL_HANDLE, std::memory_order_relaxed);
     {
         std::lock_guard lock(liveRecordersMutex);
         liveRecorders.push_back(id);
@@ -1308,6 +1311,22 @@ void ForgetPendingCommands(VkCommandBuffer commands) {
     pendingCommands.erase(commands);
 }
 
+}
+
+bool Recorder::LaneOwnFamily() {
+    return laneOwnFamily.load(std::memory_order_relaxed);
+}
+
+void Recorder::FilterLaneBarrier(VkPipelineStageFlags& sourceStage, VkPipelineStageFlags& destinationStage, VkAccessFlags& sourceAccess, VkAccessFlags& destinationAccess) {
+    if (threadLane != 1 || !laneOwnFamily.load(std::memory_order_relaxed)) return;
+    constexpr VkAccessFlags graphicsAccess = VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INPUT_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    constexpr VkPipelineStageFlags graphicsStages = VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_TESSELLATION_CONTROL_SHADER_BIT | VK_PIPELINE_STAGE_TESSELLATION_EVALUATION_SHADER_BIT | VK_PIPELINE_STAGE_GEOMETRY_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT;
+    sourceAccess &= ~graphicsAccess;
+    destinationAccess &= ~graphicsAccess;
+    sourceStage &= ~graphicsStages;
+    destinationStage &= ~graphicsStages;
+    if (sourceStage == 0) sourceStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+    if (destinationStage == 0) destinationStage = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
 }
 
 bool Recorder::PendingCommandsTracked() {
@@ -2362,6 +2381,7 @@ void Recorder::RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const
 }
 
 void Recorder::recordBarrier(VkCommandBuffer commands, VkPipelineStageFlags sourceStage, VkPipelineStageFlags destinationStage, VkAccessFlags sourceAccess, VkAccessFlags destinationAccess) const {
+    FilterLaneBarrier(sourceStage, destinationStage, sourceAccess, destinationAccess);
     if (cmdPipelineBarrier == nullptr) {
         RecordMemoryBarrier(context, commands, sourceStage, destinationStage, sourceAccess, destinationAccess);
         return;

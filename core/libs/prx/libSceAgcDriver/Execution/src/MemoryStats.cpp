@@ -885,6 +885,37 @@ void ShareBuffersAcross(std::uint32_t first, std::uint32_t second) {
     buffersShared.store(true, std::memory_order_release);
 }
 
+namespace {
+
+PFN_vkGetDeviceProcAddr sharedRealProc = nullptr;
+PFN_vkCreateBuffer sharedRealCreateBuffer = nullptr;
+
+VKAPI_ATTR VkResult VKAPI_CALL SharedCreateBuffer(VkDevice device, const VkBufferCreateInfo* info, const VkAllocationCallbacks* allocator, VkBuffer* buffer) {
+    VkBufferCreateInfo shared{};
+    if (info != nullptr && info->sharingMode == VK_SHARING_MODE_EXCLUSIVE && buffersShared.load(std::memory_order_acquire)) {
+        shared = *info;
+        shared.sharingMode = VK_SHARING_MODE_CONCURRENT;
+        shared.queueFamilyIndexCount = 2;
+        shared.pQueueFamilyIndices = sharedFamilies.data();
+        info = &shared;
+    }
+    return sharedRealCreateBuffer(device, info, allocator, buffer);
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL SharedDeviceProc(VkDevice device, const char* name) {
+    if (name != nullptr && std::string_view(name) == "vkCreateBuffer") return reinterpret_cast<PFN_vkVoidFunction>(&SharedCreateBuffer);
+    return sharedRealProc(device, name);
+}
+
+}
+
+PFN_vkGetDeviceProcAddr ShareBuffersProc(VkDevice device, PFN_vkGetDeviceProcAddr real, std::uint32_t first, std::uint32_t second) {
+    sharedRealProc = real;
+    sharedRealCreateBuffer = reinterpret_cast<PFN_vkCreateBuffer>(real(device, "vkCreateBuffer"));
+    ShareBuffersAcross(first, second);
+    return sharedRealCreateBuffer != nullptr ? &SharedDeviceProc : real;
+}
+
 PFN_vkGetDeviceProcAddr TrackDevice(VkDevice device, VkPhysicalDevice physical, const VkPhysicalDeviceMemoryProperties& memory,
                                     PFN_vkGetDeviceProcAddr real, PFN_vkGetPhysicalDeviceMemoryProperties2 budget) {
     if (!Enabled() || real == nullptr || device == VK_NULL_HANDLE) return real;

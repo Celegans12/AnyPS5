@@ -111,6 +111,8 @@ public:
     // (SyncThrough) and Reap progress per lane. Keep() holds an object for both lanes' batches.
     static std::uint32_t AsyncLaneRing();
     static bool PendingCommandsTracked();
+    static bool LaneOwnFamily();
+    static void FilterLaneBarrier(VkPipelineStageFlags& sourceStage, VkPipelineStageFlags& destinationStage, VkAccessFlags& sourceAccess, VkAccessFlags& destinationAccess);
     static bool CommandBufferPending(VkCommandBuffer commands, std::uint64_t generation, int* lane);
     static std::uint64_t CommandBufferGeneration(VkCommandBuffer commands);
     static int LaneOfQueue(std::uint32_t queue);
