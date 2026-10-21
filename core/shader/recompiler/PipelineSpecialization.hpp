@@ -2,6 +2,7 @@
 #define CORE_SHADER_RECOMPILER_PIPELINESPECIALIZATION_HPP
 
 #include <cstdint>
+#include <cstdlib>
 
 namespace ShaderRecompiler {
 
@@ -58,6 +59,13 @@ inline constexpr std::uint32_t DescriptorIndex(std::uint32_t binding, std::uint3
 
 inline constexpr bool IsWorkgroupOffset(std::uint32_t id) {
     return id >= WorkgroupOffsetBase && id < WorkgroupOffsetBase + WorkgroupOffsetWords;
+}
+
+inline constexpr std::uint32_t BufferRuntimeFormatWord = 2u;
+
+inline bool AbsentRuntimeFormat() {
+    static const bool enabled = std::getenv("APS5_NO_ABSENT_RUNTIME_FORMAT") == nullptr;
+    return enabled;
 }
 
 }
