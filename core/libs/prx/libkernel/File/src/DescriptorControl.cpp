@@ -2,10 +2,12 @@
 #include "prx/libkernel/File/include/DirectoryDescriptor.hpp"
 #include "prx/libkernel/File/include/File.hpp"
 #include "prx/libkernel/File/include/RandomDevice.hpp"
+#include "prx/libkernel/File/include/ArchivedFile.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/FileLock.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstddef>
 #include <cstdio>
@@ -105,7 +107,7 @@ static_assert(sizeof(GuestLock) == 32);
 static_assert(offsetof(GuestLock, type) == 20);
 constexpr std::size_t OldGuestLockSize = 24;
 
-enum class Kind { File, Directory, Pipe, Device, RandomDevice };
+enum class Kind { File, Directory, Pipe, Socket, Device, RandomDevice, ArchivedFile };
 
 struct Entry {
     bool closeOnExec = false;
@@ -125,8 +127,10 @@ const char* KindName(Kind kind) {
         case Kind::File: return "file";
         case Kind::Directory: return "directory";
         case Kind::Pipe: return "pipe";
+        case Kind::Socket: return "socket";
         case Kind::Device: return "character device";
         case Kind::RandomDevice: return "random device";
+        case Kind::ArchivedFile: return "file read from app0.zar";
     }
     return "descriptor";
 }
@@ -138,8 +142,9 @@ const char* KindName(Kind kind) {
 #ifdef _WIN32
 std::optional<Kind> Classify(int fd, const char* function) {
     if (fd < 0 || !DescriptorIsOpen_nid_no_patch(fd)) return std::nullopt;
-    if (File::DirectoryDescriptorPath(fd)) return Kind::Directory;
+    if (File::IsDirectoryDescriptor(fd)) return Kind::Directory;
     if (File::IsRandomDevice(fd)) return Kind::RandomDevice;
+    if (File::IsArchivedFile(fd)) return Kind::ArchivedFile;
     switch (::GetFileType(WindowsDescriptorHandle_nid_no_patch(fd))) {
         case FILE_TYPE_DISK: return Kind::File;
         case FILE_TYPE_PIPE: return Kind::Pipe;
@@ -259,11 +264,13 @@ std::optional<Kind> Classify(int fd, const char* function) {
         throw std::runtime_error(std::string(function) + ": fstat failed, fd=" + std::to_string(fd) + ", errno=" + std::to_string(errno));
     }
     if (File::IsRandomDevice(fd)) return Kind::RandomDevice;
+    if (File::IsArchivedFile(fd)) return Kind::ArchivedFile;
     if (S_ISREG(status.st_mode)) return Kind::File;
     if (S_ISDIR(status.st_mode)) return Kind::Directory;
     if (S_ISFIFO(status.st_mode)) return Kind::Pipe;
     if (S_ISCHR(status.st_mode)) return Kind::Device;
-    throw std::runtime_error(std::string(function) + ": descriptor " + std::to_string(fd) + " is neither a file, a directory, a pipe nor a character device");
+    if (S_ISSOCK(status.st_mode)) return Kind::Socket;
+    throw std::runtime_error(std::string(function) + ": descriptor " + std::to_string(fd) + " is neither a file, a directory, a pipe, a socket nor a character device");
 }
 
 int HostStatus(int fd, const char* function) {
@@ -340,7 +347,7 @@ int ChangeStatus(int fd, Kind kind, int mask, int value, const char* function) {
     auto& status = *Materialize(fd).status;
     const int next = (status & ~mask) | (value & mask);
     const int changed = status ^ next;
-    if ((changed & Asynchronous) && (kind == Kind::Pipe || kind == Kind::Device)) Unsupported(function, "O_ASYNC", kind, fd);
+    if ((changed & Asynchronous) && (kind == Kind::Pipe || kind == Kind::Socket || kind == Kind::Device)) Unsupported(function, "O_ASYNC", kind, fd);
     if ((changed & Synchronous) && kind == Kind::File) Unsupported(function, "changing O_FSYNC", kind, fd);
     ApplyHostStatus(fd, kind, changed, next, function);
     status = next;
@@ -366,7 +373,7 @@ int RecordLock(int fd, int command, std::intptr_t argument) {
     GuestLock lock{};
     std::memcpy(&lock, pointer, size);
     const auto kind = Classify(fd, "fcntl");
-    if (!kind || *kind == Kind::Pipe) return Fail(GuestEbadf);
+    if (!kind || *kind == Kind::Pipe || *kind == Kind::Socket) return Fail(GuestEbadf);
     if (*kind != Kind::File && *kind != Kind::Directory) Unsupported("fcntl", "a record lock", *kind, fd);
 #ifdef _WIN32
     return ProcessRecordLock(fd, *kind, current, lock, pointer, size);
@@ -374,10 +381,8 @@ int RecordLock(int fd, int command, std::intptr_t argument) {
     struct flock host{};
     if (lock.type == ReadLock) host.l_type = F_RDLCK;
     else if (lock.type == WriteLock) host.l_type = F_WRLCK;
-    else if (lock.type == Unlock) host.l_type = F_UNLCK;
+    else if (lock.type == Unlock) host.l_type = current == GetLock ? F_RDLCK : F_UNLCK;
     else return Fail(GuestEinval);
-    if (current == GetLock && lock.type == Unlock)
-        throw std::runtime_error("fcntl: F_GETLK with F_UNLCK is not implemented, fd=" + std::to_string(fd));
     host.l_whence = lock.whence;
     host.l_start = static_cast<off_t>(lock.start);
     host.l_len = static_cast<off_t>(lock.length);
@@ -408,8 +413,8 @@ int RecordLock(int fd, int command, std::intptr_t argument) {
 
 int ReadAheadControl(int fd, int command, std::intptr_t argument) {
     const auto kind = Classify(fd, "fcntl");
-    if (!kind || *kind == Kind::Pipe) return Fail(GuestEbadf);
-    if (*kind != Kind::File) return Fail(GuestEnotty);
+    if (!kind || *kind == Kind::Pipe || *kind == Kind::Socket) return Fail(GuestEbadf);
+    if (*kind != Kind::File && *kind != Kind::ArchivedFile) return Fail(GuestEnotty);
     std::lock_guard lock(g_mutex);
     auto& status = *Materialize(fd).status;
     if (command == DarwinReadAhead || argument >= 0) status |= ReadAheadFlag;
@@ -521,8 +526,9 @@ int Ioctl(int fd, std::uint64_t request, void* argument) {
     }
     if (command == ReadableRequest) {
         if (*kind == Kind::RandomDevice) return Fail(GuestEnotty);
-        if (*kind != Kind::File && *kind != Kind::Pipe) Unsupported("ioctl", "FIONREAD", *kind, fd);
-        const int available = Readable(fd, *kind, "ioctl");
+        if (*kind != Kind::File && *kind != Kind::Pipe && *kind != Kind::Socket && *kind != Kind::ArchivedFile) Unsupported("ioctl", "FIONREAD", *kind, fd);
+        const auto archived = File::ArchivedFileRemaining(fd);
+        const int available = archived ? static_cast<int>(std::min<std::int64_t>(*archived, std::numeric_limits<int>::max())) : Readable(fd, *kind, "ioctl");
         if (argument == nullptr) return Fail(GuestEfault);
         const GuestArena::HostWrite destination(argument, sizeof(available));
         if (!destination.Open()) return Fail(GuestEfault);
@@ -544,6 +550,7 @@ void RememberDescriptor(int fd, int openFlags) {
 }
 
 void ShareDescriptor(int from, int to) {
+    File::ShareArchivedFile(from, to);
     std::lock_guard lock(g_mutex);
     auto status = Materialize(from).status;
     g_entries[to] = Entry{false, std::move(status)};
@@ -554,8 +561,27 @@ void ShareDescriptor(int from, int to) {
 }
 
 void ForgetDescriptor(int fd) {
+    File::ForgetArchivedFile(fd);
     std::lock_guard lock(g_mutex);
     g_entries.erase(fd);
+}
+
+bool Appends(int fd) {
+    std::lock_guard lock(g_mutex);
+    const auto found = g_entries.find(fd);
+    return found != g_entries.end() && found->second.status && (*found->second.status & Append) != 0;
+}
+
+bool IsVnode(int fd) {
+    if (fd < 0 || File::IsRandomDevice(fd)) return false;
+    if (File::IsArchivedFile(fd)) return true;
+#ifdef _WIN32
+    if (!DescriptorIsOpen_nid_no_patch(fd)) return false;
+    return File::DirectoryDescriptorPath(fd) || ::GetFileType(WindowsDescriptorHandle_nid_no_patch(fd)) == FILE_TYPE_DISK;
+#else
+    struct stat status{};
+    return ::fstat(fd, &status) == 0 && (S_ISREG(status.st_mode) || S_ISDIR(status.st_mode));
+#endif
 }
 
 }

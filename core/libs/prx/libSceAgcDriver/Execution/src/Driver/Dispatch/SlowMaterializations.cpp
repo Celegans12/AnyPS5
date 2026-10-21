@@ -84,13 +84,13 @@ void Compare(ProgramStats& stats, const ShaderRecompiler::ImageTableSnapshot& no
         for (std::size_t key = 0; key < shared; ++key) {
             if (a.codes[key] != b.codes[key]) ++stats.keysDiffering;
         }
+        const auto words = std::min(a.words.size(), b.words.size());
+        for (std::size_t word = 0; word < words; ++word) {
+            if (!(a.words[word] == b.words[word])) ++stats.wordsDiffering;
+        }
+        if (a.words.size() > b.words.size()) stats.wordsAdded += a.words.size() - b.words.size();
     }
     if (layout || now.ranges != before.ranges) ++stats.layoutChanged;
-    const auto shared = std::min(now.words.size(), before.words.size());
-    for (std::size_t word = 0; word < shared; ++word) {
-        if (!(now.words[word] == before.words[word])) ++stats.wordsDiffering;
-    }
-    if (now.words.size() > before.words.size()) stats.wordsAdded += now.words.size() - before.words.size();
 }
 
 void Report(State& current) {
@@ -147,7 +147,8 @@ void NoteSlowMaterialization(std::uint32_t queue, std::uint64_t address, const S
     stats.tables = tables.tables.size();
     stats.keys = 0;
     for (const auto& table : tables.tables) stats.keys += table.codes.size();
-    stats.distinct = tables.words.size();
+    stats.distinct = 0;
+    for (const auto& table : tables.tables) stats.distinct += table.words.size();
     stats.queues.insert(queue);
     auto& history = current.recent[address];
     if (!history.empty()) {

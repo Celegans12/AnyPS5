@@ -26,6 +26,11 @@ int APS5_VABI sceUserServiceGetAccessibilityChatTranscription(int user_id, int32
  return ReportAccessibilitySetting(user_id, chat_transcription, 0);
 }
 
+int APS5_VABI sceUserServiceGetAccessibilityKeyremapEnable() {
+ NotImplemented_nid_no_patch(__func__);
+ return 0;
+}
+
 int APS5_VABI sceUserServiceGetAccessibilityPressAndHoldDelay(int user_id, int32_t* press_and_hold_delay) {
  return ReportAccessibilitySetting(user_id, press_and_hold_delay, 0);
 }
@@ -36,6 +41,11 @@ int APS5_VABI sceUserServiceGetAccessibilityTriggerEffect(int user_id, int32_t* 
 
 int APS5_VABI sceUserServiceGetAccessibilityVibration(int user_id, int32_t* vibration) {
  return ReportAccessibilitySetting(user_id, vibration, 1);
+}
+
+int APS5_VABI sceUserServiceGetAccessibilityZoom() {
+ NotImplemented_nid_no_patch(__func__);
+ return 0;
 }
 
 int APS5_VABI sceUserServiceGetAccessibilityZoomEnabled(int user_id, int32_t* zoom_enabled) {
@@ -138,8 +148,11 @@ int APS5_VABI sceUserServiceGetUserNumber(int user_id, int32_t* number) {
  return USER_SERVICE_OK;
 }
 
-int APS5_VABI sceUserServiceInitialize(const void* params) {
- (void)params;
+static bool ValidThreadPriority(int priority) {
+ return priority >= USER_SERVICE_THREAD_PRIORITY_MIN && priority <= USER_SERVICE_THREAD_PRIORITY_MAX;
+}
+
+static int MarkInitialized() {
  if (initialized.exchange(true)) {
   return USER_SERVICE_ERROR_ALREADY_INITIALIZED;
  }
@@ -147,11 +160,22 @@ int APS5_VABI sceUserServiceInitialize(const void* params) {
  return USER_SERVICE_OK;
 }
 
-int APS5_VABI sceUserServiceInitialize2(void) {
- if (!initialized.exchange(true)) {
-  loginReported.store(false);
+int APS5_VABI sceUserServiceInitialize(const void* params) {
+ if (params != nullptr) {
+  int priority = 0;
+  std::memcpy(&priority, params, sizeof(priority));
+  if (!ValidThreadPriority(priority)) {
+   return USER_SERVICE_ERROR_INVALID_ARGUMENT;
+  }
  }
- return USER_SERVICE_OK;
+ return MarkInitialized();
+}
+
+int APS5_VABI sceUserServiceInitialize2(int priority) {
+ if (!ValidThreadPriority(priority)) {
+  return USER_SERVICE_ERROR_INVALID_ARGUMENT;
+ }
+ return MarkInitialized();
 }
 
 int APS5_VABI sceUserServiceTerminate(void) {

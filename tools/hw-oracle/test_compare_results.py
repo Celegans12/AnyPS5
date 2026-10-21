@@ -178,6 +178,26 @@ class CompareResultsTests(unittest.TestCase):
                     self.assertIn("1 differing words", result.stdout)
                     self.assertIn(f"row 1025, v{9 + outs}", result.stdout)
 
+    def test_diagnostic_limit_does_not_limit_comparison_or_hide_failure(self):
+        after = copy.deepcopy(self.report)
+        after["rows"][0]["output"][0] = 1
+        after["rows"][1]["output"] = [2, 3]
+        self.cli(after=after)
+        for limit, shown in ((0, 0), (1, 1), (3, 3), (10, 3)):
+            with self.subTest(limit=limit):
+                result = subprocess.run([sys.executable, str(SCRIPT), str(self.before), str(self.after),
+                                         "--max-differences", str(limit)], capture_output=True, text=True)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("3 differing words", result.stdout)
+                self.assertEqual(sum(line.startswith("row ") for line in result.stdout.splitlines()), shown)
+                if shown < 3:
+                    self.assertIn(f"{3 - shown} additional differing words omitted", result.stdout)
+        result = subprocess.run([sys.executable, str(SCRIPT), str(self.before), str(self.after),
+                                 "--max-differences", "-1"], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+
+
 
 if __name__ == "__main__":
     unittest.main()

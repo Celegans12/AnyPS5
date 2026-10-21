@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <initializer_list>
 #include <map>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -294,10 +295,11 @@ bool writesScalar(const RdnaInstruction& instruction, std::uint32_t index, std::
     return covers(instruction.destination) || covers(instruction.destination2);
 }
 
-bool findLastWriter(const RdnaProgram& program, std::uint32_t end, std::initializer_list<std::uint32_t> indices, std::uint32_t& writer, std::uint32_t waveSize = 0u) {
+bool findLastWriter(const RdnaProgram& program, std::uint32_t end, std::initializer_list<std::uint32_t> indices, std::uint32_t& writer, std::uint32_t waveSize = 0u, std::uint32_t skipBranchesPast = 0u) {
     for (auto position = end; position-- > 0u;) {
         const auto& instruction = program.instructions[position];
-        if (IsDirectBranchOpcode(instruction.op) || instruction.op == RdnaOpcode::SSetpcB64 || instruction.op == RdnaOpcode::SEndpgm) return false;
+        const bool skipped = skipBranchesPast != 0u && IsDirectBranchOpcode(instruction.op) && instruction.op != RdnaOpcode::SBranch && instruction.branchTarget > skipBranchesPast;
+        if ((IsDirectBranchOpcode(instruction.op) && !skipped) || instruction.op == RdnaOpcode::SSetpcB64 || instruction.op == RdnaOpcode::SEndpgm) return false;
         if (std::ranges::any_of(indices, [&](std::uint32_t index) { return writesScalar(instruction, index, waveSize); })) {
             writer = position;
             return true;
@@ -1286,10 +1288,10 @@ bool isScalarBufferLoad(RdnaOpcode op) {
     }
 }
 
-bool loadedDword(const RdnaProgram& program, std::uint32_t reg, std::uint32_t before, std::uint32_t waveSize, std::uint32_t& load, std::uint32_t& dword) {
+bool loadedDword(const RdnaProgram& program, std::uint32_t reg, std::uint32_t before, std::uint32_t waveSize, std::uint32_t skipBranchesPast, std::uint32_t& load, std::uint32_t& dword) {
     for (std::uint32_t copies = 0; copies < 4u; ++copies) {
         std::uint32_t writer = 0;
-        if (!findLastWriter(program, before, {reg}, writer, waveSize)) return false;
+        if (!findLastWriter(program, before, {reg}, writer, waveSize, skipBranchesPast)) return false;
         const auto& instruction = program.instructions[writer];
         const auto destination = scalarIndex(instruction.destination);
         const auto source = scalarIndex(instruction.source0);
@@ -1307,6 +1309,49 @@ bool loadedDword(const RdnaProgram& program, std::uint32_t reg, std::uint32_t be
         before = writer;
     }
     return false;
+}
+
+bool reachingWriter(const RdnaProgram& program, std::uint32_t reader, std::initializer_list<std::uint32_t> indices, std::uint32_t& writer, std::uint32_t waveSize) {
+    std::multimap<std::uint32_t, std::uint32_t> branches;
+    std::set<std::uint32_t> callTargets;
+    for (std::uint32_t index = 0; index < program.instructions.size(); ++index) {
+        const auto& instruction = program.instructions[index];
+        std::uint32_t target = 0;
+        if (IsDirectBranchOpcode(instruction.op)) branches.emplace(instruction.branchTarget, index);
+        else if (instruction.op == RdnaOpcode::SSetpcB64 && resolveSetpcTarget(program, index, target)) branches.emplace(target, index);
+        else if (instruction.op == RdnaOpcode::SCallB64) callTargets.insert(instruction.branchTarget);
+    }
+    std::vector<bool> seen(program.instructions.size());
+    std::vector<std::uint32_t> pending;
+    const auto predecessors = [&](std::uint32_t index) {
+        if (index == 0u || callTargets.contains(program.instructions[index].programCounter)) return false;
+        const auto before = pending.size();
+        const auto op = program.instructions[index - 1u].op;
+        if (op != RdnaOpcode::SBranch && op != RdnaOpcode::SEndpgm && op != RdnaOpcode::SCodeEnd && op != RdnaOpcode::SSetpcB64) pending.push_back(index - 1u);
+        const auto [first, last] = branches.equal_range(program.instructions[index].programCounter);
+        for (auto branch = first; branch != last; ++branch) pending.push_back(branch->second);
+        return pending.size() != before;
+    };
+    if (!predecessors(reader)) return false;
+    std::optional<std::uint32_t> found;
+    while (!pending.empty()) {
+        const auto index = pending.back();
+        pending.pop_back();
+        if (seen[index]) continue;
+        seen[index] = true;
+        const auto& instruction = program.instructions[index];
+        std::uint32_t target = 0;
+        if (instruction.op == RdnaOpcode::SCallB64 || (instruction.op == RdnaOpcode::SSwappcB64 && resolveSetpcTarget(program, index, target))) return false;
+        if (std::ranges::any_of(indices, [&](std::uint32_t reg) { return writesScalar(instruction, reg, waveSize); })) {
+            if (found.has_value() && *found != index) return false;
+            found = index;
+            continue;
+        }
+        if (!predecessors(index)) return false;
+    }
+    if (!found.has_value()) return false;
+    writer = *found;
+    return true;
 }
 
 std::uint32_t branchWord(std::uint32_t opcode, std::size_t from, std::size_t to, const char* what) {
@@ -1445,28 +1490,40 @@ std::vector<TableCall> FindTableCalls(const RdnaProgram& program, const SwappcIn
         const auto target = scalarIndex(instruction.source0);
         if (link == NoScalarRegister || link % 2u != 0u || link > 104u || target == NoScalarRegister || target % 2u != 0u || target > 104u) continue;
         std::uint32_t lowLoad = 0, lowDword = 0, highLoad = 0, highDword = 0;
-        if (!loadedDword(program, target, index, swappc.waveSize, lowLoad, lowDword) || !loadedDword(program, target + 1u, index, swappc.waveSize, highLoad, highDword)) continue;
+        const auto reader = instruction.programCounter;
+        if (!loadedDword(program, target, index, swappc.waveSize, reader, lowLoad, lowDword) || !loadedDword(program, target + 1u, index, swappc.waveSize, reader, highLoad, highDword)) continue;
         if (lowLoad != highLoad || highDword != lowDword + 1u || !sameBlock(lowLoad, index)) continue;
         const auto& load = program.instructions[lowLoad];
         const auto descriptor = scalarIndex(load.source0);
         if (load.source0.kind != RdnaOperandKind::ScalarRegister || descriptor % 4u != 0u || load.memoryOffset >= 0x100000u || (load.memoryOffset & 3u) != 0u) continue;
         std::uint32_t descriptorLoad = 0;
-        if (!findLastWriter(program, lowLoad, {descriptor, descriptor + 1u, descriptor + 2u, descriptor + 3u}, descriptorLoad, swappc.waveSize) || !sameBlock(descriptorLoad, index)) continue;
+        const bool sameBlockWriter = findLastWriter(program, lowLoad, {descriptor, descriptor + 1u, descriptor + 2u, descriptor + 3u}, descriptorLoad, swappc.waveSize, reader) && sameBlock(descriptorLoad, index);
+        if (!sameBlockWriter && !reachingWriter(program, lowLoad, {descriptor, descriptor + 1u, descriptor + 2u, descriptor + 3u}, descriptorLoad, swappc.waveSize)) continue;
         const auto& table = program.instructions[descriptorLoad];
         const auto pointer = scalarIndex(table.source0);
-        if (table.op != RdnaOpcode::SLoadDwordx4 || !isScalar(table.destination, descriptor) || table.source0.kind != RdnaOperandKind::ScalarRegister || table.source1.kind != RdnaOperandKind::Null ||
-            table.memoryOffset >= 0x100000u || (table.memoryOffset & 3u) != 0u || !userData(pointer) || !userData(pointer + 1u) ||
-            !unchangedUntil(program, pointer, descriptorLoad, swappc.waveSize) || !unchangedUntil(program, pointer + 1u, descriptorLoad, swappc.waveSize)) continue;
+        if (table.op != RdnaOpcode::SLoadDwordx4 || !isScalar(table.destination, descriptor) || pointer == NoScalarRegister || pointer % 2u != 0u || table.source1.kind != RdnaOperandKind::Null ||
+            table.memoryOffset >= 0x100000u || (table.memoryOffset & 3u) != 0u) continue;
+        std::optional<std::uint64_t> constantPointer;
+        if (!(userData(pointer) && userData(pointer + 1u) && unchangedUntil(program, pointer, descriptorLoad, swappc.waveSize) && unchangedUntil(program, pointer + 1u, descriptorLoad, swappc.waveSize))) {
+            std::uint32_t lowWriter = 0, highWriter = 0, low = 0, high = 0;
+            if (!findLastWriter(program, descriptorLoad, {pointer}, lowWriter, swappc.waveSize, reader) || !findLastWriter(program, descriptorLoad, {pointer + 1u}, highWriter, swappc.waveSize, reader) ||
+                !sameBlock(std::min(lowWriter, highWriter), descriptorLoad)) continue;
+            const auto& lowMove = program.instructions[lowWriter];
+            const auto& highMove = program.instructions[highWriter];
+            if (lowMove.op != RdnaOpcode::SMovB32 || highMove.op != RdnaOpcode::SMovB32 || !isScalar(lowMove.destination, pointer) || !isScalar(highMove.destination, pointer + 1u) ||
+                !isImmediate(lowMove.source0, low) || !isImmediate(highMove.source0, high)) continue;
+            constantPointer = static_cast<std::uint64_t>(high) << 32u | low;
+        }
         std::uint32_t stride = 0;
         if (load.source1.kind != RdnaOperandKind::Null) {
             const auto offset = scalarIndex(load.source1);
             std::uint32_t shift = 0, shiftIndex = 0;
-            if (offset == NoScalarRegister || !findLastWriter(program, lowLoad, {offset}, shiftIndex, swappc.waveSize) || !sameBlock(shiftIndex, index)) continue;
+            if (offset == NoScalarRegister || !findLastWriter(program, lowLoad, {offset}, shiftIndex, swappc.waveSize, reader) || !sameBlock(shiftIndex, index)) continue;
             const auto& shifted = program.instructions[shiftIndex];
             if (shifted.op != RdnaOpcode::SLshlB32 || !isScalar(shifted.destination, offset) || !isImmediate(shifted.source1, shift) || shift < 2u || shift > 24u) continue;
             stride = 1u << shift;
         }
-        calls.push_back({instruction.programCounter, link, target, pointer, table.memoryOffset, load.memoryOffset + lowDword * 4u, stride});
+        calls.push_back({instruction.programCounter, link, target, constantPointer ? 0u : pointer, table.memoryOffset, load.memoryOffset + lowDword * 4u, stride, constantPointer});
     }
     return calls;
 }

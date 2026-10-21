@@ -1,5 +1,7 @@
 if(NOT WIN32)
-    string(REPLACE "-static " "" CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ")
+    foreach(runtimeLinkFlag IN ITEMS -static-libgcc -static-libstdc++ -static)
+        string(REPLACE "${runtimeLinkFlag}" "" CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS}")
+    endforeach()
     string(STRIP "${CMAKE_EXE_LINKER_FLAGS}" CMAKE_EXE_LINKER_FLAGS)
 endif()
 
@@ -196,6 +198,29 @@ if(APS5_ENABLE_TRACY)
     list(APPEND PATCHED_OUTPUTS ${TRACY_CLIENT_COPIED})
 endif()
 
+if(TARGET mimalloc)
+    add_executable(pe_import_first ${CMAKE_CURRENT_SOURCE_DIR}/allocator/PeImportFirstMain.cpp ${CMAKE_CURRENT_SOURCE_DIR}/allocator/PeImportFirst.cpp)
+    target_compile_features(pe_import_first PRIVATE cxx_std_20)
+    if(MINGW)
+        target_compile_options(pe_import_first PRIVATE -fasynchronous-unwind-tables)
+        target_link_options(pe_import_first PRIVATE -static -static-libgcc -static-libstdc++)
+    endif()
+    add_custom_command(
+            OUTPUT ${PATCHED_DIR}/mimalloc.dll
+            COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:mimalloc> ${PATCHED_DIR}/mimalloc.dll
+            COMMAND $<TARGET_FILE:pe_import_first> ${PATCHED_DIR}/mimalloc.dll mimalloc-redirect.dll
+            DEPENDS mimalloc pe_import_first
+            COMMENT "Copying mimalloc.dll beside the libraries, its redirection module imported first"
+    )
+    add_custom_command(
+            OUTPUT ${PATCHED_DIR}/mimalloc-redirect.dll
+            COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE_DIR:mimalloc>/mimalloc-redirect.dll ${PATCHED_DIR}/mimalloc-redirect.dll
+            DEPENDS mimalloc
+            COMMENT "Copying mimalloc-redirect.dll beside the libraries"
+    )
+    list(APPEND PATCHED_OUTPUTS ${PATCHED_DIR}/mimalloc.dll ${PATCHED_DIR}/mimalloc-redirect.dll)
+endif()
+
 add_custom_target(libs DEPENDS ${PATCHED_OUTPUTS})
 
 if(BUILD_TESTING)
@@ -217,10 +242,21 @@ if(BUILD_TESTING)
     add_test(NAME nid_buffer_validation COMMAND nid_buffer_validation_tests)
     set_tests_properties(nid_buffer_validation PROPERTIES TIMEOUT 10)
 
+    add_test_executable(pe_import_first_tests allocator/tests/PeImportFirstTests.cpp allocator/PeImportFirst.cpp)
+    target_include_directories(pe_import_first_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_features(pe_import_first_tests PRIVATE cxx_std_20)
+    if(MINGW)
+        target_compile_options(pe_import_first_tests PRIVATE -fasynchronous-unwind-tables)
+    endif()
+    add_test(NAME pe_import_first COMMAND pe_import_first_tests)
+    set_tests_properties(pe_import_first PROPERTIES TIMEOUT 10)
+
     find_package(Python3 QUIET COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)
         add_test(NAME nid_gnu_hash COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/nid/tests/test_gnu_hash.py $<TARGET_FILE:nid_patcher>)
+        add_test(NAME nid_elf_duplicates COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/nid/tests/test_elf_duplicates.py $<TARGET_FILE:nid_patcher>)
         add_test(NAME nid_patcher_macho COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/nid/tests/test_macho_nids.py $<TARGET_FILE:nid_patcher>)
         add_test(NAME nid_patcher_native_paths COMMAND ${Python3_EXECUTABLE}
@@ -238,6 +274,17 @@ if(BUILD_TESTING)
         target_link_options(patched_libraries_tests PRIVATE -static -static-libgcc -static-libstdc++)
     endif()
     add_test(NAME patched_libraries COMMAND patched_libraries_tests ${PATCHED_DIR})
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_library(host_libstdcxx_exception_module SHARED tests/HostLibstdcxxExceptionModule.cpp)
+        target_link_libraries(host_libstdcxx_exception_module PRIVATE ${PATCHED_DIR}/libc.prx)
+        add_dependencies(host_libstdcxx_exception_module libs)
+        add_test_executable(host_libstdcxx_exception_tests tests/HostLibstdcxxException.cpp)
+        target_link_libraries(host_libstdcxx_exception_tests PRIVATE host_libstdcxx_exception_module ${PATCHED_DIR}/libc.prx)
+        add_dependencies(host_libstdcxx_exception_tests libs)
+        set_target_properties(host_libstdcxx_exception_module host_libstdcxx_exception_tests PROPERTIES BUILD_RPATH ${PATCHED_DIR})
+        add_test(NAME host_libstdcxx_exception COMMAND host_libstdcxx_exception_tests)
+        set_tests_properties(host_libstdcxx_exception PROPERTIES TIMEOUT 20)
+    endif()
     if(Python3_Interpreter_FOUND)
         add_test(NAME nid_elf_layout COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/nid/tests/test_elf_layout.py $<TARGET_FILE:nid_patcher>)
@@ -257,6 +304,7 @@ if(BUILD_TESTING)
     endif()
     if(APPLE)
         add_subdirectory(tests/write_watch)
+        add_subdirectory(tests/guest_arena)
     endif()
     if(WIN32)
         add_test_executable(windows_write_watch_tests tests/WindowsWriteWatch.cpp)
@@ -275,6 +323,35 @@ if(BUILD_TESTING)
         add_test(NAME undeliverable_host_exception COMMAND undeliverable_host_exception_tests $<TARGET_FILE:libc>)
         set_tests_properties(undeliverable_host_exception PROPERTIES
             PASS_REGULAR_EXPRESSION "C\\+\\+ exception St9bad_alloc raised on thread [0-9]+ cannot be delivered: 0x[0-9a-f]+ undeliverable_host_exception_tests\\.exe\\+0x[0-9a-f]+ has no unwind data")
+    endif()
+
+    add_test_executable(crash_text_tests tests/CrashText.cpp)
+    target_include_directories(crash_text_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    if(MINGW)
+        target_compile_options(crash_text_tests PRIVATE -fasynchronous-unwind-tables)
+    endif()
+    add_test(NAME crash_text COMMAND crash_text_tests)
+
+    if(WIN32)
+        add_test_executable(windows_crash_text_tests tests/WindowsCrashText.cpp)
+        add_dependencies(windows_crash_text_tests libc)
+        if(MINGW)
+            target_compile_options(windows_crash_text_tests PRIVATE -fasynchronous-unwind-tables)
+        endif()
+        add_test(NAME windows_crash_text COMMAND windows_crash_text_tests $<TARGET_FILE:libc>)
+        set_tests_properties(windows_crash_text PROPERTIES TIMEOUT 20
+            PASS_REGULAR_EXPRESSION "faulting[^~]*FATAL: unhandled exception 0xc0000005[^~]*  \\[r12\\] \"allocation failed in the heap\"[\r\n]+  \\[r13\\] u\"LowLevelFatalError \\[File:Unknown\\] \\[Line: 42\\] Out of memory\"[\r\n]+  \\[r14\\] \"PAGE END\"[.][.][.]"
+            FAIL_REGULAR_EXPRESSION "\\[rbx\\] u?\"|did not fault")
+    endif()
+
+    add_test_executable(guest_voice_port_attr_tests tests/GuestVoicePortAttr.cpp)
+    target_include_directories(guest_voice_port_attr_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(guest_voice_port_attr_tests PRIVATE libSceVoice libc)
+    configure_windows_unwind(guest_voice_port_attr_tests)
+    add_test(NAME guest_voice_port_attr COMMAND guest_voice_port_attr_tests)
+    if(WIN32)
+        set_tests_properties(guest_voice_port_attr PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceVoice>")
     endif()
 
     add_test_executable(guest_offline_imports_tests tests/GuestOfflineImports.cpp)
@@ -299,6 +376,26 @@ if(BUILD_TESTING)
     if(WIN32)
         set_tests_properties(guest_signin_dialog PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceSigninDialog>")
+    endif()
+
+    add_test_executable(guest_usb_storage_dialog_tests tests/GuestUsbStorageDialog.cpp)
+    target_include_directories(guest_usb_storage_dialog_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(guest_usb_storage_dialog_tests PRIVATE libSceUsbStorageDialog libc)
+    configure_windows_unwind(guest_usb_storage_dialog_tests)
+    add_test(NAME guest_usb_storage_dialog COMMAND guest_usb_storage_dialog_tests)
+    if(WIN32)
+        set_tests_properties(guest_usb_storage_dialog PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceUsbStorageDialog>")
+    endif()
+
+    add_test_executable(guest_game_live_streaming_tests tests/GuestGameLiveStreaming.cpp)
+    target_include_directories(guest_game_live_streaming_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(guest_game_live_streaming_tests PRIVATE libSceGameLiveStreaming libc)
+    configure_windows_unwind(guest_game_live_streaming_tests)
+    add_test(NAME guest_game_live_streaming COMMAND guest_game_live_streaming_tests)
+    if(WIN32)
+        set_tests_properties(guest_game_live_streaming PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceGameLiveStreaming>")
     endif()
 
     add_test_executable(guest_netctl_ap_dialog_tests tests/GuestNetCtlApDialog.cpp)
@@ -348,6 +445,16 @@ if(BUILD_TESTING)
     add_test(NAME guest_rudp_pump COMMAND guest_rudp_pump_tests)
     if(WIN32)
         set_tests_properties(guest_rudp_pump PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceRudp>")
+    endif()
+
+    add_test_executable(guest_rudp_context_lifecycle_tests tests/GuestRudpContextLifecycle.cpp)
+    target_include_directories(guest_rudp_context_lifecycle_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(guest_rudp_context_lifecycle_tests PRIVATE libSceRudp libc)
+    configure_windows_unwind(guest_rudp_context_lifecycle_tests)
+    add_test(NAME guest_rudp_context_lifecycle COMMAND guest_rudp_context_lifecycle_tests)
+    if(WIN32)
+        set_tests_properties(guest_rudp_context_lifecycle PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceRudp>")
     endif()
 
@@ -401,6 +508,18 @@ if(BUILD_TESTING)
         set_tests_properties(savedata_memory_growth savedata_memory_growth_read_failure PROPERTIES
             ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceSaveData.native>")
     endif()
+    add_test_executable(savedata_memory_journal_tests tests/SaveDataMemoryJournal.cpp)
+    target_include_directories(savedata_memory_journal_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(savedata_memory_journal_tests PRIVATE libSceSaveData.native)
+    configure_windows_unwind(savedata_memory_journal_tests)
+    if(MINGW)
+        target_compile_options(savedata_memory_journal_tests PRIVATE -fasynchronous-unwind-tables)
+    endif()
+    add_test(NAME savedata_memory_journal COMMAND savedata_memory_journal_tests)
+    if(WIN32)
+        set_tests_properties(savedata_memory_journal PROPERTIES
+            ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceSaveData.native>")
+    endif()
     add_library(host_thread_local_test_library SHARED tests/HostThreadLocalLibrary.cpp)
     set_target_properties(host_thread_local_test_library PROPERTIES RUNTIME_OUTPUT_DIRECTORY "$<1:${ANYPS5_TEST_OUTPUT_DIRECTORY}>")
     target_include_directories(host_thread_local_test_library PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -416,6 +535,16 @@ if(BUILD_TESTING)
         add_test(NAME prx_thread_local_destructors COMMAND ${CMAKE_COMMAND} -DNM=${CMAKE_NM} -DOBJDUMP=${CMAKE_OBJDUMP}
             -DMODULES=$<TARGET_FILE_DIR:libc> -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/ThreadLocalDestructors.cmake)
         set_tests_properties(prx_thread_local_destructors PROPERTIES TIMEOUT 300)
+    endif()
+
+    add_test_executable(guest_np_cpp_web_api_intrusive_ptr_tests tests/GuestNpCppWebApiIntrusivePtr.cpp)
+    target_include_directories(guest_np_cpp_web_api_intrusive_ptr_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(guest_np_cpp_web_api_intrusive_ptr_tests PRIVATE libSceNpCppWebApi libc)
+    configure_windows_unwind(guest_np_cpp_web_api_intrusive_ptr_tests)
+    add_test(NAME guest_np_cpp_web_api_intrusive_ptr COMMAND guest_np_cpp_web_api_intrusive_ptr_tests)
+    if(WIN32)
+        set_tests_properties(guest_np_cpp_web_api_intrusive_ptr PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceNpCppWebApi>")
     endif()
 
     add_test_executable(savedata_core_write_replacement_tests tests/SaveDataWriteReplacement.cpp)
@@ -458,16 +587,6 @@ if(BUILD_TESTING)
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceSaveData.native>")
     endif()
 
-    add_test_executable(guest_ppsa01530_exports_tests tests/GuestPPSA01530Exports.cpp)
-    target_include_directories(guest_ppsa01530_exports_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-    target_link_libraries(guest_ppsa01530_exports_tests PRIVATE libkernel libSceJson2 libSceNet libScePad libc)
-    configure_windows_unwind(guest_ppsa01530_exports_tests)
-    add_test(NAME guest_ppsa01530_exports COMMAND guest_ppsa01530_exports_tests)
-    if(WIN32)
-        set_tests_properties(guest_ppsa01530_exports PROPERTIES ENVIRONMENT_MODIFICATION
-            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
-    endif()
-
     add_test_executable(guest_posix_random_tests tests/GuestPosixRandom.cpp)
     target_include_directories(guest_posix_random_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(guest_posix_random_tests PRIVATE libScePosixForWebKit)
@@ -496,5 +615,25 @@ if(BUILD_TESTING)
     if(WIN32)
         set_tests_properties(guest_acm PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceAcm>")
+    endif()
+
+    add_test_executable(guest_voice_chat_tests tests/GuestVoiceChat.cpp)
+    target_include_directories(guest_voice_chat_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(guest_voice_chat_tests PRIVATE libSceVoiceChat libc)
+    configure_windows_unwind(guest_voice_chat_tests)
+    add_test(NAME guest_voice_chat COMMAND guest_voice_chat_tests)
+    if(WIN32)
+        set_tests_properties(guest_voice_chat PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceVoiceChat>")
+    endif()
+
+    add_test_executable(guest_np_game_intent_tests tests/GuestNpGameIntent.cpp)
+    target_include_directories(guest_np_game_intent_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(guest_np_game_intent_tests PRIVATE libSceNpGameIntent libc)
+    configure_windows_unwind(guest_np_game_intent_tests)
+    add_test(NAME guest_np_game_intent COMMAND guest_np_game_intent_tests)
+    if(WIN32)
+        set_tests_properties(guest_np_game_intent PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceNpGameIntent>")
     endif()
 endif()

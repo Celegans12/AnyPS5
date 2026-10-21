@@ -22,6 +22,7 @@ struct SpirvTargetOptions {
     bool nonConstantImageOffsets = false;
     bool narrowSubgroupClock = false;
     bool float64DenormPreserve = false;
+    bool depthRangeRemap = false;
     bool registrationModules = false;
     bool fragmentDescriptorSet = false;
     bool float16DenormPreserve = false;
@@ -30,6 +31,15 @@ struct SpirvTargetOptions {
     bool fusedFma = false;
     // ShaderComputeStageInfo::singleWorkgroup of the request.
     bool singleWorkgroup = false;
+    bool robustBufferAccess2 = false;
+    bool float32FlushToZero = false;
+    bool meshBarycentricPixel = false;
+    bool meshBarycentricVertex = false;
+    std::uint32_t barycentricSmoothLocation = 0xffffffffu;
+    std::uint32_t barycentricLinearLocation = 0xffffffffu;
+    std::uint32_t barycentricPositionsLocation = 0xffffffffu;
+    std::vector<std::uint32_t> meshExportedLocations;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> meshPerVertexLocations;
 };
 
 struct SpirvEmitInfo {

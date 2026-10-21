@@ -21,7 +21,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <future>
 #include <iostream>
@@ -35,6 +37,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -66,8 +69,32 @@ void setEnvironment(const char* name, const std::string& value) {
     ShaderRecompiler::RefreshEnvironmentGuards();
 }
 
+void removeCacheDirectory(const std::filesystem::path& directory) {
+    std::error_code error;
+#ifdef _WIN32
+    std::vector<std::filesystem::path> files;
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(directory)) {
+        if (!entry.is_directory()) files.push_back(entry.path());
+    }
+    constexpr auto dispositionInfoEx = static_cast<FILE_INFO_BY_HANDLE_CLASS>(21);
+    constexpr DWORD deleteFile = 0x00000001, posixSemantics = 0x00000002;
+    for (const auto& file : files) {
+        const auto handle = CreateFileW(file.c_str(), DELETE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (handle == INVALID_HANDLE_VALUE) error.assign(static_cast<int>(GetLastError()), std::system_category());
+        require(!error, "cannot open " + file.string() + " for deletion: " + error.message());
+        struct Close { HANDLE file; ~Close() { CloseHandle(file); } } close{handle};
+        DWORD flags = deleteFile | posixSemantics;
+        if (!SetFileInformationByHandle(handle, dispositionInfoEx, &flags, sizeof(flags))) error.assign(static_cast<int>(GetLastError()), std::system_category());
+        require(!error, "cannot delete " + file.string() + ": " + error.message());
+    }
+#endif
+    std::filesystem::remove_all(directory, error);
+    require(!error, "cannot remove the shader cache test directory: " + error.message());
+}
+
 bool sameBinding(const DescriptorBinding& left, const DescriptorBinding& right) {
-    return left.kind == right.kind && left.role == right.role && left.descriptorSet == right.descriptorSet && left.binding == right.binding && left.count == right.count && left.guestDescriptor == right.guestDescriptor && left.readOnly == right.readOnly && left.imageShape == right.imageShape && left.samplerDepthCompare == right.samplerDepthCompare && left.imageWritten == right.imageWritten && left.imageDepthCompare == right.imageDepthCompare && left.imageAtomic == right.imageAtomic && left.imageAtomic64 == right.imageAtomic64 && left.imageShapes == right.imageShapes && left.bufferAtomic == right.bufferAtomic && left.bufferWritten == right.bufferWritten && left.bufferRead == right.bufferRead && left.samplerUnnormalized == right.samplerUnnormalized && left.samplerIntegerBorder == right.samplerIntegerBorder && left.imageUnnormalized == right.imageUnnormalized && left.imageUnnormalizedBaseLevel == right.imageUnnormalizedBaseLevel && left.imageSamplers == right.imageSamplers;
+    return left.kind == right.kind && left.role == right.role && left.descriptorSet == right.descriptorSet && left.binding == right.binding && left.count == right.count && left.guestDescriptor == right.guestDescriptor && left.readOnly == right.readOnly && left.imageShape == right.imageShape && left.samplerDepthCompare == right.samplerDepthCompare && left.imageWritten == right.imageWritten && left.imageDepthCompare == right.imageDepthCompare && left.imageAtomic == right.imageAtomic && left.imageAtomic64 == right.imageAtomic64 && left.imageShapes == right.imageShapes && left.bufferAtomic == right.bufferAtomic && left.bufferWritten == right.bufferWritten && left.bufferRead == right.bufferRead && left.bufferExtent == right.bufferExtent && left.samplerUnnormalized == right.samplerUnnormalized && left.samplerIntegerBorder == right.samplerIntegerBorder && left.samplerCoordinatesIgnored == right.samplerCoordinatesIgnored && left.imageUnnormalized == right.imageUnnormalized && left.imageUnnormalizedBaseLevel == right.imageUnnormalizedBaseLevel && left.imageSamplers == right.imageSamplers;
 }
 
 bool sameBindings(const std::vector<DescriptorBinding>& left, const std::vector<DescriptorBinding>& right) {
@@ -108,6 +135,7 @@ void requireSameResult(const RecompileResult& left, const RecompileResult& right
     const std::string prefix = std::string(what) + ": ";
     require(sameBindings(left.bindings, right.bindings), prefix + "bindings differ");
     require(left.pushConstants == right.pushConstants, prefix + "push constants differ");
+    require(left.readsDepthRemapPush == right.readsDepthRemapPush, prefix + "depth remap push reads differ");
     require(left.specialization == right.specialization, prefix + "specialization constants differ");
     require(left.workgroupMemoryDwords == right.workgroupMemoryDwords, prefix + "workgroup memory stride differs");
     require(left.poisonedSrtReads == right.poisonedSrtReads, prefix + "poisoned SRT read counts differ");
@@ -128,6 +156,7 @@ void requireSameResult(const RecompileResult& left, const RecompileResult& right
         require(a.location == b.location && a.components == b.components && a.resource.fields == b.resource.fields && a.fetchIndex == b.fetchIndex && a.formatComponents == b.formatComponents, prefix + "vertex attribute differs");
     }
     require(left.barycentricEmulation.active == right.barycentricEmulation.active && left.barycentricEmulation.smooth == right.barycentricEmulation.smooth && left.barycentricEmulation.linear == right.barycentricEmulation.linear, prefix + "barycentric emulation differs");
+    require(left.meshBarycentrics == right.meshBarycentrics, prefix + "mesh barycentric layout differs");
 }
 
 void requireSameVariant(const CompiledVariant& left, const CompiledVariant& right, const char* what) {
@@ -162,10 +191,12 @@ DescriptorBinding sampleBinding(std::uint32_t seed) {
     binding.bufferWritten = {false, false, true, true, false};
     binding.samplerUnnormalized = {false, true, true};
     binding.samplerIntegerBorder = {true, false, seed % 2 == 1};
+    binding.samplerCoordinatesIgnored = {false, seed % 2 == 0, true};
     binding.imageUnnormalized = {true, false, seed % 2 == 0};
     binding.imageUnnormalizedBaseLevel = {false, true, seed % 3 == 0};
     binding.imageSamplers = {0x5u, 0u, 0x80000000u};
     binding.bufferRead = {true, false, false, true, true, false};
+    binding.bufferExtent = {32, 0, 16, 4096, 8, 0};
     return binding;
 }
 
@@ -190,6 +221,7 @@ RecompileResult sampleResult() {
     stores.imageAtomic = {false, false};
     result.bindings.push_back(std::move(stores));
     result.pushConstants = {std::byte{1}, std::byte{0xff}, std::byte{0}, std::byte{0x80}, std::byte{7}};
+    result.readsDepthRemapPush = true;
     result.bdaAbiVersion = 3;
     result.memoryOffsetDword = 7;
     result.hostSubgroupSize = 32;
@@ -216,6 +248,7 @@ RecompileResult sampleResult() {
     result.poisonedSrtReads = 3;
     result.shaderDataUserWords = {2u, 0xffffffffu, 9u};
     result.barycentricEmulation = {true, false, true};
+    result.meshBarycentrics = MeshBarycentricLayout{{true, true, false}, {FragmentParameter{0, 2, false, true}, FragmentParameter{3, 3, false, false}}};
     result.variantId = 99;
     result.imageTablePoison = {{{1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u}, 8u, 2u, 6u}, {{9u, 0u, 0u, 0u, 0u, 0u, 0u, 0u}, 4u, 0xffffffffu, 19u}};
     result.imageTableRanges = {{0x1000u, 0x200u}, {0x5000000000ull, 48u}};
@@ -272,6 +305,7 @@ CompiledVariant sampleVariant() {
     image.cubeFaceCompatible = false;
     image.flatVolumeCompatible = false;
     image.singleMipPlaneBiasCompatible = true;
+    image.volumeArraySampleCompatible = true;
     image.flatLineCompatible = false;
     image.flatVolumeLineCompatible = false;
     image.foldTexelOffsetsOnly = true;
@@ -644,6 +678,18 @@ void verifyArtifactStorageIsolation() {
     require(ShaderDiskCache::EncodeEntry(key, variant) != before, "the stored artifact ignores vertex input metadata");
 }
 
+void verifyMeshBarycentricRequestSerialization() {
+    for (const auto& layout : {std::optional<MeshBarycentricLayout>{}, std::optional<MeshBarycentricLayout>{MeshBarycentricLayout{{true, true, true}, {FragmentParameter{0, 2, false, true}, FragmentParameter{4, 4, false, false}}}}}) {
+        SampleRequest sample;
+        sample.request.shader.stage = ShaderStage::Mesh;
+        sample.request.context.compute.reset();
+        sample.request.graphics = GraphicsCompileContext{0, {}, MeshConfiguration{4u, 4u, 12u, 12u, 4u, 64u, 1024u, 0u, 4u}, std::nullopt, {}, layout};
+        const auto text = RequestSerializer{}.Serialize(sample.request);
+        const auto restored = RequestSerializer{}.Deserialize(text);
+        require(restored.request.graphics.has_value() && restored.request.graphics->meshBarycentrics == layout, "a captured mesh request lost its barycentric layout");
+    }
+}
+
 void verifyKeySensitivity() {
     SampleRequest base;
     const auto key = base.Key();
@@ -687,6 +733,7 @@ void verifyKeySensitivity() {
     changes("f64 denormal preservation", [](SampleRequest& sample) { sample.request.target.float64DenormPreserve = true; });
     changes("f16 denormal preservation", [](SampleRequest& sample) { sample.request.target.float16DenormPreserve = true; });
     changes("spanned waves", [](SampleRequest& sample) { sample.request.target.spannedWaves = true; });
+    changes("robust buffer access 2", [](SampleRequest& sample) { sample.request.target.robustBufferAccess2 = true; });
     changes("the workgroup size limit", [](SampleRequest& sample) { sample.request.target.maxWorkgroupSize[2] = 128; });
     changes("the invocation limit", [](SampleRequest& sample) { sample.request.target.maxWorkgroupInvocations = 512; });
     changes("the shared memory limit", [](SampleRequest& sample) { sample.request.target.maxWorkgroupSharedMemoryBytes = 32768; });
@@ -710,6 +757,40 @@ void verifyKeySensitivity() {
         const auto changed = withMode(mode);
         require(changed.first != astro.first && changed.second != astro.second, std::string("the key ignores ") + what);
     }
+
+    const auto meshKeys = [&](const std::optional<MeshBarycentricLayout>& layout) {
+        SampleRequest sample;
+        sample.request.shader.stage = ShaderStage::Mesh;
+        sample.request.context.compute.reset();
+        sample.request.graphics = GraphicsCompileContext{0, {}, MeshConfiguration{4u, 4u, 12u, 12u, 4u, 64u, 1024u, 0u, 4u}, std::nullopt, {}, layout};
+        return std::pair{sample.Key(), RecompileCacheKey::ContextHash(sample.request)};
+    };
+    const std::vector<std::pair<const char*, std::optional<MeshBarycentricLayout>>> meshLayouts{
+        {"no mesh barycentric layout", std::nullopt},
+        {"smooth mesh barycentrics", MeshBarycentricLayout{{true, true, false}, {}}},
+        {"linear mesh barycentrics", MeshBarycentricLayout{{true, false, true}, {}}},
+        {"smooth and linear mesh barycentrics", MeshBarycentricLayout{{true, true, true}, {}}},
+        {"a per-vertex mesh parameter", MeshBarycentricLayout{{true, true, false}, {FragmentParameter{0, 0, false, true}}}},
+        {"another per-vertex mesh parameter source", MeshBarycentricLayout{{true, true, false}, {FragmentParameter{0, 1, false, true}}}},
+        {"a flat mesh parameter", MeshBarycentricLayout{{true, true, false}, {FragmentParameter{0, 0, false, false}}}},
+    };
+    for (std::size_t i = 0; i < meshLayouts.size(); ++i) {
+        require(meshKeys(meshLayouts[i].second) == meshKeys(meshLayouts[i].second), std::string("the key of ") + meshLayouts[i].first + " is not deterministic");
+        for (std::size_t j = i + 1; j < meshLayouts.size(); ++j) {
+            const auto left = meshKeys(meshLayouts[i].second);
+            const auto right = meshKeys(meshLayouts[j].second);
+            require(left.first != right.first && left.second != right.second, std::string("the mesh key confuses ") + meshLayouts[i].first + " with " + meshLayouts[j].first);
+        }
+    }
+
+    const auto pixelKeys = [&](bool meshPath) {
+        SampleRequest sample;
+        sample.request.shader.stage = ShaderStage::Fragment;
+        sample.request.context.compute.reset();
+        sample.request.graphics = GraphicsCompileContext{0, {}, meshPath ? std::optional(MeshConfiguration{4u, 4u, 12u, 12u, 4u, 64u, 1024u, 0u, 4u}) : std::nullopt, std::nullopt, {}, std::nullopt};
+        return std::pair{sample.Key(), RecompileCacheKey::ContextHash(sample.request)};
+    };
+    require(pixelKeys(true).first != pixelKeys(false).first && pixelKeys(true).second != pixelKeys(false).second, "a pixel shader on the mesh path shares a key with the vertex path");
 
     SampleRequest moved;
     moved.userData[0] ^= 0x10000u;
@@ -769,6 +850,64 @@ void verifyFloatModeSerialization() {
     sample.request.context.floatMode = mode;
     const auto back = serializer.Deserialize(serializer.Serialize(sample.request));
     require(back.request.context.floatMode == mode, "the float mode did not survive serialization");
+}
+
+int runLargeFileWrite() {
+    constexpr std::size_t size = (std::size_t{2} << 30u) + 4096u;
+    const auto directory = std::filesystem::temp_directory_path() / ("aps5-shader-disk-cache-large-file-test-" + std::to_string(std::random_device{}()));
+    std::error_code error;
+    std::filesystem::remove_all(directory, error);
+    std::filesystem::create_directories(directory, error);
+    const auto space = std::filesystem::space(directory, error);
+    if (error || space.available < size + (std::uintmax_t{1} << 30u)) {
+        std::cout << "skipping: not enough free disk space for a file of more than 2 GiB\n";
+        return 77;
+    }
+    std::vector<std::byte> bytes;
+    try {
+        bytes.resize(size);
+    } catch (const std::bad_alloc&) {
+        std::cout << "skipping: cannot allocate a buffer of more than 2 GiB\n";
+        return 77;
+    }
+    const std::array<std::size_t, 6> samples{0u, (std::size_t{1} << 30u) - 1u, std::size_t{1} << 30u, (std::size_t{2} << 30u) - 1u, std::size_t{2} << 30u, size - 1u};
+    for (std::size_t index = 0; index < samples.size(); ++index) bytes[samples[index]] = static_cast<std::byte>(0xa0u + index);
+    const auto path = directory / "pipelines.bin";
+    auto written = std::make_shared<std::promise<bool>>();
+    auto result = written->get_future();
+    std::thread([written, &bytes, path] {
+        try {
+            written->set_value(WriteFileAtomically(path, bytes));
+        } catch (...) {
+            written->set_exception(std::current_exception());
+        }
+    }).detach();
+    if (result.wait_for(std::chrono::seconds(200)) != std::future_status::ready) {
+        std::cerr << "WriteFileAtomically did not return within 200 s for a file of more than 2 GiB\n";
+        std::cerr.flush();
+        std::_Exit(1);
+    }
+    require(result.get(), "cannot write a cache file of more than 2 GiB");
+    require(std::filesystem::file_size(path) == size, "the cache file of more than 2 GiB has the wrong size");
+    {
+        std::ifstream file(path, std::ios::binary);
+        require(static_cast<bool>(file), "cannot open the cache file of more than 2 GiB");
+        for (std::size_t index = 0; index < samples.size(); ++index) {
+            file.seekg(static_cast<std::streamoff>(samples[index]));
+            char value = 0;
+            require(file.get(value) && static_cast<std::byte>(value) == bytes[samples[index]], "the cache file of more than 2 GiB differs at byte " + std::to_string(samples[index]));
+        }
+    }
+    std::size_t entries = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(directory)) {
+        static_cast<void>(entry);
+        ++entries;
+    }
+    require(entries == 1u, "the cache file of more than 2 GiB left a temporary file behind");
+    std::filesystem::remove_all(directory, error);
+    require(!error, "cannot remove the large file test directory: " + error.message());
+    std::cout << "large cache file write test passed\n";
+    return 0;
 }
 
 void verifyAtomicReplacement(const std::filesystem::path& directory) {
@@ -1295,7 +1434,7 @@ void verifyDirectImageSelection(const RecompileResult& result, bool valid) {
     std::size_t images = 0;
     for (const auto& binding : result.bindings) if (binding.role == DescriptorRole::GuestImages) images += binding.count;
     require(writes == (valid ? 1u : 0u) && images == (valid ? 1u : 0u), "direct image disk invocation retained the wrong image accesses or bindings");
-    require(result.specialization.empty() && result.hasDeferredDirectImage == !valid,
+    require(std::ranges::all_of(result.specialization, [](const PipelineSpecializationConstant& constant) { return PipelineSpecialization::IsWorkgroupOffset(constant.id) && constant.value == 0u; }) && result.hasDeferredDirectImage == !valid,
         "direct image disk invocation lost its valid/refused completion distinction");
     if (!valid) require(result.bdaAbiVersion == BdaAbi::Version && std::any_of(result.bindings.begin(), result.bindings.end(), [](const auto& binding) {
         return binding.role == DescriptorRole::FaultBuffer;
@@ -1757,7 +1896,8 @@ void verifyBindingPlanSelection() {
         throw std::runtime_error("binding plan accepted an unsupported buffer alignment");
     };
     snapshot.buffers[0].dwords[0] |= 2u;
-    rejectsAlignment("buffer atomic on a V# whose base is not DWORD aligned");
+    const auto atomicPlan = builder.Prepare(compiled.layout, info, IrShaderStage::Compute, snapshot);
+    require(std::ranges::any_of(atomicPlan.specialization, [](const PipelineSpecializationConstant& constant) { return constant.id == PipelineSpecialization::BufferBase + 3u && constant.value == 2u; }), "a buffer atomic V# off a DWORD boundary did not record its misalignment");
     snapshot.buffers[0].dwords[0] &= ~3u;
     info.buffers[1].typedAlignment = 2u;
     snapshot.buffers[1].dwords[0] |= 2u;
@@ -2161,6 +2301,10 @@ std::vector<PlanFixture> planFixtures() {
     add("bindless material table", 64, {0xf4080100u, 0xfa000000u, 0xf4080200u, 0xfa000010u, 0xf4080300u, 0xfa000020u, 0xf4080700u, 0xfa000030u, 0x7e200500u, 0x93109010u, 0xf4200406u, 0x20000004u, 0x8f108510u, 0xf42c0502u, 0x20000000u, 0xf09c0f08u, 0x00450000u, 0xe0700000u, 0x80070000u, 0xbf810000u}, srtPointer, {{PlanSrtAddress, tables}, {PlanTableAddress, heap}, {PlanMaterialAddress, materials}});
     add("bindless whole table", 64, {0xf4080100u, 0xfa000000u, 0xf4080200u, 0xfa000010u, 0xf4080300u, 0xfa000020u, 0xf4080700u, 0xfa000030u, 0x7e200500u, 0x8f108510u, 0xf42c0502u, 0x20000000u, 0xf09c0f08u, 0x00450000u, 0xe0700000u, 0x80070000u, 0xbf810000u}, srtPointer, {{PlanSrtAddress, tables}, {PlanTableAddress, heap}, {PlanMaterialAddress, materials}});
     add("bindless sample in a loop latch", 64, {0xf4080100u, 0xfa000000u, 0xf4080200u, 0xfa000010u, 0xf4080300u, 0xfa000020u, 0xf4080700u, 0xfa000030u, 0x7e200500u, 0x8f108510u, 0xf42c0502u, 0x20000000u, 0xbea80380u, 0xf09c0f08u, 0x00450000u, 0x80288128u, 0xbf0a8428u, 0xbf85fffbu, 0xe0700000u, 0x80070000u, 0xbf810000u}, srtPointer, {{PlanSrtAddress, tables}, {PlanTableAddress, heap}, {PlanMaterialAddress, materials}});
+    auto keyed = tables;
+    keyed.resize(20u, 0u);
+    keyed[16] = 3u;
+    add("bindless selected record", 64, {0xf4080100u, 0xfa000000u, 0xf4080200u, 0xfa000010u, 0xf4080300u, 0xfa000020u, 0xf4080700u, 0xfa000030u, 0xf4000400u, 0xfa000040u, 0x8f108510u, 0xf42c0502u, 0x20000000u, 0xf09c0f08u, 0x00450000u, 0xe0700000u, 0x80070000u, 0xbf810000u}, srtPointer, {{PlanSrtAddress, keyed}, {PlanTableAddress, heap}, {PlanMaterialAddress, materials}});
 
     std::vector<std::uint32_t> phis(32, 0u);
     place(phis, 0, imageWords(PlanTextureAddress));
@@ -2306,6 +2450,9 @@ IrResourcePlan handBuiltPlan() {
     table.dwordCount = 8u;
     table.dwords[0] = &readConst(3);
     table.tableColumn = TableColumn{2u, 32u, 16u, 4u, 8u, 0xffu, false, true, {KeyDomain{3u, 4u, 16u, false}, KeyDomain{2u, 8u, 4u, true}}, false};
+    table.tableColumn->selected = true;
+    table.tableColumn->selection = 2u;
+    table.tableColumn->pointerHops = {PointerHop{0u, 0x10u}, PointerHop{8u, 0x20u}};
     DescriptorSource heap;
     heap.dwordCount = 4u;
     heap.dwords[1] = &readConst(6);
@@ -2554,6 +2701,7 @@ void verifyMalformedPlans() {
     rejects("a uniform fill of five words", [](IrResourcePlan& plan) { plan.uniformFill.fill.words = 5u; });
     rejects("an image table heap past the sources", [](IrResourcePlan& plan) { plan.descriptorSources[1].tableColumn->heapSource = 4u; });
     rejects("an image table key past the sources", [](IrResourcePlan& plan) { plan.descriptorSources[1].tableColumn->keyDomains[1].source = 4u; });
+    rejects("an image table selection past the sources", [](IrResourcePlan& plan) { plan.descriptorSources[1].tableColumn->selection = 4u; });
     auto foreign = handBuiltPlan();
     IrValue stray(IrOpcode::Void, IrType::U32, 99u);
     foreign.srtReads[0].value = &stray;
@@ -2640,6 +2788,31 @@ void verifyPlanRoundTrip() {
     static_cast<void>(PrepareShader(secondLayout, &preparation));
     require(preparation.ResourcePrograms() == 1u, "a plan reload retained full IR after an artifact for that layout was already available");
 
+    auto relocatedFixture = fixtures.front();
+    relocatedFixture.waveSize = 32u;
+    relocatedFixture.code.insert(relocatedFixture.code.begin(), 0xbf800005u);
+    const auto relocatedRequest = relocatedFixture.Request(true);
+    const auto relocatedHandle = PrepareShader(relocatedRequest);
+    static_cast<void>(GetResourcePlan(relocatedRequest));
+    ShaderDiskCache::Flush();
+    std::vector<std::byte> relocatedKey;
+    ShaderDiskCache::BuildPlanKey(relocatedRequest, 32u, relocatedKey);
+    const auto relocatedPath = ShaderDiskCache::EntryDirectory() / ShaderDiskCache::EntryName(relocatedKey);
+    std::filesystem::rename(relocatedPath, relocatedPath.string() + ".reload-preserved");
+    ReleaseUndrawnResourcePlan(*relocatedHandle);
+    auto drawn = relocatedRequest;
+    drawn.layout.pushConstantOffsetBytes = 16u;
+    drawn.layout.pushConstantSizeBytes = 112u;
+    const auto relocatedInvocation = PreparedShaderInvocation::TryCreate(drawn, relocatedHandle);
+    require(relocatedInvocation.has_value(), "the prepared artifact refused a relocated push layout");
+    RequestMemoryView drawnMemory(drawn.context.memory);
+    static_cast<void>(relocatedInvocation->Materialize(*relocatedInvocation->Capture(drawnMemory.MakeRuntime(drawn.context.userData, drawn.shader.codeAddress))));
+    auto relocatedProbe = relocatedRequest;
+    relocatedProbe.layout.pushConstantSizeBytes = 0u;
+    ShaderPreparationContext relocatedPreparation;
+    static_cast<void>(PrepareShader(relocatedProbe, &relocatedPreparation));
+    require(relocatedPreparation.ResourcePrograms() == 1u, "a plan reload retained full IR after the prepared artifact served a relocated push layout");
+
     RequestMemoryView registeredMemory(registeredRequest.context.memory);
     const auto runtimeCapture = CaptureResources(registeredRequest, registeredMemory.MakeRuntime(registeredRequest.context.userData, registeredRequest.shader.codeAddress), *registeredHandle);
     const auto beforeKeep = ShaderDiskCache::Totals();
@@ -2651,6 +2824,7 @@ void verifyPlanRoundTrip() {
     require(covers([](const IrResourcePlan& plan) { return std::any_of(plan.descriptorSources.begin(), plan.descriptorSources.end(), [](const DescriptorSource& source) { return source.tableColumn.has_value() && source.tableColumn->keyDomains.empty(); }); }), "no fixture plans a whole image table");
     require(covers([](const IrResourcePlan& plan) { return std::any_of(plan.descriptorSources.begin(), plan.descriptorSources.end(), [](const DescriptorSource& source) { return source.tableColumn.has_value() && !source.tableColumn->keyDomains.empty(); }); }), "no fixture plans an image table with a key domain");
     require(covers([](const IrResourcePlan& plan) { return std::any_of(plan.descriptorSources.begin(), plan.descriptorSources.end(), [](const DescriptorSource& source) { return source.tableColumn.has_value() && source.tableColumn->address; }); }), "no fixture plans an image table through a pointer");
+    require(covers([](const IrResourcePlan& plan) { return std::any_of(plan.descriptorSources.begin(), plan.descriptorSources.end(), [](const DescriptorSource& source) { return source.tableColumn.has_value() && source.tableColumn->selected; }); }), "no fixture plans a selected image table record");
     require(covers([](const IrResourcePlan& plan) { return std::any_of(plan.controlFlow.begin(), plan.controlFlow.end(), [](const ResourceBlock& block) { return block.condition != nullptr; }); }), "no fixture plans a control-flow condition");
     require(covers([](const IrResourcePlan& plan) { return std::any_of(plan.valueStorage.begin(), plan.valueStorage.end(), [](const auto& value) { return value.IsPhi(); }); }), "no fixture plans a phi");
     require(covers([](const IrResourcePlan& plan) { return !plan.guardedSrtSlots.empty(); }), "no fixture plans a guarded SRT read");
@@ -2761,6 +2935,10 @@ std::filesystem::path planEntryPath(PlanFixture& fixture) {
 int runPlanLoadingProcess(std::string_view mode) {
     if (mode == "--load-plan-switch") setEnvironment("APS5_TRACE_IMAGE_TABLE", "1");
     if (mode == "--load-plan-off") setEnvironment("APS5_NO_PERF_DISK_PLANS", "1");
+    if (mode == "--load-plan-reuse-off") {
+        setEnvironment("APS5_NO_TABLE_SNAPSHOT_REUSE", "1");
+        setEnvironment("APS5_NO_TABLE_RESOLUTION_REUSE", "1");
+    }
     auto fixtures = planFixtures();
     const auto count = fixtures.size();
     std::vector<std::shared_ptr<const IrResourcePlan>> plans;
@@ -2776,6 +2954,8 @@ int runPlanLoadingProcess(std::string_view mode) {
     }
     if (mode == "--load-plan") {
         require(builds == 0u && totals.planHits == count && totals.planMisses == 0u && totals.planLoadFailures == 0u && totals.hits == count && totals.misses == 0u, "the second process ran the front end" + counts);
+    } else if (mode == "--load-plan-reuse-off") {
+        require(builds == 0u && totals.planHits == count && totals.planMisses == 0u && totals.planLoadFailures == 0u && totals.hits == count && totals.misses == 0u, "turning the image table reuse off changed the stored plan or variant keys" + counts);
     } else if (mode == "--load-plan-off") {
         require(builds == count && totals.planHits == 0u && totals.planMisses == 0u && totals.planWrites == 0u && totals.hits == count && totals.misses == 0u, "APS5_NO_PERF_DISK_PLANS=1 used the stored plans or missed the stored variants" + counts);
     } else {
@@ -2795,6 +2975,8 @@ int runPlanLoadingProcess(std::string_view mode) {
         const auto after = ShaderDiskCache::Totals();
         require(FrontEndBuilds() == 1u && after.planHits == count && after.planMisses == 1u, "a changed code word reused a stored plan");
         std::cout << "second process prepared " << count << " shaders from stored plans without running the front end\n";
+    } else if (mode == "--load-plan-reuse-off") {
+        std::cout << "with the image table reuse off, a process loaded all " << count << " stored plans and variants with the same output\n";
     } else if (mode == "--load-plan-off") {
         std::cout << "APS5_NO_PERF_DISK_PLANS=1 ran the front end for all " << count << " shaders with the same output\n";
     } else {
@@ -2838,6 +3020,7 @@ void verifyPlanAcrossProcesses(const char* self) {
     };
     run("--load-plan");
     run("--load-plan-off");
+    run("--load-plan-reuse-off");
     std::vector<std::byte> entry;
     const auto damaged = planEntryPath(fixtures.front());
     require(ReadWholeFile(damaged, entry), "cannot read a stored plan entry");
@@ -2942,6 +3125,7 @@ int main(int argc, char** argv) {
             std::cout << "artifact codec tests passed\n";
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--large-file") return runLargeFileWrite();
         if (argc == 2 && std::string_view(argv[1]) == "--load") return runLoadingProcess();
         if (argc == 2 && std::string_view(argv[1]) == "--load-lazy-plan") return runLazyPlanLoadingProcess(false);
         if (argc == 2 && std::string_view(argv[1]) == "--load-eager-plan") return runLazyPlanLoadingProcess(true);
@@ -2964,6 +3148,7 @@ int main(int argc, char** argv) {
         verifyPrebuiltPack(directory / "packs");
         verifyArtifactStorageIsolation();
         verifyKeySensitivity();
+        verifyMeshBarycentricRequestSerialization();
         verifyFloatModeSerialization();
         verifyPlanRoundTrip();
         verifyPlanKey();
@@ -2993,9 +3178,7 @@ int main(int argc, char** argv) {
         verifySpecializationFunctionLiveness();
         verifySpecializationDropsDeadConstants();
         ShaderRecompiler::ShaderDiskCache::Flush();
-        std::error_code error;
-        std::filesystem::remove_all(directory, error);
-        require(!error, "cannot remove the shader cache test directory: " + error.message());
+        removeCacheDirectory(directory);
         std::cout << "shader disk cache tests passed\n";
         return 0;
     } catch (const std::exception& error) {

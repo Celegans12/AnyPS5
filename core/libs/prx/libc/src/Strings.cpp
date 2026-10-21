@@ -94,6 +94,10 @@ void APS5_VABI bzero_nid_postfix(void* destination, size_t count) {
     std::memset(destination, 0, count);
 }
 
+void APS5_VABI bcopy_nid_postfix(const void* source, void* destination, size_t count) {
+    if (count != 0) std::memmove(destination, source, count);
+}
+
 void* APS5_VABI memcpy_nid_postfix(void* dest, const void* src, size_t n) {
     return std::memcpy(dest, src, n);
 }
@@ -152,6 +156,14 @@ char* APS5_VABI strrchr_nid_postfix(const char* s, int c) {
     return std::strrchr(const_cast<char*>(s), c);
 }
 
+char* APS5_VABI rindex_nid_postfix(const char* s, int c) {
+    return strrchr_nid_postfix(s, c);
+}
+
+int APS5_VABI flsl_nid_postfix(std::int64_t mask) {
+    return mask == 0 ? 0 : 64 - std::countl_zero(static_cast<std::uint64_t>(mask));
+}
+
 char* APS5_VABI strstr_nid_postfix(const char* haystack, const char* needle) {
     return std::strstr(const_cast<char*>(haystack), needle);
 }
@@ -182,22 +194,26 @@ bool StopAtPrefixLetter_nid_no_patch(const char* str, char** endptr, int base) {
 
 std::int64_t APS5_VABI strtol_nid_postfix(const char* str, char** endptr, int base) {
     if (StopAtPrefixLetter_nid_no_patch(str, endptr, base)) return 0;
-    return std::strtoll(str, endptr, base);
+    return ParseInteger<long long>(str, endptr, base, std::strtoll);
 }
 
 std::uint64_t APS5_VABI strtoul_nid_postfix(const char* str, char** endptr, int base) {
     if (StopAtPrefixLetter_nid_no_patch(str, endptr, base)) return 0;
-    return std::strtoull(str, endptr, base);
+    return ParseInteger<unsigned long long>(str, endptr, base, std::strtoull);
 }
 
 long long APS5_VABI strtoll_nid_postfix(const char* str, char** endptr, int base) {
     if (StopAtPrefixLetter_nid_no_patch(str, endptr, base)) return 0;
-    return std::strtoll(str, endptr, base);
+    return ParseInteger<long long>(str, endptr, base, std::strtoll);
 }
 
 unsigned long long APS5_VABI strtoull_nid_postfix(const char* str, char** endptr, int base) {
     if (StopAtPrefixLetter_nid_no_patch(str, endptr, base)) return 0;
-    return std::strtoull(str, endptr, base);
+    return ParseInteger<unsigned long long>(str, endptr, base, std::strtoull);
+}
+
+unsigned long long APS5_VABI strtouq_nid_postfix(const char* str, char** endptr, int base) {
+    return strtoull_nid_postfix(str, endptr, base);
 }
 
 double APS5_VABI strtod_nid_postfix(const char* str, char** endptr) {
@@ -218,11 +234,11 @@ int APS5_VABI atoi_nid_postfix(const char* str) {
 }
 
 std::int64_t APS5_VABI atol_nid_postfix(const char* str) {
-    return std::strtoll(str, nullptr, 10);
+    return ParseInteger<long long>(str, nullptr, 10, std::strtoll);
 }
 
 long long APS5_VABI atoll_nid_postfix(const char* str) {
-    return std::strtoll(str, nullptr, 10);
+    return ParseInteger<long long>(str, nullptr, 10, std::strtoll);
 }
 
 std::div_t APS5_VABI div_nid_postfix(int numerator, int denominator) {
@@ -291,7 +307,9 @@ int APS5_VABI strcoll_nid_postfix(const char* s1, const char* s2) {
 int APS5_VABI strncpy_s_nid_postfix(char* dest, size_t destsz, const char* src, size_t count) {
     constexpr int GuestEinval = 22;
     constexpr int GuestErange = 34;
+    constexpr size_t RsizeMax = SIZE_MAX >> 1;
     if (!dest || destsz == 0) return GuestEinval;
+    if (destsz > RsizeMax) return GuestErange;
     if (!src) {
         dest[0] = '\0';
         return GuestEinval;
@@ -314,7 +332,9 @@ int APS5_VABI strcpy_s_nid_postfix(char* dest, size_t destsz, const char* src) {
 int APS5_VABI strncat_s_nid_postfix(char* dest, size_t destsz, const char* src, size_t count) {
     constexpr int GuestEinval = 22;
     constexpr int GuestErange = 34;
+    constexpr size_t RsizeMax = SIZE_MAX >> 1;
     if (!dest || destsz == 0) return GuestEinval;
+    if (destsz > RsizeMax) return GuestErange;
     size_t used = 0;
     while (used < destsz && dest[used] != '\0') ++used;
     if (used == destsz || !src) {
@@ -393,7 +413,7 @@ char* APS5_VABI strnstr_nid_postfix(const char* haystack, const char* needle, si
 
 unsigned long long APS5_VABI _Stoull_nid_postfix(const char* str, char** endptr, int base) {
     if (StopAtPrefixLetter_nid_no_patch(str, endptr, base)) return 0;
-    return std::strtoull(str, endptr, base);
+    return ParseInteger<unsigned long long>(str, endptr, base, std::strtoull);
 }
 
 size_t APS5_VABI wcslen_nid_postfix(const char16_t* s) {
@@ -478,6 +498,12 @@ size_t APS5_VABI wcsspn_nid_postfix(const char16_t* s, const char16_t* accept) {
     return count;
 }
 
+size_t APS5_VABI wcscspn_nid_postfix(const char16_t* s, const char16_t* reject) {
+    size_t count = 0;
+    while (s[count] != 0 && !Contains(reject, s[count])) ++count;
+    return count;
+}
+
 char16_t* APS5_VABI wcstok_nid_postfix(char16_t* text, const char16_t* delimiters, char16_t** last) {
     if (text == nullptr) text = *last;
     if (text == nullptr) return nullptr;
@@ -517,19 +543,27 @@ long double APS5_VABI wcstold_nid_postfix(const char16_t* str, char16_t** endptr
 }
 
 long long APS5_VABI wcstol_nid_postfix(const char16_t* str, char16_t** endptr, int base) {
-    return ParseAsciiPrefix(str, endptr, [base](const char* text, char** end) { return StopAtPrefixLetter_nid_no_patch(text, end, base) ? 0LL : std::strtoll(text, end, base); });
+    return ParseAsciiPrefix(str, endptr, [base](const char* text, char** end) { return StopAtPrefixLetter_nid_no_patch(text, end, base) ? 0LL : ParseInteger<long long>(text, end, base, std::strtoll); });
 }
 
 long long APS5_VABI wcstoll_nid_postfix(const char16_t* str, char16_t** endptr, int base) {
-    return ParseAsciiPrefix(str, endptr, [base](const char* text, char** end) { return StopAtPrefixLetter_nid_no_patch(text, end, base) ? 0LL : std::strtoll(text, end, base); });
+    return ParseAsciiPrefix(str, endptr, [base](const char* text, char** end) { return StopAtPrefixLetter_nid_no_patch(text, end, base) ? 0LL : ParseInteger<long long>(text, end, base, std::strtoll); });
 }
 
 unsigned long long APS5_VABI wcstoul_nid_postfix(const char16_t* str, char16_t** endptr, int base) {
-    return ParseAsciiPrefix(str, endptr, [base](const char* text, char** end) { return StopAtPrefixLetter_nid_no_patch(text, end, base) ? 0ULL : std::strtoull(text, end, base); });
+    return ParseAsciiPrefix(str, endptr, [base](const char* text, char** end) { return StopAtPrefixLetter_nid_no_patch(text, end, base) ? 0ULL : ParseInteger<unsigned long long>(text, end, base, std::strtoull); });
 }
 
 unsigned long long APS5_VABI wcstoull_nid_postfix(const char16_t* str, char16_t** endptr, int base) {
-    return ParseAsciiPrefix(str, endptr, [base](const char* text, char** end) { return StopAtPrefixLetter_nid_no_patch(text, end, base) ? 0ULL : std::strtoull(text, end, base); });
+    return ParseAsciiPrefix(str, endptr, [base](const char* text, char** end) { return StopAtPrefixLetter_nid_no_patch(text, end, base) ? 0ULL : ParseInteger<unsigned long long>(text, end, base, std::strtoull); });
+}
+
+long long APS5_VABI wcstoimax_nid_postfix(const char16_t* str, char16_t** endptr, int base) {
+    return wcstoll_nid_postfix(str, endptr, base);
+}
+
+unsigned long long APS5_VABI wcstoumax_nid_postfix(const char16_t* str, char16_t** endptr, int base) {
+    return wcstoull_nid_postfix(str, endptr, base);
 }
 
 std::uint64_t APS5_VABI _WStoul_nid_postfix(const char16_t* str, char16_t** endptr, int base) {
@@ -557,6 +591,111 @@ size_t APS5_VABI strxfrm_nid_postfix(char* destination, const char* source, size
 
 char* APS5_VABI strtok_s_nid_postfix(char* str, const char* delim, char** context) {
     return SonyStrtokS(str, delim, context);
+}
+
+int APS5_VABI wmemcpy_s_nid_postfix(char16_t* dest, size_t destsz, const char16_t* src, size_t count) {
+    constexpr int GuestEinval = 22;
+    constexpr int GuestErange = 34;
+    constexpr size_t RsizeMax = (SIZE_MAX >> 1) / sizeof(char16_t);
+    if (!dest) return GuestEinval;
+    if (destsz > RsizeMax) return GuestErange;
+    if (!src || count > destsz) {
+        wmemset_nid_postfix(dest, 0, destsz);
+        return src ? GuestErange : GuestEinval;
+    }
+    const auto destination = reinterpret_cast<std::uintptr_t>(dest);
+    const auto source = reinterpret_cast<std::uintptr_t>(src);
+    const auto distance = destination < source ? source - destination : destination - source;
+    if (count != 0 && distance < count * sizeof(char16_t)) {
+        wmemset_nid_postfix(dest, 0, destsz);
+        return GuestEinval;
+    }
+    if (count != 0) std::memcpy(dest, src, count * sizeof(char16_t));
+    return 0;
+}
+
+int APS5_VABI wmemmove_s_nid_postfix(char16_t* dest, size_t destsz, const char16_t* src, size_t count) {
+    constexpr int GuestEinval = 22;
+    constexpr int GuestErange = 34;
+    constexpr size_t RsizeMax = (SIZE_MAX >> 1) / sizeof(char16_t);
+    if (!dest) return GuestEinval;
+    if (destsz > RsizeMax) return GuestErange;
+    if (!src || count > destsz) {
+        wmemset_nid_postfix(dest, 0, destsz);
+        return src ? GuestErange : GuestEinval;
+    }
+    if (count != 0) std::memmove(dest, src, count * sizeof(char16_t));
+    return 0;
+}
+
+int APS5_VABI wcsncpy_s_nid_postfix(char16_t* dest, size_t destsz, const char16_t* src, size_t count) {
+    constexpr int GuestEinval = 22;
+    constexpr int GuestErange = 34;
+    constexpr size_t RsizeMax = (SIZE_MAX >> 1) / sizeof(char16_t);
+    if (!dest || destsz == 0) return GuestEinval;
+    if (destsz > RsizeMax) return GuestErange;
+    if (!src) {
+        dest[0] = 0;
+        return GuestEinval;
+    }
+    size_t length = 0;
+    while (length < count && src[length] != 0) ++length;
+    if (length >= destsz) {
+        dest[0] = 0;
+        return GuestErange;
+    }
+    const auto destination = reinterpret_cast<std::uintptr_t>(dest);
+    const auto source = reinterpret_cast<std::uintptr_t>(src);
+    const auto distance = destination < source ? source - destination : destination - source;
+    if (length != 0 && distance < (length + 1) * sizeof(char16_t)) {
+        dest[0] = 0;
+        return GuestEinval;
+    }
+    std::memcpy(dest, src, length * sizeof(char16_t));
+    dest[length] = 0;
+    return 0;
+}
+
+char16_t* APS5_VABI wcsncat_nid_postfix(char16_t* dest, const char16_t* src, size_t n) {
+    const size_t dest_len = Length(dest);
+    size_t index = 0;
+    for (; index < n && src[index] != 0; ++index) dest[dest_len + index] = src[index];
+    dest[dest_len + index] = 0;
+    return dest;
+}
+
+int APS5_VABI wcsncat_s_nid_postfix(char16_t* dest, size_t destsz, const char16_t* src, size_t count) {
+    constexpr int GuestEinval = 22;
+    constexpr int GuestErange = 34;
+    constexpr size_t RsizeMax = (SIZE_MAX >> 1) / sizeof(char16_t);
+    if (!dest || destsz == 0) return GuestEinval;
+    if (destsz > RsizeMax) return GuestErange;
+    size_t used = 0;
+    while (used < destsz && dest[used] != 0) ++used;
+    if (used == destsz || !src) {
+        dest[0] = 0;
+        return used == destsz ? GuestErange : GuestEinval;
+    }
+    size_t length = 0;
+    while (length < count && src[length] != 0) ++length;
+    if (length >= destsz - used) {
+        dest[0] = 0;
+        return GuestErange;
+    }
+    const auto destination = reinterpret_cast<std::uintptr_t>(dest + used);
+    const auto source = reinterpret_cast<std::uintptr_t>(src);
+    const auto distance = destination < source ? source - destination : destination - source;
+    if (length != 0 && distance < (length + 1) * sizeof(char16_t)) {
+        dest[0] = 0;
+        return GuestEinval;
+    }
+    std::memcpy(dest + used, src, length * sizeof(char16_t));
+    dest[used + length] = 0;
+    return 0;
+}
+
+int APS5_VABI wcscat_s_nid_postfix(char16_t* dest, size_t destsz, const char16_t* src) {
+    return wcsncat_s_nid_postfix(dest, destsz, src, static_cast<size_t>(-1));
 }
 
 }

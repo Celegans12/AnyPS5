@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
+#include "RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include <algorithm>
 #include <atomic>
 #include <stdexcept>
@@ -102,7 +103,7 @@ bool IsNullTextureResource(std::span<const std::uint32_t> words) {
     Require(words.size() == 8, "guest texture descriptor must contain 8 dwords");
     const auto base40 = (static_cast<std::uint64_t>(words[0]) | (static_cast<std::uint64_t>(words[1]) << 32u)) & 0xffffffffffull;
     const auto type = (words[3] >> 28u) & 0xfu;
-    return base40 == 0 || type == 0;
+    return base40 == 0 || type <= 1;
 }
 
 GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words) {
@@ -183,6 +184,13 @@ GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words)
 
     Require(baseLevel <= lastLevel, "guest texture descriptor has a base mip level past its last mip level");
 
+    const bool fmask = ShaderRecompiler::IsFmaskTextureFormat(static_cast<ShaderRecompiler::IrBufferFormat>(format));
+    if (fmask) {
+        Require(format == static_cast<std::uint32_t>(ShaderRecompiler::IrBufferFormat::Fmask32_S8_F8), "guest FMASK format is not implemented");
+        Require(!metaCompress && !writeCompress, "FMASK CMASK compression is not implemented");
+        Require((typeRaw == 9u || typeRaw == 13u) && tileModeRaw == 24u && baseLevel == 0u && lastLevel == 0u && maxMip == 0u, "FMASK reads require a single-mip 2D or 2D-array Z_64KB_X surface");
+        for (const auto selector : {dstSelX, dstSelY, dstSelZ, dstSelW}) Require(selector == 0u || selector == 1u || selector == 4u, "FMASK destination channel selector is not implemented");
+    }
 
     const auto describe = [&] { return " (format " + std::to_string(format) + ", " + std::to_string(width) + "x" + std::to_string(height) + "x" + std::to_string(depth + 1) + ", type " + std::to_string(typeRaw) + ", tile " + std::to_string(tileModeRaw) + ", mips " + std::to_string(baseLevel) + ".." + std::to_string(lastLevel) + " of " + std::to_string(maxMip + 1) + ")"; };
     TextureTileMode tileMode;
@@ -263,7 +271,7 @@ GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words)
     result.lastLevel = lastLevel;
     result.tileMode = tileMode;
     result.dimension = dimension;
-    result.format = format;
+    result.format = fmask ? static_cast<std::uint32_t>(ShaderRecompiler::IrBufferFormat::Format32UInt) : format;
     result.dstSelX = static_cast<std::uint8_t>(dstSelX);
     result.dstSelY = static_cast<std::uint8_t>(dstSelY);
     result.dstSelZ = static_cast<std::uint8_t>(dstSelZ);
@@ -304,6 +312,15 @@ bool DescriptorSingleLevel(std::span<const std::uint32_t> words) {
     return ((words[3] >> 12u) & 0xfu) == ((words[3] >> 16u) & 0xfu);
 }
 
+bool FirstLayerDescriptor(std::span<const std::uint32_t> words, std::array<std::uint32_t, 8>& narrowed) {
+    if (words.size() != narrowed.size()) return false;
+    const auto resource = DecodeTextureResource(words);
+    if (resource.dimension != TextureDimension::k2DArray || resource.depthOrLastArray <= resource.baseArray) return false;
+    std::copy(words.begin(), words.end(), narrowed.begin());
+    narrowed[4] = (narrowed[4] & ~0x1fffu) | resource.baseArray;
+    return true;
+}
+
 bool MatchesGuestDimension(ShaderRecompiler::DescriptorImageShape shape, TextureDimension dimension) {
     switch (shape) {
         case ShaderRecompiler::DescriptorImageShape::Image1D: return dimension == TextureDimension::k1D;
@@ -313,6 +330,7 @@ bool MatchesGuestDimension(ShaderRecompiler::DescriptorImageShape shape, Texture
         case ShaderRecompiler::DescriptorImageShape::Image3D: return dimension == TextureDimension::k3D;
         case ShaderRecompiler::DescriptorImageShape::Image1DArray: return dimension == TextureDimension::k1DArray;
         case ShaderRecompiler::DescriptorImageShape::Image2DMultisample: return dimension == TextureDimension::k2DMsaa;
+        case ShaderRecompiler::DescriptorImageShape::Image2DMultisampleArray: return dimension == TextureDimension::k2DMsaa;
     }
     throw std::runtime_error("AGC graphics: MatchesGuestDimension encountered an unknown descriptor image shape");
 }

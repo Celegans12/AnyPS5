@@ -3,9 +3,11 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 #include "prx/libc/include/General.hpp"
 #include "H264Fixture.hpp"
@@ -490,6 +492,11 @@ void testVp9PictureMetadata() {
 
 void testTenBit() {
     for (const auto codec : {CodecHevc, CodecVp9}) {
+        for (const auto [profile, expected] : {std::pair<std::uint32_t, std::uint64_t>{1, 2048ull * 1088 * 3 / 2}, {2, 3840ull * 1088 * 3 / 2}}) {
+            const DecoderConfigInfo config{sizeof(DecoderConfigInfo), 1, codec, profile, 0, 1920, 1088, 4, 1};
+            DecoderMemoryInfo memory{sizeof(DecoderMemoryInfo)};
+            check(sceVideodec2QueryDecoderMemoryInfo_nid_postfix(&config, &memory) == 0 && memory.maxFrameBufferSize == expected, "1920x1088 frame size differs for profile " + std::to_string(profile));
+        }
         const DecoderConfigInfo config{sizeof(DecoderConfigInfo), 1, codec, 2, 0, static_cast<std::int32_t>(Width), static_cast<std::int32_t>(Height), 4, 1};
         DecoderMemoryInfo memory{sizeof(DecoderMemoryInfo)};
         check(sceVideodec2QueryDecoderMemoryInfo_nid_postfix(&config, &memory) == 0, "memory query failed");
@@ -500,16 +507,29 @@ void testTenBit() {
             const InputData input{sizeof(InputData), HevcMain10Stream.data(), HevcMain10Stream.size(), 0, 0, 0};
             FrameBuffer frame{sizeof(FrameBuffer), buffer.data(), buffer.size(), false};
             OutputInfo output{sizeof(OutputInfo)};
-            checkThrows([&] {
-                sceVideodec2Decode_nid_postfix(handle, &input, &frame, &output);
-                sceVideodec2Flush_nid_postfix(handle, &frame, &output);
-            });
+            check(sceVideodec2Decode_nid_postfix(handle, &input, &frame, &output) == 0, "ten-bit decode failed");
+            if (!output.isValid) check(sceVideodec2Flush_nid_postfix(handle, &frame, &output) == 0, "ten-bit flush failed");
+            check(output.isValid && frame.isAccepted && output.frameWidth == Width && output.frameHeight == Height && output.framePitch == 128 && output.framePitchInBytes == 256 && output.frameFormat == 0, "ten-bit picture geometry differs");
+            std::uint64_t hash = 0xcbf29ce484222325ull;
+            std::uint16_t largest = 0;
+            const auto mix = [&](const std::uint8_t* row) {
+                for (std::uint32_t column = 0; column < Width; ++column) {
+                    std::uint16_t word = 0;
+                    std::memcpy(&word, row + column * 2, 2);
+                    largest = std::max(largest, word);
+                    hash = (hash ^ word) * 0x100000001b3ull;
+                }
+            };
+            for (std::uint32_t row = 0; row < Height; ++row) mix(buffer.data() + static_cast<std::size_t>(row) * output.framePitchInBytes);
+            for (std::uint32_t row = 0; row < Height / 2; ++row) mix(buffer.data() + static_cast<std::size_t>(output.framePitchInBytes) * Height + static_cast<std::size_t>(row) * output.framePitchInBytes);
+            check(largest == 1023, "ten-bit samples are not in the low bits of their words");
+            check(hash == 0x453fd1cd69e47611ull, "ten-bit picture differs from the reference");
         }
         check(sceVideodec2DeleteDecoder_nid_postfix(handle) == 0, "delete failed");
     }
 }
 
-void testDecode(bool lengthPrefixed) {
+void testDecode(bool lengthPrefixed, bool separateParameters = false) {
     const DecoderConfigInfo config{sizeof(DecoderConfigInfo), 0, 1, 100, 0, static_cast<std::int32_t>(Width), static_cast<std::int32_t>(Height), 4, 1};
     DecoderMemoryInfo memory{sizeof(DecoderMemoryInfo)};
     check(sceVideodec2QueryDecoderMemoryInfo_nid_postfix(&config, &memory) == 0, "memory query failed");
@@ -534,8 +554,29 @@ void testDecode(bool lengthPrefixed) {
         ++pictures;
         return true;
     };
-    const auto units = accessUnits(lengthPrefixed);
+    auto units = accessUnits(lengthPrefixed);
     check(units.size() == PictureHashes.size(), "unexpected access unit count");
+    if (separateParameters) {
+        auto& first = units.front();
+        std::size_t slice = 0;
+        for (std::size_t index = 0; index + 3 < first.size(); ++index) {
+            if (first[index] != 0 || first[index + 1] != 0 || first[index + 2] != 1) continue;
+            const auto type = first[index + 3] & 0x1fu;
+            if (type >= 1 && type <= 5) {
+                slice = index > 0 && first[index - 1] == 0 ? index - 1 : index;
+                break;
+            }
+            index += 2;
+        }
+        check(slice != 0, "the first access unit has no slice after its parameter sets");
+        const std::vector<std::uint8_t> parameters(first.begin(), first.begin() + static_cast<std::ptrdiff_t>(slice));
+        first.erase(first.begin(), first.begin() + static_cast<std::ptrdiff_t>(slice));
+        const InputData input{sizeof(InputData), parameters.data(), parameters.size(), 999, 0, 0x9f};
+        FrameBuffer frame{sizeof(FrameBuffer), buffer.data(), buffer.size(), false};
+        OutputInfo output{sizeof(OutputInfo)};
+        check(sceVideodec2Decode_nid_postfix(handle, &input, &frame, &output) == 0, "a unit of parameter sets alone was not accepted");
+        check(!output.isValid && !frame.isAccepted, "a unit of parameter sets alone produced a picture");
+    }
     for (std::size_t unit = 0; unit < units.size(); ++unit) {
         const InputData input{sizeof(InputData), units[unit].data(), units[unit].size(), 1000 + unit, unit, 0xa0 + unit};
         FrameBuffer frame{sizeof(FrameBuffer), buffer.data(), buffer.size(), false};
@@ -623,6 +664,42 @@ std::uint64_t frameBufferBytes() {
     DecoderMemoryInfo memory{sizeof(DecoderMemoryInfo)};
     check(sceVideodec2QueryDecoderMemoryInfo_nid_postfix(&config, &memory) == 0, "memory query failed");
     return memory.maxFrameBufferSize;
+}
+
+void testDecodeAfterFlush() {
+    std::vector<std::uint8_t> buffer(frameBufferBytes());
+    const auto handle = createDecoder(1, 100);
+    {
+        FrameBuffer frame{sizeof(FrameBuffer), buffer.data(), buffer.size(), false};
+        OutputInfo output{sizeof(OutputInfo)};
+        check(sceVideodec2Flush_nid_postfix(handle, &frame, &output) == 0 && !output.isValid && !frame.isAccepted, "flushing a decoder that decoded nothing gave a picture");
+    }
+    const auto units = accessUnits(false);
+    for (const std::uint64_t base : {1000u, 5000u}) {
+        std::size_t pictures = 0;
+        const auto take = [&](const OutputInfo& output) {
+            if (!output.isValid) return false;
+            check(pictures < PictureHashes.size() && owned(buffer, base + DisplayOrderUnits[pictures]), "a picture decoded after a flush is out of display order");
+            check(hashNv12(buffer.data(), output.framePitch, output.frameHeight) == PictureHashes[pictures], "picture " + std::to_string(pictures) + " decoded after a flush differs from the reference");
+            ++pictures;
+            return true;
+        };
+        for (std::size_t unit = 0; unit < units.size(); ++unit) {
+            const InputData input{sizeof(InputData), units[unit].data(), units[unit].size(), base + unit, unit, base + unit};
+            FrameBuffer frame{sizeof(FrameBuffer), buffer.data(), buffer.size(), false};
+            OutputInfo output{sizeof(OutputInfo)};
+            check(sceVideodec2Decode_nid_postfix(handle, &input, &frame, &output) == 0, "decode after a flush failed");
+            take(output);
+        }
+        for (;;) {
+            FrameBuffer frame{sizeof(FrameBuffer), buffer.data(), buffer.size(), false};
+            OutputInfo output{sizeof(OutputInfo)};
+            check(sceVideodec2Flush_nid_postfix(handle, &frame, &output) == 0, "flush failed");
+            if (!take(output)) break;
+        }
+        check(pictures == PictureHashes.size(), "missing pictures of a stream decoded after a flush");
+    }
+    check(sceVideodec2DeleteDecoder_nid_postfix(handle) == 0, "delete failed");
 }
 
 void testPictureOwnership() {
@@ -727,6 +804,7 @@ int main() {
         testFailures();
         testDecode(false);
         testDecode(true);
+        testDecode(false, true);
         const auto hevc = hevcUnits(HevcStream.data(), HevcStream.size());
         testClip(CodecHevc, 1, hevc, HevcHashes);
         std::vector<std::vector<std::uint8_t>> hevcLengthPrefixed;
@@ -752,6 +830,7 @@ int main() {
         testClip(CodecVp9, 0, ivfFrames(), Vp9Hashes);
         testVp9PictureMetadata();
         testTenBit();
+        testDecodeAfterFlush();
         testPictureOwnership();
         testConcurrentOwnership();
         std::puts("Videodec2 tests passed");

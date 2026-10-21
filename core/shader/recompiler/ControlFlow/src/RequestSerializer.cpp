@@ -5,7 +5,7 @@ namespace ShaderRecompiler {
 
 namespace {
 
-constexpr std::uint32_t CurrentVersion = 32u;
+constexpr std::uint32_t CurrentVersion = 39u;
 constexpr std::uint32_t DrawParameterBlockTag = 0x31504447u;
 constexpr std::uint32_t LocalFeatures = 22u;
 constexpr char kBase64Alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -244,7 +244,7 @@ ConservativeZExport readConservativeZExport(Reader& reader) {
 
 ColorExportPacking readColorExportPacking(Reader& reader) {
     const auto value = reader.ReadU8();
-    if (value > static_cast<std::uint8_t>(ColorExportPacking::Unorm10_11_11)) {
+    if (value > static_cast<std::uint8_t>(ColorExportPacking::Float11_11_10)) {
         throw std::runtime_error("RequestSerializer: invalid ColorExportPacking value");
     }
     return static_cast<ColorExportPacking>(value);
@@ -256,6 +256,14 @@ RasterPrimitive readRasterPrimitive(Reader& reader) {
         throw std::runtime_error("RequestSerializer: invalid RasterPrimitive value");
     }
     return static_cast<RasterPrimitive>(value);
+}
+
+PixelPositionLocation readPixelPositionLocation(Reader& reader) {
+    const auto value = reader.ReadU8();
+    if (value > static_cast<std::uint8_t>(PixelPositionLocation::UpperLeft)) {
+        throw std::runtime_error("RequestSerializer: invalid PixelPositionLocation value");
+    }
+    return static_cast<PixelPositionLocation>(value);
 }
 
 void writeShaderBinary(Writer& writer, const ShaderBinary& binary) {
@@ -355,6 +363,10 @@ void writePixelInfo(Writer& writer, const ShaderPixelStageInfo& info) {
         writer.WriteU8(blend.function);
         writer.WriteU8(blend.writeMask);
     }
+    writer.WriteBool(info.iteratesSamples);
+    writer.WriteU8(static_cast<std::uint8_t>(info.positionLocation));
+    for (const std::uint8_t location : info.sampleLocations) writer.WriteU8(location);
+    writer.WriteBool(info.stencilOperationValueExport);
 }
 
 ShaderPixelStageInfo readPixelInfo(Reader& reader, std::uint32_t version, std::uint32_t local) {
@@ -426,6 +438,12 @@ ShaderPixelStageInfo readPixelInfo(Reader& reader, std::uint32_t version, std::u
             blend.writeMask = reader.ReadU8();
         }
     }
+    if (version >= 34u) {
+        info.iteratesSamples = reader.ReadBool();
+        info.positionLocation = readPixelPositionLocation(reader);
+        for (std::uint8_t& location : info.sampleLocations) location = reader.ReadU8();
+    }
+    if (version >= 37u) info.stencilOperationValueExport = reader.ReadBool();
     if (version < 5u) {
         const auto input = [](PixelInput value, bool present) { return present ? PixelInputBit(value) : 0u; };
         info.inputAddr = input(PixelInput::PerspectiveSample, info.hasPerspectiveCenterVgpr && inputAddrOrCenterVgpr == 2u) | input(PixelInput::PerspectiveCenter, info.hasPerspectiveCenterVgpr) |
@@ -539,6 +557,7 @@ void writeMeshConfiguration(Writer& writer, const MeshConfiguration& configurati
     writer.WriteU32(configuration.ldsSizeDwords);
     writer.WriteU32(configuration.provokingVertex);
     writer.WriteU32(configuration.esgsItemSize);
+    writer.WriteU32(configuration.outputPrimitiveSize);
 }
 
 MeshConfiguration readMeshConfiguration(Reader& reader, std::uint32_t version) {
@@ -552,6 +571,7 @@ MeshConfiguration readMeshConfiguration(Reader& reader, std::uint32_t version) {
     configuration.ldsSizeDwords = reader.ReadU32();
     configuration.provokingVertex = reader.ReadU32();
     configuration.esgsItemSize = version >= 4u ? reader.ReadU32() : 4u;
+    if (version >= 31u) configuration.outputPrimitiveSize = reader.ReadU32();
     return configuration;
 }
 
@@ -752,6 +772,19 @@ void writeGraphicsCompileContext(Writer& writer, const GraphicsCompileContext& g
     writer.WriteU32(graphics.draw.indexCount);
     writer.WriteU32(graphics.draw.indexElementBytes);
     writer.WriteU32(graphics.draw.instanceCount);
+    writer.WriteBool(graphics.meshBarycentrics.has_value());
+    if (graphics.meshBarycentrics.has_value()) {
+        const auto& barycentrics = *graphics.meshBarycentrics;
+        writer.WriteBool(barycentrics.emulation.active);
+        writer.WriteBool(barycentrics.emulation.smooth);
+        writer.WriteBool(barycentrics.emulation.linear);
+        writer.WriteU64(barycentrics.parameters.size());
+        for (const auto& parameter : barycentrics.parameters) {
+            writer.WriteU32(parameter.location);
+            writer.WriteU32(parameter.sourceLocation);
+            writer.WriteBool(parameter.perVertex);
+        }
+    }
 }
 
 GraphicsCompileContext readGraphicsCompileContext(Reader& reader, DeserializedGraphicsCompileContext& storage, std::uint32_t version, std::uint32_t local) {
@@ -790,6 +823,22 @@ GraphicsCompileContext readGraphicsCompileContext(Reader& reader, DeserializedGr
     storage.draw.indexElementBytes = reader.ReadU32();
     storage.draw.instanceCount = reader.ReadU32();
     graphics.draw = storage.draw;
+    if (version >= 38u && reader.ReadBool()) {
+        MeshBarycentricLayout barycentrics;
+        barycentrics.emulation.active = reader.ReadBool();
+        barycentrics.emulation.smooth = reader.ReadBool();
+        barycentrics.emulation.linear = reader.ReadBool();
+        const auto count = reader.ReadU64();
+        reader.Require(count, 9u);
+        for (std::uint64_t i = 0; i < count; i++) {
+            FragmentParameter parameter{};
+            parameter.location = reader.ReadU32();
+            parameter.sourceLocation = reader.ReadU32();
+            parameter.perVertex = reader.ReadBool();
+            barycentrics.parameters.push_back(parameter);
+        }
+        graphics.meshBarycentrics = std::move(barycentrics);
+    }
     return graphics;
 }
 
@@ -832,9 +881,19 @@ DeserializedRequest deserialize(std::string_view decoded, std::uint32_t version,
         result.linkedCallFallbacks = reader.ReadU32Vector();
         result.request.context.linkedCallFallbacks = result.linkedCallFallbacks;
     }
-    if (version >= 32u && result.request.context.compute.has_value()) {
-        result.compute->singleWorkgroup = reader.ReadBool();
-        result.request.context.compute = result.compute;
+    if (version >= 32u) result.request.target.spannedWaves = reader.ReadBool();
+    if (version >= 35u) {
+        result.request.target.depthRangeRemap = reader.ReadBool();
+        if (result.vertex.has_value()) {
+            result.vertex->depthRemapMode = reader.ReadU32();
+            result.request.context.vertex = result.vertex;
+        }
+    }
+    if (version >= 36u) result.request.target.float32FlushToZero = reader.ReadBool();
+    if (version >= 39u && result.request.context.compute.has_value()) {
+        const bool singleWorkgroup = reader.ReadBool();
+        result.request.context.compute->singleWorkgroup = singleWorkgroup;
+        if (result.compute.has_value()) result.compute->singleWorkgroup = singleWorkgroup;
     }
     if (version >= 26u && reader.Remaining() == 12u && result.request.context.vertex.has_value()) {
         if (reader.ReadU32() != DrawParameterBlockTag) throw std::runtime_error("RequestSerializer: unexpected trailing data");
@@ -877,6 +936,12 @@ std::string RequestSerializer::Serialize(const RecompileRequest& request) const 
     writer.WriteBool(request.target.vertexSubgroups);
     writer.WriteBool(request.target.float16DenormPreserve);
     writer.WriteU32Span(request.context.linkedCallFallbacks);
+    writer.WriteBool(request.target.spannedWaves);
+    writer.WriteBool(request.target.depthRangeRemap);
+    if (request.context.vertex.has_value()) {
+        writer.WriteU32(request.context.vertex->depthRemapMode);
+    }
+    writer.WriteBool(request.target.float32FlushToZero);
     if (request.context.compute.has_value()) writer.WriteBool(request.context.compute->singleWorkgroup);
     // Optional trailing block (no version bump, so requests without it serialize as before): the
     // GPU-side indirect draw parameter SGPRs of a vertex stage.
@@ -895,8 +960,6 @@ DeserializedRequest RequestSerializer::Deserialize(std::string_view text) const 
     const auto version = reader.ReadU32();
     if (version < 1u || version > CurrentVersion) throw std::runtime_error("unsupported recompile request serialization version");
     if (version >= CurrentVersion) return deserialize(decoded, version, LocalFeatures, false);
-    // The previous current version (31) took the current path; it only lacks the single-workgroup flag.
-    if (version == 31u) return deserialize(decoded, version, LocalFeatures, false);
     if (version == 24u || version == 26u || version == 30u) {
         try {
             return deserialize(decoded, version == 26u ? 25u : version == 30u ? 29u : version, LocalFeatures, true);

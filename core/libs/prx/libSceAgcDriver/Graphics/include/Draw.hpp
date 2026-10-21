@@ -38,7 +38,7 @@ struct DrawInputCopy {
     std::uint64_t registryGeneration = 0;
 };
 DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use);
-DrawInputCopy CopyZeroPaddedDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t validBytes);
+DrawInputCopy CopyZeroPaddedDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t validBytes, std::size_t stride = 0);
 void KeepDrawInput(Recorder* recorder, std::uint64_t address, const DrawInputCopy& copy, Recorder::SnapshotUse use, std::uint32_t derived);
 const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t alignment, bool* behindGpuWrite = nullptr);
 struct InPlaceIndices {
@@ -100,8 +100,18 @@ bool DrawRecipes();
 // draw index, the vertex ranges, the device features, APS5_NO_GPU_INDIRECT_DRAW) or under the device
 // lock in Draw (the memory state of the records). `readMs` is the CPU read's time (its sync);
 // `rewritten` counts a GPU-side draw whose records were copied and patched with a constant.
-enum class IndirectDrawPath : std::uint8_t { Gpu, NotFolded, FetchUnknown, NonVertexPath, IndxOffset, DrawIndex, VertexRange, FeatureGap, PendingImage, PendingLabelOrCopy, NotImported, Disabled, Count };
+enum class IndirectDrawPath : std::uint8_t { Gpu, NotFolded, FetchUnknown, NonVertexPath, IndxOffset, DrawIndex, VertexRange, FeatureGap, PendingImage, PendingLabelOrCopy, NotImported, Disabled, IndexRange, Count };
 void CountIndirectDraw(IndirectDrawPath path, double readMs, bool rewritten = false);
+std::array<std::uint64_t, static_cast<std::size_t>(IndirectDrawPath::Count)> IndirectDrawCounts();
+
+struct DrawPassCounts {
+    std::uint64_t draws = 0;
+    std::uint64_t passesBegun = 0;
+    std::uint64_t passesContinued = 0;
+    std::uint64_t keyStoreFlushes = 0;
+    std::uint64_t storeFlushes = 0;
+};
+std::array<DrawPassCounts, 2> DrawPassTotals();
 const char* IndirectDrawPathName(IndirectDrawPath path);
 
 // Draw packets that drew nothing, for the [draws] line: Nothing (an empty count, or no color writes

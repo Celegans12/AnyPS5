@@ -28,6 +28,48 @@ bool UserDataDwordIndex(const SpirvEmitterState& state, ScalarReg reg, std::uint
     return true;
 }
 
+bool MeshBarycentricPixel(const SpirvEmitterState& state) {
+    return state.meshBarycentricPixel && state.program.Metadata().barycentricEmulation && state.pixelFlatPositions != 0u;
+}
+
+std::uint32_t EmitSolvedBarycentric(SpirvEmitterState& state, StageInputKind kind) {
+    const auto cached = state.solvedBarycentrics.find({state.currentLabel, static_cast<std::uint32_t>(kind)});
+    if (cached != state.solvedBarycentrics.end()) return cached->second;
+    const auto vec3 = TypeF32Vector(state, 3u);
+    const auto varying = state.module.AllocateId();
+    state.module.AddFunction(spv::OpLoad, vec3, varying, InputVariableForKind(state, kind));
+    std::array<std::uint32_t, 3> corner {};
+    for (std::uint32_t index = 0; index < 3u; index++) {
+        const auto pointer = state.module.AllocateId();
+        const auto position = state.module.AllocateId();
+        corner.at(index) = state.module.AllocateId();
+        state.module.AddFunction(spv::OpAccessChain, TypePointer(state, spv::StorageClassInput, TypeF32Vector(state, 4u)), pointer, state.pixelFlatPositions, ConstantU32(state, index));
+        state.module.AddFunction(spv::OpLoad, TypeF32Vector(state, 4u), position, pointer);
+        state.module.AddFunction(spv::OpVectorShuffle, vec3, corner.at(index), position, position, 0u, 1u, 3u);
+    }
+    const auto cross = [&](std::uint32_t left, std::uint32_t right) {
+        const auto result = state.module.AllocateId();
+        state.module.AddFunction(spv::OpExtInst, vec3, result, GlslStd450(state), GLSLstd450Cross, left, right);
+        return result;
+    };
+    const auto dot = [&](std::uint32_t left, std::uint32_t right) {
+        const auto result = state.module.AllocateId();
+        state.module.AddFunction(spv::OpDot, TypeF32(state), result, left, right);
+        return result;
+    };
+    const auto determinant = dot(corner[0], cross(corner[1], corner[2]));
+    std::array<std::uint32_t, 3> weight {};
+    const std::array<std::array<std::uint32_t, 2>, 3> rows{{{1u, 2u}, {2u, 0u}, {0u, 1u}}};
+    for (std::uint32_t index = 0; index < 3u; index++) {
+        weight.at(index) = state.module.AllocateId();
+        state.module.AddFunction(spv::OpFDiv, TypeF32(state), weight.at(index), dot(varying, cross(corner[rows[index][0]], corner[rows[index][1]])), determinant);
+    }
+    const auto solved = state.module.AllocateId();
+    state.module.AddFunction(spv::OpCompositeConstruct, vec3, solved, weight[0], weight[1], weight[2]);
+    state.solvedBarycentrics[{state.currentLabel, static_cast<std::uint32_t>(kind)}] = solved;
+    return solved;
+}
+
 const ShaderWorkgroupInputInfo* ShaderWorkgroupInputFor(const SpirvEmitterState& state) {
     switch (state.program.Resources().stage) {
     case IrShaderStage::Compute:
@@ -39,7 +81,63 @@ const ShaderWorkgroupInputInfo* ShaderWorkgroupInputFor(const SpirvEmitterState&
     }
 }
 
+std::uint32_t EmitBuiltinU32(SpirvEmitterState& state, StageInputKind kind, std::uint32_t component);
+
+std::uint32_t EmitQuadPixel(SpirvEmitterState& state) {
+    const auto coordinate = [&](std::uint32_t component) {
+        const auto value = Unary(state, spv::OpBitcast, TypeF32(state), EmitBuiltinU32(state, StageInputKind::FragCoord, component));
+        return EmitBinaryU32(state, spv::OpBitwiseAnd, Unary(state, spv::OpConvertFToU, TypeU32(state), value), ConstantU32(state, 1u));
+    };
+    return EmitBinaryU32(state, spv::OpBitwiseOr, coordinate(0u), EmitBinaryU32(state, spv::OpShiftLeftLogical, coordinate(1u), ConstantU32(state, 1u)));
+}
+
+std::uint32_t InterpolationOffset(SpirvEmitterState& state, std::uint8_t location) {
+    const std::array<std::uint32_t, 2> components{ConstantF32Value(state, SampleLocationOffset(location, 0u)), ConstantF32Value(state, SampleLocationOffset(location, 1u))};
+    return state.module.Constant(spv::OpConstantComposite, TypeF32Vector(state, 2u), std::span<const std::uint32_t>(components));
+}
+
+std::uint32_t EmitSampleOffset(SpirvEmitterState& state) {
+    const auto& locations = state.inputInfo.pixel->sampleLocations;
+    const bool vary = state.inputInfo.pixel->SampleLocationsVary();
+    const bool iterated = state.program.Metadata().pixelIteratesSamples;
+    if (!iterated && !vary) return InterpolationOffset(state, locations[0]);
+    const auto count = vary ? static_cast<std::uint32_t>(locations.size()) : 8u;
+    std::array<std::uint32_t, 32> offsets{};
+    for (std::uint32_t index = 0; index < count; ++index) offsets[index] = InterpolationOffset(state, locations[index]);
+    const auto array = state.module.Type(spv::OpTypeArray, TypeF32Vector(state, 2u), ConstantU32(state, count));
+    const auto table = state.module.DefineGlobalVariable(TypePointer(state, spv::StorageClassPrivate, array), spv::StorageClassPrivate);
+    state.module.AddFunction(spv::OpStore, table, state.module.Constant(spv::OpConstantComposite, array, std::span<const std::uint32_t>(offsets.data(), count)));
+    auto index = iterated ? EmitBuiltinU32(state, StageInputKind::SampleId, 0u) : ConstantU32(state, 0u);
+    if (vary) index = EmitBinaryU32(state, spv::OpBitwiseOr, index, EmitBinaryU32(state, spv::OpShiftLeftLogical, EmitQuadPixel(state), ConstantU32(state, 3u)));
+    const auto pointer = state.module.AllocateId();
+    state.module.AddFunction(spv::OpAccessChain, TypePointer(state, spv::StorageClassPrivate, TypeF32Vector(state, 2u)), pointer, table, index);
+    const auto offset = state.module.AllocateId();
+    state.module.AddFunction(spv::OpLoad, TypeF32Vector(state, 2u), offset, pointer);
+    return offset;
+}
+
+std::uint32_t EmitOffsetBarycentricU32(SpirvEmitterState& state, StageInputKind kind, std::uint32_t component) {
+    const auto variable = InputVariableForKind(state, BarycentricInputOf(kind));
+    if (variable == 0u) {
+        throw std::runtime_error("an offset barycentric read lacks its barycentric input");
+    }
+    if (std::find(state.supportedCapabilities.begin(), state.supportedCapabilities.end(), static_cast<std::uint32_t>(spv::CapabilityInterpolationFunction)) == state.supportedCapabilities.end()) {
+        throw std::runtime_error("barycentrics away from the fragment's default position need the device's sampleRateShading");
+    }
+    state.module.EmitCapability(spv::CapabilityInterpolationFunction);
+    const bool center = kind == StageInputKind::BaryCoordSmoothCenter || kind == StageInputKind::BaryCoordNoPerspectiveCenter;
+    const auto offset = center ? InterpolationOffset(state, 0u) : EmitSampleOffset(state);
+    const auto weights = state.module.AllocateId();
+    state.module.AddFunction(spv::OpExtInst, TypeF32Vector(state, 3u), weights, GlslStd450(state), GLSLstd450InterpolateAtOffset, variable, offset);
+    const auto weight = state.module.AllocateId();
+    state.module.AddFunction(spv::OpCompositeExtract, TypeF32(state), weight, weights, component + 1u);
+    return Unary(state, spv::OpBitcast, TypeU32(state), weight);
+}
+
 std::uint32_t EmitBuiltinU32(SpirvEmitterState& state, StageInputKind kind, std::uint32_t component) {
+    if (BarycentricInputOf(kind) != kind) {
+        return EmitOffsetBarycentricU32(state, kind, component);
+    }
     if (kind == StageInputKind::LocalInvocationIndex) {
         return EmitLocalInvocationIndex(state);
     }
@@ -67,8 +165,17 @@ std::uint32_t EmitBuiltinU32(SpirvEmitterState& state, StageInputKind kind, std:
         if (kind == StageInputKind::LocalInvocationId) {
             return local;
         }
-        const auto group = EmitInputComponentU32(state, StageInputKind::WorkgroupId, component);
+        const auto group = EmitBuiltinU32(state, StageInputKind::WorkgroupId, component);
         return EmitBinaryU32(state, spv::OpIAdd, local, EmitBinaryU32(state, spv::OpIMul, group, ConstantU32(state, size)));
+    }
+    if (StageOf(state) == IrShaderStage::Compute && (kind == StageInputKind::WorkgroupId || kind == StageInputKind::GlobalInvocationId)) {
+        const auto offset = state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::WorkgroupOffsetBase + component, 0u);
+        const auto value = EmitInputComponentU32(state, kind, component);
+        if (kind == StageInputKind::WorkgroupId) {
+            return EmitBinaryU32(state, spv::OpIAdd, value, offset);
+        }
+        const auto local = WorkgroupLocalSize(state, *ShaderWorkgroupInput(state));
+        return EmitBinaryU32(state, spv::OpIAdd, value, EmitBinaryU32(state, spv::OpIMul, offset, ConstantU32(state, local[component])));
     }
     const auto variable = InputVariableForKind(state, kind);
     if (variable == 0) {
@@ -100,12 +207,28 @@ std::uint32_t EmitBuiltinU32(SpirvEmitterState& state, StageInputKind kind, std:
         state.module.AddFunction(spv::OpBitcast, TypeU32(state), bits, value);
         return bits;
     }
+    if (kind == StageInputKind::SampleMask) {
+        const auto pointer = state.module.AllocateId();
+        const auto value = state.module.AllocateId();
+        const auto bits = state.module.AllocateId();
+        state.module.AddFunction(spv::OpAccessChain, TypePointer(state, spv::StorageClassInput, TypeI32(state)), pointer, variable, ConstantU32(state, 0u));
+        state.module.AddFunction(spv::OpLoad, TypeI32(state), value, pointer);
+        state.module.AddFunction(spv::OpBitcast, TypeU32(state), bits, value);
+        return bits;
+    }
     if (kind == StageInputKind::FragCoord || kind == StageInputKind::TessCoord) {
         const auto pointer = state.module.AllocateId();
         const auto value = state.module.AllocateId();
         const auto bits = state.module.AllocateId();
         state.module.AddFunction(spv::OpAccessChain, TypePointer(state, spv::StorageClassInput, TypeF32(state)), pointer, variable, ConstantU32(state, component));
         state.module.AddFunction(spv::OpLoad, TypeF32(state), value, pointer);
+        state.module.AddFunction(spv::OpBitcast, TypeU32(state), bits, value);
+        return bits;
+    }
+    if ((kind == StageInputKind::BaryCoordSmooth || kind == StageInputKind::BaryCoordNoPerspective) && MeshBarycentricPixel(state)) {
+        const auto value = state.module.AllocateId();
+        const auto bits = state.module.AllocateId();
+        state.module.AddFunction(spv::OpCompositeExtract, TypeF32(state), value, EmitSolvedBarycentric(state, kind), component + 1u);
         state.module.AddFunction(spv::OpBitcast, TypeU32(state), bits, value);
         return bits;
     }
@@ -155,12 +278,17 @@ std::uint32_t EmitAttributeValue(SpirvEmitterState& state, std::uint32_t attr, s
             throw std::runtime_error("per-vertex attribute interpolation lacks its barycentric input");
         }
         std::uint32_t sum = 0;
+        const auto solved = MeshBarycentricPixel(state) ? EmitSolvedBarycentric(state, barycentricKind) : 0u;
         for (std::uint32_t vertex = 0; vertex < 3u; vertex++) {
             const auto pointer = state.module.AllocateId();
             const auto weight = state.module.AllocateId();
             const auto product = state.module.AllocateId();
-            state.module.AddFunction(spv::OpAccessChain, TypePointer(state, spv::StorageClassInput, TypeF32(state)), pointer, barycentric, ConstantU32(state, vertex));
-            state.module.AddFunction(spv::OpLoad, TypeF32(state), weight, pointer);
+            if (solved != 0u) {
+                state.module.AddFunction(spv::OpCompositeExtract, TypeF32(state), weight, solved, vertex);
+            } else {
+                state.module.AddFunction(spv::OpAccessChain, TypePointer(state, spv::StorageClassInput, TypeF32(state)), pointer, barycentric, ConstantU32(state, vertex));
+                state.module.AddFunction(spv::OpLoad, TypeF32(state), weight, pointer);
+            }
             state.module.AddFunction(spv::OpFMul, TypeF32(state), product, loadPerVertex(vertex), weight);
             if (vertex == 0u) {
                 sum = product;
@@ -258,8 +386,8 @@ std::uint32_t MrtOutputMode(const SpirvEmitterState& state, const ExportInfo& ex
     return state.inputInfo.pixel->targetOutputMode[exp.index];
 }
 
-std::uint32_t PackUnorm10_11_11(SpirvEmitterState& state, std::uint32_t color) {
-    const auto info = GetFormatInfo(IrBufferFormat::Format11_11_10UNorm);
+std::uint32_t PackExport(SpirvEmitterState& state, IrBufferFormat format, std::uint32_t color) {
+    const auto info = GetFormatInfo(format);
     auto packed = ConstantU32(state, 0u);
     for (std::uint32_t component = 0; component < info.componentCount; component++) {
         const auto value = state.module.AllocateId();
@@ -274,8 +402,9 @@ std::uint32_t PackUnorm10_11_11(SpirvEmitterState& state, std::uint32_t color) {
 
 std::uint32_t SelectExportPacking(SpirvEmitterState& state, std::uint32_t target, std::uint32_t color) {
     const auto packing = state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::ExportPackingBase + target, static_cast<std::uint32_t>(ColorExportPacking::None));
-    const auto packed = EmitCompareU32Constant(state, spv::OpIEqual, packing, static_cast<std::uint32_t>(ColorExportPacking::Unorm10_11_11));
-    const auto word = PackUnorm10_11_11(state, color);
+    const auto packed = EmitCompareU32Constant(state, spv::OpINotEqual, packing, static_cast<std::uint32_t>(ColorExportPacking::None));
+    const auto floating = EmitCompareU32Constant(state, spv::OpIEqual, packing, static_cast<std::uint32_t>(ColorExportPacking::Float11_11_10));
+    const auto word = Select(state, TypeU32(state), floating, PackExport(state, IrBufferFormat::Format10_11_11Float, color), PackExport(state, IrBufferFormat::Format11_11_10UNorm, color));
     std::array<std::uint32_t, 4> components{};
     for (std::uint32_t component = 0; component < components.size(); ++component) {
         const auto unpacked = state.module.AllocateId();
@@ -626,6 +755,59 @@ std::uint32_t ConvertClipCoordinate(SpirvEmitterState& state, std::uint32_t coor
     return ndc;
 }
 
+std::uint32_t RemapPositionDepth(SpirvEmitterState& state, std::uint32_t position) {
+    const auto& remap = state.inputInfo.vertex->depthRemap;
+    const auto f32 = TypeF32(state);
+    const auto u32 = TypeU32(state);
+    const auto boolean = TypeBool(state);
+    std::array<std::uint32_t, 4> components{};
+    for (std::uint32_t i = 0; i < 4u; i++) {
+        components.at(i) = state.module.AllocateId();
+        state.module.AddFunction(spv::OpCompositeExtract, f32, components.at(i), position, i);
+    }
+    const auto mode = state.module.SpecializationConstant(u32, PipelineSpecialization::DepthRemapBase, remap.mode);
+    if (state.pushConstantVariable == 0u) throw std::runtime_error("depth remap push constants were not declared");
+    const auto pushFloat = [&](std::uint32_t dword) {
+        const auto pointer = state.module.AllocateId();
+        state.module.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state), pointer, state.pushConstantVariable, ConstantU32(state, 0u), ConstantU32(state, DepthRemapPushOffsetBytes / 4u + dword));
+        const auto bits = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, u32, bits, pointer);
+        const auto value = state.module.AllocateId();
+        state.module.AddFunction(spv::OpBitcast, f32, value, bits);
+        return value;
+    };
+    const auto scale = pushFloat(0u);
+    const auto offset = pushFloat(1u);
+    const auto scaled = state.module.AllocateId();
+    state.module.AddFunction(spv::OpFMul, f32, scaled, components[2], scale);
+    const auto shifted = state.module.AllocateId();
+    state.module.AddFunction(spv::OpFMul, f32, shifted, components[3], offset);
+    const auto remapped = state.module.AllocateId();
+    state.module.AddFunction(spv::OpFAdd, f32, remapped, scaled, shifted);
+    const auto active = state.module.AllocateId();
+    state.module.AddFunction(spv::OpINotEqual, boolean, active, mode, ConstantU32(state, 0u));
+    const auto z = Select(state, f32, active, remapped, components[2]);
+    const auto symmetric = state.module.AllocateId();
+    state.module.AddFunction(spv::OpIEqual, boolean, symmetric, mode, ConstantU32(state, 2u));
+    const auto nearSymmetric = state.module.AllocateId();
+    state.module.AddFunction(spv::OpFAdd, f32, nearSymmetric, components[3], components[2]);
+    const auto near = Select(state, f32, symmetric, nearSymmetric, components[2]);
+    const auto far = state.module.AllocateId();
+    state.module.AddFunction(spv::OpFSub, f32, far, components[3], components[2]);
+    const auto inside = ConstantF32Value(state, 1.0f);
+    const auto storeDistance = [&](std::uint32_t index, std::uint32_t distance) {
+        const auto pointer = state.module.AllocateId();
+        state.module.AddFunction(spv::OpAccessChain, TypePointer(state, spv::StorageClassOutput, f32), pointer, state.clipDistanceVariable, ConstantU32(state, index));
+        state.module.AddFunction(spv::OpStore, pointer, Select(state, f32, active, distance, inside));
+    };
+    if (state.clipDistanceVariable == 0u) throw std::runtime_error("depth remap clip distances were not declared");
+    storeDistance(state.depthRemapClipIndex, near);
+    storeDistance(state.depthRemapClipIndex + 1u, far);
+    const auto converted = state.module.AllocateId();
+    state.module.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 4u), converted, components[0], components[1], z, components[3]);
+    return converted;
+}
+
 std::uint32_t ConvertPositionToClipSpace(SpirvEmitterState& state, std::uint32_t position) {
     if (state.inputInfo.vertex == nullptr) {
         throw std::runtime_error("vertex input info is missing for clip-space conversion");
@@ -878,36 +1060,102 @@ void DefineMeshOutputs(SpirvEmitterState& state) {
             throw std::runtime_error("unsupported mesh output kind");
         }
         const auto type = MeshOutputType(state, output.kind);
-        output.variableId = MeshArray(state, spv::StorageClassOutput, type, output.kind == StageOutputKind::Layer ? mesh.maxPrimitives : mesh.maxVertices);
         const bool shared = output.kind == StageOutputKind::Layer;
         output.meshDataVariable = MeshArray(state, shared ? spv::StorageClassWorkgroup : spv::StorageClassPrivate, type, shared ? mesh.maxVertices : state.laneCount);
+        if (state.meshBarycentricVertex && output.kind == StageOutputKind::Parameter && std::ranges::find(state.meshExportedLocations, output.location) == state.meshExportedLocations.end()) {
+            continue;
+        }
+        const auto layerBlock = output.kind == StageOutputKind::Layer ? state.module.DecoratedType(spv::OpTypeStruct, {{spv::OpMemberDecorate, {0u, spv::DecorationBuiltIn, spv::BuiltInLayer}}, {spv::OpMemberDecorate, {0u, spv::DecorationPerPrimitiveEXT}}, {spv::OpDecorate, {spv::DecorationBlock}}}, type) : 0u;
+        output.variableId = MeshArray(state, spv::StorageClassOutput, output.kind == StageOutputKind::Layer ? layerBlock : type, output.kind == StageOutputKind::Layer ? mesh.maxPrimitives : mesh.maxVertices);
         state.interfaceVariables.push_back(output.variableId);
         state.module.AddName(output.variableId, output.debugName);
         if (output.kind == StageOutputKind::Parameter) {
             state.module.AddAnnotation(spv::OpDecorate, output.variableId, spv::DecorationLocation, output.location);
-        } else {
-            state.module.AddAnnotation(spv::OpDecorate, output.variableId, spv::DecorationBuiltIn, output.kind == StageOutputKind::Layer ? spv::BuiltInLayer : spv::BuiltInPosition);
-        }
-        if (output.kind == StageOutputKind::Layer) {
-            state.module.AddAnnotation(spv::OpDecorate, output.variableId, spv::DecorationPerPrimitiveEXT);
+        } else if (output.kind != StageOutputKind::Layer) {
+            state.module.AddAnnotation(spv::OpDecorate, output.variableId, spv::DecorationBuiltIn, spv::BuiltInPosition);
         }
         if (output.kind == StageOutputKind::Position) {
             state.module.AddAnnotation(spv::OpDecorate, output.variableId, spv::DecorationInvariant);
         }
     }
+    if (state.meshBarycentricVertex) {
+        if (std::ranges::none_of(state.outputs, [](const SpirvOutputBinding& output) { return output.kind == StageOutputKind::Position; })) {
+            throw std::runtime_error("barycentric emulation on the mesh path needs the mesh program to export a position");
+        }
+        const auto vec3 = TypeF32Vector(state, 3u);
+        state.meshPositionStaging = MeshArray(state, spv::StorageClassWorkgroup, TypeF32Vector(state, 4u), mesh.maxVertices);
+        const auto defineClip = [&](std::uint32_t location, bool linear, const char* name) {
+            if (location == BarycentricEmulationLayout::NoLocation) return 0u;
+            const auto variable = MeshArray(state, spv::StorageClassOutput, vec3, mesh.maxVertices);
+            state.interfaceVariables.push_back(variable);
+            state.module.AddName(variable, name);
+            state.module.AddAnnotation(spv::OpDecorate, variable, spv::DecorationLocation, location);
+            if (linear) state.module.AddAnnotation(spv::OpDecorate, variable, spv::DecorationNoPerspective);
+            return variable;
+        };
+        state.meshClipSmooth = defineClip(state.barycentricSmoothLocation, false, "meshBarycentricClipSmooth");
+        state.meshClipLinear = defineClip(state.barycentricLinearLocation, true, "meshBarycentricClipLinear");
+        if (state.barycentricPositionsLocation == BarycentricEmulationLayout::NoLocation) {
+            throw std::runtime_error("barycentric emulation on the mesh path has no location for the corner positions");
+        }
+        const auto corners = state.module.Type(spv::OpTypeArray, TypeF32Vector(state, 4u), ConstantU32(state, 3u));
+        state.meshFlatPositions = MeshArray(state, spv::StorageClassOutput, corners, mesh.maxPrimitives);
+        state.interfaceVariables.push_back(state.meshFlatPositions);
+        state.module.AddName(state.meshFlatPositions, "meshBarycentricPositions");
+        state.module.AddAnnotation(spv::OpDecorate, state.meshFlatPositions, spv::DecorationLocation, state.barycentricPositionsLocation);
+        state.module.AddAnnotation(spv::OpDecorate, state.meshFlatPositions, spv::DecorationPerPrimitiveEXT);
+        for (const auto& [sourceLocation, relocated] : state.meshPerVertexLocations) {
+            const auto source = std::ranges::find_if(state.outputs, [sourceLocation = sourceLocation](const SpirvOutputBinding& output) { return output.kind == StageOutputKind::Parameter && output.location == sourceLocation; });
+            if (source == state.outputs.end()) {
+                throw std::runtime_error("barycentric emulation on the mesh path: the mesh program does not export per-vertex parameter " + std::to_string(sourceLocation));
+            }
+            const auto staging = MeshArray(state, spv::StorageClassWorkgroup, TypeF32Vector(state, 4u), mesh.maxVertices);
+            const auto perPrimitive = MeshArray(state, spv::StorageClassOutput, corners, mesh.maxPrimitives);
+            state.interfaceVariables.push_back(perPrimitive);
+            state.module.AddName(perPrimitive, "meshPerVertexParameter" + std::to_string(sourceLocation));
+            state.module.AddAnnotation(spv::OpDecorate, perPrimitive, spv::DecorationLocation, relocated);
+            state.module.AddAnnotation(spv::OpDecorate, perPrimitive, spv::DecorationPerPrimitiveEXT);
+            state.meshVertexParameters.push_back({source->meshDataVariable, staging, perPrimitive});
+        }
+    }
     state.meshAllocation = MeshArray(state, spv::StorageClassWorkgroup, TypeU32(state), 2u);
     state.meshPrimitiveData = MeshArray(state, spv::StorageClassPrivate, TypeU32(state), state.laneCount);
-    state.meshPrimitives = MeshArray(state, spv::StorageClassOutput, TypeU32Vector(state, 3u), mesh.maxPrimitives);
+    state.meshPrimitives = MeshArray(state, spv::StorageClassOutput, TypeU32Vector(state, mesh.outputPrimitiveSize), mesh.maxPrimitives);
     state.meshCull = MeshArray(state, spv::StorageClassOutput, TypeBool(state), mesh.maxPrimitives);
     state.interfaceVariables.push_back(state.meshPrimitives);
     state.interfaceVariables.push_back(state.meshCull);
-    state.module.AddAnnotation(spv::OpDecorate, state.meshPrimitives, spv::DecorationBuiltIn, spv::BuiltInPrimitiveTriangleIndicesEXT);
+    state.module.AddAnnotation(spv::OpDecorate, state.meshPrimitives, spv::DecorationBuiltIn, mesh.outputPrimitiveSize == 2u ? spv::BuiltInPrimitiveLineIndicesEXT : spv::BuiltInPrimitiveTriangleIndicesEXT);
     state.module.AddAnnotation(spv::OpDecorate, state.meshCull, spv::DecorationBuiltIn, spv::BuiltInCullPrimitiveEXT);
     state.module.AddAnnotation(spv::OpDecorate, state.meshCull, spv::DecorationPerPrimitiveEXT);
     if (state.numWorkgroupsVariable == 0u) {
         state.numWorkgroupsVariable = DefineInterfaceVariable(state, TypeU32Vector(state, 3u), spv::StorageClassInput, "gl_NumWorkGroups");
         state.module.AddAnnotation(spv::OpDecorate, state.numWorkgroupsVariable, spv::DecorationBuiltIn, spv::BuiltInNumWorkgroups);
     }
+}
+
+void EmitPixelEntryPoint(SpirvEmitterState& state) {
+    state.module.AddFunction(spv::OpFunction, TypeVoid(state), state.mainFunc, spv::FunctionControlMaskNone, TypeFunction(state));
+    EmitLabel(state, state.module.AllocateId());
+    state.module.AddFunction(spv::OpStore, state.pixelStopFlag, ConstantBool(state, false));
+    state.module.AddFunction(spv::OpFunctionCall, TypeVoid(state), state.module.AllocateId(), state.pixelGuestFunc);
+    if (state.pixelStopStored) {
+        const auto stopped = state.module.AllocateId();
+        const auto stop = state.module.AllocateId();
+        const auto done = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, TypeBool(state), stopped, state.pixelStopFlag);
+        state.module.AddFunction(spv::OpSelectionMerge, done, spv::SelectionControlMaskNone);
+        state.module.AddFunction(spv::OpBranchConditional, stopped, stop, done);
+        EmitLabel(state, stop);
+        if (std::ranges::find(state.supportedExtensions, "SPV_KHR_terminate_invocation") != state.supportedExtensions.end()) {
+            state.module.EmitExtension("SPV_KHR_terminate_invocation");
+            state.module.AddFunction(spv::OpTerminateInvocation);
+        } else {
+            state.module.AddFunction(spv::OpKill);
+        }
+        EmitLabel(state, done);
+    }
+    state.module.AddFunction(spv::OpReturn);
+    state.module.AddFunction(spv::OpFunctionEnd);
 }
 
 void EmitMeshEntryPoint(SpirvEmitterState& state) {
@@ -946,14 +1194,15 @@ void EmitMeshEntryPoint(SpirvEmitterState& state) {
     const auto anyVertex = state.module.AllocateId();
     state.module.AddFunction(spv::OpExtInst, TypeU32(state), anyVertex, GlslStd450(state), GLSLstd450UMax, vertices, ConstantU32(state, 1u));
     const auto lastVertex = EmitBinaryU32(state, spv::OpISub, anyVertex, ConstantU32(state, 1u));
-    for (std::uint32_t half = 0; half < state.laneCount; half++) {
+    const bool emulating = state.meshBarycentricVertex;
+    const auto emitVertexPart = [&](std::uint32_t half) {
         state.laneHalf = half;
         const auto index = EmitLocalInvocationIndex(state);
         const auto isVertex = state.module.AllocateId();
         state.module.AddFunction(spv::OpULessThan, TypeBool(state), isVertex, index, vertices);
         EmitIfCondition(state, isVertex, [&]() {
             for (const auto& output : state.outputs) {
-                if (output.kind == StageOutputKind::Layer) {
+                if (output.kind == StageOutputKind::Layer || output.variableId == 0u) {
                     continue;
                 }
                 const auto type = MeshOutputType(state, output.kind);
@@ -961,22 +1210,43 @@ void EmitMeshEntryPoint(SpirvEmitterState& state) {
                 const auto pointer = IsMeshDistance(output.kind) ? MeshDistancePointer(state, output, index) : MeshElement(state, output.variableId, spv::StorageClassOutput, type, index);
                 state.module.AddFunction(spv::OpStore, pointer, value);
             }
+            if (!emulating) {
+                return;
+            }
+            const auto position = std::ranges::find_if(state.outputs, [](const SpirvOutputBinding& output) { return output.kind == StageOutputKind::Position; });
+            const auto value = MeshLoad(state, position->meshDataVariable, spv::StorageClassPrivate, TypeF32Vector(state, 4u), ConstantU32(state, half));
+            state.module.AddFunction(spv::OpStore, MeshElement(state, state.meshPositionStaging, spv::StorageClassWorkgroup, TypeF32Vector(state, 4u), index), value);
+            const auto clip = state.module.AllocateId();
+            state.module.AddFunction(spv::OpVectorShuffle, TypeF32Vector(state, 3u), clip, value, value, 0u, 1u, 3u);
+            for (const auto& parameter : state.meshVertexParameters) {
+                const auto staged = MeshLoad(state, parameter[0], spv::StorageClassPrivate, TypeF32Vector(state, 4u), ConstantU32(state, half));
+                state.module.AddFunction(spv::OpStore, MeshElement(state, parameter[1], spv::StorageClassWorkgroup, TypeF32Vector(state, 4u), index), staged);
+            }
+            for (const auto variable : {state.meshClipSmooth, state.meshClipLinear}) {
+                if (variable != 0u) {
+                    state.module.AddFunction(spv::OpStore, MeshElement(state, variable, spv::StorageClassOutput, TypeF32Vector(state, 3u), index), clip);
+                }
+            }
         });
+    };
+    const auto emitPrimitivePart = [&](std::uint32_t half) {
+        state.laneHalf = half;
+        const auto index = EmitLocalInvocationIndex(state);
         const auto isPrimitive = state.module.AllocateId();
         state.module.AddFunction(spv::OpULessThan, TypeBool(state), isPrimitive, index, primitives);
         EmitIfCondition(state, isPrimitive, [&]() {
             const auto packed = MeshLoad(state, state.meshPrimitiveData, spv::StorageClassPrivate, TypeU32(state), ConstantU32(state, half));
             std::array<std::uint32_t, 3> vertex {};
-            for (std::uint32_t component = 0; component < 3u; component++) {
+            for (std::uint32_t component = 0; component < mesh.outputPrimitiveSize; component++) {
                 const auto field = state.module.AllocateId();
                 state.module.AddFunction(spv::OpBitFieldUExtract, TypeU32(state), field, packed, ConstantU32(state, component * 10u), ConstantU32(state, 9u));
                 vertex.at(component) = state.module.AllocateId();
                 state.module.AddFunction(spv::OpExtInst, TypeU32(state), vertex.at(component), GlslStd450(state), GLSLstd450UMin, field, lastVertex);
             }
-            const auto triangle = state.module.AllocateId();
-            state.module.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 3u), triangle, vertex[0], vertex[1], vertex[2]);
-            const auto trianglePointer = MeshElement(state, state.meshPrimitives, spv::StorageClassOutput, TypeU32Vector(state, 3u), index);
-            state.module.AddFunction(spv::OpStore, trianglePointer, triangle);
+            const auto indices = state.module.AllocateId();
+            state.module.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, mesh.outputPrimitiveSize), indices, std::span<const std::uint32_t>(vertex.data(), mesh.outputPrimitiveSize));
+            const auto indicesPointer = MeshElement(state, state.meshPrimitives, spv::StorageClassOutput, TypeU32Vector(state, mesh.outputPrimitiveSize), index);
+            state.module.AddFunction(spv::OpStore, indicesPointer, indices);
             const auto nullBit = EmitBinaryU32(state, spv::OpBitwiseAnd, packed, ConstantU32(state, 0x80000000u));
             const auto culled = state.module.AllocateId();
             state.module.AddFunction(spv::OpINotEqual, TypeBool(state), culled, nullBit, ConstantU32(state, 0u));
@@ -986,10 +1256,45 @@ void EmitMeshEntryPoint(SpirvEmitterState& state) {
                     continue;
                 }
                 const auto layer = MeshLoad(state, output.meshDataVariable, spv::StorageClassWorkgroup, TypeU32(state), vertex.at(state.inputInfo.vertex->mesh.provokingVertex));
-                const auto pointer = MeshElement(state, output.variableId, spv::StorageClassOutput, TypeU32(state), index);
+                const auto pointer = state.module.AllocateId();
+                state.module.AddFunction(spv::OpAccessChain, TypePointer(state, spv::StorageClassOutput, TypeU32(state)), pointer, output.variableId, index, ConstantU32(state, 0u));
                 state.module.AddFunction(spv::OpStore, pointer, layer);
             }
+            if (emulating) {
+                const auto corners = state.module.Type(spv::OpTypeArray, TypeF32Vector(state, 4u), ConstantU32(state, 3u));
+                std::array<std::uint32_t, 3> staged {};
+                for (std::uint32_t component = 0; component < 3u; component++) {
+                    staged.at(component) = MeshLoad(state, state.meshPositionStaging, spv::StorageClassWorkgroup, TypeF32Vector(state, 4u), vertex.at(component));
+                }
+                const auto array = state.module.AllocateId();
+                state.module.AddFunction(spv::OpCompositeConstruct, corners, array, staged[0], staged[1], staged[2]);
+                state.module.AddFunction(spv::OpStore, MeshElement(state, state.meshFlatPositions, spv::StorageClassOutput, corners, index), array);
+                for (const auto& parameter : state.meshVertexParameters) {
+                    std::array<std::uint32_t, 3> values {};
+                    for (std::uint32_t component = 0; component < 3u; component++) {
+                        values.at(component) = MeshLoad(state, parameter[1], spv::StorageClassWorkgroup, TypeF32Vector(state, 4u), vertex.at(component));
+                    }
+                    const auto perVertex = state.module.AllocateId();
+                    state.module.AddFunction(spv::OpCompositeConstruct, corners, perVertex, values[0], values[1], values[2]);
+                    state.module.AddFunction(spv::OpStore, MeshElement(state, parameter[2], spv::StorageClassOutput, corners, index), perVertex);
+                }
+            }
         });
+    };
+    if (!emulating) {
+        for (std::uint32_t half = 0; half < state.laneCount; half++) {
+            emitVertexPart(half);
+            emitPrimitivePart(half);
+        }
+    } else {
+        for (std::uint32_t half = 0; half < state.laneCount; half++) {
+            emitVertexPart(half);
+        }
+        state.laneHalf = 0;
+        state.module.AddFunction(spv::OpControlBarrier, ConstantU32(state, spv::ScopeWorkgroup), ConstantU32(state, spv::ScopeWorkgroup), ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask | spv::MemorySemanticsWorkgroupMemoryMask));
+        for (std::uint32_t half = 0; half < state.laneCount; half++) {
+            emitPrimitivePart(half);
+        }
     }
     state.laneHalf = 0;
     state.module.AddFunction(spv::OpReturn);
@@ -1274,10 +1579,17 @@ void EmitProgram(SpirvEmitterState& state) {
             break;
         }
     }
-    state.module.AddFunction(spv::OpFunction, TypeVoid(state), state.meshGuestFunc != 0u ? state.meshGuestFunc : state.mainFunc, spv::FunctionControlMaskNone, TypeFunction(state));
+    const bool blendable = std::any_of(state.blendTargetImages.begin(), state.blendTargetImages.end(), [](std::uint32_t image) { return image != 0u; });
+    if (program.Resources().stage == IrShaderStage::Pixel && state.bdaStopsInvocations && !OrderedPixelShader(state) && !blendable) {
+        state.pixelGuestFunc = state.module.AllocateId();
+        state.pixelStopFlag = state.module.DefineGlobalVariable(TypePointer(state, spv::StorageClassPrivate, TypeBool(state)), spv::StorageClassPrivate);
+        if (state.spirvVersion >= 0x00010400u) state.interfaceVariables.push_back(state.pixelStopFlag);
+        state.module.AddName(state.pixelStopFlag, "bda_stopped");
+    }
+    state.module.AddFunction(spv::OpFunction, TypeVoid(state), state.meshGuestFunc != 0u ? state.meshGuestFunc : state.pixelGuestFunc != 0u ? state.pixelGuestFunc : state.mainFunc, spv::FunctionControlMaskNone, TypeFunction(state));
     EmitLabel(state, state.entryLabel);
     if (state.requirements.functionLds) {
-        state.module.AddFunction(spv::OpVariable, TypeU32ArrayPointer(state, spv::StorageClassFunction, LdsDwordCount(state)), state.ldsVariable, spv::StorageClassFunction);
+        state.module.AddFunction(spv::OpVariable, TypeU32ArrayPointer(state, spv::StorageClassFunction, LdsStorageDwords(state)), state.ldsVariable, spv::StorageClassFunction);
     }
     if (state.requirements.functionScratch) {
         for (std::uint32_t half = 0; half < state.laneCount; half++) {
@@ -1285,10 +1597,14 @@ void EmitProgram(SpirvEmitterState& state) {
         }
     }
     if (const auto window = state.program.Metadata().vectorWindowSize; window != 0u) {
-        const auto array = state.module.Type(spv::OpTypeArray, TypeU32(state), ConstantU32(state, window));
+        const auto indexed = state.vectorWindowIndexed != 0u ? state.vectorWindowIndexed : window;
+        const auto array = state.module.Type(spv::OpTypeArray, TypeU32(state), ConstantU32(state, indexed));
         const auto zero = state.module.Constant(spv::OpConstantNull, array);
         for (std::uint32_t half = 0; half < state.laneCount; half++) {
             state.module.AddFunction(spv::OpVariable, TypePointer(state, spv::StorageClassFunction, array), state.vectorWindowVariable.at(half), spv::StorageClassFunction, zero);
+            for (const auto slot : state.vectorWindowSlots.at(half)) {
+                state.module.AddFunction(spv::OpVariable, TypePointer(state, spv::StorageClassFunction, TypeU32(state)), slot, spv::StorageClassFunction, ConstantU32(state, 0u));
+            }
         }
     }
     if (state.pixelValidMaskVariable != 0u) {
@@ -1302,7 +1618,11 @@ void EmitProgram(SpirvEmitterState& state) {
     }
     EmitLdsBufferBase(state);
     if (state.requirements.ldsLock) {
-        state.module.AddFunction(spv::OpStore, EmitLdsLockPointer(state), ConstantU32(state, 0u));
+        const auto firstInvocation = state.module.AllocateId();
+        state.module.AddFunction(spv::OpIEqual, TypeBool(state), firstInvocation, EmitLocalInvocationIndex(state), ConstantU32(state, 0u));
+        EmitIfCondition(state, firstInvocation, [&] {
+            state.module.AddFunction(spv::OpStore, EmitLdsLockPointer(state), ConstantU32(state, 0u));
+        });
         state.module.AddFunction(spv::OpControlBarrier, ConstantU32(state, spv::ScopeWorkgroup), ConstantU32(state, spv::ScopeWorkgroup), ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask | LdsMemorySemantics(state)));
     }
     if (state.gdsVariable != 0u) {
@@ -1316,17 +1636,14 @@ void EmitProgram(SpirvEmitterState& state) {
     for (const auto written : state.blendTargetWritten) {
         if (written != 0u) state.module.AddFunction(spv::OpStore, written, ConstantU32(state, 0u));
     }
+    EmitBdaAnchors(state);
     if (OrderedPixelShader(state)) {
         state.module.AddFunction(spv::OpBeginInvocationInterlockEXT);
     }
     EmitMemoryOffsets(state);
     if (state.program.Resources().stage == IrShaderStage::Pixel && state.inputInfo.pixel != nullptr && state.inputInfo.pixel->QuadMasked()) {
         const auto& pixel = *state.inputInfo.pixel;
-        const auto coordinate = [&](std::uint32_t component) {
-            const auto value = Unary(state, spv::OpBitcast, TypeF32(state), EmitBuiltinU32(state, StageInputKind::FragCoord, component));
-            return EmitBinaryU32(state, spv::OpBitwiseAnd, Unary(state, spv::OpConvertFToU, TypeU32(state), value), ConstantU32(state, 1u));
-        };
-        const auto quad = EmitBinaryU32(state, spv::OpBitwiseOr, coordinate(0u), EmitBinaryU32(state, spv::OpShiftLeftLogical, coordinate(1u), ConstantU32(state, 1u)));
+        const auto quad = EmitQuadPixel(state);
         auto bit = EmitBinaryU32(state, spv::OpBitwiseAnd, EmitBinaryU32(state, spv::OpShiftRightLogical, ConstantU32(state, pixel.quadPixelMask), quad), ConstantU32(state, 1u));
         if (pixel.QuadSampleMaskPartial()) {
             const auto top = ConstantU32(state, static_cast<std::uint32_t>(pixel.quadSampleMask[0]) | (static_cast<std::uint32_t>(pixel.quadSampleMask[1]) << 16u));
@@ -1394,6 +1711,7 @@ void EmitProgram(SpirvEmitterState& state) {
         EmitControlFlow(ctx, functionState, program);
     }
     state.module.AddFunction(spv::OpFunctionEnd);
+    if (state.pixelGuestFunc != 0u) EmitPixelEntryPoint(state);
     if (state.program.Resources().stage == IrShaderStage::Mesh) {
         EmitMeshEntryPoint(state);
     }
@@ -1622,7 +1940,8 @@ void EmitSetAttribute(SpirvValueEmitContext& ctx, const IrValue& inst) {
                 state.module.AddFunction(spv::OpStore, state.depthVariable, f32);
             }
             if ((exp.en & 2u) != 0u && state.stencilRefVariable != 0u) {
-                const auto raw = ExportRawComponent(ctx, data, 1);
+                auto raw = ExportRawComponent(ctx, data, 1);
+                if (state.inputInfo.pixel != nullptr && state.inputInfo.pixel->psStencilOperationValueExport) raw = EmitBinaryU32(state, spv::OpBitwiseAnd, EmitBinaryU32(state, spv::OpShiftRightLogical, raw, ConstantU32(state, 8u)), ConstantU32(state, 0xffu));
                 const auto value = state.module.AllocateId();
                 state.module.AddFunction(spv::OpBitcast, TypeI32(state), value, raw);
                 state.module.AddFunction(spv::OpStore, state.stencilRefVariable, value);
@@ -1664,6 +1983,9 @@ void EmitSetAttribute(SpirvValueEmitContext& ctx, const IrValue& inst) {
             }
             if (state.inputInfo.vertex->clipSpace.enabled) {
                 value = ConvertPositionToClipSpace(state, value);
+            }
+            if (state.depthRangeRemap && state.program.Resources().stage == IrShaderStage::Vertex) {
+                value = RemapPositionDepth(state, value);
             }
         }
         if (exp.kind == ExportTargetKind::Position && state.zeroPositionClipIndex) {

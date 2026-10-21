@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 
 namespace AgcDriver::Graphics {
@@ -16,12 +17,14 @@ class StorageTexture;
 class Texture;
 struct GuestTextureResource;
 
+std::optional<DccKeys> MultisampledCmaskKeys(std::uint8_t code);
+
 class MultisampledCmask {
 public:
     MultisampledCmask() = default;
     MultisampledCmask(std::uint64_t cmaskAddress, std::uint64_t cmaskBytes) : address(cmaskAddress), bytes(cmaskBytes) {}
     void NoteFill(std::uint64_t fillAddress, std::size_t fillBytes, std::uint32_t pattern);
-    void SeedKeys(DccKeys seeded);
+    void SeedCode(std::optional<std::uint8_t> code);
     void CheckAddress(std::uint64_t cmaskAddress) const;
     bool TakeClear();
     DccKeys Keys() const { return keys; }
@@ -49,11 +52,17 @@ private:
 };
 
 std::uint64_t MultisampledColorBytes(const ColorTarget& target);
+std::size_t MultisampledDccBytes(const ColorTarget& target);
+VkClearColorValue MultisampledDccClear(const ColorTarget& target, std::span<const std::byte> dcc, std::span<const std::byte> cmask);
 bool MultisampledFillClearColor(const ColorTarget& target, std::uint32_t fill, VkClearColorValue& clear);
 bool TakeMultisampledClear(MultisampledCmask& cmask, MultisampledColorFill& colorFill, const ColorTarget& use, VkClearColorValue& clear);
-VkImageView MultisampleTargetView(const Context& context, const ColorTarget& target);
-std::shared_ptr<Texture> MultisampleTargetTexture(const Context& context, const GuestTextureResource& resource, VkComponentMapping components);
+std::shared_ptr<Texture> MultisampleTargetTexture(const Context& context, const GuestTextureResource& resource, VkComponentMapping components, VkImageViewType viewType = VK_IMAGE_VIEW_TYPE_2D);
+VkImageView MultisampleTargetView(const Context& context, const ColorTarget& target, VkImage* image = nullptr);
+VkImageView MultisampleTargetView(const Context& context, const ColorTarget& target, std::shared_ptr<void>& owner, VkImage* image = nullptr);
+void KeepMultisampleTarget_nid_no_patch(const std::shared_ptr<void>& owner);
 void MaterializeMultisampleTargetClear(const Context& context, const ColorTarget& target);
+VkImageView MultisampleTargetStorageView(const Context& context, const GuestTextureResource& resource);
+bool MultisampleTargetStorable(const Context& context, const ColorTarget& target);
 void ResolveMultisampleTarget(const Context& context, const ColorTarget& source, StorageTexture& destination, VkImageView destinationView);
 bool MultisampledColorFillAbsorbs(std::uint64_t address, std::size_t bytes, std::uint32_t pattern);
 void NoteColorMetadataFill(std::uint64_t address, std::size_t bytes, std::uint32_t pattern);

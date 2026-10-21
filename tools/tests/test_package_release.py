@@ -1,7 +1,10 @@
-import os
+import contextlib
+import io
 import json
+import os
 import ctypes
 import stat
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -52,16 +55,19 @@ class ReleasePackageTests(unittest.TestCase):
         names = ("libgcc_s_seh-1.dll", "libstdc++-6.dll", "libwinpthread-1.dll")
         for name in names:
             (runtime / name).write_bytes(name.encode())
+        allocator = ("mimalloc.dll", "mimalloc-redirect.dll")
+        for name in allocator:
+            (self.library.parent / name).write_bytes(name.encode())
         compiler = runtime / "g++.exe"
         (self.build / "CMakeCache.txt").write_text("CMAKE_CXX_COMPILER:STRING=" + compiler.as_posix() + "\n", encoding="utf-8")
         (self.build / "core/relinker/relinker.exe").write_bytes(b"Windows executable")
         package_release.package("windows", self.build, self.output, "v1")
         with zipfile.ZipFile(self.output / "prx-windows-v1.zip") as archive:
-            self.assertEqual(set(archive.namelist()), {"libs/libc.prx", *("libs/" + name for name in names)})
-            for name in names:
+            self.assertEqual(set(archive.namelist()), {"libs/libc.prx", *("libs/" + name for name in names + allocator)})
+            for name in names + allocator:
                 self.assertEqual(archive.read("libs/" + name), name.encode())
         with tarfile.open(self.output / "prx-windows-v1.tar.gz") as archive:
-            for name in names:
+            for name in names + allocator:
                 self.assertEqual(archive.extractfile("libs/" + name).read(), name.encode())
         self.assertEqual((self.output / "relinker-v1.exe").read_bytes(), b"Windows executable")
 
@@ -90,6 +96,9 @@ class ReleasePackageTests(unittest.TestCase):
                     for runtime_name in ("libgcc_s_seh-1.dll", "libstdc++-6.dll", "libwinpthread-1.dll"):
                         (runtime / runtime_name).write_bytes(runtime_name.encode())
                         expected.add("libs/" + runtime_name)
+                    for allocator_name in ("mimalloc.dll", "mimalloc-redirect.dll"):
+                        (directory / allocator_name).write_bytes(allocator_name.encode())
+                        expected.add("libs/" + allocator_name)
                     cache += "CMAKE_CXX_COMPILER:FILEPATH=" + (runtime / "g++.exe").as_posix() + "\n"
                     (self.build / "core/relinker/relinker.exe").write_bytes(b"Windows executable")
                 (self.build / "CMakeCache.txt").write_text(cache, encoding="utf-8")
@@ -231,6 +240,33 @@ class ReleasePackageTests(unittest.TestCase):
                 self.assertEqual(archive.read("libs/libc.prx"), b"library bytes")
         finally:
             destination.chmod(stat.S_IREAD | stat.S_IWRITE)
+
+    @unittest.skipUnless(os.name == "nt", "Windows directory junction replacement semantics")
+    def test_dangling_directory_junction_preserves_all_existing_assets(self):
+        names = ["prx-linux-v1.zip", "prx-linux-v1.tar.gz", "relinker-v1"]
+        for index, blocked in enumerate(names):
+            with self.subTest(blocked=blocked):
+                output = self.output / str(index)
+                output.mkdir(parents=True)
+                previous = {name: b"old " + name.encode() for name in names if name != blocked}
+                previous["unrelated.txt"] = b"unrelated"
+                for name, content in previous.items():
+                    (output / name).write_bytes(content)
+                target = self.root / f"target-{index}"
+                target.mkdir()
+                destination = output / blocked
+                subprocess.run(["cmd", "/c", "mklink", "/J", str(destination), str(target)],
+                               check=True, capture_output=True)
+                self.addCleanup(destination.rmdir)
+                target.rmdir()
+                self.assertFalse(destination.exists())
+                self.assertTrue(destination.lstat().st_file_attributes & stat.FILE_ATTRIBUTE_DIRECTORY)
+                with self.assertRaises((OSError, RuntimeError)) as error:
+                    package_release.package("linux", self.build, output, "v1")
+                self.assertEqual({path.name: path.read_bytes() for path in output.iterdir() if path != destination}, previous)
+                self.assertTrue(destination.lstat().st_file_attributes & stat.FILE_ATTRIBUTE_DIRECTORY)
+                self.assertFalse(target.exists())
+                self.assertIn("not a file", str(error.exception))
 
     def file_link(self, link, target):
         try:
@@ -383,7 +419,65 @@ class ReleaseAssetsTests(unittest.TestCase):
                 self.assertEqual((output / name).read_bytes(), b"old " + name.encode())
 
 
+class ReleaseNoteDestinationsTests(unittest.TestCase):
+    def test_directory_body_preserves_existing_full_notes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, body, full = root / "notes.json", root / "body", root / "full.md"
+            source.write_text(json.dumps({"body": "new release notes"}), encoding="utf-8")
+            body.mkdir()
+            full.write_bytes(b"previous full notes")
+            with self.assertRaises(OSError):
+                prepare_release_notes.prepare_notes(source, body, full)
+            self.assertEqual(full.read_bytes(), b"previous full notes")
+            self.assertEqual(list(body.iterdir()), [])
+
+    @unittest.skipUnless(os.name == "nt", "Windows read-only output semantics")
+    def test_readonly_output_preserves_both_note_files(self):
+        for target in ("body.md", "full.md"):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                source, body, full = root / "notes.json", root / "body.md", root / "full.md"
+                source.write_text(json.dumps({"body": "new release notes"}), encoding="utf-8")
+                body.write_bytes(b"previous body")
+                full.write_bytes(b"previous full notes")
+                readonly = root / target
+                readonly.chmod(stat.S_IREAD)
+                try:
+                    with self.assertRaises(OSError):
+                        prepare_release_notes.prepare_notes(source, body, full)
+                    self.assertEqual(body.read_bytes(), b"previous body")
+                    self.assertEqual(full.read_bytes(), b"previous full notes")
+                finally:
+                    readonly.chmod(stat.S_IREAD | stat.S_IWRITE)
+
+
 class ReleaseNotesTests(unittest.TestCase):
+    def test_aliased_paths_preserve_input_and_existing_outputs(self):
+        for pair in ((0, 1), (0, 2), (1, 2)):
+            for alias in ("same", "symlink", "hardlink"):
+                with self.subTest(pair=pair, alias=alias), tempfile.TemporaryDirectory() as directory:
+                    paths = [Path(directory) / name for name in ("notes.json", "body.md", "full.md")]
+                    paths[0].write_text(json.dumps({"body": "release notes"}), encoding="utf-8")
+                    paths[1].write_bytes(b"previous body")
+                    paths[2].write_bytes(b"previous full")
+                    first, second = pair
+                    paths[second].unlink()
+                    if alias == "same":
+                        paths[second] = paths[first]
+                    elif alias == "symlink":
+                        try:
+                            paths[second].symlink_to(paths[first])
+                        except OSError as error:
+                            self.skipTest(str(error))
+                    else:
+                        os.link(paths[first], paths[second])
+                    previous = [path.read_bytes() for path in paths]
+                    with self.assertRaisesRegex(ValueError, "distinct files"):
+                        prepare_release_notes.prepare_notes(*paths)
+                    self.assertEqual([path.read_bytes() for path in paths], previous)
+
+
     def test_short_notes_are_unchanged_including_unicode_at_limit(self):
         for notes in ("", "## What's Changed\n* Fix\n", "я" * 125000):
             self.assertEqual(prepare_release_notes.release_body(notes), notes)
@@ -416,6 +510,71 @@ class ReleaseNotesTests(unittest.TestCase):
                 prepare_release_notes.prepare_notes(source, body, full)
                 self.assertEqual(full.read_bytes(), notes.encode("utf-8"))
                 self.assertEqual(body.read_bytes(), prepare_release_notes.release_body(notes).encode("utf-8"))
+
+
+class ReleaseNotesEdgeCaseTests(unittest.TestCase):
+    def test_non_string_body_raises_value_error(self):
+        source = json.dumps({"body": 123})
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            source_path = directory / "source.json"
+            source_path.write_text(source, encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "must be a string"):
+                prepare_release_notes.prepare_notes(source_path, directory / "body.md", directory / "full.md")
+
+    def test_main_with_valid_arguments(self):
+        notes = "# Release v1.0.0\n\n## What's Changed\n\n* Fix a by @user in #1\n"
+        source = json.dumps({"body": notes})
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            source_path = directory / "source.json"
+            body_path = directory / "body.md"
+            full_path = directory / "full.md"
+            source_path.write_text(source, encoding="utf-8")
+            arguments = [
+                "prepare_release_notes.py",
+                "--input", str(source_path),
+                "--body", str(body_path),
+                "--full", str(full_path),
+            ]
+            with contextlib.redirect_stdout(io.StringIO()):
+                with patch.object(sys, "argv", arguments):
+                    prepare_release_notes.main()
+            self.assertEqual(full_path.read_text(encoding="utf-8"), notes)
+            self.assertEqual(body_path.read_text(encoding="utf-8"), notes)
+
+    def test_main_with_missing_arguments_exits_with_error(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                with patch.object(sys, "argv", ["prepare_release_notes.py"]):
+                    prepare_release_notes.main()
+
+    def test_creates_parent_directories(self):
+        notes = "# Release v1.0.0\n"
+        source = json.dumps({"body": notes})
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            source_path = directory / "source.json"
+            source_path.write_text(source, encoding="utf-8")
+            body_path = directory / "nested" / "body.md"
+            full_path = directory / "nested" / "full.md"
+            prepare_release_notes.prepare_notes(source_path, body_path, full_path)
+            self.assertEqual(full_path.read_text(encoding="utf-8"), notes)
+
+    def test_body_over_limit_without_whats_changed_is_returned_unchanged(self):
+        notes = "# Release\n\n## Details\n\n" + "x" * (prepare_release_notes.BODY_LIMIT + 1)
+        result = prepare_release_notes.release_body(notes)
+        self.assertEqual(result, notes)
+
+    def test_body_over_limit_preserves_full_changelog_link(self):
+        notes = (
+            "## What's Changed\n"
+            "* Fix a by @user in #1\n\n"
+            "**Full Changelog**: https://github.com/example/compare/v0.9.0...v1.0.0\n"
+        )
+        result = prepare_release_notes.release_body(notes + "x" * (prepare_release_notes.BODY_LIMIT + 1))
+        self.assertNotIn("What's Changed", result)
+        self.assertIn("Full Changelog", result)
 
 
 if __name__ == "__main__":

@@ -9,11 +9,14 @@
 static constexpr int SCE_NGS2_OK = 0;
 static constexpr int SCE_NGS2_ERROR_INVALID_OUT_ADDRESS = static_cast<int>(0x804A8010);
 static constexpr int SCE_NGS2_ERROR_INVALID_OUT_SIZE = static_cast<int>(0x804A8011);
-static constexpr int SCE_NGS2_ERROR_INVALID_SYSTEM_HANDLE = static_cast<int>(0x804A0230);
-static constexpr int SCE_NGS2_ERROR_INVALID_RACK_HANDLE = static_cast<int>(0x804A0261);
+static constexpr int SCE_NGS2_ERROR_INVALID_SYSTEM_HANDLE = static_cast<int>(0x804A8201);
+static constexpr int SCE_NGS2_ERROR_INVALID_RACK_HANDLE = static_cast<int>(0x804A8202);
+static constexpr int SCE_NGS2_ERROR_INVALID_VOICE_INDEX = static_cast<int>(0x804A8305);
 static constexpr int SCE_NGS2_ERROR_INVALID_WAVEFORM_DATA = static_cast<int>(0x804A8430);
 static constexpr int SCE_NGS2_ERROR_INVALID_WAVEFORM_FORMAT = static_cast<int>(0x804A8431);
 static constexpr int SCE_NGS2_ERROR_UNKNOWN_WAVEFORM_FORMAT = static_cast<int>(0x804A8432);
+static constexpr int SCE_NGS2_ERROR_INVALID_VOICE_HANDLE = static_cast<int>(0x804A8203);
+static constexpr int SCE_NGS2_ERROR_NULL_PARAM_LIST = static_cast<int>(0x804A8360);
 
 static constexpr std::uint32_t SCE_NGS2_RACK_ID_SAMPLER = 0x1000;
 static constexpr std::uint32_t SCE_NGS2_RACK_ID_SUBMIXER = 0x2000;
@@ -746,5 +749,15 @@ struct Ngs2GeomAttribute {
     std::uint32_t reserved[4];
 };
 static_assert(sizeof(Ngs2GeomAttribute) == 308);
+
+struct Ngs2ReportDataHeader {
+    std::size_t size;
+    Ngs2Handle handle;
+    std::uint32_t type;
+    std::int32_t result;
+};
+static_assert(sizeof(Ngs2ReportDataHeader) == 24);
+
+using Ngs2ReportHandler = void (APS5_VABI *)(const Ngs2ReportDataHeader* data, std::uintptr_t user_data);
 
 #endif

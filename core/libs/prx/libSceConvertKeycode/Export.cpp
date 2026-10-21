@@ -8,6 +8,7 @@
 namespace {
 constexpr int kErrInvalidAddress = static_cast<int>(0x80BC0031u);
 constexpr int kErrInvalidUserId = static_cast<int>(0x80BC0010u);
+constexpr std::uint32_t kIgnoredStateBits = 0x4000000u;
 
 char16_t UsCharacter(std::uint16_t keycode) {
     static constexpr char16_t kPunctuation[] = u"-=[]\\\0;'`,./";
@@ -17,6 +18,7 @@ char16_t UsCharacter(std::uint16_t keycode) {
     if (keycode == 0x27) return u'0';
     if (keycode == 0x2C) return u' ';
     if (keycode >= 0x2D && keycode <= 0x38) return kPunctuation[keycode - 0x2D];
+    if (keycode == 0x64) return u'\\';
     if (keycode >= 0x54 && keycode <= 0x63) return kKeypad[keycode - 0x54];
     return 0;
 }
@@ -43,7 +45,7 @@ int APS5_VABI sceConvertKeycodeGetCharacterFromKeyboardData(void) {
 
 int APS5_VABI sceConvertKeycodeGetCharacter(std::uint16_t keycode, std::uint32_t state, std::uint32_t type, char16_t* character) {
     if (character == nullptr) return kErrInvalidAddress;
-    if (state != 0) throw std::runtime_error("sceConvertKeycodeGetCharacter: unsupported state " + std::to_string(state));
+    if ((state & ~kIgnoredStateBits) != 0) throw std::runtime_error("sceConvertKeycodeGetCharacter: unsupported state " + std::to_string(state));
     if (type != 0) throw std::runtime_error("sceConvertKeycodeGetCharacter: unsupported keyboard type " + std::to_string(type));
     *character = UsCharacter(keycode);
     return 0;

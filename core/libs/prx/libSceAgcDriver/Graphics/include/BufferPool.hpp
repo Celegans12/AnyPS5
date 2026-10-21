@@ -57,8 +57,6 @@ class BufferPool {
 public:
     explicit BufferPool(const Context& context);
     static VkDeviceSize DeviceBudget(const VkPhysicalDeviceMemoryProperties& memory, const VkPhysicalDeviceMemoryBudgetPropertiesEXT* reported = nullptr);
-    using CacheReclaim = VkDeviceSize (*)(VkDeviceSize bytes);
-    static void SetCacheReclaim(CacheReclaim reclaim);
     static VkDeviceSize ReclaimTarget(VkDeviceSize bytes);
     ~BufferPool();
     BufferPool(const BufferPool&) = delete;
@@ -87,6 +85,7 @@ private:
     };
     struct Slab {
         std::vector<SlabBlock*> available;
+        std::size_t blocks = 0;
         std::size_t emptyBlocks = 0;
     };
     static std::uint64_t SlabKey(std::uint32_t memoryType, std::size_t capacity, bool addressable);
@@ -133,20 +132,26 @@ private:
     void evictOldest(Tier& tier, std::vector<BufferAllocation>& evicted);
     // The retained-slot bound of each tier (APS5_BUFFER_POOL_SLOTS, default `defaultSlots`), read once.
     static std::size_t MaxSlots();
-    static std::atomic<CacheReclaim>& cacheReclaim();
     std::size_t maxSlots;
+    VkDeviceSize (*cacheReclaim)(VkDeviceSize bytes);
     VkDevice device;
     PFN_vkUnmapMemory unmap;
     PFN_vkDestroyBuffer destroyBuffer;
     PFN_vkFreeMemory freeMemory;
     PFN_vkAllocateMemory allocateMemory;
     PFN_vkMapMemory mapMemory;
+    VkPhysicalDevice physical;
+    VkPhysicalDeviceMemoryProperties memoryProperties;
+    PFN_vkGetPhysicalDeviceMemoryProperties2 memoryProperties2;
     std::mutex mutex;
     // Not `small`/`large`: <rpcndr.h> (via <windows.h>) defines `small` as a macro.
     Tier smallTier;
     Tier largeTier;
     Tier deviceTier;
+    Tier smallDeviceTier;
     std::uint64_t clock = 0;
+    std::uint64_t exactSizeHits = 0;
+    std::uint64_t resizedHits = 0;
     std::mutex slabMutex;
     std::unordered_map<std::uint64_t, Slab> slabs;
     std::unordered_map<VkDeviceMemory, std::unique_ptr<SlabBlock>> slabBlocks;
@@ -161,6 +166,7 @@ private:
     static constexpr std::size_t classLimit = std::size_t{1} << 20u;
     static constexpr unsigned deviceClassBits = 3;
     static constexpr std::size_t defaultSlots = 4096;
+    static constexpr std::size_t exactSizeScan = 64;
 };
 
 std::shared_ptr<BufferPool> GetBufferPool(const Context& context);
@@ -182,7 +188,7 @@ std::optional<std::uint32_t> SystemMemoryType(const VkPhysicalDeviceMemoryProper
 // NVIDIA that type still counts as VRAM but may pass the heap's size (the driver moves its pages
 // to system memory), where a device-local allocation fails.
 std::optional<std::uint32_t> OverflowMemoryType(const VkPhysicalDeviceMemoryProperties& memory, std::uint32_t memoryTypeBits);
-VkDeviceMemory AllocateAttachmentMemory(const Context& context, const VkMemoryAllocateInfo& allocation, std::uint32_t mask, const char* operation);
+VkDeviceMemory AllocateImageMemory(const Context& context, const VkMemoryAllocateInfo& allocation, std::uint32_t mask, const char* operation);
 
 }
 

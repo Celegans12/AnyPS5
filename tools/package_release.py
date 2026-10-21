@@ -49,6 +49,7 @@ def package(platform, build, output, version):
     if platform == "windows":
         runtime = windows_runtime(build)
         files.extend(runtime / name for name in ("libgcc_s_seh-1.dll", "libstdc++-6.dll", "libwinpthread-1.dll"))
+        files.extend(build / "core/libs/libs" / name for name in ("mimalloc.dll", "mimalloc-redirect.dll"))
     files.extend(tracy_runtime(platform, build))
     binary = build / "core/relinker" / executable
     for file in [*files, binary]:
@@ -60,8 +61,12 @@ def package(platform, build, output, version):
         destination = output / name
         if destination.exists() and not destination.is_file():
             raise RuntimeError(f"Release destination is not a file: {destination}")
-        if os.name == "nt" and os.path.lexists(destination) and destination.lstat().st_file_attributes & stat.FILE_ATTRIBUTE_READONLY:
-            raise RuntimeError(f"Release destination is read-only: {destination}")
+        if os.name == "nt" and os.path.lexists(destination):
+            attributes = destination.lstat().st_file_attributes
+            if attributes & stat.FILE_ATTRIBUTE_DIRECTORY:
+                raise RuntimeError(f"Release destination is not a file: {destination}")
+            if attributes & stat.FILE_ATTRIBUTE_READONLY:
+                raise RuntimeError(f"Release destination is read-only: {destination}")
     output.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".release-", dir=output) as temporary:
         staging = Path(temporary)

@@ -67,7 +67,7 @@ bool MapRegions(const std::vector<ShaderRecompiler::MemoryRegion>& regions, Mapp
         else runs.emplace_back(page, page + Page);
     }
     for (const auto& [begin, end] : runs) {
-        void* block = VirtualAlloc(reinterpret_cast<void*>(begin), static_cast<SIZE_T>(end - begin), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        void* block = VirtualAlloc(reinterpret_cast<void*>(begin), static_cast<SIZE_T>(end - begin), MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE);
         if (block == nullptr) {
             using VirtualAlloc2Function = PVOID(WINAPI*)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, void*, ULONG);
             static const auto virtualAlloc2 = reinterpret_cast<VirtualAlloc2Function>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"kernelbase.dll"), "VirtualAlloc2")));
@@ -76,7 +76,7 @@ bool MapRegions(const std::vector<ShaderRecompiler::MemoryRegion>& regions, Mapp
                 constexpr ULONG PreservePlaceholder = 0x00000002;
                 constexpr ULONG ReplacePlaceholder = 0x00004000;
                 VirtualFree(reinterpret_cast<void*>(begin), static_cast<SIZE_T>(end - begin), MEM_RELEASE | PreservePlaceholder);
-                block = virtualAlloc2(GetCurrentProcess(), reinterpret_cast<void*>(begin), static_cast<SIZE_T>(end - begin), MEM_RESERVE | MEM_COMMIT | ReplacePlaceholder, PAGE_READWRITE, nullptr, 0);
+                block = virtualAlloc2(GetCurrentProcess(), reinterpret_cast<void*>(begin), static_cast<SIZE_T>(end - begin), MEM_RESERVE | MEM_COMMIT | ReplacePlaceholder | MEM_WRITE_WATCH, PAGE_READWRITE, nullptr, 0);
                 if (block == reinterpret_cast<void*>(begin)) {
                     mapping.blocks.push_back(block);
                     continue;
@@ -158,8 +158,10 @@ bool Bench(const char* path, int iterations, bool bindless) {
             if (iteration == 0) {
                 first = fingerprint;
                 tables = captured->snapshot.tables.tables.size();
-                for (const auto& table : captured->snapshot.tables.tables) keys += table.keys;
-                words = captured->snapshot.tables.words.size();
+                for (const auto& table : captured->snapshot.tables.tables) {
+                    keys += table.keys;
+                    words += table.words.size();
+                }
                 registrations = result->bindlessTables.size();
                 heap = result->bindlessHeap;
                 for (const auto& binding : result->bindings) {

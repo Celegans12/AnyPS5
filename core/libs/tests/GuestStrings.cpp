@@ -1,4 +1,5 @@
 #include "prx/libc/include/general/VabiMacros.hpp"
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -7,6 +8,7 @@
 #include <string>
 
 extern "C" {
+void APS5_VABI bcopy_nid_postfix(const void*, void*, std::size_t);
 char* APS5_VABI basename_nid_postfix(const char*);
 char* APS5_VABI __inet_ntoa_nid_postfix(unsigned int);
 char* APS5_VABI dirname_nid_postfix(const char*);
@@ -25,6 +27,7 @@ char* APS5_VABI strtok_nid_postfix(char*, const char*);
 char* APS5_VABI strsep_nid_postfix(char**, const char*);
 char* APS5_VABI strcasestr_nid_postfix(const char*, const char*);
 int APS5_VABI strcpy_s_nid_postfix(char*, std::size_t, const char*);
+int APS5_VABI strncpy_s_nid_postfix(char*, std::size_t, const char*, std::size_t);
 int APS5_VABI strcat_s_nid_postfix(char*, std::size_t, const char*);
 int APS5_VABI strncat_s_nid_postfix(char*, std::size_t, const char*, std::size_t);
 int APS5_VABI memcpy_s_nid_postfix(void*, std::size_t, const void*, std::size_t);
@@ -135,6 +138,33 @@ static void CheckBoundsCheckedFunctions() {
     Require(snprintf_s_nid_postfix(formatted, sizeof(formatted), "%d-%s", 42, "x") == 4 && std::strcmp(formatted, "42-x") == 0);
 }
 
+static void CheckSecureStringSizeLimits() {
+    constexpr std::size_t RsizeMax = SIZE_MAX >> 1;
+    const std::array<char, 8> original = {'!', 'a', 'b', '\0', 'x', 'y', 'z', '!'};
+    for (const auto size : {RsizeMax + 1, SIZE_MAX}) {
+        for (const char* source : {"cd", "", static_cast<const char*>(nullptr)}) {
+            for (const auto copy : {strcpy_s_nid_postfix, strcat_s_nid_postfix}) {
+                auto bytes = original;
+                Require(copy(bytes.data() + 1, size, source) != 0);
+                Require(bytes == original);
+            }
+            for (const auto copy : {strncpy_s_nid_postfix, strncat_s_nid_postfix}) {
+                for (const auto count : {std::size_t{0}, std::size_t{1}, std::size_t{3}}) {
+                    auto bytes = original;
+                    Require(copy(bytes.data() + 1, size, source, count) != 0);
+                    Require(bytes == original);
+                }
+            }
+        }
+    }
+    auto bytes = original;
+    Require(strcpy_s_nid_postfix(bytes.data() + 1, RsizeMax, "cd") == 0);
+    Require(bytes[0] == '!' && std::strcmp(bytes.data() + 1, "cd") == 0 && bytes[4] == 'x');
+    bytes = original;
+    Require(strcat_s_nid_postfix(bytes.data() + 1, RsizeMax, "cd") == 0);
+    Require(bytes[0] == '!' && std::strcmp(bytes.data() + 1, "abcd") == 0 && bytes[6] == 'z');
+}
+
 static void CheckCaseInsensitiveComparison() {
     Require(strcasecmp_nid_postfix("", "") == 0 && strcasecmp_nid_postfix("AbC", "aBc") == 0);
     Require(strcasecmp_nid_postfix("A", "b") == 'a' - 'b' && strcasecmp_nid_postfix("b", "A") == 'b' - 'a');
@@ -212,7 +242,28 @@ static bool CheckDirnameLengths() {
     return passed;
 }
 
+static void CheckBcopy() {
+    constexpr std::array<unsigned char, 12> original = {0, 17, 34, 51, 68, 85, 102, 119, 136, 153, 170, 187};
+    for (std::size_t source = 0; source < original.size(); ++source) {
+        for (std::size_t destination = 0; destination < original.size(); ++destination) {
+            for (std::size_t count = 0; count <= original.size() - std::max(source, destination); ++count) {
+                auto actual = original;
+                auto expected = original;
+                for (std::size_t i = 0; i < count; ++i) expected[destination + i] = original[source + i];
+                bcopy_nid_postfix(actual.data() + source, actual.data() + destination, count);
+                Require(actual == expected);
+            }
+        }
+    }
+    auto destination = original;
+    destination.fill(0xff);
+    bcopy_nid_postfix(original.data(), destination.data(), original.size());
+    Require(destination == original);
+    bcopy_nid_postfix(nullptr, nullptr, 0);
+}
+
 int main() {
+    CheckBcopy();
     if (!CheckDirnameLengths()) return 1;
     CheckBoundsCheckedFunctions();
     CheckCaseInsensitiveComparison();
@@ -400,5 +451,6 @@ int main() {
     const char highBytes[] = {static_cast<char>(0xff), 'A', 0};
     Require(strcasestr_nid_postfix(highBytes, "a") == highBytes + 1);
     CheckSecureCopySizeLimits();
+    CheckSecureStringSizeLimits();
     return CheckMemcpyOverlap() ? 0 : 1;
 }

@@ -31,7 +31,7 @@ inline std::string DeviceFaultText(const char (&text)[VK_MAX_DESCRIPTION_SIZE]) 
     return std::string(text, strnlen(text, VK_MAX_DESCRIPTION_SIZE));
 }
 
-inline std::vector<std::string> DeviceFaultReport(VkDevice device, PFN_vkGetDeviceFaultInfoEXT faultInfo, VkQueue queue, PFN_vkGetQueueCheckpointDataNV checkpointData) {
+inline std::vector<std::string> DeviceFaultReport(VkDevice device, PFN_vkGetDeviceFaultInfoEXT faultInfo, VkQueue queue, PFN_vkGetQueueCheckpointDataNV checkpointData, std::vector<std::string> (*describe)(std::uint64_t, std::uint64_t) = nullptr) {
     std::vector<std::string> lines;
     char line[VK_MAX_DESCRIPTION_SIZE + 128];
     if (checkpointData != nullptr && queue != VK_NULL_HANDLE) {
@@ -42,7 +42,10 @@ inline std::vector<std::string> DeviceFaultReport(VkDevice device, PFN_vkGetDevi
         points.resize(count);
         if (points.empty()) lines.emplace_back("[device-fault] no checkpoint reached");
         for (const auto& point : points) {
-            std::snprintf(line, sizeof(line), "[device-fault] checkpoint: program 0x%llx at stage 0x%x", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(point.pCheckpointMarker)), static_cast<unsigned>(point.stage));
+            const auto marker = static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(point.pCheckpointMarker));
+            const auto kind = marker >> 56u;
+            const char* name = kind == 0x1 ? "draw program" : kind == 0xf1 ? "copy-in of guest" : kind == 0xf2 ? "copy-back of guest" : kind == 0xf3 ? "diff copy-back of guest" : kind == 0xf4 ? "bindless publish" : kind == 0xf5 ? "DMA copy to guest" : kind == 0xf6 ? "GPU copies" : "program";
+            std::snprintf(line, sizeof(line), "[device-fault] checkpoint: %s 0x%llx at stage 0x%x", name, kind == 0x1 || kind >= 0xf1 ? marker & ((1ull << 56u) - 1u) : marker, static_cast<unsigned>(point.stage));
             lines.emplace_back(line);
         }
     }
@@ -66,6 +69,9 @@ inline std::vector<std::string> DeviceFaultReport(VkDevice device, PFN_vkGetDevi
     for (const auto& address : addresses) {
         std::snprintf(line, sizeof(line), "[device-fault] %s at 0x%llx (precision 0x%llx)", DeviceFaultAddressKind(address.addressType), static_cast<unsigned long long>(address.reportedAddress), static_cast<unsigned long long>(address.addressPrecision));
         lines.emplace_back(line);
+        if (describe != nullptr) {
+            for (auto& described : describe(address.reportedAddress, address.addressPrecision)) lines.push_back("[device-fault]   " + described);
+        }
     }
     for (const auto& vendor : vendors) {
         std::snprintf(line, sizeof(line), "[device-fault] vendor: %s (code 0x%llx, data 0x%llx)", DeviceFaultText(vendor.description).c_str(), static_cast<unsigned long long>(vendor.vendorFaultCode), static_cast<unsigned long long>(vendor.vendorFaultData));

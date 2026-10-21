@@ -46,7 +46,7 @@ def key(kind, text):
 def relink(text, source, destination):
     def replace(match):
         target = match.group(1)
-        if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:|//", target):
+        if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:|/", target):
             return match.group(0)
         path, _, anchor = target.partition("#")
         resolved = posixpath.normpath(posixpath.join(posixpath.dirname(source), path)) if path else source
@@ -197,7 +197,7 @@ def apply_change(root, base, new, index_text):
         for offset, fresh in enumerate(added):
             if offset in kept_new:
                 continue
-            anchor = after[j1 + offset - 1] if j1 + offset > 0 else None
+            anchor = next((entry for entry in reversed(after[:j1 + offset]) if entry[1] == fresh[1] and entry[3] == fresh[3]), None)
             insert(fresh, anchor)
     for name, sections in files.items():
         write_debt(root, name, sections, order)

@@ -118,7 +118,7 @@ ShaderRecompiler::ShaderPixelStageInfo DecodePixelStageInfo(const Registers& con
     constexpr std::uint32_t knownMask = PixelInputBit(PixelInput::PerspectiveSample) | PixelInputBit(PixelInput::PerspectiveCenter) | PixelInputBit(PixelInput::PerspectiveCentroid) |
         PixelInputBit(PixelInput::LinearSample) | PixelInputBit(PixelInput::LinearCenter) | PixelInputBit(PixelInput::LinearCentroid) |
         PixelInputBit(PixelInput::PositionX) | PixelInputBit(PixelInput::PositionY) | PixelInputBit(PixelInput::PositionZ) | PixelInputBit(PixelInput::PositionW) |
-        PixelInputBit(PixelInput::FrontFace) | PixelInputBit(PixelInput::Ancillary) | PixelInputBit(PixelInput::LineStipple) | PixelInputBit(PixelInput::PositionFixedPoint);
+        PixelInputBit(PixelInput::FrontFace) | PixelInputBit(PixelInput::Ancillary) | PixelInputBit(PixelInput::SampleCoverage) | PixelInputBit(PixelInput::LineStipple) | PixelInputBit(PixelInput::PositionFixedPoint);
     if ((activeInputs & ~knownMask) != 0) {
         char message[128];
         std::snprintf(message, sizeof(message), "AGC graphics: unsupported SPI_PS_INPUT_ENA/ADDR bit combination (ena 0x%x addr 0x%x)", ena, addr);
@@ -143,8 +143,19 @@ ShaderRecompiler::ShaderPixelStageInfo DecodePixelStageInfo(const Registers& con
     const bool pixelKillEnable = ((shaderControl >> 6u) & 0x1u) != 0;
     const bool depthExportEnable = (shaderControl & 0x1u) != 0;
     const bool sampleMaskExportEnable = ((shaderControl >> 8u) & 0x1u) != 0;
-    const bool stencilRefExportEnable = ((shaderControl >> 1u) & 0x1u) != 0;
+    const bool stencilOperationValue = !nullProgram && StencilOperationValueReplaces(context);
+    const bool stencilRefExportEnable = ((shaderControl >> 1u) & 0x1u) != 0 || stencilOperationValue;
+    if (stencilOperationValue && PixelEarlyZ(shaderControl)) throw std::runtime_error("AGC graphics: early tests with a pixel shader that exports the stencil operation value are unsupported");
     const auto loaded = [&](PixelInput input) { return (activeInputs & PixelInputBit(input)) != 0; };
+    std::uint32_t positionControl = 0;
+    if (loaded(PixelInput::PositionX) || loaded(PixelInput::PositionY)) {
+        NoteRegisterRead(RegisterBank::Context, spiBarycCntl);
+        if (const auto it = context.find(spiBarycCntl); it != context.end()) positionControl = it->second;
+    }
+    const auto floatLocation = (positionControl >> 16u) & 0x3u;
+    if (floatLocation == 3u) {
+        throw std::runtime_error("AGC graphics: SPI_BARYC_CNTL.POS_FLOAT_LOCATION uses the reserved value 3");
+    }
     return ShaderRecompiler::ShaderPixelStageInfo{
         .interpolatorCount = inputNum,
         .interpolatorSettings = interpolatorSettings,
@@ -171,7 +182,9 @@ ShaderRecompiler::ShaderPixelStageInfo DecodePixelStageInfo(const Registers& con
         .orderedPixelShader = ((shaderControl >> 16u) & 0x1u) != 0,
         .targetOutputMode = targetOutputMode,
         .targetExportMapping = nullProgram ? std::array<std::uint8_t, 8>{} : exportMappings,
-        .stencilRefExportEnable = stencilRefExportEnable
+        .stencilRefExportEnable = stencilRefExportEnable,
+        .stencilOperationValueExport = stencilOperationValue,
+        .positionLocation = (positionControl & 0x100000u) != 0u ? ShaderRecompiler::PixelPositionLocation::UpperLeft : static_cast<ShaderRecompiler::PixelPositionLocation>(floatLocation)
     };
 }
 
@@ -223,6 +236,14 @@ ShaderRecompiler::ShaderVertexStageInfo DecodeVertexStageInfo(std::span<const st
     info.fetchEmbedded = true;
     info.fetchAttribReg = static_cast<std::uint32_t>(vertexAttribReg);
     info.fetchBufferReg = static_cast<std::uint32_t>(vertexBufferReg);
+    const auto record = [&](std::uint64_t address, std::span<const std::byte> bytes) {
+        if (reads == nullptr) return;
+        auto& read = reads->emplace_back();
+        read.address = address;
+        std::copy(bytes.begin(), bytes.end(), read.data.begin());
+        read.size = static_cast<std::uint32_t>(bytes.size());
+    };
+    if (reads != nullptr) reads->reserve(reads->size() + 2u * shader.num_input_semantics);
     for (std::uint32_t i = 0; i < shader.num_input_semantics; ++i) {
         const auto& semantic = semantics[i];
         if (semantic.static_vb_index == 1 || semantic.static_attribute == 1) throw std::runtime_error("AGC graphics: statically bound vertex attributes are not implemented");
@@ -236,7 +257,7 @@ ShaderRecompiler::ShaderVertexStageInfo DecodeVertexStageInfo(std::span<const st
         std::array<std::byte, 4> attribWordBytes{};
         const auto attribWordAddress = attribTableAddr + static_cast<std::uint64_t>(semantic.semantic) * 4u;
         AgcDriver::GuestMemory::Read(attribWordAddress, attribWordBytes, 4);
-        if (reads != nullptr) reads->push_back({attribWordAddress, {attribWordBytes.begin(), attribWordBytes.end()}});
+        record(attribWordAddress, attribWordBytes);
         std::uint32_t attribWord;
         std::memcpy(&attribWord, attribWordBytes.data(), 4);
         const auto index = attribWord & 0x1fu;
@@ -247,7 +268,7 @@ ShaderRecompiler::ShaderVertexStageInfo DecodeVertexStageInfo(std::span<const st
         std::array<std::byte, 16> sharpBytes{};
         const auto sharpAddress = bufferTableAddr + static_cast<std::uint64_t>(index) * 16u;
         AgcDriver::GuestMemory::Read(sharpAddress, sharpBytes, 4);
-        if (reads != nullptr) reads->push_back({sharpAddress, {sharpBytes.begin(), sharpBytes.end()}});
+        record(sharpAddress, sharpBytes);
         std::array<std::uint32_t, 4> sharp{};
         std::memcpy(sharp.data(), sharpBytes.data(), 16);
         if (info.resourcesNum >= ShaderRecompiler::ShaderVertexStageInfo::MaxResources) throw std::runtime_error("AGC graphics: vertex resource count exceeds the supported domain");

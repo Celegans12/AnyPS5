@@ -3,6 +3,7 @@
 
 #include "SpirvBackend/SpirvEmitterState.hpp"
 #include "Optimization/BindingAllocator.hpp"
+#include <array>
 #include <string>
 
 namespace ShaderRecompiler {
@@ -12,6 +13,7 @@ IrShaderStage StageOf(const SpirvEmitterState& state);
 const ShaderVertexInputInfo& VertexInfo(const SpirvEmitterState& state);
 const ShaderPixelInputInfo& PixelInfo(const SpirvEmitterState& state);
 const ShaderWorkgroupInputInfo* ShaderWorkgroupInput(const SpirvEmitterState& state);
+std::array<std::uint32_t, 3> WorkgroupLocalSize(const SpirvEmitterState& state, const ShaderWorkgroupInputInfo& workgroup);
 const RdnaImageDimensionInfo& RdnaImageDimensionInfoFor(RdnaImageDimension dimension);
 std::uint32_t TypeVoid(SpirvEmitterState& state);
 std::uint32_t TypeBool(SpirvEmitterState& state);
@@ -114,11 +116,16 @@ bool LdsInDeviceMemory(const SpirvEmitterState& state);
 std::uint32_t LdsMemorySemantics(const SpirvEmitterState& state);
 void EmitLdsBufferBase(SpirvEmitterState& state);
 std::uint32_t EmitLdsLockPointer(SpirvEmitterState& state);
+std::uint32_t EmitLdsBufferU64Pointer(SpirvEmitterState& state, std::uint32_t index);
 MemoryResourceAccess PrepareMemoryResourceAccess(SpirvEmitterState& state, const MemoryInfo& mem);
 std::uint32_t EmitMemoryElementIndex(SpirvEmitterState& state, const MemoryResourceAccess& access, std::uint32_t rawIndex);
 std::uint32_t EmitMemoryElementInBounds(SpirvEmitterState& state, const MemoryResourceAccess& access, std::uint32_t index);
 bool InFunctionStorage(const SpirvEmitterState& state, ResourceKind kind);
 std::uint32_t EmitMemoryElementPointer(SpirvEmitterState& state, const MemoryResourceAccess& access, std::uint32_t index);
+std::uint32_t EmitValueOrZero(SpirvEmitterState& state, std::uint32_t condition, std::uint32_t value);
+std::uint32_t LdsStorageDwords(const SpirvEmitterState& state);
+bool LoadsSelectable(const SpirvEmitterState& state, const MemoryResourceAccess& access);
+std::uint32_t GuardedElementIndex(SpirvEmitterState& state, const MemoryResourceAccess& access, std::uint32_t condition, std::uint32_t index);
 std::uint32_t EmitStorageBufferElementPointer(SpirvEmitterState& state, const MemoryResourceAccess& access, std::uint32_t index, std::uint32_t pointerType);
 std::uint32_t EmitTBufferBitcastU32ToI32(SpirvEmitterState& state, std::uint32_t value);
 bool IsSignedFormatComponent(SpirvFormatComponentType type);
@@ -271,7 +278,7 @@ std::uint32_t AtomicUpdateTyped(SpirvEmitterState& state, std::uint32_t pointer,
     EmitLabel(state, cont);
     state.module.AddFunction(spv::OpBranch, header);
     EmitLabel(state, merge);
-    state.module.AddFunction(spv::OpMemoryBarrier, ConstantU32(state, scope), ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask | memory));
+    if (kind != ResourceKind::Lds || !state.insideLdsLock) state.module.AddFunction(spv::OpMemoryBarrier, ConstantU32(state, scope), ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask | memory));
     return observed;
 }
 

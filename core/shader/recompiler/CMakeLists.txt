@@ -169,15 +169,21 @@ function(add_shader_recompiler target runtimeTarget)
 
     target_compile_features(${target} PUBLIC cxx_std_20)
 
+    if(ANYPS5_ENABLE_SPIRV_TOOLS)
+        target_sources(${target} PRIVATE ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/SpirvBackend/src/SpirvOptimizer.cpp)
+    endif()
+
     set(shaderCacheGeneratedDir "${CMAKE_CURRENT_BINARY_DIR}/${target}_generated")
     set(shaderCacheVersionSource "${shaderCacheGeneratedDir}/ShaderCacheVersion.cpp")
     file(GLOB_RECURSE shaderCacheRecompilerSources CONFIGURE_DEPENDS
-            "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/*.cpp"
             "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/*.hpp"
             "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/*.h"
             "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/*.cmake"
             "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/CMakeLists.txt"
     )
+    get_target_property(shaderCacheCompiledSources ${target} SOURCES)
+    list(APPEND shaderCacheRecompilerSources ${shaderCacheCompiledSources})
+    list(REMOVE_DUPLICATES shaderCacheRecompilerSources)
     set(shaderCacheKeySources "${PROJECT_SOURCE_DIR}/core/libs/prx/libc/include/HostThreadLocal.hpp")
     foreach(source IN LISTS shaderCacheKeySources)
         if(NOT EXISTS "${source}")
@@ -226,18 +232,26 @@ function(add_shader_recompiler target runtimeTarget)
             UnnormalizedWrapAxes
             DirectImageLoopGuardEnabled
             BdaAbi::BuildRangeIndex
+            BdaAbi::RangesOrdered
             BuildBarycentricGeometryShader
             BdaAbi::DirectImageFaultReason
             BdaAbi::DirectImageFaultResource
+            BuildBarycentricTessellationShaders
             BuildPreparedShaderKey
             BuildRectListShaders
             CaptureResources
             DebugProbeActive
             DepthBitsTextureWidth
             HashBytes
+            LayoutBarycentricEmulation
+            MeshBarycentricLayoutOf
             ImageTableAbi::PoisonCode
             ImageTableAbi::PoisonReasonName
             ImageTableAbi::TableHeader
+            IsFmaskTextureFormat
+            PipelineSpecialization::IsWorkgroupOffset
+            PipelineSpecialization::WorkgroupOffsetBase
+            PipelineSpecialization::WorkgroupOffsetWords
             PixelInput
             PointFilteredSamplerWord
             PixelInputBit
@@ -267,8 +281,14 @@ function(add_shader_recompiler target runtimeTarget)
             SampledTextureNumericClass
             SetDebugProbeActive
             ShaderCacheDirectory
-            ShaderDiskCache::SourceVersion
+            ShaderDiskCache::Shutdown
             ShaderStage
+            HashSpirvWords
+            ShaderDiskCache::DecodeResult
+            ShaderDiskCache::Enabled
+            ShaderDiskCache::EncodeResult
+            ShaderDiskCache::EntryDirectory
+            ShaderDiskCache::SourceVersion
             SrgbDecodeBit
             SrgbUnormFormat
             FindUserDataTail
@@ -282,6 +302,7 @@ function(add_shader_recompiler target runtimeTarget)
             LinkUserDataCalls
             FindTableCalls
             LinkCalls
+            LoadStamp
             WriteFileAtomically
     )
     set(shaderCacheManifest)
@@ -331,8 +352,20 @@ function(add_shader_recompiler target runtimeTarget)
     )
 
     if(ANYPS5_ENABLE_SPIRV_TOOLS)
-        target_sources(${target} PRIVATE ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/SpirvBackend/src/SpirvOptimizer.cpp)
         target_link_libraries(${target} PRIVATE SPIRV-Tools-opt SPIRV-Tools-static)
     endif()
     target_compile_definitions(${target} PUBLIC ANYPS5_ENABLE_SPIRV_TOOLS=$<BOOL:${ANYPS5_ENABLE_SPIRV_TOOLS}>)
+    if(BUILD_TESTING AND ANYPS5_ENABLE_SPIRV_TOOLS AND NOT ANYPS5_USE_SYSTEM_DEPS AND NOT TARGET spirv_validator_exit_tests)
+        add_test_executable(spirv_validator_exit_tests "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/SpirvValidatorExit.cpp")
+        target_link_libraries(spirv_validator_exit_tests PRIVATE SPIRV-Tools-static)
+        set_target_properties(spirv_validator_exit_tests PROPERTIES CXX_EXTENSIONS OFF)
+        configure_windows_unwind(spirv_validator_exit_tests)
+        add_test(NAME spirv_validator_exit COMMAND spirv_validator_exit_tests)
+        set_tests_properties(spirv_validator_exit PROPERTIES TIMEOUT 30)
+        if(MINGW)
+            target_link_libraries(spirv_validator_exit_tests PRIVATE libc)
+            set_tests_properties(spirv_validator_exit PROPERTIES ENVIRONMENT_MODIFICATION
+                    "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endif()
 endfunction()

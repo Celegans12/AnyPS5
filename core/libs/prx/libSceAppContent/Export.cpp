@@ -2,6 +2,7 @@
 #include <cstddef>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/RemoveTree.hpp"
 #include "prx/libkernel/AppMetadata/include/AppMetadata.hpp"
 #include <algorithm>
 #include <cstring>
@@ -49,7 +50,7 @@ bool IsTemporaryMountPoint(const AppContentMountPoint* mountPoint) {
 }
 
 static void ClearDirectory(const std::filesystem::path& directory) {
-    for (const auto& entry : std::filesystem::directory_iterator(directory)) std::filesystem::remove_all(entry.path());
+    for (const auto& entry : std::filesystem::directory_iterator(directory)) RemoveTree(entry.path());
     RecordWrittenPath_nid_no_patch(directory);
 }
 
@@ -184,8 +185,9 @@ int APS5_VABI sceAppContentAddcontDelete(uint32_t service_label, const NpUnified
     return SCE_APP_CONTENT_ERROR_NOT_FOUND;
 }
 
-int APS5_VABI sceAppContentGetAddcontDownloadProgress(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+int APS5_VABI sceAppContentGetAddcontDownloadProgress(uint32_t service_label, const NpUnifiedEntitlementLabel* entitlement_label, void* progress) {
+    (void)service_label;
+    if (!entitlement_label || !progress) return SCE_APP_CONTENT_ERROR_PARAMETER;
+    return SCE_APP_CONTENT_ERROR_NOT_FOUND;
 }
 }

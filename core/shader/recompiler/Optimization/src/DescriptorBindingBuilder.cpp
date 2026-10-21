@@ -95,10 +95,7 @@ DescriptorRole RoleFor(DescriptorBindingKind kind) {
 DescriptorImageShape ImageShapeForResource(const ImageResource& image) {
     const RdnaImageDimensionInfo& info = RdnaImageDimensionInfoFor(image.dimension);
     if (info.multisampled != 0u) {
-        if (info.arrayed != 0u) {
-            fail("DescriptorBindingBuilder::Populate multisampled array image resources have no descriptor image shape");
-        }
-        return DescriptorImageShape::Image2DMultisample;
+        return info.arrayed != 0u ? DescriptorImageShape::Image2DMultisampleArray : DescriptorImageShape::Image2DMultisample;
     }
     if (info.spirvDimension == spv::Dim1D) {
         return info.arrayed != 0u ? DescriptorImageShape::Image1DArray : DescriptorImageShape::Image1D;
@@ -180,10 +177,11 @@ struct UnnormalizedProof {
     std::vector<bool> samplers;
     std::vector<bool> images;
     std::vector<bool> imagesAtBaseLevel;
+    std::vector<bool> samplersIgnoreCoordinates;
 };
 
 UnnormalizedProof ProveUnnormalized(const ShaderInfo& info, const ResourceSnapshot& snapshot) {
-    UnnormalizedProof proof{std::vector<bool>(info.samplers.size()), std::vector<bool>(info.images.size()), std::vector<bool>(info.images.size())};
+    UnnormalizedProof proof{std::vector<bool>(info.samplers.size()), std::vector<bool>(info.images.size()), std::vector<bool>(info.images.size()), std::vector<bool>(info.samplers.size())};
     for (std::uint32_t r = 0; r < info.samplers.size(); r++) {
         if (snapshot.samplers.at(r).dwordCount != 4u) fail("sampler descriptor must contain four dwords");
         const auto& sampler = info.samplers[r];
@@ -210,6 +208,8 @@ UnnormalizedProof ProveUnnormalized(const ShaderInfo& info, const ResourceSnapsh
         if (sampler.depthCompare) {
             failUnnormalized("is used with depth comparison");
         }
+        bool sampled = false;
+        const char* nullMismatch = nullptr;
         for (const auto& pair : info.sampledPairs) {
             if (pair.sampler != r) {
                 continue;
@@ -219,12 +219,23 @@ UnnormalizedProof ProveUnnormalized(const ShaderInfo& info, const ResourceSnapsh
                 failUnnormalized("samples an image selected at run time");
             }
             const auto& image = info.runtimeImageModes.at(pair.image).at(ResourceMaterializer::RuntimeImageMode(base, snapshot.images.at(pair.image), info.runtimeImageModes.at(pair.image)));
-            if (const auto* reason = ResourceMaterializer::UnnormalizedSampleMismatch(image)) {
+            const auto* reason = ResourceMaterializer::UnnormalizedSampleMismatch(image);
+            if (reason != nullptr && ResourceMaterializer::NullImageDescriptor(base, snapshot.images.at(pair.image))) {
+                if (nullMismatch == nullptr) nullMismatch = reason;
+                continue;
+            }
+            if (reason != nullptr) {
                 failUnnormalized(reason);
             }
             if (image.constantSwizzle) continue;
+            sampled = true;
             proof.images[pair.image] = true;
         }
+        if (!sampled && nullMismatch != nullptr) {
+            proof.samplersIgnoreCoordinates[r] = true;
+            continue;
+        }
+        if (nullMismatch != nullptr) failUnnormalized(nullMismatch);
         proof.samplers[r] = true;
     }
     for (std::uint32_t resource = 0; resource < info.images.size(); resource++) {
@@ -233,7 +244,7 @@ UnnormalizedProof ProveUnnormalized(const ShaderInfo& info, const ResourceSnapsh
             if (!exact) break;
             if (pair.image != resource) continue;
             const auto& words = snapshot.samplers.at(pair.sampler).dwords;
-            exact = proof.samplers[pair.sampler] && info.samplers.at(pair.sampler).uses == SamplerUseExplicitLod && (words[1] & 0xfffu) == 0u && (words[2] & 0x3fffu) == 0u;
+            exact = proof.samplers[pair.sampler] && (((words[2] >> 26u) & 3u) == 0u || (info.samplers.at(pair.sampler).uses == SamplerUseExplicitLod && (words[1] & 0xfffu) == 0u && (words[2] & 0x3fffu) == 0u));
         }
         proof.imagesAtBaseLevel[resource] = exact;
     }
@@ -319,7 +330,8 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
     }
     std::vector<std::uint32_t> compareStates(info.images.size());
     for (std::uint32_t index = 0; index < info.images.size(); ++index) {
-        if (!info.images[index].depthCompare) continue;
+        const bool convertedSample = !info.images[index].srgbDecodeCompatible && index < info.runtimeImageModes.size() && std::ranges::any_of(info.runtimeImageModes.at(index), [](const ImageResource& mode) { return mode.conversionFormat == IrBufferFormat::Format11_11_10UNorm; });
+        if (!info.images[index].depthCompare && !convertedSample) continue;
         const auto compare = compareStates[index] = ResourceMaterializer::EmulatedCompareState(info, snapshot, index);
         const auto first = PipelineSpecialization::CompareBase + index * PipelineSpecialization::CompareWords;
         const std::array<std::uint32_t, 6> values{EmulatedCompare::Function(compare), (compare & EmulatedCompare::Linear) != 0u, EmulatedCompare::AddressX(compare), EmulatedCompare::AddressY(compare), EmulatedCompare::Reference(compare), (compare & EmulatedCompare::BorderWhite) != 0u};
@@ -338,7 +350,6 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
         const auto format = (fields.word3 >> 12u) & 0x7fu;
         if (buffer.descriptorFormatted && (format > static_cast<std::uint32_t>(IrBufferFormat::Format32_32_32_32Float) || (fields.known && format == 0u))) fail("buffer specialization has an unsupported format");
         const auto misalignment = fields.misalignment;
-        if (buffer.atomic && misalignment != 0u) fail("buffer atomic on a V# whose base is not DWORD aligned");
         auto alignment = static_cast<std::uint32_t>(buffer.typedAlignment);
         if (buffer.descriptorFormatted && format != 0u) alignment = std::max(alignment, std::min(GetFormatInfo(static_cast<IrBufferFormat>(format)).byteSize, 4u));
         if (alignment == 0u || misalignment % alignment != 0u) fail("is a formatted buffer access through a V# whose base is not aligned to its element");
@@ -371,7 +382,7 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
     std::vector<std::uint32_t> samplerIntegerModes(info.samplers.size(), 0u);
     std::vector<std::uint32_t> samplerFloatModes(info.samplers.size(), 0u);
     std::vector<std::uint32_t> directSamplerModes(info.samplers.size(), 0u);
-    const auto samplerMode = [](const ImageResource& image) { return !image.constantSwizzle && (image.numericClass == IrTextureNumericClass::Sint || image.conversionFormat != IrBufferFormat::Invalid || image.depthBits) ? 2u : 1u; };
+    const auto samplerMode = [](const ImageResource& image) { return !image.constantSwizzle && (image.numericClass == IrTextureNumericClass::Uint || image.numericClass == IrTextureNumericClass::Sint || image.conversionFormat != IrBufferFormat::Invalid || image.depthBits) ? 2u : 1u; };
     const auto pairSampler = [&](std::uint32_t sampler, const ImageResource& image) {
         const auto mode = samplerMode(image);
         samplerModes.at(sampler) |= mode;
@@ -421,7 +432,7 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
                 } else {
                     const auto& mode = info.runtimeImageModes.at(resource).at(imageModes[resource]);
                     const auto word = snapshot.images.at(resource).dwords[3];
-                    active = DescriptorBindingForImage(mode) == logical.kind && mode.packedFormat != IrBufferFormat::Fmask8_S2_F1 && !mode.constantSwizzle && (image.mipMode != ImageMipMode::DynamicStorage || mip <= ((word >> 16u) & 0xfu) - ((word >> 12u) & 0xfu));
+                    active = DescriptorBindingForImage(mode) == logical.kind && !mode.constantSwizzle && (image.mipMode != ImageMipMode::DynamicStorage || mip <= ((word >> 16u) & 0xfu) - ((word >> 12u) & 0xfu));
                 }
             } else if (samplerHeap) {
                 active = (samplerModes.at(resource) & (1u << (element & 1u))) != 0u;
@@ -448,6 +459,7 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
                 physical.bufferAtomic.push_back(buffer.atomic);
                 physical.bufferWritten.push_back(buffer.written || buffer.atomic);
                 physical.bufferRead.push_back(buffer.read);
+                physical.bufferExtent.push_back(buffer.maxByteExtent);
                 if (buffer.written || buffer.atomic) ++entry.writtenBuffers;
                 else ++entry.readOnlyBuffers;
             }
@@ -476,6 +488,7 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
                 for (const auto& pair : info.sampledPairs) if (pair.sampler == resource) compare |= info.images.at(pair.image).depthCompare && compareStates.at(pair.image) == 0u;
                 physical.samplerDepthCompare.push_back(compare);
                 physical.samplerUnnormalized.push_back(unnormalized.samplers.at(resource));
+                physical.samplerCoordinatesIgnored.push_back(unnormalized.samplersIgnoreCoordinates.at(resource));
                 const auto mode = 1u << (originals[element] & 1u);
                 physical.samplerIntegerBorder.push_back((samplerIntegerModes.at(resource) & mode) != 0u && (samplerFloatModes.at(resource) & mode) == 0u);
                 const auto& words = snapshot.samplers.at(resource).dwords;
@@ -526,7 +539,7 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
         }
     }
     for (auto& binding : plan.bindings) {
-        if (binding.descriptor.role == DescriptorRole::ImageTable) binding.tableSamplerMasks = samplerMasks;
+        if (binding.descriptor.role == DescriptorRole::ImageTable || binding.descriptor.role == DescriptorRole::ImageStorageTable) binding.tableSamplerMasks = samplerMasks;
     }
     return plan;
 }
@@ -595,6 +608,7 @@ void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, con
             }
             break;
         case DescriptorRole::ImageTable:
+        case DescriptorRole::ImageStorageTable:
             if (tables == nullptr) fail("DescriptorBindingBuilder::Populate image table elements were not resolved");
             physical.guestDescriptor.reserve(tables->elements.size() * 8u);
             for (const auto& element : tables->elements) {

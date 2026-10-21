@@ -165,28 +165,23 @@ int main(int argc, char** argv) {
 
         Data = NewBlock();
         Counters = NewBlock();
-        const std::string only = argc > 1 ? std::string(argv[1]) : std::string();
-        check(only.empty() || only == "--reuse" || only == "--atomics" || only == "--reads", "unknown argument " + only);
-        if (only.empty() || only == "--reuse") {
-            std::uint32_t expected = 0;
+        const bool atomicsOnly = argc > 1 && std::string(argv[1]) == "--atomics";
+        std::uint32_t expected = 0;
+        if (!atomicsOnly) {
             Round(1, expected, "one dispatch");
             Round(2, expected, "two unordered dispatches of one build");
             Round(4, expected, "four unordered dispatches of one build");
             std::printf("overlap staged reuse: %u increments kept\n", expected);
         }
-        if (only.empty() || only == "--atomics") {
-            std::uint32_t counted = 0;
-            for (int round = 0; round < 3; ++round) AtomicRound(counted, "two unordered atomic dispatches, round " + std::to_string(round + 1));
-            std::printf("overlap staged atomics: %u atomic adds kept\n", counted);
-        }
-        if (only.empty() || only == "--reads") {
-            Register(StoreCode.data(), sizeof(StoreCode));
-            Register(CopyCode.data(), sizeof(CopyCode));
-            Source = NewBlock();
-            Target = NewBlock();
-            for (std::uint32_t round = 1; round <= 3; ++round) ReadRound(round);
-            std::puts("overlap staged reads: a later unordered dispatch read the earlier one's staged output");
-        }
+        std::uint32_t counted = 0;
+        for (int round = 0; round < 3; ++round) AtomicRound(counted, "two unordered atomic dispatches, round " + std::to_string(round + 1));
+        std::printf("overlap staged atomics: %u atomic adds kept\n", counted);
+        Register(StoreCode.data(), sizeof(StoreCode));
+        Register(CopyCode.data(), sizeof(CopyCode));
+        Source = NewBlock();
+        Target = NewBlock();
+        for (std::uint32_t round = 1; round <= 3; ++round) ReadRound(round);
+        std::puts("overlap staged reads: a later unordered dispatch read the earlier one's staged output");
 
         LibcRunShutdown_nid_postfix();
         std::puts("overlap staged reuse tests passed");

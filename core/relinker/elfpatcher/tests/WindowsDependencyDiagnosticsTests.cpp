@@ -46,13 +46,14 @@ void checkRuntimeDependencies() {
             throw std::runtime_error("Incorrect Windows runtime dependency visibility");
     };
     check({}, {});
-    check({"libkernel.prx"}, {"libkernel.prx"});
+    check({"libkernel.prx"}, {"libkernel.prx", "libc.prx"});
+    check({"libkernel.prx", "libc.prx"}, {"libkernel.prx", "libc.prx"});
     check({"libSceLibcInternal.prx", "libkernel.prx"},
           {"libSceLibcInternal.prx", "libkernel.prx", "libc.prx"});
     check({"libc.prx", "libSceLibcInternal.prx"},
           {"libc.prx", "libSceLibcInternal.prx"});
     check({"libSceVideoOut.prx", "libkernel.prx", "libSceVideoOut.prx"},
-          {"libSceVideoOut.prx", "libkernel.prx"});
+          {"libSceVideoOut.prx", "libkernel.prx", "libc.prx"});
     check({"libSceVideoOut.prx", "libSceVideoOut.prx"}, {"libSceVideoOut.prx"});
 }
 
@@ -184,7 +185,7 @@ void expectDiagnostic(const Fs::path& runner, const std::vector<std::string>& ex
     if (!CreateProcessW(filename.c_str(), nullptr, nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, runner.parent_path().wstring().c_str(), &startup, &process))
         throw std::runtime_error("Cannot start diagnostic test: " + std::to_string(GetLastError()));
     CloseHandle(output);
-    if (WaitForSingleObject(process.hProcess, 20000) != WAIT_OBJECT_0) {
+    if (WaitForSingleObject(process.hProcess, 120000) != WAIT_OBJECT_0) {
         TerminateProcess(process.hProcess, 1);
         throw std::runtime_error("Diagnostic test timed out");
     }

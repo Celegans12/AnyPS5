@@ -90,6 +90,10 @@ namespace ShaderRecompiler
             SpannedBallot(state, result, predicate);
             return;
         }
+        EmitHostSubgroupBallot(state, result, predicate);
+    }
+
+    void EmitHostSubgroupBallot(SpirvEmitterState& state, std::uint32_t result, std::uint32_t predicate) {
         if (HostSubgroupSingleLane(state)) {
             const auto zero = ConstantU32(state, 0u);
             const auto own = Select(state, TypeU32(state), predicate, ConstantU32(state, 1u), zero);

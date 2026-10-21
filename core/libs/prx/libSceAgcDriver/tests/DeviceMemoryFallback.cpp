@@ -56,11 +56,11 @@ void Choose(const char* what, bool budgetExtension, std::uint64_t budget, std::u
 void RefusedFallbackTests() {
     const auto context = mockContext(true);
     const std::uint32_t both = (1u << HostType) | (1u << DeviceType);
-    const auto refused = context.RefusedDeviceMemoryFallback(both, DeviceType, 9 * MiB, "test");
+    const auto refused = context.RefusedDeviceMemoryFallback(both, DeviceType);
     Expect(refused.has_value() && *refused == HostType, "a device-local type out of device memory did not fall back to the host type");
-    Expect(!context.RefusedDeviceMemoryFallback(both, HostType, 9 * MiB, "test").has_value(), "a host type out of memory was given a fallback");
-    Expect(!context.RefusedDeviceMemoryFallback(1u << DeviceType, DeviceType, 9 * MiB, "test").has_value(), "a fallback was chosen outside the allowed type mask");
-    Expect(!context.RefusedDeviceMemoryFallback(both, 7, 9 * MiB, "test").has_value(), "an unknown memory type was given a fallback");
+    Expect(!context.RefusedDeviceMemoryFallback(both, HostType).has_value(), "a host type out of memory was given a fallback");
+    Expect(!context.RefusedDeviceMemoryFallback(1u << DeviceType, DeviceType).has_value(), "a fallback was chosen outside the allowed type mask");
+    Expect(!context.RefusedDeviceMemoryFallback(both, 7).has_value(), "an unknown memory type was given a fallback");
 }
 
 void BufferPlacementTests() {

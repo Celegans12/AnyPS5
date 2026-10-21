@@ -69,6 +69,10 @@ struct ShaderStageRuntime {
     }
 };
 
+struct ShaderDepthRemap {
+    std::uint32_t mode = 0;
+};
+
 struct ShaderClipSpaceTransform {
     float scale[2] = {};
     float offset[2] = {};
@@ -92,6 +96,7 @@ struct ShaderMeshInputInfo: ShaderWorkgroupInputInfo {
     std::uint32_t maxPrimitives = 0;
     std::uint32_t provokingVertex = 0;
     std::uint32_t esgsItemSize = 0;
+    std::uint32_t outputPrimitiveSize = 3;
 
     [[nodiscard]] std::uint32_t InputPrimitiveSize() const {
         return inputPrimitive == 1u ? 1u : inputPrimitive == 2u ? 2u : 3u;
@@ -136,6 +141,7 @@ struct ShaderVertexInputInfo {
     std::uint32_t hostSubgroupSize = 64;
     std::uint32_t paClVsOutCntl = 0;
     ShaderClipSpaceTransform clipSpace;
+    ShaderDepthRemap depthRemap;
     ShaderMeshInputInfo mesh;
     ShaderTessellationInputInfo tess;
     bool fetchExternal = false;
@@ -175,6 +181,7 @@ struct ShaderPixelInputInfo {
     bool psDepthExportEnable = false;
     bool psSampleMaskExportEnable = false;
     bool psStencilRefExportEnable = false;
+    bool psStencilOperationValueExport = false;
     bool psSampleShading = false;
     bool psEarlyZ = false;
     bool psExecuteOnNoop = false;
@@ -184,10 +191,24 @@ struct ShaderPixelInputInfo {
     bool psDitheredAlphaToCoverage = false;
     std::uint8_t quadPixelMask = 0xf;
     std::array<std::uint16_t, 4> quadSampleMask{0xffffu, 0xffffu, 0xffffu, 0xffffu};
+    bool psIteratesSamples = false;
+    PixelPositionLocation psPositionLocation = PixelPositionLocation::Center;
+    std::array<std::uint8_t, 32> sampleLocations{};
     ShaderStageRuntime stage;
 
     bool HasPositionInput() const {
         return psPosX || psPosY || psPosZ || psPosW;
+    }
+
+    [[nodiscard]] bool SampleLocationsOffCenter() const {
+        return std::ranges::any_of(sampleLocations, [](std::uint8_t location) { return location != 0u; });
+    }
+
+    [[nodiscard]] bool SampleLocationsVary() const {
+        for (std::size_t index = 8; index < sampleLocations.size(); ++index) {
+            if (sampleLocations[index] != sampleLocations[index % 8u]) return true;
+        }
+        return false;
     }
 
     [[nodiscard]] bool QuadSampleMaskPartial() const {

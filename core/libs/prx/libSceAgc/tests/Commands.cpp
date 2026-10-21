@@ -16,11 +16,14 @@ extern "C" std::uint32_t* APS5_VABI sceAgcDcbResetQueue(CommandBuffer* buf, std:
 extern "C" std::uint32_t* APS5_VABI sceAgcDcbClearState(CommandBuffer* buf, std::uint32_t command);
 extern "C" std::uint32_t* APS5_VABI sceAgcDcbSetFlip(CommandBuffer* buf, std::uint32_t handle, std::int32_t index, std::uint32_t mode, std::int64_t argument);
 extern "C" std::uint32_t* APS5_VABI sceAgcAcbWaitUntilSafeForRendering(CommandBuffer* buf, std::uint32_t handle, std::uint32_t index);
+extern "C" std::uint32_t* APS5_VABI sceAgcAcbSetFlip(CommandBuffer* buf, std::uint32_t handle, std::int32_t index, std::uint32_t mode, std::int64_t argument);
 extern "C" int APS5_VABI sceAgcSuspendPoint();
 extern "C" int APS5_VABI sceAgcInit(std::uint32_t version);
 extern "C" void* APS5_VABI sceAgcGetRegisterDefaults();
+extern "C" void* APS5_VABI sceAgcGetRegisterDefaults2(std::uint32_t version);
 extern "C" void* APS5_VABI sceAgcGetRegisterDefaultsInternal();
 extern "C" void* APS5_VABI sceAgcGetRegisterDefaults2Internal(std::uint32_t version);
+extern "C" int APS5_VABI sceAgcGetDefaultCxStateFlat(void* out_state, std::uint32_t size);
 extern "C" int APS5_VABI sceAgcInit_0090(std::uint32_t* state, std::uint32_t version);
 extern "C" std::uint32_t* APS5_VABI sceAgcDcbDrawIndexAuto(CommandBuffer* buf, std::uint32_t indexCount, std::uint64_t modifier);
 extern "C" std::uint32_t* APS5_VABI sceAgcDcbDrawIndexIndirect(CommandBuffer* buf, std::uint32_t dataOffsetInBytes, std::uint64_t modifier);
@@ -424,6 +427,16 @@ void testFlip() {
     full.buffer.cursor_down = full.words.data() + 3;
     expectFailure([&] { sceAgcAcbWaitUntilSafeForRendering(&full.buffer, 1, 0); });
     check(full.buffer.cursor_up == full.words.data(), "failed compute rendering wait advanced cursor");
+    Storage acbFlip;
+    acbFlip.words.fill(0xdeadbeefu);
+    auto* computeFlip = sceAgcAcbSetFlip(&acbFlip.buffer, 0xfedcba98u, -2, 0x12345678u, -0x123456789abcdefLL);
+    check(computeFlip == acbFlip.words.data() && std::equal(expected.begin(), expected.end(), computeFlip), "compute flip packet mismatch");
+    check(acbFlip.buffer.cursor_up == computeFlip + 6 && computeFlip[6] == 0xdeadbeefu, "compute flip overran allocation");
+    expectFailure([] { sceAgcAcbSetFlip(nullptr, 1, 0, 1, 0); });
+    Storage fullFlip;
+    fullFlip.buffer.cursor_down = fullFlip.words.data() + 5;
+    expectFailure([&] { sceAgcAcbSetFlip(&fullFlip.buffer, 1, 0, 1, 0); });
+    check(fullFlip.buffer.cursor_up == fullFlip.words.data(), "failed compute flip advanced cursor");
     check(sceAgcSuspendPoint() == 0, "empty suspend failed");
 }
 
@@ -637,8 +650,77 @@ void testDefaults() {
     auto* internalDefaults = sceAgcGetRegisterDefaultsInternal();
     check(internalDefaults != nullptr && internalDefaults == Agc::Command::GetRegisterDefaults(0, true, __func__) && internalDefaults == sceAgcGetRegisterDefaults2Internal(0), "internal register defaults are not the baseline internal table");
     check(internalDefaults != sceAgcGetRegisterDefaults(), "internal register defaults returned the public table");
+    constexpr int kInvalidArgument = static_cast<int>(0x80890001u);
+    std::array<std::uint32_t, 512> flatCxBuffer{};
+    check(sceAgcGetDefaultCxStateFlat(nullptr, sizeof(flatCxBuffer)) == kInvalidArgument, "null destination was accepted");
+    check(sceAgcGetDefaultCxStateFlat(flatCxBuffer.data(), 0) == 0, "zero size copy failed");
+    check(sceAgcGetDefaultCxStateFlat(flatCxBuffer.data(), sizeof(flatCxBuffer)) == 0, "flat CX state default retrieval failed");
+    check(flatCxBuffer[0x001] == 0x11000100u, "flat CX state register 0x001 mismatch");
+    check(flatCxBuffer[0x007] == 0x0000ffffu, "flat CX state register 0x007 mismatch");
+    check(flatCxBuffer[0x12d] == 0x3f800000u, "flat CX state register 0x12d mismatch");
+    check(flatCxBuffer[0x1e0] == 0x20010001u, "flat CX state register 0x1e0 mismatch");
+    std::array<std::uint32_t, 513> overBuffer{};
+    overBuffer[512] = 0x12345678u;
+    check(sceAgcGetDefaultCxStateFlat(overBuffer.data(), sizeof(overBuffer)) == 0, "oversized copy failed");
+    check(overBuffer[512] == 0x12345678u, "oversized copy overflowed buffer");
+    check(Agc::Command::GetDefaultCxStateFlat(nullptr, sizeof(flatCxBuffer)) == kInvalidArgument, "null command destination was accepted");
+    check(Agc::Command::GetDefaultCxStateFlat(flatCxBuffer.data(), sizeof(flatCxBuffer)) == 0, "command flat CX state retrieval failed");
     expectFailure([] { Agc::Command::GetRegisterDefaults(14, false, __func__); });
     expectFailure([] { Agc::Command::GetRegisterDefaults(0xffffffffu, true, __func__); });
+}
+
+struct DefaultsType {
+    std::uint32_t key;
+    std::uint32_t bankIndex;
+};
+
+std::uint32_t colourTargetBlock(const void* root) {
+    const auto* bytes = static_cast<const unsigned char*>(root);
+    ShaderRegister** contextBlocks = nullptr;
+    const DefaultsType* types = nullptr;
+    std::uint32_t count = 0;
+    std::memcpy(&contextBlocks, bytes, sizeof(contextBlocks));
+    std::memcpy(&types, bytes + 0x30, sizeof(types));
+    std::memcpy(&count, bytes + 0x38, sizeof(count));
+    check(contextBlocks != nullptr && types != nullptr && count > 0, "register defaults root has no context blocks or types");
+    std::uint32_t contexts = 0;
+    std::uint32_t matches = 0;
+    std::uint32_t block = 0;
+    for (std::uint32_t entry = 0; entry < count; ++entry) {
+        if ((types[entry].bankIndex & 3u) == 0)
+            ++contexts;
+        if (types[entry].key != 0x38e92c91u)
+            continue;
+        check((types[entry].bankIndex & 3u) == 0, "MRT0 defaults are not in the context bank");
+        block = types[entry].bankIndex >> 2;
+        ++matches;
+    }
+    check(matches == 1 && block < contexts && contextBlocks[block] != nullptr, "MRT0 defaults key is missing, repeated or outside the context blocks");
+    constexpr std::array<std::uint32_t, 16> offsets{0x318, 0x31b, 0x31c, 0x31d, 0x31e, 0x31f, 0x321, 0x323, 0x324, 0x325, 0x390, 0x398, 0x3a0, 0x3a8, 0x3b0, 0x3b8};
+    for (std::size_t i = 0; i < offsets.size(); ++i)
+        check(contextBlocks[block][i].offset == offsets[i], "MRT0 defaults block does not hold the colour target registers");
+    return block;
+}
+
+void testDefaultsTypes() {
+    const auto* legacy = sceAgcGetRegisterDefaults();
+    check(legacy != sceAgcGetRegisterDefaults2(13), "legacy register defaults reused the compact versioned table");
+    check(colourTargetBlock(legacy) == 78, "MRT0 defaults are not block 78 of the 137-entry table");
+
+    const auto checkCompactTypes = [](const void* root, std::uint32_t count, std::uint32_t key,
+                                      std::uint32_t packedType, std::uint32_t extra) {
+        const auto* bytes = static_cast<const unsigned char*>(root);
+        const std::uint32_t* types = nullptr;
+        std::uint32_t actualCount = 0;
+        std::memcpy(&types, bytes + 0x30, sizeof(types));
+        std::memcpy(&actualCount, bytes + 0x38, sizeof(actualCount));
+        check(types != nullptr && actualCount == count, "versioned register defaults have an invalid compact type table");
+        check(types[0] == key && types[1] == packedType && types[2] == extra,
+              "versioned register defaults did not preserve their compact type entry");
+    };
+    checkCompactTypes(sceAgcGetRegisterDefaults2(0), 150, 0xe24f806du, 0x00040400u, 0);
+    checkCompactTypes(sceAgcGetRegisterDefaults2(10), 128, 0xe24f806du, 0x00040400u, 0);
+    checkCompactTypes(sceAgcGetRegisterDefaults2Internal(0), 15, 0xf58fea31u, 0x00040400u, 0);
 }
 
 void testEventWrite() {
@@ -688,6 +770,7 @@ int main(int argc, char** argv) {
     try {
         if (argc == 2 && std::strcmp(argv[1], "defaults") == 0) {
             testDefaults();
+            testDefaultsTypes();
             LibcRunShutdown_nid_postfix();
             std::puts("AGC initialization tests passed");
             return 0;
@@ -711,6 +794,7 @@ int main(int argc, char** argv) {
         testAtomicGds();
         testDebugRaiseException();
         testDefaults();
+        testDefaultsTypes();
         LibcRunShutdown_nid_postfix();
         std::puts("AGC command tests passed");
         return 0;

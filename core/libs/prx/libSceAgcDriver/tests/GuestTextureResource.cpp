@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include <algorithm>
 #include <array>
 #include <string>
@@ -171,6 +172,10 @@ void RunGuestTextureResourceTests() {
     Fields nullType = base;
     nullType.typeRaw = 0;
     Require(IsNullTextureResource(pack(nullType)), "a type-0 texture with a nonzero base was not classified as null");
+    nullType.typeRaw = 1;
+    Require(IsNullTextureResource(pack(nullType)), "a type-1 texture with a nonzero base was not classified as null");
+    nullType.typeRaw = 2;
+    Require(!IsNullTextureResource(pack(nullType)), "a reserved type-2 texture was classified as null");
     auto result = DecodeTextureResource(pack(base));
     Require(result.baseAddress == (base.base40 << 8u), "decoded base address changed");
     Require(result.width == 16 && result.height == 16, "decoded width or height changed");
@@ -179,6 +184,43 @@ void RunGuestTextureResourceTests() {
     Require(result.tileMode == TextureTileMode::kLinear, "decoded tile mode changed");
     Require(result.dimension == TextureDimension::k2D, "decoded dimension changed");
     Require(result.format == 56, "decoded format changed");
+    Fields fmask = base;
+    fmask.format = 166u;
+    fmask.tileModeRaw = 24u;
+    fmask.dstSelY = fmask.dstSelZ = fmask.dstSelW = 0u;
+    const auto fmaskResource = DecodeTextureResource(pack(fmask));
+    Require(fmaskResource.format == 20u && fmaskResource.dimension == TextureDimension::k2D && fmaskResource.tileMode == TextureTileMode::kZ64KBX, "uncompressed 32-bit FMASK did not use an integer Z surface");
+    Fields fmaskArray = fmask;
+    fmaskArray.typeRaw = 13u;
+    fmaskArray.depth = 2u;
+    fmaskArray.baseArray = 1u;
+    const auto fmaskArrayResource = DecodeTextureResource(pack(fmaskArray));
+    Require(fmaskArrayResource.format == 20u && fmaskArrayResource.baseArray == 1u && fmaskArrayResource.depthOrLastArray == 2u, "FMASK normalization changed the array view");
+    for (std::uint32_t format = 156u; format <= 168u; ++format) {
+        if (format == 166u) continue;
+        auto unsupported = fmask;
+        unsupported.format = format;
+        rejectFields(unsupported, "FMASK format is not implemented");
+    }
+    for (const auto field : {&Fields::metaCompress, &Fields::writeCompress}) {
+        auto compressed = fmask;
+        compressed.*field = true;
+        rejectFields(compressed, "FMASK CMASK compression is not implemented");
+    }
+    for (const auto selector : {5u, 6u, 7u}) {
+        auto unsupported = fmask;
+        unsupported.dstSelX = selector;
+        rejectFields(unsupported, "FMASK destination channel selector is not implemented");
+    }
+    auto unsupportedFmask = fmask;
+    unsupportedFmask.tileModeRaw = 0u;
+    rejectFields(unsupportedFmask, "FMASK reads require a single-mip");
+    unsupportedFmask = fmask;
+    unsupportedFmask.lastLevel = unsupportedFmask.maxMip = 1u;
+    rejectFields(unsupportedFmask, "FMASK reads require a single-mip");
+    unsupportedFmask = fmask;
+    unsupportedFmask.typeRaw = 10u;
+    rejectFields(unsupportedFmask, "FMASK reads require a single-mip");
     Require(result.dstSelX == 4 && result.dstSelY == 5 && result.dstSelZ == 6 && result.dstSelW == 7, "decoded destination selectors changed");
 
     Fields wide = base;
@@ -333,6 +375,89 @@ void RunGuestTextureResourceTests() {
     const std::array<std::uint32_t, 8> canvas{0x021f2000u, 0x03800000u, 0x804a004au, 0xe1b20facu, 0x00000000u, 0x00400020u, 0x00000000u, 0x00000000u};
     result = DecodeTextureResource(canvas);
     Require(result.dimension == TextureDimension::k2DMsaa && result.samples == 4 && result.baseAddress == 0x21f200000ull && result.width == 297 && result.height == 297 && result.format == 56 && result.tileMode == TextureTileMode::kR64KBX, "the 4x canvas descriptor of PPSA99006 decoded incorrectly");
+    Require(DescribeSurface(result).guestBytes == 0x190000, "4x render-target geometry must include fragment-aware padding for the PPSA99006 canvas");
+    const auto canvasGeometry = DescribeSurface(result);
+    const std::array<std::uint32_t, 8> sonic{0x405fc080u, 0xc4700000u, 0x821bc3bfu, 0xe1b30facu, 0x00000000u, 0x00400030u, 0x406b0000u, 0x0040819fu};
+    const auto sonicResource = DecodeTextureResource(sonic);
+    const auto sonicGeometry = DescribeSurface(sonicResource);
+    Require(sonicResource.width == 3840u && sonicResource.height == 2160u && sonicResource.samples == 8u && sonicResource.format == 71u, "the PPSA99902 multisampled color descriptor decoded incorrectly");
+    Require(sonicGeometry.guestBytes == 0x1fe00000ull, "the PPSA99902 8x surface footprint omits fragments: " + std::to_string(sonicGeometry.guestBytes));
+    Require(canvasGeometry.guestBytes == 0x190000u, "the 297x297 4x surface footprint does not use fragment-aware blocks");
+    auto singleSample = sonicResource;
+    singleSample.samples = 1u;
+    singleSample.dimension = TextureDimension::k2D;
+    Require(DescribeSurface(singleSample).guestBytes == 0x3fc0000u, "single-sample surface geometry changed");
+    struct FootprintCase {
+        TextureTileMode tile;
+        VkFormat format;
+        std::uint32_t elementBytes, width, height, samples, blocksPerRow;
+        std::uint64_t bytes;
+    };
+    const std::array footprints{
+        FootprintCase{TextureTileMode::kR64KBX, VK_FORMAT_R8_UINT, 1u, 129u, 65u, 2u, 2u, 0x20000u},
+        FootprintCase{TextureTileMode::kR64KBX, VK_FORMAT_R16_UINT, 2u, 65u, 129u, 4u, 1u, 0x30000u},
+        FootprintCase{TextureTileMode::kR64KBX, VK_FORMAT_R32_UINT, 4u, 129u, 65u, 2u, 3u, 0x30000u},
+        FootprintCase{TextureTileMode::kR64KBX, VK_FORMAT_R32_UINT, 4u, 65u, 129u, 2u, 2u, 0x40000u},
+        FootprintCase{TextureTileMode::kR64KBX, VK_FORMAT_R32_UINT, 4u, 297u, 297u, 4u, 5u, 0x190000u},
+        FootprintCase{TextureTileMode::kR64KBX, VK_FORMAT_R32_UINT, 4u, 65u, 129u, 8u, 3u, 0x90000u},
+        FootprintCase{TextureTileMode::kR64KBX, VK_FORMAT_R32G32_SFLOAT, 8u, 3840u, 2160u, 8u, 120u, 0x1fe00000u},
+        FootprintCase{TextureTileMode::kR64KBX, VK_FORMAT_R32G32B32A32_UINT, 16u, 16384u, 16384u, 8u, 1024u, 0x800000000ull},
+        FootprintCase{TextureTileMode::kZ64KBX, VK_FORMAT_R16_UNORM, 2u, 129u, 65u, 2u, 2u, 0x20000u},
+        FootprintCase{TextureTileMode::kZ64KBX, VK_FORMAT_R32_SFLOAT, 4u, 65u, 129u, 8u, 3u, 0x90000u},
+        FootprintCase{TextureTileMode::kStandard4KB, VK_FORMAT_R32_UINT, 4u, 17u, 33u, 4u, 2u, 0x6000u},
+        FootprintCase{TextureTileMode::kStandard64KB, VK_FORMAT_R32_UINT, 4u, 129u, 65u, 2u, 3u, 0x30000u}
+    };
+    for (const auto& test : footprints) {
+        auto resource = sonicResource;
+        const auto format = FindGuestTextureFormat(test.format, test.elementBytes);
+        Require(format.has_value(), "the multisample footprint test format has no guest encoding");
+        resource.format = format.value();
+        resource.width = test.width;
+        resource.height = test.height;
+        resource.samples = test.samples;
+        resource.tileMode = test.tile;
+        const auto geometry = DescribeSurface(resource);
+        const auto linearBytes = static_cast<std::uint64_t>(test.width) * test.height * test.samples * test.elementBytes;
+        Require(geometry.guestBytes == test.bytes && geometry.layerBytes == test.bytes && geometry.sliceLinearBytes == linearBytes, "multisampled surface footprint or linear size disagrees with the reference");
+        Require(geometry.layers == 1u && geometry.imageLayers == 1u && geometry.imageDepth == 1u && !geometry.thick && geometry.blockDepth == 1u && geometry.mips.size() == 1u, "multisampled surface geometry is not one thin 2D level");
+        const auto& mip = geometry.mips.front();
+        Require(mip.tiledOffset == 0u && mip.tiledSize == test.bytes && mip.linearOffset == 0u && mip.linearSize == linearBytes && mip.width == test.width && mip.height == test.height && mip.blocksPerRow == test.blocksPerRow && mip.pitchBytes == test.width * test.samples * test.elementBytes && !mip.tail && mip.tailX == 0u && mip.tailY == 0u, "multisampled mip geometry lost its sample pitch or block layout");
+    }
+    auto unsupportedSurface = sonicResource;
+    for (const auto samples : {0u, 3u, 16u}) {
+        unsupportedSurface.samples = samples;
+        reject([&] { DescribeSurface(unsupportedSurface); }, "fragment count");
+    }
+    unsupportedSurface = sonicResource;
+    unsupportedSurface.mipCount = 2u;
+    reject([&] { DescribeSurface(unsupportedSurface); }, "mip levels");
+    unsupportedSurface = sonicResource;
+    unsupportedSurface.dimension = TextureDimension::k2DArray;
+    reject([&] { DescribeSurface(unsupportedSurface); }, "dimension or array");
+    unsupportedSurface = sonicResource;
+    unsupportedSurface.tileMode = TextureTileMode::kStandard256B;
+    reject([&] { DescribeSurface(unsupportedSurface); }, "4 KiB or 64 KiB");
+    for (const auto format : {56u, 71u}) {
+        for (const auto samples : {2u, 4u, 8u}) {
+            for (const auto extent : {std::array{1u, 1u}, std::array{17u, 5u}, std::array{297u, 297u}}) {
+                auto linear = sonicResource;
+                linear.tileMode = TextureTileMode::kLinear;
+                linear.format = format;
+                linear.samples = samples;
+                linear.width = extent[0];
+                linear.height = extent[1];
+                auto single = linear;
+                single.samples = 1u;
+                single.dimension = TextureDimension::k2D;
+                const auto expected = DescribeSurface(single);
+                const auto actual = DescribeSurface(linear);
+                Require(actual.guestBytes == expected.guestBytes && actual.layerBytes == expected.layerBytes && actual.sliceLinearBytes == expected.sliceLinearBytes && actual.mips.size() == expected.mips.size(), "linear multisampled descriptors must retain the existing geometry path");
+                const auto& mip = actual.mips.front();
+                const auto& baseline = expected.mips.front();
+                Require(mip.tiledSize == baseline.tiledSize && mip.linearSize == baseline.linearSize && mip.pitchBytes == baseline.pitchBytes && mip.blocksPerRow == baseline.blocksPerRow, "linear multisampled descriptors changed existing mip geometry");
+            }
+        }
+    }
     Fields fewerFragments = multisampled;
     fewerFragments.maxMip = 1;
     rejectFields(fewerFragments, "same sample count");
@@ -577,6 +702,8 @@ void RunGuestTextureResourceTests() {
     Require(MatchesGuestDimension(Shape::Image2DArray, TextureDimension::k2DArray), "2D array shape must match 2D array dimension");
     Require(MatchesGuestDimension(Shape::Image2DMultisample, TextureDimension::k2DMsaa), "multisampled shape must match the multisampled dimension");
     Require(!MatchesGuestDimension(Shape::Image2DMultisample, TextureDimension::k2D), "multisampled shape must not match 2D dimension");
+    Require(MatchesGuestDimension(Shape::Image2DMultisampleArray, TextureDimension::k2DMsaa), "multisampled array shape must match the multisampled dimension");
+    Require(!MatchesGuestDimension(Shape::Image2DMultisampleArray, TextureDimension::k2DArray), "multisampled array shape must not match 2D array dimension");
     Require(!MatchesGuestDimension(Shape::Image2D, TextureDimension::k2DMsaa), "2D shape must not match the multisampled dimension");
     Require(MatchesGuestDimension(Shape::Image2DArray, TextureDimension::kCube), "a cube must be readable as a 2D array of its faces");
     Require(MatchesGuestDimension(Shape::ImageCube, TextureDimension::kCube), "cube shape must match cube dimension");
@@ -623,4 +750,21 @@ void RunGuestTextureResourceTests() {
     Fields cornered = base;
     cornered.cornerSample = true;
     Require(!SampledTexturesShareEntry(pack(base), pack(cornered)), "T#s differing in a field next to the feedback fields must not share a sampled texture entry");
+
+    Fields arrayFields = base;
+    arrayFields.typeRaw = 13;
+    arrayFields.depth = 1536;
+    arrayFields.baseArray = 3;
+    const auto arrayWords = pack(arrayFields);
+    std::array<std::uint32_t, 8> narrowed{};
+    Require(FirstLayerDescriptor(arrayWords, narrowed), "a 2D array T# naming more than its base slice must narrow to that slice");
+    const auto slice = DecodeTextureResource(narrowed);
+    const auto whole = DecodeTextureResource(arrayWords);
+    Require(slice.dimension == TextureDimension::k2DArray && slice.baseArray == 3 && slice.depthOrLastArray == 3, "a narrowed 2D array T# must name its base slice alone");
+    Require(slice.baseAddress == whole.baseAddress && slice.width == whole.width && slice.format == whole.format && slice.mipCount == whole.mipCount && slice.tileMode == whole.tileMode, "narrowing a 2D array T# must keep every other field");
+    Require(!SampledTexturesShareEntry(arrayWords, narrowed), "a narrowed 2D array T# must not share the whole array's sampled texture entry");
+    Fields single = arrayFields;
+    single.depth = 3;
+    Require(!FirstLayerDescriptor(pack(single), narrowed), "a 2D array T# of its base slice alone needs no narrowing");
+    Require(!FirstLayerDescriptor(baseWords, narrowed), "a 2D T# needs no narrowing");
 }

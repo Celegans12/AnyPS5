@@ -1,14 +1,18 @@
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VramBudget.hpp"
+#include "AllocationFailure.hpp"
+#include "SlabReturn.hpp"
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <cstdio>
 #include <deque>
 #include <initializer_list>
 #include <map>
 #include <memory>
+#include <new>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -16,8 +20,11 @@
 #include <vector>
 
 using namespace AgcDriver::Graphics;
+using AgcDriver::Tests::SetAllocationFailureCountdown;
 
 namespace {
+
+thread_local int failAfterMap = -1;
 
 int failures = 0;
 
@@ -51,6 +58,11 @@ struct MockDevice {
     VkDeviceSize otherUsage = 0;
     std::uint64_t budgetQueries = 0;
     std::uint32_t lastType = 0;
+    VkResult mapResult = VK_SUCCESS;
+    VkResult bindResult = VK_SUCCESS;
+    unsigned binds = 0;
+    unsigned maps = 0;
+    unsigned unmaps = 0;
 };
 
 MockDevice mock;
@@ -90,17 +102,23 @@ VKAPI_ATTR VkResult VKAPI_CALL mockAllocateMemory(VkDevice, const VkMemoryAlloca
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL mockBindBufferMemory(VkDevice, VkBuffer buffer, VkDeviceMemory memory, VkDeviceSize offset) {
+    ++mock.binds;
+    if (mock.bindResult != VK_SUCCESS) return mock.bindResult;
     if (offset + mock.sizes.at(buffer) > mock.memoryBytes.at(memory)) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
     mock.bound[buffer] = {memory, offset};
     return VK_SUCCESS;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL mockMapMemory(VkDevice, VkDeviceMemory memory, VkDeviceSize, VkDeviceSize, VkMemoryMapFlags, void** data) {
+    if (mock.mapResult != VK_SUCCESS) return mock.mapResult;
     *data = mock.hostMemory.at(memory).data();
+    ++mock.maps;
+    SetAllocationFailureCountdown(failAfterMap);
+    failAfterMap = -1;
     return VK_SUCCESS;
 }
 
-VKAPI_ATTR void VKAPI_CALL mockUnmapMemory(VkDevice, VkDeviceMemory) {}
+VKAPI_ATTR void VKAPI_CALL mockUnmapMemory(VkDevice, VkDeviceMemory) { ++mock.unmaps; }
 
 VKAPI_ATTR void VKAPI_CALL mockDestroyBuffer(VkDevice, VkBuffer buffer, const VkAllocationCallbacks*) {
     Expect(mock.liveBuffers.erase(buffer) == 1, "an unknown buffer was destroyed");
@@ -246,6 +264,17 @@ void VramIntegratedKeepsPool() {
     Expect(mock.budgetQueries == 5 && mock.frees == 0 && mock.liveBytes == 256 * MiB, "an integrated GPU's pool followed the device-local heap's budget");
 }
 
+std::uint64_t diagnosticBudgetQueries = 0;
+
+VKAPI_ATTR void VKAPI_CALL mockDiagnosticMemoryProperties2(VkPhysicalDevice, VkPhysicalDeviceMemoryProperties2* properties) {
+    ++diagnosticBudgetQueries;
+    auto* reported = static_cast<VkPhysicalDeviceMemoryBudgetPropertiesEXT*>(properties->pNext);
+    reported->heapUsage[0] = 1500 * MiB;
+    reported->heapBudget[0] = 2000 * MiB;
+    reported->heapUsage[1] = 2500 * MiB;
+    reported->heapBudget[1] = 3000 * MiB;
+}
+
 Context hostBudgetContext() {
     auto context = mockContext();
     context.physical = reinterpret_cast<VkPhysicalDevice>(std::uintptr_t{1});
@@ -323,7 +352,7 @@ void AttachmentReclaim() {
         Expect(mock.memoryBytes.size() == 1, "a released device buffer was not kept in the device pool");
         const auto pooled = mock.memoryBytes.begin()->first;
         mock.results = results;
-        const auto memory = AllocateAttachmentMemory(context, allocation, 3, "vkAllocateMemory attachment");
+        const auto memory = AllocateImageMemory(context, allocation, 3, "vkAllocateMemory attachment");
         Expect(!mock.memoryBytes.contains(pooled), "an attachment refused device memory did not reclaim the pool before retrying");
         const auto type = mock.memoryTypes.at(memory);
         mockFreeMemory(VK_NULL_HANDLE, memory, nullptr);
@@ -352,6 +381,79 @@ void SizeClassesAndDirections() {
     Expect(MemoryOf(writeBack.Handle()) == first && mock.allocations == made, "a retained 11 MiB device buffer did not serve a write-back of another size and direction in its class");
     Expect(writeBack.Size() == 10 * MiB + 512 * 1024, "a reused device buffer reports the retained size");
     Expect(mock.sizes.at(writeBack.Handle()) == 10 * MiB + 512 * 1024, "a reused device buffer kept the VkBuffer of the earlier size");
+}
+
+void SmallDeviceRetention() {
+    mock = MockDevice{};
+    {
+        auto context = mockContext();
+        constexpr auto usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        const auto deviceBudget = BufferPool::DeviceBudget(context.memory);
+        const auto bytes = static_cast<std::size_t>((deviceBudget != 0 ? deviceBudget : 512 * MiB) / 2) + MiB;
+        VkDeviceMemory small = VK_NULL_HANDLE;
+        {
+            DeviceBuffer buffer(context, 256, usage);
+            small = MemoryOf(buffer.Handle());
+        }
+        std::vector<std::unique_ptr<DeviceBuffer>> large;
+        for (int i = 0; i < 2; ++i) large.push_back(std::make_unique<DeviceBuffer>(context, bytes, usage));
+        large.clear();
+        Expect(mock.frees != 0, "large device buffers did not exercise pool budget eviction");
+        const auto made = mock.allocations;
+        const bool isolated = std::getenv("APS5_BUFFER_POOL_SHARED") == nullptr;
+        DeviceBuffer again(context, 256, usage);
+        Expect((MemoryOf(again.Handle()) == small) == isolated, "small device buffer retention did not follow the separate or shared pool budget");
+        Expect(mock.allocations == made + (isolated ? 0 : 1), "large device buffer churn changed small buffer allocation reuse");
+    }
+    Expect(mock.liveBytes == 0 && mock.liveBuffers.empty(), "device pool tier retention leaked Vulkan objects");
+}
+
+void SmallDeviceOwnTier() {
+    mock = MockDevice{};
+    {
+        auto context = mockContext();
+        constexpr auto usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        VkDeviceMemory small = VK_NULL_HANDLE;
+        {
+            DeviceBuffer buffer(context, 256 * 1024, usage);
+            small = MemoryOf(buffer.Handle());
+        }
+        std::vector<std::unique_ptr<Buffer>> host;
+        for (int i = 0; i < 160; ++i) host.push_back(std::make_unique<Buffer>(context, 512 * 1024, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, HostVisible));
+        host.clear();
+        const auto made = mock.allocations;
+        const bool ownTier = std::getenv("APS5_NO_SMALL_DEVICE_TIER") == nullptr;
+        DeviceBuffer again(context, 256 * 1024, usage);
+        Expect((MemoryOf(again.Handle()) == small) == ownTier, "small device buffer retention did not follow APS5_NO_SMALL_DEVICE_TIER under small host buffer churn");
+        Expect(mock.allocations == made + (ownTier ? 0 : 1), "small host buffer churn changed small device buffer allocation reuse");
+    }
+    Expect(mock.liveBytes == 0 && mock.liveBuffers.empty(), "the small device tier leaked Vulkan objects");
+}
+
+void ExactSizeReuse() {
+    mock = MockDevice{};
+    auto context = mockContext();
+    VkBuffer first = VK_NULL_HANDLE;
+    VkBuffer second = VK_NULL_HANDLE;
+    {
+        auto a = std::make_unique<Buffer>(context, 3000, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, HostVisible);
+        auto b = std::make_unique<Buffer>(context, 4000, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, HostVisible);
+        first = a->Handle();
+        second = b->Handle();
+        a.reset();
+        b.reset();
+    }
+    const auto destroyed = mock.destroyedBuffers;
+    const bool exact = std::getenv("APS5_NO_EXACT_SIZE_REUSE") == nullptr;
+    {
+        Buffer again(context, 3000, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, HostVisible);
+        Expect((again.Handle() == first) == exact, "a pooled buffer of the requested exact size was not preferred as APS5_NO_EXACT_SIZE_REUSE says");
+        Expect(mock.sizes.at(again.Handle()) == 3000 && again.Bytes().size() == 3000, "a reused buffer does not have the requested size");
+        Expect(mock.destroyedBuffers == destroyed + (exact ? 0 : 1), "taking a pooled buffer of the requested size rebuilt a VkBuffer");
+    }
+    Buffer other(context, 4000, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, HostVisible);
+    Expect(!exact || other.Handle() == second, "the other exact size was not kept for its own request");
+    Expect(mock.sizes.at(other.Handle()) == 4000, "a reused buffer of the other size does not have its size");
 }
 
 void LargerClass() {
@@ -468,6 +570,66 @@ void SmallDeviceClasses() {
     const auto made = mock.allocations;
     DeviceBuffer nextArgs(context, 20, indirect);
     Expect(nextArgs.Handle() == tiny && mock.allocations == made, "a 20-byte device request did not reuse the retained 256-byte buffer of its class");
+}
+
+void SlabMetadataFailure() {
+    unsigned rejected = 0;
+    for (int point = 0; point < 16; ++point) {
+        mock = MockDevice{};
+        bool failed = false;
+        {
+            const auto context = mockContext();
+            BufferPool pool(context);
+            SlabSlot slot{};
+            failAfterMap = point;
+            try {
+                slot = pool.TakeSlot(context, 1, 512, false);
+            } catch (const std::bad_alloc&) {
+                failed = true;
+                ++rejected;
+            }
+            SetAllocationFailureCountdown(-1);
+            failAfterMap = -1;
+            if (failed) {
+                Expect(mock.allocations == 1, "metadata failure did not follow a successful Vulkan allocation");
+                Expect(mock.frees == 1 && mock.liveBytes == 0, "metadata failure leaked the slab's device memory at allocation " + std::to_string(point));
+                Expect(mock.maps == 1 && mock.unmaps == 1, "metadata failure did not unmap its slab");
+                Expect(pool.SlabBlocks() == 0, "metadata failure published an unusable slab");
+                slot = pool.TakeSlot(context, 1, 512, false);
+            }
+            Expect(slot.mapping != nullptr, "slab retry did not return mapped memory");
+            pool.PutSlot(slot.memory, slot.offset);
+        }
+        Expect(mock.liveBytes == 0 && mock.allocations == mock.frees, "metadata failure retained device memory after pool destruction");
+        if (!failed) {
+            Expect(rejected != 0, "slab metadata allocation failures were not exercised");
+            std::printf("slab metadata failures checked: %u\n", rejected);
+            return;
+        }
+    }
+    Expect(false, "slab allocation never reached the success control");
+}
+
+void SlabMapFailure() {
+    mock = MockDevice{};
+    {
+        const auto context = mockContext();
+        BufferPool pool(context);
+        mock.mapResult = VK_ERROR_MEMORY_MAP_FAILED;
+        bool failed = false;
+        try {
+            static_cast<void>(pool.TakeSlot(context, 1, 512, false));
+        } catch (const std::runtime_error& error) {
+            failed = std::strstr(error.what(), "vkMapMemory buffer slab") != nullptr;
+        }
+        Expect(failed, "the slab mapping failure was not reported");
+        Expect(mock.allocations == 1 && mock.frees == 1 && mock.liveBytes == 0, "a failed slab mapping did not release exactly its allocation");
+        Expect(mock.maps == 0 && mock.unmaps == 0 && pool.SlabBlocks() == 0, "a failed mapping published a slab or unmapped invalid memory");
+        mock.mapResult = VK_SUCCESS;
+        const auto slot = pool.TakeSlot(context, 1, 512, false);
+        pool.PutSlot(slot.memory, slot.offset);
+    }
+    Expect(mock.liveBytes == 0 && mock.allocations == mock.frees && mock.maps == mock.unmaps, "a failed mapping made a later slab leak");
 }
 
 void Slabs() {
@@ -728,14 +890,11 @@ void CacheReclaimRecovery() {
     Expect(BufferPool::ReclaimTarget(4 * MiB) == 260 * MiB, "a 4 MiB request does not ask the caches for 256 MiB on top of itself");
     Expect(BufferPool::ReclaimTarget(512 * MiB) == 1024 * MiB, "a 512 MiB request does not ask the caches for twice its size");
     constexpr auto usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-    BufferPool::SetCacheReclaim(mockCacheReclaim);
-    struct Reset {
-        ~Reset() { BufferPool::SetCacheReclaim(nullptr); }
-    } reset;
     mock = MockDevice{};
     reclaimMock = ReclaimMock{};
     {
         auto context = mockContext();
+        context.cacheReclaim = mockCacheReclaim;
         { DeviceBuffer idle(context, 2 * MiB, usage); }
         ExternalAllocation(10 * MiB);
         mock.limit = 12 * MiB;
@@ -754,6 +913,7 @@ void CacheReclaimRecovery() {
     reclaimMock = ReclaimMock{};
     {
         auto context = mockContext();
+        context.cacheReclaim = mockCacheReclaim;
         ExternalAllocation(10 * MiB);
         mock.limit = 12 * MiB;
         const auto before = mock.attempts;
@@ -769,6 +929,7 @@ void CacheReclaimRecovery() {
     reclaimMock = ReclaimMock{};
     {
         auto context = mockContext();
+        context.cacheReclaim = mockCacheReclaim;
         mock.limit = 2 * MiB;
         const auto before = mock.attempts;
         std::string failure;
@@ -790,6 +951,73 @@ void CacheReclaimRecovery() {
         Expect(reclaimMock.requests == 1 && failure.find("Vulkan result -4") != std::string::npos, "a device loss asked the caches for memory");
     }
     Expect(mock.liveBytes == 0 && mock.liveBuffers.empty(), "the failed cache release leaked a resource");
+}
+
+void ImageCacheReclaim() {
+    mock = MockDevice{};
+    reclaimMock = ReclaimMock{};
+    auto context = hostBudgetContext();
+    context.cacheReclaim = mockCacheReclaim;
+    mock.heapBudget = 1620 * MiB;
+    mock.otherUsage = 200 * MiB;
+    VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    allocation.allocationSize = 8 * MiB;
+    allocation.memoryTypeIndex = 0;
+    const auto refuse = [&](std::initializer_list<VkResult> results) {
+        ExternalAllocation(4 * MiB);
+        mock.results = results;
+        const auto requests = reclaimMock.requests;
+        const auto memory = AllocateImageMemory(context, allocation, 3, "vkAllocateMemory texture");
+        Expect(reclaimMock.requests == requests + 1 && reclaimMock.external == VK_NULL_HANDLE, "a texture refused device memory did not release the texture caches before retrying");
+        const auto type = mock.memoryTypes.at(memory);
+        mockFreeMemory(VK_NULL_HANDLE, memory, nullptr);
+        return type;
+    };
+    Expect(refuse({VK_ERROR_OUT_OF_DEVICE_MEMORY}) == 0, "a texture was placed in host memory although releasing the texture caches made room in device memory");
+    Expect(refuse({VK_ERROR_OUT_OF_DEVICE_MEMORY, VK_ERROR_OUT_OF_DEVICE_MEMORY}) == 1, "a texture still refused device memory after releasing the texture caches was not placed in host memory");
+    Expect(mock.liveBytes == 0, "a texture allocation leaked memory");
+}
+
+void AllocationFailureReportsHeapBudgets() {
+    mock = MockDevice{};
+    diagnosticBudgetQueries = 0;
+    std::string failure;
+    std::uint64_t allocationPathBudgetQueries = 0;
+    {
+        auto context = mockContext();
+        context.physical = reinterpret_cast<VkPhysicalDevice>(std::uintptr_t{1});
+        context.memoryProperties2 = mockDiagnosticMemoryProperties2;
+        context.memory.memoryHeapCount = 2;
+        context.bufferPool = std::make_shared<BufferPool>(context);
+        const auto beforeAllocation = diagnosticBudgetQueries;
+        mock.results = {VK_ERROR_DEVICE_LOST, VK_ERROR_DEVICE_LOST};
+        try {
+            DeviceBuffer buffer(context, 4 * MiB, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        } catch (const std::exception& error) {
+            failure = error.what();
+        }
+        allocationPathBudgetQueries = diagnosticBudgetQueries - beforeAllocation;
+    }
+    Expect(failure.find("heap 0 1500/2000 MiB") != std::string::npos, "allocation failure omitted the first heap's memory budget");
+    Expect(failure.find("heap 1 2500/3000 MiB") != std::string::npos, "allocation failure omitted a later heap's memory budget");
+    Expect(allocationPathBudgetQueries == 3, "allocation failure did not query the memory budget for type selection and the diagnostics of both refused memory types");
+
+    mock = MockDevice{};
+    diagnosticBudgetQueries = 0;
+    failure.clear();
+    {
+        auto context = mockContext();
+        context.physical = reinterpret_cast<VkPhysicalDevice>(std::uintptr_t{1});
+        context.memory.memoryHeapCount = 2;
+        mock.results = {VK_ERROR_DEVICE_LOST, VK_ERROR_DEVICE_LOST};
+        try {
+            DeviceBuffer buffer(context, 4 * MiB, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        } catch (const std::exception& error) {
+            failure = error.what();
+        }
+    }
+    Expect(failure.find("heap 0") == std::string::npos && failure.find("heap 1") == std::string::npos, "allocation failure emitted heap data when VK_EXT_memory_budget was unavailable");
+    Expect(diagnosticBudgetQueries == 0, "missing-extension fallback attempted a memory budget query");
 }
 
 void SuccessfulAllocationKeepsPool() {
@@ -824,16 +1052,67 @@ void PartialSlabDoesNotRetry() {
     Expect(mock.liveBytes == 0 && mock.liveBuffers.empty(), "partial slab failure leaked a resource");
 }
 
+void DeviceBindingFailures() {
+    constexpr auto bytes = 3 * MiB;
+    constexpr auto usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    for (const auto result : {VK_ERROR_OUT_OF_HOST_MEMORY, VK_ERROR_OUT_OF_DEVICE_MEMORY}) {
+        mock = MockDevice{};
+        {
+            auto context = mockContext();
+            mock.bindResult = result;
+            bool threw = false;
+            try {
+                DeviceBuffer failed(context, bytes, usage);
+            } catch (const std::runtime_error& error) {
+                threw = std::string(error.what()).find("Vulkan result " + std::to_string(result)) != std::string::npos;
+            }
+            const auto retained = mock.liveBytes;
+            Expect(threw && mock.binds == 1, "a failed device buffer bind lost its error");
+            Expect(retained == 0 && mock.liveBuffers.empty(), "a failed device buffer was retained for reuse");
+            mock.bindResult = VK_SUCCESS;
+            unsigned invalid = 0;
+            for (unsigned retry = 0; retry < 3; ++retry) {
+                DeviceBuffer recovered(context, bytes, usage);
+                if (!mock.bound.contains(recovered.Handle())) ++invalid;
+            }
+            Expect(invalid == 0, "a retry reused an unbound device buffer");
+            Expect(mock.binds == 2 && mock.allocations == 2, "successfully bound device buffers stopped being reused");
+            std::printf("device bind result=%d retained=%llu invalid retries=%u binds=%u\n", static_cast<int>(result), static_cast<unsigned long long>(retained), invalid, mock.binds);
+        }
+        Expect(mock.liveBytes == 0 && mock.liveBuffers.empty(), "device bind recovery leaked a resource");
+    }
 }
 
-int main() {
+}
+
+int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--small-device-retention") {
+            SmallDeviceRetention();
+            return failures == 0 ? 0 : 1;
+        }
+        if (argc == 2) {
+            const bool host = std::strcmp(argv[1], "--slab-return-host") == 0;
+            Expect(host || std::strcmp(argv[1], "--slab-return-device") == 0, "unknown slab return test mode");
+            AgcDriver::Tests::SlabReturnWithoutAllocation(mockContext(), host ? 1u : 0u);
+            Expect(mock.liveBytes == 0, "slab return test leaked memory");
+            return failures == 0 ? 0 : 1;
+        }
+        AgcDriver::Tests::SlabReturnWithoutAllocation(mockContext(), 0);
+        AgcDriver::Tests::SlabReturnWithoutAllocation(mockContext(), 1);
+        Expect(mock.liveBytes == 0, "slab return test leaked memory");
         SizeClassesAndDirections();
         LargerClass();
         KeptUntilFence();
+        SmallDeviceRetention();
+        SmallDeviceOwnTier();
+        ExactSizeReuse();
         Budget();
         AddressAndHostUnchanged();
         SmallDeviceClasses();
+        SlabMetadataFailure();
+        SlabMapFailure();
+        DeviceBindingFailures();
         Slabs();
         for (const auto result : {VK_ERROR_OUT_OF_DEVICE_MEMORY, VK_ERROR_OUT_OF_HOST_MEMORY}) {
             AllocationRecovery(result, false);
@@ -845,6 +1124,7 @@ int main() {
         ReclaimSlabs();
         AllocationFailure(VK_ERROR_DEVICE_LOST, VK_ERROR_DEVICE_LOST, true);
         AllocationFailure(VK_ERROR_OUT_OF_DEVICE_MEMORY, VK_ERROR_DEVICE_LOST, true);
+        AllocationFailureReportsHeapBudgets();
         SuccessfulAllocationKeepsPool();
         PartialSlabDoesNotRetry();
         SystemAndOverflowTypes();
@@ -855,6 +1135,7 @@ int main() {
         VramTrimsPool();
         VramIntegratedKeepsPool();
         CacheReclaimRecovery();
+        ImageCacheReclaim();
         HostPlacement();
         RefusedDevicePlacement();
         AttachmentReclaim();

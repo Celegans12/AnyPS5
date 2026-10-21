@@ -205,7 +205,8 @@ int APS5_VABI sceHttpUriEscape(char* out, size_t* require, size_t prepare, const
     std::string escaped;
     for (const char* c = in; *c; ++c) {
         const auto value = static_cast<unsigned char>(*c);
-        if (std::isalnum(value) || value == '-' || value == '_' || value == '.' || value == '~') {
+        if ((value >= 'a' && value <= 'z') || (value >= 'A' && value <= 'Z') || (value >= '0' && value <= '9')
+            || value == '-' || value == '_' || value == '.' || value == '~') {
             escaped.push_back(*c);
         } else {
             escaped.push_back('%');
@@ -312,6 +313,40 @@ int APS5_VABI sceHttpUriParse(SceHttpUriElement* out, const char* src_url, void*
     out->query = strings[5];
     out->fragment = strings[6];
     out->port = parts.port;
+    return 0;
+}
+
+int APS5_VABI sceHttpUriCopy(SceHttpUriElement* out, const SceHttpUriElement* src, void* pool, size_t prepare, size_t* require) {
+    if (!src) return ERROR_INVALID_URL;
+    const bool write = out && pool;
+    if (!write && !require) return ERROR_INVALID_VALUE;
+
+    const char* const fields[] = {src->scheme, src->hostname, src->path, src->username, src->password};
+    SceHttpUriElement copy{};
+    char** const slots[] = {&copy.scheme, &copy.hostname, &copy.path, &copy.username, &copy.password};
+    if (write) std::memset(pool, 0, prepare);
+    size_t used = 0;
+    for (size_t i = 0; i < 5; ++i) {
+        const size_t length = fields[i] ? std::strlen(fields[i]) : 0;
+        const size_t needed = length + 1;
+        if (write) {
+            if (needed > prepare - used) {
+                *out = {};
+                std::memset(pool, 0, prepare);
+                return ERROR_OUT_OF_MEMORY;
+            }
+            char* next = static_cast<char*>(pool) + used;
+            if (length != 0) std::memcpy(next, fields[i], length);
+            next[length] = '\0';
+            *slots[i] = next;
+        }
+        used += needed;
+    }
+    if (write) {
+        copy.port = src->port;
+        *out = copy;
+    }
+    if (require) *require = used;
     return 0;
 }
 

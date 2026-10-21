@@ -123,9 +123,63 @@ void SetFpWord(GuestMcontext& m, std::size_t offset, std::uint32_t value) {
     std::memcpy(reinterpret_cast<unsigned char*>(m.fpstate) + offset, &value, sizeof(value));
 }
 
+char* AppendText(char* output, const char* text) {
+    while (*text != '\0') *output++ = *text++;
+    return output;
+}
+
+char* AppendHex(char* output, std::uint64_t value, std::size_t digits) {
+    static constexpr char hexDigits[] = "0123456789abcdef";
+    while (digits != 0) {
+        --digits;
+        *output++ = hexDigits[(value >> (digits * 4)) & 0xf];
+    }
+    return output;
+}
+
+char* AppendHexField(char* output, const char* name, std::uint64_t value, std::size_t digits) {
+    return AppendHex(AppendText(output, name), value, digits);
+}
+
+void LogGuestExceptionContext(int signum, const GuestMcontext& context) {
+    char buffer[768];
+    char* output = AppendText(buffer, "[exception] guest context");
+    output = AppendHexField(output, " signal=0x", static_cast<std::uint32_t>(signum), 2);
+    output = AppendHexField(output, " rip=0x", context.rip, 16);
+    output = AppendHexField(output, " rsp=0x", context.rsp, 16);
+    output = AppendHexField(output, " rflags=0x", context.rflags, 16);
+    output = AppendHexField(output, " trap=0x", context.trapno, 8);
+    output = AppendHexField(output, " error=0x", context.err, 16);
+    output = AppendHexField(output, " fault=0x", context.addr, 16);
+    output = AppendHexField(output, " rax=0x", context.rax, 16);
+    output = AppendHexField(output, " rbx=0x", context.rbx, 16);
+    output = AppendHexField(output, " rcx=0x", context.rcx, 16);
+    output = AppendHexField(output, " rdx=0x", context.rdx, 16);
+    output = AppendHexField(output, " rsi=0x", context.rsi, 16);
+    output = AppendHexField(output, " rdi=0x", context.rdi, 16);
+    output = AppendHexField(output, " rbp=0x", context.rbp, 16);
+    output = AppendHexField(output, " r8=0x", context.r8, 16);
+    output = AppendHexField(output, " r9=0x", context.r9, 16);
+    output = AppendHexField(output, " r10=0x", context.r10, 16);
+    output = AppendHexField(output, " r11=0x", context.r11, 16);
+    output = AppendHexField(output, " r12=0x", context.r12, 16);
+    output = AppendHexField(output, " r13=0x", context.r13, 16);
+    output = AppendHexField(output, " r14=0x", context.r14, 16);
+    output = AppendHexField(output, " r15=0x", context.r15, 16);
+    *output++ = '\n';
+#ifdef _WIN32
+    DWORD written = 0;
+    WriteFile(GetStdHandle(STD_ERROR_HANDLE), buffer, static_cast<DWORD>(output - buffer), &written, nullptr);
+#else
+    const auto written = write(STDERR_FILENO, buffer, static_cast<std::size_t>(output - buffer));
+    (void)written;
+#endif
+}
+
 void CallHandler(GuestExceptionHandler handler, int signum, GuestUcontext& ucontext) {
     auto& m = ucontext.mcontext;
     const std::uint32_t mxcsrMask = FpWord(m, MxcsrMaskOffset);
+    LogGuestExceptionContext(signum, m);
     handler(signum, &ucontext);
     SetFpWord(m, MxcsrOffset, FpWord(m, MxcsrOffset) & (mxcsrMask != 0 ? mxcsrMask : DefaultMxcsrMask));
     SetFpWord(m, MxcsrMaskOffset, mxcsrMask);
@@ -515,11 +569,11 @@ int APS5_VABI sceKernelRaiseException(Pthread thread, int signum) {
 }
 
 void APS5_VABI sceKernelDebugRaiseException(int c1, int c2) {
-  APS5_LOG_OUT("sceKernelDebugRaiseException c1=%d c2=%d", c1, c2);
+    APS5_LOG_OUT("sceKernelDebugRaiseException c1=0x%08x c2=0x%08x caller=%p", static_cast<unsigned>(c1), static_cast<unsigned>(c2), __builtin_return_address(0));
 }
 
 void APS5_VABI sceKernelDebugRaiseExceptionOnReleaseMode(int c1, int c2) {
-  APS5_LOG_OUT("sceKernelDebugRaiseExceptionOnReleaseMode c1=%d c2=%d", c1, c2);
+    APS5_LOG_OUT("sceKernelDebugRaiseExceptionOnReleaseMode c1=0x%08x c2=0x%08x caller=%p", static_cast<unsigned>(c1), static_cast<unsigned>(c2), __builtin_return_address(0));
 }
 
 }

@@ -6,6 +6,7 @@
 extern "C" {
 const std::uint8_t* APS5_VABI sceCesRefersUcsProfileCp1252(void);
 const std::uint8_t* APS5_VABI sceCesRefersUcsProfileCp1251(void);
+const std::uint8_t* APS5_VABI sceCesRefersUcsProfileCp1250(void);
 int APS5_VABI sceCesMbcsUcsContextInit(void*, const void*);
 void* APS5_VABI sceCesUcsProfileInitEucJpCp51932(void*);
 int APS5_VABI sceCesUtf8StrToMbcsStr(void*, const std::uint8_t*, std::uint32_t, std::uint32_t*, std::uint8_t*, std::uint32_t, std::uint32_t*);
@@ -114,6 +115,37 @@ int main() {
     Require(Utf8ToSbc(cyrillic, "\xC3\xA9", 2) == unassignedCode);
     Require(Utf8ToSbc(profile, "\xD0\x90", 2) == unassignedCode);
 
+    const std::uint8_t* latin2 = sceCesRefersUcsProfileCp1250();
+    Require(latin2 != nullptr && latin2 == sceCesRefersUcsProfileCp1250() && latin2 != profile && latin2 != cyrillic);
+    RequireSbcToUtf8(latin2, 'A', "A");
+    RequireSbcToUtf8(latin2, 0x80, "\xE2\x82\xAC");
+    RequireSbcToUtf8(latin2, 0x81, "\xC2\x81");
+    RequireSbcToUtf8(latin2, 0x8A, "\xC5\xA0");
+    RequireSbcToUtf8(latin2, 0xA3, "\xC5\x81");
+    RequireSbcToUtf8(latin2, 0xA5, "\xC4\x84");
+    RequireSbcToUtf8(latin2, 0xAF, "\xC5\xBB");
+    RequireSbcToUtf8(latin2, 0xE9, "\xC3\xA9");
+    RequireSbcToUtf8(latin2, 0xFF, "\xCB\x99");
+    RequireUtf8ToSbc(latin2, "\xC5\xA0", 0x8A);
+    RequireUtf8ToSbc(latin2, "\xC5\x81", 0xA3);
+    RequireUtf8ToSbc(latin2, "\xC3\xA9", 0xE9);
+    for (int sbc = 1; sbc < 256; ++sbc) {
+        std::uint8_t cp[4] = {};
+        std::uint32_t cpLength = 0;
+        std::uint8_t back = 0;
+        Require(sceCesSbcToUtf8(latin2, static_cast<std::uint8_t>(sbc), cp, sizeof(cp), &cpLength) == 0);
+        Require(sceCesUtf8ToSbc(cp, cpLength, &cpLength, latin2, &back) == 0 && back == sbc);
+    }
+    Require(Utf8ToSbc(latin2, "\xD0\x90", 2) == unassignedCode);
+    char latin2Context[256] = {};
+    Require(sceCesMbcsUcsContextInit(latin2Context, latin2) == 0);
+    std::uint8_t latin2Back[16] = {};
+    std::uint32_t latin2Used = 0;
+    std::uint32_t latin2Produced = 0;
+    Require(sceCesMbcsStrToUtf8Str(latin2Context, reinterpret_cast<const std::uint8_t*>("\x80\xA3\xFF"), 3, &latin2Used, latin2Back, sizeof(latin2Back), &latin2Produced) == 0);
+    Require(latin2Used == 3 && latin2Produced == 7 && std::memcmp(latin2Back, "\xE2\x82\xAC\xC5\x81\xCB\x99", 7) == 0);
+    Require(sceCesMbcsStrGetUtf8Len(latin2Context, reinterpret_cast<const std::uint8_t*>("\x80\xA3\xFF"), 3, &latin2Used, &latin2Produced) == 0 && latin2Produced == 7);
+
     char context[256] = {};
     Require(sceCesMbcsUcsContextInit(context, cyrillic) == 0);
     Require(sceCesMbcsUcsContextInit(nullptr, cyrillic) == invalidParameter);
@@ -188,6 +220,102 @@ int main() {
         }
     }
     Require(assigned == 7336);
+
+    std::uint16_t supplementary = 0;
+    Require(sceCesEucJpToUcs2(eucJp, reinterpret_cast<const std::uint8_t*>("\x8F\xA2\xAF"), 3, &used, &supplementary) == 0 && used == 3 && supplementary == 0x02D8);
+    Require(sceCesEucJpToUcs2(eucJp, reinterpret_cast<const std::uint8_t*>("\x8F\xA2"), 2, &used, &supplementary) == srcBufferEnd);
+    Require(sceCesEucJpToUcs2(eucJp, reinterpret_cast<const std::uint8_t*>("\x8F\x41\xA1"), 3, &used, &supplementary) == invalidEncode);
+    Require(sceCesEucJpToUcs2(eucJp, reinterpret_cast<const std::uint8_t*>("\x8F\xA2\x41"), 3, &used, &supplementary) == invalidEncode);
+    Require(sceCesEucJpToUcs2(eucJp, reinterpret_cast<const std::uint8_t*>("\x8F\xA1\xA1"), 3, &used, &supplementary) == unassignedCode);
+    Require(sceCesEucJpToUcs2(eucJp, reinterpret_cast<const std::uint8_t*>("\x8F\xF5\xA1"), 3, &used, &supplementary) == unassignedCode);
+    const std::uint16_t supplementaryText[] = {0x02D8, 0x0386, 0x0402, 0x6600, 0};
+    Require(sceCesUcs2StrToMbcsStr(eucContext, supplementaryText, 5, &used, mbcs, sizeof(mbcs), &produced) == 0);
+    Require(used == 4 && produced == 11 && std::memcmp(mbcs, "\x8F\xA2\xAF\x8F\xA6\xE1\x8F\xA7\xC2\xFA\xB4", 11) == 0);
+    Require(sceCesUcs2StrGetMbcsLen(eucContext, supplementaryText, 5, &used, &produced) == 0 && produced == 11);
+    std::uint16_t supplementaryBack[8] = {};
+    Require(sceCesMbcsStrToUcs2Str(eucContext, mbcs, 11, &used, supplementaryBack, 8, &produced) == 0);
+    Require(used == 11 && produced == 4 && supplementaryBack[0] == 0x02D8 && supplementaryBack[1] == 0x0386 && supplementaryBack[2] == 0x0402 && supplementaryBack[3] == 0x6600);
+    Require(sceCesMbcsStrGetUcs2Len(eucContext, mbcs, 11, &used, &produced) == 0 && produced == 4);
+    Require(sceCesMbcsStrToUtf8Str(eucContext, mbcs, 11, &used, japaneseBack, sizeof(japaneseBack), &produced) == 0);
+    Require(produced == 9 && std::memcmp(japaneseBack, "\xCB\x98\xCE\x86\xD0\x82\xE6\x98\x80", 9) == 0);
+    Require(sceCesMbcsStrGetUtf8Len(eucContext, mbcs, 11, &used, &produced) == 0 && produced == 9);
+    Require(sceCesMbcsStrToUcs2Str(eucContext, mbcs, 10, &used, supplementaryBack, 8, &produced) == srcBufferEnd);
+    std::uint32_t supplementaryAssigned = 0;
+    for (std::uint32_t lead = 0xA2; lead <= 0xF4; ++lead) {
+        for (std::uint32_t trail = 0xA1; trail <= 0xFE; ++trail) {
+            const std::uint8_t cell[3] = {0x8F, static_cast<std::uint8_t>(lead), static_cast<std::uint8_t>(trail)};
+            std::uint16_t decoded[2] = {};
+            if (sceCesEucJpToUcs2(eucJp, cell, 3, &used, decoded) != 0) continue;
+            ++supplementaryAssigned;
+            decoded[1] = 0;
+            std::uint8_t again[4] = {};
+            std::uint16_t second[2] = {};
+            Require(sceCesUcs2StrToMbcsStr(eucContext, decoded, 2, &used, again, sizeof(again), &produced) == 0);
+            if (produced == 3) Require(again[1] == cell[1] && again[2] == cell[2]);
+            Require(sceCesEucJpToUcs2(eucJp, again, produced, &used, second) == 0 && second[0] == decoded[0]);
+        }
+    }
+    Require(supplementaryAssigned == 6067);
+
+    const auto* sjisSource = reinterpret_cast<const std::uint8_t*>("Go \xEF\xBD\xB1!");
+    Require(sceCesUtf8StrToMbcsStr(sjisContext, sjisSource, 16, &used, mbcs, sizeof(mbcs), &produced) == 0);
+    Require(used == 7 && produced == 5 && std::memcmp(mbcs, "Go \xB1!", 5) == 0);
+    Require(sceCesUtf8StrGetMbcsLen(sjisContext, sjisSource, 16, &used, &produced) == 0 && used == 7 && produced == 5);
+    Require(sceCesUtf8StrToMbcsStr(sjisContext, sjisSource, 16, &used, mbcs, 4, &produced) == dstBufferEnd);
+    Require(sceCesUtf8StrToMbcsStr(sjisContext, reinterpret_cast<const std::uint8_t*>("\xF0\x9F\x98\x80"), 4, &used, mbcs, sizeof(mbcs), &produced) == unassignedCode);
+
+    std::uint8_t sjisBack[16] = {};
+    Require(sceCesMbcsStrToUtf8Str(sjisContext, mbcs, 5, &used, sjisBack, sizeof(sjisBack), &produced) == 0);
+    Require(used == 5 && produced == 7 && std::memcmp(sjisBack, sjisSource, 7) == 0);
+    Require(sceCesMbcsStrGetUtf8Len(sjisContext, mbcs, 5, &used, &produced) == 0 && produced == 7);
+    Require(sceCesMbcsStrToUtf8Str(sjisContext, reinterpret_cast<const std::uint8_t*>("\x82"), 1, &used, sjisBack, sizeof(sjisBack), &produced) == srcBufferEnd);
+    Require(sceCesMbcsStrToUtf8Str(sjisContext, reinterpret_cast<const std::uint8_t*>("\x82\x20"), 2, &used, sjisBack, sizeof(sjisBack), &produced) == invalidEncode);
+    Require(sceCesMbcsStrToUtf8Str(sjisContext, reinterpret_cast<const std::uint8_t*>("\x82\x7F"), 2, &used, sjisBack, sizeof(sjisBack), &produced) == invalidEncode);
+
+    const std::uint16_t sjisUcs2[] = {u'O', u'K', 0xFF9F, 0};
+    Require(sceCesUcs2StrToMbcsStr(sjisContext, sjisUcs2, 4, &used, mbcs, sizeof(mbcs), &produced) == 0);
+    Require(used == 3 && produced == 3 && std::memcmp(mbcs, "OK\xDF", 3) == 0);
+    Require(sceCesUcs2StrGetMbcsLen(sjisContext, sjisUcs2, 4, &used, &produced) == 0 && produced == 3);
+    std::uint16_t sjisWide[8] = {};
+    Require(sceCesMbcsStrToUcs2Str(sjisContext, mbcs, 3, &used, sjisWide, 8, &produced) == 0);
+    Require(used == 3 && produced == 3 && sjisWide[0] == u'O' && sjisWide[1] == u'K' && sjisWide[2] == 0xFF9F);
+    Require(sceCesMbcsStrGetUcs2Len(sjisContext, mbcs, 3, &used, &produced) == 0 && produced == 3);
+
+    Require(sceCesUtf8StrToMbcsStr(sjisContext, japanese, 24, &used, mbcs, sizeof(mbcs), &produced) == 0);
+    Require(used == 24 && produced == 16 && std::memcmp(mbcs, "\x82\xB1\x82\xF1\x82\xC9\x82\xBF\x82\xCD\x93\xFA\x96\x7B\x8C\xEA", 16) == 0);
+    std::uint8_t sjisJapaneseBack[32] = {};
+    Require(sceCesMbcsStrToUtf8Str(sjisContext, mbcs, 16, &used, sjisJapaneseBack, sizeof(sjisJapaneseBack), &produced) == 0 && produced == 24 && std::memcmp(sjisJapaneseBack, japanese, 24) == 0);
+    Require(sceCesMbcsStrToUcs2Str(sjisContext, mbcs, 16, &used, sjisWide, 8, &produced) == 0 && used == 16 && produced == 8 && sjisWide[0] == 0x3053 && sjisWide[5] == 0x65E5 && sjisWide[7] == 0x8A9E);
+    Require(sceCesMbcsStrToUcs2Str(sjisContext, mbcs, 15, &used, sjisWide, 8, &produced) == srcBufferEnd);
+    const std::uint16_t sjisExtensions[] = {0x2460, 0xFF5E, 0x2252, 0};
+    Require(sceCesUcs2StrToMbcsStr(sjisContext, sjisExtensions, 4, &used, mbcs, sizeof(mbcs), &produced) == 0 && produced == 6 && std::memcmp(mbcs, "\x87\x40\x81\x60\x81\xE0", 6) == 0);
+    Require(sceCesMbcsStrToUcs2Str(sjisContext, reinterpret_cast<const std::uint8_t*>("\x85\x40"), 2, &used, sjisWide, 8, &produced) == unassignedCode);
+    Require(sceCesMbcsStrToUcs2Str(sjisContext, reinterpret_cast<const std::uint8_t*>("\x80"), 1, &used, sjisWide, 8, &produced) == invalidEncode);
+    Require(sceCesMbcsStrToUcs2Str(sjisContext, reinterpret_cast<const std::uint8_t*>("\xA0"), 1, &used, sjisWide, 8, &produced) == invalidEncode);
+    Require(sceCesUcs2StrToMbcsStr(sjisContext, yen, 2, &used, mbcs, sizeof(mbcs), &produced) == unassignedCode);
+    Require(sceCesMbcsStrToUcs2Str(sjisContext, reinterpret_cast<const std::uint8_t*>("\xFB\xFC"), 2, &used, sjisWide, 8, &produced) == 0 && used == 2 && produced == 1 && sjisWide[0] == 0x9AD9);
+    Require(sceCesMbcsStrToUcs2Str(sjisContext, reinterpret_cast<const std::uint8_t*>("\xFA\x40"), 2, &used, sjisWide, 8, &produced) == 0 && used == 2 && produced == 1 && sjisWide[0] == 0x2170);
+    Require(sceCesMbcsStrToUcs2Str(sjisContext, reinterpret_cast<const std::uint8_t*>("\xFC\x4B"), 2, &used, sjisWide, 8, &produced) == 0 && used == 2 && produced == 1 && sjisWide[0] == 0x9ED1);
+    Require(sceCesMbcsStrToUcs2Str(sjisContext, reinterpret_cast<const std::uint8_t*>("\xFC\x4C"), 2, &used, sjisWide, 8, &produced) == unassignedCode);
+    Require(sceCesMbcsStrToUcs2Str(sjisContext, reinterpret_cast<const std::uint8_t*>("\xF0\x40"), 2, &used, sjisWide, 8, &produced) == unassignedCode);
+    std::uint32_t sjisAssigned = 0;
+    for (std::uint32_t lead = 0x81; lead <= 0xFC; ++lead) {
+        if (lead > 0x9F && lead < 0xE0) continue;
+        for (std::uint32_t trail = 0x40; trail <= 0xFC; ++trail) {
+            if (trail == 0x7F) continue;
+            const std::uint8_t cell[2] = {static_cast<std::uint8_t>(lead), static_cast<std::uint8_t>(trail)};
+            std::uint16_t decoded[2] = {};
+            if (sceCesMbcsStrToUcs2Str(sjisContext, cell, 2, &used, decoded, 2, &produced) != 0) continue;
+            ++sjisAssigned;
+            decoded[1] = 0;
+            std::uint8_t again[4] = {};
+            std::uint16_t second[2] = {};
+            Require(sceCesUcs2StrToMbcsStr(sjisContext, decoded, 2, &used, again, sizeof(again), &produced) == 0 && produced == 2);
+            Require(sceCesMbcsStrToUcs2Str(sjisContext, again, 2, &used, second, 2, &produced) == 0 && second[0] == decoded[0]);
+            if (again[0] != cell[0] || again[1] != cell[1]) Require(again[0] < cell[0] || (again[0] == cell[0] && again[1] < cell[1]));
+        }
+    }
+    Require(sjisAssigned == 7724);
 
     Require(sceCesMbcsStrToUtf8Str(context, reinterpret_cast<const std::uint8_t*>("\xC0\xFF"), 2, &used, back, sizeof(back), &produced) == 0);
     Require(produced == 4 && std::memcmp(back, "\xD0\x90\xD1\x8F", 4) == 0);

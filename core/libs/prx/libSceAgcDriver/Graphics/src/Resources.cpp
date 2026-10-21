@@ -158,7 +158,10 @@ DeviceBuffer::DeviceBuffer(const Context& context, std::size_t size, VkBufferUsa
         memory = allocation->memory;
         allocationBytes = allocation->allocationBytes;
         capacity = allocation->bytes;
-        if (allocation->bufferBytes == size) return;
+        if (allocation->bufferBytes == size) {
+            ready = true;
+            return;
+        }
         context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr);
         buffer = VK_NULL_HANDLE;
         try {
@@ -167,6 +170,7 @@ DeviceBuffer::DeviceBuffer(const Context& context, std::size_t size, VkBufferUsa
             release();
             throw;
         }
+        ready = true;
         return;
     }
     try {
@@ -186,7 +190,7 @@ DeviceBuffer::DeviceBuffer(const Context& context, std::size_t size, VkBufferUsa
         {
             const MemoryStats::PoolTierScope tier(MemoryStats::Owner::PoolDevice);
             try {
-                memory = cache->AllocateMemory(allocation, "vkAllocateMemory device buffer", allocation.memoryTypeIndex == deviceType ? context.HostMemoryType(requirements.memoryTypeBits) : std::nullopt, &allocatedType);
+                memory = cache->AllocateMemory(allocation, "vkAllocateMemory device buffer", context.RefusedDeviceMemoryFallback(requirements.memoryTypeBits, allocation.memoryTypeIndex), &allocatedType);
             } catch (const std::runtime_error& error) {
                 const auto overflow = OverflowMemoryType(context.memory, requirements.memoryTypeBits);
                 const auto system = SystemMemoryType(context.memory, requirements.memoryTypeBits);
@@ -209,6 +213,7 @@ DeviceBuffer::DeviceBuffer(const Context& context, std::size_t size, VkBufferUsa
         }
         hostPlaced = allocatedType != deviceType;
         Check(context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, buffer, memory, 0), "vkBindBufferMemory device");
+        ready = true;
     } catch (...) {
         release();
         throw;
@@ -220,7 +225,7 @@ DeviceBuffer::~DeviceBuffer() {
 }
 
 void DeviceBuffer::release() noexcept {
-    if (buffer && memory && cache && !hostPlaced) {
+    if (ready && buffer && memory && cache && !hostPlaced) {
         cache->Put({buffer, memory, nullptr, 0, allocationBytes, capacity, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, false, size});
         return;
     }
@@ -320,7 +325,7 @@ RenderTarget::RenderTarget(const Context& context, const ColorTarget& target, bo
         VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         allocation.allocationSize = requirements.size;
         allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        memory = AllocateAttachmentMemory(context, allocation, requirements.memoryTypeBits, "vkAllocateMemory render target");
+        memory = AllocateImageMemory(context, allocation, requirements.memoryTypeBits, "vkAllocateMemory render target");
         Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, memory, 0), "vkBindImageMemory");
         VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         viewInfo.image = image;
@@ -362,7 +367,9 @@ CommandBatch::CommandBatch(const Context& context) : context(context) {
         allocation.commandBufferCount = 1;
         Check(context.Function<PFN_vkAllocateCommandBuffers>("vkAllocateCommandBuffers")(context.device, &allocation, &commands), "vkAllocateCommandBuffers");
         VkFenceCreateInfo info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-        Check(context.Function<PFN_vkCreateFence>("vkCreateFence")(context.device, &info, nullptr, &fence), "vkCreateFence");
+        VkFence created = VK_NULL_HANDLE;
+        Check(context.Function<PFN_vkCreateFence>("vkCreateFence")(context.device, &info, nullptr, &created), "vkCreateFence");
+        fence = created;
         VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         Check(context.Function<PFN_vkBeginCommandBuffer>("vkBeginCommandBuffer")(commands, &begin), "vkBeginCommandBuffer");
@@ -406,9 +413,9 @@ void CommandBatch::Submit() {
     submission.pCommandBuffers = &commands;
     timing.Mark("command_end");
     Check(context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.queue, 1, &submission, fence), "vkQueueSubmit graphics");
-    timing.Mark("queue_submit");
     pending = true;
     submitted = true;
+    timing.Mark("queue_submit");
 }
 
 void CommandBatch::Wait() {

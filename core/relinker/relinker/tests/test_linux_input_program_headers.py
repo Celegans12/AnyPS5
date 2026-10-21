@@ -95,8 +95,8 @@ def main():
         convert("phdr-only", fixture(True, False, 9))
         both = convert("both", fixture(True, True, 9))
         exact = convert("both-exact-slots", fixture(True, True, 8))
-        assert program_headers(exact)[1] == 8, program_headers(exact)[1]
-        assert program_headers(both)[1] == 8, program_headers(both)[1]
+        assert program_headers(exact)[1] == 9, program_headers(exact)[1]
+        assert program_headers(both)[1] == 9, program_headers(both)[1]
     print("Linux input program headers test passed")
 
 

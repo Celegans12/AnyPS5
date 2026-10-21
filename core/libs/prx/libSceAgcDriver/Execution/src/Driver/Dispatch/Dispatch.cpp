@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/BufferCopy.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DwordPatternFill.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -460,13 +461,13 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
         require(keepVariant != nullptr && keepVariant->shader == registeredShader, "dispatch cache belongs to another registered shader");
         captureMs += phaseTiming.Elapsed();
     } else if (!fromAhead) {
-        shaderMemory = std::make_shared<ShaderMemory>(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter());
+        shaderMemory = std::make_shared<ShaderMemory>(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter(), &QueryPendingSpan);
         if (pipelineRequestsEnabled()) shaderMemory->RecordProbes();
         std::uint64_t forgetAtCapture = 0;
 
         static const bool dumpShaders = std::getenv("APS5_DUMP_SHADERS") != nullptr;
         try {
-            const auto invocation = InvocationFor(snapshot, codeOffset, request);
+            auto invocation = InvocationFor(snapshot, codeOffset, request);
             timing.Mark("prepared_invocation");
 
             const auto waitedBefore = traceCapSync() ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
@@ -474,7 +475,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
             forgetAtCapture = GuestMemory::ForgetSerial();
             capture = [&] {
                 const SampledReadScope sampling(evidenceReads);
-                return shaderMemory->Capture(invocation);
+                return CaptureInvocation(*shaderMemory, snapshot, codeOffset, request, invocation);
             }();
             captured = shaderMemory->Regions();
             request.context.memory = captured;
@@ -579,7 +580,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
                 words += text;
             }
         }
-        std::fprintf(stderr, "[dispatch-io] shader 0x%llx%s\n", static_cast<unsigned long long>(address), words.c_str());
+        std::fprintf(stderr, "[dispatch-io] queue=0x%x submission=%llu shader 0x%llx%s\n", submission.queue, static_cast<unsigned long long>(submission.serial), static_cast<unsigned long long>(address), words.c_str());
     }
 
     const auto rethrow = [&](const std::exception& error) {
@@ -717,6 +718,21 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
     auto* const attachTo = stampValidate() ? nullptr : keepVariant != nullptr ? keepVariant.get() : attachVariant.get();
     bool writersNoted = false;
     const bool noteWrites = writeEvidenceEnabled() || traceCapSync();
+    const auto keysFill = indirectArguments == 0 && !partialLastGroup ? MatchSgprPatternFill(packet, std::span(snapshot.code).subspan(codeOffset), userData, compute) : std::nullopt;
+    const auto filledKeys = keysFill ? KeysFillMemo(keysFill->pattern, false, true) : std::nullopt;
+
+    std::optional<Graphics::DepthPlaneClear> depthPlaneClear;
+    if (indirectArguments == 0 && !partialLastGroup) {
+        if (const auto clear = Graphics::MatchStorageImageClear(std::span(snapshot.code).subspan(codeOffset), userData, compute, groups)) {
+            const auto clearAddress = Graphics::StorageImageClearAddress(*clear);
+            if (clearAddress != 0 && Graphics::DepthSurfaceAt(clearAddress)) {
+                GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Dispatch);
+                std::lock_guard clearLock(GuestMemory::GpuMutex());
+                recordLabelsForPacket(localDevice.get(), submission.queue);
+                depthPlaneClear.emplace(*clear);
+            }
+        }
+    }
 
     for (;;) {
 
@@ -762,6 +778,8 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
             writersNoted = true;
         }
         phaseTiming.Phase(PhaseNoteWriters);
+        auto* const keysRecorder = filledKeys ? Graphics::Recorder::Active() : nullptr;
+        const auto keysNoteBefore = keysRecorder != nullptr ? keysRecorder->LastWriteNote(keysFill->base, keysFill->bytes) : 0;
         try {
             if (recipeHit != nullptr) {
                 VulkanDevice::IndirectOutcome outcome{0, 0};
@@ -785,6 +803,10 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
             if (rethrow(error)) return;
         }
         if (htileMask.address != 0) localDevice->NoteHtileMask(htileMask.address, htileMask.bytes, htileMask.mask, htileMask.value);
+        if (keysRecorder != nullptr && keysRecorder == Graphics::Recorder::Active()) {
+            const auto note = keysRecorder->LastWriteNote(keysFill->base, keysFill->bytes);
+            if (note != 0 && note != keysNoteBefore) Graphics::NoteKeysFillOnGpu(keysFill->base, keysFill->bytes, *filledKeys);
+        }
         if (builtRecipe != nullptr) {
             if (dataHit) {
 

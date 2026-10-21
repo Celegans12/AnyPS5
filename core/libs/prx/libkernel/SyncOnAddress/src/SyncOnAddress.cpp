@@ -158,6 +158,11 @@ int UmtxDeadline(const void* sizeArgument, const void* timeArgument, std::option
     if (timeArgument == nullptr) {
         return 0;
     }
+    if (sizeArgument == nullptr) {
+        const auto usecs = *static_cast<const std::uint32_t*>(timeArgument);
+        deadlineNanos = TimedWait::DeadlineNanos(usecs);
+        return 0;
+    }
     UmtxTime time{{0, 0}, 0, GUEST_CLOCK_REALTIME};
     if (reinterpret_cast<std::uintptr_t>(sizeArgument) <= sizeof(KernelTimespec)) {
         time.timeout = *static_cast<const KernelTimespec*>(timeArgument);
@@ -165,9 +170,6 @@ int UmtxDeadline(const void* sizeArgument, const void* timeArgument, std::option
         time = *static_cast<const UmtxTime*>(timeArgument);
     }
     if (time.timeout.tv_sec < 0 || time.timeout.tv_nsec < 0 || time.timeout.tv_nsec >= NANOS_PER_SECOND) {
-        if (sizeArgument == nullptr) {
-            NotImplemented_nid_no_patch("_umtx_op timeout with size argument 0 that is not a valid timespec");
-        }
         return GUEST_EINVAL;
     }
 
@@ -301,9 +303,7 @@ int APS5_VABI _umtx_op_nid_postfix(void* object, int operation, std::uint64_t va
         default:
             if (operation < 0 || operation >= UMTX_OP_MAX) {
                 error = GUEST_EINVAL;
-            } else if (operation == UMTX_OP_RESERVED1) {
-                NotImplemented_nid_no_patch("_umtx_op operation 1");
-            } else if (operation < UMTX_OP_RESERVED1) {
+            } else if (operation <= UMTX_OP_RESERVED1) {
                 error = GUEST_EOPNOTSUPP;
             } else {
                 NotImplemented_nid_no_patch(("_umtx_op operation " + std::to_string(operation)).c_str());

@@ -293,6 +293,90 @@ OpFunctionEnd
     }
 }
 
+void testLargeFunctionArray() {
+    constexpr std::uint32_t elementCount = 1000;
+    const auto source = std::string(R"(OpCapability Shader
+OpCapability StorageBuffer8BitAccess
+OpExtension "SPV_KHR_8bit_storage"
+OpExtension "SPV_KHR_storage_buffer_storage_class"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %input Block
+OpMemberDecorate %input 0 Offset 0
+OpDecorate %inputBuffer DescriptorSet 0
+OpDecorate %inputBuffer Binding 0
+OpDecorate %secondInputBuffer DescriptorSet 0
+OpDecorate %secondInputBuffer Binding 1
+OpDecorate %output Block
+OpMemberDecorate %output 0 Offset 0
+OpDecorate %outputBuffer DescriptorSet 0
+OpDecorate %outputBuffer Binding 2
+OpDecorate %flag Block
+OpMemberDecorate %flag 0 Offset 0
+OpDecorate %flagBuffer DescriptorSet 0
+OpDecorate %flagBuffer Binding 3
+OpDecorate %array ArrayStride 4
+%void = OpTypeVoid
+%bool = OpTypeBool
+%uint = OpTypeInt 32 0
+%small = OpTypeInt 8 0
+%function = OpTypeFunction %void
+%zero = OpConstant %uint 0
+%scope = OpConstant %uint 2
+%semantics = OpConstant %uint 264
+%length = OpConstant %uint )") + std::to_string(elementCount) + R"(
+%array = OpTypeArray %uint %length
+%arrayPointer = OpTypePointer Function %array
+%arrayPointerStorage = OpTypePointer StorageBuffer %array
+%input = OpTypeStruct %array
+%inputPointer = OpTypePointer StorageBuffer %input
+%flag = OpTypeStruct %uint
+%flagPointer = OpTypePointer StorageBuffer %flag
+%uintPointerStorage = OpTypePointer StorageBuffer %uint
+%output = OpTypeStruct %array
+%outputPointer = OpTypePointer StorageBuffer %output
+%inputBuffer = OpVariable %inputPointer StorageBuffer
+%secondInputBuffer = OpVariable %inputPointer StorageBuffer
+%outputBuffer = OpVariable %outputPointer StorageBuffer
+%flagBuffer = OpVariable %flagPointer StorageBuffer
+%main = OpFunction %void None %function
+%entry = OpLabel
+%local = OpVariable %arrayPointer Function
+%flagPointerValue = OpAccessChain %uintPointerStorage %flagBuffer %zero
+%flagValue = OpLoad %uint %flagPointerValue
+%condition = OpINotEqual %bool %flagValue %zero
+OpSelectionMerge %merge None
+OpBranchConditional %condition %then %else
+%then = OpLabel
+%inputArray = OpAccessChain %arrayPointerStorage %inputBuffer %zero
+%inputValue = OpLoad %array %inputArray
+OpStore %local %inputValue
+OpBranch %merge
+%else = OpLabel
+%secondInputArray = OpAccessChain %arrayPointerStorage %secondInputBuffer %zero
+%secondInputValue = OpLoad %array %secondInputArray
+OpStore %local %secondInputValue
+OpBranch %merge
+%merge = OpLabel
+OpMemoryBarrier %scope %semantics
+%localValue = OpLoad %array %local
+%outputArray = OpAccessChain %arrayPointerStorage %outputBuffer %zero
+OpStore %outputArray %localValue
+OpReturn
+OpFunctionEnd
+)";
+    try {
+        const auto input = assemble(source);
+        const auto output = ShaderRecompiler::ValidateAndOptimizeSpirv(input, Vulkan11, Spirv13, false);
+        spvtools::SpirvTools validator(SPV_ENV_VULKAN_1_1);
+        check(validator.Validate(output), "large function array optimizer output is invalid");
+        check(output.size() < input.size() * 4u, "large function array was scalarized");
+    } catch (const std::exception& error) {
+        check(false, std::string("large function array: ") + error.what());
+    }
+}
+
 std::optional<std::pair<std::uint32_t, std::uint32_t>> storedLaneFunction(const std::vector<std::uint32_t>& words) {
     std::map<std::uint32_t, std::pair<std::uint32_t, std::uint32_t>> values;
     std::set<std::uint32_t> inputs;
@@ -598,90 +682,6 @@ OpFunctionEnd
         check(distinctSelect, "the select on a runtime condition lost its true and false arms");
     } catch (const std::exception& error) {
         check(false, std::string("true and false predicates: ") + error.what());
-    }
-}
-
-void testLargeFunctionArray() {
-    constexpr std::uint32_t elementCount = 1000;
-    const auto source = std::string(R"(OpCapability Shader
-OpCapability StorageBuffer8BitAccess
-OpExtension "SPV_KHR_8bit_storage"
-OpExtension "SPV_KHR_storage_buffer_storage_class"
-OpMemoryModel Logical GLSL450
-OpEntryPoint GLCompute %main "main"
-OpExecutionMode %main LocalSize 1 1 1
-OpDecorate %input Block
-OpMemberDecorate %input 0 Offset 0
-OpDecorate %inputBuffer DescriptorSet 0
-OpDecorate %inputBuffer Binding 0
-OpDecorate %secondInputBuffer DescriptorSet 0
-OpDecorate %secondInputBuffer Binding 1
-OpDecorate %output Block
-OpMemberDecorate %output 0 Offset 0
-OpDecorate %outputBuffer DescriptorSet 0
-OpDecorate %outputBuffer Binding 2
-OpDecorate %flag Block
-OpMemberDecorate %flag 0 Offset 0
-OpDecorate %flagBuffer DescriptorSet 0
-OpDecorate %flagBuffer Binding 3
-OpDecorate %array ArrayStride 4
-%void = OpTypeVoid
-%bool = OpTypeBool
-%uint = OpTypeInt 32 0
-%small = OpTypeInt 8 0
-%function = OpTypeFunction %void
-%zero = OpConstant %uint 0
-%scope = OpConstant %uint 2
-%semantics = OpConstant %uint 264
-%length = OpConstant %uint )") + std::to_string(elementCount) + R"(
-%array = OpTypeArray %uint %length
-%arrayPointer = OpTypePointer Function %array
-%arrayPointerStorage = OpTypePointer StorageBuffer %array
-%input = OpTypeStruct %array
-%inputPointer = OpTypePointer StorageBuffer %input
-%flag = OpTypeStruct %uint
-%flagPointer = OpTypePointer StorageBuffer %flag
-%uintPointerStorage = OpTypePointer StorageBuffer %uint
-%output = OpTypeStruct %array
-%outputPointer = OpTypePointer StorageBuffer %output
-%inputBuffer = OpVariable %inputPointer StorageBuffer
-%secondInputBuffer = OpVariable %inputPointer StorageBuffer
-%outputBuffer = OpVariable %outputPointer StorageBuffer
-%flagBuffer = OpVariable %flagPointer StorageBuffer
-%main = OpFunction %void None %function
-%entry = OpLabel
-%local = OpVariable %arrayPointer Function
-%flagPointerValue = OpAccessChain %uintPointerStorage %flagBuffer %zero
-%flagValue = OpLoad %uint %flagPointerValue
-%condition = OpINotEqual %bool %flagValue %zero
-OpSelectionMerge %merge None
-OpBranchConditional %condition %then %else
-%then = OpLabel
-%inputArray = OpAccessChain %arrayPointerStorage %inputBuffer %zero
-%inputValue = OpLoad %array %inputArray
-OpStore %local %inputValue
-OpBranch %merge
-%else = OpLabel
-%secondInputArray = OpAccessChain %arrayPointerStorage %secondInputBuffer %zero
-%secondInputValue = OpLoad %array %secondInputArray
-OpStore %local %secondInputValue
-OpBranch %merge
-%merge = OpLabel
-OpMemoryBarrier %scope %semantics
-%localValue = OpLoad %array %local
-%outputArray = OpAccessChain %arrayPointerStorage %outputBuffer %zero
-OpStore %outputArray %localValue
-OpReturn
-OpFunctionEnd
-)";
-    try {
-        const auto input = assemble(source);
-        const auto output = ShaderRecompiler::ValidateAndOptimizeSpirv(input, Vulkan11, Spirv13, false);
-        spvtools::SpirvTools validator(SPV_ENV_VULKAN_1_1);
-        check(validator.Validate(output), "large function array optimizer output is invalid");
-        check(output.size() < input.size() * 4u, "large function array was scalarized");
-    } catch (const std::exception& error) {
-        check(false, std::string("large function array: ") + error.what());
     }
 }
 

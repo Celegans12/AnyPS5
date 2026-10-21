@@ -131,6 +131,20 @@ int APS5_VABI sceHttpAddRequestHeader(int id, const char* name, const char* valu
     return 0;
 }
 
+int APS5_VABI sceHttpAuthCacheFlush(int httpCtxId) {
+    std::lock_guard lock(g_stateMutex);
+    if (g_contexts.empty()) return ERROR_BEFORE_INIT;
+    if (!g_contexts.contains(httpCtxId)) return ERROR_INVALID_ID;
+    return 0;
+}
+
+int APS5_VABI sceHttpCookieFlush(int httpCtxId) {
+    std::lock_guard lock(g_stateMutex);
+    if (g_contexts.empty()) return ERROR_BEFORE_INIT;
+    if (!g_contexts.contains(httpCtxId)) return ERROR_INVALID_ID;
+    return 0;
+}
+
 int APS5_VABI sceHttpCreateConnection(int tmpl_id, const char* server_name, const char* scheme, uint16_t port, int enable_keep_alive) {
     (void)tmpl_id;
     (void)server_name;

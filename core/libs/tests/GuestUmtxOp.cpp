@@ -123,19 +123,20 @@ static void TimesOutWhileTheValueMatches() {
 static void RejectsAnInvalidTimeout() {
     std::uint32_t word = 1;
     KernelTimespec negative{-1, 0};
-    Require(FailsWith(Umtx(&word, UMTX_OP_WAIT_UINT, 1, SizeOf(sizeof(negative)), &negative), GUEST_EINVAL));
     KernelTimespec tooManyNanos{0, 1000000000};
-    Require(FailsWith(Umtx(&word, UMTX_OP_WAIT_UINT, 1, SizeOf(sizeof(tooManyNanos)), &tooManyNanos), GUEST_EINVAL));
     for (const int operation : {UMTX_OP_WAIT, UMTX_OP_WAIT_UINT}) {
-        bool threw = false;
-        try { Umtx(&word, operation, 1, nullptr, &tooManyNanos); }
-        catch (const std::runtime_error&) { threw = true; }
-        Require(threw);
-        threw = false;
-        try { Umtx(&word, operation, 1, nullptr, &negative); }
-        catch (const std::runtime_error&) { threw = true; }
-        Require(threw);
+        Require(FailsWith(Umtx(&word, operation, 1, SizeOf(sizeof(negative)), &negative), GUEST_EINVAL));
+        Require(FailsWith(Umtx(&word, operation, 1, SizeOf(sizeof(tooManyNanos)), &tooManyNanos), GUEST_EINVAL));
     }
+    struct {
+        std::uint32_t usecs = 20000;
+        std::uint32_t zero32 = 0;
+        std::int64_t zero64 = 0;
+    } zeroNeighbours;
+    auto start = std::chrono::steady_clock::now();
+    Require(FailsWith(Umtx(&word, UMTX_OP_WAIT_UINT, 1, nullptr, &zeroNeighbours), GUEST_ETIMEDOUT));
+    Require(std::chrono::steady_clock::now() - start >= std::chrono::milliseconds(15));
+    Require(std::chrono::steady_clock::now() - start < std::chrono::seconds(1));
     UmtxTime negativeNanos{{0, -1}, 0, CLOCK_MONOTONIC_ID};
     Require(FailsWith(Umtx(&word, UMTX_OP_WAIT_UINT, 1, SizeOf(sizeof(negativeNanos)), &negativeNanos), GUEST_EINVAL));
 }
@@ -146,7 +147,7 @@ static void WakeReleasesAWaiterWithoutAValueChange() {
     int result = -2;
     std::thread waiter([&] {
         KernelTimespec failsafe = FailsafeTimeout();
-        result = Umtx(&value, UMTX_OP_WAIT, 1, nullptr, &failsafe);
+        result = Umtx(&value, UMTX_OP_WAIT, 1, SizeOf(sizeof(failsafe)), &failsafe);
         ++finished;
     });
     while (finished.load() == 0) {
@@ -171,14 +172,14 @@ static void WakeHonoursTheCountAndTheAddress() {
         waiters.emplace_back([&, i] {
             KernelTimespec failsafe = FailsafeTimeout();
             ++started;
-            results[i] = Umtx(&word, UMTX_OP_WAIT_UINT_PRIVATE, 1, nullptr, &failsafe);
+            results[i] = Umtx(&word, UMTX_OP_WAIT_UINT_PRIVATE, 1, SizeOf(sizeof(failsafe)), &failsafe);
             ++finished;
         });
     }
     std::thread otherWaiter([&] {
         KernelTimespec failsafe = FailsafeTimeout();
         ++started;
-        otherResult = Umtx(&other, UMTX_OP_WAIT_UINT, 1, nullptr, &failsafe);
+        otherResult = Umtx(&other, UMTX_OP_WAIT_UINT, 1, SizeOf(sizeof(failsafe)), &failsafe);
         ++otherFinished;
     });
     AwaitCount(started, 5);
@@ -227,20 +228,20 @@ static void NwakeWakesEveryWaiterOnEachListedAddress() {
         waiters.emplace_back([&, i] {
             KernelTimespec failsafe = FailsafeTimeout();
             ++started;
-            results[i] = Umtx(&first, UMTX_OP_WAIT_UINT_PRIVATE, 1, nullptr, &failsafe);
+            results[i] = Umtx(&first, UMTX_OP_WAIT_UINT_PRIVATE, 1, SizeOf(sizeof(failsafe)), &failsafe);
             ++finished;
         });
     }
     waiters.emplace_back([&] {
         KernelTimespec failsafe = FailsafeTimeout();
         ++started;
-        results[3] = Umtx(&second, UMTX_OP_WAIT, 1, nullptr, &failsafe);
+        results[3] = Umtx(&second, UMTX_OP_WAIT, 1, SizeOf(sizeof(failsafe)), &failsafe);
         ++finished;
     });
     std::thread unlistedWaiter([&] {
         KernelTimespec failsafe = FailsafeTimeout();
         ++started;
-        unlistedResult = Umtx(&unlisted, UMTX_OP_WAIT_UINT, 1, nullptr, &failsafe);
+        unlistedResult = Umtx(&unlisted, UMTX_OP_WAIT_UINT, 1, SizeOf(sizeof(failsafe)), &failsafe);
         ++unlistedFinished;
     });
     AwaitCount(started, 5);
@@ -280,11 +281,14 @@ static void RejectsBadObjectsAndOperations() {
     Require(FailsWith(Umtx(&value, UMTX_OP_MAX, 0), GUEST_EINVAL));
     Require(FailsWith(Umtx(&value, -1, 0), GUEST_EINVAL));
 
+    for (const std::uint64_t owner : {std::uint64_t{0}, std::uint64_t{123456}, (std::uint64_t{1} << 63) | 123456}) {
+        std::uint64_t word = owner;
+        Require(FailsWith(Umtx(&word, 1, 123456), GUEST_EOPNOTSUPP));
+        Require(FailsWith(Umtx(&word, 0, 123456), GUEST_EOPNOTSUPP));
+        Require(word == owner);
+    }
+
     bool threw = false;
-    try { Umtx(&value, 1, 0); }
-    catch (const std::runtime_error&) { threw = true; }
-    Require(threw);
-    threw = false;
     try { Umtx(&value, UMTX_OP_MUTEX_LOCK, 0); }
     catch (const std::runtime_error&) { threw = true; }
     Require(threw);

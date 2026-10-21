@@ -167,6 +167,15 @@ int main(int argc, char** argv) {
             Gate gate;
             Hold(gate, held, sizeof(pending));
             words.clear();
+            Append(words, DmaData(false, held, 0, other, 2));
+            ExpectDrains(words, 0x50, gate, "an unaligned copy of an uncommitted pipeline write did not drain");
+        }
+        AgcDriverWaitIdle_nid_postfix();
+
+        {
+            Gate gate;
+            Hold(gate, held, sizeof(pending));
+            words.clear();
             Append(words, std::array<std::uint32_t, 4>{0xc0022000u, 0x31100u, static_cast<std::uint32_t>(held), static_cast<std::uint32_t>(held >> 32u)});
             Append(words, std::array<std::uint32_t, 2>{0xc0001301u, 32u});
             ExpectDrains(words, 0x13, gate, "a predicated packet whose predicate overlaps an uncommitted write did not drain");
@@ -176,9 +185,11 @@ int main(int argc, char** argv) {
         {
             Gate gate;
             Hold(gate, held, sizeof(pending));
+            const auto resetBefore = DrawPipeline::DrainRequestsByOpcode(0x10);
             words.clear();
             Append(words, std::array<std::uint32_t, 2>{0xc0001024u, 0u});
-            ExpectDrains(words, 0x10, gate, "DISPATCH_RESET did not drain the pipeline");
+            Submit(words);
+            ExpectNoDrain(0x10, resetBefore, "DISPATCH_RESET drained the pipeline");
         }
 
         LibcRunShutdown_nid_postfix();

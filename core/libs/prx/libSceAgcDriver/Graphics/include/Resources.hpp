@@ -68,6 +68,7 @@ private:
     std::shared_ptr<BufferPool> cache;
     MemoryStats::LiveToken live;
     bool hostPlaced = false;
+    bool ready = false;
 };
 
 // Records a whole-range buffer copy.

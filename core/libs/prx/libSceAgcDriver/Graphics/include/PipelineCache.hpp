@@ -25,7 +25,9 @@ public:
     PipelineCache& operator=(const PipelineCache&) = delete;
     VkPipelineCache Handle() const { return cache; }
     PipelineCacheSynchronization& Synchronization() { return synchronization; }
-    bool SaveUnlessCreating() { return save(false); }
+    bool SaveUnlessCreating() { return save(false, false); }
+    void SaveNow();
+    void SaveUnlessBusy();
 
 private:
     struct FileHeader {
@@ -47,7 +49,7 @@ private:
     File readFile() const;
     std::optional<FileHeader> readHeader() const;
     void load(std::vector<std::byte>& initialData);
-    bool save(bool final);
+    bool save(bool final, bool waitForPipelines);
     void run();
 
     Context context;
@@ -55,6 +57,7 @@ private:
     VkPipelineCache cache = VK_NULL_HANDLE;
     PipelineCacheSynchronization synchronization;
     std::filesystem::path path;
+    bool holdsFile = false;
     std::size_t loadedBytes = 0;
     std::size_t settledBytes = 0;
     std::optional<FileHeader> settledFile;

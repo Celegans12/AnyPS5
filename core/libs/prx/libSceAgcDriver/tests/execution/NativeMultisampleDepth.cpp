@@ -104,6 +104,7 @@ public:
             function<PFN_vkGetPhysicalDeviceMemoryProperties>("vkGetPhysicalDeviceMemoryProperties")(context.physical, &context.memory);
             context.Function<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(context.device, family, 0u, &context.queue);
             VkCommandPoolCreateInfo pool{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+            pool.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
             pool.queueFamilyIndex = family;
             Check(context.Function<PFN_vkCreateCommandPool>("vkCreateCommandPool")(context.device, &pool, nullptr, &context.pool), "vkCreateCommandPool");
         } catch (...) { release(); throw; }
@@ -194,7 +195,6 @@ void QueueTargetByteWrite(const Context& context, Recorder& recorder, std::uint6
 std::vector<std::uint32_t> FetchShader(std::uint32_t width, std::uint32_t height, std::uint32_t fragments, bool arrayed, bool floating) {
     ShaderRecompiler::SpirvModule module;
     module.EmitCapability(spv::CapabilityShader);
-    if (arrayed) module.EmitCapability(spv::CapabilityImageMSArray);
     module.AddMemoryModel(spv::AddressingModelLogical, spv::MemoryModelGLSL450);
     const auto u32 = module.Type(spv::OpTypeInt, 32u, 0u);
     const auto i32 = module.Type(spv::OpTypeInt, 32u, 1u);
@@ -534,7 +534,7 @@ std::array<std::uint32_t, 8> DepthSampleWords(const DepthTarget& target) {
     const auto format = target.format == VK_FORMAT_D16_UNORM ? 7u : 22u;
     const auto count = static_cast<std::uint32_t>(std::countr_zero(target.samples));
     const auto width = target.extent.width - 1u, height = target.extent.height - 1u;
-    return {static_cast<std::uint32_t>(base), static_cast<std::uint32_t>((base >> 32u) & 255u) | (format << 20u) | ((width & 3u) << 30u), (width >> 2u) | (height << 14u), (14u << 28u) | (24u << 20u) | (count << 16u) | 0x204u, 0u, count << 4u, (1u << 10u) | (1u << 19u) | (1u << 21u) | (static_cast<std::uint32_t>(metadata & 255u) << 24u), static_cast<std::uint32_t>(metadata >> 8u)};
+    return {static_cast<std::uint32_t>(base), static_cast<std::uint32_t>((base >> 32u) & 255u) | (format << 20u) | ((width & 3u) << 30u), (width >> 2u) | (height << 14u), (14u << 28u) | (24u << 20u) | (count << 16u) | 0x204u, 0u, count << 4u, (target.iterate256 ? 1u << 10u : 0u) | (1u << 19u) | (1u << 21u) | (static_cast<std::uint32_t>(metadata & 255u) << 24u), static_cast<std::uint32_t>(metadata >> 8u)};
 }
 
 bool DepthSupported(const Context& context, VkFormat format, std::uint32_t fragments) {
@@ -649,7 +649,7 @@ void CheckClearDispatch() {
     }
 }
 
-void CheckDepthTarget(Context context, VkFormat format, std::uint32_t fragments, bool one, bool clearing = false, std::optional<bool> depthOnlyOverride = std::nullopt, ClearFault fault = ClearFault::None) {
+void CheckDepthTarget(Context context, VkFormat format, std::uint32_t fragments, bool one, bool clearing = false, std::optional<bool> depthOnlyOverride = std::nullopt, ClearFault fault = ClearFault::None, bool iterate256 = true) {
     const VkExtent2D extent{5u, 3u};
     const auto bytes = static_cast<std::size_t>(MultisampledDepthBytes_nid_no_patch(extent, format == VK_FORMAT_D16_UNORM ? 2u : 4u, fragments));
     TargetMemory memory(bytes), metadata(65536u);
@@ -661,7 +661,10 @@ void CheckDepthTarget(Context context, VkFormat format, std::uint32_t fragments,
     target.depthSwizzle = 24u;
     target.pipeBankXor = one ? 0x8c00u : 0u;
     target.htileDepthOnly = depthOnly;
-    target.iterate256 = target.htilePipeAligned = true;
+    target.iterate256 = iterate256;
+    target.htilePipeAligned = true;
+    TargetMemory otherMemory(static_cast<std::size_t>(DepthSliceBytes(extent, 4u)));
+    DepthTarget otherTarget{otherMemory.Address(), 0u, extent, VK_FORMAT_D32_SFLOAT, 0.0f, 0u, 0u, false, 1u};
     Recorder recorder(context);
     recorder.Activate();
     struct Cleanup {
@@ -681,8 +684,10 @@ void CheckDepthTarget(Context context, VkFormat format, std::uint32_t fragments,
     TargetRefuses([&] { RequireNoMultisampleTarget(target.htileAddress + metadataBytes - 1u, 1u, "a DMA copy"); }, "sample-preserving guest publication");
     const auto words = DepthSampleWords(target);
     auto texture = CachedSampledTexture(context, words);
-    Require(texture != nullptr && CachedSampledTexture(context, words) == texture, "native depth sampled view was not reused");
-    Require(DepthSurfaceHolds(context, DecodeTextureResource(words), texture.get()), "native depth sampled view is not held by its attachment");
+    auto arrayTexture = CachedSampledTexture(context, words, VK_IMAGE_VIEW_TYPE_2D_ARRAY);
+    Require(texture != nullptr && CachedSampledTexture(context, words) == texture && texture->SampledViewRange(false).type == VK_IMAGE_VIEW_TYPE_2D, "native depth sampled view was not reused");
+    Require(arrayTexture != nullptr && arrayTexture != texture && CachedSampledTexture(context, words, VK_IMAGE_VIEW_TYPE_2D_ARRAY) == arrayTexture && arrayTexture->SampledViewRange(false).type == VK_IMAGE_VIEW_TYPE_2D_ARRAY, "native depth arrayed sampled view was not created as VK_IMAGE_VIEW_TYPE_2D_ARRAY or reused");
+    Require(DepthSurfaceHolds(context, DecodeTextureResource(words), texture.get()) && DepthSurfaceHolds(context, DecodeTextureResource(words), arrayTexture.get()), "native depth sampled view is not held by its attachment");
     const std::array<std::shared_ptr<Texture>, 1> sampled{texture};
     TargetRefuses([&] { RequireNoNativeDepthFeedback_nid_no_patch(context, target, sampled); }, "sampling a native multisampled depth target the draw attaches");
     const std::array<std::shared_ptr<Texture>, 1> unused{};
@@ -700,6 +705,7 @@ void CheckDepthTarget(Context context, VkFormat format, std::uint32_t fragments,
     const auto count = extent.width * extent.height * fragments;
     Buffer output(context, (count + 2u) * 16u, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     const Fetch fetch(context, *texture, output, FetchShader(extent.width, extent.height, fragments, false, true));
+    const Fetch arrayFetch(context, *arrayTexture, output, FetchShader(extent.width, extent.height, fragments, true, true));
     const auto check = [&](bool rendered, float offset) {
         output.Invalidate();
         for (std::uint32_t index = 0u; index < count; ++index) {
@@ -719,16 +725,38 @@ void CheckDepthTarget(Context context, VkFormat format, std::uint32_t fragments,
         batch.SubmitAndWait();
         check(false, 0.0f);
     }
+    std::memset(output.Bytes().data(), 0xa5, output.Bytes().size());
+    {
+        CommandBatch batch(context);
+        arrayFetch.Run(batch.Handle(), count);
+        RecordMemoryBarrier(context, batch.Handle(), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        batch.SubmitAndWait();
+        check(false, 0.0f);
+    }
     {
         const DepthRaster raster(context, target, view);
         for (const auto offset : {0.0f, 0.25f}) {
-            Require(CachedSampledTexture(context, words) == texture, "native sampled view changed between raster writes");
+            Require(DepthSurfaceView(context, target) == view, "rebinding the native depth attachment replaced its image");
+            Require(CachedSampledTexture(context, words) == texture && CachedSampledTexture(context, words, VK_IMAGE_VIEW_TYPE_2D_ARRAY) == arrayTexture, "native sampled view changed between raster writes");
             std::memset(output.Bytes().data(), 0xa5, output.Bytes().size());
+            {
+                CommandBatch batch(context);
+                raster.Run(batch.Handle(), offset);
+                batch.SubmitAndWait();
+            }
+            if (offset == 0.0f) DepthSurfaceView(context, otherTarget);
+            Require(CachedSampledTexture(context, words) == texture, "native depth shadow view changed after a raster write");
+            recorder.Sync();
             CommandBatch batch(context);
-            raster.Run(batch.Handle(), offset);
             fetch.Run(batch.Handle(), count);
             RecordMemoryBarrier(context, batch.Handle(), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
             batch.SubmitAndWait();
+            check(true, offset);
+            std::memset(output.Bytes().data(), 0xa5, output.Bytes().size());
+            CommandBatch arrayBatch(context);
+            arrayFetch.Run(arrayBatch.Handle(), count);
+            RecordMemoryBarrier(context, arrayBatch.Handle(), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+            arrayBatch.SubmitAndWait();
             check(true, offset);
         }
         if (clearing) {
@@ -797,7 +825,7 @@ void CheckDepthTarget(Context context, VkFormat format, std::uint32_t fragments,
             case 8u: changed.pipeBankXor ^= 0x100u; break;
             case 9u: changed.dccAddress += 256u; break;
             case 10u: changed.dccPipeAligned = false; break;
-            case 11u: changed.iterate256 = false; break;
+            case 11u: changed.iterate256 = !changed.iterate256; break;
             case 12u: changed.allocatedMipCount = 2u; break;
             case 13u: changed.mipCount = 2u; break;
             case 14u: changed.baseLevel = 1u; break;
@@ -811,7 +839,8 @@ void CheckDepthTarget(Context context, VkFormat format, std::uint32_t fragments,
     TargetRefuses([&] { CachedSampledTexture(context, words); }, "guest writes");
     TargetRefuses([&] { DepthSurfaceHolds(context, resource, texture.get()); }, "guest writes");
     texture.reset();
-    std::printf("Native depth format=%u samples=%u clear=%u: imported, rasterized twice, sampled and refused conflicts\n", static_cast<std::uint32_t>(format), fragments, one);
+    arrayTexture.reset();
+    std::printf("Native depth format=%u samples=%u clear=%u iterate256=%u: imported, rasterized twice, sampled and refused conflicts\n", static_cast<std::uint32_t>(format), fragments, one, iterate256);
 }
 
 void CheckHtileRouting(Context context, VkFormat format, std::uint32_t fragments) {
@@ -877,7 +906,7 @@ void CheckEligibility(Context context) {
             case 2u: invalid.lastSlice = 1u; reason = "arrays"; break;
             case 3u: invalid.pipeBankXor = 0x10u; reason = "XOR"; break;
             case 4u: invalid.htileAddress = 0u; reason = "HTILE"; break;
-            case 5u: invalid.iterate256 = false; reason = "HTILE"; break;
+            case 5u: invalid.htileAddress += 16u; reason = "HTILE"; break;
             case 6u: invalid.htilePipeAligned = false; reason = "HTILE"; break;
             case 7u: invalid.htileVrsEncoding = 1u; reason = "VRS"; break;
             case 8u: invalid.clearDepth = 0.5f; reason = "clear value"; break;
@@ -919,6 +948,8 @@ void CheckEligibility(Context context) {
         auto invalid = target;
         invalid.address = unwatched.Address();
         Require(DepthSurfaceView(context, invalid) != VK_NULL_HANDLE, "unwatched sampling memory must preserve attachment rendering");
+        TargetRefuses([&] { lookup(invalid); }, "watched accessible guest memory");
+        NoteDepthMetadataFill(invalid.htileAddress, HtileMetadataBytes(extent), 0u);
         TargetRefuses([&] { lookup(invalid); }, "watched accessible guest memory");
         clear();
     }
@@ -1143,8 +1174,10 @@ int main(int argc, char** argv) {
         std::uint32_t checked = 0u, unavailable = 0u;
         for (const auto format : {VK_FORMAT_D16_UNORM, VK_FORMAT_D32_SFLOAT}) {
             for (const auto samples : {2u, 4u, 8u}) {
-                if (!DepthSupported(context, format, samples)) { unavailable += 2u; continue; }
-                for (const bool one : {false, true}) { CheckDepthTarget(context, format, samples, one); ++checked; }
+                if (!DepthSupported(context, format, samples)) { unavailable += 4u; continue; }
+                for (const bool one : {false, true}) {
+                    for (const bool iterate256 : {true, false}) { CheckDepthTarget(context, format, samples, one, false, std::nullopt, ClearFault::None, iterate256); ++checked; }
+                }
                 CheckHtileRouting(context, format, samples);
             }
         }

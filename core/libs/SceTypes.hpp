@@ -160,18 +160,23 @@ struct VirtualQueryInfo {
     std::uint64_t offset;
     std::int32_t protection;
     std::int32_t memory_type;
-    std::uint32_t is_flexible : 1;
-    std::uint32_t is_direct : 1;
-    std::uint32_t is_stack : 1;
-    std::uint32_t is_pooled : 1;
-    std::uint32_t is_committed : 1;
-    std::uint32_t is_gpu_prt : 1;
-    std::uint32_t amm_usage : 1;
-    std::uint32_t reserved : 1;
+    std::uint8_t is_flexible : 1;
+    std::uint8_t is_direct : 1;
+    std::uint8_t is_stack : 1;
+    std::uint8_t is_pooled : 1;
+    std::uint8_t is_committed : 1;
+    std::uint8_t is_gpu_prt : 1;
+    std::uint8_t amm_usage : 1;
+    std::uint8_t reserved : 1;
     char name[32];
     std::uint8_t gpu_mask_id;
     std::uint8_t reserved2;
 };
+static_assert(sizeof(VirtualQueryInfo) == 72);
+static_assert(alignof(VirtualQueryInfo) == 8);
+static_assert(offsetof(VirtualQueryInfo, name) == 33);
+static_assert(offsetof(VirtualQueryInfo, gpu_mask_id) == 65);
+static_assert(offsetof(VirtualQueryInfo, reserved2) == 66);
 
 struct KernelSemaPrivate;
 struct KernelEventFlagPrivate;
@@ -552,6 +557,47 @@ struct AudioOut2MasteringStatesHeader {
     std::uint32_t states_id;
 };
 
+struct AudioOut2MasteringStatesDescriptor {
+    std::uint32_t id;
+    std::uint32_t size;
+};
+
+struct AudioOut2MasteringCompressorStates {
+    AudioOut2MasteringStatesDescriptor descriptor;
+    std::uint32_t reserved[2];
+    float input_rms[3][8];
+    float compression_coeff[3][8];
+};
+
+struct AudioOut2MasteringCompressorStatesV2 {
+    AudioOut2MasteringStatesDescriptor descriptor;
+    std::uint32_t reserved[2];
+    float input_rms[4][8];
+    float compression_coeff[4][8];
+};
+
+struct AudioOut2MasteringLimiterStates {
+    AudioOut2MasteringStatesDescriptor descriptor;
+    std::uint32_t reserved[2];
+    float input_peak[8];
+    float output_peak[8];
+    float gain_peak[8];
+};
+
+struct AudioOut2MasteringStates {
+    AudioOut2MasteringStatesHeader states_header;
+    std::uint32_t reserved[3];
+    AudioOut2MasteringCompressorStates compressor_states;
+    AudioOut2MasteringLimiterStates limiter_states;
+};
+
+struct AudioOut2MasteringStatesV2 {
+    AudioOut2MasteringStatesHeader states_header;
+    std::uint32_t reserved[3];
+    AudioOut2MasteringCompressorStatesV2 compressor_states;
+    AudioOut2MasteringLimiterStates limiter_states;
+};
+
 struct AudioOutOutputParam {
     int handle;
     const void* ptr;
@@ -675,10 +721,13 @@ struct AvPlayerVideoEx {
     std::uint8_t luma_bit_depth;
     std::uint8_t chroma_bit_depth;
     bool video_full_range_flag;
-    std::uint8_t reserved1[37];
+    std::uint8_t reserved1[5];
+    double frame_rate;
+    std::uint8_t reserved2[24];
 };
 static_assert(sizeof(AvPlayerVideoEx) == 80);
 static_assert(offsetof(AvPlayerVideoEx, crop_left_offset) == 20 && offsetof(AvPlayerVideoEx, pitch) == 36);
+static_assert(offsetof(AvPlayerVideoEx, frame_rate) == 48);
 
 struct AvPlayerTimedTextEx {
     std::uint8_t language_code[4];
@@ -911,6 +960,14 @@ struct VoicePortInfo {
     std::uint32_t frame_size;
     std::uint16_t edge_count;
     std::uint16_t reserved;
+};
+
+struct VoiceResourceInfo {
+    std::uint16_t max_voice_input_ports;
+    std::uint16_t max_voice_output_ports;
+    std::uint16_t max_device_input_ports;
+    std::uint16_t max_device_output_ports;
+    std::uint16_t max_ports;
 };
 
 struct VoiceStartParam {
@@ -1272,7 +1329,7 @@ struct NetCtlIfStat {
     std::uint32_t reserved[8];
 };
 
-using NetCtlCallback = void (*)(int, void*);
+using NetCtlCallback = void (APS5_VABI *)(int, void*);
 
 struct HttpEpoll;
 using HttpEpollHandle = HttpEpoll*;
@@ -1364,10 +1421,6 @@ struct NpUniversalDataSystemMemoryStat {
     std::size_t current_inuse_size;
 };
 
-struct NpUniversalDataSystemEvent {};
-struct NpUniversalDataSystemEventPropertyObject {};
-struct NpUniversalDataSystemEventPropertyArray {};
-
 struct NpUniversalDataSystemStorageStat {
     std::size_t in_events;
     std::size_t out_events;
@@ -1384,6 +1437,11 @@ constexpr std::uint32_t NP_GAME_INTENT_TYPE_MAX_SIZE = 64;
 struct NpGameIntentData {
     std::uint8_t data[NP_GAME_INTENT_DATA_MAX_SIZE];
     std::uint8_t padding[7];
+};
+
+struct NpGameIntentInitParam {
+    std::size_t size;
+    std::uint8_t reserved[32];
 };
 
 struct NpGameIntentInfo {
@@ -1883,6 +1941,13 @@ struct SystemGestureTouchRecognizerInformation {
 
 struct SystemGestureTouchEvent { std::uint8_t reserve[168]; };
 
+struct SystemGestureTouchPadData {
+    std::int32_t pad_handle;
+    std::int32_t report_number;
+    const PadData* pad_data_buffer;
+    std::uint8_t reserve[8];
+};
+
 struct UserServiceLoginUserIdList { int user_id[4]; };
 
 struct UserServiceRegisteredUserIdList { int user_id[16]; };
@@ -1960,6 +2025,42 @@ struct VideoOutVblankStatus {
     std::uint8_t pad1[6] = {};
 };
 
+struct VideoOutBufferAttribute {
+    std::uint32_t pixel_format;
+    std::uint32_t tiling_mode;
+    std::uint32_t aspect_ratio;
+    std::uint32_t width;
+    std::uint32_t height;
+    std::uint32_t pitch_in_pixel;
+    std::uint32_t option;
+    std::uint32_t reserved0;
+    std::uint64_t reserved1;
+};
+static_assert(sizeof(VideoOutBufferAttribute) == 40);
+
+struct VideoOutFlipStatusPs4 {
+    std::uint64_t count = 0;
+    std::uint64_t processTime = 0;
+    std::uint64_t tsc = 0;
+    std::int64_t flipArg = 0;
+    std::uint64_t submitTsc = 0;
+    std::uint64_t reserved0 = 0;
+    std::int32_t gcQueueNum = 0;
+    std::int32_t flipPendingNum = 0;
+    std::int32_t currentBuffer = 0;
+    std::uint32_t reserved1 = 0;
+};
+static_assert(sizeof(VideoOutFlipStatusPs4) == 64);
+
+struct VideoOutVblankStatusPs4 {
+    std::uint64_t count = 0;
+    std::uint64_t processTime = 0;
+    std::uint64_t tsc = 0;
+    std::uint8_t flags = 0;
+    std::uint8_t pad[7] = {};
+};
+static_assert(sizeof(VideoOutVblankStatusPs4) == 32);
+
 struct VideoOutOutputStatus {
     std::uint32_t resolution = 0;
     std::uint32_t dynamicRange = 0;
@@ -1987,6 +2088,11 @@ struct VideoOutColorSettings {
     float gamma = 1.0f;
     std::uint32_t reserved[3] = {};
 };
+
+struct VideoOutColorSpaceConversionSettings {
+    std::uint32_t internalData[8] = {};
+};
+static_assert(sizeof(VideoOutColorSpaceConversionSettings) == 32);
 
 
 using atexit_func_t = void (*)();

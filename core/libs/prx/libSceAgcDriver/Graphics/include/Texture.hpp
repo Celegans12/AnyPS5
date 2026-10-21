@@ -35,6 +35,7 @@ struct HostImport;
 VkFormat StorageFormatForGuest(const Context& context, std::uint32_t guestFormat);
 // Whether StorageFormatForGuest would succeed, without throwing (unknown guest formats included).
 bool StorageFormatAvailable(const Context& context, std::uint32_t guestFormat);
+VkFormat HostStorageFormat(const Context& context, VkFormat format);
 bool StorageClearAvailable(const Context& context, std::uint32_t guestFormat, DccKeys keys);
 // Live sampled textures' own images: in device-local memory (what the texture caches' budgets
 // count), and in system memory (snapshots made past the sampled share, see cachedTexture).
@@ -81,11 +82,17 @@ public:
     Texture(const Context& context, VkImage depthImage, VkFormat depthFormat, VkImageAspectFlags aspect, VkComponentMapping components, VkImageViewType viewType = VK_IMAGE_VIEW_TYPE_2D, std::uint32_t baseLayer = 0, std::shared_ptr<OwnedImage> owner = {});
     struct DepthCopyTag {};
     Texture(const Context& context, const std::shared_ptr<StorageTexture>& source, const GuestTextureResource& descriptor, VkComponentMapping components, DepthCopyTag);
+    struct SrgbExpandTag {};
+    Texture(const Context& context, const std::shared_ptr<StorageTexture>& source, const GuestTextureResource& descriptor, VkComponentMapping components, SrgbExpandTag);
+    static bool CanSrgbExpandFrom(const Context& context, const StorageTexture& source, const GuestTextureResource& descriptor);
     static VkFormat DepthCopyFormat(VkFormat colorFormat);
     static bool CanDepthCopyFrom(const StorageTexture& source, const GuestTextureResource& descriptor);
     struct BlockCopyTag {};
     Texture(const Context& context, const std::shared_ptr<StorageTexture>& source, const GuestTextureResource& descriptor, VkComponentMapping components, BlockCopyTag);
     static bool CanBlockCopyFrom(const StorageTexture& source, const GuestTextureResource& descriptor);
+    struct RepackCopyTag {};
+    Texture(const Context& context, const std::shared_ptr<StorageTexture>& source, const GuestTextureResource& descriptor, VkComponentMapping components, RepackCopyTag);
+    static bool CanRepackCopyFrom(const StorageTexture& source, const GuestTextureResource& descriptor);
     bool IsDepthCopy() const { return perUseCopy == PerUseCopy::RefreshedOnReuse; }
     bool RefreshDepthCopy();
     struct DepthCopyCounts {
@@ -147,6 +154,8 @@ public:
         while (seen < serial && !lastUse.compare_exchange_weak(seen, serial, std::memory_order_acq_rel)) {
         }
     }
+    bool Released() const { return SampledCacheState() == CacheState::Released; }
+    void MarkReleased() { SetSampledCacheState(CacheState::Released); }
 
 private:
     std::atomic<CacheState> cacheState{CacheState::Unmanaged};
@@ -154,6 +163,7 @@ private:
     std::atomic<std::uint64_t> lastUse{0};
     void release() noexcept;
     bool refreshBlockCopy();
+    bool refreshSrgbExpand();
     void createFirstLayerView(const GuestTextureResource& descriptor, VkImageViewCreateInfo viewInfo);
     void prepareBaseLevelView(const GuestTextureResource& descriptor, VkImageViewCreateInfo viewInfo);
     void prepareSrgbView(const GuestTextureResource& descriptor, VkImageViewCreateInfo viewInfo);
@@ -186,9 +196,12 @@ private:
     std::unique_ptr<CommandBatch> upload;
     PerUseCopy perUseCopy = PerUseCopy::None;
     bool copiedOnce = false;
+    bool srgbExpand = false;
+    GuestTextureResource sourceDescriptor{};
     std::uint64_t copiedVersion = 0;
     VkFormat depthFormat = VK_FORMAT_UNDEFINED;
     VkFormat blockFormat = VK_FORMAT_UNDEFINED;
+    bool repackCopy = false;
     std::uint32_t copyWidth = 0, copyHeight = 0, copyLevels = 0, copyLayers = 0, copyElementBytes = 0;
 };
 
@@ -226,7 +239,7 @@ public:
     void WriteBack();
     // Deferred write-back (APS5_EAGER_WRITEBACK=1 stores at once instead).
     void MarkDirty();
-    void MarkSliceDirty(std::uint32_t slice);
+    void MarkSliceDirty(std::uint32_t slice, std::uint32_t count = 1);
     void Flush();
     bool Dirty() const;
     // Stores every pending image overlapping the range, except `except`; returns whether any was.
@@ -238,6 +251,7 @@ public:
     // overlapping pending image, as before).
     static bool FlushPending(std::uint64_t address, std::size_t bytes, const StorageTexture* except = nullptr, const char* reason = "memory access", PublishScope scope = PublishScope::Whole, bool* published = nullptr);
     static void FlushAllPending(const char* reason);
+    static bool WaitForFlushing(std::uint64_t address, std::size_t bytes, const StorageTexture* except = nullptr);
     static void SaveBeforeUnwatch(std::uint64_t address, std::size_t bytes);
     static constexpr std::uint64_t SmallStoreBytes = 64 * 1024;
     static std::size_t StoreSmallPending(const char* reason);
@@ -251,6 +265,7 @@ public:
     // Whether an image with results pending, or one a FlushPending is storing right now, overlaps
     // any of the [begin, end) ranges: one acquisition of the registry's mutex.
     static bool AnyPendingOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
+    static bool AnyLiveOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
     // Moves with every change of the pending registry (an image marked dirty, stored, flushed or
     // dropped; after the store for a flush), bumped under the registry's mutex with the change, so
     // a reader that loads it before and after its own reads knows the registry it consulted stayed
@@ -366,6 +381,7 @@ public:
     // may carry DCC metadata, and this surface must be host-imported (the write-back is GPU-direct).
     // False, naming why, when the copy must be a transfer.
     bool CopyFrom(StorageTexture& source, const char*& refusal);
+    static const char* CopyRefusal(const Context& context, const StorageTexture* destination, const StorageTexture& source, std::uint64_t address);
     VkImage Image() const { return image; }
     VkFormat StorageFormat() const { return storageFormat; }
     const GuestTextureResource& Descriptor() const { return descriptor; }
@@ -391,6 +407,7 @@ public:
     // Keeps the image current with guest memory (see GuestMemory::CollectWrites).
     bool Refresh();
     static std::uint64_t SinglePassMoves();
+    static std::uint64_t SlabRetiles();
     static std::uint64_t RefreshesProved();
     static std::uint64_t UntrackedCompares();
     std::uint64_t GuestBytes() const;

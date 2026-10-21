@@ -15,6 +15,7 @@
 #include <codegen/x86/X64InstructionRewriter.hpp>
 #include <codegen/IInstructionScanner.hpp>
 #include <elfpatcher/general/EntryStubBuilder.hpp>
+#include <elfpatcher/general/ElfConstants.hpp>
 #include <elfpatcher/general/ProgramHeaderLayoutBuilder.hpp>
 #include <elfpatcher/general/SectionHeaderTableBuilder.hpp>
 #include <elfpatcher/general/SegmentFilter.hpp>
@@ -24,7 +25,7 @@
 #include <cmath>
 #include <cstring>
 #include <cstdint>
-#ifdef __linux__
+#if defined(__linux__) || defined(__APPLE__)
 #include <sys/mman.h>
 #endif
 #include <functional>
@@ -655,8 +656,8 @@ void rosettaSubstitutions() {
     const auto intel = Codegen::MakeAmd64OnlyInstructionMatcher();
     const auto rosetta = Codegen::MakeAmd64OnlyInstructionMatcher(Codegen::Amd64OnlyTarget::Rosetta);
     const auto match = [](const auto& matcher, const Bytes& bytes) { return matcher->Match(bytes.data(), bytes.size()); };
-    for (const auto& bytes : {Bytes{0x0F, 0xC7, 0xF8}, Bytes{0xF3, 0x0F, 0xC7, 0xF8}, Bytes{0x66, 0x0F, 0xAE, 0x30}})
-        require(!match(intel, bytes).has_value(), "RDSEED, RDPID or CLWB was converted for an Intel host");
+    for (const auto& bytes : {Bytes{0x0F, 0xC7, 0xF8}, Bytes{0xF3, 0x0F, 0xC7, 0xF8}, Bytes{0x66, 0x0F, 0xAE, 0x30}, Bytes{0x0F, 0x01, 0xF9}})
+        require(!match(intel, bytes).has_value(), "RDSEED, RDPID, CLWB or RDTSCP was converted for an Intel host");
     const auto rdseed = match(rosetta, {0x48, 0x0F, 0xC7, 0xF9});
     require(rdseed && rdseed->Lowering == Amd64OnlyLowering::InPlace && rdseed->ReplacementBytes == Bytes{0x48, 0x0F, 0xC7, 0xF1} && rdseed->InstructionName == "RDSEED", "RDSEED was not rewritten to RDRAND");
     const auto rdseed16 = match(rosetta, {0x66, 0x41, 0x0F, 0xC7, 0xFA});
@@ -669,6 +670,11 @@ void rosettaSubstitutions() {
     const auto rdpid = match(rosetta, {0xF3, 0x41, 0x0F, 0xC7, 0xFB});
     require(rdpid && rdpid->Lowering == Amd64OnlyLowering::Trampoline && rdpid->Optional && rdpid->InstructionName == "RDPID", "RDPID was not lowered through an optional stub");
     require(rdpid->ReturnBranchOffset == 6 && Bytes(rdpid->StubBody.begin(), rdpid->StubBody.begin() + 7) == Bytes{0x41, 0xBB, 0, 0, 0, 0, 0xE9}, "RDPID r11 stub does not load 0 before returning");
+    const auto rdtscp = match(rosetta, {0x0F, 0x01, 0xF9});
+    require(rdtscp && rdtscp->Lowering == Amd64OnlyLowering::Trampoline && rdtscp->Optional && rdtscp->InstructionName == "RDTSCP", "RDTSCP was not lowered through an optional stub");
+    require(rdtscp->ReturnBranchOffset == 8 && Bytes(rdtscp->StubBody.begin(), rdtscp->StubBody.begin() + 9) == Bytes{0x0F, 0x01, 0xF9, 0xB9, 0, 0, 0, 0, 0xE9}, "RDTSCP stub does not load 0 into ECX after reading the counter");
+    require(!match(rosetta, {0x0F, 0x01, 0xF8}).has_value(), "SWAPGS (0F 01 F8) was taken for RDTSCP");
+    require(!match(rosetta, {0x66, 0x0F, 0x01, 0xF9}).has_value(), "RDTSCP with an operand size prefix was lowered");
 }
 
 void wideStoreSplit() {
@@ -825,6 +831,19 @@ void converterWideStoreWindows() {
         require(!preceded.Trampolines.empty() && preceded.Trampolines[0].Offset == 0x200 && preceded.Trampolines[0].Length == 8 && body(preceded.Trampolines[0]) == expected, "A 256-bit store moved a following instruction that cannot leave its place instead of the one before it");
     }
 
+    const Bytes fsRead = {0x66, 0x66, 0x66, 0x64, 0x48, 0x8B, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00};
+    const Bytes gsRead = {0x65, 0x48, 0x8B, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00};
+    for (const auto& segmentRead : {fsRead, gsRead}) {
+        const auto beforeSegment = convert(withStore(add, segmentRead));
+        expected = add;
+        expected.insert(expected.end(), halves.begin(), halves.end());
+        require(beforeSegment.Trampolines.size() == 1 && beforeSegment.Trampolines[0].Offset == 0x200 && beforeSegment.Trampolines[0].Length == 8 && body(beforeSegment.Trampolines[0]) == expected, "A 256-bit store moved a following FS or GS access, which the macOS writer cannot rewrite in a stub, instead of the instruction before it");
+        const auto onlySegment = convert(withStore({}, segmentRead));
+        expected = halves;
+        expected.insert(expected.end(), segmentRead.begin(), segmentRead.end());
+        require(onlySegment.Trampolines.size() == 1 && onlySegment.Trampolines[0].Offset == 0x200 && onlySegment.Trampolines[0].Length == store.size() + segmentRead.size() && body(onlySegment.Trampolines[0]) == expected, "A 256-bit store with no other movable neighbour did not fall back to the following FS or GS access");
+    }
+
     Bytes throwing = {0xC3, 0xEB, 0xFD};
     for (int index = 0; index < 3; ++index)
         throwing.insert(throwing.end(), add.begin(), add.end());
@@ -866,6 +885,14 @@ void converterWideStoreWindows() {
     expected = Bytes(adds.begin(), adds.begin() + 12);
     expected.push_back(0xC3);
     require(returnIsland.Trampolines.size() == 2 && returnIsland.Trampolines[0].Offset == 0x20B && body(returnIsland.Trampolines[0]) == expected, "Instructions moved for an island that end in a return jump back after it");
+
+    const auto intoStore = convert(withStore({0x73, 0x01}, {0xC3}));
+    expected = halves;
+    expected.push_back(0xC3);
+    require(intoStore.Trampolines.size() == 1 && intoStore.Trampolines[0].Offset == 0x202 && intoStore.Trampolines[0].Length == 5 && body(intoStore.Trampolines[0]) == expected, "A branch into the middle of a 256-bit store, where no scanned instruction starts, kept the store");
+
+    const auto intoFollower = convert(withStore({0x73, 0x06}, {0x48, 0x83, 0xC1, 0x01, 0xC3}));
+    require(intoFollower.Trampolines.size() == 1 && intoFollower.Trampolines[0].Offset == 0x202 && intoFollower.Trampolines[0].Length == 8, "A branch into the middle of an instruction moved with a 256-bit store kept the store");
 
     const auto afterBranch = convert(withStore({0x75, 0x10}, {0xFF, 0xD0}));
     expected = {0x0F, 0x85, 0, 0, 0, 0};
@@ -969,12 +996,54 @@ void rosettaScalarCompares() {
     require(vex3 && Bytes(vex3->StubBody.begin(), vex3->StubBody.begin() + 6) == Bytes{0xC4, 0xE1, 0xEB, 0xC2, 0xCB, 0x03}, "A VEX3 VCMPSD with a hazard predicate does not move unchanged");
     for (const Bytes& kept : {Bytes{0xC5, 0xEA, 0xC2, 0xCA, 0x00}, Bytes{0xC5, 0xEA, 0xC2, 0xCA, 0x01}, Bytes{0xC5, 0xEA, 0xC2, 0xCA, 0x02}, Bytes{0xC4, 0xE1, 0xEB, 0xC2, 0xCB, 0x01}})
         require(!match(kept).has_value(), "An EQ_OQ, LT_OS or LE_OS scalar compare must stay inline");
-    for (const Bytes& other : {Bytes{0xC5, 0xE9, 0xC2, 0xCA, 0x03}, Bytes{0xC5, 0xE8, 0xC2, 0xCA, 0x03}, Bytes{0xC5, 0xEA, 0x2E, 0xC8}, Bytes{0xC5, 0xEA, 0xC2, 0xCA}, Bytes{0xC4, 0xE2, 0xEB, 0xC2, 0xCB, 0x03}, Bytes{0x62, 0xD1, 0x76, 0x08, 0xC2, 0xCB, 0x03}, Bytes{0xF3, 0x0F, 0xC2, 0xCA, 0x03}})
+    for (const Bytes& other : {Bytes{0xC5, 0xE9, 0xC2, 0xCA, 0x03}, Bytes{0xC5, 0xE8, 0xC2, 0xCA, 0x03}, Bytes{0xC5, 0xEA, 0x2E, 0xC8}, Bytes{0xC5, 0xEA, 0xC2, 0xCA}, Bytes{0xC4, 0xE2, 0xEB, 0xC2, 0xCB, 0x03}, Bytes{0x62, 0xD1, 0x76, 0x08, 0xC2, 0xCB, 0x03}})
         require(!match(other).has_value(), "An instruction other than a Rosetta-hazard scalar compare was moved");
     require(!Codegen::MakeAmd64OnlyInstructionMatcher()->Match(compare.data(), compare.size()).has_value(), "A scalar compare was moved for an Intel host");
     const std::vector<std::span<const std::uint8_t>> pair = {std::span<const std::uint8_t>(compare), std::span<const std::uint8_t>(rip)};
     const auto sequence = rosetta->MatchSequence(pair, {});
     require(sequence && sequence->InstructionName == "scalar compare" && sequence->ReturnBranchOffset == 14 && sequence->Relocations.size() == 1 && sequence->Relocations[0].SiteTarget == 5 + 9 + 0x100, "A scalar compare after another is not emitted out of line in one stub");
+}
+
+void rosettaLegacyScalarCompares() {
+    const auto rosetta = Codegen::MakeAmd64OnlyInstructionMatcher(Codegen::Amd64OnlyTarget::Rosetta);
+    const auto match = [&](const Bytes& bytes) { return rosetta->Match(bytes.data(), bytes.size()); };
+    for (const Bytes& moved : {Bytes{0xF3, 0x0F, 0xC2, 0xCA, 0x03}, Bytes{0xF2, 0x0F, 0xC2, 0xCA, 0x04}, Bytes{0xF2, 0x41, 0x0F, 0xC2, 0xC9, 0x05},
+                               Bytes{0x64, 0xF3, 0x0F, 0xC2, 0x4F, 0x68, 0x06}, Bytes{0xF3, 0x2E, 0x0F, 0xC2, 0x44, 0x24, 0x08, 0x07}, Bytes{0xF3, 0x0F, 0xC2, 0xCA, 0x08}}) {
+        const auto lowered = match(moved);
+        require(lowered && lowered->Lowering == Codegen::Amd64OnlyLowering::Trampoline && lowered->Optional && lowered->InstructionName == "scalar compare", "A legacy Rosetta-hazard scalar compare was not lowered through an optional stub");
+        require(lowered->ReturnBranchOffset == moved.size() && lowered->StubBody.size() == moved.size() + 5 && Bytes(lowered->StubBody.begin(), lowered->StubBody.begin() + static_cast<std::ptrdiff_t>(moved.size())) == moved && lowered->StubBody[moved.size()] == 0xE9 && lowered->Relocations.empty(), "A legacy scalar compare does not run unchanged before its return jump");
+    }
+    const auto rip = match(Bytes{0xF3, 0x0F, 0xC2, 0x0D, 0x00, 0x01, 0x00, 0x00, 0x06});
+    require(rip && rip->Relocations.size() == 1 && rip->Relocations[0].DisplacementOffset == 4 && rip->Relocations[0].InstructionEnd == 9 && rip->Relocations[0].SiteTarget == 9 + 0x100, "A RIP-relative legacy CMPSS was not relocated from its place in the site");
+    const auto ripRex = match(Bytes{0xF2, 0x48, 0x0F, 0xC2, 0x05, 0x00, 0x01, 0x00, 0x00, 0x07});
+    require(ripRex && ripRex->Relocations.size() == 1 && ripRex->Relocations[0].DisplacementOffset == 5 && ripRex->Relocations[0].InstructionEnd == 10 && ripRex->Relocations[0].SiteTarget == 10 + 0x100, "A RIP-relative legacy CMPSD with REX was not relocated");
+    for (const Bytes& kept : {Bytes{0xF3, 0x0F, 0xC2, 0xCA, 0x00}, Bytes{0xF3, 0x0F, 0xC2, 0xCA, 0x01}, Bytes{0xF2, 0x0F, 0xC2, 0xCA, 0x02}})
+        require(!match(kept).has_value(), "A legacy EQ_OQ, LT_OS or LE_OS scalar compare must stay inline");
+    for (const Bytes& other : {Bytes{0x0F, 0xC2, 0xCA, 0x03}, Bytes{0x66, 0x0F, 0xC2, 0xCA, 0x03}, Bytes{0x66, 0xF3, 0x0F, 0xC2, 0xCA, 0x03}, Bytes{0xF2, 0xF3, 0x0F, 0xC2, 0xCA, 0x03},
+                               Bytes{0x67, 0xF3, 0x0F, 0xC2, 0x0D, 0x00, 0x01, 0x00, 0x00, 0x03}, Bytes{0xF0, 0xF3, 0x0F, 0xC2, 0xCA, 0x03}, Bytes{0x48, 0xF3, 0x0F, 0xC2, 0xCA, 0x03},
+                               Bytes{0xF3, 0x0F, 0xC2, 0xCA}, Bytes{0xF3, 0x0F, 0xC3, 0xCA, 0x03}, Bytes{0xF3, 0x0F, 0x10, 0xCA}})
+        require(!match(other).has_value(), "An instruction other than a legacy Rosetta-hazard scalar compare was moved");
+    const Bytes compare = {0xF3, 0x0F, 0xC2, 0xCA, 0x03};
+    require(!Codegen::MakeAmd64OnlyInstructionMatcher()->Match(compare.data(), compare.size()).has_value(), "A legacy scalar compare was moved for an Intel host");
+}
+
+void converterRosettaLegacyScalarCompare() {
+    const auto converter = Codegen::MakeAmd64OnlyConverter(Codegen::Amd64OnlyTarget::Rosetta);
+    Bytes file(0x300, 0xCC);
+    const Bytes text = {
+        0xF3, 0x0F, 0x10, 0x15, 0x10, 0x00, 0x00, 0x00,
+        0x0F, 0x28, 0xC2,
+        0xF3, 0x0F, 0xC2, 0xCA, 0x03,
+        0xC5, 0xF8, 0x28, 0x0D, 0x20, 0x00, 0x00, 0x00,
+        0xC5, 0xF8, 0x2E, 0xC8,
+        0xC3};
+    std::copy(text.begin(), text.end(), file.begin() + 0x200);
+    const auto result = converter->Convert(file, {segmentHeader(text.size())});
+    require(result.Trampolines.size() == 1 && result.Reports.size() == 1 && result.Reports[0].InstructionName == "scalar compare" && result.Reports[0].Offset == 0x20B && result.Reports[0].Lowering == Codegen::Amd64OnlyLowering::Trampoline, "The legacy compare in the fmax shape was not the only moved instruction");
+    const auto& site = result.Trampolines[0];
+    require(site.Offset == 0x20B && site.Length == 5 && Bytes(site.Body.begin(), site.Body.begin() + 5) == Bytes(text.begin() + 11, text.begin() + 16) && site.Relocations.empty(), "The legacy compare stub does not run the compare unchanged");
+    const auto intel = Codegen::MakeAmd64OnlyConverter()->Convert(file, {segmentHeader(text.size())});
+    require(intel.Reports.empty() && intel.Bytes == file, "The Intel target moved a legacy scalar compare");
 }
 
 void converterRosettaScalarCompare() {
@@ -994,10 +1063,15 @@ void converterRosettaScalarCompare() {
     require(site.Offset == 0x20C && site.Length == 5 && site.ReturnBranchOffset == 5 && Bytes(site.Body.begin(), site.Body.begin() + 5) == Bytes(text.begin() + 12, text.begin() + 17) && Bytes(site.Body.begin() + 5, site.Body.begin() + 10) == Bytes{0xE9, 0, 0, 0, 0} && site.Relocations.empty(), "The compare stub does not run the compare unchanged and return");
     require(result.Bytes == file, "Moving the compare changed the file image");
     auto branchInside = file;
-    const Bytes jumped = {0xEB, 0x02, 0xC5, 0xEA, 0xC2, 0xCA, 0x03, 0xC3};
+    const Bytes jumped = {0xEB, 0x01, 0xF3, 0x0F, 0xC2, 0xCA, 0x03, 0xC3};
     std::copy(jumped.begin(), jumped.end(), branchInside.begin() + 0x200);
     const auto kept = converter->Convert(branchInside, {segmentHeader(jumped.size())});
-    require(kept.Trampolines.empty() && kept.KeptCount == 1 && kept.Reports.size() == 1 && kept.Reports[0].Lowering == Codegen::Amd64OnlyLowering::Kept && kept.Bytes == branchInside, "A branch into the compare did not keep it native");
+    require(kept.Trampolines.empty() && kept.KeptCount == 1 && kept.Reports.size() == 1 && kept.Reports[0].Lowering == Codegen::Amd64OnlyLowering::Kept && kept.Bytes == branchInside, "A branch past the prefix of the compare did not keep it native");
+    auto branchIntoVex = file;
+    const Bytes vexJumped = {0xEB, 0x02, 0xC5, 0xEA, 0xC2, 0xCA, 0x03, 0xC3};
+    std::copy(vexJumped.begin(), vexJumped.end(), branchIntoVex.begin() + 0x200);
+    const auto moved = converter->Convert(branchIntoVex, {segmentHeader(vexJumped.size())});
+    require(moved.Trampolines.size() == 1 && moved.Trampolines[0].Offset == 0x202 && moved.KeptCount == 0, "A branch past the VEX prefix of the compare, where no instruction starts, kept the compare native");
     auto ripSource = file;
     const Bytes ripText = {0xC5, 0xEA, 0xC2, 0x0D, 0x00, 0x01, 0x00, 0x00, 0x03, 0xC3};
     std::copy(ripText.begin(), ripText.end(), ripSource.begin() + 0x200);
@@ -1195,9 +1269,10 @@ Elfpatcher::Linux::LinuxElfPatcher linuxPatcher() {
 }
 
 std::uint64_t executableFileOffset(const Bytes& output, const std::uint64_t address) {
+    const auto phOff = read<std::uint64_t>(output, 32);
     const auto phNum = read<std::uint16_t>(output, 56);
     for (std::uint16_t index = 0; index < phNum; ++index) {
-        const auto header = 64 + index * 56;
+        const auto header = phOff + index * 56;
         if (read<std::uint32_t>(output, header) != 1) continue;
         const auto vaddr = read<std::uint64_t>(output, header + 16);
         const auto memSize = read<std::uint64_t>(output, header + 40);
@@ -1245,9 +1320,61 @@ void linuxRipRelativePlacement() {
     require(operand == 0x2040, "Relocated RIP-relative operand does not reach the original address");
 }
 
+std::vector<std::array<std::uint64_t, 8>> stackHeaders(const Bytes& output) {
+    const auto phOff = read<std::uint64_t>(output, 32);
+    const auto phNum = read<std::uint16_t>(output, 56);
+    std::vector<std::array<std::uint64_t, 8>> found;
+    for (std::uint16_t index = 0; index < phNum; ++index) {
+        const auto header = static_cast<std::size_t>(phOff) + index * 56;
+        if (read<std::uint32_t>(output, header) != Elfpatcher::PT_GNU_STACK) continue;
+        found.push_back({read<std::uint32_t>(output, header), read<std::uint32_t>(output, header + 4),
+            read<std::uint64_t>(output, header + 8), read<std::uint64_t>(output, header + 16),
+            read<std::uint64_t>(output, header + 24), read<std::uint64_t>(output, header + 32),
+            read<std::uint64_t>(output, header + 40), read<std::uint64_t>(output, header + 48)});
+    }
+    return found;
 }
 
-#if defined(__linux__) && defined(__x86_64__)
+void linuxStackSynthesis() {
+    const auto patchOutput = [](std::uint16_t slots, std::vector<Domain::ProgramHeader> headers) {
+        auto elf = elfFixture({0xC3});
+        write<std::uint16_t>(elf, 56, slots);
+        auto patcher = linuxPatcher();
+        return patcher.Patch(std::move(elf), std::move(headers), {}, 0, "$ORIGIN/libs", true, false, {});
+    };
+    const Domain::ProgramHeader inputStack{Elfpatcher::PT_GNU_STACK, 6, 0, 0, 0, 0, 0x20000, 16};
+    const std::vector<std::array<std::uint64_t, 8>> synthetic = {{Elfpatcher::PT_GNU_STACK, 6, 0, 0, 0, 0, 0, 16}};
+    const std::vector<std::array<std::uint64_t, 8>> preserved = {{Elfpatcher::PT_GNU_STACK, 6, 0, 0, 0, 0, 0x20000, 16}};
+
+    const auto exactFit = patchOutput(7, elfHeaders());
+    require(read<std::uint64_t>(exactFit, 32) >= 0x400, "a full input table must move to make room for the synthetic stack");
+    require(read<std::uint16_t>(exactFit, 56) == 8, "the output must use the reserved synthetic stack slot");
+    require(stackHeaders(exactFit) == synthetic, "the synthetic stack must be PT_GNU_STACK with PF_R|PF_W and alignment 16");
+
+    const auto spareSlot = patchOutput(8, elfHeaders());
+    require(read<std::uint64_t>(spareSlot, 32) == 64, "the required count must not move a table that has a free slot");
+    require(read<std::uint16_t>(spareSlot, 56) == 8, "the free slot must be filled by the synthetic stack");
+    require(stackHeaders(spareSlot) == synthetic, "the synthetic stack must be PT_GNU_STACK with PF_R|PF_W and alignment 16");
+
+    const auto roomyTable = patchOutput(9, elfHeaders());
+    require(read<std::uint64_t>(roomyTable, 32) == 64, "the required count must not move a table with spare slots");
+    require(read<std::uint16_t>(roomyTable, 56) == 8, "the output count must match the required count");
+    require(stackHeaders(roomyTable) == synthetic, "the synthetic stack must be PT_GNU_STACK with PF_R|PF_W and alignment 16");
+
+    const auto keptStackExact = patchOutput(8, {elfHeaders()[0], elfHeaders()[1], inputStack});
+    require(read<std::uint64_t>(keptStackExact, 32) == 64, "an input stack must not over-reserve a header slot");
+    require(read<std::uint16_t>(keptStackExact, 56) == 8, "an input stack must not grow the output count");
+    require(stackHeaders(keptStackExact) == preserved, "a kept PT_GNU_STACK must stay unchanged");
+
+    const auto keptStackShort = patchOutput(7, {elfHeaders()[0], elfHeaders()[1], inputStack});
+    require(read<std::uint64_t>(keptStackShort, 32) >= 0x400, "a full input table must move when the kept stack does not fit");
+    require(read<std::uint16_t>(keptStackShort, 56) == 8, "the moved table must carry the kept stack");
+    require(stackHeaders(keptStackShort) == preserved, "a kept PT_GNU_STACK must stay unchanged");
+}
+
+}
+
+#if (defined(__linux__) || defined(__APPLE__)) && defined(__x86_64__)
 std::uint64_t extrqReference(std::uint64_t value, std::uint64_t control) {
     const auto length = static_cast<unsigned>(control & 0x3f);
     const auto index = static_cast<unsigned>((control >> 8) & 0x3f);
@@ -1690,6 +1817,40 @@ void immediateFormExecution() {}
 void ripRelativeExecution() {}
 #endif
 
+#if defined(__x86_64__) && (defined(__linux__) || defined(__APPLE__))
+void rdtscpExecution() {
+    const auto matcher = Codegen::MakeAmd64OnlyInstructionMatcher(Codegen::Amd64OnlyTarget::Rosetta);
+    const Bytes site = {0x0F, 0x01, 0xF9};
+    const auto match = matcher->Match(site.data(), site.size());
+    require(match && match->Lowering == Codegen::Amd64OnlyLowering::Trampoline, "RDTSCP stub was not produced");
+    auto body = match->StubBody;
+    body[match->ReturnBranchOffset] = 0xC3;
+    void* code = mmap(nullptr, 4096, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    require(code != MAP_FAILED, "cannot map executable memory for the stub");
+    std::memcpy(code, body.data(), body.size());
+    std::uint64_t low = 0;
+    std::uint64_t high = 0;
+    std::uint64_t processor = 0;
+    std::uint8_t carry = 0;
+    asm volatile(
+        "mov $-1, %%rcx\n\t"
+        "sub $128, %%rsp\n\t"
+        "stc\n\t"
+        "call *%[code]\n\t"
+        "setc %[carry]\n\t"
+        "add $128, %%rsp\n\t"
+        : "=&a"(low), "=&d"(high), "=&c"(processor), [carry] "=&q"(carry)
+        : [code] "r"(code)
+        : "memory", "cc");
+    munmap(code, 4096);
+    require(((high << 32) | low) != 0, "RDTSCP stub did not read the time stamp counter");
+    require(processor == 0, "RDTSCP stub left a value other than processor 0 in RCX");
+    require(carry == 1, "RDTSCP stub changed the flags");
+}
+#else
+void rdtscpExecution() {}
+#endif
+
 void scannerZeroTail() {
     const auto scanner = Codegen::MakeInstructionScanner();
     const Bytes code{0xC3, 0x00, 0x00, 0x00};
@@ -1729,6 +1890,9 @@ int main() {
         converterRosetta();
         rosettaScalarCompares();
         converterRosettaScalarCompare();
+        rosettaLegacyScalarCompares();
+        converterRosettaLegacyScalarCompare();
+        rdtscpExecution();
         wideStoreSplit();
         converterWideStoreWindows();
         converterJumpTableTargets();
@@ -1739,6 +1903,7 @@ int main() {
         converterFailureOffsets();
         linuxPlacement();
         linuxRipRelativePlacement();
+        linuxStackSynthesis();
         scannerZeroTail();
         std::cout << "AMD64-only converter tests passed\n";
     } catch (const std::exception& error) {

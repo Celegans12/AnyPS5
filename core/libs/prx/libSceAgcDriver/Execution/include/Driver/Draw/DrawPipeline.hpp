@@ -55,9 +55,11 @@ public:
     static bool& Active();
     static std::atomic<std::uint64_t>& EpochToken();
     static void FollowEpoch(std::uint64_t token);
+    static unsigned Committers();
 
     void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, Prepare prepare = {});
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100);
+    void Stop();
     static std::uint64_t DrainRequestsByOpcode(std::uint32_t opcode);
     // DMA_DATA as pipeline items, and SET_PREDICATION, NOP sub-ops and non-overlapping DMA_DATA kept
     // without a drain (upstream #6208). LOCAL A/B: APS5_NO_PIPELINE_DMA=1 (any value but 0) restores
@@ -80,6 +82,7 @@ public:
     std::uint64_t Events(Event event) const { return events[static_cast<std::size_t>(event)].load(std::memory_order_relaxed); }
     std::optional<std::uint64_t> PendingLabel(std::uint64_t address, std::size_t bytes);
     static bool HeldReads(std::uint64_t address, std::size_t bytes);
+    void ReleaseRunningReads();
 
 private:
     struct Item {
@@ -91,6 +94,8 @@ private:
         std::int64_t pushedNs = 0;
         Prepare prepare;
         bool prepareTaken = false;
+        // The span of `reads` (HeldReads skips an item it misses; APS5_NO_HELD_READ_BOUNDS=1 scans every range).
+        Range readBounds{~std::uint64_t{0}, 0};
     };
     DrawPipeline() = default;
     template<typename TRanges, typename TBounds>
@@ -132,6 +137,7 @@ private:
     std::uint32_t idleWaiters = 0;
     bool committerWaiting = false;
     bool stopped = false;
+    bool closing = false;
     std::thread thread;
     std::thread preparer;
     std::condition_variable prepareWake;

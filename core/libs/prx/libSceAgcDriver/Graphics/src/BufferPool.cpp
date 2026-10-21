@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -8,7 +9,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
-#include <atomic>
+#include <cstring>
 #include <limits>
 #include <optional>
 
@@ -41,14 +42,15 @@ constexpr VkBufferUsageFlags deviceUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | 
 
 }
 
-BufferPool::BufferPool(const Context& context) : device(context.device), unmap(context.Function<PFN_vkUnmapMemory>("vkUnmapMemory")), destroyBuffer(context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")), freeMemory(context.Function<PFN_vkFreeMemory>("vkFreeMemory")), allocateMemory(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")), mapMemory(context.Function<PFN_vkMapMemory>("vkMapMemory")), maxSlots(std::max<std::size_t>(1, std::min<std::size_t>(MaxSlots(), context.limits.maxMemoryAllocationCount / 6u))), vram(context) {
+BufferPool::BufferPool(const Context& context) : maxSlots(std::max<std::size_t>(1, std::min<std::size_t>(MaxSlots(), context.limits.maxMemoryAllocationCount / 6u))), cacheReclaim(context.cacheReclaim), device(context.device), unmap(context.Function<PFN_vkUnmapMemory>("vkUnmapMemory")), destroyBuffer(context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")), freeMemory(context.Function<PFN_vkFreeMemory>("vkFreeMemory")), allocateMemory(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")), mapMemory(context.Function<PFN_vkMapMemory>("vkMapMemory")), physical(context.physical), memoryProperties(context.memory), memoryProperties2(context.memoryProperties2), vram(context) {
     smallTier.budget = smallBudget;
     largeTier.budget = budget;
     deviceTier.budget = deviceBudget(context);
+    smallDeviceTier.budget = std::max<VkDeviceSize>(smallBudget, deviceTier.budget / 8u);
 }
 
 BufferPool::~BufferPool() {
-    for (auto* tier : {&smallTier, &largeTier, &deviceTier}) {
+    for (auto* tier : {&smallTier, &largeTier, &deviceTier, &smallDeviceTier}) {
         for (const auto& [key, slots] : tier->free) {
             for (const auto& slot : slots) destroy(slot.allocation);
         }
@@ -74,7 +76,7 @@ VkDeviceMemory BufferPool::AllocateMemory(const VkMemoryAllocateInfo& allocation
         }
     }
     if (exhausted(result)) {
-        if (const auto reclaim = cacheReclaim().load(std::memory_order_acquire); reclaim != nullptr) released = reclaim(ReclaimTarget(allocation.allocationSize));
+        if (cacheReclaim != nullptr) released = cacheReclaim(ReclaimTarget(allocation.allocationSize));
         if (released == 0 && result == VK_ERROR_OUT_OF_DEVICE_MEMORY) released = ReclaimTextureMemory(device, allocation.allocationSize);
         if (released != 0) {
             reclaimed += trim();
@@ -91,9 +93,10 @@ VkDeviceMemory BufferPool::AllocateMemory(const VkMemoryAllocateInfo& allocation
         ++attempts;
         if (result == VK_SUCCESS) {
             if (allocatedType != nullptr) *allocatedType = *hostType;
-            static std::atomic<std::uint64_t> placements{0};
+            static std::atomic<std::uint64_t> placements{0}, placedBytes{0};
             const auto count = placements.fetch_add(1, std::memory_order_relaxed) + 1;
-            if (count <= 5 || (count & (count - 1)) == 0) std::fprintf(stderr, "[bufferpool] %s: memory type %u is out of device memory for %llu bytes after reclaiming %llu; placed in host memory type %u until it is released; %llu such allocations\n", operation, allocation.memoryTypeIndex, static_cast<unsigned long long>(allocation.allocationSize), static_cast<unsigned long long>(reclaimed), *hostType, static_cast<unsigned long long>(count));
+            const auto total = placedBytes.fetch_add(allocation.allocationSize, std::memory_order_relaxed) + allocation.allocationSize;
+            if (count <= 5 || (count & (count - 1)) == 0) std::fprintf(stderr, "[bufferpool] %s: memory type %u is out of device memory for %llu bytes after reclaiming %llu and releasing %llu; placed in host memory type %u until it is released; %llu such allocations, %llu MiB\n", operation, allocation.memoryTypeIndex, static_cast<unsigned long long>(allocation.allocationSize), static_cast<unsigned long long>(reclaimed), static_cast<unsigned long long>(released), *hostType, static_cast<unsigned long long>(count), static_cast<unsigned long long>(total >> 20u));
             return memory;
         }
     }
@@ -101,8 +104,20 @@ VkDeviceMemory BufferPool::AllocateMemory(const VkMemoryAllocateInfo& allocation
         if (attempts > 1) std::fprintf(stderr, "[bufferpool] %s recovered: allocation=%llu reclaimed=%llu released=%llu initialResult=%d attempts=%u\n", operation, static_cast<unsigned long long>(allocation.allocationSize), static_cast<unsigned long long>(reclaimed), static_cast<unsigned long long>(released), static_cast<int>(initialResult), attempts);
         return memory;
     }
-    char details[512];
+    char details[1536];
     std::snprintf(details, sizeof(details), "%s: allocation=%llu memoryType=%u reclaimed=%llu released=%llu initialResult=%d attempts=%u", operation, static_cast<unsigned long long>(allocation.allocationSize), allocation.memoryTypeIndex, static_cast<unsigned long long>(reclaimed), static_cast<unsigned long long>(released), static_cast<int>(initialResult), attempts);
+    if (memoryProperties2 != nullptr && physical != VK_NULL_HANDLE) {
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+        VkPhysicalDeviceMemoryProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &budget};
+        memoryProperties2(physical, &properties);
+        auto used = std::strlen(details);
+        for (std::uint32_t heap = 0; heap < memoryProperties.memoryHeapCount && heap < VK_MAX_MEMORY_HEAPS; ++heap) {
+            const auto remaining = sizeof(details) - used;
+            const auto appended = std::snprintf(details + used, remaining, "; heap %u %llu/%llu MiB", heap, static_cast<unsigned long long>(budget.heapUsage[heap] >> 20u), static_cast<unsigned long long>(budget.heapBudget[heap] >> 20u));
+            if (appended < 0 || static_cast<std::size_t>(appended) >= remaining) break;
+            used += static_cast<std::size_t>(appended);
+        }
+    }
     Check(result, details);
     return VK_NULL_HANDLE;
 }
@@ -174,15 +189,6 @@ VkDeviceMemory AllocateDeviceMemory(const Context& context, VkMemoryAllocateInfo
     }
 }
 
-std::atomic<BufferPool::CacheReclaim>& BufferPool::cacheReclaim() {
-    static std::atomic<CacheReclaim> reclaim{nullptr};
-    return reclaim;
-}
-
-void BufferPool::SetCacheReclaim(CacheReclaim reclaim) {
-    cacheReclaim().store(reclaim, std::memory_order_release);
-}
-
 VkDeviceSize BufferPool::ReclaimTarget(VkDeviceSize bytes) {
     return bytes + std::max<VkDeviceSize>(bytes, VkDeviceSize{256} << 20u);
 }
@@ -218,7 +224,11 @@ SlabSlot BufferPool::TakeSlot(const Context& context, std::uint32_t memoryType, 
         if (!slab.available.empty()) return takeFrom(*slab.available.back(), slab);
     }
     const auto blockBytes = SlabBlockBytes(capacity);
-    auto block = std::make_unique<SlabBlock>();
+    const auto release = [this](SlabBlock* block) noexcept {
+        if (block->memory != VK_NULL_HANDLE) freeBlock(*block);
+        delete block;
+    };
+    std::unique_ptr<SlabBlock, decltype(release)> block(new SlabBlock, release);
     block->slotBytes = capacity;
     block->slab = key;
     VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
@@ -233,7 +243,6 @@ SlabSlot BufferPool::TakeSlot(const Context& context, std::uint32_t memoryType, 
     if ((context.memory.memoryTypes[memoryType].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) {
         void* mapping = nullptr;
         const auto mapped = mapMemory(device, block->memory, 0, VK_WHOLE_SIZE, 0, &mapping);
-        if (mapped != VK_SUCCESS) freeMemory(device, block->memory, nullptr);
         Check(mapped, "vkMapMemory buffer slab");
         block->mapping = static_cast<std::byte*>(mapping);
     }
@@ -242,9 +251,12 @@ SlabSlot BufferPool::TakeSlot(const Context& context, std::uint32_t memoryType, 
     for (std::uint32_t index = slots; index-- != 0;) block->free.push_back(index);
     std::lock_guard lock(slabMutex);
     auto& slab = slabs[key];
+    if (slab.blocks == slab.available.capacity()) slab.available.reserve(std::max<std::size_t>(1, slab.available.capacity() * 2));
     auto& inserted = *block;
-    slabBlocks.emplace(inserted.memory, std::move(block));
+    const auto owner = slabBlocks.try_emplace(inserted.memory).first;
+    owner->second.reset(block.release());
     slab.available.push_back(&inserted);
+    ++slab.blocks;
     ++slab.emptyBlocks;
     return takeFrom(*slab.available.back(), slab);
 }
@@ -270,6 +282,7 @@ VkDeviceSize BufferPool::PutSlot(VkDeviceMemory memory, VkDeviceSize offset) noe
             return 0;
         }
         slab.available.erase(std::find(slab.available.begin(), slab.available.end(), &block));
+        --slab.blocks;
         released = std::move(found->second);
         slabBlocks.erase(found);
     }
@@ -347,7 +360,8 @@ VkBufferUsageFlags BufferPool::Usage(VkBufferUsageFlags usage, VkMemoryPropertyF
 }
 
 BufferPool::Tier& BufferPool::tierFor(std::size_t capacity, VkMemoryPropertyFlags properties) {
-    if (DeviceTiered(properties)) return deviceTier;
+    if (DeviceTiered(properties) && (sharedTiers() || capacity >= classLimit)) return deviceTier;
+    if (DeviceTiered(properties) && !RuntimeSwitches::Set(RuntimeSwitch::NoSmallDeviceTier)) return smallDeviceTier;
     return !sharedTiers() && capacity < classLimit ? smallTier : largeTier;
 }
 
@@ -361,7 +375,7 @@ std::optional<BufferAllocation> BufferPool::Take(std::size_t bytes, VkBufferUsag
         const auto now = std::chrono::steady_clock::now();
         if (now - lastReport > std::chrono::seconds(10)) {
             lastReport = now;
-            AgcDriver::ProfilePrint_nid_no_patch("[bufferpool] small: %llu hits, %llu misses, %llu evictions, %zu retained (%.0f MiB); large: %llu hits, %llu misses, %llu evictions, %zu retained (%.0f MiB)%s; device: %llu hits, %llu misses, %llu evictions, %zu retained (%.0f MiB of %llu)\n", static_cast<unsigned long long>(smallTier.hits), static_cast<unsigned long long>(smallTier.misses), static_cast<unsigned long long>(smallTier.evictions), smallTier.slots, smallTier.retainedBytes / 1048576.0, static_cast<unsigned long long>(largeTier.hits), static_cast<unsigned long long>(largeTier.misses), static_cast<unsigned long long>(largeTier.evictions), largeTier.slots, largeTier.retainedBytes / 1048576.0, sharedTiers() ? " (shared)" : "", static_cast<unsigned long long>(deviceTier.hits), static_cast<unsigned long long>(deviceTier.misses), static_cast<unsigned long long>(deviceTier.evictions), deviceTier.slots, deviceTier.retainedBytes / 1048576.0, static_cast<unsigned long long>(deviceTier.budget >> 20u));
+            AgcDriver::ProfilePrint_nid_no_patch("[bufferpool] small: %llu hits, %llu misses, %llu evictions, %zu retained (%.0f MiB); large: %llu hits, %llu misses, %llu evictions, %zu retained (%.0f MiB)%s; device: %llu hits, %llu misses, %llu evictions, %zu retained (%.0f MiB of %llu); small device%s: %llu hits, %llu misses, %llu evictions, %zu retained (%.0f MiB of %llu); hits of the exact size %llu, rebound to another size %llu%s\n", static_cast<unsigned long long>(smallTier.hits), static_cast<unsigned long long>(smallTier.misses), static_cast<unsigned long long>(smallTier.evictions), smallTier.slots, smallTier.retainedBytes / 1048576.0, static_cast<unsigned long long>(largeTier.hits), static_cast<unsigned long long>(largeTier.misses), static_cast<unsigned long long>(largeTier.evictions), largeTier.slots, largeTier.retainedBytes / 1048576.0, sharedTiers() ? " (shared)" : "", static_cast<unsigned long long>(deviceTier.hits), static_cast<unsigned long long>(deviceTier.misses), static_cast<unsigned long long>(deviceTier.evictions), deviceTier.slots, deviceTier.retainedBytes / 1048576.0, static_cast<unsigned long long>(deviceTier.budget >> 20u), RuntimeSwitches::Set(RuntimeSwitch::NoSmallDeviceTier) ? " (APS5_NO_SMALL_DEVICE_TIER: in the small tier)" : "", static_cast<unsigned long long>(smallDeviceTier.hits), static_cast<unsigned long long>(smallDeviceTier.misses), static_cast<unsigned long long>(smallDeviceTier.evictions), smallDeviceTier.slots, smallDeviceTier.retainedBytes / 1048576.0, static_cast<unsigned long long>(smallDeviceTier.budget >> 20u), static_cast<unsigned long long>(exactSizeHits), static_cast<unsigned long long>(resizedHits), RuntimeSwitches::Set(RuntimeSwitch::NoExactSizeReuse) ? " (APS5_NO_EXACT_SIZE_REUSE)" : "");
             if (vram.Enabled()) {
                 const auto report = vram.Report();
                 AgcDriver::ProfilePrint_nid_no_patch("[vram] heap %u: budget %llu MiB, usage %llu MiB, target %llu MiB; %llu released device buffers (%.0f MiB) not pooled over the target\n", report.heap, static_cast<unsigned long long>(report.budget >> 20u), static_cast<unsigned long long>(report.usage >> 20u), static_cast<unsigned long long>(report.target >> 20u), static_cast<unsigned long long>(vramDropped), vramDroppedBytes / 1048576.0);
@@ -369,16 +383,30 @@ std::optional<BufferAllocation> BufferPool::Take(std::size_t bytes, VkBufferUsag
         }
     }
     auto& tier = tierFor(capacity, properties);
-    const auto largest = &tier == &deviceTier && !exactSizes() && bytes <= std::numeric_limits<std::size_t>::max() / 2 ? std::max(capacity, bytes * 2) : capacity;
+    const auto largest = (&tier == &deviceTier || &tier == &smallDeviceTier) && !exactSizes() && bytes <= std::numeric_limits<std::size_t>::max() / 2 ? std::max(capacity, bytes * 2) : capacity;
     auto found = tier.free.end();
     for (auto size = capacity; size <= largest && found == tier.free.end(); size = NextCapacity(size)) found = tier.free.find({size, usage, properties});
     if (found == tier.free.end() || found->second.empty()) {
         ++tier.misses;
         return std::nullopt;
     }
-    auto result = found->second.back().allocation;
-    found->second.pop_back();
-    if (found->second.empty()) tier.free.erase(found);
+    auto& slots = found->second;
+    auto chosen = std::prev(slots.end());
+    if (chosen->allocation.bufferBytes != bytes && !RuntimeSwitches::Set(RuntimeSwitch::NoExactSizeReuse)) {
+        std::size_t scanned = 0;
+        for (auto it = chosen; scanned < exactSizeScan; ++scanned) {
+            if (it->allocation.bufferBytes == bytes) {
+                chosen = it;
+                break;
+            }
+            if (it == slots.begin()) break;
+            --it;
+        }
+    }
+    auto result = chosen->allocation;
+    (result.bufferBytes == bytes ? exactSizeHits : resizedHits) += 1;
+    slots.erase(chosen);
+    if (slots.empty()) tier.free.erase(found);
     --tier.slots;
     tier.retainedBytes -= result.allocationBytes;
     ++tier.hits;
@@ -411,9 +439,10 @@ VkDeviceSize BufferPool::trim() {
     Tier retiredSmall;
     Tier retiredLarge;
     Tier retiredDevice;
+    Tier retiredSmallDevice;
     {
         std::lock_guard lock(mutex);
-        for (const auto& [tier, retired] : {std::pair{&smallTier, &retiredSmall}, std::pair{&largeTier, &retiredLarge}, std::pair{&deviceTier, &retiredDevice}}) {
+        for (const auto& [tier, retired] : {std::pair{&smallTier, &retiredSmall}, std::pair{&largeTier, &retiredLarge}, std::pair{&deviceTier, &retiredDevice}, std::pair{&smallDeviceTier, &retiredSmallDevice}}) {
             tier->free.swap(retired->free);
             tier->evictions += tier->slots;
             tier->retainedBytes = 0;
@@ -421,7 +450,7 @@ VkDeviceSize BufferPool::trim() {
         }
     }
     VkDeviceSize bytes = 0;
-    for (const auto* tier : {&retiredSmall, &retiredLarge, &retiredDevice}) {
+    for (const auto* tier : {&retiredSmall, &retiredLarge, &retiredDevice, &retiredSmallDevice}) {
         for (const auto& [key, slots] : tier->free) {
             for (const auto& slot : slots) bytes += destroy(slot.allocation);
         }
@@ -434,6 +463,7 @@ VkDeviceSize BufferPool::trim() {
             if (found == slabBlocks.end()) break;
             auto& slab = slabs.at(found->second->slab);
             slab.available.erase(std::find(slab.available.begin(), slab.available.end(), found->second.get()));
+            --slab.blocks;
             --slab.emptyBlocks;
             released = std::move(found->second);
             slabBlocks.erase(found);
@@ -453,7 +483,7 @@ void BufferPool::Put(const BufferAllocation& allocation) noexcept {
         if (DeviceTiered(allocation.properties)) excess = vram.Excess();
         std::lock_guard lock(mutex);
         auto& tier = tierFor(allocation.bytes, allocation.properties);
-        if (excess != 0 && &tier == &deviceTier) {
+        if (excess != 0 && (&tier == &deviceTier || &tier == &smallDeviceTier)) {
             auto dropped = allocation.allocationBytes;
             while (tier.slots != 0 && dropped < excess) {
                 evictOldest(tier, evicted);
@@ -483,8 +513,8 @@ std::shared_ptr<BufferPool> GetBufferPool(const Context& context) {
     return context.bufferPool;
 }
 
-VkDeviceMemory AllocateAttachmentMemory(const Context& context, const VkMemoryAllocateInfo& allocation, std::uint32_t mask, const char* operation) {
-    return GetBufferPool(context)->AllocateMemory(allocation, operation, context.HostMemoryType(mask));
+VkDeviceMemory AllocateImageMemory(const Context& context, const VkMemoryAllocateInfo& allocation, std::uint32_t mask, const char* operation) {
+    return GetBufferPool(context)->AllocateMemory(allocation, operation, context.RefusedDeviceMemoryFallback(mask, allocation.memoryTypeIndex));
 }
 
 }

@@ -1,17 +1,20 @@
 #include "prx/libkernel/AppMetadata/include/AppMetadata.hpp"
 #include "prx/libkernel/AppMetadata/include/ParamJsonParser.hpp"
+#include "prx/libkernel/AppMetadata/include/ParamSfoParser.hpp"
 #include "prx/libc/include/General.hpp"
 
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace {
 
+std::mutex g_metadataMutex;
 bool g_titleLoaded = false;
 bool g_iconAttempted = false;
 bool g_iconLoaded = false;
@@ -23,6 +26,7 @@ std::int32_t g_userDefinedParams[4] = {};
 std::vector<std::uint8_t> g_iconBytes;
 
 constexpr const char* AppMetadataParamJsonGuestPath = "/app0/sce_sys/param.json";
+constexpr const char* AppMetadataParamSfoGuestPath = "/app0/sce_sys/param.sfo";
 constexpr const char* AppMetadataIconGuestPath = "/app0/sce_sys/icon0.png";
 
 void copyToFixedBuffer(char* destination, std::size_t destinationSize, const std::string& source) {
@@ -31,11 +35,16 @@ void copyToFixedBuffer(char* destination, std::size_t destinationSize, const std
     std::memcpy(destination, source.c_str(), source.size() + 1);
 }
 
+ParsedParamJson parseParams(const std::filesystem::path& paramJson, const std::filesystem::path& paramSfo) {
+    if (std::filesystem::exists(paramJson)) return parseParamJson(paramJson);
+    if (std::filesystem::exists(paramSfo)) return parseParamSfo(paramSfo);
+    throw std::runtime_error("param.json or param.sfo not found");
+}
+
 void ensureTitleLoaded() {
+    std::lock_guard lock(g_metadataMutex);
     if (g_titleLoaded) return;
-    const auto resolvedPath = ResolvePath_nid_no_patch(AppMetadataParamJsonGuestPath);
-    if (!std::filesystem::exists(resolvedPath)) throw std::runtime_error("param.json not found");
-    const auto parsed = parseParamJson(resolvedPath);
+    const auto parsed = parseParams(ResolvePath_nid_no_patch(AppMetadataParamJsonGuestPath), ResolvePath_nid_no_patch(AppMetadataParamSfoGuestPath));
     copyToFixedBuffer(g_title, sizeof(g_title), parsed.title);
     copyToFixedBuffer(g_titleId, sizeof(g_titleId), parsed.titleId);
     g_downloadDataSizeMiB = parsed.downloadDataSizeMiB;
@@ -47,8 +56,9 @@ void ensureTitleLoaded() {
 const bool g_downloadDataMounted = [] {
     try {
         const auto run = std::filesystem::current_path();
-        const auto paramJson = run / "app0" / "sce_sys" / "param.json";
-        if (!std::filesystem::exists(paramJson) || parseParamJson(paramJson).downloadDataSizeMiB == 0) return false;
+        const auto metadata = run / "app0" / "sce_sys";
+        if (!std::filesystem::exists(metadata / "param.json") && !std::filesystem::exists(metadata / "param.sfo")) return false;
+        if (parseParams(metadata / "param.json", metadata / "param.sfo").downloadDataSizeMiB == 0) return false;
         std::filesystem::create_directories(run / "download0");
         return true;
     } catch (const std::exception&) {
@@ -59,7 +69,8 @@ const bool g_downloadDataMounted = [] {
 const bool g_dataMounted = [] {
     try {
         const auto run = std::filesystem::current_path();
-        if (!std::filesystem::exists(run / "app0" / "sce_sys" / "param.json")) return false;
+        const auto metadata = run / "app0" / "sce_sys";
+        if (!std::filesystem::exists(metadata / "param.json") && !std::filesystem::exists(metadata / "param.sfo")) return false;
         std::filesystem::create_directories(run / "data");
         return true;
     } catch (const std::exception&) {
@@ -68,6 +79,7 @@ const bool g_dataMounted = [] {
 }();
 
 void ensureIconLoaded() {
+    std::lock_guard lock(g_metadataMutex);
     if (g_iconAttempted) return;
     g_iconAttempted = true;
     const auto resolvedPath = ResolvePath_nid_no_patch(AppMetadataIconGuestPath);
@@ -76,10 +88,11 @@ void ensureIconLoaded() {
     if (!file.is_open()) throw std::runtime_error("failed to open icon0.png");
     file.seekg(0, std::ios::end);
     const auto fileSize = file.tellg();
+    if (file.fail() || fileSize <= 0) throw std::runtime_error("icon0.png is empty or unreadable");
     file.seekg(0, std::ios::beg);
     std::vector<std::uint8_t> bytes(static_cast<std::size_t>(fileSize));
-    if (!bytes.empty()) file.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
-    if (bytes.empty()) throw std::runtime_error("icon0.png is empty");
+    file.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    if (!file || file.gcount() != static_cast<std::streamsize>(bytes.size())) throw std::runtime_error("failed to read icon0.png");
     constexpr std::uint8_t PngSignature[8] = {0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A};
     if (bytes.size() < 8 || std::memcmp(bytes.data(), PngSignature, sizeof(PngSignature)) != 0) throw std::runtime_error("icon0.png is not a valid PNG file");
     g_iconBytes = std::move(bytes);

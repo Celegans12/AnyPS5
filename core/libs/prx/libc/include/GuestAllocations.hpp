@@ -20,6 +20,7 @@ struct Range {
     std::size_t allocationBytes;
     bool releasable = true;
     bool gpu = false;
+    std::uint64_t backingSerial = 0;
 };
 
 class Lease {
@@ -54,10 +55,8 @@ using Mapped = std::vector<std::weak_ptr<const Range>>;
 extern "C" {
 void* GuestAllocationsBegin_nid_postfix();
 void GuestAllocationsRegisterMainImage_nid_postfix(void* mutation);
-#ifdef _WIN32
 void GuestAllocationsRegisterImage_nid_postfix(void* mutation, const void* image);
 void GuestAllocationsUnregisterImage_nid_postfix(void* mutation, const void* image);
-#endif
 void GuestAllocationsEnd_nid_postfix(void* mutation) noexcept;
 void GuestAllocationsAdd_nid_postfix(void* mutation, void* pointer, std::size_t bytes, bool readable, bool writable, bool gpu);
 void GuestAllocationsRequireUnpinned_nid_postfix(void* mutation, const void* pointer, std::size_t bytes);
@@ -97,10 +96,8 @@ public:
     Mutation(const Mutation&) = delete;
     Mutation& operator=(const Mutation&) = delete;
     void RegisterMainImage() { GuestAllocationsRegisterMainImage_nid_postfix(handle); }
-#ifdef _WIN32
     void RegisterImage(const void* image) { GuestAllocationsRegisterImage_nid_postfix(handle, image); }
     void UnregisterImage(const void* image) { GuestAllocationsUnregisterImage_nid_postfix(handle, image); }
-#endif
     void Add(void* pointer, std::size_t bytes, bool readable, bool writable, bool gpu) { GuestAllocationsAdd_nid_postfix(handle, pointer, bytes, readable, writable, gpu); }
     void RequireUnpinned(const void* pointer, std::size_t bytes) const { GuestAllocationsRequireUnpinned_nid_postfix(handle, pointer, bytes); }
     void RequireAvailable(const void* pointer, std::size_t bytes) const { GuestAllocationsRequireAvailable_nid_postfix(handle, pointer, bytes); }
