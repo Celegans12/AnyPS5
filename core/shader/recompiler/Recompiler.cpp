@@ -1128,6 +1128,8 @@ std::shared_ptr<const std::set<std::uint32_t>> declaredSpecializationIds(const C
     return declared.emplace(artifact.variantId, std::move(ids)).first->second;
 }
 
+constexpr std::size_t MaxRuntimeFormatReuseBuffers = 6;
+
 std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderArtifact& artifact, const IrBindingLayout& layout, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target) {
     struct ModuleKeyStorage {};
     auto& key = HostThreadLocal<std::vector<std::uint64_t>, ModuleKeyStorage>();
@@ -1142,9 +1144,31 @@ std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderAr
         if (const auto found = modules.find(key); found != modules.end()) entry = found->second;
     }
     if (entry == nullptr) {
+        std::vector<std::size_t> formats;
+        if (PipelineSpecialization::AbsentRuntimeFormat()) {
+            for (std::size_t position = 1; position < constants.size(); ++position) {
+                const auto& flag = constants[position];
+                if (flag.id >= PipelineSpecialization::ImageBase || flag.id % PipelineSpecialization::BufferWords != PipelineSpecialization::BufferRuntimeFormatWord || flag.value != 0u || constants[position - 1u].id + 1u != flag.id) continue;
+                formats.push_back(position);
+            }
+        }
+        if (!formats.empty() && formats.size() <= MaxRuntimeFormatReuseBuffers) {
+            auto alternative = key;
+            std::shared_lock lock(mutex);
+            for (std::size_t mask = 1; mask < (std::size_t{1} << formats.size()) && entry == nullptr; ++mask) {
+                alternative = key;
+                for (std::size_t bit = 0; bit < formats.size(); ++bit) {
+                    if ((mask & (std::size_t{1} << bit)) == 0u) continue;
+                    const auto position = formats[bit];
+                    alternative[position] = (static_cast<std::uint64_t>(constants[position - 1u].id) << 32u);
+                    alternative[position + 1u] = (static_cast<std::uint64_t>(constants[position].id) << 32u) | 1u;
+                }
+                if (const auto found = modules.find(alternative); found != modules.end()) entry = found->second;
+            }
+        }
         std::unique_lock lock(mutex);
         const auto found = modules.find(key);
-        entry = found != modules.end() ? found->second : modules.emplace(key, std::make_shared<SpecializedModuleEntry>()).first->second;
+        entry = found != modules.end() ? found->second : entry != nullptr ? modules.emplace(key, entry).first->second : modules.emplace(key, std::make_shared<SpecializedModuleEntry>()).first->second;
     }
     std::call_once(entry->ready, [&] {
         try {

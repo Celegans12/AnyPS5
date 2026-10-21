@@ -5,6 +5,7 @@
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <iostream>
 #include <span>
 #include <string>
@@ -30,6 +31,7 @@ constexpr std::array<std::uint32_t, 12> LoadCode(std::uint32_t marker) {
 
 alignas(256) constexpr auto BoundFirstCode = LoadCode(0u);
 alignas(256) constexpr auto NullFirstCode = LoadCode(1u);
+alignas(256) constexpr auto FormatsCode = LoadCode(2u);
 
 std::array<std::uint32_t, 4> Descriptor(const void* data, std::uint32_t records, std::uint32_t format, std::uint32_t stride = 0u) {
     const auto address = reinterpret_cast<std::uintptr_t>(data);
@@ -97,12 +99,29 @@ void BoundThenNull(AgcDriver::VulkanDevice& device) {
     Require(absentAfter.pipeline == bound.pipeline, "a null V# did not keep the first bound slot's substitute");
 }
 
+bool RuntimeFormatEnabled() {
+    return std::getenv("APS5_NO_ABSENT_RUNTIME_FORMAT") == nullptr;
+}
+
 void NullThenBound(AgcDriver::VulkanDevice& device) {
     const auto first = Run(device, NullFirstCode, 1u, GameNull, "null V# before any bound slot", 0xffffffffu);
     const auto bound = Run(device, NullFirstCode, 1u, Descriptor(Input.data(), InputBytes, Format32UInt), "bound after null", 0xffffffffu);
-    Require(first.pipeline != bound.pipeline, "a slot never seen bound did not specialize as absent");
+    if (RuntimeFormatEnabled()) Require(first.pipeline == bound.pipeline && first.spirv == bound.spirv, "a slot never seen bound did not give its module to the bound slot");
+    else Require(first.pipeline != bound.pipeline, "a slot never seen bound did not specialize as absent");
     const auto learned = Run(device, NullFirstCode, 1u, ZeroNull, "zero V# after the slot was bound", 0xffffffffu);
     Require(learned.pipeline == bound.pipeline && learned.spirv == bound.spirv, "a null V# did not take the substitute learned from the bound slot");
+}
+
+void AbsentThenFormats(AgcDriver::VulkanDevice& device) {
+    const auto absent = Run(device, FormatsCode, 2u, GameNull, "null V# before any format", 0xffffffffu);
+    const auto wide = Run(device, FormatsCode, 2u, Descriptor(Input.data(), InputBytes, Format32UInt), "32_UINT after null", 0xffffffffu);
+    const auto narrow = Run(device, FormatsCode, 2u, Descriptor(Input.data(), 1u, Format16UInt, InputBytes), "16_UINT structured stride 128 after 32_UINT", 0xffffu);
+    if (RuntimeFormatEnabled()) {
+        Require(absent.pipeline == wide.pipeline && absent.spirv == wide.spirv, "the first format built a module beside the absent slot's");
+        Require(absent.pipeline == narrow.pipeline && absent.spirv == narrow.spirv, "the second format built a module beside the absent slot's");
+    } else {
+        Require(absent.pipeline != wide.pipeline && wide.pipeline != narrow.pipeline && absent.pipeline != narrow.pipeline, "APS5_NO_ABSENT_RUNTIME_FORMAT did not build one module per format word");
+    }
 }
 
 }
@@ -113,6 +132,7 @@ int main() {
         if (!device) return VulkanTestSkipped;
         BoundThenNull(*device);
         NullThenBound(*device);
+        AbsentThenFormats(*device);
         std::puts("buffer presence runtime tests passed");
         return 0;
     } catch (const std::exception& error) {
