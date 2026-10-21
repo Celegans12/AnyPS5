@@ -139,7 +139,8 @@ public:
             queue.queueFamilyIndex = family;
             queue.queueCount = 1;
             queue.pQueuePriorities = &priority;
-            const std::array<const char*, 2> extensionNames{VK_EXT_ROBUSTNESS_2_EXTENSION_NAME, VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME};
+            std::vector<const char*> extensionNames{VK_EXT_ROBUSTNESS_2_EXTENSION_NAME, VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME};
+            if (enabled12.timelineSemaphore == VK_TRUE && hasExtension(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME)) extensionNames.push_back(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME);
             VkDeviceCreateInfo device{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enabled12};
             device.queueCreateInfoCount = 1;
             device.pQueueCreateInfos = &queue;

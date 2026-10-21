@@ -301,6 +301,12 @@ FileStream* APS5_VABI fdopen_nid_postfix(int descriptor, const char* mode) {
     } catch (const std::bad_alloc&) { errno = 12; return nullptr; }
 }
 
+static int OpenFailure(const std::filesystem::path& path, bool writes, int hostError) {
+    const int error = GuestErrnoFromHost_nid_no_patch(hostError);
+    std::error_code status;
+    return writes && error == 13 && std::filesystem::is_directory(path, status) ? 21 : error;
+}
+
 FileStream* APS5_VABI freopen_nid_postfix(const char* filename, const char* mode, FileStream* stream) {
     if (!stream || !mode) { errno = 22; return nullptr; }
     if (!filename) { errno = 45; return nullptr; } // Mode-only reopening is not supported.
@@ -317,7 +323,7 @@ FileStream* APS5_VABI freopen_nid_postfix(const char* filename, const char* mode
                 return nullptr;
             }
         }
-        if (stream->Reopen(path, parsed->native.c_str())) {
+        if (stream->Reopen(path, parsed->native.c_str(), OpenNative)) {
 #ifdef _WIN32
             if (parsed->append && !AppendOnlyDescriptor(_fileno(stream->GetHandle()))) {
                 const int error = errno;
@@ -331,7 +337,8 @@ FileStream* APS5_VABI freopen_nid_postfix(const char* filename, const char* mode
             if (!path.empty() && parsed->writes) RecordWrittenPath_nid_no_patch(path);
             return stream;
         }
-        const int error = GuestErrnoFromHost_nid_no_patch(errno);
+        int error = OpenFailure(path, parsed->writes, errno);
+        if (error == 2) error = NotFoundError_nid_no_patch(path);
         if (stream->IsDynamic()) delete stream;
         errno = error;
         return nullptr;
@@ -363,7 +370,8 @@ FileStream* APS5_VABI fopen_nid_postfix(const char* filename, const char* mode) 
     if (const int error = ResolvePathError_nid_no_patch(filename, fpath)) { errno = error; return nullptr; }
     std::unique_ptr<std::FILE, int (*)(std::FILE*)> handle(OpenNative(fpath, parsed->native), std::fclose);
     if (!handle) {
-        errno = GuestErrnoFromHost_nid_no_patch(errno);
+        errno = OpenFailure(fpath, parsed->writes, errno);
+        if (errno == 2) errno = NotFoundError_nid_no_patch(fpath);
         return nullptr;
     }
     // APS5_LOG_OUT("success: \"%s\"", abs_path.c_str());

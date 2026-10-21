@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <list>
 #include <memory>
+#include <utility>
 #include <vector>
 #include "prx/libc/include/general/AtomicSharedPtr.hpp"
 
@@ -44,6 +45,9 @@ struct DrawDecode {
 void ReadUserWords(const QueueState& queue, DrawProgram& program, bool staticAbi);
 void InitializeMerged(const QueueState& queue, DrawProgram& program, std::uint32_t pointerBase, bool pointerRequired, bool staticAbi);
 void DecodeGraphicsPrograms(DrawDecode& decoded, const QueueState& queue, const ShaderRegistry& registry, bool staticAbi, bool includeFragment);
+
+void AppendProgramMemory(std::vector<ShaderRecompiler::MemoryRegion>& memory, const std::vector<DrawProgram>& programs);
+std::vector<std::pair<std::size_t, std::size_t>> UserDataWords(const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, std::uint32_t location);
 
 struct PreparedGraphicsStage {
     std::shared_ptr<const ShaderSnapshot> snapshot;
@@ -134,6 +138,7 @@ struct StageCapture {
     std::uint64_t forgetSerial = 0;
     std::uint32_t pushOffset = 0;
     ShaderRecompiler::SrtUserDataUse userDataUse;
+    std::uint64_t userDataMask = ~std::uint64_t{0};
 };
 
 struct RelocatableUserWord {

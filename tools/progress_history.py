@@ -8,7 +8,7 @@ import sys
 import subprocess
 import tarfile
 import tempfile
-from datetime import date
+from datetime import date, datetime, timezone
 from html import escape
 from pathlib import Path
 
@@ -26,9 +26,9 @@ def git(*args):
 
 def daily_commits(ref):
     seen = {}
-    for line in git("log", "--first-parent", "--format=%H %cs", ref).decode().splitlines():
-        sha, day = line.split()
-        seen.setdefault(day, sha)
+    for line in git("log", "--first-parent", "--format=%H %ct", ref).decode().splitlines():
+        sha, timestamp = line.split()
+        seen.setdefault(datetime.fromtimestamp(int(timestamp), timezone.utc).date().isoformat(), sha)
     return sorted(seen.items())
 
 
@@ -210,7 +210,7 @@ def page(points):
         f'<p>Each panel has its own scale: the solid line is what is implemented, the dashed line what is declared. Library '
         'functions are declared in the <code>prx</code> sources; the shader total is the AMD RDNA 1 + RDNA 2 instruction list '
         f'(<a href="{progress.SOURCE}/tools/rdna_isa.txt">tools/rdna_isa.txt</a>). '
-        'One point per day with commits on <code>main</code>, taken at the last commit of the day. Every point is measured '
+        'One point per UTC day with commits on <code>main</code>, taken at the last commit of the day. Every point is measured '
         f'with the current <a href="{progress.SOURCE}/tools/progress.py">tools/progress.py</a> rules and instruction list, '
         'so the series is comparable across days. Hover a day for the exact numbers. Raw numbers: <a href="history.json">history.json</a>. '
         '<a href="progress.html">Back to the current progress</a>.</p>',

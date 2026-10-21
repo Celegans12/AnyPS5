@@ -23,6 +23,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -33,6 +34,7 @@ using namespace AgcDriver::GuestMemory;
 constexpr std::size_t Block = 65536;
 #ifdef _WIN32
 constexpr wchar_t HostHoleMode[] = L"--host-hole";
+constexpr wchar_t ResidentRemapMode[] = L"--resident-direct-remap";
 #endif
 
 void Require(bool condition, const std::string& message) {
@@ -688,6 +690,82 @@ void CheckRewatch() {
     GuestArena::GuestArenaRelease_nid_postfix(memory, 4 * Block);
 }
 
+void CheckResidentDirectMappingReuse() {
+    constexpr std::size_t bytes = 5 * Block;
+    auto* memory = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, Block));
+    Require(memory != nullptr, "cannot reserve the resident remap fixture");
+    struct Cleanup {
+        std::uint8_t* memory;
+        std::array<HANDLE, 3> sections{};
+        ~Cleanup() {
+            GuestArena::GuestArenaReset_nid_postfix(memory, bytes);
+            GuestArena::GuestArenaRelease_nid_postfix(memory, bytes);
+            for (const auto section : sections) {
+                if (section == nullptr) continue;
+                GuestArena::GuestArenaForgetSection_nid_postfix(section);
+                CloseHandle(section);
+            }
+        }
+    } cleanup{memory};
+    GuestArena::GuestArenaCommit_nid_postfix(memory, 3 * Block, PAGE_READWRITE, 3 * Block);
+    GuestArena::GuestArenaCommit_nid_postfix(memory + 3 * Block, 2 * Block, PAGE_READWRITE, 2 * Block);
+    Require(Watched(reinterpret_cast<std::uint64_t>(memory), bytes), "the resident remap fixture is not watched");
+    for (auto& section : cleanup.sections) {
+        section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, 3 * Block, nullptr);
+        Require(section != nullptr, "cannot create the resident remap backing");
+    }
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    const auto nativeType = [&](std::size_t offset) {
+        MEMORY_BASIC_INFORMATION info{};
+        Require(VirtualQuery(memory + offset, &info, sizeof(info)) == sizeof(info), "cannot query the resident remap backing");
+        return info.Type;
+    };
+    for (std::size_t use = 0; use < 2; ++use) {
+        BumpCollectEpoch();
+        const auto before = CollectWrites(base, 3 * Block);
+        Require(before != 0, "the backing before a resident remap was not collected");
+        Unwatch(base + Block, Block);
+        Require(!Watched(base + Block, Block), "the resident remap exclusion was not established");
+        const auto outside = CollectWrites(base + 3 * Block, 2 * Block);
+        const auto mapping = GuestArena::GuestArenaCommitGeneration_nid_postfix();
+        GuestArena::GuestArenaMapDirect_nid_postfix(memory, 3 * Block, cleanup.sections[use], 0, PAGE_READWRITE);
+        Require(nativeType(0) == MEM_PRIVATE && nativeType(2 * Block) == MEM_PRIVATE, "the resident remap did not create private memory");
+        Require(Watched(base, 3 * Block), "a resident direct remap retained an old import exclusion");
+        Require(GuestArena::GuestArenaCommitGeneration_nid_postfix() > mapping, "a resident direct remap reused the mapping generation");
+        Require(!UnchangedSince(base, Block, before) && !UnchangedSince(base + 2 * Block, Block, before), "a resident direct remap reused old neighbour stamps");
+        Require(UnchangedSince(base + 3 * Block, 2 * Block, outside), "a resident direct remap invalidated memory outside its range");
+        const auto after = CollectWritesUncached(base, 3 * Block);
+        Require(after > before && UnchangedSince(base, 3 * Block, after), "the resident remap could not establish a current generation");
+        memory[Block + 9] = static_cast<std::uint8_t>(0x51 + use);
+        CollectWritesUncached(base, 3 * Block);
+        Require(!UnchangedSince(base + Block, Block, after), "a CPU store after a resident direct remap was missed");
+        std::cout << "resident direct remap " << use << ": private, watched, new mapping generation, CPU store collected\n";
+    }
+    Unwatch(base, 3 * Block);
+    GuestArena::GuestArenaMap_nid_postfix(memory, 3 * Block, cleanup.sections[0], 0, PAGE_READWRITE);
+    Require(nativeType(0) == MEM_MAPPED, "the shared remap did not create mapped memory");
+    for (std::size_t block = 0; block < 3; ++block) Require(!Watched(base + block * Block, Block), "an ordinary shared remap restored a private import exclusion");
+    GuestArena::GuestArenaMapDirect_nid_postfix(memory + 3 * Block, 2 * Block, cleanup.sections[2], 0, PAGE_READWRITE);
+    GuestArena::GuestArenaMapDirect_nid_postfix(memory, 3 * Block, cleanup.sections[2], 0, PAGE_READWRITE);
+    Require(nativeType(0) == MEM_MAPPED && nativeType(Block) == MEM_MAPPED && nativeType(2 * Block) == MEM_PRIVATE, "the mixed direct remap did not establish shared and private spans");
+    Require(!Watched(base, Block) && !Watched(base + Block, Block) && Watched(base + 2 * Block, Block), "the mixed direct remap restored an exclusion outside its new private span");
+    std::cout << "resident direct remap controls: shared exclusions retained, only the new private span restored\n";
+    Unwatch(base, 3 * Block);
+    bool refused = false;
+    try {
+        GuestArena::GuestArenaMapDirect_nid_postfix(memory, 3 * Block, cleanup.sections[1], 0, 0);
+    } catch (const std::system_error& error) {
+        Require(error.code().value() == ERROR_INVALID_PARAMETER, "the failed resident remap reported an unexpected error");
+        refused = true;
+    }
+    std::uintptr_t createdBegin = 0;
+    std::uintptr_t createdEnd = 0;
+    Require(refused && GuestArena::GuestArenaResidentSpan_nid_postfix(base, 1, &createdBegin, &createdEnd), "the failing protection change did not leave a new private span");
+    Require(createdBegin == base && createdEnd <= base + 3 * Block && Watched(base, createdEnd - base), "a failed resident remap did not report its completed private span");
+    for (auto block = createdEnd; block < base + 3 * Block; block += Block) Require(!Watched(block, Block), "a failed resident remap restored an uncreated span");
+    std::cout << "resident direct remap failure: completed private span watched, original mapping error retained\n";
+}
+
 void CheckUntrackedHint() {
     constexpr std::size_t bytes = 4 * Block;
     auto* memory = static_cast<volatile std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, Block));
@@ -1142,8 +1220,8 @@ void CheckImportWindowOverUnwatchedPart() {
     const bool imported = ImportWatched(base, 3 * Block, [] { return true; });
     SetUnwatchHook(nullptr);
     Require(imported, "an import over a partly unwatched range failed");
-    Require(!Watched(base, Block) && !Watched(base + 2 * Block, Block), "an import over a partly unwatched range left its watched blocks watched");
-    Require(hookedBegin <= base && hookedEnd >= base + 3 * Block, "an import that left the write watch did not run the unwatch hook over its range");
+    Require(Watched(base, Block) && Watched(base + 2 * Block, Block), "an import over a partly unwatched range took its watched blocks out of the watch");
+    Require(hookedBegin <= base + Block && hookedEnd >= base + 2 * Block, "an import that left the write watch did not run the unwatch hook over the part that left");
 }
 
 void CheckImportWindowOtherThread() {
@@ -1197,6 +1275,37 @@ void CheckImportWindowZeroPages() {
     Require(changed[2] == BlockWritten && WrittenSince(base + 2 * Block, Block, synced), "a store of new bytes to a zero page within an import window was missed");
     Require(changed[3] == BlockUnchanged && UnchangedSince(base + 3 * Block, Block, synced), "a page after the zero pages of an import window was compared with other bytes");
     Require(changed[4] == BlockWritten && WrittenSince(base + 4 * Block, Block, synced), "a store of new bytes after the zero pages of an import window was missed");
+}
+
+void CheckImportWindowOverUnwatchedBlock() {
+    void* memory = AllocateWatched(4 * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    auto* bytes = static_cast<volatile std::uint8_t*>(memory);
+    std::memset(memory, 0x11, 4 * Block);
+    Unwatch(base + Block, Block);
+    const auto synced = CollectWritesUncached(base + 2 * Block, 2 * Block);
+    const auto syncedFirst = CollectWritesUncached(base, Block);
+    Require(synced != 0 && syncedFirst != 0, "the watched blocks around the unwatched one are not collected");
+    bytes[0x500] = 0x44;
+    Require(ImportWatched(base, 4 * Block, [&] {
+        bytes[0x100] = 0x11;
+        bytes[2 * Block + 0x100] = 0x11;
+        bytes[3 * Block + 0x2000] = 0x22;
+        return true;
+    }), "the import over an unwatched block failed");
+    Require(!Watched(base + Block, Block), "an import window made an unwatched block watched");
+    Require(Watched(base, Block) && Watched(base + 2 * Block, 2 * Block), "an import window over an unwatched block took the watched blocks out of the write watch");
+    const std::array<std::uint64_t, 2> generations{synced, synced};
+    std::array<std::uint8_t, 2> changed{};
+    std::array<std::uint8_t, 2> cpu{};
+    Require(ChangedBlocks(base + 2 * Block, 2 * Block, generations, changed, cpu), "the watched blocks after an unwatched block are not tracked");
+    Require(changed[0] == BlockUnchanged && UnchangedSince(base + 2 * Block, Block, synced), "a page an import window over an unwatched block resolved without changing its bytes reads as written");
+    Require(changed[1] == BlockWritten && WrittenSince(base + 3 * Block, Block, synced), "a store of new bytes within an import window over an unwatched block was missed");
+    Require(WrittenSince(base, Block, syncedFirst), "a store before an import window over an unwatched block was missed");
+    const auto after = CollectWritesUncached(base, Block);
+    bytes[0x100] = 0x33;
+    static_cast<void>(CollectWritesUncached(base, Block));
+    Require(after != 0 && !UnchangedSince(base, Block, after), "a store after an import window over an unwatched block was missed");
 }
 
 void ProtectPage(std::uint64_t address, bool readable) {
@@ -1754,6 +1863,10 @@ int main(int argc, char** argv) {
             CheckHostHole();
             return 0;
         }
+        if (std::wstring_view(GetCommandLineW()).ends_with(ResidentRemapMode)) {
+            CheckResidentDirectMappingReuse();
+            return 0;
+        }
 #endif
         CheckSharedBlock();
         CheckRepeatedNeighbourStores();
@@ -1786,6 +1899,7 @@ int main(int argc, char** argv) {
         CheckImportWindowZeroPages();
         CheckImportWindowOtherThread();
         CheckImportWindowOverUnwatchedPart();
+        CheckImportWindowOverUnwatchedBlock();
         CheckStoreAcrossImports();
         CheckUnwatchedImport();
         CheckCommittedRanges();

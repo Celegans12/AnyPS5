@@ -12,6 +12,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "ShaderDiskCache.hpp"
+#include "ShaderCacheDirectory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
@@ -51,6 +52,7 @@
 #include <random>
 #include <initializer_list>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <optional>
 #include <set>
@@ -519,6 +521,12 @@ void stateTests() {
     queue.shader[0x008] = 0;
     Require(AgcDriver::Graphics::PixelProgramSkipped(queue), "a zero pixel program address was not read as unset");
     Require(AgcDriver::Graphics::DrawRejection(queue, true).find("writes color") != std::string::npos, "a draw without a pixel program that writes color was accepted");
+    auto colorDisabled = queue;
+    colorDisabled.context[0x202] = colorDisabled.context.at(0x202) & ~0x70u;
+    Require(AgcDriver::Graphics::DrawRejection(colorDisabled, true).empty(), "a draw without a pixel program was rejected while CB_COLOR_CONTROL disables color");
+    Require(!AgcDriver::Graphics::DecodeState(colorDisabled).hasColorTarget, "a draw with CB_COLOR_CONTROL disabling color decoded a color target");
+    colorDisabled.context.erase(0x202);
+    Require(AgcDriver::Graphics::DrawRejection(colorDisabled, true).find("writes color") != std::string::npos, "a draw without a pixel program and an unwritten CB_COLOR_CONTROL was accepted");
     queue.shader.erase(0x008);
     queue.shader.erase(0x009);
     Require(AgcDriver::Graphics::PixelProgramSkipped(queue), "an unwritten pixel program address was not read as unset");
@@ -2646,6 +2654,28 @@ void DepthBoundsBiasTests() {
     queue.context[0x009] = bits(0.75f);
     auto state = AgcDriver::Graphics::DecodeState(queue);
     Require(state.depthTest && state.depthBoundsTest && state.minDepthBounds == 0.25f && state.maxDepthBounds == 0.75f, "depth bounds decode changed");
+    const auto infinity = std::numeric_limits<float>::infinity();
+    for (const auto bounds : {std::array{0.0f, infinity}, std::array{-infinity, 1.0f}, std::array{-infinity, infinity}}) {
+        queue.context[0x008] = bits(bounds[0]);
+        queue.context[0x009] = bits(bounds[1]);
+        state = AgcDriver::Graphics::DecodeState(queue);
+        Require(state.depthBoundsTest && state.minDepthBounds == bounds[0] && state.maxDepthBounds == bounds[1], "infinite depth bounds changed");
+        AgcDriver::Graphics::Context context{};
+        expectFailure([&] { AgcDriver::Graphics::ValidateDepthBounds(context, state); }, "depth bounds outside [0, 1]");
+        context.depthRangeUnrestricted = true;
+        AgcDriver::Graphics::ValidateDepthBounds(context, state);
+    }
+    for (const auto offset : {0x008u, 0x009u}) {
+        queue.context[0x008] = bits(0.25f);
+        queue.context[0x009] = bits(0.75f);
+        queue.context[offset] = bits(std::numeric_limits<float>::quiet_NaN());
+        expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "NaN depth bound");
+    }
+    queue.context[0x008] = bits(0.25f);
+    queue.context[0x009] = bits(0.75f);
+    queue.context[0x00b] = bits(infinity);
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "non-finite register");
+    queue.context[0x00b] = bits(0.0f);
     queue.context[0x1b3] = 2;
     queue.context[0x1b4] = 2;
     const auto rejection = AgcDriver::Graphics::DrawRejection(queue, false);
@@ -4211,7 +4241,7 @@ void DepthClipTests() {
     collapsedQueue.context[0x10f] = std::bit_cast<std::uint32_t>(-1.0f);
     expectFailure([&] { AgcDriver::Graphics::DecodeState(collapsedQueue); }, "unsupported viewport transform");
     for (std::uint32_t bit = 0; bit < 32; ++bit) {
-        if (bit == 19 || bit == 24 || bit == 26 || bit == 27) continue;
+        if (bit == 16 || bit == 19 || bit == 24 || bit == 26 || bit == 27) continue;
         for (const auto linearBit : {0u, 0x01000000u}) {
             queue.context[0x204] = (1u << bit) | linearBit;
             expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "PA_CL_CLIP_CNTL");
@@ -4224,10 +4254,12 @@ void DepthClipTests() {
     for (const auto clip : {0x00080000u, 0x00000000u, 0x0c080000u, 0x04000000u}) {
         queue.context[0x204] = clip;
         const auto plain = AgcDriver::Graphics::DecodeState(queue);
-        queue.context[0x204] = clip | 0x01000000u;
-        const auto linearClip = AgcDriver::Graphics::DecodeState(queue);
-        Require(AgcDriver::Graphics::DrawRejection(queue, false).empty(), "the precheck rejected DX_LINEAR_ATTR_CLIP_ENA");
-        Require(linearClip.negativeOneToOne == plain.negativeOneToOne && linearClip.depthClamp == plain.depthClamp && linearClip.viewport.minDepth == plain.viewport.minDepth && linearClip.viewport.maxDepth == plain.viewport.maxDepth, "DX_LINEAR_ATTR_CLIP_ENA changed the clip space, depth clamping or depth range");
+        for (const auto extraBit : {0x00010000u, 0x01000000u, 0x01010000u}) {
+            queue.context[0x204] = clip | extraBit;
+            const auto decoded = AgcDriver::Graphics::DecodeState(queue);
+            Require(AgcDriver::Graphics::DrawRejection(queue, false).empty(), "the precheck rejected CLIP_DISABLE or DX_LINEAR_ATTR_CLIP_ENA");
+            Require(decoded.negativeOneToOne == plain.negativeOneToOne && decoded.depthClamp == plain.depthClamp && decoded.viewport.minDepth == plain.viewport.minDepth && decoded.viewport.maxDepth == plain.viewport.maxDepth, "CLIP_DISABLE or DX_LINEAR_ATTR_CLIP_ENA changed the clip space, depth clamping or depth range");
+        }
     }
 }
 
@@ -4865,6 +4897,7 @@ AgcDriver::Graphics::Context mockContext() {
     context.limits.maxPerStageDescriptorStorageBuffers = 16;
     context.limits.maxPerStageResources = 128;
     context.limits.maxDescriptorSetStorageBuffers = 32;
+    context.limits.maxImageArrayLayers = 2048;
     return context;
 }
 
@@ -6663,10 +6696,10 @@ void storageTextureBudgetTests() {
     Require(StorageTextureBudget(memory, &reported, 0, 0) == 2560 * MiB, "a 10 GiB budget on the 16 GiB heap does not limit the storage image cache to a quarter of the budget");
     reported.heapUsage[2] = 5 * GiB;
     Require(StorageTextureBudget(memory, &reported, 1 * GiB, 2 * GiB) == 2560 * MiB, "2 GiB used outside the texture caches on a 10 GiB budget lowered the storage image cache below its quarter");
-    reported.heapUsage[2] = 8 * GiB;
-    Require(StorageTextureBudget(memory, &reported, 1 * GiB, 2 * GiB) == 1792 * MiB, "a 10 GiB budget with 5 GiB used outside the texture caches does not leave 1792 MiB after the sampled textures' 2 GiB floor and 1280 MiB of headroom");
+    reported.heapUsage[2] = 8 * GiB + 512 * MiB;
+    Require(StorageTextureBudget(memory, &reported, 1 * GiB, 2 * GiB) == 2304 * MiB, "a 10 GiB budget with 5632 MiB used outside the texture caches does not leave 2304 MiB after 1 GiB of sampled textures and 1280 MiB of headroom");
     reported.heapUsage[2] = 9 * GiB;
-    Require(StorageTextureBudget(memory, &reported, 3 * GiB, 2 * GiB) == 1792 * MiB, "3 GiB of sampled textures were not reserved past their 2 GiB floor");
+    Require(StorageTextureBudget(memory, &reported, 3 * GiB, 2 * GiB) == 1792 * MiB, "3 GiB of sampled textures were not reserved in full");
     reported.heapUsage[2] = 1 * GiB;
     Require(StorageTextureBudget(memory, &reported, 1 * GiB, 2 * GiB) == 2560 * MiB, "usage below the cached bytes is not read as no other device memory in use");
     Require(StorageTextureBudget(memory, &reported, 7 * GiB, 1 * GiB) == 1792 * MiB, "7 GiB of sampled textures with the usage below the cached bytes do not leave 1792 MiB after their reservation and 1280 MiB of headroom");
@@ -6679,6 +6712,35 @@ void storageTextureBudgetTests() {
     Require(StorageTextureBudget(memory, &reported, 0, 0) == 512 * MiB, "a 1 GiB budget does not keep the 512 MiB floor");
     reported.heapBudget[2] = 40 * GiB;
     Require(StorageTextureBudget(memory, &reported, 0, 0) == 4 * GiB, "a budget above the heap size raised the storage image cache past a quarter of the heap");
+    memory.memoryHeaps[2].size = 8 * GiB;
+    reported.heapBudget[2] = 7189 * MiB;
+    reported.heapUsage[2] = 4491 * MiB;
+    Require(StorageTextureBudget(memory, &reported, 49 * MiB, 506 * MiB) == 7189 * MiB / 4u, "49 MiB of sampled textures on an 8 GiB heap with a 7189 MiB budget and 3936 MiB used outside the texture caches held the storage image cache below a quarter of the budget");
+    reported.heapUsage[2] = 6490 * MiB;
+    Require(StorageTextureBudget(memory, &reported, 2 * GiB, 506 * MiB) == 512 * MiB, "2 GiB of sampled textures on an 8 GiB heap with a 7189 MiB budget and 3936 MiB used outside the texture caches did not take the storage image cache back to its 512 MiB floor");
+    memory.memoryHeaps[2].size = 10 * GiB;
+    reported.heapBudget[2] = 8767 * MiB;
+    reported.heapUsage[2] = 7981 * MiB;
+    Require(StorageTextureBudget(memory, &reported, 1427 * MiB, 490 * MiB) == 512 * MiB, "a 10 GiB heap at 7981 of its 8767 MiB budget with 1427 MiB of sampled textures does not keep the storage image cache at its 512 MiB floor");
+    for (const auto heapGiB : {2u, 4u, 6u, 8u, 16u, 32u}) {
+        memory.memoryHeaps[2].size = heapGiB * GiB;
+        for (std::uint64_t budget = GiB; budget <= heapGiB * GiB; budget += 512 * MiB) {
+            reported.heapBudget[2] = budget;
+            for (std::uint64_t sampled = 0; sampled <= budget; sampled += 256 * MiB) {
+                std::uint64_t previous = 0;
+                for (std::uint64_t outside = 0; outside <= budget + GiB; outside += 128 * MiB) {
+                    reported.heapUsage[2] = outside + sampled + 512 * MiB;
+                    const auto limit = StorageTextureBudget(memory, &reported, sampled, 512 * MiB);
+                    Require(limit >= 512 * MiB, "pressure sweep lost the storage cache floor");
+                    Require(limit <= std::max<std::uint64_t>(512 * MiB, budget / 4u), "pressure sweep exceeded a quarter of the reported budget above the floor");
+                    Require(limit <= std::max<std::uint64_t>(2 * GiB, heapGiB * GiB / 4u), "pressure sweep exceeded the heap storage cache cap");
+                    if (outside != 0) Require(limit <= previous, "additional non-cache memory usage grew the storage cache budget");
+                    if (limit > 512 * MiB) Require(outside + sampled + budget / 8u + limit <= budget, "storage cache budget consumed live sampled memory or pressure headroom");
+                    previous = limit;
+                }
+            }
+        }
+    }
     memory.memoryHeaps[0].flags = 0;
     memory.memoryHeaps[2].flags = 0;
     Require(StorageTextureBudget(memory, &reported, 0, 0) == 2 * GiB, "a device without a device-local heap does not keep 2 GiB of storage images");
@@ -8596,6 +8658,25 @@ void LineStripTests() {
     Require(rejection.empty(), "the draw precheck rejected an indexed line strip with primitive restart: " + rejection);
 }
 
+std::uint32_t keyedGenerator = 0;
+std::size_t keyedWords = 0;
+
+VKAPI_ATTR VkResult VKAPI_CALL keyedCreateShaderModule(VkDevice, const VkShaderModuleCreateInfo* info, const VkAllocationCallbacks*, VkShaderModule* module) {
+    keyedWords = info->codeSize / sizeof(std::uint32_t);
+    keyedGenerator = info->pCode[2];
+    *module = makeHandle<VkShaderModule>();
+    return VK_SUCCESS;
+}
+
+void ShaderModuleKeyTests() {
+    const std::array<std::uint32_t, 5> code{0x07230203u, 0x00010300u, 0x00080001u, 8u, 0u};
+    static_cast<void>(AgcDriver::Graphics::CreateShaderModule(keyedCreateShaderModule, VK_NULL_HANDLE, true, code.data(), sizeof(code), "keyed module"));
+    Require(keyedWords == code.size() && keyedGenerator == 0x00080001u, "a shader module with graphics pipeline libraries changed its generator word");
+    static_cast<void>(AgcDriver::Graphics::CreateShaderModule(keyedCreateShaderModule, VK_NULL_HANDLE, false, code.data(), sizeof(code), "keyed module"));
+    Require(keyedWords == code.size() && keyedGenerator == (0x00080001u ^ 0x8000u), "a shader module without graphics pipeline libraries kept the generator word of the other mode");
+    Require(code[2] == 0x00080001u, "keying a shader module changed its source words");
+}
+
 void ProvokingVertexTests() {
     using namespace AgcDriver::Graphics;
     constexpr std::uint32_t lastVertex = 1u << 19u;
@@ -8977,6 +9058,14 @@ void unorm10_11_11TargetTests() {
     auto plainState = state;
     plainState.colors[0].packing = ColorExportPacking::None;
     expectFailure([&] { validate(packed, plainState); }, "float4 colors");
+    auto targetless = plainState;
+    targetless.colors.clear();
+    targetless.blends.clear();
+    Require(validate(packed, targetless) == std::set<std::uint32_t>{0u}, "a uint4 export from a draw with no color target was refused");
+    auto gap = plainState;
+    gap.blends.insert(gap.blends.begin(), gap.blends.front());
+    gap.colors[0].exportIndex = 1;
+    Require(validate(packed, gap) == std::set<std::uint32_t>{0u}, "a uint4 export into the unused slot below a color target was refused");
     auto uintExport = request;
     uintExport.context.pixel->targetOutputMode[0] = 7;
     expectFailure([&] { static_cast<void>(ShaderRecompiler::Recompile(uintExport)); }, "fragment output 0 has no color export packing path");
@@ -9850,6 +9939,24 @@ void highestDrawIndexTests() {
     Require(HighestDrawIndex(bytesOf(restartOnly), 2, false) == 0xffff, "a 16-bit all-ones index without restart was skipped");
     Require(HighestDrawIndex(bytesOf(narrow).first(4), 2, true) == 7 && HighestDrawIndex(bytesOf(narrow).first(2), 2, true) == 0, "the scan read past its index range");
     expectFailure([&] { HighestDrawIndex(bytesOf(narrow), 1, false); }, "unsupported index size");
+    Require(!HighestDrawIndex({}, 2, false).has_value() && !HighestDrawIndex({}, 4, true).has_value(), "an empty index range reached a vertex");
+    std::vector<std::uint16_t> long16(1027, 0xffff);
+    long16[1026] = 0;
+    Require(HighestDrawIndex(std::as_bytes(std::span(long16)), 2, true) == 0, "index 0 after many restart indices was not reached");
+    long16[513] = 4000;
+    Require(HighestDrawIndex(std::as_bytes(std::span(long16)), 2, true) == 4000, "a 16-bit index inside a long range was missed");
+    std::vector<std::uint32_t> long32(1029);
+    for (std::size_t i = 0; i < long32.size(); ++i) long32[i] = static_cast<std::uint32_t>(i * 7u % 1000u);
+    long32[1028] = 0x80000001u;
+    Require(HighestDrawIndex(std::as_bytes(std::span(long32)), 4, true) == 0x80000001u, "a 32-bit index above 2^31 in the tail was missed");
+    long32[1028] = 0xffffffffu;
+    Require(HighestDrawIndex(std::as_bytes(std::span(long32)), 4, true) == 999u && HighestDrawIndex(std::as_bytes(std::span(long32)), 4, false) == 0xffffffffu, "a 32-bit restart index at the end of a long range");
+    std::vector<std::byte> shifted(2 * 1000 + 3);
+    for (std::size_t i = 0; i < 1000; ++i) {
+        const auto value = static_cast<std::uint16_t>(i == 777 ? 0x8001u : i % 300u);
+        std::memcpy(shifted.data() + 1 + 2 * i, &value, sizeof(value));
+    }
+    Require(HighestDrawIndex(std::span<const std::byte>(shifted).subspan(1, 2 * 1000 + 1), 2, false) == 0x8001u, "an unaligned 16-bit range with a trailing byte");
 }
 
 void storeAtFlipTests() {
@@ -10132,21 +10239,36 @@ void pipelineStoreLazyBufferPoolTests() {
     Require(mock.live == 0, "lazy buffer pool pipeline tests leaked Vulkan objects");
 }
 
-void pipelineJournalTests() {
+void pipelineJournalTests(bool longPath = false, bool extended = false) {
     using namespace AgcDriver::Graphics;
     using Stage = ShaderRecompiler::ShaderStage;
-    const auto directory = std::filesystem::temp_directory_path() / ("aps5-pipeline-journal-mock-" + std::to_string(std::random_device{}()));
+    const auto root = std::filesystem::temp_directory_path() / ("aps5-pipeline-journal-mock-" + std::to_string(std::random_device{}()));
+    auto directory = root;
+    if (longPath) {
+        Require(root.native().size() < 180, "the temporary root is too long for the journal path fixture");
+        directory /= std::filesystem::path(u8"cache-\u00e4\u6f22");
+        directory /= std::string(229 - directory.native().size(), 'd');
+    }
     std::filesystem::create_directories(directory);
     struct Cleanup {
         std::filesystem::path directory;
+        std::filesystem::path journal;
         ~Cleanup() {
+            ShaderRecompiler::ShaderDiskCache::Shutdown();
             std::error_code error;
+            if (!journal.empty()) {
+                std::filesystem::remove(journal, error);
+                auto lock = journal;
+                lock += ".lock";
+                std::filesystem::remove(lock, error);
+            }
             std::filesystem::remove_all(directory, error);
         }
-    } cleanup{directory};
+    } cleanup{root, {}};
 #ifdef _WIN32
+    if (extended) directory = std::filesystem::path(L"\\\\?\\" + directory.make_preferred().native());
     _putenv_s("ANYPS5_NO_SHADER_CACHE", "0");
-    _putenv_s("ANYPS5_SHADER_CACHE_DIR", directory.string().c_str());
+    _wputenv_s(L"ANYPS5_SHADER_CACHE_DIR", directory.c_str());
     _putenv_s("APS5_PIPELINE_JOURNAL_THREADS", "2");
 #else
     setenv("ANYPS5_NO_SHADER_CACHE", "0", 1);
@@ -10154,6 +10276,14 @@ void pipelineJournalTests() {
     setenv("APS5_PIPELINE_JOURNAL_THREADS", "2", 1);
 #endif
     Require(PipelineJournalEnabled(), "the journal is disabled with a shader cache directory set");
+    auto journalFile = PipelineJournalPath();
+#ifdef _WIN32
+    std::error_code pathError;
+    journalFile = ShaderRecompiler::NativeCachePath_nid_no_patch(journalFile, pathError);
+    Require(!pathError, "cannot normalize the journal fixture path");
+#endif
+    cleanup.journal = journalFile;
+    if (longPath) Require(journalFile.native().size() > 260, "the journal fixture did not cross MAX_PATH");
     const auto module = [](std::uint32_t salt) {
         ShaderRecompiler::RecompileResult result;
         result.spirv = std::vector<std::uint32_t>{0x07230203u, 0x00010000u, 0u, 8u, 0u, 0x00020011u, 1u, 0x00020011u, 2u + salt};
@@ -10345,13 +10475,15 @@ void pipelineJournalTests() {
         FlushPipelineJournal();
         const auto repeated = PipelineJournalTotals();
         Require(repeated.recordedGraphics == recorded.recordedGraphics && repeated.recordedCompute == recorded.recordedCompute && repeated.recordedModules == recorded.recordedModules, "a repeated pipeline was recorded again");
-        Require(std::filesystem::file_size(PipelineJournalPath()) > 0, "the journal file is empty");
+        Require(std::filesystem::file_size(journalFile) > 0, "the journal file is empty");
         const auto storeBefore = PipelineStoreTotals();
         std::vector<std::byte> receivedWords;
         ShaderRecompiler::RecompileResult received;
         bool receivedPush = false;
         std::uint32_t computeCalls = 0;
+        std::mutex computeMutex;
         PipelineJournalHooks hooks{[&](const ShaderRecompiler::RecompileResult& shader, bool pushConstants) {
+            std::lock_guard lock(computeMutex);
             ++computeCalls;
             received = shader;
             receivedPush = pushConstants;
@@ -10374,7 +10506,7 @@ void pipelineJournalTests() {
         const auto storeHit = PipelineStoreTotals();
         Require(pipeline != nullptr && !built && mock.pipelineCreateCount == created && storeHit.hits == storeReplayed.hits + 1 && storeHit.misses == storeReplayed.misses, "the draw's configuration did not find the replayed pipeline");
         {
-            const auto journalPath = PipelineJournalPath();
+            const auto& journalPath = journalFile;
             const auto whole = std::filesystem::file_size(journalPath);
             Require(whole % 8 == 0 && whole > 3, "the journal file is not record aligned");
             std::filesystem::resize_file(journalPath, whole - 3);
@@ -10388,9 +10520,33 @@ void pipelineJournalTests() {
             torn->Wait();
             const auto reloaded = PipelineJournalTotals();
             Require(reloaded.droppedRecords == 0 && reloaded.loadedModules == 4 && reloaded.loadedRecipes == 2 && reloaded.replayFailed == 0, "the journal did not recover from a tail torn inside a record's padding");
+            const auto writtenBefore = PipelineJournalTotals().writtenBytes;
             RecordComputePipeline(compute, true);
             FlushPipelineJournal();
             Require(PipelineJournalTotals().recordedCompute == reloaded.recordedCompute + 1 && PipelineJournalTotals().recordedModules == reloaded.recordedModules, "the pipeline whose record was torn was not recorded again, or its module was");
+            const auto recordBytes = PipelineJournalTotals().writtenBytes - writtenBefore;
+            std::vector<std::byte> bytes;
+            Require(ShaderRecompiler::ReadWholeFile(journalFile, bytes) && recordBytes > 0 && recordBytes <= bytes.size(), "cannot read the re-recorded journal entry");
+            {
+                std::ofstream file(journalFile, std::ios::binary | std::ios::app);
+                file.write(reinterpret_cast<const char*>(bytes.data() + bytes.size() - recordBytes), static_cast<std::streamsize>(recordBytes));
+                const std::array<char, 8> tornTail{};
+                file.write(tornTail.data(), tornTail.size());
+                file.close();
+                Require(file.good(), "cannot append an external complete record and torn tail");
+            }
+            auto another = module(5);
+            another.bindings.push_back(makeBinding(Role::GuestBuffers, 0, 1, std::vector<std::uint32_t>(4)));
+            const auto beforeAppend = PipelineJournalTotals();
+            RecordComputePipeline(another, false);
+            FlushPipelineJournal();
+            const auto appended = PipelineJournalTotals();
+            Require(appended.writeFailures == 0 && appended.recordedCompute == beforeAppend.recordedCompute + 1, "the append after an external torn tail failed");
+            Require(std::filesystem::file_size(journalFile) == bytes.size() + recordBytes + appended.writtenBytes - beforeAppend.writtenBytes, "tail recovery discarded an external complete record or retained torn bytes");
+            auto recovered = StartPipelineJournalReplay(context, fingerprint, hooks);
+            Require(recovered != nullptr, "the replay after the external append did not start");
+            recovered->Wait();
+            Require(PipelineJournalTotals().loadedModules == 5 && PipelineJournalTotals().loadedRecipes == 4 && PipelineJournalTotals().droppedRecords == 0, "the external append and torn-tail recovery did not replay cleanly");
         }
         {
             const auto before = PipelineJournalTotals();
@@ -10403,7 +10559,7 @@ void pipelineJournalTests() {
         }
         {
             const std::uint32_t meshWithoutOutputSize = 2u;
-            std::fstream file(PipelineJournalPath(), std::ios::in | std::ios::out | std::ios::binary);
+            std::fstream file(journalFile, std::ios::in | std::ios::out | std::ios::binary);
             file.seekp(4);
             file.write(reinterpret_cast<const char*>(&meshWithoutOutputSize), sizeof(meshWithoutOutputSize));
             file.close();
@@ -10446,8 +10602,8 @@ int main(int argc, char** argv) {
             commandBatchFenceFailureTests();
             return 0;
         }
-        if (argc == 2 && std::string_view(argv[1]) == "--pipeline-journal") {
-            pipelineJournalTests();
+        if (argc == 2 && (std::string_view(argv[1]) == "--pipeline-journal" || std::string_view(argv[1]) == "--pipeline-journal-long-paths" || std::string_view(argv[1]) == "--pipeline-journal-extended-paths")) {
+            pipelineJournalTests(std::string_view(argv[1]) != "--pipeline-journal", std::string_view(argv[1]) == "--pipeline-journal-extended-paths");
             std::cout << "pipeline journal recipe, record and replay tests passed\n";
             return 0;
         }
@@ -10621,6 +10777,11 @@ int main(int argc, char** argv) {
             std::cout << "Multisampled DCC state checks passed\n";
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--depth-bounds-state") {
+            DepthBoundsBiasTests();
+            std::cout << "Depth bounds state checks passed\n";
+            return 0;
+        }
         {
             const AgcDriver::Graphics::Context context{};
             const AgcDriver::Graphics::State state{};
@@ -10683,6 +10844,7 @@ int main(int argc, char** argv) {
         stencilReferenceUnusedTests();
         aliasedBufferViewTests();
         LineStripTests();
+        ShaderModuleKeyTests();
         ProvokingVertexTests();
         ProvokingVertexRenderPassTests();
         ConservativeRasterizationTests();

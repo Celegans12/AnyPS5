@@ -357,9 +357,14 @@ void RunGuestTextureResourceTests() {
     Fields cubeBadArray = cube;
     cubeBadArray.baseArray = 6;
     rejectFields(cubeBadArray, "base array past its last array slice");
-    Fields cubeNotMultiple = cube;
-    cubeNotMultiple.depth = 4;
-    rejectFields(cubeNotMultiple, "multiple of 6");
+    Fields cubeExtraSlice = cube;
+    cubeExtraSlice.depth = 6;
+    result = DecodeTextureResource(pack(cubeExtraSlice));
+    Require(result.baseArray == 0 && result.depthOrLastArray == 6, "a cube descriptor with a slice past its last whole cube lost a slice");
+    Require(DescribeSurface(result).imageLayers == 7, "a cube allocation with a slice past its last whole cube omitted it");
+    Fields cubePartial = cube;
+    cubePartial.depth = 4;
+    rejectFields(cubePartial, "fewer than 6 array slices");
 
     Fields multisampled = base;
     multisampled.typeRaw = 14;

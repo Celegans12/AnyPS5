@@ -10,13 +10,14 @@
 #include <optional>
 #include <span>
 #include <utility>
+#include <vector>
 
 namespace AgcDriver::Graphics {
 
 class Texture;
 class StorageTexture;
 
-VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target);
+VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, bool depthWritten = true);
 // Under GuestMemory::GpuMutex: the HTILE bytes whose store-back read in DepthSurfaceView would wait
 // for a pending GPU write (no GPU expansion knows the words), 0 when it would not. The draw's
 // HTILE pre-sync (S1) waits for that writer without the mutex first.
@@ -26,6 +27,8 @@ std::size_t HtileStoreBackWaits(const Context& context, const DepthTarget& targe
 // store-back read after the wait reports the words it found for that writer ([htile] line).
 void NoteHtileWriter(std::uint64_t program, std::uint64_t htileAddress);
 bool HtileWriterProgram(std::uint64_t program);
+std::vector<std::pair<std::uint64_t, std::uint64_t>> FlushDepthPlanes(std::uint64_t address, std::size_t bytes);
+bool DepthPlanesStale();
 bool SampleLocationsCompatibleDepth(const Context& context, VkFormat format, std::uint32_t samples);
 std::uint64_t DepthSurfacesSerial();
 std::uint64_t DepthSurfacesReleased();

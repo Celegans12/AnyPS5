@@ -14,13 +14,13 @@ import progress_history
 OPCODES = Path("core/shader/recompiler/RdnaDecoder/include/RdnaDecoder/RdnaOpcode.hpp")
 
 
-def commit(root, day, message, body):
+def commit(root, day, message, body, time="12:00:00Z"):
     library = root / "core/libs/prx/libSceExample"
     library.mkdir(parents=True, exist_ok=True)
     (library / "Export.cpp").write_text(body)
     (root / OPCODES).parent.mkdir(parents=True, exist_ok=True)
     (root / OPCODES).write_text("enum class RdnaOpcode : int {\n    SEndpgm,\n};\n")
-    env = {**os.environ, "GIT_AUTHOR_DATE": f"{day}T12:00:00Z", "GIT_COMMITTER_DATE": f"{day}T12:00:00Z"}
+    env = {**os.environ, "GIT_AUTHOR_DATE": f"{day}T{time}", "GIT_COMMITTER_DATE": f"{day}T{time}"}
     subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
     subprocess.run(["git", "-C", str(root), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", message],
                    check=True, env=env)
@@ -97,6 +97,17 @@ class ProgressHistoryTests(unittest.TestCase):
         self.assertEqual([(p["libraries"]["done"], p["libraries"]["total"]) for p in points], [(0, 1), (1, 2)])
         self.assertIn("<svg", html)
         self.assertIn("2026-01-02", html)
+
+    def test_days_are_utc_whatever_the_committer_offset(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "-C", directory, "init", "-q"], check=True)
+            commit(root, "2026-01-02", "older", "int APS5_VABI A() { return 0; }\n", "08:00:00+13:00")
+            commit(root, "2026-01-01", "newer", "int APS5_VABI A() { return 0; }\nint APS5_VABI B() { return 0; }\n",
+                   "21:30:00+02:00")
+            with patch.multiple(progress, ROOT=root, PRX=root / "core/libs/prx", OPCODES=root / OPCODES):
+                points = progress_history.collect("HEAD")
+        self.assertEqual([(p["date"], p["libraries"]["total"]) for p in points], [("2026-01-01", 2)])
 
     def test_long_series_keeps_the_chart_readable(self):
         def series(count):

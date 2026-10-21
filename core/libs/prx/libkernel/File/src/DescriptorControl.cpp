@@ -93,6 +93,8 @@ constexpr std::uint32_t KeepOnExecRequest = 0x20006602;
 constexpr std::uint32_t NonblockingRequest = 0x8004667e;
 constexpr std::uint32_t ReadableRequest = 0x4004667f;
 constexpr std::uint32_t RequestIn = 0x80000000u;
+constexpr std::uint32_t RequestOut = 0x40000000u;
+constexpr std::uint32_t RequestVoid = 0x20000000u;
 constexpr std::uint32_t TerminalGroup = 't';
 
 struct GuestLock {
@@ -510,7 +512,16 @@ int Fcntl(int fd, int command, std::intptr_t argument) {
     }
 }
 
+bool IoctlRequestMalformed(std::uint64_t request) {
+    const auto command = static_cast<std::uint32_t>(request);
+    const std::uint32_t length = (command >> 16) & 0x1fff;
+    if ((command & (RequestIn | RequestOut | RequestVoid)) == 0) return true;
+    if ((command & RequestOut) && length == 0) return true;
+    return (command & RequestVoid) && length != 0 && length != sizeof(int);
+}
+
 int Ioctl(int fd, std::uint64_t request, void* argument) {
+    if (IoctlRequestMalformed(request)) return Fail(GuestEnotty);
     const auto command = static_cast<std::uint32_t>(request);
     const std::uint32_t length = (command >> 16) & 0x1fff;
     if ((command & RequestIn) && length != 0 && argument == nullptr) return Fail(GuestEfault);

@@ -119,6 +119,28 @@ class SelectTests(unittest.TestCase):
         subprocess.run(["cmake", "--build", str(self.build)], check=True, capture_output=True)
         self.assertEqual(built, {"alpha_tests"})
 
+    def test_explain_reports_input_and_fixture_reasons_without_a_build_cache(self):
+        changed = self.build / "explain-changed.txt"
+        cache = self.build / "CMakeCache.txt"
+        saved = self.build / "CMakeCache.saved"
+        cache.rename(saved)
+        try:
+            for path in ("alpha/alpha.h", "beta/main.c", "CMakeLists.txt"):
+                with self.subTest(path=path):
+                    changed.write_text(path + "\n", encoding="utf-8")
+                    report = json.loads(self.tool("explain", self.graph, changed))
+                    picked, full = select_tests.select(json.loads(self.graph.read_text(encoding="utf-8")), [path])
+                    self.assertEqual(report["tests"], sorted(picked) if picked is not None else None)
+                    self.assertEqual(report["full_run_paths"], full)
+                    if path == "alpha/alpha.h":
+                        self.assertIn("input: alpha/alpha.h", report["reasons"]["alpha"])
+                        self.assertIn("no build executable", report["reasons"]["script"])
+                    elif path == "beta/main.c":
+                        self.assertIn("fixture setup for: beta", report["reasons"]["beta_setup"])
+        finally:
+            saved.rename(cache)
+
+
 
 @unittest.skipUnless(shutil.which("ninja") and (shutil.which("gcc") or shutil.which("cc")), "needs ninja and a C compiler")
 class FixtureBuildTests(unittest.TestCase):
@@ -202,6 +224,20 @@ class CaseInsensitivePathTests(unittest.TestCase):
             self.assertEqual(build.output(os.path.join("tests", "MemoryPoolTest.exe")), "tests/MemoryPoolTest.exe")
             self.assertEqual(build.repo(os.path.join(os.sep, "work", "source", "core", "libSceAgc", "Driver.cpp")), "core/libSceAgc/Driver.cpp")
             self.assertIsNone(build.repo(os.path.join(os.sep, "WORK", "SOURCE", "BUILD", "Generated.h")))
+
+
+class PlanTests(unittest.TestCase):
+    def test_plan_empty_run_avoids_invoking_ctest(self):
+        build = mock.Mock()
+        build.tests.return_value = ({}, [{"name": "alpha", "command": ["/build/alpha_tests"]}])
+        build.leaves.return_value = ["tests/alpha_tests"]
+        build.target.side_effect = lambda t: "tests/alpha_tests"
+        graph = {"tests": {"alpha": {}}}
+        run, leaves, count = select_tests.plan(build, graph, set())
+        self.assertEqual(run, [])
+        self.assertEqual(leaves, [])
+        self.assertEqual(count, 1)
+        build.tests.assert_called_once_with()
 
 
 if __name__ == "__main__":

@@ -53,6 +53,12 @@ float readFloat(const Registers& registers, std::uint32_t offset) {
     return value;
 }
 
+float readDepthBound(const Registers& registers, std::uint32_t offset) {
+    const auto value = std::bit_cast<float>(read(registers, offset));
+    if (std::isnan(value)) Require(false, "NaN depth bound at DWORD " + std::to_string(offset));
+    return value;
+}
+
 std::string zeroMessage(std::uint32_t offset, std::uint32_t value, const char* name) {
     char detail[64];
     std::snprintf(detail, sizeof(detail), " (register 0x%x = 0x%08x)", offset, value);
@@ -188,8 +194,9 @@ constexpr std::uint32_t PixelShaderIteratesSamples = 0x10000u;
 constexpr std::uint32_t PixelSampleCoverageInput = 0x4000u;
 constexpr std::uint32_t PixelSampleRateInputs = 0x2011u;
 constexpr std::uint32_t ScreenOffsetMask = ~0x01ff01ffu;
-// Bits 26/27 (ZCLIP_NEAR/FAR_DISABLE) become depth clamping; bit 19 selects the [0, 1] clip space.
-constexpr std::uint32_t ClipControlMask = ~(0x80000u | 0x01000000u | 0x0c000000u);
+// Bits 26/27 (ZCLIP_NEAR/FAR_DISABLE) become depth clamping; bit 19 selects the [0, 1] clip space;
+// bit 16 disables clipping.
+constexpr std::uint32_t ClipControlMask = ~(0x10000u | 0x80000u | 0x01000000u | 0x0c000000u);
 
 bool zFormatSupported(std::uint32_t format) {
     return format == 0u || format == 1u || format == 2u || format == 3u || format == 9u;
@@ -362,8 +369,8 @@ void decodeDepth(const Registers& cx, std::uint32_t depthControl, bool testValEx
     result.depthBoundsTest = (depthControl & 8u) != 0;
     if (result.depthBoundsTest) {
         Require(zFormat != 0, "depth bounds without a depth plane");
-        result.minDepthBounds = readFloat(cx, 0x008);
-        result.maxDepthBounds = readFloat(cx, 0x009);
+        result.minDepthBounds = readDepthBound(cx, 0x008);
+        result.maxDepthBounds = readDepthBound(cx, 0x009);
     }
     if (depthClear) {
         result.depthTest = true;
@@ -2023,7 +2030,9 @@ std::string NullPixelProgramRejection(const QueueState& queue) {
     const auto targetMask = find(queue.context, 0x8e);
     const auto shaderMask = find(queue.context, 0x8f);
     if (targetMask == queue.context.end() || shaderMask == queue.context.end()) return "AGC graphics: a draw without a pixel program needs CB_TARGET_MASK and CB_SHADER_MASK";
-    if (ColorWriteMask(queue.context) != 0) return "AGC graphics: a draw without a pixel program writes color";
+    const auto colorControl = find(queue.context, 0x202);
+    const bool colorDisabled = colorControl != queue.context.end() && ((colorControl->second >> 4u) & 7u) == 0u;
+    if (!colorDisabled && ColorWriteMask(queue.context) != 0) return "AGC graphics: a draw without a pixel program writes color";
     return {};
 }
 

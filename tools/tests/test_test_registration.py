@@ -1,6 +1,7 @@
 from pathlib import Path
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -12,6 +13,43 @@ import check_test_registration
 
 
 class RegistrationTests(unittest.TestCase):
+    def test_literal_prefixes_cannot_expose_commands_inside_arguments(self):
+        prefixes = (r"\#", r"\(", '"prefix" ', '"" ', '"line\nprefix" ', "[[prefix]] ",
+                    "[=[prefix]=] ", "[===[line\nprefix]===] ")
+        for prefix in prefixes:
+            with self.subTest(prefix=prefix):
+                content = (f"set(example\n{prefix}add_test(ghost /build/tests/missing_tests)\n)\n"
+                           'add_test("real" "/build/tests/real_tests")\n')
+                self.assertEqual(self.registered(content), {"real_tests"})
+
+    def test_commands_inside_literals_do_not_register_tests(self):
+        for opening, closing in (('"', '"'), ("[[", "]]"), ("[=[", "]=]"), ("[===[", "]===]")):
+            with self.subTest(opening=opening):
+                content = (f"set(example {opening}\nadd_test(ghost /build/tests/missing_tests)\n{closing})\n"
+                           'add_test("real" "/build/tests/real_tests")\n')
+                self.assertEqual(self.registered(content), {"real_tests"})
+
+    def test_properties_inside_literals_do_not_disable_a_real_test(self):
+        for opening, closing in (('"', '"'), ("[[", "]]"), ("[=[", "]=]"), ("[===[", "]===]")):
+            with self.subTest(opening=opening):
+                content = ('add_test("real" "/build/tests/real_tests")\n'
+                           f"set(example {opening}\nset_tests_properties(real PROPERTIES DISABLED TRUE)\n{closing})\n")
+                self.assertEqual(self.registered(content), {"real_tests"})
+
+    def test_subdirectories_inside_literals_are_not_followed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            build = Path(directory)
+            ignored = build / "ignored"
+            ignored.mkdir()
+            (ignored / "CTestTestfile.cmake").write_text(
+                'add_test("ghost" "/build/tests/missing_tests")\n', encoding="utf-8")
+            for opening, closing in (('"', '"'), ("[[", "]]"), ("[=[", "]=]"), ("[===[", "]===]")):
+                with self.subTest(opening=opening):
+                    content = (f"set(example {opening}\nsubdirs(ignored)\n{closing})\n"
+                               'add_test("real" "/build/tests/real_tests")\n')
+                    (build / "CTestTestfile.cmake").write_text(content, encoding="utf-8")
+                    self.assertEqual(check_test_registration.registered(build), {"real_tests"})
+
     def test_disabled_property_is_local_to_each_configuration(self):
         for configurations in (("OFF", "TRUE"), ("TRUE", "OFF"), ("TRUE", "TRUE")):
             with self.subTest(configurations=configurations):
@@ -235,6 +273,75 @@ class RegistrationTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "unsupported Ninja build-file encoding"):
                     check_test_registration.built(build)
                 run.assert_called_once()
+
+    def run_tool(self, build):
+        return subprocess.run([sys.executable, "-I", str(Path(check_test_registration.__file__)), str(build)],
+                              capture_output=True, text=True, timeout=30)
+
+    def test_missing_build_directory_is_reported_without_a_traceback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.run_tool(Path(directory) / "no build")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error:", result.stderr)
+        self.assertIn("CMakeCache.txt", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_unsupported_generator_is_reported_without_a_traceback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "CMakeCache.txt").write_text("CMAKE_GENERATOR:INTERNAL=Unix Makefiles\n", encoding="utf-8")
+            result = self.run_tool(directory)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("requires a Ninja generator", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+class ScriptRegistrationTests(unittest.TestCase):
+    def unrun(self, files):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            check_test_registration.subprocess.run(["git", "init", "-q", str(root)], check=True)
+            for name, content in files.items():
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
+                (root / name).write_text(content, encoding="utf-8")
+            return check_test_registration.unrun_scripts(root)[1]
+
+    def test_script_registered_by_a_nested_add_test_runs(self):
+        self.assertEqual(self.unrun({
+            "core/relinker/CMakeLists.txt": "if(WIN32)\n    add_test(NAME a COMMAND ${Python3_EXECUTABLE}\n        ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_a.py)\nendif()\n",
+            "core/relinker/relinker/tests/test_a.py": ""}), [])
+
+    def test_unregistered_script_is_reported(self):
+        self.assertEqual(self.unrun({
+            "CMakeLists.txt": "add_test(NAME a COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_a.py)\n",
+            "tools/tests/test_a.py": "", "tools/tests/test_b.py": "", "tools/tests/helper.py": ""}), ["tools/tests/test_b.py"])
+
+    def test_commented_add_test_does_not_run_a_script(self):
+        self.assertEqual(self.unrun({
+            "CMakeLists.txt": "#add_test(NAME a COMMAND python ${CMAKE_CURRENT_SOURCE_DIR}/test_a.py)\n#[[\nadd_test(NAME a COMMAND python test_a.py)\n]]\n",
+            "test_a.py": ""}), ["test_a.py"])
+
+    def test_registration_names_its_directory(self):
+        self.assertEqual(self.unrun({
+            "CMakeLists.txt": "add_test(NAME a COMMAND python ${CMAKE_CURRENT_SOURCE_DIR}/a/tests/test_a.py)\n",
+            "a/tests/test_a.py": "", "b/tests/test_a.py": ""}), ["b/tests/test_a.py"])
+
+    def test_workflow_run_counts_and_a_paths_filter_does_not(self):
+        self.assertEqual(self.unrun({
+            ".github/workflows/pages.yml": "jobs:\n  web:\n    steps:\n      - run: python3 tools/test_web.py --build build-wasm\n",
+            ".github/workflows/web.yml": "on:\n  pull_request:\n    paths:\n      - tools/test_paths.py\n",
+            "tools/test_web.py": "", "tools/test_paths.py": ""}), ["tools/test_paths.py"])
+
+    def test_commented_workflow_line_does_not_run_a_script(self):
+        self.assertEqual(self.unrun({
+            ".github/workflows/ci.yml": "# python3 tools/tests/test_f.py\njobs:\n  t:\n    steps:\n      # python3 tools/tests/test_a.py\n"
+                                        "      - run: |\n          #python3 tools/tests/test_b.py\n"
+                                        "          \t# python3 tools/tests/test_c.py\n"
+                                        "          echo done\t# python3 tools/tests/test_d.py\n"
+                                        "          python3 tools/tests/test_e.py\n",
+            "tools/tests/test_a.py": "", "tools/tests/test_b.py": "", "tools/tests/test_c.py": "",
+            "tools/tests/test_d.py": "", "tools/tests/test_e.py": "", "tools/tests/test_f.py": ""}),
+            ["tools/tests/test_a.py", "tools/tests/test_b.py", "tools/tests/test_c.py", "tools/tests/test_d.py",
+             "tools/tests/test_f.py"])
+
 
 if __name__ == "__main__":
     unittest.main()

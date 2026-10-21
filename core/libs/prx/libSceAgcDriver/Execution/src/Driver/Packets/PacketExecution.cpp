@@ -16,12 +16,15 @@
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
 #include <algorithm>
 #include <chrono>
+#include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <functional>
 #include <map>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
+#include <utility>
 
 namespace AgcDriver::DriverDetail {
 
@@ -195,6 +198,20 @@ bool keepsDrawPipeline(std::span<const std::uint32_t> packet, std::uint32_t head
         }
         default: return false;
     }
+}
+
+bool sealsWriteOnly(std::span<const std::uint32_t> packet, std::uint32_t opcode) {
+    if (opcode == 0x58) return true;
+    if (opcode != 0x46 || packet.size() < 2) return false;
+    switch (packet[1] & 0x3fu) {
+        case 0x07: case 0x0f: case 0x10: case 0x16: case 0x2a: case 0x2c: case 0x2e: case 0x31: return true;
+        default: return false;
+    }
+}
+
+bool& drawnSinceSeal() {
+    static thread_local bool drawn = false;
+    return drawn;
 }
 
 }
@@ -587,6 +604,7 @@ void Driver::execute(const Submission& submission) {
         } else if (drawPacket) {
             landPendingWaits(submission.queue);
             packetCounters.CountDraw();
+            drawnSinceSeal() = true;
             bool drawn = false;
             timed(&WorkerProfile::drawMs, [&] {
                 static const bool traceDraws = std::getenv("APS5_TRACE_DRAWS") != nullptr;
@@ -633,10 +651,43 @@ void Driver::execute(const Submission& submission) {
             Pm4::Execute(packet, queue);
         } else if (sampleDump && !wroteOnGpu) {
             dumpSampleCounters(Pm4::SampleDumpAddress(packet));
+        } else if (submission.queue == 0 && sealsWriteOnly(packet, opcode)) {
+            if (std::exchange(drawnSinceSeal(), false)) {
+                const auto seal = [this] {
+                    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
+                    std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                    if (const auto localDevice = device.Load()) localDevice->SealPassWriteOnly();
+                };
+                if (pipelined && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Enqueue(seal, {});
+                else seal();
+            }
         } else if (opcode != 0x42 && opcode != 0x46 && opcode != 0x58) {
             if (!wroteOnGpu) {
-                if (Pm4::IndirectRegisterOpcode(opcode)) Pm4::ExecuteIndirectRegisters(packet, submission.registerLists.at(cursor), queue);
-                else Pm4::Execute(packet, queue);
+                if (Pm4::IndirectRegisterOpcode(opcode)) {
+                    const auto& listed = submission.registerLists.at(cursor);
+                    if (Pm4::IndirectRegistersValid(listed)) {
+                        Pm4::ExecuteIndirectRegisters(packet, listed, queue);
+                    } else {
+                        landPendingWaits(submission.queue);
+                        recordQueuedLabelsBeforeRead(submission.queue);
+                        const auto current = Pm4::ReadIndirectRegisters(packet);
+                        static const bool skipInvalid = std::getenv("APS5_SKIP_INVALID_INDIRECT_REGISTERS") != nullptr;
+                        static std::atomic<bool> reported{false};
+                        if (!reported.exchange(true)) {
+                            std::uint32_t invalid = 0;
+                            for (std::size_t i = 0; i < listed.size(); i += 2) {
+                                if (!Pm4::IndirectRegistersValid(std::span(&listed[i], 1))) {
+                                    invalid = listed[i];
+                                    break;
+                                }
+                            }
+                            std::fprintf(stderr, "[gpu] queue 0x%x %s at DWORD %zu: register list entry with offset dword 0x%08x read again where the packet executes%s\n", submission.queue, Pm4::Name(packet[0]).c_str(), cursor, invalid, skipInvalid ? "; invalid entries are skipped (APS5_SKIP_INVALID_INDIRECT_REGISTERS)" : "");
+                        }
+                        Pm4::ExecuteIndirectRegisters(packet, current, queue, skipInvalid);
+                    }
+                } else {
+                    Pm4::Execute(packet, queue);
+                }
                 if (opcode == 0x49 || opcode == 0x37) {
                     if (const auto label = Pm4::DecodeLabelWrite(packet)) noteLabelStore(label->address, label->Bytes(), ++eventSerial, submission.queue);
                 }
@@ -663,6 +714,7 @@ void Driver::execute(const Submission& submission) {
                 submitOpenWork();
                 wakeQueueZeroForCompletions();
             }, {});
+            endTiming.Finish();
             executeRewindTail(submission);
             return;
         }

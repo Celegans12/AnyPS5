@@ -8,6 +8,12 @@
 // absolute address and breaks on host addresses outside that range.
 namespace GuestArena {
 
+#ifdef ANYPS5_ENABLE_ASAN
+inline constexpr std::uintptr_t GuestAddressOffset = 0x0000100000000000ull;
+#else
+inline constexpr std::uintptr_t GuestAddressOffset = 0;
+#endif
+
 #ifndef _WIN32
 using SharedBackingResolver = bool (*)(std::uintptr_t address, std::size_t bytes, int* file, std::uint64_t* offset);
 using SharedBackingWriter = bool (*)(std::uintptr_t address, const void* source, std::size_t bytes);

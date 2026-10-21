@@ -31,6 +31,7 @@ add_library(relinker_core STATIC
         ${CMAKE_CURRENT_SOURCE_DIR}/io/src/ByteReader.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/io/src/BufferUtils.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/io/src/NativePath.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/io/src/FileIdentity.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/Amd64OnlyConverter.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/InstructionScanner.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/x86/X64InstructionDecoder.cpp
@@ -454,9 +455,15 @@ if(BUILD_TESTING)
         add_test(NAME guest_none_relocations COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_guest_none_relocations.py $<TARGET_FILE:relinker>)
         set_tests_properties(guest_none_relocations PROPERTIES TIMEOUT 20)
+        add_test(NAME interpreter_in_code COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_interpreter_in_code.py $<TARGET_FILE:relinker>)
+        set_tests_properties(interpreter_in_code PROPERTIES TIMEOUT 20)
         add_test(NAME guest_relative_section_symbols COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_guest_relative_section_symbols.py $<TARGET_FILE:relinker>)
         set_tests_properties(guest_relative_section_symbols PROPERTIES TIMEOUT 20)
+        add_test(NAME overlapping_relocations COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_overlapping_relocations.py $<TARGET_FILE:relinker>)
+        set_tests_properties(overlapping_relocations PROPERTIES TIMEOUT 30)
         add_test(NAME optional_plt COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_optional_plt.py $<TARGET_FILE:relinker>)
         add_test(NAME optional_rela COMMAND ${Python3_EXECUTABLE}
@@ -499,6 +506,9 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_linux_executable_exports.py $<TARGET_FILE:relinker>)
         add_test(NAME executable_tls_relocations COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_executable_tls_relocations.py $<TARGET_FILE:relinker>)
+        add_test(NAME macos_empty_tls COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_macos_empty_tls.py $<TARGET_FILE:relinker>)
+        set_tests_properties(macos_empty_tls PROPERTIES TIMEOUT 60)
         add_test(NAME linux_entry_argv COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_linux_entry_argv.py $<TARGET_FILE:relinker>)
         add_test(NAME linux_fixed_base COMMAND ${Python3_EXECUTABLE}
@@ -516,6 +526,8 @@ if(BUILD_TESTING)
         set_tests_properties(windows_runpath PROPERTIES TIMEOUT 30)
         add_test(NAME windows_trace_imports COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_windows_trace_imports.py $<TARGET_FILE:relinker>)
+        add_test(NAME linux_trace_imports COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_linux_trace_imports.py $<TARGET_FILE:relinker>)
         add_test(NAME windows_address_space COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_windows_address_space.py $<TARGET_FILE:relinker>)
         add_test(NAME windows_tls_thread_pointer COMMAND ${Python3_EXECUTABLE}
@@ -583,6 +595,10 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_guest_absolute_symbols.py $<TARGET_FILE:relinker>)
         add_test(NAME guest_module_identity COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_guest_module_identity.py $<TARGET_FILE:relinker>)
+        add_test(NAME guest_unused_import_dependencies COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_guest_unused_import_dependencies.py
+            $<TARGET_FILE:relinker> $<TARGET_FILE:guest_module_args_host>)
+        set_property(TEST guest_unused_import_dependencies APPEND PROPERTY LABELS relinker)
         add_test(NAME guest_export_lookup COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_guest_export_lookup.py $<TARGET_FILE:relinker>)
         set_tests_properties(guest_export_lookup PROPERTIES TIMEOUT 30)
@@ -594,6 +610,11 @@ if(BUILD_TESTING)
         add_asan_test_options(guest_module_fini verify_asan_link_order=0)
         add_test(NAME guest_needed_nested_modules COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_guest_needed_nested_modules.py $<TARGET_FILE:relinker>)
+        add_test(NAME guest_zero_initializer COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_guest_zero_initializer.py
+            $<TARGET_FILE:relinker> $<TARGET_FILE:guest_module_args_host>)
+        set_tests_properties(guest_zero_initializer PROPERTIES TIMEOUT 30)
+        add_asan_test_options(guest_zero_initializer verify_asan_link_order=0)
         set(windows_stdio_host_arguments)
         if(WIN32)
             if(MINGW)
@@ -664,6 +685,8 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_sce_relro.py $<TARGET_FILE:relinker>)
         add_test(NAME sce_module_code_extent COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_sce_module_code_extent.py $<TARGET_FILE:relinker>)
+        add_test(NAME sce_code_gaps COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_sce_code_gaps.py $<TARGET_FILE:relinker>)
         add_test(NAME call_registry COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_call_registry.py $<TARGET_FILE:relinker>)
         add_test(NAME jmprel_table_bounds COMMAND ${Python3_EXECUTABLE}
@@ -720,6 +743,10 @@ if(BUILD_TESTING)
         ${CMAKE_CURRENT_SOURCE_DIR}/io/include
     )
     add_test(NAME windows_icon_resource COMMAND windows_icon_resource_tests)
+
+    add_test_executable(windows_trampoline_builder_tests ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/tests/WindowsTrampolineBuilderTests.cpp)
+    target_link_libraries(windows_trampoline_builder_tests PRIVATE relinker_core)
+    add_test(NAME windows_trampoline_builder COMMAND windows_trampoline_builder_tests)
 
     add_test_executable(entry_stub_tests ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/tests/EntryStubTests.cpp)
     target_link_libraries(entry_stub_tests PRIVATE relinker_core)

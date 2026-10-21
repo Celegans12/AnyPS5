@@ -943,15 +943,29 @@ void NoteDispatchRegisters(std::span<const std::uint32_t> packet, QueueState& qu
     }
 }
 
-void ExecuteIndirectRegisters(std::span<const std::uint32_t> packet, std::span<const std::uint32_t> pairs, QueueState& queue) {
+bool IndirectRegistersValid(std::span<const std::uint32_t> pairs) {
+    for (std::size_t i = 0; i < pairs.size(); i += 2) {
+        if (pairs[i] == 0xffffffffu || (pairs[i] & ~0x70000000u) > 0xffffu) return false;
+    }
+    return true;
+}
+
+void ExecuteIndirectRegisters(std::span<const std::uint32_t> packet, std::span<const std::uint32_t> pairs, QueueState& queue, bool skipInvalid) {
     const auto opcode = (packet[0] >> 8u) & 0xffu;
     require(packet.size() == 5 && IndirectRegisterOpcode(opcode), "expected indirect register packet");
     require(pairs.size() == static_cast<std::size_t>(packet[4]) * 2, "indirect register list does not match its packet");
-    for (std::size_t i = 0; i < pairs.size(); i += 2) registerOffset(pairs[i]);
-    for (std::size_t i = 0; i < pairs.size(); i += 2) writeRegister(queue, opcode, registerOffset(pairs[i]), pairs[i + 1]);
+    const auto usable = [&](std::uint32_t value) { return !skipInvalid || IndirectRegistersValid(std::span(&value, 1)); };
+    for (std::size_t i = 0; i < pairs.size(); i += 2) {
+        if (usable(pairs[i])) registerOffset(pairs[i]);
+    }
+    for (std::size_t i = 0; i < pairs.size(); i += 2) {
+        if (usable(pairs[i])) writeRegister(queue, opcode, registerOffset(pairs[i]), pairs[i + 1]);
+    }
     if (queue.savedContext.has_value() && TraceContextState()) {
         std::fprintf(stderr, "[context]   indirect 0x%x:", opcode);
-        for (std::size_t i = 0; i < pairs.size(); i += 2) std::fprintf(stderr, " %x", registerOffset(pairs[i]));
+        for (std::size_t i = 0; i < pairs.size(); i += 2) {
+            if (usable(pairs[i])) std::fprintf(stderr, " %x", registerOffset(pairs[i]));
+        }
         std::fprintf(stderr, "\n");
     }
 }

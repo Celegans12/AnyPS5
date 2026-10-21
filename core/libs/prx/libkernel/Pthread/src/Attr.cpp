@@ -77,11 +77,13 @@ int APS5_VABI scePthreadAttrGetstack(const PthreadAttr* attr, void** stackaddr, 
 int APS5_VABI scePthreadAttrGet(Pthread thread, PthreadAttr* attr) {
     if (!thread || !attr || !*attr)
         return SCE_KERNEL_ERROR_EINVAL;
+    const auto live = LockLiveGuestThread(thread);
+    if (!live) return SCE_KERNEL_ERROR_ESRCH;
     (*attr)->_stacksize = thread->stackSize;
     (*attr)->stackAddress = thread->stackAddress;
     (*attr)->_detachstate = thread->_detached ? DETACH_DETACHED : DETACH_JOINABLE;
     (*attr)->_schedpriority = thread->priority.load(std::memory_order_relaxed);
-    (*attr)->_schedpolicy = SCHED_FIFO_PS5;
+    (*attr)->_schedpolicy = thread->schedPolicy.load(std::memory_order_relaxed);
     (*attr)->_inheritsched = 4;
     (*attr)->_affinity = thread->affinity.load(std::memory_order_relaxed);
     (*attr)->_affinityExplicit = true;

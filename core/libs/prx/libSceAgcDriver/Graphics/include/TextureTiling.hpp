@@ -80,8 +80,8 @@ struct SurfaceGeometry {
 std::uint32_t FullMipChainLevels(std::uint32_t width, std::uint32_t height, std::uint32_t depth);
 SurfaceGeometry DescribeSurface(const GuestTextureResource& descriptor);
 bool LevelsFitAllocation(const GuestTextureResource& surface, std::uint32_t levels);
-bool TracksBlockUnits(const GuestTextureResource& surface, const SurfaceGeometry& geometry);
 GuestTextureResource ViewedArrayWindow(const GuestTextureResource& viewed);
+GuestTextureResource ArrayLayerWindow(const GuestTextureResource& viewed, std::uint32_t maxArrayLayers);
 
 }
 

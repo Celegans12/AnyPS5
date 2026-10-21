@@ -7,7 +7,9 @@
 #include <cwchar>
 #include <cstdio>
 #include <limits>
+#include <stdexcept>
 #include <string>
+#include <type_traits>
 
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/SonyCrt.hpp"
@@ -37,31 +39,130 @@ std::string AsciiPrefix(const char16_t* text) {
     return prefix;
 }
 
-bool IsNanSubject(const char* text) {
+struct NanSubject {
+    const char* tail;
+    bool negative;
+};
+
+NanSubject FindNanSubject(const char* text) {
     while (*text == ' ' || (*text >= '\t' && *text <= '\r')) ++text;
-    if (*text == '+' || *text == '-') ++text;
-    return *text == 'n' || *text == 'N';
+    bool negative = false;
+    if (*text == '+' || *text == '-') negative = *text++ == '-';
+    if ((text[0] | 0x20) == 'n' && (text[1] | 0x20) == 'a' && (text[2] | 0x20) == 'n') return {text + 3, negative};
+    return {nullptr, negative};
 }
 
-double QuietNan(double value, const char* text) {
-    const auto bits = std::bit_cast<std::uint64_t>(value);
-    if ((bits & 0x7ff0000000000000u) != 0x7ff0000000000000u || !IsNanSubject(text)) return value;
-    return std::bit_cast<double>((bits & 0x8000000000000000u) | 0x7ff8000000000000u);
+unsigned HexNanDigit(unsigned char c) {
+    if (c >= '0' && c <= '9') return c - '0' + 0x10;
+    if (c >= 'a' && c <= 'f') return c - 'a' + 0x1a;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 0x1a;
+    return 0;
 }
 
-float QuietNan(float value, const char* text) {
-    const auto bits = std::bit_cast<std::uint32_t>(value);
-    if ((bits & 0x7f800000u) != 0x7f800000u || !IsNanSubject(text)) return value;
-    return std::bit_cast<float>((bits & 0x80000000u) | 0x7fc00000u);
+void ShiftNanWords(std::uint32_t* words, int from, int to, int digits) {
+    const int shift = (8 - digits) * 4;
+    const int carry = 32 - shift;
+    int index = from;
+    do {
+        words[index] |= words[index + 1] << carry;
+        words[index + 1] >>= shift;
+    } while (++index < to);
 }
 
-long double QuietNan(long double value, const char* text) {
-    std::uint16_t exponent;
-    std::memcpy(&exponent, reinterpret_cast<const unsigned char*>(&value) + sizeof(std::uint64_t), sizeof(exponent));
-    if ((exponent & 0x7fffu) != 0x7fffu || !IsNanSubject(text)) return value;
-    const std::uint64_t significand = 0xc000000000000000u;
-    std::memcpy(&value, &significand, sizeof(significand));
-    return value;
+std::uint64_t HexNanPayload(const char* open, const char*& end) {
+    std::uint32_t words[2] = {};
+    constexpr int high = 1;
+    int top = high;
+    int group = high;
+    int digits = 0;
+    int groupStart = 0;
+    int inWord = 0;
+    const auto* s = reinterpret_cast<const unsigned char*>(open);
+    const auto skipBlanksAndPrefix = [&s](bool inside) {
+        while (s[1] != 0 && s[1] <= ' ') ++s;
+        if (inside && s[1] == 0) throw std::invalid_argument("strtod: blanks after a NAN payload digit reach the terminating NUL, where the console reads past it");
+        if (s[1] == '0' && (s[2] == 'x' || s[2] == 'X') && s[3] > ' ') s += 2;
+    };
+    skipBlanksAndPrefix(false);
+    for (unsigned char c; (c = *++s) != 0;) {
+        const unsigned digit = HexNanDigit(c);
+        if (digit == 0) {
+            if (c <= ' ') {
+                if (groupStart < digits) {
+                    if (top < group && inWord < 8) ShiftNanWords(words, top, group, inWord);
+                    if (top <= 0) {
+                        inWord = 8;
+                        continue;
+                    }
+                    groupStart = digits;
+                    words[--top] = 0;
+                    group = top;
+                    inWord = 0;
+                }
+                skipBlanksAndPrefix(true);
+                continue;
+            }
+            if (c == ')' && digits != 0) {
+                end = reinterpret_cast<const char*>(s + 1);
+                break;
+            }
+            for (; c != 0; c = *++s) {
+                if (c == ')') {
+                    end = reinterpret_cast<const char*>(s + 1);
+                    break;
+                }
+            }
+            return 0;
+        }
+        ++digits;
+        if (++inWord > 8) {
+            if (top <= 0) continue;
+            inWord = 1;
+            words[--top] = 0;
+        }
+        words[top] = (words[top] << 4) | (digit & 0xf);
+    }
+    if (digits == 0) return 0;
+    if (top < group && inWord < 8) ShiftNanWords(words, top, group, inWord);
+    if (top > 0) {
+        int to = 0;
+        int from = top;
+        do words[to++] = words[from++];
+        while (from <= high);
+        do words[to++] = 0;
+        while (to <= high);
+    } else {
+        words[high] &= 0xffffffffu >> 12;
+    }
+    if (words[0] == 0 && words[1] == 0) words[0] = 1;
+    return (static_cast<std::uint64_t>(words[1]) << 32) | words[0];
+}
+
+const char* NanSequenceEnd(const char* tail) {
+    if (*tail != '(') return tail;
+    const char* cursor = tail + 1;
+    while ((*cursor >= '0' && *cursor <= '9') || ((*cursor | 0x20) >= 'a' && (*cursor | 0x20) <= 'z') || *cursor == '_') ++cursor;
+    return *cursor == ')' ? cursor + 1 : tail;
+}
+
+template<typename TFloat>
+TFloat NanValue(const NanSubject& subject, const char*& end) {
+    if constexpr (std::is_same_v<TFloat, double>) {
+        end = subject.tail;
+        const std::uint64_t payload = *subject.tail == '(' ? HexNanPayload(subject.tail, end) : 0;
+        return std::bit_cast<double>((subject.negative ? 0x8000000000000000ull : 0) | 0x7ff8000000000000ull | payload);
+    } else if constexpr (std::is_same_v<TFloat, float>) {
+        end = NanSequenceEnd(subject.tail);
+        return std::bit_cast<float>(0x7fc00000u);
+    } else {
+        end = NanSequenceEnd(subject.tail);
+        TFloat value{};
+        const std::uint64_t significand = 0xc000000000000000u;
+        const std::uint16_t signExponent = 0x7fff;
+        std::memcpy(&value, &significand, sizeof(significand));
+        std::memcpy(reinterpret_cast<unsigned char*>(&value) + sizeof(significand), &signExponent, sizeof(signExponent));
+        return value;
+    }
 }
 
 template<typename TParse>
@@ -75,10 +176,18 @@ auto ParseAsciiPrefix(const char16_t* text, char16_t** end, TParse parse) {
 
 template<typename TFloat>
 TFloat ParseFloat(const char* text, char** end, TFloat (*parse)(const char*, char**)) {
+    if (const NanSubject subject = FindNanSubject(text); subject.tail != nullptr) {
+        const char* stop = subject.tail;
+        const TFloat value = NanValue<TFloat>(subject, stop);
+        if (end != nullptr) *end = const_cast<char*>(stop);
+        return value;
+    }
     char* parsedEnd = nullptr;
+    const int saved = errno;
     const TFloat value = parse(text, &parsedEnd);
+    if (errno == ERANGE && value != 0 && (value < 0 ? -value : value) < std::numeric_limits<TFloat>::min()) errno = saved;
     if (end != nullptr) *end = parsedEnd;
-    return parsedEnd == text ? TFloat{0} : QuietNan(value, text);
+    return parsedEnd == text ? TFloat{0} : value;
 }
 
 }
@@ -124,6 +233,32 @@ void* APS5_VABI memrchr_nid_postfix(const void* s, int c, size_t n) {
     return nullptr;
 }
 
+void* APS5_VABI memccpy_nid_postfix(void* dest, const void* src, int c, size_t n) {
+    auto* d = static_cast<unsigned char*>(dest);
+    const auto* s = static_cast<const unsigned char*>(src);
+    const auto target = static_cast<unsigned char>(c);
+    for (size_t i = 0; i < n; ++i) {
+        d[i] = s[i];
+        if (s[i] == target) return d + i + 1;
+    }
+    return nullptr;
+}
+
+void* APS5_VABI memmem_nid_postfix(const void* haystack, size_t haystacklen, const void* needle, size_t needlelen) {
+    if (needlelen == 0) return const_cast<void*>(haystack);
+    if (haystacklen < needlelen) return nullptr;
+    const auto* h = static_cast<const unsigned char*>(haystack);
+    const auto* n = static_cast<const unsigned char*>(needle);
+    const unsigned char first = n[0];
+    const size_t limit = haystacklen - needlelen;
+    for (size_t i = 0; i <= limit; ++i) {
+        if (h[i] == first && std::memcmp(h + i, n, needlelen) == 0) {
+            return const_cast<unsigned char*>(h + i);
+        }
+    }
+    return nullptr;
+}
+
 int APS5_VABI strcmp_nid_postfix(const char* s1, const char* s2) {
     return std::strcmp(s1, s2);
 }
@@ -153,7 +288,7 @@ const char* APS5_VABI strchr_nid_postfix(const char* s, int c) {
 }
 
 char* APS5_VABI strrchr_nid_postfix(const char* s, int c) {
-    return std::strrchr(const_cast<char*>(s), c);
+    return std::strrchr(const_cast<char*>(s), static_cast<char>(c));
 }
 
 char* APS5_VABI rindex_nid_postfix(const char* s, int c) {

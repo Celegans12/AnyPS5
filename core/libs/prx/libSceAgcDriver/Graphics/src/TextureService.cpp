@@ -262,6 +262,7 @@ void TextureService::readTable(Tracked& tracked) {
     tracked.pending = std::move(prepared);
     tracked.unmapped = !mapped;
     tracked.perUseEpoch = ~std::uint64_t{0};
+    if (tracked.state != TableState::Prepared) ++preparedTables;
     tracked.state = TableState::Prepared;
     tracked.primerNanoseconds += Elapsed(started);
     totals.primedRecords += registration.records;
@@ -299,7 +300,11 @@ void TextureService::workerLoop() {
         missPending.insert(missPending.end(), std::make_move_iterator(prepared.begin()), std::make_move_iterator(prepared.end()));
         takingMisses = false;
         changed.notify_all();
-        const bool work = !missPending.empty() || std::any_of(tables.begin(), tables.end(), [](const auto& item) { return item.second.state == TableState::Prepared; });
+        // PERF-PLAN: the walk over every table cost ~4% of the process in the world (12.7k tables every
+        // 4 ms, under the mutex the draw path's bindless lookups take). APS5_NO_PREPARED_TABLE_COUNT=1
+        // walks the tables as before.
+        const bool scanTables = RuntimeSwitches::Set(RuntimeSwitch::NoPreparedTableCount);
+        const bool work = !missPending.empty() || (scanTables ? std::any_of(tables.begin(), tables.end(), [](const auto& item) { return item.second.state == TableState::Prepared; }) : preparedTables != 0);
         lock.unlock();
         if (!work) continue;
         auto& gpu = GuestMemory::GpuMutex();
@@ -580,6 +585,7 @@ void TextureService::commitTable(Tracked& tracked, Recorder& recorder, Lock& loc
     }
     tracked.primerNanoseconds += Elapsed(started);
     if (!tracked.pending.empty() || tracked.state != TableState::Prepared) return;
+    --preparedTables;
     tracked.state = TableState::Done;
     ++totals.primed;
     totals.primerNanoseconds += tracked.primerNanoseconds;

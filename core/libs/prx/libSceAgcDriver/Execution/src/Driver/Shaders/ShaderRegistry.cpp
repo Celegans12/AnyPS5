@@ -962,7 +962,7 @@ std::optional<ShaderRecompiler::ShaderFloatMode> DecodeFloatMode(const Registers
     case 0: rsrc1 = 0x212; fp16OverflowBit = 26; break;
     case 1: rsrc1 = 0x00a; fp16OverflowBit = 29; break;
     case 2: case 4: case 6: rsrc1 = 0x08a; fp16OverflowBit = 31; break;
-    case 5: case 7: rsrc1 = 0x10a; fp16OverflowBit = 30; break;
+    case 3: case 5: case 7: rsrc1 = 0x10a; fp16OverflowBit = 30; break;
     default: return std::nullopt;
     }
     const auto found = registers.find(rsrc1);
@@ -1060,7 +1060,7 @@ std::unique_ptr<RegisteredPreparation> PlanRegistered(const ShaderSnapshot& snap
     case 1: stage = Stage::Fragment; programRegister = 0x008; resourceRegister = 0x00b; break;
     case 2: stage = Stage::Vertex; programRegister = 0x0c8; resourceRegister = 0x08b; firstUser = 8; break;
     case 4: stage = Stage::Mesh; programRegister = 0x0c8; resourceRegister = 0x08b; break;
-    case 5: return {};
+    case 3: case 5: return {};
     case 6: stage = Stage::Mesh; programRegister = 0x088; resourceRegister = 0x08b; break;
     case 7: stage = Stage::TessellationControl; programRegister = 0x108; resourceRegister = 0x10b; break;
     default:
@@ -1354,33 +1354,37 @@ public:
     }
 
     void Close() {
-        std::vector<pthread_t> joined;
-#ifdef _WIN32
-        std::vector<std::pair<HANDLE, unsigned>> windowsJoined;
-#endif
+        std::vector<Worker> joined;
         {
             std::unique_lock lock(mutex);
             closed = true;
             idle.wait(lock, [&] { return tasks.empty() && running == 0; });
             joined.swap(workers);
-#ifdef _WIN32
-            windowsJoined.swap(windowsWorkers);
-#endif
         }
         ready.notify_all();
-        for (const auto worker : joined) {
-            if (!pthread_equal(worker, pthread_self())) pthread_join(worker, nullptr);
-        }
-#ifdef _WIN32
-        for (const auto& [handle, id] : windowsJoined) {
-            if (id != GetCurrentThreadId()) WaitForSingleObject(handle, INFINITE);
-            CloseHandle(handle);
-        }
-#endif
+        for (const auto& worker : joined) Join(worker);
     }
 
 private:
     static constexpr std::size_t StackBytes = 64u << 20u;
+
+#ifdef _WIN32
+    struct Worker {
+        HANDLE handle;
+        unsigned id;
+    };
+
+    static void Join(const Worker& worker) {
+        if (worker.id != GetCurrentThreadId()) WaitForSingleObject(worker.handle, INFINITE);
+        CloseHandle(worker.handle);
+    }
+#else
+    using Worker = pthread_t;
+
+    static void Join(Worker worker) {
+        if (!pthread_equal(worker, pthread_self())) pthread_join(worker, nullptr);
+    }
+#endif
 
     explicit RegistrationPreparePool(unsigned count) {
 #ifdef _WIN32
@@ -1388,7 +1392,7 @@ private:
             unsigned id = 0;
             const auto thread = _beginthreadex(nullptr, static_cast<unsigned>(StackBytes), &RegistrationPreparePool::WindowsMain, this, STACK_SIZE_PARAM_IS_A_RESERVATION, &id);
             if (thread != 0) {
-                windowsWorkers.emplace_back(reinterpret_cast<HANDLE>(thread), id);
+                workers.push_back({reinterpret_cast<HANDLE>(thread), id});
                 ++threads;
                 liveWorkers.fetch_add(1, std::memory_order_acq_rel);
             }
@@ -1460,10 +1464,7 @@ private:
     std::condition_variable ready;
     std::condition_variable idle;
     std::deque<Task> tasks;
-    std::vector<pthread_t> workers;
-#ifdef _WIN32
-    std::vector<std::pair<HANDLE, unsigned>> windowsWorkers;
-#endif
+    std::vector<Worker> workers;
     unsigned threads = 0;
     inline static std::atomic<unsigned> liveWorkers{0};
     unsigned running = 0;
@@ -1550,13 +1551,13 @@ std::vector<PreparedGraphicsStage> PrepareGraphicsStages(const DrawDecode& decod
     require(expected == decoded.roles, "graphics ABI linked programs do not match the stage routing");
     std::vector<ShaderRecompiler::LinkedProgram> linked;
     std::vector<ShaderRecompiler::MemoryRegion> memory;
+    AppendProgramMemory(memory, decoded.programs);
     for (std::size_t index = 0; index < decoded.programs.size(); ++index) {
         const auto& program = decoded.programs[index];
         require(program.snapshot != nullptr && program.codeOffset < program.snapshot->code.size(), "graphics ABI has an invalid registered entry point");
         const auto code = std::span(program.snapshot->code).subspan(program.codeOffset);
         require(program.binary.code.data() == code.data() && program.binary.code.size() == code.size() && program.binary.codeAddress == program.snapshot->codeAddress + program.codeOffset * sizeof(std::uint32_t), "graphics ABI entry point differs from its snapshot");
         linked.push_back({decoded.roles[index], program.binary, program.userDataBase, program.firstUserSgpr, program.userData});
-        memory.insert(memory.end(), program.memory.begin(), program.memory.end());
     }
     std::vector<PreparedGraphicsStage> prepared;
     std::uint32_t pushOffset = 0;

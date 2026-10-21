@@ -108,6 +108,8 @@ def parse_elf(data):
     if inner + 0x40 > len(data):
         raise Refused("inner ELF header is truncated")
     header = bytearray(data[inner:inner + 0x40])
+    if header[4] != 2 or header[5] != 1:
+        raise Refused("inner ELF is not 64-bit little-endian")
     program_offset = struct.unpack_from("<Q", header, 0x20)[0]
     entry_size = struct.unpack_from("<H", header, 0x36)[0]
     count = struct.unpack_from("<H", header, 0x38)[0]
@@ -265,7 +267,8 @@ def unwrap(path, output, verbose=False):
         if header["type"] == PT_LOAD or header["size"] == 0:
             continue
         if region_for(header["source"], header["size"]) is None:
-            regions.append({"old": header["source"], "size": header["size"], "vaddr": 0, "align": 1})
+            regions.append({"old": header["source"], "size": header["size"],
+                            "vaddr": header["vaddr"], "align": header["align"]})
 
     regions.sort(key=lambda region: region["old"])
     program_offset = struct.unpack_from("<Q", elf_header, 0x20)[0]

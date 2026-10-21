@@ -33,6 +33,7 @@ struct SpirvTargetOptions {
     bool singleWorkgroup = false;
     bool robustBufferAccess2 = false;
     bool float32FlushToZero = false;
+    bool float32DenormPreserve = false;
     bool meshBarycentricPixel = false;
     bool meshBarycentricVertex = false;
     std::uint32_t barycentricSmoothLocation = 0xffffffffu;

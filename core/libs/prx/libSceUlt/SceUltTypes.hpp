@@ -4,7 +4,9 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <cstring>
 #include <memory>
+#include <list>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -19,15 +21,41 @@ constexpr int ULT_ERROR_STATE = -2139029498;
 constexpr int ULT_ERROR_BUSY = -2139029497;
 constexpr int ULT_ERROR_AGAIN = -2139029496;
 
+struct UltOptParam {
+    std::uint8_t bytes[128];
+};
+
+inline int InitializeOptParam(UltOptParam* optParam) {
+    if (optParam == nullptr) {
+        return ULT_ERROR_NULL;
+    }
+    std::memset(optParam, 0, sizeof(*optParam));
+    return ULT_OK;
+}
+
 struct UltMutexState {
     std::mutex _mutex;
     std::condition_variable _available;
     std::thread::id _owner{};
     std::uint32_t _lockCount = 0;
     std::uint32_t _waiters = 0;
+    std::uint32_t _conditions = 0;
+    std::uint32_t _conditionWaiters = 0;
     bool _alive = true;
     std::uint32_t _attribute = 0;
     void* _waitingPool = nullptr;
+};
+
+struct UltConditionWaiter {
+    std::condition_variable _available;
+    bool _signaled = false;
+};
+
+struct UltConditionState {
+    std::shared_ptr<UltMutexState> _mutex;
+    std::list<UltConditionWaiter*> _queue;
+    std::uint32_t _waiters = 0;
+    bool _alive = true;
 };
 
 struct UltSemaphoreState {
@@ -78,6 +106,7 @@ struct UltRuntimeState {
 struct UltUlthreadState {
     UltUlthreadEntry _entry = nullptr;
     std::uint64_t _arg = 0;
+    void* _object = nullptr;
     Pthread _thread = nullptr;
     void* _runtime = nullptr;
     std::atomic<bool> _exited{false};

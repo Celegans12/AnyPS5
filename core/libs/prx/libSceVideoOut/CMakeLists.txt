@@ -149,6 +149,15 @@ if(BUILD_TESTING)
         set_tests_properties(pad_input_mapping PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    add_test_executable(pad_output_pacing_tests tests/PadOutputPacing.cpp)
+    target_include_directories(pad_output_pacing_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(pad_output_pacing_tests PRIVATE libc)
+    configure_windows_unwind(pad_output_pacing_tests)
+    add_test(NAME pad_output_pacing COMMAND pad_output_pacing_tests)
+    if(WIN32)
+        set_tests_properties(pad_output_pacing PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
 endif()
 
 if(BUILD_TESTING)

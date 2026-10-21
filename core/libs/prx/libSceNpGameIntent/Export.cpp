@@ -73,4 +73,54 @@ int APS5_VABI sceNpGameIntentVshTerminate(void) {
     return 0;
 }
 
+int APS5_VABI sceNpAppLauncherInitialize() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceNpAppLauncherLaunchApp() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceNpAppLauncherTerminate() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceNpGameIntentGetUdsNpComId() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceNpGameIntentLaunchApp() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceNpGameIntentLaunchApp2() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceNpGameIntentNotifyAppLaunched() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceNpSessionServiceGetJoinedPartySession() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceNpSessionServiceGetRunningGamePlayerSession() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceNpSessionServiceSendPlayerSessionInvitations() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
 }

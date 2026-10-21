@@ -1,8 +1,10 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
+#include <algorithm>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <iostream>
 #include <mutex>
@@ -95,6 +97,12 @@ int main() {
         AgcDriver::DriverDetail::Driver::Get();
         CheckPool("registration preparation", [](std::function<void()> task) { AgcDriver::DriverDetail::SubmitRegistrationPreparation(std::move(task)); });
         CheckPool("library prebuild", [](std::function<void()> task) { AgcDriver::DriverDetail::SubmitLibraryPrebuild(std::move(task)); });
+        const char* prebuildThreads = std::getenv("APS5_PREBUILD_THREADS");
+        const auto started = std::max(2u, std::thread::hardware_concurrency() / 2u) + (prebuildThreads != nullptr ? std::max(1u, static_cast<unsigned>(std::strtoul(prebuildThreads, nullptr, 10))) : 1u);
+        const auto live = AgcDriver::DriverDetail::RegistrationPreparationThreads();
+        Require(live == started, "the preparation and prebuild pools count " + std::to_string(live) + " live threads of the " + std::to_string(started) + " they started");
+        AgcDriver::DriverDetail::CloseRegistrationPreparation();
+        Require(AgcDriver::DriverDetail::RegistrationPreparationThreads() == 0, "closing the preparation and prebuild pools left " + std::to_string(AgcDriver::DriverDetail::RegistrationPreparationThreads()) + " live threads");
         std::puts("registration prepare stack tests passed");
         return 0;
     } catch (const std::exception& error) {

@@ -53,9 +53,9 @@ void PrintFailure(std::exception_ptr error) {
     std::fflush(stderr);
 }
 
-constexpr std::uint64_t DriverMemoryAddress = 0xfe0000000ull;
+constexpr std::uint64_t DriverMemoryAddress = 0xfe0000000ull + GuestArena::GuestAddressOffset;
 constexpr std::size_t DriverMemoryBytes = 2u << 20u;
-constexpr std::uint64_t FsTableAddress = 0xfe0040000ull;
+constexpr std::uint64_t FsTableAddress = DriverMemoryAddress + 0x40000ull;
 constexpr std::uint64_t FsTableSlotBytes = 16u;
 constexpr std::uint64_t FsTableSlots = 6u;
 constexpr std::uint64_t FsRoutineRecords = 8u;
@@ -186,6 +186,10 @@ Driver::Driver() {
     InstallAsyncLog_nid_no_patch();
     static const bool driverMemory = (MapDriverMemory(), true);
     static_cast<void>(driverMemory);
+    LibcSetExitDrain_nid_no_patch([] {
+        const auto current = Driver::Get().device.Load();
+        if (current) current->SavePipelineCache();
+    });
     static_cast<void>(GuestMemory::TrackerGeneration());
     ShaderMemory::SetWaitedMsProvider(&Graphics::Recorder::ThreadWaitedMs);
     try {

@@ -439,14 +439,17 @@ KernelCpumask LiveGuestThreadsAffinity() {
     return mask;
 }
 
-bool GuestThreadIsLive(const PthreadPrivate* thread) {
+std::unique_lock<std::mutex> LockLiveGuestThread(const PthreadPrivate* thread) {
     auto& registry = CpuClocks();
-    std::lock_guard lock(registry.lock);
+    std::unique_lock lock(registry.lock);
     for (const auto& [id, live] : registry.threads) {
-        if (live != thread) continue;
-        return !live->_finished.load(std::memory_order_acquire);
+        if (live == thread && !live->_finished.load(std::memory_order_acquire)) return lock;
     }
-    return false;
+    return {};
+}
+
+bool GuestThreadIsLive(const PthreadPrivate* thread) {
+    return LockLiveGuestThread(thread).owns_lock();
 }
 
 bool GetLiveGuestThreadAffinity_nid_no_patch(std::int64_t tid, KernelCpumask& mask) {

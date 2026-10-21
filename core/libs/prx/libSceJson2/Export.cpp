@@ -196,12 +196,15 @@ void CopyInto(Value& destination, const Value& source) {
 }
 
 void SetType(Node& n, ValueType type) {
-    Clear(n);
-    n.type = type;
-    if (type == TypeString) Construct(n.string, std::string());
-    if (type == TypeArray) Construct(n.array);
-    if (type == TypeObject) Construct(n.object);
     if (type < TypeNull || type > TypeObject) throw std::invalid_argument("sce::Json::Value::set: invalid value type");
+    Node pending{};
+    pending.type = type;
+    if (type == TypeString) Construct(pending.string, std::string());
+    if (type == TypeArray) Construct(pending.array);
+    if (type == TypeObject) Construct(pending.object);
+    Clear(n);
+    pending.handlers = n.handlers;
+    n = pending;
 }
 
 const Value& Defaults(ValueType type) {

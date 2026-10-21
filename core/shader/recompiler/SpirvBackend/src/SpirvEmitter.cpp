@@ -10,6 +10,7 @@
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
 #include <bit>
+#include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
@@ -19,8 +20,14 @@ namespace ShaderRecompiler {
 
 namespace {
 
+std::string FailureText(const IrProgram& program) {
+    char hash[24];
+    std::snprintf(hash, sizeof(hash), "%llx", static_cast<unsigned long long>(program.Resources().shaderHash));
+    return std::string("SPIR-V emission failed: hash=0x") + hash + " stage=" + std::to_string(static_cast<unsigned>(program.Resources().stage));
+}
+
 [[noreturn]] void FailProgram(const IrProgram& program, const char* reason) {
-    throw std::runtime_error("SPIR-V emission failed: hash=0x" + std::to_string(program.Resources().shaderHash) + " stage=" + std::to_string(static_cast<unsigned>(program.Resources().stage)) + " reason=" + reason);
+    throw std::runtime_error(FailureText(program) + " reason=" + reason);
 }
 
 const ShaderWorkgroupInputInfo* ShaderWorkgroupInputFor(const SpirvEmitterState& state) {
@@ -246,7 +253,7 @@ std::uint32_t SpirvValueEmitContext::Label(const IrBlock* block) const {
 }
 
 [[noreturn]] void SpirvValueEmitContext::Fail(const IrValue& inst, const char* reason) const {
-    throw std::runtime_error("SPIR-V emission failed: hash=0x" + std::to_string(state.program.Resources().shaderHash) + " stage=" + std::to_string(static_cast<unsigned>(state.program.Resources().stage)) + " opcode=" + std::string(IrOpcodeName(inst.Opcode())) + " reason=" + reason);
+    throw std::runtime_error(FailureText(state.program) + " opcode=" + std::string(IrOpcodeName(inst.Opcode())) + " reason=" + reason);
 }
 
 std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const CompiledBindingLayout& bindings, const SpirvTargetOptions& target) const {
@@ -285,6 +292,7 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
     state.singleWorkgroup = target.singleWorkgroup && program.Resources().stage == IrShaderStage::Compute;
     state.robustBufferAccess2 = target.robustBufferAccess2;
     state.float32FlushToZero = target.float32FlushToZero;
+    state.float32DenormPreserve = target.float32DenormPreserve;
     state.hostSubgroupSize = target.subgroupSize;
     state.bindlessImages = target.bindlessImages && ResourceMaterializer::UsesBindlessImages(program.Info(), program.Resources().stage);
     const auto supports = [&](spv::Capability capability) { return std::ranges::find(target.supportedCapabilities, static_cast<std::uint32_t>(capability)) != target.supportedCapabilities.end(); };
@@ -294,6 +302,8 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
         state.requirements.ldsLock = false;
         state.requirements.ldsBufferInt64Atomics = true;
     }
+    const bool int64Atomics = std::ranges::find(state.supportedCapabilities, static_cast<std::uint32_t>(spv::CapabilityInt64Atomics)) != state.supportedCapabilities.end();
+    state.requirements.bufferU64View = state.requirements.bufferInt64Atomics || (state.requirements.coherentBufferPairs && int64Atomics);
     if (HostSubgroupSingleLane(state)) {
         state.requirements.subgroupBallot = false;
         state.requirements.subgroupShuffle = false;

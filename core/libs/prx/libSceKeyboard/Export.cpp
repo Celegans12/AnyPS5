@@ -98,6 +98,36 @@ int APS5_VABI sceKeyboardSetProcessPrivilege(void) {
     return 0;
 }
 
+int APS5_VABI sceDbgKeyboardClose() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceDbgKeyboardGetKey2Char() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceDbgKeyboardInit() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceDbgKeyboardOpen() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceDbgKeyboardRead() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceDbgKeyboardReadState() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
 void KeyboardPublishInput_nid_postfix(const KeyboardInputEvent& event) {
     Keyboard::Publish(event);
 }

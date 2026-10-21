@@ -196,6 +196,8 @@ bool addsImmediate(const RdnaInstruction& instruction, std::uint32_t reg, std::u
          (isRegister(instruction.source1, RdnaOperandKind::ScalarRegister, reg) && isImmediate(instruction.source0, immediate)));
 }
 
+bool findLastWriter(const RdnaProgram& program, std::uint32_t end, std::initializer_list<std::uint32_t> indices, std::uint32_t& writer, std::uint32_t waveSize = 0u, std::uint32_t skipBranchesPast = 0u);
+
 bool resolveJumpTable(const RdnaProgram& program, std::uint32_t index, BoundedJumpTable& result) {
     if (index < 9u) return false;
     const auto& branch = program.instructions[index];
@@ -224,8 +226,13 @@ bool resolveJumpTable(const RdnaProgram& program, std::uint32_t index, BoundedJu
         const auto& basePc = program.instructions[loadIndex - 3u];
         const auto& baseLow = program.instructions[loadIndex - 2u];
         const auto& baseHigh = program.instructions[loadIndex - 1u];
-        const auto& shift = program.instructions[loadIndex - 4u];
-        const auto& bound = program.instructions[loadIndex - 5u];
+        const auto offsetReg = scalarIndex(load.source1);
+        std::uint32_t shiftIndex = 0, boundIndex = 0;
+        if (offsetReg == NoScalarRegister ||
+            !findLastWriter(program, loadIndex - 3u, {offsetReg}, shiftIndex) ||
+            !findLastWriter(program, shiftIndex, {offsetReg}, boundIndex)) return false;
+        const auto& shift = program.instructions[shiftIndex];
+        const auto& bound = program.instructions[boundIndex];
         const auto baseReg = load.source0.reg;
         std::uint32_t displacement = 0, carry = 0, shiftAmount = 0, maximum = 0;
         if (basePc.op != RdnaOpcode::SGetpcB64 || !isRegister(basePc.destination, RdnaOperandKind::ScalarRegister, baseReg) ||
@@ -295,7 +302,7 @@ bool writesScalar(const RdnaInstruction& instruction, std::uint32_t index, std::
     return covers(instruction.destination) || covers(instruction.destination2);
 }
 
-bool findLastWriter(const RdnaProgram& program, std::uint32_t end, std::initializer_list<std::uint32_t> indices, std::uint32_t& writer, std::uint32_t waveSize = 0u, std::uint32_t skipBranchesPast = 0u) {
+bool findLastWriter(const RdnaProgram& program, std::uint32_t end, std::initializer_list<std::uint32_t> indices, std::uint32_t& writer, std::uint32_t waveSize, std::uint32_t skipBranchesPast) {
     for (auto position = end; position-- > 0u;) {
         const auto& instruction = program.instructions[position];
         const bool skipped = skipBranchesPast != 0u && IsDirectBranchOpcode(instruction.op) && instruction.op != RdnaOpcode::SBranch && instruction.branchTarget > skipBranchesPast;

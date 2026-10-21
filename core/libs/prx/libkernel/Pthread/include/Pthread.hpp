@@ -171,6 +171,7 @@ bool GuestThreadCpuNanos(int cpuClockThread, std::uint64_t* nanos);
 void SetLiveGuestThreadsAffinity(KernelCpumask mask);
 KernelCpumask LiveGuestThreadsAffinity();
 bool GuestThreadIsLive(const PthreadPrivate* thread);
+std::unique_lock<std::mutex> LockLiveGuestThread(const PthreadPrivate* thread);
 bool LiveGuestThreadExists(std::int64_t tid);
 bool GetLiveGuestThreadAffinity_nid_no_patch(std::int64_t tid, KernelCpumask& mask);
 bool SetLiveGuestThreadAffinity_nid_no_patch(std::int64_t tid, KernelCpumask mask);

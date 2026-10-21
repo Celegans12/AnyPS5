@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <exception>
 #ifndef _WIN32
 #include <cerrno>
 #include <fstream>
@@ -45,11 +46,7 @@ void noteAccess(const void* pointer, std::size_t bytes) {
     if (const auto callback = accessObserver.load(std::memory_order_acquire)) callback(reinterpret_cast<std::uintptr_t>(pointer), bytes);
 }
 
-#ifdef ANYPS5_ENABLE_ASAN
-constexpr std::uintptr_t GuestArenaOffset = 0x0000100000000000ull;
-#else
-constexpr std::uintptr_t GuestArenaOffset = 0;
-#endif
+constexpr std::uintptr_t GuestArenaOffset = GuestArena::GuestAddressOffset;
 constexpr std::uintptr_t ArenaStart = 0x0000000200000000ull + GuestArenaOffset;
 constexpr std::uintptr_t SystemReservedStart = 0x00000007FFFFC000ull + GuestArenaOffset;
 constexpr std::uintptr_t SystemReservedEnd = 0x0000001000000000ull + GuestArenaOffset;
@@ -477,7 +474,23 @@ void GuestArenaMap_nid_postfix(void* pointer, std::size_t bytes, void* section, 
 
 void GuestArenaMapDirect_nid_postfix(void* pointer, std::size_t bytes, void* section, std::uint64_t offset, std::uint32_t protection) {
     if (!Arena::Get().Contains(pointer, bytes)) throw OutsideArena("direct memory mapping", pointer, bytes);
-    WindowsMappings::Get().Map(pointer, bytes, section, offset, protection, Arena::Get().WriteWatched(), true);
+    const auto generation = commitGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
+    std::vector<std::pair<std::uintptr_t, std::size_t>> created;
+    std::exception_ptr failure;
+    try {
+        WindowsMappings::Get().Map(pointer, bytes, section, offset, protection, Arena::Get().WriteWatched(), true, PAGE_EXECUTE_READWRITE, SIZE_MAX, &created);
+    } catch (...) {
+        failure = std::current_exception();
+    }
+    try {
+        if (const auto callback = privateMappingObserver.load(std::memory_order_acquire)) {
+            for (const auto& [address, size] : created) callback(address, size, generation);
+        }
+    } catch (...) {
+        if (failure != nullptr) std::rethrow_exception(failure);
+        throw;
+    }
+    if (failure != nullptr) std::rethrow_exception(failure);
     noteAccess(pointer, bytes);
 }
 

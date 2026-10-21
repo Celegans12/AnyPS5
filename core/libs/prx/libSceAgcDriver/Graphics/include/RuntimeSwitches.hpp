@@ -40,6 +40,8 @@ enum class RuntimeSwitch : std::size_t {
     NoLaneLabelScope,
     NoLaneForwardEdge,
     NoLaneLeaseWait,
+    NoImageSlabs,
+    NoPreparedTableCount,
     Count,
 };
 

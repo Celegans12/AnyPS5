@@ -1,6 +1,13 @@
 #include "prx/libc/include/CallTrace.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <dlfcn.h>
+#include <unistd.h>
+#endif
+#include <atomic>
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -49,18 +56,65 @@ static Block APS5_VABI Blocks(std::uint64_t seed) {
     return {{seed, seed + 1, seed + 2, seed + 3}};
 }
 
+static std::uint64_t CurrentThread() {
+#ifdef _WIN32
+    return GetCurrentThreadId();
+#else
+    return static_cast<std::uint64_t>(gettid());
+#endif
+}
+
+static const void* ImageOf(const void* address) {
+#ifdef _WIN32
+    MEMORY_BASIC_INFORMATION memory{};
+    if (VirtualQuery(address, &memory, sizeof(memory)) != sizeof(memory)) return nullptr;
+    return memory.AllocationBase;
+#else
+    Dl_info info{};
+    if (dladdr(address, &info) == 0) return nullptr;
+    return info.dli_fbase;
+#endif
+}
+
 template <typename TFunction>
 static TFunction* Traced(TFunction* function, const char* name, const char* library) {
     return reinterpret_cast<TFunction*>(TraceImport_nid_no_patch(reinterpret_cast<void*>(function), name, library));
 }
 
 int main(int argc, char** argv) {
+#ifdef _WIN32
     Require(_putenv_s("APS5_TRACE_CALLS", "libTraced,libOther.prx") == 0);
-    if (argc > 1 && std::strcmp(argv[1], "abort") == 0) {
+#else
+    Require(setenv("APS5_TRACE_CALLS", "libTraced,libOther.prx", 1) == 0);
+#endif
+    if (argc > 1 && (std::strcmp(argv[1], "abort") == 0 || std::strcmp(argv[1], "abort-race") == 0)) {
+#ifndef _WIN32
+        Require(std::signal(SIGABRT, [](int) { _exit(3); }) != SIG_ERR);
+#endif
         const auto first = Traced(&Integers, "Integers", "libTraced.prx");
         const auto second = Traced(&Blocks, "Blocks", "libOther.prx");
         Require(first(1, 2, 3, 4, 5, 6, 7, 8) == 204 && second(7).words[3] == 10);
+#ifdef _WIN32
         _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+#else
+        std::atomic<bool> locked{false};
+        std::thread([&locked] {
+            flockfile(stderr);
+            locked.store(true);
+            for (;;) pause();
+        }).detach();
+        while (!locked.load()) std::this_thread::yield();
+        if (std::strcmp(argv[1], "abort-race") == 0) {
+            for (int call = 0; call < 100; ++call) Require(first(1, 2, 3, 4, 5, 6, 7, 8) == 204);
+            std::atomic<bool> go{false};
+            std::thread([&go] {
+                while (!go.load()) {
+                }
+                std::abort();
+            }).detach();
+            go.store(true);
+        }
+#endif
         std::abort();
     }
     CallTraceEntry entries[16];
@@ -90,15 +144,13 @@ int main(int argc, char** argv) {
 
     const char* const names[] = {"Integers", "Doubles", "Mixed", "Variadic", "Blocks"};
     const char* const libraries[] = {"libTraced.prx", "libTraced", "libOther.prx", "libOther", "libTraced.prx"};
-    MEMORY_BASIC_INFORMATION image{};
-    Require(VirtualQuery(reinterpret_cast<const void*>(&main), &image, sizeof(image)) == sizeof(image));
+    const void* image = ImageOf(reinterpret_cast<const void*>(&main));
+    Require(image != nullptr);
     Require(CopyCallTrace_nid_no_patch(entries, 16) == 5);
     for (std::uint64_t index = 0; index < 5; ++index) {
-        Require(entries[index].sequence == index + 1 && entries[index].thread == GetCurrentThreadId());
+        Require(entries[index].sequence == index + 1 && entries[index].thread == CurrentThread());
         Require(std::strcmp(entries[index].name, names[index]) == 0 && std::strcmp(entries[index].library, libraries[index]) == 0);
-        MEMORY_BASIC_INFORMATION caller{};
-        Require(VirtualQuery(reinterpret_cast<const void*>(entries[index].returnAddress), &caller, sizeof(caller)) == sizeof(caller));
-        Require(caller.AllocationBase == image.AllocationBase);
+        Require(ImageOf(reinterpret_cast<const void*>(entries[index].returnAddress)) == image);
     }
     Require(CopyCallTrace_nid_no_patch(entries, 2) == 2 && entries[0].sequence == 4 && entries[1].sequence == 5);
     Require(CopyCallCounts_nid_no_patch(counts, 8, &total) == 5 && total == 5);

@@ -12,12 +12,25 @@ from pathlib import Path
 
 CPP = (".cpp", ".cc", ".cxx", ".c")
 DROP = ("-c", "-MD", "-MMD", "-MP")
-DROP_WITH_VALUE = ("-o", "-MT", "-MF", "-MJ")
+DROP_WITH_VALUE = ("-o", "-MT", "-MF", "-MQ", "-MJ")
 
 
-def capture(command, cwd=None):
-    return subprocess.run(command, capture_output=True, text=True, encoding="utf-8",
+def capture(command, cwd=None, encoding="utf-8"):
+    return subprocess.run(command, capture_output=True, text=True, encoding=encoding,
                           errors="replace", cwd=cwd)
+
+
+def ninja_encoding(ninja):
+    if sys.platform != "win32":
+        return "utf-8"
+    result = capture([ninja, "-t", "wincodepage"])
+    if result.returncode != 0:
+        raise ValueError(f"ninja -t wincodepage: {result.stderr.strip() or result.stdout.strip()}")
+    declared = result.stdout.strip()
+    encodings = {"Build file encoding: UTF-8": "utf-8", "Build file encoding: ANSI": "mbcs"}
+    if declared not in encodings:
+        raise ValueError(f"unsupported Ninja build-file encoding: {declared!r}")
+    return encodings[declared]
 
 
 def repository():
@@ -36,7 +49,7 @@ def entries(build):
     ninja = shutil.which("ninja")
     if ninja is None:
         raise ValueError(f"no {manifest} and ninja is not on PATH")
-    result = capture([ninja, "-C", str(build), "-t", "compdb", "-x"])
+    result = capture([ninja, "-C", str(build), "-t", "compdb", "-x"], encoding=ninja_encoding(ninja))
     if result.returncode != 0:
         raise ValueError(f"ninja -t compdb: {result.stderr.strip()}")
     return json.loads(result.stdout)
@@ -113,7 +126,7 @@ def syntax_arguments(arguments, directory, source):
         if argument in DROP_WITH_VALUE:
             index += 2
             continue
-        if argument in DROP or argument.startswith("-MJ"):
+        if argument in DROP or argument.startswith(("-MT", "-MF", "-MQ", "-MJ")):
             index += 1
             continue
         if not argument.startswith("-"):

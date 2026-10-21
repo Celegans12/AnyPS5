@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -583,7 +584,7 @@ const char* bindImport(const Context& context, HostImport& entry, VkExternalMemo
     const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::HostImport);
     const auto failed = [&](const char* step, VkResult result) -> const char* {
         if (entry.buffer) context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, entry.buffer, nullptr);
-        if (entry.memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, entry.memory, nullptr);
+        if (allocated && entry.memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, entry.memory, nullptr);
         entry.buffer = VK_NULL_HANDLE;
         entry.memory = VK_NULL_HANDLE;
         failure = result;
@@ -600,7 +601,9 @@ const char* bindImport(const Context& context, HostImport& entry, VkExternalMemo
     ImportFamilies families;
     if (handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) shareDmaBufImport(context, info, families, false);
 #endif
-    if (const auto result = context.Function<PFN_vkCreateBuffer>("vkCreateBuffer")(context.device, &info, nullptr, &entry.buffer); result != VK_SUCCESS) return failed("vkCreateBuffer", result);
+    VkBuffer buffer = VK_NULL_HANDLE;
+    if (const auto result = context.Function<PFN_vkCreateBuffer>("vkCreateBuffer")(context.device, &info, nullptr, &buffer); result != VK_SUCCESS) return failed("vkCreateBuffer", result);
+    entry.buffer = buffer;
     VkMemoryRequirements requirements{};
     context.Function<PFN_vkGetBufferMemoryRequirements>("vkGetBufferMemoryRequirements")(context.device, entry.buffer, &requirements);
     const auto types = requirements.memoryTypeBits & importTypes;
@@ -4909,6 +4912,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
     for (const auto& region : regions) CompletePendingCpuWrites(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
     if (space != nullptr) completeSpaceWrites();
     uploaded = true;
+    for (const auto& region : regions) static_cast<void>(FlushDepthPlanes(region.begin, static_cast<std::size_t>(region.end - region.begin)));
     for (const auto& [begin, end] : writes) StorageTexture::FlushPending(begin, static_cast<std::size_t>(end - begin), nullptr, "written buffer range");
     if (context.hostImportAlignment != 0) {
         auto& state = Imports();
@@ -5231,7 +5235,8 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
     // barrier is skipped when the trailing barrier just recorded already orders it (ElideCovered).
     bool inRun = false;
     VkAccessFlags covered = 0;
-    thread_local std::vector<std::array<std::uint64_t, 3>> runAccesses;
+    thread_local std::vector<std::array<std::uint64_t, 3>>* runAccessesSlot = nullptr;
+    auto& runAccesses = ShaderRecompiler::ThreadOwned(runAccessesSlot);
     runAccesses.clear();
     if (recorder->RunOpen()) RunAccesses(runAccesses);
     auto commands = Recorder::DispatchOverlapEnabled() && Recorder::StagedOverlapEnabled() ? recorder->RunCommands(Recorder::PeekUnorderedDispatch(), this, inRun, &covered, runAccesses) : recorder->Commands(&covered);

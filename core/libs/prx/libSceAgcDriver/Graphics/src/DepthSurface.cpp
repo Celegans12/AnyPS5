@@ -41,6 +41,7 @@ namespace AgcDriver::Graphics {
 namespace {
 
 std::uint64_t depthWrites = 0;
+std::uint64_t mirrorEpoch = 0;
 
 std::pair<std::uint32_t, std::uint32_t> DepthBlockExtent(std::uint32_t bytesPerTexel) {
     return {bytesPerTexel == 4 ? 128u : 256u, bytesPerTexel == 1 ? 256u : 128u};
@@ -826,6 +827,43 @@ public:
         else Recorder::CountBarriers(Recorder::CommandClass::Copy, 3);
     }
 
+    std::shared_ptr<StorageTexture> StoreDepthPlane(const GuestTextureResource& resource) {
+        ApplyFastClear();
+        if (mirrorPlane.storage == nullptr) {
+            mirrorPlane.storage = StorageTexture::Create(context, *context.detiler, resource, 0);
+            ++mirrorEpoch;
+        }
+        copyPlane(mirrorPlane, mirrorPlane.storage, false, true, true);
+        return mirrorPlane.storage;
+    }
+
+    bool SyncFromMemory(const GuestTextureResource& resource) {
+        const auto bytes = static_cast<std::size_t>(DescribeSurface(resource).guestBytes);
+        GuestMemory::CollectWrites(resource.baseAddress, bytes);
+        if (syncedGeneration == 0 || (pendingClear & VK_IMAGE_ASPECT_DEPTH_BIT) != 0 || !GuestMemory::WrittenSince(resource.baseAddress, bytes, syncedGeneration)) {
+            syncedGeneration = GuestMemory::TrackerGeneration();
+            return false;
+        }
+        memoryStale = false;
+        if (mirrorPlane.storage == nullptr) {
+            mirrorPlane.storage = StorageTexture::Create(context, *context.detiler, resource, 0);
+            ++mirrorEpoch;
+        }
+        else static_cast<void>(mirrorPlane.storage->Refresh());
+        syncedGeneration = GuestMemory::TrackerGeneration();
+        copyPlane(mirrorPlane, mirrorPlane.storage, false, false, true);
+        written = ++depthWrites;
+        return true;
+    }
+
+    void DropMirror() {
+        mirrorPlane = {};
+    }
+
+    bool memoryStale = false;
+    std::uint64_t scannedEpoch = 0;
+    std::uint64_t syncedGeneration = 0;
+
     const Context context;
     const DepthTarget target;
     const VkFormat hostFormat;
@@ -1031,6 +1069,7 @@ private:
     std::uint64_t stencilBytes() const {
         return DepthSliceBytes(target.extent, 1u);
     }
+    PlaneStorage mirrorPlane;
 
     bool CoversPlane(const StorageTexture& storage, bool stencil) const {
         const auto& resource = storage.Descriptor();
@@ -1042,8 +1081,9 @@ private:
         return ResolveTextureFormat(resource.format) == (stencil ? VK_FORMAT_R8_UINT : d16 ? VK_FORMAT_R16_UNORM : VK_FORMAT_R32_SFLOAT);
     }
 
-    void copyPlane(PlaneStorage& plane, const std::shared_ptr<StorageTexture>& storage, bool stencil, bool toStorage) {
+    void copyPlane(PlaneStorage& plane, const std::shared_ptr<StorageTexture>& storage, bool stencil, bool toStorage, bool ownBatch = false) {
         auto* recorder = RecorderFor(context);
+        static_cast<void>(ownBatch);
         std::unique_ptr<CommandBatch> batch;
         if (recorder == nullptr) batch = std::make_unique<CommandBatch>(context);
         const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
@@ -1105,6 +1145,7 @@ private:
         sampledStencilTexture.reset();
         sampledStencil = {};
         releaseStencilCopy();
+        mirrorPlane = {};
         textures.clear();
         if (view) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, view, nullptr);
         if (owned != nullptr) owned.reset();
@@ -1398,8 +1439,8 @@ bool sameSurface(const DepthTarget& a, const DepthTarget& b) {
     return a.address == b.address && a.stencilAddress == b.stencilAddress && a.extent.width == b.extent.width && a.extent.height == b.extent.height && a.format == b.format && a.samples == b.samples && a.htileAddress == b.htileAddress && a.htileStencil == b.htileStencil && a.stencilSwizzle == b.stencilSwizzle && (a.samples == 1u || (a.depthSwizzle == b.depthSwizzle && a.pipeBankXor == b.pipeBankXor && a.firstSlice == b.firstSlice && a.lastSlice == b.lastSlice && a.iterate256 == b.iterate256 && a.htilePipeAligned == b.htilePipeAligned && a.htileVrsEncoding == b.htileVrsEncoding && a.htileDepthOnly == b.htileDepthOnly));
 }
 
-std::mutex& surfacesMutex() {
-    static std::mutex mutex;
+std::recursive_mutex& surfacesMutex() {
+    static std::recursive_mutex mutex;
     return mutex;
 }
 
@@ -1470,13 +1511,6 @@ DepthSurface* planeSurface(VkDevice device, std::uint64_t address) {
         return surface->active->load(std::memory_order_acquire) && surface->context.device == device && !surface->retired && (surface->target.address == address || (surface->target.stencilAddress != 0 && surface->target.stencilAddress == address));
     });
     return found == list.rend() ? nullptr : found->get();
-}
-
-void retire(DepthSurface& surface) {
-    surface.retired = true;
-    for (auto* owners : {&depthOwners(), &stencilOwners()}) {
-        std::erase_if(*owners, [&](const auto& entry) { return entry.second.surface == &surface; });
-    }
 }
 
 std::map<std::uint64_t, std::size_t>& clearedHtiles() {
@@ -1904,6 +1938,84 @@ VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarg
     htileReads()[target.htileAddress] = generation;
     return cleared;
 }
+
+struct StalePlanes {
+    std::mutex mutex;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    std::atomic<std::uint64_t> begin{std::numeric_limits<std::uint64_t>::max()};
+    std::atomic<std::uint64_t> end{0};
+};
+
+StalePlanes& stalePlanes() {
+    static auto* planes = new StalePlanes();
+    return *planes;
+}
+
+void publishStaleHull(StalePlanes& planes) {
+    auto begin = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t end = 0;
+    for (const auto& range : planes.ranges) {
+        begin = std::min(begin, range.first);
+        end = std::max(end, range.second);
+    }
+    planes.begin.store(begin, std::memory_order_release);
+    planes.end.store(end, std::memory_order_release);
+}
+
+void noteStalePlane(std::uint64_t begin, std::uint64_t end) {
+    auto& planes = stalePlanes();
+    std::lock_guard lock(planes.mutex);
+    if (std::find(planes.ranges.begin(), planes.ranges.end(), std::pair{begin, end}) != planes.ranges.end()) return;
+    planes.ranges.emplace_back(begin, end);
+    publishStaleHull(planes);
+}
+
+bool overlapsStalePlane(std::uint64_t begin, std::uint64_t end) {
+    auto& planes = stalePlanes();
+    if (begin >= planes.end.load(std::memory_order_acquire) || planes.begin.load(std::memory_order_acquire) >= end) return false;
+    std::lock_guard lock(planes.mutex);
+    return std::any_of(planes.ranges.begin(), planes.ranges.end(), [&](const auto& range) { return begin < range.second && range.first < end; });
+}
+
+bool mirrorable(const DepthTarget& target) {
+    return (target.format == VK_FORMAT_D32_SFLOAT || target.format == VK_FORMAT_D32_SFLOAT_S8_UINT) && target.samples == 1 && target.depthSwizzle == XorSwizzleMode(TextureTileMode::kZ64KBX);
+}
+
+GuestTextureResource mirrorResource(const DepthTarget& target) {
+    GuestTextureResource resource{};
+    resource.baseAddress = target.address;
+    resource.width = target.extent.width;
+    resource.height = target.extent.height;
+    resource.mipCount = 1;
+    resource.allocatedMipCount = 1;
+    resource.tileMode = TextureTileMode::kZ64KBX;
+    resource.dimension = TextureDimension::k2D;
+    resource.format = 22;
+    resource.dstSelX = 4;
+    resource.dstSelY = 5;
+    resource.dstSelZ = 6;
+    resource.dstSelW = 7;
+    return resource;
+}
+
+std::pair<std::uint64_t, std::uint64_t> stalePlaneRange(const DepthSurface& surface) {
+    return {surface.target.address, surface.target.address + DescribeSurface(mirrorResource(surface.target)).guestBytes};
+}
+
+void retire(DepthSurface& surface) {
+    surface.retired = true;
+    for (auto* owners : {&depthOwners(), &stencilOwners()}) {
+        std::erase_if(*owners, [&](const auto& entry) { return entry.second.surface == &surface; });
+    }
+    if (!surface.memoryStale) return;
+    surface.memoryStale = false;
+    const auto plane = stalePlaneRange(surface);
+    if (std::any_of(surfaces().begin(), surfaces().end(), [&](const auto& other) { return other->memoryStale && stalePlaneRange(*other) == plane; })) return;
+    auto& planes = stalePlanes();
+    std::lock_guard lock(planes.mutex);
+    std::erase(planes.ranges, plane);
+    publishStaleHull(planes);
+}
 }
 
 std::uint64_t DepthSurfacesSerial() {
@@ -2047,7 +2159,7 @@ std::size_t HtileStoreBackWaits(const Context& context, const DepthTarget& targe
     return bytes;
 }
 
-VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) {
+VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, bool depthWritten) {
     const auto htileCleared = RoutesToNativeDepthOwner(target) ? VkImageAspectFlags{0} : storeBackClearedHtile(context, target);
     std::lock_guard gpu(GuestMemory::GpuMutex());
     std::unique_lock lock(surfacesMutex());
@@ -2086,6 +2198,7 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) 
         releaseRetired(context);
         surfacesSerial.fetch_add(1, std::memory_order_release);
         surfaces().push_back(std::make_unique<DepthSurface>(context, target, std::move(sampling)));
+        ++mirrorEpoch;
         auto& fresh = *surfaces().back();
         if (target.samples != 1u && fresh.sampleable && fresh.sampling.refusal.empty()) {
             std::unique_lock guardLock(depthGuardMutex());
@@ -2108,11 +2221,28 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) 
         if (!created) surface->NoteHtileClear(VK_IMAGE_ASPECT_DEPTH_BIT);
     }
     if (!created) surface->NoteHtileClear(htileCleared);
+    if (mirrorable(target)) static_cast<void>(surface->SyncFromMemory(mirrorResource(target)));
     surface->ApplyFastClear();
     surface->TakeWrites();
     if (drawnDepth != nullptr && drawnDepth != surface) drawnDepth->written = ++depthWrites;
     surface->written = ++depthWrites;
     surface->NoteMemory();
+    if (mirrorable(target) && surface->scannedEpoch != mirrorEpoch) {
+        surface->scannedEpoch = mirrorEpoch;
+        const auto plane = stalePlaneRange(*surface);
+        for (const auto& other : surfaces()) {
+            if (other.get() == surface || other->context.device != context.device || other->written >= surface->written || !mirrorable(other->target)) continue;
+            const auto otherPlane = stalePlaneRange(*other);
+            if (otherPlane == plane || otherPlane.first >= plane.second || plane.first >= otherPlane.second) continue;
+            other->memoryStale = false;
+            other->DropMirror();
+        }
+    }
+    if ((depthWritten || cleared) && mirrorable(target)) {
+        surface->memoryStale = true;
+        const auto plane = target.address;
+        noteStalePlane(plane, plane + DescribeSurface(mirrorResource(target)).guestBytes);
+    }
     drawnDepth = surface;
     return surface->view;
 }
@@ -2147,6 +2277,57 @@ std::optional<HtileBufferMaskClear> MatchHtileBufferMaskClear(std::span<const st
 
 bool HtileMaskKernelCode(std::span<const std::uint32_t> code) {
     return code.size() >= HtileMaskKernel.size() && std::equal(HtileMaskKernel.begin(), HtileMaskKernel.end(), code.begin());
+}
+
+bool DepthPlanesStale() {
+    auto& planes = stalePlanes();
+    return planes.begin.load(std::memory_order_acquire) < planes.end.load(std::memory_order_acquire);
+}
+
+std::vector<std::pair<std::uint64_t, std::uint64_t>> FlushDepthPlanes(std::uint64_t address, std::size_t bytes) {
+    static thread_local bool flushing = false;
+    const auto end = bytes > std::numeric_limits<std::uint64_t>::max() - address ? std::numeric_limits<std::uint64_t>::max() : address + bytes;
+    if (flushing || !overlapsStalePlane(address, end)) return {};
+    flushing = true;
+    struct Reset {
+        ~Reset() { flushing = false; }
+    } reset;
+    std::vector<std::pair<DepthSurface*, std::shared_ptr<StorageTexture>>> stored;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    {
+        std::lock_guard gpu(GuestMemory::GpuMutex());
+        std::lock_guard lock(surfacesMutex());
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> remaining;
+        for (const auto& surface : surfaces()) {
+            if (!surface->memoryStale) continue;
+            const auto resource = mirrorResource(surface->target);
+            const auto plane = surface->target.address;
+            const auto planeBytes = DescribeSurface(resource).guestBytes;
+            if (plane >= end || address >= plane + planeBytes) {
+                remaining.emplace_back(plane, plane + planeBytes);
+                continue;
+            }
+            surface->memoryStale = false;
+            if (surface->SyncFromMemory(resource)) continue;
+            stored.emplace_back(surface.get(), surface->StoreDepthPlane(resource));
+            ranges.emplace_back(plane, planeBytes);
+        }
+        auto& planes = stalePlanes();
+        std::lock_guard staleLock(planes.mutex);
+        planes.ranges = std::move(remaining);
+        publishStaleHull(planes);
+    }
+    for (const auto& entry : stored) entry.second->MarkWholeWritten();
+    for (const auto& [plane, planeBytes] : ranges) StorageTexture::FlushPending(plane, static_cast<std::size_t>(planeBytes), nullptr, "depth plane store");
+    const auto generation = GuestMemory::TrackerGeneration();
+    std::lock_guard lock(surfacesMutex());
+    for (const auto& entry : stored) {
+        if (std::any_of(surfaces().begin(), surfaces().end(), [&](const auto& candidate) { return candidate.get() == entry.first; })) {
+            entry.first->syncedGeneration = generation;
+            entry.first->NoteMemory();
+        }
+    }
+    return ranges;
 }
 
 std::uint64_t HtileDepthClearAddress(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const std::array<std::uint32_t, 3>& numThreads) {

@@ -8,6 +8,7 @@ if(BUILD_TESTING)
     target_link_libraries(guest_playgo_tests PRIVATE libScePlayGo libc)
     configure_windows_unwind(guest_playgo_tests)
     add_test(NAME guest_playgo COMMAND guest_playgo_tests)
+    set_tests_properties(guest_playgo PROPERTIES ENVIRONMENT "APS5_PLAYGO_SCENARIO_CHUNKS=1")
     if(WIN32)
         set_tests_properties(guest_playgo PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libScePlayGo>")

@@ -5,6 +5,7 @@
 #include "SDL_gamecontroller.h"
 #include "prx/libScePad/include/KeyboardMouse.hpp"
 #include "prx/libScePad/include/PadState.hpp"
+#include "prx/libSceVideoOut/include/PadOutputPacing.hpp"
 #include <chrono>
 #include "prx/libSceVideoOut/include/Telemetry.hpp"
 
@@ -37,6 +38,8 @@ private:
     bool outputPending = false;
     VideoOutTelemetry::PadChangeFilter telemetryFilter;
     std::chrono::steady_clock::time_point nextRumbleRefresh{};
+    LightBarPacer lightBar;
+    TriggerEffectCache triggerEffect;
 };
 
 #endif
