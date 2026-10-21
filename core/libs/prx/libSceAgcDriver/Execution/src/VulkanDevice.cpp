@@ -5156,7 +5156,9 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     bool unordered = false;
     const auto overlapQueue = Graphics::Recorder::TakeDispatchOrder(unordered);
     const auto* groupLimit = state->properties.limits.maxComputeWorkGroupCount;
-    const bool overlapCapable = overlapQueue != 0 && Graphics::Recorder::DispatchOverlapEnabled() && arguments == 0 && argumentImport == nullptr && record.shader->program->workgroupMemoryDwords == 0 && (state->checkpointMarker == nullptr || CheckpointsInRuns()) && record.x <= groupLimit[0] && record.y <= groupLimit[1] && record.z <= groupLimit[2] && (Graphics::Recorder::StagedOverlapEnabled() || !resources.HasGpuCopies());
+    // APS5_NO_LANE_OVERLAP=1 (diagnostic, an APS5_AB switch): no dispatch of the async lane (lane 1) overlaps.
+    const bool laneOverlap = !recorder.AsyncLaneActive() || Graphics::Recorder::ThreadLane() == 0 || !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoLaneOverlap);
+    const bool overlapCapable = laneOverlap && overlapQueue != 0 && Graphics::Recorder::DispatchOverlapEnabled() && arguments == 0 && argumentImport == nullptr && record.shader->program->workgroupMemoryDwords == 0 && (state->checkpointMarker == nullptr || CheckpointsInRuns()) && record.x <= groupLimit[0] && record.y <= groupLimit[1] && record.z <= groupLimit[2] && (Graphics::Recorder::StagedOverlapEnabled() || !resources.HasGpuCopies());
     if (timer.profile && overlapQueue != 0) {
         if (!overlapCapable) {
             if (arguments != 0 || argumentImport != nullptr) ++d.notIndirect;
