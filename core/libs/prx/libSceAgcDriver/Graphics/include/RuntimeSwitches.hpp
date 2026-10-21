@@ -37,6 +37,7 @@ enum class RuntimeSwitch : std::size_t {
     NoLaneTemplateEdge,
     LaneSerialize,
     NoLaneOverlap,
+    NoLaneLabelScope,
     Count,
 };
 

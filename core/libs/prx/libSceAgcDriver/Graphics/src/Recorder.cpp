@@ -1280,6 +1280,7 @@ thread_local int threadLane = 0;
 struct ConsumedLabel {
     std::uint64_t address;
     std::size_t bytes;
+    int lane;
 };
 
 struct ConsumedLabelsTag {};
@@ -1373,21 +1374,29 @@ Recorder::LaneSwitch::~LaneSwitch() noexcept(false) {
 
 void Recorder::NoteConsumedLabel(std::uint64_t address, std::size_t bytes) {
     if (AsyncLaneRing() == 0 || bytes == 0) return;
-    ConsumedLabels().push_back({address, bytes});
+    ConsumedLabels().push_back({address, bytes, threadLane});
 }
 
 void Recorder::applyConsumedLabels() {
     auto& pending = ConsumedLabels();
     if (pending.empty() || open == nullptr) return;
-    auto consumed = std::move(pending);
-    pending.clear();
     const int lane = currentLane();
+    std::vector<ConsumedLabel> consumed;
+    if (RuntimeSwitches::Set(RuntimeSwitch::NoLaneLabelScope)) {
+        consumed = std::move(pending);
+        pending.clear();
+    } else {
+        const auto mine = std::stable_partition(pending.begin(), pending.end(), [&](const ConsumedLabel& label) { return label.lane != lane; });
+        consumed.assign(mine, pending.end());
+        pending.erase(mine, pending.end());
+        if (consumed.empty()) return;
+    }
     const int other = 1 - lane;
     bool otherOpen = false;
     std::uint64_t serial = 0;
     {
         std::lock_guard tableLock(labelTableMutex);
-        for (const auto& [address, bytes] : consumed) {
+        for (const auto& [address, bytes, noted] : consumed) {
             for (auto it = labels.lower_bound(address & ~std::uint64_t{3}); it != labels.end() && it->first < address + bytes; ++it) {
                 const Batch* batch = it->second.batch;
                 if (batch == nullptr || batch->lane != other) continue;
@@ -2182,6 +2191,7 @@ void Recorder::ensureOpen() {
         }
         batch->waitOther = std::max(batch->waitOther, std::exchange(laneOwed[static_cast<std::size_t>(batch->lane)], 0));
         batch->openedAt = OpenSerial();
+        Checkpoint(batch->commands, CheckpointKind::BatchBegin, (static_cast<std::uint64_t>(batch->lane) << 48u) | batch->openedAt);
         if (countingSamples && !segmentMode()) beginSamples(*batch);
         dropStaleHoldKept();
         batch->kept.insert(batch->kept.end(), holdKept.begin(), holdKept.end());
@@ -3215,8 +3225,12 @@ std::string Recorder::runningRanges(const Batch& batch) {
     std::string waiting;
     std::size_t finished = 0, started = 0, pending = 0;
     std::optional<std::size_t> lastFinished;
+    std::string whole;
     for (std::size_t index = 0; index < count; ++index) {
-        if (index == batch.batchTiming) continue;
+        if (index == batch.batchTiming) {
+            whole = std::string("; batch range ") + (values[index * 4 + 1] != 0 ? "started" : "not started") + (values[index * 4 + 3] != 0 ? ", ended" : ", not ended");
+            continue;
+        }
         const bool begun = values[index * 4 + 1] != 0;
         const bool ended = values[index * 4 + 3] != 0;
         if (begun && ended) {
@@ -3228,7 +3242,19 @@ std::string Recorder::runningRanges(const Batch& batch) {
             waiting += " " + name(index);
         }
     }
-    return std::to_string(count) + " timed ranges; started, not finished:" + (running.empty() ? std::string(" none") : running) + "; finished " + std::to_string(finished) + (lastFinished ? " (last " + name(*lastFinished) + ")" : std::string()) + "; not started " + std::to_string(pending) + (waiting.empty() ? std::string() : " (first:" + waiting + ")");
+    return std::to_string(count) + " timed ranges; started, not finished:" + (running.empty() ? std::string(" none") : running) + "; finished " + std::to_string(finished) + (lastFinished ? " (last " + name(*lastFinished) + ")" : std::string()) + "; not started " + std::to_string(pending) + (waiting.empty() ? std::string() : " (first:" + waiting + ")") + whole;
+}
+
+std::string Recorder::laneState(const Batch& batch) const {
+    std::array<std::uint64_t, 2> reached{};
+    const auto counter = context.Function<PFN_vkGetSemaphoreCounterValueKHR>("vkGetSemaphoreCounterValueKHR");
+    const std::array<VkSemaphore, 2> semaphores{timeline, asyncTimeline};
+    for (std::size_t lane = 0; lane < 2; ++lane) {
+        if (semaphores[lane] != VK_NULL_HANDLE && counter != nullptr) counter(context.device, semaphores[lane], &reached[lane]);
+    }
+    char text[320];
+    std::snprintf(text, sizeof(text), "lane %d, opened at %llu, waits for the other lane's serial %llu; timelines reached lane 0 %llu / lane 1 %llu, submitted lane 0 %llu / lane 1 %llu; open batches lane 0 %s / lane 1 %s; %zu in flight", batch.lane, static_cast<unsigned long long>(batch.openedAt), static_cast<unsigned long long>(batch.waitOther), static_cast<unsigned long long>(reached[0]), static_cast<unsigned long long>(reached[1]), static_cast<unsigned long long>(laneSubmitted[0]), static_cast<unsigned long long>(laneSubmitted[1]), lanes[0] != nullptr ? "yes" : "no", lanes[1] != nullptr ? "yes" : "no", inFlight.size());
+    return text;
 }
 
 void Recorder::readGpuTiming(Batch& batch) {
@@ -3948,6 +3974,11 @@ bool Recorder::CheckpointsOn() {
 void Recorder::Checkpoint(VkCommandBuffer commands, CheckpointKind kind, std::uint64_t value) {
     const auto function = checkpointFunction.load(std::memory_order_acquire);
     if (function == nullptr || commands == VK_NULL_HANDLE) return;
+    static const bool batchOnly = [] {
+        const char* value = std::getenv("APS5_GPU_CHECKPOINTS");
+        return value != nullptr && std::string_view(value) == "batch";
+    }();
+    if (batchOnly && kind != CheckpointKind::BatchBegin && kind != CheckpointKind::BatchEnd) return;
     const auto marker = (static_cast<std::uint64_t>(kind) << 56u) | (value & ((std::uint64_t{1} << 56u) - 1u));
     function(commands, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(marker)));
 }
@@ -4265,6 +4296,7 @@ void Recorder::Submit() {
         CountBarriers(CommandClass::Draw);
     }
     EndGpuTiming(open->batchTiming);
+    Checkpoint(open->commands, CheckpointKind::BatchEnd, (static_cast<std::uint64_t>(open->lane) << 48u) | (submissions + 1));
     if (!GpuTimingEnabled()) reportBarriers();
     if (FlipReadCheck()) {
         // A CPU write into a noted read after this collect (and so possibly before the GPU read
@@ -4820,7 +4852,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
         for (int waited = 5; result == VK_TIMEOUT; waited += 5) {
             // A batch still running after 5 s is reported (every 5 s) so a GPU-side hang is visible.
             std::fprintf(stderr, "[gpu] recorded batch still running on the GPU after %d s\n", waited);
-            if (waited == 10) std::fprintf(stderr, "[gpu] recorded batch %llu still running: %s\n", static_cast<unsigned long long>(batch->serial), runningRanges(*batch).c_str());
+            if (waited == 10) std::fprintf(stderr, "[gpu] recorded batch %llu still running: %s; %s\n", static_cast<unsigned long long>(batch->serial), runningRanges(*batch).c_str(), laneState(*batch).c_str());
             result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
         }
         if (result != VK_SUCCESS && result != VK_ERROR_DEVICE_LOST) {

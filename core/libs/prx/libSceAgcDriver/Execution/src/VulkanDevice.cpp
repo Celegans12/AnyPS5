@@ -2021,8 +2021,9 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     }
     if (state->sparseFamily != VK_QUEUE_FAMILY_IGNORED) state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, state->sparseFamily, 0, &state->sparseQueue);
     if (checkpoints) {
-        state->checkpointMarker = state->DeviceFunction<PFN_vkCmdSetCheckpointNV>("vkCmdSetCheckpointNV");
-        Graphics::Recorder::SetCheckpointFunction(state->checkpointMarker);
+        const auto marker = state->DeviceFunction<PFN_vkCmdSetCheckpointNV>("vkCmdSetCheckpointNV");
+        if (std::string_view(std::getenv("APS5_GPU_CHECKPOINTS")) != "batch") state->checkpointMarker = marker;
+        Graphics::Recorder::SetCheckpointFunction(marker);
     }
     if (deviceFault || checkpoints) {
         const auto faultInfo = deviceFault ? state->DeviceFunction<PFN_vkGetDeviceFaultInfoEXT>("vkGetDeviceFaultInfoEXT") : nullptr;
