@@ -6,21 +6,21 @@
 <p align="center"><img src="https://raw.githubusercontent.com/Celegans12/AnyPS5/bringup-media/yotei/2026-10-21/open-world-merge19.png" alt="Atsu at the Nupur river by the Ainu village in the open world of Ghost of Yōtei on AnyPS5, on this build (2026-10-21)" width="880"></p>
 
 > [!NOTE]
-> This is a work-in-progress test branch, not upstream code. Since 2026-10-21 it is based on `main` from 2026-10-20
-> (`b50976750d`) and carries local rewrites that haven't been reviewed upstream, plus diagnostics. It moves forward only
+> This is a work-in-progress test branch, not upstream code. Since 2026-10-22 it is based on `main` from 2026-10-21
+> (`557682ca44`) and carries local rewrites that haven't been reviewed upstream, plus diagnostics. It moves forward only
 > when a build renders our 60-frame title reference exactly and runs faster in the open world than the build before it.
 > Fixes that apply to `main` go upstream as separate PRs.
 
-## Where it stands (2026-10-21)
+## Where it stands (2026-10-22)
 
 | | |
 |---|---|
 | **Furthest point** | Open world, the Nupur river by the Ainu village, with HUD and quest |
 | **Time to the world** | about 5 minutes from a save near Teshio Ridge (warm shader cache) |
-| **Frame rate in the world** | about **0.5-0.6 fps** (5.9 presents per 10 s with the second queue on, 5.45 with it off, in a provisional same-session pair; this laptop's GPU clocks drift by ~14 % between sessions, so builds are compared back to back in one session) |
-| **Stability** | with the second Vulkan queue on its own compute-only queue family, 4 of 4 world runs clean (up to 16 minutes each); see known issues |
+| **Frame rate in the world** | about **0.5-0.6 fps** (5.2-6.6 presents per 10 s depending on the session; this laptop's GPU clocks drift by ~14 % between sessions, so builds are compared back to back in one session) |
+| **Stability** | with the second Vulkan queue on its own compute-only queue family, every world run since the fix has been clean (up to 22 minutes); see known issues |
 | **Tested on** | Windows 11, RTX 3080 Laptop GPU 16 GB (driver 610.62), 32 GB RAM, MinGW-w64 GCC 15.2.0, Release |
-| **Build** | `63700c68ef` (our tree merged with `main` 2026-10-20, plus the second-queue fixes) + docs, shader-cache SourceVersion `3b35146912b7970c`, title reference T1 exact (`t1-lh6`) |
+| **Build** | `84b388765e` (our tree merged with `main` 2026-10-21 `557682ca44`) + docs, shader-cache SourceVersion `d0982988e4b6716e`, title reference T1 exact (`t1-m21s`) |
 
 <table>
 <tr>
@@ -53,6 +53,8 @@
 | 10-19 | **5.1** (+9 % in an in-run A/B, ~2.7 SE) | a dispatch run's staged copy-ins in one prelude with one barrier instead of a barrier per dispatch: the cloth queue's GPU time halves, GPU busy -26 % |
 | 10-21 | **5.0** (the previous build got 4.19 in the same session: +19 % presents, -13 % frame time) | merged with `main` 2026-10-20; three fixes for slowdowns `main` added in the draw committer (buffer pool tiers, exact-size buffer reuse, held-read checks: +18 % in an in-run A/B); the second Vulkan queue off |
 | 10-21 | **5.9** (lane off 5.45 in the same session: +8 % presents, -16 % median frame; provisional) | the cloth compute ring's second Vulkan queue back on, now on a compute-only queue family |
+| 10-21 | +11 % in an in-run A/B (6.26 vs 5.62) | hritikutekar's two committer fixes: a count of prepared bindless tables instead of a full walk every 4 ms, and small texture snapshots in pooled slabs |
+| 10-22 | **5.2** (the previous build with hritikutekar's fixes: 5.13 in the same session) | merged with `main` 2026-10-21; same speed, newer `main` underneath |
 
 ## Run it
 
@@ -64,7 +66,7 @@ APS5_STAGING_DIFF=1 APS5_PIPELINE_INDIRECT=1 APS5_NO_ADDRESS_DRAW_REUSE=1
 APS5_NO_PIPELINE_JOURNAL=1 APS5_RESOURCE_CACHE_ENTRIES=1024 APS5_ASYNC_LANE=51
 ```
 
-- **This build has a new shader-cache version, so the first run compiles cold** and can take 30-60 minutes to reach the world. Later runs start warm.
+- **This build has a new shader-cache version (since 2026-10-22), so the first run compiles cold**: about 53 minutes to the world on our machine. Later runs start warm.
 - `APS5_ASYNC_LANE=51` runs the cloth compute ring on a second Vulkan queue. That queue now comes from a compute-only queue family by default; `APS5_LANE_GRAPHICS_FAMILY=1` goes back to a third queue of the graphics family, which faulted the GPU for us. Without `APS5_ASYNC_LANE`, everything runs on one queue as before.
 - `APS5_NO_PIPELINE_JOURNAL=1` turns off `main`'s startup pipeline replay. `APS5_RESOURCE_CACHE_ENTRIES=1024` is the resource-cache size all our measurements used.
 - `main`'s paths that broke Yōtei on our tree are off here and can be turned back on:
@@ -72,11 +74,15 @@ APS5_NO_PIPELINE_JOURNAL=1 APS5_RESOURCE_CACHE_ENTRIES=1024 APS5_ASYNC_LANE=51
   - `APS5_DEFERRED_SETTLES=1`: deferred import settles. GPU write faults.
   - `APS5_HOST_IMPORT_HALF_HEAP_RESERVE=1`: `main`'s halved host-import budget. The world arrived late.
   - `APS5_TABLE_COUNT_NEUTRAL_PIPELINES=1`: broke world rendering.
+  - `APS5_CLEAR_HAND_OVER=1`: `main`'s clear hand-over (#7427). A white glare with coloured sprites over the upper half of the world.
+  - `APS5_PLAYGO_SCENARIO_CHUNKS=1`: `main`'s PlayGo chunk listing from a scenario file (#7726). The game then opens an audio stream our AJM rejects and crashes before the title.
+  - `APS5_IMAGE_POOL=1`: `main`'s image memory pool (#7870), not tested on Yōtei.
   - Where `main` and our tree differ, `APS5_RESULT_MEMO_TABLE=1`, `APS5_RELOCATED_HEADER_COPIES=1` and `APS5_SAMPLED_LATER_USE_REFUSAL=1` select `main`'s version.
 - Off switches for the newest local changes:
   - `APS5_NO_SMALL_DEVICE_TIER=1`, `APS5_NO_EXACT_SIZE_REUSE=1`, `APS5_NO_HELD_READ_SKIP=1`, `APS5_NO_HELD_READ_BOUNDS=1`: committer fixes.
   - `APS5_NO_OWED_RUN_CLOSE=1`, `APS5_NO_RUN_ATOMIC_GUARD=1`, `APS5_NO_RUN_STAGED_READ_GUARD=1`: overlap fixes.
   - `APS5_NO_LANE_OPEN_SERIAL=1`, `APS5_NO_LANE_TEMPLATE_EDGE=1`, `APS5_NO_LANE_LABEL_SCOPE=1`, `APS5_NO_LANE_FORWARD_EDGE=1`, `APS5_NO_LANE_LEASE_WAIT=1`: second-queue fixes.
+  - `APS5_NO_IMAGE_SLABS=1`, `APS5_NO_PREPARED_TABLE_COUNT=1`: hritikutekar's committer fixes.
   - `APS5_NO_DISPATCH_OVERLAP=1`, `APS5_NO_BATCHED_STAGING=1`, `APS5_NO_SPARSE_PAGE_STATES=1`.
   - Every local change has an off switch (`APS5_NO_...`), named in its commit message.
 - Diagnostics: `APS5_GPU_CHECKPOINTS=1` (`=batch` marks only batch begin/end per queue), `APS5_NV_DIAGNOSTICS=1` (NVIDIA device diagnostics config, so an Nsight Aftermath crash dump can name the fault), `APS5_FAULT_ADDRESSES=1` (with `APS5_MEM_STATS=1`; also reports a buffer destroyed while a pending batch writes it), `APS5_LANE_SERIALIZE=1`, `APS5_NO_LANE_OVERLAP=1`.
@@ -89,14 +95,15 @@ APS5_NO_PIPELINE_JOURNAL=1 APS5_RESOURCE_CACHE_ENTRIES=1024 APS5_ASYNC_LANE=51
 - The second queue is tested only on Windows with NVIDIA (RTX 3080 Laptop, driver 610.62). AMD and Linux are untested.
 - A GPU hang can reset NVIDIA's shader store for the game. After that, the saved pipelines no longer load and every run compiles again (long stalls on the last loading screen). If that happens after a hang, expect one slow run.
 - Black shapes on some rocks and terrain (the depth pre-pass and the G-buffer pass disagree on depth). Cause not found yet.
-- Process memory is about 30 GB early in the world, so 32 GB of RAM is tight.
+- Process memory is about 30-35 GB in the world, so 32 GB of RAM is tight. `main` 2026-10-21 dropped the 2 GiB reserve of the sampled-texture budget (#7862), with no switch; our cold run went down to 0.2 GB of free RAM (paging) without failing.
+- Once, during loading on the build before this one, the game stopped with `missing static shader ABI register 531`. It did not come back in any later run; if you see it, please post the log in #675.
 - The overlap fixes keep conflicting dispatches out of overlapped runs, which costs GPU time (about +14 % per frame on the previous build). Frames are CPU-bound, so presents barely move.
 - One compute program (0x8000361f00) is still refused by the recompiler at registration (non-fatal so far).
 - About 0.5 fps is far from playable. What limits a frame now, and what's next, is in [discussion #675](https://github.com/boykopovar/AnyPS5/discussions/675).
 
-## What it carries on top of `main` 2026-10-20
+## What it carries on top of `main` 2026-10-21
 
-- #7571 (BDA lookup with one return; without it `main`'s #5859 hangs on NVIDIA), not merged yet. Most of the upstream PRs this branch adopted earlier are part of `main` now.
+- Most of the upstream PRs this branch adopted earlier are part of `main` now.
 - Local work:
   - image tables resolved on the GPU through a bindless descriptor heap, including T#s loaded from run-time addresses;
   - a cheaper draw-miss path (resolve memo, faster table snapshots);
@@ -116,7 +123,7 @@ APS5_NO_PIPELINE_JOURNAL=1 APS5_RESOURCE_CACHE_ENTRIES=1024 APS5_ASYNC_LANE=51
     - small device buffers get their own pool tier;
     - an exact-size buffer is reused instead of rebinding another one;
     - a flush with nothing to store skips the held-read check;
-  - from contributors in #675: FardinHaque70's fix for an import unwatch hook that re-entered the import lookup (from hritikutekar's diagnosis), and Izamaru's page-state table allocated on demand (about 250 MB less commit charge).
+  - from contributors in #675: hritikutekar's prepared-table count in the texture service and slab-backed texture snapshots (here only for images that fill at least 3/4 of their slot, with slots counted at full size against the budget; unrestricted slabs made the texture cache thrash on this tree); FardinHaque70's fix for an import unwatch hook that re-entered the import lookup (from hritikutekar's diagnosis), and Izamaru's page-state table allocated on demand (about 250 MB less commit charge).
 
 ## Updates
 
@@ -127,6 +134,7 @@ APS5_NO_PIPELINE_JOURNAL=1 APS5_RESOURCE_CACHE_ENTRIES=1024 APS5_ASYNC_LANE=51
 - 2026-10-21: added a known issue: GPU hangs with `APS5_ASYNC_LANE=51` (twice in the world on this build). Leave it out if you hit them.
 - 2026-10-21: moved to our tree merged with `main` 2026-10-20 (`020d736b15`). In a same-session pair with the second queue off on both, 4.99 vs 4.19 presents per 10 s (+19 %) and a 2,070 vs 2,372 ms median frame (-13 %). It reaches the world sooner too: frame 85 at 334 s vs 478 s. T1 exact. **New shader-cache version, so the first run compiles cold.** `APS5_ASYNC_LANE=51` is out of the env until its GPU hang is fixed.
 - 2026-10-21: the second queue is back (`63700c68ef`, same shader cache, T1 exact). Its "hang" was a DMA page fault on the GPU tied to the graphics family's third queue: the same work on a compute-only queue family ran clean in 4 of 4 world runs, up to 16 minutes each. The queue now comes from a compute-only family by default, and `APS5_ASYNC_LANE=51` is back in the env. Same-session pair, second queue on vs off: 5.89 vs 5.45 presents per 10 s (+8 %), 1,564 vs 1,852 ms median frame (-16 %). These numbers are **provisional**: an Nsight Aftermath monitor was running during both runs. Also three more cross-queue fixes, each with a test that fails without it.
+- 2026-10-22: moved to our tree merged with `main` 2026-10-21 (`557682ca44`), with hritikutekar's two committer fixes from #675. In a same-session pair against the previous build plus the same fixes: 5.20 vs 5.13 presents per 10 s and a 2,065 vs 2,071 ms median frame, so the same speed on a newer `main`. On the previous build the two fixes were worth +11 % in an in-run A/B (6.26 vs 5.62). T1 exact. **New shader-cache version, so the first run compiles cold.** Three `main` paths that broke Yōtei are off here and listed under [Run it](#run-it). These numbers were measured with no debugging tools running.
 
 ---
 
