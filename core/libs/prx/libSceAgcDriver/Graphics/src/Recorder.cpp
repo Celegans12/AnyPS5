@@ -4005,11 +4005,13 @@ bool Recorder::CheckpointsOn() {
 void Recorder::Checkpoint(VkCommandBuffer commands, CheckpointKind kind, std::uint64_t value) {
     const auto function = checkpointFunction.load(std::memory_order_acquire);
     if (function == nullptr || commands == VK_NULL_HANDLE) return;
-    static const bool batchOnly = [] {
+    static const std::string_view mode = [] {
         const char* value = std::getenv("APS5_GPU_CHECKPOINTS");
-        return value != nullptr && std::string_view(value) == "batch";
+        return value != nullptr ? std::string_view(value) : std::string_view();
     }();
-    if (batchOnly && kind != CheckpointKind::BatchBegin && kind != CheckpointKind::BatchEnd && kind != CheckpointKind::AsyncDispatch) return;
+    const bool batchKind = kind == CheckpointKind::BatchBegin || kind == CheckpointKind::BatchEnd;
+    if (mode == "batch" && !batchKind) return;
+    if (mode == "batch+async" && !batchKind && kind != CheckpointKind::AsyncDispatch) return;
     const auto marker = (static_cast<std::uint64_t>(kind) << 56u) | (value & ((std::uint64_t{1} << 56u) - 1u));
     function(commands, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(marker)));
 }
