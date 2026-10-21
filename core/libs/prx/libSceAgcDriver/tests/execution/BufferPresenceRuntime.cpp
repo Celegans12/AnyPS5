@@ -303,19 +303,19 @@ Outcome DispatchMany(AgcDriver::VulkanDevice& device, std::uint32_t presentMask,
 }
 
 void ManyFormattedBuffers(AgcDriver::VulkanDevice& device) {
-    const auto absent = DispatchMany(device, 0u, "eight V# absent");
-    const auto all = DispatchMany(device, 0xffu, "eight V# present");
+    const auto built = DispatchMany(device, 0x0fu, "four of eight V# present");
     const auto seven = DispatchMany(device, 0x7fu, "seven V# present");
-    const auto partial = DispatchMany(device, 0x15u, "three V# present");
+    const auto all = DispatchMany(device, 0xffu, "eight V# present");
+    const auto partial = DispatchMany(device, 0x15u, "three V# present after all were seen");
     if (RuntimeFormatEnabled()) {
-        Require(absent.pipeline == all.pipeline && absent.spirv == all.spirv, "eight present V# built a module beside the absent set's");
-        Require(absent.pipeline == seven.pipeline && absent.spirv == seven.spirv, "seven present V# built a module beside the absent set's");
-        Require(absent.pipeline == partial.pipeline && absent.spirv == partial.spirv, "three present V# built a module beside the absent set's");
+        Require(built.pipeline == seven.pipeline && built.spirv == seven.spirv, "seven present V# built a module beside the four-present module");
+        Require(built.pipeline == all.pipeline && built.spirv == all.spirv, "eight present V# built a module beside the four-present module");
+        Require(built.pipeline == partial.pipeline && built.spirv == partial.spirv, "three present V# after all were seen built a module beside the four-present module");
     } else {
-        Require(absent.pipeline != all.pipeline && all.pipeline != seven.pipeline, "APS5_NO_ABSENT_RUNTIME_FORMAT did not build one module per format word");
+        Require(built.pipeline != seven.pipeline && seven.pipeline != all.pipeline && built.pipeline != all.pipeline, "APS5_NO_ABSENT_RUNTIME_FORMAT did not build one module per format word");
+        Require(partial.pipeline == all.pipeline && partial.spirv == all.spirv, "absent V# did not take the substitutes learned from the eight present ones");
     }
 }
-
 }
 
 int main() {
