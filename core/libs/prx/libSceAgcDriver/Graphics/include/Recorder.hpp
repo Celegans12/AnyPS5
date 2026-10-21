@@ -1179,9 +1179,10 @@ private:
     VkDeviceSize drawUploadUsed = 0;
     // Command buffers and fences of completed batches, reused by later ones (hundreds of batches per
     // frame would otherwise allocate and free their objects each time).
-    std::vector<std::pair<VkCommandBuffer, VkFence>> spare;
+    std::array<std::vector<std::pair<VkCommandBuffer, VkFence>>, 2> spare;
+    VkCommandPool poolOf(int lane) const { return lane == 1 && context.asyncPool != VK_NULL_HANDLE ? context.asyncPool : context.pool; }
     // Extra command buffers of completed batches (SplitForRun, preludes), reused likewise.
-    std::vector<VkCommandBuffer> spareChunks;
+    std::array<std::vector<VkCommandBuffer>, 2> spareChunks;
     VkCommandBuffer beginChunk();
     void sealPrelude();
     std::vector<VkQueryPool> sparePools;

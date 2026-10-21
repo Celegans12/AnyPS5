@@ -333,8 +333,19 @@ VKAPI_ATTR void VKAPI_CALL TrackedDestroyImage(VkDevice device, VkImage image, c
     entry->destroyImage(device, image, allocator);
 }
 
+std::atomic<bool> buffersShared{false};
+std::array<std::uint32_t, 2> sharedFamilies{};
+
 VKAPI_ATTR VkResult VKAPI_CALL TrackedCreateBuffer(VkDevice device, const VkBufferCreateInfo* info, const VkAllocationCallbacks* allocator, VkBuffer* buffer) {
     const auto* entry = Find(device);
+    VkBufferCreateInfo shared{};
+    if (info != nullptr && info->sharingMode == VK_SHARING_MODE_EXCLUSIVE && buffersShared.load(std::memory_order_acquire)) {
+        shared = *info;
+        shared.sharingMode = VK_SHARING_MODE_CONCURRENT;
+        shared.queueFamilyIndexCount = 2;
+        shared.pQueueFamilyIndices = sharedFamilies.data();
+        info = &shared;
+    }
     const auto result = entry->createBuffer(device, info, allocator, buffer);
     if (result == VK_SUCCESS && buffer != nullptr) {
         Bump(Get().buffers, 0, 1);
@@ -867,6 +878,11 @@ std::vector<std::string> DescribeDeviceAddress(std::uint64_t address, std::uint6
     std::snprintf(text, sizeof(text), "registry: %zu live addressed buffers in 0x%llx..0x%llx, %llu destroyed (last %llu kept); write checks %llu, failed %llu, null descriptors %llu", registry.live.size(), static_cast<unsigned long long>(lowest), static_cast<unsigned long long>(highest), static_cast<unsigned long long>(registry.destroyedTotal), static_cast<unsigned long long>(count), static_cast<unsigned long long>(writeChecks.load()), static_cast<unsigned long long>(writeCheckFailures.load()), static_cast<unsigned long long>(nullDescriptors.load()));
     lines.emplace_back(text);
     return lines;
+}
+
+void ShareBuffersAcross(std::uint32_t first, std::uint32_t second) {
+    sharedFamilies = {first, second};
+    buffersShared.store(true, std::memory_order_release);
 }
 
 PFN_vkGetDeviceProcAddr TrackDevice(VkDevice device, VkPhysicalDevice physical, const VkPhysicalDeviceMemoryProperties& memory,

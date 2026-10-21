@@ -403,6 +403,8 @@ struct VulkanDevice::State {
     // Graphics family queue index 2 for the async compute lane (Recorder lanes, APS5_ASYNC_LANE).
     VkQueue asyncQueue = VK_NULL_HANDLE;
     bool asyncQueueWanted = false;
+    std::uint32_t asyncFamily = VK_QUEUE_FAMILY_IGNORED;
+    VkCommandPool asyncPool = VK_NULL_HANDLE;
     std::uint32_t settleFamily = 0;
     VkCommandPool settlePool = VK_NULL_HANDLE;
     std::mutex settleQueueMutex;
@@ -867,6 +869,7 @@ struct VulkanDevice::State {
                 destroyPool(device, pool, nullptr);
             }
             if (settlePool != VK_NULL_HANDLE) destroyPool(device, settlePool, nullptr);
+            if (asyncPool != VK_NULL_HANDLE) destroyPool(device, asyncPool, nullptr);
             destroyDevice(device, nullptr);
         }
         if (instance != VK_NULL_HANDLE) {
@@ -1593,7 +1596,14 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             queueInfo.pQueuePriorities = priorities;
             settleQueue = true;
             settleIndex = 1;
-            if (Graphics::Recorder::AsyncLaneRing() != 0 && queues[family].queueCount >= 3 && !compileOnly) {
+            const char* computeFamily = std::getenv("APS5_LANE_COMPUTE_FAMILY");
+            if (Graphics::Recorder::AsyncLaneRing() != 0 && !compileOnly && computeFamily != nullptr && std::string_view(computeFamily) == "1") {
+                if (!MemoryStats::Enabled()) std::fprintf(stderr, "[gpu] APS5_LANE_COMPUTE_FAMILY needs APS5_MEM_STATS (its buffer hook shares buffers across the families); the async lane stays in the graphics family\n");
+                for (std::uint32_t i = 0; i < families && MemoryStats::Enabled() && state->asyncFamily == VK_QUEUE_FAMILY_IGNORED; ++i) {
+                    if (i != family && queues[i].queueCount != 0 && (queues[i].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0 && (queues[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) == 0) state->asyncFamily = i;
+                }
+            }
+            if (Graphics::Recorder::AsyncLaneRing() != 0 && state->asyncFamily == VK_QUEUE_FAMILY_IGNORED && queues[family].queueCount >= 3 && !compileOnly) {
                 queueInfo.queueCount = 3;
                 state->asyncQueueWanted = true;
             }
@@ -1640,7 +1650,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     // Guest shaders routinely read past descriptor ranges; robust access turns that into zeros
     // instead of a GPU fault that loses the device.
     enabled.robustBufferAccess = available.robustBufferAccess;
-    VkDeviceQueueCreateInfo queueInfos[3]{queueInfo, {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}, {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}};
+    VkDeviceQueueCreateInfo queueInfos[4]{queueInfo, {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}, {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}, {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}};
     if (available.sparseBinding && state->dmaBufImport) {
         std::uint32_t families = 0;
         auto getFamilies = state->InstanceFunction<PFN_vkGetPhysicalDeviceQueueFamilyProperties>("vkGetPhysicalDeviceQueueFamilyProperties");
@@ -1682,6 +1692,19 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             settleInfo.queueFamilyIndex = settleFamily;
             settleInfo.queueCount = 1;
             settleInfo.pQueuePriorities = &priority;
+        }
+    }
+    if (state->asyncFamily != VK_QUEUE_FAMILY_IGNORED) {
+        bool shared = false;
+        for (std::uint32_t i = 0; i < deviceInfo.queueCreateInfoCount; ++i) shared = shared || queueInfos[i].queueFamilyIndex == state->asyncFamily;
+        if (shared) {
+            state->asyncFamily = VK_QUEUE_FAMILY_IGNORED;
+        } else {
+            auto& asyncInfo = queueInfos[deviceInfo.queueCreateInfoCount++];
+            asyncInfo = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+            asyncInfo.queueFamilyIndex = state->asyncFamily;
+            asyncInfo.queueCount = 1;
+            asyncInfo.pQueuePriorities = &priority;
         }
     }
     // Indirect draw records with a non-zero first instance, and several records per call.
@@ -2038,6 +2061,11 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, family, 0, &state->queue);
     state->queueFamily = family;
     if (state->asyncQueueWanted) state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, family, 2, &state->asyncQueue);
+    if (state->asyncFamily != VK_QUEUE_FAMILY_IGNORED) {
+        state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, state->asyncFamily, 0, &state->asyncQueue);
+        MemoryStats::ShareBuffersAcross(family, state->asyncFamily);
+        std::fprintf(stderr, "[gpu] APS5_LANE_COMPUTE_FAMILY: the async lane submits to queue family %u (compute only); buffers are created CONCURRENT across families %u and %u\n", state->asyncFamily, family, state->asyncFamily);
+    }
     if (settleQueue) {
         state->settleFamily = settleFamily;
         state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, settleFamily, settleIndex, &state->settleQueue);
@@ -2069,6 +2097,11 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         VkCommandPoolCreateInfo settlePoolInfo = poolInfo;
         settlePoolInfo.queueFamilyIndex = state->settleFamily;
         check(state->DeviceFunction<PFN_vkCreateCommandPool>("vkCreateCommandPool")(state->device, &settlePoolInfo, nullptr, &state->settlePool), "vkCreateCommandPool settle");
+    }
+    if (state->asyncFamily != VK_QUEUE_FAMILY_IGNORED) {
+        VkCommandPoolCreateInfo asyncPoolInfo = poolInfo;
+        asyncPoolInfo.queueFamilyIndex = state->asyncFamily;
+        check(state->DeviceFunction<PFN_vkCreateCommandPool>("vkCreateCommandPool")(state->device, &asyncPoolInfo, nullptr, &state->asyncPool), "vkCreateCommandPool async lane");
     }
     static const bool procTable = std::getenv("APS5_NO_PROC_TABLE") == nullptr;
     if (procTable) {
@@ -4111,6 +4144,7 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.sparseQueueMutex = &state->sparseQueueMutex;
     context.settleQueue = state->settlePool != VK_NULL_HANDLE ? state->settleQueue : VK_NULL_HANDLE;
     context.asyncQueue = state->asyncQueue;
+    context.asyncPool = state->asyncPool;
     context.settlePool = state->settlePool;
     context.settleFamily = state->settleFamily;
     context.settleQueueMutex = &state->settleQueueMutex;
