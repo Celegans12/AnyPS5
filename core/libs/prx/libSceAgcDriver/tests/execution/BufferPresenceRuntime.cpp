@@ -244,6 +244,78 @@ void MisalignedPresent(AgcDriver::VulkanDevice& device) {
     RequireSameModule(absent, aligned, "an aligned V# made another module than the absent one");
 }
 
+constexpr std::uint32_t ManyBuffers = 8;
+alignas(256) std::array<std::uint32_t, Lanes * ManyBuffers + 4u> ManyOutput{};
+
+constexpr std::array<std::uint32_t, 3 + ManyBuffers * 4> ManyCode() {
+    std::array<std::uint32_t, 3 + ManyBuffers * 4> code{};
+    std::size_t cursor = 0;
+    code[cursor++] = 0x34020082u;
+    for (std::uint32_t index = 0; index < ManyBuffers; ++index) {
+        code[cursor++] = 0xe0001000u;
+        code[cursor++] = 0x80000001u | (index << 16u) | ((2u + index) << 8u);
+    }
+    code[cursor++] = 0xbf8c0000u;
+    for (std::uint32_t index = 0; index < ManyBuffers; ++index) {
+        code[cursor++] = 0xe0701000u + index * 0x80u;
+        code[cursor++] = 0x80000001u | (ManyBuffers << 16u) | ((2u + index) << 8u);
+    }
+    code[cursor++] = 0xbf810000u;
+    return code;
+}
+
+alignas(256) constexpr auto ManyBuffersCode = ManyCode();
+
+Outcome DispatchMany(AgcDriver::VulkanDevice& device, std::uint32_t presentMask, const std::string& name) {
+    for (std::uint32_t lane = 0; lane < Lanes; ++lane) Input[lane] = 0x9e3779b9u * (lane + 1u) ^ 0x01234567u;
+    ManyOutput.fill(Fill);
+    std::vector<std::uint32_t> userData;
+    for (std::uint32_t index = 0; index < ManyBuffers; ++index) {
+        const auto slot = (presentMask >> index) & 1u ? Descriptor(Input.data(), InputBytes, Format32UInt) : GameNull;
+        userData.insert(userData.end(), slot.begin(), slot.end());
+    }
+    const auto output = Descriptor(ManyOutput.data(), sizeof(ManyOutput), Format32UInt);
+    userData.insert(userData.end(), output.begin(), output.end());
+    const std::span<const std::uint32_t> code = ManyBuffersCode;
+    const std::array<ShaderRecompiler::MemoryRegion, 1> memory{{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)}}};
+    const ShaderRecompiler::ShaderComputeStageInfo compute{{Lanes, 1, 1}, 0u, {false, false, false}, false, 1};
+    ShaderRecompiler::RecompileRequest request{
+        {ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}},
+        {Lanes, 0, userData, compute, std::nullopt, std::nullopt, memory},
+        device.Target(),
+        {0, 0, 0, 128}
+    };
+    request.useCache = true;
+    const auto result = ShaderRecompiler::Recompile(request);
+    device.Dispatch(result, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(code.data()));
+    device.WaitIdle();
+    for (std::uint32_t index = 0; index < ManyBuffers; ++index) {
+        for (std::uint32_t lane = 0; lane < Lanes; ++lane) {
+            const auto expected = (presentMask >> index) & 1u ? Input[lane] : 0u;
+            Require(ManyOutput[index * Lanes + lane] == expected, name + ": buffer " + std::to_string(index) + " lane " + std::to_string(lane) + " loaded " + Hex(ManyOutput[index * Lanes + lane]) + ", expected " + Hex(expected));
+        }
+    }
+    Outcome outcome;
+    outcome.pipeline = result.PipelineVariantId();
+    outcome.spirv = result.spirv.Copy();
+    Require(outcome.pipeline != 0u && !outcome.spirv.empty(), name + ": no specialized module");
+    return outcome;
+}
+
+void ManyFormattedBuffers(AgcDriver::VulkanDevice& device) {
+    const auto absent = DispatchMany(device, 0u, "eight V# absent");
+    const auto all = DispatchMany(device, 0xffu, "eight V# present");
+    const auto seven = DispatchMany(device, 0x7fu, "seven V# present");
+    const auto partial = DispatchMany(device, 0x15u, "three V# present");
+    if (RuntimeFormatEnabled()) {
+        Require(absent.pipeline == all.pipeline && absent.spirv == all.spirv, "eight present V# built a module beside the absent set's");
+        Require(absent.pipeline == seven.pipeline && absent.spirv == seven.spirv, "seven present V# built a module beside the absent set's");
+        Require(absent.pipeline == partial.pipeline && absent.spirv == partial.spirv, "three present V# built a module beside the absent set's");
+    } else {
+        Require(absent.pipeline != all.pipeline && all.pipeline != seven.pipeline, "APS5_NO_ABSENT_RUNTIME_FORMAT did not build one module per format word");
+    }
+}
+
 }
 
 int main() {
@@ -256,6 +328,7 @@ int main() {
         TwoFormattedBuffers(*device);
         AbsentLoadsZero(*device);
         MisalignedPresent(*device);
+        ManyFormattedBuffers(*device);
         std::puts("buffer presence runtime tests passed");
         return 0;
     } catch (const std::exception& error) {
