@@ -5,6 +5,7 @@
 #include "VulkanTestDevice.hpp"
 #include <algorithm>
 #include <array>
+#include <new>
 #include <bit>
 #include <cmath>
 #include <cstdint>
@@ -30,7 +31,7 @@ constexpr std::uint32_t ClampEdge = 2;
 
 alignas(256) std::array<std::uint32_t, Threads * 4> Input{};
 alignas(256) std::array<float, Threads * 8> Output{};
-alignas(65536) std::array<std::uint8_t, 4u << 20u> Texels{};
+std::array<std::uint8_t, 4u << 20u>& Texels = *new (std::align_val_t{65536}) std::array<std::uint8_t, 4u << 20u>{};
 
 alignas(256) constexpr std::array<std::uint32_t, 15> Code{
     0x34020084, 0xe0381000, 0x80000201, 0xbf8c3f70, 0xf09c0f20, 0x00820602, 0xf0001f20, 0x00020a04,

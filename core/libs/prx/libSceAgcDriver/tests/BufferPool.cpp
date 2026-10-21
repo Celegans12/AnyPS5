@@ -1124,8 +1124,8 @@ void ImageMemoryReclaim() {
 void ImageMemoryOverBudget() {
     mock = MockDevice{};
     auto context = budgetContext();
-    reportedBudget = 1000 * MiB;
-    reportedUsage = 500 * MiB;
+    mock.heapBudget = 1000 * MiB;
+    mock.otherUsage = 500 * MiB;
     VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     allocation.allocationSize = 4 * MiB;
     allocation.memoryTypeIndex = 0;
@@ -1133,7 +1133,7 @@ void ImageMemoryOverBudget() {
     const auto first = AllocateImageMemory(context, allocation, 1u, "test image", &type);
     ReleaseImageMemory(context, first, 4 * MiB, 0);
     Expect(mock.frees == 0 && context.bufferPool->RetainedImages() == 1, "image memory is retained while the heap is under its reported budget");
-    reportedUsage = 1100 * MiB;
+    mock.otherUsage = 1100 * MiB;
     std::this_thread::sleep_for(std::chrono::milliseconds(150));
     const auto second = AllocateImageMemory(context, allocation, 1u, "test image", &type);
     Expect(second == first && mock.allocations == 1, "a retained allocation is still handed out over the budget");
@@ -1141,7 +1141,7 @@ void ImageMemoryOverBudget() {
     Expect(mock.frees == 1 && context.bufferPool->RetainedImages() == 0, "image memory released while the heap is over its reported budget is freed");
     const auto third = AllocateImageMemory(context, allocation, 1u, "test image", &type);
     ReleaseImageMemory(context, third, 4 * MiB, 0);
-    reportedUsage = 500 * MiB;
+    mock.otherUsage = 500 * MiB;
     std::this_thread::sleep_for(std::chrono::milliseconds(150));
     const auto fourth = AllocateImageMemory(context, allocation, 1u, "test image", &type);
     ReleaseImageMemory(context, fourth, 4 * MiB, 0);
