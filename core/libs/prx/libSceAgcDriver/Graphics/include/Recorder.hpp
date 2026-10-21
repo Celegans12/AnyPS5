@@ -277,6 +277,7 @@ public:
     // APS5_NO_LANE_OPEN_SERIAL=1 (an APS5_AB switch) leaves the open batches and the opening serials
     // out as before: a slot retired in one lane's open batch could then be reused once the other
     // lane's earlier-opened batch completed, while the first one still read it.
+    // RetiredSerial() (a use noted at UseSerial()) is capped the same way when a batch finishes.
     std::uint64_t CompletedThrough() const;
     // Under the mutex, async lane only: the calling thread's lane's open (or next) batch waits on the
     // GPU for everything lane `from` recorded so far (its open batch is submitted first).
