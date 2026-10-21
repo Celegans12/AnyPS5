@@ -792,6 +792,8 @@ void EmitStructuredBlock(SpirvValueEmitContext& ctx, StructuredFunctionState& fu
             SpirvValueEmitContext& lane = half == 0 ? ctx : *ctx.otherHalf;
             state.laneHalf = half;
             if (half == 0 || (inst->Opcode() != IrOpcode::Barrier && inst->Opcode() != IrOpcode::MeshAllocate)) {
+                WordProfile::Scope laneScope(half == 0 ? "lane:half0" : "lane:half1");
+                WordProfile::Scope irScope("ir:", IrOpcodeName(inst->Opcode()));
                 EmitStructuredInstruction(lane, functionState, *inst);
             }
         }

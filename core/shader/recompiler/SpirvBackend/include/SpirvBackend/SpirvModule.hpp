@@ -1,6 +1,7 @@
 #ifndef CORE_SHADER_RECOMPILIER_SPIRVBACKEND_INCLUDE_SPIRVBACKEND_SPIRVMODULE_HPP
 #define CORE_SHADER_RECOMPILIER_SPIRVBACKEND_INCLUDE_SPIRVBACKEND_SPIRVMODULE_HPP
 
+#include "SpirvBackend/WordProfile.hpp"
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -136,7 +137,9 @@ public:
 
     template<typename... TOperands>
     void AddFunction(std::uint32_t opcode, const TOperands&... operands) {
+        const auto noteOffset = functionInstructions.size();
         appendInstruction(functionInstructions, opcode, operands...);
+        if (WordProfile::Enabled()) WordProfile::NoteFunctionInstruction(functionInstructions.data() + noteOffset);
     }
 
 private:
@@ -229,6 +232,7 @@ private:
         appendOperands(section, opcode, operands...);
         const auto wordCount = static_cast<std::uint32_t>(section.size() - offset);
         section[offset] |= wordCount << spv::WordCountShift;
+        WordProfile::Add(wordCount);
     }
 
     std::uint32_t declareType(std::uint32_t opcode, std::vector<std::uint32_t> key);

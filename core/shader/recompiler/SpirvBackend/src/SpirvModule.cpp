@@ -1,3 +1,7 @@
+#define SPV_ENABLE_UTILITY_CODE
+#include <spirv/unified1/spirv.hpp>
+#undef SPV_ENABLE_UTILITY_CODE
+#include <cstdio>
 #include "SpirvBackend/SpirvModule.hpp"
 
 #include <algorithm>
@@ -18,6 +22,7 @@ void AppendInstructionWords(std::vector<std::uint32_t>& section, std::span<const
     const auto wordCount = static_cast<std::uint32_t>(words.size());
     section.push_back((wordCount << spv::WordCountShift) | opcode);
     section.insert(section.end(), words.begin() + 1, words.end());
+    WordProfile::Add(wordCount);
 }
 
 }
@@ -218,7 +223,57 @@ void SpirvModule::AddName(std::uint32_t target, const std::string& name) {
 }
 
 void SpirvModule::AddFunction(std::span<const std::uint32_t> words) {
+    const auto noteOffset = functionInstructions.size();
     AppendInstructionWords(functionInstructions, words);
+    if (WordProfile::Enabled() && !words.empty()) WordProfile::NoteFunctionInstruction(functionInstructions.data() + noteOffset);
+}
+
+namespace WordProfile {
+
+void NoteFunctionInstruction(const std::uint32_t* words) {
+    bool result = false;
+    bool type = false;
+    spv::HasResultAndType(static_cast<spv::Op>(words[0] & 0xffffu), &result, &type);
+    if (result) IdScopes()[words[type ? 2u : 1u]] = CurrentTag();
+}
+
+void DumpFinal(const std::vector<std::uint32_t>& module) {
+    if (!Enabled() || module.size() < 5u) return;
+    std::map<std::string, std::uint64_t> inner, ir, combined;
+    std::uint64_t half1 = 0, functionWords = 0, total = module.size();
+    std::uint32_t last = 0u;
+    bool inFunction = false;
+    const auto& list = NameList();
+    const auto name = [&](std::uint32_t index) { return index < list.size() ? list[index] : std::string("?"); };
+    for (std::size_t cursor = 5; cursor < module.size();) {
+        const auto count = module[cursor] >> 16u;
+        const auto op = static_cast<spv::Op>(module[cursor] & 0xffffu);
+        if (count == 0u) break;
+        if (op == spv::OpFunction) inFunction = true;
+        if (inFunction) {
+            bool result = false;
+            bool type = false;
+            spv::HasResultAndType(op, &result, &type);
+            if (result) {
+                const auto found = IdScopes().find(module[cursor + (type ? 2u : 1u)]);
+                last = found == IdScopes().end() ? 0u : found->second;
+            }
+            std::string key = op == spv::OpLabel || op == spv::OpBranch || op == spv::OpBranchConditional || op == spv::OpSelectionMerge || op == spv::OpLoopMerge || op == spv::OpReturn || op == spv::OpReturnValue || op == spv::OpSwitch || op == spv::OpFunctionEnd ? std::string("(cf)") : std::string();
+            const auto tag = last;
+            inner[name(tag & 0x7fffu) + key] += count;
+            ir[name((tag >> 15u) & 0xffffu)] += count;
+            if (tag & 0x80000000u) half1 += count;
+            functionWords += count;
+        }
+        if (op == spv::OpFunctionEnd) inFunction = false;
+        cursor += count;
+    }
+    std::fprintf(stderr, "[word-final] total=%llu function=%llu half1=%llu\n", static_cast<unsigned long long>(total), static_cast<unsigned long long>(functionWords), static_cast<unsigned long long>(half1));
+    for (const auto& [key, words] : inner) std::fprintf(stderr, "[word-final] scope|%s|%llu\n", key.c_str(), static_cast<unsigned long long>(words));
+    for (const auto& [key, words] : ir) std::fprintf(stderr, "[word-final] ir|%s|%llu\n", key.c_str(), static_cast<unsigned long long>(words));
+    IdScopes().clear();
+}
+
 }
 
 void SpirvModule::appendString(std::vector<std::uint32_t>& words, const std::string& text) {

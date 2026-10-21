@@ -1,3 +1,4 @@
+#include "SpirvBackend/WordProfile.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvFormatConvert.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvTypes.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvSubgroup.hpp"
@@ -71,6 +72,7 @@ std::uint32_t EmitUFloatToF32Bits(SpirvEmitterState& state, std::uint32_t raw, s
 }
 
 std::uint32_t NormalizeFormatComponent(SpirvEmitterState& state, const SpirvBufferFormatInfo& info, std::uint32_t component, std::uint32_t raw) {
+    WordProfile::Scope wordProfileScope("fmt:normalize");
     const auto bits = info.componentBits[component];
     switch (info.type) {
     case SpirvFormatComponentType::Uint:
@@ -243,6 +245,7 @@ std::uint32_t NormStoreBits(SpirvEmitterState& state, std::uint32_t bits, std::u
 }
 
 std::uint32_t EmitD16FormatComponent(SpirvEmitterState& state, const SpirvBufferFormatInfo& info, std::uint32_t component, std::uint32_t raw) {
+    WordProfile::Scope wordProfileScope("fmt:d16");
     const auto bits = info.componentBits[component];
     if (info.type != SpirvFormatComponentType::Float && bits > 16u) {
         if (info.type == SpirvFormatComponentType::Uint) return Ext(state, TypeU32(state), GLSLstd450UMin, raw, ConstantU32(state, 0xffffu));
@@ -280,6 +283,7 @@ std::uint32_t EmitD16FormatComponent(SpirvEmitterState& state, const SpirvBuffer
 }
 
 std::uint32_t EmitFormatStoreComponent(SpirvEmitterState& state, const SpirvBufferFormatInfo& info, std::uint32_t component, std::uint32_t data) {
+    WordProfile::Scope wordProfileScope("fmt:storeComponent");
     const auto bits = info.componentBits[component];
     const std::uint32_t mask = bits >= 32u ? 0xffffffffu : (1u << bits) - 1u;
     switch (info.type) {
@@ -309,6 +313,7 @@ std::uint32_t EmitFormatStoreComponent(SpirvEmitterState& state, const SpirvBuff
 }
 
 std::uint32_t EmitD16StoreComponent(SpirvEmitterState& state, const SpirvBufferFormatInfo& info, std::uint32_t component, std::uint32_t half) {
+    WordProfile::Scope wordProfileScope("fmt:d16Store");
     switch (info.type) {
     case SpirvFormatComponentType::Uint:
         return EmitFormatStoreComponent(state, info, component, half);

@@ -299,7 +299,9 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
     EmitModuleHeader(state, bindings);
     EmitProgram(state);
     state.module.EmitEntryPoint(ExecutionModelForStage(state.program.Resources().stage), state.mainFunc, "main", state.interfaceVariables);
-    return state.module.Finalize();
+    auto finalWords = state.module.Finalize();
+    WordProfile::Dump(0u, finalWords.size());
+    return finalWords;
 }
 
 }

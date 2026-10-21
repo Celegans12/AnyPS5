@@ -1,3 +1,4 @@
+#include "SpirvBackend/WordProfile.hpp"
 #include "SpirvBackend/SpirvBda.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvTypes.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvConstants.hpp"
@@ -13,6 +14,7 @@ namespace ShaderRecompiler {
 namespace {
 
 void EmitBdaOverflowCheck(SpirvEmitterState& state, std::uint32_t address, std::uint32_t bytes, std::uint32_t instruction) {
+    WordProfile::Scope wordProfileScope("bda:overflowCheck");
     const auto overflow = Binary(state, spv::OpUGreaterThan, TypeBool(state), address, BdaConstant(state, std::numeric_limits<std::uint64_t>::max() - bytes));
     EmitIfCondition(state, overflow, [&] { RecordBdaFault(state, address, ConstantU32(state, bytes), instruction, BdaAbi::FaultReason::Overflow); });
     StopBdaInvocationIf(state, overflow);
@@ -134,6 +136,7 @@ std::uint32_t BdaAddressUnaligned(SpirvEmitterState& state, std::uint32_t addres
 }
 
 std::uint32_t AddBdaSignedOffset(SpirvEmitterState& state, std::uint32_t address, std::uint32_t offset, std::uint32_t instruction) {
+    WordProfile::Scope wordProfileScope("bda:signedOffset");
     const auto u32 = TypeU32(state);
     const auto u64 = TypeScalarU64(state);
     const auto boolean = TypeBool(state);
@@ -380,6 +383,7 @@ std::uint32_t BdaInstructionPc(SpirvEmitterState& state, const IrValue& inst) {
 }
 
 std::uint32_t AddBdaAddress(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::uint32_t offset, bool subtract) {
+    WordProfile::Scope wordProfileScope("bda:addAddress");
     auto& state = ctx.state;
     const auto result = Binary(state, subtract ? spv::OpISub : spv::OpIAdd, TypeScalarU64(state), address, offset);
     const auto overflow = subtract ? Binary(state, spv::OpUGreaterThan, TypeBool(state), offset, address) : Binary(state, spv::OpULessThan, TypeBool(state), result, address);
@@ -389,6 +393,7 @@ std::uint32_t AddBdaAddress(SpirvValueEmitContext& ctx, const IrValue& inst, std
 }
 
 std::uint32_t AddBdaImmediate(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::int32_t immediate) {
+    WordProfile::Scope wordProfileScope("bda:addImmediate");
     if (immediate == 0) {
         return address;
     }
@@ -418,6 +423,7 @@ bool BdaInvocationsMayStop(const IrProgram& program) {
 }
 
 std::uint32_t EmitBdaRead(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::uint32_t bits) {
+    WordProfile::Scope wordProfileScope("bda:read");
     auto& state = ctx.state;
     if (bits != 8u && bits != 16u && bits != 32u) ctx.Fail(inst, "unsupported BDA read width");
     if (state.bdaPointerFunction == 0) ctx.Fail(inst, "BDA lookup function is missing");
@@ -428,6 +434,7 @@ std::uint32_t EmitBdaRead(SpirvValueEmitContext& ctx, const IrValue& inst, std::
 }
 
 std::uint32_t EmitBdaReadBytes(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::uint32_t bytes) {
+    WordProfile::Scope wordProfileScope("bda:readBytes");
     auto& state = ctx.state;
     if (state.bdaPointerFunction == 0) ctx.Fail(inst, "BDA lookup function is missing");
     const auto instruction = BdaInstructionPc(state, inst);
@@ -439,6 +446,7 @@ std::uint32_t EmitBdaReadBytes(SpirvValueEmitContext& ctx, const IrValue& inst, 
 }
 
 void EmitBdaWrite(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::uint32_t value, std::uint32_t bits) {
+    WordProfile::Scope wordProfileScope("bda:write");
     auto& state = ctx.state;
     if (state.bdaWritePointerFunction == 0 || state.bdaNoteWriteFunction == 0) ctx.Fail(inst, "BDA write functions are missing");
     const auto instruction = BdaInstructionPc(state, inst);
@@ -523,6 +531,7 @@ void DefineBdaByteWriteFunctions(SpirvEmitterState& state) {
 }
 
 void EmitBdaStore(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::uint32_t value, std::uint32_t bits) {
+    WordProfile::Scope wordProfileScope("bda:store");
     auto& state = ctx.state;
     if (bits != 8u && bits != 16u && bits != 32u) ctx.Fail(inst, "unsupported BDA store width");
     if (state.bdaWritePointerFunction == 0 || state.bdaNoteWriteFunction == 0) ctx.Fail(inst, "BDA write functions are missing");
@@ -544,6 +553,7 @@ void EmitBdaStore(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t
 }
 
 void EmitBdaDwordWrites(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::uint32_t offset, std::uint32_t dwords, std::uint32_t value) {
+    WordProfile::Scope wordProfileScope("bda:dwordWrites");
     auto& state = ctx.state;
     if (dwords < 2u || dwords > 4u) ctx.Fail(inst, "unsupported BDA dword store count");
     if (state.bdaWritePointerFunction == 0 || state.bdaNoteWriteFunction == 0) ctx.Fail(inst, "BDA write functions are missing");
@@ -616,6 +626,7 @@ void EmitBdaDwordWrites(SpirvValueEmitContext& ctx, const IrValue& inst, std::ui
 }
 
 std::uint32_t EmitBdaAtomic(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::uint32_t bytes, const std::function<std::uint32_t(std::uint32_t)>& operation) {
+    WordProfile::Scope wordProfileScope("bda:atomic");
     auto& state = ctx.state;
     if (bytes != 4u && bytes != 8u) ctx.Fail(inst, "unsupported BDA atomic width");
     if (state.bdaWritePointerFunction == 0 || state.bdaNoteWriteFunction == 0) ctx.Fail(inst, "BDA write functions are missing");

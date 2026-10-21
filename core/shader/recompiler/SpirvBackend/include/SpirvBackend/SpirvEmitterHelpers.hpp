@@ -1,6 +1,7 @@
 #ifndef CORE_SHADER_RECOMPILIER_SPIRVBACKEND_INCLUDE_SPIRVBACKEND_SPIRVEMITTERHELPERS_HPP
 #define CORE_SHADER_RECOMPILIER_SPIRVBACKEND_INCLUDE_SPIRVBACKEND_SPIRVEMITTERHELPERS_HPP
 
+#include "SpirvBackend/WordProfile.hpp"
 #include "SpirvBackend/SpirvEmitterState.hpp"
 #include "Optimization/BindingAllocator.hpp"
 #include <string>
@@ -173,6 +174,7 @@ std::uint32_t EmitGlsl(SpirvEmitterState& state, TArguments... arguments) {
 
 template<typename TFunction>
 void EmitIfCondition(SpirvEmitterState& state, std::uint32_t condition, TFunction&& function) {
+    WordProfile::Scope wordProfileScope("cf:if");
     const auto thenLabel = state.module.AllocateId();
     const auto mergeLabel = state.module.AllocateId();
     state.module.AddFunction(spv::OpSelectionMerge, mergeLabel, spv::SelectionControlMaskNone);
@@ -185,6 +187,7 @@ void EmitIfCondition(SpirvEmitterState& state, std::uint32_t condition, TFunctio
 
 template<typename TFunction>
 std::uint32_t EmitValueOrDefaultIfCondition(SpirvEmitterState& state, std::uint32_t condition, std::uint32_t type, std::uint32_t defaultValue, TFunction&& function) {
+    WordProfile::Scope wordProfileScope("cf:valueOrDefault");
     const auto thenLabel = state.module.AllocateId();
     const auto thenExit = state.module.AllocateId();
     const auto elseLabel = state.module.AllocateId();
@@ -213,6 +216,7 @@ std::uint32_t EmitValueOrZeroIfCondition(SpirvEmitterState& state, std::uint32_t
 // valid when an arm opens nested selections.
 template<typename TThen, typename TElse>
 std::uint32_t EmitValueIfElse(SpirvEmitterState& state, std::uint32_t condition, std::uint32_t type, TThen&& thenFunction, TElse&& elseFunction) {
+    WordProfile::Scope wordProfileScope("cf:ifElse");
     const auto thenLabel = state.module.AllocateId();
     const auto thenExit = state.module.AllocateId();
     const auto elseLabel = state.module.AllocateId();

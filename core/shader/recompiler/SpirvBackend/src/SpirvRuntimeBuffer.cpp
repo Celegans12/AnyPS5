@@ -1,3 +1,4 @@
+#include "SpirvBackend/WordProfile.hpp"
 #include "SpirvBackend/SpirvRuntimeBuffer.hpp"
 #include "SpirvBackend/SpirvEmitterInstructions.hpp"
 #include "SpirvBackend/SpirvBda.hpp"
@@ -48,6 +49,7 @@ std::uint32_t nonzero(SpirvEmitterState& state, std::uint32_t value) {
 }
 
 void faultIf(SpirvValueEmitContext& context, const IrValue& instruction, std::uint32_t condition, std::uint32_t address, std::uint32_t bytes, BdaAbi::FaultReason reason) {
+    WordProfile::Scope wordProfileScope("vbuf:faultIf");
     auto& state = context.state;
     EmitIfCondition(state, condition, [&] { RecordBdaFault(state, address, ConstantU32(state, bytes), BdaInstructionPc(state, instruction), reason); });
     StopBdaInvocationIf(state, condition);
@@ -60,6 +62,7 @@ std::uint32_t runtimePresent(SpirvValueEmitContext& context, const IrValue& hand
 }
 
 RuntimeDescriptor descriptor(SpirvValueEmitContext& context, const IrValue& instruction) {
+    WordProfile::Scope wordProfileScope("vbuf:descriptor");
     auto& state = context.state;
     const auto* handle = instruction.Argument(0)->Resolve();
     if (handle->Opcode() != IrOpcode::GetBufferResource || handle->ArgumentCount() != 4u) context.Fail(instruction, "requires a runtime four-dword V#");
@@ -97,6 +100,7 @@ RuntimeDescriptor descriptor(SpirvValueEmitContext& context, const IrValue& inst
 }
 
 RuntimeAddress byteAddress(SpirvValueEmitContext& context, const IrValue& instruction, const RuntimeDescriptor& resource, std::uint32_t offset, std::uint32_t bytes) {
+    WordProfile::Scope wordProfileScope("vbuf:byteAddress(bounds)");
     auto& state = context.state;
     const auto u32 = TypeU32(state);
     const auto boolean = TypeBool(state);
@@ -137,6 +141,7 @@ RuntimeAddress address(SpirvValueEmitContext& context, const IrValue& instructio
 }
 
 MemoryResourceAccess directAccess(SpirvValueEmitContext& context, const IrValue& instruction, bool wide = false, bool plainLoad = false) {
+    WordProfile::Scope wordProfileScope("vbuf:directAccess");
     auto& state = context.state;
     const auto& memory = context.Memory(instruction);
     const auto variable = wide ? state.storageBufferU64Variable : plainLoad || state.storageBufferCoherentVariable == 0u ? state.storageBufferVariable : state.storageBufferCoherentVariable;
@@ -167,6 +172,7 @@ std::uint32_t directWordIndex(SpirvEmitterState& state, const MemoryResourceAcce
 }
 
 std::uint32_t readBuffer(SpirvValueEmitContext& context, const IrValue& instruction, std::uint32_t address, std::uint32_t bits) {
+    WordProfile::Scope wordProfileScope("vbuf:readBuffer");
     if (context.Memory(instruction).gpuDescriptor) return EmitBdaRead(context, instruction, address, bits);
     auto& state = context.state;
     const auto access = directAccess(context, instruction, false, !context.Memory(instruction).coherent);
@@ -220,6 +226,7 @@ std::uint32_t byteBuffers(SpirvEmitterState& state) {
 }
 
 void writeBuffer(SpirvValueEmitContext& context, const IrValue& instruction, std::uint32_t address, std::uint32_t value, std::uint32_t bits = 32u) {
+    WordProfile::Scope wordProfileScope("vbuf:writeBuffer");
     if (context.Memory(instruction).gpuDescriptor) {
         EmitBdaWrite(context, instruction, address, value, bits);
         return;
@@ -307,6 +314,7 @@ std::array<std::uint32_t, 4> storeValues(SpirvEmitterState& state, std::uint32_t
 }
 
 std::uint32_t formatted(SpirvValueEmitContext& context, const IrValue& instruction, const RuntimeDescriptor& resource, const SpirvBufferFormatInfo& info, std::uint32_t components, bool store, std::uint32_t data) {
+    WordProfile::Scope wordProfileScope("vbuf:formatted(inline fmt)");
     auto& state = context.state;
     const auto& memory = context.Memory(instruction);
     const auto u32 = TypeU32(state);
@@ -398,6 +406,7 @@ std::uint32_t formatTable(SpirvEmitterState& state, std::uint32_t formats) {
 }
 
 std::uint32_t genericFormattedLoad(SpirvValueEmitContext& context, const IrValue& instruction, const RuntimeDescriptor& resource, std::uint32_t components, std::uint32_t format, std::uint32_t formats) {
+    WordProfile::Scope wordProfileScope("vbuf:genericFormattedLoad");
     auto& state = context.state;
     const auto& memory = context.Memory(instruction);
     const auto u32 = TypeU32(state);
@@ -530,6 +539,7 @@ std::uint32_t formattedDispatch(SpirvValueEmitContext& context, const IrValue& i
 }
 
 std::uint32_t formatSwitch(SpirvValueEmitContext& context, const IrValue& instruction, const RuntimeDescriptor& resource, std::uint32_t components, bool store, std::uint32_t data) {
+    WordProfile::Scope wordProfileScope("vbuf:formatSwitch");
     auto& state = context.state;
     const auto& memory = context.Memory(instruction);
     const auto format = field(state, resource.word3, 12u, 7u);
@@ -583,6 +593,7 @@ std::uint32_t formatSwitch(SpirvValueEmitContext& context, const IrValue& instru
 }
 
 std::uint32_t formattedCall(SpirvValueEmitContext& context, const IrValue& instruction, const RuntimeDescriptor& resource, std::uint32_t components, bool store, std::uint32_t data) {
+    WordProfile::Scope wordProfileScope("vbuf:formattedCall");
     auto& state = context.state;
     const auto& memory = context.Memory(instruction);
     const auto u32 = TypeU32(state);
@@ -648,6 +659,7 @@ std::uint32_t formattedCall(SpirvValueEmitContext& context, const IrValue& instr
 }
 
 std::uint32_t formattedGpuCall(SpirvValueEmitContext& context, const IrValue& instruction, const RuntimeDescriptor& resource, std::uint32_t components, bool store, std::uint32_t data) {
+    WordProfile::Scope wordProfileScope("vbuf:formattedGpuCall");
     auto& state = context.state;
     const auto& memory = context.Memory(instruction);
     const auto u32 = TypeU32(state);
@@ -723,6 +735,7 @@ std::uint32_t formattedGpuCall(SpirvValueEmitContext& context, const IrValue& in
 }
 
 std::uint32_t EmitRuntimeBufferLoad(SpirvValueEmitContext& context, const IrValue& instruction, std::uint32_t components) {
+    WordProfile::Scope wordProfileScope("vbuf:load");
     auto& state = context.state;
     const auto& memory = context.Memory(instruction);
     const auto type = components == 1u ? TypeU32(state) : TypeU32Composite(state, components);
@@ -756,6 +769,7 @@ std::uint32_t EmitRuntimeBufferLoad(SpirvValueEmitContext& context, const IrValu
 }
 
 void EmitRuntimeBufferStore(SpirvValueEmitContext& context, const IrValue& instruction, std::uint32_t components) {
+    WordProfile::Scope wordProfileScope("vbuf:store");
     auto& state = context.state;
     const auto& memory = context.Memory(instruction);
     EmitIfCondition(state, context.Arg(instruction, instruction.ArgumentCount() - 1u), [&] {
@@ -773,6 +787,7 @@ void EmitRuntimeBufferStore(SpirvValueEmitContext& context, const IrValue& instr
 }
 
 std::uint32_t EmitRuntimeScalarBufferLoad(SpirvValueEmitContext& context, const IrValue& instruction) {
+    WordProfile::Scope wordProfileScope("vbuf:scalarLoad");
     auto& state = context.state;
     if (std::ranges::find(state.supportedCapabilities, spv::CapabilityInt64) == state.supportedCapabilities.end()) context.Fail(instruction, "scalar buffer bounds require shaderInt64");
     state.module.EmitCapability(spv::CapabilityInt64);
@@ -789,6 +804,7 @@ std::uint32_t EmitRuntimeScalarBufferLoad(SpirvValueEmitContext& context, const 
 }
 
 std::uint32_t EmitRuntimeBufferAtomic(SpirvValueEmitContext& context, const IrValue& instruction, std::uint32_t bits, std::uint32_t active, const std::function<std::uint32_t(std::uint32_t)>& operation) {
+    WordProfile::Scope wordProfileScope("vbuf:atomic");
     auto& state = context.state;
     if (bits != 32u && bits != 64u) context.Fail(instruction, "unsupported runtime buffer atomic width");
     if (context.Memory(instruction).gpuDescriptor && (state.bdaAtomicPointerFunction == 0u || state.bdaNoteWriteFunction == 0u)) context.Fail(instruction, "BDA atomic functions are missing");

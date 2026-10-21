@@ -1,3 +1,4 @@
+#include "SpirvBackend/WordProfile.hpp"
 #include "Recompiler.hpp"
 #include "BdaAbi.hpp"
 #include "DirectImageRefusal.hpp"
@@ -817,6 +818,7 @@ std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledSh
     materialized = SpecializeSpirv(materialized);
     verifyDirectImageRefusalPruning(materialized, refusedIndices);
     materialized = SpecializeFragmentOutputs(materialized, constants, specializedIds);
+    WordProfile::DumpFinal(materialized);
 #if ANYPS5_ENABLE_SPIRV_TOOLS
     materialized = ValidateAndOptimizeSpirv(materialized, target.vulkanVersion, target.spirvVersion, target.nonConstantImageOffsets, true, true);
 #endif

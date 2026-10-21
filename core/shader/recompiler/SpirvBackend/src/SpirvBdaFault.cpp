@@ -1,3 +1,4 @@
+#include "SpirvBackend/WordProfile.hpp"
 #include "SpirvBackend/SpirvBda.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvTypes.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvConstants.hpp"
@@ -71,16 +72,19 @@ void DefineBdaFaultFunction(SpirvEmitterState& state) {
 }
 
 void RecordBdaFault(SpirvEmitterState& state, std::uint32_t address, std::uint32_t bytes, std::uint32_t instruction, BdaAbi::FaultReason reason) {
+    WordProfile::Scope wordProfileScope("fault:record");
     if (state.bdaFaultFunction == 0 || !state.program.Info().usesDma) throw std::runtime_error("BDA fault function is missing");
     state.module.AddFunction(spv::OpFunctionCall, TypeVoid(state), state.module.AllocateId(), state.bdaFaultFunction, ConstantU32(state, static_cast<std::uint32_t>(reason)), address, bytes, instruction);
 }
 
 void RecordBdaFaultReason(SpirvEmitterState& state, std::uint32_t address, std::uint32_t bytes, std::uint32_t instruction, std::uint32_t reason) {
+    WordProfile::Scope wordProfileScope("fault:record");
     if (state.bdaFaultFunction == 0 || !state.program.Info().usesDma) throw std::runtime_error("BDA fault function is missing");
     state.module.AddFunction(spv::OpFunctionCall, TypeVoid(state), state.module.AllocateId(), state.bdaFaultFunction, reason, address, bytes, instruction);
 }
 
 void RecordBdaFaultWords(SpirvEmitterState& state, std::uint32_t addressLow, std::uint32_t addressHigh, std::uint32_t bytes, std::uint32_t instruction, BdaAbi::FaultReason reason) {
+    WordProfile::Scope wordProfileScope("fault:recordWords");
     if (state.program.Info().usesDma) {
         const auto u64 = TypeScalarU64(state);
         const auto high = Binary(state, spv::OpShiftLeftLogical, u64, Unary(state, spv::OpUConvert, u64, addressHigh), BdaConstant(state, 32u));
@@ -92,6 +96,7 @@ void RecordBdaFaultWords(SpirvEmitterState& state, std::uint32_t addressLow, std
 }
 
 void ReturnBdaFailureIf(SpirvEmitterState& state, std::uint32_t condition, std::uint32_t address, std::uint32_t bytes, std::uint32_t instruction, BdaAbi::FaultReason reason) {
+    WordProfile::Scope wordProfileScope("fault:returnIf");
     const auto failed = state.module.AllocateId();
     const auto next = state.module.AllocateId();
     state.module.AddFunction(spv::OpSelectionMerge, next, spv::SelectionControlMaskNone);
@@ -103,6 +108,7 @@ void ReturnBdaFailureIf(SpirvEmitterState& state, std::uint32_t condition, std::
 }
 
 void StopBdaInvocationIf(SpirvEmitterState& state, std::uint32_t condition) {
+    WordProfile::Scope wordProfileScope("fault:stopIf");
     if (!state.bdaStopsInvocations) return;
     const auto failed = state.module.AllocateId();
     const auto next = state.module.AllocateId();
