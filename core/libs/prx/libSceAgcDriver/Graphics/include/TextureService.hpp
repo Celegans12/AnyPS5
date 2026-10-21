@@ -271,6 +271,9 @@ private:
     mutable std::mutex mutex;
     std::condition_variable changed;
     std::map<std::uint64_t, Tracked> tables;
+    // Tables in TableState::Prepared (entered only in readTable, left only in commitTable): the worker's
+    // idle check reads this instead of walking every table each 4 ms under the mutex.
+    std::size_t preparedTables = 0;
     std::map<BindlessTableRegistration, std::uint64_t> ids;
     std::deque<std::uint64_t> queue;
     std::vector<BindlessPrepared> missPending;
