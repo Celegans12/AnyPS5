@@ -1288,6 +1288,45 @@ auto& ConsumedLabels() { return HostThreadLocal<std::vector<ConsumedLabel>, Cons
 
 }
 
+namespace {
+
+std::mutex pendingCommandsMutex;
+std::unordered_map<VkCommandBuffer, std::pair<std::uint64_t, int>> pendingCommands;
+std::uint64_t pendingCommandGenerations = 0;
+
+void NotePendingCommands(VkCommandBuffer commands, int lane) {
+    if (!Recorder::PendingCommandsTracked() || commands == VK_NULL_HANDLE) return;
+    std::lock_guard lock(pendingCommandsMutex);
+    pendingCommands[commands] = {++pendingCommandGenerations, lane};
+}
+
+void ForgetPendingCommands(VkCommandBuffer commands) {
+    if (!Recorder::PendingCommandsTracked() || commands == VK_NULL_HANDLE) return;
+    std::lock_guard lock(pendingCommandsMutex);
+    pendingCommands.erase(commands);
+}
+
+}
+
+bool Recorder::PendingCommandsTracked() {
+    static const bool tracked = std::getenv("APS5_FAULT_ADDRESSES") != nullptr;
+    return tracked;
+}
+
+std::uint64_t Recorder::CommandBufferGeneration(VkCommandBuffer commands) {
+    std::lock_guard lock(pendingCommandsMutex);
+    const auto found = pendingCommands.find(commands);
+    return found != pendingCommands.end() ? found->second.first : 0;
+}
+
+bool Recorder::CommandBufferPending(VkCommandBuffer commands, std::uint64_t generation, int* lane) {
+    std::lock_guard lock(pendingCommandsMutex);
+    const auto found = pendingCommands.find(commands);
+    if (found == pendingCommands.end() || found->second.first != generation) return false;
+    if (lane != nullptr) *lane = found->second.second;
+    return true;
+}
+
 std::uint32_t Recorder::AsyncLaneRing() {
     static const std::uint32_t ring = [] {
         const char* value = std::getenv("APS5_ASYNC_LANE");
@@ -1858,6 +1897,7 @@ VkCommandBuffer Recorder::beginChunk() {
         context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, 1, &commands);
         Check(result, "vkBeginCommandBuffer recorder chunk");
     }
+    NotePendingCommands(commands, currentLane());
     return commands;
 }
 
@@ -2220,6 +2260,7 @@ void Recorder::ensureOpen() {
         }
         batch->waitOther = std::max(batch->waitOther, std::exchange(laneOwed[static_cast<std::size_t>(batch->lane)], 0));
         batch->openedAt = OpenSerial();
+        NotePendingCommands(batch->commands, batch->lane);
         Checkpoint(batch->commands, CheckpointKind::BatchBegin, (static_cast<std::uint64_t>(batch->lane) << 48u) | batch->openedAt);
         if (countingSamples && !segmentMode()) beginSamples(*batch);
         dropStaleHoldKept();
@@ -4902,6 +4943,8 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
     // With the async lane a use recorded into an open (or later-submitted) batch of one lane carries
     // the serial the other lane's batch may get first (UseSerial), so the bound also stays below
     // every open or in-flight batch's opening serial (APS5_NO_LANE_OPEN_SERIAL=1: as before).
+    ForgetPendingCommands(batch->commands);
+    for (const auto chunk : batch->chunks) ForgetPendingCommands(chunk);
     auto retiredBound = inFlight.empty() ? batch->serial : std::min(batch->serial, inFlight.front()->serial - 1);
     if (asyncTimeline != VK_NULL_HANDLE && !RuntimeSwitches::Set(RuntimeSwitch::NoLaneOpenSerial)) {
         const auto plain = retiredBound;
@@ -5013,6 +5056,13 @@ void Recorder::removeLabels(Batch& batch) {
 }
 
 void Recorder::release(Batch& batch) noexcept {
+    if (PendingCommandsTracked()) {
+        try {
+            ForgetPendingCommands(batch.commands);
+            for (const auto chunk : batch.chunks) ForgetPendingCommands(chunk);
+        } catch (...) {
+        }
+    }
     if (batch.queries != VK_NULL_HANDLE) {
         if (!GpuTimingEnabled() && sparePools.size() < 64) {
             try {
