@@ -416,6 +416,7 @@ struct VulkanDevice::State {
     VkQueue asyncQueue = VK_NULL_HANDLE;
     bool asyncQueueWanted = false;
     std::uint32_t asyncFamily = VK_QUEUE_FAMILY_IGNORED;
+    std::uint32_t asyncIndex = 0;
     VkCommandPool asyncPool = VK_NULL_HANDLE;
     std::uint32_t settleFamily = 0;
     VkCommandPool settlePool = VK_NULL_HANDLE;
@@ -1613,17 +1614,19 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         getFamilies(selected, &families, nullptr);
         queues.resize(families);
         getFamilies(selected, &families, queues.data());
+        // The async lane's compute-only family, whether or not the graphics family has a queue for the
+        // settles: RADV's graphics family has one queue, and its settle queue then takes the compute family.
+        const char* graphicsFamily = std::getenv("APS5_LANE_GRAPHICS_FAMILY");
+        if (Graphics::Recorder::AsyncLaneRing() != 0 && !compileOnly && (graphicsFamily == nullptr || std::string_view(graphicsFamily) != "1")) {
+            for (std::uint32_t i = 0; i < families && state->asyncFamily == VK_QUEUE_FAMILY_IGNORED; ++i) {
+                if (i != family && queues[i].queueCount != 0 && (queues[i].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0 && (queues[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) == 0) state->asyncFamily = i;
+            }
+        }
         if (family < families && queues[family].queueCount >= 2) {
             queueInfo.queueCount = 2;
             queueInfo.pQueuePriorities = priorities;
             settleQueue = true;
             settleIndex = 1;
-            const char* graphicsFamily = std::getenv("APS5_LANE_GRAPHICS_FAMILY");
-            if (Graphics::Recorder::AsyncLaneRing() != 0 && !compileOnly && (graphicsFamily == nullptr || std::string_view(graphicsFamily) != "1")) {
-                for (std::uint32_t i = 0; i < families && state->asyncFamily == VK_QUEUE_FAMILY_IGNORED; ++i) {
-                    if (i != family && queues[i].queueCount != 0 && (queues[i].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0 && (queues[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) == 0) state->asyncFamily = i;
-                }
-            }
             if (Graphics::Recorder::AsyncLaneRing() != 0 && state->asyncFamily == VK_QUEUE_FAMILY_IGNORED && queues[family].queueCount >= 3 && !compileOnly) {
                 queueInfo.queueCount = 3;
                 state->asyncQueueWanted = true;
@@ -1716,10 +1719,19 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         }
     }
     if (state->asyncFamily != VK_QUEUE_FAMILY_IGNORED) {
-        bool shared = false;
-        for (std::uint32_t i = 0; i < deviceInfo.queueCreateInfoCount; ++i) shared = shared || queueInfos[i].queueFamilyIndex == state->asyncFamily;
-        if (shared) {
-            state->asyncFamily = VK_QUEUE_FAMILY_IGNORED;
+        VkDeviceQueueCreateInfo* shared = nullptr;
+        for (std::uint32_t i = 0; i < deviceInfo.queueCreateInfoCount; ++i) {
+            if (queueInfos[i].queueFamilyIndex == state->asyncFamily) shared = &queueInfos[i];
+        }
+        if (shared != nullptr) {
+            // The family already has a queue (the settle or sparse one): the lane takes one more of it
+            // when the family has one, never the same VkQueue.
+            if (shared->queueCount < queues[state->asyncFamily].queueCount && shared->queueCount < 3) {
+                state->asyncIndex = shared->queueCount++;
+                shared->pQueuePriorities = priorities;
+            } else {
+                state->asyncFamily = VK_QUEUE_FAMILY_IGNORED;
+            }
         } else {
             auto& asyncInfo = queueInfos[deviceInfo.queueCreateInfoCount++];
             asyncInfo = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
@@ -2083,9 +2095,9 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     state->queueFamily = family;
     if (state->asyncQueueWanted) state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, family, 2, &state->asyncQueue);
     if (state->asyncFamily != VK_QUEUE_FAMILY_IGNORED) {
-        state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, state->asyncFamily, 0, &state->asyncQueue);
+        state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, state->asyncFamily, state->asyncIndex, &state->asyncQueue);
         state->deviceProc = MemoryStats::ShareBuffersProc(state->device, state->deviceProc, family, state->asyncFamily);
-        std::fprintf(stderr, "[gpu] async compute lane: queue family %u (compute only; APS5_LANE_GRAPHICS_FAMILY=1 uses a third graphics-family queue); buffers are created CONCURRENT across families %u and %u\n", state->asyncFamily, family, state->asyncFamily);
+        std::fprintf(stderr, "[gpu] async compute lane: queue family %u index %u (compute only; APS5_LANE_GRAPHICS_FAMILY=1 uses a third graphics-family queue); buffers are created CONCURRENT across families %u and %u\n", state->asyncFamily, state->asyncIndex, family, state->asyncFamily);
     }
     if (settleQueue) {
         state->settleFamily = settleFamily;
