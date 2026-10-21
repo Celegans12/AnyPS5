@@ -190,6 +190,7 @@ struct Context {
     VkQueue settleQueue = VK_NULL_HANDLE;
     // The async compute lane's queue (Recorder lanes, APS5_ASYNC_LANE): a third queue of `queueFamily`.
     VkQueue asyncQueue = VK_NULL_HANDLE;
+    VkCommandPool asyncPool = VK_NULL_HANDLE;
     VkCommandPool settlePool = VK_NULL_HANDLE;
     std::uint32_t settleFamily = 0;
     std::mutex* settleQueueMutex = nullptr;
