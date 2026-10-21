@@ -1325,7 +1325,7 @@ void Recorder::switchEdge(int from, int to) {
 
 namespace {
 
-std::atomic<std::uint64_t> laneHeldCompletions{0}, laneTemplateEdges[2]{}, laneSerialWaits{0};
+std::atomic<std::uint64_t> laneHeldCompletions{0}, laneTemplateEdges[2]{}, laneSerialWaits{0}, laneHeldRetires{0};
 
 }
 
@@ -1354,7 +1354,7 @@ void Recorder::CountTemplateEdge(bool beforeRefresh) {
 
 std::string Recorder::LaneOrderReport() {
     char text[512];
-    std::snprintf(text, sizeof(text), "[lane-order] (cumulative) completed-through answers lowered by a batch opened before the other lane's submission %llu (APS5_NO_LANE_OPEN_SERIAL %s); cached-template data edges to the other lane: after its refresh %llu, before a refresh over its reads %llu (APS5_NO_LANE_TEMPLATE_EDGE %s); batches given a wait for the other lane by APS5_LANE_SERIALIZE %llu (%s)", static_cast<unsigned long long>(laneHeldCompletions.load()), RuntimeSwitches::Set(RuntimeSwitch::NoLaneOpenSerial) ? "set" : "unset", static_cast<unsigned long long>(laneTemplateEdges[1].load()), static_cast<unsigned long long>(laneTemplateEdges[0].load()), RuntimeSwitches::Set(RuntimeSwitch::NoLaneTemplateEdge) ? "set" : "unset", static_cast<unsigned long long>(laneSerialWaits.load()), RuntimeSwitches::Set(RuntimeSwitch::LaneSerialize) ? "set" : "unset");
+    std::snprintf(text, sizeof(text), "[lane-order] (cumulative) completed-through answers / retired-serial updates lowered by a batch opened before the other lane's submission %llu / %llu (APS5_NO_LANE_OPEN_SERIAL %s); cached-template data edges to the other lane: after its refresh %llu, before a refresh over its reads %llu (APS5_NO_LANE_TEMPLATE_EDGE %s); batches given a wait for the other lane by APS5_LANE_SERIALIZE %llu (%s)", static_cast<unsigned long long>(laneHeldCompletions.load()), static_cast<unsigned long long>(laneHeldRetires.load()), RuntimeSwitches::Set(RuntimeSwitch::NoLaneOpenSerial) ? "set" : "unset", static_cast<unsigned long long>(laneTemplateEdges[1].load()), static_cast<unsigned long long>(laneTemplateEdges[0].load()), RuntimeSwitches::Set(RuntimeSwitch::NoLaneTemplateEdge) ? "set" : "unset", static_cast<unsigned long long>(laneSerialWaits.load()), RuntimeSwitches::Set(RuntimeSwitch::LaneSerialize) ? "set" : "unset");
     return text;
 }
 
@@ -4834,7 +4834,18 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
     }
     // Every batch <= the retired serial has finished: with two lanes a batch can finish before an
     // older one of the other lane, so the bound is the oldest still in flight.
-    const auto retiredBound = inFlight.empty() ? batch->serial : std::min(batch->serial, inFlight.front()->serial - 1);
+    // With the async lane a use recorded into an open (or later-submitted) batch of one lane carries
+    // the serial the other lane's batch may get first (UseSerial), so the bound also stays below
+    // every open or in-flight batch's opening serial (APS5_NO_LANE_OPEN_SERIAL=1: as before).
+    auto retiredBound = inFlight.empty() ? batch->serial : std::min(batch->serial, inFlight.front()->serial - 1);
+    if (asyncTimeline != VK_NULL_HANDLE && !RuntimeSwitches::Set(RuntimeSwitch::NoLaneOpenSerial)) {
+        const auto plain = retiredBound;
+        for (const auto& open : lanes) {
+            if (open != nullptr) retiredBound = std::min(retiredBound, open->openedAt - 1);
+        }
+        for (const auto& flying : inFlight) retiredBound = std::min(retiredBound, flying->openedAt - 1);
+        if (retiredBound != plain) laneHeldRetires.fetch_add(1, std::memory_order_relaxed);
+    }
     for (auto seen = retiredSerial.load(std::memory_order_relaxed); seen < retiredBound && !retiredSerial.compare_exchange_weak(seen, retiredBound, std::memory_order_acq_rel);) {
     }
     if (asyncTimeline != VK_NULL_HANDLE) {

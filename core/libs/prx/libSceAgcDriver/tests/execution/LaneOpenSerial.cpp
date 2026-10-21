@@ -110,11 +110,14 @@ int main() {
             Require(recorder->Submissions() == before + 1 && recorder->Recording(), "the async lane's batch was not submitted alone");
             recorder->FinishUpTo(retired);
             Require(recorder->CompletedThrough() < retired, "a resource retired at serial " + std::to_string(retired) + " by the main lane's open batch is free (completed through " + std::to_string(recorder->CompletedThrough()) + ") once the async lane's batch, opened earlier and submitted first with that serial, completed");
+            Require(recorder->RetiredSerial() < retired, "a use noted at serial " + std::to_string(retired) + " (UseSerial) by the main lane's open batch counts as retired (retired serial " + std::to_string(recorder->RetiredSerial()) + ") once the async lane's batch with that serial completed");
             recorder->Submit();
             Require(recorder->Submissions() == before + 2, "the main lane's batch was not submitted");
             Require(recorder->CompletedThrough() < retired, "a resource retired at serial " + std::to_string(retired) + " is free (completed through " + std::to_string(recorder->CompletedThrough()) + ") while the main lane's batch that recorded its use runs on the GPU with serial " + std::to_string(retired + 1));
+            Require(recorder->UseSerial() == retired + 2, "the use serial did not follow the submissions");
             gate.Release();
             recorder->Sync();
+            Require(recorder->RetiredSerial() >= retired + 1, "the retired serial did not reach both lanes' batches after they completed");
             Require(recorder->CompletedThrough() >= retired, "a resource retired at serial " + std::to_string(retired) + " stays held (completed through " + std::to_string(recorder->CompletedThrough()) + ") after both lanes completed");
             std::printf("lane open serial: retired at %llu, held until both lanes' batches completed\n", static_cast<unsigned long long>(retired));
         }
