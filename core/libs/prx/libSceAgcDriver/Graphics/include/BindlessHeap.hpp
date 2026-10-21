@@ -30,6 +30,7 @@ public:
     static BindlessHeap& For(const Context& context);
     static BindlessHeap* Existing(const Context& context);
     static void Release(VkDevice device);
+    static bool Fits(const VkPhysicalDeviceDescriptorHeapPropertiesEXT& properties);
 
     bool DescriptorHeapMode() const { return resourceHeap != nullptr; }
     VkDeviceSize ImageHeapOffset(std::uint32_t kind) const;

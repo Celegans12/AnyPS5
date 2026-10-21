@@ -99,16 +99,38 @@ bool HeapComputeEnabled() {
     return DescriptorHeapEnabled();
 }
 
+namespace {
+
+struct HeapSizes {
+    VkDeviceSize imageStride = 0, samplerStride = 0, resourceUsed = 0, samplerUsed = 0;
+};
+
+HeapSizes heapSizes(const VkPhysicalDeviceDescriptorHeapPropertiesEXT& properties) {
+    const auto align = [](VkDeviceSize value, VkDeviceSize alignment) { return alignment == 0 ? value : (value + alignment - 1) / alignment * alignment; };
+    HeapSizes sizes;
+    sizes.imageStride = align(properties.imageDescriptorSize, properties.imageDescriptorAlignment);
+    sizes.samplerStride = align(properties.samplerDescriptorSize, properties.samplerDescriptorAlignment);
+    sizes.resourceUsed = align(static_cast<VkDeviceSize>(static_cast<std::uint32_t>(Abi::Binding::Samplers)) * Abi::GpuImageHeapSlots * sizes.imageStride, properties.resourceHeapAlignment);
+    sizes.samplerUsed = align(static_cast<VkDeviceSize>(Abi::GpuSamplerHeapSlots) * sizes.samplerStride, properties.samplerHeapAlignment);
+    return sizes;
+}
+
+}
+
+bool BindlessHeap::Fits(const VkPhysicalDeviceDescriptorHeapPropertiesEXT& properties) {
+    const auto sizes = heapSizes(properties);
+    return sizes.resourceUsed + properties.minResourceHeapReservedRange <= properties.maxResourceHeapSize && sizes.samplerUsed + properties.minSamplerHeapReservedRangeWithEmbedded <= properties.maxSamplerHeapSize;
+}
+
 BindlessHeap::BindlessHeap(const Context& context) : context(context) {
     Require(context.descriptorHeap, "the GPU heap needs VK_EXT_descriptor_heap");
     const auto& heapProperties = context.descriptorHeapProperties;
-    const auto align = [](VkDeviceSize value, VkDeviceSize alignment) { return alignment == 0 ? value : (value + alignment - 1) / alignment * alignment; };
-    imageHeapStride = align(heapProperties.imageDescriptorSize, heapProperties.imageDescriptorAlignment);
-    samplerHeapStride = align(heapProperties.samplerDescriptorSize, heapProperties.samplerDescriptorAlignment);
-    resourceHeapUsed = align(static_cast<VkDeviceSize>(static_cast<std::uint32_t>(Abi::Binding::Samplers)) * Abi::GpuImageHeapSlots * imageHeapStride, heapProperties.resourceHeapAlignment);
-    samplerHeapUsed = align(static_cast<VkDeviceSize>(Abi::GpuSamplerHeapSlots) * samplerHeapStride, heapProperties.samplerHeapAlignment);
-    Require(resourceHeapUsed + heapProperties.minResourceHeapReservedRange <= heapProperties.maxResourceHeapSize, "the GPU heap's image slots exceed the device's resource heap size");
-    Require(samplerHeapUsed + heapProperties.minSamplerHeapReservedRangeWithEmbedded <= heapProperties.maxSamplerHeapSize, "the GPU heap's sampler slots exceed the device's sampler heap size");
+    const auto sizes = heapSizes(heapProperties);
+    imageHeapStride = sizes.imageStride;
+    samplerHeapStride = sizes.samplerStride;
+    resourceHeapUsed = sizes.resourceUsed;
+    samplerHeapUsed = sizes.samplerUsed;
+    Require(Fits(heapProperties), "the GPU heap's slots exceed the device's descriptor heap sizes");
     constexpr VkBufferUsageFlags heapUsage = VK_BUFFER_USAGE_DESCRIPTOR_HEAP_BIT_EXT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     resourceHeap = std::make_unique<Buffer>(context, static_cast<std::size_t>(resourceHeapUsed + heapProperties.minResourceHeapReservedRange), heapUsage);
     samplerHeap = std::make_unique<Buffer>(context, static_cast<std::size_t>(samplerHeapUsed + heapProperties.minSamplerHeapReservedRangeWithEmbedded), heapUsage);
