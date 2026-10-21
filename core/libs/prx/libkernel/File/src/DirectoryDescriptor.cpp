@@ -153,12 +153,13 @@ std::optional<std::int64_t> SeekDirectoryDescriptor(int fd, std::int64_t offset,
     return target;
 }
 
-int ReadDirectoryDescriptor(int fd, char* buf, int nbytes) {
+int ReadDirectoryDescriptor(int fd, char* buf, int nbytes, std::int64_t* base) {
     const auto found = Find(fd);
     if (!found) return SCE_KERNEL_ERROR_ENOTDIR;
     auto& state = *found;
     std::lock_guard lock(state.mutex);
     Load(state, fd);
+    if (base != nullptr) *base = static_cast<std::int64_t>(state.cursor);
     std::size_t used = 0;
     while (state.cursor < state.entries.size()) {
         const auto& [name, type] = state.entries[state.cursor];
@@ -226,4 +227,14 @@ extern "C" const char* GetDirectoryDescriptorPath_nid_no_patch(int fd, int* erro
     path.assign(reinterpret_cast<const char*>(utf8Path.data()), utf8Path.size());
     *error = 0;
     return path.c_str();
+}
+
+extern "C" std::uint64_t GetDirectoryDescriptorPosition_nid_no_patch(int fd) {
+#ifdef _WIN32
+    const auto position = File::SeekDirectoryDescriptor(fd, 0, 1);
+    return position && *position > 0 ? static_cast<std::uint64_t>(*position) : 0;
+#else
+    (void)fd;
+    return 0;
+#endif
 }

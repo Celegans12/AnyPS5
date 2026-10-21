@@ -6,4 +6,5 @@
 
 ### Unknown function info
 
+- [sceDbgKeyboardClose, sceDbgKeyboardGetKey2Char, sceDbgKeyboardInit, sceDbgKeyboardOpen, sceDbgKeyboardRead, sceDbgKeyboardReadState](../../../core/libs/prx/libSceKeyboard/Export.cpp) (libSceKeyboard) - names and NIDs are present in the [PS5 3.20 export inventory](https://github.com/DNNDHH/PS5-3.20_Libs/blob/b2a77c09cd71c01f34c790cfbe98c751a13262ad/libSceKeyboard.c), but no credible prototypes were found. They are declared without parameters solely to resolve known imports; this is not an ABI claim.
 - [sceKeyboardConnectPort, sceKeyboardDebugGetDeviceId, sceKeyboardDeviceOpen, sceKeyboardDisconnectAll, sceKeyboardDisconnectDevice, sceKeyboardDisconnectPort, sceKeyboardGetConnection, sceKeyboardGetDeviceInfo, sceKeyboardGetHandle, sceKeyboardMbusInit, sceKeyboardPadEmulateClose, sceKeyboardPadEmulateOpen, sceKeyboardSetProcessFocus, sceKeyboardSetProcessPrivilege](../../../core/libs/prx/libSceKeyboard/Export.cpp) (libSceKeyboard) - throwing stubs declared without parameters from the firmware export database (aerolib.csv); their guest signatures are unverified on hardware

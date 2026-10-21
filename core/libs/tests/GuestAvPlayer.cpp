@@ -1273,6 +1273,26 @@ void TestRestartAfterPausedJumpKeepsClockRunning() {
     Check(sceAvPlayerClose(player) == 0, "close failed");
 }
 
+void TestPausedPreparationAfterAudioStarts(std::uint32_t syncMode) {
+    Events events;
+    auto init = InitData(&events);
+    auto* player = sceAvPlayerInit(&init);
+    Check(player != nullptr, "init failed");
+    Check(sceAvPlayerAddSource(player, "/app0/avplayer.mp4") == 0, "add source failed");
+    Check(sceAvPlayerEnableStream(player, VideoStream) == 0, "enable video failed");
+    Check(sceAvPlayerEnableStream(player, EnglishAudioStream) == 0, "enable audio failed");
+    Check(sceAvPlayerSetAvSyncMode(player, syncMode) == 0, "sync mode failed");
+    Check(sceAvPlayerStart(player) == 0, "start failed");
+    AvPlayerFrameInfo audio{};
+    Check(WaitFor([&] { return sceAvPlayerGetAudioData(player, &audio) != 0; }), "no initial audio frame");
+    Check(sceAvPlayerPause(player) == 0, "pause failed");
+    AvPlayerFrameInfoEx frame{};
+    Check(WaitFor([&] { return sceAvPlayerGetVideoDataEx(player, &frame) != 0; }), "first video frame blocked during paused preparation after audio started");
+    CheckVideoFrame(frame);
+    Check(!sceAvPlayerGetVideoDataEx(player, &frame), "paused preparation delivered more than the initial video frame");
+    Check(sceAvPlayerClose(player) == 0, "close failed");
+}
+
 void TestUnsyncedVideoKeepsUpWithAudio() {
     Events events;
     AvPlayerInitData init = InitData(&events);
@@ -1570,6 +1590,13 @@ int main(int argc, char** argv) {
             TestCloseFromEventCallback(EventReady);
             TestCloseFromEventCallback(EventStop);
             std::puts("AvPlayer callback close tests passed");
+            return 0;
+        }
+        if (argc == 2 && std::strcmp(argv[1], "--paused-first-video") == 0) {
+            WriteMovie();
+            TestPausedPreparationAfterAudioStarts(0);
+            TestPausedPreparationAfterAudioStarts(1);
+            std::puts("AvPlayer paused first video tests passed");
             return 0;
         }
         Check(argc == 1, "unknown AvPlayer test arguments");

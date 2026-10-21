@@ -402,13 +402,13 @@ class TargetOverrideTests(unittest.TestCase):
                 encoding="utf-8")
             binary = root / ("oracle.cmd" if os.name == "nt" else "oracle")
             if os.name == "nt":
-                binary.write_text(f'@"{sys.executable}" "{runner}" %*\n', encoding="utf-8")
+                binary.write_text('@"%HW_ORACLE_TEST_PYTHON%" "%~dp0probe.py" %*\n', encoding="ascii")
             else:
                 binary.write_text(f'#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(runner))} "$@"\n',
                                   encoding="utf-8")
                 binary.chmod(0o755)
             with patch.object(hw_oracle, "oracle", return_value=binary), \
-                    patch.dict(os.environ, {"HW_ORACLE_TARGET": ""}):
+                    patch.dict(os.environ, {"HW_ORACLE_TARGET": "", "HW_ORACLE_TEST_PYTHON": sys.executable}):
                 os.environ["ROCR_VISIBLE_DEVICES"] = "0"
                 self.assertEqual(hw_oracle.detected_target(binary, "1"), "gfx1100")
                 for visible, expected in (("0", "gfx1030"), ("0", "gfx1030"),

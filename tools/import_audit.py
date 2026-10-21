@@ -13,7 +13,6 @@ import progress
 
 ROOT = Path(__file__).resolve().parent.parent
 PRX = ROOT / "core" / "libs" / "prx"
-NID_POSTFIX = "_nid_postfix"
 MODULE_SUFFIX = "#"
 CLASSES = ("implemented", "stub", "absent", "module")
 PE_DIRECTORY_OFFSET = {0x20b: 112, 0x10b: 96}
@@ -459,7 +458,7 @@ def read_modules(directories):
 def nids_of(name, aliases):
     if name in aliases:
         return aliases[name]
-    return {nid_names.compute_nid(name.removesuffix(NID_POSTFIX))}
+    return {nid_names.compute_nid(nid_names.strip_nid_postfix(name))}
 
 
 def source_stubs(source):
@@ -534,6 +533,30 @@ def check_conservation(references, records):
         raise AuditError(f"conservation failed: {references} references in, {classified} classified, unknown classes {unknown}")
 
 
+MODULE_FILE_SUFFIXES = (".debug_prx", ".suprx", ".sprx", ".prx")
+
+
+def module_stem(name, fold):
+    for suffix in MODULE_FILE_SUFFIXES:
+        if len(name) > len(suffix) and name.endswith(suffix):
+            name = name[:-len(suffix)]
+            break
+    return name.lower() if fold else name
+
+
+class ModuleNames(set):
+    """Title module names, matched like the relinker: by the name without its .prx, .sprx, .suprx or .debug_prx suffix, and
+    ignoring case for Windows output."""
+
+    def __init__(self, names=(), fold=False):
+        super().__init__(names)
+        self.fold = fold
+        self.stems = {module_stem(name, fold) for name in self}
+
+    def __contains__(self, library):
+        return isinstance(library, str) and module_stem(library, self.fold) in self.stems
+
+
 def classify(nid, library, providers, stubs, modules):
     if library and library in modules:
         return "module"
@@ -557,13 +580,13 @@ def audit(imports, exports, stubs, libraries, modules, module_imports=None, modu
     for record in records.values():
         nid, library = record["nid"], record["library"]
         providers = exports.get(nid, [])
-        if library is None:
+        if not library:
             providers = sorted(set(providers) | set((module_exports or {}).get(nid, [])))
         resolved_nid = nid
         if not providers:
             resolved_nid = nid_names.compute_nid(nid)
             providers = exports.get(resolved_nid, [])
-            if library is None:
+            if not library:
                 providers = sorted(set(providers) | set((module_exports or {}).get(resolved_nid, [])))
         kind = classify(resolved_nid, library, providers, stubs, modules)
         record["class"] = kind
@@ -710,6 +733,8 @@ def main(argv=None):
     parser.add_argument("--source", default=str(PRX), help="core/libs/prx tree used to find throwing stubs (default: this repository's)")
     parser.add_argument("--names", help="aerolib.csv style file (NID, name per line) used to name absent imports")
     parser.add_argument("--json", type=Path, help="write the full result to this file")
+    parser.add_argument("--strict-stubs", action="store_true",
+                        help="also fail when a referenced import resolves to a throwing stub")
     parser.add_argument("--strict-providers", action="store_true", help="fail when a named import is provided only by another library; retains the existing libc and title-module rules")
     args = parser.parse_args(argv)
     try:
@@ -731,6 +756,7 @@ def main(argv=None):
         module_imports, module_exports = read_modules(args.modules)
         modules = set(module_imports)
         modules |= {name.removesuffix(".guest.prx") for name in modules if name.endswith(".guest.prx")}
+        modules = ModuleNames(modules, fold=bool(windows))
         records, missing = audit(imports, exports, source_stubs(args.source), libraries, modules, module_imports, module_exports, needed_libraries=needed)
         missing_hosts = audit_host_dependencies(host_dependencies, libraries, modules, windows)
         if args.names:
@@ -752,7 +778,7 @@ def main(argv=None):
         print(f"FAIL: {error.strerror}: {error.filename}" if error.filename else f"FAIL: {error}", file=sys.stderr)
         return 2
     print(render(summary, records, missing, stops, missing_hosts))
-    return 1 if summary["unique_by_class"]["absent"] or missing or missing_hosts or (args.strict_providers and summary["library_mismatch"]) else 0
+    return 1 if summary["unique_by_class"]["absent"] or missing or missing_hosts or (args.strict_providers and summary["library_mismatch"]) or (args.strict_stubs and summary["unique_by_class"]["stub"]) else 0
 
 
 if __name__ == "__main__":

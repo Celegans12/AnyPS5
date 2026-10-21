@@ -7,6 +7,9 @@ import sys
 import tempfile
 import unittest
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import select_tests
+
 
 SOURCE = Path(sys.argv.pop(1))
 CMAKE = sys.argv.pop(1)
@@ -74,7 +77,7 @@ file(WRITE "${{CMAKE_CURRENT_BINARY_DIR}}/runtime-sources.txt" "${{runtimeSource
             raise AssertionError('The generator fixture invoked a compiler: ' + (self.root / 'compiler-invoked').read_text(encoding='utf-8'))
         self.generated = self.build / 'shader_recompiler_probe_generated'
         self.listing = self.generated / 'sources.txt'
-        ninja = (self.build / 'build.ninja').read_text(encoding='utf-8')
+        ninja = (self.build / 'build.ninja').read_text(encoding=select_tests.Build(self.build).encoding)
         command = next(line for line in ninja.splitlines() if line.startswith('  COMMAND = ') and 'ShaderCacheVersion.cmake' in line)
         self.extra = re.search(r'"-DEXTRA=([^"]*)"', command).group(1)
         self.compiled = []

@@ -474,8 +474,14 @@ void testRegisterRange() {
     check(packet == storage.words.data() + 6 && storage.buffer.cursor_up == storage.words.data() + 12, "incorrect populated register range allocation");
     check(storage.words == expected, "register values were not copied correctly");
     const auto* misaligned = reinterpret_cast<const std::uint32_t*>(reinterpret_cast<const unsigned char*>(values.data()) + 1);
-    expectFailure([&] { sceAgcCbSetShRegisterRangeDirect(&storage.buffer, 0x8c, misaligned, 4); });
-    check(storage.words == expected && storage.buffer.cursor_up == storage.words.data() + 12, "misaligned register values modified command buffer");
+    packet = sceAgcCbSetShRegisterRangeDirect(&storage.buffer, 0x8c, misaligned, 3);
+    expected[12] = 0xc0037600u;
+    expected[13] = 0x8c;
+    expected[14] = 0x02000000u;
+    expected[15] = 0x03000000u;
+    expected[16] = 0x04000000u;
+    check(packet == storage.words.data() + 12 && storage.buffer.cursor_up == storage.words.data() + 17, "incorrect misaligned register range allocation");
+    check(storage.words == expected, "misaligned register values were not read byte for byte");
 }
 
 void testPacketPayloadAddress() {

@@ -24,6 +24,8 @@ void APS5_VABI _ZN3sce4Json5ValueD1Ev(Value*);
 Value* APS5_VABI _ZN3sce4Json5ValueaSERKS1_(Value*, const Value*);
 int APS5_VABI _ZN3sce4Json5Value3setERKNS0_5ArrayE(Value*, const Array*);
 int APS5_VABI _ZN3sce4Json5Value3setERKNS0_6ObjectE(Value*, const Object*);
+int APS5_VABI _ZN3sce4Json5Value3setENS0_9ValueTypeE(Value*, std::int32_t);
+std::int32_t APS5_VABI _ZNK3sce4Json5Value7getTypeEv(const Value*);
 const Array* APS5_VABI _ZNK3sce4Json5Value8getArrayEv(const Value*);
 const Object* APS5_VABI _ZNK3sce4Json5Value9getObjectEv(const Value*);
 int APS5_VABI _ZN3sce4Json5Value9serializeERNS0_6StringE(Value*, String*);
@@ -92,7 +94,7 @@ static void CheckValue(const Value& value, const char* expected) {
 enum class Operation {
     ValueCopy, ArrayCopy, ObjectCopy, ValueAssign, ObjectAssign, ArrayAppend,
     ValueArray, ValueObject, ValueString, ValueText, ValueTypeString, ValueTypeArray,
-    ValueTypeObject, SetArray, SetObject, PairCopy
+    ValueTypeObject, SetArray, SetObject, SetTypeArray, SetTypeObject, SetTypeString, PairCopy
 };
 
 static bool Run(Operation operation, const Value& source, const char* expected, const Array& array, const Object& object, const String& text) {
@@ -101,7 +103,8 @@ static bool Run(Operation operation, const Value& source, const char* expected, 
     Object objectResult{};
     Pair pair{};
     bool valueReady = false, arrayReady = false, objectReady = false, pairReady = false;
-    if (operation == Operation::ValueAssign || operation == Operation::SetArray || operation == Operation::SetObject) {
+    const bool typeSetter = operation == Operation::SetTypeArray || operation == Operation::SetTypeObject || operation == Operation::SetTypeString;
+    if (operation == Operation::ValueAssign || operation == Operation::SetArray || operation == Operation::SetObject || typeSetter) {
         _ZN3sce4Json5ValueC1EPKc(&result, "previous");
         valueReady = true;
     }
@@ -126,6 +129,9 @@ static bool Run(Operation operation, const Value& source, const char* expected, 
             case Operation::ValueTypeObject: _ZN3sce4Json5ValueC1ENS0_9ValueTypeE(&result, 7); valueReady = true; break;
             case Operation::SetArray: _ZN3sce4Json5Value3setERKNS0_5ArrayE(&result, &array); break;
             case Operation::SetObject: _ZN3sce4Json5Value3setERKNS0_6ObjectE(&result, &object); break;
+            case Operation::SetTypeArray: _ZN3sce4Json5Value3setENS0_9ValueTypeE(&result, 6); break;
+            case Operation::SetTypeObject: _ZN3sce4Json5Value3setENS0_9ValueTypeE(&result, 7); break;
+            case Operation::SetTypeString: _ZN3sce4Json5Value3setENS0_9ValueTypeE(&result, 5); break;
             case Operation::PairCopy: _ZN3sce4Json6Object4PairC1ERKNS0_6StringERKNS0_5ValueE(&pair, &text, &source); pairReady = true; break;
         }
         succeeded = true;
@@ -134,7 +140,10 @@ static bool Run(Operation operation, const Value& source, const char* expected, 
     allocationBudget = -1;
     if (valueReady) {
         if (succeeded) CheckValue(result, expected);
-        else CheckValue(result, "\"previous\"");
+        else {
+            Require(_ZNK3sce4Json5Value7getTypeEv(&result) == 5, "failed setter changed the destination type");
+            CheckValue(result, "\"previous\"");
+        }
         _ZN3sce4Json5ValueD1Ev(&result);
     }
     if (arrayReady) {
@@ -183,6 +192,9 @@ int main() {
         {"empty object value", Operation::ValueTypeObject, &objectValue, "{}"},
         {"set array", Operation::SetArray, &arrayValue, arrayJson},
         {"set object", Operation::SetObject, &objectValue, objectJson},
+        {"set empty array", Operation::SetTypeArray, &objectValue, "[]"},
+        {"set empty object", Operation::SetTypeObject, &objectValue, "{}"},
+        {"set empty string", Operation::SetTypeString, &objectValue, "\"\""},
         {"pair copy", Operation::PairCopy, &objectValue, objectJson},
     };
     unsigned failures = 0;

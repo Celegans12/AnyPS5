@@ -39,6 +39,7 @@ int APS5_VABI sceSslGetPem(int, void*, char*, std::size_t*);
 namespace {
 
 constexpr int NotFound = static_cast<int>(0x8095F004);
+constexpr int InvalidId = static_cast<int>(0x8095F006);
 
 void Check(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
@@ -120,8 +121,8 @@ void ConnectionLifetime() {
     Check(sceSslSetVerifyCallback(retained, nullptr, nullptr) == 0, "credential unload invalidated the connection");
     Check(sceSslFreeCaCerts(id, &bytes) == 0 && Stats(id).currentInuseSize == 0, "CA snapshot leaked with a retained connection");
     Check(sceSslTerm_nid_postfix(id) == 0, "context termination failed with a retained connection");
-    Throws([&] { sceSslSetVerifyCallback(retained, nullptr, nullptr); });
-    Check(sceSslDeleteConnection(retained) == 0, "terminated context's connection cannot be released");
+    Check(sceSslSetVerifyCallback(retained, nullptr, nullptr) == InvalidId, "terminated context's connection did not report an invalid id");
+    Check(sceSslDeleteConnection(retained) == InvalidId, "terminated context's connection was still deletable");
     Check(sceSslGetCaCerts(other, &empty) == NotFound, "unrelated context was invalidated");
     Check(sceSslTerm_nid_postfix(other) == 0, "unrelated context termination failed");
 }
@@ -188,7 +189,7 @@ void CertificateReaders() {
     unsigned char serialData[8]{};
     std::size_t serialLen = sizeof(serialData);
     Check(sceSslGetSerialNumber(id, cert, serialData, &serialLen) == 0, "get serial failed");
-    Check(serialLen == 3, "serial length mismatch");
+    Check(serialLen == sizeof(serialData) && serialData[3] == 0, "a large enough serial buffer changed the caller's length");
     Check(serialData[0] == 0x00 && serialData[1] == 0x80 && serialData[2] == 0xa1, "serial bytes mismatch");
     Check(sceSslGetSerialNumber(id, cert, serialData, nullptr) == static_cast<int>(0x8095177a), "null serial length accepted");
     Throws([&] { sceSslGetSerialNumber(id, nullptr, serialData, &serialLen); });
@@ -217,11 +218,11 @@ void CertificateReaders() {
     char val[64]{};
     std::size_t vlen = 0;
     Check(sceSslGetNameEntryInfo(id, subject, 0, oid, sizeof(oid), val, sizeof(val), &vlen) == 0, "entry 0 info failed");
-    Check(std::strcmp(oid, "C") == 0 && std::strcmp(val, "GB") == 0 && vlen == 2, "entry 0 mismatch");
+    Check(std::strcmp(oid, "countryName") == 0 && std::strcmp(val, "GB") == 0 && vlen == 2, "entry 0 mismatch");
     Check(sceSslGetNameEntryInfo(id, subject, 1, oid, sizeof(oid), val, sizeof(val), &vlen) == 0, "entry 1 info failed");
-    Check(std::strcmp(oid, "O") == 0 && std::strcmp(val, "AnyPS5 Tests") == 0 && vlen == 12, "entry 1 mismatch");
+    Check(std::strcmp(oid, "organizationName") == 0 && std::strcmp(val, "AnyPS5 Tests") == 0 && vlen == 12, "entry 1 mismatch");
     Check(sceSslGetNameEntryInfo(id, subject, 2, oid, sizeof(oid), val, sizeof(val), &vlen) == 0, "entry 2 info failed");
-    Check(std::strcmp(oid, "CN") == 0 && std::strcmp(val, "AnyPS5 fixture root") == 0 && vlen == 19, "entry 2 mismatch");
+    Check(std::strcmp(oid, "commonName") == 0 && std::strcmp(val, "AnyPS5 fixture root") == 0 && vlen == 19, "entry 2 mismatch");
 
     char smallVal[4]{};
     std::size_t fullLen = 0;
@@ -296,7 +297,7 @@ void CertificateReaders() {
     Throws([&] { sceSslGetPem(id, nullptr, pemBuf.data(), &writtenLen); });
     Throws([&] { sceSslGetPem(id, fake, pemBuf.data(), &writtenLen); });
 
-    Throws([&] { sceSslClose(1); });
+    Check(sceSslClose(1) == InvalidId, "closing an unknown connection did not report an invalid id");
 
     Check(sceSslFreeCaList(id, &handles) == 0, "free ca list failed");
     Check(sceSslTerm_nid_postfix(id) == 0, "term failed");

@@ -494,15 +494,21 @@ int APS5_VABI sceCesUtf8ToSbc(const uint8_t* utf8, uint32_t utf8max, uint32_t* u
     return 0;
 }
 
-int APS5_VABI sceCesEucJpToUtf8(void* profile, uint8_t* eucBuffer, uint32_t eucMax, uint32_t* eucLength, uint8_t* utf8Buffer, uint32_t utf8Max, uint32_t* utf8Length) {
-    (void)profile;
-    (void)eucBuffer;
-    (void)eucMax;
-    (void)eucLength;
-    (void)utf8Buffer;
-    (void)utf8Max;
-    (void)utf8Length;
-    NotImplemented_nid_no_patch(__func__);
+int APS5_VABI sceCesEucJpToUtf8(const void* profile, const uint8_t* eucBuffer, uint32_t eucMax, uint32_t* eucLength, uint8_t* utf8Buffer, uint32_t utf8Max, uint32_t* utf8Length) {
+    if (!isEucJp(profile)) return CES_ERROR_INVALID_PARAMETER;
+    if (!eucBuffer) return CES_ERROR_INVALID_SRC_BUFFER;
+    if (eucMax == 0) return CES_ERROR_SRC_BUFFER_END;
+    if (!utf8Buffer) return CES_ERROR_INVALID_DST_BUFFER;
+    uint32_t consumed = 0;
+    uint32_t code = 0;
+    if (const int result = decodeMbcs(profile, eucBuffer, eucMax, consumed, code); result != 0) return result;
+    uint8_t encoded[3];
+    const uint32_t produced = encodeUtf8(code, encoded);
+    if (utf8Max < produced) return CES_ERROR_DST_BUFFER_END;
+    std::memcpy(utf8Buffer, encoded, produced);
+    if (eucLength) *eucLength = consumed;
+    if (utf8Length) *utf8Length = produced;
+    return 0;
 }
 
 int APS5_VABI sceCesEucKrToUtf8(void* profile, uint8_t* eucBuffer, uint32_t eucMax, uint32_t* eucLength, uint8_t* utf8Buffer, uint32_t utf8Max, uint32_t* utf8Length) {

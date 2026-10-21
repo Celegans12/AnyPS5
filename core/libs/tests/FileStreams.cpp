@@ -206,6 +206,17 @@ int main(int argc, char** argv) {
     std::array<char, 5> appended{};
     Require(stream != nullptr && fread_nid_postfix(appended.data(), 1, 4, stream) == 4 && std::strcmp(appended.data(), "abcd") == 0);
     Require(fclose_nid_postfix(stream) == 0 && remove_nid_postfix(heldName.c_str()) == 0);
+    stream = fopen_nid_postfix(heldName.c_str(), "w+b");
+    Require(stream != nullptr);
+    stream = freopen_nid_postfix(movedName.c_str(), "w+b", stream);
+    Require(stream != nullptr && fwrite_nid_postfix(payload, 1, sizeof(payload), stream) == sizeof(payload));
+    Require(fflush_nid_postfix(stream) == 0);
+    Require(rename_nid_postfix(movedName.c_str(), heldName.c_str()) == 0 && !std::filesystem::exists(movedName));
+    Require(remove_nid_postfix(heldName.c_str()) == 0 && !std::filesystem::exists(heldName));
+    Require(fseek_nid_postfix(stream, 0, SEEK_SET) == 0);
+    std::array<char, sizeof(payload)> reopenedBuffer{};
+    Require(fread_nid_postfix(reopenedBuffer.data(), 1, reopenedBuffer.size(), stream) == reopenedBuffer.size());
+    Require(std::strcmp(reopenedBuffer.data(), payload) == 0 && fclose_nid_postfix(stream) == 0);
     constexpr char marker[] = "marker";
     stream = fopen_nid_postfix(argv[1], "wb");
     Require(stream != nullptr);

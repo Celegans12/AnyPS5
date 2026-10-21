@@ -48,6 +48,8 @@
 #endif
 #include <windows.h>
 #include <io.h>
+#include <fcntl.h>
+#include "prx/libc/include/General.hpp"
 #else
 #include <unistd.h>
 #endif
@@ -68,6 +70,40 @@ void setEnvironment(const char* name, const std::string& value) {
 #endif
     ShaderRecompiler::RefreshEnvironmentGuards();
 }
+
+#ifdef _WIN32
+void verifyHostStandardError() {
+    const auto directory = std::filesystem::temp_directory_path() / ("aps5-shader-host-stderr-" + std::to_string(std::random_device{}()));
+    setEnvironment("ANYPS5_NO_SHADER_CACHE", "0");
+    setEnvironment("ANYPS5_SHADER_CACHE_DIR", directory.string());
+    int capture[2], guest[2];
+    require(::_pipe(capture, 65536, _O_BINARY) == 0, "cannot create host capture");
+    require(::_pipe(guest, 65536, _O_BINARY) == 0, "cannot create guest capture");
+    const int original = ::_dup(2);
+    require(original >= 0 && ::_dup2(capture[1], 2) == 0, "cannot capture initial stderr");
+    const int saved = ::_dup(2);
+    require(saved >= 0 && AdoptHostStandardStream_nid_no_patch(2, saved), "cannot preserve host stderr");
+    require(::_dup2(guest[1], 2) == 0, "cannot redirect guest stderr");
+    require(ShaderDiskCache::Enabled(), "shader disk cache was disabled");
+    ShaderDiskCache::Shutdown();
+    std::fflush(stderr);
+    std::fflush(HostStandardErrorFile_nid_no_patch());
+    require(::_dup2(original, 2) == 0, "cannot restore stderr");
+    ::_close(original);
+    DWORD hostBytes = 0, guestBytes = 0;
+    require(::PeekNamedPipe(reinterpret_cast<HANDLE>(::_get_osfhandle(capture[0])), nullptr, 0, nullptr, &hostBytes, nullptr) != 0, "cannot inspect host capture");
+    require(::PeekNamedPipe(reinterpret_cast<HANDLE>(::_get_osfhandle(guest[0])), nullptr, 0, nullptr, &guestBytes, nullptr) != 0, "cannot inspect guest capture");
+    std::string host(hostBytes, '\0');
+    if (hostBytes != 0) require(::_read(capture[0], host.data(), hostBytes) == static_cast<int>(hostBytes), "cannot read host capture");
+    ::_close(capture[0]);
+    ::_close(capture[1]);
+    ::_close(guest[0]);
+    ::_close(guest[1]);
+    std::filesystem::remove_all(directory);
+    require(guestBytes == 0, "shader cache diagnostic entered the guest stderr pipe");
+    require(host.find("[shader-disk-cache]") != std::string::npos, "shader cache diagnostic did not reach host stderr");
+}
+#endif
 
 void removeCacheDirectory(const std::filesystem::path& directory) {
     std::error_code error;
@@ -144,6 +180,7 @@ void requireSameResult(const RecompileResult& left, const RecompileResult& right
     require(left.shaderDataUserWords == right.shaderDataUserWords, prefix + "shader-data user words differ");
     require(left.imageTableRanges == right.imageTableRanges && left.imageTableShader == right.imageTableShader && left.imageTableFaults == right.imageTableFaults && left.imageTablePoison.size() == right.imageTablePoison.size(), prefix + "image table invocation data differs");
     require(left.imageTableReadRanges == right.imageTableReadRanges, prefix + "image table read ranges differ");
+    require(left.userDataRegisterReads == right.userDataRegisterReads, prefix + "user data register read mask differs");
     for (std::size_t i = 0; i < left.imageTablePoison.size(); ++i) {
         const auto& a = left.imageTablePoison[i];
         const auto& b = right.imageTablePoison[i];
@@ -257,6 +294,7 @@ RecompileResult sampleResult() {
     result.imageTableFaults = 3u;
     result.hasDeferredDirectImage = true;
     result.hasGuardedUnnormalizedWrap = true;
+    result.userDataRegisterReads = (std::uint64_t{1} << 63u) | (std::uint64_t{1} << 32u) | 0x25u;
     return result;
 }
 
@@ -309,6 +347,7 @@ CompiledVariant sampleVariant() {
     image.flatLineCompatible = false;
     image.flatVolumeLineCompatible = false;
     image.foldTexelOffsetsOnly = true;
+    image.remappedDepth1D = true;
     image.byElements = 4;
     image.byComponents = 1;
     image.emulatedCompare = 0x1a07u;
@@ -661,6 +700,43 @@ void verifyPrebuiltAcrossProcesses(const char* self, const std::filesystem::path
     require(std::system(command.c_str()) == 0, "the prebuilt loading process failed");
 }
 
+void verifyPrebuiltDiscovery(std::string_view layout, bool seed) {
+    using namespace ShaderRecompiler::ShaderDiskCache;
+    require(layout == "pack" || layout == "loose" || layout == "versioned" || layout == "file" || layout == "empty" || layout == "missing", "unknown prebuilt discovery layout");
+    Shutdown();
+    SampleRequest sample = prebuiltSample();
+    const auto key = sample.Key();
+    const auto variant = sampleVariant();
+    if (seed) {
+        const auto directory = ShaderRecompiler::ShaderCacheDirectory() / "prebuilt";
+        const auto entry = EncodeEntry(key, variant);
+        if (layout == "pack") {
+            auto otherKey = key;
+            otherKey.back() ^= std::byte{1};
+            require(WriteFileAtomically(directory / "a.pack", packBytes({{key, entry}})), "cannot seed the matching prebuilt pack");
+            require(WriteFileAtomically(directory / "z.pack", packBytes({{otherKey, EncodeEntry(otherKey, variant)}})), "cannot seed the other prebuilt pack");
+        } else if (layout == "loose") {
+            require(WriteFileAtomically(directory / EntryName(key), entry), "cannot seed the loose prebuilt entry");
+        } else if (layout == "versioned") {
+            require(WriteFileAtomically(directory / EntryDirectory().filename() / EntryName(key), entry), "cannot seed the versioned prebuilt entry");
+        } else if (layout == "file") {
+            require(WriteFileAtomically(directory, packBytes({{key, entry}})), "cannot seed the direct prebuilt pack");
+        } else if (layout == "empty") {
+            require(WriteFileAtomically(directory / "ignored.txt", entry), "cannot seed the ignored prebuilt file");
+        }
+        std::cout << "prebuilt discovery seeded " << layout << '\n';
+        return;
+    }
+    CompiledVariant loaded;
+    const bool expected = layout != "empty" && layout != "missing";
+    require(Load(key, loaded) == expected, "prebuilt discovery returned the wrong result for " + std::string(layout));
+    if (expected) requireSameVariant(variant, loaded, "prebuilt discovery");
+    const auto totals = Totals();
+    require(totals.prebuiltHits == (expected ? 1u : 0u) && totals.hits == 0 && totals.writes == 0 && Writers() == 0,
+            "prebuilt discovery did not remain a read-only prebuilt lookup");
+    std::cout << "prebuilt discovery verified " << layout << '\n';
+}
+
 void verifyArtifactStorageIsolation() {
     SampleRequest sample;
     const auto key = sample.Key();
@@ -732,6 +808,7 @@ void verifyKeySensitivity() {
     changes("the narrow subgroup clock", [](SampleRequest& sample) { sample.request.target.narrowSubgroupClock = true; });
     changes("f64 denormal preservation", [](SampleRequest& sample) { sample.request.target.float64DenormPreserve = true; });
     changes("f16 denormal preservation", [](SampleRequest& sample) { sample.request.target.float16DenormPreserve = true; });
+    changes("f32 denormal preservation", [](SampleRequest& sample) { sample.request.target.float32DenormPreserve = true; });
     changes("spanned waves", [](SampleRequest& sample) { sample.request.target.spannedWaves = true; });
     changes("robust buffer access 2", [](SampleRequest& sample) { sample.request.target.robustBufferAccess2 = true; });
     changes("the workgroup size limit", [](SampleRequest& sample) { sample.request.target.maxWorkgroupSize[2] = 128; });
@@ -858,6 +935,13 @@ int runLargeFileWrite() {
     std::error_code error;
     std::filesystem::remove_all(directory, error);
     std::filesystem::create_directories(directory, error);
+    struct Cleanup {
+        std::filesystem::path directory;
+        ~Cleanup() {
+            std::error_code error;
+            std::filesystem::remove_all(directory, error);
+        }
+    } cleanup{directory};
     const auto space = std::filesystem::space(directory, error);
     if (error || space.available < size + (std::uintmax_t{1} << 30u)) {
         std::cout << "skipping: not enough free disk space for a file of more than 2 GiB\n";
@@ -884,6 +968,8 @@ int runLargeFileWrite() {
     }).detach();
     if (result.wait_for(std::chrono::seconds(200)) != std::future_status::ready) {
         std::cerr << "WriteFileAtomically did not return within 200 s for a file of more than 2 GiB\n";
+        std::filesystem::remove_all(directory, error);
+        if (error) std::cerr << "cannot remove the large file test directory: " << error.message() << '\n';
         std::cerr.flush();
         std::_Exit(1);
     }
@@ -1037,6 +1123,62 @@ void verifyPersist() {
     require(!error, "cannot remove the replaced cache entry");
     requireSameArtifact(variant.artifact, persisted->artifact, "a persisted entry whose file was replaced and removed");
 }
+
+#ifdef _WIN32
+void verifyLongHostPaths() {
+    using namespace ShaderRecompiler::ShaderDiskCache;
+    auto directory = std::filesystem::temp_directory_path() / ("aps5-cache-long-" + std::to_string(std::random_device{}()));
+    require(directory.native().size() < 224, "temporary path is too long for the cache control");
+    directory /= std::wstring(224 - directory.native().size(), L'd');
+    const auto extended = [](const auto& path) { return std::filesystem::path(L"\\\\?\\" + path.native()); };
+    std::filesystem::create_directories(extended(directory));
+    setEnvironment("ANYPS5_NO_SHADER_CACHE", "0");
+    setEnvironment("ANYPS5_SHADER_CACHE_DIR", directory.string());
+    std::vector<std::filesystem::path> files;
+    std::filesystem::path entries;
+    struct Cleanup {
+        const std::filesystem::path& directory;
+        const std::vector<std::filesystem::path>& files;
+        const std::filesystem::path& entries;
+        ~Cleanup() {
+            ShaderRecompiler::ShaderDiskCache::Shutdown();
+            std::error_code error;
+            for (const auto& file : files) std::filesystem::remove(std::filesystem::path(L"\\\\?\\" + file.native()), error);
+            if (!entries.empty()) std::filesystem::remove(std::filesystem::path(L"\\\\?\\" + entries.native()), error);
+            std::filesystem::remove(std::filesystem::path(L"\\\\?\\" + directory.native()), error);
+        }
+    } cleanup{directory, files, entries};
+    SampleRequest sample;
+    const auto key = sample.Key();
+    const auto variant = sampleVariant();
+    entries = ShaderDiskCache::EntryDirectory();
+    files.push_back(entries / EntryName(key));
+    files.push_back(entries / "last-used");
+    require(files.front().native().size() >= MAX_PATH, "the cache persistence control did not cross MAX_PATH");
+    const auto persisted = ShaderDiskCache::Persist(key, variant);
+    std::vector<std::byte> published;
+    require(ReadWholeFile(files.front(), published) && published == EncodeEntry(key, variant),
+            "the long-path cache entry was not correctly published before mapping");
+    require(persisted != nullptr, "a long-path cache entry was not persisted and mapped");
+    MEMORY_BASIC_INFORMATION region{};
+    require(VirtualQuery(persisted->artifact.spirv.data(), &region, sizeof(region)) == sizeof(region) && region.Type == MEM_MAPPED,
+            "long-path persisted SPIR-V is not mapped");
+    requireSameVariant(variant, *persisted, "long-path persist round trip");
+    CompiledVariant loaded;
+    require(ShaderDiskCache::Load(key, loaded), "a long-path persisted cache entry did not load");
+    requireSameVariant(variant, loaded, "long-path load round trip");
+    const auto packPath = directory / (std::wstring(75, L'p') + L".pack");
+    files.push_back(packPath);
+    require(WriteFileAtomically(packPath, packBytes({{key, EncodeEntry(key, variant)}})), "cannot publish the long-path cache pack");
+    CachePack pack(packPath);
+    require(pack.Valid(), "a long-path cache pack was rejected: " + pack.Error());
+    PackLoadTimings timings;
+    CompiledVariant decoded;
+    require(pack.Load(key, decoded, timings) == LoadStatus::Loaded, "a long-path cache pack entry did not load");
+    requireSameVariant(variant, decoded, "long-path cache pack round trip");
+    std::cout << "long-path shader cache persistence and pack tests passed\n";
+}
+#endif
 
 struct ComputeRequest {
     std::vector<std::uint32_t> code{0xe0700000u, 0x80000000u, 0xbf810000u};
@@ -3123,6 +3265,20 @@ int main(int argc, char** argv) {
             verifyResultRoundTrip();
             verifyEntryRoundTrip();
             std::cout << "artifact codec tests passed\n";
+            return 0;
+        }
+#ifdef _WIN32
+        if (argc == 2 && std::string_view(argv[1]) == "--host-stderr") {
+            verifyHostStandardError();
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--long-host-paths") {
+            verifyLongHostPaths();
+            return 0;
+        }
+#endif
+        if (argc == 3 && (std::string_view(argv[1]) == "--seed-prebuilt-discovery" || std::string_view(argv[1]) == "--verify-prebuilt-discovery")) {
+            verifyPrebuiltDiscovery(argv[2], std::string_view(argv[1]) == "--seed-prebuilt-discovery");
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--large-file") return runLargeFileWrite();

@@ -71,6 +71,8 @@ def main():
             for name, image, message in cases:
                 convert(f"{index}-{name}", image, message, flags)
             convert(f"{index}-extra", cases[0][1], cases[0][2], flags, extra=True)
+            if "--windows" in flags:
+                convert(f"{index}-module-name", None, "Unsupported Windows guest filename", flags, module=guest_fixture(PLAIN_SITE))
             module = guest_fixture(PLAIN_SITE)
             struct.pack_into("<QQ", module, 176 + 32, 17, 17)
             convert(f"{index}-module", None, "Missing or invalid ELF load/dynamic segments", flags, module=module)

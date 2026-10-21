@@ -18,4 +18,19 @@ int APS5_VABI sceAutoMounterClientInit() {
     return 0;
 }
 
+int APS5_VABI sceAutoMounterClientRegisterCallback() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceAutoMounterClientTerm() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceAutoMounterClientUnregisterCallback() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
 }

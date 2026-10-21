@@ -453,6 +453,16 @@ int APS5_VABI sceKernelUuidCreate(std::uint32_t* uuid) {
     return 0;
 }
 
+int APS5_VABI sceKernelCreateUuidV4(std::uint8_t* uuid) {
+    if (!uuid) return sceInvalidArgument;
+    std::array<std::uint8_t, 16> value;
+    HostEntropy_nid_no_patch(value.data(), value.size());
+    value[6] = static_cast<std::uint8_t>((value[6] & 0x0fu) | 0x40u);
+    value[8] = static_cast<std::uint8_t>((value[8] & 0x3fu) | 0x80u);
+    std::memcpy(uuid, value.data(), value.size());
+    return 0;
+}
+
 void APS5_VABI sceKernelSync(void) {
     SyncWrittenPaths_nid_no_patch();
 }
@@ -733,6 +743,12 @@ int APS5_VABI setegid_nid_postfix(std::uint32_t egid) {
 int APS5_VABI setuid_nid_postfix(std::uint32_t uid) {
     if (uid != 0)
         throw std::runtime_error("setuid: unsupported user id " + std::to_string(uid));
+    return 0;
+}
+
+int APS5_VABI setgid_nid_postfix(std::uint32_t gid) {
+    if (gid != 0)
+        throw std::runtime_error("setgid: unsupported group id " + std::to_string(gid));
     return 0;
 }
 

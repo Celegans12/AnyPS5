@@ -6,8 +6,79 @@
 
 ### Unknown function info
 
-- [sceNetCtlGetInfoV6](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl, NID `Jy1EO5GdlcM`) - imported by PPSA08587, which fails to load without it, and not called before its loading screen; declared without parameters as a throwing stub, signature unknown. Name from the aerolib NID list
+- [sceNetCtlGetInfoV6](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl, NID `Jy1EO5GdlcM`) - imported by PPSA08587. `(int code, SceNetCtlInfoV6* info)` with codes 1-5 (IP address, link-local address, default route, primary and secondary DNS) comes only from [SharpProspero](https://github.com/SvenGDK/SharpProspero), whose source is unknown; shadPS4 and fpPS4 only stub it. A null `info` answers `INVALID_ADDR`, a code outside 1-5 `INVALID_CODE`, and a host without an IPv6 address `NOT_CONNECTED`, as `sceNetCtlGetStateV6` reports it. The layout of each answer is unverified, so every code throws on a host with an IPv6 address
 - [sceNetCtlGetInfo](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - answers from the host interface that holds an IPv4 address, preferring the one that carries the default route: its address, netmask, gateway, MTU and first two IPv4 DNS servers. The device is reported as wired, the link as connected, the IP configuration as DHCP and the HTTP proxy as off, whatever the host uses, and the Ethernet address is the one `sceNetGetMacAddress` reports. A gateway or DNS server the interface does not have is reported as `0.0.0.0`; what a console reports then is unknown. The DHCP host name (12), the PPPoE user name (13), the HTTP proxy server (20) and the Wi-Fi BSSID and SSID (5, 6) are empty strings, as that configuration sets none of them; the remaining Wi-Fi codes (7-10) and the HTTP proxy port (21) report 0; this follows [KytyPS5](https://github.com/KytyPS5/KytyPS5/blob/main/src/libs/network.cpp) and is not measured on hardware
+- [sceNetCtlRegisterCallbackForNpToolkit](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlRegisterCallbackIpcInt](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlRegisterCallbackForLibIpcInt](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlUnregisterCallbackForNpToolkit](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlUnregisterCallbackIpcInt](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlUnregisterCallbackForLibIpcInt](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlCheckCallbackForNpToolkit](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlCheckCallbackForLibIpcInt](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlClearEventIpcInt](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlClearEventForNpToolkit](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlClearEventForLibIpcInt](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlGetResultIpcInt](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlGetStateIpcInt](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlGetState2IpcInt](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlGetInfoIpcInt](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlGetEtherLinkMode](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlGetWifiType](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlConnectIpcInt](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlConnectWithRetryIpcInt](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlConnectConfIpcInt](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlDisconnectIpcInt](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlScanIpcInt](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlGetScanInfoBssidIpcInt](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlGetScanInfoByBssidIpcInt](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlGetScanInfoForSsidScanIpcInt](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlGetScanInfoBssidForSsidListScanIpcInt](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlGetScanInfoForSsidListScanIpcInt](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlSetErrorNotificationEnabledIpcInt](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlRegisterCallbackV6IpcInt](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlUnregisterCallbackV6IpcInt](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlGetResultV6](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlGetResultV6IpcInt](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlGetStateV6IpcInt](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlGetInfoV6IpcInt](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlGetNatInfoIpcInt](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlSetStunWithPaddingFlagIpcInt](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlUnsetStunWithPaddingFlagIpcInt](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlIsBandwidthManagementEnabledIpcInt](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlDisableBandwidthManagementIpcInt](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlEnableBandwidthManagementIpcInt](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlGetBandwidthInfoIpcInt](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlGetNetEvConfigInfoIpcInt](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlGetConnectionElapsedTimeIpcInt](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlApRpCheckCallback](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlApRpClearEvent](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlApRpRegisterCallback](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlApRpUnregisterCallback](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlApRpGetResult](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlApRpGetState](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlApRpGetInfo](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlApRpStart](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlApCpStart](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlApAppStartWithRetryPid](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlApAppStartWithRetry](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlApRpStartWithRetry](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlApRpStartConf](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlApRpStop](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlApCpStop](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlApAppInitWpaKey](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlApAppInitWpaKeyForQa](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlApRestart](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetBweCheckCallbackIpcInt](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetBweClearEventIpcInt](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetBweRegisterCallbackIpcInt](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetBweUnregisterCallbackIpcInt](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetBweGetInfoIpcInt](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetBweStartInternetConnectionTestIpcInt](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetBweFinishInternetConnectionTestIpcInt](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetBweStartInternetConnectionTestBandwidthTestIpcInt](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetBweSetInternetConnectionTestResultIpcInt](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
+- [sceNetCtlGetWifiInfoIpcInt](../../../core/libs/prx/libSceNetCtl/Export.cpp) (libSceNetCtl) - unknown signature
 
 ### Functional
 

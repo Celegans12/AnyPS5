@@ -153,14 +153,14 @@ struct PhysicalMemoryPool {
         return true;
     }
 
-    bool LargestFree(int64_t searchStart, int64_t searchEnd, size_t alignment, int64_t* startOut, size_t* sizeOut) {
-        if (!startOut || !sizeOut) return false;
-        if (searchStart < 0 || searchEnd <= searchStart) return false;
+    int LargestFree(int64_t searchStart, int64_t searchEnd, size_t alignment, int64_t* startOut, size_t* sizeOut) {
+        if (!startOut || !sizeOut) return SCE_KERNEL_ERROR_EINVAL;
+        if (searchStart < 0 || searchEnd <= searchStart) return SCE_KERNEL_ERROR_EAGAIN;
         uint64_t align;
-        if (!NormalizeAlignment(alignment, align)) return false;
+        if (!NormalizeAlignment(alignment, align)) return SCE_KERNEL_ERROR_EAGAIN;
 
         uint64_t cur;
-        if (!RoundUp(static_cast<uint64_t>(searchStart), kPage, cur)) return false;
+        if (!RoundUp(static_cast<uint64_t>(searchStart), kPage, cur)) return SCE_KERNEL_ERROR_EAGAIN;
         const uint64_t limit = std::min<uint64_t>(static_cast<uint64_t>(searchEnd), kPoolBytes) & ~(kPage - 1);
 
         std::lock_guard<std::mutex> lock(_mutex);
@@ -184,10 +184,10 @@ struct PhysicalMemoryPool {
             cur = runEnd;
         }
 
-        if (bestSize == 0) return false;
+        if (bestSize == 0) return SCE_KERNEL_ERROR_ENOMEM;
         *startOut = static_cast<int64_t>(bestStart);
         *sizeOut = static_cast<size_t>(bestSize);
-        return true;
+        return 0;
     }
 
     size_t FreeRun(uint64_t offset, uint64_t limit) {
@@ -343,7 +343,7 @@ void DirectMemoryRetype(int64_t start, size_t len, int memoryType) {
     (void)PhysicalMemoryPool::Instance().Retype(static_cast<uint64_t>(start), len, memoryType);
 }
 
-bool DirectMemoryLargestFree(int64_t searchStart, int64_t searchEnd, size_t alignment, int64_t* startOut, size_t* sizeOut) {
+int DirectMemoryLargestFree(int64_t searchStart, int64_t searchEnd, size_t alignment, int64_t* startOut, size_t* sizeOut) {
     return PhysicalMemoryPool::Instance().LargestFree(searchStart, searchEnd, alignment, startOut, sizeOut);
 }
 

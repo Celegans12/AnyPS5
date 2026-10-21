@@ -7,6 +7,10 @@
 #include <sys/ioctl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#ifdef __APPLE__
+#include <libproc.h>
+#include <unistd.h>
+#endif
 #endif
 #include "prx/libkernel/Socket/include/SocketError.hpp"
 #include "prx/libkernel/Socket/include/SocketOptions.hpp"
@@ -160,6 +164,20 @@ int SetSocketLevelOption(std::uintptr_t native, SocketOptionState& state, int op
     return ErrorNoProtocolOption;
 }
 
+bool NativeListening(std::uintptr_t native, bool& listening) {
+#ifdef __APPLE__
+    socket_fdinfo info{};
+    if (proc_pidfdinfo(getpid(), static_cast<int>(native), PROC_PIDFDSOCKETINFO, &info, sizeof(info)) != static_cast<int>(sizeof(info))) return false;
+    listening = (info.psi.soi_options & SO_ACCEPTCONN) != 0;
+#else
+    int accepting = 0;
+    socklen_t size = sizeof(accepting);
+    if (::getsockopt(static_cast<NativeHandle>(native), SOL_SOCKET, SO_ACCEPTCONN, reinterpret_cast<NativeOptionOutput>(&accepting), &size)) return false;
+    listening = accepting != 0;
+#endif
+    return true;
+}
+
 int GetSocketLevelOption(std::uintptr_t native, SocketOptionState& state, int type, int option, void* value, std::uint32_t* length) {
     const auto handle = static_cast<NativeHandle>(native);
     if (option == GuestLinger) {
@@ -180,10 +198,9 @@ int GetSocketLevelOption(std::uintptr_t native, SocketOptionState& state, int ty
         if (::getsockopt(handle, SOL_SOCKET, nativeOption, reinterpret_cast<NativeOptionOutput>(&enabled), &size)) return HostError();
         number = enabled != 0 ? option : 0;
     } else if (option == GuestAcceptConnection) {
-        int listening = 0;
-        socklen_t size = sizeof(listening);
-        if (::getsockopt(handle, SOL_SOCKET, SO_ACCEPTCONN, reinterpret_cast<NativeOptionOutput>(&listening), &size)) return HostError();
-        number = listening != 0 ? GuestAcceptConnection : 0;
+        bool listening = false;
+        if (!NativeListening(native, listening)) return HostError();
+        number = listening ? GuestAcceptConnection : 0;
     } else if (option == GuestType) {
         number = type;
     } else if (option == GuestNoSigpipe) {

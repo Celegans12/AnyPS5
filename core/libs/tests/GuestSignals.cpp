@@ -14,6 +14,8 @@ struct GuestSignalSet {
 extern "C" {
 Handler APS5_VABI signal_nid_postfix(int, Handler);
 int APS5_VABI raise_nid_postfix(int);
+int APS5_VABI kill_nid_postfix(int, int);
+int APS5_VABI getpid_nid_postfix();
 int APS5_VABI pthread_kill_nid_postfix(void*, int);
 void* APS5_VABI scePthreadSelf();
 int APS5_VABI scePthreadCreate(void** thread, const void* attr, void* (APS5_VABI *entry)(void*), void* arg, const char* name);
@@ -93,6 +95,11 @@ int main() {
     Require(raise_nid_postfix(15) == 0 && received == 0);
     Require(signal_nid_postfix(15, nullptr) == ignore);
     Require(raise_nid_postfix(100) == -1 && *__error_nid_postfix() == 22);
+    *__error_nid_postfix() = 0;
+    received = 0;
+    Require(raise_nid_postfix(0) == 0 && received == 0 && *__error_nid_postfix() == 0);
+    Require(raise_nid_postfix(129) == -1 && *__error_nid_postfix() == 22);
+    Require(raise_nid_postfix(-1) == -1 && *__error_nid_postfix() == 22);
     GuestSignalSet blocked{{0x20, 0, 0, 0}};
     GuestSignalSet previous{{}};
     Require(sigprocmask_nid_postfix(3, &blocked, &previous) == 0);
@@ -310,4 +317,28 @@ int main() {
         pendingSignals.bits[0] == 0 && pendingSignals.bits[1] == 0 &&
         pendingSignals.bits[2] == 0 && pendingSignals.bits[3] == 0);
     for (int guest : {40, 73, 128}) Require(signal_nid_postfix(guest, nullptr) == Callback);
+    for (const int ignoredByDefault : {16, 19, 20, 23, 28, 29}) {
+        *__error_nid_postfix() = 0;
+        received = 0;
+        Require(raise_nid_postfix(ignoredByDefault) == 0 && received == 0 && *__error_nid_postfix() == 0);
+        Require(kill_nid_postfix(getpid_nid_postfix(), ignoredByDefault) == 0 && *__error_nid_postfix() == 0);
+    }
+    const GuestSignalSet ignoredByDefaultSet{{(1u << 15) | (1u << 19) | (1u << 22) | (1u << 27) | (1u << 28), 0, 0, 0}};
+    GuestSignalSet pendingIgnored{};
+    Require(sigprocmask_nid_postfix(3, &ignoredByDefaultSet, nullptr) == 0);
+    for (const int ignoredByDefault : {16, 20, 23, 28, 29}) Require(raise_nid_postfix(ignoredByDefault) == 0);
+    Require(sigpending_nid_postfix(&pendingIgnored) == 0 && pendingIgnored.bits[0] == 0);
+    const GuestSignalSet noneBlocked{{0, 0, 0, 0}};
+    Require(sigprocmask_nid_postfix(3, &noneBlocked, nullptr) == 0);
+    const GuestSigaction ignored{1, 0, {}};
+    const GuestSigaction restored{0, 0, {}};
+    const GuestSignalSet userSignal{{1u << 29, 0, 0, 0}};
+    Require(sigaction_nid_postfix(30, &ignored, nullptr) == 0);
+    *__error_nid_postfix() = 0;
+    Require(raise_nid_postfix(30) == 0 && kill_nid_postfix(getpid_nid_postfix(), 30) == 0 && *__error_nid_postfix() == 0);
+    Require(sigprocmask_nid_postfix(3, &userSignal, nullptr) == 0);
+    Require(raise_nid_postfix(30) == 0);
+    Require(sigpending_nid_postfix(&pendingIgnored) == 0 && pendingIgnored.bits[0] == 0);
+    Require(sigprocmask_nid_postfix(3, &noneBlocked, nullptr) == 0);
+    Require(sigaction_nid_postfix(30, &restored, nullptr) == 0);
 }

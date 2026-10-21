@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 
+from signal_run import run_without_core_dump
 from test_guest_intel_trampolines import main_fixture
 from test_guest_module_directories import module_with_symbol
 from test_linux_load_alignment import fixture as single_load_fixture
@@ -78,7 +79,7 @@ def run_expecting_trap(name, output):
     if not (sys.platform.startswith("linux") and platform.machine() in ("x86_64", "AMD64")):
         return
     output.chmod(0o755)
-    executed = subprocess.run([str(output)], capture_output=True, timeout=20)
+    executed = run_without_core_dump([str(output)], capture_output=True, timeout=20)
     assert executed.returncode == -signal.SIGTRAP, (name, executed.returncode, executed.stderr)
 
 

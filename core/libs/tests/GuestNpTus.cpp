@@ -1,9 +1,12 @@
 #include "prx/libc/include/general/VabiMacros.hpp"
+#include <array>
 #include <cstdint>
 #include <cstdlib>
+#include <initializer_list>
 
 extern "C" {
 int APS5_VABI sceNpTusCreateNpTitleCtxA(std::uint32_t serviceLabel, int userId);
+int APS5_VABI sceNpTusDeleteNpTitleCtx(int titleCtxId);
 int APS5_VABI sceNpTusCreateRequest(int titleCtxId);
 int APS5_VABI sceNpTusDeleteRequest(int reqId);
 int APS5_VABI sceNpTusAbortRequest(int reqId);
@@ -16,6 +19,7 @@ int APS5_VABI sceNpTusAddAndGetVariableAAsync(int reqId, std::uint64_t targetAcc
 
 static constexpr int SIGNED_OUT = static_cast<int>(0x80550006);
 static constexpr int INVALID_ARGUMENT = static_cast<int>(0x80550704);
+static constexpr int TOO_MANY_OBJECTS = static_cast<int>(0x80550706);
 static constexpr int ABORTED = static_cast<int>(0x80550707);
 static constexpr int INSUFFICIENT_ARGUMENT = static_cast<int>(0x8055070C);
 static constexpr int INVALID_ID = static_cast<int>(0x8055070E);
@@ -70,4 +74,53 @@ int main() {
     Require(sceNpTusAbortRequest(request) == INVALID_ID);
     Require(sceNpTusPollAsync(request, &result) == INVALID_ID);
     Require(sceNpTusSetMultiSlotVariableAAsync(request, 0, slots, values, 2, nullptr) == INVALID_ID);
+
+    Require(sceNpTusDeleteNpTitleCtx(0) == INVALID_ID);
+    Require(sceNpTusDeleteNpTitleCtx(-1) == INVALID_ID);
+    Require(sceNpTusDeleteNpTitleCtx(context + 1000) == INVALID_ID);
+    const int siblingContext = sceNpTusCreateNpTitleCtxA(0, 1);
+    const int siblingRequest = sceNpTusCreateRequest(siblingContext);
+    Require(siblingContext > 0 && siblingRequest > 0);
+    Require(sceNpTusSetMultiSlotVariableAAsync(siblingRequest, 0, slots, values, 2, nullptr) == 0);
+    const int idle = sceNpTusCreateRequest(context);
+    const int finished = sceNpTusCreateRequest(context);
+    const int aborted = sceNpTusCreateRequest(context);
+    Require(idle > 0 && finished > 0 && aborted > 0);
+    Require(sceNpTusSetMultiSlotVariableAAsync(finished, 0, slots, values, 2, nullptr) == 0);
+    Require(sceNpTusAbortRequest(aborted) == 0);
+    Require(sceNpTusDeleteNpTitleCtx(context) == 0);
+    Require(sceNpTusDeleteNpTitleCtx(context) == INVALID_ID);
+    Require(sceNpTusCreateRequest(context) == INVALID_ID);
+    for (const int child : {idle, finished, aborted}) {
+        Require(sceNpTusPollAsync(child, &result) == INVALID_ID);
+        Require(sceNpTusDeleteRequest(child) == INVALID_ID);
+        Require(sceNpTusAbortRequest(child) == INVALID_ID);
+        Require(sceNpTusSetMultiSlotVariableAAsync(child, 0, slots, values, 2, nullptr) == INVALID_ID);
+    }
+    RequireFinished(siblingRequest, SIGNED_OUT);
+    Require(sceNpTusDeleteNpTitleCtx(siblingContext) == 0);
+
+    std::array<int, 32> contexts{};
+    for (int& titleContext : contexts) {
+        titleContext = sceNpTusCreateNpTitleCtxA(0, 1);
+        Require(titleContext > 0);
+    }
+    Require(sceNpTusCreateNpTitleCtxA(0, 1) == TOO_MANY_OBJECTS);
+    for (int& titleContext : contexts) {
+        const int previous = titleContext;
+        Require(sceNpTusDeleteNpTitleCtx(previous) == 0);
+        titleContext = sceNpTusCreateNpTitleCtxA(0, 1);
+        Require(titleContext > 0 && titleContext != previous);
+        Require(sceNpTusCreateRequest(previous) == INVALID_ID);
+    }
+    std::array<int, 256> children{};
+    for (int& child : children) {
+        child = sceNpTusCreateRequest(contexts[0]);
+        Require(child > 0);
+    }
+    Require(sceNpTusCreateRequest(contexts[1]) == TOO_MANY_OBJECTS);
+    Require(sceNpTusDeleteNpTitleCtx(contexts[0]) == 0);
+    Require(sceNpTusCreateRequest(contexts[1]) > 0);
+    for (const int child : children) Require(sceNpTusPollAsync(child, &result) == INVALID_ID);
+    for (std::size_t index = 1; index < contexts.size(); ++index) Require(sceNpTusDeleteNpTitleCtx(contexts[index]) == 0);
 }

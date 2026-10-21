@@ -224,6 +224,11 @@ bool foldRedundantMask(IrValue& value) {
     return false;
 }
 
+bool feedsMultiply(const IrValue& value) {
+    const auto& uses = value.Uses();
+    return std::any_of(uses.begin(), uses.end(), [](const IrValue* use) { return use->Opcode() == IrOpcode::IMul32; });
+}
+
 bool isImmediateU32(const IrValue& value, std::uint32_t immediate) {
     return isImmediate(value, IrType::U32) && value.ImmediateU32() == immediate;
 }
@@ -903,7 +908,7 @@ bool tryFoldValue(IrProgram& program, IrValue& value, OperandFacts& facts) {
                     return true;
                 }
             }
-            if (value.Opcode() == IrOpcode::BitFieldUExtract && isImmediateU32(offset, 0u) && isImmediate(count, IrType::U32) && count.ImmediateU32() < 32u && !isImmediate(source, IrType::U32) && (possibleBits(source) >> count.ImmediateU32()) == 0u) {
+            if (value.Opcode() == IrOpcode::BitFieldUExtract && isImmediateU32(offset, 0u) && isImmediate(count, IrType::U32) && count.ImmediateU32() < 32u && !isImmediate(source, IrType::U32) && (possibleBits(source) >> count.ImmediateU32()) == 0u && !feedsMultiply(value)) {
                 replaceWith(value, source);
                 return true;
             }

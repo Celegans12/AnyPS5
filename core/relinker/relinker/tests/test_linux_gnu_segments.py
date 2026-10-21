@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 
+from signal_run import run_without_core_dump
 from test_linux_load_alignment import fixture
 
 PT_GNU_STACK = 0x6474E551
@@ -84,7 +85,7 @@ def main():
                     found = {header[0]: header for header in headers(output.read_bytes())}
                     assert (PT_GNU_RELRO in found) == keeps_relro, "PT_GNU_RELRO was kept without writable load coverage"
                     output.chmod(output.stat().st_mode | 0o111)
-                    execution = subprocess.run([str(output)], capture_output=True, text=True, timeout=20)
+                    execution = run_without_core_dump([str(output)], capture_output=True, text=True, timeout=20)
                     assert execution.returncode == -signal.SIGTRAP, (execution.returncode, execution.stdout, execution.stderr)
 
             synthesized_executable = executable_image(0x4000)
@@ -98,7 +99,7 @@ def main():
             assert found[PT_GNU_STACK] == (PT_GNU_STACK, 6, 0, 0, 0, 0, 0, 16), found
             assert found[PT_GNU_RELRO][3:5] == (0x4000, 0x4000), found
             output.chmod(output.stat().st_mode | 0o111)
-            execution = subprocess.run([str(output)], capture_output=True, text=True, timeout=20)
+            execution = run_without_core_dump([str(output)], capture_output=True, text=True, timeout=20)
             assert execution.returncode == -signal.SIGTRAP, (execution.returncode, execution.stdout, execution.stderr)
     print("Linux GNU segment tests passed")
 

@@ -596,6 +596,103 @@ void testDecode(bool lengthPrefixed, bool separateParameters = false) {
     checkThrows([&] { sceVideodec2DeleteDecoder_nid_postfix(handle); });
 }
 
+void decodeInOrder(const std::vector<std::vector<std::uint8_t>>& units) {
+    const DecoderConfigInfo config{sizeof(DecoderConfigInfo), 0, 1, 100, 0, static_cast<std::int32_t>(Width), static_cast<std::int32_t>(Height), 4, 1};
+    DecoderMemoryInfo memory{sizeof(DecoderMemoryInfo)};
+    check(sceVideodec2QueryDecoderMemoryInfo_nid_postfix(&config, &memory) == 0, "memory query failed");
+    std::uint64_t handle = 0;
+    check(sceVideodec2CreateDecoder_nid_postfix(&config, &memory, &handle) == 0, "decoder creation failed");
+    std::vector<std::uint8_t> buffer(memory.maxFrameBufferSize);
+    std::size_t pictures = 0;
+    const auto take = [&](const OutputInfo& output) {
+        if (!output.isValid) return false;
+        check(pictures < PictureHashes.size(), "more pictures than access units");
+        check(!output.isErrorFrame && output.frameWidth == Width && output.frameHeight == CodedHeight, "unexpected picture geometry");
+        check(hashNv12(buffer.data(), output.framePitch, output.frameHeight) == PictureHashes[pictures], "picture " + std::to_string(pictures) + " differs from the reference");
+        ++pictures;
+        return true;
+    };
+    for (std::size_t unit = 0; unit < units.size(); ++unit) {
+        const InputData input{sizeof(InputData), units[unit].data(), units[unit].size(), 1000 + unit, unit, 0xa0 + unit};
+        FrameBuffer frame{sizeof(FrameBuffer), buffer.data(), buffer.size(), false};
+        OutputInfo output{sizeof(OutputInfo)};
+        check(sceVideodec2Decode_nid_postfix(handle, &input, &frame, &output) == 0, "decode failed");
+        take(output);
+    }
+    for (;;) {
+        FrameBuffer frame{sizeof(FrameBuffer), buffer.data(), buffer.size(), false};
+        OutputInfo output{sizeof(OutputInfo)};
+        check(sceVideodec2Flush_nid_postfix(handle, &frame, &output) == 0, "flush failed");
+        if (!take(output)) break;
+    }
+    check(pictures == PictureHashes.size(), "missing pictures after flush");
+    check(sceVideodec2DeleteDecoder_nid_postfix(handle) == 0, "delete failed");
+}
+
+bool readsAsOneLengthPrefix(const std::vector<std::uint8_t>& unit) {
+    const std::size_t length = (static_cast<std::size_t>(unit[0]) << 24u) | (static_cast<std::size_t>(unit[1]) << 16u) | (static_cast<std::size_t>(unit[2]) << 8u) | unit[3];
+    return length + 4 == unit.size();
+}
+
+std::vector<std::uint8_t> lengthPrefixedFiller(std::size_t length) {
+    std::vector<std::uint8_t> filler;
+    for (int shift = 24; shift >= 0; shift -= 8) filler.push_back(static_cast<std::uint8_t>(length >> shift));
+    filler.push_back(0x0c);
+    filler.insert(filler.end(), length - 1, 0xff);
+    return filler;
+}
+
+void testLengthPrefixLooksLikeStartCode() {
+    auto units = accessUnits(true);
+    const auto filler = lengthPrefixedFiller(0x101);
+    check(!(units[0][0] == 0 && units[0][1] == 0 && (units[0][2] == 1 || units[0][3] == 1)), "the first length-prefixed unit already begins with start-code bytes");
+    units[1].insert(units[1].begin(), filler.begin(), filler.end());
+    check(units[1][0] == 0 && units[1][1] == 0 && units[1][2] == 1, "the crafted unit does not begin with start-code bytes");
+    decodeInOrder(units);
+
+    auto mixed = accessUnits(false);
+    const auto mixedFiller = lengthPrefixedFiller(0x123);
+    mixed[1] = accessUnits(true)[1];
+    mixed[1].insert(mixed[1].begin(), mixedFiller.begin(), mixedFiller.end());
+    check(mixed[0][2] == 0 && mixed[0][3] == 1 && mixed[1][0] == 0 && mixed[1][1] == 0 && mixed[1][2] == 1, "the length-prefixed unit does not follow an Annex-B unit with a four-byte start code");
+    decodeInOrder(mixed);
+}
+
+void testStartCodeLooksLikeLengthPrefix() {
+    auto units = accessUnits(false);
+    for (auto& unit : units) {
+        check(unit[0] == 0 && unit[1] == 0 && unit[2] == 0 && unit[3] == 1, "an access unit does not open with a four-byte start code");
+        unit.erase(unit.begin());
+    }
+    auto& first = units.front();
+    std::size_t sequence = 0;
+    std::size_t afterPicture = 0;
+    bool picture = false;
+    for (std::size_t index = 0; index + 3 < first.size(); ++index) {
+        if (first[index] != 0 || first[index + 1] != 0 || first[index + 2] != 1) continue;
+        const auto type = first[index + 3] & 0x1fu;
+        if (picture) {
+            afterPicture = first[index - 1] == 0 ? index - 1 : index;
+            break;
+        }
+        if (type == 7 && sequence == 0) sequence = index;
+        if (type == 8 && sequence != 0) picture = true;
+        index += 2;
+    }
+    check(sequence != 0 && afterPicture > sequence, "the first access unit has no SPS and PPS before another NAL");
+    const std::vector<std::uint8_t> delimiter(first.begin(), first.begin() + static_cast<std::ptrdiff_t>(first[sequence - 1] == 0 ? sequence - 1 : sequence));
+    check(delimiter.size() >= 4 && delimiter[2] == 1 && !readsAsOneLengthPrefix(delimiter), "the access unit delimiter is not an unambiguous unit with a three-byte start code");
+    std::vector<std::uint8_t> parameters(first.begin() + static_cast<std::ptrdiff_t>(sequence), first.begin() + static_cast<std::ptrdiff_t>(afterPicture));
+    first.erase(first.begin(), first.begin() + static_cast<std::ptrdiff_t>(afterPicture));
+    if (first[2] == 0) first.erase(first.begin());
+    const std::size_t padded = 4 + ((std::size_t{1} << 8u) | parameters[3]);
+    check(parameters.size() < padded, "the parameter sets are too long to pad");
+    parameters.resize(padded, 0);
+    check(readsAsOneLengthPrefix(parameters), "the padded parameter sets do not read as one length-prefixed NAL");
+    units.insert(units.begin(), {delimiter, parameters});
+    decodeInOrder(units);
+}
+
 std::uint64_t createDecoder(std::uint32_t codec, std::uint32_t profile) {
     const DecoderConfigInfo config{sizeof(DecoderConfigInfo), 1, codec, profile, 0, static_cast<std::int32_t>(Width), static_cast<std::int32_t>(Height), 4, 1};
     DecoderMemoryInfo memory{sizeof(DecoderMemoryInfo)};
@@ -804,6 +901,8 @@ int main() {
         testFailures();
         testDecode(false);
         testDecode(true);
+        testLengthPrefixLooksLikeStartCode();
+        testStartCodeLooksLikeLengthPrefix();
         testDecode(false, true);
         const auto hevc = hevcUnits(HevcStream.data(), HevcStream.size());
         testClip(CodecHevc, 1, hevc, HevcHashes);

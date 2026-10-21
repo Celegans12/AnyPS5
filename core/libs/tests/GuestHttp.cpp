@@ -50,6 +50,27 @@ static void Require(bool value) { if (!value) std::abort(); }
 
 static bool Equal(const char* left, const char* right) { return std::strcmp(left, right) == 0; }
 
+static void CheckUriParseCharacters() {
+    char pool[256];
+    SceHttpUriElement element{};
+    Require(sceHttpUriParse(&element, "HtTpS://AZaz09-._/path", pool, nullptr, sizeof(pool)) == 0);
+    Require(Equal(element.scheme, "HtTpS") && Equal(element.hostname, "AZaz09-._") && element.port == 443);
+    Require(sceHttpUriParse(&element, "aZ09+.-://host/", pool, nullptr, sizeof(pool)) == 0);
+    Require(Equal(element.scheme, "aZ09+.-") && element.port == 0);
+    for (unsigned value = 128; value <= 255; ++value) {
+        const std::string byte(1, static_cast<char>(value));
+        const std::string urls[] = {
+            "http://" + byte + "/", "http://[" + byte + "]/", byte + "://host/",
+            "a" + byte + "://host/", "http://host:" + byte + "/"
+        };
+        for (const auto& url : urls) {
+            std::size_t required = 0;
+            Require(sceHttpUriParse(nullptr, url.c_str(), nullptr, &required, 0) == static_cast<int>(0x80433060));
+            Require(sceHttpUriParse(&element, url.c_str(), pool, nullptr, sizeof(pool)) == static_cast<int>(0x80433060));
+        }
+    }
+}
+
 static void CheckUriEscapeBytes() {
     constexpr char unreserved[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
     constexpr char hex[] = "0123456789ABCDEF";
@@ -163,13 +184,22 @@ int main() {
     Require(sceHttpUriEscape(escaped, nullptr, sizeof(escaped), "a b/~\xC3\xA9") == 0);
     Require(Equal(escaped, "a%20b%2F~%C3%A9"));
     Require(sceHttpUriEscape(escaped, nullptr, sizeof(escaped), nullptr) == invalidValue);
-    CheckUriEscapeBytes();
-#ifdef _WIN32
     const std::string previousCtype = std::setlocale(LC_CTYPE, nullptr);
+    Require(std::setlocale(LC_CTYPE, "C") != nullptr);
+    CheckUriEscapeBytes();
+    CheckUriParseCharacters();
+#ifdef _WIN32
     Require(std::setlocale(LC_CTYPE, ".1252") != nullptr);
     CheckUriEscapeBytes();
-    Require(std::setlocale(LC_CTYPE, previousCtype.c_str()) != nullptr);
+    CheckUriParseCharacters();
+#else
+    for (const char* locale : {"en_US.ISO8859-1", "en_US.iso88591", "en_US.UTF-8"}) {
+        if (!std::setlocale(LC_CTYPE, locale)) continue;
+        CheckUriEscapeBytes();
+        CheckUriParseCharacters();
+    }
 #endif
+    Require(std::setlocale(LC_CTYPE, previousCtype.c_str()) != nullptr);
 
     constexpr const char* unescapeCases[][2] = {
         {"", ""}, {"plain+text", "plain+text"}, {"a%20b%2F~%c3%a9", "a b/~\xC3\xA9"},

@@ -66,9 +66,28 @@ SECTION = re.compile(r"^###(?!#)\s*(.+?)\s*$", re.M)
 KEY = re.compile(r"^( *)([A-Za-z0-9_-]+|'[^']*'|\"[^\"]*\"):(?:\s+(.*?))?\s*$")
 
 
+
 def git(*args, text=True):
-    output = subprocess.run(["git", "-c", "core.quotePath=false", *args], capture_output=True, check=True).stdout
+    try:
+        result = subprocess.run(
+            ["git", "-c", "core.quotePath=false", *args],
+            capture_output=True,
+            check=True,
+        )
+    except subprocess.CalledProcessError as error:
+        message = error.stderr.decode("utf-8", errors="replace").strip()
+        print(
+            f"Git command failed: {message or 'unknown Git error'}",
+            file=sys.stderr,
+        )
+        raise SystemExit(2) from None
+    except FileNotFoundError:
+        print("Git executable not found. Please install Git.", file=sys.stderr)
+        raise SystemExit(2) from None
+
+    output = result.stdout
     return output.decode("utf-8", errors="replace") if text else output
+
 
 
 class Check:

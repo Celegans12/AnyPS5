@@ -66,10 +66,10 @@ void Readers() {
     Throws([&] { sceSslGetSubjectName(other, certificate); });
     Throws([&] { sceSslGetNameEntryCount(other, subject); });
     Throws([&] { sceSslFreeSslCertName(other, subject); });
-    std::array<char, 16> oid{}, value{};
+    std::array<char, 32> oid{}, value{};
     length = SIZE_MAX;
     Check(sceSslGetNameEntryInfo(context, subject, 1, oid.data(), oid.size(), value.data(), value.size(), &length) == 0, "PS5 eight-argument name query failed");
-    Check(std::strcmp(oid.data(), "O") == 0 && std::strcmp(value.data(), "AnyPS5 Tests") == 0 && length == 12, "name output or full-width length changed");
+    Check(std::strcmp(oid.data(), "organizationName") == 0 && std::strcmp(value.data(), "AnyPS5 Tests") == 0 && length == 12, "name output or full-width length changed");
 
     length = SIZE_MAX;
     Check(sceSslGetPem(context, certificate, nullptr, &length) == 0 && length == std::strlen(RootPem) + 1, "PS5 PEM size query failed");

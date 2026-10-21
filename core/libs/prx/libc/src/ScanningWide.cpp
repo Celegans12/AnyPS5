@@ -427,4 +427,14 @@ int APS5_VABI swscanf_s_nid_postfix(const char16_t* buffer, const char16_t* form
     }
 }
 
+int APS5_VABI vswscanf_nid_postfix(const char16_t* buffer, const char16_t* format, VaList* args) {
+    if (buffer == nullptr || format == nullptr) return EOF;
+    return WideScanner("vswscanf", false, buffer, format, args).Run();
+}
+
+int APS5_VABI vswscanf_s_nid_postfix(const char16_t* buffer, const char16_t* format, VaList* args) {
+    if (buffer == nullptr || format == nullptr) return EOF;
+    return WideScanner("vswscanf_s", true, buffer, format, args).Run();
+}
+
 }

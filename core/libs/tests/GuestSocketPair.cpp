@@ -192,6 +192,7 @@ int main(int argc, char** argv) {
     Require(std::strcmp(received, ping) == 0);
 
     Require(fcntl_nid_postfix(pair[1], 3) == 2);
+    Require(fcntl_nid_postfix(pair[0], 1) == 0 && fcntl_nid_postfix(pair[1], 1) == 0);
     Require(fcntl_nid_postfix(pair[1], 4, 4) == 0);
     Require(fcntl_nid_postfix(pair[1], 3) == 6);
     Require(recv_nid_postfix(pair[1], received, sizeof(received), 0) == -1 && *__error_nid_postfix() == 35);
@@ -209,6 +210,7 @@ int main(int argc, char** argv) {
 
     Require(socketpair_nid_postfix(Unix, Stream | NonBlocking | CloseOnExec, 0, pair) == 0);
     Require(fcntl_nid_postfix(pair[0], 3) == 6 && fcntl_nid_postfix(pair[1], 3) == 6);
+    Require(fcntl_nid_postfix(pair[0], 1) == 1 && fcntl_nid_postfix(pair[1], 1) == 1);
     Require(recv_nid_postfix(pair[0], received, sizeof(received), 0) == -1 && *__error_nid_postfix() == 35);
     Require(Exchange(pair[1], pair[0], "wake up"));
     Require(close_nid_postfix(pair[0]) == 0 && close_nid_postfix(pair[1]) == 0);

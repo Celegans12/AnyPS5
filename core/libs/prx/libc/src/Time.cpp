@@ -587,7 +587,8 @@ GuestTm* APS5_VABI localtime_s_nid_postfix(const int64_t* timer, GuestTm* result
     const int callerError = errno;
 #ifdef _WIN32
     const std::int64_t cycles = *timer >= 0 && *timer <= HOST_LAST_SECOND ? 0 : calendarCycles(*timer, CALENDAR_CYCLE_SECONDS);
-    const std::time_t t = static_cast<std::time_t>(*timer - cycles * CALENDAR_CYCLE_SECONDS);
+    const std::int64_t offset = *timer % CALENDAR_CYCLE_SECONDS;
+    const std::time_t t = static_cast<std::time_t>(cycles == 0 ? *timer : offset < 0 ? offset + CALENDAR_CYCLE_SECONDS : offset);
     if (localtime_s(&host, &t) != 0) {
         errno = callerError;
         return nullptr;

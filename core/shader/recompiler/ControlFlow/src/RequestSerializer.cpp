@@ -5,7 +5,7 @@ namespace ShaderRecompiler {
 
 namespace {
 
-constexpr std::uint32_t CurrentVersion = 39u;
+constexpr std::uint32_t CurrentVersion = 42u;
 constexpr std::uint32_t DrawParameterBlockTag = 0x31504447u;
 constexpr std::uint32_t LocalFeatures = 22u;
 constexpr char kBase64Alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -584,6 +584,7 @@ void writeTessellationConfiguration(Writer& writer, const TessellationConfigurat
     writer.WriteU32(configuration.patchesPerGroup);
     writer.WriteU32(configuration.primitiveGroupSize);
     writer.WriteBool(configuration.breakAtInstance);
+    writer.WriteBool(configuration.mergedHull);
 }
 
 TessellationConfiguration readTessellationConfiguration(Reader& reader, std::uint32_t version, std::uint32_t local) {
@@ -600,6 +601,7 @@ TessellationConfiguration readTessellationConfiguration(Reader& reader, std::uin
     if (version >= 22u || local >= 18u) configuration.patchesPerGroup = reader.ReadU32();
     if (version >= 24u || local >= 19u) configuration.primitiveGroupSize = reader.ReadU32();
     if (version >= 24u || local >= 21u) configuration.breakAtInstance = reader.ReadBool();
+    if (version >= 39u) configuration.mergedHull = reader.ReadBool();
     return configuration;
 }
 
@@ -890,7 +892,8 @@ DeserializedRequest deserialize(std::string_view decoded, std::uint32_t version,
         }
     }
     if (version >= 36u) result.request.target.float32FlushToZero = reader.ReadBool();
-    if (version >= 39u && result.request.context.compute.has_value()) {
+    if (version >= 41u) result.request.target.float32DenormPreserve = reader.ReadBool();
+    if (version >= 42u && result.request.context.compute.has_value()) {
         const bool singleWorkgroup = reader.ReadBool();
         result.request.context.compute->singleWorkgroup = singleWorkgroup;
         if (result.compute.has_value()) result.compute->singleWorkgroup = singleWorkgroup;
@@ -942,6 +945,7 @@ std::string RequestSerializer::Serialize(const RecompileRequest& request) const 
         writer.WriteU32(request.context.vertex->depthRemapMode);
     }
     writer.WriteBool(request.target.float32FlushToZero);
+    writer.WriteBool(request.target.float32DenormPreserve);
     if (request.context.compute.has_value()) writer.WriteBool(request.context.compute->singleWorkgroup);
     // Optional trailing block (no version bump, so requests without it serialize as before): the
     // GPU-side indirect draw parameter SGPRs of a vertex stage.

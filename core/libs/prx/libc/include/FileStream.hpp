@@ -119,7 +119,8 @@ public:
         return randomDevice;
     }
 
-    bool Reopen(const std::filesystem::path& filename, const char* mode) {
+    bool Reopen(const std::filesystem::path& filename, const char* mode,
+        [[maybe_unused]] std::FILE* (*open)(const std::filesystem::path&, const std::string&) = nullptr) {
         auto* previous = GetHandle();
         _guest = {};
         guestError = false;
@@ -130,10 +131,16 @@ public:
         const int replaced = previous ? _fileno(previous) : -1;
         auto* const standard = HostStandardHandle_nid_no_patch(replaced);
         GuestFileLockForget_nid_no_patch(replaced);
-        const int kept = IsHostStandard() ? DuplicateHostDescriptor_nid_no_patch(replaced) : -1;
-        if (kept >= 0) ::_lock_file(previous);
-        _handle = ::_wfreopen(filename.c_str(), wideMode.c_str(), previous);
-        if (kept >= 0) RestoreHostStandard(previous, kept);
+        if (open && !IsHostStandard() && !filename.empty()) {
+            _handle = nullptr;
+            std::fclose(previous);
+            _handle = open(filename, mode);
+        } else {
+            const int kept = IsHostStandard() ? DuplicateHostDescriptor_nid_no_patch(replaced) : -1;
+            if (kept >= 0) ::_lock_file(previous);
+            _handle = ::_wfreopen(filename.c_str(), wideMode.c_str(), previous);
+            if (kept >= 0) RestoreHostStandard(previous, kept);
+        }
         KeepStandardHandle_nid_no_patch(replaced, standard);
 #else
         if (::fileno(previous) == 2) KeepHostStandardError_nid_no_patch();

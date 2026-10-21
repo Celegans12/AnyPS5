@@ -8,7 +8,7 @@
 
 - [sceHttpUriBuild](../../../core/libs/prx/libSceHttp/src/Uri.cpp) (libSceHttp) retains `//` for a non-opaque URI independently of the selected fields, following [shadPS4](https://github.com/shadps4-emu/shadPS4/blob/a8a70da595da2a96e0410309472ba4a7eb558144/src/core/libraries/network/http.cpp#L3551-L3558). Black Myth: Wukong builds its `Scheme` header with option 1 and expects `http://` or `https://`. Other partial field combinations follow the PS4 reference and remain unverified on PS5 hardware.
 - [sceHttpSetCookieEnabled](../../../core/libs/prx/libSceHttp/Export.cpp) - the two-argument signature and 0/1 enable values follow [VitaSDK](https://github.com/vitasdk/vita-headers/blob/master/include/psp2/net/http.h) and [shadPS4](https://github.com/shadps4-emu/shadPS4/blob/main/src/core/libraries/network/http.cpp); PPSA01521 passes 0 to disable cookies. Disabling succeeds because the offline HTTP backend has no cookie engine; enabling throws. Invalid enable values use the same error as `sceHttpSetInflateGZIPEnabled`. Like the existing offline HTTP setters, the handle is not validated; requests still fail with the network error. Console behavior is unverified
-- [sceHttpParseResponseHeader](../../../core/libs/prx/libSceHttp/Export.cpp) (libSceHttp) - signature follows [SharpProspero](https://github.com/SvenGDK/SharpProspero/blob/main/src/SharpProspero/Interop/Net/Http.cs); parsing and error codes follow [shadPS4's reverse-engineered PS4 library](https://github.com/shadps4-emu/shadPS4/blob/main/src/core/libraries/network/http.cpp), not confirmed on a PS5 title or hardware. Folded values retain their line breaks and whitespace; an empty first line starts the value scan after its line feed. A consumed byte count above `INT_MAX` throws instead of wrapping.
+- [sceHttpParseResponseHeader](../../../core/libs/prx/libSceHttp/Export.cpp) (libSceHttp) - signature follows [SharpProspero](https://github.com/SvenGDK/SharpProspero/blob/main/src/SharpProspero/Interop/Net/Http.cs); the result, value bounds and error codes follow a payload process on a PS5 (firmware 13.60). Unmeasured there: a bare carriage return, and vertical tab or form feed around the value, which are skipped as blanks before it as before. A value end above `INT_MAX` throws instead of wrapping
 - [sceHttpParseStatusLine](../../../core/libs/prx/libSceHttp/src/Parse.cpp) (libSceHttp) - behaviour and error codes follow the [shadPS4](https://github.com/shadps4-emu/shadPS4) reimplementation of the PS4 library, not confirmed on a PS5 title; unlike it, no byte past `lineLen` is read
 - [sceHttpUriMerge](../../../core/libs/prx/libSceHttp/src/Uri.cpp) (libSceHttp) - signature follows [SharpProspero](https://github.com/SvenGDK/SharpProspero/blob/main/src/SharpProspero/Interop/Net/Http.cs); validation, size formula, absolute/relative split and path join follow the disassembly-like body in [shadPS4](https://github.com/shadps4-emu/shadPS4/blob/main/src/core/libraries/network/http.cpp), not confirmed on a PS5 title or hardware. The base URL goes through our `sceHttpUriParse`, which removes dot segments from the base path, while the relative part is appended unswept; base query and fragment are dropped. The relative reference is only classified by its scheme and a leading `//`, and only references with `//` are validated; as in shadPS4, `//host/x` is returned unchanged instead of taking the base scheme, a reference with a scheme but no `//` (`mailto:x`) is joined onto the base directory, and `?q` and `#f` are appended to the base directory instead of the base path.
 - [sceHttpUriUnescape](../../../core/libs/prx/libSceHttp/src/Uri.cpp) (libSceHttp) - signature follows [SharpProspero](https://github.com/SvenGDK/SharpProspero/blob/main/src/SharpProspero/Interop/Net/Http.cs); percent decoding, invalid sequences and error codes follow [shadPS4](https://github.com/shadps4-emu/shadPS4/blob/main/src/core/libraries/network/http.cpp), not confirmed on a PS5 title or hardware. Size includes the final NUL; malformed escapes and `+` remain unchanged, and decoding runs once.
@@ -19,8 +19,59 @@
 - [sceHttpSetAuthInfoCallback](../../../core/libs/prx/libSceHttp/Export.cpp) (libSceHttp) - signature and callback type follow [shadPS4](https://github.com/shadps4-emu/shadPS4/blob/main/src/core/libraries/network/http.h) (PS4); no PS5 reference has them. The `id` is not checked, as in the other libSceHttp setters
 - [sceHttpWaitRequest](../../../core/libs/prx/libSceHttp/Export.cpp) (libSceHttp) - the timeout is assumed to be in microseconds and a negative timeout to wait without limit; the invalid-value error for a null handle or event array or a non-positive event count is assumed, not measured. No request is ever pending, so a wait returns 0 events when its timeout passes
 - [sceHttpUriCopy](../../../core/libs/prx/libSceHttp/src/Uri.cpp) (libSceHttp) - read from the disassembly of libSceHttp.sprx on firmware 13.60, not measured on a console and not compared with other emulators. The arguments are (out, src, pool, prepare, require), `prepare` before `require`, the reverse of `sceHttpUriParse`. A null source returns `ERROR_INVALID_URL`; without an output or a pool, a null `require` returns `ERROR_INVALID_VALUE`, otherwise the size is only reported. Only the scheme, hostname, path, username and password are copied, in that order, each with its terminator (a missing one becomes an empty string and takes one byte), and the port; the query, the fragment and the opaque flag stay 0. A pool that is too small clears the output and the pool and returns `ERROR_OUT_OF_MEMORY` (0x80431022, the console's out-of-size error)
+- [sceHttpAuthCacheImport](../../../core/libs/prx/libSceHttp/Export.cpp) (libSceHttp) - unknown signature
+- [sceHttpAuthCacheExport](../../../core/libs/prx/libSceHttp/Export.cpp) (libSceHttp) - unknown signature
+- [sceHttpDbgEnableProfile](../../../core/libs/prx/libSceHttp/Export.cpp) (libSceHttp) - unknown signature
+- [sceHttpDbgSetPrintf](../../../core/libs/prx/libSceHttp/Export.cpp) (libSceHttp) - unknown signature
+- [sceHttpDbgShowStat](../../../core/libs/prx/libSceHttp/Export.cpp) (libSceHttp) - unknown signature
+- [sceHttpGetMemoryPoolStats](../../../core/libs/prx/libSceHttp/Export.cpp) (libSceHttp) - unknown signature
+- [sceHttpDbgShowConnectionStat](../../../core/libs/prx/libSceHttp/Export.cpp) (libSceHttp) - unknown signature
+- [sceHttpDbgShowRequestStat](../../../core/libs/prx/libSceHttp/Export.cpp) (libSceHttp) - unknown signature
+- [sceHttpDbgShowMemoryPoolStat](../../../core/libs/prx/libSceHttp/Export.cpp) (libSceHttp) - unknown signature
+- [sceHttpDbgGetConnectionStat](../../../core/libs/prx/libSceHttp/Export.cpp) (libSceHttp) - unknown signature
+- [sceHttpDbgGetRequestStat](../../../core/libs/prx/libSceHttp/Export.cpp) (libSceHttp) - unknown signature
+- [sceHttpAbortRequestForce](../../../core/libs/prx/libSceHttp/Export.cpp) (libSceHttp) - unknown signature
+- [sceHttpAddRequestHeaderRaw](../../../core/libs/prx/libSceHttp/Export.cpp) (libSceHttp) - unknown signature
+- [sceHttpRemoveRequestHeader](../../../core/libs/prx/libSceHttp/Export.cpp) (libSceHttp) - unknown signature
+- [sceHttpGetAuthEnabled](../../../core/libs/prx/libSceHttp/Export.cpp) (libSceHttp) - unknown signature
+- [sceHttpGetAutoRedirect](../../../core/libs/prx/libSceHttp/Export.cpp) (libSceHttp) - unknown signature
+- [sceHttpTrySetNonblock](../../../core/libs/prx/libSceHttp/Export.cpp) (libSceHttp) - unknown signature
+- [sceHttpGetNonblock](../../../core/libs/prx/libSceHttp/Export.cpp) (libSceHttp) - unknown signature
+- [sceHttpTryGetNonblock](../../../core/libs/prx/libSceHttp/Export.cpp) (libSceHttp) - unknown signature
+- [sceHttpSetEpollId](../../../core/libs/prx/libSceHttp/Export.cpp) (libSceHttp) - unknown signature
+- [sceHttpGetEpollId](../../../core/libs/prx/libSceHttp/Export.cpp) (libSceHttp) - unknown signature
+- [sceHttpGetEpoll](../../../core/libs/prx/libSceHttp/Export.cpp) (libSceHttp) - unknown signature
+- [sceHttpGetCookie](../../../core/libs/prx/libSceHttp/Export.cpp) (libSceHttp) - unknown signature
+- [sceHttpGetCookieEnabled](../../../core/libs/prx/libSceHttp/Export.cpp) (libSceHttp) - unknown signature
+- [sceHttpAddCookie](../../../core/libs/prx/libSceHttp/Export.cpp) (libSceHttp) - unknown signature
+- [sceHttpSetCookieSendCallback](../../../core/libs/prx/libSceHttp/Export.cpp) (libSceHttp) - unknown signature
+- [sceHttpCookieExport](../../../core/libs/prx/libSceHttp/Export.cpp) (libSceHttp) - unknown signature
+- [sceHttpCookieImport](../../../core/libs/prx/libSceHttp/Export.cpp) (libSceHttp) - unknown signature
+- [sceHttpSetCookieTotalMaxSize](../../../core/libs/prx/libSceHttp/Export.cpp) (libSceHttp) - unknown signature
+- [sceHttpSetCookieMaxSize](../../../core/libs/prx/libSceHttp/Export.cpp) (libSceHttp) - unknown signature
+- [sceHttpSetCookieMaxNum](../../../core/libs/prx/libSceHttp/Export.cpp) (libSceHttp) - unknown signature
+- [sceHttpSetCookieMaxNumPerDomain](../../../core/libs/prx/libSceHttp/Export.cpp) (libSceHttp) - unknown signature
+- [sceHttpGetCookieStats](../../../core/libs/prx/libSceHttp/Export.cpp) (libSceHttp) - unknown signature
+- [sceHttpsEnableOptionPrivate](../../../core/libs/prx/libSceHttp/Export.cpp) (libSceHttp) - unknown signature
+- [sceHttpsDisableOptionPrivate](../../../core/libs/prx/libSceHttp/Export.cpp) (libSceHttp) - unknown signature
+- [sceHttpSetPriorityOption](../../../core/libs/prx/libSceHttp/Export.cpp) (libSceHttp) - unknown signature
+- [sceHttpSetPolicyOption](../../../core/libs/prx/libSceHttp/Export.cpp) (libSceHttp) - unknown signature
+- [sceHttpRequestGetAllHeaders](../../../core/libs/prx/libSceHttp/Export.cpp) (libSceHttp) - unknown signature
+- [sceHttpSetAcceptEncodingGZIPEnabled](../../../core/libs/prx/libSceHttp/Export.cpp) (libSceHttp) - unknown signature
+- [sceHttpGetAcceptEncodingGZIPEnabled](../../../core/libs/prx/libSceHttp/Export.cpp) (libSceHttp) - unknown signature
+- [sceHttpSetDefaultAcceptEncodingGZIPEnabled](../../../core/libs/prx/libSceHttp/Export.cpp) (libSceHttp) - unknown signature
+- [sceHttpSetProxy](../../../core/libs/prx/libSceHttp/Export.cpp) (libSceHttp) - unknown signature
+- [sceHttpSetSocketCreationCallback](../../../core/libs/prx/libSceHttp/Export.cpp) (libSceHttp) - unknown signature
+- [sceHttpSetHttp09Enabled](../../../core/libs/prx/libSceHttp/Export.cpp) (libSceHttp) - unknown signature
+- [sceHttpGetRegisteredCtxIds](../../../core/libs/prx/libSceHttp/Export.cpp) (libSceHttp) - unknown signature
+- [sceHttpGetConnectionStat](../../../core/libs/prx/libSceHttp/Export.cpp) (libSceHttp) - unknown signature
+- [sceHttpAddQuery](../../../core/libs/prx/libSceHttp/Export.cpp) (libSceHttp) - unknown signature
+- [sceHttpSetDelayBuildRequestEnabled](../../../core/libs/prx/libSceHttp/Export.cpp) (libSceHttp) - unknown signature
+- [sceHttpCacheRedirectedConnectionEnabled](../../../core/libs/prx/libSceHttp/Export.cpp) (libSceHttp) - unknown signature
 
 ### Functional
+
+- [sceHttpUriParse, sceHttpUriBuild, sceHttpUriMerge](../../../core/libs/prx/libSceHttp/src/Uri.cpp) - console behavior for non-ASCII scheme and hostname bytes remains unmeasured. ASCII character classification and scheme case folding follow [RFC 3986 sections 3.1 and 3.2](https://www.rfc-editor.org/rfc/rfc3986#section-3.1), independently of the host locale; parsing retains the existing C-locale rejection of those bytes.
 
 - [sceHttpUriEscape](../../../core/libs/prx/libSceHttp/src/Uri.cpp) escapes every byte except the ASCII unreserved set in [RFC 3986 section 2.3](https://www.rfc-editor.org/rfc/rfc3986#section-2.3), independently of the host locale. Console behaviour for non-ASCII input remains unmeasured.
 

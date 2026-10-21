@@ -64,6 +64,8 @@ int APS5_VABI ungetc_nid_postfix(int, FileStream*);
 char* APS5_VABI fgets_nid_postfix(char*, int, FileStream*);
 int APS5_VABI feof_nid_postfix(FileStream*);
 int APS5_VABI ferror_nid_postfix(FileStream*);
+int APS5_VABI feof_unlocked_nid_postfix(FileStream*);
+int APS5_VABI ferror_unlocked_nid_postfix(FileStream*);
 int APS5_VABI fileno_nid_postfix(FileStream*);
 void APS5_VABI clearerr_nid_postfix(FileStream*);
 void APS5_VABI rewind_nid_postfix(FileStream*);
@@ -167,6 +169,9 @@ static void CheckUnlockedStreams() {
     { std::ofstream seed(filename, std::ios::binary); seed.put('A'); Require(seed.good()); }
     FileStream readOnly(std::fopen(filename.c_str(), "rb"));
     Require(putc_unlocked_nid_postfix('X', &readOnly) == EOF && (readOnly.GuestState().flags & 0x40));
+    Require(ferror_unlocked_nid_postfix(&readOnly) == 1 && feof_unlocked_nid_postfix(&readOnly) == 0);
+    clearerr_unlocked_nid_postfix(&readOnly);
+    Require(ferror_unlocked_nid_postfix(&readOnly) == 0);
     readOnly.Close();
     Require(CheckFileBytes(filename, "A", "rb", false));
     Require(std::filesystem::remove(filename));
@@ -174,6 +179,17 @@ static void CheckUnlockedStreams() {
 
 static void CheckUnlockedQueries() {
     FileStream stream(std::tmpfile());
+    Require(feof_unlocked_nid_postfix(&stream) == 0 && ferror_unlocked_nid_postfix(&stream) == 0);
+    Require(std::fgetc(stream.GetHandle()) == EOF);
+    Require(feof_unlocked_nid_postfix(&stream) == 1 && ferror_unlocked_nid_postfix(&stream) == 0);
+    Require((stream.GuestState().flags & 0x60) == 0x20);
+    stream.SetError();
+    Require(feof_unlocked_nid_postfix(&stream) == 1 && ferror_unlocked_nid_postfix(&stream) == 1);
+    clearerr_unlocked_nid_postfix(&stream);
+    Require(feof_unlocked_nid_postfix(&stream) == 0 && ferror_unlocked_nid_postfix(&stream) == 0);
+    Require(std::fgetc(stream.GetHandle()) == EOF && std::ungetc('Q', stream.GetHandle()) == 'Q');
+    Require(feof_unlocked_nid_postfix(&stream) == 0 && ferror_unlocked_nid_postfix(&stream) == 0);
+    Require(std::fgetc(stream.GetHandle()) == 'Q');
     Require(fputc_nid_postfix(0x7f, &stream) == 0x7f);
     std::rewind(stream.GetHandle());
     Require(fgetc_nid_postfix(&stream) == 0x7f && feof_nid_postfix(&stream) == 0);
@@ -239,7 +255,7 @@ static void CheckTryLock() {
     Require(threw);
 }
 
-static void CheckUnlockedStreamLock(bool write) {
+static void CheckUnlockedStreamLock(bool write, int (APS5_VABI *query)(FileStream*) = nullptr) {
     FileStream stream(std::tmpfile());
     Require(std::fputc('A', stream.GetHandle()) == 'A');
     std::rewind(stream.GetHandle());
@@ -260,7 +276,7 @@ static void CheckUnlockedStreamLock(bool write) {
     }
     std::thread caller([&] {
         entered = true;
-        result = write ? putc_unlocked_nid_postfix('B', &stream) : getc_unlocked_nid_postfix(&stream);
+        result = query ? query(&stream) : write ? putc_unlocked_nid_postfix('B', &stream) : getc_unlocked_nid_postfix(&stream);
         done = true;
     });
     const auto enteredDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
@@ -277,7 +293,7 @@ static void CheckUnlockedStreamLock(bool write) {
     release = true;
     owner.join();
     caller.join();
-    Require(completedWhileHeld && result == (write ? 'B' : 'A'));
+    Require(completedWhileHeld && result == (query ? 0 : write ? 'B' : 'A'));
     stream.Close();
 }
 
@@ -875,6 +891,8 @@ int main(int argc, char** argv) {
     CheckUnlockedStreams();
     CheckUnlockedStreamLock(false);
     CheckUnlockedStreamLock(true);
+    CheckUnlockedStreamLock(false, feof_unlocked_nid_postfix);
+    CheckUnlockedStreamLock(false, ferror_unlocked_nid_postfix);
     CheckTryLock();
     CheckUnlockedQueries();
     return CheckBinaryModes() ? 0 : 1;

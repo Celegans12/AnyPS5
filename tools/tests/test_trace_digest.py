@@ -128,6 +128,41 @@ class TraceDigestTests(unittest.TestCase):
         return trace_digest.digest(trace_digest.load_trace(self.trace), trace_digest.load_summary(None, self.trace),
                                    trace_digest.load_stacks(self.stacks), worst=2, top=3)
 
+    def json_output(self, trace, *arguments):
+        result = subprocess.run([sys.executable, trace_digest.__file__, str(trace), "--json", *arguments],
+                                capture_output=True, text=True, encoding="utf-8", timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_utf8_bom_plain_and_compressed_traces_preserve_the_digest(self):
+        events = [dict(event, args={"name": "worker \u03a9"}) if event["name"] == "thread_name" and event["tid"] == 1
+                  else event for event in EVENTS]
+        text = json.dumps({"traceEvents": events}, ensure_ascii=False)
+        self.trace.write_bytes(gzip.compress(text.encode("utf-8")))
+        expected = self.json_output(self.trace)
+        for trace in (self.trace, self.trace.with_suffix("")):
+            for encoding in ("utf-8", "utf-8-sig"):
+                with self.subTest(trace=trace.name, encoding=encoding):
+                    data = text.encode(encoding)
+                    trace.write_bytes(gzip.compress(data) if trace.suffix == ".gz" else data)
+                    self.assertEqual(self.json_output(trace), expected)
+
+    def test_utf8_bom_summary_preserves_the_digest(self):
+        expected = self.json_output(self.trace)
+        summary = self.trace.with_name("aps5-summary.jsonl")
+        summary.write_text(summary.read_text(encoding="utf-8"), encoding="utf-8-sig")
+        self.assertEqual(self.json_output(self.trace), expected)
+
+    def test_utf8_bom_stacks_preserve_comments_and_frame_names(self):
+        for text in (STACKS, "root;module\u03a9+0x1 2\n"):
+            with self.subTest(comments=text.startswith("#")):
+                self.stacks.write_text(text, encoding="utf-8")
+                expected = self.json_output(self.trace, "--stacks", str(self.stacks))
+                expected_stacks = trace_digest.load_stacks(self.stacks)
+                self.stacks.write_text(text, encoding="utf-8-sig")
+                self.assertEqual(self.json_output(self.trace, "--stacks", str(self.stacks)), expected)
+                self.assertEqual(trace_digest.load_stacks(self.stacks), expected_stacks)
+
     def test_summary_is_the_line_of_this_trace(self):
         self.assertEqual(self.result()["summary"]["trace"], "aps5-trace-abc-7.json.gz")
 
@@ -519,6 +554,36 @@ class TraceDigestTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, 2)
         self.assertIn("summary file not found", error.getvalue())
 
+    def test_thread_filter_keeps_frame_bounds_and_capture_summary(self):
+        command = [sys.executable, trace_digest.__file__, str(self.trace)]
+        result = subprocess.run([*command, "--thread", "queue worker 0x0", "--json"], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["frames"], 3)
+        self.assertEqual(report["summary"], SUMMARY)
+        self.assertEqual(report["thread_filter"], ["queue worker 0x0"])
+        self.assertEqual([thread["thread"] for thread in report["threads"]], ["queue worker 0x0"])
+        self.assertTrue(all("Present" not in entry["name"] for entry in report["top_slices_ms_per_frame"]))
+        self.assertTrue(all(wait["thread"] == "queue worker 0x0" for wait in report["longest_waits"]))
+        result = subprocess.run([*command, "--thread", "presenter", "--thread", "queue worker 0x0", "--json"],
+                                capture_output=True, text=True)
+        unfiltered = trace_digest.digest(trace_digest.load_trace(self.trace), SUMMARY)
+        report = json.loads(result.stdout)
+        del report["thread_filter"]
+        self.assertEqual(report, unfiltered)
+        result = subprocess.run([*command, "--thread", "presenter"], capture_output=True, text=True)
+        self.assertIn("Thread filter:", result.stdout)
+        self.assertIn("capture-wide", result.stdout)
+        result = subprocess.run([*command, "--thread", "misspelled"], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("unknown thread", result.stderr)
+        self.assertEqual(result.stdout, "")
+        result = subprocess.run([sys.executable, trace_digest.__file__, str(self.trace.with_suffix(".jsonl")),
+                                 "--thread", "presenter"], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("event trace", result.stderr)
+
+
 
 def interval_line(start, end, p99, gpu_ms, **changes):
     line = dict(SUMMARY, window={"spec": "summary_every 30", "first_present": 0, "ms": (end - start) * 1000.0}, interval_start_s=start, interval_end_s=end,
@@ -540,6 +605,14 @@ class IntervalDigestTests(unittest.TestCase):
 
     def test_window_lines_are_skipped(self):
         self.assertEqual(len(trace_digest.load_intervals(self.path)), 4)
+
+    def test_utf8_bom_intervals_preserve_the_command_line_digest(self):
+        expected = trace_digest.digest_intervals(trace_digest.load_intervals(self.path))
+        self.path.write_text(self.path.read_text(encoding="utf-8"), encoding="utf-8-sig")
+        result = subprocess.run([sys.executable, trace_digest.__file__, str(self.path), "--json"],
+                                capture_output=True, text=True, encoding="utf-8", timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), expected)
 
     def test_rows(self):
         result = trace_digest.digest_intervals(trace_digest.load_intervals(self.path))
@@ -627,6 +700,29 @@ class IntervalDigestTests(unittest.TestCase):
                 self.assertTrue(all(line.count("|") == 11 for line in rows), rows)
                 cells = [cell.strip() for cell in rows[2].split("|")[1:-1]]
                 self.assertEqual(cells, ["1", "0-30", "1800", "16.6", "18.0", "20.0", "25.0", "5.0", "50 %", escaped + " 7.5"])
+
+    def test_bom_encoded_stacks_load(self):
+        with tempfile.TemporaryDirectory() as directory:
+            stacks_file = Path(directory) / "stacks.txt"
+            stacks_file.write_bytes(b"\xef\xbb\xbf# samples=1 depth=1 truncated=0\nmodule.prx+0x10 1\n")
+            loaded = trace_digest.load_stacks(stacks_file)
+            self.assertEqual(loaded, [(["module.prx+0x10"], 1)])
+
+    def test_bom_encoded_intervals_load(self):
+        with tempfile.TemporaryDirectory() as directory:
+            intervals_file = Path(directory) / "intervals.jsonl"
+            intervals_file.write_bytes(b"\xef\xbb\xbf" + json.dumps({"interval_start_s": 0.0, "interval_end_s": 10.0, "presents": 600}).encode("utf-8") + b"\n")
+            loaded = trace_digest.load_intervals(intervals_file)
+            self.assertEqual(len(loaded), 1)
+            self.assertEqual(loaded[0]["interval_start_s"], 0.0)
+
+    def test_bom_encoded_summary_loads(self):
+        with tempfile.TemporaryDirectory() as directory:
+            summary_file = Path(directory) / "aps5-summary.jsonl"
+            summary_file.write_bytes(b"\xef\xbb\xbf" + json.dumps(SUMMARY).encode("utf-8") + b"\n")
+            loaded = trace_digest.load_summary(str(summary_file), SUMMARY["trace"])
+            self.assertEqual(loaded["commit"], SUMMARY["commit"])
+
 
 if __name__ == "__main__":
     unittest.main()

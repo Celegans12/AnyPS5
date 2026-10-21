@@ -249,6 +249,57 @@ void CheckRelativeJumpTables() {
     nonPadding.back() = 0x55;
     Require(Relinker::FindTrailingRelativeJumpTable(nonPadding) == nonPadding.size(), "Table followed by non-padding bytes was accepted");
 
+    Bytes codeAfter = text;
+    codeAfter.resize(48, 0xcc);
+    codeAfter[32] = 0x55;
+    codeAfter[33] = 0x5d;
+    codeAfter[34] = 0xc3;
+    std::size_t tableEnd = 0;
+    Require(Relinker::FindTrailingRelativeJumpTable(codeAfter, TextAddress, &tableEnd) == tableOffset && tableEnd == 32, "Table padded to 16 bytes before more code was not found");
+    const std::vector<std::pair<VirtualAddress, VirtualAddress>> codeAfterFunctions{{TextAddress, TextAddress + 9}, {TextAddress + codeAfter.size(), TextAddress + codeAfter.size() + 8}};
+    const auto codeAfterTables = Relinker::FindRelativeJumpTables(codeAfter, TextAddress, codeAfterFunctions);
+    Require(codeAfterTables.size() == 1 && codeAfterTables[0].Begin == TextAddress + tableOffset && codeAfterTables[0].End == TextAddress + 32, "Table before more code did not end at its padding");
+
+    std::size_t shiftedEnd = 0;
+    Require(Relinker::FindTrailingRelativeJumpTable(nonPadding, TextAddress + 1, &shiftedEnd) == tableOffset && shiftedEnd == 31, "Table boundary ignored the code address");
+    const auto shifted = Relinker::FindRelativeJumpTables(nonPadding, TextAddress + 1, {{TextAddress + 1, TextAddress + 10}, {TextAddress + 33, TextAddress + 41}});
+    Require(shifted.size() == 1 && shifted[0].Begin == TextAddress + 17 && shifted[0].End == TextAddress + 32, "Function address was not passed to the table search");
+    Require(Relinker::FindTrailingRelativeJumpTable(nonPadding, TextAddress + 8) == tableOffset, "Table ending on a 16-byte boundary was rejected");
+
+    Bytes padded = text;
+    padded.resize(48, 0xcc);
+    const auto paddedTables = Relinker::FindRelativeJumpTables(padded, TextAddress, {{TextAddress, TextAddress + 9}, {TextAddress + 48, TextAddress + 56}});
+    Require(paddedTables.size() == 1 && paddedTables[0].End == TextAddress + 48, "Padding to the end of the range was cut at the boundary");
+
+    Bytes nopAtRangeEnd = text;
+    const std::uint8_t fourByteNop[]{0x0f, 0x1f, 0x40, 0x00};
+    std::memcpy(nopAtRangeEnd.data() + 28, fourByteNop, sizeof(fourByteNop));
+    const auto cut = std::span<const std::uint8_t>(nopAtRangeEnd).first(31);
+    Require(Relinker::FindTrailingRelativeJumpTable(cut) == cut.size(), "Padding check read past the inspected range");
+
+    Bytes longNops = text;
+    longNops.resize(48);
+    const std::uint8_t fifteenByteNop[]{0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x2e, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00};
+    const std::uint8_t nineByteNop[]{0x66, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00};
+    std::memcpy(longNops.data() + 24, fifteenByteNop, sizeof(fifteenByteNop));
+    std::memcpy(longNops.data() + 39, nineByteNop, sizeof(nineByteNop));
+    std::size_t longNopsEnd = 0;
+    Require(Relinker::FindTrailingRelativeJumpTable(longNops, TextAddress, &longNopsEnd) == tableOffset && longNopsEnd == 48, "Table followed by a NOP across the boundary was not found");
+    Bytes longNopsCodeAfter = longNops;
+    longNopsCodeAfter.resize(64, 0xcc);
+    longNopsCodeAfter[48] = 0x55;
+    longNopsCodeAfter[49] = 0x5d;
+    longNopsCodeAfter[50] = 0xc3;
+    Require(Relinker::FindTrailingRelativeJumpTable(longNopsCodeAfter, TextAddress) == longNopsCodeAfter.size(), "Table ending inside a NOP was accepted");
+
+    Bytes cutShort = text;
+    cutShort.resize(56, 0xcc);
+    const std::int32_t cutShortTargets[]{-16, -7, -6, -5, 0x20, 0x20};
+    std::memcpy(cutShort.data() + tableOffset, cutShortTargets, sizeof(cutShortTargets));
+    cutShort[48] = 0x55;
+    cutShort[49] = 0x5d;
+    cutShort[50] = 0xc3;
+    Require(Relinker::FindRelativeJumpTables(cutShort, TextAddress, {{TextAddress, TextAddress + cutShort.size()}}).empty(), "Table followed by more of its function was accepted");
 }
 
 }
