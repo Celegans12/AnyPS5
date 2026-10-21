@@ -403,6 +403,8 @@ struct VulkanDevice::State {
     // Graphics family queue index 2 for the async compute lane (Recorder lanes, APS5_ASYNC_LANE).
     VkQueue asyncQueue = VK_NULL_HANDLE;
     bool asyncQueueWanted = false;
+    std::uint32_t asyncFamily = VK_QUEUE_FAMILY_IGNORED;
+    VkCommandPool asyncPool = VK_NULL_HANDLE;
     std::uint32_t settleFamily = 0;
     VkCommandPool settlePool = VK_NULL_HANDLE;
     std::mutex settleQueueMutex;
@@ -867,6 +869,7 @@ struct VulkanDevice::State {
                 destroyPool(device, pool, nullptr);
             }
             if (settlePool != VK_NULL_HANDLE) destroyPool(device, settlePool, nullptr);
+            if (asyncPool != VK_NULL_HANDLE) destroyPool(device, asyncPool, nullptr);
             destroyDevice(device, nullptr);
         }
         if (instance != VK_NULL_HANDLE) {
@@ -1593,7 +1596,13 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             queueInfo.pQueuePriorities = priorities;
             settleQueue = true;
             settleIndex = 1;
-            if (Graphics::Recorder::AsyncLaneRing() != 0 && queues[family].queueCount >= 3 && !compileOnly) {
+            const char* graphicsFamily = std::getenv("APS5_LANE_GRAPHICS_FAMILY");
+            if (Graphics::Recorder::AsyncLaneRing() != 0 && !compileOnly && (graphicsFamily == nullptr || std::string_view(graphicsFamily) != "1")) {
+                for (std::uint32_t i = 0; i < families && state->asyncFamily == VK_QUEUE_FAMILY_IGNORED; ++i) {
+                    if (i != family && queues[i].queueCount != 0 && (queues[i].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0 && (queues[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) == 0) state->asyncFamily = i;
+                }
+            }
+            if (Graphics::Recorder::AsyncLaneRing() != 0 && state->asyncFamily == VK_QUEUE_FAMILY_IGNORED && queues[family].queueCount >= 3 && !compileOnly) {
                 queueInfo.queueCount = 3;
                 state->asyncQueueWanted = true;
             }
@@ -1640,7 +1649,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     // Guest shaders routinely read past descriptor ranges; robust access turns that into zeros
     // instead of a GPU fault that loses the device.
     enabled.robustBufferAccess = available.robustBufferAccess;
-    VkDeviceQueueCreateInfo queueInfos[3]{queueInfo, {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}, {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}};
+    VkDeviceQueueCreateInfo queueInfos[4]{queueInfo, {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}, {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}, {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}};
     if (available.sparseBinding && state->dmaBufImport) {
         std::uint32_t families = 0;
         auto getFamilies = state->InstanceFunction<PFN_vkGetPhysicalDeviceQueueFamilyProperties>("vkGetPhysicalDeviceQueueFamilyProperties");
@@ -1682,6 +1691,19 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             settleInfo.queueFamilyIndex = settleFamily;
             settleInfo.queueCount = 1;
             settleInfo.pQueuePriorities = &priority;
+        }
+    }
+    if (state->asyncFamily != VK_QUEUE_FAMILY_IGNORED) {
+        bool shared = false;
+        for (std::uint32_t i = 0; i < deviceInfo.queueCreateInfoCount; ++i) shared = shared || queueInfos[i].queueFamilyIndex == state->asyncFamily;
+        if (shared) {
+            state->asyncFamily = VK_QUEUE_FAMILY_IGNORED;
+        } else {
+            auto& asyncInfo = queueInfos[deviceInfo.queueCreateInfoCount++];
+            asyncInfo = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+            asyncInfo.queueFamilyIndex = state->asyncFamily;
+            asyncInfo.queueCount = 1;
+            asyncInfo.pQueuePriorities = &priority;
         }
     }
     // Indirect draw records with a non-zero first instance, and several records per call.
@@ -1948,6 +1970,29 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         deviceInfo.enabledExtensionCount = static_cast<std::uint32_t>(deviceExtensions.size());
         deviceInfo.ppEnabledExtensionNames = deviceExtensions.data();
     }
+    VkPhysicalDeviceDiagnosticsConfigFeaturesNV diagnosticsFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DIAGNOSTICS_CONFIG_FEATURES_NV};
+    VkDeviceDiagnosticsConfigCreateInfoNV diagnosticsConfig{VK_STRUCTURE_TYPE_DEVICE_DIAGNOSTICS_CONFIG_CREATE_INFO_NV};
+    if (const char* diagnostics = std::getenv("APS5_NV_DIAGNOSTICS"); diagnostics != nullptr && std::string_view(diagnostics) == "1") {
+        if (hasExtension(VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME)) {
+            VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &diagnosticsFeatures};
+            state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(selected, &features);
+        }
+        if (diagnosticsFeatures.diagnosticsConfig == VK_TRUE) {
+            diagnosticsFeatures = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DIAGNOSTICS_CONFIG_FEATURES_NV};
+            diagnosticsFeatures.diagnosticsConfig = VK_TRUE;
+            diagnosticsConfig.flags = VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_SHADER_DEBUG_INFO_BIT_NV | VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_RESOURCE_TRACKING_BIT_NV | VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_AUTOMATIC_CHECKPOINTS_BIT_NV | VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_SHADER_ERROR_REPORTING_BIT_NV;
+            deviceExtensions.push_back(VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME);
+            if (!checkpoints && hasExtension(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME)) deviceExtensions.push_back(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+            deviceInfo.enabledExtensionCount = static_cast<std::uint32_t>(deviceExtensions.size());
+            deviceInfo.ppEnabledExtensionNames = deviceExtensions.data();
+            diagnosticsConfig.pNext = byteFeatures.pNext;
+            diagnosticsFeatures.pNext = &diagnosticsConfig;
+            byteFeatures.pNext = &diagnosticsFeatures;
+            std::fprintf(stderr, "[gpu] APS5_NV_DIAGNOSTICS: enabling VK_NV_device_diagnostics_config (shader debug info, resource tracking, automatic checkpoints, shader error reporting)\n");
+        } else {
+            std::fprintf(stderr, "[gpu] APS5_NV_DIAGNOSTICS: the device does not support VK_NV_device_diagnostics_config\n");
+        }
+    }
     bdaFeatures.pNext = &byteFeatures;
     VkPhysicalDeviceRobustness2FeaturesEXT robustness2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
     if (hasExtension(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME)) {
@@ -2015,14 +2060,20 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, family, 0, &state->queue);
     state->queueFamily = family;
     if (state->asyncQueueWanted) state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, family, 2, &state->asyncQueue);
+    if (state->asyncFamily != VK_QUEUE_FAMILY_IGNORED) {
+        state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, state->asyncFamily, 0, &state->asyncQueue);
+        state->deviceProc = MemoryStats::ShareBuffersProc(state->device, state->deviceProc, family, state->asyncFamily);
+        std::fprintf(stderr, "[gpu] async compute lane: queue family %u (compute only; APS5_LANE_GRAPHICS_FAMILY=1 uses a third graphics-family queue); buffers are created CONCURRENT across families %u and %u\n", state->asyncFamily, family, state->asyncFamily);
+    }
     if (settleQueue) {
         state->settleFamily = settleFamily;
         state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, settleFamily, settleIndex, &state->settleQueue);
     }
     if (state->sparseFamily != VK_QUEUE_FAMILY_IGNORED) state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, state->sparseFamily, 0, &state->sparseQueue);
     if (checkpoints) {
-        state->checkpointMarker = state->DeviceFunction<PFN_vkCmdSetCheckpointNV>("vkCmdSetCheckpointNV");
-        Graphics::Recorder::SetCheckpointFunction(state->checkpointMarker);
+        const auto marker = state->DeviceFunction<PFN_vkCmdSetCheckpointNV>("vkCmdSetCheckpointNV");
+        if (const std::string_view mode = std::getenv("APS5_GPU_CHECKPOINTS"); mode != "batch" && mode != "batch+async") state->checkpointMarker = marker;
+        Graphics::Recorder::SetCheckpointFunction(marker);
     }
     if (deviceFault || checkpoints) {
         const auto faultInfo = deviceFault ? state->DeviceFunction<PFN_vkGetDeviceFaultInfoEXT>("vkGetDeviceFaultInfoEXT") : nullptr;
@@ -2045,6 +2096,11 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         VkCommandPoolCreateInfo settlePoolInfo = poolInfo;
         settlePoolInfo.queueFamilyIndex = state->settleFamily;
         check(state->DeviceFunction<PFN_vkCreateCommandPool>("vkCreateCommandPool")(state->device, &settlePoolInfo, nullptr, &state->settlePool), "vkCreateCommandPool settle");
+    }
+    if (state->asyncFamily != VK_QUEUE_FAMILY_IGNORED) {
+        VkCommandPoolCreateInfo asyncPoolInfo = poolInfo;
+        asyncPoolInfo.queueFamilyIndex = state->asyncFamily;
+        check(state->DeviceFunction<PFN_vkCreateCommandPool>("vkCreateCommandPool")(state->device, &asyncPoolInfo, nullptr, &state->asyncPool), "vkCreateCommandPool async lane");
     }
     static const bool procTable = std::getenv("APS5_NO_PROC_TABLE") == nullptr;
     if (procTable) {
@@ -4087,6 +4143,7 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.sparseQueueMutex = &state->sparseQueueMutex;
     context.settleQueue = state->settlePool != VK_NULL_HANDLE ? state->settleQueue : VK_NULL_HANDLE;
     context.asyncQueue = state->asyncQueue;
+    context.asyncPool = state->asyncPool;
     context.settlePool = state->settlePool;
     context.settleFamily = state->settleFamily;
     context.settleQueueMutex = &state->settleQueueMutex;
@@ -5157,6 +5214,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     const auto overlapQueue = Graphics::Recorder::TakeDispatchOrder(unordered);
     const auto* groupLimit = state->properties.limits.maxComputeWorkGroupCount;
     // APS5_NO_LANE_OVERLAP=1 (diagnostic, an APS5_AB switch): no dispatch of the async lane (lane 1) overlaps.
+    if (Graphics::Recorder::LaneOwnFamily() && Graphics::Recorder::ThreadLane() == 1) require(!record.shader->program->bindlessHeap && resources.SampledTextures().empty() && resources.StorageImages().empty(), "a dispatch that binds images was recorded into the async lane, whose compute-family queue does not own the images");
     const bool laneOverlap = !recorder.AsyncLaneActive() || Graphics::Recorder::ThreadLane() == 0 || !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoLaneOverlap);
     const bool overlapCapable = laneOverlap && overlapQueue != 0 && Graphics::Recorder::DispatchOverlapEnabled() && arguments == 0 && argumentImport == nullptr && record.shader->program->workgroupMemoryDwords == 0 && (state->checkpointMarker == nullptr || CheckpointsInRuns()) && record.x <= groupLimit[0] && record.y <= groupLimit[1] && record.z <= groupLimit[2] && (Graphics::Recorder::StagedOverlapEnabled() || !resources.HasGpuCopies());
     if (timer.profile && overlapQueue != 0) {
@@ -5352,6 +5410,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     }
     const auto gpuTiming = recorder.BeginGpuTiming(record.programAddress != 0 ? record.programAddress : record.shader->program->variantId);
     if (state->checkpointMarker != nullptr) state->checkpointMarker(commands, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(record.programAddress)));
+    else if (Graphics::Recorder::ThreadLane() == 1) Graphics::Recorder::Checkpoint(commands, Graphics::Recorder::CheckpointKind::AsyncDispatch, record.programAddress);
     if (argumentImport != nullptr) {
         context.Resolved(&Graphics::DeviceFunctions::cmdDispatchIndirect, "vkCmdDispatchIndirect")(commands, indirectBuffer, indirectOffset);
     } else {

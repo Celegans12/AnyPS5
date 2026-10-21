@@ -13,6 +13,8 @@ namespace AgcDriver::MemoryStats {
 
 // DEBUG (APS5_MEM_STATS): wraps the device's vkGetDeviceProcAddr so memory, shader module, pipeline,
 // image and buffer creation is counted; returns `real` unchanged when the stats are off.
+void ShareBuffersAcross(std::uint32_t first, std::uint32_t second);
+PFN_vkGetDeviceProcAddr ShareBuffersProc(VkDevice device, PFN_vkGetDeviceProcAddr real, std::uint32_t first, std::uint32_t second);
 [[nodiscard]] PFN_vkGetDeviceProcAddr TrackDevice(VkDevice device, VkPhysicalDevice physical, const VkPhysicalDeviceMemoryProperties& memory,
                                                   PFN_vkGetDeviceProcAddr real, PFN_vkGetPhysicalDeviceMemoryProperties2 budget);
 // DEBUG (APS5_MEM_STATS + APS5_FAULT_ADDRESSES): the live and recently destroyed addressable buffers

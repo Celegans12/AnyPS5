@@ -103,6 +103,7 @@ struct AddressRegistry {
     };
     std::mutex mutex;
     std::unordered_map<std::uint64_t, Created> created;
+    std::unordered_map<std::uint64_t, std::pair<VkCommandBuffer, std::uint64_t>> writers;
     std::map<std::uint64_t, Live> live;
     std::vector<Destroyed> destroyed = std::vector<Destroyed>(65536);
     std::size_t destroyedNext = 0;
@@ -332,8 +333,19 @@ VKAPI_ATTR void VKAPI_CALL TrackedDestroyImage(VkDevice device, VkImage image, c
     entry->destroyImage(device, image, allocator);
 }
 
+std::atomic<bool> buffersShared{false};
+std::array<std::uint32_t, 2> sharedFamilies{};
+
 VKAPI_ATTR VkResult VKAPI_CALL TrackedCreateBuffer(VkDevice device, const VkBufferCreateInfo* info, const VkAllocationCallbacks* allocator, VkBuffer* buffer) {
     const auto* entry = Find(device);
+    VkBufferCreateInfo shared{};
+    if (info != nullptr && info->sharingMode == VK_SHARING_MODE_EXCLUSIVE && buffersShared.load(std::memory_order_acquire)) {
+        shared = *info;
+        shared.sharingMode = VK_SHARING_MODE_CONCURRENT;
+        shared.queueFamilyIndexCount = 2;
+        shared.pQueueFamilyIndices = sharedFamilies.data();
+        info = &shared;
+    }
     const auto result = entry->createBuffer(device, info, allocator, buffer);
     if (result == VK_SUCCESS && buffer != nullptr) {
         Bump(Get().buffers, 0, 1);
@@ -379,8 +391,11 @@ VKAPI_ATTR VkDeviceAddress VKAPI_CALL TrackedGetBufferDeviceAddress(VkDevice dev
     return address;
 }
 
+void CheckDestroyedWriter(VkBuffer buffer);
+
 VKAPI_ATTR void VKAPI_CALL TrackedDestroyBuffer(VkDevice device, VkBuffer buffer, const VkAllocationCallbacks* allocator) {
     const auto* entry = Find(device);
+    if (buffer != VK_NULL_HANDLE && FaultAddressesTracked()) CheckDestroyedWriter(buffer);
     if (buffer != VK_NULL_HANDLE) {
         Bump(Get().buffers, 0, -1);
         std::lock_guard lock(Get().objectMutex);
@@ -426,8 +441,43 @@ void ReportWriteCheck(const char* call, const char* problem, VkBuffer buffer, Vk
                  static_cast<unsigned long long>(Graphics::Recorder::CurrentWriteOrigin()), packet.opcode, packet.queue, stack.c_str());
 }
 
-void CheckBufferWrite(const char* call, VkBuffer buffer, VkDeviceSize offset, VkDeviceSize bytes) {
+std::atomic<std::uint64_t> destroyedWhilePending{0};
+
+void CheckDestroyedWriter(VkBuffer buffer) {
+    std::pair<VkCommandBuffer, std::uint64_t> writer{VK_NULL_HANDLE, 0};
+    {
+        auto& registry = Addresses();
+        std::lock_guard lock(registry.mutex);
+        const auto found = registry.writers.find(HandleKey(buffer));
+        if (found == registry.writers.end()) return;
+        writer = found->second;
+        registry.writers.erase(found);
+    }
+    int lane = 0;
+    if (!Graphics::Recorder::CommandBufferPending(writer.first, writer.second, &lane)) return;
+    const auto count = destroyedWhilePending.fetch_add(1, std::memory_order_relaxed);
+    if (count >= 64u) return;
+    unsigned long long frames[12] = {};
+    const auto captured = GuestMemory::CaptureCallerOffsets(std::span<unsigned long long>(frames, 12), 1);
+    std::string stack;
+    char part[32];
+    for (std::size_t i = 0; i < captured; ++i) {
+        std::snprintf(part, sizeof(part), " +0x%llx", frames[i]);
+        stack += part;
+    }
+    const auto packet = GuestMemory::CurrentPacket();
+    std::fprintf(stderr, "[destroy-check] vkDestroyBuffer 0x%llx while a recorded batch of lane %d that writes it is open or running (command buffer 0x%llx); packet 0x%x queue 0x%x, thread lane %d; libSceAgcDriver.prx%s\n", static_cast<unsigned long long>(HandleKey(buffer)), lane, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(writer.first)), packet.opcode, packet.queue, Graphics::Recorder::ThreadLane(), stack.c_str());
+}
+
+void CheckBufferWrite(const char* call, VkBuffer buffer, VkDeviceSize offset, VkDeviceSize bytes, VkCommandBuffer commands = VK_NULL_HANDLE) {
     writeChecks.fetch_add(1, std::memory_order_relaxed);
+    if (commands != VK_NULL_HANDLE && buffer != VK_NULL_HANDLE && Graphics::Recorder::PendingCommandsTracked()) {
+        if (const auto generation = Graphics::Recorder::CommandBufferGeneration(commands); generation != 0) {
+            auto& registry = Addresses();
+            std::lock_guard lock(registry.mutex);
+            registry.writers[HandleKey(buffer)] = {commands, generation};
+        }
+    }
     if (buffer == VK_NULL_HANDLE) {
         ReportWriteCheck(call, "VK_NULL_HANDLE destination", buffer, offset, bytes, 0);
         return;
@@ -448,27 +498,27 @@ void CheckBufferWrite(const char* call, VkBuffer buffer, VkDeviceSize offset, Vk
 }
 
 VKAPI_ATTR void VKAPI_CALL TrackedCmdCopyBuffer(VkCommandBuffer commands, VkBuffer source, VkBuffer destination, std::uint32_t count, const VkBufferCopy* regions) {
-    for (std::uint32_t i = 0; i < count; ++i) CheckBufferWrite("vkCmdCopyBuffer", destination, regions[i].dstOffset, regions[i].size);
+    for (std::uint32_t i = 0; i < count; ++i) CheckBufferWrite("vkCmdCopyBuffer", destination, regions[i].dstOffset, regions[i].size, commands);
     Get().devices.back().cmdCopyBuffer(commands, source, destination, count, regions);
 }
 
 VKAPI_ATTR void VKAPI_CALL TrackedCmdFillBuffer(VkCommandBuffer commands, VkBuffer destination, VkDeviceSize offset, VkDeviceSize bytes, std::uint32_t data) {
-    CheckBufferWrite("vkCmdFillBuffer", destination, offset, bytes);
+    CheckBufferWrite("vkCmdFillBuffer", destination, offset, bytes, commands);
     Get().devices.back().cmdFillBuffer(commands, destination, offset, bytes, data);
 }
 
 VKAPI_ATTR void VKAPI_CALL TrackedCmdUpdateBuffer(VkCommandBuffer commands, VkBuffer destination, VkDeviceSize offset, VkDeviceSize bytes, const void* data) {
-    CheckBufferWrite("vkCmdUpdateBuffer", destination, offset, bytes);
+    CheckBufferWrite("vkCmdUpdateBuffer", destination, offset, bytes, commands);
     Get().devices.back().cmdUpdateBuffer(commands, destination, offset, bytes, data);
 }
 
 VKAPI_ATTR void VKAPI_CALL TrackedCmdCopyImageToBuffer(VkCommandBuffer commands, VkImage image, VkImageLayout layout, VkBuffer destination, std::uint32_t count, const VkBufferImageCopy* regions) {
-    for (std::uint32_t i = 0; i < count; ++i) CheckBufferWrite("vkCmdCopyImageToBuffer", destination, regions[i].bufferOffset, 1);
+    for (std::uint32_t i = 0; i < count; ++i) CheckBufferWrite("vkCmdCopyImageToBuffer", destination, regions[i].bufferOffset, 1, commands);
     Get().devices.back().cmdCopyImageToBuffer(commands, image, layout, destination, count, regions);
 }
 
 VKAPI_ATTR void VKAPI_CALL TrackedCmdCopyQueryPoolResults(VkCommandBuffer commands, VkQueryPool pool, std::uint32_t first, std::uint32_t count, VkBuffer destination, VkDeviceSize offset, VkDeviceSize stride, VkQueryResultFlags flags) {
-    CheckBufferWrite("vkCmdCopyQueryPoolResults", destination, offset, count == 0 ? 0 : stride * (count - 1u) + ((flags & VK_QUERY_RESULT_64_BIT) != 0 ? 8u : 4u));
+    CheckBufferWrite("vkCmdCopyQueryPoolResults", destination, offset, count == 0 ? 0 : stride * (count - 1u) + ((flags & VK_QUERY_RESULT_64_BIT) != 0 ? 8u : 4u), commands);
     Get().devices.back().cmdCopyQueryPoolResults(commands, pool, first, count, destination, offset, stride, flags);
 }
 
@@ -828,6 +878,42 @@ std::vector<std::string> DescribeDeviceAddress(std::uint64_t address, std::uint6
     std::snprintf(text, sizeof(text), "registry: %zu live addressed buffers in 0x%llx..0x%llx, %llu destroyed (last %llu kept); write checks %llu, failed %llu, null descriptors %llu", registry.live.size(), static_cast<unsigned long long>(lowest), static_cast<unsigned long long>(highest), static_cast<unsigned long long>(registry.destroyedTotal), static_cast<unsigned long long>(count), static_cast<unsigned long long>(writeChecks.load()), static_cast<unsigned long long>(writeCheckFailures.load()), static_cast<unsigned long long>(nullDescriptors.load()));
     lines.emplace_back(text);
     return lines;
+}
+
+void ShareBuffersAcross(std::uint32_t first, std::uint32_t second) {
+    sharedFamilies = {first, second};
+    buffersShared.store(true, std::memory_order_release);
+}
+
+namespace {
+
+PFN_vkGetDeviceProcAddr sharedRealProc = nullptr;
+PFN_vkCreateBuffer sharedRealCreateBuffer = nullptr;
+
+VKAPI_ATTR VkResult VKAPI_CALL SharedCreateBuffer(VkDevice device, const VkBufferCreateInfo* info, const VkAllocationCallbacks* allocator, VkBuffer* buffer) {
+    VkBufferCreateInfo shared{};
+    if (info != nullptr && info->sharingMode == VK_SHARING_MODE_EXCLUSIVE && buffersShared.load(std::memory_order_acquire)) {
+        shared = *info;
+        shared.sharingMode = VK_SHARING_MODE_CONCURRENT;
+        shared.queueFamilyIndexCount = 2;
+        shared.pQueueFamilyIndices = sharedFamilies.data();
+        info = &shared;
+    }
+    return sharedRealCreateBuffer(device, info, allocator, buffer);
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL SharedDeviceProc(VkDevice device, const char* name) {
+    if (name != nullptr && std::string_view(name) == "vkCreateBuffer") return reinterpret_cast<PFN_vkVoidFunction>(&SharedCreateBuffer);
+    return sharedRealProc(device, name);
+}
+
+}
+
+PFN_vkGetDeviceProcAddr ShareBuffersProc(VkDevice device, PFN_vkGetDeviceProcAddr real, std::uint32_t first, std::uint32_t second) {
+    sharedRealProc = real;
+    sharedRealCreateBuffer = reinterpret_cast<PFN_vkCreateBuffer>(real(device, "vkCreateBuffer"));
+    ShareBuffersAcross(first, second);
+    return sharedRealCreateBuffer != nullptr ? &SharedDeviceProc : real;
 }
 
 PFN_vkGetDeviceProcAddr TrackDevice(VkDevice device, VkPhysicalDevice physical, const VkPhysicalDeviceMemoryProperties& memory,
