@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ImageSlabs.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 // For the declaration of PendingStorageOverlaps, defined below.
@@ -482,15 +483,14 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
             // PERF-PLAN). Reuse is as safe as the free it replaces: the slot returns when the OwnedImage goes.
             // APS5_NO_IMAGE_SLABS=1 allocates every snapshot on its own as before.
             const bool imageSlabs = !RuntimeSwitches::Set(RuntimeSwitch::NoImageSlabs);
-            constexpr VkDeviceSize imageSlabLimit = VkDeviceSize{4} << 20u;
-            const auto slabCapacity = std::bit_ceil(std::max(requirements.size, requirements.alignment));
+            const auto slabCapacity = ImageSlabClass(requirements.size, requirements.alignment);
             const bool deviceLocalType = (context.memory.memoryTypes[allocation.memoryTypeIndex].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
-            if (imageSlabs && context.bufferPool && !spilled && deviceLocalType && slabCapacity <= imageSlabLimit && requirements.alignment <= slabCapacity) {
+            if (imageSlabs && context.bufferPool && !spilled && deviceLocalType && slabCapacity != 0) {
                 const auto slot = context.bufferPool->TakeSlot(context, allocation.memoryTypeIndex, static_cast<std::size_t>(slabCapacity), false);
                 owned->slotMemory = slot.memory;
                 owned->slotOffset = slot.offset;
                 inHostMemory = false;
-                allocationBytes = slabCapacity + ImageAllocationOverhead(slabCapacity);
+                allocationBytes = ImageSlabAccountedBytes(slabCapacity);
                 Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, slot.memory, slot.offset), "vkBindImageMemory slab");
                 ImageSlabCounts().slabbed.fetch_add(1, std::memory_order_relaxed);
             } else {
