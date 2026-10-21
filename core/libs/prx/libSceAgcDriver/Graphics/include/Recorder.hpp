@@ -416,7 +416,7 @@ public:
     static void SetWriteOrigin(std::uint64_t program);
     static void SetWriteOriginKernel(std::uint32_t mask, std::uint32_t value);
     static std::uint64_t CurrentWriteOrigin();
-    enum class CheckpointKind : std::uint64_t { Draw = 0x1, CopyIn = 0xf1, CopyBack = 0xf2, DiffCopyBack = 0xf3, BindlessPublish = 0xf4, DmaCopy = 0xf5, GpuCopies = 0xf6, BatchBegin = 0xb0, BatchEnd = 0xb1 };
+    enum class CheckpointKind : std::uint64_t { Draw = 0x1, CopyIn = 0xf1, CopyBack = 0xf2, DiffCopyBack = 0xf3, BindlessPublish = 0xf4, DmaCopy = 0xf5, GpuCopies = 0xf6, BatchBegin = 0xb0, BatchEnd = 0xb1, AsyncDispatch = 0xb2 };
     static void SetCheckpointFunction(PFN_vkCmdSetCheckpointNV function);
     static bool CheckpointsOn();
     static void Checkpoint(VkCommandBuffer commands, CheckpointKind kind, std::uint64_t value);
@@ -809,6 +809,8 @@ private:
         // Its lane (see AsyncLaneRing), and the other lane's serial it waits for on the GPU (0: none).
         int lane = 0;
         std::uint64_t waitOther = 0;
+        bool handedOut = false;
+        std::uint64_t edgeOwed = 0;
         std::uint64_t traceId = 0;
         bool submitted = false;
         // The GpuMutex queue tag of the thread that opened the batch, and when it was submitted
@@ -1139,7 +1141,9 @@ private:
     std::array<std::uint64_t, 2> laneSubmitted{};
     // The other lane's serial the next batch of each lane must wait for (LaneSwitch).
     std::array<std::uint64_t, 2> laneOwed{};
-    void switchEdge(int from, int to);
+    void switchEdge(int from, int to, bool retroactive = false);
+    void addEdge(int lane, std::uint64_t serial, bool retroactive = false);
+    void takeOwedEdge();
     // Submits `lane`'s open batch (from any thread's lane).
     void submitLane(int lane);
     // The edges this thread's consumed labels owe (NoteConsumedLabel), applied to the open batch.

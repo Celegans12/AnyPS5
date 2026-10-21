@@ -38,6 +38,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_LANE_SERIALIZE",
     "APS5_NO_LANE_OVERLAP",
     "APS5_NO_LANE_LABEL_SCOPE",
+    "APS5_NO_LANE_FORWARD_EDGE",
 };
 
 struct Refusal {

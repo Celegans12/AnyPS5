@@ -44,8 +44,8 @@ inline std::vector<std::string> DeviceFaultReport(VkDevice device, PFN_vkGetDevi
         for (const auto& point : points) {
             const auto marker = static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(point.pCheckpointMarker));
             const auto kind = marker >> 56u;
-            const char* name = kind == 0x1 ? "draw program" : kind == 0xf1 ? "copy-in of guest" : kind == 0xf2 ? "copy-back of guest" : kind == 0xf3 ? "diff copy-back of guest" : kind == 0xf4 ? "bindless publish" : kind == 0xf5 ? "DMA copy to guest" : kind == 0xf6 ? "GPU copies" : kind == 0xb0 ? "batch begin (lane << 48 | opened at)" : kind == 0xb1 ? "batch end (lane << 48 | serial)" : "program";
-            std::snprintf(line, sizeof(line), "[device-fault] checkpoint: %s 0x%llx at stage 0x%x", name, kind == 0x1 || kind >= 0xf1 || kind == 0xb0 || kind == 0xb1 ? marker & ((1ull << 56u) - 1u) : marker, static_cast<unsigned>(point.stage));
+            const char* name = kind == 0x1 ? "draw program" : kind == 0xf1 ? "copy-in of guest" : kind == 0xf2 ? "copy-back of guest" : kind == 0xf3 ? "diff copy-back of guest" : kind == 0xf4 ? "bindless publish" : kind == 0xf5 ? "DMA copy to guest" : kind == 0xf6 ? "GPU copies" : kind == 0xb0 ? "batch begin (lane << 48 | opened at)" : kind == 0xb1 ? "batch end (lane << 48 | serial)" : kind == 0xb2 ? "async lane dispatch of program" : "program";
+            std::snprintf(line, sizeof(line), "[device-fault] checkpoint: %s 0x%llx at stage 0x%x", name, kind == 0x1 || kind >= 0xf1 || kind == 0xb0 || kind == 0xb1 || kind == 0xb2 ? marker & ((1ull << 56u) - 1u) : marker, static_cast<unsigned>(point.stage));
             lines.emplace_back(line);
         }
     }
