@@ -438,6 +438,7 @@ public:
     // Under the mutex: finishes (completions, release) the in-flight batches up to `serial`, from the
     // front only; tolerates batches another thread finished meanwhile. Later batches stay in flight.
     void FinishUpTo(std::uint64_t serial);
+    void FinishThroughOpened(std::uint64_t serial);
     // Submits and waits for every batch, running completions in order.
     void Sync();
     void CountSamples();

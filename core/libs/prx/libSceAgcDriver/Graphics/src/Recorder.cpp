@@ -4543,6 +4543,20 @@ void Recorder::FinishUpTo(std::uint64_t serial) {
     activeSyncSite = previousSite;
 }
 
+void Recorder::FinishThroughOpened(std::uint64_t serial) {
+    if (asyncTimeline == VK_NULL_HANDLE || RuntimeSwitches::Set(RuntimeSwitch::NoLaneLeaseWait)) {
+        if (serial >= OpenSerial()) Submit();
+        FinishUpTo(serial);
+        return;
+    }
+    if (anyOpen([&](const Batch& batch) { return batch.openedAt <= serial; })) SubmitAllLanes();
+    auto bound = serial;
+    for (const auto& batch : inFlight) {
+        if (batch->openedAt <= serial) bound = std::max(bound, batch->serial);
+    }
+    FinishUpTo(bound);
+}
+
 void Recorder::Sync() {
     PerformanceTimer frameTiming("Recorder.Sync");
     const auto source = std::exchange(announcedSource, 4);
