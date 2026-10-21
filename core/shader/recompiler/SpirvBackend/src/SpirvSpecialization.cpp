@@ -85,7 +85,22 @@ Instruction Make(spv::Op op, std::initializer_list<std::uint32_t> operands) {
     return result;
 }
 
-bool PureInstruction(const Instruction& instruction) {
+class IdSet {
+public:
+    void Reset(std::size_t bound) { present.assign(bound, 0u); }
+    bool contains(std::uint32_t id) const { return id < present.size() && present[id] != 0u; }
+    bool insert(std::uint32_t id) {
+        if (id >= present.size()) throw std::runtime_error("prepared SPIR-V id exceeds the module bound");
+        if (present[id] != 0u) return false;
+        present[id] = 1u;
+        return true;
+    }
+
+private:
+    std::vector<std::uint8_t> present;
+};
+
+bool PureInstruction(const Instruction& instruction, const IdSet& glslExtInstSets = {}) {
     switch (Opcode(instruction)) {
     case spv::OpVectorExtractDynamic:
     case spv::OpVectorInsertDynamic:
@@ -203,8 +218,9 @@ bool PureInstruction(const Instruction& instruction) {
     case spv::OpInBoundsPtrAccessChain:
     case spv::OpArrayLength:
     case spv::OpPhi:
-    case spv::OpExtInst:
         return true;
+    case spv::OpExtInst:
+        return instruction.size() >= 5u && glslExtInstSets.contains(instruction[3]);
     case spv::OpLoad:
         return instruction.size() == 4u || (instruction.size() == 5u && instruction[4] == spv::MemoryAccessMaskNone);
     default:
@@ -557,21 +573,6 @@ private:
     std::size_t count = 0;
 };
 
-class IdSet {
-public:
-    void Reset(std::size_t bound) { present.assign(bound, 0u); }
-    bool contains(std::uint32_t id) const { return id < present.size() && present[id] != 0u; }
-    bool insert(std::uint32_t id) {
-        if (id >= present.size()) throw std::runtime_error("prepared SPIR-V id exceeds the module bound");
-        if (present[id] != 0u) return false;
-        present[id] = 1u;
-        return true;
-    }
-
-private:
-    std::vector<std::uint8_t> present;
-};
-
 class Specialization {
 public:
     explicit Specialization(std::span<const std::uint32_t> words) : arena(words.size()) {
@@ -582,6 +583,7 @@ public:
         values.Reset(bound);
         resultTypes.Reset(bound);
         vectorTypes.Reset(bound);
+        glslExtInstSets.Reset(bound);
         removed.Reset(bound);
         aliases.Reset(bound);
         composites.Reset(bound);
@@ -596,6 +598,7 @@ public:
             bool hasType = false;
             spv::HasResultAndType(op, &hasResult, &hasType);
             if (hasResult && hasType) resultTypes.emplace(instruction.at(2), instruction.at(1));
+            if (op == spv::OpExtInstImport && instruction.size() == 6u && instruction[2] == 0x4c534c47u && instruction[3] == 0x6474732eu && instruction[4] == 0x3035342eu && instruction[5] == 0u) glslExtInstSets.insert(instruction.at(1));
             if (op == spv::OpTypeBool) types.emplace(instruction.at(1), ScalarType{1u, true});
             if (op == spv::OpTypeInt) types.emplace(instruction.at(1), ScalarType{instruction.at(2), false});
             if (op == spv::OpTypeVector) vectorTypes.insert(instruction.at(1));
@@ -1182,7 +1185,7 @@ private:
                 }
                 continue;
             }
-            if (PureInstruction(instruction)) {
+            if (PureInstruction(instruction, glslExtInstSets)) {
                 definitions.emplace(Result(instruction), index);
                 continue;
             }
@@ -1219,6 +1222,7 @@ private:
     IdTable<std::uint32_t> values;
     IdTable<std::uint32_t> resultTypes;
     IdSet vectorTypes;
+    IdSet glslExtInstSets;
     IdSet removed;
     IdTable<std::uint32_t> aliases;
     IdTable<std::vector<std::uint32_t>> composites;

@@ -173,7 +173,7 @@ void Check() {
 
 constexpr std::array<std::uint32_t, 5> SubwordWord3{0x31005facu, 0x31006facu, 0x3100bfacu, 0x3100cfacu, 0x31012facu};
 
-constexpr const char* SubwordNames[14] = {
+constexpr const char* SubwordNames[16] = {
     "buffer_load_format_x 8_UINT +1",
     "buffer_load_format_x 8_UINT +2",
     "buffer_load_format_x 8_UINT +3",
@@ -182,8 +182,10 @@ constexpr const char* SubwordNames[14] = {
     "buffer_load_format_x 8_SINT +3",
     "buffer_load_format_x 16_UINT +1",
     "buffer_load_format_x 16_UINT +2",
+    "buffer_load_format_x 16_UINT +3",
     "buffer_load_format_x 16_SINT +1",
     "buffer_load_format_x 16_SINT +2",
+    "buffer_load_format_x 16_SINT +3",
     "buffer_load_format_xy 8_8_UINT +1 x",
     "buffer_load_format_xy 8_8_UINT +1 y",
     "buffer_load_format_xy 8_8_UINT +2 x",
@@ -200,11 +202,11 @@ std::vector<std::uint32_t> SubwordCode() {
     };
     for (std::uint32_t offset = 1u; offset <= 3u; ++offset) emitLoad(0u, 2u, offset, 1u);
     for (std::uint32_t offset = 1u; offset <= 3u; ++offset) emitLoad(0u, 3u, offset, 1u);
-    for (std::uint32_t offset = 1u; offset <= 2u; ++offset) emitLoad(0u, 4u, offset, 1u);
-    for (std::uint32_t offset = 1u; offset <= 2u; ++offset) emitLoad(0u, 5u, offset, 1u);
+    for (std::uint32_t offset = 1u; offset <= 3u; ++offset) emitLoad(0u, 4u, offset, 1u);
+    for (std::uint32_t offset = 1u; offset <= 3u; ++offset) emitLoad(0u, 5u, offset, 1u);
     for (std::uint32_t offset = 1u; offset <= 2u; ++offset) emitLoad(1u, 6u, offset, 2u);
     code.push_back(0xbf8c3f70u);
-    for (std::uint32_t index = 0u; index < 14u; ++index) {
+    for (std::uint32_t index = 0u; index < 16u; ++index) {
         code.push_back(0xe0701000u | (index * 4u));
         code.push_back(0x80010003u | ((10u + index) << 8u));
     }
@@ -245,11 +247,11 @@ void CheckSubwordOffsets() {
         const auto s8 = [&](std::uint32_t offset) { return static_cast<std::uint32_t>(static_cast<std::int32_t>(static_cast<std::int8_t>(u8(offset)))); };
         const auto u16 = [&](std::uint32_t offset) { return (word >> (offset * 8u)) & 0xffffu; };
         const auto s16 = [&](std::uint32_t offset) { return static_cast<std::uint32_t>(static_cast<std::int32_t>(static_cast<std::int16_t>(u16(offset)))); };
-        const std::array<std::uint32_t, 14> expected{
+        const std::array<std::uint32_t, 16> expected{
             u8(1u), u8(2u), u8(3u),
             s8(1u), s8(2u), s8(3u),
-            u16(1u), u16(2u),
-            s16(1u), s16(2u),
+            u16(1u), u16(2u), u16(3u),
+            s16(1u), s16(2u), s16(3u),
             u8(1u), u8(2u),
             u8(2u), u8(3u),
         };
