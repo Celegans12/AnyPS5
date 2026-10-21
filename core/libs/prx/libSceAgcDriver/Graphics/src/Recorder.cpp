@@ -1320,6 +1320,41 @@ void Recorder::switchEdge(int from, int to) {
     else laneOwed[static_cast<std::size_t>(to)] = std::max(laneOwed[static_cast<std::size_t>(to)], serial);
 }
 
+namespace {
+
+std::atomic<std::uint64_t> laneHeldCompletions{0}, laneTemplateEdges[2]{};
+
+}
+
+std::uint64_t Recorder::CompletedThrough() const {
+    auto through = inFlight.empty() ? submissions : inFlight.front()->serial - 1;
+    if (asyncTimeline == VK_NULL_HANDLE || RuntimeSwitches::Set(RuntimeSwitch::NoLaneOpenSerial)) return through;
+    const auto plain = through;
+    for (const auto& batch : lanes) {
+        if (batch != nullptr) through = std::min(through, batch->openedAt - 1);
+    }
+    for (const auto& batch : inFlight) through = std::min(through, batch->openedAt - 1);
+    if (through != plain) laneHeldCompletions.fetch_add(1, std::memory_order_relaxed);
+    return through;
+}
+
+void Recorder::OrderAfterLane(int from) {
+    GuestMemory::AssertGpuLockHeld("Recorder::OrderAfterLane");
+    const int to = currentLane();
+    if (!AsyncLaneActive() || from == to) return;
+    switchEdge(from, to);
+}
+
+void Recorder::CountTemplateEdge(bool beforeRefresh) {
+    laneTemplateEdges[beforeRefresh ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
+}
+
+std::string Recorder::LaneOrderReport() {
+    char text[400];
+    std::snprintf(text, sizeof(text), "[lane-order] (cumulative) completed-through answers lowered by a batch opened before the other lane's submission %llu (APS5_NO_LANE_OPEN_SERIAL %s); cached-template data edges to the other lane: after its refresh %llu, before a refresh over its reads %llu (APS5_NO_LANE_TEMPLATE_EDGE %s)", static_cast<unsigned long long>(laneHeldCompletions.load()), RuntimeSwitches::Set(RuntimeSwitch::NoLaneOpenSerial) ? "set" : "unset", static_cast<unsigned long long>(laneTemplateEdges[1].load()), static_cast<unsigned long long>(laneTemplateEdges[0].load()), RuntimeSwitches::Set(RuntimeSwitch::NoLaneTemplateEdge) ? "set" : "unset");
+    return text;
+}
+
 Recorder::LaneSwitch::LaneSwitch(Recorder* recorder, int lane) : recorder(recorder), from(threadLane), to(lane) {
     if (recorder != nullptr && recorder->AsyncLaneActive() && from != to) {
         GuestMemory::AssertGpuLockHeld("Recorder::LaneSwitch");
@@ -2142,6 +2177,7 @@ void Recorder::ensureOpen() {
             batch->waitOther = laneSubmitted[0];
         }
         batch->waitOther = std::max(batch->waitOther, std::exchange(laneOwed[static_cast<std::size_t>(batch->lane)], 0));
+        batch->openedAt = OpenSerial();
         if (countingSamples && !segmentMode()) beginSamples(*batch);
         dropStaleHoldKept();
         batch->kept.insert(batch->kept.end(), holdKept.begin(), holdKept.end());

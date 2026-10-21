@@ -269,7 +269,22 @@ public:
     bool Recording() const { return open != nullptr; }
     bool Idle() const { return lanes[0] == nullptr && lanes[1] == nullptr && inFlight.empty(); }
     std::uint64_t OpenSerial() const { return submissions + 1; }
-    std::uint64_t CompletedThrough() const { return inFlight.empty() ? submissions : inFlight.front()->serial - 1; }
+    // The newest serial S such that every batch that may hold work recorded while OpenSerial() was
+    // <= S has completed (a resource retired at OpenSerial() is free to reuse once it is <= this).
+    // One lane: the oldest in-flight batch's serial - 1. With the async lane both lanes' open
+    // batches report the same OpenSerial() and the one submitted later gets a higher serial, so
+    // every open or in-flight batch also caps it at the serial it was opened at - 1.
+    // APS5_NO_LANE_OPEN_SERIAL=1 (an APS5_AB switch) leaves the open batches and the opening serials
+    // out as before: a slot retired in one lane's open batch could then be reused once the other
+    // lane's earlier-opened batch completed, while the first one still read it.
+    std::uint64_t CompletedThrough() const;
+    // Under the mutex, async lane only: the calling thread's lane's open (or next) batch waits on the
+    // GPU for everything lane `from` recorded so far (its open batch is submitted first).
+    void OrderAfterLane(int from);
+    // APS5_PROFILE_DRAW: the [lane-order] line (CompletedThrough answers lowered by the opening
+    // serials, cached-template data edges between the lanes).
+    static std::string LaneOrderReport();
+    static void CountTemplateEdge(bool beforeRefresh);
     // Whether recorded work still has completion actions (write-backs the CPU must see) to run.
     bool HasCompletions() const;
     void Keep(std::shared_ptr<void> object, std::size_t bytes = 0);
@@ -773,6 +788,8 @@ private:
         std::vector<ReadListNote> readLists;
         // Submission number (1-based): identifies a batch after its allocation may have been reused.
         std::uint64_t serial = 0;
+        // OpenSerial() when the batch was opened: its serial is at least this (see CompletedThrough).
+        std::uint64_t openedAt = 0;
         // Its lane (see AsyncLaneRing), and the other lane's serial it waits for on the GPU (0: none).
         int lane = 0;
         std::uint64_t waitOther = 0;

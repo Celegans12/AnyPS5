@@ -30,6 +30,8 @@ enum class RuntimeSwitch : std::size_t {
     NoOwedRunClose,
     NoRunAtomicGuard,
     NoRunStagedReadGuard,
+    NoLaneOpenSerial,
+    NoLaneTemplateEdge,
     Count,
 };
 

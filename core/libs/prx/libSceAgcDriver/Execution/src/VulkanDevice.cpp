@@ -4941,7 +4941,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
             std::string async;
             for (const auto& [site, count] : Graphics::Recorder::RunCloseSites(24, 0x51)) async += (async.empty() ? "" : "; ") + site + " " + std::to_string(count);
             AgcDriver::ProfilePrint_nid_no_patch("[run-close] runs closed by call site (cumulative, ring keys as guest queues): %s\n[run-close] of ring 0x51: %s\n[run-close] unordered dispatches by ring: %s\n", sites.c_str(), async.c_str(), Graphics::Recorder::OverlapByRing().c_str());
-            AgcDriver::ProfilePrint_nid_no_patch("%s (APS5_NO_STAGED_OVERLAP %s)\n%s\n", Graphics::Recorder::RunConflictReport().c_str(), Graphics::Recorder::StagedOverlapEnabled() ? "unset" : "set", Graphics::Recorder::OwedCopyBackReport().c_str());
+            AgcDriver::ProfilePrint_nid_no_patch("%s (APS5_NO_STAGED_OVERLAP %s)\n%s\n%s\n", Graphics::Recorder::RunConflictReport().c_str(), Graphics::Recorder::StagedOverlapEnabled() ? "unset" : "set", Graphics::Recorder::OwedCopyBackReport().c_str(), Graphics::Recorder::LaneOrderReport().c_str());
         }
     }
     // The record phase split (APS5_PROFILE_DRAW, rows "record: ..." of the [dispatch] totals):
@@ -5009,14 +5009,38 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         // after an earlier dispatch's reads of the buffers by that dispatch's trailing barrier. A
         // recipe compares the two 64-bit hashes first: equal hashes mean the buffers hold the words.
         const bool differs = record.dataRefresh == RecordedDispatch::DataRefresh::Words || resources.DataWordsHash() != record.dataWordsHash;
+        // With the async lane a cached template can be used by both lanes, which the GPU runs
+        // unordered: a refresh must wait for the other lane's dispatches still reading the old
+        // words, and a dispatch reading (or refreshing over) words the other lane refreshed must
+        // wait for that refresh. The edge submits the other lane's open batch and makes this
+        // lane's batch wait for it. APS5_NO_LANE_TEMPLATE_EDGE=1 (an APS5_AB switch) records
+        // without the edge as before.
+        const bool laneEdges = recorder.AsyncLaneActive() && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoLaneTemplateEdge);
+        const int lane = laneEdges ? Graphics::Recorder::ThreadLane() : 0;
+        if (laneEdges) {
+            const int other = 1 - lane;
+            const bool afterRefresh = resources.dataWriterLane == other;
+            const bool beforeRefresh = !afterRefresh && (resources.dataReaderLanes & (1u << other)) != 0 && differs && resources.DataWordsDiffer(*record.shader);
+            if (afterRefresh || beforeRefresh) {
+                recorder.OrderAfterLane(other);
+                Graphics::Recorder::CountTemplateEdge(beforeRefresh);
+                resources.dataWriterLane = -1;
+                resources.dataReaderLanes = 0;
+            }
+        }
         if (differs && (record.resourceKeyMatched ? resources.refreshData(commands, *record.shader, &recorder) : resources.RefreshData(commands, *record.shader, &recorder))) {
             covered = 0;
             ++d.templateRefreshed;
             d.templateRevalidateMs += record.revalidateMs;
             record.refreshed = true;
+            if (laneEdges) {
+                resources.dataWriterLane = lane;
+                resources.dataReaderLanes = 0;
+            }
         } else {
             ++d.templateSameWords;
         }
+        if (laneEdges) resources.dataReaderLanes = static_cast<std::uint8_t>(resources.dataReaderLanes | (1u << lane));
         recordStep(PhaseRecordDataRefresh);
     }
     using CommandClass = Graphics::Recorder::CommandClass;
