@@ -732,6 +732,11 @@ private:
     HostImportsProof importsProof;
     // FNV-1a offset basis: the hash of no data buffers (DataWordsHash).
     std::uint64_t dataWordsHash = 14695981039346656037ull;
+    // Async lane (VulkanDevice's dispatch record, APS5_NO_LANE_TEMPLATE_EDGE): the lane of the
+    // last data refresh not yet ordered before the other lane's work (-1: none), and the lanes
+    // whose recorded dispatches read the data buffers since (bit per lane).
+    int dataWriterLane = -1;
+    std::uint8_t dataReaderLanes = 0;
     void rehashDataWords();
     std::vector<std::pair<std::uint32_t, std::uint32_t>> pushPatches;
     std::vector<DataPatch> dataPatches;

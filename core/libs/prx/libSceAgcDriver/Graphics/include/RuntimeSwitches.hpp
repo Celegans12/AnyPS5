@@ -33,6 +33,8 @@ enum class RuntimeSwitch : std::size_t {
     NoSmallDeviceTier,
     NoExactSizeReuse,
     NoHeldReadSkip,
+    NoLaneOpenSerial,
+    NoLaneTemplateEdge,
     Count,
 };
 
