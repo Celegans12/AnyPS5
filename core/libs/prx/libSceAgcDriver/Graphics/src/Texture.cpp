@@ -43,6 +43,21 @@
 
 namespace AgcDriver::Graphics {
 
+// PERF-PLAN image slabs: sampled snapshots served from a BufferPool slab slot vs given their own
+// allocation (the [texture] line).
+struct ImageSlabCountsType {
+    std::atomic<std::uint64_t> slabbed{0};
+    std::atomic<std::uint64_t> dedicated{0};
+};
+ImageSlabCountsType& ImageSlabCounts() {
+    static ImageSlabCountsType counts;
+    return counts;
+}
+
+void ReturnImageSlot(const Context& context, VkDeviceMemory memory, VkDeviceSize offset) noexcept {
+    if (context.bufferPool) context.bufferPool->PutSlot(memory, offset);
+}
+
 namespace {
 
 // APS5_PROFILE_DRAW: accumulate texture setup phases and report every 200 textures.
@@ -440,8 +455,28 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
         allocation.allocationSize = requirements.size;
         allocationBytes = requirements.size + ImageAllocationOverhead(requirements.size);
         allocation.memoryTypeIndex = systemType ? *systemType : overflowType ? *overflowType : BudgetedImageMemoryType(context, requirements.memoryTypeBits, requirements.size, "texture");
-        owned->memory = AllocateDeviceMemory(context, allocation, "vkAllocateMemory texture", requirements.memoryTypeBits, &inHostMemory);
-        Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, owned->memory, 0), "vkBindImageMemory");
+        // A device-local snapshot of up to 4 MiB goes into a BufferPool slab slot (its power-of-two size
+        // class) instead of its own allocation: each vkAllocateMemory/vkFreeMemory pair walked libdrm's
+        // VA hole list on the committer (amdgpu_va_range_alloc2/free, ~5.7% of the process in the world,
+        // PERF-PLAN). Reuse is as safe as the free it replaces: the slot returns when the OwnedImage goes.
+        // APS5_NO_IMAGE_SLABS=1 allocates every snapshot on its own as before.
+        const bool imageSlabs = !RuntimeSwitches::Set(RuntimeSwitch::NoImageSlabs);
+        constexpr VkDeviceSize imageSlabLimit = VkDeviceSize{4} << 20u;
+        const auto slabCapacity = std::bit_ceil(std::max(requirements.size, requirements.alignment));
+        const bool deviceLocalType = (context.memory.memoryTypes[allocation.memoryTypeIndex].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
+        if (imageSlabs && context.bufferPool && !spilled && deviceLocalType && slabCapacity <= imageSlabLimit && requirements.alignment <= slabCapacity) {
+            const auto slot = context.bufferPool->TakeSlot(context, allocation.memoryTypeIndex, static_cast<std::size_t>(slabCapacity), false);
+            owned->slotMemory = slot.memory;
+            owned->slotOffset = slot.offset;
+            inHostMemory = false;
+            allocationBytes = slabCapacity + ImageAllocationOverhead(slabCapacity);
+            Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, slot.memory, slot.offset), "vkBindImageMemory slab");
+            ImageSlabCounts().slabbed.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            owned->memory = AllocateDeviceMemory(context, allocation, "vkAllocateMemory texture", requirements.memoryTypeBits, &inHostMemory);
+            Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, owned->memory, 0), "vkBindImageMemory");
+            ImageSlabCounts().dedicated.fetch_add(1, std::memory_order_relaxed);
+        }
 
         const VkImage uploadImage = image;
         std::shared_ptr<OwnedImage> uploadOwned;
@@ -637,7 +672,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
         if (profile) {
             auto& totals = Profile();
             totals.view += timer.lap();
-            if (++totals.count % 200 == 0) std::fprintf(stderr, "[texture] %llu textures (%llu copied from storage images, %llu uploads recorded): allocate+image %.0f ms, guest read %.0f ms, detile+copy %.0f ms, view+buffer release %.0f ms\n", static_cast<unsigned long long>(totals.count), static_cast<unsigned long long>(totals.fromStorage), static_cast<unsigned long long>(totals.recordedUploads), totals.allocate, totals.read, totals.gpu, totals.view);
+            if (++totals.count % 200 == 0) std::fprintf(stderr, "[texture] %llu textures (%llu copied from storage images, %llu uploads recorded): allocate+image %.0f ms, guest read %.0f ms, detile+copy %.0f ms, view+buffer release %.0f ms; image memory: %llu slab slots, %llu own allocations\n", static_cast<unsigned long long>(totals.count), static_cast<unsigned long long>(totals.fromStorage), static_cast<unsigned long long>(totals.recordedUploads), totals.allocate, totals.read, totals.gpu, totals.view, static_cast<unsigned long long>(ImageSlabCounts().slabbed.load(std::memory_order_relaxed)), static_cast<unsigned long long>(ImageSlabCounts().dedicated.load(std::memory_order_relaxed)));
         }
         countedBytes = allocationBytes;
         (inHostMemory ? SampledHostMemoryCounter() : SampledMemoryCounter()).fetch_add(countedBytes, std::memory_order_relaxed);

@@ -54,6 +54,9 @@ VkDeviceSize ImageAllocationOverhead(VkDeviceSize bytes);
 bool ClearKeepsDenormals(const Context& context, VkFormat format);
 bool ClearColorForTexel(VkFormat format, std::uint32_t elementBytes, std::span<const std::uint32_t, 4> pattern, VkClearColorValue& clear);
 
+// Returns a sampled snapshot's BufferPool slab slot (OwnedImage::slotMemory) to the pool.
+void ReturnImageSlot(const Context& context, VkDeviceMemory memory, VkDeviceSize offset) noexcept;
+
 // A sampled texture's own VkImage with its memory, shared with the recorder while a recorded upload
 // still writes it (see the snapshot constructor), so the texture may go before the batch completes.
 struct OwnedImage {
@@ -63,10 +66,15 @@ struct OwnedImage {
     ~OwnedImage() {
         if (image) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);
         if (memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
+        if (slotMemory != VK_NULL_HANDLE) ReturnImageSlot(context, slotMemory, slotOffset);
     }
     Context context;
     VkImage image;
     VkDeviceMemory memory;
+    // A sampled snapshot bound into a BufferPool slab slot instead of its own allocation (the snapshot
+    // constructor, APS5_NO_IMAGE_SLABS): the slot goes back to the pool after the image is destroyed.
+    VkDeviceMemory slotMemory = VK_NULL_HANDLE;
+    VkDeviceSize slotOffset = 0;
 };
 
 class Texture {
