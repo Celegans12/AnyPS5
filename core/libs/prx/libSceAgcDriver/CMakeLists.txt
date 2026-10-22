@@ -387,6 +387,7 @@ set(agcDriverSources
         ${agcSampleOrderShaderHeaders}
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/BindlessHeap.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/DeviceImageKeys.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/DeviceImageTable.cpp
         ${agcTextureDetileShaderHeader}
         ${agcReadbackHeaders}
         ${agcMultisampleUploadHeader}
@@ -3475,6 +3476,11 @@ if(BUILD_TESTING)
         if(WIN32)
             set_tests_properties(agc_driver_heap_draw_sample_heap PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endif()
+    endif()
+    add_test(NAME agc_driver_device_image_table_heap COMMAND agc_driver_device_image_table_tests --heap)
+    set_tests_properties(agc_driver_device_image_table_heap PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_GPU_HEAP=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 60)
+    if(WIN32)
+        set_tests_properties(agc_driver_device_image_table_heap PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test(NAME agc_driver_heap_slots_comes_back COMMAND agc_driver_heap_slots_tests comes-back)
     set_tests_properties(agc_driver_heap_slots_comes_back PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")

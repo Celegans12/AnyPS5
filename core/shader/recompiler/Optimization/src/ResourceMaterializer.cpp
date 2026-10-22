@@ -2683,4 +2683,88 @@ std::uint64_t ResourceMaterializer::MaterializeNanoseconds() {
     return materializeNanoseconds.load(std::memory_order_relaxed);
 }
 
+namespace {
+
+ImageResource deviceInterfaceImage(const ImageResource& image) {
+    auto normalized = image;
+    normalized.source = 0u;
+    normalized.firstUsePc = 0u;
+    if (normalized.table != NoTable) normalized.table = 0u;
+    return normalized;
+}
+
+std::uint64_t mixImageInterface(std::uint64_t hash, const ImageResource& image) {
+    const auto mix = [&](std::uint64_t value) {
+        hash ^= value;
+        hash *= 0x100000001b3ull;
+    };
+    mix(static_cast<std::uint64_t>(image.resourceClass));
+    mix(static_cast<std::uint64_t>(image.numericClass));
+    mix(static_cast<std::uint64_t>(image.dimension));
+    mix(static_cast<std::uint64_t>(image.mipMode));
+    mix(image.mipCount);
+    mix(static_cast<std::uint64_t>(image.conversionFormat));
+    mix(image.shaderSwizzle);
+    mix((image.read ? 1u : 0u) | (image.written ? 2u : 0u) | (image.atomic ? 4u : 0u) | (image.atomic64 ? 8u : 0u) | (image.depthCompare ? 16u : 0u) | (image.cube ? 32u : 0u) | (image.r128 ? 64u : 0u) | (image.srgbDecode ? 128u : 0u));
+    mix((image.srgbDecodeCompatible ? 1u : 0u) | (image.depthBits ? 2u : 0u) | (image.depthUnorm16 ? 4u : 0u) | (image.packed ? 8u : 0u) | (image.fmaskCompatible ? 16u : 0u) | (image.depthBitsCompatible ? 32u : 0u) | (image.constantSwizzle ? 64u : 0u) | (image.constantSwizzleCompatible ? 128u : 0u));
+    mix((image.flatVolumeCompatible ? 1u : 0u) | (image.flatLineCompatible ? 2u : 0u) | (image.foldTexelOffsetsOnly ? 4u : 0u) | (image.table != NoTable ? 8u : 0u) | (image.singleMipPlaneBiasCompatible ? 32u : 0u) | (image.flatVolumeLineCompatible ? 64u : 0u) | (image.cubeFaceCompatible ? 128u : 0u));
+    mix((image.volumeArraySampleCompatible ? 1u : 0u) | (image.convertedSamples ? 2u : 0u) | (image.remappedDepth1D ? 4u : 0u));
+    mix(image.srgbDecodeFormats);
+    mix(image.byElements);
+    mix(image.byComponents);
+    mix(static_cast<std::uint64_t>(image.packedFormat));
+    mix(image.emulatedCompare);
+    mix(static_cast<std::uint64_t>(image.tableOperation));
+    return hash;
+}
+
+struct DeviceImageInterfaceRegistry {
+    std::mutex mutex;
+    std::unordered_map<std::uint64_t, std::shared_ptr<const DeviceImageInterface>> interfaces;
+};
+
+DeviceImageInterfaceRegistry& deviceImageInterfaces() {
+    static auto& registry = *new DeviceImageInterfaceRegistry();
+    return registry;
+}
+
+}
+
+std::uint64_t ResourceMaterializer::DeviceImageInterfaceId(const ImageResource& image, std::span<const ImageResource> modes) {
+    auto hash = mixImageInterface(0xcbf29ce484222325ull, deviceInterfaceImage(image));
+    hash = (hash ^ modes.size()) * 0x100000001b3ull;
+    for (const auto& mode : modes) hash = mixImageInterface(hash, deviceInterfaceImage(mode));
+    return hash;
+}
+
+std::uint64_t ResourceMaterializer::RegisterDeviceImageInterface(const ImageResource& image, std::span<const ImageResource> modes) {
+    const auto id = DeviceImageInterfaceId(image, modes);
+    const auto same = [&](const DeviceImageInterface& entry) {
+        if (entry.image != deviceInterfaceImage(image) || entry.modes.size() != modes.size()) return false;
+        for (std::size_t index = 0; index < modes.size(); ++index) {
+            if (entry.modes[index] != deviceInterfaceImage(modes[index])) return false;
+        }
+        return true;
+    };
+    auto& registry = deviceImageInterfaces();
+    std::lock_guard lock(registry.mutex);
+    if (const auto found = registry.interfaces.find(id); found != registry.interfaces.end()) {
+        if (!same(*found->second)) throw std::runtime_error("device image interface: two image interfaces share the id 0x" + hexText(id));
+        return id;
+    }
+    auto entry = std::make_shared<DeviceImageInterface>();
+    entry->id = id;
+    entry->image = deviceInterfaceImage(image);
+    for (const auto& mode : modes) entry->modes.push_back(deviceInterfaceImage(mode));
+    registry.interfaces.emplace(id, std::move(entry));
+    return id;
+}
+
+std::shared_ptr<const DeviceImageInterface> ResourceMaterializer::FindDeviceImageInterface(std::uint64_t id) {
+    auto& registry = deviceImageInterfaces();
+    std::lock_guard lock(registry.mutex);
+    const auto found = registry.interfaces.find(id);
+    return found != registry.interfaces.end() ? found->second : nullptr;
+}
+
 }

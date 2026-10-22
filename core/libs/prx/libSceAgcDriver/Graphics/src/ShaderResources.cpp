@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BindlessHeap.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DeviceImageTable.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
@@ -5571,6 +5572,53 @@ void ShaderResources::resolveImageTables() {
 
 std::uint64_t SampledLookupKeyScans() {
     return sampledLookupKeyScans;
+}
+
+DeviceTableTexture LookupDeviceTableTexture(const Context& context, std::span<const std::uint32_t, 8> descriptor, const DeviceTableView& view, std::uint32_t samplerClass) {
+    namespace Abi = ShaderRecompiler::DeviceImageTableAbi;
+    std::array<std::uint32_t, 8> words{};
+    std::copy(descriptor.begin(), descriptor.end(), words.begin());
+    if (view.identitySwizzle) words[3] = (words[3] & ~0xfffu) | ShaderRecompiler::ShaderImageIdentitySwizzle;
+    const auto resource = DecodeTextureResource(words);
+    const bool firstLayer = view.shape == ShaderRecompiler::DescriptorImageShape::Image2D && resource.dimension == TextureDimension::k2DArray;
+    if (!firstLayer && !MatchesGuestDimension(view.shape, resource.dimension)) throw std::runtime_error("AGC graphics: guest texture dimension disagrees with the table entry's image shape (shape " + std::to_string(static_cast<int>(view.shape)) + ", dimension " + std::to_string(static_cast<int>(resource.dimension)) + ")");
+    const auto guestBytes = DescribeSurface(resource).guestBytes;
+    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(resource.baseAddress), static_cast<std::size_t>(guestBytes)) && GuestMemory::CommittedRanges(resource.baseAddress, static_cast<std::size_t>(guestBytes), false).empty()) throw std::runtime_error("AGC graphics: the table entry's surface at 0x" + HexText(resource.baseAddress) + " (0x" + HexText(guestBytes) + " bytes) is not mapped");
+    static_cast<void>(ResolveTextureFormat(resource.format));
+    CompletePendingCpuWrites(context, resource.baseAddress, static_cast<std::size_t>(guestBytes));
+    if (resource.dccAddress != 0) CompletePendingCpuWrites(context, resource.dccAddress, DccKeyBytes(guestBytes));
+    DeviceTableTexture result;
+    result.address = resource.baseAddress;
+    result.guestBytes = guestBytes;
+    result.generation = GuestMemory::CollectWrites(resource.baseAddress, static_cast<std::size_t>(guestBytes));
+    auto texture = cachedTexture(context, words, resource, ViewComponents(resource), guestBytes, view.depthCompare);
+    const auto& log = lookupLog();
+    const auto* looked = !log.empty() && log.back().object == texture.get() ? &log.back() : nullptr;
+    if (looked != nullptr && looked->depth) {
+        result.unservable = "the surface at 0x" + HexText(resource.baseAddress) + " is a depth surface, whose layout transitions per use the device image table does not make";
+        return result;
+    }
+    if (texture->CopyKind() != Texture::PerUseCopy::None) {
+        result.unservable = "the texture at 0x" + HexText(resource.baseAddress) + " is a copy remade or refreshed per use, which the device image table does not make";
+        return result;
+    }
+    if ((samplerClass & Abi::SamplerFilterMinmax) != 0u) {
+        VkFormatProperties properties{};
+        context.formatProperties(context.physical, texture->ViewFormat(), &properties);
+        if ((properties.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_MINMAX_BIT_EXT) == 0) throw std::runtime_error("a sampled texture whose format " + std::to_string(texture->ViewFormat()) + " does not support min/max filtering is sampled through a min or max reduction sampler with linear filtering");
+    }
+    if ((samplerClass & Abi::SamplerOpaqueBlackBorder) != 0u && resource.bcSwizzle != 0u && resource.bcSwizzle != 4u) throw std::runtime_error("a sampled texture whose BC swizzle " + std::to_string(resource.bcSwizzle) + " moves the alpha channel is sampled through an opaque black border, which is not implemented");
+    if ((samplerClass & Abi::SamplerNonSeamlessCube) != 0u && resource.dimension == TextureDimension::kCube && !context.nonSeamlessCubeMap) throw std::runtime_error("a cube texture is sampled through a sampler that disables seamless cube filtering, which needs VK_EXT_non_seamless_cube_map");
+    const auto numeric = ShaderRecompiler::DepthBitsTextureWidth(words[1], words[3]) != 0u ? ShaderRecompiler::IrTextureNumericClass::Float : ShaderRecompiler::SampledTextureNumericClass(static_cast<ShaderRecompiler::IrBufferFormat>(resource.format));
+    const bool integerImage = numeric == ShaderRecompiler::IrTextureNumericClass::Uint || numeric == ShaderRecompiler::IrTextureNumericClass::Sint;
+    if (((samplerClass & Abi::SamplerFloatBorder) != 0u && integerImage) || ((samplerClass & Abi::SamplerIntegerBorder) != 0u && !integerImage)) throw std::runtime_error("an image table entry's sampler border color numeric class disagrees with its sampled image class, which needs dynamic pairing and is not implemented");
+    if ((samplerClass & Abi::SamplerAnisoOverride) != 0u) throw std::runtime_error("an image table entry paired with anisotropic ANISO_OVERRIDE needs dynamic texture mip-level pairing, which is not implemented");
+    result.view = firstLayer ? texture->FirstLayerView() : texture->View();
+    result.layout = texture->Layout();
+    result.texture = std::move(texture);
+    result.words = words;
+    result.depthCompare = view.depthCompare;
+    return result;
 }
 
 ImageTableReuseCounts ImageTableReuses() {
