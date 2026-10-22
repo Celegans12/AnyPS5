@@ -278,6 +278,10 @@ int main() {
             if (!device) return VulkanTestSkipped;
         }
         const bool heap = std::getenv("APS5_GPU_HEAP") != nullptr;
+        if (heap && !AgcDriver::Graphics::DescriptorHeapEnabled()) {
+            std::cout << "skipped, the device lacks VK_EXT_descriptor_heap, or the maintenance5, slot room and push data the GPU heap needs with it, so APS5_GPU_HEAP has no heap to draw through\n";
+            return VulkanTestSkipped;
+        }
         {
             GuestAllocations::Mutation mutation;
             mutation.Add(StorageMemory.data(), StorageMemory.size(), true, true, true);

@@ -782,6 +782,10 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (argc >= 2 && std::string(argv[1]) == "--gpu-heap") {
+            if (AgcDriver::Graphics::GpuHeapEnabled() && !AgcDriver::Graphics::DescriptorHeapEnabled()) {
+                std::puts("skipped, the device lacks VK_EXT_descriptor_heap, or the maintenance5, slot room and push data the GPU heap needs with it, so no compute stage can run in GPU mode to record");
+                return VulkanTestSkipped;
+            }
             HeapJournalTests();
             std::puts("pipeline journal record and replay of a GPU-mode compute stage passed");
             return 0;
