@@ -120,6 +120,11 @@ const ProgramList& TintedVertexPrograms() {
     return list;
 }
 
+const ProgramList& DepthStateTracePrograms() {
+    static const auto& list = listFromEnvironment("APS5_TRACE_DEPTH_STATE");
+    return list;
+}
+
 const ProgramList& DumpedDrawPrograms() {
     static const auto& list = listFromEnvironment("APS5_DUMP_DRAW_PROGRAMS");
     return list;

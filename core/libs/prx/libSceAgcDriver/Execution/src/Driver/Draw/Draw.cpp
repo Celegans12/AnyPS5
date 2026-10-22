@@ -21,6 +21,7 @@
 #include <atomic>
 #include <limits>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 
 namespace AgcDriver::DriverDetail {
@@ -33,6 +34,20 @@ namespace {
 // vertex-path indirect draw whose CP-written base vertex / start instance SGPRs the stage uses
 // beyond the folded fetch offset ("patched SGPR not folded") compiles its front stage with those
 // SGPRs read from BaseVertex / BaseInstance, so the records stay on the GPU.
+void TraceDepthState(std::uint64_t vertexProgram, std::uint64_t pixelProgram, const Graphics::State& state) {
+    char text[640];
+    std::snprintf(text, sizeof(text), "vs 0x%llx ps 0x%llx colors %zu depth 0x%llx f%d test %d write %d cmp %d | viewport %g..%g zscale %g zoffset %g clamp [%g, %g] negOne %d depthClamp %d remap %u %g %g | bias %d const %g slope %g clamp %g perFace %d back %g %g | cull %d front %d topology %d",
+        static_cast<unsigned long long>(vertexProgram), static_cast<unsigned long long>(pixelProgram), state.colors.size(), static_cast<unsigned long long>(state.depth ? state.depth->address : 0), state.depth ? static_cast<int>(state.depth->format) : 0, state.depthTest ? 1 : 0, state.depthWrite ? 1 : 0, static_cast<int>(state.depthCompare),
+        state.viewport.minDepth, state.viewport.maxDepth, state.depthScale, state.depthOffset, state.depthClampMin, state.depthClampMax, state.negativeOneToOne ? 1 : 0, state.depthClamp ? 1 : 0, state.depthRemap.mode, state.depthRemap.scale, state.depthRemap.offset,
+        state.depthBias ? 1 : 0, state.depthBiasConstant, state.depthBiasSlope, state.depthBiasClamp, state.depthBiasPerFace ? 1 : 0, state.backDepthBiasConstant, state.backDepthBiasSlope, static_cast<int>(state.cullMode), static_cast<int>(state.frontFace), static_cast<int>(state.topology));
+    static std::mutex mutex;
+    static std::unordered_map<std::string, std::uint64_t> seen;
+    std::lock_guard lock(mutex);
+    if (seen.size() >= 256) return;
+    const auto hits = ++seen[text];
+    if (hits == 1) std::fprintf(stderr, "[depth-state] %s\n", text);
+}
+
 bool GpuIndirectArgs() {
     return !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoGpuIndirectArgs);
 }
@@ -343,6 +358,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         ApplyBlendTint(state.blends, state.blendConstants, formats);
         decode = std::move(tinted);
     }
+    if (!DepthStateTracePrograms().empty() && ListedProgram(DepthStateTracePrograms(), vertexProgram)) TraceDepthState(vertexProgram, pixelProgram, decode->state);
     bool skipDepthOnly = false;
     if (decode->state.depth && decode->state.depthWrite && !(filtered && !filterTargets.empty()) && VertexScheduleSkips(vertexProgram)) skipDepthOnly = true;
     const bool gbufferDraw = decode->state.colors.size() >= 4u && decode->state.depth.has_value();
