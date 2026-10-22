@@ -85,21 +85,6 @@ Instruction Make(spv::Op op, std::initializer_list<std::uint32_t> operands) {
     return result;
 }
 
-class IdSet {
-public:
-    void Reset(std::size_t bound) { present.assign(bound, 0u); }
-    bool contains(std::uint32_t id) const { return id < present.size() && present[id] != 0u; }
-    bool insert(std::uint32_t id) {
-        if (id >= present.size()) throw std::runtime_error("prepared SPIR-V id exceeds the module bound");
-        if (present[id] != 0u) return false;
-        present[id] = 1u;
-        return true;
-    }
-
-private:
-    std::vector<std::uint8_t> present;
-};
-
 bool PureInstruction(const Instruction& instruction) {
     switch (Opcode(instruction)) {
     case spv::OpVectorExtractDynamic:
@@ -568,6 +553,21 @@ private:
     std::size_t count = 0;
 };
 
+class IdSet {
+public:
+    void Reset(std::size_t bound) { present.assign(bound, 0u); }
+    bool contains(std::uint32_t id) const { return id < present.size() && present[id] != 0u; }
+    bool insert(std::uint32_t id) {
+        if (id >= present.size()) throw std::runtime_error("prepared SPIR-V id exceeds the module bound");
+        if (present[id] != 0u) return false;
+        present[id] = 1u;
+        return true;
+    }
+
+private:
+    std::vector<std::uint8_t> present;
+};
+
 class Specialization {
 public:
     explicit Specialization(std::span<const std::uint32_t> words) : arena(words.size()) {
@@ -599,7 +599,7 @@ public:
             if (op == spv::OpConstantTrue || op == spv::OpConstantFalse) values.emplace(instruction.at(2), op == spv::OpConstantTrue ? 1u : 0u);
             if ((op == spv::OpConstant || op == spv::OpConstantTrue || op == spv::OpConstantFalse) && values.contains(instruction.at(2))) canonical.emplace(std::pair{instruction.at(1), values.at(instruction[2])}, instruction[2]);
             if (op == spv::OpConstantComposite && instruction.size() >= 3u) composites.emplace(instruction.at(2), std::vector<std::uint32_t>(instruction.begin() + 3, instruction.end()));
-            if (op == spv::OpVariable && instruction.size() == 5u && instruction[3] == spv::StorageClassPrivate && composites.contains(instruction[4])) privateTables.emplace(instruction.at(2), instruction[4]);
+            if (op == spv::OpVariable && instruction.size() == 5u && (instruction[3] == spv::StorageClassPrivate || instruction[3] == spv::StorageClassFunction) && composites.contains(instruction[4])) privateTables.emplace(instruction.at(2), instruction[4]);
             cursor += count;
         }
         IdTable<std::uint32_t> tablePointers;
