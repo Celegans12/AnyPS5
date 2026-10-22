@@ -24,6 +24,8 @@
 
 namespace AgcDriver::DriverDetail {
 
+std::uint64_t& AheadDumpKey();
+
 namespace {
 
 // gpuind: GPU-side indirect draw parameters (APS5_NO_GPU_INDIRECT_ARGS=1 turns them off). A
@@ -289,6 +291,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         }
         maybeReportDrawCache(profile);
     }
+    AheadDumpKey() = drawKey;
     if (decode != nullptr && !DecodeProgramsCurrent(*decode, *submission.shaders)) {
         userPatches.clear();
         std::lock_guard cacheLock(drawCacheMutex);

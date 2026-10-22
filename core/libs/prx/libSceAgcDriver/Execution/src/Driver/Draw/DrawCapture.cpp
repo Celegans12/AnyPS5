@@ -8,6 +8,8 @@
 #include "Optimization/ResourceProgram.hpp"
 #include "ShaderDiskCache.hpp"
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
@@ -36,6 +38,23 @@ bool SameCompilation(const ShaderRecompiler::RecompileResult& a, const ShaderRec
     ShaderRecompiler::ShaderDiskCache::EncodeResult(left, encodedLeft);
     ShaderRecompiler::ShaderDiskCache::EncodeResult(right, encodedRight);
     return encodedLeft == encodedRight;
+}
+
+// Debug (local, APS5_DRAW_AHEAD_DUMP=<n>): the first <n> stage requests built by draw-ahead workers and by queue 0,
+// named by draw key and stage, for diffing the two builds of one draw.
+std::uint64_t& AheadDumpKey() {
+    thread_local std::uint64_t key = 0;
+    return key;
+}
+
+void DumpAheadRequest(const char* side, std::uint64_t key, std::size_t stage, std::uint64_t address, const ShaderRecompiler::RecompileRequest& request) {
+    static const long limit = [] { const char* text = std::getenv("APS5_DRAW_AHEAD_DUMP"); return text ? std::strtol(text, nullptr, 10) : 0L; }();
+    if (limit <= 0 || key == 0) return;
+    static std::atomic<long> dumped{0};
+    if (dumped.fetch_add(1, std::memory_order_relaxed) >= 2 * limit) return;
+    char suffix[96];
+    std::snprintf(suffix, sizeof(suffix), "_k%016llx_s%zu_%s", static_cast<unsigned long long>(key), stage, side);
+    static_cast<void>(Driver::dumpRequest(address, request, suffix));
 }
 
 ShaderRecompiler::RecompileRequest DrawStageRequest(const DrawProgram& program, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertexInfo, std::span<const ShaderRecompiler::MemoryRegion> memory, std::span<const ShaderRecompiler::LinkedProgram> linked, const Pm4::DrawParameters& drawParameters, const ShaderRecompiler::SpirvTarget& target, std::uint32_t pushOffset, const std::optional<ShaderRecompiler::MeshBarycentricLayout>& meshBarycentrics) {
@@ -84,6 +103,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     phaseTiming.Phase(DrawRowVectors);
     const auto& program = programs[i];
     auto request = DrawStageRequest(program, graphics, pixel, vertexInfos[i], memory, linked, drawParameters, localDevice->Target(), pushOffset, meshBarycentrics);
+    DumpAheadRequest("q0", AheadDumpKey(), i, program.binary.codeAddress, request);
     const auto waitedBefore = traceCapSync() || profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
     auto invocation = InvocationFor(*program.snapshot, program.codeOffset, request);
     timing.Mark("prepared_invocation");
@@ -258,6 +278,7 @@ bool Driver::compileDrawAhead(std::uint64_t key, std::uint64_t shape, const std:
             }
         }
         const auto request = DrawStageRequest(program, graphics, pixel, vertexInfos[i], memory, linked, parameters, localDevice->Target(), pushCursorBytes);
+        DumpAheadRequest("ahead", key, i, program.binary.codeAddress, request);
         auto invocation = InvocationFor(*program.snapshot, program.codeOffset, request);
         auto& stageCapture = stageCaptures[i];
         stageCapture.forgetSerial = GuestMemory::ForgetSerial();
