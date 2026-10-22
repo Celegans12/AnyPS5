@@ -6,9 +6,11 @@
 #include "Optimization/ResourceMaterializer.hpp"
 #include "Recompiler.hpp"
 #include <cstdint>
+#include <span>
 
 namespace ShaderRecompiler {
 
+std::uint32_t DeviceSamplerClass(std::span<const std::uint32_t, 4> words, bool integerBorder);
 std::uint32_t PointFilteredSamplerWord(std::uint32_t word0, std::uint32_t filter);
 struct PreparedDescriptorBinding {
     DescriptorBinding descriptor;

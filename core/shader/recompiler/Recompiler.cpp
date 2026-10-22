@@ -357,8 +357,10 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
     deadCodeEliminator.Eliminate(program);
     dumpIr("srt");
 
+    const bool heapStage = request.shader.stage == ShaderStage::Fragment || request.shader.stage == ShaderStage::Vertex || request.shader.stage == ShaderStage::Compute;
+    const bool gpuModeStage = request.target.gpuResolvedImages && request.target.descriptorMemory && heapStage;
     constexpr ResourceTracker resourceTracker;
-    resourceTracker.Track(program);
+    resourceTracker.Track(program, request.target.deviceImageTables && gpuModeStage && supports(spv::CapabilityInt64) && supports(spv::CapabilityPhysicalStorageBufferAddresses));
     deadCodeEliminator.Eliminate(program);
     dumpIr("resources");
     program.Resources().srgbDecodeFormats = request.target.srgbDecodeFormats;
@@ -799,6 +801,8 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program)
     }
     result.gpuResolvedImages = targetOptions.gpuResolvedImages;
     result.samplerSlotDword = result.gpuResolvedImages ? bindings.layout.SamplerSlotDword() : 0u;
+    result.deviceImageTables = std::ranges::any_of(program.Info().images, [](const ImageResource& image) { return image.deviceTable; });
+    if (result.deviceImageTables && !(result.gpuResolvedImages && bindings.layout.UsesDataAddress())) throw std::logic_error("a device image table column was planned for a stage that is not a GPU-mode stage reading its table map by address");
     result.bufferAddressDword = bindings.layout.bufferAddressDwords != 0u ? bindings.layout.BufferAddressDword() : 0u;
     result.bufferAddressCount = bindings.layout.bufferAddressDwords / 4u;
     result.dataAddressPush = bindings.layout.UsesDataAddress();
@@ -1225,6 +1229,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         .bufferAddressCount = artifact.bufferAddressCount,
         .dataAddressPush = artifact.dataAddressPush,
         .bdaStores = artifact.bdaStores,
+        .deviceImageTables = artifact.deviceImageTables,
         .bdaAbiVersion = artifact.bdaAbiVersion,
         .windowLaneGuards = artifact.windowLaneGuards,
         .descriptorFaults = artifact.descriptorFaults,
@@ -1375,6 +1380,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
     }
     const auto resolved = ResourceMaterializer::ResolveImageTablesShared(variant.info.info, snapshot, artifact.variantId);
     const auto& tables = *resolved;
+    if (artifact.deviceImageTables) ResourceMaterializer::RegisterDeviceImageInterfaces(variant.info.info);
     if (usedPlan != nullptr) *usedPlan = {entry != nullptr ? std::shared_ptr<const void>(entry) : std::shared_ptr<const void>(plan), bindingPlan};
     BindingAllocationResult bindings;
     DescriptorBindingBuilder{}.Populate(bindings, variant.bindings, *bindingPlan, variant.info.userDataBase, snapshot, partialThreads(request), &tables);

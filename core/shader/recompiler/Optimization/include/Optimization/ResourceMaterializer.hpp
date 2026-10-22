@@ -87,6 +87,7 @@ public:
     static ResolvedImageTables ResolveImageTables(const ShaderInfo& info, const ResourceSnapshot& snapshot, std::uint64_t memoKey = 0);
     static std::uint64_t DeviceImageInterfaceId(const ImageResource& image, std::span<const ImageResource> modes);
     static std::uint64_t RegisterDeviceImageInterface(const ImageResource& image, std::span<const ImageResource> modes);
+    static void RegisterDeviceImageInterfaces(const ShaderInfo& info);
     static std::shared_ptr<const DeviceImageInterface> FindDeviceImageInterface(std::uint64_t id);
     [[nodiscard]] IrResourcePlan ExtractPlan(const IrProgram& program) const;
     static void CompactPlan(IrResourcePlan& plan);

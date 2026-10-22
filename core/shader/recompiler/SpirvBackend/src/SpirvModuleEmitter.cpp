@@ -5,6 +5,7 @@
 #include "SpirvBackend/SpirvFlowEmitter.hpp"
 #include "SpirvBackend/SpirvBda.hpp"
 #include <cmath>
+#include "SpirvBackend/SpirvImageEmitter.hpp"
 #include <spirv/unified1/GLSL.std.450.h>
 #include <spirv/unified1/spirv.hpp>
 #include "PipelineSpecialization.hpp"
@@ -1699,6 +1700,7 @@ void EmitProgram(SpirvEmitterState& state) {
         state.labels.emplace(block, label);
     }
     DefineGetBdaPointer(state);
+    DefineDeviceImageLookup(state);
     DefineDot2F32F16Function(state);
     DefineReciprocalCorrectionFunction(state);
     for (const IrBlock* block : program.BlockOrder()) {

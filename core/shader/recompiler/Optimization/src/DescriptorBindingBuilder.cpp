@@ -3,6 +3,7 @@
 #include "RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include "SpirvBackend/SpirvEmitterHelpers.hpp"
 #include "SpirvBackend/SpirvBufferFormat.hpp"
+#include "DeviceImageTableAbi.hpp"
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
 #include <atomic>
@@ -286,6 +287,27 @@ bool ReducesBetweenTexels(std::uint32_t word0, std::uint32_t filter) {
     return ((word0 >> 29u) & 3u) != 0u && (((filter >> 20u) & 0xfu) != 0u || ((filter >> 26u) & 3u) == 2u);
 }
 
+std::uint32_t DeviceSamplerClass(std::span<const std::uint32_t, 4> words, bool integerBorder) {
+    namespace Abi = DeviceImageTableAbi;
+    const auto linear = [](std::uint32_t filter) { return filter == 1u || filter == 3u; };
+    const auto anisotropic = [](std::uint32_t filter) { return filter == 2u || filter == 3u; };
+    const auto magFilter = (words[2] >> 20u) & 3u;
+    const auto minFilter = (words[2] >> 22u) & 3u;
+    bool border = false;
+    for (std::uint32_t axis = 0; axis < 3u; ++axis) {
+        const auto clamp = (words[0] >> (axis * 3u)) & 7u;
+        border = border || clamp == 4u || clamp == 6u;
+    }
+    std::uint32_t bits = 0u;
+    if (((words[0] >> 29u) & 3u) != 0u && (linear(magFilter) || linear(minFilter))) bits |= Abi::SamplerFilterMinmax;
+    if (border && ((words[3] >> 30u) & 3u) == 1u) bits |= Abi::SamplerOpaqueBlackBorder;
+    if (((words[0] >> 28u) & 1u) != 0u) bits |= Abi::SamplerNonSeamlessCube;
+    if (border) bits |= integerBorder ? Abi::SamplerIntegerBorder : Abi::SamplerFloatBorder;
+    if (((words[2] >> 29u) & 1u) != 0u && (anisotropic(magFilter) || anisotropic(minFilter))) bits |= Abi::SamplerAnisoOverride;
+    if (ReducesBetweenTexels(words[0], words[2])) bits |= Abi::SamplerReduction;
+    return bits;
+}
+
 std::uint32_t PointFilteredSamplerWord(std::uint32_t word0, std::uint32_t filter) {
     if (ReducesBetweenTexels(word0, filter)) {
         fail("DescriptorBindingBuilder: a min or max reduction sampler that filters between texels or mip levels samples an image that needs point filtering (sint, converted or depth-bits format), which is not implemented");
@@ -402,6 +424,17 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
         } else {
             samplerModes.at(pair.sampler) |= 3u;
         }
+    }
+    for (std::uint32_t sampler = 0; sampler < info.samplers.size(); ++sampler) {
+        if (std::ranges::none_of(info.sampledPairs, [&](const SampledResourcePair& pair) { return pair.sampler == sampler && info.images.at(pair.image).deviceTable; })) continue;
+        const auto& words = snapshot.samplers.at(sampler).dwords;
+        std::uint32_t bits = 0u;
+        for (const auto mode : {1u, 2u}) {
+            if ((samplerModes.at(sampler) & mode) == 0u) continue;
+            const bool integerBorder = (samplerIntegerModes.at(sampler) & mode) != 0u && (samplerFloatModes.at(sampler) & mode) == 0u;
+            bits |= DeviceSamplerClass(std::span<const std::uint32_t, 4>(words.data(), 4u), integerBorder);
+        }
+        plan.specialization.push_back({PipelineSpecialization::DeviceSamplerClassBase + sampler, bits});
     }
     for (std::uint32_t index = 0; index < info.images.size(); ++index) {
         if (info.images[index].mipMode != ImageMipMode::DynamicStorage) continue;

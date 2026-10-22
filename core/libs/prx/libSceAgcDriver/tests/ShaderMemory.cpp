@@ -28,6 +28,7 @@
 #include "CacheKey.hpp"
 #include "CompiledVariant.hpp"
 #include "BdaAbi.hpp"
+#include "DeviceImageTableAbi.hpp"
 #include "ImageTableAbi.hpp"
 #include "ShaderDiskCache.hpp"
 #include <limits>
@@ -53,6 +54,7 @@
 #include <chrono>
 #include <thread>
 #include <string>
+#include <set>
 #include <string_view>
 #include <tuple>
 #include <utility>
@@ -4127,6 +4129,191 @@ void verifyScalarAddressRule() {
             const bool exact = static_cast<std::uint64_t>(maxKey) * stride <= 0xffffffffull;
             require(Abi::KeyRecords(maxKey, stride) == (exact ? maxKey + 1u : 0xffffffffu), "scalar address rule: the key bound is wrong");
         }
+    }
+}
+
+ShaderRecompiler::RecompileRequest DeviceTableRequest(const std::vector<std::uint32_t>& code, std::span<const std::uint32_t> userData, bool pixel, bool deviceTables, bool gpuMode) {
+    using namespace ShaderRecompiler;
+    static constexpr std::array<std::uint32_t, 4> capabilities{29u, spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess};
+    static constexpr std::array<std::string_view, 2> extensions{"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
+    std::uint64_t hash = 0xcbf29ce484222325ull;
+    for (const auto word : code) hash = (hash ^ word) * 0x100000001b3ull;
+    RecompileRequest request{};
+    request.shader = {pixel ? ShaderStage::Fragment : ShaderStage::Compute, 0x200000u + (hash & 0xffffu) * 0x100u, code, 0, {}};
+    request.context.waveSize = pixel ? 32u : 64u;
+    request.context.userDataBaseRegister = 0;
+    request.context.userData = userData;
+    if (pixel) {
+        request.context.pixel = ShaderPixelStageInfo{};
+        request.context.pixel->inputAddr = PixelInputBit(PixelInput::PositionX);
+        request.context.pixel->posX = true;
+        request.context.pixel->targetOutputMode[0] = 9u;
+        request.context.pixel->targetExportMapping.fill(0xe4u);
+    } else {
+        request.context.compute = ShaderComputeStageInfo{{64u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
+    }
+    request.target.vulkanVersion = 0x00401000u;
+    request.target.spirvVersion = 0x00010300u;
+    request.target.subgroupSize = 32u;
+    request.target.supportedCapabilities = capabilities;
+    request.target.supportedExtensions = extensions;
+    request.target.bdaAbiVersion = BdaAbi::Version;
+    request.target.fragmentShaderBarycentricEnabled = false;
+    request.target.gpuResolvedImages = gpuMode;
+    request.target.descriptorMemory = gpuMode;
+    request.target.deviceImageTables = deviceTables;
+    request.layout.pushConstantSizeBytes = 128;
+    return request;
+}
+
+struct DeviceTableSpirvScan {
+    bool lookup = false;
+    std::set<std::uint32_t> lookupSubtrahends;
+    std::set<std::uint32_t> sets;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> tableArrays;
+    std::vector<std::array<std::uint32_t, 4>> lookupKeys;
+};
+
+DeviceTableSpirvScan ScanDeviceTableSpirv(std::span<const std::uint32_t> words) {
+    DeviceTableSpirvScan result;
+    std::map<std::uint32_t, std::uint32_t> sets;
+    std::map<std::uint32_t, std::uint32_t> bindings;
+    std::map<std::uint32_t, std::string> names;
+    std::map<std::uint32_t, std::uint32_t> constants;
+    std::map<std::uint32_t, std::vector<std::uint32_t>> composites;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> calls;
+    std::vector<std::uint32_t> subtracted;
+    std::uint32_t lookup = 0;
+    std::uint32_t function = 0;
+    for (std::size_t cursor = 5; cursor < words.size();) {
+        const auto count = words[cursor] >> 16u;
+        require(count != 0 && count <= words.size() - cursor, "device image tables: truncated SPIR-V instruction");
+        const auto op = words[cursor] & 0xffffu;
+        if (op == spv::OpName && count > 2u) {
+            const auto* text = reinterpret_cast<const char*>(words.data() + cursor + 2u);
+            names[words[cursor + 1]] = std::string(text, std::min<std::size_t>(std::strlen(text), (count - 2u) * 4u));
+            if (names[words[cursor + 1]] == "device_image_lookup") lookup = words[cursor + 1];
+        }
+        if (op == spv::OpDecorate && count == 4u && words[cursor + 2] == spv::DecorationDescriptorSet) sets[words[cursor + 1]] = words[cursor + 3];
+        if (op == spv::OpDecorate && count == 4u && words[cursor + 2] == spv::DecorationBinding) bindings[words[cursor + 1]] = words[cursor + 3];
+        if (op == spv::OpConstant && count == 4u) constants[words[cursor + 2]] = words[cursor + 3];
+        if ((op == spv::OpCompositeConstruct || op == spv::OpConstantComposite) && count > 3u) composites[words[cursor + 2]] = std::vector<std::uint32_t>(words.begin() + cursor + 3, words.begin() + cursor + count);
+        if (op == spv::OpFunctionCall && count >= 7u) calls.emplace_back(words[cursor + 3], words[cursor + 6]);
+        if (op == spv::OpFunction && count >= 5u) function = words[cursor + 2];
+        if (op == spv::OpFunctionEnd) function = 0;
+        if (op == spv::OpISub && count == 5u && function != 0u && function == lookup) subtracted.push_back(words[cursor + 4]);
+        cursor += count;
+    }
+    result.lookup = lookup != 0u;
+    for (const auto operand : subtracted) {
+        if (const auto constant = constants.find(operand); constant != constants.end()) result.lookupSubtrahends.insert(constant->second);
+    }
+    for (const auto& [callee, extra] : calls) {
+        const auto composite = composites.find(extra);
+        if (callee != lookup || composite == composites.end() || composite->second.size() != 4u) continue;
+        std::array<std::uint32_t, 4> values{};
+        bool known = true;
+        for (std::size_t component = 0; component < 4u; ++component) {
+            const auto constant = constants.find(composite->second[component]);
+            known = known && constant != constants.end();
+            if (known) values[component] = constant->second;
+        }
+        if (known) result.lookupKeys.push_back(values);
+    }
+    for (const auto& [id, set] : sets) {
+        result.sets.insert(set);
+        const auto binding = bindings.find(id);
+        const auto name = names.find(id);
+        if (binding != bindings.end() && name != names.end() && name->second.rfind("table_images_", 0) == 0) result.tableArrays.emplace_back(set, binding->second);
+    }
+    return result;
+}
+
+const std::vector<std::uint32_t> DeviceTableComputeCode{0xf4080100u, 0xfa000000u, 0xf4080200u, 0xfa000010u, 0xf4080700u, 0xfa000030u, 0xbe900302u, 0x8f108510u, 0xf42c0502u, 0x20000000u, 0xf09c0f08u, 0x00450000u, 0xe0700000u, 0x80070000u, 0xbf810000u};
+const std::vector<std::uint32_t> DeviceTablePixelCode{0xf4080100u, 0xfa000000u, 0xf4080200u, 0xfa000010u, 0x7e020300u, 0xbe900302u, 0x8f108510u, 0xf42c0502u, 0x20000000u, 0xf09c0f08u, 0x00450000u, 0xf800180fu, 0x03020100u, 0xbf810000u};
+
+void verifyDeviceImageTables() {
+    using namespace ShaderRecompiler;
+    namespace Abi = DeviceImageTableAbi;
+    namespace TableAbi = ImageTableAbi;
+    constexpr std::uint32_t Entries = 2000;
+    static TableTexture textures[2];
+    alignas(4096) static std::array<std::array<std::uint32_t, 8>, Entries> heap{};
+    alignas(4096) static std::array<std::uint32_t, 16> srt{};
+    static std::array<std::uint32_t, 4> output{};
+    for (std::uint32_t entry = 0; entry < Entries; ++entry) heap[entry] = TableT(textures[entry % 2u].bytes.data(), TableFormat8888UNorm, TableType2D);
+    const auto heapV = TableV(heap.data(), 32u, Entries);
+    const auto outputV = TableV(output.data(), 0u, 16u);
+    std::copy(heapV.begin(), heapV.end(), srt.begin());
+    srt[4] = 6u;
+    srt[5] = 0u;
+    srt[6] = 0u;
+    srt[7] = 1u << 30u;
+    std::copy(outputV.begin(), outputV.end(), srt.begin() + 12);
+    const auto address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(srt.data()));
+    const std::array<std::uint32_t, 3> userData{static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), 7u};
+    constexpr std::uint32_t samplerClass = Abi::SamplerOpaqueBlackBorder | Abi::SamplerFloatBorder;
+    const std::set<std::uint32_t> trailerWords{TableAbi::TrailerWords - TableAbi::TrailerBucketsLow, TableAbi::TrailerWords - TableAbi::TrailerBucketsHigh, TableAbi::TrailerWords - TableAbi::TrailerRingLow, TableAbi::TrailerWords - TableAbi::TrailerRingHigh};
+    for (const bool pixel : {false, true}) {
+        const auto& code = pixel ? DeviceTablePixelCode : DeviceTableComputeCode;
+        const auto request = DeviceTableRequest(code, userData, pixel, true, true);
+        const auto plan = GetResourcePlan(request);
+        require(plan->info.images.size() == 1u && plan->info.images[0].table != NoTable && plan->info.images[0].deviceTable, "device image tables: the GPU-mode stage's V# table column is not read at run time");
+        require(!plan->requiresSpecializationMemory, "device image tables: a program whose only table is a device table still needs specialization memory");
+        const auto compiled = CompileTable(request);
+        require(!TableTouched(compiled.regions, heap.data(), sizeof(heap)), "device image tables: the capture read the table records");
+        const auto& result = *compiled.result;
+        require(result.deviceImageTables && result.gpuResolvedImages && result.dataAddressPush, "device image tables: the result is not a GPU-mode stage reading the device image table");
+        const auto* map = TableBinding(result, DescriptorRole::ImageTableMap);
+        require(map != nullptr && map->guestDescriptor.size() >= TableAbi::HeaderWords && map->guestDescriptor[TableAbi::HeaderVersion] == TableAbi::Version, "device image tables: the GPU-mode stage has no table map to carry the trailer");
+        const auto& mapWords = map->guestDescriptor;
+        require(mapWords[TableAbi::HeaderElementCount] == 0u && mapWords[TableAbi::TableHeader(0) + TableAbi::TableKeyCount] == 0u, "device image tables: the device column's records went into the CPU map");
+        require(TableBinding(result, DescriptorRole::SamplerTable) == nullptr, "device image tables: a device-table program bound a sampler table");
+        const auto scan = ScanDeviceTableSpirv(result.spirv.Words());
+        require(scan.lookup, "device image tables: the module has no device image lookup");
+        require(std::ranges::includes(scan.lookupSubtrahends, trailerWords), "device image tables: the lookup does not read the bucket and ring addresses from the four trailer words before the element base");
+        require(scan.sets.size() <= 2u && !scan.sets.contains(2u) && !scan.sets.contains(3u), "device image tables: the module declares descriptor sets 2 or 3");
+        require(!scan.tableArrays.empty(), "device image tables: the module has no table image array for the device slots");
+        for (const auto& [set, binding] : scan.tableArrays) require(set == RuntimeAbi::FragmentDescriptorSet && binding == NativeBinding(IrShaderStage::Pixel, static_cast<DescriptorBindingKind>(RuntimeAbi::FirstImageBinding)), "device image tables: a table image array does not alias the GPU heap's first sampled binding");
+        const auto& modes = plan->info.runtimeImageModes.at(0);
+        require(!scan.lookupKeys.empty(), "device image tables: the lookup is not keyed by constants");
+        for (const auto& key : scan.lookupKeys) {
+            require(key[2] == samplerClass, "device image tables: the lookup's sampler class is not the S#'s");
+            const auto registered = ResourceMaterializer::FindDeviceImageInterface(key[0] | (static_cast<std::uint64_t>(key[1]) << 32u));
+            require(registered != nullptr && registered->modes.size() == modes.size() && registered->image.deviceTable, "device image tables: the module's image interface was not registered with its modes");
+        }
+#if ANYPS5_ENABLE_SPIRV_TOOLS
+        static_cast<void>(ValidateAndOptimizeSpirv(result.spirv, request.target.vulkanVersion, request.target.spirvVersion));
+#endif
+
+        const auto offRequest = DeviceTableRequest(code, userData, pixel, false, true);
+        const auto offPlan = GetResourcePlan(offRequest);
+        require(offPlan->info.images.size() == 1u && offPlan->info.images[0].table != NoTable && !offPlan->info.images[0].deviceTable && offPlan->requiresSpecializationMemory, "device image tables: the table column left the CPU map with the option off");
+        const auto off = CompileTable(offRequest);
+        require(!off.result->deviceImageTables && !ScanDeviceTableSpirv(off.result->spirv.Words()).lookup, "device image tables: the option off still emitted the device lookup");
+
+        const auto perDraw = DeviceTableRequest(code, userData, pixel, true, false);
+        const auto perDrawPlan = GetResourcePlan(perDraw);
+        require(perDrawPlan->info.images.size() == 1u && perDrawPlan->info.images[0].table != NoTable && !perDrawPlan->info.images[0].deviceTable, "device image tables: a stage on the per-draw path read a column through the device image table");
+    }
+
+    alignas(4096) static TableGuest guest;
+    std::fill(guest.heap.begin(), guest.heap.end(), std::array<std::uint32_t, 8>{});
+    guest.heap[0] = TableT(textures[0].bytes.data(), TableFormat8888UNorm, TableType2D);
+    FillTableSrt(guest, guest.heap.data(), 32u, 4u);
+    const auto guestData = TableUserData(guest);
+    const std::vector<std::uint32_t> storeCode{0xf4080100u, 0xfa000000u, 0xf4080700u, 0xfa000030u, 0x7e200500u, 0x8f108510u, 0xf42c0502u, 0x20000000u, 0xf0200f08u, 0x00050200u, 0xbf810000u};
+    const std::vector<std::uint32_t> compareCode{0xf4080100u, 0xfa000000u, 0xf4080200u, 0xfa000010u, 0xf4080700u, 0xfa000030u, 0x7e200500u, 0x8f108510u, 0xf42c0502u, 0x20000000u, 0xf0fc0108u, 0x00450000u, 0xe0700000u, 0x80070000u, 0xbf810000u};
+    const std::vector<std::uint32_t> samplerTableCode{0xf4080100u, 0xfa000000u, 0xf4080300u, 0xfa000020u, 0xf4080700u, 0xfa000030u, 0xf4000400u, 0xfa000040u, 0x7e240500u, 0x8f118412u, 0x8f108510u, 0xf42c0502u, 0x20000000u, 0xf4280206u, 0x22000000u, 0xf09c0f08u, 0x00450000u, 0xe0700000u, 0x80070000u, 0xbf810000u};
+    const std::vector<std::uint32_t> unnormalizedCode{0xf4080100u, 0xfa000000u, 0xbe8803ffu, 0x00008000u, 0xbe890380u, 0xbe8a0380u, 0xbe8b0380u, 0xf4080700u, 0xfa000030u, 0xf4000400u, 0xfa000040u, 0x8f108510u, 0xf42c0502u, 0x20000000u, 0xf09c0f08u, 0x00450000u, 0xe0700000u, 0x80070000u, 0xbf810000u};
+    for (const auto* code : {&storeCode, &compareCode, &samplerTableCode, &unnormalizedCode}) {
+        auto request = TableRequest(*code, guestData);
+        request.target.gpuResolvedImages = true;
+        request.target.descriptorMemory = true;
+        request.target.deviceImageTables = true;
+        const auto plan = GetResourcePlan(request);
+        require(!plan->info.images.empty() && plan->info.images[0].table != NoTable && !plan->info.images[0].deviceTable, "device image tables: a column with a storage write, a depth compare, a sampler table or an unnormalized sampler left the CPU map");
+        require(code != &samplerTableCode || (plan->info.samplers.size() == 1u && plan->info.samplers[0].table != NoTable), "device image tables: the sampler table program has no sampler table");
     }
 }
 
@@ -9757,6 +9944,11 @@ int main(int argc, char** argv) {
             verifyWaterfallImageTable();
             verifySplitWaterfallImageTable();
             std::cout << "Image table keys, maps, records and registration passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--device-image-tables") {
+            verifyDeviceImageTables();
+            std::cout << "GPU-mode stages read V# table columns through the device image table, whose addresses they take from the map trailer\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--table-trailer") {

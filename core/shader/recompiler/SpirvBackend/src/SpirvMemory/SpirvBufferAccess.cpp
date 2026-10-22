@@ -75,6 +75,10 @@ std::uint32_t wordPointer(SpirvEmitterState& state, std::uint32_t base, std::uin
 
 }
 
+std::uint32_t EmitAddressWordPointer(SpirvEmitterState& state, std::uint32_t base, std::uint32_t index) {
+    return wordPointer(state, base, index);
+}
+
 std::uint32_t EmitRootAddressWordPointer(SpirvEmitterState& state, std::uint32_t field, std::uint32_t index) {
     return wordPointer(state, rootAddress(state, field), index);
 }

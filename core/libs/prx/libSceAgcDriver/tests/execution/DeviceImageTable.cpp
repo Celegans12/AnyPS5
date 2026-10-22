@@ -182,8 +182,8 @@ ShaderRecompiler::RuntimeImageModeMatch ExpectedMode(const Key& key) {
     return ShaderRecompiler::ResourceMaterializer::TryRuntimeImageMode(sampled->image, descriptor, sampled->modes);
 }
 
-std::uint32_t KindOf(const DeviceImageValue& value) {
-    return static_cast<std::uint32_t>(ShaderRecompiler::DescriptorBindingForImage(SampledInterface()->modes.at(value.mode)));
+std::uint32_t KindOf(const DeviceImageValue&) {
+    return Runtime::FirstImageBinding;
 }
 
 void ResolvesAndUploads(AgcDriver::VulkanDevice& device) {

@@ -344,13 +344,13 @@ std::optional<DeviceImageValue> DeviceImageTable::lookupKey(const Context& build
         if (failure != nullptr) *failure = texture.unservable;
         return std::nullopt;
     }
-    const auto slot = slots.nearlyFull() ? std::nullopt : slots.take(kind, texture.texture, texture.view, texture.layout);
+    const auto slot = slots.nearlyFull() ? std::nullopt : slots.take(Runtime::FirstImageBinding, texture.texture, texture.view, texture.layout);
     if (!slot.has_value()) {
-        heapFull(key, kind);
-        if (failure != nullptr) *failure = "the image heap has no free slot of kind " + std::to_string(kind) + " outside its margin";
+        heapFull(key, Runtime::FirstImageBinding);
+        if (failure != nullptr) *failure = "the image heap has no free sampled slot outside its margin";
         return std::nullopt;
     }
-    entry = {std::move(texture.texture), kind, *slot, slots.generation(kind, *slot), texture.address, texture.guestBytes, texture.generation, stamp, 0u, 0u, texture.words, texture.depthCompare};
+    entry = {std::move(texture.texture), Runtime::FirstImageBinding, *slot, slots.generation(Runtime::FirstImageBinding, *slot), texture.address, texture.guestBytes, texture.generation, stamp, 0u, 0u, texture.words, texture.depthCompare};
     return DeviceImageValue{*slot, *match.mode, 0u, 0u};
 }
 

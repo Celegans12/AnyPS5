@@ -353,6 +353,7 @@ struct SpirvTarget {
     bool descriptorMemory = false;
     bool ldsLockFences = false;
     bool fragmentBarycentricBuiltins = false;
+    bool deviceImageTables = false;
 };
 
 struct BindingLayout {
@@ -766,6 +767,7 @@ struct CompiledShaderArtifact {
     std::uint32_t bufferAddressCount = 0;
     bool dataAddressPush = false;
     bool bdaStores = false;
+    bool deviceImageTables = false;
     std::uint32_t bdaAbiVersion = 0;
     std::uint32_t windowLaneGuards = 0;
     std::uint32_t descriptorFaults = 0;

@@ -6307,7 +6307,17 @@ void ShaderResources::writeHeapTableMap(const CompiledShader& shader, std::size_
     auto& map = HostThreadLocal<std::vector<std::uint32_t>, MapStorage>();
     map.assign(table->map.begin(), table->map.end());
     const auto elements = images != nullptr ? static_cast<std::size_t>(images->count) : std::size_t{0};
-    const auto base = TableAbi::AppendTrailer(map, {});
+    TableAbi::Trailer trailer;
+    if (shader.program->deviceImageTables) {
+        auto* deviceTable = DeviceImageTable::Existing(context);
+        auto* recorder = Recorder::Active();
+        Require(deviceTable != nullptr, "a stage reading images through the device image table needs the device's table");
+        Require(recorder != nullptr, "a stage reading images through the device image table records into the device's recorder");
+        const std::array<ShaderRecompiler::PipelineIdentity, 1> programs{shader.program->Identity()};
+        deviceTable->Prepare(context, *recorder, programs);
+        trailer = deviceTable->Trailer(*recorder);
+    }
+    const auto base = TableAbi::AppendTrailer(map, trailer);
     const auto sampledAbsent = heap.AbsentSlot(Abi::FirstImageBinding, heapPlaceholderView(Abi::FirstImageBinding));
     const auto storageAbsent = heap.AbsentSlot(Abi::FirstStorageImageBinding, heapPlaceholderView(Abi::FirstStorageImageBinding));
     for (std::size_t element = 0; element < elements; ++element) {

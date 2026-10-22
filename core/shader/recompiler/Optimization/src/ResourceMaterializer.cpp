@@ -716,6 +716,10 @@ public:
         if (count == 0u) {
             return;
         }
+        const bool snapshotted = std::ranges::any_of(plan.info.images, [](const ImageResource& image) { return image.table != NoTable && !image.deviceTable; }) || std::ranges::any_of(plan.info.samplers, [](const SamplerResource& sampler) { return sampler.table != NoTable; });
+        tables.shader = plan.shaderHash;
+        tables.tables.resize(count);
+        if (!snapshotted) return;
         if (runtime.readMemory == nullptr) {
             throw std::runtime_error("image table snapshot requires runtime memory access");
         }
@@ -734,7 +738,7 @@ public:
             const SrtForceSyncScope forceSync(runtime, checkEpoch && attempt == 2u);
             const auto invalidationsBefore = checkEpoch ? runtime.descriptorScope(runtime.userContext, 0u) : 0u;
             for (const auto& image : plan.info.images) {
-                if (image.table != NoTable) Snapshot(image.source, image.table);
+                if (image.table != NoTable && !image.deviceTable) Snapshot(image.source, image.table);
             }
             for (const auto& sampler : plan.info.samplers) {
                 if (sampler.table != NoTable) Snapshot(sampler.source, sampler.table);
@@ -1964,7 +1968,7 @@ ResolvedImageTables ResourceMaterializer::ResolveImageTables(const ShaderInfo& i
         }
     };
     for (std::uint32_t resource = 0; resource < info.images.size(); resource++) {
-        if (info.images[resource].table != NoTable) fill(resource, info.images[resource].table, false);
+        if (info.images[resource].table != NoTable && !info.images[resource].deviceTable) fill(resource, info.images[resource].table, false);
     }
     for (std::uint32_t resource = 0; resource < info.samplers.size(); resource++) {
         if (info.samplers[resource].table != NoTable) fill(resource, info.samplers[resource].table, true);
@@ -2347,7 +2351,7 @@ void ResourceMaterializer::ApplyStaticInterface(IrProgram& program, bool nativeS
         tables = true;
         const auto modes = RuntimeImageModes(image);
         const bool storage = image.resourceClass == ImageResourceClass::Storage;
-        if (modes.empty() || modes.size() > ImageTableAbi::MaxModes || (storage && image.mipMode == ImageMipMode::DynamicStorage)) image.tableOperation = TableOperation::Unsupported;
+        if (modes.empty() || (!image.deviceTable && modes.size() > ImageTableAbi::MaxModes) || (storage && image.mipMode == ImageMipMode::DynamicStorage)) image.tableOperation = TableOperation::Unsupported;
     }
     for (const auto& pair : resources.info.sampledPairs) {
         if (pair.image >= images.size() || pair.sampler >= resources.info.samplers.size()) throw std::runtime_error("static sampled pair is out of range");
@@ -2597,10 +2601,10 @@ IrResourcePlan ResourceMaterializer::ExtractPlan(const IrProgram& program) const
         if (image.source >= plan.descriptorSources.size()) {
             throw std::runtime_error("ResourceMaterializer::ExtractPlan image references an unknown descriptor source");
         }
-        if (image.table != NoTable) {
-            plan.requiresSpecializationMemory = true;
-        } else {
+        if (image.table == NoTable) {
             addSource(image.source);
+        } else if (!image.deviceTable) {
+            plan.requiresSpecializationMemory = true;
         }
     }
     for (const auto& sampler : plan.info.samplers) {
@@ -2707,7 +2711,7 @@ std::uint64_t mixImageInterface(std::uint64_t hash, const ImageResource& image) 
     mix(image.shaderSwizzle);
     mix((image.read ? 1u : 0u) | (image.written ? 2u : 0u) | (image.atomic ? 4u : 0u) | (image.atomic64 ? 8u : 0u) | (image.depthCompare ? 16u : 0u) | (image.cube ? 32u : 0u) | (image.r128 ? 64u : 0u) | (image.srgbDecode ? 128u : 0u));
     mix((image.srgbDecodeCompatible ? 1u : 0u) | (image.depthBits ? 2u : 0u) | (image.depthUnorm16 ? 4u : 0u) | (image.packed ? 8u : 0u) | (image.fmaskCompatible ? 16u : 0u) | (image.depthBitsCompatible ? 32u : 0u) | (image.constantSwizzle ? 64u : 0u) | (image.constantSwizzleCompatible ? 128u : 0u));
-    mix((image.flatVolumeCompatible ? 1u : 0u) | (image.flatLineCompatible ? 2u : 0u) | (image.foldTexelOffsetsOnly ? 4u : 0u) | (image.table != NoTable ? 8u : 0u) | (image.singleMipPlaneBiasCompatible ? 32u : 0u) | (image.flatVolumeLineCompatible ? 64u : 0u) | (image.cubeFaceCompatible ? 128u : 0u));
+    mix((image.flatVolumeCompatible ? 1u : 0u) | (image.flatLineCompatible ? 2u : 0u) | (image.foldTexelOffsetsOnly ? 4u : 0u) | (image.table != NoTable ? 8u : 0u) | (image.deviceTable ? 16u : 0u) | (image.singleMipPlaneBiasCompatible ? 32u : 0u) | (image.flatVolumeLineCompatible ? 64u : 0u) | (image.cubeFaceCompatible ? 128u : 0u));
     mix((image.volumeArraySampleCompatible ? 1u : 0u) | (image.convertedSamples ? 2u : 0u) | (image.remappedDepth1D ? 4u : 0u));
     mix(image.srgbDecodeFormats);
     mix(image.byElements);
@@ -2758,6 +2762,14 @@ std::uint64_t ResourceMaterializer::RegisterDeviceImageInterface(const ImageReso
     for (const auto& mode : modes) entry->modes.push_back(deviceInterfaceImage(mode));
     registry.interfaces.emplace(id, std::move(entry));
     return id;
+}
+
+void ResourceMaterializer::RegisterDeviceImageInterfaces(const ShaderInfo& info) {
+    for (std::uint32_t resource = 0; resource < info.images.size(); ++resource) {
+        if (!info.images[resource].deviceTable) continue;
+        if (resource >= info.runtimeImageModes.size()) throw std::runtime_error("device image interface: the runtime image modes are missing");
+        static_cast<void>(RegisterDeviceImageInterface(info.images[resource], info.runtimeImageModes[resource]));
+    }
 }
 
 std::shared_ptr<const DeviceImageInterface> ResourceMaterializer::FindDeviceImageInterface(std::uint64_t id) {

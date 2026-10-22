@@ -109,6 +109,7 @@ struct ImageResource {
     std::uint32_t table = NoTable;
     TableOperation tableOperation = TableOperation::Supported;
     bool targetMerge = false;
+    bool deviceTable = false;
 
     bool operator==(const ImageResource& other) const = default;
 };

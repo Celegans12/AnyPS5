@@ -361,6 +361,7 @@ private:
         append(key, value.gpuResolvedImages);
         append(key, value.descriptorMemory);
         append(key, value.ldsLockFences);
+        append(key, value.deviceImageTables);
     }
 };
 
