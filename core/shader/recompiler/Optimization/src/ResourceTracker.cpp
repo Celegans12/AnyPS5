@@ -109,6 +109,7 @@ public:
         m_info.images.clear();
         m_info.samplers.clear();
         m_info.sampledPairs.clear();
+        m_info.deviceImageUses.clear();
         m_info.usesDma = false;
         m_info.bdaWrites = false;
     }
@@ -140,6 +141,9 @@ public:
         if (m_bdaTraces > bdaTraceLimit) std::fprintf(stderr, "[bda] %u more address accesses in this program not shown\n", m_bdaTraces - bdaTraceLimit);
         CheckTableStores();
         AssignTables();
+        for (const auto& use : m_imageUses) {
+            if (m_info.images.at(use.image).deviceTable) m_info.deviceImageUses.push_back(use);
+        }
         LinkImageAliases();
         for (const auto& patch : m_handlePatches) {
             patch.handle->SetFlags<std::uint32_t>(patch.resource);
@@ -2308,6 +2312,26 @@ private:
         m_info.sampledPairs.push_back({image, sampler, pc});
     }
 
+    std::uint32_t ElementSource(const TableColumnPlan& column) {
+        if (const auto found = m_elementSources.find(column.handle); found != m_elementSources.end()) return found->second;
+        DescriptorSource element;
+        MakeSource(*column.handle, 8u, false, false, element);
+        const auto index = static_cast<std::uint32_t>(m_sources.size());
+        m_sources.push_back(std::move(element));
+        m_elementSources.emplace(column.handle, index);
+        return index;
+    }
+
+    void AddImageUse(std::uint32_t image, std::uint32_t sampler, std::uint32_t descriptor, std::uint32_t pc) {
+        for (auto& use : m_imageUses) {
+            if (use.image == image && use.sampler == sampler && use.descriptor == descriptor) {
+                use.firstUsePc = std::min(use.firstUsePc, pc);
+                return;
+            }
+        }
+        m_imageUses.push_back({image, sampler, descriptor, pc});
+    }
+
     void AddHandlePatch(IrValue* handle, std::uint32_t resource) {
         for (const auto& patch : m_handlePatches) {
             if (patch.handle == handle) {
@@ -2436,6 +2460,7 @@ private:
             AddHandlePatch(samplerHandle, sampler);
             AddSampledPair(resource, sampler, flags.pc);
         }
+        if (column != nullptr && DeviceColumn(*column)) AddImageUse(resource, imageInfo.needsSampler ? sampler : NoSampler, ElementSource(*column), flags.pc);
         AddMemoryPatch(flags.index, resource, sampler, imageInfo.needsSampler);
     }
 
@@ -2483,6 +2508,8 @@ private:
     std::vector<const IrValue*> m_tablePlanningReads;
     std::vector<std::uint32_t> m_tablePlanningMemory;
     std::vector<std::uint8_t> m_deviceSources;
+    std::vector<DeviceImageUse> m_imageUses;
+    std::unordered_map<const IrValue*, std::uint32_t> m_elementSources;
     bool m_deviceImageTables = false;
     std::vector<const IrValue*> m_unselectedHandles;
     struct EdgeSelectorEntry {

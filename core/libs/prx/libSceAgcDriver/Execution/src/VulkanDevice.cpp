@@ -12,6 +12,7 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FloatFlushProbe.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BindlessHeap.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DeviceImageTable.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -4046,6 +4047,28 @@ void VulkanDevice::QueuePresent() {
 
 bool VulkanDevice::PresentsOnOwnQueue() const {
     return state->presentQueue != VK_NULL_HANDLE;
+}
+
+bool VulkanDevice::DeviceImagesServe(std::uint64_t codeAddress) const {
+    const auto* table = Graphics::DeviceImageTable::Existing(state->context);
+    return table != nullptr && table->ServesProgram(codeAddress);
+}
+
+void VulkanDevice::NoteDeviceImageProgram(const ShaderRecompiler::RecompileResult& result, std::uint64_t codeAddress) const {
+    if (!result.deviceImageTables) return;
+    if (auto* table = Graphics::DeviceImageTable::Existing(state->context)) table->NoteProgram(result.Identity(), codeAddress);
+}
+
+std::optional<std::string> VulkanDevice::ExpectDeviceImages(std::span<const ShaderRecompiler::DeviceImageTableAbi::Expectation> images) const {
+    auto* table = Graphics::DeviceImageTable::Existing(state->context);
+    require(table != nullptr && state->recorder != nullptr, "expected device images need the device's table and its recorder");
+    return table->Expect(graphicsContext(), *state->recorder, images);
+}
+
+void VulkanDevice::FallBackDeviceImages(const ShaderRecompiler::RecompileResult& result, std::uint64_t codeAddress, const std::string& reason) const {
+    auto* table = Graphics::DeviceImageTable::Existing(state->context);
+    require(table != nullptr, "a device image fallback needs the device's table");
+    table->FallBackProgram(result.Identity(), codeAddress, reason);
 }
 
 ShaderRecompiler::SpirvTarget VulkanDevice::ComputeTarget(std::uint32_t waveSize) const {

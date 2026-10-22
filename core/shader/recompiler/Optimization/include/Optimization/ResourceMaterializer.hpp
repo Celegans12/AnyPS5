@@ -3,6 +3,7 @@
 
 #include "IntermediateRepresentation/IrProgram.hpp"
 #include "Optimization/SrtWalker.hpp"
+#include "DeviceImageTableAbi.hpp"
 #include "ImageTableAbi.hpp"
 #include <array>
 #include <cstdint>
@@ -89,6 +90,8 @@ public:
     static std::uint64_t RegisterDeviceImageInterface(const ImageResource& image, std::span<const ImageResource> modes);
     static void RegisterDeviceImageInterfaces(const ShaderInfo& info);
     static std::shared_ptr<const DeviceImageInterface> FindDeviceImageInterface(std::uint64_t id);
+    static constexpr std::size_t MaxDeviceImageCandidates = 16;
+    static std::vector<DeviceImageTableAbi::Expectation> ExpectedDeviceImages(const IrResourcePlan& plan, const SrtRuntime& runtime, bool& complete);
     [[nodiscard]] IrResourcePlan ExtractPlan(const IrProgram& program) const;
     static void CompactPlan(IrResourcePlan& plan);
     void Materialize(const IrResourcePlan& program, const SrtRuntime& runtime, ResourceSnapshot& snapshot) const;

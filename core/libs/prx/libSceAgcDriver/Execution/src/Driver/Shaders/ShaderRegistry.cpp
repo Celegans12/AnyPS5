@@ -1336,6 +1336,7 @@ std::unique_ptr<RegisteredPreparation> PlanRegistered(const ShaderSnapshot& snap
     }
     plan->memory = {{{snapshot.codeAddress, std::as_bytes(std::span(snapshot.code))}, {snapshot.headerAddress, snapshot.header}}};
     auto& request = plan->request.emplace(ShaderRecompiler::RecompileRequest{{stage, address, code, snapshot.headerAddress, snapshot.header}, {wave, firstUser, plan->userData, compute, pixel, vertex, plan->memory, RegisteredFloatMode(snapshot)}, stage == Stage::Compute ? device.ComputeTarget(wave) : device.Target(), {0, 0, 0, 128}, graphics});
+    if (request.target.deviceImageTables) request.target.deviceImageTables = device.DeviceImagesServe(address);
     if (graphics && graphics->mesh) request.layout.pushConstantSizeBytes = ShaderRecompiler::MeshDrawPushOffsetBytes;
     if (graphics && graphics->tessellation) request.layout.pushConstantSizeBytes = ShaderRecompiler::TessellationLevelPushOffsetBytes;
     if (pixel && device.GraphicsPipelineLibraries()) request.layout.pushConstantOffsetBytes = Graphics::FixedPushOffset(Stage::Fragment);

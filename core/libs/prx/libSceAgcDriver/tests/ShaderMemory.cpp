@@ -4285,6 +4285,26 @@ void verifyDeviceImageTables() {
 #if ANYPS5_ENABLE_SPIRV_TOOLS
         static_cast<void>(ValidateAndOptimizeSpirv(result.spirv, request.target.vulkanVersion, request.target.spirvVersion));
 #endif
+        require(plan->info.deviceImageUses.size() == 1u && plan->info.deviceImageUses[0].image == 0u && plan->info.deviceImageUses[0].sampler == 0u, "device image tables: the plan does not record the device column's sampled use");
+        SrtRuntime runtime;
+        runtime.userData = userData;
+        runtime.shaderBase = request.shader.codeAddress;
+        bool complete = false;
+        auto expected = ResourceMaterializer::ExpectedDeviceImages(*plan, runtime, complete);
+        require(complete && expected.size() == 1u && !expected[0].candidate && std::equal(heap[7].begin(), heap[7].end(), expected[0].key.begin()), "device image tables: the pre-pass did not expect the T# at key 7 of the 2,000-entry table");
+        const auto sample = static_cast<std::uint32_t>(std::distance(code.begin(), std::find(code.begin(), code.end(), 0xf09c0f08u)) * 4u);
+        require(expected[0].pc == sample && expected[0].sampler == 0u, "device image tables: the expected use does not name its first pc and its S#");
+        require(result.deviceSamplerClasses.size() == 1u && result.deviceSamplerClasses[expected[0].sampler] == samplerClass, "device image tables: the result does not carry the S#'s device sampler class");
+        require(result.deviceImageInterfaces.size() == 1u && result.deviceImageInterfaces[0] != 0u, "device image tables: the result does not carry its interface ids");
+        Abi::NameInterfaces(expected, result.deviceImageInterfaces);
+        Abi::NameSamplerClasses(expected, result.deviceSamplerClasses);
+        require(std::ranges::any_of(scan.lookupKeys, [&](const std::array<std::uint32_t, 4>& key) { return key[0] == expected[0].key[Abi::InterfaceWord] && key[1] == expected[0].key[Abi::InterfaceWord + 1u] && key[2] == expected[0].key[Abi::SamplerClassWord]; }), "device image tables: the expected key names another interface or sampler class than the module's lookup");
+        auto readLane = code;
+        *std::find(readLane.begin(), readLane.end(), 0xbe900302u) = 0x7e200500u;
+        const auto lanePlan = GetResourcePlan(DeviceTableRequest(readLane, userData, pixel, true, true));
+        require(lanePlan->info.images.size() == 1u && lanePlan->info.images[0].deviceTable, "device image tables: a key read from a lane is not a device column");
+        static_cast<void>(ResourceMaterializer::ExpectedDeviceImages(*lanePlan, runtime, complete));
+        require(!complete, "device image tables: the pre-pass called a key read from a lane complete");
 
         const auto offRequest = DeviceTableRequest(code, userData, pixel, false, true);
         const auto offPlan = GetResourcePlan(offRequest);

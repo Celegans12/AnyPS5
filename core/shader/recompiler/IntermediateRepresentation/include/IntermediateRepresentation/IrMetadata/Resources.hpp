@@ -153,6 +153,17 @@ inline bool SamplesBaseLevelIfUnnormalized(const SamplerResource& sampler) {
     return (sampler.uses & (SamplerUseImplicitLod | SamplerUseGradient)) != 0u && (sampler.uses & ~static_cast<std::uint32_t>(SamplerUseExplicitLod | SamplerUseImplicitLod | SamplerUseGradient | SamplerUseNonZeroLod | SamplerUseOffset)) == 0u && !sampler.depthCompare;
 }
 
+inline constexpr std::uint32_t NoSampler = std::numeric_limits<std::uint32_t>::max();
+
+struct DeviceImageUse {
+    std::uint32_t image = 0;
+    std::uint32_t sampler = NoSampler;
+    std::uint32_t descriptor = 0;
+    std::uint32_t firstUsePc = 0;
+
+    bool operator==(const DeviceImageUse& other) const = default;
+};
+
 struct SampledResourcePair {
     std::uint32_t image = 0;
     std::uint32_t sampler = 0;

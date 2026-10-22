@@ -8,6 +8,7 @@
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
 #include "SpirvBackend/SpirvBufferFormat.hpp"
 #include "ThreadOwned.hpp"
+#include "DeviceImageTableAbi.hpp"
 #include "ImageTableAbi.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
@@ -2777,6 +2778,136 @@ std::shared_ptr<const DeviceImageInterface> ResourceMaterializer::FindDeviceImag
     std::lock_guard lock(registry.mutex);
     const auto found = registry.interfaces.find(id);
     return found != registry.interfaces.end() ? found->second : nullptr;
+}
+
+std::vector<DeviceImageTableAbi::Expectation> ResourceMaterializer::ExpectedDeviceImages(const IrResourcePlan& plan, const SrtRuntime& runtime, bool& complete) {
+    namespace Abi = DeviceImageTableAbi;
+    std::vector<Abi::Expectation> expected;
+    complete = true;
+    if (plan.info.deviceImageUses.empty()) return expected;
+    Detail::Evaluator evaluator(plan, runtime);
+    std::vector<std::uint8_t> active(plan.info.images.size(), 1u);
+    std::vector<std::vector<std::uint32_t>> taken(plan.controlFlow.size());
+    std::vector<std::uint8_t> visited(plan.controlFlow.size());
+    if (!plan.controlFlow.empty()) {
+        for (const auto& block : plan.controlFlow) {
+            for (const auto image : block.images) active.at(image) = 0u;
+        }
+        std::vector<std::uint32_t> pending{0};
+        while (!pending.empty()) {
+            const auto index = pending.back();
+            pending.pop_back();
+            if (visited.at(index) != 0u) continue;
+            visited[index] = 1u;
+            const auto& block = plan.controlFlow[index];
+            for (const auto image : block.images) active[image] = 1u;
+            std::uint32_t condition = 0;
+            if (block.condition != nullptr && block.successors.size() == 2u && evaluator.Evaluate(Detail::IrNode(block.condition), condition)) {
+                taken[index] = {block.successors[condition != 0u ? 0u : 1u]};
+            } else {
+                taken[index] = block.successors;
+            }
+            pending.insert(pending.end(), taken[index].begin(), taken[index].end());
+        }
+    }
+    using Words = std::vector<IrValue*>;
+    using Values = std::vector<std::uint32_t>;
+    const auto unwrapped = [](IrValue* word) {
+        IrValue* value = word->Resolve();
+        while (value->Opcode() == IrOpcode::ReadFirstLane) value = value->Argument(0)->Resolve();
+        return value;
+    };
+    const auto joining = [](const IrValue* value) { return value->IsPhi() || (value->Opcode() == IrOpcode::SelectU32 && !value->Argument(0)->Resolve()->HasImmediate()); };
+    const auto incoming = [&](const Words& words) {
+        Words start;
+        for (auto* word : words) start.push_back(unwrapped(word));
+        std::vector<Words> sets{start};
+        for (std::uint32_t round = 0; round < 4u && sets.size() <= MaxDeviceImageCandidates; ++round) {
+            std::vector<Words> next;
+            bool expanded = false;
+            for (const auto& set : sets) {
+                const auto found = std::ranges::find_if(set, joining);
+                if (found == set.end()) {
+                    next.push_back(set);
+                    continue;
+                }
+                expanded = true;
+                const IrValue* join = *found;
+                if (!join->IsPhi()) {
+                    const IrValue* condition = join->Argument(0)->Resolve();
+                    for (const std::size_t operand : {1u, 2u}) {
+                        auto candidate = set;
+                        for (auto*& word : candidate) {
+                            if (word->Opcode() == IrOpcode::SelectU32 && word->Argument(0)->Resolve() == condition) word = unwrapped(word->Argument(operand));
+                        }
+                        next.push_back(candidate);
+                    }
+                    continue;
+                }
+                for (std::size_t edge = 0; edge < join->ArgumentCount(); ++edge) {
+                    auto candidate = set;
+                    for (auto*& word : candidate) {
+                        if (!word->IsPhi() || word->ArgumentCount() != join->ArgumentCount()) continue;
+                        bool joined = true;
+                        for (std::size_t index = 0; joined && index < join->ArgumentCount(); ++index) joined = word->PhiBlock(index) == join->PhiBlock(index);
+                        if (joined) word = unwrapped(word->Argument(edge));
+                    }
+                    next.push_back(candidate);
+                }
+            }
+            sets = std::move(next);
+            if (!expanded) break;
+        }
+        return sets;
+    };
+    const auto evaluated = [&](const Words& words, Values& values) {
+        values.assign(words.size(), 0u);
+        for (std::size_t word = 0; word < words.size(); ++word) {
+            if (!evaluator.Evaluate(Detail::IrNode(words[word]), values[word])) return false;
+        }
+        return true;
+    };
+    const auto valuesOf = [&](const Words& words, bool& joined) {
+        std::vector<Values> values(1);
+        joined = false;
+        if (evaluated(words, values.front())) return values;
+        values.clear();
+        joined = true;
+        const auto sets = incoming(words);
+        if (sets.size() > MaxDeviceImageCandidates) return values;
+        for (const auto& candidate : sets) {
+            Values value;
+            if (!evaluated(candidate, value)) return std::vector<Values>{};
+            if (std::ranges::find(values, value) == values.end()) values.push_back(std::move(value));
+        }
+        return values;
+    };
+    expected.reserve(plan.info.deviceImageUses.size());
+    for (const auto& use : plan.info.deviceImageUses) {
+        if (active.at(use.image) == 0u) continue;
+        const auto& descriptor = plan.descriptorSources.at(use.descriptor);
+        if (descriptor.dwordCount != Abi::DescriptorWords || std::any_of(descriptor.dwords.begin(), descriptor.dwords.begin() + Abi::DescriptorWords, [](const IrValue* word) { return word == nullptr; })) {
+            complete = false;
+            continue;
+        }
+        const Words words(descriptor.dwords.begin(), descriptor.dwords.begin() + Abi::DescriptorWords);
+        bool joined = false;
+        const auto images = valuesOf(words, joined);
+        if (images.empty()) complete = false;
+        for (const auto& value : images) {
+            Abi::Expectation expectation;
+            expectation.pc = use.firstUsePc;
+            expectation.image = use.image;
+            expectation.sampler = use.sampler;
+            expectation.candidate = joined;
+            std::copy_n(value.begin(), Abi::DescriptorWords, expectation.key.begin());
+            if (Abi::NullDescriptor(expectation.key[0], expectation.key[1])) continue;
+            const auto same = std::ranges::find_if(expected, [&](const Abi::Expectation& held) { return held.key == expectation.key && held.pc == expectation.pc && held.image == expectation.image && held.sampler == expectation.sampler; });
+            if (same == expected.end()) expected.push_back(expectation);
+            else same->candidate = same->candidate && expectation.candidate;
+        }
+    }
+    return expected;
 }
 
 }

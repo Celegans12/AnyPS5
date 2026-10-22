@@ -4,6 +4,7 @@
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
 #include "Recompiler.hpp"
+#include "DeviceImageTableAbi.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Presentation.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DisplayBuffer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Recipe.hpp"
@@ -89,6 +90,10 @@ public:
     const std::uint32_t* WorkGroupCountLimit() const;
     std::uint32_t VendorId() const;
     ShaderRecompiler::SpirvTarget ComputeTarget(std::uint32_t waveSize) const;
+    bool DeviceImagesServe(std::uint64_t codeAddress) const;
+    void NoteDeviceImageProgram(const ShaderRecompiler::RecompileResult& result, std::uint64_t codeAddress) const;
+    std::optional<std::string> ExpectDeviceImages(std::span<const ShaderRecompiler::DeviceImageTableAbi::Expectation> images) const;
+    void FallBackDeviceImages(const ShaderRecompiler::RecompileResult& result, std::uint64_t codeAddress, const std::string& reason) const;
     bool ComputeFullSubgroups() const;
     // Distinguishes this device from every earlier one in the process (a memo keyed by the device
     // cannot rely on the pointer, which a replacement may reuse).

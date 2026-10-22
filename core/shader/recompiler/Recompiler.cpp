@@ -1380,7 +1380,19 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
     }
     const auto resolved = ResourceMaterializer::ResolveImageTablesShared(variant.info.info, snapshot, artifact.variantId);
     const auto& tables = *resolved;
-    if (artifact.deviceImageTables) ResourceMaterializer::RegisterDeviceImageInterfaces(variant.info.info);
+    if (artifact.deviceImageTables) {
+        const auto& info = variant.info.info;
+        ResourceMaterializer::RegisterDeviceImageInterfaces(info);
+        result.deviceImageInterfaces.assign(info.images.size(), 0u);
+        for (std::size_t image = 0; image < info.images.size(); ++image) {
+            if (info.images[image].deviceTable) result.deviceImageInterfaces[image] = ResourceMaterializer::DeviceImageInterfaceId(info.images[image], info.runtimeImageModes.at(image));
+        }
+        result.deviceSamplerClasses.assign(info.samplers.size(), 0u);
+        for (const auto& constant : plan->bindings.specialization) {
+            const auto sampler = constant.id - PipelineSpecialization::DeviceSamplerClassBase;
+            if (constant.id >= PipelineSpecialization::DeviceSamplerClassBase && sampler < info.samplers.size()) result.deviceSamplerClasses[sampler] = constant.value;
+        }
+    }
     if (usedPlan != nullptr) *usedPlan = {entry != nullptr ? std::shared_ptr<const void>(entry) : std::shared_ptr<const void>(plan), bindingPlan};
     BindingAllocationResult bindings;
     DescriptorBindingBuilder{}.Populate(bindings, variant.bindings, *bindingPlan, variant.info.userDataBase, snapshot, partialThreads(request), &tables);
@@ -1969,6 +1981,7 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
         counters.misses.fetch_add(1, std::memory_order_relaxed);
     }
     result->cacheHit = cacheHit;
+    if (result->deviceImageTables) result->deviceImagePlan = source.plan;
     std::shared_ptr<const RecompileResult> shared = std::move(result);
     const auto bytes = resultBytes(*shared);
     const auto insert = [&](std::unique_ptr<ResultMemoTable>& table, std::uint64_t at, std::uint64_t key, std::shared_ptr<const MemoPatch> recipe, bool count) {
@@ -2027,9 +2040,15 @@ std::shared_ptr<const RecompileResult> RecompileImpl(const RecompileRequest& req
     if (!request.useCache || capture.source == nullptr) {
         auto program = PrepareResourceProgram(request);
         const auto variant = compileVariant(request, std::move(program));
-        return std::make_shared<const RecompileResult>(materializeResult(variant, request, capture.snapshot));
+        auto result = std::make_shared<RecompileResult>(materializeResult(variant, request, capture.snapshot));
+        if (result->deviceImageTables) result->deviceImagePlan = capture.plan;
+        return result;
     }
-    if (!ResultMemo()) return std::make_shared<const RecompileResult>(materializeVariant(*capture.source, request, capture.snapshot));
+    if (!ResultMemo()) {
+        auto result = std::make_shared<RecompileResult>(materializeVariant(*capture.source, request, capture.snapshot));
+        if (result->deviceImageTables) result->deviceImagePlan = capture.plan;
+        return result;
+    }
     return materializeMemoized(*capture.source, request, capture.snapshot, memoHit);
 }
 
@@ -2286,6 +2305,7 @@ std::shared_ptr<const RecompileResult> PreparedShaderInvocation::MaterializeHeap
     UsedBindingPlan usedPlan;
     auto built = std::make_shared<RecompileResult>(materializeResult(*variant, request, snapshot, false, &usedPlan));
     built->cacheHit = true;
+    if (built->deviceImageTables) built->deviceImagePlan = capture.plan;
     for (const auto reg : layout.userDataRegisters) built->heapUserWords.push_back(reg - userDataBase);
     static std::atomic<std::uint64_t> templateIds{0};
     built->heapTemplateId = templateIds.fetch_add(1, std::memory_order_relaxed) + 1u;
@@ -2311,6 +2331,7 @@ std::shared_ptr<const RecompileResult> PreparedShaderInvocation::Materialize(con
     if (request.useCache && ResultMemo()) return materializePreparedMemoized(*handle->source, handle->artifact, request, capture.snapshot, true, nullptr);
     auto result = std::make_shared<RecompileResult>(materializeResult(*handle->artifact, request, capture.snapshot));
     result->cacheHit = true;
+    if (result->deviceImageTables) result->deviceImagePlan = capture.plan;
     return result;
 }
 
@@ -2383,6 +2404,7 @@ std::shared_ptr<const RecompileResult> MaterializeShader(const RecompileRequest&
     if (request.useCache && ResultMemo()) return materializePreparedMemoized(*handle.source, handle.artifact, request, capture.snapshot, true, nullptr);
     auto result = std::make_shared<RecompileResult>(materializeResult(*handle.artifact, request, capture.snapshot));
     result->cacheHit = true;
+    if (result->deviceImageTables) result->deviceImagePlan = capture.plan;
     return result;
 }
 

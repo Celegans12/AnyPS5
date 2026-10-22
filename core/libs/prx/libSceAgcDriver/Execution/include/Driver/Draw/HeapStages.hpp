@@ -12,6 +12,10 @@
 #include <utility>
 #include <vector>
 
+namespace AgcDriver {
+class VulkanDevice;
+}
+
 namespace AgcDriver::DriverDetail {
 
 bool HeapFragmentsEnabled();
@@ -26,6 +30,7 @@ bool HeapStageMappable(const ShaderRecompiler::RecompileResult& result, bool wor
 void SetHeapStageUnmapped(std::optional<ShaderRecompiler::ShaderStage> stage);
 bool HeapDrawStageMappable(const ShaderRecompiler::RecompileResult& result, ShaderRecompiler::ShaderStage stage);
 bool HeapPairRefused(std::uint64_t pair);
+bool ExpectDeviceImages(const VulkanDevice& device, std::span<const std::uint32_t> userData, std::uint64_t codeAddress, const ShaderRecompiler::RecompileResult& result, bool dispatch);
 void RefuseHeapPair(std::uint64_t pair);
 
 class HeapDrawOff {
