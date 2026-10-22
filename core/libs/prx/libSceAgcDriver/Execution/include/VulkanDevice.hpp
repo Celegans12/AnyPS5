@@ -90,6 +90,7 @@ public:
     const std::uint32_t* WorkGroupCountLimit() const;
     std::uint32_t VendorId() const;
     ShaderRecompiler::SpirvTarget ComputeTarget(std::uint32_t waveSize) const;
+    bool DeviceImagePath() const;
     bool DeviceImagesServe(std::uint64_t codeAddress) const;
     void NoteDeviceImageProgram(const ShaderRecompiler::RecompileResult& result, std::uint64_t codeAddress) const;
     std::optional<std::string> ExpectDeviceImages(std::span<const ShaderRecompiler::DeviceImageTableAbi::Expectation> images) const;

@@ -717,6 +717,15 @@ void RegistersInterfaces() {
     Require(ResourceMaterializer::DeviceImageInterfaceId(integer, ResourceMaterializer::RuntimeImageModes(integer)) != id, "an image of another numeric class has another interface");
 }
 
+void DevicePathRefusals() {
+    Require(!DeviceImagePathRefusal({true, true}).has_value(), "the GPU heap on a device with VK_EXT_descriptor_heap serves the device image path");
+    const auto withoutHeap = DeviceImagePathRefusal({false, true});
+    Require(withoutHeap.has_value() && withoutHeap->find("APS5_GPU_HEAP") != std::string::npos, "the device image path stays off without APS5_GPU_HEAP and says so");
+    const auto withoutExtension = DeviceImagePathRefusal({true, false});
+    Require(withoutExtension.has_value() && withoutExtension->find("VK_EXT_descriptor_heap") != std::string::npos, "the device image path stays off without VK_EXT_descriptor_heap and says so");
+    Require(DeviceImagePathRefusal({false, false}).has_value(), "the device image path stays off with neither");
+}
+
 int HeapRetention() {
     auto device = OpenVulkanTestDevice();
     if (device == nullptr) return VulkanTestSkipped;
@@ -769,6 +778,7 @@ int main(int argc, char** argv) {
         }
         if (mode == "--heap") return HeapRetention();
         RegistersInterfaces();
+        DevicePathRefusals();
         auto device = OpenVulkanTestDevice();
         if (device == nullptr) return VulkanTestSkipped;
         ResolvesAndUploads(*device);

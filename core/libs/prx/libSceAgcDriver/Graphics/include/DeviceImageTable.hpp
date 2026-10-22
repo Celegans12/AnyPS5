@@ -53,6 +53,15 @@ struct DeviceTableTexture {
 DeviceTableTexture LookupDeviceTableTexture(const Context& context, std::span<const std::uint32_t, 8> descriptor, const DeviceTableView& view, std::uint32_t samplerClass);
 bool DeviceTableTextureCurrent(const Context& context, const std::array<std::uint32_t, 8>& words, bool depthCompare, const Texture& texture);
 
+bool GpuPathEnabled();
+
+struct DeviceImagePathFeatures {
+    bool gpuHeap = false;
+    bool descriptorHeap = false;
+};
+
+std::optional<std::string> DeviceImagePathRefusal(const DeviceImagePathFeatures& features);
+
 class DeviceImageTable {
 public:
     using Key = DeviceImageKeys::Key;

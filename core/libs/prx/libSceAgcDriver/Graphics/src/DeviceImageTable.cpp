@@ -117,6 +117,17 @@ DeviceImageTable& DeviceImageTable::Create(const Context& context, InterfaceLook
     return *table;
 }
 
+bool GpuPathEnabled() {
+    static const bool enabled = std::getenv("APS5_GPU_PATH") != nullptr;
+    return enabled;
+}
+
+std::optional<std::string> DeviceImagePathRefusal(const DeviceImagePathFeatures& features) {
+    if (!features.gpuHeap) return std::string("APS5_GPU_HEAP is unset, and the device image table takes its slots from the GPU heap and is read only by GPU-mode stages");
+    if (!features.descriptorHeap) return std::string("the device lacks VK_EXT_descriptor_heap, which the GPU heap the device image table takes its slots from needs");
+    return std::nullopt;
+}
+
 bool DeviceImageTable::ExpectsKeys() {
     static const bool expects = std::getenv("APS5_NO_DEVICE_IMAGE_EXPECT") == nullptr;
     return expects;
