@@ -330,7 +330,7 @@ public:
     static void NoteDrawRecipeMiss(DrawRecipePrecheck miss);
     // `recipe`, when given, receives the DrawRecipe a recorded, cacheable, reusable, direct draw
     // built for its draw-cache entry (design_cpu_final M8); null otherwise.
-    void Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, Graphics::PreparedDraw* prepared = nullptr);
+    void Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, Graphics::PreparedDraw* prepared = nullptr, const Graphics::AheadDraw* ahead = nullptr);
     // S1: the unlocked part of a draw's resource build, made ahead of the draw (Graphics::PrepareDraw).
     std::shared_ptr<Graphics::PreparedDraw> PrepareDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders);
     // The draw's HTILE pre-sync (APS5_NO_HTILE_PRESYNC=1 off): when the depth target's store-back
@@ -339,6 +339,8 @@ public:
     // without it. Returns the serial waited for (0: none); the draw reaps up to it under its lock,
     // so the read then finds the writes landed. Only a wait: results are unchanged.
     std::uint64_t PresyncDrawDepth(const Graphics::State& graphics);
+    // #6188: the draw state a draw-ahead worker prepares for an entry it compiled ahead (Graphics::PrepareAheadDraw).
+    std::shared_ptr<const Graphics::AheadDraw> PrepareAheadDraw(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders) const;
     bool DrawInputsInPlace() const;
     std::optional<std::string> KnownDrawRejection(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders) const;
     void ColorMetadataPass(const Graphics::ColorMetadataPass& pass);
@@ -372,6 +374,7 @@ private:
     VulkanDevice(const PresentationWindow* window, bool compileOnly);
     friend struct VulkanDeviceTestAccess;
     VkPipeline splitComputePipeline(const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, ComputePipelineObjects& objects, const std::array<std::uint32_t, 3>& base);
+    const Graphics::Context& graphicsContext(std::optional<Graphics::Context>& built) const;
     ShaderRecompiler::SpirvTarget buildTarget() const;
     Graphics::Context buildContext() const;
     std::vector<VkDescriptorSetLayout> computeSetLayouts(const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, VkDescriptorSetLayout setLayout) const;

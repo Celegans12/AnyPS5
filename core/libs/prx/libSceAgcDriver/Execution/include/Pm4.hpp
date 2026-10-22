@@ -9,6 +9,7 @@
 #include <array>
 #include <span>
 #include <string>
+#include <utility>
 
 namespace AgcDriver::Pm4 {
 
@@ -91,6 +92,8 @@ inline bool IndirectRegisterOpcode(std::uint32_t opcode) { return opcode == 0x63
 std::vector<std::uint32_t> ReadIndirectRegisters(std::span<const std::uint32_t> packet);
 bool IndirectRegistersValid(std::span<const std::uint32_t> pairs);
 void ExecuteIndirectRegisters(std::span<const std::uint32_t> packet, std::span<const std::uint32_t> pairs, QueueState& queue, bool skipInvalid = false);
+std::uint32_t RegisterOffset(std::uint32_t value);
+std::optional<std::pair<std::uint32_t, std::uint32_t>> CopyDataContextRegisters(std::span<const std::uint32_t> packet);
 bool AccessesMemory(std::uint32_t header);
 // Whether an ACQUIRE_MEM packet asks only for GPU cache actions (no CPU-visible memory
 // synchronization): such a packet needs a pipeline barrier, not a device drain.

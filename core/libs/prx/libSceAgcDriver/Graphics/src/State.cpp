@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/General.hpp"
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <bitset>
 #include <cmath>
@@ -1146,9 +1147,8 @@ void ApplyDepthRemap(const Context& context, State& state) {
     const float clampMax = std::clamp(state.depthClampMax, 0.0f, 1.0f);
     const bool floatDepth = state.depth.has_value() && (state.depth->format == VK_FORMAT_D32_SFLOAT || state.depth->format == VK_FORMAT_D32_SFLOAT_S8_UINT);
     if ((clampMin != state.depthClampMin || clampMax != state.depthClampMax) && floatDepth && (state.depthWrite || state.depthTest)) {
-        static bool reported = false;
-        if (!reported) {
-            reported = true;
+        static std::atomic<bool> reported{false};
+        if (!reported.exchange(true)) {
             std::fprintf(stderr, "[gpu] viewport depth clamp bounds [%g, %g] on a float depth target are clipped to [0, 1]: the device has no VK_EXT_depth_range_unrestricted\n", state.depthClampMin, state.depthClampMax);
         }
     }
@@ -1210,15 +1210,13 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
         if ((clear || tests != 0) && depthSurfaceBound(cx)) {
             decodeDepth(cx, depthControl, (read(cx, 0x203) & 2u) != 0 && !PixelProgramSkipped(queue), (read(cx, 0x203) & 4u) != 0 && !PixelProgramSkipped(queue), result);
         } else if (depthPassThrough(depthControl) || ((depthControl & 0xbu) != 0 && (tests == 0 || depthPlanesAbsent(cx)))) {
-            static bool reported = false;
-            if (!reported) {
-                reported = true;
+            static std::atomic<bool> reported{false};
+            if (!reported.exchange(true)) {
                 std::fprintf(stderr, "[gpu] always-pass depth/stencil state is rendered without a depth target (DB_DEPTH_CONTROL=0x%08x)\n", depthControl);
             }
         } else if (IgnoreDepthTest()) {
-            static bool reported = false;
-            if (!reported) {
-                reported = true;
+            static std::atomic<bool> reported{false};
+            if (!reported.exchange(true)) {
                 std::fprintf(stderr, "[gpu] depth/stencil tests are ignored (APS5_IGNORE_DEPTH_TEST; DB_DEPTH_CONTROL=0x%08x)\n", depthControl);
             }
         } else {
@@ -1380,9 +1378,8 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
     result.quadSampleMask = decodeQuadSampleMask(cx, result.samples);
     result.pixelEarlyZ = !PixelProgramSkipped(queue) && PixelEarlyZ(read(cx, 0x203));
     if ((read(cx, 0x207) & LayerExports & ~result.layerExports & ~(1u << 21u)) != 0) {
-        static bool reported = false;
-        if (!reported) {
-            reported = true;
+        static std::atomic<bool> reported{false};
+        if (!reported.exchange(true)) {
             std::fprintf(stderr, "[gpu] layer/viewport index vertex exports are ignored (PA_CL_VS_OUT_CNTL=0x%08x)\n", read(cx, 0x207));
         }
     }
@@ -1824,9 +1821,8 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot, bool allo
                 if (!allowMultisampleDcc) Require((color.dccControl & 0x3ff80u) == 0, "multisampled DCC color transforms or lossy modes are not implemented");
             }
         } else {
-            static bool reported = false;
-            if (!reported) {
-                reported = true;
+            static std::atomic<bool> reported{false};
+            if (!reported.exchange(true)) {
                 std::fprintf(stderr, "[gpu] DCC keys of mipmapped color targets are ignored\n");
             }
         }

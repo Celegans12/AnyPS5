@@ -4,6 +4,7 @@
 #include "UserDataUse.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchCache.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -11,6 +12,8 @@
 #include <cstdint>
 #include <list>
 #include <memory>
+#include <optional>
+#include <span>
 #include <utility>
 #include <vector>
 #include "prx/libc/include/general/AtomicSharedPtr.hpp"
@@ -66,14 +69,23 @@ struct DrawRecipeRecord {
     bool Expired() const;
 };
 
+struct PreparedDrawRecord {
+    std::vector<std::weak_ptr<const DispatchVariant>> stages;
+    std::size_t shaders = 0;
+    std::shared_ptr<const Graphics::AheadDraw> prepared;
+    const Graphics::AheadDraw* For(const std::vector<std::shared_ptr<DispatchVariant>>& variants, std::size_t shaderCount) const;
+};
+
 struct DrawEntry {
 
     std::shared_ptr<const DrawDecode> decode;
+    std::shared_ptr<const PreparedDrawRecord> prepared;
 
     std::vector<std::vector<std::shared_ptr<DispatchVariant>>> stages;
 
     AtomicSharedPtr<const std::vector<DrawRecipeRecord>> recipes;
     std::uint64_t touched = 0;
+    bool probation = false;
     std::list<std::uint64_t>::iterator order;
     std::uint64_t shape = 0;
 };
@@ -171,6 +183,11 @@ struct DrawRelocationCounters {
 };
 
 bool DecodeProgramsCurrent(const DrawDecode& decode, const ShaderRegistry& registry);
+bool SameCompilation(const ShaderRecompiler::RecompileResult& a, const ShaderRecompiler::RecompileResult& b, std::uint32_t hiddenUserWords = 0);
+std::shared_ptr<DrawEntry> BuildAheadEntry(const std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::shared_ptr<const DrawDecode> decode, std::uint64_t shape, std::shared_ptr<const Graphics::AheadDraw> prepared, std::size_t preparedShaders);
+ShaderRecompiler::RecompileRequest DrawStageRequest(const DrawProgram& program, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertexInfo, std::span<const ShaderRecompiler::MemoryRegion> memory, std::span<const ShaderRecompiler::LinkedProgram> linked, const Pm4::DrawParameters& drawParameters, const ShaderRecompiler::SpirvTarget& target, std::uint32_t pushOffset, const std::optional<ShaderRecompiler::MeshBarycentricLayout>& meshBarycentrics = std::nullopt);
+std::uint64_t StageUserDataMask(const ShaderRecompiler::ResourceCapture& capture, const ShaderRecompiler::RecompileResult& compiled, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertexInfo);
+std::shared_ptr<DispatchVariant> DrawStageVariant(const DrawProgram& program, const StageCapture& capture, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertexInfo, std::span<const Graphics::DecodeRead> decodeReads);
 
 }
 

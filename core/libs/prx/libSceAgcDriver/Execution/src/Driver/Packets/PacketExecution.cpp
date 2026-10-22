@@ -325,6 +325,22 @@ void Driver::execute(const Submission& submission) {
         state = &queues[submission.queue];
     }
     auto& queue = *state;
+    DrawAhead* ahead = nullptr;
+    std::uint64_t aheadSegment = 0;
+    // #6188 draw-ahead; APS5_NO_DRAW_AHEAD=1 (an APS5_AB switch, read once per submission) scans and compiles nothing ahead.
+    if (submission.queue == 0 && drawEntries() && registerKeyEnabled() && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoDrawAhead) && DrawAhead::HasDirectDraws(submission.commands)) {
+        if (drawAhead == nullptr) drawAhead = std::make_unique<DrawAhead>(*this, DrawAhead::Workers());
+        ahead = drawAhead.get();
+        aheadSegment = ahead->Post(submission, queue);
+    }
+    struct RetireDrawAhead {
+        DrawAhead* drawAhead;
+        std::uint64_t segment;
+        void Retire() {
+            if (drawAhead != nullptr) std::exchange(drawAhead, nullptr)->Retire(segment);
+        }
+        ~RetireDrawAhead() { Retire(); }
+    } retireDrawAhead{ahead, aheadSegment};
     static const bool traceGpu = std::getenv("APS5_TRACE_GPU") != nullptr;
     if (traceGpu) std::fprintf(stderr, "[gpu] %.1f execute serial=%llu queue=0x%x dwords=%zu\n", TraceMs(), static_cast<unsigned long long>(submission.serial), submission.queue, submission.commands.size());
 
@@ -435,6 +451,7 @@ void Driver::execute(const Submission& submission) {
             recordQueuedLabelsBeforeRead(submission.queue);
             if (!Pm4::PredicationPasses(queue)) {
                 cursor = opcode == 0x3f ? submission.conditionalEnds.at(cursor) : nextCursor;
+                if (ahead != nullptr) ahead->Skip(aheadSegment, cursor);
                 continue;
             }
         }
@@ -602,6 +619,7 @@ void Driver::execute(const Submission& submission) {
                 }
             }
         } else if (drawPacket) {
+            if (ahead != nullptr) ahead->Progress(aheadSegment, cursor);
             landPendingWaits(submission.queue);
             packetCounters.CountDraw();
             drawnSinceSeal() = true;
@@ -643,7 +661,10 @@ void Driver::execute(const Submission& submission) {
             landPendingWaits(submission.queue);
             recordQueuedLabelsBeforeRead(submission.queue);
             const auto condition = Pm4::ReadCondition(packet);
-            if (condition == 0) nextCursor = submission.conditionalEnds.at(cursor);
+            if (condition == 0) {
+                nextCursor = submission.conditionalEnds.at(cursor);
+                if (ahead != nullptr) ahead->Skip(aheadSegment, nextCursor);
+            }
             if (traceGpu) std::fprintf(stderr, "[gpu] %.1f queue 0x%x COND_EXEC at DWORD %zu reads 0x%x at 0x%llx: %s %zu dwords\n", TraceMs(), submission.queue, cursor, condition, static_cast<unsigned long long>(packet[1] | (static_cast<std::uint64_t>(packet[2]) << 32u)), condition == 0 ? "skips" : "executes", submission.conditionalEnds.at(cursor) - cursor - count);
         } else if (opcode == 0x91) {
             landPendingWaits(submission.queue);
@@ -700,6 +721,7 @@ void Driver::execute(const Submission& submission) {
         else timing.Finish();
         cursor = nextCursor;
     }
+    retireDrawAhead.Retire();
 
     PerformanceContext endContext(submission.queue == 0 ? frameTiming() : FrameTiming::Async());
     PerformanceTimer endTiming("Driver.EndSubmission");

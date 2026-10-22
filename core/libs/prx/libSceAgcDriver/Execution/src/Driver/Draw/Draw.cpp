@@ -24,6 +24,8 @@
 
 namespace AgcDriver::DriverDetail {
 
+std::uint64_t& AheadDumpKey();
+
 namespace {
 
 // gpuind: GPU-side indirect draw parameters (APS5_NO_GPU_INDIRECT_ARGS=1 turns them off). A
@@ -116,22 +118,6 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         pending.tailAt = phaseLap;
         return DrawVerdict::Drawn;
     };
-    auto drawParameters = Pm4::ResolveDraw(packet, queue);
-    const bool pipelined = DrawPipeline::Active();
-    const bool pipelineIndirect = pipelined && drawParameters.indirect && DrawPipeline::PipelineIndirect();
-    static const bool pipelinedIndirect = std::getenv("APS5_NO_PIPELINED_INDIRECT") == nullptr && !DrawPipeline::PipelineIndirect();
-    if (pipelined && drawParameters.indirect && !pipelineIndirect) {
-        const auto& indirect = *drawParameters.indirect;
-        auto& pipeline = DrawPipeline::Queue0();
-        const bool overlaps = pipeline.Busy() && (pipeline.Overlaps(indirect.arguments, static_cast<std::size_t>(std::max<std::uint64_t>(indirect.RangeBytes(), indirect.recordBytes))) || (indirect.countIndirect && pipeline.Overlaps(indirect.countAddress, 4)));
-        if (!pipelinedIndirect || overlaps) pipeline.Drain(DrawPipeline::DrainReason::Indirect);
-    }
-    const auto drainBeforeInline = [&] {
-        if (pipelined && pipelinedIndirect && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Indirect);
-    };
-    bool traceIndirect = false;
-    if (const auto verdict = precheckDraw(queue, submission, packet, drawParameters, rejected, traceIndirect)) return *verdict;
-    phaseTiming.Phase(DrawRowPrecheck);
     using Stage = ShaderRecompiler::ShaderStage;
     using Role = ShaderRecompiler::ProgramRole;
 
@@ -140,8 +126,40 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     static const std::uint64_t dumpSlot1 = [] { const char* text = std::getenv("APS5_DUMP_DRAW_SLOT1"); return text ? std::strtoull(text, nullptr, 16) : 0ull; }();
 
     static const bool lockedPrepare = std::getenv("APS5_LOCKED_DRAW_PREPARE") != nullptr;
-    std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
+    const bool useDrawEntries = drawEntries() && !ShaderRecompiler::DebugProbeActive() && dumpTarget == 0 && dumpSlot1 == 0;
+    const bool registerKey = useDrawEntries && registerKeyEnabled();
     std::shared_ptr<VulkanDevice> localDevice;
+    const bool pipelined = DrawPipeline::Active();
+    static const bool pipelinedIndirect = std::getenv("APS5_NO_PIPELINED_INDIRECT") == nullptr && !DrawPipeline::PipelineIndirect();
+    const auto drainBeforeInline = [&] {
+        if (pipelined && pipelinedIndirect && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Indirect);
+    };
+    const PublishedDraw* published = nullptr;
+    // APS5_NO_DRAW_AHEAD=1 (#6188 off, an APS5_AB switch): the draw neither takes a published record nor an entry compiled ahead.
+    const bool useDrawAhead = !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoDrawAhead);
+    if (useDrawAhead && drawAhead != nullptr && registerKey && !lockedPrepare && !verifyDrawRecipe() && !verifyDrawEntries() && (localDevice = device.Load()) != nullptr) published = drawAhead->Find(submission, packet, queue, localDevice->Serial());
+    Pm4::DrawParameters drawParameters{};
+    bool traceIndirect = false;
+    bool pipelineIndirect = false;
+    if (published != nullptr) {
+        drawParameters = published->parameters;
+        if (drawParameters.indexed) GuestMemory::CheckRange(reinterpret_cast<const void*>(drawParameters.indexAddress), static_cast<std::size_t>(drawParameters.indexCount) * drawParameters.indexSize, drawParameters.indexSize);
+        if (published->precheck == DrawPrecheckOutcome::Nothing) return DrawVerdict::Nothing;
+        traceIndirect = TraceIndirectDraws();
+    } else {
+        drawParameters = Pm4::ResolveDraw(packet, queue);
+        pipelineIndirect = pipelined && drawParameters.indirect && DrawPipeline::PipelineIndirect();
+        if (pipelined && drawParameters.indirect && !pipelineIndirect) {
+            const auto& indirect = *drawParameters.indirect;
+            auto& pipeline = DrawPipeline::Queue0();
+            const bool overlaps = pipeline.Busy() && (pipeline.Overlaps(indirect.arguments, static_cast<std::size_t>(std::max<std::uint64_t>(indirect.RangeBytes(), indirect.recordBytes))) || (indirect.countIndirect && pipeline.Overlaps(indirect.countAddress, 4)));
+            if (!pipelinedIndirect || overlaps) pipeline.Drain(DrawPipeline::DrainReason::Indirect);
+        }
+        if (const auto verdict = precheckDraw(queue, submission, packet, drawParameters, rejected, traceIndirect)) return *verdict;
+    }
+    phaseTiming.Phase(DrawRowPrecheck);
+
+    std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
     if (lockedPrepare) {
 
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
@@ -153,7 +171,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
 
         recordLabelsForPacket(localDevice.get(), submission.queue);
         phaseTiming.Phase(DrawRowLabels);
-    } else if ((localDevice = device.Load()) == nullptr) {
+    } else if (localDevice == nullptr && (localDevice = device.Load()) == nullptr) {
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
         std::lock_guard createLock(GuestMemory::GpuMutex());
         if (device == nullptr) device = std::make_shared<VulkanDevice>();
@@ -162,8 +180,6 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     timing.Mark("device_setup");
     phaseTiming.Phase(DrawRowVectors);
 
-    const bool useDrawEntries = drawEntries() && !ShaderRecompiler::DebugProbeActive() && dumpTarget == 0 && dumpSlot1 == 0;
-    const bool registerKey = useDrawEntries && registerKeyEnabled();
     std::uint64_t drawKey = 0;
     DrawKeyComponents drawKeyComponents;
     std::shared_ptr<DrawEntry> entry;
@@ -178,12 +194,26 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         bool aliasFirst = false;
         // One registry pass feeds the identity key, the shader-set key and the register-key tail; the exact key does
         // not depend on any cache state, so it is built before the single drawCacheMutex acquisition of the lookup.
+        // A draw-ahead record (#6188) carries the identity, shape and register key the scan built the same way.
         DrawRegistryWalk registryWalk;
-        WalkDrawRegistry(queue, *submission.shaders, registryWalk);
+        bool walked = false;
+        const auto walk = [&]() -> const DrawRegistryWalk* {
+            if (!walked) {
+                WalkDrawRegistry(queue, *submission.shaders, registryWalk);
+                walked = true;
+            }
+            return &registryWalk;
+        };
         const bool relocating = drawRelocationEnabled();
-        if (relocating) drawIdentity = drawIdentityKey(registryWalk);
-        drawKey = drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), &shapeKey, traceDrawCache() || profile ? &drawKeyComponents : nullptr, nullptr, nullptr, &registryWalk);
-        if (GpuIndirectArgs() && drawParameters.indirect) drawKey = GpuParameterKey(drawKey, *drawParameters.indirect);
+        const bool usePublished = published != nullptr && !traceDrawCache();
+        if (relocating) drawIdentity = usePublished ? published->identity : drawIdentityKey(*walk());
+        if (usePublished) {
+            shapeKey = published->shape;
+            drawKey = published->key;
+        } else {
+            drawKey = drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), &shapeKey, traceDrawCache() || profile ? &drawKeyComponents : nullptr, nullptr, nullptr, walk());
+            if (GpuIndirectArgs() && drawParameters.indirect) drawKey = GpuParameterKey(drawKey, *drawParameters.indirect);
+        }
         std::unique_lock cacheLock(drawCacheMutex);
         if (relocating) {
             learnPendingRelocation();
@@ -198,7 +228,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         if (aliasFirst) {
             // The alias reads guest memory (relocatedContentKey), so it is computed outside the lock as before.
             cacheLock.unlock();
-            drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), nullptr, nullptr, relocation.get(), &drawAlias, &registryWalk);
+            drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), nullptr, nullptr, relocation.get(), &drawAlias, walk());
             if (GpuIndirectArgs() && drawParameters.indirect) drawAlias = GpuParameterKey(drawAlias, *drawParameters.indirect);
             cacheLock.lock();
         }
@@ -209,11 +239,22 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         if (found != drawCache.end()) {
             entry = found->second;
             decode = entry->decode;
+        } else if (auto ahead = useDrawAhead ? findAheadEntry(drawKey) : nullptr; ahead != nullptr) {
+            entry = std::move(ahead);
+            decode = entry->decode;
+            if (drawIdentity != 0) {
+                if (relocation != nullptr && !aliasFirst) {
+                    cacheLock.unlock();
+                    drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), nullptr, nullptr, relocation.get(), &drawAlias);
+                    cacheLock.lock();
+                }
+                drawRelocationPending = {drawKey, drawAlias, drawIdentity};
+            }
         } else {
             ++drawEntryCounters.absent;
             if (relocation != nullptr && !aliasFirst) {
                 cacheLock.unlock();
-                drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), nullptr, nullptr, relocation.get(), &drawAlias, &registryWalk);
+                drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), nullptr, nullptr, relocation.get(), &drawAlias, walk());
                 if (GpuIndirectArgs() && drawParameters.indirect) drawAlias = GpuParameterKey(drawAlias, *drawParameters.indirect);
                 cacheLock.lock();
             }
@@ -250,6 +291,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         }
         maybeReportDrawCache(profile);
     }
+    AheadDumpKey() = drawKey;
     if (decode != nullptr && !DecodeProgramsCurrent(*decode, *submission.shaders)) {
         userPatches.clear();
         std::lock_guard cacheLock(drawCacheMutex);
@@ -906,7 +948,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), direct, stages = std::move(stages), snapshots = std::move(snapshots), commitQueue, commitPacket, epoch, programs = std::move(programs), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData)] {
                     DrawPipeline::FollowEpoch(epoch);
                     GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
-                    commitDraw(localDevice, commitQueue, decode->state, direct, stages, snapshots, nullptr, {}, 0);
+                    commitDraw(localDevice, commitQueue, decode->state, direct, stages, snapshots, nullptr, {}, 0, nullptr);
                 };
                 auto held = std::make_shared<decltype(commit)>(std::move(commit));
                 DrawPipeline::Queue0().Enqueue([held] { (*held)(); }, std::move(writes));
@@ -943,6 +985,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         }
     }
     timing.Mark("recipe_and_rejection");
+    const auto* ahead = drawHit && !patchedStages && userPatches.empty() && !drawParameters.indirect && entry != nullptr && entry->prepared != nullptr ? entry->prepared->For(matched, stages.size()) : nullptr;
     if (pipelined && (!drawParameters.indirect || pipelineIndirect) && deferredLabels().labels.empty()) {
         phaseTiming.Phase(DrawRowVectors);
         auto writes = drawWriteRanges(graphics, stages);
@@ -965,7 +1008,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         auto prepareDevice = prepareDraw ? localDevice : nullptr;
         auto prepareDecode = prepareDraw ? decode : nullptr;
         auto reads = QueuedDrawReadRanges(drawParameters, stages);
-        auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, commitQueue, commitPacket, epoch, programs = std::move(programs), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData), slot, program] {
+        auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), ahead, drawKey, commitQueue, commitPacket, epoch, programs = std::move(programs), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData), slot, program] {
             DrawPipeline::FollowEpoch(epoch);
             GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
             struct OriginScope {
@@ -978,7 +1021,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 // The pre-sync again, now that every earlier draw is recorded: still without the
                 // GPU mutex, so the other queues are not held while this commit waits for the GPU.
                 if (htilePresync && decode->state.depth.has_value()) presyncSerial = std::max(presyncSerial, localDevice->PresyncDrawDepth(decode->state));
-                commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey, prepared != nullptr ? prepared->draw.get() : nullptr, presyncSerial);
+                commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey, prepared != nullptr ? prepared->draw.get() : nullptr, presyncSerial, ahead);
             } catch (const std::runtime_error& error) {
                 std::string where = "draw commit (programs";
                 for (const auto& program : programs) {
@@ -1027,14 +1070,14 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
     }
     std::shared_ptr<const DrawRecipe> built;
-    localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built);
+    localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, nullptr, ahead);
     phaseTiming.Phase(DrawRowGraphics);
     if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, std::move(built));
     timing.Mark("draw_and_resource_release");
     return drawn();
 }
 
-void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, Graphics::PreparedDraw* prepared, std::uint64_t presyncSerial) {
+void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, Graphics::PreparedDraw* prepared, std::uint64_t presyncSerial, const Graphics::AheadDraw* ahead) {
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
     if (auto current = device.Load(); current != nullptr && current != localDevice) {
@@ -1058,7 +1101,7 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
         VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
     }
     std::shared_ptr<const DrawRecipe> built;
-    localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, prepared);
+    localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, prepared, ahead);
     if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, std::move(built));
 }
 

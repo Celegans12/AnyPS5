@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/WriteEvidence.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <cstdlib>
+#include <utility>
 
 namespace AgcDriver::DriverDetail {
 
@@ -15,6 +16,14 @@ bool DrawRecipeRecord::Matches(const std::vector<std::shared_ptr<DispatchVariant
         if (stages[i].owner_before(variants[i]) || variants[i].owner_before(stages[i])) return false;
     }
     return true;
+}
+
+const Graphics::AheadDraw* PreparedDrawRecord::For(const std::vector<std::shared_ptr<DispatchVariant>>& variants, std::size_t shaderCount) const {
+    if (shaderCount != shaders || variants.size() != stages.size()) return nullptr;
+    for (std::size_t i = 0; i < stages.size(); ++i) {
+        if (stages[i].owner_before(variants[i]) || variants[i].owner_before(stages[i])) return nullptr;
+    }
+    return prepared.get();
 }
 
 bool DrawRecipeRecord::Expired() const {
@@ -123,10 +132,99 @@ bool Driver::admitDrawKey(std::uint64_t key, std::uint64_t shape) {
     return drawShapeSightings->SeenBefore(shape);
 }
 
-void Driver::insertDrawEntry(std::uint64_t key, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::shared_ptr<const DrawDecode> decode, std::uint64_t shape) {
+std::shared_ptr<DrawEntry> BuildAheadEntry(const std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::shared_ptr<const DrawDecode> decode, std::uint64_t shape, std::shared_ptr<const Graphics::AheadDraw> prepared, std::size_t preparedShaders) {
+    auto entry = std::make_shared<DrawEntry>();
+    entry->stages.resize(fresh.size());
+    entry->decode = std::move(decode);
+    entry->shape = shape;
+    entry->probation = true;
+    for (std::size_t i = 0; i < fresh.size(); ++i) {
+        if (fresh[i] != nullptr) entry->stages[i].push_back(fresh[i]);
+    }
+    if (prepared != nullptr) entry->prepared = std::make_shared<const PreparedDrawRecord>(PreparedDrawRecord{{fresh.begin(), fresh.end()}, preparedShaders, std::move(prepared)});
+    return entry;
+}
+
+bool Driver::insertAheadEntry(std::uint64_t key, const std::shared_ptr<DrawEntry>& entry, std::vector<std::shared_ptr<DrawEntry>>& released) {
+    std::list<std::uint64_t> node{key};
+    std::lock_guard aheadLock(drawAheadMutex);
+    if (drawAheadEntries.contains(key)) return false;
+    const auto limit = drawCacheEntries();
+    released.reserve(drawAheadOrder.size() + 1 > limit ? drawAheadOrder.size() + 1 - limit : 0);
+    drawAheadEntries.emplace(key, entry);
+    entry->order = node.begin();
+    drawAheadOrder.splice(drawAheadOrder.begin(), node);
+    while (drawAheadOrder.size() > limit) {
+        const auto last = drawAheadEntries.find(drawAheadOrder.back());
+        released.push_back(std::move(last->second));
+        drawAheadEntries.erase(last);
+        drawAheadOrder.pop_back();
+    }
+    return true;
+}
+
+std::shared_ptr<DrawEntry> Driver::findAheadEntry(std::uint64_t key) {
+    std::lock_guard aheadLock(drawAheadMutex);
+    const auto found = drawAheadEntries.find(key);
+    return found == drawAheadEntries.end() ? nullptr : found->second;
+}
+
+std::shared_ptr<DrawEntry> Driver::takeAheadEntry(std::uint64_t key, const DrawEntry* expected) {
+    std::lock_guard aheadLock(drawAheadMutex);
+    const auto found = drawAheadEntries.find(key);
+    if (found == drawAheadEntries.end() || (expected != nullptr && found->second.get() != expected)) return nullptr;
+    auto taken = std::move(found->second);
+    drawAheadOrder.erase(taken->order);
+    drawAheadEntries.erase(found);
+    return taken;
+}
+
+void Driver::admitAheadEntry(std::uint64_t key, const DrawEntry& ahead, std::uint64_t shape) {
+    std::vector<std::shared_ptr<DrawEntry>> released;
+    std::shared_ptr<DrawEntry> taken;
+    auto admitted = std::make_shared<DrawEntry>();
+    admitted->decode = ahead.decode;
+    admitted->prepared = ahead.prepared;
+    admitted->stages = ahead.stages;
+    admitted->shape = shape;
+    admitted->recipes.store(ahead.recipes.load());
+    std::list<std::uint64_t> node{key};
     std::lock_guard cacheLock(drawCacheMutex);
-    auto& counters = drawEntryCounters;
-    ++counters.inserts;
+    if (drawCache.contains(key)) {
+        taken = takeAheadEntry(key, &ahead);
+        return;
+    }
+    prepareEvictions(1, 0);
+    const auto inserted = drawCache.emplace(key, admitted).first;
+    if (admitted->decode != nullptr && shape != 0) {
+        try {
+            drawShapes[shape] = key;
+        } catch (...) {
+            drawCache.erase(inserted);
+            throw;
+        }
+    }
+    admitted->touched = drawCacheHits;
+    admitted->order = node.begin();
+    drawOrder.splice(drawOrder.begin(), node);
+    std::uint64_t variants = 0;
+    for (const auto& stage : admitted->stages) {
+        for (const auto& variant : stage) {
+            accountDrawVariant(*variant, true);
+            ++variants;
+        }
+    }
+    ++drawEntryCounters.inserts;
+    drawEntryCounters.variantsInserted += variants;
+    taken = takeAheadEntry(key, &ahead);
+    evictDrawEntries();
+    released.swap(releasedDrawEntries);
+}
+
+void Driver::insertDrawEntry(std::uint64_t key, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::shared_ptr<const DrawDecode> decode, std::uint64_t shape) {
+    std::vector<std::shared_ptr<DrawEntry>> released;
+    std::shared_ptr<DrawEntry> taken;
+    std::lock_guard cacheLock(drawCacheMutex);
     const auto found = drawCache.find(key);
     auto replacement = std::make_shared<DrawEntry>();
     replacement->stages.resize(fresh.size());
@@ -135,52 +233,94 @@ void Driver::insertDrawEntry(std::uint64_t key, std::vector<std::shared_ptr<Disp
     if (found != drawCache.end()) {
         if (found->second->stages.size() == fresh.size()) replacement->stages = found->second->stages;
         if (found->second->decode != nullptr) replacement->decode = found->second->decode;
+        replacement->prepared = found->second->prepared;
         replacement->recipes.store(found->second->recipes.load());
     }
-    for (std::size_t i = 0; i < fresh.size(); ++i) {
-        if (fresh[i] == nullptr) continue;
+    auto resolved = fresh;
+    std::vector<std::shared_ptr<DispatchVariant>> added;
+    std::vector<std::shared_ptr<DispatchVariant>> dropped;
+    std::uint64_t present = 0;
+    for (std::size_t i = 0; i < resolved.size(); ++i) {
+        if (resolved[i] == nullptr) continue;
         auto& variants = replacement->stages[i];
-        const auto present = std::find_if(variants.begin(), variants.end(), [&](const std::shared_ptr<DispatchVariant>& kept) { return kept->pushOffset == fresh[i]->pushOffset && kept->meshIndexDescriptor == fresh[i]->meshIndexDescriptor && kept->runs == fresh[i]->runs && SameCapturedWords(kept->words, kept->shared, fresh[i]->words, fresh[i]->shared); });
-        if (present != variants.end()) {
-            ++counters.present;
-            fresh[i] = *present;
+        const auto kept = std::find_if(variants.begin(), variants.end(), [&](const std::shared_ptr<DispatchVariant>& variant) { return variant->pushOffset == resolved[i]->pushOffset && variant->meshIndexDescriptor == resolved[i]->meshIndexDescriptor && variant->runs == resolved[i]->runs && SameCapturedWords(variant->words, variant->shared, resolved[i]->words, resolved[i]->shared); });
+        if (kept != variants.end()) {
+            ++present;
+            resolved[i] = *kept;
             continue;
         }
-        accountDrawVariant(*fresh[i], true);
-        variants.insert(variants.begin(), fresh[i]);
-        ++counters.variantsInserted;
+        added.push_back(resolved[i]);
+        variants.insert(variants.begin(), resolved[i]);
         while (variants.size() > dispatchVariants()) {
-            accountDrawVariant(*variants.back(), false);
+            dropped.push_back(std::move(variants.back()));
             variants.pop_back();
-            ++counters.variantsEvicted;
         }
     }
     replacement->touched = drawCacheHits;
-    if (replacement->decode != nullptr && shape != 0) drawShapes[shape] = key;
+    const bool ownsShape = replacement->decode != nullptr && shape != 0;
+    std::list<std::uint64_t> node;
+    if (found == drawCache.end()) node.push_front(key);
+    prepareEvictions(found == drawCache.end() ? 1 : 0, found == drawCache.end() ? 0 : 1);
     if (found == drawCache.end()) {
-        drawOrder.push_front(key);
-        replacement->order = drawOrder.begin();
-        drawCache.emplace(key, std::move(replacement));
+        const auto inserted = drawCache.emplace(key, replacement).first;
+        if (ownsShape) {
+            try {
+                drawShapes[shape] = key;
+            } catch (...) {
+                drawCache.erase(inserted);
+                throw;
+            }
+        }
+        replacement->order = node.begin();
+        drawOrder.splice(drawOrder.begin(), node);
     } else {
+        if (ownsShape) drawShapes[shape] = key;
         replacement->order = found->second->order;
         drawOrder.splice(drawOrder.begin(), drawOrder, replacement->order);
-        found->second = std::move(replacement);
+        releasedDrawEntries.push_back(std::exchange(found->second, std::move(replacement)));
     }
-    while (drawCache.size() > drawCacheEntries()) {
+    for (const auto& variant : added) accountDrawVariant(*variant, true);
+    for (const auto& variant : dropped) accountDrawVariant(*variant, false);
+    auto& counters = drawEntryCounters;
+    ++counters.inserts;
+    counters.present += present;
+    counters.variantsInserted += added.size();
+    counters.variantsEvicted += dropped.size();
+    fresh.swap(resolved);
+    taken = takeAheadEntry(key, nullptr);
+    evictDrawEntries();
+    released.swap(releasedDrawEntries);
+}
+
+void Driver::prepareEvictions(std::size_t growth, std::size_t replaced) {
+    const auto limit = drawCacheEntries();
+    const auto victims = drawOrder.size() + growth > limit ? drawOrder.size() + growth - limit : 0;
+    releasedDrawEntries.reserve(releasedDrawEntries.size() + replaced + victims);
+    if (!traceDrawCache()) return;
+    auto victim = drawOrder.rbegin();
+    for (std::size_t i = 0; i < victims && victim != drawOrder.rend(); ++i, ++victim) traceInsert(traceKeysEvicted, *victim);
+}
+
+void Driver::evictDrawEntries() {
+    while (drawOrder.size() > drawCacheEntries()) {
         const auto last = drawCache.find(drawOrder.back());
         for (const auto& variants : last->second->stages) {
             for (const auto& variant : variants) accountDrawVariant(*variant, false);
         }
-        if (traceDrawCache()) traceInsert(traceKeysEvicted, last->first);
         if (const auto shapeOf = drawShapes.find(last->second->shape); shapeOf != drawShapes.end() && shapeOf->second == last->first) drawShapes.erase(shapeOf);
         drawOrder.erase(last->second->order);
+        releasedDrawEntries.push_back(std::move(last->second));
         drawCache.erase(last);
         ++drawCacheEvictions;
-        ++counters.evictions;
+        ++drawEntryCounters.evictions;
     }
 }
 
 void Driver::eraseDrawEntry(std::uint64_t key, const std::shared_ptr<DrawEntry>& expected) {
+    if (expected != nullptr && expected->probation) {
+        takeAheadEntry(key, expected.get());
+        return;
+    }
     const auto found = drawCache.find(key);
     if (found == drawCache.end() || found->second != expected) return;
     for (const auto& variants : found->second->stages) {

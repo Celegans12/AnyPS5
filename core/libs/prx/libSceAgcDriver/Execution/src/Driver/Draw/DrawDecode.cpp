@@ -156,9 +156,13 @@ void DecodeGraphicsPrograms(DrawDecode& decoded, const QueueState& queue, const 
 }
 
 std::shared_ptr<DrawDecode> Driver::decodeDraw(const QueueState& queue, const Submission& submission, const Graphics::Context& context) {
+    return decodeDraw(queue, *submission.shaders, context);
+}
+
+std::shared_ptr<DrawDecode> Driver::decodeDraw(const QueueState& queue, const ShaderRegistry& registry, const Graphics::Context& context) {
     auto product = std::make_shared<DrawDecode>();
-    product->state = Graphics::DecodeState(queue, VertexWorkgroupRequired(queue, *submission.shaders));
-    DecodeGraphicsPrograms(*product, queue, *submission.shaders, false, true);
+    product->state = Graphics::DecodeState(queue, VertexWorkgroupRequired(queue, registry));
+    DecodeGraphicsPrograms(*product, queue, registry, false, true);
     product->pixel = Graphics::DecodePixelStageInfo(queue.context, Graphics::ExportMappings(product->state), Graphics::PixelProgramSkipped(queue));
     Graphics::NormalizeUnusedViewportDepth(product->state, product->pixel);
     Graphics::ApplyDepthRemap(context, product->state);

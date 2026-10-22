@@ -4903,6 +4903,11 @@ bool unitShadowTests(const Device& device, Recorder& recorder) {
     Require(AnyShadowedOverlaps(unit3, 1) && AnyShadowedOverlaps(unit4 - 1, 1) && AnyShadowedOverlaps(unit3 + 1000, 64), "a fresh unit is not seen as shadowed");
     Require(!AnyShadowedOverlaps(unit3 - 1, 1) && !AnyShadowedOverlaps(unit4, unit) && !AnyShadowedOverlaps(address, 3 * unit), "a range outside the unit is seen as shadowed");
     {
+        const std::array<std::pair<std::uint64_t, std::uint64_t>, 3> outside{{{unit3 - 8, unit3}, {unit4, unit4 + unit}, {address, address + 3 * unit}}};
+        const std::array<std::pair<std::uint64_t, std::uint64_t>, 3> lastInside{{{unit3 - 8, unit3}, {unit4, unit4 + 8}, {unit4 - 4, unit4}}};
+        Require(!AnyShadowedOverlaps(outside) && AnyShadowedOverlaps(lastInside), "a list of runs is not shadowed exactly when one of its runs is");
+    }
+    {
         // An upload's runs over units 2..4 split at unit 3's freshness; the fresh piece reads the slab.
         const std::pair<std::uint64_t, std::uint64_t> run{2 * unit, 5 * unit};
         const auto sources = ShadowSources(context, *import, address, std::span(&run, 1), {});

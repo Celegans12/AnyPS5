@@ -80,6 +80,7 @@ public:
     }
     void Note(Event event) { events[static_cast<std::size_t>(event)].fetch_add(1, std::memory_order_relaxed); }
     std::uint64_t Events(Event event) const { return events[static_cast<std::size_t>(event)].load(std::memory_order_relaxed); }
+    bool OverlapsAny(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
     std::optional<std::uint64_t> PendingLabel(std::uint64_t address, std::size_t bytes);
     static bool HeldReads(std::uint64_t address, std::size_t bytes);
     void ReleaseRunningReads();
