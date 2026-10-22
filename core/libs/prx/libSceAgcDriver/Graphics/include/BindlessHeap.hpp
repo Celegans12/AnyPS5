@@ -163,6 +163,7 @@ enum class HeapStageReason : std::uint8_t { Heap, Disabled, PairRefused, Fragmen
 void NoteHeapStageReason(HeapStageReason reason);
 void NoteHeapRecord(bool compute, bool heap);
 void NoteHeapFallback(HeapFallback reason);
+std::uint64_t HeapFallbacks(HeapFallback reason);
 void NoteCpuBufferCopy(std::uint64_t bytes);
 enum class HeapCost : std::uint8_t { StagePrepare, HeapStageCall, StageFinish, WalkMemo, Walk, Materialize, TemplateFind, TemplateBuild, Slots, StageData, BufferAddresses, MemoInsert, Guards, Count };
 bool HeapCostTimed();

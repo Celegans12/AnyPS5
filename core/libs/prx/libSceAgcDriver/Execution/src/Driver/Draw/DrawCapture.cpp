@@ -177,7 +177,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
         callCost.Stop();
         Graphics::HeapCostScope finishCost(Graphics::HeapCost::StageFinish);
         if (direct == nullptr) goto heapCapture;
-        if (!HeapStageMappable(*direct)) return unmapped();
+        if (!HeapDrawStageMappable(*direct, program.binary.stage)) return unmapped();
         NoteHeapDirect();
         stageCapture.compiled = std::move(direct);
         if (reusedWords != nullptr) words = std::const_pointer_cast<ShaderRecompiler::HeapStageWords>(std::move(reusedWords));
@@ -283,7 +283,7 @@ heapCapture:
             throw named(error, request.context.memory);
         }
     }
-    if (stageCapture.compiled->gpuResolvedImages && !HeapStageMappable(*stageCapture.compiled)) return unmapped();
+    if (stageCapture.compiled->gpuResolvedImages && !HeapDrawStageMappable(*stageCapture.compiled, program.binary.stage)) return unmapped();
     stageCapture.capture = capture;
     timing.Mark("materialize");
     const auto walked = capture->userDataUse.asValue | capture->userDataUse.asBase;

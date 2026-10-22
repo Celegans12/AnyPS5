@@ -866,6 +866,10 @@ void NoteHeapFallback(HeapFallback reason) {
     heapFallbacks[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
 }
 
+std::uint64_t HeapFallbacks(HeapFallback reason) {
+    return heapFallbacks[static_cast<std::size_t>(reason)].load(std::memory_order_relaxed);
+}
+
 void NoteCommandBufferBegun(VkCommandBuffer commands) {
     commandBuffersBegun.fetch_add(1, std::memory_order_relaxed);
     forgetHeapBinding(commands);

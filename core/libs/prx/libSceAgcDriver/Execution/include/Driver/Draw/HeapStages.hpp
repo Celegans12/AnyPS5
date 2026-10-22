@@ -22,6 +22,8 @@ bool HeapStageEligible(ShaderRecompiler::ShaderStage stage, const ShaderRecompil
 std::optional<bool> HeapFragmentKnown(const void* snapshot, std::size_t codeOffset);
 void NoteHeapFragment(const void* snapshot, std::size_t codeOffset, bool eligible);
 bool HeapStageMappable(const ShaderRecompiler::RecompileResult& result, bool workgroupAddress = false);
+void SetHeapStageUnmapped(std::optional<ShaderRecompiler::ShaderStage> stage);
+bool HeapDrawStageMappable(const ShaderRecompiler::RecompileResult& result, ShaderRecompiler::ShaderStage stage);
 bool HeapPairRefused(std::uint64_t pair);
 void RefuseHeapPair(std::uint64_t pair);
 

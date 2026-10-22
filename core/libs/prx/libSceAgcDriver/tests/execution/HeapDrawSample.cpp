@@ -18,6 +18,7 @@
 #include <initializer_list>
 #include <iostream>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -53,6 +54,8 @@ alignas(256) constexpr std::array<std::uint32_t, 28> TableVertexCode{
     0x7e060280u, 0x7e0802f2u, 0xf80008cfu, 0x04030201u, 0xbf810000u, 0xbf810000u,
 };
 alignas(256) std::array<std::uint32_t, 16> TableMemory{};
+alignas(256) std::array<std::uint32_t, 24> MixedVertexCode{};
+alignas(256) std::array<std::uint32_t, 8> MixedPixelCode{};
 alignas(256) std::array<std::uint32_t, 4> MaterialMemory{};
 alignas(256) std::array<std::uint8_t, 1024> OtherTextureMemory{};
 constexpr float BufferAlpha = 0.2f;
@@ -89,9 +92,9 @@ void Append(std::vector<std::uint32_t>& commands, std::uint32_t opcode, std::ini
 
 enum class Mode { Texture, Buffer, Storage, Gds, Vertex, Bda, Table, VertexTable, MovedBuffer, MovedTexture };
 
-std::vector<std::uint32_t> Draw(const std::uint32_t* pixelCode, Mode mode) {
+std::vector<std::uint32_t> Draw(const std::uint32_t* pixelCode, Mode mode, const std::uint32_t* vertexCode = nullptr) {
     const bool vertexSampling = mode == Mode::Vertex || mode == Mode::VertexTable;
-    const auto vertex = reinterpret_cast<std::uintptr_t>(mode == Mode::VertexTable ? TableVertexCode.data() : mode == Mode::Vertex ? SamplingVertexCode.data() : VertexCode.data());
+    const auto vertex = reinterpret_cast<std::uintptr_t>(vertexCode != nullptr ? vertexCode : mode == Mode::VertexTable ? TableVertexCode.data() : mode == Mode::Vertex ? SamplingVertexCode.data() : VertexCode.data());
     const auto pixel = reinterpret_cast<std::uintptr_t>(pixelCode);
     const auto color = reinterpret_cast<std::uintptr_t>(ColorMemory.data());
     const auto texture = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(TextureMemory.data()));
@@ -225,6 +228,46 @@ void DrawSamplesTheTexture(bool heap, Mode mode) {
     if (heap && descriptorMemory) Require(AgcDriver::Graphics::DataAddressPushes() > pushesBefore, "the heap stages did not read their shader data through pushed addresses");
 }
 
+void MixedDrawTakesThePerDrawPath() {
+    using AgcDriver::Graphics::HeapFallback;
+    using AgcDriver::Graphics::HeapFallbacks;
+    MixedVertexCode = SamplingVertexCode;
+    MixedPixelCode = InterpolantPixelCode;
+    for (std::size_t offset = 0; offset < TextureMemory.size(); offset += Texel.size()) std::memcpy(TextureMemory.data() + offset, Texel.data(), Texel.size());
+    Registered(PixelHeader, MixedPixelCode.data(), sizeof(MixedPixelCode), 1);
+    {
+        Registered(VertexHeader, VertexCode.data(), sizeof(VertexCode), 2);
+        auto commands = Draw(MixedPixelCode.data(), Mode::Texture);
+        Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
+        Require(sceAgcDriverSubmitDcb(&packet) == 0, "the draw putting the fragment stage on the heap failed");
+        AgcDriverWaitIdle_nid_postfix();
+        Registered(VertexHeader, MixedVertexCode.data(), sizeof(MixedVertexCode), 2);
+    }
+    AgcDriver::DriverDetail::SetHeapStageUnmapped(ShaderRecompiler::ShaderStage::Fragment);
+    for (const char* draw : {"first", "repeated"}) {
+        const auto takenBefore = AgcDriver::DriverDetail::HeapStagesTaken();
+        const auto retriesBefore = HeapFallbacks(HeapFallback::DrawMixedRetry);
+        const auto refusedBefore = HeapFallbacks(HeapFallback::DrawRefusedPair);
+        ColorMemory.fill(Kept);
+        auto commands = Draw(MixedPixelCode.data(), Mode::Vertex, MixedVertexCode.data());
+        Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
+        Require(sceAgcDriverSubmitDcb(&packet) == 0, std::string("the ") + draw + " mixed draw submission failed");
+        AgcDriverWaitIdle_nid_postfix();
+        std::size_t drawn = 0;
+        for (std::size_t offset = 0; offset < ColorMemory.size(); offset += 4) {
+            if (std::all_of(ColorMemory.begin() + static_cast<std::ptrdiff_t>(offset), ColorMemory.begin() + static_cast<std::ptrdiff_t>(offset + 4), [](std::byte value) { return value == Kept; })) continue;
+            for (std::size_t channel = 0; channel < 4; ++channel) Require(static_cast<unsigned>(ColorMemory[offset + channel]) == Texel[channel], std::string("the ") + draw + " mixed draw: pixel " + std::to_string(offset / 4) + " channel " + std::to_string(channel) + " is " + std::to_string(static_cast<unsigned>(ColorMemory[offset + channel])) + ", expected " + std::to_string(Texel[channel]));
+            ++drawn;
+        }
+        Require(drawn != 0, std::string("the ") + draw + " mixed draw covered no pixel");
+        const bool first = std::strcmp(draw, "first") == 0;
+        if (first) Require(AgcDriver::DriverDetail::HeapStagesTaken() > takenBefore, "the heap did not take the vertex stage of the mixed draw");
+        Require(HeapFallbacks(HeapFallback::DrawMixedRetry) - retriesBefore == (first ? 1u : 0u), std::string("the ") + draw + " mixed draw retried on the per-draw path " + std::to_string(HeapFallbacks(HeapFallback::DrawMixedRetry) - retriesBefore) + " times, expected " + (first ? "once" : "never"));
+        Require(HeapFallbacks(HeapFallback::DrawRefusedPair) == refusedBefore, std::string("the ") + draw + " mixed draw stayed mixed after its per-draw retry");
+    }
+    AgcDriver::DriverDetail::SetHeapStageUnmapped(std::nullopt);
+}
+
 }
 
 int main() {
@@ -251,6 +294,7 @@ int main() {
         DrawSamplesTheTexture(heap, Mode::MovedBuffer);
         DrawSamplesTheTexture(heap, Mode::MovedTexture);
         DrawSamplesTheTexture(heap, Mode::Texture);
+        if (heap && AgcDriver::Graphics::DescriptorHeapEnabled() && std::getenv("APS5_HEAP_SLOT_CAP") == nullptr) MixedDrawTakesThePerDrawPath();
         if (heap && std::getenv("APS5_HEAP_SLOT_CAP") != nullptr) Require(AgcDriver::DriverDetail::HeapRefused(), "a draw found the capped heap full and the heap was not refused");
         AgcDriverShutdown_nid_postfix();
         if (heap && AgcDriver::Graphics::DescriptorHeapEnabled() && std::getenv("APS5_HEAP_SLOT_CAP") == nullptr) Require(AgcDriver::Graphics::EmptyResourceSets() != 0, "no heap draw bound without a per-draw resource set");

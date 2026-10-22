@@ -409,6 +409,20 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> MaterializeHeapStage(co
     return nullptr;
 }
 
+namespace {
+
+std::atomic<int> unmappedStage{-1};
+
+}
+
+void SetHeapStageUnmapped(std::optional<ShaderRecompiler::ShaderStage> stage) {
+    unmappedStage.store(stage.has_value() ? static_cast<int>(*stage) : -1, std::memory_order_relaxed);
+}
+
+bool HeapDrawStageMappable(const ShaderRecompiler::RecompileResult& result, ShaderRecompiler::ShaderStage stage) {
+    return unmappedStage.load(std::memory_order_relaxed) != static_cast<int>(stage) && HeapStageMappable(result);
+}
+
 std::uint64_t HeapStagesTaken() {
     return heapStages().load();
 }
