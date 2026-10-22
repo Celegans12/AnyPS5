@@ -36,6 +36,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <unordered_set>
 #include <mutex>
 #include <set>
 #include <unordered_map>
@@ -859,6 +860,96 @@ ResourceCache::Key DrawResourceKey(const Context& context, std::span<const Compi
     return key;
 }
 
+// Debug (local, APS5_RESKEY_DIFF=1): which words of the draw resource key differ between a draw and the last draw of
+// the same shape (the key's layout words), for cache misses and for address-table draws (never cached today), and
+// whether an address-table draw's key was seen before (the hit rate a template without its BDA part would get).
+bool ResourceKeyDiffEnabled() {
+    static const bool enabled = std::getenv("APS5_RESKEY_DIFF") != nullptr;
+    return enabled;
+}
+
+void NoteResourceKeyDiff(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::uint64_t indexBytes, bool trimKey, bool cacheable, bool hit, const ResourceCache::Key& cachedKey) {
+    constexpr std::size_t Roles = 9;
+    static const char* const RoleNames[Roles] = {"header", "variant", "layout", "descriptor-address", "descriptor-other", "buffer", "sampler", "bits", "target"};
+    struct Stats {
+        std::uint64_t draws = 0, hits = 0, firstShape = 0, lengthDiffers = 0, sameKey = 0, seenBefore = 0;
+        std::array<std::uint64_t, Roles> anyRole{};
+        std::array<std::uint64_t, Roles> onlyRole{};
+    };
+    struct Last {
+        ResourceCache::Key key;
+    };
+    static std::mutex mutex;
+    static std::unordered_map<std::uint64_t, Last> lastByShape;
+    static std::unordered_set<std::uint64_t> seenBda;
+    static std::array<Stats, 2> stats;
+    static auto reported = std::chrono::steady_clock::now();
+    const bool bda = !cacheable && ShaderResources::NeverReusable(shaders);
+    if (!cacheable && !bda) return;
+    ResourceCache::Key key = cacheable ? cachedKey : DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
+    std::vector<std::uint8_t> roles;
+    roles.reserve(key.size());
+    roles.push_back(0);
+    roles.push_back(0);
+    roles.push_back(0);
+    roles.push_back(2);
+    for (const auto& shader : shaders) {
+        roles.push_back(2);
+        ShaderResources::AppendContentKeyRoles(shader, true, MovableBuffers(), roles);
+    }
+    roles.push_back(2);
+    while (roles.size() < key.size()) roles.push_back(8);
+    std::uint64_t shape = 1469598103934665603ull, full = 1469598103934665603ull;
+    for (std::size_t i = 0; i < key.size(); ++i) {
+        full = (full ^ key[i]) * 1099511628211ull;
+        if (i < roles.size() && (roles[i] == 0 || roles[i] == 2)) shape = (shape ^ key[i]) * 1099511628211ull;
+    }
+    std::lock_guard lock(mutex);
+    auto& stat = stats[bda ? 1 : 0];
+    ++stat.draws;
+    if (hit) ++stat.hits;
+    if (bda) {
+        if (!seenBda.insert(full).second) ++stat.seenBefore;
+        if (seenBda.size() > 65536) seenBda.clear();
+    }
+    if (!hit) {
+        auto found = lastByShape.find(shape);
+        if (found == lastByShape.end()) {
+            ++stat.firstShape;
+        } else if (found->second.key.size() != key.size() || roles.size() != key.size()) {
+            ++stat.lengthDiffers;
+        } else {
+            std::array<bool, Roles> differs{};
+            for (std::size_t i = 0; i < key.size(); ++i) {
+                if (key[i] != found->second.key[i]) differs[roles[i]] = true;
+            }
+            const auto count = std::count(differs.begin(), differs.end(), true);
+            if (count == 0) ++stat.sameKey;
+            for (std::size_t r = 0; r < Roles; ++r) {
+                if (!differs[r]) continue;
+                ++stat.anyRole[r];
+                if (count == 1) ++stat.onlyRole[r];
+            }
+        }
+    }
+    lastByShape[shape].key = std::move(key);
+    if (lastByShape.size() > 65536) lastByShape.clear();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - reported < std::chrono::seconds(10)) return;
+    reported = now;
+    for (std::size_t kind = 0; kind < 2; ++kind) {
+        const auto& s = stats[kind];
+        std::string roleText;
+        for (std::size_t r = 0; r < Roles; ++r) {
+            char item[96];
+            std::snprintf(item, sizeof(item), " %s %llu/%llu", RoleNames[r], static_cast<unsigned long long>(s.anyRole[r]), static_cast<unsigned long long>(s.onlyRole[r]));
+            roleText += item;
+        }
+        std::fprintf(stderr, "[reskey] %s (10 s): %llu draws, %llu hits, %llu keys seen before (address-table draws); vs the last key of the same shape: first of shape %llu, length differs %llu, same key %llu; differing roles (any/only):%s\n", kind == 0 ? "cacheable" : "address-table", static_cast<unsigned long long>(s.draws), static_cast<unsigned long long>(s.hits), static_cast<unsigned long long>(s.seenBefore), static_cast<unsigned long long>(s.firstShape), static_cast<unsigned long long>(s.lengthDiffers), static_cast<unsigned long long>(s.sameKey), roleText.c_str());
+    }
+    stats = {};
+}
+
 // The alias checks the build makes for every guest buffer descriptor (ShaderResources::
 // addGuestBuffer), repeated for a cached build whose own checks compared the buffers against
 // another draw's render target and index buffer. The same conditions and messages, so a draw that
@@ -1677,6 +1768,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     } else {
         countCache(&DrawProfile::uncacheable);
     }
+    if (ResourceKeyDiffEnabled() && recordable) NoteResourceKeyDiff(context, state, draw, shaders, indexBytes, trimKey, resolved.cacheable, resolved.resources != nullptr, resolved.contentKey);
     timer.phase(PhaseLookup);
     if (resolved.resources == nullptr) {
         // S1: stage A made ahead of the draw, when nothing it read can have moved since (the stamps

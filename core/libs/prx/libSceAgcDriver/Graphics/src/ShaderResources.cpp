@@ -3519,6 +3519,72 @@ void VisitContentKey(const CompiledShader& shader, bool dataWords, bool movableB
     }
 }
 
+template<typename TVisitor>
+void VisitContentKeyTagged(const CompiledShader& shader, bool dataWords, bool movableBuffers, const TVisitor& tagged) {
+    std::uint8_t role = 0;
+    const auto visit = [&](std::uint32_t word) { tagged(word, role); };
+    Require(shader.program != nullptr, "missing compiled shader");
+    const auto& program = *shader.program;
+    visit(program.hasGuardedUnnormalizedWrap ? 1u : 0u);
+    visit(ShaderRecompiler::UnnormalizedWrapEnabled() ? 1u : 0u);
+    visit(dataWords ? 1u : 0u);
+    visit(static_cast<std::uint32_t>(shader.stage));
+    role = 1;
+    visit(static_cast<std::uint32_t>(program.PipelineVariantId()));
+    visit(static_cast<std::uint32_t>(program.PipelineVariantId() >> 32u));
+    role = 2;
+    visit(static_cast<std::uint32_t>(program.bindings.size()));
+    const auto packBits = [&](const ShaderRecompiler::ElementFlags& bits) {
+        role = 7;
+        visit(static_cast<std::uint32_t>(bits.size()));
+        std::uint32_t word = 0;
+        for (std::size_t i = 0; i < bits.size(); ++i) {
+            if (bits[i]) word |= 1u << (i % 32u);
+            if (i % 32u == 31u || i + 1 == bits.size()) {
+                visit(word);
+                word = 0;
+            }
+        }
+    };
+    for (const auto& binding : program.bindings) {
+        role = 2;
+        for (const auto word : {static_cast<std::uint32_t>(binding.kind), static_cast<std::uint32_t>(binding.role), binding.descriptorSet, binding.binding, binding.count, binding.readOnly ? 1u : 0u, binding.imageShape.has_value() ? static_cast<std::uint32_t>(*binding.imageShape) + 1u : 0u, static_cast<std::uint32_t>(binding.guestDescriptor.size())}) visit(word);
+        if (movableBuffers && binding.role == ShaderRecompiler::DescriptorRole::GuestBuffers && binding.guestDescriptor.size() == static_cast<std::size_t>(binding.count) * 4u) {
+            for (std::uint32_t element = 0; element < binding.count; ++element) {
+                const auto* words = binding.guestDescriptor.data() + static_cast<std::size_t>(element) * 4u;
+                const bool written = element >= binding.bufferWritten.size() || binding.bufferWritten[element];
+                const bool empty = words[2] == 0 || (words[0] == 0 && (words[1] & 0xffffu) == 0);
+                role = 5;
+                if (written || empty) { for (std::uint32_t index = 0; index < 4u; ++index) visit(words[index]); }
+                else { for (const auto word : {0u, words[1] & 0xffff0000u, 0u, words[3]}) visit(word); }
+            }
+        } else if ((dataWords && !movableBuffers) || !DataRole(binding.role)) {
+            for (std::size_t index = 0; index < binding.guestDescriptor.size(); ++index) {
+                role = DataRole(binding.role) ? 5 : (index % 8u < 2u ? 3 : 4);
+                visit(binding.guestDescriptor[index]);
+            }
+        }
+        packBits(binding.imageWritten);
+        packBits(binding.samplerDepthCompare);
+        packBits(binding.imageDepthCompare);
+        packBits(binding.imageAtomic);
+        packBits(binding.samplerUnnormalized);
+        packBits(binding.samplerIntegerBorder);
+        packBits(binding.samplerCoordinatesIgnored);
+        packBits(binding.imageUnnormalized);
+        packBits(binding.imageUnnormalizedBaseLevel);
+        // Read-only elements are bound without a write set: an object built for one written set
+        // must not serve a build with another (the variant implies it, this makes it explicit).
+        packBits(binding.bufferWritten);
+        role = 6;
+        visit(static_cast<std::uint32_t>(binding.imageSamplers.size()));
+        for (const auto sampler : binding.imageSamplers) visit(sampler);
+        role = 2;
+        visit(static_cast<std::uint32_t>(binding.imageShapes.size()));
+        for (const auto shape : binding.imageShapes) visit(static_cast<std::uint32_t>(shape));
+    }
+}
+
 std::vector<std::uint32_t> ShaderResources::ContentKey(const CompiledShader& shader, bool dataWords, bool movableBuffers) {
     std::vector<std::uint32_t> key;
     AppendContentKey(shader, dataWords, movableBuffers, key);
@@ -3541,6 +3607,13 @@ void ShaderResources::AppendContentKey(const CompiledShader& shader, bool dataWo
     }
     key.reserve(words);
     VisitContentKey(shader, dataWords, movableBuffers, [&](std::uint32_t word) { key.push_back(word); });
+}
+
+// Debug (local, APS5_RESKEY_DIFF): the role of every word AppendContentKey appends, in the same order: 0 header,
+// 1 pipeline variant id, 2 binding layout, 3 image/sampler descriptor address words, 4 other image/sampler descriptor
+// words, 5 buffer descriptor words, 6 sampler indices, 7 flag bits.
+void ShaderResources::AppendContentKeyRoles(const CompiledShader& shader, bool dataWords, bool movableBuffers, std::vector<std::uint8_t>& roles) {
+    VisitContentKeyTagged(shader, dataWords, movableBuffers, [&](std::uint32_t, std::uint8_t role) { roles.push_back(role); });
 }
 
 namespace {
