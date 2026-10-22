@@ -4130,6 +4130,56 @@ void verifyScalarAddressRule() {
     }
 }
 
+void verifyTableTrailer() {
+    using namespace ShaderRecompiler;
+    namespace Abi = ImageTableAbi;
+    static TableTexture textures[2];
+    alignas(4096) static TableGuest guest;
+    std::fill(guest.heap.begin(), guest.heap.end(), std::array<std::uint32_t, 8>{});
+    guest.heap[0] = TableT(textures[0].bytes.data(), TableFormat8888UNorm, TableType2D);
+    guest.heap[1] = TableT(textures[1].bytes.data(), TableFormat32UInt, TableType2D);
+    guest.heap[3] = guest.heap[0];
+    guest.materials = {{{0u, 1u, 0u, 0u}, {0u, 0u, 0u, 0u}, {0u, 3u, 0u, 0u}}};
+    FillTableSrt(guest, guest.heap.data(), 32u, 4u);
+    const auto compiled = CompileTable(TableRequest(TableMaterialCode, TableUserData(guest)));
+    const auto& recompiled = TableMap(*compiled.result);
+    require(Abi::Version == 3u && recompiled[Abi::HeaderVersion] == Abi::Version, "table trailer: the recompiled map does not carry ABI version 3");
+    const auto tables = recompiled[Abi::HeaderTableCount];
+    require(tables != 0u, "table trailer: the program has no image table");
+    std::size_t recordsEnd = Abi::TableHeader(tables);
+    for (std::uint32_t table = 0; table < tables; ++table) {
+        const auto header = Abi::TableHeader(table);
+        recordsEnd = std::max<std::size_t>(recordsEnd, static_cast<std::size_t>(recompiled[header + Abi::TableMapStart]) + recompiled[header + Abi::TableKeyCount]);
+    }
+    recordsEnd = std::max<std::size_t>(recordsEnd, static_cast<std::size_t>(recompiled[Abi::HeaderElementFaults]) + recompiled[Abi::HeaderElementCount]);
+    recordsEnd = std::max<std::size_t>(recordsEnd, static_cast<std::size_t>(recompiled[Abi::HeaderSamplerFaults]) + recompiled[Abi::HeaderSamplerCount] / Abi::SamplerEntryElements);
+    require(recordsEnd <= recompiled.size(), "table trailer: the recompiled map is shorter than its records");
+
+    const auto check = [&](const Abi::Trailer& trailer, const char* what) {
+        auto map = recompiled;
+        const auto base = Abi::AppendTrailer(map, trailer);
+        require(base == recompiled.size() + Abi::TrailerWords && map.size() == base && map[Abi::HeaderElementBase] == base, (std::string("table trailer: ") + what + ": the element base does not follow the four trailer words").c_str());
+        for (std::size_t word = 0; word < recompiled.size(); ++word) {
+            if (word != Abi::HeaderElementBase) require(map[word] == recompiled[word], (std::string("table trailer: ") + what + ": a header or record word moved").c_str());
+        }
+        require(Abi::TrailerWord(base, 0u) == recompiled.size() && Abi::TrailerWord(base, 0u) >= recordsEnd && Abi::TrailerWord(base, Abi::TrailerWords) == base, (std::string("table trailer: ") + what + ": the trailer does not sit between the records and the element base").c_str());
+        require(map[Abi::TrailerWord(base, Abi::TrailerBucketsLow)] == static_cast<std::uint32_t>(trailer.buckets) && map[Abi::TrailerWord(base, Abi::TrailerBucketsHigh)] == static_cast<std::uint32_t>(trailer.buckets >> 32u), (std::string("table trailer: ") + what + ": the bucket address words are wrong").c_str());
+        require(map[Abi::TrailerWord(base, Abi::TrailerRingLow)] == static_cast<std::uint32_t>(trailer.ring) && map[Abi::TrailerWord(base, Abi::TrailerRingHigh)] == static_cast<std::uint32_t>(trailer.ring >> 32u), (std::string("table trailer: ") + what + ": the ring address words are wrong").c_str());
+        require(Abi::ReadTrailer(map) == trailer, (std::string("table trailer: ") + what + ": reading the trailer back gives other addresses").c_str());
+        map.resize(base + 2u * recompiled[Abi::HeaderElementCount], 0x5a5a5a5au);
+        require(Abi::ReadTrailer(map) == trailer, (std::string("table trailer: ") + what + ": slot parts after the element base changed the trailer").c_str());
+        return map;
+    };
+    const auto absent = check({}, "without a device table");
+    for (std::uint32_t field = 0; field < Abi::TrailerWords; ++field) require(absent[Abi::TrailerWord(static_cast<std::uint32_t>(recompiled.size() + Abi::TrailerWords), field)] == 0u, "table trailer: without a device table a trailer word is not zero");
+    static_cast<void>(check({0x0000123456789ab0ull, 0xfedcba9876543200ull}, "with a device table"));
+    auto truncated = recompiled;
+    truncated[Abi::HeaderElementBase] = Abi::HeaderWords + Abi::TrailerWords - 1u;
+    require(!Abi::ReadTrailer(truncated).has_value(), "table trailer: an element base inside the header read a trailer");
+    truncated[Abi::HeaderElementBase] = static_cast<std::uint32_t>(truncated.size() + 1u);
+    require(!Abi::ReadTrailer(truncated).has_value(), "table trailer: an element base past the map read a trailer");
+}
+
 void verifyPointerImageTable() {
     using namespace ShaderRecompiler;
     namespace Abi = ImageTableAbi;
@@ -9707,6 +9757,11 @@ int main(int argc, char** argv) {
             verifyWaterfallImageTable();
             verifySplitWaterfallImageTable();
             std::cout << "Image table keys, maps, records and registration passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--table-trailer") {
+            verifyTableTrailer();
+            std::cout << "The heap map's device table trailer sits between the records and the element base\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--table-snapshot-reuse") {

@@ -104,6 +104,11 @@ std::uint32_t tableHeapSlot(SpirvEmitterState& state, std::uint32_t part, std::u
 
 }
 
+std::uint32_t TableTrailerWord(SpirvEmitterState& state, std::uint32_t field) {
+    const auto base = tableMapWord(state, ConstantU32(state, ImageTableAbi::HeaderElementBase));
+    return tableMapWord(state, Binary(state, spv::OpISub, TypeU32(state), base, ConstantU32(state, ImageTableAbi::TrailerWords - field)));
+}
+
 std::uint32_t TableStorageImagePointer(SpirvEmitterState& state, DescriptorBindingKind kind, std::uint32_t resource, std::uint32_t pointerType) {
     const auto found = std::find_if(state.tableImageVariables.begin(), state.tableImageVariables.end(), [&](const SpirvTableImageVariable& variable) { return variable.kind == kind; });
     if (found == state.tableImageVariables.end() || !state.tableAccess.active) ExitDescriptorBindingFailure(state, kind, resource, "image storage table array was not emitted for the mode");
