@@ -1003,11 +1003,11 @@ void Pipeline::PushConstants(VkCommandBuffer commands, VkShaderStageFlags stages
         return;
     }
     if (dynamicRendering) {
-        context.Resolved(&DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, layout, pushStagesOf(context), 0, PipelinePushSlotBytes, bytes.data());
-        context.Resolved(&DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, layout, VK_SHADER_STAGE_FRAGMENT_BIT, PipelinePushSlotBytes, PipelinePushSlotBytes, bytes.data() + PipelinePushSlotBytes);
+        CmdPushConstants(context, commands, layout, pushStagesOf(context), 0, PipelinePushSlotBytes, bytes.data());
+        CmdPushConstants(context, commands, layout, VK_SHADER_STAGE_FRAGMENT_BIT, PipelinePushSlotBytes, PipelinePushSlotBytes, bytes.data() + PipelinePushSlotBytes);
         return;
     }
-    context.Resolved(&DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, layout, stages, 0, PipelinePushSlotBytes, bytes.data());
+    CmdPushConstants(context, commands, layout, stages, 0, PipelinePushSlotBytes, bytes.data());
 }
 
 namespace {

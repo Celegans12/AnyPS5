@@ -757,7 +757,6 @@ private:
     PFN_vkCmdResetQueryPool cmdResetQueryPool = nullptr;
     PFN_vkCmdCopyQueryPoolResults cmdCopyQueryPoolResults = nullptr;
     PFN_vkCmdBindPipeline cmdBindPipeline = nullptr;
-    PFN_vkCmdPushConstants cmdPushConstants = nullptr;
     PFN_vkCmdDispatch cmdDispatch = nullptr;
     template<typename TFunction>
     TFunction function(TFunction resolved, const char* name) const {

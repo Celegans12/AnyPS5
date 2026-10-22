@@ -5177,7 +5177,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
             const VkPushDataInfoEXT push{VK_STRUCTURE_TYPE_PUSH_DATA_INFO_EXT, nullptr, 0, {pushed.data(), pushed.size()}};
             context.Function<PFN_vkCmdPushDataEXT>("vkCmdPushDataEXT")(commands, &push);
         } else {
-            context.Resolved(&Graphics::DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, record.objects->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::ComputePushConstantBytes, pushed.data());
+            Graphics::CmdPushConstants(context, commands, record.objects->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::ComputePushConstantBytes, pushed.data());
         }
     }
     const auto gpuTiming = recorder.BeginGpuTiming(record.programAddress != 0 ? record.programAddress : record.shader->program->variantId);

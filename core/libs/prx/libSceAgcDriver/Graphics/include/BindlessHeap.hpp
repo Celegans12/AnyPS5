@@ -185,6 +185,7 @@ private:
     std::chrono::steady_clock::time_point start;
 };
 void NoteCommandBufferBegun(VkCommandBuffer commands);
+void CmdPushConstants(const Context& context, VkCommandBuffer commands, VkPipelineLayout layout, VkShaderStageFlags stages, std::uint32_t offset, std::uint32_t size, const void* values);
 void CmdBindDescriptorSets(const Context& context, VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout, std::uint32_t firstSet, std::uint32_t setCount, const VkDescriptorSet* sets, SetBindSite site);
 std::uint64_t DescriptorHeapBinds();
 

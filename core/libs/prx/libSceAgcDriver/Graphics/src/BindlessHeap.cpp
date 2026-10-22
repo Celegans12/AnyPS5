@@ -875,6 +875,11 @@ void NoteCommandBufferBegun(VkCommandBuffer commands) {
     forgetHeapBinding(commands);
 }
 
+void CmdPushConstants(const Context& context, VkCommandBuffer commands, VkPipelineLayout layout, VkShaderStageFlags stages, std::uint32_t offset, std::uint32_t size, const void* values) {
+    context.Resolved(&DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, layout, stages, offset, size, values);
+    forgetHeapBinding(commands);
+}
+
 void CmdBindDescriptorSets(const Context& context, VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout, std::uint32_t firstSet, std::uint32_t setCount, const VkDescriptorSet* sets, SetBindSite site) {
     context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, bindPoint, layout, firstSet, setCount, sets, 0, nullptr);
     setBinds[static_cast<std::size_t>(site)].fetch_add(1, std::memory_order_relaxed);
