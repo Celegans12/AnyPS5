@@ -3106,7 +3106,7 @@ if(BUILD_TESTING)
             endif()
         endforeach()
     endforeach()
-    set_tests_properties(agc_driver_array_layer_target agc_driver_array_layer_target_full agc_driver_array_layer_target_none PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_LAYER_REFRESH=1")
+    set_tests_properties(agc_driver_array_layer_target PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_LAYER_REFRESH=1")
     add_test(NAME agc_driver_array_layer_target_cpu COMMAND agc_driver_array_layer_target_tests)
     set_tests_properties(agc_driver_array_layer_target_cpu PROPERTIES
             ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_HOST_IMPORT=1;APS5_LAYER_REFRESH=1;APS5_SELECTED_CPU_UPLOAD=1" TIMEOUT 30 SKIP_RETURN_CODE 77)

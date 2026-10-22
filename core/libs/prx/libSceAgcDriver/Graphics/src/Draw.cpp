@@ -1607,7 +1607,13 @@ struct ResourceUse {
     std::shared_ptr<ShaderResources> resources;
     ResourceUse() = default;
     ResourceUse(ResourceUse&& other) noexcept : resources(std::move(other.resources)) {}
-    ResourceUse& operator=(ResourceUse&& other) = delete;
+    ResourceUse& operator=(ResourceUse&& other) noexcept {
+        if (this != &other) {
+            if (resources != nullptr) resources->EndUse();
+            resources = std::move(other.resources);
+        }
+        return *this;
+    }
     ~ResourceUse() {
         if (resources != nullptr) resources->EndUse();
     }
