@@ -1618,7 +1618,7 @@ struct ResolvedResources {
     ResourceUse use;
 };
 
-ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, DrawOutcome& outcome, DrawTimer& timer, PreparedDraw* prepared = nullptr, const AheadDraw* ahead) {
+ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, DrawOutcome& outcome, DrawTimer& timer, PreparedDraw* prepared = nullptr, const AheadDraw* ahead = nullptr) {
     ResolvedResources resolved;
     if (prepared != nullptr && (prepared->device != context.device || prepared->indexBytes != indexBytes)) {
         if (prepared->resources != nullptr) Splits().staleOther.fetch_add(1, std::memory_order_relaxed);
