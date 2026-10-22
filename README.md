@@ -20,7 +20,7 @@
 | **Frame rate in the world** | about **0.5-0.6 fps** (5.2-6.6 presents per 10 s depending on the session; this laptop's GPU clocks drift by ~14 % between sessions, so builds are compared back to back in one session) |
 | **Stability** | with the second Vulkan queue on its own compute-only queue family, every world run since the fix has been clean (up to 22 minutes); see known issues |
 | **Tested on** | Windows 11, RTX 3080 Laptop GPU 16 GB (driver 610.62), 32 GB RAM, MinGW-w64 GCC 15.2.0, Release |
-| **Build** | `84b388765e` (our tree merged with `main` 2026-10-21 `557682ca44`) + docs, shader-cache SourceVersion `d0982988e4b6716e`, title reference T1 exact (`t1-m21s`) |
+| **Build** | `4212ed0d36` (our tree merged with `main` 2026-10-21 `557682ca44`, plus the overlap access-range check) + docs, shader-cache SourceVersion `d0982988e4b6716e`, title reference T1 exact |
 
 <table>
 <tr>
@@ -83,6 +83,7 @@ APS5_NO_PIPELINE_JOURNAL=1 APS5_RESOURCE_CACHE_ENTRIES=1024 APS5_ASYNC_LANE=51
   - `APS5_NO_OWED_RUN_CLOSE=1`, `APS5_NO_RUN_ATOMIC_GUARD=1`, `APS5_NO_RUN_STAGED_READ_GUARD=1`: overlap fixes.
   - `APS5_NO_LANE_OPEN_SERIAL=1`, `APS5_NO_LANE_TEMPLATE_EDGE=1`, `APS5_NO_LANE_LABEL_SCOPE=1`, `APS5_NO_LANE_FORWARD_EDGE=1`, `APS5_NO_LANE_LEASE_WAIT=1`: second-queue fixes.
   - `APS5_NO_IMAGE_SLABS=1`, `APS5_NO_PREPARED_TABLE_COUNT=1`: hritikutekar's committer fixes.
+  - `APS5_NO_OVERLAP_RANGE_CHECK=1`: overlapped dispatches no longer need disjoint access ranges (the old rule).
   - `APS5_NO_DISPATCH_OVERLAP=1`, `APS5_NO_BATCHED_STAGING=1`, `APS5_NO_SPARSE_PAGE_STATES=1`.
   - Every local change has an off switch (`APS5_NO_...`), named in its commit message.
 - Diagnostics: `APS5_GPU_CHECKPOINTS=1` (`=batch` marks only batch begin/end per queue), `APS5_NV_DIAGNOSTICS=1` (NVIDIA device diagnostics config, so an Nsight Aftermath crash dump can name the fault), `APS5_FAULT_ADDRESSES=1` (with `APS5_MEM_STATS=1`; also reports a buffer destroyed while a pending batch writes it), `APS5_LANE_SERIALIZE=1`, `APS5_NO_LANE_OVERLAP=1`.
@@ -97,7 +98,7 @@ APS5_NO_PIPELINE_JOURNAL=1 APS5_RESOURCE_CACHE_ENTRIES=1024 APS5_ASYNC_LANE=51
 - Black shapes on some rocks and terrain (the depth pre-pass and the G-buffer pass disagree on depth). Cause not found yet.
 - Process memory is about 30-35 GB in the world, so 32 GB of RAM is tight. `main` 2026-10-21 dropped the 2 GiB reserve of the sampled-texture budget (#7862), with no switch; our cold run went down to 0.2 GB of free RAM (paging) without failing.
 - Once, during loading on the build before this one, the game stopped with `missing static shader ABI register 531`. It did not come back in any later run; if you see it, please post the log in #675.
-- The overlap fixes keep conflicting dispatches out of overlapped runs, which costs GPU time (about +14 % per frame on the previous build). Frames are CPU-bound, so presents barely move.
+- A dispatch joins an overlapped run only when its access ranges are disjoint from the run's; address-based, BDA and bindless dispatches count as conflicting. That costs about 5 % GPU time per frame against the old rule. Frames are CPU-bound, so presents don't move.
 - One compute program (0x8000361f00) is still refused by the recompiler at registration (non-fatal so far).
 - About 0.5 fps is far from playable. What limits a frame now, and what's next, is in [discussion #675](https://github.com/boykopovar/AnyPS5/discussions/675).
 
@@ -135,6 +136,7 @@ APS5_NO_PIPELINE_JOURNAL=1 APS5_RESOURCE_CACHE_ENTRIES=1024 APS5_ASYNC_LANE=51
 - 2026-10-21: moved to our tree merged with `main` 2026-10-20 (`020d736b15`). In a same-session pair with the second queue off on both, 4.99 vs 4.19 presents per 10 s (+19 %) and a 2,070 vs 2,372 ms median frame (-13 %). It reaches the world sooner too: frame 85 at 334 s vs 478 s. T1 exact. **New shader-cache version, so the first run compiles cold.** `APS5_ASYNC_LANE=51` is out of the env until its GPU hang is fixed.
 - 2026-10-21: the second queue is back (`63700c68ef`, same shader cache, T1 exact). Its "hang" was a DMA page fault on the GPU tied to the graphics family's third queue: the same work on a compute-only queue family ran clean in 4 of 4 world runs, up to 16 minutes each. The queue now comes from a compute-only family by default, and `APS5_ASYNC_LANE=51` is back in the env. Same-session pair, second queue on vs off: 5.89 vs 5.45 presents per 10 s (+8 %), 1,564 vs 1,852 ms median frame (-16 %). These numbers are **provisional**: an Nsight Aftermath monitor was running during both runs. Also three more cross-queue fixes, each with a test that fails without it.
 - 2026-10-22: moved to our tree merged with `main` 2026-10-21 (`557682ca44`), with hritikutekar's two committer fixes from #675. In a same-session pair against the previous build plus the same fixes: 5.20 vs 5.13 presents per 10 s and a 2,065 vs 2,071 ms median frame, so the same speed on a newer `main`. On the previous build the two fixes were worth +11 % in an in-run A/B (6.26 vs 5.62). T1 exact. **New shader-cache version, so the first run compiles cold.** Three `main` paths that broke Yōtei are off here and listed under [Run it](#run-it). These numbers were measured with no debugging tools running.
+- 2026-10-22: dispatch overlap now checks access ranges (`4212ed0d36`, same shader cache, T1 exact): a dispatch joins an overlapped run only when what it reads and writes doesn't overlap what the run reads and writes, the rule CnRJay asked for on #9176. Without it, about 40 % of the joins in the world (28,969 of 42,749) had an access conflict. In an in-run A/B the check costs no presents (-0.15 ± 0.27 per 10 s) and about 43 ms of GPU time per frame; frames were clean either way. `APS5_NO_OVERLAP_RANGE_CHECK=1` goes back to the old rule.
 
 ---
 
