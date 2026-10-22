@@ -1739,7 +1739,8 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
             resolved.contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
         }
         auto cached = SharedResourceCache().Find(resolved.contentKey);
-        const bool inUse = cached != nullptr && cached->InUse();
+        // APS5_UNSAFE_BDA_REUSE (measurement-only oracle): an address-table build in flight is reused anyway.
+        const bool inUse = cached != nullptr && cached->InUse() && !(cached->ReusesAddressSpace() && RuntimeSwitches::Set(RuntimeSwitch::UnsafeBdaReuse));
         if (inUse) CountAddressReuse(AddressReuse::InUse);
         if (cached != nullptr && !inUse) {
             const bool addressBased = cached->ReusesAddressSpace();

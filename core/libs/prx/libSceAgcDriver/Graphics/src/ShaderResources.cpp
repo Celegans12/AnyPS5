@@ -3384,9 +3384,17 @@ bool LoopGuardEnabled() {
     return enabled;
 }
 
+// APS5_UNSAFE_BDA_REUSE=1 (MEASUREMENT-ONLY ORACLE, NOT EXACT; an APS5_AB switch): address-table
+// builds are cached and reused even under APS5_NO_ADDRESS_DRAW_REUSE=1, and a reuse skips the
+// "in use" and snapshot checks, i.e. it acts as if the memory read through the page table never
+// changed. Stale reads (glitches) are expected. It bounds what address-table templates could save.
+bool UnsafeBdaReuseOn() {
+    return RuntimeSwitches::Set(RuntimeSwitch::UnsafeBdaReuse);
+}
+
 bool AddressReuseEnabled() {
     static const bool enabled = std::getenv("APS5_NO_ADDRESS_DRAW_REUSE") == nullptr;
-    return enabled;
+    return enabled || UnsafeBdaReuseOn();
 }
 
 void CompleteSnapshotWrites(std::span<const GuestMemorySnapshot> snapshots) {
@@ -4327,9 +4335,12 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     auto& outcome = report != nullptr ? *report : proof;
     outcome = {ProofPath::Full, ProofFailure::Other};
     if (!reusable) return refuse(AddressReuse::NotReusable);
-    if (InUse()) return refuse(AddressReuse::InUse);
-    CompleteSnapshotWrites(snapshots);
-    if (!guestMemory.SameSnapshots(snapshots)) return refuse(AddressReuse::Snapshots);
+    const bool oracle = UnsafeBdaReuseOn();
+    if (!oracle && InUse()) return refuse(AddressReuse::InUse);
+    if (!oracle) {
+        CompleteSnapshotWrites(snapshots);
+        if (!guestMemory.SameSnapshots(snapshots)) return refuse(AddressReuse::Snapshots);
+    }
     struct Suspend {
         GuestBufferMemory& memory;
         bool armed = true;
