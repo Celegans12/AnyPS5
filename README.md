@@ -20,7 +20,7 @@
 | **Frame rate in the world** | about **0.5-0.6 fps** (5.2-6.6 presents per 10 s depending on the session; this laptop's GPU clocks drift by ~14 % between sessions, so builds are compared back to back in one session) |
 | **Stability** | with the second Vulkan queue on its own compute-only queue family, every world run since the fix has been clean (up to 22 minutes); see known issues |
 | **Tested on** | Windows 11, RTX 3080 Laptop GPU 16 GB (driver 610.62), 32 GB RAM, MinGW-w64 GCC 15.2.0, Release |
-| **Build** | `4212ed0d36` (our tree merged with `main` 2026-10-21 `557682ca44`, plus the overlap access-range check) + docs, shader-cache SourceVersion `d0982988e4b6716e`, title reference T1 exact |
+| **Build** | `18bffe373a` (our tree merged with `main` 2026-10-21 `557682ca44`, plus fixes from #675) + docs, shader-cache SourceVersion `d0982988e4b6716e`, title reference T1 exact |
 
 <table>
 <tr>
@@ -82,7 +82,7 @@ APS5_NO_PIPELINE_JOURNAL=1 APS5_RESOURCE_CACHE_ENTRIES=1024 APS5_ASYNC_LANE=51
   - `APS5_NO_SMALL_DEVICE_TIER=1`, `APS5_NO_EXACT_SIZE_REUSE=1`, `APS5_NO_HELD_READ_SKIP=1`, `APS5_NO_HELD_READ_BOUNDS=1`: committer fixes.
   - `APS5_NO_OWED_RUN_CLOSE=1`, `APS5_NO_RUN_ATOMIC_GUARD=1`, `APS5_NO_RUN_STAGED_READ_GUARD=1`: overlap fixes.
   - `APS5_NO_LANE_OPEN_SERIAL=1`, `APS5_NO_LANE_TEMPLATE_EDGE=1`, `APS5_NO_LANE_LABEL_SCOPE=1`, `APS5_NO_LANE_FORWARD_EDGE=1`, `APS5_NO_LANE_LEASE_WAIT=1`: second-queue fixes.
-  - `APS5_NO_IMAGE_SLABS=1`, `APS5_NO_PREPARED_TABLE_COUNT=1`: hritikutekar's committer fixes.
+  - `APS5_NO_IMAGE_SLABS=1`, `APS5_NO_PREPARED_TABLE_COUNT=1`: hritikutekar's committer fixes; `APS5_NO_PRESENT_FRAME_AGE=1`: his texture-cache frame age.
   - `APS5_NO_OVERLAP_RANGE_CHECK=1`: overlapped dispatches no longer need disjoint access ranges (the old rule).
   - `APS5_NO_DISPATCH_OVERLAP=1`, `APS5_NO_BATCHED_STAGING=1`, `APS5_NO_SPARSE_PAGE_STATES=1`.
   - Every local change has an off switch (`APS5_NO_...`), named in its commit message.
@@ -124,7 +124,7 @@ APS5_NO_PIPELINE_JOURNAL=1 APS5_RESOURCE_CACHE_ENTRIES=1024 APS5_ASYNC_LANE=51
     - small device buffers get their own pool tier;
     - an exact-size buffer is reused instead of rebinding another one;
     - a flush with nothing to store skips the held-read check;
-  - from contributors in #675: hritikutekar's prepared-table count in the texture service and slab-backed texture snapshots (here only for images that fill at least 3/4 of their slot, with slots counted at full size against the budget; unrestricted slabs made the texture cache thrash on this tree); FardinHaque70's fix for an import unwatch hook that re-entered the import lookup (from hritikutekar's diagnosis), and Izamaru's page-state table allocated on demand (about 250 MB less commit charge).
+  - from contributors in #675: shahulmubeen-a's register lists read at any byte address (#9600, an open-world crash); hritikutekar's texture-cache frame age (entries age by presents while a frame takes seconds) and his second queue on a compute-only family when the graphics family has one queue (RADV); hritikutekar's prepared-table count in the texture service and slab-backed texture snapshots (here only for images that fill at least 3/4 of their slot, with slots counted at full size against the budget; unrestricted slabs made the texture cache thrash on this tree); FardinHaque70's fix for an import unwatch hook that re-entered the import lookup (from hritikutekar's diagnosis), and Izamaru's page-state table allocated on demand (about 250 MB less commit charge).
 
 ## Updates
 
@@ -137,6 +137,7 @@ APS5_NO_PIPELINE_JOURNAL=1 APS5_RESOURCE_CACHE_ENTRIES=1024 APS5_ASYNC_LANE=51
 - 2026-10-21: the second queue is back (`63700c68ef`, same shader cache, T1 exact). Its "hang" was a DMA page fault on the GPU tied to the graphics family's third queue: the same work on a compute-only queue family ran clean in 4 of 4 world runs, up to 16 minutes each. The queue now comes from a compute-only family by default, and `APS5_ASYNC_LANE=51` is back in the env. Same-session pair, second queue on vs off: 5.89 vs 5.45 presents per 10 s (+8 %), 1,564 vs 1,852 ms median frame (-16 %). These numbers are **provisional**: an Nsight Aftermath monitor was running during both runs. Also three more cross-queue fixes, each with a test that fails without it.
 - 2026-10-22: moved to our tree merged with `main` 2026-10-21 (`557682ca44`), with hritikutekar's two committer fixes from #675. In a same-session pair against the previous build plus the same fixes: 5.20 vs 5.13 presents per 10 s and a 2,065 vs 2,071 ms median frame, so the same speed on a newer `main`. On the previous build the two fixes were worth +11 % in an in-run A/B (6.26 vs 5.62). T1 exact. **New shader-cache version, so the first run compiles cold.** Three `main` paths that broke Yōtei are off here and listed under [Run it](#run-it). These numbers were measured with no debugging tools running.
 - 2026-10-22: dispatch overlap now checks access ranges (`4212ed0d36`, same shader cache, T1 exact): a dispatch joins an overlapped run only when what it reads and writes doesn't overlap what the run reads and writes, the rule CnRJay asked for on #9176. Without it, about 40 % of the joins in the world (28,969 of 42,749) had an access conflict. In an in-run A/B the check costs no presents (-0.15 ± 0.27 per 10 s) and about 43 ms of GPU time per frame; frames were clean either way. `APS5_NO_OVERLAP_RANGE_CHECK=1` goes back to the old rule.
+- 2026-10-22: three fixes from #675 (`18bffe373a`, same shader cache, T1 exact): shahulmubeen-a's #9600 (register lists at any byte address; an open-world crash), hritikutekar's texture-cache frame age (in-run A/B 6.09 vs 5.86 presents per 10 s, about 1 SE; his big gain was with the cache over budget, which ours no longer is), and his second-queue fix for GPUs whose graphics family has one queue (RADV; NVIDIA unchanged).
 
 ---
 
