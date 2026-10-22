@@ -115,6 +115,11 @@ const ProgramList& TintedPixelPrograms() {
     return list;
 }
 
+const ProgramList& TintedVertexPrograms() {
+    static const auto& list = listFromEnvironment("APS5_TINT_VERTEX_PROGRAMS");
+    return list;
+}
+
 const ProgramList& DumpedDrawPrograms() {
     static const auto& list = listFromEnvironment("APS5_DUMP_DRAW_PROGRAMS");
     return list;
@@ -210,7 +215,7 @@ std::optional<char> DepthScheduleItem() {
         if (end == nullptr || *end != ':') throw std::runtime_error("APS5_DEPTH_SCHEDULE must be <frame>:<item>,...");
         for (const char* cursor = end + 1; *cursor != '\0'; ++cursor) {
             if (*cursor == ',') continue;
-            if (*cursor != '-' && *cursor != 'p' && (*cursor < '0' || *cursor > '7') && (*cursor < 'a' || *cursor > 'l')) throw std::runtime_error("APS5_DEPTH_SCHEDULE items are '-', 'p', a VkCompareOp digit 0-7 or a depth slack letter a-l");
+            if (*cursor != '-' && *cursor != 'p' && (*cursor < '0' || *cursor > '7') && (*cursor < 'a' || *cursor > 'l') && *cursor != 'y' && *cursor != 'z') throw std::runtime_error("APS5_DEPTH_SCHEDULE items are '-', 'p', a VkCompareOp digit 0-7 or a depth slack letter a-l");
             parsed.items.push_back(*cursor);
         }
         if (parsed.items.empty()) throw std::runtime_error("APS5_DEPTH_SCHEDULE has no items");

@@ -350,7 +350,20 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     if (!gbufferDraw && decode->state.depth && decode->state.depthWrite && decode->state.depth->address == GbufferDepth() && VertexBitsSkip(vertexProgram)) skipDepthOnly = true;
     if (const auto item = DepthScheduleItem()) {
         const auto& state = decode->state;
-        if (const auto slack = DepthSlackBias(*item)) {
+        if ((*item == 'y' || *item == 'z') && ListedProgram(TintedVertexPrograms(), vertexProgram)) {
+            auto tinted = std::make_shared<DrawDecode>(*decode);
+            auto& tintState = tinted->state;
+            std::vector<VkFormat> formats(tintState.blends.size(), VK_FORMAT_UNDEFINED);
+            for (const auto& color : tintState.colors) {
+                if (color.exportIndex < formats.size() && !color.uintExport) formats[color.exportIndex] = color.format;
+            }
+            ApplyBlendTint(tintState.blends, tintState.blendConstants, formats);
+            if (*item == 'z') {
+                tintState.depthCompare = VK_COMPARE_OP_ALWAYS;
+                tintState.depthWrite = false;
+            }
+            decode = std::move(tinted);
+        } else if (const auto slack = DepthSlackBias(*item)) {
             if (gbufferDraw && state.depthTest && (state.depthCompare == VK_COMPARE_OP_EQUAL || state.depthCompare == VK_COMPARE_OP_GREATER_OR_EQUAL)) {
                 auto relaxed = std::make_shared<DrawDecode>(*decode);
                 relaxed->state.depthCompare = VK_COMPARE_OP_GREATER_OR_EQUAL;
