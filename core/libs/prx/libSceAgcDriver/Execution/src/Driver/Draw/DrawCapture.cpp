@@ -171,6 +171,20 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
         if ((graphics.hasColorTarget && graphics.color.address == dumpTarget) || slot0 == dumpTarget) static_cast<void>(dumpRequest(program.binary.codeAddress, request));
     }
     if (ListedProgram(DumpedDrawPrograms(), program.binary.codeAddress)) static_cast<void>(dumpRequest(program.binary.codeAddress, request));
+    static const bool dumpMainDepthVertex = std::getenv("APS5_DUMP_MAIN_DEPTH_VERTEX") != nullptr;
+    if (dumpMainDepthVertex && i == 0 && program.binary.stage != ShaderRecompiler::ShaderStage::Fragment && graphics.depth && graphics.depth->extent.width >= 1280u && graphics.depth->extent.width != graphics.depth->extent.height) {
+        static std::mutex mutex;
+        static std::set<std::uint64_t> dumped;
+        bool first = false;
+        {
+            std::lock_guard lock(mutex);
+            first = dumped.insert(program.binary.codeAddress).second;
+        }
+        if (first) {
+            const auto name = dumpRequest(program.binary.codeAddress, request);
+            std::fprintf(stderr, "[progstats] dumped vertex program 0x%llx hash 0x%08x (%zu colour targets, depth 0x%llx) to %s\n", static_cast<unsigned long long>(program.binary.codeAddress), ProgramBisectHash(program.binary.codeAddress), graphics.colors.size(), static_cast<unsigned long long>(graphics.depth->address), name.c_str());
+        }
+    }
     if (dumpSlot1 != 0) {
         const auto value = [&](std::uint32_t offset) -> std::uint64_t { const auto it = queue.context.find(offset); return it == queue.context.end() ? 0u : it->second; };
         const auto slot1 = (value(0x391) << 40u) | (value(0x327) << 8u);
