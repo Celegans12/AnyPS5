@@ -44,6 +44,7 @@ enum class RuntimeSwitch : std::size_t {
     NoPreparedTableCount,
     NoOverlapRangeCheck,
     NoDrawAhead,
+    NoPresentFrameAge,
     Count,
 };
 
