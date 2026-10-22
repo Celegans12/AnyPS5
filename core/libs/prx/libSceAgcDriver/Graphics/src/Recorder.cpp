@@ -1768,7 +1768,7 @@ std::array<std::uint64_t, 12> runConflicts{};
 std::uint64_t runJoinsChecked = 0, runJoinsConflicting = 0;
 std::map<std::tuple<std::uint64_t, std::uint64_t, int>, std::uint64_t> runConflictPairs;
 std::array<std::uint64_t, 3> owedCopyBacks{};
-std::atomic<std::uint64_t> atomicGuardRefusals{0}, owedRunsClosed{0}, stagedReadRefusals{0};
+std::atomic<std::uint64_t> atomicGuardRefusals{0}, owedRunsClosed{0}, stagedReadRefusals{0}, rangeRefusals{0}, rangeConflictsUnchecked{0}, runDeferredCount{0}, runJoinedCount{0};
 bool DrawOrGpuProfiled();
 constexpr bool CopiedAtomic(std::uint64_t flags) {
     return (flags & (Recorder::RunAccessCopied | Recorder::RunAccessAtomic)) == (Recorder::RunAccessCopied | Recorder::RunAccessAtomic);
@@ -1817,6 +1817,7 @@ bool Recorder::RunAtomicConflict(std::span<const std::array<std::uint64_t, 3>> a
         }
         if (conflict || !CopiedAtomic(access[2])) continue;
         for (const auto& member : open->runAccess) {
+            if ((member[2] & RunAccessImage) != 0) continue;
             if (!overlaps(access[0], access[1], member[0], member[1])) continue;
             conflict = true;
             break;
@@ -1828,8 +1829,9 @@ bool Recorder::RunAtomicConflict(std::span<const std::array<std::uint64_t, 3>> a
     }
     if (RuntimeSwitches::Set(RuntimeSwitch::NoRunStagedReadGuard)) return false;
     for (const auto& access : accesses) {
-        if ((access[2] & RunAccessWritten) != 0) continue;
+        if ((access[2] & (RunAccessWritten | RunAccessImage)) != 0) continue;
         for (const auto& member : open->runAccess) {
+            if ((member[2] & RunAccessImage) != 0) continue;
             if ((member[2] & RunAccessWritten) == 0 || ((access[2] | member[2]) & RunAccessCopied) == 0) continue;
             if (!overlaps(access[0], access[1], member[0], member[1])) continue;
             stagedReadRefusals.fetch_add(1, std::memory_order_relaxed);
@@ -1839,6 +1841,32 @@ bool Recorder::RunAtomicConflict(std::span<const std::array<std::uint64_t, 3>> a
     return false;
 }
 
+bool Recorder::RunRangeConflict(std::span<const std::array<std::uint64_t, 3>> accesses) const {
+    if (open == nullptr || open->deferredDispatchQueue == 0) return false;
+    bool conflict = false;
+    for (const auto& access : accesses) {
+        for (const auto& member : open->runAccess) {
+            if (((access[2] ^ member[2]) & RunAccessImage) != 0) continue;
+            if (!(access[0] < member[1] && member[0] < access[1])) continue;
+            if (((access[2] | member[2]) & RunAccessWritten) == 0) continue;
+            conflict = true;
+            break;
+        }
+        if (conflict) break;
+    }
+    if (!conflict) return false;
+    if (RuntimeSwitches::Set(RuntimeSwitch::NoOverlapRangeCheck)) {
+        rangeConflictsUnchecked.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    rangeRefusals.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+std::array<std::uint64_t, 2> Recorder::RangeCheckCounts() {
+    return {rangeRefusals.load(std::memory_order_relaxed), rangeConflictsUnchecked.load(std::memory_order_relaxed)};
+}
+
 void Recorder::CheckRunConflicts(std::uint64_t program, std::span<const std::array<std::uint64_t, 3>> accesses) const {
     if (open == nullptr || open->deferredDispatchQueue == 0) return;
     std::lock_guard lock(runCloseMutex);
@@ -1846,6 +1874,7 @@ void Recorder::CheckRunConflicts(std::uint64_t program, std::span<const std::arr
     bool any = false;
     for (const auto& joiner : accesses) {
         for (const auto& member : open->runAccess) {
+            if (((joiner[2] | member[2]) & RunAccessImage) != 0) continue;
             if (!(joiner[0] < member[1] && member[0] < joiner[1])) continue;
             const bool joinerWrites = (joiner[2] & RunAccessWritten) != 0;
             const bool memberWrites = (member[2] & RunAccessWritten) != 0;
@@ -2118,7 +2147,7 @@ void Recorder::flushDeferredDispatch(std::size_t site, const std::source_locatio
 }
 
 VkCommandBuffer Recorder::RunCommands(std::uint32_t queueKey, const void* owner, bool& inRun, VkAccessFlags* coveredAccess, std::span<const std::array<std::uint64_t, 3>> accesses) {
-    inRun = queueKey != 0 && open != nullptr && open->edgeOwed == 0 && open->deferredDispatchQueue == queueKey && !open->renderPass.open && !open->run.open && std::find(open->deferredRun.begin(), open->deferredRun.end(), owner) == open->deferredRun.end() && !RunAtomicConflict(accesses);
+    inRun = queueKey != 0 && open != nullptr && open->edgeOwed == 0 && open->deferredDispatchQueue == queueKey && !open->renderPass.open && !open->run.open && std::find(open->deferredRun.begin(), open->deferredRun.end(), owner) == open->deferredRun.end() && !RunAtomicConflict(accesses) && !RunRangeConflict(accesses);
     if (!inRun) return Commands(coveredAccess);
     GuestMemory::AssertGpuLockHeld("Recorder::RunCommands");
     if (coveredAccess != nullptr) *coveredAccess = 0;
@@ -2131,7 +2160,7 @@ void Recorder::AfterRun(std::function<void(Recorder&)> work) {
 }
 
 VkCommandBuffer Recorder::OverlapCommands(std::uint32_t queueKey, std::span<const void* const> owners, VkAccessFlags* coveredAccess, bool& overlapped, std::span<const std::array<std::uint64_t, 3>> accesses) {
-    overlapped = queueKey != 0 && open != nullptr && open->edgeOwed == 0 && open->deferredDispatchQueue == queueKey && !open->renderPass.open && !open->run.open && std::none_of(owners.begin(), owners.end(), [&](const void* owner) { return std::find(open->deferredRun.begin(), open->deferredRun.end(), owner) != open->deferredRun.end(); }) && !RunAtomicConflict(accesses);
+    overlapped = queueKey != 0 && open != nullptr && open->edgeOwed == 0 && open->deferredDispatchQueue == queueKey && !open->renderPass.open && !open->run.open && std::none_of(owners.begin(), owners.end(), [&](const void* owner) { return std::find(open->deferredRun.begin(), open->deferredRun.end(), owner) != open->deferredRun.end(); }) && !RunAtomicConflict(accesses) && !RunRangeConflict(accesses);
     if (queueKey != 0 && DrawOrGpuProfiled()) {
         std::lock_guard lock(runCloseMutex);
         ++overlapByRing[queueKey][overlapped ? 0 : open == nullptr || open->deferredDispatchQueue == 0 ? 1 : 2];
@@ -2149,12 +2178,19 @@ VkCommandBuffer Recorder::OverlapCommands(std::uint32_t queueKey, std::span<cons
     return open->commands;
 }
 
+Recorder::OverlapStatistics Recorder::OverlapCounts() {
+    return {runDeferredCount.load(std::memory_order_relaxed), runJoinedCount.load(std::memory_order_relaxed)};
+}
+
 void Recorder::DeferDispatchBarrier(std::uint32_t queueKey, std::span<const void* const> owners) {
     Require(open != nullptr && queueKey != 0, "a deferred dispatch barrier has no batch");
+    runDeferredCount.fetch_add(1, std::memory_order_relaxed);
     if (open->deferredDispatchQueue == 0) {
         open->deferredRun.clear();
         open->runAccess.clear();
         open->runCopiedAtomic.clear();
+    } else {
+        runJoinedCount.fetch_add(1, std::memory_order_relaxed);
     }
     open->deferredRun.insert(open->deferredRun.end(), owners.begin(), owners.end());
     open->deferredDispatchQueue = queueKey;

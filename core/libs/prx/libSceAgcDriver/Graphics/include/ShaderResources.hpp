@@ -322,7 +322,7 @@ public:
     void InPlaceReads(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) const { guestMemory.InPlaceReads(out); }
     std::vector<std::pair<VkImage, bool>> StorageImages() const;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> DeviceReads() const { return guestMemory.DeviceReads(); }
-    void RunAccesses(std::vector<std::array<std::uint64_t, 3>>& out) const { guestMemory.RunAccesses(out); }
+    void RunAccesses(std::vector<std::array<std::uint64_t, 3>>& out) const;
     void DeviceReads(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) const { guestMemory.DeviceReads(out); }
     bool ReadsImage(const StorageTexture* image) const;
     bool HasCachedStorageImages() const;
