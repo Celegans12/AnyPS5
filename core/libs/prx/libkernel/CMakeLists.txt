@@ -275,6 +275,30 @@ if(BUILD_TESTING)
         set_tests_properties(guest_dynamic_loader_fixed_base PROPERTIES
             WORKING_DIRECTORY "$<TARGET_FILE_DIR:guest_module_fixture>" RESOURCE_LOCK guest_dynamic_loader_files)
     endif()
+    file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/variant_names")
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/variant_names/guest_module_fixture.sprx.GUEST.PRX" "not a module\n")
+    add_custom_command(TARGET guest_module_fixture POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:guest_module_fixture>"
+            "${CMAKE_CURRENT_BINARY_DIR}/variant_names/guest_module_fixture.elf.GUEST.PRX"
+        VERBATIM)
+    if(NOT WIN32)
+        add_custom_command(TARGET guest_module_fixture POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E create_symlink missing.guest.prx
+                "${CMAKE_CURRENT_BINARY_DIR}/variant_names/guest_module_fixture.zprx.GUEST.PRX"
+            VERBATIM)
+    endif()
+    add_test_executable(guest_dynamic_loader_variants_tests ${LIBS_INCLUDE_DIR}/tests/GuestDynamicLoaderVariants.cpp)
+    target_include_directories(guest_dynamic_loader_variants_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_dynamic_loader_variants_tests PRIVATE libkernel libc)
+    configure_windows_unwind(guest_dynamic_loader_variants_tests)
+    add_dependencies(guest_dynamic_loader_variants_tests guest_module_fixture)
+    add_test(NAME guest_dynamic_loader_variant_names COMMAND guest_dynamic_loader_variants_tests)
+    set_tests_properties(guest_dynamic_loader_variant_names PROPERTIES TIMEOUT 15
+        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/variant_names")
+    if(WIN32)
+        set_tests_properties(guest_dynamic_loader_variant_names PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+    endif()
     add_test_executable(guest_module_info_tests ${LIBS_INCLUDE_DIR}/tests/GuestModuleInfo.cpp)
     target_include_directories(guest_module_info_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(guest_module_info_tests PRIVATE libkernel libc)
@@ -356,6 +380,16 @@ if(BUILD_TESTING)
         set_tests_properties(guest_truncate_race PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
     endif()
+    add_test_executable(guest_termios_speed_tests ${LIBS_INCLUDE_DIR}/tests/GuestTermiosSpeed.cpp)
+    target_include_directories(guest_termios_speed_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_termios_speed_tests PRIVATE libkernel libc ${CMAKE_DL_LIBS})
+    configure_windows_unwind(guest_termios_speed_tests)
+    add_test(NAME guest_termios_speed COMMAND guest_termios_speed_tests $<TARGET_FILE:libkernel>)
+    if(WIN32)
+        set_tests_properties(guest_termios_speed PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+    endif()
+
     add_test_executable(guest_terminal_tests ${LIBS_INCLUDE_DIR}/tests/GuestTerminal.cpp)
     target_include_directories(guest_terminal_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(guest_terminal_tests PRIVATE libkernel libc)
@@ -747,6 +781,16 @@ if(BUILD_TESTING)
         add_test(NAME guest_sleep_wake_coarse COMMAND guest_sleep_wake_tests)
         set_tests_properties(guest_sleep_wake_coarse PROPERTIES TIMEOUT 20 ENVIRONMENT "APS5_COARSE_TIMED_WAITS=1")
         set_tests_properties(guest_sleep_wake guest_sleep_wake_coarse PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+    endif()
+    add_test_executable(guest_nanosleep_long_request_tests ${LIBS_INCLUDE_DIR}/tests/GuestNanosleepLongRequest.cpp)
+    target_include_directories(guest_nanosleep_long_request_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_nanosleep_long_request_tests PRIVATE libkernel libc)
+    configure_windows_unwind(guest_nanosleep_long_request_tests)
+    add_test(NAME guest_nanosleep_long_request COMMAND guest_nanosleep_long_request_tests)
+    set_tests_properties(guest_nanosleep_long_request PROPERTIES TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(guest_nanosleep_long_request PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
     endif()
     add_test_executable(guest_pthread_sem_tests ${LIBS_INCLUDE_DIR}/tests/GuestPthreadSem.cpp)
@@ -1661,6 +1705,13 @@ if(BUILD_TESTING)
         add_test(NAME guest_directory_rewind COMMAND guest_directory_rewind_tests)
         set_tests_properties(guest_directory_rewind PROPERTIES TIMEOUT 15 ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+    endif()
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_test_executable(guest_directory_link_type_tests ${LIBS_INCLUDE_DIR}/tests/GuestDirectoryLinkTypes.cpp)
+        target_include_directories(guest_directory_link_type_tests PRIVATE ${LIBS_INCLUDE_DIR})
+        target_link_libraries(guest_directory_link_type_tests PRIVATE libkernel libc)
+        add_test(NAME guest_directory_link_types COMMAND guest_directory_link_type_tests)
+        set_tests_properties(guest_directory_link_types PROPERTIES TIMEOUT 15)
     endif()
     add_test_executable(guest_directory_entry_tests ${LIBS_INCLUDE_DIR}/tests/GuestDirectoryEntries.cpp)
     target_include_directories(guest_directory_entry_tests PRIVATE ${LIBS_INCLUDE_DIR})

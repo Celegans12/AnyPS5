@@ -258,7 +258,10 @@ def main():
                           "full_run_paths": full, "reasons": {name: sorted(set(why)) for name, why in reasons.items()}},
                          indent=2, sort_keys=True))
         return 0
-    build = Build(args.build)
+    try:
+        build = Build(args.build)
+    except (OSError, KeyError) as error:
+        parser.error(f"{args.build}: not a configured CMake build directory ({error})")
     if args.command == "dump":
         dump(build, args.graph)
         return 0
@@ -268,7 +271,7 @@ def main():
         print("full run: no test graph")
         return 0
     graph = json.loads(Path(args.graph).read_text(encoding="utf-8"))
-    changed = [line.strip() for line in Path(args.changed).read_text(encoding="utf-8").splitlines() if line.strip()]
+    changed = [line.strip() for line in Path(args.changed).read_text(encoding="utf-8-sig").splitlines() if line.strip()]
     picked, full = select(graph, changed)
     if picked is None:
         print(f"full run: {', '.join(full[:5])}")

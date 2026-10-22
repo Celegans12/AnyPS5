@@ -244,6 +244,13 @@ static int OpenNative(const std::filesystem::path& native, int flags, std::uint1
         }
     }
 #endif
+#ifdef _WIN32
+    if (fd < 0 && (errno == ENOENT || errno == ENOTDIR)) {
+        std::error_code metadataError;
+        const auto metadataPath = NativeMetadataPath(native, metadataError);
+        if (!metadataError && NativeSymbolicLinkLoop(metadataPath)) return SCE_KERNEL_ERROR_ELOOP;
+    }
+#endif
     if (fd < 0) {
         return SceErrorFromErrno(errno == ENOENT ? NotFoundError_nid_no_patch(native) : errno);
     }
@@ -316,7 +323,7 @@ std::int64_t APS5_VABI sceKernelRead(int d, void* buf, std::size_t nbytes) {
         return n < 0 ? SceKernelError(*__error_nid_postfix()) : n;
     }
     if (buf == nullptr) {
-        if (nbytes != 0) return SceIoErrorFromErrno(EFAULT);
+        if (nbytes != 0) return SceIoErrorFromErrno(DescriptorIsOpen_nid_no_patch(d) ? EFAULT : EBADF);
         char empty = 0;
         return sceKernelRead(d, &empty, 0);
     }
@@ -335,7 +342,7 @@ std::int64_t APS5_VABI sceKernelWrite(int d, const void* buf, std::size_t nbytes
         return n < 0 ? SceKernelError(*__error_nid_postfix()) : n;
     }
     if (buf == nullptr) {
-        if (nbytes != 0) return SceIoErrorFromErrno(EFAULT);
+        if (nbytes != 0) return SceIoErrorFromErrno(DescriptorIsOpen_nid_no_patch(d) ? EFAULT : EBADF);
         const char empty = 0;
         return sceKernelWrite(d, &empty, 0);
     }

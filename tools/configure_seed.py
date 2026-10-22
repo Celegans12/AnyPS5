@@ -44,6 +44,7 @@ def main():
     found = {name: entry for name, entry in results.items()
              if (not args.include or any(fnmatch.fnmatchcase(name, pattern) for pattern in args.include))
              and not any(fnmatch.fnmatchcase(name, pattern) for pattern in args.exclude)}
+    seed.parent.mkdir(parents=True, exist_ok=True)
     seed.write_text("".join(f"set({quote(name)} {quote(value)} CACHE INTERNAL {quote(doc)})\n"
                            for name, (value, doc) in sorted(found.items())), encoding="utf-8")
     print(f"{len(found)} check results")

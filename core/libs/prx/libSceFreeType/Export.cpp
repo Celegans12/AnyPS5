@@ -15,6 +15,40 @@ using namespace FreeType;
 
 namespace {
 
+void FinalizeSlot(void* object) {
+    auto* host = static_cast<FT_GlyphSlot>(object);
+    auto* face = static_cast<GuestFace*>(host->generic.data);
+    face->rec.glyph = nullptr;
+    if (face->slot.generic.finalizer) face->slot.generic.finalizer(&face->slot);
+}
+
+void FinalizeSize(void* object) {
+    auto* host = static_cast<FT_Size>(object);
+    auto* face = static_cast<GuestFace*>(host->generic.data);
+    if (face->size.generic.finalizer) face->size.generic.finalizer(&face->size);
+    face->rec.size = nullptr;
+}
+
+void FinalizeFace(void* object) {
+    auto* host = static_cast<FT_Face>(object);
+    auto* face = static_cast<GuestFace*>(host->generic.data);
+    if (face->rec.generic.finalizer) face->rec.generic.finalizer(&face->rec);
+}
+
+void PublishFace(GuestLibrary* library, std::unique_ptr<GuestFace> face, FT_Face host, GuestFaceRec** aface) {
+    std::unique_ptr<FT_FaceRec, decltype(&FT_Done_Face)> hostOwner(host, &FT_Done_Face);
+    face->library = library;
+    face->host = host;
+    SyncFace(*face);
+    auto* owner = face.get();
+    library->faces.push_back(std::move(face));
+    host->generic = {owner, FinalizeFace};
+    if (host->glyph) host->glyph->generic = {owner, FinalizeSlot};
+    if (host->size) host->size->generic = {owner, FinalizeSize};
+    *aface = &owner->rec;
+    hostOwner.release();
+}
+
 bool ReadFontFile(const char* path, std::vector<unsigned char>& bytes) {
     std::filesystem::path hostPath;
     if (ResolvePathError_nid_no_patch(path, hostPath) != 0) return false;
@@ -58,11 +92,17 @@ extern "C" {
 
 int APS5_VABI FT_Init_FreeType_nid_postfix(GuestLibrary** alibrary) {
     if (!alibrary) return FT_Err_Invalid_Argument;
-    FT_Library host = nullptr;
-    const FT_Error error = FT_Init_FreeType(&host);
+    auto library = std::make_unique<GuestLibrary>();
+    const FT_Error error = FT_Init_FreeType(&library->host);
     if (error != 0) return error;
-    *alibrary = new GuestLibrary{host};
+    *alibrary = library.release();
     return 0;
+}
+
+int APS5_VABI FT_Done_FreeType_nid_postfix(GuestLibrary* library) {
+    const FT_Error error = FT_Done_FreeType(library ? library->host : nullptr);
+    if (error == 0) delete library;
+    return error;
 }
 
 int APS5_VABI FT_New_Face_nid_postfix(GuestLibrary* library, const char* filepathname, std::int64_t face_index, GuestFaceRec** aface) {
@@ -77,11 +117,29 @@ int APS5_VABI FT_New_Face_nid_postfix(GuestLibrary* library, const char* filepat
     FT_Face host = nullptr;
     const FT_Error error = FT_New_Memory_Face(library->host, face->bytes.data(), static_cast<FT_Long>(face->bytes.size()), static_cast<FT_Long>(faceIndex), aface ? &host : nullptr);
     if (error != 0 || !aface) return error;
-    face->library = library;
-    face->host = host;
-    SyncFace(*face);
-    *aface = &face.release()->rec;
+    PublishFace(library, std::move(face), host, aface);
     return 0;
+}
+
+int APS5_VABI FT_New_Memory_Face_nid_postfix(GuestLibrary* library, const unsigned char* fileBase, std::int64_t fileSize, std::int64_t faceIndex, GuestFaceRec** aface) {
+    if (!fileBase) return FT_Err_Invalid_Argument;
+    if (!library) return FT_Err_Invalid_Library_Handle;
+    if (fileSize < std::numeric_limits<FT_Long>::min() || fileSize > std::numeric_limits<FT_Long>::max()) {
+        throw std::runtime_error("FT_New_Memory_Face: a font buffer size outside the host FT_Long range is not implemented");
+    }
+    auto face = std::make_unique<GuestFace>();
+    FT_Face host = nullptr;
+    const FT_Error error = FT_New_Memory_Face(library->host, fileBase, static_cast<FT_Long>(fileSize), static_cast<FT_Long>(OpenFaceIndex(faceIndex)), aface ? &host : nullptr);
+    if (error != 0 || !aface) return error;
+    PublishFace(library, std::move(face), host, aface);
+    return 0;
+}
+
+int APS5_VABI FT_Done_Face_nid_postfix(GuestFaceRec* face) {
+    GuestFace* owner = FaceOf(face);
+    const FT_Error error = FT_Done_Face(owner ? owner->host : nullptr);
+    if (error == 0) owner->library->faces.remove_if([owner](const auto& entry) { return entry.get() == owner; });
+    return error;
 }
 
 int APS5_VABI FT_Set_Pixel_Sizes_nid_postfix(GuestFaceRec* face, std::uint32_t pixel_width, std::uint32_t pixel_height) {
@@ -103,12 +161,48 @@ int APS5_VABI FT_Load_Glyph_nid_postfix(GuestFaceRec* face, std::uint32_t glyph_
     return error;
 }
 
+int APS5_VABI FT_Load_Char_nid_postfix(GuestFaceRec* face, std::uint64_t charCode, std::int32_t loadFlags) {
+    GuestFace* owner = FaceOf(face);
+    const FT_Error error = FT_Load_Char(owner ? owner->host : nullptr, static_cast<FT_ULong>(static_cast<std::uint32_t>(charCode)), loadFlags);
+    if (owner) SyncSlot(*owner);
+    return error;
+}
+
 int APS5_VABI FT_Render_Glyph_nid_postfix(GuestGlyphSlotRec* slot, std::int32_t render_mode) {
     GuestFace* owner = FaceOf(slot);
     if (owner) WriteBackOutline(*owner);
     const FT_Error error = FT_Render_Glyph(owner ? owner->host->glyph : nullptr, static_cast<FT_Render_Mode>(render_mode));
     if (owner) SyncSlot(*owner);
     return error;
+}
+
+int APS5_VABI FT_Select_Charmap_nid_postfix(GuestFaceRec* face, std::int32_t encoding) {
+    GuestFace* owner = FaceOf(face);
+    const FT_Error error = FT_Select_Charmap(owner ? owner->host : nullptr, static_cast<FT_Encoding>(encoding));
+    if (error == 0) owner->rec.charmap = owner->charmapPointers.at(FT_Get_Charmap_Index(owner->host->charmap));
+    return error;
+}
+
+int APS5_VABI FT_Set_Charmap_nid_postfix(GuestFaceRec* face, GuestCharMapRec* charmap) {
+    GuestFace* owner = FaceOf(face);
+    if (!owner || !charmap || owner->charmapPointers.empty()) return FT_Set_Charmap(owner ? owner->host : nullptr, nullptr);
+    for (std::size_t index = 0; index < owner->charmapPointers.size(); ++index) {
+        if (owner->charmapPointers[index] != charmap) continue;
+        const FT_Error error = FT_Set_Charmap(owner->host, owner->host->charmaps[index]);
+        if (error == 0) owner->rec.charmap = charmap;
+        return error;
+    }
+    return FT_Err_Invalid_Argument;
+}
+
+std::uint64_t APS5_VABI FT_Get_First_Char_nid_postfix(GuestFaceRec* face, std::uint32_t* glyphIndex) {
+    const GuestFace* owner = FaceOf(face);
+    return FT_Get_First_Char(owner ? owner->host : nullptr, glyphIndex);
+}
+
+std::uint64_t APS5_VABI FT_Get_Next_Char_nid_postfix(GuestFaceRec* face, std::uint64_t charcode, std::uint32_t* glyphIndex) {
+    const GuestFace* owner = FaceOf(face);
+    return FT_Get_Next_Char(owner ? owner->host : nullptr, static_cast<FT_ULong>(static_cast<std::uint32_t>(charcode)), glyphIndex);
 }
 
 }

@@ -598,6 +598,26 @@ static int CheckExclusiveStandardOutput() {
     return 0;
 }
 
+#ifdef _WIN32
+static void CheckStandardStreamDeleteSharing() {
+    int index = 0;
+    for (auto* stream : {__stdinp_nid_postfix, __stderrp_nid_postfix}) {
+        const std::string filename = "anyps5-standard-delete-" + std::to_string(index++) + "-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+        auto* const native = stream->GetHandle();
+        const int descriptor = ::_fileno(native);
+        Require(freopen_nid_postfix(filename.c_str(), "w+b", stream) == stream);
+        Require(stream->GetHandle() == native && ::_fileno(stream->GetHandle()) == descriptor);
+        Require(fputc_nid_postfix('A', stream) == 'A' && fflush_nid_postfix(stream) == 0);
+        const std::string renamed = filename + "-moved";
+        std::filesystem::rename(filename, renamed);
+        Require(fputc_nid_postfix('B', stream) == 'B' && fflush_nid_postfix(stream) == 0);
+        Require(std::filesystem::remove(renamed));
+        Require(fseeko_nid_postfix(stream, 0, SEEK_SET) == 0);
+        Require(fgetc_nid_postfix(stream) == 'A' && fgetc_nid_postfix(stream) == 'B');
+    }
+}
+#endif
+
 int main(int argc, char** argv) {
     if (argc > 1 && std::string_view(argv[1]) == "--closed-stdout") return CheckClosedStandardOutput();
     if (argc > 1 && std::string_view(argv[1]) == "--exclusive-stdout") return CheckExclusiveStandardOutput();
@@ -895,5 +915,30 @@ int main(int argc, char** argv) {
     CheckUnlockedStreamLock(false, ferror_unlocked_nid_postfix);
     CheckTryLock();
     CheckUnlockedQueries();
-    return CheckBinaryModes() ? 0 : 1;
+    if (!CheckBinaryModes()) return 1;
+#ifdef _WIN32
+    CheckStandardStreamDeleteSharing();
+    const std::string standardFilename = "anyps5-standard-reopen-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+    Require(freopen_nid_postfix(standardFilename.c_str(), "w", __stdoutp_nid_postfix) == __stdoutp_nid_postfix);
+    Require(printf_nid_postfix("standard output") == 15 && fflush_nid_postfix(__stdoutp_nid_postfix) == 0);
+    { std::ifstream input(standardFilename, std::ios::binary); std::string contents; std::getline(input, contents);
+      Require(contents == "standard output"); }
+    const std::string movedFilename = standardFilename + "-moved";
+    std::error_code renameError;
+    std::filesystem::rename(standardFilename, movedFilename, renameError);
+    Require(!renameError && !std::filesystem::exists(standardFilename) && std::filesystem::exists(movedFilename));
+    Require(printf_nid_postfix(" continued") == 10 && fflush_nid_postfix(__stdoutp_nid_postfix) == 0);
+    { std::ifstream input(movedFilename, std::ios::binary); std::string contents; std::getline(input, contents);
+      Require(contents == "standard output continued"); }
+    Require(std::filesystem::remove(movedFilename));
+    Require(!std::filesystem::exists(movedFilename));
+    Require(printf_nid_postfix(" after delete") == 13 && fflush_nid_postfix(__stdoutp_nid_postfix) == 0);
+    const std::string exclusiveFilename = "anyps5-standard-exclusive-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+    { std::ofstream out(exclusiveFilename, std::ios::binary); out << "existing"; }
+    Require(freopen_nid_postfix(exclusiveFilename.c_str(), "wx", __stdoutp_nid_postfix) == nullptr && *__error_nid_postfix() == 17);
+    Require(std::filesystem::remove(exclusiveFilename));
+    Require(printf_nid_postfix("closed") == -1 && *__error_nid_postfix() == 9);
+    Require(std::fputs("host stdout intact\n", stdout) >= 0 && std::fflush(stdout) == 0);
+#endif
+    return 0;
 }

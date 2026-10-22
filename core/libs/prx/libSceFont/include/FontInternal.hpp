@@ -37,7 +37,6 @@ struct FontState {
     float scaleW = 16.0f;
     float scaleH = 16.0f;
     std::map<int, int> scriptLanguages;
-    std::map<int, int> typographicFeatures;
     int attribute = 0;
 
     FontState() = default;

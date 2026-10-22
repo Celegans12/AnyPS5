@@ -28,6 +28,9 @@ int APS5_VABI sceAgcDriverFindResourcesPublic(const void*, void*);
 bool APS5_VABI sceAgcDriverIsCaptureInProgress(void);
 bool APS5_VABI sceAgcDriverIsTraceInProgress(void);
 bool APS5_VABI sceAgcDriverIsSubmitValidationEnabled(void);
+int APS5_VABI sceAgcDriverRegisterOwnerForSystem();
+int APS5_VABI sceAgcDriverInitResourceRegistrationInterface();
+int APS5_VABI sceAgcDriverSetResourceRegistrationInfo();
 }
 
 static constexpr int Unavailable = static_cast<int>(0x8A6C9018);
@@ -94,4 +97,7 @@ int main() {
     Require(!sceAgcDriverIsCaptureInProgress());
     Require(!sceAgcDriverIsTraceInProgress());
     Require(!sceAgcDriverIsSubmitValidationEnabled());
+    Require(sceAgcDriverRegisterOwnerForSystem() == Unavailable);
+    Require(sceAgcDriverInitResourceRegistrationInterface() == Unavailable);
+    Require(sceAgcDriverSetResourceRegistrationInfo() == 0);
 }

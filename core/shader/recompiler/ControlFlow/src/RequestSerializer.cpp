@@ -5,7 +5,7 @@ namespace ShaderRecompiler {
 
 namespace {
 
-constexpr std::uint32_t CurrentVersion = 42u;
+constexpr std::uint32_t CurrentVersion = 43u;
 constexpr std::uint32_t DrawParameterBlockTag = 0x31504447u;
 constexpr std::uint32_t LocalFeatures = 22u;
 constexpr char kBase64Alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -367,6 +367,7 @@ void writePixelInfo(Writer& writer, const ShaderPixelStageInfo& info) {
     writer.WriteU8(static_cast<std::uint8_t>(info.positionLocation));
     for (const std::uint8_t location : info.sampleLocations) writer.WriteU8(location);
     writer.WriteBool(info.stencilOperationValueExport);
+    for (const std::uint32_t order : info.sampleOrder) writer.WriteU32(order);
 }
 
 ShaderPixelStageInfo readPixelInfo(Reader& reader, std::uint32_t version, std::uint32_t local) {
@@ -444,6 +445,9 @@ ShaderPixelStageInfo readPixelInfo(Reader& reader, std::uint32_t version, std::u
         for (std::uint8_t& location : info.sampleLocations) location = reader.ReadU8();
     }
     if (version >= 37u) info.stencilOperationValueExport = reader.ReadBool();
+    if (version >= 42u) {
+        for (std::uint32_t& order : info.sampleOrder) order = reader.ReadU32();
+    }
     if (version < 5u) {
         const auto input = [](PixelInput value, bool present) { return present ? PixelInputBit(value) : 0u; };
         info.inputAddr = input(PixelInput::PerspectiveSample, info.hasPerspectiveCenterVgpr && inputAddrOrCenterVgpr == 2u) | input(PixelInput::PerspectiveCenter, info.hasPerspectiveCenterVgpr) |
@@ -893,7 +897,7 @@ DeserializedRequest deserialize(std::string_view decoded, std::uint32_t version,
     }
     if (version >= 36u) result.request.target.float32FlushToZero = reader.ReadBool();
     if (version >= 41u) result.request.target.float32DenormPreserve = reader.ReadBool();
-    if (version >= 42u && result.request.context.compute.has_value()) {
+    if (version >= 43u && result.request.context.compute.has_value()) {
         const bool singleWorkgroup = reader.ReadBool();
         result.request.context.compute->singleWorkgroup = singleWorkgroup;
         if (result.compute.has_value()) result.compute->singleWorkgroup = singleWorkgroup;

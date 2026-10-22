@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <vector>
 #include <cstdio>
+#include <cstdint>
 
 #include "general/LogMacros.hpp"
 #include "general/VabiMacros.hpp"
@@ -14,6 +15,7 @@
 extern "C" [[noreturn]] void NotImplemented_nid_no_patch(const char* funcName);
 extern "C" void CxaFinalize_nid_no_patch(void* dsoHandle);
 extern "C" bool StopAtPrefixLetter_nid_no_patch(const char* str, char** endptr, int base);
+extern "C" bool RejectIntegerBase_nid_no_patch(const char* str, char** endptr, int base, bool setError);
 #ifndef _WIN32
 extern "C" int KeepHostStandardError_nid_no_patch();
 extern "C" int HostStandardError_nid_no_patch();
@@ -57,6 +59,17 @@ using PthreadDetachFn_nid_no_patch = int (APS5_VABI*)(void*);
 extern "C" void RegisterPthreadCreate_nid_no_patch(PthreadCreateFn_nid_no_patch fn);
 extern "C" void RegisterPthreadJoin_nid_no_patch(PthreadJoinFn_nid_no_patch fn);
 extern "C" void RegisterPthreadDetach_nid_no_patch(PthreadDetachFn_nid_no_patch fn);
+struct ThreadForwards_nid_no_patch {
+    int (APS5_VABI* once)(std::int32_t*, void (APS5_VABI*)(void));
+    int (APS5_VABI* keyCreate)(int*, void (APS5_VABI*)(void*));
+    int (APS5_VABI* keyDelete)(int);
+    void* (APS5_VABI* getSpecific)(int);
+    int (APS5_VABI* setSpecific)(int, void*);
+    int (APS5_VABI* equal)(void*, void*);
+    void* (APS5_VABI* self)();
+    void (APS5_VABI* exit)(void*);
+};
+extern "C" void RegisterThreadForwards_nid_no_patch(const ThreadForwards_nid_no_patch* forwards);
 
 #define APS5_INVALID_ARG_EX throw std::invalid_argument(std::string(__func__) + ": invalid argument")
 

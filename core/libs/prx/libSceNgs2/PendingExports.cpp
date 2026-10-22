@@ -29,14 +29,6 @@ int APS5_VABI sceNgs2ParseWaveformUser(std::uintptr_t handler, std::uintptr_t us
     NotImplemented_nid_no_patch(__func__);
     return 0;
 }
-int APS5_VABI sceNgs2RackGetUserData(std::uintptr_t rackHandle, std::uintptr_t* outUserData) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-int APS5_VABI sceNgs2RackSetUserData(std::uintptr_t rackHandle, std::uintptr_t userData) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
 int APS5_VABI sceNgs2SystemEnumHandles(std::uintptr_t* outHandles, std::uint32_t maxHandles) {
     NotImplemented_nid_no_patch(__func__);
     return 0;
@@ -46,10 +38,6 @@ int APS5_VABI sceNgs2SystemEnumRackHandles(std::uintptr_t systemHandle, std::uin
     return 0;
 }
 int APS5_VABI sceNgs2VoiceGetMatrixInfo(std::uintptr_t voiceHandle, std::uint32_t matrixId, void* outInfo, std::size_t infoSize) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-int APS5_VABI sceNgs2VoiceGetOwner(std::uintptr_t voiceHandle, std::uintptr_t* outOwnerRack, std::uint32_t* outVoiceIndex) {
     NotImplemented_nid_no_patch(__func__);
     return 0;
 }

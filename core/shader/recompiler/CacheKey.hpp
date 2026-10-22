@@ -218,6 +218,7 @@ private:
         append(key, value.positionLocation);
         append(key, value.sampleLocations);
         append(key, value.targetOutputMode);
+        append(key, value.sampleOrder);
     }
 
     static void append(std::vector<std::uint64_t>& key, const ShaderVertexResourceDestination& value) {
@@ -294,6 +295,7 @@ private:
         append(key, value.fusedFma);
         append(key, value.robustBufferAccess2);
         append(key, value.float32FlushToZero);
+        append(key, value.waveLdsMemoryBarriers);
         append(key, value.float32DenormPreserve);
     }
 };

@@ -199,7 +199,11 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
 } catch (const std::exception& error) {
     if (dynamic_cast<const Graphics::LiveSnapshotInvalidated*>(&error) != nullptr) throw;
     if (!SkipRefusedShaders()) {
-        if (dynamic_cast<const ShaderRefusal*>(&error) != nullptr || !SkipRefusedGraphicsRecompile(static_cast<std::uint32_t>(programs[i].binary.stage), error.what())) throw;
+        if (dynamic_cast<const ShaderRefusal*>(&error) != nullptr) throw;
+        if (!SkipRefusedGraphicsRecompile(static_cast<std::uint32_t>(programs[i].binary.stage), error.what())) {
+            if (!SkipRefusedDraws()) throw;
+            throw RefusedDraw(programs[i].binary.codeAddress, error.what());
+        }
         throw ShaderRefusal(RefusedShaderSubject(static_cast<std::uint32_t>(programs[i].binary.stage), programs[i].binary.codeAddress) + ": skipping its draws: " + error.what());
     }
     std::string reason = error.what();

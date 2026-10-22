@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBC_INCLUDE_FILESTREAM_HPP
 #define CORE_LIBS_PRX_LIBC_INCLUDE_FILESTREAM_HPP
 
+#include <atomic>
 #include <cerrno>
 #include <cstdio>
 #include <filesystem>
@@ -16,8 +17,20 @@
 #include "prx/libc/include/FileLock.hpp"
 extern "C" void* HostStandardHandle_nid_no_patch(int descriptor);
 extern "C" void KeepStandardHandle_nid_no_patch(int descriptor, void* handle);
+struct UcrtStreamState {
+    char* pointer;
+    char* base;
+    int count;
+    long flags;
+};
+extern "C" void LibcRegisterDirectoryStreams_nid_no_patch(int (*open)(const wchar_t* path), void (*forget)(int descriptor));
+extern "C" void ForgetDirectoryStream_nid_no_patch(int descriptor);
 #else
 #include <unistd.h>
+#endif
+#if defined(__GLIBC__)
+#include <stdio_ext.h>
+extern "C" int _IO_switch_to_get_mode(std::FILE* stream);
 #endif
 extern "C" int DuplicateHostDescriptor_nid_no_patch(int descriptor);
 
@@ -55,6 +68,7 @@ class FileStream {
     bool _dynamic;
     bool guestError = false;
     bool randomDevice = false;
+    bool directory = false;
 
 public:
     explicit FileStream(std::FILE* handle, bool dynamic = false) : _handle(handle), _dynamic(dynamic) {
@@ -119,6 +133,14 @@ public:
         return randomDevice;
     }
 
+    void MarkDirectory() {
+        directory = true;
+    }
+
+    bool IsDirectory() const {
+        return directory;
+    }
+
     bool Reopen(const std::filesystem::path& filename, const char* mode,
         [[maybe_unused]] std::FILE* (*open)(const std::filesystem::path&, const std::string&) = nullptr) {
         auto* previous = GetHandle();
@@ -129,12 +151,43 @@ public:
         std::wstring wideMode;
         for (const char character : std::string_view(mode)) wideMode.push_back(static_cast<unsigned char>(character));
         const int replaced = previous ? _fileno(previous) : -1;
+        if (std::exchange(directory, false)) ForgetDirectoryStream_nid_no_patch(replaced);
         auto* const standard = HostStandardHandle_nid_no_patch(replaced);
         GuestFileLockForget_nid_no_patch(replaced);
-        if (open && !IsHostStandard() && !filename.empty()) {
-            _handle = nullptr;
-            std::fclose(previous);
-            _handle = open(filename, mode);
+        if (open && !filename.empty()) {
+            if (!IsHostStandard()) {
+                _handle = nullptr;
+                std::fclose(previous);
+                _handle = open(filename, mode);
+            } else {
+                std::wstring resetMode;
+                for (const char character : std::string_view(mode))
+                    if (character != 'x') resetMode.push_back(static_cast<unsigned char>(character));
+                const int kept = DuplicateHostDescriptor_nid_no_patch(replaced);
+                if (kept >= 0) ::_lock_file(previous);
+                _handle = nullptr;
+                try {
+                    std::FILE* const replacement = open(filename, mode);
+                    if (replacement) {
+                        if (::_wfreopen(L"NUL", resetMode.c_str(), previous) == previous) {
+                            const int moved = ::_dup2(_fileno(replacement), replaced);
+                            const int error = errno;
+                            std::fclose(replacement);
+                            if (moved == 0) _handle = previous;
+                            else errno = error;
+                        } else {
+                            const int error = errno;
+                            std::fclose(replacement);
+                            errno = error;
+                        }
+                    }
+                } catch (...) {
+                    if (kept >= 0) RestoreHostStandard(previous, kept);
+                    KeepStandardHandle_nid_no_patch(replaced, standard);
+                    throw;
+                }
+                if (kept >= 0) RestoreHostStandard(previous, kept);
+            }
         } else {
             const int kept = IsHostStandard() ? DuplicateHostDescriptor_nid_no_patch(replaced) : -1;
             if (kept >= 0) ::_lock_file(previous);
@@ -182,6 +235,47 @@ public:
             (endOfFile ? 0x20 : 0) | (error || guestError ? 0x40 : 0));
     }
 
+    bool SwitchToReading() {
+#ifdef _WIN32
+        ::_lock_file(GetHandle());
+        const bool switched = SwitchToReadingUnlocked();
+        ::_unlock_file(GetHandle());
+        return switched;
+#else
+        ::flockfile(GetHandle());
+        const bool switched = SwitchToReadingUnlocked();
+        ::funlockfile(GetHandle());
+        return switched;
+#endif
+    }
+
+    bool SwitchToReadingUnlocked() {
+#ifdef _WIN32
+        constexpr long UcrtReading = 0x0001;
+        constexpr long UcrtWriting = 0x0002;
+        constexpr long UcrtUpdate = 0x0004;
+        auto* native = GetHandle();
+        std::atomic_ref<long> state(reinterpret_cast<UcrtStreamState*>(native)->flags);
+        if ((state.load() & (UcrtReading | UcrtUpdate)) != UcrtUpdate) return true;
+        const bool switched = (state.load() & UcrtWriting) == 0 || ::_fflush_nolock(native) == 0;
+        if (switched) state.fetch_or(UcrtReading);
+        SyncUnlockedStatus();
+        return switched;
+#elif defined(__GLIBC__)
+        auto* native = GetHandle();
+        if (!::__freadable(native) || !::__fwriting(native)) return true;
+        const bool switched = ::_IO_switch_to_get_mode(native) == 0;
+        SyncUnlockedStatus();
+        return switched;
+#else
+        return true;
+#endif
+    }
+
+    void KeepDirectoryReadError(bool failed) {
+        if (failed && directory && (_guest.flags & 0x40) != 0) errno = 21;
+    }
+
     void SetError() {
         guestError = true;
         SyncStatus();
@@ -198,6 +292,7 @@ public:
         GetHandle();
 #ifdef _WIN32
         GuestFileLockForget_nid_no_patch(::_fileno(_handle));
+        if (std::exchange(directory, false)) ForgetDirectoryStream_nid_no_patch(::_fileno(_handle));
 #endif
         const int result = std::fclose(std::exchange(_handle, nullptr));
         _guest.flags = 0;

@@ -56,6 +56,12 @@ class ConfigureSeedPathTests(unittest.TestCase):
         self.assertNotIn("Traceback", result.stderr)
         self.assertFalse((self.root / "seed.cmake").exists())
 
+    def test_missing_seed_directory_is_created(self):
+        seed = self.root / "new dir" / "nested" / "seed.cmake"
+        result = self.run_seed(seed)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("HAVE_FEATURE", seed.read_text(encoding="utf-8"))
+
     def test_same_path_preserves_cache(self):
         self.assert_rejected(self.cache)
 

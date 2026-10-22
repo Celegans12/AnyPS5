@@ -102,6 +102,7 @@ public:
         std::size_t released = 0;
     };
     DrawCacheOccupancy DrawCacheState();
+    EntryCounters DispatchCacheCounters();
     struct DispatchCacheFootprint {
         std::size_t entries = 0;
         std::uint64_t variantBytes = 0;
@@ -117,6 +118,7 @@ private:
     friend class DrawAhead;
     friend struct PendingView;
     friend struct PacketTimer;
+    friend struct DriverTestAccess;
     void stop();
     Driver();
     void rethrowFailure() const;
@@ -414,8 +416,7 @@ private:
 
     std::atomic<std::uint64_t> dataPendingMisses{0};
 
-    using ValueSet = std::pair<std::vector<std::pair<std::uint64_t, std::uint64_t>>, std::vector<std::uint32_t>>;
-    std::unordered_map<std::uint64_t, std::deque<ValueSet>> priorValueSets;
+    std::unordered_map<std::uint64_t, std::deque<std::uint64_t>> priorValueSets;
 
     std::unordered_map<std::uint64_t, std::shared_ptr<DrawEntry>> drawCache;
     std::unordered_map<std::uint64_t, std::uint64_t> drawShapes;

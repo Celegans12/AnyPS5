@@ -117,12 +117,12 @@ unsigned int APS5_VABI _Atomic_load_4_nid_postfix(volatile unsigned int* target,
 }
 
 std::intmax_t APS5_VABI strtoimax_nid_postfix(const char* str, char** endptr, int base) {
-    if (StopAtPrefixLetter_nid_no_patch(str, endptr, base)) return 0;
+    if (RejectIntegerBase_nid_no_patch(str, endptr, base, false) || StopAtPrefixLetter_nid_no_patch(str, endptr, base)) return 0;
     return ParseInteger<std::intmax_t>(str, endptr, base, std::strtoimax);
 }
 
 std::uintmax_t APS5_VABI strtoumax_nid_postfix(const char* str, char** endptr, int base) {
-    if (StopAtPrefixLetter_nid_no_patch(str, endptr, base)) return 0;
+    if (RejectIntegerBase_nid_no_patch(str, endptr, base, false) || StopAtPrefixLetter_nid_no_patch(str, endptr, base)) return 0;
     return ParseInteger<std::uintmax_t>(str, endptr, base, std::strtoumax);
 }
 
@@ -172,7 +172,7 @@ int APS5_VABI ftrylockfile_nid_postfix(FileStream* stream) {
 }
 
 std::uint64_t APS5_VABI _Stoul_nid_postfix(const char* str, char** endptr, int base) {
-    if (StopAtPrefixLetter_nid_no_patch(str, endptr, base)) return 0;
+    if (RejectIntegerBase_nid_no_patch(str, endptr, base, false) || StopAtPrefixLetter_nid_no_patch(str, endptr, base)) return 0;
     return ParseInteger<unsigned long long>(str, endptr, base, std::strtoull);
 }
 

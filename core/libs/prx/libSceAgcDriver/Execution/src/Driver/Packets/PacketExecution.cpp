@@ -650,6 +650,10 @@ void Driver::execute(const Submission& submission) {
                     CaptureTrace::Log("draw-refused submission=%llu offset=%zu reason=%.256s", static_cast<unsigned long long>(submission.serial), cursor, refusal.what());
                     countSkip(Graphics::DrawSkip::Thrown);
                     reportSkip("draw", refusal.what());
+                } catch (const RefusedDraw& refused) {
+                    CaptureTrace::Log("draw-refused submission=%llu offset=%zu reason=%.256s", static_cast<unsigned long long>(submission.serial), cursor, refused.what());
+                    countSkip(Graphics::DrawSkip::Thrown);
+                    ReportRefusedDraw(refused);
                 } catch (const std::exception& error) {
                     CaptureTrace::Log("draw-error submission=%llu offset=%zu reason=%.256s", static_cast<unsigned long long>(submission.serial), cursor, error.what());
                     countSkip(Graphics::DrawSkip::Thrown);

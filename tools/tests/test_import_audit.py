@@ -682,6 +682,22 @@ class ImportAuditTests(unittest.TestCase):
         self.assertEqual(data["missing_libraries"], {"libSceMissing.prx": 1})
         self.assertIn("libSceMissing.prx", out)
 
+    def test_missing_library_is_located_next_to_the_registry(self):
+        work = self.work
+        (work.libs / "libc.prx").write_bytes(exporting())
+        (work.modules / "main.prx").write_bytes(build_elf([], ["libSceMissing.prx", "libSceGone.prx"]))
+        registry = work.root / "game.json"
+        write_registry(registry, [])
+        elsewhere = work.root / "in" / "Media Modules"
+        elsewhere.mkdir(parents=True)
+        (elsewhere / "libSceMissing.prx").write_bytes(exporting("DDDDDDDDDDD"))
+        code, out, err = work.run(registry)
+        self.assertEqual((code, err), (1, ""))
+        self.assertIn(f"libSceMissing.prx is in {elsewhere.resolve()}: pass that directory with --modules", out)
+        self.assertNotIn("libSceGone.prx is in", out)
+        code, out, err = work.run(registry, "--modules", str(elsewhere))
+        self.assertNotIn("libSceMissing.prx is in", out)
+
     def test_conflicting_module_files_preserve_or_leave_no_json_report(self):
         work = self.work
         first, second = work.modules, work.root / "other-modules"

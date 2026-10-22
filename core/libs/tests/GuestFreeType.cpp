@@ -1,3 +1,4 @@
+#include "FreeTypeFontFixture.hpp"
 #include "prx/libSceFreeType/include/GuestFreeType.hpp"
 #include "prx/libc/include/General.hpp"
 
@@ -5,6 +6,7 @@
 #include FT_FREETYPE_H
 #include FT_OUTLINE_H
 
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -22,10 +24,14 @@ using namespace FreeType;
 
 extern "C" {
 int APS5_VABI FT_Init_FreeType_nid_postfix(void**);
+int APS5_VABI FT_Done_FreeType_nid_postfix(void*);
 int APS5_VABI FT_New_Face_nid_postfix(void*, const char*, std::int64_t, GuestFaceRec**);
+int APS5_VABI FT_New_Memory_Face_nid_postfix(void*, const unsigned char*, std::int64_t, std::int64_t, GuestFaceRec**);
+int APS5_VABI FT_Done_Face_nid_postfix(GuestFaceRec*);
 int APS5_VABI FT_Set_Pixel_Sizes_nid_postfix(GuestFaceRec*, std::uint32_t, std::uint32_t);
 std::uint32_t APS5_VABI FT_Get_Char_Index_nid_postfix(GuestFaceRec*, std::uint64_t);
 int APS5_VABI FT_Load_Glyph_nid_postfix(GuestFaceRec*, std::uint32_t, std::int32_t);
+int APS5_VABI FT_Load_Char_nid_postfix(GuestFaceRec*, std::uint64_t, std::int32_t);
 int APS5_VABI FT_Render_Glyph_nid_postfix(GuestGlyphSlotRec*, std::int32_t);
 }
 
@@ -44,65 +50,6 @@ template <typename TCall> static bool ThrowsWith(TCall call, const std::string& 
         return std::string(error.what()).rfind(prefix, 0) == 0;
     }
     return false;
-}
-
-static void Put16(std::vector<unsigned char>& out, std::uint32_t value) {
-    out.push_back(static_cast<unsigned char>(value >> 8));
-    out.push_back(static_cast<unsigned char>(value));
-}
-
-static void Put32(std::vector<unsigned char>& out, std::uint32_t value) {
-    Put16(out, value >> 16);
-    Put16(out, value & 0xFFFFu);
-}
-
-static void PutAll16(std::vector<unsigned char>& out, std::initializer_list<int> values) {
-    for (const int value : values) Put16(out, static_cast<std::uint32_t>(static_cast<std::uint16_t>(value)));
-}
-
-static std::vector<unsigned char> SquareGlyphFont(std::uint32_t codepoint, int width) {
-    std::vector<unsigned char> head;
-    Put32(head, 0x00010000u);
-    Put32(head, 0x00010000u);
-    Put32(head, 0);
-    Put32(head, 0x5F0F3CF5u);
-    PutAll16(head, {0x000B, 1000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, width, 800, 0, 8, 2, 0, 0});
-    std::vector<unsigned char> hhea;
-    Put32(hhea, 0x00010000u);
-    PutAll16(hhea, {800, -200, 0, width, 0, 0, width, 1, 0, 0, 0, 0, 0, 0, 0, 2});
-    std::vector<unsigned char> maxp;
-    Put32(maxp, 0x00010000u);
-    PutAll16(maxp, {2, 4, 1, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0});
-    std::vector<unsigned char> hmtx;
-    PutAll16(hmtx, {width, 0, width, 100});
-    std::vector<unsigned char> glyf;
-    PutAll16(glyf, {1, 100, 0, width - 100, 700, 3, 0});
-    glyf.insert(glyf.end(), {1, 1, 1, 1});
-    PutAll16(glyf, {100, 0, width - 200, 0, 0, 700, 0, -700});
-    std::vector<unsigned char> loca;
-    PutAll16(loca, {0, 0, static_cast<int>(glyf.size() / 2)});
-    std::vector<unsigned char> cmap;
-    PutAll16(cmap, {0, 1, 3, 1});
-    Put32(cmap, 12);
-    PutAll16(cmap, {4, 32, 0, 4, 4, 1, 0, static_cast<int>(codepoint), 0xFFFF, 0, static_cast<int>(codepoint), 0xFFFF, 1 - static_cast<int>(codepoint), 1, 0, 0});
-    const std::vector<std::pair<const char*, const std::vector<unsigned char>*>> tables = {
-        {"cmap", &cmap}, {"glyf", &glyf}, {"head", &head}, {"hhea", &hhea}, {"hmtx", &hmtx}, {"loca", &loca}, {"maxp", &maxp}};
-    std::vector<unsigned char> font;
-    Put32(font, 0x00010000u);
-    PutAll16(font, {static_cast<int>(tables.size()), 64, 2, static_cast<int>(tables.size()) * 16 - 64});
-    std::uint32_t offset = 12 + static_cast<std::uint32_t>(tables.size()) * 16;
-    for (const auto& [tag, data] : tables) {
-        font.insert(font.end(), tag, tag + 4);
-        Put32(font, 0);
-        Put32(font, offset);
-        Put32(font, static_cast<std::uint32_t>(data->size()));
-        offset += (static_cast<std::uint32_t>(data->size()) + 3u) & ~3u;
-    }
-    for (const auto& [tag, data] : tables) {
-        font.insert(font.end(), data->begin(), data->end());
-        font.resize((font.size() + 3u) & ~std::size_t{3});
-    }
-    return font;
 }
 
 static void FaceMatches(const GuestFaceRec* face, FT_Face host, const void* library) {
@@ -142,6 +89,58 @@ static void SlotMatches(const GuestGlyphSlotRec* slot, FT_GlyphSlot host) {
     Require(slot->lsb_delta == host->lsb_delta && slot->rsb_delta == host->rsb_delta && slot->control_len == host->control_len);
 }
 
+struct Finalizers {
+    std::vector<int> calls;
+};
+
+static void NativeSlotFinalizer(void* object) {
+    auto* slot = static_cast<FT_GlyphSlot>(object);
+    Require(slot->face->glyph == nullptr);
+    static_cast<Finalizers*>(slot->generic.data)->calls.push_back(1);
+}
+
+static void NativeSizeFinalizer(void* object) {
+    auto* size = static_cast<FT_Size>(object);
+    Require(size->face->size == size);
+    static_cast<Finalizers*>(size->generic.data)->calls.push_back(2);
+}
+
+static void NativeFaceFinalizer(void* object) {
+    auto* face = static_cast<FT_Face>(object);
+    Require(face->glyph == nullptr && face->size == nullptr);
+    static_cast<Finalizers*>(face->generic.data)->calls.push_back(3);
+}
+
+static void APS5_VABI GuestSlotFinalizer(void* object) {
+    auto* slot = static_cast<GuestGlyphSlotRec*>(object);
+    Require(static_cast<GuestFaceRec*>(slot->face)->glyph == nullptr);
+    static_cast<Finalizers*>(slot->generic.data)->calls.push_back(1);
+}
+
+static void APS5_VABI GuestSizeFinalizer(void* object) {
+    auto* size = static_cast<GuestSizeRec*>(object);
+    Require(static_cast<GuestFaceRec*>(size->face)->size == size);
+    static_cast<Finalizers*>(size->generic.data)->calls.push_back(2);
+}
+
+static void APS5_VABI GuestFaceFinalizer(void* object) {
+    auto* face = static_cast<GuestFaceRec*>(object);
+    Require(face->glyph == nullptr && face->size == nullptr);
+    static_cast<Finalizers*>(face->generic.data)->calls.push_back(3);
+}
+
+static void SetFinalizers(FT_Face face, Finalizers& events) {
+    face->generic = {&events, NativeFaceFinalizer};
+    face->glyph->generic = {&events, NativeSlotFinalizer};
+    face->size->generic = {&events, NativeSizeFinalizer};
+}
+
+static void SetFinalizers(GuestFaceRec* face, Finalizers& events) {
+    face->generic = {&events, GuestFaceFinalizer};
+    face->glyph->generic = {&events, GuestSlotFinalizer};
+    face->size->generic = {&events, GuestSizeFinalizer};
+}
+
 int main() {
     const auto root = std::filesystem::temp_directory_path() / ("anyps5_guest_freetype-" + std::to_string(std::random_device{}()));
     std::filesystem::create_directories(root / "app0");
@@ -164,6 +163,8 @@ int main() {
     Require(FT_Init_FreeType_nid_postfix(nullptr) == FT_Err_Invalid_Argument);
     void* library = nullptr;
     Require(FT_Init_FreeType_nid_postfix(&library) == 0 && library != nullptr);
+    Require(FT_Done_FreeType_nid_postfix(nullptr) == FT_Err_Invalid_Library_Handle);
+    Require(FT_Done_Face_nid_postfix(nullptr) == FT_Err_Invalid_Face_Handle);
 
     GuestFaceRec* face = nullptr;
     Require(FT_New_Face_nid_postfix(library, nullptr, 0, &face) == FT_Err_Invalid_Argument);
@@ -178,6 +179,54 @@ int main() {
     Require(FT_New_Face_nid_postfix(library, "/app0/font.ttf", 0, &face) == 0 && face != nullptr && face != masked);
     FaceMatches(face, host, library);
 
+    const auto fontSize = static_cast<std::int64_t>(font.size());
+    GuestFaceRec* memoryFace = nullptr;
+    Require(FT_New_Memory_Face_nid_postfix(library, nullptr, fontSize, 0, &memoryFace) == FT_Err_Invalid_Argument);
+    Require(FT_New_Memory_Face_nid_postfix(nullptr, font.data(), fontSize, 0, &memoryFace) == FT_Err_Invalid_Library_Handle);
+    Require(FT_New_Memory_Face_nid_postfix(library, font.data(), fontSize, 0, nullptr) == FT_Err_Invalid_Argument);
+    Require(FT_New_Memory_Face_nid_postfix(library, font.data(), fontSize, -1, nullptr) == 0);
+    FT_Face nativeProbe = nullptr;
+    GuestFaceRec* probe = nullptr;
+    Require(FT_New_Memory_Face(hostLibrary, font.data(), static_cast<FT_Long>(font.size()), -1, &nativeProbe) == 0);
+    Require(FT_New_Memory_Face_nid_postfix(library, font.data(), fontSize, -1, &probe) == 0 && probe != nullptr);
+    Require(probe->num_faces == nativeProbe->num_faces && probe->face_index == nativeProbe->face_index);
+    Require((probe->glyph == nullptr) == (nativeProbe->glyph == nullptr) && (probe->size == nullptr) == (nativeProbe->size == nullptr));
+    Finalizers nativeProbeEvents;
+    Finalizers guestProbeEvents;
+    nativeProbe->generic = {&nativeProbeEvents, NativeFaceFinalizer};
+    probe->generic = {&guestProbeEvents, GuestFaceFinalizer};
+    Require(FT_Done_Face(nativeProbe) == 0 && FT_Done_Face_nid_postfix(probe) == 0);
+    Require(nativeProbeEvents.calls == std::vector<int>({3}) && guestProbeEvents.calls == nativeProbeEvents.calls);
+    Require(FT_New_Memory_Face_nid_postfix(library, font.data(), fontSize, 1, &memoryFace) == secondFace && memoryFace == nullptr);
+    Require(FT_New_Memory_Face_nid_postfix(library, font.data(), fontSize, 0x80000001ll, &memoryFace) == secondFace && memoryFace == nullptr);
+    FT_Face invalidHost = nullptr;
+    for (const FT_Long length : {0L, 4L}) {
+        const FT_Error expected = FT_New_Memory_Face(hostLibrary, font.data(), length, 0, &invalidHost);
+        Require(expected != 0 && invalidHost == nullptr);
+        Require(FT_New_Memory_Face_nid_postfix(library, font.data(), length, 0, &memoryFace) == expected && memoryFace == nullptr);
+    }
+    const unsigned char invalidFont[32]{};
+    const FT_Error invalidFormat = FT_New_Memory_Face(hostLibrary, invalidFont, sizeof(invalidFont), 0, &invalidHost);
+    Require(invalidFormat != 0 && invalidHost == nullptr);
+    Require(FT_New_Memory_Face_nid_postfix(library, invalidFont, sizeof(invalidFont), 0, &memoryFace) == invalidFormat && memoryFace == nullptr);
+    if constexpr (sizeof(FT_Long) < sizeof(std::int64_t)) {
+        for (const std::int64_t length : {0x80000000ll, -0x80000001ll}) {
+            Require(ThrowsWith([&] { FT_New_Memory_Face_nid_postfix(library, font.data(), length, 0, &memoryFace); },
+                               "FT_New_Memory_Face: a font buffer size outside the host FT_Long range is not implemented"));
+            Require(memoryFace == nullptr);
+        }
+    }
+    Require(FT_New_Memory_Face_nid_postfix(library, font.data(), fontSize, 0x180000000ll, &memoryFace) == 0 && memoryFace != nullptr);
+    FaceMatches(memoryFace, host, library);
+    Require(memoryFace != face && memoryFace->glyph != face->glyph);
+    Require(FT_Set_Pixel_Sizes_nid_postfix(memoryFace, 0, 100) == 0 && FT_Set_Pixel_Sizes(host, 0, 100) == 0);
+    Require(FT_Get_Char_Index_nid_postfix(memoryFace, 'A') == 1);
+    Require(FT_Load_Glyph_nid_postfix(memoryFace, 1, FT_LOAD_DEFAULT) == 0 && FT_Load_Glyph(host, 1, FT_LOAD_DEFAULT) == 0);
+    SlotMatches(memoryFace->glyph, host->glyph);
+    Require(FT_Render_Glyph_nid_postfix(memoryFace->glyph, FT_RENDER_MODE_NORMAL) == 0 && FT_Render_Glyph(host->glyph, FT_RENDER_MODE_NORMAL) == 0);
+    SlotMatches(memoryFace->glyph, host->glyph);
+    Require(face->size->metrics.y_ppem == 0);
+
     Require(FT_Set_Pixel_Sizes_nid_postfix(nullptr, 0, 100) == FT_Err_Invalid_Face_Handle);
     Require(FT_Set_Pixel_Sizes_nid_postfix(face, 0, 100) == 0 && FT_Set_Pixel_Sizes(host, 0, 100) == 0);
     const auto& metrics = host->size->metrics;
@@ -188,6 +237,47 @@ int main() {
     Require(FT_Get_Char_Index_nid_postfix(face, 'A') == 1 && FT_Get_Char_Index_nid_postfix(face, 'B') == 0);
     Require(FT_Get_Char_Index_nid_postfix(face, 0x100000041ull) == 1);
     Require(FT_Get_Char_Index_nid_postfix(nullptr, 'A') == 0);
+
+    Require(FT_Load_Char_nid_postfix(nullptr, 'A', FT_LOAD_DEFAULT) == FT_Err_Invalid_Face_Handle);
+    for (const std::uint64_t code : std::array<std::uint64_t, 4>{'A', 'B', 0x100000041ull, 0xFFFFFFFFFFFFFFFFull}) {
+        for (const std::int32_t flags : std::array<std::int32_t, 4>{FT_LOAD_DEFAULT, FT_LOAD_NO_SCALE, FT_LOAD_NO_HINTING, FT_LOAD_RENDER}) {
+            Require(FT_Load_Char_nid_postfix(face, code, flags) == FT_Load_Char(host, static_cast<FT_ULong>(code), flags));
+            SlotMatches(face->glyph, host->glyph);
+            Require(face->glyph->glyph_index == (static_cast<std::uint32_t>(code) == 'A' ? 1u : 0u));
+        }
+    }
+    {
+        auto noMap = font;
+        const std::size_t tableCount = (static_cast<std::size_t>(noMap[4]) << 8) | noMap[5];
+        bool renamed = false;
+        for (std::size_t offset = 12; offset < 12 + tableCount * 16; offset += 16) {
+            if (std::memcmp(noMap.data() + offset, "cmap", 4) != 0) continue;
+            std::memcpy(noMap.data() + offset, "none", 4);
+            renamed = true;
+            break;
+        }
+        Require(renamed);
+        {
+            std::ofstream file(root / "app0" / "no-map.ttf", std::ios::binary);
+            file.write(reinterpret_cast<const char*>(noMap.data()), static_cast<std::streamsize>(noMap.size()));
+            Require(file.good());
+        }
+        GuestFaceRec* guestNoMap = nullptr;
+        FT_Face nativeNoMap = nullptr;
+        Require(FT_New_Face_nid_postfix(library, "/app0/no-map.ttf", 0, &guestNoMap) == 0);
+        Require(FT_New_Memory_Face(hostLibrary, noMap.data(), static_cast<FT_Long>(noMap.size()), 0, &nativeNoMap) == 0);
+        Require(guestNoMap->charmap == nullptr && nativeNoMap->charmap == nullptr);
+        Require(FT_Set_Pixel_Sizes_nid_postfix(guestNoMap, 0, 100) == 0 && FT_Set_Pixel_Sizes(nativeNoMap, 0, 100) == 0);
+        for (const std::uint64_t code : {1ull, 2ull}) {
+            for (const std::int32_t flags : std::array<std::int32_t, 2>{FT_LOAD_DEFAULT, FT_LOAD_RENDER}) {
+                const FT_Error expected = FT_Load_Char(nativeNoMap, static_cast<FT_ULong>(code), flags);
+                Require((code == 1) == (expected == 0));
+                Require(FT_Load_Char_nid_postfix(guestNoMap, code, flags) == expected);
+                SlotMatches(guestNoMap->glyph, nativeNoMap->glyph);
+            }
+        }
+        Require(FT_Done_Face(nativeNoMap) == 0);
+    }
 
     Require(FT_Load_Glyph_nid_postfix(nullptr, 1, FT_LOAD_DEFAULT) == FT_Err_Invalid_Face_Handle);
     Require(FT_Load_Glyph_nid_postfix(face, 1, FT_LOAD_DEFAULT) == 0 && FT_Load_Glyph(host, 1, FT_LOAD_DEFAULT) == 0);
@@ -212,8 +302,43 @@ int main() {
     slot->outline.points = original;
     Require(FT_Render_Glyph_nid_postfix(slot, FT_RENDER_MODE_NORMAL) == 0 && slot->bitmap_left == 10);
 
-    FT_Done_Face(host);
-    FT_Done_FreeType(hostLibrary);
+    Finalizers nativeDone;
+    Finalizers guestDone;
+    SetFinalizers(host, nativeDone);
+    SetFinalizers(face, guestDone);
+    Require(FT_Done_Face(host) == 0);
+    Require(FT_Done_Face_nid_postfix(face) == 0);
+    Require(nativeDone.calls == std::vector<int>({1, 2, 3}) && guestDone.calls == nativeDone.calls);
+    Require(FT_Get_Char_Index_nid_postfix(masked, 'A') == 1);
+
+    FT_Face nativeFirst = nullptr;
+    FT_Face nativeSecond = nullptr;
+    Require(FT_New_Memory_Face(hostLibrary, font.data(), static_cast<FT_Long>(font.size()), 0, &nativeFirst) == 0);
+    Require(FT_New_Memory_Face(hostLibrary, font.data(), static_cast<FT_Long>(font.size()), 0, &nativeSecond) == 0);
+    Finalizers nativeFirstEvents;
+    Finalizers nativeSecondEvents;
+    Finalizers guestFirstEvents;
+    Finalizers guestSecondEvents;
+    SetFinalizers(nativeFirst, nativeFirstEvents);
+    SetFinalizers(nativeSecond, nativeSecondEvents);
+    SetFinalizers(masked, guestFirstEvents);
+    SetFinalizers(memoryFace, guestSecondEvents);
+    Require(FT_Done_FreeType(hostLibrary) == 0);
+
+    void* independent = nullptr;
+    GuestFaceRec* independentFace = nullptr;
+    Require(FT_Init_FreeType_nid_postfix(&independent) == 0);
+    Require(FT_New_Memory_Face_nid_postfix(independent, font.data(), fontSize, 0, &independentFace) == 0);
+    Finalizers independentEvents;
+    SetFinalizers(independentFace, independentEvents);
+    Require(FT_Done_FreeType_nid_postfix(library) == 0);
+    Require(guestFirstEvents.calls == nativeFirstEvents.calls && guestSecondEvents.calls == nativeSecondEvents.calls);
+    Require(guestFirstEvents.calls == nativeDone.calls && independentEvents.calls.empty());
+    Require(FT_Get_Char_Index_nid_postfix(independentFace, 'A') == 1);
+    Require(FT_Done_FreeType_nid_postfix(independent) == 0 && independentEvents.calls == nativeDone.calls);
+
+    void* empty = nullptr;
+    Require(FT_Init_FreeType_nid_postfix(&empty) == 0 && FT_Done_FreeType_nid_postfix(empty) == 0);
     std::filesystem::current_path(previous);
     std::error_code ignored;
     std::filesystem::remove_all(root, ignored);
