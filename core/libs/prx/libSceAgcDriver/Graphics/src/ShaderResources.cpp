@@ -5621,6 +5621,17 @@ DeviceTableTexture LookupDeviceTableTexture(const Context& context, std::span<co
     return result;
 }
 
+bool DeviceTableTextureCurrent(const Context& context, const std::array<std::uint32_t, 8>& words, bool depthCompare, const Texture& texture) {
+    const auto key = MakeTextureKey(context.device, words, ViewComponents(DecodeTextureResource(words)), depthCompare);
+    auto& cache = Textures();
+    std::lock_guard lock(cache.mutex);
+    const auto it = findTexture(cache, key);
+    if (it == cache.entries.end() || it->texture.get() != &texture || it->source != nullptr || it->keys != DccKeys::Uncompressed || it->committed.has_value()) return false;
+    if (Recorder::SnapshotWriteOverlaps(it->address, it->bytes.size())) return false;
+    const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureCompare);
+    return GuestMemory::EqualsCommitted(it->address, it->bytes);
+}
+
 ImageTableReuseCounts ImageTableReuses() {
     const auto& counters = TextureCounts();
     return {counters.tablesReused.load(std::memory_order_relaxed) + counters.tablesReplayed.load(std::memory_order_relaxed), counters.tablesResolved.load(std::memory_order_relaxed), counters.tablesReplayed.load(std::memory_order_relaxed), counters.tableWritesKept.load(std::memory_order_relaxed), counters.tableWritesMade.load(std::memory_order_relaxed)};

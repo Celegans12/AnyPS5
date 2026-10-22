@@ -431,7 +431,7 @@ void DeviceImageTable::retainSlots(Recorder& recorder) {
 
 void DeviceImageTable::refresh(const Context& build, Recorder& recorder) {
     if (entries.empty()) return;
-    const ValidationState state{GuestMemory::ThreadCollectEpoch(), GuestMemory::UnwatchSerial(), DepthSurfacesSerial(), StorageTexture::PendingSerial()};
+    const ValidationState state{GuestMemory::ThreadCollectEpoch(), GuestMemory::UnwatchSerial(), DepthSurfacesSerial(), StorageTexture::PendingSerial(), GuestMemory::OwnWriteSerial()};
     if (!validated.has_value()) {
         validated = state;
         return;
@@ -439,11 +439,14 @@ void DeviceImageTable::refresh(const Context& build, Recorder& recorder) {
     if (state.epoch != 0u && *validated == state) return;
     const bool everything = validated->unwatch != state.unwatch || validated->depthSurfaces != state.depthSurfaces;
     const bool pendingMoved = validated->pending != state.pending;
+    const bool epochMoved = state.epoch == 0u || validated->epoch != state.epoch;
     validated = state;
     ++totals.scans;
+    const auto scanned = std::exchange(scannedStamp, GuestMemory::TrackerGeneration());
     std::set<Key> stale;
     std::vector<std::uint64_t> generations;
     std::vector<std::uint8_t> changed;
+    std::vector<std::uint8_t> cpu;
     for (auto run = blocks.begin(); run != blocks.end();) {
         auto end = std::next(run);
         while (end != blocks.end() && end->first == std::prev(end)->first + 1u) ++end;
@@ -451,10 +454,15 @@ void DeviceImageTable::refresh(const Context& build, Recorder& recorder) {
         const auto count = static_cast<std::size_t>(std::prev(end)->first - run->first + 1u);
         const auto bytes = static_cast<std::size_t>(count) << BlockShift;
         static_cast<void>(GuestMemory::CollectWrites(begin, bytes));
+        if (!everything && !epochMoved && !pendingMoved && scanned != 0u && GuestMemory::NewestStamp(begin, bytes) <= scanned) {
+            run = end;
+            continue;
+        }
         generations.clear();
         for (auto block = run; block != end; ++block) generations.push_back(everything ? 0u : block->second.generation);
         changed.assign(count, GuestMemory::BlockWritten);
-        static_cast<void>(GuestMemory::ChangedBlocks(begin, bytes, generations, changed));
+        cpu.assign(count, 1u);
+        static_cast<void>(GuestMemory::ChangedBlocks(begin, bytes, generations, changed, cpu));
         StorageTexture::PendingQuery runQuery{begin, begin + bytes, nullptr, nullptr, false};
         if (pendingMoved) static_cast<void>(StorageTexture::ScanPending(std::span(&runQuery, 1)));
         const auto stamp = GuestMemory::TrackerGeneration();
@@ -464,9 +472,15 @@ void DeviceImageTable::refresh(const Context& build, Recorder& recorder) {
                 for (const auto& key : block->second.keys) {
                     if (stale.contains(key)) continue;
                     const auto& entry = entries.at(key);
-                    bool fresh = !everything && entry.generation != 0u && GuestMemory::UnchangedSince(entry.address, static_cast<std::size_t>(entry.guestBytes), entry.generation);
+                    const auto range = static_cast<std::size_t>(entry.guestBytes);
+                    const auto* image = entry.texture != nullptr ? entry.texture->StorageSource() : nullptr;
+                    bool fresh = false;
+                    if (everything || (image != nullptr && !image->Cached())) fresh = false;
+                    else if (image != nullptr && entry.generation != 0u) fresh = cpu[index] == 0u || GuestMemory::UnchangedSinceCollected(entry.address, range, entry.generation);
+                    else if (entry.generation != 0u) fresh = GuestMemory::UnchangedSince(entry.address, range, entry.generation);
+                    else fresh = GuestMemory::NewestStamp(entry.address, range) <= entry.stamp && (!epochMoved || (image != nullptr ? image->UntrackedUnchanged() : entry.texture != nullptr && DeviceTableTextureCurrent(build, entry.words, entry.depthCompare, *entry.texture)));
                     if (fresh && runQuery.overlaps) {
-                        StorageTexture::PendingQuery query{entry.address, entry.address + entry.guestBytes, nullptr, nullptr, false};
+                        StorageTexture::PendingQuery query{entry.address, entry.address + entry.guestBytes, image, nullptr, false};
                         static_cast<void>(StorageTexture::ScanPending(std::span(&query, 1)));
                         fresh = !query.overlaps;
                     }

@@ -2597,6 +2597,14 @@ bool StorageTexture::originalHolds(std::uint64_t address, std::size_t bytes) con
     return true;
 }
 
+bool StorageTexture::UntrackedUnchanged() const {
+    if (descriptor.dccAddress != 0 || uploadedKeys != DccKeys::Uncompressed || !keptAtUnwatch.empty() || original.size() != guestBytes) return false;
+    constexpr std::uint64_t blockBytes = 65536;
+    std::vector<std::uint8_t> blocks(static_cast<std::size_t>((descriptor.baseAddress + guestBytes - 1) / blockBytes - descriptor.baseAddress / blockBytes + 1));
+    if (!compareUntracked(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), blocks, true)) return false;
+    return std::all_of(blocks.begin(), blocks.end(), [](std::uint8_t block) { return block == GuestMemory::BlockUnchanged; });
+}
+
 bool StorageTexture::compareUntracked(std::uint64_t address, std::size_t bytes, std::span<std::uint8_t> changed, bool memoize) const {
     if (!originalHolds(address, bytes)) return false;
     struct Exempt {

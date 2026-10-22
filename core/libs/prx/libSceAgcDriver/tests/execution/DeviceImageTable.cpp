@@ -337,7 +337,7 @@ constexpr std::uint32_t WatchedTextures = 2000u;
 
 class GuestBlock {
 public:
-    GuestBlock() {
+    explicit GuestBlock(bool watched = true) : watched(watched) {
 #ifdef _WIN32
         block = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(BlockBytes, 65536));
         if (block != nullptr) GuestArena::GuestArenaCommit_nid_postfix(block, BlockBytes, PAGE_READWRITE, BlockBytes);
@@ -350,7 +350,7 @@ public:
             if (aligned != begin) munmap(mapped, aligned - begin);
             if (aligned + BlockBytes != begin + BlockBytes + alignment) munmap(reinterpret_cast<void*>(aligned + BlockBytes), begin + alignment - aligned);
             block = reinterpret_cast<std::uint8_t*>(aligned);
-            GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(block, BlockBytes);
+            if (watched) GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(block, BlockBytes);
         }
 #endif
         Require(block != nullptr, "cannot allocate the guest block");
@@ -364,13 +364,14 @@ public:
         GuestArena::GuestArenaRelease_nid_postfix(block, BlockBytes);
 #else
         munmap(block, BlockBytes);
-        GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(block, BlockBytes);
+        if (watched) GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(block, BlockBytes);
 #endif
     }
 
     std::uint8_t* Texture(std::uint32_t index) const { return block + static_cast<std::size_t>(index) * TextureStride; }
 
 private:
+    bool watched = true;
     std::uint8_t* block = nullptr;
 };
 
@@ -432,6 +433,71 @@ void RefreshesWrittenEntries(AgcDriver::VulkanDevice& device) {
     recorder->Sync();
     std::printf("2000 entries: insert %.1f us per key (%.1f bytes uploaded per insert); prepare with nothing changed %.2f us in the same epoch, %.1f us in a new epoch (%llu scans); one written texture refreshed in %.1f us (%llu entries of its 64 KiB blocks checked), %llu uploads after it\n",
         insertUs / WatchedTextures, static_cast<double>(insertBytes) / WatchedTextures, sameEpochUs, newEpochUs, static_cast<unsigned long long>(counts.scans), refreshUs, static_cast<unsigned long long>(counts.checked), static_cast<unsigned long long>(counts.uploads - uploads));
+}
+
+void RefreshesOnOwnStores(AgcDriver::VulkanDevice& device) {
+    GuestBlock block;
+    constexpr std::uint32_t Count = 16u;
+    for (std::uint32_t index = 0; index < Count; ++index) std::memset(block.Texture(index), static_cast<int>(index + 1u), Side * Side * 4u);
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    if (!AgcDriver::GuestMemory::WriteWatched()) {
+        std::puts("guest memory has no write watch: refreshes after the driver's own stores are not tested");
+        return;
+    }
+    auto* recorder = Recorder::Active();
+    const auto context = device.GraphicsContext();
+    DeviceImageTable table(context, Lookup(), FakeSlots(std::make_shared<FakeHeap>()));
+    std::vector<Key> keys;
+    for (std::uint32_t index = 0; index < Count; ++index) keys.push_back(KeyFor(TextureDescriptor(block.Texture(index), Formats[4])));
+    table.Prepare(context, *recorder);
+    WriteRecords(table.RingChunk(*recorder), keys, Count);
+    recorder->Sync();
+    table.Prepare(context, *recorder);
+    table.Prepare(context, *recorder);
+    Require(table.Totals().entries == Count && table.Totals().refreshed == 0u, "the entries are inserted and nothing is refreshed");
+    const auto before = table.EntryTexture(keys[5]);
+    const auto address = reinterpret_cast<std::uint64_t>(block.Texture(5));
+    std::memset(block.Texture(5), 0x77, Side * Side * 4u);
+    static_cast<void>(AgcDriver::GuestMemory::MarkWritten(address, Side * Side * 4u));
+    table.Prepare(context, *recorder);
+    const auto counts = table.Totals();
+    Require(counts.refreshed == 1u && table.EntryTexture(keys[5]) != before, "a store the driver made in the same collect epoch refreshes the entry it covers (" + std::to_string(counts.refreshed) + " refreshed)");
+    recorder->Sync();
+}
+
+void KeepsUnwatchedEntries(AgcDriver::VulkanDevice& device) {
+    GuestBlock block(false);
+    constexpr std::uint32_t Count = 16u;
+    for (std::uint32_t index = 0; index < Count; ++index) std::memset(block.Texture(index), static_cast<int>(0x40u + index), Side * Side * 4u);
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    auto* recorder = Recorder::Active();
+    const auto context = device.GraphicsContext();
+    DeviceImageTable table(context, Lookup(), FakeSlots(std::make_shared<FakeHeap>()));
+    std::vector<Key> keys;
+    for (std::uint32_t index = 0; index < Count; ++index) keys.push_back(KeyFor(TextureDescriptor(block.Texture(index), Formats[4])));
+    table.Prepare(context, *recorder);
+    WriteRecords(table.RingChunk(*recorder), keys, Count);
+    recorder->Sync();
+    table.Prepare(context, *recorder);
+    Require(table.Totals().entries == Count, "the unwatched entries are inserted");
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    table.Prepare(context, *recorder);
+    const auto settled = table.Totals();
+    for (int round = 0; round < 4; ++round) {
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        table.Prepare(context, *recorder);
+    }
+    auto counts = table.Totals();
+    Require(counts.checked == settled.checked && counts.refreshed == 0u, "a new collect epoch over unwatched entries whose bytes still match looks none of them up again (" + std::to_string(counts.checked - settled.checked) + " checked)");
+    const auto before = table.EntryTexture(keys[9]);
+    std::memset(block.Texture(9), 0x99, Side * Side * 4u);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    table.Prepare(context, *recorder);
+    counts = table.Totals();
+    Require(counts.refreshed == 1u && table.EntryTexture(keys[9]) != before, "a CPU write to one unwatched texture refreshes its entry at the next collect epoch (" + std::to_string(counts.refreshed) + " refreshed)");
+    std::printf("unwatched entries: %llu checked over 5 epochs with nothing written, 1 refreshed after a CPU write\n", static_cast<unsigned long long>(settled.checked));
+    recorder->Sync();
 }
 
 void EvictsLeastRecentlyUsed(AgcDriver::VulkanDevice& device) {
@@ -712,6 +778,8 @@ int main(int argc, char** argv) {
         RejectsAndFaults(*device);
         CountsOverflow(*device);
         RefreshesWrittenEntries(*device);
+        RefreshesOnOwnStores(*device);
+        KeepsUnwatchedEntries(*device);
         EvictsLeastRecentlyUsed(*device);
         FullTableFallsBack(*device);
         OverflowFallsBack(*device);

@@ -51,6 +51,7 @@ struct DeviceTableTexture {
 };
 
 DeviceTableTexture LookupDeviceTableTexture(const Context& context, std::span<const std::uint32_t, 8> descriptor, const DeviceTableView& view, std::uint32_t samplerClass);
+bool DeviceTableTextureCurrent(const Context& context, const std::array<std::uint32_t, 8>& words, bool depthCompare, const Texture& texture);
 
 class DeviceImageTable {
 public:
@@ -156,6 +157,7 @@ private:
         std::uint64_t unwatch = 0;
         std::uint64_t depthSurfaces = 0;
         std::uint64_t pending = 0;
+        std::uint64_t ownWrites = 0;
         bool operator==(const ValidationState&) const = default;
     };
     struct Block {
@@ -215,6 +217,7 @@ private:
     Budget budget;
     std::map<std::uint64_t, Block> blocks;
     std::optional<ValidationState> validated;
+    std::uint64_t scannedStamp = 0;
     std::uint64_t slotSerial = 0;
     std::uint64_t useSerial = 0;
     std::uint64_t evictionCheck = 0;
