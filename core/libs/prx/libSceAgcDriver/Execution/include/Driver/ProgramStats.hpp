@@ -59,6 +59,10 @@ const ProgramList& DumpedDrawPrograms();
 // pre-passes, not the G-buffer draws).
 std::vector<ProgramList> ParseVertexSchedule(const char* text, std::uint32_t& frame);
 bool VertexScheduleSkips(std::uint64_t vertex);
+bool VertexBitsSkip(std::uint64_t vertex);
+std::optional<float> DepthSlackBias(char item);
+void NoteGbufferDepth(std::uint64_t address);
+std::uint64_t GbufferDepth();
 std::uint32_t StatsDepthMode(bool test, bool write, std::uint32_t compare);
 
 bool BlendableAttachmentFormat(VkFormat format);

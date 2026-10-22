@@ -210,7 +210,7 @@ std::optional<char> DepthScheduleItem() {
         if (end == nullptr || *end != ':') throw std::runtime_error("APS5_DEPTH_SCHEDULE must be <frame>:<item>,...");
         for (const char* cursor = end + 1; *cursor != '\0'; ++cursor) {
             if (*cursor == ',') continue;
-            if (*cursor != '-' && *cursor != 'p' && (*cursor < '0' || *cursor > '7')) throw std::runtime_error("APS5_DEPTH_SCHEDULE items are '-', 'p' or a VkCompareOp digit 0-7");
+            if (*cursor != '-' && *cursor != 'p' && (*cursor < '0' || *cursor > '7') && (*cursor < 'a' || *cursor > 'l')) throw std::runtime_error("APS5_DEPTH_SCHEDULE items are '-', 'p', a VkCompareOp digit 0-7 or a depth slack letter a-l");
             parsed.items.push_back(*cursor);
         }
         if (parsed.items.empty()) throw std::runtime_error("APS5_DEPTH_SCHEDULE has no items");
@@ -253,6 +253,44 @@ bool VertexScheduleSkips(std::uint64_t vertex) {
     if (items.empty() || vertex == 0) return false;
     const auto index = BisectBitForPresent(presentCount.load(std::memory_order_relaxed), frame, static_cast<std::uint32_t>(items.size()));
     return index && ListedProgram(items[*index], vertex);
+}
+
+std::optional<float> DepthSlackBias(char item) {
+    if (item < 'a' || item > 'l') return std::nullopt;
+    return static_cast<float>(1u << (2u * static_cast<std::uint32_t>(item - 'a')));
+}
+
+namespace {
+
+std::atomic<std::uint64_t> gbufferDepth{0};
+
+}
+
+void NoteGbufferDepth(std::uint64_t address) {
+    if (gbufferDepth.exchange(address, std::memory_order_relaxed) != address) std::fprintf(stderr, "[progstats] G-buffer depth target 0x%llx\n", static_cast<unsigned long long>(address));
+}
+
+std::uint64_t GbufferDepth() {
+    return gbufferDepth.load(std::memory_order_relaxed);
+}
+
+bool VertexBitsSkip(std::uint64_t vertex) {
+    static const BisectSetting setting = [] {
+        BisectSetting parsed;
+        const char* text = std::getenv("APS5_SKIP_VERTEX_BITS");
+        if (text == nullptr || *text == '\0') return parsed;
+        char* end = nullptr;
+        parsed.frame = static_cast<std::uint32_t>(std::strtoul(text, &end, 10));
+        if (end == nullptr || *end != ':') throw std::runtime_error("APS5_SKIP_VERTEX_BITS must be <frame>:<bits>");
+        parsed.bits = static_cast<std::uint32_t>(std::strtoul(end + 1, &end, 10));
+        if (end == nullptr || *end != '\0' || parsed.bits == 0 || parsed.bits > 32) throw std::runtime_error("APS5_SKIP_VERTEX_BITS must be <frame>:<bits> with 1 to 32 bits");
+        parsed.active = true;
+        std::fprintf(stderr, "[progstats] APS5_SKIP_VERTEX_BITS: frame dumps %u..%u skip pre-pass draws whose vertex program has hash bits 0..%u\n", parsed.frame + 1, parsed.frame + parsed.bits, parsed.bits - 1);
+        return parsed;
+    }();
+    if (!setting.active || vertex == 0) return false;
+    const auto bit = BisectBitForPresent(presentCount.load(std::memory_order_relaxed), setting.frame, setting.bits);
+    return bit && ((ProgramBisectHash(vertex) >> *bit) & 1u) != 0;
 }
 
 bool BlendableAttachmentFormat(VkFormat format) {

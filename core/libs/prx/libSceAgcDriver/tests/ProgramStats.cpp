@@ -85,6 +85,14 @@ void VertexSchedule() {
     Check(threw, "a vertex schedule without a frame is accepted");
 }
 
+void DepthSlack() {
+    Check(!DepthSlackBias('-') && !DepthSlackBias('p') && !DepthSlackBias('7') && !DepthSlackBias('m'), "a non-slack item has a bias");
+    Check(DepthSlackBias('a') == 1.0f && DepthSlackBias('b') == 4.0f && DepthSlackBias('l') == 4194304.0f, "the depth slack biases are misread");
+    NoteGbufferDepth(0x5002870000ull);
+    Check(GbufferDepth() == 0x5002870000ull, "the G-buffer depth target is not kept");
+    Check(!VertexBitsSkip(0x8023613b00ull), "the vertex bit skip is active without its variable");
+}
+
 void Stats() {
     ProgramStats off(0);
     off.NoteDraw(1, 2, {}, std::nullopt, false, false);

@@ -345,9 +345,23 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
     bool skipDepthOnly = false;
     if (decode->state.depth && decode->state.depthWrite && !(filtered && !filterTargets.empty()) && VertexScheduleSkips(vertexProgram)) skipDepthOnly = true;
+    const bool gbufferDraw = decode->state.colors.size() >= 4u && decode->state.depth.has_value();
+    if (gbufferDraw) NoteGbufferDepth(decode->state.depth->address);
+    if (!gbufferDraw && decode->state.depth && decode->state.depthWrite && decode->state.depth->address == GbufferDepth() && VertexBitsSkip(vertexProgram)) skipDepthOnly = true;
     if (const auto item = DepthScheduleItem()) {
         const auto& state = decode->state;
-        if (*item == 'p') {
+        if (const auto slack = DepthSlackBias(*item)) {
+            if (gbufferDraw && state.depthTest && (state.depthCompare == VK_COMPARE_OP_EQUAL || state.depthCompare == VK_COMPARE_OP_GREATER_OR_EQUAL)) {
+                auto relaxed = std::make_shared<DrawDecode>(*decode);
+                relaxed->state.depthCompare = VK_COMPARE_OP_GREATER_OR_EQUAL;
+                relaxed->state.depthBias = true;
+                relaxed->state.depthBiasConstant = *slack;
+                relaxed->state.depthBiasSlope = 0.0f;
+                relaxed->state.depthBiasClamp = 0.0f;
+                relaxed->state.depthBiasPerFace = false;
+                decode = std::move(relaxed);
+            }
+        } else if (*item == 'p') {
             skipDepthOnly = skipDepthOnly || (state.colors.empty() && !state.hasColorTarget && state.depth && ListedProgram(filterTargets, state.depth->address));
         } else if (filtered && !filterTargets.empty() && state.depthTest && state.depthCompare == VK_COMPARE_OP_EQUAL) {
             auto relaxed = std::make_shared<DrawDecode>(*decode);
