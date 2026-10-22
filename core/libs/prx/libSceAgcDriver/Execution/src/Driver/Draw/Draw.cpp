@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <array>
 #include <atomic>
 #include <limits>
 #include <mutex>
@@ -46,6 +47,44 @@ void TraceDepthState(std::uint64_t vertexProgram, std::uint64_t pixelProgram, co
     if (seen.size() >= 256) return;
     const auto hits = ++seen[text];
     if (hits == 1) std::fprintf(stderr, "[depth-state] %s\n", text);
+}
+
+void TraceInstanceRows(std::uint64_t vertexProgram, const DrawDecode& decode, const Pm4::DrawParameters& draw) {
+    const DrawProgram* program = nullptr;
+    for (const auto& candidate : decode.programs) {
+        if (candidate.binary.codeAddress == vertexProgram) program = &candidate;
+    }
+    if (program == nullptr || program->firstUserSgpr != 8u || program->userData.size() < 2u) return;
+    const auto& user = program->userData;
+    const auto word = [&](std::size_t index) { return index < user.size() ? user[index] : 0u; };
+    const auto readable = [](std::uint64_t address, std::size_t bytes) { return address != 0 && GuestMemory::Accessible(reinterpret_cast<const void*>(address), bytes); };
+    const std::uint64_t table = static_cast<std::uint64_t>(word(0)) | (static_cast<std::uint64_t>(word(1) & 0xffffu) << 32u);
+    std::uint64_t list = 0;
+    if (readable(table + 0x58u, 8u)) std::memcpy(&list, reinterpret_cast<const void*>(table + 0x58u), 8u);
+    list &= 0xffffffffffffull;
+    std::array<std::uint32_t, 4> descriptor{};
+    if (readable(list, 16u)) std::memcpy(descriptor.data(), reinterpret_cast<const void*>(list), 16u);
+    const std::uint64_t base = static_cast<std::uint64_t>(descriptor[0]) | (static_cast<std::uint64_t>(descriptor[1] & 0xffffu) << 32u);
+    const std::uint32_t stride = (descriptor[1] >> 16u) & 0x3fffu;
+    std::string line;
+    char text[512];
+    std::snprintf(text, sizeof(text), "[instance-rows] present %llu vs 0x%llx colors %zu index 0x%llx n%u inst %u first %u vertex %u indirect %d ud14 0x%x ud15 0x%x table 0x%llx list 0x%llx base 0x%llx stride %u records %u",
+        static_cast<unsigned long long>(ProgramStatsPresent()), static_cast<unsigned long long>(vertexProgram), decode.state.colors.size(), static_cast<unsigned long long>(draw.indexAddress), draw.indexCount, draw.instanceCount, draw.firstInstance, draw.firstVertex, draw.indirect.has_value() ? 1 : 0, word(14), word(15),
+        static_cast<unsigned long long>(table), static_cast<unsigned long long>(list), static_cast<unsigned long long>(base), stride, descriptor[2]);
+    line += text;
+    const std::uint32_t records = std::min<std::uint32_t>(descriptor[2], 4u);
+    for (std::uint32_t record = 0; record < records && stride >= 64u; ++record) {
+        const auto address = base + static_cast<std::uint64_t>(record) * stride;
+        if (!readable(address, 64u)) break;
+        std::array<float, 16> rows{};
+        std::memcpy(rows.data(), reinterpret_cast<const void*>(address), sizeof(rows));
+        line += " |";
+        for (const auto value : rows) {
+            std::snprintf(text, sizeof(text), " %.7g", value);
+            line += text;
+        }
+    }
+    std::fprintf(stderr, "%s\n", line.c_str());
 }
 
 bool GpuIndirectArgs() {
@@ -359,6 +398,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         decode = std::move(tinted);
     }
     if (!DepthStateTracePrograms().empty() && ListedProgram(DepthStateTracePrograms(), vertexProgram)) TraceDepthState(vertexProgram, pixelProgram, decode->state);
+    if (InstanceRowTraceActive(vertexProgram)) TraceInstanceRows(vertexProgram, *decode, drawParameters);
     bool skipDepthOnly = false;
     if (decode->state.depth && decode->state.depthWrite && !(filtered && !filterTargets.empty()) && VertexScheduleSkips(vertexProgram)) skipDepthOnly = true;
     const bool gbufferDraw = decode->state.colors.size() >= 4u && decode->state.depth.has_value();

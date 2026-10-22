@@ -205,6 +205,25 @@ std::uint32_t StatsDepthMode(bool test, bool write, std::uint32_t compare) {
     return 0x80000000u | (test ? 0x100u : 0u) | (write ? 0x10u : 0u) | (compare & 0xfu);
 }
 
+std::uint64_t ProgramStatsPresent() {
+    return presentCount.load(std::memory_order_relaxed);
+}
+
+bool InstanceRowTraceActive(std::uint64_t vertex) {
+    static const auto setting = [] {
+        std::pair<std::uint64_t, ProgramList> parsed{0, {}};
+        const char* text = std::getenv("APS5_TRACE_INSTANCE_ROWS");
+        if (text == nullptr) return parsed;
+        char* end = nullptr;
+        parsed.first = std::strtoull(text, &end, 10);
+        if (end == nullptr || *end != ':') throw std::runtime_error("APS5_TRACE_INSTANCE_ROWS must be <present>:<list>");
+        parsed.second = ParseProgramList(end + 1);
+        return parsed;
+    }();
+    if (setting.second.empty() || presentCount.load(std::memory_order_relaxed) != setting.first) return false;
+    return ListedProgram(setting.second, vertex);
+}
+
 std::optional<char> DepthScheduleItem() {
     struct Schedule {
         bool active = false;
