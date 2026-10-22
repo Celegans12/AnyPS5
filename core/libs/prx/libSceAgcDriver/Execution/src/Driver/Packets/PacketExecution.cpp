@@ -449,7 +449,28 @@ void Driver::execute(const Submission& submission) {
         if (predicated) {
             landPendingWaits(submission.queue);
             recordQueuedLabelsBeforeRead(submission.queue);
-            if (!Pm4::PredicationPasses(queue)) {
+            static const int condSync = [] { const char* value = std::getenv("APS5_COND_SYNC"); return value != nullptr ? std::atoi(value) : 0; }();
+            static std::atomic<std::uint64_t> condEvaluated{0}, condSkipped{0}, condChanged{0};
+            const auto fullSync = [&] {
+                if (DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, opcode);
+                GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
+                std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                if (const auto localDevice = device.Load()) localDevice->WaitIdle();
+            };
+            bool passes = Pm4::PredicationPasses(queue);
+            if (condSync != 0) {
+                fullSync();
+                const bool synced = Pm4::PredicationPasses(queue);
+                const auto evaluated = condEvaluated.fetch_add(1) + 1;
+                if (!synced) condSkipped.fetch_add(1);
+                if (synced != passes) {
+                    const auto changed = condChanged.fetch_add(1) + 1;
+                    if (changed <= 64) std::fprintf(stderr, "[cond] predication of opcode 0x%x at 0x%llx: %s before a full sync, %s after\n", opcode, static_cast<unsigned long long>(queue.predication.address), passes ? "passes" : "fails", synced ? "passes" : "fails");
+                }
+                if ((evaluated & 1023u) == 0) std::fprintf(stderr, "[cond] %llu conditions, %llu false after a full sync, %llu changed by it\n", static_cast<unsigned long long>(evaluated), static_cast<unsigned long long>(condSkipped.load()), static_cast<unsigned long long>(condChanged.load()));
+                if (condSync >= 2) passes = synced;
+            }
+            if (!passes) {
                 cursor = opcode == 0x3f ? submission.conditionalEnds.at(cursor) : nextCursor;
                 if (ahead != nullptr) ahead->Skip(aheadSegment, cursor);
                 continue;
@@ -660,7 +681,27 @@ void Driver::execute(const Submission& submission) {
         } else if (opcode == 0x22) {
             landPendingWaits(submission.queue);
             recordQueuedLabelsBeforeRead(submission.queue);
-            const auto condition = Pm4::ReadCondition(packet);
+            static const int condSync = [] { const char* value = std::getenv("APS5_COND_SYNC"); return value != nullptr ? std::atoi(value) : 0; }();
+            static std::atomic<std::uint64_t> condEvaluated{0}, condSkipped{0}, condChanged{0};
+            const auto fullSync = [&] {
+                if (DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, opcode);
+                GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
+                std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                if (const auto localDevice = device.Load()) localDevice->WaitIdle();
+            };
+            auto condition = Pm4::ReadCondition(packet);
+            if (condSync != 0) {
+                fullSync();
+                const auto synced = Pm4::ReadCondition(packet);
+                const auto evaluated = condEvaluated.fetch_add(1) + 1;
+                if (synced == 0) condSkipped.fetch_add(1);
+                if ((synced == 0) != (condition == 0)) {
+                    const auto changed = condChanged.fetch_add(1) + 1;
+                    if (changed <= 64) std::fprintf(stderr, "[cond] COND_EXEC at 0x%llx reads 0x%x before a full sync, 0x%x after (%zu dwords)\n", static_cast<unsigned long long>(packet[1] | (static_cast<std::uint64_t>(packet[2]) << 32u)), condition, synced, submission.conditionalEnds.at(cursor) - cursor - count);
+                }
+                if ((evaluated & 1023u) == 0) std::fprintf(stderr, "[cond] %llu conditions, %llu false after a full sync, %llu changed by it\n", static_cast<unsigned long long>(evaluated), static_cast<unsigned long long>(condSkipped.load()), static_cast<unsigned long long>(condChanged.load()));
+                if (condSync >= 2) condition = synced;
+            }
             if (condition == 0) {
                 nextCursor = submission.conditionalEnds.at(cursor);
                 if (ahead != nullptr) ahead->Skip(aheadSegment, nextCursor);

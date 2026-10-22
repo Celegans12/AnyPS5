@@ -360,6 +360,13 @@ void ProgramStats::NoteMesh(std::uint64_t indexAddress, std::uint32_t indexCount
     if (users.size() < 8) users.insert({vertex, depthMode, color});
 }
 
+void ProgramStats::NoteMeshUse(std::uint64_t indexAddress, std::uint64_t depth, std::uint64_t vertex, std::uint32_t depthMode, std::uint32_t colorCount, std::uint64_t color, std::uint32_t instances, std::uint32_t indexCount, std::uint32_t firstVertex, bool indirect) {
+    if (!Enabled() || indexAddress == 0 || depth == 0 || depth != GbufferDepth()) return;
+    std::lock_guard lock(mutex);
+    auto& uses = meshUses[{indexAddress, depth}];
+    if (uses.size() < 16) uses.push_back({vertex, depthMode, colorCount, color, instances, indexCount, firstVertex, indirect});
+}
+
 void ProgramStats::NoteDispatch(std::uint64_t program, std::span<const StatsImage> written, bool skipped) {
     if (!Enabled()) return;
     std::lock_guard lock(mutex);
@@ -463,11 +470,45 @@ std::vector<std::string> ProgramStats::Present() {
         std::vector<std::pair<std::string, std::uint64_t>> orderedSets(sets.begin(), sets.end());
         std::stable_sort(orderedSets.begin(), orderedSets.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
         for (std::size_t i = 0; i < orderedSets.size() && i < 160; ++i) lines.push_back("[progstats] present " + std::to_string(presents) + " mesh x" + std::to_string(orderedSets[i].second) + ": " + orderedSets[i].first);
+        std::size_t orphans = 0;
+        std::size_t prepassMeshes = 0;
+        for (const auto& [key, uses] : meshUses) {
+            std::uint64_t prepassInstances = 0;
+            std::uint64_t gbufferInstances = 0;
+            bool prepass = false;
+            bool gbuffer = false;
+            bool indirect = false;
+            for (const auto& use : uses) {
+                indirect = indirect || use.indirect;
+                if (use.colorCount >= 4u) {
+                    gbuffer = true;
+                    gbufferInstances += use.instances;
+                } else if (((use.depthMode >> 4u) & 1u) != 0) {
+                    prepass = true;
+                    prepassInstances += use.instances;
+                }
+            }
+            if (!prepass) continue;
+            ++prepassMeshes;
+            if (gbuffer && prepassInstances == gbufferInstances && !indirect) continue;
+            if (++orphans > 120) continue;
+            char head[160];
+            std::snprintf(head, sizeof(head), "[progstats] present %llu orphan index 0x%llx%s:", static_cast<unsigned long long>(presents), static_cast<unsigned long long>(key.first), gbuffer ? "" : " (no G-buffer draw)");
+            std::string text = head;
+            for (const auto& use : uses) {
+                char item[200];
+                std::snprintf(item, sizeof(item), " vs 0x%llx(h%08x)@%ux0x%llx:w%u:c%u n%u f%u i%u%s;", static_cast<unsigned long long>(use.vertex), ProgramBisectHash(use.vertex), use.colorCount, static_cast<unsigned long long>(use.color), (use.depthMode >> 4u) & 1u, use.depthMode & 0xfu, use.indexCount, use.firstVertex, use.instances, use.indirect ? " ind" : "");
+                text += item;
+            }
+            lines.push_back(std::move(text));
+        }
+        if (prepassMeshes != 0) lines.push_back("[progstats] present " + std::to_string(presents) + " orphans: " + std::to_string(orphans) + " of " + std::to_string(prepassMeshes) + " pre-pass meshes");
     }
     groups.clear();
     compute.clear();
     sampled.clear();
     meshes.clear();
+    meshUses.clear();
     draws = 0;
     return lines;
 }

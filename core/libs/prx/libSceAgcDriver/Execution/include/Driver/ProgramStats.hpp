@@ -100,6 +100,7 @@ public:
     // One indexed draw of a mesh (index buffer, count, instances); the report lists the sets of (vertex program, depth
     // mode, first colour target) that drew the same mesh in one frame.
     void NoteMesh(std::uint64_t indexAddress, std::uint32_t indexCount, std::uint32_t firstVertex, std::uint32_t instances, std::uint64_t depth, std::uint64_t vertex, std::uint32_t depthMode, std::uint64_t color);
+    void NoteMeshUse(std::uint64_t indexAddress, std::uint64_t depth, std::uint64_t vertex, std::uint32_t depthMode, std::uint32_t colorCount, std::uint64_t color, std::uint32_t instances, std::uint32_t indexCount, std::uint32_t firstVertex, bool indirect);
     void NoteDispatch(std::uint64_t program, std::span<const StatsImage> written, bool skipped);
     // Counts a present; on every n-th one returns the report lines of the draws and dispatches since the previous
     // present (otherwise none) and starts a new frame.
@@ -131,6 +132,17 @@ private:
     std::map<std::uint64_t, ComputeCount> compute;
     std::map<std::uint64_t, std::set<std::uint64_t>> sampled;
     std::map<std::tuple<std::uint64_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint64_t>, std::set<std::tuple<std::uint64_t, std::uint32_t, std::uint64_t>>> meshes;
+    struct MeshUse {
+        std::uint64_t vertex = 0;
+        std::uint32_t depthMode = 0;
+        std::uint32_t colorCount = 0;
+        std::uint64_t color = 0;
+        std::uint32_t instances = 0;
+        std::uint32_t indexCount = 0;
+        std::uint32_t firstVertex = 0;
+        bool indirect = false;
+    };
+    std::map<std::pair<std::uint64_t, std::uint64_t>, std::vector<MeshUse>> meshUses;
 };
 
 }
