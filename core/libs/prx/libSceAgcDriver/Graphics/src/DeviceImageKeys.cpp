@@ -37,9 +37,36 @@ std::optional<DeviceImageValue> DeviceImageKeys::Find(const Key& key) const {
     for (std::uint32_t step = 0; step < Abi::ProbeSteps; ++step) {
         const auto* at = words.data() + static_cast<std::size_t>((home + step) & mask) * Abi::BucketWords;
         if (at[Abi::StateWord] != Abi::LiveState) return std::nullopt;
-        if (std::equal(key.begin(), key.end(), at)) return DeviceImageValue{at[Abi::SlotWord], at[Abi::ModeWord], at[Abi::FaultWord]};
+        if (std::equal(key.begin(), key.end(), at)) return DeviceImageValue{at[Abi::SlotWord], at[Abi::ModeWord], at[Abi::FaultWord], at[Abi::SamplerSlotWord]};
     }
     return std::nullopt;
+}
+
+std::uint32_t DeviceImageKeys::Retain(const std::function<bool(const Key&)>& keep) {
+    std::vector<std::uint32_t> kept(words.size(), 0u);
+    std::uint32_t dropped = 0;
+    std::uint32_t live = 0;
+    for (std::uint32_t bucket = 0; bucket < Buckets(); ++bucket) {
+        const auto* at = words.data() + static_cast<std::size_t>(bucket) * Abi::BucketWords;
+        if (at[Abi::StateWord] != Abi::LiveState) continue;
+        Key key{};
+        std::copy_n(at, Abi::KeyWords, key.begin());
+        if (!keep(key)) {
+            ++dropped;
+            continue;
+        }
+        bool found = false;
+        const auto destination = place(kept, key, found);
+        if (!destination.has_value()) throw std::runtime_error("device image keys: a retained key found no bucket in a table of the same size");
+        std::copy_n(at, Abi::BucketWords, kept.begin() + static_cast<std::ptrdiff_t>(*destination) * Abi::BucketWords);
+        ++live;
+    }
+    if (dropped == 0u) return 0u;
+    words = std::move(kept);
+    entries = live;
+    rebuilt = true;
+    changed.clear();
+    return dropped;
 }
 
 bool DeviceImageKeys::grow() {
@@ -71,6 +98,7 @@ DeviceImageKeys::Insertion DeviceImageKeys::Insert(const Key& key, const DeviceI
         at[Abi::SlotWord] = value.slot;
         at[Abi::ModeWord] = value.mode;
         at[Abi::FaultWord] = value.fault;
+        at[Abi::SamplerSlotWord] = value.samplerSlot;
         changed.push_back(bucket);
     };
     bool found = false;
