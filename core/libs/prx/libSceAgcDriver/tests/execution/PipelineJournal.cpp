@@ -330,6 +330,7 @@ void HeapJournalTests() {
         Require(device->ComputePipelinesCreated() == 1, "the first run did not build exactly one compute pipeline");
         AgcDriver::Graphics::FlushPipelineJournal();
         Require(Snapshot().journal.recordedCompute == 1, "the first run did not record the GPU-mode compute pipeline");
+        Require(AgcDriver::Graphics::PipelineJournalPath().filename() == "pipelines-heap.journal", "the GPU-mode pipelines were recorded in the journal the per-draw binding model replays");
     }
     {
         const auto device = OpenVulkanTestDevice();
@@ -348,6 +349,7 @@ void JournalTests() {
     using namespace NarrowConstantStoreFixture;
     Require(AgcDriver::Graphics::PipelineJournalEnabled(), "the pipeline journal is disabled although the shader cache directory is set");
     const auto journalPath = AgcDriver::Graphics::PipelineJournalPath();
+    Require(journalPath.filename() == (AgcDriver::Graphics::GpuHeapEnabled() ? "pipelines-heap.journal" : "pipelines.journal"), "the pipeline journal file does not match the GPU heap mode");
     Block compute(BlockBytes);
     Block target(ColorTargetLayout(Width, Height, ColorTileMode::Linear, 2).Bytes());
     const auto computeCode = ComputeCode(0);
