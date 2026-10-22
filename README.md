@@ -20,7 +20,7 @@
 | **Frame rate in the world** | about **0.5-0.6 fps** (5.2-6.6 presents per 10 s depending on the session; this laptop's GPU clocks drift by ~14 % between sessions, so builds are compared back to back in one session) |
 | **Stability** | with the second Vulkan queue on its own compute-only queue family, every world run since the fix has been clean (up to 22 minutes); see known issues |
 | **Tested on** | Windows 11, RTX 3080 Laptop GPU 16 GB (driver 610.62), 32 GB RAM, MinGW-w64 GCC 15.2.0, Release |
-| **Build** | `18bffe373a` (our tree merged with `main` 2026-10-21 `557682ca44`, plus fixes from #675) + docs, shader-cache SourceVersion `d0982988e4b6716e`, title reference T1 exact |
+| **Build** | `3957893917` (our tree merged with `main` 2026-10-21 `557682ca44`, plus fixes from #675 and #6188, off by default) + docs, shader-cache SourceVersion `d0982988e4b6716e`, title reference T1 exact |
 
 <table>
 <tr>
@@ -64,10 +64,12 @@ Build as usual ([build instructions](docs/dev/BUILD.md)), then run the game with
 APS5_SPANNED_WAVE=1 APS5_BINDLESS_IMAGES=1 APS5_BINDLESS_LAZY=1 APS5_NO_RESULT_MEMO=1
 APS5_STAGING_DIFF=1 APS5_PIPELINE_INDIRECT=1 APS5_NO_ADDRESS_DRAW_REUSE=1
 APS5_NO_PIPELINE_JOURNAL=1 APS5_RESOURCE_CACHE_ENTRIES=1024 APS5_ASYNC_LANE=51
+APS5_NO_DRAW_AHEAD=1
 ```
 
 - **This build has a new shader-cache version (since 2026-10-22), so the first run compiles cold**: about 53 minutes to the world on our machine. Later runs start warm.
 - `APS5_ASYNC_LANE=51` runs the cloth compute ring on a second Vulkan queue. That queue now comes from a compute-only queue family by default; `APS5_LANE_GRAPHICS_FAMILY=1` goes back to a third queue of the graphics family, which faulted the GPU for us. Without `APS5_ASYNC_LANE`, everything runs on one queue as before.
+- `APS5_NO_DRAW_AHEAD=1` keeps mitul72's draw-ahead (#6188) off: worker threads that capture and compile upcoming draws ahead of queue 0. Leave it out to try it: in our A/B it was +4 % presents (not significant), and one of four title checks with it on stalled at boot and rendered wrong, which we haven't reproduced or explained yet.
 - `APS5_NO_PIPELINE_JOURNAL=1` turns off `main`'s startup pipeline replay. `APS5_RESOURCE_CACHE_ENTRIES=1024` is the resource-cache size all our measurements used.
 - `main`'s paths that broke Yōtei on our tree are off here and can be turned back on:
   - `APS5_RESIDENT_LINEAR=1`: resident linear color targets. Wrong spawn, T-pose, camera under water or in the sky (#8152).
@@ -124,6 +126,7 @@ APS5_NO_PIPELINE_JOURNAL=1 APS5_RESOURCE_CACHE_ENTRIES=1024 APS5_ASYNC_LANE=51
     - small device buffers get their own pool tier;
     - an exact-size buffer is reused instead of rebinding another one;
     - a flush with nothing to store skips the held-read check;
+  - mitul72's draw-ahead from #6188 (off in the env above);
   - from contributors in #675: shahulmubeen-a's register lists read at any byte address (#9600, an open-world crash); hritikutekar's texture-cache frame age (entries age by presents while a frame takes seconds) and his second queue on a compute-only family when the graphics family has one queue (RADV); hritikutekar's prepared-table count in the texture service and slab-backed texture snapshots (here only for images that fill at least 3/4 of their slot, with slots counted at full size against the budget; unrestricted slabs made the texture cache thrash on this tree); FardinHaque70's fix for an import unwatch hook that re-entered the import lookup (from hritikutekar's diagnosis), and Izamaru's page-state table allocated on demand (about 250 MB less commit charge).
 
 ## Updates
@@ -138,6 +141,7 @@ APS5_NO_PIPELINE_JOURNAL=1 APS5_RESOURCE_CACHE_ENTRIES=1024 APS5_ASYNC_LANE=51
 - 2026-10-22: moved to our tree merged with `main` 2026-10-21 (`557682ca44`), with hritikutekar's two committer fixes from #675. In a same-session pair against the previous build plus the same fixes: 5.20 vs 5.13 presents per 10 s and a 2,065 vs 2,071 ms median frame, so the same speed on a newer `main`. On the previous build the two fixes were worth +11 % in an in-run A/B (6.26 vs 5.62). T1 exact. **New shader-cache version, so the first run compiles cold.** Three `main` paths that broke Yōtei are off here and listed under [Run it](#run-it). These numbers were measured with no debugging tools running.
 - 2026-10-22: dispatch overlap now checks access ranges (`4212ed0d36`, same shader cache, T1 exact): a dispatch joins an overlapped run only when what it reads and writes doesn't overlap what the run reads and writes, the rule CnRJay asked for on #9176. Without it, about 40 % of the joins in the world (28,969 of 42,749) had an access conflict. In an in-run A/B the check costs no presents (-0.15 ± 0.27 per 10 s) and about 43 ms of GPU time per frame; frames were clean either way. `APS5_NO_OVERLAP_RANGE_CHECK=1` goes back to the old rule.
 - 2026-10-22: three fixes from #675 (`18bffe373a`, same shader cache, T1 exact): shahulmubeen-a's #9600 (register lists at any byte address; an open-world crash), hritikutekar's texture-cache frame age (in-run A/B 6.09 vs 5.86 presents per 10 s, about 1 SE; his big gain was with the cache over budget, which ours no longer is), and his second-queue fix for GPUs whose graphics family has one queue (RADV; NVIDIA unchanged).
+- 2026-10-22: added mitul72's draw-ahead from #6188 (`3957893917`, same shader cache), **off by default** (`APS5_NO_DRAW_AHEAD=1` in the env). With it on, queue 0's capture drops from 82 to 31 µs per draw, but most of that comes back as waiting for the committer: in an in-run A/B, 5.74 vs 5.44 presents per 10 s, within noise. The title check matched with it off every time and with it on in 3 of 4 runs; the one miss stalled at boot while the workers compiled about 10k entries and hasn't come back.
 
 ---
 
