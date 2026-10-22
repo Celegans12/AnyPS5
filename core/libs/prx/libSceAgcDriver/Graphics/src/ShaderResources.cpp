@@ -1297,10 +1297,20 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     const bool depthCopy = depthCompare && guestBytes >= DepthCopyMinBytes() && Texture::DepthCopyFormat(ResolveTextureFormat(resource.format)) != VK_FORMAT_UNDEFINED && resource.dimension != TextureDimension::k3D;
     const bool srgbExpand = !depthCompare && SrgbExpandsToRgba8(context, resource.format);
     auto source = StorageTexture::FindPending(address, guestBytes);
+    // APS5_TRACE_SAMPLED_FLUSH: why a surface with pending storage results is not served from them
+    // (the flush below then waits for the GPU under the mutex).
+    const auto pendingSource = source;
+    const char* dropReason = source == nullptr ? "no pending image covers it" : nullptr;
     const bool blockCopy = source != nullptr && !depthCompare && !srgbExpand && Texture::CanBlockCopyFrom(*source, resource);
     const bool repackCopy = source != nullptr && !depthCompare && Texture::CanRepackCopyFrom(*source, resource);
-    if (source != nullptr && !blockCopy && !repackCopy && (depthCompare ? !depthCopy || !Texture::CanDepthCopyFrom(*source, resource) : srgbExpand ? !Texture::CanSrgbExpandFrom(context, *source, resource) : !Texture::CanCopyFrom(*source, resource))) source.reset();
-    if (source != nullptr && MetadataMoved(*source, resource)) source.reset();
+    if (source != nullptr && !blockCopy && !repackCopy && (depthCompare ? !depthCopy || !Texture::CanDepthCopyFrom(*source, resource) : srgbExpand ? !Texture::CanSrgbExpandFrom(context, *source, resource) : !Texture::CanCopyFrom(*source, resource))) {
+        source.reset();
+        dropReason = depthCompare ? "no depth copy" : srgbExpand ? "no sRGB expand" : "no copy path (format/layout)";
+    }
+    if (source != nullptr && MetadataMoved(*source, resource)) {
+        source.reset();
+        dropReason = "metadata moved";
+    }
     std::optional<DccKeys> keys;
     bool clearThroughKeys = false;
     if (source != nullptr && resource.dccAddress != 0 && IsDccClear(source->FilledKeys())) {
@@ -1318,7 +1328,10 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             clearThroughKeys = true;
         }
     }
-    if (source != nullptr && resource.dccAddress != 0 && (keys.has_value() ? *keys : scanKeys()) == DccKeys::ClearSingle) source.reset();
+    if (source != nullptr && resource.dccAddress != 0 && (keys.has_value() ? *keys : scanKeys()) == DccKeys::ClearSingle) {
+        source.reset();
+        dropReason = "single-colour DCC clear";
+    }
 
     // Otherwise a surface in host-imported memory is viewed through its cached storage image (made
     // here when there is none): its refresh after a CPU or GPU write is a GPU-direct detile from the
@@ -1364,8 +1377,29 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     const auto observedKeys = keys.has_value() ? *keys : scanKeys();
     const bool stagedClear = source != nullptr && resource.dccAddress != 0 && (IsDccClear(observedKeys) || observedKeys == DccKeys::ClearSingle);
     bool stagedFlushed = false;
+    static const bool traceSampledFlush = std::getenv("APS5_TRACE_SAMPLED_FLUSH") != nullptr;
+    const auto traceStart = traceSampledFlush ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if ((source == nullptr || stagedClear) && !clearThroughKeys && StorageTexture::FlushPending(address, bytes, nullptr, "sampled texture")) {
         if (profile) LookupOutcomes::Add(LookupOutcomes::PendingFlush, flushStart);
+        if (traceSampledFlush) {
+            const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - traceStart).count();
+            char image[160] = "none";
+            if (pendingSource != nullptr) {
+                const auto& d = pendingSource->Descriptor();
+                std::snprintf(image, sizeof(image), "0x%llx %ux%u fmt %u tile %d mips %u", static_cast<unsigned long long>(d.baseAddress), d.width, d.height, d.format, static_cast<int>(d.tileMode), d.mipCount);
+            }
+            static std::uint64_t describedAddress = 0;
+            if (describedAddress != resource.baseAddress) {
+                describedAddress = resource.baseAddress;
+                const auto geometry = DescribeSurface(resource);
+                std::fprintf(stderr, "[sampled-flush] geometry 0x%llx: layers %u imageLayers %u layerBytes 0x%llx guestBytes 0x%llx thick %d dim %d array %u\n", static_cast<unsigned long long>(resource.baseAddress), geometry.layers, geometry.imageLayers, static_cast<unsigned long long>(geometry.layerBytes), static_cast<unsigned long long>(geometry.guestBytes), geometry.thick ? 1 : 0, static_cast<int>(resource.dimension), resource.depthOrLastArray);
+                for (std::size_t level = 0; level < geometry.mips.size(); ++level) {
+                    const auto& m = geometry.mips[level];
+                    std::fprintf(stderr, "[sampled-flush]   mip %zu: %ux%u tiled 0x%llx+0x%llx tail %d (%u,%u) blocksPerRow %u\n", level, m.width, m.height, static_cast<unsigned long long>(m.tiledOffset), static_cast<unsigned long long>(m.tiledSize), m.tail ? 1 : 0, m.tailX, m.tailY, m.blocksPerRow);
+                }
+            }
+            std::fprintf(stderr, "[sampled-flush] %.1f ms: 0x%llx %ux%u fmt %u tile %d mips %u%s; reason: %s; pending image: %s\n", ms, static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, static_cast<int>(resource.tileMode), resource.mipCount, depthCompare ? " depth-compare" : "", stagedClear ? "staged DCC clear" : dropReason != nullptr ? dropReason : "a storage image lookup found none (not eligible / keys not uncompressed)", image);
+        }
         generation = GuestMemory::CollectWrites(address, bytes);
         if (stagedClear) {
             stagedFlushed = true;

@@ -3986,6 +3986,14 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
                 ++it;
             }
         }
+        // APS5_TRACE_SAMPLED_FLUSH: the images a sampled texture's flush stores (ShaderResources' [sampled-flush]).
+        static const bool traceSampledFlush = std::getenv("APS5_TRACE_SAMPLED_FLUSH") != nullptr;
+        if (traceSampledFlush && reason != nullptr && std::strcmp(reason, "sampled texture") == 0) {
+            for (const auto& texture : flush) {
+                const auto& d = texture->descriptor;
+                std::fprintf(stderr, "[sampled-flush] range 0x%llx+0x%llx stores 0x%llx %ux%u fmt %u tile %d mips %u\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(d.baseAddress), d.width, d.height, d.format, static_cast<int>(d.tileMode), d.mipCount);
+            }
+        }
         // Still pending for the adjacency rule of writeBack until each one is stored.
         for (const auto& texture : flush) pending.flushing.push_back(texture.get());
         pending.flushingCount.store(pending.flushing.size(), std::memory_order_release);
