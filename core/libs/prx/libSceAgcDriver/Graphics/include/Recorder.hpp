@@ -158,6 +158,10 @@ public:
     // RunAtomicConflict).
     VkCommandBuffer OverlapCommands(std::uint32_t queueKey, std::span<const void* const> owners, VkAccessFlags* coveredAccess, bool& overlapped, std::span<const std::array<std::uint64_t, 3>> accesses = {});
     void DeferDispatchBarrier(std::uint32_t queueKey, std::span<const void* const> owners);
+    struct OverlapStatistics {
+        std::uint64_t deferred, overlapped;
+    };
+    static OverlapStatistics OverlapCounts();
     // The copy-ins of an unordered dispatch joining an open run of its ring (GuestBufferMemory::
     // recordGpuCopies): the command buffer without recording the deferred barrier when a run of
     // `queueKey` is open and `owner` (the build's guest memory, whose shadows the copies fill) takes
@@ -180,6 +184,8 @@ public:
     // either side of the overlap is a copied region (the run is closed first). Writes over writes stay
     // (the copy-backs store only the dwords that changed), as do accesses both in place.
     bool RunAtomicConflict(std::span<const std::array<std::uint64_t, 3>> accesses) const;
+    bool RunRangeConflict(std::span<const std::array<std::uint64_t, 3>> accesses) const;
+    static std::array<std::uint64_t, 2> RangeCheckCounts();
     // Opens a batch when none is open, recording nothing (no deferred dispatch barrier either).
     void OpenBatch() { ensureOpen(); }
     // Work an overlapping dispatch owes after itself (its staged copy-backs): recorded right after
@@ -229,7 +235,7 @@ public:
     // with RunAccessWritten / RunAccessCopied / RunAccessAtomic (NoteRunAccess, after each
     // DeferDispatchBarrier), and those of a dispatch joining the run checked against them
     // (CheckRunConflicts); RunConflictReport is the cumulative tally.
-    static constexpr std::uint64_t RunAccessWritten = 1, RunAccessCopied = 2, RunAccessAtomic = 4;
+    static constexpr std::uint64_t RunAccessWritten = 1, RunAccessCopied = 2, RunAccessAtomic = 4, RunAccessImage = 8;
     void NoteRunAccess(std::uint64_t program, std::span<const std::array<std::uint64_t, 3>> accesses);
     void CheckRunConflicts(std::uint64_t program, std::span<const std::array<std::uint64_t, 3>> accesses) const;
     static std::string RunConflictReport();

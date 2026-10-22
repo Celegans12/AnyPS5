@@ -6046,9 +6046,10 @@ std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> GuestBufferM
 void GuestBufferMemory::RunAccesses(std::vector<std::array<std::uint64_t, 3>>& out) const {
     out.clear();
     if (!uploaded || committed) return;
+    if (HoldsLease()) out.push_back({0, std::numeric_limits<std::uint64_t>::max(), 1u});
     for (const auto& region : regions) {
-        if (region.direct != nullptr) out.push_back({region.begin, inPlaceEnd(region), 0});
-        else if (region.gpuCopy) out.push_back({region.begin, region.end, 2u | (region.atomic ? 4u : 0u)});
+        if (region.gpuCopy) out.push_back({region.begin, region.end, 2u | (region.atomic ? 4u : 0u)});
+        else out.push_back({region.begin, region.direct != nullptr ? inPlaceEnd(region) : region.end, 0});
     }
     for (const auto& [begin, end] : mergeWrites(writes)) {
         const auto* found = owner(begin, end);
