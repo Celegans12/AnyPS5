@@ -327,7 +327,8 @@ void Driver::execute(const Submission& submission) {
     auto& queue = *state;
     DrawAhead* ahead = nullptr;
     std::uint64_t aheadSegment = 0;
-    if (submission.queue == 0 && drawEntries() && registerKeyEnabled() && DrawAhead::HasDirectDraws(submission.commands)) {
+    // #6188 draw-ahead; APS5_NO_DRAW_AHEAD=1 (an APS5_AB switch, read once per submission) scans and compiles nothing ahead.
+    if (submission.queue == 0 && drawEntries() && registerKeyEnabled() && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoDrawAhead) && DrawAhead::HasDirectDraws(submission.commands)) {
         if (drawAhead == nullptr) drawAhead = std::make_unique<DrawAhead>(*this, DrawAhead::Workers());
         ahead = drawAhead.get();
         aheadSegment = ahead->Post(submission, queue);
