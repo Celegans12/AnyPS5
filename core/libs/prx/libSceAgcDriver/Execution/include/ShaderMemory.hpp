@@ -158,6 +158,7 @@ private:
     void spill(std::size_t index);
     void spillTouching(std::uint64_t begin, std::uint64_t end);
     [[nodiscard]] std::vector<ShaderRecompiler::MemoryRegion> collect(bool recentOnly) const;
+    [[nodiscard]] std::vector<ShaderRecompiler::MemoryRegion> merge(bool recentOnly, bool heap) const;
 
     // Regions given at construction (the registered shader's code and header), referenced as given:
     // the caller keeps them alive for as long as the capture is used.

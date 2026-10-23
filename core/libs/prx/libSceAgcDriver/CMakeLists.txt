@@ -641,6 +641,7 @@ endif()
 add_test_executable(agc_shader_memory_tests EXCLUDE_FROM_ALL
         tests/ShaderMemory.cpp
         Execution/src/ShaderMemory.cpp
+        Graphics/src/RuntimeSwitches.cpp
         Execution/src/GuestMemory.cpp
         Execution/src/PerformanceTraceThread.cpp
 )
@@ -652,6 +653,7 @@ configure_windows_unwind(agc_shader_memory_tests)
 add_executable(agc_miss_bench EXCLUDE_FROM_ALL
         tools/MissBench.cpp
         Execution/src/ShaderMemory.cpp
+        Graphics/src/RuntimeSwitches.cpp
         Execution/src/GuestMemory.cpp
         Execution/src/PerformanceTraceThread.cpp
 )

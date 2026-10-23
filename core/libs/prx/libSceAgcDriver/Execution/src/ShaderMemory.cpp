@@ -8,6 +8,7 @@
 #include "Optimization/ResourceMaterializer.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "ThreadOwned.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -15,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -662,7 +664,26 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::capture(c
     return capture;
 }
 
+// APS5_VERIFY_COLLECT_HEAP=1: every collect merges both ways and reports the first difference.
 std::vector<ShaderRecompiler::MemoryRegion> ShaderMemory::collect(bool recentOnly) const {
+    const bool heap = !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoCollectHeap);
+    auto result = merge(recentOnly, heap);
+    static const bool verify = std::getenv("APS5_VERIFY_COLLECT_HEAP") != nullptr;
+    if (!verify) return result;
+    static std::atomic<std::uint64_t> checked{0}, differed{0};
+    const auto other = merge(recentOnly, !heap);
+    std::size_t first = 0;
+    while (first < result.size() && first < other.size() && result[first].guestAddress == other[first].guestAddress && result[first].bytes.data() == other[first].bytes.data() && result[first].bytes.size() == other[first].bytes.size()) ++first;
+    const auto count = checked.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (first != result.size() || first != other.size()) {
+        const auto bad = differed.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (bad <= 20) std::fprintf(stderr, "[collect-verify] DIFFERENT (%llu of %llu): %zu vs %zu regions, first difference at %zu: 0x%llx+%zu vs 0x%llx+%zu\n", static_cast<unsigned long long>(bad), static_cast<unsigned long long>(count), result.size(), other.size(), first, first < result.size() ? static_cast<unsigned long long>(result[first].guestAddress) : 0ull, first < result.size() ? result[first].bytes.size() : 0u, first < other.size() ? static_cast<unsigned long long>(other[first].guestAddress) : 0ull, first < other.size() ? other[first].bytes.size() : 0u);
+    }
+    if ((count & 0xffffu) == 0u) std::fprintf(stderr, "[collect-verify] %llu collects checked, %llu different\n", static_cast<unsigned long long>(count), static_cast<unsigned long long>(differed.load(std::memory_order_relaxed)));
+    return result;
+}
+
+std::vector<ShaderRecompiler::MemoryRegion> ShaderMemory::merge(bool recentOnly, bool heap) const {
     struct Cursor {
         const ShaderRecompiler::SrtGuestWords* words;
         std::size_t run;
@@ -678,11 +699,27 @@ std::vector<ShaderRecompiler::MemoryRegion> ShaderMemory::collect(bool recentOnl
     std::vector<ShaderRecompiler::MemoryRegion> result;
     result.reserve((recentOnly ? 0u : initial.size()) + pages.size() + runs);
     auto next = recentOnly ? initial.end() : initial.begin();
+    // The cursors by their next run's address, then their position (the scan below keeps the first of equal
+    // addresses), so the merge takes the lowest at once: the scan over every cursor for each region emitted was
+    // ~60 % of collect (best141, ~2 % of the queue worker). APS5_NO_COLLECT_HEAP=1 (runtime switch) scans.
+    using Key = std::pair<std::uint64_t, std::size_t>;
+    std::vector<Key> order;
+    if (heap) {
+        order.reserve(cursors.size());
+        for (std::size_t i = 0; i < cursors.size(); ++i) {
+            if (cursors[i].run < cursors[i].words->runs.size()) order.push_back({cursors[i].words->runs[cursors[i].run].first, i});
+        }
+        std::ranges::make_heap(order, std::greater<>{});
+    }
     const auto emitBefore = [&](std::uint64_t address) {
         while (true) {
             Cursor* lowest = nullptr;
-            for (auto& cursor : cursors) {
-                if (cursor.run < cursor.words->runs.size() && (lowest == nullptr || cursor.words->runs[cursor.run].first < lowest->words->runs[lowest->run].first)) lowest = &cursor;
+            if (heap) {
+                if (!order.empty()) lowest = &cursors[order.front().second];
+            } else {
+                for (auto& cursor : cursors) {
+                    if (cursor.run < cursor.words->runs.size() && (lowest == nullptr || cursor.words->runs[cursor.run].first < lowest->words->runs[lowest->run].first)) lowest = &cursor;
+                }
             }
             const auto run = lowest != nullptr ? lowest->words->runs[lowest->run].first : std::numeric_limits<std::uint64_t>::max();
             if (next != initial.end() && next->first < address && next->first < run) {
@@ -699,6 +736,14 @@ std::vector<ShaderRecompiler::MemoryRegion> ShaderMemory::collect(bool recentOnl
                 }
                 lowest->at += count;
                 ++lowest->run;
+                if (heap) {
+                    std::ranges::pop_heap(order, std::greater<>{});
+                    order.pop_back();
+                    if (lowest->run < lowest->words->runs.size()) {
+                        order.push_back({lowest->words->runs[lowest->run].first, static_cast<std::size_t>(lowest - cursors.data())});
+                        std::ranges::push_heap(order, std::greater<>{});
+                    }
+                }
             } else {
                 return;
             }
