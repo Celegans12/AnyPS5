@@ -126,7 +126,15 @@ private:
         std::uint64_t hits = 0;
         std::uint64_t misses = 0;
         std::uint64_t evictions = 0;
+        // Evictions by cause: the byte budget, the slot bound, VRAM over its target (APS5_PROFILE_DRAW report).
+        std::uint64_t budgetEvictions = 0;
+        std::uint64_t slotEvictions = 0;
+        std::uint64_t vramEvictions = 0;
     };
+    // The byte budget Put holds a tier to: the small tiers' at 4x (best151: the 64 MiB small device tier missed
+    // and evicted ~5,700 times a 10 s, each a new VkDeviceMemory, ~17 % of an async compute queue's time in
+    // libdrm's VA allocator under the GPU mutex). APS5_NO_LARGER_SMALL_POOLS=1 (runtime switch) keeps 1x.
+    VkDeviceSize retentionBudget(const Tier& tier) const;
     // The tier a buffer of `capacity` and `properties` is retained in (the large one for everything
     // when shared; the device tier for device-local memory while it has a budget).
     Tier& tierFor(std::size_t capacity, VkMemoryPropertyFlags properties);

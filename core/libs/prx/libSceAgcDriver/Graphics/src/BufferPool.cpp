@@ -482,6 +482,7 @@ std::optional<BufferAllocation> BufferPool::Take(std::size_t bytes, VkBufferUsag
         if (now - lastReport > std::chrono::seconds(10)) {
             lastReport = now;
             AgcDriver::ProfilePrint_nid_no_patch("[bufferpool] small: %llu hits, %llu misses, %llu evictions, %zu retained (%.0f MiB); large: %llu hits, %llu misses, %llu evictions, %zu retained (%.0f MiB)%s; device: %llu hits, %llu misses, %llu evictions, %zu retained (%.0f MiB of %llu); small device%s: %llu hits, %llu misses, %llu evictions, %zu retained (%.0f MiB of %llu); hits of the exact size %llu, rebound to another size %llu%s; images: %llu hits, %llu misses, %llu evictions, %zu retained (%.0f MiB of %llu)\n", static_cast<unsigned long long>(smallTier.hits), static_cast<unsigned long long>(smallTier.misses), static_cast<unsigned long long>(smallTier.evictions), smallTier.slots, smallTier.retainedBytes / 1048576.0, static_cast<unsigned long long>(largeTier.hits), static_cast<unsigned long long>(largeTier.misses), static_cast<unsigned long long>(largeTier.evictions), largeTier.slots, largeTier.retainedBytes / 1048576.0, sharedTiers() ? " (shared)" : "", static_cast<unsigned long long>(deviceTier.hits), static_cast<unsigned long long>(deviceTier.misses), static_cast<unsigned long long>(deviceTier.evictions), deviceTier.slots, deviceTier.retainedBytes / 1048576.0, static_cast<unsigned long long>(deviceTier.budget >> 20u), RuntimeSwitches::Set(RuntimeSwitch::NoSmallDeviceTier) ? " (APS5_NO_SMALL_DEVICE_TIER: in the small tier)" : "", static_cast<unsigned long long>(smallDeviceTier.hits), static_cast<unsigned long long>(smallDeviceTier.misses), static_cast<unsigned long long>(smallDeviceTier.evictions), smallDeviceTier.slots, smallDeviceTier.retainedBytes / 1048576.0, static_cast<unsigned long long>(smallDeviceTier.budget >> 20u), static_cast<unsigned long long>(exactSizeHits), static_cast<unsigned long long>(resizedHits), RuntimeSwitches::Set(RuntimeSwitch::NoExactSizeReuse) ? " (APS5_NO_EXACT_SIZE_REUSE)" : "", static_cast<unsigned long long>(imageHits), static_cast<unsigned long long>(imageMisses), static_cast<unsigned long long>(imageEvictions), imageSlots, imageBytes / 1048576.0, static_cast<unsigned long long>(imageBudget >> 20u));
+            AgcDriver::ProfilePrint_nid_no_patch("[bufferpool] evictions by cause (budget/slots/vram): small %llu/%llu/%llu (budget %llu MiB), small device %llu/%llu/%llu (budget %llu MiB), device %llu/%llu/%llu, large %llu/%llu/%llu; slot bound %zu\n", static_cast<unsigned long long>(smallTier.budgetEvictions), static_cast<unsigned long long>(smallTier.slotEvictions), static_cast<unsigned long long>(smallTier.vramEvictions), static_cast<unsigned long long>(retentionBudget(smallTier) >> 20u), static_cast<unsigned long long>(smallDeviceTier.budgetEvictions), static_cast<unsigned long long>(smallDeviceTier.slotEvictions), static_cast<unsigned long long>(smallDeviceTier.vramEvictions), static_cast<unsigned long long>(retentionBudget(smallDeviceTier) >> 20u), static_cast<unsigned long long>(deviceTier.budgetEvictions), static_cast<unsigned long long>(deviceTier.slotEvictions), static_cast<unsigned long long>(deviceTier.vramEvictions), static_cast<unsigned long long>(largeTier.budgetEvictions), static_cast<unsigned long long>(largeTier.slotEvictions), static_cast<unsigned long long>(largeTier.vramEvictions), maxSlots);
             if (vram.Enabled()) {
                 const auto report = vram.Report();
                 AgcDriver::ProfilePrint_nid_no_patch("[vram] heap %u: budget %llu MiB, usage %llu MiB, target %llu MiB; %llu released device buffers (%.0f MiB) not pooled over the target\n", report.heap, static_cast<unsigned long long>(report.budget >> 20u), static_cast<unsigned long long>(report.usage >> 20u), static_cast<unsigned long long>(report.target >> 20u), static_cast<unsigned long long>(vramDropped), vramDroppedBytes / 1048576.0);
@@ -517,6 +518,11 @@ std::optional<BufferAllocation> BufferPool::Take(std::size_t bytes, VkBufferUsag
     tier.retainedBytes -= result.allocationBytes;
     ++tier.hits;
     return result;
+}
+
+VkDeviceSize BufferPool::retentionBudget(const Tier& tier) const {
+    if ((&tier != &smallTier && &tier != &smallDeviceTier) || RuntimeSwitches::Set(RuntimeSwitch::NoLargerSmallPools)) return tier.budget;
+    return tier.budget * 4u;
 }
 
 void BufferPool::evictOldest(Tier& tier, std::vector<BufferAllocation>& evicted) {
@@ -622,15 +628,20 @@ void BufferPool::Put(const BufferAllocation& allocation) noexcept {
             auto dropped = allocation.allocationBytes;
             while (tier.slots != 0 && dropped < excess) {
                 evictOldest(tier, evicted);
+                ++tier.vramEvictions;
                 dropped += evicted.back().allocationBytes;
             }
             evicted.push_back(allocation);
             vramDropped += evicted.size();
             vramDroppedBytes += dropped;
-        } else if (allocation.allocationBytes > tier.budget) {
+        } else if (allocation.allocationBytes > retentionBudget(tier)) {
             evicted.push_back(allocation);
         } else {
-            while (tier.slots != 0 && (tier.retainedBytes + allocation.allocationBytes > tier.budget || tier.slots >= maxSlots)) evictOldest(tier, evicted);
+            const auto budget = retentionBudget(tier);
+            while (tier.slots != 0 && (tier.retainedBytes + allocation.allocationBytes > budget || tier.slots >= maxSlots)) {
+                ++(tier.retainedBytes + allocation.allocationBytes > budget ? tier.budgetEvictions : tier.slotEvictions);
+                evictOldest(tier, evicted);
+            }
             tier.free[{allocation.bytes, allocation.usage, allocation.properties}].push_back({allocation, ++clock, {}});
             ++tier.slots;
             tier.retainedBytes += allocation.allocationBytes;

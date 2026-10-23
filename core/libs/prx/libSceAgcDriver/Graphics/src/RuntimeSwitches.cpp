@@ -57,6 +57,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_NO_REFUSAL_MEMO",
     "APS5_NO_DISTINCT_WRITE_SCANS",
     "APS5_NO_COLLECT_HEAP",
+    "APS5_NO_LARGER_SMALL_POOLS",
 };
 
 struct Refusal {
