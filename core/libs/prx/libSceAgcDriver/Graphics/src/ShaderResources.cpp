@@ -1396,13 +1396,13 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     // batch that wrote them (~100 ms a frame on the GPU mutex). A new snapshot still reads guest
     // memory, storing them first. APS5_NO_SLICE_COPY=1 stores them for every lookup, as before.
     std::vector<PendingSlice> slices;
-    const bool sliceCopy = !disabled && source == nullptr && !clearThroughKeys && !depthCompare && !srgbExpand && IsBlockCompressed(resource.format) && resource.dccAddress == 0 && Recorder::Active() != nullptr && Recorder::ThreadLane() == 0 && !Recorder::InCompletion() && !RuntimeSwitches::Set(RuntimeSwitch::NoSliceCopy) && PendingStorageOverlaps(address, bytes, nullptr) && StorageTexture::PendingSlicesOf(resource, DescribeSurface(resource), slices);
-    const auto takeSlices = [&](Texture& texture) {
-        const bool taken = texture.CopyPendingSlices(slices);
-        if (!taken) StorageTexture::FlushPending(address, bytes, nullptr, "sampled texture");
-        reportSliceCopies(taken);
-        return taken;
-    };
+    bool sliceCopy = !disabled && generation != 0 && source == nullptr && !clearThroughKeys && !depthCompare && !srgbExpand && IsBlockCompressed(resource.format) && resource.dccAddress == 0 && Recorder::Active() != nullptr && Recorder::ThreadLane() == 0 && !Recorder::InCompletion() && !RuntimeSwitches::Set(RuntimeSwitch::NoSliceCopy) && PendingStorageOverlaps(address, bytes, nullptr) && StorageTexture::PendingSlicesOf(resource, DescribeSurface(resource), slices);
+    // Marked when recognized, not when first copied: the flip's store of small images (which skips
+    // marked ones) would otherwise stamp the surface every frame, so no lookup ever proves its
+    // snapshot by stamps and the first copy never comes (best111).
+    if (sliceCopy) {
+        for (const auto& slice : slices) slice.image->MarkSliceServed();
+    }
     const auto flushStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto observedKeys = keys.has_value() ? *keys : scanKeys();
     const bool stagedClear = source != nullptr && resource.dccAddress != 0 && (IsDccClear(observedKeys) || observedKeys == DccKeys::ClearSingle);
@@ -1467,6 +1467,28 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         return std::make_shared<Texture>(context, *context.detiler, resource, components, snapshot, depthCompare);
     }
     auto snapshotGeneration = generation;
+    // Slice copies serve only a cached snapshot proved current by write stamps alone: any read of
+    // the surface (a compare, a new snapshot) goes through the flush hook, which stores the pending
+    // slices after `generation` was collected and waits for their writer; the snapshot made then
+    // looks stale at the next lookup, whose compare stores the next slices, and so on every frame
+    // (best110). So everything else stores them first and collects again, as without slice copies.
+    // APS5_TRACE_SAMPLED_FLUSH: why a lookup with slices stored them instead of copying ([slice-store]).
+    const auto storeSlices = [&](const char* why) {
+        if (traceSampledFlush) std::fprintf(stderr, "[slice-store] 0x%llx: %s (%zu slices)\n", static_cast<unsigned long long>(address), why, slices.size());
+        StorageTexture::FlushPending(address, bytes, nullptr, "sampled texture");
+        generation = GuestMemory::CollectWrites(address, bytes);
+        snapshotGeneration = generation;
+        sliceCopy = false;
+        reportSliceCopies(false);
+    };
+    const auto takeSlices = [&](Texture& texture) {
+        if (texture.CopyPendingSlices(slices)) {
+            reportSliceCopies(true);
+            return true;
+        }
+        storeSlices("the texture cannot take copies");
+        return false;
+    };
     std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> committed;
     if (source == nullptr && generation == 0) {
         std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
@@ -1526,8 +1548,59 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 (same ? counters.untrackedKept : counters.untrackedCompared).fetch_add(1, std::memory_order_relaxed);
                 return same;
             };
+            // The slices' own GPU writes stamp the 64 KiB blocks they cover (the driver's MarkWritten,
+            // no CPU store), so stamps alone never prove the snapshot while slices are pending
+            // (best113: 7 of 141 blocks a frame, the current cubemap's). The snapshot holds when every
+            // block stamped since it was taken was stamped by the driver, not a CPU store, and lies
+            // under a pending slice the copy below replaces.
+            const auto onlySliceStamps = [&] {
+                const auto blocks = ((address + bytes + 0xffffu) >> 16u) - (address >> 16u);
+                std::vector<std::uint64_t> generations(blocks, it->generation);
+                std::vector<std::uint8_t> changed(blocks), cpu(blocks);
+                GuestMemory::ChangedBlocks(address, bytes, generations, changed, cpu);
+                for (std::size_t k = 0; k < blocks; ++k) {
+                    if (changed[k] == GuestMemory::BlockUnchanged) continue;
+                    if (cpu[k] != 0) return false;
+                    const auto begin = ((address >> 16u) + k) << 16u;
+                    const auto end = begin + 0x10000u;
+                    const bool underSlice = std::any_of(slices.begin(), slices.end(), [&](const PendingSlice& slice) {
+                        const auto sliceBegin = slice.image->Descriptor().baseAddress;
+                        return sliceBegin < end && begin < sliceBegin + slice.image->GuestBytes();
+                    });
+                    if (!underSlice) return false;
+                }
+                return true;
+            };
+            const bool sliceHit = sliceCopy && *keys == DccKeys::Uncompressed && it->generation != 0 && (unchanged() || onlySliceStamps());
+            if (sliceCopy && !sliceHit) {
+                if (traceSampledFlush && *keys == DccKeys::Uncompressed && it->generation != 0) {
+                    // Which 64 KiB tracker blocks moved since the snapshot, and whether a CPU store
+                    // (a collect) or the driver's own MarkWritten stamped them.
+                    const auto blocks = ((address + bytes + 0xffffu) >> 16u) - (address >> 16u);
+                    std::vector<std::uint64_t> generations(blocks, it->generation);
+                    std::vector<std::uint8_t> changed(blocks), cpu(blocks);
+                    GuestMemory::ChangedBlocks(address, bytes, generations, changed, cpu);
+                    std::size_t moved = 0, byCpu = 0;
+                    std::string first;
+                    const auto layerBytes = DescribeSurface(resource).layerBytes;
+                    for (std::size_t k = 0; k < blocks; ++k) {
+                        if (changed[k] == GuestMemory::BlockUnchanged) continue;
+                        ++moved;
+                        byCpu += cpu[k] != 0;
+                        if (moved <= 6) {
+                            const auto blockStart = ((address >> 16u) + k) << 16u;
+                            const auto offset = blockStart > address ? blockStart - address : 0u;
+                            char item[48];
+                            std::snprintf(item, sizeof(item), " +0x%llx(layer %llu%s)", static_cast<unsigned long long>(offset), static_cast<unsigned long long>(layerBytes != 0 ? offset / layerBytes : 0), cpu[k] != 0 ? " cpu" : "");
+                            first += item;
+                        }
+                    }
+                    std::fprintf(stderr, "[slice-store] 0x%llx: cached snapshot stamped since generation %llu: %zu of %llu blocks moved, %zu by CPU stores:%s\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(it->generation), moved, static_cast<unsigned long long>(blocks), byCpu, first.c_str());
+                }
+                storeSlices(*keys != DccKeys::Uncompressed ? "keys not uncompressed" : "cached snapshot stamped");
+            }
             // A slice copy the texture cannot take stores the slices instead: the snapshot is stale then.
-            if (((*keys != DccKeys::Uncompressed && *keys != DccKeys::ClearSingle) || unchanged() || kept() || equalsCommitted()) && (!sliceCopy || takeSlices(*it->texture))) {
+            if ((sliceHit || (*keys != DccKeys::Uncompressed && *keys != DccKeys::ClearSingle) || unchanged() || kept() || equalsCommitted()) && (!sliceCopy || takeSlices(*it->texture))) {
                 it->generation = snapshotGeneration;
                 it->committed = std::move(committed);
                 it->untracked = untracked;
@@ -1541,6 +1614,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         eraseTexture(cache, it);
         ++cache.counts.stale;
     }
+    if (sliceCopy) storeSlices("no current cached snapshot");
     const auto budgets = currentBudgets(context);
     const auto insert = [&](CachedTexture&& entry, const std::shared_ptr<Texture>& texture) {
         cache.bytes += entry.accounted;
@@ -1566,7 +1640,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 if (*keys != DccKeys::Uncompressed || GuestMemory::UnchangedSince(address, bytes, oneOff.generation)) return true;
                 return snapshotStillMatches(address, bytes, oneOff.hashes, generation != 0 ? oneOff.generation : 0, std::nullopt, SnapshotCompare::OneOff);
             };
-            if (texture != nullptr && oneOff.bytes == guestBytes && oneOff.keys == *keys && current() && (!sliceCopy || takeSlices(*texture))) {
+            if (texture != nullptr && oneOff.bytes == guestBytes && oneOff.keys == *keys && current()) {
                 ++cache.counts.oneOffReuses;
                 ++cache.totals.oneOffReuses;
                 if (oneOff.kept != nullptr) {

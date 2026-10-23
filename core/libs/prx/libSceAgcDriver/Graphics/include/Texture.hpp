@@ -374,7 +374,7 @@ public:
     // offset in its layer, or inside the layer's tail block for a tail level) and none is being
     // stored right now; false otherwise, or when none is pending.
     static bool PendingSlicesOf(const GuestTextureResource& surface, const SurfaceGeometry& geometry, std::vector<PendingSlice>& out);
-    // A slice of this image was copied into a sampled texture (Texture::CopyPendingSlices): the
+    // A sampled lookup recognized this image as a slice it copies (Texture::CopyPendingSlices): the
     // flip's store of small images (StoreSmallPending) leaves it pending, so the surface's guest
     // bytes stay unchanged and its snapshot valid. Readers of the memory still store it as before.
     void MarkSliceServed() { sliceServed.store(true, std::memory_order_relaxed); }
