@@ -51,6 +51,7 @@ enum class RuntimeSwitch : std::size_t {
     NoDepthIndex,
     NoDeferredDrawEviction,
     NoIncrementalBdaRanges,
+    NoReadOnlyLeaseSkip,
     Count,
 };
 
