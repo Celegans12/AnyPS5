@@ -345,6 +345,7 @@ public:
     // differ, and the hit refreshes its data buffers with the dispatch's words (RefreshData).
     static std::vector<std::uint32_t> ContentKey(const CompiledShader& shader, bool dataWords = true, bool movableBuffers = false);
     static void AppendContentKey(const CompiledShader& shader, bool dataWords, bool movableBuffers, std::vector<std::uint32_t>& key);
+    static void AppendContentKeyRoles(const CompiledShader& shader, bool dataWords, bool movableBuffers, std::vector<std::uint8_t>& roles);
     static bool DiffContentKeys(std::span<const std::uint32_t> previous, std::span<const std::uint32_t> key, bool draw, ContentKeyDiff& diff);
     // Records the shader's ShaderData and FlattenedSrt words into this object's data buffers
     // (vkCmdUpdateBuffer, a transfer write the caller's pre-dispatch barrier makes visible; a
@@ -358,6 +359,16 @@ public:
     void KeepStorageImageBytes(Recorder& recorder) const;
     const std::vector<std::uint64_t>& MultisampleSources() const { return multisampleSources; }
     static bool NeverReusable(std::span<const CompiledShader> shaders);
+    // Whether a stage with a BDA page table stores through guest addresses (its SPIR-V; cached).
+    static bool StagesStoreThroughAddresses(std::span<const CompiledShader> shaders);
+    // Whether every storing BDA stage stores only through an extended instruction taking a pointer.
+    static bool StagesStoreOnlyThroughExtInst(std::span<const CompiledShader> shaders);
+    // APS5_PROFILE_DRAW ([bda-template] line): what became of address-table draw builds under
+    // APS5_NO_BDA_TEMPLATES unset, by the first reason that kept one from being a template.
+    enum class TemplateOutcome : std::size_t { Storing, StoringExtOnly, StorageTable, CopiedWrites, Multisample, LoopGuard, DepthStorage, TableElement, RefreshedPerUse, DataSize, SpaceRegions, Serial, Shared, NotShared, Inserted, Count };
+    static const char* TemplateOutcomeName(TemplateOutcome outcome);
+    static std::array<std::uint64_t, static_cast<std::size_t>(TemplateOutcome::Count)> TemplateOutcomes();
+    static void CountTemplateOutcome(TemplateOutcome outcome);
     static std::uint64_t DepthGuardRefusals();
     static std::uint64_t GuestBufferBytes(const Context& context, std::span<const std::uint32_t> words);
     const std::vector<std::shared_ptr<Texture>>& SampledTextures() const { return textures; }
@@ -374,6 +385,11 @@ public:
     bool ReusesAddressSpace() const { return addressReuse; }
     std::shared_ptr<const void> BeginUse();
     void CompleteUse();
+    // Address-table template (APS5_NO_BDA_TEMPLATES unset): a read-only address-table draw build
+    // (no store through BDA, no written buffer or image, no GPU copies) that later draws may use
+    // while earlier uses are still in flight; each use takes its own descriptor set for changed data
+    // words or moved read-only buffers, and the template itself is never written after its build.
+    bool SharesUses() const;
     void EndUse() noexcept;
     // `shaders` are the stages the object was built from, in build order (a recorded draw's vertex
     // and fragment stages, or one compute stage): their bindings are walked like the build did.
@@ -725,6 +741,8 @@ private:
     std::vector<SamplerSource> samplerSources;
     bool reusable = false;
     bool addressReuse = false;
+    bool bdaTemplate = false;
+    bool sharedUses = false;
     bool reuseProved = false;
     std::shared_ptr<std::atomic<std::uint32_t>> usesInFlight = std::make_shared<std::atomic<std::uint32_t>>(0u);
     std::vector<std::pair<std::uint64_t, std::uint64_t>> addressWrites;
@@ -849,6 +867,11 @@ private:
     void indexTextures(decltype(entries)::iterator entry, bool add);
     std::size_t capacity = 0;
     bool fixedCapacity = false;
+    // Address-table builds (ReusesAddressSpace) have a bound of their own, so the other entries'
+    // churn (dispatch keys) does not evict them before the next frame draws them again, and they
+    // never displace the others: APS5_ADDRESS_TEMPLATE_ENTRIES (default 2048).
+    std::size_t addressEntries = 0;
+    std::size_t addressCapacity = 0;
     std::list<std::size_t> evictedOrder;
     std::unordered_map<std::size_t, decltype(evictedOrder)::iterator> evictedKeys;
     std::size_t evictionsSinceCheck = 0;

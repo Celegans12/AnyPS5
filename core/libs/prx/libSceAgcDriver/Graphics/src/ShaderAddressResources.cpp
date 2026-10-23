@@ -116,6 +116,61 @@ bool SpirvStoresThroughAddresses(std::span<const std::uint32_t> words) {
     return stores;
 }
 
+namespace {
+
+bool storesThroughPlainInstructions(std::span<const std::uint32_t> words) {
+    if (words.size() < 5 || words[0] != spv::MagicNumber) return true;
+    std::unordered_set<std::uint32_t> pointerTypes;
+    forEachInstruction(words, [&](std::uint32_t opcode, std::span<const std::uint32_t> instruction) {
+        if ((opcode == spv::OpTypePointer || opcode == spv::OpTypeUntypedPointerKHR) && instruction.size() > 2 && instruction[2] == spv::StorageClassPhysicalStorageBuffer) pointerTypes.insert(instruction[1]);
+    });
+    if (pointerTypes.empty()) return false;
+    std::unordered_set<std::uint32_t> pointers;
+    forEachInstruction(words, [&](std::uint32_t opcode, std::span<const std::uint32_t> instruction) {
+        if (instruction.size() > 2 && !definesNoPointerValue(opcode) && pointerTypes.contains(instruction[1])) pointers.insert(instruction[2]);
+    });
+    bool stores = false;
+    forEachInstruction(words, [&](std::uint32_t opcode, std::span<const std::uint32_t> instruction) {
+        const auto pointer = pointerOperandStored(opcode, instruction);
+        stores = stores || (pointer != 0 && pointers.contains(pointer));
+    });
+    return stores;
+}
+
+bool storesOnlyThroughExtInstCached(const ShaderRecompiler::SharedSpirv& spirv) {
+    static std::mutex mutex;
+    static std::map<std::pair<std::uint64_t, std::uint64_t>, bool> known;
+    const auto hash = spirv.ContentHash();
+    const std::pair key{hash.low, hash.high};
+    {
+        std::lock_guard lock(mutex);
+        if (const auto found = known.find(key); found != known.end()) return found->second;
+    }
+    const bool extOnly = storesThroughAddressesCached(spirv) && !storesThroughPlainInstructions(spirv.Words());
+    std::lock_guard lock(mutex);
+    known.emplace(key, extOnly);
+    return extOnly;
+}
+
+}
+
+bool ShaderResources::StagesStoreOnlyThroughExtInst(std::span<const CompiledShader> shaders) {
+    bool any = false;
+    for (const auto& shader : shaders) {
+        if (shader.program == nullptr || !std::any_of(shader.program->bindings.begin(), shader.program->bindings.end(), [](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable; })) continue;
+        if (!storesThroughAddressesCached(shader.program->spirv)) continue;
+        if (!storesOnlyThroughExtInstCached(shader.program->spirv)) return false;
+        any = true;
+    }
+    return any;
+}
+
+bool ShaderResources::StagesStoreThroughAddresses(std::span<const CompiledShader> shaders) {
+    return std::any_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) {
+        return shader.program != nullptr && std::any_of(shader.program->bindings.begin(), shader.program->bindings.end(), [](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable; }) && storesThroughAddressesCached(shader.program->spirv);
+    });
+}
+
 void ShaderResources::prepareAddressBindings(std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots) {
     static const bool loopGuarded = std::getenv("APS5_LOOP_GUARD") != nullptr;
     for (const auto& shader : shaders) {

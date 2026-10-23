@@ -918,6 +918,22 @@ void reportTextureCounters() {
     AgcDriver::ProfilePrint_nid_no_patch("[textures] sampled created: %llu from storage images, %llu snapshots (%llu snapshot reads over recorded writes inside cachedTexture, %llu storage-path fallbacks); stage-A records %llu: %llu fast hits, %llu full lookups; storage images %llu hits, %llu created, %llu own-object refreshes; image tables %llu reused, %llu resolved; untracked snapshots %llu kept by the write-watch hint, %llu compared\n", count(counters.fromStorage), count(counters.snapshots), count(counters.pendingReads), count(counters.storageFallbacks), count(counters.records), count(counters.fastHits), count(counters.fastMisses), count(counters.storageHits), count(counters.storageCreated), count(counters.ownRefreshes), count(counters.tablesReused), count(counters.tablesResolved), count(counters.untrackedKept), count(counters.untrackedCompared));
 }
 
+// APS5_PROFILE_DRAW: cachedTexture's slice copies (Texture::CopyPendingSlices), 10 s deltas: lookups
+// that took the pending slices by device copies, the slices copied, and lookups whose texture could
+// not take them (stored and re-read instead).
+void reportSliceCopies(bool taken) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static std::atomic<std::uint64_t> refused{0};
+    static std::atomic<long long> lastReport{0};
+    if (!taken) refused.fetch_add(1, std::memory_order_relaxed);
+    if (!profile) return;
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = lastReport.load();
+    if (nowMs - last < 10000 || !lastReport.compare_exchange_strong(last, nowMs)) return;
+    const auto counts = Texture::TakeSliceCopyCounts();
+    std::fprintf(stderr, "[slice-copy] (10 s): %llu lookups took pending slices by copies, %llu slices copied, %llu lookups stored them instead\n", static_cast<unsigned long long>(counts.lookups), static_cast<unsigned long long>(counts.copies), static_cast<unsigned long long>(refused.exchange(0, std::memory_order_relaxed)));
+}
+
 // What the sampled-texture lookups on this thread proved their returned objects current against,
 // taken by object into the ShaderResources being built or revalidated (captureValidation), which
 // then repeats the proof from write stamps on its next Revalidate. The lookups run inside one build
@@ -1297,10 +1313,20 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     const bool depthCopy = depthCompare && guestBytes >= DepthCopyMinBytes() && Texture::DepthCopyFormat(ResolveTextureFormat(resource.format)) != VK_FORMAT_UNDEFINED && resource.dimension != TextureDimension::k3D;
     const bool srgbExpand = !depthCompare && SrgbExpandsToRgba8(context, resource.format);
     auto source = StorageTexture::FindPending(address, guestBytes);
+    // APS5_TRACE_SAMPLED_FLUSH: why a surface with pending storage results is not served from them
+    // (the flush below then waits for the GPU under the mutex).
+    const auto pendingSource = source;
+    const char* dropReason = source == nullptr ? "no pending image covers it" : nullptr;
     const bool blockCopy = source != nullptr && !depthCompare && !srgbExpand && Texture::CanBlockCopyFrom(*source, resource);
     const bool repackCopy = source != nullptr && !depthCompare && Texture::CanRepackCopyFrom(*source, resource);
-    if (source != nullptr && !blockCopy && !repackCopy && (depthCompare ? !depthCopy || !Texture::CanDepthCopyFrom(*source, resource) : srgbExpand ? !Texture::CanSrgbExpandFrom(context, *source, resource) : !Texture::CanCopyFrom(*source, resource))) source.reset();
-    if (source != nullptr && MetadataMoved(*source, resource)) source.reset();
+    if (source != nullptr && !blockCopy && !repackCopy && (depthCompare ? !depthCopy || !Texture::CanDepthCopyFrom(*source, resource) : srgbExpand ? !Texture::CanSrgbExpandFrom(context, *source, resource) : !Texture::CanCopyFrom(*source, resource))) {
+        source.reset();
+        dropReason = depthCompare ? "no depth copy" : srgbExpand ? "no sRGB expand" : "no copy path (format/layout)";
+    }
+    if (source != nullptr && MetadataMoved(*source, resource)) {
+        source.reset();
+        dropReason = "metadata moved";
+    }
     std::optional<DccKeys> keys;
     bool clearThroughKeys = false;
     if (source != nullptr && resource.dccAddress != 0 && IsDccClear(source->FilledKeys())) {
@@ -1318,7 +1344,10 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             clearThroughKeys = true;
         }
     }
-    if (source != nullptr && resource.dccAddress != 0 && (keys.has_value() ? *keys : scanKeys()) == DccKeys::ClearSingle) source.reset();
+    if (source != nullptr && resource.dccAddress != 0 && (keys.has_value() ? *keys : scanKeys()) == DccKeys::ClearSingle) {
+        source.reset();
+        dropReason = "single-colour DCC clear";
+    }
 
     // Otherwise a surface in host-imported memory is viewed through its cached storage image (made
     // here when there is none): its refresh after a CPU or GPU write is a GPU-direct detile from the
@@ -1360,12 +1389,47 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     // Results stored to guest memory just now are stamped newer than `generation`; a snapshot read
     // after them is current at the generation of a second (memoized) collect. The store marks the
     // surface's DCC keys uncompressed, so the keys are read after it.
+    // A block-compressed surface the title compresses on the GPU one layer's level at a time, each
+    // into a storage image of the block's texel format (Yotei's reflection probes, BC6H through
+    // R32G32B32A32_UINT): a cached snapshot takes those results by device copies below
+    // (Texture::CopyPendingSlices) instead of a store and a re-read, which waited for the open
+    // batch that wrote them (~100 ms a frame on the GPU mutex). A new snapshot still reads guest
+    // memory, storing them first. APS5_NO_SLICE_COPY=1 stores them for every lookup, as before.
+    std::vector<PendingSlice> slices;
+    bool sliceCopy = !disabled && generation != 0 && source == nullptr && !clearThroughKeys && !depthCompare && !srgbExpand && IsBlockCompressed(resource.format) && resource.dccAddress == 0 && Recorder::Active() != nullptr && Recorder::ThreadLane() == 0 && !Recorder::InCompletion() && !RuntimeSwitches::Set(RuntimeSwitch::NoSliceCopy) && PendingStorageOverlaps(address, bytes, nullptr) && StorageTexture::PendingSlicesOf(resource, DescribeSurface(resource), slices);
+    // Marked when recognized, not when first copied: the flip's store of small images (which skips
+    // marked ones) would otherwise stamp the surface every frame, so no lookup ever proves its
+    // snapshot by stamps and the first copy never comes (best111).
+    if (sliceCopy) {
+        for (const auto& slice : slices) slice.image->MarkSliceServed();
+    }
     const auto flushStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto observedKeys = keys.has_value() ? *keys : scanKeys();
     const bool stagedClear = source != nullptr && resource.dccAddress != 0 && (IsDccClear(observedKeys) || observedKeys == DccKeys::ClearSingle);
     bool stagedFlushed = false;
-    if ((source == nullptr || stagedClear) && !clearThroughKeys && StorageTexture::FlushPending(address, bytes, nullptr, "sampled texture")) {
+    static const bool traceSampledFlush = std::getenv("APS5_TRACE_SAMPLED_FLUSH") != nullptr;
+    const auto traceStart = traceSampledFlush ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    if ((source == nullptr || stagedClear) && !clearThroughKeys && !sliceCopy && StorageTexture::FlushPending(address, bytes, nullptr, "sampled texture")) {
         if (profile) LookupOutcomes::Add(LookupOutcomes::PendingFlush, flushStart);
+        if (traceSampledFlush) {
+            const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - traceStart).count();
+            char image[160] = "none";
+            if (pendingSource != nullptr) {
+                const auto& d = pendingSource->Descriptor();
+                std::snprintf(image, sizeof(image), "0x%llx %ux%u fmt %u tile %d mips %u", static_cast<unsigned long long>(d.baseAddress), d.width, d.height, d.format, static_cast<int>(d.tileMode), d.mipCount);
+            }
+            static std::uint64_t describedAddress = 0;
+            if (describedAddress != resource.baseAddress) {
+                describedAddress = resource.baseAddress;
+                const auto geometry = DescribeSurface(resource);
+                std::fprintf(stderr, "[sampled-flush] geometry 0x%llx: layers %u imageLayers %u layerBytes 0x%llx guestBytes 0x%llx thick %d dim %d array %u\n", static_cast<unsigned long long>(resource.baseAddress), geometry.layers, geometry.imageLayers, static_cast<unsigned long long>(geometry.layerBytes), static_cast<unsigned long long>(geometry.guestBytes), geometry.thick ? 1 : 0, static_cast<int>(resource.dimension), resource.depthOrLastArray);
+                for (std::size_t level = 0; level < geometry.mips.size(); ++level) {
+                    const auto& m = geometry.mips[level];
+                    std::fprintf(stderr, "[sampled-flush]   mip %zu: %ux%u tiled 0x%llx+0x%llx tail %d (%u,%u) blocksPerRow %u\n", level, m.width, m.height, static_cast<unsigned long long>(m.tiledOffset), static_cast<unsigned long long>(m.tiledSize), m.tail ? 1 : 0, m.tailX, m.tailY, m.blocksPerRow);
+                }
+            }
+            std::fprintf(stderr, "[sampled-flush] %.1f ms: 0x%llx %ux%u fmt %u tile %d mips %u%s; reason: %s; pending image: %s\n", ms, static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, static_cast<int>(resource.tileMode), resource.mipCount, depthCompare ? " depth-compare" : "", stagedClear ? "staged DCC clear" : dropReason != nullptr ? dropReason : "a storage image lookup found none (not eligible / keys not uncompressed)", image);
+        }
         generation = GuestMemory::CollectWrites(address, bytes);
         if (stagedClear) {
             stagedFlushed = true;
@@ -1403,6 +1467,28 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         return std::make_shared<Texture>(context, *context.detiler, resource, components, snapshot, depthCompare);
     }
     auto snapshotGeneration = generation;
+    // Slice copies serve only a cached snapshot proved current by write stamps alone: any read of
+    // the surface (a compare, a new snapshot) goes through the flush hook, which stores the pending
+    // slices after `generation` was collected and waits for their writer; the snapshot made then
+    // looks stale at the next lookup, whose compare stores the next slices, and so on every frame
+    // (best110). So everything else stores them first and collects again, as without slice copies.
+    // APS5_TRACE_SAMPLED_FLUSH: why a lookup with slices stored them instead of copying ([slice-store]).
+    const auto storeSlices = [&](const char* why) {
+        if (traceSampledFlush) std::fprintf(stderr, "[slice-store] 0x%llx: %s (%zu slices)\n", static_cast<unsigned long long>(address), why, slices.size());
+        StorageTexture::FlushPending(address, bytes, nullptr, "sampled texture");
+        generation = GuestMemory::CollectWrites(address, bytes);
+        snapshotGeneration = generation;
+        sliceCopy = false;
+        reportSliceCopies(false);
+    };
+    const auto takeSlices = [&](Texture& texture) {
+        if (texture.CopyPendingSlices(slices)) {
+            reportSliceCopies(true);
+            return true;
+        }
+        storeSlices("the texture cannot take copies");
+        return false;
+    };
     std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> committed;
     if (source == nullptr && generation == 0) {
         std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
@@ -1462,7 +1548,59 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 (same ? counters.untrackedKept : counters.untrackedCompared).fetch_add(1, std::memory_order_relaxed);
                 return same;
             };
-            if ((*keys != DccKeys::Uncompressed && *keys != DccKeys::ClearSingle) || unchanged() || kept() || equalsCommitted()) {
+            // The slices' own GPU writes stamp the 64 KiB blocks they cover (the driver's MarkWritten,
+            // no CPU store), so stamps alone never prove the snapshot while slices are pending
+            // (best113: 7 of 141 blocks a frame, the current cubemap's). The snapshot holds when every
+            // block stamped since it was taken was stamped by the driver, not a CPU store, and lies
+            // under a pending slice the copy below replaces.
+            const auto onlySliceStamps = [&] {
+                const auto blocks = ((address + bytes + 0xffffu) >> 16u) - (address >> 16u);
+                std::vector<std::uint64_t> generations(blocks, it->generation);
+                std::vector<std::uint8_t> changed(blocks), cpu(blocks);
+                GuestMemory::ChangedBlocks(address, bytes, generations, changed, cpu);
+                for (std::size_t k = 0; k < blocks; ++k) {
+                    if (changed[k] == GuestMemory::BlockUnchanged) continue;
+                    if (cpu[k] != 0) return false;
+                    const auto begin = ((address >> 16u) + k) << 16u;
+                    const auto end = begin + 0x10000u;
+                    const bool underSlice = std::any_of(slices.begin(), slices.end(), [&](const PendingSlice& slice) {
+                        const auto sliceBegin = slice.image->Descriptor().baseAddress;
+                        return sliceBegin < end && begin < sliceBegin + slice.image->GuestBytes();
+                    });
+                    if (!underSlice) return false;
+                }
+                return true;
+            };
+            const bool sliceHit = sliceCopy && *keys == DccKeys::Uncompressed && it->generation != 0 && (unchanged() || onlySliceStamps());
+            if (sliceCopy && !sliceHit) {
+                if (traceSampledFlush && *keys == DccKeys::Uncompressed && it->generation != 0) {
+                    // Which 64 KiB tracker blocks moved since the snapshot, and whether a CPU store
+                    // (a collect) or the driver's own MarkWritten stamped them.
+                    const auto blocks = ((address + bytes + 0xffffu) >> 16u) - (address >> 16u);
+                    std::vector<std::uint64_t> generations(blocks, it->generation);
+                    std::vector<std::uint8_t> changed(blocks), cpu(blocks);
+                    GuestMemory::ChangedBlocks(address, bytes, generations, changed, cpu);
+                    std::size_t moved = 0, byCpu = 0;
+                    std::string first;
+                    const auto layerBytes = DescribeSurface(resource).layerBytes;
+                    for (std::size_t k = 0; k < blocks; ++k) {
+                        if (changed[k] == GuestMemory::BlockUnchanged) continue;
+                        ++moved;
+                        byCpu += cpu[k] != 0;
+                        if (moved <= 6) {
+                            const auto blockStart = ((address >> 16u) + k) << 16u;
+                            const auto offset = blockStart > address ? blockStart - address : 0u;
+                            char item[48];
+                            std::snprintf(item, sizeof(item), " +0x%llx(layer %llu%s)", static_cast<unsigned long long>(offset), static_cast<unsigned long long>(layerBytes != 0 ? offset / layerBytes : 0), cpu[k] != 0 ? " cpu" : "");
+                            first += item;
+                        }
+                    }
+                    std::fprintf(stderr, "[slice-store] 0x%llx: cached snapshot stamped since generation %llu: %zu of %llu blocks moved, %zu by CPU stores:%s\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(it->generation), moved, static_cast<unsigned long long>(blocks), byCpu, first.c_str());
+                }
+                storeSlices(*keys != DccKeys::Uncompressed ? "keys not uncompressed" : "cached snapshot stamped");
+            }
+            // A slice copy the texture cannot take stores the slices instead: the snapshot is stale then.
+            if ((sliceHit || (*keys != DccKeys::Uncompressed && *keys != DccKeys::ClearSingle) || unchanged() || kept() || equalsCommitted()) && (!sliceCopy || takeSlices(*it->texture))) {
                 it->generation = snapshotGeneration;
                 it->committed = std::move(committed);
                 it->untracked = untracked;
@@ -1476,6 +1614,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         eraseTexture(cache, it);
         ++cache.counts.stale;
     }
+    if (sliceCopy) storeSlices("no current cached snapshot");
     const auto budgets = currentBudgets(context);
     const auto insert = [&](CachedTexture&& entry, const std::shared_ptr<Texture>& texture) {
         cache.bytes += entry.accounted;
@@ -3389,6 +3528,13 @@ bool AddressReuseEnabled() {
     return enabled;
 }
 
+// APS5_NO_BDA_TEMPLATES=1 (an APS5_AB switch): read-only address-table draw builds are cached only
+// by #6636's whole-build reuse (APS5_NO_ADDRESS_DRAW_REUSE unset), as before; else they are
+// templates (SharesUses, SnapshotsServed, per-use descriptor sets for changed data words).
+bool BdaTemplatesOn() {
+    return !RuntimeSwitches::Set(RuntimeSwitch::NoBdaTemplates);
+}
+
 void CompleteSnapshotWrites(std::span<const GuestMemorySnapshot> snapshots) {
     auto* recorder = Recorder::Active();
     if (recorder == nullptr || Recorder::InCompletion()) return;
@@ -3408,15 +3554,25 @@ void ShaderResources::noteReusable() {
     addressReuse = false;
     directRegions.clear();
     addressWrites.clear();
-    if (storageTableBindings[0] != std::numeric_limits<std::size_t>::max() || storageTableBindings[1] != std::numeric_limits<std::size_t>::max()) return;
-    const bool addressBased = usesBda && drawBuild && AddressReuseEnabled();
-    if (guestMemory.HasCopiedWrites() || (!addressBased && (HoldsLease() || usesBda)) || !multisampleSources.empty() || (bda != nullptr && LoopGuardEnabled())) return;
-    if (std::any_of(storageTextures.begin(), storageTextures.end(), [](const auto& texture) { return texture != nullptr && DepthSurfaceAt(texture->Descriptor().baseAddress); })) return;
-    if (addressBased && std::any_of(tableStages.begin(), tableStages.end(), [](const TableStage& table) { return std::find(table.elementTextures.begin(), table.elementTextures.end(), std::numeric_limits<std::size_t>::max()) != table.elementTextures.end(); })) return;
-    if (std::any_of(textures.begin(), textures.end(), [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->RefreshedPerUse(); })) return;
-    if (TemplateDataRefresh() && std::any_of(allocations.begin(), allocations.end(), [](const Allocation& allocation) { return allocation.buffer != nullptr && !allocation.guest && allocation.role != ShaderRecompiler::DescriptorRole::ImageTableMap && allocation.size > MaxRefreshBytes; })) return;
+    static const bool profileTemplates = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    const bool candidate = profileTemplates && usesBda && drawBuild && bdaReadOnly && BdaTemplatesOn();
+    const auto refuse = [&](TemplateOutcome outcome) {
+        if (candidate) CountTemplateOutcome(outcome);
+    };
+    bdaTemplate = false;
+    sharedUses = false;
+    if (storageTableBindings[0] != std::numeric_limits<std::size_t>::max() || storageTableBindings[1] != std::numeric_limits<std::size_t>::max()) return refuse(TemplateOutcome::StorageTable);
+    const bool templated = usesBda && drawBuild && bdaReadOnly && BdaTemplatesOn();
+    const bool addressBased = usesBda && drawBuild && (AddressReuseEnabled() || templated);
+    if (guestMemory.HasCopiedWrites()) return refuse(TemplateOutcome::CopiedWrites);
+    if ((!addressBased && (HoldsLease() || usesBda)) || (bda != nullptr && LoopGuardEnabled())) return refuse(TemplateOutcome::LoopGuard);
+    if (!multisampleSources.empty()) return refuse(TemplateOutcome::Multisample);
+    if (std::any_of(storageTextures.begin(), storageTextures.end(), [](const auto& texture) { return texture != nullptr && DepthSurfaceAt(texture->Descriptor().baseAddress); })) return refuse(TemplateOutcome::DepthStorage);
+    if (addressBased && std::any_of(tableStages.begin(), tableStages.end(), [](const TableStage& table) { return std::find(table.elementTextures.begin(), table.elementTextures.end(), std::numeric_limits<std::size_t>::max()) != table.elementTextures.end(); })) return refuse(TemplateOutcome::TableElement);
+    if (std::any_of(textures.begin(), textures.end(), [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->RefreshedPerUse(); })) return refuse(TemplateOutcome::RefreshedPerUse);
+    if (TemplateDataRefresh() && std::any_of(allocations.begin(), allocations.end(), [](const Allocation& allocation) { return allocation.buffer != nullptr && !allocation.guest && allocation.role != ShaderRecompiler::DescriptorRole::ImageTableMap && allocation.size > MaxRefreshBytes; })) return refuse(TemplateOutcome::DataSize);
     const auto regions = addressBased ? guestMemory.SpaceRegions() : guestMemory.DirectRegions();
-    if (!regions.has_value()) return;
+    if (!regions.has_value()) return refuse(TemplateOutcome::SpaceRegions);
     for (const auto& [begin, end] : *regions) {
         // No reconcile here: the upload just took these imports, and the set is about to be recorded
         // against them.
@@ -3424,7 +3580,10 @@ void ShaderResources::noteReusable() {
         // Read-only image mirrors (exe ranges) are as stable as imports; their serials have the top
         // bit set, so the two spaces never collide.
         if (serial == 0) serial = ImageMirrorSerial(context, begin, static_cast<std::size_t>(end - begin));
-        if (serial == 0) return;
+        if (serial == 0) {
+            directRegions.clear();
+            return refuse(TemplateOutcome::Serial);
+        }
         directRegions.push_back({begin, end, serial});
     }
     for (const auto& cut : guestMemory.CutRegions()) {
@@ -3437,6 +3596,49 @@ void ShaderResources::noteReusable() {
     if (addressBased) addressWrites = guestMemory.DirectWrites();
     reusable = true;
     addressReuse = addressBased;
+    bdaTemplate = templated;
+    sharedUses = templated && addressWrites.empty() && guestMemory.Writes().empty() && !guestMemory.HasGpuCopies() && !guestMemory.HasCopiedWrites() && std::none_of(storageWritten.begin(), storageWritten.end(), [](bool written) { return written; });
+    refuse(sharedUses ? TemplateOutcome::Shared : TemplateOutcome::NotShared);
+}
+
+namespace {
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ShaderResources::TemplateOutcome::Count)> templateOutcomes{};
+}
+
+void ShaderResources::CountTemplateOutcome(TemplateOutcome outcome) {
+    templateOutcomes[static_cast<std::size_t>(outcome)].fetch_add(1, std::memory_order_relaxed);
+}
+
+std::array<std::uint64_t, static_cast<std::size_t>(ShaderResources::TemplateOutcome::Count)> ShaderResources::TemplateOutcomes() {
+    std::array<std::uint64_t, static_cast<std::size_t>(TemplateOutcome::Count)> result{};
+    for (std::size_t index = 0; index < result.size(); ++index) result[index] = templateOutcomes[index].load(std::memory_order_relaxed);
+    return result;
+}
+
+const char* ShaderResources::TemplateOutcomeName(TemplateOutcome outcome) {
+    switch (outcome) {
+        case TemplateOutcome::Storing: return "draws storing through BDA";
+        case TemplateOutcome::StoringExtOnly: return "of them only through extended instructions";
+        case TemplateOutcome::StorageTable: return "storage image table";
+        case TemplateOutcome::CopiedWrites: return "copied writes";
+        case TemplateOutcome::Multisample: return "multisample source";
+        case TemplateOutcome::LoopGuard: return "loop guard";
+        case TemplateOutcome::DepthStorage: return "depth storage image";
+        case TemplateOutcome::TableElement: return "rejected table element";
+        case TemplateOutcome::RefreshedPerUse: return "texture refreshed per use";
+        case TemplateOutcome::DataSize: return "data buffer too big";
+        case TemplateOutcome::SpaceRegions: return "regions copied per build";
+        case TemplateOutcome::Serial: return "region without import serial";
+        case TemplateOutcome::Shared: return "templates";
+        case TemplateOutcome::NotShared: return "templates one use at a time";
+        case TemplateOutcome::Inserted: return "inserted";
+        case TemplateOutcome::Count: break;
+    }
+    return "?";
+}
+
+bool ShaderResources::SharesUses() const {
+    return sharedUses && BdaTemplatesOn();
 }
 
 std::uint64_t ShaderResources::DepthGuardRefusals() {
@@ -3446,9 +3648,11 @@ std::uint64_t ShaderResources::DepthGuardRefusals() {
 bool ShaderResources::NeverReusable(std::span<const CompiledShader> shaders) {
     const bool loopGuard = LoopGuardEnabled();
     const bool addressReuse = AddressReuseEnabled();
-    return std::any_of(shaders.begin(), shaders.end(), [loopGuard, addressReuse](const CompiledShader& shader) {
+    const bool never = std::any_of(shaders.begin(), shaders.end(), [loopGuard, addressReuse](const CompiledShader& shader) {
         return shader.program != nullptr && std::any_of(shader.program->bindings.begin(), shader.program->bindings.end(), [loopGuard, addressReuse](const ShaderRecompiler::DescriptorBinding& binding) { return (binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable && !addressReuse) || (loopGuard && binding.role == ShaderRecompiler::DescriptorRole::FaultBuffer); });
     });
+    if (!never || addressReuse || loopGuard || !BdaTemplatesOn()) return never;
+    return StagesStoreThroughAddresses(shaders);
 }
 
 // APS5_PROFILE_DRAW: the per-device descriptor caches' counters, every 10 s.
@@ -3519,6 +3723,72 @@ void VisitContentKey(const CompiledShader& shader, bool dataWords, bool movableB
     }
 }
 
+template<typename TVisitor>
+void VisitContentKeyTagged(const CompiledShader& shader, bool dataWords, bool movableBuffers, const TVisitor& tagged) {
+    std::uint8_t role = 0;
+    const auto visit = [&](std::uint32_t word) { tagged(word, role); };
+    Require(shader.program != nullptr, "missing compiled shader");
+    const auto& program = *shader.program;
+    visit(program.hasGuardedUnnormalizedWrap ? 1u : 0u);
+    visit(ShaderRecompiler::UnnormalizedWrapEnabled() ? 1u : 0u);
+    visit(dataWords ? 1u : 0u);
+    visit(static_cast<std::uint32_t>(shader.stage));
+    role = 1;
+    visit(static_cast<std::uint32_t>(program.PipelineVariantId()));
+    visit(static_cast<std::uint32_t>(program.PipelineVariantId() >> 32u));
+    role = 2;
+    visit(static_cast<std::uint32_t>(program.bindings.size()));
+    const auto packBits = [&](const ShaderRecompiler::ElementFlags& bits) {
+        role = 7;
+        visit(static_cast<std::uint32_t>(bits.size()));
+        std::uint32_t word = 0;
+        for (std::size_t i = 0; i < bits.size(); ++i) {
+            if (bits[i]) word |= 1u << (i % 32u);
+            if (i % 32u == 31u || i + 1 == bits.size()) {
+                visit(word);
+                word = 0;
+            }
+        }
+    };
+    for (const auto& binding : program.bindings) {
+        role = 2;
+        for (const auto word : {static_cast<std::uint32_t>(binding.kind), static_cast<std::uint32_t>(binding.role), binding.descriptorSet, binding.binding, binding.count, binding.readOnly ? 1u : 0u, binding.imageShape.has_value() ? static_cast<std::uint32_t>(*binding.imageShape) + 1u : 0u, static_cast<std::uint32_t>(binding.guestDescriptor.size())}) visit(word);
+        if (movableBuffers && binding.role == ShaderRecompiler::DescriptorRole::GuestBuffers && binding.guestDescriptor.size() == static_cast<std::size_t>(binding.count) * 4u) {
+            for (std::uint32_t element = 0; element < binding.count; ++element) {
+                const auto* words = binding.guestDescriptor.data() + static_cast<std::size_t>(element) * 4u;
+                const bool written = element >= binding.bufferWritten.size() || binding.bufferWritten[element];
+                const bool empty = words[2] == 0 || (words[0] == 0 && (words[1] & 0xffffu) == 0);
+                role = 5;
+                if (written || empty) { for (std::uint32_t index = 0; index < 4u; ++index) visit(words[index]); }
+                else { for (const auto word : {0u, words[1] & 0xffff0000u, 0u, words[3]}) visit(word); }
+            }
+        } else if ((dataWords && !movableBuffers) || !DataRole(binding.role)) {
+            for (std::size_t index = 0; index < binding.guestDescriptor.size(); ++index) {
+                role = DataRole(binding.role) ? 5 : (index % 8u < 2u ? 3 : 4);
+                visit(binding.guestDescriptor[index]);
+            }
+        }
+        packBits(binding.imageWritten);
+        packBits(binding.samplerDepthCompare);
+        packBits(binding.imageDepthCompare);
+        packBits(binding.imageAtomic);
+        packBits(binding.samplerUnnormalized);
+        packBits(binding.samplerIntegerBorder);
+        packBits(binding.samplerCoordinatesIgnored);
+        packBits(binding.imageUnnormalized);
+        packBits(binding.imageUnnormalizedBaseLevel);
+        // Read-only elements are bound without a write set: an object built for one written set
+        // must not serve a build with another (the variant implies it, this makes it explicit).
+        packBits(binding.bufferWritten);
+        role = 6;
+        visit(static_cast<std::uint32_t>(binding.imageSamplers.size()));
+        for (const auto sampler : binding.imageSamplers) visit(sampler);
+        role = 2;
+        visit(static_cast<std::uint32_t>(binding.imageShapes.size()));
+        for (const auto shape : binding.imageShapes) visit(static_cast<std::uint32_t>(shape));
+    }
+}
+
 std::vector<std::uint32_t> ShaderResources::ContentKey(const CompiledShader& shader, bool dataWords, bool movableBuffers) {
     std::vector<std::uint32_t> key;
     AppendContentKey(shader, dataWords, movableBuffers, key);
@@ -3541,6 +3811,13 @@ void ShaderResources::AppendContentKey(const CompiledShader& shader, bool dataWo
     }
     key.reserve(words);
     VisitContentKey(shader, dataWords, movableBuffers, [&](std::uint32_t word) { key.push_back(word); });
+}
+
+// Debug (local, APS5_RESKEY_DIFF): the role of every word AppendContentKey appends, in the same order: 0 header,
+// 1 pipeline variant id, 2 binding layout, 3 image/sampler descriptor address words, 4 other image/sampler descriptor
+// words, 5 buffer descriptor words, 6 sampler indices, 7 flag bits.
+void ShaderResources::AppendContentKeyRoles(const CompiledShader& shader, bool dataWords, bool movableBuffers, std::vector<std::uint8_t>& roles) {
+    VisitContentKeyTagged(shader, dataWords, movableBuffers, [&](std::uint32_t, std::uint8_t role) { roles.push_back(role); });
 }
 
 namespace {
@@ -4254,9 +4531,13 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     auto& outcome = report != nullptr ? *report : proof;
     outcome = {ProofPath::Full, ProofFailure::Other};
     if (!reusable) return refuse(AddressReuse::NotReusable);
-    if (InUse()) return refuse(AddressReuse::InUse);
-    CompleteSnapshotWrites(snapshots);
-    if (!guestMemory.SameSnapshots(snapshots)) return refuse(AddressReuse::Snapshots);
+    const bool shared = SharesUses();
+    if (bdaTemplate && !BdaTemplatesOn()) return refuse(AddressReuse::NotReusable);
+    if (!shared && InUse()) return refuse(AddressReuse::InUse);
+    if (!bdaTemplate) {
+        CompleteSnapshotWrites(snapshots);
+        if (!guestMemory.SameSnapshots(snapshots)) return refuse(AddressReuse::Snapshots);
+    }
     struct Suspend {
         GuestBufferMemory& memory;
         bool armed = true;
@@ -4266,6 +4547,10 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     } suspend{guestMemory};
     try {
         if (!guestMemory.ResumeSpace()) return refuse(AddressReuse::Space);
+        if (bdaTemplate) {
+            CompleteSnapshotWrites(snapshots);
+            if (!guestMemory.SnapshotsServed(snapshots)) return refuse(AddressReuse::Snapshots);
+        }
         if (!proveBuild(shaders, &outcome)) return refuse(outcome.failure == ProofFailure::Imports ? AddressReuse::Imports : AddressReuse::Proof);
         if (!guestMemory.SpaceImportsCurrent()) {
             outcome.failure = ProofFailure::Imports;
@@ -4277,6 +4562,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     }
     suspend.armed = false;
     reuseProved = true;
+    if (shared && InUse()) CountSharedAddressUse();
     return true;
 }
 
@@ -4838,6 +5124,7 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
         return;
     }
     resources->PinTextures(true);
+    if (resources->ReusesAddressSpace()) ++addressEntries;
     entries.emplace_front(key, std::move(resources));
     index.emplace(key, entries.begin());
     indexTextures(entries.begin(), true);
@@ -4847,10 +5134,19 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
         fixedCapacity = parsed != 0;
         capacity = fixedCapacity ? static_cast<std::size_t>(parsed) : baseEntries;
     }
+    if (addressCapacity == 0) {
+        const char* value = std::getenv("APS5_ADDRESS_TEMPLATE_ENTRIES");
+        const auto parsed = value ? std::strtoull(value, nullptr, 10) : 0ull;
+        addressCapacity = parsed != 0 ? static_cast<std::size_t>(parsed) : 2048u;
+    }
     noteUse(key);
-    while (entries.size() > capacity) {
-        noteEvicted(entries.back().first);
-        drop(std::prev(entries.end()), evicted);
+    while (entries.size() - addressEntries > capacity || addressEntries > addressCapacity) {
+        const bool address = addressEntries > addressCapacity;
+        auto victim = std::prev(entries.end());
+        while (victim != entries.begin() && victim->second->ReusesAddressSpace() != address) --victim;
+        if (victim->second->ReusesAddressSpace() != address) break;
+        noteEvicted(victim->first);
+        drop(victim, evicted);
     }
     if (entries.front().second->TableElements() == 0) return;
     std::uint64_t tables = 0;
@@ -4925,6 +5221,7 @@ void ResourceCache::indexTextures(decltype(entries)::iterator entry, bool add) {
 
 void ResourceCache::drop(std::list<std::pair<Key, std::shared_ptr<ShaderResources>>>::iterator entry, std::vector<std::shared_ptr<ShaderResources>>* evicted) {
     entry->second->PinTextures(false);
+    if (entry->second->ReusesAddressSpace()) --addressEntries;
     indexTextures(entry, false);
     index.erase(entry->first);
     if (evicted != nullptr) evicted->push_back(std::move(entry->second));
@@ -4955,6 +5252,7 @@ void ResourceCache::Clear() {
     textureIndex.clear();
     index.clear();
     entries.clear();
+    addressEntries = 0;
     evictedKeys.clear();
     evictedOrder.clear();
     evictionsSinceCheck = 0;
@@ -6447,7 +6745,7 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
             }
         }
     }
-    if (usesBda && !moved.empty()) return std::nullopt;
+    if (usesBda && !moved.empty() && !(bdaTemplate && BdaTemplatesOn())) return std::nullopt;
     return moved;
 }
 
@@ -6524,7 +6822,12 @@ std::size_t ShaderResources::DrawUploadLimit() {
 }
 
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly) const {
-    if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return {};
+    if (_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) return {};
+    if (usesBda) {
+        if (!bdaTemplate || moved.empty()) return {};
+        movedOnly = true;
+        CountPerUseAddressSet();
+    }
     thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* readsSlot = nullptr;
     auto& reads = ShaderRecompiler::ThreadOwned(readsSlot);
     guestMemory.InPlaceReads(reads);

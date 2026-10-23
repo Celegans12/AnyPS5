@@ -29,6 +29,15 @@ class CommandBatch;
 class StorageTexture;
 struct HostImport;
 
+// A pending storage image holding one level of one array layer of a block-compressed surface, in
+// the block's texel format (a title compressing on the GPU: Yotei's reflection probes write BC6H
+// blocks through R32G32B32A32_UINT images, one per cube face and level), and where in the surface.
+struct PendingSlice {
+    std::shared_ptr<StorageTexture> image;
+    std::uint32_t layer;
+    std::uint32_t level;
+};
+
 // The Vulkan format storage images of a guest format use (sRGB formats store as their UNORM form).
 // Throws when the format has no storage form; the query is cached per format (a lookup cost a
 // vkGetPhysicalDeviceFormatProperties call before).
@@ -102,6 +111,17 @@ public:
     static bool CanRepackCopyFrom(const StorageTexture& source, const GuestTextureResource& descriptor);
     bool IsDepthCopy() const { return perUseCopy == PerUseCopy::RefreshedOnReuse; }
     bool RefreshDepthCopy();
+    // Copies the pending slices this snapshot has not taken yet (another image, or a newer version
+    // than its last copy) into their layer and level on the device, recorded into the active
+    // recorder behind their writers, so the sampler sees the results without a store to guest
+    // memory and a re-read. False, copying nothing, when the texture cannot take them (not a
+    // device snapshot in the shader-read layout, no recorder).
+    bool CopyPendingSlices(std::span<const PendingSlice> slices);
+    struct SliceCopyCounts {
+        std::uint64_t lookups;
+        std::uint64_t copies;
+    };
+    static SliceCopyCounts TakeSliceCopyCounts();
     struct DepthCopyCounts {
         std::uint64_t textures;
         std::uint64_t refreshes;
@@ -210,6 +230,14 @@ private:
     VkFormat blockFormat = VK_FORMAT_UNDEFINED;
     bool repackCopy = false;
     std::uint32_t copyWidth = 0, copyHeight = 0, copyLevels = 0, copyLayers = 0, copyElementBytes = 0;
+    // CopyPendingSlices: the image and version each copied slice came from.
+    struct SliceCopy {
+        std::uint32_t layer;
+        std::uint32_t level;
+        std::weak_ptr<StorageTexture> image;
+        std::uint64_t version;
+    };
+    std::vector<SliceCopy> sliceCopies;
 };
 
 VkFormat AttachmentProxyFormat(const Context& context, VkFormat format);
@@ -341,6 +369,15 @@ public:
     // (Texture::CanCopyFrom, ResidentPresentable).
     static std::shared_ptr<StorageTexture> FindPending(std::uint64_t address, std::uint64_t bytes);
     static std::shared_ptr<StorageTexture> FindPendingSlice(std::uint64_t address, std::uint64_t bytes);
+    // Every image with results pending over the block-compressed `surface`, when each one is a
+    // PendingSlice of it (same tile mode and swizzle, the level's extent in blocks, at the level's
+    // offset in its layer, or inside the layer's tail block for a tail level) and none is being
+    // stored right now; false otherwise, or when none is pending.
+    static bool PendingSlicesOf(const GuestTextureResource& surface, const SurfaceGeometry& geometry, std::vector<PendingSlice>& out);
+    // A sampled lookup recognized this image as a slice it copies (Texture::CopyPendingSlices): the
+    // flip's store of small images (StoreSmallPending) leaves it pending, so the surface's guest
+    // bytes stay unchanged and its snapshot valid. Readers of the memory still store it as before.
+    void MarkSliceServed() { sliceServed.store(true, std::memory_order_relaxed); }
     // How a buffer fill of [address, address + bytes) (Driver.cpp's fill HLE) meets the storage
     // images alive: none of them; a whole surface (Exact) or one array layer of a surface (Layer),
     // `image` and `layer` naming it, whatever other images lie over the range (`others`, of which
@@ -695,6 +732,7 @@ private:
     // no fill may put results into this one (guarded by the live-image registry lock).
     bool released = false;
     std::atomic<bool> cached{false};
+    std::atomic<bool> sliceServed{false};
     // The present a consumer last proved the image current at (NoteProved).
     mutable std::atomic<std::uint64_t> provedPresent{0};
     // Hook skips of this image since FlushPending last listed it (AccessKeptByCpu), the read site

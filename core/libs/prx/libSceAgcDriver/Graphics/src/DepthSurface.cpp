@@ -15,6 +15,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "RdnaDecoder/include/RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include <algorithm>
+#include <unordered_set>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -620,6 +621,16 @@ public:
 
     std::uint64_t written = ++depthWrites;
     bool retired = false;
+
+    // DepthRangeIndex: the start addresses DepthSurfaceAt matches and the ranges Overlaps tests.
+    void AppendRanges(std::unordered_set<std::uint64_t>& addresses, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) const {
+        addresses.insert(target.address);
+        ranges.emplace_back(target.address, target.address + depthBytes());
+        if (target.stencilAddress != 0) {
+            addresses.insert(target.stencilAddress);
+            ranges.emplace_back(target.stencilAddress, target.stencilAddress + stencilBytes());
+        }
+    }
 
     bool Overlaps(std::uint64_t address, std::uint64_t bytes) const {
         const auto end = address + bytes;
@@ -1564,24 +1575,105 @@ void ForStorageDepth(const Context& context, const StorageTexture& storage, Acti
 }
 
 std::atomic<std::uint64_t> surfacesSerial{0};
+// Moves when a surface joins or leaves surfaces() (DepthRangeIndex); under surfacesMutex.
+std::uint64_t surfacesMembership = 0;
 std::atomic<std::uint64_t> surfacesReleased{0};
 
-void releaseRetired(const Context& context) {
+// APS5_PROFILE_DRAW: the list's shape and the scans over it ([depth-surfaces], 10 s).
+std::atomic<std::uint64_t> depthAtCalls{0}, depthOverlapCalls{0}, depthRetireCalls{0}, depthViewCalls{0}, depthIndexRejects{0};
+
+std::size_t releaseRetiredOn(VkDevice device) {
     auto* recorder = Recorder::Active();
-    if (recorder != nullptr && recorder->Device() != context.device) return;
+    if (recorder != nullptr && recorder->Device() != device) return 0;
     auto& list = surfaces();
+    std::size_t released = 0;
     for (auto it = list.begin(); it != list.end();) {
         const auto& surface = **it;
-        if (!surface.retired || surface.context.device != context.device || surface.target.samples != 1u || surface.SampledElsewhere()) {
+        if (!surface.retired || surface.context.device != device || surface.target.samples != 1u || surface.SampledElsewhere()) {
             ++it;
             continue;
         }
         if (drawnDepth == &surface) drawnDepth = nullptr;
-        std::shared_ptr<DepthSurface> released = std::move(*it);
+        std::shared_ptr<DepthSurface> kept = std::move(*it);
         it = list.erase(it);
+        ++surfacesMembership;
         surfacesReleased.fetch_add(1, std::memory_order_release);
-        if (recorder != nullptr) recorder->Keep(std::move(released));
+        ++released;
+        if (recorder != nullptr) recorder->Keep(std::move(kept));
     }
+    return released;
+}
+
+void releaseRetired(const Context& context) {
+    static_cast<void>(releaseRetiredOn(context.device));
+}
+
+// The list's depth and stencil ranges, for the scans that mostly ask about memory no depth surface holds
+// (best124: ~270 live surfaces, ~27k DepthSurfaceAt and ~9k retire scans a second, ~11 % of the
+// committer). A superset of what the scans test (retired and inactive surfaces stay in it), rebuilt
+// when a surface joins or leaves the list (surfacesMembership); a surface's target never changes. Under
+// surfacesMutex. APS5_NO_DEPTH_INDEX=1 (runtime switch) scans every surface, as before.
+struct DepthRangeIndex {
+    std::uint64_t membership = ~std::uint64_t{0};
+    std::unordered_set<std::uint64_t> addresses;
+    // Ranges sorted by begin, with the running maximum of the ends.
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    std::vector<std::uint64_t> maxEnd;
+};
+
+DepthRangeIndex& depthRangeIndex() {
+    static auto* index = new DepthRangeIndex();
+    if (index->membership != surfacesMembership) {
+        index->membership = surfacesMembership;
+        index->addresses.clear();
+        index->ranges.clear();
+        for (const auto& surface : surfaces()) surface->AppendRanges(index->addresses, index->ranges);
+        std::sort(index->ranges.begin(), index->ranges.end());
+        index->maxEnd.resize(index->ranges.size());
+        std::uint64_t highest = 0;
+        for (std::size_t i = 0; i < index->ranges.size(); ++i) index->maxEnd[i] = highest = std::max(highest, index->ranges[i].second);
+    }
+    return *index;
+}
+
+bool depthIndexUsed() {
+    return !RuntimeSwitches::Set(RuntimeSwitch::NoDepthIndex);
+}
+
+// False only when no surface of the list starts at `address` (the scan would find none).
+bool mayHoldAddress(std::uint64_t address) {
+    if (!depthIndexUsed()) return true;
+    const bool may = depthRangeIndex().addresses.contains(address);
+    if (!may) depthIndexRejects.fetch_add(1, std::memory_order_relaxed);
+    return may;
+}
+
+// False only when no surface's depth or stencil range overlaps [address, address + bytes).
+bool mayOverlap(std::uint64_t address, std::uint64_t bytes) {
+    if (!depthIndexUsed()) return true;
+    const auto& index = depthRangeIndex();
+    const auto end = address + bytes;
+    const auto after = std::lower_bound(index.ranges.begin(), index.ranges.end(), std::pair<std::uint64_t, std::uint64_t>{end, 0});
+    const bool may = after != index.ranges.begin() && index.maxEnd[static_cast<std::size_t>(after - index.ranges.begin()) - 1u] > address;
+    if (!may) depthIndexRejects.fetch_add(1, std::memory_order_relaxed);
+    return may;
+}
+
+void reportDepthSurfaces() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile) return;
+    static auto last = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::seconds(10)) return;
+    last = now;
+    std::size_t live = 0, retiredCount = 0, inactive = 0;
+    for (const auto& surface : surfaces()) {
+        if (!surface->active->load(std::memory_order_acquire)) ++inactive;
+        else if (surface->retired) ++retiredCount;
+        else ++live;
+    }
+    const auto take = [](std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.exchange(0, std::memory_order_relaxed)); };
+    std::fprintf(stderr, "[depth-surfaces] (10 s): list %zu (live %zu, retired %zu, inactive %zu); scans: at %llu, overlaps %llu, retire %llu, view %llu; answered by the index %llu\n", surfaces().size(), live, retiredCount, inactive, take(depthAtCalls), take(depthOverlapCalls), take(depthRetireCalls), take(depthViewCalls), take(depthIndexRejects));
 }
 
 std::uint32_t expandedHtileWord(std::uint32_t word, bool stencilInHtile, VkImageAspectFlags cleared) {
@@ -2163,6 +2255,8 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, 
     const auto htileCleared = RoutesToNativeDepthOwner(target) ? VkImageAspectFlags{0} : storeBackClearedHtile(context, target);
     std::lock_guard gpu(GuestMemory::GpuMutex());
     std::unique_lock lock(surfacesMutex());
+    depthViewCalls.fetch_add(1, std::memory_order_relaxed);
+    reportDepthSurfaces();
     const bool cleared = takeClearedHtile(target);
     auto& list = surfaces();
     DepthSurface* surface = nullptr;
@@ -2198,6 +2292,7 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, 
         releaseRetired(context);
         surfacesSerial.fetch_add(1, std::memory_order_release);
         surfaces().push_back(std::make_unique<DepthSurface>(context, target, std::move(sampling)));
+        ++surfacesMembership;
         ++mirrorEpoch;
         auto& fresh = *surfaces().back();
         if (target.samples != 1u && fresh.sampleable && fresh.sampling.refusal.empty()) {
@@ -2488,6 +2583,7 @@ void ClearDepthSurfaces(VkDevice device) {
     std::erase_if(depthOwners(), [&](const auto& entry) { return entry.first.first == device; });
     std::erase_if(stencilOwners(), [&](const auto& entry) { return entry.first.first == device; });
     std::erase_if(surfaces(), [&](const auto& surface) { return surface->context.device == device; });
+    ++surfacesMembership;
     std::erase_if(planeCopies(), [&](const auto& entry) { return std::get<0>(entry.first) == device; });
     std::erase_if(layeredStorages(), [&](const auto& entry) { return std::get<0>(entry.first) == device; });
     std::unique_lock guardLock(depthGuardMutex());
@@ -2805,16 +2901,22 @@ bool DepthSurfaceStoreBack(const Context& context, const StorageTexture& storage
 
 bool DepthSurfaceAt(std::uint64_t address) {
     std::lock_guard lock(surfacesMutex());
+    depthAtCalls.fetch_add(1, std::memory_order_relaxed);
+    if (!mayHoldAddress(address)) return false;
     return std::any_of(surfaces().begin(), surfaces().end(), [&](const auto& surface) { return surface->active->load(std::memory_order_acquire) && !surface->retired && (surface->target.address == address || surface->target.stencilAddress == address); });
 }
 
 bool DepthSurfaceOverlaps(VkDevice device, std::uint64_t address, std::uint64_t bytes) {
     std::lock_guard lock(surfacesMutex());
+    depthOverlapCalls.fetch_add(1, std::memory_order_relaxed);
+    if (!mayOverlap(address, bytes)) return false;
     return std::any_of(surfaces().begin(), surfaces().end(), [&](const auto& surface) { return surface->active->load(std::memory_order_acquire) && !surface->retired && surface->context.device == device && surface->Overlaps(address, bytes); });
 }
 
 void RetireDepthSurfaces(VkDevice device, std::uint64_t address, std::uint64_t bytes) {
     std::lock_guard lock(surfacesMutex());
+    depthRetireCalls.fetch_add(1, std::memory_order_relaxed);
+    if (!mayOverlap(address, bytes)) return;
     for (const auto& surface : surfaces()) {
         if (surface->context.device == device && !surface->retired && surface->Overlaps(address, bytes)) retire(*surface);
     }
@@ -2822,6 +2924,7 @@ void RetireDepthSurfaces(VkDevice device, std::uint64_t address, std::uint64_t b
 
 void RetireCoveredDepthSurfaces(VkDevice device, std::span<const std::pair<std::uint64_t, std::uint64_t>> written, std::span<const WrittenStorageExtent> extents) {
     std::lock_guard lock(surfacesMutex());
+    depthRetireCalls.fetch_add(1, std::memory_order_relaxed);
     for (const auto& surface : surfaces()) {
         if (surface->context.device == device && !surface->retired && surface->CoveredBy(written, extents)) retire(*surface);
     }

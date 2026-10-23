@@ -36,6 +36,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <unordered_set>
 #include <mutex>
 #include <set>
 #include <unordered_map>
@@ -515,6 +516,7 @@ struct DrawProfile {
     std::array<std::uint64_t, static_cast<std::size_t>(DrawSkip::Count)> skips{};
     std::array<double, static_cast<std::size_t>(DrawSkip::Count)> skipUs{};
     AddressReuseStats reuseSeen;
+    std::array<std::uint64_t, static_cast<std::size_t>(ShaderResources::TemplateOutcome::Count)> templateSeen{};
     LeaseStats leaseSeen;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
@@ -633,6 +635,20 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     const auto resumeMiss = [&](SpaceResumeMiss kind) { return static_cast<unsigned long long>(reuse.resumeMisses[static_cast<std::size_t>(kind)] - reuseSeen.resumeMisses[static_cast<std::size_t>(kind)]); };
     if (reuse.proofs != reuseSeen.proofs || reuseCount(AddressReuse::InUse) != 0) {
         std::fprintf(stderr, "[rescache] address-based draws: %llu proofs, %llu reused; refused: in use %llu, not reusable %llu, snapshots %llu, space %llu (state %llu, replaced %llu, device %llu, generation %llu, epoch %llu, mirrors %llu), images or buffers %llu, imports %llu, threw %llu, moved buffers %llu; %.1f ms in refused proofs; host import refusals: budget %llu (%llu while a reused draw held its space), held import %llu (%llu); pin-contention waits %llu (%.1f ms)\n", static_cast<unsigned long long>(reuse.proofs - reuseSeen.proofs), reuseCount(AddressReuse::Reused), reuseCount(AddressReuse::InUse), reuseCount(AddressReuse::NotReusable), reuseCount(AddressReuse::Snapshots), reuseCount(AddressReuse::Space), resumeMiss(SpaceResumeMiss::State), resumeMiss(SpaceResumeMiss::Replaced), resumeMiss(SpaceResumeMiss::Device), resumeMiss(SpaceResumeMiss::Generation), resumeMiss(SpaceResumeMiss::Epoch), resumeMiss(SpaceResumeMiss::Mirrors), reuseCount(AddressReuse::Proof), reuseCount(AddressReuse::Imports), reuseCount(AddressReuse::Threw), reuseCount(AddressReuse::Moved), static_cast<double>(reuse.refusedProofNs - reuseSeen.refusedProofNs) / 1e6, static_cast<unsigned long long>(reuse.budgetRefusals - reuseSeen.budgetRefusals), static_cast<unsigned long long>(reuse.budgetRefusalsHeld - reuseSeen.budgetRefusalsHeld), static_cast<unsigned long long>(reuse.heldImportRefusals - reuseSeen.heldImportRefusals), static_cast<unsigned long long>(reuse.heldImportRefusalsHeld - reuseSeen.heldImportRefusalsHeld), static_cast<unsigned long long>(leases.contentionWaits - profile.leaseSeen.contentionWaits), leases.contentionMs - profile.leaseSeen.contentionMs);
+    }
+    {
+        const auto outcomes = ShaderResources::TemplateOutcomes();
+        char text[1024];
+        int used = std::snprintf(text, sizeof(text), "[bda-template] builds:");
+        for (std::size_t index = 0; index < outcomes.size() && used > 0 && static_cast<std::size_t>(used) < sizeof(text); ++index) {
+            const auto count = outcomes[index] - profile.templateSeen[index];
+            if (count != 0) used += std::snprintf(text + used, sizeof(text) - static_cast<std::size_t>(used), " %s %llu,", ShaderResources::TemplateOutcomeName(static_cast<ShaderResources::TemplateOutcome>(index)), static_cast<unsigned long long>(count));
+        }
+        if (outcomes != profile.templateSeen) std::fprintf(stderr, "%s\n", text);
+        profile.templateSeen = outcomes;
+    }
+    if (reuse.sharedUses != reuseSeen.sharedUses || reuse.perUseSets != reuseSeen.perUseSets) {
+        std::fprintf(stderr, "[bda-template] %llu address-table hits while an earlier use was in flight, %llu per-use descriptor sets (changed data words or moved read-only buffers)\n", static_cast<unsigned long long>(reuse.sharedUses - reuseSeen.sharedUses), static_cast<unsigned long long>(reuse.perUseSets - reuseSeen.perUseSets));
     }
     profile.reuseSeen = reuse;
     profile.leaseSeen = leases;
@@ -859,6 +875,96 @@ ResourceCache::Key DrawResourceKey(const Context& context, std::span<const Compi
     return key;
 }
 
+// Debug (local, APS5_RESKEY_DIFF=1): which words of the draw resource key differ between a draw and the last draw of
+// the same shape (the key's layout words), for cache misses and for address-table draws (never cached today), and
+// whether an address-table draw's key was seen before (the hit rate a template without its BDA part would get).
+bool ResourceKeyDiffEnabled() {
+    static const bool enabled = std::getenv("APS5_RESKEY_DIFF") != nullptr;
+    return enabled;
+}
+
+void NoteResourceKeyDiff(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::uint64_t indexBytes, bool trimKey, bool cacheable, bool hit, const ResourceCache::Key& cachedKey) {
+    constexpr std::size_t Roles = 9;
+    static const char* const RoleNames[Roles] = {"header", "variant", "layout", "descriptor-address", "descriptor-other", "buffer", "sampler", "bits", "target"};
+    struct Stats {
+        std::uint64_t draws = 0, hits = 0, firstShape = 0, lengthDiffers = 0, sameKey = 0, seenBefore = 0;
+        std::array<std::uint64_t, Roles> anyRole{};
+        std::array<std::uint64_t, Roles> onlyRole{};
+    };
+    struct Last {
+        ResourceCache::Key key;
+    };
+    static std::mutex mutex;
+    static std::unordered_map<std::uint64_t, Last> lastByShape;
+    static std::unordered_set<std::uint64_t> seenBda;
+    static std::array<Stats, 2> stats;
+    static auto reported = std::chrono::steady_clock::now();
+    const bool bda = !cacheable && ShaderResources::NeverReusable(shaders);
+    if (!cacheable && !bda) return;
+    ResourceCache::Key key = cacheable ? cachedKey : DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
+    std::vector<std::uint8_t> roles;
+    roles.reserve(key.size());
+    roles.push_back(0);
+    roles.push_back(0);
+    roles.push_back(0);
+    roles.push_back(2);
+    for (const auto& shader : shaders) {
+        roles.push_back(2);
+        ShaderResources::AppendContentKeyRoles(shader, true, MovableBuffers(), roles);
+    }
+    roles.push_back(2);
+    while (roles.size() < key.size()) roles.push_back(8);
+    std::uint64_t shape = 1469598103934665603ull, full = 1469598103934665603ull;
+    for (std::size_t i = 0; i < key.size(); ++i) {
+        full = (full ^ key[i]) * 1099511628211ull;
+        if (i < roles.size() && (roles[i] == 0 || roles[i] == 2)) shape = (shape ^ key[i]) * 1099511628211ull;
+    }
+    std::lock_guard lock(mutex);
+    auto& stat = stats[bda ? 1 : 0];
+    ++stat.draws;
+    if (hit) ++stat.hits;
+    if (bda) {
+        if (!seenBda.insert(full).second) ++stat.seenBefore;
+        if (seenBda.size() > 65536) seenBda.clear();
+    }
+    if (!hit) {
+        auto found = lastByShape.find(shape);
+        if (found == lastByShape.end()) {
+            ++stat.firstShape;
+        } else if (found->second.key.size() != key.size() || roles.size() != key.size()) {
+            ++stat.lengthDiffers;
+        } else {
+            std::array<bool, Roles> differs{};
+            for (std::size_t i = 0; i < key.size(); ++i) {
+                if (key[i] != found->second.key[i]) differs[roles[i]] = true;
+            }
+            const auto count = std::count(differs.begin(), differs.end(), true);
+            if (count == 0) ++stat.sameKey;
+            for (std::size_t r = 0; r < Roles; ++r) {
+                if (!differs[r]) continue;
+                ++stat.anyRole[r];
+                if (count == 1) ++stat.onlyRole[r];
+            }
+        }
+    }
+    lastByShape[shape].key = std::move(key);
+    if (lastByShape.size() > 65536) lastByShape.clear();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - reported < std::chrono::seconds(10)) return;
+    reported = now;
+    for (std::size_t kind = 0; kind < 2; ++kind) {
+        const auto& s = stats[kind];
+        std::string roleText;
+        for (std::size_t r = 0; r < Roles; ++r) {
+            char item[96];
+            std::snprintf(item, sizeof(item), " %s %llu/%llu", RoleNames[r], static_cast<unsigned long long>(s.anyRole[r]), static_cast<unsigned long long>(s.onlyRole[r]));
+            roleText += item;
+        }
+        std::fprintf(stderr, "[reskey] %s (10 s): %llu draws, %llu hits, %llu keys seen before (address-table draws); vs the last key of the same shape: first of shape %llu, length differs %llu, same key %llu; differing roles (any/only):%s\n", kind == 0 ? "cacheable" : "address-table", static_cast<unsigned long long>(s.draws), static_cast<unsigned long long>(s.hits), static_cast<unsigned long long>(s.seenBefore), static_cast<unsigned long long>(s.firstShape), static_cast<unsigned long long>(s.lengthDiffers), static_cast<unsigned long long>(s.sameKey), roleText.c_str());
+    }
+    stats = {};
+}
+
 // The alias checks the build makes for every guest buffer descriptor (ShaderResources::
 // addGuestBuffer), repeated for a cached build whose own checks compared the buffers against
 // another draw's render target and index buffer. The same conditions and messages, so a draw that
@@ -953,6 +1059,19 @@ void CountDrawSkip(DrawSkip kind, double us) {
     stats.skipUs[static_cast<std::size_t>(kind)] += us;
 }
 
+
+// APS5_PROFILE_DRAW: evicted resource sets of recorded draws handed to the release thread ([draw-evict], 10 s).
+void noteDeferredDrawEvictions(std::size_t count) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static std::atomic<std::uint64_t> deferred{0};
+    static std::atomic<long long> lastReport{0};
+    if (!profile) return;
+    deferred.fetch_add(count, std::memory_order_relaxed);
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = lastReport.load();
+    if (nowMs - last < 10000 || !lastReport.compare_exchange_strong(last, nowMs)) return;
+    std::fprintf(stderr, "[draw-evict] (10 s): %llu evicted resource sets deferred to the release thread\n", static_cast<unsigned long long>(deferred.exchange(0, std::memory_order_relaxed)));
+}
 
 bool DrawRecipes() {
     static const bool noDrawRecipe = std::getenv("APS5_NO_DRAW_RECIPE") != nullptr;
@@ -1637,6 +1756,10 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     // the alias checks instead. Debug aid: APS5_NO_DRAW_KEY_TRIM=1 keys them as before.
     const bool trimKey = TrimmedDrawKey();
     resolved.cacheable = recordable && !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; }) && !ShaderResources::NeverReusable(shaders);
+    if (timer.profile && recordable && !resolved.cacheable && ShaderResources::StagesUseAddressTables(shaders) && ShaderResources::StagesStoreThroughAddresses(shaders)) {
+        ShaderResources::CountTemplateOutcome(ShaderResources::TemplateOutcome::Storing);
+        if (ShaderResources::StagesStoreOnlyThroughExtInst(shaders)) ShaderResources::CountTemplateOutcome(ShaderResources::TemplateOutcome::StoringExtOnly);
+    }
     if (resolved.cacheable) {
         if (prepared != nullptr && prepared->keyed && prepared->trimmed == trimKey) {
             resolved.contentKey = std::move(prepared->contentKey);
@@ -1648,7 +1771,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
             resolved.contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
         }
         auto cached = SharedResourceCache().Find(resolved.contentKey);
-        const bool inUse = cached != nullptr && cached->InUse();
+        const bool inUse = cached != nullptr && cached->InUse() && !cached->SharesUses();
         if (inUse) CountAddressReuse(AddressReuse::InUse);
         if (cached != nullptr && !inUse) {
             const bool addressBased = cached->ReusesAddressSpace();
@@ -1677,6 +1800,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     } else {
         countCache(&DrawProfile::uncacheable);
     }
+    if (ResourceKeyDiffEnabled() && recordable) NoteResourceKeyDiff(context, state, draw, shaders, indexBytes, trimKey, resolved.cacheable, resolved.resources != nullptr, resolved.contentKey);
     timer.phase(PhaseLookup);
     if (resolved.resources == nullptr) {
         // S1: stage A made ahead of the draw, when nothing it read can have moved since (the stamps
@@ -2751,7 +2875,21 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     // A build this recorded draw can share with later identical ones goes into the cache (a cache
     // hit is reusable by construction, so `recorded` holds for it; one with completion work is
     // never reusable).
-    if (cacheable && built != nullptr && recorded && resources->Reusable()) SharedResourceCache().Insert(contentKey, resources);
+    // The insert displaces the oldest entries; they go to the open batch, so their destruction (descriptor
+    // sets, pooled buffers, texture references) runs on the release thread once the batch completed, as
+    // the dispatch insert does, not here on the committer (best116: ~4-5 % of the committer).
+    // APS5_NO_DEFERRED_DRAW_EVICTION=1 (runtime switch) destroys them here as before.
+    if (cacheable && built != nullptr && recorded && resources->Reusable()) {
+        std::vector<std::shared_ptr<ShaderResources>> evicted;
+        const bool deferEviction = recorder != nullptr && !RuntimeSwitches::Set(RuntimeSwitch::NoDeferredDrawEviction);
+        SharedResourceCache().Insert(contentKey, resources, deferEviction ? &evicted : nullptr);
+        for (auto& object : evicted) {
+            object->KeepStorageImageBytes(*recorder);
+            recorder->Keep(std::move(object));
+        }
+        noteDeferredDrawEvictions(evicted.size());
+        if (timer.profile && resources->ReusesAddressSpace()) ShaderResources::CountTemplateOutcome(ShaderResources::TemplateOutcome::Inserted);
+    }
     // A recorded draw renders into its resident targets in the general layout (recordDraw). Debug
     // aid: APS5_DRAW_TRANSITIONS=1 keeps the per-draw upload and download barriers, the layout
     // transitions of every target and one pass per draw, as before.

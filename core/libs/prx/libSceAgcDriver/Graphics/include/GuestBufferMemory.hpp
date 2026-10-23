@@ -257,8 +257,12 @@ struct AddressReuseStats {
     std::uint64_t budgetRefusalsHeld = 0;
     std::uint64_t heldImportRefusals = 0;
     std::uint64_t heldImportRefusalsHeld = 0;
+    std::uint64_t sharedUses = 0;
+    std::uint64_t perUseSets = 0;
 };
 void CountAddressReuseProof();
+void CountSharedAddressUse();
+void CountPerUseAddressSet();
 void CountAddressReuse(AddressReuse outcome, std::uint64_t proofNs = 0);
 void HoldReusedSpace(bool held);
 AddressReuseStats AddressReuseCounters();
@@ -411,6 +415,13 @@ public:
     // or copied out of their imports and of the written ranges.
     void RunAccesses(std::vector<std::array<std::uint64_t, 3>>& out) const;
     bool SameSnapshots(std::span<const GuestMemorySnapshot> snapshots) const;
+    // Address-table templates (APS5_NO_BDA_TEMPLATES unset): whether a build of `snapshots` over the
+    // current (resumed) address space would add no region of its own beyond this upload's: every
+    // snapshot lies inside a live region (registered memory, an import, a mirror) and agrees with
+    // it, or inside one of this upload's snapshot copies with the same bytes, and every snapshot copy
+    // of this upload is captured again at the same address and size. A live region serves the GPU in
+    // place, so a snapshot inside one may change between uses without a rebuild.
+    bool SnapshotsServed(std::span<const GuestMemorySnapshot> snapshots) const;
     void SuspendSpace() noexcept;
     bool ResumeSpace();
     bool SpaceImportsCurrent();
@@ -499,6 +510,12 @@ private:
     // The region containing `address`: this build's own regions (sorted after UploadPrepare) or
     // the space's base regions, or null.
     const Region* owner(std::uint64_t address, std::uint64_t end) const;
+    // AddressRanges' last two passes (shared with incrementalAddressRanges): the overlays cut into the
+    // ranges they lie in, then the runtime writes split out of read-only ranges as writable parts.
+    std::vector<ShaderRecompiler::BdaAbi::Range> applyOverlaysAndWrites(std::vector<ShaderRecompiler::BdaAbi::Range> result, std::vector<ShaderRecompiler::BdaAbi::Range> overlays, std::span<const std::pair<std::uint64_t, std::uint64_t>> writtenRanges) const;
+    // AddressRanges() for a build over the cached space, redoing only the neighbourhood of its own
+    // regions, overlays and writes (see GuestBufferMemory.cpp).
+    std::vector<ShaderRecompiler::BdaAbi::Range> incrementalAddressRanges() const;
     // Builds this build's regions from a lease as the per-build path always did: `base` gets the
     // ranges served in place (imports, mirrors), `copied` the ones copied per build.
     struct CopiedRange {
