@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libkernel/Time/include/SleepWake.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
@@ -3906,7 +3907,22 @@ void Recorder::markOverwritten(std::uint64_t address, std::uint64_t end) {
     for (auto it = labels.lower_bound(address >= 3 ? address - 3 : 0); it != labels.end() && it->first < end; ++it) it->second.overwritten = true;
 }
 
+void traceWindowWrite(std::uint64_t begin, std::uint64_t end, const char* kind, std::uint32_t word) {
+    static const auto window = [] {
+        std::pair<std::uint64_t, std::uint64_t> parsed{0, 0};
+        const char* text = std::getenv("APS5_TRACE_WRITE_WINDOW");
+        if (text == nullptr) return parsed;
+        char* cursor = nullptr;
+        parsed.first = std::strtoull(text, &cursor, 16);
+        if (cursor != nullptr && *cursor == ':') parsed.second = std::strtoull(cursor + 1, nullptr, 16);
+        return parsed;
+    }();
+    if (window.second <= window.first || end <= window.first || begin >= window.second || !DepthSurfaceTraceActive()) return;
+    std::fprintf(stderr, "[depth-trace] %s 0x%llx+0x%llx word 0x%x origin 0x%llx\n", kind, static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), word, static_cast<unsigned long long>(Recorder::CurrentWriteOrigin()));
+}
+
 void Recorder::NotePendingWrite(std::uint64_t address, std::size_t bytes) {
+    traceWindowWrite(address, address + bytes, "noted write", 0);
     if (!noteWrite(address, bytes)) return;
     const std::array ranges{std::pair{address, address + bytes}};
     publishPendingWrites(ranges);
@@ -3916,6 +3932,7 @@ void Recorder::NotePendingWrite(std::uint64_t address, std::size_t bytes) {
 }
 
 void Recorder::NotePendingFill(std::uint64_t address, std::size_t bytes, std::uint8_t value) {
+    traceWindowWrite(address, address + bytes, "noted fill", value);
     if (!noteWrite(address, bytes, false, value, value * std::int64_t{0x01010101})) return;
     const std::array ranges{std::pair{address, address + bytes}};
     publishPendingWrites(ranges);
@@ -3923,6 +3940,7 @@ void Recorder::NotePendingFill(std::uint64_t address, std::size_t bytes, std::ui
 }
 
 void Recorder::NotePendingWordFill(std::uint64_t address, std::size_t bytes, std::uint32_t word) {
+    traceWindowWrite(address, address + bytes, "noted word fill", word);
     const int value = word == (word & 0xffu) * 0x01010101u ? static_cast<int>(word & 0xffu) : -1;
     if (!noteWrite(address, bytes, false, value, word)) return;
     const std::array ranges{std::pair{address, address + bytes}};
@@ -3931,6 +3949,7 @@ void Recorder::NotePendingWordFill(std::uint64_t address, std::size_t bytes, std
 }
 
 void Recorder::NotePendingWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
+    for (const auto& [begin, end] : ranges) traceWindowWrite(begin, end, "noted writes", 0);
     bool publish = false;
     for (const auto& [begin, end] : ranges) {
         if (end > begin && noteWrite(begin, static_cast<std::size_t>(end - begin))) publish = true;

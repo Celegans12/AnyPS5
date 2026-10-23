@@ -2827,6 +2827,10 @@ void SetDepthSurfaceTrace(std::uint64_t address) {
     depthTraceAddress().store(address, std::memory_order_relaxed);
 }
 
+bool DepthSurfaceTraceActive() {
+    return depthTraceAddress().load(std::memory_order_relaxed) != 0;
+}
+
 bool DepthSurfaceTraced(std::uint64_t address) {
     return address != 0 && depthTraceAddress().load(std::memory_order_relaxed) == address;
 }
