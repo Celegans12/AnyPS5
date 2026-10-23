@@ -7,6 +7,7 @@ namespace {
 
 constexpr std::uint32_t CurrentVersion = 42u;
 constexpr std::uint32_t DrawParameterBlockTag = 0x31504447u;
+constexpr std::uint32_t ObjPrimIdBlockTag = 0x31444950u;
 constexpr std::uint32_t LocalFeatures = 22u;
 constexpr char kBase64Alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -898,10 +899,17 @@ DeserializedRequest deserialize(std::string_view decoded, std::uint32_t version,
         result.request.context.compute->singleWorkgroup = singleWorkgroup;
         if (result.compute.has_value()) result.compute->singleWorkgroup = singleWorkgroup;
     }
-    if (version >= 26u && reader.Remaining() == 12u && result.request.context.vertex.has_value()) {
+    if (version >= 26u && (reader.Remaining() == 12u || reader.Remaining() == 20u) && result.request.context.vertex.has_value()) {
         if (reader.ReadU32() != DrawParameterBlockTag) throw std::runtime_error("RequestSerializer: unexpected trailing data");
         result.request.context.vertex->drawBaseVertexSgpr = reader.ReadI32();
         result.request.context.vertex->drawStartInstanceSgpr = reader.ReadI32();
+    }
+    if (version >= 42u && reader.Remaining() == 8u && result.request.context.pixel.has_value()) {
+        if (reader.ReadU32() != ObjPrimIdBlockTag) throw std::runtime_error("RequestSerializer: unexpected trailing data");
+        const auto target = reader.ReadU32();
+        if (target == 0u || target > 8u) throw std::runtime_error("RequestSerializer: invalid object/primitive ID target");
+        result.request.context.pixel->objPrimIdTarget = static_cast<std::uint8_t>(target);
+        if (result.pixel.has_value()) result.pixel->objPrimIdTarget = static_cast<std::uint8_t>(target);
     }
     if (version >= 21u && reader.Remaining() != 0u) throw std::runtime_error("RequestSerializer: unexpected trailing data");
     if (exact && !reader.Done()) throw std::runtime_error("RequestSerializer: trailing data");
@@ -953,6 +961,10 @@ std::string RequestSerializer::Serialize(const RecompileRequest& request) const 
         writer.WriteU32(DrawParameterBlockTag);
         writer.WriteI32(request.context.vertex->drawBaseVertexSgpr);
         writer.WriteI32(request.context.vertex->drawStartInstanceSgpr);
+    }
+    if (request.context.pixel.has_value() && request.context.pixel->objPrimIdTarget != 0u) {
+        writer.WriteU32(ObjPrimIdBlockTag);
+        writer.WriteU32(request.context.pixel->objPrimIdTarget);
     }
     return base64Encode(buffer);
 }

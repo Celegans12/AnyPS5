@@ -1358,6 +1358,18 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
         }
         result.colors.push_back(color);
     }
+    if (const auto objPrimId = DecodeObjPrimIdOutput(cx)) {
+        Require(!PixelProgramSkipped(queue), "an object/primitive ID payload without a pixel program is not implemented");
+        auto color = DecodeColorBuffer(cx, objPrimId->slot);
+        Require(color.format == VK_FORMAT_R32_UINT, "an object/primitive ID target that is not 32-bit unsigned integer is not implemented");
+        Require(color.samples == result.samples, "an object/primitive ID target's sample count differs from the rasterizer's");
+        Require(std::none_of(result.colors.begin(), result.colors.end(), [&](const ColorTarget& other) { return other.address == color.address; }), "an object/primitive ID target that aliases an exported color target is not implemented");
+        color.exportIndex = objPrimId->location;
+        color.objPrimId = true;
+        result.renderExtent = result.colors.empty() ? color.extent : VkExtent2D{std::min(result.renderExtent.width, color.extent.width), std::min(result.renderExtent.height, color.extent.height)};
+        result.colors.push_back(color);
+        result.hasColorTarget = true;
+    }
     if (result.hasColorTarget) {
         result.color = result.colors.front();
         result.renderLayers = result.color.layers;
@@ -1418,13 +1430,20 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
     if ((read(cx, 0x292) & 2u) != 0) intersect(result.scissor, cx, 0x94, false);
     if (collapsed) result.scissor.extent = {0, 0};
     APS5_LOG_OUT_DEBUG("Scissor offset=(%d,%d) extent=%ux%u", result.scissor.offset.x, result.scissor.offset.y, result.scissor.extent.width, result.scissor.extent.height);
-    result.blends.assign(exportCount, VkPipelineColorBlendAttachmentState{});
+    result.blends.assign(result.colors.empty() ? exportCount : std::max<std::size_t>(exportCount, result.colors.back().exportIndex + 1u), VkPipelineColorBlendAttachmentState{});
     std::array<float, 3> requiredBlendConstants{};
     std::uint32_t requiredBlendMask = 0;
     for (const auto& color : result.colors) {
         const auto slot = color.slot;
         const auto blend = read(cx, 0x1e0 + slot);
         APS5_LOG_OUT_DEBUG("Blend %u control=0x%x", slot, blend);
+        if (color.objPrimId) {
+            Require(((blend >> 30u) & 1u) == 0u || (read(cx, 0x31c + slot * 0xfu) & 0x10000u) != 0u, "blending into an object/primitive ID target is not implemented");
+            VkPipelineColorBlendAttachmentState objPrimIdState{};
+            objPrimIdState.colorWriteMask = VK_COLOR_COMPONENT_R_BIT;
+            result.blends[color.exportIndex] = objPrimIdState;
+            continue;
+        }
         Require((blend & 0x0000e000u) == 0, "reserved blend control bits");
         VkPipelineColorBlendAttachmentState state{};
         const auto mapping = color.componentMapping;
@@ -1661,6 +1680,47 @@ GuestTextureResource SurfaceForTarget(const ColorTarget& color) {
     surface.dccAlphaOnMsb = color.dccAlphaOnMsb;
     surface.dccPipeAligned = color.dccPipeAligned;
     return surface;
+}
+
+std::optional<ObjPrimIdOutput> DecodeObjPrimIdOutput(const Registers& cx) {
+    static const bool disabled = std::getenv("APS5_NO_HW_OBJPRIM_ID") != nullptr;
+    const auto payload = optionalRegister(cx, 0x2a6);
+    if (disabled || (payload & 1u) == 0u) return std::nullopt;
+    if ((payload & 4u) != 0u) throw std::runtime_error("AGC graphics: per-instance object IDs (VGT_DRAW_PAYLOAD_CNTL.OBJECT_ID_INST_EN) are not implemented");
+    const auto control = optionalRegister(cx, 0x20d);
+    if ((control & 1u) != 0u) throw std::runtime_error("AGC graphics: PA_CL_OBJPRIM_ID_CNTL.OBJ_ID_SEL 1 is not implemented");
+    if ((control & 2u) == 0u) throw std::runtime_error("AGC graphics: object IDs without PA_CL_OBJPRIM_ID_CNTL.ADD_PIPED_PRIM_ID are not implemented");
+    const auto targetMask = read(cx, 0x8e);
+    const auto shaderMask = read(cx, 0x8f);
+    const auto written = ColorWriteMask(cx);
+    std::uint32_t exportCount = 0;
+    std::uint32_t exportIndex = 0;
+    for (std::uint32_t slot = 0; slot < 8; ++slot) {
+        if (((shaderMask >> (4u * slot)) & 0xfu) == 0u) continue;
+        ++exportIndex;
+        if (((written >> (4u * slot)) & 0xfu) != 0u) exportCount = exportIndex;
+    }
+    if (((read(cx, 0x202) >> 4u) & 7u) == 0u) exportCount = 0;
+    std::optional<std::uint32_t> first;
+    for (std::uint32_t slot = 0; slot < 8; ++slot) {
+        const auto targetChannels = (targetMask >> (4u * slot)) & 0xfu;
+        if (targetChannels == 0u || ((shaderMask >> (4u * slot)) & 0xfu) != 0u) continue;
+        const auto info = find(cx, 0x31c + slot * 0xfu);
+        if (info == cx.end() || ((info->second >> 2u) & 0x1fu) == 0u) continue;
+        if ((targetChannels & 1u) == 0u) throw std::runtime_error("AGC graphics: an object/primitive ID target whose CB_TARGET_MASK leaves out the red channel is not implemented");
+        if (!first) {
+            first = slot;
+            continue;
+        }
+        for (std::uint32_t offset = 0; offset < 0xfu; ++offset) {
+            if (optionalRegister(cx, 0x318 + slot * 0xfu + offset) != optionalRegister(cx, 0x318 + *first * 0xfu + offset)) throw std::runtime_error("AGC graphics: object/primitive ID targets on different surfaces are not implemented");
+        }
+        for (const auto ext : {0x390u, 0x398u, 0x3a0u, 0x3a8u, 0x3b0u}) {
+            if (optionalRegister(cx, ext + slot) != optionalRegister(cx, ext + *first)) throw std::runtime_error("AGC graphics: object/primitive ID targets on different surfaces are not implemented");
+        }
+    }
+    if (!first) return std::nullopt;
+    return ObjPrimIdOutput{*first, exportCount};
 }
 
 ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot, bool allowMultisampleDcc) {

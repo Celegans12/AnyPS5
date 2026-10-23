@@ -1354,6 +1354,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         if (variant.info.info.rasterPrimitive) moduleKey.push_back(static_cast<std::uint32_t>(request.context.pixel->rasterPrimitive));
         if (variant.info.info.layerExported) moduleKey.push_back(request.context.pixel->layerExported ? 1u : 0u);
         for (const auto& blend : request.context.pixel->targetBlend) moduleKey.push_back(targetBlendWord(blend));
+        moduleKey.push_back(request.context.pixel->objPrimIdTarget);
     }
     const bool depthRemap = request.target.depthRangeRemap && request.shader.stage == ShaderStage::Vertex && request.context.vertex.has_value();
     if (depthRemap) {
@@ -1479,6 +1480,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
     if (result.hasGuardedUnnormalizedWrap && (variant.info.stage != IrShaderStage::Compute || request.target.bdaAbiVersion != BdaAbi::Version || result.bdaAbiVersion != BdaAbi::Version)) throw std::runtime_error("unnormalized wrap requires a compute fault buffer");
     result.pushConstants = std::move(bindings.pushConstants);
     result.readsDepthRemapPush = depthRemap;
+    result.readsObjPrimIdPush = request.shader.stage == ShaderStage::Fragment && request.context.pixel.has_value() && request.context.pixel->objPrimIdTarget != 0u;
     if (request.shader.stage == ShaderStage::Compute) {
         for (std::uint32_t component = 0; component < PipelineSpecialization::WorkgroupOffsetWords; ++component) result.specialization.push_back({PipelineSpecialization::WorkgroupOffsetBase + component, 0u});
     }

@@ -73,6 +73,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             mix(pixel.stencilRefExportEnable);
             mix(pixel.stencilOperationValueExport);
             for (const auto value : pixel.targetOutputMode) mix(value);
+            mix(pixel.objPrimIdTarget);
             for (const auto value : pixel.targetExportMapping) mix(value);
             for (const auto value : pixel.targetExportPacking) mix(static_cast<std::uint64_t>(value));
             mix(pixel.dualSourceBlend);

@@ -216,6 +216,7 @@ void DefineModule(SpirvEmitterState& state) {
     DefineOutputs(state);
     DefineTessellationInterfaces(state);
     DefineDescriptors(state);
+    DefineObjPrimIdInterface(state);
     if (state.requirements.functionLds) {
         state.ldsVariable = state.module.AllocateId();
     }

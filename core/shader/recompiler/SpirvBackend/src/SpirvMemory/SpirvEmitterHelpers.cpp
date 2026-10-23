@@ -622,4 +622,36 @@ void DefineDescriptors(SpirvEmitterState& state) {
     }
 }
 
+void DefineObjPrimIdInterface(SpirvEmitterState& state) {
+    if (state.program.Resources().stage != IrShaderStage::Pixel || state.inputInfo.pixel == nullptr || state.inputInfo.pixel->objPrimIdTarget == 0u) return;
+    const auto location = static_cast<std::uint32_t>(state.inputInfo.pixel->objPrimIdTarget) - 1u;
+    if (location >= 8u) throw std::runtime_error("the object/primitive ID target lies outside the eight color targets");
+    for (const auto& output : state.program.Info().outputs) {
+        if (output.kind == StageOutputKind::Mrt && output.index == location) throw std::runtime_error("the object/primitive ID target is also exported by the pixel shader");
+    }
+    if (state.stencilReplay) throw std::runtime_error("object/primitive ID output with stencil reference emulation is unsupported");
+    if (std::ranges::find(state.supportedCapabilities, static_cast<std::uint32_t>(spv::CapabilityGeometry)) == state.supportedCapabilities.end()) throw std::runtime_error("object/primitive ID output needs the geometry capability for the fragment primitive ID");
+    const auto& layout = state.program.Metadata().bindings;
+    if (layout.UsesPushData() && layout.PushSlotDword() * 4u != ObjPrimIdPushSlotOffsetBytes) throw std::runtime_error("object/primitive ID output needs the pixel shader's push data in the fragment push slot");
+    if (state.pushConstantVariable != 0u && layout.UsesPushData()) {
+        state.objPrimIdPushVariable = state.pushConstantVariable;
+    } else {
+        const auto type = state.module.DecoratedType(spv::OpTypeStruct,
+            {{spv::OpMemberDecorate, {0u, spv::DecorationOffset, ObjPrimIdPushSlotOffsetBytes}},
+             {spv::OpDecorate, {spv::DecorationBlock}}},
+            PushConstantArrayType(state));
+        state.objPrimIdPushVariable = state.module.DefineGlobalVariable(TypePointer(state, spv::StorageClassPushConstant, type), spv::StorageClassPushConstant);
+        state.module.AddName(state.objPrimIdPushVariable, "objprim_push");
+        if (state.spirvVersion >= 0x00010400u) state.interfaceVariables.push_back(state.objPrimIdPushVariable);
+    }
+    state.objPrimIdPushIndex = (ObjPrimIdPushOffsetBytes - ObjPrimIdPushSlotOffsetBytes) / 4u;
+    state.objPrimIdOutput = DefineInterfaceVariable(state, TypeU32Vector(state, 4u), spv::StorageClassOutput, "objprim_id");
+    state.module.AddAnnotation(spv::OpDecorate, state.objPrimIdOutput, spv::DecorationLocation, location);
+    if (InputVariableForKind(state, StageInputKind::PrimitiveId) != 0u) throw std::runtime_error("object/primitive ID output from a pixel shader that reads the primitive ID itself is unsupported");
+    state.objPrimIdPrimitive = DefineInterfaceVariable(state, TypeI32(state), spv::StorageClassInput, "gl_PrimitiveID");
+    state.module.AddAnnotation(spv::OpDecorate, state.objPrimIdPrimitive, spv::DecorationBuiltIn, spv::BuiltInPrimitiveId);
+    state.module.AddAnnotation(spv::OpDecorate, state.objPrimIdPrimitive, spv::DecorationFlat);
+    state.module.EmitCapability(spv::CapabilityGeometry);
+}
+
 }

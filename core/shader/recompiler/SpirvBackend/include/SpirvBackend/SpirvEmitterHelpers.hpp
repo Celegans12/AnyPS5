@@ -85,6 +85,7 @@ void EmitBaseHeader(SpirvModule& module, const IrProgram& program);
 void DefineInputs(SpirvEmitterState& state);
 void DefineOutputs(SpirvEmitterState& state);
 void DefineDescriptors(SpirvEmitterState& state);
+void DefineObjPrimIdInterface(SpirvEmitterState& state);
 void DefineModule(SpirvEmitterState& state);
 void DefineTessellationInterfaces(SpirvEmitterState& state);
 void DefineTessellationExecutionModes(SpirvEmitterState& state);

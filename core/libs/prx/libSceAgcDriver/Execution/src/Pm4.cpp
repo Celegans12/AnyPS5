@@ -885,7 +885,9 @@ std::uint32_t ReadDrawCount(const DrawParameters::IndirectDraw& indirect) {
     return count;
 }
 
-DrawParameters ResolveDraw(std::span<const std::uint32_t> packet, const QueueState& queue) {
+namespace {
+
+DrawParameters resolveDrawPacket(std::span<const std::uint32_t> packet, const QueueState& queue) {
     Validate(packet, 0);
     if (IndirectDrawOpcode((packet[0] >> 8u) & 0xffu)) return resolveIndirectDraw(packet, queue);
     if (((packet[0] >> 8u) & 0xffu) == 0x2d) {
@@ -913,6 +915,15 @@ DrawParameters ResolveDraw(std::span<const std::uint32_t> packet, const QueueSta
     require(indexOffset != queue.userConfig.end(), "missing GE_INDX_OFFSET register");
     return {address, count, indexSize, queue.instanceCount, packet.back(), true, indexOffset->second, 0};
 }
+
+}
+
+DrawParameters ResolveDraw(std::span<const std::uint32_t> packet, const QueueState& queue) {
+    auto parameters = resolveDrawPacket(packet, queue);
+    if (const auto base = queue.userConfig.find(0x248); base != queue.userConfig.end()) parameters.objPrimIdBase = base->second;
+    return parameters;
+}
+
 
 std::vector<std::uint32_t> ReadIndirectRegisters(std::span<const std::uint32_t> packet) {
     require(packet.size() == 5 && IndirectRegisterOpcode((packet[0] >> 8u) & 0xffu), "expected indirect register packet");

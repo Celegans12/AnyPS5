@@ -152,7 +152,7 @@ struct Module {
             Require(value == spv::BuiltInPosition && signature == "f32x4" && !position, "unsupported or duplicate vertex built-in output");
             position = true;
         } else {
-            Require((storage == spv::StorageClassInput && ((value == spv::BuiltInFragCoord && signature == "f32x4") || ((value == spv::BuiltInFrontFacing || value == spv::BuiltInHelperInvocation) && signature == "bool") || ((value == spv::BuiltInSampleId || value == spv::BuiltInLayer) && signature == "i32") || (value == spv::BuiltInSampleMask && signature == "i32[1]"))) || (storage == spv::StorageClassOutput && ((value == spv::BuiltInFragDepth && signature == "f32") || (value == spv::BuiltInFragStencilRefEXT && signature == "i32") || (value == spv::BuiltInSampleMask && (signature == "i32[1]" || signature == "u32[1]")))), "unsupported fragment built-in");
+            Require((storage == spv::StorageClassInput && ((value == spv::BuiltInFragCoord && signature == "f32x4") || ((value == spv::BuiltInFrontFacing || value == spv::BuiltInHelperInvocation) && signature == "bool") || ((value == spv::BuiltInSampleId || value == spv::BuiltInLayer || value == spv::BuiltInPrimitiveId) && signature == "i32") || (value == spv::BuiltInSampleMask && signature == "i32[1]"))) || (storage == spv::StorageClassOutput && ((value == spv::BuiltInFragDepth && signature == "f32") || (value == spv::BuiltInFragStencilRefEXT && signature == "i32") || (value == spv::BuiltInSampleMask && (signature == "i32[1]" || signature == "u32[1]")))), "unsupported fragment built-in");
         }
     }
 };
@@ -554,7 +554,7 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
                 }
             }
         } else if (variable.storage == spv::StorageClassPushConstant) {
-            Require(!push && (!shader.pushConstants.empty() || shader.readsDepthRemapPush || mesh || (control && !rectListControl)) && (type[0] & 0xffffu) == spv::OpTypeStruct, "invalid push constant interface");
+            Require(!push && (!shader.pushConstants.empty() || shader.readsDepthRemapPush || shader.readsObjPrimIdPush || mesh || (control && !rectListControl)) && (type[0] & 0xffffu) == spv::OpTypeStruct, "invalid push constant interface");
             push = true;
             Require(type.size() == 3 && module.decorations[typeId].block, "push constant variable must be a Block struct with exactly one member");
             const auto offset = module.offsets.find({typeId, 0});
@@ -642,7 +642,7 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
         Require(shader.vertexAttributes.empty(), "vertex attribute metadata is invalid for this stage");
     }
     Require(descriptors.size() == shader.bindings.size(), "recompiler binding metadata contains undeclared resources");
-    Require(push == (!shader.pushConstants.empty() || shader.readsDepthRemapPush || mesh || (control && !rectListControl && !barycentricPatches)), "recompiler push constant metadata disagrees with SPIR-V");
+    Require(push == (!shader.pushConstants.empty() || shader.readsDepthRemapPush || shader.readsObjPrimIdPush || mesh || (control && !rectListControl && !barycentricPatches)), "recompiler push constant metadata disagrees with SPIR-V");
     for (const auto id : module.interface) Require(module.variables.contains(id), "entry point interface contains an unknown variable");
     if (mesh) Require(module.primitiveIndices == state.stages.mesh->outputPrimitiveSize, "mesh shader does not export primitive indices");
     if (fragment) Require(module.primitiveInputs == 0 || !primitiveLocations.empty(), "per-primitive pixel inputs need the barycentric emulation layout");
@@ -728,7 +728,7 @@ std::set<std::uint32_t> ValidateShaders(std::span<const CompiledShader> shaders,
     for (const auto& [location, signature] : previous.outputs) {
         if (location >= attachments) continue;
         const auto color = std::find_if(state.colors.begin(), state.colors.end(), [&](const ColorTarget& target) { return target.exportIndex == location; });
-        const bool uintExport = color != state.colors.end() && color->uintExport;
+        const bool uintExport = color != state.colors.end() && (color->uintExport || color->objPrimId);
         const bool packed = color != state.colors.end() && color->packing != ShaderRecompiler::ColorExportPacking::None;
         Require(color == state.colors.end() || signature == (uintExport || packed ? "vertex:u32x4" : "vertex:f32x4"), packed ? "fragment shader must export uint4 words to its packed color attachments" : uintExport ? "fragment shader must export uint4 colors to its unsigned integer attachments" : "fragment shader must export float4 colors to its attachments");
         locations.insert(location);

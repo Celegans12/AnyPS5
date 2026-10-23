@@ -156,6 +156,7 @@ ShaderRecompiler::ShaderPixelStageInfo DecodePixelStageInfo(const Registers& con
     if (floatLocation == 3u) {
         throw std::runtime_error("AGC graphics: SPI_BARYC_CNTL.POS_FLOAT_LOCATION uses the reserved value 3");
     }
+    const auto objPrimId = nullProgram ? std::nullopt : DecodeObjPrimIdOutput(context);
     return ShaderRecompiler::ShaderPixelStageInfo{
         .interpolatorCount = inputNum,
         .interpolatorSettings = interpolatorSettings,
@@ -184,7 +185,8 @@ ShaderRecompiler::ShaderPixelStageInfo DecodePixelStageInfo(const Registers& con
         .targetExportMapping = nullProgram ? std::array<std::uint8_t, 8>{} : exportMappings,
         .stencilRefExportEnable = stencilRefExportEnable,
         .stencilOperationValueExport = stencilOperationValue,
-        .positionLocation = (positionControl & 0x100000u) != 0u ? ShaderRecompiler::PixelPositionLocation::UpperLeft : static_cast<ShaderRecompiler::PixelPositionLocation>(floatLocation)
+        .positionLocation = (positionControl & 0x100000u) != 0u ? ShaderRecompiler::PixelPositionLocation::UpperLeft : static_cast<ShaderRecompiler::PixelPositionLocation>(floatLocation),
+        .objPrimIdTarget = static_cast<std::uint8_t>(objPrimId ? objPrimId->location + 1u : 0u)
     };
 }
 

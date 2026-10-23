@@ -817,6 +817,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 }
             }
             Pm4::DrawParameters direct{0, arguments.count, 0, arguments.instances, drawParameters.flags, drawParameters.indexed, 0, 0};
+            direct.objPrimIdBase = drawParameters.objPrimIdBase;
             if (drawParameters.indexed) {
                 if (arguments.firstVertexOrIndex >= drawParameters.indexCount) continue;
                 direct.indexAddress = drawParameters.indexAddress + static_cast<std::uint64_t>(arguments.firstVertexOrIndex) * drawParameters.indexSize;
@@ -911,6 +912,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 }
             }
             Pm4::DrawParameters direct{0, arguments.count, 0, arguments.instances, drawParameters.flags, drawParameters.indexed, 0, 0};
+            direct.objPrimIdBase = drawParameters.objPrimIdBase;
             if (drawParameters.indexed) {
 
                 if (arguments.firstVertexOrIndex >= drawParameters.indexCount) continue;

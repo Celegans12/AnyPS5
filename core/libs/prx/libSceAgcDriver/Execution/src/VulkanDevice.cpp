@@ -1748,6 +1748,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     // PA_CL_CLIP_CNTL near/far clip disable maps to depth clamping.
     enabled.depthClamp = available.depthClamp;
     state->depthClamp = enabled.depthClamp == VK_TRUE;
+    enabled.independentBlend = available.independentBlend;
     enabled.depthBounds = available.depthBounds;
     state->depthBounds = enabled.depthBounds == VK_TRUE;
     enabled.depthBiasClamp = available.depthBiasClamp;

@@ -557,6 +557,21 @@ int main() {
         const auto replay35 = serializer.Deserialize(EncodeBase64(version35));
         Require(replay35.request.target.spannedWaves == spanned && !replay35.request.target.float32FlushToZero);
     }
+    request.context.pixel->objPrimIdTarget = 2u;
+    const auto objPrimIdEncoded = serializer.Serialize(request);
+    const auto objPrimId = serializer.Deserialize(objPrimIdEncoded);
+    Require(objPrimId.request.context.pixel.has_value() && objPrimId.request.context.pixel->objPrimIdTarget == 2u && serializer.Serialize(objPrimId.request) == objPrimIdEncoded);
+    auto badTarget = DecodeBase64(objPrimIdEncoded);
+    badTarget.back() = 9u;
+    bool badTargetRejected = false;
+    try {
+        static_cast<void>(serializer.Deserialize(EncodeBase64(badTarget)));
+    } catch (const std::runtime_error& error) {
+        badTargetRejected = std::string_view(error.what()) == "RequestSerializer: invalid object/primitive ID target";
+    }
+    Require(badTargetRejected);
+    request.context.pixel->objPrimIdTarget = 0u;
+    Require(serializer.Deserialize(serializer.Serialize(request)).request.context.pixel->objPrimIdTarget == 0u);
 
     return 0;
 }

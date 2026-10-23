@@ -600,6 +600,7 @@ void encodeInvocation(Writer& writer, const ShaderInvocation& invocation) {
     writer.Value<std::uint64_t>(invocation.pushConstants.size());
     for (const auto byte : invocation.pushConstants) writer.Value(static_cast<std::uint8_t>(byte));
     writer.Value(invocation.readsDepthRemapPush);
+    writer.Value(invocation.readsObjPrimIdPush);
     writer.List(invocation.vertexAttributes, [](Writer& out, const VertexAttribute& attribute) {
         out.Value(attribute.location);
         out.Value(attribute.components);
@@ -654,6 +655,7 @@ void decodeInvocation(Reader& reader, ShaderInvocation& invocation) {
     invocation.pushConstants.resize(pushConstants.size());
     if (!pushConstants.empty()) std::memcpy(invocation.pushConstants.data(), pushConstants.data(), pushConstants.size());
     reader.Value(invocation.readsDepthRemapPush);
+    reader.Value(invocation.readsObjPrimIdPush);
     reader.List(invocation.vertexAttributes, 32, [](Reader& in, VertexAttribute& attribute) {
         in.Value(attribute.location);
         in.Value(attribute.components);

@@ -154,6 +154,7 @@ ShaderStageInputInfo BuildShaderStageInputInfo(ShaderStageKind stage, const Gues
         pixelStorage.psSampleMaskExportEnable = pixel.sampleMaskExportEnable;
         pixelStorage.psStencilRefExportEnable = pixel.stencilRefExportEnable;
         pixelStorage.psStencilOperationValueExport = pixel.stencilOperationValueExport;
+        pixelStorage.objPrimIdTarget = pixel.objPrimIdTarget;
         pixelStorage.psSampleShading = pixel.sampleShading;
         pixelStorage.psEarlyZ = pixel.earlyZ;
         pixelStorage.psExecuteOnNoop = pixel.executeOnNoop;

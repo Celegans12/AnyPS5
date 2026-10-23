@@ -210,6 +210,7 @@ struct ShaderPixelStageInfo {
     bool iteratesSamples = false;
     PixelPositionLocation positionLocation = PixelPositionLocation::Center;
     std::array<std::uint8_t, 32> sampleLocations{};
+    std::uint8_t objPrimIdTarget = 0;
 };
 
 struct ShaderVertexBufferResource {
@@ -381,6 +382,8 @@ inline constexpr std::uint32_t TessellationLevelPushOffsetBytes = 120;
 inline constexpr std::uint32_t TessellationLevelPushBytes = 8;
 inline constexpr std::uint32_t DepthRemapPushOffsetBytes = 104;
 inline constexpr std::uint32_t DepthRemapPushBytes = 8;
+inline constexpr std::uint32_t ObjPrimIdPushOffsetBytes = 252;
+inline constexpr std::uint32_t ObjPrimIdPushSlotOffsetBytes = 128;
 inline constexpr std::uint32_t MeshArgumentAddressDword = 4;
 inline constexpr std::uint32_t MeshArgumentIndexCountDword = 3;
 inline constexpr std::uint32_t MeshArgumentFirstIndexDword = 4;
@@ -835,6 +838,7 @@ struct ShaderInvocation {
     std::vector<DescriptorBinding> bindings;
     std::vector<std::byte> pushConstants;
     bool readsDepthRemapPush = false;
+    bool readsObjPrimIdPush = false;
     std::vector<VertexAttribute> vertexAttributes;
     std::uint64_t userDataRegisterReads = 0;
     std::uint32_t poisonedSrtReads = 0;

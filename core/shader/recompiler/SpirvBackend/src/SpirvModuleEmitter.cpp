@@ -1648,6 +1648,21 @@ void EmitProgram(SpirvEmitterState& state) {
         state.module.AddFunction(spv::OpBeginInvocationInterlockEXT);
     }
     EmitMemoryOffsets(state);
+    if (state.objPrimIdOutput != 0u) {
+        const auto pointer = state.module.AllocateId();
+        state.module.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state), pointer, state.objPrimIdPushVariable, ConstantU32(state, 0u), ConstantU32(state, state.objPrimIdPushIndex));
+        const auto base = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, TypeU32(state), base, pointer);
+        const auto primitiveSigned = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, TypeI32(state), primitiveSigned, state.objPrimIdPrimitive);
+        const auto primitive = state.module.AllocateId();
+        state.module.AddFunction(spv::OpBitcast, TypeU32(state), primitive, primitiveSigned);
+        const auto value = state.module.AllocateId();
+        state.module.AddFunction(spv::OpIAdd, TypeU32(state), value, base, primitive);
+        const auto vector = state.module.AllocateId();
+        state.module.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4u), vector, value, ConstantU32(state, 0u), ConstantU32(state, 0u), ConstantU32(state, 0u));
+        state.module.AddFunction(spv::OpStore, state.objPrimIdOutput, vector);
+    }
     if (state.program.Resources().stage == IrShaderStage::Pixel && state.inputInfo.pixel != nullptr && state.inputInfo.pixel->QuadMasked()) {
         const auto& pixel = *state.inputInfo.pixel;
         const auto quad = EmitQuadPixel(state);
