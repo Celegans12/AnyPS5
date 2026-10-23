@@ -225,7 +225,8 @@ std::uint32_t readBuffer(SpirvValueEmitContext& context, const IrValue& instruct
     const auto load = [&](std::uint32_t word) {
         const auto value = state.module.AllocateId();
         const auto pointer = EmitMemoryElementPointer(state, access, word);
-        if (access.physical) state.module.AddFunction(spv::OpLoad, TypeU32(state), value, pointer, access.memoryAccess | spv::MemoryAccessAlignedMask, 4u);
+        if (access.physical && context.Memory(instruction).coherent) state.module.AddFunction(spv::OpAtomicLoad, TypeU32(state), value, pointer, ConstantU32(state, spv::ScopeDevice), ConstantU32(state, spv::MemorySemanticsMaskNone));
+        else if (access.physical) state.module.AddFunction(spv::OpLoad, TypeU32(state), value, pointer, access.memoryAccess | spv::MemoryAccessAlignedMask, 4u);
         else if (access.memoryAccess != 0u) state.module.AddFunction(spv::OpLoad, TypeU32(state), value, pointer, access.memoryAccess);
         else state.module.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
         return value;
@@ -324,7 +325,8 @@ void writeBuffer(SpirvValueEmitContext& context, const IrValue& instruction, std
         if (bits == 32u) {
             EmitIfCondition(state, Unary(state, spv::OpLogicalNot, TypeBool(state), unaligned), [&] {
                 const auto pointer = EmitMemoryElementPointer(state, access, index);
-                if (access.physical) state.module.AddFunction(spv::OpStore, pointer, value, access.memoryAccess | spv::MemoryAccessAlignedMask, 4u);
+                if (access.physical && context.Memory(instruction).coherent) state.module.AddFunction(spv::OpAtomicStore, pointer, ConstantU32(state, spv::ScopeDevice), ConstantU32(state, spv::MemorySemanticsMaskNone), value);
+                else if (access.physical) state.module.AddFunction(spv::OpStore, pointer, value, access.memoryAccess | spv::MemoryAccessAlignedMask, 4u);
                 else if (access.memoryAccess != 0u) state.module.AddFunction(spv::OpStore, pointer, value, access.memoryAccess);
                 else state.module.AddFunction(spv::OpStore, pointer, value);
             });
@@ -789,7 +791,8 @@ struct CoherentPair {
 std::optional<CoherentPair> coherentPair(SpirvValueEmitContext& context, const IrValue& instruction, const RuntimeDescriptor& resource, std::uint32_t components) {
     auto& state = context.state;
     const auto& memory = context.Memory(instruction);
-    if (components != 2u || !memory.coherent || memory.gpuDescriptor || memory.dataBits != 32u || state.storageBufferU64Variable == 0u) return std::nullopt;
+    const bool wideView = state.addressedBuffers ? state.requirements.bufferU64View : state.storageBufferU64Variable != 0u;
+    if (components != 2u || !memory.coherent || memory.gpuDescriptor || memory.dataBits != 32u || !wideView) return std::nullopt;
     const auto low = address(context, instruction, resource, 0u, 4u);
     const auto high = address(context, instruction, resource, 4u, 4u);
     const auto wide = directAccess(context, instruction, true);
