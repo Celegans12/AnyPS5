@@ -23,6 +23,7 @@
 #include <atomic>
 #include <limits>
 #include <mutex>
+#include <set>
 #include <string>
 #include <unordered_map>
 
@@ -403,6 +404,27 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     {
         const auto traced = DepthSurfaceTraceTarget();
         Graphics::SetDepthSurfaceTrace(traced);
+        if (traced != 0 && decode->state.depth && decode->state.depth->address == traced) {
+            static std::mutex dumpMutex;
+            static std::set<std::size_t> dumpedClasses;
+            const auto colorClass = decode->state.colors.size();
+            bool dump = false;
+            {
+                std::lock_guard dumpLock(dumpMutex);
+                dump = dumpedClasses.insert(colorClass).second;
+            }
+            char name[64];
+            std::snprintf(name, sizeof(name), "draw_c%zu.regs", colorClass);
+            if (dump) {
+                if (std::FILE* file = std::fopen(name, "w")) {
+                    std::fprintf(file, "vs 0x%llx ps 0x%llx indirect %d\n", static_cast<unsigned long long>(vertexProgram), static_cast<unsigned long long>(pixelProgram), drawParameters.indirect.has_value() ? 1 : 0);
+                    for (const auto& [offset, value] : queue.context) std::fprintf(file, "context %x %08x\n", offset, value);
+                    for (const auto& [offset, value] : queue.userConfig) std::fprintf(file, "uconfig %x %08x\n", offset, value);
+                    for (const auto& [offset, value] : queue.shader) std::fprintf(file, "shader %x %08x\n", offset, value);
+                    std::fclose(file);
+                }
+            }
+        }
         if (traced != 0 && decode->state.depth && decode->state.depth->address == traced) std::fprintf(stderr, "[depth-trace] draw vs 0x%llx ps 0x%llx colors %zu indirect %d test %d write %d cmp %d index 0x%llx\n", static_cast<unsigned long long>(vertexProgram), static_cast<unsigned long long>(pixelProgram), decode->state.colors.size(), drawParameters.indirect.has_value() ? 1 : 0, decode->state.depthTest ? 1 : 0, decode->state.depthWrite ? 1 : 0, static_cast<int>(decode->state.depthCompare), static_cast<unsigned long long>(drawParameters.indexAddress));
     }
     bool skipDepthOnly = false;
