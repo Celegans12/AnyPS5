@@ -5601,6 +5601,63 @@ std::vector<AddressRange> MergeByBegin(std::span<const AddressRange> left, const
 
 }
 
+// Range lists of merged BDA tables (~9,400 ranges, ~300 KiB each in Yotei's world), recycled: a fresh one
+// for every merge was an mmap of new pages and ~75 first-touch faults, and an munmap when the table left the
+// caches (best135: ~100 us a merge for a ~18 us copy). A list returns here when its last owner (the space's
+// table map, BdaResources' table cache, a build) lets go. Bounded; a list over the bound is freed.
+struct RangeListPool {
+    std::mutex mutex;
+    std::vector<std::unique_ptr<std::vector<ShaderRecompiler::BdaAbi::Range>>> free;
+};
+RangeListPool& rangeListPool() {
+    static auto* pool = new RangeListPool();
+    return *pool;
+}
+std::unique_ptr<std::vector<ShaderRecompiler::BdaAbi::Range>> takeRangeList() {
+    auto& pool = rangeListPool();
+    std::lock_guard lock(pool.mutex);
+    if (pool.free.empty()) return std::make_unique<std::vector<ShaderRecompiler::BdaAbi::Range>>();
+    auto list = std::move(pool.free.back());
+    pool.free.pop_back();
+    return list;
+}
+std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>> pooledRangeList(std::unique_ptr<std::vector<ShaderRecompiler::BdaAbi::Range>> list) {
+    return std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>>(list.release(), [](const std::vector<ShaderRecompiler::BdaAbi::Range>* done) {
+        std::unique_ptr<std::vector<ShaderRecompiler::BdaAbi::Range>> owned(const_cast<std::vector<ShaderRecompiler::BdaAbi::Range>*>(done));
+        auto& pool = rangeListPool();
+        std::lock_guard lock(pool.mutex);
+        if (pool.free.size() < 128u) pool.free.push_back(std::move(owned));
+    });
+}
+
+// APS5_PROFILE_DRAW: CachedAddressTable by path ([address-table], 10 s): quick returns, key lookups that
+// found the ranges, and misses that merged them anew (AddressRanges), with the key's length.
+struct AddressTableTimes {
+    std::atomic<std::uint64_t> quick{0}, hits{0}, hitNs{0}, misses{0}, missNs{0}, mergeNs{0}, keyWords{0};
+    std::atomic<std::uint64_t> spaceRanges{0}, regionCount{0}, overlayCount{0}, writeCount{0}, resultRanges{0};
+    // incrementalAddressRanges: the result vector's allocation and copies of the unchanged ranges, and the rest.
+    std::atomic<std::uint64_t> assembleNs{0}, groupNs{0};
+    std::atomic<long long> lastReport{0};
+};
+AddressTableTimes& addressTableTimes() {
+    static AddressTableTimes times;
+    return times;
+}
+void reportAddressTableTimes() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile) return;
+    auto& t = addressTableTimes();
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = t.lastReport.load();
+    if (nowMs - last < 10000 || !t.lastReport.compare_exchange_strong(last, nowMs)) return;
+    const auto take = [](std::atomic<std::uint64_t>& value) { return value.exchange(0, std::memory_order_relaxed); };
+    const auto quick = take(t.quick), hits = take(t.hits), hitNs = take(t.hitNs), misses = take(t.misses), missNs = take(t.missNs), mergeNs = take(t.mergeNs), words = take(t.keyWords);
+    const auto per = [&](std::atomic<std::uint64_t>& value) { const auto v = take(value); return misses != 0 ? static_cast<double>(v) / static_cast<double>(misses) : 0.0; };
+    const auto spaceAvg = per(t.spaceRanges), regionAvg = per(t.regionCount), overlayAvg = per(t.overlayCount), writeAvg = per(t.writeCount), resultAvg = per(t.resultRanges);
+    std::fprintf(stderr, "[address-table] (10 s): per merge: space %.0f ranges, regions %.0f, overlays %.0f, writes %.0f -> %.0f ranges; incremental: copies %.1f us, edit groups %.1f us\n", spaceAvg, regionAvg, overlayAvg, writeAvg, resultAvg, per(t.assembleNs) / 1000.0, per(t.groupNs) / 1000.0);
+    std::fprintf(stderr, "[address-table] (10 s): quick %llu; key hits %llu x %.1f us; misses %llu x %.1f us (merge %.1f us); key %.0f words avg\n", static_cast<unsigned long long>(quick), static_cast<unsigned long long>(hits), hits != 0 ? static_cast<double>(hitNs) / 1000.0 / static_cast<double>(hits) : 0.0, static_cast<unsigned long long>(misses), misses != 0 ? static_cast<double>(missNs) / 1000.0 / static_cast<double>(misses) : 0.0, misses != 0 ? static_cast<double>(mergeNs) / 1000.0 / static_cast<double>(misses) : 0.0, hits + misses != 0 ? static_cast<double>(words) / static_cast<double>(hits + misses) : 0.0);
+}
+
 std::vector<ShaderRecompiler::BdaAbi::Range> GuestBufferMemory::AddressRanges() const {
     Require(uploaded && !committed, "guest GPU address ranges are not available");
     std::vector<ShaderRecompiler::BdaAbi::Range> result;
@@ -5721,7 +5778,7 @@ std::vector<ShaderRecompiler::BdaAbi::Range> GuestBufferMemory::applyOverlaysAnd
 // space ranges between the spans are copied. The result is the same list. APS5_VERIFY_BDA_INCREMENTAL=1
 // compares every result with AddressRanges(); APS5_NO_INCREMENTAL_BDA_RANGES=1 (runtime switch) merges
 // in full.
-std::vector<ShaderRecompiler::BdaAbi::Range> GuestBufferMemory::incrementalAddressRanges() const {
+void GuestBufferMemory::incrementalAddressRanges(std::vector<ShaderRecompiler::BdaAbi::Range>& result) const {
     Require(uploaded && !committed && space != nullptr, "incremental BDA ranges need the cached space");
     using Range = ShaderRecompiler::BdaAbi::Range;
     const std::span<const Range> spaceRanges(space->ranges);
@@ -5767,11 +5824,14 @@ std::vector<ShaderRecompiler::BdaAbi::Range> GuestBufferMemory::incrementalAddre
         }
         index = next;
     }
-    std::vector<Range> result;
+    std::uint64_t groupNs = 0;
+    const auto assembleStart = std::chrono::steady_clock::now();
+    result.clear();
     result.reserve(spaceRanges.size() + edits.size() * 3u);
     std::size_t copied = 0;
     for (const auto& group : groups) {
         result.insert(result.end(), spaceRanges.begin() + static_cast<std::ptrdiff_t>(copied), spaceRanges.begin() + static_cast<std::ptrdiff_t>(group.first));
+        const auto groupStart = std::chrono::steady_clock::now();
         std::vector<Range> own;
         std::vector<Range> overlays;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> written;
@@ -5787,49 +5847,28 @@ std::vector<ShaderRecompiler::BdaAbi::Range> GuestBufferMemory::incrementalAddre
         std::vector<Range> uncovered;
         AppendUncovered(own, slice, uncovered);
         auto part = applyOverlaysAndWrites(MergeByBegin(slice, uncovered), std::move(overlays), written);
+        groupNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - groupStart).count());
         result.insert(result.end(), part.begin(), part.end());
         copied = group.last;
     }
     result.insert(result.end(), spaceRanges.begin() + static_cast<std::ptrdiff_t>(copied), spaceRanges.end());
+    {
+        const auto totalNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - assembleStart).count());
+        addressTableTimes().assembleNs.fetch_add(totalNs - std::min(totalNs, groupNs), std::memory_order_relaxed);
+        addressTableTimes().groupNs.fetch_add(groupNs, std::memory_order_relaxed);
+    }
     static const bool verify = std::getenv("APS5_VERIFY_BDA_INCREMENTAL") != nullptr;
     if (verify) {
         const auto full = AddressRanges();
         Require(full.size() == result.size() && (full.empty() || std::memcmp(full.data(), result.data(), full.size() * sizeof(Range)) == 0), "the incremental BDA ranges differ from AddressRanges()");
     }
-    return result;
-}
-
-// APS5_PROFILE_DRAW: CachedAddressTable by path ([address-table], 10 s): quick returns, key lookups that
-// found the ranges, and misses that merged them anew (AddressRanges), with the key's length.
-struct AddressTableTimes {
-    std::atomic<std::uint64_t> quick{0}, hits{0}, hitNs{0}, misses{0}, missNs{0}, mergeNs{0}, keyWords{0};
-    std::atomic<std::uint64_t> spaceRanges{0}, regionCount{0}, overlayCount{0}, writeCount{0}, resultRanges{0};
-    std::atomic<long long> lastReport{0};
-};
-AddressTableTimes& addressTableTimes() {
-    static AddressTableTimes times;
-    return times;
-}
-void reportAddressTableTimes() {
-    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    if (!profile) return;
-    auto& t = addressTableTimes();
-    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-    auto last = t.lastReport.load();
-    if (nowMs - last < 10000 || !t.lastReport.compare_exchange_strong(last, nowMs)) return;
-    const auto take = [](std::atomic<std::uint64_t>& value) { return value.exchange(0, std::memory_order_relaxed); };
-    const auto quick = take(t.quick), hits = take(t.hits), hitNs = take(t.hitNs), misses = take(t.misses), missNs = take(t.missNs), mergeNs = take(t.mergeNs), words = take(t.keyWords);
-    const auto per = [&](std::atomic<std::uint64_t>& value) { const auto v = take(value); return misses != 0 ? static_cast<double>(v) / static_cast<double>(misses) : 0.0; };
-    const auto spaceAvg = per(t.spaceRanges), regionAvg = per(t.regionCount), overlayAvg = per(t.overlayCount), writeAvg = per(t.writeCount), resultAvg = per(t.resultRanges);
-    std::fprintf(stderr, "[address-table] (10 s): per merge: space %.0f ranges, regions %.0f, overlays %.0f, writes %.0f -> %.0f ranges\n", spaceAvg, regionAvg, overlayAvg, writeAvg, resultAvg);
-    std::fprintf(stderr, "[address-table] (10 s): quick %llu; key hits %llu x %.1f us; misses %llu x %.1f us (merge %.1f us); key %.0f words avg\n", static_cast<unsigned long long>(quick), static_cast<unsigned long long>(hits), hits != 0 ? static_cast<double>(hitNs) / 1000.0 / static_cast<double>(hits) : 0.0, static_cast<unsigned long long>(misses), misses != 0 ? static_cast<double>(missNs) / 1000.0 / static_cast<double>(misses) : 0.0, misses != 0 ? static_cast<double>(mergeNs) / 1000.0 / static_cast<double>(misses) : 0.0, hits + misses != 0 ? static_cast<double>(words) / static_cast<double>(hits + misses) : 0.0);
 }
 
 std::optional<GuestBufferMemory::CachedTable> GuestBufferMemory::CachedAddressTable() const {
     if (space == nullptr) return std::nullopt;
     Require(uploaded && !committed, "guest GPU address ranges are not available");
-    if (writes.empty() && regions.empty()) return CachedTable{space->serial, &space->ranges};
-    if (tableRanges != nullptr) return CachedTable{tableSerial, tableRanges.get()};
+    if (writes.empty() && regions.empty()) return CachedTable{space->serial, &space->ranges, nullptr};
+    if (tableRanges != nullptr) return CachedTable{tableSerial, tableRanges.get(), tableRanges};
     const auto& spaceRanges = space->ranges;
     const bool inWritable = regions.empty() && std::all_of(writes.begin(), writes.end(), [&](const auto& written) {
         auto at = std::partition_point(spaceRanges.begin(), spaceRanges.end(), [&](const auto& range) { return range.end <= written.first; });
@@ -5840,7 +5879,7 @@ std::optional<GuestBufferMemory::CachedTable> GuestBufferMemory::CachedAddressTa
     });
     if (inWritable) {
         addressTableTimes().quick.fetch_add(1, std::memory_order_relaxed);
-        return CachedTable{space->serial, &space->ranges};
+        return CachedTable{space->serial, &space->ranges, nullptr};
     }
     const auto lookupStart = std::chrono::steady_clock::now();
     std::vector<ShaderRecompiler::BdaAbi::Range> own;
@@ -5862,7 +5901,17 @@ std::optional<GuestBufferMemory::CachedTable> GuestBufferMemory::CachedAddressTa
     } else {
         const auto mergeStart = std::chrono::steady_clock::now();
         const bool incremental = !RuntimeSwitches::Set(RuntimeSwitch::NoIncrementalBdaRanges);
-        tableRanges = std::make_shared<const std::vector<ShaderRecompiler::BdaAbi::Range>>(incremental ? incrementalAddressRanges() : AddressRanges());
+        if (incremental && !RuntimeSwitches::Set(RuntimeSwitch::NoLeanBdaTables)) {
+            auto list = takeRangeList();
+            incrementalAddressRanges(*list);
+            tableRanges = pooledRangeList(std::move(list));
+        } else if (incremental) {
+            std::vector<ShaderRecompiler::BdaAbi::Range> list;
+            incrementalAddressRanges(list);
+            tableRanges = std::make_shared<const std::vector<ShaderRecompiler::BdaAbi::Range>>(std::move(list));
+        } else {
+            tableRanges = std::make_shared<const std::vector<ShaderRecompiler::BdaAbi::Range>>(AddressRanges());
+        }
         {
             auto& t = addressTableTimes();
             std::size_t overlayRegions = 0;
@@ -5889,7 +5938,7 @@ std::optional<GuestBufferMemory::CachedTable> GuestBufferMemory::CachedAddressTa
         (found != space->tables.end() ? t.hitNs : t.missNs).fetch_add(ns, std::memory_order_relaxed);
     }
     reportAddressTableTimes();
-    return CachedTable{tableSerial, tableRanges.get()};
+    return CachedTable{tableSerial, tableRanges.get(), tableRanges};
 }
 
 bool GuestBufferMemory::HasCopiedWrites() const {
