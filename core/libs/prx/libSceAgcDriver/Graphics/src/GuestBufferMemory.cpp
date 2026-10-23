@@ -164,6 +164,8 @@ struct AddressReuseCounts {
     std::atomic<std::uint64_t> budgetRefusalsHeld{0};
     std::atomic<std::uint64_t> heldImportRefusals{0};
     std::atomic<std::uint64_t> heldImportRefusalsHeld{0};
+    std::atomic<std::uint64_t> sharedUses{0};
+    std::atomic<std::uint64_t> perUseSets{0};
 };
 
 AddressReuseCounts& ReuseCounts() {
@@ -3173,6 +3175,14 @@ void CountAddressReuseProof() {
     ReuseCounts().proofs.fetch_add(1, std::memory_order_relaxed);
 }
 
+void CountSharedAddressUse() {
+    ReuseCounts().sharedUses.fetch_add(1, std::memory_order_relaxed);
+}
+
+void CountPerUseAddressSet() {
+    ReuseCounts().perUseSets.fetch_add(1, std::memory_order_relaxed);
+}
+
 void CountAddressReuse(AddressReuse outcome, std::uint64_t proofNs) {
     auto& counts = ReuseCounts();
     counts.outcomes[static_cast<std::size_t>(outcome)].fetch_add(1, std::memory_order_relaxed);
@@ -3198,6 +3208,8 @@ AddressReuseStats AddressReuseCounters() {
     stats.budgetRefusalsHeld = load(counts.budgetRefusalsHeld);
     stats.heldImportRefusals = load(counts.heldImportRefusals);
     stats.heldImportRefusalsHeld = load(counts.heldImportRefusalsHeld);
+    stats.sharedUses = load(counts.sharedUses);
+    stats.perUseSets = load(counts.perUseSets);
     return stats;
 }
 
@@ -6086,6 +6098,36 @@ bool GuestBufferMemory::SameSnapshots(std::span<const GuestMemorySnapshot> snaps
         const auto bytes = region.buffer->Bytes();
         const auto offset = static_cast<std::size_t>(snapshot.address - region.begin);
         if (offset + snapshot.bytes.size() > bytes.size() || std::memcmp(bytes.data() + offset, snapshot.bytes.data(), snapshot.bytes.size()) != 0) return false;
+    }
+    return true;
+}
+
+bool GuestBufferMemory::SnapshotsServed(std::span<const GuestMemorySnapshot> snapshots) const {
+    for (const auto& snapshot : snapshots) {
+        const auto end = snapshot.address + snapshot.bytes.size();
+        const Region* owner = nullptr;
+        if (baseOverlap(snapshot.address, end, &owner) == BaseOverlap::Partial) return false;
+        if (owner == nullptr) {
+            for (const auto& region : regions) {
+                if (region.begin <= snapshot.address && end <= region.end) {
+                    owner = &region;
+                    break;
+                }
+            }
+        }
+        if (owner == nullptr) return false;
+        if (owner->writable || owner->hostBacked || owner->mirror != nullptr) {
+            if (liveSnapshotCompared(snapshot.address, snapshot.bytes.size()) && std::memcmp(reinterpret_cast<const void*>(snapshot.address), snapshot.bytes.data(), snapshot.bytes.size()) != 0) return false;
+            continue;
+        }
+        if (owner->buffer == nullptr || owner->direct != nullptr) return false;
+        const auto bytes = owner->buffer->Bytes();
+        const auto offset = static_cast<std::size_t>(snapshot.address - owner->begin);
+        if (offset + snapshot.bytes.size() > bytes.size() || std::memcmp(bytes.data() + offset, snapshot.bytes.data(), snapshot.bytes.size()) != 0) return false;
+    }
+    for (const auto& use : snapshotUses) {
+        if (use.live) continue;
+        if (std::none_of(snapshots.begin(), snapshots.end(), [&](const GuestMemorySnapshot& snapshot) { return snapshot.address == use.address && snapshot.bytes.size() == use.bytes; })) return false;
     }
     return true;
 }

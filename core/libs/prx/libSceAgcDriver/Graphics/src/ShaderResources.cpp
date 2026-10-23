@@ -3389,6 +3389,13 @@ bool AddressReuseEnabled() {
     return enabled;
 }
 
+// APS5_NO_BDA_TEMPLATES=1 (an APS5_AB switch): read-only address-table draw builds are cached only
+// by #6636's whole-build reuse (APS5_NO_ADDRESS_DRAW_REUSE unset), as before; else they are
+// templates (SharesUses, SnapshotsServed, per-use descriptor sets for changed data words).
+bool BdaTemplatesOn() {
+    return !RuntimeSwitches::Set(RuntimeSwitch::NoBdaTemplates);
+}
+
 void CompleteSnapshotWrites(std::span<const GuestMemorySnapshot> snapshots) {
     auto* recorder = Recorder::Active();
     if (recorder == nullptr || Recorder::InCompletion()) return;
@@ -3409,7 +3416,10 @@ void ShaderResources::noteReusable() {
     directRegions.clear();
     addressWrites.clear();
     if (storageTableBindings[0] != std::numeric_limits<std::size_t>::max() || storageTableBindings[1] != std::numeric_limits<std::size_t>::max()) return;
-    const bool addressBased = usesBda && drawBuild && AddressReuseEnabled();
+    bdaTemplate = false;
+    sharedUses = false;
+    const bool templated = usesBda && drawBuild && bdaReadOnly && BdaTemplatesOn();
+    const bool addressBased = usesBda && drawBuild && (AddressReuseEnabled() || templated);
     if (guestMemory.HasCopiedWrites() || (!addressBased && (HoldsLease() || usesBda)) || !multisampleSources.empty() || (bda != nullptr && LoopGuardEnabled())) return;
     if (std::any_of(storageTextures.begin(), storageTextures.end(), [](const auto& texture) { return texture != nullptr && DepthSurfaceAt(texture->Descriptor().baseAddress); })) return;
     if (addressBased && std::any_of(tableStages.begin(), tableStages.end(), [](const TableStage& table) { return std::find(table.elementTextures.begin(), table.elementTextures.end(), std::numeric_limits<std::size_t>::max()) != table.elementTextures.end(); })) return;
@@ -3437,6 +3447,12 @@ void ShaderResources::noteReusable() {
     if (addressBased) addressWrites = guestMemory.DirectWrites();
     reusable = true;
     addressReuse = addressBased;
+    bdaTemplate = templated;
+    sharedUses = templated && addressWrites.empty() && guestMemory.Writes().empty() && !guestMemory.HasGpuCopies() && !guestMemory.HasCopiedWrites() && std::none_of(storageWritten.begin(), storageWritten.end(), [](bool written) { return written; });
+}
+
+bool ShaderResources::SharesUses() const {
+    return sharedUses && BdaTemplatesOn();
 }
 
 std::uint64_t ShaderResources::DepthGuardRefusals() {
@@ -3446,9 +3462,11 @@ std::uint64_t ShaderResources::DepthGuardRefusals() {
 bool ShaderResources::NeverReusable(std::span<const CompiledShader> shaders) {
     const bool loopGuard = LoopGuardEnabled();
     const bool addressReuse = AddressReuseEnabled();
-    return std::any_of(shaders.begin(), shaders.end(), [loopGuard, addressReuse](const CompiledShader& shader) {
+    const bool never = std::any_of(shaders.begin(), shaders.end(), [loopGuard, addressReuse](const CompiledShader& shader) {
         return shader.program != nullptr && std::any_of(shader.program->bindings.begin(), shader.program->bindings.end(), [loopGuard, addressReuse](const ShaderRecompiler::DescriptorBinding& binding) { return (binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable && !addressReuse) || (loopGuard && binding.role == ShaderRecompiler::DescriptorRole::FaultBuffer); });
     });
+    if (!never || addressReuse || loopGuard || !BdaTemplatesOn()) return never;
+    return StagesStoreThroughAddresses(shaders);
 }
 
 // APS5_PROFILE_DRAW: the per-device descriptor caches' counters, every 10 s.
@@ -4327,9 +4345,13 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     auto& outcome = report != nullptr ? *report : proof;
     outcome = {ProofPath::Full, ProofFailure::Other};
     if (!reusable) return refuse(AddressReuse::NotReusable);
-    if (InUse()) return refuse(AddressReuse::InUse);
-    CompleteSnapshotWrites(snapshots);
-    if (!guestMemory.SameSnapshots(snapshots)) return refuse(AddressReuse::Snapshots);
+    const bool shared = SharesUses();
+    if (bdaTemplate && !BdaTemplatesOn()) return refuse(AddressReuse::NotReusable);
+    if (!shared && InUse()) return refuse(AddressReuse::InUse);
+    if (!bdaTemplate) {
+        CompleteSnapshotWrites(snapshots);
+        if (!guestMemory.SameSnapshots(snapshots)) return refuse(AddressReuse::Snapshots);
+    }
     struct Suspend {
         GuestBufferMemory& memory;
         bool armed = true;
@@ -4339,6 +4361,10 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     } suspend{guestMemory};
     try {
         if (!guestMemory.ResumeSpace()) return refuse(AddressReuse::Space);
+        if (bdaTemplate) {
+            CompleteSnapshotWrites(snapshots);
+            if (!guestMemory.SnapshotsServed(snapshots)) return refuse(AddressReuse::Snapshots);
+        }
         if (!proveBuild(shaders, &outcome)) return refuse(outcome.failure == ProofFailure::Imports ? AddressReuse::Imports : AddressReuse::Proof);
         if (!guestMemory.SpaceImportsCurrent()) {
             outcome.failure = ProofFailure::Imports;
@@ -4350,6 +4376,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     }
     suspend.armed = false;
     reuseProved = true;
+    if (shared && InUse()) CountSharedAddressUse();
     return true;
 }
 
@@ -6520,7 +6547,7 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
             }
         }
     }
-    if (usesBda && !moved.empty()) return std::nullopt;
+    if (usesBda && !moved.empty() && !(bdaTemplate && BdaTemplatesOn())) return std::nullopt;
     return moved;
 }
 
@@ -6597,7 +6624,12 @@ std::size_t ShaderResources::DrawUploadLimit() {
 }
 
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly) const {
-    if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return {};
+    if (_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) return {};
+    if (usesBda) {
+        if (!bdaTemplate || moved.empty()) return {};
+        movedOnly = true;
+        CountPerUseAddressSet();
+    }
     thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* readsSlot = nullptr;
     auto& reads = ShaderRecompiler::ThreadOwned(readsSlot);
     guestMemory.InPlaceReads(reads);

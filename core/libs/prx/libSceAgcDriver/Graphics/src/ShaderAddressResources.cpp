@@ -116,6 +116,12 @@ bool SpirvStoresThroughAddresses(std::span<const std::uint32_t> words) {
     return stores;
 }
 
+bool ShaderResources::StagesStoreThroughAddresses(std::span<const CompiledShader> shaders) {
+    return std::any_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) {
+        return shader.program != nullptr && std::any_of(shader.program->bindings.begin(), shader.program->bindings.end(), [](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable; }) && storesThroughAddressesCached(shader.program->spirv);
+    });
+}
+
 void ShaderResources::prepareAddressBindings(std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots) {
     static const bool loopGuarded = std::getenv("APS5_LOOP_GUARD") != nullptr;
     for (const auto& shader : shaders) {

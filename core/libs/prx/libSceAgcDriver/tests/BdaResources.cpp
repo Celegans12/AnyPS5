@@ -4,6 +4,7 @@
 #include "IntermediateRepresentation/IrMetadata/ShaderInfo.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestHeap.hpp"
@@ -3393,7 +3394,7 @@ void addressMovedBufferTests(const Context& context) {
     recorder.Sync();
 }
 
-void addressRejectedTableElementTests(const Context& context) {
+void addressRejectedTableElementTests(const Context& context, bool readOnly) {
     namespace Abi = ShaderRecompiler::ImageTableAbi;
     constexpr std::size_t surfaceBytes = 65536;
     constexpr std::uint32_t width = 64;
@@ -3429,6 +3430,7 @@ void addressRejectedTableElementTests(const Context& context) {
     images.imageDepthCompare = {false};
     images.imageSamplers = {0u};
     fragment.bindings = {binding(Role::BdaPagetable, 4), binding(Role::FaultBuffer, 5), map, images};
+    if (readOnly) fragment.spirv = std::vector<std::uint32_t>{0x07230203u, 0x10300u, 0u, 1u, 0u};
     const std::array<CompiledShader, 2> stages{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}}};
     std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
     Recorder recorder(tableContext);
@@ -3489,6 +3491,141 @@ void addressFailedSubmissionTests(const Context& context, const BdaTestAccess& a
         resources->WriteBack();
     }
     recorder.Sync();
+}
+
+// Address-table templates (APS5_NO_BDA_TEMPLATES unset): a read-only address-table draw build
+// serves later draws while earlier uses are still in flight, takes changed data words through a
+// descriptor set of each use's own and is never written itself. Memory read through the table is
+// served in place, so a store between two uses reaches the GPU; a snapshot copy whose bytes changed,
+// a capture that no longer equals memory, a capture outside the build's regions or one no longer
+// captured makes the draw build again. A build that stores through BDA keeps one use at a time.
+void addressTemplateTests(const Context& context) {
+    if (!AddressSpaceCounters().enabled) {
+        std::cout << "cached address space disabled: address-table templates not tested\n";
+        return;
+    }
+    constexpr std::size_t piece = 65536;
+    auto* block = static_cast<std::byte*>(::operator new(piece, std::align_val_t{piece}));
+    std::memset(block, 0x5a, piece);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    auto importing = context;
+    importing.hostImportAlignment = piece;
+    DescriptorCache descriptors(importing);
+    importing.descriptorCache = &descriptors;
+    const auto change = [&](bool add) {
+        auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
+        if (add) GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, block, piece, true, true, true);
+        else GuestAllocations::GuestAllocationsRemove_nid_postfix(mutation, block);
+        GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
+    };
+    change(true);
+    alignas(256) static std::array<std::byte, 64> captured{};
+    captured.fill(std::byte{0x21});
+    alignas(256) static std::array<std::byte, 32> elsewhere{};
+    const auto capturedAddress = reinterpret_cast<std::uint64_t>(captured.data());
+    std::array<std::byte, 16> liveBytes{};
+    std::memcpy(liveBytes.data(), block + 128, liveBytes.size());
+    const std::array<GuestMemorySnapshot, 2> snapshots{{{capturedAddress, captured}, {address + 128, liveBytes}}};
+    ShaderRecompiler::RecompileResult vertex;
+    auto data = binding(Role::FlattenedSrt, 7);
+    data.guestDescriptor = {7u, 8u, 9u, 10u};
+    vertex.bindings = {data};
+    ShaderRecompiler::RecompileResult fragment;
+    fragment.bdaAbiVersion = ShaderRecompiler::BdaAbi::Version;
+    fragment.bindings = {binding(Role::BdaPagetable, 4), binding(Role::FaultBuffer, 5)};
+    fragment.spirv = std::vector<std::uint32_t>{0x07230203u, 0x10300u, 0u, 1u, 0u};
+    auto storing = fragment;
+    storing.spirv = std::vector<std::uint32_t>{};
+    auto rewritten = vertex;
+    rewritten.bindings[0].guestDescriptor = {7u, 8u, 9u, 11u};
+    auto again = vertex;
+    again.bindings[0].guestDescriptor = {7u, 8u, 9u, 12u};
+    const std::array<CompiledShader, 2> built{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}}};
+    const std::array<CompiledShader, 2> storingStages{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &storing, 0}}};
+    const std::array<CompiledShader, 2> storingRewritten{{{ShaderRecompiler::ShaderStage::Vertex, &rewritten, 0}, {ShaderRecompiler::ShaderStage::Fragment, &storing, 0}}};
+    const std::array<CompiledShader, 2> rewrittenStages{{{ShaderRecompiler::ShaderStage::Vertex, &rewritten, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}}};
+    const std::array<CompiledShader, 2> againStages{{{ShaderRecompiler::ShaderStage::Vertex, &again, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}}};
+    Require(!ShaderResources::StagesStoreThroughAddresses(built) && ShaderResources::StagesStoreThroughAddresses(storingStages), "a read-only BDA stage was taken for a storing one, or the reverse");
+    const auto words = [](const ShaderResources::DrawBindings& bindings, std::initializer_list<std::uint32_t> expected) {
+        if (bindings.snapshots.size() != 1) return false;
+        const auto bytes = bindings.snapshots.front().Bytes();
+        const std::vector<std::uint32_t> list(expected);
+        return bytes.size() == list.size() * sizeof(std::uint32_t) && std::memcmp(bytes.data(), list.data(), bytes.size()) == 0;
+    };
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        Recorder recorder(importing);
+        const auto take = [&](const std::shared_ptr<ShaderResources>& resources) {
+            recorder.OnComplete([resources, hold = resources->BeginUse()]() mutable {
+                const auto held = std::move(hold);
+                resources->CompleteUse();
+            });
+            resources->EndUse();
+        };
+        auto resources = std::make_shared<ShaderResources>(importing, built, ColorTarget{}, 0, 0, 0, std::span<const GuestMemorySnapshot>(snapshots));
+        Require(resources->UsesAddressTable() && resources->Reusable() && resources->ReusesAddressSpace() && resources->SharesUses(), "a read-only address-table draw build is not a shared template");
+        take(resources);
+        Require(resources->InUse(), "a template taken by a recorded batch is not in use");
+        Require(resources->Revalidate(built, nullptr, snapshots), "a template with a use in flight was not proved for another use");
+        take(resources);
+        block[130] = std::byte{0x77};
+        Require(!resources->Revalidate(built, nullptr, snapshots), "a template took a capture that no longer equals the memory it reads in place");
+        auto storedBytes = liveBytes;
+        storedBytes[2] = std::byte{0x77};
+        const std::array<GuestMemorySnapshot, 2> stored{{snapshots[0], {address + 128, storedBytes}}};
+        Require(resources->Revalidate(built, nullptr, stored), "a template refused a draw after a store to memory it reads in place");
+        take(resources);
+        {
+            GuestBufferMemory memory(importing);
+            memory.AcquireRegistered();
+            for (const auto& snapshot : stored) memory.AddSnapshot(snapshot);
+            memory.Upload(true);
+            const auto ranges = memory.AddressRanges();
+            const auto found = std::find_if(ranges.begin(), ranges.end(), [&](const auto& range) { return range.begin <= address + 130 && address + 131 <= range.end; });
+            const auto* import = ExistingHostImportFor(importing, address, piece);
+            Require(found != ranges.end() && import != nullptr && found->deviceAddress >= import->address && found->deviceAddress + (found->end - found->begin) <= import->address + import->bytes, "the address space does not serve registered memory in place from its host import");
+            memory.WriteBack();
+        }
+        auto otherCapture = captured;
+        otherCapture[3] = std::byte{0x22};
+        const std::array<GuestMemorySnapshot, 2> otherCopied{{{capturedAddress, otherCapture}, stored[1]}};
+        Require(!resources->Revalidate(built, nullptr, otherCopied), "a template took a snapshot copy whose bytes changed");
+        Require(!resources->Revalidate(built, nullptr, std::span<const GuestMemorySnapshot>(&stored[1], 1)), "a template served a draw that no longer captures its snapshot copy");
+        const std::array<GuestMemorySnapshot, 3> outside{{stored[0], stored[1], {reinterpret_cast<std::uint64_t>(elsewhere.data()), elsewhere}}};
+        Require(!resources->Revalidate(built, nullptr, outside), "a template served a draw capturing memory outside its regions");
+        Require(resources->Revalidate(rewrittenStages, nullptr, stored), "a template was not proved for a draw with other data words");
+        const auto moved = resources->MovedReadOnlyBuffers(rewrittenStages, recorder);
+        Require(moved.has_value() && moved->size() == 1, "a template refused a draw with other data words");
+        const auto first = resources->PrepareDrawBindings(recorder, *moved);
+        Require(first != nullptr && first->allocation.set != VK_NULL_HANDLE && words(*first, {7u, 8u, 9u, 11u}), "a template's use with other data words got no descriptor set of its own holding them");
+        take(resources);
+        const auto unchanged = resources->MovedReadOnlyBuffers(built, recorder);
+        Require(unchanged.has_value() && unchanged->empty(), "a use with other data words wrote the template's own data words");
+        Require(resources->Revalidate(againStages, nullptr, stored), "a template was not proved for a third use");
+        const auto movedAgain = resources->MovedReadOnlyBuffers(againStages, recorder);
+        Require(movedAgain.has_value() && movedAgain->size() == 1, "a template refused a third use's data words");
+        const auto second = resources->PrepareDrawBindings(recorder, *movedAgain);
+        Require(second != nullptr && second->allocation.set != first->allocation.set && words(*second, {7u, 8u, 9u, 12u}) && words(*first, {7u, 8u, 9u, 11u}), "two uses in flight with other data words share a descriptor set or a data buffer");
+        take(resources);
+        Require(resources->PrepareDrawBindings(recorder, {}) == nullptr, "a template use with its own data words took a descriptor set of its own");
+        auto writer = std::make_shared<ShaderResources>(importing, storingStages, ColorTarget{}, 0, 0, 0, std::span<const GuestMemorySnapshot>(snapshots));
+        Require(!writer->SharesUses(), "an address-table build that stores through BDA is a shared template");
+        take(writer);
+        Require(!writer->Revalidate(storingStages, nullptr, snapshots), "an address-table build that stores through BDA was proved while a use was in flight");
+        Require(!writer->MovedReadOnlyBuffers(storingRewritten, recorder).has_value(), "an address-table build that stores through BDA took other data words");
+        RuntimeSwitches::Assign(RuntimeSwitch::NoBdaTemplates, true);
+        Require(!resources->SharesUses() && !resources->Revalidate(built, nullptr, stored) && !resources->MovedReadOnlyBuffers(rewrittenStages, recorder).has_value(), "APS5_NO_BDA_TEMPLATES left a template in use");
+        Require(ShaderResources::NeverReusable(built) == ShaderResources::NeverReusable(storingStages), "APS5_NO_BDA_TEMPLATES kept a read-only address-table draw cacheable apart from storing ones");
+        auto plain = std::make_shared<ShaderResources>(importing, built, ColorTarget{}, 0, 0, 0, std::span<const GuestMemorySnapshot>(snapshots));
+        Require(!plain->SharesUses() && plain->PrepareDrawBindings(recorder, *moved) == nullptr, "APS5_NO_BDA_TEMPLATES built a template");
+        RuntimeSwitches::Assign(RuntimeSwitch::NoBdaTemplates, false);
+        recorder.Sync();
+        Require(!resources->InUse() && !writer->InUse(), "uses stayed in flight after their batches completed");
+        for (auto* item : {&resources, &writer, &plain}) (*item)->WriteBack();
+    }
+    ClearSnapshotCopies(importing.device);
+    change(false);
+    ::operator delete(block, std::align_val_t{piece});
 }
 
 // S1: a draw build made in two stages (DeferredDrawBuild: stage A on another thread without the
@@ -3773,8 +3910,10 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     snapshotTableTests(context, access);
     spaceReuseTests(context);
     addressMovedBufferTests(context);
-    addressRejectedTableElementTests(context);
+    addressRejectedTableElementTests(context, false);
+    addressRejectedTableElementTests(context, true);
     addressFailedSubmissionTests(context, access);
+    addressTemplateTests(context);
     importSpanTests(context);
     failedImportRemapTests(context, access);
     spaceImportRunTests(context);

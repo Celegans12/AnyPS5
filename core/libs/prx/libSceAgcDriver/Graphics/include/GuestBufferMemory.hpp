@@ -257,8 +257,12 @@ struct AddressReuseStats {
     std::uint64_t budgetRefusalsHeld = 0;
     std::uint64_t heldImportRefusals = 0;
     std::uint64_t heldImportRefusalsHeld = 0;
+    std::uint64_t sharedUses = 0;
+    std::uint64_t perUseSets = 0;
 };
 void CountAddressReuseProof();
+void CountSharedAddressUse();
+void CountPerUseAddressSet();
 void CountAddressReuse(AddressReuse outcome, std::uint64_t proofNs = 0);
 void HoldReusedSpace(bool held);
 AddressReuseStats AddressReuseCounters();
@@ -411,6 +415,13 @@ public:
     // or copied out of their imports and of the written ranges.
     void RunAccesses(std::vector<std::array<std::uint64_t, 3>>& out) const;
     bool SameSnapshots(std::span<const GuestMemorySnapshot> snapshots) const;
+    // Address-table templates (APS5_NO_BDA_TEMPLATES unset): whether a build of `snapshots` over the
+    // current (resumed) address space would add no region of its own beyond this upload's: every
+    // snapshot lies inside a live region (registered memory, an import, a mirror) and agrees with
+    // it, or inside one of this upload's snapshot copies with the same bytes, and every snapshot copy
+    // of this upload is captured again at the same address and size. A live region serves the GPU in
+    // place, so a snapshot inside one may change between uses without a rebuild.
+    bool SnapshotsServed(std::span<const GuestMemorySnapshot> snapshots) const;
     void SuspendSpace() noexcept;
     bool ResumeSpace();
     bool SpaceImportsCurrent();

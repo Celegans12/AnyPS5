@@ -359,6 +359,8 @@ public:
     void KeepStorageImageBytes(Recorder& recorder) const;
     const std::vector<std::uint64_t>& MultisampleSources() const { return multisampleSources; }
     static bool NeverReusable(std::span<const CompiledShader> shaders);
+    // Whether a stage with a BDA page table stores through guest addresses (its SPIR-V; cached).
+    static bool StagesStoreThroughAddresses(std::span<const CompiledShader> shaders);
     static std::uint64_t DepthGuardRefusals();
     static std::uint64_t GuestBufferBytes(const Context& context, std::span<const std::uint32_t> words);
     const std::vector<std::shared_ptr<Texture>>& SampledTextures() const { return textures; }
@@ -375,6 +377,11 @@ public:
     bool ReusesAddressSpace() const { return addressReuse; }
     std::shared_ptr<const void> BeginUse();
     void CompleteUse();
+    // Address-table template (APS5_NO_BDA_TEMPLATES unset): a read-only address-table draw build
+    // (no store through BDA, no written buffer or image, no GPU copies) that later draws may use
+    // while earlier uses are still in flight; each use takes its own descriptor set for changed data
+    // words or moved read-only buffers, and the template itself is never written after its build.
+    bool SharesUses() const;
     void EndUse() noexcept;
     // `shaders` are the stages the object was built from, in build order (a recorded draw's vertex
     // and fragment stages, or one compute stage): their bindings are walked like the build did.
@@ -726,6 +733,8 @@ private:
     std::vector<SamplerSource> samplerSources;
     bool reusable = false;
     bool addressReuse = false;
+    bool bdaTemplate = false;
+    bool sharedUses = false;
     bool reuseProved = false;
     std::shared_ptr<std::atomic<std::uint32_t>> usesInFlight = std::make_shared<std::atomic<std::uint32_t>>(0u);
     std::vector<std::pair<std::uint64_t, std::uint64_t>> addressWrites;

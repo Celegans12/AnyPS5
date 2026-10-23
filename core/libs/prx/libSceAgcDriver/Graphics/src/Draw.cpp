@@ -635,6 +635,9 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     if (reuse.proofs != reuseSeen.proofs || reuseCount(AddressReuse::InUse) != 0) {
         std::fprintf(stderr, "[rescache] address-based draws: %llu proofs, %llu reused; refused: in use %llu, not reusable %llu, snapshots %llu, space %llu (state %llu, replaced %llu, device %llu, generation %llu, epoch %llu, mirrors %llu), images or buffers %llu, imports %llu, threw %llu, moved buffers %llu; %.1f ms in refused proofs; host import refusals: budget %llu (%llu while a reused draw held its space), held import %llu (%llu); pin-contention waits %llu (%.1f ms)\n", static_cast<unsigned long long>(reuse.proofs - reuseSeen.proofs), reuseCount(AddressReuse::Reused), reuseCount(AddressReuse::InUse), reuseCount(AddressReuse::NotReusable), reuseCount(AddressReuse::Snapshots), reuseCount(AddressReuse::Space), resumeMiss(SpaceResumeMiss::State), resumeMiss(SpaceResumeMiss::Replaced), resumeMiss(SpaceResumeMiss::Device), resumeMiss(SpaceResumeMiss::Generation), resumeMiss(SpaceResumeMiss::Epoch), resumeMiss(SpaceResumeMiss::Mirrors), reuseCount(AddressReuse::Proof), reuseCount(AddressReuse::Imports), reuseCount(AddressReuse::Threw), reuseCount(AddressReuse::Moved), static_cast<double>(reuse.refusedProofNs - reuseSeen.refusedProofNs) / 1e6, static_cast<unsigned long long>(reuse.budgetRefusals - reuseSeen.budgetRefusals), static_cast<unsigned long long>(reuse.budgetRefusalsHeld - reuseSeen.budgetRefusalsHeld), static_cast<unsigned long long>(reuse.heldImportRefusals - reuseSeen.heldImportRefusals), static_cast<unsigned long long>(reuse.heldImportRefusalsHeld - reuseSeen.heldImportRefusalsHeld), static_cast<unsigned long long>(leases.contentionWaits - profile.leaseSeen.contentionWaits), leases.contentionMs - profile.leaseSeen.contentionMs);
     }
+    if (reuse.sharedUses != reuseSeen.sharedUses || reuse.perUseSets != reuseSeen.perUseSets) {
+        std::fprintf(stderr, "[bda-template] %llu address-table hits while an earlier use was in flight, %llu per-use descriptor sets (changed data words or moved read-only buffers)\n", static_cast<unsigned long long>(reuse.sharedUses - reuseSeen.sharedUses), static_cast<unsigned long long>(reuse.perUseSets - reuseSeen.perUseSets));
+    }
     profile.reuseSeen = reuse;
     profile.leaseSeen = leases;
     profile.totalsUs.fill(0);
@@ -1739,7 +1742,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
             resolved.contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
         }
         auto cached = SharedResourceCache().Find(resolved.contentKey);
-        const bool inUse = cached != nullptr && cached->InUse();
+        const bool inUse = cached != nullptr && cached->InUse() && !cached->SharesUses();
         if (inUse) CountAddressReuse(AddressReuse::InUse);
         if (cached != nullptr && !inUse) {
             const bool addressBased = cached->ReusesAddressSpace();
