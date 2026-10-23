@@ -516,6 +516,7 @@ struct DrawProfile {
     std::array<std::uint64_t, static_cast<std::size_t>(DrawSkip::Count)> skips{};
     std::array<double, static_cast<std::size_t>(DrawSkip::Count)> skipUs{};
     AddressReuseStats reuseSeen;
+    std::array<std::uint64_t, static_cast<std::size_t>(ShaderResources::TemplateOutcome::Count)> templateSeen{};
     LeaseStats leaseSeen;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
@@ -634,6 +635,17 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     const auto resumeMiss = [&](SpaceResumeMiss kind) { return static_cast<unsigned long long>(reuse.resumeMisses[static_cast<std::size_t>(kind)] - reuseSeen.resumeMisses[static_cast<std::size_t>(kind)]); };
     if (reuse.proofs != reuseSeen.proofs || reuseCount(AddressReuse::InUse) != 0) {
         std::fprintf(stderr, "[rescache] address-based draws: %llu proofs, %llu reused; refused: in use %llu, not reusable %llu, snapshots %llu, space %llu (state %llu, replaced %llu, device %llu, generation %llu, epoch %llu, mirrors %llu), images or buffers %llu, imports %llu, threw %llu, moved buffers %llu; %.1f ms in refused proofs; host import refusals: budget %llu (%llu while a reused draw held its space), held import %llu (%llu); pin-contention waits %llu (%.1f ms)\n", static_cast<unsigned long long>(reuse.proofs - reuseSeen.proofs), reuseCount(AddressReuse::Reused), reuseCount(AddressReuse::InUse), reuseCount(AddressReuse::NotReusable), reuseCount(AddressReuse::Snapshots), reuseCount(AddressReuse::Space), resumeMiss(SpaceResumeMiss::State), resumeMiss(SpaceResumeMiss::Replaced), resumeMiss(SpaceResumeMiss::Device), resumeMiss(SpaceResumeMiss::Generation), resumeMiss(SpaceResumeMiss::Epoch), resumeMiss(SpaceResumeMiss::Mirrors), reuseCount(AddressReuse::Proof), reuseCount(AddressReuse::Imports), reuseCount(AddressReuse::Threw), reuseCount(AddressReuse::Moved), static_cast<double>(reuse.refusedProofNs - reuseSeen.refusedProofNs) / 1e6, static_cast<unsigned long long>(reuse.budgetRefusals - reuseSeen.budgetRefusals), static_cast<unsigned long long>(reuse.budgetRefusalsHeld - reuseSeen.budgetRefusalsHeld), static_cast<unsigned long long>(reuse.heldImportRefusals - reuseSeen.heldImportRefusals), static_cast<unsigned long long>(reuse.heldImportRefusalsHeld - reuseSeen.heldImportRefusalsHeld), static_cast<unsigned long long>(leases.contentionWaits - profile.leaseSeen.contentionWaits), leases.contentionMs - profile.leaseSeen.contentionMs);
+    }
+    {
+        const auto outcomes = ShaderResources::TemplateOutcomes();
+        char text[1024];
+        int used = std::snprintf(text, sizeof(text), "[bda-template] builds:");
+        for (std::size_t index = 0; index < outcomes.size() && used > 0 && static_cast<std::size_t>(used) < sizeof(text); ++index) {
+            const auto count = outcomes[index] - profile.templateSeen[index];
+            if (count != 0) used += std::snprintf(text + used, sizeof(text) - static_cast<std::size_t>(used), " %s %llu,", ShaderResources::TemplateOutcomeName(static_cast<ShaderResources::TemplateOutcome>(index)), static_cast<unsigned long long>(count));
+        }
+        if (outcomes != profile.templateSeen) std::fprintf(stderr, "%s\n", text);
+        profile.templateSeen = outcomes;
     }
     if (reuse.sharedUses != reuseSeen.sharedUses || reuse.perUseSets != reuseSeen.perUseSets) {
         std::fprintf(stderr, "[bda-template] %llu address-table hits while an earlier use was in flight, %llu per-use descriptor sets (changed data words or moved read-only buffers)\n", static_cast<unsigned long long>(reuse.sharedUses - reuseSeen.sharedUses), static_cast<unsigned long long>(reuse.perUseSets - reuseSeen.perUseSets));
@@ -1731,6 +1743,10 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     // the alias checks instead. Debug aid: APS5_NO_DRAW_KEY_TRIM=1 keys them as before.
     const bool trimKey = TrimmedDrawKey();
     resolved.cacheable = recordable && !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; }) && !ShaderResources::NeverReusable(shaders);
+    if (timer.profile && recordable && !resolved.cacheable && ShaderResources::StagesUseAddressTables(shaders) && ShaderResources::StagesStoreThroughAddresses(shaders)) {
+        ShaderResources::CountTemplateOutcome(ShaderResources::TemplateOutcome::Storing);
+        if (ShaderResources::StagesStoreOnlyThroughExtInst(shaders)) ShaderResources::CountTemplateOutcome(ShaderResources::TemplateOutcome::StoringExtOnly);
+    }
     if (resolved.cacheable) {
         if (prepared != nullptr && prepared->keyed && prepared->trimmed == trimKey) {
             resolved.contentKey = std::move(prepared->contentKey);
@@ -2846,7 +2862,10 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     // A build this recorded draw can share with later identical ones goes into the cache (a cache
     // hit is reusable by construction, so `recorded` holds for it; one with completion work is
     // never reusable).
-    if (cacheable && built != nullptr && recorded && resources->Reusable()) SharedResourceCache().Insert(contentKey, resources);
+    if (cacheable && built != nullptr && recorded && resources->Reusable()) {
+        SharedResourceCache().Insert(contentKey, resources);
+        if (timer.profile && resources->ReusesAddressSpace()) ShaderResources::CountTemplateOutcome(ShaderResources::TemplateOutcome::Inserted);
+    }
     // A recorded draw renders into its resident targets in the general layout (recordDraw). Debug
     // aid: APS5_DRAW_TRANSITIONS=1 keeps the per-draw upload and download barriers, the layout
     // transitions of every target and one pass per draw, as before.

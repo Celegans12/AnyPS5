@@ -3415,18 +3415,25 @@ void ShaderResources::noteReusable() {
     addressReuse = false;
     directRegions.clear();
     addressWrites.clear();
-    if (storageTableBindings[0] != std::numeric_limits<std::size_t>::max() || storageTableBindings[1] != std::numeric_limits<std::size_t>::max()) return;
+    static const bool profileTemplates = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    const bool candidate = profileTemplates && usesBda && drawBuild && bdaReadOnly && BdaTemplatesOn();
+    const auto refuse = [&](TemplateOutcome outcome) {
+        if (candidate) CountTemplateOutcome(outcome);
+    };
     bdaTemplate = false;
     sharedUses = false;
+    if (storageTableBindings[0] != std::numeric_limits<std::size_t>::max() || storageTableBindings[1] != std::numeric_limits<std::size_t>::max()) return refuse(TemplateOutcome::StorageTable);
     const bool templated = usesBda && drawBuild && bdaReadOnly && BdaTemplatesOn();
     const bool addressBased = usesBda && drawBuild && (AddressReuseEnabled() || templated);
-    if (guestMemory.HasCopiedWrites() || (!addressBased && (HoldsLease() || usesBda)) || !multisampleSources.empty() || (bda != nullptr && LoopGuardEnabled())) return;
-    if (std::any_of(storageTextures.begin(), storageTextures.end(), [](const auto& texture) { return texture != nullptr && DepthSurfaceAt(texture->Descriptor().baseAddress); })) return;
-    if (addressBased && std::any_of(tableStages.begin(), tableStages.end(), [](const TableStage& table) { return std::find(table.elementTextures.begin(), table.elementTextures.end(), std::numeric_limits<std::size_t>::max()) != table.elementTextures.end(); })) return;
-    if (std::any_of(textures.begin(), textures.end(), [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->RefreshedPerUse(); })) return;
-    if (TemplateDataRefresh() && std::any_of(allocations.begin(), allocations.end(), [](const Allocation& allocation) { return allocation.buffer != nullptr && !allocation.guest && allocation.role != ShaderRecompiler::DescriptorRole::ImageTableMap && allocation.size > MaxRefreshBytes; })) return;
+    if (guestMemory.HasCopiedWrites()) return refuse(TemplateOutcome::CopiedWrites);
+    if ((!addressBased && (HoldsLease() || usesBda)) || (bda != nullptr && LoopGuardEnabled())) return refuse(TemplateOutcome::LoopGuard);
+    if (!multisampleSources.empty()) return refuse(TemplateOutcome::Multisample);
+    if (std::any_of(storageTextures.begin(), storageTextures.end(), [](const auto& texture) { return texture != nullptr && DepthSurfaceAt(texture->Descriptor().baseAddress); })) return refuse(TemplateOutcome::DepthStorage);
+    if (addressBased && std::any_of(tableStages.begin(), tableStages.end(), [](const TableStage& table) { return std::find(table.elementTextures.begin(), table.elementTextures.end(), std::numeric_limits<std::size_t>::max()) != table.elementTextures.end(); })) return refuse(TemplateOutcome::TableElement);
+    if (std::any_of(textures.begin(), textures.end(), [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->RefreshedPerUse(); })) return refuse(TemplateOutcome::RefreshedPerUse);
+    if (TemplateDataRefresh() && std::any_of(allocations.begin(), allocations.end(), [](const Allocation& allocation) { return allocation.buffer != nullptr && !allocation.guest && allocation.role != ShaderRecompiler::DescriptorRole::ImageTableMap && allocation.size > MaxRefreshBytes; })) return refuse(TemplateOutcome::DataSize);
     const auto regions = addressBased ? guestMemory.SpaceRegions() : guestMemory.DirectRegions();
-    if (!regions.has_value()) return;
+    if (!regions.has_value()) return refuse(TemplateOutcome::SpaceRegions);
     for (const auto& [begin, end] : *regions) {
         // No reconcile here: the upload just took these imports, and the set is about to be recorded
         // against them.
@@ -3434,7 +3441,10 @@ void ShaderResources::noteReusable() {
         // Read-only image mirrors (exe ranges) are as stable as imports; their serials have the top
         // bit set, so the two spaces never collide.
         if (serial == 0) serial = ImageMirrorSerial(context, begin, static_cast<std::size_t>(end - begin));
-        if (serial == 0) return;
+        if (serial == 0) {
+            directRegions.clear();
+            return refuse(TemplateOutcome::Serial);
+        }
         directRegions.push_back({begin, end, serial});
     }
     for (const auto& cut : guestMemory.CutRegions()) {
@@ -3449,6 +3459,43 @@ void ShaderResources::noteReusable() {
     addressReuse = addressBased;
     bdaTemplate = templated;
     sharedUses = templated && addressWrites.empty() && guestMemory.Writes().empty() && !guestMemory.HasGpuCopies() && !guestMemory.HasCopiedWrites() && std::none_of(storageWritten.begin(), storageWritten.end(), [](bool written) { return written; });
+    refuse(sharedUses ? TemplateOutcome::Shared : TemplateOutcome::NotShared);
+}
+
+namespace {
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ShaderResources::TemplateOutcome::Count)> templateOutcomes{};
+}
+
+void ShaderResources::CountTemplateOutcome(TemplateOutcome outcome) {
+    templateOutcomes[static_cast<std::size_t>(outcome)].fetch_add(1, std::memory_order_relaxed);
+}
+
+std::array<std::uint64_t, static_cast<std::size_t>(ShaderResources::TemplateOutcome::Count)> ShaderResources::TemplateOutcomes() {
+    std::array<std::uint64_t, static_cast<std::size_t>(TemplateOutcome::Count)> result{};
+    for (std::size_t index = 0; index < result.size(); ++index) result[index] = templateOutcomes[index].load(std::memory_order_relaxed);
+    return result;
+}
+
+const char* ShaderResources::TemplateOutcomeName(TemplateOutcome outcome) {
+    switch (outcome) {
+        case TemplateOutcome::Storing: return "draws storing through BDA";
+        case TemplateOutcome::StoringExtOnly: return "of them only through extended instructions";
+        case TemplateOutcome::StorageTable: return "storage image table";
+        case TemplateOutcome::CopiedWrites: return "copied writes";
+        case TemplateOutcome::Multisample: return "multisample source";
+        case TemplateOutcome::LoopGuard: return "loop guard";
+        case TemplateOutcome::DepthStorage: return "depth storage image";
+        case TemplateOutcome::TableElement: return "rejected table element";
+        case TemplateOutcome::RefreshedPerUse: return "texture refreshed per use";
+        case TemplateOutcome::DataSize: return "data buffer too big";
+        case TemplateOutcome::SpaceRegions: return "regions copied per build";
+        case TemplateOutcome::Serial: return "region without import serial";
+        case TemplateOutcome::Shared: return "templates";
+        case TemplateOutcome::NotShared: return "templates one use at a time";
+        case TemplateOutcome::Inserted: return "inserted";
+        case TemplateOutcome::Count: break;
+    }
+    return "?";
 }
 
 bool ShaderResources::SharesUses() const {

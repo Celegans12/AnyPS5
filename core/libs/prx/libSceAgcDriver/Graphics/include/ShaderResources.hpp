@@ -361,6 +361,14 @@ public:
     static bool NeverReusable(std::span<const CompiledShader> shaders);
     // Whether a stage with a BDA page table stores through guest addresses (its SPIR-V; cached).
     static bool StagesStoreThroughAddresses(std::span<const CompiledShader> shaders);
+    // Whether every storing BDA stage stores only through an extended instruction taking a pointer.
+    static bool StagesStoreOnlyThroughExtInst(std::span<const CompiledShader> shaders);
+    // APS5_PROFILE_DRAW ([bda-template] line): what became of address-table draw builds under
+    // APS5_NO_BDA_TEMPLATES unset, by the first reason that kept one from being a template.
+    enum class TemplateOutcome : std::size_t { Storing, StoringExtOnly, StorageTable, CopiedWrites, Multisample, LoopGuard, DepthStorage, TableElement, RefreshedPerUse, DataSize, SpaceRegions, Serial, Shared, NotShared, Inserted, Count };
+    static const char* TemplateOutcomeName(TemplateOutcome outcome);
+    static std::array<std::uint64_t, static_cast<std::size_t>(TemplateOutcome::Count)> TemplateOutcomes();
+    static void CountTemplateOutcome(TemplateOutcome outcome);
     static std::uint64_t DepthGuardRefusals();
     static std::uint64_t GuestBufferBytes(const Context& context, std::span<const std::uint32_t> words);
     const std::vector<std::shared_ptr<Texture>>& SampledTextures() const { return textures; }
