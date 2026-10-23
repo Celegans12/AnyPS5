@@ -211,6 +211,11 @@ std::uint32_t directWordIndex(SpirvEmitterState& state, const MemoryResourceAcce
     return EmitAddU32(state, relative, base);
 }
 
+bool addressedCoherent(SpirvValueEmitContext& context, const IrValue& instruction) {
+    const auto& state = context.state;
+    return context.Memory(instruction).coherent || (state.requirements.coherentBuffers && state.program.Metadata().invalidatesCaches);
+}
+
 std::uint32_t readBuffer(SpirvValueEmitContext& context, const IrValue& instruction, std::uint32_t address, std::uint32_t bits, std::uint32_t enable = 0u) {
     if (context.Memory(instruction).gpuDescriptor) return EmitBdaRead(context, instruction, address, bits);
     auto& state = context.state;
@@ -225,7 +230,7 @@ std::uint32_t readBuffer(SpirvValueEmitContext& context, const IrValue& instruct
     const auto load = [&](std::uint32_t word) {
         const auto value = state.module.AllocateId();
         const auto pointer = EmitMemoryElementPointer(state, access, word);
-        if (access.physical && context.Memory(instruction).coherent) state.module.AddFunction(spv::OpAtomicLoad, TypeU32(state), value, pointer, ConstantU32(state, spv::ScopeDevice), ConstantU32(state, spv::MemorySemanticsMaskNone));
+        if (access.physical && addressedCoherent(context, instruction)) state.module.AddFunction(spv::OpAtomicLoad, TypeU32(state), value, pointer, ConstantU32(state, spv::ScopeDevice), ConstantU32(state, spv::MemorySemanticsMaskNone));
         else if (access.physical) state.module.AddFunction(spv::OpLoad, TypeU32(state), value, pointer, access.memoryAccess | spv::MemoryAccessAlignedMask, 4u);
         else if (access.memoryAccess != 0u) state.module.AddFunction(spv::OpLoad, TypeU32(state), value, pointer, access.memoryAccess);
         else state.module.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
@@ -325,7 +330,7 @@ void writeBuffer(SpirvValueEmitContext& context, const IrValue& instruction, std
         if (bits == 32u) {
             EmitIfCondition(state, Unary(state, spv::OpLogicalNot, TypeBool(state), unaligned), [&] {
                 const auto pointer = EmitMemoryElementPointer(state, access, index);
-                if (access.physical && context.Memory(instruction).coherent) state.module.AddFunction(spv::OpAtomicStore, pointer, ConstantU32(state, spv::ScopeDevice), ConstantU32(state, spv::MemorySemanticsMaskNone), value);
+                if (access.physical && addressedCoherent(context, instruction)) state.module.AddFunction(spv::OpAtomicStore, pointer, ConstantU32(state, spv::ScopeDevice), ConstantU32(state, spv::MemorySemanticsMaskNone), value);
                 else if (access.physical) state.module.AddFunction(spv::OpStore, pointer, value, access.memoryAccess | spv::MemoryAccessAlignedMask, 4u);
                 else if (access.memoryAccess != 0u) state.module.AddFunction(spv::OpStore, pointer, value, access.memoryAccess);
                 else state.module.AddFunction(spv::OpStore, pointer, value);

@@ -6718,10 +6718,12 @@ void verifyAddressedCoherentBufferAccesses() {
     struct Counts {
         std::uint32_t loads = 0, stores = 0, wideLoads = 0;
     };
-    const auto compile = [&](bool glc, bool pair) {
+    const auto compile = [&](bool glcLoad, bool glcStore, bool pair, bool invalidate) {
         const std::uint32_t loadOp = pair ? 0xe0341000u : 0xe0301000u;
         const std::uint32_t storeOp = pair ? 0xe0741000u : 0xe0701000u;
-        std::vector<std::uint32_t> code{0x34020082u, loadOp | (glc ? 0x4000u : 0u), 0x80000201u, 0xbf8c3f70u, storeOp | (glc ? 0x4000u : 0u), 0x80010201u, 0xbf810000u};
+        std::vector<std::uint32_t> code{0x34020082u};
+        if (invalidate) code.insert(code.end(), {0xe1c40000u, 0u});
+        code.insert(code.end(), {loadOp | (glcLoad ? 0x4000u : 0u), 0x80000201u, 0xbf8c3f70u, storeOp | (glcStore ? 0x4000u : 0u), 0x80010201u, 0xbf810000u});
         RecompileRequest request{};
         request.shader = {ShaderStage::Compute, 0x5b000u, code, 0, {}};
         request.context.waveSize = 32;
@@ -6754,16 +6756,22 @@ void verifyAddressedCoherentBufferAccesses() {
         return counts;
     };
 
-    const auto plain = compile(false, false);
+    const auto plain = compile(false, false, false, false);
     require(plain.loads == 0u && plain.stores == 0u && plain.wideLoads == 0u, "addressed coherent buffers: accesses without GLC became atomics");
 
-    const auto single = compile(true, false);
+    const auto single = compile(true, true, false, false);
     require(single.loads != 0u, "addressed coherent buffers: a GLC load through a buffer address is not an atomic load");
     require(single.stores != 0u, "addressed coherent buffers: a GLC store through a buffer address is not an atomic store");
 
-    const auto wide = compile(true, true);
+    const auto wide = compile(true, true, true, false);
     require(wide.wideLoads != 0u, "addressed coherent buffers: a GLC two-dword load through a buffer address is not one 64-bit atomic load");
     require(wide.stores != 0u, "addressed coherent buffers: a GLC two-dword store through a buffer address is not an atomic store");
+
+    const auto invalidated = compile(false, true, false, true);
+    require(invalidated.loads != 0u, "addressed coherent buffers: a load without GLC in a program that invalidates the vector caches is not an atomic load");
+
+    const auto invalidatedPlain = compile(false, false, false, true);
+    require(invalidatedPlain.loads == 0u && invalidatedPlain.stores == 0u, "addressed coherent buffers: a program that invalidates the vector caches without GLC or DLC accesses made its accesses atomic");
 }
 
 void verifyUnnormalizedSamplers() {
