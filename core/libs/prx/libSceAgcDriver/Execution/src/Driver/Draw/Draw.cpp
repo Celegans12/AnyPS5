@@ -425,7 +425,10 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 }
             }
         }
-        if (traced != 0 && decode->state.depth && decode->state.depth->address == traced) std::fprintf(stderr, "[depth-trace] draw vs 0x%llx ps 0x%llx colors %zu indirect %d test %d write %d cmp %d index 0x%llx\n", static_cast<unsigned long long>(vertexProgram), static_cast<unsigned long long>(pixelProgram), decode->state.colors.size(), drawParameters.indirect.has_value() ? 1 : 0, decode->state.depthTest ? 1 : 0, decode->state.depthWrite ? 1 : 0, static_cast<int>(decode->state.depthCompare), static_cast<unsigned long long>(drawParameters.indexAddress));
+        if (traced != 0 && decode->state.depth && decode->state.depth->address == traced) {
+            const auto reg = [&](std::uint32_t offset) -> std::uint32_t { const auto it = queue.context.find(offset); return it == queue.context.end() ? 0xffffffffu : it->second; };
+            std::fprintf(stderr, "[depth-trace] draw vs 0x%llx ps 0x%llx colors %zu indirect %d test %d write %d cmp %d index 0x%llx instances %u objid 0x%x objprim 0x%x masks %08x/%08x\n", static_cast<unsigned long long>(vertexProgram), static_cast<unsigned long long>(pixelProgram), decode->state.colors.size(), drawParameters.indirect.has_value() ? 1 : 0, decode->state.depthTest ? 1 : 0, decode->state.depthWrite ? 1 : 0, static_cast<int>(decode->state.depthCompare), static_cast<unsigned long long>(drawParameters.indexAddress), drawParameters.instanceCount, reg(0x2a6), reg(0x20d), reg(0x8e), reg(0x8f));
+        }
     }
     bool skipDepthOnly = false;
     if (decode->state.depth && decode->state.depthWrite && !(filtered && !filterTargets.empty()) && VertexScheduleSkips(vertexProgram)) skipDepthOnly = true;
