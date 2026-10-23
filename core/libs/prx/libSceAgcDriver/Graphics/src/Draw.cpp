@@ -1060,6 +1060,19 @@ void CountDrawSkip(DrawSkip kind, double us) {
 }
 
 
+// APS5_PROFILE_DRAW: evicted resource sets of recorded draws handed to the release thread ([draw-evict], 10 s).
+void noteDeferredDrawEvictions(std::size_t count) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static std::atomic<std::uint64_t> deferred{0};
+    static std::atomic<long long> lastReport{0};
+    if (!profile) return;
+    deferred.fetch_add(count, std::memory_order_relaxed);
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = lastReport.load();
+    if (nowMs - last < 10000 || !lastReport.compare_exchange_strong(last, nowMs)) return;
+    std::fprintf(stderr, "[draw-evict] (10 s): %llu evicted resource sets deferred to the release thread\n", static_cast<unsigned long long>(deferred.exchange(0, std::memory_order_relaxed)));
+}
+
 bool DrawRecipes() {
     static const bool noDrawRecipe = std::getenv("APS5_NO_DRAW_RECIPE") != nullptr;
     return !noDrawRecipe;
@@ -2862,8 +2875,19 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     // A build this recorded draw can share with later identical ones goes into the cache (a cache
     // hit is reusable by construction, so `recorded` holds for it; one with completion work is
     // never reusable).
+    // The insert displaces the oldest entries; they go to the open batch, so their destruction (descriptor
+    // sets, pooled buffers, texture references) runs on the release thread once the batch completed, as
+    // the dispatch insert does, not here on the committer (best116: ~4-5 % of the committer).
+    // APS5_NO_DEFERRED_DRAW_EVICTION=1 (runtime switch) destroys them here as before.
     if (cacheable && built != nullptr && recorded && resources->Reusable()) {
-        SharedResourceCache().Insert(contentKey, resources);
+        std::vector<std::shared_ptr<ShaderResources>> evicted;
+        const bool deferEviction = recorder != nullptr && !RuntimeSwitches::Set(RuntimeSwitch::NoDeferredDrawEviction);
+        SharedResourceCache().Insert(contentKey, resources, deferEviction ? &evicted : nullptr);
+        for (auto& object : evicted) {
+            object->KeepStorageImageBytes(*recorder);
+            recorder->Keep(std::move(object));
+        }
+        noteDeferredDrawEvictions(evicted.size());
         if (timer.profile && resources->ReusesAddressSpace()) ShaderResources::CountTemplateOutcome(ShaderResources::TemplateOutcome::Inserted);
     }
     // A recorded draw renders into its resident targets in the general layout (recordDraw). Debug
