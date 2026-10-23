@@ -918,6 +918,22 @@ void reportTextureCounters() {
     AgcDriver::ProfilePrint_nid_no_patch("[textures] sampled created: %llu from storage images, %llu snapshots (%llu snapshot reads over recorded writes inside cachedTexture, %llu storage-path fallbacks); stage-A records %llu: %llu fast hits, %llu full lookups; storage images %llu hits, %llu created, %llu own-object refreshes; image tables %llu reused, %llu resolved; untracked snapshots %llu kept by the write-watch hint, %llu compared\n", count(counters.fromStorage), count(counters.snapshots), count(counters.pendingReads), count(counters.storageFallbacks), count(counters.records), count(counters.fastHits), count(counters.fastMisses), count(counters.storageHits), count(counters.storageCreated), count(counters.ownRefreshes), count(counters.tablesReused), count(counters.tablesResolved), count(counters.untrackedKept), count(counters.untrackedCompared));
 }
 
+// APS5_PROFILE_DRAW: cachedTexture's slice copies (Texture::CopyPendingSlices), 10 s deltas: lookups
+// that took the pending slices by device copies, the slices copied, and lookups whose texture could
+// not take them (stored and re-read instead).
+void reportSliceCopies(bool taken) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static std::atomic<std::uint64_t> refused{0};
+    static std::atomic<long long> lastReport{0};
+    if (!taken) refused.fetch_add(1, std::memory_order_relaxed);
+    if (!profile) return;
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = lastReport.load();
+    if (nowMs - last < 10000 || !lastReport.compare_exchange_strong(last, nowMs)) return;
+    const auto counts = Texture::TakeSliceCopyCounts();
+    std::fprintf(stderr, "[slice-copy] (10 s): %llu lookups took pending slices by copies, %llu slices copied, %llu lookups stored them instead\n", static_cast<unsigned long long>(counts.lookups), static_cast<unsigned long long>(counts.copies), static_cast<unsigned long long>(refused.exchange(0, std::memory_order_relaxed)));
+}
+
 // What the sampled-texture lookups on this thread proved their returned objects current against,
 // taken by object into the ShaderResources being built or revalidated (captureValidation), which
 // then repeats the proof from write stamps on its next Revalidate. The lookups run inside one build
@@ -1373,13 +1389,27 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     // Results stored to guest memory just now are stamped newer than `generation`; a snapshot read
     // after them is current at the generation of a second (memoized) collect. The store marks the
     // surface's DCC keys uncompressed, so the keys are read after it.
+    // A block-compressed surface the title compresses on the GPU one layer's level at a time, each
+    // into a storage image of the block's texel format (Yotei's reflection probes, BC6H through
+    // R32G32B32A32_UINT): a cached snapshot takes those results by device copies below
+    // (Texture::CopyPendingSlices) instead of a store and a re-read, which waited for the open
+    // batch that wrote them (~100 ms a frame on the GPU mutex). A new snapshot still reads guest
+    // memory, storing them first. APS5_NO_SLICE_COPY=1 stores them for every lookup, as before.
+    std::vector<PendingSlice> slices;
+    const bool sliceCopy = !disabled && source == nullptr && !clearThroughKeys && !depthCompare && !srgbExpand && IsBlockCompressed(resource.format) && resource.dccAddress == 0 && Recorder::Active() != nullptr && Recorder::ThreadLane() == 0 && !Recorder::InCompletion() && !RuntimeSwitches::Set(RuntimeSwitch::NoSliceCopy) && PendingStorageOverlaps(address, bytes, nullptr) && StorageTexture::PendingSlicesOf(resource, DescribeSurface(resource), slices);
+    const auto takeSlices = [&](Texture& texture) {
+        const bool taken = texture.CopyPendingSlices(slices);
+        if (!taken) StorageTexture::FlushPending(address, bytes, nullptr, "sampled texture");
+        reportSliceCopies(taken);
+        return taken;
+    };
     const auto flushStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto observedKeys = keys.has_value() ? *keys : scanKeys();
     const bool stagedClear = source != nullptr && resource.dccAddress != 0 && (IsDccClear(observedKeys) || observedKeys == DccKeys::ClearSingle);
     bool stagedFlushed = false;
     static const bool traceSampledFlush = std::getenv("APS5_TRACE_SAMPLED_FLUSH") != nullptr;
     const auto traceStart = traceSampledFlush ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    if ((source == nullptr || stagedClear) && !clearThroughKeys && StorageTexture::FlushPending(address, bytes, nullptr, "sampled texture")) {
+    if ((source == nullptr || stagedClear) && !clearThroughKeys && !sliceCopy && StorageTexture::FlushPending(address, bytes, nullptr, "sampled texture")) {
         if (profile) LookupOutcomes::Add(LookupOutcomes::PendingFlush, flushStart);
         if (traceSampledFlush) {
             const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - traceStart).count();
@@ -1496,7 +1526,8 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 (same ? counters.untrackedKept : counters.untrackedCompared).fetch_add(1, std::memory_order_relaxed);
                 return same;
             };
-            if ((*keys != DccKeys::Uncompressed && *keys != DccKeys::ClearSingle) || unchanged() || kept() || equalsCommitted()) {
+            // A slice copy the texture cannot take stores the slices instead: the snapshot is stale then.
+            if (((*keys != DccKeys::Uncompressed && *keys != DccKeys::ClearSingle) || unchanged() || kept() || equalsCommitted()) && (!sliceCopy || takeSlices(*it->texture))) {
                 it->generation = snapshotGeneration;
                 it->committed = std::move(committed);
                 it->untracked = untracked;
@@ -1535,7 +1566,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 if (*keys != DccKeys::Uncompressed || GuestMemory::UnchangedSince(address, bytes, oneOff.generation)) return true;
                 return snapshotStillMatches(address, bytes, oneOff.hashes, generation != 0 ? oneOff.generation : 0, std::nullopt, SnapshotCompare::OneOff);
             };
-            if (texture != nullptr && oneOff.bytes == guestBytes && oneOff.keys == *keys && current()) {
+            if (texture != nullptr && oneOff.bytes == guestBytes && oneOff.keys == *keys && current() && (!sliceCopy || takeSlices(*texture))) {
                 ++cache.counts.oneOffReuses;
                 ++cache.totals.oneOffReuses;
                 if (oneOff.kept != nullptr) {
