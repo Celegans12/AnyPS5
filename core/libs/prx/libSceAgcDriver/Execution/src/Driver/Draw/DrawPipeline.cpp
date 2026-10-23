@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -207,6 +208,7 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     heldReadRanges.fetch_add(reads.size(), std::memory_order_relaxed);
     const bool prepared = static_cast<bool>(prepare);
     items.push_back({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), std::move(reads), nowNs(), std::move(prepare)});
+    addWrites(items.back().writes);
     for (const auto& [begin, limit] : items.back().reads) {
         items.back().readBounds.first = std::min(items.back().readBounds.first, begin);
         items.back().readBounds.second = std::max(items.back().readBounds.second, limit);
@@ -224,6 +226,22 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     if (!profile) return;
     const auto now = std::chrono::steady_clock::now();
     if (now - lastReport >= std::chrono::seconds(10)) report(now);
+}
+
+// APS5_PROFILE_DRAW: the pending-write scans (Overlaps, OverlapsAny, DrainIfOverlaps) walk every write range of
+// every pending item; every 256th scan samples how many items and ranges that is and how many ranges are distinct.
+// Under mutex.
+void DrawPipeline::noteWriteScan() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile || (writeScans++ & 255u) != 0) return;
+    static std::vector<Range> ranges;
+    ranges.clear();
+    for (const auto& item : items) ranges.insert(ranges.end(), item.writes.begin(), item.writes.end());
+    ++writeScanSamples;
+    writeScanItems += items.size();
+    writeScanRanges += ranges.size();
+    std::sort(ranges.begin(), ranges.end());
+    writeScanDistinct += static_cast<std::uint64_t>(std::unique(ranges.begin(), ranges.end()) - ranges.begin());
 }
 
 void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
@@ -268,6 +286,11 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     char prepares[224];
     std::snprintf(prepares, sizeof(prepares), "; preparer: %llu prepared in %.1f ms, %llu claimed by the commit first, commits waited for %llu (%.1f ms)", static_cast<unsigned long long>(preparedItems.exchange(0, std::memory_order_relaxed)), static_cast<double>(prepareNs.exchange(0, std::memory_order_relaxed)) / 1e6, static_cast<unsigned long long>(prepareLost.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(prepareWaits.exchange(0, std::memory_order_relaxed)), static_cast<double>(prepareWaitNs.exchange(0, std::memory_order_relaxed)) / 1e6);
     drainText += prepares;
+    const auto perSample = [&](std::uint64_t value) { return writeScanSamples == 0 ? 0.0 : static_cast<double>(value) / static_cast<double>(writeScanSamples); };
+    char scans[160];
+    std::snprintf(scans, sizeof(scans), "; write scans %llu over %.1f items, %.1f ranges, %.1f distinct", static_cast<unsigned long long>(writeScans), perSample(writeScanItems), perSample(writeScanRanges), perSample(writeScanDistinct));
+    drainText += scans;
+    writeScans = writeScanSamples = writeScanItems = writeScanRanges = writeScanDistinct = 0;
     std::fprintf(stderr, "[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer (%.1f %% busy), %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room;%s; indirect commits %llu, indirect drains (args overlap) %llu; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, busy, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, reads, static_cast<unsigned long long>(counted[0]), static_cast<unsigned long long>(counted[1]), drainText.c_str());
     commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = 0;
     roomWaits = roomWakeNs = drainWaits = drainWakeNs = committerIdles = committerIdleNs = committerWakeNs = 0;
@@ -322,6 +345,7 @@ void DrawPipeline::run() {
             std::lock_guard lock(mutex);
             done = std::move(items.front());
             items.pop_front();
+            removeWrites(done.writes);
             ++commits;
             commitNs += spent;
             if (failed) ++commitErrors;
@@ -456,6 +480,31 @@ std::optional<std::uint64_t> DrawPipeline::PendingLabel(std::uint64_t address, s
     return std::nullopt;
 }
 
+// APS5_NO_DISTINCT_WRITE_SCANS=1 (runtime switch): the pending-write scans walk every pending item's writes.
+bool DrawPipeline::DistinctWriteScans() {
+    return !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoDistinctWriteScans);
+}
+
+// Under mutex, for every item entering or leaving `items`, whatever the switch, so the list stays exact when it flips.
+void DrawPipeline::addWrites(const std::vector<Range>& writes) {
+    for (const auto& write : writes) {
+        const auto found = std::ranges::find(distinctWrites, write, &std::pair<Range, std::uint32_t>::first);
+        if (found != distinctWrites.end()) ++found->second;
+        else distinctWrites.push_back({write, 1u});
+    }
+}
+
+void DrawPipeline::removeWrites(const std::vector<Range>& writes) {
+    for (const auto& write : writes) {
+        const auto found = std::ranges::find(distinctWrites, write, &std::pair<Range, std::uint32_t>::first);
+        if (found == distinctWrites.end()) continue;
+        if (--found->second == 0u) {
+            *found = distinctWrites.back();
+            distinctWrites.pop_back();
+        }
+    }
+}
+
 bool DrawPipeline::OverlapsAny(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
     if (ranges.empty()) return false;
     auto low = ranges.front().first;
@@ -465,10 +514,15 @@ bool DrawPipeline::OverlapsAny(std::span<const std::pair<std::uint64_t, std::uin
         high = std::max(high, end);
     }
     std::lock_guard lock(mutex);
+    noteWriteScan();
+    const auto overlaps = [&](std::uint64_t begin, std::uint64_t limit) {
+        if (begin >= high || limit <= low) return false;
+        return std::any_of(ranges.begin(), ranges.end(), [&](const auto& range) { return range.first < limit && begin < range.second; });
+    };
+    if (DistinctWriteScans()) return std::ranges::any_of(distinctWrites, [&](const auto& write) { return overlaps(write.first.first, write.first.second); });
     for (const auto& item : items) {
         for (const auto& [begin, limit] : item.writes) {
-            if (begin >= high || limit <= low) continue;
-            if (std::any_of(ranges.begin(), ranges.end(), [&](const auto& range) { return range.first < limit && begin < range.second; })) return true;
+            if (overlaps(begin, limit)) return true;
         }
     }
     return false;
@@ -477,6 +531,8 @@ bool DrawPipeline::OverlapsAny(std::span<const std::pair<std::uint64_t, std::uin
 bool DrawPipeline::Overlaps(std::uint64_t address, std::size_t bytes) {
     const auto end = address + bytes;
     std::lock_guard lock(mutex);
+    noteWriteScan();
+    if (DistinctWriteScans()) return std::ranges::any_of(distinctWrites, [&](const auto& write) { return address < write.first.second && write.first.first < end; });
     for (const auto& item : items) {
         for (const auto& [begin, limit] : item.writes) {
             if (address < limit && begin < end) return true;
