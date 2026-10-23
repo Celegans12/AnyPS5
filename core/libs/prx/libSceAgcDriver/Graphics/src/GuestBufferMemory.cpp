@@ -5861,7 +5861,7 @@ std::optional<GuestBufferMemory::CachedTable> GuestBufferMemory::CachedAddressTa
         }
     } else {
         const auto mergeStart = std::chrono::steady_clock::now();
-        const bool incremental = !BufferAddressHistory::Enabled() && !RuntimeSwitches::Set(RuntimeSwitch::NoIncrementalBdaRanges);
+        const bool incremental = !RuntimeSwitches::Set(RuntimeSwitch::NoIncrementalBdaRanges);
         tableRanges = std::make_shared<const std::vector<ShaderRecompiler::BdaAbi::Range>>(incremental ? incrementalAddressRanges() : AddressRanges());
         {
             auto& t = addressTableTimes();
