@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/HandOverTrace.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/SlimMutex.hpp"
@@ -22,6 +23,14 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "RdnaDecoder/include/RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include <algorithm>
+#include <cstdarg>
+#include <deque>
+#include <unordered_set>
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 #include <array>
 #include <bit>
 #include <chrono>
@@ -1532,7 +1541,481 @@ std::shared_ptr<StorageTexture> StorageTexture::Create(const Context& context, T
     return texture;
 }
 
+// APS5_HANDOVER_TRACE (HandOverTrace.hpp): local diagnostic for #9860. Own writer: CaptureTrace logs every
+// refresh and upload of the run and gives up past its queue limit; this logs only hand-overs and the
+// readers of handed ranges, inside a present window.
+namespace HandOverTraceDetail {
+
+struct Range {
+    std::uint64_t from = 0;
+    std::uint64_t to = 0;
+    bool Overlaps(std::uint64_t begin, std::uint64_t end) const { return begin < to && from < end; }
+};
+
+struct HandedSource {
+    std::weak_ptr<StorageTexture> image;
+    std::uint64_t imageId = 0;
+    std::uint64_t writesAtHandOver = 0;
+    // Per handed source unit: the unit, its guest range, the receiver unit it lands in, dropped by a supersede.
+    struct Unit {
+        std::uint32_t unit;
+        Range range;
+        std::uint32_t receiverUnit;
+        bool dropped;
+    };
+    std::vector<Unit> units;
+    bool stale = false;
+};
+
+enum class RecordState { Live, Superseded, Stale, ReceiverRefreshed };
+
+struct Record {
+    std::uint64_t id = 0;
+    const StorageTexture* receiver = nullptr;
+    std::uint64_t receiverId = 0;
+    std::vector<HandedSource> sources;
+    RecordState state = RecordState::Live;
+    std::uint32_t readers = 0;
+    bool Overlaps(std::uint64_t begin, std::uint64_t end) const {
+        for (const auto& source : sources) {
+            for (const auto& unit : source.units) {
+                if (unit.range.Overlaps(begin, end)) return true;
+            }
+        }
+        return false;
+    }
+};
+
+constexpr std::size_t MaxRecords = 4096;
+constexpr std::uint32_t ReadersPerRecord = 8;
+constexpr std::uint32_t ReadersPerFilterRange = 64;
+constexpr std::size_t FlushBytes = 64 * 1024;
+
+std::atomic<std::uint64_t> presents{0};
+std::atomic<std::uint64_t> nextImageId{0};
+thread_local const char* commandKind = nullptr;
+thread_local std::uint64_t commandAddress = 0;
+
+struct TraceState {
+    bool enabled = false;
+    std::uint64_t first = 0;
+    std::uint64_t count = 0;
+    std::vector<Range> filter;
+    std::vector<std::uint32_t> filterReaders;
+    std::mutex mutex;
+    std::FILE* file = nullptr;
+    std::string path;
+    std::string buffer;
+    std::uint64_t sequence = 0;
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    std::deque<Record> records;
+    std::uint64_t handOvers = 0;
+    std::unordered_set<std::uint64_t> described;
+    std::map<std::string, std::uint64_t> refusals;
+    std::uint64_t supersededUnits = 0, staleErased = 0, receiverRefreshedBeforeWrite = 0, writeBackAfterDrop = 0, evicted = 0;
+    bool closed = false;
+};
+
+std::uint64_t parseNumber(const char* text, char** end) {
+    return std::strtoull(text, end, 0);
+}
+
+TraceState& State() {
+    static TraceState* state = [] {
+        auto* created = new TraceState;
+        const char* spec = std::getenv("APS5_HANDOVER_TRACE");
+        if (spec == nullptr || *spec == '\0') return created;
+        char* end = nullptr;
+        created->first = parseNumber(spec, &end);
+        created->count = (end != nullptr && *end == ':') ? parseNumber(end + 1, &end) : 1;
+        if (created->count == 0) return created;
+        if (const char* ranges = std::getenv("APS5_HANDOVER_TRACE_ADDR")) {
+            const char* cursor = ranges;
+            while (*cursor != '\0') {
+                char* next = nullptr;
+                const auto from = parseNumber(cursor, &next);
+                if (next == cursor || *next != '-') break;
+                cursor = next + 1;
+                const auto to = parseNumber(cursor, &next);
+                if (next == cursor) break;
+                if (to > from) created->filter.push_back({from, to});
+                cursor = next;
+                if (*cursor == ',') ++cursor;
+            }
+            created->filterReaders.assign(created->filter.size(), 0);
+        }
+        const char* directory = std::getenv("APS5_TRACE_DIR");
+#ifdef _WIN32
+        const auto pid = static_cast<unsigned long>(_getpid());
+#else
+        const auto pid = static_cast<unsigned long>(getpid());
+#endif
+        created->path = (directory != nullptr && *directory != '\0' ? std::string(directory) + "/" : std::string()) + "handover-trace-" + std::to_string(pid) + ".log";
+        created->file = std::fopen(created->path.c_str(), "wb");
+        if (created->file == nullptr) {
+            std::fprintf(stderr, "[handover-trace] cannot open %s; tracing off\n", created->path.c_str());
+            return created;
+        }
+        created->enabled = true;
+        std::fprintf(stderr, "[handover-trace] presents %llu..%llu to %s%s\n", static_cast<unsigned long long>(created->first), static_cast<unsigned long long>(created->first + created->count - 1), created->path.c_str(), created->filter.empty() ? "" : " (address filter)");
+        return created;
+    }();
+    return *state;
+}
+
+bool InWindow(const TraceState& state) {
+    const auto present = presents.load(std::memory_order_relaxed);
+    return !state.closed && present >= state.first && present < state.first + state.count;
+}
+
+bool Kept(const TraceState& state, std::uint64_t begin, std::uint64_t end) {
+    if (state.filter.empty()) return true;
+    return std::any_of(state.filter.begin(), state.filter.end(), [&](const Range& range) { return range.Overlaps(begin, end); });
+}
+
+void FlushBuffer(TraceState& state) {
+    if (state.file == nullptr || state.buffer.empty()) return;
+    std::fwrite(state.buffer.data(), 1, state.buffer.size(), state.file);
+    std::fflush(state.file);
+    state.buffer.clear();
+}
+
+// One line: "<seq> <elapsed-us> p=<present> q=<queue> pkt=<opcode> cmd=<draw|dispatch>:0x<program> <text>".
+void Emit(TraceState& state, const std::string& text) {
+    const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - state.start).count();
+    const auto packet = GuestMemory::CurrentPacket();
+    char prefix[160];
+    char queue[16] = "-";
+    char opcode[16] = "-";
+    if (packet.opcode != GuestMemory::NoPacket) {
+        std::snprintf(queue, sizeof(queue), "0x%x", packet.queue);
+        std::snprintf(opcode, sizeof(opcode), "0x%x", packet.opcode);
+    }
+    char command[48] = "-";
+    if (commandKind != nullptr) std::snprintf(command, sizeof(command), "%s:0x%llx", commandKind, static_cast<unsigned long long>(commandAddress));
+    std::snprintf(prefix, sizeof(prefix), "%llu %lld p=%llu q=%s pkt=%s cmd=%s ", static_cast<unsigned long long>(state.sequence++), static_cast<long long>(elapsed), static_cast<unsigned long long>(presents.load(std::memory_order_relaxed)), queue, opcode, command);
+    state.buffer += prefix;
+    state.buffer += text;
+    state.buffer += '\n';
+    if (state.buffer.size() >= FlushBytes) FlushBuffer(state);
+}
+
+std::string Format(const char* format, ...) __attribute__((format(printf, 1, 2)));
+std::string Format(const char* format, ...) {
+    char text[1024];
+    va_list arguments;
+    va_start(arguments, format);
+    std::vsnprintf(text, sizeof(text), format, arguments);
+    va_end(arguments);
+    return text;
+}
+
+void WriteSummary(TraceState& state) {
+    std::string refusals;
+    for (const auto& [reason, count] : state.refusals) refusals += Format(" %s=%llu", reason.c_str(), static_cast<unsigned long long>(count));
+    Emit(state, Format("summary handovers=%llu superseded-units=%llu stale-erased=%llu recv-refreshed-before-write=%llu writeback-after-drop=%llu records-evicted=%llu refusals:%s", static_cast<unsigned long long>(state.handOvers), static_cast<unsigned long long>(state.supersededUnits), static_cast<unsigned long long>(state.staleErased), static_cast<unsigned long long>(state.receiverRefreshedBeforeWrite), static_cast<unsigned long long>(state.writeBackAfterDrop), static_cast<unsigned long long>(state.evicted), refusals.empty() ? " none" : refusals.c_str()));
+    FlushBuffer(state);
+}
+
+const char* RecordStateName(RecordState state) {
+    switch (state) {
+        case RecordState::Live: return "live";
+        case RecordState::Superseded: return "superseded";
+        case RecordState::Stale: return "stale";
+        case RecordState::ReceiverRefreshed: return "receiver-refreshed";
+    }
+    return "?";
+}
+
+}
+
+struct HandOverTraceAccess {
+    using Detail = HandOverTraceDetail::TraceState;
+
+    static std::string Name(Detail& state, const StorageTexture& image) {
+        if (!state.described.insert(image.traceId).second) return HandOverTraceDetail::Format("img#%llu", static_cast<unsigned long long>(image.traceId));
+        const auto& d = image.descriptor;
+        return HandOverTraceDetail::Format("img#%llu{base=0x%llx bytes=0x%llx fmt=%d guestfmt=%u dim=%ux%ux%u layers=%u mips=%u tile=%d dcc=0x%llx units=%ux0x%llx}", static_cast<unsigned long long>(image.traceId), static_cast<unsigned long long>(d.baseAddress), static_cast<unsigned long long>(image.guestBytes), static_cast<int>(image.storageFormat), static_cast<unsigned>(d.format), d.width, d.height, d.depthOrLastArray + 1, image.geometry.imageLayers, d.mipCount, static_cast<int>(d.tileMode), static_cast<unsigned long long>(d.dccAddress), image.trackedLayers, static_cast<unsigned long long>(image.trackedLayerBytes));
+    }
+
+    static std::string PendingUnits(const StorageTexture& image) {
+        std::string text = "[";
+        for (std::uint32_t unit = 0; unit < image.trackedLayers; ++unit) {
+            if (!image.layerPending[unit]) continue;
+            if (text.size() > 1) text += ',';
+            text += HandOverTraceDetail::Format("%u:0x%llx-0x%llx", unit, static_cast<unsigned long long>(image.layerBegin(unit)), static_cast<unsigned long long>(image.layerBegin(unit) + image.layerBytes(unit)));
+        }
+        return text + "]";
+    }
+
+    static void Assign(StorageTexture& image) {
+        image.traceId = HandOverTraceDetail::nextImageId.fetch_add(1, std::memory_order_relaxed) + 1;
+    }
+
+    // Event 2: a candidate that was not handed over, and why (only when other images had results pending here).
+    static void Refused(StorageTexture& receiver, const char* reason, bool othersKnown, bool othersPending) {
+        auto& state = HandOverTraceDetail::State();
+        const auto begin = receiver.descriptor.baseAddress;
+        const auto end = begin + receiver.guestBytes;
+        if (!othersKnown) othersPending = !receiver.overlappingPending(begin, static_cast<std::size_t>(receiver.guestBytes)).empty();
+        if (!othersPending) return;
+        std::lock_guard lock(state.mutex);
+        ++state.refusals[reason];
+        if (!HandOverTraceDetail::InWindow(state) || !HandOverTraceDetail::Kept(state, begin, end)) return;
+        HandOverTraceDetail::Emit(state, HandOverTraceDetail::Format("handover-refused recv=%s reason=%s", Name(state, receiver).c_str(), reason));
+    }
+
+    // Event 1: end of clearHandOver(), before it returns the keys.
+    static void HandedOver(StorageTexture& receiver, const std::vector<std::shared_ptr<StorageTexture>>& others, DccKeys keys, const VkClearColorValue& clear) {
+        auto& state = HandOverTraceDetail::State();
+        const auto begin = receiver.descriptor.baseAddress;
+        const auto end = begin + receiver.guestBytes;
+        HandOverTraceDetail::Record record;
+        record.receiver = &receiver;
+        record.receiverId = receiver.traceId;
+        std::uint32_t receiverFirst = std::numeric_limits<std::uint32_t>::max(), receiverLast = 0;
+        for (const auto& other : others) {
+            HandOverTraceDetail::HandedSource source;
+            source.image = other;
+            source.imageId = other->traceId;
+            source.writesAtHandOver = other->writes;
+            for (std::uint32_t unit = 0; unit < other->trackedLayers; ++unit) {
+                const auto from = other->layerBegin(unit);
+                if (!other->layerPending[unit] || from < begin || from >= end) continue;
+                const auto receiverUnit = static_cast<std::uint32_t>((from - begin) / receiver.trackedLayerBytes);
+                source.units.push_back({unit, {from, from + other->layerBytes(unit)}, receiverUnit, false});
+                receiverFirst = std::min(receiverFirst, receiverUnit);
+                receiverLast = std::max(receiverLast, receiverUnit);
+            }
+            record.sources.push_back(std::move(source));
+        }
+        std::lock_guard lock(state.mutex);
+        record.id = ++state.handOvers;
+        if (HandOverTraceDetail::InWindow(state) && HandOverTraceDetail::Kept(state, begin, end)) {
+            HandOverTraceDetail::Emit(state, HandOverTraceDetail::Format("handover ho#%llu recv=%s keys=%s clear=%08x,%08x,%08x,%08x recvUnits=[%u..%u]", static_cast<unsigned long long>(record.id), Name(state, receiver).c_str(), DccKeysName(keys), clear.uint32[0], clear.uint32[1], clear.uint32[2], clear.uint32[3], receiverFirst == std::numeric_limits<std::uint32_t>::max() ? 0u : receiverFirst, receiverLast));
+            for (std::size_t i = 0; i < others.size(); ++i) {
+                const auto& other = *others[i];
+                std::string handed = "[";
+                for (const auto& unit : record.sources[i].units) {
+                    if (handed.size() > 1) handed += ',';
+                    handed += HandOverTraceDetail::Format("%u->%u", unit.unit, unit.receiverUnit);
+                }
+                handed += "]";
+                HandOverTraceDetail::Emit(state, HandOverTraceDetail::Format("  src %s writes=%llu uploadedKeys=%s dcc=0x%llx pending=%s handed=%s", Name(state, other).c_str(), static_cast<unsigned long long>(other.writes), DccKeysName(other.uploadedKeys), static_cast<unsigned long long>(other.descriptor.dccAddress), PendingUnits(other).c_str(), handed.c_str()));
+            }
+        }
+        state.records.push_back(std::move(record));
+        while (state.records.size() > HandOverTraceDetail::MaxRecords) {
+            if (HandOverTraceDetail::InWindow(state)) HandOverTraceDetail::Emit(state, HandOverTraceDetail::Format("ho#%llu evicted (%s)", static_cast<unsigned long long>(state.records.front().id), HandOverTraceDetail::RecordStateName(state.records.front().state)));
+            state.records.pop_front();
+            ++state.evicted;
+        }
+    }
+
+    static HandOverTraceDetail::Record* Find(Detail& state, const StorageTexture& receiver, const StorageTexture* source) {
+        for (auto it = state.records.rbegin(); it != state.records.rend(); ++it) {
+            if (it->receiver != &receiver || it->state == HandOverTraceDetail::RecordState::Stale || it->state == HandOverTraceDetail::RecordState::ReceiverRefreshed) continue;
+            if (source == nullptr) return &*it;
+            for (const auto& handed : it->sources) {
+                if (handed.imageId == source->traceId) return &*it;
+            }
+        }
+        return nullptr;
+    }
+
+    static void Resolve(Detail& state, HandOverTraceDetail::Record& record) {
+        const bool open = std::any_of(record.sources.begin(), record.sources.end(), [](const HandOverTraceDetail::HandedSource& source) { return !source.stale && std::any_of(source.units.begin(), source.units.end(), [](const auto& unit) { return !unit.dropped; }); });
+        if (!open && record.state == HandOverTraceDetail::RecordState::Live) record.state = HandOverTraceDetail::RecordState::Superseded;
+        static_cast<void>(state);
+    }
+
+    // Event 3 header: supersedeHandedOver(first, count) over [begin, end).
+    static void SupersedeBegin(StorageTexture& receiver, std::uint32_t first, std::uint32_t count, std::uint64_t begin, std::uint64_t end) {
+        auto& state = HandOverTraceDetail::State();
+        std::lock_guard lock(state.mutex);
+        if (!HandOverTraceDetail::InWindow(state) || !HandOverTraceDetail::Kept(state, begin, end)) return;
+        HandOverTraceDetail::Emit(state, HandOverTraceDetail::Format("supersede recv=%s first=%u count=%u range=0x%llx-0x%llx", Name(state, receiver).c_str(), first, count, static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end)));
+    }
+
+    // Event 3, per hand-over source: stale (its writes moved), the units dropped, or nothing inside.
+    static void SupersedeSource(StorageTexture& receiver, const StorageTexture* source, std::uint64_t writesNow, std::uint64_t writesAtHandOver, bool stale, const std::vector<std::uint32_t>& dropped, std::uint64_t begin, std::uint64_t end) {
+        auto& state = HandOverTraceDetail::State();
+        std::lock_guard lock(state.mutex);
+        auto* record = source != nullptr ? Find(state, receiver, source) : nullptr;
+        std::string outcome;
+        if (stale) {
+            ++state.staleErased;
+            outcome = "stale-erased";
+            if (record != nullptr) {
+                for (auto& handed : record->sources) {
+                    if (handed.imageId == source->traceId) handed.stale = true;
+                }
+                if (std::all_of(record->sources.begin(), record->sources.end(), [](const auto& handed) { return handed.stale; })) record->state = HandOverTraceDetail::RecordState::Stale;
+            }
+        } else if (dropped.empty()) {
+            outcome = "nothing-inside";
+        } else {
+            state.supersededUnits += dropped.size();
+            outcome = "dropped=[";
+            for (std::size_t i = 0; i < dropped.size(); ++i) {
+                if (i != 0) outcome += ',';
+                outcome += HandOverTraceDetail::Format("%u:0x%llx-0x%llx", dropped[i], static_cast<unsigned long long>(source->layerBegin(dropped[i])), static_cast<unsigned long long>(source->layerBegin(dropped[i]) + source->layerBytes(dropped[i])));
+            }
+            outcome += "]";
+            if (record != nullptr) {
+                for (auto& handed : record->sources) {
+                    if (handed.imageId != source->traceId) continue;
+                    for (auto& unit : handed.units) {
+                        if (std::find(dropped.begin(), dropped.end(), unit.unit) != dropped.end()) unit.dropped = true;
+                    }
+                }
+                Resolve(state, *record);
+            }
+        }
+        if (!HandOverTraceDetail::InWindow(state) || !HandOverTraceDetail::Kept(state, begin, end)) return;
+        HandOverTraceDetail::Emit(state, HandOverTraceDetail::Format("  ho#%llu src %s writes now=%llu at-handover=%llu -> %s", static_cast<unsigned long long>(record != nullptr ? record->id : 0), source != nullptr ? Name(state, *source).c_str() : "img#gone", static_cast<unsigned long long>(writesNow), static_cast<unsigned long long>(writesAtHandOver), outcome.c_str()));
+    }
+
+    // Event 3 tail: the handed receiver units of [first, first + count) and their generations.
+    static void SupersedeUnits(StorageTexture& receiver, std::uint32_t first, std::uint32_t last, bool tracked, const std::vector<std::uint64_t>& before, const std::vector<std::uint64_t>& after, const std::vector<std::uint8_t>& cpu, std::uint64_t begin, std::uint64_t end) {
+        auto& state = HandOverTraceDetail::State();
+        std::lock_guard lock(state.mutex);
+        if (!HandOverTraceDetail::InWindow(state) || !HandOverTraceDetail::Kept(state, begin, end)) return;
+        for (std::uint32_t unit = first; unit < last && unit < before.size(); ++unit) {
+            if (before[unit] == std::numeric_limits<std::uint64_t>::max()) continue;
+            if (!tracked) HandOverTraceDetail::Emit(state, HandOverTraceDetail::Format("  handed-unit %u kept (untracked) gen %llu", unit, static_cast<unsigned long long>(before[unit])));
+            else if (unit >= cpu.size() || cpu[unit] != 0) HandOverTraceDetail::Emit(state, HandOverTraceDetail::Format("  handed-unit %u kept (cpu-written) gen %llu", unit, static_cast<unsigned long long>(before[unit])));
+            else HandOverTraceDetail::Emit(state, HandOverTraceDetail::Format("  handed-unit %u gen %llu -> %llu (cpu=%u)", unit, static_cast<unsigned long long>(before[unit]), static_cast<unsigned long long>(after[unit]), unit < cpu.size() ? cpu[unit] : 0u));
+        }
+        static_cast<void>(receiver);
+    }
+
+    // Event 4: Refresh clears handedOver/handedUnits while a record of this receiver is still live.
+    static void ReceiverRefresh(StorageTexture& receiver) {
+        auto& state = HandOverTraceDetail::State();
+        std::lock_guard lock(state.mutex);
+        for (auto& record : state.records) {
+            if (record.receiver != &receiver || record.state != HandOverTraceDetail::RecordState::Live) continue;
+            record.state = HandOverTraceDetail::RecordState::ReceiverRefreshed;
+            ++state.receiverRefreshedBeforeWrite;
+            if (!HandOverTraceDetail::InWindow(state) || !HandOverTraceDetail::Kept(state, receiver.descriptor.baseAddress, receiver.descriptor.baseAddress + receiver.guestBytes)) continue;
+            HandOverTraceDetail::Emit(state, HandOverTraceDetail::Format("recv-refresh %s ho#%llu cleared-before-written", Name(state, receiver).c_str(), static_cast<unsigned long long>(record.id)));
+        }
+    }
+
+    // Event 5: a reader of a handed range (first ReadersPerRecord per record), or of a filter range.
+    static void Reader(const char* kind, const StorageTexture* image, std::uint64_t begin, std::uint64_t end, const std::string& extra, bool droppedOnly = false) {
+        auto& state = HandOverTraceDetail::State();
+        std::lock_guard lock(state.mutex);
+        if (!HandOverTraceDetail::InWindow(state)) return;
+        bool logged = false;
+        for (auto& record : state.records) {
+            if (record.readers >= HandOverTraceDetail::ReadersPerRecord || record.state == HandOverTraceDetail::RecordState::Stale) continue;
+            bool hit = false;
+            for (const auto& source : record.sources) {
+                for (const auto& unit : source.units) {
+                    if (unit.range.Overlaps(begin, end) && (!droppedOnly || unit.dropped)) hit = true;
+                }
+            }
+            if (!hit || !HandOverTraceDetail::Kept(state, begin, end)) continue;
+            ++record.readers;
+            const char* as = "other";
+            if (image != nullptr && image->traceId == record.receiverId) as = "recv";
+            else if (image != nullptr && std::any_of(record.sources.begin(), record.sources.end(), [&](const auto& source) { return source.imageId == image->traceId; })) as = "src";
+            HandOverTraceDetail::Emit(state, HandOverTraceDetail::Format("%s %s as=%s ho#%llu(%s) range=0x%llx-0x%llx%s", kind, image != nullptr ? Name(state, *image).c_str() : "-", as, static_cast<unsigned long long>(record.id), HandOverTraceDetail::RecordStateName(record.state), static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end), extra.c_str()));
+            logged = true;
+        }
+        if (logged || state.filter.empty()) return;
+        for (std::size_t i = 0; i < state.filter.size(); ++i) {
+            if (!state.filter[i].Overlaps(begin, end) || state.filterReaders[i] >= HandOverTraceDetail::ReadersPerFilterRange) continue;
+            ++state.filterReaders[i];
+            HandOverTraceDetail::Emit(state, HandOverTraceDetail::Format("%s %s as=filter range=0x%llx-0x%llx%s", kind, image != nullptr ? Name(state, *image).c_str() : "-", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end), extra.c_str()));
+            break;
+        }
+    }
+
+    // read-borrow: a refresh takes units of a pending alias on the device (pendingAlias).
+    static void Borrow(StorageTexture& image, const StorageTexture& alias, std::uint64_t begin, std::uint64_t end) {
+        std::string from;
+        {
+            auto& state = HandOverTraceDetail::State();
+            std::lock_guard lock(state.mutex);
+            from = " from=" + Name(state, alias);
+        }
+        Reader("read-borrow", &image, begin, end, from);
+    }
+
+    // writeback of a source: AFTER-DROP when a unit it stores was dropped by a supersede.
+    static void WriteBack(const StorageTexture& image, const std::vector<bool>& layers, const char* reason) {
+        std::string units = "[";
+        std::vector<std::uint32_t> written;
+        for (std::uint32_t unit = 0; unit < layers.size() && unit < image.trackedLayers; ++unit) {
+            if (!layers[unit]) continue;
+            written.push_back(unit);
+            if (units.size() > 1) units += ',';
+            units += std::to_string(unit);
+        }
+        units += "]";
+        bool afterDrop = false;
+        {
+            auto& state = HandOverTraceDetail::State();
+            std::lock_guard lock(state.mutex);
+            for (const auto& record : state.records) {
+                for (const auto& source : record.sources) {
+                    if (source.imageId != image.traceId) continue;
+                    for (const auto& unit : source.units) {
+                        if (unit.dropped && std::find(written.begin(), written.end(), unit.unit) != written.end()) afterDrop = true;
+                    }
+                }
+            }
+            if (afterDrop) ++state.writeBackAfterDrop;
+        }
+        Reader("writeback", &image, image.descriptor.baseAddress, image.descriptor.baseAddress + image.guestBytes, HandOverTraceDetail::Format(" units=%s reason=%s%s", units.c_str(), reason != nullptr ? reason : "-", afterDrop ? " AFTER-DROP" : ""));
+    }
+
+    static void Present() {
+        auto& state = HandOverTraceDetail::State();
+        const auto present = HandOverTraceDetail::presents.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (present != state.first + state.count) return;
+        std::lock_guard lock(state.mutex);
+        if (state.closed) return;
+        // The window just ended: the summary and the flush now (a run is usually killed, not exited).
+        HandOverTraceDetail::WriteSummary(state);
+        state.closed = true;
+        std::fprintf(stderr, "[handover-trace] window closed at present %llu: %llu hand-overs so far\n", static_cast<unsigned long long>(present), static_cast<unsigned long long>(state.handOvers));
+    }
+};
+
+namespace HandOverTrace {
+
+bool Enabled() {
+    static const bool enabled = HandOverTraceDetail::State().enabled;
+    return enabled;
+}
+
+void NotePresent() {
+    if (Enabled()) HandOverTraceAccess::Present();
+}
+
+void NoteBind(const char* kind, std::uint64_t address, std::uint64_t bytes, std::uint32_t format) {
+    if (!Enabled() || bytes == 0) return;
+    HandOverTraceAccess::Reader("bind", nullptr, address, address + bytes, HandOverTraceDetail::Format(" view=%s fmt=%u", kind, format));
+}
+
+CommandScope::CommandScope(const char* kind, std::uint64_t address) : previousKind(HandOverTraceDetail::commandKind), previousAddress(HandOverTraceDetail::commandAddress) {
+    HandOverTraceDetail::commandKind = kind;
+    HandOverTraceDetail::commandAddress = address;
+}
+
+CommandScope::~CommandScope() {
+    HandOverTraceDetail::commandKind = previousKind;
+    HandOverTraceDetail::commandAddress = previousAddress;
+}
+
+}
+
 StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, std::uint32_t mipLevel) : context(context), detiler(detiler), descriptor(descriptor) {
+    HandOverTraceAccess::Assign(*this);
     try {
         Require(!IsBlockCompressed(descriptor.format), "block-compressed textures cannot be storage images");
         Require(mipLevel < descriptor.mipCount, "storage texture mip level is outside the texture");
@@ -2274,6 +2757,10 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
     const auto scopeBegin = scoped ? layerBegin(firstLayer) : descriptor.baseAddress;
     const auto scopeBytes = scoped ? static_cast<std::size_t>(layerBegin(lastLayer - 1) + layerBytes(lastLayer - 1) - scopeBegin) : static_cast<std::size_t>(guestBytes);
     // No publish: the upload below reads the stored units from the unit shadow itself.
+    if (HandOverTrace::Enabled()) {
+        if (!handedOver.empty() || !handedUnits.empty()) HandOverTraceAccess::ReceiverRefresh(*this);
+        if (alias != nullptr) HandOverTraceAccess::Borrow(*this, *alias, scopeBegin, scopeBegin + scopeBytes);
+    }
     handedOver.clear();
     handedUnits.clear();
     const auto handOverKeys = alias == nullptr && !scoped ? clearHandOver() : std::nullopt;
@@ -2443,6 +2930,7 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
         return true;
     }
     CaptureTrace::Log("refresh image=%llx bytes=%llu generation=%llu dirty=%d keysChanged=%d cpuWrote=%d", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), static_cast<unsigned long long>(generation), dirty, keysChanged, cpuWrote);
+    if (HandOverTrace::Enabled()) HandOverTraceAccess::Reader("read-refresh", this, descriptor.baseAddress, descriptor.baseAddress + guestBytes, HandOverTraceDetail::Format(" dirty=%d keysChanged=%d cpuWrote=%d", dirty, keysChanged, cpuWrote));
     // Debug aid: APS5_TRACE_UPLOAD names why a storage image is uploaded again.
     static const bool traceUpload = std::getenv("APS5_TRACE_UPLOAD") != nullptr;
     if (traceUpload) {
@@ -2818,6 +3306,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
     CompletePendingCpuWrites(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     if (descriptor.dccAddress != 0) CompletePendingCpuWrites(context, descriptor.dccAddress, DccKeyBytes(guestBytes));
     CaptureTrace::Log("upload image=%llx bytes=%llu generation=%llu reason=%s partial=%d", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), static_cast<unsigned long long>(generation), uploadReason, layers != nullptr);
+    if (HandOverTrace::Enabled()) HandOverTraceAccess::Reader("read-upload", this, descriptor.baseAddress, descriptor.baseAddress + guestBytes, HandOverTraceDetail::Format(" reason=%s partial=%d", uploadReason != nullptr ? uploadReason : "-", layers != nullptr));
     const auto elementBytes = BytesPerElement(descriptor.format);
     const auto linearBytes = sliceLinearBytes * arrayLayers;
     const struct HeldBytes {
@@ -4118,6 +4607,7 @@ void waitForIdlePublish(const char* reason) {
 }
 
 bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, const StorageTexture* except, const char* reason, PublishScope scope, bool* published) {
+    if (HandOverTrace::Enabled()) HandOverTraceAccess::Reader("guest-read", nullptr, address, address + bytes, HandOverTraceDetail::Format(" site=%s reason=%s", GuestMemory::ReadSiteName(GuestMemory::CurrentReadSite()), reason != nullptr ? reason : "-"), true);
     static_cast<void>(FlushDepthPlanes(address, bytes));
     if (published != nullptr) *published = false;
     const auto nothingToStore = [&] {
@@ -5437,27 +5927,39 @@ std::uint64_t StorageTexture::HandedOverSuperseded() {
 }
 
 std::optional<DccKeys> StorageTexture::clearHandOver() {
-    if (!ClearHandOverOn().load(std::memory_order_relaxed) || !blockUnits || descriptor.dccAddress == 0 || anyLayerPending()) return std::nullopt;
-    if (!GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) return std::nullopt;
+    const bool traced = HandOverTrace::Enabled();
+    // APS5_HANDOVER_TRACE: why a candidate with results of other images pending here was not handed over.
+    const auto refuse = [&](const char* reason, bool othersKnown = false, bool othersPending = false) -> std::optional<DccKeys> {
+        if (traced) HandOverTraceAccess::Refused(*this, reason, othersKnown, othersPending);
+        return std::nullopt;
+    };
+    if (!ClearHandOverOn().load(std::memory_order_relaxed)) return refuse("off");
+    if (!blockUnits) return refuse("no-block-units");
+    if (descriptor.dccAddress == 0) return refuse("no-dcc");
+    if (anyLayerPending()) return refuse("layer-pending");
+    if (!GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) return refuse("unwatched");
     const auto others = overlappingPending(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
-    if (others.empty()) return std::nullopt;
+    if (others.empty()) return refuse("no-overlap", true, false);
     const auto begin = descriptor.baseAddress;
     const auto end = descriptor.baseAddress + guestBytes;
     const auto keyBytes = DccKeyBytes(guestBytes);
     for (const auto& other : others) {
-        if (!other->blockUnits || (other->descriptor.dccAddress != 0 && other->uploadedKeys != DccKeys::Uncompressed)) return std::nullopt;
-        if (other->descriptor.dccAddress != 0 && other->descriptor.dccAddress < descriptor.dccAddress + keyBytes && descriptor.dccAddress < other->descriptor.dccAddress + DccKeyBytes(other->guestBytes)) return std::nullopt;
+        if (!other->blockUnits) return refuse("no-block-units", true, true);
+        if (other->descriptor.dccAddress != 0 && other->uploadedKeys != DccKeys::Uncompressed) return refuse("src-compressed", true, true);
+        if (other->descriptor.dccAddress != 0 && other->descriptor.dccAddress < descriptor.dccAddress + keyBytes && descriptor.dccAddress < other->descriptor.dccAddress + DccKeyBytes(other->guestBytes)) return refuse("dcc-overlap", true, true);
         for (std::uint32_t unit = 0; unit < other->trackedLayers; ++unit) {
             if (!other->layerPending[unit]) continue;
             const auto from = other->layerBegin(unit);
             const auto to = from + other->layerBytes(unit);
             if (to <= begin || from >= end) continue;
-            if (from < begin || to > end || other->layerBytes(unit) != trackedLayerBytes) return std::nullopt;
+            if (from < begin || to > end) return refuse("unit-straddles", true, true);
+            if (other->layerBytes(unit) != trackedLayerBytes) return refuse("unit-size", true, true);
         }
     }
     const auto keys = ProvedKeys();
     VkClearColorValue clear{};
-    if (!IsDccClear(keys) || !ClearColorFor(storageFormat, keys, clear)) return std::nullopt;
+    if (!IsDccClear(keys) || !ClearColorFor(storageFormat, keys, clear)) return refuse("keys-not-clear", true, true);
+    if (traced) HandOverTraceAccess::HandedOver(*this, others, keys, clear);
     if (handedUnits.size() != trackedLayers) handedUnits.assign(trackedLayers, false);
     for (const auto& other : others) {
         for (std::uint32_t unit = 0; unit < other->trackedLayers; ++unit) {
@@ -5475,20 +5977,27 @@ std::optional<DccKeys> StorageTexture::clearHandOver() {
 void StorageTexture::supersedeHandedOver(std::uint32_t first, std::uint32_t count) {
     const auto begin = layerBegin(first);
     const auto end = first + count >= trackedLayers ? descriptor.baseAddress + guestBytes : layerBegin(first + count);
+    const bool traced = HandOverTrace::Enabled();
+    if (traced) HandOverTraceAccess::SupersedeBegin(*this, first, count, begin, end);
+    std::vector<std::uint32_t> traceDropped;
     for (auto entry = handedOver.begin(); entry != handedOver.end();) {
         const auto source = entry->first.lock();
         if (source == nullptr || source->writes != entry->second) {
+            if (traced) HandOverTraceAccess::SupersedeSource(*this, source.get(), source != nullptr ? source->writes : 0, entry->second, true, {}, begin, end);
             entry = handedOver.erase(entry);
             continue;
         }
         bool superseded = false;
+        traceDropped.clear();
         for (std::uint32_t unit = 0; unit < source->trackedLayers; ++unit) {
             const auto from = source->layerBegin(unit);
             if (!source->layerPending[unit] || from < begin || from + source->layerBytes(unit) > end) continue;
             source->layerPending[unit] = false;
             handedOverSuperseded.fetch_add(1, std::memory_order_relaxed);
             superseded = true;
+            if (traced) traceDropped.push_back(unit);
         }
+        if (traced) HandOverTraceAccess::SupersedeSource(*this, source.get(), source->writes, entry->second, false, traceDropped, begin, end);
         if (superseded) source->reconcilePending();
         ++entry;
     }
@@ -5501,13 +6010,17 @@ void StorageTexture::supersedeHandedOver(std::uint32_t first, std::uint32_t coun
         std::vector<std::uint8_t> cpu(generations.size(), 0);
         const bool tracked = GuestMemory::ChangedBlocks(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), generations, stamped, cpu);
         bool moved = false;
+        std::vector<std::uint64_t> traceBefore;
+        if (traced) traceBefore.assign(trackedLayers, std::numeric_limits<std::uint64_t>::max());
         for (std::uint32_t unit = first; unit < first + count && unit < handedUnits.size(); ++unit) {
             if (!handedUnits[unit]) continue;
             handedUnits[unit] = false;
+            if (traced && unit < traceBefore.size()) traceBefore[unit] = layerGeneration[unit];
             if (!tracked || unit >= cpu.size() || cpu[unit] != 0) continue;
             layerGeneration[unit] = current;
             moved = true;
         }
+        if (traced) HandOverTraceAccess::SupersedeUnits(*this, first, first + count, tracked, traceBefore, layerGeneration, cpu, begin, end);
         if (moved) refreshGeneration();
     }
     if (std::none_of(handedUnits.begin(), handedUnits.end(), [](bool handed) { return handed; })) handedUnits.clear();
@@ -5670,6 +6183,7 @@ bool StorageTexture::unchangedSinceBaseline(std::uint64_t from, std::uint64_t to
 
 void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     CaptureTrace::Log("writeback image=%llx generation=%llu reason=%s units=%zu", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(generation), flushReason, static_cast<std::size_t>(std::count(layers.begin(), layers.end(), true)));
+    if (HandOverTrace::Enabled()) HandOverTraceAccess::WriteBack(*this, layers, flushReason);
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PhaseTimer timer;
     struct Account {

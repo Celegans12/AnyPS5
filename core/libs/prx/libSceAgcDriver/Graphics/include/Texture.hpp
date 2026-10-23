@@ -673,6 +673,9 @@ private:
     std::vector<bool> borrowedUnits;
     std::vector<std::pair<std::weak_ptr<StorageTexture>, std::uint64_t>> handedOver;
     std::vector<bool> handedUnits;
+    // APS5_HANDOVER_TRACE (HandOverTrace.hpp): a sequence number naming this image in the trace.
+    std::uint64_t traceId = 0;
+    friend struct HandOverTraceAccess;
     // Units of this image were borrowed since it was last written: the borrower's proofs
     // (the resource cache's serial memo) hold only while this image's version does, so the next
     // write here bumps the pending serial although the image was pending already.

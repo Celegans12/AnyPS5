@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/HandOverTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
@@ -141,8 +142,9 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
     const auto address = (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20c)) << 8u) | (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20d) & 0xffu) << 40u);
     if (address == SkippedShader() && address != 0) return;
     struct OriginScope {
-        explicit OriginScope(std::uint64_t program) { Graphics::Recorder::SetWriteOrigin(program); }
+        explicit OriginScope(std::uint64_t program) : command("dispatch", program) { Graphics::Recorder::SetWriteOrigin(program); }
         ~OriginScope() { Graphics::Recorder::SetWriteOrigin(0); }
+        Graphics::HandOverTrace::CommandScope command;
     } originScope(address);
     auto registeredShader = RegisteredProgram(*submission.shaders, address, {0});
     if (!registeredShader) registeredShader = ReadRawShader(address);

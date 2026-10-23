@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/HandOverTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
@@ -1012,8 +1013,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             DrawPipeline::FollowEpoch(epoch);
             GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
             struct OriginScope {
-                explicit OriginScope(std::uint64_t address) { Graphics::Recorder::SetWriteOrigin(address); }
+                explicit OriginScope(std::uint64_t address) : command("draw", address) { Graphics::Recorder::SetWriteOrigin(address); }
                 ~OriginScope() { Graphics::Recorder::SetWriteOrigin(0); }
+                Graphics::HandOverTrace::CommandScope command;
             } originScope(program);
             try {
                 std::shared_ptr<PreparedCommit> prepared = slot != nullptr ? std::static_pointer_cast<PreparedCommit>(slot->Take()) : nullptr;

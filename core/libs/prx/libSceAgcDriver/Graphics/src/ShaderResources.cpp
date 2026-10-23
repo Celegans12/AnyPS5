@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/HandOverTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -1295,6 +1296,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     auto& counters = TextureCounts();
     const auto address = resource.baseAddress;
     const auto bytes = static_cast<std::size_t>(guestBytes);
+    if (HandOverTrace::Enabled()) HandOverTrace::NoteBind("sampled", address, bytes, resource.format);
     static_cast<void>(FlushDepthPlanes(address, bytes));
     // A storage image whose results for this surface (or for a mip chain containing it) are still on
     // the GPU supplies the texture by a view of it; anything else needs those results in guest
@@ -1764,6 +1766,7 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
     // views over a depth surface's memory (array layers, see SeedStorageFromDepth) use the cache.
     if (auto depth = DepthSurfaceStorage(context, words, viewed, mip)) return depth;
     const auto viewedBytes = guestBytes != 0 ? guestBytes : DescribeSurface(viewed).guestBytes;
+    if (HandOverTrace::Enabled()) HandOverTrace::NoteBind(written ? "storage-written" : "storage", viewed.baseAddress, viewedBytes, viewed.format);
     if (viewedBytes >= (1ull << 30u)) {
         static std::atomic<std::uint64_t> large{0};
         const auto count = large.fetch_add(1) + 1;
