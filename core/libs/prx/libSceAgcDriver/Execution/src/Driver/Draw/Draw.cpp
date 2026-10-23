@@ -791,6 +791,31 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         pushCursorBytes += static_cast<std::uint32_t>(result.pushConstants.size());
     }
 
+    if (drawParameters.indirect && graphics.depth && DepthSurfaceTraceTarget() == graphics.depth->address) {
+        const auto& indirect = *drawParameters.indirect;
+        std::string line;
+        char text[384];
+        std::snprintf(text, sizeof(text), "[depth-trace] indirect vs 0x%llx colors %zu path %s gpu-parameters %d args 0x%llx stride %u record %u count %u%s count-address 0x%llx rules v%d/%u i%d/%u base s%d inst s%d index 0x%llx",
+            static_cast<unsigned long long>(programs.front().binary.codeAddress), graphics.colors.size(), indirectCpu ? Graphics::IndirectDrawPathName(*indirectCpu) : "gpu", gpuParameters ? 1 : 0, static_cast<unsigned long long>(indirect.arguments), indirect.stride, indirect.recordBytes, indirect.count, indirect.countIndirect ? " (count indirect)" : "", static_cast<unsigned long long>(indirect.countAddress),
+            indirect.vertexRule == Pm4::DrawParameters::IndirectDraw::Rule::InPlace ? 1 : 0, indirect.vertexConstant, indirect.instanceRule == Pm4::DrawParameters::IndirectDraw::Rule::InPlace ? 1 : 0, indirect.instanceConstant, indirect.baseVertexSgpr, indirect.startInstanceSgpr, static_cast<unsigned long long>(drawParameters.indexAddress));
+        line += text;
+        if (indirect.countIndirect && GuestMemory::Accessible(reinterpret_cast<const void*>(indirect.countAddress), 4u)) {
+            std::uint32_t value = 0;
+            std::memcpy(&value, reinterpret_cast<const void*>(indirect.countAddress), 4u);
+            std::snprintf(text, sizeof(text), " cpu-count %u", value);
+            line += text;
+        }
+        const std::uint32_t shown = std::min<std::uint32_t>(indirect.count, 8u);
+        for (std::uint32_t record = 0; record < shown && indirect.recordBytes != 0; ++record) {
+            const auto address = indirect.arguments + static_cast<std::uint64_t>(record) * indirect.stride;
+            if (!GuestMemory::Accessible(reinterpret_cast<const void*>(address), indirect.recordBytes)) break;
+            std::array<std::uint32_t, 5> words{};
+            std::memcpy(words.data(), reinterpret_cast<const void*>(address), std::min<std::size_t>(indirect.recordBytes, sizeof(words)));
+            std::snprintf(text, sizeof(text), " | %u %u %u %d %u", words[0], words[1], words[2], static_cast<std::int32_t>(words[3]), words[4]);
+            line += text;
+        }
+        std::fprintf(stderr, "%s\n", line.c_str());
+    }
     if (stageDataVerified != 0) {
         std::lock_guard cacheLock(drawCacheMutex);
         drawEntryCounters.stageDataVerified += stageDataVerified;
