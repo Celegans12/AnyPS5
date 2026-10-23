@@ -53,6 +53,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_NO_INCREMENTAL_BDA_RANGES",
     "APS5_NO_READ_ONLY_LEASE_SKIP",
     "APS5_NO_LEAN_BDA_TABLES",
+    "APS5_NO_DEPTH_LOOKUP_FAST",
 };
 
 struct Refusal {

@@ -2260,14 +2260,31 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, 
     const bool cleared = takeClearedHtile(target);
     auto& list = surfaces();
     DepthSurface* surface = nullptr;
-    for (auto it = list.begin(); it != list.end(); ++it) {
-        if (!(*it)->active->load(std::memory_order_acquire) || (*it)->context.device != context.device || !sameSurface((*it)->target, target)) continue;
-        surface = it->get();
-        if (std::next(it) != list.end()) {
-            std::rotate(it, std::next(it), list.end());
-            surfacesSerial.fetch_add(1, std::memory_order_release);
+    // A found surface moves to the back (most recently used last), so the search from the front walked nearly the
+    // whole list for the current target (best141: ~2 % of the committer). At most one active surface of a device
+    // matches a target (one is made only when none does, and sameSurface is field equality), so the search from
+    // the back finds the same one, mostly at once. APS5_NO_DEPTH_LOOKUP_FAST=1 searches from the front.
+    if (!RuntimeSwitches::Set(RuntimeSwitch::NoDepthLookupFast)) {
+        for (auto back = list.rbegin(); back != list.rend(); ++back) {
+            if (!(*back)->active->load(std::memory_order_acquire) || (*back)->context.device != context.device || !sameSurface((*back)->target, target)) continue;
+            surface = back->get();
+            const auto it = std::prev(back.base());
+            if (std::next(it) != list.end()) {
+                std::rotate(it, std::next(it), list.end());
+                surfacesSerial.fetch_add(1, std::memory_order_release);
+            }
+            break;
         }
-        break;
+    } else {
+        for (auto it = list.begin(); it != list.end(); ++it) {
+            if (!(*it)->active->load(std::memory_order_acquire) || (*it)->context.device != context.device || !sameSurface((*it)->target, target)) continue;
+            surface = it->get();
+            if (std::next(it) != list.end()) {
+                std::rotate(it, std::next(it), list.end());
+                surfacesSerial.fetch_add(1, std::memory_order_release);
+            }
+            break;
+        }
     }
     const bool created = surface == nullptr;
     GuestAllocations::Lease creationLease;
@@ -2868,6 +2885,9 @@ std::shared_ptr<StorageTexture> DepthSurfaceStorage(const Context& context, std:
     if (mip != 0 || resource.baseLevel != 0) return nullptr;
     std::lock_guard gpu(GuestMemory::GpuMutex());
     std::lock_guard lock(surfacesMutex());
+    // Most storage lookups are of memory no depth surface starts at (best141: ~3 % of the committer in this
+    // scan); the index rules them out (APS5_NO_DEPTH_LOOKUP_FAST=1 scans, as before).
+    if (!RuntimeSwitches::Set(RuntimeSwitch::NoDepthLookupFast) && !mayHoldAddress(resource.baseAddress)) return nullptr;
     const auto& list = surfaces();
     const auto found = std::find_if(list.rbegin(), list.rend(), [&](const auto& surface) {
         return surface->active->load(std::memory_order_acquire) && surface->context.device == context.device && !surface->retired && (surface->target.address == resource.baseAddress || (surface->target.stencilAddress != 0 && surface->target.stencilAddress == resource.baseAddress));
