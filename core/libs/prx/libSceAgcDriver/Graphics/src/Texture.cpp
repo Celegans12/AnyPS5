@@ -4090,12 +4090,19 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
     // APS5_DEFER_FLIP_STORE=1 does the same for the flip's store of small images (StoreSmallPending), which
     // otherwise waits for their writer at every present (best120: ~85 ms a present once refreshes deferred).
     // Runtime switches (APS5_AB): taken once per flush.
+    // An image without block units whose memory is wholly host-imported stores on the GPU as well
+    // (writeBackLayers' layer path: retile into scratch, copy into the import, NotePendingWrite), so
+    // its writer wait defers the same way, and the flip's store, which no reader waits on, always
+    // defers for such images (best153: the flip's ~20 unaligned 4-32 KiB images made queue 0 wait
+    // ~110 ms a present for their writer while holding the GPU mutex). APS5_NO_DEFER_IMPORTED_STORES=1
+    // (runtime switch) defers block units only, and the flip only under APS5_DEFER_FLIP_STORE.
+    const bool deferImported = !RuntimeSwitches::Set(RuntimeSwitch::NoDeferImportedStores);
     const bool deferRefresh = RuntimeSwitches::Set(RuntimeSwitch::DeferRefreshFlush);
     const bool flipStore = reason != nullptr && std::strcmp(reason, "flip") == 0;
-    const bool deferFlip = flipStore && RuntimeSwitches::Set(RuntimeSwitch::DeferFlipStore);
+    const bool deferFlip = flipStore && (deferImported || RuntimeSwitches::Set(RuntimeSwitch::DeferFlipStore));
     bool deferWriter = false;
     if ((deferFlip || (deferRefresh && reason != nullptr && std::strcmp(reason, "storage refresh") == 0)) && Recorder::Active() != nullptr && !Recorder::InCompletion()) {
-        deferWriter = std::all_of(flush.begin(), flush.end(), [](const std::shared_ptr<StorageTexture>& texture) { return texture->blockUnits && HostImportFor(texture->context, texture->descriptor.baseAddress, static_cast<std::size_t>(texture->guestBytes)) != nullptr; });
+        deferWriter = std::all_of(flush.begin(), flush.end(), [deferImported](const std::shared_ptr<StorageTexture>& texture) { return (texture->blockUnits || deferImported) && HostImportFor(texture->context, texture->descriptor.baseAddress, static_cast<std::size_t>(texture->guestBytes)) != nullptr; });
         if (deferWriter) (flipStore ? deferredFlipStores : deferredRefreshFlushes).fetch_add(1, std::memory_order_relaxed);
     }
     if (auto* recorder = Recorder::Active(); !deferWriter && recorder != nullptr && !Recorder::InCompletion() && recorder->PendingWriterSerial(address, bytes) != 0) {

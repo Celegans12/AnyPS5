@@ -60,6 +60,7 @@ enum class RuntimeSwitch : std::size_t {
     NoCollectHeap,
     NoLargerSmallPools,
     DeferFlipStore,
+    NoDeferImportedStores,
     Count,
 };
 
