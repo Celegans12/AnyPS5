@@ -6531,7 +6531,8 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
             }
         }
     }
-    if (usesBda && !moved.empty()) return std::nullopt;
+    // APS5_UNSAFE_BDA_REUSE (measurement-only oracle): an address-table build takes moved data/buffers like a template.
+    if (usesBda && !moved.empty() && !(addressReuse && UnsafeBdaReuseOn())) return std::nullopt;
     return moved;
 }
 
