@@ -4086,7 +4086,8 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
     // GPU-direct (block units into an import) records their write-backs behind the pending writer
     // instead of waiting for it on the CPU: the recorded order keeps the writer first, and each
     // write-back notes its range as a pending write, which every later CPU reader waits for.
-    static const bool deferRefresh = std::getenv("APS5_DEFER_REFRESH_FLUSH") != nullptr;
+    // A runtime switch (APS5_AB): taken once per flush.
+    const bool deferRefresh = RuntimeSwitches::Set(RuntimeSwitch::DeferRefreshFlush);
     bool deferWriter = false;
     if (deferRefresh && reason != nullptr && std::strcmp(reason, "storage refresh") == 0 && Recorder::Active() != nullptr && !Recorder::InCompletion()) {
         deferWriter = std::all_of(flush.begin(), flush.end(), [](const std::shared_ptr<StorageTexture>& texture) { return texture->blockUnits && HostImportFor(texture->context, texture->descriptor.baseAddress, static_cast<std::size_t>(texture->guestBytes)) != nullptr; });
