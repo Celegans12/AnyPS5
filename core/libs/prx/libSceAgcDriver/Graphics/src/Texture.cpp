@@ -1910,7 +1910,7 @@ struct HandOverTraceAccess {
         if (!HandOverTraceDetail::InWindow(state)) return;
         bool logged = false;
         for (auto& record : state.records) {
-            if (record.readers >= HandOverTraceDetail::ReadersPerRecord || record.state == HandOverTraceDetail::RecordState::Stale) continue;
+            if (record.readers >= HandOverTraceDetail::ReadersPerRecord || (record.state != HandOverTraceDetail::RecordState::Live && record.state != HandOverTraceDetail::RecordState::Superseded)) continue;
             bool hit = false;
             for (const auto& source : record.sources) {
                 for (const auto& unit : source.units) {
@@ -1960,15 +1960,29 @@ struct HandOverTraceAccess {
         {
             auto& state = HandOverTraceDetail::State();
             std::lock_guard lock(state.mutex);
+            // Every write-back over units a supersede dropped is logged (up to MaxAfterDropLines): the source
+            // storing its old results over memory the receiver has written since.
+            std::string records;
             for (const auto& record : state.records) {
                 for (const auto& source : record.sources) {
                     if (source.imageId != image.traceId) continue;
+                    std::string units;
                     for (const auto& unit : source.units) {
-                        if (unit.dropped && std::find(written.begin(), written.end(), unit.unit) != written.end()) afterDrop = true;
+                        if (!unit.dropped || std::find(written.begin(), written.end(), unit.unit) == written.end()) continue;
+                        afterDrop = true;
+                        units += (units.empty() ? "" : ",") + HandOverTraceDetail::Format("%u->recv%u", unit.unit, unit.receiverUnit);
                     }
+                    if (!units.empty()) records += HandOverTraceDetail::Format(" ho#%llu(recv img#%llu, %s, writes at hand-over %llu now %llu)[%s]", static_cast<unsigned long long>(record.id), static_cast<unsigned long long>(record.receiverId), HandOverTraceDetail::RecordStateName(record.state), static_cast<unsigned long long>(source.writesAtHandOver), static_cast<unsigned long long>(image.writes), units.c_str());
                 }
             }
-            if (afterDrop) ++state.writeBackAfterDrop;
+            if (afterDrop) {
+                ++state.writeBackAfterDrop;
+                static std::uint64_t lines = 0;
+                if (HandOverTraceDetail::InWindow(state) && lines < 400) {
+                    ++lines;
+                    HandOverTraceDetail::Emit(state, HandOverTraceDetail::Format("writeback-after-drop %s units=%s reason=%s pendingNow=%s", Name(state, image).c_str(), units.c_str(), reason != nullptr ? reason : "-", PendingUnits(image).c_str()) + records);
+                }
+            }
         }
         Reader("writeback", &image, image.descriptor.baseAddress, image.descriptor.baseAddress + image.guestBytes, HandOverTraceDetail::Format(" units=%s reason=%s%s", units.c_str(), reason != nullptr ? reason : "-", afterDrop ? " AFTER-DROP" : ""));
     }
