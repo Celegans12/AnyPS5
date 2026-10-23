@@ -3620,6 +3620,24 @@ void addressTemplateTests(const Context& context) {
         Require(!plain->SharesUses() && plain->PrepareDrawBindings(recorder, *moved) == nullptr, "APS5_NO_BDA_TEMPLATES built a template");
         RuntimeSwitches::Assign(RuntimeSwitch::NoBdaTemplates, false);
         {
+            recorder.Sync();
+            auto reader = std::make_shared<ShaderResources>(importing, built, ColorTarget{}, 0, 0, 0, std::span<const GuestMemorySnapshot>(stored));
+            Require(reader->HoldsLease(), "a fresh address-table build holds no lease");
+            reader->MarkGpuWrites(recorder);
+            Require(recorder.PendingWriterSerial(address, 64) == 0, "the lease of a build that never stores through BDA counts as a writer");
+            RuntimeSwitches::Assign(RuntimeSwitch::NoReadOnlyLeaseSkip, true);
+            auto oldReader = std::make_shared<ShaderResources>(importing, built, ColorTarget{}, 0, 0, 0, std::span<const GuestMemorySnapshot>(stored));
+            oldReader->MarkGpuWrites(recorder);
+            Require(recorder.PendingWriterSerial(address, 64) == recorder.OpenSerial(), "APS5_NO_READ_ONLY_LEASE_SKIP did not count a read-only lease as a writer");
+            RuntimeSwitches::Assign(RuntimeSwitch::NoReadOnlyLeaseSkip, false);
+            recorder.Sync();
+            auto storer = std::make_shared<ShaderResources>(importing, storingStages, ColorTarget{}, 0, 0, 0, std::span<const GuestMemorySnapshot>(stored));
+            storer->MarkGpuWrites(recorder);
+            Require(recorder.PendingWriterSerial(address, 64) == recorder.OpenSerial(), "the lease of a build that stores through BDA does not count as a writer");
+            recorder.Sync();
+            for (auto* item : {&reader, &oldReader, &storer}) (*item)->WriteBack();
+        }
+        {
 #ifdef _WIN32
             _putenv_s("APS5_ADDRESS_TEMPLATE_ENTRIES", "2");
 #else
