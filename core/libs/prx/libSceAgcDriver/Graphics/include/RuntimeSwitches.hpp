@@ -47,6 +47,7 @@ enum class RuntimeSwitch : std::size_t {
     NoPresentFrameAge,
     NoBdaTemplates,
     SplitResourceCache,
+    NoReadOnlyLeaseSkip,
     Count,
 };
 
