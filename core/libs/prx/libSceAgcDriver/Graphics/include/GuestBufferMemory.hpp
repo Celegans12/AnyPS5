@@ -510,6 +510,12 @@ private:
     // The region containing `address`: this build's own regions (sorted after UploadPrepare) or
     // the space's base regions, or null.
     const Region* owner(std::uint64_t address, std::uint64_t end) const;
+    // AddressRanges' last two passes (shared with incrementalAddressRanges): the overlays cut into the
+    // ranges they lie in, then the runtime writes split out of read-only ranges as writable parts.
+    std::vector<ShaderRecompiler::BdaAbi::Range> applyOverlaysAndWrites(std::vector<ShaderRecompiler::BdaAbi::Range> result, std::vector<ShaderRecompiler::BdaAbi::Range> overlays, std::span<const std::pair<std::uint64_t, std::uint64_t>> writtenRanges) const;
+    // AddressRanges() for a build over the cached space, redoing only the neighbourhood of its own
+    // regions, overlays and writes (see GuestBufferMemory.cpp).
+    std::vector<ShaderRecompiler::BdaAbi::Range> incrementalAddressRanges() const;
     // Builds this build's regions from a lease as the per-build path always did: `base` gets the
     // ranges served in place (imports, mirrors), `copied` the ones copied per build.
     struct CopiedRange {

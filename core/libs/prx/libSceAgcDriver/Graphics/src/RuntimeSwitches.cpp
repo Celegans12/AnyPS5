@@ -50,6 +50,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_DEFER_REFRESH_FLUSH",
     "APS5_NO_DEPTH_INDEX",
     "APS5_NO_DEFERRED_DRAW_EVICTION",
+    "APS5_NO_INCREMENTAL_BDA_RANGES",
 };
 
 struct Refusal {

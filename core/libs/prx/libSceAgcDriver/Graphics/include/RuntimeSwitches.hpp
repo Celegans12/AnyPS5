@@ -50,6 +50,7 @@ enum class RuntimeSwitch : std::size_t {
     DeferRefreshFlush,
     NoDepthIndex,
     NoDeferredDrawEviction,
+    NoIncrementalBdaRanges,
     Count,
 };
 

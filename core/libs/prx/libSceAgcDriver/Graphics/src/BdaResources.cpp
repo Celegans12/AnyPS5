@@ -125,19 +125,83 @@ std::uint64_t hashRanges(const std::vector<ShaderRecompiler::BdaAbi::Range>& ran
 
 }
 
+// APS5_PROFILE_DRAW: where a BDA build's time goes ([bda-build], 10 s): the fault buffer, the address
+// ranges, and the table by outcome (space-serial hit, hash hit, miss with a new table buffer).
+struct BdaBuildTimes {
+    std::atomic<std::uint64_t> faults{0}, faultNs{0}, ranges{0}, rangesNs{0};
+    std::atomic<std::uint64_t> spaceHits{0}, spaceHitNs{0}, hashHits{0}, hashHitNs{0}, misses{0}, missNs{0};
+    std::atomic<long long> lastReport{0};
+};
+BdaBuildTimes& bdaBuildTimes() {
+    static BdaBuildTimes times;
+    return times;
+}
+bool bdaBuildProfiled() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return profile;
+}
+std::uint64_t nsSince(std::chrono::steady_clock::time_point start) {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+}
+void reportBdaBuildTimes() {
+    auto& t = bdaBuildTimes();
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = t.lastReport.load();
+    if (nowMs - last < 10000 || !t.lastReport.compare_exchange_strong(last, nowMs)) return;
+    const auto line = [](std::atomic<std::uint64_t>& count, std::atomic<std::uint64_t>& ns, char* out, std::size_t size) {
+        const auto n = count.exchange(0, std::memory_order_relaxed);
+        const auto total = ns.exchange(0, std::memory_order_relaxed);
+        std::snprintf(out, size, "%llu x %.1f us = %.0f ms", static_cast<unsigned long long>(n), n != 0 ? static_cast<double>(total) / 1000.0 / static_cast<double>(n) : 0.0, static_cast<double>(total) / 1e6);
+    };
+    char fault[96], ranges[96], space[96], hashHit[96], miss[96];
+    line(t.faults, t.faultNs, fault, sizeof(fault));
+    line(t.ranges, t.rangesNs, ranges, sizeof(ranges));
+    line(t.spaceHits, t.spaceHitNs, space, sizeof(space));
+    line(t.hashHits, t.hashHitNs, hashHit, sizeof(hashHit));
+    line(t.misses, t.missNs, miss, sizeof(miss));
+    std::fprintf(stderr, "[bda-build] (10 s): fault buffers %s; address ranges %s; table: space hits %s, hash hits %s, misses %s\n", fault, ranges, space, hashHit, miss);
+}
+
 BdaResources::BdaResources(const Context& context) : textureService(context.textureService) {
     static_assert(std::endian::native == std::endian::little);
     Require(ShaderRecompiler::BdaAbi::FaultBufferBytes <= context.limits.maxStorageBufferRange, "BDA fault buffer exceeds storage buffer range limit");
     const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::Bda);
+    const auto faultStart = bdaBuildProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     fault = std::make_unique<Buffer>(context, ShaderRecompiler::BdaAbi::FaultBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     std::memset(fault->Bytes().data(), 0, ShaderRecompiler::BdaAbi::WrittenListWord * sizeof(std::uint32_t));
     std::memset(fault->Bytes().data() + ShaderRecompiler::BdaAbi::SrtGuardWord * sizeof(std::uint32_t), 0, sizeof(std::uint32_t));
+    if (bdaBuildProfiled()) {
+        bdaBuildTimes().faults.fetch_add(1, std::memory_order_relaxed);
+        bdaBuildTimes().faultNs.fetch_add(nsSince(faultStart), std::memory_order_relaxed);
+    }
 }
 
 BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memory) : BdaResources(context) {
+    const bool profiled = bdaBuildProfiled();
+    const auto rangesStart = profiled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto cached = memory.CachedAddressTable();
     std::vector<ShaderRecompiler::BdaAbi::Range> built;
     if (!cached.has_value()) built = memory.AddressRanges();
+    const auto tableStart = profiled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    if (profiled) {
+        bdaBuildTimes().ranges.fetch_add(1, std::memory_order_relaxed);
+        bdaBuildTimes().rangesNs.fetch_add(nsSince(rangesStart), std::memory_order_relaxed);
+    }
+    // Which way the table came, for [bda-build]: 0 space hit, 1 hash hit, 2 miss.
+    int outcome = 2;
+    struct NoteOutcome {
+        bool profiled;
+        const int& outcome;
+        std::chrono::steady_clock::time_point start;
+        ~NoteOutcome() {
+            if (!profiled) return;
+            auto& t = bdaBuildTimes();
+            const auto ns = nsSince(start);
+            (outcome == 0 ? t.spaceHits : outcome == 1 ? t.hashHits : t.misses).fetch_add(1, std::memory_order_relaxed);
+            (outcome == 0 ? t.spaceHitNs : outcome == 1 ? t.hashHitNs : t.missNs).fetch_add(ns, std::memory_order_relaxed);
+            reportBdaBuildTimes();
+        }
+    } noteOutcome{profiled, outcome, tableStart};
     const auto& ranges = cached.has_value() ? *cached->ranges : built;
     const auto serial = cached.has_value() ? cached->serial : 0;
     Require(ranges.size() <= std::numeric_limits<std::uint32_t>::max(), "BDA table range count overflow");
@@ -162,6 +226,7 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
                 if (auto shared = it->buffer.lock(); shared != nullptr) {
                     ++cache.hits;
                     ++cache.classes.spaceTables;
+                    outcome = 0;
                     table = std::move(shared);
                     cache.entries.splice(cache.entries.begin(), cache.entries, it);
                     return;
@@ -192,6 +257,7 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
             }
             if (sameRanges(it->ranges, ranges)) {
                 ++cache.hits;
+                outcome = 1;
                 // An equal table of an earlier space (a rebuild that mapped the same ranges the
                 // same way): the next build of this space binds it by the serial.
                 if (serial != 0) it->spaceSerial = serial;
