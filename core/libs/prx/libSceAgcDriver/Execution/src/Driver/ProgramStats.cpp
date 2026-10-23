@@ -220,7 +220,8 @@ bool InstanceRowTraceActive(std::uint64_t vertex) {
         parsed.second = ParseProgramList(end + 1);
         return parsed;
     }();
-    if (setting.second.empty() || presentCount.load(std::memory_order_relaxed) != setting.first) return false;
+    const auto present = presentCount.load(std::memory_order_relaxed);
+    if (setting.second.empty() || present < setting.first || present > setting.first + 1u) return false;
     return ListedProgram(setting.second, vertex);
 }
 

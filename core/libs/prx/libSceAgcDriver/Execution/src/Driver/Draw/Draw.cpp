@@ -73,7 +73,7 @@ void TraceInstanceRows(std::uint64_t vertexProgram, const DrawDecode& decode, co
         static_cast<unsigned long long>(ProgramStatsPresent()), static_cast<unsigned long long>(vertexProgram), decode.state.colors.size(), static_cast<unsigned long long>(draw.indexAddress), draw.indexCount, draw.instanceCount, draw.firstInstance, draw.firstVertex, draw.indirect.has_value() ? 1 : 0, word(14), word(15),
         static_cast<unsigned long long>(table), static_cast<unsigned long long>(list), static_cast<unsigned long long>(base), stride, descriptor[2]);
     line += text;
-    const std::uint32_t records = std::min<std::uint32_t>(descriptor[2], 4u);
+    const std::uint32_t records = std::min<std::uint32_t>(descriptor[2], 64u);
     for (std::uint32_t record = 0; record < records && stride >= 64u; ++record) {
         const auto address = base + static_cast<std::uint64_t>(record) * stride;
         if (!readable(address, 64u)) break;
