@@ -404,6 +404,8 @@ struct DrawOutcome {
     // APS5_PROFILE_DRAW [address-draws]: 0 no address table, 1 read-only build, 2 build that
     // stores through BDA, 3 address-table template hit.
     std::uint8_t addressClass = 0;
+    std::uint32_t sampledImages = 0;
+    std::uint32_t storageImages = 0;
     // In the recorder; `waited` when the recorder was synced right after (copied writes or a lease).
     bool recorded = false;
     bool waited = false;
@@ -526,6 +528,14 @@ struct DrawProfile {
         std::uint64_t draws = 0;
         std::array<double, PhaseCount> us{};
         std::array<double, static_cast<std::size_t>(ShaderResources::BuildPhase::Count)> buildMs{};
+        double waitUs = 0;
+        double lookupUs = 0;
+        std::uint64_t targetLookups = 0;
+        std::uint64_t slowLookups = 0;
+        double slowLookupUs = 0;
+        std::uint64_t pagesWalked = 0;
+        std::uint64_t sampledImages = 0;
+        std::uint64_t storageImages = 0;
     };
     std::array<AddressClass, 4> addressClasses{};
 };
@@ -551,6 +561,14 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
         auto& item = profile.addressClasses[outcome.addressClass];
         ++item.draws;
         for (std::size_t i = 0; i < PhaseCount; ++i) item.us[i] += us[i];
+        item.waitUs += outcome.hookWaitUs + outcome.ownSyncUs;
+        item.lookupUs += outcome.lookupUs;
+        item.targetLookups += outcome.targetLookups;
+        item.slowLookups += outcome.slowLookups;
+        item.slowLookupUs += outcome.slowLookupUs;
+        item.pagesWalked += outcome.pagesWalked;
+        item.sampledImages += outcome.sampledImages;
+        item.storageImages += outcome.storageImages;
         if (built != nullptr && outcome.addressClass != 3) {
             for (std::size_t i = 0; i < item.buildMs.size(); ++i) item.buildMs[i] += built->phaseMs[i];
         }
@@ -703,6 +721,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
                     if (item.buildMs[i] * 1000.0 / count >= 2.0) used += std::snprintf(text + used, sizeof(text) - static_cast<std::size_t>(used), " %s %.0f", buildNames[i], item.buildMs[i] * 1000.0 / count);
                 }
             }
+            if (used > 0 && static_cast<std::size_t>(used) < sizeof(text)) used += std::snprintf(text + used, sizeof(text) - static_cast<std::size_t>(used), "; waits %.0f us, target lookups %.2f (%.0f us, slow %llu = %.0f us, pages walked %.0f), images %.1f sampled %.1f storage", item.waitUs / count, static_cast<double>(item.targetLookups) / count, item.lookupUs / count, static_cast<unsigned long long>(item.slowLookups), item.slowLookupUs / 1000.0, static_cast<double>(item.pagesWalked) / count, static_cast<double>(item.sampledImages) / count, static_cast<double>(item.storageImages) / count);
             std::fprintf(stderr, "%s\n", text);
             item = {};
         }
@@ -1816,6 +1835,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                 if (trimKey) CheckBufferAliases(context, shaders, state.color, draw.indexAddress, indexBytes);
                 outcome.kind = KindTemplateHit;
                 if (addressBased) outcome.addressClass = 3;
+                if (timer.profile) outcome.sampledImages = static_cast<std::uint32_t>(resolved.resources->SampledTextures().size());
                 countCache(&DrawProfile::cacheHits);
                 if (addressBased) CountAddressReuse(AddressReuse::Reused);
             } else if (valid) {
@@ -1857,6 +1877,10 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
         outcome.addressBased = resolved.resources->HoldsLease();
         outcome.kind = outcome.addressBased ? KindBda : KindBuild;
         if (resolved.resources->UsesAddressTable()) outcome.addressClass = resolved.resources->BdaReadOnly() ? 1 : 2;
+        if (timer.profile) {
+            outcome.sampledImages = static_cast<std::uint32_t>(resolved.resources->SampledTextures().size());
+            outcome.storageImages = static_cast<std::uint32_t>(resolved.resources->StorageImages().size());
+        }
         if (resolved.cacheable) countCache(&DrawProfile::cacheMisses);
     }
     if (prepared != nullptr && prepared->resources != nullptr) {
