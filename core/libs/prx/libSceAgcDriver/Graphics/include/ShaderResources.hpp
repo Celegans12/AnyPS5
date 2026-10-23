@@ -867,6 +867,11 @@ private:
     void indexTextures(decltype(entries)::iterator entry, bool add);
     std::size_t capacity = 0;
     bool fixedCapacity = false;
+    // Address-table builds (ReusesAddressSpace) have a bound of their own, so the other entries'
+    // churn (dispatch keys) does not evict them before the next frame draws them again, and they
+    // never displace the others: APS5_ADDRESS_TEMPLATE_ENTRIES (default 2048).
+    std::size_t addressEntries = 0;
+    std::size_t addressCapacity = 0;
     std::list<std::size_t> evictedOrder;
     std::unordered_map<std::size_t, decltype(evictedOrder)::iterator> evictedKeys;
     std::size_t evictionsSinceCheck = 0;

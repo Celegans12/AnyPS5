@@ -4985,6 +4985,7 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
         return;
     }
     resources->PinTextures(true);
+    if (resources->ReusesAddressSpace()) ++addressEntries;
     entries.emplace_front(key, std::move(resources));
     index.emplace(key, entries.begin());
     indexTextures(entries.begin(), true);
@@ -4994,10 +4995,19 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
         fixedCapacity = parsed != 0;
         capacity = fixedCapacity ? static_cast<std::size_t>(parsed) : baseEntries;
     }
+    if (addressCapacity == 0) {
+        const char* value = std::getenv("APS5_ADDRESS_TEMPLATE_ENTRIES");
+        const auto parsed = value ? std::strtoull(value, nullptr, 10) : 0ull;
+        addressCapacity = parsed != 0 ? static_cast<std::size_t>(parsed) : 2048u;
+    }
     noteUse(key);
-    while (entries.size() > capacity) {
-        noteEvicted(entries.back().first);
-        drop(std::prev(entries.end()), evicted);
+    while (entries.size() - addressEntries > capacity || addressEntries > addressCapacity) {
+        const bool address = addressEntries > addressCapacity;
+        auto victim = std::prev(entries.end());
+        while (victim != entries.begin() && victim->second->ReusesAddressSpace() != address) --victim;
+        if (victim->second->ReusesAddressSpace() != address) break;
+        noteEvicted(victim->first);
+        drop(victim, evicted);
     }
     if (entries.front().second->TableElements() == 0) return;
     std::uint64_t tables = 0;
@@ -5072,6 +5082,7 @@ void ResourceCache::indexTextures(decltype(entries)::iterator entry, bool add) {
 
 void ResourceCache::drop(std::list<std::pair<Key, std::shared_ptr<ShaderResources>>>::iterator entry, std::vector<std::shared_ptr<ShaderResources>>* evicted) {
     entry->second->PinTextures(false);
+    if (entry->second->ReusesAddressSpace()) --addressEntries;
     indexTextures(entry, false);
     index.erase(entry->first);
     if (evicted != nullptr) evicted->push_back(std::move(entry->second));
@@ -5102,6 +5113,7 @@ void ResourceCache::Clear() {
     textureIndex.clear();
     index.clear();
     entries.clear();
+    addressEntries = 0;
     evictedKeys.clear();
     evictedOrder.clear();
     evictionsSinceCheck = 0;

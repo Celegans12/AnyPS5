@@ -3619,6 +3619,40 @@ void addressTemplateTests(const Context& context) {
         auto plain = std::make_shared<ShaderResources>(importing, built, ColorTarget{}, 0, 0, 0, std::span<const GuestMemorySnapshot>(snapshots));
         Require(!plain->SharesUses() && plain->PrepareDrawBindings(recorder, *moved) == nullptr, "APS5_NO_BDA_TEMPLATES built a template");
         RuntimeSwitches::Assign(RuntimeSwitch::NoBdaTemplates, false);
+        {
+#ifdef _WIN32
+            _putenv_s("APS5_ADDRESS_TEMPLATE_ENTRIES", "2");
+#else
+            setenv("APS5_ADDRESS_TEMPLATE_ENTRIES", "2", 1);
+#endif
+            ResourceCache cache;
+            cache.SetBase(2, 8);
+            ShaderRecompiler::RecompileResult plainFragment;
+            const std::array<CompiledShader, 2> plainStages{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &plainFragment, 0}}};
+            std::vector<std::shared_ptr<ShaderResources>> objects;
+            const auto add = [&](bool address, std::uint32_t key) {
+                objects.push_back(address ? std::make_shared<ShaderResources>(importing, built, ColorTarget{}, 0, 0, 0, std::span<const GuestMemorySnapshot>(stored)) : std::make_shared<ShaderResources>(importing, plainStages, ColorTarget{}, 0, 0, 0, std::span<const GuestMemorySnapshot>{}));
+                Require(objects.back()->ReusesAddressSpace() == address, "a cache test object is not of the kind asked for");
+                cache.Insert({key}, objects.back());
+            };
+            const auto held = [&](std::uint32_t key) { return cache.Peek({key}) != nullptr; };
+            add(true, 100);
+            add(true, 101);
+            for (std::uint32_t key = 0; key < 4; ++key) add(false, key);
+            Require(held(100) && held(101) && !held(0) && !held(1) && held(2) && held(3), "other entries evicted address-table templates, or overran their own bound");
+            add(true, 102);
+            Require(!held(100) && held(101) && held(102) && held(2) && held(3), "an address-table template over its bound evicted another kind of entry, or not the oldest template");
+            cache.Remove({101});
+            add(true, 103);
+            Require(held(102) && held(103) && cache.Size() == 4, "a removed address-table template still counted against its bound");
+            cache.Clear();
+#ifdef _WIN32
+            _putenv_s("APS5_ADDRESS_TEMPLATE_ENTRIES", "");
+#else
+            unsetenv("APS5_ADDRESS_TEMPLATE_ENTRIES");
+#endif
+            for (auto& object : objects) object->WriteBack();
+        }
         recorder.Sync();
         Require(!resources->InUse() && !writer->InUse(), "uses stayed in flight after their batches completed");
         for (auto* item : {&resources, &writer, &plain}) (*item)->WriteBack();
