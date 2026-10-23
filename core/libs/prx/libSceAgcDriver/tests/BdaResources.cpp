@@ -3646,6 +3646,22 @@ void addressTemplateTests(const Context& context) {
             add(true, 103);
             Require(held(102) && held(103) && cache.Size() == 4, "a removed address-table template still counted against its bound");
             cache.Clear();
+            ShaderRecompiler::RecompileResult computeProgram;
+            computeProgram.bindings = {data};
+            const CompiledShader computeStage{ShaderRecompiler::ShaderStage::Compute, &computeProgram, 0};
+            const auto addDispatch = [&](std::uint32_t key) {
+                objects.push_back(std::make_shared<ShaderResources>(importing, computeStage, std::span<const GuestMemorySnapshot>{}));
+                Require(!objects.back()->DrawBuild() && !objects.back()->ReusesAddressSpace(), "a dispatch build counts as a draw");
+                cache.Insert({key}, objects.back());
+            };
+            RuntimeSwitches::Assign(RuntimeSwitch::SplitResourceCache, true);
+            for (std::uint32_t key = 10; key < 13; ++key) add(false, key);
+            for (std::uint32_t key = 20; key < 23; ++key) addDispatch(key);
+            Require(!held(10) && held(11) && held(12) && !held(20) && held(21) && held(22), "APS5_SPLIT_RESOURCE_CACHE did not give draws and dispatches a bound each");
+            RuntimeSwitches::Assign(RuntimeSwitch::SplitResourceCache, false);
+            addDispatch(23);
+            Require(held(22) && held(23) && !held(11) && !held(12) && !held(21) && cache.Size() == 2, "without APS5_SPLIT_RESOURCE_CACHE draws and dispatches do not share one bound again");
+            cache.Clear();
 #ifdef _WIN32
             _putenv_s("APS5_ADDRESS_TEMPLATE_ENTRIES", "");
 #else

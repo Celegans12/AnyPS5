@@ -2546,6 +2546,7 @@ double ShaderResources::phase(BuildPhase which) {
     const auto now = std::chrono::steady_clock::now();
     const auto ms = std::chrono::duration<double, std::milli>(now - phaseStart).count();
     addBuildPhase(which, ms);
+    timing.phaseMs[static_cast<std::size_t>(which)] += ms;
     const auto waited = Recorder::ThreadWaitedMs();
     if (ms > (drawBuild ? 5.0 : 50.0)) {
         const auto tag = GuestMemory::CurrentPacket();
@@ -4986,6 +4987,7 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
     }
     resources->PinTextures(true);
     if (resources->ReusesAddressSpace()) ++addressEntries;
+    else if (resources->DrawBuild()) ++drawEntries;
     entries.emplace_front(key, std::move(resources));
     index.emplace(key, entries.begin());
     indexTextures(entries.begin(), true);
@@ -5001,11 +5003,20 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
         addressCapacity = parsed != 0 ? static_cast<std::size_t>(parsed) : 2048u;
     }
     noteUse(key);
-    while (entries.size() - addressEntries > capacity || addressEntries > addressCapacity) {
-        const bool address = addressEntries > addressCapacity;
+    const bool split = RuntimeSwitches::Set(RuntimeSwitch::SplitResourceCache);
+    const auto kindOf = [](const std::shared_ptr<ShaderResources>& entry) { return entry->ReusesAddressSpace() ? 0 : entry->DrawBuild() ? 1 : 2; };
+    for (;;) {
+        const auto dispatchEntries = entries.size() - addressEntries - drawEntries;
+        int victimKind = -1;
+        if (addressEntries > addressCapacity) victimKind = 0;
+        else if (split && drawEntries > capacity) victimKind = 1;
+        else if (split && dispatchEntries > capacity) victimKind = 2;
+        else if (!split && drawEntries + dispatchEntries > capacity) victimKind = 3;
+        if (victimKind < 0) break;
+        const auto matches = [&](const std::shared_ptr<ShaderResources>& entry) { const auto kind = kindOf(entry); return victimKind == 3 ? kind != 0 : kind == victimKind; };
         auto victim = std::prev(entries.end());
-        while (victim != entries.begin() && victim->second->ReusesAddressSpace() != address) --victim;
-        if (victim->second->ReusesAddressSpace() != address) break;
+        while (victim != entries.begin() && !matches(victim->second)) --victim;
+        if (!matches(victim->second)) break;
         noteEvicted(victim->first);
         drop(victim, evicted);
     }
@@ -5083,6 +5094,7 @@ void ResourceCache::indexTextures(decltype(entries)::iterator entry, bool add) {
 void ResourceCache::drop(std::list<std::pair<Key, std::shared_ptr<ShaderResources>>>::iterator entry, std::vector<std::shared_ptr<ShaderResources>>* evicted) {
     entry->second->PinTextures(false);
     if (entry->second->ReusesAddressSpace()) --addressEntries;
+    else if (entry->second->DrawBuild()) --drawEntries;
     indexTextures(entry, false);
     index.erase(entry->first);
     if (evicted != nullptr) evicted->push_back(std::move(entry->second));
@@ -5114,6 +5126,7 @@ void ResourceCache::Clear() {
     index.clear();
     entries.clear();
     addressEntries = 0;
+    drawEntries = 0;
     evictedKeys.clear();
     evictedOrder.clear();
     evictionsSinceCheck = 0;

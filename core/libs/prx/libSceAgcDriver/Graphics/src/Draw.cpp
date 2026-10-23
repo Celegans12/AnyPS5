@@ -401,6 +401,9 @@ constexpr std::array<const char*, IndirectPathCount> IndirectDrawPathNames{"gpu-
 
 // What became of one draw, for the totals.
 struct DrawOutcome {
+    // APS5_PROFILE_DRAW [address-draws]: 0 no address table, 1 read-only build, 2 build that
+    // stores through BDA, 3 address-table template hit.
+    std::uint8_t addressClass = 0;
     // In the recorder; `waited` when the recorder was synced right after (copied writes or a lease).
     bool recorded = false;
     bool waited = false;
@@ -519,6 +522,12 @@ struct DrawProfile {
     std::array<std::uint64_t, static_cast<std::size_t>(ShaderResources::TemplateOutcome::Count)> templateSeen{};
     LeaseStats leaseSeen;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+    struct AddressClass {
+        std::uint64_t draws = 0;
+        std::array<double, PhaseCount> us{};
+        std::array<double, static_cast<std::size_t>(ShaderResources::BuildPhase::Count)> buildMs{};
+    };
+    std::array<AddressClass, 4> addressClasses{};
 };
 constexpr std::array<const char*, static_cast<std::size_t>(DrawSkip::Count)> DrawSkipNames{"nothing to draw", "prechecked", "thrown"};
 
@@ -538,6 +547,14 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
         drawUs += us[i];
     }
     profile.maxDrawUs = std::max(profile.maxDrawUs, drawUs);
+    if (outcome.addressClass != 0) {
+        auto& item = profile.addressClasses[outcome.addressClass];
+        ++item.draws;
+        for (std::size_t i = 0; i < PhaseCount; ++i) item.us[i] += us[i];
+        if (built != nullptr && outcome.addressClass != 3) {
+            for (std::size_t i = 0; i < item.buildMs.size(); ++i) item.buildMs[i] += built->phaseMs[i];
+        }
+    }
     profile.hookWaitUs += outcome.hookWaitUs;
     profile.maxHookWaitUs = std::max(profile.maxHookWaitUs, outcome.hookWaitUs);
     profile.ownSyncUs += outcome.ownSyncUs;
@@ -665,6 +682,31 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     profile.slowLookupUs = 0;
     profile.fullScissorLookups = profile.partialLookups = profile.pagesWalked = 0;
     profile.lookupUs = 0;
+    {
+        static constexpr std::array<const char*, 4> classNames{"", "read-only builds", "storing builds", "template hits"};
+        static constexpr std::array<const char*, 8> buildNames{"bindings", "precollect", "upload", "descriptors", "stageA", "images", "bda", "stageB"};
+        for (std::size_t c = 1; c < profile.addressClasses.size(); ++c) {
+            auto& item = profile.addressClasses[c];
+            if (item.draws == 0) continue;
+            const auto count = static_cast<double>(item.draws);
+            char text[1536];
+            int used = std::snprintf(text, sizeof(text), "[address-draws] %s %llu, us per draw:", classNames[c], static_cast<unsigned long long>(item.draws));
+            double total = 0;
+            for (std::size_t i = 0; i < PhaseCount; ++i) total += item.us[i];
+            used += std::snprintf(text + used, sizeof(text) - static_cast<std::size_t>(used), " total %.0f", total / count);
+            for (std::size_t i = 0; i < PhaseCount && used > 0 && static_cast<std::size_t>(used) < sizeof(text); ++i) {
+                if (item.us[i] / count >= 2.0) used += std::snprintf(text + used, sizeof(text) - static_cast<std::size_t>(used), " %s %.0f", DrawPhaseNames[i], item.us[i] / count);
+            }
+            if (c != 3 && used > 0 && static_cast<std::size_t>(used) < sizeof(text)) {
+                used += std::snprintf(text + used, sizeof(text) - static_cast<std::size_t>(used), "; build phases:");
+                for (std::size_t i = 0; i < item.buildMs.size() && used > 0 && static_cast<std::size_t>(used) < sizeof(text); ++i) {
+                    if (item.buildMs[i] * 1000.0 / count >= 2.0) used += std::snprintf(text + used, sizeof(text) - static_cast<std::size_t>(used), " %s %.0f", buildNames[i], item.buildMs[i] * 1000.0 / count);
+                }
+            }
+            std::fprintf(stderr, "%s\n", text);
+            item = {};
+        }
+    }
     profile.kindUs.fill(0);
     profile.kindCounts.fill(0);
     profile.cacheHits = profile.cacheMisses = profile.cacheInvalidated = profile.uncacheable = 0;
@@ -1773,6 +1815,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                 resolved.moved = std::move(*moved);
                 if (trimKey) CheckBufferAliases(context, shaders, state.color, draw.indexAddress, indexBytes);
                 outcome.kind = KindTemplateHit;
+                if (addressBased) outcome.addressClass = 3;
                 countCache(&DrawProfile::cacheHits);
                 if (addressBased) CountAddressReuse(AddressReuse::Reused);
             } else if (valid) {
@@ -1813,6 +1856,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
         resolved.built = &resolved.resources->Timing();
         outcome.addressBased = resolved.resources->HoldsLease();
         outcome.kind = outcome.addressBased ? KindBda : KindBuild;
+        if (resolved.resources->UsesAddressTable()) outcome.addressClass = resolved.resources->BdaReadOnly() ? 1 : 2;
         if (resolved.cacheable) countCache(&DrawProfile::cacheMisses);
     }
     if (prepared != nullptr && prepared->resources != nullptr) {

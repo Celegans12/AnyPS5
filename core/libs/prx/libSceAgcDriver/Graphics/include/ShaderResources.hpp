@@ -309,6 +309,7 @@ public:
     bool HoldsLease() const { return guestMemory.HoldsLease(); }
     bool BdaReadOnly() const { return usesBda && bdaReadOnly; }
     bool UsesAddressTable() const { return usesBda; }
+    bool DrawBuild() const { return drawBuild; }
     std::size_t CopiedBytes() const { return guestMemory.CopiedBytes(); }
     bool WritesOverlap(std::uint64_t address, std::size_t bytes) const { return guestMemory.WritesOverlap(address, bytes); }
     bool CopiedWritesOverlap(std::uint64_t address, std::size_t bytes) const { return guestMemory.CopiedWritesOverlap(address, bytes); }
@@ -433,6 +434,7 @@ public:
         double descriptorsMs = 0;
         double prepareMs = 0;
         double completeMs = 0;
+        std::array<double, static_cast<std::size_t>(BuildPhase::Count)> phaseMs{};
     };
     const BuildTiming& Timing() const { return timing; }
     // The image surfaces (address, bytes) whose stage-B lookup reads guest memory on the CPU and so
@@ -872,6 +874,10 @@ private:
     // never displace the others: APS5_ADDRESS_TEMPLATE_ENTRIES (default 2048).
     std::size_t addressEntries = 0;
     std::size_t addressCapacity = 0;
+    // APS5_SPLIT_RESOURCE_CACHE=1 (an APS5_AB switch): draw and dispatch entries each have the
+    // bound the two shared before (APS5_RESOURCE_CACHE_ENTRIES), so the dispatch keys' churn no
+    // longer evicts draw templates (and the cache may hold twice as many such entries).
+    std::size_t drawEntries = 0;
     std::list<std::size_t> evictedOrder;
     std::unordered_map<std::size_t, decltype(evictedOrder)::iterator> evictedKeys;
     std::size_t evictionsSinceCheck = 0;

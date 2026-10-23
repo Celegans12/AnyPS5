@@ -46,6 +46,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_NO_DRAW_AHEAD",
     "APS5_NO_PRESENT_FRAME_AGE",
     "APS5_NO_BDA_TEMPLATES",
+    "APS5_SPLIT_RESOURCE_CACHE",
 };
 
 struct Refusal {
