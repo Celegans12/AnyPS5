@@ -52,6 +52,15 @@ Recorder* RecorderFor(const Context& context) {
     return recorder != nullptr && recorder->Device() == context.device ? recorder : nullptr;
 }
 
+std::atomic<std::uint64_t>& depthTraceAddress() {
+    static std::atomic<std::uint64_t> address{0};
+    return address;
+}
+
+void depthTrace(std::uint64_t address, const char* event) {
+    if (address != 0 && depthTraceAddress().load(std::memory_order_relaxed) == address) std::fprintf(stderr, "[depth-trace] %s 0x%llx\n", event, static_cast<unsigned long long>(address));
+}
+
 bool storageFits(const DepthTarget& target, const GuestTextureResource& descriptor) {
     const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
     const auto format = ResolveTextureFormat(descriptor.format);
@@ -510,6 +519,7 @@ public:
     }
 
     void Transfer(StorageTexture& storage, bool into, std::uint32_t layer, VkImageAspectFlagBits aspect = VK_IMAGE_ASPECT_DEPTH_BIT) {
+        depthTrace(target.address, into ? (aspect == VK_IMAGE_ASPECT_STENCIL_BIT ? "transfer stencil into storage" : "transfer depth into storage") : (aspect == VK_IMAGE_ASPECT_STENCIL_BIT ? "transfer storage into stencil" : "transfer storage into depth"));
         const auto& descriptor = storage.Descriptor();
         const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
         const auto storageFormat = storage.StorageFormat();
@@ -777,6 +787,7 @@ public:
         for (const bool stencil : {false, true}) {
             auto& plane = stencil ? stencilPlane : depthPlane;
             if (plane.storage.get() == &candidate) {
+                depthTrace(target.address, stencil ? "store-back stencil plane storage" : "store-back depth plane storage");
                 if (stencil || !StoreOverwrite(candidate)) copyPlane(plane, plane.storage, stencil, false);
                 written = ++depthWrites;
                 return true;
@@ -792,6 +803,7 @@ public:
     bool StoreBackCovering(const StorageTexture& candidate) {
         for (const bool stencil : {false, true}) {
             if (!CoversPlane(candidate, stencil)) continue;
+            depthTrace(target.address, stencil ? "store-back covering stencil" : "store-back covering depth");
             auto& plane = stencil ? stencilPlane : depthPlane;
             const auto source = std::const_pointer_cast<StorageTexture>(candidate.shared_from_this());
             copyPlane(plane, source, stencil, false);
@@ -803,6 +815,7 @@ public:
 
     void TakeStorage() {
         if (target.samples != 1 || hostFormat != target.format) return;
+        depthTrace(target.address, "take storage");
         const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
         const auto bytes = DepthSliceBytes(target.extent, d16 ? 2u : 4u);
         auto storage = StorageTexture::FindPending(target.address, bytes);
@@ -828,6 +841,7 @@ public:
     }
 
     std::shared_ptr<StorageTexture> StoreDepthPlane(const GuestTextureResource& resource) {
+        depthTrace(target.address, "store depth plane to memory");
         ApplyFastClear();
         if (mirrorPlane.storage == nullptr) {
             mirrorPlane.storage = StorageTexture::Create(context, *context.detiler, resource, 0);
@@ -845,6 +859,7 @@ public:
             return false;
         }
         memoryStale = false;
+        depthTrace(target.address, "reload depth from memory");
         if (mirrorPlane.storage == nullptr) {
             mirrorPlane.storage = StorageTexture::Create(context, *context.detiler, resource, 0);
             ++mirrorEpoch;
@@ -2210,6 +2225,11 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, 
         surface = surfaces().back().get();
     }
     surface->retired = false;
+    if (DepthSurfaceTraced(target.address)) {
+        char text[160];
+        std::snprintf(text, sizeof(text), "view (written %d, created %d, cleared %d, htile cleared 0x%x, pending clear 0x%x)", depthWritten ? 1 : 0, created ? 1 : 0, cleared ? 1 : 0, htileCleared, surface->pendingClear);
+        depthTrace(target.address, text);
+    }
     const auto owner = depthOwners().find({context.device, target.address});
     const bool inherits = owner != depthOwners().end() && owner->second.surface->active->load(std::memory_order_acquire) && !owner->second.surface->retired;
     surface->clearDepth = target.clearDepth;
@@ -2801,6 +2821,14 @@ bool DepthSurfaceStoreBack(const Context& context, const StorageTexture& storage
         if ((*surface)->context.device == context.device && (*surface)->StoreBackCovering(storage)) return true;
     }
     return false;
+}
+
+void SetDepthSurfaceTrace(std::uint64_t address) {
+    depthTraceAddress().store(address, std::memory_order_relaxed);
+}
+
+bool DepthSurfaceTraced(std::uint64_t address) {
+    return address != 0 && depthTraceAddress().load(std::memory_order_relaxed) == address;
 }
 
 bool DepthSurfaceAt(std::uint64_t address) {

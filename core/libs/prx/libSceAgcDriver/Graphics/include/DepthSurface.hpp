@@ -98,6 +98,8 @@ VkFormat HostDepthFormat(const Context& context, VkFormat format);
 float HostDepthBiasConstant(const Context& context, VkFormat format, float constant);
 std::shared_ptr<StorageTexture> DepthSurfaceStorage(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, std::uint32_t mip);
 bool DepthSurfaceStoreBack(const Context& context, const StorageTexture& storage);
+void SetDepthSurfaceTrace(std::uint64_t address);
+bool DepthSurfaceTraced(std::uint64_t address);
 
 struct StorageImageClear {
     std::array<std::uint32_t, 8> image{};

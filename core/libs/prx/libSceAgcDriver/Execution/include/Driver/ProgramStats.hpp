@@ -40,6 +40,7 @@ const ProgramList& TintedVertexPrograms();
 const ProgramList& DepthStateTracePrograms();
 std::uint64_t ProgramStatsPresent();
 bool InstanceRowTraceActive(std::uint64_t vertex);
+std::uint64_t DepthSurfaceTraceTarget();
 const ProgramList& SkippedComputePrograms();
 // APS5_PROGRAM_TARGETS=<hex[-hex],...>: when set, the pixel skip and tint lists only apply to draws with a colour
 // target at a listed address.

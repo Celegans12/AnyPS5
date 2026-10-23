@@ -224,6 +224,21 @@ bool InstanceRowTraceActive(std::uint64_t vertex) {
     return ListedProgram(setting.second, vertex);
 }
 
+std::uint64_t DepthSurfaceTraceTarget() {
+    static const auto setting = [] {
+        std::pair<std::uint64_t, std::uint64_t> parsed{0, 0};
+        const char* text = std::getenv("APS5_TRACE_DEPTH_SURFACE");
+        if (text == nullptr) return parsed;
+        char* end = nullptr;
+        parsed.first = std::strtoull(text, &end, 10);
+        if (end == nullptr || *end != ':') throw std::runtime_error("APS5_TRACE_DEPTH_SURFACE must be <present>:<depth address>");
+        parsed.second = std::strtoull(end + 1, nullptr, 0);
+        return parsed;
+    }();
+    if (setting.second == 0 || presentCount.load(std::memory_order_relaxed) != setting.first) return 0;
+    return setting.second;
+}
+
 std::optional<char> DepthScheduleItem() {
     struct Schedule {
         bool active = false;
@@ -239,7 +254,7 @@ std::optional<char> DepthScheduleItem() {
         if (end == nullptr || *end != ':') throw std::runtime_error("APS5_DEPTH_SCHEDULE must be <frame>:<item>,...");
         for (const char* cursor = end + 1; *cursor != '\0'; ++cursor) {
             if (*cursor == ',') continue;
-            if (*cursor != '-' && *cursor != 'p' && (*cursor < '0' || *cursor > '7') && (*cursor < 'a' || *cursor > 'l') && *cursor != 'y' && *cursor != 'z') throw std::runtime_error("APS5_DEPTH_SCHEDULE items are '-', 'p', a VkCompareOp digit 0-7 or a depth slack letter a-l");
+            if (*cursor != '-' && *cursor != 'p' && (*cursor < '0' || *cursor > '7') && (*cursor < 'a' || *cursor > 'l') && *cursor != 'y' && *cursor != 'z' && *cursor != 'u' && *cursor != 'v' && *cursor != 'w') throw std::runtime_error("APS5_DEPTH_SCHEDULE items are '-', 'p', a VkCompareOp digit 0-7 or a depth slack letter a-l");
             parsed.items.push_back(*cursor);
         }
         if (parsed.items.empty()) throw std::runtime_error("APS5_DEPTH_SCHEDULE has no items");

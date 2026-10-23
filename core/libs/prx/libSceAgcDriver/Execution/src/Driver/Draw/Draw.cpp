@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "Optimization/ResourceProgram.hpp"
@@ -399,6 +400,11 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
     if (!DepthStateTracePrograms().empty() && ListedProgram(DepthStateTracePrograms(), vertexProgram)) TraceDepthState(vertexProgram, pixelProgram, decode->state);
     if (InstanceRowTraceActive(vertexProgram)) TraceInstanceRows(vertexProgram, *decode, drawParameters);
+    {
+        const auto traced = DepthSurfaceTraceTarget();
+        Graphics::SetDepthSurfaceTrace(traced);
+        if (traced != 0 && decode->state.depth && decode->state.depth->address == traced) std::fprintf(stderr, "[depth-trace] draw vs 0x%llx ps 0x%llx colors %zu indirect %d test %d write %d cmp %d index 0x%llx\n", static_cast<unsigned long long>(vertexProgram), static_cast<unsigned long long>(pixelProgram), decode->state.colors.size(), drawParameters.indirect.has_value() ? 1 : 0, decode->state.depthTest ? 1 : 0, decode->state.depthWrite ? 1 : 0, static_cast<int>(decode->state.depthCompare), static_cast<unsigned long long>(drawParameters.indexAddress));
+    }
     bool skipDepthOnly = false;
     if (decode->state.depth && decode->state.depthWrite && !(filtered && !filterTargets.empty()) && VertexScheduleSkips(vertexProgram)) skipDepthOnly = true;
     const bool gbufferDraw = decode->state.colors.size() >= 4u && decode->state.depth.has_value();
@@ -406,7 +412,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     if (!gbufferDraw && decode->state.depth && decode->state.depthWrite && decode->state.depth->address == GbufferDepth() && VertexBitsSkip(vertexProgram)) skipDepthOnly = true;
     if (const auto item = DepthScheduleItem()) {
         const auto& state = decode->state;
-        if ((*item == 'y' || *item == 'z') && ListedProgram(TintedVertexPrograms(), vertexProgram)) {
+        if (((*item == 'y' || *item == 'z') && ListedProgram(TintedVertexPrograms(), vertexProgram)) || ((*item == 'u' || *item == 'v') && gbufferDraw && drawParameters.indirect) || (*item == 'w' && gbufferDraw && !drawParameters.indirect)) {
             auto tinted = std::make_shared<DrawDecode>(*decode);
             auto& tintState = tinted->state;
             std::vector<VkFormat> formats(tintState.blends.size(), VK_FORMAT_UNDEFINED);
@@ -414,7 +420,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 if (color.exportIndex < formats.size() && !color.uintExport) formats[color.exportIndex] = color.format;
             }
             ApplyBlendTint(tintState.blends, tintState.blendConstants, formats);
-            if (*item == 'z') {
+            if (*item == 'z' || *item == 'v' || *item == 'w') {
                 tintState.depthCompare = VK_COMPARE_OP_ALWAYS;
                 tintState.depthWrite = false;
             }

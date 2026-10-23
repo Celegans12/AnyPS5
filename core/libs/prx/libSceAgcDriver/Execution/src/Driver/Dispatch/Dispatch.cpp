@@ -143,6 +143,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
         explicit OriginScope(std::uint64_t program) { Graphics::Recorder::SetWriteOrigin(program); }
         ~OriginScope() { Graphics::Recorder::SetWriteOrigin(0); }
     } originScope(address);
+    if (DepthSurfaceTraceTarget() != 0) std::fprintf(stderr, "[depth-trace] dispatch 0x%llx\n", static_cast<unsigned long long>(address));
     if (ListedProgram(SkippedComputePrograms(), address)) {
         if (!resolvingAhead()) ProgramStats::Global().NoteDispatch(address, {}, true);
         return;
