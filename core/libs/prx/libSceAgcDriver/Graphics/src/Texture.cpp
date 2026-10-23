@@ -3936,6 +3936,71 @@ bool StorageTexture::pendingUnitInside(std::uint64_t address, std::size_t bytes)
     return false;
 }
 
+namespace {
+
+// APS5_FLUSH_STALL_LOG=1 (diagnostic): the flushes a storage refresh makes, by the refreshed image
+// and the pending images it stores (format, tile mode, dimension, extent, mips, DCC keys, same base
+// and size), with how the flush waited for their writer (none, open batch Sync, FinishUpTo) and how
+// long; the top signatures by wait every 10 s.
+struct FlushStallLog {
+    struct Entry {
+        std::uint64_t count = 0;
+        std::uint64_t syncs = 0;
+        std::uint64_t finishes = 0;
+        double waitMs = 0;
+        double maxMs = 0;
+    };
+    std::mutex mutex;
+    std::map<std::string, Entry> entries;
+    std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+};
+
+FlushStallLog& FlushStalls() {
+    static FlushStallLog log;
+    return log;
+}
+
+bool FlushStallLogged() {
+    static const bool enabled = std::getenv("APS5_FLUSH_STALL_LOG") != nullptr;
+    return enabled;
+}
+
+std::string DescribeForStall(const GuestTextureResource& resource, std::uint64_t bytes, DccKeys keys, bool cached) {
+    char text[200];
+    std::snprintf(text, sizeof(text), "fmt %u tile %d dim %d %ux%ux%u mips %u bytes 0x%llx keys %s%s", resource.format, static_cast<int>(resource.tileMode), static_cast<int>(resource.dimension), resource.width, resource.height, resource.depthOrLastArray + 1, resource.mipCount, static_cast<unsigned long long>(bytes), DccKeysName(keys), cached ? "" : " uncached");
+    return text;
+}
+
+void NoteFlushStall(const std::string& key, int wait, double ms) {
+    auto& log = FlushStalls();
+    std::lock_guard lock(log.mutex);
+    auto& entry = log.entries[key];
+    ++entry.count;
+    if (wait == 1) ++entry.syncs;
+    if (wait == 2) ++entry.finishes;
+    entry.waitMs += ms;
+    entry.maxMs = std::max(entry.maxMs, ms);
+    const auto now = std::chrono::steady_clock::now();
+    if (now - log.last < std::chrono::seconds(10)) return;
+    log.last = now;
+    std::vector<std::pair<std::string, FlushStallLog::Entry>> sorted(log.entries.begin(), log.entries.end());
+    std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.second.waitMs > b.second.waitMs; });
+    std::uint64_t total = 0;
+    double totalMs = 0;
+    for (const auto& [name, item] : sorted) {
+        total += item.count;
+        totalMs += item.waitMs;
+    }
+    std::fprintf(stderr, "[flush-stall] %llu refresh flushes in 10 s, %.1f ms waiting for their writers; top by wait:\n", static_cast<unsigned long long>(total), totalMs);
+    for (std::size_t index = 0; index < sorted.size() && index < 10; ++index) {
+        const auto& [name, item] = sorted[index];
+        std::fprintf(stderr, "[flush-stall]   %llu x (syncs %llu, finishes %llu) %.1f ms (max %.1f): %s\n", static_cast<unsigned long long>(item.count), static_cast<unsigned long long>(item.syncs), static_cast<unsigned long long>(item.finishes), item.waitMs, item.maxMs, name.c_str());
+    }
+    log.entries.clear();
+}
+
+}
+
 bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, const StorageTexture* except, const char* reason, PublishScope scope, bool* published) {
     static_cast<void>(FlushDepthPlanes(address, bytes));
     if (published != nullptr) *published = false;
@@ -4017,19 +4082,34 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
     // the async lane's work so far (Recorder::LaneSwitch), whichever lane's access found them pending.
     std::optional<Recorder::LaneSwitch> laneSwitch;
     if (Recorder::ThreadLane() != 0) laneSwitch.emplace(Recorder::Active(), 0);
+    const bool stallLog = FlushStallLogged() && refreshing != nullptr;
+    int stallWait = 0;
+    const auto stallStart = stallLog ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (auto* recorder = Recorder::Active(); recorder != nullptr && !Recorder::InCompletion() && recorder->PendingWriterSerial(address, bytes) != 0) {
         try {
             recorder->Reap();
             if (const auto writer = recorder->PendingWriterSerial(address, bytes); writer == recorder->OpenSerial()) {
                 Recorder::CountSync(recorder->OpenWriteOverlaps(address, bytes) ? 1 : 3);
                 recorder->Sync();
+                stallWait = 1;
             } else if (writer != 0) {
                 recorder->FinishUpTo(writer);
+                stallWait = 2;
             }
         } catch (...) {
             for (const auto& texture : flush) texture->reconcilePending();
             throw;
         }
+    }
+    if (stallLog) {
+        const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stallStart).count();
+        std::string key = "refresh " + DescribeForStall(refreshing->descriptor, refreshing->guestBytes, refreshing->uploadedKeys, refreshing->Cached()) + " <- ";
+        for (const auto& texture : flush) {
+            key += "[" + DescribeForStall(texture->descriptor, texture->guestBytes, texture->uploadedKeys, texture->Cached());
+            key += texture->descriptor.baseAddress == refreshing->descriptor.baseAddress ? " same-base" : " other-base";
+            key += texture->guestBytes == refreshing->guestBytes ? " same-size]" : " other-size]";
+        }
+        NoteFlushStall(key, stallWait, ms);
     }
     std::exception_ptr failure;
     const auto previousReason = std::exchange(flushReason, reason);
