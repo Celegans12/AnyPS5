@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace AgcDriver::Graphics {
@@ -58,6 +59,8 @@ struct PipelineLibraryCounters {
 };
 
 PipelineLibraryCounters PipelineLibraryCountersOf(VkDevice device);
+
+std::vector<std::pair<VkFormat, VkFormat>> PipelineLibraryDepthFormats(VkDevice device);
 
 }
 

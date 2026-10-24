@@ -4589,7 +4589,16 @@ bool VulkanDevice::PrebuildGraphicsLibraries(const Graphics::ShaderStages& stage
         else group.push_back({ShaderRecompiler::ShaderStage::Fragment, fragmentStub.get(), Graphics::PipelinePushSlotBytes});
     }
     const auto layouts = Graphics::DescribeSetLayouts(context, group);
-    return Graphics::Pipeline::Prebuild(context, state, Graphics::VertexInputLayout{}, layouts.View(), group);
+    const bool built = Graphics::Pipeline::Prebuild(context, state, Graphics::VertexInputLayout{}, layouts.View(), group);
+    for (const auto& [depthFormat, stencilFormat] : Graphics::PipelineLibraryDepthFormats(context.device)) {
+        Graphics::DepthTarget depth{};
+        depth.format = depthFormat;
+        depth.extent = {1, 1};
+        depth.samples = 1;
+        state.depth = depth;
+        Graphics::Pipeline::Prebuild(context, state, Graphics::VertexInputLayout{}, layouts.View(), group);
+    }
+    return built;
 }
 
 std::shared_ptr<const Graphics::AheadDraw> VulkanDevice::PrepareAheadDraw(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders) const {
