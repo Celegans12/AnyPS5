@@ -499,6 +499,7 @@ void TextureService::install(const DeviceImageKeys::Key& key, BindlessResolution
 }
 
 void TextureService::replace(const DeviceImageKeys::Key& key, Recorder& recorder, Lock& lock, const BindlessPrepared* early) {
+    PerformanceTimer timing("TextureService.Replace");
     lock.unlock();
     const auto started = std::chrono::steady_clock::now();
     BindlessPrepared prepared;
@@ -521,7 +522,9 @@ void TextureService::replace(const DeviceImageKeys::Key& key, Recorder& recorder
         }
     }
     const auto commitNanoseconds = Elapsed(started) - prepareNanoseconds;
+    timing.Mark("prepare_settle");
     lock.lock();
+    timing.Mark("relock");
     totals.replacePrepareNanoseconds += prepareNanoseconds;
     totals.replaceCommitNanoseconds += commitNanoseconds;
     if (reused) ++totals.earlyUsed;
@@ -542,13 +545,16 @@ void TextureService::replace(const DeviceImageKeys::Key& key, Recorder& recorder
     const bool wasPerUse = perUseKeys.contains(key);
     const auto epoch = perUseEpoch;
     const auto old = take(key);
+    timing.Mark("take");
     if (!refusal.empty()) {
         fresh = {};
         fresh.value.fault = refuse(key, refusal, permanent);
     }
     place(key, std::move(fresh), recorder, lastUsed);
+    timing.Mark("place");
     if (perUseKeys.contains(key) == wasPerUse) perUseEpoch = epoch;
     releaseResolution(old, recorder);
+    timing.Mark("release");
 }
 
 void TextureService::commitPrepared(std::vector<BindlessPrepared>& prepared, Recorder& recorder, Lock& lock) {
