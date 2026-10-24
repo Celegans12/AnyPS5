@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "BindlessImageAbi.hpp"
 #include "Recompiler.hpp"
 #include <algorithm>
@@ -931,6 +932,7 @@ void TextureService::PrepareRevalidation() {
 }
 
 void TextureService::Revalidate(Recorder& recorder) {
+    PerformanceTimer timing("TextureService.Revalidate");
     const auto started = std::chrono::steady_clock::now();
     Lock lock(mutex);
     // Early preparations are used only when the guest mapping is the one they were checked against: a
@@ -952,9 +954,11 @@ void TextureService::Revalidate(Recorder& recorder) {
         else merged.push_back(range);
     }
     lock.unlock();
+    timing.Mark("ranges");
     const auto collectStarted = std::chrono::steady_clock::now();
     for (const auto& [begin, end] : merged) memory->Collect(begin, static_cast<std::size_t>(end - begin));
     const auto collectNanoseconds = Elapsed(collectStarted);
+    timing.Mark("collect");
     lock.lock();
     totals.revalidateCollectNanoseconds += collectNanoseconds;
     const auto checkStarted = std::chrono::steady_clock::now();
@@ -967,6 +971,7 @@ void TextureService::Revalidate(Recorder& recorder) {
         stale.push_back(key);
     }
     totals.revalidateCheckNanoseconds += Elapsed(checkStarted);
+    timing.Mark("check");
     for (const auto& key : stale) {
         if (!entries.contains(key)) continue;
         ++totals.stale;
@@ -979,6 +984,7 @@ void TextureService::Revalidate(Recorder& recorder) {
         prepared.erase(found);
         replace(key, recorder, lock, &item);
     }
+    timing.Mark("replace");
     totals.earlyDropped += prepared.size();
     const auto budget = currentBudget();
     if (budget != 0 && pinnedBytes > budget) {
@@ -986,11 +992,14 @@ void TextureService::Revalidate(Recorder& recorder) {
         const auto idleBefore = open > options.idleSubmits ? open - options.idleSubmits : 0u;
         if (idleBefore != 0) evictIdle(recorder, 0u, idleBefore, budget / 4u * 3u);
     }
+    timing.Mark("evict");
     retireNow(recorder);
+    timing.Mark("retire");
     totals.revalidateNanoseconds += Elapsed(started);
 }
 
 void TextureService::AfterPresentWait(Recorder& recorder, std::uint64_t waitedNanoseconds) {
+    PerformanceTimer timing("TextureService.AfterPresentWait");
     {
         std::lock_guard lock(mutex);
         ++frame;
@@ -999,10 +1008,14 @@ void TextureService::AfterPresentWait(Recorder& recorder, std::uint64_t waitedNa
             totals.presentWaitNanoseconds += waitedNanoseconds;
         }
     }
+    timing.Mark("entry");
     Revalidate(recorder);
+    timing.Mark("revalidate");
     table.ForgetReportedMisses();
+    timing.Mark("forget_misses");
     const auto started = std::chrono::steady_clock::now();
     Publish(recorder);
+    timing.Mark("publish");
     std::lock_guard lock(mutex);
     totals.publishNanoseconds += Elapsed(started);
 }
