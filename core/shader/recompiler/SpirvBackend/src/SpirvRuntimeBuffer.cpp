@@ -137,7 +137,9 @@ TValue cached(SpirvEmitterState& state, std::vector<std::uint32_t> key, TCompute
 
 std::uint32_t runtimePresent(SpirvValueEmitContext& context, const IrValue& handle) {
     auto& state = context.state;
-    const auto based = Binary(state, spv::OpLogicalOr, TypeBool(state), nonzero(state, context.Arg(handle, 0u)), nonzero(state, field(state, context.Arg(handle, 1u), 0u, 16u)));
+    auto word1 = context.Arg(handle, 1u);
+    if (GcnGuestShaders()) word1 = Binary(state, spv::OpBitwiseAnd, TypeU32(state), word1, ConstantU32(state, GcnBufferWord1Mask));
+    const auto based = Binary(state, spv::OpLogicalOr, TypeBool(state), nonzero(state, context.Arg(handle, 0u)), nonzero(state, field(state, word1, 0u, 16u)));
     return both(state, nonzero(state, context.Arg(handle, 2u)), based);
 }
 
