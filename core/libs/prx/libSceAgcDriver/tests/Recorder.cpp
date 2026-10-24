@@ -3031,12 +3031,13 @@ int hostImportCutTests(const Device& device) {
 
 // The driver's map observer calls ImportMappedRanges on the mapping thread, first without the GPU
 // lock. Here one thread keeps recording, submitting and completing batches under the lock while
-// another maps like that: each round imports one unit, then maps the unit after it, which grows the
+// another maps like that: each round imports one unit (above the 64 KiB that ImportMappedRanges
+// leaves to the first GPU use), then maps the unit after it, which grows the
 // import's run and so retires the import. A retirement made without the lock writes the recorder's
 // batches under the recording thread (lean-x17 died of the heap damage, 0xc0000374 in retireImport).
 void hostImportRetirementStressTests(const Device& device) {
     const auto& context = device.GetContext();
-    constexpr std::size_t UnitBytes = 65536;
+    constexpr std::size_t UnitBytes = 2 * 65536;
     constexpr std::size_t Units = 2;
     const auto seconds = [] {
         const char* value = std::getenv("APS5_TEST_STRESS_SECONDS");
