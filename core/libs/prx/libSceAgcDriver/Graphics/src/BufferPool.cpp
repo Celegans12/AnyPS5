@@ -320,7 +320,7 @@ std::uint64_t BufferPool::SlabKey(std::uint32_t memoryType, std::size_t capacity
     return (static_cast<std::uint64_t>(memoryType) << 40u) | (static_cast<std::uint64_t>(addressable ? 1u : 0u) << 39u) | static_cast<std::uint64_t>(capacity);
 }
 
-SlabSlot BufferPool::TakeSlot(const Context& context, std::uint32_t memoryType, std::size_t capacity, bool addressable) {
+SlabSlot BufferPool::TakeSlot(const Context& context, std::uint32_t memoryType, std::size_t capacity, bool addressable, bool newImage) {
     const auto key = SlabKey(memoryType, capacity, addressable);
     const auto takeFrom = [&](SlabBlock& block, Slab& slab) {
         const auto index = block.free.back();
@@ -350,7 +350,7 @@ SlabSlot BufferPool::TakeSlot(const Context& context, std::uint32_t memoryType, 
     allocation.memoryTypeIndex = memoryType;
     {
         const MemoryStats::PoolTierScope tier(MemoryStats::Owner::PoolSlab);
-        block->memory = AllocateMemory(allocation, "vkAllocateMemory buffer slab");
+        block->memory = AllocateMemory(allocation, "vkAllocateMemory buffer slab", std::nullopt, nullptr, newImage);
     }
     if ((context.memory.memoryTypes[memoryType].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) {
         void* mapping = nullptr;

@@ -498,7 +498,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
             const auto slabCapacity = ImageSlabClass(requirements.size, requirements.alignment);
             const bool deviceLocalType = (context.memory.memoryTypes[allocation.memoryTypeIndex].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
             if (imageSlabs && context.bufferPool && !spilled && deviceLocalType && slabCapacity != 0) {
-                const auto slot = context.bufferPool->TakeSlot(context, allocation.memoryTypeIndex, static_cast<std::size_t>(slabCapacity), false);
+                const auto slot = context.bufferPool->TakeSlot(context, allocation.memoryTypeIndex, static_cast<std::size_t>(slabCapacity), false, true);
                 owned->slotMemory = slot.memory;
                 owned->slotOffset = slot.offset;
                 inHostMemory = false;

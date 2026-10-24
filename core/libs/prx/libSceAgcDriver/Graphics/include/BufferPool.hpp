@@ -79,7 +79,7 @@ public:
     VkDeviceSize ReclaimIdleDevice(VkDeviceSize bytes, std::chrono::steady_clock::time_point now);
     static bool SlabEligible(std::size_t capacity, VkDeviceSize alignment, VkDeviceSize size, VkDeviceSize atom);
     static VkDeviceSize SlabBlockBytes(std::size_t capacity);
-    SlabSlot TakeSlot(const Context& context, std::uint32_t memoryType, std::size_t capacity, bool addressable);
+    SlabSlot TakeSlot(const Context& context, std::uint32_t memoryType, std::size_t capacity, bool addressable, bool newImage = false);
     VkDeviceSize PutSlot(VkDeviceMemory memory, VkDeviceSize offset) noexcept;
     std::size_t SlabBlocks();
     VramBudget& Vram() { return vram; }
