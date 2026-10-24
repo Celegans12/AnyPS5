@@ -2279,7 +2279,11 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     state->recorder->Activate();
     state->context = buildContext();
     state->contextReady = true;
-    if (state->deviceImagePath) Graphics::DeviceImageTable::Create(state->context, ShaderRecompiler::ResourceMaterializer::FindDeviceImageInterface);
+    if (state->deviceImagePath) {
+        std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
+        if (!GuestMemory::GpuMutex().HeldByThisThread()) gpuLock.lock();
+        Graphics::DeviceImageTable::Create(state->context, ShaderRecompiler::ResourceMaterializer::FindDeviceImageInterface);
+    }
     if (window != nullptr) {
         require(window->getDrawableSize != nullptr, "missing window drawable size query");
         std::uint32_t drawableWidth = 0;

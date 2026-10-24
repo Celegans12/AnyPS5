@@ -186,6 +186,21 @@ std::uint32_t KindOf(const DeviceImageValue&) {
     return Runtime::FirstImageBinding;
 }
 
+void HeaderAtCreation(AgcDriver::VulkanDevice& device) {
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    auto* recorder = Recorder::Active();
+    Require(recorder != nullptr, "the device has an active recorder");
+    const auto context = device.GraphicsContext();
+    DeviceImageTable table(context, Lookup(), FakeSlots(std::make_shared<FakeHeap>()));
+    const auto words = ReadTable(context, *recorder, table, DeviceImageTable::TableWords);
+    const auto header = std::span<const std::uint32_t>(words).first(Abi::HeaderWords);
+    Require(words[Abi::HeaderVersion] == Abi::Version && words[Abi::HeaderMask] == table.Totals().buckets - 1u && words[Abi::HeaderRingCapacity] == DeviceImageTable::RingCapacity, "a new table's header names the version, the bucket mask and the ring capacity before its first prepare (" + HexWords(header) + ")");
+    Require(std::all_of(words.begin() + Abi::HeaderRingCapacity + 1u, words.end(), [](std::uint32_t word) { return word == 0u; }), "a new table's other header words and all its buckets are zero");
+    table.Prepare(context, *recorder);
+    Require(table.Totals().uploadBytes == 0u, "a first prepare with nothing resolved writes no header again (" + std::to_string(table.Totals().uploadBytes) + " bytes)");
+    recorder->Sync();
+}
+
 void ResolvesAndUploads(AgcDriver::VulkanDevice& device) {
     std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
     auto* recorder = Recorder::Active();
@@ -781,6 +796,7 @@ int main(int argc, char** argv) {
         DevicePathRefusals();
         auto device = OpenVulkanTestDevice();
         if (device == nullptr) return VulkanTestSkipped;
+        HeaderAtCreation(*device);
         ResolvesAndUploads(*device);
         TrailerAddresses(*device);
         SweptSlotsLeave(*device);

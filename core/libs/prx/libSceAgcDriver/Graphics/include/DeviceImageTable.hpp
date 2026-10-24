@@ -202,6 +202,7 @@ private:
     void refresh(const Context& build, Recorder& recorder);
     void evict(const Context& build, Recorder& recorder);
     void upload(Recorder& recorder);
+    VkDeviceSize writeHeader(VkCommandBuffer commands);
     std::uint32_t chunkFor(Recorder& recorder, bool mayWait);
     void drain(std::uint32_t chunk);
     std::string faultText(const Key& key, std::uint32_t pc) const;

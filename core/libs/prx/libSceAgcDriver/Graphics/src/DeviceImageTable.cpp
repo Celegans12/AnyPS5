@@ -102,6 +102,12 @@ DeviceImageTable::DeviceImageTable(const Context& context, InterfaceLookup looku
     ring = std::make_unique<Buffer>(context, static_cast<std::size_t>(chunkStride * RingChunks), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
     if (table->DeviceAddress() == 0 || ring->DeviceAddress() == 0) throw std::runtime_error("AGC device image table: its table or miss ring has no device address");
     std::memset(ring->Bytes().data(), 0, ring->Bytes().size());
+    CommandBatch batch(context);
+    context.Resolved(&DeviceFunctions::cmdFillBuffer, "vkCmdFillBuffer")(batch.Handle(), table->Handle(), 0, VK_WHOLE_SIZE, 0u);
+    RecordMemoryBarrier(context, batch.Handle(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    writeHeader(batch.Handle());
+    RecordMemoryBarrier(context, batch.Handle(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+    batch.SubmitAndWait();
     chunks.resize(RingChunks);
     slotSerial = this->slots.serial();
 }
@@ -596,18 +602,20 @@ void DeviceImageTable::upload(Recorder& recorder) {
             first = last + 1u;
         }
     }
-    if (header) {
-        std::array<std::uint32_t, Abi::HeaderWords> fields{};
-        fields[Abi::HeaderVersion] = Abi::Version;
-        fields[Abi::HeaderMask] = keys.Buckets() - 1u;
-        fields[Abi::HeaderRingCapacity] = RingCapacity;
-        updateBuffer(commands, table->Handle(), 0, sizeof(fields), fields.data());
-        uploadedBuckets = keys.Buckets();
-        bytes += sizeof(fields);
-    }
+    if (header) bytes += writeHeader(commands);
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
     ++totals.uploads;
     totals.uploadBytes += bytes;
+}
+
+VkDeviceSize DeviceImageTable::writeHeader(VkCommandBuffer commands) {
+    std::array<std::uint32_t, Abi::HeaderWords> fields{};
+    fields[Abi::HeaderVersion] = Abi::Version;
+    fields[Abi::HeaderMask] = keys.Buckets() - 1u;
+    fields[Abi::HeaderRingCapacity] = RingCapacity;
+    context.Resolved(&DeviceFunctions::cmdUpdateBuffer, "vkCmdUpdateBuffer")(commands, table->Handle(), 0, sizeof(fields), fields.data());
+    uploadedBuckets = keys.Buckets();
+    return sizeof(fields);
 }
 
 std::uint32_t DeviceImageTable::chunkFor(Recorder& recorder, bool mayWait) {
