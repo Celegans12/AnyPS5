@@ -1309,6 +1309,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             reportGuestAllocation(resource, guestBytes);
         }
     }
+    PerformanceTimer timing("Texture.Cached");
     static const bool disabled = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
     const bool profile = LookupOutcomes::Profiled();
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -1345,6 +1346,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         source.reset();
         dropReason = "metadata moved";
     }
+    timing.Mark("find_pending");
     std::optional<DccKeys> keys;
     bool clearThroughKeys = false;
     if (source != nullptr && resource.dccAddress != 0 && IsDccClear(source->FilledKeys())) {
@@ -1400,7 +1402,9 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     // UnchangedSince (here and on a cache hit) looks at them: the checks only compare stamped blocks,
     // so a write the game made since the last walk is invisible until a collect stamps its page. The
     // walk is memoized per packet, so a texture viewed from a storage image repeats it for free.
+    timing.Mark("pending_checks");
     auto generation = GuestMemory::CollectWrites(address, bytes);
+    timing.Mark("collect");
     if (source != nullptr && !GuestMemory::UnchangedSince(address, bytes, source->GenerationFor(address, bytes))) {
         // The CPU wrote the memory while results were pending: Refresh merges them the usual way.
         refreshForView(*source, resource);
@@ -1423,6 +1427,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     if (sliceCopy) {
         for (const auto& slice : slices) slice.image->MarkSliceServed();
     }
+    timing.Mark("refresh_source");
     const auto flushStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const bool stagedClear = source != nullptr && resource.dccAddress != 0 && [&] {
         const auto observedKeys = keys.has_value() ? *keys : scanKeys();
@@ -1463,7 +1468,9 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         if (stagedFlushed) source.reset();
     }
     if (flushAsked) scanned.reset();
+    timing.Mark("flush");
     if (!keys.has_value()) keys = scanKeys();
+    timing.Mark("keys");
     if (disabled) {
         if (source != nullptr && depthCompare) {
             auto texture = std::make_shared<Texture>(context, source, resource, components, Texture::DepthCopyTag{});
@@ -1526,6 +1533,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     const auto key = MakeTextureKey(context.device, words, components, depthCompare);
     const DropReleasedDependents dropAfterUnlock;
     const SampledCacheLock lock(cache);
+    timing.Mark("cache_lock");
     dropUncachedViews(cache);
     if (auto it = findTexture(cache, key); it != cache.entries.end()) {
         // Held while the hit is checked: a refresh below may allocate, and an out-of-memory reclaim
@@ -1543,6 +1551,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 logLookup({it->texture.get(), resource, guestBytes, *keys, 0, it->source.get()});
                 reportTextureCounters();
                 if (profile) LookupOutcomes::Add(*keys != DccKeys::Uncompressed ? LookupOutcomes::SampledHitClearedView : LookupOutcomes::SampledHitView, start);
+                timing.Mark("hit_view");
                 return it->texture;
             }
         } else if (source == nullptr && it->bytes == guestBytes && it->keys == *keys) {
@@ -1632,13 +1641,16 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 logLookup({it->texture.get(), resource, guestBytes, *keys, generation, nullptr, false, it->committed.has_value() ? snapshotGeneration : 0, it->committed});
                 reportTextureCounters();
                 if (profile) LookupOutcomes::Add(LookupOutcomes::SampledHitSnapshot, start);
+                timing.Mark("hit_snapshot");
                 return it->texture;
             }
         }
+        timing.Mark("stale_check");
         eraseTexture(cache, it);
         ++cache.counts.stale;
     }
     if (sliceCopy) storeSlices("no current cached snapshot");
+    timing.Mark("miss");
     const auto budgets = currentBudgets(context);
     const auto insert = [&](CachedTexture&& entry, const std::shared_ptr<Texture>& texture) {
         cache.bytes += entry.accounted;
@@ -1686,6 +1698,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 reportCacheCounts(cache, budgets);
                 reportTextureCounters();
                 if (profile) LookupOutcomes::Add(LookupOutcomes::SampledHitSnapshot, start);
+                timing.Mark("hit_snapshot");
                 return texture;
             }
             eraseOneOff(cache, found);
@@ -2267,7 +2280,9 @@ std::shared_ptr<Texture> CachedSampledTexture(const Context& context, std::span<
 }
 
 std::shared_ptr<Texture> CachedTableTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, std::uint64_t guestBytes, bool depthCompare) {
+    PerformanceTimer timing("Texture.TableRefresh");
     CompletePendingCpuWrites(context, resource.baseAddress, static_cast<std::size_t>(guestBytes));
+    timing.Mark("cpu_writes");
     if (resource.dccAddress != 0) CompletePendingCpuWrites(context, resource.dccAddress, DccKeyBytes(guestBytes));
     return cachedTexture(context, words, resource, ViewComponents(resource), guestBytes, depthCompare);
 }
