@@ -1,0 +1,72 @@
+**frames 150:60** from present 150: 60 presents, frame p50 133.1 / p90 452.5 / p99 3293.8 / max 3293.8 ms, GPU busy 83.3 ms per present
+NVIDIA GeForce RTX 3080 Laptop GPU, NVIDIA 610.62, Windows 10.0.26200, 3840x2160, commit ef29bab589cf, dropped: no
+
+```json
+{"commit":"ef29bab589cf","dirty":false,"env":{"APS5_NO_CLEAR_HAND_OVER":"1","APS5_NO_DEFERRED_SETTLES":"1","APS5_NO_PAD_INPUT":"1","APS5_NO_PIPELINE_JOURNAL":"1","APS5_NO_RESIDENT_LINEAR":"1","APS5_PAD_INPUT_FILE":"<path>","APS5_RESOURCE_CACHE_ENTRIES":"1024","APS5_TRACE_FRAMES":"150:60"},"gpu":"NVIDIA GeForce RTX 3080 Laptop GPU","driver":"NVIDIA 610.62","os":"Windows 10.0.26200","cpu":"11th Gen Intel(R) Core(TM) i9-11900H @ 2.50GHz","cpu_threads":16,"memory_mib":32469,"title_id":"PPSA26344","title":"Ghost of Y\u00c5\u008dtei","content_version":"01.008.000","resolution":"3840x2160","window":{"spec":"frames 150:60","first_present":150,"ms":12754.075},"presents":60,"frame_ms":{"p50":133.124,"p90":452.488,"p99":3293.783,"max":3293.783},"gpu_busy_ms_per_present":83.296,"worker_busy_pct":{"queue worker 0x0":55.8,"queue worker 0x20":10.339,"queue worker 0x53":9.78,"queue worker 0x52":8.636,"queue worker 0x30":39.352,"queue worker 0x38":46.524,"queue worker 0x48":4.046},"top_phases_ms_per_frame":{"Shader.PrepareArtifact":433.428,"Driver.Packet":366.241,"Driver.Packet.dispatch":159.679,"Driver.Packet.memory_wait":134.443,"Driver.Dispatch":114.184,"Driver.Packet.prepare_memory":48.551,"Shader.Register":32.184,"GpuMutex.wait.dispatch":30.861},"trace_dropped":false,"trace":"aps5-trace-ef29bab589cf-16672.json.gz"}
+```
+
+**Slowest frames** (largest slices inside each, inclusive)
+
+- present 185: 3293.8 ms at 5471 ms: Shader.PrepareArtifact (shader prepare) 24267.5, Driver.WorkerWait (queue worker 0x20) 3293.7, Driver.WorkerWait.idle_and_completion_poll (queue worker 0x20) 3293.7, Driver.WorkerWait (queue worker 0x48) 3288.8
+- present 182: 637.4 ms at 4582 ms: Driver.WorkerWait (queue worker 0x48) 633.7, Driver.WorkerWait.idle_and_completion_poll (queue worker 0x48) 633.7, Driver.WorkerWait (queue worker 0x20) 623.1, Driver.WorkerWait.idle_and_completion_poll (queue worker 0x20) 623.1
+- present 181: 475.0 ms at 4107 ms: Driver.WorkerWait (queue worker 0x20) 475.0, Driver.WorkerWait.idle_and_completion_poll (queue worker 0x20) 475.0, Driver.WorkerWait (queue worker 0x48) 467.6, Driver.WorkerWait.idle_and_completion_poll (queue worker 0x48) 467.6
+- present 192: 469.2 ms at 10184 ms: Driver.WorkerWait (queue worker 0x48) 465.8, Driver.WorkerWait.idle_and_completion_poll (queue worker 0x48) 465.8, Driver.WorkerWait (queue worker 0x20) 406.3, Driver.WorkerWait.idle_and_completion_poll (queue worker 0x20) 406.3
+- present 196: 461.9 ms at 11006 ms: Driver.WorkerWait (queue worker 0x48) 458.4, Driver.WorkerWait.idle_and_completion_poll (queue worker 0x48) 458.4, Driver.WorkerWait (queue worker 0x20) 450.7, Driver.WorkerWait.idle_and_completion_poll (queue worker 0x20) 450.7
+
+**Threads** (ms per frame)
+
+| thread | busy | wait | untraced | in slices < 20 us | largest |
+|---|---|---|---|---|---|
+| title | 32.1 (15 %) | 25.8 (12 %) | 154.7 | 0.4 | Shader.Register 32.0, Shader.ResolveGraphicsStagesAbi 0.0 |
+| shader prepare | 54.2 (26 %) | 0.0 (0 %) | 158.3 | 0.0 | Shader.PrepareArtifact 54.2 |
+| shader prepare | 54.1 (25 %) | 0.0 (0 %) | 158.5 | 0.0 | Shader.PrepareArtifact 54.1 |
+| shader prepare | 54.2 (26 %) | 0.0 (0 %) | 158.4 | 0.0 | Shader.PrepareArtifact 54.2 |
+| shader prepare | 54.2 (25 %) | 0.0 (0 %) | 158.4 | 0.0 | Shader.PrepareArtifact 54.2 |
+| shader prepare | 54.2 (25 %) | 0.0 (0 %) | 158.4 | 0.0 | Shader.PrepareArtifact 54.2 |
+| shader prepare | 54.3 (26 %) | 0.0 (0 %) | 158.2 | 0.0 | Shader.PrepareArtifact 54.3 |
+| shader prepare | 54.1 (25 %) | 0.0 (0 %) | 158.4 | 0.0 | Shader.PrepareArtifact 54.1 |
+| shader prepare | 54.1 (25 %) | 0.0 (0 %) | 158.5 | 0.0 | Shader.PrepareArtifact 54.1 |
+| shader prepare | 0.5 (0 %) | 0.0 (0 %) | 212.0 | 0.0 | Vulkan.GraphicsPipelinePrebuild 0.5 |
+| queue worker 0x0 | 93.7 (44 %) | 116.9 (55 %) | 1.9 | 4.8 | Driver.Packet 117.2, Driver.Completion 0.0 |
+| queue worker 0x20 | 1.9 (1 %) | 209.4 (99 %) | 1.3 | 0.1 | Driver.Packet 21.0, Driver.EndSubmission 1.0 |
+| queue worker 0x53 | 0.2 (0 %) | 66.8 (31 %) | 145.5 | 0.1 | Driver.Packet 20.6, Driver.EndSubmission 0.1 |
+| queue worker 0x52 | 1.6 (1 %) | 65.4 (31 %) | 145.6 | 0.4 | Driver.Packet 17.8, Driver.EndSubmission 0.5 |
+| title | 0.0 (0 %) | 0.0 (0 %) | 212.6 | 0.0 | Shader.ResolveGraphicsStagesAbi 0.0, Shader.ResolveAbi 0.0 |
+| title | 0.0 (0 %) | 0.0 (0 %) | 212.6 | 0.0 | Shader.ResolveGraphicsStagesAbi 0.0 |
+| title | 0.0 (0 %) | 0.0 (0 %) | 212.6 | 0.0 | Shader.ResolveGraphicsStagesAbi 0.0, Shader.ResolveGraphicsAbi 0.0 |
+| queue worker 0x30 | 10.3 (5 %) | 201.6 (95 %) | 0.6 | 0.4 | Driver.Packet 83.3, Driver.EndSubmission 0.2 |
+| queue worker 0x38 | 34.6 (16 %) | 177.2 (83 %) | 0.7 | 0.7 | Driver.Packet 96.8, Driver.EndSubmission 1.9 |
+| queue worker 0x48 | 4.9 (2 %) | 206.3 (97 %) | 1.4 | 0.3 | Driver.Packet 7.6, Driver.EndSubmission 0.9 |
+| draw committer | 30.0 (14 %) | 13.9 (7 %) | 168.7 | 0.3 | Graphics.Draw 16.3, Vulkan.DrawFromRecipe 11.4 |
+| presenter | 11.4 (5 %) | 0.1 (0 %) | 201.1 | 0.1 | VideoOut.Flip 11.3, Driver.Present 0.2 |
+| title | 0.0 (0 %) | 0.0 (0 %) | 212.6 | 0.0 | Shader.ResolveGraphicsAbi 0.0, Shader.ResolveGraphicsStagesAbi 0.0 |
+| title | 0.0 (0 %) | 0.0 (0 %) | 212.6 | 0.0 | Shader.ResolveGraphicsStagesAbi 0.0, Shader.ResolveGraphicsAbi 0.0 |
+| title | 0.0 (0 %) | 0.0 (0 %) | 212.6 | 0.0 | Shader.ResolveGraphicsStagesAbi 0.0, Shader.ResolveGraphicsAbi 0.0 |
+| title | 0.0 (0 %) | 0.0 (0 %) | 212.6 | 0.0 | Shader.ResolveGraphicsStagesAbi 0.0, Shader.ResolveGraphicsAbi 0.0 |
+| title | 0.0 (0 %) | 0.0 (0 %) | 212.6 | 0.0 | Shader.ResolveGraphicsStagesAbi 0.0, Shader.ResolveAbi 0.0 |
+| title | 0.0 (0 %) | 0.0 (0 %) | 212.6 | 0.0 | Shader.ResolveGraphicsStagesAbi 0.0, Shader.ResolveGraphicsAbi 0.0 |
+| title | 0.0 (0 %) | 0.0 (0 %) | 212.6 | 0.0 | Shader.ResolveGraphicsStagesAbi 0.0, Shader.ResolveGraphicsAbi 0.0 |
+| gpu | 83.0 (39 %) | 0.0 (0 %) | 129.6 | 0.0 | batch 83.0 |
+
+**Largest slices** (ms per frame, inclusive, all threads): Driver.WorkerWait 822.0, Driver.WorkerWait.idle_and_completion_poll 821.9, Shader.PrepareArtifact 433.4, Driver.Packet 364.4, Driver.Packet.dispatch 159.4, Driver.Packet.memory_wait 134.4, Driver.Dispatch 113.6, batch 83.0, Driver.Packet.prepare_memory 48.3, Shader.Register 32.0
+
+**Longest waits**
+
+- Driver.WorkerWait (queue worker 0x20) 3205.3 ms at 5334 ms, present 183
+- Driver.WorkerWait (queue worker 0x48) 3157.2 ms at 5384 ms, present 184
+- Driver.WorkerWait (queue worker 0x30) 3090.2 ms at 5451 ms, present 184
+- Driver.WorkerWait (queue worker 0x38) 3086.7 ms at 5454 ms, present 184
+- Driver.WorkerWait (queue worker 0x0) 3070.1 ms at 5471 ms, present 185
+- Driver.WorkerWait (queue worker 0x20) 993.7 ms at 4060 ms, present 180
+- Driver.WorkerWait (queue worker 0x48) 933.1 ms at 4127 ms, present 181
+- Driver.WorkerWait (queue worker 0x30) 758.7 ms at 4301 ms, present 181
+- Driver.WorkerWait (queue worker 0x38) 682.0 ms at 4378 ms, present 181
+- Driver.WorkerWait (queue worker 0x20) 524.1 ms at 10868 ms, present 194
+
+**Largest GPU batches** (GPU ranges inside, and the CPU slices that recorded each, inclusive)
+
+- batch 1116: 339.3 ms at 4711 ms, present 182: GPU no ranges; recorded by Driver.WorkerWait (queue worker 0x0) 478.0, Driver.WorkerWait.idle_and_completion_poll (queue worker 0x0) 477.9, Recorder.Sync (queue worker 0x0) 339.7, Driver.Packet (queue worker 0x0) 2.3
+- batch 1224: 117.2 ms at 8859 ms, present 186: GPU no ranges; recorded by Driver.WorkerWait (queue worker 0x0) 239.2, Driver.WorkerWait.idle_and_completion_poll (queue worker 0x0) 239.2, Recorder.Sync (queue worker 0x0) 118.2, Driver.Packet (queue worker 0x0) 30.6
+- batch 1196: 115.0 ms at 5569 ms, present 185: GPU no ranges; recorded by Driver.WorkerWait (queue worker 0x0) 3070.2, Driver.WorkerWait.idle_and_completion_poll (queue worker 0x0) 3070.2, Recorder.Sync (queue worker 0x0) 115.3, Driver.Packet (queue worker 0x0) 36.7
+- batch 1327: 114.2 ms at 9674 ms, present 190: GPU no ranges; recorded by Driver.WorkerWait (queue worker 0x0) 323.4, Driver.WorkerWait.idle_and_completion_poll (queue worker 0x0) 323.4, Recorder.Sync (queue worker 0x0) 114.7, Driver.Packet (queue worker 0x0) 2.9
+- batch 1474: 113.8 ms at 11090 ms, present 196: GPU no ranges; recorded by Driver.WorkerWait (queue worker 0x0) 387.2, Driver.WorkerWait.idle_and_completion_poll (queue worker 0x0) 387.1, Recorder.Sync (queue worker 0x0) 114.1, Driver.Packet (queue worker 0x0) 1.1
