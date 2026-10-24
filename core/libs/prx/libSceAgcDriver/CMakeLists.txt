@@ -1179,7 +1179,7 @@ if(BUILD_TESTING)
         "APS5_STAGING_POOL_MIB=0")
     add_test(NAME agc_buffer_pool_no_small_device_tier COMMAND agc_buffer_pool_tests)
     set_tests_properties(agc_buffer_pool_no_small_device_tier PROPERTIES ENVIRONMENT
-        "APS5_NO_SMALL_DEVICE_TIER=1;APS5_IMAGE_POOL=1")
+        "APS5_NO_SMALL_DEVICE_TIER=1;APS5_NO_LARGER_SMALL_POOLS=1;APS5_IMAGE_POOL=1")
     add_test(NAME agc_buffer_pool_no_exact_size_reuse COMMAND agc_buffer_pool_tests)
     set_tests_properties(agc_buffer_pool_no_exact_size_reuse PROPERTIES ENVIRONMENT
         "APS5_NO_EXACT_SIZE_REUSE=1;APS5_IMAGE_POOL=1")
