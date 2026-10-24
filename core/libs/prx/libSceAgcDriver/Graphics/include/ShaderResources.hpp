@@ -220,6 +220,7 @@ struct PresyncSurface {
     std::uint64_t address;
     std::uint64_t bytes;
     bool dccKeys;
+    bool writerOnly;
 };
 
 // S1: the tag of the two-stage draw build (see ShaderResources).

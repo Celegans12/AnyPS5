@@ -64,6 +64,8 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_NO_REFRESH_LOOKUP_CACHE",
     "APS5_PIPELINE_DISPATCH",
     "APS5_PIPELINE_DISPATCH_MISSES",
+    "APS5_NO_WRITER_PRESYNC",
+    "APS5_NO_CPU_LABEL_ONLY_WAIT",
 };
 
 struct Refusal {

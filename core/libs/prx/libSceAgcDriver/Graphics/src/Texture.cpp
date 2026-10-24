@@ -142,6 +142,14 @@ std::atomic<std::uint64_t> depthCopyTextures{0}, depthCopyRefreshes{0};
 std::atomic<std::uint64_t> sliceCopyLookups{0}, sliceCopyRegions{0};
 std::atomic<std::uint64_t> refreshesProved{0};
 std::atomic<std::uint64_t> untrackedCompares{0};
+std::atomic<std::uint64_t> writerWaits[4]{}, writerWaitedUs[4]{}, writerWaitsCallerHeld{0};
+
+void countWriterWait(bool open, bool written, std::chrono::steady_clock::time_point start) {
+    const auto kind = (open ? 0u : 2u) + (written ? 1u : 0u);
+    writerWaits[kind].fetch_add(1, std::memory_order_relaxed);
+    writerWaitedUs[kind].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+    if (GuestMemory::GpuMutex().DepthOnThisThread() > 1) writerWaitsCallerHeld.fetch_add(1, std::memory_order_relaxed);
+}
 
 struct StorageTraffic {
     AgcDriver::Mutex mutex;
@@ -4387,9 +4395,10 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
                 for (const auto& texture : flush) texture->appendStoredLayers(address, bytes, stored);
             }
             const bool publishes = !wholeRange && scope != PublishScope::None;
-            const auto pendingWriter = [&](const Recorder& active) {
+            const auto pendingWriter = [&](const Recorder& active, bool* written = nullptr) {
                 constexpr std::uint64_t block = 65536;
                 std::uint64_t writer = 0;
+                if (written != nullptr) *written = false;
                 if (publishes) {
                     constexpr auto top = std::numeric_limits<std::uint64_t>::max();
                     const auto first = address / block * block;
@@ -4399,7 +4408,11 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
                 }
                 for (const auto& [begin, end] : stored) {
                     if (writer == active.OpenSerial()) break;
-                    writer = std::max(writer, active.PendingWriterSerial(begin, static_cast<std::size_t>(end - begin)));
+                    bool wrote = false;
+                    const auto candidate = active.PendingWriterSerial(begin, static_cast<std::size_t>(end - begin), &wrote);
+                    if (candidate == 0 || candidate < writer) continue;
+                    if (written != nullptr) *written = candidate > writer ? wrote : (*written || wrote);
+                    writer = candidate;
                 }
                 return writer;
             };
@@ -4408,11 +4421,17 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
             };
             if (pendingWriter(*recorder) != 0) {
                 recorder->Reap();
-                if (const auto writer = pendingWriter(*recorder); writer == recorder->OpenSerial()) {
-                    Recorder::CountSync(openWrites(*recorder) ? 1 : 3);
+                bool written = false;
+                if (const auto writer = pendingWriter(*recorder, &written); writer == recorder->OpenSerial()) {
+                    const auto waitStart = std::chrono::steady_clock::now();
+                    const bool writes = openWrites(*recorder);
+                    Recorder::CountSync(writes ? 1 : 3);
                     recorder->Sync();
+                    countWriterWait(true, writes, waitStart);
                 } else if (writer != 0) {
-                    recorder->FinishUpTo(writer);
+                    const auto waitStart = std::chrono::steady_clock::now();
+                    recorder->FinishUpTo(writer, written ? 1 : 3);
+                    countWriterWait(false, written, waitStart);
                 }
             }
         } catch (...) {
@@ -4455,6 +4474,12 @@ bool StorageTexture::WaitForFlushing(std::uint64_t address, std::size_t bytes, c
         { std::lock_guard gpu(GuestMemory::GpuMutex()); }
         std::this_thread::yield();
     }
+}
+
+StorageTexture::WriterWaitStatistics StorageTexture::WriterWaitCounts() {
+    const auto count = [](std::size_t kind) { return writerWaits[kind].load(std::memory_order_relaxed); };
+    const auto ms = [](std::size_t kind) { return writerWaitedUs[kind].load(std::memory_order_relaxed) / 1000.0; };
+    return {count(0), count(1), count(2), count(3), writerWaitsCallerHeld.load(std::memory_order_relaxed), ms(0), ms(1), ms(2), ms(3)};
 }
 
 void StorageTexture::SaveBeforeUnwatch(std::uint64_t address, std::size_t bytes) {
@@ -4900,6 +4925,49 @@ bool StorageTexture::AnyLiveOverlaps(std::span<const std::pair<std::uint64_t, st
         }
     }
     return false;
+}
+
+bool StorageTexture::OthersPendingInside(std::uint64_t address, std::size_t bytes) {
+    auto& pending = Pending();
+    if (pending.textures.SurelyClear(address, bytes)) return false;
+    std::lock_guard lock(pending.mutex);
+    if (!pending.textures.MayOverlap(address, bytes)) return false;
+    for (const auto* texture : pending.textures) {
+        if (texture->descriptor.baseAddress == address && texture->guestBytes == bytes) continue;
+        if (texture->overlaps(address, bytes) && texture->pendingUnitInside(address, bytes)) return true;
+    }
+    return false;
+}
+
+std::uint64_t StorageTexture::PresyncWriterSerial(const Recorder& recorder, std::uint64_t address, std::size_t bytes) {
+    std::vector<std::shared_ptr<StorageTexture>> others;
+    {
+        auto& pending = Pending();
+        if (pending.textures.SurelyClear(address, bytes)) return 0;
+        std::lock_guard lock(pending.mutex);
+        if (!pending.textures.MayOverlap(address, bytes)) return 0;
+        for (auto* texture : pending.textures) {
+            if (texture->descriptor.baseAddress == address && texture->guestBytes == bytes) continue;
+            if (!texture->overlaps(address, bytes) || !texture->pendingUnitInside(address, bytes)) continue;
+            if (auto alive = texture->weak_from_this().lock()) others.push_back(std::move(alive));
+        }
+    }
+    if (others.empty()) return 0;
+    if (RuntimeSwitches::Set(RuntimeSwitch::DeferRefreshFlush)) {
+        const bool deferImported = !RuntimeSwitches::Set(RuntimeSwitch::NoDeferImportedStores);
+        if (std::all_of(others.begin(), others.end(), [deferImported](const std::shared_ptr<StorageTexture>& texture) { return (texture->blockUnits || deferImported) && ExistingHostImportFor(texture->context, texture->descriptor.baseAddress, static_cast<std::size_t>(texture->guestBytes)) != nullptr; })) return 0;
+    }
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> stored;
+    if (RuntimeSwitches::Set(RuntimeSwitch::FlushWaitWholeRange)) stored.emplace_back(address, address + bytes);
+    else {
+        for (const auto& texture : others) texture->appendStoredLayers(address, bytes, stored);
+    }
+    std::uint64_t writer = 0;
+    for (const auto& [begin, end] : stored) {
+        if (writer != 0 && writer == recorder.OpenSerial()) break;
+        writer = std::max(writer, recorder.PendingWriterSerial(begin, static_cast<std::size_t>(end - begin)));
+    }
+    return writer;
 }
 
 std::uint64_t StorageTexture::PendingSerial() {
