@@ -38,30 +38,33 @@ void textureSlots(const Context& context, VkImageView view) {
     const auto slot = heap.TextureSlot(kind, first, view, VK_IMAGE_LAYOUT_GENERAL);
     require(slot.has_value(), "the first texture takes a slot");
     require(heap.SlotTexture(kind, *slot) == first.get(), "the slot holds the first texture");
-    const auto generation = heap.SlotGeneration(kind, *slot);
+    const auto generation = heap.SlotGeneration(*slot);
 
     auto second = fakeTexture(1);
     require(!heap.TextureSlot(kind, second, view, VK_IMAGE_LAYOUT_GENERAL).has_value(), "a held slot is not reused");
     first.reset();
     const auto reused = heap.TextureSlot(kind, second, view, VK_IMAGE_LAYOUT_GENERAL);
     require(reused.has_value() && *reused == *slot, "the released texture's slot is reused");
-    require(heap.SlotGeneration(kind, *slot) != generation, "a freed slot moves its generation");
+    require(heap.SlotGeneration(*slot) != generation, "a freed slot moves its generation");
     require(heap.SlotTexture(kind, *slot) == second.get(), "the reused slot holds the second texture");
     const auto counts = heap.Statistics();
     require(counts.slotsFreed == 1u && counts.slotsReused == 1u, "one slot freed and reused");
 
     auto shared = fakeTexture(2);
     const auto otherKind = kind + 1u;
-    const auto firstShared = heap.TextureSlot(kind, shared, view, VK_IMAGE_LAYOUT_GENERAL);
-    require(!firstShared.has_value(), "the capped kind has no slot left for a third texture");
-    const auto sharedSlot = heap.TextureSlot(otherKind, shared, view, VK_IMAGE_LAYOUT_GENERAL);
-    require(sharedSlot.has_value() && shared->HeapHolds() == 1u, "a texture placed by the heap counts one heap hold");
+    require(!heap.TextureSlot(otherKind, shared, view, VK_IMAGE_LAYOUT_GENERAL).has_value(),
+            "another kind finds the capped heap's only slot held");
     second.reset();
+    const auto sharedSlot = heap.TextureSlot(otherKind, shared, view, VK_IMAGE_LAYOUT_GENERAL);
+    require(sharedSlot.has_value() && *sharedSlot == *slot, "another kind takes the slot the first kind's texture left");
+    require(shared->HeapHolds() == 1u, "a texture placed by the heap counts one heap hold");
+    require(heap.SlotTexture(kind, *slot) == nullptr && heap.SlotTexture(otherKind, *slot) == shared.get(),
+            "the slot holds the other kind's texture");
     shared.reset();
     const auto freedBefore = heap.Statistics().slotsFreed;
     auto third = fakeTexture(0);
     require(heap.TextureSlot(kind, third, view, VK_IMAGE_LAYOUT_GENERAL).has_value(), "a texture held only by the heap is swept");
-    require(heap.Statistics().slotsFreed == freedBefore + 2u, "one sweep frees every slot whose texture only the heap holds");
+    require(heap.Statistics().slotsFreed == freedBefore + 1u, "the sweep frees the slot whose texture only the heap holds");
 }
 
 void samplerSlots(const Context& context) {
@@ -89,10 +92,10 @@ void viewSlots(const Context& context, VkImageView view) {
     const int first = 0, second = 0;
     const auto slot = heap.ViewSlot(kind, &first, view);
     require(slot.has_value() && heap.ViewSlot(kind, &first, view) == slot, "a view keeps its slot");
-    require(!heap.ViewSlot(kind, &second, view).has_value(), "a full kind refuses another owner's view");
-    const auto generation = heap.SlotGeneration(kind, *slot);
+    require(!heap.ViewSlot(kind, &second, view).has_value(), "a full heap refuses another owner's view");
+    const auto generation = heap.SlotGeneration(*slot);
     heap.ReleaseViewSlots(&first);
-    require(heap.SlotGeneration(kind, *slot) != generation, "a released view slot moves its generation");
+    require(heap.SlotGeneration(*slot) != generation, "a released view slot moves its generation");
     require(heap.ViewSlot(kind, &second, view) == slot, "a released view slot is reused");
     heap.ReleaseViewSlots(&second);
 }
@@ -108,9 +111,9 @@ void sweptOwnerReentry(const Context& context, VkImageView view) {
             delete static_cast<int*>(pointer);
         });
     };
-    require(heap.StorageSlot(kind, owner(), view).has_value(), "the first storage owner takes the kind's only slot");
+    require(heap.StorageSlot(kind, owner(), view).has_value(), "the first storage owner takes the heap's only slot");
     require(heap.StorageSlot(kind, owner(), view).has_value() && released == 1,
-            "a full kind sweeps an owner whose release calls back into the heap");
+            "a full heap sweeps an owner whose release calls back into the heap");
     BindlessHeap::NoteSweepDue();
     BindlessHeap::SweepIfDue();
     require(released == 2, "a due sweep releases an owner that calls back into the heap");

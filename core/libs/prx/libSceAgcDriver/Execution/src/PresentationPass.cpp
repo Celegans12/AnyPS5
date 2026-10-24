@@ -259,7 +259,6 @@ const PresentationPass::Target& PresentationPass::target(VkFormat format, VkImag
             mappings[0].bindingCount = 1;
             mappings[0].resourceMask = VK_SPIRV_RESOURCE_TYPE_COMBINED_SAMPLED_IMAGE_BIT_EXT;
             mappings[0].source = VK_DESCRIPTOR_MAPPING_SOURCE_HEAP_WITH_PUSH_INDEX_EXT;
-            mappings[0].sourceData.pushIndex.heapOffset = static_cast<std::uint32_t>(bindless.ImageHeapOffset(PresentHeapKind));
             mappings[0].sourceData.pushIndex.pushOffset = offsetof(HeapPush, slot);
             mappings[0].sourceData.pushIndex.heapIndexStride = static_cast<std::uint32_t>(bindless.ImageHeapStride());
             mappings[0].sourceData.pushIndex.heapArrayStride = static_cast<std::uint32_t>(bindless.ImageHeapStride());

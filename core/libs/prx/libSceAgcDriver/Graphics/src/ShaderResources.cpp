@@ -6264,7 +6264,7 @@ bool ShaderResources::heapSlotsCurrent(const BindlessHeap& heap, const HeapStage
     std::size_t generation = 0;
     for (std::uint32_t kind = 0; kind < state.slots.size(); ++kind) {
         for (const auto slot : state.slots[kind]) {
-            if (generation >= state.slotGenerations.size() || heap.SlotGeneration(kind, slot) != state.slotGenerations[generation++])
+            if (generation >= state.slotGenerations.size() || heap.SlotGeneration(slot) != state.slotGenerations[generation++])
                 return false;
         }
     }
@@ -6328,7 +6328,7 @@ void ShaderResources::takeHeapSlots(BindlessHeap& heap, HeapStageState& state, V
 void ShaderResources::noteHeapSlotGenerations(const BindlessHeap& heap, HeapStageState& state) {
     state.slotGenerations.clear();
     for (std::uint32_t kind = 0; kind < state.slots.size(); ++kind) {
-        for (const auto slot : state.slots[kind]) state.slotGenerations.push_back(heap.SlotGeneration(kind, slot));
+        for (const auto slot : state.slots[kind]) state.slotGenerations.push_back(heap.SlotGeneration(slot));
     }
     state.samplerGenerations.clear();
     for (const auto slot : state.samplerSlots) state.samplerGenerations.push_back(heap.SamplerGeneration(slot));

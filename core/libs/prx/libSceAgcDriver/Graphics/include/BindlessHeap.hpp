@@ -11,6 +11,7 @@
 #include <optional>
 #include <span>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace AgcDriver::Graphics {
@@ -33,7 +34,6 @@ public:
     static bool Fits(const VkPhysicalDeviceDescriptorHeapPropertiesEXT& properties);
 
     bool DescriptorHeapMode() const { return resourceHeap != nullptr; }
-    VkDeviceSize ImageHeapOffset(std::uint32_t kind) const;
     VkDeviceSize ImageHeapStride() const { return imageHeapStride; }
     VkDeviceSize SamplerHeapStride() const { return samplerHeapStride; }
     void BindDescriptorHeaps(VkCommandBuffer commands) const;
@@ -49,7 +49,7 @@ public:
     std::optional<std::uint32_t> StorageSlot(std::uint32_t kind, std::shared_ptr<void> owner, VkImageView view);
     std::optional<std::uint32_t> ViewSlot(std::uint32_t kind, const void* owner, VkImageView view);
     void ReleaseViewSlots(const void* owner);
-    std::uint32_t SlotGeneration(std::uint32_t kind, std::uint32_t slot) const;
+    std::uint32_t SlotGeneration(std::uint32_t slot) const;
     const Texture* SlotTexture(std::uint32_t kind, std::uint32_t slot) const;
     std::optional<std::uint32_t> SamplerSlot(const std::shared_ptr<Sampler>& sampler);
     std::uint32_t SamplerGeneration(std::uint32_t slot) const;
@@ -127,34 +127,34 @@ private:
         }
     };
     std::unordered_map<TextureKey, std::uint32_t, TextureKeyHash> textureSlots;
-    std::unordered_map<const void*, std::vector<std::pair<std::uint32_t, std::uint32_t>>> viewSlots;
-    std::vector<std::uint32_t> nextTextureSlot;
+    std::unordered_map<const void*, std::vector<std::uint32_t>> viewSlots;
+    std::uint32_t nextTextureSlot = 0;
     struct SlotOwner {
         std::shared_ptr<Texture> texture;
         std::shared_ptr<void> storage;
         TextureKey key{};
         std::uint32_t generation = 0;
     };
-    std::vector<std::vector<SlotOwner>> owners;
-    std::vector<std::vector<std::uint32_t>> freeSlots;
+    std::vector<SlotOwner> owners;
+    std::vector<std::uint32_t> freeSlots;
     std::uint32_t slotCap = 0;
     std::uint64_t slotRequests = 0;
     void sweepLocked(std::vector<std::shared_ptr<Texture>>& dropped);
-    std::optional<std::uint32_t> takeSlotLocked(std::uint32_t kind);
-    std::optional<std::uint32_t> takeOrSweepLocked(std::uint32_t kind, std::vector<std::shared_ptr<Texture>>& dropped);
+    std::optional<std::uint32_t> takeSlotLocked();
+    std::optional<std::uint32_t> takeOrSweepLocked(std::vector<std::shared_ptr<Texture>>& dropped);
     SlotOwner& claimSlotLocked(const TextureKey& key, std::uint32_t slot);
-    void freeSlotLocked(std::uint32_t kind, std::uint32_t slot);
-    const SlotOwner* ownerLocked(std::uint32_t kind, std::uint32_t slot) const;
+    void freeSlotLocked(std::uint32_t slot);
+    const SlotOwner* ownerLocked(std::uint32_t slot) const;
     std::unordered_map<const Sampler*, std::uint32_t> samplerSlots;
-    std::unordered_map<std::uint32_t, std::uint32_t> absentSlots;
+    std::unordered_set<std::uint32_t> absentSlots;
     std::vector<std::shared_ptr<Sampler>> heldSamplers;
     std::vector<std::uint32_t> samplerGenerations;
     std::vector<std::uint32_t> freeSamplerSlots;
     void sweepSamplersLocked(std::vector<std::shared_ptr<Sampler>>& dropped);
-    void noteTakenLocked(std::uint32_t kind, std::vector<std::shared_ptr<Texture>>& dropped);
+    void noteTakenLocked(std::vector<std::shared_ptr<Texture>>& dropped);
     void noteSamplerTakenLocked(std::vector<std::shared_ptr<Sampler>>& dropped);
     std::uint32_t imageMargin() const;
-    std::size_t unusedLocked(std::uint32_t kind) const;
+    std::size_t unusedLocked() const;
     bool roomLocked() const;
     Counts counts;
 };

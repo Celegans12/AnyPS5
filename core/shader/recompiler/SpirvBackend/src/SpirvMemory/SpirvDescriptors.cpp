@@ -92,7 +92,12 @@ std::uint32_t tableHeapSlot(SpirvEmitterState& state, std::uint32_t part, std::u
     const auto count = tableMapWord(state, ConstantU32(state, ImageTableAbi::HeaderElementCount));
     const auto partBase = part == 0u ? base : Binary(state, spv::OpIAdd, u32, base, Binary(state, spv::OpIMul, u32, count, ConstantU32(state, part)));
     const auto slot = tableMapWord(state, Binary(state, spv::OpIAdd, u32, partBase, element));
-    const auto clamped = Select(state, u32, Binary(state, spv::OpULessThan, TypeBool(state), slot, ConstantU32(state, slots)), slot, ConstantU32(state, 0u));
+    const auto fallback = part == 0u ? RuntimeAbi::FirstImageBinding
+                        : part == 1u ? RuntimeAbi::FirstStorageImageBinding
+                        : part == 3u ? RuntimeAbi::FirstAtomicImageBinding
+                        : part == 4u ? RuntimeAbi::FirstAtomic64ImageBinding
+                                     : 0u;
+    const auto clamped = Select(state, u32, Binary(state, spv::OpULessThan, TypeBool(state), slot, ConstantU32(state, slots)), slot, ConstantU32(state, fallback));
     DecorateTableNonUniform(state, clamped);
     return clamped;
 }

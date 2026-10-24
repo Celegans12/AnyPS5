@@ -86,14 +86,13 @@ VkDescriptorSetAndBindingMappingEXT PushAddressMapping(std::uint32_t binding, st
     return mapping;
 }
 
-VkDescriptorSetAndBindingMappingEXT PushIndexMapping(const BindlessHeap& heap, std::uint32_t binding, std::uint32_t kind, std::uint32_t offset) {
+VkDescriptorSetAndBindingMappingEXT PushIndexMapping(const BindlessHeap& heap, std::uint32_t binding, std::uint32_t offset) {
     VkDescriptorSetAndBindingMappingEXT mapping{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_AND_BINDING_MAPPING_EXT};
     mapping.descriptorSet = 0;
     mapping.firstBinding = binding;
     mapping.bindingCount = 1;
     mapping.resourceMask = VK_SPIRV_RESOURCE_TYPE_READ_WRITE_IMAGE_BIT_EXT;
     mapping.source = VK_DESCRIPTOR_MAPPING_SOURCE_HEAP_WITH_PUSH_INDEX_EXT;
-    mapping.sourceData.pushIndex.heapOffset = static_cast<std::uint32_t>(heap.ImageHeapOffset(kind));
     mapping.sourceData.pushIndex.pushOffset = offset;
     mapping.sourceData.pushIndex.heapIndexStride = static_cast<std::uint32_t>(heap.ImageHeapStride());
     mapping.sourceData.pushIndex.heapArrayStride = static_cast<std::uint32_t>(heap.ImageHeapStride());
@@ -284,7 +283,7 @@ VkPipeline TextureDetiler::pipeline(TextureTileMode tileMode, std::uint32_t elem
         Require(image && !addressed, "only the image detiler runs on the descriptor heap");
         const auto& bindless = BindlessHeap::For(context);
         mappings[0] = PushAddressMapping(0, offsetof(HeapImagePush, tiled));
-        mappings[1] = PushIndexMapping(bindless, 1, DetileHeapKind, offsetof(HeapImagePush, slot));
+        mappings[1] = PushIndexMapping(bindless, 1, offsetof(HeapImagePush, slot));
         mappingInfo.mappingCount = static_cast<std::uint32_t>(mappings.size());
         mappingInfo.pMappings = mappings.data();
         createInfo.stage.pNext = &mappingInfo;
@@ -497,7 +496,7 @@ void TextureDetiler::DispatchCmaskClear(VkCommandBuffer commands, VkBuffer cmask
         }
         if (created == VK_SUCCESS && addressedPipelineLayout != VK_NULL_HANDLE && DescriptorHeapEnabled() && BindlessHeap::For(context).DescriptorHeapMode()) {
             const auto& bindless = BindlessHeap::For(context);
-            const std::array<VkDescriptorSetAndBindingMappingEXT, 3> mappings{PushAddressMapping(0, offsetof(HeapCmaskPush, cmask)), PushAddressMapping(1, offsetof(HeapCmaskPush, errors)), PushIndexMapping(bindless, 2, DetileHeapKind, offsetof(HeapCmaskPush, slot))};
+            const std::array<VkDescriptorSetAndBindingMappingEXT, 3> mappings{PushAddressMapping(0, offsetof(HeapCmaskPush, cmask)), PushAddressMapping(1, offsetof(HeapCmaskPush, errors)), PushIndexMapping(bindless, 2, offsetof(HeapCmaskPush, slot))};
             VkShaderDescriptorSetAndBindingMappingInfoEXT mappingInfo{VK_STRUCTURE_TYPE_SHADER_DESCRIPTOR_SET_AND_BINDING_MAPPING_INFO_EXT};
             mappingInfo.mappingCount = static_cast<std::uint32_t>(mappings.size());
             mappingInfo.pMappings = mappings.data();
