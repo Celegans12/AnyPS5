@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
@@ -54,11 +55,16 @@ void Driver::noteWrittenBuffers(std::uint64_t program, std::uint32_t queue, cons
 }
 
 std::vector<std::pair<std::uint64_t, std::uint64_t>> DispatchWriteRanges(const ShaderRecompiler::RecompileResult& compiled, bool& bounded) {
-    bounded = compiled.bdaAbiVersion == 0;
+    // APS5_DISPATCH_ITEM_BDA_WRITES (runtime switch, opt-in): an address-based program's writes are its
+    // descriptor-bound written buffers and storage images, as for draws (DrawWriteRanges) and as the
+    // inline path notes them (MarkGpuWrites: its BDA stores are not pending writes either).
+    const bool bdaWrites = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DispatchItemBdaWrites);
+    bounded = bdaWrites || compiled.bdaAbiVersion == 0;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
     constexpr std::uint64_t UnknownImageBytes = 64ull * 1024 * 1024;
     for (const auto& binding : compiled.bindings) {
-        if (binding.role == ShaderRecompiler::DescriptorRole::Gds || binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable || binding.role == ShaderRecompiler::DescriptorRole::FaultBuffer) bounded = false;
+        if (binding.role == ShaderRecompiler::DescriptorRole::Gds) bounded = false;
+        if (!bdaWrites && (binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable || binding.role == ShaderRecompiler::DescriptorRole::FaultBuffer)) bounded = false;
         if (binding.kind == ShaderRecompiler::DescriptorKind::StorageImage && binding.role != ShaderRecompiler::DescriptorRole::GuestImages) bounded = false;
         if (binding.role != ShaderRecompiler::DescriptorRole::GuestImages || binding.kind != ShaderRecompiler::DescriptorKind::StorageImage) continue;
         for (std::uint32_t element = 0; element < binding.count; ++element) {
