@@ -65,6 +65,13 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
                 release();
                 throw;
             }
+        } else if (deviceAddress == 0) {
+            try {
+                initializeAddress(this->usage);
+            } catch (...) {
+                release();
+                throw;
+            }
         }
         ready = true;
         return;
