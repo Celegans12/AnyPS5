@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include "RuntimeAbi.hpp"
 #include "SpirvBackend/SpirvAnalysis.hpp"
 #include <algorithm>
@@ -169,12 +170,16 @@ BindlessHeap::~BindlessHeap() = default;
 
 namespace {
 
-thread_local std::vector<std::shared_ptr<void>> sweptStorage;
+struct SweptStorageTag {};
+
+std::vector<std::shared_ptr<void>>& sweptStorage() {
+    return HostThreadLocal<std::vector<std::shared_ptr<void>>, SweptStorageTag>();
+}
 
 struct SweptStorageRelease {
     ~SweptStorageRelease() {
-        auto released = std::move(sweptStorage);
-        sweptStorage.clear();
+        auto released = std::move(sweptStorage());
+        sweptStorage().clear();
     }
 };
 
@@ -347,7 +352,7 @@ void BindlessHeap::sweepLocked(std::vector<std::shared_ptr<Texture>>& dropped) {
             auto& owner = kindOwners[slot];
             if (owner.storage != nullptr) {
                 if (owner.storage.use_count() > 1) continue;
-                sweptStorage.push_back(std::move(owner.storage));
+                sweptStorage().push_back(std::move(owner.storage));
             } else {
                 const bool heldElsewhere =
                     owner.texture == nullptr || owner.texture.use_count() > static_cast<long>(owner.texture->HeapHolds());
