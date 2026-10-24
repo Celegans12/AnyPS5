@@ -2767,6 +2767,8 @@ if(BUILD_TESTING)
     set_tests_properties(agc_driver_queued_raw_shader PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_PIPELINED_DRAWS=8" TIMEOUT 30)
     set_tests_properties(agc_driver_pass_input_hazard PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_DRAW_INPUTS_IN_PLACE=1")
     set_tests_properties(agc_driver_linear_target_resident PROPERTIES ENVIRONMENT "APS5_NO_PIPELINE_JOURNAL=1;APS5_RESIDENT_LINEAR=1")
+    # Main's 4_4_4_4 target-merge state test describes a linear target's resident surface.
+    set_tests_properties(agc_driver_graphics PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_RESIDENT_LINEAR=1")
     add_test(NAME agc_driver_pipelined_dma_legacy COMMAND agc_driver_pipelined_dma_tests --legacy)
     set_tests_properties(agc_driver_pipelined_dma_legacy PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 60)
     if(WIN32)
