@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_DEPTHSURFACE_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/SampleOrder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 #include <array>
 #include <cstdint>
@@ -27,8 +28,18 @@ std::size_t HtileStoreBackWaits(const Context& context, const DepthTarget& targe
 // store-back read after the wait reports the words it found for that writer ([htile] line).
 void NoteHtileWriter(std::uint64_t program, std::uint64_t htileAddress);
 bool HtileWriterProgram(std::uint64_t program);
-std::vector<std::pair<std::uint64_t, std::uint64_t>> FlushDepthPlanes(std::uint64_t address, std::size_t bytes);
+SampleOrderTarget DepthSurfaceOrderTarget(const Context& context, const DepthTarget& target);
+DepthSampleLocations DepthSurfaceSampleLocations(const Context& context, const DepthTarget& target);
+enum class DepthPlaneScope { Overlapped, Whole };
+std::vector<std::pair<std::uint64_t, std::uint64_t>> FlushDepthPlanes(std::uint64_t address, std::size_t bytes, DepthPlaneScope scope = DepthPlaneScope::Overlapped);
 bool DepthPlanesStale();
+struct DepthPlaneStoreStatistics {
+    std::uint64_t stores = 0;
+    std::uint64_t units = 0;
+    std::uint64_t bytes = 0;
+};
+DepthPlaneStoreStatistics DepthPlaneStoreCounts();
+void NoteDepthSurfaceWrite(const Context& context, const DepthTarget& target);
 bool SampleLocationsCompatibleDepth(const Context& context, VkFormat format, std::uint32_t samples);
 std::uint64_t DepthSurfacesSerial();
 std::uint64_t DepthSurfacesReleased();
@@ -72,7 +83,7 @@ struct HtileBufferMaskClear {
 };
 std::optional<HtileBufferMaskClear> MatchHtileBufferMaskClear(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const ShaderRecompiler::ShaderComputeStageInfo& compute, std::span<const std::uint32_t> packet, std::uint64_t indirectArguments);
 std::size_t HtileDepthClearBytes_nid_no_patch(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const ShaderRecompiler::ShaderComputeStageInfo& compute, std::span<const std::uint32_t> packet, std::uint64_t indirectArguments);
-void NoteHtileDepthClear(std::uint64_t htileAddress, std::size_t bytes, std::size_t nativeBytes = 0u);
+bool NoteHtileDepthClear(std::uint64_t htileAddress, std::size_t bytes, std::size_t nativeBytes = 0u);
 class Recorder;
 // The HTILE mask clear kernel (HtileDepthClearAddress) recorded over [address, address + bytes): every word becomes
 // (word & mask) | value on the GPU. Noted under the GPU lock right after the dispatch is recorded, with the recorder's
@@ -81,6 +92,9 @@ void NoteHtileMaskOnGpu(const Context& context, std::uint64_t address, std::size
 // The device's GPU fill of a uniform dword over guest memory (VulkanDevice::FillBuffer), per recorder; null removes it.
 using HtileFillOnGpu = std::function<bool(std::uint64_t address, std::size_t bytes, std::uint32_t word)>;
 void SetHtileFillOnGpu(const Recorder* recorder, HtileFillOnGpu fill);
+void ArmHtileDepthClear(std::uint64_t htileAddress, std::size_t bytes);
+void QueueHtileDepthClear(std::uint64_t htileAddress, std::size_t bytes);
+void CompleteHtileDepthClear(std::uint64_t htileAddress, std::size_t bytes);
 struct MemoryValueFill {
     std::uint64_t address;
     std::size_t bytes;
@@ -94,10 +108,12 @@ VkImageAspectFlags HtileFillClears(std::uint32_t pattern, bool stencilInHtile);
 std::uint64_t HtileMetadataBytes(VkExtent2D extent);
 bool HtileFillCovers(std::uint64_t htile, VkExtent2D extent, std::uint64_t address, std::size_t bytes);
 std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components, VkImageViewType multisampleViewType = VK_IMAGE_VIEW_TYPE_2D);
+std::size_t DepthPlaneCopyCount();
 VkFormat HostDepthFormat(const Context& context, VkFormat format);
 float HostDepthBiasConstant(const Context& context, VkFormat format, float constant);
 std::shared_ptr<StorageTexture> DepthSurfaceStorage(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, std::uint32_t mip);
 bool DepthSurfaceStoreBack(const Context& context, const StorageTexture& storage);
+void CopyDepthSample(const Context& context, std::uint64_t depthAddress, std::uint32_t samples, std::uint32_t sample, StorageTexture& destination, VkImageView destinationView, VkExtent2D extent);
 
 struct StorageImageClear {
     std::array<std::uint32_t, 8> image{};

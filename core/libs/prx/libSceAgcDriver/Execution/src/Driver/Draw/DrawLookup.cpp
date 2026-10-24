@@ -1,8 +1,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
-#include <bit>
 #include <algorithm>
+#include <bit>
 
 namespace AgcDriver::DriverDetail {
 
@@ -54,6 +54,10 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                 mix(vertex.paClVsOutCntl);
                 mix(static_cast<std::uint32_t>(vertex.drawBaseVertexSgpr));
                 mix(static_cast<std::uint32_t>(vertex.drawStartInstanceSgpr));
+                mix(vertex.pointList);
+                mix(std::bit_cast<std::uint32_t>(vertex.pointSize));
+                mix(std::bit_cast<std::uint32_t>(vertex.pointSizeMin));
+                mix(std::bit_cast<std::uint32_t>(vertex.pointSizeMax));
                 for (std::uint32_t r = 0; r < vertex.resourcesNum; ++r) {
                     for (const auto field : vertex.resources[r].fields) mix(field);
                     const auto& destination = vertex.resourcesDst[r];
@@ -77,6 +81,12 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             for (const auto value : pixel.targetExportPacking) mix(static_cast<std::uint64_t>(value));
             mix(pixel.dualSourceBlend);
             mix(pixel.reversedBlend);
+            mix(pixel.targetMerge.target);
+            mix(pixel.targetMerge.mask);
+            mix(pixel.targetMerge.samples);
+            for (const auto word : pixel.targetMerge.descriptor) mix(word);
+            mix(pixel.targetMerge.depthStencilWrites);
+            mix(pixel.targetMerge.depthStencilTests);
             mix(pixel.alphaToCoverage);
             for (const auto& blend : pixel.targetBlend) mix(static_cast<std::uint64_t>(blend.enable) | (static_cast<std::uint64_t>(blend.sourceFactor) << 8u) | (static_cast<std::uint64_t>(blend.destinationFactor) << 16u) | (static_cast<std::uint64_t>(blend.function) << 24u) | (static_cast<std::uint64_t>(blend.writeMask) << 32u));
             mix(static_cast<std::uint64_t>(pixel.rasterPrimitive));
@@ -86,6 +96,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             mix(pixel.iteratesSamples);
             mix(static_cast<std::uint64_t>(pixel.positionLocation));
             for (const auto location : pixel.sampleLocations) mix(location);
+            for (const auto order : pixel.sampleOrder) mix(order);
             std::lock_guard cacheLock(drawCacheMutex);
             ++drawEntryCounters.lookups;
             const auto found = drawCache.find(drawKey);

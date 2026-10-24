@@ -16,6 +16,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -117,6 +118,7 @@ struct ModuleSegment {
 
 struct ModuleMap {
     std::size_t count;
+    std::uint64_t pageSize;
     ModuleSegment segments[256];
 };
 
@@ -135,16 +137,20 @@ void SnapshotModules() {
     if (changes == g_moduleChanges) return;
     g_moduleChanges = changes;
     auto* map = new ModuleMap{};
+    map->pageSize = static_cast<std::uint64_t>(sysconf(_SC_PAGESIZE));
     dl_iterate_phdr([](dl_phdr_info* info, std::size_t, void* data) {
         auto& modules = *static_cast<ModuleMap*>(data);
         const char* path = info->dlpi_name != nullptr && *info->dlpi_name != '\0' ? info->dlpi_name : program_invocation_short_name;
         const char* slash = std::strrchr(path, '/');
         const char* name = slash == nullptr ? path : slash + 1;
+        std::uint64_t first = std::numeric_limits<std::uint64_t>::max();
+        for (int index = 0; index < info->dlpi_phnum; ++index)
+            if (info->dlpi_phdr[index].p_type == PT_LOAD) first = std::min<std::uint64_t>(first, info->dlpi_phdr[index].p_vaddr & ~(modules.pageSize - 1));
         for (int index = 0; index < info->dlpi_phnum && modules.count < std::size(modules.segments); ++index) {
             const auto& header = info->dlpi_phdr[index];
             if (header.p_type != PT_LOAD || header.p_memsz == 0) continue;
             auto& segment = modules.segments[modules.count++];
-            segment.base = info->dlpi_addr;
+            segment.base = info->dlpi_addr + first;
             segment.start = info->dlpi_addr + header.p_vaddr;
             segment.end = segment.start + header.p_memsz;
             std::strncpy(segment.name, name, sizeof(segment.name) - 1);
@@ -224,6 +230,17 @@ void ReportCallTrace() {
         line.Text(" ").Text(entries[index].library).Text(" ").Text(entries[index].name).Text(" from ");
         DescribeAddress(line, entries[index].returnAddress);
         line.Write();
+    }
+    static CallTraceEntry own[32];
+    const std::uint64_t thread = CurrentThread();
+    const std::size_t owned = CopyThreadCallTrace_nid_no_patch(thread, own, std::size(own));
+    if (owned != 0) {
+        line.Text("  last traced calls of thread ").Decimal(thread).Text(":").Write();
+        for (std::size_t index = 0; index < owned; ++index) {
+            line.Text("    #").Decimal(own[index].sequence).Text(" ").Text(own[index].library).Text(" ").Text(own[index].name).Text(" from ");
+            DescribeAddress(line, own[index].returnAddress);
+            line.Write();
+        }
     }
     std::uint64_t total = 0;
     const std::size_t counted = CopyCallCounts_nid_no_patch(counts, std::size(counts), &total);
@@ -348,6 +365,24 @@ std::size_t CopyCallTrace_nid_no_patch(CallTraceEntry* entries, std::size_t capa
         if (slot.sequence.load(std::memory_order_acquire) != sequence) continue;
         entries[count++] = entry;
     }
+    return count;
+}
+
+std::size_t CopyThreadCallTrace_nid_no_patch(std::uint64_t thread, CallTraceEntry* entries, std::size_t capacity) {
+    const RingSlot* ring = g_ring.load(std::memory_order_acquire);
+    if (entries == nullptr || capacity == 0 || ring == nullptr) return 0;
+    const std::uint64_t last = g_sequence.load(std::memory_order_acquire);
+    const std::uint64_t span = std::min<std::uint64_t>(last, RingCapacity);
+    std::size_t count = 0;
+    for (std::uint64_t sequence = last; sequence > last - span && count < capacity; --sequence) {
+        const RingSlot& slot = ring[sequence % RingCapacity];
+        if (slot.sequence.load(std::memory_order_acquire) != sequence || slot.thread.load(std::memory_order_relaxed) != thread) continue;
+        const auto* record = slot.record.load(std::memory_order_relaxed);
+        const CallTraceEntry entry{sequence, thread, slot.returnAddress.load(std::memory_order_relaxed), record->name.c_str(), record->library.c_str()};
+        if (slot.sequence.load(std::memory_order_acquire) != sequence) continue;
+        entries[count++] = entry;
+    }
+    std::reverse(entries, entries + count);
     return count;
 }
 

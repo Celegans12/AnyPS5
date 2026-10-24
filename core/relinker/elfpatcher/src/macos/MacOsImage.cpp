@@ -274,7 +274,8 @@ TlsScan ScanTls(const std::vector<std::uint8_t>& source, const std::vector<Domai
             }
             if (info.SegmentPrefix == 0 || (insidePrevious && info.SegmentPrefix != 0x64)) continue;
             if (info.SegmentPrefix == 0x65) {
-                scan.GsTraps.push_back({rva, info.Length});
+                if (info.HasMemoryOperand)
+                    scan.GsTraps.push_back({rva, info.Length});
                 continue;
             }
             const auto position = info.OpcodeOffset;

@@ -78,7 +78,10 @@ bool Ngs2FinishBlock(Ngs2Voice& voice) {
         voice.blocks.pop_front();
     }
     const auto revision = voice.waveformRevision;
-    if (voice.callback != nullptr && (voice.callbackFlags & info.flag) != 0) voice.callback(&info);
+    if (voice.callback != nullptr && (voice.callbackFlags & info.flag) != 0) {
+        const Ngs2Unlocked unlocked;
+        voice.callback(&info);
+    }
     return voice.waveformRevision == revision && voice.state == Ngs2PlayState::Playing;
 }
 
@@ -333,7 +336,7 @@ void Ngs2RenderSystem(Ngs2System& system, const Ngs2RenderBufferInfo* bufferInfo
     std::vector<std::vector<float>> mixes(numBufferInfo);
     for (auto* voice : voices) {
         RenderVoice(*voice, voices, grain, system.option.sample_rate);
-        if (voice->rack->rackId != SCE_NGS2_RACK_ID_MASTERING || !voice->hasSamples) continue;
+        if ((voice->rack->rackId != SCE_NGS2_RACK_ID_MASTERING && voice->rack->rackId != SCE_NGS2_RACK_ID_CUSTOM_MASTERING) || !voice->hasSamples) continue;
         auto& mix = OutputMix(mixes, bufferInfo, numBufferInfo, *voice, grain);
         const std::uint32_t outputChannels = bufferInfo[voice->outputId].num_channels;
         for (std::uint32_t channel = 0; channel < voice->channels; channel++) {

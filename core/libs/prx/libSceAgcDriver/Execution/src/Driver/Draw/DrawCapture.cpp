@@ -199,7 +199,11 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
 } catch (const std::exception& error) {
     if (dynamic_cast<const Graphics::LiveSnapshotInvalidated*>(&error) != nullptr) throw;
     if (!SkipRefusedShaders()) {
-        if (dynamic_cast<const ShaderRefusal*>(&error) != nullptr || !SkipRefusedGraphicsRecompile(static_cast<std::uint32_t>(programs[i].binary.stage), error.what())) throw;
+        if (dynamic_cast<const ShaderRefusal*>(&error) != nullptr) throw;
+        if (!SkipRefusedGraphicsRecompile(static_cast<std::uint32_t>(programs[i].binary.stage), error.what())) {
+            if (!SkipRefusedDraws()) throw;
+            throw RefusedDraw(programs[i].binary.codeAddress, error.what());
+        }
         throw ShaderRefusal(RefusedShaderSubject(static_cast<std::uint32_t>(programs[i].binary.stage), programs[i].binary.codeAddress) + ": skipping its draws: " + error.what());
     }
     std::string reason = error.what();
@@ -258,6 +262,7 @@ bool Driver::compileDrawAhead(std::uint64_t key, std::uint64_t shape, const std:
         if (program.binary.stage != Stage::Fragment && roles[i] != Role::GeometryBack) vertexInfos[i] = Graphics::DecodeVertexStageInfo(program.binary.header, program.binary.headerAddress, program.userData, &decodeReads[i], false, 8u - program.firstUserSgpr);
         if (vertexInfos[i]) vertexInfos[i]->paClVsOutCntl = PositionExportLayout(program.snapshot.get(), program.codeOffset, program.binary.code, graphics.paClVsOutCntl, program.tailContinuation.get()) | graphics.layerExports;
         if (vertexInfos[i]) vertexInfos[i]->depthRemapMode = graphics.depthRemap.mode;
+        if (vertexInfos[i]) Graphics::ApplyPointSize(graphics, *vertexInfos[i]);
     }
     ShaderMemory shaderMemory(memory);
     std::vector<StageCapture> stageCaptures(programs.size());
@@ -327,13 +332,14 @@ bool Driver::compileDrawAhead(std::uint64_t key, std::uint64_t shape, const std:
     }) && inserted;
 }
 
-void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawParameters& drawParameters, const std::optional<Graphics::IndirectDrawPath>& indirectCpu, const std::vector<DrawProgram>& programs, const std::vector<StageCapture>& stageCaptures, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, const std::vector<std::vector<Graphics::DecodeRead>>& decodeReads, bool verifyHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::uint64_t drawKey, bool registerKey, const std::shared_ptr<const DrawDecode>& decode, DrawPhaseTiming& phaseTiming, const std::vector<bool>& reused, const std::shared_ptr<DrawEntry>& entry, std::uint64_t shapeKey) {
+void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawParameters& drawParameters, const std::optional<Graphics::IndirectDrawPath>& indirectCpu, const std::vector<DrawProgram>& programs, const std::vector<StageCapture>& stageCaptures, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, const std::vector<std::vector<Graphics::DecodeRead>>& decodeReads, bool verifyHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, const std::vector<StageDataHit>& stageData, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::uint64_t drawKey, bool registerKey, const std::shared_ptr<const DrawDecode>& decode, DrawPhaseTiming& phaseTiming, const std::vector<bool>& reused, const std::shared_ptr<DrawEntry>& entry, std::uint64_t shapeKey, bool shapeNeedsEntry) {
     const bool cached = useDrawEntries && !(drawParameters.indirect && indirectCpu);
     const bool ahead = entry != nullptr && entry->probation;
     const auto shape = registerKey && drawDataHits() ? shapeKey : 0;
     const bool admitted = cached && (ahead || (!drawHit && !verifyHit)) && admitDrawKey(drawKey, shape);
     if (admitted && drawHit) admitAheadEntry(drawKey, *entry, shape);
-    if (cached && !drawHit && ((verifyHit && !ahead) || admitted)) {
+    const bool replaceShape = cached && !drawHit && !verifyHit && !admitted && shapeNeedsEntry;
+    if ((cached && !drawHit && ((verifyHit && !ahead) || admitted)) || replaceShape) {
         phaseTiming.Phase(DrawRowVectors);
         std::uint64_t unstable = 0, mismatches = 0, differingSameRuns = 0, differingWords = 0, differingRunsChanged = 0;
         for (std::size_t i = 0; i < programs.size(); ++i) {
@@ -355,23 +361,28 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
                     ++differingRunsChanged;
                 }
             }
-            const auto sameContent = [](const DispatchVariant& a, const DispatchVariant& b) {
-                const auto flatten = [](const DispatchVariant& source) {
+            const auto sameContent = [](const DispatchVariant& a, const std::vector<std::uint32_t>& words, const DispatchVariant& b) {
+                const auto flatten = [](const DispatchVariant& source, const std::vector<std::uint32_t>& values) {
                     std::vector<std::pair<std::uint64_t, std::uint32_t>> flat;
                     std::size_t word = 0;
                     for (const auto& [begin, end] : source.runs) {
-                        for (auto address = begin; address < end && word < source.words.size(); address += sizeof(std::uint32_t)) flat.emplace_back(address, source.words[word++]);
+                        for (auto address = begin; address < end && word < values.size(); address += sizeof(std::uint32_t)) flat.emplace_back(address, values[word++]);
                     }
                     std::sort(flat.begin(), flat.end());
                     return flat;
                 };
-                return (a.runs == b.runs && a.words == b.words) || flatten(a) == flatten(b);
+                return (a.runs == b.runs && words == b.words) || flatten(a, words) == flatten(b, b.words);
             };
-            const bool capturedDifferently = verifyHit && matched[i] != nullptr && !sameContent(*matched[i], *variant);
-            if (verifyHit && matched[i] != nullptr && (capturedDifferently || !SameCompilation(*matched[i]->compiled, *variant->compiled, programs[i].hiddenUserWords))) {
-                ++mismatches;
-                static std::atomic<std::uint64_t> reports{0};
-                if (reports.fetch_add(1) < 20) std::fprintf(stderr, "[draw-cache] verify: stage %zu (program 0x%llx) of a hit %s differently: %zu runs / %zu words matched, %zu / %zu fresh\n", i, static_cast<unsigned long long>(programs[i].binary.codeAddress), capturedDifferently ? "captured" : "compiled", matched[i]->runs.size(), matched[i]->words.size(), variant->runs.size(), variant->words.size());
+            if (verifyHit && matched[i] != nullptr) {
+                const bool refreshed = i < stageData.size() && stageData[i].compiled != nullptr;
+                const auto& words = refreshed ? stageData[i].words : matched[i]->words;
+                const auto& compiled = refreshed ? *stageData[i].compiled : *matched[i]->compiled;
+                const bool capturedDifferently = !sameContent(*matched[i], words, *variant);
+                if (capturedDifferently || !SameCompilation(compiled, *variant->compiled, programs[i].hiddenUserWords)) {
+                    ++mismatches;
+                    static std::atomic<std::uint64_t> reports{0};
+                    if (reports.fetch_add(1) < 20) std::fprintf(stderr, "[draw-cache] verify: stage %zu (program 0x%llx) of a hit %s differently: %zu runs / %zu words matched, %zu / %zu fresh\n", i, static_cast<unsigned long long>(programs[i].binary.codeAddress), capturedDifferently ? "captured" : "compiled", matched[i]->runs.size(), words.size(), variant->runs.size(), variant->words.size());
+                }
             }
             if (insertCompare()) {
                 const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::DrawCache);
@@ -382,7 +393,7 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
             }
             fresh[i] = std::move(variant);
         }
-        insertDrawEntry(drawKey, fresh, registerKey ? decode : nullptr, shape);
+        insertDrawEntry(drawKey, fresh, registerKey ? decode : nullptr, shape, replaceShape);
         std::uint64_t dataInserts = 0, dataPositions = 0;
         for (std::size_t i = 0; i < programs.size(); ++i) {
             if (fresh[i] == nullptr || reused[i] || fresh[i]->dataPositions.empty()) continue;

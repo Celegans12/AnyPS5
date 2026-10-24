@@ -221,10 +221,24 @@ void Driver::admitAheadEntry(std::uint64_t key, const DrawEntry& ahead, std::uin
     released.swap(releasedDrawEntries);
 }
 
-void Driver::insertDrawEntry(std::uint64_t key, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::shared_ptr<const DrawDecode> decode, std::uint64_t shape) {
+void Driver::insertDrawEntry(std::uint64_t key, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::shared_ptr<const DrawDecode> decode, std::uint64_t shape, bool replaceShape) {
     std::vector<std::shared_ptr<DrawEntry>> released;
     std::shared_ptr<DrawEntry> taken;
     std::lock_guard cacheLock(drawCacheMutex);
+    const bool shapeUpdate = replaceShape && shape != 0;
+    if (shapeUpdate) {
+        if (const auto shapeOf = drawShapes.find(shape); shapeOf != drawShapes.end() && shapeOf->second != key) {
+            if (const auto previous = drawCache.find(shapeOf->second); previous != drawCache.end()) {
+                for (const auto& variants : previous->second->stages) {
+                    for (const auto& variant : variants) accountDrawVariant(*variant, false);
+                }
+                drawOrder.erase(previous->second->order);
+                releasedDrawEntries.push_back(std::move(previous->second));
+                drawCache.erase(previous);
+            }
+            drawShapes.erase(shapeOf);
+        }
+    }
     const auto found = drawCache.find(key);
     auto replacement = std::make_shared<DrawEntry>();
     replacement->stages.resize(fresh.size());
@@ -282,7 +296,8 @@ void Driver::insertDrawEntry(std::uint64_t key, std::vector<std::shared_ptr<Disp
     for (const auto& variant : added) accountDrawVariant(*variant, true);
     for (const auto& variant : dropped) accountDrawVariant(*variant, false);
     auto& counters = drawEntryCounters;
-    ++counters.inserts;
+    if (shapeUpdate) ++counters.shapeUpdates;
+    else ++counters.inserts;
     counters.present += present;
     counters.variantsInserted += added.size();
     counters.variantsEvicted += dropped.size();
