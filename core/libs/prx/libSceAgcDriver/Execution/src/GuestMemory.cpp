@@ -1894,9 +1894,9 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
     }
     if (unwatchedFrom < stop) leaving.emplace_back(unwatchedFrom, stop);
     if (!leaving.empty()) {
-        lock.unlock();
+        lock.Unlock();
         for (const auto& [begin, end] : leaving) beforeUnwatch(begin, static_cast<std::size_t>(end - begin));
-        lock.lock();
+        lock.Resume();
         for (const auto& [begin, end] : leaving) unwatchLocked(tracker, begin, static_cast<std::size_t>(end - begin));
     }
     return true;
