@@ -5498,6 +5498,10 @@ void ShaderResources::finishImageTables() {
         faults.push_back({IrStage(table.stage), table.program->imageTableShader, table.poison, table.messages});
         ranges.insert(ranges.end(), table.program->imageTableRanges.begin(), table.program->imageTableRanges.end());
     }
+    for (auto& table : tableStages) {
+        table.program = nullptr;
+        table.images = nullptr;
+    }
     if (bda == nullptr) return;
     bda->SetImageTables(std::move(faults), std::move(ranges));
 }
@@ -6105,13 +6109,18 @@ void ShaderResources::writeHeapTableMap(const CompiledShader& shader, std::size_
     namespace TableAbi = ShaderRecompiler::ImageTableAbi;
     heapTableMapSet[stageIndex] = false;
     const auto table = std::find_if(tableStages.begin(), tableStages.end(),
-                                    [&](const TableStage& candidate) { return candidate.program == shader.program && candidate.heap; });
+                                    [&](const TableStage& candidate) { return candidate.stage == shader.stage && candidate.heap; });
     if (table == tableStages.end() || table->mapAllocation == noElement) return;
+    const ShaderRecompiler::DescriptorBinding* images = nullptr;
+    for (const auto& binding : shader.program->bindings) {
+        if (binding.role == ShaderRecompiler::DescriptorRole::ImageTable || binding.role == ShaderRecompiler::DescriptorRole::ImageStorageTable)
+            images = &binding;
+    }
     auto& heap = BindlessHeap::For(context);
     struct MapStorage {};
     auto& map = HostThreadLocal<std::vector<std::uint32_t>, MapStorage>();
     map.assign(table->map.begin(), table->map.end());
-    const auto elements = table->images != nullptr ? static_cast<std::size_t>(table->images->count) : std::size_t{0};
+    const auto elements = images != nullptr ? static_cast<std::size_t>(images->count) : std::size_t{0};
     const auto base = static_cast<std::uint32_t>(map.size());
     map[TableAbi::HeaderElementBase] = base;
     const auto sampledAbsent = heap.AbsentSlot(Abi::FirstImageBinding, heapPlaceholderView(Abi::FirstImageBinding));
@@ -6156,8 +6165,8 @@ void ShaderResources::writeHeapTableMap(const CompiledShader& shader, std::size_
         map.push_back(*slot);
     }
     const auto atomicElement = [&](std::size_t element, bool wide) {
-        if (table->images == nullptr) return false;
-        const auto& flags = wide ? table->images->imageAtomic64 : table->images->imageAtomic;
+        if (images == nullptr) return false;
+        const auto& flags = wide ? images->imageAtomic64 : images->imageAtomic;
         return element < flags.size() && flags[element];
     };
     const auto anyAtomic = [&](bool wide) {
