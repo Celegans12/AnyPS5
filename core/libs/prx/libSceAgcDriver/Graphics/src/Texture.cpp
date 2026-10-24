@@ -4137,7 +4137,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
     }
     if (auto* recorder = Recorder::Active(); !deferWriter && recorder != nullptr && !Recorder::InCompletion()) {
         try {
-            static const bool wholeRange = std::getenv("APS5_FLUSH_WAIT_WHOLE_RANGE") != nullptr;
+            const bool wholeRange = RuntimeSwitches::Set(RuntimeSwitch::FlushWaitWholeRange);
             std::vector<std::pair<std::uint64_t, std::uint64_t>> stored;
             if (wholeRange) stored.emplace_back(address, address + bytes);
             else {
