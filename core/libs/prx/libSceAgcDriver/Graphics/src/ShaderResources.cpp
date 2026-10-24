@@ -876,7 +876,13 @@ bool untrackedStillMatches(std::uint64_t address, std::size_t bytes, std::span<c
     GuestMemory::FlushGpuWrites(address, bytes);
     timing.Mark("flush_gpu_writes");
     GuestMemory::BlockMatch match;
-    const bool equal = GuestMemory::CommittedBlocksMatchMarked(address, bytes, hashes, stale, &match, layoutWalk ? &current : nullptr);
+    // No block left to hash (the walk proved every block clean): the snapshot matches without reading
+    // the surface, so skip the committed-range query (Accessible/CommittedRanges, VirtualQuery over the
+    // whole surface) the hasher would make first; ~2.7k such compares a frame on the draw committer.
+    // APS5_NO_SKIP_UNMARKED_HASH=1 (runtime switch): always ask CommittedBlocksMatchMarked, as before.
+    const bool skipUnmarked = !RuntimeSwitches::Set(RuntimeSwitch::NoSkipUnmarkedHash) && std::none_of(stale.begin(), stale.end(), [](std::uint8_t flag) { return flag != 0; });
+    if (skipUnmarked) match = {0, count, 0, static_cast<std::uint64_t>(bytes)};
+    const bool equal = skipUnmarked || GuestMemory::CommittedBlocksMatchMarked(address, bytes, hashes, stale, &match, layoutWalk ? &current : nullptr);
     timing.Mark("compare");
     static const bool verifyBlocks = std::getenv("APS5_VERIFY_UNTRACKED_BLOCKS") != nullptr;
     if (verifyBlocks && equal) {
