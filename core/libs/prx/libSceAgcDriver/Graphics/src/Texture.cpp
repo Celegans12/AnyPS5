@@ -506,7 +506,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
                 Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, slot.memory, slot.offset), "vkBindImageMemory slab");
                 ImageSlabCounts().slabbed.fetch_add(1, std::memory_order_relaxed);
             } else {
-                owned->memory = AllocateDeviceMemory(context, allocation, "vkAllocateMemory texture", requirements.memoryTypeBits, &inHostMemory);
+                owned->memory = AllocateDeviceMemory(context, allocation, "vkAllocateMemory texture", requirements.memoryTypeBits, &inHostMemory, true);
                 Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, owned->memory, 0), "vkBindImageMemory");
                 ImageSlabCounts().dedicated.fetch_add(1, std::memory_order_relaxed);
             }
@@ -847,7 +847,7 @@ Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& 
         allocationBytes = requirements.size + ImageAllocationOverhead(requirements.size);
         allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         if (BufferPool::ImagePoolEnabled()) owned->Allocate(context, allocation, requirements.memoryTypeBits, "vkAllocateMemory block copy", true);
-        else owned->memory = AllocateDeviceMemory(context, allocation, "vkAllocateMemory block copy", requirements.memoryTypeBits);
+        else owned->memory = AllocateDeviceMemory(context, allocation, "vkAllocateMemory block copy", requirements.memoryTypeBits, nullptr, true);
         Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, owned->memory, 0), "vkBindImageMemory block copy");
 
         const auto [viewBaseLevel, viewLevelCount] = ViewLevels(descriptor, copyLevels);
@@ -908,7 +908,7 @@ Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& 
         allocationBytes = requirements.size + ImageAllocationOverhead(requirements.size);
         allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         if (BufferPool::ImagePoolEnabled()) owned->Allocate(context, allocation, requirements.memoryTypeBits, "vkAllocateMemory depth copy", true);
-        else owned->memory = AllocateDeviceMemory(context, allocation, "vkAllocateMemory depth copy", requirements.memoryTypeBits);
+        else owned->memory = AllocateDeviceMemory(context, allocation, "vkAllocateMemory depth copy", requirements.memoryTypeBits, nullptr, true);
         Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, owned->memory, 0), "vkBindImageMemory depth copy");
 
         const auto [viewBaseLevel, viewLevelCount] = ViewLevels(descriptor, copyLevels);
@@ -1669,7 +1669,7 @@ StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, 
         } else {
             memoryBytes = requirements.size + ImageAllocationOverhead(requirements.size);
             allocation.memoryTypeIndex = BudgetedImageMemoryType(context, requirements.memoryTypeBits, requirements.size, "storage texture");
-            memory = AllocateDeviceMemory(context, allocation, "vkAllocateMemory storage texture", requirements.memoryTypeBits);
+            memory = AllocateDeviceMemory(context, allocation, "vkAllocateMemory storage texture", requirements.memoryTypeBits, nullptr, true);
         }
         Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, memory, 0), "vkBindImageMemory storage");
     } catch (...) {

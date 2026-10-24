@@ -212,7 +212,7 @@ std::shared_ptr<BufferPool> GetBufferPool(const Context& context);
 // fails after that recovery, one more try in OverflowMemoryType. `inHostMemory` then says whether
 // the memory is outside the device-local heap's usage (SystemMemoryType), as it does for an
 // allocation made in a system memory type to begin with.
-VkDeviceMemory AllocateDeviceMemory(const Context& context, VkMemoryAllocateInfo allocation, const char* operation, std::uint32_t memoryTypeBits = 0, bool* inHostMemory = nullptr);
+VkDeviceMemory AllocateDeviceMemory(const Context& context, VkMemoryAllocateInfo allocation, const char* operation, std::uint32_t memoryTypeBits = 0, bool* inHostMemory = nullptr, bool newImage = false);
 // A memory type of `memoryTypeBits` that keeps an image in system memory: host-visible, on a heap
 // that is not device-local, preferring one the host does not cache (the device reads it without
 // snooping). A type without host access on such a heap is not one: NVIDIA's (the only type besides

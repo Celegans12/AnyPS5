@@ -150,13 +150,17 @@ std::optional<std::uint32_t> OverflowMemoryType(const VkPhysicalDeviceMemoryProp
     return mappable;
 }
 
-VkDeviceMemory AllocateDeviceMemory(const Context& context, VkMemoryAllocateInfo allocation, const char* operation, std::uint32_t memoryTypeBits, bool* inHostMemory) {
+VkDeviceMemory AllocateDeviceMemory(const Context& context, VkMemoryAllocateInfo allocation, const char* operation, std::uint32_t memoryTypeBits, bool* inHostMemory, bool newImage) {
     const auto allocate = context.Function<PFN_vkAllocateMemory>("vkAllocateMemory");
     const auto attempt = [&] {
-        if (context.bufferPool) return context.bufferPool->AllocateMemory(allocation, operation);
+        if (context.bufferPool) return context.bufferPool->AllocateMemory(allocation, operation, std::nullopt, nullptr, newImage);
         VkDeviceMemory memory = VK_NULL_HANDLE;
         auto result = allocate(context.device, &allocation, nullptr, &memory);
-        if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && ReclaimTextureMemory(context.device, allocation.allocationSize) != 0) {
+        const auto reclaim = [&] {
+            const VkDeviceSize released = context.cacheReclaim != nullptr ? context.cacheReclaim(BufferPool::ReclaimTarget(allocation.allocationSize), newImage) : 0;
+            return released != 0 ? released : ReclaimTextureMemory(context.device, allocation.allocationSize);
+        };
+        if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && reclaim() != 0) {
             memory = VK_NULL_HANDLE;
             result = allocate(context.device, &allocation, nullptr, &memory);
         }
