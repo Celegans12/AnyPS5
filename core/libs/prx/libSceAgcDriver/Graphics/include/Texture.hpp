@@ -577,9 +577,11 @@ private:
     std::uint64_t layerBegin(std::uint32_t layer) const { return descriptor.baseAddress + static_cast<std::uint64_t>(layer) * trackedLayerBytes; }
     bool anyLayerPending() const;
     void refreshGeneration();
-    bool refreshProved();
-    void takeRefreshProof(bool aliased);
-    bool otherPendingOverlaps() const;
+    // `indexed`: the Refresh lookups answer from the pending index (APS5_NO_REFRESH_LOOKUP_CACHE
+    // unset), read once per Refresh.
+    bool refreshProved(bool indexed);
+    void takeRefreshProof(bool aliased, bool indexed);
+    bool otherPendingOverlaps(bool indexed) const;
     // Marks `count` tracked layers from `first` pending and registers the image (MarkDirty's
     // registration; APS5_EAGER_WRITEBACK=1 stores at once instead).
     void markLayersPending(std::uint32_t first, std::uint32_t count);
@@ -607,7 +609,7 @@ private:
     // image on the device (borrowUnits) instead of having them stored and re-read, and the alias
     // stays responsible for storing them until this image's own results supersede them
     // (markLayersPending). APS5_NO_ALIAS_BORROW=1 stores and re-reads as before.
-    std::shared_ptr<StorageTexture> pendingAlias() const;
+    std::shared_ptr<StorageTexture> pendingAlias(bool indexed) const;
     std::optional<DccKeys> clearHandOver();
     void supersedeHandedOver(std::uint32_t first, std::uint32_t count);
     // The pending images FlushPending(address, bytes) would store (not the one a Refresh validates,

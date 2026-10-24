@@ -62,6 +62,7 @@ enum class RuntimeSwitch : std::size_t {
     DeferFlipStore,
     NoDeferImportedStores,
     FlushWaitWholeRange,
+    NoRefreshLookupCache,
     Count,
 };
 
