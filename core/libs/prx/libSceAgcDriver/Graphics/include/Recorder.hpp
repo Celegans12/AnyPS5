@@ -238,6 +238,14 @@ public:
     // (CheckRunConflicts); RunConflictReport is the cumulative tally.
     static constexpr std::uint64_t RunAccessWritten = 1, RunAccessCopied = 2, RunAccessAtomic = 4, RunAccessImage = 8;
     void NoteRunAccess(std::uint64_t program, std::span<const std::array<std::uint64_t, 3>> accesses);
+    // In place in a run (RunInPlace, APS5_NO_RUN_IN_PLACE=1 off): whether the open dispatch run of
+    // `queueKey` holds a buffer access over [begin, end). A dispatch about to join that run serves such
+    // a range in place instead of staging it, so the run's dispatches share one copy of the bytes as on
+    // hardware; and the access-range check leaves pairs where neither side is a staged copy to the
+    // title's ordering, as the hardware does.
+    bool RunTouches(std::uint32_t queueKey, std::uint64_t begin, std::uint64_t end) const;
+    static bool RunInPlace();
+    static std::uint64_t RunInPlaceCount();
     void CheckRunConflicts(std::uint64_t program, std::span<const std::array<std::uint64_t, 3>> accesses) const;
     static std::string RunConflictReport();
     // APS5_PROFILE_DRAW: a reused build whose previous use still owes its copy-backs (staged regions

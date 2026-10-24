@@ -5245,7 +5245,15 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             }
             // A staged region (see stagingEligible) is copied out of the import even when aligned;
             // without a recorder to record the copies it binds in place like any other.
-            const bool staged = recorder != nullptr && stagingEligible(region, addressable);
+            bool staged = recorder != nullptr && stagingEligible(region, addressable);
+            // In place in a run (Recorder::RunTouches): a range the open run of this unordered
+            // dispatch's ring also accesses is not shadowed, so the dispatch and the run share its
+            // bytes as on hardware (a private shadow would copy in pre-run bytes and copy back over
+            // the members' writes). Atomic ranges keep their shadows (the run's atomic guard).
+            if (staged && !region.atomic && Recorder::RunInPlace() && recorder->RunTouches(Recorder::PeekUnorderedDispatch(), region.begin, region.end)) {
+                staged = false;
+                if (const auto served = profile ? Recorder::RunInPlaceCount() : 0; served % 1000 == 0 && served != 0) AgcDriver::ProfilePrint_nid_no_patch("[run-in-place] %llu staged ranges served in place for a dispatch joining a run (cumulative)\n", static_cast<unsigned long long>(served));
+            }
             if (entry != nullptr && !staged && bindableInPlace(HostImportOffset(*entry, region.begin), addressable)) {
                 region.direct = entry;
                 region.runCut = runImport;

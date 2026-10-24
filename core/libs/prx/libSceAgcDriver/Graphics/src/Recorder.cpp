@@ -1846,14 +1846,35 @@ bool Recorder::RunAtomicConflict(std::span<const std::array<std::uint64_t, 3>> a
     return false;
 }
 
+namespace {
+std::atomic<std::uint64_t> runInPlaceCount{0};
+}
+
+bool Recorder::RunInPlace() {
+    return !RuntimeSwitches::Set(RuntimeSwitch::NoRunInPlace);
+}
+
+std::uint64_t Recorder::RunInPlaceCount() {
+    return runInPlaceCount.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+bool Recorder::RunTouches(std::uint32_t queueKey, std::uint64_t begin, std::uint64_t end) const {
+    if (queueKey == 0 || open == nullptr || open->deferredDispatchQueue != queueKey) return false;
+    return std::any_of(open->runAccess.begin(), open->runAccess.end(), [&](const auto& member) { return (member[2] & RunAccessImage) == 0 && begin < member[1] && member[0] < end; });
+}
+
 bool Recorder::RunRangeConflict(std::span<const std::array<std::uint64_t, 3>> accesses) const {
     if (open == nullptr || open->deferredDispatchQueue == 0) return false;
     bool conflict = false;
+    const bool inPlace = RunInPlace();
     for (const auto& access : accesses) {
         for (const auto& member : open->runAccess) {
             if (((access[2] ^ member[2]) & RunAccessImage) != 0) continue;
             if (!(access[0] < member[1] && member[0] < access[1])) continue;
             if (((access[2] | member[2]) & RunAccessWritten) == 0) continue;
+            // Both in place (no staged copy, not images): the dispatches share the bytes as on hardware,
+            // where the title left them unordered.
+            if (inPlace && ((access[2] | member[2]) & (RunAccessCopied | RunAccessImage)) == 0) continue;
             conflict = true;
             break;
         }
