@@ -271,7 +271,11 @@ void MixedDrawTakesThePerDrawPath() {
 }
 
 int main() {
+#ifdef _WIN32
+    _putenv_s("APS5_EAGER_WRITEBACK", "1");
+#else
     setenv("APS5_EAGER_WRITEBACK", "1", 1);
+#endif
     try {
         {
             const auto device = OpenVulkanTestDevice();
