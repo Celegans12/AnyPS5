@@ -18,7 +18,6 @@
 #include <string>
 #include <vector>
 
-
 namespace {
 
 void Require(bool condition, const std::string& message) {
@@ -28,9 +27,12 @@ void Require(bool condition, const std::string& message) {
 constexpr std::array<std::uint8_t, 4> Texel{0x10u, 0x80u, 0xc0u, 0xffu};
 constexpr std::array<std::uint8_t, 4> OtherTexel{0xf0u, 0x20u, 0x00u, 0x40u};
 
-alignas(256) constexpr std::array<std::uint32_t, 8> SampleCode{0x7e0002f0u, 0x7e0202f0u, 0xf09c0f08u, 0x00400000u, 0xbf8c0000u, 0xe0780000u, 0x80030000u, 0xbf810000u};
+alignas(256) constexpr std::array<std::uint32_t, 8> SampleCode{0x7e0002f0u, 0x7e0202f0u, 0xf09c0f08u, 0x00400000u,
+                                                               0xbf8c0000u, 0xe0780000u, 0x80030000u, 0xbf810000u};
 
-alignas(256) constexpr std::array<std::uint32_t, 16> LdsSampleCode{0x7e0002f0u, 0x7e0202f0u, 0xf09c0f08u, 0x00400000u, 0x7e080280u, 0xbf8c0000u, 0xd8340000u, 0x00000004u, 0xbf8c0000u, 0xd8d80000u, 0x00000004u, 0xbf8c0000u, 0xe0780000u, 0x80030000u, 0xbf810000u, 0xbf810000u};
+alignas(256) constexpr std::array<std::uint32_t, 16> LdsSampleCode{
+    0x7e0002f0u, 0x7e0202f0u, 0xf09c0f08u, 0x00400000u, 0x7e080280u, 0xbf8c0000u, 0xd8340000u, 0x00000004u,
+    0xbf8c0000u, 0xd8d80000u, 0x00000004u, 0xbf8c0000u, 0xe0780000u, 0x80030000u, 0xbf810000u, 0xbf810000u};
 
 alignas(256) std::array<std::uint8_t, 1024> TextureMemory{};
 alignas(256) std::array<std::uint8_t, 1024> OtherTextureMemory{};
@@ -64,7 +66,14 @@ std::uint32_t High(const void* pointer) {
 
 std::array<std::uint32_t, 8> Image(const void* pointer) {
     const auto address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(pointer));
-    return {static_cast<std::uint32_t>(address >> 8u), static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (56u << 20u) | (3u << 30u), 3u << 14u, 0xfacu | (9u << 28u), 0u, 0u, 0u, 0u};
+    return {static_cast<std::uint32_t>(address >> 8u),
+            static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (56u << 20u) | (3u << 30u),
+            3u << 14u,
+            0xfacu | (9u << 28u),
+            0u,
+            0u,
+            0u,
+            0u};
 }
 
 void SetShaderRegister(std::vector<std::uint32_t>& words, std::uint32_t offset, std::uint32_t value) {
@@ -97,12 +106,15 @@ void Submit(std::vector<std::uint32_t>& words) {
 void RequireSampled(const float* output, const std::array<std::uint8_t, 4>& expected, const std::string& what, bool heap) {
     for (std::size_t channel = 0; channel < 4; ++channel) {
         const float wanted = static_cast<float>(expected[channel]) / 255.0f;
-        Require(std::fabs(output[channel] - wanted) < 1e-6f, what + ": channel " + std::to_string(channel) + " is " + std::to_string(output[channel]) + ", expected " + std::to_string(wanted) + (heap ? " through the heap" : ""));
+        Require(std::fabs(output[channel] - wanted) < 1e-6f, what + ": channel " + std::to_string(channel) + " is " +
+                                                                 std::to_string(output[channel]) + ", expected " + std::to_string(wanted) +
+                                                                 (heap ? " through the heap" : ""));
     }
 }
 
 void Fill(std::array<std::uint8_t, 1024>& memory, const std::array<std::uint8_t, 4>& texel) {
-    for (std::size_t offset = 0; offset < memory.size(); offset += texel.size()) std::memcpy(memory.data() + offset, texel.data(), texel.size());
+    for (std::size_t offset = 0; offset < memory.size(); offset += texel.size())
+        std::memcpy(memory.data() + offset, texel.data(), texel.size());
 }
 
 void DriverSample(bool heap) {
@@ -116,7 +128,8 @@ void DriverSample(bool heap) {
     if (heap) Require(AgcDriver::Graphics::HeapComputeStages() > before, "the heap did not take the sampling compute stage");
 }
 
-ShaderRecompiler::RecompileResult Compile(AgcDriver::VulkanDevice& device, const void* image, float* output, std::span<const std::uint32_t> code = SampleCode, std::uint32_t ldsDwords = 0u) {
+ShaderRecompiler::RecompileResult Compile(AgcDriver::VulkanDevice& device, const void* image, float* output,
+                                          std::span<const std::uint32_t> code = SampleCode, std::uint32_t ldsDwords = 0u) {
     std::vector<std::uint32_t> userData;
     const auto descriptor = Image(image);
     userData.insert(userData.end(), descriptor.begin(), descriptor.end());
@@ -124,7 +137,11 @@ ShaderRecompiler::RecompileResult Compile(AgcDriver::VulkanDevice& device, const
     userData.insert(userData.end(), {Low(output), High(output) & 0xffffu, static_cast<std::uint32_t>(4u * sizeof(float)), 0x31016facu});
     const std::array<ShaderRecompiler::MemoryRegion, 1> memory{{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)}}};
     const ShaderRecompiler::ShaderComputeStageInfo compute{{1u, 1u, 1u}, ldsDwords, {false, false, false}, false, 1u};
-    ShaderRecompiler::RecompileRequest request{{ShaderRecompiler::ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), code, 0u, {}}, {32u, 0u, userData, compute, std::nullopt, std::nullopt, memory}, device.ComputeTarget(32u), {0u, 0u, 0u, 128u}};
+    ShaderRecompiler::RecompileRequest request{
+        {ShaderRecompiler::ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), code, 0u, {}},
+        {32u, 0u, userData, compute, std::nullopt, std::nullopt, memory},
+        device.ComputeTarget(32u),
+        {0u, 0u, 0u, 128u}};
     request.useCache = false;
     return ShaderRecompiler::Recompile(request);
 }
@@ -133,7 +150,8 @@ void DeviceSample(AgcDriver::VulkanDevice& device, bool heap) {
     for (std::size_t index = 1; index < Outputs.size(); ++index) Outputs[index].fill(-1.0f);
     const auto first = Compile(device, OtherTextureMemory.data(), Outputs[1].data());
     const auto second = Compile(device, TextureMemory.data(), Outputs[2].data());
-    Require(first.gpuResolvedImages == heap && second.gpuResolvedImages == heap, heap ? "a sampling compute stage is not GPU mode" : "a compute stage took the heap without it");
+    Require(first.gpuResolvedImages == heap && second.gpuResolvedImages == heap,
+            heap ? "a sampling compute stage is not GPU mode" : "a compute stage took the heap without it");
     const auto before = AgcDriver::Graphics::HeapComputeStages();
     const auto pushesBefore = AgcDriver::Graphics::DataAddressPushes();
     device.Dispatch(first, 1u, 1u, 1u, {}, reinterpret_cast<std::uintptr_t>(SampleCode.data()));
@@ -142,19 +160,24 @@ void DeviceSample(AgcDriver::VulkanDevice& device, bool heap) {
     RequireSampled(Outputs[1].data(), OtherTexel, "the first of two textures in one batch", heap);
     RequireSampled(Outputs[2].data(), Texel, "the second of two textures in one batch", heap);
     if (heap) Require(AgcDriver::Graphics::HeapComputeStages() >= before + 2u, "the heap did not take both sampling compute stages");
-    if (heap) Require(AgcDriver::Graphics::DataAddressPushes() >= pushesBefore + 2u, "a heap dispatch did not read its shader data through pushed addresses");
+    if (heap)
+        Require(AgcDriver::Graphics::DataAddressPushes() >= pushesBefore + 2u,
+                "a heap dispatch did not read its shader data through pushed addresses");
     const auto again = Compile(device, TextureMemory.data(), Outputs[3].data());
     device.Dispatch(again, 1u, 1u, 1u, {}, reinterpret_cast<std::uintptr_t>(SampleCode.data()));
     device.WaitIdle();
     RequireSampled(Outputs[3].data(), Texel, "the first texture again in a later batch", heap);
     Outputs[1].fill(-1.0f);
-    const auto lds = Compile(device, TextureMemory.data(), Outputs[1].data(), LdsSampleCode, (device.ComputeTarget(32u).maxWorkgroupSharedMemoryBytes + 4096u) / 4u);
-    Require(lds.workgroupMemoryDwords != 0u && lds.gpuResolvedImages == heap, "the LDS sampling stage did not get workgroup memory in the expected mode");
+    const auto lds = Compile(device, TextureMemory.data(), Outputs[1].data(), LdsSampleCode,
+                             (device.ComputeTarget(32u).maxWorkgroupSharedMemoryBytes + 4096u) / 4u);
+    Require(lds.workgroupMemoryDwords != 0u && lds.gpuResolvedImages == heap,
+            "the LDS sampling stage did not get workgroup memory in the expected mode");
     const auto heapPipelines = device.DescriptorHeapComputePipelines();
     device.Dispatch(lds, 1u, 1u, 1u, {}, reinterpret_cast<std::uintptr_t>(LdsSampleCode.data()));
     device.WaitIdle();
     RequireSampled(Outputs[1].data(), Texel, "the texture sampled through workgroup memory", heap);
-    if (heap && heapPipelines != 0u) Require(device.DescriptorHeapComputePipelines() > heapPipelines, "the LDS sampling stage did not take the descriptor heap");
+    if (heap && heapPipelines != 0u)
+        Require(device.DescriptorHeapComputePipelines() > heapPipelines, "the LDS sampling stage did not take the descriptor heap");
 }
 
 }

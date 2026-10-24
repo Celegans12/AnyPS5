@@ -58,7 +58,8 @@ SamplerRecord recordOf(const VkSamplerCreateInfo& info) {
     return record;
 }
 
-VKAPI_ATTR VkResult VKAPI_CALL createImageView(VkDevice device, const VkImageViewCreateInfo* info, const VkAllocationCallbacks* allocator, VkImageView* view) {
+VKAPI_ATTR VkResult VKAPI_CALL createImageView(VkDevice device, const VkImageViewCreateInfo* info, const VkAllocationCallbacks* allocator,
+                                               VkImageView* view) {
     const auto result = realCreateImageView.load(std::memory_order_acquire)(device, info, allocator, view);
     if (result == VK_SUCCESS) {
         auto record = recordOf(*info);
@@ -76,7 +77,8 @@ VKAPI_ATTR void VKAPI_CALL destroyImageView(VkDevice device, VkImageView view, c
     realDestroyImageView.load(std::memory_order_acquire)(device, view, allocator);
 }
 
-VKAPI_ATTR VkResult VKAPI_CALL createSampler(VkDevice device, const VkSamplerCreateInfo* info, const VkAllocationCallbacks* allocator, VkSampler* sampler) {
+VKAPI_ATTR VkResult VKAPI_CALL createSampler(VkDevice device, const VkSamplerCreateInfo* info, const VkAllocationCallbacks* allocator,
+                                             VkSampler* sampler) {
     const auto result = realCreateSampler.load(std::memory_order_acquire)(device, info, allocator, sampler);
     if (result == VK_SUCCESS) {
         auto record = recordOf(*info);
@@ -94,7 +96,7 @@ VKAPI_ATTR void VKAPI_CALL destroySampler(VkDevice device, VkSampler sampler, co
     realDestroySampler.load(std::memory_order_acquire)(device, sampler, allocator);
 }
 
-template<typename TFunction>
+template <typename TFunction>
 bool resolve(std::atomic<TFunction>& real, VkDevice device, PFN_vkGetDeviceProcAddr deviceProc, const char* name) {
     const auto function = reinterpret_cast<TFunction>(deviceProc(device, name));
     if (function == nullptr) return false;

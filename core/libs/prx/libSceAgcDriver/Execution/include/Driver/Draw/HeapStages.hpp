@@ -17,7 +17,8 @@ namespace AgcDriver::DriverDetail {
 bool HeapFragmentsEnabled();
 bool HeapRefused();
 bool HeapPreRasterStage(ShaderRecompiler::ShaderStage stage);
-Graphics::HeapStageReason HeapStageIneligibility(ShaderRecompiler::ShaderStage stage, const ShaderRecompiler::IrResourcePlan* plan, bool heapVertex);
+Graphics::HeapStageReason HeapStageIneligibility(ShaderRecompiler::ShaderStage stage, const ShaderRecompiler::IrResourcePlan* plan,
+                                                 bool heapVertex);
 bool HeapStageEligible(ShaderRecompiler::ShaderStage stage, const ShaderRecompiler::IrResourcePlan* plan, bool heapVertex);
 std::optional<bool> HeapFragmentKnown(const void* snapshot, std::size_t codeOffset);
 void NoteHeapFragment(const void* snapshot, std::size_t codeOffset, bool eligible);
@@ -48,13 +49,19 @@ struct HeapStageReads {
     bool complete = false;
 };
 
-std::shared_ptr<const ShaderRecompiler::RecompileResult> MaterializeHeapStage(const ShaderRecompiler::PreparedShaderInvocation& invocation, std::span<const std::uint32_t> userData, std::uint64_t shaderBase, ShaderRecompiler::HeapStageWords* words = nullptr, std::shared_ptr<const ShaderRecompiler::HeapStageWords>* sharedWords = nullptr, HeapStageReads* stageReads = nullptr);
+std::shared_ptr<const ShaderRecompiler::RecompileResult>
+MaterializeHeapStage(const ShaderRecompiler::PreparedShaderInvocation& invocation, std::span<const std::uint32_t> userData,
+                     std::uint64_t shaderBase, ShaderRecompiler::HeapStageWords* words = nullptr,
+                     std::shared_ptr<const ShaderRecompiler::HeapStageWords>* sharedWords = nullptr, HeapStageReads* stageReads = nullptr);
 void NoteHeapDirect();
-void NoteHeapDirectVerify(const ShaderRecompiler::RecompileResult& direct, const ShaderRecompiler::RecompileResult& expected, const ShaderRecompiler::ResourceCapture* expectedCapture = nullptr);
+void NoteHeapDirectVerify(const ShaderRecompiler::RecompileResult& direct, const ShaderRecompiler::RecompileResult& expected,
+                          const ShaderRecompiler::ResourceCapture* expectedCapture = nullptr);
 std::uint64_t HeapStagesTaken();
-std::shared_ptr<const ShaderRecompiler::RecompileResult> PatchedHeapResult(const ShaderRecompiler::RecompileResult& shared, const ShaderRecompiler::HeapStageWords& words);
+std::shared_ptr<const ShaderRecompiler::RecompileResult> PatchedHeapResult(const ShaderRecompiler::RecompileResult& shared,
+                                                                           const ShaderRecompiler::HeapStageWords& words);
 void VerifyHeapAccessor(const Graphics::CompiledShader& stage);
-void VerifyRingWords(const ShaderRecompiler::RecompileResult& kept, const ShaderRecompiler::HeapStageWords& ring, const ShaderRecompiler::RecompileResult& fresh, const ShaderRecompiler::HeapStageWords* freshWords);
+void VerifyRingWords(const ShaderRecompiler::RecompileResult& kept, const ShaderRecompiler::HeapStageWords& ring,
+                     const ShaderRecompiler::RecompileResult& fresh, const ShaderRecompiler::HeapStageWords* freshWords);
 
 }
 

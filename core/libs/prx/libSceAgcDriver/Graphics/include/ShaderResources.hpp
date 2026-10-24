@@ -631,6 +631,16 @@ private:
     };
     std::array<HeapStageState, ShaderRecompiler::RuntimeAbi::StageCount> heapStages;
     std::uint32_t heapSpan(HeapStageState::KeptSpan& kept, std::span<const std::uint32_t> words);
+    bool ownsHeapBinding(const Binding& binding, VkShaderStageFlags stageBit) const;
+    VkImageView heapPlaceholderView(std::uint32_t kind) const;
+    VkImageView heapSampledView(std::size_t index) const;
+    VkImageView heapStorageView(std::size_t index) const;
+    void appendHeapSlotKey(VkShaderStageFlags stageBit, std::vector<std::uintptr_t>& key) const;
+    static bool heapSlotsCurrent(const BindlessHeap& heap, const HeapStageState& state);
+    void takeHeapSlots(BindlessHeap& heap, HeapStageState& state, VkShaderStageFlags stageBit, std::span<const std::uintptr_t> key);
+    static void noteHeapSlotGenerations(const BindlessHeap& heap, HeapStageState& state);
+    void verifyHeapSlots(const BindlessHeap& heap, const HeapStageState& state, VkShaderStageFlags stageBit) const;
+    void patchHeapSlotWords(const CompiledShader& shader, const HeapStageState& stageState, std::vector<std::uint32_t>& patched, bool current) const;
     static constexpr std::int64_t HeapRingDataFirst = -2;
     static constexpr std::int64_t HeapRingData(std::size_t stage) { return HeapRingDataFirst - static_cast<std::int64_t>(stage); }
     static constexpr bool IsHeapRingData(std::int64_t allocation) { return allocation <= HeapRingDataFirst && allocation > HeapRingDataFirst - static_cast<std::int64_t>(ShaderRecompiler::RuntimeAbi::StageCount); }

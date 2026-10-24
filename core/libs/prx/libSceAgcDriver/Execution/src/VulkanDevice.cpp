@@ -5311,10 +5311,14 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::createComputePipeline(cons
     if (profile && shader.spirv.size() > 100000) std::fprintf(stderr, "[dispatch] creating a pipeline for %zu SPIR-V words (program 0x%llx)\n", shader.spirv.size(), static_cast<unsigned long long>(programAddress));
     std::vector<VkDescriptorSetAndBindingMappingEXT> heapMappings;
     const bool workgroupAddress = shader.workgroupMemoryDwords != 0;
-    objects->descriptorHeap = gpuMode && context.descriptorHeap && Graphics::DescriptorHeapEnabled() && Graphics::BindlessHeap::For(context).DescriptorHeapMappings(std::span<const std::uint32_t>(shader.spirv.data(), shader.spirv.size()), heapMappings, workgroupAddress ? Graphics::ComputePushConstantBytes : ~0u, shader.dataAddressPush);
+    const bool heapDevice = gpuMode && context.descriptorHeap && Graphics::DescriptorHeapEnabled();
+    const auto workgroupAddressOffset = workgroupAddress ? Graphics::ComputePushConstantBytes : ~0u;
+    const std::span<const std::uint32_t> spirv(shader.spirv.data(), shader.spirv.size());
+    objects->descriptorHeap = heapDevice && Graphics::BindlessHeap::For(context).DescriptorHeapMappings(spirv, heapMappings, workgroupAddressOffset, shader.dataAddressPush);
     require(!gpuMode || objects->descriptorHeap, "a GPU-mode compute stage does not map onto VK_EXT_descriptor_heap");
-    if (objects->descriptorHeap) CreateComputeHeapPipeline(state->device, state->DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines"), context.pipelineCache, objects->module, computePipelineFlags(), stageFlags, specialization.Info(), subgroupSize, heapMappings, &objects->pipeline, context.pipelineCacheSynchronization);
-    else CreateComputePipeline(state->device, state->DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines"), context.pipelineCache, objects->module, objects->layout, pipelineFlags, stageFlags, specialization.Info(), subgroupSize, &objects->pipeline, context.pipelineCacheSynchronization);
+    const auto createPipelines = state->DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines");
+    if (objects->descriptorHeap) CreateComputeHeapPipeline(state->device, createPipelines, context.pipelineCache, objects->module, computePipelineFlags(), stageFlags, specialization.Info(), subgroupSize, heapMappings, &objects->pipeline, context.pipelineCacheSynchronization);
+    else CreateComputePipeline(state->device, createPipelines, context.pipelineCache, objects->module, objects->layout, pipelineFlags, stageFlags, specialization.Info(), subgroupSize, &objects->pipeline, context.pipelineCacheSynchronization);
     objects->destroyModule(objects->device, objects->module, nullptr);
     objects->module = VK_NULL_HANDLE;
     if (!state->probingFloatControls) {

@@ -37,12 +37,15 @@ public:
     VkDeviceSize ImageHeapStride() const { return imageHeapStride; }
     VkDeviceSize SamplerHeapStride() const { return samplerHeapStride; }
     void BindDescriptorHeaps(VkCommandBuffer commands) const;
-    bool DescriptorHeapMappings(std::span<const std::uint32_t> spirv, std::vector<VkDescriptorSetAndBindingMappingEXT>& mappings, std::uint32_t workgroupAddressOffset = ~0u, bool rootGds = false, bool rootFault = false, bool pixelLds = false) const;
+    bool DescriptorHeapMappings(std::span<const std::uint32_t> spirv, std::vector<VkDescriptorSetAndBindingMappingEXT>& mappings,
+                                std::uint32_t workgroupAddressOffset = ~0u, bool rootGds = false, bool rootFault = false,
+                                bool pixelLds = false) const;
     void WritePixelLdsBuffer(VkDeviceAddress address, VkDeviceSize bytes);
     VkDeviceAddress RingAddress() const;
     VkBuffer RingBuffer() const;
 
-    std::optional<std::uint32_t> TextureSlot(std::uint32_t kind, const std::shared_ptr<Texture>& texture, VkImageView view, VkImageLayout layout);
+    std::optional<std::uint32_t> TextureSlot(std::uint32_t kind, const std::shared_ptr<Texture>& texture, VkImageView view,
+                                             VkImageLayout layout);
     std::optional<std::uint32_t> StorageSlot(std::uint32_t kind, std::shared_ptr<void> owner, VkImageView view);
     std::optional<std::uint32_t> ViewSlot(std::uint32_t kind, const void* owner, VkImageView view);
     void ReleaseViewSlots(const void* owner);
@@ -51,7 +54,8 @@ public:
     std::optional<std::uint32_t> SamplerSlot(const std::shared_ptr<Sampler>& sampler);
     std::uint32_t SamplerGeneration(std::uint32_t slot) const;
     std::uint64_t SlotSerial() const { return slotSerial.load(std::memory_order_acquire); }
-    bool GenerationsCurrent(std::span<const std::vector<std::uint32_t>> slots, std::span<const std::uint32_t> slotGenerations, std::span<const std::uint32_t> samplerSlots, std::span<const std::uint32_t> samplerGenerations) const;
+    bool GenerationsCurrent(std::span<const std::vector<std::uint32_t>> slots, std::span<const std::uint32_t> slotGenerations,
+                            std::span<const std::uint32_t> samplerSlots, std::span<const std::uint32_t> samplerGenerations) const;
     std::uint32_t AbsentSlot(std::uint32_t kind, VkImageView view);
     static bool NearlyFull();
     static void NoteSweepDue();
@@ -92,7 +96,8 @@ private:
     VkDeviceSize resourceHeapUsed = 0;
     VkDeviceSize pixelLdsHeapOffset = 0;
     VkDeviceSize samplerHeapUsed = 0;
-    void writeDescriptorHeap(const VkWriteDescriptorSet& write);
+    void writeImageSlot(std::uint32_t kind, std::uint32_t slot, VkImageView view, VkImageLayout layout);
+    void writeSamplerSlot(std::uint32_t slot, VkSampler sampler);
     static constexpr std::size_t RingChunkBytes = 4u << 20u;
     struct Chunk {
         Recorder* recorder = nullptr;
@@ -115,7 +120,11 @@ private:
         bool operator==(const TextureKey&) const = default;
     };
     struct TextureKeyHash {
-        std::size_t operator()(const TextureKey& key) const { return std::hash<const void*>{}(key.texture) ^ std::hash<const void*>{}(reinterpret_cast<const void*>(key.view)) ^ (static_cast<std::size_t>(key.kind) << 48u) ^ (static_cast<std::size_t>(key.layout) << 40u); }
+        std::size_t operator()(const TextureKey& key) const {
+            const auto texture = std::hash<const void*>{}(key.texture);
+            const auto view = std::hash<const void*>{}(reinterpret_cast<const void*>(key.view));
+            return texture ^ view ^ (static_cast<std::size_t>(key.kind) << 48u) ^ (static_cast<std::size_t>(key.layout) << 40u);
+        }
     };
     std::unordered_map<TextureKey, std::uint32_t, TextureKeyHash> textureSlots;
     std::unordered_map<const void*, std::vector<std::pair<std::uint32_t, std::uint32_t>>> viewSlots;
@@ -132,6 +141,10 @@ private:
     std::uint64_t slotRequests = 0;
     void sweepLocked(std::vector<std::shared_ptr<Texture>>& dropped);
     std::optional<std::uint32_t> takeSlotLocked(std::uint32_t kind);
+    std::optional<std::uint32_t> takeOrSweepLocked(std::uint32_t kind, std::vector<std::shared_ptr<Texture>>& dropped);
+    SlotOwner& claimSlotLocked(const TextureKey& key, std::uint32_t slot);
+    void freeSlotLocked(std::uint32_t kind, std::uint32_t slot);
+    const SlotOwner* ownerLocked(std::uint32_t kind, std::uint32_t slot) const;
     std::unordered_map<const Sampler*, std::uint32_t> samplerSlots;
     std::unordered_map<std::uint32_t, std::uint32_t> absentSlots;
     std::vector<std::shared_ptr<Sampler>> heldSamplers;
@@ -161,24 +174,52 @@ std::uint64_t EmptyResourceSets();
 std::uint64_t DataAddressPushes();
 enum class SetBindSite : std::uint8_t { Draw, Dispatch, Detiler, ColorTransfer, Presentation, Count };
 enum class HeapFallback : std::uint8_t { DrawUnmapped, DrawMixedRetry, DrawRefusedPair, DrawMixedReused, DispatchUnmapped, Count };
-enum class HeapStageReason : std::uint8_t { Heap, Disabled, PairRefused, FragmentOffHeap, StageKind, NoPlan, PlanStage, UnresolvedImageSource, KnownIneligible, Count };
+enum class HeapStageReason : std::uint8_t {
+    Heap,
+    Disabled,
+    PairRefused,
+    FragmentOffHeap,
+    StageKind,
+    NoPlan,
+    PlanStage,
+    UnresolvedImageSource,
+    KnownIneligible,
+    Count
+};
 void NoteHeapStageReason(HeapStageReason reason);
 void NoteHeapRecord(bool compute, bool heap);
 void NoteHeapFallback(HeapFallback reason);
 std::uint64_t HeapFallbacks(HeapFallback reason);
 void NoteCpuBufferCopy(std::uint64_t bytes);
-enum class HeapCost : std::uint8_t { StagePrepare, HeapStageCall, StageFinish, WalkMemo, Walk, Materialize, TemplateFind, TemplateBuild, Slots, StageData, BufferAddresses, MemoInsert, Guards, Count };
+enum class HeapCost : std::uint8_t {
+    StagePrepare,
+    HeapStageCall,
+    StageFinish,
+    WalkMemo,
+    Walk,
+    Materialize,
+    TemplateFind,
+    TemplateBuild,
+    Slots,
+    StageData,
+    BufferAddresses,
+    MemoInsert,
+    Guards,
+    Count
+};
 bool HeapCostTimed();
 void NoteHeapCost(HeapCost cost, std::uint64_t nanoseconds);
 class HeapCostScope {
 public:
-    explicit HeapCostScope(HeapCost cost) : cost(cost), start(HeapCostTimed() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}) {}
+    explicit HeapCostScope(HeapCost cost) :
+        cost(cost), start(HeapCostTimed() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}) {}
     ~HeapCostScope() { Stop(); }
     HeapCostScope(const HeapCostScope&) = delete;
     HeapCostScope& operator=(const HeapCostScope&) = delete;
     void Stop() {
         if (start == std::chrono::steady_clock::time_point{}) return;
-        NoteHeapCost(cost, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()));
+        NoteHeapCost(cost, static_cast<std::uint64_t>(
+                               std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()));
         start = {};
     }
 
@@ -187,8 +228,10 @@ private:
     std::chrono::steady_clock::time_point start;
 };
 void NoteCommandBufferBegun(VkCommandBuffer commands);
-void CmdPushConstants(const Context& context, VkCommandBuffer commands, VkPipelineLayout layout, VkShaderStageFlags stages, std::uint32_t offset, std::uint32_t size, const void* values);
-void CmdBindDescriptorSets(const Context& context, VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout, std::uint32_t firstSet, std::uint32_t setCount, const VkDescriptorSet* sets, SetBindSite site);
+void CmdPushConstants(const Context& context, VkCommandBuffer commands, VkPipelineLayout layout, VkShaderStageFlags stages,
+                      std::uint32_t offset, std::uint32_t size, const void* values);
+void CmdBindDescriptorSets(const Context& context, VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout,
+                           std::uint32_t firstSet, std::uint32_t setCount, const VkDescriptorSet* sets, SetBindSite site);
 std::uint64_t DescriptorHeapBinds();
 
 }

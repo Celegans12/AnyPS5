@@ -109,7 +109,8 @@ void sweptOwnerReentry(const Context& context, VkImageView view) {
         });
     };
     require(heap.StorageSlot(kind, owner(), view).has_value(), "the first storage owner takes the kind's only slot");
-    require(heap.StorageSlot(kind, owner(), view).has_value() && released == 1, "a full kind sweeps an owner whose release calls back into the heap");
+    require(heap.StorageSlot(kind, owner(), view).has_value() && released == 1,
+            "a full kind sweeps an owner whose release calls back into the heap");
     BindlessHeap::NoteSweepDue();
     BindlessHeap::SweepIfDue();
     require(released == 2, "a due sweep releases an owner that calls back into the heap");
@@ -158,7 +159,8 @@ void heapComesBack(const Context& context, VkImageView view) {
     std::vector<std::shared_ptr<Texture>> held;
     for (std::size_t index = 0; index < 7u; ++index) {
         held.push_back(fakeTexture(index));
-        require(heap.TextureSlot(kind, held.back(), view, VK_IMAGE_LAYOUT_GENERAL).has_value(), "a texture takes one of the eight capped slots");
+        require(heap.TextureSlot(kind, held.back(), view, VK_IMAGE_LAYOUT_GENERAL).has_value(),
+                "a texture takes one of the eight capped slots");
     }
     require(BindlessHeap::NearlyFull(), "one free slot of eight refuses the heap");
     BindlessHeap::SweepIfDue();
