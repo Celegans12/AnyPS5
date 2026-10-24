@@ -111,6 +111,81 @@ std::uint32_t NormalizeFormatComponent(SpirvEmitterState& state, const SpirvBuff
     }
 }
 
+// A float component with a runtime width as f32 bits: 32 bits as they are, 16 bits as a half, 10 and 11 bits as the
+// unsigned small floats (5 and 6 mantissa bits; EmitUFloatToF32Bits).
+static std::uint32_t FloatComponentToF32BitsRuntime(SpirvEmitterState& state, std::uint32_t bits, std::uint32_t raw, bool half) {
+    const auto constant = [&](std::uint32_t value) { return ConstantU32(state, value); };
+    const auto mantissaBits = EmitSelectValueU32(state, EmitCompareU32Constant(state, spv::OpIEqual, bits, 11u), constant(6u), constant(5u));
+    const auto mantissa = EmitBinaryU32(state, spv::OpBitwiseAnd, raw, EmitBinaryU32(state, spv::OpISub, EmitBinaryU32(state, spv::OpShiftLeftLogical, constant(1u), mantissaBits), constant(1u)));
+    const auto smallExponent = EmitBinaryU32(state, spv::OpBitwiseAnd, EmitBinaryU32(state, spv::OpShiftRightLogical, raw, mantissaBits), constant(0x1fu));
+    const auto mantissaBits32 = EmitBinaryU32(state, spv::OpShiftLeftLogical, mantissa, EmitBinaryU32(state, spv::OpISub, constant(23u), mantissaBits));
+    const auto normal = EmitBitcastU32ToF32(state, EmitOrU32(state, EmitBinaryU32(state, spv::OpShiftLeftLogical, EmitAddU32(state, smallExponent, constant(127u - 15u)), constant(23u)), mantissaBits32));
+    const auto special = EmitBitcastU32ToF32(state, EmitOrU32(state, constant(0x7f800000u), mantissaBits32));
+    const auto mantissaF32 = state.module.AllocateId();
+    state.module.AddFunction(spv::OpConvertUToF, TypeF32(state), mantissaF32, mantissa);
+    const auto subnormalScale = EmitTBufferSelectF32(state, EmitCompareU32Constant(state, spv::OpIEqual, mantissaBits, 6u), ConstantF32Value(state, std::ldexp(1.0f, 1 - 15 - 6)), ConstantF32Value(state, std::ldexp(1.0f, 1 - 15 - 5)));
+    const auto subnormal = state.module.AllocateId();
+    state.module.AddFunction(spv::OpFMul, TypeF32(state), subnormal, mantissaF32, subnormalScale);
+    const auto finite = EmitTBufferSelectF32(state, EmitCompareU32Constant(state, spv::OpIEqual, smallExponent, 0u), subnormal, normal);
+    auto value = EmitBitcastF32ToU32(state, EmitTBufferSelectF32(state, EmitCompareU32Constant(state, spv::OpIEqual, smallExponent, 31u), special, finite));
+    if (half) value = EmitSelectValueU32(state, EmitCompareU32Constant(state, spv::OpIEqual, bits, 16u), EmitBitcastF32ToU32(state, EmitF16BitsToF32(state, raw)), value);
+    return EmitSelectValueU32(state, EmitCompareU32Constant(state, spv::OpIEqual, bits, 32u), raw, value);
+}
+
+std::uint32_t NormalizeFormatComponentRuntime(SpirvEmitterState& state, std::uint32_t type, std::uint32_t bits, std::uint32_t raw) {
+    const auto u32 = TypeU32(state);
+    const auto boolean = TypeBool(state);
+    const auto constant = [&](std::uint32_t value) { return ConstantU32(state, value); };
+    const auto isType = [&](SpirvFormatComponentType value) { return EmitCompareU32Constant(state, spv::OpIEqual, type, static_cast<std::uint32_t>(value)); };
+    const auto umin = [&](std::uint32_t lhs, std::uint32_t rhs) {
+        const auto result = state.module.AllocateId();
+        state.module.AddFunction(spv::OpExtInst, u32, result, GlslStd450(state), GLSLstd450UMin, lhs, rhs);
+        return result;
+    };
+    const auto snorm = isType(SpirvFormatComponentType::Snorm);
+    // Snorm: the sign and the magnitude clamped to 2^(bits-1)-1, then the unorm conversion of bits-1 bits.
+    const auto negative = Binary(state, spv::OpSLessThan, boolean, EmitTBufferBitcastU32ToI32(state, raw), EmitTBufferBitcastU32ToI32(state, constant(0u)));
+    const auto magnitude = EmitSelectValueU32(state, negative, Unary(state, spv::OpSNegate, u32, raw), raw);
+    const auto snormBits = EmitBinaryU32(state, spv::OpISub, bits, constant(1u));
+    const auto snormMaximum = EmitBinaryU32(state, spv::OpISub, EmitBinaryU32(state, spv::OpShiftLeftLogical, constant(1u), snormBits), constant(1u));
+    const auto clamped = umin(magnitude, snormMaximum);
+    const auto sign = EmitSelectValueU32(state, Binary(state, spv::OpLogicalAnd, boolean, snorm, negative), constant(0x80000000u), constant(0u));
+    // UnormToF32Bits with a runtime width: value / (2^width - 1), correctly rounded, from the repeating binary pattern.
+    const auto value = EmitSelectValueU32(state, snorm, clamped, raw);
+    const auto width = EmitSelectValueU32(state, snorm, snormBits, bits);
+    const auto maximum = EmitBinaryU32(state, spv::OpISub, EmitBinaryU32(state, spv::OpShiftLeftLogical, constant(1u), width), constant(1u));
+    const auto zero = EmitCompareU32Constant(state, spv::OpIEqual, value, 0u);
+    const auto safe = EmitSelectValueU32(state, zero, constant(1u), value);
+    const auto msb = state.module.AllocateId();
+    state.module.AddFunction(spv::OpExtInst, u32, msb, GlslStd450(state), GLSLstd450FindUMsb, safe);
+    const auto leading = EmitBinaryU32(state, spv::OpISub, EmitBinaryU32(state, spv::OpISub, width, constant(1u)), msb);
+    const auto high = EmitBinaryU32(state, spv::OpShiftLeftLogical, safe, leading);
+    const auto low = EmitBinaryU32(state, spv::OpShiftRightLogical, safe, EmitBinaryU32(state, spv::OpISub, width, leading));
+    const auto rotated = EmitBinaryU32(state, spv::OpBitwiseAnd, EmitOrU32(state, high, low), maximum);
+    auto pattern = EmitBinaryU32(state, spv::OpShiftLeftLogical, rotated, EmitBinaryU32(state, spv::OpISub, constant(32u), width));
+    for (std::uint32_t doubling = 0; doubling < 5u; ++doubling) {
+        const auto shift = EmitBinaryU32(state, spv::OpShiftLeftLogical, width, constant(doubling));
+        const auto within = Binary(state, spv::OpULessThan, boolean, shift, constant(32u));
+        pattern = EmitSelectValueU32(state, within, EmitOrU32(state, pattern, EmitBinaryU32(state, spv::OpShiftRightLogical, pattern, umin(shift, constant(31u)))), pattern);
+    }
+    const auto round = EmitAndConstant(state, EmitBinaryU32(state, spv::OpShiftRightLogical, pattern, constant(7u)), 1u);
+    const auto rounded = EmitAddU32(state, EmitBinaryU32(state, spv::OpShiftRightLogical, pattern, constant(8u)), round);
+    const auto exponent = EmitBinaryU32(state, spv::OpShiftLeftLogical, EmitBinaryU32(state, spv::OpISub, EmitAddU32(state, msb, constant(126u)), width), constant(23u));
+    const auto normalized = EmitOrU32(state, sign, EmitSelectValueU32(state, zero, constant(0u), EmitAddU32(state, exponent, rounded)));
+    // Scaled: the integer as a float.
+    const auto unsignedFloat = state.module.AllocateId();
+    state.module.AddFunction(spv::OpConvertUToF, TypeF32(state), unsignedFloat, raw);
+    const auto signedFloat = state.module.AllocateId();
+    state.module.AddFunction(spv::OpConvertSToF, TypeF32(state), signedFloat, EmitTBufferBitcastU32ToI32(state, raw));
+    const auto floatValue = FloatComponentToF32BitsRuntime(state, bits, raw, true);
+    auto result = raw;
+    result = EmitSelectValueU32(state, isType(SpirvFormatComponentType::Uscaled), EmitBitcastF32ToU32(state, unsignedFloat), result);
+    result = EmitSelectValueU32(state, isType(SpirvFormatComponentType::Sscaled), EmitBitcastF32ToU32(state, signedFloat), result);
+    result = EmitSelectValueU32(state, Binary(state, spv::OpLogicalOr, boolean, snorm, isType(SpirvFormatComponentType::Unorm)), normalized, result);
+    result = EmitSelectValueU32(state, isType(SpirvFormatComponentType::Float), floatValue, result);
+    return result;
+}
+
 namespace {
 
 std::uint32_t Ext(SpirvEmitterState& state, std::uint32_t type, std::uint32_t op, std::uint32_t lhs, std::uint32_t rhs) {
@@ -240,6 +315,50 @@ std::uint32_t NormStoreBits(SpirvEmitterState& state, std::uint32_t bits, std::u
     return EmitSelectValueU32(state, negative, Unary(state, spv::OpSNegate, TypeU32(state), result), result);
 }
 
+}
+
+std::uint32_t EmitD16FormatComponentRuntime(SpirvEmitterState& state, std::uint32_t type, std::uint32_t bits, std::uint32_t raw) {
+    const auto u32 = TypeU32(state);
+    const auto constant = [&](std::uint32_t value) { return ConstantU32(state, value); };
+    const auto isType = [&](SpirvFormatComponentType value) { return EmitCompareU32Constant(state, spv::OpIEqual, type, static_cast<std::uint32_t>(value)); };
+    // Integers: wider than 16 bits clamped to the 16-bit range, else the low 16 bits.
+    const auto wide = UnsignedGreater(state, bits, constant(16u));
+    const auto unsignedWide = Ext(state, u32, GLSLstd450UMin, raw, constant(0xffffu));
+    const auto signedClamped = Ext(state, TypeI32(state), GLSLstd450SMax, EmitTBufferBitcastU32ToI32(state, raw), EmitTBufferBitcastU32ToI32(state, constant(0xffff8000u)));
+    const auto signedLimited = Ext(state, TypeI32(state), GLSLstd450SMin, signedClamped, EmitTBufferBitcastU32ToI32(state, constant(0x7fffu)));
+    const auto signedWide = EmitAndConstant(state, Unary(state, spv::OpBitcast, u32, signedLimited), 0xffffu);
+    const auto integer = EmitSelectValueU32(state, wide, EmitSelectValueU32(state, isType(SpirvFormatComponentType::Uint), unsignedWide, signedWide), EmitAndConstant(state, raw, 0xffffu));
+    // Norms: NormToF16Bits with a runtime maximum (2^bits-1, or 2^(bits-1)-1 for the snorm magnitude) and width.
+    std::uint32_t magnitude = raw;
+    const auto sign = SplitSign(state, raw, magnitude);
+    const auto snorm = isType(SpirvFormatComponentType::Snorm);
+    const auto width = EmitSelectValueU32(state, snorm, EmitBinaryU32(state, spv::OpISub, bits, constant(1u)), bits);
+    const auto maximum = EmitBinaryU32(state, spv::OpISub, EmitBinaryU32(state, spv::OpShiftLeftLogical, constant(1u), width), constant(1u));
+    const auto value = EmitSelectValueU32(state, snorm, Ext(state, u32, GLSLstd450UMin, magnitude, maximum), raw);
+    const auto zero = EmitCompareU32Constant(state, spv::OpIEqual, value, 0u);
+    const auto safe = EmitSelectValueU32(state, zero, constant(1u), value);
+    const auto first = EmitBinaryU32(state, spv::OpISub, EmitAddU32(state, width, constant(9u)), FindMsb(state, safe));
+    const auto low = Binary(state, spv::OpULessThan, TypeBool(state), EmitBinaryU32(state, spv::OpShiftLeftLogical, safe, first), EmitBinaryU32(state, spv::OpIMul, maximum, constant(1024u)));
+    const auto shift = Ext(state, u32, GLSLstd450UMin, EmitSelectValueU32(state, low, EmitAddU32(state, first, constant(1u)), first), constant(24u));
+    const auto scaled = EmitBinaryU32(state, spv::OpShiftLeftLogical, safe, shift);
+    const auto quotient = EmitBinaryU32(state, spv::OpUDiv, scaled, maximum);
+    const auto remainder = EmitBinaryU32(state, spv::OpUMod, scaled, maximum);
+    const auto up = UnsignedGreater(state, remainder, EmitBinaryU32(state, spv::OpShiftRightLogical, maximum, constant(1u)));
+    const auto rounded = EmitAddU32(state, quotient, EmitSelectValueU32(state, up, constant(1u), constant(0u)));
+    const auto exponent = EmitBinaryU32(state, spv::OpShiftLeftLogical, EmitBinaryU32(state, spv::OpISub, constant(25u), shift), constant(10u));
+    const auto half = EmitSelectValueU32(state, zero, constant(0u), EmitBinaryU32(state, spv::OpISub, EmitAddU32(state, exponent, rounded), constant(1024u)));
+    const auto norm = EmitOrU32(state, EmitSelectValueU32(state, snorm, sign, constant(0u)), half);
+    // Scaled: the integer (the magnitude, signed) as a half.
+    const auto sscaledType = isType(SpirvFormatComponentType::Sscaled);
+    const auto scaledHalf = EmitOrU32(state, EmitSelectValueU32(state, sscaledType, sign, constant(0u)), IntegerToF16Bits(state, EmitSelectValueU32(state, sscaledType, magnitude, raw)));
+    // Float: 16 bits as they are, else the f32 value rounded toward zero to a half.
+    const auto floatOther = F32BitsToSmallFloatRtz(state, FloatComponentToF32BitsRuntime(state, bits, raw, false), 10u, true);
+    const auto floatValue = EmitSelectValueU32(state, EmitCompareU32Constant(state, spv::OpIEqual, bits, 16u), EmitAndConstant(state, raw, 0xffffu), floatOther);
+    auto result = integer;
+    result = EmitSelectValueU32(state, EmitLogicalOrBool(state, snorm, isType(SpirvFormatComponentType::Unorm)), norm, result);
+    result = EmitSelectValueU32(state, EmitLogicalOrBool(state, sscaledType, isType(SpirvFormatComponentType::Uscaled)), scaledHalf, result);
+    result = EmitSelectValueU32(state, isType(SpirvFormatComponentType::Float), floatValue, result);
+    return result;
 }
 
 std::uint32_t EmitD16FormatComponent(SpirvEmitterState& state, const SpirvBufferFormatInfo& info, std::uint32_t component, std::uint32_t raw) {

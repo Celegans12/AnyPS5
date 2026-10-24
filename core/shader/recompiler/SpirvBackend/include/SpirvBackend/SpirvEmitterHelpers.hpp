@@ -134,7 +134,13 @@ std::uint32_t EmitTBufferBitcastU32ToI32(SpirvEmitterState& state, std::uint32_t
 bool IsSignedFormatComponent(SpirvFormatComponentType type);
 std::uint32_t EmitUFloatToF32Bits(SpirvEmitterState& state, std::uint32_t raw, std::uint32_t bits);
 std::uint32_t NormalizeFormatComponent(SpirvEmitterState& state, const SpirvBufferFormatInfo& info, std::uint32_t component, std::uint32_t raw);
+// NormalizeFormatComponent with the component's type (SpirvFormatComponentType) and bit width as SPIR-V u32 values
+// instead of constants: one straight-line conversion for whatever format a runtime descriptor names, with the same
+// results for every (type, width) a buffer format uses.
+std::uint32_t NormalizeFormatComponentRuntime(SpirvEmitterState& state, std::uint32_t type, std::uint32_t bits, std::uint32_t raw);
 std::uint32_t EmitD16FormatComponent(SpirvEmitterState& state, const SpirvBufferFormatInfo& info, std::uint32_t component, std::uint32_t raw);
+// EmitD16FormatComponent with the component's type and bit width as SPIR-V u32 values (see NormalizeFormatComponentRuntime).
+std::uint32_t EmitD16FormatComponentRuntime(SpirvEmitterState& state, std::uint32_t type, std::uint32_t bits, std::uint32_t raw);
 std::uint32_t EmitFormatStoreComponent(SpirvEmitterState& state, const SpirvBufferFormatInfo& info, std::uint32_t component, std::uint32_t data);
 std::uint32_t EmitD16StoreComponent(SpirvEmitterState& state, const SpirvBufferFormatInfo& info, std::uint32_t component, std::uint32_t half);
 void EmitDeviceAtomicMemoryBarrier(SpirvEmitterState& state);

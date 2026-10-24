@@ -8,6 +8,7 @@
 #include "RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
 #include <algorithm>
+#include <cstdlib>
 #include <array>
 #include <cstring>
 #include <type_traits>
@@ -686,6 +687,12 @@ std::uint32_t genericFormattedLoad(SpirvValueEmitContext& context, const IrValue
             const auto signedField = state.module.AllocateId();
             state.module.AddFunction(spv::OpBitFieldSExtract, TypeI32(state), signedField, Unary(state, spv::OpBitcast, TypeI32(state), raw), bitOffset, bits[component]);
             const auto extracted = Select(state, u32, equal(state, bits[component], constant(32u)), raw, Select(state, u32, signedType, Unary(state, spv::OpBitcast, u32, signedField), unsignedField));
+            // One straight-line conversion from the format table's type and width instead of a switch over every
+            // (type, width) pair the formats use: the switch was ~3/4 of a runtime-format load (~660 SPIR-V instructions a
+            // component), and the driver inlines the load helper at every call (0x80002a9000: 112 calls, 1.81M GPU
+            // instructions). APS5_NO_COMPACT_FORMAT_CONVERT=1 switches for every load.
+            static const bool compact = std::getenv("APS5_NO_COMPACT_FORMAT_CONVERT") == nullptr;
+            if (compact) return memory.d16 ? EmitD16FormatComponentRuntime(state, type, bits[component], extracted) : NormalizeFormatComponentRuntime(state, type, bits[component], extracted);
             std::vector<std::pair<SpirvFormatComponentType, std::uint32_t>> conversions;
             std::vector<std::vector<std::uint32_t>> cases;
             for (std::uint32_t index = 1; index <= formats; ++index) {
