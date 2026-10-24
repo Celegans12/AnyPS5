@@ -13,6 +13,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ImageSlabs.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RangeIndex.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 // For the declaration of PendingStorageOverlaps, defined below.
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
@@ -233,6 +234,11 @@ bool LayerTrackingEnabled() {
 bool BlockTrackingEnabled() {
     static const bool disabled = std::getenv("APS5_NO_BLOCK_TRACKING") != nullptr;
     return !disabled;
+}
+
+bool BlockWriteBackEach() {
+    static const bool each = std::getenv("APS5_BLOCK_WRITEBACK_EACH") != nullptr || std::getenv("APS5_BLOCK_WRITEBACK_WIDEN") == nullptr;
+    return each;
 }
 
 struct PhaseTimer {
@@ -1673,15 +1679,25 @@ public:
     void push_back(StorageTexture* texture) {
         textures.push_back(texture);
         changed();
+        // The index is kept whatever APS5_NO_REFRESH_LOOKUP_CACHE says, so the A/B can flip it.
+        index.Insert(texture, texture->Descriptor().baseAddress, texture->Descriptor().baseAddress + texture->GuestBytes());
     }
     iterator erase(iterator it) {
+        index.Remove(*it, (*it)->Descriptor().baseAddress);
         const auto next = textures.erase(it);
         changed();
         return next;
     }
     void remove(const StorageTexture* texture) {
-        if (std::erase(textures, texture) != 0) changed();
+        if (std::erase(textures, texture) != 0) {
+            changed();
+            index.Remove(const_cast<StorageTexture*>(texture), texture->Descriptor().baseAddress, true);
+        }
     }
+    template <class Visit>
+    bool Overlapping(std::uint64_t address, std::uint64_t bytes, Visit&& visit) { return index.Overlapping(address, bytes, visit); }
+    template <class Visit>
+    bool StartingAt(std::uint64_t address, Visit&& visit) const { return index.StartingAt(address, visit); }
     bool MayOverlap(std::uint64_t address, std::size_t bytes) {
         if (indexed != version) rebuild();
         return !textures.empty() && Overlaps(ranges, address, bytes);
@@ -1723,6 +1739,7 @@ private:
         published.store(std::make_shared<const Snapshot>(Snapshot{version, ranges}), std::memory_order_release);
     }
     std::vector<StorageTexture*> textures;
+    RangeIndex<StorageTexture*> index;
     Ranges ranges;
     std::uint64_t version = 0;
     std::uint64_t indexed = ~std::uint64_t{0};
@@ -2267,9 +2284,11 @@ LookupOutcomes& ThreadLookupOutcomes() {
 bool StorageTexture::Refresh() {
     const bool profile = LookupOutcomes::Profiled();
     auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    // Read once per Refresh (a runtime switch): index, quick path and host-import cache together.
+    const bool lookups = !RuntimeSwitches::Set(RuntimeSwitch::NoRefreshLookupCache);
     CompletePendingCpuWrites(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     if (descriptor.dccAddress != 0) CompletePendingCpuWrites(context, descriptor.dccAddress, DccKeyBytes(guestBytes));
-    if (refreshProved()) {
+    if (refreshProved(lookups)) {
         NoteProved();
         refreshesProved.fetch_add(1, std::memory_order_relaxed);
         if (profile) LookupOutcomes::Add(LookupOutcomes::RefreshProved, start);
@@ -2291,7 +2310,7 @@ bool StorageTexture::Refresh() {
     // generation, no results of this image's own there) or dead to its own write-back (tracked and
     // stamped); an untracked unit is stored whole by that write-back, and a unit pending in both
     // images takes the old order (store, then this image re-uploads it).
-    auto alias = pendingAlias();
+    auto alias = pendingAlias(lookups);
     if (alias != nullptr && !(ProvedClearKeys(descriptor, guestBytes, keyProof) == DccKeys::Uncompressed && HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) != nullptr)) alias = nullptr;
     if (alias != nullptr) {
         std::vector<std::uint8_t> aliasStamped(trackedLayers);
@@ -2315,7 +2334,7 @@ bool StorageTexture::Refresh() {
     // since `generation` need no comparison.
     const auto current = GuestMemory::CollectWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     // Per tracked layer: changed since its generation (a keys change makes every layer stale).
-    std::vector<bool> changed(trackedLayers, false);
+    std::vector<bool> changed;
     // Per 64 KiB block of the surface (blockGenerations): stamped since its layer's generation, and
     // by a CPU store; scanned once when anything changed.
     std::vector<std::uint64_t> generations;
@@ -2356,6 +2375,9 @@ bool StorageTexture::Refresh() {
         const auto keysStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         keys = handOverKeys.has_value() ? *handOverKeys : ProvedKeys();
         if (profile && descriptor.dccAddress != 0) LookupOutcomes::Add(LookupOutcomes::DccScan, keysStart);
+        const bool quickCandidate = lookups && alias == nullptr && keys == uploadedKeys && blockUnits;
+        const bool quick = quickCandidate && GuestMemory::UnchangedSince(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), generation);
+        if (!quick) changed.assign(trackedLayers, false);
         if (keys != uploadedKeys) {
             changed.assign(trackedLayers, true);
             unchanged = false;
@@ -2363,7 +2385,7 @@ bool StorageTexture::Refresh() {
             // Which units the CPU stamped still decides what the drop rule below may drop.
             if (blockUnits) scanBlocks();
         } else if (blockUnits) {
-            if (!GuestMemory::UnchangedSince(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), generation)) {
+            if (quickCandidate ? !quick : !GuestMemory::UnchangedSince(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), generation)) {
                 // One stamp scan for every unit (each is one stamp block); the unchanged units move
                 // to the current generation, so the whole-surface check answers next time.
                 scanBlocks();
@@ -2402,7 +2424,7 @@ bool StorageTexture::Refresh() {
         // the same bytes read differently, and a changed unit holding pending results must take
         // the drop rule below (the image holds the results, `original` what the CPU wrote back).
         bool pendingChanged = false;
-        for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
+        for (std::uint32_t layer = 0; !quick && layer < trackedLayers; ++layer) {
             if (changed[layer] && layerPending[layer]) pendingChanged = true;
         }
         if (!unchanged && !keysChanged && !pendingChanged && originalHolds(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) && equalsOriginal()) {
@@ -2411,7 +2433,7 @@ bool StorageTexture::Refresh() {
         }
         // Only the direct path uploads the selected layers alone (see upload); the others replace
         // the whole image, so every pending layer's results are stored first.
-        direct = keys == DccKeys::Uncompressed && HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) != nullptr;
+        direct = keys == DccKeys::Uncompressed && (lookups ? HostImportForCached(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes), importLookup) : HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) != nullptr;
         if (alias != nullptr && direct) {
             // The alias's pending units that nothing stamped since its generation (a CPU store or a
             // driver store there wins over its results, as at its own write-back) are taken from
@@ -2439,7 +2461,7 @@ bool StorageTexture::Refresh() {
         ++Profile().storageReused;
         layerGeneration.assign(trackedLayers, current);
         refreshGeneration();
-        takeRefreshProof(alias != nullptr);
+        takeRefreshProof(alias != nullptr, lookups);
         if (profile) LookupOutcomes::Add(stamped ? LookupOutcomes::RefreshUnchanged : LookupOutcomes::RefreshCompared, start);
         return true;
     }
@@ -2559,14 +2581,15 @@ std::uint64_t StorageTexture::SlabRetiles() {
     return slabRetiles.load(std::memory_order_relaxed);
 }
 
-bool StorageTexture::otherPendingOverlaps() const {
+bool StorageTexture::otherPendingOverlaps(bool indexed) const {
     auto& pending = Pending();
     std::lock_guard lock(pending.mutex);
     const auto other = [&](const StorageTexture* texture) { return texture != this && texture->overlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)); };
-    return std::any_of(pending.textures.begin(), pending.textures.end(), other) || std::any_of(pending.flushing.begin(), pending.flushing.end(), other);
+    const bool pendingOverlap = indexed ? pending.textures.Overlapping(descriptor.baseAddress, guestBytes, [&](StorageTexture* texture) { return texture != this; }) : std::any_of(pending.textures.begin(), pending.textures.end(), other);
+    return pendingOverlap || std::any_of(pending.flushing.begin(), pending.flushing.end(), other);
 }
 
-bool StorageTexture::refreshProved() {
+bool StorageTexture::refreshProved(bool indexed) {
     if (refreshProof.generation == 0) return false;
     if (generation != refreshProof.generation || uploadedKeys != refreshProof.keys || !GuestMemory::GpuMutex().HeldByThisThread()) return false;
     const auto bytes = static_cast<std::size_t>(guestBytes);
@@ -2583,18 +2606,18 @@ bool StorageTexture::refreshProved() {
     if (!GuestMemory::UnchangedSinceAll(std::span(queries.data(), used))) return false;
     const auto serial = PendingSerial();
     if (serial != refreshProof.pendingSerial) {
-        if (otherPendingOverlaps()) return false;
+        if (otherPendingOverlaps(indexed)) return false;
         refreshProof.pendingSerial = serial;
     }
     return true;
 }
 
-void StorageTexture::takeRefreshProof(bool aliased) {
+void StorageTexture::takeRefreshProof(bool aliased, bool indexed) {
     refreshProof = {};
     if (aliased || generation == 0 || !GuestMemory::GpuMutex().HeldByThisThread()) return;
     if (descriptor.dccAddress != 0 && (keyProof.generation == 0 || keyProof.keys != uploadedKeys)) return;
     const auto serial = PendingSerial();
-    if (otherPendingOverlaps()) return;
+    if (otherPendingOverlaps(indexed)) return;
     refreshProof = {generation, serial, keyProof.generation, uploadedKeys};
 }
 
@@ -3979,6 +4002,31 @@ void StorageTexture::Flush() {
     flushReason = previous;
 }
 
+void StorageTexture::appendStoredLayers(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) const {
+    constexpr std::uint64_t block = 65536;
+    constexpr std::size_t runs = 8;
+    const auto start = ranges.size();
+    const bool all = (descriptor.dccAddress != 0 && (uploadedKeys != DccKeys::Uncompressed || descriptor.mipCount > 1)) || (blockUnits && !BlockWriteBackEach());
+    for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
+        if (!layerPending[layer]) continue;
+        const auto begin = layerBegin(layer);
+        const auto end = begin + layerBytes(layer);
+        if (!all && !(address < end && begin < address + bytes)) continue;
+        const auto first = begin / block * block;
+        const auto last = (end + block - 1) / block * block;
+        if (ranges.size() > start && ranges.back().first <= first && first <= ranges.back().second) ranges.back().second = std::max(ranges.back().second, last);
+        else ranges.emplace_back(first, last);
+    }
+    if (ranges.size() - start <= runs) return;
+    auto hull = ranges[start];
+    for (auto index = start + 1; index < ranges.size(); ++index) {
+        hull.first = std::min(hull.first, ranges[index].first);
+        hull.second = std::max(hull.second, ranges[index].second);
+    }
+    ranges.resize(start);
+    ranges.push_back(hull);
+}
+
 // Whether a pending unit of the image lies inside the range (writeBack's own selection): an image
 // listed by FlushPending without one stored nothing and only cost the GPU mutex.
 bool StorageTexture::pendingUnitInside(std::uint64_t address, std::size_t bytes) const {
@@ -4105,14 +4153,42 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         deferWriter = std::all_of(flush.begin(), flush.end(), [deferImported](const std::shared_ptr<StorageTexture>& texture) { return (texture->blockUnits || deferImported) && HostImportFor(texture->context, texture->descriptor.baseAddress, static_cast<std::size_t>(texture->guestBytes)) != nullptr; });
         if (deferWriter) (flipStore ? deferredFlipStores : deferredRefreshFlushes).fetch_add(1, std::memory_order_relaxed);
     }
-    if (auto* recorder = Recorder::Active(); !deferWriter && recorder != nullptr && !Recorder::InCompletion() && recorder->PendingWriterSerial(address, bytes) != 0) {
+    if (auto* recorder = Recorder::Active(); !deferWriter && recorder != nullptr && !Recorder::InCompletion()) {
         try {
-            recorder->Reap();
-            if (const auto writer = recorder->PendingWriterSerial(address, bytes); writer == recorder->OpenSerial()) {
-                Recorder::CountSync(recorder->OpenWriteOverlaps(address, bytes) ? 1 : 3);
-                recorder->Sync();
-            } else if (writer != 0) {
-                recorder->FinishUpTo(writer);
+            const bool wholeRange = RuntimeSwitches::Set(RuntimeSwitch::FlushWaitWholeRange);
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> stored;
+            if (wholeRange) stored.emplace_back(address, address + bytes);
+            else {
+                for (const auto& texture : flush) texture->appendStoredLayers(address, bytes, stored);
+            }
+            const bool publishes = !wholeRange && scope != PublishScope::None;
+            const auto pendingWriter = [&](const Recorder& active) {
+                constexpr std::uint64_t block = 65536;
+                std::uint64_t writer = 0;
+                if (publishes) {
+                    constexpr auto top = std::numeric_limits<std::uint64_t>::max();
+                    const auto first = address / block * block;
+                    const auto end = bytes > top - address ? top : address + bytes;
+                    const auto last = end > top - block ? end : (end + block - 1) / block * block;
+                    writer = active.PendingLeaseSerial(first, static_cast<std::size_t>(last - first));
+                }
+                for (const auto& [begin, end] : stored) {
+                    if (writer == active.OpenSerial()) break;
+                    writer = std::max(writer, active.PendingWriterSerial(begin, static_cast<std::size_t>(end - begin)));
+                }
+                return writer;
+            };
+            const auto openWrites = [&stored](const Recorder& active) {
+                return std::any_of(stored.begin(), stored.end(), [&active](const auto& range) { return active.OpenWriteOverlaps(range.first, static_cast<std::size_t>(range.second - range.first)); });
+            };
+            if (pendingWriter(*recorder) != 0) {
+                recorder->Reap();
+                if (const auto writer = pendingWriter(*recorder); writer == recorder->OpenSerial()) {
+                    Recorder::CountSync(openWrites(*recorder) ? 1 : 3);
+                    recorder->Sync();
+                } else if (writer != 0) {
+                    recorder->FinishUpTo(writer);
+                }
             }
         } catch (...) {
             for (const auto& texture : flush) texture->reconcilePending();
@@ -5433,16 +5509,24 @@ void StorageTexture::supersedeHandedOver(std::uint32_t first, std::uint32_t coun
     if (std::none_of(handedUnits.begin(), handedUnits.end(), [](bool handed) { return handed; })) handedUnits.clear();
 }
 
-std::shared_ptr<StorageTexture> StorageTexture::pendingAlias() const {
+std::shared_ptr<StorageTexture> StorageTexture::pendingAlias(bool indexed) const {
     static const bool disabled = std::getenv("APS5_NO_ALIAS_BORROW") != nullptr;
     if (disabled || !blockUnits) return nullptr;
     std::vector<std::shared_ptr<StorageTexture>> candidates;
     {
         auto& pending = Pending();
         std::lock_guard lock(pending.mutex);
-        for (auto* texture : pending.textures) {
-            if (texture == this || texture->descriptor.baseAddress != descriptor.baseAddress || texture->guestBytes != guestBytes || !texture->blockUnits) continue;
+        const auto consider = [&](StorageTexture* texture) {
+            if (texture == this || texture->descriptor.baseAddress != descriptor.baseAddress || texture->guestBytes != guestBytes || !texture->blockUnits) return;
             if (auto alive = texture->weak_from_this().lock()) candidates.push_back(std::move(alive));
+        };
+        if (indexed) {
+            pending.textures.StartingAt(descriptor.baseAddress, [&](StorageTexture* texture) {
+                consider(texture);
+                return false;
+            });
+        } else {
+            for (auto* texture : pending.textures) consider(texture);
         }
     }
     for (const auto& candidate : candidates) {
@@ -5541,7 +5625,7 @@ void StorageTexture::writeBack(std::uint64_t address, std::size_t bytes) {
     // widening them stored whole images again (movie stage: 39 vs 35 ms of GPU per present, 188 vs
     // 214 presents per 10 s); APS5_BLOCK_WRITEBACK_WIDEN=1 enables the widening, and
     // APS5_BLOCK_WRITEBACK_EACH=1 stores the touched units only, every time.
-    static const bool each = std::getenv("APS5_BLOCK_WRITEBACK_EACH") != nullptr || std::getenv("APS5_BLOCK_WRITEBACK_WIDEN") == nullptr;
+    const bool each = BlockWriteBackEach();
     static const std::uint32_t pieces = [] { const char* text = std::getenv("APS5_BLOCK_WRITEBACK_PIECES"); return text != nullptr ? static_cast<std::uint32_t>(std::strtoul(text, nullptr, 10)) : 4u; }();
     static const std::uint64_t window = [] { const char* text = std::getenv("APS5_BLOCK_WRITEBACK_FRAMES"); return text != nullptr ? std::strtoull(text, nullptr, 10) : 8ull; }();
     std::vector<bool> layers(trackedLayers, false);

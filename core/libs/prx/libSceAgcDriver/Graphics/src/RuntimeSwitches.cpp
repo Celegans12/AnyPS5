@@ -60,6 +60,8 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_NO_LARGER_SMALL_POOLS",
     "APS5_DEFER_FLIP_STORE",
     "APS5_NO_DEFER_IMPORTED_STORES",
+    "APS5_FLUSH_WAIT_WHOLE_RANGE",
+    "APS5_NO_REFRESH_LOOKUP_CACHE",
 };
 
 struct Refusal {
