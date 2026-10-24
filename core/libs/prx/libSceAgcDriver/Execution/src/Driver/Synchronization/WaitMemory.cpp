@@ -325,6 +325,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
 
     if (entryTryFailed && pollService(false)) return;
 
+    noteWaitFields(queue, packet);
     noteWaitBlocked(queue, awaited, true);
     struct BlockedWait {
         Driver& driver;

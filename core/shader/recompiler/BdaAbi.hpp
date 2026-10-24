@@ -79,7 +79,7 @@ inline bool RangesOrdered(const Range* ranges, std::size_t count) {
 }
 
 enum class FaultState : std::uint32_t { Empty, Writing, Ready };
-enum class FaultReason : std::uint32_t { Unmapped = 1, Permission, Overflow, InvalidTable, InvalidRectangle, LoopLimit, Unaligned, InvalidDescriptor, ImageTable, UnlinkedCall, UnnormalizedWrap = 11, DirectImage = 12, BindlessMiss = 13, BindlessRefused = 14 };
+enum class FaultReason : std::uint32_t { Unmapped = 1, Permission, Overflow, InvalidTable, InvalidRectangle, LoopLimit, Unaligned, InvalidDescriptor, ImageTable, UnlinkedCall, WindowLaneSpill = 11, UnnormalizedWrap = 12, DirectImage = 13, BindlessMiss = 14, BindlessRefused = 15 };
 
 inline constexpr std::uint32_t DirectImageDimension = 1u;
 

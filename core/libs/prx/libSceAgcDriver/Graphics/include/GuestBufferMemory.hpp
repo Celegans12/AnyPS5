@@ -131,7 +131,9 @@ void SetHostImportDeferredSettles(bool enabled);
 // The larger of 6 GiB and half the physical memory, at most the largest host heap less the larger of 2 GiB and half
 // that heap: the other half stays for the buffers, mirrors and textures that share it.
 std::uint64_t HostImportBudget(const VkPhysicalDeviceMemoryProperties& memory, std::uint64_t physicalBytes, bool halfHeapReserve = true);
+void SetHostImportMaxBytes(std::uint64_t bytes);
 std::uint64_t HostImportLiveBytes();
+std::uint64_t HostImportBudgetRemaining(const Context& context);
 struct HostImportSettleCounts {
     std::uint64_t submitted = 0;
     std::uint64_t waited = 0;
@@ -287,6 +289,11 @@ struct MirrorStats {
 };
 MirrorStats MirrorCounters();
 std::uint64_t SnapshotMismatches();
+struct HeapMirrorHold {
+    std::uint64_t mirrors = 0;
+    std::uint64_t bytes = 0;
+};
+HeapMirrorHold HeapMirrorsWithin(std::uint64_t begin, std::uint64_t end);
 void ClearSnapshotCopies(VkDevice device);
 std::vector<std::uint64_t> AddressTableKey(std::span<const std::pair<std::uint64_t, std::uint64_t>> writes, std::span<const ShaderRecompiler::BdaAbi::Range> own);
 void ClearImageMirrors(VkDevice device);
@@ -558,9 +565,9 @@ private:
     // APS5_GPU_COPY_MAX_KIB allows, and APS5_CPU_COPIES unset.
     bool gpuCopyEligible(const Region& region) const;
     // Whether a region inside a host import is staged in device memory instead of bound in place
-    // (see GuestBufferMemory.cpp): staging allowed, not address-based, a written element inside,
-    // and an atomic element or a size within the written-shadow window. Independent of the import,
-    // so UploadPrepare and UploadFinish decide alike.
+    // (see GuestBufferMemory.cpp): staging allowed, not address-based unless an overlay region, a
+    // written element inside, and an atomic element or a size within the written-shadow window.
+    // Independent of the import, so UploadPrepare and UploadFinish decide alike.
     bool stagingEligible(const Region& region, bool addressable) const;
     // Whether a written descriptor range inside the space's base region `inside` becomes an
     // overlay region (Region::overlay), and the UploadPrepare pass that keeps only the overlay
@@ -601,11 +608,13 @@ private:
     std::vector<std::pair<std::uint64_t, std::vector<std::byte>>> heapReferences;
     std::vector<SnapshotUse> snapshotUses;
     std::uint64_t suspendedSpace = 0;
+    std::vector<std::pair<std::uint64_t, std::shared_ptr<Buffer>>> heapReadbacks;
     // UploadPrepare ran (regions are frozen); `uploaded` once UploadFinish ran.
     bool prepared = false;
     bool uploaded = false;
     bool deferHostCopies = false;
     bool committed = false;
+    mutable std::uint64_t directWritesGeneration = 0;
 };
 
 }

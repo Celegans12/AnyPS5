@@ -47,7 +47,12 @@ void noteAccess(const void* pointer, std::size_t bytes) {
 }
 
 constexpr std::uintptr_t GuestArenaOffset = GuestArena::GuestAddressOffset;
-constexpr std::uintptr_t ArenaStart = 0x0000000200000000ull + GuestArenaOffset;
+constexpr std::uintptr_t DefaultAllocationStart = 0x0000000200000000ull + GuestArenaOffset;
+#ifdef __APPLE__
+constexpr std::uintptr_t ArenaStart = DefaultAllocationStart;
+#else
+constexpr std::uintptr_t ArenaStart = GuestArenaOffset == 0 ? 0x10000ull : DefaultAllocationStart;
+#endif
 constexpr std::uintptr_t SystemReservedStart = 0x00000007FFFFC000ull + GuestArenaOffset;
 constexpr std::uintptr_t SystemReservedEnd = 0x0000001000000000ull + GuestArenaOffset;
 constexpr std::uintptr_t ApplicationAreaEnd = 0x000000FC00000000ull + GuestArenaOffset;
@@ -87,7 +92,7 @@ public:
         RequireAllocatable(alignment);
         std::lock_guard lock(_lock);
         auto candidate = hint < _end ? FindAtOrAbove(hint, bytes, alignment) : 0;
-        if (candidate == 0 && hint > _base) candidate = FindAtOrAbove(_base, bytes, alignment);
+        if (candidate == 0 && hint > _base) candidate = FindAtOrAbove(hint < DefaultAllocationStart ? _base : DefaultAllocationStart, bytes, alignment);
         return Claim(candidate, bytes);
     }
 
@@ -274,6 +279,10 @@ private:
             const int failed = ReserveNoReplace(cursor, end - cursor);
             if (failed == 0) continue;
             if (failed != EEXIST) {
+                if (cursor < DefaultAllocationStart && (failed == EACCES || failed == EPERM)) {
+                    occupied.emplace_back(cursor, end);
+                    continue;
+                }
                 char message[128];
                 std::snprintf(message, sizeof(message), "guest arena: cannot reserve 0x%llx+0x%llx",
                     static_cast<unsigned long long>(cursor), static_cast<unsigned long long>(end - cursor));
@@ -310,7 +319,7 @@ private:
     }
 
     std::uintptr_t FindAtOrAbove(std::uintptr_t hint, std::size_t bytes, std::size_t alignment) const {
-        std::uintptr_t candidate = alignUp(std::max(_base, hint), alignment);
+        std::uintptr_t candidate = alignUp(hint == 0 ? DefaultAllocationStart : std::max(_base, hint), alignment);
         auto it = _used.upper_bound(candidate);
         if (it != _used.begin() && std::prev(it)->second > candidate) --it;
         for (; it != _used.end(); ++it) {
@@ -520,6 +529,10 @@ void GuestArenaSavedMemory_nid_postfix(std::uint64_t* bytes, std::uint64_t* bloc
     *bytes = saved;
     *blocks = count;
 }
+
+bool GuestArenaForgetReusableSection_nid_no_patch(void* section) {
+    return WindowsMappings::Get().ForgetSection(section);
+}
 #endif
 
 #if defined(__linux__) || defined(__APPLE__)
@@ -601,6 +614,16 @@ bool GuestArenaBeginHostWrite_nid_postfix(void* pointer, std::size_t bytes) {
     return true;
 #endif
 }
+
+#ifdef _WIN32
+bool GuestArenaBeginHostImport_nid_no_patch(void* pointer, std::size_t bytes) {
+    return WindowsMappings::Get().BeginHostWrite(reinterpret_cast<std::uintptr_t>(pointer), bytes, false);
+}
+
+void GuestArenaEndHostImport_nid_no_patch(void* pointer, std::size_t bytes) {
+    WindowsMappings::Get().EndHostWrite(reinterpret_cast<std::uintptr_t>(pointer), bytes, false);
+}
+#endif
 
 void GuestArenaEndHostWrite_nid_postfix(void* pointer, std::size_t bytes) {
 #ifdef _WIN32

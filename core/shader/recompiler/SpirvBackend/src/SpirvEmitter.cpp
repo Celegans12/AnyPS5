@@ -292,12 +292,20 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
     state.singleWorkgroup = target.singleWorkgroup && program.Resources().stage == IrShaderStage::Compute;
     state.robustBufferAccess2 = target.robustBufferAccess2;
     state.float32FlushToZero = target.float32FlushToZero;
+    state.waveLdsMemoryBarriers = target.waveLdsMemoryBarriers;
     state.float32DenormPreserve = target.float32DenormPreserve;
+    state.fusedExactArithmetic = target.fusedExactArithmetic;
+    state.deviceScopeLdsMemoryBarriers = target.deviceScopeLdsMemoryBarriers;
     state.hostSubgroupSize = target.subgroupSize;
     state.bindlessImages = target.bindlessImages && ResourceMaterializer::UsesBindlessImages(program.Info(), program.Resources().stage);
     const auto supports = [&](spv::Capability capability) { return std::ranges::find(target.supportedCapabilities, static_cast<std::uint32_t>(capability)) != target.supportedCapabilities.end(); };
     state.bindlessWaveUniform = state.bindlessImages && program.Resources().stage == IrShaderStage::Compute && !HostSubgroupSingleLane(state) && supports(spv::CapabilityGroupNonUniformBallot);
     state.bindlessQuadUniform = state.bindlessImages && program.Resources().stage == IrShaderStage::Pixel && !HostSubgroupSingleLane(state) && supports(spv::CapabilityGroupNonUniformQuad);
+    if (target.largePixelFunctionLdsBuffer && program.Resources().stage == IrShaderStage::Pixel && state.requirements.functionLds && state.requirements.functionLdsDwords > target.pixelFunctionStorageDwords) {
+        state.pixelFunctionLdsBuffer = true;
+        state.requirements.subgroupLocalInvocationId = true;
+        state.requirements.subgroupBallot = true;
+    }
     if (state.requirements.ldsLock && LdsInDeviceMemory(state) && std::find(target.supportedCapabilities.begin(), target.supportedCapabilities.end(), static_cast<std::uint32_t>(spv::CapabilityInt64Atomics)) != target.supportedCapabilities.end()) {
         state.requirements.ldsLock = false;
         state.requirements.ldsBufferInt64Atomics = true;
@@ -342,7 +350,10 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
     EmitModuleHeader(state, bindings);
     EmitProgram(state);
     state.module.EmitEntryPoint(ExecutionModelForStage(state.program.Resources().stage), state.mainFunc, "main", state.interfaceVariables);
-    if (info != nullptr) info->fullSubgroups = state.spannedWave;
+    if (info != nullptr) {
+        info->fullSubgroups = state.spannedWave;
+        info->functionLdsBuffer = state.pixelFunctionLdsBuffer;
+    }
     return state.module.Finalize();
 }
 

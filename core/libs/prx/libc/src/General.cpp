@@ -84,7 +84,19 @@ struct NameMatch {
     std::string name;
     std::optional<std::filesystem::path> path;
     bool ambiguous = false;
+    bool stem = false;
 };
+
+std::string_view NameStem(std::string_view name) {
+    const auto dot = name.rfind('.');
+    return dot == std::string_view::npos || dot == 0 ? name : name.substr(0, dot);
+}
+
+bool SameRelinkedStem(std::string_view filename, std::string_view name) {
+    constexpr std::string_view suffix = ".guest.prx";
+    if (filename.size() <= suffix.size() || !SameName(filename.substr(filename.size() - suffix.size()), suffix)) return false;
+    return SameName(NameStem(filename.substr(0, filename.size() - suffix.size())), NameStem(name));
+}
 
 #ifdef _WIN32
 bool CaseInsensitiveDirectoryWindows(const std::filesystem::path& directory) {
@@ -124,13 +136,21 @@ std::error_code MatchNamesWindows(const std::filesystem::path& directory, std::s
 
 std::error_code MatchNames(const std::filesystem::path& directory, std::span<NameMatch> names) {
 #ifdef _WIN32
-    if (CaseInsensitiveDirectoryWindows(directory)) return MatchNamesWindows(directory, names);
+    bool stem = false;
+    for (const auto& name : names) stem = stem || name.stem;
+    if (!stem && CaseInsensitiveDirectoryWindows(directory)) return MatchNamesWindows(directory, names);
 #endif
     std::error_code error;
     std::filesystem::directory_iterator entry(directory, error), end;
     for (; !error && entry != end; entry.increment(error)) {
         const auto filename = entry->path().filename().string();
         for (auto& name : names) {
+            if (name.stem) {
+                std::error_code status;
+                if (!SameRelinkedStem(filename, name.name) || !entry->is_regular_file(status) || status) continue;
+                if (!name.path || filename.size() < name.path->filename().string().size()) name.path = entry->path();
+                continue;
+            }
             if (!SameName(filename, name.name)) continue;
             name.ambiguous = name.ambiguous || name.path.has_value();
             name.path = entry->path();
@@ -235,13 +255,11 @@ std::optional<std::filesystem::path> ResolveAlias(const std::string& guestPath, 
             const auto result = std::filesystem::path(host).make_preferred();
             return module ? PathOrRelinkedModule(result) : result;
         }
-#ifndef _WIN32
         if (guestPath.back() == '/') {
-            auto result = ResolveHostPath(host, SplitNames(std::string_view(relative).substr(prefix.size() + 1)));
+            auto result = ResolveHostPath(host, SplitNames(std::string_view(relative).substr(prefix.size() + 1))).make_preferred();
             result /= "";
             return module ? PathOrRelinkedModule(result) : result;
         }
-#endif
         return ResolveHostPath(host, SplitNames(std::string_view(relative).substr(prefix.size() + 1)), module).make_preferred();
     }
     return std::nullopt;
@@ -298,6 +316,14 @@ void RequireHostDirectory(WorkingDirectory& state, const std::vector<std::string
 #endif
     throw std::filesystem::filesystem_error("Guest path component is not a directory", host, error);
 }
+void RejectNonDirectory(const std::filesystem::path& host) {
+    auto target = host;
+    while (!target.has_filename() && target.has_relative_path()) target = target.parent_path();
+    std::error_code error;
+    const auto status = std::filesystem::status(target, error);
+    if (std::filesystem::exists(status) && !std::filesystem::is_directory(status))
+        throw std::filesystem::filesystem_error("Guest path with a trailing slash is not a directory", host, std::make_error_code(std::errc::not_a_directory));
+}
 std::vector<std::string> WithTrailingSeparator(std::vector<std::string> names, bool trailing) {
     if (trailing && !names.empty()) names.emplace_back();
     return names;
@@ -326,10 +352,12 @@ std::filesystem::path Resolve(WorkingDirectory& state, const char* path, bool mo
     if (text.empty() || text.front() != '/') text = state.current.lexically_relative(state.root).generic_string() + "/" + text;
     std::vector<std::string> names;
     bool trailing = true;
+    bool endsWithDot = false;
     const auto parts = SplitNames(text);
     for (std::size_t i = 0; i < parts.size(); ++i) {
         const auto& name = parts[i];
         if (name.empty() && i + 1 != parts.size()) continue;
+        if (!name.empty()) endsWithDot = name == ".";
         if (name == ".." && !names.empty()) {
             if (!(archived && AppArchiveHasDirectory_nid_no_patch(HostPath(state, names)))) RequireHostDirectory(state, WithTrailingSeparator(names, trailing));
             names.pop_back();
@@ -337,7 +365,11 @@ std::filesystem::path Resolve(WorkingDirectory& state, const char* path, bool mo
         trailing = name.empty() || name == "." || name == "..";
         if (!trailing) names.push_back(name);
     }
-    return HostPath(state, WithTrailingSeparator(std::move(names), trailing), module);
+    if (endsWithDot && !names.empty() && !(archived && AppArchiveHasDirectory_nid_no_patch(HostPath(state, names)))) RequireHostDirectory(state, names);
+    const bool directory = trailing && !names.empty();
+    auto resolved = HostPath(state, WithTrailingSeparator(std::move(names), trailing), module);
+    if (directory) RejectNonDirectory(resolved);
+    return resolved;
 }
 #ifdef _WIN32
 using WriteMark = FILETIME;
@@ -353,7 +385,11 @@ bool NotBefore(const WriteMark& time, const WriteMark& mark) {
 using WriteMark = timespec;
 WriteMark Now() {
     timespec now;
+#ifdef __APPLE__
+    clock_gettime(CLOCK_REALTIME, &now);
+#else
     clock_gettime(CLOCK_REALTIME_COARSE, &now);
+#endif
     return now;
 }
 bool NotBefore(const WriteMark& time, const WriteMark& mark) {
@@ -392,7 +428,11 @@ void FlushPath(const std::filesystem::path& path) {
 #else
 std::optional<WriteMark> WriteTime(const std::filesystem::path& path) {
     struct stat data;
+#ifdef __APPLE__
+    if (::stat(path.c_str(), &data) == 0) return data.st_mtimespec;
+#else
     if (::stat(path.c_str(), &data) == 0) return data.st_mtim;
+#endif
     if (errno == ENOENT || errno == ENOTDIR) return std::nullopt;
     throw std::system_error(errno, std::generic_category(), "Reading the write time of " + path.string());
 }
@@ -534,6 +574,36 @@ extern "C" std::FILE* HostStandardErrorFile_nid_no_patch() {
     if (std::FILE* kept = g_hostStandardErrorFile.load(std::memory_order_acquire)) return kept;
     return __acrt_iob_func(2);
 }
+
+namespace {
+std::mutex g_hostStandardStreamMutex;
+
+int keepHostStandardStream(int standard) {
+    auto& slot = standard == 1 ? g_hostStandardOutputFile : g_hostStandardErrorFile;
+    if (auto* stream = slot.load(std::memory_order_acquire)) return ::_fileno(stream);
+    const std::unique_ptr<std::FILE, decltype(&::_unlock_file)> unlock(__acrt_iob_func(standard), ::_unlock_file);
+    ::_lock_file(unlock.get());
+    const std::lock_guard lock(g_hostStandardStreamMutex);
+    if (auto* stream = slot.load(std::memory_order_acquire)) return ::_fileno(stream);
+    const int saved = DuplicateHostDescriptor_nid_no_patch(standard);
+    if (saved < 0) return -1;
+    if (!AdoptHostStandardStream_nid_no_patch(standard, saved)) {
+        const int error = errno;
+        ::_close(saved);
+        errno = error;
+        return -1;
+    }
+    return saved;
+}
+}
+
+extern "C" int KeepHostStandardError_nid_no_patch() {
+    return keepHostStandardStream(2);
+}
+
+extern "C" int KeepHostStandardOutput_nid_no_patch() {
+    return keepHostStandardStream(1);
+}
 #endif
 
 extern "C" void AddPathAlias_nid_no_patch(const char* guestPrefix, const char* hostPath) {
@@ -672,9 +742,10 @@ extern "C" std::filesystem::path RelinkedModulePath_nid_no_patch(const std::file
     const auto relinked = RelinkedModuleName(path);
     std::error_code error;
     if (std::filesystem::is_regular_file(relinked, error)) return relinked;
-    NameMatch names[] = {{relinked.filename().string()}};
+    NameMatch names[] = {{relinked.filename().string()}, {path.filename().string(), std::nullopt, false, true}};
     MatchNames(relinked.parent_path().empty() ? "." : relinked.parent_path(), names);
-    return MatchedModuleOrPath(path, relinked, names[0]);
+    if (names[0].ambiguous || names[0].path) return MatchedModuleOrPath(path, relinked, names[0]);
+    return names[1].path ? *names[1].path : path;
 }
 
 extern "C" int SetWorkingDirectory_nid_no_patch(const char* resolved) {
