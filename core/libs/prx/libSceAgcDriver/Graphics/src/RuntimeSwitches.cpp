@@ -62,6 +62,8 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_NO_DEFER_IMPORTED_STORES",
     "APS5_FLUSH_WAIT_WHOLE_RANGE",
     "APS5_NO_REFRESH_LOOKUP_CACHE",
+    "APS5_PIPELINE_DISPATCH",
+    "APS5_PIPELINE_DISPATCH_MISSES",
 };
 
 struct Refusal {

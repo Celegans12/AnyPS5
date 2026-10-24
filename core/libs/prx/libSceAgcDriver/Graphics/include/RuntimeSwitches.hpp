@@ -63,6 +63,8 @@ enum class RuntimeSwitch : std::size_t {
     NoDeferImportedStores,
     FlushWaitWholeRange,
     NoRefreshLookupCache,
+    PipelineDispatch,
+    PipelineDispatchMisses,
     Count,
 };
 

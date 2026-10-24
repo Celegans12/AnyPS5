@@ -14,6 +14,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
 #include <atomic>
@@ -42,20 +43,14 @@ bool DispatchUsesImages(const ShaderRecompiler::RecompileResult& compiled) {
     return false;
 }
 
+// APS5_PIPELINE_DISPATCH / APS5_PIPELINE_DISPATCH_MISSES are runtime switches (in-run A/B): set when the variable is
+// present (any value); a dispatch packet takes both once (Driver::dispatch, and the gate in PacketExecution).
 bool DispatchItemsEnabled() {
-    static const bool enabled = [] {
-        const char* text = std::getenv("APS5_PIPELINE_DISPATCH");
-        return text != nullptr && text[0] != '\0' && text[0] != '0';
-    }();
-    return enabled;
+    return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::PipelineDispatch);
 }
 
 bool DispatchMissItemsEnabled() {
-    static const bool enabled = [] {
-        const char* text = std::getenv("APS5_PIPELINE_DISPATCH_MISSES");
-        return DispatchItemsEnabled() && text != nullptr && text[0] != '\0' && text[0] != '0';
-    }();
-    return enabled;
+    return DispatchItemsEnabled() && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::PipelineDispatchMisses);
 }
 
 bool NoDispatchItems() {
@@ -136,6 +131,9 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
 
 void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments, bool forceFresh) {
     PerformanceTimer timing("Driver.Dispatch");
+    // Both switches once per attempt: an A/B flip (at a queue-0 present) never splits one.
+    const bool itemsOn = DispatchItemsEnabled();
+    const bool missItemsOn = itemsOn && DispatchMissItemsEnabled();
     const auto address = (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20c)) << 8u) | (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20d) & 0xffu) << 40u);
     if (address == SkippedShader() && address != 0) return;
     struct OriginScope {
@@ -220,7 +218,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
     if (indirectArguments == 0 && (packet[4] & 0x2u) != 0) {
         partialGroups = Pm4::PartialGroupThreads({packet[1], packet[2], packet[3]}, {readRegister(queue.shader, 0x207), readRegister(queue.shader, 0x208), readRegister(queue.shader, 0x209)});
     }
-    const bool pipelineCandidate = !resolving && !fromAhead && DispatchItemsEnabled() && DrawPipeline::Active() && indirectArguments == 0 && deferredLabels().labels.empty() && !matchesCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) && !MatchesStreamCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute);
+    const bool pipelineCandidate = !resolving && !fromAhead && itemsOn && DrawPipeline::Active() && indirectArguments == 0 && deferredLabels().labels.empty() && !matchesCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) && !MatchesStreamCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute);
     const bool partialLastGroup = partialGroups != std::array<std::uint32_t, 3>{};
     struct HtileMaskClear {
         std::uint64_t address = 0;
@@ -413,7 +411,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
                 for (const auto& variant : found->second->variants) appendEntryRegions(*variant, reads);
             }
         }
-        if (!entryFound && !noDispatchCache && !stampValidate() && DispatchMissItemsEnabled()) {
+        if (!entryFound && !noDispatchCache && !stampValidate() && missItemsOn) {
             readsClear = true;
         } else if (!entryFound || noDispatchCache || stampValidate()) {
             NoteItemFallback(ItemFallback::Miss);
@@ -455,7 +453,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
             itemWrites = DispatchWriteRanges(*compiledResult, bounded);
             pipelined = bounded && !NoDispatchItems();
             if (!bounded) NoteItemFallback(ItemFallback::Writes);
-        } else if (DispatchMissItemsEnabled() && !NoDispatchItems()) {
+        } else if (missItemsOn && !NoDispatchItems()) {
             missItem = true;
         } else {
             NoteItemFallback(ItemFallback::NoRecipe);
