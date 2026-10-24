@@ -13,7 +13,6 @@
 #include <cstring>
 #include <stdexcept>
 #include <string_view>
-#include <thread>
 #include <utility>
 
 namespace AgcDriver::Graphics {
@@ -860,33 +859,11 @@ void TextureService::checkMapping(Recorder& recorder) {
     retireNow(recorder);
 }
 
-void TextureService::drainPendingStale(Recorder& recorder, Lock& lock) {
-    while (!pendingStale.empty()) {
-        const auto key = *pendingStale.begin();
-        pendingStale.erase(pendingStale.begin());
-        ++totals.pendingDrained;
-        const auto found = pendingPrepared.find(key);
-        if (!entries.contains(key)) {
-            if (found != pendingPrepared.end()) pendingPrepared.erase(found);
-            continue;
-        }
-        ++totals.stale;
-        if (found == pendingPrepared.end()) {
-            replace(key, recorder, lock);
-            continue;
-        }
-        const auto item = std::move(found->second);
-        pendingPrepared.erase(found);
-        replace(key, recorder, lock, &item);
-    }
-}
-
 void TextureService::Serve(std::span<const std::uint64_t> served, Recorder& recorder) {
     Require(GuestMemory::GpuMutex().HeldByThisThread(), "the texture service publishes only under the GPU lock");
     const auto started = std::chrono::steady_clock::now();
     {
         Lock lock(mutex);
-        drainPendingStale(recorder, lock);
         const auto serial = recorder.OpenSerial();
         for (const auto id : served) {
             auto found = tables.find(id);
@@ -1001,44 +978,18 @@ void TextureService::Revalidate(Recorder& recorder) {
     }
     totals.revalidateCheckNanoseconds += Elapsed(checkStarted);
     timing.Mark("check");
-    // The present holds the GPU lock; replacing ~300 stale entries under it kept queue 0x20's frame-start
-    // work waiting ~30 ms a frame. With a yield, the lock is given up between replacements: the keys still
-    // to replace stay in pendingStale, and Serve replaces those first, so no table is served with an entry
-    // this revalidation found stale (the same entries reach consumers as when the lock is held throughout).
-    // Only at the outermost hold, so no caller's lock is given up. APS5_NO_PRESENT_YIELD=1 (runtime switch) off.
-    const bool yield = !RuntimeSwitches::Set(RuntimeSwitch::NoPresentYield) && GuestMemory::GpuMutex().DepthOnThisThread() == 1u;
-    if (yield) {
-        pendingStale.insert(stale.begin(), stale.end());
-        for (auto& [key, item] : prepared) {
-            if (pendingStale.contains(key)) pendingPrepared.insert_or_assign(key, std::move(item));
-        }
-        prepared.clear();
-    }
     for (const auto& key : stale) {
-        if (yield && pendingStale.erase(key) == 0u) continue;
-        if (!entries.contains(key)) {
-            if (yield) pendingPrepared.erase(key);
+        if (!entries.contains(key)) continue;
+        ++totals.stale;
+        const auto found = prepared.find(key);
+        if (found == prepared.end()) {
+            replace(key, recorder, lock);
             continue;
         }
-        ++totals.stale;
-        auto& source = yield ? pendingPrepared : prepared;
-        const auto found = source.find(key);
-        if (found == source.end()) {
-            replace(key, recorder, lock);
-        } else {
-            const auto item = std::move(found->second);
-            source.erase(found);
-            replace(key, recorder, lock, &item);
-        }
-        if (yield && !pendingStale.empty()) {
-            lock.unlock();
-            GuestMemory::GpuMutex().unlock();
-            std::this_thread::yield();
-            GuestMemory::GpuMutex().lock();
-            lock.lock();
-        }
+        const auto item = std::move(found->second);
+        prepared.erase(found);
+        replace(key, recorder, lock, &item);
     }
-    pendingPrepared.clear();
     timing.Mark("replace");
     totals.earlyDropped += prepared.size();
     const auto budget = currentBudget();
@@ -1149,8 +1100,8 @@ std::string TextureService::TakeFrameLine(std::uint64_t oldPathNanoseconds) {
         refusals += std::to_string(now.refusals[kind] - reported.refusals[kind]);
     }
     char text[2048];
-    std::snprintf(text, sizeof(text), "[bindless] frame %llu: misses %llu (%llu dropped), created %llu, refused %llu, primed %llu tables (%llu records, %llu new keys, primer %.1f ms), re-decoded %llu pages (%llu records changed), served-checked %llu (%llu stale), queue %llu, revalidated %llu (%llu stale, %llu per-use, %llu dcc), retired %llu (%llu unmapped, %llu evicted, %llu full), serve %.1f ms over %llu calls, present wait %.1f ms, entries %llu, slots %llu+%llu, pinned %.1f MiB of a %llu MiB budget, old-path resolve %.1f ms, refusals (%s), kept refusals %llu, host: tables %llu (%.1f MiB), entries %.1f MiB, rejections %llu (%.1f MiB), miss ring: %llu records, %llu set clears; revalidate %.1f ms under the GPU lock (collect %.1f, check %.1f, prepare %.1f, commit %.1f), publish %.1f ms, early prepare %.1f ms off the lock (%llu prepared, %llu used, %llu dropped), drained by a serve %llu",
-        static_cast<unsigned long long>(frame), delta(now.misses, reported.misses), static_cast<unsigned long long>(dropped), delta(now.created, reported.created), delta(now.refused, reported.refused), delta(now.primed, reported.primed), delta(now.primedRecords, reported.primedRecords), delta(now.primedKeys, reported.primedKeys), Milliseconds(now.primerNanoseconds - reported.primerNanoseconds), delta(now.pagesChanged, reported.pagesChanged), delta(now.recordsChanged, reported.recordsChanged), delta(now.servedChecked, reported.servedChecked), delta(now.servedStale, reported.servedStale), static_cast<unsigned long long>(now.queued), delta(now.revalidated, reported.revalidated), delta(now.stale, reported.stale), delta(now.refreshed, reported.refreshed), delta(now.dccRefreshed, reported.dccRefreshed), delta(now.retired, reported.retired), delta(now.unmapped, reported.unmapped), delta(now.evicted, reported.evicted), delta(now.fullEvictions, reported.fullEvictions), Milliseconds(now.serveNanoseconds - reported.serveNanoseconds), delta(now.serves, reported.serves), Milliseconds(now.presentWaitNanoseconds - reported.presentWaitNanoseconds), static_cast<unsigned long long>(now.entries), static_cast<unsigned long long>(now.imageSlots), static_cast<unsigned long long>(now.samplerSlots), static_cast<double>(now.pinnedBytes) / static_cast<double>(1u << 20u), static_cast<unsigned long long>(now.budgetBytes >> 20u), Milliseconds(oldPath), refusals.c_str(), delta(now.keptRefusals, reported.keptRefusals), static_cast<unsigned long long>(now.tables), static_cast<double>(now.tableHostBytes) / static_cast<double>(1u << 20u), static_cast<double>(now.entryHostBytes) / static_cast<double>(1u << 20u), static_cast<unsigned long long>(now.rejections), static_cast<double>(now.rejectionHostBytes) / static_cast<double>(1u << 20u), static_cast<unsigned long long>(records), static_cast<unsigned long long>(clears), Milliseconds(now.revalidateNanoseconds - reported.revalidateNanoseconds), Milliseconds(now.revalidateCollectNanoseconds - reported.revalidateCollectNanoseconds), Milliseconds(now.revalidateCheckNanoseconds - reported.revalidateCheckNanoseconds), Milliseconds(now.replacePrepareNanoseconds - reported.replacePrepareNanoseconds), Milliseconds(now.replaceCommitNanoseconds - reported.replaceCommitNanoseconds), Milliseconds(now.publishNanoseconds - reported.publishNanoseconds), Milliseconds(now.earlyNanoseconds - reported.earlyNanoseconds), delta(now.earlyPrepared, reported.earlyPrepared), delta(now.earlyUsed, reported.earlyUsed), delta(now.earlyDropped, reported.earlyDropped), delta(now.pendingDrained, reported.pendingDrained));
+    std::snprintf(text, sizeof(text), "[bindless] frame %llu: misses %llu (%llu dropped), created %llu, refused %llu, primed %llu tables (%llu records, %llu new keys, primer %.1f ms), re-decoded %llu pages (%llu records changed), served-checked %llu (%llu stale), queue %llu, revalidated %llu (%llu stale, %llu per-use, %llu dcc), retired %llu (%llu unmapped, %llu evicted, %llu full), serve %.1f ms over %llu calls, present wait %.1f ms, entries %llu, slots %llu+%llu, pinned %.1f MiB of a %llu MiB budget, old-path resolve %.1f ms, refusals (%s), kept refusals %llu, host: tables %llu (%.1f MiB), entries %.1f MiB, rejections %llu (%.1f MiB), miss ring: %llu records, %llu set clears; revalidate %.1f ms under the GPU lock (collect %.1f, check %.1f, prepare %.1f, commit %.1f), publish %.1f ms, early prepare %.1f ms off the lock (%llu prepared, %llu used, %llu dropped)",
+        static_cast<unsigned long long>(frame), delta(now.misses, reported.misses), static_cast<unsigned long long>(dropped), delta(now.created, reported.created), delta(now.refused, reported.refused), delta(now.primed, reported.primed), delta(now.primedRecords, reported.primedRecords), delta(now.primedKeys, reported.primedKeys), Milliseconds(now.primerNanoseconds - reported.primerNanoseconds), delta(now.pagesChanged, reported.pagesChanged), delta(now.recordsChanged, reported.recordsChanged), delta(now.servedChecked, reported.servedChecked), delta(now.servedStale, reported.servedStale), static_cast<unsigned long long>(now.queued), delta(now.revalidated, reported.revalidated), delta(now.stale, reported.stale), delta(now.refreshed, reported.refreshed), delta(now.dccRefreshed, reported.dccRefreshed), delta(now.retired, reported.retired), delta(now.unmapped, reported.unmapped), delta(now.evicted, reported.evicted), delta(now.fullEvictions, reported.fullEvictions), Milliseconds(now.serveNanoseconds - reported.serveNanoseconds), delta(now.serves, reported.serves), Milliseconds(now.presentWaitNanoseconds - reported.presentWaitNanoseconds), static_cast<unsigned long long>(now.entries), static_cast<unsigned long long>(now.imageSlots), static_cast<unsigned long long>(now.samplerSlots), static_cast<double>(now.pinnedBytes) / static_cast<double>(1u << 20u), static_cast<unsigned long long>(now.budgetBytes >> 20u), Milliseconds(oldPath), refusals.c_str(), delta(now.keptRefusals, reported.keptRefusals), static_cast<unsigned long long>(now.tables), static_cast<double>(now.tableHostBytes) / static_cast<double>(1u << 20u), static_cast<double>(now.entryHostBytes) / static_cast<double>(1u << 20u), static_cast<unsigned long long>(now.rejections), static_cast<double>(now.rejectionHostBytes) / static_cast<double>(1u << 20u), static_cast<unsigned long long>(records), static_cast<unsigned long long>(clears), Milliseconds(now.revalidateNanoseconds - reported.revalidateNanoseconds), Milliseconds(now.revalidateCollectNanoseconds - reported.revalidateCollectNanoseconds), Milliseconds(now.revalidateCheckNanoseconds - reported.revalidateCheckNanoseconds), Milliseconds(now.replacePrepareNanoseconds - reported.replacePrepareNanoseconds), Milliseconds(now.replaceCommitNanoseconds - reported.replaceCommitNanoseconds), Milliseconds(now.publishNanoseconds - reported.publishNanoseconds), Milliseconds(now.earlyNanoseconds - reported.earlyNanoseconds), delta(now.earlyPrepared, reported.earlyPrepared), delta(now.earlyUsed, reported.earlyUsed), delta(now.earlyDropped, reported.earlyDropped));
     reported = now;
     return text;
 }

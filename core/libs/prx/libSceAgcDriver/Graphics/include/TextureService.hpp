@@ -161,7 +161,6 @@ public:
         std::uint64_t earlyPrepared = 0;
         std::uint64_t earlyUsed = 0;
         std::uint64_t earlyDropped = 0;
-        std::uint64_t pendingDrained = 0;
     };
 
     TextureService(BindlessTable& table, std::shared_ptr<BindlessResolver> resolver, std::shared_ptr<BindlessMemory> memory, Options options);
@@ -245,8 +244,6 @@ private:
     void place(const DeviceImageKeys::Key& key, BindlessResolution resolution, Recorder& recorder, std::uint64_t lastUsed);
     BindlessResolution take(const DeviceImageKeys::Key& key);
     void replace(const DeviceImageKeys::Key& key, Recorder& recorder, Lock& lock, const BindlessPrepared* early = nullptr);
-    // Replaces the keys a yielding present revalidation found stale and has not replaced yet (Serve, first).
-    void drainPendingStale(Recorder& recorder, Lock& lock);
     BindlessResolution settle(const BindlessPrepared& prepared);
     std::uint32_t refuse(const DeviceImageKeys::Key& key, const std::string& reason, bool permanent);
     std::uint32_t acquireImage(VkImageView view, VkImageLayout layout);
@@ -306,10 +303,6 @@ private:
     Counts reported;
     std::uint64_t reportedOldPath = 0;
     std::unordered_map<DeviceImageKeys::Key, BindlessPrepared, KeyHash> early;
-    // Stale keys of the present revalidation still to replace while it yields the GPU lock between
-    // replacements (APS5_NO_PRESENT_YIELD=1: it holds the lock throughout, as before), with their early preparations.
-    std::set<DeviceImageKeys::Key> pendingStale;
-    std::unordered_map<DeviceImageKeys::Key, BindlessPrepared, KeyHash> pendingPrepared;
     std::uint64_t earlyMapping = 0;
     bool stopping = false;
     bool takingMisses = false;
