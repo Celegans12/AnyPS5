@@ -855,8 +855,10 @@ bool untrackedStillMatches(std::uint64_t address, std::size_t bytes, std::span<c
         since = 0;
         return snapshotStillMatches(address, bytes, hashes, 0, std::nullopt, reason);
     }
+    PerformanceTimer timing("Texture.UntrackedMatch");
     const auto now = untrackedGuard(address, bytes);
     const bool trusted = since != 0 && (now[0] & 1u) == 0 && now == guard;
+    timing.Mark(trusted ? "guard_trusted" : "guard_untrusted");
     thread_local std::vector<std::uint8_t>* staleSlot = nullptr;
     auto& stale = ShaderRecompiler::ThreadOwned(staleSlot);
     stale.assign(count, 1);
@@ -865,13 +867,17 @@ bool untrackedStillMatches(std::uint64_t address, std::size_t bytes, std::span<c
     auto& current = ShaderRecompiler::ThreadOwned(layoutSlot);
     const bool layoutWalk = GuestMemory::UntrackedLayoutWalks();
     const auto walked = GuestMemory::WalkUntrackedBlocks(address, bytes, trusted ? since : 0, stale, &kinds, layoutWalk ? &layout : nullptr, layoutWalk ? &current : nullptr);
+    timing.Mark("walk");
     const auto& pending = pendingBlocks(address, bytes, count);
     const bool pendingAny = std::any_of(pending.begin(), pending.end(), [](std::uint8_t flag) { return flag != 0; });
     for (std::size_t i = 0; i < pending.size() && i < stale.size(); ++i) stale[i] = static_cast<std::uint8_t>(stale[i] | pending[i]);
+    timing.Mark("pending");
     const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureCompare);
     GuestMemory::FlushGpuWrites(address, bytes);
+    timing.Mark("flush_gpu_writes");
     GuestMemory::BlockMatch match;
     const bool equal = GuestMemory::CommittedBlocksMatchMarked(address, bytes, hashes, stale, &match, layoutWalk ? &current : nullptr);
+    timing.Mark("compare");
     static const bool verifyBlocks = std::getenv("APS5_VERIFY_UNTRACKED_BLOCKS") != nullptr;
     if (verifyBlocks && equal) {
         static std::atomic<std::uint64_t> checked{0}, differed{0}, compares{0};
