@@ -64,7 +64,7 @@ Build as usual ([build instructions](docs/dev/BUILD.md)), then run the game with
 APS5_SPANNED_WAVE=1 APS5_BINDLESS_IMAGES=1 APS5_BINDLESS_LAZY=1 APS5_NO_RESULT_MEMO=1
 APS5_STAGING_DIFF=1 APS5_PIPELINE_INDIRECT=1 APS5_NO_ADDRESS_DRAW_REUSE=1
 APS5_NO_PIPELINE_JOURNAL=1 APS5_RESOURCE_CACHE_ENTRIES=1024 APS5_ASYNC_LANE=51
-APS5_NO_DRAW_AHEAD=1 APS5_DEFER_REFRESH_FLUSH=1
+APS5_NO_DRAW_AHEAD=1 APS5_DEFER_REFRESH_FLUSH=1 APS5_PIPELINE_DISPATCH=1
 ```
 
 - **This build has a new shader-cache version (since 2026-10-22), so the first run compiles cold**: about 53 minutes to the world on our machine. Later runs start warm.
@@ -157,6 +157,7 @@ APS5_NO_DRAW_AHEAD=1 APS5_DEFER_REFRESH_FLUSH=1
 - 2026-10-23: added the read-only lease skip (`085bd8f203`, same shader cache, T1 exact; upstream as #10382). A texture refresh used to wait for every address-table build that leased its memory, even builds that only read it; in the world that was about six waits of 35-200 ms per frame. In-run A/B on this build (1,300 s, 9 phases each): +0.19 ± 0.15 presents per 10 s (+2.8 %) and frames about 38 ms shorter, within noise; on the build before the templates it was +0.41 ± 0.33. Frames clean in both phases. `APS5_NO_READ_ONLY_LEASE_SKIP=1` turns it off.
 - 2026-10-24: hritikutekar's second committer batch from #675 (`98e1a55cf2`, same shader cache, T1 exact): BDA range lists shared and recycled instead of copied, depth-surface lookups that skip addresses no surface starts at, refused preparations answered from a memo, pending-write scans over the distinct ranges, a heap merge in the shader-memory collect, small pool tiers that keep 4x their budget, and host-imported storage images stored behind their writer on the GPU without a CPU wait. In-run A/B (all seven on vs off, 9 phases each): +0.18 ± 0.06 presents per 10 s (about +2.8 %, 3 SE) and frames about 40 ms shorter; frames identical in both phases, and the heap merge matched the old merge in about 10.5 million collects.
 - 2026-10-24: added SleglJan's #8887 and AlxcBTW's #7514 (`06ef2cbc1f`, same shader cache, T1 exact). In-run A/Bs on this build (1,300 s, 9 phases each, change on minus off): #8887 +0.03 ± 0.06 presents per 10 s (neutral), #7514 +0.15 ± 0.12 (about +2 %, frames ~25 ms shorter). Frames clean in every phase. Our perf-evidence runs for the six PRs we have open are linked from those PRs; the round showed that separate runs drift too much (up to 22 % between two unchanged runs) to resolve changes this size, so the switches are now measured inside one run.
+- 2026-10-24: new env line item `APS5_PIPELINE_DISPATCH=1` (same build, same shader cache, T1 exact with it). A dispatch whose program is already in the dispatch cache no longer makes queue 0 drain the draw pipeline first; it goes through the pipeline as an item instead. Two in-run A/Bs (9 phases each): +0.18 ± 0.16 and +0.54 ± 0.53 presents per 10 s with it on, pooled about +0.21 ± 0.15 (+3 %), frames 31 and 78 ms shorter. Leave `APS5_PIPELINE_DISPATCH_MISSES` off: with misses pipelined too, the committer becomes the limit and frames get slower (-0.26 ± 0.10).
 
 ---
 
