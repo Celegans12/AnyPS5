@@ -29,6 +29,9 @@ class ShaderPreparationContext;
 
 namespace AgcDriver {
 class VulkanDevice;
+namespace Graphics {
+struct ShaderStages;
+}
 }
 
 namespace AgcDriver::DriverDetail {
@@ -235,6 +238,7 @@ void PrioritizeRegistrationPreparation(PreparedShaders& prepared);
 void AwaitRegistrationPreparation();
 void SubmitLibraryPrebuild(std::function<void()> task);
 void AwaitLibraryPrebuilds();
+void PrebuildStageLibrary(const std::shared_ptr<VulkanDevice>& device, const Graphics::ShaderStages& stages, ShaderRecompiler::ShaderStage stage, std::shared_ptr<const ShaderRecompiler::RecompileResult> result, std::uint32_t pushOffset);
 void CloseRegistrationPreparation();
 unsigned RegistrationPreparationThreads();
 

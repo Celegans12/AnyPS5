@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ShaderPreparation.hpp"
 #include "SceShaders.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawCache.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "Optimization/ResourceProgram.hpp"
@@ -673,6 +674,29 @@ void CheckMergedHullVertexTables(AgcDriver::VulkanDevice& device) {
     }
 }
 
+void PrebuildStageWithoutPushConstants(AgcDriver::VulkanDevice& device) {
+    using namespace AgcDriver::DriverDetail;
+    if (!device.Target().registrationModules) return;
+    const auto* disabled = std::getenv("APS5_NO_LIBRARY_PREBUILD");
+    if (disabled != nullptr && std::string_view(disabled) == "1") return;
+    auto result = std::make_shared<ShaderRecompiler::RecompileResult>();
+    result->spirv = {0x07230203u, 0x00010000u, 0u, 6u, 0u, 0x00020011u, 1u, 0x0003000eu, 0u, 1u, 0x0005000fu, 4u, 4u, 0x6e69616du, 0u, 0x00030010u, 4u, 7u, 0x00020013u, 2u, 0x00030021u, 3u, 2u, 0x00050036u, 2u, 4u, 0u, 3u, 0x000200f8u, 5u, 0x000100fdu, 0x00010038u};
+    result->variantId = 0x5ca1ab1e0000feedull;
+    result->runtimeAbiVersion = ShaderRecompiler::RuntimeAbi::Version;
+    Require(result->pushConstants.empty(), "the push-constant-free test fragment shader has push constants");
+    const AgcDriver::Graphics::ShaderStages stages{AgcDriver::Graphics::ShaderPath::Vertex, 0u, 32u, 32u, {}, {}};
+    const std::shared_ptr<AgcDriver::VulkanDevice> shared(&device, [](AgcDriver::VulkanDevice*) {});
+    const auto before = AgcDriver::Graphics::PipelineLibraryCountersOf(device.Device());
+    PrebuildStageLibrary(shared, stages, ShaderRecompiler::ShaderStage::Fragment, result, AgcDriver::Graphics::PipelinePushSlotBytes);
+    AwaitLibraryPrebuilds();
+    const auto prebuilt = AgcDriver::Graphics::PipelineLibraryCountersOf(device.Device());
+    Require(prebuilt.built[2] - before.built[2] == 1u, "the registration prebuild of a push-constant-free fragment shader did not build its fragment library");
+    const std::array<AgcDriver::Graphics::CompiledShader, 1> drawShaders{{{ShaderRecompiler::ShaderStage::Fragment, result.get(), 0u}}};
+    Require(device.PrebuildGraphicsLibraries(stages, drawShaders), "the draw-side lookup of a push-constant-free fragment shader was not built");
+    const auto drawn = AgcDriver::Graphics::PipelineLibraryCountersOf(device.Device());
+    Require(drawn.built[2] == prebuilt.built[2], "the draw built a fragment library the registration prebuild of a push-constant-free shader should have provided");
+}
+
 void NullPixelMatchesRegistration(AgcDriver::VulkanDevice& device) {
     using namespace AgcDriver::DriverDetail;
     Fixture front;
@@ -730,6 +754,7 @@ int main(int argc, char** argv) {
         const auto dump = argc == 2 ? std::filesystem::path(argv[1]) : std::filesystem::path{};
         RetainedPixelMatchesNullProgram(*device);
         NullPixelMatchesRegistration(*device);
+        PrebuildStageWithoutPushConstants(*device);
         Check(*device, AgcDriver::Graphics::ShaderPath::Vertex, dump);
         Check(*device, AgcDriver::Graphics::ShaderPath::Geometry, dump);
         Check(*device, AgcDriver::Graphics::ShaderPath::Tessellation, dump);
