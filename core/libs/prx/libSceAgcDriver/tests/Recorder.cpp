@@ -3707,7 +3707,7 @@ void stagingDiffTests(const Device& device, Recorder& recorder) {
 // inside an import of the cached address space is staged device-local, the BDA table sends its
 // addresses to the shadow (the import's entry cut around it), and the copy-back stores what the
 // work wrote; an element crossed by a range the import serves in place is not staged.
-void bdaStagingTests(const Device& device, Recorder& recorder) {
+void stagingDiffBdaTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     const bool diff = std::getenv("APS5_STAGING_DIFF") != nullptr && context.bufferDeviceAddress;
     if (context.hostImportAlignment == 0 || !context.bufferDeviceAddress || !AddressSpaceCounters().enabled || std::getenv("APS5_NO_BDA_STAGING") != nullptr) {
@@ -11877,7 +11877,7 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--staging-diff-only") {
             stagingDiffTests(device, recorder);
             readWrittenStagingTests(device, recorder);
-            bdaStagingTests(device, recorder);
+            stagingDiffBdaTests(device, recorder);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--read-list-only") {
