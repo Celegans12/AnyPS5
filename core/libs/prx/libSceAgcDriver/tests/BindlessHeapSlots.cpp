@@ -178,8 +178,62 @@ void heapComesBack(const Context& context, VkImageView view) {
     BindlessHeap::Release(context.device);
 }
 
+void storageComesBack(const Context& context, VkImageView view) {
+    auto& heap = BindlessHeap::For(context);
+    std::vector<std::shared_ptr<void>> owners;
+    for (std::size_t index = 0; index < 7u; ++index) {
+        owners.push_back(std::make_shared<int>(0));
+        require(heap.StorageSlot(Abi::FirstStorageImageBinding, owners.back(), view).has_value(),
+                "a storage owner takes one of the eight capped slots");
+    }
+    require(BindlessHeap::NearlyFull(), "storage owners that leave one free slot of eight refuse the heap");
+    BindlessHeap::NoteSweepDue();
+    BindlessHeap::SweepIfDue();
+    require(BindlessHeap::NearlyFull(), "a sweep while every storage owner is held leaves the heap refused");
+    owners.clear();
+    for (std::uint32_t check = 0; check < 64u && BindlessHeap::NearlyFull(); ++check) BindlessHeap::SweepIfDue();
+    require(!BindlessHeap::NearlyFull(), "a refused heap sweeps again by itself and takes the heap back once the storage owners are gone");
+    BindlessHeap::Release(context.device);
+}
+
+void mixedComesBack(const Context& context, VkImageView sampledView, VkImageView storageView) {
+    auto& heap = BindlessHeap::For(context);
+    std::vector<std::shared_ptr<Texture>> textures;
+    for (std::size_t index = 0; index < 4u; ++index) {
+        textures.push_back(fakeTexture(index));
+        require(heap.TextureSlot(Abi::FirstImageBinding, textures.back(), sampledView, VK_IMAGE_LAYOUT_GENERAL).has_value(),
+                "a texture takes one of the eight capped slots");
+    }
+    require(!BindlessHeap::NearlyFull(), "four textures in eight capped slots leave the heap taken");
+    std::vector<std::shared_ptr<void>> owners;
+    for (std::size_t index = 0; index < 3u; ++index) {
+        owners.push_back(std::make_shared<int>(0));
+        require(heap.StorageSlot(Abi::FirstStorageImageBinding, owners.back(), storageView).has_value(),
+                "a storage owner takes one of the slots the textures left");
+    }
+    require(BindlessHeap::NearlyFull(), "storage owners that take the slots the textures left refuse the heap");
+    owners.clear();
+    BindlessHeap::NoteSweepDue();
+    BindlessHeap::SweepIfDue();
+    require(!BindlessHeap::NearlyFull(), "a sweep after the storage owners are gone takes the heap again while the textures stay");
+    BindlessHeap::Release(context.device);
+}
+
+void viewsComeBack(const Context& context, VkImageView view) {
+    auto& heap = BindlessHeap::For(context);
+    const auto kind = Abi::FirstStorageImageBinding + 27u;
+    std::array<int, 7> owners{};
+    for (auto& owner : owners) require(heap.ViewSlot(kind, &owner, view).has_value(), "a view takes one of the eight capped slots");
+    require(BindlessHeap::NearlyFull(), "views that leave one free slot of eight refuse the heap");
+    for (auto& owner : owners) heap.ReleaseViewSlots(&owner);
+    BindlessHeap::SweepIfDue();
+    require(!BindlessHeap::NearlyFull(), "releasing the views schedules the sweep that takes the heap again");
+    BindlessHeap::Release(context.device);
+}
+
 int main(int argc, char** argv) {
-    const bool comesBack = argc > 1 && std::string(argv[1]) == "comes-back";
+    const std::string mode = argc > 1 ? argv[1] : "";
+    const bool comesBack = !mode.empty();
     try {
 #ifdef _WIN32
         _putenv_s("APS5_GPU_HEAP", "1");
@@ -207,11 +261,17 @@ int main(int argc, char** argv) {
             {
                 const auto context = device->GraphicsContext();
                 const PlaceholderImages placeholders(context);
-                heapComesBack(context, placeholders.View(Abi::FirstImageBinding));
+                const auto sampled = placeholders.View(Abi::FirstImageBinding);
+                const auto storage = placeholders.View(Abi::FirstStorageImageBinding);
+                if (mode == "comes-back") heapComesBack(context, sampled);
+                else if (mode == "storage-comes-back") storageComesBack(context, storage);
+                else if (mode == "mixed-comes-back") mixedComesBack(context, sampled, storage);
+                else if (mode == "views-come-back") viewsComeBack(context, storage);
+                else throw std::runtime_error("unknown mode " + mode);
                 device->WaitIdle();
             }
             device.reset();
-            std::cout << "the refused heap comes back after a sweep\n";
+            std::cout << "the refused heap comes back after a sweep (" << mode << ")\n";
             return 0;
         }
         {

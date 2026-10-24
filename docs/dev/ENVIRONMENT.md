@@ -165,7 +165,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 | `APS5_GROUP_CAPTURE_ALL_QUEUES` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Dispatch/DispatchAhead.cpp` |  | resolves group-ahead capture on queue 0 as well |
 | `APS5_HANDOFF_SPIN_US` | integer | `core/libs/prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp` |  | microseconds a thread spins for a handed-off draw's work or for the GPU mutex before blocking, clamped to 0..10000; unset spins 150 us when the process has more than 8 usable processors and not at all otherwise |
 | `APS5_HEAP_MIRROR_MIB` | integer | `core/libs/prx/libSceAgcDriver/Graphics/src/GuestBufferMemory.cpp` | 24576 | budget in MiB for the heap mirrors held for registered allocations |
-| `APS5_HEAP_SLOT_CAP` | integer | `core/libs/prx/libSceAgcDriver/Graphics/src/BindlessHeap.cpp` | 4096 | number of image slots per binding kind the GPU heap uses; 0 keeps the default |
+| `APS5_HEAP_SLOT_CAP` | integer | `core/libs/prx/libSceAgcDriver/Graphics/src/BindlessHeap.cpp` | 233415 | number of shared image slots the GPU heap hands out, after the 57 slots reserved for each binding kind's absent descriptor; 0 keeps the default |
 | `APS5_HOOK_FLUSH_CPU_BLOCKS` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Recorder.cpp` |  | set to 0 flushes pending images whose every 64 KiB block the CPU wrote, instead of skipping them |
 | `APS5_HOOK_FULL_SYNC` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Recorder.cpp` |  | makes the flush hook's recorded-store wait a full Sync under the GpuMutex |
 | `APS5_HOOK_LOCKED_WAIT` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Recorder.cpp` |  | keeps the flush hook's pending-write wait under the GpuMutex |

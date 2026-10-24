@@ -265,6 +265,7 @@ std::optional<std::uint32_t> BindlessHeap::StorageSlot(std::uint32_t kind, std::
     if (++slotRequests % 1024u == 0u) NoteSweepDue();
     const auto slot = takeOrSweepLocked(dropped);
     if (!slot) return std::nullopt;
+    noteTakenLocked(dropped);
     writeImageSlot(kind, *slot, view, VK_IMAGE_LAYOUT_GENERAL);
     claimSlotLocked(key, *slot).storage = std::move(owner);
     return slot;
@@ -280,6 +281,7 @@ std::optional<std::uint32_t> BindlessHeap::ViewSlot(std::uint32_t kind, const vo
     if (const auto found = textureSlots.find(key); found != textureSlots.end()) return found->second;
     const auto slot = takeOrSweepLocked(dropped);
     if (!slot) return std::nullopt;
+    noteTakenLocked(dropped);
     writeImageSlot(kind, *slot, view, VK_IMAGE_LAYOUT_GENERAL);
     claimSlotLocked(key, *slot);
     viewSlots[owner].push_back(*slot);
@@ -293,6 +295,7 @@ void BindlessHeap::ReleaseViewSlots(const void* owner) {
     for (const auto slot : found->second) freeSlotLocked(slot);
     slotSerial.fetch_add(1, std::memory_order_release);
     viewSlots.erase(found);
+    if (NearlyFull()) NoteSweepDue();
 }
 
 std::optional<std::uint32_t> BindlessHeap::takeOrSweepLocked(std::vector<std::shared_ptr<Texture>>& dropped) {
@@ -390,6 +393,8 @@ bool BindlessHeap::NearlyFull() {
 namespace {
 
 std::atomic<bool> sweepDue{false};
+std::atomic<std::uint32_t> refusedSweepChecks{0};
+constexpr std::uint32_t RefusedSweepInterval = 64u;
 
 }
 
@@ -398,7 +403,10 @@ void BindlessHeap::NoteSweepDue() {
 }
 
 void BindlessHeap::SweepIfDue() {
-    if (!sweepDue.load(std::memory_order_relaxed) || !sweepDue.exchange(false, std::memory_order_relaxed)) return;
+    const bool due = sweepDue.load(std::memory_order_relaxed) && sweepDue.exchange(false, std::memory_order_relaxed);
+    const bool retry = !due && nearlyFull.load(std::memory_order_relaxed) &&
+                       refusedSweepChecks.fetch_add(1, std::memory_order_relaxed) % RefusedSweepInterval == RefusedSweepInterval - 1u;
+    if (!due && !retry) return;
     std::vector<std::shared_ptr<Texture>> dropped;
     SweptStorageRelease swept;
     std::vector<std::shared_ptr<Sampler>> droppedSamplers;
