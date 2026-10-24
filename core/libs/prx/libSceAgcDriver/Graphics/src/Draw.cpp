@@ -59,6 +59,9 @@ struct PixelFunctionLdsPool {
     std::uint32_t* header = nullptr;
     std::uint32_t subgroupSize = 0;
     std::uint32_t slots = 0;
+    VkDeviceSize bytes = 0;
+    VkDeviceAddress address = 0;
+    const BindlessHeap* heapWritten = nullptr;
     bool announced = false;
 };
 
@@ -122,12 +125,15 @@ void PreparePixelFunctionLds(const Context& context, VkCommandBuffer commands, s
         const auto bytes = 16ull + stride * pool.slots;
         VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         bufferInfo.size = bytes;
-        bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        const bool addressed = context.descriptorHeap && context.bufferDeviceAddress;
+        bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | (addressed ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0u);
         bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         Check(context.Function<PFN_vkCreateBuffer>("vkCreateBuffer")(context.device, &bufferInfo, nullptr, &pool.buffer), "vkCreateBuffer pixel function LDS");
         VkMemoryRequirements requirements{};
         context.Function<PFN_vkGetBufferMemoryRequirements>("vkGetBufferMemoryRequirements")(context.device, pool.buffer, &requirements);
         VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        const VkMemoryAllocateFlagsInfo addressFlags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, nullptr, VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT, 0};
+        if (addressed) allocation.pNext = &addressFlags;
         allocation.allocationSize = requirements.size;
         constexpr auto hostCoherent = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
         constexpr auto deviceLocalHost = hostCoherent | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
@@ -158,6 +164,11 @@ void PreparePixelFunctionLds(const Context& context, VkCommandBuffer commands, s
             Check(allocated, "vkAllocateMemory pixel function LDS");
         }
         Check(context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, pool.buffer, pool.memory, 0), "vkBindBufferMemory pixel function LDS");
+        pool.bytes = bytes;
+        if (addressed) {
+            const VkBufferDeviceAddressInfo addressInfo{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, nullptr, pool.buffer};
+            pool.address = context.Function<PFN_vkGetBufferDeviceAddressKHR>("vkGetBufferDeviceAddressKHR")(context.device, &addressInfo);
+        }
         Check(context.Function<PFN_vkMapMemory>("vkMapMemory")(context.device, pool.memory, 0, 16, 0, reinterpret_cast<void**>(&pool.header)), "vkMapMemory pixel function LDS");
         pool.header[0] = 0u;
         pool.header[1] = 0u;
@@ -185,6 +196,14 @@ void PreparePixelFunctionLds(const Context& context, VkCommandBuffer commands, s
         pool.announced = true;
     }
     Require(pool.subgroupSize == subgroupSize, "pixel function LDS subgroup size does not match the pool");
+    if (context.descriptorHeap && DescriptorHeapEnabled()) {
+        auto& heap = BindlessHeap::For(context);
+        if (pool.heapWritten != &heap) {
+            Require(pool.address != 0, "the pixel function LDS pool has no device address for the GPU heap");
+            heap.WritePixelLdsBuffer(pool.address, pool.bytes);
+            pool.heapWritten = &heap;
+        }
+    }
     const VkMemoryBarrier beforeFill{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT};
     context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &beforeFill, 0, nullptr, 0, nullptr);
     context.Resolved(&DeviceFunctions::cmdFillBuffer, "vkCmdFillBuffer")(commands, pool.buffer, 0, 4, 0u);
@@ -2344,7 +2363,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         Require(!resources.HeapStage(), "a GPU-mode draw needs a VK_EXT_descriptor_heap pipeline");
         resources.Bind(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout());
     }
-    if (std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->functionLdsBuffer; })) BindPixelFunctionLds(context, commands, record.pipeline->Layout());
+    if (!record.pipeline->DescriptorHeap() && std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->functionLdsBuffer; })) BindPixelFunctionLds(context, commands, record.pipeline->Layout());
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
     pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, record.pushBytes, record.pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty(), drawBindings.get());
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
@@ -3083,7 +3102,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
         BindlessHeap::For(context).BindDescriptorHeaps(commands);
         NoteEmptyResourceSet();
     } else resources->Bind(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->Layout());
-    if (pixelLdsSubgroup != 0u) BindPixelFunctionLds(context, commands, pipeline->Layout());
+    if (pixelLdsSubgroup != 0u && !pipeline->DescriptorHeap()) BindPixelFunctionLds(context, commands, pipeline->Layout());
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
     pushDrawConstants(*pipeline, commands, state, draw, shaders, *resources, nullptr, 0, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty());
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");

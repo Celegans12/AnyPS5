@@ -39,6 +39,7 @@ alignas(256) constexpr std::array<std::uint32_t, 12> PixelCode{0x7e0002f0u, 0x7e
 alignas(256) constexpr std::array<std::uint32_t, 16> BufferPixelCode{0x7e0002f0u, 0x7e0202f0u, 0xf4200506u, 0xfa000000u, 0xf09c0f08u, 0x00400000u, 0xbf8c0000u, 0x7e060214u, 0xf800180fu, 0x03020100u, 0xbf810000u, 0xbf810000u, 0xbf810000u, 0xbf810000u, 0xbf810000u, 0xbf810000u};
 alignas(256) constexpr std::array<std::uint32_t, 16> GdsPixelCode{0xbefc03ffu, 0x0000ffffu, 0x7e0002f0u, 0x7e0202f0u, 0xd8fa0010u, 0x04000000u, 0xf09c0f08u, 0x00400000u, 0xbf8c0000u, 0xf800180fu, 0x03020100u, 0xbf810000u, 0xbf810000u, 0xbf810000u, 0xbf810000u, 0xbf810000u};
 alignas(256) constexpr std::array<std::uint32_t, 16> StoragePixelCode{0x7e0002f0u, 0x7e0202f0u, 0xf09c0f08u, 0x00400000u, 0xbf8c0000u, 0x7e100280u, 0x7e120280u, 0xf0201f08u, 0x00040008u, 0xbf8c0000u, 0xf800180fu, 0x03020100u, 0xbf810000u, 0xbf810000u, 0xbf810000u, 0xbf810000u};
+alignas(256) constexpr std::array<std::uint32_t, 16> LdsPixelCode{0x7e0002f0u, 0x7e0202f0u, 0xf09c0f08u, 0x00400000u, 0xbf8c0000u, 0x7e080280u, 0xd8344400u, 0x00000004u, 0xbf8cc07fu, 0xd8d84400u, 0x00000004u, 0xbf8cc07fu, 0xf800180fu, 0x03020100u, 0xbf810000u, 0xbf810000u};
 alignas(4096) std::array<std::uint8_t, 4096> StorageMemory{};
 alignas(256) constexpr std::array<std::uint32_t, 24> SamplingVertexCode{
     0x7e1402f0u, 0x7e1602f0u, 0xf09c0f08u, 0x00820c0au, 0xbf8c0000u, 0xf800020fu, 0x0f0e0d0cu,
@@ -90,7 +91,7 @@ void Append(std::vector<std::uint32_t>& commands, std::uint32_t opcode, std::ini
     commands.insert(commands.end(), payload);
 }
 
-enum class Mode { Texture, Buffer, Storage, Gds, Vertex, Bda, Table, VertexTable, MovedBuffer, MovedTexture };
+enum class Mode { Texture, Buffer, Storage, Gds, Vertex, Bda, Table, VertexTable, MovedBuffer, MovedTexture, PixelLds };
 
 std::vector<std::uint32_t> Draw(const std::uint32_t* pixelCode, Mode mode, const std::uint32_t* vertexCode = nullptr) {
     const bool vertexSampling = mode == Mode::Vertex || mode == Mode::VertexTable;
@@ -190,8 +191,8 @@ void DrawSamplesTheTexture(bool heap, Mode mode) {
     Registered(VertexHeader, VertexCode.data(), sizeof(VertexCode), 2);
     for (std::size_t offset = 0; offset < OtherTextureMemory.size(); offset += 4) OtherTextureMemory[offset] = OtherTextureMemory[offset + 1] = OtherTextureMemory[offset + 2] = OtherTextureMemory[offset + 3] = 0x33u;
     const bool vertexSampling = mode == Mode::Vertex || mode == Mode::VertexTable;
-    const auto* code = mode == Mode::Table ? TablePixelCode.data() : mode == Mode::Gds ? GdsPixelCode.data() : mode == Mode::Storage ? StoragePixelCode.data() : mode == Mode::Bda ? BdaPixelCode.data() : buffer ? BufferPixelCode.data() : vertexSampling ? InterpolantPixelCode.data() : PixelCode.data();
-    const auto bytes = mode == Mode::Table ? sizeof(TablePixelCode) : mode == Mode::Gds ? sizeof(GdsPixelCode) : mode == Mode::Storage ? sizeof(StoragePixelCode) : mode == Mode::Bda ? sizeof(BdaPixelCode) : buffer ? sizeof(BufferPixelCode) : vertexSampling ? sizeof(InterpolantPixelCode) : sizeof(PixelCode);
+    const auto* code = mode == Mode::PixelLds ? LdsPixelCode.data() : mode == Mode::Table ? TablePixelCode.data() : mode == Mode::Gds ? GdsPixelCode.data() : mode == Mode::Storage ? StoragePixelCode.data() : mode == Mode::Bda ? BdaPixelCode.data() : buffer ? BufferPixelCode.data() : vertexSampling ? InterpolantPixelCode.data() : PixelCode.data();
+    const auto bytes = mode == Mode::PixelLds ? sizeof(LdsPixelCode) : mode == Mode::Table ? sizeof(TablePixelCode) : mode == Mode::Gds ? sizeof(GdsPixelCode) : mode == Mode::Storage ? sizeof(StoragePixelCode) : mode == Mode::Bda ? sizeof(BdaPixelCode) : buffer ? sizeof(BufferPixelCode) : vertexSampling ? sizeof(InterpolantPixelCode) : sizeof(PixelCode);
     if (mode == Mode::Vertex) Registered(VertexHeader, SamplingVertexCode.data(), sizeof(SamplingVertexCode), 2);
     if (mode == Mode::VertexTable) Registered(VertexHeader, TableVertexCode.data(), sizeof(TableVertexCode), 2);
     Registered(PixelHeader, code, bytes, 1);
@@ -301,6 +302,7 @@ int main() {
         DrawSamplesTheTexture(heap, Mode::VertexTable);
         DrawSamplesTheTexture(heap, Mode::MovedBuffer);
         DrawSamplesTheTexture(heap, Mode::MovedTexture);
+        DrawSamplesTheTexture(heap, Mode::PixelLds);
         DrawSamplesTheTexture(heap, Mode::Texture);
         if (heap && AgcDriver::Graphics::DescriptorHeapEnabled() && std::getenv("APS5_HEAP_SLOT_CAP") == nullptr) MixedDrawTakesThePerDrawPath();
         if (heap && std::getenv("APS5_HEAP_SLOT_CAP") != nullptr) Require(AgcDriver::DriverDetail::HeapRefused(), "a draw found the capped heap full and the heap was not refused");

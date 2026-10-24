@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "RuntimeAbi.hpp"
+#include "SpirvBackend/SpirvAnalysis.hpp"
 #include <cstring>
 #include <algorithm>
 #include <array>
@@ -102,7 +103,7 @@ bool HeapComputeEnabled() {
 namespace {
 
 struct HeapSizes {
-    VkDeviceSize imageStride = 0, samplerStride = 0, resourceUsed = 0, samplerUsed = 0;
+    VkDeviceSize imageStride = 0, samplerStride = 0, pixelLdsOffset = 0, resourceUsed = 0, samplerUsed = 0;
 };
 
 HeapSizes heapSizes(const VkPhysicalDeviceDescriptorHeapPropertiesEXT& properties) {
@@ -110,7 +111,8 @@ HeapSizes heapSizes(const VkPhysicalDeviceDescriptorHeapPropertiesEXT& propertie
     HeapSizes sizes;
     sizes.imageStride = align(properties.imageDescriptorSize, properties.imageDescriptorAlignment);
     sizes.samplerStride = align(properties.samplerDescriptorSize, properties.samplerDescriptorAlignment);
-    sizes.resourceUsed = align(static_cast<VkDeviceSize>(static_cast<std::uint32_t>(Abi::Binding::Samplers)) * Abi::GpuImageHeapSlots * sizes.imageStride, properties.resourceHeapAlignment);
+    sizes.pixelLdsOffset = align(static_cast<VkDeviceSize>(static_cast<std::uint32_t>(Abi::Binding::Samplers)) * Abi::GpuImageHeapSlots * sizes.imageStride, properties.bufferDescriptorAlignment);
+    sizes.resourceUsed = align(sizes.pixelLdsOffset + properties.bufferDescriptorSize, properties.resourceHeapAlignment);
     sizes.samplerUsed = align(static_cast<VkDeviceSize>(Abi::GpuSamplerHeapSlots) * sizes.samplerStride, properties.samplerHeapAlignment);
     return sizes;
 }
@@ -129,6 +131,7 @@ BindlessHeap::BindlessHeap(const Context& context) : context(context) {
     imageHeapStride = sizes.imageStride;
     samplerHeapStride = sizes.samplerStride;
     resourceHeapUsed = sizes.resourceUsed;
+    pixelLdsHeapOffset = sizes.pixelLdsOffset;
     samplerHeapUsed = sizes.samplerUsed;
     Require(Fits(heapProperties), "the GPU heap's slots exceed the device's descriptor heap sizes");
     constexpr VkBufferUsageFlags heapUsage = VK_BUFFER_USAGE_DESCRIPTOR_HEAP_BIT_EXT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
@@ -645,11 +648,12 @@ namespace {
 
 const std::uint32_t GeneratedFaultBinding = Abi::BindingNumber(Abi::Stage::TessellationControl, Abi::Binding::FaultBuffer);
 
-bool heapBindings(std::span<const std::uint32_t> spirv, bool workgroupAddress, bool gdsAddress, bool faultAddress, std::vector<std::uint32_t>& bindings, bool& workgroupMemory, std::uint32_t& gdsBinding, bool& faultMemory, std::pair<std::uint32_t, std::uint32_t>* refused = nullptr) {
+bool heapBindings(std::span<const std::uint32_t> spirv, bool workgroupAddress, bool gdsAddress, bool faultAddress, bool pixelLds, std::vector<std::uint32_t>& bindings, bool& workgroupMemory, std::uint32_t& gdsBinding, bool& faultMemory, bool& pixelLdsMemory, std::pair<std::uint32_t, std::uint32_t>* refused = nullptr) {
     bindings.clear();
     workgroupMemory = false;
     gdsBinding = ~0u;
     faultMemory = false;
+    pixelLdsMemory = false;
     if (spirv.size() < 5u) return false;
     constexpr std::uint32_t opDecorate = 71u;
     constexpr std::uint32_t decorationBinding = 33u;
@@ -681,24 +685,29 @@ bool heapBindings(std::span<const std::uint32_t> spirv, bool workgroupAddress, b
             faultMemory = true;
             continue;
         }
+        if (pixelLds && !pixelLdsMemory && entry.first == ShaderRecompiler::PixelFunctionLdsDescriptorSet && entry.second == 0u) {
+            pixelLdsMemory = true;
+            continue;
+        }
         if (entry.first != Abi::FragmentDescriptorSet || entry.second < bindingCount + Abi::FirstImageBinding || entry.second > bindingCount + samplerBinding) {
             if (refused != nullptr) *refused = entry;
             return false;
         }
         if (std::find(bindings.begin(), bindings.end(), entry.second) == bindings.end()) bindings.push_back(entry.second);
     }
-    return (!workgroupAddress || workgroupMemory) && (!faultAddress || faultMemory);
+    return (!workgroupAddress || workgroupMemory) && (!faultAddress || faultMemory) && (!pixelLds || pixelLdsMemory);
 }
 
 }
 
-bool DescriptorHeapMappable(std::span<const std::uint32_t> spirv, bool workgroupAddress, bool gdsAddress) {
+bool DescriptorHeapMappable(std::span<const std::uint32_t> spirv, bool workgroupAddress, bool gdsAddress, bool pixelLds) {
     std::vector<std::uint32_t> bindings;
     bool workgroupMemory = false;
     std::uint32_t gdsBinding = ~0u;
     bool faultMemory = false;
+    bool pixelLdsMemory = false;
     std::pair<std::uint32_t, std::uint32_t> refused{~0u, ~0u};
-    const bool mappable = heapBindings(spirv, workgroupAddress, gdsAddress, false, bindings, workgroupMemory, gdsBinding, faultMemory, &refused);
+    const bool mappable = heapBindings(spirv, workgroupAddress, gdsAddress, false, pixelLds, bindings, workgroupMemory, gdsBinding, faultMemory, pixelLdsMemory, &refused);
     static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
     if (!mappable && stats) {
         static std::mutex causesMutex;
@@ -710,13 +719,14 @@ bool DescriptorHeapMappable(std::span<const std::uint32_t> spirv, bool workgroup
     return mappable;
 }
 
-bool BindlessHeap::DescriptorHeapMappings(std::span<const std::uint32_t> spirv, std::vector<VkDescriptorSetAndBindingMappingEXT>& mappings, std::uint32_t workgroupAddressOffset, bool rootGds, bool rootFault) const {
+bool BindlessHeap::DescriptorHeapMappings(std::span<const std::uint32_t> spirv, std::vector<VkDescriptorSetAndBindingMappingEXT>& mappings, std::uint32_t workgroupAddressOffset, bool rootGds, bool rootFault, bool pixelLds) const {
     mappings.clear();
     std::vector<std::uint32_t> bindings;
     bool workgroupMemory = false;
     std::uint32_t gdsBinding = ~0u;
     bool faultMemory = false;
-    if (resourceHeap == nullptr || !heapBindings(spirv, workgroupAddressOffset != ~0u, rootGds, rootFault, bindings, workgroupMemory, gdsBinding, faultMemory)) return false;
+    bool pixelLdsMemory = false;
+    if (resourceHeap == nullptr || !heapBindings(spirv, workgroupAddressOffset != ~0u, rootGds, rootFault, pixelLds, bindings, workgroupMemory, gdsBinding, faultMemory, pixelLdsMemory)) return false;
     constexpr auto bindingCount = static_cast<std::uint32_t>(Abi::Binding::Count);
     constexpr auto samplerBinding = static_cast<std::uint32_t>(Abi::Binding::Samplers);
     std::sort(bindings.begin(), bindings.end());
@@ -768,7 +778,29 @@ bool BindlessHeap::DescriptorHeapMappings(std::span<const std::uint32_t> spirv, 
         mapping.sourceData.pushAddressOffset = (Abi::RootDword + Abi::RootFaultAddress) * sizeof(std::uint32_t);
         mappings.push_back(mapping);
     }
+    if (pixelLdsMemory) {
+        VkDescriptorSetAndBindingMappingEXT mapping{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_AND_BINDING_MAPPING_EXT};
+        mapping.descriptorSet = ShaderRecompiler::PixelFunctionLdsDescriptorSet;
+        mapping.firstBinding = 0;
+        mapping.bindingCount = 1;
+        mapping.resourceMask = VK_SPIRV_RESOURCE_TYPE_READ_WRITE_STORAGE_BUFFER_BIT_EXT;
+        mapping.source = VK_DESCRIPTOR_MAPPING_SOURCE_HEAP_WITH_CONSTANT_OFFSET_EXT;
+        mapping.sourceData.constantOffset.heapOffset = static_cast<std::uint32_t>(pixelLdsHeapOffset);
+        mapping.sourceData.constantOffset.heapArrayStride = 0;
+        mappings.push_back(mapping);
+    }
     return true;
+}
+
+void BindlessHeap::WritePixelLdsBuffer(VkDeviceAddress address, VkDeviceSize bytes) {
+    const auto& properties = context.descriptorHeapProperties;
+    Require(pixelLdsHeapOffset + properties.bufferDescriptorSize <= resourceHeapUsed, "the pixel function LDS descriptor lies outside the resource heap");
+    const VkDeviceAddressRangeEXT buffer{address, bytes};
+    VkResourceDescriptorInfoEXT resource{VK_STRUCTURE_TYPE_RESOURCE_DESCRIPTOR_INFO_EXT};
+    resource.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    resource.data.pAddressRange = &buffer;
+    const VkHostAddressRangeEXT range{resourceHeap->Bytes().data() + pixelLdsHeapOffset, static_cast<std::size_t>(properties.bufferDescriptorSize)};
+    Check(context.Function<PFN_vkWriteResourceDescriptorsEXT>("vkWriteResourceDescriptorsEXT")(context.device, 1, &resource, &range), "vkWriteResourceDescriptorsEXT pixel function LDS");
 }
 
 namespace {

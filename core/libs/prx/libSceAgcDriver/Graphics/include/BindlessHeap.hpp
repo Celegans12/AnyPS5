@@ -37,7 +37,8 @@ public:
     VkDeviceSize ImageHeapStride() const { return imageHeapStride; }
     VkDeviceSize SamplerHeapStride() const { return samplerHeapStride; }
     void BindDescriptorHeaps(VkCommandBuffer commands) const;
-    bool DescriptorHeapMappings(std::span<const std::uint32_t> spirv, std::vector<VkDescriptorSetAndBindingMappingEXT>& mappings, std::uint32_t workgroupAddressOffset = ~0u, bool rootGds = false, bool rootFault = false) const;
+    bool DescriptorHeapMappings(std::span<const std::uint32_t> spirv, std::vector<VkDescriptorSetAndBindingMappingEXT>& mappings, std::uint32_t workgroupAddressOffset = ~0u, bool rootGds = false, bool rootFault = false, bool pixelLds = false) const;
+    void WritePixelLdsBuffer(VkDeviceAddress address, VkDeviceSize bytes);
     VkDeviceAddress RingAddress() const;
     VkBuffer RingBuffer() const;
 
@@ -89,6 +90,7 @@ private:
     VkDeviceSize imageHeapStride = 0;
     VkDeviceSize samplerHeapStride = 0;
     VkDeviceSize resourceHeapUsed = 0;
+    VkDeviceSize pixelLdsHeapOffset = 0;
     VkDeviceSize samplerHeapUsed = 0;
     void writeDescriptorHeap(const VkWriteDescriptorSet& write);
     static constexpr std::size_t RingChunkBytes = 4u << 20u;
@@ -148,7 +150,7 @@ bool GpuHeapEnabled();
 void SetDescriptorHeapDevice(bool available);
 bool DescriptorHeapEnabled();
 bool HeapComputeEnabled();
-bool DescriptorHeapMappable(std::span<const std::uint32_t> spirv, bool workgroupAddress, bool gdsAddress);
+bool DescriptorHeapMappable(std::span<const std::uint32_t> spirv, bool workgroupAddress, bool gdsAddress, bool pixelLds = false);
 void NoteHeapComputeStage();
 std::uint64_t HeapComputeStages();
 void NoteImageTableBuild();
