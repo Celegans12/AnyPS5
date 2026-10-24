@@ -159,6 +159,16 @@ struct PreparedShaders : PreparedShaderState {
     std::atomic<bool> demanded{false};
     bool pending = false;
     std::vector<std::size_t> convertedSamples;
+    // Preparations at use that the recompiler refused (InvocationFor), by what its own failure memo keys on:
+    // the code, the interface key and the binding layout.
+    struct Refusal {
+        std::size_t codeOffset;
+        std::vector<std::uint64_t> key;
+        std::vector<std::uint32_t> linkedCode;
+        ShaderRecompiler::BindingLayout layout;
+        std::exception_ptr failure;
+    };
+    std::vector<Refusal> refusals;
 };
 
 struct RegisteredShaderState {

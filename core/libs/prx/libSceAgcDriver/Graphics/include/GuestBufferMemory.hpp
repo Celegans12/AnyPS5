@@ -349,6 +349,12 @@ public:
     struct CachedTable {
         std::uint64_t serial;
         const std::vector<ShaderRecompiler::BdaAbi::Range>* ranges;
+        // Shares a merged list (tableRanges), so BdaResources' table cache can keep it without a copy
+        // (APS5_NO_LEAN_BDA_TABLES=1 copies, as before). Null for the space's own list: a reference to it would
+        // keep the whole AddressSpace alive, and with it the lease pinning its guest allocations (best137: a
+        // freed allocation waited 60 s for that pin and aborted); the space's list is cached about once per space
+        // and is copied.
+        std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>> owner;
     };
     std::optional<CachedTable> CachedAddressTable() const;
     // The registered memory an address-based build maps, shared by consecutive builds (see
@@ -515,7 +521,7 @@ private:
     std::vector<ShaderRecompiler::BdaAbi::Range> applyOverlaysAndWrites(std::vector<ShaderRecompiler::BdaAbi::Range> result, std::vector<ShaderRecompiler::BdaAbi::Range> overlays, std::span<const std::pair<std::uint64_t, std::uint64_t>> writtenRanges) const;
     // AddressRanges() for a build over the cached space, redoing only the neighbourhood of its own
     // regions, overlays and writes (see GuestBufferMemory.cpp).
-    std::vector<ShaderRecompiler::BdaAbi::Range> incrementalAddressRanges() const;
+    void incrementalAddressRanges(std::vector<ShaderRecompiler::BdaAbi::Range>& result) const;
     // Builds this build's regions from a lease as the per-build path always did: `base` gets the
     // ranges served in place (imports, mirrors), `copied` the ones copied per build.
     struct CopiedRange {

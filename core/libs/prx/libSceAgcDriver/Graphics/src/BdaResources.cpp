@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureService.hpp"
 #include "ImageTableAbi.hpp"
@@ -40,7 +41,8 @@ namespace {
 // serial: a build served by that space alone binds it by the serial, with no hash and no compare.
 struct TableEntry {
     std::uint64_t hash;
-    std::vector<ShaderRecompiler::BdaAbi::Range> ranges;
+    // Shared with the address space's table map when the ranges came from it (no copy).
+    std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>> ranges;
     std::weak_ptr<Buffer> buffer;
     std::uint64_t spaceSerial = 0;
 };
@@ -69,17 +71,18 @@ void classifyFirstEntry(TableCache& cache, std::uint64_t hash, const std::vector
     const auto& first = cache.entries.front();
     if (first.hash == hash) {
         if (first.buffer.expired()) ++classes.firstExpired;
-        else if (!sameRanges(first.ranges, ranges)) ++classes.firstSameHash;
+        else if (!sameRanges(*first.ranges, ranges)) ++classes.firstSameHash;
         return;
     }
     if (first.buffer.expired()) {
         ++classes.firstExpired;
         return;
     }
-    const auto common = std::min(first.ranges.size(), ranges.size());
+    const auto& firstRanges = *first.ranges;
+    const auto common = std::min(firstRanges.size(), ranges.size());
     std::size_t at = 0;
-    while (at < common && std::memcmp(&first.ranges[at], &ranges[at], sizeof(ranges[at])) == 0) ++at;
-    const auto begin = at < ranges.size() ? ranges[at].begin : at < first.ranges.size() ? first.ranges[at].begin : 0;
+    while (at < common && std::memcmp(&firstRanges[at], &ranges[at], sizeof(ranges[at])) == 0) ++at;
+    const auto begin = at < ranges.size() ? ranges[at].begin : at < firstRanges.size() ? firstRanges[at].begin : 0;
     ++(begin < 0x10000000ull ? classes.firstDiffersLow : classes.firstDiffersHeap);
 }
 
@@ -108,6 +111,30 @@ bool sameRanges(const std::vector<ShaderRecompiler::BdaAbi::Range>& left, const 
 
 // A 64-bit mix of the table's words: a table is ~1200 ranges of four words, and comparing the bytes
 // against every held table would cost as much as building it.
+// APS5_NO_LEAN_BDA_TABLES unset: the same words in four independent lanes (each mixed as before), combined at
+// the end: the single chain of dependent multiplies took ~60 us for Yotei's ~9,400 ranges (best135). The value
+// only keys this process's table cache, and a matching hash is always confirmed by the byte compare.
+std::uint64_t hashRangesLanes(const std::vector<ShaderRecompiler::BdaAbi::Range>& ranges) {
+    static_assert(sizeof(ShaderRecompiler::BdaAbi::Range) == 4 * sizeof(std::uint64_t));
+    std::uint64_t lanes[4] = {0x9e3779b97f4a7c15ull ^ ranges.size(), 0xc2b2ae3d27d4eb4full, 0x165667b19e3779f9ull, 0x27d4eb2f165667c5ull};
+    for (const auto& range : ranges) {
+        std::uint64_t words[4];
+        std::memcpy(words, &range, sizeof(range));
+        for (int lane = 0; lane < 4; ++lane) {
+            lanes[lane] ^= words[lane];
+            lanes[lane] *= 0xff51afd7ed558ccdull;
+            lanes[lane] ^= lanes[lane] >> 33u;
+        }
+    }
+    std::uint64_t hash = lanes[0];
+    for (int lane = 1; lane < 4; ++lane) {
+        hash ^= lanes[lane] + 0x9e3779b97f4a7c15ull + (hash << 6u) + (hash >> 2u);
+        hash *= 0xff51afd7ed558ccdull;
+        hash ^= hash >> 33u;
+    }
+    return hash;
+}
+
 std::uint64_t hashRanges(const std::vector<ShaderRecompiler::BdaAbi::Range>& ranges) {
     static_assert(sizeof(ShaderRecompiler::BdaAbi::Range) % sizeof(std::uint64_t) == 0);
     std::uint64_t hash = 0x9e3779b97f4a7c15ull ^ ranges.size();
@@ -130,6 +157,9 @@ std::uint64_t hashRanges(const std::vector<ShaderRecompiler::BdaAbi::Range>& ran
 struct BdaBuildTimes {
     std::atomic<std::uint64_t> faults{0}, faultNs{0}, ranges{0}, rangesNs{0};
     std::atomic<std::uint64_t> spaceHits{0}, spaceHitNs{0}, hashHits{0}, hashHitNs{0}, misses{0}, missNs{0};
+    // Miss sub-steps (ns): hash + first-entry classification, the candidate scan, the range index, the table
+    // buffer, the copies into it, the cache entry (a copy of the ranges when they came from the cached space).
+    std::atomic<std::uint64_t> hashNs{0}, scanNs{0}, indexNs{0}, bufferNs{0}, copyNs{0}, entryNs{0};
     std::atomic<long long> lastReport{0};
 };
 BdaBuildTimes& bdaBuildTimes() {
@@ -160,6 +190,8 @@ void reportBdaBuildTimes() {
     line(t.hashHits, t.hashHitNs, hashHit, sizeof(hashHit));
     line(t.misses, t.missNs, miss, sizeof(miss));
     std::fprintf(stderr, "[bda-build] (10 s): fault buffers %s; address ranges %s; table: space hits %s, hash hits %s, misses %s\n", fault, ranges, space, hashHit, miss);
+    const auto ms = [](std::atomic<std::uint64_t>& ns) { return static_cast<double>(ns.exchange(0, std::memory_order_relaxed)) / 1e6; };
+    std::fprintf(stderr, "[bda-build] (10 s): table build parts (ms): hash %.0f, candidate scan %.0f, index %.0f, buffer %.0f, copies %.0f, cache entry %.0f\n", ms(t.hashNs), ms(t.scanNs), ms(t.indexNs), ms(t.bufferNs), ms(t.copyNs), ms(t.entryNs));
 }
 
 BdaResources::BdaResources(const Context& context) : textureService(context.textureService) {
@@ -178,6 +210,9 @@ BdaResources::BdaResources(const Context& context) : textureService(context.text
 
 BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memory) : BdaResources(context) {
     const bool profiled = bdaBuildProfiled();
+    // APS5_NO_LEAN_BDA_TABLES=1 (runtime switch): copy the ranges into the table cache and hash them in one
+    // chain, as before (see hashRangesLanes and GuestBufferMemory's range-list pool).
+    const bool lean = !RuntimeSwitches::Set(RuntimeSwitch::NoLeanBdaTables);
     const auto rangesStart = profiled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto cached = memory.CachedAddressTable();
     std::vector<ShaderRecompiler::BdaAbi::Range> built;
@@ -208,7 +243,10 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
     Require(ranges.size() <= (std::numeric_limits<std::size_t>::max() - sizeof(ShaderRecompiler::BdaAbi::Header)) / sizeof(ShaderRecompiler::BdaAbi::Range), "BDA table size overflow");
     // The range index (BdaAbi::IndexedTable) after the ranges; APS5_NO_BDA_INDEX=1 leaves it out.
     static const bool indexDisabled = std::getenv("APS5_NO_BDA_INDEX") != nullptr;
+    // [bda-build] index part: on this tree the index is built before the cache lookup (every build, not only misses).
+    const auto indexStart = profiled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto index = indexDisabled ? std::vector<std::uint32_t>{} : ShaderRecompiler::BdaAbi::BuildRangeIndex(ranges.data(), ranges.size());
+    if (profiled) bdaBuildTimes().indexNs.fetch_add(nsSince(indexStart), std::memory_order_relaxed);
     tableBytes = sizeof(ShaderRecompiler::BdaAbi::Header) + ranges.size() * sizeof(ShaderRecompiler::BdaAbi::Range) + index.size() * sizeof(std::uint32_t);
     Require(tableBytes <= context.limits.maxStorageBufferRange && ShaderRecompiler::BdaAbi::FaultBufferBytes <= context.limits.maxStorageBufferRange, "BDA descriptors exceed storage buffer range limit");
     auto& cache = Tables();
@@ -235,8 +273,18 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
                 break;
             }
         }
-        hash = hashRanges(ranges);
+        const auto hashStart = profiled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        hash = lean ? hashRangesLanes(ranges) : hashRanges(ranges);
         classifyFirstEntry(cache, hash, ranges);
+        const auto scanStart = profiled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        if (profiled) bdaBuildTimes().hashNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(scanStart - hashStart).count()), std::memory_order_relaxed);
+        struct NoteScan {
+            bool profiled;
+            std::chrono::steady_clock::time_point start;
+            ~NoteScan() {
+                if (profiled) bdaBuildTimes().scanNs.fetch_add(nsSince(start), std::memory_order_relaxed);
+            }
+        } noteScan{profiled, scanStart};
         for (auto it = cache.entries.begin(); it != cache.entries.end();) {
             // Compare the hash before taking a strong reference: locking a non-matching entry's
             // buffer could make this thread its last owner (a concurrent reap releasing it) and
@@ -255,7 +303,7 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
                 it = cache.entries.erase(it);
                 continue;
             }
-            if (sameRanges(it->ranges, ranges)) {
+            if (sameRanges(*it->ranges, ranges)) {
                 ++cache.hits;
                 outcome = 1;
                 // An equal table of an earlier space (a rebuild that mapped the same ranges the
@@ -271,11 +319,23 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
     Require(ShaderRecompiler::BdaAbi::RangesOrdered(ranges.data(), ranges.size()), "BDA table ranges do not ascend by begin");
     for (const auto& range : ranges) Require((range.permissions & ShaderRecompiler::BdaAbi::Write) == 0 || range.end <= ShaderRecompiler::BdaAbi::WrittenAddressLimit, "a writable BDA range ends past the addresses the written-page record can hold");
     const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::Bda);
+    const auto bufferStart = profiled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     table = std::make_shared<Buffer>(context, tableBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    const auto copyStart = profiled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    if (profiled) bdaBuildTimes().bufferNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(copyStart - bufferStart).count()), std::memory_order_relaxed);
     const ShaderRecompiler::BdaAbi::Header header{ShaderRecompiler::BdaAbi::Version, static_cast<std::uint32_t>(ranges.size()), sizeof(ShaderRecompiler::BdaAbi::Range), index.empty() ? 0u : ShaderRecompiler::BdaAbi::IndexedTable};
     std::memcpy(table->Bytes().data(), &header, sizeof(header));
     if (!ranges.empty()) std::memcpy(table->Bytes().data() + sizeof(header), ranges.data(), ranges.size() * sizeof(ranges.front()));
     if (!index.empty()) std::memcpy(table->Bytes().data() + sizeof(header) + ranges.size() * sizeof(ranges.front()), index.data(), index.size() * sizeof(index.front()));
+    const auto entryStart = profiled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    if (profiled) bdaBuildTimes().copyNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(entryStart - copyStart).count()), std::memory_order_relaxed);
+    struct NoteEntry {
+        bool profiled;
+        std::chrono::steady_clock::time_point start;
+        ~NoteEntry() {
+            if (profiled) bdaBuildTimes().entryNs.fetch_add(nsSince(start), std::memory_order_relaxed);
+        }
+    } noteEntry{profiled, entryStart};
     if (tableCacheEnabled()) {
         std::lock_guard lock(cache.mutex);
         ++cache.misses;
@@ -283,7 +343,8 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
             cache.entries.clear();
             cache.device = context.device;
         }
-        cache.entries.push_front({hash, cached.has_value() ? ranges : std::move(built), table, serial});
+        auto entryRanges = cached.has_value() && lean && cached->owner != nullptr ? cached->owner : std::make_shared<const std::vector<ShaderRecompiler::BdaAbi::Range>>(cached.has_value() ? ranges : std::move(built));
+        cache.entries.push_front({hash, std::move(entryRanges), table, serial});
         while (cache.entries.size() > tableCacheEntries()) cache.entries.pop_back();
     }
 }

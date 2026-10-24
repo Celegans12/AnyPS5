@@ -9,6 +9,8 @@
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "CacheKey.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderPreparation.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderPreparationScope.hpp"
@@ -907,7 +909,59 @@ ShaderRecompiler::LinkedCalls LinkUserDataCallees(const ShaderRecompiler::Recomp
 
 }
 
+// APS5_PROFILE_DRAW: InvocationFor's outcomes ([invocation-for], 10 s): calls, hits on a prepared entry, artifacts
+// prepared at use (and appended), refusals repeated from the memo, entries scanned, and the time spent.
+struct InvocationForCounts {
+    std::atomic<std::uint64_t> calls{0}, hits{0}, prepared{0}, refused{0}, scanned{0}, ns{0}, prepareNs{0};
+    std::atomic<long long> lastReport{0};
+};
+InvocationForCounts& invocationForCounts() {
+    static InvocationForCounts counts;
+    return counts;
+}
+void reportInvocationFor() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile) return;
+    auto& c = invocationForCounts();
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = c.lastReport.load();
+    if (nowMs - last < 10000 || !c.lastReport.compare_exchange_strong(last, nowMs)) return;
+    const auto take = [](std::atomic<std::uint64_t>& value) { return value.exchange(0, std::memory_order_relaxed); };
+    const auto calls = take(c.calls), hits = take(c.hits), prepared = take(c.prepared), refused = take(c.refused), scanned = take(c.scanned), ns = take(c.ns), prepareNs = take(c.prepareNs);
+    std::fprintf(stderr, "[invocation-for] (10 s): %llu calls, %llu hits, %llu prepared at use (%.0f ms), %llu refusals repeated, %.1f entries scanned a call, %.0f ms in all\n", static_cast<unsigned long long>(calls), static_cast<unsigned long long>(hits), static_cast<unsigned long long>(prepared), static_cast<double>(prepareNs) / 1e6, static_cast<unsigned long long>(refused), calls != 0 ? static_cast<double>(scanned) / static_cast<double>(calls) : 0.0, static_cast<double>(ns) / 1e6);
+}
+
+bool sameBindingLayout(const ShaderRecompiler::BindingLayout& left, const ShaderRecompiler::BindingLayout& right) {
+    return left.descriptorSet == right.descriptorSet && left.firstBinding == right.firstBinding && left.pushConstantOffsetBytes == right.pushConstantOffsetBytes && left.pushConstantSizeBytes == right.pushConstantSizeBytes;
+}
+
+// Keeps a recompiler refusal of a preparation at use, with its reason cut before the serialized request that
+// PrepareShader appends; other failures (memory, invalidated snapshots) are not kept.
+void noteRefusal(PreparedShaders& prepared, std::size_t codeOffset, std::span<const std::uint64_t> key, std::span<const std::uint32_t> linkedCode, const ShaderRecompiler::BindingLayout& layout, const std::exception& error) {
+    static constexpr std::string_view marker = "\nRecompileRequest:\n";
+    static constexpr std::size_t kept = 32;
+    if (dynamic_cast<const Graphics::LiveSnapshotInvalidated*>(&error) != nullptr) return;
+    std::string_view what = error.what();
+    if (what.find("ShaderRecompiler::Recompile: ") == std::string_view::npos) return;
+    if (const auto request = what.find(marker); request != std::string_view::npos) what = what.substr(0, request);
+    const auto* refusal = dynamic_cast<const ShaderRefusal*>(&error);
+    auto failure = refusal != nullptr ? std::make_exception_ptr(ShaderRefusal(std::string(what), refusal->subject)) : std::make_exception_ptr(std::runtime_error(std::string(what)));
+    if (prepared.refusals.size() >= kept) prepared.refusals.erase(prepared.refusals.begin());
+    prepared.refusals.push_back({codeOffset, {key.begin(), key.end()}, {linkedCode.begin(), linkedCode.end()}, layout, std::move(failure)});
+}
+
 ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request) {
+    const auto callStart = std::chrono::steady_clock::now();
+    auto& counts = invocationForCounts();
+    struct NoteCall {
+        InvocationForCounts& counts;
+        std::chrono::steady_clock::time_point start;
+        ~NoteCall() {
+            counts.calls.fetch_add(1, std::memory_order_relaxed);
+            counts.ns.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+            reportInvocationFor();
+        }
+    } noteCall{counts, callStart};
     require(codeOffset < snapshot.code.size(), "prepared shader code offset is outside the snapshot");
     const auto code = std::span(snapshot.code).subspan(codeOffset);
     require(request.shader.code.data() == code.data() && request.shader.code.size() == code.size(), "prepared invocation does not refer to registered code");
@@ -927,12 +981,38 @@ ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& s
     ShaderRecompiler::BuildPreparedShaderKey(source, key);
     for (const auto& entry : snapshot.prepared->entries) {
         if (entry.codeOffset != codeOffset) continue;
+        counts.scanned.fetch_add(1, std::memory_order_relaxed);
         invocationRequest.shader.code = ShaderRecompiler::GetPreparedCode(*entry.handle);
         if (!linked.code.empty() && !std::ranges::equal(invocationRequest.shader.code, linked.code)) continue;
-        if (auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(invocationRequest, entry.handle, key)) return std::move(*invocation);
+        if (auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(invocationRequest, entry.handle, key)) {
+            counts.hits.fetch_add(1, std::memory_order_relaxed);
+            return std::move(*invocation);
+        }
+    }
+    // A refused preparation is refused again: the recompiler memoizes the failure by source and layout, but each
+    // call still rethrew it through PrepareShader, which appends the whole serialized request (54-64 KB here) to
+    // the reason, copied and hashed again by the draw's skip report (best141: the merged hull draws refused in
+    // tessellation lowering, ~2,500 a 10 s, ~5.5 % of the queue worker in Serialize). A repeat rethrows the
+    // first refusal without the request. APS5_NO_REFUSAL_MEMO=1 (runtime switch) prepares again each time.
+    const bool memo = !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoRefusalMemo);
+    if (memo) {
+        for (const auto& refusal : snapshot.prepared->refusals) {
+            if (refusal.codeOffset != codeOffset || !sameBindingLayout(refusal.layout, source.layout) || !std::ranges::equal(refusal.key, key) || !std::ranges::equal(refusal.linkedCode, linked.code)) continue;
+            counts.refused.fetch_add(1, std::memory_order_relaxed);
+            std::rethrow_exception(refusal.failure);
+        }
     }
     ReportPreparedAtUse(snapshot, source);
-    auto handle = PrepareShaderWithDiagnostics(source);
+    counts.prepared.fetch_add(1, std::memory_order_relaxed);
+    const auto prepareStart = std::chrono::steady_clock::now();
+    std::shared_ptr<const ShaderRecompiler::SourceHandle> handle;
+    try {
+        handle = PrepareShaderWithDiagnostics(source);
+    } catch (const std::exception& error) {
+        if (memo) noteRefusal(*snapshot.prepared, codeOffset, key, linked.code, source.layout, error);
+        throw;
+    }
+    counts.prepareNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - prepareStart).count()), std::memory_order_relaxed);
     invocationRequest = source;
     invocationRequest.shader.code = ShaderRecompiler::GetPreparedCode(*handle);
     auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(invocationRequest, handle, key);

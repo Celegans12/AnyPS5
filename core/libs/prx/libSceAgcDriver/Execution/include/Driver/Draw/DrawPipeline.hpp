@@ -110,17 +110,27 @@ private:
         }
         if (lowest >= highest) return false;
         std::lock_guard lock(mutex);
+        noteWriteScan();
+        const auto overlaps = [&](std::uint64_t begin, std::uint64_t limit) {
+            if (begin >= highest || limit <= lowest) return false;
+            for (const auto& range : ranges) {
+                const auto [first, end] = bounds(range);
+                if (first < limit && begin < end) return true;
+            }
+            return false;
+        };
+        if (DistinctWriteScans()) return std::ranges::any_of(distinctWrites, [&](const auto& write) { return overlaps(write.first.first, write.first.second); });
         for (const auto& item : items) {
             for (const auto& [begin, limit] : item.writes) {
-                if (begin >= highest || limit <= lowest) continue;
-                for (const auto& range : ranges) {
-                    const auto [first, end] = bounds(range);
-                    if (first < limit && begin < end) return true;
-                }
+                if (overlaps(begin, limit)) return true;
             }
         }
         return false;
     }
+    static bool DistinctWriteScans();
+    void addWrites(const std::vector<Range>& writes);
+    void removeWrites(const std::vector<Range>& writes);
+    void noteWriteScan();
     void run();
     void prepareLoop();
     Item* nextPrepare();
@@ -133,6 +143,9 @@ private:
     std::condition_variable wake;
     std::condition_variable idle;
     std::deque<Item> items;
+    // The distinct ranges the pending items write, each with how many of their writes it is: the pending-write scans
+    // walk these instead of every item's (best144: ~210 ranges over ~40 items, ~5 distinct, ~38k scans a second).
+    std::vector<std::pair<Range, std::uint32_t>> distinctWrites;
     std::exception_ptr failure;
     std::atomic<std::size_t> outstanding{0};
     std::uint32_t idleWaiters = 0;
@@ -167,6 +180,11 @@ private:
     std::uint64_t committerIdles = 0;
     std::uint64_t committerIdleNs = 0;
     std::uint64_t committerWakeNs = 0;
+    std::uint64_t writeScans = 0;
+    std::uint64_t writeScanSamples = 0;
+    std::uint64_t writeScanItems = 0;
+    std::uint64_t writeScanRanges = 0;
+    std::uint64_t writeScanDistinct = 0;
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(Event::Count)> events{};
     std::array<std::uint64_t, static_cast<std::size_t>(Event::Count)> reportedEvents{};
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
