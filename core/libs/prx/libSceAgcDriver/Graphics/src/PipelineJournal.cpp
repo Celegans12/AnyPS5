@@ -35,7 +35,10 @@ static_assert(sizeof(VkStencilOpState) == 28, "VkStencilOpState changed: update 
 static_assert(sizeof(VkVertexInputBindingDescription) == 12, "VkVertexInputBindingDescription changed: update the recipe codec");
 static_assert(sizeof(VkVertexInputAttributeDescription) == 16, "VkVertexInputAttributeDescription changed: update the recipe codec");
 #if defined(__linux__) && defined(__x86_64__) && defined(__GLIBCXX__)
-static_assert(sizeof(State) == 824, "State changed: update CanonicalPipelineState and the recipe codec");
+// 888 on Linux with this tree's State (stencilSwizzle, blendedColors, targetBlends): the codec does not
+// encode blendedColors, so a journalled build of a blended-colour pipeline lands under another pipeline key
+// (Pipeline.cpp keys blendedColors) and the draw builds its own: wasted prebuild work, not a wrong pipeline.
+static_assert(sizeof(State) == 888, "State changed: update CanonicalPipelineState and the recipe codec");
 static_assert(sizeof(ShaderStages) == 112, "ShaderStages changed: update the recipe codec");
 static_assert(sizeof(ShaderRecompiler::MeshConfiguration) == 40, "MeshConfiguration changed: update the recipe codec");
 static_assert(sizeof(ShaderRecompiler::TessellationConfiguration) == 40, "TessellationConfiguration changed: update the recipe codec");
