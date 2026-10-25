@@ -8,6 +8,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <array>
+#include <string>
 
 namespace AgcDriver::DriverDetail {
 
@@ -136,6 +138,96 @@ std::size_t TemplateBytes(const RelocatedTemplate& t) {
         if (v.vertexInfo != nullptr) bytes += sizeof(*v.vertexInfo);
     }
     return bytes;
+}
+
+// APS5_RELOCATED_MISS_SAMPLE=<n> (with APS5_PROFILE_DRAW): the first n "no index match" misses of every
+// 10 s print the words that differ from the nearest template of the same plan.
+std::size_t MissSampleQuota() {
+    static const std::size_t quota = std::getenv("APS5_PROFILE_DRAW") != nullptr ? EnvCount("APS5_RELOCATED_MISS_SAMPLE", 0) : 0;
+    return quota;
+}
+
+bool takeMissSample() {
+    static auto window = std::chrono::steady_clock::now();
+    static std::size_t taken = 0;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - window >= std::chrono::seconds(10)) {
+        window = now;
+        taken = 0;
+    }
+    if (taken >= MissSampleQuota()) return false;
+    ++taken;
+    return true;
+}
+
+const char* WordKind(std::uint32_t before, std::uint32_t after) {
+    const auto delta = static_cast<std::int64_t>(after) - static_cast<std::int64_t>(before);
+    const auto floatLike = [](std::uint32_t v) {
+        const auto exponent = (v >> 23u) & 0xffu;
+        return v == 0 || (exponent >= 100u && exponent <= 154u);
+    };
+    if (before <= 0xffffu && after <= 0xffffu) return delta >= -64 && delta <= 64 ? "small int (counter-like)" : "small int";
+    if (delta >= -64 && delta <= 64) return "counter";
+    if (floatLike(before) && floatLike(after)) return "float";
+    if (((before ^ after) & 3u) == 0 && delta >= -(std::int64_t{1} << 28) && delta <= (std::int64_t{1} << 28)) return "address-like";
+    return "other";
+}
+
+void reportMissSample(const RelocatedLookup& lookup, const RelocatedTemplate& exemplar, std::span<const std::uint32_t> words, std::span<const std::uint64_t> addresses, std::span<const std::shared_ptr<const RelocatedTemplate>> templates) {
+    const auto& now = lookup.program->userData;
+    std::string text;
+    char part[512];
+    std::snprintf(part, sizeof(part), "[relocated-miss] stage %zu program 0x%llx shape 0x%llx plan 0x%llx: %zu words (%zu hashed) in %zu runs, %zu templates of the plan; movable 0x%llx, demoted base (register read, no shader-data slot) 0x%llx, uncovered slot 0x%llx, fixed 0x%llx, patched 0x%llx", lookup.stage, static_cast<unsigned long long>(lookup.program->binary.codeAddress), static_cast<unsigned long long>(lookup.shape), static_cast<unsigned long long>(exemplar.plan), words.size(), exemplar.hashed.size(), exemplar.runs.size(), templates.size(), static_cast<unsigned long long>(exemplar.movable), static_cast<unsigned long long>(exemplar.demotedWords), static_cast<unsigned long long>(exemplar.uncoveredWords), static_cast<unsigned long long>(exemplar.fixedWords), static_cast<unsigned long long>(exemplar.patchedWords));
+    text += part;
+    const RelocatedTemplate* nearest = nullptr;
+    std::size_t nearestDiffers = std::numeric_limits<std::size_t>::max();
+    for (const auto& held : templates) {
+        if (held->variant->words.size() != words.size()) continue;
+        std::size_t differs = 0;
+        for (const auto p : held->hashed) differs += held->variant->words[p] != words[p] ? 1u : 0u;
+        if (differs < nearestDiffers) {
+            nearestDiffers = differs;
+            nearest = held.get();
+        }
+    }
+    if (nearest == nullptr) {
+        AgcDriver::ProfilePrint_nid_no_patch("%s; no template of the plan to compare\n", text.c_str());
+        return;
+    }
+    std::vector<std::uint32_t> runOf(words.size(), 0);
+    for (std::uint32_t r = 0; r < exemplar.runs.size(); ++r) {
+        for (std::uint32_t k = 0; k < exemplar.runs[r].count && exemplar.runs[r].first + k < runOf.size(); ++k) runOf[exemplar.runs[r].first + k] = r;
+    }
+    std::array<std::size_t, 4> byBase{};
+    std::vector<std::uint32_t> differing;
+    for (const auto p : nearest->hashed) {
+        if (nearest->variant->words[p] == words[p]) continue;
+        differing.push_back(p);
+        ++byBase[static_cast<std::size_t>(exemplar.runs[runOf[p]].base)];
+    }
+    std::snprintf(part, sizeof(part), "; nearest differs in %zu hashed words (fixed-address runs %zu, user-based %zu, pointer-based %zu, decoder %zu)", differing.size(), byBase[0], byBase[1], byBase[2], byBase[3]);
+    text += part;
+    static constexpr std::array<const char*, 4> bases{"fixed", "user", "pointer", "decoder"};
+    for (std::size_t d = 0; d < differing.size() && d < 8; ++d) {
+        const auto p = differing[d];
+        const auto& run = exemplar.runs[runOf[p]];
+        const auto address = addresses[runOf[p]] + static_cast<std::uint64_t>(p - run.first) * sizeof(std::uint32_t);
+        const auto before = nearest->variant->words[p];
+        const auto after = words[p];
+        std::snprintf(part, sizeof(part), "; word %u (run %u %s source %u, at 0x%llx, template at 0x%llx): 0x%08x -> 0x%08x %s", p, runOf[p], bases[static_cast<std::size_t>(run.base)], run.source, static_cast<unsigned long long>(address), static_cast<unsigned long long>(nearest->variant->runs[runOf[p]].first + static_cast<std::uint64_t>(p - run.first) * sizeof(std::uint32_t)), before, after, WordKind(before, after));
+        text += part;
+    }
+    std::size_t users = 0;
+    for (std::size_t w = 0; w < now.size() && w < nearest->userData.size(); ++w) {
+        if (now[w] == nearest->userData[w]) continue;
+        if (users++ >= 8) continue;
+        const auto bit = w < 64 ? std::uint64_t{1} << w : 0;
+        std::snprintf(part, sizeof(part), "; user word %zu (reg 0x%x%s%s%s%s): 0x%08x -> 0x%08x %s", w, static_cast<unsigned>(nearest->userDataBase + w - nearest->hidden), (nearest->movable & bit) != 0 ? " movable" : "", (nearest->demotedWords & bit) != 0 ? " demoted" : "", (nearest->fixedWords & bit) != 0 ? " fixed" : "", (nearest->fetchWords & bit) != 0 ? " fetch" : "", nearest->userData[w], now[w], WordKind(nearest->userData[w], now[w]));
+        text += part;
+    }
+    std::snprintf(part, sizeof(part), "; %zu user words differ\n", users);
+    text += part;
+    AgcDriver::ProfilePrint_nid_no_patch("%s", text.c_str());
 }
 
 }
@@ -312,10 +404,9 @@ std::shared_ptr<RelocatedTemplate> Driver::BuildRelocatedTemplate(const std::sha
     }
     const auto& compiledResult = *variant->compiled;
     const auto registers = compiledResult.userDataRegisterReads;
-    std::uint64_t forwarded = 0;
+    std::uint64_t forwarded = 0, uncovered = 0;
     {
         const auto shaderData = std::find_if(compiledResult.bindings.begin(), compiledResult.bindings.end(), [](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::ShaderData; });
-        std::uint64_t uncovered = 0;
         for (std::uint32_t slot = 0; slot < compiledResult.shaderDataUserWords.size(); ++slot) {
             const auto w = compiledResult.shaderDataUserWords[slot];
             if (w >= 64) continue;
@@ -324,7 +415,8 @@ std::shared_ptr<RelocatedTemplate> Driver::BuildRelocatedTemplate(const std::sha
         }
         forwarded &= ~uncovered;
     }
-    movable &= ~(registers & ~forwarded);
+    const auto demoted = movable & registers & ~forwarded;
+    movable &= ~demoted;
 
     const auto positionOf = [&](std::uint64_t address) -> std::int64_t {
         std::size_t position = 0;
@@ -501,6 +593,8 @@ std::shared_ptr<RelocatedTemplate> Driver::BuildRelocatedTemplate(const std::sha
     plan->fixedWords = fixed;
     plan->patchedWords = patched;
     plan->registerWords = registers;
+    plan->demotedWords = demoted;
+    plan->uncoveredWords = uncovered;
     plan->vertexMovable = !vertexWords.empty();
     plan->vertexWords = std::move(vertexWords);
     plan->hidden = hidden;
@@ -643,6 +737,8 @@ std::optional<RelocatedHit> Driver::relocatedDrawStage(const RelocatedLookup& lo
         std::vector<RelocatedPool::Kept> candidates;
     };
     std::vector<Gathered> gathered;
+    const bool missSampling = MissSampleQuota() != 0;
+    std::vector<std::pair<const Gathered*, std::vector<std::shared_ptr<const RelocatedTemplate>>>> samePlan;
     const auto& vertexInfo = *lookup.vertexInfo;
     const auto& now = program.userData;
     std::optional<RelocatedHit> hit;
@@ -703,7 +799,20 @@ std::optional<RelocatedHit> Driver::relocatedDrawStage(const RelocatedLookup& lo
             if (list == found->second.byIndex.end()) continue;
             g.candidates = list->second;
         }
+        if (missSampling) {
+            for (auto& g : gathered) {
+                if (!g.readable || !g.candidates.empty() || found == relocatedPools.end() || !takeMissSample()) continue;
+                auto& same = samePlan.emplace_back();
+                same.first = &g;
+                for (const auto& [index, list] : found->second.byIndex) {
+                    for (const auto& entry : list) {
+                        if (entry.held->plan == g.exemplar->plan && same.second.size() < 64) same.second.push_back(entry.held);
+                    }
+                }
+            }
+        }
     }
+    for (const auto& [g, templates] : samePlan) reportMissSample(lookup, *g->exemplar, g->words, g->addresses, templates);
     const auto classifyValueWord = [&](const RelocatedTemplate& t) {
         for (std::size_t w = 0; w < now.size() && w < t.userData.size(); ++w) {
             if (now[w] == t.userData[w]) continue;

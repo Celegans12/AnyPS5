@@ -225,6 +225,8 @@ struct RelocatedTemplate {
     std::uint64_t fixedWords = 0;
     std::uint64_t patchedWords = 0;
     std::uint64_t registerWords = 0;
+    std::uint64_t demotedWords = 0;
+    std::uint64_t uncoveredWords = 0;
     std::uint32_t hidden = 0;
     std::uint32_t userDataBase = 0;
     std::uint32_t firstUserSgpr = 0;
