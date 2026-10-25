@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/TraceRevision.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
@@ -658,6 +659,7 @@ void FrameRecorder::start() {
         return;
     }
     startedAt = std::chrono::steady_clock::now();
+    gdsAddress = Pm4::GdsAddress();
     startBoundary = boundaries;
     allocationsGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     ranges = committedRanges();
@@ -724,6 +726,7 @@ std::string FrameRecorder::header() const {
     text += ",\"commit\":" + jsonString(APS5_TRACE_COMMIT);
     text += std::string(",\"dirty\":") + (APS5_TRACE_DIRTY < 0 ? "null" : APS5_TRACE_DIRTY != 0 ? "true" : "false");
     text += ",\"arena_base\":" + std::to_string(arenaBase) + ",\"arena_bytes\":" + std::to_string(arenaBytes);
+    text += ",\"gds_address\":" + std::to_string(gdsAddress);
     text += ",\"start_boundary\":" + std::to_string(startBoundary) + ",\"frames\":" + std::to_string(recordedFrames);
     text += ",\"calls\":" + std::to_string(recordedCalls) + ",\"prologue_calls\":" + std::to_string(prologueCallCount);
     text += ",\"prologue_rewrites\":" + std::to_string(prologueRewrites) + ",\"prologue_rewrite_bytes\":" + std::to_string(prologueRewriteBytes) + ",\"prologue_dropped\":" + std::to_string(prologueDropped);

@@ -107,6 +107,7 @@ private:
     std::uint64_t prologueRewriteBytes = 0;
     std::uint64_t prologueDropped = 0;
     std::uint64_t prologueCallCount = 0;
+    std::uint64_t gdsAddress = 0;
     std::deque<FrameCall> reservations;
     std::vector<Range> ranges;
     std::map<std::uint64_t, std::uint64_t> shaderMarks;
