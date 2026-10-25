@@ -45,6 +45,10 @@ alignas(256) constexpr std::array<std::uint32_t, 8> ValuePixelCode{0x7e000200u, 
 alignas(256) constexpr std::array<std::uint32_t, 12> TablePixelCode{0xf40c0100u, 0xfa000000u, 0xbf8cc07fu, 0x7e040280u, 0x7e060280u, 0xf0001f08u, 0x00010402u, 0xbf8c3f70u, 0xf800180fu, 0x07060504u, 0xbf810000u, 0xbf810000u};
 alignas(256) constexpr std::array<std::uint32_t, 12> NestedPixelCode{0xf4040080u, 0xfa000000u, 0xbf8cc07fu, 0xf4000101u, 0xfa000000u, 0xbf8cc07fu, 0x7e000204u, 0x7e020280u, 0xf800180fu, 0x00010100u, 0xbf810000u, 0xbf810000u};
 alignas(256) constexpr std::array<std::uint32_t, 16> NestedImageCode{0xf4040080u, 0xfa000000u, 0xbf8cc07fu, 0xf40c0101u, 0xfa000000u, 0xbf8cc07fu, 0x7e040280u, 0x7e060280u, 0xf0001f08u, 0x00010402u, 0xbf8c3f70u, 0xf800180fu, 0x07060504u, 0xbf810000u, 0xbf810000u, 0xbf810000u};
+alignas(256) constexpr std::array<std::uint32_t, 8> PatchedPixelCode = ValuePixelCode;
+alignas(256) constexpr std::array<std::uint32_t, 8> FetchPixelCode = ValuePixelCode;
+alignas(256) constexpr std::array<std::uint32_t, 8> ReferencePixelCode = ValuePixelCode;
+alignas(256) constexpr std::array<std::uint32_t, 4> FetchVertexCode{0xbe8a2108u, 0xf80008cfu, 0x0b0a0908u, 0xbf810000u};
 alignas(16) std::array<float, 4> Other{0.5f, 0.0f, 0.0f, 0.0f};
 alignas(16) std::array<float, 4> ForwardedData{};
 alignas(32) std::array<std::array<std::uint64_t, 4>, 6> AlignedTables{};
@@ -68,6 +72,39 @@ alignas(8) Header ValuePixelHeader{};
 alignas(8) Header TablePixelHeader{};
 alignas(8) Header NestedPixelHeader{};
 alignas(8) Header NestedImageHeader{};
+alignas(8) Header PatchedPixelHeader{};
+alignas(8) Header FetchPixelHeader{};
+alignas(8) Header ReferencePixelHeader{};
+
+struct FetchHeader {
+    Shader shader{};
+    ShaderUserData userData{};
+    std::array<std::uint16_t, 11> direct{};
+    ShaderSemantic semantic{};
+};
+
+alignas(8) FetchHeader FetchVertexHeader{};
+
+void RegisteredFetch() {
+    auto& header = FetchVertexHeader;
+    header.direct.fill(0xffffu);
+    header.direct[8] = 4;
+    header.direct[10] = 6;
+    header.semantic.hardware_mapping = 8;
+    header.semantic.size_in_elements = 4;
+    header.userData.direct_resource_offset = header.direct.data();
+    header.userData.direct_resource_count = static_cast<std::uint16_t>(header.direct.size());
+    header.shader.file_header = 0x34333231u;
+    header.shader.version = 0x18u;
+    header.shader.header_size = sizeof(FetchHeader);
+    header.shader.shader_size = sizeof(FetchVertexCode);
+    header.shader.code = FetchVertexCode.data();
+    header.shader.type = 2;
+    header.shader.user_data = &header.userData;
+    header.shader.input_semantics = &header.semantic;
+    header.shader.num_input_semantics = 1;
+    AgcDriverRegisterShader_nid_postfix(&header.shader);
+}
 
 const Shader* Registered(Header& header, const std::uint32_t* code, std::size_t bytes, std::uint8_t type) {
     header.shader.file_header = 0x34333231u;
@@ -86,7 +123,7 @@ void Append(std::vector<std::uint32_t>& commands, std::uint32_t opcode, std::ini
     commands.insert(commands.end(), payload);
 }
 
-std::vector<std::uint32_t> DrawFrom(std::initializer_list<const void*> sources, const std::uint32_t* vertexCode = VertexCode.data(), const std::uint32_t* pixelCode = PixelCode.data(), const std::byte* target = ColorMemory.data()) {
+std::vector<std::uint32_t> DrawFrom(std::initializer_list<const void*> sources, const std::uint32_t* vertexCode = VertexCode.data(), const std::uint32_t* pixelCode = PixelCode.data(), const std::byte* target = ColorMemory.data(), const std::vector<std::pair<std::uint32_t, std::uint32_t>>* vertexRegisters = nullptr) {
     const auto color = reinterpret_cast<std::uintptr_t>(target);
     const auto vertex = reinterpret_cast<std::uintptr_t>(vertexCode);
     const auto pixel = reinterpret_cast<std::uintptr_t>(pixelCode);
@@ -111,10 +148,12 @@ std::vector<std::uint32_t> DrawFrom(std::initializer_list<const void*> sources, 
         {0x113, std::bit_cast<std::uint32_t>(1.0f)}, {0x114, 0},
         {0xb4, 0}, {0xb5, std::bit_cast<std::uint32_t>(1.0f)},
     };
-    const std::vector<std::pair<std::uint32_t, std::uint32_t>> shader{
-        {0xc8, static_cast<std::uint32_t>(vertex >> 8u)}, {0xc9, static_cast<std::uint32_t>(vertex >> 40u)}, {0x8b, 1u << 1u}, {0x8c, 0},
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> shader{
+        {0xc8, static_cast<std::uint32_t>(vertex >> 8u)}, {0xc9, static_cast<std::uint32_t>(vertex >> 40u)},
         {0x008, static_cast<std::uint32_t>(pixel >> 8u)}, {0x009, static_cast<std::uint32_t>(pixel >> 40u)}, {0x00b, 2u << 1u},
     };
+    if (vertexRegisters != nullptr) shader.insert(shader.end(), vertexRegisters->begin(), vertexRegisters->end());
+    else shader.insert(shader.end(), {{0x8b, 1u << 1u}, {0x8c, 0}});
     std::vector<std::uint32_t> commands;
     Append(commands, 0x79, {0x242, 4});
     for (const auto& [offset, value] : context) Append(commands, 0x69, {offset, value});
@@ -454,6 +493,106 @@ void PendingWriteOverMovedConstantSyncs() {
     Require(Hits(after, RelocatedClass::Data) - Hits(before, RelocatedClass::Data) == 1 && after.validations > before.validations, "a draw whose constant moved under the GPU write of the draw before it in the same submission was not a validated relocated data hit (" + std::to_string(MovingHits(after) - MovingHits(before)) + " hits, " + std::to_string(after.synced - before.synced) + " runs synced)");
 }
 
+
+void ForwardedRegisterWordReachesTheShader() {
+    Registered(TriangleVertexHeader, TriangleVertexCode.data(), sizeof(TriangleVertexCode), 2);
+    Registered(PatchedPixelHeader, PatchedPixelCode.data(), sizeof(PatchedPixelCode), 1);
+    const auto word = [](float value) { return reinterpret_cast<const void*>(static_cast<std::uintptr_t>(std::bit_cast<std::uint32_t>(value))); };
+    const bool patching = !AgcDriver::Graphics::RuntimeSwitches::Set(AgcDriver::Graphics::RuntimeSwitch::NoRelocatedRegisterWords);
+    Require(DrawRed({word(0.25f)}, PatchedPixelCode.data()) == 64, "the first draw of user word 0.25 did not render 64");
+    const auto before = Relocated();
+    Require(DrawRed({word(1.0f)}, PatchedPixelCode.data()) == 255, "a draw whose user word read only as a register changed to 1.0 did not render 255");
+    const auto after = Relocated();
+    if (patching) Require(after.patchedHits - before.patchedHits == 1, "a draw whose user word reaches the shader only through its shader data was not a relocated hit with a patched word (" + std::to_string(RelocatedHits(after) - RelocatedHits(before)) + " hits)");
+    else Require(after.patchedHits == before.patchedHits, "APS5_NO_RELOCATED_REGISTER_WORDS patched a register word");
+    const auto half = DrawRed({word(0.5f)}, PatchedPixelCode.data());
+    Require(half == 127 || half == 128, "a second patched register word 0.5 rendered " + std::to_string(half));
+}
+
+std::uint32_t Low(const void* pointer) {
+    return static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(pointer));
+}
+
+std::uint32_t High(const void* pointer) {
+    return static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(pointer) >> 32u);
+}
+
+std::vector<std::pair<std::uint32_t, std::uint32_t>> FetchRegisters(const std::array<std::uint32_t, 4>& sharps, const std::array<std::uint32_t, 1>& attributes) {
+    return {{0x8b, 8u << 1u}, {0x8c, Low(FetchVertexCode.data())}, {0x8d, High(FetchVertexCode.data())}, {0x8e, 0}, {0x8f, 0}, {0x90, Low(sharps.data())}, {0x91, High(sharps.data())}, {0x92, Low(attributes.data())}, {0x93, High(attributes.data())}};
+}
+
+std::array<std::uint32_t, 4> VertexSharp(const void* vertices, std::uint32_t word3 = 0x0104dfacu) {
+    constexpr std::uint32_t Stride = 16;
+    const auto address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(vertices));
+    return {static_cast<std::uint32_t>(address), (static_cast<std::uint32_t>(address >> 32u) & 0xffffu) | (Stride << 16u), 3u, word3};
+}
+
+void MovedVertexBufferReachesTheDraw() {
+    RegisteredFetch();
+    Registered(FetchPixelHeader, FetchPixelCode.data(), sizeof(FetchPixelCode), 1);
+    Registered(ReferencePixelHeader, ReferencePixelCode.data(), sizeof(ReferencePixelCode), 1);
+    const bool moving = !AgcDriver::Graphics::RuntimeSwitches::Set(AgcDriver::Graphics::RuntimeSwitch::NoRelocatedVertexBuffers);
+    const auto one = reinterpret_cast<const void*>(static_cast<std::uintptr_t>(std::bit_cast<std::uint32_t>(1.0f)));
+    alignas(64) static std::array<std::array<float, 16>, 4> vertices{};
+    vertices[0] = {0.0f, 0.0f, 0.5f, 1.0f, 0.5f, 0.0f, 0.5f, 1.0f, 0.0f, 0.5f, 0.5f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    vertices[1] = vertices[0];
+    vertices[2] = {0.0f, 0.0f, 0.5f, 1.0f, -0.5f, 0.0f, 0.5f, 1.0f, 0.0f, -0.5f, 0.5f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    vertices[3] = vertices[2];
+    alignas(64) static std::array<std::array<std::uint32_t, 4>, 5> sharps{};
+    for (std::size_t v = 0; v < 4; ++v) sharps[v] = VertexSharp(vertices[v].data());
+    sharps[4] = VertexSharp(vertices[3].data(), 0x0104d3acu);
+    alignas(64) static std::array<std::array<std::uint32_t, 1>, 5> attributes{};
+    const auto draw = [&](std::size_t table, const std::uint32_t* pixelCode) {
+        const auto registers = FetchRegisters(sharps[table], attributes[table]);
+        auto& target = ColorMemory;
+        target.fill(std::byte{0});
+        auto commands = DrawFrom({one}, FetchVertexCode.data(), pixelCode, target.data(), &registers);
+        Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
+        Require(sceAgcDriverSubmitDcb(&packet) == 0, "the fetch draw submission failed");
+        AgcDriverWaitIdle_nid_postfix();
+        AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(target.data()), target.size());
+        return Relocated();
+    };
+    alignas(256) static std::array<std::byte, 1024> first{};
+    alignas(256) static std::array<std::byte, 1024> reference{};
+    const auto start = draw(0, FetchPixelCode.data());
+    first = ColorMemory;
+    Require(std::any_of(first.begin(), first.end(), [](std::byte value) { return value != std::byte{0}; }), "the first draw of fetched vertices wrote no pixel");
+    const auto moved = draw(1, FetchPixelCode.data());
+    Require(ColorMemory == first, "a draw whose vertex buffer moved to the same vertices wrote other pixels");
+    if (moving) Require(moved.vertexHits - start.vertexHits == 1, "a draw whose vertex buffer moved to the same vertices was not a relocated hit with moved vertex buffers (" + std::to_string(RelocatedHits(moved) - RelocatedHits(start)) + " hits in " + std::to_string(moved.lookups - start.lookups) + " lookups, fallbacks" + [&] { std::string text; for (std::size_t f = 0; f < moved.fallbacks.size(); ++f) text += " " + std::to_string(moved.fallbacks[f] - start.fallbacks[f]); return text; }() + ", " + std::to_string(start.vertexMovable) + " vertex-movable learned)");
+    else Require(moved.vertexHits == start.vertexHits, "APS5_NO_RELOCATED_VERTEX_BUFFERS moved a vertex buffer");
+    draw(2, ReferencePixelCode.data());
+    reference = ColorMemory;
+    Require(reference != first, "the reference draw of the other vertices wrote the pixels of the first ones");
+    const auto before = Relocated();
+    const auto other = draw(3, FetchPixelCode.data());
+    Require(ColorMemory == reference, "a relocated draw of other vertices at a moved vertex buffer wrote other pixels than their uncached draw");
+    if (moving) Require(other.vertexHits - before.vertexHits == 1, "a draw whose vertex buffer moved to other vertices was not a relocated hit with moved vertex buffers");
+    const auto format = draw(4, FetchPixelCode.data());
+    Require(format.vertexHits == other.vertexHits, "a draw whose vertex buffer has another format was served by a relocated hit");
+}
+
+void LearningWaitsForARepeatedMiss() {
+    Registered(TriangleVertexHeader, TriangleVertexCode.data(), sizeof(TriangleVertexCode), 2);
+    Registered(TablePixelHeader, TablePixelCode.data(), sizeof(TablePixelCode), 1);
+    if (std::getenv("APS5_RELOCATED_LEARN_AFTER") != nullptr) return;
+    alignas(256) static std::array<std::uint8_t, 4096> texels{};
+    texels.fill(0x90u);
+    alignas(256) static std::array<std::array<std::uint32_t, 64>, 3> tables{};
+    for (auto& table : tables) std::copy_n(ImageDescriptor(texels.data()).begin(), 8, table.begin());
+    const auto start = Relocated();
+    Require(DrawRed({tables[0].data()}, TablePixelCode.data()) == 0x90, "the first draw of a new image in a known pool did not render 0x90");
+    const auto once = Relocated();
+    Require(once.learnDeferred - start.learnDeferred == 1 && MovingHits(once) == MovingHits(start), "the first miss of a new image in a known pool was learned at once (" + std::to_string(once.learnDeferred - start.learnDeferred) + " deferred)");
+    Require(DrawRed({tables[1].data()}, TablePixelCode.data()) == 0x90, "the second draw of the new image did not render 0x90");
+    const auto twice = Relocated();
+    Require(twice.learnDeferred == once.learnDeferred && MovingHits(twice) == MovingHits(once) && twice.learned > once.learned, "the second miss of the same image was not learned");
+    Require(DrawRed({tables[2].data()}, TablePixelCode.data()) == 0x90, "the third draw of the new image did not render 0x90");
+    const auto third = Relocated();
+    Require(third.lookups == twice.lookups || MovingHits(third) - MovingHits(twice) == 1, "the image learned on its second miss did not serve its third draw (" + std::to_string(MovingHits(third) - MovingHits(twice)) + " moving hits in " + std::to_string(third.lookups - twice.lookups) + " lookups)");
+}
+
 }
 
 int main() {
@@ -477,6 +616,9 @@ int main() {
             NestedPointerMovesItsRuns();
             NestedDescriptorChangeMisses();
             PendingWriteOverMovedConstantSyncs();
+            LearningWaitsForARepeatedMiss();
+            ForwardedRegisterWordReachesTheShader();
+            MovedVertexBufferReachesTheDraw();
         }
         AgcDriverShutdown_nid_postfix();
         std::cout << "A draw whose data moved reused the cached draw " << (libraries ? "with" : "without") << " graphics pipeline libraries\n";

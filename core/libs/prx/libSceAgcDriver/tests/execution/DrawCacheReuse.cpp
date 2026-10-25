@@ -143,12 +143,14 @@ void UserDataDrawsReuseTheirShape(bool libraries) {
     const auto mode = std::string(libraries ? "with" : "without") + " graphics pipeline libraries";
     const bool verify = std::getenv("APS5_VERIFY_DRAW_DATA_HITS") != nullptr;
     const auto before = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
+    const auto patchedBefore = AgcDriver::DriverDetail::Driver::Get().RelocatedHitCounters().patchedHits;
     const auto known = Submit(32.0f, {2.0f, 3.0f, 4.0f});
+    const auto patched = AgcDriver::DriverDetail::Driver::Get().RelocatedHitCounters().patchedHits - patchedBefore;
     Require(known.lookups - before.lookups == 3 && known.absent - before.absent == 3, mode + ": three draws with new user words did not miss the draw key three times");
     Require(known.dataHits - before.dataHits == 3, mode + ": " + std::to_string(known.dataHits - before.dataHits) + " of three draws that differ from a cached draw only in user words reused its decode, expected 3");
     Require(known.inserts == before.inserts, mode + ": a new key of a shape that has an entry was cached at its first sight");
     const auto stages = known.dataStagesReused + known.dataStagesCompiled - before.dataStagesReused - before.dataStagesCompiled;
-    Require(stages == 6, mode + ": the three data-only hits accounted " + std::to_string(stages) + " stages, expected 6");
+    Require(stages + (verify ? 0 : patched) == 6, mode + ": the three data-only hits accounted " + std::to_string(stages) + " stages and " + std::to_string(patched) + " relocated stages with patched register words, expected 6");
     Require(verify ? known.dataVerified - before.dataVerified == 3 : known.dataStagesReused - before.dataStagesReused == 3, mode + ": the data-only hits reused " + std::to_string(known.dataStagesReused - before.dataStagesReused) + " stages and verified " + std::to_string(known.dataVerified - before.dataVerified) + ", expected the 3 vertex stages, whose user words did not change");
     const auto fresh = Submit(16.0f, {5.0f, 6.0f, 7.0f});
     Require(fresh.inserts - known.inserts == 1, mode + ": three keys of a new shape inserted " + std::to_string(fresh.inserts - known.inserts) + " draw entries, expected 1: the shape's second key");
