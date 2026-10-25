@@ -379,6 +379,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PipelineCreationGate.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PipelineJournal.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/RuntimeSwitches.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShapeReplayProfile.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Resources.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PlaceholderImages.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Recorder.cpp
@@ -598,6 +599,17 @@ if(BUILD_TESTING)
     target_link_libraries(agc_runtime_switches_tests PRIVATE libc)
     configure_windows_unwind(agc_runtime_switches_tests)
     add_test(NAME agc_runtime_switches COMMAND agc_runtime_switches_tests)
+
+    add_test_executable(agc_draw_cache_shape_replay_tests tests/ShapeReplayProfile.cpp Graphics/src/ShapeReplayProfile.cpp)
+    target_include_directories(agc_draw_cache_shape_replay_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_draw_cache_shape_replay_tests PRIVATE shader_recompiler_agc_driver libc)
+    set_target_properties(agc_draw_cache_shape_replay_tests PROPERTIES CXX_EXTENSIONS OFF)
+    configure_windows_unwind(agc_draw_cache_shape_replay_tests)
+    add_test(NAME agc_draw_cache_shape_replay COMMAND agc_draw_cache_shape_replay_tests)
+    if(WIN32)
+        set_tests_properties(agc_draw_cache_shape_replay PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     set_tests_properties(agc_runtime_switches PROPERTIES TIMEOUT 20)
     if(WIN32)
         set_tests_properties(agc_runtime_switches PROPERTIES ENVIRONMENT_MODIFICATION

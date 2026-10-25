@@ -152,6 +152,7 @@ struct StageCapture {
     std::uint32_t pushOffset = 0;
     ShaderRecompiler::SrtUserDataUse userDataUse;
     std::uint64_t userDataMask = ~std::uint64_t{0};
+    std::shared_ptr<const Graphics::ShapeReplay::StageRecord> shapeReplay;
 };
 
 struct RelocatableUserWord {

@@ -10,6 +10,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShapeReplayProfile.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
@@ -736,6 +737,20 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     if (pipelineIndirect && DrawPipeline::Queue0().DrainIfOverlaps(memory, regionBounds, DrawPipeline::DrainReason::Capture)) return draw(queue, packet, submission, rejected);
     if (pipelined && !deferredLabels().labels.empty()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Labels);
     if (recordQueuedLabelsAfterCapture(submission.queue, memory)) return draw(queue, packet, submission, rejected);
+    if (Graphics::ShapeReplay::Enabled()) {
+        if (shapeKey == 0) {
+            Graphics::ShapeReplay::NoteUnkeyedDraw();
+        } else {
+            std::vector<const Graphics::ShapeReplay::StageRecord*> replayStages;
+            replayStages.reserve(programs.size());
+            for (std::size_t i = 0; i < programs.size(); ++i) {
+                if (roles[i] == Role::GeometryBack) continue;
+                const auto& record = recompiled[i] ? stageCaptures[i].shapeReplay : matched[i] != nullptr ? matched[i]->shapeReplay : nullptr;
+                replayStages.push_back(record.get());
+            }
+            Graphics::ShapeReplay::NoteDraw(shapeKey, replayStages, Graphics::ShapeReplay::DrawParameterBits(drawParameters.indexed, drawParameters.indexSize, drawParameters.instanceCount, drawParameters.indirect.has_value()), frameSerial.load(std::memory_order_relaxed), drawHit);
+        }
+    }
 
     bool rectListBuilt = false;
 

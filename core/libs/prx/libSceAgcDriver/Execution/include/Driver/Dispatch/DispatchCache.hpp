@@ -19,6 +19,10 @@
 #include <vector>
 #include "prx/libc/include/general/AtomicSharedPtr.hpp"
 
+namespace AgcDriver::Graphics::ShapeReplay {
+struct StageRecord;
+}
+
 namespace AgcDriver::DriverDetail {
 
 inline constexpr std::size_t MaxDispatchVariants = 8;
@@ -47,6 +51,7 @@ struct DispatchVariant {
     std::vector<std::pair<std::uint32_t, std::uint32_t>> shaderDataPatches;
     std::uint64_t userDataMask = ~std::uint64_t{0};
     std::shared_ptr<const ShaderRecompiler::ShaderVertexStageInfo> vertexInfo;
+    std::shared_ptr<const Graphics::ShapeReplay::StageRecord> shapeReplay;
 
     std::shared_ptr<ShaderMemory> memory;
     std::vector<ShaderRecompiler::MemoryRegion> captured;

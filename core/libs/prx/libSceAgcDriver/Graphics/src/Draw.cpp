@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShapeReplayProfile.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureService.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/SampleOrder.hpp"
@@ -2030,6 +2031,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                 if (trimKey) CheckBufferAliases(context, shaders, state.color, draw.indexAddress, indexBytes);
                 outcome.kind = KindTemplateHit;
                 countCache(&DrawProfile::cacheHits);
+                if (ShapeReplay::Enabled()) ShapeReplay::NoteResourceLookup(resolved.contentKey, true);
                 if (addressBased) CountAddressReuse(AddressReuse::Reused);
             } else if (valid) {
                 if (addressBased) CountAddressReuse(AddressReuse::Moved, timer.profile ? static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - proofStart).count()) : 0);
@@ -2070,6 +2072,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
         outcome.addressBased = resolved.resources->HoldsLease();
         outcome.kind = outcome.addressBased ? KindBda : KindBuild;
         if (resolved.cacheable) countCache(&DrawProfile::cacheMisses);
+        if (resolved.cacheable && ShapeReplay::Enabled()) ShapeReplay::NoteResourceLookup(resolved.contentKey, false);
     }
     if (prepared != nullptr && prepared->resources != nullptr) {
         // A cache hit served the draw: the prepared build is not needed.
@@ -2535,6 +2538,8 @@ bool WriteOnlyPasses() {
 }
 
 void recordDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawInputs& inputs, RecordedDraw& record, DrawOutcome& outcome, DrawTimer& timer, double& ownWaitedMs) {
+    const bool replayLaps = ShapeReplay::Enabled();
+    if (replayLaps) ShapeReplay::RecordStart();
     auto* recorder = record.recorder;
     auto& resources = *record.resources;
     const auto* args = record.indirect != nullptr ? record.indirect->args : nullptr;
@@ -2566,7 +2571,9 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         outcome.storesFlushed = true;
     }
     const bool heap = serveBindlessTables(context, *recorder, shaders);
+    if (replayLaps) ShapeReplay::RecordLap(ShapeReplay::RecordPart::Prelude);
     const auto drawBindings = resources.PrepareDrawBindings(*recorder, record.moved);
+    if (replayLaps) ShapeReplay::RecordLap(ShapeReplay::RecordPart::BindingsUpdate);
     const bool capture = CaptureInputsEnabled();
     const bool meshIndirect = state.stages.mesh && args != nullptr;
     const bool addressBased = resources.HoldsLease();
@@ -2619,7 +2626,9 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     }
     const PassAccess passAccess{passReads, passWrites, passImages, passAttachments, unknownMemory, unknownWrites, passWriteOnly};
     const bool fenced = state.depth.has_value() || !record.proxies.empty() || record.blended != nullptr;
+    if (replayLaps) ShapeReplay::RecordLap(ShapeReplay::RecordPart::PassAccess);
     const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect || record.blended != nullptr || heap || PixelFunctionLdsSubgroup(shaders) != 0u, fenced, passAccess);
+    if (replayLaps) ShapeReplay::RecordLap(ShapeReplay::RecordPart::StartPass);
     for (const auto& target : record.multisampleTargets) KeepMultisampleTarget_nid_no_patch(target);
     const bool continued = start.continued;
     outcome.passContinued = continued;
@@ -2739,7 +2748,12 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
             }
         };
     }
+    if (replayLaps) ShapeReplay::RecordLap(ShapeReplay::RecordPart::Emit);
     recorder->LeaveRenderPassOpen(passKey, drawTiming, fenced, passAccess, std::move(storeProxies));
+    if (replayLaps) {
+        ShapeReplay::RecordLap(ShapeReplay::RecordPart::LeavePass);
+        ShapeReplay::RecordEnd();
+    }
     timer.phase(PhaseRecord);
     if (record.blended != nullptr) {
         recorder->Keep(record.blended);
