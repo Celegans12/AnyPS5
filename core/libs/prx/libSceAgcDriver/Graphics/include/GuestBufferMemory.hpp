@@ -538,6 +538,9 @@ private:
         // of the region went through that kernel (no whole-copied edge), so the pristine copy equals
         // the shadow after the copy-back.
         bool residentPristine = false;
+        // `pristine` is (or was) a resident entry's shared copy: a use without the entry's copy
+        // takes one of its own instead.
+        bool pristineFromEntry = false;
         mutable bool pristineKept = false;
         std::uint64_t copySerial = 0;
     };

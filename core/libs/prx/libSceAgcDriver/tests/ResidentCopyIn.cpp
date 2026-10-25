@@ -14,6 +14,7 @@
 #include <iostream>
 #include <memory>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 #ifdef _WIN32
@@ -390,19 +391,6 @@ int RunResidentCopyInTests(const Context& context, Recorder& recorder, bool budg
         if (detect) expectWord(fx, word(0, 30), Initial, "a use after an unclean end skipped its copy-in");
     }
 
-    // (8) APS5_NO_RESIDENT_COPY_IN toggled while the game runs: set, the next use copies in whole;
-    // cleared again, the use after skips (the uses made while set kept the entry's state).
-    RuntimeSwitches::Assign(RuntimeSwitch::NoResidentCopyIn, true);
-    secret(fx, a, word(1, 7), 0xdead0008u);
-    reuse(fx, a);
-    work(fx, a, {});
-    if (detect) expectWord(fx, word(1, 7), Initial, "a use with APS5_NO_RESIDENT_COPY_IN set skipped its copy-in");
-    RuntimeSwitches::Assign(RuntimeSwitch::NoResidentCopyIn, false);
-    secret(fx, a, word(1, 8), 0xdead0009u);
-    reuse(fx, a);
-    work(fx, a, {});
-    if (detect) expectWord(fx, word(1, 8), 0xdead0009u, "a use after APS5_NO_RESIDENT_COPY_IN was cleared copied in");
-
     // (9) A use that never ended (a reused build not dispatched): the next one copies in whole.
     reuse(fx, a);
     secret(fx, a, word(3, 4), 0xdead000au);
@@ -420,7 +408,40 @@ int RunResidentCopyInTests(const Context& context, Recorder& recorder, bool budg
     Require(d.view.buffer == shadow, "the resident shadow did not outlive its builds");
     work(fx, d, {});
     if (detect) expectWord(fx, word(4, 4), Initial, "a use after a build destroyed mid-use skipped its copy-in");
+
+    // (8) APS5_NO_RESIDENT_COPY_IN toggled while the game runs: set, the registry is emptied (no
+    // shadow kept, shared or noted) and every use copies in whole, a build that shared a shadow
+    // keeping it as its own; cleared again, new builds register anew and skip from their second use.
+    RuntimeSwitches::Assign(RuntimeSwitch::NoResidentCopyIn, true);
+    secret(fx, d, word(1, 7), 0xdead0008u);
+    reuse(fx, d);
+    work(fx, d, {});
+    if (detect) expectWord(fx, word(1, 7), Initial, "a use with APS5_NO_RESIDENT_COPY_IN set skipped its copy-in");
+    Require(ResidentShadows::Find(fx.element, fx.element + fx.elementBytes, false) == nullptr && ResidentShadows::Held().first == 0, "APS5_NO_RESIDENT_COPY_IN set kept resident shadows");
+    secret(fx, d, word(1, 9), 0xdead000du);
+    reuse(fx, d);
+    work(fx, d, {});
+    if (detect) expectWord(fx, word(1, 9), Initial, "a build whose shadow left the registry skipped its copy-in");
+    RuntimeSwitches::Assign(RuntimeSwitch::NoResidentCopyIn, false);
+    auto e = makeBuild(fx);
+    Require(e.view.buffer != d.view.buffer, "a new build took a shadow the switched-off registry gave up");
+    work(fx, e, {});
+    Require(ResidentShadows::Find(fx.element, fx.element + fx.elementBytes, false) != nullptr, "a new build after APS5_NO_RESIDENT_COPY_IN was cleared registered no shadow");
+    secret(fx, e, word(1, 8), 0xdead0009u);
+    reuse(fx, e);
+    work(fx, e, {});
+    if (detect) expectWord(fx, word(1, 8), 0xdead0009u, "a use after APS5_NO_RESIDENT_COPY_IN was cleared copied in");
     d.memory.reset();
+    e.memory.reset();
+
+    // (11) Idle entries leave the registry (APS5_RESIDENT_IDLE_MS, 300 in this test's environment).
+    if (const char* idle = std::getenv("APS5_RESIDENT_IDLE_MS"); idle != nullptr) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(std::strtoll(idle, nullptr, 10) + 1100));
+        auto f = makeBuild(fx);
+        work(fx, f, {});
+        Require(counter(stats.idleEvictions) > 0, "an idle resident shadow was not evicted");
+        f.memory.reset();
+    }
 
     // The cost of the copy-in decision's walk (printed only): a GetWriteWatch over the range's pages.
     {

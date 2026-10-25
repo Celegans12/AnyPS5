@@ -26,7 +26,22 @@ struct Registry {
     std::uint64_t bytes = 0;
     std::uint64_t tick = 0;
     std::atomic<std::size_t> live{0};
+    std::atomic<std::int64_t> lastSweep{0};
+    bool copyInOff = false;
+    bool pristineOff = false;
 };
+
+std::int64_t steadyMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+std::int64_t idleMs() {
+    static const std::int64_t ms = [] {
+        const char* value = std::getenv("APS5_RESIDENT_IDLE_MS");
+        return value != nullptr ? static_cast<std::int64_t>(std::strtoll(value, nullptr, 10)) : std::int64_t{10000};
+    }();
+    return ms;
+}
 
 Registry& registry() {
     static auto* state = new Registry;
@@ -36,7 +51,7 @@ Registry& registry() {
 std::uint64_t budgetBytes() {
     static const std::uint64_t bytes = [] {
         const char* value = std::getenv("APS5_RESIDENT_MIB");
-        return (value != nullptr ? std::strtoull(value, nullptr, 10) : 1024ull) << 20u;
+        return (value != nullptr ? std::strtoull(value, nullptr, 10) : 256ull) << 20u;
     }();
     return bytes;
 }
@@ -52,7 +67,8 @@ void unlink(Registry& state, Entry& entry) {
             break;
         }
     }
-    state.bytes -= entry.end - entry.begin;
+    state.bytes -= entry.end - entry.begin + entry.pristineBytes;
+    entry.pristineBytes = 0;
     state.live.fetch_sub(1, std::memory_order_relaxed);
 }
 
@@ -63,22 +79,46 @@ void eraseLocked(Registry& state, const EntryPtr& entry) {
     if (found != state.entries.end() && found->second == entry) state.entries.erase(found);
 }
 
-// Least recently used idle entries go until `needed` more bytes fit (an entry with an open use
-// stays: its build owes the use's end).
-bool makeRoom(Registry& state, std::uint64_t needed) {
+// Least recently used idle entries go until `needed` more bytes fit, down to 7/8 of the budget in
+// one pass so a full registry does not scan once per new entry (an entry with an open use stays:
+// its build owes the use's end). The registry's references go to `dropped`, released by the caller
+// outside the lock.
+bool makeRoom(Registry& state, std::uint64_t needed, std::vector<EntryPtr>& dropped) {
     const auto budget = budgetBytes();
     if (needed > budget) return false;
-    while (state.bytes + needed > budget) {
-        EntryPtr oldest;
-        for (const auto& [key, entry] : state.entries) {
-            if (entry->user != nullptr) continue;
-            if (oldest == nullptr || entry->lastUse < oldest->lastUse) oldest = entry;
-        }
-        if (oldest == nullptr) return false;
-        eraseLocked(state, oldest);
+    if (state.bytes + needed <= budget) return true;
+    std::vector<EntryPtr> idle;
+    for (const auto& [key, entry] : state.entries) {
+        if (entry->user == nullptr) idle.push_back(entry);
+    }
+    // Entries no build holds any more go first (their shadows are the registry's VRAM alone), each
+    // group least recently used first.
+    const auto orphan = [](const EntryPtr& entry) { return entry->shadow == nullptr || entry->shadow.use_count() == 1; };
+    std::sort(idle.begin(), idle.end(), [&](const EntryPtr& left, const EntryPtr& right) {
+        const bool leftOrphan = orphan(left);
+        const bool rightOrphan = orphan(right);
+        if (leftOrphan != rightOrphan) return leftOrphan;
+        return left->lastUse < right->lastUse;
+    });
+    const auto target = std::min(budget - needed, budget - budget / 8);
+    for (const auto& entry : idle) {
+        if (state.bytes <= target) break;
+        eraseLocked(state, entry);
+        dropped.push_back(entry);
         Counters().evictions.fetch_add(1, std::memory_order_relaxed);
     }
-    return true;
+    return state.bytes + needed <= budget;
+}
+
+// Outside the registry lock: an evicted entry's buffers go with the last build holding them (every
+// recorded use kept them in its batch).
+void release(std::vector<EntryPtr>& dropped) {
+    for (auto& entry : dropped) {
+        if (entry->user != nullptr) continue;
+        entry->shadow.reset();
+        entry->pristine.reset();
+    }
+    dropped.clear();
 }
 
 }
@@ -93,6 +133,78 @@ std::unique_lock<AgcDriver::Mutex> Lock() {
 
 void Touch(Entry& entry) {
     entry.lastUse = ++registry().tick;
+    entry.lastUseMs = steadyMs();
+}
+
+bool ChargePristine(Entry& entry, std::uint64_t bytes) {
+    auto& state = registry();
+    std::vector<EntryPtr> dropped;
+    bool charged = false;
+    {
+        std::lock_guard lock(state.mutex);
+        if (entry.live && entry.pristineBytes == 0 && makeRoom(state, bytes, dropped)) {
+            entry.pristineBytes = bytes;
+            state.bytes += bytes;
+            charged = true;
+        }
+    }
+    release(dropped);
+    if (!charged) Counters().pristineRefused.fetch_add(1, std::memory_order_relaxed);
+    return charged;
+}
+
+void Sweep() {
+    auto& state = registry();
+    if (state.live.load(std::memory_order_relaxed) == 0) return;
+    const auto now = steadyMs();
+    auto last = state.lastSweep.load(std::memory_order_relaxed);
+    if (now - last < 1000 || !state.lastSweep.compare_exchange_strong(last, now)) return;
+    std::vector<EntryPtr> dropped;
+    {
+        std::lock_guard lock(state.mutex);
+        for (auto it = state.entries.begin(); it != state.entries.end();) {
+            auto& entry = it->second;
+            if (entry->user != nullptr || now - entry->lastUseMs <= idleMs()) {
+                ++it;
+                continue;
+            }
+            dropped.push_back(entry);
+            unlink(state, *entry);
+            it = state.entries.erase(it);
+            Counters().idleEvictions.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    release(dropped);
+}
+
+void Switches(bool copyInOff, bool pristineOff) {
+    auto& state = registry();
+    std::vector<EntryPtr> dropped;
+    std::vector<std::shared_ptr<Buffer>> pristines;
+    {
+        std::lock_guard lock(state.mutex);
+        if (copyInOff && !state.copyInOff) {
+            for (auto& [key, entry] : state.entries) {
+                unlink(state, *entry);
+                dropped.push_back(entry);
+            }
+            state.entries.clear();
+            state.byBegin.clear();
+            state.longest = 0;
+        }
+        if (pristineOff && !state.pristineOff) {
+            for (auto& [key, entry] : state.entries) {
+                if (entry->user != nullptr || entry->pristine == nullptr) continue;
+                pristines.push_back(std::move(entry->pristine));
+                state.bytes -= entry->pristineBytes;
+                entry->pristineBytes = 0;
+                entry->pristineSame = false;
+            }
+        }
+        state.copyInOff = copyInOff;
+        state.pristineOff = pristineOff;
+    }
+    release(dropped);
 }
 
 EntryPtr Find(std::uint64_t begin, std::uint64_t end, bool addressable) {
@@ -106,9 +218,17 @@ EntryPtr Find(std::uint64_t begin, std::uint64_t end, bool addressable) {
 EntryPtr Register(std::uint64_t begin, std::uint64_t end, bool addressable, std::shared_ptr<Buffer> shadow, std::uint64_t importSerial) {
     if (!Enabled() || shadow == nullptr || end <= begin) return nullptr;
     auto& state = registry();
+    std::vector<EntryPtr> dropped;
+    struct Released {
+        std::vector<EntryPtr>& dropped;
+        ~Released() { release(dropped); }
+    } released{dropped};
     std::lock_guard lock(state.mutex);
-    if (const auto found = state.entries.find(Key{begin, end, addressable}); found != state.entries.end()) eraseLocked(state, found->second);
-    if (!makeRoom(state, end - begin)) {
+    if (const auto found = state.entries.find(Key{begin, end, addressable}); found != state.entries.end()) {
+        dropped.push_back(found->second);
+        eraseLocked(state, found->second);
+    }
+    if (!makeRoom(state, end - begin, dropped)) {
         Counters().privateBudget.fetch_add(1, std::memory_order_relaxed);
         return nullptr;
     }
@@ -119,6 +239,7 @@ EntryPtr Register(std::uint64_t begin, std::uint64_t end, bool addressable, std:
     entry->shadow = std::move(shadow);
     entry->importSerial = importSerial;
     entry->lastUse = ++state.tick;
+    entry->lastUseMs = steadyMs();
     state.entries.emplace(Key{begin, end, addressable}, entry);
     state.byBegin.emplace(begin, entry.get());
     state.longest = std::max(state.longest, end - begin);
@@ -228,7 +349,9 @@ void Report() {
     const auto copied = delta(stats.copiedBytes, seen[5]);
     unsigned long long by[static_cast<std::size_t>(Full::Count)];
     for (std::size_t reason = 0; reason < static_cast<std::size_t>(Full::Count); ++reason) by[reason] = delta(stats.fullBy[reason], seen[6 + reason]);
-    static std::uint64_t more[16]{};
+    static std::uint64_t more[20]{};
+    const auto idle = delta(stats.idleEvictions, more[17]);
+    const auto pristineRefused = delta(stats.pristineRefused, more[18]);
     const auto busy = delta(stats.privateBusy, more[0]);
     const auto budget = delta(stats.privateBudget, more[1]);
     const auto lane = delta(stats.privateLane, more[2]);
@@ -249,10 +372,10 @@ void Report() {
     const auto pristineKept = delta(stats.pristineKept, pristine[2]);
     const auto pristineLost = delta(stats.pristineLost, pristine[3]);
     const auto [entries, bytes] = Held();
-    AgcDriver::ProfilePrint_nid_no_patch("[resident] copy-in (APS5_NO_RESIDENT_COPY_IN %s), last 10 s: %llu staged uses on resident shadows: %llu skipped, %llu partial, %llu full (new %llu, switched off %llu, unclean %llu, import %llu, mapping %llu, foreign note %llu, lane %llu, lease %llu, unwatched %llu); %.0f KiB copied in, %.0f KiB saved; private shadows: busy %llu, budget %llu, lane %llu, not covered by writes %llu; reuses refused %llu, takeovers %llu, runs closed %llu; uses ended clean %llu, foreign %llu; foreign notes %llu; %llu entries (%.1f MiB of %llu MiB), %llu evicted; verify %llu checked, %llu differ; pristine copies (APS5_NO_RESIDENT_PRISTINE %s): %llu uses, %.0f KiB copied, %.0f KiB saved, %llu kept by their copy-backs, %llu not\n",
+    AgcDriver::ProfilePrint_nid_no_patch("[resident] copy-in (APS5_NO_RESIDENT_COPY_IN %s), last 10 s: %llu staged uses on resident shadows: %llu skipped, %llu partial, %llu full (new %llu, switched off %llu, unclean %llu, import %llu, mapping %llu, foreign note %llu, lane %llu, lease %llu, unwatched %llu); %.0f KiB copied in, %.0f KiB saved; private shadows: busy %llu, budget %llu, lane %llu, not covered by writes %llu; reuses refused %llu, takeovers %llu, runs closed %llu; uses ended clean %llu, foreign %llu; foreign notes %llu; %llu entries (%.1f MiB of %llu MiB with pristine copies), %llu evicted for room, %llu idle; verify %llu checked, %llu differ; pristine copies (APS5_NO_RESIDENT_PRISTINE %s): %llu uses, %.0f KiB copied, %.0f KiB saved, %llu kept by their copy-backs, %llu not, %llu over the budget\n",
         RuntimeSwitches::Set(RuntimeSwitch::NoResidentCopyIn) ? "set" : "unset", uses, skipped, partial, full, by[0], by[1], by[2], by[3], by[4], by[5], by[6], by[7], by[8], copied / 1024.0, saved / 1024.0,
-        busy, budget, lane, covered, refused, takeovers, closed, clean, foreign, notes, static_cast<unsigned long long>(entries), bytes / 1048576.0, static_cast<unsigned long long>(budgetBytes() >> 20u), evicted, verified, differs,
-        RuntimeSwitches::Set(RuntimeSwitch::NoResidentPristine) ? "set" : "unset", pristineUses, pristineCopied / 1024.0, pristineSaved / 1024.0, pristineKept, pristineLost);
+        busy, budget, lane, covered, refused, takeovers, closed, clean, foreign, notes, static_cast<unsigned long long>(entries), bytes / 1048576.0, static_cast<unsigned long long>(budgetBytes() >> 20u), evicted, idle, verified, differs,
+        RuntimeSwitches::Set(RuntimeSwitch::NoResidentPristine) ? "set" : "unset", pristineUses, pristineCopied / 1024.0, pristineSaved / 1024.0, pristineKept, pristineLost, pristineRefused);
 }
 
 }

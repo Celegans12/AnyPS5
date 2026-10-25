@@ -50,6 +50,10 @@ struct Entry {
     // copies in into it.
     std::shared_ptr<Buffer> pristine;
     bool pristineSame = false;
+    // The pristine copy's bytes, charged to the budget with the shadow's (ChargePristine).
+    std::uint64_t pristineBytes = 0;
+    // Steady-clock milliseconds of the last use (Touch), for the idle eviction (Sweep).
+    std::int64_t lastUseMs = 0;
     std::uint64_t lastUse = 0;
 };
 
@@ -57,6 +61,16 @@ using EntryPtr = std::shared_ptr<Entry>;
 
 // Whether the registry is used at all (APS5_RESIDENT_MIB=0 turns it off for the whole run).
 bool Enabled();
+// Charges an entry's pristine copy to the budget (evicting idle entries); false: it does not fit,
+// and the use keeps a pristine copy of its build's own.
+bool ChargePristine(Entry& entry, std::uint64_t bytes);
+// Evicts the entries idle for longer than APS5_RESIDENT_IDLE_MS (default 10000); runs at most once a
+// second, from the copy-in decisions.
+void Sweep();
+// The switches seen at a copy-in decision: APS5_NO_RESIDENT_COPY_IN set empties the registry (once
+// per change: no shadow is kept, shared or noted while it is set); APS5_NO_RESIDENT_PRISTINE set drops
+// the entries' pristine copies.
+void Switches(bool copyInOff, bool pristineOff);
 // The live entry of exactly [begin, end) with that buffer usage, or null.
 EntryPtr Find(std::uint64_t begin, std::uint64_t end, bool addressable);
 // Registers a shadow for [begin, end) (replacing a live entry of the same key, which is dropped).
@@ -97,6 +111,8 @@ struct Stats {
     std::atomic<std::uint64_t> privateBusy{0};
     std::atomic<std::uint64_t> privateBudget{0};
     std::atomic<std::uint64_t> privateLane{0};
+    std::atomic<std::uint64_t> idleEvictions{0};
+    std::atomic<std::uint64_t> pristineRefused{0};
     std::atomic<std::uint64_t> privateCovered{0};
     std::atomic<std::uint64_t> reuseRefused{0};
     std::atomic<std::uint64_t> takeovers{0};

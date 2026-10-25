@@ -5492,8 +5492,11 @@ void GuestBufferMemory::copyRegion(Region& region, bool addressable) {
 //   (today's path); a reused build closes the run owing the other use's copy-backs
 //   (CloseRunOwing), and is refused reuse (RecordStagingCopies false) when it cannot; a use opened
 //   and never ended (a build that threw, or a revalidated build not dispatched) leaves the entry
-//   unclean for whoever comes next. The registry's budget (APS5_RESIDENT_MIB, 1024) evicts idle
-//   entries; a shadow the device refuses takes the unstaged path as before.
+//   unclean for whoever comes next. The registry's budget (APS5_RESIDENT_MIB, 256, shadows and
+//   pristine copies together: what it holds competes with the texture caches for VRAM) evicts idle
+//   entries, those no build holds any more first; entries idle for APS5_RESIDENT_IDLE_MS (10000) go
+//   too. A shadow the device refuses takes the unstaged path as before. With the switch set the
+//   registry is emptied and nothing is kept or noted.
 // Exact either way: a skipped byte is one the tracker proves nothing stored into since the shadow
 // equalled the import. APS5_VERIFY_RESIDENT=<n> copies the import and the shadow of the first n uses
 // per 10 s that skipped anything into a host buffer at the copy-in point and prints
@@ -5519,6 +5522,14 @@ void GuestBufferMemory::residentCopyRanges(Region& region, Recorder& recorder, b
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     auto& stats = ResidentShadows::Counters();
     const bool off = RuntimeSwitches::Set(RuntimeSwitch::NoResidentCopyIn);
+    // Switched off: no shadow is kept, shared or noted (the registry is emptied once); a build that
+    // shared one keeps it as its private shadow, copied in whole, as without residency.
+    ResidentShadows::Switches(off, RuntimeSwitches::Set(RuntimeSwitch::NoResidentPristine));
+    if (off) {
+        region.resident.reset();
+        return;
+    }
+    ResidentShadows::Sweep();
     const auto bytes = static_cast<std::size_t>(region.end - region.begin);
     const int lane = Recorder::ThreadLane();
     const bool lanes = recorder.AsyncLaneActive();
@@ -5530,7 +5541,7 @@ void GuestBufferMemory::residentCopyRanges(Region& region, Recorder& recorder, b
         if (!region.resident->live || region.resident->shadow != region.buffer) region.resident.reset();
     }
     if (region.resident == nullptr) {
-        if (reuse || off) return;
+        if (reuse) return;
         if (region.overlay && !coveredByWrites(region)) {
             stats.privateCovered.fetch_add(1, std::memory_order_relaxed);
             return;
@@ -5884,22 +5895,26 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
                     auto lock = ResidentShadows::Lock();
                     shared = region->resident->pristine;
                 }
-                if (shared == nullptr) {
+                if (shared == nullptr && ResidentShadows::ChargePristine(*region->resident, bytes)) {
                     shared = stagingBuffer(context, bytes, pristineUsage);
                     pristineWhole[index] = true;
                     auto lock = ResidentShadows::Lock();
                     region->resident->pristine = shared;
                 }
-                region->pristine = std::move(shared);
-            } else if (region->resident != nullptr && region->pristine != nullptr) {
-                // A pristine copy taken from the entry earlier is the entry's (a shared buffer): this
-                // use's own copy is made apart.
-                std::shared_ptr<Buffer> shared;
-                {
-                    auto lock = ResidentShadows::Lock();
-                    shared = region->resident->pristine;
+                if (shared == nullptr) {
+                    // Over the budget (or refused by the device): a pristine copy of the build's own.
+                    region->residentPristine = false;
+                    pristineWhole[index] = true;
+                } else {
+                    region->pristine = std::move(shared);
+                    region->pristineFromEntry = true;
                 }
-                if (shared == region->pristine) region->pristine.reset();
+            }
+            if (!region->residentPristine && region->pristineFromEntry) {
+                // The entry's pristine copy (shared with other builds of the range) serves only uses
+                // that keep it equal to the shadow: this use's own copy is made apart.
+                region->pristine.reset();
+                region->pristineFromEntry = false;
             }
             if (region->pristine == nullptr) region->pristine = stagingBuffer(context, bytes, pristineUsage);
             if (region->pristine == nullptr || region->pristine->DeviceAddress() == 0) {
@@ -7075,7 +7090,7 @@ bool GuestBufferMemory::RecordStagingCopies(Recorder& recorder) {
     // (APS5_NO_OWED_RUN_CLOSE) or a use that never ends; the first leaves this build unusable now
     // (its copy-in would refill the shadow under that use's work), the second is taken over.
     for (auto& region : regions) {
-        if (!region.gpuCopy || !region.deviceLocal || region.resident == nullptr) continue;
+        if (!region.gpuCopy || !region.deviceLocal || region.resident == nullptr || RuntimeSwitches::Set(RuntimeSwitch::NoResidentCopyIn)) continue;
         auto lock = ResidentShadows::Lock();
         const void* other = region.resident->live && region.resident->shadow == region.buffer && region.resident->user != this ? region.resident->user : nullptr;
         lock.unlock();
