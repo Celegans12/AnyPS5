@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/OwnershipProbe.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
@@ -5302,6 +5303,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             } else {
                 heapsBegin = std::min(heapsBegin, region.begin);
                 heapsEnd = std::max(heapsEnd, region.end);
+                if (OwnershipProbe::Enabled()) OwnershipProbe::Global()->NoteAddressHeap(region.begin, region.end);
             }
             continue;
         }
@@ -5968,6 +5970,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
     }
     if (stagedAny) reportStaging();
     if (profile) ResidentShadows::Report();
+    if (OwnershipProbe::Enabled()) OwnershipProbe::Report();
     // The copied bytes are visible to the shaders bound to the buffers, which may also store into
     // them. Every stage: dispatches and draws share this path, and draws run mesh, task and
     // tessellation shaders too (the batch's own barriers around dispatches are as wide). A
@@ -6099,6 +6102,7 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
                 if (diff && profile && region.deviceLocal) Copies().diffWholeBytes.fetch_add(wholeEnd - whole, std::memory_order_relaxed);
             }
             copiedBytes += to - from;
+            if (OwnershipProbe::Enabled()) OwnershipProbe::Global()->NoteGpuWrite(from, to);
             recorder.Keep(region.buffer);
             if (profile) {
                 Copies().gpuCopyBacks.fetch_add(1, std::memory_order_relaxed);
