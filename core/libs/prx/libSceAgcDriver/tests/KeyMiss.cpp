@@ -24,13 +24,13 @@ struct Binding {
 };
 
 std::vector<std::uint32_t> shaderKey(bool dataWords, bool movable, const std::vector<Binding>& bindings) {
-    std::vector<std::uint32_t> key{dataWords ? 1u : 0u, 0u, 7u, 0u, static_cast<std::uint32_t>(bindings.size())};
+    std::vector<std::uint32_t> key{0u, 0u, dataWords ? 1u : 0u, 0u, 7u, 0u, static_cast<std::uint32_t>(bindings.size())};
     for (const auto& binding : bindings) {
         const bool data = binding.role == DescriptorRole::ShaderData || binding.role == DescriptorRole::FlattenedSrt;
         for (const auto word : {0u, static_cast<std::uint32_t>(binding.role), 0u, 0u, binding.count, 0u, 0u, static_cast<std::uint32_t>(binding.words.size())}) key.push_back(word);
         const bool emitted = (movable && binding.role == DescriptorRole::GuestBuffers && binding.words.size() == binding.count * 4u) || (dataWords && !movable) || !data;
         if (emitted) key.insert(key.end(), binding.words.begin(), binding.words.end());
-        for (int flags = 0; flags < 9; ++flags) key.push_back(0u);
+        for (int flags = 0; flags < 10; ++flags) key.push_back(0u);
         key.push_back(0u);
         key.push_back(static_cast<std::uint32_t>(binding.shapes.size()));
         key.insert(key.end(), binding.shapes.begin(), binding.shapes.end());
@@ -110,6 +110,35 @@ std::vector<std::uint32_t> withDevice(std::vector<std::uint32_t> key, std::uint3
     return key;
 }
 
+void testBuiltKey() {
+    ShaderRecompiler::RecompileResult program;
+    ShaderRecompiler::DescriptorBinding buffer{};
+    buffer.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+    buffer.role = DescriptorRole::GuestBuffers;
+    buffer.count = 1;
+    buffer.guestDescriptor = {0x1000u, 0x40000u, 64u, 0x00014204u};
+    ShaderRecompiler::DescriptorBinding image{};
+    image.kind = ShaderRecompiler::DescriptorKind::SampledImage;
+    image.role = DescriptorRole::GuestImages;
+    image.count = 1;
+    image.guestDescriptor = {20, 21, 22, 23, 24, 25, 26, 27};
+    image.imageSamplers = {0u};
+    program.bindings = {buffer, image};
+    const auto keyOf = [](const ShaderRecompiler::RecompileResult& built) { return ShaderResources::ContentKey({ShaderRecompiler::ShaderStage::Compute, &built, 0}, false, false); };
+    const auto base = keyOf(program);
+    ContentKeyDiff diff;
+    check(ShaderResources::DiffContentKeys(base, base, false, diff), "a key built by ContentKey was not comparable");
+    expectOnly(diff, std::nullopt, "equal built keys reported a difference");
+    auto moved = program;
+    moved.bindings[0].guestDescriptor[0] += 0x100u;
+    check(ShaderResources::DiffContentKeys(base, keyOf(moved), false, diff), "a built key with a moved V# was not comparable");
+    expectOnly(diff, ContentKeyComponent::BufferWord0, "a moved V# base in a built key");
+    auto texture = program;
+    texture.bindings[1].guestDescriptor[3] += 1u;
+    check(ShaderResources::DiffContentKeys(base, keyOf(texture), false, diff), "a built key with another T# was not comparable");
+    expectOnly(diff, ContentKeyComponent::Image, "a changed T# word in a built key");
+}
+
 void testDispatchKeyWithDevice() {
     ContentKeyDiff diff;
     const auto base = withDevice(shaderKey(false, false, bindings()), 5);
@@ -145,6 +174,7 @@ void testDrawKey() {
 int main() {
     try {
         testDispatchKey();
+        testBuiltKey();
         testDispatchKeyWithDevice();
         testDrawKey();
         std::puts("Key miss attribution passed");

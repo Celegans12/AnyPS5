@@ -3761,6 +3761,11 @@ bool TemplateDataRefresh() {
     return enabled;
 }
 
+constexpr std::size_t ContentKeyHeaderWords = 7;
+constexpr std::size_t ContentKeyDataWordsAt = 2;
+constexpr std::size_t ContentKeyBindingsAt = 6;
+constexpr std::size_t ContentKeyFlagSets = 10;
+
 bool DataRole(ShaderRecompiler::DescriptorRole role) {
     return role == ShaderRecompiler::DescriptorRole::ShaderData || role == ShaderRecompiler::DescriptorRole::FlattenedSrt;
 }
@@ -4097,10 +4102,10 @@ bool LabelShaderKey(std::span<const std::uint32_t> key, std::size_t at, std::siz
         std::fill(labels.begin() + static_cast<std::ptrdiff_t>(first), labels.begin() + static_cast<std::ptrdiff_t>(first + count), static_cast<std::uint8_t>(component));
         return true;
     };
-    if (!label(at, 5, Component::Layout)) return false;
-    const bool dataWords = key[at] != 0;
-    const auto bindings = key[at + 4];
-    at += 5;
+    if (!label(at, ContentKeyHeaderWords, Component::Layout)) return false;
+    const bool dataWords = key[at + ContentKeyDataWordsAt] != 0;
+    const auto bindings = key[at + ContentKeyBindingsAt];
+    at += ContentKeyHeaderWords;
     for (std::uint32_t binding = 0; binding < bindings; ++binding) {
         if (!label(at, 8, Component::Layout)) return false;
         const auto role = static_cast<ShaderRecompiler::DescriptorRole>(key[at + 1]);
@@ -4117,7 +4122,7 @@ bool LabelShaderKey(std::span<const std::uint32_t> key, std::size_t at, std::siz
             labels[at + i] = static_cast<std::uint8_t>(component);
         }
         at += words;
-        for (int flags = 0; flags < 9; ++flags) {
+        for (std::size_t flags = 0; flags < ContentKeyFlagSets; ++flags) {
             if (at >= end) return false;
             const auto count = 1 + (static_cast<std::size_t>(key[at]) + 31) / 32;
             if (!label(at, count, Component::Other)) return false;
@@ -5239,13 +5244,13 @@ ChurnProfile& Churn() {
 // Charges word `diff` of `key` to the binding of the ContentKey that starts at `at` (the layout of
 // ShaderResources::ContentKey), moving `at` past that key; false when `diff` lies beyond it.
 bool chargeShaderKey(ChurnCounts& profile, const ResourceCache::Key& key, std::size_t& at, std::size_t diff) {
-    if (at + 5 > key.size() || diff < at + 5) {
+    if (at + ContentKeyHeaderWords > key.size() || diff < at + ContentKeyHeaderWords) {
         ++profile.layout;
         return true;
     }
-    const bool dataWords = key[at] != 0;
-    const auto bindings = key[at + 4];
-    at += 5;
+    const bool dataWords = key[at + ContentKeyDataWordsAt] != 0;
+    const auto bindings = key[at + ContentKeyBindingsAt];
+    at += ContentKeyHeaderWords;
     for (std::uint32_t binding = 0; binding < bindings; ++binding) {
         if (at + 8 > key.size() || diff < at + 8) {
             ++profile.layout;
@@ -5263,12 +5268,12 @@ bool chargeShaderKey(ChurnCounts& profile, const ResourceCache::Key& key, std::s
             return true;
         }
         at += descriptorWords;
-        for (int flags = 0; flags < 4; ++flags) {
+        for (std::size_t flags = 0; flags < ContentKeyFlagSets + 2u; ++flags) {
             if (at >= key.size()) {
                 ++profile.layout;
                 return true;
             }
-            const auto words = 1 + (static_cast<std::size_t>(key[at]) + 31) / 32;
+            const auto words = flags < ContentKeyFlagSets ? 1 + (static_cast<std::size_t>(key[at]) + 31) / 32 : 1 + static_cast<std::size_t>(key[at]);
             if (diff < at + words) {
                 ++profile.layout;
                 return true;
