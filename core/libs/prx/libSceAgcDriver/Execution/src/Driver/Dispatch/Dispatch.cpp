@@ -623,7 +623,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
         const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
         const auto queueId = submission.queue;
         itemCommits.fetch_add(1, std::memory_order_relaxed);
-        DrawPipeline::Queue0().Enqueue([this, localDevice = std::move(localDevice), result = compiledResult, snapshots = std::move(snapshots), captured = std::move(captured), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant, dataHit, epoch, htileClearCompletion] {
+        DrawPipeline::Queue0().Enqueue([this, localDevice = std::move(localDevice), result = compiledResult, snapshots = std::move(snapshots), captured = std::move(captured), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant, dataHit, epoch, htileClearCompletion, htileMask] {
             DrawPipeline::FollowEpoch(epoch);
             GuestMemory::SetCurrentPacket(0x15, queueId);
             const auto& compiledCommit = *result;
@@ -654,6 +654,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
                     } else {
                         localDevice->Dispatch(compiledCommit, groups[0], groups[1], groups[2], snapshots, address, std::move(prepared), htileClearCompletion.has_value() ? nullptr : &builtRecipe, htileClearCompletion);
                     }
+                    if (htileMask.address != 0 && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoHitItemHtileNote)) localDevice->NoteHtileMask(htileMask.address, htileMask.bytes, htileMask.mask, htileMask.value);
                     break;
                 }
                 if (noteWrites && !writerKeyedEvidence()) noteWrittenBuffers(address, queueId, compiledCommit);
