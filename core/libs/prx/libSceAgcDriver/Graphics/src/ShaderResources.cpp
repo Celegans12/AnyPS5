@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShapeReplayProfile.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -7235,6 +7236,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         totalSnapshotBytes += bytes;
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
     }
+    if (ShapeReplay::Enabled()) ShapeReplay::RecordLap(ShapeReplay::RecordPart::BindingsSnapshot);
     if (selected.empty()) return {};
     Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
     std::array<bool, 2> described{};
@@ -7265,6 +7267,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         result->fragmentLayout = fragment.layout;
         Require(result->fragmentAllocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
     }
+    if (ShapeReplay::Enabled()) ShapeReplay::RecordLap(ShapeReplay::RecordPart::BindingsSet);
     thread_local std::vector<VkDescriptorBufferInfo>* buffersSlot = nullptr;
     auto& buffers = ShaderRecompiler::ThreadOwned(buffersSlot);
     buffers = descriptorBuffers;

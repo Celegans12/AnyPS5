@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShapeReplayProfile.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "ShaderDiskCache.hpp"
 #include <algorithm>
@@ -91,6 +92,8 @@ std::shared_ptr<DispatchVariant> DrawStageVariant(const DrawProgram& program, co
     variant->pushOffset = capture.pushOffset;
     variant->userDataMask = capture.userDataMask;
     if (vertexInfo) variant->vertexInfo = std::make_shared<const ShaderRecompiler::ShaderVertexStageInfo>(*vertexInfo);
+    variant->shapeReplay = capture.shapeReplay;
+    if (variant->shapeReplay == nullptr && Graphics::ShapeReplay::Enabled()) variant->shapeReplay = Graphics::ShapeReplay::DescribeCapture(capture.capture.get(), program.userData, vertexInfo ? &*vertexInfo : nullptr);
     std::vector<ShaderRecompiler::MemoryRegion> regions(capture.regions.begin(), capture.regions.end());
     for (const auto& read : decodeReads) regions.push_back({read.address, read.Bytes()});
     std::stable_sort(regions.begin(), regions.end(), [](const ShaderRecompiler::MemoryRegion& a, const ShaderRecompiler::MemoryRegion& b) { return a.guestAddress < b.guestAddress; });
@@ -194,6 +197,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     stageCapture.capture = capture;
     timing.Mark("materialize");
     stageCapture.userDataMask = StageUserDataMask(*capture, *stageCapture.compiled, vertexInfos[i]);
+    stageCapture.shapeReplay = Graphics::ShapeReplay::Enabled() ? Graphics::ShapeReplay::DescribeCapture(capture.get(), program.userData, vertexInfos[i] ? &*vertexInfos[i] : nullptr) : nullptr;
     phaseTiming.Phase(DrawRowRecompile);
     return stageCapture.compiled;
 } catch (const std::exception& error) {
