@@ -640,7 +640,8 @@ int usage() {
                          "  --strict            fails on a pacing timeout or a failed registration inside the captured frames\n"
                          "  --timeout-s <n>     exits with code 4 when the replay has no result after n seconds (900; 0 waits forever)\n"
                          "  --dump              writes guest memory to a file after the replay (hexadecimal or decimal)\n"
-                         "  --frames <dir>      writes each recorded and replayed display buffer as reference-<n>.bmp and replay-<n>.bmp\n");
+                         "  --frames <dir>      writes each recorded and replayed display buffer as reference-<n>.bmp and replay-<n>.bmp\n"
+                         "  the shader cache's Vulkan pipeline cache file is loaded as the title loads it (APS5_PIPELINE_CACHE_LOAD=0 starts empty)\n");
     return 2;
 }
 
@@ -795,8 +796,10 @@ int main(int argc, char** argv) {
     if (options.directory.empty()) return usage();
 #ifdef _WIN32
     _putenv_s("APS5_FRAME_CAPTURE", "");
+    if (std::getenv("APS5_PIPELINE_CACHE_LOAD") == nullptr) _putenv_s("APS5_PIPELINE_CACHE_LOAD", "1");
 #else
     unsetenv("APS5_FRAME_CAPTURE");
+    setenv("APS5_PIPELINE_CACHE_LOAD", "1", 0);
 #endif
     startWatchdog(options.timeout);
     int code = 2;
