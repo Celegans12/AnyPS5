@@ -3828,6 +3828,87 @@ void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::u
     pool.bytes += bytes;
 }
 
+Recorder::OwnedSnapshot& Recorder::ownedSnapshotEntry(const OwnedSnapshotKey& key) {
+    if (const auto found = ownedSnapshots.find(key); found != ownedSnapshots.end()) {
+        ownedSnapshotRecency.splice(ownedSnapshotRecency.end(), ownedSnapshotRecency, found->second.recent);
+        return found->second;
+    }
+    while (!ownedSnapshotRecency.empty() && ownedSnapshots.size() >= OwnedSnapshotEntries) {
+        const auto oldest = ownedSnapshots.find(ownedSnapshotRecency.front());
+        dropOwnedSnapshotBuffer(oldest->second);
+        ownedSnapshotRecency.pop_front();
+        ownedSnapshots.erase(oldest);
+    }
+    ownedSnapshotRecency.push_back(key);
+    auto& entry = ownedSnapshots[key];
+    entry.recent = std::prev(ownedSnapshotRecency.end());
+    return entry;
+}
+
+void Recorder::dropOwnedSnapshotBuffer(OwnedSnapshot& entry) {
+    if (entry.buffer == nullptr) return;
+    ownedSnapshotBytes -= entry.buffer->Bytes().size();
+    entry.buffer.reset();
+    entry.words.clear();
+}
+
+std::shared_ptr<Buffer> Recorder::OwnedDrawSnapshot(std::uint64_t address, std::size_t bytes, bool& arm, OwnedSnapshotMiss& miss) {
+    arm = true;
+    miss = OwnedSnapshotMiss::Absent;
+    const auto found = ownedSnapshots.find({address, bytes});
+    if (found == ownedSnapshots.end()) return {};
+    auto& entry = found->second;
+    ownedSnapshotRecency.splice(ownedSnapshotRecency.end(), ownedSnapshotRecency, entry.recent);
+    if (entry.buffer != nullptr) {
+        if (entry.registryGeneration != GuestAllocations::GuestAllocationsGeneration_nid_postfix() || entry.forgetSerial != GuestMemory::ForgetSerial()) {
+            miss = OwnedSnapshotMiss::Mapping;
+        } else if (!GuestMemory::OwnedWordsHold(address, bytes, entry.words)) {
+            miss = OwnedSnapshotMiss::WordsMoved;
+            entry.backoff = static_cast<std::uint8_t>(std::min<unsigned>(entry.backoff + 1u, 6u));
+            entry.skip = static_cast<std::uint16_t>((1u << entry.backoff) - 1u);
+        } else if (!GuestMemory::OwnedProofHolds(address, bytes, entry.words, entry.since)) {
+            miss = OwnedSnapshotMiss::StampsMoved;
+        } else {
+            miss = OwnedSnapshotMiss::None;
+            entry.backoff = 0;
+            return entry.buffer;
+        }
+        dropOwnedSnapshotBuffer(entry);
+        if (miss != OwnedSnapshotMiss::WordsMoved) return {};
+    }
+    if (entry.skip != 0) {
+        --entry.skip;
+        arm = false;
+        if (miss == OwnedSnapshotMiss::Absent) miss = OwnedSnapshotMiss::BackingOff;
+    }
+    return {};
+}
+
+void Recorder::KeepOwnedDrawSnapshot(std::uint64_t address, std::size_t bytes, std::vector<std::uint64_t> words, std::uint64_t since, std::uint64_t registryGeneration, std::uint64_t forgetSerial, std::shared_ptr<Buffer> buffer) {
+    if (since == 0 || (forgetSerial & 1u) != 0 || buffer == nullptr || bytes > OwnedSnapshotBudget) return;
+    const OwnedSnapshotKey key{address, bytes};
+    auto& entry = ownedSnapshotEntry(key);
+    dropOwnedSnapshotBuffer(entry);
+    for (auto it = ownedSnapshotRecency.begin(); it != ownedSnapshotRecency.end() && ownedSnapshotBytes + bytes > OwnedSnapshotBudget;) {
+        auto& other = ownedSnapshots.find(*it)->second;
+        ++it;
+        if (&other != &entry) dropOwnedSnapshotBuffer(other);
+    }
+    entry.words = std::move(words);
+    entry.since = since;
+    entry.registryGeneration = registryGeneration;
+    entry.forgetSerial = forgetSerial;
+    ownedSnapshotBytes += buffer->Bytes().size();
+    entry.buffer = std::move(buffer);
+}
+
+void Recorder::RefuseOwnedDrawSnapshot(std::uint64_t address, std::size_t bytes) {
+    auto& entry = ownedSnapshotEntry({address, bytes});
+    dropOwnedSnapshotBuffer(entry);
+    entry.backoff = static_cast<std::uint8_t>(std::min<unsigned>(entry.backoff + 1u, 6u));
+    entry.skip = static_cast<std::uint16_t>((1u << entry.backoff) - 1u);
+}
+
 bool Recorder::KnownHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::optional<std::uint32_t>& highest) {
     const auto found = indexRanges.find({address, use, bytes});
     if (found == indexRanges.end()) return false;
@@ -4031,6 +4112,19 @@ bool Recorder::PendingWriteOverlaps(std::uint64_t address, std::size_t bytes) co
     if (anyOpen([&](const Batch& batch) { return overlaps(batch, address, end); })) return true;
     for (const auto& batch : inFlight) {
         if (overlaps(*batch, address, end)) return true;
+    }
+    return false;
+}
+
+bool Recorder::PendingWriteOtherLane(std::uint64_t address, std::size_t bytes) const {
+    if (bytes == 0) return false;
+    const auto end = address + bytes;
+    const int lane = currentLane();
+    for (std::size_t index = 0; index < lanes.size(); ++index) {
+        if (static_cast<int>(index) != lane && lanes[index] != nullptr && overlaps(*lanes[index], address, end)) return true;
+    }
+    for (const auto& batch : inFlight) {
+        if (batch->lane != lane && overlaps(*batch, address, end)) return true;
     }
     return false;
 }

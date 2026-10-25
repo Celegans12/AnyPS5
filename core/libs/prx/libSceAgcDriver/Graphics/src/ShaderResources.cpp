@@ -7122,6 +7122,77 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedD
 
 namespace {
 
+enum class DrawSnapshotPath : std::size_t { Upload, TrackedHit, OwnedHit, TrackedCopy, UntrackedCopy, Count };
+constexpr std::size_t DrawSnapshotPaths = static_cast<std::size_t>(DrawSnapshotPath::Count);
+constexpr std::size_t OwnedSnapshotMisses = static_cast<std::size_t>(Recorder::OwnedSnapshotMiss::Count);
+
+struct DrawSnapshotCounters {
+    std::array<std::atomic<std::uint64_t>, DrawSnapshotPaths> count{};
+    std::array<std::atomic<std::uint64_t>, DrawSnapshotPaths> bytes{};
+    std::array<std::atomic<std::uint64_t>, OwnedSnapshotMisses> misses{};
+    std::atomic<std::uint64_t> armed{0}, refused{0};
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+DrawSnapshotCounters& SnapshotPathCounts() {
+    static DrawSnapshotCounters counters;
+    return counters;
+}
+
+void reportDrawSnapshots(const Recorder& recorder) {
+    auto& counters = SnapshotPathCounts();
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = counters.lastReport.load();
+    if (nowMs - last < 10000 || !counters.lastReport.compare_exchange_strong(last, nowMs)) return;
+    static std::array<std::uint64_t, DrawSnapshotPaths> previousCount{}, previousBytes{};
+    static std::array<std::uint64_t, OwnedSnapshotMisses> previousMisses{};
+    static std::uint64_t previousArmed = 0, previousRefused = 0;
+    std::array<unsigned long long, DrawSnapshotPaths> count{};
+    std::array<double, DrawSnapshotPaths> mib{};
+    for (std::size_t index = 0; index < DrawSnapshotPaths; ++index) {
+        const auto c = counters.count[index].load();
+        const auto b = counters.bytes[index].load();
+        count[index] = static_cast<unsigned long long>(c - previousCount[index]);
+        mib[index] = static_cast<double>(b - previousBytes[index]) / (1024.0 * 1024.0);
+        previousCount[index] = c;
+        previousBytes[index] = b;
+    }
+    std::array<unsigned long long, OwnedSnapshotMisses> misses{};
+    for (std::size_t index = 0; index < OwnedSnapshotMisses; ++index) {
+        const auto m = counters.misses[index].load();
+        misses[index] = static_cast<unsigned long long>(m - previousMisses[index]);
+        previousMisses[index] = m;
+    }
+    const auto armed = counters.armed.load();
+    const auto refused = counters.refused.load();
+    using Path = DrawSnapshotPath;
+    using Miss = Recorder::OwnedSnapshotMiss;
+    const auto at = [](auto value) { return static_cast<std::size_t>(value); };
+    AgcDriver::ProfilePrint_nid_no_patch("[draw-snapshots] last 10 s (APS5_NO_OWNED_DRAW_SNAPSHOTS %s): uploads %llu (%.1f MiB copied), tracked reuses %llu (%.1f MiB), owned reuses %llu (%.1f MiB not copied), copies of tracked memory %llu (%.1f MiB), copies of untracked memory %llu (%.1f MiB); owned misses: absent %llu, backing off %llu, words moved %llu, stamps moved %llu, mapping %llu; armed %llu, arms refused %llu; %.0f MiB owned copies held\n", RuntimeSwitches::Set(RuntimeSwitch::NoOwnedDrawSnapshots) ? "set" : "unset", count[at(Path::Upload)], mib[at(Path::Upload)], count[at(Path::TrackedHit)], mib[at(Path::TrackedHit)], count[at(Path::OwnedHit)], mib[at(Path::OwnedHit)], count[at(Path::TrackedCopy)], mib[at(Path::TrackedCopy)], count[at(Path::UntrackedCopy)], mib[at(Path::UntrackedCopy)], misses[at(Miss::Absent)], misses[at(Miss::BackingOff)], misses[at(Miss::WordsMoved)], misses[at(Miss::StampsMoved)], misses[at(Miss::Mapping)], static_cast<unsigned long long>(armed - previousArmed), static_cast<unsigned long long>(refused - previousRefused), static_cast<double>(recorder.OwnedSnapshotBytes()) / (1024.0 * 1024.0));
+    previousArmed = armed;
+    previousRefused = refused;
+}
+
+bool DrawSnapshotsProfiled() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return profile;
+}
+
+void countDrawSnapshot(DrawSnapshotPath path, std::size_t bytes) {
+    if (!DrawSnapshotsProfiled()) return;
+    auto& counters = SnapshotPathCounts();
+    counters.count[static_cast<std::size_t>(path)].fetch_add(1, std::memory_order_relaxed);
+    counters.bytes[static_cast<std::size_t>(path)].fetch_add(bytes, std::memory_order_relaxed);
+}
+
+void countOwnedSnapshotMiss(Recorder::OwnedSnapshotMiss miss, bool armed, bool refused) {
+    if (!DrawSnapshotsProfiled()) return;
+    auto& counters = SnapshotPathCounts();
+    counters.misses[static_cast<std::size_t>(miss)].fetch_add(1, std::memory_order_relaxed);
+    if (armed) counters.armed.fetch_add(1, std::memory_order_relaxed);
+    if (refused) counters.refused.fetch_add(1, std::memory_order_relaxed);
+}
+
 void verifyGpuSource(const Context& context, Recorder& recorder, const GuestBufferMemory::GpuSource& source, std::uint64_t address, std::size_t bytes) {
     std::vector<std::byte> expected(bytes);
     std::memcpy(expected.data(), reinterpret_cast<const void*>(address), bytes);
@@ -7179,6 +7250,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     std::array<std::uint64_t, 3> stamp{};
     bool stamped = false;
     const bool gpuSourced = GuestBufferMemory::GpuSourcedDrawBuffers();
+    const bool ownedSnapshots = !RuntimeSwitches::Set(RuntimeSwitch::NoOwnedDrawSnapshots);
     const auto keep = [&](DrawBindings::Snapshot snapshot) {
         if (result->snapshots.empty()) result->snapshots.reserve(allocations.size());
         result->snapshots.push_back(std::move(snapshot));
@@ -7255,14 +7327,35 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                 std::memcpy(slice.bytes, reinterpret_cast<const void*>(begin), bytes);
                 buffer = std::move(slice.buffer);
                 offset = slice.offset;
+                countDrawSnapshot(DrawSnapshotPath::Upload, bytes);
             } else {
                 const auto generation = GuestMemory::CollectWrites(begin, bytes);
-                buffer = recorder.ReusableDrawSnapshot(begin, bytes, Recorder::SnapshotUse::Storage, nullptr, generation);
+                const bool owned = generation == 0 && ownedSnapshots;
+                bool arm = false;
+                auto ownedMiss = Recorder::OwnedSnapshotMiss::None;
+                buffer = owned ? recorder.OwnedDrawSnapshot(begin, bytes, arm, ownedMiss) : recorder.ReusableDrawSnapshot(begin, bytes, Recorder::SnapshotUse::Storage, nullptr, generation);
+                if (buffer != nullptr) countDrawSnapshot(owned ? DrawSnapshotPath::OwnedHit : DrawSnapshotPath::TrackedHit, bytes);
                 if (buffer == nullptr) {
+                    std::vector<std::uint64_t> words;
+                    bool armed = false;
+                    std::uint64_t since = 0;
+                    std::uint64_t forgetSerial = 0;
+                    if (owned && arm) {
+                        words.resize(GuestMemory::HashBlockCount(begin, bytes));
+                        armed = GuestMemory::ArmOwnedBlocks(begin, bytes, words, !RuntimeSwitches::Set(RuntimeSwitch::NoOwnedPrivate));
+                        if (armed) {
+                            forgetSerial = GuestMemory::ForgetSerial();
+                            since = GuestMemory::TrackerGeneration();
+                        }
+                    }
                     const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::ShaderResources);
                     buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
                     std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
-                    recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, buffer);
+                    if (!owned) recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, buffer);
+                    else if (armed) recorder.KeepOwnedDrawSnapshot(begin, bytes, std::move(words), since, registryGeneration, forgetSerial, buffer);
+                    else if (arm) recorder.RefuseOwnedDrawSnapshot(begin, bytes);
+                    countDrawSnapshot(generation == 0 ? DrawSnapshotPath::UntrackedCopy : DrawSnapshotPath::TrackedCopy, bytes);
+                    if (owned) countOwnedSnapshotMiss(ownedMiss, armed, arm && !armed);
                 }
             }
             if (GuestMemory::TrackerGeneration() != stamp[0]) stamped = false;
@@ -7336,6 +7429,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     for (const auto& snapshot : result->snapshots) {
         if (snapshot.buffer->Mapped()) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
     }
+    if (DrawSnapshotsProfiled()) reportDrawSnapshots(recorder);
     return result;
 }
 

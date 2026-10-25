@@ -5467,7 +5467,7 @@ struct GpuSourceStats {
     std::atomic<std::uint64_t> copyInSourced{0};
     std::atomic<std::uint64_t> copyInGpu{0}, copyInGpuBytes{0}, copyInCpu{0}, copyInCpuBytes{0};
     std::array<std::atomic<std::uint64_t>, GpuSourceMissCount> copyInMisses{};
-    std::atomic<std::uint64_t> registered{0}, refusedStored{0}, refusedPending{0}, crossLaneOrders{0}, backingOff{0};
+    std::atomic<std::uint64_t> registered{0}, refusedStored{0}, refusedPending{0}, crossLaneOrders{0}, backingOff{0}, afterWriter{0};
     std::array<std::atomic<std::uint64_t>, 2> armed{};
     std::atomic<std::uint64_t> verified{0}, verifyDiffering{0};
     std::atomic<std::int64_t> lastReport{0};
@@ -5576,6 +5576,7 @@ const char* GuestBufferMemory::GpuSourceMissName(GpuSourceMiss miss) {
     switch (miss) {
     case GpuSourceMiss::None: return "none";
     case GpuSourceMiss::NoSource: return "no source";
+    case GpuSourceMiss::Partial: return "partly in a source";
     case GpuSourceMiss::Released: return "released";
     case GpuSourceMiss::Pending: return "writer pending";
     case GpuSourceMiss::Lane: return "other lane";
@@ -5611,10 +5612,17 @@ std::optional<GuestBufferMemory::GpuSource> GuestBufferMemory::FindGpuSource(std
     {
         std::lock_guard lock(registry.mutex);
         if (registry.entries.empty()) return std::nullopt;
-        auto found = registry.entries.upper_bound(address);
-        if (found == registry.entries.begin()) return std::nullopt;
-        --found;
-        if (found->first > address || found->second.end < address + bytes) return std::nullopt;
+        const auto next = registry.entries.upper_bound(address);
+        const bool startsInside = next != registry.entries.end() && next->first < address + bytes;
+        if (next == registry.entries.begin()) {
+            if (startsInside) miss = GpuSourceMiss::Partial;
+            return std::nullopt;
+        }
+        auto found = std::prev(next);
+        if (found->second.end < address + bytes) {
+            if (startsInside || found->second.end > address) miss = GpuSourceMiss::Partial;
+            return std::nullopt;
+        }
         if (found->second.buffer.expired()) {
             miss = GpuSourceMiss::Released;
             registry.byBuffer.erase(found->second.key);
@@ -5719,9 +5727,9 @@ void GuestBufferMemory::ReportGpuSources() {
     const auto nowMs = GpuSourceNowMs();
     auto last = stats.lastReport.load();
     if (nowMs - last < 10000 || !stats.lastReport.compare_exchange_strong(last, nowMs)) return;
-    enum Slot : std::size_t { DrawGpu, DrawGpuBytes, DrawCopied, DrawCopiedBytes, CopyGpu, CopyGpuBytes, CopyCpu, CopyCpuBytes, Registered, RefusedStored, RefusedPending, BackingOff, Armed, ArmRefused, CrossLane, Verified, Differing, Slots };
+    enum Slot : std::size_t { DrawGpu, DrawGpuBytes, DrawCopied, DrawCopiedBytes, CopyGpu, CopyGpuBytes, CopyCpu, CopyCpuBytes, Registered, RefusedStored, RefusedPending, AfterWriter, BackingOff, Armed, ArmRefused, CrossLane, Verified, Differing, Slots };
     static std::array<std::uint64_t, Slots> previous{};
-    const std::array<std::uint64_t, Slots> now{stats.drawGpu.load(), stats.drawGpuBytes.load(), stats.drawCopied.load(), stats.drawCopiedBytes.load(), stats.copyInGpu.load(), stats.copyInGpuBytes.load(), stats.copyInCpu.load(), stats.copyInCpuBytes.load(), stats.registered.load(), stats.refusedStored.load(), stats.refusedPending.load(), stats.backingOff.load(), stats.armed[0].load(), stats.armed[1].load(), stats.crossLaneOrders.load(), stats.verified.load(), stats.verifyDiffering.load()};
+    const std::array<std::uint64_t, Slots> now{stats.drawGpu.load(), stats.drawGpuBytes.load(), stats.drawCopied.load(), stats.drawCopiedBytes.load(), stats.copyInGpu.load(), stats.copyInGpuBytes.load(), stats.copyInCpu.load(), stats.copyInCpuBytes.load(), stats.registered.load(), stats.refusedStored.load(), stats.refusedPending.load(), stats.afterWriter.load(), stats.backingOff.load(), stats.armed[0].load(), stats.armed[1].load(), stats.crossLaneOrders.load(), stats.verified.load(), stats.verifyDiffering.load()};
     std::array<unsigned long long, Slots> delta{};
     for (std::size_t index = 0; index < Slots; ++index) delta[index] = static_cast<unsigned long long>(now[index] - previous[index]);
     previous = now;
@@ -5737,7 +5745,7 @@ void GuestBufferMemory::ReportGpuSources() {
         previousCopy[index] = copyNow;
     }
     const auto kib = [](unsigned long long value) { return static_cast<double>(value) / 1024.0; };
-    AgcDriver::ProfilePrint_nid_no_patch("[gpu-sourced] last 10 s (APS5_NO_GPU_SOURCED_DRAW_BUFFERS %s, APS5_NO_IMPORT_SOURCED_COPY_IN %s): draw buffers %llu bound GPU-side (%.0f KiB not compared or copied), %llu copied (%.0f KiB; misses: %s); copy-ins %llu from a GPU source (%.0f KiB not memcpy'd), %llu CPU snapshots (%.0f KiB; misses: %s); sources registered %llu, refused %llu stored since the copy-in, %llu writer pending at the copy-in, %llu backing off; owned words armed %llu, refused %llu; cross-lane orders %llu; %zu live; verify %llu checked, %llu differing\n", RuntimeSwitches::Set(RuntimeSwitch::NoGpuSourcedDrawBuffers) ? "set" : "unset", RuntimeSwitches::Set(RuntimeSwitch::NoImportSourcedCopyIn) ? "set" : "unset", delta[DrawGpu], kib(delta[DrawGpuBytes]), delta[DrawCopied], kib(delta[DrawCopiedBytes]), draws.c_str(), delta[CopyGpu], kib(delta[CopyGpuBytes]), delta[CopyCpu], kib(delta[CopyCpuBytes]), copies.c_str(), delta[Registered], delta[RefusedStored], delta[RefusedPending], delta[BackingOff], delta[Armed], delta[ArmRefused], delta[CrossLane], GpuSourceEntries(), delta[Verified], delta[Differing]);
+    AgcDriver::ProfilePrint_nid_no_patch("[gpu-sourced] last 10 s (APS5_NO_GPU_SOURCED_DRAW_BUFFERS %s, APS5_NO_IMPORT_SOURCED_COPY_IN %s): draw buffers %llu bound GPU-side (%.0f KiB not compared or copied), %llu taken by the CPU path (%.0f KiB, copied or reused, see [draw-snapshots]; misses: %s); copy-ins %llu from a GPU source (%.0f KiB not memcpy'd), %llu CPU snapshots (%.0f KiB; misses: %s); sources registered %llu, refused %llu stored since the copy-in, %llu writer pending on the other lane at the copy-in, %llu after a same-lane writer (APS5_NO_GPU_SOURCE_AFTER_WRITER %s), %llu backing off; owned words armed %llu, refused %llu; cross-lane orders %llu; %zu live; verify %llu checked, %llu differing\n", RuntimeSwitches::Set(RuntimeSwitch::NoGpuSourcedDrawBuffers) ? "set" : "unset", RuntimeSwitches::Set(RuntimeSwitch::NoImportSourcedCopyIn) ? "set" : "unset", delta[DrawGpu], kib(delta[DrawGpuBytes]), delta[DrawCopied], kib(delta[DrawCopiedBytes]), draws.c_str(), delta[CopyGpu], kib(delta[CopyGpuBytes]), delta[CopyCpu], kib(delta[CopyCpuBytes]), copies.c_str(), delta[Registered], delta[RefusedStored], delta[RefusedPending], delta[AfterWriter], RuntimeSwitches::Set(RuntimeSwitch::NoGpuSourceAfterWriter) ? "set" : "unset", delta[BackingOff], delta[Armed], delta[ArmRefused], delta[CrossLane], GpuSourceEntries(), delta[Verified], delta[Differing]);
 }
 
 void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool addressable) {
@@ -5818,7 +5826,8 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         }
         region->gpuSourceSince = 0;
         region->gpuSourceWords.clear();
-        if (sourcesOn && !pendingWriter && region->deviceLocal && !region->overlay && !region->sparse && !HoldsLease()) {
+        const bool orderedWriter = pendingWriter && !RuntimeSwitches::Set(RuntimeSwitch::NoGpuSourceAfterWriter) && !recorder->PendingWriteOtherLane(address, static_cast<std::size_t>(bytes));
+        if (sourcesOn && (!pendingWriter || orderedWriter) && region->deviceLocal && !region->overlay && !region->sparse && !HoldsLease()) {
             if (const auto feedback = std::exchange(region->gpuSourceFeedback, nullptr)) {
                 const auto learned = feedback->load(std::memory_order_relaxed);
                 if ((learned & 1u) != 0 && (learned & 2u) == 0) region->gpuSourceBackoff = 0;
@@ -5842,6 +5851,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
                     region->gpuSourceRegistry = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
                 }
             }
+            if (orderedWriter && profile) SourceStats().afterWriter.fetch_add(1, std::memory_order_relaxed);
         } else if (sourcesOn && pendingWriter && region->deviceLocal && profile) {
             SourceStats().refusedPending.fetch_add(1, std::memory_order_relaxed);
         }

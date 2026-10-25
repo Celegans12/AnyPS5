@@ -323,6 +323,22 @@ public:
     void NoteUnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp, std::shared_ptr<Buffer> buffer, VkDeviceSize offset = 0);
     std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr, std::uint64_t generation = 0);
     void KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use = SnapshotUse::Storage, std::uint32_t derived = 0);
+    // Owned draw snapshots (APS5_NO_OWNED_DRAW_SNAPSHOTS=1 off; an APS5_AB switch). A read-only draw
+    // input outside the write watch (CollectWrites 0: host imports compared, not watched) had no
+    // proof that it was unchanged, so every draw copied it whole into a new buffer. Its blocks are
+    // armed with owned words (GuestMemory::ArmOwnedBlocks) before the copy; the copy is current
+    // while OwnedProofHolds at the tracker generation read before the copy (no CPU store since the
+    // arming, no stamp or untracked hint newer), the registry and the forget serial are unchanged.
+    // The caller checks the pending writes first, as for every draw snapshot. An entry whose
+    // words moved backs off arming (2^n - 1 misses, n <= 6); a hit clears the back-off.
+    // `arm`: whether the caller should arm and keep its copy.
+    static constexpr std::size_t OwnedSnapshotBudget = std::size_t{1024} << 20u;
+    static constexpr std::size_t OwnedSnapshotEntries = 8192;
+    enum class OwnedSnapshotMiss : std::uint8_t { None, Absent, BackingOff, WordsMoved, StampsMoved, Mapping, Count };
+    std::shared_ptr<Buffer> OwnedDrawSnapshot(std::uint64_t address, std::size_t bytes, bool& arm, OwnedSnapshotMiss& miss);
+    void KeepOwnedDrawSnapshot(std::uint64_t address, std::size_t bytes, std::vector<std::uint64_t> words, std::uint64_t since, std::uint64_t registryGeneration, std::uint64_t forgetSerial, std::shared_ptr<Buffer> buffer);
+    void RefuseOwnedDrawSnapshot(std::uint64_t address, std::size_t bytes);
+    std::size_t OwnedSnapshotBytes() const { return ownedSnapshotBytes; }
     static constexpr std::size_t DrawUploadChunk = std::size_t{1} << 20u;
     struct UploadSlice {
         std::shared_ptr<Buffer> buffer;
@@ -342,6 +358,9 @@ public:
     // Notes several [begin, end) ranges and publishes the snapshot once (a dispatch writes many buffers).
     void NotePendingWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
     bool PendingWriteOverlaps(std::uint64_t address, std::size_t bytes) const;
+    // Whether a pending write over the range is in a batch of the other lane than the calling
+    // thread's (open, or in flight): this lane's own pending writers run before what it records next.
+    bool PendingWriteOtherLane(std::uint64_t address, std::size_t bytes) const;
     // Whether no unfinished batch writes the range any more: no open-batch overlap, and every
     // overlapping in-flight batch's fence has signaled (its in-place GPU stores are final in host
     // memory; its completion stores are the caller's business, see VulkanDevice::CopyBuffer).
@@ -1235,6 +1254,22 @@ private:
         VkDeviceSize offset = 0;
     };
     std::unordered_map<std::uint64_t, UnwrittenSnapshot> unwrittenSnapshots;
+    using OwnedSnapshotKey = std::pair<std::uint64_t, std::size_t>;
+    struct OwnedSnapshot {
+        std::vector<std::uint64_t> words;
+        std::uint64_t since = 0;
+        std::uint64_t registryGeneration = 0;
+        std::uint64_t forgetSerial = 0;
+        std::shared_ptr<Buffer> buffer;
+        std::list<OwnedSnapshotKey>::iterator recent;
+        std::uint8_t backoff = 0;
+        std::uint16_t skip = 0;
+    };
+    std::map<OwnedSnapshotKey, OwnedSnapshot> ownedSnapshots;
+    std::list<OwnedSnapshotKey> ownedSnapshotRecency;
+    std::size_t ownedSnapshotBytes = 0;
+    OwnedSnapshot& ownedSnapshotEntry(const OwnedSnapshotKey& key);
+    void dropOwnedSnapshotBuffer(OwnedSnapshot& entry);
     std::array<std::uint64_t, 3> unwrittenStamp{};
     std::size_t unwrittenBytes = 0;
     void retireUnwrittenSnapshots(const std::array<std::uint64_t, 3>& stamp);

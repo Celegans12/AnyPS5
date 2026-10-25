@@ -404,7 +404,7 @@ public:
     // the batch that wrote it completed; a draw binds the shadow instead of copying the bytes on the
     // CPU, a copy-in copies from it instead of a CPU snapshot of the import. Nullopt and `miss` say
     // why not.
-    enum class GpuSourceMiss : std::uint8_t { None, NoSource, Released, Pending, Lane, Align, Registry, Stored, Cpu, Count };
+    enum class GpuSourceMiss : std::uint8_t { None, NoSource, Partial, Released, Pending, Lane, Align, Registry, Stored, Cpu, Count };
     struct GpuSource {
         std::shared_ptr<Buffer> buffer;
         VkDeviceSize offset = 0;

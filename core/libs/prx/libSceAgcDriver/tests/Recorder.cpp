@@ -4743,7 +4743,7 @@ bool gpuSourcedDrawTests(const Device& device, Recorder& recorder) {
         const auto contents = readback->Bytes();
         return std::vector<std::byte>(contents.begin(), contents.end());
     };
-    const auto produce = [&](std::uint32_t value) {
+    const auto produce = [&](std::uint32_t value, bool settle) {
         auto memory = std::make_unique<GuestBufferMemory>(snapshotContext);
         memory->AllowDeviceStaging();
         memory->AddWritable(element, elementBytes, false, true);
@@ -4758,6 +4758,7 @@ bool gpuSourcedDrawTests(const Device& device, Recorder& recorder) {
         memory->RecordCopyBacks(snapshotRecorder);
         snapshotRecorder.NotePendingWrites(memory->Writes());
         memory->MarkDirectWrites();
+        if (!settle) return std::make_pair(std::move(memory), view.buffer);
         snapshotRecorder.Sync();
         snapshotRecorder.FlushDeferredReleases();
         const auto* words = reinterpret_cast<const std::uint32_t*>(element);
@@ -4787,7 +4788,7 @@ bool gpuSourcedDrawTests(const Device& device, Recorder& recorder) {
             return bindings;
         };
         const auto verified = GuestBufferMemory::GpuSourceVerifyCounts();
-        auto [producer, shadow] = produce(0x22222222u);
+        auto [producer, shadow] = produce(0x22222222u, true);
         {
             const auto bindings = draw();
             const auto& snapshot = bindings->snapshots[0];
@@ -4810,11 +4811,11 @@ bool gpuSourcedDrawTests(const Device& device, Recorder& recorder) {
             Require(snapshot.buffer->Handle() != shadow && snapshot.buffer->Mapped(), "a CPU store after the GPU write did not take the CPU snapshot path");
             Require(reinterpret_cast<const std::uint32_t*>(snapshot.Bytes().data())[100] == 0x33333333u, "the CPU snapshot after a CPU store misses the store");
         }
-        auto second = produce(0x44444444u);
+        auto second = produce(0x44444444u, true);
         Require(draw()->snapshots[0].buffer->Handle() == second.second, "the next dispatch's results were not bound GPU-side");
         AgcDriver::GuestMemory::MarkWritten(element + 8, 4);
         Require(draw()->snapshots[0].buffer->Mapped(), "a driver store after the GPU write did not take the CPU snapshot path");
-        auto third = produce(0x55555555u);
+        auto third = produce(0x55555555u, true);
         RuntimeSwitches::Assign(RuntimeSwitch::NoGpuSourcedDrawBuffers, true);
         const auto off = draw();
         RuntimeSwitches::Assign(RuntimeSwitch::NoGpuSourcedDrawBuffers, false);
@@ -4844,11 +4845,131 @@ bool gpuSourcedDrawTests(const Device& device, Recorder& recorder) {
                 reader.WriteBack();
             }
         }
+        {
+            auto pending = produce(0x77777777u, false);
+            auto after = produce(0x78787878u, true);
+            AgcDriver::GuestMemory::BumpCollectEpoch();
+            const auto bindings = draw();
+            const bool afterWriter = !RuntimeSwitches::Set(RuntimeSwitch::NoGpuSourceAfterWriter);
+            Require((bindings->snapshots[0].buffer->Handle() == after.second) == afterWriter, afterWriter ? "a staged use behind a same-lane pending writer did not become a GPU source" : "APS5_NO_GPU_SOURCE_AFTER_WRITER still made a use behind a pending writer a GPU source");
+            Require(holds(readBack(bindings->snapshots[0].buffer->Handle(), bindings->snapshots[0].offset, elementBytes), 0x78787878u), "the draw input behind two staged uses does not hold the second one's results");
+        }
         snapshotRecorder.Sync();
     }
     recorder.Activate();
     std::cout << "GPU-sourced draw buffers and copy-ins: ok" << (verify ? " (verified)" : "") << "\n";
     return true;
+}
+
+// Owned draw snapshots (APS5_NO_OWNED_DRAW_SNAPSHOTS): a read-only draw input outside the write
+// watch is copied once and reused while its owned words and stamps hold; a CPU store, a driver
+// store or the switch makes the next draw copy the current bytes.
+bool ownedDrawSnapshotTests(const Device& device, Recorder& recorder) {
+#ifndef _WIN32
+    (void)device;
+    (void)recorder;
+    std::cout << "owned words are Windows only: owned draw snapshots not tested\n";
+    return false;
+#else
+    const auto& context = device.GetContext();
+    constexpr std::size_t bytes = 4 * 65536;
+    std::unique_lock gpu(GpuMutex());
+    void* block = context.hostImportAlignment != 0 ? AllocateWatched(bytes, 65536) : nullptr;
+    if (block == nullptr) {
+        std::cout << "host imports or write watching unavailable: owned draw snapshots not tested\n";
+        return false;
+    }
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+    auto* guest = static_cast<std::uint8_t*>(block);
+    for (std::size_t at = 0; at < bytes; ++at) guest[at] = static_cast<std::uint8_t>(at * 5u + 1u);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes);
+        }
+    } unregister{context, block};
+    if (HostImportFor(context, address, bytes) == nullptr) {
+        std::cout << "host import of the block refused: owned draw snapshots not tested\n";
+        return false;
+    }
+    constexpr std::size_t elementOffset = 65536;
+    constexpr std::size_t elementBytes = 2 * 65536;
+    const auto element = address + elementOffset;
+    if (AgcDriver::GuestMemory::CollectWrites(element, elementBytes) != 0) {
+        std::cout << "host imports stay watched: owned draw snapshots not tested\n";
+        return false;
+    }
+    ShaderRecompiler::RecompileResult program;
+    ShaderRecompiler::DescriptorBinding binding;
+    binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+    binding.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+    binding.descriptorSet = 0;
+    binding.binding = 0;
+    binding.count = 1;
+    binding.guestDescriptor = {static_cast<std::uint32_t>(element), static_cast<std::uint32_t>(element >> 32u) & 0xffffu, static_cast<std::uint32_t>(elementBytes), 0x31000000u};
+    binding.bufferWritten = {false};
+    program.bindings.push_back(binding);
+    const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    auto snapshotContext = context;
+    DescriptorCache cache(snapshotContext);
+    snapshotContext.descriptorCache = &cache;
+    Recorder snapshotRecorder(snapshotContext);
+    snapshotRecorder.Activate();
+    {
+        ShaderResources resources(snapshotContext, compute);
+        const auto next = [&] {
+            AgcDriver::GuestMemory::MarkWritten(address, 4);
+            AgcDriver::GuestMemory::BumpCollectEpoch();
+            const auto bindings = resources.PrepareDrawBindings(snapshotRecorder);
+            Require(bindings != nullptr && bindings->snapshots.size() == 1, "read-only draw input was not snapshotted");
+            auto buffer = bindings->snapshots[0].buffer;
+            Require(buffer->Bytes().size() == elementBytes && std::memcmp(buffer->Bytes().data(), reinterpret_cast<const void*>(element), elementBytes) == 0, "a draw snapshot does not hold the guest bytes of its draw");
+            return buffer;
+        };
+        const auto settles = [&](const char* what) {
+            auto previous = next();
+            for (int attempt = 0; attempt < 4; ++attempt) {
+                auto current = next();
+                if (current == previous) return current;
+                previous = std::move(current);
+            }
+            Require(false, what);
+            return previous;
+        };
+        const auto first = next();
+        Require(next() == first, "an unchanged untracked draw input was copied again");
+        guest[elementOffset + 70000] ^= 0xffu;
+        const auto afterCpu = next();
+        Require(afterCpu != first, "an owned draw snapshot outlived a CPU store to its range");
+        const auto settled = settles("an untracked draw input was not reused again after a CPU store");
+        AgcDriver::GuestMemory::MarkWritten(element + 8, 4);
+        const auto bindings = resources.PrepareDrawBindings(snapshotRecorder);
+        Require(bindings != nullptr && bindings->snapshots[0].buffer != settled, "an owned draw snapshot outlived a driver store to its range");
+        settles("an untracked draw input was not reused after a driver store");
+        RuntimeSwitches::Assign(RuntimeSwitch::NoOwnedDrawSnapshots, true);
+        const auto offFirst = next();
+        const auto offSecond = next();
+        RuntimeSwitches::Assign(RuntimeSwitch::NoOwnedDrawSnapshots, false);
+        Require(offFirst != offSecond, "APS5_NO_OWNED_DRAW_SNAPSHOTS still reused the untracked draw input");
+        snapshotRecorder.Sync();
+    }
+    recorder.Activate();
+    std::cout << "owned draw snapshots: ok\n";
+    return true;
+#endif
 }
 
 void drawSnapshotCapTests(const Device& device, Recorder& recorder) {
@@ -12241,6 +12362,9 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--draw-snapshot-epoch-only") {
             drawSnapshotEpochTests(device);
             return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--owned-draw-snapshots-only") {
+            return ownedDrawSnapshotTests(device, recorder) ? 0 : 77;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--gpu-sourced-only") {
             return gpuSourcedDrawTests(device, recorder) ? 0 : 77;
