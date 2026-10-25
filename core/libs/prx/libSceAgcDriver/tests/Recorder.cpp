@@ -4680,7 +4680,7 @@ void drawSnapshotEpochTests(const Device& device) {
     std::cout << "draw snapshot reuse within a collect epoch: ok\n";
 }
 
-// GPU-sourced draw buffers and copy-ins (APS5_NO_GPU_SOURCED_DRAW_BUFFERS, APS5_NO_IMPORT_SOURCED_COPY_IN):
+// GPU-sourced draw buffers and copy-ins (opt-in: APS5_GPU_SOURCED_DRAW_BUFFERS, APS5_IMPORT_SOURCED_COPY_IN):
 // a read-only draw input over a range a staged dispatch wrote binds the dispatch's shadow; a CPU store
 // or a driver store after the write, or the switch, keeps the CPU snapshot; a misaligned read-only
 // copy-in copies from the shadow; APS5_VERIFY_GPU_SOURCED (set by the second registration) agrees.
@@ -4787,6 +4787,18 @@ bool gpuSourcedDrawTests(const Device& device, Recorder& recorder) {
             Require(bindings != nullptr && bindings->snapshots.size() == 1 && bindings->snapshots[0].bytes == elementBytes, "read-only draw input was not snapshotted");
             return bindings;
         };
+        if (!RuntimeSwitches::Set(RuntimeSwitch::GpuSourcedDrawBuffers) && !RuntimeSwitches::Set(RuntimeSwitch::ImportSourcedCopyIn)) {
+            {
+                auto produced = produce(0x21212121u, true);
+                const auto bindings = draw();
+                Require(bindings->snapshots[0].buffer->Mapped() && bindings->snapshots[0].buffer->Handle() != produced.second, "a draw input was bound GPU-side with the GPU-sourced switches unset");
+                Require(GuestBufferMemory::GpuSourceEntries() == 0, "GPU sources were registered with the GPU-sourced switches unset");
+            }
+            snapshotRecorder.Sync();
+            recorder.Activate();
+            std::cout << "GPU-sourced draw buffers and copy-ins: off by default, nothing registered\n";
+            return true;
+        }
         const auto verified = GuestBufferMemory::GpuSourceVerifyCounts();
         auto [producer, shadow] = produce(0x22222222u, true);
         {
@@ -4816,10 +4828,10 @@ bool gpuSourcedDrawTests(const Device& device, Recorder& recorder) {
         AgcDriver::GuestMemory::MarkWritten(element + 8, 4);
         Require(draw()->snapshots[0].buffer->Mapped(), "a driver store after the GPU write did not take the CPU snapshot path");
         auto third = produce(0x55555555u, true);
-        RuntimeSwitches::Assign(RuntimeSwitch::NoGpuSourcedDrawBuffers, true);
+        RuntimeSwitches::Assign(RuntimeSwitch::GpuSourcedDrawBuffers, false);
         const auto off = draw();
-        RuntimeSwitches::Assign(RuntimeSwitch::NoGpuSourcedDrawBuffers, false);
-        Require(off->snapshots[0].buffer->Mapped() && holds(std::vector<std::byte>(off->snapshots[0].Bytes().begin(), off->snapshots[0].Bytes().end()), 0x55555555u), "APS5_NO_GPU_SOURCED_DRAW_BUFFERS did not keep the CPU snapshot");
+        RuntimeSwitches::Assign(RuntimeSwitch::GpuSourcedDrawBuffers, true);
+        Require(off->snapshots[0].buffer->Mapped() && holds(std::vector<std::byte>(off->snapshots[0].Bytes().begin(), off->snapshots[0].Bytes().end()), 0x55555555u), "APS5_GPU_SOURCED_DRAW_BUFFERS unset did not keep the CPU snapshot");
         AgcDriver::GuestMemory::BumpCollectEpoch();
         Require(draw()->snapshots[0].buffer->Handle() == third.second, "the switch turned back on did not bind GPU-side");
         const auto copied = GuestBufferMemory::GpuSourcedCopyIns();

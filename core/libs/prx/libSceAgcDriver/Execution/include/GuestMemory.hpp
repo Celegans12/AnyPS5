@@ -160,7 +160,7 @@ std::uint64_t MarkPossiblyWritten(std::uint64_t address, std::size_t bytes);
 std::uint64_t StoreOwnBytes(std::uint64_t address, std::size_t bytes, const std::function<void()>& store);
 std::uint64_t StoreOwnBytes(std::uint64_t address, std::span<const std::byte> source);
 bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
-// Own GPU write marks (GPU-sourced draw buffers, APS5_NO_GPU_SOURCED_DRAW_BUFFERS): every range of
+// Own GPU write marks (GPU-sourced draw buffers, APS5_GPU_SOURCED_DRAW_BUFFERS): every range of
 // `marks` is marked as MarkPossiblyWritten does (its generation into `generations`), under the one
 // tracker hold that first answers each check: `clean` when nothing stored over its range since its
 // `since` (StoredOver after a fresh collect of its pages, so a CPU store not collected yet counts;

@@ -395,7 +395,7 @@ public:
     // regions was recorded (ShaderResources::MarkGpuWrites), under GuestMemory::GpuMutex. A use that
     // never calls it (a synchronous draw) stores the staging bytes from the CPU in WriteBack.
     void RecordCopyBacks(Recorder& recorder);
-    // GPU-sourced buffers (APS5_NO_GPU_SOURCED_DRAW_BUFFERS=1 off, APS5_NO_IMPORT_SOURCED_COPY_IN=1 off
+    // GPU-sourced buffers (opt-in: APS5_GPU_SOURCED_DRAW_BUFFERS=1, APS5_IMPORT_SOURCED_COPY_IN=1
     // for the copy-in side; APS5_AB switches). A staged region whose copy-in found no pending writer
     // and whose copy-back marks found nothing stored over it since the copy-in (MarkOwnWrites) is
     // registered with its device-local shadow: until a later store (CPU or driver, any stamp after

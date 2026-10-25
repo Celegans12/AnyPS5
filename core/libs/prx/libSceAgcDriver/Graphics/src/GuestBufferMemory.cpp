@@ -5457,6 +5457,8 @@ GpuSourceRegistry& GpuSources() {
     return *registry;
 }
 
+std::atomic<bool> gpuSourcesUsed{false};
+
 constexpr std::size_t GpuSourceEntryLimit = 16384;
 constexpr std::size_t GpuSourceBorrowLimit = 16384;
 constexpr std::size_t GpuSourceMissCount = static_cast<std::size_t>(GuestBufferMemory::GpuSourceMiss::Count);
@@ -5500,6 +5502,7 @@ void forgetGpuSourceLocked(GpuSourceRegistry& registry, const Buffer* buffer) {
 void registerGpuSource(std::uint64_t begin, std::uint64_t end, const std::shared_ptr<Buffer>& buffer, std::uint64_t since, std::uint64_t after, std::uint64_t registryGeneration, int lane, std::vector<std::uint64_t> words, std::shared_ptr<std::atomic<std::uint8_t>> feedback) {
     auto& registry = GpuSources();
     std::lock_guard lock(registry.mutex);
+    gpuSourcesUsed.store(true, std::memory_order_relaxed);
     forgetGpuSourceLocked(registry, buffer.get());
     auto it = registry.entries.lower_bound(begin);
     if (it != registry.entries.begin()) {
@@ -5535,6 +5538,7 @@ void forgetGpuSource(const Buffer* buffer) {
 }
 
 std::optional<int> gpuSourceCopyIn(const Buffer* buffer) {
+    if (!gpuSourcesUsed.load(std::memory_order_relaxed)) return std::nullopt;
     auto& registry = GpuSources();
     std::lock_guard lock(registry.mutex);
     forgetGpuSourceLocked(registry, buffer);
@@ -5564,12 +5568,12 @@ void countCopyIn(bool gpu, std::size_t bytes, GuestBufferMemory::GpuSourceMiss m
 
 bool GuestBufferMemory::GpuSourcedDrawBuffers() {
     static const bool capture = std::getenv("APS5_CAPTURE_INPUTS") != nullptr;
-    return !capture && !RuntimeSwitches::Set(RuntimeSwitch::NoGpuSourcedDrawBuffers);
+    return !capture && RuntimeSwitches::Set(RuntimeSwitch::GpuSourcedDrawBuffers);
 }
 
 bool GuestBufferMemory::ImportSourcedCopyIn() {
     static const bool capture = std::getenv("APS5_CAPTURE_GPU_COPIES") != nullptr;
-    return !capture && !RuntimeSwitches::Set(RuntimeSwitch::NoImportSourcedCopyIn);
+    return !capture && RuntimeSwitches::Set(RuntimeSwitch::ImportSourcedCopyIn);
 }
 
 const char* GuestBufferMemory::GpuSourceMissName(GpuSourceMiss miss) {
@@ -5745,7 +5749,7 @@ void GuestBufferMemory::ReportGpuSources() {
         previousCopy[index] = copyNow;
     }
     const auto kib = [](unsigned long long value) { return static_cast<double>(value) / 1024.0; };
-    AgcDriver::ProfilePrint_nid_no_patch("[gpu-sourced] last 10 s (APS5_NO_GPU_SOURCED_DRAW_BUFFERS %s, APS5_NO_IMPORT_SOURCED_COPY_IN %s): draw buffers %llu bound GPU-side (%.0f KiB not compared or copied), %llu taken by the CPU path (%.0f KiB, copied or reused, see [draw-snapshots]; misses: %s); copy-ins %llu from a GPU source (%.0f KiB not memcpy'd), %llu CPU snapshots (%.0f KiB; misses: %s); sources registered %llu, refused %llu stored since the copy-in, %llu writer pending on the other lane at the copy-in, %llu after a same-lane writer (APS5_NO_GPU_SOURCE_AFTER_WRITER %s), %llu backing off; owned words armed %llu, refused %llu; cross-lane orders %llu; %zu live; verify %llu checked, %llu differing\n", RuntimeSwitches::Set(RuntimeSwitch::NoGpuSourcedDrawBuffers) ? "set" : "unset", RuntimeSwitches::Set(RuntimeSwitch::NoImportSourcedCopyIn) ? "set" : "unset", delta[DrawGpu], kib(delta[DrawGpuBytes]), delta[DrawCopied], kib(delta[DrawCopiedBytes]), draws.c_str(), delta[CopyGpu], kib(delta[CopyGpuBytes]), delta[CopyCpu], kib(delta[CopyCpuBytes]), copies.c_str(), delta[Registered], delta[RefusedStored], delta[RefusedPending], delta[AfterWriter], RuntimeSwitches::Set(RuntimeSwitch::NoGpuSourceAfterWriter) ? "set" : "unset", delta[BackingOff], delta[Armed], delta[ArmRefused], delta[CrossLane], GpuSourceEntries(), delta[Verified], delta[Differing]);
+    AgcDriver::ProfilePrint_nid_no_patch("[gpu-sourced] last 10 s (APS5_GPU_SOURCED_DRAW_BUFFERS %s, APS5_IMPORT_SOURCED_COPY_IN %s): draw buffers %llu bound GPU-side (%.0f KiB not compared or copied), %llu taken by the CPU path (%.0f KiB, copied or reused, see [draw-snapshots]; misses: %s); copy-ins %llu from a GPU source (%.0f KiB not memcpy'd), %llu CPU snapshots (%.0f KiB; misses: %s); sources registered %llu, refused %llu stored since the copy-in, %llu writer pending on the other lane at the copy-in, %llu after a same-lane writer (APS5_NO_GPU_SOURCE_AFTER_WRITER %s), %llu backing off; owned words armed %llu, refused %llu; cross-lane orders %llu; %zu live; verify %llu checked, %llu differing\n", RuntimeSwitches::Set(RuntimeSwitch::GpuSourcedDrawBuffers) ? "set" : "unset", RuntimeSwitches::Set(RuntimeSwitch::ImportSourcedCopyIn) ? "set" : "unset", delta[DrawGpu], kib(delta[DrawGpuBytes]), delta[DrawCopied], kib(delta[DrawCopiedBytes]), draws.c_str(), delta[CopyGpu], kib(delta[CopyGpuBytes]), delta[CopyCpu], kib(delta[CopyCpuBytes]), copies.c_str(), delta[Registered], delta[RefusedStored], delta[RefusedPending], delta[AfterWriter], RuntimeSwitches::Set(RuntimeSwitch::NoGpuSourceAfterWriter) ? "set" : "unset", delta[BackingOff], delta[Armed], delta[ArmRefused], delta[CrossLane], GpuSourceEntries(), delta[Verified], delta[Differing]);
 }
 
 void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool addressable) {
@@ -5825,8 +5829,8 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
             if (profile) SourceStats().crossLaneOrders.fetch_add(1, std::memory_order_relaxed);
         }
         region->gpuSourceSince = 0;
-        region->gpuSourceWords.clear();
-        const bool orderedWriter = pendingWriter && !RuntimeSwitches::Set(RuntimeSwitch::NoGpuSourceAfterWriter) && !recorder->PendingWriteOtherLane(address, static_cast<std::size_t>(bytes));
+        if (!region->gpuSourceWords.empty()) region->gpuSourceWords.clear();
+        const bool orderedWriter = sourcesOn && pendingWriter && !RuntimeSwitches::Set(RuntimeSwitch::NoGpuSourceAfterWriter) && !recorder->PendingWriteOtherLane(address, static_cast<std::size_t>(bytes));
         if (sourcesOn && (!pendingWriter || orderedWriter) && region->deviceLocal && !region->overlay && !region->sparse && !HoldsLease()) {
             if (const auto feedback = std::exchange(region->gpuSourceFeedback, nullptr)) {
                 const auto learned = feedback->load(std::memory_order_relaxed);
