@@ -192,6 +192,20 @@ StageRecord DescribeStage(const SlotClasses& classes, const ShaderRecompiler::Ir
     auto& shape = record.hashes[classIndex(Diff::BufferShape)];
     auto& alignment = record.hashes[classIndex(Diff::BaseAlignment)];
     shape = mix(shape, snapshot.buffers.size());
+    auto& descriptorPlan = record.descriptorPlan;
+    descriptorPlan = Seed;
+    for (std::size_t index = 0; index < snapshot.buffers.size(); ++index) {
+        const auto& buffer = snapshot.buffers[index];
+        const bool formatted = index < plan.info.buffers.size() && plan.info.buffers[index].descriptorFormatted;
+        const auto word3 = formatted ? buffer.dwords[3] : (buffer.dwords[3] & 0xf0e00000u) | (((buffer.dwords[3] >> 12u) & 0x7fu) != 0u ? 1u << 12u : 0u);
+        descriptorPlan = mix(mix(mix(mix(descriptorPlan, buffer.dwordCount), buffer.dwords[1] & 0xffff0000u), word3), buffer.dwords[0] & 3u);
+    }
+    for (const auto& image : snapshot.images) {
+        descriptorPlan = mix(mix(descriptorPlan, image.dwordCount), image.dwords[0] != 0u || (image.dwords[1] & 0xffu) != 0u ? 1u : 0u);
+        descriptorPlan = mix(descriptorPlan, image.dwords[1] & ~0xffu);
+        for (std::size_t word = 2; word < 8; ++word) descriptorPlan = mix(descriptorPlan, image.dwords[word]);
+    }
+    for (const auto& value : snapshot.samplers) hashDescriptor(descriptorPlan, value);
     for (const auto& buffer : snapshot.buffers) {
         shape = mix(shape, buffer.dwordCount);
         shape = mix(shape, buffer.availableDwordMask);
@@ -286,6 +300,7 @@ void Tally::Add(const Outcome& outcome) {
     ++lookups;
     if (outcome.hit) ++hits[static_cast<std::size_t>(outcome.age)];
     else if (outcome.diff < Diff::Count) ++misses[classIndex(outcome.diff)];
+    if (!outcome.hit && outcome.descriptorData) ++descriptorData[outcome.diff == Diff::Texture ? 1u : 0u];
 }
 
 std::uint64_t Tally::Hits() const {
@@ -294,7 +309,7 @@ std::uint64_t Tally::Hits() const {
     return total;
 }
 
-Outcome Predictor::note(std::uint64_t key, const std::array<std::uint64_t, HashedClasses>& hashes, std::uint64_t combined, std::uint64_t frame) {
+Outcome Predictor::note(std::uint64_t key, const std::array<std::uint64_t, HashedClasses>& hashes, std::uint64_t combined, std::uint64_t descriptorPlan, std::uint64_t frame) {
     if (rings.size() >= MaxRings && !rings.contains(key)) {
         rings.clear();
         ++resets;
@@ -308,6 +323,7 @@ Outcome Predictor::note(std::uint64_t key, const std::array<std::uint64_t, Hashe
         outcome.age = seen == frame ? Age::SameFrame : seen + 1u == frame ? Age::PreviousFrame : Age::Older;
         ring.frames[entry] = frame;
         ring.last = hashes;
+        ring.lastPlan = descriptorPlan;
         return outcome;
     }
     if (ring.size == 0) {
@@ -319,19 +335,29 @@ Outcome Predictor::note(std::uint64_t key, const std::array<std::uint64_t, Hashe
             outcome.diff = static_cast<Diff>(c);
             break;
         }
+        if (outcome.diff == Diff::Texture || outcome.diff == Diff::BufferShape) {
+            bool rest = descriptorPlan == ring.lastPlan;
+            for (std::size_t c = 0; c < HashedClasses && rest; ++c) {
+                const auto diff = static_cast<Diff>(c);
+                if (diff == Diff::Texture || diff == Diff::Sampler || diff == Diff::BufferShape || diff == Diff::BaseAlignment) continue;
+                rest = ring.last[c] == hashes[c];
+            }
+            outcome.descriptorData = rest;
+        }
     }
     ring.hashes[ring.next] = combined;
     ring.frames[ring.next] = frame;
     ring.next = static_cast<std::uint32_t>((ring.next + 1u) % RingEntries);
     ring.size = std::min<std::uint32_t>(ring.size + 1u, RingEntries);
     ring.last = hashes;
+    ring.lastPlan = descriptorPlan;
     return outcome;
 }
 
 Outcome Predictor::NoteStage(std::uint64_t shape, std::size_t stage, const StageRecord* record, std::uint64_t frame) {
     if (record == nullptr) return {false, Age::SameFrame, Diff::Unrecorded};
     if (!record->eligible) return {false, Age::SameFrame, Diff::NoPlan};
-    return note(stageKey(shape, stage), record->hashes, record->Combined(), frame);
+    return note(stageKey(shape, stage), record->hashes, record->Combined(), record->descriptorPlan, frame);
 }
 
 Outcome Predictor::NoteDraw(std::uint64_t shape, std::span<const StageRecord* const> stages, std::uint64_t drawParameters, std::uint64_t frame) {
@@ -350,7 +376,9 @@ Outcome Predictor::NoteDraw(std::uint64_t shape, std::span<const StageRecord* co
     hashes[classIndex(Diff::DrawParameters)] = mix(hashes[classIndex(Diff::DrawParameters)], drawParameters);
     std::uint64_t combined = Seed;
     for (const auto value : hashes) combined = mix(combined, value);
-    return note(drawKey(shape), hashes, combined, frame);
+    std::uint64_t descriptorPlan = Seed;
+    for (std::size_t s = 0; s < stages.size(); ++s) descriptorPlan = mix(mix(descriptorPlan, s), stages[s]->descriptorPlan);
+    return note(drawKey(shape), hashes, combined, descriptorPlan, frame);
 }
 
 void Predictor::Clear() {
@@ -428,6 +456,7 @@ void appendTally(std::string& text, const Tally& tally) {
     const auto hits = tally.Hits();
     appendf(text, "predicted hits %llu = %.1f %% (same frame %llu, previous frame %llu, older %llu); misses by first differing class:", static_cast<unsigned long long>(hits), percent(hits, tally.lookups), static_cast<unsigned long long>(tally.hits[0]), static_cast<unsigned long long>(tally.hits[1]), static_cast<unsigned long long>(tally.hits[2]));
     for (std::size_t d = 0; d < static_cast<std::size_t>(Diff::Count); ++d) appendf(text, "%s %s %llu", d == 0 ? "" : ",", DiffName(static_cast<Diff>(d)), static_cast<unsigned long long>(tally.misses[d]));
+    appendf(text, "; of the V# and T# misses, descriptor data only (binding-plan key and other classes equal): V# %llu, T# %llu", static_cast<unsigned long long>(tally.descriptorData[0]), static_cast<unsigned long long>(tally.descriptorData[1]));
 }
 
 }

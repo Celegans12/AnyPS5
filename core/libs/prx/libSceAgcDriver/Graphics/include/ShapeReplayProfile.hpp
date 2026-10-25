@@ -71,6 +71,7 @@ struct StageRecord {
     bool eligible = false;
     std::array<std::uint64_t, HashedClasses> hashes{};
     std::array<std::uint32_t, 4> slotCounts{};
+    std::uint64_t descriptorPlan = 0;
     [[nodiscard]] std::uint64_t Combined() const;
 };
 
@@ -84,6 +85,7 @@ struct Outcome {
     bool hit = false;
     Age age = Age::SameFrame;
     Diff diff = Diff::Count;
+    bool descriptorData = false;
 };
 
 struct Tally {
@@ -91,6 +93,7 @@ struct Tally {
     std::array<std::uint64_t, static_cast<std::size_t>(Age::Count)> hits{};
     std::array<std::uint64_t, static_cast<std::size_t>(Diff::Count)> misses{};
     std::array<std::uint64_t, 4> slots{};
+    std::array<std::uint64_t, 2> descriptorData{};
     void Add(const Outcome& outcome);
     [[nodiscard]] std::uint64_t Hits() const;
 };
@@ -112,10 +115,11 @@ private:
         std::array<std::uint64_t, RingEntries> hashes{};
         std::array<std::uint64_t, RingEntries> frames{};
         std::array<std::uint64_t, HashedClasses> last{};
+        std::uint64_t lastPlan = 0;
         std::uint32_t size = 0;
         std::uint32_t next = 0;
     };
-    Outcome note(std::uint64_t key, const std::array<std::uint64_t, HashedClasses>& hashes, std::uint64_t combined, std::uint64_t frame);
+    Outcome note(std::uint64_t key, const std::array<std::uint64_t, HashedClasses>& hashes, std::uint64_t combined, std::uint64_t descriptorPlan, std::uint64_t frame);
     std::unordered_map<std::uint64_t, Ring> rings;
     std::uint64_t resets = 0;
 };

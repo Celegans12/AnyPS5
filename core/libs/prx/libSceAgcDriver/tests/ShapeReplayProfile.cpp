@@ -1,4 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/ShapeReplayProfile.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/ShapeReplay.hpp"
+#include <cstring>
 #include <cstdio>
 #include <exception>
 #include <memory>
@@ -189,6 +191,18 @@ void predictedHits() {
     miss([](Draw& draw) { draw.userData[ConditionUserWord] = 8u; }, Diff::UserValue, "a changed user value word");
     miss([](Draw& draw) { draw.vertex.resources[0].fields[1] = 0x00300000u; }, Diff::Vertex, "a changed vertex stride");
     miss([](Draw& draw) { draw.parameters = ShapeReplay::DrawParameterBits(true, 4, 1, false); }, Diff::DrawParameters, "a changed index size");
+    const auto dataOnly = [&](auto change, Diff expected, bool data, const char* what) {
+        auto draw = baseDraw();
+        change(draw);
+        const auto outcome = note(draw, 7);
+        Require(!outcome.hit && outcome.diff == expected && outcome.descriptorData == data, std::string("descriptor data split: ") + what + (data ? " was not" : " was") + " counted as descriptor data only");
+        Require(note(baseDraw(), 7).hit, std::string("descriptor data split: the base draw after ") + what + " missed");
+    };
+    dataOnly([](Draw& draw) { draw.snapshot.buffers[0].dwords[2] = 1024u; draw.snapshot.flattenedSrt[SizeSlot] = 1024u; }, Diff::BufferShape, true, "a V# size change");
+    dataOnly([](Draw& draw) { draw.snapshot.buffers[0].dwords[1] = 0x00400000u; }, Diff::BufferShape, false, "a V# stride change");
+    dataOnly([](Draw& draw) { draw.snapshot.images[0].dwords[0] = 0x00c0ff00u; }, Diff::Texture, true, "a T# base change");
+    dataOnly([](Draw& draw) { draw.snapshot.images[0].dwords[2] = 0x1ff003ffu; }, Diff::Texture, false, "a T# size change");
+    dataOnly([](Draw& draw) { draw.snapshot.images[0].dwords[0] = 0x00c0ff00u; draw.userData[ConditionUserWord] = 8u; }, Diff::Texture, false, "a T# base change with a user value word change");
     const auto other = note(baseDraw(), 6, Shape + 1);
     Require(!other.hit && other.diff == Diff::NewShape, "predicted hits: another shape shared a ring");
 
@@ -199,6 +213,89 @@ void predictedHits() {
     const ShapeReplay::StageRecord* stages[] = {&ineligible};
     const auto noPlan = predictor.NoteDraw(Shape, stages, baseDraw().parameters, 6);
     Require(!noPlan.hit && noPlan.diff == Diff::NoPlan, "predicted hits: a draw with an ineligible stage was not a no-plan miss");
+}
+
+void patching() {
+    namespace Replay = AgcDriver::DriverDetail::ShapeReplay;
+    using ShaderRecompiler::DescriptorRole;
+    ShaderRecompiler::ResourceSnapshot snapshot;
+    snapshot.flattenedSrt = {1u, 2u, 3u};
+    ShaderRecompiler::DescriptorValue first, second;
+    first.dwords = {0x10000000u, 0x00100000u, 256u, 0x00027facu};
+    first.dwordCount = 4;
+    second.dwords = {0x20000000u, 0x00100000u, 128u, 0x00027facu};
+    second.dwordCount = 4;
+    snapshot.buffers = {first, second};
+    snapshot.userData = {10u, 11u, 12u, 13u};
+    ShaderRecompiler::ShaderVertexStageInfo vertex{};
+    vertex.resourcesNum = 2;
+    vertex.resources[1].fields = {0x30000000u, 0x00200000u, 64u, 0x00027facu};
+    ShaderRecompiler::RecompileResult plan;
+    plan.variantId = 7;
+    plan.shaderDataUserWords = {2u, 0u};
+    const auto binding = [](DescriptorRole role, std::vector<std::uint32_t> words) {
+        ShaderRecompiler::DescriptorBinding made{};
+        made.role = role;
+        made.count = 1;
+        made.guestDescriptor = std::move(words);
+        return made;
+    };
+    plan.bindings.push_back(binding(DescriptorRole::FlattenedSrt, snapshot.flattenedSrt));
+    plan.bindings.push_back(binding(DescriptorRole::GuestBuffers, {0x20000000u, 0x00100000u, 128u, 0x00027facu, 0x10000000u, 0x00100000u, 256u, 0x00027facu}));
+    plan.bindings.push_back(binding(DescriptorRole::ShaderData, {12u, 10u, 0xabcu}));
+    plan.vertexAttributes.push_back({1u, 4u, vertex.resources[1], 0u, 4u});
+    const auto map = Replay::Learn(plan, snapshot, &vertex);
+    Require(map.has_value() && map->flatBindings.size() == 1 && map->buffers.size() == 2 && map->shaderDataBinding == 2 && map->vertexAttributes && !map->pushUserWords, "patching: the data positions of a result were not learned");
+    auto moved = snapshot;
+    moved.flattenedSrt = {4u, 5u, 6u};
+    moved.buffers[0].dwords[0] = 0x10000100u;
+    moved.buffers[1].dwords[2] = 512u;
+    moved.userData[2] = 99u;
+    auto movedVertex = vertex;
+    movedVertex.resources[1].fields[0] = 0x30000040u;
+    const auto replayed = Replay::Apply(plan, *map, moved, &movedVertex);
+    Require(replayed != nullptr, "patching: moved data was refused");
+    auto expected = plan;
+    expected.bindings[0].guestDescriptor = {4u, 5u, 6u};
+    expected.bindings[1].guestDescriptor = {0x20000000u, 0x00100000u, 512u, 0x00027facu, 0x10000100u, 0x00100000u, 256u, 0x00027facu};
+    expected.bindings[2].guestDescriptor = {99u, 10u, 0xabcu};
+    expected.vertexAttributes[0].resource = movedVertex.resources[1];
+    Require(Replay::Difference(*replayed, expected).empty(), "patching: the replayed result differs from the expected one in its " + Replay::Difference(*replayed, expected));
+    auto pushed = expected;
+    pushed.pushConstants.resize(4);
+    Require(Replay::Difference(*replayed, pushed) == "push constants", "patching: a push constant difference was not reported");
+    auto described = expected;
+    described.bindings[1].guestDescriptor[6] = 0u;
+    Require(Replay::Difference(*replayed, described).find("binding 1") != std::string::npos, "patching: a guest descriptor difference was not reported");
+
+    auto pushPlan = plan;
+    pushPlan.bindings.pop_back();
+    pushPlan.pushConstants.resize(12);
+    const std::uint32_t pushWords[3] = {12u, 10u, 0x55u};
+    std::memcpy(pushPlan.pushConstants.data(), pushWords, sizeof(pushWords));
+    const auto pushMap = Replay::Learn(pushPlan, snapshot, &vertex);
+    Require(pushMap.has_value() && pushMap->pushUserWords, "patching: forwarded user words in push constants were not learned");
+    const auto pushReplayed = Replay::Apply(pushPlan, *pushMap, moved, &movedVertex);
+    std::uint32_t replayedPush[3] = {};
+    std::memcpy(replayedPush, pushReplayed->pushConstants.data(), sizeof(replayedPush));
+    Require(replayedPush[0] == 99u && replayedPush[1] == 10u && replayedPush[2] == 0x55u, "patching: forwarded user words were not refreshed in the push constants");
+
+    auto twins = snapshot;
+    twins.buffers[1] = twins.buffers[0];
+    auto twinPlan = plan;
+    twinPlan.bindings[1].guestDescriptor = {0x10000000u, 0x00100000u, 256u, 0x00027facu, 0x10000000u, 0x00100000u, 256u, 0x00027facu};
+    const auto twinMap = Replay::Learn(twinPlan, twins, &vertex);
+    Require(twinMap.has_value() && twinMap->buffers[0].candidates.size() == 2, "patching: equal V#s did not both stay candidates");
+    auto split = twins;
+    split.buffers[1].dwords[0] = 0x40000000u;
+    Require(Replay::Apply(twinPlan, *twinMap, split, &vertex) == nullptr, "patching: an element whose candidate V#s diverged was patched");
+    auto stale = plan;
+    stale.bindings[0].guestDescriptor = {9u};
+    Require(!Replay::Learn(stale, snapshot, &vertex).has_value(), "patching: a flattened SRT binding unlike the snapshot was learned");
+    auto foreign = plan;
+    foreign.bindings[1].guestDescriptor[0] = 0x77777777u;
+    Require(!Replay::Learn(foreign, snapshot, &vertex).has_value(), "patching: a guest buffer element no snapshot V# explains was learned");
+    Require(!Replay::Learn(plan, snapshot, nullptr).has_value(), "patching: vertex attributes without vertex stage info were learned");
 }
 
 void report() {
@@ -235,6 +332,7 @@ int main() {
     try {
         classes();
         predictedHits();
+        patching();
         report();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());

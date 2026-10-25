@@ -318,6 +318,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawRegisterKey.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawRelocate.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawTiming.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/ShapeReplay.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/IndirectDraw.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/EntryPoints.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Lifecycle.cpp
@@ -601,7 +602,7 @@ if(BUILD_TESTING)
     configure_windows_unwind(agc_runtime_switches_tests)
     add_test(NAME agc_runtime_switches COMMAND agc_runtime_switches_tests)
 
-    add_test_executable(agc_draw_cache_shape_replay_tests tests/ShapeReplayProfile.cpp Graphics/src/ShapeReplayProfile.cpp)
+    add_test_executable(agc_draw_cache_shape_replay_tests tests/ShapeReplayProfile.cpp Graphics/src/ShapeReplayProfile.cpp Execution/src/Driver/Draw/ShapeReplay.cpp Graphics/src/RuntimeSwitches.cpp)
     target_include_directories(agc_draw_cache_shape_replay_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(agc_draw_cache_shape_replay_tests PRIVATE shader_recompiler_agc_driver libc)
     set_target_properties(agc_draw_cache_shape_replay_tests PROPERTIES CXX_EXTENSIONS OFF)
@@ -3315,6 +3316,16 @@ if(BUILD_TESTING)
     set_tests_properties(agc_driver_draw_cache_reuse_entry_verify PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_VERIFY_DRAW_ENTRIES=1" SKIP_RETURN_CODE 77 FAIL_REGULAR_EXPRESSION "FATAL:")
     if(WIN32)
         set_tests_properties(agc_driver_draw_cache_reuse_entry_verify PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    add_test(NAME agc_driver_shape_replay_draws_off COMMAND agc_driver_shape_replay_draws_tests)
+    set_tests_properties(agc_driver_shape_replay_draws_off PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_SHAPE_REPLAY=1" SKIP_RETURN_CODE 77)
+    add_test(NAME agc_driver_shape_replay_draws_verify COMMAND agc_driver_shape_replay_draws_tests)
+    set_tests_properties(agc_driver_shape_replay_draws_verify PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_VERIFY_SHAPE_REPLAY=100" SKIP_RETURN_CODE 77 FAIL_REGULAR_EXPRESSION "shape-replay. (verify|probation):")
+    add_test(NAME agc_driver_shape_replay_command_log COMMAND ${CMAKE_COMMAND} -DFIXTURE=$<TARGET_FILE:agc_driver_shape_replay_draws_tests> -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/ShapeReplayCommandLog.cmake)
+    set_tests_properties(agc_driver_shape_replay_command_log PROPERTIES TIMEOUT 150 SKIP_REGULAR_EXPRESSION "shape replay command log: skipped")
+    if(WIN32)
+        set_tests_properties(agc_driver_shape_replay_draws_off agc_driver_shape_replay_draws_verify agc_driver_shape_replay_command_log PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test(NAME agc_driver_draw_cache_reuse_inline COMMAND agc_driver_draw_cache_reuse_tests)
