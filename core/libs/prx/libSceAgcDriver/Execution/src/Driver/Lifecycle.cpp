@@ -281,6 +281,10 @@ std::vector<AwaitedWait> Driver::AwaitedWaits() {
     return result;
 }
 
+bool Driver::Quiescent() {
+    return runningWorkers.load(std::memory_order_acquire) == 0 && !DrawPipeline::Queue0().Busy() && !completionsPending();
+}
+
 std::pair<std::uint64_t, std::uint64_t> Driver::SerialProgress() {
     std::lock_guard lock(mutex);
     return {accepted, completed};
