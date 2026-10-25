@@ -401,6 +401,13 @@ public:
     bool OpenWriteOverlaps(std::uint64_t address, std::size_t bytes) const;
     std::uint64_t PendingWriterSerial(std::uint64_t address, std::size_t bytes) const;
     std::uint64_t PendingLeaseSerial(std::uint64_t address, std::size_t bytes) const;
+    struct WriterWait {
+        std::array<std::uint64_t, 2> targets{};
+        std::size_t leftInFlight = 0;
+        std::size_t leftOpen = 0;
+    };
+    WriterWait FinishWritersByLane(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t leaseBegin, std::uint64_t leaseEnd);
+    bool WritersPendingOver(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t leaseBegin, std::uint64_t leaseEnd) const;
     // What SyncThrough(address, bytes) would wait for, for the [hooksync] attribution: the newest
     // batch whose noted range overlaps the access (the open batch counts first, with the serial it
     // will get), whether that batch's fence has already signaled (its GPU work is done, so the
@@ -1088,6 +1095,7 @@ private:
     void removeLabels(Batch& batch);
     void release(Batch& batch) noexcept;
     static bool overlaps(const Batch& batch, std::uint64_t address, std::uint64_t end);
+    static bool writesOver(const Batch& batch, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t leaseBegin, std::uint64_t leaseEnd);
     static std::optional<ReadKind> readOverlap(const Batch& batch, std::uint64_t address, std::uint64_t end, std::optional<ReadKind> only = std::nullopt);
     static std::vector<std::pair<std::uint64_t, std::uint64_t>> notedReads(const Batch& batch);
     bool signaled(const Batch& batch) const;

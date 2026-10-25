@@ -4913,6 +4913,50 @@ void Recorder::SyncThrough(std::uint64_t address, std::size_t bytes, bool waitUn
     batchesLeftInFlight.fetch_add(inFlight.size(), std::memory_order_relaxed);
 }
 
+bool Recorder::writesOver(const Batch& batch, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t leaseBegin, std::uint64_t leaseEnd) {
+    if (leaseEnd > leaseBegin && readOverlap(batch, leaseBegin, leaseEnd, ReadKind::AddressBased).has_value()) return true;
+    for (const auto& [begin, end] : ranges) {
+        if (end > begin && (overlaps(batch, begin, end) || readOverlap(batch, begin, end, ReadKind::AddressBased).has_value())) return true;
+    }
+    return false;
+}
+
+Recorder::WriterWait Recorder::FinishWritersByLane(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t leaseBegin, std::uint64_t leaseEnd) {
+    const auto source = std::exchange(announcedSource, 4);
+    const void* site = std::exchange(announcedSite, nullptr);
+    const auto writes = [&](const Batch& batch) { return writesOver(batch, ranges, leaseBegin, leaseEnd); };
+    WriterWait wait;
+    for (int lane = 0; lane < 2; ++lane) {
+        const auto& slot = lanes[static_cast<std::size_t>(lane)];
+        if (slot == nullptr || !writes(*slot)) continue;
+        submitLane(lane);
+        wait.targets[static_cast<std::size_t>(lane)] = laneSubmitted[static_cast<std::size_t>(lane)];
+    }
+    for (auto it = inFlight.rbegin(); it != inFlight.rend(); ++it) {
+        auto& target = wait.targets[static_cast<std::size_t>((*it)->lane)];
+        if (target == 0 && writes(**it)) target = (*it)->serial;
+    }
+    if (wait.targets[0] == 0 && wait.targets[1] == 0) return wait;
+    if (unsignaled(wait.targets[0]) || unsignaled(wait.targets[1])) ++hookRealWaits;
+    targetedSyncs.fetch_add(1, std::memory_order_relaxed);
+    const RestoreSyncSite restoreSite{BeginSyncSite(source, site != nullptr ? site : __builtin_return_address(0))};
+    for (int lane = 0; lane < 2; ++lane) {
+        if (wait.targets[static_cast<std::size_t>(lane)] != 0) finishLaneThrough(lane, wait.targets[static_cast<std::size_t>(lane)], true, source);
+    }
+    wait.leftInFlight = inFlight.size();
+    for (const auto& batch : lanes) {
+        if (batch != nullptr) ++wait.leftOpen;
+    }
+    batchesLeftInFlight.fetch_add(inFlight.size(), std::memory_order_relaxed);
+    return wait;
+}
+
+bool Recorder::WritersPendingOver(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t leaseBegin, std::uint64_t leaseEnd) const {
+    const auto writes = [&](const Batch& batch) { return writesOver(batch, ranges, leaseBegin, leaseEnd); };
+    if (anyOpen(writes)) return true;
+    return std::any_of(inFlight.begin(), inFlight.end(), [&](const auto& batch) { return writes(*batch); });
+}
+
 namespace {
 
 // What the unlocked hook waits waited for, per read site (the [syncwait] line every 10 s under

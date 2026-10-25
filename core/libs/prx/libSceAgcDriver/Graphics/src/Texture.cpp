@@ -143,6 +143,79 @@ std::atomic<std::uint64_t> sliceCopyLookups{0}, sliceCopyRegions{0};
 std::atomic<std::uint64_t> refreshesProved{0};
 std::atomic<std::uint64_t> untrackedCompares{0};
 
+namespace {
+
+bool FlushWaitsProfiled() {
+    static const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return profiled;
+}
+
+bool FlushLaneWaitVerified() {
+    static const bool verified = std::getenv("APS5_VERIFY_FLUSH_LANE_WAIT") != nullptr;
+    return verified;
+}
+
+struct FlushWaitTotals {
+    std::uint64_t count = 0;
+    double ms = 0;
+};
+
+struct FlushWaits {
+    AgcDriver::Mutex mutex;
+    std::map<std::string, FlushWaitTotals> byReason;
+    std::uint64_t laneWaits = 0, fullWaits = 0, openWriters = 0, laneOneOnly = 0, laneZeroOnly = 0, bothLanes = 0, nothingLeft = 0;
+    std::uint64_t leftInFlight = 0, leftOpen = 0;
+    double laneMs = 0, fullMs = 0;
+};
+
+FlushWaits& FlushWaitCounts() {
+    static FlushWaits waits;
+    return waits;
+}
+
+void NoteFlushWait(const char* reason, bool byLane, bool openWriter, const Recorder::WriterWait& wait, double ms) {
+    auto& waits = FlushWaitCounts();
+    std::lock_guard lock(waits.mutex);
+    auto& totals = waits.byReason[reason != nullptr ? reason : "other"];
+    ++totals.count;
+    totals.ms += ms;
+    if (openWriter) ++waits.openWriters;
+    if (!byLane) {
+        ++waits.fullWaits;
+        waits.fullMs += ms;
+        return;
+    }
+    ++waits.laneWaits;
+    waits.laneMs += ms;
+    const bool zero = wait.targets[0] != 0, one = wait.targets[1] != 0;
+    if (zero && one) ++waits.bothLanes;
+    else if (zero) ++waits.laneZeroOnly;
+    else if (one) ++waits.laneOneOnly;
+    else ++waits.nothingLeft;
+    waits.leftInFlight += wait.leftInFlight;
+    waits.leftOpen += wait.leftOpen;
+}
+
+std::string FlushWaitReport() {
+    auto& waits = FlushWaitCounts();
+    std::lock_guard lock(waits.mutex);
+    std::vector<std::pair<std::string, FlushWaitTotals>> order(waits.byReason.begin(), waits.byReason.end());
+    std::sort(order.begin(), order.end(), [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
+    char text[512];
+    std::snprintf(text, sizeof(text), "[flush-wait] writer waits (10 s): lane-targeted %llu in %.1f ms (lane 0 only %llu, lane 1 only %llu, both %llu, none left %llu; left behind %llu batches in flight, %llu open), full syncs %llu in %.1f ms, open-batch writers %llu%s; by reason (count/ms):", static_cast<unsigned long long>(waits.laneWaits), waits.laneMs, static_cast<unsigned long long>(waits.laneZeroOnly), static_cast<unsigned long long>(waits.laneOneOnly), static_cast<unsigned long long>(waits.bothLanes), static_cast<unsigned long long>(waits.nothingLeft), static_cast<unsigned long long>(waits.leftInFlight), static_cast<unsigned long long>(waits.leftOpen), static_cast<unsigned long long>(waits.fullWaits), waits.fullMs, static_cast<unsigned long long>(waits.openWriters), RuntimeSwitches::Set(RuntimeSwitch::NoFlushLaneWait) ? ", APS5_NO_FLUSH_LANE_WAIT" : "");
+    std::string report = text;
+    for (const auto& [reason, totals] : order) {
+        std::snprintf(text, sizeof(text), " %s %llu/%.1f", reason.c_str(), static_cast<unsigned long long>(totals.count), totals.ms);
+        report += text;
+    }
+    waits.byReason.clear();
+    waits.laneWaits = waits.fullWaits = waits.openWriters = waits.laneOneOnly = waits.laneZeroOnly = waits.bothLanes = waits.nothingLeft = waits.leftInFlight = waits.leftOpen = 0;
+    waits.laneMs = waits.fullMs = 0;
+    return report;
+}
+
+}
+
 struct StorageTraffic {
     AgcDriver::Mutex mutex;
     std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> writeBacks;
@@ -183,6 +256,7 @@ void reportStorageTraffic(StorageTraffic& traffic) {
     const auto partialUploadCount = take(partialUploads), partialWriteBackCount = take(partialWriteBacks);
     const auto uploadMiB = take(partialUploadBytes) / 1048576.0, writeBackMiB = take(partialWriteBackBytes) / 1048576.0;
     AgcDriver::ProfilePrint_nid_no_patch( "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, handed over at %llu clear-key refreshes (%llu units superseded), dropped unregistered %llu, kept over a key flip %llu%s, pretest skipped %llu, held for a queued draw read %llu (%llu flushes with nothing to store skipped the check%s), evicted stale %llu, refresh flushes deferred %llu, flip stores deferred %llu\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(clearHandOvers), take(handedOverSuperseded), take(unregisteredDropped), take(keyFlipKept), ShadowReport().c_str(), take(pretestSkipped), take(queuedReadHeld), take(heldReadSkips), RuntimeSwitches::Set(RuntimeSwitch::NoHeldReadSkip) ? ", APS5_NO_HELD_READ_SKIP" : "", take(staleEvicted), take(deferredRefreshFlushes), take(deferredFlipStores));
+    AgcDriver::ProfilePrint_nid_no_patch("%s\n", FlushWaitReport().c_str());
     traffic.writeBacks.clear();
     traffic.uploadReasons.clear();
     traffic.directWriteBacks = 0;
@@ -4408,11 +4482,36 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
             };
             if (pendingWriter(*recorder) != 0) {
                 recorder->Reap();
-                if (const auto writer = pendingWriter(*recorder); writer == recorder->OpenSerial()) {
-                    Recorder::CountSync(openWrites(*recorder) ? 1 : 3);
-                    recorder->Sync();
-                } else if (writer != 0) {
-                    recorder->FinishUpTo(writer);
+                if (const auto writer = pendingWriter(*recorder); writer != 0) {
+                    const bool openWriter = writer == recorder->OpenSerial();
+                    const int source = openWriter ? (openWrites(*recorder) ? 1 : 3) : 0;
+                    const bool profiled = FlushWaitsProfiled();
+                    const auto waitStart = profiled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                    const bool byLane = !RuntimeSwitches::Set(RuntimeSwitch::NoFlushLaneWait);
+                    Recorder::WriterWait wait;
+                    if (byLane) {
+                        std::uint64_t leaseBegin = 0, leaseEnd = 0;
+                        if (publishes) {
+                            constexpr std::uint64_t block = 65536;
+                            constexpr auto top = std::numeric_limits<std::uint64_t>::max();
+                            const auto end = bytes > top - address ? top : address + bytes;
+                            leaseBegin = address / block * block;
+                            leaseEnd = end > top - block ? end : (end + block - 1) / block * block;
+                        }
+                        Recorder::CountSync(source);
+                        wait = recorder->FinishWritersByLane(stored, leaseBegin, leaseEnd);
+                        if (FlushLaneWaitVerified() && recorder->WritersPendingOver(stored, leaseBegin, leaseEnd)) {
+                            char message[256];
+                            std::snprintf(message, sizeof(message), "AGC graphics: a lane-targeted flush wait for 0x%llx+0x%llx (%s) left a batch that writes or leases the stored range unfinished", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), reason != nullptr ? reason : "?");
+                            throw std::runtime_error(message);
+                        }
+                    } else if (openWriter) {
+                        Recorder::CountSync(source);
+                        recorder->Sync();
+                    } else {
+                        recorder->FinishUpTo(writer);
+                    }
+                    if (profiled) NoteFlushWait(reason, byLane, openWriter, wait, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count());
                 }
             }
         } catch (...) {
