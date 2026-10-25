@@ -72,6 +72,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_NO_OWNED_DRAW_SNAPSHOTS",
     "APS5_NO_GPU_SOURCE_AFTER_WRITER",
     "APS5_NO_OWNED_VERTEX_INPUTS",
+    "APS5_NO_FLUSH_LANE_WAIT",
 };
 
 struct Refusal {
