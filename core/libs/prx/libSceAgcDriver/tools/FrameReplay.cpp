@@ -63,6 +63,7 @@ struct Options {
     std::chrono::milliseconds memoryPaceTimeout{10000};
     std::chrono::milliseconds releaseAfter{3};
     std::chrono::milliseconds drainTimeout{10000};
+    std::chrono::seconds timeout{900};
     bool release = true;
     bool synthesize = true;
 };
@@ -120,6 +121,24 @@ public:
 private:
     Frames& frames;
 };
+
+[[noreturn]] void hardExit(int code) {
+    std::fflush(stdout);
+    std::fflush(stderr);
+#ifdef _WIN32
+    TerminateProcess(GetCurrentProcess(), static_cast<UINT>(code));
+#endif
+    std::_Exit(code);
+}
+
+void startWatchdog(std::chrono::seconds timeout) {
+    if (timeout.count() <= 0) return;
+    std::thread([timeout] {
+        std::this_thread::sleep_for(timeout);
+        std::fprintf(stderr, "agc_frame_replay: no result after %lld s (--timeout-s); exiting without a driver shutdown\n", static_cast<long long>(timeout.count()));
+        hardExit(4);
+    }).detach();
+}
 
 std::uint64_t headerNumber(const std::string& header, std::string_view key) {
     const auto quoted = "\"" + std::string(key) + "\":";
@@ -570,7 +589,7 @@ struct Replay {
 };
 
 int usage() {
-    std::fprintf(stderr, "usage: agc_frame_replay <capture directory> [--no-pace] [--no-release] [--release-after-ms <n>] [--strict]\n"
+    std::fprintf(stderr, "usage: agc_frame_replay <capture directory> [--no-pace] [--no-release] [--release-after-ms <n>] [--strict] [--timeout-s <n>]\n"
                          "                        [--dump <address>:<bytes>:<file>]...\n"
                          "  replays the driver calls and guest memory that APS5_FRAME_CAPTURE=<directory> recorded, through this\n"
                          "  build's AGC driver with no title running, and prints one JSON line with the frame times\n"
@@ -579,6 +598,7 @@ int usage() {
                          "  --release-after-ms  milliseconds without a completion before awaited dwords are released (3)\n"
                          "  --no-synthesize     releases a wait only with a value the capture recorded, never with its reference value\n"
                          "  --strict            fails on a pacing timeout or a failed registration inside the captured frames\n"
+                         "  --timeout-s <n>     exits with code 4 when the replay has no result after n seconds (900; 0 waits forever)\n"
                          "  --dump              writes guest memory to a file after the replay (hexadecimal or decimal)\n"
                          "  --frames <dir>      writes each recorded and replayed display buffer as reference-<n>.bmp and replay-<n>.bmp\n");
     return 2;
@@ -716,6 +736,7 @@ int main(int argc, char** argv) {
         else if (argument == "--no-synthesize") options.synthesize = false;
         else if (argument == "--release-after-ms" && index + 1 < argc) options.releaseAfter = std::chrono::milliseconds(std::strtoll(argv[++index], nullptr, 10));
         else if (argument == "--strict") options.strict = true;
+        else if (argument == "--timeout-s" && index + 1 < argc) options.timeout = std::chrono::seconds(std::strtoll(argv[++index], nullptr, 10));
         else if (argument == "--dump" && index + 1 < argc) options.dumps.push_back(parseDump(argv[++index]));
         else if (argument == "--frames" && index + 1 < argc) options.frames = argv[++index];
         else if (!argument.starts_with("-") && options.directory.empty()) options.directory = argument;
@@ -727,6 +748,7 @@ int main(int argc, char** argv) {
 #else
     unsetenv("APS5_FRAME_CAPTURE");
 #endif
+    startWatchdog(options.timeout);
     int code = 2;
     try {
         code = run(options);
@@ -737,7 +759,5 @@ int main(int argc, char** argv) {
     } catch (const std::exception& error) {
         std::fprintf(stderr, "agc_frame_replay: %s\n", error.what());
     }
-    std::fflush(stdout);
-    std::fflush(stderr);
-    std::_Exit(code);
+    hardExit(code);
 }
