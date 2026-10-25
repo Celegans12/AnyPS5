@@ -3763,6 +3763,7 @@ bool TemplateDataRefresh() {
 
 constexpr std::size_t ContentKeyHeaderWords = 7;
 constexpr std::size_t ContentKeyDataWordsAt = 2;
+constexpr std::size_t ContentKeyVariantAt = 4;
 constexpr std::size_t ContentKeyBindingsAt = 6;
 constexpr std::size_t ContentKeyFlagSets = 10;
 
@@ -5377,7 +5378,7 @@ void traceMiss(ChurnProfile& churn, bool draw, std::uint64_t variants, const Con
 void ResourceCache::noteMiss(const Key& key) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     static const bool trace = std::getenv("APS5_TRACE_RESOURCE_KEY_MISSES") != nullptr;
-    if ((!profile && !trace) || key.size() < 5) return;
+    if ((!profile && !trace) || key.size() < ContentKeyHeaderWords) return;
     // The variant(s) the key belongs to: a compute key starts with the data-words flag, the stage
     // and its variant, a draw key with a marker, the device and its stages' keys (Draw.cpp
     // DrawResourceKey).
@@ -5385,12 +5386,12 @@ void ResourceCache::noteMiss(const Key& key) {
     std::uint64_t variants = 0;
     if (draw) {
         std::size_t at = 4;
-        for (std::uint32_t stage = 0; stage < key[3] && at + 4 < key.size(); ++stage) {
-            variants = variants * 1000003ull ^ (key[at + 3] | (static_cast<std::uint64_t>(key[at + 4]) << 32u));
+        for (std::uint32_t stage = 0; stage < key[3] && at + 2 + ContentKeyVariantAt < key.size(); ++stage) {
+            variants = variants * 1000003ull ^ (key[at + 1 + ContentKeyVariantAt] | (static_cast<std::uint64_t>(key[at + 2 + ContentKeyVariantAt]) << 32u));
             at += 1 + key[at];
         }
     } else {
-        variants = key[2] | (static_cast<std::uint64_t>(key[3]) << 32u);
+        variants = key[ContentKeyVariantAt] | (static_cast<std::uint64_t>(key[ContentKeyVariantAt + 1]) << 32u);
     }
     auto& churn = Churn();
     std::lock_guard lock(churn.mutex);
