@@ -125,11 +125,11 @@ public:
 
     void Write(std::uint64_t address, std::uint64_t bytes, std::uint64_t key) {
         const auto end = address + bytes;
-        for (auto it = known.begin(); it != known.end();) {
-            if (it->first < end && address < it->second.first) it = known.erase(it);
+        for (auto it = known.lower_bound(address > longest ? address - longest : 0); it != known.end() && it->first < end;) {
+            if (address < it->second.first) it = known.erase(it);
             else ++it;
         }
-        known[address] = {end, key};
+        remember(address, end, key);
         auto first = address;
         auto last = end;
         auto it = written.upper_bound(address);
@@ -143,10 +143,16 @@ public:
     }
 
     void Note(std::uint64_t address, std::uint64_t bytes, std::uint64_t key) {
-        if (!Rewritten(address, bytes)) known[address] = {address + bytes, key};
+        if (!Rewritten(address, bytes)) remember(address, address + bytes, key);
     }
 
 private:
+    void remember(std::uint64_t address, std::uint64_t end, std::uint64_t key) {
+        known[address] = {end, key};
+        longest = std::max(longest, end - address);
+    }
+
+    std::uint64_t longest = 0;
     std::map<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>> known;
     std::map<std::uint64_t, std::uint64_t> written;
 };
