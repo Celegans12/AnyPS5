@@ -102,11 +102,6 @@ int APS5_VABI getfsstat_nid_postfix(void) {
     return 0;
 }
 
-int APS5_VABI getlogin_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
 int APS5_VABI ipmimgr_call_nid_postfix(void) {
     NotImplemented_nid_no_patch(__func__);
     return 0;
@@ -2316,11 +2311,6 @@ int APS5_VABI sigreturn_nid_postfix(void) {
 }
 
 int APS5_VABI statfs_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI swapcontext_nid_postfix(void) {
     NotImplemented_nid_no_patch(__func__);
     return 0;
 }

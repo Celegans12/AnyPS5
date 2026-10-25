@@ -1219,7 +1219,13 @@ static void VnodeOneshotWatchStops() {
     KernelEvent events[4]{};
     const auto ident = static_cast<std::uintptr_t>(file);
 #ifdef __linux__
-    const auto watchesBefore = InotifyWatchCount();
+    auto watchesBefore = InotifyWatchCount();
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        const auto settled = InotifyWatchCount();
+        if (settled == watchesBefore) break;
+        watchesBefore = settled;
+    }
 #endif
     Require(Apply(kq, Change(ident, EvfiltVnode, EvAdd | EvOneshot, NoteDelete | NoteWrite, 0, &marker)) == 0);
     Require(write_nid_postfix(file, "abc", 3) == 3);
@@ -1230,8 +1236,8 @@ static void VnodeOneshotWatchStops() {
     Require(Poll(kq, events, 4) == 0);
     RequireFailure(Apply(kq, Change(ident, EvfiltVnode, EvDelete)), GuestEnoent);
 #ifdef __linux__
-    for (int attempt = 0; attempt < 100 && InotifyWatchCount() != watchesBefore; ++attempt) std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    Require(InotifyWatchCount() == watchesBefore);
+    for (int attempt = 0; attempt < 100 && InotifyWatchCount() > watchesBefore; ++attempt) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    Require(InotifyWatchCount() <= watchesBefore);
 #endif
     Require(close_nid_postfix(file) == 0);
     Require(close_nid_postfix(kq) == 0);

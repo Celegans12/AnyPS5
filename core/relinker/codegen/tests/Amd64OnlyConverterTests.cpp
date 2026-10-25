@@ -328,6 +328,8 @@ void matcherSubstitutions() {
     const auto movntsd = match({0xF2, 0x44, 0x0F, 0x2B, 0x4C, 0x24, 0x10});
     require(movntsd && movntsd->Lowering == Codegen::Amd64OnlyLowering::InPlace && movntsd->ReplacementBytes == Bytes{0xF2, 0x44, 0x0F, 0x11, 0x4C, 0x24, 0x10} && movntsd->InstructionName == "MOVNTSD", "MOVNTSD was not rewritten to MOVSD");
     requireFailure([&] { (void)match({0xF3, 0x0F, 0x2B, 0xC1}); }, "MOVNTSS with a register operand was accepted");
+    const auto movntssDisplacement = match({0xF3, 0x0F, 0x2B, 0x47, 0xF0});
+    require(movntssDisplacement && movntssDisplacement->ReplacementBytes == Bytes{0xF3, 0x0F, 0x11, 0x47, 0xF0}, "MOVNTSS displacement byte was treated as a LOCK prefix");
     const auto monitorx = match({0x0F, 0x01, 0xFA});
     require(monitorx && monitorx->Lowering == Codegen::Amd64OnlyLowering::InPlace && monitorx->ReplacementBytes == Bytes{0x0F, 0x1F, 0x00} && monitorx->InstructionName == "MONITORX", "MONITORX was not replaced by a NOP");
     const auto mwaitx = match({0x0F, 0x01, 0xFB});
@@ -512,6 +514,13 @@ void converterSegment() {
     lockedRdpru[0x211] = 0x01;
     lockedRdpru[0x212] = 0xFD;
     requireFailure([&] { (void)converter->Convert(lockedRdpru, {segmentHeader(20)}); }, "LOCK RDPRU was accepted");
+    for (const Bytes& instruction : {Bytes{0xF0, 0xF3, 0x0F, 0x2B, 0x07}, Bytes{0xF3, 0xF0, 0x0F, 0x2B, 0x07},
+                                     Bytes{0xF0, 0xF2, 0x0F, 0x2B, 0x07}, Bytes{0xF2, 0xF0, 0x0F, 0x2B, 0x07}}) {
+        auto lockedMovnts = file;
+        std::copy(instruction.begin(), instruction.end(), lockedMovnts.begin() + 0x20F);
+        lockedMovnts[0x214] = 0xC3;
+        require(failureOffset([&] { (void)converter->Convert(lockedMovnts, {segmentHeader(21)}); }, "LOCK MOVNTSS/MOVNTSD was accepted") == 0x20F, "LOCK MOVNTSS/MOVNTSD failure does not carry the file offset");
+    }
     auto registerForm = file;
     const Bytes extrqRegister = {0x66, 0x0F, 0x79, 0xCA};
     std::copy(extrqRegister.begin(), extrqRegister.end(), registerForm.begin() + 0x20F);

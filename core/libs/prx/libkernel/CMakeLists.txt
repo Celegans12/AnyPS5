@@ -69,6 +69,7 @@ add_library(libkernel SHARED EXCLUDE_FROM_ALL
         ${CMAKE_CURRENT_SOURCE_DIR}/System/src/HostCpu.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/System/src/SystemConfiguration.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/System/src/Login.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/System/src/Getlogin.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/System/src/SoftwareVersion.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/System/src/Error.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/System/src/ThermalSensors.cpp
@@ -1001,6 +1002,16 @@ if(BUILD_TESTING)
     target_link_libraries(guest_signal_tests PRIVATE libkernel libc)
     configure_windows_unwind(guest_signal_tests)
     add_test(NAME guest_signals COMMAND guest_signal_tests)
+    add_test_executable(guest_signal_interrupt_tests ${LIBS_INCLUDE_DIR}/tests/GuestSignalInterrupt.cpp)
+    target_include_directories(guest_signal_interrupt_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_signal_interrupt_tests PRIVATE libkernel libc)
+    configure_windows_unwind(guest_signal_interrupt_tests)
+    add_test(NAME guest_signal_interrupt COMMAND guest_signal_interrupt_tests)
+    set_tests_properties(guest_signal_interrupt PROPERTIES TIMEOUT 20)
+    if(WIN32)
+        set_tests_properties(guest_signal_interrupt PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+    endif()
     if(WIN32)
         set_tests_properties(guest_signals PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
