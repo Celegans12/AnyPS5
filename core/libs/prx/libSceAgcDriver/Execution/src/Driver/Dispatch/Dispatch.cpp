@@ -18,7 +18,9 @@
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <string>
 #include <cstdlib>
 #include <functional>
@@ -77,6 +79,52 @@ void NoteItemFallback(ItemFallback reason) {
     itemFallbacks[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
 }
 
+enum class DrainSite : std::size_t { Ahead, ItemsOff, Indirect, Labels, CopyKernel, HtileDepth, HtileBuffer, LookupMiss, LookupVerify, LookupReads, NoRecipe, ItemWrites, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(DrainSite::Count)> DrainSiteNames{"ahead", "items off", "indirect", "labels", "copy kernel", "htile depth", "htile buffer", "miss", "verify", "reads", "no recipe", "item writes"};
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrainSite::Count)> drainSiteCounts{};
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrainSite::Count)> drainSiteNs{};
+std::atomic<std::uint64_t> profiledAttempts{0}, packetToAttemptNs{0}, attemptToKeyNs{0};
+
+void DrainAt(DrainSite site, bool profile) {
+    auto& pipeline = DrawPipeline::Queue0();
+    if (!profile) {
+        pipeline.Drain(DrawPipeline::DrainReason::Packet, 0x15);
+        return;
+    }
+    const bool busy = pipeline.Busy();
+    const auto start = std::chrono::steady_clock::now();
+    pipeline.Drain(DrawPipeline::DrainReason::Packet, 0x15);
+    if (!busy) return;
+    const auto index = static_cast<std::size_t>(site);
+    drainSiteCounts[index].fetch_add(1, std::memory_order_relaxed);
+    drainSiteNs[index].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+}
+
+void ReportDispatchFast(bool profile) {
+    static std::atomic<std::int64_t> lastReport{0};
+    if (!profile) return;
+    const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = lastReport.load(std::memory_order_relaxed);
+    if (now - last < 10000 || !lastReport.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
+    std::string drains;
+    std::uint64_t decodeDrainNs = 0;
+    for (std::size_t i = 0; i < DrainSiteNames.size(); ++i) {
+        const auto count = drainSiteCounts[i].exchange(0, std::memory_order_relaxed);
+        const auto ns = drainSiteNs[i].exchange(0, std::memory_order_relaxed);
+        if (i <= static_cast<std::size_t>(DrainSite::HtileBuffer)) decodeDrainNs += ns;
+        if (count == 0) continue;
+        char item[64];
+        std::snprintf(item, sizeof(item), " %s %llu/%.1f", DrainSiteNames[i], static_cast<unsigned long long>(count), static_cast<double>(ns) / 1e6);
+        drains += item;
+    }
+    if (drains.empty()) drains = " none";
+    const auto attempts = profiledAttempts.exchange(0, std::memory_order_relaxed);
+    const auto entry = packetToAttemptNs.exchange(0, std::memory_order_relaxed);
+    const auto decode = attemptToKeyNs.exchange(0, std::memory_order_relaxed);
+    const auto perAttempt = [&](std::uint64_t ns) { return attempts != 0 ? static_cast<double>(ns) / 1e3 / static_cast<double>(attempts) : 0.0; };
+    std::fprintf(stderr, "[dispatch-fast] (10 s) %llu dispatch attempts; us per attempt: packet start to attempt %.1f, attempt to key %.1f (of it decode-phase drains %.1f); queue-0 dispatch drains by site (count/ms):%s\n", static_cast<unsigned long long>(attempts), perAttempt(entry), perAttempt(decode), perAttempt(decodeDrainNs), drains.c_str());
+}
+
 void ReportDispatchItems(bool profile) {
     static auto lastReport = std::chrono::steady_clock::now();
     if (!profile) return;
@@ -133,6 +181,8 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
 
 void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments, bool forceFresh) {
     PerformanceTimer timing("Driver.Dispatch");
+    static const bool profileDrains = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    const auto attemptStart = profileDrains ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     // Both switches once per attempt: an A/B flip (at a queue-0 present) never splits one.
     const bool itemsOn = DispatchItemsEnabled();
     const bool missItemsOn = itemsOn && DispatchMissItemsEnabled();
@@ -245,9 +295,9 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
             pendingDispatchPhases().outcome = DispatchOutcome::FillHle;
             return;
         }
-        if (DrawPipeline::Active() && !pipelineCandidate) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+        if (DrawPipeline::Active() && !pipelineCandidate) DrainAt(fromAhead ? DrainSite::Ahead : !itemsOn ? DrainSite::ItemsOff : indirectArguments != 0 ? DrainSite::Indirect : !deferredLabels().labels.empty() ? DrainSite::Labels : DrainSite::CopyKernel, profileDrains);
         if (const auto htile = Graphics::HtileDepthClearAddress(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads); htile != 0) {
-            if (pipelineCandidate && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+            if (pipelineCandidate && DrawPipeline::Queue0().Busy()) DrainAt(DrainSite::HtileDepth, profileDrains);
             const auto threads = (packet[4] & 0x20u) != 0 ? static_cast<std::uint64_t>(packet[1]) : static_cast<std::uint64_t>(packet[1]) * compute.numThreads[0];
             const auto nativeBytes = Graphics::HtileDepthClearBytes_nid_no_patch(std::span(snapshot.code).subspan(codeOffset), userData, compute, packet, indirectArguments);
             const auto bytes = static_cast<std::size_t>(threads * 16u);
@@ -255,7 +305,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
             if (nativeBytes != 0u && userData.size() >= 6u) htileMask = {htile, nativeBytes, userData[5], userData[4]};
         } else if (const auto buffered = Graphics::MatchHtileBufferMaskClear(std::span(snapshot.code).subspan(codeOffset), userData, compute, packet, indirectArguments); buffered.has_value() && (buffered->mask & 0xfu) == 0u && (buffered->value & 0xfu) == 0u) {
             // S1: the buffer variant of the mask kernel, read the same way (zmask cleared: a depth clear).
-            if (pipelineCandidate && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+            if (pipelineCandidate && DrawPipeline::Queue0().Busy()) DrainAt(DrainSite::HtileBuffer, profileDrains);
             if (Graphics::NoteHtileDepthClear(buffered->address, buffered->bytes, buffered->bytes)) htileClearCompletion = std::pair{buffered->address, buffered->bytes};
             htileMask = {buffered->address, buffered->bytes, buffered->mask, buffered->value};
         }
@@ -298,6 +348,11 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
     static std::uint64_t cacheHits = 0;
     static std::uint64_t dispatches = 0;
     auto lap = std::chrono::steady_clock::now();
+    if (profileDrains) {
+        profiledAttempts.fetch_add(1, std::memory_order_relaxed);
+        if (packetStartedAt() != std::chrono::steady_clock::time_point{} && packetStartedAt() <= attemptStart) packetToAttemptNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(attemptStart - packetStartedAt()).count()), std::memory_order_relaxed);
+        attemptToKeyNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(lap - attemptStart).count()), std::memory_order_relaxed);
+    }
 
     std::array<double, DriverPhaseCount> phaseMs{};
     auto phaseLap = lap;
@@ -411,6 +466,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
     timing.Mark("decode_key_device_setup");
     bool readsClear = false;
     if (pipelineCandidate) {
+        auto lookupSite = DrainSite::LookupMiss;
         std::vector<ShaderRecompiler::MemoryRegion> reads;
         bool entryFound = false;
         {
@@ -426,11 +482,13 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
             NoteItemFallback(ItemFallback::Miss);
         } else if (verifyDataHits()) {
             NoteItemFallback(ItemFallback::Verify);
+            lookupSite = DrainSite::LookupVerify;
         } else {
             readsClear = std::none_of(reads.begin(), reads.end(), [](const auto& region) { return DrawPipeline::Queue0().Overlaps(region.guestAddress, region.bytes.size()); });
             if (!readsClear) NoteItemFallback(ItemFallback::Reads);
+            lookupSite = DrainSite::LookupReads;
         }
-        if (!readsClear && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+        if (!readsClear && DrawPipeline::Queue0().Busy()) DrainAt(lookupSite, profileDrains);
     }
     if (fromAhead) {
         compiledResult = std::move(ahead.compiledResult);
@@ -467,7 +525,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
         } else {
             NoteItemFallback(ItemFallback::NoRecipe);
         }
-        if (!pipelined && !missItem && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+        if (!pipelined && !missItem && DrawPipeline::Queue0().Busy()) DrainAt(cached && keepVariant != nullptr && keepVariant->recipe.load(std::memory_order_acquire) != nullptr ? DrainSite::ItemWrites : DrainSite::NoRecipe, profileDrains);
     }
     if (cached) {
         require(keepVariant != nullptr && keepVariant->shader == registeredShader, "dispatch cache belongs to another registered shader");
@@ -568,7 +626,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
         if (!bounded || !deferredLabels().labels.empty()) {
             missItem = false;
             NoteItemFallback(ItemFallback::Writes);
-            if (DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+            if (DrawPipeline::Queue0().Busy()) DrainAt(DrainSite::ItemWrites, profileDrains);
         }
     }
     phaseTiming.Phase(PhaseQueuedLabels);
@@ -675,6 +733,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
         }, std::move(itemWrites));
         if (DrainAfterDispatchItems()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
         ReportDispatchItems(profile);
+        ReportDispatchFast(profile);
         return;
     }
     if (missItem) {
@@ -721,6 +780,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
         }, std::move(itemWrites));
         if (DrainAfterDispatchItems()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
         ReportDispatchItems(profile);
+        ReportDispatchFast(profile);
         return;
     }
 
@@ -839,6 +899,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
     if (noteWrites && !writerKeyedEvidence()) noteWrittenBuffers(address, submission.queue, compiled);
     deviceMs += phaseTiming.Elapsed();
     phaseTiming.Phase(PhaseTail);
+    ReportDispatchFast(profile);
     if (profile) {
         auto& pending = pendingDispatchPhases();
         pending.outcome = DispatchOutcome::Real;
