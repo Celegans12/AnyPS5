@@ -1,5 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/ShapeReplay.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DrawPlans.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "ShaderDiskCache.hpp"
 #include <algorithm>
@@ -51,7 +53,7 @@ Store& store() {
 constexpr std::size_t MaxPlans = 8192;
 
 struct AtomicCounters {
-    std::atomic<std::uint64_t> captures{0}, eligible{0}, hits{0}, learned{0}, unlearnable{0}, refused{0}, probations{0}, probationMismatches{0}, verified{0}, verifyMismatches{0}, disabled{0}, replayNs{0}, materializeNs{0}, materializes{0};
+    std::atomic<std::uint64_t> captures{0}, eligible{0}, hits{0}, learned{0}, unlearnable{0}, refused{0}, probations{0}, probationMismatches{0}, verified{0}, verifyMismatches{0}, disabled{0}, replayNs{0}, materializeNs{0}, materializes{0}, absentBuffers{0}, keysCarried{0}, keyMismatches{0};
 };
 
 AtomicCounters& counters() {
@@ -68,7 +70,7 @@ std::uint32_t verifyBudget() {
 }
 
 bool reporting() {
-    static const bool enabled = Graphics::ShapeReplay::Enabled() || verifyBudget() != 0u || std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static const bool enabled = Graphics::ShapeReplay::Enabled() || verifyBudget() != 0u || std::getenv("APS5_VERIFY_DRAW_PLANS") != nullptr || std::getenv("APS5_PROFILE_DRAW") != nullptr;
     return enabled;
 }
 
@@ -115,7 +117,7 @@ void report() {
         auto& state = window();
         std::lock_guard lock(state.mutex);
         const auto& before = state.last;
-        delta = {totals.captures - before.captures, totals.eligible - before.eligible, totals.hits - before.hits, totals.learned - before.learned, totals.unlearnable - before.unlearnable, totals.refused - before.refused, totals.probations - before.probations, totals.probationMismatches - before.probationMismatches, totals.verified - before.verified, totals.verifyMismatches - before.verifyMismatches, totals.disabled - before.disabled, totals.replayNs - before.replayNs, totals.materializeNs - before.materializeNs, totals.materializes - before.materializes};
+        delta = {totals.captures - before.captures, totals.eligible - before.eligible, totals.hits - before.hits, totals.learned - before.learned, totals.unlearnable - before.unlearnable, totals.refused - before.refused, totals.probations - before.probations, totals.probationMismatches - before.probationMismatches, totals.verified - before.verified, totals.verifyMismatches - before.verifyMismatches, totals.disabled - before.disabled, totals.replayNs - before.replayNs, totals.materializeNs - before.materializeNs, totals.materializes - before.materializes, totals.absentBuffers - before.absentBuffers, totals.keysCarried - before.keysCarried, totals.keyMismatches - before.keyMismatches};
         state.last = totals;
     }
     {
@@ -125,7 +127,8 @@ void report() {
         resets = plansStore.resets;
     }
     const auto average = [](std::uint64_t ns, std::uint64_t count) { return count != 0 ? static_cast<double>(ns) / 1000.0 / static_cast<double>(count) : 0.0; };
-    std::fprintf(stderr, "[shape-replay] D1 (10 s): %llu stage captures, %llu eligible, %llu replayed (%.1f %% of eligible), %llu learned, %llu unlearnable, %llu refused at patching; probations %llu (%llu mismatches), verified %llu (%llu mismatches, total %llu), %llu plans disabled; plans %zu (resets %llu); avg us: replay %.1f, materialize %.1f%s\n", static_cast<unsigned long long>(delta.captures), static_cast<unsigned long long>(delta.eligible), static_cast<unsigned long long>(delta.hits), delta.eligible != 0 ? 100.0 * static_cast<double>(delta.hits) / static_cast<double>(delta.eligible) : 0.0, static_cast<unsigned long long>(delta.learned), static_cast<unsigned long long>(delta.unlearnable), static_cast<unsigned long long>(delta.refused), static_cast<unsigned long long>(delta.probations), static_cast<unsigned long long>(delta.probationMismatches), static_cast<unsigned long long>(delta.verified), static_cast<unsigned long long>(delta.verifyMismatches), static_cast<unsigned long long>(totals.verifyMismatches), static_cast<unsigned long long>(delta.disabled), plans, static_cast<unsigned long long>(resets), average(delta.replayNs, delta.hits), average(delta.materializeNs, delta.materializes), Active() ? "" : " (replay off)");
+    std::fprintf(stderr, "[shape-replay] D1 (10 s): %llu stage captures, %llu eligible, %llu replayed (%.1f %% of eligible; %llu carried their resource key words, %llu key mismatches), %llu learned, %llu unlearnable, %llu refused at patching, %llu with an absent V#; probations %llu (%llu mismatches), verified %llu (%llu mismatches, total %llu), %llu plans disabled; plans %zu (resets %llu); avg us: replay %.1f, materialize %.1f%s\n", static_cast<unsigned long long>(delta.captures), static_cast<unsigned long long>(delta.eligible), static_cast<unsigned long long>(delta.hits), delta.eligible != 0 ? 100.0 * static_cast<double>(delta.hits) / static_cast<double>(delta.eligible) : 0.0, static_cast<unsigned long long>(delta.keysCarried), static_cast<unsigned long long>(delta.keyMismatches), static_cast<unsigned long long>(delta.learned), static_cast<unsigned long long>(delta.unlearnable), static_cast<unsigned long long>(delta.refused), static_cast<unsigned long long>(delta.absentBuffers), static_cast<unsigned long long>(delta.probations), static_cast<unsigned long long>(delta.probationMismatches), static_cast<unsigned long long>(delta.verified), static_cast<unsigned long long>(delta.verifyMismatches), static_cast<unsigned long long>(totals.verifyMismatches), static_cast<unsigned long long>(delta.disabled), plans, static_cast<unsigned long long>(resets), average(delta.replayNs, delta.hits), average(delta.materializeNs, delta.materializes), Active() ? "" : " (replay off)");
+    std::fprintf(stderr, "%s%s\n", Graphics::DrawPlans::ReportLine().c_str(), Graphics::DrawPlans::Active() ? "" : " (plans off)");
 }
 
 std::uint64_t elapsedNs(std::chrono::steady_clock::time_point since) {
@@ -259,16 +262,46 @@ std::string Difference(const ShaderRecompiler::RecompileResult& replayed, const 
     return "encoding";
 }
 
+bool KeyWordsCarry(const ShaderRecompiler::RecompileResult& plan, const ShaderRecompiler::RecompileResult& replayed, const PatchMap& map, bool movableBuffers) {
+    if (!movableBuffers) return false;
+    const auto empty = [](const std::uint32_t* words) { return words[2] == 0u || (words[0] == 0u && (words[1] & 0xffffu) == 0u); };
+    for (const auto& element : map.buffers) {
+        const auto& binding = replayed.bindings[element.binding];
+        const auto* before = plan.bindings[element.binding].guestDescriptor.data() + element.element * 4u;
+        const auto* after = binding.guestDescriptor.data() + element.element * 4u;
+        const bool whole = binding.guestDescriptor.size() != static_cast<std::size_t>(binding.count) * 4u;
+        const bool written = element.element >= binding.bufferWritten.size() || binding.bufferWritten[element.element];
+        if (whole || written || empty(before) || empty(after)) {
+            if (!std::equal(before, before + 4, after)) return false;
+        } else if ((before[1] & 0xffff0000u) != (after[1] & 0xffff0000u) || before[3] != after[3]) {
+            return false;
+        }
+    }
+    return true;
+}
+
 std::uint64_t ReplayKey(const Graphics::ShapeReplay::StageRecord& record) {
     using Graphics::ShapeReplay::Diff;
     std::uint64_t key = 0xcbf29ce484222325ull;
-    for (const auto diff : {Diff::Texture, Diff::Sampler, Diff::BufferShape, Diff::BaseAlignment, Diff::UniformFill, Diff::Vertex, Diff::Other}) key = mix(key, record.hashes[static_cast<std::size_t>(diff)]);
-    return key;
+    for (const auto diff : {Diff::Texture, Diff::Sampler, Diff::UniformFill, Diff::Vertex, Diff::Other}) key = mix(key, record.hashes[static_cast<std::size_t>(diff)]);
+    return mix(key, record.bufferPlan);
 }
 
 bool Active() {
     static const bool memoOff = std::getenv("APS5_NO_RESULT_MEMO") != nullptr;
     return memoOff && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoShapeReplay);
+}
+
+std::uint64_t PlanKey(std::uint64_t shape, std::span<const Graphics::CompiledShader> stages) {
+    if (shape == 0) return 0;
+    auto key = mix(mix(0xd2a1a115ull, shape), stages.size());
+    for (const auto& stage : stages) {
+        if (stage.program == nullptr) return 0;
+        const auto& program = *stage.program;
+        key = mix(mix(mix(key, static_cast<std::uint64_t>(stage.stage)), stage.pushConstantOffset), program.PipelineVariantId());
+        key = mix(mix(mix(key, program.pushConstants.size()), program.bindlessHeap ? 1u : 0u), program.bindings.size());
+    }
+    return key != 0 ? key : 1u;
 }
 
 std::uint64_t& DrawShape() {
@@ -279,10 +312,10 @@ std::uint64_t& DrawShape() {
 Counters Totals() {
     auto& state = counters();
     const auto load = [](const std::atomic<std::uint64_t>& value) { return value.load(std::memory_order_relaxed); };
-    return {load(state.captures), load(state.eligible), load(state.hits), load(state.learned), load(state.unlearnable), load(state.refused), load(state.probations), load(state.probationMismatches), load(state.verified), load(state.verifyMismatches), load(state.disabled), load(state.replayNs), load(state.materializeNs), load(state.materializes)};
+    return {load(state.captures), load(state.eligible), load(state.hits), load(state.learned), load(state.unlearnable), load(state.refused), load(state.probations), load(state.probationMismatches), load(state.verified), load(state.verifyMismatches), load(state.disabled), load(state.replayNs), load(state.materializeNs), load(state.materializes), load(state.absentBuffers), load(state.keysCarried), load(state.keyMismatches)};
 }
 
-std::shared_ptr<const ShaderRecompiler::RecompileResult> Materialize(std::uint64_t shape, std::size_t stage, std::uint32_t pushOffset, std::uint64_t program, const ShaderRecompiler::ResourceCapture& capture, const Graphics::ShapeReplay::StageRecord* record, const ShaderRecompiler::ShaderVertexStageInfo* vertex, const FullMaterialize& full) {
+std::shared_ptr<const ShaderRecompiler::RecompileResult> Materialize(std::uint64_t shape, std::size_t stage, ShaderRecompiler::ShaderStage kind, std::uint32_t pushOffset, std::uint64_t program, const ShaderRecompiler::ResourceCapture& capture, const Graphics::ShapeReplay::StageRecord* record, const ShaderRecompiler::ShaderVertexStageInfo* vertex, const FullMaterialize& full) {
     auto& count = counters();
     const bool timed = reporting();
     count.captures.fetch_add(1, std::memory_order_relaxed);
@@ -301,6 +334,10 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Materialize(std::uint64
     };
     if (shape == 0 || record == nullptr || !record->eligible || capture.plan == nullptr || capture.source == nullptr || !Active()) return finish(materialize());
     count.eligible.fetch_add(1, std::memory_order_relaxed);
+    if (!record->buffersPresent) {
+        count.absentBuffers.fetch_add(1, std::memory_order_relaxed);
+        return finish(materialize());
+    }
     auto key = mix(mix(mix(mix(mix(0x5ba9e5ull, shape), stage), pushOffset), program), ReplayKey(*record));
     key = mix(key, static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(capture.plan.get())));
     auto& plans = store();
@@ -317,10 +354,25 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Materialize(std::uint64
             count.refused.fetch_add(1, std::memory_order_relaxed);
             return finish(materialize());
         }
+        static const bool movableBuffers = std::getenv("APS5_NO_MOVED_BUFFER_TEMPLATES") == nullptr;
+        const bool carry = Graphics::DrawPlans::Active() && KeyWordsCarry(*plan->result, *replayed, plan->map, movableBuffers);
+        auto carried = carry ? plan->result->drawKeyMemo.words.load(std::memory_order_acquire) : nullptr;
+        if (carried != nullptr) {
+            replayed->drawKeyMemo.words.store(carried, std::memory_order_release);
+            count.keysCarried.fetch_add(1, std::memory_order_relaxed);
+        }
         const bool probation = !plan->checked.exchange(true, std::memory_order_relaxed);
-        if (probation || takeVerify()) {
+        const bool keyCheck = carried != nullptr && Graphics::DrawPlans::TakeVerify();
+        if (probation || keyCheck || takeVerify()) {
             auto result = materialize();
-            const auto difference = Difference(*replayed, *result);
+            auto difference = Difference(*replayed, *result);
+            if (difference.empty() && carried != nullptr) {
+                const auto fresh = Graphics::ShaderResources::ContentKey(Graphics::CompiledShader{kind, result.get(), pushOffset}, true, movableBuffers);
+                if (fresh != *carried) {
+                    difference = "carried resource key words";
+                    count.keyMismatches.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
             (probation ? count.probations : count.verified).fetch_add(1, std::memory_order_relaxed);
             if (!difference.empty()) {
                 (probation ? count.probationMismatches : count.verifyMismatches).fetch_add(1, std::memory_order_relaxed);

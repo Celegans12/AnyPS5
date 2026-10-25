@@ -12,6 +12,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShapeReplayProfile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/ShapeReplay.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DrawPlans.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
@@ -1043,6 +1044,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         return drawn();
     }
 
+    const auto planKey = Graphics::DrawPlans::Active() && registerKey ? ShapeReplay::PlanKey(shapeKey, stages) : 0u;
     std::vector<std::shared_ptr<DispatchVariant>> recipeStages;
     if (registerKey && !drawParameters.indirect && !patchedStages && Graphics::DrawRecipes()) {
         recipeStages.reserve(programs.size());
@@ -1084,7 +1086,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         auto prepareDevice = prepareDraw ? localDevice : nullptr;
         auto prepareDecode = prepareDraw ? decode : nullptr;
         auto reads = QueuedDrawReadRanges(drawParameters, stages);
-        auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), ahead, drawKey, commitQueue, commitPacket, epoch, programs = std::move(programs), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData), slot, program] {
+        auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), ahead, drawKey, commitQueue, commitPacket, epoch, programs = std::move(programs), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData), slot, program, planKey] {
             DrawPipeline::FollowEpoch(epoch);
             GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
             struct OriginScope {
@@ -1097,7 +1099,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 // The pre-sync again, now that every earlier draw is recorded: still without the
                 // GPU mutex, so the other queues are not held while this commit waits for the GPU.
                 if (htilePresync && decode->state.depth.has_value()) presyncSerial = std::max(presyncSerial, localDevice->PresyncDrawDepth(decode->state));
-                commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey, prepared != nullptr ? prepared->draw.get() : nullptr, presyncSerial, ahead);
+                commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey, prepared != nullptr ? prepared->draw.get() : nullptr, presyncSerial, ahead, planKey);
             } catch (const std::runtime_error& error) {
                 std::string where = "draw commit (programs";
                 for (const auto& program : programs) {
@@ -1146,14 +1148,17 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
     }
     std::shared_ptr<const DrawRecipe> built;
-    localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, nullptr, ahead);
+    {
+        const Graphics::DrawPlans::KeyScope planScope(planKey);
+        localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, nullptr, ahead);
+    }
     phaseTiming.Phase(DrawRowGraphics);
     if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, std::move(built));
     timing.Mark("draw_and_resource_release");
     return drawn();
 }
 
-void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, Graphics::PreparedDraw* prepared, std::uint64_t presyncSerial, const Graphics::AheadDraw* ahead) {
+void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, Graphics::PreparedDraw* prepared, std::uint64_t presyncSerial, const Graphics::AheadDraw* ahead, std::uint64_t planKey) {
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
     if (auto current = device.Load(); current != nullptr && current != localDevice) {
@@ -1177,7 +1182,10 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
         VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
     }
     std::shared_ptr<const DrawRecipe> built;
-    localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, prepared, ahead);
+    {
+        const Graphics::DrawPlans::KeyScope planScope(planKey);
+        localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, prepared, ahead);
+    }
     if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, std::move(built));
 }
 

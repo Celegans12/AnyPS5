@@ -193,13 +193,18 @@ StageRecord DescribeStage(const SlotClasses& classes, const ShaderRecompiler::Ir
     auto& alignment = record.hashes[classIndex(Diff::BaseAlignment)];
     shape = mix(shape, snapshot.buffers.size());
     auto& descriptorPlan = record.descriptorPlan;
-    descriptorPlan = Seed;
+    auto& bufferPlan = record.bufferPlan;
+    bufferPlan = mix(Seed, snapshot.buffers.size());
+    record.buffersPresent = true;
     for (std::size_t index = 0; index < snapshot.buffers.size(); ++index) {
         const auto& buffer = snapshot.buffers[index];
         const bool formatted = index < plan.info.buffers.size() && plan.info.buffers[index].descriptorFormatted;
+        const bool present = buffer.dwords[2] != 0u && (buffer.dwords[0] != 0u || (buffer.dwords[1] & 0xffffu) != 0u);
+        record.buffersPresent = record.buffersPresent && present;
         const auto word3 = formatted ? buffer.dwords[3] : (buffer.dwords[3] & 0xf0e00000u) | (((buffer.dwords[3] >> 12u) & 0x7fu) != 0u ? 1u << 12u : 0u);
-        descriptorPlan = mix(mix(mix(mix(descriptorPlan, buffer.dwordCount), buffer.dwords[1] & 0xffff0000u), word3), buffer.dwords[0] & 3u);
+        bufferPlan = mix(mix(mix(mix(mix(bufferPlan, buffer.dwordCount), present ? 1u : 0u), buffer.dwords[1] & 0xffff0000u), word3), buffer.dwords[0] & 3u);
     }
+    descriptorPlan = bufferPlan;
     for (const auto& image : snapshot.images) {
         descriptorPlan = mix(mix(descriptorPlan, image.dwordCount), image.dwords[0] != 0u || (image.dwords[1] & 0xffu) != 0u ? 1u : 0u);
         descriptorPlan = mix(descriptorPlan, image.dwords[1] & ~0xffu);

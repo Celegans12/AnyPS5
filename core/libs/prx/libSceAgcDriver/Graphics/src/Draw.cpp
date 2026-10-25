@@ -10,6 +10,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShapeReplayProfile.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DrawPlans.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureService.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/SampleOrder.hpp"
@@ -2901,7 +2902,56 @@ struct DrawPreparation {
     std::shared_ptr<BlendedTargetSet> blendedSet;
 };
 
+std::shared_ptr<Pipeline> plannedPipeline(const Context& context, std::uint64_t planKey, const State& pipelineState, const DrawInputs& inputs, const std::shared_ptr<ShaderResources>& resources, std::span<const CompiledShader> shaders, bool lean) {
+    const auto layout = lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    if (planKey == 0) return CachedPipeline(context, pipelineState, inputs.VertexLayout(), *resources, shaders, layout);
+    using DrawPlans::Outcome;
+    if (const auto plan = DrawPlans::FindPipeline(planKey); plan != nullptr) {
+        auto outcome = Outcome::Hit;
+        std::shared_ptr<Pipeline> planned;
+        if (plan->resources.lock() != resources) outcome = Outcome::Resources;
+        else if (plan->lean != lean || plan->fragmentOutputs != inputs.fragmentOutputs || !DrawPlans::SameVertexInput(plan->vertexInput, inputs.VertexLayout())) outcome = Outcome::Layout;
+        else if ((planned = plan->pipeline.lock()) == nullptr) outcome = Outcome::PipelineGone;
+        else if (!TouchCachedPipeline(context, plan->hash, planned.get())) outcome = Outcome::StoreMoved;
+        if (outcome == Outcome::Hit) {
+            if (DrawPlans::TakeVerify()) {
+                auto fresh = CachedPipeline(context, pipelineState, inputs.VertexLayout(), *resources, shaders, layout);
+                DrawPlans::NoteVerified();
+                if (fresh != planned) {
+                    DrawPlans::Count(Outcome::VerifyMismatch);
+                    DrawPlans::ForgetPipeline(planKey);
+                    static std::atomic<std::uint32_t> printed{0};
+                    if (printed.fetch_add(1, std::memory_order_relaxed) < 20u) std::fprintf(stderr, "[draw-plans] verify: plan 0x%llx gave another pipeline than the store's lookup; the plan is dropped\n", static_cast<unsigned long long>(planKey));
+                    return fresh;
+                }
+            }
+            DrawPlans::Count(Outcome::Hit);
+            return planned;
+        }
+        DrawPlans::Count(outcome);
+    } else {
+        DrawPlans::Count(Outcome::NoPlan);
+    }
+    std::uint64_t hash = 0;
+    auto pipeline = CachedPipeline(context, pipelineState, inputs.VertexLayout(), resources->SetLayouts(), shaders, layout, nullptr, &hash);
+    if (hash != 0) {
+        auto plan = std::make_shared<DrawPlans::PipelinePlan>();
+        plan->resources = resources;
+        plan->pipeline = pipeline;
+        plan->hash = hash;
+        plan->lean = lean;
+        plan->fragmentOutputs = inputs.fragmentOutputs;
+        plan->vertexInput = inputs.VertexLayout();
+        DrawPlans::StorePipeline(planKey, std::move(plan));
+        DrawPlans::Count(Outcome::Stored);
+    } else {
+        DrawPlans::Count(Outcome::Unstorable);
+    }
+    return pipeline;
+}
+
 bool prepareDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, PreparedDraw* prepared, const AheadDraw* ahead, DrawPreparation& preparation) {
+    const auto takenPlanKey = std::exchange(DrawPlans::CurrentKey(), 0u);
     auto*& recipeOut = preparation.recipeOut;
     auto& stencilReferences = preparation.stencilReferences;
     for (const auto& shader : shaders) {
@@ -3275,7 +3325,9 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         stencilReplay.emplace_back(reference, std::move(selectedPipeline));
     }
     auto& pipeline = preparation.pipeline;
-    pipeline = stencilReplay.empty() ? CachedPipeline(context, pipelineState, inputs.VertexLayout(), *resources, shaders, lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) : stencilReplay.front().second;
+    const bool proxiedTarget = std::any_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.proxied; });
+    const auto planKey = DrawPlans::Active() && blendedTargets.empty() && !proxiedTarget ? takenPlanKey : 0u;
+    pipeline = stencilReplay.empty() ? plannedPipeline(context, planKey, pipelineState, inputs, resources, shaders, lean) : stencilReplay.front().second;
     // Resident targets' views are stable while their storage image lives, so the framebuffer is
     // reused with the pipeline; a per-draw RenderTarget gets a framebuffer of its own.
     auto& owners = preparation.owners;
