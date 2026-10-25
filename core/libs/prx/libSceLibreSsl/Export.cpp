@@ -19,32 +19,7 @@ constexpr std::size_t DesScheduleBytes = 128;
 extern "C" {
 
 APS5_DUMMY_FUN
-int APS5_VABI ASN1_INTEGER_get_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI ASN1_STRING_data_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI ASN1_STRING_length_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
 int APS5_VABI ASN1_STRING_print_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI ASN1_STRING_to_UTF8_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI ASN1_STRING_type_nid_postfix(void) {
     NotImplemented_nid_no_patch(__func__);
     return 0;
 }
@@ -1004,21 +979,6 @@ int APS5_VABI RSA_verify_nid_postfix(void) {
 }
 
 int APS5_VABI RSA_verify_PKCS1_PSS_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI SSL_CIPHER_get_bits_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI SSL_CIPHER_get_name_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI SSL_CIPHER_get_version_nid_postfix(void) {
     NotImplemented_nid_no_patch(__func__);
     return 0;
 }

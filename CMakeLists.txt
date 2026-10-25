@@ -241,6 +241,15 @@ if(BUILD_TESTING)
         add_test(NAME pad_timeline COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_pad_timeline.py)
         set_tests_properties(pad_timeline PROPERTIES TIMEOUT 20)
+        set(check_compile_modes_source "${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_check_compile_modes.py")
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${check_compile_modes_source}")
+        file(STRINGS "${check_compile_modes_source}" check_compile_modes_cases REGEX "^    def test_")
+        foreach(test_case IN LISTS check_compile_modes_cases)
+            string(REGEX REPLACE "^    def (test_[A-Za-z0-9_]+).*" "\\1" test_case "${test_case}")
+            add_test(NAME check_compile_modes_${test_case} COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_check_compile_modes.py" CheckCompileModeTests.${test_case})
+            set_tests_properties(check_compile_modes_${test_case} PROPERTIES TIMEOUT 30)
+        endforeach()
         add_test(NAME trace_digest COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_trace_digest.py)
         add_test(NAME conventions_bom_shebang COMMAND ${Python3_EXECUTABLE}
