@@ -2328,6 +2328,44 @@ bool ChangedBlocks(std::uint64_t address, std::size_t bytes, std::span<const std
     return true;
 }
 
+bool ArmOwnedBlocks(std::uint64_t address, std::size_t bytes, std::span<std::uint64_t> words, bool allowPrivate) {
+    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || words.size() != HashBlockCount(address, bytes)) return false;
+    return GuestArena::GuestArenaArmOwned_nid_no_patch(static_cast<std::uintptr_t>(address), bytes, words.data(), words.size(), allowPrivate ? 1u : 0u);
+}
+
+bool OwnedWordsHold(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> words) {
+    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || words.empty() || words.size() != HashBlockCount(address, bytes)) return false;
+    return GuestArena::GuestArenaOwnedUnchanged_nid_no_patch(static_cast<std::uintptr_t>(address), bytes, words.data(), words.size());
+}
+
+bool OwnedProofHolds(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> words, std::uint64_t since) {
+    if (since == 0 || !OwnedWordsHold(address, bytes, words)) return false;
+    auto& tracker = Tracker();
+    const auto lock = lockTracker(tracker);
+    tracker.initialize();
+    if (!tracker.watched) return false;
+    // The walk's own test for a block it may skip (WalkUntrackedBlocks): no stamp and no hint newer
+    // than the generation it proved the range at.
+    if (tracker.newestStamp(address, address + bytes) > since) return false;
+#ifdef _WIN32
+    constexpr std::uint64_t page = 4096;
+    const auto first = address & ~(page - 1);
+    const auto stop = (address + bytes + page - 1) & ~(page - 1);
+    if (first < tracker.base || stop > tracker.base + tracker.size) return false;
+    if (tracker.newestHint(first, stop) > since) return false;
+#endif
+    return true;
+}
+
+OwnedBlockCounts TakeOwnedBlockCounts() {
+    std::array<std::uint64_t, GuestArena::GuestArenaOwnedCountSlots> counts{};
+    GuestArena::GuestArenaTakeOwnedCounts_nid_no_patch(counts.data(), counts.size());
+    OwnedBlockCounts taken{counts[0], counts[1], counts[2], counts[3], counts[4], counts[5], counts[6], counts[7], {}};
+    static_assert(GuestArena::GuestArenaOwnedCountSlots == 9 + std::tuple_size_v<decltype(taken.refusedBy)>);
+    for (std::size_t i = 0; i < taken.refusedBy.size(); ++i) taken.refusedBy[i] = counts[9 + i];
+    return taken;
+}
+
 namespace {
 
 // Per-thread GpuMutex wait accounting (APS5_PROFILE_DRAW): a queue worker tags its thread, other

@@ -870,7 +870,9 @@ if(BUILD_TESTING)
         set_tests_properties(agc_write_tracking_metadata_commit PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
         add_test(NAME agc_resident_direct_remap COMMAND agc_write_tracking_tests --resident-direct-remap)
         set_tests_properties(agc_resident_direct_remap PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 20)
-        set_tests_properties(agc_write_tracking agc_write_tracking_metadata_commit agc_resident_direct_remap PROPERTIES ENVIRONMENT_MODIFICATION
+        add_test(NAME agc_untracked_owned_proofs COMMAND agc_write_tracking_tests --owned-proofs)
+        set_tests_properties(agc_untracked_owned_proofs PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+        set_tests_properties(agc_write_tracking agc_write_tracking_metadata_commit agc_resident_direct_remap agc_untracked_owned_proofs PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()

@@ -2,6 +2,7 @@
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "prx/libc/include/WindowsMappings.hpp"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <exception>
@@ -586,6 +587,55 @@ void GuestArenaReset_nid_postfix(void* pointer, std::size_t bytes) {
 bool GuestArenaWriteWatched_nid_postfix() {
     return Arena::Get().WriteWatched();
 }
+
+#ifdef _WIN32
+namespace {
+
+bool ownedRangeInArena(std::uintptr_t address, std::size_t bytes) {
+    constexpr std::uintptr_t block = WindowsMappings::ownedBlockBytes;
+    if (bytes == 0 || bytes > std::numeric_limits<std::uintptr_t>::max() - address - block) return false;
+    const auto first = address & ~(block - 1);
+    const auto stop = (address + bytes + block - 1) & ~(block - 1);
+    return Arena::Get().Contains(reinterpret_cast<const void*>(first), stop - first) && !Arena::Get().OverlapsHostRegion(first, stop - first);
+}
+
+}
+
+bool GuestArenaArmOwned_nid_no_patch(std::uintptr_t address, std::size_t bytes, std::uint64_t* words, std::size_t count, unsigned flags) {
+    if (!ownedRangeInArena(address, bytes)) return WindowsMappings::Get().NoteOwnedRefusal(WindowsMappings::OwnedRefusal::Outside);
+    return WindowsMappings::Get().ArmOwned(address, bytes, words, count, flags);
+}
+
+bool GuestArenaOwnedUnchanged_nid_no_patch(std::uintptr_t address, std::size_t bytes, const std::uint64_t* words, std::size_t count) {
+    return WindowsMappings::Get().OwnedUnchanged(address, bytes, words, count);
+}
+
+void GuestArenaTakeOwnedCounts_nid_no_patch(std::uint64_t* counts, std::size_t count) {
+    const auto taken = WindowsMappings::Get().TakeOwnedCounts();
+    std::array<std::uint64_t, GuestArenaOwnedCountSlots> values{taken.arms, taken.armedBlocks, taken.refused, taken.faults, taken.disowned, taken.privateBlocks, taken.unmappedBlocks, taken.partialBlocks};
+    static_assert(8 + WindowsMappings::OwnedRefusalCount == GuestArenaOwnedCountSlots);
+    for (std::size_t i = 0; i < WindowsMappings::OwnedRefusalCount; ++i) values[8 + i] = taken.reasons[i];
+    for (std::size_t i = 0; i < count && i < values.size(); ++i) counts[i] = values[i];
+}
+
+void GuestArenaEndSetProtection_nid_no_patch(std::uintptr_t, std::size_t) {
+    WindowsMappings::Get().EndSetProtection();
+}
+#else
+bool GuestArenaArmOwned_nid_no_patch(std::uintptr_t, std::size_t, std::uint64_t*, std::size_t, unsigned) {
+    return false;
+}
+
+bool GuestArenaOwnedUnchanged_nid_no_patch(std::uintptr_t, std::size_t, const std::uint64_t*, std::size_t) {
+    return false;
+}
+
+void GuestArenaTakeOwnedCounts_nid_no_patch(std::uint64_t* counts, std::size_t count) {
+    for (std::size_t i = 0; i < count; ++i) counts[i] = 0;
+}
+
+void GuestArenaEndSetProtection_nid_no_patch(std::uintptr_t, std::size_t) {}
+#endif
 
 void GuestArenaSetHostWriteHook_nid_no_patch(void (*hook)(std::uintptr_t, std::size_t)) {
     hostWriteHook.store(hook, std::memory_order_release);

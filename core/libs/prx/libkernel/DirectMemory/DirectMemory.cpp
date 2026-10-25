@@ -156,6 +156,13 @@ static bool AtStackReserveBottom(std::uintptr_t start, std::uintptr_t end) {
 
 static int mprotect(void* addr, size_t len, int prot) {
     GuestArena::GuestArenaSetProtection_nid_postfix(reinterpret_cast<std::uintptr_t>(addr), len, WinProtFromPosix(prot));
+    // The protection change stays in flight (no owned block is armed over it) until the
+    // VirtualProtect below has landed, or failed.
+    struct EndProtection {
+        void* addr;
+        size_t len;
+        ~EndProtection() { GuestArena::GuestArenaEndSetProtection_nid_no_patch(reinterpret_cast<std::uintptr_t>(addr), len); }
+    } endProtection{addr, len};
     if (prot != PROT_NONE && KernelArena::Get().Owns(addr, len)) CommitArenaRange(addr, len, WinProtFromPosix(prot));
     auto cursor = reinterpret_cast<std::uintptr_t>(addr);
     const auto end = cursor + len;
