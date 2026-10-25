@@ -332,7 +332,7 @@ bool Driver::compileDrawAhead(std::uint64_t key, std::uint64_t shape, const std:
     }) && inserted;
 }
 
-void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawParameters& drawParameters, const std::optional<Graphics::IndirectDrawPath>& indirectCpu, const std::vector<DrawProgram>& programs, const std::vector<StageCapture>& stageCaptures, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, const std::vector<std::vector<Graphics::DecodeRead>>& decodeReads, bool verifyHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, const std::vector<StageDataHit>& stageData, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::uint64_t drawKey, bool registerKey, const std::shared_ptr<const DrawDecode>& decode, DrawPhaseTiming& phaseTiming, const std::vector<bool>& reused, const std::shared_ptr<DrawEntry>& entry, std::uint64_t shapeKey, bool shapeNeedsEntry) {
+void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawParameters& drawParameters, const std::optional<Graphics::IndirectDrawPath>& indirectCpu, const std::vector<DrawProgram>& programs, const std::vector<StageCapture>& stageCaptures, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, const std::vector<std::vector<Graphics::DecodeRead>>& decodeReads, bool verifyHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, const std::vector<StageDataHit>& stageData, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::uint64_t drawKey, bool registerKey, const std::shared_ptr<const DrawDecode>& decode, DrawPhaseTiming& phaseTiming, const std::vector<bool>& reused, const std::shared_ptr<DrawEntry>& entry, std::uint64_t shapeKey, bool shapeNeedsEntry, const std::vector<bool>* relocatedStages) {
     const bool cached = useDrawEntries && !(drawParameters.indirect && indirectCpu);
     const bool ahead = entry != nullptr && entry->probation;
     const auto shape = registerKey && drawDataHits() ? shapeKey : 0;
@@ -396,7 +396,7 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
         insertDrawEntry(drawKey, fresh, registerKey ? decode : nullptr, shape, replaceShape);
         std::uint64_t dataInserts = 0, dataPositions = 0;
         for (std::size_t i = 0; i < programs.size(); ++i) {
-            if (fresh[i] == nullptr || reused[i] || fresh[i]->dataPositions.empty()) continue;
+            if (fresh[i] == nullptr || (reused[i] && (relocatedStages == nullptr || !(*relocatedStages)[i])) || fresh[i]->dataPositions.empty()) continue;
             ++dataInserts;
             dataPositions += fresh[i]->dataPositions.size();
         }

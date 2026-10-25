@@ -499,6 +499,10 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     bool drawHit = false;
     bool verifyHit = false;
     const bool stageEntries = useDrawEntries && !(graphics.stages.tessellation && !drawParameters.indirect && drawParameters.instanceCount > 1u);
+    // Stage A' (APS5_NO_RELOCATED_DATA_HITS unset): stages of direct vertex-path draws are looked up
+    // among the earlier captures of their (shape key, stage) with relocated runs and patched data.
+    const bool relocatedHits = registerKey && stageEntries && shapeKey != 0 && !drawParameters.indirect && drawDataHits() && graphics.stages.path == Graphics::ShaderPath::Vertex && !graphics.stages.mesh && !graphics.stages.tessellation && !verifyDrawEntries() && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoRelocatedDataHits);
+    std::vector<bool> relocated(programs.size(), false);
     lookupDraw(submission, localDevice, graphics, pixel, programs, roles, vertexInfos, stageEntries, registerKey, profile, drawKey, entry, matched, matchedRegions, drawHit, verifyHit, phaseTiming, phaseMs, dataEntry, dataCandidates, stageData);
     for (std::size_t i = 0; i < matched.size(); ++i) {
         if (matched[i] == nullptr || matched[i]->shaderDataPatches.empty()) continue;
@@ -587,6 +591,39 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         std::snprintf(message, sizeof(message), "APS5_VERIFY_DRAW_DATA_HITS: stage %zu (program 0x%llx) of a stage data hit differs from its full build in its %s (%zu data positions refreshed)", i, static_cast<unsigned long long>(programs[i].binary.codeAddress), what, kept.dataPositions.size());
         throw std::runtime_error(message);
     };
+    const auto previousExports = [&](std::size_t i) -> const std::vector<std::uint32_t>* {
+        for (auto previous = i; previous-- > 0;) {
+            if (programResults[previous] != nullptr) return &programResults[previous]->parameterExports;
+        }
+        return nullptr;
+    };
+    const auto verifyRelocatedStage = [&](std::size_t i, const RelocatedHit& hit) {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
+        std::vector<std::uint32_t> words;
+        freshRuns(i, runs, words);
+        const auto flatten = [](std::span<const std::pair<std::uint64_t, std::uint64_t>> spans, std::span<const std::uint32_t> values) {
+            std::vector<std::pair<std::uint64_t, std::uint32_t>> flat;
+            std::size_t word = 0;
+            for (const auto& [begin, end] : spans) {
+                for (auto address = begin; address < end && word < values.size(); address += sizeof(std::uint32_t)) flat.emplace_back(address, values[word++]);
+            }
+            std::sort(flat.begin(), flat.end());
+            return flat;
+        };
+        const auto& fresh = *stageCaptures[i].compiled;
+        const auto& kept = *hit.variant->compiled;
+        const bool sameBindings = fresh.bindings.size() == kept.bindings.size() && std::equal(fresh.bindings.begin(), fresh.bindings.end(), kept.bindings.begin(), [](const auto& a, const auto& b) { return a.kind == b.kind && a.role == b.role && a.binding == b.binding && a.count == b.count && a.guestDescriptor == b.guestDescriptor; });
+        const bool sameVertex = vertexInfos[i].has_value() == (hit.variant->vertexInfo != nullptr) && (!vertexInfos[i] || sameVertexInfo(*vertexInfos[i], *hit.variant->vertexInfo));
+        const char* what = flatten(runs, words) != flatten(hit.variant->runs, hit.variant->words) ? "captured words" : !sameVertex ? "vertex stage info" : fresh.Identity() != kept.Identity() ? "module" : !sameBindings ? "bindings" : fresh.pushConstants != kept.pushConstants ? "push constants" : !SameCompilation(fresh, kept, programs[i].hiddenUserWords) ? "compilation" : nullptr;
+        noteRelocatedVerify(what != nullptr);
+        if (what == nullptr) return;
+        static constexpr std::array<const char*, 4> kinds{"R0 same", "R1 moved", "R2 moved+data", "R4 nested"};
+        char message[384];
+        std::snprintf(message, sizeof(message), "[relocated-hits] verify: stage %zu (program 0x%llx, %s) of a relocated hit differs from its fresh capture in its %s (%zu runs / %zu words reused, %zu / %zu fresh; shape 0x%llx)", i, static_cast<unsigned long long>(programs[i].binary.codeAddress), kinds[static_cast<std::size_t>(hit.kind)], what, hit.variant->runs.size(), hit.variant->words.size(), runs.size(), words.size(), static_cast<unsigned long long>(shapeKey));
+        if (relocatedHitsVerified()) throw std::runtime_error(message);
+        static std::atomic<std::uint64_t> reports{0};
+        if (reports.fetch_add(1, std::memory_order_relaxed) < 32) std::fprintf(stderr, "%s\n", message);
+    };
     std::optional<Graphics::IndirectDrawPath> indirectCpu;
     std::vector<std::uint32_t> pushOffsets(programs.size(), 0);
     std::optional<ShaderRecompiler::MeshBarycentricLayout> meshBarycentrics;
@@ -610,21 +647,33 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 memory.insert(memory.end(), matchedRegions[i].begin(), matchedRegions[i].end());
             } else {
                 if (!dataCandidates[i].empty() && !verifyDrawDataHits()) decodeVertexInfo(i);
-                if (program.binary.stage == ShaderRecompiler::ShaderStage::Fragment) {
-                    for (auto previous = i; previous-- > 0;) {
-                        if (programResults[previous] == nullptr) continue;
-                        pixel = Graphics::DefaultUnexportedInputs(decode->pixel, programResults[previous]->parameterExports);
-                        break;
-                    }
+                const auto* exports = previousExports(i);
+                if (program.binary.stage == ShaderRecompiler::ShaderStage::Fragment && exports != nullptr) pixel = Graphics::DefaultUnexportedInputs(decode->pixel, *exports);
+                std::optional<RelocatedHit> relocatedHit;
+                if (relocatedHits && candidate == dataCandidates[i].end()) {
+                    phaseTiming.Phase(DrawRowVectors);
+                    relocatedHit = relocatedDrawStage({shapeKey, i, pushCursorBytes, submission.queue, &program, &vertexInfos[i], decodeReads[i], exports});
+                    phaseTiming.Phase(DrawRowKeyLookupValidate);
                 }
-                compiledStages.push_back(materializeDrawStage(i, pushCursorBytes, queue, submission, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, *shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected, meshBarycentrics));
-                if (!rejected.empty()) return DrawVerdict::Rejected;
-                programResults[i] = compiledStages.back().get();
-                if (candidate != dataCandidates[i].end()) verifyDataStage(i, *candidate->first);
-                if (stageData[i].compiled != nullptr && verifyDrawDataHits()) verifyStageData(i);
+                const bool verifyRelocated = relocatedHit.has_value() && takeRelocatedVerify();
+                if (relocatedHit && !verifyRelocated) {
+                    matched[i] = relocatedHit->variant;
+                    matchedRegions[i] = std::move(relocatedHit->regions);
+                    reused[i] = true;
+                    relocated[i] = true;
+                    programResults[i] = matched[i]->compiled.get();
+                    memory.insert(memory.end(), matchedRegions[i].begin(), matchedRegions[i].end());
+                } else {
+                    compiledStages.push_back(materializeDrawStage(i, pushCursorBytes, queue, submission, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, *shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected, meshBarycentrics));
+                    if (!rejected.empty()) return DrawVerdict::Rejected;
+                    programResults[i] = compiledStages.back().get();
+                    if (candidate != dataCandidates[i].end()) verifyDataStage(i, *candidate->first);
+                    if (stageData[i].compiled != nullptr && verifyDrawDataHits()) verifyStageData(i);
+                    if (verifyRelocated) verifyRelocatedStage(i, *relocatedHit);
+                }
             }
-            if (dataEntry != nullptr && reused[i]) ++dataStagesReused;
-            else if (dataEntry != nullptr) ++dataStagesCompiled;
+            if (dataEntry != nullptr && reused[i] && !relocated[i]) ++dataStagesReused;
+            else if (dataEntry != nullptr && !relocated[i]) ++dataStagesCompiled;
         }
         if (i == 0 && drawParameters.indirect) {
             // gpuind: the front stage as compiled (or served by a hit) says whether it reads the
@@ -699,6 +748,14 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         std::lock_guard cacheLock(drawCacheMutex);
         drawEntryCounters.stageDataVerified += stageDataVerified;
     }
+    if (relocatedHits) {
+        for (std::size_t i = 0; i < programs.size(); ++i) {
+            const auto& capture = stageCaptures[i];
+            if (roles[i] == Role::GeometryBack || reused[i] || capture.compiled == nullptr || capture.capture == nullptr || !CacheableResult(*capture.compiled)) continue;
+            learnRelocatedStage(shapeKey, i, programs[i], capture, vertexInfos[i], decodeReads[i], previousExports(i));
+        }
+        maybeReportRelocatedHits(profile);
+    }
     if (dataEntry != nullptr) {
         std::lock_guard cacheLock(drawCacheMutex);
         drawEntryCounters.dataStagesReused += dataStagesReused;
@@ -764,7 +821,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         return lastData[shapeKey % lastData.size()].exchange(data, std::memory_order_relaxed) == data;
     };
     const bool shapeNeedsEntry = shapeRefresh && registerKey && shapeKey != 0 && drawDataHits() && !drawParameters.indirect && dataEntry != nullptr && dataStagesCompiled != 0 && refreshSeenTwice();
-    cacheDrawStages(stageEntries, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, stageData, fresh, drawKey, registerKey, decode, phaseTiming, reused, entry, shapeKey, shapeNeedsEntry);
+    cacheDrawStages(stageEntries, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, stageData, fresh, drawKey, registerKey, decode, phaseTiming, reused, entry, shapeKey, shapeNeedsEntry, &relocated);
     timing.Mark("shader_compile_and_link");
 
     for (const auto& reads : decodeReads) {
@@ -1065,7 +1122,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
 
     std::vector<std::shared_ptr<DispatchVariant>> recipeStages;
-    if (registerKey && !drawParameters.indirect && !patchedStages && Graphics::DrawRecipes()) {
+    if (registerKey && !drawParameters.indirect && !patchedStages && std::none_of(relocated.begin(), relocated.end(), [](bool stage) { return stage; }) && Graphics::DrawRecipes()) {
         recipeStages.reserve(programs.size());
         for (std::size_t i = 0; i < programs.size(); ++i) recipeStages.push_back(drawHit ? matched[i] : fresh[i]);
         if (std::all_of(recipeStages.begin(), recipeStages.end(), [](const std::shared_ptr<DispatchVariant>& variant) { return variant == nullptr; })) recipeStages.clear();

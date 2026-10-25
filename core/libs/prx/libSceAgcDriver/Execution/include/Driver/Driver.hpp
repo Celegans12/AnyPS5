@@ -119,6 +119,10 @@ public:
     // preparation transaction commit what was prepared before it.
     static void SkipRefusedPreparation(const ShaderRefusal& refusal);
     DrawEntryCounters DrawCacheCounters();
+    RelocatedCounters RelocatedHitCounters();
+    // Stage A' plan of one stage capture (see RelocatedTemplate); null when the capture's runs do
+    // not match the variant's words or a pointer chain cannot be ordered.
+    static std::shared_ptr<RelocatedTemplate> BuildRelocatedTemplate(const std::shared_ptr<const DispatchVariant>& variant, const DrawProgram& program, std::span<const ShaderRecompiler::MemoryRegion> regions, const ShaderRecompiler::SrtUserDataUse& use, std::span<const Graphics::DecodeRead> decodeReads, const std::vector<std::uint32_t>* exports);
     struct DrawCacheOccupancy {
         std::size_t admitted = 0;
         std::size_t probation = 0;
@@ -225,6 +229,13 @@ private:
     void learnPendingRelocation();
     void relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std::shared_ptr<DrawEntry>& entry, std::shared_ptr<const DrawDecode>& decode, std::vector<DrawUserPatch>& patches);
     void reportDrawRelocation();
+    static bool relocatedHitsVerified();
+    static std::uint64_t relocatedVerifyQuota();
+    std::optional<RelocatedHit> relocatedDrawStage(const RelocatedLookup& lookup);
+    void learnRelocatedStage(std::uint64_t shape, std::size_t stage, const DrawProgram& program, const StageCapture& capture, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertexInfo, const std::vector<Graphics::DecodeRead>& decodeReads, const std::vector<std::uint32_t>* exports);
+    bool takeRelocatedVerify();
+    void noteRelocatedVerify(bool mismatch);
+    void maybeReportRelocatedHits(bool profile);
     static bool sameVertexInfo(const ShaderRecompiler::ShaderVertexStageInfo& a, const ShaderRecompiler::ShaderVertexStageInfo& b);
     static bool sameDecode(const DrawDecode& a, const DrawDecode& b);
     std::shared_ptr<DrawDecode> decodeDraw(const QueueState& queue, const Submission& submission, const Graphics::Context& context);
@@ -234,7 +245,7 @@ private:
     void lookupDraw(const Submission& submission, const std::shared_ptr<VulkanDevice>& localDevice, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, bool useDrawEntries, bool registerKey, bool profile, std::uint64_t& drawKey, std::shared_ptr<DrawEntry>& entry, std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool& drawHit, bool& verifyHit, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, const std::shared_ptr<DrawEntry>& dataEntry, DrawDataCandidates& dataCandidates, std::vector<StageDataHit>& stageData);
     std::shared_ptr<const ShaderRecompiler::RecompileResult> materializeDrawStage(std::size_t i, std::uint32_t pushOffset, const QueueState& queue, const Submission& submission, const std::vector<DrawProgram>& programs, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, std::vector<ShaderRecompiler::MemoryRegion>& memory, const std::vector<ShaderRecompiler::LinkedProgram>& linked, const Pm4::DrawParameters& drawParameters, const std::shared_ptr<VulkanDevice>& localDevice, ShaderMemory& shaderMemory, std::vector<StageCapture>& stageCaptures, std::vector<bool>& recompiled, bool drawHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, const std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool profile, std::uint64_t dumpTarget, std::uint64_t dumpSlot1, std::uint64_t& captures, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, std::string& rejected, const std::optional<ShaderRecompiler::MeshBarycentricLayout>& meshBarycentrics);
     static void recordStageDataPositions(DispatchVariant& variant, const ShaderRecompiler::ResourceCapture& capture, const std::vector<Graphics::DecodeRead>& decodeReads);
-    void cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawParameters& drawParameters, const std::optional<Graphics::IndirectDrawPath>& indirectCpu, const std::vector<DrawProgram>& programs, const std::vector<StageCapture>& stageCaptures, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, const std::vector<std::vector<Graphics::DecodeRead>>& decodeReads, bool verifyHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, const std::vector<StageDataHit>& stageData, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::uint64_t drawKey, bool registerKey, const std::shared_ptr<const DrawDecode>& decode, DrawPhaseTiming& phaseTiming, const std::vector<bool>& reused, const std::shared_ptr<DrawEntry>& entry, std::uint64_t shapeKey, bool shapeNeedsEntry = false);
+    void cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawParameters& drawParameters, const std::optional<Graphics::IndirectDrawPath>& indirectCpu, const std::vector<DrawProgram>& programs, const std::vector<StageCapture>& stageCaptures, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, const std::vector<std::vector<Graphics::DecodeRead>>& decodeReads, bool verifyHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, const std::vector<StageDataHit>& stageData, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::uint64_t drawKey, bool registerKey, const std::shared_ptr<const DrawDecode>& decode, DrawPhaseTiming& phaseTiming, const std::vector<bool>& reused, const std::shared_ptr<DrawEntry>& entry, std::uint64_t shapeKey, bool shapeNeedsEntry = false, const std::vector<bool>* relocatedStages = nullptr);
     std::optional<DrawVerdict> precheckDraw(const QueueState& queue, const Submission& submission, std::span<const std::uint32_t> packet, const Pm4::DrawParameters& drawParameters, std::string& rejected, bool& traceIndirect);
     static std::uint32_t drawUserWord(const DrawProgram& program, std::int32_t sgpr);
     DrawVerdict draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected);
@@ -460,6 +471,14 @@ private:
     DrawRelocationPending drawRelocationPending;
     std::unordered_map<std::uint64_t, DrawRelocationTrial> drawRelocationTrials;
     DrawRelocationCounters drawRelocationCounters;
+    AgcDriver::Mutex relocatedMutex;
+    std::unordered_map<std::uint64_t, RelocatedPool> relocatedPools;
+    std::list<std::uint64_t> relocatedOrder;
+    std::size_t relocatedTemplates = 0;
+    std::uint64_t relocatedClock = 0;
+    RelocatedCounters relocatedCounters;
+    std::chrono::steady_clock::time_point relocatedVerifyWindow = std::chrono::steady_clock::now();
+    std::uint64_t relocatedVerifiedInWindow = 0;
     std::vector<std::shared_ptr<DrawEntry>> releasedDrawEntries;
     std::mutex drawAheadMutex;
     std::unordered_map<std::uint64_t, std::shared_ptr<DrawEntry>> drawAheadEntries;

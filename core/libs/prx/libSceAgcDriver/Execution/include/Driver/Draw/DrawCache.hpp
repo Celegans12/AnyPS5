@@ -183,6 +183,83 @@ struct DrawRelocationCounters {
     std::uint64_t lookups = 0, donors = 0, refused = 0, hits = 0, evicted = 0;
 };
 
+// Stage A' (APS5_NO_RELOCATED_DATA_HITS off): a stage capture kept per (shape key, stage) and
+// reused by a later draw whose pointers moved. Every word the capture read is reached from a pure
+// base user word (moves with it), from a pointer word the walk loaded and used only as a read base
+// (moves with that word's new value), from a vertex decoder read (moves with the fresh decode), or
+// stays at its address. A reuse gathers the runs at their new places, finds a capture whose
+// non-data words hash alike, and validates every non-data word exactly there (validateVariant);
+// data words and moved user words reach the reused stage as patches.
+struct RelocatedRun {
+    enum class Base : std::uint8_t { Fixed, User, Pointer, Decoder };
+    std::uint64_t address = 0;
+    std::uint64_t offset = 0;
+    std::uint32_t first = 0;
+    std::uint32_t count = 0;
+    std::uint32_t source = 0;
+    Base base = Base::Fixed;
+};
+
+struct RelocatedTemplate {
+    std::shared_ptr<const DispatchVariant> variant;
+    std::vector<RelocatedRun> runs;
+    std::vector<std::uint32_t> order;
+    std::vector<std::uint32_t> pointers;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> pointerSlots;
+    std::uint32_t flatBinding = 0;
+    std::vector<std::uint32_t> hashed;
+    std::vector<std::uint32_t> userData;
+    std::vector<std::uint32_t> decodeBytes;
+    std::vector<std::uint32_t> exports;
+    std::shared_ptr<const ShaderSnapshot> shader;
+    std::uint64_t movable = 0;
+    std::uint64_t baseWords = 0;
+    std::uint64_t valueWords = 0;
+    std::uint64_t fetchWords = 0;
+    std::uint32_t hidden = 0;
+    std::uint32_t userDataBase = 0;
+    std::uint32_t firstUserSgpr = 0;
+    bool vertex = false;
+    bool fragment = false;
+    bool tracked = false;
+    std::uint64_t plan = 0;
+    std::uint64_t index = 0;
+};
+
+struct RelocatedPool {
+    std::vector<std::shared_ptr<const RelocatedTemplate>> templates;
+    std::vector<std::uint64_t> used;
+    std::list<std::uint64_t>::iterator order;
+};
+
+enum class RelocatedClass : std::size_t { Same, Moved, Data, Nested, Count };
+enum class RelocatedFallback : std::size_t { NoTemplate, Layout, ValueWord, PinnedBase, Unreadable, NoIndex, PointerBits, Decode, Differing, Gate, Count };
+
+struct RelocatedCounters {
+    std::uint64_t lookups = 0, learned = 0, learnRefused = 0, replaced = 0, evicted = 0, validations = 0, synced = 0, verified = 0, verifyMismatches = 0, nestedRuns = 0, nestedUntracked = 0;
+    std::array<std::uint64_t, static_cast<std::size_t>(RelocatedClass::Count)> hits{};
+    std::array<std::uint64_t, static_cast<std::size_t>(RelocatedFallback::Count)> fallbacks{};
+    double hitUs = 0, missUs = 0, learnUs = 0;
+    std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+};
+
+struct RelocatedLookup {
+    std::uint64_t shape = 0;
+    std::size_t stage = 0;
+    std::uint32_t pushOffset = 0;
+    std::uint32_t queue = 0;
+    const DrawProgram* program = nullptr;
+    const std::optional<ShaderRecompiler::ShaderVertexStageInfo>* vertexInfo = nullptr;
+    std::span<const Graphics::DecodeRead> decodeReads;
+    const std::vector<std::uint32_t>* exports = nullptr;
+};
+
+struct RelocatedHit {
+    std::shared_ptr<DispatchVariant> variant;
+    std::vector<ShaderRecompiler::MemoryRegion> regions;
+    RelocatedClass kind = RelocatedClass::Same;
+};
+
 bool DecodeProgramsCurrent(const DrawDecode& decode, const ShaderRegistry& registry);
 bool SameCompilation(const ShaderRecompiler::RecompileResult& a, const ShaderRecompiler::RecompileResult& b, std::uint32_t hiddenUserWords = 0);
 std::shared_ptr<DrawEntry> BuildAheadEntry(const std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::shared_ptr<const DrawDecode> decode, std::uint64_t shape, std::shared_ptr<const Graphics::AheadDraw> prepared, std::size_t preparedShaders);

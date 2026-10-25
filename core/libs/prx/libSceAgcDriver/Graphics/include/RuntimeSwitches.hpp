@@ -65,6 +65,7 @@ enum class RuntimeSwitch : std::size_t {
     NoRefreshLookupCache,
     PipelineDispatch,
     PipelineDispatchMisses,
+    NoRelocatedDataHits,
     Count,
 };
 
