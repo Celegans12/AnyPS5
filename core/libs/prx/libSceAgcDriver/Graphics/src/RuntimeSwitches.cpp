@@ -107,6 +107,12 @@ double ParseSeconds(std::string_view text, const char* what) {
     return value;
 }
 
+std::string ArmText(const std::vector<RuntimeSwitch>& arm) {
+    std::string text;
+    for (const auto id : arm) text += std::string(text.empty() ? "" : "+") + SwitchNames[static_cast<std::size_t>(id)];
+    return text;
+}
+
 std::string FlippableList() {
     std::string list;
     for (const auto* name : SwitchNames) list += std::string(list.empty() ? "" : ", ") + name;
@@ -152,18 +158,32 @@ AbSchedule::Config AbSchedule::Parse(std::string_view ab, std::string_view start
     auto list = ab.substr(colon + 1);
     while (!list.empty()) {
         const auto comma = list.find(',');
-        const auto name = Trim(list.substr(0, comma));
+        auto group = list.substr(0, comma);
         list = comma == std::string_view::npos ? std::string_view{} : list.substr(comma + 1);
-        if (name.empty()) continue;
-        const auto found = RuntimeSwitches::Find(name);
-        if (!found.has_value()) {
-            for (const auto& refusal : Refused) {
-                if (name == refusal.name) throw std::invalid_argument("APS5_AB: " + std::string(name) + " cannot change while the game runs: " + refusal.reason);
+        std::vector<RuntimeSwitch> arm;
+        while (!group.empty()) {
+            const auto plus = group.find('+');
+            const auto name = Trim(group.substr(0, plus));
+            group = plus == std::string_view::npos ? std::string_view{} : group.substr(plus + 1);
+            if (name.empty()) continue;
+            const auto found = RuntimeSwitches::Find(name);
+            if (!found.has_value()) {
+                for (const auto& refusal : Refused) {
+                    if (name == refusal.name) throw std::invalid_argument("APS5_AB: " + std::string(name) + " cannot change while the game runs: " + refusal.reason);
+                }
+                throw std::invalid_argument("APS5_AB: " + std::string(name) + " is read once at startup and cannot change while the game runs; switches the A/B can flip: " + FlippableList());
             }
-            throw std::invalid_argument("APS5_AB: " + std::string(name) + " is read once at startup and cannot change while the game runs; switches the A/B can flip: " + FlippableList());
+            if (std::find(arm.begin(), arm.end(), *found) != arm.end()) throw std::invalid_argument("APS5_AB: " + std::string(name) + " is listed twice in one arm");
+            arm.push_back(*found);
         }
-        if (std::find(config.switches.begin(), config.switches.end(), *found) != config.switches.end()) throw std::invalid_argument("APS5_AB: " + std::string(name) + " is listed twice");
-        config.switches.push_back(*found);
+        if (arm.empty()) continue;
+        for (const auto& other : config.arms) {
+            if (other.size() == arm.size() && std::is_permutation(other.begin(), other.end(), arm.begin())) throw std::invalid_argument("APS5_AB: the arm " + ArmText(arm) + " is listed twice");
+        }
+        for (const auto id : arm) {
+            if (std::find(config.switches.begin(), config.switches.end(), id) == config.switches.end()) config.switches.push_back(id);
+        }
+        config.arms.push_back(std::move(arm));
     }
     if (config.switches.empty()) throw std::invalid_argument("APS5_AB: no switch listed after the phase length");
     start = Trim(start);
@@ -183,6 +203,11 @@ AbSchedule::Config AbSchedule::Parse(std::string_view ab, std::string_view start
     return config;
 }
 
+std::size_t AbSchedule::ArmOf(std::uint64_t phase, std::size_t arms) {
+    if ((phase & 1u) == 0 || arms == 0) return 0;
+    return static_cast<std::size_t>(((phase - 1) / 2) % arms) + 1;
+}
+
 AbSchedule::AbSchedule(Config config) : config(std::move(config)) {}
 
 AbSchedule::Step AbSchedule::AtPresent(std::uint64_t present, double seconds) {
@@ -194,22 +219,28 @@ AbSchedule::Step AbSchedule::AtPresent(std::uint64_t present, double seconds) {
         settled = false;
         phase = 0;
         phaseStart = seconds;
-        return {Event::Begin, 0, false};
+        return {Event::Begin, 0, false, 0};
     }
     if (seconds - phaseStart >= config.phaseSeconds) {
         ++phase;
         settled = false;
         phaseStart = seconds;
-        return {Event::Begin, phase, (phase & 1u) != 0};
+        return {Event::Begin, phase, (phase & 1u) != 0, ArmOf(phase, config.arms.size())};
     }
     if (!settled && seconds - phaseStart >= config.settleSeconds) {
         settled = true;
-        return {Event::Settled, phase, (phase & 1u) != 0};
+        return {Event::Settled, phase, (phase & 1u) != 0, ArmOf(phase, config.arms.size())};
     }
     return {};
 }
 
 namespace {
+
+std::string Fixed1(double value) {
+    char text[64];
+    std::snprintf(text, sizeof(text), "%.1f", value);
+    return text;
+}
 
 const char* EnvText(const char* name) {
     const char* value = std::getenv(name);
@@ -234,11 +265,16 @@ AbState& Ab() {
     return *state;
 }
 
-std::string SwitchSettings(const AbState& state, bool b) {
+bool ArmSets(const AbState& state, RuntimeSwitch id, std::size_t arm) {
+    const auto& arms = state.schedule->Settings().arms;
+    const bool toggled = arm != 0 && std::find(arms[arm - 1].begin(), arms[arm - 1].end(), id) != arms[arm - 1].end();
+    return state.environment[static_cast<std::size_t>(id)] != toggled;
+}
+
+std::string SwitchSettings(const AbState& state, std::size_t arm) {
     std::string text;
     for (const auto id : state.schedule->Settings().switches) {
-        const bool set = state.environment[static_cast<std::size_t>(id)] != b;
-        text += std::string(text.empty() ? "" : ", ") + RuntimeSwitches::Name(id) + (set ? " set" : " unset");
+        text += std::string(text.empty() ? "" : ", ") + RuntimeSwitches::Name(id) + (ArmSets(state, id, arm) ? " set" : " unset");
     }
     return text;
 }
@@ -264,15 +300,22 @@ std::vector<std::string> AbAtPresent(std::uint64_t present, double seconds) {
             char from[96];
             if (config.startSeconds.has_value()) std::snprintf(from, sizeof(from), "%.1f s after the first present", *config.startSeconds);
             else std::snprintf(from, sizeof(from), "present %llu", static_cast<unsigned long long>(config.startPresent));
-            std::snprintf(text, sizeof(text), "[ab] in-run A/B: phases of %.1f s from %s, settle %.1f s; A: %s; B: %s\n", config.phaseSeconds, from, config.settleSeconds, SwitchSettings(state, false).c_str(), SwitchSettings(state, true).c_str());
-            lines.emplace_back(text);
+            std::string arms;
+            if (config.arms.size() == 1) {
+                arms = "A: " + SwitchSettings(state, 0) + "; B: " + SwitchSettings(state, 1);
+            } else {
+                arms = std::to_string(config.arms.size()) + " arms; A: " + SwitchSettings(state, 0);
+                for (std::size_t arm = 1; arm <= config.arms.size(); ++arm) arms += "; B" + std::to_string(arm) + " (" + ArmText(config.arms[arm - 1]) + "): " + SwitchSettings(state, arm);
+            }
+            lines.push_back("[ab] in-run A/B: phases of " + Fixed1(config.phaseSeconds) + " s from " + from + ", settle " + Fixed1(config.settleSeconds) + " s; " + arms + "\n");
         }
-        for (const auto id : config.switches) RuntimeSwitches::Assign(id, state.environment[static_cast<std::size_t>(id)] != step.b);
-        keySalt.store(step.b ? 0xab00000bu : 0xab00000au, std::memory_order_relaxed);
-        std::snprintf(text, sizeof(text), "[ab] phase %c %llu begins at present %llu (t %.3f s): %s\n", step.b ? 'B' : 'A', static_cast<unsigned long long>(step.phase), static_cast<unsigned long long>(present), seconds, SwitchSettings(state, step.b).c_str());
-    } else {
-        std::snprintf(text, sizeof(text), "[ab] phase %c %llu settled at present %llu (t %.3f s)\n", step.b ? 'B' : 'A', static_cast<unsigned long long>(step.phase), static_cast<unsigned long long>(present), seconds);
+        for (const auto id : config.switches) RuntimeSwitches::Assign(id, ArmSets(state, id, step.arm));
+        keySalt.store(step.arm == 0 ? 0xab00000au : 0xab00000bu + (static_cast<std::uint32_t>(step.arm - 1) << 8), std::memory_order_relaxed);
+        std::snprintf(text, sizeof(text), "[ab] phase %c %llu begins at present %llu (t %.3f s) arm %llu: ", step.b ? 'B' : 'A', static_cast<unsigned long long>(step.phase), static_cast<unsigned long long>(present), seconds, static_cast<unsigned long long>(step.arm));
+        lines.push_back(text + SwitchSettings(state, step.arm) + "\n");
+        return lines;
     }
+    std::snprintf(text, sizeof(text), "[ab] phase %c %llu settled at present %llu (t %.3f s) arm %llu\n", step.b ? 'B' : 'A', static_cast<unsigned long long>(step.phase), static_cast<unsigned long long>(present), seconds, static_cast<unsigned long long>(step.arm));
     lines.emplace_back(text);
     return lines;
 }
