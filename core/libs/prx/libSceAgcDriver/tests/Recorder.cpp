@@ -4972,6 +4972,113 @@ bool ownedDrawSnapshotTests(const Device& device, Recorder& recorder) {
 #endif
 }
 
+// Owned vertex and index inputs (APS5_NO_OWNED_VERTEX_INPUTS): a draw input outside the write watch
+// is copied once and reused with its derived word while its owned words and stamps hold; a CPU
+// store, a driver store or the switch makes the next copy read the current bytes.
+bool ownedVertexInputTests(const Device& device) {
+#ifndef _WIN32
+    (void)device;
+    std::cout << "owned words are Windows only: owned vertex inputs not tested\n";
+    return false;
+#else
+    using Use = Recorder::SnapshotUse;
+    const auto& context = device.GetContext();
+    constexpr std::size_t bytes = 4 * 65536;
+    std::unique_lock gpu(GpuMutex());
+    void* block = context.hostImportAlignment != 0 ? AllocateWatched(bytes, 65536) : nullptr;
+    if (block == nullptr) {
+        std::cout << "host imports or write watching unavailable: owned vertex inputs not tested\n";
+        return false;
+    }
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+    auto* words = static_cast<std::uint32_t*>(block);
+    for (std::uint32_t i = 0; i < bytes / sizeof(std::uint32_t); ++i) words[i] = i * 7u;
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes);
+        }
+    } unregister{context, block};
+    if (HostImportFor(context, address, bytes) == nullptr) {
+        std::cout << "host import of the block refused: owned vertex inputs not tested\n";
+        return false;
+    }
+    const auto input = address + 65536;
+    constexpr std::size_t size = 65536;
+    if (AgcDriver::GuestMemory::CollectWrites(input, size) != 0) {
+        std::cout << "host imports stay watched: owned vertex inputs not tested\n";
+        return false;
+    }
+    const bool verify = std::getenv("APS5_VERIFY_OWNED_SNAPSHOTS") != nullptr;
+    const auto verified = Recorder::OwnedSnapshotVerifyCounts();
+    Recorder inputRecorder(context);
+    inputRecorder.Activate();
+    const auto equalsGuest = [&](const DrawInputCopy& copy) {
+        const auto contents = copy.buffer->Bytes();
+        return contents.size() == size && std::memcmp(contents.data(), reinterpret_cast<const void*>(input), size) == 0;
+    };
+    const auto vertex = CopyDrawInput(context, &inputRecorder, input, size, 1, Use::Vertex);
+    Require(!vertex.reused && vertex.generation == 0 && equalsGuest(vertex), "the first untracked vertex input copy is wrong");
+    KeepDrawInput(&inputRecorder, input, vertex, Use::Vertex, 0);
+    const auto again = CopyDrawInput(context, &inputRecorder, input, size, 1, Use::Vertex);
+    Require(again.reused && again.buffer == vertex.buffer, "an unchanged untracked vertex input was copied again");
+    const auto index = CopyDrawInput(context, &inputRecorder, input, size, 2, Use::Index16);
+    Require(!index.reused && equalsGuest(index), "an index input reused a vertex input's copy");
+    KeepDrawInput(&inputRecorder, input, index, Use::Index16, 4321);
+    const auto indexAgain = CopyDrawInput(context, &inputRecorder, input, size, 2, Use::Index16);
+    Require(indexAgain.reused && indexAgain.buffer == index.buffer && indexAgain.derived == 4321, "an unchanged untracked index input was not reused with its highest index");
+    if (verify) {
+        const auto now = Recorder::OwnedSnapshotVerifyCounts();
+        Require(now[0] > verified[0] && now[1] == verified[1], "the owned verify mode did not check the reuse or found a difference");
+    }
+    words[65536 / 4 + 9] ^= 0xffffu;
+    const auto stored = CopyDrawInput(context, &inputRecorder, input, size, 1, Use::Vertex);
+    Require(!stored.reused && stored.buffer != vertex.buffer && equalsGuest(stored), "an owned vertex input outlived a CPU store");
+    KeepDrawInput(&inputRecorder, input, stored, Use::Vertex, 0);
+    bool reusedAfterStore = false;
+    for (int attempt = 0; attempt < 4 && !reusedAfterStore; ++attempt) {
+        auto copy = CopyDrawInput(context, &inputRecorder, input, size, 1, Use::Vertex);
+        Require(equalsGuest(copy), "a vertex input after a CPU store does not hold the guest bytes");
+        reusedAfterStore = copy.reused;
+        KeepDrawInput(&inputRecorder, input, copy, Use::Vertex, 0);
+    }
+    Require(reusedAfterStore, "an untracked vertex input was not reused again after a CPU store");
+    AgcDriver::GuestMemory::MarkWritten(input + 64, 4);
+    const auto marked = CopyDrawInput(context, &inputRecorder, input, size, 2, Use::Index16);
+    Require(!marked.reused && equalsGuest(marked), "an owned index input outlived a driver store");
+    KeepDrawInput(&inputRecorder, input, marked, Use::Index16, 7);
+    bool indexReused = false;
+    for (int attempt = 0; attempt < 8 && !indexReused; ++attempt) {
+        auto copy = CopyDrawInput(context, &inputRecorder, input, size, 2, Use::Index16);
+        Require(equalsGuest(copy), "an index input after a driver store does not hold the guest bytes");
+        indexReused = copy.reused;
+        Require(!indexReused || copy.derived == 7, "a reused index input lost its highest index");
+        KeepDrawInput(&inputRecorder, input, copy, Use::Index16, 7);
+    }
+    Require(indexReused, "an untracked index input was not reused again after a driver store");
+    RuntimeSwitches::Assign(RuntimeSwitch::NoOwnedVertexInputs, true);
+    const auto off = CopyDrawInput(context, &inputRecorder, input, size, 2, Use::Index16);
+    RuntimeSwitches::Assign(RuntimeSwitch::NoOwnedVertexInputs, false);
+    Require(!off.reused && equalsGuest(off), "APS5_NO_OWNED_VERTEX_INPUTS still reused the untracked index input");
+    inputRecorder.Sync();
+    std::cout << "owned vertex and index inputs: ok" << (verify ? " (verified)" : "") << "\n";
+    return true;
+#endif
+}
+
 void drawSnapshotCapTests(const Device& device, Recorder& recorder) {
     using namespace AgcDriver::GuestMemory;
     const auto& context = device.GetContext();
@@ -12362,6 +12469,11 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--draw-snapshot-epoch-only") {
             drawSnapshotEpochTests(device);
             return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--owned-vertex-inputs-only") {
+            const bool tested = ownedVertexInputTests(device);
+            recorder.Activate();
+            return tested ? 0 : 77;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--owned-draw-snapshots-only") {
             return ownedDrawSnapshotTests(device, recorder) ? 0 : 77;

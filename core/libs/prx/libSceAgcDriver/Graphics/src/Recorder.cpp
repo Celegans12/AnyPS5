@@ -3852,10 +3852,33 @@ void Recorder::dropOwnedSnapshotBuffer(OwnedSnapshot& entry) {
     entry.words.clear();
 }
 
-std::shared_ptr<Buffer> Recorder::OwnedDrawSnapshot(std::uint64_t address, std::size_t bytes, bool& arm, OwnedSnapshotMiss& miss) {
+namespace {
+
+std::atomic<std::uint64_t> ownedVerified{0}, ownedVerifyDiffering{0}, ownedVerifyTurns{0};
+std::atomic<std::int64_t> ownedVerifyWindow{0};
+
+bool ownedVerifyTurn() {
+    static const std::uint64_t perWindow = [] {
+        const char* value = std::getenv("APS5_VERIFY_OWNED_SNAPSHOTS");
+        return value != nullptr ? static_cast<std::uint64_t>(std::strtoull(value, nullptr, 10)) : std::uint64_t{0};
+    }();
+    if (perWindow == 0) return false;
+    const auto window = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    auto seen = ownedVerifyWindow.load(std::memory_order_relaxed);
+    if (seen != window && ownedVerifyWindow.compare_exchange_strong(seen, window)) ownedVerifyTurns.store(0, std::memory_order_relaxed);
+    return ownedVerifyTurns.fetch_add(1, std::memory_order_relaxed) < perWindow;
+}
+
+}
+
+std::array<std::uint64_t, 2> Recorder::OwnedSnapshotVerifyCounts() {
+    return {ownedVerified.load(std::memory_order_relaxed), ownedVerifyDiffering.load(std::memory_order_relaxed)};
+}
+
+std::shared_ptr<Buffer> Recorder::OwnedDrawSnapshot(std::uint64_t address, std::size_t bytes, bool& arm, OwnedSnapshotMiss& miss, SnapshotUse use, std::uint32_t* derived) {
     arm = true;
     miss = OwnedSnapshotMiss::Absent;
-    const auto found = ownedSnapshots.find({address, bytes});
+    const auto found = ownedSnapshots.find({address, bytes, use});
     if (found == ownedSnapshots.end()) return {};
     auto& entry = found->second;
     ownedSnapshotRecency.splice(ownedSnapshotRecency.end(), ownedSnapshotRecency, entry.recent);
@@ -3871,6 +3894,16 @@ std::shared_ptr<Buffer> Recorder::OwnedDrawSnapshot(std::uint64_t address, std::
         } else {
             miss = OwnedSnapshotMiss::None;
             entry.backoff = 0;
+            if (ownedVerifyTurn()) {
+                const auto held = entry.buffer->Bytes();
+                const bool same = held.size() >= bytes && std::memcmp(held.data(), reinterpret_cast<const void*>(address), bytes) == 0;
+                ownedVerified.fetch_add(1, std::memory_order_relaxed);
+                if (!same) {
+                    ownedVerifyDiffering.fetch_add(1, std::memory_order_relaxed);
+                    std::fprintf(stderr, "[draw-snapshots] owned verify: 0x%llx+0x%zx (use %u, since %llu): the proof held and the copy differs from guest memory\n", static_cast<unsigned long long>(address), bytes, static_cast<unsigned>(use), static_cast<unsigned long long>(entry.since));
+                }
+            }
+            if (derived != nullptr) *derived = entry.derived;
             return entry.buffer;
         }
         dropOwnedSnapshotBuffer(entry);
@@ -3884,9 +3917,9 @@ std::shared_ptr<Buffer> Recorder::OwnedDrawSnapshot(std::uint64_t address, std::
     return {};
 }
 
-void Recorder::KeepOwnedDrawSnapshot(std::uint64_t address, std::size_t bytes, std::vector<std::uint64_t> words, std::uint64_t since, std::uint64_t registryGeneration, std::uint64_t forgetSerial, std::shared_ptr<Buffer> buffer) {
+void Recorder::KeepOwnedDrawSnapshot(std::uint64_t address, std::size_t bytes, std::vector<std::uint64_t> words, std::uint64_t since, std::uint64_t registryGeneration, std::uint64_t forgetSerial, std::shared_ptr<Buffer> buffer, SnapshotUse use, std::uint32_t derived) {
     if (since == 0 || (forgetSerial & 1u) != 0 || buffer == nullptr || bytes > OwnedSnapshotBudget) return;
-    const OwnedSnapshotKey key{address, bytes};
+    const OwnedSnapshotKey key{address, bytes, use};
     auto& entry = ownedSnapshotEntry(key);
     dropOwnedSnapshotBuffer(entry);
     for (auto it = ownedSnapshotRecency.begin(); it != ownedSnapshotRecency.end() && ownedSnapshotBytes + bytes > OwnedSnapshotBudget;) {
@@ -3898,12 +3931,13 @@ void Recorder::KeepOwnedDrawSnapshot(std::uint64_t address, std::size_t bytes, s
     entry.since = since;
     entry.registryGeneration = registryGeneration;
     entry.forgetSerial = forgetSerial;
+    entry.derived = derived;
     ownedSnapshotBytes += buffer->Bytes().size();
     entry.buffer = std::move(buffer);
 }
 
-void Recorder::RefuseOwnedDrawSnapshot(std::uint64_t address, std::size_t bytes) {
-    auto& entry = ownedSnapshotEntry({address, bytes});
+void Recorder::RefuseOwnedDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use) {
+    auto& entry = ownedSnapshotEntry({address, bytes, use});
     dropOwnedSnapshotBuffer(entry);
     entry.backoff = static_cast<std::uint8_t>(std::min<unsigned>(entry.backoff + 1u, 6u));
     entry.skip = static_cast<std::uint16_t>((1u << entry.backoff) - 1u);

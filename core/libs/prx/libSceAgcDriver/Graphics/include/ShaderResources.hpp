@@ -296,6 +296,9 @@ public:
     std::optional<std::vector<MovedBuffer>> MovedDispatchBuffers(const CompiledShader& shader, Recorder* recorder, std::size_t maxBytes, MoveProof& proof) const;
     static std::size_t MaxDrawSnapshotBytes();
     static std::size_t DrawUploadLimit();
+    // The [draw-snapshots] counters of CopyDrawInput (vertex and index inputs, APS5_PROFILE_DRAW).
+    enum class DrawInputPath : std::uint8_t { TrackedHit, OwnedHit, TrackedCopy, UntrackedCopy, Count };
+    static void CountDrawInputPath(DrawInputPath path, std::size_t bytes, std::uint8_t ownedMiss, bool owned, bool armed);
     void WriteBack();
     // Deferred completion: MarkGpuWrites registers the results the recorded work leaves on the GPU
     // (storage images stay there; buffer ranges are noted so CPU reads wait); WriteBackBuffers runs

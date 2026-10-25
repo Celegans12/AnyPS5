@@ -7131,6 +7131,10 @@ struct DrawSnapshotCounters {
     std::array<std::atomic<std::uint64_t>, DrawSnapshotPaths> bytes{};
     std::array<std::atomic<std::uint64_t>, OwnedSnapshotMisses> misses{};
     std::atomic<std::uint64_t> armed{0}, refused{0};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ShaderResources::DrawInputPath::Count)> inputCount{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ShaderResources::DrawInputPath::Count)> inputBytes{};
+    std::array<std::atomic<std::uint64_t>, OwnedSnapshotMisses> inputMisses{};
+    std::atomic<std::uint64_t> inputArmed{0}, inputRefused{0};
     std::atomic<std::int64_t> lastReport{0};
 };
 
@@ -7171,6 +7175,35 @@ void reportDrawSnapshots(const Recorder& recorder) {
     AgcDriver::ProfilePrint_nid_no_patch("[draw-snapshots] last 10 s (APS5_NO_OWNED_DRAW_SNAPSHOTS %s): uploads %llu (%.1f MiB copied), tracked reuses %llu (%.1f MiB), owned reuses %llu (%.1f MiB not copied), copies of tracked memory %llu (%.1f MiB), copies of untracked memory %llu (%.1f MiB); owned misses: absent %llu, backing off %llu, words moved %llu, stamps moved %llu, mapping %llu; armed %llu, arms refused %llu; %.0f MiB owned copies held\n", RuntimeSwitches::Set(RuntimeSwitch::NoOwnedDrawSnapshots) ? "set" : "unset", count[at(Path::Upload)], mib[at(Path::Upload)], count[at(Path::TrackedHit)], mib[at(Path::TrackedHit)], count[at(Path::OwnedHit)], mib[at(Path::OwnedHit)], count[at(Path::TrackedCopy)], mib[at(Path::TrackedCopy)], count[at(Path::UntrackedCopy)], mib[at(Path::UntrackedCopy)], misses[at(Miss::Absent)], misses[at(Miss::BackingOff)], misses[at(Miss::WordsMoved)], misses[at(Miss::StampsMoved)], misses[at(Miss::Mapping)], static_cast<unsigned long long>(armed - previousArmed), static_cast<unsigned long long>(refused - previousRefused), static_cast<double>(recorder.OwnedSnapshotBytes()) / (1024.0 * 1024.0));
     previousArmed = armed;
     previousRefused = refused;
+    constexpr std::size_t InputPaths = static_cast<std::size_t>(ShaderResources::DrawInputPath::Count);
+    static std::array<std::uint64_t, InputPaths> previousInputCount{}, previousInputBytes{};
+    static std::array<std::uint64_t, OwnedSnapshotMisses> previousInputMisses{};
+    static std::uint64_t previousInputArmed = 0, previousInputRefused = 0, previousVerified = 0, previousDiffering = 0;
+    std::array<unsigned long long, InputPaths> inputCount{};
+    std::array<double, InputPaths> inputMib{};
+    for (std::size_t index = 0; index < InputPaths; ++index) {
+        const auto c = counters.inputCount[index].load();
+        const auto b = counters.inputBytes[index].load();
+        inputCount[index] = static_cast<unsigned long long>(c - previousInputCount[index]);
+        inputMib[index] = static_cast<double>(b - previousInputBytes[index]) / (1024.0 * 1024.0);
+        previousInputCount[index] = c;
+        previousInputBytes[index] = b;
+    }
+    std::array<unsigned long long, OwnedSnapshotMisses> inputMisses{};
+    for (std::size_t index = 0; index < OwnedSnapshotMisses; ++index) {
+        const auto m = counters.inputMisses[index].load();
+        inputMisses[index] = static_cast<unsigned long long>(m - previousInputMisses[index]);
+        previousInputMisses[index] = m;
+    }
+    const auto inputArmed = counters.inputArmed.load();
+    const auto inputRefused = counters.inputRefused.load();
+    const auto verify = Recorder::OwnedSnapshotVerifyCounts();
+    using Input = ShaderResources::DrawInputPath;
+    AgcDriver::ProfilePrint_nid_no_patch("[draw-snapshots] vertex and index inputs, last 10 s (APS5_NO_OWNED_VERTEX_INPUTS %s): tracked reuses %llu (%.1f MiB), owned reuses %llu (%.1f MiB not copied), copies of tracked memory %llu (%.1f MiB), copies of untracked memory %llu (%.1f MiB); owned misses: absent %llu, backing off %llu, words moved %llu, stamps moved %llu, mapping %llu; armed %llu, arms refused %llu; owned verify (both kinds) %llu checked, %llu differing\n", RuntimeSwitches::Set(RuntimeSwitch::NoOwnedVertexInputs) ? "set" : "unset", inputCount[at(Input::TrackedHit)], inputMib[at(Input::TrackedHit)], inputCount[at(Input::OwnedHit)], inputMib[at(Input::OwnedHit)], inputCount[at(Input::TrackedCopy)], inputMib[at(Input::TrackedCopy)], inputCount[at(Input::UntrackedCopy)], inputMib[at(Input::UntrackedCopy)], inputMisses[at(Miss::Absent)], inputMisses[at(Miss::BackingOff)], inputMisses[at(Miss::WordsMoved)], inputMisses[at(Miss::StampsMoved)], inputMisses[at(Miss::Mapping)], static_cast<unsigned long long>(inputArmed - previousInputArmed), static_cast<unsigned long long>(inputRefused - previousInputRefused), static_cast<unsigned long long>(verify[0] - previousVerified), static_cast<unsigned long long>(verify[1] - previousDiffering));
+    previousInputArmed = inputArmed;
+    previousInputRefused = inputRefused;
+    previousVerified = verify[0];
+    previousDiffering = verify[1];
 }
 
 bool DrawSnapshotsProfiled() {
@@ -7214,6 +7247,17 @@ void verifyGpuSource(const Context& context, Recorder& recorder, const GuestBuff
     });
 }
 
+}
+
+void ShaderResources::CountDrawInputPath(DrawInputPath path, std::size_t bytes, std::uint8_t ownedMiss, bool owned, bool armed) {
+    if (!DrawSnapshotsProfiled()) return;
+    auto& counters = SnapshotPathCounts();
+    counters.inputCount[static_cast<std::size_t>(path)].fetch_add(1, std::memory_order_relaxed);
+    counters.inputBytes[static_cast<std::size_t>(path)].fetch_add(bytes, std::memory_order_relaxed);
+    if (!owned) return;
+    if (ownedMiss < OwnedSnapshotMisses) counters.inputMisses[ownedMiss].fetch_add(1, std::memory_order_relaxed);
+    if (armed) counters.inputArmed.fetch_add(1, std::memory_order_relaxed);
+    else if (ownedMiss != static_cast<std::uint8_t>(Recorder::OwnedSnapshotMiss::BackingOff)) counters.inputRefused.fetch_add(1, std::memory_order_relaxed);
 }
 
 std::size_t ShaderResources::MaxDrawSnapshotBytes() {

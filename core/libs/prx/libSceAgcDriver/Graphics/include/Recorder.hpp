@@ -333,11 +333,16 @@ public:
     // words moved backs off arming (2^n - 1 misses, n <= 6); a hit clears the back-off.
     // `arm`: whether the caller should arm and keep its copy.
     static constexpr std::size_t OwnedSnapshotBudget = std::size_t{1024} << 20u;
-    static constexpr std::size_t OwnedSnapshotEntries = 8192;
+    // Vertex and index inputs (CopyDrawInput, APS5_NO_OWNED_VERTEX_INPUTS=1 off) share the cache, keyed
+    // by their use as well and keeping the derived word (an index buffer's highest index).
+    // APS5_VERIFY_OWNED_SNAPSHOTS=<n>: the first n hits per 10 s also compare the copy with guest
+    // memory (counted, a difference printed).
+    static constexpr std::size_t OwnedSnapshotEntries = 16384;
     enum class OwnedSnapshotMiss : std::uint8_t { None, Absent, BackingOff, WordsMoved, StampsMoved, Mapping, Count };
-    std::shared_ptr<Buffer> OwnedDrawSnapshot(std::uint64_t address, std::size_t bytes, bool& arm, OwnedSnapshotMiss& miss);
-    void KeepOwnedDrawSnapshot(std::uint64_t address, std::size_t bytes, std::vector<std::uint64_t> words, std::uint64_t since, std::uint64_t registryGeneration, std::uint64_t forgetSerial, std::shared_ptr<Buffer> buffer);
-    void RefuseOwnedDrawSnapshot(std::uint64_t address, std::size_t bytes);
+    std::shared_ptr<Buffer> OwnedDrawSnapshot(std::uint64_t address, std::size_t bytes, bool& arm, OwnedSnapshotMiss& miss, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr);
+    void KeepOwnedDrawSnapshot(std::uint64_t address, std::size_t bytes, std::vector<std::uint64_t> words, std::uint64_t since, std::uint64_t registryGeneration, std::uint64_t forgetSerial, std::shared_ptr<Buffer> buffer, SnapshotUse use = SnapshotUse::Storage, std::uint32_t derived = 0);
+    void RefuseOwnedDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage);
+    static std::array<std::uint64_t, 2> OwnedSnapshotVerifyCounts();
     std::size_t OwnedSnapshotBytes() const { return ownedSnapshotBytes; }
     static constexpr std::size_t DrawUploadChunk = std::size_t{1} << 20u;
     struct UploadSlice {
@@ -1254,7 +1259,7 @@ private:
         VkDeviceSize offset = 0;
     };
     std::unordered_map<std::uint64_t, UnwrittenSnapshot> unwrittenSnapshots;
-    using OwnedSnapshotKey = std::pair<std::uint64_t, std::size_t>;
+    using OwnedSnapshotKey = std::tuple<std::uint64_t, std::size_t, SnapshotUse>;
     struct OwnedSnapshot {
         std::vector<std::uint64_t> words;
         std::uint64_t since = 0;
@@ -1264,6 +1269,7 @@ private:
         std::list<OwnedSnapshotKey>::iterator recent;
         std::uint8_t backoff = 0;
         std::uint16_t skip = 0;
+        std::uint32_t derived = 0;
     };
     std::map<OwnedSnapshotKey, OwnedSnapshot> ownedSnapshots;
     std::list<OwnedSnapshotKey> ownedSnapshotRecency;

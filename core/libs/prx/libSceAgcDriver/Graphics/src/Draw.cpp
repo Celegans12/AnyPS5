@@ -1359,11 +1359,25 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
         GuestMemory::FlushGpuWrites(address, bytes);
         copy.registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         copy.generation = GuestMemory::CollectWrites(address, bytes);
+        const bool owned = copy.generation == 0 && !RuntimeSwitches::Set(RuntimeSwitch::NoOwnedVertexInputs) && !recorder->PendingWriteOverlaps(address, bytes);
+        auto miss = Recorder::OwnedSnapshotMiss::None;
         if (copy.generation != 0) copy.buffer = recorder->ReusableDrawSnapshot(address, bytes, use, &copy.derived);
+        else if (owned) copy.buffer = recorder->OwnedDrawSnapshot(address, bytes, copy.ownedArm, miss, use, &copy.derived);
         if (copy.buffer != nullptr) {
             copy.reused = true;
+            ShaderResources::CountDrawInputPath(owned ? ShaderResources::DrawInputPath::OwnedHit : ShaderResources::DrawInputPath::TrackedHit, bytes, static_cast<std::uint8_t>(miss), false, false);
             return copy;
         }
+        if (owned && copy.ownedArm) {
+            copy.ownedWords.resize(GuestMemory::HashBlockCount(address, bytes));
+            if (GuestMemory::ArmOwnedBlocks(address, bytes, copy.ownedWords, !RuntimeSwitches::Set(RuntimeSwitch::NoOwnedPrivate))) {
+                copy.ownedForget = GuestMemory::ForgetSerial();
+                copy.ownedSince = GuestMemory::TrackerGeneration();
+            } else {
+                copy.ownedWords.clear();
+            }
+        }
+        ShaderResources::CountDrawInputPath(copy.generation != 0 ? ShaderResources::DrawInputPath::TrackedCopy : ShaderResources::DrawInputPath::UntrackedCopy, bytes, static_cast<std::uint8_t>(miss), owned, owned && !copy.ownedWords.empty());
     }
     const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::DrawSnapshot);
     copy.buffer = std::make_shared<Buffer>(context, bytes, use == Recorder::SnapshotUse::Vertex ? VK_BUFFER_USAGE_VERTEX_BUFFER_BIT : VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
@@ -1390,7 +1404,12 @@ DrawInputCopy CopyZeroPaddedDrawInput(const Context& context, std::uint64_t addr
 }
 
 void KeepDrawInput(Recorder* recorder, std::uint64_t address, const DrawInputCopy& copy, Recorder::SnapshotUse use, std::uint32_t derived) {
-    if (recorder == nullptr || copy.reused || copy.generation == 0 || copy.buffer == nullptr) return;
+    if (recorder == nullptr || copy.reused || copy.buffer == nullptr) return;
+    if (copy.generation == 0) {
+        if (!copy.ownedWords.empty()) recorder->KeepOwnedDrawSnapshot(address, copy.buffer->Bytes().size(), copy.ownedWords, copy.ownedSince, copy.registryGeneration, copy.ownedForget, copy.buffer, use, derived);
+        else if (copy.ownedArm) recorder->RefuseOwnedDrawSnapshot(address, copy.buffer->Bytes().size(), use);
+        return;
+    }
     recorder->KeepDrawSnapshot(address, copy.buffer->Bytes().size(), copy.generation, copy.registryGeneration, copy.buffer, use, derived);
 }
 

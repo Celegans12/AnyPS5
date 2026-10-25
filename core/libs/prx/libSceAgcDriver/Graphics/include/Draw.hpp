@@ -60,6 +60,10 @@ struct DrawInputCopy {
     std::uint32_t derived = 0;
     std::uint64_t generation = 0;
     std::uint64_t registryGeneration = 0;
+    std::vector<std::uint64_t> ownedWords;
+    std::uint64_t ownedSince = 0;
+    std::uint64_t ownedForget = 0;
+    bool ownedArm = false;
 };
 DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use);
 DrawInputCopy CopyZeroPaddedDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t validBytes, std::size_t stride = 0);
