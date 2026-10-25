@@ -120,7 +120,7 @@ FrameCall decodeCall(FrameCallKind kind, std::span<const std::byte> payload) {
 }
 
 bool knownCall(std::uint32_t kind) {
-    return kind >= static_cast<std::uint32_t>(FrameCallKind::RegisterShader) && kind <= static_cast<std::uint32_t>(FrameCallKind::UnregisterVideoOutput);
+    return kind >= static_cast<std::uint32_t>(FrameCallKind::RegisterShader) && kind <= static_cast<std::uint32_t>(FrameCallKind::QueueStates);
 }
 
 std::vector<std::byte> readFile(const std::filesystem::path& path) {
@@ -174,6 +174,7 @@ std::string_view FrameCallName(FrameCallKind kind) {
     case FrameCallKind::FrameStart: return "frame-start";
     case FrameCallKind::End: return "end";
     case FrameCallKind::DisplayBuffer: return "display-buffer";
+    case FrameCallKind::QueueStates: return "queue-states";
     }
     throw std::runtime_error("frame capture: unknown call kind " + std::to_string(static_cast<std::uint32_t>(kind)));
 }
