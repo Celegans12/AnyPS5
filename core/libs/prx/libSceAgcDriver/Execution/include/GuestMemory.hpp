@@ -103,7 +103,8 @@ bool CommittedBlocksMatchSince(std::uint64_t address, std::size_t bytes, std::sp
 bool ArmOwnedBlocks(std::uint64_t address, std::size_t bytes, std::span<std::uint64_t> words, bool allowPrivate = true);
 bool OwnedWordsHold(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> words);
 bool OwnedProofHolds(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> words, std::uint64_t since);
-// Arms (all blocks armed), blocks newly write-protected (of them with private pages), arms refused
+// Arms (all blocks armed), blocks newly armed (of them with private pages, with nothing mapped, partly
+// mapped: placeholders are proved by the word alone, see WindowsMappings::ownable), arms refused
 // (by reason: outside the arena or a host region, shared or aliased view, pinned or importing, host
 // write open, protection change in flight, not writable or another mapping type, private while not
 // allowed, nothing mapped), blocks disarmed by a CPU store, blocks disarmed by a mapping, protection
@@ -115,6 +116,8 @@ struct OwnedBlockCounts {
     std::uint64_t faults = 0;
     std::uint64_t disowned = 0;
     std::uint64_t privateBlocks = 0;
+    std::uint64_t unmappedBlocks = 0;
+    std::uint64_t partialBlocks = 0;
     std::array<std::uint64_t, 8> refusedBy{};
 };
 OwnedBlockCounts TakeOwnedBlockCounts();

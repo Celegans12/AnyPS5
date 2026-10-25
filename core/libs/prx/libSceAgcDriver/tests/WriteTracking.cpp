@@ -1976,7 +1976,7 @@ struct DirectFixture {
         Require(memory != nullptr, "cannot reserve the owned-proof fixture");
         section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, static_cast<DWORD>(bytes), nullptr);
         Require(section != nullptr, "cannot create the owned-proof backing");
-        Map(0, mappedBytes);
+        if (mappedBytes != 0) Map(0, mappedBytes);
     }
     ~DirectFixture() {
         GuestArena::GuestArenaReset_nid_postfix(memory, bytes);
@@ -2014,7 +2014,7 @@ struct PrivateFixture {
     PrivateFixture(std::size_t bytes, std::size_t committed) : bytes(bytes) {
         memory = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, Block));
         Require(memory != nullptr, "cannot reserve the private owned-proof fixture");
-        Commit(0, committed);
+        if (committed != 0) Commit(0, committed);
     }
     ~PrivateFixture() {
         GuestArena::GuestArenaReset_nid_postfix(memory, bytes);
@@ -2135,11 +2135,47 @@ void CheckOwnedPrivate() {
         GuestArena::GuestArenaSetProtection_nid_postfix(fixture.Base(), Block, PAGE_READWRITE);
         Require(ArmOwned(fixture.Base(), Block).empty() && TakeOwnedBlockCounts().refusedBy[ReasonInFlight] == 1, "a block was armed during a protection change or not counted");
         GuestArena::GuestArenaEndSetProtection_nid_no_patch(fixture.Base(), Block);
-        auto* reserved = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(Block, Block));
-        Require(ArmOwned(reinterpret_cast<std::uint64_t>(reserved), Block).empty() && TakeOwnedBlockCounts().refusedBy[ReasonEmpty] == 1, "a block with nothing mapped was armed or not counted");
-        GuestArena::GuestArenaRelease_nid_postfix(reserved, Block);
     }
-    std::cout << "owned proofs: private memory armed when allowed, read-only as it is; inaccessible, pinned, host-written, outside, in-flight and empty blocks refused by reason\n";
+    // Unmapped blocks (sparse and partly committed surfaces) are armed by the word alone; committing
+    // or mapping into one moves its word first, and a mixed block keeps its mapped pages protected.
+    {
+        PrivateFixture fixture(3 * Block, 0);
+        const auto base = fixture.Base();
+        TakeOwnedBlockCounts();
+        const auto words = ArmOwned(base, 3 * Block);
+        Require(words.size() == 3, "unmapped blocks could not be armed");
+        const auto counts = TakeOwnedBlockCounts();
+        Require(counts.unmappedBlocks == 3 && counts.partialBlocks == 0 && counts.refused == 0, "unmapped blocks were not counted as armed unmapped");
+        Require(OwnedWordsHold(base, 3 * Block, words), "armed unmapped blocks do not hold");
+        fixture.Commit(Block + 16384, 16384);
+        Require(!OwnedWordsHold(base + Block, Block, std::span(words).subspan(1, 1)) && OwnedWordsHold(base, Block, std::span(words).first(1)) && OwnedWordsHold(base + 2 * Block, Block, std::span(words).subspan(2, 1)), "a commit into an armed unmapped block left its word or moved others");
+        fixture.At(Block + 16384) = 4;
+        Require(fixture.At(Block + 16384) == 4 && fixture.Protection(Block + 16384) == PAGE_READWRITE, "the page committed into an armed unmapped block is not plain writable memory");
+        const auto mixed = ArmOwned(base + Block, Block);
+        Require(mixed.size() == 1 && TakeOwnedBlockCounts().partialBlocks == 1, "a partly committed block was not armed as partly mapped");
+        Require(fixture.Protection(Block + 16384) == PAGE_READONLY, "the mapped page of a mixed block was not protected");
+        fixture.At(Block + 16385) = 5;
+        Require(!OwnedWordsHold(base + Block, Block, mixed) && fixture.At(Block + 16385) == 5, "a store into the mapped page of a mixed block was missed");
+    }
+    // Direct memory mapped into an armed unmapped block moves its word.
+    {
+        DirectFixture fixture(Block, 0);
+        const auto base = fixture.Base();
+        const auto words = ArmOwned(base, Block);
+        Require(words.size() == 1, "an unmapped block for direct memory could not be armed");
+        fixture.Map(0, 16384);
+        Require(!OwnedWordsHold(base, Block, words), "mapping direct memory into an armed unmapped block left its word");
+    }
+    // An unmapped block inside a pinned range (a guest stack's reserve) is refused.
+    {
+        PrivateFixture fixture(Block, 0);
+        const auto base = fixture.Base();
+        GuestArena::GuestArenaPinWritable_nid_postfix(fixture.memory, Block);
+        TakeOwnedBlockCounts();
+        Require(ArmOwned(base, Block).empty() && TakeOwnedBlockCounts().refusedBy[ReasonPinned] == 1, "an unmapped pinned block was armed or not counted as pinned");
+        GuestArena::GuestArenaUnpinWritable_nid_postfix(fixture.memory, Block);
+    }
+    std::cout << "owned proofs: private memory armed when allowed, read-only as it is; inaccessible, pinned, host-written, outside and in-flight blocks refused by reason; unmapped and partly mapped blocks armed\n";
 }
 
 void CheckOwnedStampOnWrite() {
@@ -2286,9 +2322,10 @@ void CheckOwnedMappingChanges() {
         Require(!words.empty(), "cannot arm the decommit fixture");
         GuestArena::GuestArenaReset_nid_postfix(fixture.memory, 2 * Block);
         Require(!OwnedWordsHold(base, 2 * Block, words), "an unmap of armed memory left its words");
-        Require(ArmOwned(base, 2 * Block).empty(), "unmapped memory was armed");
+        const auto unmapped = ArmOwned(base, 2 * Block);
+        Require(unmapped.size() == 2 && unmapped != words, "unmapped memory was not armed afresh");
         fixture.Map(0, 2 * Block);
-        Require(!OwnedWordsHold(base, 2 * Block, words), "remapped memory kept the old words");
+        Require(!OwnedWordsHold(base, 2 * Block, words) && !OwnedWordsHold(base, 2 * Block, unmapped), "remapped memory kept the old words");
         Require(!ArmOwned(base, 2 * Block).empty(), "remapped memory cannot be armed");
     }
     // A block with an unmapped placeholder page is armed; mapping the page moves its word.

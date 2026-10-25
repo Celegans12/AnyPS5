@@ -404,7 +404,7 @@ public:
     // requires), so an OS call can never store into an armed page unseen: it is opened first, or it
     // fails. Refused, arming nothing (OwnedRefusal, counted): shared or aliased views, pinned pages
     // (guest stacks, which host code runs on) and imports being made, open host writes, inaccessible,
-    // guarded or write-copy pages or other mapping types, blocks with nothing mapped, and any block while a guest
+    // guarded or write-copy pages or other mapping types, and any block while a guest
     // protection change is in flight (between SetProtection and EndSetProtection the guest's own
     // VirtualProtect may still land). Subpages whose write tracking Collect armed are read-only already
     // and stay that mechanism's (see ownable).
@@ -421,6 +421,8 @@ public:
         std::uint64_t faults = 0;
         std::uint64_t disowned = 0;
         std::uint64_t privateBlocks = 0;
+        std::uint64_t unmappedBlocks = 0;
+        std::uint64_t partialBlocks = 0;
         std::array<std::uint64_t, OwnedRefusalCount> reasons{};
     };
 
@@ -448,6 +450,8 @@ public:
             ++ownedLive;
             ownedArmedBlocks.fetch_add(1, std::memory_order_relaxed);
             if (plan.privatePages) ownedPrivateBlocks.fetch_add(1, std::memory_order_relaxed);
+            if (!plan.mapped) ownedUnmappedBlocks.fetch_add(1, std::memory_order_relaxed);
+            else if (plan.unmapped) ownedPartialBlocks.fetch_add(1, std::memory_order_relaxed);
         }
         std::size_t index = 0;
         for (auto block = first; block < stop; block += ownedBlockBytes, ++index) words[index] = ownedWord(block);
@@ -479,7 +483,7 @@ public:
     }
 
     OwnedCounts TakeOwnedCounts() {
-        OwnedCounts counts{ownedArms.exchange(0, std::memory_order_relaxed), ownedArmedBlocks.exchange(0, std::memory_order_relaxed), ownedRefused.exchange(0, std::memory_order_relaxed), ownedFaults.exchange(0, std::memory_order_relaxed), ownedDisowned.exchange(0, std::memory_order_relaxed), ownedPrivateBlocks.exchange(0, std::memory_order_relaxed), {}};
+        OwnedCounts counts{ownedArms.exchange(0, std::memory_order_relaxed), ownedArmedBlocks.exchange(0, std::memory_order_relaxed), ownedRefused.exchange(0, std::memory_order_relaxed), ownedFaults.exchange(0, std::memory_order_relaxed), ownedDisowned.exchange(0, std::memory_order_relaxed), ownedPrivateBlocks.exchange(0, std::memory_order_relaxed), ownedUnmappedBlocks.exchange(0, std::memory_order_relaxed), ownedPartialBlocks.exchange(0, std::memory_order_relaxed), {}};
         for (std::size_t i = 0; i < OwnedRefusalCount; ++i) counts.reasons[i] = ownedReasons[i].exchange(0, std::memory_order_relaxed);
         return counts;
     }
@@ -881,6 +885,8 @@ private:
     struct OwnedPlan {
         OwnedPages pages;
         bool privatePages = false;
+        bool mapped = false;
+        bool unmapped = false;
     };
 
     static bool overlapsRange(const std::multimap<std::uintptr_t, std::uintptr_t>& ranges, std::uintptr_t begin, std::uintptr_t end) {
@@ -899,12 +905,15 @@ private:
     }
 
     // Every 16 KiB page a single resident view that may be write-protected, else 4 KiB pages that
-    // are private commits (with `allowPrivate`) or reserved placeholders; at least one view or private
-    // page. Views and pages may be read-write or read-only (with or without execute). Subpages Collect armed (`armed`, read-only already) stay that mechanism's: an
+    // are private commits (with `allowPrivate`) or reserved placeholders. Views and pages may be
+    // read-write or read-only (with or without execute). Placeholders need no protection: the CPU
+    // cannot store into an unmapped page, and every path that makes one present (Commit, Map and so
+    // Reset's placeholder splits) disarms the block first, so a block of placeholders only, or the
+    // unmapped part of a mixed one, is proved by its word alone. Pinned ranges (guest stacks, whose
+    // pages libkernel commits itself at thread exit) are refused whatever their kind. Subpages Collect armed (`armed`, read-only already) stay that mechanism's: an
     // owned block's disarm restores only the others, and a store into an armed one still goes on to
     // resume the run's writes (HandleWrite).
     OwnedRefusal ownable(std::uintptr_t block, bool allowPrivate, OwnedPlan& plan) {
-        bool any = false;
         const auto end = block + ownedBlockBytes;
         for (auto at = block; at < end; at += pageBytes) {
             const auto found = views.find(at);
@@ -914,7 +923,7 @@ private:
                 if (!ownedReadable(view.protection)) return OwnedRefusal::NotWritable;
                 if (view.hostWrites != 0) return OwnedRefusal::HostWrite;
                 if (view.hostImports != 0 || view.page->pins != 0) return OwnedRefusal::Pinned;
-                any = true;
+                plan.mapped = true;
                 continue;
             }
             for (auto cursor = at; cursor < at + pageBytes;) {
@@ -926,18 +935,17 @@ private:
                     for (auto page = cursor; page < stop; page += subpageBytes) plan.pages.protection[(page - block) / subpageBytes] = memory.Protect;
                     plan.pages.starts |= std::uint32_t{1} << ((cursor - block) / subpageBytes);
                     plan.privatePages = true;
-                    any = true;
-                } else if (memory.State != MEM_RESERVE) {
+                    plan.mapped = true;
+                } else if (memory.State == MEM_RESERVE) {
+                    plan.unmapped = true;
+                } else {
                     return OwnedRefusal::NotWritable;
                 }
                 cursor = stop;
             }
         }
-        if (!any) return OwnedRefusal::Empty;
-        if (plan.privatePages) {
-            if (overlapsRange(pinnedRanges, block, end)) return OwnedRefusal::Pinned;
-            if (overlapsRange(hostAccess, block, end)) return OwnedRefusal::HostWrite;
-        }
+        if (overlapsRange(pinnedRanges, block, end)) return OwnedRefusal::Pinned;
+        if (plan.privatePages && overlapsRange(hostAccess, block, end)) return OwnedRefusal::HostWrite;
         return OwnedRefusal::None;
     }
 
@@ -1404,6 +1412,8 @@ private:
     std::atomic<std::uint64_t> ownedFaults{0};
     std::atomic<std::uint64_t> ownedDisowned{0};
     std::atomic<std::uint64_t> ownedPrivateBlocks{0};
+    std::atomic<std::uint64_t> ownedUnmappedBlocks{0};
+    std::atomic<std::uint64_t> ownedPartialBlocks{0};
     std::array<std::atomic<std::uint64_t>, OwnedRefusalCount> ownedReasons{};
     std::map<std::uintptr_t, OwnedPages> ownedPrivatePages;
     std::multimap<std::uintptr_t, std::uintptr_t> pinnedRanges;

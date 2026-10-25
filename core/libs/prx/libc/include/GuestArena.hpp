@@ -76,13 +76,14 @@ void GuestArenaPrepareHostRead_nid_no_patch(const void* pointer, std::size_t byt
 // a block that cannot be armed, outside the arena, or not Windows). Flag 1 lets private commits be
 // armed. OwnedUnchanged: whether every block still holds the word armed (no CPU store since, no
 // mapping or protection change). Counts, since the last call, up to `count` values: arms, blocks
-// newly armed, refusals, disarms by a store, other disarms, blocks armed with private pages, then
-// refusals by reason (WindowsMappings::OwnedRefusal: none, outside the arena or a host region,
-// shared or aliased view, pinned or importing, host write open, protection change in flight, not
-// writable or another mapping type, private with flag 1 clear, nothing mapped).
+// newly armed, refusals, disarms by a store, other disarms, blocks armed with private pages, blocks
+// armed with nothing mapped, blocks armed partly mapped, then refusals by reason
+// (WindowsMappings::OwnedRefusal: none, outside the arena or a host region, shared or aliased view,
+// pinned or importing, host write open, protection change in flight, not writable or another
+// mapping type, private with flag 1 clear, nothing mapped (no longer refused)).
 // EndSetProtection ends the guest protection change that GuestArenaSetProtection began, after the
 // caller's own protection call.
-inline constexpr std::size_t GuestArenaOwnedCountSlots = 15;
+inline constexpr std::size_t GuestArenaOwnedCountSlots = 17;
 bool GuestArenaArmOwned_nid_no_patch(std::uintptr_t address, std::size_t bytes, std::uint64_t* words, std::size_t count, unsigned flags);
 bool GuestArenaOwnedUnchanged_nid_no_patch(std::uintptr_t address, std::size_t bytes, const std::uint64_t* words, std::size_t count);
 void GuestArenaTakeOwnedCounts_nid_no_patch(std::uint64_t* counts, std::size_t count);
