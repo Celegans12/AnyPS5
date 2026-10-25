@@ -62,7 +62,7 @@ struct Options {
     bool exact = false;
     std::chrono::milliseconds paceTimeout{10000};
     std::chrono::milliseconds memoryPaceTimeout{10000};
-    std::chrono::milliseconds releaseAfter{3};
+    std::chrono::milliseconds releaseAfter{50};
     std::chrono::milliseconds drainTimeout{10000};
     std::chrono::seconds timeout{900};
     bool release = true;
@@ -347,15 +347,21 @@ struct Replay {
         const auto timeout = memory ? options.memoryPaceTimeout : options.paceTimeout;
         auto lastCompleted = progress().second;
         auto deadline = began + timeout;
+        auto quietSince = began;
         const auto waited = [&] { paceWaitedNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - began).count(); };
         while (true) {
             const auto [accepted, completed] = progress();
-            if (accepted - completed <= inFlight) return waited();
+            if (accepted - completed <= inFlight) {
+                if (options.exact && accepted == completed) AgcDriverWaitIdle_nid_postfix();
+                return waited();
+            }
             const auto now = Clock::now();
             if (completed != lastCompleted) {
                 lastCompleted = completed;
                 deadline = now + timeout;
+                quietSince = now;
             }
+            if (now - quietSince >= (options.exact ? ExactQuiet : BlockedQuiet) && blockedOnWaits()) return waited();
             if (now >= deadline) {
                 waited();
                 if (memory) {
@@ -375,6 +381,20 @@ struct Replay {
             }
             std::this_thread::sleep_for(std::chrono::microseconds(50));
         }
+    }
+
+    static constexpr auto ExactQuiet = std::chrono::milliseconds(50);
+    static constexpr auto BlockedQuiet = std::chrono::milliseconds(5);
+
+    bool blockedOnWaits() {
+        std::lock_guard lock(memoryMutex);
+        std::array<AgcDriver::AwaitedWait, 64> awaited{};
+        const auto count = AgcDriverAwaitedWaits_nid_postfix(awaited.data(), awaited.size());
+        for (std::size_t slot = 0; slot < count; ++slot) {
+            const auto& wait = awaited[slot];
+            if (wait.address != 0 && (wait.function == 0 || !satisfies(wait, load(wait.address, wait.bytes == 8 ? 8 : 4)))) return true;
+        }
+        return false;
     }
 
     void execute(const FrameCall& call) {
@@ -520,7 +540,14 @@ struct Replay {
             }
             if (!released && options.synthesize) {
                 if (const auto value = satisfying(wait, load(wait.address, bytes))) {
+                    const auto before = load(wait.address, bytes);
                     std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(wait.address)), &*value, bytes);
+                    if (syntheticReleases.load() < 64) {
+                        const auto [accepted, completed] = progress();
+                        std::fprintf(stderr, "[frame-replay] synthesized 0x%llx: 0x%llx -> 0x%llx (function %u, reference 0x%llx, mask 0x%llx) at call %zu, serials %llu/%llu\n", static_cast<unsigned long long>(wait.address),
+                                     static_cast<unsigned long long>(before), static_cast<unsigned long long>(*value), wait.function, static_cast<unsigned long long>(wait.reference), static_cast<unsigned long long>(wait.mask), from,
+                                     static_cast<unsigned long long>(completed), static_cast<unsigned long long>(accepted));
+                    }
                     ++syntheticReleases;
                     released = true;
                 }
@@ -541,16 +568,20 @@ struct Replay {
         std::thread breaker([&] {
             if (!options.release) return;
             auto lastCompleted = progress().second;
+            auto lastSequenced = sequenced.load();
             auto lastProgress = Clock::now();
+            const auto quiet = options.exact ? std::max<std::chrono::milliseconds>(options.releaseAfter, ExactQuiet * 4) : options.releaseAfter;
             while (!finished.load()) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 const auto completed = progress().second;
-                if (completed != lastCompleted) {
+                const auto issued = sequenced.load();
+                if (completed != lastCompleted || issued != lastSequenced) {
                     lastCompleted = completed;
+                    lastSequenced = issued;
                     lastProgress = Clock::now();
                     continue;
                 }
-                if (Clock::now() - lastProgress < options.releaseAfter) continue;
+                if (Clock::now() - lastProgress < quiet) continue;
                 releaseAwaited(calls, sequenced.load());
                 lastProgress = Clock::now();
             }
@@ -636,10 +667,11 @@ int usage() {
                          "  build's AGC driver with no title running, and prints one JSON line with the frame times\n"
                          "  --no-pace           issues calls without waiting for the in-flight depth the title had\n"
                          "  --no-release        never copies recorded CPU stores early to release a GPU wait\n"
-                         "  --release-after-ms  milliseconds without a completion before awaited dwords are released (3)\n"
+                         "  --release-after-ms  milliseconds without a completion or a newly issued call before awaited dwords are released (50; at least 200 with --exact)\n"
                          "  --no-synthesize     releases a wait only with a value the capture recorded, never with its reference value\n"
                          "  --strict            fails on a pacing timeout or a failed registration inside the captured frames\n"
-                         "  --exact             waits for every earlier submission to complete before each submission, flip and memory delta,\n"
+                         "  --exact             waits for every earlier submission and its GPU work to complete before each submission, flip and\n"
+                         "                      memory delta,\n"
                          "                      so the GPU work runs in one order (a reproducible baseline, slower than the title)\n"
                          "  --timeout-s <n>     exits with code 4 when the replay has no result after n seconds (900; 0 waits forever)\n"
                          "  --dump              writes guest memory to a file after the replay (hexadecimal or decimal)\n"
