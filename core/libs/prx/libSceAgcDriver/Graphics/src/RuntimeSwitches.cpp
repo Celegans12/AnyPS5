@@ -67,6 +67,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_NO_RUN_IN_PLACE",
     "APS5_DISPATCH_ITEM_BDA_WRITES",
     "APS5_NO_HIT_ITEM_HTILE_NOTE",
+    "APS5_GPU_ORDERED_WRITEBACKS",
 };
 
 struct Refusal {

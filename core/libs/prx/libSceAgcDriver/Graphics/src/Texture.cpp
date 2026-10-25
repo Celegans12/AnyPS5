@@ -134,6 +134,7 @@ std::atomic<std::uint64_t> pretestSkipped{0}, unregisteredDropped{0}, keyFlipKep
 // Storage refreshes whose flush recorded its write-backs behind the pending writer (APS5_DEFER_REFRESH_FLUSH).
 std::atomic<std::uint64_t> deferredRefreshFlushes{0};
 std::atomic<std::uint64_t> deferredFlipStores{0};
+std::atomic<std::uint64_t> deferredOrderedWriteBacks{0};
 std::atomic<std::uint64_t> queuedReadHeld{0}, heldReadSkips{0};
 // Images stored by a FlushPending after a hook skip of theirs (AccessKeptByCpu), of which by the
 // hook for the read site of the last skip; images evictStale dropped (the [hooksync] and [storage] lines).
@@ -182,7 +183,7 @@ void reportStorageTraffic(StorageTraffic& traffic) {
     const auto take = [](std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed)); };
     const auto partialUploadCount = take(partialUploads), partialWriteBackCount = take(partialWriteBacks);
     const auto uploadMiB = take(partialUploadBytes) / 1048576.0, writeBackMiB = take(partialWriteBackBytes) / 1048576.0;
-    AgcDriver::ProfilePrint_nid_no_patch( "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, handed over at %llu clear-key refreshes (%llu units superseded), dropped unregistered %llu, kept over a key flip %llu%s, pretest skipped %llu, held for a queued draw read %llu (%llu flushes with nothing to store skipped the check%s), evicted stale %llu, refresh flushes deferred %llu, flip stores deferred %llu\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(clearHandOvers), take(handedOverSuperseded), take(unregisteredDropped), take(keyFlipKept), ShadowReport().c_str(), take(pretestSkipped), take(queuedReadHeld), take(heldReadSkips), RuntimeSwitches::Set(RuntimeSwitch::NoHeldReadSkip) ? ", APS5_NO_HELD_READ_SKIP" : "", take(staleEvicted), take(deferredRefreshFlushes), take(deferredFlipStores));
+    AgcDriver::ProfilePrint_nid_no_patch( "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, handed over at %llu clear-key refreshes (%llu units superseded), dropped unregistered %llu, kept over a key flip %llu%s, pretest skipped %llu, held for a queued draw read %llu (%llu flushes with nothing to store skipped the check%s), evicted stale %llu, refresh flushes deferred %llu, flip stores deferred %llu, GPU-ordered write-backs %llu\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(clearHandOvers), take(handedOverSuperseded), take(unregisteredDropped), take(keyFlipKept), ShadowReport().c_str(), take(pretestSkipped), take(queuedReadHeld), take(heldReadSkips), RuntimeSwitches::Set(RuntimeSwitch::NoHeldReadSkip) ? ", APS5_NO_HELD_READ_SKIP" : "", take(staleEvicted), take(deferredRefreshFlushes), take(deferredFlipStores), take(deferredOrderedWriteBacks));
     traffic.writeBacks.clear();
     traffic.uploadReasons.clear();
     traffic.directWriteBacks = 0;
@@ -4377,6 +4378,19 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
     if ((deferFlip || (deferRefresh && reason != nullptr && std::strcmp(reason, "storage refresh") == 0)) && Recorder::Active() != nullptr && !Recorder::InCompletion()) {
         deferWriter = std::all_of(flush.begin(), flush.end(), [deferImported](const std::shared_ptr<StorageTexture>& texture) { return (texture->blockUnits || deferImported) && HostImportFor(texture->context, texture->descriptor.baseAddress, static_cast<std::size_t>(texture->guestBytes)) != nullptr; });
         if (deferWriter) (flipStore ? deferredFlipStores : deferredRefreshFlushes).fetch_add(1, std::memory_order_relaxed);
+    }
+    // APS5_GPU_ORDERED_WRITEBACKS=1 (runtime switch, opt-in): the same deferral for the stores of a label's or an
+    // interrupt's readback, a depth plane store, a storage image creation and an imported or written buffer range,
+    // when no pending write overlaps the stored units. The write-backs of host-imported images are recorded on the
+    // GPU and noted as pending writes whether or not the writer was waited for, so every consumer is ordered after
+    // them as before; with no pending write over the stored units, the wait would only have let pending readers
+    // finish (which run before the recorded write-back) and the write-back's own CPU checks read the same bytes.
+    static constexpr std::array<const char*, 6> OrderedReasons{"readback before label", "readback before interrupt", "depth plane store", "storage image creation", "imported buffer region", "written buffer range"};
+    if (auto* recorder = Recorder::Active(); !deferWriter && reason != nullptr && recorder != nullptr && !Recorder::InCompletion() && RuntimeSwitches::Set(RuntimeSwitch::GpuOrderedWriteBacks) && std::any_of(OrderedReasons.begin(), OrderedReasons.end(), [&](const char* name) { return std::strcmp(reason, name) == 0; })) {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> stored;
+        for (const auto& texture : flush) texture->appendStoredLayers(address, bytes, stored);
+        deferWriter = std::all_of(flush.begin(), flush.end(), [deferImported](const std::shared_ptr<StorageTexture>& texture) { return (texture->blockUnits || deferImported) && HostImportFor(texture->context, texture->descriptor.baseAddress, static_cast<std::size_t>(texture->guestBytes)) != nullptr; }) && std::none_of(stored.begin(), stored.end(), [recorder](const auto& range) { return recorder->PendingWriteOverlaps(range.first, static_cast<std::size_t>(range.second - range.first)); });
+        if (deferWriter) deferredOrderedWriteBacks.fetch_add(1, std::memory_order_relaxed);
     }
     if (auto* recorder = Recorder::Active(); !deferWriter && recorder != nullptr && !Recorder::InCompletion()) {
         try {
