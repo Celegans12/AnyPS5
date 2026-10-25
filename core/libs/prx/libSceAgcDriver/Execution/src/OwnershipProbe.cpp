@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/OwnershipProbe.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #ifdef _WIN32
@@ -13,6 +14,8 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -93,6 +96,44 @@ std::string ThreadName(std::uint32_t thread) {
 #endif
 }
 
+// The faulting thread's work as the driver tagged it (GuestMemory::SetCurrentPacket, ReadSiteScope):
+// bit 63 set, PM4 opcode in bits 0-31 (NoPacket for a thread that runs no packets, 0xffff the flip),
+// queue in 32-47, read site in 48-55. TEB slots only, so it is safe in the fault handler.
+std::uint64_t ProbeContext() {
+    const auto packet = GuestMemory::CurrentPacket();
+    return (std::uint64_t{1} << 63u) | packet.opcode | (std::uint64_t{packet.queue & 0xffffu} << 32u) | (std::uint64_t{static_cast<std::uint8_t>(GuestMemory::CurrentReadSite())} << 48u);
+}
+
+std::string ContextName(std::uint64_t context) {
+    if ((context >> 63u) == 0) return "no context";
+    const auto opcode = static_cast<std::uint32_t>(context);
+    const auto queue = static_cast<std::uint32_t>((context >> 32u) & 0xffffu);
+    const auto site = static_cast<GuestMemory::ReadSite>((context >> 48u) & 0xffu);
+    const auto* siteName = static_cast<std::size_t>(site) < static_cast<std::size_t>(GuestMemory::ReadSite::Count) ? GuestMemory::ReadSiteName(site) : "?";
+    char text[96];
+    if (opcode == GuestMemory::NoPacket) std::snprintf(text, sizeof(text), "no packet, site %s", siteName);
+    else if (opcode == 0xffffu) std::snprintf(text, sizeof(text), "flip q0x%x, site %s", queue, siteName);
+    else std::snprintf(text, sizeof(text), "pm4 0x%x q0x%x, site %s", opcode, queue, siteName);
+    return text;
+}
+
+std::string ModuleOf(std::uint64_t address) {
+    auto name = SiteName(address);
+    if (const auto plus = name.find('+'); plus != std::string::npos) name.erase(plus);
+    return name;
+}
+
+// The CRT and system DLLs a touch is charged through: the caller that matters is the first frame
+// outside them (memcpy/memcmp's caller).
+bool SystemModule(std::uint64_t address) {
+    auto name = ModuleOf(address);
+    for (auto& c : name) c = static_cast<char>(c >= 'A' && c <= 'Z' ? c - 'A' + 'a' : c);
+    for (const char* system : {"ucrtbase.dll", "ntdll.dll", "kernelbase.dll", "kernel32.dll", "vcruntime140.dll", "vcruntime140_1.dll", "msvcrt.dll", "libstdc++-6.dll", "libgcc_s_seh-1.dll", "libwinpthread-1.dll"}) {
+        if (name == system) return true;
+    }
+    return false;
+}
+
 std::uint64_t Median(std::vector<std::uint64_t>& values) {
     if (values.empty()) return 0;
     const auto middle = values.begin() + static_cast<std::ptrdiff_t>(values.size() / 2);
@@ -114,7 +155,12 @@ std::uint32_t RateFromEnvironment() {
     return static_cast<std::uint32_t>(rate);
 }
 
-Sampler::Sampler(std::uint32_t rate) : rate(rate) {}
+Sampler::Sampler(std::uint32_t rate) : rate(rate) {
+    if (rate == 0) return;
+    // Called once here so the TEB slots' indexes exist before the fault handler reads them.
+    static_cast<void>(ProbeContext());
+    GuestArena::GuestArenaSetProbeContextHook_nid_no_patch(&ProbeContext);
+}
 
 bool Sampler::Sampled(std::uint64_t unit) const {
     return rate != 0 && Mix(unit / Unit) % rate == 0;
@@ -160,6 +206,24 @@ std::string Sampler::Take(double seconds) {
         std::uint32_t thread = 0;
     };
     std::unordered_map<std::uint64_t, Site> sites;
+    // By caller: the first frame outside the CRT/system DLLs (the faulting RIP itself when it is
+    // outside them), with the thread's packet/site context; one example chain per caller.
+    struct Caller {
+        std::uint64_t reads = 0;
+        std::uint64_t writes = 0;
+        std::uint64_t underMs = 0;
+        std::uint32_t thread = 0;
+        std::vector<std::uint64_t> latency;
+        GuestArena::GuestArenaProbeEvent example{};
+    };
+    std::map<std::tuple<std::uint64_t, std::uint64_t>, Caller> callers;
+    std::map<std::string, std::uint64_t> callerModules;
+    std::unordered_map<std::uint64_t, bool> systemCache;
+    const auto system = [&](std::uint64_t address) {
+        const auto [it, inserted] = systemCache.try_emplace(address, false);
+        if (inserted) it->second = SystemModule(address);
+        return it->second;
+    };
     std::unordered_map<std::uint32_t, std::uint64_t> threads;
     std::unordered_set<std::uint64_t> readUnits;
     std::unordered_set<std::uint64_t> writtenUnits;
@@ -181,6 +245,23 @@ std::string Sampler::Take(double seconds) {
         (write ? site.writes : site.reads) += 1;
         site.thread = event.thread;
         ++threads[event.thread];
+        std::uint64_t caller = event.rip;
+        if (system(caller)) {
+            caller = 0;
+            for (std::size_t i = 0; i < event.frameCount && i < GuestArena::ProbeFrames; ++i) {
+                if (!system(event.frames[i])) {
+                    caller = event.frames[i];
+                    break;
+                }
+            }
+        }
+        auto& by = callers[{caller, event.context}];
+        (write ? by.writes : by.reads) += 1;
+        if (event.latencyUs < 1000) ++by.underMs;
+        by.latency.push_back(event.latencyUs);
+        by.thread = event.thread;
+        by.example = event;
+        ++callerModules[caller != 0 ? ModuleOf(caller) : std::string("unresolved")];
 #ifdef _WIN32
         if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(event.rip), &owner) && reinterpret_cast<std::uint64_t>(owner) == self) ++mainModule;
 #endif
@@ -231,6 +312,23 @@ std::string Sampler::Take(double seconds) {
         const auto name = ThreadName(site.thread);
         report += " " + SiteName(rip) + " r" + std::to_string(site.reads) + " w" + std::to_string(site.writes) + " (thread " + std::to_string(site.thread) + (name.empty() ? "" : " '" + name + "'") + ")";
         if (i + 1 < std::min<std::size_t>(ranked.size(), 8)) report += ";";
+    }
+    report += "\n";
+    std::vector<std::pair<std::tuple<std::uint64_t, std::uint64_t>, Caller*>> rankedCallers;
+    for (auto& [key, caller] : callers) rankedCallers.emplace_back(key, &caller);
+    std::sort(rankedCallers.begin(), rankedCallers.end(), [](const auto& a, const auto& b) { return a.second->reads + a.second->writes > b.second->reads + b.second->writes; });
+    report += "[ownership] callers (first frame outside the CRT, by caller and packet/site; top 12 of " + std::to_string(rankedCallers.size()) + "; touches by caller module:";
+    for (const auto& [module, count] : callerModules) report += " " + module + " " + std::to_string(count);
+    report += "):";
+    for (std::size_t i = 0; i < rankedCallers.size() && i < 12; ++i) {
+        const auto& [key, caller] = rankedCallers[i];
+        const auto& example = caller->example;
+        const auto name = ThreadName(caller->thread);
+        char head[160];
+        std::snprintf(head, sizeof(head), " r%llu w%llu <1ms %llu median %.1f ms", static_cast<unsigned long long>(caller->reads), static_cast<unsigned long long>(caller->writes), static_cast<unsigned long long>(caller->underMs), static_cast<double>(Median(caller->latency)) / 1000.0);
+        report += " " + (std::get<0>(key) != 0 ? SiteName(std::get<0>(key)) : std::string("unresolved")) + head + " (" + ContextName(std::get<1>(key)) + "; thread " + std::to_string(caller->thread) + (name.empty() ? "" : " '" + name + "'") + ") chain " + SiteName(example.rip);
+        for (std::size_t f = 0; f < example.frameCount && f < GuestArena::ProbeFrames; ++f) report += std::string(f < example.exactFrames ? " < " : " <~ ") + SiteName(example.frames[f]);
+        if (i + 1 < std::min<std::size_t>(rankedCallers.size(), 12)) report += ";";
     }
     report += "\n";
     gpuUnits.clear();

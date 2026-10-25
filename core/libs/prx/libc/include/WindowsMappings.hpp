@@ -726,7 +726,7 @@ public:
     // From the vectored handler: a guard fault (`guard`) or an access violation at `address`. A guard
     // fault of a block probed earlier but disarmed since is the probe's too: the system dropped that
     // page's guard, so the access goes on.
-    bool HandleProbe(std::uintptr_t address, bool write, bool guard, std::uintptr_t rip) {
+    bool HandleProbe(std::uintptr_t address, bool write, bool guard, const CONTEXT* context) {
         if (probeLive.load(std::memory_order_acquire) == 0 && !(guard && probeUsed.load(std::memory_order_acquire))) return false;
         std::lock_guard lock(mutex);
         const auto block = address & ~std::uintptr_t{ownedBlockBytes - 1};
@@ -739,7 +739,7 @@ public:
         auto& probe = found->second;
         if (!probe.writeArmed) {
             if (!guard) return false;
-            noteTouch(block, probe, write ? ProbeTouch::Write : ProbeTouch::Read, rip);
+            noteTouch(block, probe, write ? ProbeTouch::Write : ProbeTouch::Read, context);
             ++probeCounts.ends[static_cast<std::size_t>(write ? ProbeEnd::Write : ProbeEnd::Read)];
             const bool writable = std::any_of(probe.pages.protection.begin(), probe.pages.protection.end(), probeWritable);
             if (write || !writable) {
@@ -756,11 +756,15 @@ public:
             return true;
         }
         if (!write || !probeWritable(probe.pages.protection[(address - block) / subpageBytes])) return false;
-        noteTouch(block, probe, ProbeTouch::WriteAfterRead, rip);
+        noteTouch(block, probe, ProbeTouch::WriteAfterRead, context);
         ++probeCounts.afterReadWritten;
         protectPrivate(block, probe.pages, [](DWORD protection) { return protection; });
         eraseProbe(found);
         return true;
+    }
+
+    void SetProbeContextHook(std::uint64_t (*hook)()) {
+        probeContextHook.store(hook, std::memory_order_release);
     }
 
     bool NoteProbeRefusal(ProbeRefusal reason) {
@@ -1923,13 +1927,86 @@ private:
         return ticks / frequency * 1000000u + ticks % frequency * 1000000u / frequency;
     }
 
-    void noteTouch(std::uintptr_t block, const Probe& probe, ProbeTouch touch, std::uintptr_t rip) {
+    void noteTouch(std::uintptr_t block, const Probe& probe, ProbeTouch touch, const CONTEXT* context) {
         if (probeEvents.size() >= probeEventCap) {
             ++probeCounts.dropped;
             return;
         }
         const auto now = probeMicroseconds();
-        probeEvents.push_back(GuestArenaProbeEvent{block, rip, now > probe.armedUs ? now - probe.armedUs : 0, static_cast<std::uint32_t>(GetCurrentThreadId()), static_cast<std::uint8_t>(touch), probe.tag});
+        GuestArenaProbeEvent event{};
+        event.block = block;
+        event.rip = context != nullptr ? context->Rip : 0;
+        event.latencyUs = now > probe.armedUs ? now - probe.armedUs : 0;
+        event.thread = static_cast<std::uint32_t>(GetCurrentThreadId());
+        event.touch = static_cast<std::uint8_t>(touch);
+        event.tag = probe.tag;
+        if (context != nullptr) probeCallers(*context, event);
+        if (const auto hook = probeContextHook.load(std::memory_order_acquire)) event.context = hook();
+        probeEvents.push_back(event);
+    }
+
+    // The touch's callers (see GuestArenaProbeEvent::frames). Runs in the vectored handler on the
+    // faulting thread: unwind tables and the image list only (RtlLookupFunctionEntry,
+    // RtlPcToFileHeader; no loader lock), stack reads bounded by the thread's stack or the stack
+    // region's committed end.
+    static void probeCallers(const CONTEXT& faulting, GuestArenaProbeEvent& event) {
+        CONTEXT context = faulting;
+        std::size_t count = 0;
+        while (count < ProbeFrames) {
+            DWORD64 imageBase = 0;
+            const auto* function = RtlLookupFunctionEntry(context.Rip, &imageBase, nullptr);
+            if (function == nullptr) break;
+            void* handlerData = nullptr;
+            DWORD64 establisher = 0;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, context.Rip, const_cast<PRUNTIME_FUNCTION>(function), &context, &handlerData, &establisher, nullptr);
+            if (context.Rip == 0) break;
+            event.frames[count++] = context.Rip;
+        }
+        event.exactFrames = static_cast<std::uint8_t>(count);
+        // No unwind data for the function at context.Rip (most of our MinGW-built code has none):
+        // scan the stack from its rsp. When nothing was unwound, the faulting function itself has no
+        // unwind data and its return address is among the first stack slots.
+        auto cursor = static_cast<std::uintptr_t>(context.Rsp);
+        const auto* tib = reinterpret_cast<const NT_TIB*>(NtCurrentTeb());
+        auto limit = cursor + 4096;
+        if (cursor >= reinterpret_cast<std::uintptr_t>(tib->StackLimit) && cursor < reinterpret_cast<std::uintptr_t>(tib->StackBase)) {
+            limit = std::min(limit, reinterpret_cast<std::uintptr_t>(tib->StackBase));
+        } else {
+            MEMORY_BASIC_INFORMATION memory{};
+            if (VirtualQuery(reinterpret_cast<const void*>(cursor), &memory, sizeof(memory)) < sizeof(memory) || memory.State != MEM_COMMIT || (memory.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) == 0 || (memory.Protect & PAGE_GUARD) != 0) limit = cursor;
+            else limit = std::min(limit, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
+        }
+        cursor = (cursor + 7) & ~std::uintptr_t{7};
+        for (; count < ProbeFrames && cursor + 8 <= limit; cursor += 8) {
+            const auto value = *reinterpret_cast<const std::uint64_t*>(cursor);
+            if (value < 0x10000 || (count != 0 && value == event.frames[count - 1])) continue;
+            void* image = nullptr;
+            if (RtlPcToFileHeader(reinterpret_cast<void*>(value), &image) == nullptr || value - reinterpret_cast<std::uintptr_t>(image) < 0x1000) continue;
+            if (!probeAfterCall(value)) continue;
+            event.frames[count++] = value;
+        }
+        event.frameCount = static_cast<std::uint8_t>(count);
+    }
+
+    // Whether the bytes before `address` (inside a loaded image) end with a call: E8 rel32, FF /2
+    // with any ModRM form (register, [reg], disp8, disp32, rip-relative, SIB), optionally REX-prefixed.
+    static bool probeAfterCall(std::uint64_t address) {
+        const auto* code = reinterpret_cast<const std::uint8_t*>(address);
+        if (code[-5] == 0xe8) return true;
+        for (const int length : {2, 3, 4, 6, 7}) {
+            const auto* op = code - length;
+            const auto modrm = op[1];
+            if (op[0] != 0xff || ((modrm >> 3) & 7) != 2) continue;
+            const auto mod = modrm >> 6;
+            const auto rm = modrm & 7;
+            int expected = 2;
+            if (mod == 3) expected = 2;
+            else if (mod == 0 && rm == 5) expected = 6;
+            else expected = 2 + (rm == 4 ? 1 : 0) + (mod == 1 ? 1 : mod == 2 ? 4 : 0);
+            if (mod == 0 && rm == 4 && (op[2] & 7) == 5) expected = 7;
+            if (expected == length) return true;
+        }
+        return false;
     }
 
     // Whether a page the probe guarded lost its guard without a fault reaching HandleProbe.
@@ -1974,6 +2051,7 @@ private:
     GuestArenaProbeCounts probeCounts{};
     std::atomic<std::size_t> probeLive{0};
     std::atomic<bool> probeUsed{false};
+    std::atomic<std::uint64_t (*)()> probeContextHook{nullptr};
 
     Ranges cleanRanges;
     Ranges collectableRanges;

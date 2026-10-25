@@ -26,13 +26,25 @@ enum class ProbeTouch : std::uint8_t { Read, Write, WriteAfterRead };
 inline constexpr std::size_t ProbeEndCount = static_cast<std::size_t>(ProbeEnd::Count);
 inline constexpr std::size_t ProbeRefusalCount = static_cast<std::size_t>(ProbeRefusal::Count);
 
+// frames: the touch's callers, newest first (return addresses; frames[0] is the faulting
+// function's caller). The first `exactFrames` come from the x64 unwind tables (ucrtbase, the
+// system DLLs and the functions of our modules that have them), so the first caller outside the
+// CRT's memcpy/memcmp is exact; the rest are return addresses found by scanning the stack above
+// the last exact frame (an address inside a loaded image just after a call instruction), which can
+// include stale ones. context: what the faulting thread said it was doing, from the hook the
+// driver sets (GuestArenaSetProbeContextHook; its PM4 packet and read site), 0 without one.
+inline constexpr std::size_t ProbeFrames = 8;
 struct GuestArenaProbeEvent {
     std::uint64_t block;
     std::uint64_t rip;
     std::uint64_t latencyUs;
+    std::uint64_t frames[ProbeFrames];
+    std::uint64_t context;
     std::uint32_t thread;
     std::uint8_t touch;
     std::uint8_t tag;
+    std::uint8_t exactFrames;
+    std::uint8_t frameCount;
 };
 
 // Since the last take: guarded intervals begun (arms), re-armed by a GPU write while untouched
@@ -146,8 +158,12 @@ void GuestArenaEndSetProtection_nid_no_patch(std::uintptr_t address, std::size_t
 // probe's guard; with nothing armed it is VirtualQuery. Not Windows: nothing is armed.
 bool GuestArenaProbeArm_nid_no_patch(std::uintptr_t block, std::uint8_t tag);
 std::size_t GuestArenaProbeTake_nid_no_patch(GuestArenaProbeCounts* counts, GuestArenaProbeEvent* events, std::size_t capacity);
+// The driver's description of the calling thread's current work, called from the fault handler on
+// the faulting thread (must not lock, allocate or fault); null clears it.
+void GuestArenaSetProbeContextHook_nid_no_patch(std::uint64_t (*hook)());
 #ifdef _WIN32
-bool GuestArenaHandleProbe_nid_postfix(std::uintptr_t address, bool write, bool guard, std::uintptr_t rip);
+// `context` is the fault's CONTEXT record (its Rip is the touch's site; the callers are unwound from it).
+bool GuestArenaHandleProbe_nid_postfix(std::uintptr_t address, bool write, bool guard, const void* context);
 std::size_t GuestArenaQuery_nid_no_patch(const void* address, void* information, std::size_t bytes);
 #endif
 

@@ -3178,6 +3178,57 @@ void CheckOwnershipProbeResident() {
     std::cout << "ownership probe: resident direct memory probed with its own protection kept\n";
 }
 
+// A CRT copy out of a probed unit is charged to its caller: the event's first exact frame after
+// ucrtbase's memcpy is the return address inside the copying function, and the thread's packet and
+// read site come from the driver's context hook.
+[[gnu::noinline]] std::uint64_t CopyOutOfProbedUnit(const std::uint8_t* source, std::size_t bytes) {
+    std::array<std::uint8_t, 256> copy{};
+    volatile std::size_t length = bytes;
+    std::memcpy(copy.data(), source, length);
+    std::uint64_t sum = 0;
+    for (const auto value : copy) sum += value;
+    return sum;
+}
+
+void CheckOwnershipProbeCallers() {
+    PrivateFixture fixture(Block, Block);
+    const auto base = fixture.Base();
+    fixture.At(16) = 3;
+    TakeProbe();
+    AgcDriver::OwnershipProbe::Sampler all(1);
+    all.NoteGpuWrite(base, base + Block);
+    std::uint64_t sum = 0;
+    {
+        AgcDriver::GuestMemory::SetCurrentPacket(0x50, 0x20);
+        const AgcDriver::GuestMemory::ReadSiteScope site(AgcDriver::GuestMemory::ReadSite::BufferUpload);
+        sum = CopyOutOfProbedUnit(fixture.memory, 200);
+        AgcDriver::GuestMemory::SetCurrentPacket(AgcDriver::GuestMemory::NoPacket, 0);
+    }
+    Require(sum == 3, "the probed CRT copy read the wrong bytes");
+    std::vector<GuestArena::GuestArenaProbeEvent> events;
+    TakeProbe(&events);
+    Require(events.size() == 1, "the probed CRT copy recorded " + std::to_string(events.size()) + " touches, not 1");
+    const auto& event = events[0];
+    HMODULE self = GetModuleHandleW(nullptr);
+    HMODULE ripModule = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(event.rip), &ripModule);
+    const auto function = reinterpret_cast<std::uint64_t>(&CopyOutOfProbedUnit);
+    bool found = false;
+    if (ripModule == self) {
+        found = event.rip >= function && event.rip < function + 512;
+    } else {
+        for (std::size_t i = 0; i < event.exactFrames && !found; ++i) found = event.frames[i] >= function && event.frames[i] < function + 512;
+    }
+    Require(found, "the probed CRT copy's caller frame is not inside the copying function (exact frames " + std::to_string(event.exactFrames) + ", frames " + std::to_string(event.frameCount) + ")");
+    const auto expected = (std::uint64_t{1} << 63u) | 0x50u | (std::uint64_t{0x20} << 32u) | (std::uint64_t{static_cast<std::uint8_t>(AgcDriver::GuestMemory::ReadSite::BufferUpload)} << 48u);
+    Require(event.context == expected, "the probed touch's packet/site context is wrong");
+    all.NoteGpuWrite(base, base + Block);
+    sum = CopyOutOfProbedUnit(fixture.memory, 64);
+    const auto report = all.Take(10.0);
+    Require(report.find("[ownership] callers") != std::string::npos && report.find("no packet, site unknown") != std::string::npos, "the report has no callers line: " + report);
+    std::cout << "ownership probe: CRT copies charged to their caller with the thread's packet and read site\n";
+}
+
 // Owned proofs (write watch, no protection change): arming a probed unit as owned ends its interval
 // first, so the guard never reaches the owned refusals; an owned unit is not probed, also after a
 // store moved its word and the arming took the unit afresh.
@@ -3319,6 +3370,7 @@ int main(int argc, char** argv) {
             CheckOwnershipProbeResident();
             CheckOwnershipProbeHostAccess();
             CheckOwnershipProbeOwned();
+            CheckOwnershipProbeCallers();
             std::cout << "ownership probe tests passed\n";
             return 0;
         }

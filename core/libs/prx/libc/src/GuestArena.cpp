@@ -655,8 +655,12 @@ std::size_t GuestArenaProbeTake_nid_no_patch(GuestArenaProbeCounts* counts, Gues
     return WindowsMappings::Get().TakeProbe(counts, events, capacity);
 }
 
-bool GuestArenaHandleProbe_nid_postfix(std::uintptr_t address, bool write, bool guard, std::uintptr_t rip) {
-    return WindowsMappings::Get().HandleProbe(address, write, guard, rip);
+bool GuestArenaHandleProbe_nid_postfix(std::uintptr_t address, bool write, bool guard, const void* context) {
+    return WindowsMappings::Get().HandleProbe(address, write, guard, static_cast<const CONTEXT*>(context));
+}
+
+void GuestArenaSetProbeContextHook_nid_no_patch(std::uint64_t (*hook)()) {
+    WindowsMappings::Get().SetProbeContextHook(hook);
 }
 
 std::size_t GuestArenaQuery_nid_no_patch(const void* address, void* information, std::size_t bytes) {
@@ -684,6 +688,8 @@ void GuestArenaEndSetProtection_nid_no_patch(std::uintptr_t, std::size_t) {}
 bool GuestArenaProbeArm_nid_no_patch(std::uintptr_t, std::uint8_t) {
     return false;
 }
+
+void GuestArenaSetProbeContextHook_nid_no_patch(std::uint64_t (*)()) {}
 
 std::size_t GuestArenaProbeTake_nid_no_patch(GuestArenaProbeCounts* counts, GuestArenaProbeEvent*, std::size_t) {
     if (counts != nullptr) *counts = {};

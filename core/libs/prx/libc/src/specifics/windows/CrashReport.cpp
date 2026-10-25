@@ -403,7 +403,7 @@ bool HandleSse4a(EXCEPTION_POINTERS* info) {
 
 LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
     const auto* fault = info->ExceptionRecord;
-    if ((fault->ExceptionCode == EXCEPTION_GUARD_PAGE || fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) && fault->NumberParameters >= 2 && GuestArena::GuestArenaHandleProbe_nid_postfix(fault->ExceptionInformation[1], fault->ExceptionInformation[0] == 1, fault->ExceptionCode == EXCEPTION_GUARD_PAGE, info->ContextRecord->Rip)) return EXCEPTION_CONTINUE_EXECUTION;
+    if ((fault->ExceptionCode == EXCEPTION_GUARD_PAGE || fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) && fault->NumberParameters >= 2 && GuestArena::GuestArenaHandleProbe_nid_postfix(fault->ExceptionInformation[1], fault->ExceptionInformation[0] == 1, fault->ExceptionCode == EXCEPTION_GUARD_PAGE, info->ContextRecord)) return EXCEPTION_CONTINUE_EXECUTION;
     if (fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fault->NumberParameters >= 2 && fault->ExceptionInformation[0] == 1 && GuestArena::GuestArenaHandleWrite_nid_postfix(fault->ExceptionInformation[1])) return EXCEPTION_CONTINUE_EXECUTION;
     if (fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fault->NumberParameters >= 2 && fault->ExceptionInformation[0] == 0 && GuestArena::GuestArenaHandleRead_nid_postfix(fault->ExceptionInformation[1])) return EXCEPTION_CONTINUE_EXECUTION;
     if (HandleWatch(info)) return EXCEPTION_CONTINUE_EXECUTION;
