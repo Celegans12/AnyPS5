@@ -33,6 +33,7 @@ private:
         LogicalAnd, LogicalOr, LogicalXor, LogicalNot
     };
     static constexpr std::uint32_t NoNode = 0xffffffffu;
+    static constexpr std::uint64_t NoAddress = ~std::uint64_t {0};
     struct Node {
         Op op = Op::Fail;
         bool clean = false;
@@ -40,6 +41,8 @@ private:
         std::uint8_t component = 0;
         std::uint8_t argumentCount = 0;
         std::int32_t baseWord = -1;
+        bool pointerOnly = false;
+        std::uint32_t baseRead = NoNode;
         std::array<std::uint32_t, 5> arguments{};
         std::uint64_t immediate = 0;
         const IrValue* source = nullptr;

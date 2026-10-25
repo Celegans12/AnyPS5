@@ -53,6 +53,7 @@ public:
         for (std::size_t block = 0; block < plan.controlFlow.size(); ++block) {
             if (plan.controlFlow[block].condition != nullptr) tape.conditionRoots[block] = compile(plan.controlFlow[block].condition, CleanContext, 0);
         }
+        markPointers();
         return !malformed;
     }
 
@@ -65,6 +66,38 @@ private:
         bool cleanSlots;
     };
     static constexpr std::uint32_t Building = 0xfffffffeu;
+
+    static bool isRead(Op op) { return op == Op::Read || op == Op::ReadConstBuffer; }
+
+    // A read whose value only ever is the base low half of other reads, or a flat slot, is a pointer:
+    // moving what it points to moves those reads by the same delta, and the flat slots holding it
+    // (recorded per walk in SrtUserDataUse::pointerSlots) take its new value.
+    void markPointers() {
+        auto& nodes = tape.nodes;
+        std::vector<std::uint8_t> valueUse(nodes.size(), 0u);
+        std::vector<std::uint8_t> baseUse(nodes.size(), 0u);
+        const auto value = [&](std::uint32_t index) {
+            if (index < nodes.size()) valueUse[index] = 1u;
+        };
+        for (const auto& dwords : tape.sourceDwords) {
+            for (const auto index : dwords) value(index);
+        }
+        for (const auto index : tape.conditionRoots) value(index);
+        for (const auto& node : nodes) {
+            for (std::uint8_t argument = 0; argument < node.argumentCount && argument < node.arguments.size(); ++argument) {
+                const auto index = node.arguments[argument];
+                if (index >= nodes.size()) continue;
+                if (argument == 0 && isRead(node.op) && node.baseWord < 0) baseUse[index] = 1u;
+                else valueUse[index] = 1u;
+            }
+        }
+        for (auto& node : nodes) {
+            if (!isRead(node.op) || node.baseWord >= 0 || node.argumentCount == 0) continue;
+            const auto base = node.arguments[0];
+            if (base < nodes.size() && isRead(nodes[base].op)) node.baseRead = base;
+        }
+        for (std::size_t index = 0; index < nodes.size(); ++index) nodes[index].pointerOnly = isRead(nodes[index].op) && baseUse[index] != 0u && valueUse[index] == 0u;
+    }
 
     std::uint32_t emit(const Node& node) {
         tape.nodes.push_back(node);
@@ -324,6 +357,7 @@ struct SrtTape::Frame {
     std::uint64_t* values;
     std::uint8_t* states;
     bool nullRoot = false;
+    std::uint64_t* addresses = nullptr;
 };
 
 bool SrtTape::evaluate(Frame& frame, std::uint32_t index, std::uint64_t& result) const {
@@ -409,6 +443,7 @@ bool SrtTape::compute(Frame& frame, const Node& node, std::uint64_t& result) con
         case Op::ShaderBase: result = frame.runtime.shaderBase; return true;
         case Op::Read:
         case Op::ReadConstBuffer: {
+            if (frame.addresses != nullptr) frame.addresses[static_cast<std::size_t>(&node - nodes.data())] = NoAddress;
             const auto base = ((b << 32u) | static_cast<std::uint32_t>(a)) & AddressMask;
             const auto immediate = static_cast<std::int64_t>(node.immediate);
             std::uint64_t address = 0;
@@ -431,7 +466,14 @@ bool SrtTape::compute(Frame& frame, const Node& node, std::uint64_t& result) con
                 frame.nullRoot = true;
                 return false;
             }
-            if (frame.runtime.userDataUse != nullptr) frame.runtime.userDataUse->reads.emplace_back(address, origin);
+            if (auto* use = frame.runtime.userDataUse; use != nullptr) {
+                use->reads.emplace_back(address, origin);
+                if (frame.addresses != nullptr) {
+                    frame.addresses[static_cast<std::size_t>(&node - nodes.data())] = address;
+                    if (node.pointerOnly) use->pointers.push_back(address);
+                    if (node.baseRead != NoNode && nodes[node.baseRead].pointerOnly && frame.addresses[node.baseRead] != NoAddress) use->nested.emplace_back(address, frame.addresses[node.baseRead]);
+                }
+            }
             if (node.loaded && frame.runtime.accessible != nullptr && !frame.runtime.accessible(frame.runtime.userContext, address, sizeof(std::uint32_t))) return false;
             if (auto* trace = frame.runtime.readTrace; trace != nullptr) {
                 if (node.source == trace->leaf) trace->leaves.emplace_back(trace->leafSlot, address);
@@ -545,6 +587,9 @@ bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::ve
     const auto baseBefore = use != nullptr ? use->asBase : 0;
     const auto valueBefore = use != nullptr ? use->asValue : 0;
     const auto useReadsBefore = use != nullptr ? use->reads.size() : 0;
+    const auto nestedBefore = use != nullptr ? use->nested.size() : 0;
+    const auto pointersBefore = use != nullptr ? use->pointers.size() : 0;
+    const auto pointerSlotsBefore = use != nullptr ? use->pointerSlots.size() : 0;
     const auto refuse = [&] {
         if (trace != nullptr) {
             trace->leaves.resize(leavesBefore);
@@ -555,6 +600,9 @@ bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::ve
             use->asBase = baseBefore;
             use->asValue = valueBefore;
             use->reads.resize(useReadsBefore);
+            use->nested.resize(nestedBefore);
+            use->pointers.resize(pointersBefore);
+            use->pointerSlots.resize(pointerSlotsBefore);
         }
         return false;
     };
@@ -574,6 +622,12 @@ bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::ve
         std::fill_n(states, nodes.size(), std::uint8_t {0});
     }
     Frame frame {runtime, values, states};
+    std::array<std::uint64_t, InlineNodes> inlineAddresses;
+    std::vector<std::uint64_t> heapAddresses;
+    if (use != nullptr) {
+        if (nodes.size() > InlineNodes) heapAddresses.resize(nodes.size());
+        frame.addresses = nodes.size() > InlineNodes ? heapAddresses.data() : inlineAddresses.data();
+    }
 
     struct Scratch {
         std::vector<std::uint8_t> active;
@@ -660,6 +714,7 @@ bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::ve
         }
         std::uint64_t word = 0;
         const bool ok = read.flatOffset < flattened.size() && evaluate(frame, flatRoots[slot], word);
+        if (ok && frame.addresses != nullptr && flatRoots[slot] < nodes.size() && nodes[flatRoots[slot]].pointerOnly && frame.addresses[flatRoots[slot]] != NoAddress) use->pointerSlots.emplace_back(read.flatOffset, frame.addresses[flatRoots[slot]]);
         if (pure) trace->leaf = nullptr;
         if (!ok) return refuse();
         flattened[read.flatOffset] = static_cast<std::uint32_t>(word);
