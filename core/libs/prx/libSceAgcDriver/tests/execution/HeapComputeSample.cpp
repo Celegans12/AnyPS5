@@ -37,6 +37,8 @@ alignas(256) constexpr std::array<std::uint32_t, 16> LdsSampleCode{
 alignas(256) std::array<std::uint8_t, 1024> TextureMemory{};
 alignas(256) std::array<std::uint8_t, 1024> OtherTextureMemory{};
 alignas(4096) std::array<std::array<float, 1024>, 4> Outputs{};
+constexpr std::size_t FullHeapTextures = 16;
+alignas(256) std::array<std::array<std::uint8_t, 1024>, FullHeapTextures> ManyTextures{};
 
 struct Header {
     Shader shader{};
@@ -128,6 +130,16 @@ void DriverSample(bool heap) {
     if (heap) Require(AgcDriver::Graphics::HeapComputeStages() > before, "the heap did not take the sampling compute stage");
 }
 
+void FullHeapSample() {
+    Outputs[0].fill(-1.0f);
+    std::vector<std::uint32_t> words;
+    for (std::size_t index = 0; index < FullHeapTextures; ++index) Sample(words, ManyTextures[index].data(), Outputs[0].data() + 4u * index);
+    Submit(words);
+    for (std::size_t index = 0; index < FullHeapTextures; ++index)
+        RequireSampled(Outputs[0].data() + 4u * index, Texel, "texture " + std::to_string(index) + " of a heap with too few image slots", true);
+    Require(AgcDriver::Graphics::BindlessHeap::NearlyFull(), "the capped heap never ran short of image slots");
+}
+
 ShaderRecompiler::RecompileResult Compile(AgcDriver::VulkanDevice& device, const void* image, float* output,
                                           std::span<const std::uint32_t> code = SampleCode, std::uint32_t ldsDwords = 0u) {
     std::vector<std::uint32_t> userData;
@@ -196,7 +208,14 @@ int main() {
         }
         Fill(TextureMemory, Texel);
         Fill(OtherTextureMemory, OtherTexel);
+        for (auto& texture : ManyTextures) Fill(texture, Texel);
         Registered(SampleHeader, SampleCode.data(), sizeof(SampleCode));
+        if (heap && std::getenv("APS5_HEAP_SLOT_CAP") != nullptr) {
+            FullHeapSample();
+            AgcDriverShutdown_nid_postfix();
+            std::cout << "compute stages sampled every texture after the heap ran short of image slots\n";
+            return 0;
+        }
         DriverSample(heap);
         AgcDriverShutdown_nid_postfix();
         {
