@@ -2865,6 +2865,55 @@ void addBuildPhase(ShaderResources::BuildPhase which, double ms) {
     ThreadBuilds().ms[static_cast<std::size_t>(which)] += ms;
 }
 
+struct CompleteImageProfile {
+    AgcDriver::Mutex mutex;
+    std::array<std::array<std::uint64_t, LookupOutcomes::Count>, 2> counts{};
+    std::array<std::array<double, LookupOutcomes::Count>, 2> ms{};
+    std::array<std::uint64_t, 2> builds{}, deferred{};
+    std::array<double, 2> deferredMs{}, storageTablesMs{}, imageTablesMs{}, depthMs{};
+    std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+};
+
+CompleteImageProfile& CompleteImages() {
+    static CompleteImageProfile profile;
+    return profile;
+}
+
+void noteCompleteImages(const LookupOutcomes& before, std::size_t deferred, double deferredMs, double storageTablesMs, double imageTablesMs, double depthMs) {
+    const auto& after = ThreadLookupOutcomes();
+    const std::size_t side = GuestMemory::GpuLockThreadTag() == 0xffffffffu ? 0 : 1;
+    auto& profile = CompleteImages();
+    std::lock_guard lock(profile.mutex);
+    for (std::size_t kind = 0; kind < LookupOutcomes::Count; ++kind) {
+        if (after.counts[kind] >= before.counts[kind]) profile.counts[side][kind] += after.counts[kind] - before.counts[kind];
+        if (after.ms[kind] >= before.ms[kind]) profile.ms[side][kind] += after.ms[kind] - before.ms[kind];
+    }
+    ++profile.builds[side];
+    profile.deferred[side] += deferred;
+    profile.deferredMs[side] += deferredMs;
+    profile.storageTablesMs[side] += storageTablesMs;
+    profile.imageTablesMs[side] += imageTablesMs;
+    profile.depthMs[side] += depthMs;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - profile.lastReport < std::chrono::seconds(10)) return;
+    profile.lastReport = now;
+    static constexpr const char* sides[2] = {"untagged threads (draw committer, presenter)", "queue workers"};
+    for (std::size_t which = 0; which < 2; ++which) {
+        std::string report;
+        char text[160];
+        for (std::size_t kind = 0; kind < LookupOutcomes::Count; ++kind) {
+            if (profile.counts[which][kind] == 0) continue;
+            std::snprintf(text, sizeof(text), " %s %llux%.1fms", LookupOutcomes::Name(static_cast<LookupOutcomes::Kind>(kind)), static_cast<unsigned long long>(profile.counts[which][kind]), profile.ms[which][kind]);
+            report += text;
+        }
+        AgcDriver::ProfilePrint_nid_no_patch("[complete-images] (10 s) %s: %llu stage-B builds; deferred image bindings %llu in %.1f ms, storage image tables %.1f ms, image tables %.1f ms, depth-write check %.1f ms; lookups by outcome (count x ms, the refresh/upload/scan/flush rows lie inside the sampled and storage rows):%s\n", sides[which], static_cast<unsigned long long>(profile.builds[which]), static_cast<unsigned long long>(profile.deferred[which]), profile.deferredMs[which], profile.storageTablesMs[which], profile.imageTablesMs[which], profile.depthMs[which], report.c_str());
+        profile.counts[which] = {};
+        profile.ms[which] = {};
+        profile.builds[which] = profile.deferred[which] = 0;
+        profile.deferredMs[which] = profile.storageTablesMs[which] = profile.imageTablesMs[which] = profile.depthMs[which] = 0;
+    }
+}
+
 // APS5_PROFILE_DRAW: guest buffer elements bound by descriptor (addGuestBuffer) and how many the
 // recompiler proved read-only, plus the pending-write notes their uses skipped (MarkGpuWrites),
 // printed as [buffers] every 10 s from MarkGpuWrites. Cumulative.
@@ -3505,6 +3554,17 @@ void ShaderResources::buildComplete() {
     try {
         // The lookups run in plan order: Revalidate walks the bindings the same way, and consecutive
         // storage elements of one mip chain share the previous element's image.
+        const bool imagesProfiled = BuildProfiled();
+        const auto outcomesBefore = imagesProfiled ? ThreadLookupOutcomes() : LookupOutcomes{};
+        const auto deferredCount = deferredImages.size();
+        auto imagesMark = imagesProfiled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const auto lapImages = [&] {
+            if (!imagesProfiled) return 0.0;
+            const auto now = std::chrono::steady_clock::now();
+            const double ms = std::chrono::duration<double, std::milli>(now - imagesMark).count();
+            imagesMark = now;
+            return ms;
+        };
         previousSampled = {};
         for (auto& source : samplerSources) source.singleLevelImage = source.mipmappedImage = false;
         for (const auto& deferred : deferredImages) resolveImageBinding(*deferred.binding, bindings[deferred.index], std::span<const std::shared_ptr<Sampler>>(samplers).subspan(deferred.firstSampler, deferred.samplerCount));
@@ -3518,15 +3578,19 @@ void ShaderResources::buildComplete() {
         imageRecords.shrink_to_fit();
         nextImageRecord = 0;
         Require(textures.size() == plannedSampledImages && storageTextures.size() == plannedStorageImages, "image lookups disagree with the descriptor plan");
+        const double deferredMs = lapImages();
         resolveStorageImageTables();
+        const double storageTablesMs = lapImages();
         const auto tablesStart = std::chrono::steady_clock::now();
         resolveImageTables();
         if (!tableStages.empty()) AddBindlessOldPathNanoseconds(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - tablesStart).count()));
+        const double imageTablesMs = lapImages();
         std::vector<std::shared_ptr<StorageTexture>> depthWrites;
         for (std::size_t index = 0; index < storageTextures.size(); ++index) {
             if (storageWritten[index] && storageTextures[index] != nullptr && DepthSurfaceAt(storageTextures[index]->Descriptor().baseAddress)) depthWrites.push_back(storageTextures[index]);
         }
         if (depthWrites.size() > 1) ValidateStorageDepthWrites(context, depthWrites);
+        if (imagesProfiled) noteCompleteImages(outcomesBefore, deferredCount, deferredMs, storageTablesMs, imageTablesMs, lapImages());
         timing.bindingsMs += phase(BuildPhase::Images);
         guestMemory.UploadFinish(usesBda);
         timing.uploadMs += phase(BuildPhase::Upload);
