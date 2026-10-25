@@ -247,6 +247,7 @@ function(add_shader_recompiler target runtimeTarget)
             BuildBarycentricTessellationShaders
             HeapFragmentEligible
             CompleteHeapDataWords
+            HeapTemplateCounts
             BuildPreparedShaderKey
             BuildRectListShaders
             CaptureResources

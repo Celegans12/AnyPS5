@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
+#include "Recompiler.hpp"
 #include "RuntimeAbi.hpp"
 #include "SpirvBackend/SpirvAnalysis.hpp"
 #include <algorithm>
@@ -894,13 +895,14 @@ void reportHeapStatistics() {
     const auto spansWritten = takeCount(spansWrittenWindow);
     const auto spansKept = takeCount(spansKeptWindow);
     const auto spansExpired = takeCount(spansExpiredWindow);
+    const auto templates = ShaderRecompiler::HeapTemplateCounts();
     std::fprintf(stderr,
                  "[gpu-heap] (10 s): draws %llu heap / %llu plain, dispatches %llu heap / %llu plain; "
                  "heap binds %llu over %llu command buffers; set binds:%s; fallbacks:%s; draw stages:%s; "
-                 "CPU buffer copies %llu (%llu MiB); ring spans %llu written / %llu kept / %llu expired\n",
+                 "CPU buffer copies %llu (%llu MiB); ring spans %llu written / %llu kept / %llu expired; templates %llu (%llu MiB, %llu evicted)\n",
                  printed(heapDraws), printed(plainDraws), printed(heapDispatches), printed(plainDispatches), printed(heapBindsSeen),
                  printed(commandBuffers), binds.c_str(), fallbacks.c_str(), stageReasons.c_str(), printed(copies), printed(copiedMiB),
-                 printed(spansWritten), printed(spansKept), printed(spansExpired));
+                 printed(spansWritten), printed(spansKept), printed(spansExpired), printed(templates.entries), printed(templates.bytes >> 20u), printed(templates.evicted));
 }
 
 void forgetHeapBinding(VkCommandBuffer commands) {

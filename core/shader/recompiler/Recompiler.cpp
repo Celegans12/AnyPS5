@@ -14,6 +14,7 @@
 #include "SpirvBackend/SpirvSpecialization.hpp"
 #include "RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include "ShaderDiskCache.hpp"
+#include <deque>
 #include <list>
 #include <functional>
 #include <map>
@@ -392,6 +393,8 @@ struct HeapTemplate {
     std::vector<DescriptorValue> buffers;
     std::vector<DescriptorValue> images;
     std::vector<DescriptorValue> samplers;
+    std::uint64_t bytes = 0;
+    std::uint64_t used = 0;
 };
 
 struct SourceEntry : std::enable_shared_from_this<SourceEntry> {
@@ -415,6 +418,90 @@ struct SourceEntry : std::enable_shared_from_this<SourceEntry> {
     std::uint64_t memoClock = 0;
     std::unordered_map<std::uint64_t, HeapTemplate> heapTemplates;
 };
+
+namespace {
+
+struct HeapTemplateStore {
+    struct Queued {
+        std::weak_ptr<SourceEntry> source;
+        std::uint64_t key;
+        std::uint64_t bytes;
+        std::uint64_t queuedAt;
+    };
+    std::mutex mutex;
+    std::deque<Queued> queue;
+    std::uint64_t bytes = 0;
+    std::atomic<std::uint64_t> clock{0};
+    std::atomic<std::uint64_t> entries{0};
+    std::atomic<std::uint64_t> evicted{0};
+};
+
+HeapTemplateStore& HeapTemplates() {
+    static auto* store = new HeapTemplateStore();
+    return *store;
+}
+
+std::uint64_t HeapTemplateBudget() {
+    static const std::uint64_t budget = [] {
+        const char* value = std::getenv("APS5_HEAP_TEMPLATE_MIB");
+        const auto mib = value != nullptr ? std::strtoull(value, nullptr, 10) : 256ull;
+        return std::max<std::uint64_t>(mib, 1u) << 20u;
+    }();
+    return budget;
+}
+
+template<typename TVector>
+std::uint64_t VectorBytes(const TVector& values) {
+    return static_cast<std::uint64_t>(values.capacity()) * sizeof(typename TVector::value_type);
+}
+
+std::uint64_t HeapTemplateBytes(const HeapTemplate& entry) {
+    const auto& result = *entry.result;
+    std::uint64_t bytes = sizeof(RecompileResult) + sizeof(HeapTemplate) + VectorBytes(result.bindings) + VectorBytes(result.pushConstants) + VectorBytes(result.specialization) + VectorBytes(result.vertexAttributes) + VectorBytes(result.heapUserWords) + VectorBytes(result.shaderDataUserWords);
+    for (const auto& binding : result.bindings) bytes += VectorBytes(binding.guestDescriptor);
+    return bytes + VectorBytes(entry.buffers) + VectorBytes(entry.images) + VectorBytes(entry.samplers);
+}
+
+void QueueHeapTemplate(const std::shared_ptr<SourceEntry>& source, std::uint64_t key, std::uint64_t bytes) {
+    auto& store = HeapTemplates();
+    std::lock_guard lock(store.mutex);
+    store.queue.push_back({source, key, bytes, store.clock.load(std::memory_order_relaxed)});
+    store.bytes += bytes;
+    store.entries.fetch_add(1, std::memory_order_relaxed);
+    const auto budget = HeapTemplateBudget();
+    const auto visits = store.queue.size() * 2u;
+    for (std::size_t visited = 0; store.bytes > budget && !store.queue.empty() && visited < visits; ++visited) {
+        auto oldest = std::move(store.queue.front());
+        store.queue.pop_front();
+        auto owner = oldest.source.lock();
+        bool requeue = false;
+        bool held = false;
+        if (owner != nullptr) {
+            std::lock_guard sourceLock(owner->mutex);
+            if (const auto found = owner->heapTemplates.find(oldest.key); found != owner->heapTemplates.end() && found->second.bytes == oldest.bytes) {
+                held = true;
+                if (found->second.used > oldest.queuedAt) requeue = true;
+                else owner->heapTemplates.erase(found);
+            }
+        }
+        if (requeue) {
+            oldest.queuedAt = store.clock.load(std::memory_order_relaxed);
+            store.queue.push_back(std::move(oldest));
+            continue;
+        }
+        store.bytes -= oldest.bytes;
+        store.entries.fetch_sub(1, std::memory_order_relaxed);
+        if (held) store.evicted.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+}
+
+HeapTemplateCacheCounts HeapTemplateCounts() {
+    auto& store = HeapTemplates();
+    std::lock_guard lock(store.mutex);
+    return {store.entries.load(std::memory_order_relaxed), store.bytes, store.evicted.exchange(0, std::memory_order_relaxed)};
+}
 
 namespace {
 
@@ -2018,6 +2105,7 @@ std::shared_ptr<const RecompileResult> PreparedShaderInvocation::MaterializeHeap
         std::lock_guard lock(source.mutex);
         const auto found = source.heapTemplates.find(key);
         if (found != source.heapTemplates.end()) {
+            found->second.used = HeapTemplates().clock.fetch_add(1, std::memory_order_relaxed) + 1u;
             const auto shared = found->second;
             useAttributes(shared.result);
             useBindings(shared);
@@ -2032,11 +2120,16 @@ std::shared_ptr<const RecompileResult> PreparedShaderInvocation::MaterializeHeap
     static std::atomic<std::uint64_t> templateIds{0};
     built->heapTemplateId = templateIds.fetch_add(1, std::memory_order_relaxed) + 1u;
     HeapTemplate shared{std::move(built), std::move(usedPlan), perDrawBindings ? snapshot.buffers : std::vector<DescriptorValue>{}, perDrawBindings ? snapshot.images : std::vector<DescriptorValue>{}, perDrawBindings ? snapshot.samplers : std::vector<DescriptorValue>{}};
+    shared.bytes = HeapTemplateBytes(shared);
+    shared.used = HeapTemplates().clock.fetch_add(1, std::memory_order_relaxed) + 1u;
+    bool inserted = false;
     {
         std::lock_guard lock(source.mutex);
-        if (source.heapTemplates.size() >= 4096) source.heapTemplates.clear();
-        shared = source.heapTemplates.emplace(key, shared).first->second;
+        auto [at, added] = source.heapTemplates.emplace(key, shared);
+        inserted = added;
+        shared = at->second;
     }
+    if (inserted) QueueHeapTemplate(source.shared_from_this(), key, shared.bytes);
     useAttributes(shared.result);
     useBindings(shared);
     CompleteHeapDataWords(*shared.result, words);

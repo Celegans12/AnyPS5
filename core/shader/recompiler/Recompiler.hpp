@@ -443,6 +443,13 @@ struct GraphicsCompileContext {
 
 struct VertexAttribute;
 
+struct HeapTemplateCacheCounts {
+    std::uint64_t entries = 0;
+    std::uint64_t bytes = 0;
+    std::uint64_t evicted = 0;
+};
+HeapTemplateCacheCounts HeapTemplateCounts();
+
 struct HeapStageWords {
     std::vector<std::uint32_t> userData;
     std::vector<std::uint32_t> flattenedSrt;
