@@ -275,6 +275,7 @@ struct Replay {
     std::map<std::uint64_t, std::vector<const FrameMemoryChunk*>> groups;
     Skipped skipped;
     std::atomic<std::uint64_t> paceTimeouts{0};
+    std::atomic<std::uint64_t> memoryPaceTimeouts{0};
     std::atomic<std::uint64_t> staleRegistrations{0};
     std::atomic<std::uint64_t> failedRegistrations{0};
     std::atomic<std::uint64_t> submits{0};
@@ -309,21 +310,34 @@ struct Replay {
 
     void pace(const FrameCall& call) {
         if (!options.pace || !recording || !paced(call.kind) || call.accepted < call.completed) return;
-        if (stalled.load()) {
+        const bool memory = call.kind == FrameCallKind::Memory;
+        if (!memory && stalled.load()) {
             if (progress().second == stalledAt.load()) return;
             stalled.store(false);
         }
         const auto inFlight = call.accepted - call.completed;
-        const bool memory = call.kind == FrameCallKind::Memory;
         const auto began = Clock::now();
-        const auto deadline = began + (memory ? options.memoryPaceTimeout : options.paceTimeout);
+        const auto timeout = memory ? options.memoryPaceTimeout : options.paceTimeout;
+        auto lastCompleted = progress().second;
+        auto deadline = began + timeout;
         const auto waited = [&] { paceWaitedNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - began).count(); };
         while (true) {
             const auto [accepted, completed] = progress();
             if (accepted - completed <= inFlight) return waited();
-            if (Clock::now() >= deadline) {
+            const auto now = Clock::now();
+            if (completed != lastCompleted) {
+                lastCompleted = completed;
+                deadline = now + timeout;
+            }
+            if (now >= deadline) {
                 waited();
-                if (memory) return;
+                if (memory) {
+                    ++memoryPaceTimeouts;
+                    std::fprintf(stderr, "[frame-replay] memory pacing gave up at call %llu: no completion for %lld ms, serials %llu/%llu, the capture had %llu in flight\n", static_cast<unsigned long long>(call.ordinal),
+                                 static_cast<long long>(timeout.count()), static_cast<unsigned long long>(completed), static_cast<unsigned long long>(accepted), static_cast<unsigned long long>(inFlight));
+                    if (options.strict) throw std::runtime_error("frame replay: memory call " + std::to_string(call.ordinal) + " waited longer than the pacing timeout");
+                    return;
+                }
                 stalled.store(true);
                 stalledAt.store(completed);
                 std::fprintf(stderr, "[frame-replay] pacing gave up at call %llu (%s): serials %llu/%llu, the capture had %llu in flight\n", static_cast<unsigned long long>(call.ordinal),
@@ -714,9 +728,9 @@ int run(const Options& options) {
     std::sort(frameMs.begin(), frameMs.end());
     const auto percentile = [&](double fraction) { return frameMs.empty() ? 0.0 : frameMs[std::min(frameMs.size() - 1, static_cast<std::size_t>(fraction * static_cast<double>(frameMs.size())))]; };
     const auto seconds = std::chrono::duration<double>(replay.endedAt - replay.startedAt).count();
-    std::printf("{\"frames\":%zu,\"replay_s\":%.3f,\"fps\":%.3f,\"frame_ms\":{\"p50\":%.3f,\"p90\":%.3f,\"max\":%.3f,\"each\":[%s]},\"submits\":%llu,\"delta_mib\":%.1f,\"pace_timeouts\":%llu,\"pace_wait_s\":%.3f,\"stale_registrations\":%llu,\"failed_registrations\":%llu,\"skipped_mib\":%.1f,\"threads\":%zu,\"released_waits\":%llu,\"of_them_from_earlier_writes\":%llu,\"of_them_synthesized\":%llu,\"unfinished\":%llu,\"frames_compared\":%zu,\"pixels_identical\":%.6f,\"max_channel_diff\":%d,\"load_s\":%.3f}\n",
+    std::printf("{\"frames\":%zu,\"replay_s\":%.3f,\"fps\":%.3f,\"frame_ms\":{\"p50\":%.3f,\"p90\":%.3f,\"max\":%.3f,\"each\":[%s]},\"submits\":%llu,\"delta_mib\":%.1f,\"pace_timeouts\":%llu,\"memory_pace_timeouts\":%llu,\"pace_wait_s\":%.3f,\"stale_registrations\":%llu,\"failed_registrations\":%llu,\"skipped_mib\":%.1f,\"threads\":%zu,\"released_waits\":%llu,\"of_them_from_earlier_writes\":%llu,\"of_them_synthesized\":%llu,\"unfinished\":%llu,\"frames_compared\":%zu,\"pixels_identical\":%.6f,\"max_channel_diff\":%d,\"load_s\":%.3f}\n",
                 ready.size(), seconds, seconds > 0 ? static_cast<double>(ready.size()) / seconds : 0.0, percentile(0.5), percentile(0.9), frameMs.empty() ? 0.0 : frameMs.back(), frameList.c_str(),
-                static_cast<unsigned long long>(replay.submits.load()), static_cast<double>(replay.deltaBytes.load()) / (1024.0 * 1024.0), static_cast<unsigned long long>(replay.paceTimeouts.load()),
+                static_cast<unsigned long long>(replay.submits.load()), static_cast<double>(replay.deltaBytes.load()) / (1024.0 * 1024.0), static_cast<unsigned long long>(replay.paceTimeouts.load()), static_cast<unsigned long long>(replay.memoryPaceTimeouts.load()),
                 replay.paceWaitedSeconds(), static_cast<unsigned long long>(replay.staleRegistrations.load()), static_cast<unsigned long long>(replay.failedRegistrations.load()),
                 static_cast<double>(replay.skipped.bytes) / (1024.0 * 1024.0), replay.threads, static_cast<unsigned long long>(replay.earlyReleases.load()), static_cast<unsigned long long>(replay.lateReleases.load()),
                 static_cast<unsigned long long>(replay.syntheticReleases.load()),
