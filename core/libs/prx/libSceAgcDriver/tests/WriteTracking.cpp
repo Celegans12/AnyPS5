@@ -38,6 +38,7 @@ constexpr std::size_t Block = 65536;
 #ifdef _WIN32
 constexpr wchar_t HostHoleMode[] = L"--host-hole";
 constexpr wchar_t ResidentRemapMode[] = L"--resident-direct-remap";
+constexpr wchar_t OwnedProofsMode[] = L"--owned-proofs";
 #endif
 
 void Require(bool condition, const std::string& message) {
@@ -1960,6 +1961,270 @@ void CheckAdoptLatestEpoch() {
     Require(keptOwn, "adopting the newest collect epoch moved a thread off its own");
 }
 
+#ifdef _WIN32
+// Owned proofs (GuestMemory::ArmOwnedBlocks / OwnedWordsHold / OwnedProofHolds over the libc arena's
+// resident direct memory, through libc's own fault handler): every CPU store, host write, protection
+// or mapping change of an armed block moves its word before it takes effect, across threads; what
+// cannot be armed (private memory, aliased views, host memory) is refused.
+struct DirectFixture {
+    std::size_t bytes;
+    std::uint8_t* memory = nullptr;
+    HANDLE section = nullptr;
+
+    DirectFixture(std::size_t bytes, std::size_t mappedBytes) : bytes(bytes) {
+        memory = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, Block));
+        Require(memory != nullptr, "cannot reserve the owned-proof fixture");
+        section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, static_cast<DWORD>(bytes), nullptr);
+        Require(section != nullptr, "cannot create the owned-proof backing");
+        Map(0, mappedBytes);
+    }
+    ~DirectFixture() {
+        GuestArena::GuestArenaReset_nid_postfix(memory, bytes);
+        GuestArena::GuestArenaRelease_nid_postfix(memory, bytes);
+        GuestArena::GuestArenaForgetSection_nid_postfix(section);
+        CloseHandle(section);
+    }
+    DirectFixture(const DirectFixture&) = delete;
+    DirectFixture& operator=(const DirectFixture&) = delete;
+    void Map(std::size_t offset, std::size_t length) {
+        GuestArena::GuestArenaMapDirect_nid_postfix(memory + offset, length, section, offset, PAGE_READWRITE);
+    }
+    std::uint64_t Base() const { return reinterpret_cast<std::uint64_t>(memory); }
+    volatile std::uint8_t& At(std::size_t offset) { return static_cast<volatile std::uint8_t*>(memory)[offset]; }
+    DWORD Protection(std::size_t offset) const {
+        MEMORY_BASIC_INFORMATION info{};
+        Require(VirtualQuery(memory + offset, &info, sizeof(info)) == sizeof(info), "cannot query owned-proof protection");
+        return info.Protect;
+    }
+};
+
+std::vector<std::uint64_t> ArmOwned(std::uint64_t address, std::size_t bytes) {
+    std::vector<std::uint64_t> words(HashBlockCount(address, bytes));
+    if (!ArmOwnedBlocks(address, bytes, words)) words.clear();
+    return words;
+}
+
+void CheckOwnedStampOnWrite() {
+    DirectFixture fixture(4 * Block, 4 * Block);
+    const auto base = fixture.Base();
+    std::uintptr_t spanBegin = 0;
+    std::uintptr_t spanEnd = 0;
+    Require(GuestArena::GuestArenaResidentSpan_nid_postfix(base, 1, &spanBegin, &spanEnd) && spanBegin == base, "the owned-proof fixture is not resident direct memory");
+    TakeOwnedBlockCounts();
+    fixture.At(Block + 17) = 0x21;
+    const auto words = ArmOwned(base + 100, 2 * Block);
+    Require(words.size() == 3, "resident direct memory with one view could not be armed");
+    Require(fixture.Protection(0) == PAGE_READONLY && fixture.Protection(2 * Block + 4096) == PAGE_READONLY && fixture.Protection(3 * Block) == PAGE_READWRITE, "arming did not write-protect exactly its blocks");
+    Require(OwnedWordsHold(base + 100, 2 * Block, words), "armed words do not hold without a store");
+    Require(fixture.At(Block + 17) == 0x21, "a read of armed memory changed it");
+    Require(OwnedWordsHold(base + 100, 2 * Block, words), "a read moved the armed words");
+    const auto since = TrackerGeneration();
+    Require(OwnedProofHolds(base + 100, 2 * Block, words, since), "an armed proof without a store does not hold");
+    fixture.At(Block + 18) = 0x42;
+    Require(fixture.At(Block + 18) == 0x42, "the store into armed memory did not land");
+    Require(!OwnedWordsHold(base + 100, 2 * Block, words) && !OwnedProofHolds(base + 100, 2 * Block, words, since), "a CPU store into an armed block left its words");
+    Require(OwnedWordsHold(base, Block, std::span(words).first(1)) && OwnedWordsHold(base + 2 * Block, Block, std::span(words).subspan(2, 1)), "a CPU store moved the words of other blocks");
+    Require(fixture.Protection(Block) == PAGE_READWRITE && fixture.Protection(0) == PAGE_READONLY, "the fault opened more or less than its block");
+    const auto counts = TakeOwnedBlockCounts();
+    Require(counts.arms == 1 && counts.armedBlocks == 3 && counts.faults == 1, "owned counts do not show one arm of three blocks and one fault");
+    std::cout << "owned proofs: arm, read, store faults and moves only its block's word\n";
+
+    // A driver stamp (MarkWritten: a GPU write through an import) ends the proof through the tracker.
+    const auto again = ArmOwned(base, Block);
+    Require(again.size() == 1 && again[0] == words[0], "re-arming an armed block changed its word");
+    const auto stamped = TrackerGeneration();
+    Require(OwnedProofHolds(base, Block, again, stamped), "an armed proof at the current generation does not hold");
+    MarkWritten(base + 64, 4);
+    Require(OwnedWordsHold(base, Block, again) && !OwnedProofHolds(base, Block, again, stamped), "a driver stamp did not end the armed proof");
+    std::cout << "owned proofs: driver stamps end the proof through the tracker\n";
+}
+
+void CheckOwnedRearm() {
+    DirectFixture fixture(2 * Block, 2 * Block);
+    const auto base = fixture.Base();
+    TakeOwnedBlockCounts();
+    std::uint64_t previous = 0;
+    for (unsigned round = 0; round < 8; ++round) {
+        const auto words = ArmOwned(base, 2 * Block);
+        Require(words.size() == 2 && words[0] != previous && (words[0] & 1u) != 0, "a faulted block was not re-armed with a new word");
+        previous = words[0];
+        Require(OwnedWordsHold(base, 2 * Block, words), "re-armed words do not hold");
+        fixture.At(round * 4096 + 3) = static_cast<std::uint8_t>(round + 1);
+        Require(!OwnedWordsHold(base, 2 * Block, words) && fixture.At(round * 4096 + 3) == round + 1, "a store after re-arming was missed");
+    }
+    const auto counts = TakeOwnedBlockCounts();
+    Require(counts.faults == 8 && counts.arms == 8 && counts.armedBlocks == 9, "re-arm rounds did not fault once each");
+    std::cout << "owned proofs: re-armed after every fault, each store seen\n";
+}
+
+void CheckOwnedCrossThread() {
+    DirectFixture fixture(Block, Block);
+    const auto base = fixture.Base();
+    auto* value = reinterpret_cast<volatile std::uint32_t*>(fixture.memory + 0x2000);
+    *value = 0;
+    // Deterministic: a store made and finished on another thread is seen by a later check.
+    {
+        const auto words = ArmOwned(base, Block);
+        Require(!words.empty(), "cannot arm the cross-thread fixture");
+        std::thread([&] { *value = 1; }).join();
+        Require(!OwnedWordsHold(base, Block, words) && *value == 1, "a store finished on another thread left the words");
+    }
+    // Racing: the writer stores n, then publishes n. A check that holds after reading the published
+    // value p cannot have missed a store: p is at most the value read right after arming.
+    std::atomic<std::uint32_t> published{1};
+    std::atomic<bool> stop{false};
+    std::thread writer([&] {
+        for (std::uint32_t next = 2; !stop.load(std::memory_order_relaxed); ++next) {
+            *value = next;
+            published.store(next, std::memory_order_release);
+            if ((next & 63u) == 0) std::this_thread::yield();
+        }
+    });
+    std::size_t held = 0;
+    std::size_t moved = 0;
+    try {
+        for (unsigned round = 0; round < 3000; ++round) {
+            const auto words = ArmOwned(base, Block);
+            Require(!words.empty(), "cannot re-arm the racing fixture");
+            const auto armedValue = *value;
+            for (unsigned check = 0; check < 64; ++check) {
+                const auto seen = published.load(std::memory_order_acquire);
+                if (!OwnedWordsHold(base, Block, words)) {
+                    ++moved;
+                    break;
+                }
+                ++held;
+                Require(seen <= armedValue, "an armed check held after a store it should have seen");
+            }
+        }
+    } catch (...) {
+        stop = true;
+        writer.join();
+        throw;
+    }
+    stop = true;
+    writer.join();
+    Require(moved > 0, "the racing writer never moved the words");
+    std::cout << "owned proofs: cross-thread stores, " << held << " checks held, " << moved << " saw the store\n";
+}
+
+void CheckOwnedRefusals() {
+    // Private memory (flexible commits) is not armed: host calls may write it without HostWrite.
+    {
+        constexpr std::size_t bytes = 2 * Block;
+        auto* memory = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, Block));
+        GuestArena::GuestArenaCommit_nid_postfix(memory, bytes, PAGE_READWRITE, bytes);
+        Require(ArmOwned(reinterpret_cast<std::uint64_t>(memory), bytes).empty(), "private memory was armed");
+        GuestArena::GuestArenaReset_nid_postfix(memory, bytes);
+        GuestArena::GuestArenaRelease_nid_postfix(memory, bytes);
+    }
+    // Two guest views of one backing are not armed, and aliasing an armed view disarms it.
+    {
+        constexpr std::size_t bytes = Block;
+        HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, bytes, nullptr);
+        Require(section != nullptr, "cannot create the alias backing");
+        auto* first = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, Block));
+        auto* second = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, Block));
+        GuestArena::GuestArenaMapDirect_nid_postfix(first, bytes, section, 0, PAGE_READWRITE);
+        const auto words = ArmOwned(reinterpret_cast<std::uint64_t>(first), bytes);
+        Require(!words.empty(), "a single resident view could not be armed");
+        GuestArena::GuestArenaMapDirect_nid_postfix(second, bytes, section, 0, PAGE_READWRITE);
+        Require(!OwnedWordsHold(reinterpret_cast<std::uint64_t>(first), bytes, words), "aliasing an armed block left its words");
+        Require(ArmOwned(reinterpret_cast<std::uint64_t>(first), bytes).empty() && ArmOwned(reinterpret_cast<std::uint64_t>(second), bytes).empty(), "an aliased view was armed");
+        static_cast<volatile std::uint8_t*>(second)[8] = 0x77;
+        Require(static_cast<volatile std::uint8_t*>(first)[8] == 0x77, "the aliased views do not share their backing");
+        GuestArena::GuestArenaReset_nid_postfix(first, bytes);
+        GuestArena::GuestArenaReset_nid_postfix(second, bytes);
+        GuestArena::GuestArenaRelease_nid_postfix(first, bytes);
+        GuestArena::GuestArenaRelease_nid_postfix(second, bytes);
+        GuestArena::GuestArenaForgetSection_nid_postfix(section);
+        CloseHandle(section);
+    }
+    // Memory outside the arena is not armed.
+    std::vector<std::uint8_t> host(2 * Block);
+    Require(ArmOwned(reinterpret_cast<std::uint64_t>(host.data()), Block).empty(), "host memory was armed");
+    std::cout << "owned proofs: private memory, aliased views and host memory refused\n";
+}
+
+void CheckOwnedMappingChanges() {
+    // Decommit: an unmap of an armed range moves its words; remapped memory starts over.
+    {
+        DirectFixture fixture(2 * Block, 2 * Block);
+        const auto base = fixture.Base();
+        const auto words = ArmOwned(base, 2 * Block);
+        Require(!words.empty(), "cannot arm the decommit fixture");
+        GuestArena::GuestArenaReset_nid_postfix(fixture.memory, 2 * Block);
+        Require(!OwnedWordsHold(base, 2 * Block, words), "an unmap of armed memory left its words");
+        Require(ArmOwned(base, 2 * Block).empty(), "unmapped memory was armed");
+        fixture.Map(0, 2 * Block);
+        Require(!OwnedWordsHold(base, 2 * Block, words), "remapped memory kept the old words");
+        Require(!ArmOwned(base, 2 * Block).empty(), "remapped memory cannot be armed");
+    }
+    // A block with an unmapped placeholder page is armed; mapping the page moves its word.
+    {
+        DirectFixture fixture(Block, 3 * 16384);
+        const auto base = fixture.Base();
+        const auto words = ArmOwned(base, 3 * 16384);
+        Require(words.size() == 1, "a partly mapped block could not be armed");
+        fixture.Map(3 * 16384, 16384);
+        Require(!OwnedWordsHold(base, 3 * 16384, words), "mapping into an armed block left its word");
+    }
+    // A guest protection change moves the words, and nothing is armed until it has landed.
+    {
+        DirectFixture fixture(Block, Block);
+        const auto base = fixture.Base();
+        const auto words = ArmOwned(base, Block);
+        Require(!words.empty(), "cannot arm the protection fixture");
+        GuestArena::GuestArenaSetProtection_nid_postfix(base, Block, PAGE_READWRITE);
+        Require(!OwnedWordsHold(base, Block, words), "a guest protection change left the words");
+        Require(ArmOwned(base, Block).empty(), "a block was armed while a guest protection change was in flight");
+        DWORD previous = 0;
+        Require(VirtualProtect(fixture.memory, Block, PAGE_READWRITE, &previous) != 0, "cannot apply the guest protection change");
+        GuestArena::GuestArenaEndSetProtection_nid_no_patch(base, Block);
+        const auto after = ArmOwned(base, Block);
+        Require(!after.empty(), "the block cannot be armed after the protection change");
+        fixture.At(5) = 1;
+        Require(!OwnedWordsHold(base, Block, after), "a store after re-arming past a protection change was missed");
+    }
+    // A host write (an OS call storing into guest memory, here ReadFile) opens the block first.
+    {
+        DirectFixture fixture(Block, Block);
+        const auto base = fixture.Base();
+        std::array<wchar_t, MAX_PATH> directory{};
+        std::array<wchar_t, MAX_PATH> path{};
+        Require(GetTempPathW(MAX_PATH, directory.data()) != 0 && GetTempFileNameW(directory.data(), L"own", 0, path.data()) != 0, "cannot name the host-write file");
+        {
+            HANDLE file = CreateFileW(path.data(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, nullptr);
+            Require(file != INVALID_HANDLE_VALUE, "cannot create the host-write file");
+            std::array<std::uint8_t, 64> content{};
+            content.fill(0x3c);
+            DWORD written = 0;
+            const bool stored = WriteFile(file, content.data(), static_cast<DWORD>(content.size()), &written, nullptr) != 0 && written == content.size();
+            CloseHandle(file);
+            Require(stored, "cannot write the host-write file");
+        }
+        const auto words = ArmOwned(base, Block);
+        Require(!words.empty(), "cannot arm the host-write fixture");
+        bool read = false;
+        {
+            const GuestArena::HostWrite write(fixture.memory + 512, 64);
+            Require(write.Open() && !OwnedWordsHold(base, Block, words), "a host write left the words");
+            Require(ArmOwned(base, Block).empty(), "a block was armed during a host write");
+            HANDLE file = CreateFileW(path.data(), GENERIC_READ, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+            if (file != INVALID_HANDLE_VALUE) {
+                DWORD count = 0;
+                read = ReadFile(file, fixture.memory + 512, 64, &count, nullptr) != 0 && count == 64;
+                CloseHandle(file);
+            }
+        }
+        DeleteFileW(path.data());
+        Require(read && fixture.At(512) == 0x3c && fixture.At(575) == 0x3c, "the host write into opened memory did not land");
+        Require(!ArmOwned(base, Block).empty(), "the block cannot be armed after the host write");
+    }
+    std::cout << "owned proofs: unmap, partial map, guest protection and host writes move the words\n";
+}
+#endif
+
 int main(int argc, char** argv) {
     try {
 #ifdef _WIN32
@@ -1984,6 +2249,15 @@ int main(int argc, char** argv) {
         }
         if (std::wstring_view(GetCommandLineW()).ends_with(ResidentRemapMode)) {
             CheckResidentDirectMappingReuse();
+            return 0;
+        }
+        if (std::wstring_view(GetCommandLineW()).ends_with(OwnedProofsMode)) {
+            CheckOwnedStampOnWrite();
+            CheckOwnedRearm();
+            CheckOwnedCrossThread();
+            CheckOwnedRefusals();
+            CheckOwnedMappingChanges();
+            std::cout << "owned proof tests passed\n";
             return 0;
         }
 #endif

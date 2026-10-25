@@ -587,6 +587,56 @@ bool GuestArenaWriteWatched_nid_postfix() {
     return Arena::Get().WriteWatched();
 }
 
+#ifdef _WIN32
+namespace {
+
+bool ownedRangeInArena(std::uintptr_t address, std::size_t bytes) {
+    constexpr std::uintptr_t block = WindowsMappings::ownedBlockBytes;
+    if (bytes == 0 || bytes > std::numeric_limits<std::uintptr_t>::max() - address - block) return false;
+    const auto first = address & ~(block - 1);
+    const auto stop = (address + bytes + block - 1) & ~(block - 1);
+    return Arena::Get().Contains(reinterpret_cast<const void*>(first), stop - first) && !Arena::Get().OverlapsHostRegion(first, stop - first);
+}
+
+}
+
+bool GuestArenaArmOwned_nid_no_patch(std::uintptr_t address, std::size_t bytes, std::uint64_t* words, std::size_t count) {
+    if (!ownedRangeInArena(address, bytes)) return false;
+    return WindowsMappings::Get().ArmOwned(address, bytes, words, count);
+}
+
+bool GuestArenaOwnedUnchanged_nid_no_patch(std::uintptr_t address, std::size_t bytes, const std::uint64_t* words, std::size_t count) {
+    return WindowsMappings::Get().OwnedUnchanged(address, bytes, words, count);
+}
+
+void GuestArenaTakeOwnedCounts_nid_no_patch(std::uint64_t* counts) {
+    const auto taken = WindowsMappings::Get().TakeOwnedCounts();
+    counts[0] = taken.arms;
+    counts[1] = taken.armedBlocks;
+    counts[2] = taken.refused;
+    counts[3] = taken.faults;
+    counts[4] = taken.disowned;
+}
+
+void GuestArenaEndSetProtection_nid_no_patch(std::uintptr_t, std::size_t) {
+    WindowsMappings::Get().EndSetProtection();
+}
+#else
+bool GuestArenaArmOwned_nid_no_patch(std::uintptr_t, std::size_t, std::uint64_t*, std::size_t) {
+    return false;
+}
+
+bool GuestArenaOwnedUnchanged_nid_no_patch(std::uintptr_t, std::size_t, const std::uint64_t*, std::size_t) {
+    return false;
+}
+
+void GuestArenaTakeOwnedCounts_nid_no_patch(std::uint64_t* counts) {
+    for (std::size_t i = 0; i < 5; ++i) counts[i] = 0;
+}
+
+void GuestArenaEndSetProtection_nid_no_patch(std::uintptr_t, std::size_t) {}
+#endif
+
 void GuestArenaSetHostWriteHook_nid_no_patch(void (*hook)(std::uintptr_t, std::size_t)) {
     hostWriteHook.store(hook, std::memory_order_release);
 }

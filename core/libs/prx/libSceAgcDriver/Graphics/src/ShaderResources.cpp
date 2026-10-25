@@ -110,6 +110,17 @@ TextureKey MakeTextureKey(VkDevice device, std::span<const std::uint32_t> words,
     return key;
 }
 
+// The owned proof of an untracked snapshot (APS5_NO_OWNED_PROOFS): the armed words of the surface's
+// 64 KiB blocks (GuestMemory::ArmOwnedBlocks), taken before the walk and compare that set its
+// blockSince and blockGuard; empty when that walk ran unarmed. While the words, the tracker stamps
+// and the guard hold, the snapshot is current without the walk. A proof whose words moved (a CPU
+// store into the surface's blocks) backs off arming: 2^n - 1 walks unarmed after the n-th in a row.
+struct OwnedProof {
+    std::vector<std::uint64_t> words;
+    std::uint8_t backoff = 0;
+    std::uint16_t skip = 0;
+};
+
 struct CachedTexture {
     TextureKey key;
     std::uint64_t address;
@@ -137,6 +148,7 @@ struct CachedTexture {
     std::uint64_t blockSince = 0;
     std::array<std::uint64_t, 2> blockGuard{};
     GuestMemory::Commitment blockLayout;
+    OwnedProof owned;
 };
 
 // Entries in use order (front = most recent) with a hash index by key: a lookup is O(1) and the
@@ -849,7 +861,9 @@ std::uint64_t untrackedBaseline(std::uint64_t address, std::size_t bytes, GuestM
     return GuestMemory::WalkUntrackedBlocks(address, bytes, 0, stale, nullptr, nullptr, &layout);
 }
 
-bool untrackedStillMatches(std::uint64_t address, std::size_t bytes, std::span<const ContentHash::Hash128> hashes, std::uint64_t& since, std::array<std::uint64_t, 2>& guard, GuestMemory::Commitment& layout, SnapshotCompare reason) {
+// The walk proof of an untracked snapshot (as before owned proofs): walk the blocks' CPU writes
+// since `since`, compare the blocks the walk could not prove unchanged.
+bool untrackedWalkMatches(std::uint64_t address, std::size_t bytes, std::span<const ContentHash::Hash128> hashes, std::uint64_t& since, std::array<std::uint64_t, 2>& guard, GuestMemory::Commitment& layout, SnapshotCompare reason) {
     const auto count = hashes.size();
     if (!UntrackedBlocksEnabled() || count != GuestMemory::HashBlockCount(address, bytes)) {
         since = 0;
@@ -900,6 +914,149 @@ bool untrackedStillMatches(std::uint64_t address, std::size_t bytes, std::span<c
         since = 0;
     }
     if (SnapshotComparesProfiled()) noteSnapshotCompare(reason, equal, trusted, match, &kinds);
+    return equal;
+}
+
+// APS5_PROFILE_DRAW: the owned proofs of untracked snapshots ([owned-proofs], 10 s deltas).
+struct OwnedProofCounters {
+    std::atomic<std::uint64_t> held{0};
+    std::atomic<std::uint64_t> wordsMoved{0};
+    std::atomic<std::uint64_t> stampsMoved{0};
+    std::atomic<std::uint64_t> walks{0};
+    std::atomic<std::uint64_t> armedWalks{0};
+    std::atomic<std::uint64_t> notArmable{0};
+    std::atomic<std::uint64_t> backingOff{0};
+    std::atomic<std::uint64_t> switchedOff{0};
+    std::atomic<std::uint64_t> verified{0};
+    std::atomic<std::uint64_t> disagreed{0};
+    std::atomic<std::uint64_t> windowVerified{0};
+    std::atomic<std::int64_t> windowStart{0};
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+OwnedProofCounters& OwnedProofCounts() {
+    static OwnedProofCounters counters;
+    return counters;
+}
+
+std::int64_t steadyMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+void reportOwnedProofs() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile) return;
+    auto& counters = OwnedProofCounts();
+    const auto nowMs = steadyMs();
+    auto last = counters.lastReport.load();
+    if (nowMs - last < 10000 || !counters.lastReport.compare_exchange_strong(last, nowMs)) return;
+    const auto take = [](std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.exchange(0, std::memory_order_relaxed)); };
+    const auto blocks = GuestMemory::TakeOwnedBlockCounts();
+    const auto held = take(counters.held);
+    const auto wordsMoved = take(counters.wordsMoved);
+    const auto stampsMoved = take(counters.stampsMoved);
+    const auto walks = take(counters.walks);
+    const auto armedWalks = take(counters.armedWalks);
+    const auto notArmable = take(counters.notArmable);
+    const auto backingOff = take(counters.backingOff);
+    const auto switchedOff = take(counters.switchedOff);
+    const auto verified = take(counters.verified);
+    const auto disagreed = take(counters.disagreed);
+    AgcDriver::ProfilePrint_nid_no_patch("[owned-proofs] (10 s): armed proofs %llu held, %llu found the words moved, %llu found stamps or guard moved; fallback proofs (walks) %llu: %llu armed first, %llu not armable, %llu backing off, %llu switched off; arms %llu (blocks newly protected %llu), refused %llu; faults %llu, other disarms %llu; verified %llu, disagreed %llu\n", held, wordsMoved, stampsMoved, walks, armedWalks, notArmable, backingOff, switchedOff, static_cast<unsigned long long>(blocks.arms), static_cast<unsigned long long>(blocks.armedBlocks), static_cast<unsigned long long>(blocks.refused), static_cast<unsigned long long>(blocks.faults), static_cast<unsigned long long>(blocks.disowned), verified, disagreed);
+}
+
+// APS5_VERIFY_OWNED_PROOFS=<n>: the first n held armed proofs of every 10 s also run a full walk and
+// compare (from generation 0, so every block is hashed) and print any disagreement.
+bool takeOwnedVerify() {
+    static const std::uint64_t budget = [] {
+        const char* value = std::getenv("APS5_VERIFY_OWNED_PROOFS");
+        return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ull;
+    }();
+    if (budget == 0) return false;
+    auto& counters = OwnedProofCounts();
+    const auto nowMs = steadyMs();
+    auto start = counters.windowStart.load();
+    if (nowMs - start >= 10000 && counters.windowStart.compare_exchange_strong(start, nowMs)) counters.windowVerified.store(0, std::memory_order_relaxed);
+    return counters.windowVerified.fetch_add(1, std::memory_order_relaxed) < budget;
+}
+
+// An untracked snapshot's proof. With owned proofs (the default; APS5_NO_OWNED_PROOFS selects the
+// walk alone) a surface whose blocks were armed before the walk that proved it current is proved
+// again by the armed words, the tracker stamps and the guard: no walk, no compare. Anything else
+// (not armable, armed words that moved, stamps or guard that moved) walks as before; the walk is
+// armed first when it can be, so the next proof can take the armed path.
+//
+// Exactness: arming write-protects the blocks before the walk starts. A CPU store before it is
+// seen by the walk (dirty bits) or the compare (the bytes), exactly as without arming. A CPU store
+// after it faults and moves the block's word before it lands, and a mapping, protection or host
+// write change moves it before it happens, so an unchanged word means no such change since the
+// walk started. The driver's and the GPU's writes reach the range through the tracker (MarkWritten
+// stamps, untracked-host stores), recorded but unstamped ones through the guard's write note and
+// the pending write snapshot, the same evidence the walk itself uses for the blocks it skips. The
+// flush hook runs first, as before the walk's compare.
+bool untrackedStillMatches(std::uint64_t address, std::size_t bytes, std::span<const ContentHash::Hash128> hashes, std::uint64_t& since, std::array<std::uint64_t, 2>& guard, GuestMemory::Commitment& layout, SnapshotCompare reason, OwnedProof& owned) {
+    auto& counters = OwnedProofCounts();
+    const auto count = hashes.size();
+    if (RuntimeSwitches::Set(RuntimeSwitch::NoOwnedProofs) || !UntrackedBlocksEnabled() || count != GuestMemory::HashBlockCount(address, bytes)) {
+        owned.words.clear();
+        counters.walks.fetch_add(1, std::memory_order_relaxed);
+        counters.switchedOff.fetch_add(1, std::memory_order_relaxed);
+        reportOwnedProofs();
+        return untrackedWalkMatches(address, bytes, hashes, since, guard, layout, reason);
+    }
+    if (!owned.words.empty() && since != 0) {
+        const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureCompare);
+        GuestMemory::FlushGpuWrites(address, bytes);
+        const auto now = untrackedGuard(address, bytes);
+        const bool wordsHold = GuestMemory::OwnedWordsHold(address, bytes, owned.words);
+        const bool holds = wordsHold && (now[0] & 1u) == 0 && now == guard && !Recorder::SnapshotWriteOverlaps(address, bytes) && GuestMemory::OwnedProofHolds(address, bytes, owned.words, since);
+        if (holds) {
+            owned.backoff = 0;
+            bool equal = true;
+            if (takeOwnedVerify()) {
+                std::uint64_t fullSince = 0;
+                auto fullGuard = guard;
+                auto fullLayout = layout;
+                equal = untrackedWalkMatches(address, bytes, hashes, fullSince, fullGuard, fullLayout, reason);
+                counters.verified.fetch_add(1, std::memory_order_relaxed);
+                if (!equal) {
+                    counters.disagreed.fetch_add(1, std::memory_order_relaxed);
+                    std::fprintf(stderr, "[owned-proofs] verify: 0x%llx+0x%zx (%zu blocks, since %llu): the armed proof held, the full walk and compare found the surface changed%c", static_cast<unsigned long long>(address), bytes, count, static_cast<unsigned long long>(since), 10);
+                    owned.words.clear();
+                    since = 0;
+                }
+            }
+            if (equal) {
+                counters.held.fetch_add(1, std::memory_order_relaxed);
+                if (SnapshotComparesProfiled()) noteSnapshotCompare(reason, true, true, GuestMemory::BlockMatch{0, count, 0, bytes}, nullptr);
+            }
+            reportOwnedProofs();
+            return equal;
+        }
+        if (!wordsHold) {
+            counters.wordsMoved.fetch_add(1, std::memory_order_relaxed);
+            owned.backoff = static_cast<std::uint8_t>(std::min<unsigned>(owned.backoff + 1u, 6u));
+            owned.skip = static_cast<std::uint16_t>((1u << owned.backoff) - 1u);
+        } else {
+            counters.stampsMoved.fetch_add(1, std::memory_order_relaxed);
+        }
+        owned.words.clear();
+    }
+    counters.walks.fetch_add(1, std::memory_order_relaxed);
+    std::vector<std::uint64_t> words;
+    bool armed = false;
+    if (owned.skip != 0) {
+        --owned.skip;
+        counters.backingOff.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        words.resize(count);
+        armed = GuestMemory::ArmOwnedBlocks(address, bytes, words);
+        (armed ? counters.armedWalks : counters.notArmable).fetch_add(1, std::memory_order_relaxed);
+    }
+    const bool equal = untrackedWalkMatches(address, bytes, hashes, since, guard, layout, reason);
+    if (armed && equal && since != 0) owned.words = std::move(words);
+    else owned.words.clear();
+    reportOwnedProofs();
     return equal;
 }
 
@@ -1559,7 +1716,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                     }
                     return untracked[0] == 0 ? SnapshotCompare::Untracked : SnapshotCompare::HintMoved;
                 }();
-                if (!collected && *keys == DccKeys::Uncompressed) return untrackedStillMatches(address, bytes, it->hashes, it->blockSince, it->blockGuard, it->blockLayout, reason);
+                if (!collected && *keys == DccKeys::Uncompressed) return untrackedStillMatches(address, bytes, it->hashes, it->blockSince, it->blockGuard, it->blockLayout, reason, it->owned);
                 return snapshotStillMatches(address, bytes, it->hashes, collected ? it->generation : 0, it->committed, reason);
             };
             const auto unchanged = [&] {

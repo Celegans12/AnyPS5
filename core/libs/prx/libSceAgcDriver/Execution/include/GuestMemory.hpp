@@ -88,6 +88,30 @@ bool UntrackedLayoutWalks();
 std::uint64_t WalkUntrackedBlocks(std::uint64_t address, std::size_t bytes, std::uint64_t previous, std::span<std::uint8_t> stale, UntrackedBlocks* kinds = nullptr, const Commitment* before = nullptr, Commitment* now = nullptr);
 bool CommittedBlocksMatchSince(std::uint64_t address, std::size_t bytes, std::span<const ContentHash::Hash128> expected, std::uint64_t generation, const std::vector<std::pair<std::uint64_t, std::uint64_t>>* before, std::span<const std::uint8_t> pending, BlockMatch* match = nullptr);
 
+// Owned blocks (the owned proofs of untracked snapshots, APS5_NO_OWNED_PROOFS; Windows only, see
+// GuestArena::GuestArenaArmOwned_nid_no_patch): the 64 KiB blocks of a range (one word per
+// HashBlockCount block) are write-protected, so the first CPU store into one moves its word before
+// the store lands, as does every mapping or protection change and every host write opened over it.
+// ArmOwnedBlocks arms them all or none. A walk made after it that proves the range current at a
+// tracker generation `since` (WalkUntrackedBlocks, then the compare) stays valid while
+// OwnedProofHolds: every word unchanged (no CPU store since the arming) and no tracker stamp
+// (MarkWritten, a collect, a host-region store) or untracked hint newer than `since` over the range,
+// which is what the walk checks for the driver's and the GPU's writes. Recorded GPU writes not yet
+// stamped are the caller's to check (the write notes, as for the walk).
+bool ArmOwnedBlocks(std::uint64_t address, std::size_t bytes, std::span<std::uint64_t> words);
+bool OwnedWordsHold(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> words);
+bool OwnedProofHolds(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> words, std::uint64_t since);
+// Arms (all blocks armed), blocks newly write-protected, arms refused, blocks disarmed by a CPU store,
+// blocks disarmed by a mapping, protection or host-write change, since the last call.
+struct OwnedBlockCounts {
+    std::uint64_t arms = 0;
+    std::uint64_t armedBlocks = 0;
+    std::uint64_t refused = 0;
+    std::uint64_t faults = 0;
+    std::uint64_t disowned = 0;
+};
+OwnedBlockCounts TakeOwnedBlockCounts();
+
 // Write tracking. The guest arena is reserved with page write watching, so CollectWrites learns which
 // pages of a range the CPU wrote since they were last collected, stamps their 64 KiB blocks with a new
 // generation and returns it; a snapshot of the range taken after that call is current while
