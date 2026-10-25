@@ -570,7 +570,15 @@ void FrameRecorder::emitShaderDelta(std::span<const Shader* const> shaders) {
         note(shader->user_data->direct_resource_offset);
         for (const auto* sharps : shader->user_data->sharp_resource_offset) note(sharps);
     }
-    if (blocks.empty() && hostPages.empty()) return;
+    std::vector<std::pair<std::uint64_t, std::vector<std::byte>>> images;
+    for (const auto& entry : prologueShaders(shaders, false)) {
+        auto& known = shaderImageHashes[entry.header];
+        if (known == entry.headerHash) continue;
+        known = entry.headerHash;
+        images.emplace_back(entry.header, headerImages.at(entry.headerHash));
+    }
+    headerImages.clear();
+    if (blocks.empty() && hostPages.empty() && images.empty()) return;
     const auto mark = GuestMemory::WriteGeneration();
     std::vector<Span> spans;
     for (const auto block : blocks) {
@@ -578,11 +586,11 @@ void FrameRecorder::emitShaderDelta(std::span<const Shader* const> shaders) {
         spans.push_back({block, FrameCaptureWriter::BlockBytes, found != shaderMarks.end() ? std::max(found->second, generation) : generation});
     }
     const std::vector<std::uint64_t> pages(hostPages.begin(), hostPages.end());
-    writeDelta(spans, pages);
+    writeDelta(spans, pages, {}, images);
     for (const auto block : blocks) shaderMarks[block] = mark;
 }
 
-void FrameRecorder::writeDelta(std::span<const Span> spans, std::span<const std::uint64_t> hostPages, std::span<const Range> added) {
+void FrameRecorder::writeDelta(std::span<const Span> spans, std::span<const std::uint64_t> hostPages, std::span<const Range> added, std::span<const std::pair<std::uint64_t, std::vector<std::byte>>> images) {
     if (abandonIfDiskLow()) return;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> blocks;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> written;
@@ -632,6 +640,11 @@ void FrameRecorder::writeDelta(std::span<const Span> spans, std::span<const std:
         known = hash;
         writer->WriteDelta(group, completed, page, bytes);
         deltaBytes += bytes.size();
+        any = true;
+    }
+    for (const auto& [address, image] : images) {
+        writer->WriteDelta(group, completed, address, image);
+        deltaBytes += image.size();
         any = true;
     }
     for (const auto& [begin, end] : blocks) {
