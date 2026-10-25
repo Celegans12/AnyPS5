@@ -962,7 +962,8 @@ void reportOwnedProofs() {
     const auto switchedOff = take(counters.switchedOff);
     const auto verified = take(counters.verified);
     const auto disagreed = take(counters.disagreed);
-    AgcDriver::ProfilePrint_nid_no_patch("[owned-proofs] (10 s): armed proofs %llu held, %llu found the words moved, %llu found stamps or guard moved; fallback proofs (walks) %llu: %llu armed first, %llu not armable, %llu backing off, %llu switched off; arms %llu (blocks newly protected %llu), refused %llu; faults %llu, other disarms %llu; verified %llu, disagreed %llu\n", held, wordsMoved, stampsMoved, walks, armedWalks, notArmable, backingOff, switchedOff, static_cast<unsigned long long>(blocks.arms), static_cast<unsigned long long>(blocks.armedBlocks), static_cast<unsigned long long>(blocks.refused), static_cast<unsigned long long>(blocks.faults), static_cast<unsigned long long>(blocks.disowned), verified, disagreed);
+    const auto by = [&](std::size_t reason) { return static_cast<unsigned long long>(blocks.refusedBy[reason]); };
+    AgcDriver::ProfilePrint_nid_no_patch("[owned-proofs] (10 s): armed proofs %llu held, %llu found the words moved, %llu found stamps or guard moved; fallback proofs (walks) %llu: %llu armed first, %llu not armable, %llu backing off, %llu switched off; arms %llu (blocks newly protected %llu, %llu with private pages), refused %llu (outside the arena or host region %llu, shared or aliased view %llu, pinned or importing %llu, host write open %llu, protection change in flight %llu, not writable or other mapping %llu, private not allowed %llu, nothing mapped %llu); faults %llu, other disarms %llu; verified %llu, disagreed %llu\n", held, wordsMoved, stampsMoved, walks, armedWalks, notArmable, backingOff, switchedOff, static_cast<unsigned long long>(blocks.arms), static_cast<unsigned long long>(blocks.armedBlocks), static_cast<unsigned long long>(blocks.privateBlocks), static_cast<unsigned long long>(blocks.refused), by(0), by(1), by(2), by(3), by(4), by(5), by(6), by(7), static_cast<unsigned long long>(blocks.faults), static_cast<unsigned long long>(blocks.disowned), verified, disagreed);
 }
 
 // APS5_VERIFY_OWNED_PROOFS=<n>: the first n held armed proofs of every 10 s also run a full walk and
@@ -1050,7 +1051,7 @@ bool untrackedStillMatches(std::uint64_t address, std::size_t bytes, std::span<c
         counters.backingOff.fetch_add(1, std::memory_order_relaxed);
     } else {
         words.resize(count);
-        armed = GuestMemory::ArmOwnedBlocks(address, bytes, words);
+        armed = GuestMemory::ArmOwnedBlocks(address, bytes, words, !RuntimeSwitches::Set(RuntimeSwitch::NoOwnedPrivate));
         (armed ? counters.armedWalks : counters.notArmable).fetch_add(1, std::memory_order_relaxed);
     }
     const bool equal = untrackedWalkMatches(address, bytes, hashes, since, guard, layout, reason);

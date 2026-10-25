@@ -2004,6 +2004,144 @@ std::vector<std::uint64_t> ArmOwned(std::uint64_t address, std::size_t bytes) {
     return words;
 }
 
+// Refusal reasons, as GuestMemory::OwnedBlockCounts::refusedBy counts them.
+enum OwnedReason : std::size_t { ReasonOutside, ReasonShared, ReasonPinned, ReasonHostWrite, ReasonInFlight, ReasonNotWritable, ReasonPrivate, ReasonEmpty };
+
+struct PrivateFixture {
+    std::size_t bytes;
+    std::uint8_t* memory = nullptr;
+
+    PrivateFixture(std::size_t bytes, std::size_t committed) : bytes(bytes) {
+        memory = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, Block));
+        Require(memory != nullptr, "cannot reserve the private owned-proof fixture");
+        Commit(0, committed);
+    }
+    ~PrivateFixture() {
+        GuestArena::GuestArenaReset_nid_postfix(memory, bytes);
+        GuestArena::GuestArenaRelease_nid_postfix(memory, bytes);
+    }
+    PrivateFixture(const PrivateFixture&) = delete;
+    PrivateFixture& operator=(const PrivateFixture&) = delete;
+    void Commit(std::size_t offset, std::size_t length) {
+        GuestArena::GuestArenaCommit_nid_postfix(memory + offset, length, PAGE_READWRITE, 16384);
+    }
+    std::uint64_t Base() const { return reinterpret_cast<std::uint64_t>(memory); }
+    volatile std::uint8_t& At(std::size_t offset) { return static_cast<volatile std::uint8_t*>(memory)[offset]; }
+    DWORD Protection(std::size_t offset) const {
+        MEMORY_BASIC_INFORMATION info{};
+        Require(VirtualQuery(memory + offset, &info, sizeof(info)) == sizeof(info), "cannot query private owned-proof protection");
+        return info.Protect;
+    }
+};
+
+void CheckOwnedPrivate() {
+    // Private commits (flexible and memory-pool memory): refused while not allowed, else armed, and
+    // a store faults, moves the word and lands; the page gets its own protection back.
+    {
+        PrivateFixture fixture(2 * Block, 2 * Block);
+        const auto base = fixture.Base();
+        TakeOwnedBlockCounts();
+        std::vector<std::uint64_t> words(2);
+        Require(!ArmOwnedBlocks(base, 2 * Block, words, false), "private memory was armed while not allowed");
+        Require(TakeOwnedBlockCounts().refusedBy[ReasonPrivate] == 1, "a refusal of private memory was not counted as private");
+        words = ArmOwned(base, 2 * Block);
+        if (words.size() != 2) {
+            const auto refused = TakeOwnedBlockCounts();
+            std::string reasons;
+            for (const auto count : refused.refusedBy) reasons += " " + std::to_string(count);
+            Require(false, "private memory was not armed, refusals by reason:" + reasons);
+        }
+        Require(fixture.Protection(0) == PAGE_READONLY && fixture.Protection(2 * Block - 1) == PAGE_READONLY, "private memory was not write-protected, protection " + std::to_string(fixture.Protection(0)));
+        Require(fixture.At(70000) == 0 && OwnedWordsHold(base, 2 * Block, words), "a read of armed private memory moved its words");
+        fixture.At(70000) = 0x5a;
+        Require(fixture.At(70000) == 0x5a && !OwnedWordsHold(base, 2 * Block, words) && OwnedWordsHold(base, Block, std::span(words).first(1)), "a store into armed private memory was missed or moved another block");
+        Require(fixture.Protection(Block) == PAGE_READWRITE && fixture.Protection(0) == PAGE_READONLY, "the private fault opened more or less than its block");
+        const auto counts = TakeOwnedBlockCounts();
+        Require(counts.privateBlocks == 2 && counts.faults == 1, "private arming was not counted");
+        std::thread([&] { fixture.At(100) = 1; }).join();
+        Require(!OwnedWordsHold(base, Block, std::span(words).first(1)) && fixture.At(100) == 1, "a store into armed private memory from another thread was missed");
+    }
+    // A block of private pages and reserved placeholders is armed; committing the rest moves it.
+    {
+        PrivateFixture fixture(Block, Block / 2);
+        const auto base = fixture.Base();
+        const auto words = ArmOwned(base, Block / 2);
+        Require(words.size() == 1, "a partly committed private block could not be armed");
+        fixture.Commit(Block / 2, Block / 2);
+        Require(!OwnedWordsHold(base, Block / 2, words), "committing into an armed block left its word");
+        fixture.At(Block - 1) = 3;
+        Require(fixture.At(Block - 1) == 3, "the newly committed page is not writable");
+    }
+    // Read-only private memory (GPU-read-only guest memory) is armed as it is; the guest making it
+    // writable moves the word first. Inaccessible memory is refused.
+    {
+        PrivateFixture fixture(2 * Block, 2 * Block);
+        const auto base = fixture.Base();
+        const auto guestProtect = [&](std::size_t offset, std::size_t length, DWORD protection) {
+            GuestArena::GuestArenaSetProtection_nid_postfix(base + offset, length, protection);
+            for (std::size_t page = offset; page < offset + length; page += 16384) {
+                DWORD previous = 0;
+                Require(VirtualProtect(fixture.memory + page, 16384, protection, &previous) != 0, "cannot change the private fixture's protection");
+            }
+            GuestArena::GuestArenaEndSetProtection_nid_no_patch(base + offset, length);
+        };
+        guestProtect(0, Block, PAGE_READONLY);
+        const auto words = ArmOwned(base, Block);
+        Require(words.size() == 1 && fixture.Protection(0) == PAGE_READONLY, "read-only private memory was not armed as it is");
+        guestProtect(0, Block, PAGE_READWRITE);
+        Require(!OwnedWordsHold(base, Block, words), "the guest making armed read-only memory writable left the word");
+        fixture.At(8) = 9;
+        Require(fixture.At(8) == 9, "the page made writable by the guest is not writable");
+        guestProtect(Block, Block, PAGE_NOACCESS);
+        TakeOwnedBlockCounts();
+        Require(ArmOwned(base + Block, Block).empty() && TakeOwnedBlockCounts().refusedBy[ReasonNotWritable] == 1, "inaccessible private memory was armed or not counted as not writable");
+        guestProtect(Block, Block, PAGE_READWRITE);
+    }
+    // Pinned private memory (a guest stack: host code runs on it and passes it to OS calls) is not
+    // armed, and pinning an armed block disarms it.
+    {
+        PrivateFixture fixture(Block, Block);
+        const auto base = fixture.Base();
+        const auto words = ArmOwned(base, Block);
+        Require(!words.empty(), "cannot arm the pin fixture");
+        GuestArena::GuestArenaPinWritable_nid_postfix(fixture.memory + 4096, 8192);
+        Require(!OwnedWordsHold(base, Block, words) && fixture.Protection(0) == PAGE_READWRITE, "pinning an armed block left it armed");
+        TakeOwnedBlockCounts();
+        Require(ArmOwned(base, Block).empty() && TakeOwnedBlockCounts().refusedBy[ReasonPinned] == 1, "pinned private memory was armed or not counted as pinned");
+        GuestArena::GuestArenaUnpinWritable_nid_postfix(fixture.memory + 4096, 8192);
+        Require(!ArmOwned(base, Block).empty(), "unpinned private memory cannot be armed");
+    }
+    // A host write over private memory opens the block first and refuses arming until it ends.
+    {
+        PrivateFixture fixture(Block, Block);
+        const auto base = fixture.Base();
+        const auto words = ArmOwned(base, Block);
+        Require(!words.empty(), "cannot arm the private host-write fixture");
+        {
+            const GuestArena::HostWrite write(fixture.memory + 64, 64);
+            Require(write.Open() && !OwnedWordsHold(base, Block, words), "a host write over private memory left the words");
+            TakeOwnedBlockCounts();
+            Require(ArmOwned(base, Block).empty() && TakeOwnedBlockCounts().refusedBy[ReasonHostWrite] == 1, "private memory was armed during a host write or not counted");
+            std::memset(fixture.memory + 64, 0x11, 64);
+        }
+        Require(fixture.At(64) == 0x11 && !ArmOwned(base, Block).empty(), "the private host write did not land or the block cannot be armed after it");
+    }
+    // Refusal reasons for memory outside the arena and for a protection change in flight.
+    {
+        TakeOwnedBlockCounts();
+        std::vector<std::uint8_t> host(2 * Block);
+        Require(ArmOwned(reinterpret_cast<std::uint64_t>(host.data()), Block).empty() && TakeOwnedBlockCounts().refusedBy[ReasonOutside] == 1, "host memory was armed or not counted as outside");
+        PrivateFixture fixture(Block, Block);
+        GuestArena::GuestArenaSetProtection_nid_postfix(fixture.Base(), Block, PAGE_READWRITE);
+        Require(ArmOwned(fixture.Base(), Block).empty() && TakeOwnedBlockCounts().refusedBy[ReasonInFlight] == 1, "a block was armed during a protection change or not counted");
+        GuestArena::GuestArenaEndSetProtection_nid_no_patch(fixture.Base(), Block);
+        auto* reserved = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(Block, Block));
+        Require(ArmOwned(reinterpret_cast<std::uint64_t>(reserved), Block).empty() && TakeOwnedBlockCounts().refusedBy[ReasonEmpty] == 1, "a block with nothing mapped was armed or not counted");
+        GuestArena::GuestArenaRelease_nid_postfix(reserved, Block);
+    }
+    std::cout << "owned proofs: private memory armed when allowed, read-only as it is; inaccessible, pinned, host-written, outside, in-flight and empty blocks refused by reason\n";
+}
+
 void CheckOwnedStampOnWrite() {
     DirectFixture fixture(4 * Block, 4 * Block);
     const auto base = fixture.Base();
@@ -2109,15 +2247,6 @@ void CheckOwnedCrossThread() {
 }
 
 void CheckOwnedRefusals() {
-    // Private memory (flexible commits) is not armed: host calls may write it without HostWrite.
-    {
-        constexpr std::size_t bytes = 2 * Block;
-        auto* memory = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, Block));
-        GuestArena::GuestArenaCommit_nid_postfix(memory, bytes, PAGE_READWRITE, bytes);
-        Require(ArmOwned(reinterpret_cast<std::uint64_t>(memory), bytes).empty(), "private memory was armed");
-        GuestArena::GuestArenaReset_nid_postfix(memory, bytes);
-        GuestArena::GuestArenaRelease_nid_postfix(memory, bytes);
-    }
     // Two guest views of one backing are not armed, and aliasing an armed view disarms it.
     {
         constexpr std::size_t bytes = Block;
@@ -2130,7 +2259,9 @@ void CheckOwnedRefusals() {
         Require(!words.empty(), "a single resident view could not be armed");
         GuestArena::GuestArenaMapDirect_nid_postfix(second, bytes, section, 0, PAGE_READWRITE);
         Require(!OwnedWordsHold(reinterpret_cast<std::uint64_t>(first), bytes, words), "aliasing an armed block left its words");
+        TakeOwnedBlockCounts();
         Require(ArmOwned(reinterpret_cast<std::uint64_t>(first), bytes).empty() && ArmOwned(reinterpret_cast<std::uint64_t>(second), bytes).empty(), "an aliased view was armed");
+        Require(TakeOwnedBlockCounts().refusedBy[ReasonShared] == 2, "aliased views were not counted as shared");
         static_cast<volatile std::uint8_t*>(second)[8] = 0x77;
         Require(static_cast<volatile std::uint8_t*>(first)[8] == 0x77, "the aliased views do not share their backing");
         GuestArena::GuestArenaReset_nid_postfix(first, bytes);
@@ -2143,7 +2274,7 @@ void CheckOwnedRefusals() {
     // Memory outside the arena is not armed.
     std::vector<std::uint8_t> host(2 * Block);
     Require(ArmOwned(reinterpret_cast<std::uint64_t>(host.data()), Block).empty(), "host memory was armed");
-    std::cout << "owned proofs: private memory, aliased views and host memory refused\n";
+    std::cout << "owned proofs: aliased views and host memory refused" << std::endl;
 }
 
 void CheckOwnedMappingChanges() {
@@ -2256,6 +2387,7 @@ int main(int argc, char** argv) {
             CheckOwnedRearm();
             CheckOwnedCrossThread();
             CheckOwnedRefusals();
+            CheckOwnedPrivate();
             CheckOwnedMappingChanges();
             std::cout << "owned proof tests passed\n";
             return 0;

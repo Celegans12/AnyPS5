@@ -2,6 +2,7 @@
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "prx/libc/include/WindowsMappings.hpp"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <exception>
@@ -600,29 +601,28 @@ bool ownedRangeInArena(std::uintptr_t address, std::size_t bytes) {
 
 }
 
-bool GuestArenaArmOwned_nid_no_patch(std::uintptr_t address, std::size_t bytes, std::uint64_t* words, std::size_t count) {
-    if (!ownedRangeInArena(address, bytes)) return false;
-    return WindowsMappings::Get().ArmOwned(address, bytes, words, count);
+bool GuestArenaArmOwned_nid_no_patch(std::uintptr_t address, std::size_t bytes, std::uint64_t* words, std::size_t count, unsigned flags) {
+    if (!ownedRangeInArena(address, bytes)) return WindowsMappings::Get().NoteOwnedRefusal(WindowsMappings::OwnedRefusal::Outside);
+    return WindowsMappings::Get().ArmOwned(address, bytes, words, count, flags);
 }
 
 bool GuestArenaOwnedUnchanged_nid_no_patch(std::uintptr_t address, std::size_t bytes, const std::uint64_t* words, std::size_t count) {
     return WindowsMappings::Get().OwnedUnchanged(address, bytes, words, count);
 }
 
-void GuestArenaTakeOwnedCounts_nid_no_patch(std::uint64_t* counts) {
+void GuestArenaTakeOwnedCounts_nid_no_patch(std::uint64_t* counts, std::size_t count) {
     const auto taken = WindowsMappings::Get().TakeOwnedCounts();
-    counts[0] = taken.arms;
-    counts[1] = taken.armedBlocks;
-    counts[2] = taken.refused;
-    counts[3] = taken.faults;
-    counts[4] = taken.disowned;
+    std::array<std::uint64_t, GuestArenaOwnedCountSlots> values{taken.arms, taken.armedBlocks, taken.refused, taken.faults, taken.disowned, taken.privateBlocks};
+    static_assert(6 + WindowsMappings::OwnedRefusalCount == GuestArenaOwnedCountSlots);
+    for (std::size_t i = 0; i < WindowsMappings::OwnedRefusalCount; ++i) values[6 + i] = taken.reasons[i];
+    for (std::size_t i = 0; i < count && i < values.size(); ++i) counts[i] = values[i];
 }
 
 void GuestArenaEndSetProtection_nid_no_patch(std::uintptr_t, std::size_t) {
     WindowsMappings::Get().EndSetProtection();
 }
 #else
-bool GuestArenaArmOwned_nid_no_patch(std::uintptr_t, std::size_t, std::uint64_t*, std::size_t) {
+bool GuestArenaArmOwned_nid_no_patch(std::uintptr_t, std::size_t, std::uint64_t*, std::size_t, unsigned) {
     return false;
 }
 
@@ -630,8 +630,8 @@ bool GuestArenaOwnedUnchanged_nid_no_patch(std::uintptr_t, std::size_t, const st
     return false;
 }
 
-void GuestArenaTakeOwnedCounts_nid_no_patch(std::uint64_t* counts) {
-    for (std::size_t i = 0; i < 5; ++i) counts[i] = 0;
+void GuestArenaTakeOwnedCounts_nid_no_patch(std::uint64_t* counts, std::size_t count) {
+    for (std::size_t i = 0; i < count; ++i) counts[i] = 0;
 }
 
 void GuestArenaEndSetProtection_nid_no_patch(std::uintptr_t, std::size_t) {}

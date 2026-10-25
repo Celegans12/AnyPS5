@@ -2328,9 +2328,9 @@ bool ChangedBlocks(std::uint64_t address, std::size_t bytes, std::span<const std
     return true;
 }
 
-bool ArmOwnedBlocks(std::uint64_t address, std::size_t bytes, std::span<std::uint64_t> words) {
+bool ArmOwnedBlocks(std::uint64_t address, std::size_t bytes, std::span<std::uint64_t> words, bool allowPrivate) {
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || words.size() != HashBlockCount(address, bytes)) return false;
-    return GuestArena::GuestArenaArmOwned_nid_no_patch(static_cast<std::uintptr_t>(address), bytes, words.data(), words.size());
+    return GuestArena::GuestArenaArmOwned_nid_no_patch(static_cast<std::uintptr_t>(address), bytes, words.data(), words.size(), allowPrivate ? 1u : 0u);
 }
 
 bool OwnedWordsHold(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> words) {
@@ -2358,9 +2358,12 @@ bool OwnedProofHolds(std::uint64_t address, std::size_t bytes, std::span<const s
 }
 
 OwnedBlockCounts TakeOwnedBlockCounts() {
-    std::array<std::uint64_t, 5> counts{};
-    GuestArena::GuestArenaTakeOwnedCounts_nid_no_patch(counts.data());
-    return {counts[0], counts[1], counts[2], counts[3], counts[4]};
+    std::array<std::uint64_t, GuestArena::GuestArenaOwnedCountSlots> counts{};
+    GuestArena::GuestArenaTakeOwnedCounts_nid_no_patch(counts.data(), counts.size());
+    OwnedBlockCounts taken{counts[0], counts[1], counts[2], counts[3], counts[4], counts[5], {}};
+    static_assert(GuestArena::GuestArenaOwnedCountSlots == 7 + std::tuple_size_v<decltype(taken.refusedBy)>);
+    for (std::size_t i = 0; i < taken.refusedBy.size(); ++i) taken.refusedBy[i] = counts[7 + i];
+    return taken;
 }
 
 namespace {

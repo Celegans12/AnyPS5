@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_GUESTMEMORY_HPP
 
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -98,17 +99,23 @@ bool CommittedBlocksMatchSince(std::uint64_t address, std::size_t bytes, std::sp
 // (MarkWritten, a collect, a host-region store) or untracked hint newer than `since` over the range,
 // which is what the walk checks for the driver's and the GPU's writes. Recorded GPU writes not yet
 // stamped are the caller's to check (the write notes, as for the walk).
-bool ArmOwnedBlocks(std::uint64_t address, std::size_t bytes, std::span<std::uint64_t> words);
+// `allowPrivate`: private commits (flexible and memory-pool memory) may be armed too.
+bool ArmOwnedBlocks(std::uint64_t address, std::size_t bytes, std::span<std::uint64_t> words, bool allowPrivate = true);
 bool OwnedWordsHold(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> words);
 bool OwnedProofHolds(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> words, std::uint64_t since);
-// Arms (all blocks armed), blocks newly write-protected, arms refused, blocks disarmed by a CPU store,
-// blocks disarmed by a mapping, protection or host-write change, since the last call.
+// Arms (all blocks armed), blocks newly write-protected (of them with private pages), arms refused
+// (by reason: outside the arena or a host region, shared or aliased view, pinned or importing, host
+// write open, protection change in flight, not writable or another mapping type, private while not
+// allowed, nothing mapped), blocks disarmed by a CPU store, blocks disarmed by a mapping, protection
+// or host-write change, since the last call.
 struct OwnedBlockCounts {
     std::uint64_t arms = 0;
     std::uint64_t armedBlocks = 0;
     std::uint64_t refused = 0;
     std::uint64_t faults = 0;
     std::uint64_t disowned = 0;
+    std::uint64_t privateBlocks = 0;
+    std::array<std::uint64_t, 8> refusedBy{};
 };
 OwnedBlockCounts TakeOwnedBlockCounts();
 
