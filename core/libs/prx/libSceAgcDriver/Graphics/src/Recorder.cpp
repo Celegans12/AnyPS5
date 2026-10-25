@@ -4461,6 +4461,15 @@ bool Recorder::unsignaled(std::uint64_t serial) const {
 
 void Recorder::AfterCompletions(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, bool storedOnGpu) {
     Batch* newest = open != nullptr ? open.get() : newestInFlight(currentLane());
+    // With the async lane the work this label must follow (a copied writer, an earlier completion store) can sit in
+    // the other lane alone while this lane holds no batch: the label then follows that lane's open batch, else the
+    // newest batch in flight, so its completion still runs after theirs.
+    if (newest == nullptr) {
+        for (const auto& lane : lanes) {
+            if (lane != nullptr) newest = lane.get();
+        }
+        if (newest == nullptr && !inFlight.empty()) newest = inFlight.back().get();
+    }
     Require(newest != nullptr, "no batch to append a completion label to");
     Batch& batch = *newest;
     std::vector<std::byte> copy(bytes.begin(), bytes.end());
