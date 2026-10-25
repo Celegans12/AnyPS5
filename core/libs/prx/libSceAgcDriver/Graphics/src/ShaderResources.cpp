@@ -1104,6 +1104,7 @@ std::list<CachedStorageTexture>::iterator findStorageByImage(StorageTextureCache
 // Evicts an entry: its pending results go to guest memory first (the image may die with the entry).
 std::shared_ptr<StorageTexture> evictStorage(StorageTextureCache& cache, std::list<CachedStorageTexture>::iterator it) {
     auto texture = it->texture;
+    if (GpuHeapEnabled()) BindlessHeap::NoteStorageEvicted(texture.get());
     it->texture->SetCached(false);
     noteUncached(it->texture);
     it->texture->Flush();

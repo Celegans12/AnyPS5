@@ -59,6 +59,7 @@ public:
     std::uint32_t AbsentSlot(std::uint32_t kind, VkImageView view);
     static bool NearlyFull();
     static void NoteSweepDue();
+    static void NoteStorageEvicted(const void* owner);
     static void SweepIfDue();
 
     struct DataSpan {
@@ -128,6 +129,7 @@ private:
     };
     std::unordered_map<TextureKey, std::uint32_t, TextureKeyHash> textureSlots;
     std::unordered_map<const void*, std::vector<std::uint32_t>> viewSlots;
+    std::unordered_map<const void*, std::vector<std::uint32_t>> storageSlots;
     std::uint32_t nextTextureSlot = 0;
     struct SlotOwner {
         std::shared_ptr<Texture> texture;
@@ -140,6 +142,9 @@ private:
     std::uint32_t slotCap = 0;
     std::uint64_t slotRequests = 0;
     void sweepLocked(std::vector<std::shared_ptr<Texture>>& dropped);
+    bool heldOnlyHereLocked(const void* owner, long uses) const;
+    void releaseStorageLocked(std::span<const void* const> owners, std::vector<const void*>& kept);
+    void dropStorageLocked(const void* image, std::uint32_t slot);
     std::optional<std::uint32_t> takeSlotLocked();
     std::optional<std::uint32_t> takeOrSweepLocked(std::vector<std::shared_ptr<Texture>>& dropped);
     SlotOwner& claimSlotLocked(const TextureKey& key, std::uint32_t slot);

@@ -196,6 +196,44 @@ void storageComesBack(const Context& context, VkImageView view) {
     BindlessHeap::Release(context.device);
 }
 
+void storageViewsComeBack(const Context& context, VkImageView view) {
+    auto& heap = BindlessHeap::For(context);
+    int released = 0;
+    const auto owner = [&released] {
+        return std::shared_ptr<void>(new int(0), [&released](void* pointer) {
+            ++released;
+            delete static_cast<int*>(pointer);
+        });
+    };
+    std::vector<std::shared_ptr<void>> owners;
+    for (std::size_t index = 0; index < 3u; ++index) {
+        owners.push_back(owner());
+        for (std::uint32_t kind = 0; kind < 2u; ++kind) {
+            require(heap.StorageSlot(Abi::FirstStorageImageBinding + kind, owners.back(), view).has_value(),
+                    "a storage owner takes one of the eight capped slots for each of its two views");
+        }
+    }
+    owners.push_back(owner());
+    require(heap.StorageSlot(Abi::FirstStorageImageBinding, owners.back(), view).has_value(), "a single-view storage owner takes the seventh slot");
+    require(BindlessHeap::NearlyFull(), "storage owners that leave one free slot of eight refuse the heap");
+    owners.clear();
+    BindlessHeap::NoteSweepDue();
+    BindlessHeap::SweepIfDue();
+    require(released == 4, "a sweep released " + std::to_string(released) + " of four storage owners the heap alone held, three of them in two slots each");
+    require(!BindlessHeap::NearlyFull(), "a sweep after every storage owner is gone takes the heap again");
+
+    auto evicted = owner();
+    for (std::uint32_t kind = 0; kind < 2u; ++kind) require(heap.StorageSlot(Abi::FirstStorageImageBinding + kind, evicted, view).has_value(), "an evicted owner's view takes a slot");
+    const auto* image = evicted.get();
+    BindlessHeap::NoteStorageEvicted(image);
+    BindlessHeap::SweepIfDue();
+    require(released == 4, "an evicted storage owner still held outside the heap lost its slots");
+    evicted.reset();
+    BindlessHeap::SweepIfDue();
+    require(released == 5, "the present after an evicted storage owner's last outside holder went did not release its two slots");
+    BindlessHeap::Release(context.device);
+}
+
 void mixedComesBack(const Context& context, VkImageView sampledView, VkImageView storageView) {
     auto& heap = BindlessHeap::For(context);
     std::vector<std::shared_ptr<Texture>> textures;
@@ -265,6 +303,7 @@ int main(int argc, char** argv) {
                 const auto storage = placeholders.View(Abi::FirstStorageImageBinding);
                 if (mode == "comes-back") heapComesBack(context, sampled);
                 else if (mode == "storage-comes-back") storageComesBack(context, storage);
+                else if (mode == "storage-views-come-back") storageViewsComeBack(context, storage);
                 else if (mode == "mixed-comes-back") mixedComesBack(context, sampled, storage);
                 else if (mode == "views-come-back") viewsComeBack(context, storage);
                 else throw std::runtime_error("unknown mode " + mode);

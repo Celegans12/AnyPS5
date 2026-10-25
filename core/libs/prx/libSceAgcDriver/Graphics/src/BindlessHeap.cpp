@@ -269,6 +269,7 @@ std::optional<std::uint32_t> BindlessHeap::StorageSlot(std::uint32_t kind, std::
     noteTakenLocked(dropped);
     writeImageSlot(kind, *slot, view, VK_IMAGE_LAYOUT_GENERAL);
     claimSlotLocked(key, *slot).storage = std::move(owner);
+    storageSlots[key.texture].push_back(*slot);
     return slot;
 }
 
@@ -319,6 +320,11 @@ BindlessHeap::SlotOwner& BindlessHeap::claimSlotLocked(const TextureKey& key, st
 
 void BindlessHeap::freeSlotLocked(std::uint32_t slot) {
     auto& owner = owners[slot];
+    if (const auto found = storageSlots.find(owner.key.texture); found != storageSlots.end()) {
+        auto& slots = found->second;
+        if (const auto at = std::find(slots.begin(), slots.end(), slot); at != slots.end()) slots.erase(at);
+        if (slots.empty()) storageSlots.erase(found);
+    }
     textureSlots.erase(owner.key);
     owner.key = {};
     ++owner.generation;
@@ -347,8 +353,9 @@ void BindlessHeap::sweepLocked(std::vector<std::shared_ptr<Texture>>& dropped) {
     for (std::uint32_t slot = SamplerKind; slot < owners.size(); ++slot) {
         auto& owner = owners[slot];
         if (owner.storage != nullptr) {
-            if (owner.storage.use_count() > 1) continue;
-            sweptStorage().push_back(std::move(owner.storage));
+            if (!heldOnlyHereLocked(owner.key.texture, owner.storage.use_count())) continue;
+            dropStorageLocked(owner.key.texture, slot);
+            continue;
         } else {
             const bool heldElsewhere =
                 owner.texture == nullptr || owner.texture.use_count() > static_cast<long>(owner.texture->HeapHolds());
@@ -359,6 +366,35 @@ void BindlessHeap::sweepLocked(std::vector<std::shared_ptr<Texture>>& dropped) {
         slotSerial.fetch_add(1, std::memory_order_release);
     }
     for (auto index = firstDropped; index < dropped.size(); ++index) dropped[index]->DropHeapHold();
+}
+
+bool BindlessHeap::heldOnlyHereLocked(const void* owner, long uses) const {
+    const auto found = storageSlots.find(owner);
+    const auto slots = found != storageSlots.end() ? static_cast<long>(found->second.size()) : 1l;
+    return uses <= slots;
+}
+
+void BindlessHeap::releaseStorageLocked(std::span<const void* const> evicted, std::vector<const void*>& kept) {
+    for (const auto* image : evicted) {
+        const auto found = storageSlots.find(image);
+        if (found == storageSlots.end()) continue;
+        const auto& first = owners[found->second.front()].storage;
+        if (first == nullptr || !heldOnlyHereLocked(image, first.use_count())) {
+            kept.push_back(image);
+            continue;
+        }
+        dropStorageLocked(image, found->second.front());
+    }
+}
+
+void BindlessHeap::dropStorageLocked(const void* image, std::uint32_t slot) {
+    std::vector<std::uint32_t> slots{slot};
+    if (const auto found = storageSlots.find(image); found != storageSlots.end()) slots = found->second;
+    for (const auto held : slots) {
+        sweptStorage().push_back(std::move(owners[held].storage));
+        freeSlotLocked(held);
+    }
+    slotSerial.fetch_add(1, std::memory_order_release);
 }
 
 void BindlessHeap::sweepSamplersLocked(std::vector<std::shared_ptr<Sampler>>& dropped) {
@@ -382,7 +418,7 @@ std::atomic<bool> nearlyFull{false};
 
 void noteNearlyFull(const char* what, std::uint32_t margin) {
     if (!nearlyFull.exchange(true, std::memory_order_relaxed))
-        std::fprintf(stderr, "[gpu-heap] fewer than %u %s slots are free; draws take the per-draw path from now on\n", margin, what);
+        std::fprintf(stderr, "[gpu-heap] fewer than %u %s slots are free; draws and dispatches take the per-draw path until a sweep frees twice that many\n", margin, what);
 }
 
 }
@@ -394,6 +430,16 @@ bool BindlessHeap::NearlyFull() {
 namespace {
 
 std::atomic<bool> sweepDue{false};
+
+std::mutex& evictedStorageMutex() {
+    static auto& mutex = *new std::mutex();
+    return mutex;
+}
+
+std::vector<const void*>& evictedStorage() {
+    static auto& list = *new std::vector<const void*>();
+    return list;
+}
 std::atomic<std::uint32_t> refusedSweepChecks{0};
 constexpr std::uint32_t RefusedSweepInterval = 64u;
 
@@ -403,22 +449,43 @@ void BindlessHeap::NoteSweepDue() {
     sweepDue.store(true, std::memory_order_relaxed);
 }
 
+void BindlessHeap::NoteStorageEvicted(const void* owner) {
+    if (owner == nullptr) return;
+    std::lock_guard lock(evictedStorageMutex());
+    evictedStorage().push_back(owner);
+}
+
 void BindlessHeap::SweepIfDue() {
+    std::vector<const void*> evicted;
+    {
+        std::lock_guard lock(evictedStorageMutex());
+        evicted.swap(evictedStorage());
+    }
     const bool due = sweepDue.load(std::memory_order_relaxed) && sweepDue.exchange(false, std::memory_order_relaxed);
     const bool retry = !due && nearlyFull.load(std::memory_order_relaxed) &&
                        refusedSweepChecks.fetch_add(1, std::memory_order_relaxed) % RefusedSweepInterval == RefusedSweepInterval - 1u;
-    if (!due && !retry) return;
+    if (!due && !retry && evicted.empty()) return;
+    std::sort(evicted.begin(), evicted.end());
+    evicted.erase(std::unique(evicted.begin(), evicted.end()), evicted.end());
     std::vector<std::shared_ptr<Texture>> dropped;
     SweptStorageRelease swept;
     std::vector<std::shared_ptr<Sampler>> droppedSamplers;
+    std::vector<const void*> kept;
     std::lock_guard heapsLock(heapsMutex());
     bool room = true;
     for (auto& [device, heap] : heaps()) {
         if (heap == nullptr) continue;
         std::lock_guard lock(heap->mutex);
-        heap->sweepLocked(dropped);
-        heap->sweepSamplersLocked(droppedSamplers);
+        if (due || retry) {
+            heap->sweepLocked(dropped);
+            heap->sweepSamplersLocked(droppedSamplers);
+        }
+        heap->releaseStorageLocked(evicted, kept);
         room = room && heap->roomLocked();
+    }
+    if (!kept.empty()) {
+        std::lock_guard lock(evictedStorageMutex());
+        evictedStorage().insert(evictedStorage().end(), kept.begin(), kept.end());
     }
     if (room && nearlyFull.exchange(false, std::memory_order_relaxed))
         std::fprintf(stderr, "[gpu-heap] a sweep left twice the margin of slots free; draws take the heap again\n");
