@@ -75,16 +75,17 @@ bool Set(RuntimeSwitch id);
 void Assign(RuntimeSwitch id, bool set);
 std::optional<RuntimeSwitch> Find(std::string_view name);
 // A word for the keys of objects that are built under the current settings and reused later (the
-// compute resource cache): 0 while no A/B runs, else one value per phase kind (A or B).
+// compute resource cache): 0 while no A/B runs, else one value per arm (A, B1, B2, ...).
 std::uint32_t KeySalt();
 
 }
 
-// The phase plan of APS5_AB=<seconds>:<switch>[,<switch>...]: from APS5_AB_START (a present index, or
-// <n>s seconds after the first present seen) phases of <seconds> alternate, A with the switches as
-// the environment sets them and B with the listed switches toggled. A phase ends at the first
-// present at least <seconds> after its start; APS5_AB_SETTLE (default 2) seconds into a phase it is
-// marked settled, and statistics before that point mix the two settings.
+// The phase plan of APS5_AB=<seconds>:<arm>[,<arm>...], an arm being <switch>[+<switch>...]: from
+// APS5_AB_START (a present index, or <n>s seconds after the first present seen) phases of <seconds>
+// run A, B1, A, B2, ..., A, Bn, A, B1, ...: A with the switches as the environment sets them and Bk
+// with the switches of arm k toggled. One arm (one switch or a + group) is the plain A/B. A phase
+// ends at the first present at least <seconds> after its start; APS5_AB_SETTLE (default 2) seconds
+// into a phase it is marked settled, and statistics before that point mix two settings.
 class AbSchedule {
 public:
     struct Config {
@@ -92,7 +93,10 @@ public:
         double settleSeconds = 2;
         std::uint64_t startPresent = 0;
         std::optional<double> startSeconds;
+        // Every switch an arm toggles, in the order first listed.
         std::vector<RuntimeSwitch> switches;
+        // The B arms in order; each toggles its switches.
+        std::vector<std::vector<RuntimeSwitch>> arms;
     };
 
     enum class Event { None, Begin, Settled };
@@ -101,7 +105,12 @@ public:
         Event event = Event::None;
         std::uint64_t phase = 0;
         bool b = false;
+        // 0 in an A phase, k (from 1) in phase Bk.
+        std::size_t arm = 0;
     };
+
+    // The arm of a phase: 0 for the even (A) phases, the B phases cycle through arms 1..`arms`.
+    static std::size_t ArmOf(std::uint64_t phase, std::size_t arms);
 
     static Config Parse(std::string_view ab, std::string_view start, std::string_view settle);
 
