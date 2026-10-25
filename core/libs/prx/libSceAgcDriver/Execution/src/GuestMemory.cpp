@@ -687,7 +687,7 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
             static_cast<void>(emit(PageRun{cursor, end, false, false}));
             return true;
         }
-        if (VirtualQuery(reinterpret_cast<const void*>(cursor), &memory, sizeof(memory)) != sizeof(memory)) return false;
+        if (GuestArena::GuestArenaQuery_nid_no_patch(reinterpret_cast<const void*>(cursor), &memory, sizeof(memory)) != sizeof(memory)) return false;
         // Debug aid: APS5_TRACE_QUERY prints every 16th page query with its cost.
         static const bool traceQuery = std::getenv("APS5_TRACE_QUERY") != nullptr;
         if (traceQuery) {

@@ -168,7 +168,7 @@ static int mprotect(void* addr, size_t len, int prot) {
     const auto end = cursor + len;
     while (cursor < end) {
         MEMORY_BASIC_INFORMATION memory{};
-        if (VirtualQuery(reinterpret_cast<void*>(cursor), &memory, sizeof(memory)) != sizeof(memory))
+        if (GuestArena::GuestArenaQuery_nid_no_patch(reinterpret_cast<void*>(cursor), &memory, sizeof(memory)) != sizeof(memory))
             throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "VirtualQuery failed");
         const auto regionEnd = std::min(end, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
         if (memory.State == MEM_COMMIT) {
@@ -815,7 +815,7 @@ void* MapPlaced(void* addr, size_t len, int prot, int flags, size_t alignment) {
             auto cursor = start;
             while (cursor - start < len) {
                 MEMORY_BASIC_INFORMATION info{};
-                if (VirtualQuery(reinterpret_cast<LPCVOID>(cursor), &info, sizeof(info)) != sizeof(info))
+                if (GuestArena::GuestArenaQuery_nid_no_patch(reinterpret_cast<LPCVOID>(cursor), &info, sizeof(info)) != sizeof(info))
                     throw std::system_error(EINVAL, std::generic_category(), "No-overwrite range query failed");
                 if (info.State == MEM_FREE) {
                     cursor = reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize;
@@ -1081,7 +1081,7 @@ int DoMapAnon(void** addr, size_t len, int prot, int flags, size_t alignment, bo
             void* allocation = nullptr;
             for (auto cursor = start; cursor < start + len;) {
                 MEMORY_BASIC_INFORMATION memory{};
-                if (VirtualQuery(reinterpret_cast<void*>(cursor), &memory, sizeof(memory)) != sizeof(memory) ||
+                if (GuestArena::GuestArenaQuery_nid_no_patch(reinterpret_cast<void*>(cursor), &memory, sizeof(memory)) != sizeof(memory) ||
                     (memory.State != MEM_COMMIT && memory.State != MEM_RESERVE) || memory.Type != MEM_PRIVATE ||
                     (memory.Protect & PAGE_GUARD) != 0 ||
                     memory.RegionSize == 0 || reinterpret_cast<std::uintptr_t>(memory.BaseAddress) > cursor ||
@@ -1362,7 +1362,7 @@ int DoMprotect(const void* addr, size_t len, int prot) {
     GuestAllocations::Mutation mutation;
 #ifdef _WIN32
     MEMORY_BASIC_INFORMATION memory{};
-    if (VirtualQuery(pointer, &memory, sizeof(memory)) != sizeof(memory)) throw std::runtime_error("Cannot query guest memory protection range");
+    if (GuestArena::GuestArenaQuery_nid_no_patch(pointer, &memory, sizeof(memory)) != sizeof(memory)) throw std::runtime_error("Cannot query guest memory protection range");
     if (memory.Type == MEM_IMAGE) {
         if (memory.AllocationBase == GetModuleHandleW(nullptr)) mutation.RegisterMainImage();
         else if (IsGuestModuleImage(memory.AllocationBase)) mutation.RegisterImage(memory.AllocationBase);
@@ -1370,7 +1370,7 @@ int DoMprotect(const void* addr, size_t len, int prot) {
     }
     for (auto cursor = first; cursor < end;) {
         MEMORY_BASIC_INFORMATION view{};
-        if (VirtualQuery(reinterpret_cast<const void*>(cursor), &view, sizeof(view)) != sizeof(view)) throw std::runtime_error("Cannot query guest memory protection range");
+        if (GuestArena::GuestArenaQuery_nid_no_patch(reinterpret_cast<const void*>(cursor), &view, sizeof(view)) != sizeof(view)) throw std::runtime_error("Cannot query guest memory protection range");
         if (view.Type == MEM_MAPPED && (nativeProtection & ~PosixRightsFromWin(view.AllocationProtect)) != 0)
             throw std::system_error(EACCES, std::generic_category(), "mprotect above the maximum protection of a mapped view");
         cursor = reinterpret_cast<std::uintptr_t>(view.BaseAddress) + view.RegionSize;

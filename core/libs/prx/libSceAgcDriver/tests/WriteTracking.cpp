@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
+#include "prx/libSceAgcDriver/Execution/include/OwnershipProbe.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
@@ -46,6 +47,7 @@ constexpr wchar_t RewatchImportPagesMode[] = L"--rewatch-import-pages";
 constexpr wchar_t RewatchedSharedMode[] = L"--rewatched-direct-shared";
 constexpr wchar_t ImportAliasSharedMode[] = L"--import-alias-shared";
 constexpr wchar_t SharedGenerationsMode[] = L"--compared-shared-generations";
+constexpr wchar_t OwnershipProbeMode[] = L"--ownership-probe";
 #endif
 
 void Require(bool condition, const std::string& message) {
@@ -3070,6 +3072,187 @@ void CheckOwnedMappingChanges() {
     }
     std::cout << "owned proofs: unmap, partial map, guest protection and host writes move the words\n";
 }
+
+// Ownership probe (WindowsMappings::ArmProbe through OwnershipProbe::Sampler, libc's own fault
+// handler): a sampled unit the GPU wrote faults once on its first CPU read (the value is right, the
+// unit stays read-only until its first store, which faults once more and lands) or write; units with a
+// host access open are not armed, and a host write, host read, query or guest protection change
+// disarms first; with the probe off nothing changes.
+GuestArena::GuestArenaProbeCounts TakeProbe(std::vector<GuestArena::GuestArenaProbeEvent>* events = nullptr) {
+    GuestArena::GuestArenaProbeCounts counts{};
+    std::array<GuestArena::GuestArenaProbeEvent, 64> buffer{};
+    for (bool first = true;; first = false) {
+        const auto taken = GuestArena::GuestArenaProbeTake_nid_no_patch(first ? &counts : nullptr, buffer.data(), buffer.size());
+        if (events != nullptr) events->insert(events->end(), buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(taken));
+        if (taken < buffer.size()) break;
+    }
+    return counts;
+}
+
+std::uint64_t Ended(const GuestArena::GuestArenaProbeCounts& counts, GuestArena::ProbeEnd reason) {
+    return counts.ends[static_cast<std::size_t>(reason)];
+}
+
+std::uint64_t AllEnded(const GuestArena::GuestArenaProbeCounts& counts) {
+    std::uint64_t total = counts.afterReadWritten + counts.afterReadOther;
+    for (const auto value : counts.ends) total += value;
+    return total;
+}
+
+void CheckOwnershipProbeOff() {
+    Require(!AgcDriver::OwnershipProbe::Enabled(), "the ownership probe is on without APS5_PROFILE_OWNERSHIP");
+    PrivateFixture fixture(2 * Block, 2 * Block);
+    const auto base = fixture.Base();
+    TakeProbe();
+    AgcDriver::OwnershipProbe::Sampler off(0);
+    off.NoteGpuWrite(base, base + 2 * Block);
+    Require(fixture.Protection(0) == PAGE_READWRITE && fixture.Protection(Block) == PAGE_READWRITE, "the probe at rate 0 changed a protection");
+    fixture.At(10) = 1;
+    Require(fixture.At(10) == 1 && fixture.At(Block + 10) == 0, "memory under the probe at rate 0 is not plain memory");
+    std::vector<GuestArena::GuestArenaProbeEvent> events;
+    const auto counts = TakeProbe(&events);
+    Require(counts.arms == 0 && events.empty() && AllEnded(counts) == 0 && counts.live == 0, "the probe at rate 0 armed or counted something");
+    std::cout << "ownership probe: off arms nothing, memory untouched\n";
+}
+
+void CheckOwnershipProbeTouches() {
+    PrivateFixture fixture(3 * Block, 3 * Block);
+    const auto base = fixture.Base();
+    fixture.At(100) = 7;
+    fixture.At(Block + 5) = 9;
+    TakeProbe();
+    AgcDriver::OwnershipProbe::Sampler all(1);
+    all.NoteGpuWrite(base + 10, base + 2 * Block);
+    Require(fixture.Protection(0) == (PAGE_READWRITE | PAGE_GUARD) && fixture.Protection(2 * Block - 1) == (PAGE_READWRITE | PAGE_GUARD), "the GPU-written units are not guarded, protection " + std::to_string(fixture.Protection(0)));
+    Require(fixture.Protection(2 * Block) == PAGE_READWRITE, "a unit the GPU did not write is guarded");
+    Require(fixture.At(100) == 7, "the probed read returned the wrong value");
+    Require(fixture.Protection(0) == PAGE_READONLY && fixture.Protection(Block - 1) == PAGE_READONLY && fixture.Protection(Block) == (PAGE_READWRITE | PAGE_GUARD), "the read did not leave its unit read-only and the other one guarded");
+    Require(fixture.At(5000) == 0, "a second read of the unit faulted or read wrong");
+    fixture.At(100) = 8;
+    Require(fixture.At(100) == 8 && fixture.Protection(0) == PAGE_READWRITE && fixture.Protection(Block - 1) == PAGE_READWRITE, "the store after the read did not land or left the unit protected");
+    std::thread([&] { fixture.At(Block + 5) = 10; }).join();
+    Require(fixture.At(Block + 5) == 10 && fixture.Protection(Block) == PAGE_READWRITE, "the other thread's first store did not land or left its unit protected");
+    std::vector<GuestArena::GuestArenaProbeEvent> events;
+    auto counts = TakeProbe(&events);
+    Require(counts.arms == 2 && Ended(counts, GuestArena::ProbeEnd::Read) == 1 && Ended(counts, GuestArena::ProbeEnd::Write) == 1 && counts.afterReadWritten == 1 && counts.live == 0, "the probe counts do not show one read, one write after it and one first write");
+    Require(events.size() == 3, "the probe recorded " + std::to_string(events.size()) + " touches, not 3");
+    Require(events[0].block == base && events[0].touch == static_cast<std::uint8_t>(GuestArena::ProbeTouch::Read) && events[0].thread == GetCurrentThreadId(), "the first touch is not this thread's read of the first unit");
+    Require(events[1].block == base && events[1].touch == static_cast<std::uint8_t>(GuestArena::ProbeTouch::WriteAfterRead), "the second touch is not the store after the read");
+    Require(events[2].block == base + Block && events[2].touch == static_cast<std::uint8_t>(GuestArena::ProbeTouch::Write) && events[2].thread != GetCurrentThreadId(), "the third touch is not the other thread's store");
+    Require(events[0].rip != 0 && events[0].latencyUs < 60000000, "the read's site or time since the GPU write is missing");
+    all.NoteGpuWrite(base, base + Block);
+    all.NoteGpuWrite(base, base + Block);
+    DWORD previous = 0;
+    Require(VirtualProtect(fixture.memory, 4096, PAGE_READWRITE, &previous) != 0, "cannot drop a probe guard behind its back");
+    all.NoteGpuWrite(base, base + Block);
+    counts = TakeProbe();
+    Require(counts.arms == 1 && Ended(counts, GuestArena::ProbeEnd::Rewritten) == 2 && counts.lost == 1 && counts.live == 1, "rewrites without a touch or the lost guard were not counted");
+    Require(fixture.Protection(0) == (PAGE_READWRITE | PAGE_GUARD), "the re-armed unit lost its guard");
+    const auto report = all.Take(10.0);
+    Require(report.find("[ownership] probe 1/1") != std::string::npos && report.find("GPU-written 2 units") != std::string::npos && report.find("[ownership] sites") != std::string::npos, "the report is not the [ownership] lines: " + report);
+    GuestArena::GuestArenaSetProtection_nid_postfix(base, Block, PAGE_READWRITE);
+    Require(fixture.Protection(0) == PAGE_READWRITE, "a guest protection change left the probe's guard");
+    all.NoteGpuWrite(base, base + Block);
+    GuestArena::GuestArenaEndSetProtection_nid_no_patch(base, Block);
+    counts = TakeProbe();
+    Require(Ended(counts, GuestArena::ProbeEnd::Mapping) == 1 && counts.refused[static_cast<std::size_t>(GuestArena::ProbeRefusal::InFlight)] == 1 && fixture.Protection(0) == PAGE_READWRITE, "a protection change did not disarm first or a unit was armed during it");
+    std::cout << "ownership probe: first read and write counted once each, store after a read seen, rewrites and lost guards counted, access restored\n";
+}
+
+void CheckOwnershipProbeResident() {
+    DirectFixture fixture(2 * Block, 2 * Block);
+    const auto base = fixture.Base();
+    std::uintptr_t spanBegin = 0;
+    std::uintptr_t spanEnd = 0;
+    Require(GuestArena::GuestArenaResidentSpan_nid_postfix(base, 1, &spanBegin, &spanEnd), "the probe's direct memory fixture is not resident");
+    fixture.At(300) = 4;
+    TakeProbe();
+    AgcDriver::OwnershipProbe::Sampler all(1);
+    all.NoteGpuWrite(base, base + 2 * Block);
+    Require(fixture.Protection(0) == (PAGE_READWRITE | PAGE_GUARD) && fixture.Protection(Block) == (PAGE_READWRITE | PAGE_GUARD), "resident direct memory was not armed, protection " + std::to_string(fixture.Protection(0)));
+    Require(fixture.At(300) == 4 && fixture.Protection(0) == PAGE_READONLY, "the probed read of resident memory returned the wrong value or left the wrong protection");
+    fixture.At(300) = 5;
+    Require(fixture.At(300) == 5 && fixture.Protection(0) == PAGE_READWRITE, "the store into resident memory after the read did not land");
+    const auto counts = TakeProbe();
+    Require(counts.arms == 2 && Ended(counts, GuestArena::ProbeEnd::Read) == 1 && counts.afterReadWritten == 1 && counts.live == 1, "the resident probe counts do not show one read and the store after it");
+    std::cout << "ownership probe: resident direct memory probed with its own protection kept\n";
+}
+
+// Owned proofs (write watch, no protection change): arming a probed unit as owned ends its interval
+// first, so the guard never reaches the owned refusals; an owned unit is not probed, also after a
+// store moved its word and the arming took the unit afresh.
+void CheckOwnershipProbeOwned() {
+    PrivateFixture fixture(Block, Block);
+    const auto base = fixture.Base();
+    AgcDriver::OwnershipProbe::Sampler all(1);
+    TakeProbe();
+    all.NoteGpuWrite(base, base + Block);
+    Require(fixture.Protection(0) == (PAGE_READWRITE | PAGE_GUARD), "cannot arm the unit owned next");
+    TakeOwnedBlockCounts();
+    auto words = ArmOwned(base, Block);
+    Require(words.size() == 1 && fixture.Protection(0) == PAGE_READWRITE, "a probed unit was not armed as owned, or kept its guard");
+    all.NoteGpuWrite(base, base + Block);
+    Require(fixture.Protection(0) == PAGE_READWRITE, "an owned unit was probed");
+    fixture.At(64) = 3;
+    Require(!OwnedWordsHold(base, Block, words), "the store into the owned unit was missed");
+    words = ArmOwned(base, Block);
+    Require(words.size() == 1 && OwnedWordsHold(base, Block, words), "the written owned unit was not armed afresh");
+    all.NoteGpuWrite(base, base + Block);
+    Require(fixture.Protection(0) == PAGE_READWRITE && fixture.At(64) == 3, "a re-armed owned unit was probed");
+    std::vector<GuestArena::GuestArenaProbeEvent> events;
+    const auto counts = TakeProbe(&events);
+    Require(counts.arms == 1 && Ended(counts, GuestArena::ProbeEnd::Owned) == 1 && counts.refused[static_cast<std::size_t>(GuestArena::ProbeRefusal::Owned)] == 2 && events.empty() && counts.live == 0, "owned arming did not end the probe first, or owned units were not refused");
+    std::cout << "ownership probe: owned arming disarms first; owned units, re-armed after a store, are refused\n";
+}
+
+void CheckOwnershipProbeHostAccess() {
+    PrivateFixture fixture(2 * Block, 2 * Block);
+    const auto base = fixture.Base();
+    AgcDriver::OwnershipProbe::Sampler all(1);
+    TakeProbe();
+    {
+        const GuestArena::HostWrite write(fixture.memory + 64, 64);
+        all.NoteGpuWrite(base, base + Block);
+        Require(write.Open() && fixture.Protection(0) == PAGE_READWRITE, "a unit with a host write open was armed");
+        std::memset(fixture.memory + 64, 0x11, 64);
+    }
+    auto counts = TakeProbe();
+    Require(counts.arms == 0 && counts.refused[static_cast<std::size_t>(GuestArena::ProbeRefusal::HostAccess)] == 1, "the refusal of a unit with a host write open was not counted");
+    all.NoteGpuWrite(base, base + Block);
+    Require(fixture.Protection(0) == (PAGE_READWRITE | PAGE_GUARD), "cannot arm the host-write unit");
+    {
+        const GuestArena::HostWrite write(fixture.memory + 64, 64);
+        Require(write.Open() && fixture.Protection(0) == PAGE_READWRITE, "a host write left its unit guarded");
+        std::memset(fixture.memory + 64, 0x22, 64);
+    }
+    std::vector<GuestArena::GuestArenaProbeEvent> events;
+    counts = TakeProbe(&events);
+    Require(Ended(counts, GuestArena::ProbeEnd::HostWrite) == 1 && events.empty() && fixture.At(64) == 0x22, "a host write did not disarm its unit first, or counted as a touch");
+    all.NoteGpuWrite(base, base + Block);
+    GuestArena::GuestArenaPrepareHostRead_nid_no_patch(fixture.memory, 4096);
+    Require(fixture.Protection(0) == PAGE_READWRITE, "a host read left its unit guarded");
+    std::array<wchar_t, MAX_PATH> directory{};
+    std::array<wchar_t, MAX_PATH> path{};
+    Require(GetTempPathW(MAX_PATH, directory.data()) != 0 && GetTempFileNameW(directory.data(), L"own", 0, path.data()) != 0, "cannot name the host-read file");
+    bool wrote = false;
+    if (HANDLE file = CreateFileW(path.data(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr); file != INVALID_HANDLE_VALUE) {
+        DWORD count = 0;
+        wrote = WriteFile(file, fixture.memory, 4096, &count, nullptr) != 0 && count == 4096;
+        CloseHandle(file);
+    }
+    DeleteFileW(path.data());
+    events.clear();
+    counts = TakeProbe(&events);
+    Require(wrote && Ended(counts, GuestArena::ProbeEnd::HostRead) == 1 && events.empty(), "the OS call reading the disarmed unit failed or the host read was not counted");
+    all.NoteGpuWrite(base, base + 2 * Block);
+    MEMORY_BASIC_INFORMATION info{};
+    Require(GuestArena::GuestArenaQuery_nid_no_patch(fixture.memory, &info, sizeof(info)) == sizeof(info) && info.Protect == PAGE_READWRITE && info.State == MEM_COMMIT, "a query through the probe saw its guard");
+    Require(fixture.Protection(0) == PAGE_READWRITE, "the query left its unit guarded");
+    Require(GuestArena::GuestArenaQuery_nid_no_patch(fixture.memory + Block, &info, sizeof(info)) == sizeof(info) && info.Protect == PAGE_READWRITE, "a query of the second unit saw its guard");
+    counts = TakeProbe();
+    Require(Ended(counts, GuestArena::ProbeEnd::Query) == 2 && counts.live == 0, "the queries did not disarm both units");
+    std::cout << "ownership probe: units with a host access open are not armed; host writes, host reads and queries disarm first\n";
+}
 #endif
 
 int main(int argc, char** argv) {
@@ -3128,6 +3311,15 @@ int main(int argc, char** argv) {
         }
         if (std::wstring_view(GetCommandLineW()).ends_with(SharedGenerationsMode)) {
             CheckComparedSharingGenerations();
+            return 0;
+        }
+        if (std::wstring_view(GetCommandLineW()).ends_with(OwnershipProbeMode)) {
+            CheckOwnershipProbeOff();
+            CheckOwnershipProbeTouches();
+            CheckOwnershipProbeResident();
+            CheckOwnershipProbeHostAccess();
+            CheckOwnershipProbeOwned();
+            std::cout << "ownership probe tests passed\n";
             return 0;
         }
 #endif

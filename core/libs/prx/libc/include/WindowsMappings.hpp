@@ -21,7 +21,9 @@
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <unordered_set>
 #include <utility>
+#include "prx/libc/include/GuestArena.hpp"
 
 namespace GuestArena {
 
@@ -371,6 +373,7 @@ public:
         for (auto it = first; it != views.end() && it->first < end; ++it) {
             if (!writable(it->second.protection)) return false;
         }
+        disarmProbes(address, end, ProbeEnd::HostWrite);
         disownRange(address, end);
         hostAccess.emplace(address, end);
         for (auto it = first; it != views.end() && it->first < end; ++it) {
@@ -548,6 +551,7 @@ public:
                 if (!blockWritten(block)) continue;
                 disownBlock(block, ownedCollected);
             }
+            disarmProbes(block, block + ownedBlockBytes, ProbeEnd::Owned);
             OwnedPlan plan;
             if (const auto refusal = ownable(block, (flags & OwnedPrivate) != 0, plan); refusal != OwnedRefusal::None) return NoteOwnedRefusal(refusal);
             appendRuns(runs, block, plan.layout, block, block + ownedBlockBytes);
@@ -640,6 +644,167 @@ public:
     void EndSetProtection() {
         std::lock_guard lock(mutex);
         if (protectionsInFlight != 0) --protectionsInFlight;
+    }
+
+    // Ownership probe (see GuestArena.hpp). A probed block's private pages carry PAGE_GUARD over their
+    // own protection; the first access raises a one-shot guard fault (the system has already dropped
+    // that page's guard), HandleProbe records it and gives the other pages their own protection back,
+    // except that after a read the writable ones stay read-only until the first store, whose fault
+    // restores them. Every protection the probe sets is undone under the mutex before anything here
+    // changes the block's mapping or protection (disownRange), opens it to a host call (BeginHostWrite,
+    // DisarmProbes from GuestArenaPrepareHostRead), arms it as an owned block, or answers a query that
+    // covers it (Query), and before Collect arms a resident run's write tracking. Only private commits
+    // (resident direct memory with a single view included, its own protection kept) are probed; shared
+    // or aliased views, owned blocks, pinned pages, open host accesses and protection changes in
+    // flight refuse.
+    static constexpr std::size_t probeCap = 65536;
+    static constexpr std::size_t probeEventCap = 65536;
+
+    bool ArmProbe(std::uintptr_t block, std::uint8_t tag) {
+        std::lock_guard lock(mutex);
+        if (const auto found = probes.find(block); found != probes.end()) {
+            auto& probe = found->second;
+            if (!probe.writeArmed) {
+                ++probeCounts.ends[static_cast<std::size_t>(ProbeEnd::Rewritten)];
+                if (guardLost(block, probe)) ++probeCounts.lost;
+                protectPrivate(block, probe.pages, [](DWORD protection) { return protection | PAGE_GUARD; });
+                probe.armedUs = probeMicroseconds();
+                probe.tag = tag;
+                return true;
+            }
+            const auto reason = ProbeEnd::Rewritten;
+            disarmProbe(found, &reason);
+        }
+        const auto refuse = [&](ProbeRefusal reason) {
+            ++probeCounts.refused[static_cast<std::size_t>(reason)];
+            return false;
+        };
+        if (probes.size() >= probeCap) return refuse(ProbeRefusal::Cap);
+        if (protectionsInFlight != 0) return refuse(ProbeRefusal::InFlight);
+        if (block % ownedBlockBytes != 0 || block >= ownedAddressLimit) return refuse(ProbeRefusal::Outside);
+        if ((ownedWord(block) & 1u) != 0) return refuse(ProbeRefusal::Owned);
+        const auto end = block + ownedBlockBytes;
+        for (auto view = views.lower_bound(block); view != views.end() && view->first < end; ++view) {
+            const auto& page = view->second;
+            if (!page.resident || page.page->aliases.size() != 1 || page.viewBytes != pageBytes || page.hostWrites != 0 || page.hostImports != 0 || page.page->pins != 0) return refuse(ProbeRefusal::View);
+        }
+        if (overlapsRange(pinnedRanges, block, end)) return refuse(ProbeRefusal::Pinned);
+        if (overlapsRange(hostAccess, block, end)) return refuse(ProbeRefusal::HostAccess);
+        Probe probe;
+        for (auto cursor = block; cursor < end;) {
+            const auto memory = query(cursor);
+            const auto stop = std::min(end, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
+            if (memory.State == MEM_COMMIT) {
+                if (memory.Type != MEM_PRIVATE) return refuse(ProbeRefusal::NotPrivate);
+                if ((memory.Protect & ~0xffu) != 0 || !ownedReadable(memory.Protect)) return refuse(ProbeRefusal::Protection);
+                for (auto page = cursor; page < stop; page += subpageBytes) {
+                    const auto index = (page - block) / subpageBytes;
+                    probe.pages.protection[index] = memory.Protect;
+                    probe.guarded = static_cast<std::uint16_t>(probe.guarded | (1u << index));
+                }
+                probe.pages.starts |= std::uint32_t{1} << ((cursor - block) / subpageBytes);
+            } else if (memory.State != MEM_RESERVE) {
+                return refuse(ProbeRefusal::Protection);
+            }
+            cursor = stop;
+        }
+        if (probe.guarded == 0) return refuse(ProbeRefusal::Empty);
+        if (!protectPrivate(block, probe.pages, [](DWORD protection) { return protection | PAGE_GUARD; })) {
+            protectPrivate(block, probe.pages, [](DWORD protection) { return protection; });
+            return refuse(ProbeRefusal::Failed);
+        }
+        probe.armedUs = probeMicroseconds();
+        probe.tag = tag;
+        probes.emplace(block, probe);
+        probeSeen.insert(block);
+        probeUsed.store(true, std::memory_order_release);
+        probeLive.store(probes.size(), std::memory_order_release);
+        ++probeCounts.arms;
+        return true;
+    }
+
+    // From the vectored handler: a guard fault (`guard`) or an access violation at `address`. A guard
+    // fault of a block probed earlier but disarmed since is the probe's too: the system dropped that
+    // page's guard, so the access goes on.
+    bool HandleProbe(std::uintptr_t address, bool write, bool guard, std::uintptr_t rip) {
+        if (probeLive.load(std::memory_order_acquire) == 0 && !(guard && probeUsed.load(std::memory_order_acquire))) return false;
+        std::lock_guard lock(mutex);
+        const auto block = address & ~std::uintptr_t{ownedBlockBytes - 1};
+        const auto found = probes.find(block);
+        if (found == probes.end()) {
+            if (!guard || !probeSeen.contains(block)) return false;
+            ++probeCounts.extraFaults;
+            return true;
+        }
+        auto& probe = found->second;
+        if (!probe.writeArmed) {
+            if (!guard) return false;
+            noteTouch(block, probe, write ? ProbeTouch::Write : ProbeTouch::Read, rip);
+            ++probeCounts.ends[static_cast<std::size_t>(write ? ProbeEnd::Write : ProbeEnd::Read)];
+            const bool writable = std::any_of(probe.pages.protection.begin(), probe.pages.protection.end(), probeWritable);
+            if (write || !writable) {
+                protectPrivate(block, probe.pages, [](DWORD protection) { return protection; });
+                eraseProbe(found);
+                return true;
+            }
+            protectPrivate(block, probe.pages, [](DWORD protection) { return probeWritable(protection) ? readOnlyOf(protection) : protection; });
+            probe.writeArmed = true;
+            return true;
+        }
+        if (guard) {
+            ++probeCounts.extraFaults;
+            return true;
+        }
+        if (!write || !probeWritable(probe.pages.protection[(address - block) / subpageBytes])) return false;
+        noteTouch(block, probe, ProbeTouch::WriteAfterRead, rip);
+        ++probeCounts.afterReadWritten;
+        protectPrivate(block, probe.pages, [](DWORD protection) { return protection; });
+        eraseProbe(found);
+        return true;
+    }
+
+    bool NoteProbeRefusal(ProbeRefusal reason) {
+        std::lock_guard lock(mutex);
+        ++probeCounts.refused[static_cast<std::size_t>(reason)];
+        return false;
+    }
+
+    void DisarmProbes(std::uintptr_t start, std::uintptr_t end, ProbeEnd reason) {
+        if (probeLive.load(std::memory_order_acquire) == 0) return;
+        std::lock_guard lock(mutex);
+        disarmProbes(start, end, reason);
+    }
+
+    // VirtualQuery, with the probed blocks the answer covers or ends at disarmed first: the region it
+    // returns is the one the guest's own protections make.
+    std::size_t Query(const void* address, MEMORY_BASIC_INFORMATION* information, std::size_t bytes) {
+        if (probeLive.load(std::memory_order_acquire) == 0) return VirtualQuery(address, information, bytes);
+        std::lock_guard lock(mutex);
+        const auto at = reinterpret_cast<std::uintptr_t>(address);
+        disarmProbes(at, at + 1, ProbeEnd::Query);
+        for (;;) {
+            const auto size = VirtualQuery(address, information, bytes);
+            if (size < sizeof(MEMORY_BASIC_INFORMATION) || probes.empty()) return size;
+            const auto next = probes.find((reinterpret_cast<std::uintptr_t>(information->BaseAddress) + information->RegionSize) & ~std::uintptr_t{ownedBlockBytes - 1});
+            if (next == probes.end()) return size;
+            const auto reason = ProbeEnd::Query;
+            disarmProbe(next, &reason);
+        }
+    }
+
+    std::size_t TakeProbe(GuestArenaProbeCounts* counts, GuestArenaProbeEvent* events, std::size_t capacity) {
+        std::lock_guard lock(mutex);
+        if (counts != nullptr) {
+            *counts = probeCounts;
+            counts->live = probes.size();
+            probeCounts = {};
+        }
+        const auto taken = std::min(capacity, probeEvents.size());
+        if (taken != 0) {
+            std::copy_n(probeEvents.begin(), taken, events);
+            probeEvents.erase(probeEvents.begin(), probeEvents.begin() + static_cast<std::ptrdiff_t>(taken));
+        }
+        return taken;
     }
 
     bool Collect(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear, Collection collection = Collection::All) {
@@ -1290,6 +1455,7 @@ private:
     }
 
     void disownRange(std::uintptr_t start, std::uintptr_t end, std::atomic<std::uint64_t>* reason = nullptr) {
+        disarmProbes(start, end, ProbeEnd::Mapping);
         if (ownedLive == 0 || end <= start) return;
         end = std::min(end, ownedAddressLimit);
         for (auto block = start & ~std::uintptr_t{ownedBlockBytes - 1}; block < end && ownedLive != 0;) {
@@ -1702,6 +1868,112 @@ private:
         }
         return error;
     }
+
+    // A probed block's private pages with the protection each had (0 for a page that is not one),
+    // restored when the probe ends. `starts` marks the pages that begin a queried region: a protection
+    // call cannot span two allocations. (Kept from the protection-based owned arming merge24 removed.)
+    struct OwnedPages {
+        std::array<DWORD, ownedPagesPerBlock> protection{};
+        std::uint32_t starts = 0;
+    };
+
+    static DWORD readOnlyOf(DWORD protection) {
+        return protection == PAGE_EXECUTE_READWRITE || protection == PAGE_EXECUTE_READ ? PAGE_EXECUTE_READ : PAGE_READONLY;
+    }
+
+    // Applies `protection(page)` to the block's private pages that have one, in runs of equal value.
+    template <typename Protection>
+    static bool protectPrivate(std::uintptr_t block, const OwnedPages& pages, Protection protection) {
+        for (std::size_t page = 0; page < ownedPagesPerBlock;) {
+            if (pages.protection[page] == 0) {
+                ++page;
+                continue;
+            }
+            auto stop = page + 1;
+            while (stop < ownedPagesPerBlock && pages.protection[stop] == pages.protection[page] && (pages.starts >> stop & 1u) == 0) ++stop;
+            DWORD previous;
+            if (!VirtualProtect(reinterpret_cast<void*>(block + page * subpageBytes), (stop - page) * subpageBytes, protection(pages.protection[page]), &previous)) return false;
+            page = stop;
+        }
+        return true;
+    }
+
+    struct Probe {
+        OwnedPages pages;
+        std::uint64_t armedUs = 0;
+        std::uint16_t guarded = 0;
+        std::uint8_t tag = 0;
+        bool writeArmed = false;
+    };
+    using Probes = std::map<std::uintptr_t, Probe>;
+
+    static bool probeWritable(DWORD protection) {
+        return protection == PAGE_READWRITE || protection == PAGE_EXECUTE_READWRITE;
+    }
+
+    static std::uint64_t probeMicroseconds() {
+        static const auto frequency = [] {
+            LARGE_INTEGER value{};
+            QueryPerformanceFrequency(&value);
+            return static_cast<std::uint64_t>(value.QuadPart);
+        }();
+        LARGE_INTEGER now{};
+        QueryPerformanceCounter(&now);
+        const auto ticks = static_cast<std::uint64_t>(now.QuadPart);
+        return ticks / frequency * 1000000u + ticks % frequency * 1000000u / frequency;
+    }
+
+    void noteTouch(std::uintptr_t block, const Probe& probe, ProbeTouch touch, std::uintptr_t rip) {
+        if (probeEvents.size() >= probeEventCap) {
+            ++probeCounts.dropped;
+            return;
+        }
+        const auto now = probeMicroseconds();
+        probeEvents.push_back(GuestArenaProbeEvent{block, rip, now > probe.armedUs ? now - probe.armedUs : 0, static_cast<std::uint32_t>(GetCurrentThreadId()), static_cast<std::uint8_t>(touch), probe.tag});
+    }
+
+    // Whether a page the probe guarded lost its guard without a fault reaching HandleProbe.
+    static bool guardLost(std::uintptr_t block, const Probe& probe) {
+        std::uint32_t still = 0;
+        for (auto cursor = block; cursor < block + ownedBlockBytes;) {
+            const auto memory = query(cursor);
+            const auto stop = std::min(block + ownedBlockBytes, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
+            if (memory.State == MEM_COMMIT && (memory.Protect & PAGE_GUARD) != 0) {
+                for (auto page = cursor; page < stop; page += subpageBytes) still |= 1u << ((page - block) / subpageBytes);
+            }
+            cursor = stop;
+        }
+        return (probe.guarded & ~still) != 0;
+    }
+
+    void eraseProbe(Probes::iterator found) {
+        probes.erase(found);
+        probeLive.store(probes.size(), std::memory_order_release);
+    }
+
+    // Gives the block's pages their own protection back; `reason` ends its interval.
+    void disarmProbe(Probes::iterator found, const ProbeEnd* reason) {
+        auto& probe = found->second;
+        if (probe.writeArmed) ++probeCounts.afterReadOther;
+        else {
+            ++probeCounts.ends[static_cast<std::size_t>(*reason)];
+            if (guardLost(found->first, probe)) ++probeCounts.lost;
+        }
+        if (!protectPrivate(found->first, probe.pages, [](DWORD protection) { return protection; })) fail("restore probed guest memory");
+        eraseProbe(found);
+    }
+
+    void disarmProbes(std::uintptr_t start, std::uintptr_t end, ProbeEnd reason) {
+        if (probes.empty() || end <= start) return;
+        for (auto it = probes.lower_bound(start & ~std::uintptr_t{ownedBlockBytes - 1}); it != probes.end() && it->first < end;) disarmProbe(it++, &reason);
+    }
+
+    Probes probes;
+    std::unordered_set<std::uintptr_t> probeSeen;
+    std::vector<GuestArenaProbeEvent> probeEvents;
+    GuestArenaProbeCounts probeCounts{};
+    std::atomic<std::size_t> probeLive{0};
+    std::atomic<bool> probeUsed{false};
 
     Ranges cleanRanges;
     Ranges collectableRanges;

@@ -645,6 +645,23 @@ void GuestArenaTakeOwnedCounts_nid_no_patch(std::uint64_t* counts, std::size_t c
 void GuestArenaEndSetProtection_nid_no_patch(std::uintptr_t, std::size_t) {
     WindowsMappings::Get().EndSetProtection();
 }
+
+bool GuestArenaProbeArm_nid_no_patch(std::uintptr_t block, std::uint8_t tag) {
+    if (!ownedRangeInArena(block, WindowsMappings::ownedBlockBytes)) return WindowsMappings::Get().NoteProbeRefusal(ProbeRefusal::Outside);
+    return WindowsMappings::Get().ArmProbe(block, tag);
+}
+
+std::size_t GuestArenaProbeTake_nid_no_patch(GuestArenaProbeCounts* counts, GuestArenaProbeEvent* events, std::size_t capacity) {
+    return WindowsMappings::Get().TakeProbe(counts, events, capacity);
+}
+
+bool GuestArenaHandleProbe_nid_postfix(std::uintptr_t address, bool write, bool guard, std::uintptr_t rip) {
+    return WindowsMappings::Get().HandleProbe(address, write, guard, rip);
+}
+
+std::size_t GuestArenaQuery_nid_no_patch(const void* address, void* information, std::size_t bytes) {
+    return WindowsMappings::Get().Query(address, static_cast<MEMORY_BASIC_INFORMATION*>(information), bytes);
+}
 #else
 bool GuestArenaArmOwned_nid_no_patch(std::uintptr_t, std::size_t, std::uint64_t*, std::size_t, unsigned) {
     return false;
@@ -663,6 +680,15 @@ void GuestArenaTakeOwnedCounts_nid_no_patch(std::uint64_t* counts, std::size_t c
 }
 
 void GuestArenaEndSetProtection_nid_no_patch(std::uintptr_t, std::size_t) {}
+
+bool GuestArenaProbeArm_nid_no_patch(std::uintptr_t, std::uint8_t) {
+    return false;
+}
+
+std::size_t GuestArenaProbeTake_nid_no_patch(GuestArenaProbeCounts* counts, GuestArenaProbeEvent*, std::size_t) {
+    if (counts != nullptr) *counts = {};
+    return 0;
+}
 #endif
 
 void GuestArenaSetHostWriteHook_nid_no_patch(void (*hook)(std::uintptr_t, std::size_t)) {
@@ -681,6 +707,9 @@ void GuestArenaPrepareHostRead_nid_no_patch(const void* pointer, std::size_t byt
     const auto address = reinterpret_cast<std::uintptr_t>(pointer);
     if (address == 0 || bytes == 0 || bytes > std::numeric_limits<std::uintptr_t>::max() - address) return;
     if (const auto hook = hostReadHook.load(std::memory_order_acquire)) hook(address, bytes);
+#ifdef _WIN32
+    WindowsMappings::Get().DisarmProbes(address, address + bytes, ProbeEnd::HostRead);
+#endif
 }
 
 bool GuestArenaBeginHostWrite_nid_postfix(void* pointer, std::size_t bytes) {

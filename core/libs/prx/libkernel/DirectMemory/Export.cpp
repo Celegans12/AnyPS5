@@ -6,6 +6,7 @@
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/GuestArena.hpp"
 #include "prx/libkernel/DirectMemory/DirectMemory.hpp"
 #include "prx/libkernel/AppMetadata/include/ParamJsonParser.hpp"
 #include "prx/libkernel/Pthread/include/Pthread.hpp"
@@ -382,7 +383,7 @@ int APS5_VABI sceKernelVirtualQuery(const void* addr, int flags, VirtualQueryInf
  // region around the address is the honest extent; unmapped memory is an error, as on the PS5.
  #ifdef _WIN32
  MEMORY_BASIC_INFORMATION host{};
- if (VirtualQuery(addr, &host, sizeof(host)) == 0 || host.State != MEM_COMMIT) return SCE_KERNEL_ERROR_EACCES;
+ if (GuestArena::GuestArenaQuery_nid_no_patch(addr, &host, sizeof(host)) == 0 || host.State != MEM_COMMIT) return SCE_KERNEL_ERROR_EACCES;
  info->start = reinterpret_cast<uintptr_t>(host.BaseAddress);
  info->end = info->start + host.RegionSize;
  const bool writable = (host.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY)) != 0;
@@ -607,7 +608,7 @@ std::mutex g_workingSetLock;
 bool HostRangeAccessible(std::uintptr_t start, std::uintptr_t end) {
     for (auto cursor = start; cursor < end;) {
         MEMORY_BASIC_INFORMATION region{};
-        if (VirtualQuery(reinterpret_cast<const void*>(cursor), &region, sizeof(region)) != sizeof(region)) return false;
+        if (GuestArena::GuestArenaQuery_nid_no_patch(reinterpret_cast<const void*>(cursor), &region, sizeof(region)) != sizeof(region)) return false;
         if (region.State != MEM_COMMIT || (region.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) return false;
         cursor = reinterpret_cast<std::uintptr_t>(region.BaseAddress) + region.RegionSize;
     }
@@ -650,7 +651,7 @@ std::uintptr_t HostPageSize() {
 int UnlockHostPages(std::uintptr_t start, std::uintptr_t end) {
     for (auto cursor = start; cursor < end;) {
         MEMORY_BASIC_INFORMATION region{};
-        if (VirtualQuery(reinterpret_cast<const void*>(cursor), &region, sizeof(region)) != sizeof(region) || region.State == MEM_FREE) return SCE_KERNEL_ERROR_ENOMEM;
+        if (GuestArena::GuestArenaQuery_nid_no_patch(reinterpret_cast<const void*>(cursor), &region, sizeof(region)) != sizeof(region) || region.State == MEM_FREE) return SCE_KERNEL_ERROR_ENOMEM;
         const auto next = std::min(end, reinterpret_cast<std::uintptr_t>(region.BaseAddress) + region.RegionSize);
         if (region.State == MEM_RESERVE) {
             for (auto reserved = cursor; reserved < next;) {
@@ -670,7 +671,7 @@ int UnlockHostPages(std::uintptr_t start, std::uintptr_t end) {
     }
     for (auto cursor = start; cursor < end;) {
         MEMORY_BASIC_INFORMATION region{};
-        if (VirtualQuery(reinterpret_cast<const void*>(cursor), &region, sizeof(region)) != sizeof(region)) return SCE_KERNEL_ERROR_ENOMEM;
+        if (GuestArena::GuestArenaQuery_nid_no_patch(reinterpret_cast<const void*>(cursor), &region, sizeof(region)) != sizeof(region)) return SCE_KERNEL_ERROR_ENOMEM;
         const auto next = std::min(end, reinterpret_cast<std::uintptr_t>(region.BaseAddress) + region.RegionSize);
         if (region.State == MEM_COMMIT && (region.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0 && !VirtualUnlock(reinterpret_cast<void*>(cursor), next - cursor)) {
             if (GetLastError() != ERROR_NOT_LOCKED) throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "VirtualUnlock failed");
@@ -759,7 +760,7 @@ int APS5_VABI sceKernelMunlockall_nid_postfix() {
         const auto end = start + len;
         for (auto cursor = start; cursor < end;) {
             MEMORY_BASIC_INFORMATION region{};
-            if (VirtualQuery(reinterpret_cast<const void*>(cursor), &region, sizeof(region)) != sizeof(region)) break;
+            if (GuestArena::GuestArenaQuery_nid_no_patch(reinterpret_cast<const void*>(cursor), &region, sizeof(region)) != sizeof(region)) break;
             const auto next = std::min(end, reinterpret_cast<std::uintptr_t>(region.BaseAddress) + region.RegionSize);
             if (region.State == MEM_COMMIT && (region.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0 && !VirtualUnlock(reinterpret_cast<void*>(cursor), next - cursor)) {
                 if (GetLastError() != ERROR_NOT_LOCKED) throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "VirtualUnlock failed");

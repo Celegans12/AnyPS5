@@ -14,6 +14,44 @@ inline constexpr std::uintptr_t GuestAddressOffset = 0x0000100000000000ull;
 inline constexpr std::uintptr_t GuestAddressOffset = 0;
 #endif
 
+// Ownership probe (WindowsMappings::ArmProbe, the driver's APS5_PROFILE_OWNERSHIP; Windows only):
+// one-shot guards on 64 KiB blocks of private guest memory the GPU wrote, counting the CPU's first
+// touch of each. A guarded interval ends with a read or a write fault, the block's next GPU write
+// (rewritten untouched), or a disarm before a host write, a host read, a query covering it, a
+// mapping or protection change, or owned-proof arming. After a read the block's writable pages stay
+// read-only until the first store (written) or the next end (other).
+enum class ProbeEnd : std::uint8_t { Read, Write, Rewritten, HostWrite, HostRead, Query, Mapping, Owned, Count };
+enum class ProbeRefusal : std::uint8_t { Outside, View, Owned, Pinned, HostAccess, InFlight, NotPrivate, Protection, Empty, Failed, Cap, Count };
+enum class ProbeTouch : std::uint8_t { Read, Write, WriteAfterRead };
+inline constexpr std::size_t ProbeEndCount = static_cast<std::size_t>(ProbeEnd::Count);
+inline constexpr std::size_t ProbeRefusalCount = static_cast<std::size_t>(ProbeRefusal::Count);
+
+struct GuestArenaProbeEvent {
+    std::uint64_t block;
+    std::uint64_t rip;
+    std::uint64_t latencyUs;
+    std::uint32_t thread;
+    std::uint8_t touch;
+    std::uint8_t tag;
+};
+
+// Since the last take: guarded intervals begun (arms), re-armed by a GPU write while untouched
+// (also counted as ends[Rewritten]), touch events dropped (the event buffer was full), intervals
+// whose guard the system dropped without a fault reaching the handler (kernel-mode access or a
+// foreign protection change), guard faults after the block's first, after-read ends; live = blocks
+// armed now.
+struct GuestArenaProbeCounts {
+    std::uint64_t arms;
+    std::uint64_t live;
+    std::uint64_t dropped;
+    std::uint64_t lost;
+    std::uint64_t extraFaults;
+    std::uint64_t afterReadWritten;
+    std::uint64_t afterReadOther;
+    std::uint64_t ends[ProbeEndCount];
+    std::uint64_t refused[ProbeRefusalCount];
+};
+
 #ifndef _WIN32
 using SharedBackingResolver = bool (*)(std::uintptr_t address, std::size_t bytes, int* file, std::uint64_t* offset);
 using SharedBackingWriter = bool (*)(std::uintptr_t address, const void* source, std::size_t bytes);
@@ -101,6 +139,17 @@ bool GuestArenaOwnedUnchanged_nid_no_patch(std::uintptr_t address, std::size_t b
 std::uint64_t GuestArenaOwnedMark_nid_no_patch();
 void GuestArenaTakeOwnedCounts_nid_no_patch(std::uint64_t* counts, std::size_t count);
 void GuestArenaEndSetProtection_nid_no_patch(std::uintptr_t address, std::size_t bytes);
+// Ownership probe: arms the 64 KiB block at `block` (re-arms it when armed and untouched; false
+// when it cannot be armed, counted by reason). Take: the counts since the last take and up to
+// `capacity` touch events (returns their number; the rest stay for the next take). Query is
+// VirtualQuery that first disarms the probed blocks the answer would show, so no caller sees a
+// probe's guard; with nothing armed it is VirtualQuery. Not Windows: nothing is armed.
+bool GuestArenaProbeArm_nid_no_patch(std::uintptr_t block, std::uint8_t tag);
+std::size_t GuestArenaProbeTake_nid_no_patch(GuestArenaProbeCounts* counts, GuestArenaProbeEvent* events, std::size_t capacity);
+#ifdef _WIN32
+bool GuestArenaHandleProbe_nid_postfix(std::uintptr_t address, bool write, bool guard, std::uintptr_t rip);
+std::size_t GuestArenaQuery_nid_no_patch(const void* address, void* information, std::size_t bytes);
+#endif
 
 }
 
