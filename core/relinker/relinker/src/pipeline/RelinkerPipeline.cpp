@@ -277,6 +277,8 @@ RelinkResult RelinkerPipeline::Relink() {
 
     for (auto& [fst, snd] : neededLibraryNamesByStrOffset) {
         snd = readCStr(fst);
+        if (snd.empty() || snd.find_first_of("\\:$\r\n") != std::string::npos)
+            throw RelinkerException("Invalid dependency: " + snd, dynStrTabOffset + fst);
         neededLibraries.push_back(snd);
     }
 
