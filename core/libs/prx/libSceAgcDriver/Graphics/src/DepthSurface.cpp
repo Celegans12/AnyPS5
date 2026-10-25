@@ -2908,6 +2908,15 @@ void NoteHtileMaskOnGpu(const Context& context, std::uint64_t address, std::size
     gpu.masks.push_back({address, end, mask, value, note});
 }
 
+std::uint64_t HtileMaskNoteAt(std::uint64_t address) {
+    auto& gpu = HtileGpu();
+    std::lock_guard lock(gpu.mutex);
+    for (const auto& write : gpu.masks) {
+        if (write.begin == address) return write.note;
+    }
+    return 0;
+}
+
 void SetHtileFillOnGpu(const Recorder* recorder, HtileFillOnGpu fill) {
     auto& gpu = HtileGpu();
     std::lock_guard lock(gpu.mutex);

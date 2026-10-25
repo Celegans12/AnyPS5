@@ -89,6 +89,8 @@ class Recorder;
 // (word & mask) | value on the GPU. Noted under the GPU lock right after the dispatch is recorded, with the recorder's
 // write note, so a depth store-back can know the HTILE words without reading them back (APS5_NO_HTILE_GPU_EXPANSION=1: off).
 void NoteHtileMaskOnGpu(const Context& context, std::uint64_t address, std::size_t bytes, std::uint32_t mask, std::uint32_t value);
+// The recorder write note of the HTILE mask clear noted over a range starting at `address` (0: none), for tests.
+std::uint64_t HtileMaskNoteAt(std::uint64_t address);
 // The device's GPU fill of a uniform dword over guest memory (VulkanDevice::FillBuffer), per recorder; null removes it.
 using HtileFillOnGpu = std::function<bool(std::uint64_t address, std::size_t bytes, std::uint32_t word)>;
 void SetHtileFillOnGpu(const Recorder* recorder, HtileFillOnGpu fill);
