@@ -1,12 +1,34 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "ImageTableAbi.hpp"
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+
+bool TakeAdmissionProbe() {
+    static const std::uint64_t limit = [] {
+        const char* text = std::getenv("APS5_VERIFY_DISPATCH_ADMISSION");
+        return text != nullptr ? static_cast<std::uint64_t>(std::strtoull(text, nullptr, 10)) : 0ull;
+    }();
+    if (limit == 0) return false;
+    static std::int64_t window = -1;
+    static std::uint64_t used = 0;
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    if (now != window) {
+        window = now;
+        used = 0;
+    }
+    return used++ < limit;
+}
+
+}
 
 bool CacheableResult(const ShaderRecompiler::RecompileResult& compiled) {
     return compiled.poisonedSrtReads == 0u && std::none_of(compiled.imageTablePoison.begin(), compiled.imageTablePoison.end(), [](const ShaderRecompiler::ImageTableEntryPoison& poison) {
@@ -16,7 +38,27 @@ bool CacheableResult(const ShaderRecompiler::RecompileResult& compiled) {
 
 void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDispatchCache, bool profile, const std::shared_ptr<const ShaderSnapshot>& registeredShader, std::uint64_t forgetAtCapture, std::span<const ShaderRecompiler::MemoryRegion> memory, const std::shared_ptr<ShaderMemory>& shaderMemory, const std::vector<ShaderRecompiler::MemoryRegion>& captured, const std::shared_ptr<const ShaderRecompiler::ResourceCapture>& capture, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, const std::shared_ptr<DispatchEntry>& missedEntry, bool missedDiffering, std::shared_ptr<DispatchVariant>& attachVariant, DispatchPhaseTiming& phaseTiming) {
     if (!noDispatchCache) {
+        bool probe = false;
+        if (!stampValidate() && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoDispatchAdmission)) {
+            std::lock_guard admissionLock(dispatchCacheMutex);
+            if (dispatchCache.find(key) == dispatchCache.end()) {
+                auto& seen = dispatchAdmission.sightings[DispatchAdmission::Slot(key)];
+                if (seen != key) {
+                    seen = key;
+                    ++dispatchAdmission.skipped;
+                    if (!TakeAdmissionProbe()) {
+                        phaseTiming.Phase(PhaseInsert);
+                        return;
+                    }
+                    probe = true;
+                    ++dispatchAdmission.probes;
+                } else {
+                    ++dispatchAdmission.admitted;
+                }
+            }
+        }
         auto fresh = std::make_shared<DispatchVariant>();
+        fresh->admissionProbe = probe;
         fresh->compiled = compiledResult;
         fresh->shader = registeredShader;
         fresh->forgetSerial = forgetAtCapture;

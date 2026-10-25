@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
@@ -116,6 +117,7 @@ void AlternatingValueSets(const GuestBlock& block) {
 
 int main() {
     try {
+        AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::NoDispatchAdmission, true);
 #ifdef _WIN32
         _putenv_s("APS5_PROFILE_DRAW", "1");
         _putenv_s("APS5_DISPATCH_VARIANTS", "1");

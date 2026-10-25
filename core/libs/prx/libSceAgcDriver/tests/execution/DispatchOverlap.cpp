@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
@@ -199,6 +200,7 @@ void SameBuildTwice() {
 
 int main(int argc, char** argv) {
     try {
+        AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::NoDispatchAdmission, true);
         {
             const auto probe = OpenVulkanTestDevice();
             if (!probe) return VulkanTestSkipped;

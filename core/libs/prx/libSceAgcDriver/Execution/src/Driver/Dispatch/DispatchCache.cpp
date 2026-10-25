@@ -59,6 +59,11 @@ EntryCounters Driver::DispatchCacheCounters() {
     return entryCounters;
 }
 
+std::array<std::uint64_t, 4> Driver::DispatchAdmissionCounts() {
+    std::lock_guard lock(dispatchCacheMutex);
+    return {dispatchAdmission.skipped, dispatchAdmission.admitted, dispatchAdmission.probes, dispatchAdmission.probeHits};
+}
+
 Driver::DispatchCacheFootprint Driver::DispatchCacheSize() {
     std::lock_guard lock(dispatchCacheMutex);
     return {dispatchCache.size(), dispatchCacheVariantBytes};

@@ -52,6 +52,17 @@ struct DispatchVariant {
     std::vector<ShaderRecompiler::MemoryRegion> captured;
     std::vector<std::pair<std::uint64_t, std::size_t>> spans;
     std::atomic<std::uint64_t> generation{0};
+    bool admissionProbe = false;
+};
+
+struct DispatchAdmission {
+    static constexpr std::size_t Slots = 16384;
+    static std::size_t Slot(std::uint64_t key) { return static_cast<std::size_t>((key ^ (key >> 29u) ^ (key >> 47u)) & (Slots - 1u)); }
+    std::array<std::uint64_t, Slots> sightings{};
+    std::uint64_t skipped = 0;
+    std::uint64_t admitted = 0;
+    std::uint64_t probes = 0;
+    std::uint64_t probeHits = 0;
 };
 
 struct DispatchEntry {

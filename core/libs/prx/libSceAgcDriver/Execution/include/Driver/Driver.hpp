@@ -126,6 +126,7 @@ public:
     };
     DrawCacheOccupancy DrawCacheState();
     EntryCounters DispatchCacheCounters();
+    std::array<std::uint64_t, 4> DispatchAdmissionCounts();
     struct DispatchCacheFootprint {
         std::size_t entries = 0;
         std::uint64_t variantBytes = 0;
@@ -446,6 +447,7 @@ private:
     std::uint64_t dispatchCacheVariantBytes = 0;
 
     EntryCounters entryCounters;
+    DispatchAdmission dispatchAdmission;
 
     std::atomic<std::uint64_t> dataPendingMisses{0};
 

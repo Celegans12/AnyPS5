@@ -140,6 +140,10 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
                 keepVariant = variant;
                 cached = true;
                 ++dispatchCacheHits;
+                if (variant->admissionProbe) {
+                    variant->admissionProbe = false;
+                    ++dispatchAdmission.probeHits;
+                }
                 if (untouched) {
                     if (restamped != 0) variant->generation.store(restamped, std::memory_order_release);
 
