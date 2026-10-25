@@ -165,6 +165,8 @@ struct FlushWaits {
     std::map<std::string, FlushWaitTotals> byReason;
     std::uint64_t laneWaits = 0, fullWaits = 0, openWriters = 0, laneOneOnly = 0, laneZeroOnly = 0, bothLanes = 0, nothingLeft = 0;
     std::uint64_t leftInFlight = 0, leftOpen = 0;
+    std::array<std::uint64_t, 5> bySource{}, stampedBySource{};
+    std::array<double, 5> msBySource{};
     double laneMs = 0, fullMs = 0;
 };
 
@@ -173,9 +175,14 @@ FlushWaits& FlushWaitCounts() {
     return waits;
 }
 
-void NoteFlushWait(const char* reason, bool byLane, bool openWriter, const Recorder::WriterWait& wait, double ms) {
+void NoteFlushWait(const char* reason, bool byLane, bool openWriter, const Recorder::WriterWait& wait, double ms, int source, bool stamped) {
     auto& waits = FlushWaitCounts();
     std::lock_guard lock(waits.mutex);
+    if (source >= 0 && source < 5) {
+        ++waits.bySource[static_cast<std::size_t>(source)];
+        waits.msBySource[static_cast<std::size_t>(source)] += ms;
+        if (stamped) ++waits.stampedBySource[static_cast<std::size_t>(source)];
+    }
     auto& totals = waits.byReason[reason != nullptr ? reason : "other"];
     ++totals.count;
     totals.ms += ms;
@@ -208,6 +215,16 @@ std::string FlushWaitReport() {
         std::snprintf(text, sizeof(text), " %s %llu/%.1f", reason.c_str(), static_cast<unsigned long long>(totals.count), totals.ms);
         report += text;
     }
+    static constexpr const char* sourceNames[5] = {"in-flight writer", "open-batch write", "recorded store", "open-batch lease", "other"};
+    report += "\n[flush-wait-source] writer waits by what was waited for (count/ms, of them waits whose completions stamped the stored blocks):";
+    for (std::size_t source = 0; source < 5; ++source) {
+        if (waits.bySource[source] == 0) continue;
+        std::snprintf(text, sizeof(text), " %s %llu/%.1f stamped %llu", sourceNames[source], static_cast<unsigned long long>(waits.bySource[source]), waits.msBySource[source], static_cast<unsigned long long>(waits.stampedBySource[source]));
+        report += text;
+    }
+    waits.bySource = {};
+    waits.stampedBySource = {};
+    waits.msBySource = {};
     waits.byReason.clear();
     waits.laneWaits = waits.fullWaits = waits.openWriters = waits.laneOneOnly = waits.laneZeroOnly = waits.bothLanes = waits.nothingLeft = waits.leftInFlight = waits.leftOpen = 0;
     waits.laneMs = waits.fullMs = 0;
@@ -4487,6 +4504,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
                     const int source = openWriter ? (openWrites(*recorder) ? 1 : 3) : 0;
                     const bool profiled = FlushWaitsProfiled();
                     const auto waitStart = profiled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                    const auto generationBefore = profiled ? GuestMemory::TrackerGeneration() : 0;
                     const bool byLane = !RuntimeSwitches::Set(RuntimeSwitch::NoFlushLaneWait);
                     Recorder::WriterWait wait;
                     if (byLane) {
@@ -4511,7 +4529,11 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
                     } else {
                         recorder->FinishUpTo(writer);
                     }
-                    if (profiled) NoteFlushWait(reason, byLane, openWriter, wait, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count());
+                    if (profiled) {
+                        const auto waitedMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count();
+                        const bool stamped = std::any_of(stored.begin(), stored.end(), [&](const auto& range) { return range.second > range.first && GuestMemory::WrittenSince(range.first, static_cast<std::size_t>(range.second - range.first), generationBefore); });
+                        NoteFlushWait(reason, byLane, openWriter, wait, waitedMs, source, stamped);
+                    }
                 }
             }
         } catch (...) {
