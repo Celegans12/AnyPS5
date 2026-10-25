@@ -302,6 +302,7 @@ public:
     static void StoreReadbackBeforeLabel(const char* reason);
     static std::size_t StoreDrawnLinear(const char* reason);
     static std::size_t StoreDrawnLinearTouching(const char* reason, const std::function<bool(std::uint64_t, std::uint64_t)>& touches, bool all);
+    static std::vector<std::pair<std::uint64_t, std::size_t>> ReadbackBeforeLabelRanges();
     static bool AnyPending();
     static void FlushDumpSelected(const char* reason);
     static bool StoreAtFlipRequested(const char* value);

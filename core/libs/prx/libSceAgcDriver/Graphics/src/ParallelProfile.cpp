@@ -62,6 +62,11 @@ struct State {
     double processCpuMs = 0;
     double committerCpuMs = 0;
     GuestMemory::TrackerLockStats tracker{};
+    std::array<double, static_cast<std::size_t>(LabelWait::Count)> labelWaitUs{};
+    std::array<std::uint64_t, static_cast<std::size_t>(LabelWait::Count)> labelWaits{};
+    std::uint64_t labelPreWaits = 0;
+    std::uint64_t labelPreWaited = 0;
+    double labelPreWaitUs = 0;
     bool primed = false;
 };
 
@@ -71,6 +76,8 @@ State& state() {
 }
 
 thread_local bool committerThread = false;
+thread_local bool labelScopeOpen = false;
+constexpr std::array<const char*, static_cast<std::size_t>(LabelWait::Count)> LabelWaitNames{"deferred labels", "storage readback", "reap", "unit shadow", "device drain"};
 
 void addRun(std::array<std::uint64_t, RunBuckets>& histogram, std::uint64_t& run) {
     if (run == 0) return;
@@ -177,6 +184,34 @@ void NoteStamps(Window window, std::uint32_t moved) {
     }
 }
 
+void NoteLabelWait(LabelWait cause, double lockedWaitUs) {
+    if (!On() || !committerThread || lockedWaitUs <= 0) return;
+    auto& s = state();
+    s.labelWaitUs[static_cast<std::size_t>(cause)] += lockedWaitUs;
+    ++s.labelWaits[static_cast<std::size_t>(cause)];
+}
+
+void NoteLabelPreWait(double waitedUs, bool waited) {
+    if (!On() || !committerThread) return;
+    auto& s = state();
+    ++s.labelPreWaits;
+    if (waited) ++s.labelPreWaited;
+    s.labelPreWaitUs += waitedUs;
+}
+
+LabelWaitScope::LabelWaitScope(LabelWait cause) : cause(cause) {
+    if (!On() || !committerThread || labelScopeOpen) return;
+    active = true;
+    labelScopeOpen = true;
+    before = GuestMemory::ThreadLockedGpuWaitMs();
+}
+
+LabelWaitScope::~LabelWaitScope() {
+    if (!active) return;
+    labelScopeOpen = false;
+    NoteLabelWait(cause, (GuestMemory::ThreadLockedGpuWaitMs() - before) * 1e3);
+}
+
 void NoteItem(const ItemSample& sample) {
     if (!On() || !committerThread) return;
     auto& s = state();
@@ -274,6 +309,17 @@ void Report() {
         passes += s.passLengths[index];
         serialRuns += s.serialRuns[index];
         itemRuns += s.itemRuns[index];
+    }
+    others += "; label locked waits by cause (count/ms):";
+    for (std::size_t cause = 0; cause < s.labelWaitUs.size(); ++cause) {
+        char text[96];
+        std::snprintf(text, sizeof(text), " %s %llu/%.0f", LabelWaitNames[cause], static_cast<unsigned long long>(s.labelWaits[cause]), s.labelWaitUs[cause] / 1e3);
+        others += text;
+    }
+    {
+        char text[160];
+        std::snprintf(text, sizeof(text), "; label readback pre-waits %llu (%llu waited %.0f ms without the mutex)", static_cast<unsigned long long>(s.labelPreWaits), static_cast<unsigned long long>(s.labelPreWaited), s.labelPreWaitUs / 1e3);
+        others += text;
     }
     const auto verdict = Gate({share, queueSurvival, serialP50});
     AgcDriver::ProfilePrint_nid_no_patch(

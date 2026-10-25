@@ -63,6 +63,7 @@ class Driver {
 public:
     static Driver& Get();
     static CommitPrep::PreDrain PreDrainCommit(bool submitOpen);
+    void preWaitLabelReadback(std::uint64_t address, std::size_t bytes);
     // APS5_MEM_STATS (see MemoryStats.hpp): registered shaders, the prepare pool and the dispatch/draw caches.
     static void AppendMemoryStats(std::string& line);
     static std::uint64_t GpuMapImportThreads();

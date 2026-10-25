@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/ParallelProfile.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryStatsDevice.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
@@ -2616,6 +2617,35 @@ VulkanDevice::PreDrained VulkanDevice::PreDrainUnlocked(bool submitOpen) {
     return outcome;
 }
 
+VulkanDevice::PreDrained VulkanDevice::PreWaitStorageWriters(std::span<const std::pair<std::uint64_t, std::size_t>> ranges, bool readbackBeforeLabel) {
+    PreDrained outcome;
+    if (!CanWaitUnlocked() || GuestMemory::GpuMutex().HeldByThisThread()) return outcome;
+    auto stored = readbackBeforeLabel ? Graphics::StorageTexture::ReadbackBeforeLabelRanges() : std::vector<std::pair<std::uint64_t, std::size_t>>{};
+    for (const auto& [address, bytes] : ranges) {
+        const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> range{{{address, address + bytes}}};
+        if (bytes != 0 && Graphics::StorageTexture::AnyPendingOverlaps(range)) stored.emplace_back(address, bytes);
+    }
+    if (std::none_of(stored.begin(), stored.end(), [](const auto& range) { return Graphics::Recorder::SnapshotWriteOverlaps(range.first, range.second); })) return outcome;
+    std::uint64_t serial = 0;
+    {
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Wait);
+        std::lock_guard lock(GuestMemory::GpuMutex());
+        if (!state->recorder) return outcome;
+        auto& recorder = *state->recorder;
+        for (const auto& [address, bytes] : stored) serial = std::max(serial, recorder.PendingWriterSerial(address, bytes));
+        if (serial != 0 && serial >= recorder.OpenSerial()) {
+            serial = recorder.SubmitAndEpoch();
+            outcome.submitted = true;
+        }
+    }
+    if (serial == 0 || WaitRecordedFor(serial, 0)) return outcome;
+    const auto start = std::chrono::steady_clock::now();
+    WaitRecorded(serial);
+    outcome.drained = true;
+    outcome.waitedUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+    return outcome;
+}
+
 void VulkanDevice::ReapRecorded(std::uint64_t serial) {
     if (!state->recorder) return;
     // The drain's site in the [recorder] table is this call's caller (Driver::execute's drain,
@@ -2658,9 +2688,12 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
     // A label lands after its own queue's recorded work: into that queue's lane, whichever thread records it.
     const Graphics::Recorder::LaneScope laneScope(Graphics::Recorder::LaneOfQueue(queue));
     static const bool storeAtLabel = Graphics::StorageTexture::StoreAtLabelRequested(std::getenv("APS5_STORE_AT_LABEL"));
-    if (storeAtLabel) Graphics::StorageTexture::FlushAllPending("label");
-    if (queue == 0) static_cast<void>(Graphics::StorageTexture::StoreDrawnLinear("label"));
-    Graphics::StorageTexture::StoreReadbackBeforeLabel("readback before label");
+    {
+        const Graphics::ParallelProfile::LabelWaitScope readbackWait(Graphics::ParallelProfile::LabelWait::Readback);
+        if (storeAtLabel) Graphics::StorageTexture::FlushAllPending("label");
+        if (queue == 0) static_cast<void>(Graphics::StorageTexture::StoreDrawnLinear("label"));
+        Graphics::StorageTexture::StoreReadbackBeforeLabel("readback before label");
+    }
     if (!state->recorder || bytes.empty() || bytes.size() > 65536 || address % 4 != 0 || bytes.size() % 4 != 0) return 4;
     auto& recorder = *state->recorder;
     // Batches that already finished are retired before the checks: their completions ran, so they
@@ -2670,7 +2703,10 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
     // against queue 0; its label goes behind a completion instead (reason 5, still no wait).
     // Debug aid: APS5_LABEL_REAP_ALL_QUEUES=1 reaps on every queue as before.
     static const bool reapAllQueues = std::getenv("APS5_LABEL_REAP_ALL_QUEUES") != nullptr;
-    if (reapFirst && (queue == 0 || reapAllQueues) && OpportunisticReap()) recorder.Reap();
+    if (reapFirst && (queue == 0 || reapAllQueues) && OpportunisticReap()) {
+        const Graphics::ParallelProfile::LabelWaitScope reapWait(Graphics::ParallelProfile::LabelWait::Reap);
+        recorder.Reap();
+    }
     if (recorder.Idle()) return 1;
     static const bool drain = std::getenv("APS5_DRAIN_COMPLETION_LABELS") != nullptr;
     const auto context = graphicsContext();
@@ -2679,7 +2715,10 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
     // A unit shadow's results in the label's unit reach the import before the store lands over
     // part of it (the store's stamp then makes the unit stale); the deferred label paths call no
     // FlushPending of their own.
-    if (Graphics::AnyShadowedOverlaps(address, bytes.size())) Graphics::PublishShadow(address, bytes.size(), Graphics::PublishScope::PartialUnits, Graphics::PublishReason::Label);
+    if (Graphics::AnyShadowedOverlaps(address, bytes.size())) {
+        const Graphics::ParallelProfile::LabelWaitScope shadowWait(Graphics::ParallelProfile::LabelWait::Shadow);
+        Graphics::PublishShadow(address, bytes.size(), Graphics::PublishScope::PartialUnits, Graphics::PublishReason::Label);
+    }
     // The store on the GPU, into the open batch: everything recorded so far completes before it,
     // and it is visible to the host after. The barriers belong to the recorder's store run: one
     // pair for a whole group of labels recorded back to back (Recorder::RecordStore orders the

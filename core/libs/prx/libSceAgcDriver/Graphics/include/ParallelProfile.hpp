@@ -34,6 +34,22 @@ enum class Window : std::uint8_t { Queue, Commit, Count };
 constexpr std::uint32_t StampBit(Stamp stamp) { return 1u << static_cast<std::uint32_t>(stamp); }
 void NoteStamps(Window window, std::uint32_t moved);
 
+enum class LabelWait : std::uint8_t { Deferred, Readback, Reap, Shadow, Drain, Count };
+void NoteLabelWait(LabelWait cause, double lockedWaitUs);
+void NoteLabelPreWait(double waitedUs, bool waited);
+class LabelWaitScope {
+public:
+    explicit LabelWaitScope(LabelWait cause);
+    ~LabelWaitScope();
+    LabelWaitScope(const LabelWaitScope&) = delete;
+    LabelWaitScope& operator=(const LabelWaitScope&) = delete;
+
+private:
+    LabelWait cause;
+    double before = 0;
+    bool active = false;
+};
+
 struct GateInputs {
     double movableShare = 0;
     double survival = 0;

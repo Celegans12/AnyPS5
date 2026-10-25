@@ -5116,18 +5116,20 @@ std::size_t StorageTexture::StoreSmallPending(const char* reason) {
     return stored;
 }
 
-void StorageTexture::StoreReadbackBeforeLabel(const char* reason) {
+std::vector<std::pair<std::uint64_t, std::size_t>> StorageTexture::ReadbackBeforeLabelRanges() {
     static const bool disabled = std::getenv("APS5_NO_LABEL_READBACK_STORE") != nullptr;
-    if (disabled) return;
     std::vector<std::pair<std::uint64_t, std::size_t>> ranges;
-    {
-        auto& pending = Pending();
-        std::lock_guard lock(pending.mutex);
-        for (const auto* texture : pending.textures) {
-            if (texture->descriptor.tileMode == TextureTileMode::kLinear || texture->guestBytes <= SmallStoreBytes) ranges.emplace_back(texture->descriptor.baseAddress, static_cast<std::size_t>(texture->guestBytes));
-        }
+    if (disabled) return ranges;
+    auto& pending = Pending();
+    std::lock_guard lock(pending.mutex);
+    for (const auto* texture : pending.textures) {
+        if (texture->descriptor.tileMode == TextureTileMode::kLinear || texture->guestBytes <= SmallStoreBytes) ranges.emplace_back(texture->descriptor.baseAddress, static_cast<std::size_t>(texture->guestBytes));
     }
-    for (const auto& [address, bytes] : ranges) static_cast<void>(FlushPending(address, bytes, nullptr, reason));
+    return ranges;
+}
+
+void StorageTexture::StoreReadbackBeforeLabel(const char* reason) {
+    for (const auto& [address, bytes] : ReadbackBeforeLabelRanges()) static_cast<void>(FlushPending(address, bytes, nullptr, reason));
 }
 
 std::size_t StorageTexture::StoreDrawnLinear(const char* reason) {

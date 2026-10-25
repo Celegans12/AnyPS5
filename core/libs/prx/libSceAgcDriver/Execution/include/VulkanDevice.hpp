@@ -123,6 +123,7 @@ public:
         double waitedUs = 0;
     };
     PreDrained PreDrainUnlocked(bool submitOpen);
+    PreDrained PreWaitStorageWriters(std::span<const std::pair<std::uint64_t, std::size_t>> ranges, bool readbackBeforeLabel);
     void ReapRecorded(std::uint64_t serial);
     // Completes the batches that already finished (non-blocking); under the mutex.
     void ReapRecorded();

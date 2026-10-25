@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/ParallelProfile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
@@ -34,6 +35,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
         const bool storesNothing = (packet[2] >> 29u) == 0 || (packet[3] | (static_cast<std::uint64_t>(packet[4]) << 32u)) == 0;
         if (label.has_value() || storesNothing) {
             bumpEpoch(&EpochBumps::drains);
+            preWaitLabelReadback(0, 0);
             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
             std::lock_guard gpuLock(GuestMemory::GpuMutex());
             const auto localDevice = device.Load();
@@ -384,11 +386,18 @@ bool Driver::enqueueDmaPacket(std::span<const std::uint32_t> packet, std::uint32
 
 void Driver::commitDmaStore(std::uint32_t queue, std::uint64_t address, std::span<const std::byte> bytes) {
     constexpr std::size_t gpuStoreLimit = 65536;
+    preWaitLabelReadback(address, bytes.size());
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
     const auto localDevice = device.Load();
-    Graphics::StorageTexture::FlushPending(address, bytes.size(), nullptr, "packet store", Graphics::PublishScope::PartialUnits);
-    recordDeferredLabels(localDevice.get(), queue);
+    {
+        const Graphics::ParallelProfile::LabelWaitScope readbackWait(Graphics::ParallelProfile::LabelWait::Readback);
+        Graphics::StorageTexture::FlushPending(address, bytes.size(), nullptr, "packet store", Graphics::PublishScope::PartialUnits);
+    }
+    {
+        const Graphics::ParallelProfile::LabelWaitScope deferredWait(Graphics::ParallelProfile::LabelWait::Deferred);
+        recordDeferredLabels(localDevice.get(), queue);
+    }
     int reason = 4;
     std::uint64_t stamp = 0;
     if (bytes.size() <= gpuStoreLimit && localDevice != nullptr) {
@@ -400,7 +409,10 @@ void Driver::commitDmaStore(std::uint32_t queue, std::uint64_t address, std::spa
         if (reason == 0) ++storesOnGpu;
         else ++storesBehindCompletions;
     } else {
-        if (reason != 1 && localDevice != nullptr) localDevice->WaitIdle();
+        if (reason != 1 && localDevice != nullptr) {
+            const Graphics::ParallelProfile::LabelWaitScope drainWait(Graphics::ParallelProfile::LabelWait::Drain);
+            localDevice->WaitIdle();
+        }
         GuestMemory::Write(address, bytes, 1);
         noteLabelStore(address, bytes, stamp != 0 ? stamp : ++eventSerial, queue);
         ++storesOnCpu;
@@ -460,11 +472,24 @@ bool Driver::enqueueLabelPacket(std::span<const std::uint32_t> packet, std::uint
     return true;
 }
 
+void Driver::preWaitLabelReadback(std::uint64_t address, std::size_t bytes) {
+    if (!CommitPrep::LockSplit()) return;
+    const auto localDevice = device.Load();
+    if (localDevice == nullptr) return;
+    const std::array<std::pair<std::uint64_t, std::size_t>, 1> range{{{address, bytes}}};
+    const auto waited = localDevice->PreWaitStorageWriters(bytes != 0 ? std::span<const std::pair<std::uint64_t, std::size_t>>(range) : std::span<const std::pair<std::uint64_t, std::size_t>>{}, true);
+    Graphics::ParallelProfile::NoteLabelPreWait(waited.waitedUs, waited.drained);
+}
+
 void Driver::commitLabel(std::uint32_t queue, std::uint64_t address, std::span<const std::byte> bytes, bool endOfPipeInterrupt) {
+    preWaitLabelReadback(0, 0);
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
     const auto localDevice = device.Load();
-    recordDeferredLabels(localDevice.get(), queue);
+    {
+        const Graphics::ParallelProfile::LabelWaitScope deferredWait(Graphics::ParallelProfile::LabelWait::Deferred);
+        recordDeferredLabels(localDevice.get(), queue);
+    }
     bool workOpen = Graphics::Recorder::RecordedWorkSinceSubmit() != 0;
     int reason = localDevice != nullptr ? 0 : 1;
     if (!bytes.empty()) {
@@ -472,7 +497,10 @@ void Driver::commitLabel(std::uint32_t queue, std::uint64_t address, std::span<c
         if (localDevice != nullptr && queue == 0 && Graphics::StorageTexture::StoreDrawnLinear("label") != 0) workOpen = true;
         reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(address, bytes, stamp, queue) : 4;
         if (reason != 0 && reason != 5 && reason != 6) {
-            if (reason != 1 && localDevice != nullptr) localDevice->WaitIdle();
+            if (reason != 1 && localDevice != nullptr) {
+                const Graphics::ParallelProfile::LabelWaitScope drainWait(Graphics::ParallelProfile::LabelWait::Drain);
+                localDevice->WaitIdle();
+            }
             GuestMemory::Write(address, bytes, 4);
         }
         noteLabelStore(address, bytes, stamp, queue);
