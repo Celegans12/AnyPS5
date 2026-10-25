@@ -11,6 +11,7 @@ namespace AgcDriver::Graphics {
 
 class Pipeline;
 class ShaderResources;
+struct StorageSurfacePlan;
 
 namespace DrawPlans {
 
@@ -40,7 +41,13 @@ void StorePipeline(std::uint64_t key, std::shared_ptr<const PipelinePlan> plan);
 void ForgetPipeline(std::uint64_t key);
 bool SameVertexInput(const VertexInputLayout& a, const VertexInputLayout& b);
 
-enum class Outcome : std::uint8_t { Hit, NoPlan, Resources, Layout, PipelineGone, StoreMoved, Stored, Unstorable, VerifyMismatch, Count };
+bool PlannedTargets();
+std::uint64_t TargetKey(std::uint64_t planKey, std::size_t index);
+std::shared_ptr<const StorageSurfacePlan> FindTarget(std::uint64_t key);
+void StoreTarget(std::uint64_t key, std::shared_ptr<const StorageSurfacePlan> plan);
+void ForgetTarget(std::uint64_t key);
+
+enum class Outcome : std::uint8_t { Hit, NoPlan, Resources, Layout, PipelineGone, StoreMoved, Stored, Unstorable, VerifyMismatch, TargetHit, TargetNoPlan, TargetFallback, TargetVerifyMismatch, Count };
 void Count(Outcome outcome);
 
 struct Totals {

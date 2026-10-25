@@ -70,6 +70,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_NO_DISPATCH_ADMISSION",
     "APS5_NO_SHAPE_REPLAY",
     "APS5_NO_DRAW_PLANS",
+    "APS5_NO_PLANNED_TARGETS",
 };
 
 struct Refusal {
