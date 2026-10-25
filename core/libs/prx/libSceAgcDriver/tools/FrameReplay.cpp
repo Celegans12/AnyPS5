@@ -60,6 +60,7 @@ struct Options {
     bool pace = true;
     bool strict = false;
     bool exact = false;
+    std::size_t frameLimit = 0;
     std::chrono::milliseconds paceTimeout{10000};
     std::chrono::milliseconds memoryPaceTimeout{10000};
     std::chrono::milliseconds releaseAfter{50};
@@ -387,6 +388,7 @@ struct Replay {
     static constexpr auto BlockedQuiet = std::chrono::milliseconds(5);
 
     bool blockedOnWaits() {
+        if (!AgcDriverQuiescent_nid_postfix()) return false;
         std::lock_guard lock(memoryMutex);
         std::array<AgcDriver::AwaitedWait, 64> awaited{};
         const auto count = AgcDriverAwaitedWaits_nid_postfix(awaited.data(), awaited.size());
@@ -575,7 +577,7 @@ struct Replay {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 const auto completed = progress().second;
                 const auto issued = sequenced.load();
-                if (completed != lastCompleted || issued != lastSequenced) {
+                if (completed != lastCompleted || issued != lastSequenced || !AgcDriverQuiescent_nid_postfix()) {
                     lastCompleted = completed;
                     lastSequenced = issued;
                     lastProgress = Clock::now();
@@ -661,7 +663,7 @@ struct Replay {
 };
 
 int usage() {
-    std::fprintf(stderr, "usage: agc_frame_replay <capture directory> [--no-pace] [--no-release] [--release-after-ms <n>] [--strict] [--exact] [--timeout-s <n>]\n"
+    std::fprintf(stderr, "usage: agc_frame_replay <capture directory> [--no-pace] [--no-release] [--release-after-ms <n>] [--strict] [--exact] [--frame-limit <n>] [--timeout-s <n>]\n"
                          "                        [--dump <address>:<bytes>:<file>]...\n"
                          "  replays the driver calls and guest memory that APS5_FRAME_CAPTURE=<directory> recorded, through this\n"
                          "  build's AGC driver with no title running, and prints one JSON line with the frame times\n"
@@ -673,6 +675,7 @@ int usage() {
                          "  --exact             waits for every earlier submission and its GPU work to complete before each submission, flip and\n"
                          "                      memory delta,\n"
                          "                      so the GPU work runs in one order (a reproducible baseline, slower than the title)\n"
+                         "  --frame-limit <n>   replays the calls through the n-th CPU flip, or the n-th suspend point when the title flips from the GPU\n"
                          "  --timeout-s <n>     exits with code 4 when the replay has no result after n seconds (900; 0 waits forever)\n"
                          "  --dump              writes guest memory to a file after the replay (hexadecimal or decimal)\n"
                          "  --frames <dir>      writes each recorded and replayed display buffer as reference-<n>.bmp and replay-<n>.bmp\n"
@@ -781,7 +784,17 @@ int run(const Options& options) {
                  std::chrono::duration<double>(Clock::now() - prologueStart).count(), rewritten.size(), static_cast<unsigned long long>(replay.staleRegistrations.load()));
     replay.recording = true;
     replay.startedAt = Clock::now();
-    if (frameStart != calls.end()) replay.runWindow(std::span(calls).subspan(static_cast<std::size_t>(frameStart - calls.begin()) + 1));
+    if (frameStart != calls.end()) {
+        auto window = std::span(calls).subspan(static_cast<std::size_t>(frameStart - calls.begin()) + 1);
+        if (options.frameLimit != 0) {
+            const bool cpuFlips = std::any_of(window.begin(), window.end(), [](const FrameCall& call) { return call.kind == FrameCallKind::Flip; });
+            const auto boundary = cpuFlips ? FrameCallKind::Flip : FrameCallKind::Suspend;
+            std::size_t boundaries = 0;
+            const auto cut = std::find_if(window.begin(), window.end(), [&](const FrameCall& call) { return call.kind == boundary && ++boundaries == options.frameLimit; });
+            if (cut != window.end()) window = window.first(static_cast<std::size_t>(cut - window.begin()) + 1);
+        }
+        replay.runWindow(window);
+    }
     if (frameStart == calls.end()) AgcDriverWaitIdle_nid_postfix();
     replay.endedAt = Clock::now();
     if (const auto failure = replay.frames.Failure()) std::rethrow_exception(failure);
@@ -823,6 +836,7 @@ int main(int argc, char** argv) {
         else if (argument == "--release-after-ms" && index + 1 < argc) options.releaseAfter = std::chrono::milliseconds(std::strtoll(argv[++index], nullptr, 10));
         else if (argument == "--strict") options.strict = true;
         else if (argument == "--exact") options.exact = true;
+        else if (argument == "--frame-limit" && index + 1 < argc) options.frameLimit = static_cast<std::size_t>(std::strtoull(argv[++index], nullptr, 10));
         else if (argument == "--timeout-s" && index + 1 < argc) options.timeout = std::chrono::seconds(std::strtoll(argv[++index], nullptr, 10));
         else if (argument == "--dump" && index + 1 < argc) options.dumps.push_back(parseDump(argv[++index]));
         else if (argument == "--frames" && index + 1 < argc) options.frames = argv[++index];
