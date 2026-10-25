@@ -18,7 +18,7 @@
 | **Furthest point** | Open world, the Nupur river by the Ainu village, with HUD and quest |
 | **Time to the world** | about 5 minutes from a save near Teshio Ridge (warm shader cache) |
 | **Frame rate in the world** | about **0.5-0.8 fps** (5-8 presents per 10 s depending on the spot and the session; 7.6 at the river village on 10-25; this laptop's GPU clocks drift by ~14 % between sessions, so builds are compared back to back in one session) |
-| **Stability** | with the second Vulkan queue on its own compute-only queue family, world runs are clean (up to 45 minutes); one crash on 10-25 from a second-queue label bug, fix pending (see known issues) |
+| **Stability** | with the second Vulkan queue on its own compute-only queue family, world runs are clean (up to 22 minutes); one crash on 10-25 from a second-queue label bug, fix pending (see known issues) |
 | **Tested on** | Windows 11, RTX 3080 Laptop GPU 16 GB (driver 610.62), 32 GB RAM, MinGW-w64 GCC 15.2.0, Release |
 | **Build** | `9d0ee8e1af` (our tree merged with `main` 2026-10-24 `a39be6252d`, plus owned texture proofs, mrfelek's #9957 and #10228, fixes from #675, #6188 (off by default), #9558, #8887, #7514, address-table templates, the read-only lease skip and hritikutekar's committer batches) + docs, shader-cache SourceVersion `6c403b0d2815d602`, title reference T1 exact |
 
@@ -99,7 +99,7 @@ APS5_NO_DRAW_AHEAD=1 APS5_DEFER_REFRESH_FLUSH=1 APS5_PIPELINE_DISPATCH=1
   - `APS5_NO_DISPATCH_OVERLAP=1`, `APS5_NO_BATCHED_STAGING=1`, `APS5_NO_SPARSE_PAGE_STATES=1`.
   - Every local change has an off switch (`APS5_NO_...`), named in its commit message.
 - Diagnostics: `APS5_GPU_CHECKPOINTS=1` (`=batch` marks only batch begin/end per queue), `APS5_NV_DIAGNOSTICS=1` (NVIDIA device diagnostics config, so an Nsight Aftermath crash dump can name the fault), `APS5_FAULT_ADDRESSES=1` (with `APS5_MEM_STATS=1`; also reports a buffer destroyed while a pending batch writes it), `APS5_LANE_SERIALIZE=1`, `APS5_NO_LANE_OVERLAP=1`.
-- `APS5_AB=<seconds>:<switch>[+<switch>...]` (with `APS5_AB_START=<present>`) alternates two configurations of driver switches in one run, so a comparison needs one run and no run-to-run noise. `+` flips several switches together.
+- `APS5_AB=<seconds>:<switch>[,...]` (with `APS5_AB_START=<present>`) alternates two configurations of driver switches in one run, so a comparison needs one run and no run-to-run noise.
 - Leave `APS5_PIPELINE_REQUESTS` unset when you measure: it costs about 12 % of a frame here.
 
 ## Known issues
