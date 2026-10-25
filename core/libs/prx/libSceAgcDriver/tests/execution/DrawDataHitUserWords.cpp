@@ -25,6 +25,13 @@
 
 namespace {
 
+std::uint64_t RelocatedStageHits() {
+    const auto counters = AgcDriver::DriverDetail::Driver::Get().RelocatedHitCounters();
+    std::uint64_t hits = 0;
+    for (const auto value : counters.hits) hits += value;
+    return hits;
+}
+
 using AgcDriver::Graphics::Require;
 
 alignas(256) constexpr std::array<std::uint32_t, 8> VertexCode{0x7e000208u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u, 0xf80008cfu, 0x03020100u, 0xbf810000u, 0xbf810000u};
@@ -186,13 +193,15 @@ void UnreadUserWordsKeepTheStage(bool verify) {
         PixelUserData(commands, second, unread);
         Append(commands, 0x2d, {3, 2});
         const auto last = counters;
+        const auto relocatedBefore = RelocatedStageHits();
         counters = Submit(std::move(commands));
         Require(counters.dataHits == last.dataHits + 1 && counters.inserts == last.inserts, "a draw at the moved pointer with a new unread word: " + Counts(counters));
         if (verify) continue;
         const auto compiled = counters.dataStagesCompiled - last.dataStagesCompiled;
-        const bool expectReuse = refresh && unread == 0x44u;
-        Require(compiled == (expectReuse ? 0u : 1u), std::string(expectReuse ? "after a refresh, the draw at the moved pointer compiled its pixel stage again: " : "the draw at the moved pointer did not compile its pixel stage: ") + Counts(counters));
-        Require(counters.shapeUpdates - last.shapeUpdates == (refresh && unread == 0x33u ? 1u : 0u), "shape refreshes: " + std::to_string(counters.shapeUpdates - last.shapeUpdates) + " (" + Counts(counters) + ")");
+        const bool relocated = RelocatedStageHits() != relocatedBefore;
+        const bool expectReuse = (refresh && unread == 0x44u) || relocated;
+        Require(compiled == (expectReuse ? 0u : 1u), std::string(expectReuse ? "after a refresh or a relocated stage hit, the draw at the moved pointer compiled its pixel stage again: " : "the draw at the moved pointer did not compile its pixel stage: ") + Counts(counters));
+        Require(counters.shapeUpdates - last.shapeUpdates == (refresh && unread == 0x33u && !relocated ? 1u : 0u), "shape refreshes: " + std::to_string(counters.shapeUpdates - last.shapeUpdates) + " (" + Counts(counters) + ")");
     }
 }
 
