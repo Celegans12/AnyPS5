@@ -121,6 +121,20 @@ void LastRecordIndices(std::span<const void* const> logged, std::span<const void
 // to date with guest memory before it is returned.
 std::shared_ptr<StorageTexture> CachedStorageSurface(const Context& context, const GuestTextureResource& resource);
 std::shared_ptr<StorageTexture> CachedStorageLayers(const Context& context, const GuestTextureResource& resource, std::uint32_t firstLayer, std::uint32_t layerCount);
+// The register-only part of CachedStorageSurface's lookup (the viewed window, its guest bytes, the
+// storage key), computed once per draw plan; CachedStorageSurfacePlanned runs the rest exactly as
+// CachedStorageSurface does, or answers nothing (the caller then calls CachedStorageSurface) when the
+// precomputed part may not hold.
+struct StorageSurfacePlan {
+    VkDevice device = VK_NULL_HANDLE;
+    GuestTextureResource requested{};
+    GuestTextureResource viewed{};
+    std::uint64_t viewedBytes = 0;
+    std::array<std::uint32_t, 8> key{};
+};
+std::optional<StorageSurfacePlan> PlanStorageSurface(const Context& context, const GuestTextureResource& requested);
+std::optional<std::shared_ptr<StorageTexture>> CachedStorageSurfacePlanned(const Context& context, const StorageSurfacePlan& plan);
+bool SameStorageSurfacePlan(const StorageSurfacePlan& a, const StorageSurfacePlan& b);
 // Whether `image` is still the storage cache's image of its surface (what CachedStorageSurface
 // would return); a true answer counts as a use for the cache's eviction order, as a lookup would.
 bool StorageImageCached(const Context& context, const StorageTexture* image);

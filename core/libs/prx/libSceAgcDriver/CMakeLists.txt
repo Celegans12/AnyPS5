@@ -3327,10 +3327,12 @@ if(BUILD_TESTING)
     set_tests_properties(agc_driver_shape_replay_draws_plans_off PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_DRAW_PLANS=1" SKIP_RETURN_CODE 77)
     add_test(NAME agc_driver_shape_replay_draws_plans_verify COMMAND agc_driver_shape_replay_draws_tests)
     set_tests_properties(agc_driver_shape_replay_draws_plans_verify PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_VERIFY_DRAW_PLANS=100" SKIP_RETURN_CODE 77 FAIL_REGULAR_EXPRESSION "draw-plans. verify:")
+    add_test(NAME agc_driver_shape_replay_draws_targets_off COMMAND agc_driver_shape_replay_draws_tests)
+    set_tests_properties(agc_driver_shape_replay_draws_targets_off PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_PLANNED_TARGETS=1" SKIP_RETURN_CODE 77)
     add_test(NAME agc_driver_shape_replay_command_log COMMAND ${CMAKE_COMMAND} -DFIXTURE=$<TARGET_FILE:agc_driver_shape_replay_draws_tests> -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/ShapeReplayCommandLog.cmake)
     set_tests_properties(agc_driver_shape_replay_command_log PROPERTIES TIMEOUT 300 SKIP_REGULAR_EXPRESSION "shape replay command log: skipped")
     if(WIN32)
-        set_tests_properties(agc_driver_shape_replay_draws_off agc_driver_shape_replay_draws_verify agc_driver_shape_replay_draws_plans_off agc_driver_shape_replay_draws_plans_verify agc_driver_shape_replay_command_log PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_driver_shape_replay_draws_off agc_driver_shape_replay_draws_verify agc_driver_shape_replay_draws_plans_off agc_driver_shape_replay_draws_plans_verify agc_driver_shape_replay_draws_targets_off agc_driver_shape_replay_command_log PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test(NAME agc_driver_draw_cache_reuse_inline COMMAND agc_driver_draw_cache_reuse_tests)

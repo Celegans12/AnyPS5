@@ -2902,6 +2902,36 @@ struct DrawPreparation {
     std::shared_ptr<BlendedTargetSet> blendedSet;
 };
 
+std::shared_ptr<StorageTexture> plannedStorageSurface(const Context& context, std::uint64_t planKey, std::size_t index, const ColorTarget& color) {
+    if (planKey == 0 || !DrawPlans::PlannedTargets()) return CachedStorageSurface(context, SurfaceForTarget(color));
+    using DrawPlans::Outcome;
+    const auto key = DrawPlans::TargetKey(planKey, index);
+    if (const auto plan = DrawPlans::FindTarget(key); plan != nullptr) {
+        if (DrawPlans::TakeVerify()) {
+            DrawPlans::NoteVerified();
+            const auto fresh = PlanStorageSurface(context, SurfaceForTarget(color));
+            if (!fresh || !SameStorageSurfacePlan(*fresh, *plan)) {
+                DrawPlans::Count(Outcome::TargetVerifyMismatch);
+                DrawPlans::ForgetTarget(key);
+                static std::atomic<std::uint32_t> printed{0};
+                if (printed.fetch_add(1, std::memory_order_relaxed) < 20u) std::fprintf(stderr, "[draw-plans] verify: target %zu of plan 0x%llx (color 0x%llx) decodes unlike its plan; the plan is dropped\n", index, static_cast<unsigned long long>(planKey), static_cast<unsigned long long>(color.address));
+                return CachedStorageSurface(context, SurfaceForTarget(color));
+            }
+        }
+        if (auto planned = CachedStorageSurfacePlanned(context, *plan)) {
+            DrawPlans::Count(Outcome::TargetHit);
+            return std::move(*planned);
+        }
+        DrawPlans::Count(Outcome::TargetFallback);
+        return CachedStorageSurface(context, SurfaceForTarget(color));
+    }
+    DrawPlans::Count(Outcome::TargetNoPlan);
+    const auto requested = SurfaceForTarget(color);
+    auto resident = CachedStorageSurface(context, requested);
+    if (auto plan = PlanStorageSurface(context, requested)) DrawPlans::StoreTarget(key, std::make_shared<const StorageSurfacePlan>(std::move(*plan)));
+    return resident;
+}
+
 std::shared_ptr<Pipeline> plannedPipeline(const Context& context, std::uint64_t planKey, const State& pipelineState, const DrawInputs& inputs, const std::shared_ptr<ShaderResources>& resources, std::span<const CompiledShader> shaders, bool lean) {
     const auto layout = lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     if (planKey == 0) return CachedPipeline(context, pipelineState, inputs.VertexLayout(), *resources, shaders, layout);
@@ -3053,7 +3083,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
                     Require(resident->Attachable(), "storage format cannot be a color attachment");
                     return resident;
                 }
-                auto resident = CachedStorageSurface(context, SurfaceForTarget(color));
+                auto resident = plannedStorageSurface(context, DrawPlans::Active() ? takenPlanKey : 0u, index, color);
                 Require(resident->Attachable(), "storage format cannot be a color attachment");
                 Require(color.mipCount > 1 || color.depth > 1 || resident->GuestBytes() == colorLayout.Bytes(), "resident image layout differs from the color layout");
                 return resident;

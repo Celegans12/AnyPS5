@@ -2074,7 +2074,7 @@ static WrittenStorage WrittenStorageBytes(const GuestTextureResource& viewed, st
 }
 
 // `guestBytes` is the surface size when the caller described the surface already (0: described here).
-std::shared_ptr<StorageTexture> lookupStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& viewed, std::uint32_t mip, std::uint64_t guestBytes, std::optional<std::pair<std::uint32_t, std::uint32_t>> layers);
+std::shared_ptr<StorageTexture> lookupStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& viewed, std::uint32_t mip, std::uint64_t guestBytes, std::optional<std::pair<std::uint32_t, std::uint32_t>> layers, const std::array<std::uint32_t, 8>* plannedKey = nullptr);
 
 std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& requested, std::uint32_t mip, std::uint64_t guestBytes, bool written, std::optional<std::pair<std::uint32_t, std::uint32_t>> layers) {
     const auto viewed = ArrayLayerWindow(requested, context.limits.maxImageArrayLayers);
@@ -2103,7 +2103,7 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
     return texture;
 }
 
-std::shared_ptr<StorageTexture> lookupStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& viewed, std::uint32_t mip, std::uint64_t guestBytes, std::optional<std::pair<std::uint32_t, std::uint32_t>> layers) {
+std::shared_ptr<StorageTexture> lookupStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& viewed, std::uint32_t mip, std::uint64_t guestBytes, std::optional<std::pair<std::uint32_t, std::uint32_t>> layers, const std::array<std::uint32_t, 8>* plannedKey) {
     static const bool disabled = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
     if (disabled) return StorageTexture::Create(context, *context.detiler, viewed, mip);
     static_cast<void>(words);
@@ -2111,8 +2111,8 @@ std::shared_ptr<StorageTexture> lookupStorageTexture(const Context& context, std
     const bool profile = LookupOutcomes::Profiled();
     auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     auto& counters = TextureCounts();
-    const auto resource = StorageSurface(context, viewed);
-    const StorageKey key{context.device, SurfaceKey(context, resource)};
+    const auto resource = plannedKey != nullptr ? viewed : StorageSurface(context, viewed);
+    const StorageKey key{context.device, plannedKey != nullptr ? *plannedKey : SurfaceKey(context, resource)};
     auto& cache = StorageTextures();
     std::vector<std::shared_ptr<StorageTexture>> evicted;
     std::shared_ptr<StorageTexture> texture;
@@ -2612,6 +2612,36 @@ bool StorageImagesCached(const Context& context, std::span<const StorageTexture*
 
 std::shared_ptr<StorageTexture> CachedStorageSurface(const Context& context, const GuestTextureResource& resource) {
     return cachedStorageTexture(context, {}, resource, 0);
+}
+
+std::optional<StorageSurfacePlan> PlanStorageSurface(const Context& context, const GuestTextureResource& requested) {
+    StorageSurfacePlan plan;
+    plan.device = context.device;
+    plan.requested = requested;
+    plan.viewed = ArrayLayerWindow(requested, context.limits.maxImageArrayLayers);
+    if (plan.viewed.dimension == TextureDimension::k2DMsaa || plan.viewed.mipCount > AllocatedLevels(plan.viewed)) return std::nullopt;
+    plan.viewedBytes = DescribeSurface(plan.viewed).guestBytes;
+    if (plan.viewedBytes >= (1ull << 30u)) return std::nullopt;
+    plan.key = SurfaceKey(context, plan.viewed);
+    return plan;
+}
+
+std::optional<std::shared_ptr<StorageTexture>> CachedStorageSurfacePlanned(const Context& context, const StorageSurfacePlan& plan) {
+    if (plan.device != context.device || ExtendedChains().any.load(std::memory_order_acquire)) return std::nullopt;
+    const auto& viewed = plan.viewed;
+    RequireNoMultisampleTarget(viewed.baseAddress, 1u, "a storage image access");
+    if (auto depth = DepthSurfaceStorage(context, {}, viewed, 0)) return depth;
+    if (DepthPlanesStale()) static_cast<void>(FlushDepthPlanes(viewed.baseAddress, static_cast<std::size_t>(plan.viewedBytes), DepthPlaneScope::Overlapped));
+    auto texture = lookupStorageTexture(context, {}, viewed, 0, 0, std::nullopt, &plan.key);
+    if (DepthSurfaceAt(viewed.baseAddress) && DepthSurfaceServesStorage(context, *texture)) SeedStorageFromDepth(context, texture);
+    return texture;
+}
+
+bool SameStorageSurfacePlan(const StorageSurfacePlan& a, const StorageSurfacePlan& b) {
+    const auto same = [](const GuestTextureResource& x, const GuestTextureResource& y) {
+        return x.baseAddress == y.baseAddress && x.width == y.width && x.height == y.height && x.depthOrLastArray == y.depthOrLastArray && x.baseArray == y.baseArray && x.mipCount == y.mipCount && x.baseLevel == y.baseLevel && x.tileMode == y.tileMode && x.dimension == y.dimension && x.format == y.format && x.dstSelX == y.dstSelX && x.dstSelY == y.dstSelY && x.dstSelZ == y.dstSelZ && x.dstSelW == y.dstSelW && x.pipeBankXor == y.pipeBankXor && x.bcSwizzle == y.bcSwizzle && x.lastLevel == y.lastLevel && x.dccAddress == y.dccAddress && x.dccAlphaOnMsb == y.dccAlphaOnMsb && x.dccPipeAligned == y.dccPipeAligned && x.iterate256 == y.iterate256 && x.minLod == y.minLod && x.allocatedMipCount == y.allocatedMipCount && x.samples == y.samples && x.fmaskCmaskAddress == y.fmaskCmaskAddress;
+    };
+    return a.device == b.device && same(a.requested, b.requested) && same(a.viewed, b.viewed) && a.viewedBytes == b.viewedBytes && a.key == b.key;
 }
 
 std::shared_ptr<StorageTexture> CachedStorageLayers(const Context& context, const GuestTextureResource& resource, std::uint32_t firstLayer, std::uint32_t layerCount) {
