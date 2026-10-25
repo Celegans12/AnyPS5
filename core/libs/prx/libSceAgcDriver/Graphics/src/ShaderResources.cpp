@@ -5102,7 +5102,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     // recorded; a failure to record leaves the object unusable for this dispatch, not the batch.
     if (auto* recorder = Recorder::Active(); recorder != nullptr) {
         try {
-            guestMemory.RecordStagingCopies(*recorder);
+            if (!guestMemory.RecordStagingCopies(*recorder)) return finish(fast, false);
         } catch (const std::exception& error) {
             std::fprintf(stderr, "[resources] staging copies of a reused build failed: %s\n", error.what());
             return finish(fast, false);
@@ -7351,7 +7351,7 @@ void ShaderResources::MarkGpuWritesInRun(Recorder& recorder, const std::shared_p
     }
     // A storage store-back above may have recorded a command, which closed the run: then as MarkGpuWrites.
     if (!recorder.RunOpen()) guestMemory.RecordCopyBacks(recorder);
-    recorder.NotePendingWrites(guestMemory.Writes());
+    guestMemory.NoteOwnWrites(recorder);
     guestMemory.MarkDirectWrites();
     if (!recorder.RunOpen()) return;
     recorder.AfterRun([self](Recorder& after) {
@@ -7383,7 +7383,7 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     guestMemory.RecordCopyBacks(recorder);
     // Only the written elements' ranges (AddWritable): a read-only element is neither noted here
     // nor marked as a direct write, so CPU reads of its memory never wait for this work.
-    recorder.NotePendingWrites(guestMemory.Writes());
+    guestMemory.NoteOwnWrites(recorder);
     guestMemory.MarkDirectWrites();
     if (!BuildProfiled()) return;
     auto& counters = BufferWrites();

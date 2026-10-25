@@ -387,6 +387,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderResources.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderAddressResources.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/GuestBufferMemory.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ResidentShadows.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ResidentMirror.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/BdaResources.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/BufferAddress.cpp
@@ -1608,6 +1609,7 @@ add_custom_command(
 add_test_executable(agc_driver_recorder_tests EXCLUDE_FROM_ALL
         tests/Recorder.cpp
         tests/HostImportLifetime.cpp
+        tests/ResidentCopyIn.cpp
         tests/ResidentPresent.cpp
         ${agcTriangleHeaders}
         ${agcSampleLodShaderHeader}
@@ -1816,6 +1818,19 @@ if(BUILD_TESTING)
     set_tests_properties(agc_copied_direct_ordering PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
     if(WIN32)
         set_tests_properties(agc_copied_direct_ordering PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    add_test(NAME agc_resident_copy_in COMMAND agc_driver_recorder_tests --resident-copy-in-only)
+    add_test(NAME agc_resident_copy_in_diff COMMAND agc_driver_recorder_tests --resident-copy-in-only)
+    add_test(NAME agc_resident_copy_in_verify COMMAND agc_driver_recorder_tests --resident-copy-in-only)
+    add_test(NAME agc_resident_copy_in_budget COMMAND agc_driver_recorder_tests --resident-copy-in-budget-only)
+    set_tests_properties(agc_resident_copy_in agc_resident_copy_in_diff agc_resident_copy_in_verify agc_resident_copy_in_budget PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+    set_tests_properties(agc_resident_copy_in PROPERTIES ENVIRONMENT "APS5_PROFILE_DRAW=1")
+    set_tests_properties(agc_resident_copy_in_diff PROPERTIES ENVIRONMENT "APS5_PROFILE_DRAW=1;APS5_STAGING_DIFF=1")
+    set_tests_properties(agc_resident_copy_in_verify PROPERTIES ENVIRONMENT "APS5_VERIFY_RESIDENT=1000")
+    set_tests_properties(agc_resident_copy_in_budget PROPERTIES ENVIRONMENT "APS5_PROFILE_DRAW=1;APS5_RESIDENT_MIB=1")
+    if(WIN32)
+        set_tests_properties(agc_resident_copy_in agc_resident_copy_in_diff agc_resident_copy_in_verify agc_resident_copy_in_budget PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test(NAME agc_staging_copy_back COMMAND agc_driver_recorder_tests --staging-diff-only)

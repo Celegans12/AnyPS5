@@ -103,6 +103,29 @@ bool CommittedBlocksMatchSince(std::uint64_t address, std::size_t bytes, std::sp
 bool ArmOwnedBlocks(std::uint64_t address, std::size_t bytes, std::span<std::uint64_t> words, bool allowPrivate = true);
 bool OwnedWordsHold(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> words);
 bool OwnedProofHolds(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> words, std::uint64_t since);
+// Resident staging shadows (APS5_NO_RESIDENT_COPY_IN, GuestBufferMemory.cpp): a device-local copy
+// of a guest range that a later use may take without copying it in again, while nothing but the
+// shadow's own uses stored into the range.
+// ResidentUseGeneration: the tracker generation a use that copies the whole range in starts at; 0
+// when the range is not wholly watched. A title store made before it and collected later gets a
+// newer stamp: the next use then copies its block in again, needlessly but exactly.
+// ResidentStoredSince: the copy-in decision of a use. An uncached walk of the range's pages first,
+// under the tracker lock (every title store made before the call becomes a stamp), then the 64 KiB
+// block parts of [address, address + bytes) anything stored over since `since` (a title store, the
+// driver's own or possible stores, MarkWritten from any path), as merged [begin, end) ranges, and the
+// generation after the walk. False (and the whole range as stored): the range is not wholly
+// watched, or the walk failed.
+// ResidentMarkOwnWrites: the use's end. Under one tracker hold: whether anything was stamped over
+// the range since `since` (`foreign`, also true without a proof), then the use's own GPU writes
+// `writes` marked as MarkPossiblyWritten marks them. Returns the newest mark's generation (0: a
+// write could not be stamped), the generation the shadow equals the range at when `foreign` is
+// false. No walk: a title store made during the use and not collected yet is stamped by a later
+// collect, newer than that generation, so the next use's decision copies its block in. Only the
+// mark's own fresh collect could stamp one older; a mark that stamps any is `foreign`.
+std::uint64_t ResidentUseGeneration(std::uint64_t address, std::size_t bytes);
+bool ResidentStoredSince(std::uint64_t address, std::size_t bytes, std::uint64_t since, std::vector<std::pair<std::uint64_t, std::uint64_t>>& stored, std::uint64_t* generation = nullptr);
+std::uint64_t ResidentMarkOwnWrites(std::uint64_t address, std::size_t bytes, std::uint64_t since, std::span<const std::pair<std::uint64_t, std::uint64_t>> writes, bool* foreign);
+
 // Arms (all blocks armed), blocks newly armed (of them with private pages, with nothing mapped, partly
 // mapped: placeholders are proved by the word alone, see WindowsMappings::ownable), arms refused
 // (by reason: outside the arena or a host region, shared or aliased view, pinned or importing, host

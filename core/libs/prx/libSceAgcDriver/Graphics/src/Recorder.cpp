@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ResidentShadows.hpp"
 #include "prx/libkernel/Time/include/SleepWake.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
@@ -3879,6 +3880,9 @@ bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel
     if (bytes == 0) return false;
     ensureOpen();
     const auto end = address + bytes;
+    // A resident staging shadow over the range no longer equals its import (unless the note is its
+    // open use's own, ResidentShadows::OwnNotes).
+    ResidentShadows::NoteWrite(address, end);
     open->writes.emplace_back(address, end);
     open->writeNotes.push_back(++writeNoteCount);
     noteWriteOrigin(writeNoteCount, address, end);
@@ -3909,6 +3913,7 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
     // An in-flight batch: its range joins the snapshot at once (the completion that stores it runs
     // when the batch finishes, and the hook must sync for a CPU read until then). The generation
     // moves as well, so a poller re-consults the label table for a completion label.
+    ResidentShadows::NoteWrite(address, address + bytes);
     batch.writes.emplace_back(address, address + bytes);
     batch.writeNotes.push_back(++writeNoteCount);
     noteWriteOrigin(writeNoteCount, address, address + bytes);

@@ -2009,11 +2009,10 @@ std::uint64_t StoreOwnBytes(std::uint64_t address, std::span<const std::byte> so
     });
 }
 
-static std::uint64_t markWritten(std::uint64_t address, std::size_t bytes, bool complete) {
-    BreakProofs();
-    auto& tracker = Tracker();
-    auto lock = lockTracker(tracker);
-    tracker.initialize();
+// markWritten under the caller's hold of the tracker lock (which it may suspend around an unwatch).
+// `freshStamped`, when given, counts the CPU-written runs the fresh collect over the range's blocks
+// stamped first (title stores not yet collected when the mark was made).
+static std::uint64_t markWrittenLocked(WriteTracker& tracker, TrackerLock& lock, std::uint64_t address, std::size_t bytes, bool complete, std::size_t* freshStamped = nullptr) {
     if (bytes == 0) return 0;
     ++tracker.generation;
     if (!tracker.watched || !tracker.covers(address, bytes)) {
@@ -2039,6 +2038,7 @@ static std::uint64_t markWritten(std::uint64_t address, std::size_t bytes, bool 
             return 0;
         }
         if (runs.stamped != 0) ++tracker.generation;
+        if (freshStamped != nullptr) *freshStamped += runs.stamped;
     }
     const auto first = tracker.blockOf(address);
     const auto last = tracker.blockOf(address + bytes - 1);
@@ -2047,6 +2047,14 @@ static std::uint64_t markWritten(std::uint64_t address, std::size_t bytes, bool 
         tracker.noteDriverStore(block, address, address + bytes, tracker.generation, complete);
     }
     return tracker.generation;
+}
+
+static std::uint64_t markWritten(std::uint64_t address, std::size_t bytes, bool complete) {
+    BreakProofs();
+    auto& tracker = Tracker();
+    auto lock = lockTracker(tracker);
+    tracker.initialize();
+    return markWrittenLocked(tracker, lock, address, bytes, complete);
 }
 
 std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes) {
@@ -2326,6 +2334,89 @@ bool ChangedBlocks(std::uint64_t address, std::size_t bytes, std::span<const std
         if (k < cpu.size()) cpu[k] = generation == 0 || tracker.cpuStampOf(block) > generation ? 1 : 0;
     }
     return true;
+}
+
+namespace {
+
+// The resident-shadow tests (see the header) over the range's blocks, under the caller's hold of the
+// tracker lock: with `walk`, an uncached walk of the range's pages first (every title store made so
+// far becomes a CPU stamp), then, per 64 KiB block, whether anything stored over its part of the
+// range since `since` (CPU pages, the driver's stores and possible stores, unstamped stores), at page
+// and piece granularity where the tracker keeps it. False when the range is not wholly watched or
+// the walk failed: the caller then has no proof for any of it.
+bool residentStoredLocked(WriteTracker& tracker, std::uint64_t address, std::size_t bytes, std::uint64_t since, std::vector<std::pair<std::uint64_t, std::uint64_t>>* stored, bool* any, bool walk) {
+    if (!tracker.watched || since == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || !tracker.covers(address, bytes)) return false;
+#ifdef _WIN32
+    if (GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(static_cast<std::uintptr_t>(address), bytes)) return false;
+#endif
+    constexpr std::uint64_t page = 4096;
+    const auto first = address & ~(page - 1);
+    const auto stop = (address + bytes + page - 1) & ~(page - 1);
+    if (walk && !walkWrites(tracker, first, stop, StampKind::Cpu)) return false;
+    const auto end = address + bytes;
+    for (auto block = tracker.blockOf(address); block <= tracker.blockOf(end - 1); ++block) {
+        const auto begin = std::max<std::uint64_t>(address, tracker.blockBegin(block));
+        const auto clipEnd = std::min<std::uint64_t>(end, tracker.blockBegin(block) + WriteBlockBytes);
+        bool changed = !tracker.rangeUnchanged(begin, static_cast<std::size_t>(clipEnd - begin), since);
+        if (!changed && !tracker.unstampedStores.empty()) {
+            for (auto slot = begin / WriteBlockBytes; slot <= (clipEnd - 1) / WriteBlockBytes && !changed; ++slot) changed = tracker.unstampedStores[slot % WriteTracker::UnstampedSlots] > since;
+        }
+        if (!changed) continue;
+        if (any != nullptr) *any = true;
+        if (stored == nullptr) continue;
+        if (!stored->empty() && stored->back().second == begin) stored->back().second = clipEnd;
+        else stored->emplace_back(begin, clipEnd);
+    }
+    return true;
+}
+
+}
+
+bool ResidentStoredSince(std::uint64_t address, std::size_t bytes, std::uint64_t since, std::vector<std::pair<std::uint64_t, std::uint64_t>>& stored, std::uint64_t* generation) {
+    stored.clear();
+    if (generation != nullptr) *generation = 0;
+    auto& tracker = Tracker();
+    const auto lock = lockTracker(tracker);
+    tracker.initialize();
+    bool any = false;
+    if (!residentStoredLocked(tracker, address, bytes, since, &stored, &any, true)) {
+        stored.assign(1, {address, address + bytes});
+        return false;
+    }
+    if (generation != nullptr) *generation = tracker.generation;
+    return true;
+}
+
+std::uint64_t ResidentUseGeneration(std::uint64_t address, std::size_t bytes) {
+    auto& tracker = Tracker();
+    const auto lock = lockTracker(tracker);
+    tracker.initialize();
+    if (!tracker.watched || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || !tracker.covers(address, bytes)) return 0;
+    return tracker.generation;
+}
+
+std::uint64_t ResidentMarkOwnWrites(std::uint64_t address, std::size_t bytes, std::uint64_t since, std::span<const std::pair<std::uint64_t, std::uint64_t>> writes, bool* foreign) {
+    BreakProofs();
+    bool stored = true;
+    auto& tracker = Tracker();
+    auto lock = lockTracker(tracker);
+    tracker.initialize();
+    bool any = false;
+    if (residentStoredLocked(tracker, address, bytes, since, nullptr, &any, false)) stored = any;
+    std::uint64_t generation = 0;
+    bool marked = true;
+    for (const auto& [begin, end] : writes) {
+        if (end <= begin) continue;
+        std::size_t fresh = 0;
+        const auto stamped = markWrittenLocked(tracker, lock, begin, static_cast<std::size_t>(end - begin), false, &fresh);
+        if (stamped == 0) marked = false;
+        // A fresh collect inside the mark stamped title stores the walk above did not see (pages
+        // mapped since): they precede the mark's generation, so no later test would find them.
+        if (fresh != 0 && begin < address + bytes && address < end) stored = true;
+        generation = std::max(generation, stamped);
+    }
+    if (foreign != nullptr) *foreign = stored || !marked;
+    return marked ? generation : 0;
 }
 
 bool ArmOwnedBlocks(std::uint64_t address, std::size_t bytes, std::span<std::uint64_t> words, bool allowPrivate) {
