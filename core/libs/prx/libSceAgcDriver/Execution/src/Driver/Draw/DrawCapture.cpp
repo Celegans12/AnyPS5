@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShapeReplayProfile.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/ShapeReplay.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "ShaderDiskCache.hpp"
 #include <algorithm>
@@ -189,15 +190,18 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     phaseTiming.Phase(DrawRowCapture);
 
     timing.Mark("capture_resources");
+    const auto replayShape = ShapeReplay::DrawShape();
+    const bool replay = replayShape != 0 && ShapeReplay::Active();
+    const auto* vertexInfo = vertexInfos[i] ? &*vertexInfos[i] : nullptr;
+    stageCapture.shapeReplay = replay || Graphics::ShapeReplay::Enabled() ? Graphics::ShapeReplay::DescribeCapture(capture.get(), program.userData, vertexInfo) : nullptr;
     try {
-        stageCapture.compiled = invocation.Materialize(*capture);
+        stageCapture.compiled = replay ? ShapeReplay::Materialize(replayShape, i, pushOffset, program.binary.codeAddress, *capture, stageCapture.shapeReplay.get(), vertexInfo, [&] { return invocation.Materialize(*capture); }) : invocation.Materialize(*capture);
     } catch (const std::exception& error) {
         throw named(error, request.context.memory);
     }
     stageCapture.capture = capture;
     timing.Mark("materialize");
     stageCapture.userDataMask = StageUserDataMask(*capture, *stageCapture.compiled, vertexInfos[i]);
-    stageCapture.shapeReplay = Graphics::ShapeReplay::Enabled() ? Graphics::ShapeReplay::DescribeCapture(capture.get(), program.userData, vertexInfos[i] ? &*vertexInfos[i] : nullptr) : nullptr;
     phaseTiming.Phase(DrawRowRecompile);
     return stageCapture.compiled;
 } catch (const std::exception& error) {
