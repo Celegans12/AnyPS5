@@ -2053,9 +2053,9 @@ VkCommandBuffer Recorder::PreludeCommands() {
     return prelude.commands;
 }
 
-void Recorder::PreludePristine(VkBuffer shadow, VkBuffer pristine, VkDeviceSize bytes) {
+void Recorder::PreludePristine(VkBuffer shadow, VkBuffer pristine, VkDeviceSize bytes, VkDeviceSize offset) {
     Require(open != nullptr && open->prelude.commands != VK_NULL_HANDLE, "a pristine copy has no prelude");
-    open->prelude.pristine.push_back({shadow, pristine, bytes});
+    open->prelude.pristine.push_back({shadow, pristine, bytes, offset});
 }
 
 void Recorder::sealPrelude() {
@@ -2068,7 +2068,7 @@ void Recorder::sealPrelude() {
         // The pristine copies read the filled shadows (as recordGpuCopies' inline path does).
         recordBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
         CountBarriers(CommandClass::StagingIn);
-        for (const auto& copy : prelude.pristine) CopyBuffer(context, commands, copy.shadow, 0, copy.pristine, 0, copy.bytes);
+        for (const auto& copy : prelude.pristine) CopyBuffer(context, commands, copy.shadow, copy.offset, copy.pristine, copy.offset, copy.bytes);
         batchedCounters.pristineCopies.fetch_add(prelude.pristine.size(), std::memory_order_relaxed);
         prelude.pristine.clear();
     }
@@ -3364,7 +3364,7 @@ bool Recorder::RecordMeshArguments(VkCommandBuffer commands, VkDeviceAddress rec
     return true;
 }
 
-bool Recorder::RecordStagingDiff(VkCommandBuffer commands, VkDeviceAddress result, VkDeviceAddress pristine, VkDeviceAddress target, std::uint32_t dwords, bool count) {
+bool Recorder::RecordStagingDiff(VkCommandBuffer commands, VkDeviceAddress result, VkDeviceAddress pristine, VkDeviceAddress target, std::uint32_t dwords, bool count, bool keepPristine) {
     constexpr std::uint32_t PushBytes = 40;
     constexpr std::uint32_t GroupSize = 64;
     if (stagingDiffState == 0) {
@@ -3418,8 +3418,8 @@ bool Recorder::RecordStagingDiff(VkCommandBuffer commands, VkDeviceAddress resul
             VkDeviceAddress target;
             VkDeviceAddress counter;
             std::uint32_t count;
-            std::uint32_t unused;
-        } parameters{result + VkDeviceAddress{done} * 4u, pristine + VkDeviceAddress{done} * 4u, target + VkDeviceAddress{done} * 4u, counter, step, 0u};
+            std::uint32_t flags;
+        } parameters{result + VkDeviceAddress{done} * 4u, pristine + VkDeviceAddress{done} * 4u, target + VkDeviceAddress{done} * 4u, counter, step, keepPristine ? 1u : 0u};
         static_assert(sizeof(parameters) == PushBytes);
         function(cmdPushConstants, "vkCmdPushConstants")(commands, stagingDiffLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, PushBytes, &parameters);
         function(cmdDispatch, "vkCmdDispatch")(commands, (step + GroupSize - 1) / GroupSize, 1, 1);

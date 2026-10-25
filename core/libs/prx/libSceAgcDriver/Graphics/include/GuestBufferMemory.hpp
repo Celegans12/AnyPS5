@@ -533,6 +533,12 @@ private:
         mutable bool residentOpen = false;
         // The open use ended at a copy-back mark (MarkDirectWrites marked its written ranges then).
         mutable bool residentEnded = false;
+        // This use's pristine copy is its resident entry's, and its diff copy-back stores the dwords
+        // it writes into it too (APS5_NO_RESIDENT_PRISTINE unset), and whether every written byte
+        // of the region went through that kernel (no whole-copied edge), so the pristine copy equals
+        // the shadow after the copy-back.
+        bool residentPristine = false;
+        mutable bool pristineKept = false;
         std::uint64_t copySerial = 0;
     };
 

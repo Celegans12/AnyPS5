@@ -5482,8 +5482,12 @@ void GuestBufferMemory::copyRegion(Region& region, bool addressable) {
 //   whole range when the entry is not clean, a foreign note came since the last use ended, the
 //   import or mapping changed, an address-based build that may store through BDA into the range is
 //   pending (its stores are marked only when it completes), the use is on the other recorder lane,
-//   or the range is not wholly watched. With APS5_STAGING_DIFF the pristine copy is still made from
-//   the shadow (VRAM to VRAM), so the diff compares against the bytes the work started from.
+//   or the range is not wholly watched. With APS5_STAGING_DIFF the pristine copy is the entry's
+//   too, and the diff kernel stores what it writes into the import into it as well, so it equals
+//   the shadow after a copy-back that took every written byte through the kernel; the next use then
+//   copies into it only the parts it copies in (APS5_NO_RESIDENT_PRISTINE=1, an APS5_AB switch:
+//   the whole shadow into a pristine copy of the build's own, as before). Either way the diff
+//   compares against exactly the bytes the work starts from.
 // - Open uses: one build at a time. A new build finding the entry's use open takes a private shadow
 //   (today's path); a reused build closes the run owing the other use's copy-backs
 //   (CloseRunOwing), and is refused reuse (RecordStagingCopies false) when it cannot; a use opened
@@ -5648,19 +5652,47 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
     auto& plans = ShaderRecompiler::ThreadOwned(plansSlot);
     if (plans.size() < copies.size()) plans.resize(copies.size());
     const bool diffActive = stagingDiffEnabled(context) && stagingDiffActive();
-    bool record = diffActive;
+    bool record = false;
     std::vector<bool> verify(copies.size(), false);
+    // The parts of each region its pristine copy (APS5_STAGING_DIFF) takes from the shadow after the
+    // copy-ins: a resident pristine copy that equals the shadow (see APS5_NO_RESIDENT_PRISTINE) only
+    // the parts copied in; every other one all of it (`pristineWhole`).
+    thread_local std::vector<std::vector<std::pair<std::uint64_t, std::uint64_t>>>* pristinePlansSlot = nullptr;
+    auto& pristinePlans = ShaderRecompiler::ThreadOwned(pristinePlansSlot);
+    if (pristinePlans.size() < copies.size()) pristinePlans.resize(copies.size());
+    std::vector<bool> pristineWhole(copies.size(), true);
+    const bool residentPristine = diffActive && !RuntimeSwitches::Set(RuntimeSwitch::NoResidentPristine);
     for (std::size_t index = 0; index < copies.size(); ++index) {
         auto& region = *copies[index];
         auto& plan = plans[index];
         residentCopyRanges(region, *recorder, addressable, reuse, plan);
         std::uint64_t planned = 0;
         for (const auto& [from, to] : plan) planned += to - from;
+        region.residentPristine = false;
+        pristinePlans[index].clear();
+        if (region.resident != nullptr && region.residentOpen && diffActive) {
+            auto lock = ResidentShadows::Lock();
+            auto& entry = *region.resident;
+            if (residentPristine) {
+                region.residentPristine = true;
+                if (entry.pristineSame && entry.pristine != nullptr) {
+                    pristineWhole[index] = false;
+                    pristinePlans[index] = plan;
+                }
+            }
+            // Until this use's copy-back keeps it again.
+            entry.pristineSame = false;
+        }
         if (region.resident != nullptr && region.residentOpen && planned < region.end - region.begin && ResidentShadows::VerifyThisUse()) {
             verify[index] = true;
             record = true;
         }
         if (planned != 0) record = true;
+    }
+    if (diffActive) {
+        bool pristineCopies = false;
+        for (std::size_t index = 0; index < copies.size() && !pristineCopies; ++index) pristineCopies = pristineWhole[index] || !pristinePlans[index].empty();
+        record = record || pristineCopies;
     }
     // The copy-ins of an unordered dispatch joining an open run of its ring (dispatch overlap, see
     // Recorder::RunCommands) record no leading barrier: the run's first dispatch ordered everything
@@ -5801,7 +5833,12 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
             std::uint64_t copied = 0;
             for (const auto& [from, to] : plans[index]) copied += to - from;
             ResidentShadows::Counters().verified.fetch_add(1, std::memory_order_relaxed);
-            recorder->OnComplete([readback, begin = region->begin, bytes, copied] {
+            std::uint64_t decided = 0;
+            {
+                auto lock = ResidentShadows::Lock();
+                decided = region->resident->useSince;
+            }
+            recorder->OnComplete([readback, begin = region->begin, bytes, copied, decided] {
                 readback->Invalidate();
                 const auto data = readback->Bytes();
                 std::size_t differing = 0;
@@ -5811,44 +5848,121 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
                     if (differing++ == 0) first = at;
                 }
                 if (differing == 0) return;
-                ResidentShadows::Counters().verifyDiffers.fetch_add(1, std::memory_order_relaxed);
-                std::fprintf(stderr, "[resident] verify: shadow of 0x%llx+0x%llx differs from its import in %zu bytes, first at +0x%zx (import %02x, shadow %02x); %llu bytes were copied in, the rest skipped\n", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(bytes), differing, first, std::to_integer<unsigned>(data[first]), std::to_integer<unsigned>(data[bytes + first]), static_cast<unsigned long long>(copied));
+                // A CPU store into the first differing byte's 64 KiB block since the copy-in decision
+                // reached the import after the decision and before the GPU read it here: a race of
+                // that store with the use (a copy-in might have read it or not), not a stale shadow.
+                // (A GPU write recorded after the decision runs after this point.) Anything else is.
+                const auto blockBegin = std::max(begin, (begin + first) & ~std::uint64_t{0xffff});
+                const auto blockEnd = std::min(begin + bytes, ((begin + first) & ~std::uint64_t{0xffff}) + 0x10000);
+                const bool raced = decided != 0 && !GuestMemory::UnchangedSinceCollected(blockBegin, static_cast<std::size_t>(blockEnd - blockBegin), decided);
+                if (!raced) ResidentShadows::Counters().verifyDiffers.fetch_add(1, std::memory_order_relaxed);
+                std::fprintf(stderr, "[resident] verify: shadow of 0x%llx+0x%llx differs from its import in %zu bytes, first at +0x%zx (import %02x, shadow %02x); %llu bytes were copied in, the rest skipped; %s\n", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(bytes), differing, first, std::to_integer<unsigned>(data[first]), std::to_integer<unsigned>(data[bytes + first]), static_cast<unsigned long long>(copied), raced ? "a store into that block came after the copy-in decision (a race with the use; not counted)" : "STALE");
             });
         }
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT);
     }
     if (stagingDiffEnabled(context)) {
         // The pristine copies of the staged shadows (APS5_STAGING_DIFF), after the copy-ins.
-        std::vector<Region*> diffed;
+        std::vector<std::size_t> diffed;
         const bool active = diffActive;
-        for (auto* region : copies) {
+        bool anyCopy = false;
+        for (std::size_t index = 0; index < copies.size(); ++index) {
+            auto* region = copies[index];
             region->diffUse = false;
             if (!active) continue;
             if (!region->deviceLocal || region->buffer == nullptr || region->buffer->DeviceAddress() == 0 || region->copySourceAddress == 0) {
                 region->pristine.reset();
+                region->residentPristine = false;
                 continue;
             }
             const auto bytes = static_cast<std::size_t>(region->end - region->begin);
-            if (region->pristine == nullptr) region->pristine = stagingBuffer(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+            constexpr VkBufferUsageFlags pristineUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+            if (region->residentPristine) {
+                // The entry's pristine copy, shared by the builds of the range as the shadow is.
+                std::shared_ptr<Buffer> shared;
+                {
+                    auto lock = ResidentShadows::Lock();
+                    shared = region->resident->pristine;
+                }
+                if (shared == nullptr) {
+                    shared = stagingBuffer(context, bytes, pristineUsage);
+                    pristineWhole[index] = true;
+                    auto lock = ResidentShadows::Lock();
+                    region->resident->pristine = shared;
+                }
+                region->pristine = std::move(shared);
+            } else if (region->resident != nullptr && region->pristine != nullptr) {
+                // A pristine copy taken from the entry earlier is the entry's (a shared buffer): this
+                // use's own copy is made apart.
+                std::shared_ptr<Buffer> shared;
+                {
+                    auto lock = ResidentShadows::Lock();
+                    shared = region->resident->pristine;
+                }
+                if (shared == region->pristine) region->pristine.reset();
+            }
+            if (region->pristine == nullptr) region->pristine = stagingBuffer(context, bytes, pristineUsage);
             if (region->pristine == nullptr || region->pristine->DeviceAddress() == 0) {
                 region->pristine.reset();
+                region->residentPristine = false;
                 continue;
             }
             region->diffUse = true;
-            diffed.push_back(region);
+            if (pristineWhole[index]) pristinePlans[index].assign(1, {region->begin, region->end});
+            if (!pristinePlans[index].empty()) anyCopy = true;
+            diffed.push_back(index);
+            if (!profile || !region->residentPristine) continue;
+            std::uint64_t copied = 0;
+            for (const auto& [from, to] : pristinePlans[index]) copied += to - from;
+            auto& residentStats = ResidentShadows::Counters();
+            residentStats.pristineUses.fetch_add(1, std::memory_order_relaxed);
+            residentStats.pristineCopiedBytes.fetch_add(copied, std::memory_order_relaxed);
+            residentStats.pristineSavedBytes.fetch_add(bytes - copied, std::memory_order_relaxed);
         }
-        if (!diffed.empty() && prelude) {
+        if (anyCopy && prelude) {
             // Recorded at the prelude's end, behind one transfer barrier for the whole run.
-            for (auto* region : diffed) {
-                recorder->PreludePristine(region->buffer->Handle(), region->pristine->Handle(), region->end - region->begin);
-                recorder->Keep(region->pristine);
+            for (const auto index : diffed) {
+                auto* region = copies[index];
+                for (const auto& [from, to] : pristinePlans[index]) recorder->PreludePristine(region->buffer->Handle(), region->pristine->Handle(), to - from, from - region->begin);
             }
-        } else if (!diffed.empty()) {
+        } else if (anyCopy) {
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
             Recorder::CountBarriers(Recorder::CommandClass::StagingIn);
-            for (auto* region : diffed) {
-                CopyBuffer(context, commands, region->buffer->Handle(), 0, region->pristine->Handle(), 0, region->end - region->begin);
-                recorder->Keep(region->pristine);
+            for (const auto index : diffed) {
+                auto* region = copies[index];
+                for (const auto& [from, to] : pristinePlans[index]) CopyBuffer(context, commands, region->buffer->Handle(), from - region->begin, region->pristine->Handle(), from - region->begin, to - from);
+            }
+        }
+        for (const auto index : diffed) recorder->Keep(copies[index]->pristine);
+        // APS5_VERIFY_RESIDENT, the pristine side: a pristine copy that skipped parts must equal the
+        // shadow (inline copies only; a prelude's pristine copies land at its end).
+        if (!prelude) {
+            bool any = false;
+            for (const auto index : diffed) any = any || (verify[index] && copies[index]->residentPristine && !pristineWhole[index]);
+            if (any) {
+                RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+                for (const auto index : diffed) {
+                    auto* region = copies[index];
+                    if (!verify[index] || !region->residentPristine || pristineWhole[index]) continue;
+                    const auto bytes = static_cast<std::size_t>(region->end - region->begin);
+                    auto readback = std::make_shared<Buffer>(context, 2 * bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+                    CopyBuffer(context, commands, region->pristine->Handle(), 0, readback->Handle(), 0, bytes);
+                    CopyBuffer(context, commands, region->buffer->Handle(), 0, readback->Handle(), bytes, bytes);
+                    recorder->OnComplete([readback, begin = region->begin, bytes] {
+                        readback->Invalidate();
+                        const auto data = readback->Bytes();
+                        std::size_t differing = 0;
+                        std::size_t first = bytes;
+                        for (std::size_t at = 0; at < bytes; ++at) {
+                            if (data[at] == data[bytes + at]) continue;
+                            if (differing++ == 0) first = at;
+                        }
+                        if (differing == 0) return;
+                        ResidentShadows::Counters().verifyDiffers.fetch_add(1, std::memory_order_relaxed);
+                        std::fprintf(stderr, "[resident] verify: pristine copy of 0x%llx+0x%llx differs from its shadow in %zu bytes, first at +0x%zx (pristine %02x, shadow %02x)\n", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(bytes), differing, first, std::to_integer<unsigned>(data[first]), std::to_integer<unsigned>(data[bytes + first]));
+                    });
+                }
+                RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT);
             }
         }
     }
@@ -5921,6 +6035,7 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
     }
     for (auto& region : regions) {
         if (!region.gpuCopy || region.copiedBack) continue;
+        region.pristineKept = region.residentPristine && region.diffUse;
         for (const auto& [begin, end] : merged) {
             const auto from = std::max(begin, region.begin);
             const auto to = std::min(end, region.end);
@@ -5962,9 +6077,11 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
                 const auto alignedTo = to & ~std::uint64_t{3};
                 if (alignedFrom < alignedTo && (alignedTo - alignedFrom) / 4u <= std::numeric_limits<std::uint32_t>::max()) {
                     const auto at = alignedFrom - region.begin;
-                    if (recorder.RecordStagingDiff(commands, region.buffer->DeviceAddress() + at, region.pristine->DeviceAddress() + at, region.copySourceAddress + (alignedFrom - region.copySourceBase), static_cast<std::uint32_t>((alignedTo - alignedFrom) / 4u), profile)) {
+                    if (recorder.RecordStagingDiff(commands, region.buffer->DeviceAddress() + at, region.pristine->DeviceAddress() + at, region.copySourceAddress + (alignedFrom - region.copySourceBase), static_cast<std::uint32_t>((alignedTo - alignedFrom) / 4u), profile, region.residentPristine)) {
                         diffed = true;
                         recorder.Keep(region.pristine);
+                        // Whole-copied edges leave the pristine copy behind the shadow there.
+                        if (from < alignedFrom || alignedTo < to) region.pristineKept = false;
                         if (from < alignedFrom) CopyBuffer(context, commands, region.buffer->Handle(), from - region.begin, region.copySource, from - region.copySourceBase, alignedFrom - from);
                         if (alignedTo < to) CopyBuffer(context, commands, region.buffer->Handle(), alignedTo - region.begin, region.copySource, alignedTo - region.copySourceBase, to - alignedTo);
                         if (profile) {
@@ -5977,6 +6094,7 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
                 }
             }
             if (whole < wholeEnd) {
+                region.pristineKept = false;
                 CopyBuffer(context, commands, region.buffer->Handle(), whole - region.begin, region.copySource, whole - region.copySourceBase, wholeEnd - whole);
                 if (diff && profile && region.deviceLocal) Copies().diffWholeBytes.fetch_add(wholeEnd - whole, std::memory_order_relaxed);
             }
@@ -6501,6 +6619,11 @@ void GuestBufferMemory::MarkDirectWrites() const {
                 entry.clean = !foreign && generation != 0;
                 entry.residentSince = entry.clean ? generation : 0;
                 entry.foreignNote = false;
+                // The pristine copy equals the shadow whatever else stored into the import: the
+                // diff kernel stored every dword the work changed into both (an unclean end only
+                // makes the next use copy more of the shadow in, and that part into the copy).
+                entry.pristineSame = region.pristineKept && entry.pristine != nullptr && entry.pristine == region.pristine;
+                if (region.residentPristine) (entry.pristineSame ? ResidentShadows::Counters().pristineKept : ResidentShadows::Counters().pristineLost).fetch_add(1, std::memory_order_relaxed);
             } else {
                 foreign = true;
             }

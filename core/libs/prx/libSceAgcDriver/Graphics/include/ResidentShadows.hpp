@@ -44,6 +44,12 @@ struct Entry {
     // A recorded GPU write by anyone but the open use's own build noted over the range since the
     // open use began (or since the last use ended).
     bool foreignNote = false;
+    // APS5_STAGING_DIFF: the shadow's pristine copy, shared by the builds of the range as the shadow
+    // is, and whether it equals the shadow (the last use's diff copy-back kept it, see
+    // APS5_NO_RESIDENT_PRISTINE in GuestBufferMemory.cpp): a use then copies only the parts it
+    // copies in into it.
+    std::shared_ptr<Buffer> pristine;
+    bool pristineSame = false;
     std::uint64_t lastUse = 0;
 };
 
@@ -101,7 +107,11 @@ struct Stats {
     std::atomic<std::uint64_t> evictions{0};
     std::atomic<std::uint64_t> verified{0};
     std::atomic<std::uint64_t> verifyDiffers{0};
-    std::atomic<std::uint64_t> faults{0};
+    std::atomic<std::uint64_t> pristineUses{0};
+    std::atomic<std::uint64_t> pristineCopiedBytes{0};
+    std::atomic<std::uint64_t> pristineSavedBytes{0};
+    std::atomic<std::uint64_t> pristineKept{0};
+    std::atomic<std::uint64_t> pristineLost{0};
 };
 Stats& Counters();
 // Live entries and their shadow bytes.
