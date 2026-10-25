@@ -2535,7 +2535,9 @@ void VulkanDevice::WaitIdle() {
     }
     std::unique_lock presentQueueLock(state->presentQueueMutex, std::defer_lock);
     if (state->presentQueue != VK_NULL_HANDLE) presentQueueLock.lock();
+    const auto idleStart = std::chrono::steady_clock::now();
     check(state->DeviceFunction<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(state->device), "vkDeviceWaitIdle");
+    GuestMemory::NoteLockedFenceWait(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - idleStart).count());
     Graphics::CheckPixelFunctionLds(graphicsContext());
     APS5_LOG_CHARS_OUT_DEBUG("VulkanDevice::WaitIdle complete");
 }

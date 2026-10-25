@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ParallelProfile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetTransfer.hpp"
@@ -597,6 +598,7 @@ TileMipLayout ColorTargetMip(const ColorTarget& color, const ColorTargetLayout& 
 // the millisecond the old print rounded to), totalled over 10 s in the [draws] line.
 enum DrawPhase : std::size_t { PhaseValidate, PhaseVertex, PhaseSetup, PhaseReadTarget, PhasePrepare, PhaseLookup, PhaseResources, PhasePipeline, PhaseRecord, PhaseKeep, PhaseSync, PhaseWriteBack, PhaseDescribe, PhaseCount };
 constexpr std::array<const char*, PhaseCount> DrawPhaseNames{"validate", "vertex", "setup", "readTarget", "prepare", "lookup", "resources", "pipeline", "record", "keep", "sync", "writeBack", "describe"};
+constexpr std::array<double, PhaseCount> DrawPhaseMovable{0.95, 0.8, 0.5, 0.6, 0.0, 0.85, 0.75, 0.95, 0.0, 0.0, 0.0, 0.0, 0.0};
 
 // Why a draw did not go into the recorder without a wait (counted in the [draws] line): its targets
 // are not all resident, no recorder is active, a switch (APS5_SYNC_DRAWS, APS5_DUMP_TARGETS,
@@ -1337,11 +1339,12 @@ namespace {
 // DrawWithRecipe.
 struct DrawTimer {
     bool profile;
+    bool measured;
     std::chrono::steady_clock::time_point phaseStart;
     std::array<double, PhaseCount> us{};
-    explicit DrawTimer(bool profile) : profile(profile), phaseStart(std::chrono::steady_clock::now()) {}
+    explicit DrawTimer(bool profile) : profile(profile), measured(profile || ParallelProfile::On()), phaseStart(std::chrono::steady_clock::now()) {}
     void phase(DrawPhase which) {
-        if (!profile) return;
+        if (!measured) return;
         const auto now = std::chrono::steady_clock::now();
         us[which] += std::chrono::duration<double, std::micro>(now - phaseStart).count();
         phaseStart = now;
@@ -1352,6 +1355,7 @@ struct DrawTimer {
 // `waitedBefore` is the thread's GPU waits at the draw's start and `ownWaitedMs` the draw's own
 // syncs (see DrawOutcome::hookWaitUs).
 void reportDrawEnd(const State& state, const DrawTimer& timer, const ShaderResources::BuildTiming* built, DrawOutcome& outcome, double waitedBefore, double ownWaitedMs, const char* suffix) {
+    if (timer.measured) ParallelProfile::NoteDraw(timer.us, DrawPhaseMovable, DrawPhaseNames);
     if (!timer.profile) return;
     static const bool traceDraws = std::getenv("APS5_TRACE_DRAWS") != nullptr;
     outcome.hookWaitUs = std::max(0.0, Recorder::ThreadWaitedMs() - waitedBefore - ownWaitedMs) * 1000.0;

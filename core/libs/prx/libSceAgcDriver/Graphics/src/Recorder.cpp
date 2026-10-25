@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ParallelProfile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
@@ -2203,7 +2204,12 @@ void Recorder::DeferDispatchBarrier(std::uint32_t queueKey, std::span<const void
     open->coveredAccess = 0;
 }
 
+namespace {
+thread_local bool startingDrawPass = false;
+}
+
 VkCommandBuffer Recorder::Commands(VkAccessFlags* coveredAccess, std::source_location where) {
+    if (!startingDrawPass && ParallelProfile::On()) ParallelProfile::NoteSerialWork();
     ensureOpen();
     takeOwedEdge();
     open->handedOut = true;
@@ -2227,18 +2233,27 @@ Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, 
     takeOwedEdge();
     open->handedOut = true;
     flushDeferredDispatch(1, where);
+    struct Starting {
+        Starting() { startingDrawPass = true; }
+        ~Starting() { startingDrawPass = false; }
+    } starting;
     auto& pass = open->renderPass;
     if (!pass.open || forced || (countingSamples && segmentMode() && !segmentSlotReady(*open))) {
         const auto commands = Commands();
         open->passHazards.Clear();
         open->passHazards.BeginPass();
+        if (ParallelProfile::On()) ParallelProfile::NotePassDraw(false);
         return {commands, false, true};
     }
     const auto hazard = open->passHazards.Check(access, pass.key == key);
-    if (hazard == PassHazard::None && pass.key == key) return {open->commands, true, false};
+    if (hazard == PassHazard::None && pass.key == key) {
+        if (ParallelProfile::On()) ParallelProfile::NotePassDraw(true);
+        return {open->commands, true, false};
+    }
     const bool merge = MergeBarriers() && !fenced && !pass.fenced && !pass.afterPass;
     const bool elide = merge && hazard == PassHazard::None;
     endOpenRenderPass(!merge);
+    if (ParallelProfile::On()) ParallelProfile::NotePassDraw(false);
     const auto commands = Commands();
     if (!elide) open->passHazards.Clear();
     open->passHazards.BeginPass();
@@ -5450,7 +5465,10 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             }
         } report{profile, source, waitStart, *this, signaledAtStart};
         const auto waitFences = function(waitForFences, "vkWaitForFences");
+        const bool locked = GuestMemory::GpuMutex().DepthOnThisThread() != 0;
+        const auto fenceStart = locked ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         auto result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
+        if (locked) GuestMemory::NoteLockedFenceWait(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - fenceStart).count());
         for (int waited = 5; result == VK_TIMEOUT; waited += 5) {
             // A batch still running after 5 s is reported (every 5 s) so a GPU-side hang is visible.
             std::fprintf(stderr, "[gpu] recorded batch still running on the GPU after %d s\n", waited);

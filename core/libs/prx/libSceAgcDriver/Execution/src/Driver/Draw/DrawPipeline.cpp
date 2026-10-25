@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ParallelProfile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
@@ -528,9 +529,11 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
 void DrawPipeline::run() {
     PerformanceTrace::BindThread("draw committer");
     StartCommitterSampler();
+    Graphics::ParallelProfile::MarkCommitter();
     for (;;) {
         Commit* commit = nullptr;
         bool isDraw = false;
+        bool isLabel = false;
         SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
         {
             std::unique_lock lock(mutex);
@@ -547,8 +550,12 @@ void DrawPipeline::run() {
                 committerWakeNs += static_cast<std::uint64_t>(std::max<std::int64_t>(0, begun - items.front().pushedNs));
             }
             isDraw = items.front().draw;
+            isLabel = items.front().labelAddress != 0;
         }
         const auto start = std::chrono::steady_clock::now();
+        const bool profiled = Graphics::ParallelProfile::On();
+        const auto heldBefore = profiled ? GuestMemory::ThreadHeldNs() : 0;
+        const auto lockedBefore = GuestMemory::ThreadLockedGpuWaitMs();
         std::exception_ptr fatal;
         bool failed = false;
         bool shutdown = false;
@@ -566,6 +573,14 @@ void DrawPipeline::run() {
         }
         const auto spent = elapsedNs(start);
         traceWait("DrawPipeline", "commit", start);
+        if (profiled) {
+            Graphics::ParallelProfile::ItemSample sample;
+            sample.kind = isDraw ? Graphics::ParallelProfile::Item::Draw : isLabel ? Graphics::ParallelProfile::Item::Label : Graphics::ParallelProfile::Item::Other;
+            sample.wallUs = static_cast<double>(spent) / 1e3;
+            sample.heldUs = static_cast<double>(GuestMemory::ThreadHeldNs() - heldBefore) / 1e3;
+            sample.lockedWaitUs = (GuestMemory::ThreadLockedGpuWaitMs() - lockedBefore) * 1e3;
+            Graphics::ParallelProfile::NoteItem(sample);
+        }
         if (fatal != nullptr && !stopped) {
             stopped = true;
             if (!shutdown) Driver::Get().ReportFailure(fatal);

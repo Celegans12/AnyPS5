@@ -314,6 +314,15 @@ void TagGpuLockSite(GpuLockSite site);
 // A GPU wait (a fence or timeline wait that found its work unfinished) made while the calling
 // thread holds GpuMutex: counted on the thread's [lock] line as 'locked GPU waits' (APS5_PROFILE_DRAW).
 void NoteLockedGpuWait(double ms);
+std::uint64_t ThreadHeldNs();
+double ThreadLockedGpuWaitMs();
+void NoteLockedFenceWait(double ms);
+struct TrackerLockStats {
+    std::uint64_t acquisitions = 0;
+    std::uint64_t waits = 0;
+    std::uint64_t waitNs = 0;
+};
+TrackerLockStats TrackerLockCounts();
 // Bytes the calling thread's write-watch collects walked so far (0 without the memory profile):
 // a caller reads the difference across a span of its own work.
 std::uint64_t ThreadCollectedBytes();

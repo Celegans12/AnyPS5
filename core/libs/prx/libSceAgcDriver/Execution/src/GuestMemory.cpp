@@ -142,6 +142,11 @@ std::atomic<std::uint64_t> collectDirtyRuns{0};
 #endif
 std::atomic<std::uint64_t> trackerWaits{0};
 std::atomic<std::uint64_t> trackerAcquisitions{0};
+std::atomic<std::uint64_t> trackerWaitNs{0};
+bool parallelProfiled() {
+    static const bool enabled = std::getenv("APS5_PROFILE_PARALLEL") != nullptr;
+    return enabled;
+}
 std::uintptr_t PagesBase();
 std::size_t PagesSize();
 std::uintptr_t ImagePagesBase();
@@ -1367,14 +1372,16 @@ WriteTracker& Tracker() {
 class TrackerLock {
 public:
     explicit TrackerLock(WriteTracker& tracker) : tracker(tracker), lock(tracker.mutex, std::defer_lock) {
-        static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+        static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr || parallelProfiled();
         if (!profile) {
             lock.lock();
             return;
         }
         if (!lock.try_lock()) {
             trackerWaits.fetch_add(1, std::memory_order_relaxed);
+            const auto start = std::chrono::steady_clock::now();
             lock.lock();
+            trackerWaitNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
         }
         trackerAcquisitions.fetch_add(1, std::memory_order_relaxed);
     }
@@ -2685,11 +2692,21 @@ bool GpuMutexType::tryEnter() {
     return HeldByThisThread() || mutex.try_lock();
 }
 
+namespace {
+thread_local std::uint64_t threadHeldNs = 0;
+thread_local std::int64_t threadHoldStartNs = 0;
+thread_local double threadLockedWaitMs = 0;
+std::int64_t holdClockNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+}
+
 void GpuMutexType::acquired() {
     owner.store(CurrentThreadToken(), std::memory_order_relaxed);
     if (++depth == 1) {
         gpuHoldSerial.fetch_add(1, std::memory_order_relaxed);
         if (!proofThread) BreakProofs();
+        if (parallelProfiled()) threadHoldStartNs = holdClockNs();
     }
 }
 
@@ -2731,6 +2748,10 @@ void GpuMutexType::unlock() {
         owner.store(nullptr, std::memory_order_relaxed);
         // Still the holder here: the hold ends when the mutex is given up, not before.
         if (GpuHoldProfiled()) EndHold();
+        if (threadHoldStartNs != 0) {
+            threadHeldNs += static_cast<std::uint64_t>(std::max<std::int64_t>(0, holdClockNs() - threadHoldStartNs));
+            threadHoldStartNs = 0;
+        }
         mutex.unlock();
     }
     // After the release, so what the hook does (destroying a batch's kept objects) is neither part
@@ -2866,6 +2887,22 @@ void TagGpuLockSite(GpuLockSite site) {
 
 void MarkPresenterThread() {
     LockStats().holderColumn = PresenterColumn;
+}
+
+std::uint64_t ThreadHeldNs() {
+    return threadHeldNs + (threadHoldStartNs != 0 ? static_cast<std::uint64_t>(std::max<std::int64_t>(0, holdClockNs() - threadHoldStartNs)) : 0u);
+}
+
+double ThreadLockedGpuWaitMs() {
+    return threadLockedWaitMs;
+}
+
+void NoteLockedFenceWait(double ms) {
+    if (GpuMutex().DepthOnThisThread() != 0) threadLockedWaitMs += ms;
+}
+
+TrackerLockStats TrackerLockCounts() {
+    return {trackerAcquisitions.load(std::memory_order_relaxed), trackerWaits.load(std::memory_order_relaxed), trackerWaitNs.load(std::memory_order_relaxed)};
 }
 
 void NoteLockedGpuWait(double ms) {

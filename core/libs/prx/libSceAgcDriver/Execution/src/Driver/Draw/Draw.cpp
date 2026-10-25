@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/CommitPrep.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawProgramTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
@@ -10,6 +11,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ParallelProfile.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "Optimization/ResourceProgram.hpp"
@@ -1225,9 +1227,19 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         auto prepareDevice = prepareDraw ? localDevice : nullptr;
         auto prepareDecode = prepareDraw ? decode : nullptr;
         auto reads = QueuedDrawReadRanges(drawParameters, stages);
-        auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), ahead, drawKey, trace = trace, commitQueue, commitPacket, epoch, programs = std::move(programs), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData), slot, program] {
+        auto queued = Graphics::ParallelProfile::On() ? CommitPrep::Take(localDevice.get(), reads) : CommitPrep::Stamps{};
+        auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), ahead, drawKey, trace = trace, commitQueue, commitPacket, epoch, programs = std::move(programs), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData), slot, program, queued] {
             DrawPipeline::FollowEpoch(epoch);
             GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
+            CommitPrep::Stamps atCommit;
+            if (queued.taken) {
+                atCommit = CommitPrep::Retake(queued, device.Load().get());
+                Graphics::ParallelProfile::NoteStamps(Graphics::ParallelProfile::Window::Queue, CommitPrep::Moved(queued, atCommit));
+            }
+            struct StampScope {
+                explicit StampScope(const CommitPrep::Stamps* stamps) { CommitPrep::SetCommitStamps(stamps); }
+                ~StampScope() { CommitPrep::SetCommitStamps(nullptr); }
+            } stampScope(atCommit.taken ? &atCommit : nullptr);
             struct OriginScope {
                 explicit OriginScope(std::uint64_t address) { Graphics::Recorder::SetWriteOrigin(address); }
                 ~OriginScope() { Graphics::Recorder::SetWriteOrigin(0); }
@@ -1303,6 +1315,7 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
         prepared = nullptr;
         presyncSerial = 0;
     }
+    if (const auto* stamps = CommitPrep::CommitStamps(); stamps != nullptr) Graphics::ParallelProfile::NoteStamps(Graphics::ParallelProfile::Window::Commit, CommitPrep::Moved(*stamps, CommitPrep::Retake(*stamps, localDevice.get())));
     // The batches the HTILE pre-sync waited for: their completions land before the store-back reads.
     if (presyncSerial != 0) localDevice->ReapRecorded(presyncSerial);
     struct SubmitDue {
