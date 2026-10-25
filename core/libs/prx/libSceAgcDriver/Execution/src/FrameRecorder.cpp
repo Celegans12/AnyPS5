@@ -658,6 +658,10 @@ void FrameRecorder::start() {
         }
         return;
     }
+    if (!driver.SettleForCapture(std::chrono::seconds(10))) {
+        warnings.push_back("storage images were still pending GPU results when the snapshot started");
+        std::fprintf(stderr, "[frame-capture] storage images still hold GPU results the snapshot may miss\n");
+    }
     startedAt = std::chrono::steady_clock::now();
     gdsAddress = Pm4::GdsAddress();
     startBoundary = boundaries;
