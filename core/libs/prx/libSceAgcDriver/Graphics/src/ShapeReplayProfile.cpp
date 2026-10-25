@@ -549,6 +549,91 @@ void RecordEnd() {
     state.draws.fetch_add(1, std::memory_order_relaxed);
 }
 
+namespace {
+
+struct DispatchTotals {
+    struct TemplateRing {
+        std::array<std::array<std::uint64_t, Predictor::RingEntries>, 3> hashes{};
+        std::uint32_t size = 0;
+        std::uint32_t next = 0;
+    };
+    std::mutex mutex;
+    Predictor predictor;
+    Tally front;
+    Tally queue0;
+    std::uint64_t exact = 0;
+    std::uint64_t exactQueue0 = 0;
+    std::uint64_t templateLookups = 0;
+    std::array<std::uint64_t, 3> templateHits{};
+    std::unordered_map<std::uint64_t, TemplateRing> templates;
+    std::uint64_t templateResets = 0;
+    std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+};
+
+DispatchTotals& dispatchTotals() {
+    static DispatchTotals state;
+    return state;
+}
+
+}
+
+void NoteDispatch(const DispatchNote& note) {
+    auto& state = dispatchTotals();
+    std::string report;
+    {
+        std::lock_guard lock(state.mutex);
+        const auto frame = Frame();
+        Outcome outcome;
+        if (note.shape == 0) outcome = {false, Age::SameFrame, Diff::NoPlan};
+        else outcome = state.predictor.NoteStage(note.shape, 0, note.record, frame);
+        state.front.Add(outcome);
+        if (note.queue0) state.queue0.Add(outcome);
+        if (note.exactHit) {
+            ++state.exact;
+            if (note.queue0) ++state.exactQueue0;
+        }
+        if (note.variant != 0) {
+            if (state.templates.size() >= Predictor::MaxRings && !state.templates.contains(note.variant)) {
+                state.templates.clear();
+                ++state.templateResets;
+            }
+            auto& ring = state.templates[note.variant];
+            ++state.templateLookups;
+            for (std::size_t kind = 0; kind < 3; ++kind) {
+                if (std::find(ring.hashes[kind].begin(), ring.hashes[kind].begin() + ring.size, note.templates[kind]) != ring.hashes[kind].begin() + ring.size) ++state.templateHits[kind];
+                ring.hashes[kind][ring.next] = note.templates[kind];
+            }
+            ring.next = static_cast<std::uint32_t>((ring.next + 1u) % Predictor::RingEntries);
+            ring.size = std::min<std::uint32_t>(ring.size + 1u, Predictor::RingEntries);
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now - state.lastReport >= std::chrono::seconds(10)) {
+            state.lastReport = now;
+            report = DispatchReportLine(true);
+        }
+    }
+    if (!report.empty()) std::fputs(report.c_str(), stderr);
+}
+
+std::string DispatchReportLine(bool reset) {
+    auto& state = dispatchTotals();
+    std::string text;
+    appendf(text, "[dispatch-shape] D0 (10 s): %llu dispatches (%llu exact dispatch-cache hits today), structural-key front: ", static_cast<unsigned long long>(state.front.lookups), static_cast<unsigned long long>(state.exact));
+    appendTally(text, state.front);
+    appendf(text, "; queue 0: %llu dispatches (%llu exact hits), ", static_cast<unsigned long long>(state.queue0.lookups), static_cast<unsigned long long>(state.exactQueue0));
+    appendTally(text, state.queue0);
+    appendf(text, "; resource template keys seen in the last 64 of their variant: today's key %llu = %.1f %%, written V# bases as data %llu = %.1f %%, written bases and sizes as data %llu = %.1f %% of %llu (rings %zu, resets %llu)\n", static_cast<unsigned long long>(state.templateHits[0]), percent(state.templateHits[0], state.templateLookups), static_cast<unsigned long long>(state.templateHits[1]), percent(state.templateHits[1], state.templateLookups), static_cast<unsigned long long>(state.templateHits[2]), percent(state.templateHits[2], state.templateLookups), static_cast<unsigned long long>(state.templateLookups), state.templates.size(), static_cast<unsigned long long>(state.templateResets));
+    if (reset) {
+        state.front = {};
+        state.queue0 = {};
+        state.exact = 0;
+        state.exactQueue0 = 0;
+        state.templateLookups = 0;
+        state.templateHits = {};
+    }
+    return text;
+}
+
 std::string ReportLines(bool reset) {
     auto& state = totals();
     std::string text;

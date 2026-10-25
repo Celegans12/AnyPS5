@@ -137,6 +137,21 @@ void testBuiltKey() {
     texture.bindings[1].guestDescriptor[3] += 1u;
     check(ShaderResources::DiffContentKeys(base, keyOf(texture), false, diff), "a built key with another T# was not comparable");
     expectOnly(diff, ContentKeyComponent::Image, "a changed T# word in a built key");
+    const auto hashes = [](const ShaderRecompiler::RecompileResult& built) { return ShaderResources::TemplateKeyHashes({ShaderRecompiler::ShaderStage::Compute, &built, 0}, false); };
+    const auto baseHashes = hashes(program);
+    const auto movedHashes = hashes(moved);
+    check(movedHashes[0] != baseHashes[0] && movedHashes[1] == baseHashes[1] && movedHashes[2] == baseHashes[2], "template key hashes: a moved written V# base is data only in the masked hashes");
+    auto resized = program;
+    resized.bindings[0].guestDescriptor[2] = 128u;
+    const auto resizedHashes = hashes(resized);
+    check(resizedHashes[0] != baseHashes[0] && resizedHashes[1] != baseHashes[1] && resizedHashes[2] == baseHashes[2], "template key hashes: a written V# size is data only in the third hash");
+    const auto textureHashes = hashes(texture);
+    check(textureHashes[0] != baseHashes[0] && textureHashes[1] != baseHashes[1] && textureHashes[2] != baseHashes[2], "template key hashes: a T# change is structural in every hash");
+    auto readOnly = program;
+    readOnly.bindings[0].bufferWritten = ShaderRecompiler::ElementFlags{false};
+    auto readOnlyMoved = readOnly;
+    readOnlyMoved.bindings[0].guestDescriptor[0] += 0x100u;
+    check(hashes(readOnly)[0] == hashes(readOnlyMoved)[0], "template key hashes: a moved read-only V# base changed today's movable key");
 }
 
 void testDispatchKeyWithDevice() {

@@ -37,7 +37,10 @@ bool KeyWordsCarry(const ShaderRecompiler::RecompileResult& plan, const ShaderRe
 std::string Difference(const ShaderRecompiler::RecompileResult& replayed, const ShaderRecompiler::RecompileResult& full);
 std::uint64_t ReplayKey(const Graphics::ShapeReplay::StageRecord& record);
 
+enum class Kind : std::uint8_t { Draw, Dispatch };
+
 bool Active();
+bool DispatchActive();
 std::uint64_t PlanKey(std::uint64_t shape, std::span<const Graphics::CompiledShader> stages);
 std::uint64_t& DrawShape();
 
@@ -60,10 +63,10 @@ struct Counters {
     std::uint64_t keysCarried = 0;
     std::uint64_t keyMismatches = 0;
 };
-Counters Totals();
+Counters Totals(Kind kind = Kind::Draw);
 
 using FullMaterialize = std::function<std::shared_ptr<const ShaderRecompiler::RecompileResult>()>;
-std::shared_ptr<const ShaderRecompiler::RecompileResult> Materialize(std::uint64_t shape, std::size_t stage, ShaderRecompiler::ShaderStage kind, std::uint32_t pushOffset, std::uint64_t program, const ShaderRecompiler::ResourceCapture& capture, const Graphics::ShapeReplay::StageRecord* record, const ShaderRecompiler::ShaderVertexStageInfo* vertex, const FullMaterialize& full);
+std::shared_ptr<const ShaderRecompiler::RecompileResult> Materialize(std::uint64_t shape, std::size_t stage, ShaderRecompiler::ShaderStage kind, std::uint32_t pushOffset, std::uint64_t program, const ShaderRecompiler::ResourceCapture& capture, const Graphics::ShapeReplay::StageRecord* record, const ShaderRecompiler::ShaderVertexStageInfo* vertex, const FullMaterialize& full, Kind lane = Kind::Draw);
 
 }
 

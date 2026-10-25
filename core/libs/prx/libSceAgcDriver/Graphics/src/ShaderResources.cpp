@@ -4153,6 +4153,27 @@ bool ShaderResources::DiffContentKeys(std::span<const std::uint32_t> previous, s
     return true;
 }
 
+std::array<std::uint64_t, 3> ShaderResources::TemplateKeyHashes(const CompiledShader& shader, bool dataWords) {
+    const auto key = ContentKey(shader, dataWords, true);
+    std::vector<std::uint8_t> labels;
+    const bool labelled = LabelContentKey(key, false, true, labels);
+    std::array<std::uint64_t, 3> hashes{0xcbf29ce484222325ull, 0x84222325cbf29ce4ull, 0x2325cbf29ce48422ull};
+    const auto mix = [](std::uint64_t& hash, std::uint64_t value) {
+        hash ^= value + 0x9e3779b97f4a7c15ull + (hash << 6u) + (hash >> 2u);
+        hash *= 0x100000001b3ull;
+    };
+    for (std::size_t i = 0; i < key.size(); ++i) {
+        const auto label = labelled ? static_cast<Component>(labels[i]) : Component::Layout;
+        const auto word = key[i];
+        mix(hashes[0], word);
+        const auto based = label == Component::BufferWord0 ? 0u : label == Component::BufferWord1 ? word & 0xffff0000u : word;
+        mix(hashes[1], based);
+        mix(hashes[2], label == Component::BufferWord2 ? 0u : based);
+    }
+    if (!labelled) hashes[1] = hashes[2] = hashes[0];
+    return hashes;
+}
+
 bool MatchesContentKey(const CompiledShader& shader, std::span<const std::uint32_t> key) {
     std::size_t cursor = 0;
     bool equal = true;

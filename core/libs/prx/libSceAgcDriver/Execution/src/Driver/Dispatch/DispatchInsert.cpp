@@ -36,7 +36,7 @@ bool CacheableResult(const ShaderRecompiler::RecompileResult& compiled) {
     });
 }
 
-void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDispatchCache, bool profile, const std::shared_ptr<const ShaderSnapshot>& registeredShader, std::uint64_t forgetAtCapture, std::span<const ShaderRecompiler::MemoryRegion> memory, const std::shared_ptr<ShaderMemory>& shaderMemory, const std::vector<ShaderRecompiler::MemoryRegion>& captured, const std::shared_ptr<const ShaderRecompiler::ResourceCapture>& capture, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, const std::shared_ptr<DispatchEntry>& missedEntry, bool missedDiffering, std::shared_ptr<DispatchVariant>& attachVariant, DispatchPhaseTiming& phaseTiming) {
+void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDispatchCache, bool profile, const std::shared_ptr<const ShaderSnapshot>& registeredShader, std::uint64_t forgetAtCapture, std::span<const ShaderRecompiler::MemoryRegion> memory, const std::shared_ptr<ShaderMemory>& shaderMemory, const std::vector<ShaderRecompiler::MemoryRegion>& captured, const std::shared_ptr<const ShaderRecompiler::ResourceCapture>& capture, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, const std::shared_ptr<DispatchEntry>& missedEntry, bool missedDiffering, std::shared_ptr<DispatchVariant>& attachVariant, DispatchPhaseTiming& phaseTiming, std::shared_ptr<const Graphics::ShapeReplay::StageRecord> shapeRecord) {
     if (!noDispatchCache) {
         bool probe = false;
         if (!stampValidate() && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoDispatchAdmission)) {
@@ -59,6 +59,7 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
         }
         auto fresh = std::make_shared<DispatchVariant>();
         fresh->admissionProbe = probe;
+        fresh->shapeReplay = std::move(shapeRecord);
         fresh->compiled = compiledResult;
         fresh->shader = registeredShader;
         fresh->forgetSerial = forgetAtCapture;

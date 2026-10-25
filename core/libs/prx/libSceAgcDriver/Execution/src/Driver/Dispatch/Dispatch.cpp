@@ -6,6 +6,9 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/ShapeReplay.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShapeReplayProfile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/BufferCopy.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DwordPatternFill.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
@@ -142,6 +145,56 @@ void ReportDispatchItems(bool profile) {
     std::fprintf(stderr, "[dispatch-item] %llu commit items (%llu recipes rebuilt on the committer), %llu miss items (%llu refused on the committer); drained instead, cumulative:%s\n", static_cast<unsigned long long>(itemCommits.load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemRebuilds.load(std::memory_order_relaxed)), static_cast<unsigned long long>(missItemCommits.load(std::memory_order_relaxed)), static_cast<unsigned long long>(missItemRefusals.load(std::memory_order_relaxed)), drained.c_str());
 }
 
+}
+
+template<typename TRegisters>
+std::uint64_t DispatchShapeKey(std::uint64_t address, const void* registered, std::size_t codeOffset, std::uint32_t packetFlags, const ShaderRecompiler::RecompileRequest& request, std::size_t userWords, const TRegisters& registers) {
+    std::uint64_t key = 0x5d15a7c4e1d0b2a3ull;
+    const auto mix = [&](std::uint64_t value) {
+        key ^= value + 0x9e3779b97f4a7c15ull + (key << 6u) + (key >> 2u);
+        key *= 0x100000001b3ull;
+    };
+    mix(address);
+    mix(reinterpret_cast<std::uintptr_t>(registered));
+    mix(codeOffset);
+    mix(packetFlags & 0x8000u);
+    mix(userWords);
+    const auto& context = request.context;
+    mix(context.waveSize);
+    mix(context.userDataBaseRegister);
+    mix(context.convertedSamples ? 1u : 0u);
+    mix(context.linkedCallFallbacks.size());
+    for (const auto word : context.linkedCallFallbacks) mix(word);
+    mix(context.pixel.has_value() || context.vertex.has_value() ? 1u : 0u);
+    if (!context.compute.has_value()) return 0;
+    const auto& compute = *context.compute;
+    for (const auto value : compute.numThreads) mix(value);
+    mix(compute.ldsSizeDwords);
+    for (const bool enabled : compute.groupIdEnable) mix(enabled ? 1u : 0u);
+    mix(compute.tgSizeEnable ? 1u : 0u);
+    mix(compute.threadIdComponentCount);
+    for (const auto value : compute.partialThreads) mix(value);
+    mix(compute.scratchDwords);
+    mix(compute.singleWorkgroup ? 1u : 0u);
+    mix(context.floatMode.has_value() ? 1u : 0u);
+    if (context.floatMode.has_value()) {
+        mix(context.floatMode->floatMode);
+        mix((context.floatMode->dx10Clamp ? 1u : 0u) | (context.floatMode->ieeeMode ? 2u : 0u) | (context.floatMode->fp16Overflow ? 4u : 0u));
+    }
+    mix(request.layout.descriptorSet);
+    mix(request.layout.firstBinding);
+    mix(request.layout.pushConstantOffsetBytes);
+    mix(request.layout.pushConstantSizeBytes);
+    mix(request.target.subgroupSize);
+    mix(request.target.bdaAbiVersion);
+    mix(request.shader.headerAddress);
+    mix(request.shader.code.size());
+    mix(request.useCache ? 1u : 0u);
+    for (const auto offset : {0x207u, 0x208u, 0x209u, 0x212u, 0x213u}) {
+        const auto found = registers.find(offset);
+        mix(found == registers.end() ? (1ull << 32u) : found->second);
+    }
+    return key != 0 ? key : 1u;
 }
 
 bool Driver::pipelineDispatch() {
@@ -460,6 +513,10 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
     }
 
     mix(reinterpret_cast<std::uintptr_t>(registeredShader.get()));
+    const bool shapeKeys = !resolving && ShapeReplay::DispatchActive();
+    const bool shapeProfile = !resolving && Graphics::ShapeReplay::Enabled();
+    const std::uint64_t dispatchShape = shapeKeys || shapeProfile ? DispatchShapeKey(address, registeredShader.get(), codeOffset, packet[4], request, userData.size(), queue.shader) : 0u;
+    std::shared_ptr<const Graphics::ShapeReplay::StageRecord> shapeRecord;
     if (fromAhead && key != ahead.key) {
         fromAhead = false;
         ++groupStats.keyMismatches;
@@ -560,7 +617,8 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
 
 
             timing.Mark("capture_resources");
-            compiledResult = invocation.Materialize(*capture);
+            if (shapeKeys || shapeProfile) shapeRecord = Graphics::ShapeReplay::DescribeCapture(capture.get(), userData, nullptr);
+            compiledResult = shapeKeys ? ShapeReplay::Materialize(dispatchShape, 0, ShaderRecompiler::ShaderStage::Compute, 0, address, *capture, shapeRecord.get(), nullptr, [&] { return invocation.Materialize(*capture); }, ShapeReplay::Kind::Dispatch) : invocation.Materialize(*capture);
             timing.Mark("materialize");
             if (compiledResult->cacheHit) ++cacheHits;
             const auto elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
@@ -591,7 +649,11 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
         }
         recompileMs += phaseTiming.Elapsed();
         phaseTiming.Phase(PhaseRecompile);
-        insertDispatch(address, key, noDispatchCache || !CacheableResult(*compiledResult), profile, registeredShader, forgetAtCapture, memory, shaderMemory, captured, capture, compiledResult, missedEntry, missedDiffering, attachVariant, phaseTiming);
+        insertDispatch(address, key, noDispatchCache || !CacheableResult(*compiledResult), profile, registeredShader, forgetAtCapture, memory, shaderMemory, captured, capture, compiledResult, missedEntry, missedDiffering, attachVariant, phaseTiming, shapeProfile ? shapeRecord : nullptr);
+    }
+    if (shapeProfile && compiledResult != nullptr) {
+        const auto* record = shapeRecord != nullptr ? shapeRecord.get() : cached && keepVariant != nullptr ? keepVariant->shapeReplay.get() : nullptr;
+        Graphics::ShapeReplay::NoteDispatch({dispatchShape, record, cached, submission.queue == 0, compiledResult->PipelineVariantId(), Graphics::ShaderResources::TemplateKeyHashes({ShaderRecompiler::ShaderStage::Compute, compiledResult.get(), 0}, !VulkanDevice::TemplateDataRefresh())});
     }
     if (resolving) {
         auto& parked = resolvedAhead()[currentPacketOffset()];

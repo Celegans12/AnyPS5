@@ -133,6 +133,17 @@ std::uint64_t Frame();
 
 void NoteResourceLookup(std::span<const std::uint32_t> key, bool hit);
 
+struct DispatchNote {
+    std::uint64_t shape = 0;
+    const StageRecord* record = nullptr;
+    bool exactHit = false;
+    bool queue0 = false;
+    std::uint64_t variant = 0;
+    std::array<std::uint64_t, 3> templates{};
+};
+void NoteDispatch(const DispatchNote& note);
+std::string DispatchReportLine(bool reset);
+
 enum class RecordPart : std::uint8_t { Prelude, BindingsSnapshot, BindingsSet, BindingsUpdate, PassAccess, StartPass, Emit, LeavePass, Count };
 void RecordStart();
 void RecordLap(RecordPart part);

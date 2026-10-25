@@ -57,22 +57,9 @@ struct AtomicCounters {
     std::atomic<std::uint64_t> captures{0}, eligible{0}, hits{0}, learned{0}, unlearnable{0}, refused{0}, probations{0}, probationMismatches{0}, verified{0}, verifyMismatches{0}, disabled{0}, replayNs{0}, materializeNs{0}, materializes{0}, absentBuffers{0}, keysCarried{0}, keyMismatches{0};
 };
 
-AtomicCounters& counters() {
-    static AtomicCounters state;
-    return state;
-}
-
-std::uint32_t verifyBudget() {
-    static const std::uint32_t budget = [] {
-        const char* text = std::getenv("APS5_VERIFY_SHAPE_REPLAY");
-        return text != nullptr ? static_cast<std::uint32_t>(std::strtoul(text, nullptr, 10)) : 0u;
-    }();
-    return budget;
-}
-
-bool reporting() {
-    static const bool enabled = Graphics::ShapeReplay::Enabled() || verifyBudget() != 0u || std::getenv("APS5_VERIFY_DRAW_PLANS") != nullptr || std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    return enabled;
+std::uint32_t readBudget(const char* name) {
+    const char* text = std::getenv(name);
+    return text != nullptr ? static_cast<std::uint32_t>(std::strtoul(text, nullptr, 10)) : 0u;
 }
 
 struct Window {
@@ -82,15 +69,37 @@ struct Window {
     Counters last{};
 };
 
-Window& window() {
-    static Window state;
-    return state;
+struct Lane {
+    Kind kind;
+    std::uint32_t budget;
+    AtomicCounters counters;
+    Window window;
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+Lane& lane(Kind kind) {
+    static Lane draws{Kind::Draw, readBudget("APS5_VERIFY_SHAPE_REPLAY")};
+    static Lane dispatches{Kind::Dispatch, readBudget("APS5_VERIFY_DISPATCH_SHAPE_KEYS")};
+    return kind == Kind::Draw ? draws : dispatches;
 }
 
-bool takeVerify() {
-    const auto budget = verifyBudget();
+AtomicCounters& counters(Kind kind = Kind::Draw) {
+    return lane(kind).counters;
+}
+
+std::uint32_t verifyBudget(Kind kind = Kind::Draw) {
+    return lane(kind).budget;
+}
+
+bool reporting() {
+    static const bool enabled = Graphics::ShapeReplay::Enabled() || verifyBudget(Kind::Draw) != 0u || verifyBudget(Kind::Dispatch) != 0u || std::getenv("APS5_VERIFY_DRAW_PLANS") != nullptr || std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return enabled;
+}
+
+bool takeVerify(Kind kind) {
+    const auto budget = verifyBudget(kind);
     if (budget == 0u) return false;
-    auto& state = window();
+    auto& state = lane(kind).window;
     std::lock_guard lock(state.mutex);
     if (std::chrono::steady_clock::now() - state.start >= std::chrono::seconds(10)) {
         state.start = std::chrono::steady_clock::now();
@@ -101,8 +110,8 @@ bool takeVerify() {
     return true;
 }
 
-void report() {
-    static std::atomic<std::int64_t> lastReport{0};
+void report(Kind kind) {
+    auto& lastReport = lane(kind).lastReport;
     const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
     auto last = lastReport.load(std::memory_order_relaxed);
     if (last == 0) {
@@ -110,12 +119,12 @@ void report() {
         return;
     }
     if (now - last < 10000 || !lastReport.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
-    const auto totals = Totals();
+    const auto totals = Totals(kind);
     Counters delta;
     std::size_t plans = 0;
     std::uint64_t resets = 0;
     {
-        auto& state = window();
+        auto& state = lane(kind).window;
         std::lock_guard lock(state.mutex);
         const auto& before = state.last;
         delta = {totals.captures - before.captures, totals.eligible - before.eligible, totals.hits - before.hits, totals.learned - before.learned, totals.unlearnable - before.unlearnable, totals.refused - before.refused, totals.probations - before.probations, totals.probationMismatches - before.probationMismatches, totals.verified - before.verified, totals.verifyMismatches - before.verifyMismatches, totals.disabled - before.disabled, totals.replayNs - before.replayNs, totals.materializeNs - before.materializeNs, totals.materializes - before.materializes, totals.absentBuffers - before.absentBuffers, totals.keysCarried - before.keysCarried, totals.keyMismatches - before.keyMismatches};
@@ -128,8 +137,8 @@ void report() {
         resets = plansStore.resets;
     }
     const auto average = [](std::uint64_t ns, std::uint64_t count) { return count != 0 ? static_cast<double>(ns) / 1000.0 / static_cast<double>(count) : 0.0; };
-    std::fprintf(stderr, "[shape-replay] D1 (10 s): %llu stage captures, %llu eligible, %llu replayed (%.1f %% of eligible; %llu carried their resource key words, %llu key mismatches), %llu learned, %llu unlearnable, %llu refused at patching, %llu with an absent V#; probations %llu (%llu mismatches), verified %llu (%llu mismatches, total %llu), %llu plans disabled; plans %zu (resets %llu); avg us: replay %.1f, materialize %.1f%s\n", static_cast<unsigned long long>(delta.captures), static_cast<unsigned long long>(delta.eligible), static_cast<unsigned long long>(delta.hits), delta.eligible != 0 ? 100.0 * static_cast<double>(delta.hits) / static_cast<double>(delta.eligible) : 0.0, static_cast<unsigned long long>(delta.keysCarried), static_cast<unsigned long long>(delta.keyMismatches), static_cast<unsigned long long>(delta.learned), static_cast<unsigned long long>(delta.unlearnable), static_cast<unsigned long long>(delta.refused), static_cast<unsigned long long>(delta.absentBuffers), static_cast<unsigned long long>(delta.probations), static_cast<unsigned long long>(delta.probationMismatches), static_cast<unsigned long long>(delta.verified), static_cast<unsigned long long>(delta.verifyMismatches), static_cast<unsigned long long>(totals.verifyMismatches), static_cast<unsigned long long>(delta.disabled), plans, static_cast<unsigned long long>(resets), average(delta.replayNs, delta.hits), average(delta.materializeNs, delta.materializes), Active() ? "" : " (replay off)");
-    std::fprintf(stderr, "%s%s\n", Graphics::DrawPlans::ReportLine().c_str(), Graphics::DrawPlans::Active() ? "" : " (plans off)");
+    std::fprintf(stderr, "%s (10 s): %llu stage captures, %llu eligible, %llu replayed (%.1f %% of eligible; %llu carried their resource key words, %llu key mismatches), %llu learned, %llu unlearnable, %llu refused at patching, %llu with an absent V#; probations %llu (%llu mismatches), verified %llu (%llu mismatches, total %llu), %llu plans disabled; plans %zu (resets %llu); avg us: replay %.1f, materialize %.1f%s\n", kind == Kind::Draw ? "[shape-replay] D1" : "[dispatch-shape] dispatch materializations", static_cast<unsigned long long>(delta.captures), static_cast<unsigned long long>(delta.eligible), static_cast<unsigned long long>(delta.hits), delta.eligible != 0 ? 100.0 * static_cast<double>(delta.hits) / static_cast<double>(delta.eligible) : 0.0, static_cast<unsigned long long>(delta.keysCarried), static_cast<unsigned long long>(delta.keyMismatches), static_cast<unsigned long long>(delta.learned), static_cast<unsigned long long>(delta.unlearnable), static_cast<unsigned long long>(delta.refused), static_cast<unsigned long long>(delta.absentBuffers), static_cast<unsigned long long>(delta.probations), static_cast<unsigned long long>(delta.probationMismatches), static_cast<unsigned long long>(delta.verified), static_cast<unsigned long long>(delta.verifyMismatches), static_cast<unsigned long long>(totals.verifyMismatches), static_cast<unsigned long long>(delta.disabled), plans, static_cast<unsigned long long>(resets), average(delta.replayNs, delta.hits), average(delta.materializeNs, delta.materializes), (kind == Kind::Draw ? Active() : DispatchActive()) ? "" : " (replay off)");
+    if (kind == Kind::Draw) std::fprintf(stderr, "%s%s\n", Graphics::DrawPlans::ReportLine().c_str(), Graphics::DrawPlans::Active() ? "" : " (plans off)");
 }
 
 std::uint64_t elapsedNs(std::chrono::steady_clock::time_point since) {
@@ -293,6 +302,11 @@ bool Active() {
     return memoOff && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoShapeReplay);
 }
 
+bool DispatchActive() {
+    static const bool memoOff = std::getenv("APS5_NO_RESULT_MEMO") != nullptr;
+    return memoOff && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoDispatchShapeKeys);
+}
+
 std::uint64_t PlanKey(std::uint64_t shape, std::span<const Graphics::CompiledShader> stages) {
     if (shape == 0) return 0;
     auto key = mix(mix(0xd2a1a115ull, shape), stages.size());
@@ -310,14 +324,14 @@ std::uint64_t& DrawShape() {
     return shape;
 }
 
-Counters Totals() {
-    auto& state = counters();
+Counters Totals(Kind kind) {
+    auto& state = counters(kind);
     const auto load = [](const std::atomic<std::uint64_t>& value) { return value.load(std::memory_order_relaxed); };
     return {load(state.captures), load(state.eligible), load(state.hits), load(state.learned), load(state.unlearnable), load(state.refused), load(state.probations), load(state.probationMismatches), load(state.verified), load(state.verifyMismatches), load(state.disabled), load(state.replayNs), load(state.materializeNs), load(state.materializes), load(state.absentBuffers), load(state.keysCarried), load(state.keyMismatches)};
 }
 
-std::shared_ptr<const ShaderRecompiler::RecompileResult> Materialize(std::uint64_t shape, std::size_t stage, ShaderRecompiler::ShaderStage kind, std::uint32_t pushOffset, std::uint64_t program, const ShaderRecompiler::ResourceCapture& capture, const Graphics::ShapeReplay::StageRecord* record, const ShaderRecompiler::ShaderVertexStageInfo* vertex, const FullMaterialize& full) {
-    auto& count = counters();
+std::shared_ptr<const ShaderRecompiler::RecompileResult> Materialize(std::uint64_t shape, std::size_t stage, ShaderRecompiler::ShaderStage kind, std::uint32_t pushOffset, std::uint64_t program, const ShaderRecompiler::ResourceCapture& capture, const Graphics::ShapeReplay::StageRecord* record, const ShaderRecompiler::ShaderVertexStageInfo* vertex, const FullMaterialize& full, Kind laneKind) {
+    auto& count = counters(laneKind);
     const bool timed = reporting();
     count.captures.fetch_add(1, std::memory_order_relaxed);
     const auto materialize = [&] {
@@ -330,10 +344,10 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Materialize(std::uint64
         return result;
     };
     const auto finish = [&](std::shared_ptr<const ShaderRecompiler::RecompileResult> result) {
-        if (timed) report();
+        if (timed) report(laneKind);
         return result;
     };
-    if (shape == 0 || record == nullptr || !record->eligible || capture.plan == nullptr || capture.source == nullptr || !Active()) return finish(materialize());
+    if (shape == 0 || record == nullptr || !record->eligible || capture.plan == nullptr || capture.source == nullptr || !(laneKind == Kind::Draw ? Active() : DispatchActive())) return finish(materialize());
     count.eligible.fetch_add(1, std::memory_order_relaxed);
     if (!record->buffersPresent) {
         count.absentBuffers.fetch_add(1, std::memory_order_relaxed);
@@ -341,6 +355,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Materialize(std::uint64
     }
     auto key = mix(mix(mix(mix(mix(0x5ba9e5ull, shape), stage), pushOffset), program), ReplayKey(*record));
     key = mix(key, static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(capture.plan.get())));
+    key = mix(key, static_cast<std::uint64_t>(laneKind));
     auto& plans = store();
     std::shared_ptr<Plan> plan;
     {
@@ -371,7 +386,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Materialize(std::uint64
             return finish(materialize());
         }
         static const bool movableBuffers = std::getenv("APS5_NO_MOVED_BUFFER_TEMPLATES") == nullptr;
-        const bool carry = Graphics::DrawPlans::Active() && KeyWordsCarry(*plan->result, *replayed, plan->map, movableBuffers);
+        const bool carry = laneKind == Kind::Draw && Graphics::DrawPlans::Active() && KeyWordsCarry(*plan->result, *replayed, plan->map, movableBuffers);
         auto carried = carry ? plan->result->drawKeyMemo.words.load(std::memory_order_acquire) : nullptr;
         if (carried != nullptr) {
             replayed->drawKeyMemo.words.store(carried, std::memory_order_release);
@@ -379,7 +394,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Materialize(std::uint64
         }
         const bool probation = !plan->checked.exchange(true, std::memory_order_relaxed);
         const bool keyCheck = carried != nullptr && Graphics::DrawPlans::TakeVerify();
-        if (probation || keyCheck || takeVerify()) {
+        if (probation || keyCheck || takeVerify(laneKind)) {
             auto result = materialize();
             auto difference = Difference(*replayed, *result);
             if (difference.empty() && carried != nullptr) {
@@ -394,7 +409,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Materialize(std::uint64
                 (probation ? count.probationMismatches : count.verifyMismatches).fetch_add(1, std::memory_order_relaxed);
                 if (!plan->disabled.exchange(true, std::memory_order_relaxed)) count.disabled.fetch_add(1, std::memory_order_relaxed);
                 static std::atomic<std::uint32_t> printed{0};
-                if (!probation || printed.fetch_add(1, std::memory_order_relaxed) < 20u) std::fprintf(stderr, "[shape-replay] %s: stage %zu (program 0x%llx, push offset %u) replayed unlike its full materialization in its %s; the plan is disabled\n", probation ? "probation" : "verify", stage, static_cast<unsigned long long>(program), pushOffset, difference.c_str());
+                if (!probation || printed.fetch_add(1, std::memory_order_relaxed) < 20u) std::fprintf(stderr, "[shape-replay] %s: stage %zu (program 0x%llx, push offset %u) replayed unlike its full materialization in its %s; the plan is disabled\n", laneKind == Kind::Draw ? (probation ? "probation" : "verify") : (probation ? "dispatch probation" : "dispatch verify"), stage, static_cast<unsigned long long>(program), pushOffset, difference.c_str());
             }
             return finish(result);
         }
