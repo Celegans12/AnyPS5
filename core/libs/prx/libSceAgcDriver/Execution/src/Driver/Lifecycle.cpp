@@ -12,6 +12,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "ShaderDiskCache.hpp"
 #include "prx/libc/include/GuestArena.hpp"
@@ -382,6 +384,20 @@ void Driver::LoadQueueStates(std::span<const std::uint32_t> words) {
     require(accepted == completed, "AGC driver: queue states can be loaded only while no submission is pending");
     queues = std::move(loaded);
     resetGraphics = reset;
+}
+
+bool Driver::SettleForCapture(std::chrono::milliseconds timeout) {
+    if (!WaitIdleFor(timeout)) return false;
+    const auto settle = [&] {
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Hook);
+        std::lock_guard gpuLock(GuestMemory::GpuMutex());
+        if (auto* recorder = Graphics::Recorder::Active()) recorder->Sync();
+        if (const auto localDevice = device.Load()) localDevice->WaitIdle();
+    };
+    settle();
+    Graphics::StorageTexture::FlushAllPending("frame capture");
+    settle();
+    return !Graphics::StorageTexture::AnyPending();
 }
 
 bool Driver::Quiescent() {
