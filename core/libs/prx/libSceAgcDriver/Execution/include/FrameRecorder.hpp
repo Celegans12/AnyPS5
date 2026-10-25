@@ -62,6 +62,19 @@ private:
         std::uint64_t since = 0;
     };
 
+    struct PrologueShader {
+        std::uint64_t header = 0;
+        std::uint64_t headerHash = 0;
+        std::uint64_t code = 0;
+        std::uint64_t codeBytes = 0;
+        std::uint64_t codeHash = 0;
+    };
+
+    struct PrologueCall {
+        FrameCall call;
+        std::vector<PrologueShader> shaders;
+    };
+
     FrameCall make(FrameCallKind kind);
     void record(FrameCall call, bool prologueCall, std::span<const Shader* const> shaders = {}, const std::function<void()>& accept = {});
     void recordLocked(FrameCall call, bool prologueCall, std::span<const Shader* const> shaders);
@@ -73,6 +86,8 @@ private:
     void finish();
     void snapshot(const Range& range);
     void writeReferenceFrames();
+    std::vector<PrologueShader> prologueShaders(std::span<const Shader* const> shaders, bool registration);
+    void writePrologue();
     bool abandonIfDiskLow();
     void stop(const char* reason);
     std::string header() const;
@@ -86,7 +101,12 @@ private:
     std::mutex mutex;
     State state = State::Waiting;
     std::unique_ptr<FrameCaptureWriter> writer;
-    std::vector<FrameCall> prologue;
+    std::vector<PrologueCall> prologue;
+    std::map<std::uint64_t, std::vector<std::byte>> headerImages;
+    std::uint64_t prologueRewrites = 0;
+    std::uint64_t prologueRewriteBytes = 0;
+    std::uint64_t prologueDropped = 0;
+    std::uint64_t prologueCallCount = 0;
     std::deque<FrameCall> reservations;
     std::vector<Range> ranges;
     std::map<std::uint64_t, std::uint64_t> shaderMarks;
