@@ -767,6 +767,117 @@ bool SnapshotComparesProfiled() {
     return profile;
 }
 
+// APS5_DRAW_REUSE_DIFF (profile-only, design.md 3.3): how often untrackedStillMatches proves the
+// same texture entry again inside one collect epoch of its thread (what a per-epoch proof memo would
+// skip), the distinct surfaces and epochs per frame each thread proves in, and where the walk's time
+// goes. Appended to the [texhash] line; observation only.
+bool ProofDiagnosticsEnabled() {
+    static const bool enabled = std::getenv("APS5_DRAW_REUSE_DIFF") != nullptr;
+    return enabled;
+}
+
+struct ProofThread {
+    std::uint32_t index = 0;
+    std::atomic<std::uint64_t> lookups{0}, first{0}, repeat{0}, noEpoch{0}, frames{0}, surfaces{0}, epochs{0};
+    std::atomic<std::uint64_t> classifyNs{0}, walkNs{0}, stampNs{0};
+    // Owned by the thread itself.
+    std::unordered_map<std::uint64_t, std::uint64_t> lastEpoch;
+    std::unordered_set<std::uint64_t> frameSurfaces;
+    std::unordered_set<std::uint64_t> frameEpochs;
+    std::uint64_t frame = std::numeric_limits<std::uint64_t>::max();
+};
+
+struct ProofThreads {
+    std::mutex mutex;
+    std::vector<std::shared_ptr<ProofThread>> threads;
+};
+
+ProofThreads& ProofRegistry() {
+    static ProofThreads registry;
+    return registry;
+}
+
+ProofThread& ThreadProofs() {
+    thread_local std::shared_ptr<ProofThread> state = [] {
+        auto created = std::make_shared<ProofThread>();
+        auto& registry = ProofRegistry();
+        std::lock_guard lock(registry.mutex);
+        created->index = static_cast<std::uint32_t>(registry.threads.size());
+        registry.threads.push_back(created);
+        return created;
+    }();
+    return *state;
+}
+
+void noteProofLookup(std::uint64_t address, std::size_t bytes, const void* entry, const GuestMemory::UntrackedWalkTimes& times) {
+    auto& state = ThreadProofs();
+    const auto mix = [](std::uint64_t hash, std::uint64_t value) { return hash ^ (value + 0x9e3779b97f4a7c15ull + (hash << 6u) + (hash >> 2u)); };
+    const auto frame = GuestMemory::PresentIndex();
+    if (frame != state.frame) {
+        if (!state.frameSurfaces.empty()) {
+            state.frames.fetch_add(1, std::memory_order_relaxed);
+            state.surfaces.fetch_add(state.frameSurfaces.size(), std::memory_order_relaxed);
+            state.epochs.fetch_add(state.frameEpochs.size(), std::memory_order_relaxed);
+        }
+        state.frameSurfaces.clear();
+        state.frameEpochs.clear();
+        state.frame = frame;
+    }
+    const auto surface = mix(address, bytes);
+    state.frameSurfaces.insert(surface);
+    state.lookups.fetch_add(1, std::memory_order_relaxed);
+    state.classifyNs.fetch_add(times.classifyNs, std::memory_order_relaxed);
+    state.walkNs.fetch_add(times.walkNs, std::memory_order_relaxed);
+    state.stampNs.fetch_add(times.stampNs, std::memory_order_relaxed);
+    const auto epoch = GuestMemory::ThreadCollectEpoch();
+    if (epoch == 0) {
+        state.noEpoch.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    state.frameEpochs.insert(epoch);
+    if (state.lastEpoch.size() >= (std::size_t{1} << 16u)) state.lastEpoch.clear();
+    auto& last = state.lastEpoch[mix(surface, reinterpret_cast<std::uintptr_t>(entry))];
+    (last == epoch ? state.repeat : state.first).fetch_add(1, std::memory_order_relaxed);
+    last = epoch;
+}
+
+std::string proofReport() {
+    if (!ProofDiagnosticsEnabled()) return {};
+    auto& registry = ProofRegistry();
+    std::vector<std::shared_ptr<ProofThread>> threads;
+    {
+        std::lock_guard lock(registry.mutex);
+        threads = registry.threads;
+    }
+    std::uint64_t lookups = 0, first = 0, repeat = 0, noEpoch = 0, classifyNs = 0, walkNs = 0, stampNs = 0;
+    std::uint64_t busiestLookups = 0, busiestFrames = 0, busiestSurfaces = 0, busiestEpochs = 0;
+    std::uint32_t busiest = 0;
+    for (const auto& thread : threads) {
+        const auto taken = thread->lookups.exchange(0, std::memory_order_relaxed);
+        lookups += taken;
+        first += thread->first.exchange(0, std::memory_order_relaxed);
+        repeat += thread->repeat.exchange(0, std::memory_order_relaxed);
+        noEpoch += thread->noEpoch.exchange(0, std::memory_order_relaxed);
+        classifyNs += thread->classifyNs.exchange(0, std::memory_order_relaxed);
+        walkNs += thread->walkNs.exchange(0, std::memory_order_relaxed);
+        stampNs += thread->stampNs.exchange(0, std::memory_order_relaxed);
+        const auto frames = thread->frames.exchange(0, std::memory_order_relaxed);
+        const auto surfaces = thread->surfaces.exchange(0, std::memory_order_relaxed);
+        const auto epochs = thread->epochs.exchange(0, std::memory_order_relaxed);
+        if (taken <= busiestLookups) continue;
+        busiestLookups = taken;
+        busiest = thread->index;
+        busiestFrames = frames;
+        busiestSurfaces = surfaces;
+        busiestEpochs = epochs;
+    }
+    const auto each = [&](std::uint64_t ns) { return lookups != 0 ? static_cast<double>(ns) / 1000.0 / static_cast<double>(lookups) : 0.0; };
+    const auto perFrame = [&](std::uint64_t value) { return busiestFrames != 0 ? static_cast<double>(value) / static_cast<double>(busiestFrames) : 0.0; };
+    char line[768];
+    std::snprintf(line, sizeof(line), "; epoch proofs: %llu untracked lookups, %llu first in their entry's epoch, %llu repeats (same entry, same epoch), %llu without an epoch; walk %.1f us each (classify %.1f, OS walk %.1f, stamp loop %.1f); busiest thread %u: %llu lookups over %llu frames, %.1f distinct surfaces and %.1f epochs (with a lookup) per frame", static_cast<unsigned long long>(lookups), static_cast<unsigned long long>(first), static_cast<unsigned long long>(repeat), static_cast<unsigned long long>(noEpoch), each(classifyNs + walkNs + stampNs), each(classifyNs), each(walkNs), each(stampNs), busiest, static_cast<unsigned long long>(busiestLookups), static_cast<unsigned long long>(busiestFrames), perFrame(busiestSurfaces), perFrame(busiestEpochs));
+    return line;
+}
+
 void noteSnapshotCompare(SnapshotCompare reason, bool equal, bool narrowed, const GuestMemory::BlockMatch& match, const GuestMemory::UntrackedBlocks* kinds) {
     auto& counters = SnapshotCompares();
     const auto slot = static_cast<std::size_t>(reason);
@@ -800,7 +911,7 @@ void noteSnapshotCompare(SnapshotCompare reason, bool equal, bool narrowed, cons
     const auto refused = take(5);
     const auto partial = take(6);
     const auto layoutChanged = take(7);
-    AgcDriver::ProfilePrint_nid_no_patch("[texhash] snapshot compares (10 s) by reason:%s; %llu narrowed to written blocks; blocks hashed %llu (%.1f MiB), skipped %llu (%.1f MiB); untracked ranges' blocks: write-watched %llu, hinted %llu, outside the arena %llu, host region %llu, unwatched without hint %llu, walk refused %llu; partly readable %llu, layout changed %llu\n", reasons.c_str(), static_cast<unsigned long long>(counters.narrowed.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.hashedBlocks.exchange(0, std::memory_order_relaxed)), static_cast<double>(counters.hashedBytes.exchange(0, std::memory_order_relaxed)) / 1048576.0, static_cast<unsigned long long>(counters.skippedBlocks.exchange(0, std::memory_order_relaxed)), static_cast<double>(counters.skippedBytes.exchange(0, std::memory_order_relaxed)) / 1048576.0, covered, hinted, outside, hostRegion, unhinted, refused, partial, layoutChanged);
+    AgcDriver::ProfilePrint_nid_no_patch("[texhash] snapshot compares (10 s) by reason:%s; %llu narrowed to written blocks; blocks hashed %llu (%.1f MiB), skipped %llu (%.1f MiB); untracked ranges' blocks: write-watched %llu, hinted %llu, outside the arena %llu, host region %llu, unwatched without hint %llu, walk refused %llu; partly readable %llu, layout changed %llu%s\n", reasons.c_str(), static_cast<unsigned long long>(counters.narrowed.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.hashedBlocks.exchange(0, std::memory_order_relaxed)), static_cast<double>(counters.hashedBytes.exchange(0, std::memory_order_relaxed)) / 1048576.0, static_cast<unsigned long long>(counters.skippedBlocks.exchange(0, std::memory_order_relaxed)), static_cast<double>(counters.skippedBytes.exchange(0, std::memory_order_relaxed)) / 1048576.0, covered, hinted, outside, hostRegion, unhinted, refused, partial, layoutChanged, proofReport().c_str());
 }
 
 const std::vector<std::uint8_t>& pendingBlocks(std::uint64_t address, std::size_t bytes, std::size_t count) {
@@ -864,7 +975,10 @@ bool untrackedStillMatches(std::uint64_t address, std::size_t bytes, std::span<c
     thread_local GuestMemory::Commitment* layoutSlot = nullptr;
     auto& current = ShaderRecompiler::ThreadOwned(layoutSlot);
     const bool layoutWalk = GuestMemory::UntrackedLayoutWalks();
-    const auto walked = GuestMemory::WalkUntrackedBlocks(address, bytes, trusted ? since : 0, stale, &kinds, layoutWalk ? &layout : nullptr, layoutWalk ? &current : nullptr);
+    GuestMemory::UntrackedWalkTimes walkTimes;
+    const bool proofDiagnostics = ProofDiagnosticsEnabled();
+    const auto walked = GuestMemory::WalkUntrackedBlocks(address, bytes, trusted ? since : 0, stale, &kinds, layoutWalk ? &layout : nullptr, layoutWalk ? &current : nullptr, proofDiagnostics ? &walkTimes : nullptr);
+    if (proofDiagnostics) noteProofLookup(address, bytes, &since, walkTimes);
     const auto& pending = pendingBlocks(address, bytes, count);
     const bool pendingAny = std::any_of(pending.begin(), pending.end(), [](std::uint8_t flag) { return flag != 0; });
     for (std::size_t i = 0; i < pending.size() && i < stale.size(); ++i) stale[i] = static_cast<std::uint8_t>(stale[i] | pending[i]);

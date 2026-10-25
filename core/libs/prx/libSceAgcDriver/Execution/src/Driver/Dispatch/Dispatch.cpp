@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/LiveSnapshotRetry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/SlowMaterializations.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawReuseDiff.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/BufferCopy.hpp"
@@ -21,6 +22,7 @@
 #include <atomic>
 #include <string>
 #include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <optional>
 #include <stdexcept>
@@ -532,6 +534,36 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
         recompileMs += phaseTiming.Elapsed();
         phaseTiming.Phase(PhaseRecompile);
         insertDispatch(address, key, noDispatchCache || !CacheableResult(*compiledResult), profile, registeredShader, forgetAtCapture, memory, shaderMemory, captured, capture, compiledResult, missedEntry, missedDiffering, attachVariant, phaseTiming);
+        if (ReuseDiffEnabled() && !resolving && capture != nullptr && compiledResult != nullptr) {
+            // APS5_DRAW_REUSE_DIFF (profile-only): the dispatch's SRT runs as insertDispatch stores
+            // them (registered shader memory left out), classified per shader address.
+            DispatchVariant plan;
+            plan.compiled = compiledResult;
+            for (const auto& region : captured) {
+                if (std::any_of(memory.begin(), memory.end(), [&](const auto& known) { return region.guestAddress >= known.guestAddress && region.guestAddress < known.guestAddress + known.bytes.size(); })) continue;
+                plan.runs.emplace_back(region.guestAddress, region.guestAddress + region.bytes.size());
+                const auto count = region.bytes.size() / sizeof(std::uint32_t);
+                const auto offset = plan.words.size();
+                plan.words.resize(offset + count);
+                std::memcpy(plan.words.data() + offset, region.bytes.data(), count * sizeof(std::uint32_t));
+            }
+            if (!capture->readTrace.leaves.empty()) {
+                for (const auto& binding : compiledResult->bindings) {
+                    if (binding.role != ShaderRecompiler::DescriptorRole::FlattenedSrt) continue;
+                    static_cast<void>(DataWordPositions(plan.runs, capture->readTrace.leaves, capture->readTrace.otherReads, plan.words, binding.guestDescriptor, plan.dataPositions, plan.dataSlots));
+                    break;
+                }
+            }
+            ReuseStageInput input;
+            input.kind = ReuseKind::Dispatch;
+            input.shape = address;
+            input.stageType = static_cast<std::uint32_t>(ShaderRecompiler::ShaderStage::Compute);
+            input.userData = userData;
+            input.userDataBase = 0x240;
+            input.variant = &plan;
+            input.use = &capture->userDataUse;
+            NoteReuseStage(input);
+        }
     }
     if (resolving) {
         auto& parked = resolvedAhead()[currentPacketOffset()];

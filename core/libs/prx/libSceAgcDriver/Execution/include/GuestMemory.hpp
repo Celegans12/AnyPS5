@@ -85,7 +85,19 @@ struct UntrackedBlocks {
     std::size_t layoutChanged = 0;
 };
 bool UntrackedLayoutWalks();
-std::uint64_t WalkUntrackedBlocks(std::uint64_t address, std::size_t bytes, std::uint64_t previous, std::span<std::uint8_t> stale, UntrackedBlocks* kinds = nullptr, const Commitment* before = nullptr, Commitment* now = nullptr);
+// Profile-only split of one WalkUntrackedBlocks call (APS5_DRAW_REUSE_DIFF): classify = the layout
+// query, the tracker lock and the per-block kind loop; walk = the GetWriteWatch / hint walks of the
+// covered and hinted runs; stamp = the per-block stamp loop. Nanoseconds, added to.
+struct UntrackedWalkTimes {
+    std::uint64_t classifyNs = 0;
+    std::uint64_t walkNs = 0;
+    std::uint64_t stampNs = 0;
+};
+std::uint64_t WalkUntrackedBlocks(std::uint64_t address, std::size_t bytes, std::uint64_t previous, std::span<std::uint8_t> stale, UntrackedBlocks* kinds = nullptr, const Commitment* before = nullptr, Commitment* now = nullptr, UntrackedWalkTimes* times = nullptr);
+// Presents counted for profile-only diagnostics (APS5_DRAW_REUSE_DIFF): the present path calls
+// NotePresent when the diagnostic is on; PresentIndex is 0 otherwise.
+void NotePresent();
+std::uint64_t PresentIndex();
 bool CommittedBlocksMatchSince(std::uint64_t address, std::size_t bytes, std::span<const ContentHash::Hash128> expected, std::uint64_t generation, const std::vector<std::pair<std::uint64_t, std::uint64_t>>* before, std::span<const std::uint8_t> pending, BlockMatch* match = nullptr);
 
 // Write tracking. The guest arena is reserved with page write watching, so CollectWrites learns which

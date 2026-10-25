@@ -2176,7 +2176,29 @@ bool UntrackedLayoutWalks() {
     return !disabled;
 }
 
-std::uint64_t WalkUntrackedBlocks(std::uint64_t address, std::size_t bytes, std::uint64_t previous, std::span<std::uint8_t> stale, UntrackedBlocks* kinds, const Commitment* before, Commitment* now) {
+namespace {
+
+std::atomic<std::uint64_t> diagnosticPresents{0};
+
+}
+
+void NotePresent() {
+    diagnosticPresents.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::uint64_t PresentIndex() {
+    return diagnosticPresents.load(std::memory_order_relaxed);
+}
+
+std::uint64_t WalkUntrackedBlocks(std::uint64_t address, std::size_t bytes, std::uint64_t previous, std::span<std::uint8_t> stale, UntrackedBlocks* kinds, const Commitment* before, Commitment* now, UntrackedWalkTimes* times) {
+    const auto timedStart = times != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    auto timedMark = timedStart;
+    const auto timedPhase = [&](std::uint64_t UntrackedWalkTimes::*field) {
+        if (times == nullptr) return;
+        const auto at = std::chrono::steady_clock::now();
+        times->*field += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(at - timedMark).count());
+        timedMark = at;
+    };
     std::fill(stale.begin(), stale.end(), std::uint8_t{1});
     if (kinds != nullptr) *kinds = {};
     if (now != nullptr) *now = {};
@@ -2211,6 +2233,7 @@ std::uint64_t WalkUntrackedBlocks(std::uint64_t address, std::size_t bytes, std:
         else if (tracker.hinted(first, last)) kind = Kind::Hinted;
 #endif
     }
+    timedPhase(&UntrackedWalkTimes::classifyNs);
     const auto walkRun = [&](Kind kind, std::uint64_t first, std::uint64_t last) {
         if (kind == Kind::Covered) return walkWrites(tracker, first, last, StampKind::Cpu);
 #ifdef _WIN32
@@ -2245,6 +2268,7 @@ std::uint64_t WalkUntrackedBlocks(std::uint64_t address, std::size_t bytes, std:
         }
         index = next;
     }
+    timedPhase(&UntrackedWalkTimes::walkNs);
     for (std::size_t index = 0; index < stale.size(); ++index) {
         const auto kind = blockKinds[index];
         const auto [begin, stop] = blockRange(index);
@@ -2270,6 +2294,7 @@ std::uint64_t WalkUntrackedBlocks(std::uint64_t address, std::size_t bytes, std:
 #endif
         stale[index] = 0;
     }
+    timedPhase(&UntrackedWalkTimes::stampNs);
     return tracker.generation.load(std::memory_order_relaxed);
 }
 

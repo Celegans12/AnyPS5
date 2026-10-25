@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawProgramTrace.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawReuseDiff.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -703,6 +704,44 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         drawEntryCounters.dataStagesReused += dataStagesReused;
         drawEntryCounters.dataStagesCompiled += dataStagesCompiled;
         drawEntryCounters.dataVerified += dataVerified;
+    }
+    if (ReuseDiffEnabled()) {
+        // APS5_DRAW_REUSE_DIFF (profile-only): classify each fresh stage capture against the earlier
+        // plans of its (shape key, stage); reads only what the capture recorded.
+        std::uint64_t hitStages = 0, reusedStages = 0, unkeyedStages = 0;
+        for (std::size_t i = 0; i < programs.size(); ++i) {
+            if (roles[i] == Role::GeometryBack) continue;
+            const auto& capture = stageCaptures[i];
+            if (drawHit) {
+                ++hitStages;
+                continue;
+            }
+            if (reused[i]) {
+                ++reusedStages;
+                continue;
+            }
+            if (capture.compiled == nullptr || capture.capture == nullptr) continue;
+            if (!registerKey || shapeKey == 0) {
+                ++unkeyedStages;
+                continue;
+            }
+            const auto variant = DrawStageVariant(programs[i], capture, vertexInfos[i], decodeReads[i]);
+            if (!capture.capture->readTrace.leaves.empty()) recordStageDataPositions(*variant, *capture.capture, decodeReads[i]);
+            ReuseStageInput input;
+            input.kind = ReuseKind::Draw;
+            input.shape = shapeKey;
+            input.stage = static_cast<std::uint32_t>(i);
+            input.stageType = static_cast<std::uint32_t>(programs[i].binary.stage);
+            input.userData = programs[i].userData;
+            input.userDataBase = programs[i].userDataBase;
+            input.hiddenUserWords = programs[i].hiddenUserWords;
+            input.variant = variant.get();
+            input.use = &capture.userDataUse;
+            input.decodeReads = decodeReads[i];
+            input.sameVertex = &Driver::sameVertexInfo;
+            NoteReuseStage(input);
+        }
+        NoteReuseUncaptured(ReuseKind::Draw, hitStages, reusedStages, unkeyedStages);
     }
     const bool shapeRefresh = Graphics::DrawPipelineEnabled();
     const auto refreshSeenTwice = [&] {
