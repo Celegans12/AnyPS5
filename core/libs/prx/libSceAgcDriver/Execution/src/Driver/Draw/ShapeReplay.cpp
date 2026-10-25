@@ -42,6 +42,7 @@ struct Plan {
 struct Store {
     std::shared_mutex mutex;
     std::unordered_map<std::uint64_t, std::shared_ptr<Plan>> plans;
+    std::unordered_map<std::uint64_t, std::shared_ptr<Plan>> old;
     std::uint64_t resets = 0;
 };
 
@@ -123,7 +124,7 @@ void report() {
     {
         auto& plansStore = store();
         std::shared_lock lock(plansStore.mutex);
-        plans = plansStore.plans.size();
+        plans = plansStore.plans.size() + plansStore.old.size();
         resets = plansStore.resets;
     }
     const auto average = [](std::uint64_t ns, std::uint64_t count) { return count != 0 ? static_cast<double>(ns) / 1000.0 / static_cast<double>(count) : 0.0; };
@@ -346,6 +347,21 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Materialize(std::uint64
         std::shared_lock lock(plans.mutex);
         if (const auto found = plans.plans.find(key); found != plans.plans.end()) plan = found->second;
     }
+    if (plan == nullptr) {
+        std::unique_lock lock(plans.mutex);
+        if (const auto found = plans.plans.find(key); found != plans.plans.end()) {
+            plan = found->second;
+        } else if (const auto aged = plans.old.find(key); aged != plans.old.end()) {
+            plan = std::move(aged->second);
+            plans.old.erase(aged);
+            if (plans.plans.size() >= MaxPlans) {
+                plans.old = std::move(plans.plans);
+                plans.plans.clear();
+                ++plans.resets;
+            }
+            plans.plans[key] = plan;
+        }
+    }
     if (plan != nullptr && (plan->plan.lock() != capture.plan || plan->source.lock() != capture.source)) plan = nullptr;
     if (plan != nullptr && !plan->disabled.load(std::memory_order_relaxed)) {
         const auto started = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -403,6 +419,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Materialize(std::uint64
         }
         std::unique_lock lock(plans.mutex);
         if (plans.plans.size() >= MaxPlans && !plans.plans.contains(key)) {
+            plans.old = std::move(plans.plans);
             plans.plans.clear();
             ++plans.resets;
         }
