@@ -120,7 +120,7 @@ private:
 // them. Debug aid: APS5_NO_PIPELINE_CACHE=1 builds one per draw as before.
 std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 // `created` reports whether this call built the pipeline (false: served from the store or private).
-std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, bool* created = nullptr);
+std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, bool* created = nullptr, std::uint64_t* storedHash = nullptr);
 // Cumulative pipeline store outcomes since start-up (the [pipecache] line reports 10 s windows).
 struct PipelineStoreCounters {
     std::uint64_t hits = 0;
@@ -133,6 +133,7 @@ struct PipelineStoreCounters {
 PipelineStoreCounters PipelineStoreTotals();
 // The pipeline store's key of a configuration (empty when the configuration gets a private pipeline).
 void BuildPipelineStoreKey(std::vector<std::byte>& key, const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout);
+bool TouchCachedPipeline(const Context& context, std::uint64_t hash, const Pipeline* pipeline);
 struct DescribedSetLayouts {
     PipelineSetLayouts layouts;
     std::vector<std::uint32_t> mainKey;

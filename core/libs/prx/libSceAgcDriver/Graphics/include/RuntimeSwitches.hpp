@@ -70,6 +70,7 @@ enum class RuntimeSwitch : std::size_t {
     NoHitItemHtileNote,
     NoDispatchAdmission,
     NoShapeReplay,
+    NoDrawPlans,
     Count,
 };
 

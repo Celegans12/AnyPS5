@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/ShapeReplayProfile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/ShapeReplay.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DrawPlans.hpp"
 #include <cstring>
 #include <cstdio>
 #include <exception>
@@ -296,6 +297,39 @@ void patching() {
     foreign.bindings[1].guestDescriptor[0] = 0x77777777u;
     Require(!Replay::Learn(foreign, snapshot, &vertex).has_value(), "patching: a guest buffer element no snapshot V# explains was learned");
     Require(!Replay::Learn(plan, snapshot, nullptr).has_value(), "patching: vertex attributes without vertex stage info were learned");
+
+    auto readOnly = plan;
+    readOnly.bindings[1].count = 2;
+    readOnly.bindings[1].bufferWritten = {false, false};
+    const auto readOnlyMap = Replay::Learn(readOnly, snapshot, &vertex);
+    Require(readOnlyMap.has_value(), "key words: a read-only buffer plan was not learned");
+    const auto readOnlyReplay = Replay::Apply(readOnly, *readOnlyMap, moved, &movedVertex);
+    Require(Replay::KeyWordsCarry(readOnly, *readOnlyReplay, *readOnlyMap, true), "key words: moved bases and sizes of read-only V#s did not keep the resource key words");
+    Require(!Replay::KeyWordsCarry(readOnly, *readOnlyReplay, *readOnlyMap, false), "key words: the key words were carried without movable buffer templates");
+    auto written = readOnly;
+    written.bindings[1].bufferWritten = {false, true};
+    const auto writtenMap = Replay::Learn(written, snapshot, &vertex);
+    const auto writtenReplay = Replay::Apply(written, *writtenMap, moved, &movedVertex);
+    Require(!Replay::KeyWordsCarry(written, *writtenReplay, *writtenMap, true), "key words: a written V# whose base moved kept the resource key words");
+    auto strided = moved;
+    strided.buffers[1].dwords[1] = 0x00200000u;
+    const auto stridedReplay = Replay::Apply(readOnly, *readOnlyMap, strided, &movedVertex);
+    Require(!Replay::KeyWordsCarry(readOnly, *stridedReplay, *readOnlyMap, true), "key words: a read-only V# whose stride changed kept the resource key words");
+    auto emptied = moved;
+    emptied.buffers[0].dwords[2] = 0u;
+    const auto emptiedReplay = Replay::Apply(readOnly, *readOnlyMap, emptied, &movedVertex);
+    Require(!Replay::KeyWordsCarry(readOnly, *emptiedReplay, *readOnlyMap, true), "key words: a V# that became empty kept the resource key words");
+
+    AgcDriver::Graphics::VertexInputLayout left, right;
+    left.bindings.push_back({0u, 16u, VK_VERTEX_INPUT_RATE_VERTEX});
+    left.attributes.push_back({0u, 0u, VK_FORMAT_R32G32B32A32_SFLOAT, 0u});
+    right = left;
+    Require(AgcDriver::Graphics::DrawPlans::SameVertexInput(left, right), "vertex inputs: equal layouts differ");
+    right.bindings[0].stride = 32u;
+    Require(!AgcDriver::Graphics::DrawPlans::SameVertexInput(left, right), "vertex inputs: a stride change was not seen");
+    right = left;
+    right.attributes[0].offset = 4u;
+    Require(!AgcDriver::Graphics::DrawPlans::SameVertexInput(left, right), "vertex inputs: an offset change was not seen");
 }
 
 void report() {

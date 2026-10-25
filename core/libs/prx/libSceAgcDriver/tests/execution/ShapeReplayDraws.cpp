@@ -3,8 +3,16 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/ShapeReplay.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DrawPlans.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "VulkanTestDevice.hpp"
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -13,6 +21,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <span>
 #include <initializer_list>
 #include <iostream>
 #include <string>
@@ -29,7 +38,17 @@ alignas(256) constexpr std::array<std::uint32_t, 16> TriangleVertexCode{
     0x7e060280u, 0x7e0802f2u, 0xf80008cfu, 0x04030201u, 0xbf810000u,
 };
 alignas(256) constexpr std::array<std::uint32_t, 8> ConstantPixelCode{0xf4000080u, 0xfa000000u, 0xbf8cc07fu, 0x7e000202u, 0x7e020280u, 0xf800180fu, 0x00010100u, 0xbf810000u};
-alignas(256) std::array<std::byte, 1024> ColorMemory{};
+std::span<std::byte> ColorTarget() {
+    static std::byte* const base = [] {
+#ifdef _WIN32
+        return static_cast<std::byte*>(VirtualAlloc(nullptr, 65536u, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+#else
+        return static_cast<std::byte*>(std::aligned_alloc(65536u, 65536u));
+#endif
+    }();
+    Require(base != nullptr, "the color target pages were not allocated");
+    return {base, 65536u};
+}
 alignas(256) std::array<float, 64> Constants{};
 
 struct Header {
@@ -56,8 +75,8 @@ void Append(std::vector<std::uint32_t>& commands, std::uint32_t opcode, std::ini
     commands.insert(commands.end(), payload);
 }
 
-std::vector<std::uint32_t> Draw(const float* constant) {
-    const auto color = reinterpret_cast<std::uintptr_t>(ColorMemory.data());
+std::vector<std::uint32_t> Draw(const float* constant, bool tiled) {
+    const auto color = reinterpret_cast<std::uintptr_t>(ColorTarget().data());
     const auto vertex = reinterpret_cast<std::uintptr_t>(TriangleVertexCode.data());
     const auto pixel = reinterpret_cast<std::uintptr_t>(ConstantPixelCode.data());
     const auto pointer = reinterpret_cast<std::uintptr_t>(constant);
@@ -72,7 +91,7 @@ std::vector<std::uint32_t> Draw(const float* constant) {
         {0x8e, 0xf}, {0x8f, 0xf}, {0x202, 0xcc0010},
         {0x1c4, 0}, {0x1c5, 9}, {0x1c3, 4}, {0x31c, 0x28028},
         {0x31b, 0}, {0x31d, 0}, {0x3b0, (63u << 14u) | 3u},
-        {0x3b8, 0x9000000}, {0x1e0, 0},
+        {0x3b8, 0x9000000u | (tiled ? 0x1bu << 14u : 0u)}, {0x1e0, 0},
         {0xc, 0}, {0xd, 0x40040},
         {0x81, 0x80000000}, {0x82, 0x40040},
         {0x90, 0x80000000}, {0x91, 0x40040},
@@ -98,15 +117,18 @@ std::vector<std::uint32_t> Draw(const float* constant) {
     return commands;
 }
 
-unsigned Drawn(const float* constant) {
-    ColorMemory.fill(std::byte{0});
-    auto commands = Draw(constant);
+unsigned Drawn(const float* constant, bool tiled) {
+    const auto target = ColorTarget();
+    std::fill(target.begin(), target.end(), std::byte{0});
+    auto commands = Draw(constant, tiled);
     Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
     Require(sceAgcDriverSubmitDcb(&packet) == 0, "the draw submission failed");
     AgcDriverWaitIdle_nid_postfix();
-    AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(ColorMemory.data()), ColorMemory.size());
+    AgcDriver::Graphics::StorageTexture::FlushPending(reinterpret_cast<std::uintptr_t>(target.data()), target.size(), nullptr, "test read-back");
+    AgcDriverWaitIdle_nid_postfix();
+    AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(target.data()), target.size());
     unsigned brightest = 0;
-    for (const auto value : ColorMemory) brightest = std::max(brightest, static_cast<unsigned>(value));
+    for (const auto value : target) brightest = std::max(brightest, static_cast<unsigned>(value));
     return brightest;
 }
 
@@ -135,9 +157,10 @@ int main() {
         for (const auto& [slot, value] : draws) Constants[slot] = value;
         for (const auto& [slot, value] : draws) {
             const auto expected = static_cast<unsigned>(value * 255.0f + 0.5f);
-            const auto drawn = Drawn(&Constants[slot]);
+            const auto drawn = Drawn(&Constants[slot], false);
             Require(drawn == expected || drawn + 1u == expected || drawn == expected + 1u, "a draw of constant " + std::to_string(value) + " through a moved pointer wrote " + std::to_string(drawn) + ", expected " + std::to_string(expected));
         }
+        for (const auto& [slot, value] : draws) static_cast<void>(Drawn(&Constants[slot], true));
         const auto totals = Replay::Totals();
         std::cout << "shape replay " << (on ? "on" : "off") << ": " << totals.captures << " stage captures, " << totals.eligible << " eligible, " << totals.hits << " replayed, " << totals.learned << " learned, " << totals.unlearnable << " unlearnable, " << totals.probations << " probations (" << totals.probationMismatches << " mismatches), " << totals.verified << " verified (" << totals.verifyMismatches << " mismatches)\n";
         Require(totals.probationMismatches == 0 && totals.verifyMismatches == 0, "a replayed stage differed from its full materialization");
@@ -146,6 +169,19 @@ int main() {
             if (std::getenv("APS5_VERIFY_SHAPE_REPLAY") != nullptr) Require(totals.verified != 0, "the verify mode compared no replayed stage");
         } else {
             Require(totals.hits == 0 && totals.eligible == 0, "a draw was replayed with APS5_NO_SHAPE_REPLAY set");
+        }
+        namespace Plans = AgcDriver::Graphics::DrawPlans;
+        const bool plans = Plans::Active();
+        const auto planned = Plans::Counters();
+        const auto outcome = [&](Plans::Outcome which) { return planned.outcomes[static_cast<std::size_t>(which)]; };
+        std::cout << "draw plans " << (plans ? "on" : "off") << ": " << outcome(Plans::Outcome::Hit) << " pipeline hits, " << outcome(Plans::Outcome::Stored) << " stored, " << outcome(Plans::Outcome::NoPlan) << " without a plan, " << outcome(Plans::Outcome::Resources) << " other template, " << outcome(Plans::Outcome::Layout) << " other layout, " << planned.verified << " verified (" << outcome(Plans::Outcome::VerifyMismatch) << " mismatches), " << totals.keysCarried << " key words carried (" << totals.keyMismatches << " mismatches)\n";
+        Require(outcome(Plans::Outcome::VerifyMismatch) == 0 && totals.keyMismatches == 0, "a draw plan differed from today's derivation");
+        if (plans) {
+            Require(outcome(Plans::Outcome::Hit) >= 6, "eight recorded draws of one shape took " + std::to_string(outcome(Plans::Outcome::Hit)) + " pipelines from their plan, expected at least 6");
+            if (on && std::getenv("APS5_VERIFY_SHAPE_REPLAY") == nullptr) Require(totals.keysCarried >= 1, "no replayed stage carried its resource key words");
+            if (std::getenv("APS5_VERIFY_DRAW_PLANS") != nullptr) Require(planned.verified != 0, "the draw plan verify mode compared nothing");
+        } else {
+            Require(outcome(Plans::Outcome::Hit) == 0 && totals.keysCarried == 0, "a draw used a plan with APS5_NO_DRAW_PLANS set");
         }
         if (AgcDriver::CommandLog::Enabled()) {
             for (const auto& stream : AgcDriver::CommandLog::Streams()) std::cout << "command-log: pool " << stream.pool << " commands " << stream.commands << " hash " << std::hex << stream.hash << std::dec << "\n";

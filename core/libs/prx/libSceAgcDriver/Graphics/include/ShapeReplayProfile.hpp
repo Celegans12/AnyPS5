@@ -72,6 +72,8 @@ struct StageRecord {
     std::array<std::uint64_t, HashedClasses> hashes{};
     std::array<std::uint32_t, 4> slotCounts{};
     std::uint64_t descriptorPlan = 0;
+    std::uint64_t bufferPlan = 0;
+    bool buffersPresent = false;
     [[nodiscard]] std::uint64_t Combined() const;
 };
 

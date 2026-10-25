@@ -195,7 +195,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     const auto* vertexInfo = vertexInfos[i] ? &*vertexInfos[i] : nullptr;
     stageCapture.shapeReplay = replay || Graphics::ShapeReplay::Enabled() ? Graphics::ShapeReplay::DescribeCapture(capture.get(), program.userData, vertexInfo) : nullptr;
     try {
-        stageCapture.compiled = replay ? ShapeReplay::Materialize(replayShape, i, pushOffset, program.binary.codeAddress, *capture, stageCapture.shapeReplay.get(), vertexInfo, [&] { return invocation.Materialize(*capture); }) : invocation.Materialize(*capture);
+        stageCapture.compiled = replay ? ShapeReplay::Materialize(replayShape, i, program.binary.stage, pushOffset, program.binary.codeAddress, *capture, stageCapture.shapeReplay.get(), vertexInfo, [&] { return invocation.Materialize(*capture); }) : invocation.Materialize(*capture);
     } catch (const std::exception& error) {
         throw named(error, request.context.memory);
     }
