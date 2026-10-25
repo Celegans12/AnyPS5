@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/CommitPrep.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ParallelProfile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -9,6 +10,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
+#include <memory>
 #include <array>
 #include <limits>
 #include <string>
@@ -394,7 +396,7 @@ void DrawPipeline::rethrowFailure() {
     std::rethrow_exception(error);
 }
 
-void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes, std::vector<Range> reads, Prepare prepare, bool draw) {
+void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes, std::vector<Range> reads, Prepare prepare, bool draw, std::uint64_t site) {
     if (DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread()) DrawFinisher::Get().Drain();
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto lockStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -426,6 +428,7 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     const bool prepared = static_cast<bool>(prepare);
     items.push_back({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), std::move(reads), nowNs(), std::move(prepare)});
     items.back().draw = draw;
+    items.back().site = site;
     addWrites(items.back().writes);
     for (const auto& [begin, limit] : items.back().reads) {
         items.back().readBounds.first = std::min(items.back().readBounds.first, begin);
@@ -530,10 +533,12 @@ void DrawPipeline::run() {
     PerformanceTrace::BindThread("draw committer");
     StartCommitterSampler();
     Graphics::ParallelProfile::MarkCommitter();
+    auto predictor = std::make_unique<CommitPrep::DrainPredictor>();
     for (;;) {
         Commit* commit = nullptr;
         bool isDraw = false;
         bool isLabel = false;
+        std::uint64_t key = 0;
         SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
         {
             std::unique_lock lock(mutex);
@@ -551,10 +556,21 @@ void DrawPipeline::run() {
             }
             isDraw = items.front().draw;
             isLabel = items.front().labelAddress != 0;
+            if (commit != nullptr) key = CommitPrep::ItemKey(isDraw, items.front().labelAddress, items.front().writes, items.front().reads, items.front().site);
         }
         const auto start = std::chrono::steady_clock::now();
         const bool profiled = Graphics::ParallelProfile::On();
+        const bool split = key != 0 && CommitPrep::LockSplit();
+        const auto plan = split ? predictor->Predict(key) : CommitPrep::DrainPredictor::Plan::None;
         const auto heldBefore = profiled ? GuestMemory::ThreadHeldNs() : 0;
+        CommitPrep::PreDrain drained;
+        if (plan != CommitPrep::DrainPredictor::Plan::None) {
+            try {
+                drained = Driver::PreDrainCommit(plan == CommitPrep::DrainPredictor::Plan::Open);
+            } catch (...) {
+                drained = {};
+            }
+        }
         const auto lockedBefore = GuestMemory::ThreadLockedGpuWaitMs();
         std::exception_ptr fatal;
         bool failed = false;
@@ -573,12 +589,18 @@ void DrawPipeline::run() {
         }
         const auto spent = elapsedNs(start);
         traceWait("DrawPipeline", "commit", start);
+        const auto lockedWaitUs = (GuestMemory::ThreadLockedGpuWaitMs() - lockedBefore) * 1e3;
+        if (split) predictor->Learn(key, plan, drained.waitedUs, lockedWaitUs);
+        const bool stageA = CommitPrep::TakeStageA();
         if (profiled) {
             Graphics::ParallelProfile::ItemSample sample;
             sample.kind = isDraw ? Graphics::ParallelProfile::Item::Draw : isLabel ? Graphics::ParallelProfile::Item::Label : Graphics::ParallelProfile::Item::Other;
             sample.wallUs = static_cast<double>(spent) / 1e3;
             sample.heldUs = static_cast<double>(GuestMemory::ThreadHeldNs() - heldBefore) / 1e3;
-            sample.lockedWaitUs = (GuestMemory::ThreadLockedGpuWaitMs() - lockedBefore) * 1e3;
+            sample.lockedWaitUs = lockedWaitUs;
+            sample.preDrained = plan != CommitPrep::DrainPredictor::Plan::None;
+            sample.preDrainUs = drained.waitedUs;
+            sample.stageA = stageA;
             Graphics::ParallelProfile::NoteItem(sample);
         }
         if (fatal != nullptr && !stopped) {

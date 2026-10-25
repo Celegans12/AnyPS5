@@ -1545,6 +1545,46 @@ bool SplitDrawBuild() {
     return !RuntimeSwitches::Set(RuntimeSwitch::NoSplitDrawBuild);
 }
 
+PreparedDrawStamp CheckPreparedDraw(const PreparedDraw& prepared, VkDevice device, std::uint64_t indexBytes) {
+    if (prepared.device != device) return PreparedDrawStamp::Device;
+    if (prepared.indexBytes != indexBytes) return PreparedDrawStamp::IndexBytes;
+    if (GuestMemory::ForgetSerial() != prepared.forgetSerial) return PreparedDrawStamp::ForgetSerial;
+    if (GuestAllocations::GuestAllocationsGeneration_nid_postfix() != prepared.registryGeneration) return PreparedDrawStamp::Registry;
+    return PreparedDrawStamp::Current;
+}
+
+VkDevice PreparedDrawDevice(const PreparedDraw& prepared) {
+    return prepared.device;
+}
+
+bool PreparedDrawHasResources(const PreparedDraw& prepared) {
+    return prepared.resources != nullptr;
+}
+
+namespace {
+
+std::atomic<std::uint64_t> verifiedPreparedDraws{0};
+
+void verifyPreparedBuild(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, const ShaderResources& prepared) {
+    const ShaderResources rebuilt(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots);
+    const auto preparedLayouts = prepared.SetLayouts();
+    const auto rebuiltLayouts = rebuilt.SetLayouts();
+    const bool layouts = std::ranges::equal(preparedLayouts.mainKey, rebuiltLayouts.mainKey) && std::ranges::equal(preparedLayouts.fragmentKey, rebuiltLayouts.fragmentKey) && preparedLayouts.split == rebuiltLayouts.split;
+    const auto preparedText = prepared.Describe();
+    const auto rebuiltText = rebuilt.Describe();
+    if (!layouts || preparedText != rebuiltText || prepared.NeedsCompletion() != rebuilt.NeedsCompletion() || prepared.Reusable() != rebuilt.Reusable()) {
+        throw std::runtime_error("APS5_VERIFY_PREP: a draw build completed from its unlocked preparation differs from the inline build (prepared " + preparedText + "; inline " + rebuiltText + (layouts ? "" : "; set layouts differ") + ")");
+    }
+    const auto count = verifiedPreparedDraws.fetch_add(1, std::memory_order_relaxed) + 1;
+    if ((count & (count - 1)) == 0 || count % 65536 == 0) std::fprintf(stderr, "[verify-prep] %llu prepared draw builds matched their inline builds\n", static_cast<unsigned long long>(count));
+}
+
+}
+
+std::uint64_t VerifiedPreparedDraws() {
+    return verifiedPreparedDraws.load(std::memory_order_relaxed);
+}
+
 std::shared_ptr<PreparedDraw> PrepareDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders) {
     if (!SplitDrawBuild()) return nullptr;
     auto& counters = Splits();
@@ -2096,14 +2136,19 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
         // were taken before it); else the build runs here as before.
         if (prepared != nullptr && prepared->resources != nullptr) {
             auto& counters = Splits();
-            if (GuestMemory::ForgetSerial() != prepared->forgetSerial) {
+            const auto stamp = CheckPreparedDraw(*prepared, context.device, indexBytes);
+            if (stamp == PreparedDrawStamp::ForgetSerial) {
                 counters.staleForget.fetch_add(1, std::memory_order_relaxed);
-            } else if (GuestAllocations::GuestAllocationsGeneration_nid_postfix() != prepared->registryGeneration) {
+            } else if (stamp == PreparedDrawStamp::Registry) {
                 counters.staleRegistry.fetch_add(1, std::memory_order_relaxed);
+            } else if (stamp != PreparedDrawStamp::Current) {
+                counters.staleOther.fetch_add(1, std::memory_order_relaxed);
             } else {
                 resolved.resources = std::move(prepared->resources);
                 resolved.resources->CompleteDraw();
                 counters.used.fetch_add(1, std::memory_order_relaxed);
+                static const bool verify = std::getenv("APS5_VERIFY_PREP") != nullptr;
+                if (verify) verifyPreparedBuild(context, state, draw, shaders, snapshots, indexBytes, *resolved.resources);
             }
             prepared->resources.reset();
         }

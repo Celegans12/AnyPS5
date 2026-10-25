@@ -117,6 +117,12 @@ public:
     void WaitRecorded(std::uint64_t serial);
     std::uint64_t SubmittedEpoch() const;
     bool WaitRecordedFor(std::uint64_t serial, std::uint64_t timeoutNanos);
+    struct PreDrained {
+        bool drained = false;
+        bool submitted = false;
+        double waitedUs = 0;
+    };
+    PreDrained PreDrainUnlocked(bool submitOpen);
     void ReapRecorded(std::uint64_t serial);
     // Completes the batches that already finished (non-blocking); under the mutex.
     void ReapRecorded();

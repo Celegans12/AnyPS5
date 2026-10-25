@@ -3,9 +3,12 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ParallelProfile.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include <algorithm>
+#include <cstdlib>
+#include <utility>
 
 namespace AgcDriver::DriverDetail::CommitPrep {
 
@@ -74,6 +77,76 @@ std::uint32_t Moved(const Stamps& then, const Stamps& now) {
         }
     }
     return moved;
+}
+
+namespace {
+
+thread_local bool stageAByCommitter = false;
+
+constexpr std::uint8_t PredictScore = 2;
+constexpr std::uint8_t MaxScore = 4;
+
+std::uint64_t mixKey(std::uint64_t hash, std::uint64_t value) {
+    hash ^= value + 0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2);
+    return hash;
+}
+
+}
+
+bool LockSplit() {
+    return !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoCommitLockSplit);
+}
+
+bool VerifyPrep() {
+    static const bool enabled = std::getenv("APS5_VERIFY_PREP") != nullptr;
+    return enabled;
+}
+
+void NoteStageA() {
+    stageAByCommitter = true;
+}
+
+bool TakeStageA() {
+    return std::exchange(stageAByCommitter, false);
+}
+
+std::size_t DrainPredictor::index(std::uint64_t key) {
+    return static_cast<std::size_t>((key * 0x9e3779b97f4a7c15ull) >> 52u) & (Entries - 1u);
+}
+
+DrainPredictor::Plan DrainPredictor::Predict(std::uint64_t key) const {
+    if (key == 0) return Plan::None;
+    const auto& entry = entries[index(key)];
+    if (entry.key != key || entry.score < PredictScore) return Plan::None;
+    return entry.open ? Plan::Open : Plan::Submitted;
+}
+
+void DrainPredictor::Learn(std::uint64_t key, Plan used, double preDrainUs, double lockedWaitUs) {
+    if (key == 0) return;
+    auto& entry = entries[index(key)];
+    const bool waited = lockedWaitUs >= WaitThresholdUs;
+    if (entry.key != key) {
+        if (waited) entry = {key, PredictScore, false};
+        return;
+    }
+    if (waited) {
+        entry.score = std::min<std::uint8_t>(MaxScore, static_cast<std::uint8_t>(entry.score + 1u));
+        if (used == Plan::Submitted) entry.open = true;
+        return;
+    }
+    if (used != Plan::None && preDrainUs >= WaitThresholdUs) return;
+    if (entry.score != 0) --entry.score;
+    if (entry.score == 0) entry.open = false;
+}
+
+std::uint64_t ItemKey(bool draw, std::uint64_t labelAddress, std::span<const Range> writes, std::span<const Range> reads, std::uint64_t site) {
+    std::uint64_t key = mixKey(0x51ed27u, draw ? 1u : 2u);
+    if (site != 0) key = mixKey(key, site);
+    if (site != 0) return key != 0 ? key : 1u;
+    key = mixKey(key, labelAddress);
+    if (!writes.empty()) key = mixKey(mixKey(key, writes.front().first), writes.front().second);
+    if (!reads.empty()) key = mixKey(mixKey(key, reads.front().first), reads.front().second);
+    return key != 0 ? key : 1u;
 }
 
 void SetCommitStamps(const Stamps* stamps) {

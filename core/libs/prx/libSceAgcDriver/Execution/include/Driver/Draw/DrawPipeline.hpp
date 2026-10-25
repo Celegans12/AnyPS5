@@ -63,7 +63,7 @@ public:
     static void FollowEpoch(std::uint64_t token);
     static unsigned Committers();
 
-    void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, Prepare prepare = {}, bool draw = false);
+    void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, Prepare prepare = {}, bool draw = false, std::uint64_t site = 0);
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100);
     void Stop();
     void ReleaseRetired();
@@ -114,6 +114,7 @@ private:
         // The span of `reads` (HeldReads skips an item it misses; APS5_NO_HELD_READ_BOUNDS=1 scans every range).
         Range readBounds{~std::uint64_t{0}, 0};
         bool draw = false;
+        std::uint64_t site = 0;
     };
     DrawPipeline() = default;
     template<typename TRanges, typename TBounds>

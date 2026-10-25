@@ -265,6 +265,7 @@ endforeach()
 
 set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Unimplemented.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/CommandLog.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ComputePipelineCapture.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/DisplayBuffer.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/DisplayFormat.cpp
@@ -2975,6 +2976,20 @@ if(BUILD_TESTING)
         set_tests_properties(agc_driver_lazy_resolved_abi_switch_set PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     set_tests_properties(agc_driver_queued_raw_shader PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_PIPELINED_DRAWS=8" TIMEOUT 30)
+    add_test(NAME agc_driver_commit_lock_split_command_log COMMAND agc_driver_commit_lock_split_tests)
+    set_tests_properties(agc_driver_commit_lock_split_command_log PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_COMMAND_LOG=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 60)
+    foreach(agcTestName IN ITEMS agc_driver_draw_cache_reuse agc_driver_draw_write_ranges agc_driver_pipelined_dma agc_driver_finisher_label_order agc_driver_unimported_label_order)
+        add_test(NAME ${agcTestName}_verify_prep COMMAND ${agcTestName}_tests)
+        set_tests_properties(${agcTestName}_verify_prep PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_DRAW_PIPELINE=1;APS5_PIPELINED_DRAWS=32;APS5_PIPELINE_DISPATCH=1;APS5_VERIFY_PREP=1;APS5_COMMAND_LOG=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" FAIL_REGULAR_EXPRESSION "APS5_VERIFY_PREP:")
+        add_test(NAME ${agcTestName}_no_lock_split COMMAND ${agcTestName}_tests)
+        set_tests_properties(${agcTestName}_no_lock_split PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_DRAW_PIPELINE=1;APS5_PIPELINED_DRAWS=32;APS5_PIPELINE_DISPATCH=1;APS5_NO_COMMIT_LOCK_SPLIT=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+        if(WIN32)
+            set_tests_properties(${agcTestName}_verify_prep ${agcTestName}_no_lock_split PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
+    if(WIN32)
+        set_tests_properties(agc_driver_commit_lock_split_command_log PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     set(agcDrawPipelineTests agc_driver_draw_write_ranges agc_driver_draw_unsupported_buffer_type agc_driver_bda_span_reads agc_driver_copied_writer_copy agc_driver_image_table_reuse agc_driver_depth_storage_reuse agc_driver_staged_clear_sampled_read agc_driver_storage_write_back_overhang agc_driver_write_data_written_ahead agc_driver_gated_dispatch_capture agc_driver_buffer_load_store agc_driver_pipelined_dma agc_driver_pipelined_fill agc_driver_pipelined_predication_read agc_driver_pipelined_predicated_label_order agc_driver_pipelined_metadata_pass agc_driver_draw_cache_reuse agc_driver_draw_cache_relocation agc_driver_draw_data_hit_user_words agc_driver_finisher_label_order agc_driver_same_queue_label_wait agc_driver_unimported_label_order)
     foreach(agcTestName IN LISTS agcDrawPipelineTests)
         add_test(NAME ${agcTestName}_draw_pipeline COMMAND ${agcTestName}_tests)

@@ -13,6 +13,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineJournal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DeferredDestruction.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Execution/include/CommandLog.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FloatFlushProbe.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
@@ -2210,6 +2211,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     check(state->InstanceFunction<PFN_vkCreateDevice>("vkCreateDevice")(selected, &deviceInfo, nullptr, &state->device), "vkCreateDevice");
     state->deviceProc = MemoryStats::TrackDevice(state->device, selected, state->memoryProperties, state->deviceProc,
         state->memoryBudget ? state->InstanceFunction<PFN_vkGetPhysicalDeviceMemoryProperties2>("vkGetPhysicalDeviceMemoryProperties2") : nullptr);
+    state->deviceProc = CommandLog::Wrap(state->device, state->deviceProc);
     // Before the profile (its target carries the result into every recompile and cache key).
     state->fusedFma = fusedFmaProbe(*state, family);
     state->shaderProfile = std::make_unique<const ShaderDeviceProfile>(buildTarget(), deviceInfo, state->properties.limits);
@@ -2591,6 +2593,27 @@ std::uint64_t VulkanDevice::SubmittedEpoch() const {
 
 bool VulkanDevice::WaitRecordedFor(std::uint64_t serial, std::uint64_t timeoutNanos) {
     return state->recorder && state->recorder->WaitSerialFor(serial, timeoutNanos);
+}
+
+VulkanDevice::PreDrained VulkanDevice::PreDrainUnlocked(bool submitOpen) {
+    PreDrained outcome;
+    if (!CanWaitUnlocked() || GuestMemory::GpuMutex().HeldByThisThread()) return outcome;
+    std::uint64_t serial = 0;
+    if (submitOpen) {
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Wait);
+        std::lock_guard lock(GuestMemory::GpuMutex());
+        if (!state->recorder) return outcome;
+        serial = state->recorder->SubmitAndEpoch();
+        outcome.submitted = true;
+    } else {
+        serial = SubmittedEpoch();
+    }
+    if (serial == 0 || WaitRecordedFor(serial, 0)) return outcome;
+    const auto start = std::chrono::steady_clock::now();
+    WaitRecorded(serial);
+    outcome.drained = true;
+    outcome.waitedUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+    return outcome;
 }
 
 void VulkanDevice::ReapRecorded(std::uint64_t serial) {
