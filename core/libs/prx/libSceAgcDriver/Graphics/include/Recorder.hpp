@@ -209,7 +209,7 @@ public:
     VkCommandBuffer PreludeCommands();
     // A pristine copy (APS5_STAGING_DIFF) of a shadow the prelude fills: recorded at the prelude's
     // end, after one transfer barrier for all of them.
-    void PreludePristine(VkBuffer shadow, VkBuffer pristine, VkDeviceSize bytes);
+    void PreludePristine(VkBuffer shadow, VkBuffer pristine, VkDeviceSize bytes, VkDeviceSize offset = 0);
     // The copy-backs a run's deferred barrier records after itself (AfterRun work) while batched
     // staging is on: they record no barriers of their own, and the run records one after all of
     // them. AfterRunWrite notes a guest range one writes and returns true when an earlier one of
@@ -462,8 +462,9 @@ public:
     bool RecordMeshArguments(VkCommandBuffer commands, VkDeviceAddress record, VkDeviceAddress arguments, std::span<const std::uint32_t, 7> rules);
     // APS5_STAGING_DIFF=1 (GuestBufferMemory::RecordCopyBacks): stores into `target` the dwords of
     // `result` that differ from `pristine` (all three device addresses, `dwords` long), with the
-    // stored count added to StagingDiffStoredDwords when `count`. False when the kernel is unavailable.
-    bool RecordStagingDiff(VkCommandBuffer commands, VkDeviceAddress result, VkDeviceAddress pristine, VkDeviceAddress target, std::uint32_t dwords, bool count);
+    // stored count added to StagingDiffStoredDwords when `count`; `keepPristine` stores them into
+    // `pristine` too (it equals `result` afterwards). False when the kernel is unavailable.
+    bool RecordStagingDiff(VkCommandBuffer commands, VkDeviceAddress result, VkDeviceAddress pristine, VkDeviceAddress target, std::uint32_t dwords, bool count, bool keepPristine = false);
     std::uint64_t StagingDiffStoredDwords();
     std::uint64_t SamplesTotal();
     bool DumpSamples(VkDeviceAddress target, std::uint64_t address = 0);
@@ -926,6 +927,7 @@ private:
                 VkBuffer shadow;
                 VkBuffer pristine;
                 VkDeviceSize bytes;
+                VkDeviceSize offset = 0;
             };
             std::vector<Pristine> pristine;
         } prelude;

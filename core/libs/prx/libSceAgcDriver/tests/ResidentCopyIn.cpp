@@ -295,6 +295,46 @@ int RunResidentCopyInTests(const Context& context, Recorder& recorder, bool budg
     work(fx, b, {});
     if (detect) expectWord(fx, word(5, 7), 0xdead0004u, "a new build of an unchanged resident range copied it in");
 
+    // (4b) APS5_STAGING_DIFF: the pristine copy is the entry's and its diff copy-back keeps it equal
+    // to the shadow, so a use that copies nothing in takes no pristine copy either. Shown with an
+    // untracked store into the pristine copy: taken over, the kernel sees the shadow's dword as
+    // changed and stores it over a CPU store the work left alone; refreshed (or with
+    // APS5_NO_RESIDENT_PRISTINE set), the CPU store survives as without residency.
+    if (fx.diff) {
+        const auto entry = ResidentShadows::Find(fx.element, fx.element + fx.elementBytes, false);
+        Require(entry != nullptr && entry->pristine != nullptr, "the resident entry has no pristine copy under APS5_STAGING_DIFF");
+        const auto pristineCase = [&](std::size_t target, bool kept) {
+            const auto savedBefore = counter(stats.pristineSavedBytes);
+            {
+                auto commands = recorder.Commands();
+                fx.fill(commands, entry->pristine->Handle(), target * 4u, 4, 0xdeadbeefu);
+                RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+                recorder.Sync();
+            }
+            reuse(fx, a);
+            recorder.Sync();
+            fx.words[target] = 0x99999999u;
+            work(fx, a, {});
+            if (kept) {
+                expectWord(fx, target, Initial, "a pristine copy that equals the shadow was copied again (the marker went)");
+                if (profile) Require(counter(stats.pristineSavedBytes) > savedBefore, "a skipped pristine copy was not counted");
+            } else {
+                expectWord(fx, target, 0x99999999u, "a refreshed pristine copy lost a CPU store the work left alone");
+            }
+            // The CPU store made during the use: the next use copies its unit (and the pristine part).
+            reuse(fx, a);
+            work(fx, a, {});
+        };
+        pristineCase(word(0, 40), true);
+        RuntimeSwitches::Assign(RuntimeSwitch::NoResidentPristine, true);
+        pristineCase(word(0, 41), false);
+        RuntimeSwitches::Assign(RuntimeSwitch::NoResidentPristine, false);
+        // The first use after the switch cleared copies the whole pristine in again, then it holds.
+        reuse(fx, a);
+        work(fx, a, {});
+        pristineCase(word(0, 42), true);
+    }
+
     // (5) A recorded GPU write by other work into the import (noted, not yet marked): the next
     // use copies in whole, after it.
     {
