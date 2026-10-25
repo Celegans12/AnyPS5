@@ -503,6 +503,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     // among the earlier captures of their (shape key, stage) with relocated runs and patched data.
     const bool relocatedHits = registerKey && stageEntries && shapeKey != 0 && !drawParameters.indirect && drawDataHits() && graphics.stages.path == Graphics::ShaderPath::Vertex && !graphics.stages.mesh && !graphics.stages.tessellation && !verifyDrawEntries() && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoRelocatedDataHits);
     std::vector<bool> relocated(programs.size(), false);
+    std::vector<std::uint8_t> relocatedLearn(programs.size(), 1u);
     lookupDraw(submission, localDevice, graphics, pixel, programs, roles, vertexInfos, stageEntries, registerKey, profile, drawKey, entry, matched, matchedRegions, drawHit, verifyHit, phaseTiming, phaseMs, dataEntry, dataCandidates, stageData);
     for (std::size_t i = 0; i < matched.size(); ++i) {
         if (matched[i] == nullptr || matched[i]->shaderDataPatches.empty()) continue;
@@ -614,7 +615,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         const auto& kept = *hit.variant->compiled;
         const bool sameBindings = fresh.bindings.size() == kept.bindings.size() && std::equal(fresh.bindings.begin(), fresh.bindings.end(), kept.bindings.begin(), [](const auto& a, const auto& b) { return a.kind == b.kind && a.role == b.role && a.binding == b.binding && a.count == b.count && a.guestDescriptor == b.guestDescriptor; });
         const bool sameVertex = vertexInfos[i].has_value() == (hit.variant->vertexInfo != nullptr) && (!vertexInfos[i] || sameVertexInfo(*vertexInfos[i], *hit.variant->vertexInfo));
-        const char* what = flatten(runs, words) != flatten(hit.variant->runs, hit.variant->words) ? "captured words" : !sameVertex ? "vertex stage info" : fresh.Identity() != kept.Identity() ? "module" : !sameBindings ? "bindings" : fresh.pushConstants != kept.pushConstants ? "push constants" : !SameCompilation(fresh, kept, programs[i].hiddenUserWords) ? "compilation" : nullptr;
+        const bool sameAttributes = fresh.vertexAttributes.size() == kept.vertexAttributes.size() && std::equal(fresh.vertexAttributes.begin(), fresh.vertexAttributes.end(), kept.vertexAttributes.begin(), [](const auto& a, const auto& b) { return a.location == b.location && a.components == b.components && a.resource.fields == b.resource.fields && a.fetchIndex == b.fetchIndex && a.formatComponents == b.formatComponents; });
+        const char* what = flatten(runs, words) != flatten(hit.variant->runs, hit.variant->words) ? "captured words" : !sameVertex ? "vertex stage info" : fresh.Identity() != kept.Identity() ? "module" : !sameBindings ? "bindings" : fresh.pushConstants != kept.pushConstants ? "push constants" : !sameAttributes ? "vertex attributes" : fresh.shaderDataUserWords != kept.shaderDataUserWords || fresh.userDataRegisterReads != kept.userDataRegisterReads ? "shader data words" : !SameCompilation(fresh, kept, programs[i].hiddenUserWords) ? "compilation" : nullptr;
         noteRelocatedVerify(what != nullptr);
         if (what == nullptr) return;
         static constexpr std::array<const char*, 4> kinds{"R0 same", "R1 moved", "R2 moved+data", "R4 nested"};
@@ -652,7 +654,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 std::optional<RelocatedHit> relocatedHit;
                 if (relocatedHits && candidate == dataCandidates[i].end()) {
                     phaseTiming.Phase(DrawRowVectors);
-                    relocatedHit = relocatedDrawStage({shapeKey, i, pushCursorBytes, submission.queue, &program, &vertexInfos[i], decodeReads[i], exports});
+                    bool learn = true;
+                    relocatedHit = relocatedDrawStage({shapeKey, i, pushCursorBytes, submission.queue, &program, &vertexInfos[i], decodeReads[i], exports, &learn});
+                    relocatedLearn[i] = learn ? 1u : 0u;
                     phaseTiming.Phase(DrawRowKeyLookupValidate);
                 }
                 const bool verifyRelocated = relocatedHit.has_value() && takeRelocatedVerify();
@@ -751,7 +755,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     if (relocatedHits) {
         for (std::size_t i = 0; i < programs.size(); ++i) {
             const auto& capture = stageCaptures[i];
-            if (roles[i] == Role::GeometryBack || reused[i] || capture.compiled == nullptr || capture.capture == nullptr || !CacheableResult(*capture.compiled)) continue;
+            if (roles[i] == Role::GeometryBack || reused[i] || relocatedLearn[i] == 0u || capture.compiled == nullptr || capture.capture == nullptr || !CacheableResult(*capture.compiled)) continue;
             learnRelocatedStage(shapeKey, i, programs[i], capture, vertexInfos[i], decodeReads[i], previousExports(i));
         }
         maybeReportRelocatedHits(profile);

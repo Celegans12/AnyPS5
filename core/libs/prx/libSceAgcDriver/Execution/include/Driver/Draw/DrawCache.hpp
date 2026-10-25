@@ -14,6 +14,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 #include "prx/libc/include/general/AtomicSharedPtr.hpp"
@@ -188,8 +189,9 @@ struct DrawRelocationCounters {
 // base user word (moves with it), from a pointer word the walk loaded and used only as a read base
 // (moves with that word's new value), from a vertex decoder read (moves with the fresh decode), or
 // stays at its address. A reuse gathers the runs at their new places, finds a capture whose
-// non-data words hash alike, and validates every non-data word exactly there (validateVariant);
-// data words and moved user words reach the reused stage as patches.
+// non-data words hash alike and whose fixed user words are equal, and validates every non-data word
+// exactly there (validateVariant); data words, moved user words, user words the shader reads only
+// through its shader data and moved vertex buffers reach the reused stage as patches.
 struct RelocatedRun {
     enum class Base : std::uint8_t { Fixed, User, Pointer, Decoder };
     std::uint64_t address = 0;
@@ -198,6 +200,7 @@ struct RelocatedRun {
     std::uint32_t count = 0;
     std::uint32_t source = 0;
     Base base = Base::Fixed;
+    bool operator==(const RelocatedRun&) const = default;
 };
 
 struct RelocatedTemplate {
@@ -211,34 +214,57 @@ struct RelocatedTemplate {
     std::vector<std::uint32_t> userData;
     std::vector<std::uint32_t> decodeBytes;
     std::vector<std::uint32_t> exports;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> vertexWords;
     std::shared_ptr<const ShaderSnapshot> shader;
+    std::shared_ptr<const ShaderSnapshot> tail;
+    std::size_t codeOffset = 0;
     std::uint64_t movable = 0;
     std::uint64_t baseWords = 0;
     std::uint64_t valueWords = 0;
     std::uint64_t fetchWords = 0;
+    std::uint64_t fixedWords = 0;
+    std::uint64_t patchedWords = 0;
+    std::uint64_t registerWords = 0;
     std::uint32_t hidden = 0;
     std::uint32_t userDataBase = 0;
     std::uint32_t firstUserSgpr = 0;
     bool vertex = false;
+    bool vertexMovable = false;
     bool fragment = false;
     bool tracked = false;
     std::uint64_t plan = 0;
     std::uint64_t index = 0;
+    std::uint64_t identity = 0;
+    std::size_t bytes = 0;
+    std::size_t compiledBytes = 0;
 };
 
 struct RelocatedPool {
-    std::vector<std::shared_ptr<const RelocatedTemplate>> templates;
-    std::vector<std::uint64_t> used;
+    struct Kept {
+        std::shared_ptr<const RelocatedTemplate> held;
+        std::uint64_t used = 0;
+    };
+    struct Plan {
+        std::uint64_t plan = 0;
+        std::shared_ptr<const RelocatedTemplate> exemplar;
+        std::uint64_t used = 0;
+        std::size_t templates = 0;
+    };
+    std::vector<Plan> plans;
+    std::unordered_map<std::uint64_t, std::vector<Kept>> byIndex;
+    std::size_t templates = 0;
     std::list<std::uint64_t>::iterator order;
 };
 
 enum class RelocatedClass : std::size_t { Same, Moved, Data, Nested, Count };
-enum class RelocatedFallback : std::size_t { NoTemplate, Layout, ValueWord, PinnedBase, Unreadable, NoIndex, PointerBits, Decode, Differing, Gate, Count };
+enum class RelocatedFallback : std::size_t { NoTemplate, DecodeReads, Unreadable, NoIndex, ValueWord, Layout, PinnedBase, Decode, PointerBits, Differing, Gate, Count };
+enum class RelocatedValueWord : std::size_t { AsValue, Hidden, Base, Register, Other, Count };
 
 struct RelocatedCounters {
-    std::uint64_t lookups = 0, learned = 0, learnRefused = 0, replaced = 0, evicted = 0, validations = 0, synced = 0, verified = 0, verifyMismatches = 0, nestedRuns = 0, nestedUntracked = 0;
+    std::uint64_t lookups = 0, learned = 0, learnRefused = 0, learnDeferred = 0, replaced = 0, evicted = 0, validations = 0, synced = 0, verified = 0, verifyMismatches = 0, nestedRuns = 0, nestedUntracked = 0, vertexHits = 0, patchedHits = 0, vertexMovable = 0;
     std::array<std::uint64_t, static_cast<std::size_t>(RelocatedClass::Count)> hits{};
     std::array<std::uint64_t, static_cast<std::size_t>(RelocatedFallback::Count)> fallbacks{};
+    std::array<std::uint64_t, static_cast<std::size_t>(RelocatedValueWord::Count)> valueWords{};
     double hitUs = 0, missUs = 0, learnUs = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
@@ -252,12 +278,15 @@ struct RelocatedLookup {
     const std::optional<ShaderRecompiler::ShaderVertexStageInfo>* vertexInfo = nullptr;
     std::span<const Graphics::DecodeRead> decodeReads;
     const std::vector<std::uint32_t>* exports = nullptr;
+    bool* learn = nullptr;
 };
 
 struct RelocatedHit {
     std::shared_ptr<DispatchVariant> variant;
     std::vector<ShaderRecompiler::MemoryRegion> regions;
     RelocatedClass kind = RelocatedClass::Same;
+    bool vertexMoved = false;
+    bool patched = false;
 };
 
 bool DecodeProgramsCurrent(const DrawDecode& decode, const ShaderRegistry& registry);

@@ -66,6 +66,8 @@ enum class RuntimeSwitch : std::size_t {
     PipelineDispatch,
     PipelineDispatchMisses,
     NoRelocatedDataHits,
+    NoRelocatedVertexBuffers,
+    NoRelocatedRegisterWords,
     Count,
 };
 

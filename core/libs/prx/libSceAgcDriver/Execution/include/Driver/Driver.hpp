@@ -475,6 +475,9 @@ private:
     std::unordered_map<std::uint64_t, RelocatedPool> relocatedPools;
     std::list<std::uint64_t> relocatedOrder;
     std::size_t relocatedTemplates = 0;
+    std::size_t relocatedBytes = 0;
+    std::size_t relocatedCompiledBytes = 0;
+    std::vector<std::pair<std::uint64_t, std::uint32_t>> relocatedSightings;
     std::uint64_t relocatedClock = 0;
     RelocatedCounters relocatedCounters;
     std::chrono::steady_clock::time_point relocatedVerifyWindow = std::chrono::steady_clock::now();
