@@ -3,6 +3,7 @@
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/PreciseWait.hpp"
 #include <algorithm>
+#include <atomic>
 #include <thread>
 #include <chrono>
 #include <cstdio>
@@ -16,7 +17,18 @@ extern "C" void* APS5_VABI mmap_nid_postfix(void* address, std::size_t length, i
 
 namespace AgcDriver::Pm4 {
 
+namespace {
+
+std::atomic<std::uint64_t> gdsPlacement{0};
+
+}
+
+void UseGdsAt(std::uint64_t address) {
+    gdsPlacement.store(address, std::memory_order_release);
+}
+
 std::uint64_t GdsAddress() {
+    if (const auto placed = gdsPlacement.load(std::memory_order_acquire); placed != 0) return placed;
     static const std::uint64_t address = [] {
         constexpr int ReadWrite = 0x3;
         constexpr int PrivateAnonymous = 0x1002;
