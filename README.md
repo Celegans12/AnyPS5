@@ -95,6 +95,7 @@ APS5_NO_DRAW_AHEAD=1 APS5_DEFER_REFRESH_FLUSH=1 APS5_PIPELINE_DISPATCH=1
   - `APS5_FLUSH_WAIT_WHOLE_RANGE=1`: a storage flush waits for writers over its whole range again instead of only the image layers it stores (SleglJan's #8887); `APS5_NO_REFRESH_LOOKUP_CACHE=1`: texture refreshes walk the pending registry and look up host imports in full again (AlxcBTW's #7514).
   - `APS5_NO_READ_ONLY_LEASE_SKIP=1`: an address-table build whose shaders never store through pointers counts as a writer of its leased memory again, so texture refreshes wait for it (#10382).
   - `APS5_NO_OWNED_PROOFS=1`: owned texture proofs (`APS5_VERIFY_OWNED_PROOFS=<n>` re-runs the old proof for the first n armed proofs every 10 s and reports any disagreement). Windows only; elsewhere the old proof runs.
+  - `APS5_NO_HIT_ITEM_HTILE_NOTE=1`: a depth clear recorded as a cached dispatch item (`APS5_PIPELINE_DISPATCH`) no longer notes its HTILE mask, so the next depth draw waits for the whole GPU before its store-back again.
   - `APS5_NO_OVERLAP_RANGE_CHECK=1`: overlapped dispatches no longer need disjoint access ranges (the old rule).
   - `APS5_NO_DISPATCH_OVERLAP=1`, `APS5_NO_BATCHED_STAGING=1`, `APS5_NO_SPARSE_PAGE_STATES=1`.
   - Every local change has an off switch (`APS5_NO_...`), named in its commit message.
