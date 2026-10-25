@@ -514,6 +514,13 @@ struct Replay {
         case FrameCallKind::Suspend:
             AgcDriverSuspendPoint_nid_postfix();
             return;
+        case FrameCallKind::QueueStates: {
+            std::vector<std::uint32_t> words;
+            words.reserve(call.values.size());
+            for (const auto value : call.values) words.push_back(static_cast<std::uint32_t>(value));
+            AgcDriverLoadQueueStates_nid_postfix(words);
+            return;
+        }
         case FrameCallKind::Memory: {
             std::lock_guard lock(memoryMutex);
             const auto found = groups.find(call.values.at(0));

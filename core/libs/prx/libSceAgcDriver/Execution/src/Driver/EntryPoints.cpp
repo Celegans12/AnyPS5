@@ -145,6 +145,14 @@ extern "C" bool AgcDriverFailed_nid_postfix() {
     return AgcDriver::DriverDetail::Driver::Get().Failed();
 }
 
+extern "C" std::vector<std::uint32_t> AgcDriverSaveQueueStates_nid_postfix() {
+    return AgcDriver::DriverDetail::Driver::Get().SaveQueueStates();
+}
+
+extern "C" void AgcDriverLoadQueueStates_nid_postfix(std::span<const std::uint32_t> words) {
+    AgcDriver::DriverDetail::Driver::Get().LoadQueueStates(words);
+}
+
 extern "C" bool AgcDriverQuiescent_nid_postfix() {
     return AgcDriver::DriverDetail::Driver::Get().Quiescent();
 }
