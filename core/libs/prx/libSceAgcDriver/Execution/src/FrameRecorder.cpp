@@ -685,6 +685,10 @@ void FrameRecorder::start() {
     for (const auto& call : reservations) {
         if (open.contains(call.values.back())) writer->WriteCall(call);
     }
+    auto queueStates = make(FrameCallKind::QueueStates);
+    queueStates.ordinal = ++ordinal;
+    for (const auto word : driver.SaveQueueStates()) queueStates.values.push_back(word);
+    writer->WriteCall(queueStates);
     auto begin = make(FrameCallKind::FrameStart);
     begin.ordinal = ++ordinal;
     std::tie(begin.accepted, begin.completed) = driver.SerialProgress();

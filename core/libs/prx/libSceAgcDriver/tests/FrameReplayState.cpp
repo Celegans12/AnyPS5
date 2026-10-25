@@ -259,6 +259,13 @@ void testPrologueHeader(const std::filesystem::path& directory) {
     restoreRewritten(reader, rewritten, Skipped{});
     check(std::memcmp(shader, later.data(), later.size()) == 0, "the snapshot was not restored over the prologue header image");
     check(reader.Header().find("\"prologue_rewrites\":1,") != std::string::npos, "the capture header does not count the prologue rewrite");
+    const auto states = std::find_if(reader.Calls().begin(), reader.Calls().end(), [](const FrameCall& call) { return call.kind == FrameCallKind::QueueStates; });
+    const auto start = std::find_if(reader.Calls().begin(), reader.Calls().end(), [](const FrameCall& call) { return call.kind == FrameCallKind::FrameStart; });
+    check(states != reader.Calls().end() && states < start, "the capture does not record the queue states before the first frame");
+    std::vector<std::uint32_t> words;
+    for (const auto value : states->values) words.push_back(static_cast<std::uint32_t>(value));
+    AgcDriverLoadQueueStates_nid_postfix(words);
+    check(AgcDriverSaveQueueStates_nid_postfix() == words, "loaded queue states do not save back unchanged");
 }
 
 }

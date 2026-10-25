@@ -281,6 +281,109 @@ std::vector<AwaitedWait> Driver::AwaitedWaits() {
     return result;
 }
 
+namespace {
+
+void putRegisters(std::vector<std::uint32_t>& words, const Registers& registers) {
+    const auto at = words.size();
+    words.push_back(0);
+    registers.ForEach([&](std::uint32_t offset, std::uint32_t value) {
+        words.push_back(offset);
+        words.push_back(value);
+        ++words[at];
+    });
+}
+
+void put64(std::vector<std::uint32_t>& words, std::uint64_t value) {
+    words.push_back(static_cast<std::uint32_t>(value));
+    words.push_back(static_cast<std::uint32_t>(value >> 32u));
+}
+
+class QueueStateReader {
+public:
+    explicit QueueStateReader(std::span<const std::uint32_t> words) : words(words) {}
+
+    std::uint32_t Take() {
+        require(at < words.size(), "AGC driver: queue state record ends early");
+        return words[at++];
+    }
+
+    std::uint64_t Take64() {
+        const std::uint64_t low = Take();
+        return low | (static_cast<std::uint64_t>(Take()) << 32u);
+    }
+
+    Registers TakeRegisters() {
+        Registers registers;
+        for (auto count = Take(); count != 0; --count) {
+            const auto offset = Take();
+            registers.insert_or_assign(offset, Take());
+        }
+        return registers;
+    }
+
+    bool Done() const { return at == words.size(); }
+
+private:
+    std::span<const std::uint32_t> words;
+    std::size_t at = 0;
+};
+
+}
+
+std::vector<std::uint32_t> Driver::SaveQueueStates() {
+    std::lock_guard lock(mutex);
+    std::vector<std::uint32_t> words{resetGraphics ? 1u : 0u, static_cast<std::uint32_t>(queues.size())};
+    for (const auto& [id, state] : queues) {
+        words.push_back(id);
+        putRegisters(words, state.shader);
+        putRegisters(words, state.context);
+        putRegisters(words, state.userConfig);
+        words.push_back(state.savedContext.has_value() ? 1u : 0u);
+        if (state.savedContext) putRegisters(words, *state.savedContext);
+        words.push_back(static_cast<std::uint32_t>(state.constantRam.size()));
+        words.insert(words.end(), state.constantRam.begin(), state.constantRam.end());
+        put64(words, state.indexBase);
+        put64(words, state.drawIndirectBase);
+        put64(words, state.dispatchIndirectBase);
+        words.push_back(state.indexBufferSize);
+        words.push_back(state.indexType);
+        words.push_back(state.instanceCount);
+        put64(words, state.predication.address);
+        words.push_back(state.predication.operation);
+        words.push_back(state.predication.executeWhenSet ? 1u : 0u);
+    }
+    return words;
+}
+
+void Driver::LoadQueueStates(std::span<const std::uint32_t> words) {
+    QueueStateReader reader(words);
+    const bool reset = reader.Take() != 0;
+    std::map<std::uint32_t, QueueState> loaded;
+    for (auto count = reader.Take(); count != 0; --count) {
+        auto& state = loaded[reader.Take()];
+        state.shader = reader.TakeRegisters();
+        state.context = reader.TakeRegisters();
+        state.userConfig = reader.TakeRegisters();
+        if (reader.Take() != 0) state.savedContext = reader.TakeRegisters();
+        state.constantRam.resize(reader.Take());
+        for (auto& word : state.constantRam) word = reader.Take();
+        state.indexBase = reader.Take64();
+        state.drawIndirectBase = reader.Take64();
+        state.dispatchIndirectBase = reader.Take64();
+        state.indexBufferSize = reader.Take();
+        state.indexType = reader.Take();
+        state.instanceCount = reader.Take();
+        state.predication.address = reader.Take64();
+        state.predication.operation = reader.Take();
+        state.predication.executeWhenSet = reader.Take() != 0;
+    }
+    require(reader.Done(), "AGC driver: queue state record has trailing words");
+    std::lock_guard lock(mutex);
+    require(accepted == completed, "AGC driver: queue states can be loaded only while no submission is pending");
+    queues = std::move(loaded);
+    resetGraphics = reset;
+}
+
 bool Driver::Quiescent() {
     return runningWorkers.load(std::memory_order_acquire) == 0 && !DrawPipeline::Queue0().Busy() && !completionsPending();
 }

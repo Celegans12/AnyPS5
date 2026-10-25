@@ -82,6 +82,8 @@ public:
     std::uint64_t FlipSubmissions() const;
     std::vector<AwaitedWait> AwaitedWaits();
     bool Quiescent();
+    std::vector<std::uint32_t> SaveQueueStates();
+    void LoadQueueStates(std::span<const std::uint32_t> words);
     bool WaitIdleFor(std::chrono::milliseconds timeout);
     void RegisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOutput>& output);
     void UnregisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOutput>& output);
