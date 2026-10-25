@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/DeviceAccess.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Packets/PacketHistory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchCache.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/CommitPrep.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawCache.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRegisterKey.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawAhead.hpp"
@@ -61,6 +62,7 @@ class ShaderRefusal;
 class Driver {
 public:
     static Driver& Get();
+    static CommitPrep::PreDrain PreDrainCommit(bool submitOpen);
     // APS5_MEM_STATS (see MemoryStats.hpp): registered shaders, the prepare pool and the dispatch/draw caches.
     static void AppendMemoryStats(std::string& line);
     static std::uint64_t GpuMapImportThreads();
