@@ -298,6 +298,7 @@ public:
     static constexpr std::uint64_t SmallStoreBytes = 64 * 1024;
     static std::size_t StoreSmallPending(const char* reason);
     static void StoreReadbackBeforeLabel(const char* reason);
+    static std::vector<std::pair<std::uint64_t, std::size_t>> ReadbackBeforeLabelRanges();
     static bool AnyPending();
     static void FlushDumpSelected(const char* reason);
     static bool StoreAtFlipRequested(const char* value);

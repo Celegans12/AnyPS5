@@ -169,6 +169,8 @@ void preDrainCoversLaterWork(AgcDriver::VulkanDevice& device) {
     check(block.Word(8192) == second[0] && block.Word(8192 + 12) == second[3], "the inline drain after a pre-drain missed work recorded between them");
     const auto idle = device.PreDrainUnlocked(false);
     check(!idle.drained, "a pre-drain with nothing in flight waited");
+    const auto readback = device.PreWaitStorageWriters({}, true);
+    check(!readback.drained && !readback.submitted && !AgcDriver::GuestMemory::GpuMutex().HeldByThisThread(), "a label readback pre-wait without pending storage results waited or submitted");
 }
 
 void commandLog(AgcDriver::VulkanDevice& device) {
