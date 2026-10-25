@@ -68,6 +68,8 @@ enum class RuntimeSwitch : std::size_t {
     NoOwnedProofs,
     NoOwnedPrivate,
     NoHitItemHtileNote,
+    NoGpuSourcedDrawBuffers,
+    NoImportSourcedCopyIn,
     Count,
 };
 

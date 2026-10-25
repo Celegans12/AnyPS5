@@ -160,6 +160,25 @@ std::uint64_t MarkPossiblyWritten(std::uint64_t address, std::size_t bytes);
 std::uint64_t StoreOwnBytes(std::uint64_t address, std::size_t bytes, const std::function<void()>& store);
 std::uint64_t StoreOwnBytes(std::uint64_t address, std::span<const std::byte> source);
 bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
+// Own GPU write marks (GPU-sourced draw buffers, APS5_NO_GPU_SOURCED_DRAW_BUFFERS): every range of
+// `marks` is marked as MarkPossiblyWritten does (its generation into `generations`), under the one
+// tracker hold that first answers each check: `clean` when nothing stored over its range since its
+// `since` (StoredOver after a fresh collect of its pages, so a CPU store not collected yet counts;
+// for an `owned` range, armed with ArmOwnedBlocks, whose CPU stores its words show, no tracker
+// stamp or untracked hint newer, as OwnedProofHolds), so no store can land between the answer and
+// the marks unseen. Returns the generation after.
+struct OwnWriteCheck {
+    std::uint64_t address;
+    std::size_t bytes;
+    std::uint64_t since;
+    bool owned = false;
+    bool clean = false;
+};
+std::uint64_t MarkOwnWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> marks, std::span<std::uint64_t> generations, std::span<OwnWriteCheck> checks);
+// Whether a CPU store collected after `generation` (a collect of any kind: the per-page CPU stamps,
+// not the driver's MarkWritten stamps) touched a page of the range. True outside the watched arena,
+// over a host region or for a generation of 0. The caller collects the range first.
+bool CpuStoredSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
 bool StoredAllSince_nid_no_patch(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
 // Collect epoch: within one epoch a range already collected is not walked again, CollectWrites
 // returns the current generation instead. A guest write landing between two collects of the same

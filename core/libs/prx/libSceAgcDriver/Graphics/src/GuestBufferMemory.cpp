@@ -55,6 +55,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 
 namespace AgcDriver::Graphics {
 
@@ -5429,6 +5430,316 @@ void GuestBufferMemory::copyRegion(Region& region, bool addressable) {
     }
 }
 
+namespace {
+
+struct GpuSourceEntry {
+    std::uint64_t end;
+    std::uint64_t regionBegin;
+    const Buffer* key;
+    std::weak_ptr<Buffer> buffer;
+    std::uint64_t since;
+    std::uint64_t after;
+    std::uint64_t registry;
+    int lane;
+    std::vector<std::uint64_t> words;
+    std::shared_ptr<std::atomic<std::uint8_t>> feedback;
+};
+
+struct GpuSourceRegistry {
+    AgcDriver::Mutex mutex;
+    std::map<std::uint64_t, GpuSourceEntry> entries;
+    std::unordered_map<const Buffer*, std::uint64_t> byBuffer;
+    std::unordered_map<const Buffer*, std::pair<std::weak_ptr<Buffer>, int>> borrowed;
+};
+
+GpuSourceRegistry& GpuSources() {
+    static auto* registry = new GpuSourceRegistry;
+    return *registry;
+}
+
+constexpr std::size_t GpuSourceEntryLimit = 16384;
+constexpr std::size_t GpuSourceBorrowLimit = 16384;
+constexpr std::size_t GpuSourceMissCount = static_cast<std::size_t>(GuestBufferMemory::GpuSourceMiss::Count);
+
+struct GpuSourceStats {
+    std::atomic<std::uint64_t> drawGpu{0}, drawGpuBytes{0}, drawCopied{0}, drawCopiedBytes{0};
+    std::array<std::atomic<std::uint64_t>, GpuSourceMissCount> drawMisses{};
+    std::atomic<std::uint64_t> copyInSourced{0};
+    std::atomic<std::uint64_t> copyInGpu{0}, copyInGpuBytes{0}, copyInCpu{0}, copyInCpuBytes{0};
+    std::array<std::atomic<std::uint64_t>, GpuSourceMissCount> copyInMisses{};
+    std::atomic<std::uint64_t> registered{0}, refusedStored{0}, refusedPending{0}, crossLaneOrders{0}, backingOff{0};
+    std::array<std::atomic<std::uint64_t>, 2> armed{};
+    std::atomic<std::uint64_t> verified{0}, verifyDiffering{0};
+    std::atomic<std::int64_t> lastReport{0};
+    std::atomic<std::int64_t> verifyWindow{0};
+    std::atomic<std::uint64_t> verifyTurns{0};
+};
+
+GpuSourceStats& SourceStats() {
+    static GpuSourceStats stats;
+    return stats;
+}
+
+bool GpuSourceProfiled() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return profile;
+}
+
+std::int64_t GpuSourceNowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+void forgetGpuSourceLocked(GpuSourceRegistry& registry, const Buffer* buffer) {
+    const auto found = registry.byBuffer.find(buffer);
+    if (found == registry.byBuffer.end()) return;
+    const auto entry = registry.entries.find(found->second);
+    if (entry != registry.entries.end() && entry->second.key == buffer) registry.entries.erase(entry);
+    registry.byBuffer.erase(found);
+}
+
+void registerGpuSource(std::uint64_t begin, std::uint64_t end, const std::shared_ptr<Buffer>& buffer, std::uint64_t since, std::uint64_t after, std::uint64_t registryGeneration, int lane, std::vector<std::uint64_t> words, std::shared_ptr<std::atomic<std::uint8_t>> feedback) {
+    auto& registry = GpuSources();
+    std::lock_guard lock(registry.mutex);
+    forgetGpuSourceLocked(registry, buffer.get());
+    auto it = registry.entries.lower_bound(begin);
+    if (it != registry.entries.begin()) {
+        const auto previous = std::prev(it);
+        if (previous->second.end > begin) it = previous;
+    }
+    while (it != registry.entries.end() && it->first < end) {
+        registry.byBuffer.erase(it->second.key);
+        it = registry.entries.erase(it);
+    }
+    if (registry.entries.size() >= GpuSourceEntryLimit) {
+        for (auto entry = registry.entries.begin(); entry != registry.entries.end();) {
+            if (!entry->second.buffer.expired()) {
+                ++entry;
+                continue;
+            }
+            registry.byBuffer.erase(entry->second.key);
+            entry = registry.entries.erase(entry);
+        }
+        if (registry.entries.size() >= GpuSourceEntryLimit) {
+            registry.byBuffer.erase(registry.entries.begin()->second.key);
+            registry.entries.erase(registry.entries.begin());
+        }
+    }
+    registry.entries.emplace(begin, GpuSourceEntry{end, begin, buffer.get(), buffer, since, after, registryGeneration, lane, std::move(words), std::move(feedback)});
+    registry.byBuffer[buffer.get()] = begin;
+}
+
+void forgetGpuSource(const Buffer* buffer) {
+    auto& registry = GpuSources();
+    std::lock_guard lock(registry.mutex);
+    forgetGpuSourceLocked(registry, buffer);
+}
+
+std::optional<int> gpuSourceCopyIn(const Buffer* buffer) {
+    auto& registry = GpuSources();
+    std::lock_guard lock(registry.mutex);
+    forgetGpuSourceLocked(registry, buffer);
+    const auto found = registry.borrowed.find(buffer);
+    if (found == registry.borrowed.end()) return std::nullopt;
+    const auto [weak, lane] = found->second;
+    registry.borrowed.erase(found);
+    if (weak.expired()) return std::nullopt;
+    return lane;
+}
+
+void countCopyIn(bool gpu, std::size_t bytes, GuestBufferMemory::GpuSourceMiss miss) {
+    auto& stats = SourceStats();
+    if (gpu) stats.copyInSourced.fetch_add(1, std::memory_order_relaxed);
+    if (!GpuSourceProfiled()) return;
+    if (gpu) {
+        stats.copyInGpu.fetch_add(1, std::memory_order_relaxed);
+        stats.copyInGpuBytes.fetch_add(bytes, std::memory_order_relaxed);
+    } else {
+        stats.copyInCpu.fetch_add(1, std::memory_order_relaxed);
+        stats.copyInCpuBytes.fetch_add(bytes, std::memory_order_relaxed);
+        stats.copyInMisses[static_cast<std::size_t>(miss)].fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+}
+
+bool GuestBufferMemory::GpuSourcedDrawBuffers() {
+    static const bool capture = std::getenv("APS5_CAPTURE_INPUTS") != nullptr;
+    return !capture && !RuntimeSwitches::Set(RuntimeSwitch::NoGpuSourcedDrawBuffers);
+}
+
+bool GuestBufferMemory::ImportSourcedCopyIn() {
+    static const bool capture = std::getenv("APS5_CAPTURE_GPU_COPIES") != nullptr;
+    return !capture && !RuntimeSwitches::Set(RuntimeSwitch::NoImportSourcedCopyIn);
+}
+
+const char* GuestBufferMemory::GpuSourceMissName(GpuSourceMiss miss) {
+    switch (miss) {
+    case GpuSourceMiss::None: return "none";
+    case GpuSourceMiss::NoSource: return "no source";
+    case GpuSourceMiss::Released: return "released";
+    case GpuSourceMiss::Pending: return "writer pending";
+    case GpuSourceMiss::Lane: return "other lane";
+    case GpuSourceMiss::Align: return "unaligned";
+    case GpuSourceMiss::Registry: return "registry";
+    case GpuSourceMiss::Stored: return "stored since";
+    case GpuSourceMiss::Cpu: return "cpu store";
+    case GpuSourceMiss::Count: break;
+    }
+    return "?";
+}
+
+std::uint64_t GuestBufferMemory::GpuSourcedCopyIns() {
+    return SourceStats().copyInSourced.load(std::memory_order_relaxed);
+}
+
+std::array<std::uint64_t, 2> GuestBufferMemory::GpuSourceVerifyCounts() {
+    auto& stats = SourceStats();
+    return {stats.verified.load(std::memory_order_relaxed), stats.verifyDiffering.load(std::memory_order_relaxed)};
+}
+
+std::size_t GuestBufferMemory::GpuSourceEntries() {
+    auto& registry = GpuSources();
+    std::lock_guard lock(registry.mutex);
+    return registry.entries.size();
+}
+
+std::optional<GuestBufferMemory::GpuSource> GuestBufferMemory::FindGpuSource(std::uint64_t address, std::size_t bytes, VkDeviceSize alignment, GpuSourceMiss& miss) {
+    miss = GpuSourceMiss::NoSource;
+    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return std::nullopt;
+    auto& registry = GpuSources();
+    GpuSourceEntry entry{};
+    {
+        std::lock_guard lock(registry.mutex);
+        if (registry.entries.empty()) return std::nullopt;
+        auto found = registry.entries.upper_bound(address);
+        if (found == registry.entries.begin()) return std::nullopt;
+        --found;
+        if (found->first > address || found->second.end < address + bytes) return std::nullopt;
+        if (found->second.buffer.expired()) {
+            miss = GpuSourceMiss::Released;
+            registry.byBuffer.erase(found->second.key);
+            registry.entries.erase(found);
+            return std::nullopt;
+        }
+        entry = found->second;
+    }
+    auto buffer = entry.buffer.lock();
+    if (buffer == nullptr) {
+        miss = GpuSourceMiss::Released;
+        return std::nullopt;
+    }
+    const auto* recorder = Recorder::Active();
+    if (recorder == nullptr || recorder->PendingWriteOverlaps(entry.regionBegin, static_cast<std::size_t>(entry.end - entry.regionBegin))) {
+        miss = GpuSourceMiss::Pending;
+        return std::nullopt;
+    }
+    if (entry.lane != Recorder::ThreadLane()) {
+        miss = GpuSourceMiss::Lane;
+        return std::nullopt;
+    }
+    const auto offset = address - entry.regionBegin;
+    if (alignment > 1 && offset % alignment != 0) {
+        miss = GpuSourceMiss::Align;
+        return std::nullopt;
+    }
+    if (entry.registry != GuestAllocations::GuestAllocationsGeneration_nid_postfix()) {
+        miss = GpuSourceMiss::Registry;
+        return std::nullopt;
+    }
+    if (!entry.words.empty()) {
+        const auto regionBytes = static_cast<std::size_t>(entry.end - entry.regionBegin);
+        if (!GuestMemory::OwnedWordsHold(entry.regionBegin, regionBytes, entry.words)) {
+            miss = GpuSourceMiss::Cpu;
+            if (entry.feedback != nullptr) entry.feedback->fetch_or(2, std::memory_order_relaxed);
+            return std::nullopt;
+        }
+        if (!GuestMemory::OwnedProofHolds(entry.regionBegin, regionBytes, entry.words, entry.after)) {
+            miss = GpuSourceMiss::Stored;
+            return std::nullopt;
+        }
+    } else {
+        GuestMemory::CollectWrites(address, bytes);
+        if (!GuestMemory::UnchangedSince(address, bytes, entry.after)) {
+            miss = GpuSourceMiss::Stored;
+            return std::nullopt;
+        }
+        if (GuestMemory::CpuStoredSince(address, bytes, entry.since)) {
+            miss = GpuSourceMiss::Cpu;
+            if (entry.feedback != nullptr) entry.feedback->fetch_or(2, std::memory_order_relaxed);
+            return std::nullopt;
+        }
+    }
+    if (entry.feedback != nullptr) entry.feedback->fetch_or(1, std::memory_order_relaxed);
+    {
+        std::lock_guard lock(registry.mutex);
+        if (registry.borrowed.size() >= GpuSourceBorrowLimit) {
+            for (auto it = registry.borrowed.begin(); it != registry.borrowed.end();) it = it->second.first.expired() ? registry.borrowed.erase(it) : std::next(it);
+        }
+        registry.borrowed[buffer.get()] = {buffer, entry.lane};
+    }
+    miss = GpuSourceMiss::None;
+    return GpuSource{std::move(buffer), offset, entry.since};
+}
+
+void GuestBufferMemory::CountDrawBuffer(bool gpuSide, std::size_t bytes, GpuSourceMiss miss) {
+    if (!GpuSourceProfiled()) return;
+    auto& stats = SourceStats();
+    if (gpuSide) {
+        stats.drawGpu.fetch_add(1, std::memory_order_relaxed);
+        stats.drawGpuBytes.fetch_add(bytes, std::memory_order_relaxed);
+    } else {
+        stats.drawCopied.fetch_add(1, std::memory_order_relaxed);
+        stats.drawCopiedBytes.fetch_add(bytes, std::memory_order_relaxed);
+        stats.drawMisses[static_cast<std::size_t>(miss)].fetch_add(1, std::memory_order_relaxed);
+    }
+    ReportGpuSources();
+}
+
+bool GuestBufferMemory::VerifyGpuSourceTurn() {
+    static const std::uint64_t perWindow = [] {
+        const char* value = std::getenv("APS5_VERIFY_GPU_SOURCED");
+        return value != nullptr ? static_cast<std::uint64_t>(std::strtoull(value, nullptr, 10)) : std::uint64_t{0};
+    }();
+    if (perWindow == 0) return false;
+    auto& stats = SourceStats();
+    const auto window = GpuSourceNowMs() / 10000;
+    auto seen = stats.verifyWindow.load(std::memory_order_relaxed);
+    if (seen != window && stats.verifyWindow.compare_exchange_strong(seen, window)) stats.verifyTurns.store(0, std::memory_order_relaxed);
+    return stats.verifyTurns.fetch_add(1, std::memory_order_relaxed) < perWindow;
+}
+
+void GuestBufferMemory::CountGpuSourceVerify(bool same) {
+    auto& stats = SourceStats();
+    stats.verified.fetch_add(1, std::memory_order_relaxed);
+    if (!same) stats.verifyDiffering.fetch_add(1, std::memory_order_relaxed);
+}
+
+void GuestBufferMemory::ReportGpuSources() {
+    auto& stats = SourceStats();
+    const auto nowMs = GpuSourceNowMs();
+    auto last = stats.lastReport.load();
+    if (nowMs - last < 10000 || !stats.lastReport.compare_exchange_strong(last, nowMs)) return;
+    enum Slot : std::size_t { DrawGpu, DrawGpuBytes, DrawCopied, DrawCopiedBytes, CopyGpu, CopyGpuBytes, CopyCpu, CopyCpuBytes, Registered, RefusedStored, RefusedPending, BackingOff, Armed, ArmRefused, CrossLane, Verified, Differing, Slots };
+    static std::array<std::uint64_t, Slots> previous{};
+    const std::array<std::uint64_t, Slots> now{stats.drawGpu.load(), stats.drawGpuBytes.load(), stats.drawCopied.load(), stats.drawCopiedBytes.load(), stats.copyInGpu.load(), stats.copyInGpuBytes.load(), stats.copyInCpu.load(), stats.copyInCpuBytes.load(), stats.registered.load(), stats.refusedStored.load(), stats.refusedPending.load(), stats.backingOff.load(), stats.armed[0].load(), stats.armed[1].load(), stats.crossLaneOrders.load(), stats.verified.load(), stats.verifyDiffering.load()};
+    std::array<unsigned long long, Slots> delta{};
+    for (std::size_t index = 0; index < Slots; ++index) delta[index] = static_cast<unsigned long long>(now[index] - previous[index]);
+    previous = now;
+    static std::array<std::uint64_t, GpuSourceMissCount> previousDraw{}, previousCopy{};
+    std::string draws, copies;
+    for (std::size_t index = 1; index < GpuSourceMissCount; ++index) {
+        const auto drawNow = stats.drawMisses[index].load();
+        const auto copyNow = stats.copyInMisses[index].load();
+        const auto name = GpuSourceMissName(static_cast<GpuSourceMiss>(index));
+        draws += std::string(draws.empty() ? "" : ", ") + name + " " + std::to_string(drawNow - previousDraw[index]);
+        copies += std::string(copies.empty() ? "" : ", ") + name + " " + std::to_string(copyNow - previousCopy[index]);
+        previousDraw[index] = drawNow;
+        previousCopy[index] = copyNow;
+    }
+    const auto kib = [](unsigned long long value) { return static_cast<double>(value) / 1024.0; };
+    AgcDriver::ProfilePrint_nid_no_patch("[gpu-sourced] last 10 s (APS5_NO_GPU_SOURCED_DRAW_BUFFERS %s, APS5_NO_IMPORT_SOURCED_COPY_IN %s): draw buffers %llu bound GPU-side (%.0f KiB not compared or copied), %llu copied (%.0f KiB; misses: %s); copy-ins %llu from a GPU source (%.0f KiB not memcpy'd), %llu CPU snapshots (%.0f KiB; misses: %s); sources registered %llu, refused %llu stored since the copy-in, %llu writer pending at the copy-in, %llu backing off; owned words armed %llu, refused %llu; cross-lane orders %llu; %zu live; verify %llu checked, %llu differing\n", RuntimeSwitches::Set(RuntimeSwitch::NoGpuSourcedDrawBuffers) ? "set" : "unset", RuntimeSwitches::Set(RuntimeSwitch::NoImportSourcedCopyIn) ? "set" : "unset", delta[DrawGpu], kib(delta[DrawGpuBytes]), delta[DrawCopied], kib(delta[DrawCopiedBytes]), draws.c_str(), delta[CopyGpu], kib(delta[CopyGpuBytes]), delta[CopyCpu], kib(delta[CopyCpuBytes]), copies.c_str(), delta[Registered], delta[RefusedStored], delta[RefusedPending], delta[BackingOff], delta[Armed], delta[ArmRefused], delta[CrossLane], GpuSourceEntries(), delta[Verified], delta[Differing]);
+}
+
 void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool addressable) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     static const bool capture = std::getenv("APS5_CAPTURE_GPU_COPIES") != nullptr;
@@ -5475,6 +5786,8 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
     }
     bool stagedAny = false;
     std::uint64_t copiedBytes = 0;
+    const bool importSourced = ImportSourcedCopyIn();
+    const bool sourcesOn = importSourced || GpuSourcedDrawBuffers();
     for (auto* region : copies) {
         const auto bytes = region->end - region->begin;
         copiedBytes += bytes;
@@ -5499,7 +5812,53 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         std::shared_ptr<Buffer> inputSnapshot;
         auto copySource = region->copySource;
         auto copyOffset = region->begin - region->copySourceBase;
-        if (!pendingWriter && !writable) {
+        if (const auto lane = gpuSourceCopyIn(region->buffer.get()); lane.has_value() && *lane != Recorder::ThreadLane()) {
+            recorder->OrderAfterLane(*lane);
+            if (profile) SourceStats().crossLaneOrders.fetch_add(1, std::memory_order_relaxed);
+        }
+        region->gpuSourceSince = 0;
+        region->gpuSourceWords.clear();
+        if (sourcesOn && !pendingWriter && region->deviceLocal && !region->overlay && !region->sparse && !HoldsLease()) {
+            if (const auto feedback = std::exchange(region->gpuSourceFeedback, nullptr)) {
+                const auto learned = feedback->load(std::memory_order_relaxed);
+                if ((learned & 1u) != 0 && (learned & 2u) == 0) region->gpuSourceBackoff = 0;
+                else region->gpuSourceBackoff = static_cast<std::uint8_t>(std::min<unsigned>(region->gpuSourceBackoff + 1u, 6u));
+                region->gpuSourceSkip = static_cast<std::uint16_t>((1u << region->gpuSourceBackoff) - 1u);
+            }
+            if (region->gpuSourceSkip != 0) {
+                --region->gpuSourceSkip;
+                if (profile) SourceStats().backingOff.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                const auto regionBytes = static_cast<std::size_t>(bytes);
+                bool trackable = GuestMemory::Watched(region->begin, regionBytes);
+                if (!trackable) {
+                    region->gpuSourceWords.resize(GuestMemory::HashBlockCount(region->begin, regionBytes));
+                    trackable = GuestMemory::ArmOwnedBlocks(region->begin, regionBytes, region->gpuSourceWords, !RuntimeSwitches::Set(RuntimeSwitch::NoOwnedPrivate));
+                    if (!trackable) region->gpuSourceWords.clear();
+                    if (profile) SourceStats().armed[trackable ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
+                }
+                if (trackable) {
+                    region->gpuSourceSince = GuestMemory::TrackerGeneration();
+                    region->gpuSourceRegistry = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+                }
+            }
+        } else if (sourcesOn && pendingWriter && region->deviceLocal && profile) {
+            SourceStats().refusedPending.fetch_add(1, std::memory_order_relaxed);
+        }
+        bool sourced = false;
+        if (!pendingWriter && !writable && importSourced) {
+            auto miss = GpuSourceMiss::NoSource;
+            if (auto source = FindGpuSource(address, static_cast<std::size_t>(bytes), 1, miss); source.has_value() && source->buffer != region->buffer) {
+                copySource = source->buffer->Handle();
+                copyOffset = source->offset;
+                recorder->Keep(source->buffer);
+                sourced = true;
+                countCopyIn(true, static_cast<std::size_t>(bytes), miss);
+            } else {
+                countCopyIn(false, static_cast<std::size_t>(bytes), miss);
+            }
+        }
+        if (!pendingWriter && !writable && !sourced) {
             const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::GuestStaging);
             inputSnapshot = std::make_shared<Buffer>(context, static_cast<std::size_t>(bytes), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
             std::memcpy(inputSnapshot->Bytes().data(), reinterpret_cast<const void*>(address), static_cast<std::size_t>(bytes));
@@ -5533,7 +5892,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
                 CaptureTrace::Log("copy-input-result batch=%llu address=%llx bytes=%zu changed=%zu", batch, static_cast<unsigned long long>(address), expected.size(), changed);
             });
         }
-        if (inputSnapshot == nullptr) recorder->NotePendingRead(region->begin, static_cast<std::size_t>(bytes), Recorder::ReadKind::GpuCopy);
+        if (inputSnapshot == nullptr && !sourced) recorder->NotePendingRead(region->begin, static_cast<std::size_t>(bytes), Recorder::ReadKind::GpuCopy);
         // Kept by the batch at record time, as every other recorded target is: the caller keeps
         // the resources only after descriptor and pipeline work that may throw, and a released
         // buffer would go back to the pool (reused or destroyed) under this copy command. The
@@ -6205,6 +6564,41 @@ bool GuestBufferMemory::CopiedWritesOverlap(std::uint64_t address, std::size_t b
 }
 
 void GuestBufferMemory::MarkDirectWrites() const {
+    std::vector<const Region*> sources;
+    for (const auto& region : regions) {
+        if (region.gpuSourceSince != 0 && region.gpuCopy && region.copiedBack && region.deviceLocal && region.buffer != nullptr) sources.push_back(&region);
+    }
+    if (!sources.empty()) {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> marks;
+        for (const auto& [begin, end] : writes) {
+            const auto* found = owner(begin, end);
+            if (found != nullptr && (found->direct != nullptr || (found->gpuCopy && found->copiedBack))) marks.emplace_back(begin, end);
+        }
+        std::vector<std::uint64_t> generations(marks.size(), 0);
+        std::vector<GuestMemory::OwnWriteCheck> checks;
+        checks.reserve(sources.size());
+        for (const auto* region : sources) checks.push_back({region->begin, static_cast<std::size_t>(region->end - region->begin), region->gpuSourceSince, !region->gpuSourceWords.empty()});
+        const auto after = GuestMemory::MarkOwnWrites(marks, generations, checks);
+        for (const auto generation : generations) {
+            if (generation != 0) directWritesGeneration = std::max(directWritesGeneration, generation);
+        }
+        const bool registrable = after != 0 && Recorder::Active() != nullptr;
+        const int lane = Recorder::ThreadLane();
+        for (std::size_t index = 0; index < sources.size(); ++index) {
+            const auto* region = sources[index];
+            if (registrable && checks[index].clean) {
+                region->gpuSourceFeedback = std::make_shared<std::atomic<std::uint8_t>>(0);
+                registerGpuSource(region->begin, region->end, region->buffer, region->gpuSourceSince, after, region->gpuSourceRegistry, lane, std::move(region->gpuSourceWords), region->gpuSourceFeedback);
+                if (GpuSourceProfiled()) SourceStats().registered.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                forgetGpuSource(region->buffer.get());
+                if (GpuSourceProfiled()) SourceStats().refusedStored.fetch_add(1, std::memory_order_relaxed);
+            }
+            region->gpuSourceSince = 0;
+            region->gpuSourceWords.clear();
+        }
+        return;
+    }
     for (const auto& [begin, end] : writes) {
         const auto* found = owner(begin, end);
         if (found == nullptr) continue;

@@ -7120,6 +7120,31 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedD
     return moved;
 }
 
+namespace {
+
+void verifyGpuSource(const Context& context, Recorder& recorder, const GuestBufferMemory::GpuSource& source, std::uint64_t address, std::size_t bytes) {
+    std::vector<std::byte> expected(bytes);
+    std::memcpy(expected.data(), reinterpret_cast<const void*>(address), bytes);
+    const bool watched = GuestMemory::Watched(address, bytes);
+    if (watched) GuestMemory::CollectWritesUncached(address, bytes);
+    const bool raced = watched && GuestMemory::CpuStoredSince(address, bytes, source.since);
+    auto readback = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    const auto commands = recorder.Commands();
+    CopyBuffer(context, commands, source.buffer->Handle(), source.offset, readback->Handle(), 0, bytes);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+    recorder.Keep(source.buffer);
+    recorder.OnComplete([readback, expected = std::move(expected), address, raced] {
+        const auto actual = readback->Bytes();
+        std::size_t first = 0;
+        while (first < expected.size() && expected[first] == actual[first]) ++first;
+        const bool same = first == expected.size();
+        GuestBufferMemory::CountGpuSourceVerify(same);
+        if (!same) std::fprintf(stderr, "[gpu-sourced] verify %s: 0x%llx+0x%zx differs first at +0x%zx (import %02x, bound %02x)\n", raced ? "race (a CPU store after the copy-in that the draw's collect had not seen)" : "STALE", static_cast<unsigned long long>(address), expected.size(), first, std::to_integer<unsigned>(expected[first]), std::to_integer<unsigned>(actual[first]));
+    });
+}
+
+}
+
 std::size_t ShaderResources::MaxDrawSnapshotBytes() {
     const char* text = std::getenv("APS5_DRAW_SNAPSHOT_MAX_MIB");
     const auto mib = text != nullptr ? std::strtoull(text, nullptr, 10) : 64ull;
@@ -7153,6 +7178,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     selected.clear();
     std::array<std::uint64_t, 3> stamp{};
     bool stamped = false;
+    const bool gpuSourced = GuestBufferMemory::GpuSourcedDrawBuffers();
     const auto keep = [&](DrawBindings::Snapshot snapshot) {
         if (result->snapshots.empty()) result->snapshots.reserve(allocations.size());
         result->snapshots.push_back(std::move(snapshot));
@@ -7209,6 +7235,18 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             const bool same = slow == buffer || (slow != nullptr && slow->Bytes().size() == fast.size() && std::memcmp(slow->Bytes().data(), fast.data(), fast.size()) == 0) || (slow == nullptr && std::memcmp(fast.data(), reinterpret_cast<const void*>(begin), bytes) == 0);
             if (!same) differing.fetch_add(1);
             if (checked.fetch_add(1) % 200000 == 199999) std::fprintf(stderr, "[draw-snapshots] verify: %llu fast answers checked, %llu differing%c", static_cast<unsigned long long>(checked.load()), static_cast<unsigned long long>(differing.load()), 10);
+        }
+        bool gpuSide = false;
+        if (buffer == nullptr && override == moved.end() && gpuSourced) {
+            auto miss = GuestBufferMemory::GpuSourceMiss::NoSource;
+            if (auto source = GuestBufferMemory::FindGpuSource(begin, bytes, std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4), miss)) {
+                if (GuestBufferMemory::VerifyGpuSourceTurn()) verifyGpuSource(context, recorder, *source, begin, bytes);
+                buffer = std::move(source->buffer);
+                offset = source->offset;
+                gpuSide = true;
+            }
+            GuestBufferMemory::CountDrawBuffer(gpuSide, bytes, miss);
+            if (GuestMemory::TrackerGeneration() != stamp[0]) stamped = false;
         }
         if (buffer == nullptr) {
             const bool uploaded = bytes != 0 && bytes <= uploadLimit;
@@ -7295,7 +7333,9 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     Require(nextWrite == writes.end(), "draw snapshot writes disagree with their descriptor bindings");
     context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
     recorder.Keep(result);
-    for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+    for (const auto& snapshot : result->snapshots) {
+        if (snapshot.buffer->Mapped()) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+    }
     return result;
 }
 

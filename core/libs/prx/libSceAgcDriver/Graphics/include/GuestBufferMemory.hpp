@@ -6,6 +6,7 @@
 #include "prx/libc/include/GuestAllocations.hpp"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -394,6 +395,35 @@ public:
     // regions was recorded (ShaderResources::MarkGpuWrites), under GuestMemory::GpuMutex. A use that
     // never calls it (a synchronous draw) stores the staging bytes from the CPU in WriteBack.
     void RecordCopyBacks(Recorder& recorder);
+    // GPU-sourced buffers (APS5_NO_GPU_SOURCED_DRAW_BUFFERS=1 off, APS5_NO_IMPORT_SOURCED_COPY_IN=1 off
+    // for the copy-in side; APS5_AB switches). A staged region whose copy-in found no pending writer
+    // and whose copy-back marks found nothing stored over it since the copy-in (MarkOwnWrites) is
+    // registered with its device-local shadow: until a later store (CPU or driver, any stamp after
+    // the marks, a CPU stamp after the copy-in) or the shadow's next copy-in, the shadow holds exactly
+    // the import's bytes. FindGpuSource answers a range inside one such region on the same lane once
+    // the batch that wrote it completed; a draw binds the shadow instead of copying the bytes on the
+    // CPU, a copy-in copies from it instead of a CPU snapshot of the import. Nullopt and `miss` say
+    // why not.
+    enum class GpuSourceMiss : std::uint8_t { None, NoSource, Released, Pending, Lane, Align, Registry, Stored, Cpu, Count };
+    struct GpuSource {
+        std::shared_ptr<Buffer> buffer;
+        VkDeviceSize offset = 0;
+        std::uint64_t since = 0;
+    };
+    static std::optional<GpuSource> FindGpuSource(std::uint64_t address, std::size_t bytes, VkDeviceSize alignment, GpuSourceMiss& miss);
+    static const char* GpuSourceMissName(GpuSourceMiss miss);
+    static bool GpuSourcedDrawBuffers();
+    static bool ImportSourcedCopyIn();
+    // APS5_PROFILE_DRAW: a draw buffer bound GPU-side or copied (bytes), a miss by reason, and the
+    // [gpu-sourced] line every 10 s. APS5_VERIFY_GPU_SOURCED=<n>: the first n GPU-side binds per 10 s
+    // also copy the import on the CPU and compare it with the bound shadow once the draw's batch ran.
+    static void CountDrawBuffer(bool gpuSide, std::size_t bytes, GpuSourceMiss miss);
+    static bool VerifyGpuSourceTurn();
+    static void CountGpuSourceVerify(bool same);
+    static void ReportGpuSources();
+    static std::size_t GpuSourceEntries();
+    static std::uint64_t GpuSourcedCopyIns();
+    static std::array<std::uint64_t, 2> GpuSourceVerifyCounts();
     // Whether a region is copied out of an import by the GPU (RecordCopyBacks has work).
     bool HasGpuCopies() const {
         for (const auto& region : regions) if (region.gpuCopy) return true;
@@ -510,6 +540,17 @@ private:
         // mapping, so nothing is ever stored from it by the CPU, and the region is taken even when
         // the import could bind it in place.
         bool deviceLocal = false;
+        // The tracker generation and registry generation at this use's copy-in when it may become a
+        // GPU source (FindGpuSource), else 0; consumed by MarkDirectWrites.
+        mutable std::uint64_t gpuSourceSince = 0;
+        mutable std::uint64_t gpuSourceRegistry = 0;
+        // Outside the write watch: the owned words armed at the copy-in (a CPU store moves them).
+        mutable std::vector<std::uint64_t> gpuSourceWords {};
+        // What the last registered source learned (bit 0 a draw or copy-in used it, bit 1 a CPU
+        // store moved its words), and the back-off of uses that do not try (2^n - 1 skipped).
+        mutable std::shared_ptr<std::atomic<std::uint8_t>> gpuSourceFeedback {};
+        mutable std::uint8_t gpuSourceBackoff = 0;
+        mutable std::uint16_t gpuSourceSkip = 0;
         // The device refused the shadow (memory or allocations exhausted): the region takes the
         // path it would take without staging, in both upload stages.
         bool unstaged = false;

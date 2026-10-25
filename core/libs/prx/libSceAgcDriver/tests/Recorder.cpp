@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
@@ -4677,6 +4678,177 @@ void drawSnapshotEpochTests(const Device& device) {
         snapshotRecorder.Sync();
     }
     std::cout << "draw snapshot reuse within a collect epoch: ok\n";
+}
+
+// GPU-sourced draw buffers and copy-ins (APS5_NO_GPU_SOURCED_DRAW_BUFFERS, APS5_NO_IMPORT_SOURCED_COPY_IN):
+// a read-only draw input over a range a staged dispatch wrote binds the dispatch's shadow; a CPU store
+// or a driver store after the write, or the switch, keeps the CPU snapshot; a misaligned read-only
+// copy-in copies from the shadow; APS5_VERIFY_GPU_SOURCED (set by the second registration) agrees.
+bool gpuSourcedDrawTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    constexpr std::size_t bytes = 4 * 65536;
+    std::unique_lock gpu(GpuMutex());
+    void* block = context.hostImportAlignment != 0 ? AllocateWatched(bytes, 65536) : nullptr;
+    if (block == nullptr) {
+        std::cout << "host imports or write watching unavailable: GPU-sourced draw buffers not tested\n";
+        return false;
+    }
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+    std::memset(block, 0x11, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes);
+        }
+    } unregister{context, block};
+    if (HostImportFor(context, address, bytes) == nullptr) {
+        std::cout << "host import of the watched block refused: GPU-sourced draw buffers not tested\n";
+        return false;
+    }
+#ifndef _WIN32
+    if (!AgcDriver::GuestMemory::Watched(address, bytes)) {
+        std::cout << "host imports are compared and owned words are Windows only: GPU-sourced draw buffers not tested\n";
+        return false;
+    }
+#endif
+    const bool verify = std::getenv("APS5_VERIFY_GPU_SOURCED") != nullptr;
+    const auto element = address + 65536;
+    constexpr std::size_t elementBytes = 65536;
+    const auto fill = context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer");
+    auto snapshotContext = context;
+    DescriptorCache cache(snapshotContext);
+    snapshotContext.descriptorCache = &cache;
+    Recorder snapshotRecorder(snapshotContext);
+    snapshotRecorder.Activate();
+    const auto readBack = [&](VkBuffer source, VkDeviceSize offset, std::size_t length) {
+        auto readback = std::make_shared<Buffer>(snapshotContext, length, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        const auto commands = snapshotRecorder.Commands();
+        RecordMemoryBarrier(snapshotContext, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        CopyBuffer(snapshotContext, commands, source, offset, readback->Handle(), 0, length);
+        RecordMemoryBarrier(snapshotContext, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        snapshotRecorder.Sync();
+        const auto contents = readback->Bytes();
+        return std::vector<std::byte>(contents.begin(), contents.end());
+    };
+    const auto produce = [&](std::uint32_t value) {
+        auto memory = std::make_unique<GuestBufferMemory>(snapshotContext);
+        memory->AllowDeviceStaging();
+        memory->AddWritable(element, elementBytes, false, true);
+        memory->Upload(false);
+        Require(memory->InPlaceReads().empty(), "a read and written 64 KiB element was not staged");
+        std::uint32_t adjustment = 0;
+        const auto view = memory->Descriptor(element, elementBytes, adjustment);
+        const auto commands = snapshotRecorder.Commands();
+        RecordMemoryBarrier(snapshotContext, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        fill(commands, view.buffer, view.offset + adjustment, elementBytes, value);
+        RecordMemoryBarrier(snapshotContext, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+        memory->RecordCopyBacks(snapshotRecorder);
+        snapshotRecorder.NotePendingWrites(memory->Writes());
+        memory->MarkDirectWrites();
+        snapshotRecorder.Sync();
+        snapshotRecorder.FlushDeferredReleases();
+        const auto* words = reinterpret_cast<const std::uint32_t*>(element);
+        Require(std::all_of(words, words + elementBytes / 4, [&](std::uint32_t word) { return word == value; }), "the staged copy-back did not reach the import");
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        return std::make_pair(std::move(memory), view.buffer);
+    };
+    ShaderRecompiler::RecompileResult program;
+    ShaderRecompiler::DescriptorBinding binding;
+    binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+    binding.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+    binding.descriptorSet = 0;
+    binding.binding = 0;
+    binding.count = 1;
+    binding.guestDescriptor = {static_cast<std::uint32_t>(element), static_cast<std::uint32_t>(element >> 32u) & 0xffffu, static_cast<std::uint32_t>(elementBytes), 0x31000000u};
+    binding.bufferWritten = {false};
+    program.bindings.push_back(binding);
+    const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    const auto holds = [&](const std::vector<std::byte>& contents, std::uint32_t value) {
+        return contents.size() == elementBytes && std::all_of(reinterpret_cast<const std::uint32_t*>(contents.data()), reinterpret_cast<const std::uint32_t*>(contents.data()) + elementBytes / 4, [&](std::uint32_t word) { return word == value; });
+    };
+    {
+        ShaderResources resources(snapshotContext, compute);
+        const auto draw = [&] {
+            const auto bindings = resources.PrepareDrawBindings(snapshotRecorder);
+            Require(bindings != nullptr && bindings->snapshots.size() == 1 && bindings->snapshots[0].bytes == elementBytes, "read-only draw input was not snapshotted");
+            return bindings;
+        };
+        const auto verified = GuestBufferMemory::GpuSourceVerifyCounts();
+        auto [producer, shadow] = produce(0x22222222u);
+        {
+            const auto bindings = draw();
+            const auto& snapshot = bindings->snapshots[0];
+            Require(snapshot.buffer->Handle() == shadow && !snapshot.buffer->Mapped(), "a draw input the staged dispatch wrote was copied on the CPU instead of bound GPU-side");
+            Require(holds(readBack(snapshot.buffer->Handle(), snapshot.offset, elementBytes), 0x22222222u), "the GPU-side draw input does not hold the dispatch's results");
+        }
+        if (verify) {
+            const auto now = GuestBufferMemory::GpuSourceVerifyCounts();
+            Require(now[0] > verified[0] && now[1] == verified[1], "the verify mode did not check the GPU-side bind or found a difference");
+        }
+        {
+            const auto bindings = draw();
+            Require(bindings->snapshots[0].buffer->Handle() == shadow, "a second draw over the unchanged results did not bind them GPU-side");
+        }
+        reinterpret_cast<std::uint32_t*>(element)[100] = 0x33333333u;
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        {
+            const auto bindings = draw();
+            const auto& snapshot = bindings->snapshots[0];
+            Require(snapshot.buffer->Handle() != shadow && snapshot.buffer->Mapped(), "a CPU store after the GPU write did not take the CPU snapshot path");
+            Require(reinterpret_cast<const std::uint32_t*>(snapshot.Bytes().data())[100] == 0x33333333u, "the CPU snapshot after a CPU store misses the store");
+        }
+        auto second = produce(0x44444444u);
+        Require(draw()->snapshots[0].buffer->Handle() == second.second, "the next dispatch's results were not bound GPU-side");
+        AgcDriver::GuestMemory::MarkWritten(element + 8, 4);
+        Require(draw()->snapshots[0].buffer->Mapped(), "a driver store after the GPU write did not take the CPU snapshot path");
+        auto third = produce(0x55555555u);
+        RuntimeSwitches::Assign(RuntimeSwitch::NoGpuSourcedDrawBuffers, true);
+        const auto off = draw();
+        RuntimeSwitches::Assign(RuntimeSwitch::NoGpuSourcedDrawBuffers, false);
+        Require(off->snapshots[0].buffer->Mapped() && holds(std::vector<std::byte>(off->snapshots[0].Bytes().begin(), off->snapshots[0].Bytes().end()), 0x55555555u), "APS5_NO_GPU_SOURCED_DRAW_BUFFERS did not keep the CPU snapshot");
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        Require(draw()->snapshots[0].buffer->Handle() == third.second, "the switch turned back on did not bind GPU-side");
+        const auto copied = GuestBufferMemory::GpuSourcedCopyIns();
+        if (context.limits.minStorageBufferOffsetAlignment > 4) {
+            {
+                GuestBufferMemory reader(snapshotContext);
+                reader.AddReadable(element + 4, 1024);
+                reader.Upload(false);
+                std::uint32_t adjustment = 0;
+                const auto view = reader.Descriptor(element + 4, 1024, adjustment);
+                Require(GuestBufferMemory::GpuSourcedCopyIns() == copied + 1, "a misaligned read-only copy-in over GPU results was not copied from the shadow");
+                reinterpret_cast<std::uint32_t*>(element)[1] = 0x66666666u;
+                const auto contents = readBack(view.buffer, view.offset + adjustment, 1024);
+                Require(contents.size() == 1024 && std::all_of(contents.begin(), contents.end(), [](std::byte value) { return value == std::byte{0x55}; }), "the GPU-sourced copy-in does not hold the bytes of its record time");
+                reader.WriteBack();
+            }
+            AgcDriver::GuestMemory::BumpCollectEpoch();
+            {
+                GuestBufferMemory reader(snapshotContext);
+                reader.AddReadable(element + 4, 1024);
+                reader.Upload(false);
+                Require(GuestBufferMemory::GpuSourcedCopyIns() == copied + 1, "a copy-in after a CPU store copied from the shadow");
+                reader.WriteBack();
+            }
+        }
+        snapshotRecorder.Sync();
+    }
+    recorder.Activate();
+    std::cout << "GPU-sourced draw buffers and copy-ins: ok" << (verify ? " (verified)" : "") << "\n";
+    return true;
 }
 
 void drawSnapshotCapTests(const Device& device, Recorder& recorder) {
@@ -12069,6 +12241,9 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--draw-snapshot-epoch-only") {
             drawSnapshotEpochTests(device);
             return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--gpu-sourced-only") {
+            return gpuSourcedDrawTests(device, recorder) ? 0 : 77;
         }
 
         if (argc == 2 && (std::string_view(argv[1]) == "--vertex-target-range-copied" || std::string_view(argv[1]) == "--vertex-target-range-imported")) {
