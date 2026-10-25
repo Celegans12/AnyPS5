@@ -370,11 +370,27 @@ std::vector<FrameRecorder::PrologueShader> FrameRecorder::prologueShaders(std::s
         Shader fields;
         std::memcpy(&fields, static_cast<const void*>(shader), sizeof(Shader));
         if (fields.file_header != 0x34333231u || fields.header_size < sizeof(Shader) || fields.header_size > MaximumHeaderImageBytes || !GuestMemory::Accessible(shader, fields.header_size)) continue;
-        PrologueShader entry;
-        entry.header = pointer(shader);
-        const std::span header(reinterpret_cast<const std::byte*>(shader), fields.header_size);
-        entry.headerHash = wideHash(header);
-        if (!headerImages.contains(entry.headerHash)) headerImages.emplace(entry.headerHash, std::vector<std::byte>(header.begin(), header.end()));
+        const auto image = [&](const void* address, std::size_t bytes) {
+            PrologueShader entry;
+            entry.header = pointer(address);
+            const std::span view(static_cast<const std::byte*>(address), bytes);
+            entry.headerHash = wideHash(view);
+            if (!headerImages.contains(entry.headerHash)) headerImages.emplace(entry.headerHash, std::vector<std::byte>(view.begin(), view.end()));
+            return entry;
+        };
+        const auto begin = pointer(shader);
+        const auto end = begin + fields.header_size;
+        const auto referred = [&](const void* array, std::size_t bytes) {
+            const auto at = pointer(array);
+            if (array == nullptr || bytes == 0 || bytes > MaximumHeaderImageBytes || (at >= begin && at + bytes <= end) || !GuestMemory::Accessible(array, bytes)) return;
+            result.push_back(image(array, bytes));
+        };
+        referred(fields.cx_registers, fields.num_cx_registers * sizeof(ShaderRegister));
+        referred(fields.sh_registers, fields.num_sh_registers * sizeof(ShaderRegister));
+        referred(fields.specials, sizeof(ShaderSpecialRegs));
+        referred(fields.input_semantics, fields.num_input_semantics * sizeof(ShaderSemantic));
+        referred(fields.output_semantics, fields.num_output_semantics * sizeof(ShaderSemantic));
+        auto entry = image(shader, fields.header_size);
         const auto* code = const_cast<const void*>(fields.code);
         if (registration && code != nullptr && fields.shader_size != 0 && GuestMemory::Accessible(code, fields.shader_size)) {
             entry.code = pointer(code);
