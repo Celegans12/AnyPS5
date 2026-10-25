@@ -458,6 +458,7 @@ void PendingWriteOverMovedConstantSyncs() {
 
 int main() {
     try {
+        AgcDriver::DriverDetail::DrawAhead::SetCompileAhead(false);
         SplitRunsNameTheirSharedWords();
         NestedPlanFollowsPointerWords();
         bool libraries = false;
