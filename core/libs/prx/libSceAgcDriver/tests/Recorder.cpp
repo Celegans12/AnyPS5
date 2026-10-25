@@ -31,6 +31,7 @@
 #include "ResidentPresent.hpp"
 #include "ImageTableAbi.hpp"
 #include "HostImportLifetime.hpp"
+#include "ResidentCopyIn.hpp"
 #include "ShaderCacheDirectory.hpp"
 #include "SampleLod_spv.h"
 #include "BufferUpdate_spv.h"
@@ -11874,6 +11875,9 @@ int main(int argc, char** argv) {
             if (!writtenBufferOrderTests(device, recorder)) return 77;
             std::cout << "written buffer order tests passed\n";
             return 0;
+        }
+        if (argc == 2 && (std::string_view(argv[1]) == "--resident-copy-in-only" || std::string_view(argv[1]) == "--resident-copy-in-budget-only")) {
+            return RunResidentCopyInTests(device.GetContext(), recorder, std::string_view(argv[1]) == "--resident-copy-in-budget-only");
         }
         if (argc == 2 && std::string_view(argv[1]) == "--staging-diff-only") {
             stagingDiffTests(device, recorder);

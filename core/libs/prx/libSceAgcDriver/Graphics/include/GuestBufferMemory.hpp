@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_GUESTBUFFERMEMORY_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ResidentShadows.hpp"
 #include "BdaAbi.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include <algorithm>
@@ -46,7 +47,7 @@ struct HostImport {
     std::shared_ptr<const GuestAllocations::Range> range {};
     std::vector<std::shared_ptr<const GuestAllocations::Range>> ranges {};
     // Identity for the life of this import (see HostImportSerial); 0 until first asked for.
-    std::uint64_t serial = 0;
+    mutable std::uint64_t serial = 0;
     bool unwatched = false;
     bool dmaBuf = false;
     bool joined = false;
@@ -341,8 +342,11 @@ public:
     // Records the copy-in of every staged region anew for another use of this upload (a resource
     // cache hit, from ShaderResources::Revalidate, under GuestMemory::GpuMutex, once the imports
     // were confirmed unchanged): the previous use's copy-back left the shadow behind, and the next
-    // RecordCopyBacks copies it back again. Nothing to do without staged regions.
-    void RecordStagingCopies(Recorder& recorder);
+    // RecordCopyBacks copies it back again. Nothing to do without staged regions. A region on a
+    // resident shadow (ResidentShadows.hpp) copies in only what changed since the shadow last
+    // equalled its import. False: a resident shadow of this build has an open use of another build
+    // that cannot be ended here; nothing was recorded, and the build must not be reused now.
+    bool RecordStagingCopies(Recorder& recorder);
     void AddSnapshot(const GuestMemorySnapshot& snapshot);
     // Upload is the two stages below back to back. UploadPrepare needs no device lock: it merges the
     // regions, binds the image mirrors and host imports that already serve them (an import pointer is
@@ -386,6 +390,9 @@ public:
     // Reports writes into host-imported memory (made by the GPU in place, or copied back into it by
     // RecordCopyBacks) to the write tracking now.
     void MarkDirectWrites() const;
+    // The recorder's pending-write notes of this use's written ranges (Recorder::NotePendingWrites),
+    // made as the notes of this build: they do not count against its own resident shadows.
+    void NoteOwnWrites(Recorder& recorder) const;
     // Records, into the recorder's open batch, the copy of every written sub-range of a region the
     // GPU copied out of a host import (see Region::gpuCopy) back into the import: what the shader
     // wrote lands in guest memory by the GPU, ordered after the recorded work, so the region needs
@@ -518,6 +525,15 @@ private:
         // resolveOverlays); the BDA table sends its guest addresses to this region's buffer instead
         // of the import (AddressRanges). APS5_NO_BDA_STAGING=1 serves it from the import as before.
         bool overlay = false;
+        // Resident staging shadows (APS5_NO_RESIDENT_COPY_IN, see GuestBufferMemory.cpp): the
+        // registry entry whose shadow `buffer` is (null: a private shadow), whether this use's
+        // copy-in decision opened a use on it that its copy-back mark has not ended yet, and the
+        // serial of the import `copySource` belongs to.
+        std::shared_ptr<ResidentShadows::Entry> resident {};
+        mutable bool residentOpen = false;
+        // The open use ended at a copy-back mark (MarkDirectWrites marked its written ranges then).
+        mutable bool residentEnded = false;
+        std::uint64_t copySerial = 0;
     };
 
     // How [begin, end) lies against the space's base regions.
@@ -578,7 +594,14 @@ private:
     bool bindableInPlace(std::uint64_t offset, bool addressable) const;
     // Records the import-to-buffer copies of the given gpuCopy regions into the open batch, with
     // the barriers that order them after earlier recorded writes and before the shaders reading them.
-    void recordGpuCopies(std::span<Region* const> copies, bool addressable);
+    // `reuse`: the copies of a reused build (RecordStagingCopies), whose shadows are bound in its
+    // descriptor sets: a region keeps its buffer, resident or private.
+    void recordGpuCopies(std::span<Region* const> copies, bool addressable, bool reuse = false);
+    // The guest ranges of a staged region the use copies in (resident shadows: the parts changed
+    // since the shadow last equalled the import; else the whole region), opening the use on its
+    // resident entry. `reuse` as for recordGpuCopies.
+    void residentCopyRanges(Region& region, Recorder& recorder, bool addressable, bool reuse, std::vector<std::pair<std::uint64_t, std::uint64_t>>& copy);
+    bool coveredByWrites(const Region& region) const;
     void takeHeapReferences();
     Context context;
     bool stagingAllowed = false;
