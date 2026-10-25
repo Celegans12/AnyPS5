@@ -14,6 +14,7 @@ namespace AgcDriver::Pm4 {
 
 constexpr std::size_t GdsBytes = 0x10000;
 std::uint64_t GdsAddress();
+void UseGdsAt(std::uint64_t address);
 
 struct DrawParameters {
     std::uint64_t indexAddress;

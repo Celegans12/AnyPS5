@@ -835,6 +835,7 @@ int run(const Options& options) {
     const auto loaded = Clock::now();
     Replay replay{options, reader};
     replay.skipped = std::move(skipped);
+    if (const auto at = reader.Header().find("\"gds_address\":"); at != std::string::npos) AgcDriverUseGdsAt_nid_postfix(std::strtoull(reader.Header().c_str() + at + 14, nullptr, 10));
     for (const auto& chunk : reader.Chunks()) {
         if (chunk.kind == FrameMemoryKind::Delta) replay.groups[chunk.group].push_back(&chunk);
     }
