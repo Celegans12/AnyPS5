@@ -80,7 +80,7 @@ private:
     void recordLocked(FrameCall call, bool prologueCall, std::span<const Shader* const> shaders);
     void emitDelta();
     void emitShaderDelta(std::span<const Shader* const> shaders);
-    void writeDelta(std::span<const Span> spans, std::span<const std::uint64_t> hostPages, std::span<const Range> added = {});
+    void writeDelta(std::span<const Span> spans, std::span<const std::uint64_t> hostPages, std::span<const Range> added = {}, std::span<const std::pair<std::uint64_t, std::vector<std::byte>>> images = {});
     bool triggered();
     void start();
     void finish();
@@ -112,6 +112,7 @@ private:
     std::vector<Range> ranges;
     std::map<std::uint64_t, std::uint64_t> shaderMarks;
     std::map<std::uint64_t, std::uint64_t> hostPageHashes;
+    std::map<std::uint64_t, std::uint64_t> shaderImageHashes;
     std::mutex displayMutex;
     std::map<std::uint64_t, DisplayBuffer> displayBuffers;
     std::uint64_t ordinal = 0;
