@@ -170,6 +170,7 @@ FrameRecorder* FrameRecorder::Active() {
         if (frames == 0) throw std::runtime_error("frame capture: APS5_FRAME_CAPTURE_FRAMES must be at least 1");
         auto* created = new FrameRecorder(directory, trigger != nullptr ? trigger : "", atBoundary, frames);
         created->checkpointFrame = readNumber(std::getenv("APS5_FRAME_CAPTURE_CHECKPOINT"), 0);
+        created->checkpointSubmit = readNumber(std::getenv("APS5_FRAME_CAPTURE_CHECKPOINT_SUBMIT"), 0);
         return created;
     }();
     return recorder;
@@ -262,6 +263,7 @@ void FrameRecorder::ReserveEopFlip(const FlipInfo& info, std::uint32_t token) {
     std::tie(call.accepted, call.completed) = DriverDetail::Driver::Get().SerialProgress();
     writer->WriteCall(call);
     ++recordedCalls;
+    if (call.kind == FrameCallKind::Submit && ++frameSubmits == checkpointSubmit && checkpointFrame != 0 && recordedFrames + 1 == checkpointFrame && !checkpointTaken) writeCheckpoint();
 }
 
 void FrameRecorder::Suspend(const std::function<void()>& accept) {
@@ -301,6 +303,7 @@ void FrameRecorder::writeFrameReference() {
 void FrameRecorder::writeCheckpoint() {
     emitDelta();
     if (state != State::Recording) return;
+    checkpointTaken = true;
     if (!DriverDetail::Driver::Get().SettleForCapture(std::chrono::seconds(10))) warnings.push_back("storage images were still pending GPU results at the checkpoint");
     std::vector<std::byte> bytes;
     for (const auto& range : ranges) {
@@ -320,9 +323,9 @@ void FrameRecorder::writeCheckpoint() {
     auto call = make(FrameCallKind::Checkpoint);
     call.ordinal = ++ordinal;
     std::tie(call.accepted, call.completed) = DriverDetail::Driver::Get().SerialProgress();
-    call.values = {checkpointFrame};
+    call.values = {checkpointFrame, checkpointSubmit};
     writer->WriteCall(call);
-    std::fprintf(stderr, "[frame-capture] checkpoint after frame %llu: %llu blocks (%.1f MiB) differ from the snapshot\n", static_cast<unsigned long long>(checkpointFrame), static_cast<unsigned long long>(checkpointBlocks), static_cast<double>(checkpointBytes) / (1024.0 * 1024.0));
+    std::fprintf(stderr, "[frame-capture] checkpoint in frame %llu after submit %llu: %llu blocks (%.1f MiB) differ from the snapshot\n", static_cast<unsigned long long>(checkpointFrame), static_cast<unsigned long long>(frameSubmits), static_cast<unsigned long long>(checkpointBlocks), static_cast<double>(checkpointBytes) / (1024.0 * 1024.0));
 }
 
 void FrameRecorder::writeReferenceFrames() {
@@ -529,7 +532,8 @@ void FrameRecorder::FrameBoundary() {
     ++boundaries;
     if (state == State::Recording) {
         writeFrameReference();
-        if (checkpointFrame != 0 && recordedFrames + 1 == checkpointFrame) writeCheckpoint();
+        if (checkpointFrame != 0 && recordedFrames + 1 == checkpointFrame && !checkpointTaken) writeCheckpoint();
+        frameSubmits = 0;
         if (++recordedFrames >= frames) finish();
         return;
     }
@@ -860,7 +864,7 @@ std::string FrameRecorder::header() const {
     text += std::string(",\"dirty\":") + (APS5_TRACE_DIRTY < 0 ? "null" : APS5_TRACE_DIRTY != 0 ? "true" : "false");
     text += ",\"arena_base\":" + std::to_string(arenaBase) + ",\"arena_bytes\":" + std::to_string(arenaBytes);
     text += ",\"gds_address\":" + std::to_string(gdsAddress);
-    text += ",\"checkpoint_frame\":" + std::to_string(checkpointFrame) + ",\"checkpoint_blocks\":" + std::to_string(checkpointBlocks);
+    text += ",\"checkpoint_frame\":" + std::to_string(checkpointFrame) + ",\"checkpoint_submit\":" + std::to_string(checkpointSubmit) + ",\"checkpoint_blocks\":" + std::to_string(checkpointBlocks);
     text += ",\"aliased_pages\":" + std::to_string(aliasedPages) + ",\"alias_groups\":" + std::to_string(aliasGroups);
     text += ",\"start_boundary\":" + std::to_string(startBoundary) + ",\"frames\":" + std::to_string(recordedFrames);
     text += ",\"calls\":" + std::to_string(recordedCalls) + ",\"prologue_calls\":" + std::to_string(prologueCallCount);
