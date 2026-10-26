@@ -270,6 +270,37 @@ void testPrologueHeader(const std::filesystem::path& directory) {
 
 }
 
+void testCheckpoint(const std::filesystem::path& directory) {
+    auto* bytes = allocate(4 * FrameCaptureWriter::BlockBytes);
+    std::fill_n(bytes, 4 * FrameCaptureWriter::BlockBytes, std::byte{0x11});
+    auto* recorder = AgcDriver::FrameRecorder::Active();
+    check(recorder != nullptr, "frame recorder is disabled");
+    recorder->FrameBoundary();
+    bytes[FrameCaptureWriter::BlockBytes + 5] = std::byte{0x22};
+    recorder->FrameBoundary();
+    const FrameCaptureReader reader(directory);
+    std::size_t blocks = 0;
+    for (const auto& chunk : reader.Chunks()) {
+        if (chunk.kind != FrameMemoryKind::Checkpoint) continue;
+        ++blocks;
+        check(chunk.address == address(bytes + FrameCaptureWriter::BlockBytes) && reader.Read(chunk)[5] == std::byte{0x22}, "the checkpoint holds another block");
+    }
+    check(blocks == 1, "the checkpoint does not hold exactly the changed block");
+    check(std::any_of(reader.Calls().begin(), reader.Calls().end(), [](const FrameCall& call) { return call.kind == FrameCallKind::Checkpoint; }), "the capture has no checkpoint call");
+    const auto report = directory / "checkpoint.csv";
+    const auto lines = [&] {
+        std::ifstream file(report);
+        std::size_t count = 0;
+        for (std::string line; std::getline(file, line);) ++count;
+        return count;
+    };
+    compareCheckpoint(reader, report, Skipped{});
+    check(lines() == 1, "an unchanged checkpoint block was reported as differing");
+    bytes[FrameCaptureWriter::BlockBytes + 6] = std::byte{0x33};
+    compareCheckpoint(reader, report, Skipped{});
+    check(lines() == 2, "a differing checkpoint block was not reported");
+}
+
 #ifdef _WIN32
 void testAliasedPages(const std::filesystem::path& directory) {
     constexpr std::size_t PageBytes = 0x4000;
@@ -322,6 +353,7 @@ int main(int argc, char** argv) {
         else if (mode == "blocking") testBlockingSubmission(directory);
         else if (mode == "shader" || mode == "shader_host") testShaderCode(directory, mode == "shader_host");
         else if (mode == "shader_prologue") testPrologueHeader(directory);
+        else if (mode == "shader_checkpoint") testCheckpoint(directory);
 #ifdef _WIN32
         else if (mode == "shader_aliases") testAliasedPages(directory);
 #endif
