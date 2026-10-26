@@ -93,10 +93,8 @@ Behind SubmitBehindBusyPipeline(const std::array<std::uint32_t, 7>& dma, std::ui
 int main() {
 #ifdef _WIN32
     _putenv_s("APS5_PIPELINED_DRAWS", "1");
-    _putenv_s("APS5_NO_PIPELINE_DMA", "1");
 #else
     setenv("APS5_PIPELINED_DRAWS", "1", 1);
-    setenv("APS5_NO_PIPELINE_DMA", "1", 1);
 #endif
     try {
         for (std::size_t i = 0; i < Source.size(); ++i) Source[i] = static_cast<std::uint32_t>(i * 2654435761u);
