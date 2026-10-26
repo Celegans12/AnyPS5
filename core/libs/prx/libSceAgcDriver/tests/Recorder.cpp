@@ -4963,9 +4963,11 @@ bool ownedDrawSnapshotTests(const Device& device, Recorder& recorder) {
         };
         const auto first = next();
         Require(next() == first, "an unchanged untracked draw input was copied again");
+        AgcDriver::GuestMemory::TakeOwnedBlockCounts();
         guest[elementOffset + 70000] ^= 0xffu;
         const auto afterCpu = next();
         Require(afterCpu != first, "an owned draw snapshot outlived a CPU store to its range");
+        Require(AgcDriver::GuestMemory::TakeOwnedBlockCounts().faults == 0, "a CPU store into an owned draw snapshot's range faulted");
         const auto settled = settles("an untracked draw input was not reused again after a CPU store");
         AgcDriver::GuestMemory::MarkWritten(element + 8, 4);
         const auto bindings = resources.PrepareDrawBindings(snapshotRecorder);
@@ -5056,9 +5058,11 @@ bool ownedVertexInputTests(const Device& device) {
         const auto now = Recorder::OwnedSnapshotVerifyCounts();
         Require(now[0] > verified[0] && now[1] == verified[1], "the owned verify mode did not check the reuse or found a difference");
     }
+    AgcDriver::GuestMemory::TakeOwnedBlockCounts();
     words[65536 / 4 + 9] ^= 0xffffu;
     const auto stored = CopyDrawInput(context, &inputRecorder, input, size, 1, Use::Vertex);
     Require(!stored.reused && stored.buffer != vertex.buffer && equalsGuest(stored), "an owned vertex input outlived a CPU store");
+    Require(AgcDriver::GuestMemory::TakeOwnedBlockCounts().faults == 0, "a CPU store into an owned vertex input's range faulted");
     KeepDrawInput(&inputRecorder, input, stored, Use::Vertex, 0);
     bool reusedAfterStore = false;
     for (int attempt = 0; attempt < 4 && !reusedAfterStore; ++attempt) {
