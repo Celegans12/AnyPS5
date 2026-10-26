@@ -2523,6 +2523,11 @@ void VulkanDevice::PrepareForReplacement() {
     state->computePipelines.clear();
 }
 
+void VulkanDevice::PublishShadows() {
+    GuestMemory::AssertGpuLockHeld("VulkanDevice::PublishShadows");
+    Graphics::PublishAllShadows(state->context, Graphics::PublishReason::Hook);
+}
+
 void VulkanDevice::WaitIdle() {
     APS5_LOG_CHARS_OUT_DEBUG("VulkanDevice::WaitIdle begin");
     static_cast<void>(Graphics::StorageTexture::StoreDrawnLinear("wait idle"));

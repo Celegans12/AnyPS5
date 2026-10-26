@@ -12,6 +12,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -19,6 +20,7 @@
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include <atomic>
+#include <limits>
 #include <cstdint>
 #include <cstdio>
 #include <cerrno>
@@ -395,7 +397,13 @@ bool Driver::SettleForCapture(std::chrono::milliseconds timeout) {
         if (const auto localDevice = device.Load()) localDevice->WaitIdle();
     };
     settle();
+    static_cast<void>(Graphics::FlushDepthPlanes(0, std::numeric_limits<std::size_t>::max(), Graphics::DepthPlaneScope::Whole));
     Graphics::StorageTexture::FlushAllPending("frame capture");
+    {
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Hook);
+        std::lock_guard gpuLock(GuestMemory::GpuMutex());
+        if (const auto localDevice = device.Load()) localDevice->PublishShadows();
+    }
     settle();
     return !Graphics::StorageTexture::AnyPending();
 }
