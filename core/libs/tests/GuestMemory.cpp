@@ -2570,7 +2570,7 @@ static void CheckBatchMapCostFollowsTheBatch() {
     };
     print("batch map of 64 entries", small, large);
     print("batch map of 1 entry", smallSingle, largeSingle);
-    for (auto* mapped : background) Require(sceKernelMunmap(mapped, page) == 0);
+    for (auto* mapped : background) Require(sceKernelMunmap(reinterpret_cast<std::uint64_t>(mapped), page) == 0);
     GuestAllocations::GuestAllocationsSetGpuMapObserver_nid_postfix(nullptr);
     Require(sceKernelReleaseDirectMemory(phys, page * many) == 0);
     for (const auto& [low, high] : {std::pair{small, large}, std::pair{smallSingle, largeSingle}}) Require(high.mapSeconds <= low.mapSeconds * 6 && high.unmapSeconds <= low.unmapSeconds * 6);
