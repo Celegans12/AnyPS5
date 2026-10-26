@@ -395,7 +395,7 @@ public:
     // as written until a clearing collect takes them, so the write tracker sees every store it would
     // have seen without the arming. Every operation here that changes the block's mapping or
     // protection or opens it to a host call (Commit, Reset, Map, SetProtection, Pin, BeginHostWrite
-    // and import, a resident run's demotion, eviction or resumed write tracking) moves the word first:
+    // and import, a resident run's demotion or eviction) moves the word first:
     // a recommitted page reads zeros without a write bit. So while OwnedUnchanged holds for the words
     // ArmOwned returned, no CPU store reached the range after ArmOwned. GPU writes through a host
     // import bypass the page tables and are not seen here.
@@ -412,7 +412,7 @@ public:
     static constexpr std::size_t OwnedRefusalCount = static_cast<std::size_t>(OwnedRefusal::Count);
 
     // faults: guest write faults inside armed owned blocks. Owned blocks never change a protection,
-    // so each one is another mechanism's (shared views, resident clean proofs) and none is resolved
+    // so each one is another mechanism's (shared views, a genuine access violation) and none is resolved
     // for them. collected: disarms by a written page (a reset that took it, or a re-arm that found
     // it); taken: pages whose write bits an arming took (reported later as written); queries:
     // GetWriteWatch calls of OwnedUnchanged; dirty: OwnedUnchanged answers that found a written page;
