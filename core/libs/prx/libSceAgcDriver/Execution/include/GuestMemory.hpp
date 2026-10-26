@@ -103,6 +103,13 @@ bool CommittedBlocksMatchSince(std::uint64_t address, std::size_t bytes, std::sp
 // stamped are the caller's to check (the write notes, as for the walk).
 // `allowPrivate`: private commits (flexible and memory-pool memory) may be armed too.
 bool ArmOwnedBlocks(std::uint64_t address, std::size_t bytes, std::span<std::uint64_t> words, bool allowPrivate = true);
+// On a thread inside a collect epoch (BumpCollectEpoch; the collect memo on, APS5_NO_COLLECT_MEMO
+// unset) an answer may come from the blocks' checks by a GetWriteWatch query that began after the
+// thread's last epoch bump (each bump takes a new owned mark, GuestArenaOwnedMark): a CPU store made
+// before that ordering point is seen, one made after it may be seen only after the next, the rule the
+// collect memo already follows (APS5_NO_OWNED_EPOCH: every answer queries, as before).
+// APS5_VERIFY_OWNED_EPOCH=<n>: the first n such answers of every 10 s are asked again with a query
+// (disagreements: CPU stores after the thread's last ordering point, printed).
 bool OwnedWordsHold(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> words);
 // `wordsHeld`: the caller has just seen OwnedWordsHold hold for these words (one GetWriteWatch
 // query per proof instead of two).
@@ -115,8 +122,9 @@ bool OwnedProofHolds(std::uint64_t address, std::size_t bytes, std::span<const s
 // never write-protect, so none is theirs), blocks disarmed by a mapping, protection or host-write
 // change, blocks disarmed by a collect that took a CPU-written page, pages whose write bits an arming
 // took, OwnedWordsHold GetWriteWatch queries and those that found a written page, OwnedWordsHold
-// answers asked again under the mapping lock (a collect's reset ran across the first), since the
-// last call.
+// answers asked again under the mapping lock (a collect's reset ran across the first), answers
+// with an epoch mark held from the blocks' checks alone and those that queried, epoch answers
+// verified by a query and those the query found written (see OwnedWordsHold), since the last call.
 struct OwnedBlockCounts {
     std::uint64_t arms = 0;
     std::uint64_t armedBlocks = 0;
@@ -131,6 +139,10 @@ struct OwnedBlockCounts {
     std::uint64_t queries = 0;
     std::uint64_t dirty = 0;
     std::uint64_t locked = 0;
+    std::uint64_t epochHeld = 0;
+    std::uint64_t epochQueried = 0;
+    std::uint64_t epochVerified = 0;
+    std::uint64_t epochDisagreed = 0;
     std::array<std::uint64_t, 9> refusedBy{};
 };
 OwnedBlockCounts TakeOwnedBlockCounts();
