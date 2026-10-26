@@ -76,7 +76,7 @@ std::vector<std::uint32_t> emitLoad(const LoadCase& test, bool active, std::uint
         program.Metadata().bindings.pushDataStartDword = 0;
         program.Metadata().bindings.memoryOffsetCount = 1;
         auto& size = constant(records);
-        auto& base = constant(valid ? 0x1000u : 0u);
+        auto& base = constant(valid ? 0x100u : 0u);
         auto& handle = emit(IrOpcode::GetBufferResource, IrType::BufferResource, {&base, &zero, &size, &zero});
         emit(test.opcode, test.type, {&handle, &zero, &address, &zero, &enabled});
     } else {

@@ -1,3 +1,5 @@
+#include "prx/libSceLibreSsl/include/Api.hpp"
+#include <atomic>
 #include <cinttypes>
 #include <cstdio>
 #include <cstddef>
@@ -12,38 +14,20 @@
 namespace {
 
 constexpr std::size_t DesScheduleBytes = 128;
+constexpr int CryptoNumLocks = 41;
+
+static_assert(sizeof(CryptoThreadId) == 16);
+
+std::atomic<void*> lockingCallback{nullptr};
+std::atomic<void*> addLockCallback{nullptr};
+std::atomic<void*> threadIdCallback{nullptr};
 
 }
 
 extern "C" {
 
 APS5_DUMMY_FUN
-int APS5_VABI ASN1_INTEGER_get_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI ASN1_STRING_data_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI ASN1_STRING_length_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
 int APS5_VABI ASN1_STRING_print_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI ASN1_STRING_to_UTF8_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI ASN1_STRING_type_nid_postfix(void) {
     NotImplemented_nid_no_patch(__func__);
     return 0;
 }
@@ -228,14 +212,15 @@ int APS5_VABI CONF_modules_load_file_nid_postfix(void) {
     return 0;
 }
 
-int APS5_VABI CRYPTO_THREADID_set_callback_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+int APS5_VABI CRYPTO_THREADID_set_callback_nid_postfix(void* callback) {
+    void* expected = nullptr;
+    return threadIdCallback.compare_exchange_strong(expected, callback) ? 1 : 0;
 }
 
-int APS5_VABI CRYPTO_THREADID_set_numeric_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+void APS5_VABI CRYPTO_THREADID_set_numeric_nid_postfix(CryptoThreadId* id, std::uint64_t value) {
+    if (id == nullptr) APS5_INVALID_ARG_EX;
+    *id = {};
+    id->val = value;
 }
 
 int APS5_VABI CRYPTO_cleanup_all_ex_data_nid_postfix(void) {
@@ -244,18 +229,15 @@ int APS5_VABI CRYPTO_cleanup_all_ex_data_nid_postfix(void) {
 }
 
 int APS5_VABI CRYPTO_num_locks_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    return CryptoNumLocks;
 }
 
-int APS5_VABI CRYPTO_set_add_lock_callback_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+void APS5_VABI CRYPTO_set_add_lock_callback_nid_postfix(void* callback) {
+    addLockCallback.store(callback);
 }
 
-int APS5_VABI CRYPTO_set_locking_callback_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+void APS5_VABI CRYPTO_set_locking_callback_nid_postfix(void* callback) {
+    lockingCallback.store(callback);
 }
 
 void APS5_VABI DES_ecb_encrypt_nid_postfix(const unsigned char* input, unsigned char* output, const unsigned char* schedule, int enc) {
@@ -472,11 +454,6 @@ int APS5_VABI ENGINE_set_default_nid_postfix(void) {
     return 0;
 }
 
-int APS5_VABI ERR_clear_error_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
 int APS5_VABI ERR_error_string_nid_postfix(void) {
     NotImplemented_nid_no_patch(__func__);
     return 0;
@@ -488,21 +465,6 @@ int APS5_VABI ERR_error_string_n_nid_postfix(void) {
 }
 
 int APS5_VABI ERR_free_strings_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI ERR_get_error_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI ERR_peek_error_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI ERR_remove_thread_state_nid_postfix(void) {
     NotImplemented_nid_no_patch(__func__);
     return 0;
 }
@@ -857,17 +819,7 @@ int APS5_VABI OCSP_basic_verify_nid_postfix(void) {
     return 0;
 }
 
-int APS5_VABI OCSP_cert_status_str_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
 int APS5_VABI OCSP_check_validity_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI OCSP_crl_reason_str_nid_postfix(void) {
     NotImplemented_nid_no_patch(__func__);
     return 0;
 }
@@ -888,11 +840,6 @@ int APS5_VABI OCSP_response_get1_basic_nid_postfix(void) {
 }
 
 int APS5_VABI OCSP_response_status_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI OCSP_response_status_str_nid_postfix(void) {
     NotImplemented_nid_no_patch(__func__);
     return 0;
 }
@@ -1023,21 +970,6 @@ int APS5_VABI RSA_verify_nid_postfix(void) {
 }
 
 int APS5_VABI RSA_verify_PKCS1_PSS_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI SSL_CIPHER_get_bits_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI SSL_CIPHER_get_name_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI SSL_CIPHER_get_version_nid_postfix(void) {
     NotImplemented_nid_no_patch(__func__);
     return 0;
 }
@@ -1228,11 +1160,6 @@ int APS5_VABI SSL_SESSION_free_nid_postfix(void) {
 }
 
 int APS5_VABI SSL_accept_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI SSL_alert_desc_string_long_nid_postfix(void) {
     NotImplemented_nid_no_patch(__func__);
     return 0;
 }
@@ -1457,9 +1384,8 @@ int APS5_VABI SSL_write_nid_postfix(void) {
     return 0;
 }
 
-int APS5_VABI SSLeay_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+std::uint64_t APS5_VABI SSLeay_nid_postfix(void) {
+    return 0x20000000;
 }
 
 int APS5_VABI SSLv23_client_method_nid_postfix(void) {

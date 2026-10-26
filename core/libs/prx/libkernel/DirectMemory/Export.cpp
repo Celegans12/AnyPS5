@@ -1,3 +1,5 @@
+#include "prx/libkernel/include/Api.hpp"
+#include "prx/libc/include/Api.hpp"
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
@@ -34,8 +36,6 @@
 #include <vector>
 
 extern "C" std::uint64_t GuestImageSegmentBytes_nid_no_patch();
-extern "C" void* APS5_VABI mmap_nid_postfix(void* address, std::size_t length, int protection, int flags, int descriptor, std::int64_t offset) noexcept;
-extern "C" int* APS5_VABI __error_nid_postfix();
 
 namespace {
 
@@ -278,8 +278,6 @@ int APS5_VABI sceKernelMapFlexibleMemory(void** addr_in_out, size_t len, int pro
  return _mapFlexible(addr_in_out, len, prot, flags & ~IgnoredHeapFlag);
 }
 
-int APS5_VABI sceKernelSetVirtualRangeName(const void* addr, uint64_t len, const char* name);
-
 int APS5_VABI sceKernelMapNamedDirectMemory(void** addr, size_t len, int prot, int flags, int64_t direct_memory_start, size_t alignment, const char* name) {
  const int result = DoMapDirect(addr, len, prot, flags, direct_memory_start, alignment);
  if (result == 0) _releaseFlexible(reinterpret_cast<uintptr_t>(*addr), len);
@@ -506,6 +504,12 @@ int APS5_VABI sceKernelGetPageTableStats(int* cpu_total, int* cpu_available, int
  return 0;
 }
 
+int APS5_VABI sceKernelGetTraceMemoryStats(std::uint64_t* first, std::uint64_t* second) {
+ if (first) *first = 0;
+ if (second) *second = 0;
+ return 0;
+}
+
 int APS5_VABI sceKernelGetPrtAperture(int index, void** addr, size_t* len) {
  if (index < 0 || index >= PRT_APERTURE_COUNT || !addr || !len) return SCE_KERNEL_ERROR_EINVAL;
  std::lock_guard lock(g_prtLock);
@@ -520,8 +524,6 @@ int APS5_VABI sceKernelSetPrtAperture(int index, void* addr, size_t len) {
  g_prtApertures[index] = {addr, len};
  return 0;
 }
-
-int APS5_VABI sceKernelBatchMap2(KernelBatchMapEntry* entries, int num_entries, int* num_entries_out, int flags);
 
 int APS5_VABI sceKernelBatchMap(KernelBatchMapEntry* entries, int num_entries, int* num_entries_out) {
  constexpr int MapFixed = 0x10;

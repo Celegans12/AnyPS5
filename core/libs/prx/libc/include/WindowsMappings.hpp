@@ -130,6 +130,7 @@ public:
             auto shared = slot.page.lock();
             if (!shared) {
                 shared = std::make_shared<SharedPage>();
+                shared->comparedWhenShared = slot.comparedWhenShared;
                 slot.page = shared;
             }
             return shared;
@@ -139,6 +140,8 @@ public:
             const auto shared = slot.page.lock();
             return resident && !slot.stored && (!shared || shared->aliases.empty());
         };
+        const bool perPage = !resident && sectionBytes == SIZE_MAX;
+        if (perPage) commitSection(section, offset, bytes);
         for (std::size_t done = 0; done < bytes;) {
             const auto base = cursor + done;
             if (single(done)) {
@@ -168,21 +171,56 @@ public:
                 done += runBytes;
                 continue;
             }
-            const auto slot = slotOf(done);
-            const auto shared = pageOf(*slot);
-            const auto aliases = shared->aliases;
-            for (const auto alias : aliases) {
-                if (views.at(alias).resident) demote(alias);
+            if (sectionBytes != SIZE_MAX) {
+                const auto slot = slotOf(done);
+                const auto shared = pageOf(*slot);
+                const auto aliases = shared->aliases;
+                for (const auto alias : aliases) {
+                    if (views.at(alias).resident) demote(alias);
+                    views.at(alias).aliasDemoted = false;
+                }
+                const auto viewBytes = std::min(pageBytes, sectionBytes - done);
+                split(base, pageBytes);
+                mapShared(base, section, offset + done, protection, viewProtection, viewBytes);
+                slot->stored = true;
+                shared->aliases.push_back(base);
+                const auto created = views.emplace(base, View{shared, protection, {}, 0, owned, offset + done, 0, 0, false, slot, hostPages(viewBytes)}).first;
+                if (shared->comparedWhenShared) created->second.unreported = allSubpages;
+                remember(freshRanges, base, base + pageBytes);
+                invalidate(*shared);
+                done += pageBytes;
+                continue;
             }
-            const auto viewBytes = std::min(pageBytes, sectionBytes - done);
-            split(base, pageBytes);
-            mapShared(base, section, offset + done, protection, viewProtection, viewBytes);
-            slot->stored = true;
-            shared->aliases.push_back(base);
-            views.emplace(base, View{shared, protection, {}, 0, owned, offset + done, 0, 0, false, slot, hostPages(viewBytes)});
-            remember(freshRanges, base, base + pageBytes);
-            invalidate(*shared);
-            done += pageBytes;
+            std::vector<std::pair<std::shared_ptr<Physical>, std::shared_ptr<SharedPage>>> pages;
+            pages.reserve((bytes - done) / pageBytes);
+            auto runBytes = std::size_t{0};
+            do {
+                const auto slot = slotOf(done + runBytes);
+                const auto shared = pageOf(*slot);
+                const auto aliases = shared->aliases;
+                for (const auto alias : aliases) {
+                    if (views.at(alias).resident) demote(alias);
+                    views.at(alias).aliasDemoted = false;
+                }
+                pages.emplace_back(slot, shared);
+                runBytes += pageBytes;
+            } while (done + runBytes < bytes && !single(done + runBytes));
+            if (!perPage) commitSection(section, offset + done, runBytes);
+            split(base, runBytes);
+            mapRun(base, runBytes, section, offset + done);
+            DWORD previous;
+            if (!VirtualProtect(reinterpret_cast<void*>(base), runBytes, protection, &previous)) fail("protect shared guest pages");
+            collectableRanges.clear();
+            for (std::size_t at = 0; at < runBytes; at += pageBytes) {
+                auto& [slot, shared] = pages[at / pageBytes];
+                slot->stored = true;
+                shared->aliases.push_back(base + at);
+                invalidate(*shared);
+                const auto created = views.emplace(base + at, View{std::move(shared), protection, {}, 0, owned, offset + done + at, 0, 0, false, std::move(slot)}).first;
+                if (created->second.page->comparedWhenShared) created->second.unreported = allSubpages;
+            }
+            remember(freshRanges, base, base + runBytes);
+            done += runBytes;
         }
     }
 
@@ -224,6 +262,45 @@ public:
             auto& page = *it->second.page;
             if (page.pins != 0) --page.pins;
             invalidate(page);
+        }
+    }
+
+    void CompareWhenShared(std::uintptr_t address, std::size_t bytes, bool residentOnly = false) {
+        std::lock_guard lock(mutex);
+        collectableRanges.clear();
+        for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < address + bytes; ++it) {
+            if (residentOnly && !it->second.resident && !it->second.aliasDemoted) continue;
+            auto& page = *it->second.page;
+            const bool marked = page.comparedWhenShared;
+            page.comparedWhenShared = true;
+            it->second.slot->comparedWhenShared = true;
+            for (const auto alias : page.aliases) {
+                auto& view = views.at(alias);
+                if (view.resident) continue;
+                if (!marked) view.unreported = allSubpages;
+                if (view.armed == 0) continue;
+                protectSubpages(alias, view.armed, view.protection, "stop arming a compared shared page", view.viewBytes);
+                view.armed = 0;
+            }
+        }
+    }
+
+    void ComparedPages(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool unreported) {
+        std::lock_guard lock(mutex);
+        const auto capacity = *count;
+        *count = 0;
+        const auto end = address + bytes;
+        for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < end; ++it) {
+            auto& view = it->second;
+            if (view.resident || !view.page->comparedWhenShared) continue;
+            const auto listed = static_cast<std::uint8_t>(subpagesOf(it->first, address, end) & (unreported ? view.unreported : allSubpages));
+            for (std::size_t sub = 0; sub < subpages; ++sub) {
+                const auto bit = static_cast<std::uint8_t>(1u << sub);
+                if ((listed & bit) == 0) continue;
+                if (*count == capacity) return;
+                pages[(*count)++] = reinterpret_cast<void*>(it->first + sub * subpageBytes);
+                if (unreported) view.unreported &= static_cast<std::uint8_t>(~bit);
+            }
         }
     }
 
@@ -331,7 +408,7 @@ public:
         }
         for (std::size_t done = 0; done < bytes; done += pageBytes) {
             const auto found = views.find(address + done);
-            if (found != views.end() && found->second.resident) demote(address + done);
+            if (found != views.end() && found->second.resident) demote(address + done, true);
         }
         auto view = views.find(address);
         if (view == views.end()) throw refuse("the range does not start at a shared view");
@@ -536,6 +613,7 @@ public:
                     if (!watchResident) return false;
                     continue;
                 }
+                if (it->second.page->comparedWhenShared) return false;
                 if (it->second.protection != PAGE_NOACCESS) continue;
                 for (auto at = std::max(address, it->first); at < std::min(end, it->first + pageBytes); at += 4096) {
                     if ((it->second.collected & (1u << ((at - it->first) / 4096))) == 0) return false;
@@ -684,7 +762,7 @@ private:
         for (auto cursor = address; cursor < end;) {
             const auto base = cursor & ~(pageBytes - 1);
             if (const auto found = viewAt(base, position); found != views.end()) {
-                if (found->second.protection == PAGE_NOACCESS || (found->second.resident && !watchResident)) return false;
+                if (found->second.protection == PAGE_NOACCESS || (found->second.resident ? !watchResident : found->second.page->comparedWhenShared)) return false;
                 cursor = std::min(end, base + pageBytes);
                 continue;
             }
@@ -710,6 +788,7 @@ private:
         }();
         std::vector<std::uintptr_t> aliases;
         std::uint32_t pins = 0;
+        bool comparedWhenShared = false;
     };
     struct Section {
         HANDLE handle;
@@ -760,6 +839,7 @@ private:
     struct Physical {
         std::weak_ptr<SharedPage> page;
         bool stored = false;
+        bool comparedWhenShared = false;
         std::shared_ptr<Saved> saved;
         std::size_t savedOffset = 0;
     };
@@ -776,6 +856,8 @@ private:
         std::shared_ptr<Physical> slot;
         std::size_t viewBytes = pageBytes;
         std::uint32_t hostImports = 0;
+        bool aliasDemoted = false;
+        std::uint8_t unreported = 0;
     };
     struct Run {
         std::uintptr_t end;
@@ -1167,12 +1249,23 @@ private:
         return (bytes + subpageBytes - 1) & ~(subpageBytes - 1);
     }
 
-    void mapShared(std::uintptr_t base, HANDLE section, std::uint64_t offset, DWORD protection, DWORD viewProtection = PAGE_EXECUTE_READWRITE, std::size_t sectionBytes = pageBytes) {
+    void commitSection(HANDLE section, std::uint64_t offset, std::size_t bytes) {
+        auto window = open(section, offset, bytes);
+        const auto memory = query(reinterpret_cast<std::uintptr_t>(window.bytes));
+        if ((memory.State != MEM_COMMIT || memory.RegionSize < bytes) && !VirtualAlloc(window.bytes, bytes, MEM_COMMIT, PAGE_READWRITE)) {
+            const auto error = GetLastError();
+            close(window);
+            throw std::system_error(static_cast<int>(error), std::system_category(), "commit direct memory pages");
+        }
+        close(window);
+    }
+
+    void mapShared(std::uintptr_t base, HANDLE section, std::uint64_t offset, DWORD protection, DWORD viewProtection = PAGE_EXECUTE_READWRITE, std::size_t sectionBytes = pageBytes, bool committed = false) {
         void* page = reinterpret_cast<void*>(base);
         const auto viewBytes = hostPages(sectionBytes);
         if (viewBytes != pageBytes) split(base, viewBytes);
         if (!map(section, GetCurrentProcess(), page, offset, sectionBytes, MEM_REPLACE_PLACEHOLDER, viewProtection, nullptr, 0)) fail("map shared guest page");
-        if (query(base).State == MEM_RESERVE && !VirtualAlloc(page, viewBytes, MEM_COMMIT, PAGE_EXECUTE_READWRITE)) fail("commit shared guest page");
+        if (!committed && query(base).State == MEM_RESERVE && !VirtualAlloc(page, viewBytes, MEM_COMMIT, PAGE_EXECUTE_READWRITE)) fail("commit shared guest page");
         DWORD previous;
         if (!VirtualProtect(page, viewBytes, protection, &previous)) fail("protect shared guest page");
         if (viewBytes == pageBytes) return;
@@ -1186,6 +1279,47 @@ private:
         slot.saved.reset();
     }
 
+    void mapRun(std::uintptr_t base, std::size_t bytes, HANDLE section, std::uint64_t offset) {
+        if (!map(section, GetCurrentProcess(), reinterpret_cast<void*>(base), offset, bytes, MEM_REPLACE_PLACEHOLDER, PAGE_EXECUTE_READWRITE, nullptr, 0)) fail("map a run of shared guest pages");
+    }
+
+    void breakView(std::uintptr_t at) {
+        const auto memory = query(at);
+        if (memory.State == MEM_FREE || memory.Type != MEM_MAPPED) return;
+        const auto start = reinterpret_cast<std::uintptr_t>(memory.AllocationBase);
+        if (start == at) return;
+        const auto first = views.find(start);
+        if (first == views.end()) return;
+        struct Part {
+            std::uintptr_t base;
+            std::uintptr_t end;
+            DWORD protection;
+            bool committed;
+        };
+        std::vector<Part> parts;
+        auto stop = start;
+        for (;;) {
+            const auto part = query(stop);
+            if (part.AllocationBase != memory.AllocationBase) break;
+            const auto partEnd = reinterpret_cast<std::uintptr_t>(part.BaseAddress) + part.RegionSize;
+            parts.push_back({stop, partEnd, part.Protect, part.State == MEM_COMMIT});
+            stop = partEnd;
+        }
+        const auto section = first->second.section;
+        const auto offset = first->second.offset;
+        if (!unmap(GetCurrentProcess(), reinterpret_cast<void*>(start), MEM_PRESERVE_PLACEHOLDER)) fail("unmap a run of shared guest pages to split it");
+        split(start, at - start);
+        mapRun(start, at - start, section->handle, offset);
+        mapRun(at, stop - at, section->handle, offset + (at - start));
+        for (const auto& part : parts) {
+            if (!part.committed) continue;
+            for (const auto [from, to] : {std::pair{part.base, std::min(part.end, at)}, std::pair{std::max(part.base, at), part.end}}) {
+                DWORD previous;
+                if (from < to && !VirtualProtect(reinterpret_cast<void*>(from), to - from, part.protection, &previous)) fail("protect a split run of shared guest pages");
+            }
+        }
+    }
+
     static bool blank(std::uintptr_t page) {
         const auto* words = reinterpret_cast<const std::uint64_t*>(page);
         for (std::size_t i = 0; i < pageBytes / sizeof(std::uint64_t); ++i) {
@@ -1194,7 +1328,7 @@ private:
         return true;
     }
 
-    void demote(std::uintptr_t address) {
+    void demote(std::uintptr_t address, bool alias = false) {
         const auto run = std::prev(residentRuns.upper_bound(address));
         const auto start = run->first;
         const auto stop = run->second.end;
@@ -1214,6 +1348,8 @@ private:
             mapShared(page, view.section->handle, view.offset, view.protection);
             view.slot->stored = true;
             view.resident = false;
+            view.aliasDemoted = alias;
+            view.unreported = view.page->comparedWhenShared ? allSubpages : std::uint8_t{0};
             view.seen.fill(0);
             view.armed = 0;
             view.collected = 0;
@@ -1379,7 +1515,7 @@ private:
         return memory;
     }
 
-    static void split(std::uintptr_t address, std::size_t bytes) {
+    static std::uintptr_t split(std::uintptr_t address, std::size_t bytes) {
         auto memory = query(address);
         memory = query(reinterpret_cast<std::uintptr_t>(memory.AllocationBase));
         if (memory.State != MEM_RESERVE) throw std::runtime_error("guest mapping requires a placeholder");
@@ -1390,6 +1526,7 @@ private:
         }
         if (memory.RegionSize < bytes) throw std::runtime_error("guest placeholder is too small");
         if (memory.RegionSize != bytes && !VirtualFree(reinterpret_cast<void*>(address), bytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) fail("split guest placeholder suffix");
+        return address + memory.RegionSize;
     }
 
     void reset(std::uintptr_t address, std::size_t bytes) {
@@ -1400,6 +1537,8 @@ private:
         forgetClean(address, end);
         breakRun(address);
         breakRun(end);
+        breakView(address);
+        breakView(end);
         if (const auto run = residentRuns.find(address); run != residentRuns.end() && run->second.end == end) {
             const auto memory = query(address);
             if (reinterpret_cast<std::uintptr_t>(memory.AllocationBase) != address) throw std::runtime_error("cannot release part of a host allocation");
@@ -1431,12 +1570,11 @@ private:
             if (allocationEnd > end || query(allocationEnd).AllocationBase == memory.AllocationBase) throw std::runtime_error("guest release truncates a host allocation");
             if (memory.Type == MEM_MAPPED) {
                 if (!unmap(GetCurrentProcess(), reinterpret_cast<void*>(cursor), MEM_PRESERVE_PLACEHOLDER)) fail("unmap shared guest page");
-                const auto found = views.find(cursor);
-                if (found != views.end()) {
-                    std::erase(found->second.page->aliases, cursor);
-                    views.erase(found);
-                    forget(freshRanges, cursor, cursor + pageBytes);
+                for (auto found = views.lower_bound(cursor); found != views.end() && found->first < allocationEnd;) {
+                    std::erase(found->second.page->aliases, found->first);
+                    found = views.erase(found);
                 }
+                forget(freshRanges, cursor, allocationEnd);
             } else if (memory.Type == MEM_PRIVATE) {
                 if (const auto run = residentRuns.find(cursor); run != residentRuns.end()) evict(run);
                 if (!VirtualFree(reinterpret_cast<void*>(cursor), allocationEnd - cursor, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) fail("release private guest memory");

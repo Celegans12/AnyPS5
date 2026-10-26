@@ -250,6 +250,7 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
     translateOptions.floatMode = request.context.floatMode;
     translateOptions.float32FlushToZero = HardwareFloat32Flush(request);
     translateOptions.inputInfo = inputInfo;
+    translateOptions.float32DenormPreserve = request.target.float32DenormPreserve;
     if (stageKind == ShaderStageKind::Vertex && request.context.vertex.has_value()) {
         translateOptions.drawBaseVertexSgpr = request.context.vertex->drawBaseVertexSgpr;
         translateOptions.drawStartInstanceSgpr = request.context.vertex->drawStartInstanceSgpr;
@@ -1570,13 +1571,16 @@ SharedSpirv InternSpirv(std::vector<std::uint32_t> words) {
     SharedSpirv spirv(std::move(words));
     const auto hash = spirv.ContentHash();
     static std::mutex mutex;
-    static std::unordered_map<std::uint64_t, std::vector<SharedSpirv>> interned;
+    static std::unordered_map<std::uint64_t, std::vector<SharedSpirv::Weak>> interned;
     std::lock_guard lock(mutex);
-    auto& candidates = interned[hash.low ^ (hash.high * 0x9e3779b97f4a7c15ull)];
-    for (const auto& candidate : candidates) {
+    const auto bucket = hash.low ^ (hash.high * 0x9e3779b97f4a7c15ull);
+    auto& candidates = interned[bucket];
+    std::erase_if(candidates, [](const SharedSpirv::Weak& candidate) { return candidate.Expired(); });
+    for (const auto& weak : candidates) {
+        const auto candidate = weak.Lock();
         if (candidate.ContentHash() == hash && candidate == spirv) return candidate;
     }
-    candidates.push_back(spirv);
+    candidates.push_back(spirv.Weaken());
     return spirv;
 }
 

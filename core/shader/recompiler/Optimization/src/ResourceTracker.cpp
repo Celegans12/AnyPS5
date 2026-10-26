@@ -2366,6 +2366,7 @@ private:
         if (op == IrOpcode::ImageQueryDimensions) image.levelUses |= ImageLevelUseQuery;
         if (op == IrOpcode::ImageQueryLod) image.levelUses |= ImageLevelUseLodQuery;
         if (op == IrOpcode::ImageRead && memory.imageByElements == 0u) image.levelUses |= memory.imageHasMip ? ImageLevelUseMipLoad : ImageLevelUseLoad;
+        image.dimensionQueryOnly = image.dimensionQueryOnly && op == IrOpcode::ImageQueryDimensions;
         if ((memory.imageSampleFlags & RdnaImageSampleFlagCompare) != 0u) {
             constexpr auto unsupported = RdnaImageSampleFlagLod | RdnaImageSampleFlagDerivative;
             if (op == IrOpcode::ImageGatherRaw || (memory.imageSampleFlags & unsupported) != 0u) image.emulatedCompare |= EmulatedCompare::Unsupported;

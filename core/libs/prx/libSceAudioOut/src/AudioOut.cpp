@@ -1,3 +1,4 @@
+#include "prx/libSceAudioOut/include/AudioOut.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -401,10 +402,21 @@ static int allocatePort(int type, std::uint32_t len, std::uint32_t freq, Format 
     return -2144993275;
 }
 
+static std::atomic<bool> g_audioOut2Initialized{false};
+
+bool AudioOut2IsInitialized_nid_no_patch() {
+    return g_audioOut2Initialized.load();
+}
+
 extern "C" {
 
-int APS5_VABI sceAudioOutInit() {
+int APS5_VABI sceAudioOut2Initialize(void) {
+    g_audioOut2Initialized.store(true);
     return 0;
+}
+
+int APS5_VABI sceAudioOutInit() {
+    return sceAudioOut2Initialize();
 }
 
 int APS5_VABI sceAudioOutOpen(int userId, int type, int index, std::uint32_t len,
@@ -649,6 +661,10 @@ int APS5_VABI sceAudioOutSysOpen(int userId, std::uint32_t mode) {
         throw std::runtime_error("sceAudioOutSysOpen: mode " + std::to_string(mode) + " not supported");
     }
     return allocatePort(PORT_TYPE_SYS, SYS_PORT_SAMPLES, SYS_PORT_FRAME_RATE, Format::S16_8Ch);
+}
+
+int APS5_VABI sceAudioOutSetMainOutput() {
+    return 0;
 }
 
 int APS5_VABI sceAudioOutSetMixLevelPadSpk(int handle, std::uint32_t mixLevel) {

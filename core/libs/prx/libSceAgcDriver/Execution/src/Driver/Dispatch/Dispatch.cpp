@@ -22,6 +22,7 @@
 #include <string>
 #include <cstdlib>
 #include <functional>
+#include <cstring>
 #include <optional>
 #include <stdexcept>
 #include <thread>
@@ -92,6 +93,19 @@ void ReportDispatchItems(bool profile) {
     std::fprintf(stderr, "[dispatch-item] %llu commit items (%llu recipes rebuilt on the committer), %llu miss items (%llu refused on the committer); drained instead, cumulative:%s\n", static_cast<unsigned long long>(itemCommits.load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemRebuilds.load(std::memory_order_relaxed)), static_cast<unsigned long long>(missItemCommits.load(std::memory_order_relaxed)), static_cast<unsigned long long>(missItemRefusals.load(std::memory_order_relaxed)), drained.c_str());
 }
 
+bool CapturedCurrent(std::span<const ShaderRecompiler::MemoryRegion> captured, const ShaderSnapshot& code) {
+    for (const auto& region : captured) {
+        const auto address = region.guestAddress;
+        const auto bytes = region.bytes.size();
+        if (bytes == 0 || (address >= code.codeAddress && address < code.codeAddress + code.code.size() * sizeof(std::uint32_t)) || (!code.header.empty() && address >= code.headerAddress && address < code.headerAddress + code.header.size())) continue;
+        if (Driver::QueryPendingSpan(address, bytes, {}) != ShaderMemory::PendingWrite::None || !GuestMemory::Accessible(reinterpret_cast<const void*>(address), bytes)) return false;
+        GuestMemory::GuardRead(address, bytes);
+        GuestMemory::FlushGpuWrites(address, bytes);
+        if (std::memcmp(region.bytes.data(), reinterpret_cast<const void*>(address), bytes) != 0) return false;
+    }
+    return true;
+}
+
 }
 
 bool Driver::pipelineDispatch() {
@@ -137,7 +151,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
     const bool itemsOn = DispatchItemsEnabled();
     const bool missItemsOn = itemsOn && DispatchMissItemsEnabled();
     const auto address = (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20c)) << 8u) | (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20d) & 0xffu) << 40u);
-    if (address == SkippedShader() && address != 0) return;
+    if (SkippedShader(address)) return;
     struct OriginScope {
         explicit OriginScope(std::uint64_t program) { Graphics::Recorder::SetWriteOrigin(program); }
         ~OriginScope() { Graphics::Recorder::SetWriteOrigin(0); }
@@ -407,6 +421,14 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
         fromAhead = false;
         ++groupStats.keyMismatches;
     }
+    if (fromAhead) {
+        if (const auto hook = aheadAdoptHook.load(std::memory_order_acquire)) hook();
+        if (!CapturedCurrent(ahead.captured, snapshot)) {
+            fromAhead = false;
+            ++dispatchesRejectedAhead;
+            ++groupStats.memoryMismatches;
+        }
+    }
     phaseTiming.Phase(PhaseKey);
     timing.Mark("decode_key_device_setup");
     bool readsClear = false;
@@ -554,6 +576,11 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
         parked.resolvedAt = std::chrono::steady_clock::now();
         ++groupStats.resolved;
         if (cached) ++groupStats.resolvedHits;
+        if (!cached && compiledResult != nullptr && !localDevice->HasComputePipeline(*compiledResult)) {
+            SubmitLibraryPrebuild([localDevice, compiledResult, address] {
+                try { localDevice->PrebuildComputePipeline(*compiledResult, address); } catch (const std::exception&) {}
+            });
+        }
         return;
     }
     if (verifyDataHits() && dataHit) verifyDataHit(snapshot, codeOffset, request, memory, address, *keepVariant, liveWords, *compiledResult);

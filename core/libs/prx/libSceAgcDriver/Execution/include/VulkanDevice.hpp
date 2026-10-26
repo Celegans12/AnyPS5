@@ -47,9 +47,11 @@ struct DeviceQueuePlan {
     bool sparseBinding = false;
     std::uint32_t sparseFamily = VK_QUEUE_FAMILY_IGNORED;
     std::uint32_t sparseIndex = 0;
+    bool present = false;
+    std::uint32_t presentIndex = 0;
 };
 
-DeviceQueuePlan PlanDeviceQueues(std::span<const VkQueueFamilyProperties> families, std::uint32_t family, bool settles, bool sparseBinding);
+DeviceQueuePlan PlanDeviceQueues(std::span<const VkQueueFamilyProperties> families, std::uint32_t family, bool settles, bool sparseBinding, bool presents);
 
 class VulkanDevice {
 public:
@@ -60,6 +62,8 @@ public:
     // Builds the pipeline of a journaled compute result ahead of its first dispatch (the journal
     // replay's hook, on its threads): false when the device already holds a pipeline for the module.
     bool ReplayComputePipeline(const ShaderRecompiler::RecompileResult& shader, bool pushConstants);
+    bool HasComputePipeline(const ShaderRecompiler::RecompileResult& shader) const;
+    void PrebuildComputePipeline(const ShaderRecompiler::RecompileResult& shader, std::uint64_t programAddress = 0);
     // Starts the journal replay if the device has not (a headless device starts it at its first
     // draw or dispatch) and joins it (tests; the teardown joins it anyway).
     void WaitForPipelineJournalReplay();
@@ -234,7 +238,7 @@ public:
     bool ProvokingVertexLast() const;
     bool GraphicsPipelineLibraries() const;
     // A presentation is a few steps so the presenter holds GuestMemory::GpuMutex only while it
-    // touches the queue. Presentations are slots (FlipInFlight() + 1, each with its own command
+    // touches the main queue. Presentations are slots (FlipInFlight() + 1, each with its own command
     // buffer, fence, kept resident image and dump buffer): RetirePresents(keep) (no mutex) retires
     // the slots whose fence signaled, oldest first, and waits for the oldest ones until at most
     // `keep` are in flight (the only CPU wait of the flip path; it returns the time spent waiting);
@@ -243,7 +247,9 @@ public:
     // PresentClear/PresentDisplayBuffer record and submit the frame into the next slot (under the
     // mutex; the blit follows the frame's batches in queue order, so the displayed image is always
     // complete) and return whether one was submitted; QueuePresent hands the image to the swapchain
-    // (under the mutex). FinishPresent = RetirePresents(0): the render fence wait of the
+    // (on the device's presentation queue under that queue's mutex, with the GPU mutex released,
+    // when the presentation family had a free queue; otherwise on the main queue under the GPU
+    // mutex). FinishPresent = RetirePresents(0): the render fence wait of the
     // synchronous paths (APS5_FLIP_INFLIGHT=0, APS5_SYNC_FLIP, PresentPixels). AcquireImage returns
     // false when the swapchain is out of date (the frame is dropped; the next Resize recreates it);
     // a present without a prior AcquireImage acquires itself, one whose slot is in flight waits for
@@ -266,6 +272,7 @@ public:
     bool PresentDisplayBuffer(const DisplayBuffer& buffer);
     double FinishPresent();
     void QueuePresent();
+    bool PresentsOnOwnQueue() const;
     // At the flip packet (under the mutex): the recorder's submissions so far and, under
     // APS5_PROFILE_DRAW, how many in flight have not signaled (the frame record's batches_at_flip).
     void FlipBatches(std::uint64_t& submissions, std::uint64_t& unsignaled) const;
@@ -276,8 +283,8 @@ public:
     // blit-submit times after the flip packet; noted in-place reads checked
     // (APS5_FLIP_READ_CHECK=1) and found overwritten before the blit's fence.
     struct PresentStatistics {
-        std::uint64_t presents, gpuUnread, batchesAheadOfBlit, batchesAfterFlip, readsChecked, readsOverwritten, acquireDrops;
-        double gpuBusyMs, gpuGapMs, lastSubmitAfterFlipMs, blitSubmitAfterFlipMs;
+        std::uint64_t presents, gpuUnread, batchesAheadOfBlit, batchesAfterFlip, readsChecked, readsOverwritten, acquireDrops, keyWriterWaits;
+        double gpuBusyMs, gpuGapMs, lastSubmitAfterFlipMs, blitSubmitAfterFlipMs, keyWriterWaitMs;
         // The part of gpuBusyMs in batches of the async compute lane (APS5_ASYNC_LANE).
         double asyncBusyMs;
     };
@@ -347,9 +354,10 @@ public:
     static void NoteRecipe(RecipeEvent event, RecipeKind kind);
     enum class DrawRecipePrecheck : std::size_t { NoRecipe, Device };
     static void NoteDrawRecipeMiss(DrawRecipePrecheck miss);
+    using DrawTraceContext = Graphics::DrawTraceContext;
     // `recipe`, when given, receives the DrawRecipe a recorded, cacheable, reusable, direct draw
     // built for its draw-cache entry (design_cpu_final M8); null otherwise.
-    void Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, Graphics::PreparedDraw* prepared = nullptr, const Graphics::AheadDraw* ahead = nullptr);
+    void Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, Graphics::PreparedDraw* prepared = nullptr, const Graphics::AheadDraw* ahead = nullptr, const DrawTraceContext* trace = nullptr);
     // S1: the unlocked part of a draw's resource build, made ahead of the draw (Graphics::PrepareDraw).
     std::shared_ptr<Graphics::PreparedDraw> PrepareDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders);
     // The draw's HTILE pre-sync (APS5_NO_HTILE_PRESYNC=1 off): when the depth target's store-back
@@ -363,11 +371,10 @@ public:
     bool DrawInputsInPlace() const;
     std::optional<std::string> KnownDrawRejection(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders) const;
     void ColorMetadataPass(const Graphics::ColorMetadataPass& pass);
-    void DepthCopyPass(const Graphics::DepthCopyPass& pass);
     // A draw-cache hit recorded from its recipe (Graphics::DrawWithRecipe), under the mutex after
     // the packet's labels; Rebuild when the recipe's device is not this one or DrawWithRecipe
     // missed (nothing recorded: the caller runs Draw with the hit's stages and re-attaches).
-    RecipeOutcome DrawFromRecipe(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe);
+    RecipeOutcome DrawFromRecipe(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const DrawTraceContext* trace = nullptr);
     // The indirect draw features the device enabled, for the driver's decision whether an indirect
     // draw's records can be read by the GPU (Graphics::Draw) or must be resolved on the CPU.
     struct IndirectDrawSupport {
