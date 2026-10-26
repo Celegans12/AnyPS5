@@ -2415,8 +2415,8 @@ bool OwnedWordsHold(std::uint64_t address, std::size_t bytes, std::span<const st
     return GuestArena::GuestArenaOwnedUnchanged_nid_no_patch(static_cast<std::uintptr_t>(address), bytes, words.data(), words.size());
 }
 
-bool OwnedProofHolds(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> words, std::uint64_t since) {
-    if (since == 0 || !OwnedWordsHold(address, bytes, words)) return false;
+bool OwnedProofHolds(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> words, std::uint64_t since, bool wordsHeld) {
+    if (since == 0 || (!wordsHeld && !OwnedWordsHold(address, bytes, words))) return false;
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
     tracker.initialize();
@@ -2437,9 +2437,9 @@ bool OwnedProofHolds(std::uint64_t address, std::size_t bytes, std::span<const s
 OwnedBlockCounts TakeOwnedBlockCounts() {
     std::array<std::uint64_t, GuestArena::GuestArenaOwnedCountSlots> counts{};
     GuestArena::GuestArenaTakeOwnedCounts_nid_no_patch(counts.data(), counts.size());
-    OwnedBlockCounts taken{counts[0], counts[1], counts[2], counts[3], counts[4], counts[5], counts[6], counts[7], {}};
-    static_assert(GuestArena::GuestArenaOwnedCountSlots == 9 + std::tuple_size_v<decltype(taken.refusedBy)>);
-    for (std::size_t i = 0; i < taken.refusedBy.size(); ++i) taken.refusedBy[i] = counts[9 + i];
+    OwnedBlockCounts taken{counts[0], counts[1], counts[2], counts[3], counts[4], counts[5], counts[6], counts[7], counts[8], counts[9], counts[10], counts[11], counts[12], {}};
+    static_assert(GuestArena::GuestArenaOwnedCountSlots == 14 + std::tuple_size_v<decltype(taken.refusedBy)>);
+    for (std::size_t i = 0; i < taken.refusedBy.size(); ++i) taken.refusedBy[i] = counts[14 + i];
     return taken;
 }
 

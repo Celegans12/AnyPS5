@@ -612,9 +612,9 @@ bool GuestArenaOwnedUnchanged_nid_no_patch(std::uintptr_t address, std::size_t b
 
 void GuestArenaTakeOwnedCounts_nid_no_patch(std::uint64_t* counts, std::size_t count) {
     const auto taken = WindowsMappings::Get().TakeOwnedCounts();
-    std::array<std::uint64_t, GuestArenaOwnedCountSlots> values{taken.arms, taken.armedBlocks, taken.refused, taken.faults, taken.disowned, taken.privateBlocks, taken.unmappedBlocks, taken.partialBlocks};
-    static_assert(8 + WindowsMappings::OwnedRefusalCount == GuestArenaOwnedCountSlots);
-    for (std::size_t i = 0; i < WindowsMappings::OwnedRefusalCount; ++i) values[8 + i] = taken.reasons[i];
+    std::array<std::uint64_t, GuestArenaOwnedCountSlots> values{taken.arms, taken.armedBlocks, taken.refused, taken.faults, taken.disowned, taken.privateBlocks, taken.unmappedBlocks, taken.partialBlocks, taken.collected, taken.taken, taken.queries, taken.dirty, taken.locked};
+    static_assert(13 + WindowsMappings::OwnedRefusalCount == GuestArenaOwnedCountSlots);
+    for (std::size_t i = 0; i < WindowsMappings::OwnedRefusalCount; ++i) values[13 + i] = taken.reasons[i];
     for (std::size_t i = 0; i < count && i < values.size(); ++i) counts[i] = values[i];
 }
 

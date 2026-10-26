@@ -963,7 +963,7 @@ void reportOwnedProofs() {
     const auto verified = take(counters.verified);
     const auto disagreed = take(counters.disagreed);
     const auto by = [&](std::size_t reason) { return static_cast<unsigned long long>(blocks.refusedBy[reason]); };
-    AgcDriver::ProfilePrint_nid_no_patch("[owned-proofs] (10 s): armed proofs %llu held, %llu found the words moved, %llu found stamps or guard moved; fallback proofs (walks) %llu: %llu armed first, %llu not armable, %llu backing off, %llu switched off; arms %llu (blocks newly armed %llu: %llu with private pages, %llu with nothing mapped, %llu partly mapped), refused %llu (outside the arena or host region %llu, shared or aliased view %llu, pinned or importing %llu, host write open %llu, protection change in flight %llu, not writable or other mapping %llu, private not allowed %llu, nothing mapped %llu); faults %llu, other disarms %llu; verified %llu, disagreed %llu\n", held, wordsMoved, stampsMoved, walks, armedWalks, notArmable, backingOff, switchedOff, static_cast<unsigned long long>(blocks.arms), static_cast<unsigned long long>(blocks.armedBlocks), static_cast<unsigned long long>(blocks.privateBlocks), static_cast<unsigned long long>(blocks.unmappedBlocks), static_cast<unsigned long long>(blocks.partialBlocks), static_cast<unsigned long long>(blocks.refused), by(0), by(1), by(2), by(3), by(4), by(5), by(6), by(7), static_cast<unsigned long long>(blocks.faults), static_cast<unsigned long long>(blocks.disowned), verified, disagreed);
+    AgcDriver::ProfilePrint_nid_no_patch("[owned-proofs] (10 s): armed proofs %llu held, %llu found the words moved, %llu found stamps or guard moved; fallback proofs (walks) %llu: %llu armed first, %llu not armable, %llu backing off, %llu switched off; arms %llu (blocks newly armed %llu: %llu with private pages, %llu with nothing mapped, %llu partly mapped), refused %llu (outside the arena or host region %llu, shared or aliased view %llu, pinned or importing %llu, host write open %llu, protection change in flight %llu, not writable or other mapping %llu, private not allowed %llu, nothing mapped %llu, not write-watched %llu); write-watch queries %llu (%llu found a written page, %llu proofs asked again under the lock), disarms by a collect %llu, pages taken at arming %llu, other disarms %llu; guest write faults in owned blocks %llu (owned blocks change no protection: none is theirs); verified %llu, disagreed %llu\n", held, wordsMoved, stampsMoved, walks, armedWalks, notArmable, backingOff, switchedOff, static_cast<unsigned long long>(blocks.arms), static_cast<unsigned long long>(blocks.armedBlocks), static_cast<unsigned long long>(blocks.privateBlocks), static_cast<unsigned long long>(blocks.unmappedBlocks), static_cast<unsigned long long>(blocks.partialBlocks), static_cast<unsigned long long>(blocks.refused), by(0), by(1), by(2), by(3), by(4), by(5), by(6), by(7), by(8), static_cast<unsigned long long>(blocks.queries), static_cast<unsigned long long>(blocks.dirty), static_cast<unsigned long long>(blocks.locked), static_cast<unsigned long long>(blocks.collected), static_cast<unsigned long long>(blocks.taken), static_cast<unsigned long long>(blocks.disowned), static_cast<unsigned long long>(blocks.faults), verified, disagreed);
 }
 
 // APS5_VERIFY_OWNED_PROOFS=<n>: the first n held armed proofs of every 10 s also run a full walk and
@@ -987,11 +987,12 @@ bool takeOwnedVerify() {
 // (not armable, armed words that moved, stamps or guard that moved) walks as before; the walk is
 // armed first when it can be, so the next proof can take the armed path.
 //
-// Exactness: arming write-protects the blocks before the walk starts. A CPU store before it is
-// seen by the walk (dirty bits) or the compare (the bytes), exactly as without arming. A CPU store
-// after it faults and moves the block's word before it lands, and a mapping, protection or host
-// write change moves it before it happens, so an unchanged word means no such change since the
-// walk started. The driver's and the GPU's writes reach the range through the tracker (MarkWritten
+// Exactness: arming resets the blocks' write-watch bits before the walk starts, keeping the pages
+// it takes reported to the walk's collect, so a CPU store before it is seen by the walk (dirty
+// bits) or the compare (the bytes), exactly as without arming. A CPU store after it leaves a write
+// bit that OwnedWordsHold finds (GetWriteWatch, no reset, no fault), or that a later collect takes,
+// which moves the block's word; a mapping, protection or host write change moves the word before it
+// happens. So unchanged words and no written page mean no such change since the walk started. The driver's and the GPU's writes reach the range through the tracker (MarkWritten
 // stamps, untracked-host stores), recorded but unstamped ones through the guard's write note and
 // the pending write snapshot, the same evidence the walk itself uses for the blocks it skips. The
 // flush hook runs first, as before the walk's compare.
@@ -1010,7 +1011,7 @@ bool untrackedStillMatches(std::uint64_t address, std::size_t bytes, std::span<c
         GuestMemory::FlushGpuWrites(address, bytes);
         const auto now = untrackedGuard(address, bytes);
         const bool wordsHold = GuestMemory::OwnedWordsHold(address, bytes, owned.words);
-        const bool holds = wordsHold && (now[0] & 1u) == 0 && now == guard && !Recorder::SnapshotWriteOverlaps(address, bytes) && GuestMemory::OwnedProofHolds(address, bytes, owned.words, since);
+        const bool holds = wordsHold && (now[0] & 1u) == 0 && now == guard && !Recorder::SnapshotWriteOverlaps(address, bytes) && GuestMemory::OwnedProofHolds(address, bytes, owned.words, since, true);
         if (holds) {
             owned.backoff = 0;
             bool equal = true;

@@ -91,24 +91,32 @@ bool CommittedBlocksMatchSince(std::uint64_t address, std::size_t bytes, std::sp
 
 // Owned blocks (the owned proofs of untracked snapshots, APS5_NO_OWNED_PROOFS; Windows only, see
 // GuestArena::GuestArenaArmOwned_nid_no_patch): the 64 KiB blocks of a range (one word per
-// HashBlockCount block) are write-protected, so the first CPU store into one moves its word before
-// the store lands, as does every mapping or protection change and every host write opened over it.
-// ArmOwnedBlocks arms them all or none. A walk made after it that proves the range current at a
-// tracker generation `since` (WalkUntrackedBlocks, then the compare) stays valid while
-// OwnedProofHolds: every word unchanged (no CPU store since the arming) and no tracker stamp
+// HashBlockCount block) are write-watched memory whose bits the arming resets (the pages it takes
+// stay reported to the write tracker), so a later CPU store leaves a write bit that
+// OwnedWordsHold finds with GetWriteWatch, without a fault or a protection change; a collect that
+// takes such a bit, every mapping or protection change and every host write opened over a block
+// moves its word. ArmOwnedBlocks arms them all or none. A walk made after it that proves the range
+// current at a tracker generation `since` (WalkUntrackedBlocks, then the compare) stays valid while
+// OwnedProofHolds: every word unchanged and no page written (no CPU store since the arming), no tracker stamp
 // (MarkWritten, a collect, a host-region store) or untracked hint newer than `since` over the range,
 // which is what the walk checks for the driver's and the GPU's writes. Recorded GPU writes not yet
 // stamped are the caller's to check (the write notes, as for the walk).
 // `allowPrivate`: private commits (flexible and memory-pool memory) may be armed too.
 bool ArmOwnedBlocks(std::uint64_t address, std::size_t bytes, std::span<std::uint64_t> words, bool allowPrivate = true);
 bool OwnedWordsHold(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> words);
-bool OwnedProofHolds(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> words, std::uint64_t since);
+// `wordsHeld`: the caller has just seen OwnedWordsHold hold for these words (one GetWriteWatch
+// query per proof instead of two).
+bool OwnedProofHolds(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> words, std::uint64_t since, bool wordsHeld = false);
 // Arms (all blocks armed), blocks newly armed (of them with private pages, with nothing mapped, partly
 // mapped: placeholders are proved by the word alone, see WindowsMappings::ownable), arms refused
 // (by reason: outside the arena or a host region, shared or aliased view, pinned or importing, host
 // write open, protection change in flight, not writable or another mapping type, private while not
-// allowed, nothing mapped), blocks disarmed by a CPU store, blocks disarmed by a mapping, protection
-// or host-write change, since the last call.
+// allowed, nothing mapped, not write-watched), guest write faults inside armed blocks (owned blocks
+// never write-protect, so none is theirs), blocks disarmed by a mapping, protection or host-write
+// change, blocks disarmed by a collect that took a CPU-written page, pages whose write bits an arming
+// took, OwnedWordsHold GetWriteWatch queries and those that found a written page, OwnedWordsHold
+// answers asked again under the mapping lock (a collect's reset ran across the first), since the
+// last call.
 struct OwnedBlockCounts {
     std::uint64_t arms = 0;
     std::uint64_t armedBlocks = 0;
@@ -118,7 +126,12 @@ struct OwnedBlockCounts {
     std::uint64_t privateBlocks = 0;
     std::uint64_t unmappedBlocks = 0;
     std::uint64_t partialBlocks = 0;
-    std::array<std::uint64_t, 8> refusedBy{};
+    std::uint64_t collected = 0;
+    std::uint64_t taken = 0;
+    std::uint64_t queries = 0;
+    std::uint64_t dirty = 0;
+    std::uint64_t locked = 0;
+    std::array<std::uint64_t, 9> refusedBy{};
 };
 OwnedBlockCounts TakeOwnedBlockCounts();
 

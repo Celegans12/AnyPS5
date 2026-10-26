@@ -5665,7 +5665,7 @@ std::optional<GuestBufferMemory::GpuSource> GuestBufferMemory::FindGpuSource(std
             if (entry.feedback != nullptr) entry.feedback->fetch_or(2, std::memory_order_relaxed);
             return std::nullopt;
         }
-        if (!GuestMemory::OwnedProofHolds(entry.regionBegin, regionBytes, entry.words, entry.after)) {
+        if (!GuestMemory::OwnedProofHolds(entry.regionBegin, regionBytes, entry.words, entry.after, true)) {
             miss = GpuSourceMiss::Stored;
             return std::nullopt;
         }

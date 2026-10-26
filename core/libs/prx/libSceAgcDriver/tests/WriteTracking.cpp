@@ -17,6 +17,7 @@
 #include <malloc.h>
 #endif
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <span>
@@ -1963,9 +1964,28 @@ void CheckAdoptLatestEpoch() {
 
 #ifdef _WIN32
 // Owned proofs (GuestMemory::ArmOwnedBlocks / OwnedWordsHold / OwnedProofHolds over the libc arena's
-// resident direct memory, through libc's own fault handler): every CPU store, host write, protection
-// or mapping change of an armed block moves its word before it takes effect, across threads; what
-// cannot be armed (private memory, aliased views, host memory) is refused.
+// resident direct memory and private commits, by write watch): every CPU store into an armed block
+// is seen without a fault (no access violation reaches any handler and the protection never
+// changes), every host write, protection or mapping change moves its word before it takes effect,
+// across threads; the write bits an arming takes still reach the collects; what cannot be armed
+// (aliased views, host memory) is refused.
+std::atomic<std::uint64_t> ownedAccessViolations{0};
+
+LONG CALLBACK CountOwnedAccessViolations(EXCEPTION_POINTERS* info) {
+    if (info->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) ownedAccessViolations.fetch_add(1, std::memory_order_relaxed);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+// Counts the access violations raised while it lives, ahead of every other handler.
+struct FaultCounter {
+    PVOID handler = AddVectoredExceptionHandler(1, CountOwnedAccessViolations);
+    std::uint64_t before = ownedAccessViolations.load();
+    FaultCounter() { Require(handler != nullptr, "cannot install the access violation counter"); }
+    ~FaultCounter() { RemoveVectoredExceptionHandler(handler); }
+    FaultCounter(const FaultCounter&) = delete;
+    FaultCounter& operator=(const FaultCounter&) = delete;
+    std::uint64_t Faults() const { return ownedAccessViolations.load() - before; }
+};
 struct DirectFixture {
     std::size_t bytes;
     std::uint8_t* memory = nullptr;
@@ -2005,13 +2025,16 @@ std::vector<std::uint64_t> ArmOwned(std::uint64_t address, std::size_t bytes) {
 }
 
 // Refusal reasons, as GuestMemory::OwnedBlockCounts::refusedBy counts them.
-enum OwnedReason : std::size_t { ReasonOutside, ReasonShared, ReasonPinned, ReasonHostWrite, ReasonInFlight, ReasonNotWritable, ReasonPrivate, ReasonEmpty };
+enum OwnedReason : std::size_t { ReasonOutside, ReasonShared, ReasonPinned, ReasonHostWrite, ReasonInFlight, ReasonNotWritable, ReasonPrivate, ReasonEmpty, ReasonUnwatched };
 
 struct PrivateFixture {
     std::size_t bytes;
     std::uint8_t* memory = nullptr;
 
-    PrivateFixture(std::size_t bytes, std::size_t committed) : bytes(bytes) {
+    std::size_t granule = 16384;
+    std::uint64_t touched = 0;
+
+    PrivateFixture(std::size_t bytes, std::size_t committed, std::size_t granule = 16384) : bytes(bytes), granule(granule) {
         memory = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, Block));
         Require(memory != nullptr, "cannot reserve the private owned-proof fixture");
         if (committed != 0) Commit(0, committed);
@@ -2023,7 +2046,8 @@ struct PrivateFixture {
     PrivateFixture(const PrivateFixture&) = delete;
     PrivateFixture& operator=(const PrivateFixture&) = delete;
     void Commit(std::size_t offset, std::size_t length) {
-        GuestArena::GuestArenaCommit_nid_postfix(memory + offset, length, PAGE_READWRITE, 16384);
+        GuestArena::GuestArenaCommit_nid_postfix(memory + offset, length, PAGE_READWRITE, granule);
+        for (std::size_t page = offset; page < offset + length; page += 4096) touched += At(page);
     }
     std::uint64_t Base() const { return reinterpret_cast<std::uint64_t>(memory); }
     volatile std::uint8_t& At(std::size_t offset) { return static_cast<volatile std::uint8_t*>(memory)[offset]; }
@@ -2035,9 +2059,10 @@ struct PrivateFixture {
 };
 
 void CheckOwnedPrivate() {
-    // Private commits (flexible and memory-pool memory): refused while not allowed, else armed, and
-    // a store faults, moves the word and lands; the page gets its own protection back.
+    // Private commits (flexible and memory-pool memory): refused while not allowed, else armed with
+    // their protection untouched, and a store lands without a fault and ends its block's proof.
     {
+        const FaultCounter faults;
         PrivateFixture fixture(2 * Block, 2 * Block);
         const auto base = fixture.Base();
         TakeOwnedBlockCounts();
@@ -2051,15 +2076,47 @@ void CheckOwnedPrivate() {
             for (const auto count : refused.refusedBy) reasons += " " + std::to_string(count);
             Require(false, "private memory was not armed, refusals by reason:" + reasons);
         }
-        Require(fixture.Protection(0) == PAGE_READONLY && fixture.Protection(2 * Block - 1) == PAGE_READONLY, "private memory was not write-protected, protection " + std::to_string(fixture.Protection(0)));
+        Require(fixture.Protection(0) == PAGE_READWRITE && fixture.Protection(2 * Block - 1) == PAGE_READWRITE, "arming changed the protection of private memory to " + std::to_string(fixture.Protection(0)));
         Require(fixture.At(70000) == 0 && OwnedWordsHold(base, 2 * Block, words), "a read of armed private memory moved its words");
         fixture.At(70000) = 0x5a;
         Require(fixture.At(70000) == 0x5a && !OwnedWordsHold(base, 2 * Block, words) && OwnedWordsHold(base, Block, std::span(words).first(1)), "a store into armed private memory was missed or moved another block");
-        Require(fixture.Protection(Block) == PAGE_READWRITE && fixture.Protection(0) == PAGE_READONLY, "the private fault opened more or less than its block");
+        Require(fixture.Protection(Block) == PAGE_READWRITE && fixture.Protection(0) == PAGE_READWRITE, "a store into armed private memory changed a protection");
         const auto counts = TakeOwnedBlockCounts();
-        Require(counts.privateBlocks == 2 && counts.faults == 1, "private arming was not counted");
+        Require(counts.privateBlocks == 2 && counts.faults == 0 && counts.dirty == 1, "private arming was not counted, or the store was not seen as a written page");
         std::thread([&] { fixture.At(100) = 1; }).join();
         Require(!OwnedWordsHold(base, Block, std::span(words).first(1)) && fixture.At(100) == 1, "a store into armed private memory from another thread was missed");
+        Require(faults.Faults() == 0 && TakeOwnedBlockCounts().faults == 0, "a store into armed private memory raised an access violation");
+    }
+    // The write bits an arming takes still reach the collects, in address order and within their
+    // capacity; a collect that takes a bit written after the arming moves the block's word.
+    {
+        PrivateFixture fixture(Block, Block);
+        const auto base = fixture.Base();
+        std::array<void*, 2> pages{};
+        std::size_t count = pages.size();
+        Require(GuestArena::GuestArenaCollectWrites_nid_postfix(base, Block, pages.data(), &count, true), "cannot settle the collect fixture");
+        while (count == pages.size()) {
+            count = pages.size();
+            Require(GuestArena::GuestArenaCollectWrites_nid_postfix(base, Block, pages.data(), &count, true), "cannot settle the collect fixture");
+        }
+        for (std::size_t page = 0; page < 3; ++page) fixture.At(page * 4096) = 1;
+        TakeOwnedBlockCounts();
+        const auto words = ArmOwned(base, Block);
+        Require(words.size() == 1 && OwnedWordsHold(base, Block, words), "the collect fixture could not be armed clean");
+        Require(TakeOwnedBlockCounts().taken == 3, "the arming did not take the three written pages");
+        fixture.At(3 * 4096) = 1;
+        Require(!OwnedWordsHold(base, Block, words), "a store after the arming was missed");
+        count = pages.size();
+        Require(GuestArena::GuestArenaCollectWrites_nid_postfix(base, Block, pages.data(), &count, false) && count == 2 && pages[0] == fixture.memory && pages[1] == fixture.memory + 4096, "a peek did not report the taken pages first");
+        count = pages.size();
+        Require(GuestArena::GuestArenaCollectWrites_nid_postfix(base, Block, pages.data(), &count, true) && count == 2 && pages[0] == fixture.memory && pages[1] == fixture.memory + 4096, "a clearing collect did not report the taken pages first");
+        Require(TakeOwnedBlockCounts().collected == 1, "a collect that took a page written after the arming did not move the word");
+        count = pages.size();
+        Require(GuestArena::GuestArenaCollectWrites_nid_postfix(base, Block, pages.data(), &count, true) && count == 2 && pages[0] == fixture.memory + 2 * 4096 && pages[1] == fixture.memory + 3 * 4096, "the pages past the capacity were not reported next");
+        count = pages.size();
+        Require(GuestArena::GuestArenaCollectWrites_nid_postfix(base, Block, pages.data(), &count, true) && count == 0, "a page was reported twice");
+        const auto again = ArmOwned(base, Block);
+        Require(again.size() == 1 && again[0] != words[0] && OwnedWordsHold(base, Block, again), "the block was not armed afresh after its writes were collected");
     }
     // A block of private pages and reserved placeholders is armed; committing the rest moves it.
     {
@@ -2153,7 +2210,7 @@ void CheckOwnedPrivate() {
         Require(fixture.At(Block + 16384) == 4 && fixture.Protection(Block + 16384) == PAGE_READWRITE, "the page committed into an armed unmapped block is not plain writable memory");
         const auto mixed = ArmOwned(base + Block, Block);
         Require(mixed.size() == 1 && TakeOwnedBlockCounts().partialBlocks == 1, "a partly committed block was not armed as partly mapped");
-        Require(fixture.Protection(Block + 16384) == PAGE_READONLY, "the mapped page of a mixed block was not protected");
+        Require(fixture.Protection(Block + 16384) == PAGE_READWRITE, "arming changed the protection of the mapped page of a mixed block");
         fixture.At(Block + 16385) = 5;
         Require(!OwnedWordsHold(base + Block, Block, mixed) && fixture.At(Block + 16385) == 5, "a store into the mapped page of a mixed block was missed");
     }
@@ -2179,6 +2236,7 @@ void CheckOwnedPrivate() {
 }
 
 void CheckOwnedStampOnWrite() {
+    const FaultCounter faults;
     DirectFixture fixture(4 * Block, 4 * Block);
     const auto base = fixture.Base();
     std::uintptr_t spanBegin = 0;
@@ -2188,7 +2246,7 @@ void CheckOwnedStampOnWrite() {
     fixture.At(Block + 17) = 0x21;
     const auto words = ArmOwned(base + 100, 2 * Block);
     Require(words.size() == 3, "resident direct memory with one view could not be armed");
-    Require(fixture.Protection(0) == PAGE_READONLY && fixture.Protection(2 * Block + 4096) == PAGE_READONLY && fixture.Protection(3 * Block) == PAGE_READWRITE, "arming did not write-protect exactly its blocks");
+    Require(fixture.Protection(0) == PAGE_READWRITE && fixture.Protection(2 * Block + 4096) == PAGE_READWRITE && fixture.Protection(3 * Block) == PAGE_READWRITE, "arming changed a protection");
     Require(OwnedWordsHold(base + 100, 2 * Block, words), "armed words do not hold without a store");
     Require(fixture.At(Block + 17) == 0x21, "a read of armed memory changed it");
     Require(OwnedWordsHold(base + 100, 2 * Block, words), "a read moved the armed words");
@@ -2198,10 +2256,11 @@ void CheckOwnedStampOnWrite() {
     Require(fixture.At(Block + 18) == 0x42, "the store into armed memory did not land");
     Require(!OwnedWordsHold(base + 100, 2 * Block, words) && !OwnedProofHolds(base + 100, 2 * Block, words, since), "a CPU store into an armed block left its words");
     Require(OwnedWordsHold(base, Block, std::span(words).first(1)) && OwnedWordsHold(base + 2 * Block, Block, std::span(words).subspan(2, 1)), "a CPU store moved the words of other blocks");
-    Require(fixture.Protection(Block) == PAGE_READWRITE && fixture.Protection(0) == PAGE_READONLY, "the fault opened more or less than its block");
+    Require(fixture.Protection(Block) == PAGE_READWRITE && fixture.Protection(0) == PAGE_READWRITE, "a store into armed memory changed a protection");
     const auto counts = TakeOwnedBlockCounts();
-    Require(counts.arms == 1 && counts.armedBlocks == 3 && counts.faults == 1, "owned counts do not show one arm of three blocks and one fault");
-    std::cout << "owned proofs: arm, read, store faults and moves only its block's word\n";
+    Require(counts.arms == 1 && counts.armedBlocks == 3 && counts.faults == 0 && counts.taken == 1 && counts.dirty == 2, "owned counts do not show one arm of three blocks, one taken page and two written answers without a fault");
+    Require(faults.Faults() == 0, "a store into armed memory raised an access violation");
+    std::cout << "owned proofs: arm, read, a store is seen by write watch without a fault and ends only its block's proof\n";
 
     // A driver stamp (MarkWritten: a GPU write through an import) ends the proof through the tracker.
     const auto again = ArmOwned(base, Block);
@@ -2214,24 +2273,27 @@ void CheckOwnedStampOnWrite() {
 }
 
 void CheckOwnedRearm() {
+    const FaultCounter faults;
     DirectFixture fixture(2 * Block, 2 * Block);
     const auto base = fixture.Base();
     TakeOwnedBlockCounts();
     std::uint64_t previous = 0;
     for (unsigned round = 0; round < 8; ++round) {
         const auto words = ArmOwned(base, 2 * Block);
-        Require(words.size() == 2 && words[0] != previous && (words[0] & 1u) != 0, "a faulted block was not re-armed with a new word");
+        Require(words.size() == 2 && words[0] != previous && (words[0] & 1u) != 0, "a written block was not re-armed with a new word");
         previous = words[0];
         Require(OwnedWordsHold(base, 2 * Block, words), "re-armed words do not hold");
         fixture.At(round * 4096 + 3) = static_cast<std::uint8_t>(round + 1);
         Require(!OwnedWordsHold(base, 2 * Block, words) && fixture.At(round * 4096 + 3) == round + 1, "a store after re-arming was missed");
     }
     const auto counts = TakeOwnedBlockCounts();
-    Require(counts.faults == 8 && counts.arms == 8 && counts.armedBlocks == 9, "re-arm rounds did not fault once each");
-    std::cout << "owned proofs: re-armed after every fault, each store seen\n";
+    Require(counts.faults == 0 && counts.collected == 7 && counts.arms == 8 && counts.armedBlocks == 9, "re-arm rounds did not re-arm the written block once each without a fault");
+    Require(faults.Faults() == 0, "a store into re-armed memory raised an access violation");
+    std::cout << "owned proofs: re-armed after every store, each store seen, no fault\n";
 }
 
 void CheckOwnedCrossThread() {
+    const FaultCounter faults;
     DirectFixture fixture(Block, Block);
     const auto base = fixture.Base();
     auto* value = reinterpret_cast<volatile std::uint32_t*>(fixture.memory + 0x2000);
@@ -2279,6 +2341,7 @@ void CheckOwnedCrossThread() {
     stop = true;
     writer.join();
     Require(moved > 0, "the racing writer never moved the words");
+    Require(faults.Faults() == 0 && TakeOwnedBlockCounts().faults == 0, "the racing stores raised an access violation");
     std::cout << "owned proofs: cross-thread stores, " << held << " checks held, " << moved << " saw the store\n";
 }
 
@@ -2311,6 +2374,58 @@ void CheckOwnedRefusals() {
     std::vector<std::uint8_t> host(2 * Block);
     Require(ArmOwned(reinterpret_cast<std::uint64_t>(host.data()), Block).empty(), "host memory was armed");
     std::cout << "owned proofs: aliased views and host memory refused" << std::endl;
+}
+
+// --owned-bench: the cost of one held owned proof (write-watch queries) against the walk it
+// replaces (WalkUntrackedBlocks with its layout walk) and the full compare the walk falls back to,
+// and of one arming, over resident direct memory and private commits of several sizes.
+void BenchOwnedProofs() {
+    using AgcDriver::ContentHash::Hash128;
+    const auto bench = [](const char* kind, std::uint64_t base, std::size_t bytes) {
+        constexpr int Rounds = 2000;
+        std::vector<std::uint8_t> stale(HashBlockCount(base, bytes));
+        std::vector<Hash128> hashes(HashBlockCount(base, bytes));
+        HashCommittedBlocks(base, bytes, hashes);
+        Commitment layout = DescribeCommitted(base, bytes);
+        const auto words = ArmOwned(base, bytes);
+        Require(!words.empty(), std::string("cannot arm the bench fixture: ") + kind);
+        const auto since = TrackerGeneration();
+        const auto timed = [&](auto&& step) {
+            const auto start = std::chrono::steady_clock::now();
+            for (int round = 0; round < Rounds; ++round) step();
+            return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count() / Rounds;
+        };
+        TakeOwnedBlockCounts();
+        const auto proof = timed([&] { Require(OwnedProofHolds(base, bytes, words, since), "the bench proof did not hold"); });
+        const auto counts = TakeOwnedBlockCounts();
+        std::uint64_t previous = CollectWrites(base, bytes);
+        if (previous == 0) previous = WalkUntrackedBlocks(base, bytes, 0, stale, nullptr, &layout, &layout);
+        const auto walk = timed([&] {
+            Commitment now;
+            WalkUntrackedBlocks(base, bytes, previous, stale, nullptr, &layout, &now);
+        });
+        const auto compare = timed([&] { Require(CommittedBlocksMatch(base, bytes, hashes), "the bench surface changed"); });
+        const auto arm = timed([&] {
+            std::vector<std::uint64_t> again(HashBlockCount(base, bytes));
+            *reinterpret_cast<volatile std::uint8_t*>(base) = 1;
+            Require(ArmOwnedBlocks(base, bytes, again), "the bench fixture could not be re-armed");
+        });
+        std::cout << "[owned-bench] " << kind << " " << (bytes >> 10) << " KiB: held proof " << proof << " us (" << static_cast<double>(counts.queries) / Rounds << " GetWriteWatch per proof, " << counts.locked << " under the lock), walk " << walk << " us, full compare " << compare << " us, store + re-arm " << arm << " us\n";
+    };
+    for (const std::size_t bytes : {Block, std::size_t{1} << 20, std::size_t{8} << 20}) {
+        {
+            DirectFixture fixture(bytes, bytes);
+            bench("resident direct", fixture.Base(), bytes);
+        }
+        {
+            PrivateFixture fixture(bytes, bytes, 16384);
+            bench("private, 16 KiB commits", fixture.Base(), bytes);
+        }
+        {
+            PrivateFixture fixture(bytes, bytes, bytes);
+            bench("private, one commit", fixture.Base(), bytes);
+        }
+    }
 }
 
 void CheckOwnedMappingChanges() {
@@ -2417,6 +2532,10 @@ int main(int argc, char** argv) {
         }
         if (std::wstring_view(GetCommandLineW()).ends_with(ResidentRemapMode)) {
             CheckResidentDirectMappingReuse();
+            return 0;
+        }
+        if (std::wstring_view(GetCommandLineW()).ends_with(L"--owned-bench")) {
+            BenchOwnedProofs();
             return 0;
         }
         if (std::wstring_view(GetCommandLineW()).ends_with(OwnedProofsMode)) {

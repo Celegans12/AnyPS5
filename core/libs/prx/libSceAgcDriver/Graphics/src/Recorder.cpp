@@ -3889,7 +3889,7 @@ std::shared_ptr<Buffer> Recorder::OwnedDrawSnapshot(std::uint64_t address, std::
             miss = OwnedSnapshotMiss::WordsMoved;
             entry.backoff = static_cast<std::uint8_t>(std::min<unsigned>(entry.backoff + 1u, 6u));
             entry.skip = static_cast<std::uint16_t>((1u << entry.backoff) - 1u);
-        } else if (!GuestMemory::OwnedProofHolds(address, bytes, entry.words, entry.since)) {
+        } else if (!GuestMemory::OwnedProofHolds(address, bytes, entry.words, entry.since, true)) {
             miss = OwnedSnapshotMiss::StampsMoved;
         } else {
             miss = OwnedSnapshotMiss::None;
