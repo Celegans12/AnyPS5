@@ -88,6 +88,7 @@ private:
     void snapshot(const Range& range);
     void writeReferenceFrames();
     void writeFrameReference();
+    void writeCheckpoint();
     std::vector<PrologueShader> prologueShaders(std::span<const Shader* const> shaders, bool registration);
     void writePrologue();
     void writeAliasedPages();
@@ -123,6 +124,10 @@ private:
     std::optional<DisplayBuffer> lastPresented;
     std::uint64_t presents = 0;
     std::uint64_t referenceIndex = 0;
+    std::uint64_t checkpointFrame = 0;
+    std::uint64_t checkpointBlocks = 0;
+    std::uint64_t checkpointBytes = 0;
+    std::map<std::uint64_t, std::uint64_t> blockHashes;
     std::uint64_t ordinal = 0;
     std::uint64_t boundaries = 0;
     std::uint64_t startBoundary = 0;

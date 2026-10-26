@@ -161,6 +161,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 | `APS5_FORCE_STRUCTURIZER_FALLBACK` | presence | `core/libs/prx/libSceAgcDriver/tests/ControlFlow.cpp` |  | makes the control-flow test expect the reach-flag fallback instead of no cloning |
 | `APS5_FRAME_CAPTURE` | string | `core/libs/prx/libSceAgcDriver/Execution/src/FrameRecorder.cpp` |  | directory in which the driver records a few frames of the title's driver calls and guest memory for `agc_frame_replay` |
 | `APS5_FRAME_CAPTURE_AT_FLIP` | integer | `core/libs/prx/libSceAgcDriver/Execution/src/FrameRecorder.cpp` | 1 | frame boundary (CPU flip or submission that flips) at which the frame capture starts when no trigger file is set |
+| `APS5_FRAME_CAPTURE_CHECKPOINT` | integer | `core/libs/prx/libSceAgcDriver/Execution/src/FrameRecorder.cpp` | 0 | after this captured frame the frame capture settles the GPU and stores every 64 KiB block that differs from the snapshot, for agc_frame_replay --checkpoint; 0 stores none |
 | `APS5_FRAME_CAPTURE_FRAMES` | integer | `core/libs/prx/libSceAgcDriver/Execution/src/FrameRecorder.cpp` | 10 | number of frame boundaries the frame capture records |
 | `APS5_FRAME_CAPTURE_TRIGGER` | string | `core/libs/prx/libSceAgcDriver/Execution/src/FrameRecorder.cpp` |  | file whose appearance starts the frame capture at the next frame boundary; a number in it replaces the frame count |
 | `APS5_FULL_BARRIERS` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Recorder.cpp` |  | records every barrier instead of merging redundant ones |
