@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -373,6 +374,7 @@ bool ImportsStayWatchedThroughReads(const AgcDriver::Graphics::Context& context)
 
 int main(int argc, char** argv) {
     SetBudgets();
+    AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::NoDispatchAdmission, true);
     try {
         {
             const auto device = OpenVulkanTestDevice();

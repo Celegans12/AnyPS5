@@ -73,6 +73,7 @@ enum class RuntimeSwitch : std::size_t {
     NoDrawPlans,
     NoPlannedTargets,
     NoDispatchShapeKeys,
+    NoComputeTemplateBudget,
     Count,
 };
 
