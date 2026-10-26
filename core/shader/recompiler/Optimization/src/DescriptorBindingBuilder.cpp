@@ -363,6 +363,7 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
             const auto first = PipelineSpecialization::BufferBase + index * PipelineSpecialization::BufferWords;
             if (stage != IrShaderStage::Compute) plan.specialization.push_back({first, fields.word1});
             plan.specialization.push_back({first + 1u, fields.word3});
+            if (stage == IrShaderStage::Compute && buffer.descriptorFormatted) plan.specialization.push_back({first + PipelineSpecialization::BufferRuntimeFormatWord, !fields.known && PipelineSpecialization::AbsentRuntimeFormat() ? 1u : 0u});
             plan.specialization.push_back({first + 3u, misalignment});
         }
         if (buffer.formattedReadMask != 0u) {

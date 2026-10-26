@@ -1143,6 +1143,41 @@ std::shared_ptr<const std::set<std::uint32_t>> declaredSpecializationIds(const C
     return declared.emplace(artifact.variantId, std::move(ids)).first->second;
 }
 
+bool RuntimeFormatFlagPosition(const std::vector<std::uint64_t>& key, std::size_t position) {
+    if (position < 2u) return false;
+    const auto id = static_cast<std::uint32_t>(key[position] >> 32u);
+    return id < PipelineSpecialization::ImageBase && id % PipelineSpecialization::BufferWords == PipelineSpecialization::BufferRuntimeFormatWord && static_cast<std::uint32_t>(key[position - 1u] >> 32u) + 1u == id;
+}
+
+struct RuntimeFormatCandidate {
+    std::vector<std::uint64_t> key;
+    std::shared_ptr<SpecializedModuleEntry> entry;
+    std::size_t absent = 0;
+};
+
+std::size_t RuntimeFormatAbsentCount(const std::vector<std::uint64_t>& key) {
+    std::size_t absent = 0;
+    for (std::size_t position = 2; position < key.size(); ++position)
+        if (RuntimeFormatFlagPosition(key, position) && (key[position] & 0xffffffffu) == 1u) ++absent;
+    return absent;
+}
+
+bool RuntimeFormatCompatible(const std::vector<std::uint64_t>& candidate, const std::vector<std::uint64_t>& key) {
+    if (candidate.size() != key.size()) return false;
+    std::vector<bool> swapped(key.size(), false);
+    for (std::size_t position = 1; position < key.size(); ++position) {
+        if ((candidate[position] >> 32u) != (key[position] >> 32u)) return false;
+        if (candidate[position] == key[position] || !RuntimeFormatFlagPosition(key, position)) continue;
+        const auto id = key[position] & ~std::uint64_t{0xffffffffu};
+        if (candidate[position] != (id | 1u) || key[position] != id || (candidate[position - 1u] & 0xffffffffu) != 0u) return false;
+        swapped[position] = true;
+        swapped[position - 1u] = true;
+    }
+    for (std::size_t position = 1; position < key.size(); ++position)
+        if (candidate[position] != key[position] && !swapped[position]) return false;
+    return true;
+}
+
 std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderArtifact& artifact, const IrBindingLayout& layout, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target) {
     struct ModuleKeyStorage {};
     auto& key = HostThreadLocal<std::vector<std::uint64_t>, ModuleKeyStorage>();
@@ -1151,21 +1186,37 @@ std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderAr
     for (const auto& constant : constants) key.push_back((static_cast<std::uint64_t>(constant.id) << 32u) | constant.value);
     static PrimedSharedMutex mutex;
     static std::map<std::vector<std::uint64_t>, std::shared_ptr<SpecializedModuleEntry>> modules;
+    static std::map<std::uint64_t, std::vector<RuntimeFormatCandidate>> runtimeFormats;
     std::shared_ptr<SpecializedModuleEntry> entry;
     {
         std::shared_lock lock(mutex);
         if (const auto found = modules.find(key); found != modules.end()) entry = found->second;
     }
     if (entry == nullptr) {
+        if (PipelineSpecialization::AbsentRuntimeFormat()) {
+            std::shared_lock lock(mutex);
+            if (const auto list = runtimeFormats.find(artifact.variantId); list != runtimeFormats.end()) {
+                const RuntimeFormatCandidate* best = nullptr;
+                for (const auto& candidate : list->second)
+                    if ((best == nullptr || candidate.absent < best->absent) && RuntimeFormatCompatible(candidate.key, key)) best = &candidate;
+                if (best != nullptr) entry = best->entry;
+            }
+        }
         std::unique_lock lock(mutex);
         const auto found = modules.find(key);
-        entry = found != modules.end() ? found->second : modules.emplace(key, std::make_shared<SpecializedModuleEntry>()).first->second;
+        entry = found != modules.end() ? found->second : entry != nullptr ? modules.emplace(key, entry).first->second : modules.emplace(key, std::make_shared<SpecializedModuleEntry>()).first->second;
     }
     std::call_once(entry->ready, [&] {
         try {
             entry->module = buildSpecializedModule(artifact, layout, classes, constants, target);
         } catch (...) {
             entry->failure = std::current_exception();
+        }
+        if (entry->failure == nullptr && PipelineSpecialization::AbsentRuntimeFormat()) {
+            if (const auto absent = RuntimeFormatAbsentCount(key); absent != 0u) {
+                std::unique_lock lock(mutex);
+                runtimeFormats[artifact.variantId].push_back({key, entry, absent});
+            }
         }
     });
     if (entry->failure) std::rethrow_exception(entry->failure);

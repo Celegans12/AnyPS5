@@ -35,6 +35,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 | `APS5_GATHER_CONST` | integer | `core/shader/recompiler/SpirvBackend/src/SpirvImageEmitter.cpp` |  | integer every non-depth gather returns in all four texels instead of the sampled value |
 | `APS5_IMAGE_TABLE_KEY_SCAN` | integer | `core/shader/recompiler/Optimization/src/ResourceMaterializer.cpp` | 256 | number of image-table entries the key scan examines |
 | `APS5_IMAGE_TABLE_STRICT` | presence | `core/shader/recompiler/Optimization/src/ResourceMaterializer.cpp` |  | sets image-table materialization to its strict form; 0 leaves it off |
+| `APS5_NO_ABSENT_RUNTIME_FORMAT` | presence | `core/shader/recompiler/PipelineSpecialization.hpp` |  | builds a compute module per format word of an absent formatted V# instead of one module with a run-time format |
 | `APS5_NO_ATOMIC_BARRIER` | presence | `core/shader/recompiler/SpirvBackend/src/SpirvMemory/SpirvFormatConvert.cpp` |  | drops the device-scope acquire/release memory barrier emitted after atomics |
 | `APS5_NO_ATOMIC_ZERO_SKIP` | presence | `core/shader/recompiler/SpirvBackend/src/SpirvMemory/SpirvMemoryInstructions.cpp` |  | restores plain buffer atomics instead of skipping identity-operand atomics |
 | `APS5_NO_CODE_HASH_KEY` | presence | `core/shader/recompiler/CacheKey.hpp` |  | appends every code word to the cache key instead of hashing the code |
