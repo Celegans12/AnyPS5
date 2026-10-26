@@ -517,6 +517,10 @@ void GuestArenaUnmapAlias_nid_postfix(void* alias) {
     WindowsMappings::Get().UnmapAlias(alias);
 }
 
+std::size_t GuestArenaAliasedPages_nid_postfix(std::uintptr_t* pages, std::uintptr_t* identities, std::size_t capacity, std::size_t* pageBytes) {
+    return WindowsMappings::Get().AliasedPages(pages, identities, capacity, pageBytes);
+}
+
 bool GuestArenaResidentSpan_nid_postfix(std::uintptr_t address, std::size_t bytes, std::uintptr_t* start, std::uintptr_t* end) {
     return WindowsMappings::Get().ResidentSpan(address, bytes, start, end);
 }

@@ -364,6 +364,37 @@ std::vector<FrameRecorder::PrologueShader> FrameRecorder::prologueShaders(std::s
     return result;
 }
 
+void FrameRecorder::writeAliasedPages() {
+#ifdef _WIN32
+    std::size_t pageBytes = 0;
+    std::vector<std::uintptr_t> pages;
+    std::vector<std::uintptr_t> identities;
+    for (auto count = GuestArena::GuestArenaAliasedPages_nid_postfix(nullptr, nullptr, 0, &pageBytes); count != pages.size();) {
+        pages.resize(count);
+        identities.resize(count);
+        count = GuestArena::GuestArenaAliasedPages_nid_postfix(pages.data(), identities.data(), pages.size(), &pageBytes);
+        if (count <= pages.size()) {
+            pages.resize(count);
+            identities.resize(count);
+            break;
+        }
+    }
+    if (pages.empty()) return;
+    auto call = make(FrameCallKind::AliasedPages);
+    call.ordinal = ++ordinal;
+    call.size = pageBytes;
+    std::map<std::uintptr_t, std::uint64_t> groups;
+    for (std::size_t index = 0; index < pages.size(); ++index) {
+        const auto group = groups.try_emplace(identities[index], groups.size()).first->second;
+        call.values.push_back(pages[index]);
+        call.values.push_back(group);
+    }
+    aliasedPages = pages.size();
+    aliasGroups = groups.size();
+    writer->WriteCall(call);
+#endif
+}
+
 void FrameRecorder::writePrologue() {
     const auto registry = DriverDetail::Driver::Get().RegisteredShaders();
     ReplayedMemory replayed;
@@ -464,7 +495,7 @@ bool FrameRecorder::triggered() {
 void FrameRecorder::emitDelta() {
     std::vector<Span> spans;
     for (const auto& range : ranges) {
-        if (range.kind == FrameRangeKind::Watched || range.kind == FrameRangeKind::Unwatched) spans.push_back({range.address, range.bytes, generation});
+        if (range.kind == FrameRangeKind::Watched || range.kind == FrameRangeKind::Unwatched || range.kind == FrameRangeKind::Section) spans.push_back({range.address, range.bytes, generation});
     }
     const auto mark = GuestMemory::WriteGeneration();
     const auto added = newRanges();
@@ -681,9 +712,10 @@ void FrameRecorder::start() {
     allocationsGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     ranges = committedRanges();
     writer = std::make_unique<FrameCaptureWriter>(directory);
+    writeAliasedPages();
     std::vector<std::pair<std::uint64_t, std::uint64_t>> written;
     for (const auto& range : ranges) {
-        if (range.kind == FrameRangeKind::Watched || range.kind == FrameRangeKind::Unwatched) GuestMemory::CollectWrittenBlocks(range.address, static_cast<std::size_t>(range.bytes), std::numeric_limits<std::uint64_t>::max(), written);
+        if (range.kind == FrameRangeKind::Watched || range.kind == FrameRangeKind::Unwatched || range.kind == FrameRangeKind::Section) GuestMemory::CollectWrittenBlocks(range.address, static_cast<std::size_t>(range.bytes), std::numeric_limits<std::uint64_t>::max(), written);
     }
     generation = GuestMemory::WriteGeneration();
     for (const auto& range : ranges) {
@@ -744,6 +776,7 @@ std::string FrameRecorder::header() const {
     text += std::string(",\"dirty\":") + (APS5_TRACE_DIRTY < 0 ? "null" : APS5_TRACE_DIRTY != 0 ? "true" : "false");
     text += ",\"arena_base\":" + std::to_string(arenaBase) + ",\"arena_bytes\":" + std::to_string(arenaBytes);
     text += ",\"gds_address\":" + std::to_string(gdsAddress);
+    text += ",\"aliased_pages\":" + std::to_string(aliasedPages) + ",\"alias_groups\":" + std::to_string(aliasGroups);
     text += ",\"start_boundary\":" + std::to_string(startBoundary) + ",\"frames\":" + std::to_string(recordedFrames);
     text += ",\"calls\":" + std::to_string(recordedCalls) + ",\"prologue_calls\":" + std::to_string(prologueCallCount);
     text += ",\"prologue_rewrites\":" + std::to_string(prologueRewrites) + ",\"prologue_rewrite_bytes\":" + std::to_string(prologueRewriteBytes) + ",\"prologue_dropped\":" + std::to_string(prologueDropped);

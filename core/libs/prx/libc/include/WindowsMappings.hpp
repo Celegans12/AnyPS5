@@ -224,6 +224,21 @@ public:
         }
     }
 
+    std::size_t AliasedPages(std::uintptr_t* pages, std::uintptr_t* identities, std::size_t capacity, std::size_t* bytes) {
+        std::lock_guard lock(mutex);
+        if (bytes != nullptr) *bytes = pageBytes;
+        std::size_t count = 0;
+        for (const auto& [base, view] : views) {
+            if (view.page->aliases.size() < 2) continue;
+            if (count < capacity) {
+                pages[count] = base;
+                identities[count] = reinterpret_cast<std::uintptr_t>(view.page.get());
+            }
+            ++count;
+        }
+        return count;
+    }
+
     // Begins a guest protection change of the range (the caller's VirtualProtect follows): owned blocks
     // are disarmed and none is armed until EndSetProtection.
     void SetProtection(std::uintptr_t address, std::size_t bytes, DWORD protection) {
