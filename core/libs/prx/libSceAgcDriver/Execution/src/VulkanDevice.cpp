@@ -5293,7 +5293,7 @@ VulkanDevice::PresyncStatistics VulkanDevice::PresyncCounts() {
     return {counters.checked.load(std::memory_order_relaxed), counters.presyncs.load(std::memory_order_relaxed), counters.keyChecks.load(std::memory_order_relaxed), counters.keyWaits.load(std::memory_order_relaxed)};
 }
 
-std::shared_ptr<PreparedDispatch> VulkanDevice::PrepareDispatch(const ShaderRecompiler::RecompileResult& shader, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t dispatchThreads, std::uint64_t programAddress) {
+std::shared_ptr<PreparedDispatch> VulkanDevice::PrepareDispatch(const ShaderRecompiler::RecompileResult& shader, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t dispatchThreads, std::uint64_t programAddress, bool ahead) {
     ShaderRecompiler::RuntimeAbi::RequireVersion(shader.runtimeAbiVersion);
     // APS5_LOCKED_BUILD=1: the whole build under the mutex, as before the split.
     static const bool lockedBuild = std::getenv("APS5_LOCKED_BUILD") != nullptr;
@@ -5319,7 +5319,11 @@ std::shared_ptr<PreparedDispatch> VulkanDevice::PrepareDispatch(const ShaderReco
     if (ResourceCacheEnabled() && shader.PipelineVariantId() != 0) {
         prepared->key = DispatchContentKey(compute, context.device);
         phase(PreparedDispatch::PrepareKey);
-        cached = state->resourceCache.Find(prepared->key);
+        cached = ahead ? state->resourceCache.Peek(prepared->key) : state->resourceCache.Find(prepared->key);
+        if (ahead && cached != nullptr) {
+            prepared->cached = std::move(cached);
+            return prepared;
+        }
         if (cached != nullptr && DispatchMove()) {
             Graphics::ShaderResources::MoveProof proof;
             if (!cached->MovedDispatchBuffers(compute, nullptr, DispatchMoveBytes(), proof).has_value()) {
@@ -5350,7 +5354,7 @@ std::shared_ptr<PreparedDispatch> VulkanDevice::PrepareDispatch(const ShaderReco
     // noted in between falls back to the locked wait as before. A cached object's Revalidate
     // repeats the same lookups when its stamps fail, so it gets the same pre-sync. Needs timeline
     // semaphores.
-    if (!NoPresync() && CanWaitUnlocked()) {
+    if (!ahead && !NoPresync() && CanWaitUnlocked()) {
         Presyncs().checked.fetch_add(1, std::memory_order_relaxed);
         const auto surfaces = cached != nullptr ? cached->PresyncSurfaces() : prepared->resources->PresyncSurfaces();
         prepared->presyncSerial = presync(surfaces);
@@ -5370,6 +5374,50 @@ std::shared_ptr<PreparedDispatch> VulkanDevice::PrepareDispatch(const ShaderReco
         prepared->objects = computePipeline(context, shader, described.layouts.main, described.mainKey, pushStages, programAddress);
     }
     return prepared;
+}
+
+VulkanDevice::PreparedAdoption VulkanDevice::AdoptPreparedDispatch(PreparedDispatch& prepared, const ShaderRecompiler::RecompileResult& shader) {
+    if (prepared.resources == nullptr || prepared.cached != nullptr) return PreparedAdoption::NoStageA;
+    if (ResourceCacheEnabled() && shader.PipelineVariantId() != 0) {
+        const Graphics::CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &shader, 0};
+        if (prepared.exact || DispatchContentKey(compute, state->device) != prepared.key) return PreparedAdoption::KeyChanged;
+        if (state->resourceCache.Peek(prepared.key) != nullptr || state->resourceCache.Find(prepared.key) != nullptr) return PreparedAdoption::CacheEntry;
+    } else if (!prepared.key.empty()) {
+        return PreparedAdoption::KeyChanged;
+    }
+    if (!NoPresync() && CanWaitUnlocked()) {
+        Presyncs().checked.fetch_add(1, std::memory_order_relaxed);
+        prepared.presyncSerial = presync(prepared.resources->PresyncSurfaces());
+    }
+    return PreparedAdoption::Adopted;
+}
+
+bool VulkanDevice::SamePreparation(const PreparedDispatch& left, const PreparedDispatch& right, std::string& difference) {
+    if ((left.resources == nullptr) != (right.resources == nullptr) || (left.cached == nullptr) != (right.cached == nullptr)) {
+        difference = "one preparation found a cached object or built stage A, the other did not";
+        return false;
+    }
+    if (left.key != right.key || left.exact != right.exact) {
+        difference = "content keys differ";
+        return false;
+    }
+    if (left.objects != right.objects || left.describedLayoutKey != right.describedLayoutKey) {
+        difference = "pipeline objects differ";
+        return false;
+    }
+    if (left.resources != nullptr) {
+        const auto a = left.resources->SetLayouts();
+        const auto b = right.resources->SetLayouts();
+        if (!std::ranges::equal(a.mainKey, b.mainKey) || !std::ranges::equal(a.fragmentKey, b.fragmentKey) || a.split != b.split) {
+            difference = "set layouts differ";
+            return false;
+        }
+        if (left.resources->NeedsCompletion() != right.resources->NeedsCompletion() || left.resources->Reusable() != right.resources->Reusable()) {
+            difference = "completion or reusability differs";
+            return false;
+        }
+    }
+    return true;
 }
 
 std::span<const double, 5> VulkanDevice::PreparePhaseMs(const PreparedDispatch& prepared) {

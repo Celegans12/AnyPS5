@@ -294,7 +294,10 @@ public:
     // Revalidate stays under the mutex), or APS5_LOCKED_BUILD=1 keeps the whole build under it as
     // before. `shader` and `snapshots` must outlive the dispatch.
     void PrimeBindlessDraw(std::span<const Graphics::CompiledShader> shaders) const;
-    std::shared_ptr<PreparedDispatch> PrepareDispatch(const ShaderRecompiler::RecompileResult& shader, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t dispatchThreads = 0, std::uint64_t programAddress = 0);
+    std::shared_ptr<PreparedDispatch> PrepareDispatch(const ShaderRecompiler::RecompileResult& shader, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t dispatchThreads = 0, std::uint64_t programAddress = 0, bool ahead = false);
+    enum class PreparedAdoption : std::uint8_t { Adopted, NoStageA, KeyChanged, CacheEntry, Count };
+    PreparedAdoption AdoptPreparedDispatch(PreparedDispatch& prepared, const ShaderRecompiler::RecompileResult& shader);
+    static bool SamePreparation(const PreparedDispatch& left, const PreparedDispatch& right, std::string& difference);
     // APS5_PROFILE_DRAW: the parts of a PrepareDispatch in milliseconds, in the order key, find,
     // precollect, presync, stage A (the driver's 'prepare:' rows).
     static std::span<const double, 5> PreparePhaseMs(const PreparedDispatch& prepared);

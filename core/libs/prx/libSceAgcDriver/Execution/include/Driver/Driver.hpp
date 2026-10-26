@@ -57,6 +57,7 @@ class PerformanceTimer;
 namespace AgcDriver::DriverDetail {
 
 class ShaderRefusal;
+struct DispatchSlot;
 
 class Driver {
 public:
@@ -68,6 +69,21 @@ public:
     void Shutdown();
     void WaitIdle();
     std::uint64_t DispatchesAdoptedAhead() const;
+    struct DispatchSlotCounts {
+        std::uint64_t slots = 0;
+        std::uint64_t hitsWithRecipe = 0;
+        std::uint64_t hits = 0;
+        std::uint64_t misses = 0;
+        std::uint64_t htileNotes = 0;
+        std::uint64_t drainsAvoided = 0;
+        std::uint64_t fallbacks = 0;
+        std::uint64_t preparedAhead = 0;
+        std::uint64_t adopted = 0;
+        std::uint64_t discarded = 0;
+        std::uint64_t verified = 0;
+        std::uint64_t verifyMismatches = 0;
+    };
+    static DispatchSlotCounts DispatchSlotStatistics();
     void CheckFailure();
     void ReportFailure(std::exception_ptr error);
     void Submit(const Packet* packet, std::uint32_t queue, bool cpuFlip = false);
@@ -188,6 +204,7 @@ private:
     void insertDispatch(std::uint64_t address, std::uint64_t key, bool noDispatchCache, bool profile, const std::shared_ptr<const ShaderSnapshot>& registeredShader, std::uint64_t forgetAtCapture, std::span<const ShaderRecompiler::MemoryRegion> memory, const std::shared_ptr<ShaderMemory>& shaderMemory, const std::vector<ShaderRecompiler::MemoryRegion>& captured, const std::shared_ptr<const ShaderRecompiler::ResourceCapture>& capture, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, const std::shared_ptr<DispatchEntry>& missedEntry, bool missedDiffering, std::shared_ptr<DispatchVariant>& attachVariant, DispatchPhaseTiming& phaseTiming);
     void dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments = 0);
     void dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments, bool forceFresh);
+    void commitDispatchSlot(DispatchSlot& slot);
     void verifyDataHit(const ShaderSnapshot& snapshot, std::size_t codeOffset, ShaderRecompiler::RecompileRequest request, std::span<const ShaderRecompiler::MemoryRegion> memory, std::uint64_t address, const DispatchVariant& variant, std::span<const std::uint32_t> liveWords, const ShaderRecompiler::RecompileResult& patched);
     static bool drawEntries();
     static bool drawDataHits();

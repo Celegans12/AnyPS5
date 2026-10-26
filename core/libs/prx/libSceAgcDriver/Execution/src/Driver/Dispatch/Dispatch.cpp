@@ -16,7 +16,9 @@
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include "Optimization/ShaderStageInputInfo.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -140,10 +142,341 @@ void ReportDispatchItems(bool profile) {
     std::fprintf(stderr, "[dispatch-item] %llu commit items (%llu recipes rebuilt on the committer), %llu miss items (%llu refused on the committer); drained instead, cumulative:%s\n", static_cast<unsigned long long>(itemCommits.load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemRebuilds.load(std::memory_order_relaxed)), static_cast<unsigned long long>(missItemCommits.load(std::memory_order_relaxed)), static_cast<unsigned long long>(missItemRefusals.load(std::memory_order_relaxed)), drained.c_str());
 }
 
+bool DispatchSlotsEnabled() {
+    return !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoDispatchSlots);
+}
+
+bool VerifyDispatchSlots() {
+    static const bool verify = std::getenv("APS5_VERIFY_DISPATCH_SLOTS") != nullptr;
+    return verify;
+}
+
+bool ProfileDispatchSlots() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PROFILE_DISPATCH_SLOTS") != nullptr || VerifyDispatchSlots();
+    return profile;
+}
+
+enum class SlotKind : std::size_t { HitWithRecipe, Hit, Miss, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(SlotKind::Count)> SlotKindNames{"hits with recipe", "hits without recipe", "misses"};
+enum class AheadOutcome : std::size_t { Adopted, NotStarted, Failed, ForgetSerial, Registry, NoStageA, KeyChanged, CacheEntry, RecipeAtCommit, VerifyMismatch, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(AheadOutcome::Count)> AheadOutcomeNames{"adopted", "not started", "made nothing", "forget serial", "registry", "cache object at prepare", "key changed", "cache entry since", "recipe at commit", "verify mismatch"};
+enum class AheadRefusal : std::size_t { Switch, Recipe, Htile, Bindings, PendingWrites, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(AheadRefusal::Count)> AheadRefusalNames{"switch", "recipe", "htile", "bindings", "pending writes"};
+
+struct SlotCounterSet {
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(SlotKind::Count)> kinds{};
+    std::atomic<std::uint64_t> htileNotes{0};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrainSite::Count)> avoided{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrainSite::Count)> fallbacks{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(AheadOutcome::Count)> ahead{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(AheadRefusal::Count)> notAhead{};
+    std::atomic<std::uint64_t> preparedAhead{0};
+    std::atomic<std::uint64_t> prepareNs{0};
+    std::atomic<std::uint64_t> verified{0};
+    std::atomic<std::uint64_t> verifyMismatches{0};
+    std::atomic<std::uint64_t> commits{0};
+    std::atomic<std::uint64_t> commitNs{0};
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+SlotCounterSet& SlotCounters() {
+    static auto* counters = new SlotCounterSet();
+    return *counters;
+}
+
+void NoteSlotFallback(DrainSite site) {
+    SlotCounters().fallbacks[static_cast<std::size_t>(site)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void ReportDispatchSlots() {
+    if (!ProfileDispatchSlots()) return;
+    auto& c = SlotCounters();
+    const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = c.lastReport.load(std::memory_order_relaxed);
+    if (last == 0) {
+        c.lastReport.compare_exchange_strong(last, now, std::memory_order_relaxed);
+        return;
+    }
+    if (now - last < 10000 || !c.lastReport.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
+    static std::array<std::uint64_t, 64> previous{};
+    std::size_t slot = 0;
+    const auto delta = [&](std::atomic<std::uint64_t>& value) {
+        const auto current = value.load(std::memory_order_relaxed);
+        const auto change = current - previous[slot];
+        previous[slot++] = current;
+        return static_cast<unsigned long long>(change);
+    };
+    const auto list = [&](auto& values, const auto& names) {
+        std::string text;
+        for (std::size_t i = 0; i < names.size(); ++i) {
+            const auto count = delta(values[i]);
+            if (count == 0) continue;
+            char item[64];
+            std::snprintf(item, sizeof(item), " %s %llu", names[i], count);
+            text += item;
+        }
+        return text.empty() ? std::string(" none") : text;
+    };
+    const auto kinds = list(c.kinds, SlotKindNames);
+    const auto htile = delta(c.htileNotes);
+    const auto avoided = list(c.avoided, DrainSiteNames);
+    const auto fallbacks = list(c.fallbacks, DrainSiteNames);
+    const auto prepared = delta(c.preparedAhead);
+    const auto prepareMs = static_cast<double>(delta(c.prepareNs)) / 1e6;
+    const auto outcomes = list(c.ahead, AheadOutcomeNames);
+    const auto refusals = list(c.notAhead, AheadRefusalNames);
+    const auto commits = delta(c.commits);
+    const auto commitUs = commits != 0 ? static_cast<double>(delta(c.commitNs)) / 1e3 / static_cast<double>(commits) : (static_cast<void>(delta(c.commitNs)), 0.0);
+    std::fprintf(stderr, "[dispatch-slots] (10 s) %llu queue-0 dispatch slots (by kind:%s; HTILE notes made in order %llu), %.1f us per slot on the committer; drains avoided by today's site:%s; fallbacks to the drained path by site:%s; stage A ahead: %llu prepared (%.1f ms), at the commit:%s; not prepared ahead:%s; verify (cumulative): %llu checked, %llu differing\n", commits, kinds.c_str(), htile, commitUs, avoided.c_str(), fallbacks.c_str(), prepared, prepareMs, outcomes.c_str(), refusals.c_str(), static_cast<unsigned long long>(c.verified.load(std::memory_order_relaxed)), static_cast<unsigned long long>(c.verifyMismatches.load(std::memory_order_relaxed)));
+}
+
+struct HtileMaskClear {
+    std::uint64_t address = 0;
+    std::size_t bytes = 0;
+    std::uint32_t mask = 0;
+    std::uint32_t value = 0;
+};
+
+struct HtileNote {
+    std::uint64_t address = 0;
+    std::size_t bytes = 0;
+    std::size_t nativeBytes = 0;
+};
+
+struct SlotPreparation {
+    std::shared_ptr<PreparedDispatch> prepared;
+    std::uint64_t forgetSerial = 0;
+    std::uint64_t registryGeneration = 0;
+    std::uint64_t inputHash = 0;
+};
+
+bool AheadBindings(const ShaderRecompiler::RecompileResult& compiled) {
+    if (compiled.bindlessHeap || compiled.bdaAbiVersion != 0) return false;
+    using Role = ShaderRecompiler::DescriptorRole;
+    return std::ranges::all_of(compiled.bindings, [](const auto& binding) {
+        switch (binding.role) {
+            case Role::GuestBuffers: case Role::GuestImages: case Role::GuestSamplers: case Role::FlattenedSrt: case Role::ShaderData: case Role::ImageTable: case Role::SamplerTable: case Role::ImageTableMap: return true;
+            default: return false;
+        }
+    });
+}
+
+std::vector<std::pair<std::uint64_t, std::uint64_t>> SlotInputRanges(const ShaderRecompiler::RecompileResult& compiled, std::span<const ShaderRecompiler::MemoryRegion> captured) {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    for (const auto& binding : compiled.bindings) {
+        if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers || binding.guestDescriptor.size() < static_cast<std::size_t>(binding.count) * 4u) continue;
+        for (std::uint32_t element = 0; element < binding.count; ++element) {
+            const auto* words = binding.guestDescriptor.data() + static_cast<std::size_t>(element) * 4u;
+            const ShaderRecompiler::ShaderBufferResource descriptor{{words[0], words[1], words[2], words[3]}};
+            const auto base = descriptor.Base48();
+            const auto bytes = descriptor.GetSize();
+            if (base != 0 && bytes != 0) ranges.emplace_back(base, base + bytes);
+        }
+    }
+    for (const auto& region : captured) {
+        if (!region.bytes.empty()) ranges.emplace_back(region.guestAddress, region.guestAddress + region.bytes.size());
+    }
+    return ranges;
+}
+
+std::uint64_t SlotInputHash(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
+    constexpr std::uint64_t Limit = 8ull * 1024 * 1024;
+    std::uint64_t hash = 0xcbf29ce484222325ull;
+    std::uint64_t total = 0;
+    for (const auto& [begin, end] : ranges) {
+        hash = (hash ^ begin) * 0x100000001b3ull;
+        hash = (hash ^ end) * 0x100000001b3ull;
+        const auto bytes = end - begin;
+        if (total + bytes > Limit || !GuestMemory::Accessible(reinterpret_cast<const void*>(begin), static_cast<std::size_t>(bytes))) continue;
+        total += bytes;
+        const auto* data = reinterpret_cast<const unsigned char*>(begin);
+        for (std::uint64_t i = 0; i < bytes; ++i) hash = (hash ^ data[i]) * 0x100000001b3ull;
+    }
+    return hash;
+}
+
+struct SlotOrigin {
+    SlotOrigin(std::uint64_t program, bool kernel, std::uint32_t mask, std::uint32_t value) {
+        Graphics::Recorder::SetWriteOrigin(program);
+        if (kernel) Graphics::Recorder::SetWriteOriginKernel(mask, value);
+    }
+    ~SlotOrigin() { Graphics::Recorder::SetWriteOrigin(0); }
+    SlotOrigin(const SlotOrigin&) = delete;
+    SlotOrigin& operator=(const SlotOrigin&) = delete;
+};
+
+}
+
+struct DispatchSlot {
+    std::shared_ptr<VulkanDevice> device;
+    std::shared_ptr<const ShaderSnapshot> shader;
+    std::size_t codeOffset = 0;
+    std::vector<std::uint32_t> userData;
+    ShaderRecompiler::ShaderComputeStageInfo compute{};
+    std::array<std::uint32_t, 5> packet{};
+    std::shared_ptr<const ShaderRecompiler::RecompileResult> compiled;
+    std::shared_ptr<DispatchVariant> keepVariant;
+    std::shared_ptr<DispatchVariant> attachVariant;
+    std::shared_ptr<ShaderMemory> shaderMemory;
+    std::shared_ptr<const ShaderRecompiler::ResourceCapture> capture;
+    std::vector<ShaderRecompiler::MemoryRegion> captured;
+    std::vector<std::uint32_t> liveWords;
+    std::vector<Graphics::GuestMemorySnapshot> snapshots;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> inputRanges;
+    std::array<std::uint32_t, 3> groups{};
+    std::uint64_t address = 0;
+    std::uint64_t dispatchThreads = 0;
+    std::uint64_t epoch = 0;
+    std::uint32_t queue = 0;
+    bool cached = false;
+    bool dataHit = false;
+    bool partialLastGroup = false;
+    bool htileKernel = false;
+    std::optional<std::pair<std::uint64_t, std::size_t>> htileClearCompletion;
+    HtileMaskClear htileMask;
+    std::optional<HtileNote> htileNote;
+    std::shared_ptr<DrawPipeline::PrepareSlot> prepareSlot;
+};
+
+namespace {
+
 }
 
 bool Driver::pipelineDispatch() {
-    return DispatchItemsEnabled();
+    return DispatchItemsEnabled() || DispatchSlotsEnabled();
+}
+
+Driver::DispatchSlotCounts Driver::DispatchSlotStatistics() {
+    auto& c = SlotCounters();
+    DispatchSlotCounts counts;
+    counts.hitsWithRecipe = c.kinds[static_cast<std::size_t>(SlotKind::HitWithRecipe)].load(std::memory_order_relaxed);
+    counts.hits = c.kinds[static_cast<std::size_t>(SlotKind::Hit)].load(std::memory_order_relaxed);
+    counts.misses = c.kinds[static_cast<std::size_t>(SlotKind::Miss)].load(std::memory_order_relaxed);
+    counts.slots = counts.hitsWithRecipe + counts.hits + counts.misses;
+    counts.htileNotes = c.htileNotes.load(std::memory_order_relaxed);
+    for (const auto& value : c.avoided) counts.drainsAvoided += value.load(std::memory_order_relaxed);
+    for (const auto& value : c.fallbacks) counts.fallbacks += value.load(std::memory_order_relaxed);
+    counts.preparedAhead = c.preparedAhead.load(std::memory_order_relaxed);
+    counts.adopted = c.ahead[static_cast<std::size_t>(AheadOutcome::Adopted)].load(std::memory_order_relaxed);
+    for (std::size_t i = 0; i < c.ahead.size(); ++i) {
+        if (i != static_cast<std::size_t>(AheadOutcome::Adopted)) counts.discarded += c.ahead[i].load(std::memory_order_relaxed);
+    }
+    counts.verified = c.verified.load(std::memory_order_relaxed);
+    counts.verifyMismatches = c.verifyMismatches.load(std::memory_order_relaxed);
+    return counts;
+}
+
+void Driver::commitDispatchSlot(DispatchSlot& slot) {
+    auto& counters = SlotCounters();
+    if (slot.htileNote.has_value()) {
+        if (Graphics::NoteHtileDepthClear(slot.htileNote->address, slot.htileNote->bytes, slot.htileNote->nativeBytes)) slot.htileClearCompletion = std::pair{slot.htileNote->address, slot.htileNote->bytes};
+        counters.htileNotes.fetch_add(1, std::memory_order_relaxed);
+    }
+    const auto& compiled = *slot.compiled;
+    const auto code = std::span<const std::uint32_t>(slot.shader->code).subspan(slot.codeOffset);
+    std::shared_ptr<RecipeHit> recipeHit;
+    if (slot.cached && slot.keepVariant != nullptr && !stampValidate()) recipeHit = slot.htileClearCompletion.has_value() ? nullptr : slot.device->PrepareRecipe(slot.keepVariant->recipe.load(std::memory_order_acquire), false);
+    std::shared_ptr<const Recipe> builtRecipe;
+    auto* const attachTo = stampValidate() ? nullptr : slot.keepVariant != nullptr ? slot.keepVariant.get() : slot.attachVariant.get();
+    bool writersNoted = false;
+    const bool noteWrites = writeEvidenceEnabled() || traceCapSync();
+    const auto keysFill = !slot.partialLastGroup ? MatchSgprPatternFill(slot.packet, code, slot.userData, slot.compute) : std::nullopt;
+    const auto filledKeys = keysFill ? KeysFillMemo(keysFill->pattern, false, true) : std::nullopt;
+    std::optional<Graphics::DepthPlaneClear> depthPlaneClear;
+    if (!slot.partialLastGroup) {
+        if (const auto clear = Graphics::MatchStorageImageClear(code, slot.userData, slot.compute, slot.groups)) {
+            const auto clearAddress = Graphics::StorageImageClearAddress(*clear);
+            if (clearAddress != 0 && Graphics::DepthSurfaceAt(clearAddress)) {
+                GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Dispatch);
+                std::lock_guard clearLock(GuestMemory::GpuMutex());
+                recordLabelsForPacket(slot.device.get(), slot.queue);
+                depthPlaneClear.emplace(*clear);
+            }
+        }
+    }
+    const auto adoptAhead = [&](bool wanted) -> std::shared_ptr<PreparedDispatch> {
+        if (slot.prepareSlot == nullptr) return nullptr;
+        const auto taken = std::static_pointer_cast<SlotPreparation>(slot.prepareSlot->Take());
+        auto outcome = AheadOutcome::Adopted;
+        if (taken == nullptr) outcome = AheadOutcome::NotStarted;
+        else if (!wanted) outcome = AheadOutcome::RecipeAtCommit;
+        else if (taken->prepared == nullptr) outcome = (taken->forgetSerial & 1u) != 0 ? AheadOutcome::ForgetSerial : AheadOutcome::Failed;
+        else if (GuestMemory::ForgetSerial() != taken->forgetSerial) outcome = AheadOutcome::ForgetSerial;
+        else if (GuestAllocations::GuestAllocationsGeneration_nid_postfix() != taken->registryGeneration) outcome = AheadOutcome::Registry;
+        else {
+            switch (slot.device->AdoptPreparedDispatch(*taken->prepared, compiled)) {
+                case VulkanDevice::PreparedAdoption::Adopted: break;
+                case VulkanDevice::PreparedAdoption::NoStageA: outcome = AheadOutcome::NoStageA; break;
+                case VulkanDevice::PreparedAdoption::KeyChanged: outcome = AheadOutcome::KeyChanged; break;
+                default: outcome = AheadOutcome::CacheEntry; break;
+            }
+        }
+        if (outcome == AheadOutcome::Adopted && VerifyDispatchSlots()) {
+            counters.verified.fetch_add(1, std::memory_order_relaxed);
+            std::string difference;
+            if (taken->inputHash != SlotInputHash(slot.inputRanges)) {
+                difference = "the bytes the preparation read changed before the commit";
+            } else {
+                const auto inOrder = slot.device->PrepareDispatch(compiled, slot.snapshots, slot.dispatchThreads, slot.address, true);
+                if (inOrder == nullptr) difference = "the in-order preparation made nothing";
+                else static_cast<void>(VulkanDevice::SamePreparation(*taken->prepared, *inOrder, difference));
+            }
+            if (!difference.empty()) {
+                counters.verifyMismatches.fetch_add(1, std::memory_order_relaxed);
+                std::fprintf(stderr, "[dispatch-slots] verify: compute shader 0x%llx: %s; prepared again in order\n", static_cast<unsigned long long>(slot.address), difference.c_str());
+                outcome = AheadOutcome::VerifyMismatch;
+            }
+        }
+        counters.ahead[static_cast<std::size_t>(outcome)].fetch_add(1, std::memory_order_relaxed);
+        return outcome == AheadOutcome::Adopted ? taken->prepared : nullptr;
+    };
+    bool first = true;
+    for (;;) {
+        std::shared_ptr<PreparedDispatch> prepared;
+        const bool wantPrepared = recipeHit == nullptr || VulkanDevice::VerifyRecipes();
+        if (first) prepared = adoptAhead(wantPrepared);
+        first = false;
+        if (wantPrepared && prepared == nullptr) prepared = slot.device->PrepareDispatch(compiled, slot.snapshots, slot.dispatchThreads, slot.address);
+        if (!wantPrepared) prepared.reset();
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Dispatch);
+        std::lock_guard gpuLock(GuestMemory::GpuMutex());
+        std::optional<Graphics::Recorder::LaneSwitch> laneSwitch;
+        if (Graphics::Recorder::ThreadLane() != 0 && DispatchUsesImages(compiled)) laneSwitch.emplace(Graphics::Recorder::Active(), 0);
+        recordLabelsForPacket(slot.device.get(), slot.queue);
+        if (noteWrites && writerKeyedEvidence() && !writersNoted) {
+            noteWrittenBuffers(slot.address, slot.queue, compiled);
+            writersNoted = true;
+        }
+        auto* const keysRecorder = filledKeys ? Graphics::Recorder::Active() : nullptr;
+        const auto keysNoteBefore = keysRecorder != nullptr ? keysRecorder->LastWriteNote(keysFill->base, keysFill->bytes) : 0;
+        if (recipeHit != nullptr) {
+            VulkanDevice::IndirectOutcome outcome{0, 0};
+            const auto result = slot.device->DispatchRecipe(compiled, slot.groups[0], slot.groups[1], slot.groups[2], 0, slot.address, recipeHit, outcome, VulkanDevice::VerifyRecipes() ? prepared : nullptr, slot.dataHit, {});
+            if (result == RecipeOutcome::Rebuild) {
+                recipeHit = nullptr;
+                VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, false);
+                continue;
+            }
+        } else {
+            slot.device->Dispatch(compiled, slot.groups[0], slot.groups[1], slot.groups[2], slot.snapshots, slot.address, std::move(prepared), slot.htileClearCompletion.has_value() ? nullptr : (attachTo != nullptr ? &builtRecipe : nullptr), slot.htileClearCompletion);
+        }
+        if (slot.htileMask.address != 0) slot.device->NoteHtileMask(slot.htileMask.address, slot.htileMask.bytes, slot.htileMask.mask, slot.htileMask.value);
+        if (keysRecorder != nullptr && keysRecorder == Graphics::Recorder::Active()) {
+            const auto note = keysRecorder->LastWriteNote(keysFill->base, keysFill->bytes);
+            if (note != 0 && note != keysNoteBefore) Graphics::NoteKeysFillOnGpu(keysFill->base, keysFill->bytes, *filledKeys);
+        }
+        if (builtRecipe != nullptr) {
+            if (slot.dataHit) {
+                auto own = std::make_shared<Recipe>(*builtRecipe);
+                own->dataWordsHash = Graphics::ShaderResources::DataWordsHash({ShaderRecompiler::ShaderStage::Compute, slot.keepVariant->compiled.get(), 0});
+                builtRecipe = std::move(own);
+            }
+            attachTo->recipe.store(std::move(builtRecipe), std::memory_order_release);
+            VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Attach, false);
+        }
+        break;
+    }
+    if (noteWrites && !writerKeyedEvidence()) noteWrittenBuffers(slot.address, slot.queue, compiled);
 }
 
 void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments) {
@@ -184,8 +517,11 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
     static const bool profileDrains = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto attemptStart = profileDrains ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     // Both switches once per attempt: an A/B flip (at a queue-0 present) never splits one.
-    const bool itemsOn = DispatchItemsEnabled();
-    const bool missItemsOn = itemsOn && DispatchMissItemsEnabled();
+    const bool slotsOn = DispatchSlotsEnabled();
+    const bool legacyItems = DispatchItemsEnabled();
+    const bool legacyMissItems = legacyItems && DispatchMissItemsEnabled();
+    const bool itemsOn = slotsOn || legacyItems;
+    const bool missItemsOn = slotsOn || legacyMissItems;
     const auto address = (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20c)) << 8u) | (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20d) & 0xffu) << 40u);
     if (address == SkippedShader() && address != 0) return;
     struct OriginScope {
@@ -272,13 +608,22 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
     }
     const bool pipelineCandidate = !resolving && !fromAhead && itemsOn && DrawPipeline::Active() && indirectArguments == 0 && deferredLabels().labels.empty() && !matchesCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) && !MatchesStreamCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) && !MatchesIndexedCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute);
     const bool partialLastGroup = partialGroups != std::array<std::uint32_t, 3>{};
-    struct HtileMaskClear {
-        std::uint64_t address = 0;
-        std::size_t bytes = 0;
-        std::uint32_t mask = 0;
-        std::uint32_t value = 0;
-    } htileMask;
+    HtileMaskClear htileMask;
     std::optional<std::pair<std::uint64_t, std::size_t>> htileClearCompletion;
+    const bool slotHtile = slotsOn && pipelineCandidate && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoDispatchSlotHtile);
+    std::optional<HtileNote> deferredHtile;
+    bool busyAtHtile = false;
+    auto htileSite = DrainSite::Count;
+    const auto settleHtile = [&] {
+        if (!deferredHtile.has_value()) return;
+        if (Graphics::NoteHtileDepthClear(deferredHtile->address, deferredHtile->bytes, deferredHtile->nativeBytes)) htileClearCompletion = std::pair{deferredHtile->address, deferredHtile->bytes};
+        deferredHtile.reset();
+    };
+    const auto fallBack = [&](DrainSite site) {
+        if (slotsOn) NoteSlotFallback(site);
+        if (DrawPipeline::Queue0().Busy()) DrainAt(site, profileDrains);
+        settleHtile();
+    };
     if (resolving) {
         if (indirectArguments == 0 && Graphics::MatchMultisampledSingleClear(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads)) return;
         if (!partialLastGroup && matchesFillKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute)) return;
@@ -295,18 +640,34 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
             pendingDispatchPhases().outcome = DispatchOutcome::FillHle;
             return;
         }
-        if (DrawPipeline::Active() && !pipelineCandidate) DrainAt(fromAhead ? DrainSite::Ahead : !itemsOn ? DrainSite::ItemsOff : indirectArguments != 0 ? DrainSite::Indirect : !deferredLabels().labels.empty() ? DrainSite::Labels : DrainSite::CopyKernel, profileDrains);
+        if (DrawPipeline::Active() && !pipelineCandidate) {
+            const auto site = fromAhead ? DrainSite::Ahead : !itemsOn ? DrainSite::ItemsOff : indirectArguments != 0 ? DrainSite::Indirect : !deferredLabels().labels.empty() ? DrainSite::Labels : DrainSite::CopyKernel;
+            if (slotsOn) NoteSlotFallback(site);
+            DrainAt(site, profileDrains);
+        }
         if (const auto htile = Graphics::HtileDepthClearAddress(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads); htile != 0) {
-            if (pipelineCandidate && DrawPipeline::Queue0().Busy()) DrainAt(DrainSite::HtileDepth, profileDrains);
+            if (slotHtile) {
+                busyAtHtile = DrawPipeline::Queue0().Busy();
+                htileSite = DrainSite::HtileDepth;
+            } else if (pipelineCandidate && DrawPipeline::Queue0().Busy()) {
+                DrainAt(DrainSite::HtileDepth, profileDrains);
+            }
             const auto threads = (packet[4] & 0x20u) != 0 ? static_cast<std::uint64_t>(packet[1]) : static_cast<std::uint64_t>(packet[1]) * compute.numThreads[0];
             const auto nativeBytes = Graphics::HtileDepthClearBytes_nid_no_patch(std::span(snapshot.code).subspan(codeOffset), userData, compute, packet, indirectArguments);
             const auto bytes = static_cast<std::size_t>(threads * 16u);
-            if (Graphics::NoteHtileDepthClear(htile, bytes, nativeBytes)) htileClearCompletion = std::pair{htile, bytes};
+            if (slotHtile) deferredHtile = HtileNote{htile, bytes, nativeBytes};
+            else if (Graphics::NoteHtileDepthClear(htile, bytes, nativeBytes)) htileClearCompletion = std::pair{htile, bytes};
             if (nativeBytes != 0u && userData.size() >= 6u) htileMask = {htile, nativeBytes, userData[5], userData[4]};
         } else if (const auto buffered = Graphics::MatchHtileBufferMaskClear(std::span(snapshot.code).subspan(codeOffset), userData, compute, packet, indirectArguments); buffered.has_value() && (buffered->mask & 0xfu) == 0u && (buffered->value & 0xfu) == 0u) {
             // S1: the buffer variant of the mask kernel, read the same way (zmask cleared: a depth clear).
-            if (pipelineCandidate && DrawPipeline::Queue0().Busy()) DrainAt(DrainSite::HtileBuffer, profileDrains);
-            if (Graphics::NoteHtileDepthClear(buffered->address, buffered->bytes, buffered->bytes)) htileClearCompletion = std::pair{buffered->address, buffered->bytes};
+            if (slotHtile) {
+                busyAtHtile = DrawPipeline::Queue0().Busy();
+                htileSite = DrainSite::HtileBuffer;
+                deferredHtile = HtileNote{buffered->address, buffered->bytes, buffered->bytes};
+            } else {
+                if (pipelineCandidate && DrawPipeline::Queue0().Busy()) DrainAt(DrainSite::HtileBuffer, profileDrains);
+                if (Graphics::NoteHtileDepthClear(buffered->address, buffered->bytes, buffered->bytes)) htileClearCompletion = std::pair{buffered->address, buffered->bytes};
+            }
             htileMask = {buffered->address, buffered->bytes, buffered->mask, buffered->value};
         }
         if (!partialLastGroup && indirectArguments == 0 && copyBuffer(queue, submission.queue, packet, std::span(snapshot.code).subspan(codeOffset), userData, compute, localDevice, address)) {
@@ -465,7 +826,9 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
     phaseTiming.Phase(PhaseKey);
     timing.Mark("decode_key_device_setup");
     bool readsClear = false;
+    bool busyAtLookup = false;
     if (pipelineCandidate) {
+        busyAtLookup = DrawPipeline::Queue0().Busy();
         auto lookupSite = DrainSite::LookupMiss;
         std::vector<ShaderRecompiler::MemoryRegion> reads;
         bool entryFound = false;
@@ -488,7 +851,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
             if (!readsClear) NoteItemFallback(ItemFallback::Reads);
             lookupSite = DrainSite::LookupReads;
         }
-        if (!readsClear && DrawPipeline::Queue0().Busy()) DrainAt(lookupSite, profileDrains);
+        if (!readsClear) fallBack(lookupSite);
     }
     if (fromAhead) {
         compiledResult = std::move(ahead.compiledResult);
@@ -514,7 +877,11 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
     std::vector<DrawPipeline::Range> itemWrites;
     bool pipelined = false;
     bool missItem = false;
-    if (readsClear) {
+    bool slot = false;
+    if (readsClear && slotsOn) {
+        slot = !NoDispatchItems();
+        if (!slot) fallBack(DrainSite::ItemWrites);
+    } else if (readsClear) {
         if (cached && keepVariant != nullptr && keepVariant->recipe.load(std::memory_order_acquire) != nullptr) {
             bool bounded = false;
             itemWrites = DispatchWriteRanges(*compiledResult, bounded);
@@ -629,6 +996,14 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
             if (DrawPipeline::Queue0().Busy()) DrainAt(DrainSite::ItemWrites, profileDrains);
         }
     }
+    if (slot) {
+        bool bounded = false;
+        itemWrites = DispatchWriteRanges(*compiledResult, bounded);
+        if (!bounded || !deferredLabels().labels.empty()) {
+            slot = false;
+            fallBack(DrainSite::ItemWrites);
+        }
+    }
     phaseTiming.Phase(PhaseQueuedLabels);
     const auto& compiled = *compiledResult;
     std::vector<Graphics::GuestMemorySnapshot> snapshots;
@@ -676,6 +1051,113 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
     };
     phaseTiming.Phase(PhaseSnapshots);
 
+    if (slot) {
+        auto& counters = SlotCounters();
+        const bool hasRecipe = cached && keepVariant != nullptr && keepVariant->recipe.load(std::memory_order_acquire) != nullptr;
+        const auto kind = hasRecipe ? SlotKind::HitWithRecipe : cached ? SlotKind::Hit : SlotKind::Miss;
+        counters.kinds[static_cast<std::size_t>(kind)].fetch_add(1, std::memory_order_relaxed);
+        auto legacySite = DrainSite::Count;
+        bool legacyBusy = busyAtLookup;
+        if (!legacyItems) {
+            legacySite = DrainSite::ItemsOff;
+        } else if (htileSite != DrainSite::Count) {
+            legacySite = htileSite;
+            legacyBusy = busyAtHtile;
+        } else if (!legacyMissItems && kind == SlotKind::Miss) {
+            legacySite = DrainSite::LookupMiss;
+        } else if (!legacyMissItems && kind == SlotKind::Hit) {
+            legacySite = DrainSite::NoRecipe;
+        }
+        if (legacySite != DrainSite::Count && legacyBusy) counters.avoided[static_cast<std::size_t>(legacySite)].fetch_add(1, std::memory_order_relaxed);
+        auto state = std::make_shared<DispatchSlot>();
+        state->device = localDevice;
+        state->shader = registeredShader;
+        state->codeOffset = codeOffset;
+        state->userData = userData;
+        state->compute = compute;
+        std::copy_n(packet.begin(), std::min(packet.size(), state->packet.size()), state->packet.begin());
+        state->compiled = compiledResult;
+        state->keepVariant = keepVariant;
+        state->attachVariant = attachVariant;
+        state->shaderMemory = shaderMemory;
+        state->capture = capture;
+        state->captured = std::move(captured);
+        state->liveWords = std::move(liveWords);
+        state->snapshots = std::move(snapshots);
+        state->groups = groups;
+        state->address = address;
+        state->dispatchThreads = dispatchThreads;
+        state->epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
+        state->queue = submission.queue;
+        state->cached = cached;
+        state->dataHit = dataHit;
+        state->partialLastGroup = partialLastGroup;
+        state->htileKernel = userData.size() >= 6 && Graphics::HtileMaskKernelCode(std::span(snapshot.code).subspan(codeOffset));
+        state->htileClearCompletion = htileClearCompletion;
+        state->htileMask = htileMask;
+        state->htileNote = deferredHtile;
+        deferredHtile.reset();
+        auto refusal = AheadRefusal::Count;
+        if (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoDispatchSlotPrepare)) {
+            refusal = AheadRefusal::Switch;
+        } else if (hasRecipe && !stampValidate()) {
+            refusal = AheadRefusal::Recipe;
+        } else if (state->htileNote.has_value() || state->htileClearCompletion.has_value()) {
+            refusal = AheadRefusal::Htile;
+        } else if (!AheadBindings(*compiledResult)) {
+            refusal = AheadRefusal::Bindings;
+        } else {
+            state->inputRanges = SlotInputRanges(*compiledResult, state->captured);
+            if (DrawPipeline::Queue0().OverlapsAny(state->inputRanges)) refusal = AheadRefusal::PendingWrites;
+        }
+        DrawPipeline::Prepare prepareJob;
+        if (refusal != AheadRefusal::Count) {
+            counters.notAhead[static_cast<std::size_t>(refusal)].fetch_add(1, std::memory_order_relaxed);
+        } else {
+            state->prepareSlot = std::make_shared<DrawPipeline::PrepareSlot>();
+            prepareJob = [state, preparation = state->prepareSlot] {
+                auto& work = *state;
+                if (!preparation->Begin()) return;
+                const auto started = std::chrono::steady_clock::now();
+                auto result = std::make_shared<SlotPreparation>();
+                try {
+                    DrawPipeline::FollowEpoch(work.epoch);
+                    GuestMemory::SetCurrentPacket(0x15, work.queue);
+                    result->forgetSerial = GuestMemory::ForgetSerial();
+                    result->registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+                    if (VerifyDispatchSlots()) result->inputHash = SlotInputHash(work.inputRanges);
+                    if ((result->forgetSerial & 1u) == 0) result->prepared = work.device->PrepareDispatch(*work.compiled, work.snapshots, work.dispatchThreads, work.address, true);
+                } catch (...) {
+                    result->prepared = nullptr;
+                }
+                auto& slotCounters = SlotCounters();
+                slotCounters.preparedAhead.fetch_add(1, std::memory_order_relaxed);
+                slotCounters.prepareNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
+                preparation->Finish(std::move(result));
+            };
+        }
+        DrawPipeline::Queue0().Enqueue([this, state] {
+            auto& work = *state;
+            DrawPipeline::FollowEpoch(work.epoch);
+            GuestMemory::SetCurrentPacket(0x15, work.queue);
+            const SlotOrigin origin(work.address, work.htileKernel, work.htileKernel ? work.userData[5] : 0u, work.htileKernel ? work.userData[4] : 0u);
+            const auto started = std::chrono::steady_clock::now();
+            try {
+                commitDispatchSlot(work);
+            } catch (const std::exception& error) {
+                char where[64];
+                std::snprintf(where, sizeof(where), "compute shader 0x%llx: ", static_cast<unsigned long long>(work.address));
+                throw std::runtime_error(where + std::string(error.what()));
+            }
+            auto& slotCounters = SlotCounters();
+            slotCounters.commits.fetch_add(1, std::memory_order_relaxed);
+            slotCounters.commitNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
+        }, std::move(itemWrites), 0, {}, {}, std::move(prepareJob));
+        if (DrainAfterDispatchItems()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+        ReportDispatchFast(profile);
+        ReportDispatchSlots();
+        return;
+    }
     if (pipelined) {
         const auto recipe = keepVariant->recipe.load(std::memory_order_acquire);
         const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
@@ -784,6 +1266,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
         return;
     }
 
+    settleHtile();
     std::shared_ptr<RecipeHit> recipeHit;
     if (cached && keepVariant != nullptr && !stampValidate()) {
         recipeHit = htileClearCompletion.has_value() ? nullptr : localDevice->PrepareRecipe(keepVariant->recipe.load(std::memory_order_acquire), indirectArguments != 0);
@@ -900,6 +1383,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
     deviceMs += phaseTiming.Elapsed();
     phaseTiming.Phase(PhaseTail);
     ReportDispatchFast(profile);
+    if (slotsOn) ReportDispatchSlots();
     if (profile) {
         auto& pending = pendingDispatchPhases();
         pending.outcome = DispatchOutcome::Real;
