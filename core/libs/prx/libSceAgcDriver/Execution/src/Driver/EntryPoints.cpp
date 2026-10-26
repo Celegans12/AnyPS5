@@ -141,6 +141,10 @@ extern "C" std::size_t AgcDriverAwaitedWaits_nid_postfix(AgcDriver::AwaitedWait*
     return count;
 }
 
+extern "C" bool AgcDriverFailed_nid_postfix() {
+    return AgcDriver::DriverDetail::Driver::Get().Failed();
+}
+
 extern "C" bool AgcDriverQuiescent_nid_postfix() {
     return AgcDriver::DriverDetail::Driver::Get().Quiescent();
 }
