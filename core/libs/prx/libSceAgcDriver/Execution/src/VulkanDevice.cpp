@@ -5412,10 +5412,6 @@ bool VulkanDevice::SamePreparation(const PreparedDispatch& left, const PreparedD
             difference = "set layouts differ";
             return false;
         }
-        if (left.resources->NeedsCompletion() != right.resources->NeedsCompletion() || left.resources->Reusable() != right.resources->Reusable()) {
-            difference = "completion or reusability differs";
-            return false;
-        }
     }
     return true;
 }
