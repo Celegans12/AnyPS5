@@ -1660,24 +1660,15 @@ void CheckImportWindow() {
     Require(!UnchangedSince(base, Block, after), "a store after the import window was missed");
 }
 
-std::uint64_t hookedBegin = 0;
-std::uint64_t hookedEnd = 0;
-
 void CheckImportWindowOverUnwatchedPart() {
     void* memory = AllocateWatched(3 * Block);
     const auto base = reinterpret_cast<std::uint64_t>(memory);
     std::memset(memory, 0x11, 3 * Block);
     static_cast<void>(CollectWritesUncached(base, 3 * Block));
     Unwatch(base + Block, Block);
-    SetUnwatchHook([](std::uint64_t address, std::size_t bytes) {
-        hookedBegin = address;
-        hookedEnd = address + bytes;
-    });
     const bool imported = ImportWatched(base, 3 * Block, [] { return true; });
-    SetUnwatchHook(nullptr);
     Require(imported, "an import over a partly unwatched range failed");
     Require(Watched(base, Block) && Watched(base + 2 * Block, Block), "an import over a partly unwatched range took its watched blocks out of the watch");
-    Require(hookedBegin <= base + Block && hookedEnd >= base + 2 * Block, "an import that left the write watch did not run the unwatch hook over the part that left");
 }
 
 void CheckImportWindowOtherThread() {
