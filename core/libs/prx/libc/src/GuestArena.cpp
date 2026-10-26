@@ -606,15 +606,19 @@ bool GuestArenaArmOwned_nid_no_patch(std::uintptr_t address, std::size_t bytes, 
     return WindowsMappings::Get().ArmOwned(address, bytes, words, count, flags);
 }
 
-bool GuestArenaOwnedUnchanged_nid_no_patch(std::uintptr_t address, std::size_t bytes, const std::uint64_t* words, std::size_t count) {
-    return WindowsMappings::Get().OwnedUnchanged(address, bytes, words, count);
+bool GuestArenaOwnedUnchanged_nid_no_patch(std::uintptr_t address, std::size_t bytes, const std::uint64_t* words, std::size_t count, std::uint64_t mark) {
+    return WindowsMappings::Get().OwnedUnchanged(address, bytes, words, count, mark);
+}
+
+std::uint64_t GuestArenaOwnedMark_nid_no_patch() {
+    return WindowsMappings::Get().OwnedMark();
 }
 
 void GuestArenaTakeOwnedCounts_nid_no_patch(std::uint64_t* counts, std::size_t count) {
     const auto taken = WindowsMappings::Get().TakeOwnedCounts();
-    std::array<std::uint64_t, GuestArenaOwnedCountSlots> values{taken.arms, taken.armedBlocks, taken.refused, taken.faults, taken.disowned, taken.privateBlocks, taken.unmappedBlocks, taken.partialBlocks, taken.collected, taken.taken, taken.queries, taken.dirty, taken.locked};
-    static_assert(13 + WindowsMappings::OwnedRefusalCount == GuestArenaOwnedCountSlots);
-    for (std::size_t i = 0; i < WindowsMappings::OwnedRefusalCount; ++i) values[13 + i] = taken.reasons[i];
+    std::array<std::uint64_t, GuestArenaOwnedCountSlots> values{taken.arms, taken.armedBlocks, taken.refused, taken.faults, taken.disowned, taken.privateBlocks, taken.unmappedBlocks, taken.partialBlocks, taken.collected, taken.taken, taken.queries, taken.dirty, taken.locked, taken.epochHeld, taken.epochQueried};
+    static_assert(15 + WindowsMappings::OwnedRefusalCount == GuestArenaOwnedCountSlots);
+    for (std::size_t i = 0; i < WindowsMappings::OwnedRefusalCount; ++i) values[15 + i] = taken.reasons[i];
     for (std::size_t i = 0; i < count && i < values.size(); ++i) counts[i] = values[i];
 }
 
@@ -626,8 +630,12 @@ bool GuestArenaArmOwned_nid_no_patch(std::uintptr_t, std::size_t, std::uint64_t*
     return false;
 }
 
-bool GuestArenaOwnedUnchanged_nid_no_patch(std::uintptr_t, std::size_t, const std::uint64_t*, std::size_t) {
+bool GuestArenaOwnedUnchanged_nid_no_patch(std::uintptr_t, std::size_t, const std::uint64_t*, std::size_t, std::uint64_t) {
     return false;
+}
+
+std::uint64_t GuestArenaOwnedMark_nid_no_patch() {
+    return 0;
 }
 
 void GuestArenaTakeOwnedCounts_nid_no_patch(std::uint64_t* counts, std::size_t count) {

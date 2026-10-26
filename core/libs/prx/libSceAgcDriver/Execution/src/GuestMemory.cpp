@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WriteWatchCoverage.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
@@ -1423,6 +1424,9 @@ void watchPrivateMapping(std::uintptr_t address, std::size_t bytes, std::uint64_
 std::atomic<std::uint64_t> nextCollectEpoch{1};
 struct CollectEpochSlot {};
 std::atomic<std::uint64_t> lastBumpedEpoch{0};
+// The owned mark of the thread's epoch (GuestArenaOwnedMark at its last bump or adoption; 0 outside
+// an epoch), see OwnedWordsHold.
+struct OwnedMarkSlot {};
 
 std::uint64_t currentCollectEpoch() {
     if (const auto epoch = HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get(); epoch != 0) return epoch;
@@ -1708,6 +1712,7 @@ std::uint64_t CollectWrittenBlocks(std::uint64_t address, std::size_t bytes, std
 }
 
 void BumpCollectEpoch() {
+    HostThreadSlot<std::uint64_t, OwnedMarkSlot>::Set(GuestArena::GuestArenaOwnedMark_nid_no_patch());
     const auto epoch = nextCollectEpoch.fetch_add(1, std::memory_order_relaxed) + 1;
     HostThreadSlot<std::uint64_t, CollectEpochSlot>::Set(epoch);
     auto last = lastBumpedEpoch.load(std::memory_order_relaxed);
@@ -1717,6 +1722,7 @@ void BumpCollectEpoch() {
 
 void EndCollectEpoch() {
     HostThreadSlot<std::uint64_t, CollectEpochSlot>::Set(0);
+    HostThreadSlot<std::uint64_t, OwnedMarkSlot>::Set(0);
 }
 
 std::uint64_t ThreadCollectEpoch() {
@@ -1729,7 +1735,10 @@ std::uint64_t UnwatchSerial() {
 
 void AdoptLatestCollectEpoch() {
     const auto latest = lastBumpedEpoch.load(std::memory_order_acquire);
-    if (latest > HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get()) HostThreadSlot<std::uint64_t, CollectEpochSlot>::Set(latest);
+    if (latest > HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get()) {
+        HostThreadSlot<std::uint64_t, OwnedMarkSlot>::Set(GuestArena::GuestArenaOwnedMark_nid_no_patch());
+        HostThreadSlot<std::uint64_t, CollectEpochSlot>::Set(latest);
+    }
 }
 
 std::uint64_t CollectEpochBumps() {
@@ -2410,9 +2419,41 @@ bool ArmOwnedBlocks(std::uint64_t address, std::size_t bytes, std::span<std::uin
     return GuestArena::GuestArenaArmOwned_nid_no_patch(static_cast<std::uintptr_t>(address), bytes, words.data(), words.size(), allowPrivate ? 1u : 0u);
 }
 
+namespace {
+
+std::atomic<std::uint64_t> ownedEpochVerified{0};
+std::atomic<std::uint64_t> ownedEpochDisagreed{0};
+
+// APS5_VERIFY_OWNED_EPOCH=<n>: whether this epoch answer is one of the first n of its 10 s.
+bool takeOwnedEpochVerify() {
+    static const std::uint64_t budget = [] {
+        const char* value = std::getenv("APS5_VERIFY_OWNED_EPOCH");
+        return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ull;
+    }();
+    if (budget == 0) return false;
+    static std::atomic<long long> windowStart{0};
+    static std::atomic<std::uint64_t> windowTaken{0};
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto start = windowStart.load(std::memory_order_relaxed);
+    if (nowMs - start >= 10000 && windowStart.compare_exchange_strong(start, nowMs)) windowTaken.store(0, std::memory_order_relaxed);
+    return windowTaken.fetch_add(1, std::memory_order_relaxed) < budget;
+}
+
+}
+
 bool OwnedWordsHold(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> words) {
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || words.empty() || words.size() != HashBlockCount(address, bytes)) return false;
-    return GuestArena::GuestArenaOwnedUnchanged_nid_no_patch(static_cast<std::uintptr_t>(address), bytes, words.data(), words.size());
+    const auto mark = ThreadCollectEpoch() != 0 && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoOwnedEpoch) ? HostThreadSlot<std::uint64_t, OwnedMarkSlot>::Get() : 0;
+    const bool holds = GuestArena::GuestArenaOwnedUnchanged_nid_no_patch(static_cast<std::uintptr_t>(address), bytes, words.data(), words.size(), mark);
+    if (holds && mark != 0 && takeOwnedEpochVerify()) {
+        ownedEpochVerified.fetch_add(1, std::memory_order_relaxed);
+        if (!GuestArena::GuestArenaOwnedUnchanged_nid_no_patch(static_cast<std::uintptr_t>(address), bytes, words.data(), words.size(), 0)) {
+            ownedEpochDisagreed.fetch_add(1, std::memory_order_relaxed);
+            static std::atomic<int> shown{0};
+            if (shown.fetch_add(1, std::memory_order_relaxed) < 50) std::fprintf(stderr, "[owned-proofs] epoch verify: 0x%llx+0x%zx held by the epoch (mark %llu), a query found it written or its words moved (a CPU store after the thread's last ordering point)\n", static_cast<unsigned long long>(address), bytes, static_cast<unsigned long long>(mark));
+        }
+    }
+    return holds;
 }
 
 bool OwnedProofHolds(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> words, std::uint64_t since, bool wordsHeld) {
@@ -2437,9 +2478,9 @@ bool OwnedProofHolds(std::uint64_t address, std::size_t bytes, std::span<const s
 OwnedBlockCounts TakeOwnedBlockCounts() {
     std::array<std::uint64_t, GuestArena::GuestArenaOwnedCountSlots> counts{};
     GuestArena::GuestArenaTakeOwnedCounts_nid_no_patch(counts.data(), counts.size());
-    OwnedBlockCounts taken{counts[0], counts[1], counts[2], counts[3], counts[4], counts[5], counts[6], counts[7], counts[8], counts[9], counts[10], counts[11], counts[12], {}};
-    static_assert(GuestArena::GuestArenaOwnedCountSlots == 14 + std::tuple_size_v<decltype(taken.refusedBy)>);
-    for (std::size_t i = 0; i < taken.refusedBy.size(); ++i) taken.refusedBy[i] = counts[14 + i];
+    OwnedBlockCounts taken{counts[0], counts[1], counts[2], counts[3], counts[4], counts[5], counts[6], counts[7], counts[8], counts[9], counts[10], counts[11], counts[12], counts[13], counts[14], ownedEpochVerified.exchange(0, std::memory_order_relaxed), ownedEpochDisagreed.exchange(0, std::memory_order_relaxed), {}};
+    static_assert(GuestArena::GuestArenaOwnedCountSlots == 16 + std::tuple_size_v<decltype(taken.refusedBy)>);
+    for (std::size_t i = 0; i < taken.refusedBy.size(); ++i) taken.refusedBy[i] = counts[16 + i];
     return taken;
 }
 

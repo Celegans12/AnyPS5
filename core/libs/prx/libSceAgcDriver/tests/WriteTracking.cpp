@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
@@ -2345,6 +2346,127 @@ void CheckOwnedCrossThread() {
     std::cout << "owned proofs: cross-thread stores, " << held << " checks held, " << moved << " saw the store\n";
 }
 
+// Owned answers inside a collect epoch (OwnedWordsHold on a thread that bumped its epoch): the first
+// answer of an epoch queries the blocks whole and checks them, later ones read the checks and the
+// words only; a store made before the thread's last ordering point (its bump) is always seen, one
+// made after it may be seen only after the next bump; a collect that takes a written page, a
+// mapping change or APS5_NO_OWNED_EPOCH end such answers as before; outside an epoch every answer
+// queries.
+void CheckOwnedEpoch() {
+    using AgcDriver::Graphics::RuntimeSwitch;
+    namespace Switches = AgcDriver::Graphics::RuntimeSwitches;
+    const FaultCounter faults;
+    Require(_putenv_s("APS5_VERIFY_OWNED_EPOCH", "40") == 0, "cannot ask for epoch verification");
+    DirectFixture fixture(4 * Block, 4 * Block);
+    const auto base = fixture.Base();
+    {
+        EndCollectEpoch();
+        const auto words = ArmOwned(base, 2 * Block);
+        Require(words.size() == 2, "cannot arm the epoch fixture");
+        TakeOwnedBlockCounts();
+        Require(OwnedWordsHold(base, 2 * Block, words) && OwnedWordsHold(base, 2 * Block, words), "armed words do not hold outside an epoch");
+        auto counts = TakeOwnedBlockCounts();
+        Require(counts.epochHeld == 0 && counts.epochQueried == 0 && counts.queries >= 2, "an answer outside an epoch did not query");
+
+        BumpCollectEpoch();
+        Require(OwnedWordsHold(base, 2 * Block, words), "armed words do not hold in a new epoch");
+        counts = TakeOwnedBlockCounts();
+        Require(counts.epochQueried == 1 && counts.epochHeld == 0 && counts.queries >= 1, "the first answer of an epoch did not query the blocks");
+        for (int round = 0; round < 10; ++round) Require(OwnedWordsHold(base, 2 * Block, words) && OwnedWordsHold(base + Block, Block, std::span(words).subspan(1, 1)), "a checked block does not hold");
+        counts = TakeOwnedBlockCounts();
+        Require(counts.epochHeld == 20 && counts.epochQueried == 0 && counts.epochVerified == 20 && counts.epochDisagreed == 0, "answers after the check queried or disagreed with a query");
+
+        fixture.At(Block + 40) = 7;
+        Require(OwnedWordsHold(base, 2 * Block, words), "a store after the mark ended the epoch's answer");
+        counts = TakeOwnedBlockCounts();
+        Require(counts.epochHeld == 1 && counts.epochVerified == 1 && counts.epochDisagreed == 1, "the epoch verification did not report the store after the mark");
+        BumpCollectEpoch();
+        Require(!OwnedWordsHold(base + Block, Block, std::span(words).subspan(1, 1)), "a store before the mark was missed");
+        Require(OwnedWordsHold(base, Block, std::span(words).first(1)), "a store moved another block's answer");
+        Require(OwnedWordsHold(base, Block, std::span(words).first(1)) && TakeOwnedBlockCounts().epochHeld == 1, "the unwritten block was not answered from its check");
+        Require(faults.Faults() == 0, "epoch answers raised an access violation");
+    }
+    std::cout << "owned proofs: epoch answers query once per epoch, a store before the mark is seen, after it at the next mark\n";
+
+    {
+        BumpCollectEpoch();
+        const auto words = ArmOwned(base, Block);
+        Require(words.size() == 1 && OwnedWordsHold(base, Block, words), "cannot arm the collect fixture");
+        fixture.At(300) = 1;
+        Require(OwnedWordsHold(base, Block, words), "the checked block did not hold in its epoch");
+        CollectWritesUncached(base, Block);
+        Require(!OwnedWordsHold(base, Block, words), "a collect that took a written page left the epoch's answer");
+
+        const auto again = ArmOwned(base + 2 * Block, Block);
+        Require(again.size() == 1 && OwnedWordsHold(base + 2 * Block, Block, again), "cannot arm the switch fixture");
+        Switches::Assign(RuntimeSwitch::NoOwnedEpoch, true);
+        fixture.At(2 * Block + 9) = 3;
+        const bool held = OwnedWordsHold(base + 2 * Block, Block, again);
+        Switches::Assign(RuntimeSwitch::NoOwnedEpoch, false);
+        Require(!held, "APS5_NO_OWNED_EPOCH did not query");
+
+        const auto partial = ArmOwned(base + 3 * Block, Block);
+        Require(partial.size() == 1, "cannot arm the partial fixture");
+        BumpCollectEpoch();
+        fixture.At(3 * Block + 5 * 4096) = 4;
+        TakeOwnedBlockCounts();
+        Require(OwnedWordsHold(base + 3 * Block, 4096, partial) && OwnedWordsHold(base + 3 * Block, 4096, partial), "a store outside the range ended the range's answer");
+        const auto counts = TakeOwnedBlockCounts();
+        Require(counts.epochQueried == 2 && counts.epochHeld == 0, "a block with a written page outside the range was checked");
+        Require(!OwnedWordsHold(base + 3 * Block, Block, partial), "the store into the block was missed");
+    }
+    std::cout << "owned proofs: collects and APS5_NO_OWNED_EPOCH end epoch answers, a block written outside the range is not checked\n";
+
+    // Racing: the writer stores n, then publishes n; the checker reads the published p, then bumps
+    // (its ordering point). An answer that holds after that bump cannot have missed store p.
+    {
+        auto* value = reinterpret_cast<volatile std::uint32_t*>(fixture.memory + 0x2000);
+        *value = 0;
+        std::atomic<std::uint32_t> published{0};
+        std::atomic<bool> stop{false};
+        std::thread writer([&] {
+            for (std::uint32_t next = 1; !stop.load(std::memory_order_relaxed); ++next) {
+                *value = next;
+                published.store(next, std::memory_order_release);
+                if ((next & 63u) == 0) std::this_thread::yield();
+            }
+        });
+        std::size_t held = 0;
+        std::size_t moved = 0;
+        TakeOwnedBlockCounts();
+        try {
+            for (unsigned round = 0; round < 3000; ++round) {
+                const auto words = ArmOwned(base, Block);
+                Require(!words.empty(), "cannot re-arm the racing epoch fixture");
+                const auto armedValue = *value;
+                for (unsigned check = 0; check < 64; ++check) {
+                    const auto seen = published.load(std::memory_order_acquire);
+                    BumpCollectEpoch();
+                    bool holds = true;
+                    for (int again = 0; again < 4 && holds; ++again) holds = OwnedWordsHold(base, Block, words);
+                    if (!holds) {
+                        ++moved;
+                        break;
+                    }
+                    ++held;
+                    Require(seen <= armedValue, "an epoch answer held after a store made before the mark");
+                }
+            }
+        } catch (...) {
+            stop = true;
+            writer.join();
+            throw;
+        }
+        stop = true;
+        writer.join();
+        const auto counts = TakeOwnedBlockCounts();
+        Require(moved > 0, "the racing epoch checks never saw a store");
+        std::cout << "owned proofs: cross-thread stores in epochs, " << held << " checks held, " << moved << " saw the store, " << counts.epochHeld << " answers from block checks\n";
+    }
+    EndCollectEpoch();
+    Require(faults.Faults() == 0, "epoch answers raised an access violation");
+}
+
 void CheckOwnedRefusals() {
     // Two guest views of one backing are not armed, and aliasing an armed view disarms it.
     {
@@ -2395,9 +2517,20 @@ void BenchOwnedProofs() {
             for (int round = 0; round < Rounds; ++round) step();
             return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count() / Rounds;
         };
+        EndCollectEpoch();
         TakeOwnedBlockCounts();
         const auto proof = timed([&] { Require(OwnedProofHolds(base, bytes, words, since), "the bench proof did not hold"); });
         const auto counts = TakeOwnedBlockCounts();
+        const auto query = timed([&] { Require(OwnedWordsHold(base, bytes, words), "the bench words did not hold"); });
+        BumpCollectEpoch();
+        const auto firstStart = std::chrono::steady_clock::now();
+        Require(OwnedWordsHold(base, bytes, words), "the bench words did not hold in the epoch");
+        const auto first = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - firstStart).count();
+        const auto epoch = timed([&] { Require(OwnedWordsHold(base, bytes, words), "the bench words did not hold from the checks"); });
+        const auto epochProof = timed([&] { Require(OwnedProofHolds(base, bytes, words, since), "the bench proof did not hold in the epoch"); });
+        const auto epochCounts = TakeOwnedBlockCounts();
+        Require(epochCounts.epochQueried == 1 && epochCounts.epochHeld == 2 * Rounds, "the bench epoch answers did not come from the checks");
+        EndCollectEpoch();
         std::uint64_t previous = CollectWrites(base, bytes);
         if (previous == 0) previous = WalkUntrackedBlocks(base, bytes, 0, stale, nullptr, &layout, &layout);
         const auto walk = timed([&] {
@@ -2410,7 +2543,7 @@ void BenchOwnedProofs() {
             *reinterpret_cast<volatile std::uint8_t*>(base) = 1;
             Require(ArmOwnedBlocks(base, bytes, again), "the bench fixture could not be re-armed");
         });
-        std::cout << "[owned-bench] " << kind << " " << (bytes >> 10) << " KiB: held proof " << proof << " us (" << static_cast<double>(counts.queries) / Rounds << " GetWriteWatch per proof, " << counts.locked << " under the lock), walk " << walk << " us, full compare " << compare << " us, store + re-arm " << arm << " us\n";
+        std::cout << "[owned-bench] " << kind << " " << (bytes >> 10) << " KiB: held proof " << proof << " us (" << static_cast<double>(counts.queries) / Rounds << " GetWriteWatch per proof, " << counts.locked << " under the lock), words by query " << query << " us, epoch: first answer " << first << " us, words from checks " << epoch << " us, held proof " << epochProof << " us; walk " << walk << " us, full compare " << compare << " us, store + re-arm " << arm << " us\n";
     };
     for (const std::size_t bytes : {Block, std::size_t{1} << 20, std::size_t{8} << 20}) {
         {
@@ -2545,6 +2678,7 @@ int main(int argc, char** argv) {
             CheckOwnedRefusals();
             CheckOwnedPrivate();
             CheckOwnedMappingChanges();
+            CheckOwnedEpoch();
             std::cout << "owned proof tests passed\n";
             return 0;
         }

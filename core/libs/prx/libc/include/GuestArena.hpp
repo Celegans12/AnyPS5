@@ -81,15 +81,19 @@ void GuestArenaPrepareHostRead_nid_no_patch(const void* pointer, std::size_t byt
 // resolved by owned blocks), other disarms, blocks armed with private pages, blocks armed with
 // nothing mapped, blocks armed partly mapped, disarms by a collect that took a written page, pages
 // whose write bits an arming took, GetWriteWatch queries of OwnedUnchanged, OwnedUnchanged answers
-// that found a written page, OwnedUnchanged answers asked again under the lock, then refusals by reason (WindowsMappings::OwnedRefusal: none, outside
+// that found a written page, OwnedUnchanged answers asked again under the lock, answers with a mark
+// held from the blocks' checks alone, answers with a mark that queried, then refusals by reason (WindowsMappings::OwnedRefusal: none, outside
 // the arena or a host region, shared or aliased view, pinned or importing, host write open,
 // protection change in flight, not writable or another mapping type, private with flag 1 clear,
 // nothing mapped (no longer refused), not write-watched).
+// OwnedMark: a new mark for OwnedUnchanged (0: none, every answer queries): an answer with a mark
+// may rely on a block's check by a query that began after the mark (WindowsMappings::OwnedUnchanged).
 // EndSetProtection ends the guest protection change that GuestArenaSetProtection began, after the
 // caller's own protection call.
-inline constexpr std::size_t GuestArenaOwnedCountSlots = 23;
+inline constexpr std::size_t GuestArenaOwnedCountSlots = 25;
 bool GuestArenaArmOwned_nid_no_patch(std::uintptr_t address, std::size_t bytes, std::uint64_t* words, std::size_t count, unsigned flags);
-bool GuestArenaOwnedUnchanged_nid_no_patch(std::uintptr_t address, std::size_t bytes, const std::uint64_t* words, std::size_t count);
+bool GuestArenaOwnedUnchanged_nid_no_patch(std::uintptr_t address, std::size_t bytes, const std::uint64_t* words, std::size_t count, std::uint64_t mark);
+std::uint64_t GuestArenaOwnedMark_nid_no_patch();
 void GuestArenaTakeOwnedCounts_nid_no_patch(std::uint64_t* counts, std::size_t count);
 void GuestArenaEndSetProtection_nid_no_patch(std::uintptr_t address, std::size_t bytes);
 
