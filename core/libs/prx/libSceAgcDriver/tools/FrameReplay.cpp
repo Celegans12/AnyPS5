@@ -135,9 +135,15 @@ private:
 }
 
 void startWatchdog(std::chrono::seconds timeout) {
-    if (timeout.count() <= 0) return;
     std::thread([timeout] {
-        std::this_thread::sleep_for(timeout);
+        const auto deadline = Clock::now() + timeout;
+        while (timeout.count() <= 0 || Clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            if (!AgcDriverFailed_nid_postfix()) continue;
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            std::fprintf(stderr, "agc_frame_replay: the driver failed; if it lost the GPU device (Vulkan result -4), the NVIDIA shader store may have been reset: check the game dictionary before the next game run; exiting without a driver shutdown\n");
+            hardExit(6);
+        }
         std::fprintf(stderr, "agc_frame_replay: no result after %lld s (--timeout-s); exiting without a driver shutdown\n", static_cast<long long>(timeout.count()));
         hardExit(4);
     }).detach();

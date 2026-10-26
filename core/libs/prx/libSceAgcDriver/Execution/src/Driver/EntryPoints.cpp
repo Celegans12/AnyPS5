@@ -158,6 +158,10 @@ extern "C" bool AgcDriverSettle_nid_postfix() {
     return AgcDriver::DriverDetail::Driver::Get().SettleForCapture(std::chrono::seconds(10));
 }
 
+extern "C" bool AgcDriverFailed_nid_postfix() {
+    return AgcDriver::DriverDetail::Driver::Get().Failed();
+}
+
 extern "C" bool AgcDriverQuiescent_nid_postfix() {
     return AgcDriver::DriverDetail::Driver::Get().Quiescent();
 }

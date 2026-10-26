@@ -82,6 +82,7 @@ public:
     std::uint64_t FlipSubmissions() const;
     std::vector<AwaitedWait> AwaitedWaits();
     bool Quiescent();
+    bool Failed() const { return failed.load(std::memory_order_acquire); }
     bool SettleForCapture(std::chrono::milliseconds timeout);
     std::vector<std::uint32_t> SaveQueueStates();
     void LoadQueueStates(std::span<const std::uint32_t> words);
