@@ -11,14 +11,14 @@
 > when a build renders our 60-frame title reference exactly and runs faster in the open world than the build before it.
 > Fixes that apply to `main` go upstream as separate PRs.
 
-## Where it stands (2026-10-25)
+## Where it stands (2026-10-26)
 
 | | |
 |---|---|
 | **Furthest point** | Open world, the Nupur river by the Ainu village, with HUD and quest |
 | **Time to the world** | about 5 minutes from a save near Teshio Ridge (warm shader cache) |
-| **Frame rate in the world** | about **0.5-0.8 fps** (5-8 presents per 10 s depending on the spot and the session; 7.6-8.4 at the river village on 10-25/26; this laptop's GPU clocks drift by ~14 % between sessions, so builds are compared back to back in one session) |
-| **Stability** | with the second Vulkan queue on its own compute-only queue family, world runs are clean (up to 22 minutes); one crash on 10-25 from a second-queue label bug, fixed in this build |
+| **Frame rate in the world** | about **0.6-0.8 fps** (6-8.4 presents per 10 s depending on the spot and the session; 8.05 at the river village on 10-26, against 7.2 on the build from 10-24; this laptop's GPU clocks drift by ~14 % between sessions, so builds are compared back to back in one session) |
+| **Stability** | with the second Vulkan queue on its own compute-only queue family, world runs are clean (up to 22 minutes); the one crash we saw on 10-25 (a second-queue label bug) is fixed since `5becc82a97` |
 | **Tested on** | Windows 11, RTX 3080 Laptop GPU 16 GB (driver 610.62), 32 GB RAM, MinGW-w64 GCC 15.2.0, Release |
 | **Build** | `6debc980ee` (our tree merged with `main` 2026-10-24 `a39be6252d`, plus owned texture proofs, owned draw and vertex inputs, a lane-targeted storage flush, shahulmubeen-a's HTILE note (Celegans12/AnyPS5#2), mrfelek's #9957 and #10228, fixes from #675, #6188 (off by default), #9558, #8887, #7514, address-table templates, the read-only lease skip and hritikutekar's committer batches) + docs, shader-cache SourceVersion `6c403b0d2815d602`, title reference T1 exact |
 
@@ -121,7 +121,7 @@ APS5_NO_DRAW_AHEAD=1 APS5_DEFER_REFRESH_FLUSH=1 APS5_PIPELINE_DISPATCH=1
 - Once, during loading on the build before this one, the game stopped with `missing static shader ABI register 531`. It did not come back in any later run; if you see it, please post the log in #675.
 - A dispatch joins an overlapped run only when its access ranges are disjoint from the run's; address-based, BDA and bindless dispatches count as conflicting. That costs about 5 % GPU time per frame against the old rule. Frames are CPU-bound, so presents don't move.
 - One compute program (0x8000361f00) is still refused by the recompiler at registration (non-fatal so far).
-- About 0.5-0.8 fps is far from playable. What limits a frame now, and what's next, is in [discussion #675](https://github.com/boykopovar/AnyPS5/discussions/675).
+- About 0.6-0.8 fps is far from playable. What limits a frame now, and what's next, is in [discussion #675](https://github.com/boykopovar/AnyPS5/discussions/675).
 
 ## What it carries on top of `main` 2026-10-24
 
@@ -141,6 +141,9 @@ APS5_NO_DRAW_AHEAD=1 APS5_DEFER_REFRESH_FLUSH=1 APS5_PIPELINE_DISPATCH=1
   - presenter revalidation prepared off the GPU lock, and a cheaper image-table miss path;
   - batched staging: a dispatch run's copy-ins in one prelude ahead of it and its copy-backs behind one barrier (on NVIDIA any barrier between dispatches serializes them);
   - an in-run A/B switch registry;
+  - owned reuse of vertex/index inputs and draw snapshots in host-imported memory the write tracker doesn't watch (same per-block word proof as the texture checks);
+  - storage write-backs before a label wait only for the queue lanes whose batches write or lease the stored range;
+  - shahulmubeen-a's HTILE note for cache-hit dispatch items (Celegans12/AnyPS5#2) and a fix for second-queue labels whose copied writer sits only in the async lane's batch;
   - owned texture proofs: the 64 KiB blocks under the committer's untracked texture snapshots are write-protected (or, when unmapped, watched through every map and commit path), so a snapshot proof is a few word reads instead of a memory walk;
   - fixes for three slowdowns that `main` added in the draw committer:
     - small device buffers get their own pool tier;
