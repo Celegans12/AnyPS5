@@ -110,6 +110,8 @@ APS5_NO_DRAW_AHEAD=1 APS5_DEFER_REFRESH_FLUSH=1 APS5_PIPELINE_DISPATCH=1
 
 ## Known issues
 
+- **The owned proofs and owned draw/vertex inputs use guest-thread write faults** (blocks are write-protected and a guest store faults once and retries). Upstream removed that kind of fault (#5596, #9181) because Windows writes the exception frame into the System V red zone below `rsp` (#361). In our runs no CPU store ever hit an armed block (0 faults), but a scene that does could corrupt guest stack data. A fault-free version (write-watch based) is being written; until then `APS5_NO_OWNED_PROOFS=1 APS5_NO_OWNED_DRAW_SNAPSHOTS=1 APS5_NO_OWNED_VERTEX_INPUTS=1` turns all of it off (about 13 % slower here).
+
 - Fixed on 10-25: a rare crash with the second queue (`AGC graphics: no batch to append a completion label to`): a queue-0 label waiting for a copy-back found the copied writer only in the second queue's batch. The label now goes into that lane's batch (`5becc82a97`, with a test).
 - A silver sheen appears on Atsu and the boat a few frames after entering the world. Not investigated yet.
 
