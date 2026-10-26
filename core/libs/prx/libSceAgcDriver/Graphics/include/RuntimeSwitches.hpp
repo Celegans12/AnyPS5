@@ -74,6 +74,7 @@ enum class RuntimeSwitch : std::size_t {
     NoGpuSourceAfterWriter,
     NoOwnedVertexInputs,
     NoFlushLaneWait,
+    NoOwnedEpoch,
     Count,
 };
 

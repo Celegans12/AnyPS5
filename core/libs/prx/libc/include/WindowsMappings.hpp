@@ -416,7 +416,9 @@ public:
     // for them. collected: disarms by a written page (a reset that took it, or a re-arm that found
     // it); taken: pages whose write bits an arming took (reported later as written); queries:
     // GetWriteWatch calls of OwnedUnchanged; dirty: OwnedUnchanged answers that found a written page;
-    // locked: OwnedUnchanged answers asked again under the lock (a reset ran across the first).
+    // locked: OwnedUnchanged answers asked again under the lock (a reset ran across the first);
+    // epochHeld: answers with a mark taken from the blocks' checks alone (no query); epochQueried:
+    // answers with a mark that had to query (a block not checked since the mark).
     struct OwnedCounts {
         std::uint64_t arms = 0;
         std::uint64_t armedBlocks = 0;
@@ -431,6 +433,8 @@ public:
         std::uint64_t queries = 0;
         std::uint64_t dirty = 0;
         std::uint64_t locked = 0;
+        std::uint64_t epochHeld = 0;
+        std::uint64_t epochQueried = 0;
         std::array<std::uint64_t, OwnedRefusalCount> reasons{};
     };
 
@@ -493,26 +497,49 @@ public:
     // moves it implies are under way) must be even and unchanged across them, so no reset that took
     // a bit of the range falls between a query and the words; otherwise it is asked again under the
     // lock.
-    bool OwnedUnchanged(std::uintptr_t address, std::size_t bytes, const std::uint64_t* words, std::size_t count) {
+    //
+    // `mark` (OwnedMark, the caller's last ordering point; 0: none) lets the answer come from the
+    // blocks' checks: a block is checked at c when a query that began after a read of the clock
+    // (ownedClock) returning c found none of the block's armed pages written and its word still the
+    // one it was asked with. With every block checked at c >= mark and its word unchanged, the answer
+    // holds without a query: the clock only moves by read-modify-writes, so a read returning
+    // c >= mark reads from the mark's increment or a later one (its release sequence) and every CPU
+    // store that happened before the mark had set its page's bit before that query, which then saw
+    // it (no check) or found the word moved by the reset that took it (a reset moves the words inside
+    // the reset window). A store after the mark may stay unseen until the caller's next mark, the
+    // collect epoch's rule: the driver marks at its ordering points (a submission, a guest-memory
+    // wait the CPU may have satisfied, a drain, a reap). Without a mark every answer queries, as
+    // before. With a mark and a block not checked since it, the blocks are queried whole and checked;
+    // a written page found in them is asked again over the range alone.
+    bool OwnedUnchanged(std::uintptr_t address, std::size_t bytes, const std::uint64_t* words, std::size_t count, std::uint64_t mark = 0) {
         if (bytes == 0 || bytes > ownedAddressLimit || address > ownedAddressLimit - bytes) return false;
         const auto first = address & ~std::uintptr_t{ownedBlockBytes - 1};
         const auto stop = (address + bytes + ownedBlockBytes - 1) & ~std::uintptr_t{ownedBlockBytes - 1};
         if ((stop - first) / ownedBlockBytes != count) return false;
-        const auto before = ownedResets.load(std::memory_order_seq_cst);
-        if (!wordsHold(first, stop, words)) return false;
-        if ((before & 1u) == 0) {
-            const auto answer = ownedQuery(address, bytes, first, stop, words);
-            if (answer == OwnedAnswer::Written || answer == OwnedAnswer::Moved) return false;
-            if (answer == OwnedAnswer::Holds && ownedResets.load(std::memory_order_seq_cst) == before) return true;
+        if (mark != 0) {
+            if (checkedSince(first, stop, words, mark)) {
+                ownedEpochHeld.fetch_add(1, std::memory_order_relaxed);
+                return true;
+            }
+            ownedEpochQueried.fetch_add(1, std::memory_order_relaxed);
+            const auto clock = ownedClock.load(std::memory_order_seq_cst);
+            if (!wordsHold(first, stop, words)) return false;
+            if (unchangedNow(first, stop - first, first, stop, words)) {
+                markChecked(first, stop, clock);
+                return true;
+            }
         }
-        ownedLocked.fetch_add(1, std::memory_order_relaxed);
-        std::lock_guard lock(mutex);
-        return ownedQuery(address, bytes, first, stop, words) == OwnedAnswer::Holds;
+        return unchangedNow(address, bytes, first, stop, words);
+    }
+
+    // A new mark: the clock after this call's increment (see OwnedUnchanged).
+    std::uint64_t OwnedMark() {
+        return ownedClock.fetch_add(1, std::memory_order_seq_cst) + 1;
     }
 
     OwnedCounts TakeOwnedCounts() {
         const auto take = [](std::atomic<std::uint64_t>& value) { return value.exchange(0, std::memory_order_relaxed); };
-        OwnedCounts counts{take(ownedArms), take(ownedArmedBlocks), take(ownedRefused), take(ownedFaults), take(ownedDisowned), take(ownedPrivateBlocks), take(ownedUnmappedBlocks), take(ownedPartialBlocks), take(ownedCollected), take(ownedTaken), take(ownedQueries), take(ownedDirty), take(ownedLocked), {}};
+        OwnedCounts counts{take(ownedArms), take(ownedArmedBlocks), take(ownedRefused), take(ownedFaults), take(ownedDisowned), take(ownedPrivateBlocks), take(ownedUnmappedBlocks), take(ownedPartialBlocks), take(ownedCollected), take(ownedTaken), take(ownedQueries), take(ownedDirty), take(ownedLocked), take(ownedEpochHeld), take(ownedEpochQueried), {}};
         for (std::size_t i = 0; i < OwnedRefusalCount; ++i) counts.reasons[i] = take(ownedReasons[i]);
         return counts;
     }
@@ -871,6 +898,7 @@ private:
         auto& entry = ownedLeaves[block >> ownedLeafShift];
         auto* leaf = entry.load(std::memory_order_relaxed);
         if (leaf == nullptr) {
+            ownedChecked[block >> ownedLeafShift].store(new std::atomic<std::uint64_t>[ownedLeafBlocks](), std::memory_order_release);
             leaf = new std::atomic<std::uint64_t>[ownedLeafBlocks]();
             entry.store(leaf, std::memory_order_release);
         }
@@ -1055,6 +1083,39 @@ private:
             if ((word & 1u) == 0 || word != words[index]) return false;
         }
         return true;
+    }
+
+    // OwnedUnchanged's answer from queries (see there).
+    bool unchangedNow(std::uintptr_t address, std::size_t bytes, std::uintptr_t first, std::uintptr_t stop, const std::uint64_t* words) {
+        const auto before = ownedResets.load(std::memory_order_seq_cst);
+        if (!wordsHold(first, stop, words)) return false;
+        if ((before & 1u) == 0) {
+            const auto answer = ownedQuery(address, bytes, first, stop, words);
+            if (answer == OwnedAnswer::Written || answer == OwnedAnswer::Moved) return false;
+            if (answer == OwnedAnswer::Holds && ownedResets.load(std::memory_order_seq_cst) == before) return true;
+        }
+        ownedLocked.fetch_add(1, std::memory_order_relaxed);
+        std::lock_guard lock(mutex);
+        return ownedQuery(address, bytes, first, stop, words) == OwnedAnswer::Holds;
+    }
+
+    // Every block checked at a clock value >= mark (each check read first, acquire) and still armed
+    // with its word (read after).
+    bool checkedSince(std::uintptr_t first, std::uintptr_t stop, const std::uint64_t* words, std::uint64_t mark) const {
+        for (auto block = first; block < stop; block += ownedBlockBytes) {
+            const auto* checked = ownedChecked[block >> ownedLeafShift].load(std::memory_order_acquire);
+            if (checked == nullptr || checked[(block / ownedBlockBytes) & (ownedLeafBlocks - 1)].load(std::memory_order_acquire) < mark) return false;
+        }
+        return wordsHold(first, stop, words);
+    }
+
+    // Stores `clock` as the blocks' check (release, after the queries and the words they were
+    // answered with). A smaller value stored over a larger one only asks for a query sooner.
+    void markChecked(std::uintptr_t first, std::uintptr_t stop, std::uint64_t clock) {
+        for (auto block = first; block < stop; block += ownedBlockBytes) {
+            auto* checked = ownedChecked[block >> ownedLeafShift].load(std::memory_order_acquire);
+            if (checked != nullptr) checked[(block / ownedBlockBytes) & (ownedLeafBlocks - 1)].store(clock, std::memory_order_release);
+        }
     }
 
     // Every 16 KiB page a single resident view (write-watched when watchResident), else 4 KiB pages
@@ -1511,6 +1572,10 @@ private:
     std::size_t granularity = 0x10000;
     bool watchResident = false;
     std::array<std::atomic<std::atomic<std::uint64_t>*>, ownedLeafCount> ownedLeaves{};
+    std::array<std::atomic<std::atomic<std::uint64_t>*>, ownedLeafCount> ownedChecked{};
+    std::atomic<std::uint64_t> ownedClock{1};
+    std::atomic<std::uint64_t> ownedEpochHeld{0};
+    std::atomic<std::uint64_t> ownedEpochQueried{0};
     std::size_t ownedLive = 0;
     std::uint32_t protectionsInFlight = 0;
     std::atomic<std::uint64_t> ownedArms{0};
