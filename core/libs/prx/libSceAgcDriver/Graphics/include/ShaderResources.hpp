@@ -868,8 +868,11 @@ public:
         std::array<std::uint64_t, 16> notReusable{};
         std::size_t entries = 0;
         std::size_t capacity = 0;
+        std::uint64_t pinnedBytes = 0;
+        std::uint64_t byteBudget = 0;
         bool split = false;
     };
+    static bool ComputeBudgetRequested();
     ComputeFates ComputeFateCounts() const;
     static bool ComputeKey(const Key& key) { return !key.empty() && key[0] != 0xffffffffu; }
     // Moves the entry to the front of the LRU (a recipe hit uses its template without Find, and a
@@ -934,6 +937,9 @@ private:
     std::size_t addressCapacity = 0;
     std::size_t computeEntries = 0;
     std::size_t computeCapacity = 0;
+    std::uint64_t computePinnedBytes = 0;
+    std::uint64_t computeByteBudget = 0;
+    bool computeSplit() const;
     enum Fate : std::uint8_t { FateUnknown, FatePresent, FateEvicted, FateEvictedByDraw, FateDropped, FateRemoved, FateRefusedStorage, FateRefusedTexture, FateNotReusable };
     std::unordered_map<std::size_t, std::uint8_t> computeFates;
     ComputeFates fateCounts;

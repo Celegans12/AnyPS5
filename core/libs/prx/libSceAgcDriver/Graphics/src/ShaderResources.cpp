@@ -5314,6 +5314,30 @@ bool ResourceCache::computeEntry(const std::pair<Key, std::shared_ptr<ShaderReso
     return ComputeKey(entry.first) && !entry.second->ReusesAddressSpace();
 }
 
+namespace {
+
+std::uint64_t PinnedTextureBytes(const ShaderResources& resources) {
+    std::uint64_t bytes = 0;
+    const auto& textures = resources.SampledTextures();
+    for (std::size_t i = 0; i < textures.size(); ++i) {
+        if (textures[i] == nullptr) continue;
+        if (std::any_of(textures.begin(), textures.begin() + static_cast<std::ptrdiff_t>(i), [&](const auto& earlier) { return earlier == textures[i]; })) continue;
+        bytes += textures[i]->AllocationBytes();
+    }
+    return bytes;
+}
+
+}
+
+bool ResourceCache::ComputeBudgetRequested() {
+    static const bool requested = std::getenv("APS5_COMPUTE_TEMPLATE_ENTRIES") != nullptr;
+    return requested;
+}
+
+bool ResourceCache::computeSplit() const {
+    return ComputeBudgetRequested() && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoComputeTemplateBudget);
+}
+
 void ResourceCache::noteFate(const Key& key, std::uint8_t fate) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (!profile || !ComputeKey(key)) return;
@@ -5359,7 +5383,7 @@ void ResourceCache::noteComputeLookup(const Key& key, bool hit) {
         refused += item;
     }
     const auto total = counts.hits + counts.misses;
-    AgcDriver::ProfilePrint_nid_no_patch("[rescache] compute templates (10 s): %llu lookups, %llu hits (%.1f %%); misses by the key's last fate: never cached %llu, evicted over the bound %llu (by a draw's insert %llu), dropped with an image or texture %llu, invalidated %llu, refused at insert: uncached storage image %llu, released texture %llu, not reusable:%s; still present %llu; compute entries %zu, bound %zu (%s)\n", static_cast<unsigned long long>(total), static_cast<unsigned long long>(counts.hits), total != 0 ? 100.0 * static_cast<double>(counts.hits) / static_cast<double>(total) : 0.0, static_cast<unsigned long long>(counts.neverSeen), static_cast<unsigned long long>(counts.evicted), static_cast<unsigned long long>(counts.evictedByDraws), static_cast<unsigned long long>(counts.dropped), static_cast<unsigned long long>(counts.removed), static_cast<unsigned long long>(counts.refusedStorage), static_cast<unsigned long long>(counts.refusedTexture), refused.empty() ? " none" : refused.c_str(), static_cast<unsigned long long>(counts.present), computeEntries, Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoComputeTemplateBudget) ? capacity : computeCapacity, Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoComputeTemplateBudget) ? "shared with draws, APS5_NO_COMPUTE_TEMPLATE_BUDGET" : "own budget, APS5_COMPUTE_TEMPLATE_ENTRIES");
+    AgcDriver::ProfilePrint_nid_no_patch("[rescache] compute templates (10 s): %llu lookups, %llu hits (%.1f %%); misses by the key's last fate: never cached %llu, evicted over the bound %llu (by a draw's insert %llu), dropped with an image or texture %llu, invalidated %llu, refused at insert: uncached storage image %llu, released texture %llu, not reusable:%s; still present %llu; compute entries %zu, bound %zu, sampled textures they pin %llu MiB of %llu MiB (%s)\n", static_cast<unsigned long long>(total), static_cast<unsigned long long>(counts.hits), total != 0 ? 100.0 * static_cast<double>(counts.hits) / static_cast<double>(total) : 0.0, static_cast<unsigned long long>(counts.neverSeen), static_cast<unsigned long long>(counts.evicted), static_cast<unsigned long long>(counts.evictedByDraws), static_cast<unsigned long long>(counts.dropped), static_cast<unsigned long long>(counts.removed), static_cast<unsigned long long>(counts.refusedStorage), static_cast<unsigned long long>(counts.refusedTexture), refused.empty() ? " none" : refused.c_str(), static_cast<unsigned long long>(counts.present), computeEntries, computeSplit() ? computeCapacity : capacity, static_cast<unsigned long long>(computePinnedBytes >> 20u), static_cast<unsigned long long>(computeByteBudget >> 20u), computeSplit() ? "own bound, APS5_COMPUTE_TEMPLATE_ENTRIES / _MIB" : "shared with draws");
     counts = {};
 }
 
@@ -5367,8 +5391,10 @@ ResourceCache::ComputeFates ResourceCache::ComputeFateCounts() const {
     std::lock_guard lock(mutex);
     auto counts = fateCounts;
     counts.entries = computeEntries;
-    counts.split = !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoComputeTemplateBudget);
+    counts.split = computeSplit();
     counts.capacity = counts.split ? computeCapacity : capacity;
+    counts.pinnedBytes = computePinnedBytes;
+    counts.byteBudget = computeByteBudget;
     return counts;
 }
 
@@ -5556,7 +5582,10 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
     }
     resources->PinTextures(true);
     if (resources->ReusesAddressSpace()) ++addressEntries;
-    else if (ComputeKey(key)) ++computeEntries;
+    else if (ComputeKey(key)) {
+        ++computeEntries;
+        computePinnedBytes += PinnedTextureBytes(*resources);
+    }
     noteFate(key, FatePresent);
     entries.emplace_front(key, std::move(resources));
     index.emplace(key, entries.begin());
@@ -5576,16 +5605,20 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
         const char* value = std::getenv("APS5_COMPUTE_TEMPLATE_ENTRIES");
         const auto parsed = value ? std::strtoull(value, nullptr, 10) : 0ull;
         computeCapacity = parsed != 0 ? static_cast<std::size_t>(parsed) : 4096u;
+        const char* mib = std::getenv("APS5_COMPUTE_TEMPLATE_MIB");
+        const auto parsedMib = mib ? std::strtoull(mib, nullptr, 10) : 0ull;
+        computeByteBudget = static_cast<std::uint64_t>(parsedMib != 0 ? parsedMib : 256ull) << 20u;
     }
     noteUse(key);
-    const bool split = !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoComputeTemplateBudget);
+    const bool split = computeSplit();
     const bool drawInsert = !ComputeKey(key);
     enum class Pool { Shared, Address, Compute };
     const auto poolOf = [&](const std::pair<Key, std::shared_ptr<ShaderResources>>& entry) { return entry.second->ReusesAddressSpace() ? Pool::Address : split && ComputeKey(entry.first) ? Pool::Compute : Pool::Shared; };
     for (;;) {
         const auto shared = entries.size() - addressEntries - (split ? computeEntries : 0u);
-        const auto pool = addressEntries > addressCapacity ? Pool::Address : split && computeEntries > computeCapacity ? Pool::Compute : shared > capacity ? Pool::Shared : Pool::Shared;
-        if (!(addressEntries > addressCapacity || (split && computeEntries > computeCapacity) || shared > capacity)) break;
+        const bool computeOver = split && (computeEntries > computeCapacity || computePinnedBytes > computeByteBudget);
+        const auto pool = addressEntries > addressCapacity ? Pool::Address : computeOver ? Pool::Compute : Pool::Shared;
+        if (!(addressEntries > addressCapacity || computeOver || shared > capacity)) break;
         auto victim = std::prev(entries.end());
         while (victim != entries.begin() && poolOf(*victim) != pool) --victim;
         if (poolOf(*victim) != pool) break;
@@ -5683,7 +5716,11 @@ void ResourceCache::indexTextures(decltype(entries)::iterator entry, bool add) {
 void ResourceCache::drop(std::list<std::pair<Key, std::shared_ptr<ShaderResources>>>::iterator entry, std::vector<std::shared_ptr<ShaderResources>>* evicted) {
     entry->second->PinTextures(false);
     if (entry->second->ReusesAddressSpace()) --addressEntries;
-    else if (ComputeKey(entry->first)) --computeEntries;
+    else if (ComputeKey(entry->first)) {
+        --computeEntries;
+        const auto bytes = PinnedTextureBytes(*entry->second);
+        computePinnedBytes -= std::min(computePinnedBytes, bytes);
+    }
     indexTextures(entry, false);
     index.erase(entry->first);
     if (evicted != nullptr) evicted->push_back(std::move(entry->second));
@@ -5716,6 +5753,7 @@ void ResourceCache::Clear() {
     entries.clear();
     addressEntries = 0;
     computeEntries = 0;
+    computePinnedBytes = 0;
     evictedKeys.clear();
     evictedOrder.clear();
     evictionsSinceCheck = 0;
