@@ -396,6 +396,8 @@ struct Replay {
                 lastCompleted = completed;
                 deadline = now + timeout;
                 quietSince = now;
+            } else if (!AgcDriverQuiescent_nid_postfix()) {
+                deadline = now + timeout;
             }
             if (now - quietSince >= (options.exact ? ExactQuiet : BlockedQuiet) && blockedOnWaits()) return waited();
             if (now >= deadline) {
