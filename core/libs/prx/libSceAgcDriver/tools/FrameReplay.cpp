@@ -799,6 +799,10 @@ FrameCheck compareFrames(const FrameCaptureReader& reader, const Options& option
             continue;
         }
         const auto reference = reader.Read(*chunk);
+        if (call.values.size() >= 11) {
+            if (!options.frames.empty()) writeFrame(options.frames / ("game-frame-" + std::to_string(call.values[9]) + ".bmp"), buffer, reference);
+            continue;
+        }
         const auto replayed = AgcDriver::ReadDisplayBuffer(buffer);
         ++check.compared;
         std::size_t same = 0;
