@@ -368,6 +368,7 @@ public:
     // ranges are fixed by the build), so a Revalidate's collects on the same worker are memo hits.
     void PrecollectSurfaces() const;
     bool Reusable() const { return reusable; }
+    std::size_t ReusableRefusal() const { return static_cast<std::size_t>(reusableRefusal); }
     void KeepStorageImageBytes(Recorder& recorder) const;
     const std::vector<std::uint64_t>& MultisampleSources() const { return multisampleSources; }
     static bool NeverReusable(std::span<const CompiledShader> shaders);
@@ -754,6 +755,7 @@ private:
     };
     std::vector<SamplerSource> samplerSources;
     bool reusable = false;
+    TemplateOutcome reusableRefusal = TemplateOutcome::Count;
     bool addressReuse = false;
     bool bdaTemplate = false;
     bool sharedUses = false;
@@ -849,6 +851,27 @@ public:
     // Drops every entry binding one of `textures` (sampled textures the sampled cache let go).
     void RemoveTextures(const std::unordered_set<const Texture*>& textures, std::vector<std::shared_ptr<ShaderResources>>* evicted = nullptr);
     bool TryRemoveImage(const StorageTexture* image, std::vector<std::shared_ptr<ShaderResources>>* evicted = nullptr);
+    // A compute build the cache was not given (ShaderResources::ReusableRefusal, a TemplateOutcome): the fate its
+    // key's next miss is charged to in the [rescache] compute line.
+    void NoteNotInserted(const Key& key, std::size_t refusal);
+    struct ComputeFates {
+        std::uint64_t hits = 0;
+        std::uint64_t misses = 0;
+        std::uint64_t neverSeen = 0;
+        std::uint64_t evicted = 0;
+        std::uint64_t evictedByDraws = 0;
+        std::uint64_t dropped = 0;
+        std::uint64_t removed = 0;
+        std::uint64_t refusedStorage = 0;
+        std::uint64_t refusedTexture = 0;
+        std::uint64_t present = 0;
+        std::array<std::uint64_t, 16> notReusable{};
+        std::size_t entries = 0;
+        std::size_t capacity = 0;
+        bool split = false;
+    };
+    ComputeFates ComputeFateCounts() const;
+    static bool ComputeKey(const Key& key) { return !key.empty() && key[0] != 0xffffffffu; }
     // Moves the entry to the front of the LRU (a recipe hit uses its template without Find, and a
     // hot template must not age out under the recipes that depend on it); false when no entry.
     bool Touch(const Key& key);
@@ -909,6 +932,15 @@ private:
     // never displace the others: APS5_ADDRESS_TEMPLATE_ENTRIES (default 2048).
     std::size_t addressEntries = 0;
     std::size_t addressCapacity = 0;
+    std::size_t computeEntries = 0;
+    std::size_t computeCapacity = 0;
+    enum Fate : std::uint8_t { FateUnknown, FatePresent, FateEvicted, FateEvictedByDraw, FateDropped, FateRemoved, FateRefusedStorage, FateRefusedTexture, FateNotReusable };
+    std::unordered_map<std::size_t, std::uint8_t> computeFates;
+    ComputeFates fateCounts;
+    std::chrono::steady_clock::time_point fateReport = std::chrono::steady_clock::now();
+    void noteFate(const Key& key, std::uint8_t fate);
+    void noteComputeLookup(const Key& key, bool hit);
+    bool computeEntry(const std::pair<Key, std::shared_ptr<ShaderResources>>& entry) const;
     std::list<std::size_t> evictedOrder;
     std::unordered_map<std::size_t, decltype(evictedOrder)::iterator> evictedKeys;
     std::size_t evictionsSinceCheck = 0;

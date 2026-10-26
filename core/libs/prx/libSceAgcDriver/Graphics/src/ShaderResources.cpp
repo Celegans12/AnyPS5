@@ -3830,6 +3830,7 @@ void ShaderResources::noteReusable() {
     static const bool profileTemplates = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const bool candidate = profileTemplates && usesBda && drawBuild && bdaReadOnly && BdaTemplatesOn();
     const auto refuse = [&](TemplateOutcome outcome) {
+        reusableRefusal = outcome;
         if (candidate) CountTemplateOutcome(outcome);
     };
     bdaTemplate = false;
@@ -5300,11 +5301,75 @@ std::shared_ptr<ShaderResources> ResourceCache::Find(const Key& key) {
     if (found == index.end()) {
         noteReturn(key);
         noteMiss(key);
+        noteComputeLookup(key, false);
         return nullptr;
     }
     entries.splice(entries.begin(), entries, found->second);
     noteUse(key);
+    noteComputeLookup(key, true);
     return found->second->second;
+}
+
+bool ResourceCache::computeEntry(const std::pair<Key, std::shared_ptr<ShaderResources>>& entry) const {
+    return ComputeKey(entry.first) && !entry.second->ReusesAddressSpace();
+}
+
+void ResourceCache::noteFate(const Key& key, std::uint8_t fate) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile || !ComputeKey(key)) return;
+    if (computeFates.size() >= (1u << 20u)) computeFates.clear();
+    computeFates[KeyHash{}(key)] = fate;
+}
+
+void ResourceCache::NoteNotInserted(const Key& key, std::size_t refusal) {
+    std::lock_guard lock(mutex);
+    noteFate(key, static_cast<std::uint8_t>(FateNotReusable + std::min<std::size_t>(refusal, fateCounts.notReusable.size() - 1u)));
+}
+
+void ResourceCache::noteComputeLookup(const Key& key, bool hit) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile || !ComputeKey(key)) return;
+    auto& counts = fateCounts;
+    if (hit) {
+        ++counts.hits;
+    } else {
+        ++counts.misses;
+        const auto found = computeFates.find(KeyHash{}(key));
+        const auto fate = found == computeFates.end() ? std::uint8_t{FateUnknown} : found->second;
+        switch (fate) {
+            case FateUnknown: ++counts.neverSeen; break;
+            case FatePresent: ++counts.present; break;
+            case FateEvicted: ++counts.evicted; break;
+            case FateEvictedByDraw: ++counts.evicted; ++counts.evictedByDraws; break;
+            case FateDropped: ++counts.dropped; break;
+            case FateRemoved: ++counts.removed; break;
+            case FateRefusedStorage: ++counts.refusedStorage; break;
+            case FateRefusedTexture: ++counts.refusedTexture; break;
+            default: ++counts.notReusable[std::min<std::size_t>(fate - FateNotReusable, counts.notReusable.size() - 1u)]; break;
+        }
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - fateReport < std::chrono::seconds(10)) return;
+    fateReport = now;
+    std::string refused;
+    for (std::size_t reason = 0; reason < counts.notReusable.size(); ++reason) {
+        if (counts.notReusable[reason] == 0) continue;
+        char item[96];
+        std::snprintf(item, sizeof(item), " %s %llu", reason < static_cast<std::size_t>(ShaderResources::TemplateOutcome::Count) ? ShaderResources::TemplateOutcomeName(static_cast<ShaderResources::TemplateOutcome>(reason)) : "other", static_cast<unsigned long long>(counts.notReusable[reason]));
+        refused += item;
+    }
+    const auto total = counts.hits + counts.misses;
+    AgcDriver::ProfilePrint_nid_no_patch("[rescache] compute templates (10 s): %llu lookups, %llu hits (%.1f %%); misses by the key's last fate: never cached %llu, evicted over the bound %llu (by a draw's insert %llu), dropped with an image or texture %llu, invalidated %llu, refused at insert: uncached storage image %llu, released texture %llu, not reusable:%s; still present %llu; compute entries %zu, bound %zu (%s)\n", static_cast<unsigned long long>(total), static_cast<unsigned long long>(counts.hits), total != 0 ? 100.0 * static_cast<double>(counts.hits) / static_cast<double>(total) : 0.0, static_cast<unsigned long long>(counts.neverSeen), static_cast<unsigned long long>(counts.evicted), static_cast<unsigned long long>(counts.evictedByDraws), static_cast<unsigned long long>(counts.dropped), static_cast<unsigned long long>(counts.removed), static_cast<unsigned long long>(counts.refusedStorage), static_cast<unsigned long long>(counts.refusedTexture), refused.empty() ? " none" : refused.c_str(), static_cast<unsigned long long>(counts.present), computeEntries, Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoComputeTemplateBudget) ? capacity : computeCapacity, Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoComputeTemplateBudget) ? "shared with draws, APS5_NO_COMPUTE_TEMPLATE_BUDGET" : "own budget, APS5_COMPUTE_TEMPLATE_ENTRIES");
+    counts = {};
+}
+
+ResourceCache::ComputeFates ResourceCache::ComputeFateCounts() const {
+    std::lock_guard lock(mutex);
+    auto counts = fateCounts;
+    counts.entries = computeEntries;
+    counts.split = !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoComputeTemplateBudget);
+    counts.capacity = counts.split ? computeCapacity : capacity;
+    return counts;
 }
 
 void ResourceCache::noteEvicted(const Key& key) {
@@ -5476,17 +5541,23 @@ void ResourceCache::noteMiss(const Key& key) {
 
 void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> resources, std::vector<std::shared_ptr<ShaderResources>>* evicted) {
     std::lock_guard lock(mutex);
-    if (!resources->HasCachedStorageImages()) return;
+    if (!resources->HasCachedStorageImages()) {
+        noteFate(key, FateRefusedStorage);
+        return;
+    }
     if (const auto found = index.find(key); found != index.end()) drop(found->second, evicted);
     // A set binding a sampled texture the sampled cache let go would keep its image alive outside
     // the cache's budget: it serves its own use only. Checked under this mutex, after which an
     // eviction's RemoveTextures finds the entry (the eviction marks the texture first).
     if (resources->BindsReleasedTexture()) {
         SampledAtomics().refusedSets.fetch_add(1, std::memory_order_relaxed);
+        noteFate(key, FateRefusedTexture);
         return;
     }
     resources->PinTextures(true);
     if (resources->ReusesAddressSpace()) ++addressEntries;
+    else if (ComputeKey(key)) ++computeEntries;
+    noteFate(key, FatePresent);
     entries.emplace_front(key, std::move(resources));
     index.emplace(key, entries.begin());
     indexTextures(entries.begin(), true);
@@ -5501,13 +5572,25 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
         const auto parsed = value ? std::strtoull(value, nullptr, 10) : 0ull;
         addressCapacity = parsed != 0 ? static_cast<std::size_t>(parsed) : 2048u;
     }
+    if (computeCapacity == 0) {
+        const char* value = std::getenv("APS5_COMPUTE_TEMPLATE_ENTRIES");
+        const auto parsed = value ? std::strtoull(value, nullptr, 10) : 0ull;
+        computeCapacity = parsed != 0 ? static_cast<std::size_t>(parsed) : 4096u;
+    }
     noteUse(key);
-    while (entries.size() - addressEntries > capacity || addressEntries > addressCapacity) {
-        const bool address = addressEntries > addressCapacity;
+    const bool split = !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoComputeTemplateBudget);
+    const bool drawInsert = !ComputeKey(key);
+    enum class Pool { Shared, Address, Compute };
+    const auto poolOf = [&](const std::pair<Key, std::shared_ptr<ShaderResources>>& entry) { return entry.second->ReusesAddressSpace() ? Pool::Address : split && ComputeKey(entry.first) ? Pool::Compute : Pool::Shared; };
+    for (;;) {
+        const auto shared = entries.size() - addressEntries - (split ? computeEntries : 0u);
+        const auto pool = addressEntries > addressCapacity ? Pool::Address : split && computeEntries > computeCapacity ? Pool::Compute : shared > capacity ? Pool::Shared : Pool::Shared;
+        if (!(addressEntries > addressCapacity || (split && computeEntries > computeCapacity) || shared > capacity)) break;
         auto victim = std::prev(entries.end());
-        while (victim != entries.begin() && victim->second->ReusesAddressSpace() != address) --victim;
-        if (victim->second->ReusesAddressSpace() != address) break;
+        while (victim != entries.begin() && poolOf(*victim) != pool) --victim;
+        if (poolOf(*victim) != pool) break;
         noteEvicted(victim->first);
+        noteFate(victim->first, drawInsert ? FateEvictedByDraw : FateEvicted);
         drop(victim, evicted);
     }
     if (entries.front().second->TableElements() == 0) return;
@@ -5521,6 +5604,7 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
         }
         tables -= elements;
         const auto victim = it--;
+        noteFate(victim->first, FateEvicted);
         drop(victim, evicted);
     }
 }
@@ -5552,6 +5636,7 @@ void ResourceCache::removeImage(const StorageTexture* image, std::vector<std::sh
             ++it;
             continue;
         }
+        noteFate(it->first, FateDropped);
         drop(it++, evicted);
     }
 }
@@ -5565,7 +5650,10 @@ void ResourceCache::RemoveTextures(const std::unordered_set<const Texture*>& tex
     }
     std::sort(binding.begin(), binding.end(), [](const auto& first, const auto& second) { return std::less<>{}(&*first, &*second); });
     binding.erase(std::unique(binding.begin(), binding.end()), binding.end());
-    for (const auto entry : binding) drop(entry, evicted);
+    for (const auto entry : binding) {
+        noteFate(entry->first, FateDropped);
+        drop(entry, evicted);
+    }
     if (!binding.empty()) SampledAtomics().droppedSets.fetch_add(binding.size(), std::memory_order_relaxed);
 }
 
@@ -5595,6 +5683,7 @@ void ResourceCache::indexTextures(decltype(entries)::iterator entry, bool add) {
 void ResourceCache::drop(std::list<std::pair<Key, std::shared_ptr<ShaderResources>>>::iterator entry, std::vector<std::shared_ptr<ShaderResources>>* evicted) {
     entry->second->PinTextures(false);
     if (entry->second->ReusesAddressSpace()) --addressEntries;
+    else if (ComputeKey(entry->first)) --computeEntries;
     indexTextures(entry, false);
     index.erase(entry->first);
     if (evicted != nullptr) evicted->push_back(std::move(entry->second));
@@ -5626,6 +5715,7 @@ void ResourceCache::Clear() {
     index.clear();
     entries.clear();
     addressEntries = 0;
+    computeEntries = 0;
     evictedKeys.clear();
     evictedOrder.clear();
     evictionsSinceCheck = 0;
@@ -5672,6 +5762,7 @@ std::uint64_t ResourceCache::TableElements() const {
 void ResourceCache::erase(const Key& key) {
     const auto found = index.find(key);
     if (found == index.end()) return;
+    noteFate(key, FateRemoved);
     drop(found->second, nullptr);
 }
 

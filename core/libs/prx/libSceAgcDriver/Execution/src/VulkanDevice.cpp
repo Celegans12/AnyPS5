@@ -6206,6 +6206,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
             ++d.cacheMisses;
             if (prepared->exact) noteRefusalBuild(resources->Reusable());
             if (resources->Reusable()) insert();
+            else state->resourceCache.NoteNotInserted(contentKey, resources->ReusableRefusal());
         }
     } else if (cacheable) {
         // PrepareDispatch made the key already when it found the cached object, and carries the
@@ -6285,6 +6286,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
             ++d.cacheMisses;
             if (refusedMove) noteRefusalBuild(resources->Reusable());
             if (resources->Reusable()) insert();
+            else state->resourceCache.NoteNotInserted(contentKey, resources->ReusableRefusal());
         }
     }
     resources->PatchPushConstants(pushBytes);
