@@ -551,9 +551,28 @@ void FrameRecorder::emitDelta() {
     }
     const auto mark = GuestMemory::WriteGeneration();
     const auto added = newRanges();
-    writeDelta(spans, {}, added);
+    const auto sectionPages = changedSectionPages();
+    writeDelta(spans, {}, added, sectionPages);
     generation = mark;
     shaderMarks.clear();
+}
+
+std::vector<std::pair<std::uint64_t, std::vector<std::byte>>> FrameRecorder::changedSectionPages() {
+    constexpr std::uint64_t PageBytes = 4096;
+    std::vector<std::pair<std::uint64_t, std::vector<std::byte>>> changed;
+    for (const auto& range : ranges) {
+        if (range.kind != FrameRangeKind::Section || !range.readable || (range.access & FrameRangeAccess::Writable) == 0) continue;
+        for (std::uint64_t at = range.address; at < range.address + range.bytes; at += PageBytes) {
+            const auto bytes = std::min<std::uint64_t>(PageBytes, range.address + range.bytes - at);
+            const std::span page(reinterpret_cast<const std::byte*>(static_cast<std::uintptr_t>(at)), static_cast<std::size_t>(bytes));
+            const auto hash = wideHash(page);
+            auto& known = sectionPageHashes[at];
+            if (known == hash) continue;
+            known = hash;
+            changed.emplace_back(at, std::vector<std::byte>(page.begin(), page.end()));
+        }
+    }
+    return changed;
 }
 
 std::vector<FrameRecorder::Range> FrameRecorder::newRanges() {
@@ -714,6 +733,9 @@ void FrameRecorder::snapshot(const Range& range) {
                 const auto length = std::min<std::size_t>(FrameCaptureWriter::BlockBytes, bytes.size() - block);
                 blockHashes[range.address + at + block] = wideHash(std::span(bytes).subspan(block, length));
             }
+        }
+        if (range.kind == FrameRangeKind::Section && (range.access & FrameRangeAccess::Writable) != 0) {
+            for (std::size_t page = 0; page < bytes.size(); page += 4096) sectionPageHashes[range.address + at + page] = wideHash(std::span(bytes).subspan(page, std::min<std::size_t>(4096, bytes.size() - page)));
         }
         snapshotBytes += writer->WriteSnapshot(range.address + at, bytes);
     }
