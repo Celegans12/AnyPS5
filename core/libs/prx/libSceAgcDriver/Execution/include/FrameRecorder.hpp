@@ -86,6 +86,7 @@ private:
     void writeReferenceFrames();
     std::vector<PrologueShader> prologueShaders(std::span<const Shader* const> shaders, bool registration);
     void writePrologue();
+    void writeAliasedPages();
     bool abandonIfDiskLow();
     std::string header() const;
     std::vector<Range> committedRanges();
@@ -105,6 +106,8 @@ private:
     std::uint64_t prologueDropped = 0;
     std::uint64_t prologueCallCount = 0;
     std::uint64_t gdsAddress = 0;
+    std::uint64_t aliasedPages = 0;
+    std::uint64_t aliasGroups = 0;
     std::deque<FrameCall> reservations;
     std::vector<Range> ranges;
     std::map<std::uint64_t, std::uint64_t> shaderMarks;
