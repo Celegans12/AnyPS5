@@ -125,6 +125,9 @@ private:
     std::uint64_t presents = 0;
     std::uint64_t referenceIndex = 0;
     std::uint64_t checkpointFrame = 0;
+    std::uint64_t checkpointSubmit = 0;
+    std::uint64_t frameSubmits = 0;
+    bool checkpointTaken = false;
     std::uint64_t checkpointBlocks = 0;
     std::uint64_t checkpointBytes = 0;
     std::map<std::uint64_t, std::uint64_t> blockHashes;
