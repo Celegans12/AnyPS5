@@ -761,7 +761,7 @@ int usage() {
                          "  --frame-limit <n>   replays the calls through the n-th CPU flip, or the n-th suspend point when the title flips from the GPU,\n"
                          "                      and compares the display buffer with the title's image at that frame\n"
                          "  --checkpoint <csv>  replays up to the checkpoint of a capture made with APS5_FRAME_CAPTURE_CHECKPOINT=<frame> and lists\n"
-                         "                      the 64 KiB blocks whose replayed bytes differ from the title's at that point\n"
+                         "                      the 64 KiB blocks whose replayed bytes differ from the title's at that point; their replayed bytes go to <csv>.replay.bin\n"
                          "  --timeout-s <n>     exits with code 4 when the replay has no result after n seconds (900; 0 waits forever)\n"
                          "  --dump              writes guest memory to a file after the replay (hexadecimal or decimal)\n"
                          "  --frames <dir>      writes each recorded and replayed display buffer as reference-<n>.bmp and replay-<n>.bmp\n"
@@ -855,6 +855,9 @@ void compareCheckpoint(const FrameCaptureReader& reader, const std::filesystem::
     AgcDriverWaitIdle_nid_postfix();
     if (!AgcDriverSettle_nid_postfix()) std::fprintf(stderr, "[frame-replay] storage images were still pending at the checkpoint\n");
     std::ofstream report(path, std::ios::trunc);
+    auto blocksPath = path;
+    blocksPath += ".replay.bin";
+    std::ofstream replayed(blocksPath, std::ios::binary | std::ios::trunc);
     report << "address,bytes,differing_bytes,first_difference\n";
     std::uint64_t blocks = 0, differing = 0, differingBytes = 0;
     for (const auto& chunk : reader.Chunks()) {
@@ -873,6 +876,9 @@ void compareCheckpoint(const FrameCaptureReader& reader, const std::filesystem::
         if (count == 0) continue;
         ++differing;
         differingBytes += count;
+        const std::array<std::uint64_t, 2> head{chunk.address, chunk.bytes};
+        replayed.write(reinterpret_cast<const char*>(head.data()), sizeof(head));
+        replayed.write(reinterpret_cast<const char*>(pointer), static_cast<std::streamsize>(chunk.bytes));
         char line[96];
         std::snprintf(line, sizeof(line), "0x%llx,%llu,%llu,%lld\n", static_cast<unsigned long long>(chunk.address), static_cast<unsigned long long>(chunk.bytes), static_cast<unsigned long long>(count), static_cast<long long>(first));
         report << line;
@@ -928,6 +934,7 @@ int run(const Options& options) {
     if (const auto failure = replay.frames.Failure()) std::rethrow_exception(failure);
     FrameCheck check;
     if (replay.unfinished == 0) {
+        if (!AgcDriverSettle_nid_postfix()) std::fprintf(stderr, "[frame-replay] storage images were still pending before the comparison\n");
         for (const auto& dump : options.dumps) writeDump(dump);
         check = compareFrames(reader, options);
     } else if (!options.dumps.empty()) {
