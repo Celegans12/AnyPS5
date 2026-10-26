@@ -14,6 +14,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -88,6 +89,7 @@ private:
     void snapshot(const Range& range);
     void writeReferenceFrames();
     std::vector<std::pair<std::uint64_t, std::vector<std::byte>>> changedSectionPages();
+    void writeFrameReference();
     std::vector<PrologueShader> prologueShaders(std::span<const Shader* const> shaders, bool registration);
     void writePrologue();
     void writeAliasedPages();
@@ -121,6 +123,9 @@ private:
     std::map<std::uint64_t, std::uint64_t> shaderImageHashes;
     std::mutex displayMutex;
     std::map<std::uint64_t, DisplayBuffer> displayBuffers;
+    std::optional<DisplayBuffer> lastPresented;
+    std::uint64_t presents = 0;
+    std::uint64_t referenceIndex = 0;
     std::uint64_t ordinal = 0;
     std::uint64_t boundaries = 0;
     std::uint64_t startBoundary = 0;

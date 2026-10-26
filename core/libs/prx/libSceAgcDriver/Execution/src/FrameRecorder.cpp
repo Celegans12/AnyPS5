@@ -308,6 +308,31 @@ void FrameRecorder::Suspend(const std::function<void()>& accept) {
 void FrameRecorder::PresentBuffer(const DisplayBuffer& buffer) {
     std::lock_guard lock(displayMutex);
     displayBuffers[buffer.address] = buffer;
+    lastPresented = buffer;
+    ++presents;
+}
+
+void FrameRecorder::writeFrameReference() {
+    std::optional<DisplayBuffer> buffer;
+    std::uint64_t presented = 0;
+    {
+        std::lock_guard lock(displayMutex);
+        buffer = lastPresented;
+        presented = presents;
+    }
+    if (!buffer) return;
+    try {
+        const auto pixels = ReadDisplayBuffer(*buffer);
+        const auto index = referenceIndex++;
+        writer->WriteReference(index, buffer->address, pixels);
+        auto call = make(FrameCallKind::DisplayBuffer);
+        call.ordinal = ++ordinal;
+        call.address = buffer->address;
+        call.values = {index, buffer->pixelFormat, buffer->width, buffer->height, buffer->tilingMode, buffer->pitchInPixel, buffer->dccAddress, buffer->dccClearColor, buffer->alignment, recordedFrames + 1, presented};
+        writer->WriteCall(call);
+    } catch (const std::exception& failure) {
+        warnings.push_back(std::string("no reference for a captured frame: ") + failure.what());
+    }
 }
 
 void FrameRecorder::writeReferenceFrames() {
@@ -321,11 +346,12 @@ void FrameRecorder::writeReferenceFrames() {
         warnings.push_back("no reference frames: the driver did not go idle after the last frame");
         return;
     }
-    std::uint64_t index = 0;
     for (const auto& [address, buffer] : presented) {
+        const auto index = referenceIndex;
         try {
             const auto pixels = ReadDisplayBuffer(buffer);
             writer->WriteReference(index, address, pixels);
+            ++referenceIndex;
         } catch (const std::exception& failure) {
             warnings.push_back(std::string("no reference frame for a display buffer: ") + failure.what());
             continue;
@@ -335,7 +361,6 @@ void FrameRecorder::writeReferenceFrames() {
         call.address = buffer.address;
         call.values = {index, buffer.pixelFormat, buffer.width, buffer.height, buffer.tilingMode, buffer.pitchInPixel, buffer.dccAddress, buffer.dccClearColor, buffer.alignment};
         writer->WriteCall(call);
-        ++index;
     }
 }
 
@@ -513,6 +538,7 @@ void FrameRecorder::FrameBoundary() {
     std::lock_guard lock(mutex);
     ++boundaries;
     if (state == State::Recording) {
+        writeFrameReference();
         if (++recordedFrames >= frames) finish();
         return;
     }
