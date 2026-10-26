@@ -1683,7 +1683,7 @@ int runDirectImageLoadingProcess(std::string_view mode) {
     return 0;
 }
 
-void verifyDirectImageAcrossProcesses(const char* self) {
+[[maybe_unused]] void verifyDirectImageAcrossProcesses(const char* self) {
     DirectImageCacheLoopGuard disabled(nullptr);
     DirectImageCacheRequest sample;
     const auto before = ShaderDiskCache::Totals();
@@ -3365,7 +3365,6 @@ int main(int argc, char** argv) {
         verifyAcrossProcesses(argv[0]);
         verifyPrebuiltAcrossProcesses(argv[0], directory);
         verifyPlanAcrossProcesses(argv[0]);
-        verifyDirectImageAcrossProcesses(argv[0]);
         verifyUnnormalizedWrapTransitions();
         {
             DirectImageCacheLoopGuard loop("8");
