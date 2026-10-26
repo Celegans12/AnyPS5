@@ -17,6 +17,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace AgcDriver {
@@ -89,6 +90,7 @@ private:
     void writeReferenceFrames();
     void writeFrameReference();
     void writeCheckpoint();
+    std::vector<std::pair<std::uint64_t, std::vector<std::byte>>> changedSectionPages();
     std::vector<PrologueShader> prologueShaders(std::span<const Shader* const> shaders, bool registration);
     void writePrologue();
     void writeAliasedPages();
@@ -118,6 +120,7 @@ private:
     std::vector<Range> ranges;
     std::map<std::uint64_t, std::uint64_t> shaderMarks;
     std::map<std::uint64_t, std::uint64_t> hostPageHashes;
+    std::unordered_map<std::uint64_t, std::uint64_t> sectionPageHashes;
     std::map<std::uint64_t, std::uint64_t> shaderImageHashes;
     std::mutex displayMutex;
     std::map<std::uint64_t, DisplayBuffer> displayBuffers;
