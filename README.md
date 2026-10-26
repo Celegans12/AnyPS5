@@ -17,10 +17,10 @@
 |---|---|
 | **Furthest point** | Open world, the Nupur river by the Ainu village, with HUD and quest |
 | **Time to the world** | about 5 minutes from a save near Teshio Ridge (warm shader cache) |
-| **Frame rate in the world** | about **0.6-0.8 fps** (6-8.4 presents per 10 s depending on the spot and the session; about 7.8-8.2 at the river village on the fault-free build of 10-26; this laptop's GPU clocks drift by ~14 % between sessions, so builds are compared back to back in one session) |
+| **Frame rate in the world** | about **0.6-0.8 fps** (6-8.4 presents per 10 s depending on the spot and the session; about 7.7-7.9 at the river village on the fault-free build of 10-26 with the epoch checks; this laptop's GPU clocks drift by ~14 % between sessions, so builds are compared back to back in one session) |
 | **Stability** | with the second Vulkan queue on its own compute-only queue family, world runs are clean (up to 22 minutes); the one crash we saw on 10-25 (a second-queue label bug) is fixed since `5becc82a97` |
 | **Tested on** | Windows 11, RTX 3080 Laptop GPU 16 GB (driver 610.62), 32 GB RAM, MinGW-w64 GCC 15.2.0, Release |
-| **Build** | `3243b61759` (fault-free owned proofs, upstream #9181) on `6debc980ee` (our tree merged with `main` 2026-10-24 `a39be6252d`, plus owned texture proofs, owned draw and vertex inputs, a lane-targeted storage flush, shahulmubeen-a's HTILE note (Celegans12/AnyPS5#2), mrfelek's #9957 and #10228, fixes from #675, #6188 (off by default), #9558, #8887, #7514, address-table templates, the read-only lease skip and hritikutekar's committer batches) + docs, shader-cache SourceVersion `6c403b0d2815d602`, title reference T1 exact |
+| **Build** | `d3e0db3032` (owned answers from per-block checks within a collect epoch) and `3243b61759` (fault-free owned proofs, upstream #9181) on `6debc980ee` (our tree merged with `main` 2026-10-24 `a39be6252d`, plus owned texture proofs, owned draw and vertex inputs, a lane-targeted storage flush, shahulmubeen-a's HTILE note (Celegans12/AnyPS5#2), mrfelek's #9957 and #10228, fixes from #675, #6188 (off by default), #9558, #8887, #7514, address-table templates, the read-only lease skip and hritikutekar's committer batches) + docs, shader-cache SourceVersion `6c403b0d2815d602`, title reference T1 exact |
 
 <table>
 <tr>
@@ -60,6 +60,7 @@
 | 10-25 | **7.6** (7.2 with them off in the same run: +8.5 %, frames ~100 ms shorter) | owned texture proofs: the committer's texture checks become a few word reads instead of a memory walk |
 | 10-25 | +1.8 % in an in-run A/B | shahulmubeen-a's HTILE note for cache-hit dispatch items (#2) |
 | 10-26 | **8.05** (7.70 with them off in the same run: +4.4 %, frames ~55 ms shorter) | owned reuse of untracked vertex/index inputs and draw snapshots; storage flushes wait only for the lanes that write the range |
+| 10-26 | **7.8** (7.3 with all owned features off in the same run: +6.4 %, frames ~80 ms shorter) | the owned features made fault-free: write watch instead of write protection, answered from per-block checks within each collect epoch |
 
 ## Run it
 
@@ -70,7 +71,6 @@ APS5_SPANNED_WAVE=1 APS5_BINDLESS_IMAGES=1 APS5_BINDLESS_LAZY=1 APS5_NO_RESULT_M
 APS5_STAGING_DIFF=1 APS5_PIPELINE_INDIRECT=1 APS5_NO_ADDRESS_DRAW_REUSE=1
 APS5_NO_PIPELINE_JOURNAL=1 APS5_RESOURCE_CACHE_ENTRIES=1024 APS5_ASYNC_LANE=51
 APS5_NO_DRAW_AHEAD=1 APS5_DEFER_REFRESH_FLUSH=1 APS5_PIPELINE_DISPATCH=1
-APS5_NO_OWNED_PROOFS=1 APS5_NO_OWNED_DRAW_SNAPSHOTS=1 APS5_NO_OWNED_VERTEX_INPUTS=1
 ```
 
 - **This build has a new shader-cache version (since 2026-10-24, `6c403b0d2815d602`), so the first run compiles cold**: about 50 minutes to the world on our machine (frame 90 at 3,006 s). Later runs start warm.
@@ -111,7 +111,7 @@ APS5_NO_OWNED_PROOFS=1 APS5_NO_OWNED_DRAW_SNAPSHOTS=1 APS5_NO_OWNED_VERTEX_INPUT
 
 ## Known issues
 
-- Fixed on 10-26: the owned proofs no longer write-protect memory (no guest-thread write faults), and this build carries upstream's #9181, so resident runs aren't write-protected either. The write-watch versions measured neutral, so the env above keeps them off.
+- Fixed on 10-26: the owned proofs no longer write-protect memory (no guest-thread write faults), and this build carries upstream's #9181, so resident runs aren't write-protected either. The first write-watch versions measured neutral; with the per-epoch checks (`d3e0db3032`) they are +6.4 % again and back on in the env.
 
 - Fixed on 10-25: a rare crash with the second queue (`AGC graphics: no batch to append a completion label to`): a queue-0 label waiting for a copy-back found the copied writer only in the second queue's batch. The label now goes into that lane's batch (`5becc82a97`, with a test).
 - A silver sheen appears on Atsu and the boat a few frames after entering the world. Not investigated yet.
@@ -147,7 +147,7 @@ APS5_NO_OWNED_PROOFS=1 APS5_NO_OWNED_DRAW_SNAPSHOTS=1 APS5_NO_OWNED_VERTEX_INPUT
   - owned reuse of vertex/index inputs and draw snapshots in host-imported memory the write tracker doesn't watch (same per-block word proof as the texture checks);
   - storage write-backs before a label wait only for the queue lanes whose batches write or lease the stored range;
   - shahulmubeen-a's HTILE note for cache-hit dispatch items (Celegans12/AnyPS5#2) and a fix for second-queue labels whose copied writer sits only in the async lane's batch;
-  - owned texture proofs: the 64 KiB blocks under the committer's untracked texture snapshots are write-protected (or, when unmapped, watched through every map and commit path), so a snapshot proof is a few word reads instead of a memory walk;
+  - owned texture proofs: the 64 KiB blocks under the committer's untracked texture snapshots are watched for writes (write watch, or, when unmapped, every map and commit path), each check good for the rest of its collect epoch, so a snapshot proof is a few word reads instead of a memory walk;
   - fixes for three slowdowns that `main` added in the draw committer:
     - small device buffers get their own pool tier;
     - an exact-size buffer is reused instead of rebinding another one;
@@ -183,6 +183,7 @@ APS5_NO_OWNED_PROOFS=1 APS5_NO_OWNED_DRAW_SNAPSHOTS=1 APS5_NO_OWNED_VERTEX_INPUT
 - 2026-10-25: shahulmubeen-a's HTILE note for cache-hit dispatch items (Celegans12/AnyPS5#2) and our fix for the second-queue label crash (`5becc82a97`, same shader cache, T1 exact, focused ctest 388/390 with the two known failures). In a 4-arm in-run A/B the HTILE note was +0.13 ± 0.05 presents per 10 s (+1.8 %, frames ~23 ms shorter); in the same run hritikutekar's in-place join (`8106f78f5`) cost 0.18 ± 0.09 presents although it saved ~47 ms of GPU time, so it isn't in this build, and `APS5_DISPATCH_ITEM_BDA_WRITES` and the GPU-ordered write-backs were neutral here.
 - 2026-10-26: owned reuse of draw inputs and a lane-targeted storage flush (`6debc980ee`, same shader cache, T1 exact with both verify modes, focused ctest 391/394: the two known failures plus `agc_write_tracking_metadata_commit`, which failed once under the full parallel suite and passes 30 of 30 repeats on this and the previous build). Vertex/index inputs and draw snapshots in host-imported memory that the write tracker doesn't watch were copied again on every draw; they are now kept and reused while per-block words armed on their memory show no store (the same proof as the texture checks). Storage write-backs before a label used to wait for every batch on both queues; they now wait only for the lanes whose batches write or lease the stored range. In-run A/B (6 pairs per arm): all three off -0.34 ± 0.07 presents per 10 s (+4.4 % with them on, frames ~55 ms shorter); vertex inputs alone +3.9 %, the flush alone +2.0 %. 2,035 reuse verifications found no difference.
 - 2026-10-26: correctness move (`3243b61759`, same shader cache, T1 exact, focused ctest 392/394 with the two known failures). The owned proofs and owned draw/vertex inputs relied on guest-thread write faults, which upstream removed (#5596, #9181) because the exception frame overwrites the System V red zone (#361). They now use write watch instead, and upstream's #9181 is cherry-picked (resident runs are no longer write-protected). In an in-run A/B the write-watch versions were neutral (each arm within ±0.1 presents per 10 s once two stalled phases are left out; 0 faults, 0 verify differences), so the README env turns them off. In that session the build ran at about 7.8-8.2 presents per 10 s with the owned features on or off; the fault-based versions had measured +8.5 % and +4.4 % in earlier sessions, so some of that is likely lost, but separate sessions can't show how much. A cheaper fault-free proof is the next thing to try.
+- 2026-10-26: owned answers from per-block checks within a collect epoch (`d3e0db3032`, same shader cache, T1 exact). The write-watch proofs asked Windows for the written pages on every proof, about 15 queries each. Now each collect epoch takes a mark from a shared clock, and a block that was checked after the mark is answered from its word alone, so most proofs are a few atomic loads (0.04-0.2 µs instead of up to 125 µs). A CPU store before the thread's ordering point is seen by the next query; a store racing a submission waits for the next mark, which is the rule the collect memo already had. **The owned features are back on in the env.** In-run A/B (2,400 s, 6 phases per arm): all owned features off -0.50 ± 0.04 presents per 10 s (**+6.4 %** with them on, frames ~80 ms shorter), the epoch checks alone off -0.19 ± 0.09 (+2.5 %), owned vertex inputs alone off +0.01 (neutral). 0 guest faults, 0 epoch disagreements. `APS5_NO_OWNED_EPOCH=1` goes back to one query per proof; `APS5_VERIFY_OWNED_EPOCH=<n>` also queries the first n epoch answers every 10 s and reports any disagreement.
 
 ---
 
