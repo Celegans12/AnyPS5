@@ -4530,7 +4530,8 @@ std::uint64_t StorageTexture::storeDrawnRect(const DrawnArea& area, std::span<co
         const auto saved = savedBytes->Bytes();
         for (const auto unit : saveUnits) {
             const auto offset = static_cast<std::size_t>(layerBegin(unit) - descriptor.baseAddress);
-            std::memcpy(saved.data() + offset, original.data() + offset, static_cast<std::size_t>(layerBytes(unit)));
+            if (original.size() == guestBytes) std::memcpy(saved.data() + offset, original.data() + offset, static_cast<std::size_t>(layerBytes(unit)));
+            else GuestMemory::ReadCommitted(layerBegin(unit), saved.subspan(offset, static_cast<std::size_t>(layerBytes(unit))));
         }
         std::vector<VkBufferCopy> saves;
         for (const auto& [from, to] : stores) saves.push_back({scratchOffset(from), from - descriptor.baseAddress, to - from});
