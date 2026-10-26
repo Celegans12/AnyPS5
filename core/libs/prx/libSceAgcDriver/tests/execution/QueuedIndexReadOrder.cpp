@@ -374,7 +374,7 @@ int main() {
         const auto copiedAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(Copied));
         const auto heldQueries = AgcDriver::DriverDetail::DrawPipeline::HeldReadQueries();
         Require(!AgcDriver::Graphics::StorageTexture::FlushPending(copiedAddress, PoolBytes), "queued index read: a flush over memory without pending results stored something");
-        Require(AgcDriver::DriverDetail::DrawPipeline::HeldReadQueries() == heldQueries, "queued index read: a flush with nothing to store asked the draw pipeline for held reads");
+        Require(std::getenv("APS5_NO_HELD_READ_SKIP") != nullptr || AgcDriver::DriverDetail::DrawPipeline::HeldReadQueries() == heldQueries, "queued index read: a flush with nothing to store asked the draw pipeline for held reads");
         Require(IndicesIntact(), "queued index read: a flush over other memory stored the image's results");
         GateUntilQueued();
         std::fill_n(ColorMemory, ColorBytes, std::byte{0});

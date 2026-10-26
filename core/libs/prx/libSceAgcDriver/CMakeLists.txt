@@ -2870,6 +2870,10 @@ if(BUILD_TESTING)
     set_tests_properties(agc_driver_queued_raw_shader PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_PIPELINED_DRAWS=8" TIMEOUT 30)
     set_tests_properties(agc_driver_pass_input_hazard PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_DRAW_INPUTS_IN_PLACE=1")
     set_tests_properties(agc_driver_linear_target_resident PROPERTIES ENVIRONMENT "APS5_NO_PIPELINE_JOURNAL=1;APS5_RESIDENT_LINEAR=1")
+    set_property(TEST agc_driver_linear_target_completion_points agc_driver_linear_target_completion_points_sync_flip agc_driver_linear_target_completion_points_unpipelined
+        agc_driver_linear_target_completion_stores agc_driver_linear_target_cpu_writes agc_driver_linear_target_direct_write_completion agc_driver_linear_target_dispatch_access
+        agc_driver_linear_target_rectangle_bound agc_driver_linear_target_draw_bindings APPEND PROPERTY ENVIRONMENT "APS5_RESIDENT_LINEAR=1")
+    set_property(TEST agc_driver_linear_target_draw_bindings APPEND PROPERTY ENVIRONMENT "APS5_NO_READ_ONLY_LEASE_SKIP=1")
     # Main's 4_4_4_4 target-merge state test describes a linear target's resident surface.
     set_tests_properties(agc_driver_graphics PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_RESIDENT_LINEAR=1")
     add_test(NAME agc_driver_pipelined_dma_legacy COMMAND agc_driver_pipelined_dma_tests --legacy)
@@ -3544,6 +3548,7 @@ if(BUILD_TESTING)
     add_test(NAME agc_driver_depth_plane_partial_store_unimported COMMAND agc_driver_depth_plane_partial_store_tests)
     set_tests_properties(agc_driver_depth_plane_partial_store_unimported PROPERTIES
             ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_HOST_IMPORT=1" TIMEOUT 30 SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    set_property(TEST agc_driver_depth_plane_partial_store agc_driver_depth_plane_partial_store_unimported APPEND PROPERTY ENVIRONMENT "APS5_LAYER_REFRESH=1")
     if(WIN32)
         set_tests_properties(agc_driver_depth_plane_partial_store_unimported PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
