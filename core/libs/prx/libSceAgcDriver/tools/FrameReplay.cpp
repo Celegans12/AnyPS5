@@ -378,7 +378,7 @@ struct Replay {
             if (progress().second == stalledAt.load()) return;
             stalled.store(false);
         }
-        const auto inFlight = options.exact ? 0 : call.accepted - call.completed;
+        const auto inFlight = options.exact || memory ? 0 : call.accepted - call.completed;
         const auto began = Clock::now();
         const auto timeout = memory ? options.memoryPaceTimeout : options.paceTimeout;
         auto lastCompleted = progress().second;
