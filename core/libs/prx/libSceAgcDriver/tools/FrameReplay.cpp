@@ -605,6 +605,11 @@ struct Replay {
                     const auto before = load(wait.address, bytes);
                     std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(wait.address)), &*value, bytes);
                     if (syntheticReleases.load() < 64) {
+                        for (std::size_t other = 0; other < count; ++other) {
+                            const auto& waiting = awaited[other];
+                            if (waiting.address == 0) continue;
+                            std::fprintf(stderr, "[frame-replay]   awaited 0x%llx == 0x%llx (function %u) holds 0x%llx\n", static_cast<unsigned long long>(waiting.address), static_cast<unsigned long long>(waiting.reference), waiting.function, static_cast<unsigned long long>(load(waiting.address, waiting.bytes == 8 ? 8 : 4)));
+                        }
                         const auto [accepted, completed] = progress();
                         std::fprintf(stderr, "[frame-replay] synthesized 0x%llx: 0x%llx -> 0x%llx (function %u, reference 0x%llx, mask 0x%llx) at call %zu, serials %llu/%llu\n", static_cast<unsigned long long>(wait.address),
                                      static_cast<unsigned long long>(before), static_cast<unsigned long long>(*value), wait.function, static_cast<unsigned long long>(wait.reference), static_cast<unsigned long long>(wait.mask), from,
@@ -735,7 +740,8 @@ int usage() {
                          "  --exact             waits for every earlier submission and its GPU work to complete before each submission, flip and\n"
                          "                      memory delta,\n"
                          "                      so the GPU work runs in one order (a reproducible baseline, slower than the title)\n"
-                         "  --frame-limit <n>   replays the calls through the n-th CPU flip, or the n-th suspend point when the title flips from the GPU\n"
+                         "  --frame-limit <n>   replays the calls through the n-th CPU flip, or the n-th suspend point when the title flips from the GPU,\n"
+                         "                      and compares the display buffer with the title's image at that frame\n"
                          "  --timeout-s <n>     exits with code 4 when the replay has no result after n seconds (900; 0 waits forever)\n"
                          "  --dump              writes guest memory to a file after the replay (hexadecimal or decimal)\n"
                          "  --frames <dir>      writes each recorded and replayed display buffer as reference-<n>.bmp and replay-<n>.bmp\n"
@@ -799,10 +805,9 @@ FrameCheck compareFrames(const FrameCaptureReader& reader, const Options& option
             continue;
         }
         const auto reference = reader.Read(*chunk);
-        if (call.values.size() >= 11) {
-            if (!options.frames.empty()) writeFrame(options.frames / ("game-frame-" + std::to_string(call.values[9]) + ".bmp"), buffer, reference);
-            continue;
-        }
+        const bool perFrame = call.values.size() >= 11;
+        if (perFrame && !options.frames.empty()) writeFrame(options.frames / ("game-frame-" + std::to_string(call.values[9]) + ".bmp"), buffer, reference);
+        if (perFrame != (options.frameLimit != 0) || (perFrame && call.values[9] != options.frameLimit)) continue;
         const auto replayed = AgcDriver::ReadDisplayBuffer(buffer);
         ++check.compared;
         std::size_t same = 0;
@@ -887,7 +892,7 @@ int run(const Options& options) {
     gap("failed-registrations", replay.failedRegistrations.load() != 0);
     gap("pacing-timeouts", replay.paceTimeouts.load() != 0 || replay.memoryPaceTimeouts.load() != 0);
     gap("synthesized-waits", replay.syntheticReleases.load() != 0);
-    gap("partial-window", options.frameLimit != 0);
+    gap("partial-window", options.frameLimit != 0 && check.compared == 0);
     gap("no-reference-frames", check.compared == 0 && options.dumps.empty());
     gap("missing-reference-frames", check.missing != 0);
     gap("pixels-differ", check.compared != 0 && check.identical < 1.0);
