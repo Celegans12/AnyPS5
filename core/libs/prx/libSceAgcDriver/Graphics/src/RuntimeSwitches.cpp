@@ -74,6 +74,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_NO_OWNED_VERTEX_INPUTS",
     "APS5_NO_FLUSH_LANE_WAIT",
     "APS5_NO_COMPUTE_TEMPLATE_BUDGET",
+    "APS5_NO_MOVED_WRITTEN_TEMPLATES",
 };
 
 struct Refusal {

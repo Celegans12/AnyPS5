@@ -4682,8 +4682,14 @@ std::size_t DispatchMoveBytes() {
 // The content key of a compute stage, naming the device: the cache is process-wide and the driver
 // replaces the headless device with the windowed one while workers may still use the old one, so
 // the key names the device that built the entry (its descriptor set and pooled buffers belong to it).
+// Written V# bases as data in compute template keys (APS5_NO_MOVED_WRITTEN_TEMPLATES, an A/B switch): a template
+// built for one base of a written element serves another through the per-use overlay (MovedDispatchBuffers).
+bool MovedWrittenTemplates() {
+    return DispatchMove() && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoMovedWrittenTemplates);
+}
+
 ResourceCache::Key DispatchContentKey(const Graphics::CompiledShader& shader, VkDevice device, bool movable = true) {
-    auto key = Graphics::ShaderResources::ContentKey(shader, !TemplateDataRefresh(), movable && DispatchMove());
+    auto key = Graphics::ShaderResources::ContentKey(shader, !TemplateDataRefresh(), movable && DispatchMove(), movable && MovedWrittenTemplates());
     const auto deviceHandle = reinterpret_cast<std::uint64_t>(device);
     key.push_back(static_cast<std::uint32_t>(deviceHandle));
     key.push_back(static_cast<std::uint32_t>(deviceHandle >> 32u));
@@ -4927,6 +4933,8 @@ constexpr std::size_t MoveRefusals = static_cast<std::size_t>(Graphics::ShaderRe
 
 struct DispatchMoveCounters {
     std::atomic<std::uint64_t> checked{0}, exact{0}, moved{0}, buffers{0}, bytes{0};
+    std::atomic<std::uint64_t> written{0}, writtenBuffers{0}, writtenBytes{0}, verified{0}, mismatches{0};
+    std::atomic<std::uint64_t> totalWritten{0}, totalVerified{0}, totalMismatches{0};
     std::atomic<std::uint64_t> rebuilt{0}, kept{0}, served{0};
     std::array<std::atomic<std::uint64_t>, 5> sizes{};
     std::array<std::atomic<std::uint64_t>, MoveRefusals> refused{};
@@ -4971,7 +4979,59 @@ void reportDispatchMove() {
     for (std::size_t i = 0; i < 5; ++i) sizes[i] = take(moves.sizes[i]);
     const auto refused = list(moves.refused);
     const auto filtered = list(moves.filtered);
+    const auto written = take(moves.written);
+    const auto writtenBuffers = take(moves.writtenBuffers);
+    const auto writtenBytes = take(moves.writtenBytes);
+    const auto verified = take(moves.verified);
+    const auto mismatches = take(moves.mismatches);
+    AgcDriver::ProfilePrint_nid_no_patch("[dispmove] (10 s) written V#s at a new base (%s): %llu hits rebound %llu written elements in place (%.2f MiB), verified %llu against a full build, %llu mismatches\n", MovedWrittenTemplates() ? "on" : "off, APS5_NO_MOVED_WRITTEN_TEMPLATES", written, writtenBuffers, static_cast<double>(writtenBytes) / 1048576.0, verified, mismatches);
     AgcDriver::ProfilePrint_nid_no_patch("[dispmove] (10 s) %llu template hits checked: %llu with every read-only buffer where it was built, %llu with %llu moved ones (%.2f MiB snapshotted; per dispatch up to 1 KiB %llu, 16 KiB %llu, 256 KiB %llu, 4 MiB %llu, more %llu); refused %s at stage A (the hit was dropped before the record), %s at record; after a refusal: %llu rebuilt, %llu inserted beside the movable template (kept), %llu served by an exact entry\n", checked, exact, moved, buffers, static_cast<double>(bytes) / 1048576.0, sizes[0], sizes[1], sizes[2], sizes[3], sizes[4], filtered.c_str(), refused.c_str(), rebuilt, kept, served);
+}
+
+bool TakeMovedWrittenVerify() {
+    static const std::uint64_t budget = [] {
+        const char* text = std::getenv("APS5_VERIFY_MOVED_WRITTEN");
+        return text != nullptr ? static_cast<std::uint64_t>(std::strtoull(text, nullptr, 10)) : 0ull;
+    }();
+    if (budget == 0) return false;
+    static std::atomic<std::int64_t> window{-1};
+    static std::atomic<std::uint64_t> used{0};
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    auto seen = window.load(std::memory_order_relaxed);
+    if (seen != now && window.compare_exchange_strong(seen, now, std::memory_order_relaxed)) used.store(0, std::memory_order_relaxed);
+    return used.fetch_add(1, std::memory_order_relaxed) < budget;
+}
+
+bool CoveredBy(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t begin, std::uint64_t end) {
+    while (begin < end) {
+        const auto found = std::find_if(ranges.begin(), ranges.end(), [&](const auto& range) { return range.first <= begin && begin < range.second; });
+        if (found == ranges.end()) return false;
+        begin = found->second;
+    }
+    return true;
+}
+
+std::string MovedWrittenDifference(const Graphics::ShaderResources& full, std::vector<std::array<std::uint64_t, 3>> expected) {
+    const auto actual = full.GuestBufferElements();
+    if (actual.size() != expected.size()) return "element count " + std::to_string(actual.size()) + " vs " + std::to_string(expected.size());
+    for (std::size_t i = 0; i < actual.size(); ++i) {
+        if (actual[i] != expected[i]) {
+            char text[160];
+            std::snprintf(text, sizeof(text), "element %zu: full 0x%llx+0x%llx w%llu, overlay 0x%llx+0x%llx w%llu", i, static_cast<unsigned long long>(actual[i][0]), static_cast<unsigned long long>(actual[i][1]), static_cast<unsigned long long>(actual[i][2]), static_cast<unsigned long long>(expected[i][0]), static_cast<unsigned long long>(expected[i][1]), static_cast<unsigned long long>(expected[i][2]));
+            return text;
+        }
+    }
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> written;
+    for (const auto& element : expected) {
+        if (element[2] != 0 && element[0] != 0) written.emplace_back(element[0], element[0] + element[1]);
+    }
+    for (const auto& [begin, end] : full.GuestWrites()) {
+        if (!CoveredBy(written, begin, end)) return "a write range of the full build is outside the overlay's written elements";
+    }
+    for (const auto& [begin, end] : written) {
+        if (!CoveredBy(full.GuestWrites(), begin, end)) return "a written element of the overlay is outside the full build's write ranges";
+    }
+    return {};
 }
 
 void noteDispatchMoveSize(std::size_t bytes) {
@@ -5320,7 +5380,7 @@ std::shared_ptr<PreparedDispatch> VulkanDevice::PrepareDispatch(const ShaderReco
         cached = state->resourceCache.Find(prepared->key);
         if (cached != nullptr && DispatchMove()) {
             Graphics::ShaderResources::MoveProof proof;
-            if (!cached->MovedDispatchBuffers(compute, nullptr, DispatchMoveBytes(), proof).has_value()) {
+            if (!cached->MovedDispatchBuffers(compute, nullptr, DispatchMoveBytes(), proof, MovedWrittenTemplates()).has_value()) {
                 DispatchMoves().filtered[static_cast<std::size_t>(proof.refusal)].fetch_add(1, std::memory_order_relaxed);
                 prepared->key = DispatchContentKey(compute, context.device, false);
                 prepared->exact = true;
@@ -5528,7 +5588,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     // APS5_NO_LANE_OVERLAP=1 (diagnostic, an APS5_AB switch): no dispatch of the async lane (lane 1) overlaps.
     if (Graphics::Recorder::LaneOwnFamily() && Graphics::Recorder::ThreadLane() == 1) require(!record.shader->program->bindlessHeap && resources.SampledTextures().empty() && resources.StorageImages().empty(), "a dispatch that binds images was recorded into the async lane, whose compute-family queue does not own the images");
     const bool laneOverlap = !recorder.AsyncLaneActive() || Graphics::Recorder::ThreadLane() == 0 || !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoLaneOverlap);
-    const bool overlapCapable = laneOverlap && overlapQueue != 0 && Graphics::Recorder::DispatchOverlapEnabled() && arguments == 0 && argumentImport == nullptr && !record.htileClear.has_value() && record.shader->program->workgroupMemoryDwords == 0 && (state->checkpointMarker == nullptr || CheckpointsInRuns()) && record.x <= groupLimit[0] && record.y <= groupLimit[1] && record.z <= groupLimit[2] && (Graphics::Recorder::StagedOverlapEnabled() || !resources.HasGpuCopies());
+    const bool overlapCapable = laneOverlap && (record.bindings == nullptr || record.bindings->movedWrites == nullptr) && overlapQueue != 0 && Graphics::Recorder::DispatchOverlapEnabled() && arguments == 0 && argumentImport == nullptr && !record.htileClear.has_value() && record.shader->program->workgroupMemoryDwords == 0 && (state->checkpointMarker == nullptr || CheckpointsInRuns()) && record.x <= groupLimit[0] && record.y <= groupLimit[1] && record.z <= groupLimit[2] && (Graphics::Recorder::StagedOverlapEnabled() || !resources.HasGpuCopies());
     if (timer.profile && overlapQueue != 0) {
         if (!overlapCapable) {
             if (arguments != 0 || argumentImport != nullptr) ++d.notIndirect;
@@ -5575,7 +5635,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     // the label).
     const auto touches = [&](std::uint64_t begin, std::uint64_t end) {
         const auto bytes = static_cast<std::size_t>(end - begin);
-        return resources.WritesOverlap(begin, bytes) || resources.ReadsOverlap(begin, bytes) || (argumentImport != nullptr && begin < arguments + 12 && arguments < end);
+        return resources.WritesOverlap(begin, bytes) || resources.ReadsOverlap(begin, bytes) || (record.bindings != nullptr && Graphics::ShaderResources::MovedWritesOverlap(*record.bindings, begin, bytes)) || (argumentImport != nullptr && begin < arguments + 12 && arguments < end);
     };
     if (recorder.HasQueuedKeyStores() && (resources.HoldsLease() || recorder.AnyQueuedKeyStore(touches))) recorder.FlushKeyStores();
     if (recorder.HasQueuedStores() && (resources.HoldsLease() || recorder.AnyQueuedStore(touches))) recorder.FlushStores();
@@ -5612,7 +5672,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     if (record.bindings != nullptr) {
         recorder.Keep(record.bindings);
         for (const auto& snapshot : record.bindings->snapshots) {
-            if (snapshot.buffer->Mapped()) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+            if (snapshot.buffer != nullptr && snapshot.buffer->Mapped()) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
         }
     }
     recordStep(PhaseRecordKeeps);
@@ -5803,6 +5863,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     if (record.htileClear.has_value()) Graphics::ArmHtileDepthClear(record.htileClear->first, record.htileClear->second);
     if (overlapCapable) resources.MarkGpuWritesInRun(recorder, record.resources);
     else resources.MarkGpuWrites(recorder);
+    if (record.bindings != nullptr) Graphics::ShaderResources::MarkMovedWrites(recorder, *record.bindings);
     if (record.htileClear.has_value()) {
         Graphics::QueueHtileDepthClear(record.htileClear->first, record.htileClear->second);
         recorder.NotePendingWrite(record.htileClear->first, record.htileClear->second);
@@ -6074,6 +6135,11 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::computePipeline(const Grap
     return finish(std::move(objects), nullptr);
 }
 
+std::array<std::uint64_t, 3> VulkanDevice::MovedWrittenTotals() {
+    auto& moves = DispatchMoves();
+    return {moves.totalWritten.load(std::memory_order_relaxed), moves.totalVerified.load(std::memory_order_relaxed), moves.totalMismatches.load(std::memory_order_relaxed)};
+}
+
 VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t programAddress, std::shared_ptr<PreparedDispatch> prepared, std::shared_ptr<const Recipe>* recipeOut, const std::array<std::uint32_t, 3>& threadGroup, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear) {
     startJournalReplay();
     for (const auto& binding : shader.bindings) {
@@ -6129,6 +6195,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     bool refusedMove = false;
     double revalidateMs = 0;
     std::shared_ptr<Graphics::ShaderResources::DrawBindings> overlay;
+    std::optional<std::vector<Graphics::ShaderResources::MovedBuffer>> verifyMoves;
     // The batches the pre-sync (PrepareDispatch) waited for are reaped first: their completions
     // (CPU write-backs) land before stage B or a cached object's Revalidate reads, and the flush
     // hook then finds nothing pending over their surfaces.
@@ -6222,7 +6289,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
                 if (DispatchMove() && !exactEntry) {
                     auto& moves = DispatchMoves();
                     Graphics::ShaderResources::MoveProof proof;
-                    auto moved = cached->MovedDispatchBuffers(shaders[0], state->recorder.get(), DispatchMoveBytes(), proof);
+                    auto moved = cached->MovedDispatchBuffers(shaders[0], state->recorder.get(), DispatchMoveBytes(), proof, MovedWrittenTemplates());
                     moves.checked.fetch_add(1, std::memory_order_relaxed);
                     if (moved.has_value() && threadGroup != std::array<std::uint32_t, 3>{}) {
                         const auto data = cached->shaderDataAllocation(shaders[0]);
@@ -6246,6 +6313,13 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
                         moves.buffers.fetch_add(proof.buffers, std::memory_order_relaxed);
                         moves.bytes.fetch_add(proof.bytes, std::memory_order_relaxed);
                         noteDispatchMoveSize(proof.bytes);
+                        if (proof.writtenBuffers != 0) {
+                            moves.written.fetch_add(1, std::memory_order_relaxed);
+                            moves.totalWritten.fetch_add(1, std::memory_order_relaxed);
+                            moves.writtenBuffers.fetch_add(proof.writtenBuffers, std::memory_order_relaxed);
+                            moves.writtenBytes.fetch_add(proof.writtenBytes, std::memory_order_relaxed);
+                            if (TakeMovedWrittenVerify()) verifyMoves = *moved;
+                        }
                     }
                 }
                 if (!usable) {
@@ -6259,7 +6333,30 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
                         state->recorder->Keep(std::move(cached));
                     }
                 }
-                if (usable) {
+                if (usable && verifyMoves.has_value() && overlay != nullptr) {
+                    auto expected = cached->GuestBufferAllocations();
+                    for (const auto& entry : *verifyMoves) {
+                        for (auto& element : expected) {
+                            if (element[3] == entry.allocation) element = {entry.address, entry.size, element[2], element[3]};
+                        }
+                    }
+                    std::vector<std::array<std::uint64_t, 3>> compared;
+                    compared.reserve(expected.size());
+                    for (const auto& element : expected) compared.push_back({element[0], element[1], element[2]});
+                    auto full = std::make_shared<Graphics::ShaderResources>(context, shaders[0], snapshots, false, prepared != nullptr ? prepared->dispatchThreads : 0);
+                    const auto difference = MovedWrittenDifference(*full, std::move(compared));
+                    DispatchMoves().verified.fetch_add(1, std::memory_order_relaxed);
+                    DispatchMoves().totalVerified.fetch_add(1, std::memory_order_relaxed);
+                    if (!difference.empty()) {
+                        DispatchMoves().mismatches.fetch_add(1, std::memory_order_relaxed);
+                        DispatchMoves().totalMismatches.fetch_add(1, std::memory_order_relaxed);
+                        std::fprintf(stderr, "[dispmove] verify: program 0x%llx bound moved written V#s unlike a full build: %s\n", static_cast<unsigned long long>(programAddress), difference.c_str());
+                    }
+                    overlay.reset();
+                    resources = std::move(full);
+                    usable = false;
+                    cached.reset();
+                } else if (usable) {
                     if (refusedMove || exactEntry) DispatchMoves().served.fetch_add(1, std::memory_order_relaxed);
                     resources = std::move(cached);
                     fromCache = true;

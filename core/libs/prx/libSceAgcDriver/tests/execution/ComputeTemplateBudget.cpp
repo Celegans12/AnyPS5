@@ -156,6 +156,7 @@ void UseTheResourceCacheOnEveryDispatch() {
 
 int main() {
     UseTheResourceCacheOnEveryDispatch();
+    AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::NoMovedWrittenTemplates, true);
     try {
         {
             const auto device = OpenVulkanTestDevice();

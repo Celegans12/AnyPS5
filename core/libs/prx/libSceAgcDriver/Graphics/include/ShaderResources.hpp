@@ -276,6 +276,11 @@ public:
         DescriptorCache::SetAllocation fragmentAllocation;
         DescriptorCache::SetAllocation allocation;
         std::vector<Snapshot> snapshots;
+        // Written V#s a compute template binds at a new base for this use (MovedDispatchBuffers with
+        // written moves): their own upload of the new ranges, in place, whose writes this use notes
+        // and marks (MarkMovedWrites); a snapshot without a buffer stands for such an element.
+        std::shared_ptr<GuestBufferMemory> movedWrites;
+        std::vector<std::pair<std::size_t, VkDescriptorBufferInfo>> movedWriteViews;
         ~DrawBindings();
     };
     struct MovedBuffer {
@@ -283,17 +288,30 @@ public:
         std::uint64_t address;
         std::size_t size;
         std::span<const std::uint32_t> words;
+        bool written = false;
     };
     std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, bool movedOnly = false) const;
     std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const;
-    enum class MoveRefusal : std::size_t { None, Shape, NotGuest, Written, Limit, Inaccessible, Overlap, Bindings, Count };
+    enum class MoveRefusal : std::size_t { None, Shape, NotGuest, Written, Limit, Inaccessible, Overlap, Bindings, WrittenStaged, WrittenSize, WrittenAdjustment, WrittenOverlap, Count };
     struct MoveProof {
         MoveRefusal refusal = MoveRefusal::None;
         std::size_t buffers = 0;
         std::size_t bytes = 0;
+        std::size_t writtenBuffers = 0;
+        std::size_t writtenBytes = 0;
     };
     static const char* MoveRefusalName(MoveRefusal refusal);
-    std::optional<std::vector<MovedBuffer>> MovedDispatchBuffers(const CompiledShader& shader, Recorder* recorder, std::size_t maxBytes, MoveProof& proof) const;
+    std::optional<std::vector<MovedBuffer>> MovedDispatchBuffers(const CompiledShader& shader, Recorder* recorder, std::size_t maxBytes, MoveProof& proof, bool movedWrites = false) const;
+    // The pending-read and pending-write notes and the direct-write marks of a use's moved written
+    // V#s (DrawBindings::movedWrites), as MarkGpuWrites makes them for the template's own ranges.
+    static void MarkMovedWrites(Recorder& recorder, const DrawBindings& bindings);
+    static bool MovedWritesOverlap(const DrawBindings& bindings, std::uint64_t address, std::size_t bytes);
+    // Every guest buffer element of the build as {address, size, written}, in allocation order (the
+    // verify of moved written V#s compares a full build's with the template's plus the moves).
+    std::vector<std::array<std::uint64_t, 3>> GuestBufferElements() const;
+    // The same with each element's allocation index as a fourth word.
+    std::vector<std::array<std::uint64_t, 4>> GuestBufferAllocations() const;
+    const std::vector<std::pair<std::uint64_t, std::uint64_t>>& GuestWrites() const { return guestMemory.Writes(); }
     static std::size_t MaxDrawSnapshotBytes();
     static std::size_t DrawUploadLimit();
     // The [draw-snapshots] counters of CopyDrawInput (vertex and index inputs, APS5_PROFILE_DRAW).
@@ -355,8 +373,8 @@ public:
     // Without `dataWords` the ShaderData and FlattenedSrt descriptor words stay out of the key
     // (their count and size remain): a compute template then serves dispatches whose constants
     // differ, and the hit refreshes its data buffers with the dispatch's words (RefreshData).
-    static std::vector<std::uint32_t> ContentKey(const CompiledShader& shader, bool dataWords = true, bool movableBuffers = false);
-    static void AppendContentKey(const CompiledShader& shader, bool dataWords, bool movableBuffers, std::vector<std::uint32_t>& key);
+    static std::vector<std::uint32_t> ContentKey(const CompiledShader& shader, bool dataWords = true, bool movableBuffers = false, bool movableWritten = false);
+    static void AppendContentKey(const CompiledShader& shader, bool dataWords, bool movableBuffers, std::vector<std::uint32_t>& key, bool movableWritten = false);
     static void AppendContentKeyRoles(const CompiledShader& shader, bool dataWords, bool movableBuffers, std::vector<std::uint8_t>& roles);
     static bool DiffContentKeys(std::span<const std::uint32_t> previous, std::span<const std::uint32_t> key, bool draw, ContentKeyDiff& diff);
     // Records the shader's ShaderData and FlattenedSrt words into this object's data buffers

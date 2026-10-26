@@ -160,6 +160,7 @@ void UseTheResourceCacheOnEveryDispatch() {
 
 int main() {
     UseTheResourceCacheOnEveryDispatch();
+    AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::NoMovedWrittenTemplates, true);
     AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::NoComputeTemplateBudget, true);
     try {
         {
