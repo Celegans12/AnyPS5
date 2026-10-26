@@ -207,7 +207,9 @@ FrameRecorder* FrameRecorder::Active() {
         const auto atBoundary = readNumber(std::getenv("APS5_FRAME_CAPTURE_AT_FLIP"), 0);
         const auto frames = readNumber(std::getenv("APS5_FRAME_CAPTURE_FRAMES"), DefaultFrames);
         if (frames == 0) throw std::runtime_error("frame capture: APS5_FRAME_CAPTURE_FRAMES must be at least 1");
-        return new FrameRecorder(directory, trigger != nullptr ? trigger : "", atBoundary, frames);
+        auto* created = new FrameRecorder(directory, trigger != nullptr ? trigger : "", atBoundary, frames);
+        created->checkpointFrame = readNumber(std::getenv("APS5_FRAME_CAPTURE_CHECKPOINT"), 0);
+        return created;
     }();
     return recorder;
 }
@@ -333,6 +335,33 @@ void FrameRecorder::writeFrameReference() {
     } catch (const std::exception& failure) {
         warnings.push_back(std::string("no reference for a captured frame: ") + failure.what());
     }
+}
+
+void FrameRecorder::writeCheckpoint() {
+    emitDelta();
+    if (state != State::Recording) return;
+    if (!DriverDetail::Driver::Get().SettleForCapture(std::chrono::seconds(10))) warnings.push_back("storage images were still pending GPU results at the checkpoint");
+    std::vector<std::byte> bytes;
+    for (const auto& range : ranges) {
+        if (!range.readable) continue;
+        for (std::uint64_t at = 0; at < range.bytes; at += FrameCaptureWriter::BlockBytes) {
+            bytes.resize(static_cast<std::size_t>(std::min<std::uint64_t>(FrameCaptureWriter::BlockBytes, range.bytes - at)));
+            GuestMemory::ReadCommitted(range.address + at, bytes);
+            const auto known = blockHashes.find(range.address + at);
+            const auto hash = wideHash(bytes);
+            if (known != blockHashes.end() ? known->second == hash : AllZero(bytes)) continue;
+            writer->WriteCheckpoint(checkpointFrame, range.address + at, bytes);
+            ++checkpointBlocks;
+            checkpointBytes += bytes.size();
+        }
+    }
+    blockHashes.clear();
+    auto call = make(FrameCallKind::Checkpoint);
+    call.ordinal = ++ordinal;
+    std::tie(call.accepted, call.completed) = DriverDetail::Driver::Get().SerialProgress();
+    call.values = {checkpointFrame};
+    writer->WriteCall(call);
+    std::fprintf(stderr, "[frame-capture] checkpoint after frame %llu: %llu blocks (%.1f MiB) differ from the snapshot\n", static_cast<unsigned long long>(checkpointFrame), static_cast<unsigned long long>(checkpointBlocks), static_cast<double>(checkpointBytes) / (1024.0 * 1024.0));
 }
 
 void FrameRecorder::writeReferenceFrames() {
@@ -539,6 +568,7 @@ void FrameRecorder::FrameBoundary() {
     ++boundaries;
     if (state == State::Recording) {
         writeFrameReference();
+        if (checkpointFrame != 0 && recordedFrames + 1 == checkpointFrame) writeCheckpoint();
         if (++recordedFrames >= frames) finish();
         return;
     }
@@ -779,6 +809,12 @@ void FrameRecorder::snapshot(const Range& range) {
         if (range.kind == FrameRangeKind::Section && (range.access & FrameRangeAccess::Writable) != 0) {
             for (std::size_t page = 0; page < bytes.size(); page += 4096) sectionPageHashes[range.address + at + page] = wideHash(std::span(bytes).subspan(page, std::min<std::size_t>(4096, bytes.size() - page)));
         }
+        if (checkpointFrame != 0) {
+            for (std::size_t block = 0; block < bytes.size(); block += FrameCaptureWriter::BlockBytes) {
+                const auto length = std::min<std::size_t>(FrameCaptureWriter::BlockBytes, bytes.size() - block);
+                blockHashes[range.address + at + block] = wideHash(std::span(bytes).subspan(block, length));
+            }
+        }
         snapshotBytes += writer->WriteSnapshot(range.address + at, bytes);
     }
 }
@@ -889,6 +925,7 @@ std::string FrameRecorder::header() const {
     text += std::string(",\"dirty\":") + (APS5_TRACE_DIRTY < 0 ? "null" : APS5_TRACE_DIRTY != 0 ? "true" : "false");
     text += ",\"arena_base\":" + std::to_string(arenaBase) + ",\"arena_bytes\":" + std::to_string(arenaBytes);
     text += ",\"gds_address\":" + std::to_string(gdsAddress);
+    text += ",\"checkpoint_frame\":" + std::to_string(checkpointFrame) + ",\"checkpoint_blocks\":" + std::to_string(checkpointBlocks);
     text += ",\"aliased_pages\":" + std::to_string(aliasedPages) + ",\"alias_groups\":" + std::to_string(aliasGroups);
     text += ",\"start_boundary\":" + std::to_string(startBoundary) + ",\"frames\":" + std::to_string(recordedFrames);
     text += ",\"calls\":" + std::to_string(recordedCalls) + ",\"prologue_calls\":" + std::to_string(prologueCallCount);

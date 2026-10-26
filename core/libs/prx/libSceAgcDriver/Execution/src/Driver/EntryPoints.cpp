@@ -158,6 +158,10 @@ extern "C" void AgcDriverUseGdsAt_nid_postfix(std::uint64_t address) {
     AgcDriver::Pm4::UseGdsAt(address);
 }
 
+extern "C" bool AgcDriverSettle_nid_postfix() {
+    return AgcDriver::DriverDetail::Driver::Get().SettleForCapture(std::chrono::seconds(10));
+}
+
 extern "C" bool AgcDriverQuiescent_nid_postfix() {
     return AgcDriver::DriverDetail::Driver::Get().Quiescent();
 }
