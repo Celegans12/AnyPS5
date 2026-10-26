@@ -26,6 +26,7 @@ void require(bool condition, const std::string& what) {
 }
 
 alignas(Texture) std::array<std::array<std::byte, sizeof(Texture)>, 8> fakeTextures{};
+alignas(StorageTexture) std::array<std::array<std::byte, sizeof(StorageTexture)>, 3> fakeImages{};
 
 std::shared_ptr<Texture> fakeTexture(std::size_t index) {
     return std::shared_ptr<Texture>(reinterpret_cast<Texture*>(fakeTextures[index].data()), [](Texture*) {});
@@ -222,15 +223,39 @@ void storageViewsComeBack(const Context& context, VkImageView view) {
     require(released == 4, "a sweep released " + std::to_string(released) + " of four storage owners the heap alone held, three of them in two slots each");
     require(!BindlessHeap::NearlyFull(), "a sweep after every storage owner is gone takes the heap again");
 
-    auto evicted = owner();
-    for (std::uint32_t kind = 0; kind < 2u; ++kind) require(heap.StorageSlot(Abi::FirstStorageImageBinding + kind, evicted, view).has_value(), "an evicted owner's view takes a slot");
-    const auto* image = evicted.get();
-    BindlessHeap::NoteStorageEvicted(image);
+    const auto image = [&released](std::size_t index, bool cached) {
+        auto* pointer = reinterpret_cast<StorageTexture*>(fakeImages[index].data());
+        pointer->SetCached(true);
+        pointer->SetCached(cached);
+        return std::shared_ptr<StorageTexture>(pointer, [&released](StorageTexture*) { ++released; });
+    };
+    auto evicted = image(0, true);
+    auto cached = image(1, true);
+    for (std::uint32_t kind = 0; kind < 2u; ++kind) require(heap.StorageSlot(Abi::FirstStorageImageBinding + kind, evicted, view).has_value(), "an evicted image's view takes a slot");
+    require(heap.StorageSlot(Abi::FirstStorageImageBinding, cached, view).has_value(), "a cached image takes a slot");
+    evicted->SetCached(false);
+    BindlessHeap::NoteStorageEvicted();
     BindlessHeap::SweepIfDue();
-    require(released == 4, "an evicted storage owner still held outside the heap lost its slots");
+    require(released == 4, "an evicted storage image still held outside the heap lost its slots");
     evicted.reset();
+    cached.reset();
     BindlessHeap::SweepIfDue();
-    require(released == 5, "the present after an evicted storage owner's last outside holder went did not release its two slots");
+    require(released == 5, "the present after an evicted storage image's last outside holder went did not release its two slots, or released the cached image the heap alone holds");
+
+    auto late = image(0, false);
+    require(heap.StorageSlot(Abi::FirstStorageImageBinding, late, view).has_value(), "an image that left the storage cache before its first slot takes one");
+    BindlessHeap::SweepIfDue();
+    require(released == 5, "an image that left the cache lost its slot while still held outside the heap");
+    late.reset();
+    BindlessHeap::SweepIfDue();
+    require(released == 6, "an image that took its slot after leaving the storage cache kept it after its last outside holder went");
+
+    auto outside = std::shared_ptr<StorageTexture>(reinterpret_cast<StorageTexture*>(fakeImages[2].data()), [&released](StorageTexture*) { ++released; });
+    require(heap.StorageSlot(Abi::FirstStorageImageBinding, outside, view).has_value(), "an image made outside the storage cache takes a slot");
+    outside.reset();
+    BindlessHeap::NoteStorageEvicted();
+    BindlessHeap::SweepIfDue();
+    require(released == 6, "an image the storage cache never held lost its slot without a sweep");
     BindlessHeap::Release(context.device);
 }
 

@@ -19,6 +19,7 @@ namespace AgcDriver::Graphics {
 class Buffer;
 class Recorder;
 class Sampler;
+class StorageTexture;
 class Texture;
 
 class BindlessHeap {
@@ -47,6 +48,7 @@ public:
     std::optional<std::uint32_t> TextureSlot(std::uint32_t kind, const std::shared_ptr<Texture>& texture, VkImageView view,
                                              VkImageLayout layout);
     std::optional<std::uint32_t> StorageSlot(std::uint32_t kind, std::shared_ptr<void> owner, VkImageView view);
+    std::optional<std::uint32_t> StorageSlot(std::uint32_t kind, const std::shared_ptr<StorageTexture>& image, VkImageView view);
     std::optional<std::uint32_t> ViewSlot(std::uint32_t kind, const void* owner, VkImageView view);
     void ReleaseViewSlots(const void* owner);
     std::uint32_t SlotGeneration(std::uint32_t slot) const;
@@ -59,7 +61,7 @@ public:
     std::uint32_t AbsentSlot(std::uint32_t kind, VkImageView view);
     static bool NearlyFull();
     static void NoteSweepDue();
-    static void NoteStorageEvicted(const void* owner);
+    static void NoteStorageEvicted();
     static void SweepIfDue();
 
     struct DataSpan {
@@ -134,6 +136,7 @@ private:
     struct SlotOwner {
         std::shared_ptr<Texture> texture;
         std::shared_ptr<void> storage;
+        const StorageTexture* image = nullptr;
         TextureKey key{};
         std::uint32_t generation = 0;
     };
@@ -143,7 +146,8 @@ private:
     std::uint64_t slotRequests = 0;
     void sweepLocked(std::vector<std::shared_ptr<Texture>>& dropped);
     bool heldOnlyHereLocked(const void* owner, long uses) const;
-    void releaseStorageLocked(std::span<const void* const> owners, std::vector<const void*>& kept);
+    std::optional<std::uint32_t> takeStorageSlot(std::uint32_t kind, std::shared_ptr<void> owner, VkImageView view, const StorageTexture* image);
+    bool releaseUncachedLocked(std::vector<std::shared_ptr<Texture>>& dropped, bool storagePhase);
     void dropStorageLocked(const void* image, std::uint32_t slot);
     std::optional<std::uint32_t> takeSlotLocked();
     std::optional<std::uint32_t> takeOrSweepLocked(std::vector<std::shared_ptr<Texture>>& dropped);

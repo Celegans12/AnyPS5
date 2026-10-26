@@ -252,10 +252,19 @@ std::optional<std::uint32_t> BindlessHeap::TextureSlot(std::uint32_t kind, const
     owner.texture = texture;
     texture->AddHeapHold();
     noteTakenLocked(dropped);
+    if (const auto& source = texture->SharedStorageSource(); source != nullptr && source->LeftCache()) NoteStorageEvicted();
     return slot;
 }
 
 std::optional<std::uint32_t> BindlessHeap::StorageSlot(std::uint32_t kind, std::shared_ptr<void> owner, VkImageView view) {
+    return takeStorageSlot(kind, std::move(owner), view, nullptr);
+}
+
+std::optional<std::uint32_t> BindlessHeap::StorageSlot(std::uint32_t kind, const std::shared_ptr<StorageTexture>& image, VkImageView view) {
+    return takeStorageSlot(kind, image, view, image.get());
+}
+
+std::optional<std::uint32_t> BindlessHeap::takeStorageSlot(std::uint32_t kind, std::shared_ptr<void> owner, VkImageView view, const StorageTexture* image) {
     if (!Abi::GpuHeapStorageKind(kind) || owner == nullptr || view == VK_NULL_HANDLE)
         throw std::runtime_error("AGC bindless heap: invalid storage slot request");
     std::vector<std::shared_ptr<Texture>> dropped;
@@ -268,8 +277,11 @@ std::optional<std::uint32_t> BindlessHeap::StorageSlot(std::uint32_t kind, std::
     if (!slot) return std::nullopt;
     noteTakenLocked(dropped);
     writeImageSlot(kind, *slot, view, VK_IMAGE_LAYOUT_GENERAL);
-    claimSlotLocked(key, *slot).storage = std::move(owner);
+    auto& claimed = claimSlotLocked(key, *slot);
+    claimed.storage = std::move(owner);
+    claimed.image = image;
     storageSlots[key.texture].push_back(*slot);
+    if (image != nullptr && image->LeftCache()) NoteStorageEvicted();
     return slot;
 }
 
@@ -326,6 +338,7 @@ void BindlessHeap::freeSlotLocked(std::uint32_t slot) {
         if (slots.empty()) storageSlots.erase(found);
     }
     textureSlots.erase(owner.key);
+    owner.image = nullptr;
     owner.key = {};
     ++owner.generation;
     freeSlots.push_back(slot);
@@ -374,17 +387,39 @@ bool BindlessHeap::heldOnlyHereLocked(const void* owner, long uses) const {
     return uses <= slots;
 }
 
-void BindlessHeap::releaseStorageLocked(std::span<const void* const> evicted, std::vector<const void*>& kept) {
-    for (const auto* image : evicted) {
-        const auto found = storageSlots.find(image);
-        if (found == storageSlots.end()) continue;
-        const auto& first = owners[found->second.front()].storage;
-        if (first == nullptr || !heldOnlyHereLocked(image, first.use_count())) {
-            kept.push_back(image);
+bool BindlessHeap::releaseUncachedLocked(std::vector<std::shared_ptr<Texture>>& dropped, bool storagePhase) {
+    bool heldElsewhere = false;
+    const auto firstDropped = dropped.size();
+    std::vector<std::pair<const void*, std::uint32_t>> images;
+    for (std::uint32_t slot = SamplerKind; slot < owners.size(); ++slot) {
+        auto& owner = owners[slot];
+        if (owner.storage != nullptr) {
+            if (!storagePhase) continue;
+            if (owner.image == nullptr || !owner.image->LeftCache()) continue;
+            const auto found = storageSlots.find(owner.key.texture);
+            if (found == storageSlots.end() || found->second.front() != slot) continue;
+            if (!heldOnlyHereLocked(owner.key.texture, owner.storage.use_count())) {
+                heldElsewhere = true;
+                continue;
+            }
+            images.emplace_back(owner.key.texture, slot);
             continue;
         }
-        dropStorageLocked(image, found->second.front());
+        if (storagePhase || owner.texture == nullptr) continue;
+        const auto& source = owner.texture->SharedStorageSource();
+        if (source == nullptr || !source->LeftCache()) continue;
+        if (owner.texture.use_count() > static_cast<long>(owner.texture->HeapHolds())) {
+            heldElsewhere = true;
+            continue;
+        }
+        heldElsewhere = true;
+        dropped.push_back(std::move(owner.texture));
+        freeSlotLocked(slot);
+        slotSerial.fetch_add(1, std::memory_order_release);
     }
+    for (auto index = firstDropped; index < dropped.size(); ++index) dropped[index]->DropHeapHold();
+    for (const auto& [image, slot] : images) dropStorageLocked(image, slot);
+    return heldElsewhere;
 }
 
 void BindlessHeap::dropStorageLocked(const void* image, std::uint32_t slot) {
@@ -431,15 +466,7 @@ namespace {
 
 std::atomic<bool> sweepDue{false};
 
-std::mutex& evictedStorageMutex() {
-    static auto& mutex = *new std::mutex();
-    return mutex;
-}
-
-std::vector<const void*>& evictedStorage() {
-    static auto& list = *new std::vector<const void*>();
-    return list;
-}
+std::atomic<bool> uncachedPending{false};
 std::atomic<std::uint32_t> refusedSweepChecks{0};
 constexpr std::uint32_t RefusedSweepInterval = 64u;
 
@@ -449,44 +476,45 @@ void BindlessHeap::NoteSweepDue() {
     sweepDue.store(true, std::memory_order_relaxed);
 }
 
-void BindlessHeap::NoteStorageEvicted(const void* owner) {
-    if (owner == nullptr) return;
-    std::lock_guard lock(evictedStorageMutex());
-    evictedStorage().push_back(owner);
+void BindlessHeap::NoteStorageEvicted() {
+    uncachedPending.store(true, std::memory_order_relaxed);
 }
 
 void BindlessHeap::SweepIfDue() {
-    std::vector<const void*> evicted;
-    {
-        std::lock_guard lock(evictedStorageMutex());
-        evicted.swap(evictedStorage());
-    }
+    const bool uncached = uncachedPending.load(std::memory_order_relaxed) && uncachedPending.exchange(false, std::memory_order_relaxed);
     const bool due = sweepDue.load(std::memory_order_relaxed) && sweepDue.exchange(false, std::memory_order_relaxed);
     const bool retry = !due && nearlyFull.load(std::memory_order_relaxed) &&
                        refusedSweepChecks.fetch_add(1, std::memory_order_relaxed) % RefusedSweepInterval == RefusedSweepInterval - 1u;
-    if (!due && !retry && evicted.empty()) return;
-    std::sort(evicted.begin(), evicted.end());
-    evicted.erase(std::unique(evicted.begin(), evicted.end()), evicted.end());
-    std::vector<std::shared_ptr<Texture>> dropped;
-    SweptStorageRelease swept;
-    std::vector<std::shared_ptr<Sampler>> droppedSamplers;
-    std::vector<const void*> kept;
-    std::lock_guard heapsLock(heapsMutex());
+    if (!due && !retry && !uncached) return;
+    bool again = false;
     bool room = true;
-    for (auto& [device, heap] : heaps()) {
-        if (heap == nullptr) continue;
-        std::lock_guard lock(heap->mutex);
-        if (due || retry) {
-            heap->sweepLocked(dropped);
-            heap->sweepSamplersLocked(droppedSamplers);
+    {
+        std::vector<std::shared_ptr<Texture>> dropped;
+        SweptStorageRelease swept;
+        std::vector<std::shared_ptr<Sampler>> droppedSamplers;
+        std::lock_guard heapsLock(heapsMutex());
+        for (auto& [device, heap] : heaps()) {
+            if (heap == nullptr) continue;
+            std::lock_guard lock(heap->mutex);
+            if (due || retry) {
+                heap->sweepLocked(dropped);
+                heap->sweepSamplersLocked(droppedSamplers);
+            }
+            if (uncached && heap->releaseUncachedLocked(dropped, false)) again = true;
         }
-        heap->releaseStorageLocked(evicted, kept);
-        room = room && heap->roomLocked();
     }
-    if (!kept.empty()) {
-        std::lock_guard lock(evictedStorageMutex());
-        evictedStorage().insert(evictedStorage().end(), kept.begin(), kept.end());
+    {
+        std::vector<std::shared_ptr<Texture>> none;
+        SweptStorageRelease swept;
+        std::lock_guard heapsLock(heapsMutex());
+        for (auto& [device, heap] : heaps()) {
+            if (heap == nullptr) continue;
+            std::lock_guard lock(heap->mutex);
+            if (uncached && heap->releaseUncachedLocked(none, true)) again = true;
+            room = room && heap->roomLocked();
+        }
     }
+    if (again) NoteStorageEvicted();
     if (room && nearlyFull.exchange(false, std::memory_order_relaxed))
         std::fprintf(stderr, "[gpu-heap] a sweep left twice the margin of slots free; draws take the heap again\n");
 }
