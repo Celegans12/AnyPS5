@@ -84,7 +84,7 @@ APS5_NO_OWNED_PROOFS=1 APS5_NO_OWNED_DRAW_SNAPSHOTS=1 APS5_NO_OWNED_VERTEX_INPUT
   - `APS5_HOST_IMPORT_HALF_HEAP_RESERVE=1`: `main`'s halved host-import budget. The world arrived late.
   - `APS5_TABLE_COUNT_NEUTRAL_PIPELINES=1`: broke world rendering.
   - `APS5_CLEAR_HAND_OVER=1`: `main`'s clear hand-over (#7427). A white glare with coloured sprites over the upper half of the world.
-  - `APS5_PLAYGO_SCENARIO_CHUNKS=1`: `main`'s PlayGo chunk listing from a scenario file (#7726). The game then opens an audio stream our AJM rejects and crashes before the title.
+  - `APS5_PLAYGO_SCENARIO_CHUNKS=1`: `main`'s PlayGo chunk listing from a scenario file (#7726). The ATRAC9 crash it used to cause is gone since #6721 (on this base too), but with the listing the boot crawls: on `main` of 10-26 the title sequence reached frame 23 by 370 s, against the title at 324 s with the listing off.
   - `APS5_IMAGE_POOL=1`: `main`'s image memory pool (#7870), not tested on Yōtei.
   - Where `main` and our tree differ, `APS5_RESULT_MEMO_TABLE=1`, `APS5_RELOCATED_HEADER_COPIES=1` and `APS5_SAMPLED_LATER_USE_REFUSAL=1` select `main`'s version.
 - Off switches for the newest local changes:
