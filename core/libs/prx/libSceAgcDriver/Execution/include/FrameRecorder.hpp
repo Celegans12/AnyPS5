@@ -140,6 +140,8 @@ private:
     std::uint64_t recordedFrames = 0;
     std::uint64_t generation = 0;
     std::uint64_t deltaGroups = 0;
+    std::uint64_t blockedDeltas = 0;
+    std::uint64_t rereadDeltas = 0;
     std::uint64_t deltaBytes = 0;
     std::uint64_t snapshotBytes = 0;
     std::uint64_t recordedCalls = 0;
