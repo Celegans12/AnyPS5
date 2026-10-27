@@ -42,6 +42,7 @@ void registry() {
     Require(RuntimeSwitches::Find("APS5_NO_SPLIT_DRAW_BUILD") == RuntimeSwitch::NoSplitDrawBuild, "APS5_NO_SPLIT_DRAW_BUILD is not a runtime switch");
     Require(RuntimeSwitches::Find("APS5_NO_HTILE_GPU_EXPANSION") == RuntimeSwitch::NoHtileGpuExpansion, "APS5_NO_HTILE_GPU_EXPANSION is not a runtime switch");
     Require(RuntimeSwitches::Find("APS5_NO_GPU_INDIRECT_ARGS") == RuntimeSwitch::NoGpuIndirectArgs && RuntimeSwitches::Find("APS5_NO_BARRIER_BATCH") == RuntimeSwitch::NoBarrierBatch && RuntimeSwitches::Find("APS5_NO_EARLY_REVALIDATE") == RuntimeSwitch::NoEarlyRevalidate && RuntimeSwitches::Find("APS5_NO_BATCHED_STAGING") == RuntimeSwitch::NoBatchedStaging && RuntimeSwitches::Find("APS5_QUIET_PUBLISH") == RuntimeSwitch::QuietPublish, "a combined-build switch is not a runtime switch");
+    Require(RuntimeSwitches::Find("APS5_SINGLE_GROUP_COHERENCE") == RuntimeSwitch::SingleGroupCoherence && !RuntimeSwitches::Set(RuntimeSwitch::SingleGroupCoherence), "APS5_SINGLE_GROUP_COHERENCE is not an opt-in runtime switch");
     Require(!RuntimeSwitches::Find("APS5_ASYNC_LANE").has_value() && !RuntimeSwitches::Find("APS5_SPANNED_WAVE").has_value(), "a startup-only variable was found as a runtime switch");
     for (std::size_t index = 0; index < static_cast<std::size_t>(RuntimeSwitch::Count); ++index) {
         const auto id = static_cast<RuntimeSwitch>(index);

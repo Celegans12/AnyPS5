@@ -262,8 +262,27 @@ int main(int argc, char** argv) {
             }
         }
         const auto compileStart = std::chrono::steady_clock::now();
-        const auto shader = ShaderRecompiler::Recompile(request.request);
+        auto shader = ShaderRecompiler::Recompile(request.request);
+        if (const auto inlineMode = Env("BENCH_INLINE", 0u); inlineMode != 0u) {
+            auto words = shader.spirv.Copy();
+            std::uint64_t patched = 0;
+            for (std::size_t at = 5; at < words.size();) {
+                const auto count = words[at] >> 16u;
+                if (count == 0u) break;
+                if ((words[at] & 0xffffu) == 54u && count >= 5u && (words[at + 3u] & 2u) != 0u) {
+                    words[at + 3u] = (words[at + 3u] & ~3u) | (inlineMode == 2u ? 1u : 0u);
+                    ++patched;
+                }
+                at += count;
+            }
+            shader.spirv = std::move(words);
+            std::printf("request bench: BENCH_INLINE=%llu cleared DontInline on %llu functions\n", static_cast<unsigned long long>(inlineMode), static_cast<unsigned long long>(patched));
+        }
         const auto compileMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - compileStart).count();
+        if (const char* spirvPath = std::getenv("BENCH_SPIRV"); spirvPath != nullptr && *spirvPath != '\0') {
+            std::ofstream spirvFile(spirvPath, std::ios::binary);
+            spirvFile.write(reinterpret_cast<const char*>(shader.spirv.data()), static_cast<std::streamsize>(shader.spirv.size() * sizeof(std::uint32_t)));
+        }
         const auto& compute = *request.request.context.compute;
         std::printf("request bench: %s, %zu code words, threads %ux%ux%u, %zu SPIR-V words (recompile %.0f ms)\n", argv[1], request.request.shader.code.size(), compute.numThreads[0], compute.numThreads[1], compute.numThreads[2], shader.spirv.size(), compileMs);
 

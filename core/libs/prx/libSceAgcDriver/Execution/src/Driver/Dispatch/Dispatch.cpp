@@ -289,8 +289,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
     // coherence for its glc reads (ShaderComputeStageInfo::singleWorkgroup). Opt-in, APS5_SINGLE_GROUP_COHERENCE=1:
     // with the BDA overlays (device-local buffers) it saves ~2 % of 0x80001c0d00 on the request bench, and one
     // of four bench runs gave an unstable output hash, so it is not shown to be exact.
-    static const bool singleGroupCoherence = std::getenv("APS5_SINGLE_GROUP_COHERENCE") != nullptr;
-    if (singleGroupCoherence && indirectArguments == 0) {
+    if (indirectArguments == 0 && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::SingleGroupCoherence)) {
         const bool threads = (packet[4] & 0x20u) != 0;
         bool single = true;
         for (std::uint32_t axis = 0; axis < 3; ++axis) single = single && (threads ? packet[1 + axis] <= compute.numThreads[axis] : packet[1 + axis] == 1u);
