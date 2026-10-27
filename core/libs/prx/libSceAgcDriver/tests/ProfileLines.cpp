@@ -3,6 +3,7 @@
 // windows themselves (ProfileWindows).
 #include "prx/libSceAgcDriver/Execution/include/CommandMix.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileWindows.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BindlessRegistrations.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidentCensus.hpp"
 #include "IntermediateRepresentation/IrMetadata/ResourcePlan.hpp"
 #include "IntermediateRepresentation/IrValue.hpp"
@@ -177,6 +178,35 @@ void testCensusLru() {
     check(second.evicted[1] == 0, "1 GiB holds both windows");
 }
 
+void testBindlessCodec() {
+    using AgcDriver::Graphics::BindlessRegistration;
+    check(AgcDriver::Graphics::DecodeBindlessRegistrations({}).empty(), "no words, no tables");
+    std::vector<BindlessRegistration> tables(2);
+    tables[0].base = 0x5012340000ull;
+    tables[0].records = 300;
+    tables[0].stride = 48;
+    tables[0].dwords = 8;
+    tables[0].uses.resize(2);
+    tables[0].uses[0].interfaceId = 0x1234567890abcdefull;
+    tables[0].uses[0].samplerClass = 3;
+    tables[0].uses[0].sampler[0] = 0xdeadbeefu;
+    tables[0].uses[1].interfaceId = 7;
+    tables[1].base = 0x8000001000ull;
+    tables[1].records = 1;
+    const auto words = AgcDriver::Graphics::EncodeBindlessRegistrations(tables);
+    check(!words.empty() && words.front() == 2, "the count leads");
+    check(AgcDriver::Graphics::DecodeBindlessRegistrations(words) == tables, "registrations survive encode and decode");
+    auto truncated = words;
+    truncated.pop_back();
+    bool threw = false;
+    try {
+        static_cast<void>(AgcDriver::Graphics::DecodeBindlessRegistrations(truncated));
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    check(threw, "truncated words are refused");
+}
+
 void testFrameWindows() {
     using AgcDriver::ProfileWindows::ClockDue;
     auto past = std::chrono::steady_clock::now() - std::chrono::seconds(11);
@@ -206,6 +236,7 @@ int main(int argc, char** argv) {
             testCensusLru();
         }
         if (mode == "all" || mode == "windows") testFrameWindows();
+        if (mode == "all" || mode == "bindless_codec") testBindlessCodec();
         std::puts("profile lines test passed");
         return 0;
     } catch (const std::exception& error) {

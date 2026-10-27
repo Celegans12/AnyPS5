@@ -174,6 +174,9 @@ public:
     const BindlessTable& Table() const { return table; }
     std::uint64_t Register(const BindlessTableRegistration& registration);
     bool Primed(std::uint64_t id) const;
+    // Every table registered so far, in registration order (agc_frame_replay's heap primer and the
+    // frame capture's BindlessTables record).
+    std::vector<BindlessTableRegistration> Registrations() const;
     bool WaitPrimed(std::uint64_t id, std::uint32_t milliseconds);
     void Serve(std::span<const std::uint64_t> ids, Recorder& recorder);
     void Publish(Recorder& recorder) { Serve({}, recorder); }

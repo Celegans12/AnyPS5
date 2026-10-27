@@ -86,6 +86,10 @@ public:
     bool SettleForCapture(std::chrono::milliseconds timeout);
     std::vector<std::uint32_t> SaveQueueStates();
     void LoadQueueStates(std::span<const std::uint32_t> words);
+    // The device's registered bindless tables as BindlessRegistrations words (empty before the device
+    // exists), and the replay's heap primer for such words (makes the device when there is none yet).
+    std::vector<std::uint64_t> BindlessRegistrationWords();
+    void PrimeBindlessTables(std::span<const std::uint64_t> words);
     bool WaitIdleFor(std::chrono::milliseconds timeout);
     void RegisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOutput>& output);
     void UnregisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOutput>& output);

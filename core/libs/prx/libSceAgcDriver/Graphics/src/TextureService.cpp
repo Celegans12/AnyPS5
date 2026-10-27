@@ -172,6 +172,14 @@ std::uint64_t TextureService::Register(const BindlessTableRegistration& registra
     return id;
 }
 
+std::vector<BindlessTableRegistration> TextureService::Registrations() const {
+    std::lock_guard lock(mutex);
+    std::vector<BindlessTableRegistration> result;
+    result.reserve(tables.size());
+    for (const auto& [id, tracked] : tables) result.push_back(tracked.registration);
+    return result;
+}
+
 bool TextureService::Primed(std::uint64_t id) const {
     std::lock_guard lock(mutex);
     const auto found = tables.find(id);

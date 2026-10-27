@@ -5355,6 +5355,21 @@ void VulkanDevice::PrimeBindlessDraw(std::span<const Graphics::CompiledShader> s
     }
 }
 
+std::vector<ShaderRecompiler::BindlessImageAbi::TableRegistration> VulkanDevice::BindlessRegistrations() const {
+    const auto context = graphicsContext();
+    if (context.textureService == nullptr) return {};
+    return context.textureService->Registrations();
+}
+
+void VulkanDevice::PrimeBindlessRegistrations(std::span<const ShaderRecompiler::BindlessImageAbi::TableRegistration> tables) {
+    const auto context = graphicsContext();
+    if (tables.empty() || context.textureService == nullptr || !state->recorder) return;
+    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Hook);
+    std::lock_guard gpuLock(GuestMemory::GpuMutex());
+    Graphics::ServeBindlessTables(context, *state->recorder, tables);
+    state->recorder->Sync();
+}
+
 VulkanDevice::PresyncStatistics VulkanDevice::PresyncCounts() {
     const auto& counters = Presyncs();
     return {counters.checked.load(std::memory_order_relaxed), counters.presyncs.load(std::memory_order_relaxed), counters.keyChecks.load(std::memory_order_relaxed), counters.keyWaits.load(std::memory_order_relaxed)};

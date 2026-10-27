@@ -120,7 +120,7 @@ FrameCall decodeCall(FrameCallKind kind, std::span<const std::byte> payload) {
 }
 
 bool knownCall(std::uint32_t kind) {
-    return kind >= static_cast<std::uint32_t>(FrameCallKind::RegisterShader) && kind <= static_cast<std::uint32_t>(FrameCallKind::Checkpoint);
+    return kind >= static_cast<std::uint32_t>(FrameCallKind::RegisterShader) && kind <= static_cast<std::uint32_t>(FrameCallKind::BindlessTables);
 }
 
 std::vector<std::byte> readFile(const std::filesystem::path& path) {
@@ -177,6 +177,7 @@ std::string_view FrameCallName(FrameCallKind kind) {
     case FrameCallKind::QueueStates: return "queue-states";
     case FrameCallKind::AliasedPages: return "aliased-pages";
     case FrameCallKind::Checkpoint: return "checkpoint";
+    case FrameCallKind::BindlessTables: return "bindless-tables";
     }
     throw std::runtime_error("frame capture: unknown call kind " + std::to_string(static_cast<std::uint32_t>(kind)));
 }

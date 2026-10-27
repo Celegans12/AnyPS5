@@ -33,6 +33,9 @@ enum class FrameCallKind : std::uint32_t {
     QueueStates,
     AliasedPages,
     Checkpoint,
+    // The bindless tables the texture service had registered when the capture started
+    // (values: BindlessRegistrations words), for agc_frame_replay's heap primer.
+    BindlessTables,
 };
 
 struct FrameCall {

@@ -317,6 +317,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Queues/WorkerAffinity.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Shaders/ShaderDiagnostics.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Shaders/ShaderRegistry.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/BindlessPriming.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Synchronization/DeferredLabels.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Synchronization/LabelHistory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Synchronization/SynchronizationStatistics.cpp
@@ -3869,7 +3870,7 @@ if(BUILD_TESTING)
     target_link_libraries(agc_driver_profile_lines_tests PRIVATE libSceAgcDriver shader_recompiler_agc_driver libc)
     set_target_properties(agc_driver_profile_lines_tests PROPERTIES CXX_EXTENSIONS OFF)
     configure_windows_unwind(agc_driver_profile_lines_tests)
-    foreach(mode IN ITEMS command_mix census windows)
+    foreach(mode IN ITEMS command_mix census windows bindless_codec)
         add_test(NAME agc_driver_profile_lines_${mode} COMMAND agc_driver_profile_lines_tests ${mode})
         set_tests_properties(agc_driver_profile_lines_${mode} PROPERTIES TIMEOUT 30)
         if(WIN32)
