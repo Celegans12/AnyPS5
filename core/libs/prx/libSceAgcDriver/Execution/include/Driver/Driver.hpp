@@ -91,6 +91,13 @@ public:
     std::vector<std::uint64_t> BindlessRegistrationWords();
     void PrimeBindlessTables(std::span<const std::uint64_t> words);
     bool WaitIdleFor(std::chrono::milliseconds timeout);
+    // Waits until the submissions accepted so far completed, or until the ones still unfinished
+    // are all parked on waits (no worker running, no completions pending, the serials unmoved for
+    // 5 ms) and the device holds no recorded work: the frame capture's delta reads, whose next call
+    // may be what releases the waits. WaitReleases counts parked waits that ended.
+    enum class CaptureSettle { Completed, Blocked, TimedOut };
+    CaptureSettle WaitCompletedOrBlockedFor(std::chrono::milliseconds timeout);
+    std::uint64_t WaitReleases() const { return waitReleases.load(std::memory_order_acquire); }
     void RegisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOutput>& output);
     void UnregisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOutput>& output);
     void AttachWindow(const PresentationWindow& window);
@@ -521,6 +528,8 @@ private:
     std::atomic<std::uint32_t> orderHolders{0};
     std::atomic<std::uint32_t> runningWorkers{0};
     std::atomic<std::uint64_t> idleEpoch{0};
+    std::atomic<std::uint64_t> waitReleases{0};
+    bool blockedOnWaits();
     std::atomic<std::uint64_t> queue0Awaited{0};
     std::atomic<std::uint32_t> flipsAhead{0};
     std::atomic<std::uint32_t> flipHolders{0};
