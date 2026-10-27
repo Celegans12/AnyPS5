@@ -349,7 +349,8 @@ std::vector<std::uint32_t> Driver::SaveQueueStates() {
         put64(words, state.indexBase);
         put64(words, state.drawIndirectBase);
         put64(words, state.dispatchIndirectBase);
-        words.push_back(state.indexBufferSize);
+        // Captures store one word, 0 for a size never written (a written zero fails at the draw either way).
+        words.push_back(state.indexBufferSize.value_or(0));
         words.push_back(state.indexType);
         words.push_back(state.instanceCount);
         put64(words, state.predication.address);
@@ -374,7 +375,8 @@ void Driver::LoadQueueStates(std::span<const std::uint32_t> words) {
         state.indexBase = reader.Take64();
         state.drawIndirectBase = reader.Take64();
         state.dispatchIndirectBase = reader.Take64();
-        state.indexBufferSize = reader.Take();
+        if (const auto size = reader.Take(); size != 0) state.indexBufferSize = size;
+        else state.indexBufferSize.reset();
         state.indexType = reader.Take();
         state.instanceCount = reader.Take();
         state.predication.address = reader.Take64();
