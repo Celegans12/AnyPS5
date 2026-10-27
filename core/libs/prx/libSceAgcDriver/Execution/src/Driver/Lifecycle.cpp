@@ -19,6 +19,7 @@
 #include "ShaderDiskCache.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
+#include <algorithm>
 #include <atomic>
 #include <limits>
 #include <cstdint>
@@ -263,6 +264,63 @@ bool Driver::WaitIdleFor(std::chrono::milliseconds timeout) {
     rethrowFailure();
     checkStopping();
     return idle;
+}
+
+bool Driver::blockedOnWaits() {
+    if (!Quiescent()) return false;
+    return std::any_of(awaitedSlots.begin(), awaitedSlots.end(), [](const AwaitedSlot& slot) { return slot.address.load(std::memory_order_acquire) != 0; });
+}
+
+Driver::CaptureSettle Driver::WaitCompletedOrBlockedFor(std::chrono::milliseconds timeout) {
+    require(!onWorkerThread(), "worker cannot wait for itself");
+    constexpr auto Quiet = std::chrono::milliseconds(5);
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    std::uint64_t target = 0;
+    {
+        std::lock_guard lock(mutex);
+        target = accepted;
+    }
+    std::optional<std::chrono::steady_clock::time_point> blockedSince;
+    std::uint64_t lastCompleted = 0;
+    std::uint64_t releases = WaitReleases();
+    while (true) {
+        std::uint64_t seen = 0;
+        {
+            std::unique_lock lock(mutex);
+            ++idleWaiters;
+            const bool done = changed.wait_for(lock, std::chrono::milliseconds(1), [&] { return failure != nullptr || stopping || completed >= target; });
+            --idleWaiters;
+            rethrowFailure();
+            checkStopping();
+            if (done) return CaptureSettle::Completed;
+            seen = completed;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        const auto released = WaitReleases();
+        if (seen != lastCompleted || released != releases || !blockedOnWaits()) {
+            lastCompleted = seen;
+            releases = released;
+            blockedSince.reset();
+        } else if (!blockedSince) {
+            blockedSince = now;
+        } else if (now - *blockedSince >= Quiet) {
+            {
+                GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Hook);
+                std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                if (auto* recorder = Graphics::Recorder::Active()) recorder->Sync();
+                if (const auto localDevice = device.Load()) localDevice->WaitIdle();
+            }
+            const bool still = WaitReleases() == releases && blockedOnWaits();
+            {
+                std::lock_guard lock(mutex);
+                rethrowFailure();
+                if (completed >= target) return CaptureSettle::Completed;
+                if (completed == seen && still) return CaptureSettle::Blocked;
+            }
+            blockedSince.reset();
+        }
+        if (now >= deadline) return CaptureSettle::TimedOut;
+    }
 }
 
 std::vector<AwaitedWait> Driver::AwaitedWaits() {

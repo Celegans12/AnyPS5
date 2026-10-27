@@ -83,6 +83,9 @@ public:
     std::vector<std::uint32_t> SaveQueueStates();
     void LoadQueueStates(std::span<const std::uint32_t> words);
     bool WaitIdleFor(std::chrono::milliseconds timeout);
+    enum class CaptureSettle { Completed, Blocked, TimedOut };
+    CaptureSettle WaitCompletedOrBlockedFor(std::chrono::milliseconds timeout);
+    std::uint64_t WaitReleases() const { return waitReleases.load(std::memory_order_acquire); }
     void RegisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOutput>& output);
     void UnregisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOutput>& output);
     void AttachWindow(const PresentationWindow& window);
@@ -483,6 +486,8 @@ private:
     std::atomic<std::uint32_t> orderHolders{0};
     std::atomic<std::uint32_t> runningWorkers{0};
     std::atomic<std::uint64_t> idleEpoch{0};
+    std::atomic<std::uint64_t> waitReleases{0};
+    bool blockedOnWaits();
     std::atomic<std::uint64_t> queue0Awaited{0};
     std::atomic<std::uint32_t> flipsAhead{0};
     std::atomic<std::uint32_t> flipHolders{0};
