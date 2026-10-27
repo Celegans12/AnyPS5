@@ -431,7 +431,7 @@ void BdaResources::CheckFault(std::uint64_t shaderAddress) const {
                 message << std::dec << ")";
             }
             message << ": " << ShaderRecompiler::ImageTableAbi::PoisonReasonName(static_cast<ShaderRecompiler::ImageTableAbi::PoisonReason>(poison.reason));
-            if (report.bytes < stageTables->messages.size() && !stageTables->messages[report.bytes].empty()) message << ": " << stageTables->messages[report.bytes];
+            if (report.bytes < stageTables->messages.size() && stageTables->messages[report.bytes] != nullptr && !stageTables->messages[report.bytes]->empty()) message << ": " << *stageTables->messages[report.bytes];
         } else {
             message << ": poison entry " << report.bytes;
         }

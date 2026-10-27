@@ -187,6 +187,8 @@ APS5_NO_DRAW_AHEAD=1 APS5_DEFER_REFRESH_FLUSH=1 APS5_PIPELINE_DISPATCH=1
 
 ---
 
+**English** | [Português (Brasil)](docs/user/README.pt-BR.md) | [Español](docs/user/README.es.md) | [简体中文](docs/user/README.zh-CN.md) | [Русский](docs/user/README.ru.md)
+
 # About AnyPS5
 
 Tool for automatic executables porting to Linux and Windows.

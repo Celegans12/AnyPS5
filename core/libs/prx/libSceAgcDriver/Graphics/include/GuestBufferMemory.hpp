@@ -86,8 +86,8 @@ ImportProbe ProbeDmaBufImportWriteProtection(const Context& context);
 ImportWatch PrepareImportWatch(const Context& context);
 void SetImportWatch(const Context& context, ImportWatch watch);
 
-enum class ImportRequester : std::uint8_t { Map, Build, Access, Join, Segment };
-inline constexpr std::size_t ImportRequesterCount = 5;
+enum class ImportRequester : std::uint8_t { Map, Build, Access, Join, Segment, ColorTarget };
+inline constexpr std::size_t ImportRequesterCount = 6;
 
 struct HostImportRequesterCounts {
     std::uint64_t made = 0;
@@ -312,6 +312,24 @@ struct AddressCopy {
     bool overBudget = false;
 };
 std::string AddressCopyOverflow(std::vector<AddressCopy> copies, std::uint64_t limit);
+
+class AddressCopyCounters {
+public:
+    struct Totals {
+        std::uint64_t bytes = 0;
+        std::uint64_t largest = 0;
+    };
+
+    static AddressCopyCounters& ThisThread();
+    static Totals Fold();
+    static std::uint64_t Limit();
+
+    void Count(std::uint64_t copied);
+
+private:
+    alignas(64) std::atomic<std::uint64_t> bytes{0};
+    std::atomic<std::uint64_t> largest{0};
+};
 
 class GuestBufferMemory {
 public:

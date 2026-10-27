@@ -304,11 +304,33 @@ float APS5_VABI fmodf_nid_postfix(float x, float y) {
     errno = saved_errno;
     return result;
 }
+static float AsinfRational(float t) {
+    const float p = t * (1.6666586697e-01f + t * (-4.2743422091e-02f + t * -8.6563630030e-03f));
+    const float q = 1.0f + t * -7.0662963390e-01f;
+    return p / q;
+}
+
 float APS5_VABI asinf_nid_postfix(float x) {
-    const int saved_errno = errno;
-    const float result = std::asin(x);
-    errno = saved_errno;
-    return result;
+    const double pio2 = 1.570796326794896558e+00;
+    const std::int32_t hx = std::bit_cast<std::int32_t>(x);
+    const std::int32_t ix = hx & 0x7fffffff;
+    if (ix >= 0x3f800000) {
+        if (ix == 0x3f800000) {
+            return static_cast<float>(x * pio2);
+        }
+        errno = EDOM;
+        return (x - x) / (x - x);
+    }
+    if (ix < 0x3f000000) {
+        if (ix < 0x39800000) {
+            return x;
+        }
+        return x + x * AsinfRational(x * x);
+    }
+    const float t = (1.0f - std::fabs(x)) * 0.5f;
+    const double s = std::sqrt(static_cast<double>(t));
+    const float result = static_cast<float>(pio2 - 2.0 * (s + s * AsinfRational(t)));
+    return hx > 0 ? result : -result;
 }
 float APS5_VABI acosf_nid_postfix(float x) {
     if (std::isnan(x)) {
@@ -1273,6 +1295,7 @@ float APS5_VABI cbrtf_nid_postfix(float x) {
     return static_cast<float>(T);
 }
 float APS5_VABI remainderf_nid_postfix(float x, float y) { return std::remainder(x, y); }
+
 float APS5_VABI nextafterf_nid_postfix(float x, float y) {
     const std::uint32_t ux = std::bit_cast<std::uint32_t>(x);
     const std::uint32_t uy = std::bit_cast<std::uint32_t>(y);
@@ -1285,17 +1308,20 @@ float APS5_VABI nextafterf_nid_postfix(float x, float y) {
         return y;
     }
     if ((ux & 0x7fffffffu) == 0) {
-        return std::bit_cast<float>((uy & 0x80000000u) | 1u);
+        const volatile float smallest = std::bit_cast<float>((uy & 0x80000000u) | 1u);
+        volatile float product = smallest * smallest;
+        return product == smallest ? product : smallest;
     }
-    const bool towardZero = (x > 0.0f) == (x > y);
+    const bool towardZero = ((ux ^ uy) & 0x80000000u) != 0 || ux > uy;
     const std::uint32_t next = towardZero ? ux - 1 : ux + 1;
     const std::uint32_t exponent = next & 0x7f800000u;
     if (exponent == 0x7f800000u) {
-        errno = ERANGE;
+        _Feraise_nid_postfix(0x08);
         return x + x;
     }
     if (exponent == 0) {
-        errno = ERANGE;
+        volatile float product = x * x;
+        if (product != x) _Feraise_nid_postfix(0x10);
     }
     return std::bit_cast<float>(next);
 }
@@ -1311,17 +1337,20 @@ double APS5_VABI nextafter_nid_postfix(double x, double y) {
         return y;
     }
     if ((ux & 0x7fffffffffffffffull) == 0) {
-        return std::bit_cast<double>((uy & 0x8000000000000000ull) | 1u);
+        const volatile double smallest = std::bit_cast<double>((uy & 0x8000000000000000ull) | 1u);
+        volatile double product = smallest * smallest;
+        return product == smallest ? product : smallest;
     }
-    const bool towardZero = (x > 0.0) == (x > y);
+    const bool towardZero = ((ux ^ uy) & 0x8000000000000000ull) != 0 || ux > uy;
     const std::uint64_t next = towardZero ? ux - 1 : ux + 1;
     const std::uint64_t exponent = next & 0x7ff0000000000000ull;
     if (exponent == 0x7ff0000000000000ull) {
-        errno = ERANGE;
+        _Feraise_nid_postfix(0x08);
         return x + x;
     }
     if (exponent == 0) {
-        errno = ERANGE;
+        volatile double product = x * x;
+        if (product != x) _Feraise_nid_postfix(0x10);
     }
     return std::bit_cast<double>(next);
 }
@@ -1618,6 +1647,8 @@ int APS5_VABI feholdexcept_nid_postfix(GuestFloatingPointEnvironment* environmen
     _mm_setcsr((csr & ~0x3fu) | 0x1f80u);
     return 0;
 }
+
+const GuestFloatingPointEnvironment __fe_dfl_env_nid_postfix {0xffff037fu, 0xffff0000u, 0xffffffffu, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff}, 0x9fc0u};
 
 union SonyDconst {
     unsigned short _Word[8];

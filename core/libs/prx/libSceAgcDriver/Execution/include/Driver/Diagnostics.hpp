@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -26,6 +27,7 @@ public:
 bool SkipRefusedDraws();
 
 void ReportRefusedDraw(const RefusedDraw& refused);
+std::optional<std::size_t> RefusedShaderCount();
 
 void require(bool condition, const char* reason);
 

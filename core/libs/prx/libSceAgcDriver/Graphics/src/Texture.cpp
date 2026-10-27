@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/SlimMutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/general/AtomicSharedPtr.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -1382,7 +1383,7 @@ Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& 
     }
 }
 
-Texture::Texture(const Context& context, VkImage depthImage, VkFormat depthFormat, VkImageAspectFlags aspect, VkComponentMapping components, VkImageViewType viewType, std::uint32_t baseLayer, std::shared_ptr<OwnedImage> owner, VkImageUsageFlags usage) : context(context), owned(std::move(owner)) {
+Texture::Texture(const Context& context, VkImage depthImage, VkFormat depthFormat, VkImageAspectFlags aspect, VkComponentMapping components, VkImageViewType viewType, std::uint32_t baseLayer, std::shared_ptr<OwnedImage> owner, VkImageUsageFlags usage, std::uint32_t layerCount) : context(context), owned(std::move(owner)) {
     Require(owned == nullptr || (owned->image == depthImage && owned->context.device == context.device), "a depth sampled view must retain its own device and image");
     layout = VK_IMAGE_LAYOUT_GENERAL;
     VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
@@ -1394,7 +1395,7 @@ Texture::Texture(const Context& context, VkImage depthImage, VkFormat depthForma
     viewInfo.format = depthFormat;
     viewFormat = depthFormat;
     viewInfo.components = components;
-    viewInfo.subresourceRange = {aspect, 0, 1, baseLayer, viewType == VK_IMAGE_VIEW_TYPE_2D ? 1u : VK_REMAINING_ARRAY_LAYERS};
+    viewInfo.subresourceRange = {aspect, 0, 1, baseLayer, viewType == VK_IMAGE_VIEW_TYPE_2D ? 1u : layerCount};
     Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &view), "vkCreateImageView depth plane");
     viewRange = {viewInfo.viewType, viewInfo.subresourceRange.levelCount, viewInfo.subresourceRange.layerCount};
     if (viewType != VK_IMAGE_VIEW_TYPE_2D_ARRAY) return;
@@ -1866,7 +1867,7 @@ private:
     std::uint64_t version = 0;
     std::uint64_t indexed = ~std::uint64_t{0};
     std::atomic<std::uint64_t> changes{0};
-    std::atomic<std::shared_ptr<const Snapshot>> published;
+    AtomicSharedPtr<const Snapshot> published;
 };
 
 // Storage images whose results have not reached guest memory yet.
@@ -3080,7 +3081,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         ~HeldBytes() { image.accountHeld(); }
     } held{*this};
     if (layers != nullptr && ((!blockUnits && trackedLayers != arrayLayers) || std::all_of(layers->begin(), layers->end(), [](bool selected) { return selected; }))) layers = nullptr;
-    const auto now = GuestMemory::CollectWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+    auto now = GuestMemory::CollectWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     const auto stampLayers = [&](bool selectedOnly) {
         const bool whole = !selectedOnly || layers == nullptr;
         if (guestBytes > GenerationBaselineBytes || !guestBytesSettled()) generationBaseline.clear();
@@ -3162,6 +3163,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         return;
     }
     if (const auto* import = uploadedKeys == DccKeys::Uncompressed ? HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) : nullptr) {
+        now = GuestMemory::CollectWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
         if (GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) {
             layerOriginal.assign(trackedLayers, false);
             original = {};
@@ -5090,6 +5092,8 @@ void StorageTexture::FlushDumpSelected(const char* reason) {
 }
 
 void StorageTexture::FlushAllPending(const char* reason) {
+    std::optional<PublishOnCpuScope> onCpu;
+    if (reason != nullptr && std::strcmp(reason, "idle") == 0) onCpu.emplace();
     static_cast<void>(FlushPending(0, std::numeric_limits<std::size_t>::max(), nullptr, reason));
 }
 
@@ -6040,6 +6044,11 @@ bool StorageTexture::SameSurfaceShape(const StorageTexture& other) const {
     return guestBytes == other.guestBytes && mine.width == theirs.width && mine.height == theirs.height && mine.depthOrLastArray == theirs.depthOrLastArray && mine.baseArray == theirs.baseArray && mine.mipCount == theirs.mipCount && mine.tileMode == theirs.tileMode && mine.dimension == theirs.dimension && mine.format == theirs.format && storageFormat == other.storageFormat && geometry.imageLayers == other.geometry.imageLayers && geometry.imageDepth == other.geometry.imageDepth;
 }
 
+bool StorageTexture::ImageCoversGuestBytes() const {
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> whole{{{0, guestBytes}}};
+    return uncoveredBytes(whole).empty();
+}
+
 const char* StorageTexture::CopyRefusal(const Context& context, const StorageTexture* destination, const StorageTexture& source, std::uint64_t address) {
     if (destination != nullptr && (destination == &source || !destination->SameSurfaceShape(source))) return "shape";
     if (source.geometry.imageLevels < source.descriptor.mipCount || (destination != nullptr && destination->geometry.imageLevels < destination->descriptor.mipCount)) return "levels past the image";
@@ -6670,6 +6679,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     }
     if (const auto* import = HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) segments.push_back({import, descriptor.baseAddress, descriptor.baseAddress + guestBytes});
     else segments = importSegments();
+    if (flushReason != nullptr && std::strcmp(flushReason, "idle") == 0 && GuestMemory::Watched(firstStored, static_cast<std::size_t>(lastStored - firstStored))) segments.clear();
     if (!segments.empty()) {
         Require(!unsavedOutsideWatch, "storing storage image results pending over memory outside the write watch without the guest bytes saved before them is not implemented");
         // Outside the write watch the stored bytes are what the next store compares with.

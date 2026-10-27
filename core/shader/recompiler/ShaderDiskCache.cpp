@@ -150,7 +150,7 @@ static_assert(fieldCount<StageInput>() == 5, "StageInput changed: update the inf
 static_assert(fieldCount<StageOutput>() == 4, "StageOutput changed: update the info encoder");
 static_assert(fieldCount<IrResourcePlan>() == 24, "IrResourcePlan changed: update EncodePlan and DecodePlan");
 static_assert(fieldCount<GuestRegister>() == 2, "GuestRegister changed: update the plan value encoder");
-static_assert(fieldCount<MemoryInfo>() == 31, "MemoryInfo changed: update the plan encoder");
+static_assert(fieldCount<MemoryInfo>() == 32, "MemoryInfo changed: update the plan encoder");
 static_assert(fieldCount<DescriptorSource>() == 3, "DescriptorSource changed: update the plan encoder");
 static_assert(fieldCount<TableColumn>() == 19, "TableColumn changed: update the plan encoder");
 static_assert(fieldCount<KeyDomain>() == 4, "KeyDomain changed: update the plan encoder");
@@ -517,6 +517,7 @@ void encodeArtifact(Writer& writer, const CompiledShaderArtifact& result) {
     writer.Values(std::span<const std::uint32_t>(result.spirv.Words()));
     writer.Value(result.bdaAbiVersion);
     writer.Value(result.windowLaneGuards);
+    writer.Value(result.descriptorFaults);
     writer.Value(result.memoryOffsetDword);
     writer.Value(result.shaderDataDwords);
     writer.Value(result.imageMetadataDword);
@@ -581,6 +582,7 @@ void decodeArtifact(Reader& reader, CompiledShaderArtifact& result) {
     result.spirv = reader.Spirv();
     reader.Value(result.bdaAbiVersion);
     reader.Value(result.windowLaneGuards);
+    reader.Value(result.descriptorFaults);
     reader.Value(result.memoryOffsetDword);
     reader.Value(result.shaderDataDwords);
     reader.Value(result.imageMetadataDword);
@@ -834,6 +836,7 @@ void encodeShaderInfo(Writer& writer, const ShaderInfo& info) {
         out.Value(image.foldTexelOffsetsOnly);
         out.Value(image.convertedSamples);
         out.Value(image.remappedDepth1D);
+        out.Value(image.optionalDescriptor);
         out.Value(image.byElements);
         out.Value(image.byComponents);
         out.Value(image.packedFormat);
@@ -943,6 +946,7 @@ void decodeShaderInfo(Reader& reader, ShaderInfo& info) {
         in.Value(image.foldTexelOffsetsOnly);
         in.Value(image.convertedSamples);
         in.Value(image.remappedDepth1D);
+        in.Value(image.optionalDescriptor);
         in.Value(image.byElements);
         in.Value(image.byComponents);
         in.Value(image.packedFormat);
@@ -1071,6 +1075,7 @@ void encodeMemoryInfo(Writer& out, const MemoryInfo& memory) {
     out.Value(memory.gpuDescriptor);
     out.Value(memory.flushDenormals);
     out.Value(memory.flushDenormalResults);
+    out.Value(memory.descriptorWebArm);
 }
 
 void decodeMemoryInfo(Reader& in, MemoryInfo& memory) {
@@ -1105,6 +1110,7 @@ void decodeMemoryInfo(Reader& in, MemoryInfo& memory) {
     in.Value(memory.gpuDescriptor);
     in.Value(memory.flushDenormals);
     in.Value(memory.flushDenormalResults);
+    in.Value(memory.descriptorWebArm);
 }
 
 bool encodePlan(Writer& writer, const IrResourcePlan& plan) {

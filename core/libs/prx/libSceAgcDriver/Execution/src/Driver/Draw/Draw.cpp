@@ -19,7 +19,7 @@
 #include <bit>
 #include <cstdlib>
 #include <algorithm>
-#include <cstdlib>
+#include <map>
 #include <cstdio>
 #include <cstring>
 #include <atomic>
@@ -911,6 +911,20 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         }
     };
     if (graphics.rectList) buildRectList();
+    if (graphics.stages.tessellationGeometry) {
+        static std::mutex captureMutex;
+        static std::map<std::pair<std::uint32_t, std::uint32_t>, ShaderRecompiler::RecompileResult> captureShaders;
+        const auto& geometry = *graphics.stages.tessellationGeometry;
+        {
+            std::lock_guard captureLock(captureMutex);
+            auto found = captureShaders.find({geometry.esgsItemSize, geometry.primitivesPerGroup});
+            if (found == captureShaders.end()) found = captureShaders.emplace(std::pair{geometry.esgsItemSize, geometry.primitivesPerGroup}, ShaderRecompiler::BuildTessellationCaptureGeometryShader(geometry, localDevice->Target(), localDevice->GeometryLimits())).first;
+            results.push_back(found->second);
+        }
+        const auto evaluation = std::ranges::find_if(stages, [](const Graphics::CompiledShader& stage) { return stage.stage == Stage::TessellationEvaluation; });
+        require(evaluation != stages.end(), "tessellation followed by a geometry stage has no domain program");
+        stages.insert(std::next(evaluation), Graphics::CompiledShader{Stage::Geometry, &results.back(), 0});
+    }
     if (!programs.empty() && programResults.back() != nullptr && programResults.back()->barycentricEmulation.active && graphics.stages.path == Graphics::ShaderPath::Geometry) {
         require(localDevice->Target().mesh.has_value(), "a pixel shader on the mesh path reads barycentrics, and this device has neither VK_KHR_fragment_shader_barycentric nor mesh shaders (VK_EXT_mesh_shader), so they cannot be provided or emulated");
         require(!graphics.rectList && graphics.stages.mesh && programs.size() == 2 && programResults[0] != nullptr && programResults[1] != nullptr && stages.size() == 2, "a pixel shader that reads barycentrics needs exactly one mesh program before it to emulate them");
@@ -1185,7 +1199,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
 
     std::vector<std::shared_ptr<DispatchVariant>> recipeStages;
-    if (registerKey && !drawParameters.indirect && !patchedStages && Graphics::DrawRecipes()) {
+    if (registerKey && !drawParameters.indirect && !patchedStages && !graphics.stages.tessellationGeometry && Graphics::DrawRecipes()) {
         recipeStages.reserve(programs.size());
         for (std::size_t i = 0; i < programs.size(); ++i) recipeStages.push_back(drawHit ? matched[i] : fresh[i]);
         if (std::all_of(recipeStages.begin(), recipeStages.end(), [](const std::shared_ptr<DispatchVariant>& variant) { return variant == nullptr; })) recipeStages.clear();
@@ -1203,6 +1217,15 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
     timing.Mark("recipe_and_rejection");
     const auto* ahead = drawHit && !patchedStages && userPatches.empty() && !drawParameters.indirect && entry != nullptr && entry->prepared != nullptr ? entry->prepared->For(matched, stages.size()) : nullptr;
+    if (static const bool nameVariants = std::getenv("APS5_PROFILE_GPU_DRAWS") != nullptr; nameVariants && stages.size() == programs.size()) {
+        static std::mutex namedMutex;
+        static std::set<std::uint64_t> named;
+        std::lock_guard namedLock(namedMutex);
+        for (std::size_t i = 0; i < stages.size(); ++i) {
+            if (stages[i].program == nullptr || !named.insert(stages[i].program->variantId).second) continue;
+            std::fprintf(stderr, "[drawvariant] 0x%llx stage %d code 0x%llx\n", static_cast<unsigned long long>(stages[i].program->variantId), static_cast<int>(stages[i].stage), static_cast<unsigned long long>(programs[i].binary.codeAddress));
+        }
+    }
     if (pipelined && (!drawParameters.indirect || pipelineIndirect) && deferredLabels().labels.empty()) {
         phaseTiming.Phase(DrawRowVectors);
         auto writes = drawWriteRanges(graphics, stages);

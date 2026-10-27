@@ -566,6 +566,27 @@ int APS5_VABI chroot_nid_postfix(const char* path) {
     throw std::runtime_error(std::string("chroot: changing the root directory to ") + path + " is not supported, the guest path resolver keeps a fixed root");
 }
 
+int APS5_VABI kldfind_nid_postfix(const char* file) {
+    std::string copy;
+    if (const int error = CopyPath(file, copy)) return static_cast<int>(Fail(error));
+    return static_cast<int>(Fail(GuestEnoent));
+}
+
+int APS5_VABI kldfirstmod_nid_postfix(int fileid) {
+    return static_cast<int>(Fail(GuestEnoent));
+}
+
+int APS5_VABI kldnext_nid_postfix(int fileid) {
+    if (fileid < 0) return static_cast<int>(Fail(GuestEnoent));
+    if (fileid == 0) return 0;
+    return static_cast<int>(Fail(GuestEnoent));
+}
+
+int APS5_VABI kldunload_nid_postfix(int fileid) {
+    (void)fileid;
+    return static_cast<int>(Fail(GuestEperm));
+}
+
 int APS5_VABI symlink_nid_postfix(const char* target, const char* created) {
     std::string targetCopy, createdCopy;
     if (const int error = CopyPath(target, targetCopy)) return static_cast<int>(Fail(error));
@@ -722,11 +743,7 @@ int APS5_VABI fchmodat_nid_postfix(int fd, const char* path, int mode, int flag)
         return 0;
     }
     }
-#ifdef _WIN32
-    if (::_wchmod(native.wstring().c_str(), mode & 07777) != 0) return static_cast<int>(Fail(errno == ENOENT && HasNonDirectoryPrefix(native) ? GuestEnotdir : GuestFileError(errno)));
-#else
-    if (::chmod(native.c_str(), static_cast<mode_t>(mode & 07777)) != 0) return static_cast<int>(Fail(errno == ENOENT && HasNonDirectoryPrefix(native) ? GuestEnotdir : GuestFileError(errno)));
-#endif
+    if (ChmodNative_nid_no_patch(native, mode & 07777) != 0) return static_cast<int>(Fail(errno == ENOENT && HasNonDirectoryPrefix(native) ? GuestEnotdir : GuestFileError(errno)));
     RecordWrittenPath_nid_no_patch(native);
     return 0;
 }
@@ -823,6 +840,13 @@ int APS5_VABI unlinkat_nid_postfix(int fd, const char* path, int flag) {
     if (IsDotOrDotDot(path)) return static_cast<int>(Fail(GuestEinval));
     if (flag & GuestAtRemovedir) {
         if (std::filesystem::is_symlink(symlinkStatus)) return static_cast<int>(Fail(GuestEnotdir));
+#ifdef _WIN32
+        const DWORD attributes = GetFileAttributesW(native.c_str());
+        if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 && (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+            std::string junctionTarget;
+            if (File::WindowsSymbolicLink::ReadJunction(native, junctionTarget, "unlinkat")) return static_cast<int>(Fail(GuestEnotdir));
+        }
+#endif
         if (!std::filesystem::is_directory(symlinkStatus)) {
             if (HasNonDirectoryPrefix(native) || std::filesystem::exists(symlinkStatus))
                 return static_cast<int>(Fail(GuestEnotdir));
@@ -852,6 +876,17 @@ int APS5_VABI unlinkat_nid_postfix(int fd, const char* path, int flag) {
                 return static_cast<int>(Fail(GuestEnotdir));
             return static_cast<int>(Fail(GuestEnoent));
         }
+#ifdef _WIN32
+        const DWORD attributes = GetFileAttributesW(native.c_str());
+        if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 && (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+            std::string junctionTarget;
+            if (File::WindowsSymbolicLink::ReadJunction(native, junctionTarget, "unlinkat")) {
+                if (RemoveDirectoryW(native.c_str()) == 0) return static_cast<int>(Fail(GuestEperm));
+                RecordWrittenPath_nid_no_patch(native);
+                return 0;
+            }
+        }
+#endif
         if (std::filesystem::is_directory(symlinkStatus)) return static_cast<int>(Fail(GuestEperm));
 #ifdef _WIN32
         struct _stat64 status{};

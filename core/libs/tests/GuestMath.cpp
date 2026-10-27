@@ -52,6 +52,7 @@ extern DinkumwareFloatCharacteristics _Dbl_nid_postfix;
 extern DinkumwareFloatCharacteristics _Ldbl_nid_postfix;
 }
 static void Require(bool value) { if (!value) std::abort(); }
+constexpr int StandardExceptions = FE_INVALID | FE_DIVBYZERO | FE_OVERFLOW | FE_UNDERFLOW | FE_INEXACT;
 
 static void CheckSquareRoot() {
     Require(sqrt_nid_postfix(4.) == 2. && sqrtf_nid_postfix(6.25f) == 2.5f);
@@ -319,8 +320,11 @@ static void CheckNanConversions() {
 static void CheckFloatUnderflowErrno() {
     char* end = nullptr;
     errno = 7;
-    Require(strtod_nid_postfix("1e-310", &end) == 1e-310 && errno == 7);
-    Require(strtod_nid_postfix("-4.9406564584124654e-324", &end) == -0x1p-1074 && errno == 7);
+    Require(strtod_nid_postfix("1e-310", &end) == 1e-310 && errno == ERANGE);
+    Require(strtod_nid_postfix("-4.9406564584124654e-324", &end) == -0x1p-1074 && errno == ERANGE);
+    errno = 7;
+    Require(strtof_nid_postfix("1e-40", &end) == 1e-40f && errno == ERANGE);
+    errno = 7;
     Require(strtold_nid_postfix("1e-4940", &end) == 1e-4940L && errno == 7);
     Require(strtod_nid_postfix("1e-330", &end) == 0.0 && errno == ERANGE);
     errno = 0;
@@ -382,9 +386,29 @@ static void CheckHypotSpecialValue() {
 }
 
 static void CheckAsinfErrno() {
-    errno = 0;
-    (void)asinf_nid_postfix(2.0f);
-    Require(errno == 0);
+    for (const float input : {2.0f, -2.0f, std::numeric_limits<float>::infinity(), -std::numeric_limits<float>::infinity(), std::numeric_limits<float>::quiet_NaN()}) {
+        errno = 0;
+        (void)asinf_nid_postfix(input);
+        Require(errno == EDOM);
+    }
+    for (const float input : {1.0f, -1.0f, 0.5f, 0.0f}) {
+        errno = 1234;
+        (void)asinf_nid_postfix(input);
+        Require(errno == 1234);
+    }
+}
+
+static void CheckAsinfConsoleBits() {
+    constexpr std::uint32_t cases[][2] = {
+        {0x3f000000u, 0x3f060a92u}, {0x3f800000u, 0x3fc90fdbu}, {0xbf800000u, 0xbfc90fdbu},
+        {0x3b3a82dau, 0x3b3a82eau}, {0xbb753808u, 0xbb75382du}, {0x3f0008fbu, 0x3f0614f1u},
+        {0xbf001216u, 0xbf061f75u}, {0x3f7fffffu, 0x3fc9048au}, {0x39000000u, 0x39000000u},
+        {0x80000000u, 0x80000000u}, {0x00000001u, 0x00000001u}, {0x40000000u, 0xffc00000u},
+        {0x7fc00001u, 0x7fc00001u},
+    };
+    for (const auto& [input, expected] : cases) {
+        Require(std::bit_cast<std::uint32_t>(asinf_nid_postfix(std::bit_cast<float>(input))) == expected);
+    }
 }
 
 static void CheckExp2Errno() {
@@ -669,6 +693,69 @@ static void CheckRoundingNaNConsoleBits() {
             Require(std::bit_cast<std::uint32_t>(function(std::bit_cast<float>(input))) == expected);
         }
     }
+}
+
+template<typename T, typename UInt>
+static void CheckNextafterEnvironment(T (APS5_VABI *next)(T, T), UInt sign, UInt one, UInt minimum, UInt maximum, UInt infinity) {
+    const RestoreFloatingPointState saved;
+    const auto savedControl = _mm_getcsr();
+    const struct {
+        UInt x, y, normalResult, dazResult;
+        unsigned normalFlags, dazFlags;
+        int normalError, dazError;
+    } cases[] = {
+        {0, one, 1, 0, 0x32, 0, 97, 97},
+        {sign, sign | one, sign | 1, 0, 0x32, 0, 97, 97},
+        {1, 0, 0, 0, 0x32, 0, ERANGE, 97},
+        {1, one, 2, 2, 0x32, 0, ERANGE, 97},
+        {sign | 1, sign | one, sign | 2, sign | 2, 0x32, 0, ERANGE, 97},
+        {minimum, 0, minimum - 1, minimum - 1, 0x30, 0x30, ERANGE, ERANGE},
+        {maximum, infinity, infinity, infinity, 0x28, 0x28, ERANGE, ERANGE},
+        {1, 1, 1, 1, 0x02, 0, 97, 97},
+        {one, one + 1, one + 1, one + 1, 0, 0, 97, 97},
+    };
+    for (unsigned denorm = 0; denorm != 4; ++denorm) {
+        const unsigned control = 0x1f80u | ((denorm & 1u) ? 0x40u : 0u) | ((denorm & 2u) ? 0x8000u : 0u);
+        const bool daz = (denorm & 1u) != 0;
+        for (const auto& item : cases) {
+            Require(std::fesetround(FE_TONEAREST) == 0);
+            Require(std::feclearexcept(FE_ALL_EXCEPT) == 0);
+            errno = 97;
+            _mm_setcsr(control);
+            const auto result = std::bit_cast<UInt>(next(std::bit_cast<T>(item.x), std::bit_cast<T>(item.y)));
+            const auto flags = _mm_getcsr() & 0x3fu;
+            const int exceptions = std::fetestexcept(FE_ALL_EXCEPT);
+            const int error = errno;
+            const auto expectedFlags = daz ? item.dazFlags : item.normalFlags;
+            Require(result == (daz ? item.dazResult : item.normalResult));
+            Require(flags == expectedFlags);
+            const int expectedExceptions = ((expectedFlags & 0x01u) ? FE_INVALID : 0) |
+                                           ((expectedFlags & 0x04u) ? FE_DIVBYZERO : 0) |
+                                           ((expectedFlags & 0x08u) ? FE_OVERFLOW : 0) |
+                                           ((expectedFlags & 0x10u) ? FE_UNDERFLOW : 0) |
+                                           ((expectedFlags & 0x20u) ? FE_INEXACT : 0);
+            Require(exceptions == expectedExceptions);
+            Require(error == (daz ? item.dazError : item.normalError));
+        }
+    }
+    constexpr int rounding[] = {FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO};
+    for (const int mode : rounding) {
+        Require(std::fesetround(mode) == 0);
+        const unsigned control = (_mm_getcsr() & 0x6000u) | 0x1f80u;
+        errno = 97;
+        Require(std::feclearexcept(FE_ALL_EXCEPT) == 0);
+        _mm_setcsr(control);
+        Require(std::bit_cast<UInt>(next(std::bit_cast<T>(maximum), std::bit_cast<T>(infinity))) == (mode == FE_UPWARD ? infinity : maximum));
+        Require((_mm_getcsr() & 0x3fu) == 0x28u);
+        Require(errno == ERANGE);
+        errno = 97;
+        Require(std::feclearexcept(FE_ALL_EXCEPT) == 0);
+        _mm_setcsr(control);
+        Require(std::bit_cast<UInt>(next(std::bit_cast<T>(UInt{1}), std::bit_cast<T>(one))) == 2);
+        Require((_mm_getcsr() & 0x3fu) == 0x32u);
+        Require(errno == (mode == FE_UPWARD ? 97 : ERANGE));
+    }
+    _mm_setcsr(savedControl);
 }
 
 static void CheckAsinl() {
@@ -1188,7 +1275,7 @@ static void CheckScaledHyperbolic() {
             if ((exact ? actualBits != expectedBits : !std::isfinite(result) || distance > 2) ||
                 (std::isfinite(expected) && (std::fetestexcept(FE_OVERFLOW | FE_INVALID) != 0 || errno != 12345))) {
                 std::fprintf(stderr, "%s(%a, %a): got %08x, expected %08x, errno %d, flags %x\n",
-                    name, static_cast<double>(x), static_cast<double>(y), actualBits, expectedBits, errno, std::fetestexcept(FE_ALL_EXCEPT));
+                    name, static_cast<double>(x), static_cast<double>(y), actualBits, expectedBits, errno, std::fetestexcept(StandardExceptions));
                 std::abort();
             }
             ++checks;
@@ -1224,7 +1311,7 @@ static void CheckScaledHyperbolic() {
             std::feraiseexcept(FE_DIVBYZERO);
             errno = 12345;
             const float result = function(x, y);
-            const int raised = std::fetestexcept(FE_ALL_EXCEPT);
+            const int raised = std::fetestexcept(StandardExceptions);
             if (std::bit_cast<std::uint32_t>(result) != expectedBits || errno != error || raised != (FE_DIVBYZERO | flags)) {
                 std::fprintf(stderr, "%s special (%a, %a): got %08x, expected %08x, errno %d, flags %x\n",
                     name, static_cast<double>(x), static_cast<double>(y), std::bit_cast<std::uint32_t>(result), expectedBits, errno, raised);
@@ -1854,6 +1941,8 @@ int main() {
     CheckNextafterConsoleBits();
     CheckTanhConsoleBits();
     CheckRoundingNaNConsoleBits();
+    CheckNextafterEnvironment(nextafterf_nid_postfix, 0x80000000u, 0x3f800000u, 0x00800000u, 0x7f7fffffu, 0x7f800000u);
+    CheckNextafterEnvironment(nextafter_nid_postfix, std::uint64_t{0x8000000000000000ull}, std::uint64_t{0x3ff0000000000000ull}, std::uint64_t{0x0010000000000000ull}, std::uint64_t{0x7fefffffffffffffull}, std::uint64_t{0x7ff0000000000000ull});
     CheckAsinl();
     Require(scalbn_nid_postfix(0.75, -2) == 0.1875);
     Require(scalbnf_nid_postfix(0.75f, 4) == 12.f);
@@ -1931,6 +2020,7 @@ int main() {
     CheckAsin();
     const auto quotient = div_nid_postfix(7, 2);
     CheckAsinfErrno();
+    CheckAsinfConsoleBits();
     Require(quotient.quot == 3 && quotient.rem == 1);
     const auto negativeNumerator = div_nid_postfix(-7, 2);
     Require(negativeNumerator.quot == -3 && negativeNumerator.rem == -1);

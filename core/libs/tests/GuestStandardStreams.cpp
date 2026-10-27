@@ -575,6 +575,10 @@ static int CheckClosedStandardOutput() {
     Require(printf_nid_postfix("%d", 1) == -1 && *__error_nid_postfix() == 9);
     Require(puts_nid_postfix("text") == -1 && *__error_nid_postfix() == 9);
     Require(PrintStandard("%d", 1) == -1 && *__error_nid_postfix() == 9);
+    *__error_nid_postfix() = 0;
+    Require(printf_s_nid_postfix("%d", 1) == -1 && *__error_nid_postfix() == 9);
+    *__error_nid_postfix() = 0;
+    Require(printf_s_nid_postfix("%p", nullptr) == -1 && *__error_nid_postfix() == 9);
     Require(fputs_nid_postfix("text", __stdoutp_nid_postfix) == -1 && *__error_nid_postfix() == 9);
     *__error_nid_postfix() = 0;
     Require(wprintf_nid_postfix(u"%d", 1) == -1 && *__error_nid_postfix() == 9);
@@ -582,6 +586,10 @@ static int CheckClosedStandardOutput() {
     Require(putwchar_nid_postfix(u't') == -1 && *__error_nid_postfix() == 9);
     Require(std::fputs("host output\n", stdout) >= 0 && std::fflush(stdout) == 0 && !std::ferror(stdout));
     Require(freopen_nid_postfix("missing-closed-stream-dir/err.log", "a", __stderrp_nid_postfix) == nullptr);
+    *__error_nid_postfix() = 2;
+    perror_nid_postfix("closed stderr");
+    perror_nid_postfix(nullptr);
+    Require(*__error_nid_postfix() == 2);
     Require(std::fputs("host error\n", stderr) >= 0 && std::fflush(stderr) == 0 && !std::ferror(stderr));
     return 0;
 }

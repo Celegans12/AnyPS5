@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include <algorithm>
+#include "prx/libSceAgcDriver/Execution/include/PerformanceOverlay.hpp"
 #include <cstdlib>
 
 namespace AgcDriver::DriverDetail {
@@ -75,6 +76,13 @@ Driver::DrawCacheOccupancy Driver::DrawCacheState() {
     std::lock_guard cacheLock(drawCacheMutex);
     std::lock_guard aheadLock(drawAheadMutex);
     return {drawOrder.size(), drawAheadEntries.size(), releasedDrawEntries.size()};
+}
+
+OverlayDriverCounters Driver::OverlayCounters() {
+    OverlayDriverCounters counters{flipsCounted.load(std::memory_order_relaxed), std::nullopt};
+    std::unique_lock cacheLock(drawCacheMutex, std::try_to_lock);
+    if (cacheLock.owns_lock()) counters.drawCache = OverlayHits{drawEntryCounters.lookups, drawEntryCounters.hits};
+    return counters;
 }
 
 std::string Driver::profileDrawCacheLines(const DrawEntryCounters& counters) {

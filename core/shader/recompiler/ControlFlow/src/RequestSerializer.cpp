@@ -352,7 +352,7 @@ void writePixelInfo(Writer& writer, const ShaderPixelStageInfo& info) {
     writer.WriteBool(info.stencilRefExportEnable);
     writer.WriteU8(static_cast<std::uint8_t>(info.rasterPrimitive));
     writer.WriteBool(info.layerExported);
-    writer.WriteBool(info.ditheredAlphaToCoverage);
+    writer.WriteU8(info.ditheredAlphaToCoverage ? (info.ditheredAlphaSamples == 2u ? 2u : 1u) : 0u);
     writer.WriteBool(info.frontFaceAllBits);
     writer.WriteU8(info.quadPixelMask);
     for (const std::uint16_t mask : info.quadSampleMask) writer.WriteU32(mask);
@@ -426,7 +426,12 @@ ShaderPixelStageInfo readPixelInfo(Reader& reader, std::uint32_t version, std::u
     if (version >= 17u) info.stencilRefExportEnable = reader.ReadBool();
     if (version >= 19u) info.rasterPrimitive = readRasterPrimitive(reader);
     if (version >= 23u) info.layerExported = reader.ReadBool();
-    if (version >= 25u) info.ditheredAlphaToCoverage = reader.ReadBool();
+    if (version >= 25u) {
+        const auto dither = reader.ReadU8();
+        if (dither > (version >= 47u ? 2u : 1u)) throw std::runtime_error("RequestSerializer: invalid alpha-to-coverage dither value");
+        info.ditheredAlphaToCoverage = dither != 0u;
+        info.ditheredAlphaSamples = dither == 2u ? 2u : 8u;
+    }
     if (version >= 27u) info.frontFaceAllBits = reader.ReadBool();
     if (version >= 28u) info.quadPixelMask = reader.ReadU8();
     if (version >= 29u) {

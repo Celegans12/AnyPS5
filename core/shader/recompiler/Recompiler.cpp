@@ -112,12 +112,26 @@ std::uint32_t HostSubgroupSize(const RecompileRequest& request) {
     return request.target.subgroupSize;
 }
 
-RdnaProgram DecodeStageProgram(ShaderStageKind stage, std::span<const std::uint32_t> code, bool mergedHull) {
+bool CapturesGeometryInput(const RecompileRequest& request) {
+    return request.shader.stage == ShaderStage::TessellationEvaluation && request.graphics && request.graphics->mesh;
+}
+
+RdnaProgram DecodeStageProgram(ShaderStageKind stage, std::span<const std::uint32_t> code, bool mergedHull, bool vertexHalf) {
     static constexpr std::array<std::uint32_t, 1> EndProgram{0xbf810000u};
     if (stage == ShaderStageKind::Local && mergedHull) {
         RdnaProgram program;
         program.code = EndProgram;
         program.instructions.push_back(DecodeRdnaInstruction(0u, EndProgram, 0u));
+        return program;
+    }
+    if (vertexHalf) {
+        auto program = RdnaInstructionDecoder{}.Decode(code);
+        const auto guard = std::ranges::find_if(program.instructions, [](const RdnaInstruction& instruction) { return instruction.op == RdnaOpcode::SCbranchExecz; });
+        if (guard == program.instructions.end()) throw std::runtime_error("the merged domain and geometry program has no s_cbranch_execz around its vertex half");
+        const auto end = std::ranges::find_if(program.instructions, [&](const RdnaInstruction& instruction) { return instruction.programCounter == guard->branchTarget; });
+        if (end == program.instructions.end() || end <= guard) throw std::runtime_error("the vertex half of the merged domain and geometry program ends outside the program");
+        *end = DecodeRdnaInstruction(end->programCounter, EndProgram, 0u);
+        program.instructions.erase(std::next(end), program.instructions.end());
         return program;
     }
     if (stage != ShaderStageKind::Local) return RdnaInstructionDecoder{}.Decode(code);
@@ -168,7 +182,7 @@ std::atomic<std::uint64_t> frontEndBuilds{0};
 struct PreparedControlFlow {
     PreparedControlFlow(const RecompileRequest& request, const SwappcInfo& swappcInfo)
         : stage(request.shader.stage), mergedHull(MergedHullStage(request)), fallbacks(swappcInfo.linkedCallFallbacks.begin(), swappcInfo.linkedCallFallbacks.end()), swappc(WithFallbacks(swappcInfo, fallbacks)), code(request.shader.code.begin(), request.shader.code.end()),
-          decoded(DecodeStageProgram(toShaderStageKind(request.shader.stage), code, mergedHull)), cfg(GraphBuilder{}.Build(decoded, &swappc)) {
+          vertexHalf(CapturesGeometryInput(request)), decoded(DecodeStageProgram(toShaderStageKind(request.shader.stage), code, mergedHull, vertexHalf)), cfg(GraphBuilder{}.Build(decoded, &swappc)) {
         Structurizer{}.Structurize(cfg);
     }
 
@@ -176,7 +190,7 @@ struct PreparedControlFlow {
     PreparedControlFlow& operator=(const PreparedControlFlow&) = delete;
 
     bool Matches(const RecompileRequest& request, const SwappcInfo& swappcInfo) const {
-        return stage == request.shader.stage && mergedHull == MergedHullStage(request) && swappc.fetchCallAllowed == swappcInfo.fetchCallAllowed &&
+        return stage == request.shader.stage && mergedHull == MergedHullStage(request) && vertexHalf == CapturesGeometryInput(request) && swappc.fetchCallAllowed == swappcInfo.fetchCallAllowed &&
                swappc.userDataBaseRegister == swappcInfo.userDataBaseRegister && swappc.userDataCount == swappcInfo.userDataCount && swappc.waveSize == swappcInfo.waveSize &&
                std::ranges::equal(fallbacks, swappcInfo.linkedCallFallbacks) && std::ranges::equal(code, request.shader.code);
     }
@@ -191,6 +205,7 @@ struct PreparedControlFlow {
     std::vector<std::uint32_t> fallbacks;
     SwappcInfo swappc;
     std::vector<std::uint32_t> code;
+    bool vertexHalf;
     RdnaProgram decoded;
     ControlFlowGraph cfg;
 };
@@ -656,6 +671,7 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program)
     targetOptions.fusedFma = request.target.fusedFma;
     targetOptions.singleWorkgroup = request.context.compute.has_value() && request.context.compute->singleWorkgroup;
     targetOptions.robustBufferAccess2 = request.target.robustBufferAccess2;
+    targetOptions.exactRobustLoads = request.target.exactRobustLoads;
     targetOptions.float32FlushToZero = HardwareFloat32Flush(request);
     targetOptions.float32DenormPreserve = request.target.float32DenormPreserve;
     targetOptions.fusedExactArithmetic = request.target.fusedExactArithmetic;
@@ -729,7 +745,8 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program)
     result.bdaAbiVersion = program.Info().usesDma || program.Info().usesFaultBuffer ? request.target.bdaAbiVersion : 0u;
     result.windowLaneGuards = 0;
     for (const auto& block : program.Blocks()) result.windowLaneGuards += static_cast<std::uint32_t>(std::ranges::count_if(block->Instructions(), [](const IrValue* value) { return value->Opcode() == IrOpcode::WindowLaneGuard; }));
-    result.memoryOffsetDword = bindings.layout.memoryOffsetDword;
+    result.descriptorFaults = 0;
+    for (const auto& block : program.Blocks()) result.descriptorFaults += static_cast<std::uint32_t>(std::ranges::count_if(block->Instructions(), [](const IrValue* value) { return value->Opcode() == IrOpcode::DescriptorFault; }));    result.memoryOffsetDword = bindings.layout.memoryOffsetDword;
     result.shaderDataDwords = bindings.layout.ShaderDataDwords();
     result.imageMetadataDword = bindings.layout.ImageMetadataDword();
     result.runtimeImageCount = bindings.layout.runtimeImageCount;
@@ -1387,6 +1404,8 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         .runtimeImageResources = artifact.runtimeImageResources,
         .registrationModule = artifact.registrationModule,
         .bdaAbiVersion = artifact.bdaAbiVersion,
+        .windowLaneGuards = artifact.windowLaneGuards,
+        .descriptorFaults = artifact.descriptorFaults,
         .runtimeAbiVersion = artifact.runtimeAbiVersion,
         .vertexInputs = artifact.vertexInputs,
         .vertexOffsetSgpr = artifact.vertexOffsetSgpr,
@@ -2094,8 +2113,10 @@ void materializeCapture(ResourceCapture& capture, const SrtRuntime& runtime, boo
     traced.readTrace = &capture.readTrace;
     ResourceMaterializer{}.Materialize(plan, traced, capture.snapshot, allowDirectImageRefusal);
     auto& other = capture.readTrace.otherReads;
-    std::sort(other.begin(), other.end());
-    other.erase(std::unique(other.begin(), other.end()), other.end());
+    if (other.size() > 1) {
+        std::sort(other.begin(), other.end());
+        other.erase(std::unique(other.begin(), other.end()), other.end());
+    }
 }
 
 }

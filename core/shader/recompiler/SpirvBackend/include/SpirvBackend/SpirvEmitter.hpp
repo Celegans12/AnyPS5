@@ -32,6 +32,7 @@ struct SpirvTargetOptions {
     // ShaderComputeStageInfo::singleWorkgroup of the request.
     bool singleWorkgroup = false;
     bool robustBufferAccess2 = false;
+    bool exactRobustLoads = false;
     bool float32FlushToZero = false;
     bool float32DenormPreserve = false;
     bool fusedExactArithmetic = false;

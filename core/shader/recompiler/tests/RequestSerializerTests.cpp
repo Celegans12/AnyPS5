@@ -841,5 +841,41 @@ int main() {
         Require(!serializer.Deserialize(EncodeBase64(bytes)).request.target.fusedExactArithmetic);
     }
 
+    Require(request.context.pixel.has_value());
+    request.context.pixel->ditheredAlphaToCoverage = true;
+    request.context.pixel->ditheredAlphaSamples = 2u;
+    auto twoSample = DecodeBase64(serializer.Serialize(request));
+    const auto twoReplay = serializer.Deserialize(EncodeBase64(twoSample));
+    Require(twoReplay.request.context.pixel->ditheredAlphaToCoverage && twoReplay.request.context.pixel->ditheredAlphaSamples == 2u);
+    request.context.pixel->ditheredAlphaSamples = 8u;
+    const auto eightSample = DecodeBase64(serializer.Serialize(request));
+    const auto eightReplay = serializer.Deserialize(EncodeBase64(eightSample));
+    Require(eightReplay.request.context.pixel->ditheredAlphaToCoverage && eightReplay.request.context.pixel->ditheredAlphaSamples == 8u);
+    Require(twoSample.size() == eightSample.size());
+    std::size_t ditherByte = 0u;
+    std::size_t differences = 0u;
+    for (std::size_t index = 0; index < twoSample.size(); ++index) {
+        if (twoSample[index] == eightSample[index]) continue;
+        ditherByte = index;
+        ++differences;
+    }
+    Require(differences == 1u && twoSample[ditherByte] == 2u && eightSample[ditherByte] == 1u);
+    const auto rejectsDither = [&](std::vector<std::uint8_t> bytes) {
+        try {
+            static_cast<void>(serializer.Deserialize(EncodeBase64(bytes)));
+        } catch (const std::runtime_error& error) {
+            return std::string_view(error.what()) == "RequestSerializer: invalid alpha-to-coverage dither value";
+        }
+        return false;
+    };
+    auto version46Dither = twoSample;
+    version46Dither[4] = 46u;
+    Require(rejectsDither(version46Dither));
+    version46Dither[ditherByte] = 1u;
+    Require(serializer.Deserialize(EncodeBase64(version46Dither)).request.context.pixel->ditheredAlphaSamples == 8u);
+    auto unknownDither = twoSample;
+    unknownDither[ditherByte] = 3u;
+    Require(rejectsDither(unknownDither));
+
     return 0;
 }
