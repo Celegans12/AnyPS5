@@ -392,6 +392,7 @@ void Driver::commitDmaStore(std::uint32_t queue, std::uint64_t address, std::spa
         stamp = ++eventSerial;
         reason = localDevice->WriteLabelOnGpu(address, bytes, stamp, queue);
     }
+    if (std::getenv("APS5_TRACE_TEXFILL") != nullptr) std::fprintf(stderr, "[texfill] dma store 0x%llx+%zu reason %d\n", (unsigned long long)address, bytes.size(), reason);
     if (reason == 0 || reason == 5 || reason == 6) {
         noteLabelStore(address, bytes, stamp, queue);
         if (reason == 0) ++storesOnGpu;

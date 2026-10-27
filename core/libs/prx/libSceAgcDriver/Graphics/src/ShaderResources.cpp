@@ -1432,6 +1432,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         Require(native != nullptr, "compressed FMASK sampling without a matching resident native target is not implemented");
         return native;
     }
+    if (std::getenv("APS5_TRACE_TEXFILL") != nullptr) { auto* r = Recorder::Active(); std::fprintf(stderr, "[texfill] lookup 0x%llx pendingWrite %d completionStores %llu bytes0 %08x\n", (unsigned long long)resource.baseAddress, r != nullptr && r->PendingWriteOverlaps(resource.baseAddress, 64) ? 1 : 0, (unsigned long long)Recorder::PendingCompletionStores(), *reinterpret_cast<const std::uint32_t*>(resource.baseAddress)); }
     CaptureTrace::Log("sampled-lookup address=%llx width=%u height=%u dcc=%llx", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, static_cast<unsigned long long>(resource.dccAddress));
     RequireNoMultisampleTarget(resource.baseAddress, guestBytes != 0 ? static_cast<std::size_t>(guestBytes) : 1u, "a texture read");
     if (auto* recorder = Recorder::Active(); recorder != nullptr) recorder->BoundKeptBytes();
@@ -1784,6 +1785,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             }
             // A slice copy the texture cannot take stores the slices instead: the snapshot is stale then.
             if ((sliceHit || (*keys != DccKeys::Uncompressed && *keys != DccKeys::ClearSingle) || unchanged() || kept() || equalsCommitted()) && (!sliceCopy || takeSlices(*it->texture))) {
+                if (std::getenv("APS5_TRACE_TEXFILL") != nullptr) std::fprintf(stderr, "[texfill] hit 0x%llx gen %llu entry gen %llu untracked %llu/%llu/%llu/%llu entry %llu/%llu/%llu/%llu committed %d keys %d\n", (unsigned long long)address, (unsigned long long)generation, (unsigned long long)it->generation, (unsigned long long)untracked[0], (unsigned long long)untracked[1], (unsigned long long)untracked[2], (unsigned long long)untracked[3], (unsigned long long)it->untracked[0], (unsigned long long)it->untracked[1], (unsigned long long)it->untracked[2], (unsigned long long)it->untracked[3], committed.has_value() ? 1 : 0, (int)*keys);
                 it->generation = snapshotGeneration;
                 it->committed = std::move(committed);
                 it->untracked = untracked;
@@ -1794,6 +1796,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 return it->texture;
             }
         }
+        if (std::getenv("APS5_TRACE_TEXFILL") != nullptr) std::fprintf(stderr, "[texfill] stale 0x%llx gen %llu\n", (unsigned long long)address, (unsigned long long)generation);
         eraseTexture(cache, it);
         ++cache.counts.stale;
     }
