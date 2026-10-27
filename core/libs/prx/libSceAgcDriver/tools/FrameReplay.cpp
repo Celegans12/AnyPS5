@@ -393,6 +393,9 @@ struct Replay {
     FrameCallKind boundary = FrameCallKind::Flip;
     std::atomic<std::size_t> framesClosed{0};
     std::atomic<std::size_t> undrainedWindows{0};
+    // A frame's windows are closing: the next call waits for it, so the release timer (runWindow's
+    // breaker) must not count that time as no progress and release awaited dwords early.
+    std::atomic<bool> closingWindows{false};
     std::size_t bindlessPrimed = 0;
     std::vector<std::uint64_t> deferredBindless;
     bool bindlessWritten = false;
@@ -607,6 +610,11 @@ struct Replay {
     // completed (as --exact pacing waits; a GPU blocked on a wait that a later call releases ends
     // the wait after 10 s, and the window then holds what completed), as "frame-<n>".
     void closeFrame() {
+        closingWindows.store(true);
+        struct Closed {
+            std::atomic<bool>& flag;
+            ~Closed() { flag.store(false); }
+        } closed{closingWindows};
         const auto deadline = Clock::now() + std::chrono::seconds(10);
         auto quietSince = Clock::now();
         auto lastCompleted = progress().second;
@@ -744,7 +752,7 @@ struct Replay {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 const auto completed = progress().second;
                 const auto issued = sequenced.load();
-                if (completed != lastCompleted || issued != lastSequenced || !AgcDriverQuiescent_nid_postfix()) {
+                if (completed != lastCompleted || issued != lastSequenced || closingWindows.load() || !AgcDriverQuiescent_nid_postfix()) {
                     lastCompleted = completed;
                     lastSequenced = issued;
                     lastProgress = Clock::now();
