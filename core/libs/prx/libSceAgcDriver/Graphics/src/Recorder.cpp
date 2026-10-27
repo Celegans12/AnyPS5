@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileWindows.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GpuTimingUnion.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
@@ -2657,6 +2658,23 @@ AgcDriver::Mutex timingMutex;
 std::map<std::uint64_t, TimingTotals> timingByKey;
 double timingProgramMs = 0, timingClassMs = 0, timingUnionMs = 0, timingBatchMs = 0;
 std::uint64_t timingBatches = 0;
+// [gputime-union]: the window's timed ranges (class and program ranges, not the whole-batch spans) per
+// lane, and those of the APS5_PROFILE_GPU_FAMILY programs per family, in device timestamp ticks (one
+// device clock for both lanes' queues), so the union sees overlap across batches and lanes.
+std::array<std::vector<GpuTimingUnion::Interval>, 2> timingLaneIntervals;
+const std::vector<GpuTimingUnion::Family>& TimingFamilies() {
+    static const auto families = [] {
+        const char* text = std::getenv("APS5_PROFILE_GPU_FAMILY");
+        return text != nullptr ? GpuTimingUnion::ParseFamilies(text) : std::vector<GpuTimingUnion::Family>{};
+    }();
+    return families;
+}
+const std::unordered_map<std::uint64_t, std::size_t>& TimingFamilyIndex() {
+    static const auto index = GpuTimingUnion::FamilyIndex(TimingFamilies());
+    return index;
+}
+std::vector<std::vector<GpuTimingUnion::Interval>> timingFamilyIntervals;
+double timingPeriodNs = 1.0;
 
 bool DrawOrGpuProfiled() {
     static const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr || Recorder::GpuTimingEnabled();
@@ -3591,6 +3609,13 @@ void Recorder::readGpuTiming(Batch& batch) {
         totals.bytes += batch.timedBytes[i];
         (key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count) ? timingClassMs : timingProgramMs) += ns / 1e6;
         intervals.emplace_back(stamps[i * 2], stamps[i * 2 + 1]);
+        timingLaneIntervals[batch.lane == 1 ? 1 : 0].emplace_back(stamps[i * 2], stamps[i * 2 + 1]);
+        if (const auto& families = TimingFamilyIndex(); !families.empty()) {
+            if (const auto found = families.find(key); found != families.end()) {
+                if (timingFamilyIntervals.size() < TimingFamilies().size()) timingFamilyIntervals.resize(TimingFamilies().size());
+                timingFamilyIntervals[found->second].emplace_back(stamps[i * 2], stamps[i * 2 + 1]);
+            }
+        }
     }
     std::sort(intervals.begin(), intervals.end());
     std::uint64_t coveredTicks = 0, unionEnd = 0;
@@ -3600,6 +3625,7 @@ void Recorder::readGpuTiming(Batch& batch) {
         unionEnd = std::max(unionEnd, end);
     }
     timingUnionMs += static_cast<double>(coveredTicks) * period / 1e6;
+    timingPeriodNs = period;
     ++timingBatches;
     if (!ProfileWindows::ClockDue(lastReport)) return;
     printGpuTiming("10 s");
@@ -3638,6 +3664,27 @@ void printGpuTiming(const char* window) {
     AgcDriver::ProfilePrint_nid_no_patch("[gputime] %.0f ms of GPU time in %llu batches over %s (batch %.0f ms first to last command; classes %.0f ms, all ranges %.0f ms, untimed %.0f ms outside every range; %llu presents; %llu ranges dropped at the %u cap); by program:", timingProgramMs, static_cast<unsigned long long>(timingBatches), window, timingBatchMs, timingClassMs, timingUnionMs, timingBatchMs - timingUnionMs, static_cast<unsigned long long>(presents), static_cast<unsigned long long>(timingDropped.exchange(0, std::memory_order_relaxed)), MaxTimedRanges);
     for (std::size_t i = 0; i < hot.size() && i < 12; ++i) AgcDriver::ProfilePrint_nid_no_patch(" 0x%llx x%llu %.0fms", static_cast<unsigned long long>(hot[i].first), static_cast<unsigned long long>(hot[i].second.count), hot[i].second.ms);
     AgcDriver::ProfilePrint_nid_no_patch("; by class:%s\n", classes.c_str());
+    // Across batches and lanes: what the per-batch "all ranges" union cannot see.
+    const auto ms = [](std::uint64_t ticks) { return static_cast<double>(ticks) * timingPeriodNs / 1e6; };
+    const auto lane0 = GpuTimingUnion::UnionTicks(timingLaneIntervals[0]);
+    const auto lane1 = GpuTimingUnion::UnionTicks(timingLaneIntervals[1]);
+    auto both = timingLaneIntervals[0];
+    both.insert(both.end(), timingLaneIntervals[1].begin(), timingLaneIntervals[1].end());
+    const auto busy = GpuTimingUnion::UnionTicks(both);
+    std::string families;
+    for (std::size_t index = 0; index < TimingFamilies().size(); ++index) {
+        const auto* ranges = index < timingFamilyIntervals.size() ? &timingFamilyIntervals[index] : nullptr;
+        std::uint64_t sum = 0;
+        if (ranges != nullptr) {
+            for (const auto& [begin, end] : *ranges) sum += end > begin ? end - begin : 0;
+        }
+        char text[192];
+        std::snprintf(text, sizeof(text), "; family %s: %zu ranges, sum %.1f ms, union %.1f ms", TimingFamilies()[index].name.c_str(), ranges != nullptr ? ranges->size() : std::size_t{0}, ms(sum), ranges != nullptr ? ms(GpuTimingUnion::UnionTicks(*ranges)) : 0.0);
+        families += text;
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[gputime-union] over %s: GPU busy (union of every timed range of both lanes) %.1f ms; lane 0 %.1f ms, lane 1 %.1f ms, overlap %.1f ms%s\n", window, ms(busy), ms(lane0), ms(lane1), ms(lane0 + lane1 - busy), families.c_str());
+    for (auto& lane : timingLaneIntervals) lane.clear();
+    for (auto& family : timingFamilyIntervals) family.clear();
     timingByKey.clear();
     timingProgramMs = timingClassMs = timingUnionMs = timingBatchMs = 0;
     timingBatches = 0;
