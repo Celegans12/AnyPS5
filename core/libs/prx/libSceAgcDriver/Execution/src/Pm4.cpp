@@ -8,6 +8,7 @@
 #include <thread>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -152,6 +153,8 @@ std::uint32_t copyDataCount(std::span<const std::uint32_t> packet) {
 }
 
 std::uint64_t gpuClockCount() {
+    static const bool exactClock = std::getenv("APS5_EXACT_CLOCK") != nullptr;
+    if (exactClock) return 0x100000000000ull;
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10);
 }
 
@@ -629,7 +632,7 @@ std::optional<LabelWrite> DecodeLabelWrite(std::span<const std::uint32_t> packet
         if (dataSelect == 0 || dataSelect > 3) return std::nullopt;
         if (destination == 0) return std::nullopt;
         std::uint64_t value = address(packet[5], packet[6]);
-        if (dataSelect == 3) value = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10);
+        if (dataSelect == 3) value = gpuClockCount();
         LabelWrite label{destination, {}};
         label.inlineSize = dataSelect == 1 ? 4 : 8;
         std::memcpy(label.inlineBytes.data(), &value, label.inlineSize);
@@ -1152,7 +1155,7 @@ void Execute(std::span<const std::uint32_t> packet, QueueState& queue) {
             if (dataSelect == 0 || destination == 0) return;
             std::uint64_t value = address(packet[5], packet[6]);
             if (dataSelect == 3) {
-                value = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10);
+                value = gpuClockCount();
             }
             GuestMemory::Write(destination, std::as_bytes(std::span(&value, 1)).first(dataSelect == 1 ? 4 : 8), dataSelect == 1 ? 4 : 8);
             return;
