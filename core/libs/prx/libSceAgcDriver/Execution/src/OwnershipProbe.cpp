@@ -304,6 +304,18 @@ std::string Sampler::Take(double seconds) {
         static_cast<unsigned long long>(histogram[0]), static_cast<unsigned long long>(histogram[1]), static_cast<unsigned long long>(histogram[2]), static_cast<unsigned long long>(histogram[3]), static_cast<unsigned long long>(histogram[4]), static_cast<unsigned long long>(histogram[5]), static_cast<unsigned long long>(histogram[6]),
         static_cast<double>(readMedian) / 1000.0, static_cast<double>(writeMedian) / 1000.0);
     std::string report = line;
+    // Faults the handler took on a thread that already held the mapping mutex (it does not lock it
+    // again): guard faults let through, access violations left to the crash report.
+    report += "[ownership] faultsUnderLock " + std::to_string(counts.faultsUnderLock) + " (guard faults let through), violationsUnderLock " + std::to_string(counts.violationsUnderLock) + "; first of the run: ";
+    if (counts.underLockSeen == 0) {
+        report += "none";
+    } else {
+        const auto& first = counts.underLock;
+        const auto name = ThreadName(first.thread);
+        report += std::string(first.tag != 0 ? "guard" : "access violation") + (first.touch == static_cast<std::uint8_t>(GuestArena::ProbeTouch::Read) ? " read" : " write") + " of " + Hex(first.block) + " at " + SiteName(first.rip) + " (thread " + std::to_string(first.thread) + (name.empty() ? "" : " '" + name + "'") + ") chain";
+        for (std::size_t i = 0; i < first.frameCount && i < GuestArena::ProbeFrames; ++i) report += std::string(i == 0 ? " " : (i < first.exactFrames ? " < " : " <~ ")) + SiteName(first.frames[i]);
+    }
+    report += "\n";
     std::vector<std::pair<std::uint64_t, Site>> ranked(sites.begin(), sites.end());
     std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) { return a.second.reads + a.second.writes > b.second.reads + b.second.writes; });
     report += "[ownership] sites (top 8 of " + std::to_string(ranked.size()) + ", " + std::to_string(threads.size()) + " threads):";

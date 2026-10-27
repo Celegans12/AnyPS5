@@ -62,6 +62,14 @@ struct GuestArenaProbeCounts {
     std::uint64_t afterReadOther;
     std::uint64_t ends[ProbeEndCount];
     std::uint64_t refused[ProbeRefusalCount];
+    // Faults taken by a thread that already holds the mapping mutex (the handler cannot lock it
+    // again): guard faults in the arena, let through (the system dropped the guard), and access
+    // violations, left to the crash report. underLock is the first such fault of the run (block =
+    // the faulting address, touch = Read/Write, tag 1 for a guard fault); underLockSeen says it is set.
+    std::uint64_t faultsUnderLock;
+    std::uint64_t violationsUnderLock;
+    std::uint64_t underLockSeen;
+    GuestArenaProbeEvent underLock;
 };
 
 #ifndef _WIN32
@@ -164,6 +172,10 @@ void GuestArenaSetProbeContextHook_nid_no_patch(std::uint64_t (*hook)());
 #ifdef _WIN32
 // `context` is the fault's CONTEXT record (its Rip is the touch's site; the callers are unwound from it).
 bool GuestArenaHandleProbe_nid_postfix(std::uintptr_t address, bool write, bool guard, const void* context);
+// The thread id holding the mapping mutex (WindowsMappings), 0 when free. Test hook: runs `body`
+// with the mapping mutex held by the calling thread.
+std::uint32_t GuestArenaMappingLockOwner_nid_no_patch();
+void GuestArenaRunUnderMappingLock_nid_no_patch(void (*body)(void*), void* argument);
 std::size_t GuestArenaQuery_nid_no_patch(const void* address, void* information, std::size_t bytes);
 #endif
 

@@ -27,6 +27,38 @@
 
 namespace GuestArena {
 
+// The mapping mutex, with its owner's thread id kept beside it: the vectored handler runs on the
+// faulting thread, and a fault taken while that thread holds the mutex must not lock it again
+// (std::mutex is not recursive, the thread would wait on itself). The owner is written by the
+// holder after locking and cleared before unlocking, so a thread reads its own id only while it
+// holds the mutex.
+class MappingMutex {
+public:
+    void lock() {
+        inner.lock();
+        owner.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    }
+    bool try_lock() {
+        if (!inner.try_lock()) return false;
+        owner.store(GetCurrentThreadId(), std::memory_order_relaxed);
+        return true;
+    }
+    void unlock() {
+        owner.store(0, std::memory_order_relaxed);
+        inner.unlock();
+    }
+    bool HeldByCurrentThread() const {
+        return owner.load(std::memory_order_relaxed) == GetCurrentThreadId();
+    }
+    DWORD Owner() const {
+        return owner.load(std::memory_order_relaxed);
+    }
+
+private:
+    std::mutex inner;
+    std::atomic<DWORD> owner{0};
+};
+
 class WindowsMappings {
 public:
     enum class Collection { All, Armed, Fresh };
@@ -321,7 +353,10 @@ public:
         }
     }
 
+    // A fault on a thread that holds the mapping mutex is not one of ours to resolve (nothing under
+    // the mutex touches tracked guest memory): left to the crash report instead of a self-deadlock.
     bool HandleWrite(std::uintptr_t address) {
+        if (mutex.HeldByCurrentThread()) return false;
         std::lock_guard lock(mutex);
         if (ownedLive != 0 && address < ownedAddressLimit && (ownedWord(address & ~std::uintptr_t{ownedBlockBytes - 1}) & 1u) != 0) ownedFaults.fetch_add(1, std::memory_order_relaxed);
         const auto base = address & ~(pageBytes - 1);
@@ -340,6 +375,7 @@ public:
     }
 
     bool HandleRead(std::uintptr_t address) {
+        if (mutex.HeldByCurrentThread()) return false;
         std::lock_guard lock(mutex);
         if (!views.contains(address & ~(pageBytes - 1))) return false;
         const auto memory = query(address);
@@ -715,6 +751,11 @@ public:
         }
         probe.armedUs = probeMicroseconds();
         probe.tag = tag;
+        if (!probeReserved) {
+            std::lock_guard events(eventsMutex);
+            probeEvents.reserve(probeEventCap);
+            probeReserved = true;
+        }
         probes.emplace(block, probe);
         probeSeen.insert(block);
         probeUsed.store(true, std::memory_order_release);
@@ -728,39 +769,29 @@ public:
     // page's guard, so the access goes on.
     bool HandleProbe(std::uintptr_t address, bool write, bool guard, const CONTEXT* context) {
         if (probeLive.load(std::memory_order_acquire) == 0 && !(guard && probeUsed.load(std::memory_order_acquire))) return false;
+        if (mutex.HeldByCurrentThread()) return faultUnderLock(address, write, guard, context);
+        GuestArenaProbeEvent event{};
+        bool note = false;
+        bool handled = false;
+        {
+            std::lock_guard lock(mutex);
+            handled = handleProbe(address, write, guard, event, note);
+        }
+        // The callers and the context are taken outside the mapping mutex (they walk the stack and
+        // the unwind tables); the event buffer has its own lock and room reserved at the first arm.
+        if (note) noteTouch(event, context);
+        return handled;
+    }
+
+    // The mapping mutex's owner (0: free), for callers that must not stop a thread inside it.
+    DWORD MappingLockOwner() const {
+        return mutex.Owner();
+    }
+
+    // Test hook: runs `body` with the mapping mutex held by this thread.
+    void RunUnderLock(void (*body)(void*), void* argument) {
         std::lock_guard lock(mutex);
-        const auto block = address & ~std::uintptr_t{ownedBlockBytes - 1};
-        const auto found = probes.find(block);
-        if (found == probes.end()) {
-            if (!guard || !probeSeen.contains(block)) return false;
-            ++probeCounts.extraFaults;
-            return true;
-        }
-        auto& probe = found->second;
-        if (!probe.writeArmed) {
-            if (!guard) return false;
-            noteTouch(block, probe, write ? ProbeTouch::Write : ProbeTouch::Read, context);
-            ++probeCounts.ends[static_cast<std::size_t>(write ? ProbeEnd::Write : ProbeEnd::Read)];
-            const bool writable = std::any_of(probe.pages.protection.begin(), probe.pages.protection.end(), probeWritable);
-            if (write || !writable) {
-                protectPrivate(block, probe.pages, [](DWORD protection) { return protection; });
-                eraseProbe(found);
-                return true;
-            }
-            protectPrivate(block, probe.pages, [](DWORD protection) { return probeWritable(protection) ? readOnlyOf(protection) : protection; });
-            probe.writeArmed = true;
-            return true;
-        }
-        if (guard) {
-            ++probeCounts.extraFaults;
-            return true;
-        }
-        if (!write || !probeWritable(probe.pages.protection[(address - block) / subpageBytes])) return false;
-        noteTouch(block, probe, ProbeTouch::WriteAfterRead, context);
-        ++probeCounts.afterReadWritten;
-        protectPrivate(block, probe.pages, [](DWORD protection) { return protection; });
-        eraseProbe(found);
-        return true;
+        body(argument);
     }
 
     void SetProbeContextHook(std::uint64_t (*hook)()) {
@@ -797,12 +828,20 @@ public:
     }
 
     std::size_t TakeProbe(GuestArenaProbeCounts* counts, GuestArenaProbeEvent* events, std::size_t capacity) {
-        std::lock_guard lock(mutex);
         if (counts != nullptr) {
+            std::lock_guard lock(mutex);
             *counts = probeCounts;
             counts->live = probes.size();
             probeCounts = {};
+            counts->dropped = probeDropped.exchange(0, std::memory_order_relaxed);
+            counts->faultsUnderLock = probeFaultsUnderLock.exchange(0, std::memory_order_relaxed);
+            counts->violationsUnderLock = probeViolationsUnderLock.exchange(0, std::memory_order_relaxed);
+            if (underLockReady.load(std::memory_order_acquire)) {
+                counts->underLockSeen = 1;
+                counts->underLock = underLockEvent;
+            }
         }
+        std::lock_guard lock(eventsMutex);
         const auto taken = std::min(capacity, probeEvents.size());
         if (taken != 0) {
             std::copy_n(probeEvents.begin(), taken, events);
@@ -1927,22 +1966,90 @@ private:
         return ticks / frequency * 1000000u + ticks % frequency * 1000000u / frequency;
     }
 
-    void noteTouch(std::uintptr_t block, const Probe& probe, ProbeTouch touch, const CONTEXT* context) {
-        if (probeEvents.size() >= probeEventCap) {
-            ++probeCounts.dropped;
-            return;
+    // HandleProbe under the mapping mutex: the probe's state changes, and in `event` the touch to
+    // record (`note`) once the mutex is released.
+    bool handleProbe(std::uintptr_t address, bool write, bool guard, GuestArenaProbeEvent& event, bool& note) {
+        const auto block = address & ~std::uintptr_t{ownedBlockBytes - 1};
+        const auto found = probes.find(block);
+        if (found == probes.end()) {
+            if (!guard || !probeSeen.contains(block)) return false;
+            ++probeCounts.extraFaults;
+            return true;
         }
+        auto& probe = found->second;
+        if (!probe.writeArmed) {
+            if (!guard) return false;
+            note = startTouch(event, block, probe, write ? ProbeTouch::Write : ProbeTouch::Read);
+            ++probeCounts.ends[static_cast<std::size_t>(write ? ProbeEnd::Write : ProbeEnd::Read)];
+            const bool writable = std::any_of(probe.pages.protection.begin(), probe.pages.protection.end(), probeWritable);
+            if (write || !writable) {
+                protectPrivate(block, probe.pages, [](DWORD protection) { return protection; });
+                eraseProbe(found);
+                return true;
+            }
+            protectPrivate(block, probe.pages, [](DWORD protection) { return probeWritable(protection) ? readOnlyOf(protection) : protection; });
+            probe.writeArmed = true;
+            return true;
+        }
+        if (guard) {
+            ++probeCounts.extraFaults;
+            return true;
+        }
+        if (!write || !probeWritable(probe.pages.protection[(address - block) / subpageBytes])) return false;
+        note = startTouch(event, block, probe, ProbeTouch::WriteAfterRead);
+        ++probeCounts.afterReadWritten;
+        protectPrivate(block, probe.pages, [](DWORD protection) { return protection; });
+        eraseProbe(found);
+        return true;
+    }
+
+    // The fields of a touch that need the probe (under the mutex).
+    static bool startTouch(GuestArenaProbeEvent& event, std::uintptr_t block, const Probe& probe, ProbeTouch touch) {
         const auto now = probeMicroseconds();
-        GuestArenaProbeEvent event{};
         event.block = block;
-        event.rip = context != nullptr ? context->Rip : 0;
         event.latencyUs = now > probe.armedUs ? now - probe.armedUs : 0;
-        event.thread = static_cast<std::uint32_t>(GetCurrentThreadId());
         event.touch = static_cast<std::uint8_t>(touch);
         event.tag = probe.tag;
+        return true;
+    }
+
+    // The rest of a touch and its recording, outside the mapping mutex; no allocation (room was
+    // reserved at the first arm).
+    void noteTouch(GuestArenaProbeEvent& event, const CONTEXT* context) {
+        event.thread = static_cast<std::uint32_t>(GetCurrentThreadId());
+        event.rip = context != nullptr ? context->Rip : 0;
         if (context != nullptr) probeCallers(*context, event);
         if (const auto hook = probeContextHook.load(std::memory_order_acquire)) event.context = hook();
+        std::lock_guard lock(eventsMutex);
+        if (probeEvents.size() >= std::min(probeEventCap, probeEvents.capacity())) {
+            probeDropped.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
         probeEvents.push_back(event);
+    }
+
+    // A fault on a thread that already holds the mapping mutex (HandleProbe). The probe's state is
+    // not touched (the holder may be in the middle of changing it). A guard fault inside the owned
+    // range is let through: the system has dropped that page's guard, so the access goes on, and
+    // the probe's next end or re-arm finds the guard gone (lost). An access violation is left to the
+    // rest of the handler chain, which ends the run with a crash report. The first one of the run is
+    // kept with its callers; nothing allocates or locks.
+    bool faultUnderLock(std::uintptr_t address, bool write, bool guard, const CONTEXT* context) {
+        const bool passed = guard && address < ownedAddressLimit;
+        (passed ? probeFaultsUnderLock : probeViolationsUnderLock).fetch_add(1, std::memory_order_relaxed);
+        bool expected = false;
+        if (underLockClaimed.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+            auto& event = underLockEvent;
+            event = {};
+            event.block = address;
+            event.rip = context != nullptr ? context->Rip : 0;
+            event.thread = static_cast<std::uint32_t>(GetCurrentThreadId());
+            event.touch = static_cast<std::uint8_t>(write ? ProbeTouch::Write : ProbeTouch::Read);
+            event.tag = guard ? 1 : 0;
+            if (context != nullptr) probeCallers(*context, event);
+            underLockReady.store(true, std::memory_order_release);
+        }
+        return passed;
     }
 
     // The touch's callers (see GuestArenaProbeEvent::frames). Runs in the vectored handler on the
@@ -2048,6 +2155,14 @@ private:
     Probes probes;
     std::unordered_set<std::uintptr_t> probeSeen;
     std::vector<GuestArenaProbeEvent> probeEvents;
+    std::mutex eventsMutex;
+    bool probeReserved = false;
+    std::atomic<std::uint64_t> probeDropped{0};
+    std::atomic<std::uint64_t> probeFaultsUnderLock{0};
+    std::atomic<std::uint64_t> probeViolationsUnderLock{0};
+    std::atomic<bool> underLockClaimed{false};
+    std::atomic<bool> underLockReady{false};
+    GuestArenaProbeEvent underLockEvent{};
     GuestArenaProbeCounts probeCounts{};
     std::atomic<std::size_t> probeLive{0};
     std::atomic<bool> probeUsed{false};
@@ -2104,7 +2219,7 @@ private:
 #ifdef APS5_COUNT_MAPPING_QUERIES
     static inline std::atomic<std::uint64_t> queries{0};
 #endif
-    std::mutex mutex;
+    MappingMutex mutex;
     AllocateFunction allocate = nullptr;
     MapFunction map = nullptr;
     UnmapFunction unmap = nullptr;

@@ -3,6 +3,7 @@
 #include <cstddef>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/GuestArena.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
 #include "prx/libkernel/Pthread/include/Pthread.hpp"
 #include "prx/libkernel/Time/include/TimedWait.hpp"
@@ -439,7 +440,10 @@ bool RaiseOn(Pthread thread, GuestExceptionHandler handler, int signum) {
             queued.release();
             return true;
         }
-        const bool restoring = RestoringContext(delivery.context.Rip) || InWinpthread(delivery.context.Rip);
+        // A thread holding the guest mapping mutex is never redirected: the guest handler would run
+        // with it held, and every fault handler and mapping call would wait behind it.
+        const bool holdsMapping = GuestArena::GuestArenaMappingLockOwner_nid_no_patch() == GetThreadId(native);
+        const bool restoring = holdsMapping || RestoringContext(delivery.context.Rip) || InWinpthread(delivery.context.Rip);
         DWORD64 image = 0;
         const auto running = restoring ? CodeKind::Guest : RunningCode(delivery.context.Rip, image);
         const auto now = std::chrono::steady_clock::now();
@@ -450,7 +454,7 @@ bool RaiseOn(Pthread thread, GuestExceptionHandler handler, int signum) {
             static_cast<void>(ClassifyImage(image));
             continue;
         }
-        if (restoring && std::chrono::steady_clock::now() >= retryDeadline) throw std::runtime_error("sceKernelRaiseException: the target thread stayed inside NtContinue or winpthreads for 1 s");
+        if (restoring && std::chrono::steady_clock::now() >= retryDeadline) throw std::runtime_error(holdsMapping ? "sceKernelRaiseException: the target thread held the guest mapping mutex for 1 s" : "sceKernelRaiseException: the target thread stayed inside NtContinue or winpthreads for 1 s");
         if (running == CodeKind::Host) {
             const auto resample = std::chrono::steady_clock::now() + HostCodeResample;
             while (std::chrono::steady_clock::now() < resample) YieldProcessor();

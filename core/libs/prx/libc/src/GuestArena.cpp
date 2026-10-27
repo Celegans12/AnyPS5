@@ -663,6 +663,14 @@ void GuestArenaSetProbeContextHook_nid_no_patch(std::uint64_t (*hook)()) {
     WindowsMappings::Get().SetProbeContextHook(hook);
 }
 
+std::uint32_t GuestArenaMappingLockOwner_nid_no_patch() {
+    return WindowsMappings::Get().MappingLockOwner();
+}
+
+void GuestArenaRunUnderMappingLock_nid_no_patch(void (*body)(void*), void* argument) {
+    WindowsMappings::Get().RunUnderLock(body, argument);
+}
+
 std::size_t GuestArenaQuery_nid_no_patch(const void* address, void* information, std::size_t bytes) {
     return WindowsMappings::Get().Query(address, static_cast<MEMORY_BASIC_INFORMATION*>(information), bytes);
 }

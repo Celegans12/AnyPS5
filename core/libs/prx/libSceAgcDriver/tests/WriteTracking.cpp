@@ -3304,6 +3304,59 @@ void CheckOwnershipProbeHostAccess() {
     Require(Ended(counts, GuestArena::ProbeEnd::Query) == 2 && counts.live == 0, "the queries did not disarm both units");
     std::cout << "ownership probe: units with a host access open are not armed; host writes, host reads and queries disarm first\n";
 }
+
+// own-probe-6's hang: a thread that holds the mapping mutex touches a probed unit. The fault handler
+// runs on that thread, so it must not lock the mutex again (it would wait on itself, and every
+// mapping call after it): the guard fault is let through and counted with its site, the probe is
+// left as it was (its next re-arm finds the guard lost), and the mutex keeps no owner afterwards.
+struct ReadUnderLock {
+    volatile std::uint8_t* at = nullptr;
+    std::uint8_t value = 0;
+    DWORD owner = 0;
+};
+
+void CheckProbeFaultUnderMappingLock() {
+    PrivateFixture fixture(Block, Block);
+    const auto base = fixture.Base();
+    fixture.At(64) = 5;
+    AgcDriver::OwnershipProbe::Sampler all(1);
+    TakeProbe();
+    all.NoteGpuWrite(base, base + Block);
+    Require(fixture.Protection(0) == (PAGE_READWRITE | PAGE_GUARD), "cannot arm the unit read under the mapping mutex");
+    ReadUnderLock read;
+    read.at = &fixture.At(64);
+    const auto body = [](void* argument) -> DWORD {
+        GuestArena::GuestArenaRunUnderMappingLock_nid_no_patch([](void* inner) {
+            auto& state = *static_cast<ReadUnderLock*>(inner);
+            state.owner = GuestArena::GuestArenaMappingLockOwner_nid_no_patch();
+            state.value = *state.at;
+        }, argument);
+        return 0;
+    };
+    const HANDLE worker = CreateThread(nullptr, 0, body, &read, 0, nullptr);
+    Require(worker != nullptr, "cannot start the thread that reads under the mapping mutex");
+    if (WaitForSingleObject(worker, 5000) != WAIT_OBJECT_0) {
+        std::cerr << "FAIL: a probed read by the mapping mutex's holder deadlocked in the fault handler\n";
+        std::cerr.flush();
+        TerminateProcess(GetCurrentProcess(), 3);
+    }
+    const auto workerId = GetThreadId(worker);
+    CloseHandle(worker);
+    Require(read.value == 5 && read.owner == workerId, "the read under the mapping mutex returned the wrong value, or the mutex did not name its holder");
+    Require(GuestArena::GuestArenaMappingLockOwner_nid_no_patch() == 0, "the mapping mutex kept an owner after it was released");
+    auto counts = TakeProbe();
+    Require(counts.faultsUnderLock == 1 && counts.violationsUnderLock == 0, "the guard fault under the mapping mutex was not counted once: " + std::to_string(counts.faultsUnderLock) + " guard, " + std::to_string(counts.violationsUnderLock) + " violations");
+    Require(counts.underLockSeen == 1 && counts.underLock.block == base + 64 && counts.underLock.tag == 1 && counts.underLock.thread == workerId && counts.underLock.rip != 0, "the first fault under the mapping mutex was not kept with its address, thread and site");
+    Require(Ended(counts, GuestArena::ProbeEnd::Read) == 0 && counts.live == 1, "the fault under the mapping mutex changed the probe's state");
+    Require(fixture.Protection(0) == PAGE_READWRITE && fixture.Protection(4096) == (PAGE_READWRITE | PAGE_GUARD), "the faulting page kept its guard, or the others lost theirs");
+    all.NoteGpuWrite(base, base + Block);
+    counts = TakeProbe();
+    Require(counts.lost == 1 && Ended(counts, GuestArena::ProbeEnd::Rewritten) == 1, "the re-arm did not find the guard the fault under the mutex dropped");
+    Require(fixture.At(64) == 5, "the read after the re-arm returned the wrong value");
+    const auto report = all.Take(10.0);
+    Require(report.find("[ownership] faultsUnderLock 0") != std::string::npos && report.find("first of the run: guard read of " + std::string("0x")) != std::string::npos, "the report does not name the first fault under the mapping mutex: " + report);
+    std::cout << "ownership probe: a probed read by the mapping mutex's holder is let through and counted, no deadlock\n";
+}
 #endif
 
 int main(int argc, char** argv) {
@@ -3371,6 +3424,7 @@ int main(int argc, char** argv) {
             CheckOwnershipProbeHostAccess();
             CheckOwnershipProbeOwned();
             CheckOwnershipProbeCallers();
+            CheckProbeFaultUnderMappingLock();
             std::cout << "ownership probe tests passed\n";
             return 0;
         }
