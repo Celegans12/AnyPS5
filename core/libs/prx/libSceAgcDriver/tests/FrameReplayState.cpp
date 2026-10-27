@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/FrameRecorder.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include <barrier>
+#include <sstream>
 
 namespace {
 
@@ -418,6 +419,17 @@ void testAliasedPages(const std::filesystem::path& directory) {
 }
 #endif
 
+void testDumpChunks() {
+    std::vector<std::byte> bytes(10000);
+    for (std::size_t index = 0; index < bytes.size(); ++index) bytes[index] = static_cast<std::byte>(index * 7u);
+    std::ostringstream file(std::ios::binary);
+    check(writeChunked(file, bytes.data(), bytes.size(), 4096), "chunked write failed");
+    const auto written = file.str();
+    check(written.size() == bytes.size() && std::memcmp(written.data(), bytes.data(), bytes.size()) == 0, "chunked write changed the bytes");
+    std::ostringstream empty(std::ios::binary);
+    check(writeChunked(empty, bytes.data(), 0, 4096) && empty.str().empty(), "an empty dump wrote bytes");
+}
+
 int main(int argc, char** argv) {
     try {
         check(argc == 3, "expected a test name and capture directory");
@@ -429,6 +441,7 @@ int main(int argc, char** argv) {
         else if (mode == "host_neighbors") testHostNeighbors(directory);
         else if (mode == "unwatched") testUnwatched();
         else if (mode == "tokens") testEopTokens();
+        else if (mode == "dump_chunks") testDumpChunks();
         else if (mode == "blocking") testBlockingSubmission(directory);
         else if (mode == "shader" || mode == "shader_host") testShaderCode(directory, mode == "shader_host");
         else if (mode == "shader_prologue") testPrologueHeader(directory);
