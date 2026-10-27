@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryStatsDevice.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileWindows.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -795,7 +796,7 @@ void AppendOwners(std::string& line) {
     }
 }
 
-void Report() {
+void Report(const char* window = nullptr) {
     auto& state = Get();
     std::string line;
     line.reserve(2048);
@@ -817,6 +818,7 @@ void Report() {
     section(&DriverDetail::Driver::AppendMemoryStats, "driver");
     section(&Graphics::AppendTextureMemoryStats, "textures");
     section(&Graphics::AppendGuestBufferMemoryStats, "guest_buffers");
+    if (window != nullptr) Append(line, " window=%s", window);
     line += '\n';
     std::fwrite(line.data(), 1, line.size(), stderr);
     std::fflush(stderr);
@@ -976,6 +978,8 @@ void Start() {
         while (!state.stopping) {
             state.wake.wait_for(lock, std::chrono::seconds(PeriodSeconds()), [&] { return state.stopping; });
             if (state.stopping) break;
+            // Frame windows (a frame replay): the replay prints the lines, labelled, at its frames.
+            if (ProfileWindows::FrameWindows()) continue;
             try {
                 Report();
             } catch (...) {
@@ -983,6 +987,17 @@ void Start() {
             }
         }
     }).detach();
+}
+
+void ReportNow(const char* window) {
+    if (!Enabled()) return;
+    auto& state = Get();
+    std::lock_guard lock(state.reportMutex);
+    try {
+        Report(window);
+    } catch (...) {
+        std::fprintf(stderr, "[mem] report failed\n");
+    }
 }
 
 void Stop() noexcept {

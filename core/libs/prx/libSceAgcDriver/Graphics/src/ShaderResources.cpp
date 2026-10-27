@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ResidentCensus.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -7586,11 +7587,25 @@ void ShaderResources::WriteBack() {
     if (unaligned) std::rethrow_exception(unaligned);
 }
 
+void ShaderResources::NoteResidentCensus() const {
+    if (!ResidentCensus::Enabled()) return;
+    guestMemory.NoteResidentCensus();
+    for (std::size_t index = 0; index < storageTextures.size(); ++index) {
+        const auto& storage = storageTextures[index];
+        if (storage == nullptr) continue;
+        const auto address = storage->Descriptor().baseAddress;
+        const auto bytes = storage->GuestBytes();
+        if (index < storageWritten.size() && storageWritten[index]) ResidentCensus::NoteGpuWrite(ResidentCensus::Class::StorageImage, address, bytes);
+        else ResidentCensus::NoteGpuRead(ResidentCensus::Class::StorageImage, address, bytes);
+    }
+}
+
 void ShaderResources::MarkGpuWritesInRun(Recorder& recorder, const std::shared_ptr<ShaderResources>& self) {
     if (!recorder.RunOpen() || !guestMemory.HasGpuCopies()) {
         MarkGpuWrites(recorder);
         return;
     }
+    NoteResidentCensus();
     // As MarkGpuWrites, with the copy-backs (and the marks of the ranges they store) after the run.
     const auto kind = !guestMemory.HoldsLease() ? Recorder::ReadKind::DispatchElement : usesBda && bdaReadOnly && !RuntimeSwitches::Set(RuntimeSwitch::NoReadOnlyLeaseSkip) ? Recorder::ReadKind::AddressBasedReadOnly : Recorder::ReadKind::AddressBased;
     if (auto split = guestMemory.SplitInPlaceReads()) {
@@ -7617,6 +7632,7 @@ void ShaderResources::MarkGpuWritesInRun(Recorder& recorder, const std::shared_p
 }
 
 void ShaderResources::MarkGpuWrites(Recorder& recorder) {
+    NoteResidentCensus();
     // The ranges this use reads in place through their host imports (read-only and written elements
     // alike, and an address-based build's whole leased heaps), before the writes: a CPU store into
     // one of them (the copy HLE) must not land before the recorded work read it.

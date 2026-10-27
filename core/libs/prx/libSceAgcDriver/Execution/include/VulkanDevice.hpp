@@ -302,6 +302,10 @@ public:
     // Revalidate stays under the mutex), or APS5_LOCKED_BUILD=1 keeps the whole build under it as
     // before. `shader` and `snapshots` must outlive the dispatch.
     void PrimeBindlessDraw(std::span<const Graphics::CompiledShader> shaders) const;
+    // The bindless tables the texture service registered (none without a bindless heap), and the
+    // replay's primer: serves `tables` (registers and completes them) under the GPU mutex and syncs.
+    std::vector<ShaderRecompiler::BindlessImageAbi::TableRegistration> BindlessRegistrations() const;
+    void PrimeBindlessRegistrations(std::span<const ShaderRecompiler::BindlessImageAbi::TableRegistration> tables);
     std::shared_ptr<PreparedDispatch> PrepareDispatch(const ShaderRecompiler::RecompileResult& shader, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t dispatchThreads = 0, std::uint64_t programAddress = 0);
     // APS5_PROFILE_DRAW: the parts of a PrepareDispatch in milliseconds, in the order key, find,
     // precollect, presync, stage A (the driver's 'prepare:' rows).

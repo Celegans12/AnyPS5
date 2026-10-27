@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/CommandMix.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -240,6 +241,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     timing.Mark("capture_resources");
     try {
         stageCapture.compiled = invocation.Materialize(*capture);
+        CommandMix::NoteMaterialized(*stageCapture.compiled, *capture);
         stageCapture.capture = capture;
     } catch (const std::exception& error) {
         TraceMaterializationFailure(traceToken, submission, packetOffset, i, "capture-or-materialize", std::current_exception());
@@ -347,6 +349,7 @@ bool Driver::compileDrawAhead(std::uint64_t key, std::uint64_t shape, const std:
         stageCapture.userDataUse = capture->userDataUse;
         memory = shaderMemory.Regions();
         stageCapture.compiled = invocation.Materialize(*capture);
+        CommandMix::NoteMaterialized(*stageCapture.compiled, *capture);
         stageCapture.capture = capture;
         stageCapture.userDataMask = StageUserDataMask(*capture, *stageCapture.compiled, vertexInfos[i]);
         const auto& result = *stageCapture.compiled;

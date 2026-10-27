@@ -3,7 +3,9 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FrameCapture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FrameDumpIo.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileWindows.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ResidentCensus.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -69,6 +71,14 @@ struct Options {
     std::chrono::seconds timeout{900};
     bool release = true;
     bool synthesize = true;
+    // One profile window per replayed frame (ProfileWindows), closed at the frame's flip; off
+    // (--wall-windows): the lines close on their wall clock as in the game.
+    bool frameWindows = true;
+    // The bindless heap primer: the capture's BindlessTables record (off: --no-bindless-prime), or
+    // --bindless-in <file> (a first replay's --bindless-out, for captures without the record).
+    bool bindlessPrime = true;
+    std::filesystem::path bindlessIn;
+    std::filesystem::path bindlessOut;
 };
 
 class Frames {
@@ -376,6 +386,35 @@ struct Replay {
     std::uint64_t unfinished = 0;
     std::size_t threads = 0;
     bool recording = false;
+    // Frame windows: the call that ends a frame (a CPU flip, or the suspend point when the title
+    // flips from the GPU), the windows closed and those closed before the GPU work drained.
+    bool closeFrames = false;
+    FrameCallKind boundary = FrameCallKind::Flip;
+    std::atomic<std::size_t> framesClosed{0};
+    std::atomic<std::size_t> undrainedWindows{0};
+    // A frame's windows are closing: the next call waits for it, so the release timer (runWindow's
+    // breaker) must not count that time as no progress and release awaited dwords early.
+    std::atomic<bool> closingWindows{false};
+    std::size_t bindlessPrimed = 0;
+    std::vector<std::uint64_t> deferredBindless;
+    bool bindlessWritten = false;
+
+    void primeBindless(std::span<const std::uint64_t> words) {
+        if (!options.bindlessPrime || words.empty()) return;
+        AgcDriverPrimeBindlessTables_nid_postfix(words);
+        bindlessPrimed += static_cast<std::size_t>(words.front());
+    }
+
+    // --bindless-out: the tables registered by the end of the first replayed frame (or of the replay).
+    void writeBindless() {
+        if (options.bindlessOut.empty() || bindlessWritten) return;
+        bindlessWritten = true;
+        const auto words = AgcDriverBindlessRegistrations_nid_postfix();
+        std::ofstream file(options.bindlessOut, std::ios::binary | std::ios::trunc);
+        file.write(reinterpret_cast<const char*>(words.data()), static_cast<std::streamsize>(words.size() * sizeof(std::uint64_t)));
+        if (!file.good()) throw std::runtime_error("frame replay: cannot write " + options.bindlessOut.string());
+        std::fprintf(stderr, "[frame-replay] %llu bindless tables written to %s\n", static_cast<unsigned long long>(words.empty() ? 0 : words.front()), options.bindlessOut.string().c_str());
+    }
     Clock::time_point startedAt{};
     Clock::time_point endedAt{};
 
@@ -518,6 +557,7 @@ struct Replay {
         }
         case FrameCallKind::Flip:
             AgcDriverSubmitFlip_nid_postfix(flipInfo(call));
+            if (closeFrames && boundary == FrameCallKind::Flip) closeFrame();
             return;
         case FrameCallKind::ReserveEopFlip: {
             const auto token = static_cast<std::uint32_t>(call.values.at(4));
@@ -526,9 +566,15 @@ struct Replay {
         }
         case FrameCallKind::Suspend:
             AgcDriverSuspendPoint_nid_postfix();
+            if (closeFrames && boundary == FrameCallKind::Suspend) closeFrame();
             return;
         case FrameCallKind::AliasedPages:
         case FrameCallKind::Checkpoint:
+            return;
+        case FrameCallKind::BindlessTables:
+            // In the prologue: primed once the prologue's memory is restored (run).
+            if (!recording) deferredBindless = call.values;
+            else primeBindless(call.values);
             return;
         case FrameCallKind::QueueStates: {
             std::vector<std::uint32_t> words;
@@ -544,7 +590,10 @@ struct Replay {
             for (const auto* chunk : found->second) {
                 if (skipped.Overlaps(*chunk)) continue;
                 restore(reader, *chunk);
-                if (recording) deltaBytes += chunk->bytes;
+                if (recording) {
+                    deltaBytes += chunk->bytes;
+                    AgcDriver::Graphics::ResidentCensus::NoteCpuWrite(chunk->address, chunk->bytes);
+                }
             }
             return;
         }
@@ -554,6 +603,40 @@ struct Replay {
             return;
         }
         throw std::runtime_error("frame replay: unknown call kind");
+    }
+
+    // Closes the profile windows of the frame that just flipped: once the GPU work submitted so far
+    // completed (as --exact pacing waits; a GPU blocked on a wait that a later call releases ends
+    // the wait after 10 s, and the window then holds what completed), as "frame-<n>".
+    void closeFrame() {
+        closingWindows.store(true);
+        struct Closed {
+            std::atomic<bool>& flag;
+            ~Closed() { flag.store(false); }
+        } closed{closingWindows};
+        const auto deadline = Clock::now() + std::chrono::seconds(10);
+        auto quietSince = Clock::now();
+        auto lastCompleted = progress().second;
+        bool drained = false;
+        while (true) {
+            const auto [accepted, completed] = progress();
+            if (accepted == completed) {
+                drained = true;
+                break;
+            }
+            const auto now = Clock::now();
+            if (completed != lastCompleted) {
+                lastCompleted = completed;
+                quietSince = now;
+            }
+            if (now >= deadline || (now - quietSince >= ExactQuiet && blockedOnWaits())) break;
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
+        if (drained) AgcDriverWaitIdle_nid_postfix();
+        else ++undrainedWindows;
+        const auto label = "frame-" + std::to_string(++framesClosed);
+        AgcDriver::ProfileWindows::Close(label.c_str());
+        if (framesClosed.load() == 1) writeBindless();
     }
 
     static std::uint64_t load(std::uint64_t address, std::size_t bytes) {
@@ -668,7 +751,7 @@ struct Replay {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 const auto completed = progress().second;
                 const auto issued = sequenced.load();
-                if (completed != lastCompleted || issued != lastSequenced || !AgcDriverQuiescent_nid_postfix()) {
+                if (completed != lastCompleted || issued != lastSequenced || closingWindows.load() || !AgcDriverQuiescent_nid_postfix()) {
                     lastCompleted = completed;
                     lastSequenced = issued;
                     lastProgress = Clock::now();
@@ -693,7 +776,9 @@ struct Replay {
                         turn.notify_all();
                     };
                     const auto kind = calls[index].kind;
-                    const bool ordered = kind == FrameCallKind::Memory || kind == FrameCallKind::RegisterVideoOutput || kind == FrameCallKind::UnregisterVideoOutput;
+                    // A frame's closing call too when frame windows are on: the next frame's calls
+                    // start after its windows closed.
+                    const bool ordered = kind == FrameCallKind::Memory || kind == FrameCallKind::RegisterVideoOutput || kind == FrameCallKind::UnregisterVideoOutput || (closeFrames && kind == boundary);
                     if (!ordered) advance();
                     try {
                         execute(calls[index]);
@@ -754,7 +839,8 @@ struct Replay {
 };
 
 int usage() {
-    std::fprintf(stderr, "usage: agc_frame_replay <capture directory> [--no-pace] [--no-release] [--release-after-ms <n>] [--strict] [--exact] [--frame-limit <n>] [--timeout-s <n>]\n"
+    std::fprintf(stderr, "usage: agc_frame_replay <capture directory> [--no-pace] [--no-release] [--release-after-ms <n>] [--strict] [--exact] [--frame-limit <n>] [--timeout-s <n>] [--wall-windows]\n"
+                         "                        [--no-bindless-prime] [--bindless-in <file>] [--bindless-out <file>]\n"
                          "                        [--dump <address>:<bytes>:<file>]...\n"
                          "  replays the driver calls and guest memory that APS5_FRAME_CAPTURE=<directory> recorded, through this\n"
                          "  build's AGC driver with no title running, and prints one JSON line with the frame times\n"
@@ -773,6 +859,13 @@ int usage() {
                          "  --timeout-s <n>     exits with code 4 when the replay has no result after n seconds (900; 0 waits forever)\n"
                          "  --dump              writes guest memory to a file after the replay (hexadecimal or decimal)\n"
                          "  --frames <dir>      writes each recorded and replayed display buffer as reference-<n>.bmp and replay-<n>.bmp\n"
+                         "  --wall-windows      the profile lines ([gputime], [draws], [mem], [command-mix], [resident-census]) close their windows on\n"
+                         "                      the wall clock as in the game; by default each replayed frame is one window, closed at its flip\n"
+                         "                      (frame-<n>; the replay waits there for the frame's GPU work), and every line prints once more at\n"
+                         "                      the end (replay-end)\n"
+                         "  --no-bindless-prime the bindless heap starts empty (default: primed with the tables the capture's BindlessTables record lists)\n"
+                         "  --bindless-in <f>   primes the bindless heap with the tables in <f> (a first replay's --bindless-out) before the frames\n"
+                         "  --bindless-out <f>  writes the bindless tables registered by the end of the first replayed frame to <f>\n"
                          "  the shader cache's Vulkan pipeline cache file is loaded as the title loads it (APS5_PIPELINE_CACHE_LOAD=0 starts empty)\n");
     return 2;
 }
@@ -917,12 +1010,24 @@ int run(const Options& options) {
         replay.execute(*call);
     }
     if (!rewritten.empty()) restoreRewritten(reader, rewritten, replay.skipped);
+    replay.primeBindless(replay.deferredBindless);
+    if (!options.bindlessIn.empty()) {
+        std::ifstream file(options.bindlessIn, std::ios::binary);
+        std::vector<std::uint64_t> words;
+        for (std::uint64_t word = 0; file.read(reinterpret_cast<char*>(&word), sizeof(word));) words.push_back(word);
+        if (words.empty()) throw std::runtime_error("frame replay: no bindless tables in " + options.bindlessIn.string());
+        replay.primeBindless(words);
+    }
+    if (replay.bindlessPrimed != 0) std::fprintf(stderr, "[frame-replay] bindless heap primed with %zu tables\n", replay.bindlessPrimed);
     std::fprintf(stderr, "[frame-replay] prologue: %zu calls in %.1f s, %zu shader images rewritten and restored, %llu stale registrations\n", static_cast<std::size_t>(frameStart - calls.begin()),
                  std::chrono::duration<double>(Clock::now() - prologueStart).count(), rewritten.size(), static_cast<unsigned long long>(replay.staleRegistrations.load()));
+    if (options.frameWindows) AgcDriver::ProfileWindows::Close("prologue");
     replay.recording = true;
     replay.startedAt = Clock::now();
     if (frameStart != calls.end()) {
         auto window = std::span(calls).subspan(static_cast<std::size_t>(frameStart - calls.begin()) + 1);
+        replay.boundary = std::any_of(window.begin(), window.end(), [](const FrameCall& call) { return call.kind == FrameCallKind::Flip; }) ? FrameCallKind::Flip : FrameCallKind::Suspend;
+        replay.closeFrames = options.frameWindows;
         if (!options.checkpointReport.empty()) {
             const auto cut = std::find_if(window.begin(), window.end(), [](const FrameCall& call) { return call.kind == FrameCallKind::Checkpoint; });
             if (cut == window.end()) throw std::runtime_error("frame replay: --checkpoint needs a capture made with APS5_FRAME_CAPTURE_CHECKPOINT");
@@ -949,6 +1054,9 @@ int run(const Options& options) {
         std::fprintf(stderr, "[frame-replay] no dumps written: the GPU work did not finish\n");
     }
     if (check.compared == 0) check.identical = 0.0;
+    // The final flush: what the last windows hold (a frame cut by --checkpoint, the settle).
+    AgcDriver::ProfileWindows::Close("replay-end");
+    replay.writeBindless();
     std::string gaps;
     const auto gap = [&](const char* name, bool present) {
         if (present) gaps += (gaps.empty() ? "" : ",") + std::string(name);
@@ -973,13 +1081,13 @@ int run(const Options& options) {
     std::sort(frameMs.begin(), frameMs.end());
     const auto percentile = [&](double fraction) { return frameMs.empty() ? 0.0 : frameMs[std::min(frameMs.size() - 1, static_cast<std::size_t>(fraction * static_cast<double>(frameMs.size())))]; };
     const auto seconds = std::chrono::duration<double>(replay.endedAt - replay.startedAt).count();
-    std::printf("{\"frames\":%zu,\"replay_s\":%.3f,\"fps\":%.3f,\"frame_ms\":{\"p50\":%.3f,\"p90\":%.3f,\"max\":%.3f,\"each\":[%s]},\"submits\":%llu,\"delta_mib\":%.1f,\"pace_timeouts\":%llu,\"memory_pace_timeouts\":%llu,\"pace_wait_s\":%.3f,\"stale_registrations\":%llu,\"failed_registrations\":%llu,\"skipped_mib\":%.1f,\"threads\":%zu,\"released_waits\":%llu,\"of_them_from_earlier_writes\":%llu,\"of_them_synthesized\":%llu,\"unfinished\":%llu,\"frames_compared\":%zu,\"pixels_identical\":%.6f,\"max_channel_diff\":%d,\"load_s\":%.3f,\"gaps\":\"%s\"}\n",
+    std::printf("{\"frames\":%zu,\"replay_s\":%.3f,\"fps\":%.3f,\"frame_ms\":{\"p50\":%.3f,\"p90\":%.3f,\"max\":%.3f,\"each\":[%s]},\"submits\":%llu,\"delta_mib\":%.1f,\"pace_timeouts\":%llu,\"memory_pace_timeouts\":%llu,\"pace_wait_s\":%.3f,\"stale_registrations\":%llu,\"failed_registrations\":%llu,\"skipped_mib\":%.1f,\"threads\":%zu,\"released_waits\":%llu,\"of_them_from_earlier_writes\":%llu,\"of_them_synthesized\":%llu,\"unfinished\":%llu,\"frames_compared\":%zu,\"pixels_identical\":%.6f,\"max_channel_diff\":%d,\"load_s\":%.3f,\"frame_windows\":%zu,\"undrained_windows\":%zu,\"bindless_primed\":%zu,\"gaps\":\"%s\"}\n",
                 ready.size(), seconds, seconds > 0 ? static_cast<double>(ready.size()) / seconds : 0.0, percentile(0.5), percentile(0.9), frameMs.empty() ? 0.0 : frameMs.back(), frameList.c_str(),
                 static_cast<unsigned long long>(replay.submits.load()), static_cast<double>(replay.deltaBytes.load()) / (1024.0 * 1024.0), static_cast<unsigned long long>(replay.paceTimeouts.load()), static_cast<unsigned long long>(replay.memoryPaceTimeouts.load()),
                 replay.paceWaitedSeconds(), static_cast<unsigned long long>(replay.staleRegistrations.load()), static_cast<unsigned long long>(replay.failedRegistrations.load()),
                 static_cast<double>(replay.skipped.bytes) / (1024.0 * 1024.0), replay.threads, static_cast<unsigned long long>(replay.earlyReleases.load()), static_cast<unsigned long long>(replay.lateReleases.load()),
                 static_cast<unsigned long long>(replay.syntheticReleases.load()),
-                static_cast<unsigned long long>(replay.unfinished), check.compared, check.identical, check.maxDifference, std::chrono::duration<double>(loaded - loadStart).count(), gaps.c_str());
+                static_cast<unsigned long long>(replay.unfinished), check.compared, check.identical, check.maxDifference, std::chrono::duration<double>(loaded - loadStart).count(), replay.framesClosed.load(), replay.undrainedWindows.load(), replay.bindlessPrimed, gaps.c_str());
     std::fflush(stdout);
     if (options.strict && !gaps.empty()) {
         std::fprintf(stderr, "agc_frame_replay: --strict rejects this replay: %s\n", gaps.c_str());
@@ -1005,6 +1113,10 @@ int main(int argc, char** argv) {
         else if (argument == "--timeout-s" && index + 1 < argc) options.timeout = std::chrono::seconds(std::strtoll(argv[++index], nullptr, 10));
         else if (argument == "--dump" && index + 1 < argc) options.dumps.push_back(parseDump(argv[++index]));
         else if (argument == "--frames" && index + 1 < argc) options.frames = argv[++index];
+        else if (argument == "--wall-windows") options.frameWindows = false;
+        else if (argument == "--no-bindless-prime") options.bindlessPrime = false;
+        else if (argument == "--bindless-in" && index + 1 < argc) options.bindlessIn = argv[++index];
+        else if (argument == "--bindless-out" && index + 1 < argc) options.bindlessOut = argv[++index];
         else if (!argument.starts_with("-") && options.directory.empty()) options.directory = argument;
         else return usage();
     }
@@ -1017,6 +1129,7 @@ int main(int argc, char** argv) {
     setenv("APS5_PIPELINE_CACHE_LOAD", "1", 0);
 #endif
     startWatchdog(options.timeout);
+    AgcDriver::ProfileWindows::UseFrameWindows(options.frameWindows);
     int code = 2;
     try {
         code = run(options);

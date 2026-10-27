@@ -803,6 +803,9 @@ public:
     static void AddGpuTiming(CommandClass which, double nanoseconds, std::uint64_t bytes);
     // Presentations, so the [gputime] class totals can be given per present.
     static void CountPresent();
+    // APS5_PROFILE_GPU: prints the [gputime] line of the batches read so far as the window `label`
+    // and starts the next window (ProfileWindows::Close; nothing when the timing is off).
+    static void CloseGpuTimingWindow(const char* label);
     // Presentations so far (never reset): a frame clock for policies that count per frame, such as
     // StorageTexture's write-back hysteresis.
     static std::uint64_t Presents();

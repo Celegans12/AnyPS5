@@ -1,6 +1,8 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/CommandMix.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ResidentCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/LiveSnapshotRetry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/SlowMaterializations.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
@@ -523,6 +525,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
 
             timing.Mark("capture_resources");
             compiledResult = invocation.Materialize(*capture);
+            CommandMix::NoteMaterialized(*compiledResult, *capture);
             timing.Mark("materialize");
             if (compiledResult->cacheHit) ++cacheHits;
             const auto elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
@@ -600,6 +603,8 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
     }
     phaseTiming.Phase(PhaseQueuedLabels);
     const auto& compiled = *compiledResult;
+    CommandMix::NoteDispatch(compiled, indirectArguments != 0, cached);
+    if (indirectArguments != 0) Graphics::ResidentCensus::NoteGpuRead(Graphics::ResidentCensus::Class::Indirect, indirectArguments, 12);
     std::vector<Graphics::GuestMemorySnapshot> snapshots;
     for (const auto& region : captured) snapshots.push_back({region.guestAddress, region.bytes});
     std::array<std::uint32_t, 3> groups{packet[1], packet[2], packet[3]};

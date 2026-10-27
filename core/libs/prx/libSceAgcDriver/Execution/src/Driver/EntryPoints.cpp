@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/BindlessPriming.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadPriority.hpp"
@@ -148,6 +149,16 @@ extern "C" std::vector<std::uint32_t> AgcDriverSaveQueueStates_nid_postfix() {
 
 extern "C" void AgcDriverLoadQueueStates_nid_postfix(std::span<const std::uint32_t> words) {
     AgcDriver::DriverDetail::Driver::Get().LoadQueueStates(words);
+}
+
+extern "C" std::vector<std::uint64_t> AgcDriverBindlessRegistrations_nid_postfix() {
+    return AgcDriver::BindlessRegistrationWords();
+}
+
+extern "C" void AgcDriverPrimeBindlessTables_nid_postfix(std::span<const std::uint64_t> words) try {
+    AgcDriver::PrimeBindlessTables(words);
+} catch (const ProcessShutdown&) {
+    LibcAwaitExit_nid_postfix();
 }
 
 extern "C" void AgcDriverUseGdsAt_nid_postfix(std::uint64_t address) {

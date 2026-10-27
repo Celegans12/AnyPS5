@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileWindows.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetTransfer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GpuColorTransfer.hpp"
@@ -736,6 +737,8 @@ DrawProfile& Profile() {
     return profile;
 }
 
+void printDrawWindow(DrawProfile& profile, const char* window);
+
 // Adds one draw's phases to the totals and prints the [draws] and [rescache] lines every 10 s.
 void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources::BuildTiming* built, const DrawOutcome& outcome) {
     auto& profile = Profile();
@@ -788,13 +791,17 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
         profile.kindUs[outcome.kind] += drawUs;
     }
     if (outcome.validateMemoized) ++(outcome.validateHit ? profile.validateHits : profile.validateMisses);
-    const auto now = std::chrono::steady_clock::now();
-    if (now - profile.lastReport < std::chrono::seconds(10)) return;
-    profile.lastReport = now;
+    if (!ProfileWindows::ClockDue(profile.lastReport)) return;
+    printDrawWindow(profile, "10 s");
+}
+
+// The [draws], [rescache] and [bda-template] lines of the window so far (under the profile's
+// mutex), named `window`; resets the window's totals.
+void printDrawWindow(DrawProfile& profile, const char* window) {
     const auto synchronous = profile.draws - profile.recorded - profile.waited;
     const auto average = [](double total, std::uint64_t count) { return count != 0 ? total / static_cast<double>(count) : 0.0; };
     char line[2048];
-    int n = std::snprintf(line, sizeof(line), "[draws] %llu draws over 10 s (%llu recorded avg %.0f us, of them %llu with completion; %llu recorded then waited avg %.0f us; %llu synchronous avg %.0f us; render passes %llu begun, %llu draws continued one; waited or synchronous because:", static_cast<unsigned long long>(profile.draws), static_cast<unsigned long long>(profile.recorded), average(profile.recordedUs, profile.recorded), static_cast<unsigned long long>(profile.completion), static_cast<unsigned long long>(profile.waited), average(profile.waitedUs, profile.waited), static_cast<unsigned long long>(synchronous), average(profile.synchronousUs, synchronous), static_cast<unsigned long long>(profile.passesBegun), static_cast<unsigned long long>(profile.passesContinued));
+    int n = std::snprintf(line, sizeof(line), "[draws] %llu draws over %s (%llu recorded avg %.0f us, of them %llu with completion; %llu recorded then waited avg %.0f us; %llu synchronous avg %.0f us; render passes %llu begun, %llu draws continued one; waited or synchronous because:", static_cast<unsigned long long>(profile.draws), window, static_cast<unsigned long long>(profile.recorded), average(profile.recordedUs, profile.recorded), static_cast<unsigned long long>(profile.completion), static_cast<unsigned long long>(profile.waited), average(profile.waitedUs, profile.waited), static_cast<unsigned long long>(synchronous), average(profile.synchronousUs, synchronous), static_cast<unsigned long long>(profile.passesBegun), static_cast<unsigned long long>(profile.passesContinued));
     const auto room = [&] { return n > 0 && static_cast<std::size_t>(n) < sizeof(line); };
     for (std::size_t i = SyncNone + 1; i < SyncCount && room(); ++i) {
         if (profile.reasons[i] != 0) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %llu", SyncReasonNames[i], static_cast<unsigned long long>(profile.reasons[i]));
@@ -885,6 +892,14 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     profile.indirectReadUs = 0;
     profile.skips.fill(0);
     profile.skipUs.fill(0);
+}
+
+void closeDrawWindow(const char* window) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile) return;
+    auto& stats = Profile();
+    std::lock_guard lock(stats.mutex);
+    printDrawWindow(stats, window);
 }
 
 void countCache(std::uint64_t DrawProfile::*counter) {
@@ -1222,6 +1237,10 @@ void CheckBufferAliases(const Context& context, std::span<const CompiledShader> 
     }
 }
 
+}
+
+void CloseDrawProfileWindow(const char* window) {
+    closeDrawWindow(window);
 }
 
 std::array<std::uint32_t, 4> MeshIndexBufferDescriptor(const Pm4::DrawParameters& draw) {

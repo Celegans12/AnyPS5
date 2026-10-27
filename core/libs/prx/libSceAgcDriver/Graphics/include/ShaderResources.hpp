@@ -305,6 +305,9 @@ public:
     // (storage images stay there; buffer ranges are noted so CPU reads wait); WriteBackBuffers runs
     // once the work completed.
     void MarkGpuWrites(Recorder& recorder);
+    // APS5_PROFILE_RESIDENT_CENSUS: notes the guest memory this use reaches (MarkGpuWrites and
+    // MarkGpuWritesInRun call it once per use).
+    void NoteResidentCensus() const;
     // As MarkGpuWrites for a dispatch that left its trailing barrier deferred (Recorder::
     // DeferDispatchBarrier): its staged copy-backs (and the direct-write marks they complete) are
     // recorded after the run's deferred barrier (Recorder::AfterRun); `self` keeps the object.
