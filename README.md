@@ -11,16 +11,16 @@
 > when a build renders our 60-frame title reference exactly and runs faster in the open world than the build before it.
 > Fixes that apply to `main` go upstream as separate PRs.
 
-## Where it stands (2026-10-26)
+## Where it stands (2026-10-27)
 
 | | |
 |---|---|
 | **Furthest point** | Open world, the Nupur river by the Ainu village, with HUD and quest |
 | **Time to the world** | about 5 minutes from a save near Teshio Ridge (warm shader cache) |
-| **Frame rate in the world** | about **0.6-0.8 fps** (6-8.4 presents per 10 s depending on the spot and the session; about 7.7-7.9 at the river village on the fault-free build of 10-26 with the epoch checks; this laptop's GPU clocks drift by ~14 % between sessions, so builds are compared back to back in one session) |
+| **Frame rate in the world** | about **0.6-0.8 fps** (6-8.4 presents per 10 s depending on the spot and the session; about 7.8-7.9 at the river village on this build (merged with `main` 2026-10-26; 7.9 against 7.75 for the build before, back to back); this laptop's GPU clocks drift by ~14 % between sessions, so builds are compared back to back in one session) |
 | **Stability** | with the second Vulkan queue on its own compute-only queue family, world runs are clean (up to 22 minutes); the one crash we saw on 10-25 (a second-queue label bug) is fixed since `5becc82a97` |
 | **Tested on** | Windows 11, RTX 3080 Laptop GPU 16 GB (driver 610.62), 32 GB RAM, MinGW-w64 GCC 15.2.0, Release |
-| **Build** | `d3e0db3032` (owned answers from per-block checks within a collect epoch) and `3243b61759` (fault-free owned proofs, upstream #9181) on `6debc980ee` (our tree merged with `main` 2026-10-24 `a39be6252d`, plus owned texture proofs, owned draw and vertex inputs, a lane-targeted storage flush, shahulmubeen-a's HTILE note (Celegans12/AnyPS5#2), mrfelek's #9957 and #10228, fixes from #675, #6188 (off by default), #9558, #8887, #7514, address-table templates, the read-only lease skip and hritikutekar's committer batches) + docs, shader-cache SourceVersion `6c403b0d2815d602`, title reference T1 exact |
+| **Build** | `416ce3c368`: our tree (`d3e0db3032`, owned answers from per-block checks within a collect epoch, and everything listed under [What it carries](#what-it-carries-on-top-of-main-2026-10-26)) merged with `main` 2026-10-26 `88795ed448` (which now includes #9957, #9181, #9567 and #11120), plus Pipodi's absent runtime formats (Celegans12/AnyPS5#1) and two of hritikutekar's runtime-format reads from #675, + docs, shader-cache SourceVersion `22c401ea7ca3796f`, title reference T1 exact |
 
 <table>
 <tr>
@@ -61,6 +61,7 @@
 | 10-25 | +1.8 % in an in-run A/B | shahulmubeen-a's HTILE note for cache-hit dispatch items (#2) |
 | 10-26 | **8.05** (7.70 with them off in the same run: +4.4 %, frames ~55 ms shorter) | owned reuse of untracked vertex/index inputs and draw snapshots; storage flushes wait only for the lanes that write the range |
 | 10-26 | **7.8** (7.3 with all owned features off in the same run: +6.4 %, frames ~80 ms shorter) | the owned features made fault-free: write watch instead of write protection, answered from per-block checks within each collect epoch |
+| 10-27 | **7.9** (the build before: 7.75 between two runs of this one, same script) | merged with `main` 2026-10-26; same speed, newer `main` underneath |
 
 ## Run it
 
@@ -73,7 +74,7 @@ APS5_NO_PIPELINE_JOURNAL=1 APS5_RESOURCE_CACHE_ENTRIES=1024 APS5_ASYNC_LANE=51
 APS5_NO_DRAW_AHEAD=1 APS5_DEFER_REFRESH_FLUSH=1 APS5_PIPELINE_DISPATCH=1
 ```
 
-- **This build has a new shader-cache version (since 2026-10-24, `6c403b0d2815d602`), so the first run compiles cold**: about 50 minutes to the world on our machine (frame 90 at 3,006 s). Later runs start warm.
+- **This build has a new shader-cache version (since 2026-10-27, `22c401ea7ca3796f`), so the first run compiles cold**: about 54 minutes to the world on our machine (frame 90 at 3,218 s). The second run can still compile a few very large pipelines (about 3 minutes on the last loading screen for us, if the first run was stopped before the driver saved them); after that, runs start warm (frame 90 at about 400 s).
 - `APS5_ASYNC_LANE=51` runs the cloth compute ring on a second Vulkan queue. That queue now comes from a compute-only queue family by default; `APS5_LANE_GRAPHICS_FAMILY=1` goes back to a third queue of the graphics family, which faulted the GPU for us. Without `APS5_ASYNC_LANE`, everything runs on one queue as before.
 - `APS5_DEFER_REFRESH_FLUSH=1` lets a storage refresh record its GPU-direct write-backs behind the pending writer instead of waiting for it; hritikutekar's GPU slice copies for reflection probes need it.
 - `APS5_NO_DRAW_AHEAD=1` keeps mitul72's draw-ahead (#6188) off: worker threads that capture and compile upcoming draws ahead of queue 0. Leave it out to try it: in our A/B it was +4 % presents (not significant), and one of four title checks with it on stalled at boot and rendered wrong, which we haven't reproduced or explained yet.
@@ -126,7 +127,7 @@ APS5_NO_DRAW_AHEAD=1 APS5_DEFER_REFRESH_FLUSH=1 APS5_PIPELINE_DISPATCH=1
 - One compute program (0x8000361f00) is still refused by the recompiler at registration (non-fatal so far).
 - About 0.6-0.8 fps is far from playable. What limits a frame now, and what's next, is in [discussion #675](https://github.com/boykopovar/AnyPS5/discussions/675).
 
-## What it carries on top of `main` 2026-10-24
+## What it carries on top of `main` 2026-10-26
 
 - Most of the upstream PRs this branch adopted earlier are part of `main` now.
 - Local work:
@@ -184,6 +185,7 @@ APS5_NO_DRAW_AHEAD=1 APS5_DEFER_REFRESH_FLUSH=1 APS5_PIPELINE_DISPATCH=1
 - 2026-10-26: owned reuse of draw inputs and a lane-targeted storage flush (`6debc980ee`, same shader cache, T1 exact with both verify modes, focused ctest 391/394: the two known failures plus `agc_write_tracking_metadata_commit`, which failed once under the full parallel suite and passes 30 of 30 repeats on this and the previous build). Vertex/index inputs and draw snapshots in host-imported memory that the write tracker doesn't watch were copied again on every draw; they are now kept and reused while per-block words armed on their memory show no store (the same proof as the texture checks). Storage write-backs before a label used to wait for every batch on both queues; they now wait only for the lanes whose batches write or lease the stored range. In-run A/B (6 pairs per arm): all three off -0.34 ± 0.07 presents per 10 s (+4.4 % with them on, frames ~55 ms shorter); vertex inputs alone +3.9 %, the flush alone +2.0 %. 2,035 reuse verifications found no difference.
 - 2026-10-26: correctness move (`3243b61759`, same shader cache, T1 exact, focused ctest 392/394 with the two known failures). The owned proofs and owned draw/vertex inputs relied on guest-thread write faults, which upstream removed (#5596, #9181) because the exception frame overwrites the System V red zone (#361). They now use write watch instead, and upstream's #9181 is cherry-picked (resident runs are no longer write-protected). In an in-run A/B the write-watch versions were neutral (each arm within ±0.1 presents per 10 s once two stalled phases are left out; 0 faults, 0 verify differences), so the README env turns them off. In that session the build ran at about 7.8-8.2 presents per 10 s with the owned features on or off; the fault-based versions had measured +8.5 % and +4.4 % in earlier sessions, so some of that is likely lost, but separate sessions can't show how much. A cheaper fault-free proof is the next thing to try.
 - 2026-10-26: owned answers from per-block checks within a collect epoch (`d3e0db3032`, same shader cache, T1 exact). The write-watch proofs asked Windows for the written pages on every proof, about 15 queries each. Now each collect epoch takes a mark from a shared clock, and a block that was checked after the mark is answered from its word alone, so most proofs are a few atomic loads (0.04-0.2 µs instead of up to 125 µs). A CPU store before the thread's ordering point is seen by the next query; a store racing a submission waits for the next mark, which is the rule the collect memo already had. **The owned features are back on in the env.** In-run A/B (2,400 s, 6 phases per arm): all owned features off -0.50 ± 0.04 presents per 10 s (**+6.4 %** with them on, frames ~80 ms shorter), the epoch checks alone off -0.19 ± 0.09 (+2.5 %), owned vertex inputs alone off +0.01 (neutral). 0 guest faults, 0 epoch disagreements. `APS5_NO_OWNED_EPOCH=1` goes back to one query per proof; `APS5_VERIFY_OWNED_EPOCH=<n>` also queries the first n epoch answers every 10 s and reports any disagreement.
+- 2026-10-27: moved to our tree merged with `main` 2026-10-26 (`416ce3c368`, **new shader cache**, T1 exact cold and warm). `main` now carries #9957 (buffer presence read at run time) and #9181, so those collapse into `main`'s versions; #10228 stays ours. Also Pipodi's absent runtime formats (Celegans12/AnyPS5#1, off with `APS5_NO_ABSENT_RUNTIME_FORMAT=1`) and hritikutekar's straight-line format conversion and single span reads from #675 (`APS5_NO_COMPACT_FORMAT_CONVERT=1`, `APS5_NO_SINGLE_FORMAT_READ=1`). `main`'s PlayGo now throws on chunk IDs outside the scenario list; without `APS5_PLAYGO_SCENARIO_CHUNKS` every chunk answers installed again, as before. Three 1,500 s world runs back to back (this build, the build before, this build): 7.87 / 7.75 / 7.92 presents per 10 s over the steady phases (one 60 s phase of the first run, a compile stall, left out), 1,742 against 1,743 presents in total, so the same speed. Frames clean, no fatal. Focused ctest 448/451 (one fails on plain `main` too, one only with the opt-in `APS5_LAYER_REFRESH=1`, one known NVIDIA-only).
 
 ---
 
