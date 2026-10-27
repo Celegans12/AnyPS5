@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/BindlessPriming.hpp"
 #include "prx/libSceAgcDriver/State/include/Configuration.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FrameRecorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
@@ -828,6 +829,13 @@ void FrameRecorder::start() {
     queueStates.ordinal = ++ordinal;
     for (const auto word : driver.SaveQueueStates()) queueStates.values.push_back(word);
     writer->WriteCall(queueStates);
+    // The bindless tables the title's warm heap was serving, for agc_frame_replay's heap primer.
+    if (auto tables = AgcDriver::BindlessRegistrationWords(); tables.size() > 1) {
+        auto bindless = make(FrameCallKind::BindlessTables);
+        bindless.ordinal = ++ordinal;
+        bindless.values = std::move(tables);
+        writer->WriteCall(bindless);
+    }
     auto begin = make(FrameCallKind::FrameStart);
     begin.ordinal = ++ordinal;
     std::tie(begin.accepted, begin.completed) = driver.SerialProgress();

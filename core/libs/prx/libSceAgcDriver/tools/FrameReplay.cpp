@@ -1,6 +1,5 @@
 #include "prx/libSceAgcDriver/State/include/Configuration.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DisplayBuffer.hpp"
-#include "prx/libSceAgcDriver/Execution/include/BindlessPriming.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FrameCapture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FrameDumpIo.hpp"
@@ -402,7 +401,7 @@ struct Replay {
 
     void primeBindless(std::span<const std::uint64_t> words) {
         if (!options.bindlessPrime || words.empty()) return;
-        AgcDriver::PrimeBindlessTables(words);
+        AgcDriverPrimeBindlessTables_nid_postfix(words);
         bindlessPrimed += static_cast<std::size_t>(words.front());
     }
 
@@ -410,7 +409,7 @@ struct Replay {
     void writeBindless() {
         if (options.bindlessOut.empty() || bindlessWritten) return;
         bindlessWritten = true;
-        const auto words = AgcDriver::BindlessRegistrationWords();
+        const auto words = AgcDriverBindlessRegistrations_nid_postfix();
         std::ofstream file(options.bindlessOut, std::ios::binary | std::ios::trunc);
         file.write(reinterpret_cast<const char*>(words.data()), static_cast<std::streamsize>(words.size() * sizeof(std::uint64_t)));
         if (!file.good()) throw std::runtime_error("frame replay: cannot write " + options.bindlessOut.string());
