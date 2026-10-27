@@ -187,6 +187,8 @@ private:
 // Starts the reporter thread once (no-op when off); Stop() waits for an in-flight report.
 void Start();
 void Stop() noexcept;
+// One [mem] line now, ending in ` window=<window>` (ProfileWindows::Close; nothing when off).
+void ReportNow(const char* window);
 
 inline void AppendMiB(std::string& line, const char* name, std::uint64_t bytes, std::uint64_t count) {
     char buffer[160];

@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ResidentCensus.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "ThreadOwned.hpp"
@@ -7173,6 +7174,29 @@ void GuestBufferMemory::InPlaceReads(std::vector<std::pair<std::uint64_t, std::u
     }
     for (const auto& region : regions) {
         if (region.direct != nullptr) result.emplace_back(region.begin, inPlaceEnd(region));
+    }
+}
+
+void GuestBufferMemory::NoteResidentCensus() const {
+    using ResidentCensus::Class;
+    if (!ResidentCensus::Enabled() || !uploaded || committed) return;
+    const auto leased = [](const GuestAllocations::Lease& held) {
+        const void* key = held.Snapshot().get();
+        if (key == nullptr || ResidentCensus::NoteGroupSeen(key)) return;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> reach;
+        reach.reserve(held.size());
+        for (const auto& range : held) {
+            if (range != nullptr && range->readable) reach.emplace_back(range->address, range->address + range->bytes);
+        }
+        ResidentCensus::NoteGpuReadGroup(key, Class::BdaLeased, reach);
+    };
+    leased(lease);
+    if (space != nullptr) leased(space->lease);
+    const auto classOf = [](const Region& region) { return region.direct != nullptr || region.mirror != nullptr ? Class::InPlace : Class::Staged; };
+    for (const auto& region : regions) ResidentCensus::NoteGpuRead(classOf(region), region.begin, region.end - region.begin);
+    for (const auto& [begin, end] : writes) {
+        const auto* found = owner(begin, end);
+        ResidentCensus::NoteGpuWrite(found != nullptr ? classOf(*found) : Class::BdaLeased, begin, end - begin);
     }
 }
 

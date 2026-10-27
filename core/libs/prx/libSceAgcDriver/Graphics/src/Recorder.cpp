@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileWindows.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
@@ -2662,6 +2663,8 @@ bool DrawOrGpuProfiled() {
     return profiled;
 }
 
+void printGpuTiming(const char* window);
+
 void reportBarriers() {
     if (!DrawOrGpuProfiled()) return;
     static auto lastReport = std::chrono::steady_clock::now();
@@ -3598,17 +3601,33 @@ void Recorder::readGpuTiming(Batch& batch) {
     }
     timingUnionMs += static_cast<double>(coveredTicks) * period / 1e6;
     ++timingBatches;
-    const auto now = std::chrono::steady_clock::now();
-    if (now - lastReport < std::chrono::seconds(10)) return;
-    lastReport = now;
+    if (!ProfileWindows::ClockDue(lastReport)) return;
+    printGpuTiming("10 s");
+    lock.unlock();
+    reportBarriers();
+}
+
+void Recorder::CloseGpuTimingWindow(const char* label) {
+    if (!GpuTimingEnabled()) return;
+    {
+        std::lock_guard lock(timingMutex);
+        printGpuTiming(label);
+    }
+    reportBarriers();
+}
+
+namespace {
+
+// The [gputime] line of the window so far, under timingMutex; resets the window's totals.
+void printGpuTiming(const char* window) {
     const auto presents = timingPresents.exchange(0, std::memory_order_relaxed);
     const double perPresent = presents != 0 ? 1.0 / static_cast<double>(presents) : 0.0;
     std::vector<std::pair<std::uint64_t, TimingTotals>> hot;
     std::string classes;
     for (const auto& [key, totals] : timingByKey) {
-        if (key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count)) {
+        if (key >= Recorder::ClassKey(Recorder::CommandClass::DispatchLeading) && key < Recorder::ClassKey(Recorder::CommandClass::Count)) {
             char text[160];
-            std::snprintf(text, sizeof(text), " %s x%llu %.1fms %.1fMiB (per present x%.1f %.2fms %.2fMiB)", CommandClassNames[key - ClassKey(CommandClass::DispatchLeading)], static_cast<unsigned long long>(totals.count), totals.ms, totals.bytes / 1048576.0, static_cast<double>(totals.count) * perPresent, totals.ms * perPresent, totals.bytes / 1048576.0 * perPresent);
+            std::snprintf(text, sizeof(text), " %s x%llu %.1fms %.1fMiB (per present x%.1f %.2fms %.2fMiB)", CommandClassNames[key - Recorder::ClassKey(Recorder::CommandClass::DispatchLeading)], static_cast<unsigned long long>(totals.count), totals.ms, totals.bytes / 1048576.0, static_cast<double>(totals.count) * perPresent, totals.ms * perPresent, totals.bytes / 1048576.0 * perPresent);
             classes += text;
         } else {
             hot.emplace_back(key, totals);
@@ -3616,14 +3635,14 @@ void Recorder::readGpuTiming(Batch& batch) {
     }
     std::sort(hot.begin(), hot.end(), [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
     // The first field stays the program sum: the measure scripts match on it.
-    AgcDriver::ProfilePrint_nid_no_patch("[gputime] %.0f ms of GPU time in %llu batches over 10 s (batch %.0f ms first to last command; classes %.0f ms, all ranges %.0f ms, untimed %.0f ms outside every range; %llu presents; %llu ranges dropped at the %u cap); by program:", timingProgramMs, static_cast<unsigned long long>(timingBatches), timingBatchMs, timingClassMs, timingUnionMs, timingBatchMs - timingUnionMs, static_cast<unsigned long long>(presents), static_cast<unsigned long long>(timingDropped.exchange(0, std::memory_order_relaxed)), MaxTimedRanges);
+    AgcDriver::ProfilePrint_nid_no_patch("[gputime] %.0f ms of GPU time in %llu batches over %s (batch %.0f ms first to last command; classes %.0f ms, all ranges %.0f ms, untimed %.0f ms outside every range; %llu presents; %llu ranges dropped at the %u cap); by program:", timingProgramMs, static_cast<unsigned long long>(timingBatches), window, timingBatchMs, timingClassMs, timingUnionMs, timingBatchMs - timingUnionMs, static_cast<unsigned long long>(presents), static_cast<unsigned long long>(timingDropped.exchange(0, std::memory_order_relaxed)), MaxTimedRanges);
     for (std::size_t i = 0; i < hot.size() && i < 12; ++i) AgcDriver::ProfilePrint_nid_no_patch(" 0x%llx x%llu %.0fms", static_cast<unsigned long long>(hot[i].first), static_cast<unsigned long long>(hot[i].second.count), hot[i].second.ms);
     AgcDriver::ProfilePrint_nid_no_patch("; by class:%s\n", classes.c_str());
     timingByKey.clear();
     timingProgramMs = timingClassMs = timingUnionMs = timingBatchMs = 0;
     timingBatches = 0;
-    lock.unlock();
-    reportBarriers();
+}
+
 }
 
 bool Recorder::FlipReadCheck() {
