@@ -302,7 +302,6 @@ void FrameRecorder::ReserveEopFlip(const FlipInfo& info, std::uint32_t token) {
     std::tie(call.accepted, call.completed) = DriverDetail::Driver::Get().SerialProgress();
     writer->WriteCall(call);
     ++recordedCalls;
-    if (call.kind == FrameCallKind::Submit && ++frameSubmits == checkpointSubmit && checkpointFrame != 0 && recordedFrames + 1 == checkpointFrame && !checkpointTaken) writeCheckpoint();
 }
 
 void FrameRecorder::Suspend(const std::function<void()>& accept) {
@@ -419,6 +418,7 @@ void FrameRecorder::recordLocked(FrameCall call, bool prologueCall, std::span<co
     std::tie(call.accepted, call.completed) = DriverDetail::Driver::Get().SerialProgress();
     writer->WriteCall(call);
     ++recordedCalls;
+    if (call.kind == FrameCallKind::Submit && ++frameSubmits == checkpointSubmit && checkpointFrame != 0 && recordedFrames + 1 == checkpointFrame && !checkpointTaken) writeCheckpoint();
 }
 
 std::vector<FrameRecorder::PrologueShader> FrameRecorder::prologueShaders(std::span<const Shader* const> shaders, bool registration) {
