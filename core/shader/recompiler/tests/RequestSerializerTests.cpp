@@ -870,6 +870,10 @@ int main() {
     };
     auto version46Dither = twoSample;
     version46Dither[4] = 46u;
+    // This tree's version 47 adds the local target blends (40 bytes after the reversed blend); version 46 is main's layout.
+    const auto ditherBlend = std::search(version46Dither.begin(), version46Dither.end(), pixel.sampleLocations.begin(), pixel.sampleLocations.begin() + 4) - 42;
+    Require(ditherBlend - version46Dither.begin() > static_cast<std::ptrdiff_t>(ditherByte));
+    version46Dither.erase(ditherBlend, ditherBlend + 40);
     Require(rejectsDither(version46Dither));
     version46Dither[ditherByte] = 1u;
     Require(serializer.Deserialize(EncodeBase64(version46Dither)).request.context.pixel->ditheredAlphaSamples == 8u);
