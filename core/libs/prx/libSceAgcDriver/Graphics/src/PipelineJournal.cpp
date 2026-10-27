@@ -41,8 +41,8 @@ static_assert(sizeof(VkVertexInputAttributeDescription) == 16, "VkVertexInputAtt
 // 904 on Linux with this tree's State (stencilSwizzle, blendedColors, targetBlends): the codec does not
 // encode blendedColors, so a journalled build of a blended-colour pipeline lands under another pipeline key
 // (Pipeline.cpp keys blendedColors) and the draw builds its own: wasted prebuild work, not a wrong pipeline.
-static_assert(sizeof(State) == 904, "State changed: update CanonicalPipelineState and the recipe codec");
-static_assert(sizeof(ShaderStages) == 112, "ShaderStages changed: update the recipe codec");
+static_assert(sizeof(State) == 976, "State changed: update CanonicalPipelineState and the recipe codec");
+static_assert(sizeof(ShaderStages) == 160, "ShaderStages changed: update the recipe codec");
 static_assert(sizeof(ShaderRecompiler::MeshConfiguration) == 40, "MeshConfiguration changed: update the recipe codec");
 static_assert(sizeof(ShaderRecompiler::TessellationConfiguration) == 40, "TessellationConfiguration changed: update the recipe codec");
 #endif
