@@ -562,7 +562,10 @@ void Driver::noteWaitBlocked(std::uint32_t queue, std::uint64_t awaited, bool bl
             idleEpoch.fetch_add(1, std::memory_order_release);
             changed.notify_all();
         }
-    } else runningWorkers.fetch_add(1, std::memory_order_acq_rel);
+    } else {
+        runningWorkers.fetch_add(1, std::memory_order_acq_rel);
+        waitReleases.fetch_add(1, std::memory_order_acq_rel);
+    }
     if (queue == 0) queue0Awaited.store(blocked ? awaited : 0, std::memory_order_release);
     if (queue == 0 && !blocked) queue0AwaitsTitle.store(false, std::memory_order_release);
     if (blocked && orderHolders.load(std::memory_order_acquire) != 0) {

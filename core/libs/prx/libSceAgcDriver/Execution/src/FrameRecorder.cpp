@@ -672,68 +672,96 @@ void FrameRecorder::writeDelta(std::span<const Span> spans, std::span<const std:
     }
     auto& driver = DriverDetail::Driver::Get();
     auto [accepted, completed] = driver.SerialProgress();
-    if (completed < accepted && (!added.empty() || !blocks.empty())) {
-        if (!driver.WaitIdleFor(std::chrono::seconds(10))) {
-            stop("stopped: the GPU work submitted before a memory delta did not finish within 10 s");
-            return;
+    const bool reads = !added.empty() || !blocks.empty();
+    bool blocked = false;
+    std::uint64_t releases = 0;
+    const auto settle = [&] {
+        blocked = false;
+        if (completed >= accepted || !reads) return true;
+        const auto outcome = driver.WaitCompletedOrBlockedFor(std::chrono::seconds(10));
+        if (outcome == DriverDetail::Driver::CaptureSettle::TimedOut) {
+            stop("stopped: the GPU work submitted before a memory delta neither finished nor parked on a wait within 10 s");
+            return false;
         }
+        blocked = outcome == DriverDetail::Driver::CaptureSettle::Blocked;
+        releases = driver.WaitReleases();
         std::tie(accepted, completed) = driver.SerialProgress();
-    }
-    const auto group = deltaGroups + 1;
-    bool any = false;
+        return true;
+    };
+    if (!settle()) return;
     std::vector<std::byte> bytes;
-    for (const auto& range : added) {
-        writer->WriteRange(range.address, range.bytes, range.kind, range.protection, range.access);
-        ranges.push_back(range);
-        ++lateRanges;
-        if (!range.readable) {
-            unreadableBytes += range.bytes;
-            continue;
+    for (std::uint32_t pass = 0;; ++pass) {
+        const auto group = deltaGroups + 1;
+        bool any = false;
+        for (const auto& range : added) {
+            if (pass == 0) {
+                writer->WriteRange(range.address, range.bytes, range.kind, range.protection, range.access);
+                ranges.push_back(range);
+                ++lateRanges;
+                if (!range.readable) unreadableBytes += range.bytes;
+            }
+            if (!range.readable) continue;
+            for (std::uint64_t at = 0; at < range.bytes;) {
+                bytes.resize(static_cast<std::size_t>(std::min<std::uint64_t>(FrameCaptureWriter::BlockBytes, range.bytes - at)));
+                GuestMemory::ReadCommittedUnsynced(range.address + at, bytes);
+                const bool zero = std::all_of(bytes.begin(), bytes.end(), [](std::byte value) { return value == std::byte{0}; });
+                if (!zero || pass != 0) {
+                    writer->WriteDelta(group, completed, range.address + at, bytes);
+                    deltaBytes += bytes.size();
+                    any = true;
+                }
+                at += bytes.size();
+            }
         }
-        for (std::uint64_t at = 0; at < range.bytes;) {
-            bytes.resize(static_cast<std::size_t>(std::min<std::uint64_t>(FrameCaptureWriter::BlockBytes, range.bytes - at)));
-            GuestMemory::ReadCommittedUnsynced(range.address + at, bytes);
-            const bool zero = std::all_of(bytes.begin(), bytes.end(), [](std::byte value) { return value == std::byte{0}; });
-            if (!zero) {
-                writer->WriteDelta(group, completed, range.address + at, bytes);
+        if (pass == 0) {
+            for (const auto page : hostPages) {
+                if (!GuestMemory::Accessible(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(page)), HostPageBytes)) continue;
+                bytes.resize(HostPageBytes);
+                std::memcpy(bytes.data(), reinterpret_cast<const void*>(static_cast<std::uintptr_t>(page)), HostPageBytes);
+                const auto hash = contentHash(bytes);
+                auto& known = hostPageHashes[page];
+                if (known == hash) continue;
+                known = hash;
+                writer->WriteDelta(group, completed, page, bytes);
                 deltaBytes += bytes.size();
                 any = true;
             }
-            at += bytes.size();
+            for (const auto& [address, image] : images) {
+                writer->WriteDelta(group, completed, address, image);
+                deltaBytes += image.size();
+                any = true;
+            }
         }
+        for (const auto& [begin, end] : blocks) {
+            bytes.resize(static_cast<std::size_t>(end - begin));
+            GuestMemory::ReadCommittedUnsynced(begin, bytes);
+            writer->WriteDelta(group, completed, begin, bytes);
+            deltaBytes += bytes.size();
+            any = true;
+        }
+        if (any) {
+            deltaGroups = group;
+            auto call = make(FrameCallKind::Memory);
+            call.ordinal = ++ordinal;
+            call.accepted = accepted;
+            call.completed = completed;
+            call.values = {group};
+            writer->WriteCall(call);
+        }
+        if (!blocked) return;
+        ++blockedDeltas;
+        // The unfinished work was parked on waits while the bytes were read. A wait that ended during
+        // the reads (another thread's store) let that work run under them: read the same bytes again,
+        // as a later group, once it finished or parked again.
+        if (driver.WaitReleases() == releases) return;
+        ++rereadDeltas;
+        if (pass >= 8) {
+            stop("stopped: GPU work kept resuming under a memory delta read while it was parked on waits");
+            return;
+        }
+        std::tie(accepted, completed) = driver.SerialProgress();
+        if (!settle()) return;
     }
-    for (const auto page : hostPages) {
-        if (!GuestMemory::Accessible(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(page)), HostPageBytes)) continue;
-        bytes.resize(HostPageBytes);
-        std::memcpy(bytes.data(), reinterpret_cast<const void*>(static_cast<std::uintptr_t>(page)), HostPageBytes);
-        const auto hash = contentHash(bytes);
-        auto& known = hostPageHashes[page];
-        if (known == hash) continue;
-        known = hash;
-        writer->WriteDelta(group, completed, page, bytes);
-        deltaBytes += bytes.size();
-        any = true;
-    }
-    for (const auto& [address, image] : images) {
-        writer->WriteDelta(group, completed, address, image);
-        deltaBytes += image.size();
-        any = true;
-    }
-    for (const auto& [begin, end] : blocks) {
-        bytes.resize(static_cast<std::size_t>(end - begin));
-        GuestMemory::ReadCommittedUnsynced(begin, bytes);
-        writer->WriteDelta(group, completed, begin, bytes);
-        deltaBytes += bytes.size();
-        any = true;
-    }
-    if (!any) return;
-    deltaGroups = group;
-    auto call = make(FrameCallKind::Memory);
-    call.ordinal = ++ordinal;
-    call.accepted = accepted;
-    call.completed = completed;
-    call.values = {group};
-    writer->WriteCall(call);
 }
 
 void FrameRecorder::snapshot(const Range& range) {
@@ -878,7 +906,7 @@ std::string FrameRecorder::header() const {
     text += ",\"calls\":" + std::to_string(recordedCalls) + ",\"prologue_calls\":" + std::to_string(prologueCallCount);
     text += ",\"prologue_rewrites\":" + std::to_string(prologueRewrites) + ",\"prologue_rewrite_bytes\":" + std::to_string(prologueRewriteBytes) + ",\"prologue_dropped\":" + std::to_string(prologueDropped);
     text += ",\"ranges\":" + std::to_string(ranges.size()) + ",\"late_ranges\":" + std::to_string(lateRanges) + ",\"snapshot_bytes\":" + std::to_string(snapshotBytes) + ",\"unreadable_bytes\":" + std::to_string(unreadableBytes);
-    text += ",\"memory_groups\":" + std::to_string(deltaGroups) + ",\"delta_bytes\":" + std::to_string(deltaBytes);
+    text += ",\"memory_groups\":" + std::to_string(deltaGroups) + ",\"delta_bytes\":" + std::to_string(deltaBytes) + ",\"blocked_deltas\":" + std::to_string(blockedDeltas) + ",\"reread_deltas\":" + std::to_string(rereadDeltas);
     text += ",\"capture_seconds\":" + std::to_string(std::chrono::duration<double>(std::chrono::steady_clock::now() - startedAt).count());
     text += ",\"env\":{";
     bool first = true;
