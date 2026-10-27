@@ -187,6 +187,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
         localDevice = device;
     }
     const auto codeOffset = static_cast<std::size_t>((address - snapshot.codeAddress) / sizeof(std::uint32_t));
+    if (VulkanDevice::ExactSerialAllocating() && ProgramAllocates(snapshot, codeOffset)) VulkanDevice::NoteAllocatingProgram(address);
     if (userData.size() >= 6 && Graphics::HtileMaskKernelCode(std::span(snapshot.code).subspan(codeOffset))) Graphics::Recorder::SetWriteOriginKernel(userData[5], userData[4]);
     static const bool profileWriters = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (profileWriters && Graphics::HtileWriterProgram(address)) {

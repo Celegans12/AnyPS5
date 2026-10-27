@@ -350,6 +350,13 @@ public:
     // Whether compute templates refresh their data buffers with a hit's words instead of keying
     // them (APS5_NO_TEMPLATE_DATA_REFRESH unset); the driver's data-only hits require it.
     static bool TemplateDataRefresh();
+    struct SerialAllocatingCount {
+        std::uint64_t dispatches = 0;
+        std::uint64_t workgroups = 0;
+    };
+    static bool ExactSerialAllocating();
+    static void NoteAllocatingProgram(std::uint64_t programAddress);
+    static SerialAllocatingCount SerialAllocatingCounts();
     // The driver's recipe events for the [recipe] line: a restart after Rebuild, an attach; the
     // rows are the dispatch, indirect and draw kinds. NoteDrawRecipeMiss files a draw hit's
     // pre-check miss made in the driver (no recipe for the matched variants, or a device mismatch).

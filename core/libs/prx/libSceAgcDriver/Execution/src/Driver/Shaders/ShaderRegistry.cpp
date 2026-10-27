@@ -565,6 +565,35 @@ bool decodedWritesMemory(std::span<const std::uint32_t> code) {
     }
 }
 
+bool returningMemoryAtomic(const ShaderRecompiler::RdnaInstruction& instruction) {
+    using Op = ShaderRecompiler::RdnaOpcode;
+    const auto op = instruction.op;
+    const bool atomic = (op >= Op::BufferAtomicSwap && op <= Op::BufferAtomicCsub) || (op >= Op::FlatAtomicSwap && op <= Op::GlobalAtomicCsub) || (op >= Op::ImageAtomicSwap && op <= Op::ImageAtomicFmax);
+    return atomic && instruction.glc;
+}
+
+bool decodedAllocates(std::span<const std::uint32_t> code) {
+    using Family = ShaderRecompiler::RdnaInstructionFamily;
+    using Op = ShaderRecompiler::RdnaOpcode;
+    try {
+        const auto decoded = ShaderRecompiler::RdnaInstructionDecoder{}.Decode(code);
+        return std::any_of(decoded.instructions.begin(), decoded.instructions.end(), [](const auto& instruction) {
+            switch (instruction.family) {
+            case Family::DS:
+                return instruction.gds || instruction.op == Op::DsAppend || instruction.op == Op::DsConsume || instruction.op == Op::DsOrderedCount || instruction.op == Op::DsGwsInit || instruction.op == Op::DsGwsBarrier || instruction.op == Op::DsGwsSemaV || instruction.op == Op::DsGwsSemaP || instruction.op == Op::DsGwsSemaBr || instruction.op == Op::DsGwsSemaReleaseAll;
+            case Family::MUBUF: case Family::MTBUF: case Family::FLAT: case Family::MIMG:
+                return returningMemoryAtomic(instruction);
+            case Family::Unknown:
+                return true;
+            default:
+                return false;
+            }
+        });
+    } catch (const std::exception&) {
+        return true;
+    }
+}
+
 }
 
 bool ProgramWritesMemory(const ShaderSnapshot& snapshot, std::size_t codeOffset) {
@@ -577,6 +606,18 @@ bool ProgramWritesMemory(const ShaderSnapshot& snapshot, std::size_t codeOffset)
     const bool writes = decodedWritesMemory(std::span(snapshot.code).subspan(codeOffset));
     if (codeOffset == 0) snapshot.memoryWrites->store(writes ? Writes : Reads, std::memory_order_release);
     return writes;
+}
+
+bool ProgramAllocates(const ShaderSnapshot& snapshot, std::size_t codeOffset) {
+    constexpr std::uint8_t Unknown = 0, Shares = 1, Allocates = 2;
+    if (codeOffset == 0) {
+        const auto cached = snapshot.allocates->load(std::memory_order_acquire);
+        if (cached != Unknown) return cached == Allocates;
+    }
+    if (codeOffset > snapshot.code.size()) return true;
+    const bool allocates = decodedAllocates(std::span(snapshot.code).subspan(codeOffset));
+    if (codeOffset == 0) snapshot.allocates->store(allocates ? Allocates : Shares, std::memory_order_release);
+    return allocates;
 }
 
 std::uint32_t PositionExportLayout(const ShaderSnapshot* snapshot, std::size_t codeOffset, std::span<const std::uint32_t> code, std::uint32_t paClVsOutCntl, const ShaderSnapshot* continuation) {
