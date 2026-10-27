@@ -52,7 +52,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         if (pipelined && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Indirect);
     };
     const PublishedDraw* published = nullptr;
-    if (drawAhead != nullptr && registerKey && !lockedPrepare && !verifyDrawRecipe() && !verifyDrawEntries() && (localDevice = device.Load()) != nullptr) published = drawAhead->Find(submission, packet, queue, localDevice->Serial());
+    static const bool noDrawAhead = std::getenv("APS5_NO_DRAW_AHEAD") != nullptr;
+    if (!noDrawAhead && drawAhead != nullptr && registerKey && !lockedPrepare && !verifyDrawRecipe() && !verifyDrawEntries() && (localDevice = device.Load()) != nullptr) published = drawAhead->Find(submission, packet, queue, localDevice->Serial());
     Pm4::DrawParameters drawParameters{};
     bool traceIndirect = false;
     if (published != nullptr) {
@@ -131,7 +132,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         if (found != drawCache.end()) {
             entry = found->second;
             decode = entry->decode;
-        } else if (auto ahead = findAheadEntry(drawKey); ahead != nullptr) {
+        } else if (auto ahead = noDrawAhead ? nullptr : findAheadEntry(drawKey); ahead != nullptr) {
             entry = std::move(ahead);
             decode = entry->decode;
             if (drawIdentity != 0) {

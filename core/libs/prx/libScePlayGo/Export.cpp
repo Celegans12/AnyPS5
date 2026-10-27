@@ -69,7 +69,7 @@ static const ChunkTable& Chunks() {
             if (ReadPackageChunks(table)) return table;
             table.scenario = std::ifstream(ResolvePath_nid_no_patch("/app0/sce_sys/playgo-scenario.json")).good();
             if (!table.scenario) RejectUnreadablePlayGoFiles();
-            else for (uint32_t id = 1; id < PLAYGO_SCENARIO_CHUNK_COUNT; ++id) table.ids.insert(static_cast<uint16_t>(id));
+            else if (std::getenv("APS5_PLAYGO_SCENARIO_CHUNKS") != nullptr) for (uint32_t id = 1; id < PLAYGO_SCENARIO_CHUNK_COUNT; ++id) table.ids.insert(static_cast<uint16_t>(id));
             return table;
         }
         table.defined = true;
