@@ -33,6 +33,16 @@ bool PushLayoutValid(const Abi::PushLayout& layout) {
     return true;
 }
 
+std::optional<PushBytes> ResolvedDispatchPush(const Abi::PushLayout& layout, std::span<const std::uint32_t> userWords, std::uint64_t tableRoot, std::uint64_t faultRecord) {
+    if (layout.pageTableAddressWord != ResolvedPageTableWord || layout.faultRecordAddressWord != ResolvedFaultRecordWord) return std::nullopt;
+    if (tableRoot == 0 || faultRecord == 0 || layout.overflow) return std::nullopt;
+    for (std::size_t stage = 1; stage < Abi::StageCount; ++stage) {
+        if (layout.userWordCount[stage] != 0) return std::nullopt;
+    }
+    const std::array<std::span<const std::uint32_t>, Abi::StageCount> words{userWords, {}, {}, {}};
+    return BuildPushBlock(layout, words, {tableRoot, faultRecord, 0});
+}
+
 std::optional<PushBytes> BuildPushBlock(const Abi::PushLayout& layout, std::span<const std::span<const std::uint32_t>, Abi::StageCount> userWords, const PushAddresses& addresses) {
     if (!PushLayoutValid(layout)) return std::nullopt;
     for (std::size_t stage = 0; stage < Abi::StageCount; ++stage) {

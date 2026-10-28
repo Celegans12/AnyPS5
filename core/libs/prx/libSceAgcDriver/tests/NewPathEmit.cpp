@@ -103,6 +103,38 @@ void pushBlock() {
     Expect(!BuildPushBlock(past, words, {}).has_value(), "user words past the 256-byte block were accepted");
 }
 
+void resolvedDispatchPush() {
+    Expect(PushRangeBytes(true) == 256u && PushRangeBytes(false) == 128u, "the push ranges are not 256 bytes for resolved modules and today's 128 otherwise");
+    Abi::PushLayout layout;
+    layout.driverWords = 4;
+    layout.pageTableAddressWord = ResolvedPageTableWord;
+    layout.faultRecordAddressWord = ResolvedFaultRecordWord;
+    layout.userWordOffset = {4, 0, 0, 0};
+    layout.userWordCount = {16, 0, 0, 0};
+    std::vector<std::uint32_t> user(16);
+    for (std::uint32_t index = 0; index < 16; ++index) user[index] = 0xa0000000u | index;
+    const auto bytes = ResolvedDispatchPush(layout, user, 0x0000123400560000ull, 0x0000777700880000ull);
+    Expect(bytes.has_value(), "a resolved dispatch's push block was refused");
+    if (bytes) {
+        std::uint32_t words[20]{};
+        std::memcpy(words, bytes->data(), sizeof(words));
+        Expect(words[0] == 0x00560000u && words[1] == 0x00001234u, "the page-table root is not the u64 at words 0-1");
+        Expect(words[2] == 0x00880000u && words[3] == 0x00007777u, "the fault-record address is not the u64 at words 2-3");
+        Expect(words[4] == 0xa0000000u && words[19] == 0xa000000fu, "user SGPRs do not follow the driver words");
+        Expect(std::all_of(bytes->begin() + 80, bytes->end(), [](std::byte value) { return value == std::byte{0}; }), "bytes past the used words are not zero");
+    }
+    Expect(!ResolvedDispatchPush(layout, user, 0, 0x1000).has_value(), "a resolved dispatch with no page-table root was accepted");
+    Expect(!ResolvedDispatchPush(layout, user, 0x1000, 0).has_value(), "a resolved dispatch with no fault record was accepted");
+    auto moved = layout;
+    moved.pageTableAddressWord = 2;
+    moved.faultRecordAddressWord = 0;
+    Expect(!ResolvedDispatchPush(moved, user, 0x1000, 0x2000).has_value(), "a resolved layout with the addresses swapped was accepted");
+    auto graphics = layout;
+    graphics.userWordOffset[3] = 20;
+    graphics.userWordCount[3] = 2;
+    Expect(!ResolvedDispatchPush(graphics, user, 0x1000, 0x2000).has_value(), "a dispatch layout with pixel words was accepted");
+}
+
 BdaAbi::Range MakeRange(std::uint64_t begin, std::uint64_t end, std::uint32_t permissions) {
     return {begin, end, 0x7f0000000000ull + begin, permissions, 0u};
 }
@@ -142,6 +174,7 @@ int main() {
         routerEmitOrder();
         pushBlock();
         writeSets();
+        resolvedDispatchPush();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;
