@@ -1126,6 +1126,18 @@ void ResidencyManager::refreshOrdered(std::span<const Fill> fills) {
     std::vector<Fill> needed;
     for (const auto& fill : fills) {
         const auto& page = pages[fill.id];
+        if (fill.cpu && (RunMask(fill.begin, fill.end) & page.dirty) != 0) {
+            ++counts.cpuFillsBesideDirty;
+            const auto clean = static_cast<std::uint32_t>(RunMask(fill.begin, fill.end) & ~page.dirty);
+            for (std::uint32_t bits = clean; bits != 0;) {
+                const auto first = static_cast<std::uint32_t>(std::countr_zero(bits));
+                const auto run = static_cast<std::uint32_t>(std::countr_one(bits >> first));
+                needed.push_back({fill.id, first << ResidencySubpageShift, (first + run) << ResidencySubpageShift, true});
+                ++counts.refreshed;
+                bits &= run >= 32 ? 0u : ~(((1u << run) - 1u) << first);
+            }
+            continue;
+        }
         if ((RunMask(fill.begin, fill.end) & page.dirty) != 0) {
             const bool overlaps = std::any_of(page.dirtyRuns.begin(), page.dirtyRuns.end(), [&](const Run& run) { return run.first < fill.end && run.second > fill.begin; });
             if (overlaps) ++counts.conflicts;
@@ -1396,7 +1408,7 @@ void ResidencyManager::applyFaults(std::vector<std::uint64_t> written) {
         while (bits != 0) {
             const auto first = static_cast<std::uint32_t>(std::countr_zero(bits));
             const auto run = static_cast<std::uint32_t>(std::countr_one(bits >> first));
-            fills.push_back({*id, first << ResidencySubpageShift, (first + run) << ResidencySubpageShift});
+            fills.push_back({*id, first << ResidencySubpageShift, (first + run) << ResidencySubpageShift, true});
             bits &= run >= 32 ? 0u : ~(((1u << run) - 1u) << first);
         }
         partial.emplace_back(*id, writes.generation);
@@ -1602,7 +1614,7 @@ void ResidencyManager::Use(std::uint64_t address, std::uint64_t bytes, Residency
         for (const auto id : present) {
             unlink(id);
             linkNewest(id);
-            if (stale[pages[id].index - span.first] != 0) fills.push_back({id});
+            if (stale[pages[id].index - span.first] != 0) fills.push_back({id, 0, WholeEnd, true});
             stale[pages[id].index - span.first] = 0;
         }
         refresh(fills);
@@ -2538,6 +2550,13 @@ std::vector<std::uint64_t> ResidencyManager::TakeChanges() {
     changes.clear();
     std::sort(taken.begin(), taken.end());
     return taken;
+}
+
+std::vector<std::pair<std::uint64_t, std::uint64_t>> ResidencyManager::ResidentGenerations() const {
+    const std::lock_guard structureLock(structure);
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> resident;
+    for (auto id = oldest; id != None; id = pages[id].newer) resident.emplace_back(pages[id].index, pages[id].generation);
+    return resident;
 }
 
 std::vector<std::uint32_t> ResidencyManager::Chunks() const {

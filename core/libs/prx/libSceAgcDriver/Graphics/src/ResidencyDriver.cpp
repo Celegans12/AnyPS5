@@ -169,6 +169,7 @@ std::unique_ptr<ResidencyDriver> ResidencyDriver::CreateIfEnabled(const Context&
 }
 
 void ResidencyDriver::OrderingPoint() {
+    if (const auto written = guest.WrittenSince(manager.ResidentGenerations()); !written.empty()) manager.QueueCpuWritten(written);
     if (!manager.Advance()) return;
     std::unique_lock lock(GuestMemory::GpuMutex(), std::defer_lock);
     if (!GuestMemory::GpuMutex().HeldByThisThread()) lock.lock();
@@ -275,6 +276,10 @@ std::uint64_t ResidencyDriver::Budget() {
 
 std::uint64_t ResidencyDriver::GuestBytes() {
     return guest.GuestBytes();
+}
+
+ResidencyWrites ResidencyDriver::PageWrites(std::uint64_t page, std::uint64_t generation) {
+    return guest.PageWrites(page, generation);
 }
 
 }

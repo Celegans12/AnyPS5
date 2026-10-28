@@ -24,12 +24,16 @@ public:
     ResidencyRefusal GuardAccess(std::uint64_t page, ResidencyMask mask) override;
     void UnguardAccess(std::uint64_t page) override;
     std::uint64_t GuestBytes() override;
+    ResidencyWrites PageWrites(std::uint64_t page, std::uint64_t generation) override;
+    std::vector<std::uint64_t> WrittenSince(std::span<const std::pair<std::uint64_t, std::uint64_t>> resident) override;
 
+    std::uint64_t UnwatchedImports() const { return unwatchedImports.load(std::memory_order_relaxed); }
     std::uint64_t GuardRefusals(std::size_t code) const { return code < guardRefusals.size() ? guardRefusals[code].load(std::memory_order_relaxed) : 0; }
 
 private:
     Context context;
     std::array<std::atomic<std::uint64_t>, ResidencyGuardRefusalCodes> guardRefusals{};
+    std::atomic<std::uint64_t> unwatchedImports{0};
 };
 
 }

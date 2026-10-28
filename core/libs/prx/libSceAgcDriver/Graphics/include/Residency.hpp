@@ -173,6 +173,7 @@ public:
 
 struct ResidencyCounts {
     std::uint64_t admitted = 0;
+    std::uint64_t cpuFillsBesideDirty = 0;
     std::uint64_t deferred = 0;
     std::uint64_t inadmissible = 0;
     std::uint64_t evicted = 0;
@@ -328,6 +329,7 @@ public:
     bool ChangesSince(std::uint64_t serial, std::uint64_t& now, std::vector<std::pair<std::uint64_t, std::uint64_t>>& changed);
     std::vector<std::pair<std::uint64_t, std::uint64_t>> Mirrored(std::uint64_t& now);
     std::vector<std::uint32_t> Chunks() const;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ResidentGenerations() const;
     std::uint64_t ChunkAddress(std::uint32_t chunk) const;
     std::uint32_t ChunkSlots() const { return chunkSlots; }
     std::uint64_t Serial() const { return serial; }
@@ -411,6 +413,7 @@ private:
         std::uint32_t id = 0;
         std::uint32_t begin = 0;
         std::uint32_t end = WholeEnd;
+        bool cpu = false;
     };
 
     struct UnboundedWriter {

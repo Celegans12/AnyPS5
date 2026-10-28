@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/DevicePageTable.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ResidencySession.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryStatsDevice.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
@@ -967,6 +968,7 @@ struct VulkanDevice::State {
             Graphics::ClearCachedTextures(device);
             Graphics::ClearSnapshotCopies(device);
             Graphics::ClearImageMirrors(device);
+            Graphics::ReleaseResidency(device);
             NewPath::DeviceTable().Release(device);
             Graphics::ClearHostImports(device);
             patternBuffers.clear();
