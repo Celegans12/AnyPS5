@@ -65,6 +65,12 @@ public:
     const ResidencyMirrors& Mirrors() const { return mirrors; }
     ResidencyTokens& Tokens() { return tokens; }
     void OrderingPoint();
+    void EnableFaults();
+    void DisableFaults();
+    void AccessFault(std::uint64_t address);
+    std::uint64_t FastFaults() const { return fastFaults.load(std::memory_order_relaxed); }
+    std::uint64_t ServedFaults() const { return servedFaults.load(std::memory_order_relaxed); }
+    std::uint64_t RefusedFaults() const { return refusedFaults.load(std::memory_order_relaxed); }
 
     bool Reached(const ResidencyToken& token) override;
     void Wait(const ResidencyToken& token) override;
@@ -89,6 +95,7 @@ public:
 
 private:
     ResidencyToken record(std::span<const ResidencyCopy> copies, bool intoMirror);
+    struct FaultServer;
 
     Context context;
     Recorder& recorder;
@@ -98,6 +105,10 @@ private:
     std::uint64_t budgetBytes = 0;
     ResidencyMirrors mirrors;
     ResidencyManager manager;
+    std::unique_ptr<FaultServer> faultServer;
+    std::atomic<std::uint64_t> fastFaults{0};
+    std::atomic<std::uint64_t> servedFaults{0};
+    std::atomic<std::uint64_t> refusedFaults{0};
 };
 
 }

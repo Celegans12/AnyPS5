@@ -2,8 +2,14 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidencyConfig.hpp"
+#include "prx/libc/include/GuestArena.hpp"
 #include <algorithm>
+#include <condition_variable>
+#include <cstdio>
+#include <deque>
+#include <exception>
 #include <mutex>
+#include <thread>
 #include <stdexcept>
 #include <string>
 
@@ -56,9 +62,98 @@ ResidencyDriver::ResidencyDriver(const Context& context, Recorder& recorder, IRe
     if (!activeDriver.compare_exchange_strong(expected, this)) throw std::logic_error("residency: a second residency driver while one is active");
 }
 
+struct ResidencyDriver::FaultServer {
+    struct Request {
+        std::uint64_t address = 0;
+        bool done = false;
+        std::exception_ptr failure;
+    };
+
+    explicit FaultServer(ResidencyDriver& driver) : driver(driver), thread([this] { run(); }) {}
+
+    ~FaultServer() {
+        {
+            const std::lock_guard lock(mutex);
+            stopping = true;
+        }
+        wake.notify_all();
+        thread.join();
+    }
+
+    void Serve(std::uint64_t address) {
+        Request request{address};
+        std::unique_lock lock(mutex);
+        queue.push_back(&request);
+        wake.notify_all();
+        finished.wait(lock, [&] { return request.done; });
+        if (request.failure) std::rethrow_exception(request.failure);
+    }
+
+    void run() {
+        std::unique_lock lock(mutex);
+        for (;;) {
+            wake.wait(lock, [&] { return stopping || !queue.empty(); });
+            if (queue.empty()) return;
+            auto* request = queue.front();
+            queue.pop_front();
+            lock.unlock();
+            try {
+                driver.manager.FlushForCpuRead(request->address & ~(ResidencyPageBytes - 1), ResidencyPageBytes);
+            } catch (...) {
+                request->failure = std::current_exception();
+            }
+            lock.lock();
+            request->done = true;
+            finished.notify_all();
+        }
+    }
+
+    ResidencyDriver& driver;
+    std::mutex mutex;
+    std::condition_variable wake;
+    std::condition_variable finished;
+    std::deque<Request*> queue;
+    bool stopping = false;
+    std::thread thread;
+};
+
 ResidencyDriver::~ResidencyDriver() {
+    DisableFaults();
     ResidencyDriver* expected = this;
     activeDriver.compare_exchange_strong(expected, nullptr);
+}
+
+void ResidencyDriver::EnableFaults() {
+    if (faultServer != nullptr) return;
+    faultServer = std::make_unique<FaultServer>(*this);
+    GuestArena::GuestArenaSetAccessGuardObserver_nid_no_patch([](std::uintptr_t address) {
+        if (auto* driver = ResidencyDriver::Active()) driver->AccessFault(address);
+    });
+}
+
+void ResidencyDriver::DisableFaults() {
+    if (faultServer == nullptr) return;
+    GuestArena::GuestArenaSetAccessGuardObserver_nid_no_patch(nullptr);
+    faultServer.reset();
+}
+
+void ResidencyDriver::AccessFault(std::uint64_t address) {
+    if (GuestMemory::GpuMutex().HeldByThisThread() || faultServer == nullptr) {
+        refusedFaults.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    const auto page = address & ~(ResidencyPageBytes - 1);
+    try {
+        if (manager.FlushForCpuReadSettled(page, ResidencyPageBytes)) {
+            fastFaults.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        faultServer->Serve(page);
+        servedFaults.fetch_add(1, std::memory_order_relaxed);
+    } catch (const std::exception& error) {
+        refusedFaults.fetch_add(1, std::memory_order_relaxed);
+        std::fprintf(stderr, "[residency] fault at 0x%llx not served: %s\n", static_cast<unsigned long long>(address), error.what());
+    }
 }
 
 ResidencyDriver* ResidencyDriver::Active() {
