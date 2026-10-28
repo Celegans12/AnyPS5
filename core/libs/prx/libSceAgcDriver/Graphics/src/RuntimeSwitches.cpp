@@ -81,8 +81,10 @@ struct Refusal {
     const char* reason;
 };
 
-constexpr std::array<Refusal, 1> Refused{{
+constexpr std::array<Refusal, 3> Refused{{
     {"APS5_ASYNC_LANE", "it selects the device's queues at creation, and a label stored in one lane and consumed after the change would lose its GPU edge"},
+    {"APS5_NEW_PATH", "it selects the driver's memory and command model at device creation; the new path against the old one is read from separate long runs (A-B-A)"},
+    {"APS5_NEW_PATH_NO_RESIDENCY", "the residency table owns resident and guarded pages from device creation on; turning it off mid-run would leave pages no reader publishes"},
 }};
 
 struct SwitchValues {
