@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ResidencyDriver.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidencyGuest.hpp"
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/DevicePageTable.hpp"
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <memory>
@@ -66,13 +67,16 @@ void EnsureResidency(const Context& context) {
         std::vector<ShaderRecompiler::BdaAbi::Range> pieces;
         auto* driver = ResidencyDriver::Active();
         if (driver == nullptr || end <= begin) return pieces;
-        for (auto page = begin >> ResidencyPageShift; page <= (end - 1) >> ResidencyPageShift; ++page) {
+        for (const auto& [page, generation] : driver->Manager().ResidentGenerations()) {
+            static_cast<void>(generation);
+            if (page < (begin >> ResidencyPageShift) || page > ((end - 1) >> ResidencyPageShift)) continue;
             const auto mirror = driver->Manager().Translate(page);
             if (!mirror) continue;
             const auto first = std::max(begin, page << ResidencyPageShift);
             const auto last = std::min(end, (page + 1) << ResidencyPageShift);
             pieces.push_back({first, last, *mirror + (first - (page << ResidencyPageShift)), ShaderRecompiler::BdaAbi::Read | ShaderRecompiler::BdaAbi::Write, 0});
         }
+        std::sort(pieces.begin(), pieces.end(), [](const auto& left, const auto& right) { return left.begin < right.begin; });
         return pieces;
     });
 }
