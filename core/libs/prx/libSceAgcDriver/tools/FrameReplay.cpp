@@ -524,7 +524,6 @@ struct Replay {
     std::atomic<std::uint64_t> syntheticReleases{0};
     std::atomic<std::size_t> sequenced{0};
     std::atomic<int> busy{0};
-    std::atomic<int> pacing{0};
     struct LabelWrite {
         std::uint64_t address = 0;
         std::uint64_t value = 0;
@@ -601,16 +600,9 @@ struct Replay {
         const auto waited = [&] { paceWaitedNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - began).count(); };
         struct Parked {
             std::atomic<int>& busy;
-            std::atomic<int>& pacing;
-            Parked(std::atomic<int>& counter, std::atomic<int>& waiting) : busy(counter), pacing(waiting) {
-                --busy;
-                ++pacing;
-            }
-            ~Parked() {
-                --pacing;
-                ++busy;
-            }
-        } parked{busy, pacing};
+            explicit Parked(std::atomic<int>& counter) : busy(counter) { --busy; }
+            ~Parked() { ++busy; }
+        } parked{busy};
         while (true) {
             const auto [accepted, completed] = progress();
             if (accepted - completed <= inFlight) {
@@ -626,7 +618,7 @@ struct Replay {
                 deadline = now + timeout;
             }
             if (memory && deltaReleasesWait(call)) return waited();
-            if (now - quietSince >= (options.exact ? ExactQuiet : BlockedQuiet) && blockedOnWaits()) return waited();
+            if (!options.exact && now - quietSince >= BlockedQuiet && blockedOnWaits()) return waited();
             if (now >= deadline) {
                 waited();
                 if (memory) {
@@ -1020,7 +1012,7 @@ struct Replay {
                 }
                 if (options.exact) {
                     const auto now = Clock::now();
-                    if (busy.load() == 0 && pacing.load() == 0 && blockedOnWaits()) {
+                    if (busy.load() == 0 && blockedOnWaits()) {
                         if (!parkedSince) parkedSince = now;
                         if (now - *parkedSince < ParkedQuiet) continue;
                         const auto before = earlyReleases.load();
@@ -1151,8 +1143,8 @@ int usage() {
                          "                      memory delta,\n"
                          "                      so the GPU work runs in one order (a reproducible baseline, slower than the title), and releases\n"
                          "                      awaited dwords when every replay thread is parked and the driver is blocked on waits, in capture order,\n"
-                         "                      one dword per parked state once no replay thread is still pacing, so queues released past the\n"
-                         "                      window's end do not run beside each other; a dword that a submitted packet of the window writes\n"
+                         "                      one dword per parked state, with no timed escape for a submission behind blocked ones, so queues\n"
+                         "                      released past the window's end do not run beside each other; a dword that a submitted packet of the window writes\n"
                          "                      (RELEASE_MEM, EVENT_WRITE_EOP, WRITE_DATA, COPY_DATA, ATOMIC_MEM, DMA_DATA) is synthesized last;\n"
                          "                      synthesized dwords go in the capture order of the submission that waits on them\n"
                          "  --frame-limit <n>   replays the calls through the n-th CPU flip, or the n-th suspend point when the title flips from the GPU,\n"
