@@ -1665,8 +1665,18 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     // looks stale at the next lookup, whose compare stores the next slices, and so on every frame
     // (best110). So everything else stores them first and collects again, as without slice copies.
     // APS5_TRACE_SAMPLED_FLUSH: why a lookup with slices stored them instead of copying ([slice-store]).
+    // APS5_TRACE_SAMPLED_FLUSH: the slices each surface's last store wrote back, to tell whether the blocks found
+    // moved at the next lookup are the stamps of that store landing after its collect.
+    static std::mutex storedMutex;
+    static std::unordered_map<std::uint64_t, std::vector<std::pair<std::uint64_t, std::uint64_t>>> storedSlices;
     const auto storeSlices = [&](const char* why) {
-        if (traceSampledFlush) std::fprintf(stderr, "[slice-store] 0x%llx: %s (%zu slices)\n", static_cast<unsigned long long>(address), why, slices.size());
+        if (traceSampledFlush) {
+            std::fprintf(stderr, "[slice-store] 0x%llx: %s (%zu slices)\n", static_cast<unsigned long long>(address), why, slices.size());
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+            for (const auto& slice : slices) ranges.emplace_back(slice.image->Descriptor().baseAddress, slice.image->Descriptor().baseAddress + slice.image->GuestBytes());
+            std::lock_guard storedLock(storedMutex);
+            storedSlices[address] = std::move(ranges);
+        }
         StorageTexture::FlushPending(address, bytes, nullptr, "sampled texture");
         generation = GuestMemory::CollectWrites(address, bytes);
         snapshotGeneration = generation;
@@ -1745,6 +1755,13 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             // (best113: 7 of 141 blocks a frame, the current cubemap's). The snapshot holds when every
             // block stamped since it was taken was stamped by the driver, not a CPU store, and lies
             // under a pending slice the copy below replaces.
+            // C60: a 64 KiB tracker block is shared with whatever lies next to the surface (Yotei's probe array
+            // ends 0x4000 bytes into a block another resource the GPU writes every frame stamps), so a moved
+            // block no pending slice covers is accepted when the surface's own bytes in it still hash to the
+            // snapshot's block hash and no recorded GPU write or pending storage image covers them. Without it
+            // the probe stored its 18 slices and re-snapshotted 8.8 MiB every frame (3.8 ms, best392-395).
+            // APS5_NO_SLICE_EDGE_HASH=1 (runtime switch) refuses such a block, as before.
+            const bool edgeHash = !RuntimeSwitches::Set(RuntimeSwitch::NoSliceEdgeHash) && it->hashes.size() == GuestMemory::HashBlockCount(address, bytes);
             const auto onlySliceStamps = [&] {
                 const auto blocks = ((address + bytes + 0xffffu) >> 16u) - (address >> 16u);
                 std::vector<std::uint64_t> generations(blocks, it->generation);
@@ -1759,7 +1776,13 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                         const auto sliceBegin = slice.image->Descriptor().baseAddress;
                         return sliceBegin < end && begin < sliceBegin + slice.image->GuestBytes();
                     });
-                    if (!underSlice) return false;
+                    if (underSlice) continue;
+                    if (!edgeHash) return false;
+                    const auto clipBegin = std::max<std::uint64_t>(begin, address);
+                    const auto clipBytes = static_cast<std::size_t>(std::min<std::uint64_t>(end, address + bytes) - clipBegin);
+                    const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> clip{{{clipBegin, clipBegin + clipBytes}}};
+                    if (Recorder::SnapshotWriteOverlaps(clipBegin, clipBytes) || PendingStorageOverlaps(clipBegin, clipBytes, nullptr) || StorageTexture::AnyPendingOverlaps(clip)) return false;
+                    if (!GuestMemory::CommittedBlocksMatch(clipBegin, clipBytes, std::span(it->hashes).subspan(k, 1))) return false;
                 }
                 return true;
             };
@@ -1772,13 +1795,29 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                     std::vector<std::uint64_t> generations(blocks, it->generation);
                     std::vector<std::uint8_t> changed(blocks), cpu(blocks);
                     GuestMemory::ChangedBlocks(address, bytes, generations, changed, cpu);
-                    std::size_t moved = 0, byCpu = 0;
-                    std::string first;
+                    std::size_t moved = 0, byCpu = 0, underPending = 0, underStored = 0;
+                    std::string first, uncovered;
+                    std::vector<std::pair<std::uint64_t, std::uint64_t>> stored;
+                    {
+                        std::lock_guard storedLock(storedMutex);
+                        if (const auto found = storedSlices.find(address); found != storedSlices.end()) stored = found->second;
+                    }
                     const auto layerBytes = DescribeSurface(resource).layerBytes;
                     for (std::size_t k = 0; k < blocks; ++k) {
                         if (changed[k] == GuestMemory::BlockUnchanged) continue;
                         ++moved;
                         byCpu += cpu[k] != 0;
+                        {
+                            const auto blockBegin = ((address >> 16u) + k) << 16u;
+                            const auto blockEnd = blockBegin + 0x10000u;
+                            underPending += std::any_of(slices.begin(), slices.end(), [&](const PendingSlice& slice) { const auto b = slice.image->Descriptor().baseAddress; return b < blockEnd && blockBegin < b + slice.image->GuestBytes(); }) ? 1u : 0u;
+                            underStored += std::any_of(stored.begin(), stored.end(), [&](const auto& range) { return range.first < blockEnd && blockBegin < range.second; }) ? 1u : 0u;
+                            if (!std::any_of(slices.begin(), slices.end(), [&](const PendingSlice& slice) { const auto b = slice.image->Descriptor().baseAddress; return b < blockEnd && blockBegin < b + slice.image->GuestBytes(); })) {
+                                char item[64];
+                                std::snprintf(item, sizeof(item), " uncovered 0x%llx", static_cast<unsigned long long>(blockBegin));
+                                uncovered += item;
+                            }
+                        }
                         if (moved <= 6) {
                             const auto blockStart = ((address >> 16u) + k) << 16u;
                             const auto offset = blockStart > address ? blockStart - address : 0u;
@@ -1787,7 +1826,13 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                             first += item;
                         }
                     }
-                    std::fprintf(stderr, "[slice-store] 0x%llx: cached snapshot stamped since generation %llu: %zu of %llu blocks moved, %zu by CPU stores:%s\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(it->generation), moved, static_cast<unsigned long long>(blocks), byCpu, first.c_str());
+                    std::fprintf(stderr, "[slice-store] 0x%llx: cached snapshot stamped since generation %llu: %zu of %llu blocks moved, %zu by CPU stores, %zu under a pending slice, %zu under a slice the last store wrote back (%zu stored, %zu pending now):%s;%s\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(it->generation), moved, static_cast<unsigned long long>(blocks), byCpu, underPending, underStored, stored.size(), slices.size(), first.c_str(), uncovered.c_str());
+                    static int slicesListed = 0;
+                    if (slicesListed++ < 2) {
+                        for (const auto& slice : slices) std::fprintf(stderr, "[slice-store]   pending slice 0x%llx+0x%llx %ux%u fmt %u\n", static_cast<unsigned long long>(slice.image->Descriptor().baseAddress), static_cast<unsigned long long>(slice.image->GuestBytes()), slice.image->Descriptor().width, slice.image->Descriptor().height, slice.image->Descriptor().format);
+                        const auto geometry = DescribeSurface(resource);
+                        std::fprintf(stderr, "[slice-store]   surface 0x%llx+0x%llx layers %u layerBytes 0x%llx mips %zu\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), geometry.layers, static_cast<unsigned long long>(geometry.layerBytes), geometry.mips.size());
+                    }
                 }
                 storeSlices(*keys != DccKeys::Uncompressed ? "keys not uncompressed" : "cached snapshot stamped");
             }
