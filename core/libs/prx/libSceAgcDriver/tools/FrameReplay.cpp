@@ -523,6 +523,13 @@ struct Replay {
     std::atomic<std::uint64_t> syntheticReleases{0};
     std::atomic<std::size_t> sequenced{0};
     std::atomic<int> busy{0};
+    std::atomic<int> pacing{0};
+    struct LabelWrite {
+        std::uint64_t address = 0;
+        std::uint64_t value = 0;
+        bool known = false;
+    };
+    std::vector<LabelWrite> labelWrites;
     std::atomic<std::uint64_t> parkedReleases{0};
     std::atomic<std::uint64_t> fallbackReleases{0};
     std::atomic<bool> parkedWithoutRelease{false};
@@ -592,9 +599,16 @@ struct Replay {
         const auto waited = [&] { paceWaitedNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - began).count(); };
         struct Parked {
             std::atomic<int>& busy;
-            explicit Parked(std::atomic<int>& counter) : busy(counter) { --busy; }
-            ~Parked() { ++busy; }
-        } parked{busy};
+            std::atomic<int>& pacing;
+            Parked(std::atomic<int>& counter, std::atomic<int>& waiting) : busy(counter), pacing(waiting) {
+                --busy;
+                ++pacing;
+            }
+            ~Parked() {
+                --pacing;
+                ++busy;
+            }
+        } parked{busy, pacing};
         while (true) {
             const auto [accepted, completed] = progress();
             if (accepted - completed <= inFlight) {
@@ -699,6 +713,7 @@ struct Replay {
             return;
         case FrameCallKind::Submit: {
             const Packet packet{reinterpret_cast<std::uint32_t*>(static_cast<std::uintptr_t>(call.address)), static_cast<std::uint32_t>(call.size), static_cast<std::uint8_t>(call.flags), {}};
+            if (recording && options.exact) noteLabelWrites(call.address, call.size, 0);
             if (call.queue == 0) sceAgcDriverSubmitDcb(&packet);
             else sceAgcDriverSubmitAcb(call.queue, &packet);
             if (++submits % 25 == 0) report();
@@ -822,6 +837,64 @@ struct Replay {
         }
     }
 
+    void noteLabelWrites(std::uint64_t address, std::uint64_t dwords, int depth) {
+        if (address < 0x1000 || address >> 48 != 0 || dwords == 0 || dwords > 0xfffff || depth > 8) return;
+        const auto* const words = reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(address));
+        const auto at48 = [](std::uint32_t low, std::uint32_t high) { return low | static_cast<std::uint64_t>(high & 0xffff) << 32; };
+        std::vector<LabelWrite> found;
+        for (std::uint64_t at = 0; at < dwords;) {
+            const auto header = words[at];
+            if (header >> 30 != 3) {
+                ++at;
+                continue;
+            }
+            const std::uint64_t length = ((header >> 16) & 0x3fff) + 1;
+            if (at + 1 + length > dwords) break;
+            const auto* const body = words + at + 1;
+            switch ((header >> 8) & 0xff) {
+            case 0x49:
+                if (length >= 6) {
+                    const auto select = (body[1] >> 29) & 7;
+                    if (select == 1) found.push_back({at48(body[2], body[3]), body[4], true});
+                    else if (select == 2) found.push_back({at48(body[2], body[3]), body[4] | static_cast<std::uint64_t>(body[5]) << 32, true});
+                    else if (select != 0) found.push_back({at48(body[2], body[3]), 0, false});
+                }
+                break;
+            case 0x47:
+                if (length >= 4) {
+                    const auto select = (body[2] >> 29) & 7;
+                    if (select == 1 || select == 2) found.push_back({at48(body[1], body[2]), body[3], true});
+                    else if (select != 0) found.push_back({at48(body[1], body[2]), 0, false});
+                }
+                break;
+            case 0x37:
+                if (length >= 4) found.push_back({at48(body[1], body[2]), body[3], true});
+                break;
+            case 0x40:
+            case 0x50:
+                if (length >= 5) found.push_back({at48(body[3], body[4]), 0, false});
+                break;
+            case 0x1e:
+                if (length >= 3) found.push_back({at48(body[1], body[2]), 0, false});
+                break;
+            case 0x33:
+            case 0x3f:
+                if (length >= 3) noteLabelWrites(at48(body[0] & ~3u, body[1]), body[2] & 0xfffff, depth + 1);
+                break;
+            default:
+                break;
+            }
+            at += 1 + length;
+        }
+        if (found.empty()) return;
+        std::lock_guard lock(memoryMutex);
+        labelWrites.insert(labelWrites.end(), found.begin(), found.end());
+    }
+
+    bool writerInWindow(const AgcDriver::AwaitedWait& wait) const {
+        return std::any_of(labelWrites.begin(), labelWrites.end(), [&](const LabelWrite& write) { return write.address == wait.address && (!write.known || wait.function == 0 || satisfies(wait, write.value)); });
+    }
+
     bool writeRecordedValue(const FrameCall& call, const AgcDriver::AwaitedWait& wait) {
         if (call.kind != FrameCallKind::Memory) return false;
         const auto found = groups.find(call.values.at(0));
@@ -871,18 +944,20 @@ struct Replay {
             for (std::size_t slot = 0; slot < count; ++slot) sorted[slot] = awaited[order[slot]];
             awaited = sorted;
         }
+        for (int pass = options.exact ? 0 : 1; pass < 2; ++pass)
         for (std::size_t slot = 0; slot < count; ++slot) {
             const auto& wait = awaited[slot];
             if (wait.address == 0) continue;
             const std::size_t bytes = wait.bytes == 8 ? 8 : 4;
             if (wait.function != 0 && satisfies(wait, load(wait.address, bytes))) continue;
+            const bool deferred = pass == 0 && writerInWindow(wait);
             bool released = false;
             for (auto index = from; index < calls.size() && !released; ++index) released = writeRecordedValue(calls[index], wait);
             for (auto index = std::min(from, calls.size()); index > 0 && !released; --index) {
                 released = writeRecordedValue(calls[index - 1], wait);
                 if (released) ++lateReleases;
             }
-            if (!released && options.synthesize) {
+            if (!released && options.synthesize && !deferred) {
                 if (const auto value = satisfying(wait, load(wait.address, bytes))) {
                     const auto before = load(wait.address, bytes);
                     std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(wait.address)), &*value, bytes);
@@ -937,7 +1012,7 @@ struct Replay {
                 }
                 if (options.exact) {
                     const auto now = Clock::now();
-                    if (busy.load() == 0 && blockedOnWaits()) {
+                    if (busy.load() == 0 && pacing.load() == 0 && blockedOnWaits()) {
                         if (!parkedSince) parkedSince = now;
                         if (now - *parkedSince < ParkedQuiet) continue;
                         const auto before = earlyReleases.load();
@@ -1068,7 +1143,9 @@ int usage() {
                          "                      memory delta,\n"
                          "                      so the GPU work runs in one order (a reproducible baseline, slower than the title), and releases\n"
                          "                      awaited dwords when every replay thread is parked and the driver is blocked on waits, in capture order,\n"
-                         "                      one dword per parked state, so queues released past the window's end do not run beside each other\n"
+                         "                      one dword per parked state once no replay thread is still pacing, so queues released past the\n"
+                         "                      window's end do not run beside each other; a dword that a submitted packet of the window writes\n"
+                         "                      (RELEASE_MEM, EVENT_WRITE_EOP, WRITE_DATA, COPY_DATA, ATOMIC_MEM, DMA_DATA) is synthesized last\n"
                          "  --frame-limit <n>   replays the calls through the n-th CPU flip, or the n-th suspend point when the title flips from the GPU,\n"
                          "                      and compares the display buffer with the title's image at that frame\n"
                          "  --checkpoint <csv>  replays up to the checkpoint of a capture made with APS5_FRAME_CAPTURE_CHECKPOINT=<frame> and lists\n"
