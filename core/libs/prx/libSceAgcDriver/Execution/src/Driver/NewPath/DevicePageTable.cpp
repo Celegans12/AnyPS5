@@ -79,7 +79,7 @@ std::shared_ptr<const Graphics::BdaPageTable> DevicePageTable::Refresh(const Gra
     auto snapshot = imports(context);
     importRanges = std::move(snapshot.ranges);
     std::sort(importRanges.begin(), importRanges.end(), [](const Range& left, const Range& right) { return left.begin < right.begin; });
-    const auto ranges = piecesLocked(0, ShaderRecompiler::BdaAbi::PageTableEnd);
+    auto ranges = piecesLocked(0, ShaderRecompiler::BdaAbi::PageTableEnd);
     Graphics::ValidateBdaPageRanges(ranges);
     table = Graphics::BdaPageTable::Build(context, ranges);
     built = true;
@@ -88,6 +88,7 @@ std::shared_ptr<const Graphics::BdaPageTable> DevicePageTable::Refresh(const Gra
     counts.ranges = ranges.size();
     counts.coveredBytes = coveredBytes(ranges);
     counts.importVersion = now;
+    tableRanges = std::move(ranges);
     return table;
 }
 
@@ -102,6 +103,7 @@ std::shared_ptr<const Graphics::BdaPageTable> DevicePageTable::PatchPages(const 
     if (table == nullptr) return nullptr;
     table = Graphics::BdaPageTable::Patch(context, table, pages, [this](std::uint64_t begin, std::uint64_t end) { return piecesLocked(begin, end); });
     ++counts.patches;
+    tableRanges = piecesLocked(0, ShaderRecompiler::BdaAbi::PageTableEnd);
     return table;
 }
 
@@ -113,6 +115,7 @@ void DevicePageTable::Release(VkDevice device) {
         dropped = std::move(table);
         tableDevice = VK_NULL_HANDLE;
         importRanges.clear();
+        tableRanges.clear();
         built = false;
         builtVersion = 0;
         ++counts.released;
@@ -127,6 +130,11 @@ void DevicePageTable::SetResidentPieces(ResidentPieces pieces) {
 std::shared_ptr<const Graphics::BdaPageTable> DevicePageTable::Current() const {
     std::lock_guard lock(mutex);
     return table;
+}
+
+std::vector<Range> DevicePageTable::Ranges() const {
+    std::lock_guard lock(mutex);
+    return tableRanges;
 }
 
 DevicePageTable::Counts DevicePageTable::Totals() const {

@@ -40,6 +40,7 @@ public:
 
     [[nodiscard]] std::shared_ptr<const Graphics::BdaPageTable> Current() const;
     [[nodiscard]] Counts Totals() const;
+    [[nodiscard]] std::vector<Range> Ranges() const;
 
     [[nodiscard]] static std::vector<Range> Overlay(std::span<const Range> base, std::span<const Range> resident, std::uint64_t begin, std::uint64_t end);
 
@@ -51,6 +52,7 @@ private:
     mutable std::mutex mutex;
     ResidentPieces resident;
     std::vector<Range> importRanges;
+    std::vector<Range> tableRanges;
     std::uint64_t builtVersion = 0;
     bool built = false;
     std::shared_ptr<const Graphics::BdaPageTable> table;

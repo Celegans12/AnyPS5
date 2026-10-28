@@ -28,6 +28,14 @@ struct Decision {
 struct CommandFacts {
     CommandKind kind = CommandKind::Draw;
     bool kindSwitchOff = false;
+    bool resolvedProgram = false;
+    bool pipelineReady = true;
+    bool clothGuard = false;
+    bool tableCovers = true;
+    bool pushFits = true;
+    bool overflowPlaced = false;
+    bool staticChains = true;
+    bool suspended = false;
 };
 
 struct RouteCounts {
@@ -40,13 +48,17 @@ struct RouteCounts {
 
 class Router {
 public:
+    explicit Router(bool emitDispatches = false) : emitDispatches(emitDispatches) {}
+
     [[nodiscard]] Decision Decide(const CommandFacts& facts) const;
+    [[nodiscard]] bool EmitsDispatches() const { return emitDispatches; }
     void Note(CommandKind kind, const Decision& decision);
     [[nodiscard]] RouteCounts Take();
 
     [[nodiscard]] static std::string Format(const RouteCounts& counts, const char* window);
 
 private:
+    bool emitDispatches = false;
     std::array<std::atomic<std::uint64_t>, CommandKindCount> newPath{};
     std::array<std::array<std::atomic<std::uint64_t>, FallbackReasonCount>, CommandKindCount> fallback{};
 };
