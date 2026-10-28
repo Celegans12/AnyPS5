@@ -112,6 +112,7 @@ bool OneLaneGroupsEligible(std::span<const std::uint32_t> code) {
         if (const auto found = known.find(hash); found != known.end()) return found->second;
     }
     bool eligible = true;
+    const char* reason = "";
     try {
         const auto program = RdnaInstructionDecoder{}.Decode(code);
         for (const auto& instruction : program.instructions) {
@@ -121,23 +122,34 @@ bool OneLaneGroupsEligible(std::span<const std::uint32_t> code) {
                 const bool gds = ((word >> 17u) & 1u) != 0u;
                 const bool returning = (op >= 0x20u && op <= 0x34u) || op == 0x55u || op == 0x7eu || (op >= 0x60u && op <= 0x73u);
                 const bool allocating = op == 0x3du || op == 0x3eu || op == 0x3fu || (op >= 0x18u && op <= 0x1du);
-                const bool wideAtomic = op >= 0x40u && op <= 0x53u;
+                const bool wideAtomic = (op >= 0x40u && op <= 0x4cu) || (op >= 0x50u && op <= 0x53u);  // not 0x4d-0x4f (ds_write_b64, ds_write2_b64)
                 const bool exchange = op == 0x35u || op == 0xb0u || op == 0xb1u || op == 0xb2u || op == 0xb3u;
-                if (gds || returning || allocating || wideAtomic || exchange) eligible = false;
+                if (gds || returning || allocating || wideAtomic || exchange) {
+                    eligible = false;
+                    reason = gds ? "a GDS operation" : returning ? "a returning LDS atomic" : allocating ? "an append/consume/ordered-count/GWS operation" : wideAtomic ? "a 64-bit LDS atomic" : "an LDS lane exchange";
+                }
             } else if (instruction.family == RdnaInstructionFamily::MUBUF) {
                 const auto op = ((word >> 18u) & 0x7fu) | (((word >> 25u) & 1u) << 7u);
-                if (op >= 0x30u && op <= 0x60u && ((word >> 14u) & 1u) != 0u) eligible = false;
+                if (op >= 0x30u && op <= 0x60u && ((word >> 14u) & 1u) != 0u) {
+                    eligible = false;
+                    reason = "a returning buffer atomic";
+                }
             } else if (instruction.family == RdnaInstructionFamily::FLAT) {
                 const auto op = (word >> 18u) & 0x7fu;
-                if (op >= 0x30u && op <= 0x5fu && ((word >> 16u) & 1u) != 0u) eligible = false;
+                if (op >= 0x30u && op <= 0x5fu && ((word >> 16u) & 1u) != 0u) {
+                    eligible = false;
+                    reason = "a returning flat/global atomic";
+                }
             }
             if (!eligible) break;
         }
-    } catch (const std::exception&) {
+    } catch (const std::exception& error) {
         eligible = false;
+        reason = "code that does not decode";
+        std::fprintf(stderr, "[one-lane] decode: %s\n", error.what());
     }
     std::lock_guard lock(mutex);
-    known.emplace(hash, eligible);
+    if (known.emplace(hash, eligible).second && !eligible) std::fprintf(stderr, "[one-lane] a program of %zu code words keeps two lanes per invocation: it has %s\n", code.size(), reason);
     return eligible;
 }
 
