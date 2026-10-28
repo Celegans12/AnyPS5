@@ -376,6 +376,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ResidencyMirrors.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ResidencyTokens.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ResidencyRecorderLanes.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ResidencyDriver.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/BdaResources.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/BufferAddress.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderValidation.cpp
@@ -3018,6 +3019,11 @@ if(BUILD_TESTING)
     if(WIN32)
         set_tests_properties(agc_driver_draw_pipeline_trace_disabled agc_driver_draw_finisher_trace agc_driver_draw_finisher_trace_disabled PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    add_test(NAME agc_driver_residency_driver_async_lane COMMAND agc_driver_residency_driver_tests --async-lane)
+    set_tests_properties(agc_driver_residency_driver_async_lane PROPERTIES SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 60)
+    if(WIN32)
+        set_tests_properties(agc_driver_residency_driver_async_lane PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test(NAME agc_driver_copied_writer_label_order_async_lane COMMAND agc_driver_copied_writer_label_order_tests --async-lane)
     set_tests_properties(agc_driver_copied_writer_label_order_async_lane PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 30)

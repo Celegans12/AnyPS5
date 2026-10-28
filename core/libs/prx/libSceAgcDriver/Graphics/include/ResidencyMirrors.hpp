@@ -71,6 +71,7 @@ public:
     void RecordCopyIn(VkCommandBuffer commands, std::span<const ResidencyCopy> copies, const ResidencyImportLocator& import) const;
     void RecordWriteBack(VkCommandBuffer commands, std::span<const ResidencyCopy> copies, const ResidencyImportLocator& import) const;
     std::uint64_t DeviceBytes() const;
+    std::uint32_t Slots() const { return chunkSlots; }
 
 private:
     void record(VkCommandBuffer commands, std::span<const ResidencyCopy> copies, const ResidencyImportLocator& import, bool intoMirror) const;
