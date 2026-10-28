@@ -3222,6 +3222,7 @@ std::size_t HashBlockCount(std::uint64_t address, std::size_t bytes) {
 void HashCommittedBlocks(std::uint64_t address, std::size_t bytes, std::span<ContentHash::Hash128> out) {
     require(out.size() == HashBlockCount(address, bytes), "hash block count differs");
     if (bytes == 0) return;
+    GuardRead(address, bytes);
     const TimedAccess timed(CounterRead, bytes);
     CommittedHasher hash(address, bytes);
     forEachHashBlock(address, bytes, [&](std::size_t index, std::uint64_t begin, std::size_t length) {
@@ -3241,6 +3242,7 @@ void HashBlocksOf(std::uint64_t address, std::span<const std::byte> bytes, std::
 bool CommittedBlocksMatch(std::uint64_t address, std::size_t bytes, std::span<const ContentHash::Hash128> expected) {
     if (expected.size() != HashBlockCount(address, bytes)) return false;
     if (bytes == 0) return true;
+    if (GpuOwned(address, bytes)) return false;
     const TimedAccess timed(CounterCompare, bytes);
     CommittedHasher hash(address, bytes);
     return forEachHashBlock(address, bytes, [&](std::size_t index, std::uint64_t begin, std::size_t length) { return hash(begin, length) == expected[index]; });
@@ -3293,6 +3295,7 @@ bool CommittedBlocksMatchMarked(std::uint64_t address, std::size_t bytes, std::s
     if (match != nullptr) *match = {};
     if (expected.size() != HashBlockCount(address, bytes) || marked.size() != expected.size()) return false;
     if (bytes == 0) return true;
+    if (GpuOwned(address, bytes)) return false;
     std::uint64_t markedBytes = 0;
     forEachHashBlock(address, bytes, [&](std::size_t index, std::uint64_t, std::size_t length) {
         if (marked[index] != 0) markedBytes += length;
@@ -3319,6 +3322,7 @@ bool CommittedBlocksMatchSince(std::uint64_t address, std::size_t bytes, std::sp
     if (match != nullptr) *match = {};
     if (expected.size() != HashBlockCount(address, bytes)) return false;
     if (bytes == 0) return true;
+    if (GpuOwned(address, bytes)) return false;
     auto now = DescribeCommitted(address, bytes);
     thread_local std::vector<std::uint8_t>* staleSlot = nullptr;
     auto& stale = ShaderRecompiler::ThreadOwned(staleSlot);

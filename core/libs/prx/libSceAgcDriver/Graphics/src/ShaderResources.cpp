@@ -30,6 +30,7 @@
 #include <functional>
 #include <stdexcept>
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ResidencySession.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
@@ -3856,7 +3857,7 @@ void ShaderResources::noteReusable() {
     for (const auto& [begin, end] : *regions) {
         // No reconcile here: the upload just took these imports, and the set is about to be recorded
         // against them.
-        auto serial = HostImportSerial(context, begin, static_cast<std::size_t>(end - begin), false);
+        auto serial = guestMemory.ResidencyBound(begin, end) ? ResidencyBindingSerial() : HostImportSerial(context, begin, static_cast<std::size_t>(end - begin), false);
         // Read-only image mirrors (exe ranges) are as stable as imports; their serials have the top
         // bit set, so the two spaces never collide.
         if (serial == 0) serial = ImageMirrorSerial(context, begin, static_cast<std::size_t>(end - begin));
@@ -5140,7 +5141,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     // moved since the last proof (a retire bumps its epoch, a registry change its generation).
     const auto serialLoop = [&] {
         for (const auto& region : directRegions) {
-            auto serial = HostImportSerial(context, region.begin, static_cast<std::size_t>(region.end - region.begin), true);
+            auto serial = guestMemory.ResidencyBound(region.begin, region.end) ? ResidencyBindingSerial() : HostImportSerial(context, region.begin, static_cast<std::size_t>(region.end - region.begin), true);
             if (serial == 0) serial = ImageMirrorSerial(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
             if (serial != region.serial) return false;
             if (region.regionEnd != 0) {
@@ -7419,6 +7420,14 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             stamp = {GuestMemory::TrackerGeneration(), GuestMemory::CollectEpoch(), registryGeneration};
             stamped = true;
         }
+        if (GuestMemory::GpuOwned(begin, bytes)) {
+            GuestMemory::GuardRead(begin, bytes);
+            stamped = false;
+        }
+        if (!stamped) {
+            stamp = {GuestMemory::TrackerGeneration(), GuestMemory::CollectEpoch(), registryGeneration};
+            stamped = true;
+        }
         VkDeviceSize offset = 0;
         auto buffer = recorder.UnwrittenDrawSnapshot(begin, bytes, stamp, &offset);
         static const bool verifySnapshots = std::getenv("APS5_VERIFY_DRAW_SNAPSHOTS") != nullptr;
@@ -7447,7 +7456,6 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             const bool uploaded = bytes != 0 && bytes <= uploadLimit;
             if (uploaded) {
                 auto slice = recorder.DrawUpload(bytes);
-                GuestMemory::GuardRead(begin, bytes);
                 std::memcpy(slice.bytes, reinterpret_cast<const void*>(begin), bytes);
                 buffer = std::move(slice.buffer);
                 offset = slice.offset;
@@ -7474,7 +7482,6 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                     }
                     const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::ShaderResources);
                     buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-                    GuestMemory::GuardRead(begin, bytes);
                     std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
                     if (!owned) recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, buffer);
                     else if (armed) recorder.KeepOwnedDrawSnapshot(begin, bytes, std::move(words), since, registryGeneration, forgetSerial, buffer);
