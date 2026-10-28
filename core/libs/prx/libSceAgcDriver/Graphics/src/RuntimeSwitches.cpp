@@ -74,6 +74,8 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_NO_OWNED_VERTEX_INPUTS",
     "APS5_NO_FLUSH_LANE_WAIT",
     "APS5_NO_OWNED_EPOCH",
+    "APS5_NEW_PATH_NO_GPU_DRAWS",
+    "APS5_NEW_PATH_NO_GPU_DISPATCHES",
 };
 
 struct Refusal {
@@ -81,7 +83,8 @@ struct Refusal {
     const char* reason;
 };
 
-constexpr std::array<Refusal, 1> Refused{{
+constexpr std::array<Refusal, 2> Refused{{
+    {"APS5_NEW_PATH", "it selects the driver path at start, so new path against old path is read from separate runs (A-B-A), never as an in-run arm"},
     {"APS5_ASYNC_LANE", "it selects the device's queues at creation, and a label stored in one lane and consumed after the change would lose its GPU edge"},
 }};
 

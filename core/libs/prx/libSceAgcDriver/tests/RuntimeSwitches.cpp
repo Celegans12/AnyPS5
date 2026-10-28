@@ -69,6 +69,8 @@ void parse() {
     Require(Refusal("60:APS5_NO_BDA_STAGING+APS5_ASYNC_LANE").find("APS5_ASYNC_LANE cannot change while the game runs") != std::string::npos, "a refused switch inside a group was not refused");
     const auto bySeconds = AbSchedule::Parse("60:APS5_NO_DISPATCH_OVERLAP", "90s", "");
     Require(bySeconds.startSeconds == 90.0 && bySeconds.settleSeconds == 2 && bySeconds.startPresent == 0, "a start in seconds was not parsed");
+    Require(Refusal("60:APS5_NEW_PATH").find("APS5_NEW_PATH cannot change while the game runs") != std::string::npos, "APS5_NEW_PATH was not refused with its reason");
+    Require(RuntimeSwitches::Find("APS5_NEW_PATH_NO_GPU_DRAWS").has_value() && RuntimeSwitches::Find("APS5_NEW_PATH_NO_GPU_DISPATCHES").has_value(), "the new path's per-command switches are not runtime switches");
     Require(Refusal("60:APS5_ASYNC_LANE").find("APS5_ASYNC_LANE cannot change while the game runs") != std::string::npos, "APS5_ASYNC_LANE was not refused with its reason");
     Require(Refusal("60:APS5_SPANNED_WAVE").find("read once at startup") != std::string::npos, "a startup-only variable was not refused");
     Require(Refusal("60:APS5_NO_BDA_STAGING,APS5_NO_BDA_STAGING").find("listed twice") != std::string::npos, "a duplicate switch was not refused");
