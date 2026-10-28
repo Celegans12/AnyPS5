@@ -13,6 +13,7 @@ struct BufferStoreSite {
     std::uint32_t source = 0;
     std::uint32_t soffset = 0;
     bool dynamicSoffset = false;
+    bool scalar = false;
 
     bool operator==(const BufferStoreSite& other) const = default;
 };
@@ -44,6 +45,8 @@ struct ShaderInfo {
     bool usesFaultBuffer = false;
     std::vector<BufferStoreSite> bufferStores;
     bool unboundedStores = false;
+    std::vector<BufferStoreSite> bufferLoads;
+    bool unboundedLoads = false;
     bool dispatchThreadLimit = false;
     bool rasterPrimitive = false;
     bool layerExported = false;

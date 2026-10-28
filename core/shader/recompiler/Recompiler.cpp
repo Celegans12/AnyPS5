@@ -665,6 +665,7 @@ std::optional<std::pair<std::uint64_t, std::uint64_t>> BufferStoreExtent(const D
     const std::pair<std::uint64_t, std::uint64_t> none{0u, 0u};
     if ((word3 >> 30u) != 0u || base == 0u || records == 0u) return none;
     const auto stride = (word1 >> 16u) & 0x3fffu;
+    if (site.scalar) return std::pair<std::uint64_t, std::uint64_t>{base & ~std::uint64_t{3u}, base + (stride == 0u ? records : static_cast<std::uint64_t>(records) * stride)};
     if (stride != 0u && (word1 >> 31u) != 0u) return std::nullopt;
     const auto mode = (word3 >> 28u) & 3u;
     if (mode == 3u) return std::pair<std::uint64_t, std::uint64_t>{base, base + records};
@@ -1694,6 +1695,13 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         const auto range = BufferStoreExtent(snapshot.stores[store], variant.info.info.bufferStores[store]);
         if (!range.has_value()) result.unboundedWrites = true;
         else if (range->second > range->first) result.writeRanges.push_back(*range);
+    }
+    result.unboundedReads = variant.info.info.unboundedLoads || snapshot.loads.size() != variant.info.info.bufferLoads.size();
+    result.readRanges.clear();
+    for (std::size_t load = 0; load < snapshot.loads.size() && load < variant.info.info.bufferLoads.size(); ++load) {
+        const auto range = BufferStoreExtent(snapshot.loads[load], variant.info.info.bufferLoads[load]);
+        if (!range.has_value()) result.unboundedReads = true;
+        else if (range->second > range->first) result.readRanges.push_back(*range);
     }
     if (!tables.map.empty()) {
         result.imageTablePoison.reserve(tables.poison.size());

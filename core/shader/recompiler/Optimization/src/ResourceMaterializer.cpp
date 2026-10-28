@@ -1514,6 +1514,15 @@ void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, 
         snapshot.stores[i] = values[cursor];
         cursor++;
     }
+
+    snapshot.loads.resize(plan.info.bufferLoads.size());
+    for (std::uint32_t i = 0; i < plan.info.bufferLoads.size(); i++) {
+        if (cursor >= values.size()) {
+            throw std::runtime_error("materialization sources are missing loaded buffer descriptors");
+        }
+        snapshot.loads[i] = values[cursor];
+        cursor++;
+    }
 }
 
 void materializeForcedDegamma(const IrResourcePlan& plan, ResourceSnapshot& snapshot) {
@@ -2983,6 +2992,7 @@ IrResourcePlan ResourceMaterializer::ExtractPlan(const IrProgram& program) const
         }
     }
     for (const auto& store : plan.info.bufferStores) addSource(store.source);
+    for (const auto& load : plan.info.bufferLoads) addSource(load.source);
     plan.pureFlatSlots = Detail::ComputePureFlatSlots(plan);
     plan.guardedSrtSlots = Detail::ComputeGuardedFlatSlots(plan);
     ownPlanValues(plan);

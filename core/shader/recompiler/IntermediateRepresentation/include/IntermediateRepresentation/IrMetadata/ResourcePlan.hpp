@@ -136,6 +136,7 @@ struct ResourceSnapshot {
     std::vector<DescriptorValue> images;
     std::vector<DescriptorValue> samplers;
     std::vector<DescriptorValue> stores;
+    std::vector<DescriptorValue> loads;
     std::vector<std::uint32_t> flattenedSrt;
     std::vector<std::uint32_t> userData;
     UniformFill uniformFill;
