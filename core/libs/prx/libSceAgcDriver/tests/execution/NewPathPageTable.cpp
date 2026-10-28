@@ -1,4 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/DevicePageTable.hpp"
+#include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/CommandWrites.hpp"
+#include <algorithm>
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "VulkanTestDevice.hpp"
 #include <cstdio>
@@ -100,6 +102,10 @@ void DeviceTests(const AgcDriver::Graphics::Context& context) {
     Expect(Translate(patched, ImportBase + 3 * Page + 0x40) == ImportDevice + 3 * Page + 0x40, "the page after the patch moved");
     Expect(Translate(second, ImportBase + 2 * Page + 0x40) == ImportDevice + 2 * Page + 0x40, "the patch changed the version it started from");
     Expect(table.Current() == patched && table.Totals().patches == 1, "the current version or the patch count is wrong");
+    const auto listed = table.Ranges();
+    Expect(std::any_of(listed.begin(), listed.end(), [](const Range& range) { return range.begin == ImportBase + 2 * Page && range.deviceAddress == ResidentDevice; }), "the patched table's range list lacks the resident page");
+    const auto writable = AgcDriver::NewPath::WritableRanges(listed);
+    Expect(std::none_of(writable.begin(), writable.end(), [](const AgcDriver::NewPath::AddressRange& range) { return range.first < ImportBase + 9 * Page && ImportBase + 8 * Page < range.second; }), "the read-only import is in the writable ranges");
 
     ++version;
     const auto rebuilt = table.Refresh(context);

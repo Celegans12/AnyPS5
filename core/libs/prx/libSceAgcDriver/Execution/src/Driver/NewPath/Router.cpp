@@ -41,8 +41,15 @@ std::uint64_t RouteCounts::NewPathCommands() const {
 }
 
 Decision Router::Decide(const CommandFacts& facts) const {
+    if (facts.suspended) return {Route::Fallback, FallbackReason::Suspended};
     if (facts.kindSwitchOff) return {Route::Fallback, FallbackReason::KindSwitch};
-    return {Route::Fallback, FallbackReason::KindNotEmitted};
+    if (!emitDispatches || facts.kind != CommandKind::Dispatch || !facts.resolvedProgram) return {Route::Fallback, FallbackReason::KindNotEmitted};
+    if (!facts.pipelineReady) return {Route::Fallback, FallbackReason::NoPipeline};
+    if (!facts.tableCovers) return {Route::Fallback, FallbackReason::RangeNotCovered};
+    if (!facts.pushFits && !facts.overflowPlaced) return {Route::Fallback, FallbackReason::PushOverflow};
+    if (facts.clothGuard) return {Route::Fallback, FallbackReason::ClothGuard};
+    if (!facts.staticChains) return {Route::Fallback, FallbackReason::NonStaticChain};
+    return {Route::NewPath, FallbackReason::KindNotEmitted};
 }
 
 void Router::Note(CommandKind kind, const Decision& decision) {
