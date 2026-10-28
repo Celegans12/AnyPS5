@@ -129,10 +129,22 @@ void ResidencyDriver::EnableFaults() {
     GuestArena::GuestArenaSetAccessGuardObserver_nid_no_patch([](std::uintptr_t address) {
         if (auto* driver = ResidencyDriver::Active()) driver->AccessFault(address);
     });
+    GuestMemory::SetGpuOwnedHooks(
+        [](std::uint64_t address, std::size_t bytes) {
+            auto* driver = ResidencyDriver::Active();
+            return driver != nullptr && driver->manager.AnyDirty() && driver->manager.DirtyIn(address, bytes);
+        },
+        [](std::uint64_t address, std::size_t bytes) {
+            auto* driver = ResidencyDriver::Active();
+            if (driver == nullptr) return;
+            driver->manager.FlushForCpuRead(address, bytes);
+            driver->driverPublishes.fetch_add(1, std::memory_order_relaxed);
+        });
 }
 
 void ResidencyDriver::DisableFaults() {
     if (faultServer == nullptr) return;
+    GuestMemory::SetGpuOwnedHooks(nullptr, nullptr);
     GuestArena::GuestArenaSetAccessGuardObserver_nid_no_patch(nullptr);
     faultServer.reset();
 }
@@ -165,6 +177,7 @@ std::unique_ptr<ResidencyDriver> ResidencyDriver::CreateIfEnabled(const Context&
     if (!config.residency) return nullptr;
     ResidencyPolicy policy;
     policy.budgetBytes = config.budgetForced ? config.residentBytes : DefaultResidentBytes;
+    if (config.chunkPages != 0) policy.chunkSlots = config.chunkPages;
     return std::make_unique<ResidencyDriver>(context, recorder, guest, policy);
 }
 

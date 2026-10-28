@@ -504,6 +504,13 @@ DccKeys readDccKeys(std::uint64_t metaAddress, std::size_t count, bool& memoized
             recorder->SyncThrough(metaAddress, count);
         }
     }
+    if (GuestMemory::GpuOwned(metaAddress, count)) {
+        if (!GuestMemory::GpuMutex().HeldByThisThread()) {
+            memoized = true;
+            return DccKeys::Mixed;
+        }
+        GuestMemory::GuardRead(metaAddress, count);
+    }
     const auto* keys = reinterpret_cast<const std::uint8_t*>(metaAddress);
     const auto first = keys[0];
     const auto start = ScanProfileEnabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};

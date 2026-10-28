@@ -54,6 +54,22 @@ int main() {
     config = with({{"APS5_NEW_PATH", "1"}, {"APS5_NEW_PATH_RESIDENT_MIB", "0"}});
     check(config.residency && config.budgetForced && config.residentBytes == 0, "budget 0 is a forced zero budget (matrix row), not the default");
 
+    config = with({{"APS5_NEW_PATH", "1"}, {"APS5_NEW_PATH_RESIDENT_CHUNK_PAGES", "64"}});
+    check(config.residency && config.chunkPages == 64, "chunk pages");
+
+    config = with({{"APS5_NEW_PATH_RESIDENT_CHUNK_PAGES", "64"}});
+    check(config.chunkPages == 0, "chunk pages without the master change nothing");
+
+    for (const char* bad : {"0", "65536", "8k"}) {
+        bool refused = false;
+        try {
+            static_cast<void>(with({{"APS5_NEW_PATH", "1"}, {"APS5_NEW_PATH_RESIDENT_CHUNK_PAGES", bad}}));
+        } catch (const std::invalid_argument&) {
+            refused = true;
+        }
+        check(refused, "a chunk page count outside 1..65535 throws");
+    }
+
     bool threw = false;
     try {
         static_cast<void>(with({{"APS5_NEW_PATH", "1"}, {"APS5_NEW_PATH_RESIDENT_MIB", "12x"}}));

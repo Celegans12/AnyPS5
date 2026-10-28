@@ -2901,6 +2901,8 @@ unsigned long long CodeOffset(const void* address) {
 namespace {
 std::atomic<void (*)(std::uint64_t, std::size_t)> flushHook{nullptr};
 std::atomic<void (*)(std::uint64_t, std::size_t)> readGuard{nullptr};
+std::atomic<bool (*)(std::uint64_t, std::size_t)> gpuOwnedHook{nullptr};
+std::atomic<void (*)(std::uint64_t, std::size_t)> gpuPublishHook{nullptr};
 
 void PrepareHostRead(std::uintptr_t address, std::size_t bytes) {
     if (const auto guard = readGuard.load(std::memory_order_acquire)) guard(address, bytes);
@@ -2918,8 +2920,24 @@ void SetReadGuard(void (*guard)(std::uint64_t address, std::size_t bytes)) {
     GuestArena::GuestArenaSetHostReadHook_nid_no_patch(&PrepareHostRead);
 }
 
+void SetGpuOwnedHooks(bool (*owned)(std::uint64_t address, std::size_t bytes), void (*publish)(std::uint64_t address, std::size_t bytes)) {
+    gpuPublishHook.store(publish, std::memory_order_release);
+    gpuOwnedHook.store(owned, std::memory_order_release);
+}
+
+bool GpuOwned(std::uint64_t address, std::size_t bytes) {
+    const auto owned = gpuOwnedHook.load(std::memory_order_acquire);
+    return owned != nullptr && bytes != 0 && owned(address, bytes);
+}
+
+void PublishGpuOwned(std::uint64_t address, std::size_t bytes) {
+    const auto publish = gpuPublishHook.load(std::memory_order_acquire);
+    if (publish != nullptr && GpuOwned(address, bytes)) publish(address, bytes);
+}
+
 void GuardRead(std::uint64_t address, std::size_t bytes) {
     if (const auto guard = readGuard.load(std::memory_order_acquire)) guard(address, bytes);
+    if (GpuMutex().HeldByThisThread()) PublishGpuOwned(address, bytes);
     GuestArena::GuestArenaOpenAccessGuards_nid_no_patch(static_cast<std::uintptr_t>(address), bytes);
 }
 
@@ -2968,6 +2986,7 @@ bool SpeculativeReader() {
 void FlushGpuWrites(std::uint64_t address, std::size_t bytes) {
     requireNotSpeculative("access with a flush");
     flushBeforeAccess(address, bytes);
+    if (GpuMutex().HeldByThisThread()) PublishGpuOwned(address, bytes);
 }
 
 void PrepareHostWrite(std::uintptr_t address, std::size_t bytes) {

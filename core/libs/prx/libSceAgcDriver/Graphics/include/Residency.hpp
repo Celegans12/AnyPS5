@@ -330,6 +330,7 @@ public:
     std::vector<std::pair<std::uint64_t, std::uint64_t>> Mirrored(std::uint64_t& now);
     std::vector<std::uint32_t> Chunks() const;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ResidentGenerations() const;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> MirroredIn(std::uint64_t address, std::uint64_t bytes);
     std::uint64_t ChunkAddress(std::uint32_t chunk) const;
     std::uint32_t ChunkSlots() const { return chunkSlots; }
     std::uint64_t Serial() const { return serial; }
