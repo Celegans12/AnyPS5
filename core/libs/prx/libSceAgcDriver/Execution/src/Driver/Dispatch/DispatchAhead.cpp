@@ -221,7 +221,7 @@ void Driver::resolveGroupAhead(const Submission& submission, const QueueState& l
                                                 ShaderRecompiler::RecompileRequest request{
                                                     {ShaderRecompiler::ShaderStage::Compute, address, std::span(registered->code).subspan(codeOffset), registered->headerAddress, registered->header},
                                                     {wave, 0, userData, compute, std::nullopt, std::nullopt, memory, DispatchFloatMode(*registered, state)},
-                                                    localDevice->ComputeTarget(wave),
+                                                    localDevice->ComputeTarget(wave, address),
                                                     {0, 0, 0, 128}
                                                 };
                                                 try { static_cast<void>(InvocationFor(*registered, codeOffset, request)); } catch (const std::exception&) {}

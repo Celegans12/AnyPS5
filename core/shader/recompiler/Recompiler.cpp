@@ -96,6 +96,51 @@ bool MergedHullStage(const RecompileRequest& request) {
     return (stage == ShaderStage::Local || stage == ShaderStage::TessellationControl) && request.graphics && request.graphics->tessellation && request.graphics->tessellation->mergedHull;
 }
 
+// SpirvTarget::singleLaneGroups is refused (the two-lane layout kept) for a program that one lane per invocation
+// cannot run exactly yet. One lane per invocation is the spanned layout: per-lane returning atomics of the two host
+// subgroups of one guest wave race (H2-5), GDS, GWS, append/consume and ordered-count operations are per-wave
+// allocations, the 64-bit LDS atomics run a per-lane lock loop whose exchanges would sit in per-lane control flow,
+// and LDS lane exchanges (swizzle, permute, addtid) index across the two halves (docs/dev/debt/shader.md, spanned
+// wave64). Read from the guest code (raw GFX10 encodings), memoized by code hash.
+bool OneLaneGroupsEligible(std::span<const std::uint32_t> code) {
+    static std::mutex mutex;
+    static std::unordered_map<std::uint64_t, bool> known;
+    std::uint64_t hash = 0xcbf29ce484222325ull ^ code.size();
+    for (const auto word : code) hash = (hash ^ word) * 0x100000001b3ull;
+    {
+        std::lock_guard lock(mutex);
+        if (const auto found = known.find(hash); found != known.end()) return found->second;
+    }
+    bool eligible = true;
+    try {
+        const auto program = RdnaInstructionDecoder{}.Decode(code);
+        for (const auto& instruction : program.instructions) {
+            const auto word = instruction.rawWords[0];
+            if (instruction.family == RdnaInstructionFamily::DS) {
+                const auto op = (word >> 18u) & 0xffu;
+                const bool gds = ((word >> 17u) & 1u) != 0u;
+                const bool returning = (op >= 0x20u && op <= 0x34u) || op == 0x55u || op == 0x7eu || (op >= 0x60u && op <= 0x73u);
+                const bool allocating = op == 0x3du || op == 0x3eu || op == 0x3fu || (op >= 0x18u && op <= 0x1du);
+                const bool wideAtomic = op >= 0x40u && op <= 0x53u;
+                const bool exchange = op == 0x35u || op == 0xb0u || op == 0xb1u || op == 0xb2u || op == 0xb3u;
+                if (gds || returning || allocating || wideAtomic || exchange) eligible = false;
+            } else if (instruction.family == RdnaInstructionFamily::MUBUF) {
+                const auto op = ((word >> 18u) & 0x7fu) | (((word >> 25u) & 1u) << 7u);
+                if (op >= 0x30u && op <= 0x60u && ((word >> 14u) & 1u) != 0u) eligible = false;
+            } else if (instruction.family == RdnaInstructionFamily::FLAT) {
+                const auto op = (word >> 18u) & 0x7fu;
+                if (op >= 0x30u && op <= 0x5fu && ((word >> 16u) & 1u) != 0u) eligible = false;
+            }
+            if (!eligible) break;
+        }
+    } catch (const std::exception&) {
+        eligible = false;
+    }
+    std::lock_guard lock(mutex);
+    known.emplace(hash, eligible);
+    return eligible;
+}
+
 // The host subgroup width wave64 programs are laid out for. Debug aid: APS5_SINGLE_LANE=<hex code
 // addresses, comma separated, or "all"> keeps the listed programs at one guest lane per invocation.
 std::uint32_t HostSubgroupSize(const RecompileRequest& request) {
@@ -103,6 +148,10 @@ std::uint32_t HostSubgroupSize(const RecompileRequest& request) {
     if (vertexStage && !request.target.vertexSubgroups) return 1u;
     if (request.shader.stage == ShaderStage::TessellationControl && MergedHullStage(request)) return 1u;
     static const std::string list = [] { const char* text = std::getenv("APS5_SINGLE_LANE"); return text ? std::string(text) : std::string(); }();
+    if (request.target.singleLaneGroups && request.shader.stage == ShaderStage::Compute && request.context.waveSize == 64u && request.context.compute.has_value()) {
+        const auto& threads = request.context.compute->numThreads;
+        if (std::uint64_t{std::max(threads[0], 1u)} * std::max(threads[1], 1u) * std::max(threads[2], 1u) > 64u && OneLaneGroupsEligible(request.shader.code)) return 64u;
+    }
     if (!list.empty()) {
         if (list == "all") return 64u;
         char address[32];

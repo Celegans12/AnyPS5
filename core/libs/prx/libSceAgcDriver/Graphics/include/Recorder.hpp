@@ -186,7 +186,8 @@ public:
     // (the copy-backs store only the dwords that changed), as do accesses both in place.
     bool RunAtomicConflict(std::span<const std::array<std::uint64_t, 3>> accesses) const;
     bool RunRangeConflict(std::span<const std::array<std::uint64_t, 3>> accesses) const;
-    static std::array<std::uint64_t, 2> RangeCheckCounts();
+    // {joins refused by the range check, conflicts joined under APS5_NO_OVERLAP_RANGE_CHECK, unknown-read pairs joined (UnboundedReadRuns)}.
+    static std::array<std::uint64_t, 3> RangeCheckCounts();
     // Opens a batch when none is open, recording nothing (no deferred dispatch barrier either).
     void OpenBatch() { ensureOpen(); }
     // Work an overlapping dispatch owes after itself (its staged copy-backs): recorded right after
@@ -237,6 +238,14 @@ public:
     // DeferDispatchBarrier), and those of a dispatch joining the run checked against them
     // (CheckRunConflicts); RunConflictReport is the cumulative tally.
     static constexpr std::uint64_t RunAccessWritten = 1, RunAccessCopied = 2, RunAccessAtomic = 4, RunAccessImage = 8;
+    // RunAccessUnboundedRead: a build with address tables that stores nothing through them reads guest
+    // memory at addresses it loads (ranges unknown on the CPU). Without APS5_NEW_PATH_UNBOUNDED_READ_RUNS such
+    // a build claims a write over the whole address space, so no dispatch ever joins a run with it.
+    // With it (prototype, S4 T-5) it claims this flag over the whole space instead: its stores are the
+    // ranges of its bound buffers (listed as usual), and its unknown reads join a run the title left
+    // unordered, as they would run beside each other on the GPU the title targets.
+    static constexpr std::uint64_t RunAccessUnboundedRead = 16;
+    static bool UnboundedReadRuns();
     void NoteRunAccess(std::uint64_t program, std::span<const std::array<std::uint64_t, 3>> accesses);
     void CheckRunConflicts(std::uint64_t program, std::span<const std::array<std::uint64_t, 3>> accesses) const;
     static std::string RunConflictReport();

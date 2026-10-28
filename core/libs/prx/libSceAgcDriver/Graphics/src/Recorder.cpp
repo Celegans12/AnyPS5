@@ -1776,7 +1776,7 @@ std::array<std::uint64_t, 12> runConflicts{};
 std::uint64_t runJoinsChecked = 0, runJoinsConflicting = 0;
 std::map<std::tuple<std::uint64_t, std::uint64_t, int>, std::uint64_t> runConflictPairs;
 std::array<std::uint64_t, 3> owedCopyBacks{};
-std::atomic<std::uint64_t> atomicGuardRefusals{0}, owedRunsClosed{0}, stagedReadRefusals{0}, rangeRefusals{0}, rangeConflictsUnchecked{0}, runDeferredCount{0}, runJoinedCount{0};
+std::atomic<std::uint64_t> atomicGuardRefusals{0}, owedRunsClosed{0}, stagedReadRefusals{0}, rangeRefusals{0}, rangeConflictsUnchecked{0}, runDeferredCount{0}, runJoinedCount{0}, unboundedReadJoins{0};
 bool DrawOrGpuProfiled();
 constexpr bool CopiedAtomic(std::uint64_t flags) {
     return (flags & (Recorder::RunAccessCopied | Recorder::RunAccessAtomic)) == (Recorder::RunAccessCopied | Recorder::RunAccessAtomic);
@@ -1792,6 +1792,11 @@ std::array<std::uint64_t, Recorder::DeferredFlushSites> Recorder::DeferredFlushC
 
 bool Recorder::DispatchOverlapEnabled() {
     return !RuntimeSwitches::Set(RuntimeSwitch::NoDispatchOverlap);
+}
+
+bool Recorder::UnboundedReadRuns() {
+    static const bool enabled = std::getenv("APS5_NEW_PATH_UNBOUNDED_READ_RUNS") != nullptr;
+    return enabled;
 }
 
 bool Recorder::BatchedStagingEnabled() {
@@ -1857,6 +1862,16 @@ bool Recorder::RunRangeConflict(std::span<const std::array<std::uint64_t, 3>> ac
             if (((access[2] ^ member[2]) & RunAccessImage) != 0) continue;
             if (!(access[0] < member[1] && member[0] < access[1])) continue;
             if (((access[2] | member[2]) & RunAccessWritten) == 0) continue;
+            // An unknown read (UnboundedReadRuns) does not conflict with a bounded store: the title left the
+            // two unordered. It still conflicts with a store over everything (an address-table writer, a lease).
+            const bool accessUnknown = (access[2] & RunAccessUnboundedRead) != 0;
+            const auto otherBegin = accessUnknown ? member[0] : access[0];
+            const auto otherEnd = accessUnknown ? member[1] : access[1];
+            const bool otherEverything = otherBegin == 0 && otherEnd == std::numeric_limits<std::uint64_t>::max();
+            if (((access[2] | member[2]) & RunAccessUnboundedRead) != 0 && !otherEverything) {
+                unboundedReadJoins.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
             conflict = true;
             break;
         }
@@ -1871,8 +1886,8 @@ bool Recorder::RunRangeConflict(std::span<const std::array<std::uint64_t, 3>> ac
     return true;
 }
 
-std::array<std::uint64_t, 2> Recorder::RangeCheckCounts() {
-    return {rangeRefusals.load(std::memory_order_relaxed), rangeConflictsUnchecked.load(std::memory_order_relaxed)};
+std::array<std::uint64_t, 3> Recorder::RangeCheckCounts() {
+    return {rangeRefusals.load(std::memory_order_relaxed), rangeConflictsUnchecked.load(std::memory_order_relaxed), unboundedReadJoins.load(std::memory_order_relaxed)};
 }
 
 void Recorder::CheckRunConflicts(std::uint64_t program, std::span<const std::array<std::uint64_t, 3>> accesses) const {

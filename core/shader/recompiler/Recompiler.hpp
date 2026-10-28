@@ -348,6 +348,10 @@ struct SpirvTarget {
     bool float16DenormPreserve = false;
     bool bindlessImages = false;
     bool spannedWaves = false;
+    // One guest lane per host invocation for a wave64 compute program whose workgroup holds more than one
+    // wave (the two-lane layout otherwise, HostSubgroupSize). Measured on the cloth family (request bench,
+    // research/speed/newpath/census-c.md): -11..-26 % GPU time, about half the SPIR-V, same results.
+    bool singleLaneGroups = false;
     // GLSL.std.450 Fma is a fused multiply-add on the device (the driver's startup probe, VulkanDevice
     // FusedFmaProbe): v_fma_mix* then takes an exact f32 path instead of the f64 helper.
     bool fusedFma = false;

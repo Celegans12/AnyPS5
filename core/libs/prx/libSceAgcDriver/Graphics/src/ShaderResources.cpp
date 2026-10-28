@@ -7733,7 +7733,10 @@ bool ShaderResources::ReadsOverlap(std::uint64_t address, std::size_t bytes) con
 
 void ShaderResources::RunAccesses(std::vector<std::array<std::uint64_t, 3>>& out) const {
     guestMemory.RunAccesses(out);
-    if (usesBda) out.push_back({0, std::numeric_limits<std::uint64_t>::max(), Recorder::RunAccessWritten});
+    // A build with address tables reaches guest memory the CPU cannot list. If it stores through those
+    // addresses, or without APS5_NEW_PATH_UNBOUNDED_READ_RUNS, it claims a write over everything; a read-only one
+    // (bdaReadOnly: no store through an address in its module) then claims only an unknown read.
+    if (usesBda) out.push_back({0, std::numeric_limits<std::uint64_t>::max(), bdaReadOnly && Recorder::UnboundedReadRuns() ? Recorder::RunAccessUnboundedRead : Recorder::RunAccessWritten});
     for (const auto& [image, written] : StorageImages()) {
         const auto handle = reinterpret_cast<std::uint64_t>(image);
         out.push_back({handle, handle + 1, Recorder::RunAccessImage | (written ? Recorder::RunAccessWritten : 0u)});

@@ -88,6 +88,8 @@ public:
     const Graphics::TextureService* BindlessService() const;
     void BindlessPresentWait();
     ShaderRecompiler::SpirvTarget ComputeTarget(std::uint32_t waveSize) const;
+    // ComputeTarget with the per-program target fields (singleLaneGroups: APS5_NEW_PATH_ONE_LANE).
+    ShaderRecompiler::SpirvTarget ComputeTarget(std::uint32_t waveSize, std::uint64_t programAddress) const;
     bool ComputeFullSubgroups() const;
     // Distinguishes this device from every earlier one in the process (a memo keyed by the device
     // cannot rely on the pointer, which a replacement may reuse).

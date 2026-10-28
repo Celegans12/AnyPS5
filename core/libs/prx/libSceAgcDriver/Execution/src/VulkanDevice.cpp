@@ -4062,6 +4062,38 @@ ShaderRecompiler::SpirvTarget VulkanDevice::ComputeTarget(std::uint32_t waveSize
     return target;
 }
 
+namespace {
+
+// APS5_NEW_PATH_ONE_LANE=<hex program address>[,<address>...] (prototype, S4 T-5): the compute programs whose
+// recompile target asks for one guest lane per invocation (SpirvTarget::singleLaneGroups, in the cache key).
+// An allow-list, not a mode: one lane per invocation is the spanned layout, which races per-lane returning
+// atomics between the two host subgroups (H2-5) and hangs on a cross-lane exchange inside per-lane control
+// flow (docs/dev/debt/shader.md, spanned wave64), with no uniformity check yet. The recompiler also refuses
+// it for programs with returning atomics or GDS operations (OneLaneGroupsEligible).
+bool OneLaneListed(std::uint64_t programAddress) {
+    static const auto programs = [] {
+        std::vector<std::uint64_t> list;
+        const char* text = std::getenv("APS5_NEW_PATH_ONE_LANE");
+        for (const char* cursor = text; cursor != nullptr && *cursor != ' ';) {
+            char* end = nullptr;
+            const auto value = std::strtoull(cursor, &end, 16);
+            if (end == cursor) break;
+            list.push_back(value);
+            cursor = *end == ',' ? end + 1 : end;
+        }
+        return list;
+    }();
+    return std::find(programs.begin(), programs.end(), programAddress) != programs.end();
+}
+
+}
+
+ShaderRecompiler::SpirvTarget VulkanDevice::ComputeTarget(std::uint32_t waveSize, std::uint64_t programAddress) const {
+    auto target = ComputeTarget(waveSize);
+    target.singleLaneGroups = OneLaneListed(programAddress);
+    return target;
+}
+
 std::string VulkanDevice::DeviceName() const {
     return state->properties.deviceName;
 }
@@ -5671,7 +5703,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
             const auto flushes = Graphics::Recorder::DeferredFlushCounts();
             AgcDriver::ProfilePrint_nid_no_patch("[overlap] compute-ring dispatches (cumulative): %llu after an ordering packet, %llu unordered (%llu overlapped, %llu found no open deferred barrier); not deferring: indirect %llu, (overlapped with a data refresh %llu), device LDS %llu, other %llu; %llu trailing barriers deferred, recorded by: commands %llu, draw pass %llu, key stores %llu, label store %llu, store run %llu, samples %llu, submit %llu\n", static_cast<unsigned long long>(d.orderedSeen), static_cast<unsigned long long>(d.unorderedSeen), static_cast<unsigned long long>(d.overlapped), static_cast<unsigned long long>(d.unorderedLost), static_cast<unsigned long long>(d.notIndirect), static_cast<unsigned long long>(d.notRefresh), static_cast<unsigned long long>(d.notLds), static_cast<unsigned long long>(d.notOther), static_cast<unsigned long long>(d.trailingDeferred), static_cast<unsigned long long>(flushes[0]), static_cast<unsigned long long>(flushes[1]), static_cast<unsigned long long>(flushes[2]), static_cast<unsigned long long>(flushes[3]), static_cast<unsigned long long>(flushes[4]), static_cast<unsigned long long>(flushes[5]), static_cast<unsigned long long>(flushes[6]));
             const auto range = Graphics::Recorder::RangeCheckCounts();
-            AgcDriver::ProfilePrint_nid_no_patch("[overlap-range] (cumulative) joins refused by the access-range check %llu; range conflicts joined while APS5_NO_OVERLAP_RANGE_CHECK was set %llu (now %s)\n", static_cast<unsigned long long>(range[0]), static_cast<unsigned long long>(range[1]), Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoOverlapRangeCheck) ? "set" : "unset");
+            AgcDriver::ProfilePrint_nid_no_patch("[overlap-range] (cumulative) joins refused by the access-range check %llu; range conflicts joined while APS5_NO_OVERLAP_RANGE_CHECK was set %llu (now %s); unknown-read pairs joined %llu (APS5_NEW_PATH_UNBOUNDED_READ_RUNS %s)\n", static_cast<unsigned long long>(range[0]), static_cast<unsigned long long>(range[1]), Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoOverlapRangeCheck) ? "set" : "unset", static_cast<unsigned long long>(range[2]), Graphics::Recorder::UnboundedReadRuns() ? "set" : "unset");
             const auto batched = Graphics::Recorder::BatchedStagingCounts();
             AgcDriver::ProfilePrint_nid_no_patch("[batched-staging] (APS5_NO_BATCHED_STAGING %s, cumulative) %llu run splits, %llu preludes with %llu copy-in builds and %llu pristine copies; %llu copy-backs after a run sharing its barrier (%llu after an overlapping one); unordered dispatches not overlapped: no open run %llu, other ring's run %llu, render pass %llu, store run %llu, resources already in the run %llu\n", Graphics::Recorder::BatchedStagingEnabled() ? "unset" : "set", static_cast<unsigned long long>(batched.splits), static_cast<unsigned long long>(batched.preludes), static_cast<unsigned long long>(batched.preludeCopies), static_cast<unsigned long long>(batched.pristineCopies), static_cast<unsigned long long>(batched.mergedCopyBacks), static_cast<unsigned long long>(batched.copyBackConflicts), static_cast<unsigned long long>(batched.lostNoRun), static_cast<unsigned long long>(batched.lostOtherQueue), static_cast<unsigned long long>(batched.lostRenderPass), static_cast<unsigned long long>(batched.lostStoreRun), static_cast<unsigned long long>(batched.lostOwner));
             std::string sites;

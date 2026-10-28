@@ -326,6 +326,7 @@ private:
         append(key, value.float16DenormPreserve);
         append(key, value.bindlessImages);
         append(key, value.spannedWaves);
+        append(key, value.singleLaneGroups);
         append(key, value.fusedFma);
         append(key, value.robustBufferAccess2);
         append(key, value.float32FlushToZero);

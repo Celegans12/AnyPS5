@@ -215,7 +215,7 @@ int main(int argc, char** argv) {
         }
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
-        request.request.target = device->ComputeTarget(request.request.context.waveSize);
+        request.request.target = device->ComputeTarget(request.request.context.waveSize, request.request.shader.codeAddress);
         if (std::getenv("APS5_SPANNED_WAVE") != nullptr) request.request.target.spannedWaves = true;
         if (std::getenv("APS5_BINDLESS_IMAGES") != nullptr) request.request.target.bindlessImages = true;
         // BENCH_SINGLE_GROUP=1: recompile as the driver does for a 1x1x1 dispatch (ShaderComputeStageInfo::singleWorkgroup);

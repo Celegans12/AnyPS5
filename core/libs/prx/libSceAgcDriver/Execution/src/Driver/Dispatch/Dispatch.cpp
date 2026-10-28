@@ -307,7 +307,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
     ShaderRecompiler::RecompileRequest request{
         {ShaderRecompiler::ShaderStage::Compute, address, std::span(snapshot.code).subspan(codeOffset), snapshot.headerAddress, snapshot.header},
         {(packet[4] & 0x8000u) != 0 ? 32u : 64u, 0, userData, compute, std::nullopt, std::nullopt, memory, DispatchFloatMode(snapshot, queue.shader)},
-        localDevice->ComputeTarget((packet[4] & 0x8000u) != 0 ? 32u : 64u),
+        localDevice->ComputeTarget((packet[4] & 0x8000u) != 0 ? 32u : 64u, address),
         {0, 0, 0, threadGroup != std::array<std::uint32_t, 3>{} ? 0u : 128u}
     };
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
