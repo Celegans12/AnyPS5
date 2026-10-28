@@ -7438,6 +7438,37 @@ bool HostImportsUnchanged(const Context& context, const HostImportsProof& proof)
     return state.device == proof.device && state.epoch == proof.epoch && state.refreshedGeneration == proof.refreshedGeneration && !importsStale(context, state);
 }
 
+std::uint64_t HostImportsVersion(VkDevice device) {
+    auto& state = Imports();
+    std::lock_guard lock(state.mutex);
+    if (state.device != device) return 0;
+    return state.epoch * 0x100000000ull + state.inserts;
+}
+
+HostImportSnapshot HostImportRanges(const Context& context) {
+    auto& state = Imports();
+    std::lock_guard lock(state.mutex);
+    HostImportSnapshot snapshot;
+    if (state.device != context.device) return snapshot;
+    snapshot.device = state.device;
+    snapshot.epoch = state.epoch;
+    snapshot.inserts = state.inserts;
+    snapshot.ranges.reserve(state.imports.size());
+    std::uint64_t covered = 0;
+    for (const auto& [base, import] : state.imports) {
+        if (import.address == 0 || import.bytes == 0) continue;
+        const auto end = import.base + import.bytes;
+        if (end <= covered) continue;
+        const auto begin = std::max(import.base, covered);
+        bool writable = import.range != nullptr ? import.range->writable : !import.ranges.empty();
+        for (const auto& piece : import.ranges) writable = writable && piece != nullptr && piece->writable;
+        const std::uint32_t permissions = ShaderRecompiler::BdaAbi::Read | (writable ? ShaderRecompiler::BdaAbi::Write : 0u);
+        snapshot.ranges.push_back({begin, end, import.address + HostImportOffset(import, begin), permissions, 0u});
+        covered = end;
+    }
+    return snapshot;
+}
+
 HostImportsProof HostImportsIdentity(const Context& context) {
     auto& state = Imports();
     std::lock_guard lock(state.mutex);

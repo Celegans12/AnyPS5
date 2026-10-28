@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileWindows.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CommandMix.hpp"
+#include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/NewPath.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
@@ -39,6 +40,7 @@ void Close(const char* label) {
     Graphics::Recorder::CloseGpuTimingWindow(label);
     Graphics::CloseDrawProfileWindow(label);
     CommandMix::Close(label);
+    NewPath::Close(label);
     Graphics::ResidentCensus::Close(label);
     MemoryStats::ReportNow(label);
     ProfileOutput_nid_no_patch().Flush();
