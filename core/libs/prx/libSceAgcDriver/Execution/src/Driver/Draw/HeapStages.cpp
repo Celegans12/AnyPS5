@@ -230,6 +230,109 @@ bool SampleHeapStageVerify() {
 
 namespace {
 
+template <typename TValue>
+std::uint64_t vectorBytes(const std::vector<TValue>& values) {
+    return static_cast<std::uint64_t>(values.capacity()) * sizeof(TValue);
+}
+
+std::uint64_t vectorBytes(const std::vector<bool>& values) {
+    return static_cast<std::uint64_t>(values.capacity() + 7u) / 8u;
+}
+
+template <typename TValue>
+std::uint64_t sharedBytes(const ShaderRecompiler::SharedValues<TValue>& values) {
+    return static_cast<std::uint64_t>(values.size()) * sizeof(TValue);
+}
+
+std::uint64_t descriptorBindingBytes(const ShaderRecompiler::DescriptorBinding& binding) {
+    return vectorBytes(binding.guestDescriptor) + vectorBytes(binding.samplerDepthCompare) + vectorBytes(binding.imageWritten) +
+           vectorBytes(binding.imageDepthCompare) + vectorBytes(binding.imageAtomic) + vectorBytes(binding.imageAtomic64) +
+           vectorBytes(binding.imageShapes) + vectorBytes(binding.bufferAtomic) + vectorBytes(binding.bufferWritten) +
+           vectorBytes(binding.samplerUnnormalized) + vectorBytes(binding.samplerIntegerBorder) + vectorBytes(binding.samplerCoordinatesIgnored) +
+           vectorBytes(binding.imageUnnormalized) + vectorBytes(binding.imageUnnormalizedBaseLevel) + vectorBytes(binding.imageSamplers) +
+           vectorBytes(binding.bufferRead) + vectorBytes(binding.bufferExtent);
+}
+
+std::uint64_t resultBytes(const ShaderRecompiler::RecompileResult& result) {
+    auto bytes = sizeof(ShaderRecompiler::RecompileResult) + vectorBytes(result.vertexInputPatches) + vectorBytes(result.runtimeImageResources) +
+                 vectorBytes(result.vertexInputs) + vectorBytes(result.parameterExports) + vectorBytes(result.fragmentParameters) +
+                 vectorBytes(result.stencilReferences) + vectorBytes(result.specialization) + vectorBytes(result.heapSlotWords) +
+                 vectorBytes(result.bindings) + vectorBytes(result.pushConstants) + vectorBytes(result.vertexAttributes) +
+                 vectorBytes(result.imageTablePoison) + vectorBytes(result.imageTableRanges) + vectorBytes(result.imageTableReadRanges) +
+                 vectorBytes(result.heapUserWords) + vectorBytes(result.shaderDataUserWords);
+    if (result.meshBarycentrics.has_value()) bytes += vectorBytes(result.meshBarycentrics->parameters);
+    for (const auto& binding : result.bindings) bytes += descriptorBindingBytes(binding);
+    for (const auto& ranges : result.imageTableReadRanges) bytes += vectorBytes(ranges);
+    return bytes;
+}
+
+std::uint64_t captureBytes(const ShaderRecompiler::ResourceCapture& capture) {
+    const auto& snapshot = capture.snapshot;
+    auto bytes = sizeof(ShaderRecompiler::ResourceCapture) + vectorBytes(snapshot.buffers) + vectorBytes(snapshot.images) +
+                 vectorBytes(snapshot.samplers) + vectorBytes(snapshot.flattenedSrt) + vectorBytes(snapshot.userData) +
+                 vectorBytes(snapshot.srtPoison) + vectorBytes(snapshot.tables.tables) + vectorBytes(snapshot.tables.ranges) +
+                 vectorBytes(capture.readTrace.leaves) + vectorBytes(capture.readTrace.otherReads) + vectorBytes(capture.userDataUse.reads);
+    for (const auto& column : snapshot.tables.tables)
+        bytes += sharedBytes(column.codes) + sharedBytes(column.words) + sharedBytes(column.readRanges);
+    return bytes;
+}
+
+std::uint64_t wordsBytes(const ShaderRecompiler::HeapStageWords& words) {
+    auto bytes = sizeof(ShaderRecompiler::HeapStageWords) + vectorBytes(words.userData) + vectorBytes(words.flattenedSrt) +
+                 vectorBytes(words.vertexAttributes) + vectorBytes(words.bindings);
+    for (const auto& binding : words.bindings) bytes += vectorBytes(binding);
+    return bytes;
+}
+
+}
+
+std::uint64_t HeapWalkEntryBytes(const HeapWalkEntry& entry) {
+    auto bytes = sizeof(HeapWalkEntry) + vectorBytes(entry.userData) + vectorBytes(entry.ranges) + vectorBytes(entry.values) +
+                 vectorBytes(entry.accessible) + vectorBytes(entry.userDataUse.reads);
+    if (entry.capture != nullptr) bytes += captureBytes(*entry.capture);
+    if (entry.result != nullptr) bytes += resultBytes(*entry.result);
+    if (entry.words != nullptr) bytes += wordsBytes(*entry.words);
+    return bytes;
+}
+
+std::uint64_t HeapWalkMemoBudget() {
+    static const std::uint64_t budget = [] {
+        const char* value = std::getenv("APS5_HEAP_WALK_MEMO_MB");
+        const std::uint64_t megabytes = value == nullptr || *value == '\0' ? 256u : std::strtoull(value, nullptr, 10);
+        return megabytes << 20u;
+    }();
+    return budget;
+}
+
+void HeapWalkMemo::trim() {
+    for (const auto& [key, ways] : previous) release(ways);
+    previous.clear();
+    if (heldBytes <= budget) return;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> stamps;
+    for (const auto& [key, ways] : current) {
+        for (const auto& entry : ways) stamps.emplace_back(entry.stored, entry.bytes);
+    }
+    std::sort(stamps.begin(), stamps.end());
+    const auto excess = heldBytes - budget / 4u * 3u;
+    std::uint64_t freed = 0;
+    std::uint64_t threshold = 0;
+    for (const auto& [stored, bytes] : stamps) {
+        threshold = stored;
+        freed += bytes;
+        if (freed >= excess) break;
+    }
+    for (auto it = current.begin(); it != current.end();) {
+        std::erase_if(it->second, [&](const HeapWalkEntry& entry) {
+            if (entry.stored > threshold) return false;
+            heldBytes -= entry.bytes;
+            return true;
+        });
+        it = it->second.empty() ? current.erase(it) : std::next(it);
+    }
+}
+
+namespace {
+
 HeapWalkMemo& heapWalkMemo() {
     struct WalkMemoStorage {};
     auto& memo = HostThreadLocal<HeapWalkMemo, WalkMemoStorage>();
@@ -344,10 +447,7 @@ void rememberWalk(std::uint64_t memoKey, const ShaderRecompiler::PreparedShaderI
                   const std::vector<std::uint32_t>& values, const AddressRanges& accessible,
                   const std::shared_ptr<const ShaderRecompiler::ResourceCapture>& capture,
                   const std::shared_ptr<const ShaderRecompiler::RecompileResult>& result, const ShaderRecompiler::HeapStageWords& words) {
-    auto& ways = heapWalkMemo().slot(memoKey);
-    if (ways.size() >= HeapWalkWays) ways.pop_back();
-    ways.emplace(ways.begin());
-    auto& entry = ways.front();
+    HeapWalkEntry entry;
     entry.variant = invocation.VariantId();
     entry.pushOffset = invocation.Request().layout.pushConstantOffsetBytes;
     entry.shaderBase = shaderBase;
@@ -359,6 +459,7 @@ void rememberWalk(std::uint64_t memoKey, const ShaderRecompiler::PreparedShaderI
     entry.capture = capture;
     entry.result = result;
     entry.words = std::make_shared<const ShaderRecompiler::HeapStageWords>(words);
+    heapWalkMemo().remember(memoKey, std::move(entry));
 }
 
 }

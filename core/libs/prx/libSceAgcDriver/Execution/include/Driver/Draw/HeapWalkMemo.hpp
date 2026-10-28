@@ -23,6 +23,8 @@ struct HeapWalkEntry {
     std::shared_ptr<const ShaderRecompiler::ResourceCapture> capture;
     std::shared_ptr<const ShaderRecompiler::RecompileResult> result;
     std::shared_ptr<const ShaderRecompiler::HeapStageWords> words;
+    std::uint64_t bytes = 0;
+    std::uint64_t stored = 0;
 };
 
 constexpr std::size_t HeapWalkWays = 4;
@@ -33,10 +35,17 @@ constexpr std::size_t HeapWalkDrain = 2;
 
 constexpr std::size_t HeapWalkSeenKeys = 1u << 16;
 
+std::uint64_t HeapWalkEntryBytes(const HeapWalkEntry& entry);
+
+std::uint64_t HeapWalkMemoBudget();
+
 struct HeapWalkMemo {
     std::unordered_map<std::uint64_t, std::vector<HeapWalkEntry>> current;
     std::unordered_map<std::uint64_t, std::vector<HeapWalkEntry>> previous;
     std::vector<std::uint64_t> seen = std::vector<std::uint64_t>(HeapWalkSeenKeys, 0);
+    std::uint64_t heldBytes = 0;
+    std::uint64_t stores = 0;
+    std::uint64_t budget = HeapWalkMemoBudget();
 
     bool admit(std::uint64_t key) {
         auto& last = seen[(key ^ (key >> 29)) & (HeapWalkSeenKeys - 1u)];
@@ -57,13 +66,36 @@ struct HeapWalkMemo {
     }
 
     std::vector<HeapWalkEntry>& slot(std::uint64_t key) {
-        for (std::size_t drained = 0; drained < HeapWalkDrain && !previous.empty(); ++drained) previous.erase(previous.begin());
+        for (std::size_t drained = 0; drained < HeapWalkDrain && !previous.empty(); ++drained) {
+            release(previous.begin()->second);
+            previous.erase(previous.begin());
+        }
         if (current.size() >= HeapWalkMemoKeys && !current.contains(key)) {
+            for (const auto& [old, ways] : previous) release(ways);
             previous = std::move(current);
             current.clear();
         }
         return current[key];
     }
+
+    void remember(std::uint64_t key, HeapWalkEntry entry) {
+        auto& ways = slot(key);
+        if (ways.size() >= HeapWalkWays) {
+            heldBytes -= ways.back().bytes;
+            ways.pop_back();
+        }
+        entry.bytes = HeapWalkEntryBytes(entry);
+        entry.stored = ++stores;
+        heldBytes += entry.bytes;
+        ways.insert(ways.begin(), std::move(entry));
+        if (budget != 0 && heldBytes > budget) trim();
+    }
+
+    void release(const std::vector<HeapWalkEntry>& ways) {
+        for (const auto& entry : ways) heldBytes -= entry.bytes;
+    }
+
+    void trim();
 };
 
 }
