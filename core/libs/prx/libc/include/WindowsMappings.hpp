@@ -350,10 +350,10 @@ public:
 
     AccessGuardRefusal GuardAccess(std::uintptr_t address, std::size_t bytes) {
         if (address % subpageBytes != 0 || bytes % subpageBytes != 0 || bytes == 0) return AccessGuardRefusal::Misaligned;
-        guardsUsed.store(true, std::memory_order_release);
+        guardsUsed.store(true, std::memory_order_seq_cst);
         std::lock_guard lock(mutex);
         const auto end = address + bytes;
-        if (protectionsInFlight != 0) return AccessGuardRefusal::InFlight;
+        if (protectionsInFlight != 0 || changesActive.load(std::memory_order_seq_cst) != 0) return AccessGuardRefusal::InFlight;
         if (views.lower_bound(address & ~(pageBytes - 1)) != views.end() && views.lower_bound(address & ~(pageBytes - 1))->first < end) return AccessGuardRefusal::AliasedView;
         if (overlapsRange(pinnedRanges, address, end)) return AccessGuardRefusal::Pinned;
         if (overlapsRange(hostAccess, address, end)) return AccessGuardRefusal::HostAccess;
@@ -415,7 +415,15 @@ public:
     }
 
     bool AccessGuardsUsed() const {
-        return guardsUsed.load(std::memory_order_acquire);
+        return guardsUsed.load(std::memory_order_seq_cst);
+    }
+
+    void ChangeBegin() {
+        changesActive.fetch_add(1, std::memory_order_seq_cst);
+    }
+
+    void ChangeEnd() {
+        changesActive.fetch_sub(1, std::memory_order_seq_cst);
     }
 
     void BeginMappingChange() {
@@ -1933,6 +1941,7 @@ private:
     std::map<std::uintptr_t, DWORD> accessGuards;
     std::atomic<std::size_t> guardedSubpages{0};
     std::atomic<bool> guardsUsed{false};
+    std::atomic<std::uint32_t> changesActive{0};
     std::atomic<void (*)(std::uintptr_t)> accessGuardObserver{nullptr};
     AllocateFunction allocate = nullptr;
     MapFunction map = nullptr;

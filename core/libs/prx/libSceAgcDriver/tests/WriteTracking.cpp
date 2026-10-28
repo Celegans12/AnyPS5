@@ -3321,6 +3321,24 @@ void CheckAccessGuardInFlight() {
     std::cout << "access guards: refused while a protection change is in flight and on executable pages; a drop keeps the new protection\n";
 }
 
+std::atomic<std::uint8_t> hookGuardResult{255};
+std::uintptr_t hookGuardBase = 0;
+
+void CheckAccessGuardDuringHostWrite() {
+    PrivateFixture fixture(Block, Block);
+    hookGuardBase = fixture.Base();
+    hookGuardResult = 255;
+    GuestArena::GuestArenaSetHostWriteHook_nid_no_patch([](std::uintptr_t, std::size_t) { hookGuardResult = GuestArena::GuestArenaGuardAccess_nid_no_patch(hookGuardBase, 4096); });
+    const bool begun = GuestArena::GuestArenaBeginHostWrite_nid_postfix(fixture.memory + 64, 32);
+    GuestArena::GuestArenaSetHostWriteHook_nid_no_patch(nullptr);
+    Require(begun, "the host write was refused");
+    std::memset(fixture.memory + 64, 0x6b, 32);
+    GuestArena::GuestArenaEndHostWrite_nid_postfix(fixture.memory + 64, 32);
+    Require(hookGuardResult == 8, "a guard armed from inside a host write's opening was not refused InFlight (code " + std::to_string(hookGuardResult.load()) + ")");
+    Require(GuestArena::GuestArenaAccessGuardedSubpages_nid_no_patch() == 0 && fixture.At(64) == 0x6b && fixture.At(95) == 0x6b, "the host write did not land, or a guard was left");
+    std::cout << "access guards: a guard armed while a host write is opening is refused and the write lands\n";
+}
+
 struct RemapState {
     std::uint8_t* memory = nullptr;
     HANDLE inside = nullptr;
@@ -3410,6 +3428,7 @@ int main(int argc, char** argv) {
             CheckAccessGuardRace();
             CheckAccessGuardInFlight();
             CheckAccessGuardRemap();
+            CheckAccessGuardDuringHostWrite();
             std::cout << "access guard tests passed\n";
             return 0;
         }

@@ -49,6 +49,8 @@ public:
     MappingChange(std::uintptr_t address, std::size_t bytes, bool releasing) {
 #ifdef _WIN32
         auto& mappings = WindowsMappings::Get();
+        mappings.ChangeBegin();
+        counted = true;
         if (!mappings.AccessGuardsUsed()) return;
         mappings.BeginMappingChange();
         bracketed = true;
@@ -58,6 +60,7 @@ public:
             mappings.DropAccessGuards(address, bytes);
         } catch (...) {
             mappings.EndMappingChange();
+            mappings.ChangeEnd();
             throw;
         }
 #else
@@ -69,6 +72,7 @@ public:
     ~MappingChange() {
 #ifdef _WIN32
         if (bracketed) WindowsMappings::Get().EndMappingChange();
+        if (counted) WindowsMappings::Get().ChangeEnd();
 #endif
     }
     MappingChange(const MappingChange&) = delete;
@@ -76,6 +80,23 @@ public:
 
 private:
     bool bracketed = false;
+    bool counted = false;
+};
+
+class HostChange {
+public:
+    HostChange() {
+#ifdef _WIN32
+        WindowsMappings::Get().ChangeBegin();
+#endif
+    }
+    ~HostChange() {
+#ifdef _WIN32
+        WindowsMappings::Get().ChangeEnd();
+#endif
+    }
+    HostChange(const HostChange&) = delete;
+    HostChange& operator=(const HostChange&) = delete;
 };
 
 void openAccessGuardsForHost(std::uintptr_t address, std::size_t bytes) {
@@ -797,6 +818,7 @@ void GuestArenaPrepareHostRead_nid_no_patch(const void* pointer, std::size_t byt
 }
 
 bool GuestArenaBeginHostWrite_nid_postfix(void* pointer, std::size_t bytes) {
+    const HostChange change;
     openAccessGuardsForHost(reinterpret_cast<std::uintptr_t>(pointer), bytes);
     if (const auto hook = hostWriteHook.load(std::memory_order_acquire); hook != nullptr && bytes != 0) hook(reinterpret_cast<std::uintptr_t>(pointer), bytes);
 #ifdef _WIN32
@@ -809,6 +831,7 @@ bool GuestArenaBeginHostWrite_nid_postfix(void* pointer, std::size_t bytes) {
 
 #ifdef _WIN32
 bool GuestArenaBeginHostImport_nid_no_patch(void* pointer, std::size_t bytes) {
+    const HostChange change;
     openAccessGuardsForHost(reinterpret_cast<std::uintptr_t>(pointer), bytes);
     return WindowsMappings::Get().BeginHostWrite(reinterpret_cast<std::uintptr_t>(pointer), bytes, false);
 }
