@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_RECORDER_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_RECORDER_HPP
 
+#include "prx/libSceAgcDriver/Graphics/include/PendingWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BarrierBatch.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PassHazards.hpp"
@@ -1237,6 +1238,7 @@ private:
     // snapshot (a rebuild from inside a completion must not drop them) until finish returns.
     std::vector<const Batch*> finishing;
     mutable std::shared_ptr<const WriteRanges> published;
+    mutable ::AgcDriver::Graphics::PendingWriteRanges pendingWriteRanges;
     std::uint64_t submissions = 0;
     std::atomic<std::uint64_t> submittedSerial{0};
     std::atomic<std::uint64_t> retiredSerial{0};
@@ -1308,8 +1310,6 @@ private:
     std::list<DrawSnapshotKey> indexRangeRecency;
     bool refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, std::size_t bytes);
     std::shared_ptr<Buffer> containingDrawSnapshot(std::uint64_t address, std::size_t bytes, VkDeviceSize* offset);
-    mutable std::weak_ptr<const WriteRanges> publishedWriteRanges;
-    mutable bool publishedWriteRangesValid = false;
 };
 
 }

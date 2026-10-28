@@ -626,6 +626,18 @@ if(BUILD_TESTING)
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 
+    add_test_executable(agc_pending_write_ranges_tests tests/PendingWriteRanges.cpp)
+    target_include_directories(agc_pending_write_ranges_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_pending_write_ranges_tests PRIVATE libc)
+    set_target_properties(agc_pending_write_ranges_tests PROPERTIES CXX_EXTENSIONS OFF)
+    configure_windows_unwind(agc_pending_write_ranges_tests)
+    add_test(NAME agc_pending_write_ranges COMMAND agc_pending_write_ranges_tests)
+    set_tests_properties(agc_pending_write_ranges PROPERTIES TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_pending_write_ranges PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+
     add_test_executable(agc_runtime_switches_tests tests/RuntimeSwitches.cpp Graphics/src/RuntimeSwitches.cpp)
     target_include_directories(agc_runtime_switches_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(agc_runtime_switches_tests PRIVATE libc)
