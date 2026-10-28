@@ -2220,7 +2220,9 @@ private:
         source = InternSource(descriptor);
     }
 
-    // fable-void 6105127910: a V# whose words come through a load from guest memory (LoadAddressU32 in its chain).
+    // fable-void 6105127910: a V# whose words come through a load from guest memory: an SRT read (LoadAddressU32) or,
+    // unlike fable, a scalar buffer load (ReadConstBuffer: an s_buffer_load chain) or a word of the flattened SRT
+    // (ReadConst of GetSrtResource: what the SRT walker turns those loads into), which all read guest memory.
     static bool ReadsGuestMemory(const IrValue& handle) {
         std::vector<const IrValue*> pending;
         for (std::size_t index = 0; index < handle.ArgumentCount(); index++) pending.push_back(handle.Argument(index));
@@ -2229,7 +2231,8 @@ private:
             const IrValue* value = pending.back()->Resolve();
             pending.pop_back();
             if (!seen.insert(value).second) continue;
-            if (value->Opcode() == IrOpcode::LoadAddressU32) return true;
+            if (value->Opcode() == IrOpcode::LoadAddressU32 || value->Opcode() == IrOpcode::ReadConstBuffer) return true;
+            if (value->Opcode() == IrOpcode::ReadConst && value->ArgumentCount() > 0u && value->Argument(0)->Resolve()->Opcode() == IrOpcode::GetSrtResource) return true;
             for (std::size_t index = 0; index < value->ArgumentCount(); index++) pending.push_back(value->Argument(index));
         }
         return false;

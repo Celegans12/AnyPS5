@@ -1,4 +1,5 @@
 #include "Optimization/TransferKernel.hpp"
+#include <algorithm>
 
 namespace ShaderRecompiler {
 
@@ -153,6 +154,9 @@ bool FillValues(const IrProgram& program, const IrValue* data, std::uint32_t com
 std::optional<TransferKernelSite> FindTransferKernel(const IrProgram& program) {
     const auto& info = program.Info();
     if (!info.linearStore || info.unboundedStores) return std::nullopt;
+    // As LinearStore: the driver checks the live user-data V#s, so no store or load site may come from guest memory.
+    const auto fromMemory = [](const BufferStoreSite& site) { return site.fromMemory; };
+    if (std::ranges::any_of(info.bufferStores, fromMemory) || std::ranges::any_of(info.bufferLoads, fromMemory)) return std::nullopt;
     const IrValue* store = nullptr;
     for (const auto* block : program.BlockOrder()) {
         for (const auto* instruction : block->Instructions()) {

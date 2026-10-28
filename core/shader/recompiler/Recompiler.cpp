@@ -1727,6 +1727,10 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         if (!range.has_value()) result.unboundedReads = true;
         else if (range->second > range->first) result.readRanges.push_back(*range);
     }
+    {
+        const auto fromMemory = [](const BufferStoreSite& site) { return site.fromMemory; };
+        result.rangesFromMemory = std::ranges::any_of(variant.info.info.bufferStores, fromMemory) || std::ranges::any_of(variant.info.info.bufferLoads, fromMemory);
+    }
     result.linearStore = MaterializeLinearStore(variant.info.info, snapshot.stores);
     result.transferKernel.reset();
     if (result.linearStore && variant.info.info.transferKernel) {

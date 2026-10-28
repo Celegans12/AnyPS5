@@ -1,5 +1,6 @@
 #include "Optimization/LinearStore.hpp"
 #include "IntermediateRepresentation/IrMetadata/StageIO.hpp"
+#include <algorithm>
 #include <bit>
 
 namespace ShaderRecompiler {
@@ -78,6 +79,8 @@ std::optional<LinearStoreSite> FindLinearStore(const IrProgram& program, const s
     const auto& info = program.Info();
     if (program.Resources().stage != IrShaderStage::Compute || threads[0] == 0u || threads[1] != 1u || threads[2] != 1u) return std::nullopt;
     if (info.bufferStores.size() != 1u || info.unboundedStores || info.bufferStores.front().fromMemory || !StraightLine(program)) return std::nullopt;
+    // The driver re-reads the live user-data V# to check the linear store, so no site may come from guest memory.
+    if (std::ranges::any_of(info.bufferLoads, [](const BufferStoreSite& site) { return site.fromMemory; })) return std::nullopt;
     const IrValue* store = nullptr;
     for (const auto* block : program.BlockOrder()) {
         for (const auto* instruction : block->Instructions()) {

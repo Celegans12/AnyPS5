@@ -948,6 +948,9 @@ struct ShaderInvocation {
     bool unboundedWrites = false;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> readRanges;
     bool unboundedReads = false;
+    // Some store or load site's V# was read from guest memory: its range was evaluated at materialization and can be
+    // stale on a dispatch-cache hit (no RefreshMemoryBuffers here), so a driver must not narrow claims on such a result.
+    bool rangesFromMemory = false;
     std::optional<LinearStore> linearStore;
     std::optional<TransferKernel> transferKernel;
     std::vector<std::vector<std::pair<std::uint64_t, std::uint64_t>>> imageTableReadRanges;
