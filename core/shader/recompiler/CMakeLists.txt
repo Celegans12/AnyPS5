@@ -112,6 +112,7 @@ function(add_shader_recompiler target runtimeTarget)
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/RequestMemoryView.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/DescriptorBindingBuilder.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/ShaderInfoCollector.cpp
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/LinearStore.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/SharedMemoryBarrierInserter.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/DenormalFlushEliminator.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/VectorWindowStoreEliminator.cpp

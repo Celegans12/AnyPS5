@@ -2220,6 +2220,21 @@ private:
         source = InternSource(descriptor);
     }
 
+    // fable-void 6105127910: a V# whose words come through a load from guest memory (LoadAddressU32 in its chain).
+    static bool ReadsGuestMemory(const IrValue& handle) {
+        std::vector<const IrValue*> pending;
+        for (std::size_t index = 0; index < handle.ArgumentCount(); index++) pending.push_back(handle.Argument(index));
+        std::unordered_set<const IrValue*> seen;
+        while (!pending.empty()) {
+            const IrValue* value = pending.back()->Resolve();
+            pending.pop_back();
+            if (!seen.insert(value).second) continue;
+            if (value->Opcode() == IrOpcode::LoadAddressU32) return true;
+            for (std::size_t index = 0; index < value->ArgumentCount(); index++) pending.push_back(value->Argument(index));
+        }
+        return false;
+    }
+
     bool TakeGpuDescriptor(IrValue& inst, std::uint32_t memoryIndex) {
         const IrValue* handle = inst.Argument(0)->Resolve();
         if (handle->Opcode() != IrOpcode::GetBufferResource || handle->ArgumentCount() != 4u) {
@@ -2241,7 +2256,8 @@ private:
                 const bool scalar = memory.kind == ResourceKind::ScalarBuffer;
                 const IrValue* soffset = !scalar && inst.ArgumentCount() > 3u ? inst.Argument(3u)->Resolve() : nullptr;
                 const bool immediate = scalar || (soffset != nullptr && soffset->HasImmediate() && soffset->Type() == IrType::U32);
-                const BufferStoreSite site{InternSource(descriptor), soffset != nullptr && immediate ? soffset->ImmediateU32() : 0u, !immediate, scalar};
+                BufferStoreSite site{InternSource(descriptor), soffset != nullptr && immediate ? soffset->ImmediateU32() : 0u, !immediate, scalar};
+                site.fromMemory = ReadsGuestMemory(*handle);
                 if (std::ranges::find(sites, site) == sites.end()) sites.push_back(site);
             } else {
                 (store ? m_info.unboundedStores : m_info.unboundedLoads) = true;

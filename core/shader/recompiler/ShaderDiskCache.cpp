@@ -141,10 +141,11 @@ constexpr std::size_t fieldCount() {
     }
 }
 
-static_assert(fieldCount<ShaderInfo>() == 28, "ShaderInfo changed: update the info encoder");
+static_assert(fieldCount<ShaderInfo>() == 29, "ShaderInfo changed: update the info encoder");
 static_assert(fieldCount<BufferResource>() == 12, "BufferResource changed: update the info encoder");
 static_assert(fieldCount<ImageResource>() == 44, "ImageResource changed: update the info encoder");
 static_assert(fieldCount<SamplerResource>() == 8, "SamplerResource changed: update the info encoder");
+static_assert(fieldCount<LinearStoreSite>() == 3, "LinearStoreSite changed: update the info encoder");
 static_assert(fieldCount<SampledResourcePair>() == 3, "SampledResourcePair changed: update the info encoder");
 static_assert(fieldCount<StageInput>() == 5, "StageInput changed: update the info encoder");
 static_assert(fieldCount<StageOutput>() == 4, "StageOutput changed: update the info encoder");
@@ -890,6 +891,7 @@ void encodeShaderInfo(Writer& writer, const ShaderInfo& info) {
         out.Value(site.soffset);
         out.Value(site.dynamicSoffset);
         out.Value(site.scalar);
+        out.Value(site.fromMemory);
     };
     writer.List(info.bufferStores, writeSite);
     writer.Value(info.unboundedStores);
@@ -899,6 +901,12 @@ void encodeShaderInfo(Writer& writer, const ShaderInfo& info) {
     writer.Value(info.rasterPrimitive);
     writer.Value(info.layerExported);
     writer.Value(info.smoothOffsetBarycentrics);
+    writer.Value(info.linearStore.has_value());
+    if (info.linearStore) {
+        writer.Value(info.linearStore->components);
+        writer.Value(info.linearStore->elementBytes);
+        writer.Value(info.linearStore->descriptorFormat);
+    }
 }
 
 void decodeShaderInfo(Reader& reader, ShaderInfo& info) {
@@ -1011,15 +1019,26 @@ void decodeShaderInfo(Reader& reader, ShaderInfo& info) {
         in.Value(site.soffset);
         in.Value(site.dynamicSoffset);
         in.Value(site.scalar);
+        in.Value(site.fromMemory);
     };
-    reader.List(info.bufferStores, 10, readSite);
+    reader.List(info.bufferStores, 11, readSite);
     reader.Value(info.unboundedStores);
-    reader.List(info.bufferLoads, 10, readSite);
+    reader.List(info.bufferLoads, 11, readSite);
     reader.Value(info.unboundedLoads);
     reader.Value(info.dispatchThreadLimit);
     reader.Value(info.rasterPrimitive);
     reader.Value(info.layerExported);
     reader.Value(info.smoothOffsetBarycentrics);
+    bool linearStore = false;
+    reader.Value(linearStore);
+    info.linearStore.reset();
+    if (linearStore) {
+        LinearStoreSite site;
+        reader.Value(site.components);
+        reader.Value(site.elementBytes);
+        reader.Value(site.descriptorFormat);
+        info.linearStore = site;
+    }
 }
 
 void encodeInfo(Writer& writer, const CompiledShaderInfo& compiled) {

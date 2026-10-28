@@ -910,6 +910,15 @@ struct CompiledShaderArtifact {
     std::uint64_t variantId = 0;
 };
 
+struct LinearStore {
+    std::uint64_t base = 0;
+    std::uint32_t stride = 0;
+    std::uint32_t records = 0;
+    std::uint32_t elementBytes = 0;
+
+    bool operator==(const LinearStore& other) const = default;
+};
+
 struct ShaderInvocation {
     std::vector<PipelineSpecializationConstant> specialization;
     std::uint64_t specializationId = 0;
@@ -925,6 +934,7 @@ struct ShaderInvocation {
     bool unboundedWrites = false;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> readRanges;
     bool unboundedReads = false;
+    std::optional<LinearStore> linearStore;
     std::vector<std::vector<std::pair<std::uint64_t, std::uint64_t>>> imageTableReadRanges;
     std::uint64_t imageTableShader = 0;
     std::uint32_t imageTableFaults = 0;

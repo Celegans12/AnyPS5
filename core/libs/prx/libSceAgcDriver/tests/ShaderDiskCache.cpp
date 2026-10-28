@@ -2634,6 +2634,7 @@ IrResourcePlan handBuiltPlan() {
     image.resourceClass = ImageResourceClass::Sampled;
     image.dimension = RdnaImageDimension::Dim2D;
     plan.info.images = {image};
+    plan.info.linearStore = LinearStoreSite{4u, 0u, true};
     ResourceMaterializer::PrepareImageModes(plan.info);
     plan.uniformFill.fill = {UniformFillKind::Buffer, 1u, {4u, 8u, 12u}, 2u, 0x3f800000u};
     auto& fillValue = readConst(5);

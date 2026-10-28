@@ -44,6 +44,8 @@
 #include "Optimization/ResourceProgram.hpp"
 #include "Optimization/include/Optimization/ResourceTracker.hpp"
 #include "Optimization/include/Optimization/VectorWindowStoreEliminator.hpp"
+#include "Optimization/include/Optimization/LinearStore.hpp"
+#include "SpirvBackend/SpirvBufferFormat.hpp"
 #include "Optimization/include/Optimization/ShaderInfoCollector.hpp"
 #include "Optimization/include/Optimization/SrtWalker.hpp"
 #include "Optimization/include/Optimization/SsaBuilder.hpp"
@@ -426,6 +428,7 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
     resourceTracker.Track(program, request.target.bindlessImages);
     deadCodeEliminator.Eliminate(program);
     dumpIr("resources");
+    if (request.context.compute && !request.context.compute->PartialGroups()) program.Info().linearStore = FindLinearStore(program, request.context.compute->numThreads);
     program.Resources().srgbDecodeFormats = request.target.srgbDecodeFormats;
     if (request.context.convertedSamples) {
         for (auto& image : program.Resources().info.images) image.convertedSamples = true;
@@ -654,6 +657,25 @@ void validateTargetBlends(const RecompileRequest& request) {
 
 std::array<std::uint32_t, 3> partialThreads(const RecompileRequest& request) {
     return request.context.compute ? request.context.compute->partialThreads : std::array<std::uint32_t, 3>{};
+}
+
+std::optional<LinearStore> MaterializeLinearStore(const ShaderInfo& info, std::span<const DescriptorValue> stores) {
+    if (!info.linearStore || stores.size() != 1u || stores.front().dwordCount < 4u) return std::nullopt;
+    const auto& words = stores.front().dwords;
+    const auto stride = (words[1] >> 16u) & 0x3fffu;
+    const bool swizzled = stride != 0u && (words[1] >> 31u) != 0u;
+    const bool laneIndexed = ((words[3] >> 23u) & 1u) != 0u;
+    if (swizzled || laneIndexed || (words[3] >> 30u) != 0u) return std::nullopt;
+    auto elementBytes = info.linearStore->elementBytes;
+    if (info.linearStore->descriptorFormat) {
+        const auto format = GetFormatInfo(static_cast<IrBufferFormat>((words[3] >> 12u) & 0x7fu));
+        if (format.type == SpirvFormatComponentType::Unknown || format.componentCount == 0u || format.componentCount > info.linearStore->components) return std::nullopt;
+        std::uint32_t bits = 0;
+        for (std::uint32_t component = 0; component < format.componentCount; ++component) bits += format.componentBits[component];
+        elementBytes = format.packedBitfield ? 4u : bits / 8u;
+    }
+    if (elementBytes == 0u) return std::nullopt;
+    return LinearStore{static_cast<std::uint64_t>(words[0]) | static_cast<std::uint64_t>(words[1] & 0xffffu) << 32u, stride, words[2], elementBytes};
 }
 
 std::optional<std::pair<std::uint64_t, std::uint64_t>> BufferStoreExtent(const DescriptorValue& value, const BufferStoreSite& site) {
@@ -1703,6 +1725,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         if (!range.has_value()) result.unboundedReads = true;
         else if (range->second > range->first) result.readRanges.push_back(*range);
     }
+    result.linearStore = MaterializeLinearStore(variant.info.info, snapshot.stores);
     if (!tables.map.empty()) {
         result.imageTablePoison.reserve(tables.poison.size());
         for (const auto& poison : tables.poison) result.imageTablePoison.push_back({poison.words, poison.dwordCount, poison.resource, static_cast<std::uint32_t>(poison.reason)});
