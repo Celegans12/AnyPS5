@@ -733,6 +733,10 @@ void GuestArenaUnguardAccess_nid_no_patch(std::uintptr_t address, std::size_t by
     WindowsMappings::Get().UnguardAccess(address, bytes);
 }
 
+void GuestArenaOpenAccessGuards_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
+    openAccessGuardsForHost(address, bytes);
+}
+
 bool GuestArenaAccessGuarded_nid_no_patch(std::uintptr_t address) {
     return WindowsMappings::Get().AccessGuarded(address);
 }
@@ -780,6 +784,8 @@ std::uint8_t GuestArenaGuardAccess_nid_no_patch(std::uintptr_t, std::size_t) {
 }
 
 void GuestArenaUnguardAccess_nid_no_patch(std::uintptr_t, std::size_t) {}
+
+void GuestArenaOpenAccessGuards_nid_no_patch(std::uintptr_t, std::size_t) {}
 
 bool GuestArenaAccessGuarded_nid_no_patch(std::uintptr_t) {
     return false;

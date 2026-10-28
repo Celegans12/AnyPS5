@@ -2920,6 +2920,7 @@ void SetReadGuard(void (*guard)(std::uint64_t address, std::size_t bytes)) {
 
 void GuardRead(std::uint64_t address, std::size_t bytes) {
     if (const auto guard = readGuard.load(std::memory_order_acquire)) guard(address, bytes);
+    GuestArena::GuestArenaOpenAccessGuards_nid_no_patch(static_cast<std::uintptr_t>(address), bytes);
 }
 
 namespace {

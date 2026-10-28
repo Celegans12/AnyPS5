@@ -104,6 +104,7 @@ void GuestArenaEndSetProtection_nid_no_patch(std::uintptr_t address, std::size_t
 std::uint32_t GuestArenaMappingLockOwner_nid_no_patch();
 std::uint8_t GuestArenaGuardAccess_nid_no_patch(std::uintptr_t address, std::size_t bytes);
 void GuestArenaUnguardAccess_nid_no_patch(std::uintptr_t address, std::size_t bytes);
+void GuestArenaOpenAccessGuards_nid_no_patch(std::uintptr_t address, std::size_t bytes);
 bool GuestArenaAccessGuarded_nid_no_patch(std::uintptr_t address);
 std::size_t GuestArenaAccessGuardedSubpages_nid_no_patch();
 void GuestArenaSetAccessGuardObserver_nid_no_patch(void (*callback)(std::uintptr_t address));

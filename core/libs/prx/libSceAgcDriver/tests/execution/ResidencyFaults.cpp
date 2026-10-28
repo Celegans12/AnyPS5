@@ -10,6 +10,7 @@
 #include "prx/libc/include/GuestArena.hpp"
 #include "VulkanTestDevice.hpp"
 #include <array>
+#include <span>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -88,16 +89,26 @@ struct Harness {
     void FillMirror(std::uint32_t index, std::uint32_t subpage, std::uint32_t value, int lane) const {
         const Recorder::LaneScope scope(lane);
         const std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
-        const auto slot = driver.Manager().Slot(Page(index));
-        if (!slot) throw std::runtime_error("the page to fill is not resident");
-        const auto chunk = driver.Mirrors().Chunk(slot->chunk);
+        driver.Manager().NoteGpuWritten(guest.Address(index, subpage), ResidencySubpageBytes);
+        VkBuffer target = VK_NULL_HANDLE;
+        VkDeviceSize offset = 0;
+        std::shared_ptr<MirrorChunk> chunk;
+        if (const auto slot = driver.Manager().Slot(Page(index))) {
+            chunk = driver.Mirrors().Chunk(slot->chunk);
+            target = chunk->buffer;
+            offset = (VkDeviceSize{slot->slot} << ResidencyPageShift) + (VkDeviceSize{subpage} << ResidencySubpageShift);
+        } else {
+            const auto* import = HostImportFor(context, guest.Address(index, subpage), ResidencySubpageBytes);
+            if (import == nullptr) throw std::runtime_error("the demoted page has no import to write");
+            target = import->buffer;
+            offset = HostImportOffset(*import, guest.Address(index, subpage));
+        }
         const auto commands = recorder.Commands();
         Barrier(commands, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-        context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, chunk->buffer, (VkDeviceSize{slot->slot} << ResidencyPageShift) + (VkDeviceSize{subpage} << ResidencySubpageShift), ResidencySubpageBytes, value);
-        Barrier(commands, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+        context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, target, offset, ResidencySubpageBytes, value);
+        Barrier(commands, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_READ_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT);
         recorder.MarkCovered(VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
-        recorder.Keep(chunk);
-        driver.Manager().NoteGpuWritten(guest.Address(index, subpage), ResidencySubpageBytes);
+        if (chunk != nullptr) recorder.Keep(chunk);
     }
 
     std::vector<std::uint32_t> ReadMirror(std::uint32_t index, int lane) const {
@@ -178,6 +189,52 @@ void CollectCannotHideCpuWrite(const Harness& harness, std::uint32_t index) {
     Expect(later[5 * WordsPerSubpage] == value + 1, "collect: an ordering point after the tracker's collect did not bring the CPU store into the mirror");
 }
 
+void RefusedGuardWritesBack(const Harness& harness, std::uint32_t index) {
+    harness.Use(index, 0);
+    if (!harness.driver.Manager().Slot(harness.Page(index))) {
+        Expect(false, "refused guard: the page was not admitted");
+        return;
+    }
+    const auto unguardable = harness.driver.Manager().Counts().accessUnguardable;
+    GuestArena::GuestArenaPinWritable_nid_postfix(harness.guest.Words(index), ResidencyPageBytes);
+    harness.FillMirror(index, 6, 0x6e6e6e6eu, 0);
+    Expect(harness.driver.Manager().Counts().accessUnguardable == unguardable + 1, "refused guard: the pinned page's guard was not refused");
+    Expect(!GuestArena::GuestArenaAccessGuarded_nid_no_patch(harness.guest.Address(index, 6)), "refused guard: a guard was armed over a pinned page");
+    Expect(harness.driver.Manager().Dirty(harness.Page(index)) == 0, "refused guard: a subpage stayed GPU-dirty without a guard (the merge rule's invariant)");
+    {
+        const std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        harness.device.SubmitRecorded(false);
+        harness.device.WaitIdle();
+    }
+    GuestArena::GuestArenaUnpinWritable_nid_postfix(harness.guest.Words(index), ResidencyPageBytes);
+    Expect(!harness.driver.Manager().Slot(harness.Page(index)).has_value(), "refused guard: the page was not demoted, so the GPU write could not go to guest memory directly");
+    Expect(harness.guest.Words(index)[6 * WordsPerSubpage + 9] == 0x6e6e6e6eu, "refused guard: the GPU write did not reach guest memory");
+    Expect(harness.guest.Words(index)[5 * WordsPerSubpage + 9] == Pattern(index, 5 * WordsPerSubpage + 9), "refused guard: a subpage the GPU did not write changed");
+}
+
+void DriverReadOpensGuard(const Harness& harness, std::uint32_t index) {
+    harness.Use(index, 0);
+    if (!harness.driver.Manager().Slot(harness.Page(index))) {
+        Expect(false, "driver read: the page was not admitted");
+        return;
+    }
+    harness.FillMirror(index, 0, 0x44444444u, 0);
+    bool threw = false;
+    try {
+        const std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        std::array<std::byte, 16> bytes{};
+        AgcDriver::GuestMemory::ReadCommitted(harness.guest.Address(index), bytes);
+    } catch (const std::exception&) {
+        threw = true;
+    }
+    Expect(threw, "driver read: a read of a guarded page under the GPU mutex did not fail loudly");
+    Expect(GuestArena::GuestArenaAccessGuarded_nid_no_patch(harness.guest.Address(index)), "driver read: the refused read dropped the guard");
+    std::array<std::uint32_t, 4> words{};
+    AgcDriver::GuestMemory::ReadCommitted(harness.guest.Address(index), std::as_writable_bytes(std::span(words)));
+    Expect(words[0] == 0x44444444u && words[3] == 0x44444444u, "driver read: a driver read off the GPU mutex did not get the GPU's bytes");
+    Expect(!GuestArena::GuestArenaAccessGuarded_nid_no_patch(harness.guest.Address(index)), "driver read: the guard stayed after the read opened it");
+}
+
 void OwnerIsNeverServed(const Harness& harness, std::uint32_t index) {
     harness.Use(index, 0);
     if (!harness.driver.Manager().Slot(harness.Page(index))) {
@@ -229,6 +286,8 @@ int main(int argc, char** argv) {
             if (asyncLane) SubpageMerge(harness, 1, 1);
             CollectCannotHideCpuWrite(harness, 2);
             OwnerIsNeverServed(harness, 3);
+            RefusedGuardWritesBack(harness, 4);
+            DriverReadOpensGuard(harness, 5);
             const std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
             device->SubmitRecorded(false);
             device->WaitIdle();
