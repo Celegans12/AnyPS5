@@ -703,7 +703,8 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
         std::uint32_t logicalProtection = memory.Protect;
         GuestArena::GuestArenaProtection_nid_postfix(cursor, &logicalProtection);
         const auto protection = logicalProtection & 0xffu;
-        const bool committed = memory.State == MEM_COMMIT && (memory.Protect & (PAGE_GUARD | PAGE_NOACCESS)) == 0;
+        const bool accessGuarded = memory.State == MEM_COMMIT && (memory.Protect & PAGE_NOACCESS) != 0 && GuestArena::GuestArenaAccessGuarded_nid_no_patch(cursor);
+        const bool committed = memory.State == MEM_COMMIT && ((memory.Protect & (PAGE_GUARD | PAGE_NOACCESS)) == 0 || accessGuarded);
         const bool readable = committed && readableProtection(protection);
         const bool writable = readable && writableProtection(protection);
         if ((memory.Protect & PAGE_GUARD) == 0) pages.record(base, regionEnd, readable, writable, generation, access);

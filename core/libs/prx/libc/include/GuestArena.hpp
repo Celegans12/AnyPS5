@@ -102,6 +102,12 @@ std::uint64_t GuestArenaOwnedMark_nid_no_patch();
 void GuestArenaTakeOwnedCounts_nid_no_patch(std::uint64_t* counts, std::size_t count);
 void GuestArenaEndSetProtection_nid_no_patch(std::uintptr_t address, std::size_t bytes);
 std::uint32_t GuestArenaMappingLockOwner_nid_no_patch();
+std::uint8_t GuestArenaGuardAccess_nid_no_patch(std::uintptr_t address, std::size_t bytes);
+void GuestArenaUnguardAccess_nid_no_patch(std::uintptr_t address, std::size_t bytes);
+bool GuestArenaAccessGuarded_nid_no_patch(std::uintptr_t address);
+std::size_t GuestArenaAccessGuardedSubpages_nid_no_patch();
+void GuestArenaSetAccessGuardObserver_nid_no_patch(void (*callback)(std::uintptr_t address));
+void GuestArenaSetMappingGuardObserver_nid_no_patch(void (*callback)(std::uintptr_t address, std::size_t bytes, bool releasing));
 void GuestArenaRunUnderMappingLock_nid_no_patch(void (*body)(void*), void* argument);
 
 }
