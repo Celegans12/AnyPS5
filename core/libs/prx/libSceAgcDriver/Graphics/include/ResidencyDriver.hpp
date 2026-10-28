@@ -80,6 +80,7 @@ public:
     std::uint64_t FastFaults() const { return fastFaults.load(std::memory_order_relaxed); }
     std::uint64_t ServedFaults() const { return servedFaults.load(std::memory_order_relaxed); }
     std::uint64_t RefusedFaults() const { return refusedFaults.load(std::memory_order_relaxed); }
+    std::uint64_t DriverPublishes() const { return driverPublishes.load(std::memory_order_relaxed); }
 
     bool Reached(const ResidencyToken& token) override;
     void Wait(const ResidencyToken& token) override;
@@ -119,6 +120,7 @@ private:
     std::atomic<std::uint64_t> fastFaults{0};
     std::atomic<std::uint64_t> servedFaults{0};
     std::atomic<std::uint64_t> refusedFaults{0};
+    std::atomic<std::uint64_t> driverPublishes{0};
 };
 
 }

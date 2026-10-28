@@ -6081,6 +6081,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
     for (const auto* region : copies) {
         recorder->FlushKeyStoresOverlapping(region->begin, static_cast<std::size_t>(region->end - region->begin));
         recorder->FlushStoresOverlapping(region->begin, static_cast<std::size_t>(region->end - region->begin));
+        GuestMemory::PublishGpuOwned(region->begin, static_cast<std::size_t>(region->end - region->begin));
     }
     // The copy-ins of an unordered dispatch joining an open run of its ring (dispatch overlap, see
     // Recorder::RunCommands) record no leading barrier: the run's first dispatch ordered everything
