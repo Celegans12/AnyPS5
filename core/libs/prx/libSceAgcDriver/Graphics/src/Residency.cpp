@@ -2559,6 +2559,14 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> ResidencyManager::ResidentG
     return resident;
 }
 
+std::vector<std::pair<std::uint64_t, std::uint64_t>> ResidencyManager::MirroredIn(std::uint64_t address, std::uint64_t bytes) {
+    const std::lock_guard structureLock(structure);
+    applyDrops();
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> mirrored;
+    for (const auto id : residentIn(address, bytes)) mirrored.emplace_back(pages[id].index, chunks[pages[id].slot.chunk].address + (std::uint64_t{pages[id].slot.slot} << ResidencyPageShift));
+    return mirrored;
+}
+
 std::vector<std::uint32_t> ResidencyManager::Chunks() const {
     const std::lock_guard structureLock(structure);
     std::vector<std::uint32_t> live;
