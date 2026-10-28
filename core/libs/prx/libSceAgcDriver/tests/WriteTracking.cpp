@@ -3256,6 +3256,115 @@ void CheckAccessGuardMappingChange() {
     GuestArena::GuestArenaSetMappingGuardObserver_nid_no_patch(nullptr);
     std::cout << "access guards: protection changes and resets call the mapping observer first and drop the guards\n";
 }
+struct GuardRace {
+    volatile std::uint8_t* at = nullptr;
+    std::atomic<bool> stop{false};
+    std::atomic<std::uint64_t> reads{0};
+    std::atomic<std::uint64_t> wrong{0};
+};
+
+void CheckAccessGuardRace() {
+    PrivateFixture fixture(Block, Block);
+    const auto base = fixture.Base();
+    fixture.At(200) = 0x5a;
+    GuestArena::GuestArenaSetAccessGuardObserver_nid_no_patch(&ServeAccessGuard);
+    GuardRace race;
+    race.at = &fixture.At(200);
+    const auto body = [](void* argument) -> DWORD {
+        auto& state = *static_cast<GuardRace*>(argument);
+        while (!state.stop.load(std::memory_order_acquire)) {
+            if (*state.at != 0x5a) state.wrong.fetch_add(1);
+            state.reads.fetch_add(1);
+        }
+        return 0;
+    };
+    const HANDLE reader = CreateThread(nullptr, 0, body, &race, 0, nullptr);
+    Require(reader != nullptr, "cannot start the racing reader");
+    std::uint32_t armed = 0;
+    for (int k = 0; k < 10000; ++k) {
+        if (GuestArena::GuestArenaGuardAccess_nid_no_patch(base, 4096) == 0) ++armed;
+        GuestArena::GuestArenaUnguardAccess_nid_no_patch(base, 4096);
+    }
+    race.stop.store(true, std::memory_order_release);
+    if (WaitForSingleObject(reader, 10000) != WAIT_OBJECT_0) {
+        std::cerr << "FAIL: the racing reader did not finish\n";
+        std::cerr.flush();
+        TerminateProcess(GetCurrentProcess(), 3);
+    }
+    CloseHandle(reader);
+    GuestArena::GuestArenaSetAccessGuardObserver_nid_no_patch(nullptr);
+    Require(armed == 10000, "a guard of the race loop was refused: " + std::to_string(armed) + " of 10000 armed");
+    Require(race.wrong == 0 && race.reads > 0, "the racing reader saw a wrong value or never ran: " + std::to_string(race.wrong.load()) + " wrong of " + std::to_string(race.reads.load()));
+    Require(GuestArena::GuestArenaAccessGuardedSubpages_nid_no_patch() == 0 && HostProtection(fixture.memory) == PAGE_READWRITE, "the race left a guard or the wrong protection");
+    std::cout << "access guards: 10000 guard/unguard cycles against a reading thread, no lost fault (" << race.reads.load() << " reads)\n";
+}
+
+void CheckAccessGuardInFlight() {
+    PrivateFixture fixture(Block, Block);
+    const auto base = fixture.Base();
+    GuestArena::GuestArenaSetProtection_nid_postfix(base, 4096, PAGE_READONLY);
+    Require(GuestArena::GuestArenaGuardAccess_nid_no_patch(base, 4096) == 8, "a guard was armed while a guest protection change was in flight");
+    DWORD previous = 0;
+    Require(VirtualProtect(fixture.memory, 4096, PAGE_READONLY, &previous) != 0, "cannot apply the guest's protection change");
+    GuestArena::GuestArenaEndSetProtection_nid_no_patch(base, 4096);
+    Require(GuestArena::GuestArenaGuardAccess_nid_no_patch(base, 4096) == 0, "cannot guard after the protection change ended");
+    GuestArena::GuestArenaUnguardAccess_nid_no_patch(base, 4096);
+    Require(HostProtection(fixture.memory) == PAGE_READONLY, "the dropped guard did not leave the guest's new protection");
+    GuestArena::GuestArenaSetProtection_nid_postfix(base, 4096, PAGE_EXECUTE_READWRITE);
+    Require(VirtualProtect(fixture.memory, 4096, PAGE_EXECUTE_READWRITE, &previous) != 0, "cannot make the page executable");
+    GuestArena::GuestArenaEndSetProtection_nid_no_patch(base, 4096);
+    Require(GuestArena::GuestArenaGuardAccess_nid_no_patch(base, 4096) == 9, "a guard over an executable page was not refused");
+    Require(GuestArena::GuestArenaAccessGuardedSubpages_nid_no_patch() == 0, "the refused executable guard armed something");
+    GuestArena::GuestArenaSetProtection_nid_postfix(base, 4096, PAGE_READWRITE);
+    Require(VirtualProtect(fixture.memory, 4096, PAGE_READWRITE, &previous) != 0, "cannot restore the page");
+    GuestArena::GuestArenaEndSetProtection_nid_no_patch(base, 4096);
+    std::cout << "access guards: refused while a protection change is in flight and on executable pages; a drop keeps the new protection\n";
+}
+
+struct RemapState {
+    std::uint8_t* memory = nullptr;
+    HANDLE inside = nullptr;
+    HANDLE release = nullptr;
+};
+
+RemapState* remapState = nullptr;
+
+void CheckAccessGuardRemap() {
+    PrivateFixture fixture(Block, Block);
+    const auto base = fixture.Base();
+    RemapState state;
+    state.memory = fixture.memory;
+    state.inside = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    state.release = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    Require(state.inside != nullptr && state.release != nullptr, "cannot create the remap events");
+    remapState = &state;
+    GuestArena::GuestArenaSetMappingGuardObserver_nid_no_patch([](std::uintptr_t, std::size_t, bool) {
+        SetEvent(remapState->inside);
+        WaitForSingleObject(remapState->release, 10000);
+    });
+    Require(GuestArena::GuestArenaGuardAccess_nid_no_patch(base, 4096) == 0, "cannot guard before the remap");
+    const auto body = [](void* argument) -> DWORD {
+        auto& remap = *static_cast<RemapState*>(argument);
+        GuestArena::GuestArenaReset_nid_postfix(remap.memory, 4 * 4096);
+        return 0;
+    };
+    const HANDLE worker = CreateThread(nullptr, 0, body, &state, 0, nullptr);
+    Require(worker != nullptr, "cannot start the remapping thread");
+    Require(WaitForSingleObject(state.inside, 10000) == WAIT_OBJECT_0, "the reset never called the mapping observer");
+    const auto late = GuestArena::GuestArenaGuardAccess_nid_no_patch(base + 2 * 4096, 4096);
+    SetEvent(state.release);
+    Require(WaitForSingleObject(worker, 10000) == WAIT_OBJECT_0, "the reset did not finish");
+    CloseHandle(worker);
+    GuestArena::GuestArenaSetMappingGuardObserver_nid_no_patch(nullptr);
+    remapState = nullptr;
+    CloseHandle(state.inside);
+    CloseHandle(state.release);
+    Require(late == 8, "a guard armed during a reset was not refused (code " + std::to_string(late) + ")");
+    Require(GuestArena::GuestArenaAccessGuardedSubpages_nid_no_patch() == 0, "a guard survived the reset");
+    fixture.Commit(0, 4 * 4096);
+    Require(fixture.At(2 * 4096) == 0 && HostProtection(fixture.memory + 2 * 4096) == PAGE_READWRITE, "the recommitted range is not fresh read-write memory");
+    std::cout << "access guards: a guard armed while a reset is in progress is refused\n";
+}
 #endif
 
 int main(int argc, char** argv) {
@@ -3298,6 +3407,9 @@ int main(int argc, char** argv) {
             CheckAccessGuardOwner();
             CheckAccessGuardRefusals();
             CheckAccessGuardMappingChange();
+            CheckAccessGuardRace();
+            CheckAccessGuardInFlight();
+            CheckAccessGuardRemap();
             std::cout << "access guard tests passed\n";
             return 0;
         }
