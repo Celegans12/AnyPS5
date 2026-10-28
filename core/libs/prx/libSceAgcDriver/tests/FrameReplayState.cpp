@@ -419,6 +419,22 @@ void testAliasedPages(const std::filesystem::path& directory) {
 }
 #endif
 
+void testHostCollisions(const std::filesystem::path& directory) {
+    FrameCaptureWriter writer(directory);
+    writer.WriteRange(0x10000000, 0x20000, FrameRangeKind::Watched, 3, FrameRangeAccess::Readable | FrameRangeAccess::Gpu);
+    writer.WriteRange(0x20000000, 0x10000, FrameRangeKind::Watched, 3, FrameRangeAccess::Readable);
+    writer.WriteRange(0x30000000, 0x10000, FrameRangeKind::Host, 3, FrameRangeAccess::Readable | FrameRangeAccess::Gpu);
+    writer.Finish("{}");
+    const FrameCaptureReader reader(directory);
+    const auto overlaps = [](std::uint64_t address, std::uint64_t bytes) {
+        const auto hits = [&](std::uint64_t begin, std::uint64_t end) { return address < end && begin < address + bytes; };
+        return hits(0x1001f000, 0x10021000) || hits(0x30000000, 0x30001000);
+    };
+    const auto found = HostCollisions(reader, overlaps);
+    check(found.size() == 1 && found[0].first == 0x10000000 && found[0].second == 0x10020000, "only the guest range on the host region collides");
+    check(HostCollisions(reader, [](std::uint64_t, std::uint64_t) { return false; }).empty(), "no host region, no collision");
+}
+
 void testPrologueDedupe() {
     const auto resolve = [](std::uint64_t address, std::uint32_t context) {
         FrameCall call;
@@ -466,6 +482,7 @@ int main(int argc, char** argv) {
         else if (mode == "tokens") testEopTokens();
         else if (mode == "dump_chunks") testDumpChunks();
         else if (mode == "dedupe") testPrologueDedupe();
+        else if (mode == "host_collisions") testHostCollisions(directory);
         else if (mode == "blocking") testBlockingSubmission(directory);
         else if (mode == "shader" || mode == "shader_host") testShaderCode(directory, mode == "shader_host");
         else if (mode == "shader_prologue") testPrologueHeader(directory);
