@@ -23,6 +23,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <future>
 #include <map>
 #include <memory>
@@ -37,6 +38,7 @@
 #include <vector>
 #ifdef _WIN32
 #include <windows.h>
+#include <tlhelp32.h>
 #endif
 
 namespace {
@@ -83,6 +85,8 @@ struct Options {
     // --dedupe-prologue: skip a prologue ABI resolution that repeats an identical earlier one with no
     // shader registration or memory call in between (its inputs did not change).
     bool dedupePrologue = false;
+    // --host-regions: print this process's host regions inside the guest arena and exit.
+    bool hostRegions = false;
 };
 
 // The prologue's provably redundant ABI resolutions (--dedupe-prologue): a resolve call is redundant
@@ -217,6 +221,89 @@ std::uint64_t headerNumber(const std::string& header, std::string_view key) {
     if (at == std::string::npos) throw std::runtime_error("frame replay: the capture header has no " + std::string(key));
     return std::strtoull(header.c_str() + at + quoted.size(), nullptr, 10);
 }
+
+// Host regions: what this process had allocated inside the guest arena's range before libc reserved it at static
+// init (GuestArena.cpp: "_holes"/"_hostRegions": the process heap, early thread stacks, early CRT heaps). Their
+// addresses are randomized per process start (high-entropy bottom-up ASLR), so in some starts one lands on a range
+// the capture's process used, and the replay cannot map it ("fixed guest mapping ... overlaps a host region").
+// HostCollisions lists the captured ranges that overlap one; the replay then starts itself again (main).
+using Interval = std::pair<std::uint64_t, std::uint64_t>;
+
+std::vector<Interval> HostCollisions(const FrameCaptureReader& reader, const std::function<bool(std::uint64_t, std::uint64_t)>& overlaps) {
+    std::vector<Interval> found;
+    for (const auto& chunk : reader.Chunks()) {
+        if (chunk.kind != FrameMemoryKind::Range || chunk.rangeKind == FrameRangeKind::Host) continue;
+        if (overlaps(chunk.address, chunk.bytes)) found.emplace_back(chunk.address, chunk.address + chunk.bytes);
+    }
+    return found;
+}
+
+#ifdef _WIN32
+// What owns the host allocation at `address`: its region, type and protection, and whether it is a heap of this
+// process, a thread's stack or an image.
+std::string DescribeHostRegion(std::uint64_t address) {
+    MEMORY_BASIC_INFORMATION info{};
+    if (VirtualQuery(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)), &info, sizeof(info)) == 0) return "not queryable";
+    const auto base = reinterpret_cast<std::uintptr_t>(info.AllocationBase);
+    std::string owner;
+    if (info.Type == MEM_IMAGE) {
+        char name[MAX_PATH]{};
+        owner = GetModuleFileNameA(reinterpret_cast<HMODULE>(base), name, MAX_PATH) != 0 ? std::string("image ") + name : "image";
+    }
+    std::vector<HANDLE> heaps(256);
+    const auto count = GetProcessHeaps(static_cast<DWORD>(heaps.size()), heaps.data());
+    for (DWORD index = 0; index < count && index < heaps.size(); ++index) {
+        if (reinterpret_cast<std::uintptr_t>(heaps[index]) == base) owner = std::string("heap ") + (heaps[index] == GetProcessHeap() ? "(the process heap)" : std::to_string(index));
+    }
+    using Query = LONG(WINAPI*)(HANDLE, int, void*, ULONG, ULONG*);
+    const auto query = reinterpret_cast<Query>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryInformationThread")));
+    if (const auto snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0); snapshot != INVALID_HANDLE_VALUE && query != nullptr) {
+        THREADENTRY32 entry{};
+        entry.dwSize = sizeof(entry);
+        for (bool more = Thread32First(snapshot, &entry); more; more = Thread32Next(snapshot, &entry)) {
+            if (entry.th32OwnerProcessID != GetCurrentProcessId()) continue;
+            const auto thread = OpenThread(THREAD_QUERY_INFORMATION, FALSE, entry.th32ThreadID);
+            if (thread == nullptr) continue;
+            struct { LONG status; void* teb; void* process; void* thread; std::uintptr_t affinity; LONG priority; LONG basePriority; } basic{};
+            if (query(thread, 0, &basic, sizeof(basic), nullptr) == 0 && basic.teb != nullptr) {
+                const auto* tib = static_cast<const NT_TIB*>(basic.teb);
+                MEMORY_BASIC_INFORMATION stack{};
+                if (VirtualQuery(tib->StackLimit, &stack, sizeof(stack)) != 0 && stack.AllocationBase == info.AllocationBase) owner = "stack of thread " + std::to_string(entry.th32ThreadID);
+                if (reinterpret_cast<std::uintptr_t>(basic.teb) >= base && reinterpret_cast<std::uintptr_t>(basic.teb) < reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize) owner = "TEB of thread " + std::to_string(entry.th32ThreadID);
+            }
+            CloseHandle(thread);
+        }
+        CloseHandle(snapshot);
+    }
+    char text[320];
+    std::snprintf(text, sizeof(text), "region 0x%llx+0x%llx in allocation 0x%llx, %s %s, protect 0x%lx (allocated 0x%lx)%s%s",
+                  static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(info.BaseAddress)), static_cast<unsigned long long>(info.RegionSize), static_cast<unsigned long long>(base),
+                  info.State == MEM_COMMIT ? "committed" : info.State == MEM_RESERVE ? "reserved" : "free",
+                  info.Type == MEM_IMAGE ? "image" : info.Type == MEM_MAPPED ? "mapped" : "private", info.Protect, info.AllocationProtect,
+                  owner.empty() ? "" : ": ", owner.c_str());
+    return text;
+}
+
+// --host-regions: every host region inside the guest arena of this process, described.
+int PrintHostRegions() {
+    std::uintptr_t base = 0;
+    std::size_t size = 0;
+    GuestArena::GuestArenaRange_nid_postfix(&base, &size);
+    std::size_t regions = 0;
+    for (std::uintptr_t at = base; at < base + size;) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info)) == 0) break;
+        const auto next = reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize;
+        if (info.State != MEM_FREE && GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(at, std::min<std::uintptr_t>(next, base + size) - at)) {
+            std::printf("host region %s\n", DescribeHostRegion(at).c_str());
+            ++regions;
+        }
+        at = next;
+    }
+    std::printf("%zu host regions in the guest arena 0x%llx+0x%llx\n", regions, static_cast<unsigned long long>(base), static_cast<unsigned long long>(size));
+    return 0;
+}
+#endif
 
 void restore(const FrameCaptureReader& reader, const FrameMemoryChunk& chunk) {
     reader.Read(chunk, std::span(reinterpret_cast<std::byte*>(static_cast<std::uintptr_t>(chunk.address)), static_cast<std::size_t>(chunk.bytes)));
@@ -1137,9 +1224,7 @@ void compareCheckpoint(const FrameCaptureReader& reader, const std::filesystem::
     std::fprintf(stderr, "[frame-replay] checkpoint: %llu of %llu changed blocks differ from the title (%.1f MiB of bytes), listed in %s\n", static_cast<unsigned long long>(differing), static_cast<unsigned long long>(blocks), static_cast<double>(differingBytes) / (1024.0 * 1024.0), path.string().c_str());
 }
 
-int run(const Options& options) {
-    const auto loadStart = Clock::now();
-    const FrameCaptureReader reader(options.directory);
+int run(const Options& options, const FrameCaptureReader& reader, Clock::time_point loadStart) {
     if (reader.Truncated()) std::fprintf(stderr, "[frame-replay] the capture is truncated; replaying the complete records\n");
     auto skipped = restoreMemory(reader);
     const auto loaded = Clock::now();
@@ -1268,6 +1353,7 @@ int main(int argc, char** argv) {
         else if (argument == "--dump" && index + 1 < argc) options.dumps.push_back(parseDump(argv[++index]));
         else if (argument == "--frames" && index + 1 < argc) options.frames = argv[++index];
         else if (argument == "--wall-windows") options.frameWindows = false;
+        else if (argument == "--host-regions") options.hostRegions = true;
         else if (argument == "--dedupe-prologue") options.dedupePrologue = true;
         else if (argument == "--no-bindless-prime") options.bindlessPrime = false;
         else if (argument == "--bindless-in" && index + 1 < argc) options.bindlessIn = argv[++index];
@@ -1275,6 +1361,9 @@ int main(int argc, char** argv) {
         else if (!argument.starts_with("-") && options.directory.empty()) options.directory = argument;
         else return usage();
     }
+#ifdef _WIN32
+    if (options.hostRegions) return PrintHostRegions();
+#endif
     if (options.directory.empty()) return usage();
 #ifdef _WIN32
     _putenv_s("APS5_FRAME_CAPTURE", "");
@@ -1283,11 +1372,63 @@ int main(int argc, char** argv) {
     unsetenv("APS5_FRAME_CAPTURE");
     setenv("APS5_PIPELINE_CACHE_LOAD", "1", 0);
 #endif
-    startWatchdog(options.timeout);
-    AgcDriver::ProfileWindows::UseFrameWindows(options.frameWindows);
     int code = 2;
     try {
-        code = run(options);
+        const auto loadStart = Clock::now();
+        const FrameCaptureReader reader(options.directory);
+        // A captured range on one of this process's host regions cannot be mapped: start again (a new process gets a
+        // new random layout), at most 4 times. Before the watchdog, so a waiting parent is never killed by it.
+        auto collisions = HostCollisions(reader, [](std::uint64_t address, std::uint64_t bytes) { return GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(static_cast<std::uintptr_t>(address), static_cast<std::size_t>(bytes)); });
+        const char* attemptText = std::getenv("APS5_REPLAY_ATTEMPT");
+        const int attempt = attemptText != nullptr ? std::atoi(attemptText) : 1;
+        // APS5_REPLAY_TEST_COLLISIONS=<n> (tests): starts 1..n report the first captured range as a collision.
+        if (const char* test = std::getenv("APS5_REPLAY_TEST_COLLISIONS"); test != nullptr && collisions.empty() && attempt <= std::atoi(test)) {
+            for (const auto& chunk : reader.Chunks()) {
+                if (chunk.kind == FrameMemoryKind::Range && chunk.rangeKind != FrameRangeKind::Host) {
+                    collisions.emplace_back(chunk.address, chunk.address + chunk.bytes);
+                    break;
+                }
+            }
+        }
+        if (!collisions.empty()) {
+            for (const auto& [begin, end] : collisions) {
+                std::fprintf(stderr, "[frame-replay] start %d: the captured range 0x%llx+0x%llx lies on a host region of this process", attempt, static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin));
+#ifdef _WIN32
+                for (auto at = begin; at < end;) {
+                    MEMORY_BASIC_INFORMATION info{};
+                    if (VirtualQuery(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(at)), &info, sizeof(info)) == 0) break;
+                    const auto next = reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize;
+                    if (info.State != MEM_FREE && GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(static_cast<std::uintptr_t>(at), static_cast<std::size_t>(std::min<std::uint64_t>(next, end) - at))) std::fprintf(stderr, "; %s", DescribeHostRegion(at).c_str());
+                    at = next;
+                }
+#endif
+                std::fprintf(stderr, "\n");
+            }
+#ifdef _WIN32
+            if (attempt < 4) {
+                const auto next = std::to_string(attempt + 1);
+                _putenv_s("APS5_REPLAY_ATTEMPT", next.c_str());
+                std::fprintf(stderr, "[frame-replay] starting again (start %s of at most 4)\n", next.c_str());
+                std::fflush(stderr);
+                STARTUPINFOW startup{};
+                startup.cb = sizeof(startup);
+                PROCESS_INFORMATION process{};
+                std::wstring line = GetCommandLineW();
+                if (!CreateProcessW(nullptr, line.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &startup, &process)) throw std::runtime_error("frame replay: cannot start again after a host-region collision");
+                WaitForSingleObject(process.hThread, 0);
+                WaitForSingleObject(process.hProcess, INFINITE);
+                DWORD exitCode = 2;
+                GetExitCodeProcess(process.hProcess, &exitCode);
+                CloseHandle(process.hThread);
+                CloseHandle(process.hProcess);
+                hardExit(static_cast<int>(exitCode));
+            }
+#endif
+            throw std::runtime_error("frame replay: captured ranges lie on host regions of this process in every start");
+        }
+        startWatchdog(options.timeout);
+        AgcDriver::ProfileWindows::UseFrameWindows(options.frameWindows);
+        code = run(options, reader, loadStart);
         if (code == 0) {
             AgcDriverShutdown_nid_postfix();
             return 0;
