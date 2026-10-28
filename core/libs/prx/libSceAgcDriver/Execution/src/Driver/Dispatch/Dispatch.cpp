@@ -617,6 +617,11 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
         }
     }
     const std::uint64_t dispatchThreads = indirectArguments != 0 ? 0 : std::uint64_t{groups[0]} * groups[1] * groups[2] * compute.numThreads[0] * compute.numThreads[1] * compute.numThreads[2];
+    const std::uint64_t linearThreads = indirectArguments != 0 || (packet[4] & 0x20u) != 0 || partialLastGroup || groups[1] != 1 || groups[2] != 1 ? 0 : std::uint64_t{groups[0]} * compute.numThreads[0];
+    if (linearThreads != 0 && transferBuffer(submission.queue, compiled, userData, linearThreads, localDevice, address)) {
+        pendingDispatchPhases().outcome = compiled.transferKernel->kind == ShaderRecompiler::TransferKernel::Kind::Copy ? DispatchOutcome::CopyHle : DispatchOutcome::FillHle;
+        return;
+    }
     static const bool traceIo = std::getenv("APS5_TRACE_DISPATCH_IO") != nullptr;
     if (traceIo) {
 
