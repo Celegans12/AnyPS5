@@ -298,6 +298,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/IndirectDraw.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/EntryPoints.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/NewPath/NewPath.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/NewPath/DevicePageTable.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/NewPath/Router.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Lifecycle.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Memory/BufferCopy.cpp

@@ -3,11 +3,15 @@
 
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/Router.hpp"
 
+namespace AgcDriver {
+class VulkanDevice;
+}
+
 namespace AgcDriver::NewPath {
 
 [[nodiscard]] bool Enabled();
 
-Decision RouteCommand(CommandKind kind);
+Decision RouteCommand(CommandKind kind, const VulkanDevice* device = nullptr);
 
 void Close(const char* window);
 

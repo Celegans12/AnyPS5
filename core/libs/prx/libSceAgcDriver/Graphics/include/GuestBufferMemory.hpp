@@ -203,6 +203,15 @@ bool HostImportsUnchanged(const Context& context, const HostImportsProof& proof)
 // The table's identity when it is reconciled with the live registry (one lock), else empty.
 HostImportsProof HostImportsIdentity(const Context& context);
 
+struct HostImportSnapshot {
+    VkDevice device = VK_NULL_HANDLE;
+    std::uint64_t epoch = 0;
+    std::uint64_t inserts = 0;
+    std::vector<ShaderRecompiler::BdaAbi::Range> ranges;
+};
+std::uint64_t HostImportsVersion(VkDevice device);
+HostImportSnapshot HostImportRanges(const Context& context);
+
 // Identity of the read-only image mirror serving [address, address + bytes) (the counterpart of
 // HostImportSerial for main-image ranges, which no import serves): a serial unique for the life of
 // one mirror with its top bit set, 0 when no read-only mirror whose registered range still exists

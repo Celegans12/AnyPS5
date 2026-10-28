@@ -2,6 +2,9 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileWindows.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidencyConfig.hpp"
+#include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/DevicePageTable.hpp"
+#include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include <cstdio>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -32,7 +35,8 @@ bool Profile() {
 
 void print(State& state, const char* window) {
     const auto line = Router::Format(state.router.Take(), window);
-    AgcDriver::ProfilePrint_nid_no_patch("%s\n", line.c_str());
+    const auto table = DeviceTable().Totals();
+    AgcDriver::ProfilePrint_nid_no_patch("%s; page table builds %llu, patches %llu, ranges %llu, covered %.1f MiB\n", line.c_str(), static_cast<unsigned long long>(table.builds), static_cast<unsigned long long>(table.patches), static_cast<unsigned long long>(table.ranges), static_cast<double>(table.coveredBytes) / (1024.0 * 1024.0));
 }
 
 }
@@ -42,8 +46,9 @@ bool Enabled() {
     return enabled;
 }
 
-Decision RouteCommand(CommandKind kind) {
+Decision RouteCommand(CommandKind kind, const VulkanDevice* device) {
     auto& state = Get();
+    if (device != nullptr && DeviceTable().Stale(device->Device())) static_cast<void>(DeviceTable().Refresh(device->graphicsContext()));
     CommandFacts facts;
     facts.kind = kind;
     const auto decision = state.router.Decide(facts);

@@ -1,0 +1,61 @@
+#ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_SRC_DRIVER_NEWPATH_DEVICEPAGETABLE_HPP
+#define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_SRC_DRIVER_NEWPATH_DEVICEPAGETABLE_HPP
+
+#include "prx/libSceAgcDriver/Graphics/include/BdaPageTable.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <span>
+#include <vector>
+
+namespace AgcDriver::NewPath {
+
+class DevicePageTable {
+public:
+    using Range = ShaderRecompiler::BdaAbi::Range;
+    using ImportSource = std::function<Graphics::HostImportSnapshot(const Graphics::Context&)>;
+    using VersionSource = std::function<std::uint64_t(VkDevice)>;
+    using ResidentPieces = std::function<std::vector<Range>(std::uint64_t begin, std::uint64_t end)>;
+
+    struct Counts {
+        std::uint64_t builds = 0;
+        std::uint64_t patches = 0;
+        std::uint64_t unchanged = 0;
+        std::uint64_t ranges = 0;
+        std::uint64_t coveredBytes = 0;
+        std::uint64_t importVersion = 0;
+    };
+
+    DevicePageTable(ImportSource imports, VersionSource version);
+
+    std::shared_ptr<const Graphics::BdaPageTable> Refresh(const Graphics::Context& context);
+    [[nodiscard]] bool Stale(VkDevice device) const;
+    std::shared_ptr<const Graphics::BdaPageTable> PatchPages(const Graphics::Context& context, std::span<const std::uint64_t> pages);
+    void SetResidentPieces(ResidentPieces pieces);
+
+    [[nodiscard]] std::shared_ptr<const Graphics::BdaPageTable> Current() const;
+    [[nodiscard]] Counts Totals() const;
+
+    [[nodiscard]] static std::vector<Range> Overlay(std::span<const Range> base, std::span<const Range> resident, std::uint64_t begin, std::uint64_t end);
+
+private:
+    [[nodiscard]] std::vector<Range> piecesLocked(std::uint64_t begin, std::uint64_t end) const;
+
+    ImportSource imports;
+    VersionSource version;
+    mutable std::mutex mutex;
+    ResidentPieces resident;
+    std::vector<Range> importRanges;
+    std::uint64_t builtVersion = 0;
+    bool built = false;
+    std::shared_ptr<const Graphics::BdaPageTable> table;
+    Counts counts;
+};
+
+DevicePageTable& DeviceTable();
+
+}
+
+#endif
