@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/shaders/IndexClamp_spv.h"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileWindows.hpp"
@@ -1474,6 +1475,74 @@ const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address
     return import;
 }
 
+// C63: the zero-fetch index clamp on the GPU (Graphics/shaders/IndexClamp.comp): a compute pass in the open batch
+// reads the indices where they lie (the in-place import, behind the GPU work that wrote them) and writes the clamped
+// copy, instead of waiting for those writes on the CPU and reading and clamping the buffer there (Yotei's title menu:
+// a 32 MiB index buffer the GPU rewrites every frame, ~5 ms a frame). Buffer addresses in push constants, no
+// descriptors. One pipeline per device, made on first use.
+class GpuIndexClamp {
+public:
+    static GpuIndexClamp* For(const Context& context) {
+        static std::mutex mutex;
+        static std::unordered_map<VkDevice, std::unique_ptr<GpuIndexClamp>> clamps;
+        std::lock_guard lock(mutex);
+        auto& clamp = clamps[context.device];
+        if (clamp == nullptr) {
+            try {
+                clamp.reset(new GpuIndexClamp(context));
+            } catch (const std::exception& error) {
+                std::fprintf(stderr, "[gpu] index clamp pipeline unavailable, clamping on the CPU: %s\n", error.what());
+                clamps.erase(context.device);
+                return nullptr;
+            }
+        }
+        return clamp.get();
+    }
+
+    void Record(const Context& context, VkCommandBuffer commands, VkDeviceAddress source, VkDeviceAddress target, std::uint32_t words, std::uint32_t limit, std::uint32_t mode) const {
+        const VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT};
+        context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &before, 0, nullptr, 0, nullptr);
+        context.Function<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+        struct Push {
+            VkDeviceAddress source;
+            VkDeviceAddress target;
+            std::uint32_t words;
+            std::uint32_t limit;
+            std::uint32_t mode;
+        } push{source, target, words, limit, mode};
+        context.Function<PFN_vkCmdPushConstants>("vkCmdPushConstants")(commands, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+        context.Function<PFN_vkCmdDispatch>("vkCmdDispatch")(commands, (words + 255u) / 256u, 1, 1);
+        const VkMemoryBarrier after{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_SHADER_READ_BIT};
+        context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &after, 0, nullptr, 0, nullptr);
+    }
+
+private:
+    explicit GpuIndexClamp(const Context& context) {
+        const VkPushConstantRange range{VK_SHADER_STAGE_COMPUTE_BIT, 0, 28};
+        VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        layoutInfo.pushConstantRangeCount = 1;
+        layoutInfo.pPushConstantRanges = &range;
+        Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &layoutInfo, nullptr, &layout), "vkCreatePipelineLayout index clamp");
+        const auto module = CreateShaderModule(context, INDEX_CLAMP_SPV, sizeof(INDEX_CLAMP_SPV), "vkCreateShaderModule index clamp");
+        VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        pipelineInfo.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        pipelineInfo.stage.module = module;
+        pipelineInfo.stage.pName = "main";
+        pipelineInfo.layout = layout;
+        VkResult result = VK_SUCCESS;
+        {
+            auto pipelineCacheLock = context.LockPipelineCacheForUse();
+            result = context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &pipeline);
+        }
+        context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
+        Check(result, "vkCreateComputePipelines index clamp");
+    }
+
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+};
+
 InPlaceIndices InPlaceIndexRange(Recorder& recorder, std::uint64_t address, std::size_t bytes, std::uint32_t indexSize, bool skipRestart) {
     const std::span<const std::byte> range(reinterpret_cast<const std::byte*>(address), bytes);
     InPlaceIndices indices;
@@ -1867,6 +1936,26 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
                             highest = memo.highest;
                         }
                         break;
+                    }
+                }
+                // C63: clamp on the GPU when the indices can be read in place (4-byte aligned whole words, one dispatch
+                // dimension). `highest` is then `limit`: this path runs only when the indices go past it. The copy is not
+                // memoized (the GPU writes the buffer again each frame). APS5_NO_GPU_INDEX_CLAMP=1 (runtime switch) clamps
+                // on the CPU.
+                const auto words = indexBytes / 4u;
+                if (reused == nullptr && !RuntimeSwitches::Set(RuntimeSwitch::NoGpuIndexClamp) && context.recorder != nullptr && indexBytes % 4u == 0 && words != 0 && (words + 255u) / 256u <= 65535u) {
+                    bool behind = false;
+                    const auto* source = InPlaceDrawInput(context, draw.indexAddress, static_cast<std::size_t>(indexBytes), 4, &behind);
+                    const auto sourceAddress = source != nullptr ? source->address + HostImportOffset(*source, draw.indexAddress) : 0;
+                    auto* clamp = source != nullptr && source->address != 0 && sourceAddress % 4u == 0 ? GpuIndexClamp::For(context) : nullptr;
+                    if (clamp != nullptr) {
+                        auto clamped = std::make_shared<Buffer>(context, static_cast<std::size_t>(indexBytes), VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                        const std::uint32_t mode = (draw.indexSize == 2 ? 1u : 0u) | (skipRestart ? 2u : 0u);
+                        clamp->Record(context, context.recorder->Commands(), sourceAddress, clamped->DeviceAddress(), static_cast<std::uint32_t>(words), limit, mode);
+                        reused = std::move(clamped);
+                        highest = limit;
+                        static std::atomic<std::uint64_t> gpuClamps{0};
+                        gpuClamps.fetch_add(1, std::memory_order_relaxed);
                     }
                 }
                 if (reused == nullptr) {

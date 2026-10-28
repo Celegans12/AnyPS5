@@ -81,6 +81,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_NO_DMA_COPY_BEHIND_WRITES",
     "APS5_NO_SLICE_EDGE_HASH",
     "APS5_NO_CLEAR_SNAPSHOT_REUSE",
+    "APS5_NO_GPU_INDEX_CLAMP",
 };
 
 struct Refusal {
