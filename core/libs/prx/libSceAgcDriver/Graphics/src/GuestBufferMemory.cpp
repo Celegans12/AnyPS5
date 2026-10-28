@@ -5592,6 +5592,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             // an address-based shader maps are exempt (they hold every pending image, and such shaders
             // do not read texture memory through pointers); APS5_BDA_FLUSH=1 flushes for them too.
             static const bool bdaFlush = std::getenv("APS5_BDA_FLUSH") != nullptr;
+            GuestMemory::PublishGpuOwned(region.begin, static_cast<std::size_t>(bytes));
             if (!(addressable && region.hostBacked) || bdaFlush) {
                 StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(bytes), nullptr, "imported buffer region");
             } else {
@@ -5609,6 +5610,17 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             // (OpenBatch, not Commands: an open dispatch run of the ring stays open, see Recorder::RunCommands.)
             recorder->OpenBatch();
             StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(bytes), nullptr, "copied buffer region");
+            if (region.deviceLocal && !region.overlay && ResidencyActive()) {
+                if (auto slot = BindStagedSlot(region.begin, bytes, region.writable)) {
+                    region.residencySlot = std::move(slot);
+                    region.direct = region.residencySlot.get();
+                    region.buffer.reset();
+                    region.snapshot.clear();
+                    region.deviceLocal = false;
+                    anyResidencySlot = true;
+                    continue;
+                }
+            }
             region.gpuCopy = true;
             gpuCopies.push_back(&region);
             continue;
@@ -6301,7 +6313,7 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
         std::vector<std::pair<std::uint64_t, std::uint64_t>> overlays;
         for (const auto& region : regions) {
             if (region.end <= region.begin) continue;
-            if (region.writable) writes.emplace_back(region.begin, region.end - region.begin);
+            if (region.writable && region.residencySlot == nullptr) writes.emplace_back(region.begin, region.end - region.begin);
             if (region.gpuCopy && region.deviceLocal) reads.emplace_back(region.begin, region.end - region.begin);
             if (region.gpuCopy && region.deviceLocal && region.overlay) overlays.emplace_back(region.begin, region.end - region.begin);
         }
@@ -7131,6 +7143,11 @@ void GuestBufferMemory::WriteBack() {
     space.reset();
     heapReferences.clear();
     heapReadbacks.clear();
+}
+
+bool GuestBufferMemory::ResidencyBound(std::uint64_t begin, std::uint64_t end) const {
+    if (!anyResidencySlot) return false;
+    return std::any_of(regions.begin(), regions.end(), [&](const Region& region) { return region.residencySlot != nullptr && region.begin < end && begin < region.end; });
 }
 
 std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> GuestBufferMemory::DirectRegions() const {

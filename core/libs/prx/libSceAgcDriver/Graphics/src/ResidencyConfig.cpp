@@ -39,6 +39,7 @@ ResidencyConfig ResidencyConfigFrom(ResidencyEnvironment environment) {
         config.budgetForced = true;
         config.residentBytes = residentMiB(budget) * MiB;
     }
+    config.slotBinding = config.residency && environment("APS5_NEW_PATH_SLOT_BINDING") != nullptr;
     const char* chunk = environment("APS5_NEW_PATH_RESIDENT_CHUNK_PAGES");
     if (config.residency && chunk != nullptr && *chunk != '\0') config.chunkPages = chunkPages(chunk);
     return config;

@@ -455,6 +455,7 @@ public:
     // through a device-local staging copy of the import (nothing was copied through the CPU, so the
     // upload can serve a later identical build), else nothing.
     std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> DirectRegions() const;
+    bool ResidencyBound(std::uint64_t begin, std::uint64_t end) const;
     struct CutRegion {
         std::uint64_t begin;
         std::uint64_t end;
@@ -517,6 +518,7 @@ private:
         bool hostBacked = false;
         // Set when the region is served by an imported allocation; nothing is copied or written back.
         const HostImport* direct = nullptr;
+        std::shared_ptr<HostImport> residencySlot {};
         // Set when the region covers uncommitted pages: only the `backed` parts (possibly none) are guest
         // memory; the rest reads as zeros and is never stored.
         bool sparse = false;
@@ -655,6 +657,7 @@ private:
     std::uint64_t importsEpoch = 0;
     std::uint64_t importFloor = 0;
     std::vector<Region> regions;
+    bool anyResidencySlot = false;
     // Whether `regions` is in ascending address order (true right after AcquireRegistered, whose
     // regions follow the registry's order), so AddSnapshot can search instead of scanning.
     bool regionsSorted = false;

@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidencyDriver.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidencyGuest.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ResidencySession.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "VulkanTestDevice.hpp"
@@ -363,10 +364,70 @@ void OwnerIsNeverServed(const Harness& harness, std::uint32_t index) {
 
 }
 
+int SessionReentry() {
+    try {
+        auto device = OpenVulkanTestDevice();
+        if (!device) return VulkanTestSkipped;
+        const auto context = device->graphicsContext();
+        auto* recorder = Recorder::Active();
+        if (recorder == nullptr) throw std::runtime_error("no active recorder");
+        GuestPages guest;
+        {
+            const std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            Expect(HostImportFor(context, guest.Address(0), Bytes) != nullptr, "the guest pages cannot be imported");
+        }
+        EnsureResidency(context);
+        Expect(ResidencyActive(), "reentry: the residency session did not start");
+        bool innerRan = false;
+        {
+            const std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            const std::array<const void*, 1> owners{&guest};
+            recorder->OpenBatch();
+            recorder->DeferDispatchBarrier(0x77, owners);
+            Expect(recorder->RunOpen(), "reentry: no deferred dispatch run is open");
+            const std::uint64_t inner = guest.Address(1);
+            recorder->AfterRun([&innerRan, inner](Recorder&) {
+                const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> reads{{{inner, 4096}}};
+                NoteStagedRegions(reads, {});
+                innerRan = true;
+            });
+            const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> reads{{{guest.Address(0), 4096}}};
+            NoteStagedRegions(reads, {});
+            Expect(innerRan, "reentry: the copy-in did not flush the deferred run, so its copy-backs never re-entered the session");
+            Expect(!recorder->RunOpen(), "reentry: the deferred run is still open after the copy-in");
+            device->SubmitRecorded(false);
+            device->WaitIdle();
+        }
+        const auto line = ResidencyReportLine();
+        Expect(line.find("re-entered copy-back notes 1;") != std::string::npos, "reentry: the nested note was not queued: " + line);
+        {
+            const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> reads{{{guest.Address(2), 4096}}};
+            const std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            NoteStagedRegions(reads, {});
+            device->SubmitRecorded(false);
+            device->WaitIdle();
+        }
+        const auto drained = ResidencyReportLine();
+        Expect(drained.find("admitted 3,") != std::string::npos, "reentry: the queued note was not drained by the next top-level call: " + drained);
+        ReleaseResidency(context.device);
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "FAIL: exception: %s\n", error.what());
+        return 1;
+    }
+    if (failures != 0) return 1;
+    std::printf("residency session re-entry test passed\n");
+    return 0;
+}
+
 int main(int argc, char** argv) {
     const bool asyncLane = argc > 1 && std::string(argv[1]) == "--async-lane";
     const bool sitesOnly = argc > 1 && std::string(argv[1]) == "--driver-sites";
+    const bool reentry = argc > 1 && std::string(argv[1]) == "--session-reentry";
 #ifdef _WIN32
+    if (reentry) {
+        _putenv_s("APS5_NEW_PATH", "1");
+        return SessionReentry();
+    }
     if (asyncLane) _putenv_s("APS5_ASYNC_LANE", "51");
 #else
     std::puts("skipped: residency faults use the Windows guest arena guards");

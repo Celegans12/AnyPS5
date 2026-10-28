@@ -20,6 +20,14 @@ namespace {
 constexpr std::uint64_t DefaultResidentBytes = std::uint64_t{1024} << 20u;
 
 std::atomic<ResidencyDriver*> activeDriver{nullptr};
+thread_local int recordingDepth = 0;
+
+struct RecordingScope {
+    RecordingScope() { ++recordingDepth; }
+    ~RecordingScope() { --recordingDepth; }
+    RecordingScope(const RecordingScope&) = delete;
+    RecordingScope& operator=(const RecordingScope&) = delete;
+};
 
 }
 
@@ -196,6 +204,7 @@ bool ResidencyDriver::Reached(const ResidencyToken& token) {
 }
 
 void ResidencyDriver::Wait(const ResidencyToken& token) {
+    const RecordingScope recording;
     tokens.Finish(token);
 }
 
@@ -290,8 +299,13 @@ void ResidencyDriver::stampWrittenBack(std::uint64_t address, std::size_t bytes,
     }
 }
 
+bool ResidencyDriver::Recording() {
+    return recordingDepth != 0;
+}
+
 ResidencyToken ResidencyDriver::record(std::span<const ResidencyCopy> copies, bool intoMirror) {
     if (copies.empty()) return tokens.Caller();
+    const RecordingScope recording;
     std::unique_lock lock(GuestMemory::GpuMutex(), std::defer_lock);
     if (!GuestMemory::GpuMutex().HeldByThisThread()) lock.lock();
     const ResidencyImportLocator locate = [&](std::uint64_t page) {

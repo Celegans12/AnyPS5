@@ -70,6 +70,7 @@ public:
     ~ResidencyDriver() override;
 
     static ResidencyDriver* Active();
+    static bool Recording();
     static std::unique_ptr<ResidencyDriver> CreateIfEnabled(const Context& context, Recorder& recorder, IResidencyGuestMemory& guest);
 
     ResidencyManager& Manager() { return manager; }
