@@ -300,6 +300,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/NewPath/NewPath.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/NewPath/CommandWrites.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/NewPath/CommandAccess.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/NewPath/CommandRecord.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/NewPath/PushBlock.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/NewPath/ResolvedPush.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/NewPath/PipelineAhead.cpp
@@ -604,7 +605,7 @@ if(BUILD_TESTING)
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 
-    add_test_executable(agc_newpath_emit_tests tests/NewPathEmit.cpp Execution/src/Driver/NewPath/Router.cpp Execution/src/Driver/NewPath/CommandWrites.cpp Execution/src/Driver/NewPath/PushBlock.cpp Execution/src/Driver/NewPath/ResolvedPush.cpp)
+    add_test_executable(agc_newpath_emit_tests tests/NewPathEmit.cpp Execution/src/Driver/NewPath/Router.cpp Execution/src/Driver/NewPath/CommandWrites.cpp Execution/src/Driver/NewPath/PushBlock.cpp Execution/src/Driver/NewPath/ResolvedPush.cpp Execution/src/Driver/NewPath/CommandRecord.cpp)
     target_include_directories(agc_newpath_emit_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/core/shader/recompiler)
     target_link_libraries(agc_newpath_emit_tests PRIVATE libc)
     configure_windows_unwind(agc_newpath_emit_tests)
@@ -623,6 +624,18 @@ if(BUILD_TESTING)
     set_tests_properties(agc_newpath_pipeline_gate PROPERTIES TIMEOUT 30)
     if(WIN32)
         set_tests_properties(agc_newpath_pipeline_gate PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+
+    add_test_executable(agc_pending_write_ranges_tests tests/PendingWriteRanges.cpp)
+    target_include_directories(agc_pending_write_ranges_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_pending_write_ranges_tests PRIVATE libc)
+    set_target_properties(agc_pending_write_ranges_tests PROPERTIES CXX_EXTENSIONS OFF)
+    configure_windows_unwind(agc_pending_write_ranges_tests)
+    add_test(NAME agc_pending_write_ranges COMMAND agc_pending_write_ranges_tests)
+    set_tests_properties(agc_pending_write_ranges PROPERTIES TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_pending_write_ranges PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 

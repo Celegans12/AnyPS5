@@ -5724,6 +5724,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     if (overlapCapable) resources.RunAccesses(runAccesses);
     if (overlapCapable && record.shader->program->bindlessHeap) runAccesses.push_back({0, std::numeric_limits<std::uint64_t>::max(), Graphics::Recorder::RunAccessImage | Graphics::Recorder::RunAccessWritten});
     auto commands = overlapCapable && unordered ? recorder.OverlapCommands(overlapQueue, runOwners, &covered, overlapped, runAccesses) : recorder.Commands(&covered);
+    const Graphics::Recorder::CommandInHand commandInHand;
     if (timer.profile && overlapped) recorder.CheckRunConflicts(record.programAddress, runAccesses);
     if (timer.profile && overlapCapable && unordered && !overlapped) ++d.unorderedLost;
     // Batched staging (Recorder::SplitForRun): a run's first dispatch that copies buffers itself
@@ -5880,8 +5881,17 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         auto& table = NewPath::DeviceTable();
         if (table.Stale(context.device)) static_cast<void>(table.Refresh(context));
         static_cast<void>(NewPath::UploadTableForLane(context, recorder, table.Current(), static_cast<std::uint32_t>(Graphics::Recorder::ThreadLane())));
-        const auto resolvedPush = NewPath::ComposeResolvedPush(*record.pushBytes, Graphics::ComputePushConstantBytes, table.RootAddress(), table.FaultRecordAddress(context));
+        auto commandRecord = table.TakeRecord(context);
+        const auto resolvedPush = NewPath::ComposeResolvedPush(*record.pushBytes, Graphics::ComputePushConstantBytes, table.RootAddress(), static_cast<std::uint64_t>(commandRecord->DeviceAddress()));
         Graphics::Require(resolvedPush.has_value(), "a new-path resolved dispatch has no page table or fault record for its push block");
+        recorder.Keep(commandRecord);
+        recorder.OnComplete([commandRecord, leased = table.Lists().writable, device = context.device, programAddress = record.programAddress] {
+            auto bytes = commandRecord->Bytes();
+            const auto outcome = NewPath::CompleteCommandRecord(std::span<std::uint32_t, NewPath::CommandRecordWords>(reinterpret_cast<std::uint32_t*>(bytes.data()), NewPath::CommandRecordWords), leased != nullptr ? std::span<const NewPath::AddressRange>(*leased) : std::span<const NewPath::AddressRange>{}, [](std::uint64_t address, std::size_t size) { static_cast<void>(GuestMemory::MarkPossiblyWritten(address, size)); });
+            NewPath::DeviceTable().ReturnRecord(commandRecord, device);
+            Graphics::Require(!outcome.faulted, outcome.message + " in shader at " + std::to_string(programAddress));
+            Graphics::Require(!outcome.invalid, "a new-path command's written-page record is invalid");
+        });
         context.Resolved(&Graphics::DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, record.objects->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, NewPath::PushRangeBytes(true), resolvedPush->data());
     } else if (record.pushStages != 0) {
         context.Resolved(&Graphics::DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, record.objects->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::ComputePushConstantBytes, record.pushBytes->data());
