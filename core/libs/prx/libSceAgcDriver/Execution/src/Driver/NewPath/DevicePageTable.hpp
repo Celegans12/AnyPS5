@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_SRC_DRIVER_NEWPATH_DEVICEPAGETABLE_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_SRC_DRIVER_NEWPATH_DEVICEPAGETABLE_HPP
 
+#include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/CommandAccess.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaPageTable.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include <cstdint>
@@ -42,6 +43,7 @@ public:
     [[nodiscard]] Counts Totals() const;
     [[nodiscard]] std::vector<Range> Ranges() const;
     [[nodiscard]] std::uint64_t RootAddress() const;
+    [[nodiscard]] TableLists Lists() const;
 
     [[nodiscard]] static std::vector<Range> Overlay(std::span<const Range> base, std::span<const Range> resident, std::uint64_t begin, std::uint64_t end);
 
@@ -54,6 +56,7 @@ private:
     ResidentPieces resident;
     std::vector<Range> importRanges;
     std::vector<Range> tableRanges;
+    TableLists tableLists;
     std::uint64_t builtVersion = 0;
     bool built = false;
     std::shared_ptr<const Graphics::BdaPageTable> table;
