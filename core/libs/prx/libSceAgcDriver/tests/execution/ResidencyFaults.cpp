@@ -271,6 +271,26 @@ void WriteBackStampsCaches(const Harness& harness, std::uint32_t index) {
     Expect(AgcDriver::GuestMemory::NewestStamp(address, ResidencyPageBytes) > clean, "stamps: a written-back page kept its stamp, so a snapshot cached over the old bytes would still hit");
 }
 
+void ProofIsNotProvenOverGpuOwned(const Harness& harness, std::uint32_t index) {
+    const auto address = harness.guest.Address(index);
+    std::vector<AgcDriver::ContentHash::Hash128> hashes(AgcDriver::GuestMemory::HashBlockCount(address, ResidencyPageBytes));
+    {
+        const std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        AgcDriver::GuestMemory::HashCommittedBlocks(address, ResidencyPageBytes, hashes);
+        Expect(AgcDriver::GuestMemory::CommittedBlocksMatch(address, ResidencyPageBytes, hashes), "proof: unchanged blocks did not match their own hashes");
+    }
+    if (!Admitted(harness, index, 0x56565656u, "proof")) return;
+    const auto publishes = harness.driver.DriverPublishes();
+    const auto refused = harness.driver.RefusedFaults();
+    Expect(!AgcDriver::GuestMemory::CommittedBlocksMatch(address, ResidencyPageBytes, hashes), "proof: a GPU-owned range was proven unchanged from the guest's stale bytes");
+    Expect(harness.driver.DriverPublishes() == publishes && harness.driver.RefusedFaults() == refused, "proof: answering not proven read or published the GPU-owned range");
+    Expect(AgcDriver::GuestMemory::GpuOwned(address, 16), "proof: answering not proven published the range");
+    {
+        const std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        AgcDriver::GuestMemory::PublishGpuOwned(address, ResidencyPageBytes);
+    }
+}
+
 void DriverSites(const Harness& harness, std::uint32_t first) {
     {
         const char* site = "GuestMemory::ReadCommitted under the GPU mutex";
@@ -382,6 +402,7 @@ int main(int argc, char** argv) {
             }
             DriverSites(harness, 6);
             WriteBackStampsCaches(harness, 10);
+            ProofIsNotProvenOverGpuOwned(harness, 11);
             const std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
             device->SubmitRecorded(false);
             device->WaitIdle();
