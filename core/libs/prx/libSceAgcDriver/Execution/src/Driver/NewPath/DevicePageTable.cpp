@@ -111,12 +111,13 @@ std::shared_ptr<const Graphics::BdaPageTable> DevicePageTable::PatchPages(const 
 
 void DevicePageTable::Release(VkDevice device) {
     std::shared_ptr<const Graphics::BdaPageTable> dropped;
-    std::shared_ptr<Graphics::Buffer> droppedFault;
+    std::vector<std::shared_ptr<Graphics::Buffer>> droppedRecords;
     {
         std::lock_guard lock(mutex);
-        if (faultDevice == device) {
-            droppedFault = std::move(faultRecord);
-            faultDevice = VK_NULL_HANDLE;
+        if (recordDevice == device) {
+            droppedRecords = std::move(records);
+            records.clear();
+            recordDevice = VK_NULL_HANDLE;
         }
         if (tableDevice != device || table == nullptr) return;
         dropped = std::move(table);
@@ -140,13 +141,35 @@ std::shared_ptr<const Graphics::BdaPageTable> DevicePageTable::Current() const {
     return table;
 }
 
-std::uint64_t DevicePageTable::FaultRecordAddress(const Graphics::Context& context) {
-    std::lock_guard lock(mutex);
-    if (faultRecord == nullptr || faultDevice != context.device) {
-        faultRecord = std::make_shared<Graphics::Buffer>(context, ShaderRecompiler::BdaAbi::FaultBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
-        faultDevice = context.device;
+std::shared_ptr<Graphics::Buffer> DevicePageTable::TakeRecord(const Graphics::Context& context) {
+    {
+        std::lock_guard lock(mutex);
+        if (recordDevice != context.device) {
+            records.clear();
+            recordDevice = context.device;
+        }
+        if (!records.empty()) {
+            auto record = std::move(records.back());
+            records.pop_back();
+            return record;
+        }
+        ++counts.records;
     }
-    return static_cast<std::uint64_t>(faultRecord->DeviceAddress());
+    auto record = std::make_shared<Graphics::Buffer>(context, ShaderRecompiler::BdaAbi::FaultBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+    auto bytes = record->Bytes();
+    ClearCommandRecord(std::span<std::uint32_t, CommandRecordWords>(reinterpret_cast<std::uint32_t*>(bytes.data()), CommandRecordWords));
+    return record;
+}
+
+void DevicePageTable::ReturnRecord(std::shared_ptr<Graphics::Buffer> record, VkDevice device) {
+    std::lock_guard lock(mutex);
+    if (record == nullptr || device != recordDevice) return;
+    records.push_back(std::move(record));
+}
+
+std::size_t DevicePageTable::PooledRecords() const {
+    std::lock_guard lock(mutex);
+    return records.size();
 }
 
 TableLists DevicePageTable::Lists() const {
