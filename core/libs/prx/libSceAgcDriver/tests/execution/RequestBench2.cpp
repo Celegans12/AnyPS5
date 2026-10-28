@@ -19,6 +19,7 @@
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
+#include "prx/libSceAgcDriver/tools/RecordedRequests.hpp"
 #include "Recompiler.hpp"
 #include "VulkanTestDevice.hpp"
 #ifdef _WIN32
@@ -207,7 +208,7 @@ int main(int argc, char** argv) {
             TerminateProcess(GetCurrentProcess(), 3);
             std::_Exit(3);
         }).detach();
-        auto request = ShaderRecompiler::RequestSerializer{}.Deserialize(ReadText(argv[1]));
+        auto request = AgcDriver::RecordedRequests::Deserialize(ReadText(argv[1]));
         if (request.request.shader.stage != ShaderRecompiler::ShaderStage::Compute || !request.request.context.compute.has_value()) {
             std::fprintf(stderr, "request bench: not a compute request\n");
             return 2;
