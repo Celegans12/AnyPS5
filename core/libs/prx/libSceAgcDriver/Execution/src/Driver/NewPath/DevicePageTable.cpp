@@ -132,6 +132,11 @@ std::shared_ptr<const Graphics::BdaPageTable> DevicePageTable::Current() const {
     return table;
 }
 
+std::uint64_t DevicePageTable::RootAddress() const {
+    std::lock_guard lock(mutex);
+    return table != nullptr ? static_cast<std::uint64_t>(table->Address()) : 0u;
+}
+
 std::vector<Range> DevicePageTable::Ranges() const {
     std::lock_guard lock(mutex);
     return tableRanges;
