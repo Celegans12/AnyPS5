@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <string_view>
 #include <spirv/unified1/spirv.hpp>
 #include <cstdint>
 #include <stdexcept>
@@ -281,6 +282,35 @@ decltype(auto) DispatchArgument(SpirvValueEmitContext& ctx, const IrValue& inst,
     }
 }
 
+// Spanned waves (S4 epoch 1, H2-5): one console wave64 runs as two host subgroups, so the two halves' per-lane
+// memory atomics race each other, which a console wave never does (S0 (b): the residue with APS5_SPANNED_WAVE set).
+// A memory atomic whose result is used (or a float add, whose sum depends on order) runs half by half: the lower 32
+// lanes, a workgroup barrier with device-scope release/acquire, then the upper 32. That is the order the two-lanes-
+// per-invocation mode already has (half 0 before half 1), and it needs no subgroup operation. The barrier sits at the
+// guest instruction, where the spanned ballot and shuffle already place theirs (uniform per wave; a spanned wave is
+// its whole workgroup). Data append/consume/ordered count are excluded: they already take one atomic per wave.
+bool SpannedHalfOrdered(const SpirvEmitterState& state, const IrValue& inst) {
+    if (!state.spannedWave) return false;
+    const auto name = IrOpcodeName(inst.Opcode());
+    const bool memoryAtomic = name.starts_with("BufferAtomic") || name.starts_with("AddressAtomic") || name.starts_with("SharedAtomic") || name.starts_with("ImageAtomic");
+    return memoryAtomic && (inst.HasUses() || name.find("FAdd") != std::string_view::npos);
+}
+
+template<typename TCall>
+std::uint32_t EmitSpannedHalfOrdered(SpirvValueEmitContext& ctx, const IrValue& inst, TCall&& call) {
+    auto& state = ctx.state;
+    const auto type = TypeId(state, inst.Type());
+    const auto lane = Binary(state, spv::OpBitwiseAnd, TypeU32(state), EmitLocalInvocationIndex(state), ConstantU32(state, 63u));
+    const auto upper = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), lane, ConstantU32(state, 32u));
+    const auto lower = Unary(state, spv::OpLogicalNot, TypeBool(state), upper);
+    const auto undefined = state.module.AllocateId();
+    state.module.AddFunction(spv::OpUndef, type, undefined);
+    const auto first = EmitValueOrDefaultIfCondition(state, lower, type, undefined, call);
+    const auto semantics = spv::MemorySemanticsAcquireReleaseMask | spv::MemorySemanticsUniformMemoryMask | spv::MemorySemanticsWorkgroupMemoryMask | spv::MemorySemanticsImageMemoryMask;
+    state.module.AddFunction(spv::OpControlBarrier, ConstantU32(state, spv::ScopeWorkgroup), ConstantU32(state, spv::ScopeDevice), ConstantU32(state, semantics));
+    return EmitValueOrDefaultIfCondition(state, upper, type, first, call);
+}
+
 template<typename TContext, typename TReturn, typename... TArguments>
 void Invoke(TReturn (*emit)(TContext&, TArguments...), SpirvValueEmitContext& ctx, const IrValue& inst) {
     static_assert(std::is_same_v<TContext, SpirvValueEmitContext> || std::is_same_v<TContext, SpirvEmitterState>);
@@ -301,7 +331,7 @@ void Invoke(TReturn (*emit)(TContext&, TArguments...), SpirvValueEmitContext& ct
             call();
         } else {
             static_assert(std::is_same_v<TReturn, std::uint32_t>);
-            ctx.Define(inst, call());
+            ctx.Define(inst, SpannedHalfOrdered(ctx.state, inst) ? EmitSpannedHalfOrdered(ctx, inst, call) : call());
         }
     }(std::index_sequence_for<TArguments...>{});
 }
