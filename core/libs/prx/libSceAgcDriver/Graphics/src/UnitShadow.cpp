@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/SlimMutex.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -93,6 +94,32 @@ struct UnitShadow {
     // The unit's bytes inside the import.
     std::pair<std::uint64_t, std::uint64_t> UnitRange(std::uint64_t unit) const { return {std::max(UnitBegin(unit), importBase), std::min(UnitBegin(unit + 1), ImportEnd())}; }
     bool Live(std::uint64_t unit) const { return generation[unit] != 0 && published[unit] == 0; }
+    // Unit state changes go through these, which keep liveUnits current: Recount walked every unit of the import
+    // (~10k for the title's 646 MB region) after each change, 4.3 % of the menu committer (best422).
+    void SetGeneration(std::uint64_t unit, std::uint64_t value) {
+        const bool before = Live(unit);
+        generation[unit] = value;
+        liveUnits = liveUnits - (before ? 1u : 0u) + (Live(unit) ? 1u : 0u);
+    }
+    void SetPublished(std::uint64_t unit, std::uint8_t value) {
+        const bool before = Live(unit);
+        published[unit] = value;
+        liveUnits = liveUnits - (before ? 1u : 0u) + (Live(unit) ? 1u : 0u);
+    }
+    // After a batch of changes: the incremental count stands, unless APS5_NO_INCREMENTAL_SHADOW_COUNT asks for the full
+    // walk as before.
+    void Settle() {
+        static const bool verify = std::getenv("APS5_VERIFY_SHADOW_COUNT") != nullptr;
+        if (verify) {
+            const auto incremental = liveUnits;
+            Recount();
+            static std::atomic<std::uint64_t> checked{0}, differing{0};
+            if (incremental != liveUnits) differing.fetch_add(1, std::memory_order_relaxed);
+            if (checked.fetch_add(1, std::memory_order_relaxed) % 20000 == 19999) std::fprintf(stderr, "[shadow] verify count: %llu settles checked, %llu differing\n", static_cast<unsigned long long>(checked.load()), static_cast<unsigned long long>(differing.load()));
+            return;
+        }
+        if (RuntimeSwitches::Set(RuntimeSwitch::NoIncrementalShadowCount)) Recount();
+    }
     void Recount() {
         std::uint32_t live = 0;
         for (std::uint64_t unit = 0; unit < Units(); ++unit) live += Live(unit) ? 1u : 0u;
@@ -332,14 +359,14 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
             if (!selected[k] || !shadow->Live(unit)) continue;
             if (changed[k] == GuestMemory::BlockWritten) {
                 // Newer bytes reached the import since the retile: the slab's are dead.
-                shadow->generation[unit] = 0;
+                shadow->SetGeneration(unit, 0);
                 (cpu[k] != 0 ? Stats().staleDroppedCpu : Stats().staleDroppedDriver).fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
             const auto slabIndex = static_cast<std::size_t>(unit / SlabUnits());
             const auto& slab = shadow->slabs[slabIndex];
             if (slab == nullptr) {
-                shadow->generation[unit] = 0;
+                shadow->SetGeneration(unit, 0);
                 continue;
             }
             const auto [begin, end] = shadow->UnitRange(unit);
@@ -353,12 +380,12 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
                 copies.back().regions.push_back(region);
                 ranges.emplace_back(begin, end);
             }
-            shadow->published[unit] = 1;
+            shadow->SetPublished(unit, 1);
             slab->lastUse = Recorder::Presents();
             bytes += end - begin;
             ++units;
         }
-        shadow->Recount();
+        shadow->Settle();
     }
     if (units == 0) return 0;
     Stats().published[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
@@ -420,10 +447,10 @@ bool evictOne(Shadows& registry) {
     if (TraceEnabled()) std::fprintf(stderr, "[shadow] evict slab %zu of import 0x%llx (%.1f MiB, %zu units published)\n", victimSlab, static_cast<unsigned long long>(victim->importBase), SlabBytes(*slab) / 1048576.0, published);
     // Its units read from the import from now on (the publish put their bytes there).
     for (auto unit = firstUnit; unit <= lastUnit; ++unit) {
-        victim->generation[unit] = 0;
-        victim->published[unit] = 0;
+        victim->SetGeneration(unit, 0);
+        victim->SetPublished(unit, 0);
     }
-    victim->Recount();
+    victim->Settle();
     registry.liveBytes -= SlabBytes(*slab);
     --registry.liveSlabs;
     slab.reset();
@@ -738,12 +765,12 @@ void MarkShadowed(const HostImport& import, std::span<const ShadowedRange> range
                     ++lost;
                     continue;
                 }
-                shadow->generation[unit] = generation;
-                shadow->published[unit] = 0;
+                shadow->SetGeneration(unit, generation);
+                shadow->SetPublished(unit, 0);
                 current->lastUse = present;
             }
         }
-        shadow->Recount();
+        shadow->Settle();
     }
     if (lost != 0) {
         Stats().slabLost.fetch_add(lost, std::memory_order_relaxed);
@@ -778,7 +805,7 @@ void RetireShadow(VkDevice device, const HostImport& import, const std::function
                 selected[static_cast<std::size_t>(unit)] = 1;
                 any = true;
             } else {
-                shadow->generation[unit] = 0;
+                shadow->SetGeneration(unit, 0);
                 ++dropped;
             }
         }
