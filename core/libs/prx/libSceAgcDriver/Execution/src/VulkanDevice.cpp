@@ -94,6 +94,7 @@
 #include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <utility>
 
@@ -5253,6 +5254,44 @@ bool VulkanDevice::TemplateDataRefresh() {
     return AgcDriver::TemplateDataRefresh();
 }
 
+namespace {
+
+struct AllocatingPrograms {
+    std::mutex mutex;
+    std::unordered_set<std::uint64_t> addresses;
+    std::atomic<std::uint64_t> dispatches{0};
+    std::atomic<std::uint64_t> workgroups{0};
+};
+
+AllocatingPrograms& Allocating() {
+    static AllocatingPrograms programs;
+    return programs;
+}
+
+bool AllocatingProgram(std::uint64_t programAddress) {
+    auto& programs = Allocating();
+    std::lock_guard lock(programs.mutex);
+    return programs.addresses.contains(programAddress);
+}
+
+}
+
+bool VulkanDevice::ExactSerialAllocating() {
+    static const bool serial = std::getenv("APS5_EXACT_SERIAL_ALLOCATING") != nullptr;
+    return serial;
+}
+
+void VulkanDevice::NoteAllocatingProgram(std::uint64_t programAddress) {
+    auto& programs = Allocating();
+    std::lock_guard lock(programs.mutex);
+    programs.addresses.insert(programAddress);
+}
+
+VulkanDevice::SerialAllocatingCount VulkanDevice::SerialAllocatingCounts() {
+    auto& programs = Allocating();
+    return {programs.dispatches.load(std::memory_order_relaxed), programs.workgroups.load(std::memory_order_relaxed)};
+}
+
 void VulkanDevice::NoteRecipe(RecipeEvent event, bool indirect) {
     NoteRecipe(event, indirect ? RecipeKind::Indirect : RecipeKind::Dispatch);
 }
@@ -5612,7 +5651,8 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     // APS5_NO_LANE_OVERLAP=1 (diagnostic, an APS5_AB switch): no dispatch of the async lane (lane 1) overlaps.
     if (Graphics::Recorder::LaneOwnFamily() && Graphics::Recorder::ThreadLane() == 1) require(!record.shader->program->bindlessHeap && resources.SampledTextures().empty() && resources.StorageImages().empty(), "a dispatch that binds images was recorded into the async lane, whose compute-family queue does not own the images");
     const bool laneOverlap = !recorder.AsyncLaneActive() || Graphics::Recorder::ThreadLane() == 0 || !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoLaneOverlap);
-    const bool overlapCapable = laneOverlap && overlapQueue != 0 && Graphics::Recorder::DispatchOverlapEnabled() && arguments == 0 && argumentImport == nullptr && !record.htileClear.has_value() && record.shader->program->workgroupMemoryDwords == 0 && (state->checkpointMarker == nullptr || CheckpointsInRuns()) && record.x <= groupLimit[0] && record.y <= groupLimit[1] && record.z <= groupLimit[2] && (Graphics::Recorder::StagedOverlapEnabled() || !resources.HasGpuCopies());
+    const bool serialWorkgroups = ExactSerialAllocating() && arguments == 0 && argumentImport == nullptr && record.shader->program->workgroupMemoryDwords == 0 && static_cast<std::uint64_t>(record.x) * record.y * record.z > 1u && record.x <= groupLimit[0] && record.y <= groupLimit[1] && record.z <= groupLimit[2] && AllocatingProgram(record.programAddress);
+    const bool overlapCapable = !serialWorkgroups && laneOverlap && overlapQueue != 0 && Graphics::Recorder::DispatchOverlapEnabled() && arguments == 0 && argumentImport == nullptr && !record.htileClear.has_value() && record.shader->program->workgroupMemoryDwords == 0 && (state->checkpointMarker == nullptr || CheckpointsInRuns()) && record.x <= groupLimit[0] && record.y <= groupLimit[1] && record.z <= groupLimit[2] && (Graphics::Recorder::StagedOverlapEnabled() || !resources.HasGpuCopies());
     if (timer.profile && overlapQueue != 0) {
         if (!overlapCapable) {
             if (arguments != 0 || argumentImport != nullptr) ++d.notIndirect;
@@ -5842,7 +5882,21 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     if (argumentImport != nullptr) {
         context.Resolved(&Graphics::DeviceFunctions::cmdDispatchIndirect, "vkCmdDispatchIndirect")(commands, indirectBuffer, indirectOffset);
     } else {
-        if (record.x <= limit[0] && record.y <= limit[1] && record.z <= limit[2]) {
+        if (serialWorkgroups) {
+            const auto dispatchBase = context.Function<PFN_vkCmdDispatchBase>("vkCmdDispatchBase");
+            for (std::uint32_t z = 0; z < record.z; ++z) {
+                for (std::uint32_t y = 0; y < record.y; ++y) {
+                    for (std::uint32_t x = 0; x < record.x; ++x) {
+                        if (x != 0 || y != 0 || z != 0) Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+                        dispatchBase(commands, x, y, z, 1, 1, 1);
+                    }
+                }
+            }
+            auto& programs = Allocating();
+            const auto split = programs.dispatches.fetch_add(1, std::memory_order_relaxed) + 1u;
+            const auto workgroups = programs.workgroups.fetch_add(static_cast<std::uint64_t>(record.x) * record.y * record.z, std::memory_order_relaxed) + static_cast<std::uint64_t>(record.x) * record.y * record.z;
+            if (split <= 8u || split % 64u == 0u) std::fprintf(stderr, "[exact-serial] program 0x%llx: %ux%ux%u workgroups recorded one at a time (%llu dispatches, %llu workgroups so far)\n", static_cast<unsigned long long>(record.programAddress), record.x, record.y, record.z, static_cast<unsigned long long>(split), static_cast<unsigned long long>(workgroups));
+        } else if (record.x <= limit[0] && record.y <= limit[1] && record.z <= limit[2]) {
             context.Resolved(&Graphics::DeviceFunctions::cmdDispatch, "vkCmdDispatch")(commands, record.x, record.y, record.z);
         } else {
             char counted[128] = "";
