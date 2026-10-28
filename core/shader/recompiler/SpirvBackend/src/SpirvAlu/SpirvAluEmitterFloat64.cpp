@@ -1084,7 +1084,8 @@ std::uint32_t EmitFPInterpolateF32(SpirvEmitterState& state, std::uint32_t arg0,
 // v_fma_mix* and f16 interpolation: CallInterpolate takes the exact f32 path of #10980 (tibzejoker, be81531d69)
 // and the f64/integer helper only where that result is not provably exact. Our own fused-Fma f32 path
 // (InterpolateF16Fast, APS5_NO_MIX_F32) is retired: the MixF16Exact probe gives identical results for both
-// and #10980 emits 27 % fewer words on 0x141d55d00 at the same GPU time (research/speed/newpath/census-c.md).
+// and #10980 emits 27 % fewer words on 0x141d55d00, at +5 % GPU time on the request bench (interleaved A/B, three
+// rounds: 20.8-21.1 vs 19.7-20.1 ms; research/speed/newpath/census-c.md), under the S4 lever bar of 10 %.
 std::uint32_t EmitFPInterpolateF16(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1, std::uint32_t arg2, const IrValue* mode) {
     return CallInterpolate(state, arg0, arg1, arg2, true, mode->ImmediateU32());
 }
