@@ -895,6 +895,9 @@ struct CompiledShaderArtifact {
     std::uint32_t hostSubgroupSize = 0;
     bool fullSubgroups = false;
     bool functionLdsBuffer = false;
+    // The module walks the device page table (SpirvTarget::newPathResolved): the driver gives it the 256-byte push
+    // block with the table root at words 0-1 and today's push words from word 6 (NewPath::ResolvedModule).
+    bool newPathResolved = false;
     std::vector<std::uint32_t> parameterExports;
     std::vector<FragmentParameter> fragmentParameters;
     BarycentricEmulation barycentricEmulation;

@@ -813,6 +813,7 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program)
     result.hostSubgroupSize = HostSubgroupSize(request);
     result.fullSubgroups = emitted.fullSubgroups;
     result.functionLdsBuffer = emitted.functionLdsBuffer;
+    result.newPathResolved = request.target.newPathResolved;
     result.vertexOffsetSgpr = program.Info().vertexOffsetSgpr;
     result.instanceOffsetSgpr = program.Info().instanceOffsetSgpr;
     result.vertexOffsetShared = program.Info().vertexOffsetShared;
@@ -1475,6 +1476,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         .hostSubgroupSize = artifact.hostSubgroupSize,
         .fullSubgroups = artifact.fullSubgroups,
         .functionLdsBuffer = artifact.functionLdsBuffer,
+        .newPathResolved = artifact.newPathResolved,
         .parameterExports = artifact.parameterExports,
         .fragmentParameters = artifact.fragmentParameters,
         .barycentricEmulation = artifact.barycentricEmulation,

@@ -1,11 +1,12 @@
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/ResolvedPush.hpp"
+#include "Recompiler.hpp"
 #include <algorithm>
 #include <cstring>
 
 namespace AgcDriver::NewPath {
 
-bool ResolvedModule(const ShaderRecompiler::RecompileResult&) {
-    return false;
+bool ResolvedModule(const ShaderRecompiler::RecompileResult& program) {
+    return program.newPathResolved;
 }
 
 std::optional<PushBytes> ComposeResolvedPush(const std::array<std::byte, Abi::PushBlockBytes>& legacy, std::uint32_t legacyBytes, std::uint64_t tableRoot, std::uint64_t faultRecord) {
