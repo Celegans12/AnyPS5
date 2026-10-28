@@ -14,7 +14,7 @@ namespace AgcDriver::NewPath::Abi {
 inline constexpr std::uint32_t Version = 2;
 inline constexpr std::uint32_t PushBlockBytes = 256;
 inline constexpr std::size_t StageCount = 4;
-inline constexpr std::uint32_t PageShift = 16;
+inline constexpr std::uint32_t PageShift = ShaderRecompiler::BdaAbi::PageShift;
 inline constexpr std::uint32_t SubpageShift = 12;
 
 using Stage = ShaderRecompiler::RuntimeAbi::Stage;

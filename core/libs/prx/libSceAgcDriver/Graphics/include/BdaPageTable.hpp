@@ -2,7 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_BDAPAGETABLE_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
-#include "prx/libSceAgcDriver/Graphics/include/BdaPageAbi.hpp"
+#include "BdaAbi.hpp"
 #include <atomic>
 #include <cstdint>
 #include <functional>

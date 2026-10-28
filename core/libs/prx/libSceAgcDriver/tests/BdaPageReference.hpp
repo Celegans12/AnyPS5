@@ -1,7 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_TESTS_BDAPAGEREFERENCE_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_TESTS_BDAPAGEREFERENCE_HPP
 
-#include "prx/libSceAgcDriver/Graphics/include/BdaPageAbi.hpp"
+#include "BdaAbi.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdint>
