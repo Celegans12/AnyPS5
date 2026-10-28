@@ -43,6 +43,7 @@
 #include <map>
 #include <memory>
 #include <unordered_set>
+#include <deque>
 #include <mutex>
 #include <set>
 #include <unordered_map>
@@ -1841,14 +1842,51 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         if (const auto zeroFrom = state.stages.mesh ? std::nullopt : ZeroFetchVertex(shaders.front().program->vertexAttributes)) {
             const auto limit = *zeroFrom > draw.firstVertex ? *zeroFrom - draw.firstVertex : 0u;
             if (*highest >= limit && *highest - limit >= ZeroFetchSlack) {
-                GuestMemory::FlushGpuWrites(draw.indexAddress, static_cast<std::size_t>(indexBytes));
-                auto clamped = std::make_shared<Buffer>(context, static_cast<std::size_t>(indexBytes), VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
-                const auto bytes = clamped->Bytes().first(static_cast<std::size_t>(indexBytes));
-                GuestMemory::Read(draw.indexAddress, bytes, draw.indexSize);
-                highest = ClampDrawIndices(bytes, draw.indexSize, skipRestart, limit);
+                // The clamped copy of an index buffer is kept and reused while its guest memory is unchanged since it
+                // was read (CPU and GPU writes stamp generations; recorded GPU writes not landed yet refuse the reuse).
+                // Title menu: ~4 draws per frame clamp a 32 MiB index buffer (~5 ms each); +11.9 % menu presents
+                // (best298). APS5_NO_INDEX_CLAMP_MEMO=1 (runtime switch) clamps every time.
+                struct ClampMemo {
+                    std::uint64_t address = 0, bytes = 0, generation = 0;
+                    std::uint32_t indexSize = 0, limit = 0;
+                    bool skipRestart = false;
+                    std::shared_ptr<Buffer> buffer;
+                    std::optional<std::uint32_t> highest;
+                };
+                static std::mutex memoMutex;
+                static std::deque<ClampMemo> memos;
+                const bool memoize = !RuntimeSwitches::Set(RuntimeSwitch::NoIndexClampMemo);
+                std::shared_ptr<Buffer> reused;
+                if (memoize && !Recorder::SnapshotWriteOverlaps(draw.indexAddress, static_cast<std::size_t>(indexBytes))) {
+                    GuestMemory::CollectWrites(draw.indexAddress, static_cast<std::size_t>(indexBytes));
+                    std::lock_guard memoLock(memoMutex);
+                    for (const auto& memo : memos) {
+                        if (memo.address != draw.indexAddress || memo.bytes != indexBytes || memo.indexSize != draw.indexSize || memo.limit != limit || memo.skipRestart != skipRestart) continue;
+                        if (GuestMemory::UnchangedSince(draw.indexAddress, static_cast<std::size_t>(indexBytes), memo.generation)) {
+                            reused = memo.buffer;
+                            highest = memo.highest;
+                        }
+                        break;
+                    }
+                }
+                if (reused == nullptr) {
+                    GuestMemory::FlushGpuWrites(draw.indexAddress, static_cast<std::size_t>(indexBytes));
+                    const auto generation = memoize ? GuestMemory::CollectWrites(draw.indexAddress, static_cast<std::size_t>(indexBytes)) : 0;
+                    auto clamped = std::make_shared<Buffer>(context, static_cast<std::size_t>(indexBytes), VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+                    const auto bytes = clamped->Bytes().first(static_cast<std::size_t>(indexBytes));
+                    GuestMemory::Read(draw.indexAddress, bytes, draw.indexSize);
+                    highest = ClampDrawIndices(bytes, draw.indexSize, skipRestart, limit);
+                    reused = std::move(clamped);
+                    if (memoize && generation != 0) {
+                        std::lock_guard memoLock(memoMutex);
+                        std::erase_if(memos, [&](const ClampMemo& memo) { return memo.address == draw.indexAddress && memo.bytes == indexBytes && memo.indexSize == draw.indexSize && memo.limit == limit && memo.skipRestart == skipRestart; });
+                        memos.push_front({draw.indexAddress, indexBytes, generation, draw.indexSize, limit, skipRestart, reused, highest});
+                        if (memos.size() > 16) memos.pop_back();
+                    }
+                }
                 import = nullptr;
                 copy = DrawInputCopy{};
-                copy.buffer = std::move(clamped);
+                copy.buffer = std::move(reused);
                 if (!highest) {
                     inputs.nothing = true;
                     return inputs;

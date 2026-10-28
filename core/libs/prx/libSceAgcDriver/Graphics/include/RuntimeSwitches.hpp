@@ -77,6 +77,9 @@ enum class RuntimeSwitch : std::size_t {
     NoOwnedEpoch,
     NewPathNoGpuDraws,
     NewPathNoGpuDispatches,
+    NoIndexClampMemo,
+    NoGdsGpuFill,
+    NoDmaCopyBehindWrites,
     Count,
 };
 
