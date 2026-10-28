@@ -42,6 +42,14 @@ void OverlayTests() {
         Expect(split[1].begin == ImportBase + 2 * Page && split[1].deviceAddress == ResidentDevice, "the resident page does not map to its mirror");
         Expect(split[2].begin == ImportBase + 3 * Page && split[2].deviceAddress == ImportDevice + 3 * Page && split[2].end == ImportBase + 8 * Page, "the piece after the resident page is wrong");
     }
+    const std::vector<Range> readOnly{MakeRange(ImportBase, ImportBase + 2 * Page, ImportDevice, Abi::Read)};
+    const std::vector<Range> widening{MakeRange(ImportBase + Page, ImportBase + 3 * Page, ResidentDevice)};
+    const auto clamped = DevicePageTable::Overlay(readOnly, widening, ImportBase, ImportBase + 3 * Page);
+    Expect(clamped.size() == 3, "a resident piece over a read-only import and past it did not give three pieces");
+    if (clamped.size() == 3) {
+        Expect(clamped[1].begin == ImportBase + Page && clamped[1].deviceAddress == ResidentDevice && clamped[1].permissions == Abi::Read, "a resident piece widened a read-only import's permissions");
+        Expect(clamped[2].begin == ImportBase + 2 * Page && clamped[2].deviceAddress == ResidentDevice + Page && clamped[2].permissions == (Abi::Read | Abi::Write), "a resident piece past every import lost its own permissions");
+    }
     const auto none = DevicePageTable::Overlay(imports, {}, ImportBase + 16 * Page, ImportBase + 17 * Page);
     Expect(none.empty(), "a span with no import got a piece");
 }
