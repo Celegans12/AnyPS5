@@ -901,7 +901,9 @@ struct Replay {
                     released = true;
                 }
             }
-            if (released) ++earlyReleases;
+            if (!released) continue;
+            ++earlyReleases;
+            if (options.exact) return;
         }
     }
 
@@ -1065,7 +1067,8 @@ int usage() {
                          "  --exact             waits for every earlier submission and its GPU work to complete before each submission, flip and\n"
                          "                      memory delta,\n"
                          "                      so the GPU work runs in one order (a reproducible baseline, slower than the title), and releases\n"
-                         "                      awaited dwords when every replay thread is parked and the driver is blocked on waits, in capture order\n"
+                         "                      awaited dwords when every replay thread is parked and the driver is blocked on waits, in capture order,\n"
+                         "                      one dword per parked state, so queues released past the window's end do not run beside each other\n"
                          "  --frame-limit <n>   replays the calls through the n-th CPU flip, or the n-th suspend point when the title flips from the GPU,\n"
                          "                      and compares the display buffer with the title's image at that frame\n"
                          "  --checkpoint <csv>  replays up to the checkpoint of a capture made with APS5_FRAME_CAPTURE_CHECKPOINT=<frame> and lists\n"
