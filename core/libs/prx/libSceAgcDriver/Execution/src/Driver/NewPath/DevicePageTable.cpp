@@ -32,10 +32,25 @@ std::vector<Range> DevicePageTable::Overlay(std::span<const Range> base, std::sp
         auto at = std::upper_bound(base.begin(), base.end(), cursor, [](std::uint64_t value, const Range& range) { return value < range.end; });
         for (; at != base.end() && at->begin < limit; ++at) appendClipped(out, *at, cursor, limit);
     };
+    const auto appendResident = [&](const Range& piece, std::uint64_t low, std::uint64_t high) {
+        auto at = std::upper_bound(base.begin(), base.end(), low, [](std::uint64_t value, const Range& range) { return value < range.end; });
+        auto from = low;
+        for (; at != base.end() && at->begin < high && from < high; ++at) {
+            if (at->begin > from) {
+                appendClipped(out, piece, from, at->begin);
+                from = at->begin;
+            }
+            auto clamped = piece;
+            clamped.permissions &= at->permissions;
+            appendClipped(out, clamped, from, std::min(at->end, high));
+            from = std::min(at->end, high);
+        }
+        if (from < high) appendClipped(out, piece, from, high);
+    };
     for (const auto& piece : resident) {
         if (piece.end <= cursor || piece.begin >= end) continue;
         fillTo(std::max(piece.begin, cursor));
-        appendClipped(out, piece, std::max(piece.begin, cursor), end);
+        appendResident(piece, std::max(piece.begin, cursor), std::min(piece.end, end));
         cursor = std::min(piece.end, end);
     }
     fillTo(end);
