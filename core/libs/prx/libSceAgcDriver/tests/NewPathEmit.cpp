@@ -1,5 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/CommandWrites.hpp"
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/PushBlock.hpp"
+#include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/ResolvedPush.hpp"
+#include "Recompiler.hpp"
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/Router.hpp"
 #include <algorithm>
 #include <cstdio>
@@ -135,6 +137,31 @@ void resolvedDispatchPush() {
     Expect(!ResolvedDispatchPush(graphics, user, 0x1000, 0x2000).has_value(), "a dispatch layout with pixel words was accepted");
 }
 
+void composedResolvedPush() {
+    ShaderRecompiler::RecompileResult program{};
+    Expect(!ResolvedModule(program), "a module counts as newPathResolved before the recompiler marks any");
+    std::array<std::byte, Abi::PushBlockBytes> legacy{};
+    for (std::uint32_t word = 0; word < 32; ++word) {
+        const std::uint32_t value = 0xb0000000u | word;
+        std::memcpy(legacy.data() + word * 4u, &value, 4);
+    }
+    const auto bytes = ComposeResolvedPush(legacy, 128, 0x0000222200330000ull, 0x0000444400550000ull);
+    Expect(bytes.has_value(), "a resolved push from today's 128-byte block was refused");
+    if (bytes) {
+        std::uint32_t words[64]{};
+        std::memcpy(words, bytes->data(), sizeof(words));
+        Expect(words[0] == 0x00330000u && words[1] == 0x00002222u, "the table root is not at words 0-1");
+        Expect(words[2] == 0x00550000u && words[3] == 0x00004444u, "the fault record is not at words 2-3");
+        Expect(words[4] == 0u && words[5] == 0u, "reserved words 4-5 are not zero");
+        bool shifted = true;
+        for (std::uint32_t word = 0; word < 32; ++word) shifted = shifted && words[6 + word] == (0xb0000000u | word);
+        Expect(shifted, "today's push words are not at 6 + their slot");
+        Expect(words[38] == 0u && words[63] == 0u, "words past the shifted block are not zero");
+    }
+    Expect(!ComposeResolvedPush(legacy, 128, 0, 1).has_value() && !ComposeResolvedPush(legacy, 128, 1, 0).has_value(), "a zero root or fault record was accepted");
+    Expect(!ComposeResolvedPush(legacy, 240, 1, 1).has_value(), "a legacy block that cannot shift by six words was accepted");
+}
+
 BdaAbi::Range MakeRange(std::uint64_t begin, std::uint64_t end, std::uint32_t permissions) {
     return {begin, end, 0x7f0000000000ull + begin, permissions, 0u};
 }
@@ -175,6 +202,7 @@ int main() {
         pushBlock();
         writeSets();
         resolvedDispatchPush();
+        composedResolvedPush();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;
