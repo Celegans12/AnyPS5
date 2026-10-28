@@ -89,7 +89,7 @@ bool FinishPattern(TransferRange& range) {
 
 bool Driver::transferBuffer(std::uint32_t queueId, const ShaderRecompiler::RecompileResult& compiled, std::span<const std::uint32_t> userData, std::uint64_t threads, const std::shared_ptr<VulkanDevice>& localDevice, std::uint64_t programAddress) {
     static const bool disabled = std::getenv("APS5_NO_TRANSFER_KERNELS") != nullptr;
-    if (disabled || !compiled.transferKernel || !compiled.linearStore) return false;
+    if (disabled || compiled.rangesFromMemory || !compiled.transferKernel || !compiled.linearStore) return false;
     const auto range = ResolveTransfer(*compiled.transferKernel, *compiled.linearStore, userData, threads);
     if (!range) return false;
     if (range->bytes == 0u) return true;
