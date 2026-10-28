@@ -301,6 +301,14 @@ public:
     static std::uint64_t TokenThrough(const Token& token);
     bool TokenReached(const Token& token) const;
     void FinishToken(const Token& token);
+    class CommandInHand {
+    public:
+        CommandInHand();
+        ~CommandInHand();
+        CommandInHand(const CommandInHand&) = delete;
+        CommandInHand& operator=(const CommandInHand&) = delete;
+    };
+    static bool CommandBufferInHand();
     // Under the mutex, async lane only: the calling thread's lane's open (or next) batch waits on the
     // GPU for everything lane `from` recorded so far (its open batch is submitted first).
     void OrderAfterLane(int from);

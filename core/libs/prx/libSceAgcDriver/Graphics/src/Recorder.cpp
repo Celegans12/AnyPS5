@@ -1593,8 +1593,25 @@ bool Recorder::TokenReached(const Token& token) const {
     return TokenThrough(token) <= CompletedThrough();
 }
 
+namespace {
+thread_local int commandsInHand = 0;
+}
+
+Recorder::CommandInHand::CommandInHand() {
+    ++commandsInHand;
+}
+
+Recorder::CommandInHand::~CommandInHand() {
+    --commandsInHand;
+}
+
+bool Recorder::CommandBufferInHand() {
+    return commandsInHand != 0;
+}
+
 void Recorder::FinishToken(const Token& token) {
     if (TokenReached(token)) return;
+    Require(commandsInHand == 0, "a recorder token was finished while this thread holds a command buffer for a command it has not recorded yet (finishing would submit that buffer under it)");
     SubmitAllLanes();
     const auto submitted = UseSerial() - 1;
     WaitSerial(submitted);

@@ -21,6 +21,11 @@ public:
     virtual void SubmitAll() = 0;
     virtual void WaitThrough(std::uint64_t serial) = 0;
     virtual void Complete(std::uint64_t serial) = 0;
+    virtual bool NativeTokens() const { return false; }
+    virtual ResidencyToken CallerToken() const { return {}; }
+    virtual ResidencyToken AllToken() const { return {}; }
+    virtual bool TokenReached(const ResidencyToken&) const { return false; }
+    virtual void FinishToken(const ResidencyToken&) {}
 };
 
 class ResidencyTokens {

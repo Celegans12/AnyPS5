@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ResidencyTokens.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "VulkanTestDevice.hpp"
 #ifdef _WIN32
@@ -69,6 +70,34 @@ int main() {
         }
         Expect(refused, "a token naming a stream past the two lanes was accepted");
         recorder->FinishToken(caller);
+
+        recorder->NotePendingWrite(address + 128, scratchBytes);
+        const auto held = recorder->AllToken();
+        {
+            const Recorder::CommandInHand inHand;
+            bool refusedInHand = false;
+            try {
+                recorder->FinishToken(held);
+            } catch (const std::exception&) {
+                refusedInHand = true;
+            }
+            Expect(refusedInHand && !recorder->TokenReached(held), "a token was finished while a command buffer was in hand");
+        }
+        auto lanes = AgcDriver::Graphics::RecorderLanes(*recorder);
+        AgcDriver::Graphics::ResidencyTokens tokens(*lanes);
+        Expect(tokens.Caller() == recorder->CallerToken() && tokens.All() == recorder->AllToken(), "the residency tokens are not the recorder's tokens");
+        {
+            const Recorder::CommandInHand inHand;
+            bool refusedInHand = false;
+            try {
+                tokens.Finish(held);
+            } catch (const std::exception&) {
+                refusedInHand = true;
+            }
+            Expect(refusedInHand, "the residency adapter finished a token while a command buffer was in hand (R-16)");
+        }
+        tokens.Finish(held);
+        Expect(tokens.Reached(held) && recorder->TokenReached(held), "the residency adapter did not finish through the recorder's tokens");
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;
