@@ -438,6 +438,7 @@ struct Replay {
     std::atomic<int> busy{0};
     std::atomic<std::uint64_t> parkedReleases{0};
     std::atomic<std::uint64_t> fallbackReleases{0};
+    std::atomic<bool> parkedWithoutRelease{false};
     std::uint64_t unfinished = 0;
     std::size_t threads = 0;
     bool recording = false;
@@ -842,6 +843,7 @@ struct Replay {
                     lastSequenced = issued;
                     lastProgress = Clock::now();
                     parkedSince.reset();
+                    parkedWithoutRelease.store(false);
                     continue;
                 }
                 if (options.exact) {
@@ -849,7 +851,9 @@ struct Replay {
                     if (busy.load() == 0 && blockedOnWaits()) {
                         if (!parkedSince) parkedSince = now;
                         if (now - *parkedSince < ParkedQuiet) continue;
+                        const auto before = earlyReleases.load();
                         releaseAwaited(calls, sequenced.load());
+                        parkedWithoutRelease.store(earlyReleases.load() == before);
                         ++parkedReleases;
                         parkedSince.reset();
                         lastProgress = Clock::now();
@@ -916,15 +920,22 @@ struct Replay {
 
     void drain() {
         auto lastCompleted = progress().second;
+        auto lastReleases = earlyReleases.load();
         auto lastProgress = Clock::now();
+        const auto timeout = options.exact ? std::max<std::chrono::milliseconds>(options.drainTimeout, std::chrono::seconds(60)) : options.drainTimeout;
         while (true) {
             const auto [accepted, completed] = progress();
             unfinished = accepted - completed;
             if (unfinished == 0) return;
-            if (completed != lastCompleted) {
+            if (completed != lastCompleted || earlyReleases.load() != lastReleases) {
                 lastCompleted = completed;
+                lastReleases = earlyReleases.load();
                 lastProgress = Clock::now();
-            } else if (Clock::now() - lastProgress >= options.drainTimeout) {
+            } else if (options.exact && parkedWithoutRelease.load()) {
+                std::fprintf(stderr, "[frame-replay] %llu submissions stay parked on waits nothing in the window releases (serials %llu/%llu)\n", static_cast<unsigned long long>(unfinished),
+                             static_cast<unsigned long long>(completed), static_cast<unsigned long long>(accepted));
+                return;
+            } else if (Clock::now() - lastProgress >= timeout) {
                 std::fprintf(stderr, "[frame-replay] %llu submissions did not complete after the last captured call (serials %llu/%llu)\n", static_cast<unsigned long long>(unfinished),
                              static_cast<unsigned long long>(completed), static_cast<unsigned long long>(accepted));
                 return;
@@ -1085,7 +1096,14 @@ void compareCheckpoint(const FrameCaptureReader& reader, const std::filesystem::
         AgcDriverWaitIdle_nid_postfix();
         if (!AgcDriverSettle_nid_postfix()) std::fprintf(stderr, "[frame-replay] storage images were still pending at the checkpoint\n");
     } else {
-        std::fprintf(stderr, "[frame-replay] checkpoint compared with submissions still parked on waits whose writers lie beyond the window\n");
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+        auto quietSince = std::chrono::steady_clock::now();
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (!AgcDriverQuiescent_nid_postfix()) quietSince = std::chrono::steady_clock::now();
+            else if (std::chrono::steady_clock::now() - quietSince >= std::chrono::milliseconds(50)) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        std::fprintf(stderr, "[frame-replay] checkpoint compared with submissions still parked on waits whose writers lie beyond the window (driver %s)\n", AgcDriverQuiescent_nid_postfix() ? "quiescent" : "still running after 60 s");
     }
     std::ofstream report(path, std::ios::trunc);
     auto blocksPath = path;
