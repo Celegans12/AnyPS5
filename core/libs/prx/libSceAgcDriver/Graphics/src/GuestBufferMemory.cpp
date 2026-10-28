@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidentCensus.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ResidencySession.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "ThreadOwned.hpp"
@@ -6293,6 +6294,16 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
 
 void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
     if (!uploaded || committed) return;
+    if (ResidencyActive()) {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
+        for (const auto& region : regions) {
+            if (region.end <= region.begin) continue;
+            if (region.writable) writes.emplace_back(region.begin, region.end - region.begin);
+            if (region.gpuCopy && region.deviceLocal) reads.emplace_back(region.begin, region.end - region.begin);
+        }
+        NoteStagedRegions(reads, writes);
+    }
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const bool diff = stagingDiffEnabled(context);
     bool diffed = false;
