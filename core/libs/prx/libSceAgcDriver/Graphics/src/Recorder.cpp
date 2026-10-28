@@ -4164,6 +4164,33 @@ void Recorder::RefuseOwnedDrawSnapshot(std::uint64_t address, std::size_t bytes,
     entry.skip = static_cast<std::uint16_t>((1u << entry.backoff) - 1u);
 }
 
+std::optional<std::optional<std::uint32_t>> Recorder::GpuWrittenHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use) const {
+    const auto found = indexRanges.find({address, use, bytes});
+    if (found == indexRanges.end() || found->second.registryGeneration != GuestAllocations::GuestAllocationsGeneration_nid_postfix()) return std::nullopt;
+    const auto generation = found->second.generation;
+    if (generation == 0 || GuestMemory::UnchangedSince(address, bytes, generation)) return std::nullopt;
+    const auto count = static_cast<std::size_t>((address + bytes - 1) / GuestMemory::HashBlockBytes - address / GuestMemory::HashBlockBytes + 1);
+    struct Scratch {
+        std::vector<std::uint64_t> generations;
+        std::vector<std::uint8_t> changed;
+        std::vector<std::uint8_t> cpu;
+    };
+    auto& scratch = HostThreadLocal<Scratch, Scratch>();
+    scratch.generations.assign(count, generation);
+    scratch.changed.assign(count, GuestMemory::BlockWritten);
+    scratch.cpu.assign(count, 1);
+    if (!GuestMemory::ChangedBlocks(address, bytes, scratch.generations, scratch.changed, scratch.cpu)) return std::nullopt;
+    for (std::size_t k = 0; k < count; ++k) {
+        if (scratch.changed[k] != GuestMemory::BlockUnchanged && scratch.cpu[k] != 0) return std::nullopt;
+    }
+    return found->second.highest;
+}
+
+std::uint64_t Recorder::KeptHighestIndexGeneration(std::uint64_t address, std::size_t bytes, SnapshotUse use) const {
+    const auto found = indexRanges.find({address, use, bytes});
+    return found != indexRanges.end() ? found->second.generation : 0;
+}
+
 bool Recorder::KnownHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::optional<std::uint32_t>& highest) {
     const auto found = indexRanges.find({address, use, bytes});
     if (found == indexRanges.end()) return false;

@@ -87,6 +87,7 @@ enum class RuntimeSwitch : std::size_t {
     NoIncrementalShadowCount,
     NoGpuSingleExpand,
     NoMovedInPlace,
+    NoGpuWrittenIndexEstimate,
     Count,
 };
 

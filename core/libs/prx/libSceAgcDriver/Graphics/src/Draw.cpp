@@ -1543,6 +1543,21 @@ private:
     VkPipeline pipeline = VK_NULL_HANDLE;
 };
 
+namespace {
+// Diagnostic (APS5_PROFILE_DRAW): in-place index scans C68 left out; [index-estimate] every 10 s.
+void countIndexEstimate() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile) return;
+    static std::atomic<std::uint64_t> estimates{0};
+    static std::atomic<std::int64_t> report{0};
+    estimates.fetch_add(1, std::memory_order_relaxed);
+    const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    auto last = report.load(std::memory_order_relaxed);
+    if (last == 0) report.compare_exchange_strong(last, now);
+    else if (now - last >= 10'000'000'000LL && report.compare_exchange_strong(last, now)) AgcDriver::ProfilePrint_nid_no_patch("[index-estimate] (10 s) %llu in-place index scans left to the clamp\n", static_cast<unsigned long long>(estimates.exchange(0)));
+}
+}
+
 InPlaceIndices InPlaceIndexRange(Recorder& recorder, std::uint64_t address, std::size_t bytes, std::uint32_t indexSize, bool skipRestart) {
     const std::span<const std::byte> range(reinterpret_cast<const std::byte*>(address), bytes);
     InPlaceIndices indices;
@@ -1553,11 +1568,57 @@ InPlaceIndices InPlaceIndexRange(Recorder& recorder, std::uint64_t address, std:
     const auto use = indexSize == 2 ? (skipRestart ? Recorder::SnapshotUse::Index16Restart : Recorder::SnapshotUse::Index16) : (skipRestart ? Recorder::SnapshotUse::Index32Restart : Recorder::SnapshotUse::Index32);
     const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     const auto generation = GuestMemory::CollectWrites(address, bytes);
+    static const bool profileScans = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    const auto keptGeneration = profileScans ? recorder.KeptHighestIndexGeneration(address, bytes, use) : 0;
     if (generation != 0 && recorder.KnownHighestIndex(address, bytes, use, indices.highest)) {
         indices.reused = true;
         return indices;
     }
+    const auto scanStart = profileScans ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     indices.highest = HighestDrawIndex(range, indexSize, skipRestart);
+    if (profileScans) {
+        // Diagnostic (APS5_PROFILE_DRAW): in-place index scans that missed the kept highest index, by range: misses
+        // with no kept entry, stale ones by who stamped the changed blocks (a CPU store or only the driver's GPU
+        // writes), whether the highest index came out the same, scan time; [index-scan] every 10 s, top 6 by time.
+        struct Scans { std::uint64_t none = 0, cpu = 0, driver = 0, sameHighest = 0; double ms = 0; std::optional<std::uint32_t> last; bool seen = false; };
+        static std::mutex scanMutex;
+        static std::map<std::pair<std::uint64_t, std::size_t>, Scans> scans;
+        static auto scanReport = std::chrono::steady_clock::now();
+        bool cpuStamped = false;
+        if (keptGeneration != 0) {
+            const auto count = static_cast<std::size_t>((address + bytes - 1) / GuestMemory::HashBlockBytes - address / GuestMemory::HashBlockBytes + 1);
+            std::vector<std::uint64_t> generations(count, keptGeneration);
+            std::vector<std::uint8_t> changed(count, 1), cpu(count, 1);
+            GuestMemory::ChangedBlocks(address, bytes, generations, changed, cpu);
+            for (std::size_t k = 0; k < count; ++k) cpuStamped = cpuStamped || (changed[k] != 0 && cpu[k] != 0);
+        }
+        std::lock_guard scanLock(scanMutex);
+        auto& entry = scans[{address, bytes}];
+        if (keptGeneration == 0) ++entry.none;
+        else if (cpuStamped) ++entry.cpu;
+        else ++entry.driver;
+        if (entry.seen && entry.last == indices.highest) ++entry.sameHighest;
+        entry.last = indices.highest;
+        entry.seen = true;
+        entry.ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - scanStart).count();
+        if (std::chrono::steady_clock::now() - scanReport >= std::chrono::seconds(10)) {
+            scanReport = std::chrono::steady_clock::now();
+            std::vector<std::pair<double, std::pair<std::uint64_t, std::size_t>>> order;
+            for (const auto& [key, value] : scans) order.emplace_back(value.ms, key);
+            std::sort(order.begin(), order.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+            std::string line;
+            double total = 0;
+            for (const auto& [ms, key] : order) total += ms;
+            for (std::size_t i = 0; i < order.size() && i < 6; ++i) {
+                const auto& value = scans[order[i].second];
+                char item[200];
+                std::snprintf(item, sizeof(item), "\n  0x%llx+%zu: no entry %llu, stale cpu %llu, stale driver-only %llu, same highest %llu, %.0f ms", static_cast<unsigned long long>(order[i].second.first), order[i].second.second, static_cast<unsigned long long>(value.none), static_cast<unsigned long long>(value.cpu), static_cast<unsigned long long>(value.driver), static_cast<unsigned long long>(value.sameHighest), value.ms);
+                line += item;
+            }
+            AgcDriver::ProfilePrint_nid_no_patch("[index-scan] (10 s) %zu ranges, %.0f ms:%s\n", scans.size(), total, line.c_str());
+            for (auto& [key, value] : scans) value = Scans{.last = value.last, .seen = value.seen};
+        }
+    }
     recorder.KeepHighestIndex(address, bytes, use, generation, registryGeneration, indices.highest);
     return indices;
 }
@@ -1893,8 +1954,27 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         if (import == nullptr) copy = CopyDrawInput(context, context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, use);
         else GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), static_cast<std::size_t>(indexBytes), draw.indexSize);
         std::optional<std::uint32_t> highest;
+        constexpr std::uint32_t ZeroFetchSlack = 0x10000u;
+        bool estimated = false;
+        if (import != nullptr && !RuntimeSwitches::Set(RuntimeSwitch::NoGpuWrittenIndexEstimate) && context.recorder != nullptr && !state.stages.mesh) {
+            // C68: an in-place index buffer only GPU work rewrote since its last scan, whose last scan already went past
+            // the zero-fetch limit, is not scanned again: the clamp below (min(index, limit), right for any contents)
+            // serves it and sets highest = limit. Title menu: a 32 MiB GPU-written index buffer was scanned on the
+            // CPU once per frame (~1.4 ms, best434). APS5_NO_GPU_WRITTEN_INDEX_ESTIMATE=1 (runtime switch) scans.
+            if (const auto zeroFrom = ZeroFetchVertex(shaders.front().program->vertexAttributes)) {
+                const auto limit = *zeroFrom > draw.firstVertex ? *zeroFrom - draw.firstVertex : 0u;
+                GuestMemory::CollectWrites(draw.indexAddress, static_cast<std::size_t>(indexBytes));
+                if (const auto kept = context.recorder->GpuWrittenHighestIndex(draw.indexAddress, static_cast<std::size_t>(indexBytes), use); kept && *kept && **kept >= limit && **kept - limit >= ZeroFetchSlack) {
+                    highest = *kept;
+                    estimated = true;
+                    countIndexEstimate();
+                }
+            }
+        }
         if (import != nullptr) {
-            highest = InPlaceIndexRange(*context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, skipRestart).highest;
+            if (!estimated) {
+                highest = InPlaceIndexRange(*context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, skipRestart).highest;
+            }
         } else if (!copy.reused) {
             highest = HighestDrawIndex(copy.buffer->Bytes().first(static_cast<std::size_t>(indexBytes)), draw.indexSize, skipRestart);
             KeepDrawInput(context.recorder, draw.indexAddress, copy, use, skipRestart ? (highest ? *highest + 1u : 0u) : highest.value_or(0u));
@@ -1907,7 +1987,6 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
             inputs.nothing = true;
             return inputs;
         }
-        constexpr std::uint32_t ZeroFetchSlack = 0x10000u;
         if (const auto zeroFrom = state.stages.mesh ? std::nullopt : ZeroFetchVertex(shaders.front().program->vertexAttributes)) {
             const auto limit = *zeroFrom > draw.firstVertex ? *zeroFrom - draw.firstVertex : 0u;
             if (*highest >= limit && *highest - limit >= ZeroFetchSlack) {

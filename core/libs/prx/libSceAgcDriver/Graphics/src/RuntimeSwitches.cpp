@@ -86,6 +86,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_NO_INCREMENTAL_SHADOW_COUNT",
     "APS5_NO_GPU_SINGLE_EXPAND",
     "APS5_NO_MOVED_IN_PLACE",
+    "APS5_NO_GPU_WRITTEN_INDEX_ESTIMATE",
 };
 
 struct Refusal {
