@@ -2,6 +2,7 @@
 // APS5_DUMP_SHADERS=1, running the same resource analysis and recompile steps without the game.
 #include "ControlFlow/GraphBuilder.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
+#include "prx/libSceAgcDriver/tools/RecordedRequests.hpp"
 #include "ControlFlow/Structurizer.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
 #include "Optimization/ResourceProgram.hpp"
@@ -403,7 +404,7 @@ void InspectSpirv(const char* path, std::span<const std::uint32_t> words) {
 }
 
 bool Replay(const char* path, std::unique_ptr<AgcDriver::VulkanDevice>& device) {
-    auto request = ShaderRecompiler::RequestSerializer{}.Deserialize(ReadText(path));
+    auto request = AgcDriver::RecordedRequests::Deserialize(ReadText(path));
     if (g_nativeTarget) {
         if (!device) device = std::make_unique<AgcDriver::VulkanDevice>();
         const auto native = device->ComputeTarget(request.request.context.waveSize);
@@ -695,7 +696,7 @@ int MakeRequest(int argc, char** argv) {
         const auto wave = value("wave");
         const auto userCount = value("user_sgprs");
         if ((wave != 32u && wave != 64u) || userCount > 32u || userCount != ((rsrc2 >> 1u) & 0x1fu)) throw std::runtime_error("invalid compute wave or user SGPR count");
-        const auto donor = ShaderRecompiler::RequestSerializer{}.Deserialize(ReadText(argv[2]));
+        const auto donor = AgcDriver::RecordedRequests::Deserialize(ReadText(argv[2]));
         if (donor.request.shader.stage != ShaderRecompiler::ShaderStage::Compute || !donor.request.context.compute || donor.request.graphics || donor.request.context.waveSize != wave) throw std::runtime_error("the target request must be a standalone compute request of the same wave size");
         const auto firstUser = value("first_user_sgpr");
         const auto scratch = (rsrc2 & 1u) != 0 ? value("scratch_dw_per_thread") : 0u;
