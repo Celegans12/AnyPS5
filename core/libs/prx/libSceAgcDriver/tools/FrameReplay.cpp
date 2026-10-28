@@ -855,7 +855,7 @@ struct Replay {
         return calls.size();
     }
 
-    void releaseAwaited(std::span<const FrameCall> calls, std::size_t from) {
+    void releaseAwaited(std::span<const FrameCall> calls, std::size_t from, bool maySynthesize = true) {
         std::lock_guard lock(memoryMutex);
         std::array<AgcDriver::AwaitedWait, 64> awaited{};
         const auto count = AgcDriverAwaitedWaits_nid_postfix(awaited.data(), awaited.size());
@@ -882,7 +882,7 @@ struct Replay {
                 released = writeRecordedValue(calls[index - 1], wait);
                 if (released) ++lateReleases;
             }
-            if (!released && options.synthesize) {
+            if (!released && options.synthesize && maySynthesize) {
                 if (const auto value = satisfying(wait, load(wait.address, bytes))) {
                     const auto before = load(wait.address, bytes);
                     std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(wait.address)), &*value, bytes);
@@ -941,7 +941,9 @@ struct Replay {
                         if (!parkedSince) parkedSince = now;
                         if (now - *parkedSince < ParkedQuiet) continue;
                         const auto before = earlyReleases.load();
-                        releaseAwaited(calls, sequenced.load());
+                        const bool settled = now - *parkedSince >= ExactQuiet;
+                        releaseAwaited(calls, sequenced.load(), settled);
+                        if (!settled && earlyReleases.load() == before) continue;
                         parkedWithoutRelease.store(earlyReleases.load() == before);
                         ++parkedReleases;
                         parkedSince.reset();
@@ -1068,7 +1070,8 @@ int usage() {
                          "                      memory delta,\n"
                          "                      so the GPU work runs in one order (a reproducible baseline, slower than the title), and releases\n"
                          "                      awaited dwords when every replay thread is parked and the driver is blocked on waits, in capture order,\n"
-                         "                      one dword per parked state, so queues released past the window's end do not run beside each other\n"
+                         "                      one dword per parked state (a synthesized one only after the park has held 50 ms), so queues released\n"
+                         "                      past the window's end do not run beside each other\n"
                          "  --frame-limit <n>   replays the calls through the n-th CPU flip, or the n-th suspend point when the title flips from the GPU,\n"
                          "                      and compares the display buffer with the title's image at that frame\n"
                          "  --checkpoint <csv>  replays up to the checkpoint of a capture made with APS5_FRAME_CAPTURE_CHECKPOINT=<frame> and lists\n"
