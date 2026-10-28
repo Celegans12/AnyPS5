@@ -32,6 +32,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 #ifdef _WIN32
@@ -79,6 +80,57 @@ struct Options {
     bool bindlessPrime = true;
     std::filesystem::path bindlessIn;
     std::filesystem::path bindlessOut;
+    // --dedupe-prologue: skip a prologue ABI resolution that repeats an identical earlier one with no
+    // shader registration or memory call in between (its inputs did not change).
+    bool dedupePrologue = false;
+};
+
+// The prologue's provably redundant ABI resolutions (--dedupe-prologue): a resolve call is redundant
+// when an identical one (kind, queue, flags, address, size, values and registers) was made since the
+// last register-shader or memory call; any other call kind starts a new epoch.
+class PrologueDedupe {
+public:
+    bool Redundant(const FrameCall& call) {
+        const bool resolve = call.kind == FrameCallKind::ResolveShaderAbi || call.kind == FrameCallKind::ResolveGraphicsAbi || call.kind == FrameCallKind::ResolveGraphicsStagesAbi;
+        if (!resolve) {
+            ++epoch;
+            return false;
+        }
+        std::string key;
+        const auto put = [&](const void* data, std::size_t bytes) { key.append(static_cast<const char*>(data), bytes); };
+        const auto kind = static_cast<std::uint32_t>(call.kind);
+        put(&kind, sizeof(kind));
+        put(&call.queue, sizeof(call.queue));
+        put(&call.flags, sizeof(call.flags));
+        put(&call.address, sizeof(call.address));
+        put(&call.size, sizeof(call.size));
+        const auto count = [&](std::size_t value) { put(&value, sizeof(value)); };
+        count(call.values.size());
+        if (!call.values.empty()) put(call.values.data(), call.values.size() * sizeof(call.values[0]));
+        count(call.context.size());
+        for (const auto& reg : call.context) {
+            put(&reg.offset, sizeof(reg.offset));
+            put(&reg.value, sizeof(reg.value));
+        }
+        count(call.primitive.size());
+        for (const auto& reg : call.primitive) {
+            put(&reg.offset, sizeof(reg.offset));
+            put(&reg.value, sizeof(reg.value));
+        }
+        auto [entry, inserted] = seen.try_emplace(std::move(key), epoch);
+        if (inserted || entry->second != epoch) {
+            entry->second = epoch;
+            return false;
+        }
+        ++skipped;
+        return true;
+    }
+    std::uint64_t Skipped() const { return skipped; }
+
+private:
+    std::unordered_map<std::string, std::uint64_t> seen;
+    std::uint64_t epoch = 0;
+    std::uint64_t skipped = 0;
 };
 
 class Frames {
@@ -903,7 +955,7 @@ struct Replay {
 
 int usage() {
     std::fprintf(stderr, "usage: agc_frame_replay <capture directory> [--no-pace] [--no-release] [--release-after-ms <n>] [--strict] [--exact] [--frame-limit <n>] [--timeout-s <n>] [--wall-windows]\n"
-                         "                        [--no-bindless-prime] [--bindless-in <file>] [--bindless-out <file>]\n"
+                         "                        [--no-bindless-prime] [--bindless-in <file>] [--bindless-out <file>] [--dedupe-prologue]\n"
                          "                        [--dump <address>:<bytes>:<file>]...\n"
                          "  replays the driver calls and guest memory that APS5_FRAME_CAPTURE=<directory> recorded, through this\n"
                          "  build's AGC driver with no title running, and prints one JSON line with the frame times\n"
@@ -930,6 +982,7 @@ int usage() {
                          "  --no-bindless-prime the bindless heap starts empty (default: primed with the tables the capture's BindlessTables record lists)\n"
                          "  --bindless-in <f>   primes the bindless heap with the tables in <f> (a first replay's --bindless-out) before the frames\n"
                          "  --bindless-out <f>  writes the bindless tables registered by the end of the first replayed frame to <f>\n"
+                         "  --dedupe-prologue   skips prologue ABI resolutions identical to an earlier one with no registration or memory call between\n"
                          "  the shader cache's Vulkan pipeline cache file is loaded as the title loads it (APS5_PIPELINE_CACHE_LOAD=0 starts empty)\n");
     return 2;
 }
@@ -948,12 +1001,23 @@ Dump parseDump(std::string_view text) {
     return {number(text.substr(0, first)), number(text.substr(first + 1, second - first - 1)), std::filesystem::path(std::string(text.substr(second + 1)))};
 }
 
+// One write call per `chunk` bytes at most: a single ofstream::write of more than 2 GiB ends in the
+// CRT's _write, whose count is 32-bit, and never returns.
+constexpr std::uint64_t DumpChunkBytes = 256ull << 20u;
+
+bool writeChunked(std::ostream& file, const std::byte* bytes, std::uint64_t size, std::uint64_t chunk = DumpChunkBytes) {
+    for (std::uint64_t at = 0; at < size && file.good(); at += chunk) {
+        const auto part = std::min(chunk, size - at);
+        file.write(reinterpret_cast<const char*>(bytes + at), static_cast<std::streamsize>(part));
+    }
+    return file.good();
+}
+
 void writeDump(const Dump& dump) {
     auto* const pointer = reinterpret_cast<const std::byte*>(static_cast<std::uintptr_t>(dump.address));
     GuestArena::GuestArenaPrepareHostRead_nid_no_patch(pointer, static_cast<std::size_t>(dump.bytes));
     std::ofstream file(dump.path, std::ios::binary | std::ios::trunc);
-    file.write(reinterpret_cast<const char*>(pointer), static_cast<std::streamsize>(dump.bytes));
-    if (!file.good()) throw std::runtime_error("frame replay: cannot write " + dump.path.string());
+    if (!writeChunked(file, pointer, dump.bytes) || !file.flush().good()) throw std::runtime_error("frame replay: cannot write " + dump.path.string());
 }
 
 struct FrameCheck {
@@ -1071,10 +1135,12 @@ int run(const Options& options) {
     const auto frameStart = std::find_if(calls.begin(), calls.end(), [](const FrameCall& call) { return call.kind == FrameCallKind::FrameStart; });
     std::vector<const FrameMemoryChunk*> rewritten;
     const auto prologueStart = Clock::now();
+    PrologueDedupe dedupe;
     for (auto call = calls.begin(); call != frameStart; ++call) {
         if (call->kind == FrameCallKind::Memory) {
             if (const auto found = replay.groups.find(call->values.at(0)); found != replay.groups.end()) rewritten.insert(rewritten.end(), found->second.begin(), found->second.end());
         }
+        if (options.dedupePrologue && dedupe.Redundant(*call)) continue;
         replay.execute(*call);
     }
     if (!rewritten.empty()) restoreRewritten(reader, rewritten, replay.skipped);
@@ -1087,7 +1153,9 @@ int run(const Options& options) {
         replay.primeBindless(words);
     }
     if (replay.bindlessPrimed != 0) std::fprintf(stderr, "[frame-replay] bindless heap primed with %zu tables\n", replay.bindlessPrimed);
-    std::fprintf(stderr, "[frame-replay] prologue: %zu calls in %.1f s, %zu shader images rewritten and restored, %llu stale registrations\n", static_cast<std::size_t>(frameStart - calls.begin()),
+    const auto prologueSeconds = std::chrono::duration<double>(Clock::now() - prologueStart).count();
+    const auto prologueSkipped = dedupe.Skipped();
+    std::fprintf(stderr, "[frame-replay] prologue: %zu calls (%llu redundant resolutions skipped) in %.1f s, %zu shader images rewritten and restored, %llu stale registrations\n", static_cast<std::size_t>(frameStart - calls.begin()), static_cast<unsigned long long>(dedupe.Skipped()),
                  std::chrono::duration<double>(Clock::now() - prologueStart).count(), rewritten.size(), static_cast<unsigned long long>(replay.staleRegistrations.load()));
     if (options.frameWindows) AgcDriver::ProfileWindows::Close("prologue");
     replay.recording = true;
@@ -1149,13 +1217,13 @@ int run(const Options& options) {
     std::sort(frameMs.begin(), frameMs.end());
     const auto percentile = [&](double fraction) { return frameMs.empty() ? 0.0 : frameMs[std::min(frameMs.size() - 1, static_cast<std::size_t>(fraction * static_cast<double>(frameMs.size())))]; };
     const auto seconds = std::chrono::duration<double>(replay.endedAt - replay.startedAt).count();
-    std::printf("{\"frames\":%zu,\"replay_s\":%.3f,\"fps\":%.3f,\"frame_ms\":{\"p50\":%.3f,\"p90\":%.3f,\"max\":%.3f,\"each\":[%s]},\"submits\":%llu,\"delta_mib\":%.1f,\"pace_timeouts\":%llu,\"memory_pace_timeouts\":%llu,\"pace_wait_s\":%.3f,\"stale_registrations\":%llu,\"failed_registrations\":%llu,\"skipped_mib\":%.1f,\"threads\":%zu,\"released_waits\":%llu,\"of_them_from_earlier_writes\":%llu,\"of_them_synthesized\":%llu,\"unfinished\":%llu,\"frames_compared\":%zu,\"pixels_identical\":%.6f,\"max_channel_diff\":%d,\"load_s\":%.3f,\"frame_windows\":%zu,\"undrained_windows\":%zu,\"bindless_primed\":%zu,\"gaps\":\"%s\"}\n",
+    std::printf("{\"frames\":%zu,\"replay_s\":%.3f,\"fps\":%.3f,\"frame_ms\":{\"p50\":%.3f,\"p90\":%.3f,\"max\":%.3f,\"each\":[%s]},\"submits\":%llu,\"delta_mib\":%.1f,\"pace_timeouts\":%llu,\"memory_pace_timeouts\":%llu,\"pace_wait_s\":%.3f,\"stale_registrations\":%llu,\"failed_registrations\":%llu,\"skipped_mib\":%.1f,\"threads\":%zu,\"released_waits\":%llu,\"of_them_from_earlier_writes\":%llu,\"of_them_synthesized\":%llu,\"unfinished\":%llu,\"frames_compared\":%zu,\"pixels_identical\":%.6f,\"max_channel_diff\":%d,\"load_s\":%.3f,\"prologue_s\":%.3f,\"prologue_skipped\":%llu,\"frame_windows\":%zu,\"undrained_windows\":%zu,\"bindless_primed\":%zu,\"gaps\":\"%s\"}\n",
                 ready.size(), seconds, seconds > 0 ? static_cast<double>(ready.size()) / seconds : 0.0, percentile(0.5), percentile(0.9), frameMs.empty() ? 0.0 : frameMs.back(), frameList.c_str(),
                 static_cast<unsigned long long>(replay.submits.load()), static_cast<double>(replay.deltaBytes.load()) / (1024.0 * 1024.0), static_cast<unsigned long long>(replay.paceTimeouts.load()), static_cast<unsigned long long>(replay.memoryPaceTimeouts.load()),
                 replay.paceWaitedSeconds(), static_cast<unsigned long long>(replay.staleRegistrations.load()), static_cast<unsigned long long>(replay.failedRegistrations.load()),
                 static_cast<double>(replay.skipped.bytes) / (1024.0 * 1024.0), replay.threads, static_cast<unsigned long long>(replay.earlyReleases.load()), static_cast<unsigned long long>(replay.lateReleases.load()),
                 static_cast<unsigned long long>(replay.syntheticReleases.load()),
-                static_cast<unsigned long long>(replay.unfinished), check.compared, check.identical, check.maxDifference, std::chrono::duration<double>(loaded - loadStart).count(), replay.framesClosed.load(), replay.undrainedWindows.load(), replay.bindlessPrimed, gaps.c_str());
+                static_cast<unsigned long long>(replay.unfinished), check.compared, check.identical, check.maxDifference, std::chrono::duration<double>(loaded - loadStart).count(), prologueSeconds, static_cast<unsigned long long>(prologueSkipped), replay.framesClosed.load(), replay.undrainedWindows.load(), replay.bindlessPrimed, gaps.c_str());
     std::fflush(stdout);
     if (options.strict && !gaps.empty()) {
         std::fprintf(stderr, "agc_frame_replay: --strict rejects this replay: %s\n", gaps.c_str());
@@ -1182,6 +1250,7 @@ int main(int argc, char** argv) {
         else if (argument == "--dump" && index + 1 < argc) options.dumps.push_back(parseDump(argv[++index]));
         else if (argument == "--frames" && index + 1 < argc) options.frames = argv[++index];
         else if (argument == "--wall-windows") options.frameWindows = false;
+        else if (argument == "--dedupe-prologue") options.dedupePrologue = true;
         else if (argument == "--no-bindless-prime") options.bindlessPrime = false;
         else if (argument == "--bindless-in" && index + 1 < argc) options.bindlessIn = argv[++index];
         else if (argument == "--bindless-out" && index + 1 < argc) options.bindlessOut = argv[++index];

@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/CommandMix.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileWindows.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BindlessRegistrations.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GpuTimingUnion.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidentCensus.hpp"
 #include "IntermediateRepresentation/IrMetadata/ResourcePlan.hpp"
 #include "IntermediateRepresentation/IrValue.hpp"
@@ -207,6 +208,23 @@ void testBindlessCodec() {
     check(threw, "truncated words are refused");
 }
 
+void testGpuTimingUnion() {
+    namespace U = AgcDriver::Graphics::GpuTimingUnion;
+    check(U::UnionTicks({}) == 0, "no ranges, no ticks");
+    // Lane 0: [0,10) and [5,20) overlap inside one lane; lane 1: [15,30) overlaps lane 0, [40,50) does not.
+    const std::vector<U::Interval> lane0{{5, 20}, {0, 10}};
+    const std::vector<U::Interval> lane1{{15, 30}, {40, 50}};
+    check(U::UnionTicks(lane0) == 20 && U::UnionTicks(lane1) == 25, "per-lane unions");
+    auto both = lane0;
+    both.insert(both.end(), lane1.begin(), lane1.end());
+    check(U::UnionTicks(both) == 40, "the cross-lane union counts the overlap once");
+    check(U::UnionTicks({{7, 7}, {9, 3}}) == 0, "empty and reversed ranges add nothing");
+    const auto families = U::ParseFamilies("cloth:0x80001c0d00,80001abb00,zz;skin:0x8000196500;:0x1;none:");
+    check(families.size() == 2 && families[0].name == "cloth" && families[0].programs.size() == 2 && families[0].programs[1] == 0x80001abb00ull, "family list parsed");
+    const auto index = U::FamilyIndex(families);
+    check(index.at(0x80001c0d00ull) == 0 && index.at(0x8000196500ull) == 1 && !index.contains(0x1), "program to family");
+}
+
 void testFrameWindows() {
     using AgcDriver::ProfileWindows::ClockDue;
     auto past = std::chrono::steady_clock::now() - std::chrono::seconds(11);
@@ -237,6 +255,7 @@ int main(int argc, char** argv) {
         }
         if (mode == "all" || mode == "windows") testFrameWindows();
         if (mode == "all" || mode == "bindless_codec") testBindlessCodec();
+        if (mode == "all" || mode == "gputime_union") testGpuTimingUnion();
         std::puts("profile lines test passed");
         return 0;
     } catch (const std::exception& error) {

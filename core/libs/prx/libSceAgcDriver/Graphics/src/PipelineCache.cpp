@@ -51,6 +51,11 @@ PipelineCache::PipelineCache(const Context& context, const VkPhysicalDevicePrope
         char name[160];
         std::snprintf(name, sizeof(name), "vk-pipelines-%04x-%04x-%08x-%s.bin", properties.vendorID, properties.deviceID, properties.driverVersion, uuid.c_str());
         path = directory / version / name;
+        // APS5_PIPELINE_CACHE_DIR: the Vulkan pipeline cache file in another directory, while the shader
+        // cache stays where it is. A tool (agc_frame_replay) runs under its own NVIDIA shader store, whose
+        // compression dictionary differs from the game's: the pipelines it saves into the game's file
+        // cannot be read by the game, so tools keep their own file.
+        if (const char* own = std::getenv("APS5_PIPELINE_CACHE_DIR"); own != nullptr && own[0] != '\0') path = std::filesystem::path(own) / name;
     }
     std::vector<std::byte> initialData;
     if (!path.empty()) {
