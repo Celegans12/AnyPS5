@@ -247,6 +247,30 @@ void ExpectPublished(const Harness& harness, std::uint32_t index, const std::uin
     Expect(!GuestArena::GuestArenaAccessGuarded_nid_no_patch(harness.guest.Address(index)), std::string(site) + ": the guard stayed after the publish");
 }
 
+void WriteBackStampsCaches(const Harness& harness, std::uint32_t index) {
+    const auto address = harness.guest.Address(index);
+    std::array<std::uint32_t, 4> words{};
+    {
+        const std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        AgcDriver::GuestMemory::ReadCommitted(address, std::as_writable_bytes(std::span(words)));
+    }
+    const auto clean = AgcDriver::GuestMemory::NewestStamp(address, ResidencyPageBytes);
+    const auto stampsBefore = harness.driver.WriteBackStamps();
+    {
+        const std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        AgcDriver::GuestMemory::ReadCommitted(address, std::as_writable_bytes(std::span(words)));
+    }
+    Expect(AgcDriver::GuestMemory::NewestStamp(address, ResidencyPageBytes) == clean && harness.driver.WriteBackStamps() == stampsBefore, "stamps: a read with nothing written back changed the page's stamp (a cache hit lost)");
+    if (!Admitted(harness, index, 0x55555555u, "stamps")) return;
+    {
+        const std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        AgcDriver::GuestMemory::ReadCommitted(address, std::as_writable_bytes(std::span(words)));
+    }
+    Expect(words[0] == 0x55555555u, "stamps: the publish did not read the GPU's bytes");
+    Expect(harness.driver.WriteBackStamps() > stampsBefore, "stamps: the write-back stamped nothing");
+    Expect(AgcDriver::GuestMemory::NewestStamp(address, ResidencyPageBytes) > clean, "stamps: a written-back page kept its stamp, so a snapshot cached over the old bytes would still hit");
+}
+
 void DriverSites(const Harness& harness, std::uint32_t first) {
     {
         const char* site = "GuestMemory::ReadCommitted under the GPU mutex";
@@ -357,6 +381,7 @@ int main(int argc, char** argv) {
                 DriverReadOpensGuard(harness, 5);
             }
             DriverSites(harness, 6);
+            WriteBackStampsCaches(harness, 10);
             const std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
             device->SubmitRecorded(false);
             device->WaitIdle();

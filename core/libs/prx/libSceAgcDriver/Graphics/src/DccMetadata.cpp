@@ -485,6 +485,13 @@ namespace {
 DccKeys readDccKeys(std::uint64_t metaAddress, std::size_t count, bool& memoized) {
     memoized = false;
     if (metaAddress == 0 || count == 0 || !GuestMemory::Accessible(reinterpret_cast<const void*>(metaAddress), count)) return DccKeys::Unreadable;
+    if (GuestMemory::GpuOwned(metaAddress, count)) {
+        if (!GuestMemory::GpuMutex().HeldByThisThread()) {
+            memoized = true;
+            return DccKeys::Mixed;
+        }
+        GuestMemory::GuardRead(metaAddress, count);
+    }
     // A driver store still pending on the GPU is not in the bytes yet.
     if (const auto memo = MemoizedKeys(metaAddress, metaAddress + count)) {
         memoized = true;
@@ -503,13 +510,6 @@ DccKeys readDccKeys(std::uint64_t metaAddress, std::size_t count, bool& memoized
             Recorder::CountSync(2);
             recorder->SyncThrough(metaAddress, count);
         }
-    }
-    if (GuestMemory::GpuOwned(metaAddress, count)) {
-        if (!GuestMemory::GpuMutex().HeldByThisThread()) {
-            memoized = true;
-            return DccKeys::Mixed;
-        }
-        GuestMemory::GuardRead(metaAddress, count);
     }
     const auto* keys = reinterpret_cast<const std::uint8_t*>(metaAddress);
     const auto first = keys[0];

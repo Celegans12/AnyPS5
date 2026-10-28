@@ -132,12 +132,13 @@ void ResidencyDriver::EnableFaults() {
     GuestMemory::SetGpuOwnedHooks(
         [](std::uint64_t address, std::size_t bytes) {
             auto* driver = ResidencyDriver::Active();
-            return driver != nullptr && driver->manager.AnyDirty() && driver->manager.DirtyIn(address, bytes);
+            return driver != nullptr && ((driver->manager.AnyDirty() && driver->manager.DirtyIn(address, bytes)) || driver->stampPending(address, bytes));
         },
         [](std::uint64_t address, std::size_t bytes) {
             auto* driver = ResidencyDriver::Active();
             if (driver == nullptr) return;
             driver->manager.FlushForCpuRead(address, bytes);
+            driver->stampWrittenBack(address, bytes, false);
             driver->driverPublishes.fetch_add(1, std::memory_order_relaxed);
         });
 }
@@ -182,6 +183,7 @@ std::unique_ptr<ResidencyDriver> ResidencyDriver::CreateIfEnabled(const Context&
 }
 
 void ResidencyDriver::OrderingPoint() {
+    stampWrittenBack(0, 0, true);
     if (const auto written = guest.WrittenSince(manager.ResidentGenerations()); !written.empty()) manager.QueueCpuWritten(written);
     if (!manager.Advance()) return;
     std::unique_lock lock(GuestMemory::GpuMutex(), std::defer_lock);
@@ -244,7 +246,48 @@ ResidencyToken ResidencyDriver::CopyIn(std::span<const ResidencyCopy> copies) {
 }
 
 ResidencyToken ResidencyDriver::WriteBack(std::span<const ResidencyCopy> copies) {
-    return record(copies, false);
+    const auto token = record(copies, false);
+    if (copies.empty()) return token;
+    PendingStamp pending{token, {}};
+    for (const auto& copy : copies) pending.ranges.emplace_back((copy.page << ResidencyPageShift) + copy.offset, copy.bytes);
+    const std::lock_guard lock(stampMutex);
+    pendingStamps.push_back(std::move(pending));
+    stampsPending.store(true, std::memory_order_release);
+    return token;
+}
+
+bool ResidencyDriver::stampPending(std::uint64_t address, std::size_t bytes) {
+    if (!stampsPending.load(std::memory_order_acquire)) return false;
+    const std::lock_guard lock(stampMutex);
+    for (const auto& pending : pendingStamps) {
+        for (const auto& [begin, length] : pending.ranges) {
+            if (begin < address + bytes && address < begin + length) return true;
+        }
+    }
+    return false;
+}
+
+void ResidencyDriver::stampWrittenBack(std::uint64_t address, std::size_t bytes, bool all) {
+    if (!stampsPending.load(std::memory_order_acquire)) return;
+    std::vector<PendingStamp> due;
+    {
+        const std::lock_guard lock(stampMutex);
+        for (auto at = pendingStamps.begin(); at != pendingStamps.end();) {
+            const bool overlaps = std::any_of(at->ranges.begin(), at->ranges.end(), [&](const auto& range) { return range.first < address + bytes && address < range.first + range.second; });
+            if ((all && tokens.Reached(at->token)) || (!all && overlaps)) {
+                due.push_back(std::move(*at));
+                at = pendingStamps.erase(at);
+            } else {
+                ++at;
+            }
+        }
+        stampsPending.store(!pendingStamps.empty(), std::memory_order_release);
+    }
+    for (const auto& pending : due) {
+        Wait(pending.token);
+        for (const auto& [begin, length] : pending.ranges) GuestMemory::MarkWritten(begin, static_cast<std::size_t>(length));
+        writeBackStamps.fetch_add(pending.ranges.size(), std::memory_order_relaxed);
+    }
 }
 
 ResidencyToken ResidencyDriver::record(std::span<const ResidencyCopy> copies, bool intoMirror) {

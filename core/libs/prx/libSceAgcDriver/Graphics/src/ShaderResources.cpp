@@ -7419,6 +7419,14 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             stamp = {GuestMemory::TrackerGeneration(), GuestMemory::CollectEpoch(), registryGeneration};
             stamped = true;
         }
+        if (GuestMemory::GpuOwned(begin, bytes)) {
+            GuestMemory::GuardRead(begin, bytes);
+            stamped = false;
+        }
+        if (!stamped) {
+            stamp = {GuestMemory::TrackerGeneration(), GuestMemory::CollectEpoch(), registryGeneration};
+            stamped = true;
+        }
         VkDeviceSize offset = 0;
         auto buffer = recorder.UnwrittenDrawSnapshot(begin, bytes, stamp, &offset);
         static const bool verifySnapshots = std::getenv("APS5_VERIFY_DRAW_SNAPSHOTS") != nullptr;
@@ -7447,7 +7455,6 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             const bool uploaded = bytes != 0 && bytes <= uploadLimit;
             if (uploaded) {
                 auto slice = recorder.DrawUpload(bytes);
-                GuestMemory::GuardRead(begin, bytes);
                 std::memcpy(slice.bytes, reinterpret_cast<const void*>(begin), bytes);
                 buffer = std::move(slice.buffer);
                 offset = slice.offset;
@@ -7474,7 +7481,6 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                     }
                     const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::ShaderResources);
                     buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-                    GuestMemory::GuardRead(begin, bytes);
                     std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
                     if (!owned) recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, buffer);
                     else if (armed) recorder.KeepOwnedDrawSnapshot(begin, bytes, std::move(words), since, registryGeneration, forgetSerial, buffer);
