@@ -343,6 +343,30 @@ void testAliasedPages(const std::filesystem::path& directory) {
 }
 #endif
 
+// --dedupe-prologue: only resolutions identical to one since the last registration or memory call.
+void testPrologueDedupe() {
+    const auto resolve = [](std::uint64_t address, std::uint32_t context) {
+        FrameCall call;
+        call.kind = FrameCallKind::ResolveShaderAbi;
+        call.address = address;
+        call.context = {ShaderRegister{0x200, context}};
+        return call;
+    };
+    FrameCall registration;
+    registration.kind = FrameCallKind::RegisterShader;
+    FrameCall memory = memoryCall(1, 0);
+    PrologueDedupe dedupe;
+    check(!dedupe.Redundant(resolve(0x1000, 1)), "the first resolution is executed");
+    check(dedupe.Redundant(resolve(0x1000, 1)), "an identical repeat is skipped");
+    check(!dedupe.Redundant(resolve(0x1000, 2)), "other registers are a different resolution");
+    check(!dedupe.Redundant(registration), "a registration is never skipped");
+    check(!dedupe.Redundant(resolve(0x1000, 1)), "a repeat after a registration is executed");
+    check(dedupe.Redundant(resolve(0x1000, 1)), "and its repeat skipped again");
+    check(!dedupe.Redundant(memory), "a memory call is never skipped");
+    check(!dedupe.Redundant(resolve(0x1000, 1)), "a repeat after a memory call is executed");
+    check(dedupe.Skipped() == 2, "two skipped");
+}
+
 // writeDump's chunked write: every byte, in order, with several calls.
 void testDumpChunks() {
     std::vector<std::byte> bytes(10000);
@@ -364,6 +388,7 @@ int main(int argc, char** argv) {
         else if (mode == "zero") testReusedMemory(directory);
         else if (mode == "tokens") testEopTokens();
         else if (mode == "dump_chunks") testDumpChunks();
+        else if (mode == "dedupe") testPrologueDedupe();
         else if (mode == "blocking") testBlockingSubmission(directory);
         else if (mode == "shader" || mode == "shader_host") testShaderCode(directory, mode == "shader_host");
         else if (mode == "shader_prologue") testPrologueHeader(directory);
