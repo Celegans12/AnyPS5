@@ -33,6 +33,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -530,6 +531,7 @@ struct Replay {
         bool known = false;
     };
     std::vector<LabelWrite> labelWrites;
+    std::map<std::uint64_t, std::uint64_t> waitOrdinals;
     std::atomic<std::uint64_t> parkedReleases{0};
     std::atomic<std::uint64_t> fallbackReleases{0};
     std::atomic<bool> parkedWithoutRelease{false};
@@ -713,7 +715,7 @@ struct Replay {
             return;
         case FrameCallKind::Submit: {
             const Packet packet{reinterpret_cast<std::uint32_t*>(static_cast<std::uintptr_t>(call.address)), static_cast<std::uint32_t>(call.size), static_cast<std::uint8_t>(call.flags), {}};
-            if (recording && options.exact) noteLabelWrites(call.address, call.size, 0);
+            if (recording && options.exact) noteLabelWrites(call.address, call.size, 0, call.ordinal);
             if (call.queue == 0) sceAgcDriverSubmitDcb(&packet);
             else sceAgcDriverSubmitAcb(call.queue, &packet);
             if (++submits % 25 == 0) report();
@@ -837,11 +839,12 @@ struct Replay {
         }
     }
 
-    void noteLabelWrites(std::uint64_t address, std::uint64_t dwords, int depth) {
+    void noteLabelWrites(std::uint64_t address, std::uint64_t dwords, int depth, std::uint64_t ordinal) {
         if (address < 0x1000 || address >> 48 != 0 || dwords == 0 || dwords > 0xfffff || depth > 8) return;
         const auto* const words = reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(address));
         const auto at48 = [](std::uint32_t low, std::uint32_t high) { return low | static_cast<std::uint64_t>(high & 0xffff) << 32; };
         std::vector<LabelWrite> found;
+        std::vector<std::uint64_t> waits;
         for (std::uint64_t at = 0; at < dwords;) {
             const auto header = words[at];
             if (header >> 30 != 3) {
@@ -879,16 +882,20 @@ struct Replay {
                 break;
             case 0x33:
             case 0x3f:
-                if (length >= 3) noteLabelWrites(at48(body[0] & ~3u, body[1]), body[2] & 0xfffff, depth + 1);
+                if (length >= 3) noteLabelWrites(at48(body[0] & ~3u, body[1]), body[2] & 0xfffff, depth + 1, ordinal);
+                break;
+            case 0x3c:
+                if (length >= 5 && (body[0] >> 4) & 1) waits.push_back(at48(body[1] & ~3u, body[2]));
                 break;
             default:
                 break;
             }
             at += 1 + length;
         }
-        if (found.empty()) return;
+        if (found.empty() && waits.empty()) return;
         std::lock_guard lock(memoryMutex);
         labelWrites.insert(labelWrites.end(), found.begin(), found.end());
+        for (const auto wait : waits) waitOrdinals.emplace(wait, ordinal);
     }
 
     bool writerInWindow(const AgcDriver::AwaitedWait& wait) const {
@@ -933,10 +940,11 @@ struct Replay {
         std::array<AgcDriver::AwaitedWait, 64> awaited{};
         const auto count = AgcDriverAwaitedWaits_nid_postfix(awaited.data(), awaited.size());
         if (options.exact) {
-            std::array<std::pair<std::size_t, std::uint64_t>, 64> keys{};
+            std::array<std::tuple<std::size_t, std::uint64_t, std::uint64_t>, 64> keys{};
             std::array<std::size_t, 64> order{};
             for (std::size_t slot = 0; slot < count; ++slot) {
-                keys[slot] = {awaited[slot].address == 0 ? calls.size() + 1 : recordedIndex(calls, from, awaited[slot]), awaited[slot].address};
+                const auto waiting = waitOrdinals.find(awaited[slot].address);
+                keys[slot] = {awaited[slot].address == 0 ? calls.size() + 1 : recordedIndex(calls, from, awaited[slot]), waiting == waitOrdinals.end() ? ~std::uint64_t{0} : waiting->second, awaited[slot].address};
                 order[slot] = slot;
             }
             std::sort(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(count), [&](std::size_t left, std::size_t right) { return keys[left] < keys[right]; });
@@ -1145,7 +1153,8 @@ int usage() {
                          "                      awaited dwords when every replay thread is parked and the driver is blocked on waits, in capture order,\n"
                          "                      one dword per parked state once no replay thread is still pacing, so queues released past the\n"
                          "                      window's end do not run beside each other; a dword that a submitted packet of the window writes\n"
-                         "                      (RELEASE_MEM, EVENT_WRITE_EOP, WRITE_DATA, COPY_DATA, ATOMIC_MEM, DMA_DATA) is synthesized last\n"
+                         "                      (RELEASE_MEM, EVENT_WRITE_EOP, WRITE_DATA, COPY_DATA, ATOMIC_MEM, DMA_DATA) is synthesized last;\n"
+                         "                      synthesized dwords go in the capture order of the submission that waits on them\n"
                          "  --frame-limit <n>   replays the calls through the n-th CPU flip, or the n-th suspend point when the title flips from the GPU,\n"
                          "                      and compares the display buffer with the title's image at that frame\n"
                          "  --checkpoint <csv>  replays up to the checkpoint of a capture made with APS5_FRAME_CAPTURE_CHECKPOINT=<frame> and lists\n"
