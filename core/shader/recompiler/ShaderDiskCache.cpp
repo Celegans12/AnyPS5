@@ -141,7 +141,7 @@ constexpr std::size_t fieldCount() {
     }
 }
 
-static_assert(fieldCount<ShaderInfo>() == 24, "ShaderInfo changed: update the info encoder");
+static_assert(fieldCount<ShaderInfo>() == 26, "ShaderInfo changed: update the info encoder");
 static_assert(fieldCount<BufferResource>() == 12, "BufferResource changed: update the info encoder");
 static_assert(fieldCount<ImageResource>() == 44, "ImageResource changed: update the info encoder");
 static_assert(fieldCount<SamplerResource>() == 8, "SamplerResource changed: update the info encoder");
@@ -885,6 +885,12 @@ void encodeShaderInfo(Writer& writer, const ShaderInfo& info) {
     writer.Value(info.usesDma);
     writer.Value(info.bdaWrites);
     writer.Value(info.usesFaultBuffer);
+    writer.List(info.bufferStores, [](Writer& out, const BufferStoreSite& site) {
+        out.Value(site.source);
+        out.Value(site.soffset);
+        out.Value(site.dynamicSoffset);
+    });
+    writer.Value(info.unboundedStores);
     writer.Value(info.dispatchThreadLimit);
     writer.Value(info.rasterPrimitive);
     writer.Value(info.layerExported);
@@ -996,6 +1002,12 @@ void decodeShaderInfo(Reader& reader, ShaderInfo& info) {
     reader.Value(info.usesDma);
     reader.Value(info.bdaWrites);
     reader.Value(info.usesFaultBuffer);
+    reader.List(info.bufferStores, 9, [](Reader& in, BufferStoreSite& site) {
+        in.Value(site.source);
+        in.Value(site.soffset);
+        in.Value(site.dynamicSoffset);
+    });
+    reader.Value(info.unboundedStores);
     reader.Value(info.dispatchThreadLimit);
     reader.Value(info.rasterPrimitive);
     reader.Value(info.layerExported);

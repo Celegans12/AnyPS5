@@ -9,6 +9,14 @@
 
 namespace ShaderRecompiler {
 
+struct BufferStoreSite {
+    std::uint32_t source = 0;
+    std::uint32_t soffset = 0;
+    bool dynamicSoffset = false;
+
+    bool operator==(const BufferStoreSite& other) const = default;
+};
+
 struct ShaderInfo {
     std::uint32_t scratchDwords = 0;
     std::uint32_t sharedMemoryBytes = 0;
@@ -34,6 +42,8 @@ struct ShaderInfo {
     bool usesDma = false;
     bool bdaWrites = false;
     bool usesFaultBuffer = false;
+    std::vector<BufferStoreSite> bufferStores;
+    bool unboundedStores = false;
     bool dispatchThreadLimit = false;
     bool rasterPrimitive = false;
     bool layerExported = false;

@@ -111,6 +111,8 @@ public:
         m_info.sampledPairs.clear();
         m_info.usesDma = false;
         m_info.bdaWrites = false;
+        m_info.bufferStores.clear();
+        m_info.unboundedStores = false;
     }
 
     void Run() {
@@ -2226,6 +2228,20 @@ private:
         std::uint32_t badDword = 0;
         auto& memory = m_program.Resources().memoryInfo[memoryIndex];
         const auto access = BufferAccessOf(inst.Opcode());
+        // Store sites (fable-void 199df9abf2, adapted): every buffer store or atomic names the V# it goes through and
+        // its soffset, so the materializer can evaluate the V# at record time and the result carries the ranges the
+        // stores can reach (writeRanges). A V# that does not validate keeps the whole space (unboundedStores).
+        if (access == BufferAccess::Write || access == BufferAccess::Atomic) {
+            std::uint32_t badStoreDword = 0;
+            if (ValidateSource(descriptor, badStoreDword)) {
+                const IrValue* soffset = inst.ArgumentCount() > 3u ? inst.Argument(3u)->Resolve() : nullptr;
+                const bool immediate = soffset != nullptr && soffset->HasImmediate() && soffset->Type() == IrType::U32;
+                const BufferStoreSite site{InternSource(descriptor), immediate ? soffset->ImmediateU32() : 0u, !immediate};
+                if (std::ranges::find(m_info.bufferStores, site) == m_info.bufferStores.end()) m_info.bufferStores.push_back(site);
+            } else {
+                m_info.unboundedStores = true;
+            }
+        }
         if (ValidateSource(descriptor, badDword)) {
             const auto source = InternSource(descriptor);
             const auto resource = AddBuffer(source, memory, inst.Opcode(), inst.Flags<MemoryFlags>().pc);
@@ -2238,6 +2254,8 @@ private:
         memory.gpuDescriptor = true;
         m_info.usesDma = true;
         m_info.bdaWrites = m_info.bdaWrites || access == BufferAccess::Write || access == BufferAccess::Atomic;
+        // fable records the site here, on its GPU-descriptor path, which every buffer access takes there. Here this
+        // path is reached only by a V# that did not validate, so its stores are unbounded (recorded above).
         return true;
     }
 
@@ -2492,6 +2510,7 @@ private:
             }
             m_info.usesDma = true;
             m_info.bdaWrites = m_info.bdaWrites || addressInfo.access == AddressAccess::Write || addressInfo.access == AddressAccess::Atomic;
+            m_info.unboundedStores = m_info.unboundedStores || addressInfo.access == AddressAccess::Write || addressInfo.access == AddressAccess::Atomic;
             return;
         }
 

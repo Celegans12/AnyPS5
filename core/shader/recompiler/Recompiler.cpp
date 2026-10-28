@@ -656,6 +656,23 @@ std::array<std::uint32_t, 3> partialThreads(const RecompileRequest& request) {
     return request.context.compute ? request.context.compute->partialThreads : std::array<std::uint32_t, 3>{};
 }
 
+std::optional<std::pair<std::uint64_t, std::uint64_t>> BufferStoreExtent(const DescriptorValue& value, const BufferStoreSite& site) {
+    if (value.dwordCount != 4u) return std::nullopt;
+    const auto word1 = value.dwords[1];
+    const auto records = value.dwords[2];
+    const auto word3 = value.dwords[3];
+    const auto base = static_cast<std::uint64_t>(value.dwords[0]) | (static_cast<std::uint64_t>(word1 & 0xffffu) << 32u);
+    const std::pair<std::uint64_t, std::uint64_t> none{0u, 0u};
+    if ((word3 >> 30u) != 0u || base == 0u || records == 0u) return none;
+    const auto stride = (word1 >> 16u) & 0x3fffu;
+    if (stride != 0u && (word1 >> 31u) != 0u) return std::nullopt;
+    const auto mode = (word3 >> 28u) & 3u;
+    if (mode == 3u) return std::pair<std::uint64_t, std::uint64_t>{base, base + records};
+    if (mode != 0u || site.dynamicSoffset) return std::nullopt;
+    if (stride == 0u) return none;
+    return std::pair<std::uint64_t, std::uint64_t>{base, base + static_cast<std::uint64_t>(records) * stride + site.soffset + 16u};
+}
+
 std::uint64_t nextVariantId() {
     static std::atomic<std::uint64_t> variants{0};
     return variants.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -1671,6 +1688,13 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
     }
     result.shaderDataUserWords = std::move(bindings.shaderDataUserWords);
     result.poisonedSrtReads = static_cast<std::uint32_t>(snapshot.srtPoison.size()) + snapshot.nullRootReads;
+    result.unboundedWrites = variant.info.info.unboundedStores || snapshot.stores.size() != variant.info.info.bufferStores.size();
+    result.writeRanges.clear();
+    for (std::size_t store = 0; store < snapshot.stores.size() && store < variant.info.info.bufferStores.size(); ++store) {
+        const auto range = BufferStoreExtent(snapshot.stores[store], variant.info.info.bufferStores[store]);
+        if (!range.has_value()) result.unboundedWrites = true;
+        else if (range->second > range->first) result.writeRanges.push_back(*range);
+    }
     if (!tables.map.empty()) {
         result.imageTablePoison.reserve(tables.poison.size());
         for (const auto& poison : tables.poison) result.imageTablePoison.push_back({poison.words, poison.dwordCount, poison.resource, static_cast<std::uint32_t>(poison.reason)});
