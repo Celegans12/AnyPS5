@@ -382,6 +382,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ResidencyRecorderLanes.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ResidencyDriver.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ResidencyGuest.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ResidencySession.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/BdaResources.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/BufferAddress.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderValidation.cpp
