@@ -23,6 +23,7 @@
 #include <memory>
 #include <mutex>
 #include <array>
+#include <deque>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -1705,6 +1706,22 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     const DropReleasedDependents dropAfterUnlock;
     const SampledCacheLock lock(cache);
     dropUncachedViews(cache);
+    // Diagnostic (APS5_TRACE_SAMPLED_ADDR=<hex surface address>): the lookup's decisions for one surface: the pending
+    // image found, its filled keys, the keys read, whether the keys' fill overrides it, and the cache entry found.
+    static const std::uint64_t traceAddress = [] { const char* text = std::getenv("APS5_TRACE_SAMPLED_ADDR"); return text != nullptr ? std::strtoull(text, nullptr, 16) : 0ull; }();
+    if (traceAddress != 0 && traceAddress == address) {
+        const auto found = findTexture(cache, key);
+        static int traced = 0;
+        if (traced++ < 40) {
+            std::fprintf(stderr, "[sampled-trace] 0x%llx %ux%u fmt %u dcc 0x%llx words %08x %08x %08x %08x %08x %08x %08x %08x: pending image %s (filled keys %s), keys %s, clear through keys %d, source %s; entry %s",
+                static_cast<unsigned long long>(address), resource.width, resource.height, resource.format, static_cast<unsigned long long>(resource.dccAddress),
+                words.size() > 0 ? words[0] : 0, words.size() > 1 ? words[1] : 0, words.size() > 2 ? words[2] : 0, words.size() > 3 ? words[3] : 0, words.size() > 4 ? words[4] : 0, words.size() > 5 ? words[5] : 0, words.size() > 6 ? words[6] : 0, words.size() > 7 ? words[7] : 0,
+                pendingSource != nullptr ? "yes" : "no", pendingSource != nullptr ? DccKeysName(pendingSource->FilledKeys()) : "-", keys.has_value() ? DccKeysName(*keys) : "unread", clearThroughKeys ? 1 : 0, source != nullptr ? "kept" : "none",
+                found != cache.entries.end() ? (found->source != nullptr ? "view" : "snapshot") : "none");
+            if (found != cache.entries.end()) std::fprintf(stderr, " (keys %s, bytes match %d)", DccKeysName(found->keys), found->bytes == guestBytes ? 1 : 0);
+            std::fprintf(stderr, "\n");
+        }
+    }
     if (auto it = findTexture(cache, key); it != cache.entries.end()) {
         // Held while the hit is checked: a refresh below may allocate, and an out-of-memory reclaim
         // on this thread (ReclaimTextureMemory) then passes over the entry as in use.
@@ -1938,6 +1955,45 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             entry.blockGuard = untrackedGuard(address, bytes);
             entry.blockSince = (entry.blockGuard[0] & 1u) == 0 ? untrackedBaseline(address, bytes, entry.blockLayout) : 0;
         }
+        if (traceAddress != 0 && traceAddress == address) {
+            static int tracedSnapshots = 0;
+            if (tracedSnapshots++ < 40) {
+                std::fprintf(stderr, "[sampled-trace] SNAPSHOT 0x%llx %ux%u fmt %u dcc 0x%llx: pending image %s (filled keys %s), keys %s, clear through keys %d, drop reason %s, live image %d, staged flushed %d, slice copy %d\n",
+                    static_cast<unsigned long long>(address), resource.width, resource.height, resource.format, static_cast<unsigned long long>(resource.dccAddress), pendingSource != nullptr ? "yes" : "no",
+                    pendingSource != nullptr ? DccKeysName(pendingSource->FilledKeys()) : "-", DccKeysName(*keys), clearThroughKeys ? 1 : 0, dropReason != nullptr ? dropReason : "-",
+                    StorageTexture::FindLive(address, guestBytes) != nullptr ? 1 : 0, stagedFlushed ? 1 : 0, sliceCopy ? 1 : 0);
+            }
+        }
+        // C61: a snapshot read through whole-surface DCC clear keys holds nothing but the clear (ReadTextureSurface
+        // fills it, no guest byte is read), so it is a function of the descriptor, the keys and the size: one
+        // built before is reused instead of filling and uploading again. Yotei's menu samples a 1080p surface
+        // cleared to 0000 every frame, alternately as a view of its storage image and as this snapshot, so the
+        // cache entry flips between the two and the 8.4 MiB clear was rebuilt each frame (2.3 ms, best391-399).
+        // The four constant clears only (a register clear's texels are not a function of the keys). Kept under the
+        // sampled cache lock, strong references, 8 at most. APS5_NO_CLEAR_SNAPSHOT_REUSE=1 (runtime
+        // switch) builds each one.
+        struct ClearSnapshot {
+            TextureKey key;
+            DccKeys keys;
+            std::uint64_t guestBytes;
+            std::shared_ptr<Texture> texture;
+        };
+        static std::deque<ClearSnapshot> clearSnapshots;
+        const bool clearReuse = IsDccClear(*keys) && *keys != DccKeys::ClearRegister && !RuntimeSwitches::Set(RuntimeSwitch::NoClearSnapshotReuse);
+        std::shared_ptr<Texture> reusedClear;
+        if (clearReuse) {
+            const auto found = std::find_if(clearSnapshots.begin(), clearSnapshots.end(), [&](const ClearSnapshot& held) { return held.key == key && held.keys == *keys && held.guestBytes == guestBytes && !held.texture->Spilled(); });
+            if (found != clearSnapshots.end()) {
+                reusedClear = found->texture;
+                std::rotate(clearSnapshots.begin(), found, found + 1);
+            }
+        }
+        if (reusedClear != nullptr) {
+            entry.texture = std::move(reusedClear);
+            entry.accounted = entry.texture->AllocationBytes();
+            static std::atomic<std::uint64_t> clearReuses{0};
+            clearReuses.fetch_add(1, std::memory_order_relaxed);
+        } else {
         std::vector<std::byte> snapshot(bytes);
         ReadTextureSurface(resource, *keys, snapshot);
         if (!pending) entry.untracked = untracked;
@@ -1964,6 +2020,11 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         }
         entry.accounted = entry.texture->AllocationBytes();
         counters.snapshots.fetch_add(1, std::memory_order_relaxed);
+        if (clearReuse && !entry.texture->Spilled()) {
+            clearSnapshots.push_front({key, *keys, guestBytes, entry.texture});
+            if (clearSnapshots.size() > 8) clearSnapshots.pop_back();
+        }
+        }
     }
     auto texture = entry.texture;
     texture->NoteUse(useSerial());
