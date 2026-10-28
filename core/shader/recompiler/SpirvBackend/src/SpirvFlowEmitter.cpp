@@ -105,7 +105,7 @@ void EmitReturnTerminator(SpirvValueEmitContext& ctx) {
         const auto masked = Binary(state, spv::OpBitwiseAnd, TypeU32(state), reference, ConstantU32(state, 0xffu));
         const auto offset = state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::StencilReferenceOffset, state.program.Metadata().bindings.stencilReferenceDword);
         const auto pointer = state.module.AllocateId();
-        state.module.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state), pointer, state.pushConstantVariable, ConstantU32(state, 0u), offset);
+        state.module.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state), pointer, state.pushConstantVariable, PushDataMember(state), offset);
         const auto expected = state.module.AllocateId();
         state.module.AddFunction(spv::OpLoad, TypeU32(state), expected, pointer);
         EmitKillIfBoolFalse(state, Binary(state, spv::OpIEqual, TypeBool(state), masked, expected));

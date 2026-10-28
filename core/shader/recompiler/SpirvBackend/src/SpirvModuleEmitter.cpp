@@ -859,7 +859,7 @@ std::uint32_t RemapPositionDepth(SpirvEmitterState& state, std::uint32_t positio
     if (state.pushConstantVariable == 0u) throw std::runtime_error("depth remap push constants were not declared");
     const auto pushFloat = [&](std::uint32_t dword) {
         const auto pointer = state.module.AllocateId();
-        state.module.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state), pointer, state.pushConstantVariable, ConstantU32(state, 0u), ConstantU32(state, DepthRemapPushOffsetBytes / 4u + dword));
+        state.module.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state), pointer, state.pushConstantVariable, PushDataMember(state), ConstantU32(state, DepthRemapPushOffsetBytes / 4u + dword));
         const auto bits = state.module.AllocateId();
         state.module.AddFunction(spv::OpLoad, u32, bits, pointer);
         const auto value = state.module.AllocateId();
@@ -1928,7 +1928,7 @@ std::uint32_t EmitMeshDrawParameter(SpirvValueEmitContext& ctx, const IrValue& i
         ctx.Fail(inst, "invalid mesh draw parameter");
     }
     const auto pointer = state.module.AllocateId();
-    state.module.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state), pointer, state.pushConstantVariable, ConstantU32(state, 0u), ConstantU32(state, MeshDrawPushOffsetBytes / 4u + index));
+    state.module.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state), pointer, state.pushConstantVariable, PushDataMember(state), ConstantU32(state, MeshDrawPushOffsetBytes / 4u + index));
     const auto result = state.module.AllocateId();
     state.module.AddFunction(spv::OpLoad, TypeU32(state), result, pointer);
     return result;
@@ -1939,7 +1939,7 @@ namespace {
 std::uint32_t MeshArgumentAddress(SpirvEmitterState& state) {
     const auto push = [&](std::uint32_t dword) {
         const auto pointer = state.module.AllocateId();
-        state.module.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state), pointer, state.pushConstantVariable, ConstantU32(state, 0u), ConstantU32(state, MeshDrawPushOffsetBytes / 4u + dword));
+        state.module.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state), pointer, state.pushConstantVariable, PushDataMember(state), ConstantU32(state, MeshDrawPushOffsetBytes / 4u + dword));
         const auto value = state.module.AllocateId();
         state.module.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
         return Unary(state, spv::OpUConvert, TypeScalarU64(state), value);
@@ -2013,7 +2013,7 @@ namespace {
 
 std::uint32_t TessellationLevel(SpirvEmitterState& state, std::uint32_t index) {
     const auto pointer = state.module.AllocateId();
-    state.module.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state), pointer, state.pushConstantVariable, ConstantU32(state, 0u), ConstantU32(state, TessellationLevelPushOffsetBytes / 4u + index));
+    state.module.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state), pointer, state.pushConstantVariable, PushDataMember(state), ConstantU32(state, TessellationLevelPushOffsetBytes / 4u + index));
     const auto word = state.module.AllocateId();
     state.module.AddFunction(spv::OpLoad, TypeU32(state), word, pointer);
     const auto level = state.module.AllocateId();

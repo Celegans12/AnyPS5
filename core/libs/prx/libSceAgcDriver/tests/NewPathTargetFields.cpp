@@ -1,6 +1,6 @@
 // agc_new_path_target_fields_tests: SpirvTarget::newPathResolved and bdaSegments (S4 epoch 1, piece 1) are part of the
-// recompile cache key, survive request serialization (v49), and a request asking for them is refused until their
-// emission exists, so no module built today's way is ever cached under their key.
+// recompile cache key and survive request serialization (v49). bdaSegments is refused until its emission exists, so no
+// module built today's way is ever cached under its key; newPathResolved recompiles (the page-table walk, compute).
 #include "BdaAbi.hpp"
 #include "CacheKey.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
@@ -69,8 +69,9 @@ int main() try {
         Expect(read.request.target.newPathResolved == resolved && read.request.target.bdaSegments == segments, "the new-path target fields did not survive request serialization");
     }
     Expect(!Refused(false, false), "a request without the new-path fields was refused");
-    Expect(Refused(true, false) && Refused(false, true), "a request with a new-path target field recompiled before its emission exists");
-    std::puts("NewPathTargetFields: newPathResolved and bdaSegments are keyed, serialized, and refused until implemented");
+    Expect(!Refused(true, false), "a compute request with newPathResolved was refused");
+    Expect(Refused(false, true) && Refused(true, true), "a request with bdaSegments recompiled before its emission exists");
+    std::puts("NewPathTargetFields: newPathResolved and bdaSegments are keyed and serialized; bdaSegments is refused until implemented");
     return 0;
 } catch (const std::exception& error) {
     std::fprintf(stderr, "NewPathTargetFields: %s\n", error.what());

@@ -3,12 +3,14 @@
 #include "PipelineSpecialization.hpp"
 #include "StencilReplay.hpp"
 #include "SpirvBackend/SpirvEmitterHelpers.hpp"
+#include "SpirvBackend/SpirvBda.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvTypes.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvConstants.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvDescriptors.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvInputOutput.hpp"
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
+#include <array>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -144,12 +146,40 @@ std::uint32_t PushConstantArrayType(SpirvEmitterState& state) {
 }
 
 std::uint32_t PushConstantBlockType(SpirvEmitterState& state) {
+    if (state.newPathResolved) {
+        // New path (S4 T-9): the driver words first (D's NewPathAbi PushLayout: page table address at word 0, fault
+        // record at 2, overflow at 4), then the PushData every stage reads today, moved up by them.
+        const auto driver = state.module.DecoratedType(spv::OpTypeArray, {{spv::OpDecorate, {spv::DecorationArrayStride, 4u}}}, TypeU32(state), ConstantU32(state, NewPathPushDriverWords));
+        return state.module.DecoratedType(spv::OpTypeStruct,
+            {{spv::OpMemberDecorate, {0u, spv::DecorationOffset, 0u}},
+             {spv::OpMemberDecorate, {1u, spv::DecorationOffset, (NewPathPushDriverWords + state.program.Metadata().bindings.PushSlotDword()) * 4u}},
+             {spv::OpDecorate, {spv::DecorationBlock}}},
+            driver, PushConstantArrayType(state));
+    }
     return state.module.DecoratedType(spv::OpTypeStruct,
         {{spv::OpMemberDecorate, {0u, spv::DecorationOffset, state.program.Metadata().bindings.PushSlotDword() * 4u}},
          {spv::OpDecorate, {spv::DecorationBlock}}},
         PushConstantArrayType(state));
 }
 
+}
+
+std::uint32_t PushDataMember(SpirvEmitterState& state) {
+    return ConstantU32(state, state.newPathResolved ? 1u : 0u);
+}
+
+std::uint32_t NewPathPageTableAddress(SpirvEmitterState& state) {
+    if (state.pushConstantVariable == 0u) throw std::runtime_error("a newPathResolved module has no push block for its page table address");
+    std::array<std::uint32_t, 2> words{};
+    for (std::uint32_t word = 0; word < 2u; ++word) {
+        const auto pointer = state.module.AllocateId();
+        state.module.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state), pointer, state.pushConstantVariable, ConstantU32(state, 0u), ConstantU32(state, word));
+        words[word] = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, TypeU32(state), words[word], pointer);
+    }
+    const auto u64 = TypeScalarU64(state);
+    const auto high = Binary(state, spv::OpShiftLeftLogical, u64, Unary(state, spv::OpUConvert, u64, words[1]), BdaConstant(state, 32u));
+    return Binary(state, spv::OpBitwiseOr, u64, Unary(state, spv::OpUConvert, u64, words[0]), high);
 }
 
 void CheckBindings(const IrProgram& program, const CompiledBindingLayout& bindings) {
@@ -478,7 +508,7 @@ void DefineOutputs(SpirvEmitterState& state) {
 void DefineDescriptors(SpirvEmitterState& state) {
     const IrBindingLayout& layout = state.program.Metadata().bindings;
     const IrShaderStage stage = state.program.Resources().stage;
-    if (layout.UsesPushData() || state.stencilReplay || stage == IrShaderStage::Mesh || stage == IrShaderStage::TessellationControl || (state.depthRangeRemap && stage == IrShaderStage::Vertex)) {
+    if (state.newPathResolved || layout.UsesPushData() || state.stencilReplay || stage == IrShaderStage::Mesh || stage == IrShaderStage::TessellationControl || (state.depthRangeRemap && stage == IrShaderStage::Vertex)) {
         const auto type = PushConstantBlockType(state);
         state.pushConstantVariable = state.module.DefineGlobalVariable(TypePointer(state, spv::StorageClassPushConstant, type), spv::StorageClassPushConstant);
         state.module.AddName(type, "BufferResource");

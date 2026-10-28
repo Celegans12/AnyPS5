@@ -41,6 +41,12 @@ std::uint32_t TypeStorageBufferU8Pointer(SpirvEmitterState& state);
 std::uint32_t TypeStorageBufferU8ElementPointer(SpirvEmitterState& state);
 std::uint32_t TypePhysicalU32Pointer(SpirvEmitterState& state);
 std::uint32_t TypePushConstantElementPointer(SpirvEmitterState& state);
+// The push-constant block member holding PushData: 1 in a newPathResolved module, whose member 0 is the new path's
+// driver words (NewPathPushDriverWords: page table, fault record, overflow addresses), else 0.
+std::uint32_t PushDataMember(SpirvEmitterState& state);
+inline constexpr std::uint32_t NewPathPushDriverWords = 6;
+// The device page table's address (push words 0-1) of a newPathResolved module, as a u64.
+std::uint32_t NewPathPageTableAddress(SpirvEmitterState& state);
 std::uint32_t TypeU32ArrayPointer(SpirvEmitterState& state, std::uint32_t storageClass, std::uint32_t dwords);
 std::uint32_t TypeU32ElementPointer(SpirvEmitterState& state, std::uint32_t storageClass);
 std::uint32_t TypeId(SpirvEmitterState& state, IrType type);

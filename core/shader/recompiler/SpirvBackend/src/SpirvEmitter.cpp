@@ -297,6 +297,7 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
     state.fusedExactArithmetic = target.fusedExactArithmetic;
     state.deviceScopeLdsMemoryBarriers = target.deviceScopeLdsMemoryBarriers;
     state.hostSubgroupSize = target.subgroupSize;
+    state.newPathResolved = target.newPathResolved;
     state.bindlessImages = target.bindlessImages && ResourceMaterializer::UsesBindlessImages(program.Info(), program.Resources().stage);
     const auto supports = [&](spv::Capability capability) { return std::ranges::find(target.supportedCapabilities, static_cast<std::uint32_t>(capability)) != target.supportedCapabilities.end(); };
     state.bindlessWaveUniform = state.bindlessImages && program.Resources().stage == IrShaderStage::Compute && !HostSubgroupSingleLane(state) && supports(spv::CapabilityGroupNonUniformBallot);

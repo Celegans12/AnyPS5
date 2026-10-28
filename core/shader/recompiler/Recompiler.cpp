@@ -197,9 +197,11 @@ RdnaProgram DecodeStageProgram(ShaderStageKind stage, std::span<const std::uint3
 }
 
 ShaderStageInputInfo RequestInputInfo(const RecompileRequest& request) {
-    // The new path's target fields select emission that is not written yet (S4 epoch 1, T-9): a request that asks for it
-    // must not get today's module under a key that says otherwise.
-    if (request.target.newPathResolved) throw std::runtime_error("the newPathResolved target (page-table walk, push-block user SGPRs) is not implemented yet");
+    // The new path's target fields select emission that is not written yet for every stage (S4 epoch 1): a request that
+    // asks for it must not get today's module under a key that says otherwise. newPathResolved is compute-only so far
+    // (its driver words come first in the push block, ahead of the stage's PushData; graphics stages need D's
+    // per-stage push layout first).
+    if (request.target.newPathResolved && request.shader.stage != ShaderStage::Compute) throw std::runtime_error("the newPathResolved target is implemented for compute programs only");
     if (request.target.bdaSegments) throw std::runtime_error("the bdaSegments target (segment programs) is not implemented yet");
     const auto* mesh = request.graphics && request.graphics->mesh ? &*request.graphics->mesh : nullptr;
     std::optional<TessellationConfiguration> tessellationCopy;
@@ -726,6 +728,7 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program)
     targetOptions.fragmentDescriptorSet = request.target.registrationModules;
     targetOptions.float16DenormPreserve = request.target.float16DenormPreserve;
     targetOptions.spannedWaves = request.target.spannedWaves;
+    targetOptions.newPathResolved = request.target.newPathResolved;
     targetOptions.bindlessImages = request.target.bindlessImages;
     targetOptions.fusedFma = request.target.fusedFma;
     targetOptions.singleWorkgroup = request.context.compute.has_value() && request.context.compute->singleWorkgroup;

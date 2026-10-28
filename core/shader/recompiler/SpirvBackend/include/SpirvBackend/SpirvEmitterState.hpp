@@ -126,6 +126,8 @@ struct SpirvEmitterState {
     bool float16DenormPreserve = false;
     // See SpirvTarget::fusedFma (EmitFPInterpolateF16's exact f32 path).
     bool fusedFma = false;
+    // SpirvTarget::newPathResolved (see SpirvEmitter.hpp).
+    bool newPathResolved = false;
     // See ShaderComputeStageInfo::singleWorkgroup: glc reads through the plain binding, buffer-ordering s_barrier.
     bool singleWorkgroup = false;
     bool robustBufferAccess2 = false;
