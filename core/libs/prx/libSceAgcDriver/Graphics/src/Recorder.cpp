@@ -2870,6 +2870,34 @@ void Recorder::NoteAccess(CommandClass which, const Access& access) {
 void Recorder::CountPresent() {
     timingPresents.fetch_add(1, std::memory_order_relaxed);
     presentSerial.fetch_add(1, std::memory_order_relaxed);
+    // Diagnostic: APS5_WATCH_BYTES=<hex address>+<hex bytes> hashes that guest range at every present and prints
+    // [watch-bytes] when its bytes changed, with whether any write stamp (CPU collect or driver MarkWritten) moved
+    // over it since the previous check: a change without a stamp is a writer the tracking does not see.
+    static const std::pair<std::uint64_t, std::uint64_t> watched = [] {
+        const char* text = std::getenv("APS5_WATCH_BYTES");
+        if (text == nullptr) return std::pair<std::uint64_t, std::uint64_t>{0, 0};
+        char* end = nullptr;
+        const auto address = std::strtoull(text, &end, 16);
+        const auto bytes = end != nullptr && *end == '+' ? std::strtoull(end + 1, nullptr, 16) : 0ull;
+        return std::pair<std::uint64_t, std::uint64_t>{address, bytes};
+    }();
+    if (watched.second == 0) return;
+    static std::vector<std::byte> previous;
+    static std::uint64_t generation = 0;
+    static std::uint64_t changes = 0, unstamped = 0;
+    std::vector<std::byte> current(static_cast<std::size_t>(watched.second));
+    std::memcpy(current.data(), reinterpret_cast<const void*>(watched.first), current.size());
+    GuestMemory::CollectWrites(watched.first, static_cast<std::size_t>(watched.second));
+    const bool stamped = generation != 0 && !GuestMemory::UnchangedSince(watched.first, static_cast<std::size_t>(watched.second), generation);
+    if (!previous.empty() && previous != current) {
+        ++changes;
+        if (!stamped) ++unstamped;
+        std::size_t first = 0;
+        while (first < current.size() && current[first] == previous[first]) ++first;
+        if (changes <= 40 || changes % 100 == 0) std::fprintf(stderr, "[watch-bytes] present %llu: 0x%llx+0x%llx changed from +0x%zx, stamped %d (changes %llu, unstamped %llu)\n", static_cast<unsigned long long>(presentSerial.load(std::memory_order_relaxed)), static_cast<unsigned long long>(watched.first), static_cast<unsigned long long>(watched.second), first, stamped ? 1 : 0, static_cast<unsigned long long>(changes), static_cast<unsigned long long>(unstamped));
+    }
+    previous = std::move(current);
+    generation = GuestMemory::TrackerGeneration();
 }
 
 std::uint64_t Recorder::Presents() {
