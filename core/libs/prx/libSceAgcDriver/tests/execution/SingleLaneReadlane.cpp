@@ -2,7 +2,8 @@
 // wave with v_readlane_b32 and stores them per thread (the cloth programs' reduction tail: DPP row shifts, then
 // v_readlane 31 and 63). Every thread must store 63 and 31. Run in both layouts: two guest lanes per invocation (the
 // default) and one lane per invocation (SpirvTarget::singleLaneGroups), whose host subgroups are 32 lanes wide on
-// NVIDIA: a lane-63 read inside one host subgroup has no lane 63 to read. Exit 1 when a layout stores a wrong value.
+// NVIDIA: a lane-63 read inside one host subgroup has no lane 63 to read, so on such a host the recompiler keeps two lanes
+// per invocation (T-7 guard). Also run with APS5_SINGLE_LANE=all. Exit 1 when a layout stores a wrong value.
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "Recompiler.hpp"

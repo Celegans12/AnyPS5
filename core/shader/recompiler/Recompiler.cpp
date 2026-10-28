@@ -160,15 +160,24 @@ std::uint32_t HostSubgroupSize(const RecompileRequest& request) {
     if (vertexStage && !request.target.vertexSubgroups) return 1u;
     if (request.shader.stage == ShaderStage::TessellationControl && MergedHullStage(request)) return 1u;
     static const std::string list = [] { const char* text = std::getenv("APS5_SINGLE_LANE"); return text ? std::string(text) : std::string(); }();
+    // One guest lane per invocation (singleLaneGroups, APS5_SINGLE_LANE) needs a host subgroup as wide as the wave: on
+    // a 32-lane host a wave64 program would need the spanned layout, which spans only single-wave workgroups, and
+    // without it its wave operations see one 32-lane half (v_readlane 63 reads lane 31, a half-wave scan's lane 63 reads
+    // the identity; agc_driver_single_lane_readlane, T-6/T-7). There the request keeps two lanes per invocation.
+    bool wantsOneLane = false;
     if (request.target.singleLaneGroups && request.shader.stage == ShaderStage::Compute && request.context.waveSize == 64u && request.context.compute.has_value()) {
         const auto& threads = request.context.compute->numThreads;
-        if (std::uint64_t{std::max(threads[0], 1u)} * std::max(threads[1], 1u) * std::max(threads[2], 1u) > 64u && OneLaneGroupsEligible(request.shader.code)) return 64u;
+        wantsOneLane = std::uint64_t{std::max(threads[0], 1u)} * std::max(threads[1], 1u) * std::max(threads[2], 1u) > 64u && OneLaneGroupsEligible(request.shader.code);
     }
     if (!list.empty()) {
-        if (list == "all") return 64u;
         char address[32];
         std::snprintf(address, sizeof(address), "%llx", static_cast<unsigned long long>(request.shader.codeAddress));
-        if (list.find(address) != std::string::npos) return 64u;
+        wantsOneLane = wantsOneLane || list == "all" || list.find(address) != std::string::npos;
+    }
+    if (wantsOneLane) {
+        if (request.target.subgroupSize >= 64u) return 64u;
+        static std::atomic<bool> said{false};
+        if (!said.exchange(true)) std::fprintf(stderr, "[one-lane] the host subgroup has %u lanes: wave64 programs keep two lanes per invocation (one lane per invocation needs a 64-lane subgroup or the spanned layout)\n", request.target.subgroupSize);
     }
     return request.target.subgroupSize;
 }

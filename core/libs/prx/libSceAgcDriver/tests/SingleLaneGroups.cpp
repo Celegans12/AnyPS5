@@ -29,7 +29,7 @@ constexpr std::array<std::uint32_t, 4> UserData{0x10000000u, 0x00000000u, 0x100u
 constexpr std::array<std::uint32_t, 2> Capabilities{spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses};
 constexpr std::array<std::string_view, 1> Extensions{"SPV_KHR_physical_storage_buffer"};
 
-RecompileRequest Request(std::uint32_t threads, std::uint32_t wave, bool singleLane, const std::vector<std::uint32_t>& code = Code) {
+RecompileRequest Request(std::uint32_t threads, std::uint32_t wave, bool singleLane, const std::vector<std::uint32_t>& code = Code, std::uint32_t hostLanes = 64u) {
     RecompileRequest request{};
     request.shader = {ShaderStage::Compute, 0x22000u, code, 0, {}};
     request.context.waveSize = wave;
@@ -37,7 +37,7 @@ RecompileRequest Request(std::uint32_t threads, std::uint32_t wave, bool singleL
     request.context.compute = ShaderComputeStageInfo{{threads, 1u, 1u}, 0u, {true, false, false}, false, 1u};
     request.target.vulkanVersion = 0x00401000u;
     request.target.spirvVersion = 0x00010300u;
-    request.target.subgroupSize = 32u;
+    request.target.subgroupSize = hostLanes;
     request.target.bdaAbiVersion = BdaAbi::Version;
     request.target.supportedCapabilities = Capabilities;
     request.target.supportedExtensions = Extensions;
@@ -50,8 +50,8 @@ RecompileRequest Request(std::uint32_t threads, std::uint32_t wave, bool singleL
     return request;
 }
 
-std::uint32_t HostLanes(std::uint32_t threads, std::uint32_t wave, bool singleLane, const std::vector<std::uint32_t>& code = Code) {
-    const auto result = Recompile(Request(threads, wave, singleLane, code));
+std::uint32_t HostLanes(std::uint32_t threads, std::uint32_t wave, bool singleLane, const std::vector<std::uint32_t>& code = Code, std::uint32_t hostLanes = 64u) {
+    const auto result = Recompile(Request(threads, wave, singleLane, code, hostLanes));
     Expect(!result.spirv.empty(), "the program did not recompile");
     return result.hostSubgroupSize;
 }
@@ -59,13 +59,15 @@ std::uint32_t HostLanes(std::uint32_t threads, std::uint32_t wave, bool singleLa
 }
 
 int main() try {
-    const auto twoLane = HostLanes(1024u, 64u, false);
+    // On a 32-lane host one lane per invocation would need the spanned layout (T-7 guard): the request keeps two lanes.
+    Expect(HostLanes(1024u, 64u, true, Code, 32u) == 32u, "a 1024-thread wave64 group with singleLaneGroups on a 32-lane host left the two-lane layout");
+    const auto twoLane = HostLanes(1024u, 64u, false, Code, 32u);
     const auto oneLane = HostLanes(1024u, 64u, true);
-    Expect(oneLane == 64u, "a 1024-thread wave64 group with singleLaneGroups is laid out with host subgroup " + std::to_string(oneLane) + ", expected 64 (one guest lane per invocation)");
+    Expect(oneLane == 64u, "a 1024-thread wave64 group with singleLaneGroups on a 64-lane host is laid out with host subgroup " + std::to_string(oneLane) + ", expected 64 (one guest lane per invocation)");
     Expect(twoLane != 64u, "a 1024-thread wave64 group without singleLaneGroups is already one lane per invocation; the test no longer tells the layouts apart");
     Expect(HostLanes(512u, 64u, true) == 64u, "a 512-thread wave64 group with singleLaneGroups is not one lane per invocation");
     Expect(HostLanes(64u, 64u, true) == HostLanes(64u, 64u, false), "singleLaneGroups changed a single-wave workgroup");
-    Expect(HostLanes(256u, 32u, true) == HostLanes(256u, 32u, false), "singleLaneGroups changed a wave32 program");
+    Expect(HostLanes(256u, 32u, true, Code, 32u) == HostLanes(256u, 32u, false, Code, 32u), "singleLaneGroups changed a wave32 program");
     Expect(HostLanes(1024u, 64u, true, ReturningAtomic) == HostLanes(1024u, 64u, false, ReturningAtomic), "a program with a returning buffer atomic was laid out one lane per invocation; its two host subgroups would race (H2-5)");
 
     std::vector<std::uint64_t> keyOff;
