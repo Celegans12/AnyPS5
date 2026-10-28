@@ -42,6 +42,7 @@ constexpr std::size_t Block = 65536;
 constexpr wchar_t HostHoleMode[] = L"--host-hole";
 constexpr wchar_t ResidentRemapMode[] = L"--resident-direct-remap";
 constexpr wchar_t OwnedProofsMode[] = L"--owned-proofs";
+constexpr wchar_t MappingOwnerMode[] = L"--mapping-owner";
 constexpr wchar_t RewatchImportPagesMode[] = L"--rewatch-import-pages";
 constexpr wchar_t RewatchedSharedMode[] = L"--rewatched-direct-shared";
 constexpr wchar_t ImportAliasSharedMode[] = L"--import-alias-shared";
@@ -3070,6 +3071,44 @@ void CheckOwnedMappingChanges() {
     }
     std::cout << "owned proofs: unmap, partial map, guest protection and host writes move the words\n";
 }
+struct HandlersUnderLock {
+    std::uintptr_t address = 0;
+    DWORD owner = 0;
+    bool wrote = true;
+    bool read = true;
+};
+
+void CheckHandlersSkipMappingOwner() {
+    PrivateFixture fixture(Block, Block);
+    fixture.At(64) = 5;
+    HandlersUnderLock state;
+    state.address = static_cast<std::uintptr_t>(fixture.Base() + 64);
+    const auto body = [](void* argument) -> DWORD {
+        GuestArena::GuestArenaRunUnderMappingLock_nid_no_patch([](void* inner) {
+            auto& under = *static_cast<HandlersUnderLock*>(inner);
+            under.owner = GuestArena::GuestArenaMappingLockOwner_nid_no_patch();
+            under.wrote = GuestArena::GuestArenaHandleWrite_nid_postfix(under.address);
+            under.read = GuestArena::GuestArenaHandleRead_nid_postfix(under.address);
+        }, argument);
+        return 0;
+    };
+    const HANDLE worker = CreateThread(nullptr, 0, body, &state, 0, nullptr);
+    Require(worker != nullptr, "cannot start the thread that holds the mapping mutex");
+    if (WaitForSingleObject(worker, 5000) != WAIT_OBJECT_0) {
+        std::cerr << "FAIL: the fault handlers locked the mapping mutex on the thread that holds it\n";
+        std::cerr.flush();
+        TerminateProcess(GetCurrentProcess(), 3);
+    }
+    const auto workerId = GetThreadId(worker);
+    CloseHandle(worker);
+    Require(state.owner == workerId, "the mapping mutex did not name its holder");
+    Require(!state.wrote && !state.read, "a fault handler on the mapping mutex's holder claimed the fault instead of leaving it to the crash report");
+    Require(GuestArena::GuestArenaMappingLockOwner_nid_no_patch() == 0, "the mapping mutex kept an owner after it was released");
+    static_cast<void>(GuestArena::GuestArenaHandleWrite_nid_postfix(state.address));
+    static_cast<void>(GuestArena::GuestArenaHandleRead_nid_postfix(state.address));
+    Require(fixture.At(64) == 5 && GuestArena::GuestArenaMappingLockOwner_nid_no_patch() == 0, "the handlers on a thread without the mutex changed the page or kept the mutex");
+    std::cout << "mapping owner: the fault handlers never lock the mapping mutex on its holder\n";
+}
 #endif
 
 int main(int argc, char** argv) {
@@ -3100,6 +3139,10 @@ int main(int argc, char** argv) {
         }
         if (std::wstring_view(GetCommandLineW()).ends_with(L"--owned-bench")) {
             BenchOwnedProofs();
+            return 0;
+        }
+        if (std::wstring_view(GetCommandLineW()).ends_with(MappingOwnerMode)) {
+            CheckHandlersSkipMappingOwner();
             return 0;
         }
         if (std::wstring_view(GetCommandLineW()).ends_with(OwnedProofsMode)) {

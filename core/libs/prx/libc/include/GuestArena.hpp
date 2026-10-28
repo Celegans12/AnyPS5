@@ -101,6 +101,8 @@ bool GuestArenaOwnedUnchanged_nid_no_patch(std::uintptr_t address, std::size_t b
 std::uint64_t GuestArenaOwnedMark_nid_no_patch();
 void GuestArenaTakeOwnedCounts_nid_no_patch(std::uint64_t* counts, std::size_t count);
 void GuestArenaEndSetProtection_nid_no_patch(std::uintptr_t address, std::size_t bytes);
+std::uint32_t GuestArenaMappingLockOwner_nid_no_patch();
+void GuestArenaRunUnderMappingLock_nid_no_patch(void (*body)(void*), void* argument);
 
 }
 

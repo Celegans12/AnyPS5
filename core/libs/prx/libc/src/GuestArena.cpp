@@ -645,6 +645,14 @@ void GuestArenaTakeOwnedCounts_nid_no_patch(std::uint64_t* counts, std::size_t c
 void GuestArenaEndSetProtection_nid_no_patch(std::uintptr_t, std::size_t) {
     WindowsMappings::Get().EndSetProtection();
 }
+
+std::uint32_t GuestArenaMappingLockOwner_nid_no_patch() {
+    return WindowsMappings::Get().MappingLockOwner();
+}
+
+void GuestArenaRunUnderMappingLock_nid_no_patch(void (*body)(void*), void* argument) {
+    WindowsMappings::Get().RunUnderLock(body, argument);
+}
 #else
 bool GuestArenaArmOwned_nid_no_patch(std::uintptr_t, std::size_t, std::uint64_t*, std::size_t, unsigned) {
     return false;
@@ -663,6 +671,14 @@ void GuestArenaTakeOwnedCounts_nid_no_patch(std::uint64_t* counts, std::size_t c
 }
 
 void GuestArenaEndSetProtection_nid_no_patch(std::uintptr_t, std::size_t) {}
+
+std::uint32_t GuestArenaMappingLockOwner_nid_no_patch() {
+    return 0;
+}
+
+void GuestArenaRunUnderMappingLock_nid_no_patch(void (*body)(void*), void* argument) {
+    body(argument);
+}
 #endif
 
 void GuestArenaSetHostWriteHook_nid_no_patch(void (*hook)(std::uintptr_t, std::size_t)) {

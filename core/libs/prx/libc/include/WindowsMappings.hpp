@@ -25,6 +25,33 @@
 
 namespace GuestArena {
 
+class MappingMutex {
+public:
+    void lock() {
+        inner.lock();
+        owner.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    }
+    bool try_lock() {
+        if (!inner.try_lock()) return false;
+        owner.store(GetCurrentThreadId(), std::memory_order_relaxed);
+        return true;
+    }
+    void unlock() {
+        owner.store(0, std::memory_order_relaxed);
+        inner.unlock();
+    }
+    bool HeldByCurrentThread() const {
+        return owner.load(std::memory_order_relaxed) == GetCurrentThreadId();
+    }
+    DWORD Owner() const {
+        return owner.load(std::memory_order_relaxed);
+    }
+
+private:
+    std::mutex inner;
+    std::atomic<DWORD> owner{0};
+};
+
 class WindowsMappings {
 public:
     enum class Collection { All, Armed, Fresh };
@@ -319,7 +346,17 @@ public:
         }
     }
 
+    DWORD MappingLockOwner() const {
+        return mutex.Owner();
+    }
+
+    void RunUnderLock(void (*body)(void*), void* argument) {
+        std::lock_guard lock(mutex);
+        body(argument);
+    }
+
     bool HandleWrite(std::uintptr_t address) {
+        if (mutex.HeldByCurrentThread()) return false;
         std::lock_guard lock(mutex);
         if (ownedLive != 0 && address < ownedAddressLimit && (ownedWord(address & ~std::uintptr_t{ownedBlockBytes - 1}) & 1u) != 0) ownedFaults.fetch_add(1, std::memory_order_relaxed);
         const auto base = address & ~(pageBytes - 1);
@@ -338,6 +375,7 @@ public:
     }
 
     bool HandleRead(std::uintptr_t address) {
+        if (mutex.HeldByCurrentThread()) return false;
         std::lock_guard lock(mutex);
         if (!views.contains(address & ~(pageBytes - 1))) return false;
         const auto memory = query(address);
@@ -1754,7 +1792,7 @@ private:
 #ifdef APS5_COUNT_MAPPING_QUERIES
     static inline std::atomic<std::uint64_t> queries{0};
 #endif
-    std::mutex mutex;
+    MappingMutex mutex;
     AllocateFunction allocate = nullptr;
     MapFunction map = nullptr;
     UnmapFunction unmap = nullptr;
