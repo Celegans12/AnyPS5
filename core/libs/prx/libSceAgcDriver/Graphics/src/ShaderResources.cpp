@@ -7733,6 +7733,15 @@ bool ShaderResources::ReadsOverlap(std::uint64_t address, std::size_t bytes) con
 
 void ShaderResources::RunAccesses(std::vector<std::array<std::uint64_t, 3>>& out) const {
     guestMemory.RunAccesses(out);
+    // The second whole-space claim (GuestBufferMemory::RunAccesses): an address-table build holds the address space
+    // as a lease, listed as a write over everything. With APS5_NEW_PATH_UNBOUNDED_READ_RUNS a read-only one (no store
+    // through an address) lists it as an unknown read instead, as below; any other lease stays a write.
+    const bool unknownReadOnly = usesBda && bdaReadOnly && Recorder::UnboundedReadRuns() && !guestMemory.HoldsExplicitLease();
+    if (unknownReadOnly) {
+        for (auto& access : out) {
+            if (access[0] == 0 && access[1] == std::numeric_limits<std::uint64_t>::max() && access[2] == Recorder::RunAccessWritten) access[2] = Recorder::RunAccessUnboundedRead;
+        }
+    }
     // A build with address tables reaches guest memory the CPU cannot list. If it stores through those
     // addresses, or without APS5_NEW_PATH_UNBOUNDED_READ_RUNS, it claims a write over everything; a read-only one
     // (bdaReadOnly: no store through an address in its module) then claims only an unknown read.
