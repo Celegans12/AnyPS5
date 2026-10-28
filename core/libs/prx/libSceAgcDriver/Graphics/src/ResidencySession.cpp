@@ -34,6 +34,8 @@ struct Session {
     std::uint64_t onePageBytes = 0;
     std::uint64_t multiPage = 0;
     std::uint64_t multiPageBytes = 0;
+    std::uint64_t overlayMulti = 0;
+    std::uint64_t overlayMultiBytes = 0;
     std::uint64_t stagedWrites = 0;
     std::uint64_t patches = 0;
     std::uint64_t patchedPages = 0;
@@ -116,6 +118,17 @@ void ReleaseResidency(VkDevice device) {
     ensured.store(VK_NULL_HANDLE, std::memory_order_release);
 }
 
+void NoteStagedOverlays(std::span<const std::pair<std::uint64_t, std::uint64_t>> overlays) {
+    if (!active.load(std::memory_order_acquire) || overlays.empty()) return;
+    auto& session = ResidencyState();
+    const std::lock_guard lock(session.mutex);
+    for (const auto& [address, bytes] : overlays) {
+        if ((address >> ResidencyPageShift) == ((address + bytes - 1) >> ResidencyPageShift)) continue;
+        ++session.overlayMulti;
+        session.overlayMultiBytes += bytes;
+    }
+}
+
 bool ResidencyActive() {
     return active.load(std::memory_order_acquire);
 }
@@ -163,8 +176,8 @@ std::string ResidencyReportLine() {
     if (session.driver == nullptr) return {};
     const auto counts = session.driver->Manager().Counts();
     char line[1536];
-    int at = std::snprintf(line, sizeof(line), "[residency] staged uses %llu (read; one page %llu, %.1f MiB; spanning %llu, %.1f MiB), written ranges refreshed %llu; table patches %llu (%llu pages, %llu without a table); resident %.1f MiB (%u pages, %u chunks), retired 0.0 MiB, private %.0f MiB; admitted %llu, evicted %llu, demoted %llu, dropped %llu, inadmissible %llu (unwatched imports %llu), deferred %llu; faults fast %llu served %llu refused %llu; driver publishes %llu; written back %.1f MiB, copied in %.1f MiB; lease flushes 0; refusals:",
-        static_cast<unsigned long long>(session.stagedReads), static_cast<unsigned long long>(session.onePage), static_cast<double>(session.onePageBytes) / (1024.0 * 1024.0), static_cast<unsigned long long>(session.multiPage), static_cast<double>(session.multiPageBytes) / (1024.0 * 1024.0), static_cast<unsigned long long>(session.stagedWrites),
+    int at = std::snprintf(line, sizeof(line), "[residency] staged uses %llu (read; one page %llu, %.1f MiB; spanning %llu, %.1f MiB, of them address-based overlays %llu, %.1f MiB), written ranges refreshed %llu; table patches %llu (%llu pages, %llu without a table); resident %.1f MiB (%u pages, %u chunks), retired 0.0 MiB, private %.0f MiB; admitted %llu, evicted %llu, demoted %llu, dropped %llu, inadmissible %llu (unwatched imports %llu), deferred %llu; faults fast %llu served %llu refused %llu; driver publishes %llu; written back %.1f MiB, copied in %.1f MiB; lease flushes 0; refusals:",
+        static_cast<unsigned long long>(session.stagedReads), static_cast<unsigned long long>(session.onePage), static_cast<double>(session.onePageBytes) / (1024.0 * 1024.0), static_cast<unsigned long long>(session.multiPage), static_cast<double>(session.multiPageBytes) / (1024.0 * 1024.0), static_cast<unsigned long long>(session.overlayMulti), static_cast<double>(session.overlayMultiBytes) / (1024.0 * 1024.0), static_cast<unsigned long long>(session.stagedWrites),
         static_cast<unsigned long long>(session.patches), static_cast<unsigned long long>(session.patchedPages), static_cast<unsigned long long>(session.unpatched),
         static_cast<double>(std::uint64_t{counts.resident} << ResidencyPageShift) / (1024.0 * 1024.0), counts.resident, counts.chunks, PrivateMiB(),
         static_cast<unsigned long long>(counts.admitted), static_cast<unsigned long long>(counts.evicted), static_cast<unsigned long long>(counts.demoted + counts.unusedDemoted), static_cast<unsigned long long>(counts.dropped), static_cast<unsigned long long>(counts.inadmissible), static_cast<unsigned long long>(session.guest->UnwatchedImports()), static_cast<unsigned long long>(counts.deferred),

@@ -14,6 +14,7 @@ void EnsureResidency(const Context& context);
 void ReleaseResidency(VkDevice device);
 std::string ResidencyReportLine();
 bool ResidencyActive();
+void NoteStagedOverlays(std::span<const std::pair<std::uint64_t, std::uint64_t>> overlays);
 void NoteStagedRegions(std::span<const std::pair<std::uint64_t, std::uint64_t>> reads, std::span<const std::pair<std::uint64_t, std::uint64_t>> writes);
 
 }

@@ -6298,12 +6298,15 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
     if (ResidencyActive()) {
         std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> overlays;
         for (const auto& region : regions) {
             if (region.end <= region.begin) continue;
             if (region.writable) writes.emplace_back(region.begin, region.end - region.begin);
             if (region.gpuCopy && region.deviceLocal) reads.emplace_back(region.begin, region.end - region.begin);
+            if (region.gpuCopy && region.deviceLocal && region.overlay) overlays.emplace_back(region.begin, region.end - region.begin);
         }
         NoteStagedRegions(reads, writes);
+        NoteStagedOverlays(overlays);
     }
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const bool diff = stagingDiffEnabled(context);
