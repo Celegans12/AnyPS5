@@ -89,6 +89,7 @@ std::shared_ptr<const Graphics::BdaPageTable> DevicePageTable::Refresh(const Gra
     counts.coveredBytes = coveredBytes(ranges);
     counts.importVersion = now;
     tableRanges = std::move(ranges);
+    tableLists = ListsOf(tableRanges);
     return table;
 }
 
@@ -104,6 +105,7 @@ std::shared_ptr<const Graphics::BdaPageTable> DevicePageTable::PatchPages(const 
     table = Graphics::BdaPageTable::Patch(context, table, pages, [this](std::uint64_t begin, std::uint64_t end) { return piecesLocked(begin, end); });
     ++counts.patches;
     tableRanges = piecesLocked(0, ShaderRecompiler::BdaAbi::PageTableEnd);
+    tableLists = ListsOf(tableRanges);
     return table;
 }
 
@@ -116,6 +118,7 @@ void DevicePageTable::Release(VkDevice device) {
         tableDevice = VK_NULL_HANDLE;
         importRanges.clear();
         tableRanges.clear();
+        tableLists = {};
         built = false;
         builtVersion = 0;
         ++counts.released;
@@ -130,6 +133,11 @@ void DevicePageTable::SetResidentPieces(ResidentPieces pieces) {
 std::shared_ptr<const Graphics::BdaPageTable> DevicePageTable::Current() const {
     std::lock_guard lock(mutex);
     return table;
+}
+
+TableLists DevicePageTable::Lists() const {
+    std::lock_guard lock(mutex);
+    return tableLists;
 }
 
 std::uint64_t DevicePageTable::RootAddress() const {

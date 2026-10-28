@@ -299,6 +299,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/EntryPoints.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/NewPath/NewPath.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/NewPath/CommandWrites.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/NewPath/CommandAccess.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/NewPath/PushBlock.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/NewPath/DevicePageTable.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/NewPath/Router.cpp
