@@ -1,6 +1,7 @@
 // agc_driver_mix_f16_exact_tests <out.bin>: v_fma_mixlo_f16 over 1M input triples (random bit patterns, specials,
 // f16 denormals and constructed f16 rounding midpoints), written to <out.bin>. Design-agent probe (local/design-gpu):
-// run once with and once without APS5_MIX_F32=1 and compare the two files byte for byte.
+// compare its file byte for byte with one from a build that has only the f64 helper (2026-10-28: #10980's path vs
+// 90e7077014 with APS5_NO_MIX_F32=1, identical over 4,194,304 results).
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "Recompiler.hpp"

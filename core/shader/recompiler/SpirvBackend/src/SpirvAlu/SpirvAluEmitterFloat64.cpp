@@ -1081,72 +1081,11 @@ std::uint32_t EmitFPInterpolateF32(SpirvEmitterState& state, std::uint32_t arg0,
     return CallInterpolate(state, arg0, arg1, arg2, false, mode->ImmediateU32());
 }
 
-namespace {
-
-// v_fma_mix* / f16 interpolation in mode 0 (round to nearest even, no flushes) in f32 instead of the
-// f64 helper (FP64 runs at 1/64 rate on this class of GPU; 0x141d55d00 makes 119 such calls per
-// pixel). The product is exact as hi + lo (lo = fma(a, b, -hi), which needs a fused Fma: the
-// driver's startup probe, SpirvTarget::fusedFma), the three-term sum hi + c + lo is formed by TwoSum
-// steps and rounded to odd at 24 bits (>= 11 + 2, so the later round-to-nearest-even conversion to
-// f16 rounds once, as from the exact value). Inputs that are not finite, or whose product or addend
-// lies outside [2^-60, 2^125] (the second-order error terms then stay normal even where f32
-// denormals flush), take the f64 helper. All arithmetic is NoContraction. Exactness: the
-// tests/execution/MixF16Exact probe (4.2M results over the game's four operand forms, specials,
-// f16 denormals and constructed midpoints) matches the f64 helper bit for bit. APS5_NO_MIX_F32=1
-// keeps the f64 helper.
-std::uint32_t InterpolateF16Fast(SpirvEmitterState& state, std::uint32_t a, std::uint32_t b, std::uint32_t c) {
-    const auto f32 = TypeF32(state);
-    const auto u32 = TypeU32(state);
-    const auto boolean = TypeBool(state);
-    const auto exact = [&](spv::Op op, std::uint32_t lhs, std::uint32_t rhs) {
-        const auto result = Binary(state, op, f32, lhs, rhs);
-        state.module.AddAnnotation(spv::OpDecorate, result, spv::DecorationNoContraction);
-        return result;
-    };
-    const auto bits = [&](std::uint32_t value) { return Unary(state, spv::OpBitcast, u32, value); };
-    const auto magnitude = [&](std::uint32_t value) { return Binary(state, spv::OpBitwiseAnd, u32, bits(value), ConstantU32(state, 0x7fffffffu)); };
-    const auto both = [&](std::uint32_t lhs, std::uint32_t rhs) { return Binary(state, spv::OpLogicalAnd, boolean, lhs, rhs); };
-    const auto either = [&](std::uint32_t lhs, std::uint32_t rhs) { return Binary(state, spv::OpLogicalOr, boolean, lhs, rhs); };
-    const auto inRange = [&](std::uint32_t mag) { return both(Binary(state, spv::OpUGreaterThanEqual, boolean, mag, ConstantU32(state, 0x21800000u)), Binary(state, spv::OpULessThanEqual, boolean, mag, ConstantU32(state, 0x7e000000u))); };
-    const auto isZero = [&](std::uint32_t mag) { return Binary(state, spv::OpIEqual, boolean, mag, ConstantU32(state, 0u)); };
-    const auto finite = [&](std::uint32_t mag) { return Binary(state, spv::OpULessThan, boolean, mag, ConstantU32(state, 0x7f800000u)); };
-    const auto hi = exact(spv::OpFMul, a, b);
-    const auto magA = magnitude(a);
-    const auto magB = magnitude(b);
-    const auto magC = magnitude(c);
-    const auto finiteInputs = both(finite(magA), finite(magB));
-    const auto productOk = either(inRange(magnitude(hi)), both(finiteInputs, either(isZero(magA), isZero(magB))));
-    const auto fast = both(both(productOk, either(isZero(magC), inRange(magC))), finiteInputs);
-    return EmitValueIfElse(state, fast, f32, [&] {
-        const auto lo = Glsl(state, f32, GLSLstd450Fma, a, b, Unary(state, spv::OpFNegate, f32, hi));
-        const auto twoSum = [&](std::uint32_t x, std::uint32_t y) {
-            const auto sum = exact(spv::OpFAdd, x, y);
-            const auto yPart = exact(spv::OpFSub, sum, x);
-            const auto xPart = exact(spv::OpFSub, sum, yPart);
-            const auto error = exact(spv::OpFAdd, exact(spv::OpFSub, x, xPart), exact(spv::OpFSub, y, yPart));
-            return std::pair{sum, error};
-        };
-        const auto [s, e] = twoSum(hi, c);
-        const auto [u, f] = twoSum(e, lo);
-        const auto [s2, g] = twoSum(s, u);
-        const auto rest = exact(spv::OpFAdd, g, f);
-        const auto sumBits = bits(s2);
-        const auto sameSign = Binary(state, spv::OpIEqual, boolean, Binary(state, spv::OpBitwiseAnd, u32, Binary(state, spv::OpBitwiseXor, u32, sumBits, bits(rest)), ConstantU32(state, 0x80000000u)), ConstantU32(state, 0u));
-        const auto towardZero = Select(state, u32, sameSign, sumBits, Binary(state, spv::OpISub, u32, sumBits, ConstantU32(state, 1u)));
-        const auto odd = Binary(state, spv::OpBitwiseOr, u32, towardZero, ConstantU32(state, 1u));
-        auto result = Select(state, u32, isZero(magnitude(s2)), bits(rest), odd);
-        result = Select(state, u32, isZero(magnitude(rest)), sumBits, result);
-        // e + lo == 0: the sum is s exactly (keeps the sign of a zero s, which s + 0 would turn into +0).
-        result = Select(state, u32, isZero(magnitude(u)), bits(s), result);
-        return Unary(state, spv::OpBitcast, f32, result);
-    }, [&] { return CallInterpolate(state, a, b, c, true, 0u); });
-}
-
-}
-
+// v_fma_mix* and f16 interpolation: CallInterpolate takes the exact f32 path of #10980 (tibzejoker, be81531d69)
+// and the f64/integer helper only where that result is not provably exact. Our own fused-Fma f32 path
+// (InterpolateF16Fast, APS5_NO_MIX_F32) is retired: the MixF16Exact probe gives identical results for both
+// and #10980 emits 27 % fewer words on 0x141d55d00 at the same GPU time (research/speed/newpath/census-c.md).
 std::uint32_t EmitFPInterpolateF16(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1, std::uint32_t arg2, const IrValue* mode) {
-    static const bool f64Only = std::getenv("APS5_NO_MIX_F32") != nullptr;
-    if (state.fusedFma && !f64Only && mode->ImmediateU32() == 0u) return InterpolateF16Fast(state, arg0, arg1, arg2);
     return CallInterpolate(state, arg0, arg1, arg2, true, mode->ImmediateU32());
 }
 

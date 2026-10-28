@@ -4122,7 +4122,8 @@ ShaderRecompiler::SpirvTarget VulkanDevice::Target() const {
 // FmaProbe.comp over 4,096 triples whose fused and unfused results differ (c = -round(a * b), so a
 // fused fma returns the product's rounding error and an unfused one 0) plus random ones, compared
 // bit for bit with std::fma. Any Vulkan failure or mismatch answers false (the f64 helper as
-// before); APS5_NO_MIX_F32=1 skips the f32 path in the recompiler whatever the probe found.
+// before). No emitter path reads it since our f32 mix path was retired in favour of #10980's (which needs no
+// fused Fma); the probe and the target field stay until the field leaves the cache key.
 bool VulkanDevice::fusedFmaProbe(const State& device, std::uint32_t family) {
     constexpr std::uint32_t Count = 4096;
     std::vector<float> triples(Count * 4u);
