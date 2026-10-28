@@ -207,6 +207,9 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 | `APS5_LOOP_GUARD` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/ShaderResources.cpp` |  | enables the fault buffer that guards shader loops running past their bound |
 | `APS5_MIMALLOC` | presence | `core/relinker/elfpatcher/src/windows/WindowsEntryStubBuilder.cpp` |  | loads `mimalloc.dll` in the Windows entry stub, so the process allocates through mimalloc instead of the C runtime's heap |
 | `APS5_MIRROR_REFRESH_THREADS` | integer | `core/libs/prx/libSceAgcDriver/Graphics/src/GuestBufferMemory.cpp` | 3 | number of helper threads that refresh heap mirrors, clamped to 0 through 16 |
+| `APS5_NEW_PATH` | string | `core/libs/prx/libSceAgcDriver/Graphics/src/ResidencyConfig.cpp` |  | turns the new GPU path on (any value but empty or `0`), read once at start |
+| `APS5_NEW_PATH_NO_RESIDENCY` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/ResidencyConfig.cpp` |  | with `APS5_NEW_PATH` on, keeps every range on the staging path instead of the residency table |
+| `APS5_NEW_PATH_RESIDENT_MIB` | integer | `core/libs/prx/libSceAgcDriver/Graphics/src/ResidencyConfig.cpp` |  | forces the residency budget in MiB (0 admits nothing); unset takes the VRAM partition |
 | `APS5_NO_ADDRESS_READ_PASSES` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Draw.cpp` |  | stops a draw that only reads through its buffer descriptors from counting as read-only, so it breaks the pass instead of continuing the producer's |
 | `APS5_NO_ADDRESS_SPACE_CACHE` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/GuestBufferMemory.cpp` |  | disables the address-space cache so every build rebuilds its space |
 | `APS5_NO_ADJACENT_GENERATION` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Texture.cpp` |  | leaves adjacent pending images at their generation during a write-back, as before |

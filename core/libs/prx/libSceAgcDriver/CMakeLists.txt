@@ -371,6 +371,12 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderAddressResources.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/GuestBufferMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ResidentMirror.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Residency.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ResidencyConfig.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ResidencyMirrors.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ResidencyTokens.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ResidencyRecorderLanes.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ResidencyDriver.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/BdaResources.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/BufferAddress.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderValidation.cpp
@@ -583,6 +589,40 @@ if(BUILD_TESTING)
     set_tests_properties(agc_runtime_switches PROPERTIES TIMEOUT 20)
     if(WIN32)
         set_tests_properties(agc_runtime_switches PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+
+    add_test_executable(agc_residency_tests tests/Residency.cpp Graphics/src/Residency.cpp)
+    target_include_directories(agc_residency_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_residency_tests PRIVATE libc)
+    set_target_properties(agc_residency_tests PROPERTIES CXX_EXTENSIONS OFF)
+    configure_windows_unwind(agc_residency_tests)
+    add_test(NAME agc_residency COMMAND agc_residency_tests)
+    set_tests_properties(agc_residency PROPERTIES TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_residency PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+
+    add_test_executable(agc_residency_tokens_tests tests/ResidencyTokens.cpp Graphics/src/ResidencyTokens.cpp)
+    target_include_directories(agc_residency_tokens_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_residency_tokens_tests PRIVATE libc)
+    configure_windows_unwind(agc_residency_tokens_tests)
+    add_test(NAME agc_residency_tokens COMMAND agc_residency_tokens_tests)
+    set_tests_properties(agc_residency_tokens PROPERTIES TIMEOUT 20)
+    if(WIN32)
+        set_tests_properties(agc_residency_tokens PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+
+    add_test_executable(agc_residency_config_tests tests/ResidencyConfig.cpp Graphics/src/ResidencyConfig.cpp)
+    target_include_directories(agc_residency_config_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_residency_config_tests PRIVATE libc)
+    configure_windows_unwind(agc_residency_config_tests)
+    add_test(NAME agc_residency_config COMMAND agc_residency_config_tests)
+    set_tests_properties(agc_residency_config PROPERTIES TIMEOUT 20)
+    if(WIN32)
+        set_tests_properties(agc_residency_config PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 
@@ -888,6 +928,11 @@ if(BUILD_TESTING)
         set_tests_properties(agc_write_tracking_metadata_commit PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
         add_test(NAME agc_resident_direct_remap COMMAND agc_write_tracking_tests --resident-direct-remap)
         set_tests_properties(agc_resident_direct_remap PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 20)
+        add_test(NAME agc_mapping_owner COMMAND agc_write_tracking_tests --mapping-owner)
+        add_test(NAME agc_residency_reporting COMMAND agc_write_tracking_tests --residency-reporting)
+        add_test(NAME agc_access_guards COMMAND agc_write_tracking_tests --access-guards)
+        set_tests_properties(agc_residency_reporting agc_access_guards PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+        set_tests_properties(agc_mapping_owner PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 20)
         add_test(NAME agc_untracked_owned_proofs COMMAND agc_write_tracking_tests --owned-proofs)
         set_tests_properties(agc_untracked_owned_proofs PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
         add_test(NAME agc_rewatched_direct_shared COMMAND agc_write_tracking_tests --rewatched-direct-shared)
@@ -898,7 +943,7 @@ if(BUILD_TESTING)
         set_tests_properties(agc_compared_shared_generations PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 20)
         add_test(NAME agc_write_tracking_rewatch_import_pages COMMAND agc_write_tracking_tests --rewatch-import-pages)
         set_tests_properties(agc_write_tracking_rewatch_import_pages PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 20)
-        set_tests_properties(agc_write_tracking agc_write_tracking_metadata_commit agc_resident_direct_remap agc_untracked_owned_proofs agc_rewatched_direct_shared agc_import_alias_shared agc_compared_shared_generations agc_write_tracking_rewatch_import_pages PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_write_tracking agc_write_tracking_metadata_commit agc_resident_direct_remap agc_untracked_owned_proofs agc_mapping_owner agc_residency_reporting agc_access_guards agc_rewatched_direct_shared agc_import_alias_shared agc_compared_shared_generations agc_write_tracking_rewatch_import_pages PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()
@@ -2420,6 +2465,24 @@ foreach(agcExecutionTestSource IN LISTS agcExecutionTestSources)
     configure_windows_unwind(${agcExecutionTest})
     list(APPEND agcExecutionTests ${agcExecutionTest})
 endforeach()
+if(TARGET agc_driver_residency_mirrors_tests)
+    set(agcResidencyReadSpv ${agcTestShaderGeneratedRoot}/ResidencyRead_comp.spv)
+    set(agcResidencyReadHeader ${agcTestShaderGeneratedRoot}/ResidencyRead_comp_spv.h)
+    add_custom_command(
+        OUTPUT "${agcResidencyReadHeader}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${agcTestShaderGeneratedRoot}"
+        COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -o "${agcResidencyReadSpv}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/ResidencyRead.comp"
+        COMMAND ${CMAKE_COMMAND} -DINPUT=${agcResidencyReadSpv} -DOUTPUT=${agcResidencyReadHeader}
+        -DSYMBOL=RESIDENCY_READ_COMP_SPV -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
+        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/ResidencyRead.comp" glslang-standalone
+        VERBATIM
+    )
+    target_sources(agc_driver_residency_mirrors_tests PRIVATE ${agcResidencyReadHeader})
+    target_include_directories(agc_driver_residency_mirrors_tests PRIVATE ${agcTestShaderGeneratedRoot})
+    if(WIN32)
+        target_link_libraries(agc_driver_residency_mirrors_tests PRIVATE psapi)
+    endif()
+endif()
 if(TARGET agc_driver_request_bench2_tests)
     target_link_libraries(agc_driver_request_bench2_tests PRIVATE shader_recompiler_agc_driver)
 endif()
@@ -2959,6 +3022,11 @@ if(BUILD_TESTING)
     if(WIN32)
         set_tests_properties(agc_driver_draw_pipeline_trace_disabled agc_driver_draw_finisher_trace agc_driver_draw_finisher_trace_disabled PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    add_test(NAME agc_driver_residency_driver_async_lane COMMAND agc_driver_residency_driver_tests --async-lane)
+    set_tests_properties(agc_driver_residency_driver_async_lane PROPERTIES SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 60)
+    if(WIN32)
+        set_tests_properties(agc_driver_residency_driver_async_lane PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test(NAME agc_driver_copied_writer_label_order_async_lane COMMAND agc_driver_copied_writer_label_order_tests --async-lane)
     set_tests_properties(agc_driver_copied_writer_label_order_async_lane PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 30)

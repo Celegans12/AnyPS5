@@ -71,6 +71,8 @@ void parse() {
     Require(bySeconds.startSeconds == 90.0 && bySeconds.settleSeconds == 2 && bySeconds.startPresent == 0, "a start in seconds was not parsed");
     Require(Refusal("60:APS5_ASYNC_LANE").find("APS5_ASYNC_LANE cannot change while the game runs") != std::string::npos, "APS5_ASYNC_LANE was not refused with its reason");
     Require(Refusal("60:APS5_SPANNED_WAVE").find("read once at startup") != std::string::npos, "a startup-only variable was not refused");
+    Require(Refusal("60:APS5_NEW_PATH").find("APS5_NEW_PATH cannot change while the game runs") != std::string::npos, "APS5_NEW_PATH was not refused with its reason");
+    Require(Refusal("60:APS5_NEW_PATH_NO_RESIDENCY").find("APS5_NEW_PATH_NO_RESIDENCY cannot change while the game runs") != std::string::npos, "APS5_NEW_PATH_NO_RESIDENCY was not refused with its reason");
     Require(Refusal("60:APS5_NO_BDA_STAGING,APS5_NO_BDA_STAGING").find("listed twice") != std::string::npos, "a duplicate switch was not refused");
     Require(!Refusal("APS5_NO_BDA_STAGING").empty(), "a missing phase length was not refused");
     Require(!Refusal("60:").empty(), "an empty switch list was not refused");

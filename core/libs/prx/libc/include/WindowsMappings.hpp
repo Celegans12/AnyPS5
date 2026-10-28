@@ -25,6 +25,33 @@
 
 namespace GuestArena {
 
+class MappingMutex {
+public:
+    void lock() {
+        inner.lock();
+        owner.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    }
+    bool try_lock() {
+        if (!inner.try_lock()) return false;
+        owner.store(GetCurrentThreadId(), std::memory_order_relaxed);
+        return true;
+    }
+    void unlock() {
+        owner.store(0, std::memory_order_relaxed);
+        inner.unlock();
+    }
+    bool HeldByCurrentThread() const {
+        return owner.load(std::memory_order_relaxed) == GetCurrentThreadId();
+    }
+    DWORD Owner() const {
+        return owner.load(std::memory_order_relaxed);
+    }
+
+private:
+    std::mutex inner;
+    std::atomic<DWORD> owner{0};
+};
+
 class WindowsMappings {
 public:
     enum class Collection { All, Armed, Fresh };
@@ -319,7 +346,120 @@ public:
         }
     }
 
+    enum class AccessGuardRefusal : std::uint8_t { None, Misaligned, AliasedView, Pinned, HostAccess, Resident, NotAccessible, Failed, InFlight, Executable };
+
+    AccessGuardRefusal GuardAccess(std::uintptr_t address, std::size_t bytes) {
+        if (address % subpageBytes != 0 || bytes % subpageBytes != 0 || bytes == 0) return AccessGuardRefusal::Misaligned;
+        guardsUsed.store(true, std::memory_order_seq_cst);
+        std::lock_guard lock(mutex);
+        const auto end = address + bytes;
+        if (protectionsInFlight != 0 || changesActive.load(std::memory_order_seq_cst) != 0) return AccessGuardRefusal::InFlight;
+        if (views.lower_bound(address & ~(pageBytes - 1)) != views.end() && views.lower_bound(address & ~(pageBytes - 1))->first < end) return AccessGuardRefusal::AliasedView;
+        if (overlapsRange(pinnedRanges, address, end)) return AccessGuardRefusal::Pinned;
+        if (overlapsRange(hostAccess, address, end)) return AccessGuardRefusal::HostAccess;
+        auto run = residentRuns.upper_bound(address);
+        if (run != residentRuns.begin() && std::prev(run)->second.end > address) --run;
+        if (run != residentRuns.end() && run->first < end) return AccessGuardRefusal::Resident;
+        std::vector<std::pair<std::uintptr_t, DWORD>> arming;
+        for (auto subpage = address; subpage < end; subpage += subpageBytes) {
+            if (accessGuards.contains(subpage)) continue;
+            const auto memory = query(subpage);
+            if (memory.State != MEM_COMMIT || (memory.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) return AccessGuardRefusal::NotAccessible;
+            if ((memory.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0) return AccessGuardRefusal::Executable;
+            arming.emplace_back(subpage, memory.Protect);
+        }
+        for (std::size_t k = 0; k < arming.size(); ++k) {
+            accessGuards.emplace(arming[k].first, arming[k].second);
+            guardedSubpages.fetch_add(1, std::memory_order_release);
+            DWORD previous = 0;
+            if (VirtualProtect(reinterpret_cast<void*>(arming[k].first), subpageBytes, PAGE_NOACCESS, &previous)) continue;
+            for (std::size_t undo = 0; undo <= k; ++undo) {
+                if (undo < k) VirtualProtect(reinterpret_cast<void*>(arming[undo].first), subpageBytes, arming[undo].second, &previous);
+                accessGuards.erase(arming[undo].first);
+                guardedSubpages.fetch_sub(1, std::memory_order_release);
+            }
+            return AccessGuardRefusal::Failed;
+        }
+        return AccessGuardRefusal::None;
+    }
+
+    void UnguardAccess(std::uintptr_t address, std::size_t bytes) {
+        if (guardedSubpages.load(std::memory_order_acquire) == 0) return;
+        std::lock_guard lock(mutex);
+        dropAccessGuards(address, address + bytes);
+    }
+
+    void DropAccessGuards(std::uintptr_t address, std::size_t bytes) {
+        UnguardAccess(address, bytes);
+    }
+
+    bool AccessGuarded(std::uintptr_t address) {
+        if (guardedSubpages.load(std::memory_order_acquire) == 0 || mutex.HeldByCurrentThread()) return false;
+        std::lock_guard lock(mutex);
+        return accessGuards.contains(address & ~std::uintptr_t{subpageBytes - 1});
+    }
+
+    std::uintptr_t FirstAccessGuarded(std::uintptr_t address, std::size_t bytes) {
+        if (guardedSubpages.load(std::memory_order_acquire) == 0 || bytes == 0) return 0;
+        std::lock_guard lock(mutex);
+        const auto found = accessGuards.lower_bound(address & ~std::uintptr_t{subpageBytes - 1});
+        return found != accessGuards.end() && found->first < address + bytes ? std::max(found->first, address) : 0;
+    }
+
+    std::size_t AccessGuardedSubpages() const {
+        return guardedSubpages.load(std::memory_order_acquire);
+    }
+
+    void SetAccessGuardObserver(void (*callback)(std::uintptr_t address)) {
+        accessGuardObserver.store(callback, std::memory_order_release);
+    }
+
+    bool AccessGuardsUsed() const {
+        return guardsUsed.load(std::memory_order_seq_cst);
+    }
+
+    void ChangeBegin() {
+        changesActive.fetch_add(1, std::memory_order_seq_cst);
+    }
+
+    void ChangeEnd() {
+        changesActive.fetch_sub(1, std::memory_order_seq_cst);
+    }
+
+    void BeginMappingChange() {
+        std::lock_guard lock(mutex);
+        ++protectionsInFlight;
+    }
+
+    void EndMappingChange() {
+        std::lock_guard lock(mutex);
+        if (protectionsInFlight != 0) --protectionsInFlight;
+    }
+
+    bool OpenAccessGuards(std::uintptr_t address, std::size_t bytes) {
+        while (const auto guarded = FirstAccessGuarded(address, bytes)) {
+            const auto observer = accessGuardObserver.load(std::memory_order_acquire);
+            if (observer == nullptr) return false;
+            observer(guarded);
+            if (FirstAccessGuarded(guarded, 1) != 0) return false;
+        }
+        return true;
+    }
+
+    DWORD MappingLockOwner() const {
+        return mutex.Owner();
+    }
+
+    void RunUnderLock(void (*body)(void*), void* argument) {
+        std::lock_guard lock(mutex);
+        body(argument);
+    }
+
     bool HandleWrite(std::uintptr_t address) {
+        if (mutex.HeldByCurrentThread()) return false;
+        if (guardsUsed.load(std::memory_order_acquire)) {
+            if (const auto served = handleAccessGuard(address, true)) return *served;
+        }
         std::lock_guard lock(mutex);
         if (ownedLive != 0 && address < ownedAddressLimit && (ownedWord(address & ~std::uintptr_t{ownedBlockBytes - 1}) & 1u) != 0) ownedFaults.fetch_add(1, std::memory_order_relaxed);
         const auto base = address & ~(pageBytes - 1);
@@ -338,6 +478,10 @@ public:
     }
 
     bool HandleRead(std::uintptr_t address) {
+        if (mutex.HeldByCurrentThread()) return false;
+        if (guardsUsed.load(std::memory_order_acquire)) {
+            if (const auto served = handleAccessGuard(address, false)) return *served;
+        }
         std::lock_guard lock(mutex);
         if (!views.contains(address & ~(pageBytes - 1))) return false;
         const auto memory = query(address);
@@ -468,6 +612,12 @@ public:
 
     bool Protection(std::uintptr_t address, std::uint32_t* protection) {
         std::lock_guard lock(mutex);
+        if (guardedSubpages.load(std::memory_order_acquire) != 0) {
+            if (const auto guarded = accessGuards.find(address & ~std::uintptr_t{subpageBytes - 1}); guarded != accessGuards.end() && !views.contains(address & ~(pageBytes - 1))) {
+                *protection = guarded->second;
+                return true;
+            }
+        }
         const auto found = views.find(address & ~(pageBytes - 1));
         if (found == views.end()) return false;
         *protection = found->second.protection;
@@ -797,6 +947,35 @@ public:
     }
 
 private:
+    std::optional<bool> handleAccessGuard(std::uintptr_t address, bool write) {
+        {
+            std::lock_guard lock(mutex);
+            if (!accessGuards.contains(address & ~std::uintptr_t{subpageBytes - 1})) {
+                const auto memory = query(address);
+                const auto protection = memory.Protect & 0xffu;
+                const bool allowed = memory.State == MEM_COMMIT && (memory.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0 && (!write || writable(protection) || protection == PAGE_WRITECOPY || protection == PAGE_EXECUTE_WRITECOPY);
+                if (allowed) return true;
+                return std::nullopt;
+            }
+        }
+        const auto observer = accessGuardObserver.load(std::memory_order_acquire);
+        if (observer == nullptr) return false;
+        observer(address);
+        std::lock_guard lock(mutex);
+        return !accessGuards.contains(address & ~std::uintptr_t{subpageBytes - 1});
+    }
+
+    void dropAccessGuards(std::uintptr_t address, std::uintptr_t end) {
+        auto it = accessGuards.lower_bound(address & ~std::uintptr_t{subpageBytes - 1});
+        while (it != accessGuards.end() && it->first < end) {
+            DWORD previous = 0;
+            const bool restored = VirtualProtect(reinterpret_cast<void*>(it->first), subpageBytes, it->second, &previous) != 0;
+            it = accessGuards.erase(it);
+            guardedSubpages.fetch_sub(1, std::memory_order_release);
+            if (!restored) fail("drop a guest access guard");
+        }
+    }
+
     bool collectable(std::uintptr_t address, std::uintptr_t end) {
         const auto proven = collectableRanges.upper_bound(address);
         if (proven != collectableRanges.begin() && std::prev(proven)->second >= end) return true;
@@ -1290,6 +1469,10 @@ private:
     }
 
     void disownRange(std::uintptr_t start, std::uintptr_t end, std::atomic<std::uint64_t>* reason = nullptr) {
+        if (guardedSubpages.load(std::memory_order_acquire) != 0 && end > start) {
+            const auto guarded = accessGuards.lower_bound(start & ~std::uintptr_t{subpageBytes - 1});
+            if (guarded != accessGuards.end() && guarded->first < end) fail("a mapping, protection or host-access change over an access-guarded page");
+        }
         if (ownedLive == 0 || end <= start) return;
         end = std::min(end, ownedAddressLimit);
         for (auto block = start & ~std::uintptr_t{ownedBlockBytes - 1}; block < end && ownedLive != 0;) {
@@ -1754,7 +1937,12 @@ private:
 #ifdef APS5_COUNT_MAPPING_QUERIES
     static inline std::atomic<std::uint64_t> queries{0};
 #endif
-    std::mutex mutex;
+    MappingMutex mutex;
+    std::map<std::uintptr_t, DWORD> accessGuards;
+    std::atomic<std::size_t> guardedSubpages{0};
+    std::atomic<bool> guardsUsed{false};
+    std::atomic<std::uint32_t> changesActive{0};
+    std::atomic<void (*)(std::uintptr_t)> accessGuardObserver{nullptr};
     AllocateFunction allocate = nullptr;
     MapFunction map = nullptr;
     UnmapFunction unmap = nullptr;

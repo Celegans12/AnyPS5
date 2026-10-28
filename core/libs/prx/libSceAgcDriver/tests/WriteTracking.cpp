@@ -42,6 +42,9 @@ constexpr std::size_t Block = 65536;
 constexpr wchar_t HostHoleMode[] = L"--host-hole";
 constexpr wchar_t ResidentRemapMode[] = L"--resident-direct-remap";
 constexpr wchar_t OwnedProofsMode[] = L"--owned-proofs";
+constexpr wchar_t MappingOwnerMode[] = L"--mapping-owner";
+constexpr wchar_t AccessGuardsMode[] = L"--access-guards";
+constexpr wchar_t AccessReportingMode[] = L"--residency-reporting";
 constexpr wchar_t RewatchImportPagesMode[] = L"--rewatch-import-pages";
 constexpr wchar_t RewatchedSharedMode[] = L"--rewatched-direct-shared";
 constexpr wchar_t ImportAliasSharedMode[] = L"--import-alias-shared";
@@ -3070,6 +3073,316 @@ void CheckOwnedMappingChanges() {
     }
     std::cout << "owned proofs: unmap, partial map, guest protection and host writes move the words\n";
 }
+struct HandlersUnderLock {
+    std::uintptr_t address = 0;
+    DWORD owner = 0;
+    bool wrote = true;
+    bool read = true;
+};
+
+void CheckHandlersSkipMappingOwner() {
+    PrivateFixture fixture(Block, Block);
+    fixture.At(64) = 5;
+    HandlersUnderLock state;
+    state.address = static_cast<std::uintptr_t>(fixture.Base() + 64);
+    const auto body = [](void* argument) -> DWORD {
+        GuestArena::GuestArenaRunUnderMappingLock_nid_no_patch([](void* inner) {
+            auto& under = *static_cast<HandlersUnderLock*>(inner);
+            under.owner = GuestArena::GuestArenaMappingLockOwner_nid_no_patch();
+            under.wrote = GuestArena::GuestArenaHandleWrite_nid_postfix(under.address);
+            under.read = GuestArena::GuestArenaHandleRead_nid_postfix(under.address);
+        }, argument);
+        return 0;
+    };
+    const HANDLE worker = CreateThread(nullptr, 0, body, &state, 0, nullptr);
+    Require(worker != nullptr, "cannot start the thread that holds the mapping mutex");
+    if (WaitForSingleObject(worker, 5000) != WAIT_OBJECT_0) {
+        std::cerr << "FAIL: the fault handlers locked the mapping mutex on the thread that holds it\n";
+        std::cerr.flush();
+        TerminateProcess(GetCurrentProcess(), 3);
+    }
+    const auto workerId = GetThreadId(worker);
+    CloseHandle(worker);
+    Require(state.owner == workerId, "the mapping mutex did not name its holder");
+    Require(!state.wrote && !state.read, "a fault handler on the mapping mutex's holder claimed the fault instead of leaving it to the crash report");
+    Require(GuestArena::GuestArenaMappingLockOwner_nid_no_patch() == 0, "the mapping mutex kept an owner after it was released");
+    static_cast<void>(GuestArena::GuestArenaHandleWrite_nid_postfix(state.address));
+    static_cast<void>(GuestArena::GuestArenaHandleRead_nid_postfix(state.address));
+    Require(fixture.At(64) == 5 && GuestArena::GuestArenaMappingLockOwner_nid_no_patch() == 0, "the handlers on a thread without the mutex changed the page or kept the mutex");
+    std::cout << "mapping owner: the fault handlers never lock the mapping mutex on its holder\n";
+}
+std::atomic<std::uint32_t> accessGuardServes{0};
+
+void ServeAccessGuard(std::uintptr_t address) {
+    accessGuardServes.fetch_add(1);
+    GuestArena::GuestArenaUnguardAccess_nid_no_patch(address & ~std::uintptr_t{4095}, 4096);
+}
+
+DWORD HostProtection(const void* address) {
+    MEMORY_BASIC_INFORMATION info{};
+    Require(VirtualQuery(address, &info, sizeof(info)) == sizeof(info), "cannot query access-guarded memory");
+    return info.Protect;
+}
+
+void CheckAccessGuardReporting() {
+    PrivateFixture fixture(Block, Block);
+    const auto base = fixture.Base();
+    fixture.At(64) = 5;
+    Require(GuestArena::GuestArenaAccessGuardedSubpages_nid_no_patch() == 0, "access guards before any was armed");
+    Require(GuestArena::GuestArenaGuardAccess_nid_no_patch(base, 4096) == 0, "cannot guard a private read-write page");
+    Require(HostProtection(fixture.memory) == PAGE_NOACCESS && GuestArena::GuestArenaAccessGuarded_nid_no_patch(base + 100), "the guarded page is not no-access");
+    std::uint32_t protection = 0;
+    Require(GuestArena::GuestArenaProtection_nid_postfix(base, &protection) && protection == PAGE_READWRITE, "the guarded page does not report the guest's own protection");
+    const auto ranges = AgcDriver::GuestMemory::CommittedRanges(base, Block);
+    Require(ranges.size() == 1 && ranges[0].first == base && ranges[0].second == base + Block, "the committed ranges of a guarded page are not the whole fixture");
+    GuestArena::GuestArenaUnguardAccess_nid_no_patch(base, 4096);
+    Require(HostProtection(fixture.memory) == PAGE_READWRITE && GuestArena::GuestArenaAccessGuardedSubpages_nid_no_patch() == 0 && fixture.At(64) == 5, "unguarding did not restore the page");
+    std::cout << "access guards: a guarded page reports the guest's protection and stays committed\n";
+}
+
+void CheckAccessGuardFaultRoundTrip() {
+    PrivateFixture fixture(Block, Block);
+    const auto base = fixture.Base();
+    fixture.At(4096 + 8) = 7;
+    GuestArena::GuestArenaSetAccessGuardObserver_nid_no_patch(&ServeAccessGuard);
+    accessGuardServes = 0;
+    Require(GuestArena::GuestArenaGuardAccess_nid_no_patch(base + 4096, 2 * 4096) == 0, "cannot guard two subpages");
+    Require(fixture.At(4096 + 8) == 7, "the read of a guarded subpage returned the wrong value");
+    Require(accessGuardServes == 1 && GuestArena::GuestArenaAccessGuardedSubpages_nid_no_patch() == 1, "the read fault did not reach the observer once, or opened the other subpage too");
+    fixture.At(2 * 4096 + 16) = 9;
+    Require(accessGuardServes == 2 && GuestArena::GuestArenaAccessGuardedSubpages_nid_no_patch() == 0 && fixture.At(2 * 4096 + 16) == 9, "the write fault was not served");
+    GuestArena::GuestArenaSetAccessGuardObserver_nid_no_patch(nullptr);
+    std::cout << "access guards: read and write faults reach the observer, which opens the subpage\n";
+}
+
+void CheckAccessGuardHostAccess() {
+    PrivateFixture fixture(Block, Block);
+    const auto base = fixture.Base();
+    GuestArena::GuestArenaSetAccessGuardObserver_nid_no_patch(&ServeAccessGuard);
+    accessGuardServes = 0;
+    Require(GuestArena::GuestArenaGuardAccess_nid_no_patch(base, Block) == 0, "cannot guard the fixture");
+    Require(GuestArena::GuestArenaBeginHostWrite_nid_postfix(fixture.memory + 4096 + 100, 64), "the host write was refused");
+    Require(accessGuardServes == 1 && !GuestArena::GuestArenaAccessGuarded_nid_no_patch(base + 4096), "the host write did not open its subpage first");
+    std::memset(fixture.memory + 4096 + 100, 0x3c, 64);
+    Require(GuestArena::GuestArenaGuardAccess_nid_no_patch(base + 4096, 4096) == 4, "a guard was armed over an open host write");
+    GuestArena::GuestArenaEndHostWrite_nid_postfix(fixture.memory + 4096 + 100, 64);
+    GuestArena::GuestArenaPrepareHostRead_nid_no_patch(fixture.memory + 8 * 4096, 2 * 4096);
+    Require(accessGuardServes == 3 && GuestArena::GuestArenaAccessGuardedSubpages_nid_no_patch() == 13, "the host read did not open its two subpages");
+    GuestArena::GuestArenaSetAccessGuardObserver_nid_no_patch(nullptr);
+    GuestArena::GuestArenaUnguardAccess_nid_no_patch(base, Block);
+    Require(GuestArena::GuestArenaAccessGuardedSubpages_nid_no_patch() == 0 && fixture.At(4096 + 100) == 0x3c, "the fixture was not left open");
+    std::cout << "access guards: host writes and reads open guarded subpages first; no guard over an open host write\n";
+}
+
+struct GuardUnderLock {
+    std::uintptr_t address = 0;
+    bool read = true;
+    bool wrote = true;
+    bool guarded = true;
+};
+
+void CheckAccessGuardOwner() {
+    PrivateFixture fixture(Block, Block);
+    const auto base = fixture.Base();
+    GuestArena::GuestArenaSetAccessGuardObserver_nid_no_patch(&ServeAccessGuard);
+    accessGuardServes = 0;
+    Require(GuestArena::GuestArenaGuardAccess_nid_no_patch(base, 4096) == 0, "cannot guard the owner fixture");
+    GuardUnderLock state;
+    state.address = static_cast<std::uintptr_t>(base + 32);
+    const auto body = [](void* argument) -> DWORD {
+        GuestArena::GuestArenaRunUnderMappingLock_nid_no_patch([](void* inner) {
+            auto& under = *static_cast<GuardUnderLock*>(inner);
+            under.read = GuestArena::GuestArenaHandleRead_nid_postfix(under.address);
+            under.wrote = GuestArena::GuestArenaHandleWrite_nid_postfix(under.address);
+            under.guarded = GuestArena::GuestArenaAccessGuarded_nid_no_patch(under.address);
+        }, argument);
+        return 0;
+    };
+    const HANDLE worker = CreateThread(nullptr, 0, body, &state, 0, nullptr);
+    Require(worker != nullptr, "cannot start the thread that holds the mapping mutex");
+    if (WaitForSingleObject(worker, 5000) != WAIT_OBJECT_0) {
+        std::cerr << "FAIL: an access-guard fault on the mapping mutex's holder deadlocked\n";
+        std::cerr.flush();
+        TerminateProcess(GetCurrentProcess(), 3);
+    }
+    CloseHandle(worker);
+    Require(!state.read && !state.wrote && !state.guarded && accessGuardServes == 0, "the handlers served an access guard on the mapping mutex's holder instead of leaving it to the crash report");
+    Require(GuestArena::GuestArenaAccessGuarded_nid_no_patch(state.address), "the guard was dropped by the refused fault");
+    GuestArena::GuestArenaSetAccessGuardObserver_nid_no_patch(nullptr);
+    GuestArena::GuestArenaUnguardAccess_nid_no_patch(base, 4096);
+    std::cout << "access guards: a fault on the mapping mutex's holder is never served and never waits\n";
+}
+
+void CheckAccessGuardRefusals() {
+    PrivateFixture fixture(2 * Block, Block);
+    const auto base = fixture.Base();
+    Require(GuestArena::GuestArenaGuardAccess_nid_no_patch(base + 100, 4096) == 1, "a misaligned guard was not refused");
+    Require(GuestArena::GuestArenaGuardAccess_nid_no_patch(base + Block, 4096) == 6, "a guard over uncommitted memory was not refused");
+    GuestArena::GuestArenaPinWritable_nid_postfix(fixture.memory, 4096);
+    Require(GuestArena::GuestArenaGuardAccess_nid_no_patch(base, 4096) == 3, "a guard over a pinned page was not refused");
+    GuestArena::GuestArenaUnpinWritable_nid_postfix(fixture.memory, 4096);
+    constexpr std::size_t bytes = Block;
+    HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE, 0, bytes, nullptr);
+    Require(section != nullptr, "cannot create the shared view's backing");
+    auto* memory = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, Block));
+    Require(memory != nullptr, "cannot allocate the shared view's address");
+    GuestArena::GuestArenaMap_nid_postfix(memory, bytes, section, 0, PAGE_READWRITE);
+    Require(GuestArena::GuestArenaGuardAccess_nid_no_patch(reinterpret_cast<std::uintptr_t>(memory), 4096) == 2, "a guard over a shared view was not refused");
+    Require(GuestArena::GuestArenaAccessGuardedSubpages_nid_no_patch() == 0, "a refused guard armed something");
+    GuestArena::GuestArenaReset_nid_postfix(memory, bytes);
+    GuestArena::GuestArenaRelease_nid_postfix(memory, bytes);
+    CloseHandle(section);
+    std::cout << "access guards: misaligned, uncommitted, pinned and shared-view guards are refused and arm nothing\n";
+}
+
+void CheckAccessGuardMappingChange() {
+    PrivateFixture fixture(Block, Block);
+    const auto base = fixture.Base();
+    fixture.At(8) = 11;
+    static std::atomic<std::uint32_t> released{0};
+    static std::atomic<std::uint32_t> kept{0};
+    released = 0;
+    kept = 0;
+    GuestArena::GuestArenaSetMappingGuardObserver_nid_no_patch([](std::uintptr_t, std::size_t, bool releasing) { (releasing ? released : kept).fetch_add(1); });
+    Require(GuestArena::GuestArenaGuardAccess_nid_no_patch(base, 4096) == 0, "cannot guard before the protection change");
+    GuestArena::GuestArenaSetProtection_nid_postfix(base, 4096, PAGE_READWRITE);
+    GuestArena::GuestArenaEndSetProtection_nid_no_patch(base, 4096);
+    Require(kept == 1 && released == 0 && !GuestArena::GuestArenaAccessGuarded_nid_no_patch(base) && fixture.At(8) == 11, "a protection change did not call the observer first and drop the guard");
+    Require(GuestArena::GuestArenaGuardAccess_nid_no_patch(base, 4096) == 0, "cannot guard before the reset");
+    GuestArena::GuestArenaReset_nid_postfix(fixture.memory, 4096 * 4);
+    Require(released == 1 && GuestArena::GuestArenaAccessGuardedSubpages_nid_no_patch() == 0, "a reset did not call the observer as a release and drop the guard");
+    fixture.Commit(0, 4096 * 4);
+    Require(fixture.At(8) == 0, "recommitted memory after a reset of a guarded page does not read zeros");
+    GuestArena::GuestArenaSetMappingGuardObserver_nid_no_patch(nullptr);
+    std::cout << "access guards: protection changes and resets call the mapping observer first and drop the guards\n";
+}
+struct GuardRace {
+    volatile std::uint8_t* at = nullptr;
+    std::atomic<bool> stop{false};
+    std::atomic<std::uint64_t> reads{0};
+    std::atomic<std::uint64_t> wrong{0};
+};
+
+void CheckAccessGuardRace() {
+    PrivateFixture fixture(Block, Block);
+    const auto base = fixture.Base();
+    fixture.At(200) = 0x5a;
+    GuestArena::GuestArenaSetAccessGuardObserver_nid_no_patch(&ServeAccessGuard);
+    GuardRace race;
+    race.at = &fixture.At(200);
+    const auto body = [](void* argument) -> DWORD {
+        auto& state = *static_cast<GuardRace*>(argument);
+        while (!state.stop.load(std::memory_order_acquire)) {
+            if (*state.at != 0x5a) state.wrong.fetch_add(1);
+            state.reads.fetch_add(1);
+        }
+        return 0;
+    };
+    const HANDLE reader = CreateThread(nullptr, 0, body, &race, 0, nullptr);
+    Require(reader != nullptr, "cannot start the racing reader");
+    std::uint32_t armed = 0;
+    for (int k = 0; k < 10000; ++k) {
+        if (GuestArena::GuestArenaGuardAccess_nid_no_patch(base, 4096) == 0) ++armed;
+        GuestArena::GuestArenaUnguardAccess_nid_no_patch(base, 4096);
+    }
+    race.stop.store(true, std::memory_order_release);
+    if (WaitForSingleObject(reader, 10000) != WAIT_OBJECT_0) {
+        std::cerr << "FAIL: the racing reader did not finish\n";
+        std::cerr.flush();
+        TerminateProcess(GetCurrentProcess(), 3);
+    }
+    CloseHandle(reader);
+    GuestArena::GuestArenaSetAccessGuardObserver_nid_no_patch(nullptr);
+    Require(armed == 10000, "a guard of the race loop was refused: " + std::to_string(armed) + " of 10000 armed");
+    Require(race.wrong == 0 && race.reads > 0, "the racing reader saw a wrong value or never ran: " + std::to_string(race.wrong.load()) + " wrong of " + std::to_string(race.reads.load()));
+    Require(GuestArena::GuestArenaAccessGuardedSubpages_nid_no_patch() == 0 && HostProtection(fixture.memory) == PAGE_READWRITE, "the race left a guard or the wrong protection");
+    std::cout << "access guards: 10000 guard/unguard cycles against a reading thread, no lost fault (" << race.reads.load() << " reads)\n";
+}
+
+void CheckAccessGuardInFlight() {
+    PrivateFixture fixture(Block, Block);
+    const auto base = fixture.Base();
+    GuestArena::GuestArenaSetProtection_nid_postfix(base, 4096, PAGE_READONLY);
+    Require(GuestArena::GuestArenaGuardAccess_nid_no_patch(base, 4096) == 8, "a guard was armed while a guest protection change was in flight");
+    DWORD previous = 0;
+    Require(VirtualProtect(fixture.memory, 4096, PAGE_READONLY, &previous) != 0, "cannot apply the guest's protection change");
+    GuestArena::GuestArenaEndSetProtection_nid_no_patch(base, 4096);
+    Require(GuestArena::GuestArenaGuardAccess_nid_no_patch(base, 4096) == 0, "cannot guard after the protection change ended");
+    GuestArena::GuestArenaUnguardAccess_nid_no_patch(base, 4096);
+    Require(HostProtection(fixture.memory) == PAGE_READONLY, "the dropped guard did not leave the guest's new protection");
+    GuestArena::GuestArenaSetProtection_nid_postfix(base, 4096, PAGE_EXECUTE_READWRITE);
+    Require(VirtualProtect(fixture.memory, 4096, PAGE_EXECUTE_READWRITE, &previous) != 0, "cannot make the page executable");
+    GuestArena::GuestArenaEndSetProtection_nid_no_patch(base, 4096);
+    Require(GuestArena::GuestArenaGuardAccess_nid_no_patch(base, 4096) == 9, "a guard over an executable page was not refused");
+    Require(GuestArena::GuestArenaAccessGuardedSubpages_nid_no_patch() == 0, "the refused executable guard armed something");
+    GuestArena::GuestArenaSetProtection_nid_postfix(base, 4096, PAGE_READWRITE);
+    Require(VirtualProtect(fixture.memory, 4096, PAGE_READWRITE, &previous) != 0, "cannot restore the page");
+    GuestArena::GuestArenaEndSetProtection_nid_no_patch(base, 4096);
+    std::cout << "access guards: refused while a protection change is in flight and on executable pages; a drop keeps the new protection\n";
+}
+
+std::atomic<std::uint8_t> hookGuardResult{255};
+std::uintptr_t hookGuardBase = 0;
+
+void CheckAccessGuardDuringHostWrite() {
+    PrivateFixture fixture(Block, Block);
+    hookGuardBase = fixture.Base();
+    hookGuardResult = 255;
+    GuestArena::GuestArenaSetHostWriteHook_nid_no_patch([](std::uintptr_t, std::size_t) { hookGuardResult = GuestArena::GuestArenaGuardAccess_nid_no_patch(hookGuardBase, 4096); });
+    const bool begun = GuestArena::GuestArenaBeginHostWrite_nid_postfix(fixture.memory + 64, 32);
+    GuestArena::GuestArenaSetHostWriteHook_nid_no_patch(nullptr);
+    Require(begun, "the host write was refused");
+    std::memset(fixture.memory + 64, 0x6b, 32);
+    GuestArena::GuestArenaEndHostWrite_nid_postfix(fixture.memory + 64, 32);
+    Require(hookGuardResult == 8, "a guard armed from inside a host write's opening was not refused InFlight (code " + std::to_string(hookGuardResult.load()) + ")");
+    Require(GuestArena::GuestArenaAccessGuardedSubpages_nid_no_patch() == 0 && fixture.At(64) == 0x6b && fixture.At(95) == 0x6b, "the host write did not land, or a guard was left");
+    std::cout << "access guards: a guard armed while a host write is opening is refused and the write lands\n";
+}
+
+struct RemapState {
+    std::uint8_t* memory = nullptr;
+    HANDLE inside = nullptr;
+    HANDLE release = nullptr;
+};
+
+RemapState* remapState = nullptr;
+
+void CheckAccessGuardRemap() {
+    PrivateFixture fixture(Block, Block);
+    const auto base = fixture.Base();
+    RemapState state;
+    state.memory = fixture.memory;
+    state.inside = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    state.release = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    Require(state.inside != nullptr && state.release != nullptr, "cannot create the remap events");
+    remapState = &state;
+    GuestArena::GuestArenaSetMappingGuardObserver_nid_no_patch([](std::uintptr_t, std::size_t, bool) {
+        SetEvent(remapState->inside);
+        WaitForSingleObject(remapState->release, 10000);
+    });
+    Require(GuestArena::GuestArenaGuardAccess_nid_no_patch(base, 4096) == 0, "cannot guard before the remap");
+    const auto body = [](void* argument) -> DWORD {
+        auto& remap = *static_cast<RemapState*>(argument);
+        GuestArena::GuestArenaReset_nid_postfix(remap.memory, 4 * 4096);
+        return 0;
+    };
+    const HANDLE worker = CreateThread(nullptr, 0, body, &state, 0, nullptr);
+    Require(worker != nullptr, "cannot start the remapping thread");
+    Require(WaitForSingleObject(state.inside, 10000) == WAIT_OBJECT_0, "the reset never called the mapping observer");
+    const auto late = GuestArena::GuestArenaGuardAccess_nid_no_patch(base + 2 * 4096, 4096);
+    SetEvent(state.release);
+    Require(WaitForSingleObject(worker, 10000) == WAIT_OBJECT_0, "the reset did not finish");
+    CloseHandle(worker);
+    GuestArena::GuestArenaSetMappingGuardObserver_nid_no_patch(nullptr);
+    remapState = nullptr;
+    CloseHandle(state.inside);
+    CloseHandle(state.release);
+    Require(late == 8, "a guard armed during a reset was not refused (code " + std::to_string(late) + ")");
+    Require(GuestArena::GuestArenaAccessGuardedSubpages_nid_no_patch() == 0, "a guard survived the reset");
+    fixture.Commit(0, 4 * 4096);
+    Require(fixture.At(2 * 4096) == 0 && HostProtection(fixture.memory + 2 * 4096) == PAGE_READWRITE, "the recommitted range is not fresh read-write memory");
+    std::cout << "access guards: a guard armed while a reset is in progress is refused\n";
+}
 #endif
 
 int main(int argc, char** argv) {
@@ -3100,6 +3413,27 @@ int main(int argc, char** argv) {
         }
         if (std::wstring_view(GetCommandLineW()).ends_with(L"--owned-bench")) {
             BenchOwnedProofs();
+            return 0;
+        }
+        if (std::wstring_view(GetCommandLineW()).ends_with(AccessReportingMode)) {
+            CheckAccessGuardReporting();
+            return 0;
+        }
+        if (std::wstring_view(GetCommandLineW()).ends_with(AccessGuardsMode)) {
+            CheckAccessGuardFaultRoundTrip();
+            CheckAccessGuardHostAccess();
+            CheckAccessGuardOwner();
+            CheckAccessGuardRefusals();
+            CheckAccessGuardMappingChange();
+            CheckAccessGuardRace();
+            CheckAccessGuardInFlight();
+            CheckAccessGuardRemap();
+            CheckAccessGuardDuringHostWrite();
+            std::cout << "access guard tests passed\n";
+            return 0;
+        }
+        if (std::wstring_view(GetCommandLineW()).ends_with(MappingOwnerMode)) {
+            CheckHandlersSkipMappingOwner();
             return 0;
         }
         if (std::wstring_view(GetCommandLineW()).ends_with(OwnedProofsMode)) {
