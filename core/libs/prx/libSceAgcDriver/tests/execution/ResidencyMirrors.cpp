@@ -903,6 +903,105 @@ void ResidentViewsStayOnImports(const Context& context) {
     Expect(after.residentSkipped > before.residentSkipped, "resident view: the skipped admission is not counted");
 }
 
+void BackingCommitMany(const Context& context) {
+#ifdef _WIN32
+    constexpr VkDeviceSize Bytes = VkDeviceSize{64} << 20u;
+    constexpr int Count = 16;
+    const auto privateBytes = [] {
+        PROCESS_MEMORY_COUNTERS_EX counters{};
+        GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters), sizeof(counters));
+        return static_cast<long long>(counters.PrivateUsage);
+    };
+    const auto workingSet = [] {
+        PROCESS_MEMORY_COUNTERS_EX counters{};
+        GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters), sizeof(counters));
+        MEMORYSTATUSEX status{sizeof(status)};
+        GlobalMemoryStatusEx(&status);
+        return std::pair<long long, long long>(static_cast<long long>(counters.WorkingSetSize), static_cast<long long>(status.ullAvailPhys));
+    };
+    const auto allocate = context.Function<PFN_vkAllocateMemory>("vkAllocateMemory");
+    const auto release = context.Function<PFN_vkFreeMemory>("vkFreeMemory");
+    const auto type = context.MemoryType(~0u, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    for (int pass = 0; pass < 4; ++pass) {
+        const int variant = pass % 2;
+        VkMemoryAllocateFlagsInfo addressFlags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, nullptr, VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT, 0};
+        VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, variant == 1 ? &addressFlags : nullptr};
+        allocation.allocationSize = Bytes;
+        allocation.memoryTypeIndex = type;
+        std::vector<VkDeviceMemory> memories;
+        const auto before = privateBytes();
+        const auto setBefore = workingSet();
+        for (int i = 0; i < Count; ++i) {
+            VkDeviceMemory memory = VK_NULL_HANDLE;
+            if (allocate(context.device, &allocation, nullptr, &memory) == VK_SUCCESS) memories.push_back(memory);
+        }
+        const auto held = privateBytes();
+        const auto setHeld = workingSet();
+        std::printf("backing commit many: working set %+.1f MiB, available RAM %+.1f MiB while held\n", static_cast<double>(setHeld.first - setBefore.first) / (1024.0 * 1024.0), static_cast<double>(setHeld.second - setBefore.second) / (1024.0 * 1024.0));
+        for (const auto memory : memories) release(context.device, memory, nullptr);
+        const auto freed = privateBytes();
+        std::printf("backing commit many: %zu x 64 MiB device-local (type %u, %s): private %+.1f MiB while held, %+.1f MiB after free\n", memories.size(), type, variant == 1 ? "device address" : "plain", static_cast<double>(held - before) / (1024.0 * 1024.0), static_cast<double>(freed - before) / (1024.0 * 1024.0));
+    }
+#else
+    static_cast<void>(context);
+#endif
+}
+
+void BackingCommitByType(const Context& context) {
+#ifdef _WIN32
+    constexpr VkDeviceSize Bytes = VkDeviceSize{64} << 20u;
+    const auto privateBytes = [] {
+        PROCESS_MEMORY_COUNTERS_EX counters{};
+        GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters), sizeof(counters));
+        return static_cast<long long>(counters.PrivateUsage);
+    };
+    const auto allocate = context.Function<PFN_vkAllocateMemory>("vkAllocateMemory");
+    const auto release = context.Function<PFN_vkFreeMemory>("vkFreeMemory");
+    const auto createBuffer = context.Function<PFN_vkCreateBuffer>("vkCreateBuffer");
+    const auto destroyBuffer = context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer");
+    const auto requirementsOf = context.Function<PFN_vkGetBufferMemoryRequirements>("vkGetBufferMemoryRequirements");
+    const auto bind = context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory");
+    VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    info.size = Bytes;
+    info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    for (std::uint32_t type = 0; type < context.memory.memoryTypeCount; ++type) {
+        const auto flags = context.memory.memoryTypes[type].propertyFlags;
+        if ((flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0) continue;
+        for (int variant = 0; variant < 3; ++variant) {
+            VkBuffer buffer = VK_NULL_HANDLE;
+            Check(createBuffer(context.device, &info, nullptr, &buffer), "vkCreateBuffer backing probe");
+            VkMemoryRequirements requirements{};
+            requirementsOf(context.device, buffer, &requirements);
+            if ((requirements.memoryTypeBits & (1u << type)) == 0) {
+                destroyBuffer(context.device, buffer, nullptr);
+                break;
+            }
+            VkMemoryDedicatedAllocateInfo dedicated{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};
+            dedicated.buffer = buffer;
+            VkMemoryAllocateFlagsInfo addressFlags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, variant == 2 ? &dedicated : nullptr, VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT, 0};
+            VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            allocation.pNext = variant == 0 ? nullptr : &addressFlags;
+            allocation.allocationSize = requirements.size;
+            allocation.memoryTypeIndex = type;
+            const auto before = privateBytes();
+            VkDeviceMemory memory = VK_NULL_HANDLE;
+            const auto result = allocate(context.device, &allocation, nullptr, &memory);
+            const auto allocated = privateBytes();
+            if (result == VK_SUCCESS) Check(bind(context.device, buffer, memory, 0), "vkBindBufferMemory backing probe");
+            const auto bound = privateBytes();
+            if (memory != VK_NULL_HANDLE) release(context.device, memory, nullptr);
+            destroyBuffer(context.device, buffer, nullptr);
+            const auto freed = privateBytes();
+            const char* names[] = {"plain", "device address", "device address + dedicated"};
+            std::printf("backing commit by type: memory type %u (flags 0x%x, heap %u) %s: VkResult %d, private +%.1f MiB at allocate, +%.1f MiB after bind, %+.1f MiB after free\n", type, static_cast<unsigned>(flags), context.memory.memoryTypes[type].heapIndex, names[variant], static_cast<int>(result), static_cast<double>(allocated - before) / (1024.0 * 1024.0), static_cast<double>(bound - before) / (1024.0 * 1024.0), static_cast<double>(freed - before) / (1024.0 * 1024.0));
+        }
+    }
+#else
+    static_cast<void>(context);
+#endif
+}
+
 void BackingCommit(const Context& context) {
 #ifdef _WIN32
     PROCESS_MEMORY_COUNTERS_EX before{};
@@ -945,6 +1044,8 @@ int main() {
             Release(fixture);
         }
         BackingCommit(device->Get());
+        BackingCommitByType(device->Get());
+        BackingCommitMany(device->Get());
         ResidentViewsStayOnImports(device->Get());
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: exception: %s\n", error.what());
