@@ -428,6 +428,9 @@ struct Replay {
     std::atomic<std::uint64_t> lateReleases{0};
     std::atomic<std::uint64_t> syntheticReleases{0};
     std::atomic<std::size_t> sequenced{0};
+    std::atomic<int> busy{0};
+    std::atomic<std::uint64_t> parkedReleases{0};
+    std::atomic<std::uint64_t> fallbackReleases{0};
     std::uint64_t unfinished = 0;
     std::size_t threads = 0;
     bool recording = false;
@@ -463,6 +466,11 @@ struct Replay {
         auto deadline = began + timeout;
         auto quietSince = began;
         const auto waited = [&] { paceWaitedNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - began).count(); };
+        struct Parked {
+            std::atomic<int>& busy;
+            explicit Parked(std::atomic<int>& counter) : busy(counter) { --busy; }
+            ~Parked() { ++busy; }
+        } parked{busy};
         while (true) {
             const auto [accepted, completed] = progress();
             if (accepted - completed <= inFlight) {
@@ -501,6 +509,7 @@ struct Replay {
     }
 
     static constexpr auto ExactQuiet = std::chrono::milliseconds(50);
+    static constexpr auto ParkedQuiet = std::chrono::milliseconds(5);
     static constexpr auto BlockedQuiet = std::chrono::milliseconds(5);
 
     bool deltaReleasesWait(const FrameCall& call) {
@@ -666,10 +675,34 @@ struct Replay {
         return false;
     }
 
+    std::size_t recordedIndex(std::span<const FrameCall> calls, std::size_t from, const AgcDriver::AwaitedWait& wait) const {
+        for (auto index = from; index < calls.size(); ++index) {
+            if (calls[index].kind != FrameCallKind::Memory) continue;
+            const auto found = groups.find(calls[index].values.at(0));
+            if (found == groups.end()) continue;
+            for (const auto* chunk : found->second) {
+                if (chunk->address <= wait.address && wait.address + 4 <= chunk->address + chunk->bytes) return index;
+            }
+        }
+        return calls.size();
+    }
+
     void releaseAwaited(std::span<const FrameCall> calls, std::size_t from) {
         std::lock_guard lock(memoryMutex);
         std::array<AgcDriver::AwaitedWait, 64> awaited{};
         const auto count = AgcDriverAwaitedWaits_nid_postfix(awaited.data(), awaited.size());
+        if (options.exact) {
+            std::array<std::pair<std::size_t, std::uint64_t>, 64> keys{};
+            std::array<std::size_t, 64> order{};
+            for (std::size_t slot = 0; slot < count; ++slot) {
+                keys[slot] = {awaited[slot].address == 0 ? calls.size() + 1 : recordedIndex(calls, from, awaited[slot]), awaited[slot].address};
+                order[slot] = slot;
+            }
+            std::sort(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(count), [&](std::size_t left, std::size_t right) { return keys[left] < keys[right]; });
+            std::array<AgcDriver::AwaitedWait, 64> sorted{};
+            for (std::size_t slot = 0; slot < count; ++slot) sorted[slot] = awaited[order[slot]];
+            awaited = sorted;
+        }
         for (std::size_t slot = 0; slot < count; ++slot) {
             const auto& wait = awaited[slot];
             if (wait.address == 0) continue;
@@ -718,6 +751,7 @@ struct Replay {
             auto lastCompleted = progress().second;
             auto lastSequenced = sequenced.load();
             auto lastProgress = Clock::now();
+            std::optional<Clock::time_point> parkedSince;
             const auto quiet = options.exact ? std::max<std::chrono::milliseconds>(options.releaseAfter, ExactQuiet * 4) : options.releaseAfter;
             while (!finished.load()) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -727,9 +761,31 @@ struct Replay {
                     lastCompleted = completed;
                     lastSequenced = issued;
                     lastProgress = Clock::now();
+                    parkedSince.reset();
                     continue;
                 }
-                if (Clock::now() - lastProgress < quiet || (options.exact && sequenced.load() < calls.size())) continue;
+                if (options.exact) {
+                    const auto now = Clock::now();
+                    if (busy.load() == 0 && blockedOnWaits()) {
+                        if (!parkedSince) parkedSince = now;
+                        if (now - *parkedSince < ParkedQuiet) continue;
+                        releaseAwaited(calls, sequenced.load());
+                        ++parkedReleases;
+                        parkedSince.reset();
+                        lastProgress = Clock::now();
+                        continue;
+                    }
+                    parkedSince.reset();
+                    if (now - lastProgress < quiet) continue;
+                    ++fallbackReleases;
+                    const auto [accepted, completed] = progress();
+                    std::fprintf(stderr, "[frame-replay] --exact: no parked state for %lld ms (%d replay threads running, serials %llu/%llu): wall-clock fallback release at call %zu\n", static_cast<long long>(quiet.count()), busy.load(),
+                                 static_cast<unsigned long long>(completed), static_cast<unsigned long long>(accepted), sequenced.load());
+                    releaseAwaited(calls, sequenced.load());
+                    lastProgress = Clock::now();
+                    continue;
+                }
+                if (Clock::now() - lastProgress < quiet) continue;
                 releaseAwaited(calls, sequenced.load());
                 lastProgress = Clock::now();
             }
@@ -750,7 +806,13 @@ struct Replay {
                     const auto kind = calls[index].kind;
                     const bool ordered = kind == FrameCallKind::Memory || kind == FrameCallKind::RegisterVideoOutput || kind == FrameCallKind::UnregisterVideoOutput;
                     if (!ordered) advance();
+                    struct Running {
+                        std::atomic<int>& busy;
+                        explicit Running(std::atomic<int>& counter) : busy(counter) { ++busy; }
+                        ~Running() { --busy; }
+                    };
                     try {
+                        const Running running{busy};
                         execute(calls[index]);
                         if (ordered) advance();
                     } catch (...) {
@@ -766,6 +828,7 @@ struct Replay {
         if (failure == nullptr) drain();
         finished.store(true);
         breaker.join();
+        if (options.exact && (parkedReleases.load() != 0 || fallbackReleases.load() != 0)) std::fprintf(stderr, "[frame-replay] --exact releases: %llu while parked, %llu by the wall-clock fallback\n", static_cast<unsigned long long>(parkedReleases.load()), static_cast<unsigned long long>(fallbackReleases.load()));
         if (failure != nullptr) std::rethrow_exception(failure);
     }
 
@@ -821,7 +884,7 @@ int usage() {
                          "  --exact             waits for every earlier submission and its GPU work to complete before each submission, flip and\n"
                          "                      memory delta,\n"
                          "                      so the GPU work runs in one order (a reproducible baseline, slower than the title), and releases\n"
-                         "                      awaited dwords only after the window's last call was issued\n"
+                         "                      awaited dwords when every replay thread is parked and the driver is blocked on waits, in capture order\n"
                          "  --frame-limit <n>   replays the calls through the n-th CPU flip, or the n-th suspend point when the title flips from the GPU,\n"
                          "                      and compares the display buffer with the title's image at that frame\n"
                          "  --checkpoint <csv>  replays up to the checkpoint of a capture made with APS5_FRAME_CAPTURE_CHECKPOINT=<frame> and lists\n"
@@ -914,9 +977,13 @@ FrameCheck compareFrames(const FrameCaptureReader& reader, const Options& option
     return check;
 }
 
-void compareCheckpoint(const FrameCaptureReader& reader, const std::filesystem::path& path, const Skipped& skipped) {
-    AgcDriverWaitIdle_nid_postfix();
-    if (!AgcDriverSettle_nid_postfix()) std::fprintf(stderr, "[frame-replay] storage images were still pending at the checkpoint\n");
+void compareCheckpoint(const FrameCaptureReader& reader, const std::filesystem::path& path, const Skipped& skipped, bool drained = true) {
+    if (drained) {
+        AgcDriverWaitIdle_nid_postfix();
+        if (!AgcDriverSettle_nid_postfix()) std::fprintf(stderr, "[frame-replay] storage images were still pending at the checkpoint\n");
+    } else {
+        std::fprintf(stderr, "[frame-replay] checkpoint compared with submissions still parked on waits whose writers lie beyond the window\n");
+    }
     std::ofstream report(path, std::ios::trunc);
     auto blocksPath = path;
     blocksPath += ".replay.bin";
@@ -992,7 +1059,7 @@ int run(const Options& options) {
         replay.runWindow(window);
     }
     if (frameStart == calls.end()) AgcDriverWaitIdle_nid_postfix();
-    if (!options.checkpointReport.empty()) compareCheckpoint(reader, options.checkpointReport, replay.skipped);
+    if (!options.checkpointReport.empty()) compareCheckpoint(reader, options.checkpointReport, replay.skipped, replay.unfinished == 0);
     replay.endedAt = Clock::now();
     if (const auto failure = replay.frames.Failure()) std::rethrow_exception(failure);
     FrameCheck check;
