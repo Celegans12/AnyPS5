@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/DevicePageTable.hpp"
+#include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/ResolvedPush.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidencySession.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryStatsDevice.hpp"
@@ -5908,7 +5909,14 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         context.Resolved(&Graphics::DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout, ShaderRecompiler::WorkgroupMemoryDescriptorSet, 1, &memory->set, 0, nullptr);
         recorder.Keep(std::move(memory));
     }
-    if (record.pushStages != 0) {
+    if (NewPath::ResolvedModule(*record.shader->program)) {
+        auto& table = NewPath::DeviceTable();
+        if (table.Stale(context.device)) static_cast<void>(table.Refresh(context));
+        static_cast<void>(NewPath::UploadTableForLane(context, recorder, table.Current(), static_cast<std::uint32_t>(Graphics::Recorder::ThreadLane())));
+        const auto resolvedPush = NewPath::ComposeResolvedPush(*record.pushBytes, Graphics::ComputePushConstantBytes, table.RootAddress(), table.FaultRecordAddress(context));
+        Graphics::Require(resolvedPush.has_value(), "a new-path resolved dispatch has no page table or fault record for its push block");
+        context.Resolved(&Graphics::DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, record.objects->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, NewPath::PushRangeBytes(true), resolvedPush->data());
+    } else if (record.pushStages != 0) {
         context.Resolved(&Graphics::DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, record.objects->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::ComputePushConstantBytes, record.pushBytes->data());
     }
     const auto gpuTiming = recorder.BeginGpuTiming(record.programAddress != 0 ? record.programAddress : record.shader->program->variantId);
@@ -6143,12 +6151,14 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::createComputePipeline(cons
     objects->module = Graphics::CreateShaderModule(state->DeviceFunction<PFN_vkCreateShaderModule>("vkCreateShaderModule"), state->device, state->graphicsPipelineLibrary, shader.spirv.data(), shader.spirv.size() * sizeof(std::uint32_t), "vkCreateShaderModule");
     objects->resourcesLayout = setLayout;
     const auto setLayouts = computeSetLayouts(context, shader, setLayout);
-    const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::ComputePushConstantBytes};
+    const bool resolvedModule = NewPath::ResolvedModule(shader);
+    const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, NewPath::PushRangeBytes(resolvedModule)};
+    Graphics::Require(!resolvedModule || state->properties.limits.maxPushConstantsSize >= push.size, "a new-path resolved module's push range exceeds the device limit");
     VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     layoutInfo.setLayoutCount = static_cast<std::uint32_t>(setLayouts.size());
     layoutInfo.pSetLayouts = setLayouts.data();
-    layoutInfo.pushConstantRangeCount = pushStages != 0 ? 1 : 0;
-    layoutInfo.pPushConstantRanges = pushStages != 0 ? &push : nullptr;
+    layoutInfo.pushConstantRangeCount = pushStages != 0 || resolvedModule ? 1 : 0;
+    layoutInfo.pPushConstantRanges = pushStages != 0 || resolvedModule ? &push : nullptr;
     check(state->DeviceFunction<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(state->device, &layoutInfo, nullptr, &objects->layout), "vkCreatePipelineLayout");
     const VkPipelineCreateFlags pipelineFlags = computePipelineFlags();
     const Graphics::PipelineSpecialization specialization(shader);

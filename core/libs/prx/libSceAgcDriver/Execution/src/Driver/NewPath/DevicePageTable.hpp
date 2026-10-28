@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/CommandAccess.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaPageTable.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -44,6 +45,7 @@ public:
     [[nodiscard]] std::vector<Range> Ranges() const;
     [[nodiscard]] std::uint64_t RootAddress() const;
     [[nodiscard]] TableLists Lists() const;
+    [[nodiscard]] std::uint64_t FaultRecordAddress(const Graphics::Context& context);
 
     [[nodiscard]] static std::vector<Range> Overlay(std::span<const Range> base, std::span<const Range> resident, std::uint64_t begin, std::uint64_t end);
 
@@ -57,6 +59,8 @@ private:
     std::vector<Range> importRanges;
     std::vector<Range> tableRanges;
     TableLists tableLists;
+    std::shared_ptr<Graphics::Buffer> faultRecord;
+    VkDevice faultDevice = VK_NULL_HANDLE;
     std::uint64_t builtVersion = 0;
     bool built = false;
     std::shared_ptr<const Graphics::BdaPageTable> table;
