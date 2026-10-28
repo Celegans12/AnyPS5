@@ -197,6 +197,10 @@ RdnaProgram DecodeStageProgram(ShaderStageKind stage, std::span<const std::uint3
 }
 
 ShaderStageInputInfo RequestInputInfo(const RecompileRequest& request) {
+    // The new path's target fields select emission that is not written yet (S4 epoch 1, T-9): a request that asks for it
+    // must not get today's module under a key that says otherwise.
+    if (request.target.newPathResolved) throw std::runtime_error("the newPathResolved target (page-table walk, push-block user SGPRs) is not implemented yet");
+    if (request.target.bdaSegments) throw std::runtime_error("the bdaSegments target (segment programs) is not implemented yet");
     const auto* mesh = request.graphics && request.graphics->mesh ? &*request.graphics->mesh : nullptr;
     std::optional<TessellationConfiguration> tessellationCopy;
     if (request.graphics && request.graphics->tessellation) {

@@ -352,6 +352,13 @@ struct SpirvTarget {
     // wave (the two-lane layout otherwise, HostSubgroupSize). Measured on the cloth family (request bench,
     // research/speed/newpath/census-c.md): -11..-26 % GPU time, about half the SPIR-V, same results.
     bool singleLaneGroups = false;
+    // New GPU path (PLAN v2 S2/S4): the program reads user SGPRs from the new path's push block and reaches guest
+    // memory through the device page table (the walk, BdaAbi page entries) instead of the per-build range list.
+    // Off: today's emission, unchanged.
+    bool newPathResolved = false;
+    // S4 segment program: each V# read translates its base once through its settled segment and checks every access
+    // against it (FaultReason::OutsideSegment); no per-access walk. Only together with newPathResolved.
+    bool bdaSegments = false;
     // GLSL.std.450 Fma is a fused multiply-add on the device (the driver's startup probe, VulkanDevice
     // FusedFmaProbe): v_fma_mix* then takes an exact f32 path instead of the f64 helper.
     bool fusedFma = false;

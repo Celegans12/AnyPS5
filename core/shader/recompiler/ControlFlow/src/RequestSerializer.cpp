@@ -6,7 +6,7 @@ namespace ShaderRecompiler {
 
 namespace {
 
-constexpr std::uint32_t CurrentVersion = 48u;
+constexpr std::uint32_t CurrentVersion = 49u;
 constexpr std::uint32_t DrawParameterBlockTag = 0x31504447u;
 constexpr std::uint32_t LocalFeatures = 22u;
 constexpr char kBase64Alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -933,6 +933,10 @@ DeserializedRequest deserialize(std::string_view decoded, std::uint32_t version,
         if (result.compute.has_value()) result.compute->singleWorkgroup = singleWorkgroup;
     }
     if (version >= 48u) result.request.target.singleLaneGroups = reader.ReadBool();
+    if (version >= 49u) {
+        result.request.target.newPathResolved = reader.ReadBool();
+        result.request.target.bdaSegments = reader.ReadBool();
+    }
     if (version >= 26u && reader.Remaining() == 12u && result.request.context.vertex.has_value()) {
         if (reader.ReadU32() != DrawParameterBlockTag) throw std::runtime_error("RequestSerializer: unexpected trailing data");
         result.request.context.vertex->drawBaseVertexSgpr = reader.ReadI32();
@@ -992,6 +996,8 @@ std::string RequestSerializer::Serialize(const RecompileRequest& request) const 
     writer.WriteU32(request.target.pixelFunctionStorageDwords);
     if (request.context.compute.has_value()) writer.WriteBool(request.context.compute->singleWorkgroup);
     writer.WriteBool(request.target.singleLaneGroups);
+    writer.WriteBool(request.target.newPathResolved);
+    writer.WriteBool(request.target.bdaSegments);
     // Optional trailing block (no version bump, so requests without it serialize as before): the
     // GPU-side indirect draw parameter SGPRs of a vertex stage.
     if (request.context.vertex.has_value() && (request.context.vertex->drawBaseVertexSgpr >= 0 || request.context.vertex->drawStartInstanceSgpr >= 0)) {
