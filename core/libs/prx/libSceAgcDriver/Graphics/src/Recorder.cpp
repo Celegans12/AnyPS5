@@ -1568,6 +1568,40 @@ void Recorder::submitLane(int lane) {
     Submit();
 }
 
+Recorder::Token Recorder::CallerToken() const {
+    const auto lane = ThreadLane();
+    Require(lane >= 0 && static_cast<std::size_t>(lane) < LaneStreams, "the calling thread's lane has no token stream");
+    Token token{};
+    token[static_cast<std::size_t>(lane)] = OpenSerial();
+    return token;
+}
+
+Recorder::Token Recorder::AllToken() const {
+    Token token{};
+    for (std::size_t stream = 0; stream < LaneStreams; ++stream) token[stream] = OpenSerial();
+    return token;
+}
+
+std::uint64_t Recorder::TokenThrough(const Token& token) {
+    std::uint64_t through = 0;
+    for (std::size_t stream = 0; stream < LaneStreams; ++stream) through = std::max(through, token[stream]);
+    for (std::size_t stream = LaneStreams; stream < MaxStreams; ++stream) Require(token[stream] == 0, "a recorder token names a stream past the recorder's lanes");
+    return through;
+}
+
+bool Recorder::TokenReached(const Token& token) const {
+    return TokenThrough(token) <= CompletedThrough();
+}
+
+void Recorder::FinishToken(const Token& token) {
+    if (TokenReached(token)) return;
+    SubmitAllLanes();
+    const auto submitted = UseSerial() - 1;
+    WaitSerial(submitted);
+    FinishUpTo(submitted);
+    Require(TokenReached(token), "a recorder token was not reached after every submitted batch completed");
+}
+
 void Recorder::SubmitAllLanes() {
     submitLane(1 - currentLane());
     Submit();

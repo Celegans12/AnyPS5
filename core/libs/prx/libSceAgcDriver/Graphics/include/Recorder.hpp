@@ -293,6 +293,14 @@ public:
     // lane's earlier-opened batch completed, while the first one still read it.
     // RetiredSerial() (a use noted at UseSerial()) is capped the same way when a batch finishes.
     std::uint64_t CompletedThrough() const;
+    static constexpr std::size_t MaxStreams = 16;
+    using Token = std::array<std::uint64_t, MaxStreams>;
+    static constexpr std::size_t LaneStreams = 2;
+    Token CallerToken() const;
+    Token AllToken() const;
+    static std::uint64_t TokenThrough(const Token& token);
+    bool TokenReached(const Token& token) const;
+    void FinishToken(const Token& token);
     // Under the mutex, async lane only: the calling thread's lane's open (or next) batch waits on the
     // GPU for everything lane `from` recorded so far (its open batch is submitted first).
     void OrderAfterLane(int from);
