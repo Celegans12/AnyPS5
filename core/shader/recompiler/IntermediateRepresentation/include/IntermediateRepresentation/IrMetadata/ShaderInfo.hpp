@@ -21,6 +21,20 @@ struct BufferStoreSite {
     bool operator==(const BufferStoreSite& other) const = default;
 };
 
+struct TransferKernelSite {
+    enum class Kind : std::uint8_t { Fill, Copy };
+    Kind kind = Kind::Fill;
+    std::uint32_t components = 0;
+    std::uint32_t destination = 0;
+    std::uint32_t source = 0;
+    std::array<std::uint32_t, 4> values{};
+    std::uint32_t valueRegisters = 0;
+    std::uint32_t valueMemory = 0;
+    std::uint32_t valueDescriptor = 0;
+
+    bool operator==(const TransferKernelSite& other) const = default;
+};
+
 struct LinearStoreSite {
     std::uint32_t components = 0;
     std::uint32_t elementBytes = 0;
@@ -63,6 +77,7 @@ struct ShaderInfo {
     bool layerExported = false;
     bool smoothOffsetBarycentrics = false;
     std::optional<LinearStoreSite> linearStore;
+    std::optional<TransferKernelSite> transferKernel;
 
     bool operator==(const ShaderInfo& other) const = default;
 };

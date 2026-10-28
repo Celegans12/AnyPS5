@@ -45,6 +45,7 @@
 #include "Optimization/include/Optimization/ResourceTracker.hpp"
 #include "Optimization/include/Optimization/VectorWindowStoreEliminator.hpp"
 #include "Optimization/include/Optimization/LinearStore.hpp"
+#include "Optimization/include/Optimization/TransferKernel.hpp"
 #include "SpirvBackend/SpirvBufferFormat.hpp"
 #include "Optimization/include/Optimization/ShaderInfoCollector.hpp"
 #include "Optimization/include/Optimization/SrtWalker.hpp"
@@ -429,6 +430,7 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
     deadCodeEliminator.Eliminate(program);
     dumpIr("resources");
     if (request.context.compute && !request.context.compute->PartialGroups()) program.Info().linearStore = FindLinearStore(program, request.context.compute->numThreads);
+    program.Info().transferKernel = FindTransferKernel(program);
     program.Resources().srgbDecodeFormats = request.target.srgbDecodeFormats;
     if (request.context.convertedSamples) {
         for (auto& image : program.Resources().info.images) image.convertedSamples = true;
@@ -1726,6 +1728,11 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         else if (range->second > range->first) result.readRanges.push_back(*range);
     }
     result.linearStore = MaterializeLinearStore(variant.info.info, snapshot.stores);
+    result.transferKernel.reset();
+    if (result.linearStore && variant.info.info.transferKernel) {
+        const auto& site = *variant.info.info.transferKernel;
+        result.transferKernel = TransferKernel{site.kind == TransferKernelSite::Kind::Copy ? TransferKernel::Kind::Copy : TransferKernel::Kind::Fill, site.components, site.destination, site.source, site.values, site.valueRegisters, site.valueMemory, site.valueDescriptor};
+    }
     if (!tables.map.empty()) {
         result.imageTablePoison.reserve(tables.poison.size());
         for (const auto& poison : tables.poison) result.imageTablePoison.push_back({poison.words, poison.dwordCount, poison.resource, static_cast<std::uint32_t>(poison.reason)});
