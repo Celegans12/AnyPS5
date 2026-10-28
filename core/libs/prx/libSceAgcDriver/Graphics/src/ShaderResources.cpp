@@ -7459,6 +7459,25 @@ std::size_t ShaderResources::DrawUploadLimit() {
     return limit;
 }
 
+namespace {
+// Diagnostic (APS5_PROFILE_DRAW): draw bindings read in place by C64 instead of a refreshed snapshot; [gpu-written-in-place]
+// every 10 s.
+void countGpuWrittenInPlace(std::size_t bytes) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile) return;
+    static std::mutex countMutex;
+    static std::uint64_t bindings = 0, total = 0;
+    static auto report = std::chrono::steady_clock::now();
+    std::lock_guard countLock(countMutex);
+    ++bindings;
+    total += bytes;
+    if (std::chrono::steady_clock::now() - report < std::chrono::seconds(10)) return;
+    report = std::chrono::steady_clock::now();
+    AgcDriver::ProfilePrint_nid_no_patch("[gpu-written-in-place] (10 s) %llu bindings, %.1f MiB not snapshotted\n", static_cast<unsigned long long>(bindings), total / 1048576.0);
+    bindings = total = 0;
+}
+}
+
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly) const {
     if (_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) return {};
     if (usesBda) {
@@ -7568,6 +7587,12 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                 countDrawSnapshot(DrawSnapshotPath::Upload, bytes);
             } else {
                 const auto generation = GuestMemory::CollectWrites(begin, bytes);
+                // C64: a range only GPU work rewrote since its snapshot is read in place (the base descriptor), not
+                // compared and patched again on every draw (two 23 MiB menu buffers, ~1.6 ms/frame, best413/414).
+                if (override == moved.end() && !RuntimeSwitches::Set(RuntimeSwitch::NoGpuWrittenInPlace) && recorder.DrawSnapshotGpuWrittenOnly(begin, bytes)) {
+                    countGpuWrittenInPlace(bytes);
+                    continue;
+                }
                 const bool owned = generation == 0 && ownedSnapshots;
                 bool arm = false;
                 auto ownedMiss = Recorder::OwnedSnapshotMiss::None;
