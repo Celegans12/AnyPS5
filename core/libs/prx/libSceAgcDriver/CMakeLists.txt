@@ -373,6 +373,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderAddressResources.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/GuestBufferMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ResidentMirror.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/BdaPageTable.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Residency.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ResidencyConfig.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/BdaResources.cpp
@@ -894,6 +895,21 @@ if(BUILD_TESTING AND WIN32)
     add_test(NAME agc_page_state_metadata COMMAND agc_page_state_tests --metadata)
     set_tests_properties(agc_page_states agc_page_state_metadata PROPERTIES
         TIMEOUT 30 ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+endif()
+
+add_test_executable(agc_bda_page_table_tests EXCLUDE_FROM_ALL tests/BdaPageTable.cpp)
+target_include_directories(agc_bda_page_table_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/core/shader/recompiler ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR})
+target_link_libraries(agc_bda_page_table_tests PRIVATE libSceAgcDriver libc)
+set_target_properties(agc_bda_page_table_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_bda_page_table_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_bda_page_table_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_bda_page_table COMMAND agc_bda_page_table_tests)
+    set_tests_properties(agc_bda_page_table PROPERTIES TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_bda_page_table PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
 endif()
 
 add_test_executable(agc_locks_tests EXCLUDE_FROM_ALL tests/Locks.cpp)
