@@ -26,6 +26,8 @@ public:
         std::uint64_t ranges = 0;
         std::uint64_t coveredBytes = 0;
         std::uint64_t importVersion = 0;
+        std::uint64_t released = 0;
+        std::uint64_t outlived = 0;
     };
 
     DevicePageTable(ImportSource imports, VersionSource version);
@@ -34,6 +36,7 @@ public:
     [[nodiscard]] bool Stale(VkDevice device) const;
     std::shared_ptr<const Graphics::BdaPageTable> PatchPages(const Graphics::Context& context, std::span<const std::uint64_t> pages);
     void SetResidentPieces(ResidentPieces pieces);
+    void Release(VkDevice device);
 
     [[nodiscard]] std::shared_ptr<const Graphics::BdaPageTable> Current() const;
     [[nodiscard]] Counts Totals() const;
@@ -51,6 +54,8 @@ private:
     std::uint64_t builtVersion = 0;
     bool built = false;
     std::shared_ptr<const Graphics::BdaPageTable> table;
+    VkDevice tableDevice = VK_NULL_HANDLE;
+    std::vector<std::shared_ptr<const Graphics::BdaPageTable>> outlivedDevices;
     Counts counts;
 };
 

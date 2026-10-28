@@ -56,6 +56,11 @@ std::shared_ptr<const Graphics::BdaPageTable> DevicePageTable::Refresh(const Gra
         ++counts.unchanged;
         return table;
     }
+    if (table != nullptr && tableDevice != context.device) {
+        outlivedDevices.push_back(std::move(table));
+        ++counts.outlived;
+    }
+    tableDevice = context.device;
     auto snapshot = imports(context);
     importRanges = std::move(snapshot.ranges);
     std::sort(importRanges.begin(), importRanges.end(), [](const Range& left, const Range& right) { return left.begin < right.begin; });
@@ -85,6 +90,20 @@ std::shared_ptr<const Graphics::BdaPageTable> DevicePageTable::PatchPages(const 
     return table;
 }
 
+void DevicePageTable::Release(VkDevice device) {
+    std::shared_ptr<const Graphics::BdaPageTable> dropped;
+    {
+        std::lock_guard lock(mutex);
+        if (tableDevice != device || table == nullptr) return;
+        dropped = std::move(table);
+        tableDevice = VK_NULL_HANDLE;
+        importRanges.clear();
+        built = false;
+        builtVersion = 0;
+        ++counts.released;
+    }
+}
+
 void DevicePageTable::SetResidentPieces(ResidentPieces pieces) {
     std::lock_guard lock(mutex);
     resident = std::move(pieces);
@@ -101,8 +120,8 @@ DevicePageTable::Counts DevicePageTable::Totals() const {
 }
 
 DevicePageTable& DeviceTable() {
-    static DevicePageTable table([](const Graphics::Context& context) { return Graphics::HostImportRanges(context); }, [](VkDevice device) { return Graphics::HostImportsVersion(device); });
-    return table;
+    static auto* table = new DevicePageTable([](const Graphics::Context& context) { return Graphics::HostImportRanges(context); }, [](VkDevice device) { return Graphics::HostImportsVersion(device); });
+    return *table;
 }
 
 }
