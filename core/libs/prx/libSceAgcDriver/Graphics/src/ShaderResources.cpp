@@ -13,6 +13,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidentCensus.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
@@ -7593,6 +7594,25 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                     countGpuWrittenInPlace(bytes);
                     continue;
                 }
+                // C67: a moved range (template reuse at another address) has no base descriptor to fall back on: when
+                // only GPU work rewrote it since its snapshot, its descriptor names the host import in place, and the
+                // read is noted pending as the base descriptors' are (a CPU-side store over it waits or goes to the GPU
+                // in order). Draws only (a dispatch's moved-only overlay has no pass reads to order it behind earlier
+                // writes). APS5_NO_MOVED_IN_PLACE=1 (runtime switch) refreshes the snapshot as before.
+                if (override != moved.end() && !movedOnly && !RuntimeSwitches::Set(RuntimeSwitch::NoMovedInPlace) && recorder.DrawSnapshotGpuWrittenOnly(begin, bytes)) {
+                    const auto* import = HostImportFor(context, begin, bytes);
+                    const auto importOffset = import != nullptr ? HostImportOffset(*import, begin) : 0;
+                    const auto alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4);
+                    if (import != nullptr && importOffset % alignment == 0 && bytes <= context.limits.maxStorageBufferRange) {
+                        recorder.NotePendingRead(begin, bytes, Recorder::ReadKind::DrawInput);
+                        countGpuWrittenInPlace(bytes);
+                        selected.push_back(index);
+                        DrawBindings::Snapshot snapshot{begin, nullptr, importOffset, bytes};
+                        snapshot.inPlace = import->buffer;
+                        keep(std::move(snapshot));
+                        continue;
+                    }
+                }
                 const bool owned = generation == 0 && ownedSnapshots;
                 bool arm = false;
                 auto ownedMiss = Recorder::OwnedSnapshotMiss::None;
@@ -7682,7 +7702,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                 const auto snapshotIndex = snapshotIndices[binding.allocations[element]];
                 if (snapshotIndex == selected.size()) continue;
                 const auto& snapshot = result->snapshots[snapshotIndex];
-                buffers[offset + element] = {snapshot.buffer->Handle(), snapshot.offset, snapshot.bytes};
+                buffers[offset + element] = {snapshot.Handle(), snapshot.offset, snapshot.bytes};
             }
         }
     }
@@ -7690,7 +7710,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
     recorder.Keep(result);
     for (const auto& snapshot : result->snapshots) {
-        if (snapshot.buffer->Mapped()) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+        if (snapshot.buffer != nullptr && snapshot.buffer->Mapped()) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
     }
     if (DrawSnapshotsProfiled()) reportDrawSnapshots(recorder);
     return result;

@@ -2671,6 +2671,7 @@ void captureInputs(const Context& context, Recorder& recorder, VkCommandBuffer c
     };
     if (bindings != nullptr) {
         for (const auto& snapshot : bindings->snapshots) {
+            if (snapshot.buffer == nullptr) continue;
             const auto bytes = snapshot.Bytes();
             addSample(snapshot.address, bytes.size(), snapshot.buffer->Handle(), snapshot.offset, bytes.data());
         }
@@ -2783,6 +2784,12 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         if (args->countIndirect) passReads.emplace_back(args->countAddress, args->countAddress + 4);
     }
     passReads.insert(passReads.end(), inputs.inPlaceReads.begin(), inputs.inPlaceReads.end());
+    // C67: moved ranges the draw reads in place need the barrier behind earlier GPU writes as the base descriptors' do.
+    if (drawBindings != nullptr) {
+        for (const auto& snapshot : drawBindings->snapshots) {
+            if (snapshot.buffer == nullptr) passReads.emplace_back(snapshot.address, snapshot.address + snapshot.bytes);
+        }
+    }
     auto passImages = resources.StorageImages();
     if (record.blended != nullptr) {
         for (const auto& image : record.blended->images) passImages.emplace_back(image->Image(), true);
