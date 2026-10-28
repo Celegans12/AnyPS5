@@ -43,9 +43,11 @@ std::optional<ResidencyGuestImport> ArenaResidencyGuest::ImportOf(std::uint64_t 
     ResidencyGuestImport located;
     const bool whole = import->base <= address && address + ResidencyPageBytes <= import->base + import->bytes;
     located.attributes.whole = whole && !import->unwatched && !import->dmaBuf;
+    if (whole && import->unwatched) unwatchedImports.fetch_add(1, std::memory_order_relaxed);
     located.attributes.cpuWritable = true;
     located.attributes.gpuWritable = true;
     located.attributes.serial = import->serial;
+    located.attributes.section = (import->base >> ResidencyPageShift) + 1;
     located.buffer = import->buffer;
     located.offset = HostImportOffset(*import, address);
     located.address = import->address + located.offset;
@@ -73,8 +75,8 @@ void ArenaResidencyGuest::ChangedPages(std::uint64_t firstPage, std::span<const 
     }
 }
 
-ResidencyRefusal ArenaResidencyGuest::Guard(std::uint64_t) {
-    return ResidencyRefusal::Unavailable;
+ResidencyRefusal ArenaResidencyGuest::Guard(std::uint64_t page) {
+    return GuestMemory::Watched(page << ResidencyPageShift, ResidencyPageBytes) ? ResidencyRefusal::None : ResidencyRefusal::UnsettledImport;
 }
 
 void ArenaResidencyGuest::Unguard(std::span<const std::uint64_t>) {}
@@ -99,6 +101,25 @@ ResidencyRefusal ArenaResidencyGuest::GuardAccess(std::uint64_t page, ResidencyM
 
 void ArenaResidencyGuest::UnguardAccess(std::uint64_t page) {
     GuestArena::GuestArenaUnguardAccess_nid_no_patch(static_cast<std::uintptr_t>(page << ResidencyPageShift), ResidencyPageBytes);
+}
+
+ResidencyWrites ArenaResidencyGuest::PageWrites(std::uint64_t page, std::uint64_t generation) {
+    static_cast<void>(GuestMemory::CollectWritesUncached(page << ResidencyPageShift, ResidencyPageBytes));
+    const auto stamp = GuestMemory::NewestStamp(page << ResidencyPageShift, ResidencyPageBytes);
+    ResidencyWrites writes;
+    writes.other = false;
+    writes.cpu = stamp > generation ? ResidencyWholePage : ResidencyMask{0};
+    writes.generation = std::max(stamp, generation);
+    return writes;
+}
+
+std::vector<std::uint64_t> ArenaResidencyGuest::WrittenSince(std::span<const std::pair<std::uint64_t, std::uint64_t>> resident) {
+    std::vector<std::uint64_t> written;
+    for (const auto& [page, generation] : resident) {
+        static_cast<void>(GuestMemory::CollectWritesUncached(page << ResidencyPageShift, ResidencyPageBytes));
+        if (GuestMemory::NewestStamp(page << ResidencyPageShift, ResidencyPageBytes) > generation) written.push_back(page);
+    }
+    return written;
 }
 
 std::uint64_t ArenaResidencyGuest::GuestBytes() {
