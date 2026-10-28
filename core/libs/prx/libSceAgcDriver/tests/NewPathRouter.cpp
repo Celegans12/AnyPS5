@@ -76,6 +76,10 @@ void pushBlockLimit() {
     Require(AgcDriver::NewPath::Abi::FitsPushBlock(layout), "32 user words and 8 driver words did not fit 256 bytes");
     layout.userWordCount = {16, 16, 16, 16};
     Require(!AgcDriver::NewPath::Abi::FitsPushBlock(layout), "64 user words and 8 driver words fit 256 bytes");
+    layout.userWordCount = {16, 0, 0, 0};
+    layout.pageTableAddressWord = 1;
+    Require(!AgcDriver::NewPath::Abi::FitsPushBlock(layout), "an odd page-table address word was accepted");
+    Require(AgcDriver::NewPath::Abi::FaultOutsideSegment == 16u && AgcDriver::NewPath::Abi::FaultContinuationRounds == 17u, "the new fault reasons are not appended after BindlessRefused");
 }
 
 }
