@@ -374,6 +374,8 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Residency.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ResidencyConfig.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ResidencyMirrors.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ResidencyTokens.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ResidencyRecorderLanes.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/BdaResources.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/BufferAddress.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderValidation.cpp
@@ -598,6 +600,17 @@ if(BUILD_TESTING)
     set_tests_properties(agc_residency PROPERTIES TIMEOUT 30)
     if(WIN32)
         set_tests_properties(agc_residency PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+
+    add_test_executable(agc_residency_tokens_tests tests/ResidencyTokens.cpp Graphics/src/ResidencyTokens.cpp)
+    target_include_directories(agc_residency_tokens_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_residency_tokens_tests PRIVATE libc)
+    configure_windows_unwind(agc_residency_tokens_tests)
+    add_test(NAME agc_residency_tokens COMMAND agc_residency_tokens_tests)
+    set_tests_properties(agc_residency_tokens PROPERTIES TIMEOUT 20)
+    if(WIN32)
+        set_tests_properties(agc_residency_tokens PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 
