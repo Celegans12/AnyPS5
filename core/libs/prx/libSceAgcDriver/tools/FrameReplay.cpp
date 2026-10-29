@@ -201,6 +201,14 @@ private:
     std::_Exit(code);
 }
 
+#ifdef _WIN32
+LONG CALLBACK shutdownFault(EXCEPTION_POINTERS* info) {
+    if (info->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) return EXCEPTION_CONTINUE_SEARCH;
+    std::fprintf(stderr, "[frame-replay] access violation at %p in the driver shutdown, after the result was written: exit 0\n", info->ExceptionRecord->ExceptionAddress);
+    hardExit(0);
+}
+#endif
+
 void startWatchdog(std::chrono::seconds timeout) {
     std::thread([timeout] {
         const auto deadline = Clock::now() + timeout;
@@ -533,6 +541,7 @@ struct Replay {
     std::map<std::uint64_t, std::uint64_t> waitOrdinals;
     std::atomic<std::uint64_t> parkedReleases{0};
     std::atomic<std::uint64_t> fallbackReleases{0};
+    std::atomic<std::uint64_t> stuckSubmits{0};
     std::atomic<bool> parkedWithoutRelease{false};
     std::uint64_t unfinished = 0;
     std::size_t threads = 0;
@@ -642,6 +651,7 @@ struct Replay {
 
     static constexpr auto ExactQuiet = std::chrono::milliseconds(50);
     static constexpr auto ParkedQuiet = std::chrono::milliseconds(5);
+    static constexpr auto StuckSubmit = std::chrono::milliseconds(100);
     static constexpr auto BlockedQuiet = std::chrono::milliseconds(5);
 
     bool deltaReleasesWait(const FrameCall& call) {
@@ -997,19 +1007,29 @@ struct Replay {
             auto lastSequenced = sequenced.load();
             auto lastProgress = Clock::now();
             std::optional<Clock::time_point> parkedSince;
+            std::optional<Clock::time_point> stuckSince;
             const auto quiet = options.exact ? std::max<std::chrono::milliseconds>(options.releaseAfter, ExactQuiet * 4) : options.releaseAfter;
             while (!finished.load()) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 const auto completed = progress().second;
                 const auto issued = sequenced.load();
-                if (completed != lastCompleted || issued != lastSequenced || closingWindows.load() || !AgcDriverQuiescent_nid_postfix()) {
+                const bool progressed = completed != lastCompleted || issued != lastSequenced || closingWindows.load();
+                if (progressed || !AgcDriverQuiescent_nid_postfix()) {
+                    const auto now = Clock::now();
+                    if (progressed || !options.exact || busy.load() != 0) stuckSince.reset();
+                    else if (!stuckSince) stuckSince = now;
+                    else if (now - *stuckSince >= StuckSubmit) {
+                        if (AgcDriverSubmitOpenForReplay_nid_postfix(stuckSubmits.load() < 16)) ++stuckSubmits;
+                        stuckSince.reset();
+                    }
                     lastCompleted = completed;
                     lastSequenced = issued;
-                    lastProgress = Clock::now();
+                    lastProgress = now;
                     parkedSince.reset();
                     parkedWithoutRelease.store(false);
                     continue;
                 }
+                stuckSince.reset();
                 if (options.exact) {
                     const auto now = Clock::now();
                     if (busy.load() == 0 && blockedOnWaits()) {
@@ -1079,6 +1099,7 @@ struct Replay {
         finished.store(true);
         breaker.join();
         if (options.exact && (parkedReleases.load() != 0 || fallbackReleases.load() != 0)) std::fprintf(stderr, "[frame-replay] --exact releases: %llu while parked, %llu by the wall-clock fallback\n", static_cast<unsigned long long>(parkedReleases.load()), static_cast<unsigned long long>(fallbackReleases.load()));
+        if (stuckSubmits.load() != 0) std::fprintf(stderr, "[frame-replay] --exact: %llu open batch submissions while parked with the driver not quiescent\n", static_cast<unsigned long long>(stuckSubmits.load()));
         if (failure != nullptr) std::rethrow_exception(failure);
     }
 
@@ -1511,6 +1532,9 @@ int main(int argc, char** argv) {
         AgcDriver::ProfileWindows::UseFrameWindows(options.frameWindows);
         code = run(options, reader, loadStart);
         if (code == 0) {
+#ifdef _WIN32
+            AddVectoredExceptionHandler(1, shutdownFault);
+#endif
             AgcDriverShutdown_nid_postfix();
             return 0;
         }
