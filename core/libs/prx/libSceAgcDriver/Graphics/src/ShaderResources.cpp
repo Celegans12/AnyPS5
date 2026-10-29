@@ -1075,7 +1075,7 @@ struct StorageTextureCache {
 };
 
 StorageTextureCache& StorageTextures() {
-    static StorageTextureCache cache;
+    static auto& cache = *new StorageTextureCache();
     return cache;
 }
 
