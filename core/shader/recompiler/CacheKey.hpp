@@ -329,6 +329,7 @@ private:
         append(key, value.singleLaneGroups);
         append(key, value.newPathResolved);
         append(key, value.bdaSegments);
+        append(key, value.orderedWorkgroupWaves);
         append(key, value.fusedFma);
         append(key, value.robustBufferAccess2);
         append(key, value.float32FlushToZero);

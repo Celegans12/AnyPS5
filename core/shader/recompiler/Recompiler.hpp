@@ -359,6 +359,10 @@ struct SpirvTarget {
     // S4 segment program: each V# read translates its base once through its settled segment and checks every access
     // against it (FaultReason::OutsideSegment); no per-access walk. Only together with newPathResolved.
     bool bdaSegments = false;
+    // Exact replays (APS5_EXACT_SERIAL_ALLOCATING, allocating programs): the console waves of one workgroup run one
+    // after another in wave order, so their returning atomics see the same order in every run. Compute only, and only
+    // where one host subgroup holds one console wave, without workgroup barriers or invocations that a BDA fault stops.
+    bool orderedWorkgroupWaves = false;
     // GLSL.std.450 Fma is a fused multiply-add on the device (the driver's startup probe, VulkanDevice
     // FusedFmaProbe): v_fma_mix* then takes an exact f32 path instead of the f64 helper.
     bool fusedFma = false;

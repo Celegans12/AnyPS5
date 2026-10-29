@@ -343,6 +343,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
         localDevice->ComputeTarget((packet[4] & 0x8000u) != 0 ? 32u : 64u, address),
         {0, 0, 0, threadGroup != std::array<std::uint32_t, 3>{} ? 0u : 128u}
     };
+    request.target.orderedWorkgroupWaves = OrderedWorkgroupWaves(snapshot, codeOffset);
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     static double captureMs = 0, keyMs = 0, recompileMs = 0, deviceMs = 0;
     static std::uint64_t cacheHits = 0;

@@ -92,6 +92,7 @@ void EmitReturnTerminator(SpirvValueEmitContext& ctx) {
             RecordBdaFaultWords(state, ConstantU32(state, static_cast<std::uint32_t>(hash)), ConstantU32(state, static_cast<std::uint32_t>(hash >> 32u)), ConstantU32(state, state.loopGuardLimit), EmitBinaryU32(state, spv::OpISub, pc, ConstantU32(state, 1u)), BdaAbi::FaultReason::LoopLimit);
         });
     }
+    EmitOrderedWavesReturn(state);
     EmitBlendedTargets(state);
     FlushColorTargetMerge(state);
     if (OrderedPixelShader(state)) {

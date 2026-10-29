@@ -917,6 +917,41 @@ std::uint32_t ConvertPositionToClipSpace(SpirvEmitterState& state, std::uint32_t
 
 }
 
+void EmitOrderedWavesEntry(SpirvEmitterState& state) {
+    if (!state.orderedWorkgroupWaves) return;
+    state.orderedWavesVariable = state.module.DefineGlobalVariable(TypePointer(state, spv::StorageClassWorkgroup, TypeU32(state)), spv::StorageClassWorkgroup);
+    state.module.AddName(state.orderedWavesVariable, "ordered_waves_returned");
+    const auto index = EmitLocalInvocationIndex(state);
+    EmitIfCondition(state, Binary(state, spv::OpIEqual, TypeBool(state), index, ConstantU32(state, 0u)), [&] {
+        state.module.AddFunction(spv::OpStore, state.orderedWavesVariable, ConstantU32(state, 0u));
+    });
+    state.module.AddFunction(spv::OpControlBarrier, ConstantU32(state, spv::ScopeWorkgroup), ConstantU32(state, spv::ScopeWorkgroup), ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask | spv::MemorySemanticsWorkgroupMemoryMask));
+    const auto wave = EmitBinaryU32(state, spv::OpUDiv, index, ConstantU32(state, state.program.WaveSize()));
+    const auto before = EmitBinaryU32(state, spv::OpIMul, wave, ConstantU32(state, state.program.WaveSize() / state.laneCount));
+    const auto header = state.module.AllocateId();
+    const auto body = state.module.AllocateId();
+    const auto next = state.module.AllocateId();
+    const auto merge = state.module.AllocateId();
+    state.module.AddFunction(spv::OpBranch, header);
+    EmitLabel(state, header);
+    state.module.AddFunction(spv::OpLoopMerge, merge, next, spv::LoopControlMaskNone);
+    state.module.AddFunction(spv::OpBranch, body);
+    EmitLabel(state, body);
+    const auto returned = state.module.AllocateId();
+    const auto acquire = spv::MemorySemanticsAcquireMask | spv::MemorySemanticsUniformMemoryMask | spv::MemorySemanticsWorkgroupMemoryMask | spv::MemorySemanticsImageMemoryMask;
+    state.module.AddFunction(spv::OpAtomicLoad, TypeU32(state), returned, state.orderedWavesVariable, ConstantU32(state, spv::ScopeWorkgroup), ConstantU32(state, acquire));
+    state.module.AddFunction(spv::OpBranchConditional, Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), returned, before), merge, next);
+    EmitLabel(state, next);
+    state.module.AddFunction(spv::OpBranch, header);
+    EmitLabel(state, merge);
+}
+
+void EmitOrderedWavesReturn(SpirvEmitterState& state) {
+    if (state.orderedWavesVariable == 0u) return;
+    const auto release = spv::MemorySemanticsReleaseMask | spv::MemorySemanticsUniformMemoryMask | spv::MemorySemanticsWorkgroupMemoryMask | spv::MemorySemanticsImageMemoryMask;
+    state.module.AddFunction(spv::OpAtomicIAdd, TypeU32(state), state.module.AllocateId(), state.orderedWavesVariable, ConstantU32(state, spv::ScopeWorkgroup), ConstantU32(state, release), ConstantU32(state, 1u));
+}
+
 void EmitBlendedTargets(SpirvEmitterState& state) {
     for (std::uint32_t index = 0; index < state.blendTargetImages.size(); ++index) {
         if (state.blendTargetImages[index] == 0u) continue;
@@ -1866,7 +1901,9 @@ void EmitProgram(SpirvEmitterState& state) {
         EmitLabel(state, mergeLabel);
         if (state.quadSampleCoverage != 0u) StoreCoverage(state, ConstantI32(state, -1));
     }
+    EmitOrderedWavesEntry(state);
     if (program.BlockOrder().empty()) {
+        EmitOrderedWavesReturn(state);
         FlushColorTargetMerge(state);
         if (OrderedPixelShader(state)) {
             state.module.AddFunction(spv::OpEndInvocationInterlockEXT);

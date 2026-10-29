@@ -75,6 +75,25 @@ std::uint32_t WaveLdsScope(const IrProgram& program, const ShaderWorkgroupInputI
     return threads <= program.WaveSize() ? spv::ScopeWorkgroup : 0u;
 }
 
+// SpirvTarget::orderedWorkgroupWaves: a console wave's position is its guest invocation index divided by the wave
+// size, and it waits for the earlier waves to return. That holds only where one host subgroup is one console wave
+// (wave32 on a 32-lane host, wave64 on a 64-lane host or at two lanes per invocation; not spanned or split), where
+// no workgroup barrier would wait for a later wave, and where every invocation reaches its return (no BDA stop).
+bool OrderedWavesApply(const SpirvEmitterState& state, const ShaderWorkgroupInputInfo* workgroup) {
+    const auto& program = state.program;
+    if (program.Resources().stage != IrShaderStage::Compute || workgroup == nullptr) return false;
+    if (state.spannedWave || state.splitSubgroup || state.bdaStopsInvocations || state.waveLdsScope == spv::ScopeWorkgroup) return false;
+    if (workgroup->hostSubgroupSize * state.laneCount != program.WaveSize()) return false;
+    const auto threads = std::max(workgroup->threadsNum[0], 1u) * std::max(workgroup->threadsNum[1], 1u) * std::max(workgroup->threadsNum[2], 1u);
+    if (threads <= program.WaveSize()) return false;
+    for (const auto* block : program.BlockOrder()) {
+        for (const auto* instruction : block->Instructions()) {
+            if (instruction->Opcode() == IrOpcode::Barrier) return false;
+        }
+    }
+    return true;
+}
+
 }
 
 SpirvEmitterState::SpirvEmitterState(const IrProgram& program, const ShaderStageInputInfo& inputInfo) : module(program.Resources().stage == IrShaderStage::Mesh ? 0x00010400u : 0x00010300u), program(program), inputInfo(inputInfo), requirements(AnalyzeProgramRequirements(program)) {
@@ -348,6 +367,7 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
     // other stop; the others continue with the faulting read's zero, the fault still reported.
     const bool waveOperations = state.laneCount != 1u || state.requirements.subgroupBallot || state.requirements.subgroupShuffle;
     state.bdaStopsInvocations = state.waveLdsScope == 0 && !state.spannedWave && !waveOperations && BdaInvocationsMayStop(program) && program.Resources().stage != IrShaderStage::Mesh;
+    state.orderedWorkgroupWaves = target.orderedWorkgroupWaves && OrderedWavesApply(state, workgroup);
     EmitModuleHeader(state, bindings);
     EmitProgram(state);
     state.module.EmitEntryPoint(ExecutionModelForStage(state.program.Resources().stage), state.mainFunc, "main", state.interfaceVariables);

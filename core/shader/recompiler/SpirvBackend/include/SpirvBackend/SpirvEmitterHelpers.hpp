@@ -114,6 +114,9 @@ bool OrderedPixelShader(const SpirvEmitterState& state);
 bool BlendableTarget(const SpirvEmitterState& state, std::uint32_t index);
 void EmitBlendedTargets(SpirvEmitterState& state);
 void FlushColorTargetMerge(SpirvEmitterState& state);
+// SpirvEmitterState::orderedWorkgroupWaves: the entry wait (after the counter is zeroed) and the count at a return.
+void EmitOrderedWavesEntry(SpirvEmitterState& state);
+void EmitOrderedWavesReturn(SpirvEmitterState& state);
 const SpirvInputBinding* SpirvInputBindingForParameter(const SpirvEmitterState& state, std::uint32_t location);
 std::uint32_t EmitVertexParameterComponentU32(SpirvEmitterState& state, const SpirvInputBinding& input, std::uint32_t component);
 std::uint32_t EmitInputComponentU32(SpirvEmitterState& state, StageInputKind kind, std::uint32_t component);
