@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_RECORDER_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_RECORDER_HPP
 
+#include "prx/libSceAgcDriver/Graphics/include/PendingWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BarrierBatch.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PassHazards.hpp"
@@ -301,6 +302,22 @@ public:
     // lane's earlier-opened batch completed, while the first one still read it.
     // RetiredSerial() (a use noted at UseSerial()) is capped the same way when a batch finishes.
     std::uint64_t CompletedThrough() const;
+    static constexpr std::size_t MaxStreams = 16;
+    using Token = std::array<std::uint64_t, MaxStreams>;
+    static constexpr std::size_t LaneStreams = 2;
+    Token CallerToken() const;
+    Token AllToken() const;
+    static std::uint64_t TokenThrough(const Token& token);
+    bool TokenReached(const Token& token) const;
+    void FinishToken(const Token& token);
+    class CommandInHand {
+    public:
+        CommandInHand();
+        ~CommandInHand();
+        CommandInHand(const CommandInHand&) = delete;
+        CommandInHand& operator=(const CommandInHand&) = delete;
+    };
+    static bool CommandBufferInHand();
     // Under the mutex, async lane only: the calling thread's lane's open (or next) batch waits on the
     // GPU for everything lane `from` recorded so far (its open batch is submitted first).
     void OrderAfterLane(int from);
@@ -354,6 +371,11 @@ public:
     void RefuseOwnedDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage);
     static std::array<std::uint64_t, 2> OwnedSnapshotVerifyCounts();
     std::size_t OwnedSnapshotBytes() const { return ownedSnapshotBytes; }
+    // Whether the storage snapshot held for the range is stale only through the driver's stamps (GPU writes, its own
+    // in-order stores), with no CPU store collected since: the caller collected the range first. Then the draw binds the
+    // range in place (its reads are noted pending, so a CPU-side store over them waits or goes to the GPU in order) and
+    // the snapshot is left as it is, neither refreshed nor dropped.
+    bool DrawSnapshotGpuWrittenOnly(std::uint64_t address, std::size_t bytes) const;
     static constexpr std::size_t DrawUploadChunk = std::size_t{1} << 20u;
     struct UploadSlice {
         std::shared_ptr<Buffer> buffer;
@@ -363,6 +385,12 @@ public:
     UploadSlice DrawUpload(std::size_t bytes);
     static constexpr std::size_t IndexRangeEntries = 16384;
     static constexpr std::size_t KeptIndexRangeIndices = 4096;
+    // C68: the kept highest index of the range when it is stale only through the driver's stamps (GPU writes; the
+    // caller collected the range's CPU stores first); the entry stays as it is. Nothing when none is kept, the
+    // registry moved, it is current, or a CPU store stamped a changed block.
+    std::optional<std::optional<std::uint32_t>> GpuWrittenHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use) const;
+    // Diagnostic: the generation the kept highest index of the range was read at (0 when none is kept).
+    std::uint64_t KeptHighestIndexGeneration(std::uint64_t address, std::size_t bytes, SnapshotUse use) const;
     bool KnownHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::optional<std::uint32_t>& highest);
     void KeepHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint64_t generation, std::uint64_t registryGeneration, std::optional<std::uint32_t> highest);
     void OnComplete(std::function<void()> action);
@@ -1246,6 +1274,7 @@ private:
     // snapshot (a rebuild from inside a completion must not drop them) until finish returns.
     std::vector<const Batch*> finishing;
     mutable std::shared_ptr<const WriteRanges> published;
+    mutable ::AgcDriver::Graphics::PendingWriteRanges pendingWriteRanges;
     std::uint64_t submissions = 0;
     std::atomic<std::uint64_t> submittedSerial{0};
     std::atomic<std::uint64_t> retiredSerial{0};
@@ -1317,8 +1346,6 @@ private:
     std::list<DrawSnapshotKey> indexRangeRecency;
     bool refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, std::size_t bytes);
     std::shared_ptr<Buffer> containingDrawSnapshot(std::uint64_t address, std::size_t bytes, VkDeviceSize* offset);
-    mutable std::weak_ptr<const WriteRanges> publishedWriteRanges;
-    mutable bool publishedWriteRangesValid = false;
 };
 
 }

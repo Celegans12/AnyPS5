@@ -485,6 +485,13 @@ namespace {
 DccKeys readDccKeys(std::uint64_t metaAddress, std::size_t count, bool& memoized) {
     memoized = false;
     if (metaAddress == 0 || count == 0 || !GuestMemory::Accessible(reinterpret_cast<const void*>(metaAddress), count)) return DccKeys::Unreadable;
+    if (GuestMemory::GpuOwned(metaAddress, count)) {
+        if (!GuestMemory::GpuMutex().HeldByThisThread()) {
+            memoized = true;
+            return DccKeys::Mixed;
+        }
+        GuestMemory::GuardRead(metaAddress, count);
+    }
     // A driver store still pending on the GPU is not in the bytes yet.
     if (const auto memo = MemoizedKeys(metaAddress, metaAddress + count)) {
         memoized = true;
@@ -795,6 +802,7 @@ bool ReadSingleElement(const GuestTextureResource& resource, std::span<std::byte
 
 bool ProvedSingleUniform(const GuestTextureResource& resource, std::uint64_t guestBytes, std::uint64_t collected, DccSingleProof& proof) {
     if (!SingleKeysReadable(resource) || guestBytes < KeyBytes) return false;
+    if (GuestMemory::GpuOwned(resource.baseAddress, static_cast<std::size_t>(guestBytes))) return false;
     const auto bytes = BytesPerElement(resource.format);
     if (bytes == 0 || bytes > 16) return false;
     const auto blocks = static_cast<std::size_t>(guestBytes / KeyBytes);

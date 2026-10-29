@@ -108,7 +108,7 @@ ResidencyMask SubpageMask(std::uint64_t page, std::uint64_t address, std::uint64
 }
 
 ResidencyManager::ResidencyManager(IResidencyDevice& device, const ResidencyPolicy& policy)
-    : device(device), chunkSlots(policy.chunkSlots), hotFaults(policy.hotFaults), hotFrames(policy.hotFrames), quietFrames(policy.quietFrames), dirtyLeaves(new std::atomic<DirtyLeaf*>[DirtyLeaves]()) {
+    : device(device), chunkSlots(policy.chunkSlots), hotFaults(policy.hotFaults), hotFrames(policy.hotFrames), quietFrames(policy.quietFrames), deferCopyIn(policy.deferCopyIn), dirtyLeaves(new std::atomic<DirtyLeaf*>[DirtyLeaves]()) {
     if (chunkSlots == 0 || chunkSlots > (std::numeric_limits<std::uint32_t>::max() >> ResidencyPageShift))
         throw std::invalid_argument("residency: a chunk holds 1 to 65535 pages, not " + std::to_string(chunkSlots));
     if (hotFrames == 0 || hotFrames > 64 || hotFaults == 0 || hotFaults > hotFrames)
@@ -855,6 +855,7 @@ void ResidencyManager::releasePage(std::uint32_t id) {
         writerExposed[id / 64] &= ~(std::uint64_t{1} << (id % 64));
         --writerExposedCount;
     }
+    clearBehind(id);
     pages[id] = Page{};
     freePages.push_back(id);
 }
@@ -883,6 +884,10 @@ void ResidencyManager::forget(std::uint32_t id) {
 
 void ResidencyManager::markDirty(std::uint32_t id, std::uint32_t begin, std::uint32_t end) {
     if (end <= begin) return;
+    if (pages[id].behind != 0) {
+        const std::uint32_t ids[] = {id};
+        catchUp(ids, false);
+    }
     auto& page = pages[id];
     if (page.dirtyRuns.empty()) ++dirtyPages;
     auto& runs = page.dirtyRuns;
@@ -1078,7 +1083,70 @@ void ResidencyManager::recordWriteBacks(WriteBacks& writeBacks) {
     writeBacks = WriteBacks{};
 }
 
-void ResidencyManager::copyIn(std::span<const Fill> fills) {
+std::vector<ResidencyManager::Fill> ResidencyManager::deferFills(std::span<const Fill> fills) {
+    std::vector<Fill> now;
+    if (!deferCopyIn || catchingUp) {
+        now.assign(fills.begin(), fills.end());
+        return now;
+    }
+    std::optional<std::uint64_t> generation;
+    for (const auto& fill : fills) {
+        auto& page = pages[fill.id];
+        if (!page.dirtyRuns.empty()) {
+            now.push_back(fill);
+            continue;
+        }
+        if (fill.end <= fill.begin) continue;
+        if (!generation) generation = device.Generation();
+        markBehind(fill.id, RunMask(fill.begin, fill.end));
+        counts.copyInDeferredBytes += fill.end - fill.begin;
+        if (fill.begin == 0 && fill.end == WholeEnd) page.generation = *generation;
+    }
+    return now;
+}
+
+void ResidencyManager::markBehind(std::uint32_t id, ResidencyMask mask) {
+    auto& page = pages[id];
+    if (mask == 0) return;
+    if (page.behind == 0) {
+        ++counts.behind;
+        ++counts.behindFlips;
+    }
+    page.behind = static_cast<ResidencyMask>(page.behind | mask);
+}
+
+void ResidencyManager::clearBehind(std::uint32_t id) {
+    auto& page = pages[id];
+    if (page.behind == 0) return;
+    page.behind = 0;
+    --counts.behind;
+    ++counts.behindFlips;
+}
+
+void ResidencyManager::catchUp(std::span<const std::uint32_t> ids, bool waitForWriters) {
+    std::vector<Fill> fills;
+    for (const auto id : ids) {
+        std::uint32_t bits = pages[id].behind;
+        if (bits == 0) continue;
+        clearBehind(id);
+        ++counts.caughtUp;
+        while (bits != 0) {
+            const auto first = static_cast<std::uint32_t>(std::countr_zero(bits));
+            const auto run = static_cast<std::uint32_t>(std::countr_one(bits >> first));
+            fills.push_back({id, first << ResidencySubpageShift, (first + run) << ResidencySubpageShift});
+            bits &= run >= 32 ? 0u : ~(((1u << run) - 1u) << first);
+        }
+    }
+    if (fills.empty()) return;
+    const bool was = catchingUp;
+    catchingUp = true;
+    if (waitForWriters) refresh(std::move(fills));
+    else copyIn(fills);
+    catchingUp = was;
+}
+
+void ResidencyManager::copyIn(std::span<const Fill> given) {
+    const auto fills = deferFills(given);
     std::vector<ResidencyCopy> copies;
     for (const auto& fill : fills) appendClean(fill.id, fill.begin, fill.end, copies);
     if (copies.empty()) return;
@@ -1109,6 +1177,10 @@ bool ResidencyManager::waitWriters(std::span<const Fill> fills) {
 }
 
 void ResidencyManager::refresh(std::vector<Fill> fills) {
+    if (deferCopyIn && !catchingUp) {
+        fills = deferFills(fills);
+        if (fills.empty()) return;
+    }
     std::vector<std::uint32_t> ids;
     for (const auto& fill : fills) {
         if (fill.begin == 0 && fill.end == WholeEnd) ids.push_back(fill.id);
@@ -2444,16 +2516,28 @@ void ResidencyManager::Retire() {
 std::optional<MirrorSlot> ResidencyManager::Slot(std::uint64_t page) {
     const std::lock_guard structureLock(structure);
     applyDrops();
-    const auto id = find(page);
+    auto id = find(page);
     if (!id) return std::nullopt;
+    if (pages[*id].behind != 0) {
+        const std::uint32_t ids[] = {*id};
+        catchUp(ids, true);
+        id = find(page);
+        if (!id) return std::nullopt;
+    }
     return pages[*id].slot;
 }
 
 std::optional<MirrorSlot> ResidencyManager::WriteSlot(std::uint64_t page) {
     const std::lock_guard structureLock(structure);
     applyDrops();
-    const auto id = find(page);
+    auto id = find(page);
     if (!id || !dirtyable(pages[*id])) return std::nullopt;
+    if (pages[*id].behind != 0) {
+        const std::uint32_t ids[] = {*id};
+        catchUp(ids, true);
+        id = find(page);
+        if (!id || !dirtyable(pages[*id])) return std::nullopt;
+    }
     return pages[*id].slot;
 }
 
@@ -2557,6 +2641,42 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> ResidencyManager::ResidentG
     std::vector<std::pair<std::uint64_t, std::uint64_t>> resident;
     for (auto id = oldest; id != None; id = pages[id].newer) resident.emplace_back(pages[id].index, pages[id].generation);
     return resident;
+}
+
+std::vector<std::pair<std::uint64_t, std::uint64_t>> ResidencyManager::MirroredIn(std::uint64_t address, std::uint64_t bytes) {
+    const std::lock_guard structureLock(structure);
+    applyDrops();
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> mirrored;
+    for (const auto id : residentIn(address, bytes)) {
+        if (pages[id].behind == 0) mirrored.emplace_back(pages[id].index, chunks[pages[id].slot.chunk].address + (std::uint64_t{pages[id].slot.slot} << ResidencyPageShift));
+    }
+    return mirrored;
+}
+
+std::vector<std::uint64_t> ResidencyManager::CurrentPages() const {
+    const std::lock_guard structureLock(structure);
+    std::vector<std::uint64_t> current;
+    for (auto id = oldest; id != None; id = pages[id].newer) {
+        if (pages[id].behind == 0) current.push_back(pages[id].index);
+    }
+    std::sort(current.begin(), current.end());
+    return current;
+}
+
+void ResidencyManager::CatchUp(std::uint64_t address, std::uint64_t bytes) {
+    const std::lock_guard structureLock(structure);
+    applyQueued();
+    std::vector<std::uint32_t> ids;
+    for (const auto& fill : withAliases(address, bytes)) {
+        if (pages[fill.id].behind != 0) ids.push_back(fill.id);
+    }
+    catchUp(ids, true);
+}
+
+ResidencyMask ResidencyManager::Behind(std::uint64_t page) const {
+    const std::lock_guard structureLock(structure);
+    const auto id = find(page);
+    return id ? pages[*id].behind : ResidencyMask{0};
 }
 
 std::vector<std::uint32_t> ResidencyManager::Chunks() const {

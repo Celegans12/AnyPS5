@@ -2901,6 +2901,8 @@ unsigned long long CodeOffset(const void* address) {
 namespace {
 std::atomic<void (*)(std::uint64_t, std::size_t)> flushHook{nullptr};
 std::atomic<void (*)(std::uint64_t, std::size_t)> readGuard{nullptr};
+std::atomic<bool (*)(std::uint64_t, std::size_t)> gpuOwnedHook{nullptr};
+std::atomic<void (*)(std::uint64_t, std::size_t)> gpuPublishHook{nullptr};
 
 void PrepareHostRead(std::uintptr_t address, std::size_t bytes) {
     if (const auto guard = readGuard.load(std::memory_order_acquire)) guard(address, bytes);
@@ -2918,8 +2920,24 @@ void SetReadGuard(void (*guard)(std::uint64_t address, std::size_t bytes)) {
     GuestArena::GuestArenaSetHostReadHook_nid_no_patch(&PrepareHostRead);
 }
 
+void SetGpuOwnedHooks(bool (*owned)(std::uint64_t address, std::size_t bytes), void (*publish)(std::uint64_t address, std::size_t bytes)) {
+    gpuPublishHook.store(publish, std::memory_order_release);
+    gpuOwnedHook.store(owned, std::memory_order_release);
+}
+
+bool GpuOwned(std::uint64_t address, std::size_t bytes) {
+    const auto owned = gpuOwnedHook.load(std::memory_order_acquire);
+    return owned != nullptr && bytes != 0 && owned(address, bytes);
+}
+
+void PublishGpuOwned(std::uint64_t address, std::size_t bytes) {
+    const auto publish = gpuPublishHook.load(std::memory_order_acquire);
+    if (publish != nullptr && GpuOwned(address, bytes)) publish(address, bytes);
+}
+
 void GuardRead(std::uint64_t address, std::size_t bytes) {
     if (const auto guard = readGuard.load(std::memory_order_acquire)) guard(address, bytes);
+    if (GpuMutex().HeldByThisThread()) PublishGpuOwned(address, bytes);
     GuestArena::GuestArenaOpenAccessGuards_nid_no_patch(static_cast<std::uintptr_t>(address), bytes);
 }
 
@@ -2968,6 +2986,7 @@ bool SpeculativeReader() {
 void FlushGpuWrites(std::uint64_t address, std::size_t bytes) {
     requireNotSpeculative("access with a flush");
     flushBeforeAccess(address, bytes);
+    if (GpuMutex().HeldByThisThread()) PublishGpuOwned(address, bytes);
 }
 
 void PrepareHostWrite(std::uintptr_t address, std::size_t bytes) {
@@ -3203,6 +3222,7 @@ std::size_t HashBlockCount(std::uint64_t address, std::size_t bytes) {
 void HashCommittedBlocks(std::uint64_t address, std::size_t bytes, std::span<ContentHash::Hash128> out) {
     require(out.size() == HashBlockCount(address, bytes), "hash block count differs");
     if (bytes == 0) return;
+    GuardRead(address, bytes);
     const TimedAccess timed(CounterRead, bytes);
     CommittedHasher hash(address, bytes);
     forEachHashBlock(address, bytes, [&](std::size_t index, std::uint64_t begin, std::size_t length) {
@@ -3222,6 +3242,7 @@ void HashBlocksOf(std::uint64_t address, std::span<const std::byte> bytes, std::
 bool CommittedBlocksMatch(std::uint64_t address, std::size_t bytes, std::span<const ContentHash::Hash128> expected) {
     if (expected.size() != HashBlockCount(address, bytes)) return false;
     if (bytes == 0) return true;
+    if (GpuOwned(address, bytes)) return false;
     const TimedAccess timed(CounterCompare, bytes);
     CommittedHasher hash(address, bytes);
     return forEachHashBlock(address, bytes, [&](std::size_t index, std::uint64_t begin, std::size_t length) { return hash(begin, length) == expected[index]; });
@@ -3274,6 +3295,7 @@ bool CommittedBlocksMatchMarked(std::uint64_t address, std::size_t bytes, std::s
     if (match != nullptr) *match = {};
     if (expected.size() != HashBlockCount(address, bytes) || marked.size() != expected.size()) return false;
     if (bytes == 0) return true;
+    if (GpuOwned(address, bytes)) return false;
     std::uint64_t markedBytes = 0;
     forEachHashBlock(address, bytes, [&](std::size_t index, std::uint64_t, std::size_t length) {
         if (marked[index] != 0) markedBytes += length;
@@ -3300,6 +3322,7 @@ bool CommittedBlocksMatchSince(std::uint64_t address, std::size_t bytes, std::sp
     if (match != nullptr) *match = {};
     if (expected.size() != HashBlockCount(address, bytes)) return false;
     if (bytes == 0) return true;
+    if (GpuOwned(address, bytes)) return false;
     auto now = DescribeCommitted(address, bytes);
     thread_local std::vector<std::uint8_t>* staleSlot = nullptr;
     auto& stale = ShaderRecompiler::ThreadOwned(staleSlot);

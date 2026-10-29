@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidencyDriver.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidencyGuest.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ResidencySession.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "VulkanTestDevice.hpp"
@@ -219,20 +220,129 @@ void DriverReadOpensGuard(const Harness& harness, std::uint32_t index) {
         return;
     }
     harness.FillMirror(index, 0, 0x44444444u, 0);
-    bool threw = false;
-    try {
-        const std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
-        std::array<std::byte, 16> bytes{};
-        AgcDriver::GuestMemory::ReadCommitted(harness.guest.Address(index), bytes);
-    } catch (const std::exception&) {
-        threw = true;
-    }
-    Expect(threw, "driver read: a read of a guarded page under the GPU mutex did not fail loudly");
-    Expect(GuestArena::GuestArenaAccessGuarded_nid_no_patch(harness.guest.Address(index)), "driver read: the refused read dropped the guard");
     std::array<std::uint32_t, 4> words{};
     AgcDriver::GuestMemory::ReadCommitted(harness.guest.Address(index), std::as_writable_bytes(std::span(words)));
     Expect(words[0] == 0x44444444u && words[3] == 0x44444444u, "driver read: a driver read off the GPU mutex did not get the GPU's bytes");
     Expect(!GuestArena::GuestArenaAccessGuarded_nid_no_patch(harness.guest.Address(index)), "driver read: the guard stayed after the read opened it");
+}
+
+bool Admitted(const Harness& harness, std::uint32_t index, std::uint32_t value, const char* site) {
+    harness.Use(index, 0);
+    if (!harness.driver.Manager().Slot(harness.Page(index))) {
+        Expect(false, std::string(site) + ": the page was not admitted");
+        return false;
+    }
+    harness.FillMirror(index, 0, value, 0);
+    if (!AgcDriver::GuestMemory::GpuOwned(harness.guest.Address(index), 16)) {
+        Expect(false, std::string(site) + ": the GPU-written page is not GPU-owned");
+        return false;
+    }
+    return true;
+}
+
+void ExpectPublished(const Harness& harness, std::uint32_t index, const std::uint32_t* words, std::uint32_t value, std::uint64_t publishes, std::uint64_t refused, const char* site) {
+    Expect(words[0] == value && words[3] == value, std::string(site) + ": the site did not read the GPU's bytes");
+    Expect(harness.driver.DriverPublishes() > publishes, std::string(site) + ": the site published nothing");
+    Expect(harness.driver.RefusedFaults() == refused, std::string(site) + ": the site took a refused driver fault");
+    Expect(!AgcDriver::GuestMemory::GpuOwned(harness.guest.Address(index), 16), std::string(site) + ": the page stayed GPU-owned after the publish");
+    Expect(!GuestArena::GuestArenaAccessGuarded_nid_no_patch(harness.guest.Address(index)), std::string(site) + ": the guard stayed after the publish");
+}
+
+void WriteBackStampsCaches(const Harness& harness, std::uint32_t index) {
+    const auto address = harness.guest.Address(index);
+    std::array<std::uint32_t, 4> words{};
+    {
+        const std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        AgcDriver::GuestMemory::ReadCommitted(address, std::as_writable_bytes(std::span(words)));
+    }
+    const auto clean = AgcDriver::GuestMemory::NewestStamp(address, ResidencyPageBytes);
+    const auto stampsBefore = harness.driver.WriteBackStamps();
+    {
+        const std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        AgcDriver::GuestMemory::ReadCommitted(address, std::as_writable_bytes(std::span(words)));
+    }
+    Expect(AgcDriver::GuestMemory::NewestStamp(address, ResidencyPageBytes) == clean && harness.driver.WriteBackStamps() == stampsBefore, "stamps: a read with nothing written back changed the page's stamp (a cache hit lost)");
+    if (!Admitted(harness, index, 0x55555555u, "stamps")) return;
+    {
+        const std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        AgcDriver::GuestMemory::ReadCommitted(address, std::as_writable_bytes(std::span(words)));
+    }
+    Expect(words[0] == 0x55555555u, "stamps: the publish did not read the GPU's bytes");
+    Expect(harness.driver.WriteBackStamps() > stampsBefore, "stamps: the write-back stamped nothing");
+    Expect(AgcDriver::GuestMemory::NewestStamp(address, ResidencyPageBytes) > clean, "stamps: a written-back page kept its stamp, so a snapshot cached over the old bytes would still hit");
+}
+
+void ProofIsNotProvenOverGpuOwned(const Harness& harness, std::uint32_t index) {
+    const auto address = harness.guest.Address(index);
+    std::vector<AgcDriver::ContentHash::Hash128> hashes(AgcDriver::GuestMemory::HashBlockCount(address, ResidencyPageBytes));
+    {
+        const std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        AgcDriver::GuestMemory::HashCommittedBlocks(address, ResidencyPageBytes, hashes);
+        Expect(AgcDriver::GuestMemory::CommittedBlocksMatch(address, ResidencyPageBytes, hashes), "proof: unchanged blocks did not match their own hashes");
+    }
+    if (!Admitted(harness, index, 0x56565656u, "proof")) return;
+    const auto publishes = harness.driver.DriverPublishes();
+    const auto refused = harness.driver.RefusedFaults();
+    Expect(!AgcDriver::GuestMemory::CommittedBlocksMatch(address, ResidencyPageBytes, hashes), "proof: a GPU-owned range was proven unchanged from the guest's stale bytes");
+    Expect(harness.driver.DriverPublishes() == publishes && harness.driver.RefusedFaults() == refused, "proof: answering not proven read or published the GPU-owned range");
+    Expect(AgcDriver::GuestMemory::GpuOwned(address, 16), "proof: answering not proven published the range");
+    {
+        const std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        AgcDriver::GuestMemory::PublishGpuOwned(address, ResidencyPageBytes);
+    }
+}
+
+void DriverSites(const Harness& harness, std::uint32_t first) {
+    {
+        const char* site = "GuestMemory::ReadCommitted under the GPU mutex";
+        if (Admitted(harness, first, 0x51515151u, site)) {
+            const auto publishes = harness.driver.DriverPublishes();
+            const auto refused = harness.driver.RefusedFaults();
+            std::array<std::uint32_t, 4> words{};
+            const std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            AgcDriver::GuestMemory::ReadCommitted(harness.guest.Address(first), std::as_writable_bytes(std::span(words)));
+            ExpectPublished(harness, first, words.data(), 0x51515151u, publishes, refused, site);
+        }
+    }
+    {
+        const char* site = "FlushGpuWrites before a raw read (CopyDrawInput, CapturedCurrent)";
+        if (Admitted(harness, first + 1, 0x52525252u, site)) {
+            const auto publishes = harness.driver.DriverPublishes();
+            const auto refused = harness.driver.RefusedFaults();
+            std::array<std::uint32_t, 4> words{};
+            const std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            AgcDriver::GuestMemory::FlushGpuWrites(harness.guest.Address(first + 1), sizeof(words));
+            std::memcpy(words.data(), reinterpret_cast<const void*>(harness.guest.Address(first + 1)), sizeof(words));
+            ExpectPublished(harness, first + 1, words.data(), 0x52525252u, publishes, refused, site);
+        }
+    }
+    {
+        const char* site = "GuardRead before a raw copy (PrepareDrawBindings)";
+        if (Admitted(harness, first + 2, 0x53535353u, site)) {
+            const auto publishes = harness.driver.DriverPublishes();
+            const auto refused = harness.driver.RefusedFaults();
+            std::array<std::uint32_t, 4> words{};
+            const std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            AgcDriver::GuestMemory::GuardRead(harness.guest.Address(first + 2), sizeof(words));
+            std::memcpy(words.data(), reinterpret_cast<const void*>(harness.guest.Address(first + 2)), sizeof(words));
+            ExpectPublished(harness, first + 2, words.data(), 0x53535353u, publishes, refused, site);
+        }
+    }
+    {
+        const char* site = "PublishGpuOwned before a GPU copy of the import (recordGpuCopies, DCC keys under the lock)";
+        if (Admitted(harness, first + 3, 0x54545454u, site)) {
+            Expect(AgcDriver::GuestMemory::GpuOwned(harness.guest.Address(first + 3), 16), "DCC keys off the GPU mutex: the owned range is not reported, so the presenter would read it");
+            const auto publishes = harness.driver.DriverPublishes();
+            const auto refused = harness.driver.RefusedFaults();
+            {
+                const std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+                AgcDriver::GuestMemory::PublishGpuOwned(harness.guest.Address(first + 3), ResidencyPageBytes);
+            }
+            std::array<std::uint32_t, 4> words{};
+            std::memcpy(words.data(), reinterpret_cast<const void*>(harness.guest.Address(first + 3)), sizeof(words));
+            ExpectPublished(harness, first + 3, words.data(), 0x54545454u, publishes, refused, site);
+        }
+    }
 }
 
 void OwnerIsNeverServed(const Harness& harness, std::uint32_t index) {
@@ -254,9 +364,71 @@ void OwnerIsNeverServed(const Harness& harness, std::uint32_t index) {
 
 }
 
+int SessionReentry() {
+    try {
+        auto device = OpenVulkanTestDevice();
+        if (!device) return VulkanTestSkipped;
+        const auto context = device->graphicsContext();
+        auto* recorder = Recorder::Active();
+        if (recorder == nullptr) throw std::runtime_error("no active recorder");
+        GuestPages guest;
+        {
+            const std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            Expect(HostImportFor(context, guest.Address(0), Bytes) != nullptr, "the guest pages cannot be imported");
+        }
+        EnsureResidency(context);
+        Expect(ResidencyActive(), "reentry: the residency session did not start");
+        bool innerRan = false;
+        {
+            const std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            const std::array<const void*, 1> owners{&guest};
+            recorder->OpenBatch();
+            recorder->DeferDispatchBarrier(0x77, owners);
+            Expect(recorder->RunOpen(), "reentry: no deferred dispatch run is open");
+            const std::uint64_t inner = guest.Address(1);
+            recorder->AfterRun([&innerRan, inner](Recorder&) {
+                const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> reads{{{inner, 4096}}};
+                NoteStagedRegions(reads, {});
+                innerRan = true;
+            });
+            const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> reads{{{guest.Address(0), 4096}}};
+            NoteStagedRegions(reads, {});
+            Expect(innerRan, "reentry: the copy-in did not flush the deferred run, so its copy-backs never re-entered the session");
+            Expect(!recorder->RunOpen(), "reentry: the deferred run is still open after the copy-in");
+            device->SubmitRecorded(false);
+            device->WaitIdle();
+        }
+        const auto line = ResidencyReportLine();
+        Expect(line.find("re-entered copy-back notes 1;") != std::string::npos, "reentry: the nested note was not queued: " + line);
+        {
+            const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> reads{{{guest.Address(2), 4096}}};
+            const std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            NoteStagedRegions(reads, {});
+            device->SubmitRecorded(false);
+            device->WaitIdle();
+        }
+        const auto drained = ResidencyReportLine();
+        Expect(drained.find("admitted 3,") != std::string::npos, "reentry: the queued note was not drained by the next top-level call: " + drained);
+        ReleaseResidency(context.device);
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "FAIL: exception: %s\n", error.what());
+        return 1;
+    }
+    if (failures != 0) return 1;
+    std::printf("residency session re-entry test passed\n");
+    return 0;
+}
+
 int main(int argc, char** argv) {
     const bool asyncLane = argc > 1 && std::string(argv[1]) == "--async-lane";
+    const bool sitesOnly = argc > 1 && std::string(argv[1]) == "--driver-sites";
+    const bool reentry = argc > 1 && std::string(argv[1]) == "--session-reentry";
 #ifdef _WIN32
+    if (reentry) {
+        _putenv_s("APS5_NEW_PATH", "1");
+        _putenv_s("APS5_NEW_PATH_EAGER_COPY_IN", "1");
+        return SessionReentry();
+    }
     if (asyncLane) _putenv_s("APS5_ASYNC_LANE", "51");
 #else
     std::puts("skipped: residency faults use the Windows guest arena guards");
@@ -282,12 +454,17 @@ int main(int argc, char** argv) {
             ResidencyDriver driver(context, *recorder, arena, ResidencyPolicy{Pages, Bytes});
             driver.EnableFaults();
             const Harness harness{*device, context, *recorder, driver, guest};
-            SubpageMerge(harness, 0, 0);
-            if (asyncLane) SubpageMerge(harness, 1, 1);
-            CollectCannotHideCpuWrite(harness, 2);
-            OwnerIsNeverServed(harness, 3);
-            RefusedGuardWritesBack(harness, 4);
-            DriverReadOpensGuard(harness, 5);
+            if (!sitesOnly) {
+                SubpageMerge(harness, 0, 0);
+                if (asyncLane) SubpageMerge(harness, 1, 1);
+                CollectCannotHideCpuWrite(harness, 2);
+                OwnerIsNeverServed(harness, 3);
+                RefusedGuardWritesBack(harness, 4);
+                DriverReadOpensGuard(harness, 5);
+            }
+            DriverSites(harness, 6);
+            WriteBackStampsCaches(harness, 10);
+            ProofIsNotProvenOverGpuOwned(harness, 11);
             const std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
             device->SubmitRecorded(false);
             device->WaitIdle();

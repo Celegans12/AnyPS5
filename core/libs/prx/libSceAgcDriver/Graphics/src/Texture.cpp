@@ -16,6 +16,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RangeIndex.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/shaders/ExpandSingle_spv.h"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 // For the declaration of PendingStorageOverlaps, defined below.
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
@@ -39,6 +40,8 @@
 #include <atomic>
 #include <mutex>
 #include <map>
+#include <memory>
+#include <unordered_map>
 #include <limits>
 #include <exception>
 #include <optional>
@@ -1715,6 +1718,25 @@ std::shared_ptr<StorageTexture> StorageTexture::Create(const Context& context, T
     return texture;
 }
 
+namespace {
+// Diagnostic: APS5_TRACE_STORAGE_RANGE=<hex begin>-<hex end> prints [storage-trace] lines for every storage image whose
+// guest bytes overlap the range: creation (shape, levels, layers, bytes, element extent), each markLayersPending, each
+// write-back (stored ranges), each Refresh outcome, with the present number. Capped at 3000 lines.
+bool storageTraced(std::uint64_t begin, std::uint64_t bytes) {
+    static const std::pair<std::uint64_t, std::uint64_t> range = [] {
+        const char* text = std::getenv("APS5_TRACE_STORAGE_RANGE");
+        if (text == nullptr) return std::pair<std::uint64_t, std::uint64_t>{0, 0};
+        char* end = nullptr;
+        const auto from = std::strtoull(text, &end, 16);
+        const auto to = end != nullptr && *end == '-' ? std::strtoull(end + 1, nullptr, 16) : 0ull;
+        return std::pair<std::uint64_t, std::uint64_t>{from, to};
+    }();
+    if (range.second <= range.first || begin >= range.second || begin + bytes <= range.first) return false;
+    static std::atomic<int> lines{0};
+    return lines.fetch_add(1, std::memory_order_relaxed) < 3000;
+}
+}
+
 StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, std::uint32_t mipLevel) : context(context), detiler(detiler), descriptor(descriptor) {
     try {
         Require(!IsBlockCompressed(descriptor.format), "block-compressed textures cannot be storage images");
@@ -1731,6 +1753,7 @@ StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, 
         arrayLayers = geometry.layers;
         const auto elementBytes = BytesPerElement(descriptor.format);
         guestBytes = geometry.guestBytes;
+        if (storageTraced(descriptor.baseAddress, geometry.guestBytes)) std::fprintf(stderr, "[storage-trace] present %llu create %p 0x%llx+0x%llx %ux%u fmt %u tile %u mips %u (mip %u) layers %u extent 0x%llx\n", static_cast<unsigned long long>(Recorder::Presents()), static_cast<const void*>(this), static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(geometry.guestBytes), descriptor.width, descriptor.height, descriptor.format, static_cast<unsigned>(descriptor.tileMode), descriptor.mipCount, mipLevel, geometry.layers, static_cast<unsigned long long>(geometry.guestBytes));
         // Storage images in heaps the guest commits on demand only read and store committed pages.
         Require(!GuestMemory::CommittedRanges(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), true).empty(), "storage texture has no committed guest pages");
         // Write stamps are per 64 KiB block, so only 64 KiB-aligned layer slices can be told apart.
@@ -2675,6 +2698,7 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
     const bool outsideChanged = std::any_of(outside.begin(), outside.end(), [](bool value) { return value; });
     if (scoped) noteLayersBehind(firstLayer, lastLayer, outside);
     else layerBehind.clear();
+    if (storageTraced(descriptor.baseAddress, guestBytes)) std::fprintf(stderr, "[storage-trace] present %llu refresh %p 0x%llx: %s (pending %d, keys changed %d, cpu %d, flushed %d)\n", static_cast<unsigned long long>(Recorder::Presents()), static_cast<const void*>(this), static_cast<unsigned long long>(descriptor.baseAddress), unchanged ? "unchanged" : "changed", anyLayerPending() ? 1 : 0, keysChanged ? 1 : 0, cpuWrote ? 1 : 0, flushed ? 1 : 0);
     if (unchanged) {
         ++Profile().storageReused;
         for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
@@ -3067,6 +3091,76 @@ std::vector<bool> StorageTexture::cpuUploadLayers(const std::vector<bool>& units
     return selected;
 }
 
+namespace {
+// C66: the GPU side of a "single"-keys upload (ExpandSingle.comp, one pipeline per device).
+class GpuSingleExpand {
+public:
+    static GpuSingleExpand* For(const Context& context) {
+        static std::mutex mutex;
+        static std::unordered_map<VkDevice, std::unique_ptr<GpuSingleExpand>> expands;
+        std::lock_guard lock(mutex);
+        auto& expand = expands[context.device];
+        if (expand == nullptr) {
+            try {
+                expand.reset(new GpuSingleExpand(context));
+            } catch (const std::exception& error) {
+                std::fprintf(stderr, "[gpu] single-keys expansion pipeline unavailable, expanding on the CPU: %s\n", error.what());
+                expands.erase(context.device);
+                return nullptr;
+            }
+        }
+        return expand.get();
+    }
+
+    void Record(const Context& context, VkCommandBuffer commands, VkDeviceAddress source, VkDeviceAddress target, std::uint32_t words, std::uint32_t elementWords) const {
+        const VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT};
+        context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &before, 0, nullptr, 0, nullptr);
+        context.Function<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+        struct Push {
+            VkDeviceAddress source;
+            VkDeviceAddress target;
+            std::uint32_t words;
+            std::uint32_t elementWords;
+        } push{source, target, words, elementWords};
+        context.Function<PFN_vkCmdPushConstants>("vkCmdPushConstants")(commands, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+        const auto groups = (words + 255u) / 256u;
+        context.Function<PFN_vkCmdDispatch>("vkCmdDispatch")(commands, std::min(groups, 65535u), (groups + 65534u) / 65535u, 1);
+        const VkMemoryBarrier after{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT};
+        context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &after, 0, nullptr, 0, nullptr);
+    }
+
+private:
+    explicit GpuSingleExpand(const Context& context) {
+        const VkPushConstantRange range{VK_SHADER_STAGE_COMPUTE_BIT, 0, 24};
+        VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        layoutInfo.pushConstantRangeCount = 1;
+        layoutInfo.pPushConstantRanges = &range;
+        Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &layoutInfo, nullptr, &layout), "vkCreatePipelineLayout single-keys expansion");
+        const auto module = CreateShaderModule(context, EXPAND_SINGLE_SPV, sizeof(EXPAND_SINGLE_SPV), "vkCreateShaderModule single-keys expansion");
+        VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        pipelineInfo.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        pipelineInfo.stage.module = module;
+        pipelineInfo.stage.pName = "main";
+        pipelineInfo.layout = layout;
+        VkResult result = VK_SUCCESS;
+        {
+            auto pipelineCacheLock = context.LockPipelineCacheForUse();
+            result = context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &pipeline);
+        }
+        context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
+        Check(result, "vkCreateComputePipelines single-keys expansion");
+    }
+
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+};
+
+// [storage-cpu-upload] timing of the previous CPU-path upload (read + key expansion, synchronous submit + wait).
+thread_local double lastCpuUploadReadMs = 0;
+thread_local double lastCpuUploadWaitMs = 0;
+}
+
 void StorageTexture::upload(const std::vector<bool>* layers) {
     const bool profile = LookupOutcomes::Profiled();
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -3161,7 +3255,15 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         if (profile) LookupOutcomes::Add(LookupOutcomes::UploadClear, start);
         return;
     }
-    if (const auto* import = uploadedKeys == DccKeys::Uncompressed ? HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) : nullptr) {
+    // C66: a whole surface whose keys are all "single" takes the import path too when its element is whole words: the
+    // GPU expands each 256-byte key block from its first element into a device buffer and the detile reads that, in
+    // the open batch. The CPU path read and expanded the 8 MiB menu target and waited for its own batch every frame.
+    // APS5_NO_GPU_SINGLE_EXPAND=1 (runtime switch) expands on the CPU as before.
+    const auto singleElementBytes = BytesPerElement(descriptor.format);
+    auto* singleExpand = uploadedKeys == DccKeys::ClearSingle && layers == nullptr && guestBytes % 4u == 0 && guestBytes / 4u <= std::numeric_limits<std::uint32_t>::max() && singleElementBytes % 4u == 0 && singleElementBytes != 0 && 256u % singleElementBytes == 0 && Recorder::Active() != nullptr && !RuntimeSwitches::Set(RuntimeSwitch::NoGpuSingleExpand) ? GpuSingleExpand::For(context) : nullptr;
+    const auto* singleImport = singleExpand != nullptr ? HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) : nullptr;
+    if (singleImport != nullptr && (singleImport->address == 0 || (singleImport->address + HostImportOffset(*singleImport, descriptor.baseAddress)) % 4u != 0 || (blockUnits && AnyShadowedOverlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))))) singleImport = nullptr;
+    if (const auto* import = uploadedKeys == DccKeys::Uncompressed ? HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) : singleImport) {
         if (GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) {
             layerOriginal.assign(trackedLayers, false);
             original = {};
@@ -3234,6 +3336,18 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
             commands = batch->Handle();
         }
         const auto importOffset = HostImportOffset(*import, descriptor.baseAddress);
+        std::shared_ptr<Buffer> singleExpanded;
+        VkBuffer sourceBuffer = import->buffer;
+        VkDeviceSize sourceOffset = importOffset;
+        if (import == singleImport && uploadedKeys == DccKeys::ClearSingle) {
+            auto expanded = std::make_shared<Buffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            singleExpand->Record(context, commands, import->address + importOffset, expanded->DeviceAddress(), static_cast<std::uint32_t>(guestBytes / 4u), singleElementBytes / 4u);
+            sourceBuffer = expanded->Handle();
+            sourceOffset = 0;
+            // The recorder keeps the buffer until its batch completes; without one the batch below is waited for.
+            if (recorder != nullptr) recorder->Keep(std::move(expanded), static_cast<std::size_t>(guestBytes));
+            else singleExpanded = std::move(expanded);
+        }
         if (direct) {
             recordDirectUploadBarrier(commands, layers == nullptr);
             for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
@@ -3241,7 +3355,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
                 for (std::uint32_t level = 0; level < geometry.imageLevels; ++level) {
                     if (!geometry.HasLayer(level, layer)) continue;
                     const auto& mip = mips[level];
-                    detiler.DispatchImage(commands, descriptor.tileMode, elementBytes, import->buffer, importOffset + geometry.GuestLayerOffset(layer) + mip.tiledOffset, elementLayerView(level, layer), mip, false, layer, {.pipeBankXor = descriptor.pipeBankXor});
+                    detiler.DispatchImage(commands, descriptor.tileMode, elementBytes, sourceBuffer, sourceOffset + geometry.GuestLayerOffset(layer) + mip.tiledOffset, elementLayerView(level, layer), mip, false, layer, {.pipeBankXor = descriptor.pipeBankXor});
                 }
             }
             recordDirectUploadDone(commands);
@@ -3260,7 +3374,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
             for (std::uint32_t level = 0; level < geometry.imageLevels; ++level) {
                 if (!geometry.HasLayer(level, layer)) continue;
                 const auto& mip = mips[level];
-                detiler.Dispatch(commands, descriptor.tileMode, elementBytes, import->buffer, importOffset + geometry.GuestLayerOffset(layer) + mip.tiledOffset, linear->Handle(), geometry.LinearLayerOffset(layer) + mip.linearOffset, mip, false, layer, geometry.thick, {.pipeBankXor = descriptor.pipeBankXor});
+                detiler.Dispatch(commands, descriptor.tileMode, elementBytes, sourceBuffer, sourceOffset + geometry.GuestLayerOffset(layer) + mip.tiledOffset, linear->Handle(), geometry.LinearLayerOffset(layer) + mip.linearOffset, mip, false, layer, geometry.thick, {.pipeBankXor = descriptor.pipeBankXor});
             }
         }
         const auto linearRead = WholeBufferBarrier(linear->Handle(), VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
@@ -3294,6 +3408,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
     const auto cpuLayers = uploadedKeys == DccKeys::Uncompressed && layers != nullptr ? cpuUploadLayers(*layers) : std::vector<bool>{};
     const bool selectedCpu = !cpuLayers.empty();
     std::uint64_t uploadedBytes = guestBytes;
+    const auto cpuReadStart = std::chrono::steady_clock::now();
     if (selectedCpu) {
         captureGuestBytes(layers);
         for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
@@ -3324,6 +3439,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
                 }
             } else if (uploadedKeys == DccKeys::Uncompressed) std::memcpy(staging.Bytes().data(), original.data(), original.size());
             else ReadTextureSurface(descriptor, uploadedKeys, staging.Bytes().first(original.size()));
+            lastCpuUploadReadMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - cpuReadStart).count();
             DeviceBuffer tiled(context, original.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
             DeviceBuffer linear(context, static_cast<std::size_t>(linearBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
             detiler.BeginBatch();
@@ -3366,7 +3482,9 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
             toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
             context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &toGeneral);
             APS5_LOG_CHARS_OUT("StorageTexture upload submit");
+            const auto cpuWaitStart = std::chrono::steady_clock::now();
             batch.SubmitAndWait();
+            lastCpuUploadWaitMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - cpuWaitStart).count();
             APS5_LOG_CHARS_OUT("StorageTexture upload done");
     }
     countStorageUpload(2, uploadedBytes);
@@ -4256,6 +4374,7 @@ void StorageTexture::noteLayersBehind(std::uint32_t firstLayer, std::uint32_t la
 }
 
 void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count) {
+    if (storageTraced(descriptor.baseAddress, guestBytes)) std::fprintf(stderr, "[storage-trace] present %llu pending %p 0x%llx units %u+%u (was pending %d)\n", static_cast<unsigned long long>(Recorder::Presents()), static_cast<const void*>(this), static_cast<unsigned long long>(descriptor.baseAddress), first, count, first < layerPending.size() && layerPending[first] ? 1 : 0);
     CaptureTrace::Log("image-write image=%llx first=%u count=%u generation=%llu", static_cast<unsigned long long>(descriptor.baseAddress), first, count, static_cast<unsigned long long>(generation));
     ++writes;
     static const bool eager = std::getenv("APS5_EAGER_WRITEBACK") != nullptr || std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
@@ -6607,6 +6726,11 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     }
     for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
         if (layers[layer]) forgetKeptAtUnwatch(layer);
+    }
+    if (storageTraced(descriptor.baseAddress, guestBytes)) {
+        std::string stored;
+        for (const auto& [from, to] : keep) stored += " +0x" + [](std::uint64_t v) { char b[24]; std::snprintf(b, sizeof(b), "%llx", static_cast<unsigned long long>(v)); return std::string(b); }(from - descriptor.baseAddress) + "..+0x" + [](std::uint64_t v) { char b[24]; std::snprintf(b, sizeof(b), "%llx", static_cast<unsigned long long>(v)); return std::string(b); }(to - descriptor.baseAddress);
+        std::fprintf(stderr, "[storage-trace] present %llu write-back %p 0x%llx reason %s: stores%s%s (skipped %zu)\n", static_cast<unsigned long long>(Recorder::Presents()), static_cast<const void*>(this), static_cast<unsigned long long>(descriptor.baseAddress), flushReason != nullptr ? flushReason : "-", stored.empty() ? " nothing" : "", stored.c_str(), skipped);
     }
     // Debug aid: APS5_TRACE_FLUSH also names the blocks a write-back leaves to the CPU.
     static const bool traceKept = std::getenv("APS5_TRACE_FLUSH") != nullptr;

@@ -234,8 +234,6 @@ void StreamOrderPass(AgcDriver::VulkanDevice& device, const GuestBlock& copied, 
     device.WaitIdle();
 }
 
-}
-
 int AsyncLanePass(AgcDriver::VulkanDevice& device, const GuestBlock& records, const GuestBlock& labels) {
     auto* recorder = Recorder::Active();
     Require(recorder != nullptr, "async lane: no active recorder");
@@ -249,8 +247,10 @@ int AsyncLanePass(AgcDriver::VulkanDevice& device, const GuestBlock& records, co
     }
     volatile std::uint32_t* stored = records.Word(CopiedRecordOffset + StoredOffset);
     volatile std::uint32_t* label = labels.Word(0x4000);
+    volatile std::uint32_t* inFlightLabel = labels.Word(0x4004);
     *stored = CpuValue;
     *label = 0;
+    *inFlightLabel = 0;
     {
         const Recorder::LaneScope async(1);
         RecordDispatch(device, records.Address() + CopiedRecordOffset);
@@ -266,14 +266,32 @@ int AsyncLanePass(AgcDriver::VulkanDevice& device, const GuestBlock& records, co
         const int reason = device.WriteLabelOnGpu(labels.Address() + 0x4000, bytes, 10, 0, false);
         Require(reason == 5, "async lane: a queue 0 label behind a copied writer recorded only in the async lane was handled with reason " + std::to_string(reason) + ", expected 5");
         Require(Recorder::PendingCompletionStores() == 1, "async lane: the label is not a pending completion store");
+        Require(Recorder::PendingLabelSince().has_value(), "async lane: the label on the other lane's open batch did not start its flush timer");
         Require(*label == 0, "async lane: the label landed before the copied writer's batch was reaped");
-        device.WaitIdle();
+        recorder->SubmitAllLanes();
+        Require(!Recorder::PendingLabelSince().has_value(), "async lane: submitting the other lane's last open batch did not clear its flush timer");
+        Require(*label == 0, "async lane: submitting the copied writer's batch ran its completion label before its reap");
+        Require(device.WriteLabelOnGpu(labels.Address() + 0x4004, bytes, 11, 0, false) == 5, "async lane: the label behind the submitted completion store was not deferred");
+        Require(!Recorder::PendingLabelSince().has_value(), "async lane: a label on an in-flight batch started an open-batch flush timer");
+        Require(*inFlightLabel == 0, "async lane: the in-flight batch's label landed before its reap");
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (true) {
+        {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            if (recorder->Reap()) break;
+        }
+        Require(std::chrono::steady_clock::now() < deadline, "async lane: the submitted batch did not complete through normal reaping");
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     Require(Recorder::PendingCompletionStores() == 0 && Recorder::PendingWriteBackCompletions() == 0, "async lane: completions outlived the reap of the async lane's batch");
     Require(*stored == GpuValue, "async lane: the copied writer's record holds " + Hex(*stored) + " after the reap, expected " + Hex(GpuValue));
     Require(*label == LabelValue, "async lane: the label holds " + Hex(*label) + " after the reap, expected " + Hex(LabelValue));
+    Require(*inFlightLabel == LabelValue, "async lane: the in-flight batch's label did not land at its reap");
     std::puts("copied writer label order: a queue 0 label behind an async-lane copied writer, with the main lane empty, went behind that lane's batch");
     return 0;
+}
+
 }
 
 int main(int argc, char** argv) {

@@ -2,6 +2,10 @@
 #include "prx/libSceAgc/Command/include/Packet.hpp"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <cstdint>
+#include <cstdlib>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
@@ -9,6 +13,20 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#if defined(__linux__)
+#include <dlfcn.h>
+#include <execinfo.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#elif defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace Agc::Command {
 
@@ -65,7 +83,93 @@ void Reserve(CommandBuffer* buffer, std::uint32_t count, const char* function) {
     }
 }
 
+#if defined(__linux__) || defined(_WIN32)
+namespace {
+
+// Diagnostic (APS5_TRACE_CB_RACE=1): two threads allocating in the same command buffer at once (the boot crash
+// "sceAgcAcbPopMarker: invalid command buffer cursors" and pop markers found over other packets). Each buffer hashes
+// to a slot holding the buffer, the thread inside it and the function it is in.
+struct CommandBufferUse {
+    std::atomic<const CommandBuffer*> buffer{nullptr};
+    std::atomic<long> thread{0};
+    std::atomic<const char*> function{nullptr};
+};
+
+std::array<CommandBufferUse, 4096>& commandBufferUses() {
+    static std::array<CommandBufferUse, 4096> uses{};
+    return uses;
+}
+
+class CommandBufferRaceGuard {
+public:
+    CommandBufferRaceGuard(const CommandBuffer* buffer, const char* function) {
+        static const bool enabled = std::getenv("APS5_TRACE_CB_RACE") != nullptr;
+        if (!enabled || buffer == nullptr) return;
+        _use = &commandBufferUses()[(reinterpret_cast<std::uintptr_t>(buffer) >> 4u) % 4096u];
+#if defined(_WIN32)
+        const long self = static_cast<long>(GetCurrentThreadId());
+#else
+        const long self = static_cast<long>(syscall(SYS_gettid));
+#endif
+        long expected = 0;
+        if (_use->thread.compare_exchange_strong(expected, self, std::memory_order_acq_rel)) {
+            _use->buffer.store(buffer, std::memory_order_release);
+            _use->function.store(function, std::memory_order_release);
+            _owned = true;
+            return;
+        }
+        if (expected == self || _use->buffer.load(std::memory_order_acquire) != buffer) return;
+        static std::atomic<int> reports{0};
+        if (reports.fetch_add(1) >= 20) return;
+        const char* other = _use->function.load(std::memory_order_acquire);
+        std::fprintf(stderr, "[cb-race] command buffer %p: thread %ld in %s while thread %ld is in %s; cursors bottom %p up %p down %p top %p\n",
+            static_cast<const void*>(buffer), self, function, expected, other != nullptr ? other : "?", static_cast<const void*>(buffer->bottom), static_cast<const void*>(buffer->cursor_up),
+            static_cast<const void*>(buffer->cursor_down), static_cast<const void*>(buffer->top));
+        void* frames[24];
+#if defined(_WIN32)
+        const int count = static_cast<int>(RtlCaptureStackBackTrace(0, 24, frames, nullptr));
+        for (int index = 0; index < count; ++index) {
+            HMODULE module = nullptr;
+            char name[MAX_PATH] = {};
+            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<LPCSTR>(frames[index]), &module) != 0 && GetModuleFileNameA(module, name, sizeof(name)) != 0) {
+                const char* base = std::strrchr(name, '\\');
+                std::fprintf(stderr, "[cb-race]   #%d %s+0x%llx\n", index, base != nullptr ? base + 1 : name, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(frames[index]) - reinterpret_cast<std::uintptr_t>(module)));
+            } else {
+                std::fprintf(stderr, "[cb-race]   #%d %p\n", index, frames[index]);
+            }
+        }
+#else
+        const int count = backtrace(frames, 24);
+        for (int index = 0; index < count; ++index) {
+            Dl_info where{};
+            if (dladdr(frames[index], &where) != 0 && where.dli_fname != nullptr) {
+                std::fprintf(stderr, "[cb-race]   #%d %s+0x%llx %s\n", index, where.dli_fname, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(frames[index]) - reinterpret_cast<std::uintptr_t>(where.dli_fbase)), where.dli_sname != nullptr ? where.dli_sname : "");
+            } else {
+                std::fprintf(stderr, "[cb-race]   #%d %p\n", index, frames[index]);
+            }
+        }
+#endif
+    }
+    ~CommandBufferRaceGuard() {
+        if (!_owned) return;
+        _use->buffer.store(nullptr, std::memory_order_release);
+        _use->thread.store(0, std::memory_order_release);
+    }
+    CommandBufferRaceGuard(const CommandBufferRaceGuard&) = delete;
+    CommandBufferRaceGuard& operator=(const CommandBufferRaceGuard&) = delete;
+
+private:
+    CommandBufferUse* _use = nullptr;
+    bool _owned = false;
+};
+
+}
+#endif
+
 std::uint32_t* Allocate(CommandBuffer* buffer, std::uint32_t count, const char* function) {
+#if defined(__linux__) || defined(_WIN32)
+    const CommandBufferRaceGuard guard(buffer, function);
+#endif
     Reserve(buffer, count, function);
     auto* result = buffer->cursor_up;
     AgcDriverPrepareCommandWrite_nid_no_patch(reinterpret_cast<std::uint64_t>(result), static_cast<std::size_t>(count) * sizeof(std::uint32_t));

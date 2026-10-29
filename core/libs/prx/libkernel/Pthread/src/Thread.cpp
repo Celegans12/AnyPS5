@@ -933,6 +933,15 @@ static void* StartNativeThread(void* opaque) {
     }
     if (!args->start.get())
         return nullptr;
+#if defined(__linux__)
+    // Diagnostic (APS5_TRACE_THREADS=1): host tid, guest name, requested affinity and priority of each guest thread
+    // (affinity is stored, not applied to the host thread), to match tids in other reports with the title's layout.
+    static const bool traceThreads = std::getenv("APS5_TRACE_THREADS") != nullptr;
+    if (traceThreads) {
+        std::lock_guard nameLock(self->nameLock);
+        std::fprintf(stderr, "[thread] host tid %d guest '%s' affinity 0x%llx priority %d\n", self->hostTid, self->name.c_str(), static_cast<unsigned long long>(self->affinity.load(std::memory_order_relaxed)), self->priority.load(std::memory_order_relaxed));
+    }
+#endif
     auto* guest = args->guest.release();
     args.reset();
     struct ThreadGuard {
@@ -1305,6 +1314,10 @@ int APS5_VABI scePthreadRename(Pthread thread, const char* name) {
 int APS5_VABI scePthreadSetaffinity(Pthread thread, KernelCpumask mask) {
     if (!thread || mask == 0) return SCE_KERNEL_ERROR_EINVAL;
     thread->affinity.store(mask, std::memory_order_relaxed);
+#if defined(__linux__)
+    static const bool traceThreads = std::getenv("APS5_TRACE_THREADS") != nullptr;
+    if (traceThreads) std::fprintf(stderr, "[thread] host tid %d affinity set to 0x%llx\n", thread->hostTid, static_cast<unsigned long long>(mask));
+#endif
     return SCE_OK;
 }
 
