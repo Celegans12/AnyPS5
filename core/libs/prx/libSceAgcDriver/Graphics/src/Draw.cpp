@@ -2863,12 +2863,6 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         if (args->countIndirect) passReads.emplace_back(args->countAddress, args->countAddress + 4);
     }
     passReads.insert(passReads.end(), inputs.inPlaceReads.begin(), inputs.inPlaceReads.end());
-    // C67: moved ranges the draw reads in place need the barrier behind earlier GPU writes as the base descriptors' do.
-    if (drawBindings != nullptr) {
-        for (const auto& snapshot : drawBindings->snapshots) {
-            if (snapshot.buffer == nullptr) passReads.emplace_back(snapshot.address, snapshot.address + snapshot.bytes);
-        }
-    }
     auto passImages = resources.StorageImages();
     if (record.blended != nullptr) {
         for (const auto& image : record.blended->images) passImages.emplace_back(image->Image(), true);
@@ -2882,6 +2876,12 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const bool unknownMemory = addressBased || resources.UsesAddressTable() || resources.HasCopiedWrites();
     static_cast<void>(StorageTexture::StoreDrawnLinearTouching("draw access", [&](std::uint64_t begin, std::uint64_t end) { return std::any_of(passReads.begin(), passReads.end(), [&](const auto& read) { return read.first < end && begin < read.second; }) || resources.WritesOverlap(begin, static_cast<std::size_t>(end - begin)); }, unknownMemory));
     const auto drawBindings = resources.PrepareDrawBindings(*recorder, record.moved);
+    // C67: moved ranges the draw reads in place need the barrier behind earlier GPU writes as the base descriptors' do.
+    if (drawBindings != nullptr) {
+        for (const auto& snapshot : drawBindings->snapshots) {
+            if (snapshot.buffer == nullptr) passReads.emplace_back(snapshot.address, snapshot.address + snapshot.bytes);
+        }
+    }
     static const bool addressReadPasses = std::getenv("APS5_NO_ADDRESS_READ_PASSES") == nullptr;
     const bool readOnlyBda = addressReadPasses && resources.BdaReadOnly();
     outcome.addressDraw = addressBased;
