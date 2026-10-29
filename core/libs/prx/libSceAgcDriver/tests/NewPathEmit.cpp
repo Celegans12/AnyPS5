@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/PushBlock.hpp"
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/ResolvedPush.hpp"
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/ResolvedTwins.hpp"
+#include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/ShareCensus.hpp"
 #include "Recompiler.hpp"
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/Router.hpp"
 #include <algorithm>
@@ -311,8 +312,57 @@ void writeSets() {
 
 }
 
+ShaderRecompiler::DescriptorBinding CensusBinding(ShaderRecompiler::DescriptorRole role, ShaderRecompiler::DescriptorKind kind, std::uint32_t number, std::vector<std::uint32_t> words) {
+    ShaderRecompiler::DescriptorBinding binding{};
+    binding.role = role;
+    binding.kind = kind;
+    binding.binding = number;
+    binding.count = 1;
+    binding.guestDescriptor = std::move(words);
+    return binding;
+}
+
+void shareCensus() {
+    using Role = ShaderRecompiler::DescriptorRole;
+    using Kind = ShaderRecompiler::DescriptorKind;
+    namespace Census = AgcDriver::NewPath::Census;
+    ShaderRecompiler::RecompileResult program;
+    program.bindings.push_back(CensusBinding(Role::GuestBuffers, Kind::StorageBuffer, 0, {0x1000, 0x00100000, 64, 0}));
+    program.bindings.push_back(CensusBinding(Role::FlattenedSrt, Kind::StorageBuffer, 1, {7, 8}));
+    program.rangesFromMemory = true;
+    const auto shape = Census::Classify(program);
+    Expect(shape == (Census::BuffersFromMemory | Census::BuffersWritten | Census::FlattenedSrt), "census shape " + Census::ShapeName(shape));
+    Expect(Census::ShapeName(shape) == "buf-mem+buf-write+flat-srt", "census shape name " + Census::ShapeName(shape));
+    program.rangesFromMemory = false;
+    program.bindings[0].readOnly = true;
+    program.bindings.push_back(CensusBinding(Role::GuestImages, Kind::StorageImage, 2, {1, 2, 3, 4, 5, 6, 7, 8}));
+    program.bindings.push_back(CensusBinding(Role::BdaPagetable, Kind::StorageBuffer, 3, {}));
+    Expect(Census::Classify(program) == (Census::AddressBased | Census::BuffersFromUser | Census::StorageImages | Census::FlattenedSrt), "census shape with a table, a user-SGPR buffer and a storage image");
+    Expect(Census::Classify(ShaderRecompiler::RecompileResult{}) == 0 && Census::ShapeName(0) == "none", "an empty result has a shape");
+    program.bindings.resize(2);
+    const auto base = Census::HashBindings(program);
+    Expect(Census::Compare(base, base) == Census::Repeat::Same, "equal inputs not same");
+    auto pushed = program;
+    pushed.pushConstants.push_back(std::byte{1});
+    Expect(Census::Compare(base, Census::HashBindings(pushed)) == Census::Repeat::PushOnly, "a push change not push-only");
+    auto data = program;
+    data.bindings[1].guestDescriptor[1] = 9;
+    Expect(Census::Compare(base, Census::HashBindings(data)) == Census::Repeat::DataOnly, "an SRT data change not data-only");
+    auto moved = data;
+    moved.bindings[0].guestDescriptor[0] = 0x2000;
+    moved.bindings[0].guestDescriptor[1] = 0x00100001;
+    Expect(Census::Compare(base, Census::HashBindings(moved)) == Census::Repeat::BasesOnly, "a moved buffer base not bases-only");
+    auto resized = program;
+    resized.bindings[0].guestDescriptor[2] = 128;
+    Expect(Census::Compare(base, Census::HashBindings(resized)) == Census::Repeat::Other, "a resized buffer not a descriptor change");
+    auto stride = program;
+    stride.bindings[0].guestDescriptor[1] = 0x00200000;
+    Expect(Census::Compare(base, Census::HashBindings(stride)) == Census::Repeat::Other, "a stride change not a descriptor change");
+}
+
 int main() {
     try {
+        shareCensus();
         routerDefaultsFallBack();
         routerEmitOrder();
         pushBlock();

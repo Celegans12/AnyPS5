@@ -325,6 +325,7 @@ public:
     bool HasGpuCopies() const { return guestMemory.HasGpuCopies(); }
     bool HasAddressOverlays() const { return guestMemory.HasOverlays(); }
     std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>> AddressTableRanges() const;
+    std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>> GuestBufferRanges() const;
     void WriteBackBuffers(std::uint64_t shaderAddress = 0);
     // Whether WriteBackBuffers has anything the CPU must see (copied written buffers, BDA faults).
     bool NeedsCompletion() const { return ((bda != nullptr || addressTableDeferred) && faultChecks) || guestMemory.HasCopiedWrites(); }

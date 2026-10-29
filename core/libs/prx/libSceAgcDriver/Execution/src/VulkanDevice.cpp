@@ -6520,6 +6520,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     if (emit != nullptr) {
         emit->tableDeferred = resources->AddressTableDeferred();
         emit->addressBased = resources->UsesAddressTable();
+        NewPath::NoteBufferCover(*emit, *resources);
     }
     if (profile) timer.add(PhaseResourcesHookWaits, Graphics::Recorder::ThreadWaitedMs() - waitedBefore);
     // The lookup outcomes of this call: rows with counts on the [indirect] line, and a summary for

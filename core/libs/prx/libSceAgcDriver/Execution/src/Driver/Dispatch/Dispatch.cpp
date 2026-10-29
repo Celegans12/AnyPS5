@@ -21,6 +21,7 @@
 #include "Optimization/ResourceProgram.hpp"
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/NewPath.hpp"
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/ResolvedTwins.hpp"
+#include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/ShareCensus.hpp"
 #include <algorithm>
 #include <atomic>
 #include <string>
@@ -644,6 +645,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
     phaseTiming.Phase(PhaseQueuedLabels);
     const auto& compiled = *compiledResult;
     CommandMix::NoteDispatch(compiled, indirectArguments != 0, cached);
+    if (indirectArguments == 0) NewPath::Census::NoteDecode(cached, captured.size(), lap);
     if (indirectArguments != 0) Graphics::ResidentCensus::NoteGpuRead(Graphics::ResidentCensus::Class::Indirect, indirectArguments, 12);
     std::vector<Graphics::GuestMemorySnapshot> snapshots;
     for (const auto& region : captured) snapshots.push_back({region.guestAddress, region.bytes});

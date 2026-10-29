@@ -134,6 +134,15 @@ DevicePageTable::Cover DevicePageTable::Covers(const std::shared_ptr<const std::
     return cover;
 }
 
+DevicePageTable::Cover DevicePageTable::Probe(std::span<const Range> build, Range* failed) const {
+    std::lock_guard lock(mutex);
+    if (!built) return Cover::Missing;
+    const Range* first = nullptr;
+    const auto cover = Compare(tableRanges, build, &first);
+    if (failed != nullptr && first != nullptr) *failed = *first;
+    return cover;
+}
+
 std::vector<Range> DevicePageTable::piecesLocked(std::uint64_t begin, std::uint64_t end) const {
     std::vector<Range> pieces;
     if (resident) pieces = resident(begin, end);

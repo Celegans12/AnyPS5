@@ -334,6 +334,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/NewPath/DevicePageTable.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/NewPath/Router.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/NewPath/ResolvedTwins.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/NewPath/ShareCensus.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Lifecycle.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Memory/BufferCopy.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Memory/BufferFill.cpp
@@ -635,7 +636,7 @@ if(BUILD_TESTING)
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 
-    add_test_executable(agc_newpath_emit_tests tests/NewPathEmit.cpp Execution/src/Driver/NewPath/Router.cpp Execution/src/Driver/NewPath/ResolvedTwins.cpp Execution/src/Driver/NewPath/CommandWrites.cpp Execution/src/Driver/NewPath/PushBlock.cpp Execution/src/Driver/NewPath/ResolvedPush.cpp Execution/src/Driver/NewPath/CommandRecord.cpp)
+    add_test_executable(agc_newpath_emit_tests tests/NewPathEmit.cpp Execution/src/Driver/NewPath/Router.cpp Execution/src/Driver/NewPath/ResolvedTwins.cpp Execution/src/Driver/NewPath/ShareCensus.cpp Execution/src/Driver/NewPath/CommandWrites.cpp Execution/src/Driver/NewPath/PushBlock.cpp Execution/src/Driver/NewPath/ResolvedPush.cpp Execution/src/Driver/NewPath/CommandRecord.cpp)
     target_include_directories(agc_newpath_emit_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/core/shader/recompiler)
     target_link_libraries(agc_newpath_emit_tests PRIVATE libc)
     configure_windows_unwind(agc_newpath_emit_tests)

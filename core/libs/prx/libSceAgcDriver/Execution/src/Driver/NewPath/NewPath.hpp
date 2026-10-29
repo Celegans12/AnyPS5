@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/Router.hpp"
 #include <atomic>
+#include <cstdint>
 #include <memory>
 
 namespace ShaderRecompiler {
@@ -11,6 +12,10 @@ struct RecompileResult;
 
 namespace AgcDriver {
 class VulkanDevice;
+}
+
+namespace AgcDriver::Graphics {
+class ShaderResources;
 }
 
 namespace AgcDriver::NewPath {
@@ -31,6 +36,16 @@ struct EmitCandidate {
     bool tableDeferred = false;
     bool addressBased = false;
     Route routed = Route::Fallback;
+    mutable struct {
+        bool active = false;
+        bool cached = false;
+        bool committed = false;
+        std::uint8_t repeat = 0;
+        std::uint8_t cover = 0;
+        std::uint32_t shape = 0;
+        std::uint32_t regions = 0;
+        std::uint64_t decodeNs = 0;
+    } census;
 
     EmitCandidate() = default;
     EmitCandidate(const EmitCandidate&) = delete;
@@ -56,6 +71,7 @@ private:
 Decision NoteEmit(EmitCandidate& candidate, const CommandFacts& facts);
 [[nodiscard]] bool MayEmitWithoutTable(const EmitCandidate& candidate, bool pipelineReady);
 void NoteDispatchCost(const EmitCandidate& candidate, std::uint64_t deviceNs, std::uint64_t buildNs);
+void NoteBufferCover(const EmitCandidate& candidate, const Graphics::ShaderResources& resources);
 
 void Close(const char* window);
 
