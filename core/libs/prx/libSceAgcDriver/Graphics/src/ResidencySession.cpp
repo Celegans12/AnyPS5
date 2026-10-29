@@ -66,7 +66,25 @@ double PrivateMiB() {
 }
 
 std::uint64_t ChangeMark(const ResidencyCounts& counts) {
-    return counts.admitted + counts.evicted + counts.demoted + counts.unusedDemoted + counts.dropped;
+    return counts.admitted + counts.evicted + counts.demoted + counts.unusedDemoted + counts.dropped + counts.behindFlips;
+}
+
+void PatchTable(Session& session) {
+    auto& manager = session.driver->Manager();
+    const auto mark = ChangeMark(manager.Counts());
+    if (mark == session.changeMark) return;
+    session.changeMark = mark;
+    auto now = manager.CurrentPages();
+    std::vector<std::uint64_t> changed;
+    std::set_symmetric_difference(now.begin(), now.end(), session.patched.begin(), session.patched.end(), std::back_inserter(changed));
+    if (changed.empty()) return;
+    if (NewPath::DeviceTable().PatchPages(*session.context, changed) == nullptr) {
+        ++session.unpatched;
+        return;
+    }
+    session.patched = std::move(now);
+    ++session.patches;
+    session.patchedPages += changed.size();
 }
 
 constexpr const char* RefusalNames[ResidencyRefusals] = {"none", "unsettled_import", "private_host_write", "private_pinned", "resident_view", "shared_pinned", "alias_host_write", "unavailable"};
@@ -165,6 +183,7 @@ std::shared_ptr<HostImport> BindStagedSlot(std::uint64_t address, std::uint64_t 
     import->serial = (std::uint64_t{1} << 62) | ChangeMark(manager.Counts());
     ++session.slotsBound;
     session.slotBoundBytes += bytes;
+    if (session.context) PatchTable(session);
     return import;
 }
 
@@ -208,25 +227,7 @@ void NoteStagedRegions(std::span<const std::pair<std::uint64_t, std::uint64_t>> 
         (one ? session.onePageBytes : session.multiPageBytes) += bytes;
     }
     session.stagedWrites += writes.size();
-    const auto mark = ChangeMark(manager.Counts());
-    if (mark == session.changeMark) return;
-    session.changeMark = mark;
-    std::vector<std::uint64_t> now;
-    for (const auto& [page, generation] : manager.ResidentGenerations()) {
-        static_cast<void>(generation);
-        now.push_back(page);
-    }
-    std::sort(now.begin(), now.end());
-    std::vector<std::uint64_t> changed;
-    std::set_symmetric_difference(now.begin(), now.end(), session.patched.begin(), session.patched.end(), std::back_inserter(changed));
-    if (changed.empty()) return;
-    if (NewPath::DeviceTable().PatchPages(*session.context, changed) == nullptr) {
-        ++session.unpatched;
-        return;
-    }
-    session.patched = std::move(now);
-    ++session.patches;
-    session.patchedPages += changed.size();
+    PatchTable(session);
 }
 
 std::string ResidencyReportLine() {
@@ -235,14 +236,14 @@ std::string ResidencyReportLine() {
     if (session.driver == nullptr) return {};
     const auto counts = session.driver->Manager().Counts();
     char line[1536];
-    int at = std::snprintf(line, sizeof(line), "[residency] slots bound %llu (%.1f MiB), refused %llu; re-entered copy-back notes %llu; staged uses %llu (read; one page %llu, %.1f MiB; spanning %llu, %.1f MiB, of them address-based overlays %llu, %.1f MiB), written ranges refreshed %llu; table patches %llu (%llu pages, %llu without a table); resident %.1f MiB (%u pages, %u chunks), retired 0.0 MiB, private %.0f MiB; admitted %llu, evicted %llu, demoted %llu, dropped %llu, inadmissible %llu (unwatched imports %llu), deferred %llu; faults fast %llu served %llu refused %llu; driver publishes %llu, write-back stamps %llu; written back %.1f MiB, copied in %.1f MiB; lease flushes 0; refusals:",
+    int at = std::snprintf(line, sizeof(line), "[residency] slots bound %llu (%.1f MiB), refused %llu; re-entered copy-back notes %llu; staged uses %llu (read; one page %llu, %.1f MiB; spanning %llu, %.1f MiB, of them address-based overlays %llu, %.1f MiB), written ranges refreshed %llu; table patches %llu (%llu pages, %llu without a table); resident %.1f MiB (%u pages, %u chunks), retired 0.0 MiB, private %.0f MiB; admitted %llu, evicted %llu, demoted %llu, dropped %llu, inadmissible %llu (unwatched imports %llu), deferred %llu; faults fast %llu served %llu refused %llu; driver publishes %llu, write-back stamps %llu; written back %.1f MiB, copied in %.1f MiB, copy-in deferred %.1f MiB (%u pages behind the import, %llu caught up); lease flushes 0; refusals:",
         static_cast<unsigned long long>(session.slotsBound), static_cast<double>(session.slotBoundBytes) / (1024.0 * 1024.0), static_cast<unsigned long long>(session.slotsRefused), static_cast<unsigned long long>(session.reentered.load()),
         static_cast<unsigned long long>(session.stagedReads), static_cast<unsigned long long>(session.onePage), static_cast<double>(session.onePageBytes) / (1024.0 * 1024.0), static_cast<unsigned long long>(session.multiPage), static_cast<double>(session.multiPageBytes) / (1024.0 * 1024.0), static_cast<unsigned long long>(session.overlayMulti), static_cast<double>(session.overlayMultiBytes) / (1024.0 * 1024.0), static_cast<unsigned long long>(session.stagedWrites),
         static_cast<unsigned long long>(session.patches), static_cast<unsigned long long>(session.patchedPages), static_cast<unsigned long long>(session.unpatched),
         static_cast<double>(std::uint64_t{counts.resident} << ResidencyPageShift) / (1024.0 * 1024.0), counts.resident, counts.chunks, PrivateMiB(),
         static_cast<unsigned long long>(counts.admitted), static_cast<unsigned long long>(counts.evicted), static_cast<unsigned long long>(counts.demoted + counts.unusedDemoted), static_cast<unsigned long long>(counts.dropped), static_cast<unsigned long long>(counts.inadmissible), static_cast<unsigned long long>(session.guest->UnwatchedImports()), static_cast<unsigned long long>(counts.deferred),
         static_cast<unsigned long long>(session.driver->FastFaults()), static_cast<unsigned long long>(session.driver->ServedFaults()), static_cast<unsigned long long>(session.driver->RefusedFaults()), static_cast<unsigned long long>(session.driver->DriverPublishes()), static_cast<unsigned long long>(session.driver->WriteBackStamps()),
-        static_cast<double>(counts.writtenBackBytes) / (1024.0 * 1024.0), static_cast<double>(counts.copiedInBytes) / (1024.0 * 1024.0));
+        static_cast<double>(counts.writtenBackBytes) / (1024.0 * 1024.0), static_cast<double>(counts.copiedInBytes) / (1024.0 * 1024.0), static_cast<double>(counts.copyInDeferredBytes) / (1024.0 * 1024.0), counts.behind, static_cast<unsigned long long>(counts.caughtUp));
     for (std::size_t reason = 1; reason < ResidencyRefusals && at > 0 && static_cast<std::size_t>(at) < sizeof(line); ++reason) {
         at += std::snprintf(line + at, sizeof(line) - static_cast<std::size_t>(at), " %s %llu", RefusalNames[reason], static_cast<unsigned long long>(counts.refusals[reason]));
     }

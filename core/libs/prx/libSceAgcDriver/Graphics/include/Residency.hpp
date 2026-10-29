@@ -84,6 +84,7 @@ struct ResidencyPolicy {
     std::uint32_t hotFaults = 2;
     std::uint32_t hotFrames = 2;
     std::uint32_t quietFrames = ResidencyHotQuietFrames;
+    bool deferCopyIn = false;
 };
 
 struct MirrorSlot {
@@ -227,6 +228,10 @@ struct ResidencyCounts {
     std::uint64_t rangeConflicts = 0;
     std::uint64_t rangeSetsUsed = 0;
     std::uint64_t rangeSetsReused = 0;
+    std::uint64_t copyInDeferredBytes = 0;
+    std::uint64_t behindFlips = 0;
+    std::uint64_t caughtUp = 0;
+    std::uint32_t behind = 0;
 };
 
 enum class ResidencyRangeState : std::uint8_t { Uniform, Completed, Demoted, Conflict };
@@ -331,6 +336,9 @@ public:
     std::vector<std::uint32_t> Chunks() const;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ResidentGenerations() const;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> MirroredIn(std::uint64_t address, std::uint64_t bytes);
+    std::vector<std::uint64_t> CurrentPages() const;
+    void CatchUp(std::uint64_t address, std::uint64_t bytes);
+    ResidencyMask Behind(std::uint64_t page) const;
     std::uint64_t ChunkAddress(std::uint32_t chunk) const;
     std::uint32_t ChunkSlots() const { return chunkSlots; }
     std::uint64_t Serial() const { return serial; }
@@ -374,6 +382,7 @@ private:
         std::uint64_t faultFrame = 0;
         std::uint64_t faultHistory = 0;
         ResidencyMask dirty = 0;
+        ResidencyMask behind = 0;
         std::vector<Run> dirtyRuns;
         bool gpuWritable = false;
         bool cpuWritable = false;
@@ -508,6 +517,10 @@ private:
     void appendDirty(std::uint32_t id, std::vector<ResidencyCopy>& copies) const;
     void appendClean(std::uint32_t id, std::uint32_t begin, std::uint32_t end, std::vector<ResidencyCopy>& copies) const;
     void copyIn(std::span<const Fill> fills);
+    std::vector<Fill> deferFills(std::span<const Fill> fills);
+    void markBehind(std::uint32_t id, ResidencyMask mask);
+    void clearBehind(std::uint32_t id);
+    void catchUp(std::span<const std::uint32_t> ids, bool waitForWriters);
     void refresh(std::vector<Fill> fills);
     void refreshOrdered(std::span<const Fill> fills);
     bool waitWriters(std::span<const Fill> fills);
@@ -533,6 +546,8 @@ private:
     const std::uint32_t hotFaults;
     const std::uint32_t hotFrames;
     const std::uint32_t quietFrames;
+    const bool deferCopyIn;
+    bool catchingUp = false;
     std::uint64_t budget = 0;
     std::uint32_t maxChunks = 0;
     std::uint64_t limitEpoch = 0;

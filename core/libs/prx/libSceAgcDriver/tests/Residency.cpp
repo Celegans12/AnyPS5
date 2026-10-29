@@ -613,14 +613,14 @@ public:
 };
 
 struct Fixture {
-    explicit Fixture(std::uint32_t pageCount, std::uint32_t budgetChunks, std::uint32_t hotFaults = 2, std::uint32_t hotFrames = 2) {
+    explicit Fixture(std::uint32_t pageCount, std::uint32_t budgetChunks, std::uint32_t hotFaults = 2, std::uint32_t hotFrames = 2, bool deferCopyIn = false) {
         for (std::uint32_t page = 0; page < pageCount; ++page) {
             auto& entry = gpu.imports[BasePage + page];
             entry.group = page;
             for (std::uint32_t subpage = 0; subpage < ResidencySubpages; ++subpage) (*entry.storage)[subpage] = (std::uint64_t{page} << 8) | subpage;
         }
         gpu.budgetChunks = budgetChunks;
-        manager = std::make_unique<ResidencyManager>(gpu, ResidencyPolicy{ChunkSlots, std::uint64_t{budgetChunks} * ChunkSlots * ResidencyPageBytes, hotFaults, hotFrames});
+        manager = std::make_unique<ResidencyManager>(gpu, ResidencyPolicy{ChunkSlots, std::uint64_t{budgetChunks} * ChunkSlots * ResidencyPageBytes, hotFaults, hotFrames, ResidencyHotQuietFrames, deferCopyIn});
         gpu.manager = manager.get();
     }
 
@@ -792,6 +792,65 @@ void ImportWritesRefreshMirrors() {
     fixture.gpu.copiedIn.clear();
     fixture.Use(0, BasePage + 0);
     Expect(fixture.gpu.copiedIn.empty(), "an unchanged page is not copied again");
+}
+
+std::uint64_t CopiedInBytes(const FakeGpu& gpu) {
+    std::uint64_t bytes = 0;
+    for (const auto& copy : gpu.copiedIn) bytes += copy.bytes;
+    return bytes;
+}
+
+void DeferredCopyInUntilAReader() {
+    scope = "copy-in deferred until a reader takes the mirror";
+    Fixture fixture(4, 1, 2, 2, true);
+    const auto page = BasePage + 0;
+    fixture.Use(0, page);
+    fixture.gpu.Drain();
+    Expect(fixture.gpu.copiedIn.empty() && fixture.manager->Behind(page) == ResidencyWholePage, "admission records no copy: the whole mirror is behind its import");
+    Expect(fixture.manager->MirroredIn(Address(page), ResidencyPageBytes).empty() && fixture.manager->CurrentPages().empty(), "a mirror behind its import is left out of the device page table");
+    for (std::uint64_t round = 0; round < 64; ++round) {
+        fixture.gpu.RecordTitle(FakeGpu::Kind::Write, page, 0x0010, 100 + round);
+        fixture.manager->RefreshImportWritten(Address(page, 4), 100);
+        fixture.gpu.CpuWrite(page, 0x0100, 200 + round);
+        fixture.Use(0, page);
+        fixture.gpu.Drain();
+    }
+    auto counts = fixture.manager->Counts();
+    Expect(fixture.gpu.copiedIn.empty() && counts.copiedInBytes == 0, "64 rounds of import writes and CPU stores with no reader copy nothing, not " + std::to_string(CopiedInBytes(fixture.gpu)) + " bytes");
+    Expect(counts.behindFlips == 1 && counts.behind == 1 && counts.copyInDeferredBytes >= 64 * 100, "the page went behind once and stayed behind");
+    fixture.gpu.RecordTitle(FakeGpu::Kind::Read, page, 0x0010, 163);
+    fixture.gpu.RecordTitle(FakeGpu::Kind::Read, page, 0x0100, 263);
+    fixture.gpu.Drain();
+    Expect(fixture.gpu.mirrorReads == 2, "both reads went through the mirror");
+    Expect(CopiedInBytes(fixture.gpu) == ResidencyPageBytes, "the first reader catches the page up once, whole: " + std::to_string(CopiedInBytes(fixture.gpu)) + " bytes");
+    Expect(fixture.manager->Behind(page) == 0 && fixture.manager->CurrentPages() == std::vector<std::uint64_t>{page} && fixture.manager->MirroredIn(Address(page), ResidencyPageBytes).size() == 1, "a caught-up mirror is exposed again");
+    fixture.gpu.copiedIn.clear();
+    fixture.gpu.RecordTitle(FakeGpu::Kind::Write, page, 0x0010, 300);
+    fixture.manager->RefreshImportWritten(Address(page, 4), 100);
+    Expect(fixture.manager->Behind(page) == 0x0010 && fixture.manager->CurrentPages().empty() && fixture.gpu.copiedIn.empty(), "a 100-byte import write puts its subpage behind and copies nothing");
+    fixture.gpu.RecordTitle(FakeGpu::Kind::Read, page, 0x0010, 300);
+    fixture.gpu.Drain();
+    Expect(CopiedInBytes(fixture.gpu) == ResidencySubpageBytes, "the reader copies the written subpage only: " + std::to_string(CopiedInBytes(fixture.gpu)) + " bytes");
+
+    const auto shared = BasePage + 1;
+    fixture.gpu.imports[shared].attributes.cpuWritable = false;
+    fixture.Share(shared);
+    fixture.Use(0, shared);
+    fixture.gpu.Drain();
+    fixture.gpu.copiedIn.clear();
+    Expect(fixture.manager->Behind(shared) == ResidencyWholePage, "the shared page is admitted behind");
+    fixture.Grant(0, shared, 0x0001);
+    Expect(CopiedInBytes(fixture.gpu) == ResidencyPageBytes && fixture.manager->Behind(shared) == 0 && fixture.manager->Dirty(shared) == 0x0001, "a GPU write into a mirror behind its import catches the page up first");
+    fixture.gpu.RecordTitle(FakeGpu::Kind::Write, shared, 0x0001, 900, true);
+    fixture.gpu.RecordTitle(FakeGpu::Kind::Write, shared, 0x0040, 901);
+    fixture.gpu.copiedIn.clear();
+    fixture.manager->RefreshImportWritten(Address(shared, 6), 100);
+    Expect(fixture.gpu.copiedIn.size() == 1 && fixture.gpu.copiedIn[0].bytes == 100 && fixture.manager->Behind(shared) == 0, "a page with GPU-dirty bytes is refreshed at once, the written bytes only");
+    fixture.gpu.RecordTitle(FakeGpu::Kind::Read, shared, 0x0001, 900);
+    fixture.gpu.RecordTitle(FakeGpu::Kind::Read, shared, 0x0040, 901);
+    fixture.gpu.Drain();
+    counts = fixture.manager->Counts();
+    Expect(counts.copiedInBytes <= counts.admitted * ResidencyPageBytes + 2 * ResidencySubpageBytes, "copy-in is bounded by the admitted pages plus the written subpages read since: " + std::to_string(counts.copiedInBytes) + " bytes");
 }
 
 void GuardedPagesRefreshAfterFaults() {
@@ -2197,6 +2256,7 @@ int main() {
         FlushWaitsForWriters();
         FaultRefreshOrderedAfterOwnWriters();
         ImportWritesRefreshMirrors();
+        DeferredCopyInUntilAReader();
         GuardedPagesRefreshAfterFaults();
         OrderingPointsReportQueuedWork();
         HotPagesStayAndCool();

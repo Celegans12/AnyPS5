@@ -187,6 +187,7 @@ std::unique_ptr<ResidencyDriver> ResidencyDriver::CreateIfEnabled(const Context&
     ResidencyPolicy policy;
     policy.budgetBytes = config.budgetForced ? config.residentBytes : DefaultResidentBytes;
     if (config.chunkPages != 0) policy.chunkSlots = config.chunkPages;
+    policy.deferCopyIn = !config.eagerCopyIn;
     return std::make_unique<ResidencyDriver>(context, recorder, guest, policy);
 }
 
