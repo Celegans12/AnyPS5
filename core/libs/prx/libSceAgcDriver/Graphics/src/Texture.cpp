@@ -1718,6 +1718,25 @@ std::shared_ptr<StorageTexture> StorageTexture::Create(const Context& context, T
     return texture;
 }
 
+namespace {
+// Diagnostic: APS5_TRACE_STORAGE_RANGE=<hex begin>-<hex end> prints [storage-trace] lines for every storage image whose
+// guest bytes overlap the range: creation (shape, levels, layers, bytes, element extent), each markLayersPending, each
+// write-back (stored ranges), each Refresh outcome, with the present number. Capped at 3000 lines.
+bool storageTraced(std::uint64_t begin, std::uint64_t bytes) {
+    static const std::pair<std::uint64_t, std::uint64_t> range = [] {
+        const char* text = std::getenv("APS5_TRACE_STORAGE_RANGE");
+        if (text == nullptr) return std::pair<std::uint64_t, std::uint64_t>{0, 0};
+        char* end = nullptr;
+        const auto from = std::strtoull(text, &end, 16);
+        const auto to = end != nullptr && *end == '-' ? std::strtoull(end + 1, nullptr, 16) : 0ull;
+        return std::pair<std::uint64_t, std::uint64_t>{from, to};
+    }();
+    if (range.second <= range.first || begin >= range.second || begin + bytes <= range.first) return false;
+    static std::atomic<int> lines{0};
+    return lines.fetch_add(1, std::memory_order_relaxed) < 3000;
+}
+}
+
 StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, std::uint32_t mipLevel) : context(context), detiler(detiler), descriptor(descriptor) {
     try {
         Require(!IsBlockCompressed(descriptor.format), "block-compressed textures cannot be storage images");
@@ -1734,6 +1753,7 @@ StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, 
         arrayLayers = geometry.layers;
         const auto elementBytes = BytesPerElement(descriptor.format);
         guestBytes = geometry.guestBytes;
+        if (storageTraced(descriptor.baseAddress, geometry.guestBytes)) std::fprintf(stderr, "[storage-trace] present %llu create %p 0x%llx+0x%llx %ux%u fmt %u tile %u mips %u (mip %u) layers %u extent 0x%llx\n", static_cast<unsigned long long>(Recorder::Presents()), static_cast<const void*>(this), static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(geometry.guestBytes), descriptor.width, descriptor.height, descriptor.format, static_cast<unsigned>(descriptor.tileMode), descriptor.mipCount, mipLevel, geometry.layers, static_cast<unsigned long long>(geometry.guestBytes));
         // Storage images in heaps the guest commits on demand only read and store committed pages.
         Require(!GuestMemory::CommittedRanges(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), true).empty(), "storage texture has no committed guest pages");
         // Write stamps are per 64 KiB block, so only 64 KiB-aligned layer slices can be told apart.
@@ -2678,6 +2698,7 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
     const bool outsideChanged = std::any_of(outside.begin(), outside.end(), [](bool value) { return value; });
     if (scoped) noteLayersBehind(firstLayer, lastLayer, outside);
     else layerBehind.clear();
+    if (storageTraced(descriptor.baseAddress, guestBytes)) std::fprintf(stderr, "[storage-trace] present %llu refresh %p 0x%llx: %s (pending %d, keys changed %d, cpu %d, flushed %d)\n", static_cast<unsigned long long>(Recorder::Presents()), static_cast<const void*>(this), static_cast<unsigned long long>(descriptor.baseAddress), unchanged ? "unchanged" : "changed", anyLayerPending() ? 1 : 0, keysChanged ? 1 : 0, cpuWrote ? 1 : 0, flushed ? 1 : 0);
     if (unchanged) {
         ++Profile().storageReused;
         for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
@@ -4353,6 +4374,7 @@ void StorageTexture::noteLayersBehind(std::uint32_t firstLayer, std::uint32_t la
 }
 
 void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count) {
+    if (storageTraced(descriptor.baseAddress, guestBytes)) std::fprintf(stderr, "[storage-trace] present %llu pending %p 0x%llx units %u+%u (was pending %d)\n", static_cast<unsigned long long>(Recorder::Presents()), static_cast<const void*>(this), static_cast<unsigned long long>(descriptor.baseAddress), first, count, first < layerPending.size() && layerPending[first] ? 1 : 0);
     CaptureTrace::Log("image-write image=%llx first=%u count=%u generation=%llu", static_cast<unsigned long long>(descriptor.baseAddress), first, count, static_cast<unsigned long long>(generation));
     ++writes;
     static const bool eager = std::getenv("APS5_EAGER_WRITEBACK") != nullptr || std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
@@ -6704,6 +6726,11 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     }
     for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
         if (layers[layer]) forgetKeptAtUnwatch(layer);
+    }
+    if (storageTraced(descriptor.baseAddress, guestBytes)) {
+        std::string stored;
+        for (const auto& [from, to] : keep) stored += " +0x" + [](std::uint64_t v) { char b[24]; std::snprintf(b, sizeof(b), "%llx", static_cast<unsigned long long>(v)); return std::string(b); }(from - descriptor.baseAddress) + "..+0x" + [](std::uint64_t v) { char b[24]; std::snprintf(b, sizeof(b), "%llx", static_cast<unsigned long long>(v)); return std::string(b); }(to - descriptor.baseAddress);
+        std::fprintf(stderr, "[storage-trace] present %llu write-back %p 0x%llx reason %s: stores%s%s (skipped %zu)\n", static_cast<unsigned long long>(Recorder::Presents()), static_cast<const void*>(this), static_cast<unsigned long long>(descriptor.baseAddress), flushReason != nullptr ? flushReason : "-", stored.empty() ? " nothing" : "", stored.c_str(), skipped);
     }
     // Debug aid: APS5_TRACE_FLUSH also names the blocks a write-back leaves to the CPU.
     static const bool traceKept = std::getenv("APS5_TRACE_FLUSH") != nullptr;
