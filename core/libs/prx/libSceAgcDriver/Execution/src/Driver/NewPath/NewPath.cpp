@@ -76,7 +76,7 @@ void print(State& state, const char* window) {
     const auto table = DeviceTable().Totals();
     const auto twins = Twins().Outcomes();
     AgcDriver::ProfilePrint_nid_no_patch("%s; page table builds %llu, patches %llu, ranges %llu, covered %.1f MiB; emit %s: resolved twins built %llu, not address-based %llu, failed %llu, mismatched %llu, reused %llu; table compares covered %llu, missing %llu, other address %llu, narrower %llu\n", line.c_str(), static_cast<unsigned long long>(table.builds), static_cast<unsigned long long>(table.patches), static_cast<unsigned long long>(table.ranges), static_cast<double>(table.coveredBytes) / (1024.0 * 1024.0), EmitDispatches() ? "on" : "off", static_cast<unsigned long long>(twins[0]), static_cast<unsigned long long>(twins[1]), static_cast<unsigned long long>(twins[2]), static_cast<unsigned long long>(twins[3]), static_cast<unsigned long long>(twins[4]), static_cast<unsigned long long>(table.coverHits[0]), static_cast<unsigned long long>(table.coverHits[1]), static_cast<unsigned long long>(table.coverHits[2]), static_cast<unsigned long long>(table.coverHits[3]));
-    if (EmitDispatches()) {
+    {
         std::string costs;
         static constexpr const char* names[] = {"new path (table deferred)", "new path (table built)", "fallback address-based", "fallback other"};
         for (std::size_t index = 0; index < state.costs.size(); ++index) {
