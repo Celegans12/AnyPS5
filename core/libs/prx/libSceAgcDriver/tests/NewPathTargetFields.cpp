@@ -1,6 +1,8 @@
 // agc_new_path_target_fields_tests: SpirvTarget::newPathResolved and bdaSegments (S4 epoch 1, piece 1) are part of the
 // recompile cache key and survive request serialization (v49). bdaSegments is refused until its emission exists, so no
 // module built today's way is ever cached under its key; newPathResolved recompiles (the page-table walk, compute).
+// orderedWorkgroupWaves (v50) is keyed and serialized too, and leaves the module unchanged where it does not apply: a
+// workgroup of one wave, and a program whose invocations a BDA fault can stop (the device test covers where it does).
 #include "BdaAbi.hpp"
 #include "CacheKey.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
@@ -25,11 +27,11 @@ const std::vector<std::uint32_t> Code{0xbf810000u};
 constexpr std::array<std::uint32_t, 2> Capabilities{spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses};
 constexpr std::array<std::string_view, 1> Extensions{"SPV_KHR_physical_storage_buffer"};
 
-RecompileRequest Request(bool resolved, bool segments) {
+RecompileRequest Request(bool resolved, bool segments, bool ordered = false, std::uint32_t wave = 64u, std::uint32_t threads = 64u) {
     RecompileRequest request{};
     request.shader = {ShaderStage::Compute, 0x22000u, Code, 0, {}};
-    request.context.waveSize = 64u;
-    request.context.compute = ShaderComputeStageInfo{{64u, 1u, 1u}, 0u, {true, false, false}, false, 1u};
+    request.context.waveSize = wave;
+    request.context.compute = ShaderComputeStageInfo{{threads, 1u, 1u}, 0u, {true, false, false}, false, 1u};
     request.target.vulkanVersion = 0x00401000u;
     request.target.spirvVersion = 0x00010300u;
     request.target.subgroupSize = 32u;
@@ -38,6 +40,7 @@ RecompileRequest Request(bool resolved, bool segments) {
     request.target.supportedExtensions = Extensions;
     request.target.newPathResolved = resolved;
     request.target.bdaSegments = segments;
+    request.target.orderedWorkgroupWaves = ordered;
     request.layout.pushConstantSizeBytes = 128u;
     request.useCache = false;
     return request;
@@ -71,7 +74,17 @@ int main() try {
     Expect(!Refused(false, false), "a request without the new-path fields was refused");
     Expect(!Refused(true, false), "a compute request with newPathResolved was refused");
     Expect(Refused(false, true) && Refused(true, true), "a request with bdaSegments recompiled before its emission exists");
-    std::puts("NewPathTargetFields: newPathResolved and bdaSegments are keyed and serialized; bdaSegments is refused until implemented");
+    std::vector<std::uint64_t> ordered;
+    RecompileCacheKey::Build(Request(false, false, true), ordered);
+    Expect(off != ordered, "orderedWorkgroupWaves is not part of the recompile cache key");
+    Expect(RequestSerializer{}.Deserialize(RequestSerializer{}.Serialize(Request(false, false, true))).request.target.orderedWorkgroupWaves, "orderedWorkgroupWaves did not survive request serialization");
+    Expect(!RequestSerializer{}.Deserialize(RequestSerializer{}.Serialize(Request(false, false))).request.target.orderedWorkgroupWaves, "orderedWorkgroupWaves appeared in request serialization");
+    for (const auto threads : {32u, 64u}) {
+        const auto plain = Recompile(Request(false, false, false, 32u, threads));
+        const auto waves = Recompile(Request(false, false, true, 32u, threads));
+        Expect(!plain.spirv.empty() && plain.spirv == waves.spirv, "orderedWorkgroupWaves changed a wave32 module of " + std::to_string(threads) + " threads where it does not apply");
+    }
+    std::puts("NewPathTargetFields: newPathResolved, bdaSegments and orderedWorkgroupWaves are keyed and serialized; bdaSegments is refused until implemented");
     return 0;
 } catch (const std::exception& error) {
     std::fprintf(stderr, "NewPathTargetFields: %s\n", error.what());

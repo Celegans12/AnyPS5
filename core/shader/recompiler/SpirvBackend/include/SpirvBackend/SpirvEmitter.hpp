@@ -29,6 +29,8 @@ struct SpirvTargetOptions {
     bool spannedWaves = false;
     // SpirvTarget::newPathResolved: BDA lookups walk the device page table whose address is push word 0-1.
     bool newPathResolved = false;
+    // SpirvTarget::orderedWorkgroupWaves (compute).
+    bool orderedWorkgroupWaves = false;
     bool bindlessImages = false;
     bool fusedFma = false;
     // ShaderComputeStageInfo::singleWorkgroup of the request.

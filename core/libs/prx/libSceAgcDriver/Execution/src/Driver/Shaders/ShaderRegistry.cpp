@@ -620,6 +620,10 @@ bool ProgramAllocates(const ShaderSnapshot& snapshot, std::size_t codeOffset) {
     return allocates;
 }
 
+bool OrderedWorkgroupWaves(const ShaderSnapshot& snapshot, std::size_t codeOffset) {
+    return VulkanDevice::ExactSerialAllocating() && ProgramAllocates(snapshot, codeOffset);
+}
+
 std::uint32_t PositionExportLayout(const ShaderSnapshot* snapshot, std::size_t codeOffset, std::span<const std::uint32_t> code, std::uint32_t paClVsOutCntl, const ShaderSnapshot* continuation) {
     constexpr std::uint8_t Unknown = 0, Unused = 1, Used = 2;
     const auto bits = paClVsOutCntl & Graphics::PositionExportLayoutBits;
@@ -1586,6 +1590,7 @@ std::unique_ptr<RegisteredPreparation> PlanRegistered(const ShaderSnapshot& snap
     }
     plan->memory = {{{snapshot.codeAddress, std::as_bytes(std::span(snapshot.code))}, {snapshot.headerAddress, snapshot.header}}};
     auto& request = plan->request.emplace(ShaderRecompiler::RecompileRequest{{stage, address, code, snapshot.headerAddress, snapshot.header}, {wave, firstUser, plan->userData, compute, pixel, vertex, plan->memory, RegisteredFloatMode(snapshot)}, stage == Stage::Compute ? device.ComputeTarget(wave, address) : device.Target(), {0, 0, 0, 128}, graphics});
+    if (stage == Stage::Compute) request.target.orderedWorkgroupWaves = OrderedWorkgroupWaves(snapshot, codeOffset);
     if (graphics && graphics->mesh) request.layout.pushConstantSizeBytes = ShaderRecompiler::MeshDrawPushOffsetBytes;
     if (graphics && graphics->tessellation) request.layout.pushConstantSizeBytes = ShaderRecompiler::TessellationLevelPushOffsetBytes;
     if (pixel && device.GraphicsPipelineLibraries()) request.layout.pushConstantOffsetBytes = Graphics::FixedPushOffset(Stage::Fragment);
