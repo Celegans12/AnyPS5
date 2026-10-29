@@ -574,6 +574,9 @@ private:
         // The device refused the shadow (memory or allocations exhausted): the region takes the
         // path it would take without staging, in both upload stages.
         bool unstaged = false;
+        // The gpuCopy buffer is a resident range's persistent buffer (see residentBuffer in
+        // GuestBufferMemory.cpp): its copy-in is skipped while the buffer still matches guest memory.
+        bool resident = false;
         // A written descriptor range of an address-based build that lies inside one of the space's
         // import regions, given a region of its own so it can be staged device-local (see
         // resolveOverlays); the BDA table sends its guest addresses to this region's buffer instead
