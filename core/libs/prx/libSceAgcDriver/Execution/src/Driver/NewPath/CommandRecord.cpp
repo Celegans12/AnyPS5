@@ -1,11 +1,29 @@
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/CommandRecord.hpp"
 #include <algorithm>
 #include <cstring>
+#include <mutex>
 #include <sstream>
 
 namespace AgcDriver::NewPath {
 
 namespace Bda = ShaderRecompiler::BdaAbi;
+
+namespace {
+
+std::mutex observerMutex;
+RecordObserver observer;
+
+}
+
+void SetCommandRecordObserver(RecordObserver next) {
+    std::lock_guard lock(observerMutex);
+    observer = std::move(next);
+}
+
+void ObserveCommandRecord(std::span<const std::uint32_t, CommandRecordWords> words) {
+    std::lock_guard lock(observerMutex);
+    if (observer) observer(words);
+}
 
 void ClearCommandRecord(std::span<std::uint32_t, CommandRecordWords> words) {
     std::fill(words.begin(), words.begin() + Bda::WrittenListWord, 0u);

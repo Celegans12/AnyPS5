@@ -1,4 +1,5 @@
 #include "SpirvBackend/SpirvBda.hpp"
+#include "SpirvBackend/SpirvEmitterHelpers.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvTypes.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvConstants.hpp"
 #include <algorithm>
@@ -12,6 +13,15 @@ std::uint32_t BdaConstant(SpirvEmitterState& state, std::uint64_t value) {
 }
 
 std::uint32_t BdaWord(SpirvEmitterState& state, std::uint32_t variable, std::uint32_t index) {
+    if (state.newPathResolved && variable != 0u && variable == state.faultBufferVariable) {
+        // New path (S2/S4 epoch 1): the fault and the written pages go to this dispatch's zeroed command record, push
+        // words 2-3 (D's ResolvedDispatchPush), which the driver reads at completion; the fault_buffer binding is unused.
+        const auto u64 = TypeScalarU64(state);
+        const auto offset = Binary(state, spv::OpShiftLeftLogical, u64, Unary(state, spv::OpUConvert, u64, index), BdaConstant(state, 2u));
+        const auto pointer = state.module.AllocateId();
+        state.module.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer, Binary(state, spv::OpIAdd, u64, NewPathFaultRecordAddress(state), offset));
+        return pointer;
+    }
     const auto pointer = state.module.AllocateId();
     state.module.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), pointer, variable, ConstantU32(state, 0u), index);
     return pointer;
@@ -60,7 +70,8 @@ void DefineBdaFaultFunction(SpirvEmitterState& state) {
     const auto won = Binary(state, spv::OpIEqual, TypeBool(state), previous, ConstantU32(state, 0u));
     EmitIfCondition(state, won, [&] {
         const auto store = [&](std::uint32_t index, std::uint32_t value) {
-            state.module.AddFunction(spv::OpStore, BdaWord(state, state.faultBufferVariable, ConstantU32(state, index)), value);
+            if (state.newPathResolved) state.module.AddFunction(spv::OpStore, BdaWord(state, state.faultBufferVariable, ConstantU32(state, index)), value, spv::MemoryAccessAlignedMask, 4u);
+            else state.module.AddFunction(spv::OpStore, BdaWord(state, state.faultBufferVariable, ConstantU32(state, index)), value);
         };
         store(1, reason);
         store(2, words ? address : Unary(state, spv::OpUConvert, TypeU32(state), address));

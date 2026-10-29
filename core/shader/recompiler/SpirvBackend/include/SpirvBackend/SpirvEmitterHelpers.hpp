@@ -47,6 +47,10 @@ std::uint32_t PushDataMember(SpirvEmitterState& state);
 inline constexpr std::uint32_t NewPathPushDriverWords = 6;
 // The device page table's address (push words 0-1) of a newPathResolved module, as a u64.
 std::uint32_t NewPathPageTableAddress(SpirvEmitterState& state);
+// The dispatch's command record (push words 2-3, BdaAbi::FaultBufferBytes layout: fault, written pages, SRT guard) of a
+// newPathResolved module, as a u64. Such a module reads and writes its fault and written pages there, not in the
+// fault_buffer binding.
+std::uint32_t NewPathFaultRecordAddress(SpirvEmitterState& state);
 std::uint32_t TypeU32ArrayPointer(SpirvEmitterState& state, std::uint32_t storageClass, std::uint32_t dwords);
 std::uint32_t TypeU32ElementPointer(SpirvEmitterState& state, std::uint32_t storageClass);
 std::uint32_t TypeId(SpirvEmitterState& state, IrType type);
