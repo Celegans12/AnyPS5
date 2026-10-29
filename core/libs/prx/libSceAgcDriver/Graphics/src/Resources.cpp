@@ -8,11 +8,21 @@
 #include <algorithm>
 #include <array>
 #include <exception>
+#ifdef __APPLE__
+#include <cstring>
+#endif
 
 namespace AgcDriver::Graphics {
 
 namespace {
 
+#ifdef __APPLE__
+void ClearPooledTail(void* mapping, std::size_t size, VkDeviceSize mappedBytes, VkMemoryPropertyFlags properties) {
+    if (mapping == nullptr || (properties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) == 0 || mappedBytes <= size) return;
+    std::memset(static_cast<std::byte*>(mapping) + size, 0, static_cast<std::size_t>(mappedBytes - size));
+}
+
+#endif
 VkDeviceSize ClassAllocationBytes(const VkMemoryRequirements& requirements, std::size_t capacity) {
     const auto alignment = std::max<VkDeviceSize>(requirements.alignment, 1);
     return std::max<VkDeviceSize>(requirements.size, (static_cast<VkDeviceSize>(capacity) + alignment - 1) / alignment * alignment);
@@ -40,7 +50,7 @@ VkBuffer BindExactBuffer(const Context& context, std::size_t size, VkBufferUsage
 
 }
 
-Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties) : context(context), size(size), capacity(BufferPool::Capacity(size, properties)), usage(BufferPool::Usage(usage, properties)), properties(properties) {
+Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties) : context(context), size(size), capacity(BufferPool::Capacity(size)), usage(BufferPool::Usage(usage, properties)), properties(properties) {
     Require(size != 0, "zero-sized GPU buffer");
     if (!context.bufferDeviceAddress && (usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) == 0) this->usage &= ~static_cast<VkBufferUsageFlags>(VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
     const bool addressable = (this->usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0;
@@ -55,6 +65,9 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
         capacity = allocation->bytes;
         offset = allocation->offset;
         slab = allocation->slab;
+#ifdef __APPLE__
+        ClearPooledTail(mapping, size, std::min<VkDeviceSize>(capacity, allocationBytes), properties);
+#endif
         if (allocation->bufferBytes != size) {
             context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr);
             buffer = VK_NULL_HANDLE;
@@ -103,6 +116,9 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
             Check(context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, buffer, memory, offset), "vkBindBufferMemory slab");
             initializeAddress(this->usage);
             mapping = slot.mapping;
+#ifdef __APPLE__
+            ClearPooledTail(mapping, size, capacity, properties);
+#endif
             ready = true;
             return;
         }
@@ -154,7 +170,7 @@ void Buffer::Invalidate() {
     Check(context.Function<PFN_vkInvalidateMappedMemoryRanges>("vkInvalidateMappedMemoryRanges")(context.device, 1, &range), "vkInvalidateMappedMemoryRanges");
 }
 
-DeviceBuffer::DeviceBuffer(const Context& context, std::size_t size, VkBufferUsageFlags usage) : context(context), size(size), capacity(BufferPool::Capacity(size, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)), usage(BufferPool::Usage(usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+DeviceBuffer::DeviceBuffer(const Context& context, std::size_t size, VkBufferUsageFlags usage) : context(context), size(size), capacity(BufferPool::Capacity(size)), usage(BufferPool::Usage(usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
     Require(size != 0, "zero-sized device buffer");
     if (!context.bufferDeviceAddress && (usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) == 0) this->usage &= ~static_cast<VkBufferUsageFlags>(VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
     cache = GetBufferPool(context);

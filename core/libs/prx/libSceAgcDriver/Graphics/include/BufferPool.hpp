@@ -64,7 +64,7 @@ public:
     BufferPool(const BufferPool&) = delete;
     BufferPool& operator=(const BufferPool&) = delete;
     // The size a buffer for `bytes` is created with: its size class, or `bytes` itself when large.
-    static std::size_t Capacity(std::size_t bytes, VkMemoryPropertyFlags properties);
+    static std::size_t Capacity(std::size_t bytes);
     static VkBufferUsageFlags Usage(VkBufferUsageFlags usage, VkMemoryPropertyFlags properties);
     static bool ForceAddresses();
     static void SetForceAddresses(bool force);
@@ -186,6 +186,7 @@ private:
     static constexpr std::size_t classLimit = std::size_t{1} << 20u;
     static constexpr unsigned deviceClassBits = 3;
     static constexpr std::size_t defaultSlots = 4096;
+    static constexpr std::size_t exactSizeScan = 64;
 };
 
 std::shared_ptr<BufferPool> GetBufferPool(const Context& context);

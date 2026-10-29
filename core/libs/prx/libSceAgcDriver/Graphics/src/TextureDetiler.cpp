@@ -43,6 +43,7 @@ struct Push {
     std::uint32_t columnBegin;
     std::uint32_t rowBegin;
     std::uint32_t pipeBankXor;
+    std::uint32_t splitStride;
 };
 
 struct AddressedPush {
@@ -101,8 +102,8 @@ VkDescriptorSetAndBindingMappingEXT PushIndexMapping(const BindlessHeap& heap, s
 
 constexpr std::uint32_t DetileHeapKind = ShaderRecompiler::RuntimeAbi::FirstStorageImageBinding + 27u;
 
-static_assert(offsetof(AddressedPush, input) == 72 && sizeof(AddressedPush) == 88);
-static_assert(offsetof(HeapImagePush, tiled) == 72 && offsetof(HeapImagePush, slot) == 80 && sizeof(HeapImagePush) == 88);
+static_assert(offsetof(AddressedPush, input) == 80 && sizeof(AddressedPush) == 96);
+static_assert(offsetof(HeapImagePush, tiled) == 80 && offsetof(HeapImagePush, slot) == 88 && sizeof(HeapImagePush) == 96);
 static_assert(ShaderRecompiler::RuntimeAbi::GpuHeapStorageKind(DetileHeapKind));
 static_assert(offsetof(AddressedRepackPush, source) == 16 && sizeof(AddressedRepackPush) == 32);
 
@@ -235,8 +236,18 @@ VkPipeline TextureDetiler::pipeline(TextureTileMode tileMode, std::uint32_t elem
     }
     // Constants 0-3 select element size, block size, addressing family and direction; 4-19 carry the
     // per-bit XOR equation for the equation family (2); 20-21 override the block extent in elements.
-    std::array<std::uint32_t, 22> values{elementBytes, BlockBytesFor(tileMode), tileMode == TextureTileMode::kLinear ? 0u : 1u, retile ? 1u : 0u};
-    if (thick) {
+    const bool gcn = IsGcnTiled(tileMode);
+    std::array<std::uint32_t, 26> values{elementBytes, gcn ? 0u : BlockBytesFor(tileMode), tileMode == TextureTileMode::kLinear ? 0u : 1u, retile ? 1u : 0u};
+    if (gcn) {
+        Require(!thick, "PS4 tiled surfaces are detiled thin");
+        const auto geometry = GcnTiling(tileMode, elementBytes);
+        values[1] = geometry.blockBytes;
+        values[2] = 2u;
+        std::copy(geometry.equation.begin(), geometry.equation.end(), values.begin() + 4);
+        values[20] = geometry.blockWidth;
+        values[21] = geometry.blockHeight;
+        std::copy(geometry.splitMasks.begin(), geometry.splitMasks.end(), values.begin() + 22);
+    } else if (thick) {
         const auto thickMode = tileMode == TextureTileMode::kStandard4KB ? 0x105u : tileMode == TextureTileMode::kS4KBX ? 0x115u : tileMode == TextureTileMode::kStandard64KB ? 0x109u : tileMode == TextureTileMode::kS64KBX ? 0x119u : tileMode == TextureTileMode::kD64KBX ? 0x11au : 0u;
         Require(thickMode != 0, "3D textures are only detiled thick from SW_4KB_S, SW_4KB_S_X, SW_64KB_S, SW_64KB_S_X or SW_64KB_D_X");
         const auto* equation = FindTextureSwizzleEquation(thickMode, elementBytes);
@@ -261,7 +272,7 @@ VkPipeline TextureDetiler::pipeline(TextureTileMode tileMode, std::uint32_t elem
     if (image && imageModule == VK_NULL_HANDLE) {
         imageModule = CreateShaderModule(context, TEXTURE_DETILE_IMAGE_SPV, sizeof(TEXTURE_DETILE_IMAGE_SPV), "vkCreateShaderModule");
     }
-    std::array<VkSpecializationMapEntry, 22> entries{};
+    std::array<VkSpecializationMapEntry, 26> entries{};
     for (std::uint32_t index = 0; index < entries.size(); ++index) entries[index] = {index, index * 4u, 4};
     VkSpecializationInfo specialization{};
     specialization.mapEntryCount = static_cast<std::uint32_t>(entries.size());
@@ -331,7 +342,7 @@ void TextureDetiler::Dispatch(VkCommandBuffer commands, TextureTileMode tileMode
     const auto destinationAddress = sourceAddress != 0 ? bufferAddress(destination) : 0;
     const bool addressed = sourceAddress != 0 && destinationAddress != 0;
     if (addressed) {
-        context.Function<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline(tileMode, elementBytes, retile, thick, false, true));
+        context.Function<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline(MipTileMode(tileMode, layout), elementBytes, retile, thick, false, true));
     } else {
         const auto set = allocateSet();
         const VkDescriptorBufferInfo sourceInfo{source, sourceDescriptorOffset, sourceRange};
@@ -350,7 +361,7 @@ void TextureDetiler::Dispatch(VkCommandBuffer commands, TextureTileMode tileMode
         writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         writes[1].pBufferInfo = &destinationInfo;
         context.Function<PFN_vkUpdateDescriptorSets>("vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
-        context.Function<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline(tileMode, elementBytes, retile, thick));
+        context.Function<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline(MipTileMode(tileMode, layout), elementBytes, retile, thick));
         CmdBindDescriptorSets(context, commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &set, SetBindSite::Detiler);
     }
     Push push{};
@@ -372,6 +383,7 @@ void TextureDetiler::Dispatch(VkCommandBuffer commands, TextureTileMode tileMode
     push.columnBegin = window.columnBegin;
     push.rowBegin = window.rowBegin;
     push.pipeBankXor = window.pipeBankXor;
+    push.splitStride = layout.gcnSplitStride;
     if (addressed) {
         const AddressedPush pushed{push, sourceAddress + sourceDescriptorOffset, destinationAddress + destinationDescriptorOffset};
         CmdPushConstants(context, commands, addressedPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pushed), &pushed);
@@ -599,18 +611,19 @@ void TextureDetiler::DispatchImage(VkCommandBuffer commands, TextureTileMode til
     push.columnBegin = window.columnBegin;
     push.rowBegin = window.rowBegin;
     push.pipeBankXor = window.pipeBankXor;
+    push.splitStride = layout.gcnSplitStride;
     std::optional<std::uint32_t> slot;
     const auto tiledAddress = owner != nullptr && DescriptorHeapEnabled() ? bufferAddress(tiled) : 0;
     if (tiledAddress != 0) slot = BindlessHeap::For(context).ViewSlot(DetileHeapKind, owner, view);
     if (slot) {
         auto& bindless = BindlessHeap::For(context);
         bindless.BindDescriptorHeaps(commands);
-        context.Function<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline(tileMode, elementBytes, retile, false, true, false, true));
+        context.Function<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline(MipTileMode(tileMode, layout), elementBytes, retile, false, true, false, true));
         const HeapImagePush pushed{push, tiledAddress + descriptorOffset, *slot, 0u};
         const VkPushDataInfoEXT data{VK_STRUCTURE_TYPE_PUSH_DATA_INFO_EXT, nullptr, 0, {&pushed, sizeof(pushed)}};
         context.Function<PFN_vkCmdPushDataEXT>("vkCmdPushDataEXT")(commands, &data);
     } else {
-        const auto target = pipeline(tileMode, elementBytes, retile, false, true);
+        const auto target = pipeline(MipTileMode(tileMode, layout), elementBytes, retile, false, true);
         const auto set = allocateSet(true);
         const VkDescriptorBufferInfo bufferInfo{tiled, descriptorOffset, range};
         const VkDescriptorImageInfo imageInfo{VK_NULL_HANDLE, view, VK_IMAGE_LAYOUT_GENERAL};
