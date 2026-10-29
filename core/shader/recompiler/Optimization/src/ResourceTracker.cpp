@@ -104,7 +104,7 @@ std::uint32_t byteExtent(const MemoryInfo& memory) {
 
 class Tracker {
 public:
-    Tracker(IrProgram& program, bool bindlessHandles) : m_program(program), m_info(program.Resources().info), m_builder(program), m_bindlessHandles(bindlessHandles) {
+    Tracker(IrProgram& program, bool bindlessHandles, bool runtimeBuffers) : m_program(program), m_info(program.Resources().info), m_builder(program), m_bindlessHandles(bindlessHandles), m_runtimeBuffers(runtimeBuffers) {
         m_info.buffers.clear();
         m_info.images.clear();
         m_info.samplers.clear();
@@ -2266,7 +2266,7 @@ private:
                 (store ? m_info.unboundedStores : m_info.unboundedLoads) = true;
             }
         }
-        if (ValidateSource(descriptor, badDword)) {
+        if (!m_runtimeBuffers && ValidateSource(descriptor, badDword)) {
             const auto source = InternSource(descriptor);
             const auto resource = AddBuffer(source, memory, inst.Opcode(), inst.Flags<MemoryFlags>().pc);
             if (resource == std::numeric_limits<std::uint32_t>::max()) fail("buffer resource limit exceeded");
@@ -2279,7 +2279,8 @@ private:
         m_info.usesDma = true;
         m_info.bdaWrites = m_info.bdaWrites || access == BufferAccess::Write || access == BufferAccess::Atomic;
         // fable records the site here, on its GPU-descriptor path, which every buffer access takes there. Here this
-        // path is reached only by a V# that did not validate, so its accesses are unbounded (recorded above).
+        // path is reached by a V# that did not validate, whose accesses are unbounded (recorded above), and under
+        // SpirvTarget::newPathRuntimeBuffers by every V#, whose site above keeps its bounded range.
         return true;
     }
 
@@ -2615,6 +2616,7 @@ private:
     ShaderInfo m_info;
     IrBuilder m_builder;
     bool m_bindlessHandles = false;
+    bool m_runtimeBuffers = false;
     std::map<IrValue*, std::vector<IrValue*>> m_directSamplerWords;
     std::vector<DescriptorSource> m_sources;
     std::vector<std::vector<std::uint32_t>> m_blockSources;
@@ -2640,8 +2642,8 @@ private:
 
 }
 
-void ResourceTracker::Track(IrProgram& program, bool bindlessHandles) const {
-    Tracker(program, bindlessHandles).Run();
+void ResourceTracker::Track(IrProgram& program, bool bindlessHandles, bool runtimeBuffers) const {
+    Tracker(program, bindlessHandles, runtimeBuffers).Run();
 }
 
 }

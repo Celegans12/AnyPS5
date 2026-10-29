@@ -427,7 +427,7 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
     dumpIr("srt");
 
     constexpr ResourceTracker resourceTracker;
-    resourceTracker.Track(program, request.target.bindlessImages);
+    resourceTracker.Track(program, request.target.bindlessImages, request.target.newPathRuntimeBuffers);
     deadCodeEliminator.Eliminate(program);
     dumpIr("resources");
     if (request.context.compute && !request.context.compute->PartialGroups()) program.Info().linearStore = FindLinearStore(program, request.context.compute->numThreads);
