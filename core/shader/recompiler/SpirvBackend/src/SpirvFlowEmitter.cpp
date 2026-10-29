@@ -182,28 +182,13 @@ std::uint32_t EmitBranchCondition(SpirvValueEmitContext& ctx, const BlockInfo& i
         return ctx.Def(info.condition);
     }
     auto& state = ctx.state;
-    const auto ballot = ctx.Ballot(info.condition);
-    const auto low = state.module.AllocateId();
-    const auto high = state.module.AllocateId();
-    const auto result = state.module.AllocateId();
-    state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), low, ballot, 0u);
-    state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), high, ballot, 1u);
-    const auto kind = info.terminator.condition;
-    const bool zero = kind == BranchCondition::ExecZero || kind == BranchCondition::VccZero || kind == BranchCondition::SccZero;
-    // A zero condition must hold on both lanes of every invocation still running, so the halves' AND is
-    // compared with a ballot of those invocations, not with all 32 bits: an invocation that left early
-    // (StopBdaInvocationIf after a recorded fault) drops out of every later ballot, and a loop leaving on
-    // execz, vccz or scc0 then never left (a GPU hang instead of the fault report).
-    std::uint32_t expected = ConstantU32(state, 0u);
-    if (zero) {
-        const auto active = state.module.AllocateId();
-        EmitSubgroupBallot(state, active, ConstantBool(state, true));
-        expected = state.module.AllocateId();
-        state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), expected, active, 0u);
+    const auto own = ctx.Def(info.condition);
+    const auto other = ctx.otherHalf->Def(info.condition);
+    if (condition == BranchCondition::ExecZero || condition == BranchCondition::VccZero || condition == BranchCondition::SccZero) {
+        const auto clear = Binary(state, spv::OpLogicalOr, TypeBool(state), Unary(state, spv::OpLogicalNot, TypeBool(state), own), Unary(state, spv::OpLogicalNot, TypeBool(state), other));
+        return Unary(state, spv::OpLogicalNot, TypeBool(state), EmitWaveAny(state, clear));
     }
-    const auto combined = EmitBinaryU32(state, zero ? spv::OpBitwiseAnd : spv::OpBitwiseOr, low, high);
-    state.module.AddFunction(zero ? spv::OpIEqual : spv::OpINotEqual, TypeBool(state), result, combined, expected);
-    return result;
+    return EmitWaveAny(state, Binary(state, spv::OpLogicalOr, TypeBool(state), own, other));
 }
 
 void EmitStructuredTerminator(SpirvValueEmitContext& ctx, const IrProgram& program, const BlockInfo& info) {
@@ -323,6 +308,7 @@ void EmitDirectInstruction(SpirvValueEmitContext& ctx, const IrValue& inst) {
         case IrOpcode::ReferenceU32: return Invoke(EmitReferenceU32, ctx, inst);
         case IrOpcode::UnlinkedCall: return Invoke(EmitUnlinkedCall, ctx, inst);
         case IrOpcode::WindowLaneGuard: return Invoke(EmitWindowLaneGuard, ctx, inst);
+        case IrOpcode::DescriptorFault: return Invoke(EmitDescriptorFault, ctx, inst);
         case IrOpcode::GetUserData: return Invoke(EmitGetUserData, ctx, inst);
         case IrOpcode::GetShaderBase: return Invoke(EmitGetShaderBase, ctx, inst);
         case IrOpcode::ShaderClock: return Invoke(EmitShaderClock, ctx, inst);
@@ -330,6 +316,7 @@ void EmitDirectInstruction(SpirvValueEmitContext& ctx, const IrValue& inst) {
         case IrOpcode::MeshDrawParameter: return Invoke(EmitMeshDrawParameter, ctx, inst);
         case IrOpcode::MeshArgument: return Invoke(EmitMeshArgument, ctx, inst);
         case IrOpcode::MeshRestartStart: return Invoke(EmitMeshRestartStart, ctx, inst);
+        case IrOpcode::MeshCapturedWord: return Invoke(EmitMeshCapturedWord, ctx, inst);
         case IrOpcode::MeshAllocate: return Invoke(EmitMeshAllocate, ctx, inst);
         case IrOpcode::TessellationBase: return Invoke(EmitTessellationBase, ctx, inst);
         case IrOpcode::GetTessellationAttribute: return Invoke(EmitGetTessellationAttribute, ctx, inst);
@@ -949,6 +936,12 @@ void EmitWindowLaneGuard(SpirvValueEmitContext& ctx, const IrValue& inst, std::u
     const auto ownLane = Binary(state, spv::OpIEqual, boolean, EmitSubgroupLocalInvocationId(state), Binary(state, spv::OpBitwiseAnd, TypeU32(state), lane, ConstantU32(state, state.program.WaveSize() - 1u)));
     const auto overwritten = Binary(state, spv::OpLogicalAnd, boolean, Binary(state, spv::OpIEqual, boolean, index, slot), Binary(state, spv::OpINotEqual, boolean, value, current));
     EmitIfCondition(state, Binary(state, spv::OpLogicalAnd, boolean, ownLane, overwritten), [&] { RecordBdaFaultWords(state, slot, lane, value, ConstantU32(state, 0u), BdaAbi::FaultReason::WindowLaneSpill); });
+}
+
+void EmitDescriptorFault(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t condition, std::uint32_t low, std::uint32_t high, std::uint32_t programCounter) {
+    auto& state = ctx.state;
+    if (state.faultBufferVariable == 0) ctx.Fail(inst, "reports an invalid descriptor without a fault buffer");
+    EmitIfCondition(state, condition, [&] { RecordBdaFaultWords(state, low, high, ConstantU32(state, 0u), programCounter, BdaAbi::FaultReason::InvalidDescriptor); });
 }
 
 void EmitControlNop(SpirvValueEmitContext& context) {

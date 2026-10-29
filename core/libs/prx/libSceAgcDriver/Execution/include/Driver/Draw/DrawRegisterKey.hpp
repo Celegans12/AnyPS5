@@ -25,7 +25,7 @@ struct DrawStageWalk {
     const ShaderRegistry::mapped_type* snapshots = nullptr;
     std::uint64_t offset = 0;
 };
-using DrawRegistryWalk = std::array<DrawStageWalk, 5>;
+using DrawRegistryWalk = std::array<DrawStageWalk, 6>;
 
 void WalkDrawRegistry(const QueueState& queue, const ShaderRegistry& registry, DrawRegistryWalk& walk);
 std::uint64_t DrawShaderSetKey(const DrawRegistryWalk& walk);

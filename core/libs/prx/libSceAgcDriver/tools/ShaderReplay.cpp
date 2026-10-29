@@ -65,6 +65,7 @@ bool g_maintenance8 = false;
 bool g_robust2 = false;
 bool g_waveLdsMemoryBarriers = false;
 bool g_deviceScopeLdsMemoryBarriers = false;
+bool g_ldsLockFences = false;
 bool g_code = false;
 bool g_prepareOnly = false;
 bool g_pipelineOnly = false;
@@ -450,6 +451,11 @@ bool Replay(const char* path, std::unique_ptr<AgcDriver::VulkanDevice>& device) 
         if (!g_expectedSpirv.empty() && g_requests > 1) throw std::runtime_error("--expect-spv takes one request; several requests need their .fp sidecars");
         if (request.request.shader.stage != ShaderRecompiler::ShaderStage::Compute || !request.request.context.compute.has_value() || request.request.graphics.has_value()) throw std::runtime_error("pipeline-only requires a compute request");
     }
+    if (g_maintenance8) request.request.target.nonConstantImageOffsets = true;
+    if (g_robust2) request.request.target.robustBufferAccess2 = true;
+    if (g_waveLdsMemoryBarriers) request.request.target.waveLdsMemoryBarriers = true;
+    if (g_deviceScopeLdsMemoryBarriers) request.request.target.deviceScopeLdsMemoryBarriers = true;
+    if (g_ldsLockFences) request.request.target.ldsLockFences = true;
     std::printf("%s: %zu code words, %zu user data, %zu memory regions, wave%u\n", path, request.request.shader.code.size(), request.request.context.userData.size(), request.request.context.memory.size(), request.request.context.waveSize);
     if (request.request.context.compute.has_value()) {
         const auto& compute = *request.request.context.compute;
@@ -508,7 +514,6 @@ bool Replay(const char* path, std::unique_ptr<AgcDriver::VulkanDevice>& device) 
             return false;
         }
     }
-    if (g_materialize && g_maintenance8) request.request.target.nonConstantImageOffsets = true;
     if (!g_materialize) {
         try {
             if (g_prepareOnly) {
@@ -550,10 +555,6 @@ bool Replay(const char* path, std::unique_ptr<AgcDriver::VulkanDevice>& device) 
         }
     }
     try {
-        if (g_maintenance8) request.request.target.nonConstantImageOffsets = true;
-        if (g_robust2) request.request.target.robustBufferAccess2 = true;
-        if (g_waveLdsMemoryBarriers) request.request.target.waveLdsMemoryBarriers = true;
-        if (g_deviceScopeLdsMemoryBarriers) request.request.target.deviceScopeLdsMemoryBarriers = true;
         if (g_prepareOnly) {
             const auto prepared = ShaderRecompiler::PrepareShader(request.request);
             if (!prepared) throw std::runtime_error("prepared shader handle is absent");
@@ -730,7 +731,7 @@ int MakeRequest(int argc, char** argv) {
 int main(int argc, char** argv) {
     if (argc >= 2 && std::string(argv[1]) == "--make-request") return MakeRequest(argc, argv);
     if (argc < 2) {
-        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] [--prepare] [--materialize] [--code] [--maintenance8] [--robust2] [--wave-lds-memory-barriers] [--device-scope-lds-memory-barriers] [--bindless] [--prepare-only | --pipeline-only --pipeline-cache DIR [--expect-spv FILE | --no-reference]] <shader.req>...\n  --prepare replays the request as a prepared artifact\n  --materialize also captures the resources from the request memory and materializes the prepared invocation\n  --prepare-only plans and compiles without materializing runtime memory\n  --pipeline-only recompiles captured compute inputs and creates the native pipeline without guest resources or dispatch\n  --pipeline-cache selects an existing private cache directory; __GL_SHADER_DISK_CACHE_PATH must select a separate fresh empty directory\n  --expect-spv requires byte equality with an ordinary replay before device creation (one request); without it each\n    request needs the .fp sidecar APS5_PIPELINE_REQUESTS saved next to it, and its pipeline fingerprint must match\n  --no-reference skips that check (requests from older runs); a hit in the game's pipeline cache then proves the match\n  several requests share one device and cache; each success prints a PIPELINE-RESULT line\n  --fingerprint-variants prints the pipeline fingerprint components of each way to materialize a request against its .fp\n    (--describe adds the values: specialization constants, bindings)\n  --native-target replaces a captured compute target with this device's (requests from builds with another target) and names the fields that differed\n  --bindless (or APS5_BINDLESS_IMAGES=1) compiles table images through the bindless descriptor heap; a device made for --pipeline-only enables it too\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set; shader_<address>.prepare.req holds a request whose preparation failed before any resource capture, so replay it with --prepare\n");
+        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] [--prepare] [--materialize] [--code] [--maintenance8] [--robust2] [--wave-lds-memory-barriers] [--device-scope-lds-memory-barriers] [--lds-lock-fences] [--bindless] [--prepare-only | --pipeline-only --pipeline-cache DIR [--expect-spv FILE | --no-reference]] <shader.req>...\n  --prepare replays the request as a prepared artifact\n  --materialize also captures the resources from the request memory and materializes the prepared invocation\n  --prepare-only plans and compiles without materializing runtime memory\n  --pipeline-only recompiles captured compute inputs and creates the native pipeline without guest resources or dispatch\n  --pipeline-cache selects an existing private cache directory; __GL_SHADER_DISK_CACHE_PATH must select a separate fresh empty directory\n  --expect-spv requires byte equality with an ordinary replay before device creation (one request); without it each\n    request needs the .fp sidecar APS5_PIPELINE_REQUESTS saved next to it, and its pipeline fingerprint must match\n  --no-reference skips that check (requests from older runs); a hit in the game's pipeline cache then proves the match\n  several requests share one device and cache; each success prints a PIPELINE-RESULT line\n  --fingerprint-variants prints the pipeline fingerprint components of each way to materialize a request against its .fp\n    (--describe adds the values: specialization constants, bindings)\n  --native-target replaces a captured compute target with this device's (requests from builds with another target) and names the fields that differed\n  --bindless (or APS5_BINDLESS_IMAGES=1) compiles table images through the bindless descriptor heap; a device made for --pipeline-only enables it too\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set; shader_<address>.prepare.req holds a request whose preparation failed before any resource capture, so replay it with --prepare\n");
         return 2;
     }
     for (int i = 1; i < argc; ++i) {
@@ -767,6 +768,10 @@ int main(int argc, char** argv) {
             g_prepareOnly = true;
             continue;
         }
+        if (std::string(argv[i]) == "--gcn") {
+            ShaderRecompiler::SetGcnGuestShaders(true);
+            continue;
+        }
         if (std::string(argv[i]) == "--dis") {
             g_disassemble = true;
             continue;
@@ -793,6 +798,10 @@ int main(int argc, char** argv) {
         }
         if (std::string(argv[i]) == "--device-scope-lds-memory-barriers") {
             g_deviceScopeLdsMemoryBarriers = true;
+            continue;
+        }
+        if (std::string(argv[i]) == "--lds-lock-fences") {
+            g_ldsLockFences = true;
             continue;
         }
         if (std::string(argv[i]) == "--mem") {

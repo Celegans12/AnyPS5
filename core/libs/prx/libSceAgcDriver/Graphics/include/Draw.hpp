@@ -46,7 +46,7 @@ struct DrawTraceContext {
 struct PreparedDraw;
 bool SplitDrawBuild();
 std::shared_ptr<PreparedDraw> PrepareDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders);
-void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, PreparedDraw* prepared = nullptr, const AheadDraw* ahead = nullptr, const DrawTraceContext* trace = nullptr);
+void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, PreparedDraw* prepared = nullptr, const AheadDraw* ahead = nullptr, const DrawTraceContext* trace = nullptr, std::uint64_t shape = 0);
 
 struct PixelFunctionLdsLayouts {
     VkDescriptorSetLayout empty = VK_NULL_HANDLE;
@@ -152,6 +152,7 @@ struct DrawPassCounts {
     std::uint64_t storeFlushes = 0;
 };
 std::array<DrawPassCounts, 2> DrawPassTotals();
+std::array<std::uint64_t, PassBreakCount> DrawPassBreaks();
 const char* IndirectDrawPathName(IndirectDrawPath path);
 
 // Draw packets that drew nothing, for the [draws] line: Nothing (an empty count, or no color writes

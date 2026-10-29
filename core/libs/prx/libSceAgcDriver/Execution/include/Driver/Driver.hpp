@@ -52,11 +52,16 @@ struct PreparedDraw;
 
 namespace AgcDriver {
 class PerformanceTimer;
+struct OverlayDriverCounters;
 }
 
 namespace AgcDriver::DriverDetail {
 
 class ShaderRefusal;
+
+inline std::uint32_t ThreadDimensionGroups(std::uint32_t threads, std::uint32_t groupThreads) {
+    return static_cast<std::uint32_t>((std::uint64_t{threads} + groupThreads - 1u) / groupThreads);
+}
 
 class Driver {
 public:
@@ -101,7 +106,7 @@ public:
     void RegisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOutput>& output);
     void UnregisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOutput>& output);
     void AttachWindow(const PresentationWindow& window);
-    void Present(const PresentationWindow& window, const DisplayBuffer* buffer, bool opaque, void (*gpuReady)(void*), void* context);
+    void Present(const PresentationWindow& window, const DisplayBuffer* buffer, const DisplayBuffer* plane, bool opaque, void (*gpuReady)(void*), void* context);
     void ReleaseWindow(void* window);
     void RegisterShader(const Shader* shader);
     void ResolveShaderAbi(const Shader* shader, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive);
@@ -136,7 +141,9 @@ public:
     // APS5_SKIP_REFUSED_SHADERS: reports a refused preparation on the title's thread once and lets the open
     // preparation transaction commit what was prepared before it.
     static void SkipRefusedPreparation(const ShaderRefusal& refusal);
+    static void reportSkip(const char* kind, const std::string& what);
     DrawEntryCounters DrawCacheCounters();
+    OverlayDriverCounters OverlayCounters();
     struct DrawCacheOccupancy {
         std::size_t admitted = 0;
         std::size_t probation = 0;
@@ -149,7 +156,9 @@ public:
         std::uint64_t variantBytes = 0;
     };
     DispatchCacheFootprint DispatchCacheSize();
+    DispatchCacheFootprint DrawCacheSize();
     static std::uint64_t DispatchCacheBytes();
+    static std::uint64_t DrawCacheBytes();
     static ShaderMemory::PendingWrite QueryPendingSpan(std::uint64_t address, std::size_t bytes, std::span<std::byte> known);
     std::shared_ptr<const ShaderRegistry> RegisteredShaders();
     DrawAheadCounters DrawAheadStatistics() const;
@@ -187,6 +196,7 @@ private:
     void completeSubmission(std::uint64_t serial, std::uint64_t received, std::span<const std::uint64_t> labelWrites, const std::shared_ptr<SubmissionProgress>& progress);
     static bool waitFree(const Submission& submission);
     bool queue0Before(std::uint64_t received) const;
+    bool waitFreeBefore(std::uint64_t received) const;
     bool orderReleased(std::uint32_t queue, std::uint64_t received) const;
     void noteWaitBlocked(std::uint32_t queue, std::uint64_t awaited, bool blocked);
     void reportPresents(double waitedMs, std::size_t inFlight);
@@ -268,7 +278,6 @@ private:
     static std::size_t& writeCursor();
     static void dumpPackets(std::span<const std::uint32_t> commands, const std::uint32_t* guest = nullptr);
     static void validate(const Submission& submission, const std::uint32_t* guest = nullptr);
-    static void reportSkip(const char* kind, const std::string& what);
     static bool matchesFillKernel(std::span<const std::uint32_t> code, const std::vector<std::uint32_t>& userData, const ShaderRecompiler::ShaderComputeStageInfo& compute);
     static bool fillClearEnabled();
     static bool fillClearExactOnly();
@@ -327,7 +336,7 @@ private:
     void noteForeignWriter(std::uint64_t begin, std::uint64_t end, std::uint32_t queue);
     void noteDrawWriters(std::span<const Graphics::CompiledShader> stages, std::uint32_t queue);
     static std::vector<std::pair<std::uint64_t, std::uint64_t>> drawWriteRanges(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> stages);
-    void commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, Graphics::PreparedDraw* prepared = nullptr, std::uint64_t presyncSerial = 0, const Graphics::AheadDraw* ahead = nullptr, VulkanDevice::DrawTraceContext trace = {});
+    void commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, Graphics::PreparedDraw* prepared = nullptr, std::uint64_t presyncSerial = 0, const Graphics::AheadDraw* ahead = nullptr, VulkanDevice::DrawTraceContext trace = {}, std::uint64_t shape = 0);
     bool labelPacketQueues(std::span<const std::uint32_t> packet, std::uint32_t opcode);
     bool enqueueLabelPacket(std::span<const std::uint32_t> packet, std::uint32_t opcode, std::uint32_t queue);
     bool enqueueDmaPacket(std::span<const std::uint32_t> packet, std::uint32_t opcode, std::uint32_t queue, const QueueState& state);
@@ -486,6 +495,7 @@ private:
     std::uint64_t drawCacheHits = 0, drawCacheEvictions = 0, drawCacheVariants = 0, drawCacheVariantBytes = 0;
     std::optional<DrawKeySightings> drawKeySightings;
     std::optional<DrawKeySightings> drawShapeSightings;
+    std::uint64_t drawCacheByteEvictions = 0;
 
     DrawEntryCounters drawEntryCounters;
 

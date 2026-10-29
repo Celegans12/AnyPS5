@@ -12,7 +12,7 @@ namespace AgcDriver::DriverDetail {
 namespace {
 
 bool runtimeRegister(std::uint32_t offset) {
-    return offset - 0x00cu < 32u || offset - 0x08cu < 32u || offset - 0x10cu < 32u || offset == 0x082u || offset == 0x083u || offset == 0x102u || offset == 0x103u;
+    return offset - 0x00cu < 32u || offset - 0x04cu < 16u || offset - 0x08cu < 32u || offset - 0x10cu < 32u || offset == 0x082u || offset == 0x083u || offset == 0x102u || offset == 0x103u;
 }
 
 const auto& registerMasks() {
@@ -38,10 +38,11 @@ void forEachKeyedUserWord(const QueueState& queue, bool allUserWords, TVisit&& v
     const auto words = [&](std::uint32_t base, std::uint32_t count) {
         for (auto it = queue.shader.lower_bound(base); it != queue.shader.end() && it->first < base + count; ++it) visit(it->first, it->second);
     };
-    for (const auto base : {0x00cu, 0x08cu, 0x10cu}) {
+    for (const auto base : {0x00cu, 0x04cu, 0x08cu, 0x10cu}) {
+        const auto limit = base == 0x04cu ? 16u : 32u;
         const auto resources = queue.shader.find(base - 1);
         const auto count = resources == queue.shader.end() ? 0u : ((resources->second >> 1u) & 0x1fu) | (((resources->second >> 27u) & 1u) << 5u);
-        words(base, allUserWords ? 32u : std::min(count, 32u));
+        words(base, allUserWords ? limit : std::min(count, limit));
     }
     words(0x082u, 2);
     words(0x102u, 2);
@@ -88,13 +89,14 @@ std::uint64_t RegisterStateKey(const QueueState& queue, bool allUserWords, bool 
         }
     };
     std::array<std::uint64_t, 3> byStage{};
-    std::size_t stage = 0;
-    for (const auto base : {0x00cu, 0x08cu, 0x10cu}) {
+    byStage.fill(0xcbf29ce484222325ull);
+    for (const auto base : {0x00cu, 0x04cu, 0x08cu, 0x10cu}) {
+        const auto limit = base == 0x04cu ? 16u : 32u;
         const auto resources = queue.shader.find(base - 1);
         const auto count = resources == queue.shader.end() ? 0u : ((resources->second >> 1u) & 0x1fu) | (((resources->second >> 27u) & 1u) << 5u);
-        auto& part = byStage[stage++];
-        part = 0xcbf29ce484222325ull;
-        words(base, allUserWords ? 32u : std::min(count, 32u), part);
+        words(base, allUserWords ? limit : std::min(count, limit), byStage[base == 0x00cu ? 0u : base == 0x10cu ? 2u : 1u]);
+    }
+    for (const auto part : byStage) {
         mixPart(userData, part);
     }
     words(0x082u, 2, auxiliary);
@@ -106,7 +108,7 @@ std::uint64_t RegisterStateKey(const QueueState& queue, bool allUserWords, bool 
 
 void WalkDrawRegistry(const QueueState& queue, const ShaderRegistry& registry, DrawRegistryWalk& walk) {
     std::size_t stage = 0;
-    for (const auto base : {0x008u, 0x088u, 0x0c8u, 0x108u, 0x148u}) {
+    for (const auto base : {0x008u, 0x048u, 0x088u, 0x0c8u, 0x108u, 0x148u}) {
         auto& s = walk[stage++];
         s = {};
         const auto low = queue.shader.find(base);
@@ -317,7 +319,7 @@ bool Driver::sameDecode(const DrawDecode& a, const DrawDecode& b) {
         if (!x) return true;
         return x->inputControlPoints == y->inputControlPoints && x->outputControlPoints == y->outputControlPoints && x->domain == y->domain && x->partitioning == y->partitioning && x->outputTopology == y->outputTopology && x->patchesPerGroup == y->patchesPerGroup && x->primitiveGroupSize == y->primitiveGroupSize && x->breakAtInstance == y->breakAtInstance && x->mergedHull == y->mergedHull;
     };
-    if (s.stages.path != t.stages.path || s.stages.registerValue != t.stages.registerValue || s.stages.vertexWaveSize != t.stages.vertexWaveSize || s.stages.fragmentWaveSize != t.stages.fragmentWaveSize || !sameMesh(s.stages.mesh, t.stages.mesh) || !sameTess(s.stages.tessellation, t.stages.tessellation)) return false;
+    if (s.stages.path != t.stages.path || s.stages.registerValue != t.stages.registerValue || s.stages.vertexWaveSize != t.stages.vertexWaveSize || s.stages.fragmentWaveSize != t.stages.fragmentWaveSize || s.stages.hullWaveSize != t.stages.hullWaveSize || !sameMesh(s.stages.mesh, t.stages.mesh) || !sameMesh(s.stages.tessellationGeometry, t.stages.tessellationGeometry) || !sameTess(s.stages.tessellation, t.stages.tessellation)) return false;
     if (!sameColor(s.color, t.color) || s.colors.size() != t.colors.size() || s.blends.size() != t.blends.size()) return false;
     for (std::size_t i = 0; i < s.colors.size(); ++i) {
         if (!sameColor(s.colors[i], t.colors[i])) return false;
@@ -333,14 +335,14 @@ bool Driver::sameDecode(const DrawDecode& a, const DrawDecode& b) {
     if (std::memcmp(&s.viewport, &t.viewport, sizeof(VkViewport)) != 0 || std::memcmp(&s.scissor, &t.scissor, sizeof(VkRect2D)) != 0) return false;
     const auto& p = a.pixel;
     const auto& q = b.pixel;
-    if (p.interpolatorCount != q.interpolatorCount || p.interpolatorSettings != q.interpolatorSettings || p.wave32 != q.wave32 || p.inputAddr != q.inputAddr || p.hasPerspectiveCenterVgpr != q.hasPerspectiveCenterVgpr || p.perspectiveCentroid != q.perspectiveCentroid || p.posX != q.posX || p.posY != q.posY || p.posZ != q.posZ || p.posW != q.posW || p.frontFace != q.frontFace || p.frontFaceAllBits != q.frontFaceAllBits || p.ancillary != q.ancillary || p.sampleShading != q.sampleShading || p.noPerspective != q.noPerspective || p.linearCentroid != q.linearCentroid || p.pixelKillEnable != q.pixelKillEnable || p.depthExportEnable != q.depthExportEnable || p.sampleMaskExportEnable != q.sampleMaskExportEnable || p.earlyZ != q.earlyZ || p.executeOnNoop != q.executeOnNoop || p.conservativeZExport != q.conservativeZExport || p.orderedPixelShader != q.orderedPixelShader || p.stencilRefExportEnable != q.stencilRefExportEnable || p.stencilOperationValueExport != q.stencilOperationValueExport || p.targetOutputMode != q.targetOutputMode || p.targetExportMapping != q.targetExportMapping) return false;
+    if (p.interpolatorCount != q.interpolatorCount || p.interpolatorSettings != q.interpolatorSettings || p.wave32 != q.wave32 || p.inputAddr != q.inputAddr || p.hasPerspectiveCenterVgpr != q.hasPerspectiveCenterVgpr || p.perspectiveCentroid != q.perspectiveCentroid || p.posX != q.posX || p.posY != q.posY || p.posZ != q.posZ || p.posW != q.posW || p.frontFace != q.frontFace || p.frontFaceAllBits != q.frontFaceAllBits || p.ancillary != q.ancillary || p.sampleShading != q.sampleShading || p.noPerspective != q.noPerspective || p.linearCentroid != q.linearCentroid || p.pixelKillEnable != q.pixelKillEnable || p.depthExportEnable != q.depthExportEnable || p.depthExportMin != q.depthExportMin || p.depthExportMax != q.depthExportMax || p.sampleMaskExportEnable != q.sampleMaskExportEnable || p.earlyZ != q.earlyZ || p.executeOnNoop != q.executeOnNoop || p.conservativeZExport != q.conservativeZExport || p.orderedPixelShader != q.orderedPixelShader || p.stencilRefExportEnable != q.stencilRefExportEnable || p.stencilOperationValueExport != q.stencilOperationValueExport || p.targetOutputMode != q.targetOutputMode || p.targetExportMapping != q.targetExportMapping) return false;
     if (a.roles != b.roles || a.programs.size() != b.programs.size()) return false;
     for (std::size_t i = 0; i < a.programs.size(); ++i) {
         const auto& x = a.programs[i];
         const auto& y = b.programs[i];
         if (x.binary.stage != y.binary.stage || x.binary.codeAddress != y.binary.codeAddress || x.userDataBase != y.userDataBase || x.firstUserSgpr != y.firstUserSgpr || x.userData != y.userData || x.snapshot != y.snapshot || x.codeOffset != y.codeOffset || x.tailContinuation != y.tailContinuation) return false;
     }
-    if (p.targetExportPacking != q.targetExportPacking || p.targetBlend != q.targetBlend || p.dualSourceBlend != q.dualSourceBlend || p.reversedBlend != q.reversedBlend || p.targetMerge != q.targetMerge || p.alphaToCoverage != q.alphaToCoverage || p.rasterPrimitive != q.rasterPrimitive || p.ditheredAlphaToCoverage != q.ditheredAlphaToCoverage || p.quadPixelMask != q.quadPixelMask || p.quadSampleMask != q.quadSampleMask || p.iteratesSamples != q.iteratesSamples || p.positionLocation != q.positionLocation || p.sampleLocations != q.sampleLocations || p.sampleOrder != q.sampleOrder) return false;
+    if (p.targetExportPacking != q.targetExportPacking || p.targetBlend != q.targetBlend || p.dualSourceBlend != q.dualSourceBlend || p.reversedBlend != q.reversedBlend || p.targetMerge != q.targetMerge || p.alphaToCoverage != q.alphaToCoverage || p.rasterPrimitive != q.rasterPrimitive || p.ditheredAlphaToCoverage != q.ditheredAlphaToCoverage || p.ditheredAlphaSamples != q.ditheredAlphaSamples || p.quadPixelMask != q.quadPixelMask || p.quadSampleMask != q.quadSampleMask || p.iteratesSamples != q.iteratesSamples || p.positionLocation != q.positionLocation || p.sampleLocations != q.sampleLocations || p.sampleOrder != q.sampleOrder) return false;
     if (s.samples != t.samples || s.mergedCoverage != t.mergedCoverage || s.truncatedCoverage != t.truncatedCoverage || s.quadSampleMask != t.quadSampleMask || s.pixelEarlyZ != t.pixelEarlyZ || s.pixelKill != t.pixelKill) return false;
     return true;
 }

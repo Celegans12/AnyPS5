@@ -74,6 +74,15 @@ std::size_t Driver::drawCacheEntries() {
     return entries;
 }
 
+std::uint64_t Driver::DrawCacheBytes() {
+    static const std::uint64_t bytes = [] {
+        const char* text = std::getenv("APS5_DRAW_CACHE_BYTES");
+        const auto parsed = text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+        return parsed != 0 ? static_cast<std::uint64_t>(parsed) : std::uint64_t{256} << 20u;
+    }();
+    return bytes;
+}
+
 void Driver::accountDrawVariant(const DispatchVariant& variant, bool added) {
     if (added) {
         ++drawCacheVariants;
@@ -317,7 +326,8 @@ void Driver::prepareEvictions(std::size_t growth, std::size_t replaced) {
 }
 
 void Driver::evictDrawEntries() {
-    while (drawOrder.size() > drawCacheEntries()) {
+    while (drawOrder.size() > drawCacheEntries() || (drawOrder.size() > 1 && drawCacheVariantBytes > DrawCacheBytes())) {
+        const bool overBytes = drawOrder.size() <= drawCacheEntries();
         const auto last = drawCache.find(drawOrder.back());
         for (const auto& variants : last->second->stages) {
             for (const auto& variant : variants) accountDrawVariant(*variant, false);
@@ -328,6 +338,10 @@ void Driver::evictDrawEntries() {
         drawCache.erase(last);
         ++drawCacheEvictions;
         ++drawEntryCounters.evictions;
+        if (overBytes) {
+            ++drawCacheByteEvictions;
+            ++drawEntryCounters.byteEvictions;
+        }
     }
 }
 

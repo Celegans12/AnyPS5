@@ -246,9 +246,6 @@ constexpr int guestRlimitFsize = 1;
 constexpr int guestPriorityProcess = 0;
 constexpr int guestPriorityGroup = 1;
 constexpr int guestPriorityUser = 2;
-std::atomic<int> guestNice{0};
-constexpr int guestNiceMin = -20;
-constexpr int guestNiceMax = 20;
 constexpr int guestRlimitData = 2;
 constexpr int guestRlimitStack = 3;
 constexpr int guestRlimitCore = 4;
@@ -297,6 +294,8 @@ std::mutex openFileLimitMutex;
 std::optional<GuestResourceLimit> guestOpenFileLimit;
 std::mutex processLimitMutex;
 GuestResourceLimit guestProcessResourceLimit{guestProcessLimit, guestProcessLimit};
+std::mutex coreLimitMutex;
+GuestResourceLimit guestCoreLimit{guestRlimitInfinity, guestRlimitInfinity};
 }
 
 namespace {
@@ -750,6 +749,7 @@ int APS5_VABI waitpid_nid_postfix(int pid, int* status, int options) {
     } else if (WIFSIGNALED(encoded) || WIFSTOPPED(encoded)) {
         const int hostSignal = WIFSIGNALED(encoded) ? WTERMSIG(encoded) : WSTOPSIG(encoded);
         int guestSignal = hostSignal;
+#ifndef __APPLE__
         switch (hostSignal) {
         case 7: guestSignal = 10; break;
         case 10: guestSignal = 30; break;
@@ -767,6 +767,7 @@ int APS5_VABI waitpid_nid_postfix(int pid, int* status, int options) {
             return -1;
         default: break;
         }
+#endif
         encoded = WIFSTOPPED(encoded) ? ((encoded & ~0xff00) | (guestSignal << 8)) : ((encoded & ~0x7f) | guestSignal);
     }
     if (status != nullptr) *status = encoded;
@@ -809,6 +810,13 @@ int APS5_VABI setrlimit_nid_postfix(int resource, const GuestResourceLimit* limi
         guestProcessResourceLimit = requested;
         return 0;
     }
+    if (resource == guestRlimitCore && requested.rlim_max == current.rlim_max) {
+        std::lock_guard lock(coreLimitMutex);
+        guestCoreLimit.rlim_cur = requested.rlim_cur;
+        return 0;
+    }
+    if ((resource == guestRlimitData || resource == guestRlimitStack) && requested.rlim_cur == current.rlim_cur && requested.rlim_max > current.rlim_max)
+        return 0;
     if (requested.rlim_cur != current.rlim_cur || requested.rlim_max != current.rlim_max)
         throw std::runtime_error("setrlimit: changing the limit of resource " + std::to_string(resource) + " is not supported");
     return 0;
@@ -1148,9 +1156,13 @@ int APS5_VABI getrlimit_nid_postfix(int resource, GuestResourceLimit* limit) {
         result = guestProcessResourceLimit;
         break;
     }
+    case guestRlimitCore: {
+        std::lock_guard lock(coreLimitMutex);
+        result = guestCoreLimit;
+        break;
+    }
     case guestRlimitCpu:
     case guestRlimitFsize:
-    case guestRlimitCore:
     case guestRlimitRss:
     case guestRlimitMemlock:
     case guestRlimitSbsize:
@@ -1183,7 +1195,7 @@ int APS5_VABI getpriority_nid_postfix(int which, int who) {
         *__error_nid_postfix() = guestNoProcess;
         return -1;
     }
-    return guestNice.load(std::memory_order_relaxed);
+    return 0;
 }
 
 int APS5_VABI setpriority_nid_postfix(int which, int who, int niceval) {
@@ -1197,8 +1209,11 @@ int APS5_VABI setpriority_nid_postfix(int which, int who, int niceval) {
         *__error_nid_postfix() = guestNoProcess;
         return -1;
     }
-    const int clamped = niceval < guestNiceMin ? guestNiceMin : (niceval > guestNiceMax ? guestNiceMax : niceval);
-    guestNice.store(clamped, std::memory_order_relaxed);
+    if (which != guestPriorityProcess) {
+        throw std::runtime_error(std::string("setpriority: setting the nice value of ") +
+                                 (which == guestPriorityGroup ? "PRIO_PGRP" : "PRIO_USER") + " to " + std::to_string(niceval) +
+                                 " is not verified on the console");
+    }
     return 0;
 }
 

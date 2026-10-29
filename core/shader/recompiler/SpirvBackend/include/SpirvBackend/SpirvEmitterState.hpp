@@ -108,7 +108,7 @@ struct SpirvEmitterState {
     SpirvModule module;
     const IrProgram& program;
     ShaderStageInputInfo inputInfo;
-    std::array<std::uint32_t, 10> tessVariables {};
+    std::array<std::uint32_t, 11> tessVariables {};
     std::uint32_t tessInnerVariable = 0;
 
     SpirvRequirements requirements;
@@ -129,6 +129,7 @@ struct SpirvEmitterState {
     // See ShaderComputeStageInfo::singleWorkgroup: glc reads through the plain binding, buffer-ordering s_barrier.
     bool singleWorkgroup = false;
     bool robustBufferAccess2 = false;
+    bool exactRobustLoads = false;
     bool float32FlushToZero = false;
     bool float32DenormPreserve = false;
     bool fusedExactArithmetic = false;
@@ -148,6 +149,7 @@ struct SpirvEmitterState {
     std::map<std::pair<std::uint32_t, std::uint32_t>, std::uint32_t> solvedBarycentrics;
     bool waveLdsMemoryBarriers = false;
     bool deviceScopeLdsMemoryBarriers = false;
+    bool ldsLockFences = false;
     std::unordered_set<const IrValue*> sharedLaneValues;
     std::uint32_t laneHalf = 0;
     std::uint32_t spirvVersion = 0x00010300u;
@@ -191,6 +193,7 @@ struct SpirvEmitterState {
     std::uint32_t reciprocalCorrectionFunction = 0;
     std::array<std::uint32_t, 3> reciprocalTables {};
     std::map<std::pair<bool, std::uint32_t>, std::uint32_t> interpolateFunctions;
+    std::map<std::pair<bool, std::uint32_t>, std::uint32_t> fastInterpolateFunctions;
     bool integerInterpolation = false;
     std::array<std::array<std::uint32_t, 2>, 2> bdaDwordReadFunctions {};
     std::array<std::array<std::uint32_t, 2>, 2> bdaSpanReadFunctions {};
@@ -219,7 +222,7 @@ struct SpirvEmitterState {
     std::uint32_t loopGuardVisits = 0;
     std::uint32_t loopGuardPc = 0;
     std::uint32_t srgbTableVariable = 0;
-    std::uint32_t gcnBufferFormatVariable = 0;
+    std::uint32_t gcnBufferFormatFunction = 0;
     std::uint32_t gdsVariable = 0;
     std::uint32_t gdsLength = 0;
     std::uint32_t pushConstantVariable = 0;
@@ -271,6 +274,7 @@ struct SpirvEmitterState {
     std::array<std::uint32_t, 8> blendTargetWritten {};
     std::uint32_t blendFragCoordVariable = 0;
     std::uint32_t mergeWordVariable = 0;
+    std::uint32_t mergeTexelVariable = 0;
     std::uint32_t mergePendingVariable = 0;
     std::uint32_t quadPixelUncovered = 0;
     std::uint32_t sampleMaskInputVariable = 0;

@@ -1,4 +1,3 @@
-#include "prx/libSceAgcDriver/Graphics/include/PipelineCache.hpp"
 #include "ShaderCacheDirectory.hpp"
 #include "ShaderDiskCache.hpp"
 #include <algorithm>
@@ -8,6 +7,7 @@
 #include <cstring>
 #include <fstream>
 #include <map>
+#include <new>
 #include <span>
 #include <string>
 #include <vector>
@@ -77,7 +77,12 @@ PipelineCache::PipelineCache(const Context& context, const VkPhysicalDevicePrope
         result = create(context.device, &info, nullptr, &cache);
     }
     Check(result, "vkCreatePipelineCache");
-    if (!path.empty()) saver = std::thread([this] { run(); });
+    try {
+        if (!path.empty()) saver = std::thread([this] { run(); });
+    } catch (...) {
+        context.Function<PFN_vkDestroyPipelineCache>("vkDestroyPipelineCache")(context.device, cache, nullptr);
+        throw;
+    }
 }
 
 PipelineCache::~PipelineCache() {
@@ -184,7 +189,7 @@ void PipelineCache::load(std::vector<std::byte>& initialData) {
     std::fprintf(stderr, "[pipeline-cache] loaded %.1f KiB from %s\n", static_cast<double>(initialData.size()) / 1024.0, path.string().c_str());
 }
 
-bool PipelineCache::save(bool final, bool waitForPipelines) {
+bool PipelineCache::save(bool final, bool waitForPipelines) try {
     std::lock_guard pathLock(pathMutex(path));
     const auto getData = context.Function<PFN_vkGetPipelineCacheData>("vkGetPipelineCacheData");
     const auto snapshot = [&] { return waitForPipelines ? synchronization.LockForSnapshot() : synchronization.TryLockForSnapshot(); };
@@ -205,7 +210,6 @@ bool PipelineCache::save(bool final, bool waitForPipelines) {
     auto disk = fileUnchanged ? File{} : readFile();
     if (disk.state == FileState::Unreadable) {
         std::fprintf(stderr, "[pipeline-cache] cannot read %s; not saving over it\n", path.string().c_str());
-        settle(readHeader());
         return true;
     }
     if (disk.state == FileState::Invalid) std::fprintf(stderr, "[pipeline-cache] replacing %s: %s\n", path.string().c_str(), disk.invalidReason);
@@ -276,6 +280,9 @@ bool PipelineCache::save(bool final, bool waitForPipelines) {
     }
     settle(header);
     if (final || profiling()) std::fprintf(stderr, "[pipeline-cache] saved %.1f KiB to %s in %.1f ms%s%s\n", static_cast<double>(size) / 1024.0, path.string().c_str(), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count(), mergedWithFile ? " (merged with the file)" : "", final ? " (teardown)" : "");
+    return true;
+} catch (const std::bad_alloc&) {
+    std::fputs("[pipeline-cache] save skipped: host memory exhausted\n", stderr);
     return true;
 }
 

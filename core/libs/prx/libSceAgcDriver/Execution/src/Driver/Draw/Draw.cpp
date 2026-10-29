@@ -21,7 +21,7 @@
 #include <bit>
 #include <cstdlib>
 #include <algorithm>
-#include <cstdlib>
+#include <map>
 #include <cstdio>
 #include <cstring>
 #include <atomic>
@@ -446,6 +446,11 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             }
         }
         decode = std::move(refreshed);
+    }
+    if (decode != nullptr && !userPatches.empty() && verifyDrawRecipe()) {
+        auto patched = std::make_shared<DrawDecode>(*decode);
+        for (const auto& patch : userPatches) patched->programs.at(patch.program).userData.at(patch.index) = patch.value;
+        decode = std::move(patched);
     }
     try {
         resolveDrawDecode(queue, submission, localDevice->graphicsContext(), decode, registerKey, drawKey, profile);
@@ -913,6 +918,20 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         }
     };
     if (graphics.rectList) buildRectList();
+    if (graphics.stages.tessellationGeometry) {
+        static std::mutex captureMutex;
+        static std::map<std::pair<std::uint32_t, std::uint32_t>, ShaderRecompiler::RecompileResult> captureShaders;
+        const auto& geometry = *graphics.stages.tessellationGeometry;
+        {
+            std::lock_guard captureLock(captureMutex);
+            auto found = captureShaders.find({geometry.esgsItemSize, geometry.primitivesPerGroup});
+            if (found == captureShaders.end()) found = captureShaders.emplace(std::pair{geometry.esgsItemSize, geometry.primitivesPerGroup}, ShaderRecompiler::BuildTessellationCaptureGeometryShader(geometry, localDevice->Target(), localDevice->GeometryLimits())).first;
+            results.push_back(found->second);
+        }
+        const auto evaluation = std::ranges::find_if(stages, [](const Graphics::CompiledShader& stage) { return stage.stage == Stage::TessellationEvaluation; });
+        require(evaluation != stages.end(), "tessellation followed by a geometry stage has no domain program");
+        stages.insert(std::next(evaluation), Graphics::CompiledShader{Stage::Geometry, &results.back(), 0});
+    }
     if (!programs.empty() && programResults.back() != nullptr && programResults.back()->barycentricEmulation.active && graphics.stages.path == Graphics::ShaderPath::Geometry) {
         require(localDevice->Target().mesh.has_value(), "a pixel shader on the mesh path reads barycentrics, and this device has neither VK_KHR_fragment_shader_barycentric nor mesh shaders (VK_EXT_mesh_shader), so they cannot be provided or emulated");
         require(!graphics.rectList && graphics.stages.mesh && programs.size() == 2 && programResults[0] != nullptr && programResults[1] != nullptr && stages.size() == 2, "a pixel shader that reads barycentrics needs exactly one mesh program before it to emulate them");
@@ -935,7 +954,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             results.push_back(ShaderRecompiler::BuildBarycentricGeometryShader(*programResults[0], *programResults[1], localDevice->Target(), geometryLimits));
             stages.insert(stages.begin() + 1, Graphics::CompiledShader{Stage::Geometry, &results.back(), 0});
         } else {
-            require((graphics.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST || graphics.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP) && !graphics.primitiveRestart, "a pixel shader that reads barycentrics without VK_KHR_fragment_shader_barycentric or geometry shaders needs a triangle list or strip without primitive restart");
+            require((graphics.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST && (!graphics.primitiveRestart || !localDevice->PrimitiveListRestart())) || (graphics.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP && (!graphics.primitiveRestart || !drawParameters.indexed)), "a pixel shader that reads barycentrics without VK_KHR_fragment_shader_barycentric or geometry shaders needs a triangle list, with primitive restart only on a device without VK_EXT_primitive_topology_list_restart, or a triangle strip, with primitive restart only in a non-indexed draw");
             auto patches = ShaderRecompiler::BuildBarycentricTessellationShaders(*programResults[0], *programResults[1], localDevice->Target(), localDevice->MaxFragmentInputComponents(), graphics.provokingVertexMode == VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT ? 2u : 0u);
             const auto first = results.size();
             results.push_back(std::move(patches.control));
@@ -1187,7 +1206,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
 
     std::vector<std::shared_ptr<DispatchVariant>> recipeStages;
-    if (registerKey && !drawParameters.indirect && !patchedStages && Graphics::DrawRecipes()) {
+    if (registerKey && !drawParameters.indirect && !patchedStages && !graphics.stages.tessellationGeometry && Graphics::DrawRecipes()) {
         recipeStages.reserve(programs.size());
         for (std::size_t i = 0; i < programs.size(); ++i) recipeStages.push_back(drawHit ? matched[i] : fresh[i]);
         if (std::all_of(recipeStages.begin(), recipeStages.end(), [](const std::shared_ptr<DispatchVariant>& variant) { return variant == nullptr; })) recipeStages.clear();
@@ -1205,6 +1224,15 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
     timing.Mark("recipe_and_rejection");
     const auto* ahead = drawHit && !patchedStages && userPatches.empty() && !drawParameters.indirect && entry != nullptr && entry->prepared != nullptr ? entry->prepared->For(matched, stages.size()) : nullptr;
+    if (static const bool nameVariants = std::getenv("APS5_PROFILE_GPU_DRAWS") != nullptr; nameVariants && stages.size() == programs.size()) {
+        static std::mutex namedMutex;
+        static std::set<std::uint64_t> named;
+        std::lock_guard namedLock(namedMutex);
+        for (std::size_t i = 0; i < stages.size(); ++i) {
+            if (stages[i].program == nullptr || !named.insert(stages[i].program->variantId).second) continue;
+            std::fprintf(stderr, "[drawvariant] 0x%llx stage %d code 0x%llx\n", static_cast<unsigned long long>(stages[i].program->variantId), static_cast<int>(stages[i].stage), static_cast<unsigned long long>(programs[i].binary.codeAddress));
+        }
+    }
     if (pipelined && (!drawParameters.indirect || pipelineIndirect) && deferredLabels().labels.empty()) {
         phaseTiming.Phase(DrawRowVectors);
         auto writes = drawWriteRanges(graphics, stages);
@@ -1227,7 +1255,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         auto prepareDevice = prepareDraw ? localDevice : nullptr;
         auto prepareDecode = prepareDraw ? decode : nullptr;
         auto reads = QueuedDrawReadRanges(drawParameters, stages);
-        auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), ahead, drawKey, trace = trace, commitQueue, commitPacket, epoch, programs = std::move(programs), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData), slot, program] {
+        auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), ahead, drawKey, shape = shapeKey, trace = trace, commitQueue, commitPacket, epoch, programs = std::move(programs), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData), slot, program] {
             DrawPipeline::FollowEpoch(epoch);
             GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
             struct OriginScope {
@@ -1240,7 +1268,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 // The pre-sync again, now that every earlier draw is recorded: still without the
                 // GPU mutex, so the other queues are not held while this commit waits for the GPU.
                 if (htilePresync && decode->state.depth.has_value()) presyncSerial = std::max(presyncSerial, localDevice->PresyncDrawDepth(decode->state));
-                commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey, prepared != nullptr ? prepared->draw.get() : nullptr, presyncSerial, ahead, trace);
+                commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey, prepared != nullptr ? prepared->draw.get() : nullptr, presyncSerial, ahead, trace, shape);
             } catch (const std::runtime_error& error) {
                 std::string where = "draw commit (programs";
                 for (const auto& program : programs) {
@@ -1289,14 +1317,14 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
     }
     std::shared_ptr<const DrawRecipe> built;
-    localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, nullptr, ahead, tracePtr);
+    localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, nullptr, ahead, tracePtr, shapeKey);
     phaseTiming.Phase(DrawRowGraphics);
     if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, std::move(built));
     timing.Mark("draw_and_resource_release");
     return drawn();
 }
 
-void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, Graphics::PreparedDraw* prepared, std::uint64_t presyncSerial, const Graphics::AheadDraw* ahead, VulkanDevice::DrawTraceContext trace) {
+void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, Graphics::PreparedDraw* prepared, std::uint64_t presyncSerial, const Graphics::AheadDraw* ahead, VulkanDevice::DrawTraceContext trace, std::uint64_t shape) {
     const auto* tracePtr = trace.token != 0 ? &trace : nullptr;
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
@@ -1323,7 +1351,7 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
         VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
     }
     std::shared_ptr<const DrawRecipe> built;
-    localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, prepared, ahead, tracePtr);
+    localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, prepared, ahead, tracePtr, shape);
     if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, std::move(built));
 }
 

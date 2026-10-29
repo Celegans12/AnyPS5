@@ -172,9 +172,26 @@ void glueArms() {
     Require(lines.size() == 1 && lines[0].rfind("[ab] phase B 5 begins at present 9 (t 28.000 s) arm 1: ", 0) == 0 && RuntimeSwitches::KeySalt() == saltB1 && RuntimeSwitches::Set(RuntimeSwitch::NoBdaStaging), "the arms did not cycle back to B1");
 }
 
+int refused() {
+    SetEnvironment("APS5_AB", "5:APS5_FULL_BARRIERS");
+    try {
+        AgcDriver::Graphics::AbAtPresent(1, 0.0);
+    } catch (const std::invalid_argument& error) {
+        if (std::string(error.what()).find("APS5_FULL_BARRIERS is read once at startup and cannot change while the game runs") != std::string::npos) {
+            std::printf("runtime switch refusal test passed\n");
+            return 0;
+        }
+        std::fprintf(stderr, "FAILED: unexpected refusal: %s\n", error.what());
+        return 1;
+    }
+    std::fprintf(stderr, "FAILED: APS5_AB naming a startup-only variable was not refused at the first present\n");
+    return 1;
+}
+
 }
 
 int main(int argc, char** argv) {
+    if (argc > 1 && std::string(argv[1]) == "refused") return refused();
     if (argc > 1 && std::string(argv[1]) == "--arms") {
         try {
             glueArms();

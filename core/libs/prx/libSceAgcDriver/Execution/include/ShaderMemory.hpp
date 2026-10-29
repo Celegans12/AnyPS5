@@ -93,6 +93,7 @@ public:
     };
     static SupplyCounts Supplies();
     [[nodiscard]] std::vector<std::shared_ptr<const ShaderRecompiler::SrtGuestWords>> SuppliedBlocks() const;
+    [[nodiscard]] std::size_t Bytes() const;
     struct VouchCounts {
         std::uint64_t calls, blocks, refused, words;
     };
@@ -112,6 +113,10 @@ private:
             return (bits[index / 64u] & block) == block;
         }
         void Set(std::size_t index) { bits[index / 64u] |= std::uint64_t{1} << (index % 64u); }
+        void Clear(std::size_t index) { bits[index / 64u] &= ~(std::uint64_t{1} << (index % 64u)); }
+        void ClearMask(const WordMask& other) {
+            for (std::size_t i = 0; i < bits.size(); ++i) bits[i] &= ~other.bits[i];
+        }
         void SetAll() { bits.fill(~std::uint64_t{0}); }
         void SetBlock(std::size_t index) { bits[index / 64u] |= ((std::uint64_t{1} << BlockWords) - 1u) << (index % 64u / BlockWords * BlockWords); }
         void Reset() { bits.fill(0u); }
@@ -129,6 +134,7 @@ private:
     struct Page {
         std::array<std::uint32_t, PageWords> words;
         WordMask valid;
+        WordMask raw;
         WordMask read;
         WordMask recent;
         bool wordwise = false;
@@ -150,6 +156,8 @@ private:
     static ShaderRecompiler::SrtWriteStamp stampWrites(void* context, std::uint64_t address, std::uint64_t bytes);
     static bool unchangedSince(void* context, std::uint64_t address, std::uint64_t bytes, const ShaderRecompiler::SrtWriteStamp& stamp);
     static bool supplyWords(void* context, const std::shared_ptr<const ShaderRecompiler::SrtGuestWords>& words);
+    static std::uint64_t descriptorScope(void* context, std::size_t bytes);
+    bool invalidateRawPages();
     Page& page(std::uint64_t base);
     [[nodiscard]] std::size_t pageAtOrAfter(std::uint64_t base) const;
     Page& addPage(std::size_t position, std::uint64_t base);
@@ -174,6 +182,9 @@ private:
     bool recordProbes = false;
     mutable std::vector<Probe> probes;
     PendingWriteQuery pendingSpan = nullptr;
+    std::size_t descriptorSpanBytes = 0;
+    std::uint64_t rawInvalidations = 0;
+    std::uint32_t forceSync = 0;
 };
 
 // The positions, among a dispatch-cache variant's stored words, of the pure flat-SRT leaves a

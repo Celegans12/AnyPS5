@@ -24,6 +24,7 @@
 #include <tuple>
 #include <unordered_set>
 #include <utility>
+#include <string>
 #include <vector>
 
 namespace AgcDriver::Graphics {
@@ -261,6 +262,7 @@ public:
         VkCommandBuffer commands = VK_NULL_HANDLE;
         bool continued = false;
         bool barrier = true;
+        PassBreak reason = PassBreak::Continued;
     };
     DrawPassStart StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access, std::source_location where = std::source_location::current());
     void LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(VkCommandBuffer)> afterPass = {});
@@ -783,9 +785,13 @@ public:
     // queries around each timed range; the totals per key are reported every 10 s. Begin returns the
     // range index to pass to End, or NoTiming when timing is off or the batch's queries are used up.
     static constexpr std::uint32_t NoTiming = 0xffffffffu;
+    static constexpr std::uint64_t DrawTimingFlag = std::uint64_t{1} << 63u;
+    static constexpr std::uint64_t DrawTimingKey(std::uint64_t variantId) { return variantId | DrawTimingFlag; }
+    static std::string TimingKeyLabel(std::uint64_t key);
     static bool GpuTimingEnabled();
     static bool BatchStampsEnabled();
     std::uint32_t BeginGpuTiming(std::uint64_t key);
+    std::uint32_t BeginInPassGpuTiming(std::uint64_t key);
     // `bytes`: what the range moved (a fill's, a copy's), summed per key on the [gputime] line.
     void EndGpuTiming(std::uint32_t index, std::uint64_t bytes = 0);
     // The key of the whole-batch range (first to last command; reported as "batch" on the [gputime]
@@ -1023,6 +1029,7 @@ private:
             std::uint32_t timing = NoTiming;
             PassBinding bound;
             std::function<void(VkCommandBuffer)> afterPass;
+            PassBreak closedBy = PassBreak::NewBatch;
         } renderPass;
         PassHazards passHazards;
         // A pass ended in this batch: Submit records the host-read barrier its draws left out.
@@ -1141,7 +1148,7 @@ private:
     // form, toward the host only); returns whether the batch's host-read barrier was included.
     bool closeStoreRun(bool atSubmit = false);
     // Ends the render pass a draw left open (vkCmdEndRenderPass, the pass's trailing barrier).
-    void endOpenRenderPass(bool barrier = true);
+    void endOpenRenderPass(PassBreak by, bool barrier = true);
     // Records the queued key stores as one run (`forWriter`: before a command writing, reading or
     // labelling over one, not at Submit).
     void recordKeyStores(bool forWriter);
