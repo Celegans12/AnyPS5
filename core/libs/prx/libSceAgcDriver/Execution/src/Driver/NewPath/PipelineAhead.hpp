@@ -48,6 +48,12 @@ public:
         unsigned workers = 2;
     };
     enum class Lookup : std::uint8_t { Ready, Pending, Unknown };
+    // urgent: queued ahead of earlier requests (a dispatch waiting for it, not a prewarm).
+    // forgetOnFailure: a failed creation leaves no entry, so a later request tries again.
+    struct Options {
+        bool urgent = false;
+        bool forgetOnFailure = false;
+    };
     struct Counts {
         std::uint64_t requested = 0;
         std::uint64_t created = 0;
@@ -64,10 +70,16 @@ public:
     PipelineAhead& operator=(const PipelineAhead&) = delete;
 
     Lookup Request(PipelineKey key, PipelineFactory factory);
+    Lookup Request(PipelineKey key, PipelineFactory factory, Options options);
+    // The state of a key without requesting it (nullopt: never requested, or forgotten).
+    [[nodiscard]] std::optional<Lookup> Find(PipelineKey key) const;
     [[nodiscard]] PipelineHandle Ready(PipelineKey key) const;
     PipelineHandle Acquire(PipelineKey key, PipelineFactory factory);
     std::size_t Prewarm(const std::function<PipelineFactory(PipelineKey)>& resolve);
     void WaitIdle();
+    // Drops the queued requests, waits for the running ones and forgets every entry (device teardown: the handles
+    // belong to the old device).
+    void Reset();
 
     [[nodiscard]] Counts Totals() const;
     [[nodiscard]] bool CreatedOnWorker(PipelineKey key) const;
@@ -87,7 +99,12 @@ private:
     mutable std::mutex mutex;
     std::condition_variable work;
     std::condition_variable finished;
-    std::deque<std::pair<PipelineKey, PipelineFactory>> queue;
+    struct Queued {
+        PipelineKey key;
+        PipelineFactory factory;
+        bool forgetOnFailure;
+    };
+    std::deque<Queued> queue;
     std::unordered_map<PipelineKey, Entry> entries;
     std::vector<std::thread> threads;
     std::set<std::thread::id> workerIds;

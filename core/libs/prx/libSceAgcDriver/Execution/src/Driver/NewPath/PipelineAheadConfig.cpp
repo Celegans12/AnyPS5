@@ -31,4 +31,12 @@ PipelineAhead& Pipelines() {
     return *pipelines;
 }
 
+TwinPipelines& TwinPipelineStore() {
+    static auto* twins = [] {
+        const auto manifest = DefaultManifestPath();
+        return new TwinPipelines(Pipelines(), manifest.empty() ? std::filesystem::path{} : manifest.parent_path() / "newpath-twins", ShaderRecompiler::ShaderDiskCache::SourceVersion());
+    }();
+    return *twins;
+}
+
 }
