@@ -23,7 +23,35 @@ std::uint64_t coveredBytes(std::span<const Range> ranges) {
 
 }
 
-DevicePageTable::DevicePageTable(ImportSource imports, VersionSource version) : imports(std::move(imports)), version(std::move(version)) {}
+DevicePageTable::DevicePageTable(ImportSource imports, VersionSource version, MirrorSource mirrors, VersionSource mirrorVersion) : imports(std::move(imports)), version(std::move(version)), mirrors(std::move(mirrors)), mirrorVersion(std::move(mirrorVersion)) {}
+
+std::uint64_t DevicePageTable::mirrorVersionOf(VkDevice device) const {
+    return mirrorVersion ? mirrorVersion(device) : 0u;
+}
+
+std::vector<Range> DevicePageTable::WithMirrors(std::vector<Range> imports, std::span<const Range> mirrors) {
+    if (mirrors.empty()) return imports;
+    std::vector<Range> sorted(mirrors.begin(), mirrors.end());
+    std::sort(sorted.begin(), sorted.end(), [](const Range& left, const Range& right) { return left.begin < right.begin; });
+    std::vector<Range> out = imports;
+    std::uint64_t claimed = 0;
+    for (const auto& mirror : sorted) {
+        // Mirrors overlapping each other: the first one keeps the bytes (never seen; registered
+        // ranges are disjoint).
+        auto cursor = std::max(mirror.begin, claimed);
+        auto at = std::upper_bound(imports.begin(), imports.end(), cursor, [](std::uint64_t value, const Range& range) { return value < range.end; });
+        while (cursor < mirror.end) {
+            const auto stop = at == imports.end() ? mirror.end : std::min(mirror.end, at->begin);
+            if (cursor < stop) appendClipped(out, mirror, cursor, stop);
+            if (at == imports.end() || at->begin >= mirror.end) break;
+            cursor = std::max(cursor, at->end);
+            ++at;
+        }
+        claimed = std::max(claimed, mirror.end);
+    }
+    std::sort(out.begin(), out.end(), [](const Range& left, const Range& right) { return left.begin < right.begin; });
+    return out;
+}
 
 std::vector<Range> DevicePageTable::Overlay(std::span<const Range> base, std::span<const Range> resident, std::uint64_t begin, std::uint64_t end) {
     std::vector<Range> out;
@@ -115,8 +143,9 @@ std::vector<Range> DevicePageTable::piecesLocked(std::uint64_t begin, std::uint6
 
 std::shared_ptr<const Graphics::BdaPageTable> DevicePageTable::Refresh(const Graphics::Context& context) {
     const auto now = version(context.device);
+    const auto mirrorNow = mirrorVersionOf(context.device);
     std::lock_guard lock(mutex);
-    if (built && now == builtVersion) {
+    if (built && now == builtVersion && mirrorNow == builtMirrorVersion) {
         ++counts.unchanged;
         return table;
     }
@@ -128,11 +157,27 @@ std::shared_ptr<const Graphics::BdaPageTable> DevicePageTable::Refresh(const Gra
     auto snapshot = imports(context);
     importRanges = std::move(snapshot.ranges);
     std::sort(importRanges.begin(), importRanges.end(), [](const Range& left, const Range& right) { return left.begin < right.begin; });
+    mirrorHolds.clear();
+    counts.mirrorRanges = 0;
+    counts.mirrorBytes = 0;
+    if (mirrors) {
+        auto mirrored = mirrors(context);
+        if (mirrored.device == context.device && !mirrored.ranges.empty()) {
+            const auto before = coveredBytes(importRanges);
+            const auto entries = importRanges.size();
+            importRanges = WithMirrors(std::move(importRanges), mirrored.ranges);
+            counts.mirrorRanges = importRanges.size() - entries;
+            counts.mirrorBytes = coveredBytes(importRanges) - before;
+            mirrorHolds = std::move(mirrored.holds);
+        }
+    }
     auto ranges = piecesLocked(0, ShaderRecompiler::BdaAbi::PageTableEnd);
     Graphics::ValidateBdaPageRanges(ranges);
     table = Graphics::BdaPageTable::Build(context, ranges);
     built = true;
     builtVersion = now;
+    builtMirrorVersion = mirrorNow;
+    counts.mirrorVersion = mirrorNow;
     ++counts.builds;
     counts.ranges = ranges.size();
     counts.coveredBytes = coveredBytes(ranges);
@@ -145,8 +190,9 @@ std::shared_ptr<const Graphics::BdaPageTable> DevicePageTable::Refresh(const Gra
 
 bool DevicePageTable::Stale(VkDevice device) const {
     const auto now = version(device);
+    const auto mirrorNow = mirrorVersionOf(device);
     std::lock_guard lock(mutex);
-    return !built || now != builtVersion;
+    return !built || now != builtVersion || mirrorNow != builtMirrorVersion;
 }
 
 std::shared_ptr<const Graphics::BdaPageTable> DevicePageTable::PatchPages(const Graphics::Context& context, std::span<const std::uint64_t> pages) {
@@ -174,6 +220,8 @@ void DevicePageTable::Release(VkDevice device) {
         dropped = std::move(table);
         tableDevice = VK_NULL_HANDLE;
         importRanges.clear();
+        mirrorHolds.clear();
+        builtMirrorVersion = 0;
         tableRanges.clear();
         ++generation;
         coverMemo = {};
@@ -246,7 +294,7 @@ DevicePageTable::Counts DevicePageTable::Totals() const {
 }
 
 DevicePageTable& DeviceTable() {
-    static auto* table = new DevicePageTable([](const Graphics::Context& context) { return Graphics::HostImportRanges(context); }, [](VkDevice device) { return Graphics::HostImportsVersion(device); });
+    static auto* table = new DevicePageTable([](const Graphics::Context& context) { return Graphics::HostImportRanges(context); }, [](VkDevice device) { return Graphics::HostImportsVersion(device); }, [](const Graphics::Context& context) { return Graphics::ReadOnlyImageMirrorRanges(context); }, [](VkDevice device) { return Graphics::ReadOnlyImageMirrorsVersion(device); });
     return *table;
 }
 

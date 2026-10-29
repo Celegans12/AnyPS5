@@ -2257,6 +2257,9 @@ struct ImageMirrors {
     std::uint64_t syncs = 0;
     std::uint64_t serials = 0;
     std::uint64_t version = 0;
+    // Bumped whenever a read-only, non-heap mirror enters or leaves `entries` (the device page
+    // table's mirror source, ReadOnlyImageMirrorsVersion).
+    std::uint64_t readOnlyVersion = 0;
     std::uint64_t pinnedSpace = 0;
     std::uint64_t pinnedVersion = 0;
     std::uint64_t sweeps = 0;
@@ -2481,6 +2484,12 @@ VkBuffer mirrorHandle(const ImageMirror& mirror) {
 
 VkDeviceAddress mirrorAddress(const ImageMirror& mirror) {
     return mirror.resident != nullptr ? mirror.resident->DeviceAddress() : mirror.buffer->DeviceAddress();
+}
+
+// A mirror the device page table may map: read-only, not a heap, not sparse, one buffer. Its bytes
+// are filled once and never change while its Range exists (see ImageMirror).
+bool readOnlyImageMirror(const ImageMirror& mirror) {
+    return !mirror.writable && !mirror.heap && !mirror.sparse && mirror.buffer != nullptr && mirror.resident == nullptr;
 }
 
 bool sameRange(const std::weak_ptr<const GuestAllocations::Range>& mirrored, const std::shared_ptr<const GuestAllocations::Range>& range) {
@@ -2984,6 +2993,7 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
             state.heapBytes = 0;
             state.device = context.device;
             ++state.version;
+            ++state.readOnlyVersion;
         }
         if (state.failed.contains(selected.address)) return nullptr;
         const auto found = state.entries.find(selected.address);
@@ -3078,7 +3088,10 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
         std::lock_guard lock(state.mutex);
         ++state.rebuilds;
         mirror->serial = (1ull << 63u) | ++state.serials;
-        if (const auto found = state.entries.find(selected.address); found != state.entries.end() && found->second->heap) unlistMirror(state, *found->second);
+        if (const auto found = state.entries.find(selected.address); found != state.entries.end()) {
+            if (found->second->heap) unlistMirror(state, *found->second);
+            if (readOnlyImageMirror(*found->second)) ++state.readOnlyVersion;
+        }
         mirror->listed = true;
         state.entries[selected.address] = mirror;
         ++state.version;
@@ -3123,7 +3136,11 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
     ++state.rebuilds;
     mirror->serial = (1ull << 63u) | ++state.serials;
     // A replaced mirror lives on in the regions of recorded work that bound it.
-    if (const auto found = state.entries.find(selected.address); found != state.entries.end() && found->second->heap) unlistMirror(state, *found->second);
+    if (const auto found = state.entries.find(selected.address); found != state.entries.end()) {
+        if (found->second->heap) unlistMirror(state, *found->second);
+        if (readOnlyImageMirror(*found->second)) ++state.readOnlyVersion;
+    }
+    if (readOnlyImageMirror(*mirror)) ++state.readOnlyVersion;
     mirror->listed = heap;
     state.entries[selected.address] = mirror;
     ++state.version;
@@ -3163,6 +3180,7 @@ void sweepMirrors() {
             continue;
         }
         if (it->second->heap) unlistMirror(state, *it->second);
+        if (readOnlyImageMirror(*it->second)) ++state.readOnlyVersion;
         it = state.entries.erase(it);
         ++state.version;
     }
@@ -3651,6 +3669,7 @@ void ClearImageMirrors(VkDevice device) {
         state.failed.clear();
         state.heapBytes = 0;
         state.device = VK_NULL_HANDLE;
+        ++state.readOnlyVersion;
     }
 }
 
@@ -7442,6 +7461,31 @@ std::uint64_t ImageMirrorSerial(const Context& context, std::uint64_t address, s
     // A replaced Range expires the mirror (findMirror), and a replacement mirror has a new serial.
     const auto mirror = findMirror(context, address, address + bytes);
     return mirror != nullptr && !mirror->writable ? mirror->serial : 0;
+}
+
+std::uint64_t ReadOnlyImageMirrorsVersion(VkDevice device) {
+    auto& state = Mirrors();
+    std::lock_guard lock(state.mutex);
+    if (state.device != device || !mirrorsEnabled()) return 0;
+    return state.readOnlyVersion + 1;
+}
+
+ImageMirrorTableSnapshot ReadOnlyImageMirrorRanges(const Context& context) {
+    ImageMirrorTableSnapshot snapshot;
+    if (!mirrorsEnabled()) return snapshot;
+    auto& state = Mirrors();
+    std::lock_guard lock(state.mutex);
+    if (state.device != context.device) return snapshot;
+    snapshot.device = state.device;
+    snapshot.version = state.readOnlyVersion + 1;
+    for (const auto& [base, mirror] : state.entries) {
+        // An expired Range is never served again (findMirror, acquireMirror): its replacement is a
+        // new mirror, which bumps the version.
+        if (mirror == nullptr || !readOnlyImageMirror(*mirror) || mirror->range.expired() || mirror->bytes == 0) continue;
+        snapshot.ranges.push_back({mirror->base, mirror->base + mirror->bytes, static_cast<std::uint64_t>(mirrorAddress(*mirror)), ShaderRecompiler::BdaAbi::Read, 0u});
+        snapshot.holds.push_back(mirror->buffer);
+    }
+    return snapshot;
 }
 
 std::uint64_t HostImportSerial(const Context& context, std::uint64_t address, std::size_t bytes, bool reconcile) {

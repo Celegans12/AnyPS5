@@ -22,6 +22,9 @@ public:
     using ImportSource = std::function<Graphics::HostImportSnapshot(const Graphics::Context&)>;
     using VersionSource = std::function<std::uint64_t(VkDevice)>;
     using ResidentPieces = std::function<std::vector<Range>(std::uint64_t begin, std::uint64_t end)>;
+    // The read-only image mirrors an address-based build binds in place (exe ranges no import can
+    // serve), mapped at the build's own device address; versioned apart from the imports.
+    using MirrorSource = std::function<Graphics::ImageMirrorTableSnapshot(const Graphics::Context&)>;
 
     struct Counts {
         std::uint64_t builds = 0;
@@ -30,6 +33,9 @@ public:
         std::uint64_t ranges = 0;
         std::uint64_t coveredBytes = 0;
         std::uint64_t importVersion = 0;
+        std::uint64_t mirrorVersion = 0;
+        std::uint64_t mirrorRanges = 0;
+        std::uint64_t mirrorBytes = 0;
         std::uint64_t released = 0;
         std::uint64_t outlived = 0;
         std::uint64_t records = 0;
@@ -38,7 +44,7 @@ public:
 
     enum class Cover : std::uint8_t { Covered, Missing, OtherAddress, Narrower };
 
-    DevicePageTable(ImportSource imports, VersionSource version);
+    DevicePageTable(ImportSource imports, VersionSource version, MirrorSource mirrors = {}, VersionSource mirrorVersion = {});
 
     std::shared_ptr<const Graphics::BdaPageTable> Refresh(const Graphics::Context& context);
     [[nodiscard]] bool Stale(VkDevice device) const;
@@ -57,13 +63,22 @@ public:
 
     [[nodiscard]] Cover Covers(const std::shared_ptr<const std::vector<Range>>& build);
     [[nodiscard]] static Cover Compare(std::span<const Range> table, std::span<const Range> build, const Range** failed = nullptr, std::uint64_t* failedAt = nullptr);
+    // The imports (sorted, disjoint) with the mirrors added where no import maps: a mirror's bytes
+    // that an import also maps are left to the import. Sorted and disjoint.
+    [[nodiscard]] static std::vector<Range> WithMirrors(std::vector<Range> imports, std::span<const Range> mirrors);
     [[nodiscard]] static std::vector<Range> Overlay(std::span<const Range> base, std::span<const Range> resident, std::uint64_t begin, std::uint64_t end);
 
 private:
     [[nodiscard]] std::vector<Range> piecesLocked(std::uint64_t begin, std::uint64_t end) const;
 
+    [[nodiscard]] std::uint64_t mirrorVersionOf(VkDevice device) const;
+
     ImportSource imports;
     VersionSource version;
+    MirrorSource mirrors;
+    VersionSource mirrorVersion;
+    std::vector<std::shared_ptr<const void>> mirrorHolds;
+    std::uint64_t builtMirrorVersion = 0;
     mutable std::mutex mutex;
     ResidentPieces resident;
     std::vector<Range> importRanges;

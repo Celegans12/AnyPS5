@@ -212,6 +212,19 @@ struct HostImportSnapshot {
 std::uint64_t HostImportsVersion(VkDevice device);
 HostImportSnapshot HostImportRanges(const Context& context);
 
+// The read-only image mirrors (exe ranges no import can serve) as page-table ranges: each maps its
+// guest range to the mirror buffer an address-based build binds for it (same device address), read
+// only. `holds` keeps those buffers alive while the snapshot's holder maps them. The version changes
+// whenever such a mirror is added, replaced or dropped (0 = no mirrors on this device).
+struct ImageMirrorTableSnapshot {
+    VkDevice device = VK_NULL_HANDLE;
+    std::uint64_t version = 0;
+    std::vector<ShaderRecompiler::BdaAbi::Range> ranges;
+    std::vector<std::shared_ptr<const void>> holds;
+};
+std::uint64_t ReadOnlyImageMirrorsVersion(VkDevice device);
+ImageMirrorTableSnapshot ReadOnlyImageMirrorRanges(const Context& context);
+
 // Identity of the read-only image mirror serving [address, address + bytes) (the counterpart of
 // HostImportSerial for main-image ranges, which no import serves): a serial unique for the life of
 // one mirror with its top bit set, 0 when no read-only mirror whose registered range still exists
