@@ -362,6 +362,11 @@ public:
     void RefuseOwnedDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage);
     static std::array<std::uint64_t, 2> OwnedSnapshotVerifyCounts();
     std::size_t OwnedSnapshotBytes() const { return ownedSnapshotBytes; }
+    // Whether the storage snapshot held for the range is stale only through the driver's stamps (GPU writes, its own
+    // in-order stores), with no CPU store collected since: the caller collected the range first. Then the draw binds the
+    // range in place (its reads are noted pending, so a CPU-side store over them waits or goes to the GPU in order) and
+    // the snapshot is left as it is, neither refreshed nor dropped.
+    bool DrawSnapshotGpuWrittenOnly(std::uint64_t address, std::size_t bytes) const;
     static constexpr std::size_t DrawUploadChunk = std::size_t{1} << 20u;
     struct UploadSlice {
         std::shared_ptr<Buffer> buffer;
@@ -371,6 +376,12 @@ public:
     UploadSlice DrawUpload(std::size_t bytes);
     static constexpr std::size_t IndexRangeEntries = 16384;
     static constexpr std::size_t KeptIndexRangeIndices = 4096;
+    // C68: the kept highest index of the range when it is stale only through the driver's stamps (GPU writes; the
+    // caller collected the range's CPU stores first); the entry stays as it is. Nothing when none is kept, the
+    // registry moved, it is current, or a CPU store stamped a changed block.
+    std::optional<std::optional<std::uint32_t>> GpuWrittenHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use) const;
+    // Diagnostic: the generation the kept highest index of the range was read at (0 when none is kept).
+    std::uint64_t KeptHighestIndexGeneration(std::uint64_t address, std::size_t bytes, SnapshotUse use) const;
     bool KnownHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::optional<std::uint32_t>& highest);
     void KeepHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint64_t generation, std::uint64_t registryGeneration, std::optional<std::uint32_t> highest);
     void OnComplete(std::function<void()> action);

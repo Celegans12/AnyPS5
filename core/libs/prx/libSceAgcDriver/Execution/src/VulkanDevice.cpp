@@ -5743,7 +5743,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     if (record.bindings != nullptr) {
         recorder.Keep(record.bindings);
         for (const auto& snapshot : record.bindings->snapshots) {
-            if (snapshot.buffer->Mapped()) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+            if (snapshot.buffer != nullptr && snapshot.buffer->Mapped()) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
         }
     }
     recordStep(PhaseRecordKeeps);

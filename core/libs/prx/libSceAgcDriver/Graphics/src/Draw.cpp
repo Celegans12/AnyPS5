@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/shaders/IndexClamp_spv.h"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileWindows.hpp"
@@ -43,6 +44,7 @@
 #include <map>
 #include <memory>
 #include <unordered_set>
+#include <deque>
 #include <mutex>
 #include <set>
 #include <unordered_map>
@@ -1473,6 +1475,89 @@ const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address
     return import;
 }
 
+// C63: the zero-fetch index clamp on the GPU (Graphics/shaders/IndexClamp.comp): a compute pass in the open batch
+// reads the indices where they lie (the in-place import, behind the GPU work that wrote them) and writes the clamped
+// copy, instead of waiting for those writes on the CPU and reading and clamping the buffer there (Yotei's title menu:
+// a 32 MiB index buffer the GPU rewrites every frame, ~5 ms a frame). Buffer addresses in push constants, no
+// descriptors. One pipeline per device, made on first use.
+class GpuIndexClamp {
+public:
+    static GpuIndexClamp* For(const Context& context) {
+        static std::mutex mutex;
+        static std::unordered_map<VkDevice, std::unique_ptr<GpuIndexClamp>> clamps;
+        std::lock_guard lock(mutex);
+        auto& clamp = clamps[context.device];
+        if (clamp == nullptr) {
+            try {
+                clamp.reset(new GpuIndexClamp(context));
+            } catch (const std::exception& error) {
+                std::fprintf(stderr, "[gpu] index clamp pipeline unavailable, clamping on the CPU: %s\n", error.what());
+                clamps.erase(context.device);
+                return nullptr;
+            }
+        }
+        return clamp.get();
+    }
+
+    void Record(const Context& context, VkCommandBuffer commands, VkDeviceAddress source, VkDeviceAddress target, std::uint32_t words, std::uint32_t limit, std::uint32_t mode) const {
+        const VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT};
+        context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &before, 0, nullptr, 0, nullptr);
+        context.Function<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+        struct Push {
+            VkDeviceAddress source;
+            VkDeviceAddress target;
+            std::uint32_t words;
+            std::uint32_t limit;
+            std::uint32_t mode;
+        } push{source, target, words, limit, mode};
+        context.Function<PFN_vkCmdPushConstants>("vkCmdPushConstants")(commands, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+        context.Function<PFN_vkCmdDispatch>("vkCmdDispatch")(commands, (words + 255u) / 256u, 1, 1);
+        const VkMemoryBarrier after{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_SHADER_READ_BIT};
+        context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &after, 0, nullptr, 0, nullptr);
+    }
+
+private:
+    explicit GpuIndexClamp(const Context& context) {
+        const VkPushConstantRange range{VK_SHADER_STAGE_COMPUTE_BIT, 0, 28};
+        VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        layoutInfo.pushConstantRangeCount = 1;
+        layoutInfo.pPushConstantRanges = &range;
+        Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &layoutInfo, nullptr, &layout), "vkCreatePipelineLayout index clamp");
+        const auto module = CreateShaderModule(context, INDEX_CLAMP_SPV, sizeof(INDEX_CLAMP_SPV), "vkCreateShaderModule index clamp");
+        VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        pipelineInfo.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        pipelineInfo.stage.module = module;
+        pipelineInfo.stage.pName = "main";
+        pipelineInfo.layout = layout;
+        VkResult result = VK_SUCCESS;
+        {
+            auto pipelineCacheLock = context.LockPipelineCacheForUse();
+            result = context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &pipeline);
+        }
+        context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
+        Check(result, "vkCreateComputePipelines index clamp");
+    }
+
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+};
+
+namespace {
+// Diagnostic (APS5_PROFILE_DRAW): in-place index scans C68 left out; [index-estimate] every 10 s.
+void countIndexEstimate() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile) return;
+    static std::atomic<std::uint64_t> estimates{0};
+    static std::atomic<std::int64_t> report{0};
+    estimates.fetch_add(1, std::memory_order_relaxed);
+    const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    auto last = report.load(std::memory_order_relaxed);
+    if (last == 0) report.compare_exchange_strong(last, now);
+    else if (now - last >= 10'000'000'000LL && report.compare_exchange_strong(last, now)) AgcDriver::ProfilePrint_nid_no_patch("[index-estimate] (10 s) %llu in-place index scans left to the clamp\n", static_cast<unsigned long long>(estimates.exchange(0)));
+}
+}
+
 InPlaceIndices InPlaceIndexRange(Recorder& recorder, std::uint64_t address, std::size_t bytes, std::uint32_t indexSize, bool skipRestart) {
     const std::span<const std::byte> range(reinterpret_cast<const std::byte*>(address), bytes);
     InPlaceIndices indices;
@@ -1483,11 +1568,57 @@ InPlaceIndices InPlaceIndexRange(Recorder& recorder, std::uint64_t address, std:
     const auto use = indexSize == 2 ? (skipRestart ? Recorder::SnapshotUse::Index16Restart : Recorder::SnapshotUse::Index16) : (skipRestart ? Recorder::SnapshotUse::Index32Restart : Recorder::SnapshotUse::Index32);
     const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     const auto generation = GuestMemory::CollectWrites(address, bytes);
+    static const bool profileScans = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    const auto keptGeneration = profileScans ? recorder.KeptHighestIndexGeneration(address, bytes, use) : 0;
     if (generation != 0 && recorder.KnownHighestIndex(address, bytes, use, indices.highest)) {
         indices.reused = true;
         return indices;
     }
+    const auto scanStart = profileScans ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     indices.highest = HighestDrawIndex(range, indexSize, skipRestart);
+    if (profileScans) {
+        // Diagnostic (APS5_PROFILE_DRAW): in-place index scans that missed the kept highest index, by range: misses
+        // with no kept entry, stale ones by who stamped the changed blocks (a CPU store or only the driver's GPU
+        // writes), whether the highest index came out the same, scan time; [index-scan] every 10 s, top 6 by time.
+        struct Scans { std::uint64_t none = 0, cpu = 0, driver = 0, sameHighest = 0; double ms = 0; std::optional<std::uint32_t> last; bool seen = false; };
+        static std::mutex scanMutex;
+        static std::map<std::pair<std::uint64_t, std::size_t>, Scans> scans;
+        static auto scanReport = std::chrono::steady_clock::now();
+        bool cpuStamped = false;
+        if (keptGeneration != 0) {
+            const auto count = static_cast<std::size_t>((address + bytes - 1) / GuestMemory::HashBlockBytes - address / GuestMemory::HashBlockBytes + 1);
+            std::vector<std::uint64_t> generations(count, keptGeneration);
+            std::vector<std::uint8_t> changed(count, 1), cpu(count, 1);
+            GuestMemory::ChangedBlocks(address, bytes, generations, changed, cpu);
+            for (std::size_t k = 0; k < count; ++k) cpuStamped = cpuStamped || (changed[k] != 0 && cpu[k] != 0);
+        }
+        std::lock_guard scanLock(scanMutex);
+        auto& entry = scans[{address, bytes}];
+        if (keptGeneration == 0) ++entry.none;
+        else if (cpuStamped) ++entry.cpu;
+        else ++entry.driver;
+        if (entry.seen && entry.last == indices.highest) ++entry.sameHighest;
+        entry.last = indices.highest;
+        entry.seen = true;
+        entry.ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - scanStart).count();
+        if (std::chrono::steady_clock::now() - scanReport >= std::chrono::seconds(10)) {
+            scanReport = std::chrono::steady_clock::now();
+            std::vector<std::pair<double, std::pair<std::uint64_t, std::size_t>>> order;
+            for (const auto& [key, value] : scans) order.emplace_back(value.ms, key);
+            std::sort(order.begin(), order.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+            std::string line;
+            double total = 0;
+            for (const auto& [ms, key] : order) total += ms;
+            for (std::size_t i = 0; i < order.size() && i < 6; ++i) {
+                const auto& value = scans[order[i].second];
+                char item[200];
+                std::snprintf(item, sizeof(item), "\n  0x%llx+%zu: no entry %llu, stale cpu %llu, stale driver-only %llu, same highest %llu, %.0f ms", static_cast<unsigned long long>(order[i].second.first), order[i].second.second, static_cast<unsigned long long>(value.none), static_cast<unsigned long long>(value.cpu), static_cast<unsigned long long>(value.driver), static_cast<unsigned long long>(value.sameHighest), value.ms);
+                line += item;
+            }
+            AgcDriver::ProfilePrint_nid_no_patch("[index-scan] (10 s) %zu ranges, %.0f ms:%s\n", scans.size(), total, line.c_str());
+            for (auto& [key, value] : scans) value = Scans{.last = value.last, .seen = value.seen};
+        }
+    }
     recorder.KeepHighestIndex(address, bytes, use, generation, registryGeneration, indices.highest);
     return indices;
 }
@@ -1823,8 +1954,27 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         if (import == nullptr) copy = CopyDrawInput(context, context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, use);
         else GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), static_cast<std::size_t>(indexBytes), draw.indexSize);
         std::optional<std::uint32_t> highest;
+        constexpr std::uint32_t ZeroFetchSlack = 0x10000u;
+        bool estimated = false;
+        if (import != nullptr && !RuntimeSwitches::Set(RuntimeSwitch::NoGpuWrittenIndexEstimate) && context.recorder != nullptr && !state.stages.mesh) {
+            // C68: an in-place index buffer only GPU work rewrote since its last scan, whose last scan already went past
+            // the zero-fetch limit, is not scanned again: the clamp below (min(index, limit), right for any contents)
+            // serves it and sets highest = limit. Title menu: a 32 MiB GPU-written index buffer was scanned on the
+            // CPU once per frame (~1.4 ms, best434). APS5_NO_GPU_WRITTEN_INDEX_ESTIMATE=1 (runtime switch) scans.
+            if (const auto zeroFrom = ZeroFetchVertex(shaders.front().program->vertexAttributes)) {
+                const auto limit = *zeroFrom > draw.firstVertex ? *zeroFrom - draw.firstVertex : 0u;
+                GuestMemory::CollectWrites(draw.indexAddress, static_cast<std::size_t>(indexBytes));
+                if (const auto kept = context.recorder->GpuWrittenHighestIndex(draw.indexAddress, static_cast<std::size_t>(indexBytes), use); kept && *kept && **kept >= limit && **kept - limit >= ZeroFetchSlack) {
+                    highest = *kept;
+                    estimated = true;
+                    countIndexEstimate();
+                }
+            }
+        }
         if (import != nullptr) {
-            highest = InPlaceIndexRange(*context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, skipRestart).highest;
+            if (!estimated) {
+                highest = InPlaceIndexRange(*context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, skipRestart).highest;
+            }
         } else if (!copy.reused) {
             highest = HighestDrawIndex(copy.buffer->Bytes().first(static_cast<std::size_t>(indexBytes)), draw.indexSize, skipRestart);
             KeepDrawInput(context.recorder, draw.indexAddress, copy, use, skipRestart ? (highest ? *highest + 1u : 0u) : highest.value_or(0u));
@@ -1837,18 +1987,74 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
             inputs.nothing = true;
             return inputs;
         }
-        constexpr std::uint32_t ZeroFetchSlack = 0x10000u;
         if (const auto zeroFrom = state.stages.mesh ? std::nullopt : ZeroFetchVertex(shaders.front().program->vertexAttributes)) {
             const auto limit = *zeroFrom > draw.firstVertex ? *zeroFrom - draw.firstVertex : 0u;
             if (*highest >= limit && *highest - limit >= ZeroFetchSlack) {
-                GuestMemory::FlushGpuWrites(draw.indexAddress, static_cast<std::size_t>(indexBytes));
-                auto clamped = std::make_shared<Buffer>(context, static_cast<std::size_t>(indexBytes), VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
-                const auto bytes = clamped->Bytes().first(static_cast<std::size_t>(indexBytes));
-                GuestMemory::Read(draw.indexAddress, bytes, draw.indexSize);
-                highest = ClampDrawIndices(bytes, draw.indexSize, skipRestart, limit);
+                // The clamped copy of an index buffer is kept and reused while its guest memory is unchanged since it
+                // was read (CPU and GPU writes stamp generations; recorded GPU writes not landed yet refuse the reuse).
+                // Title menu: ~4 draws per frame clamp a 32 MiB index buffer (~5 ms each); +11.9 % menu presents
+                // (best298). APS5_NO_INDEX_CLAMP_MEMO=1 (runtime switch) clamps every time.
+                struct ClampMemo {
+                    std::uint64_t address = 0, bytes = 0, generation = 0;
+                    std::uint32_t indexSize = 0, limit = 0;
+                    bool skipRestart = false;
+                    std::shared_ptr<Buffer> buffer;
+                    std::optional<std::uint32_t> highest;
+                };
+                static std::mutex memoMutex;
+                static std::deque<ClampMemo> memos;
+                const bool memoize = !RuntimeSwitches::Set(RuntimeSwitch::NoIndexClampMemo);
+                std::shared_ptr<Buffer> reused;
+                if (memoize && !Recorder::SnapshotWriteOverlaps(draw.indexAddress, static_cast<std::size_t>(indexBytes))) {
+                    GuestMemory::CollectWrites(draw.indexAddress, static_cast<std::size_t>(indexBytes));
+                    std::lock_guard memoLock(memoMutex);
+                    for (const auto& memo : memos) {
+                        if (memo.address != draw.indexAddress || memo.bytes != indexBytes || memo.indexSize != draw.indexSize || memo.limit != limit || memo.skipRestart != skipRestart) continue;
+                        if (GuestMemory::UnchangedSince(draw.indexAddress, static_cast<std::size_t>(indexBytes), memo.generation)) {
+                            reused = memo.buffer;
+                            highest = memo.highest;
+                        }
+                        break;
+                    }
+                }
+                // C63: clamp on the GPU when the indices can be read in place (4-byte aligned whole words, one dispatch
+                // dimension). `highest` is then `limit`: this path runs only when the indices go past it. The copy is not
+                // memoized (the GPU writes the buffer again each frame). APS5_NO_GPU_INDEX_CLAMP=1 (runtime switch) clamps
+                // on the CPU.
+                const auto words = indexBytes / 4u;
+                if (reused == nullptr && !RuntimeSwitches::Set(RuntimeSwitch::NoGpuIndexClamp) && context.recorder != nullptr && indexBytes % 4u == 0 && words != 0 && (words + 255u) / 256u <= 65535u) {
+                    bool behind = false;
+                    const auto* source = InPlaceDrawInput(context, draw.indexAddress, static_cast<std::size_t>(indexBytes), 4, &behind);
+                    const auto sourceAddress = source != nullptr ? source->address + HostImportOffset(*source, draw.indexAddress) : 0;
+                    auto* clamp = source != nullptr && source->address != 0 && sourceAddress % 4u == 0 ? GpuIndexClamp::For(context) : nullptr;
+                    if (clamp != nullptr) {
+                        auto clamped = std::make_shared<Buffer>(context, static_cast<std::size_t>(indexBytes), VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                        const std::uint32_t mode = (draw.indexSize == 2 ? 1u : 0u) | (skipRestart ? 2u : 0u);
+                        clamp->Record(context, context.recorder->Commands(), sourceAddress, clamped->DeviceAddress(), static_cast<std::uint32_t>(words), limit, mode);
+                        reused = std::move(clamped);
+                        highest = limit;
+                        static std::atomic<std::uint64_t> gpuClamps{0};
+                        gpuClamps.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+                if (reused == nullptr) {
+                    GuestMemory::FlushGpuWrites(draw.indexAddress, static_cast<std::size_t>(indexBytes));
+                    const auto generation = memoize ? GuestMemory::CollectWrites(draw.indexAddress, static_cast<std::size_t>(indexBytes)) : 0;
+                    auto clamped = std::make_shared<Buffer>(context, static_cast<std::size_t>(indexBytes), VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+                    const auto bytes = clamped->Bytes().first(static_cast<std::size_t>(indexBytes));
+                    GuestMemory::Read(draw.indexAddress, bytes, draw.indexSize);
+                    highest = ClampDrawIndices(bytes, draw.indexSize, skipRestart, limit);
+                    reused = std::move(clamped);
+                    if (memoize && generation != 0) {
+                        std::lock_guard memoLock(memoMutex);
+                        std::erase_if(memos, [&](const ClampMemo& memo) { return memo.address == draw.indexAddress && memo.bytes == indexBytes && memo.indexSize == draw.indexSize && memo.limit == limit && memo.skipRestart == skipRestart; });
+                        memos.push_front({draw.indexAddress, indexBytes, generation, draw.indexSize, limit, skipRestart, reused, highest});
+                        if (memos.size() > 16) memos.pop_back();
+                    }
+                }
                 import = nullptr;
                 copy = DrawInputCopy{};
-                copy.buffer = std::move(clamped);
+                copy.buffer = std::move(reused);
                 if (!highest) {
                     inputs.nothing = true;
                     return inputs;
@@ -2544,6 +2750,7 @@ void captureInputs(const Context& context, Recorder& recorder, VkCommandBuffer c
     };
     if (bindings != nullptr) {
         for (const auto& snapshot : bindings->snapshots) {
+            if (snapshot.buffer == nullptr) continue;
             const auto bytes = snapshot.Bytes();
             addSample(snapshot.address, bytes.size(), snapshot.buffer->Handle(), snapshot.offset, bytes.data());
         }
@@ -2669,6 +2876,12 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const bool unknownMemory = addressBased || resources.UsesAddressTable() || resources.HasCopiedWrites();
     static_cast<void>(StorageTexture::StoreDrawnLinearTouching("draw access", [&](std::uint64_t begin, std::uint64_t end) { return std::any_of(passReads.begin(), passReads.end(), [&](const auto& read) { return read.first < end && begin < read.second; }) || resources.WritesOverlap(begin, static_cast<std::size_t>(end - begin)); }, unknownMemory));
     const auto drawBindings = resources.PrepareDrawBindings(*recorder, record.moved);
+    // C67: moved ranges the draw reads in place need the barrier behind earlier GPU writes as the base descriptors' do.
+    if (drawBindings != nullptr) {
+        for (const auto& snapshot : drawBindings->snapshots) {
+            if (snapshot.buffer == nullptr) passReads.emplace_back(snapshot.address, snapshot.address + snapshot.bytes);
+        }
+    }
     static const bool addressReadPasses = std::getenv("APS5_NO_ADDRESS_READ_PASSES") == nullptr;
     const bool readOnlyBda = addressReadPasses && resources.BdaReadOnly();
     outcome.addressDraw = addressBased;

@@ -1,0 +1,37 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+
+// Clamps a draw's indices to the last vertex the fetch reads (prepareDrawInputs' zero-fetch clamp) on the GPU:
+// every index above `limit` becomes `limit`; a primitive-restart index stays as it is when restart is on. One
+// invocation per 32-bit word: two 16-bit indices, or one 32-bit index.
+layout(local_size_x = 256) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer SourceWords { uint words[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer TargetWords { uint words[]; };
+
+layout(push_constant) uniform Push {
+    SourceWords source;
+    TargetWords target;
+    uint words;
+    uint limit;
+    uint mode;
+} push;
+
+uint clampIndex(uint index, uint restart) {
+    if ((push.mode & 2u) != 0u && index == restart) return index;
+    return min(index, push.limit);
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= push.words) return;
+    uint value = push.source.words[i];
+    if ((push.mode & 1u) != 0u) {
+        uint low = clampIndex(value & 0xffffu, 0xffffu);
+        uint high = clampIndex(value >> 16u, 0xffffu);
+        value = (low & 0xffffu) | ((high & 0xffffu) << 16u);
+    } else {
+        value = clampIndex(value, 0xffffffffu);
+    }
+    push.target.words[i] = value;
+}

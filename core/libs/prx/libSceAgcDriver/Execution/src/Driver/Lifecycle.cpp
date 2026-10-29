@@ -35,13 +35,68 @@
 #endif
 #include <windows.h>
 #else
+#include <dlfcn.h>
+#include <execinfo.h>
 #include <pthread.h>
+#include <signal.h>
 #include <sys/mman.h>
+#include <ucontext.h>
 #endif
 
 namespace AgcDriver::DriverDetail {
 
 namespace {
+
+#if defined(__linux__)
+// A SIGSEGV or SIGBUS that no handler takes ends the process, often without a kept core: report the faulting
+// address, the instruction and a backtrace first. Earlier handlers (write watch, the guest's exception handlers)
+// run first and keep their behaviour; this only speaks when the fault would be fatal anyway.
+struct sigaction previousSegv{}, previousBus{};
+
+void describeAddress(std::uintptr_t address) {
+    Dl_info where{};
+    if (address == 0 || dladdr(reinterpret_cast<void*>(address), &where) == 0 || where.dli_fname == nullptr) {
+        std::fprintf(stderr, "0x%llx", static_cast<unsigned long long>(address));
+        return;
+    }
+    const auto base = reinterpret_cast<std::uintptr_t>(where.dli_fbase);
+    std::fprintf(stderr, "0x%llx %s+0x%llx %s", static_cast<unsigned long long>(address), where.dli_fname, static_cast<unsigned long long>(address - base), where.dli_sname != nullptr ? where.dli_sname : "");
+}
+
+void fatalFault(int signal, siginfo_t* info, void* context) {
+    const auto& previous = signal == SIGBUS ? previousBus : previousSegv;
+    if ((previous.sa_flags & SA_SIGINFO) != 0 && previous.sa_sigaction != nullptr) {
+        previous.sa_sigaction(signal, info, context);
+        return;
+    }
+    if (previous.sa_handler != SIG_DFL && previous.sa_handler != SIG_IGN && previous.sa_handler != nullptr) {
+        previous.sa_handler(signal);
+        return;
+    }
+    const auto* frame = static_cast<const ucontext_t*>(context);
+    std::fprintf(stderr, "[fault] signal %d code %d at address 0x%llx, thread %ld, instruction ", signal, info->si_code, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(info->si_addr)), static_cast<long>(gettid()));
+    describeAddress(frame != nullptr ? static_cast<std::uintptr_t>(frame->uc_mcontext.gregs[REG_RIP]) : 0);
+    std::fprintf(stderr, "\n");
+    void* frames[48];
+    const int count = backtrace(frames, 48);
+    for (int index = 0; index < count; ++index) {
+        std::fprintf(stderr, "[fault]   #%d ", index);
+        describeAddress(reinterpret_cast<std::uintptr_t>(frames[index]));
+        std::fprintf(stderr, "\n");
+    }
+    std::fflush(stderr);
+    ::signal(signal, SIG_DFL);
+}
+
+void installFatalFaultReport() {
+    struct sigaction action{};
+    action.sa_sigaction = &fatalFault;
+    action.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigemptyset(&action.sa_mask);
+    sigaction(SIGSEGV, &action, &previousSegv);
+    sigaction(SIGBUS, &action, &previousBus);
+}
+#endif
 
 constexpr std::uintptr_t InlineImportStackBytes = 256 * 1024;
 
@@ -200,6 +255,10 @@ void Driver::stop() {
 
 Driver::Driver() {
     InstallAsyncLog_nid_no_patch();
+#if defined(__linux__)
+    static const bool faultReport = (installFatalFaultReport(), true);
+    static_cast<void>(faultReport);
+#endif
     static const bool driverMemory = (MapDriverMemory(), true);
     static_cast<void>(driverMemory);
     LibcSetExitDrain_nid_no_patch([] {

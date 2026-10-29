@@ -142,6 +142,32 @@ add_custom_command(
         VERBATIM
 )
 
+set(agcIndexClampShaderSource ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/IndexClamp.comp)
+set(agcIndexClampShaderSpv ${agcTextureDetileGeneratedDir}/IndexClamp.spv)
+set(agcIndexClampShaderHeader ${agcTextureDetileGeneratedDir}/IndexClamp_spv.h)
+add_custom_command(
+        OUTPUT "${agcIndexClampShaderHeader}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${agcTextureDetileGeneratedDir}"
+        COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -o "${agcIndexClampShaderSpv}" "${agcIndexClampShaderSource}"
+        COMMAND ${CMAKE_COMMAND} -DINPUT=${agcIndexClampShaderSpv} -DOUTPUT=${agcIndexClampShaderHeader}
+        -DSYMBOL=INDEX_CLAMP_SPV -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
+        DEPENDS "${agcIndexClampShaderSource}" glslang-standalone
+        VERBATIM
+)
+
+set(agcExpandSingleShaderSource ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/ExpandSingle.comp)
+set(agcExpandSingleShaderSpv ${agcTextureDetileGeneratedDir}/ExpandSingle.spv)
+set(agcExpandSingleShaderHeader ${agcTextureDetileGeneratedDir}/ExpandSingle_spv.h)
+add_custom_command(
+        OUTPUT "${agcExpandSingleShaderHeader}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${agcTextureDetileGeneratedDir}"
+        COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -o "${agcExpandSingleShaderSpv}" "${agcExpandSingleShaderSource}"
+        COMMAND ${CMAKE_COMMAND} -DINPUT=${agcExpandSingleShaderSpv} -DOUTPUT=${agcExpandSingleShaderHeader}
+        -DSYMBOL=EXPAND_SINGLE_SPV -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
+        DEPENDS "${agcExpandSingleShaderSource}" glslang-standalone
+        VERBATIM
+)
+
 set(agcTextureRepackShaderSource ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/TextureRepack.comp)
 set(agcTextureRepackShaderSpv ${agcTextureDetileGeneratedDir}/TextureRepack.spv)
 set(agcTextureRepackShaderHeader ${agcTextureDetileGeneratedDir}/TextureRepack_spv.h)
@@ -419,6 +445,8 @@ set(agcDriverSources
         ${agcReadbackHeaders}
         ${agcMultisampleUploadHeader}
         ${agcCmaskClearShaderHeader}
+        ${agcIndexClampShaderHeader}
+        ${agcExpandSingleShaderHeader}
         ${agcMeshArgumentsShaderHeader}
         ${agcStagingDiffShaderHeader}
         ${agcFmaProbeShaderHeader}

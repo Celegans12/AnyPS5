@@ -269,6 +269,9 @@ public:
             std::shared_ptr<Buffer> buffer;
             VkDeviceSize offset = 0;
             std::size_t bytes = 0;
+            // C67: a moved range read in place: the host import's buffer (`buffer` is null, `offset` is inside the import).
+            VkBuffer inPlace = VK_NULL_HANDLE;
+            VkBuffer Handle() const { return buffer != nullptr ? buffer->Handle() : inPlace; }
             std::span<std::byte> Bytes() const { return buffer->Bytes().subspan(static_cast<std::size_t>(offset), bytes); }
         };
         DescriptorCache* cache = nullptr;

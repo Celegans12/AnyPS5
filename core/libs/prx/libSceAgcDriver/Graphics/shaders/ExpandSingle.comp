@@ -1,0 +1,24 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+
+// Expands a surface whose DCC keys are all "single" (0x10) on the GPU, as ExpandSingleBlocks does on the CPU: every
+// 256-byte key block of the tiled bytes takes the value of its first element. One invocation per 32-bit word; the
+// element is a whole number of words (elementWords), so word w of a block reads word w % elementWords of the block.
+layout(local_size_x = 256) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer SourceWords { uint words[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer TargetWords { uint words[]; };
+
+layout(push_constant) uniform Push {
+    SourceWords source;
+    TargetWords target;
+    uint words;
+    uint elementWords;
+} push;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * 65535u * 256u;
+    if (i >= push.words) return;
+    uint block = i & ~63u;
+    push.target.words[i] = push.source.words[block + (i - block) % push.elementWords];
+}
