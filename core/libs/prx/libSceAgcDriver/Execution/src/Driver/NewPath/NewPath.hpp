@@ -6,9 +6,16 @@
 #include <cstdint>
 #include <memory>
 
+#include <vector>
+
 namespace ShaderRecompiler {
 struct RecompileResult;
 }
+
+namespace ShaderRecompiler::BdaAbi {
+struct Range;
+}
+
 
 namespace AgcDriver {
 class VulkanDevice;
@@ -36,6 +43,12 @@ struct EmitCandidate {
     bool tableDeferred = false;
     bool addressBased = false;
     Route routed = Route::Fallback;
+    // S2-share C1: the twin reads the buffer V#s through the page table (RuntimeBufferTwin), or (a twin that still
+    // binds guest buffers) any twin of a C1 program; F4 then covers the build's guest-buffer ranges, taken after
+    // the build (NoteBufferRanges; null when the build could not give them).
+    bool c1Twin = false;
+    bool runtimeBuffers = false;
+    std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>> bufferRanges;
     mutable struct {
         bool active = false;
         bool cached = false;

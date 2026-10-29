@@ -24,6 +24,12 @@ const char* FallbackReasonName(FallbackReason reason) {
     case FallbackReason::Suspended: return "suspended";
     case FallbackReason::NoResolvedModule: return "no-resolved-module";
     case FallbackReason::NotRecorded: return "not-recorded";
+    case FallbackReason::C1NoTwin: return "c1-no-twin";
+    case FallbackReason::C1Switch: return "c1-switch";
+    case FallbackReason::C1RangesUnavailable: return "c1-ranges-unavailable";
+    case FallbackReason::C1WrittenElsewhere: return "c1-written-elsewhere";
+    case FallbackReason::C1NotCovered: return "c1-not-covered";
+    case FallbackReason::C1Layout: return "c1-layout";
     }
     return "unknown";
 }
@@ -46,9 +52,10 @@ Decision Router::Decide(const CommandFacts& facts) const {
     if (facts.suspended) return {Route::Fallback, FallbackReason::Suspended};
     if (facts.kindSwitchOff) return {Route::Fallback, FallbackReason::KindSwitch};
     if (!emitDispatches || facts.kind != CommandKind::Dispatch) return {Route::Fallback, FallbackReason::KindNotEmitted};
-    if (!facts.resolvedProgram) return {Route::Fallback, FallbackReason::NoResolvedModule};
+    if (!facts.resolvedProgram) return {Route::Fallback, !facts.c1 ? FallbackReason::NoResolvedModule : facts.c1Switch ? FallbackReason::C1Switch : FallbackReason::C1NoTwin};
     if (!facts.pipelineReady) return {Route::Fallback, FallbackReason::NoPipeline};
-    if (!facts.tableCovers) return {Route::Fallback, FallbackReason::RangeNotCovered};
+    if (!facts.tableCovers) return {Route::Fallback, facts.coverReason};
+    if (!facts.layoutFits) return {Route::Fallback, FallbackReason::C1Layout};
     if (!facts.pushFits && !facts.overflowPlaced) return {Route::Fallback, FallbackReason::PushOverflow};
     if (facts.clothGuard) return {Route::Fallback, FallbackReason::ClothGuard};
     if (!facts.staticChains) return {Route::Fallback, FallbackReason::NonStaticChain};

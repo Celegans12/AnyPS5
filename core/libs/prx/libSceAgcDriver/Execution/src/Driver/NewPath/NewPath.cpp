@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/NewPath.hpp"
+#include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/C1Buffers.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileWindows.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
@@ -51,7 +52,7 @@ StepClock& ThreadSteps() {
 
 struct State {
     Router router{EmitDispatches()};
-    std::array<DispatchCost, 4> costs;
+    std::array<DispatchCost, 6> costs;
     std::atomic<std::uint64_t> completions{0}, completionNs{0};
     std::mutex reporting;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
@@ -97,7 +98,8 @@ void print(State& state, const char* window) {
     AgcDriver::ProfilePrint_nid_no_patch("%s; page table builds %llu, patches %llu, ranges %llu, covered %.1f MiB, image mirrors %llu (%.1f MiB); emit %s: resolved twins built %llu, not address-based %llu, failed %llu, mismatched %llu, reused %llu; table compares covered %llu, missing %llu, other address %llu, narrower %llu\n", line.c_str(), static_cast<unsigned long long>(table.builds), static_cast<unsigned long long>(table.patches), static_cast<unsigned long long>(table.ranges), static_cast<double>(table.coveredBytes) / (1024.0 * 1024.0), static_cast<unsigned long long>(table.mirrorRanges), static_cast<double>(table.mirrorBytes) / (1024.0 * 1024.0), EmitDispatches() ? "on" : "off", static_cast<unsigned long long>(twins[0]), static_cast<unsigned long long>(twins[1]), static_cast<unsigned long long>(twins[2]), static_cast<unsigned long long>(twins[3]), static_cast<unsigned long long>(twins[4]), static_cast<unsigned long long>(table.coverHits[0]), static_cast<unsigned long long>(table.coverHits[1]), static_cast<unsigned long long>(table.coverHits[2]), static_cast<unsigned long long>(table.coverHits[3]));
     {
         std::string costs;
-        static constexpr const char* names[] = {"new path (table deferred)", "new path (table built)", "fallback address-based", "fallback other"};
+        static constexpr const char* names[] = {"new path (table deferred)", "new path (table built)", "fallback address-based", "fallback other", "new path C1", "fallback C1"};
+        static_assert(std::size(names) == std::tuple_size_v<decltype(state.costs)>);
         for (std::size_t index = 0; index < state.costs.size(); ++index) {
             auto& cost = state.costs[index];
             const auto count = cost.count.load(std::memory_order_relaxed);
@@ -122,6 +124,10 @@ void print(State& state, const char* window) {
         }
         const auto completions = state.completions.load(std::memory_order_relaxed);
         AgcDriver::ProfilePrint_nid_no_patch("[newpath-cost] window=%s us per dispatch after the build (cumulative): %s; command record completions %llu x %.1f us, records made %llu; F4 compares %llu, served by the space serial %llu\n", window, split.c_str(), static_cast<unsigned long long>(completions), completions != 0 ? static_cast<double>(state.completionNs.load(std::memory_order_relaxed)) / 1000.0 / static_cast<double>(completions) : 0.0, static_cast<unsigned long long>(table.records), static_cast<unsigned long long>(table.compares), static_cast<unsigned long long>(table.serialHits));
+    }
+    {
+        const auto c1 = Twins().C1Outcomes();
+        AgcDriver::ProfilePrint_nid_no_patch("[newpath] window=%s C1 twins (cumulative, newPathRuntimeBuffers requests): built %llu (binding no guest buffers %llu), failed %llu, mismatched %llu\n", window, static_cast<unsigned long long>(c1[0]), static_cast<unsigned long long>(Twins().C1RuntimeBuilt()), static_cast<unsigned long long>(c1[2]), static_cast<unsigned long long>(c1[3]));
     }
     if (Census::Enabled()) AgcDriver::ProfilePrint_nid_no_patch("%s\n", Census::Format(window).c_str());
     const auto ahead = Pipelines().Totals();
@@ -191,6 +197,14 @@ std::shared_ptr<EmitCandidate> ClaimDispatch(const ShaderRecompiler::RecompileRe
     else candidate->noted.store(true, std::memory_order_relaxed);
     candidate->twin = Twins().Of(compiled);
     candidate->facts.resolvedProgram = candidate->twin != nullptr;
+    candidate->facts.c1 = !UsesAddressTables(compiled) && C1Shape(compiled);
+    candidate->facts.c1Switch = candidate->facts.c1 && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NewPathNoC1);
+    if (candidate->facts.c1Switch) {
+        candidate->twin = nullptr;
+        candidate->facts.resolvedProgram = false;
+    }
+    candidate->c1Twin = candidate->facts.c1 && candidate->twin != nullptr;
+    candidate->runtimeBuffers = candidate->c1Twin && RuntimeBufferTwin(compiled, *candidate->twin);
     candidate->facts.pushFits = LegacyPushBytes <= Abi::PushBlockBytes - ResolvedDriverWords * 4u;
     candidate->facts.staticChains = true;
     Census::Fill(*candidate, compiled);
@@ -232,7 +246,7 @@ Decision NoteEmit(EmitCandidate& candidate, const CommandFacts& facts) {
 }
 
 bool MayEmitWithoutTable(const EmitCandidate& candidate, bool pipelineReady) {
-    if (candidate.twin == nullptr || !WalkReplacesTables(*candidate.twin)) return false;
+    if (candidate.twin == nullptr || candidate.c1Twin || !WalkReplacesTables(*candidate.twin)) return false;
     auto facts = candidate.facts;
     facts.pipelineReady = pipelineReady;
     facts.clothGuard = false;
@@ -253,7 +267,7 @@ void NoteDispatchCost(const EmitCandidate& candidate, std::uint64_t deviceNs, st
         candidate.census.committed = true;
         Census::NoteCommit(candidate, true, deviceNs, buildNs);
     }
-    auto& cost = Get().costs[candidate.routed != Route::NewPath ? (candidate.addressBased ? 2 : 3) : candidate.tableDeferred ? 0 : 1];
+    auto& cost = Get().costs[candidate.facts.c1 ? (candidate.routed == Route::NewPath ? 4 : 5) : candidate.routed != Route::NewPath ? (candidate.addressBased ? 2 : 3) : candidate.tableDeferred ? 0 : 1];
     if (deviceNs > 50'000'000ull) {
         cost.slow.fetch_add(1, std::memory_order_relaxed);
         return;
@@ -311,6 +325,38 @@ void NoteBufferCover(const EmitCandidate& candidate, const Graphics::ShaderResou
     } catch (const std::exception&) {
     }
     candidate.census.cover = static_cast<std::uint8_t>(cover);
+}
+
+void NoteBufferRanges(EmitCandidate& candidate, const Graphics::ShaderResources& resources) {
+    if (!candidate.c1Twin) return;
+    try {
+        candidate.bufferRanges = resources.GuestBufferRanges();
+    } catch (const std::exception&) {
+        candidate.bufferRanges = nullptr;
+    }
+}
+
+void CoverBuffers(const EmitCandidate& candidate, const Graphics::ShaderResources& resources, CommandFacts& facts, DevicePageTable::Snapshot* used, bool threadLimit) {
+    facts.layoutFits = !threadLimit || !candidate.runtimeBuffers || std::ranges::any_of(candidate.twin->bindings, [](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::ShaderData; });
+    if (candidate.bufferRanges == nullptr) {
+        facts.tableCovers = false;
+        facts.coverReason = FallbackReason::C1RangesUnavailable;
+        return;
+    }
+    auto& table = DeviceTable();
+    const auto cover = table.Covers(candidate.bufferRanges, used);
+    facts.tableCovers = cover == DevicePageTable::Cover::Covered;
+    if (facts.tableCovers) return;
+    facts.coverReason = FallbackReason::C1NotCovered;
+    if (cover != DevicePageTable::Cover::OtherAddress) return;
+    // Other address: on a range the build writes (its written elements bound to a staged copy), the dominant case
+    // in the S2-share probe, named apart.
+    DevicePageTable::Range failed{};
+    if (table.Probe(*candidate.bufferRanges, &failed) != DevicePageTable::Cover::OtherAddress) return;
+    thread_local std::vector<std::array<std::uint64_t, 3>> accesses;
+    accesses.clear();
+    resources.RunAccesses(accesses);
+    if (std::ranges::any_of(accesses, [&](const std::array<std::uint64_t, 3>& access) { return (access[2] & Graphics::Recorder::RunAccessImage) == 0 && (access[2] & Graphics::Recorder::RunAccessWritten) != 0 && access[0] < failed.end && failed.begin < access[1]; })) facts.coverReason = FallbackReason::C1WrittenElsewhere;
 }
 
 void Close(const char* window) {

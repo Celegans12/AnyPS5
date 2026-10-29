@@ -42,7 +42,10 @@ using TwinCapture = std::function<std::shared_ptr<const ShaderRecompiler::Resour
 void buildResolvedTwin(const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request, const TwinCapture& capture, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiled) {
     auto& twins = NewPath::Twins();
     if (compiled != nullptr && twins.Known(*compiled)) return;
-    if (compiled == nullptr || compiled->newPathResolved || compiled->transferKernel.has_value() || !NewPath::UsesAddressTables(*compiled)) {
+    // Address-based programs get the plain resolved twin; S2-share C1 programs (guest buffers only) one that reads
+    // their buffer V#s at run time through the page table (newPathRuntimeBuffers), unless APS5_NEW_PATH_NO_C1.
+    const bool c1 = compiled != nullptr && !NewPath::UsesAddressTables(*compiled) && NewPath::C1Shape(*compiled) && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NewPathNoC1);
+    if (compiled == nullptr || compiled->newPathResolved || compiled->transferKernel.has_value() || (!NewPath::UsesAddressTables(*compiled) && !c1)) {
         twins.Remember(compiled, nullptr, NewPath::TwinOutcome::NotAddressBased);
         return;
     }
@@ -50,22 +53,23 @@ void buildResolvedTwin(const ShaderSnapshot& snapshot, std::size_t codeOffset, c
     try {
         auto resolvedRequest = request;
         resolvedRequest.target.newPathResolved = true;
+        resolvedRequest.target.newPathRuntimeBuffers = c1;
         auto invocation = InvocationFor(snapshot, codeOffset, resolvedRequest);
         const auto resolvedCapture = capture(resolvedRequest, invocation);
         if (resolvedCapture != nullptr) twin = invocation.Materialize(*resolvedCapture);
     } catch (const std::exception& error) {
         static std::atomic<int> reported{0};
-        if (reported.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[newpath] no resolved module for compute shader 0x%llx: %.200s\n", static_cast<unsigned long long>(request.shader.codeAddress), error.what());
-        twins.Remember(compiled, nullptr, NewPath::TwinOutcome::Failed);
+        if (reported.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[newpath] no resolved module for %scompute shader 0x%llx: %.200s\n", c1 ? "C1 " : "", static_cast<unsigned long long>(request.shader.codeAddress), error.what());
+        twins.Remember(compiled, nullptr, NewPath::TwinOutcome::Failed, c1);
         return;
     }
     if (twin == nullptr || !NewPath::TwinCompatible(*compiled, *twin)) {
         static std::atomic<int> reported{0};
-        if (twin != nullptr && reported.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[newpath] resolved module of compute shader 0x%llx differs: %s\n", static_cast<unsigned long long>(request.shader.codeAddress), NewPath::TwinDifference(*compiled, *twin).c_str());
-        twins.Remember(compiled, nullptr, NewPath::TwinOutcome::Mismatch);
+        if (twin != nullptr && reported.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[newpath] resolved module of %scompute shader 0x%llx differs: %s\n", c1 ? "C1 " : "", static_cast<unsigned long long>(request.shader.codeAddress), NewPath::TwinDifference(*compiled, *twin).c_str());
+        twins.Remember(compiled, nullptr, NewPath::TwinOutcome::Mismatch, c1);
         return;
     }
-    twins.Remember(compiled, std::move(twin), NewPath::TwinOutcome::Built);
+    twins.Remember(compiled, std::move(twin), NewPath::TwinOutcome::Built, c1);
 }
 
 // Whether a compiled compute program binds images or samplers (directly, through image tables, or

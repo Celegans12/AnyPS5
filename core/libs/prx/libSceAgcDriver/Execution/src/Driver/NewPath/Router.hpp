@@ -14,8 +14,8 @@ inline constexpr std::size_t CommandKindCount = 3;
 
 enum class Route : std::uint8_t { NewPath, Fallback };
 
-enum class FallbackReason : std::uint8_t { KindSwitch, KindNotEmitted, NoPipeline, RangeNotCovered, PushOverflow, ClothGuard, NonStaticChain, Suspended, NoResolvedModule, NotRecorded };
-inline constexpr std::size_t FallbackReasonCount = 10;
+enum class FallbackReason : std::uint8_t { KindSwitch, KindNotEmitted, NoPipeline, RangeNotCovered, PushOverflow, ClothGuard, NonStaticChain, Suspended, NoResolvedModule, NotRecorded, C1NoTwin, C1Switch, C1RangesUnavailable, C1WrittenElsewhere, C1NotCovered, C1Layout };
+inline constexpr std::size_t FallbackReasonCount = 16;
 
 [[nodiscard]] const char* CommandKindName(CommandKind kind);
 [[nodiscard]] const char* FallbackReasonName(FallbackReason reason);
@@ -36,6 +36,13 @@ struct CommandFacts {
     bool overflowPlaced = false;
     bool staticChains = true;
     bool suspended = false;
+    // S2-share C1 (buffer V#s read at run time through the page table, no images): the program has the shape, its
+    // twin is not requested while APS5_NEW_PATH_NO_C1 is set, F4's refusal names the reason, and the twin's data
+    // layout fits the build's (thread-dimension limit at the same dword).
+    bool c1 = false;
+    bool c1Switch = false;
+    FallbackReason coverReason = FallbackReason::RangeNotCovered;
+    bool layoutFits = true;
 };
 
 struct RouteCounts {

@@ -59,6 +59,13 @@ void routerEmitOrder() {
         {"push overflow", [](CommandFacts& facts) { facts.pushFits = false; facts.clothGuard = true; }, FallbackReason::PushOverflow},
         {"cloth guard", [](CommandFacts& facts) { facts.clothGuard = true; facts.staticChains = false; }, FallbackReason::ClothGuard},
         {"non-static chain", [](CommandFacts& facts) { facts.staticChains = false; }, FallbackReason::NonStaticChain},
+        {"C1 without a twin", [](CommandFacts& facts) { facts.c1 = true; facts.resolvedProgram = false; facts.tableCovers = false; }, FallbackReason::C1NoTwin},
+        {"C1 switch", [](CommandFacts& facts) { facts.c1 = true; facts.c1Switch = true; facts.resolvedProgram = false; }, FallbackReason::C1Switch},
+        {"C1 written elsewhere", [](CommandFacts& facts) { facts.c1 = true; facts.tableCovers = false; facts.coverReason = FallbackReason::C1WrittenElsewhere; facts.layoutFits = false; }, FallbackReason::C1WrittenElsewhere},
+        {"C1 not covered", [](CommandFacts& facts) { facts.c1 = true; facts.tableCovers = false; facts.coverReason = FallbackReason::C1NotCovered; }, FallbackReason::C1NotCovered},
+        {"C1 ranges unavailable", [](CommandFacts& facts) { facts.c1 = true; facts.tableCovers = false; facts.coverReason = FallbackReason::C1RangesUnavailable; }, FallbackReason::C1RangesUnavailable},
+        {"C1 layout", [](CommandFacts& facts) { facts.c1 = true; facts.layoutFits = false; facts.clothGuard = true; }, FallbackReason::C1Layout},
+        {"C1 no pipeline", [](CommandFacts& facts) { facts.c1 = true; facts.pipelineReady = false; facts.tableCovers = false; }, FallbackReason::NoPipeline},
     };
     for (const auto& item : cases) {
         auto facts = ReadyDispatch();
@@ -70,6 +77,11 @@ void routerEmitOrder() {
     overflow.pushFits = false;
     overflow.overflowPlaced = true;
     Expect(router.Decide(overflow).route == Route::NewPath, "a placed overflow upload did not allow emission");
+    auto c1 = ReadyDispatch();
+    c1.c1 = true;
+    Expect(router.Decide(c1).route == Route::NewPath, "a covered C1 dispatch with its twin was not emitted");
+    for (std::size_t reason = 0; reason < FallbackReasonCount; ++reason) Expect(std::string(FallbackReasonName(static_cast<FallbackReason>(reason))) != "unknown", "fallback reason " + std::to_string(reason) + " has no name");
+    Expect(std::string(FallbackReasonName(FallbackReason::C1WrittenElsewhere)) == "c1-written-elsewhere", "C1 reason name");
 }
 
 void pushBlock() {
@@ -279,6 +291,141 @@ void resolvedTwins() {
     }
 }
 
+ShaderRecompiler::DescriptorBinding C1Binding(ShaderRecompiler::DescriptorRole role, std::uint32_t number, ShaderRecompiler::DescriptorKind kind = ShaderRecompiler::DescriptorKind::StorageBuffer) {
+    ShaderRecompiler::DescriptorBinding binding{};
+    binding.kind = kind;
+    binding.role = role;
+    binding.binding = number;
+    binding.count = 1;
+    if (role == ShaderRecompiler::DescriptorRole::FlattenedSrt) binding.guestDescriptor = {7, 8, 9};
+    return binding;
+}
+
+// Today's C1 build: guest buffers at 0, the flattened SRT at 1; push = 2 user words + 2 memory-offset dwords.
+std::shared_ptr<ShaderRecompiler::RecompileResult> C1Program() {
+    using Role = ShaderRecompiler::DescriptorRole;
+    auto program = std::make_shared<ShaderRecompiler::RecompileResult>();
+    program->bindings = {C1Binding(Role::GuestBuffers, 0), C1Binding(Role::FlattenedSrt, 1)};
+    program->pushConstants.assign(16, std::byte{3});
+    program->memoryOffsetDword = 2;
+    program->shaderDataDwords = 4;
+    program->imageMetadataDword = 4;
+    return program;
+}
+
+// Its runtime-buffer twin: no guest buffers, the SRT binding keeps its number, own push words (no offsets).
+std::shared_ptr<ShaderRecompiler::RecompileResult> C1Twin() {
+    auto twin = std::make_shared<ShaderRecompiler::RecompileResult>();
+    twin->newPathResolved = true;
+    twin->bindings = {C1Binding(ShaderRecompiler::DescriptorRole::FlattenedSrt, 1)};
+    twin->pushConstants.assign(8, std::byte{3});
+    twin->memoryOffsetDword = 2;
+    twin->shaderDataDwords = 2;
+    twin->imageMetadataDword = 2;
+    return twin;
+}
+
+void c1Twins() {
+    using Role = ShaderRecompiler::DescriptorRole;
+    using Kind = ShaderRecompiler::DescriptorKind;
+    const auto compiled = C1Program();
+    Expect(C1Shape(*compiled) && !UsesAddressTables(*compiled), "guest buffers + flattened SRT is not C1");
+    {
+        auto program = *compiled;
+        program.bindings.push_back(C1Binding(Role::ShaderData, 2));
+        program.workgroupMemoryDwords = 64;
+        Expect(C1Shape(program), "shader data or LDS took a program out of C1");
+    }
+    const struct {
+        const char* name;
+        void (*set)(ShaderRecompiler::RecompileResult&);
+    } notC1[] = {
+        {"a storage image", [](ShaderRecompiler::RecompileResult& program) { program.bindings.push_back(C1Binding(Role::GuestImages, 2, Kind::StorageImage)); }},
+        {"a sampler", [](ShaderRecompiler::RecompileResult& program) { program.bindings.push_back(C1Binding(Role::GuestSamplers, 2, Kind::Sampler)); }},
+        {"GDS", [](ShaderRecompiler::RecompileResult& program) { program.bindings.push_back(C1Binding(Role::Gds, 2)); }},
+        {"a BDA table", [](ShaderRecompiler::RecompileResult& program) { program.bindings.push_back(C1Binding(Role::BdaPagetable, 2)); }},
+        {"an image table", [](ShaderRecompiler::RecompileResult& program) { program.bindings.push_back(C1Binding(Role::ImageTable, 2)); }},
+        {"a texel buffer", [](ShaderRecompiler::RecompileResult& program) { program.bindings[0].kind = Kind::StorageTexelBuffer; }},
+        {"the bindless heap", [](ShaderRecompiler::RecompileResult& program) { program.bindlessHeap = true; }},
+        {"a resolved module", [](ShaderRecompiler::RecompileResult& program) { program.newPathResolved = true; }},
+        {"no guest buffers", [](ShaderRecompiler::RecompileResult& program) { program.bindings.erase(program.bindings.begin()); }},
+        {"a transfer kernel", [](ShaderRecompiler::RecompileResult& program) { program.transferKernel = ShaderRecompiler::TransferKernel{}; }},
+    };
+    for (const auto& item : notC1) {
+        auto program = *compiled;
+        item.set(program);
+        Expect(!C1Shape(program), std::string("a program with ") + item.name + " is C1");
+    }
+
+    const auto twin = C1Twin();
+    Expect(RuntimeBufferTwin(*compiled, *twin), "a resolved twin without guest buffers is not a runtime-buffer twin");
+    Expect(TwinCompatible(*compiled, *twin), "the runtime-buffer twin was refused: " + TwinDifference(*compiled, *twin));
+    {
+        // A twin that keeps the guest buffers (the field without effect) is the plain twin: same push words needed.
+        auto bound = std::make_shared<ShaderRecompiler::RecompileResult>(*compiled);
+        bound->newPathResolved = true;
+        Expect(!RuntimeBufferTwin(*compiled, *bound) && TwinCompatible(*compiled, *bound), "a C1 twin that keeps today's bindings and push was refused");
+        bound->pushConstants.resize(8);
+        Expect(!TwinCompatible(*compiled, *bound), "a C1 twin that keeps guest buffers but pushes other words was accepted");
+    }
+    {
+        // An address-based program whose twin drops its guest buffers stays refused (not C1).
+        auto address = *compiled;
+        address.bindings.push_back(C1Binding(Role::BdaPagetable, 2));
+        Expect(!RuntimeBufferTwin(address, *twin) && !TwinCompatible(address, *twin), "an address-based program took a runtime-buffer twin");
+    }
+    const struct {
+        const char* name;
+        void (*set)(ShaderRecompiler::RecompileResult&);
+    } refused[] = {
+        {"renumbers the SRT binding", [](ShaderRecompiler::RecompileResult& program) { program.bindings[0].binding = 0; }},
+        {"other SRT words", [](ShaderRecompiler::RecompileResult& program) { program.bindings[0].guestDescriptor[0] = 1; }},
+        {"binds more", [](ShaderRecompiler::RecompileResult& program) { program.bindings.push_back(C1Binding(Role::Gds, 5)); }},
+        {"pushes more than 128 bytes", [](ShaderRecompiler::RecompileResult& program) { program.pushConstants.assign(132, std::byte{1}); }},
+        {"pushes a partial dword", [](ShaderRecompiler::RecompileResult& program) { program.pushConstants.resize(6); }},
+        {"another specialization", [](ShaderRecompiler::RecompileResult& program) { program.specialization.push_back({}); }},
+        {"another workgroup memory", [](ShaderRecompiler::RecompileResult& program) { program.workgroupMemoryDwords = 4; }},
+        {"another subgroup size", [](ShaderRecompiler::RecompileResult& program) { program.hostSubgroupSize = 32; }},
+        {"a ShaderData binding of another layout", [](ShaderRecompiler::RecompileResult& program) { program.bindings.push_back(C1Binding(Role::ShaderData, 2)); }},
+        {"is not resolved", [](ShaderRecompiler::RecompileResult& program) { program.newPathResolved = false; }},
+    };
+    for (const auto& item : refused) {
+        auto other = *twin;
+        item.set(other);
+        Expect(!TwinCompatible(*compiled, other), std::string("a runtime-buffer twin that ") + item.name + " was accepted");
+    }
+    {
+        // A twin binding ShaderData reads today's buffer: accepted when its layout is today's.
+        auto withData = std::make_shared<ShaderRecompiler::RecompileResult>(*compiled);
+        withData->bindings.push_back(C1Binding(Role::ShaderData, 2));
+        withData->shaderDataUserWords = {5, 6};
+        auto dataTwin = *twin;
+        dataTwin.bindings.push_back(C1Binding(Role::ShaderData, 2));
+        Expect(!TwinCompatible(*withData, dataTwin), "a twin whose ShaderData layout differs from today's was accepted");
+        dataTwin.memoryOffsetDword = withData->memoryOffsetDword;
+        dataTwin.shaderDataDwords = withData->shaderDataDwords;
+        dataTwin.imageMetadataDword = withData->imageMetadataDword;
+        dataTwin.shaderDataUserWords = {5, 6};
+        Expect(TwinCompatible(*withData, dataTwin), "a twin with today's ShaderData layout was refused: " + TwinDifference(*withData, dataTwin));
+        dataTwin.shaderDataUserWords = {5, 7};
+        Expect(!TwinCompatible(*withData, dataTwin), "a twin with other ShaderData user words was accepted");
+    }
+
+    const auto words = TwinPushWords(*twin);
+    Expect(std::equal(twin->pushConstants.begin(), twin->pushConstants.end(), words.begin()) && std::all_of(words.begin() + static_cast<std::ptrdiff_t>(twin->pushConstants.size()), words.end(), [](std::byte value) { return value == std::byte{0}; }), "the twin's push words were not placed at offset 0");
+    const auto composed = ComposeResolvedPush(words, LegacyPushBytes, 0x1000, 0x2000);
+    Expect(composed.has_value() && std::equal(twin->pushConstants.begin(), twin->pushConstants.end(), composed->begin() + ResolvedDriverWords * 4u), "the twin's push words are not at word 6 of the composed block");
+
+    ResolvedTwins twins;
+    twins.Remember(compiled, twin, TwinOutcome::Built, true);
+    twins.Remember(C1Program(), nullptr, TwinOutcome::Failed, true);
+    twins.Remember(AddressProgram(false), AddressProgram(true), TwinOutcome::Built);
+    const auto c1Outcomes = twins.C1Outcomes();
+    Expect(c1Outcomes[static_cast<std::size_t>(TwinOutcome::Built)] == 1 && c1Outcomes[static_cast<std::size_t>(TwinOutcome::Failed)] == 1 && twins.C1RuntimeBuilt() == 1, "C1 twin outcomes were not counted apart");
+    Expect(twins.Outcomes()[static_cast<std::size_t>(TwinOutcome::Built)] == 2, "C1 twins left out of the outcomes");
+    Expect(twins.Of(*compiled) == twin, "a remembered C1 twin was not found");
+}
+
 BdaAbi::Range MakeRange(std::uint64_t begin, std::uint64_t end, std::uint32_t permissions) {
     return {begin, end, 0x7f0000000000ull + begin, permissions, 0u};
 }
@@ -371,6 +518,7 @@ int main() {
         composedResolvedPush();
         commandRecords();
         resolvedTwins();
+        c1Twins();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;

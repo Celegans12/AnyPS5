@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/NewPath.hpp"
+#include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/C1Buffers.hpp"
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/PipelineAheadConfig.hpp"
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/DevicePageTable.hpp"
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/ResolvedPush.hpp"
@@ -5748,6 +5749,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         return resources.WritesOverlap(begin, bytes) || resources.ReadsOverlap(begin, bytes) || (argumentImport != nullptr && begin < arguments + 12 && arguments < end);
     };
     std::shared_ptr<ComputePipelineObjects> emitted;
+    const ShaderRecompiler::RecompileResult* runtimeBufferTwin = nullptr;
     NewPath::DevicePageTable::Snapshot admitted;
     NewPath::CostLap(NewPath::CostStep::RecordHead);
     if (auto* emit = NewPath::CurrentEmit(); emit != nullptr && arguments == 0 && argumentImport == nullptr) {
@@ -5758,10 +5760,14 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
             auto& table = NewPath::DeviceTable();
             if (table.Stale(context.device)) static_cast<void>(table.Refresh(context));
             NewPath::CostLap(NewPath::CostStep::Route);
-            const auto deferred = resources.DeferredAddressTable();
-            const auto ranges = deferred.has_value() ? nullptr : resources.AddressTableRanges();
-            NewPath::CostLap(NewPath::CostStep::Ranges);
-            facts.tableCovers = (deferred.has_value() ? table.Covers(deferred->serial, deferred->ranges, &admitted) : table.Covers(ranges, &admitted)) == NewPath::DevicePageTable::Cover::Covered;
+            if (emit->c1Twin) {
+                NewPath::CoverBuffers(*emit, resources, facts, &admitted, record.threadGroup != std::array<std::uint32_t, 3>{});
+            } else {
+                const auto deferred = resources.DeferredAddressTable();
+                const auto ranges = deferred.has_value() ? nullptr : resources.AddressTableRanges();
+                NewPath::CostLap(NewPath::CostStep::Ranges);
+                facts.tableCovers = (deferred.has_value() ? table.Covers(deferred->serial, deferred->ranges, &admitted) : table.Covers(ranges, &admitted)) == NewPath::DevicePageTable::Cover::Covered;
+            }
             NewPath::CostLap(NewPath::CostStep::Compare);
         }
         // Pipeline gate on: the twin's pipeline is created by a creation worker, never here; until it is ready the
@@ -5783,6 +5789,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
                 emitted = computePipeline(context, *emit->twin, layouts.main, layouts.mainKey, record.pushStages, record.programAddress);
                 NewPath::CostLap(NewPath::CostStep::TwinPipeline);
             }
+            if (emitted != nullptr && emit->runtimeBuffers) runtimeBufferTwin = emit->twin.get();
         }
         NewPath::CostLap(NewPath::CostStep::Route);
     }
@@ -5972,7 +5979,8 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         if (!NewPath::UploadTableForLane(context, recorder, admitted.table, static_cast<std::uint32_t>(Graphics::Recorder::ThreadLane()))) recorder.Keep(std::const_pointer_cast<Graphics::BdaPageTable>(admitted.table));
         NewPath::CostLap(NewPath::CostStep::TableUpload);
         auto commandRecord = table.TakeRecord(context);
-        const auto resolvedPush = NewPath::ComposeResolvedPush(*record.pushBytes, Graphics::ComputePushConstantBytes, static_cast<std::uint64_t>(admitted.table->Address()), static_cast<std::uint64_t>(commandRecord->DeviceAddress()));
+        // A C1 twin that reads its buffer V#s at run time has its own push words (no memory-offset dwords).
+        const auto resolvedPush = NewPath::ComposeResolvedPush(runtimeBufferTwin != nullptr ? NewPath::TwinPushWords(*runtimeBufferTwin) : *record.pushBytes, Graphics::ComputePushConstantBytes, static_cast<std::uint64_t>(admitted.table->Address()), static_cast<std::uint64_t>(commandRecord->DeviceAddress()));
         Graphics::Require(resolvedPush.has_value(), "a new-path resolved dispatch has no page table or fault record for its push block");
         recorder.Keep(commandRecord);
         recorder.OnComplete([commandRecord, leased = std::move(admitted.lists.writable), device = context.device, programAddress = record.programAddress] {
@@ -6599,6 +6607,8 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         emit->addressBased = resources->UsesAddressTable();
         NewPath::NoteBufferCover(*emit, *resources);
         NewPath::CostBegin();
+        NewPath::NoteBufferRanges(*emit, *resources);
+        NewPath::CostLap(NewPath::CostStep::Ranges);
     }
     if (profile) timer.add(PhaseResourcesHookWaits, Graphics::Recorder::ThreadWaitedMs() - waitedBefore);
     // The lookup outcomes of this call: rows with counts on the [indirect] line, and a summary for
