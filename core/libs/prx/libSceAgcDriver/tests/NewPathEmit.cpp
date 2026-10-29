@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/CommandRecord.hpp"
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/CommandWrites.hpp"
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/PushBlock.hpp"
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/ResolvedPush.hpp"
@@ -162,6 +163,49 @@ void composedResolvedPush() {
     Expect(!ComposeResolvedPush(legacy, 240, 1, 1).has_value(), "a legacy block that cannot shift by six words was accepted");
 }
 
+void commandRecords() {
+    std::vector<std::uint32_t> storage(CommandRecordWords, 0xffffffffu);
+    std::span<std::uint32_t, CommandRecordWords> words(storage.data(), CommandRecordWords);
+    ClearCommandRecord(words);
+    Expect(CommandRecordClear(words), "a cleared record is not clear");
+    std::vector<AddressRange> marked;
+    const auto mark = [&](std::uint64_t address, std::size_t bytes) { marked.emplace_back(address, address + bytes); };
+    const std::vector<AddressRange> leased{{0x10000000ull, 0x10100000ull}, {0x20000000ull, 0x20010000ull}};
+
+    auto empty = CompleteCommandRecord(words, leased, mark);
+    Expect(!empty.faulted && !empty.overflow && !empty.invalid && marked.empty(), "an empty record marked pages or faulted");
+
+    const std::uint64_t chunk = 0x10020000ull;
+    words[BdaAbi::WrittenCountWord] = 1;
+    words[BdaAbi::WrittenListWord] = 5;
+    words[BdaAbi::WrittenSlotsWord + 10] = BdaAbi::WrittenChunkKey(chunk);
+    words[BdaAbi::WrittenSlotsWord + 11] = 0b0110u;
+    const auto written = CompleteCommandRecord(words, leased, mark);
+    Expect(!written.overflow && !written.invalid && written.writtenRanges == 1 && marked.size() == 1 && marked[0] == AddressRange{chunk + 0x1000, chunk + 0x3000}, "a written-page record did not mark exactly its pages");
+    Expect(CommandRecordClear(words), "a completed record was not cleared for reuse");
+
+    marked.clear();
+    words[BdaAbi::WrittenOverflowWord] = 1;
+    const auto overflow = CompleteCommandRecord(words, leased, mark);
+    Expect(overflow.overflow && marked == leased, "an overflowed record did not mark every leased range");
+
+    marked.clear();
+    words[BdaAbi::WrittenCountWord] = 1;
+    words[BdaAbi::WrittenListWord] = BdaAbi::WrittenPageSlots + 3;
+    const auto invalid = CompleteCommandRecord(words, leased, mark);
+    Expect(invalid.invalid && marked == leased, "an invalid record was trusted instead of marking every leased range");
+
+    marked.clear();
+    BdaAbi::Fault fault{};
+    fault.state = BdaAbi::FaultState::Ready;
+    fault.reason = BdaAbi::FaultReason::Unmapped;
+    fault.address = 0x5000123000ull;
+    std::memcpy(storage.data(), &fault, sizeof(fault));
+    const auto faulted = CompleteCommandRecord(words, leased, mark);
+    Expect(faulted.faulted && faulted.reason == BdaAbi::FaultReason::Unmapped && faulted.message.find("5000123000") != std::string::npos, "a fault record was not reported with its reason and address");
+    Expect(CommandRecordClear(words), "a faulted record was not cleared");
+}
+
 BdaAbi::Range MakeRange(std::uint64_t begin, std::uint64_t end, std::uint32_t permissions) {
     return {begin, end, 0x7f0000000000ull + begin, permissions, 0u};
 }
@@ -203,6 +247,7 @@ int main() {
         writeSets();
         resolvedDispatchPush();
         composedResolvedPush();
+        commandRecords();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;

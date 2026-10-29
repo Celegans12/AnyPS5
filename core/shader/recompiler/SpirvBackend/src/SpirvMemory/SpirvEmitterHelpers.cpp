@@ -168,18 +168,30 @@ std::uint32_t PushDataMember(SpirvEmitterState& state) {
     return ConstantU32(state, state.newPathResolved ? 1u : 0u);
 }
 
-std::uint32_t NewPathPageTableAddress(SpirvEmitterState& state) {
-    if (state.pushConstantVariable == 0u) throw std::runtime_error("a newPathResolved module has no push block for its page table address");
+namespace {
+
+std::uint32_t NewPathPushAddress(SpirvEmitterState& state, std::uint32_t first, const char* what) {
+    if (state.pushConstantVariable == 0u) throw std::runtime_error(std::string("a newPathResolved module has no push block for its ") + what);
     std::array<std::uint32_t, 2> words{};
     for (std::uint32_t word = 0; word < 2u; ++word) {
         const auto pointer = state.module.AllocateId();
-        state.module.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state), pointer, state.pushConstantVariable, ConstantU32(state, 0u), ConstantU32(state, word));
+        state.module.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state), pointer, state.pushConstantVariable, ConstantU32(state, 0u), ConstantU32(state, first + word));
         words[word] = state.module.AllocateId();
         state.module.AddFunction(spv::OpLoad, TypeU32(state), words[word], pointer);
     }
     const auto u64 = TypeScalarU64(state);
     const auto high = Binary(state, spv::OpShiftLeftLogical, u64, Unary(state, spv::OpUConvert, u64, words[1]), BdaConstant(state, 32u));
     return Binary(state, spv::OpBitwiseOr, u64, Unary(state, spv::OpUConvert, u64, words[0]), high);
+}
+
+}
+
+std::uint32_t NewPathPageTableAddress(SpirvEmitterState& state) {
+    return NewPathPushAddress(state, 0u, "page table address");
+}
+
+std::uint32_t NewPathFaultRecordAddress(SpirvEmitterState& state) {
+    return NewPathPushAddress(state, 2u, "command record address");
 }
 
 void CheckBindings(const IrProgram& program, const CompiledBindingLayout& bindings) {

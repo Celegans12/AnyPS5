@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_SRC_DRIVER_NEWPATH_DEVICEPAGETABLE_HPP
 
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/CommandAccess.hpp"
+#include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/CommandRecord.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaPageTable.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
@@ -30,6 +31,7 @@ public:
         std::uint64_t importVersion = 0;
         std::uint64_t released = 0;
         std::uint64_t outlived = 0;
+        std::uint64_t records = 0;
     };
 
     DevicePageTable(ImportSource imports, VersionSource version);
@@ -45,7 +47,9 @@ public:
     [[nodiscard]] std::vector<Range> Ranges() const;
     [[nodiscard]] std::uint64_t RootAddress() const;
     [[nodiscard]] TableLists Lists() const;
-    [[nodiscard]] std::uint64_t FaultRecordAddress(const Graphics::Context& context);
+    [[nodiscard]] std::shared_ptr<Graphics::Buffer> TakeRecord(const Graphics::Context& context);
+    void ReturnRecord(std::shared_ptr<Graphics::Buffer> record, VkDevice device);
+    [[nodiscard]] std::size_t PooledRecords() const;
 
     [[nodiscard]] static std::vector<Range> Overlay(std::span<const Range> base, std::span<const Range> resident, std::uint64_t begin, std::uint64_t end);
 
@@ -59,8 +63,9 @@ private:
     std::vector<Range> importRanges;
     std::vector<Range> tableRanges;
     TableLists tableLists;
-    std::shared_ptr<Graphics::Buffer> faultRecord;
-    VkDevice faultDevice = VK_NULL_HANDLE;
+    std::vector<std::shared_ptr<Graphics::Buffer>> records;
+    VkDevice recordDevice = VK_NULL_HANDLE;
+    std::uint64_t recordsMade = 0;
     std::uint64_t builtVersion = 0;
     bool built = false;
     std::shared_ptr<const Graphics::BdaPageTable> table;
