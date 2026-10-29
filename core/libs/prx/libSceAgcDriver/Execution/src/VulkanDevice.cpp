@@ -6597,6 +6597,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     if (emit != nullptr) {
         emit->tableDeferred = resources->AddressTableDeferred();
         emit->addressBased = resources->UsesAddressTable();
+        NewPath::NoteBufferCover(*emit, *resources);
         NewPath::CostBegin();
     }
     if (profile) timer.add(PhaseResourcesHookWaits, Graphics::Recorder::ThreadWaitedMs() - waitedBefore);

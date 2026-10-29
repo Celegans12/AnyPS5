@@ -72,6 +72,7 @@ public:
     [[nodiscard]] Cover Covers(const std::shared_ptr<const std::vector<Range>>& build, Snapshot* used = nullptr);
     [[nodiscard]] Cover Covers(std::uint64_t serial, std::span<const Range> build, Snapshot* used = nullptr);
     [[nodiscard]] Snapshot Use() const;
+    [[nodiscard]] Cover Probe(std::span<const Range> build, Range* failed = nullptr) const;
     [[nodiscard]] static Cover Compare(std::span<const Range> table, std::span<const Range> build, const Range** failed = nullptr, std::uint64_t* failedAt = nullptr);
     // The imports (sorted, disjoint) with the mirrors added where no import maps: a mirror's bytes
     // that an import also maps are left to the import. Sorted and disjoint.

@@ -198,6 +198,13 @@ void MirrorDeviceTests(const AgcDriver::Graphics::Context& context) {
     Expect(std::none_of(writable.begin(), writable.end(), [](const AgcDriver::NewPath::AddressRange& range) { return range.first < MirrorEnd && MirrorBase < range.second; }), "the read-only mirror is in the writable ranges");
     const auto build = std::make_shared<const std::vector<Range>>(std::vector<Range>{MakeRange(MirrorBase, MirrorEnd, MirrorDevice, Abi::Read)});
     Expect(table.Covers(build) == DevicePageTable::Cover::Covered, "Covers refused a build binding the mapped mirror");
+    const auto hitsBefore = table.Totals().coverHits;
+    Expect(table.Probe(*build) == DevicePageTable::Cover::Covered, "Probe refused a build binding the mapped mirror");
+    const std::vector<Range> written{MakeRange(MirrorBase, MirrorEnd, MirrorDevice, Abi::Read | Abi::Write)};
+    Expect(table.Probe(written) == DevicePageTable::Cover::Narrower, "Probe covered a writable range over the read-only mirror");
+    const std::vector<Range> staged{MakeRange(ImportBase, ImportBase + 0x100, ImportDevice + 0x40000000ull, Abi::Read)};
+    Expect(table.Probe(staged) == DevicePageTable::Cover::OtherAddress, "Probe covered a staged copy of an import range");
+    Expect(table.Totals().coverHits == hitsBefore, "Probe counted in the F4 compare totals");
 
     // The mirror replaced (a reprotect made a new one at another device address): the version moves,
     // the table is stale, the old build is refused and the new one covered.

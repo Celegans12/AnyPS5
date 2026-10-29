@@ -14,6 +14,10 @@ namespace AgcDriver {
 class VulkanDevice;
 }
 
+namespace AgcDriver::Graphics {
+class ShaderResources;
+}
+
 namespace AgcDriver::NewPath {
 
 [[nodiscard]] bool Enabled();
@@ -32,6 +36,16 @@ struct EmitCandidate {
     bool tableDeferred = false;
     bool addressBased = false;
     Route routed = Route::Fallback;
+    mutable struct {
+        bool active = false;
+        bool cached = false;
+        bool committed = false;
+        std::uint8_t repeat = 0;
+        std::uint8_t cover = 0;
+        std::uint32_t shape = 0;
+        std::uint32_t regions = 0;
+        std::uint64_t decodeNs = 0;
+    } census;
 
     EmitCandidate() = default;
     EmitCandidate(const EmitCandidate&) = delete;
@@ -59,6 +73,7 @@ Decision NoteEmit(EmitCandidate& candidate, const CommandFacts& facts);
 // The router's route for these facts, without noting it.
 [[nodiscard]] bool WouldEmit(const CommandFacts& facts);
 void NoteDispatchCost(const EmitCandidate& candidate, std::uint64_t deviceNs, std::uint64_t buildNs);
+void NoteBufferCover(const EmitCandidate& candidate, const Graphics::ShaderResources& resources);
 
 enum class CostStep : std::uint8_t { PreRecord, RecordHead, Ranges, Compare, Route, TwinPipeline, EnsureTable, RecordCommands, TableUpload, RecordPush, DispatchMarks, PostRecord, Count };
 void CostBegin();
