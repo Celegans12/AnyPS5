@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/Router.hpp"
 #include <atomic>
+#include <cstdint>
 #include <memory>
 
 namespace ShaderRecompiler {
@@ -56,6 +57,11 @@ private:
 Decision NoteEmit(EmitCandidate& candidate, const CommandFacts& facts);
 [[nodiscard]] bool MayEmitWithoutTable(const EmitCandidate& candidate, bool pipelineReady);
 void NoteDispatchCost(const EmitCandidate& candidate, std::uint64_t deviceNs, std::uint64_t buildNs);
+
+enum class CostStep : std::uint8_t { PreRecord, RecordHead, Ranges, Compare, Route, TwinPipeline, EnsureTable, RecordCommands, TableUpload, RecordPush, DispatchMarks, PostRecord, Count };
+void CostBegin();
+void CostLap(CostStep step);
+void NoteCompletionCost(std::uint64_t ns);
 
 void Close(const char* window);
 

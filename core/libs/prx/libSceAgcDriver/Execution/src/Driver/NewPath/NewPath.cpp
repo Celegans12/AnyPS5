@@ -28,13 +28,28 @@ bool EnvSet(const char* name) {
     return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
 }
 
+constexpr std::size_t CostSteps = static_cast<std::size_t>(CostStep::Count);
+
 struct DispatchCost {
     std::atomic<std::uint64_t> count{0}, deviceNs{0}, buildNs{0}, slow{0};
+    std::array<std::atomic<std::uint64_t>, CostSteps> stepNs{};
 };
+
+struct StepClock {
+    bool active = false;
+    std::chrono::steady_clock::time_point last;
+    std::array<std::uint64_t, CostSteps> ns{};
+};
+
+StepClock& ThreadSteps() {
+    thread_local StepClock clock;
+    return clock;
+}
 
 struct State {
     Router router{EmitDispatches()};
     std::array<DispatchCost, 4> costs;
+    std::atomic<std::uint64_t> completions{0}, completionNs{0};
     std::mutex reporting;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
@@ -88,6 +103,22 @@ void print(State& state, const char* window) {
             costs += text;
         }
         AgcDriver::ProfilePrint_nid_no_patch("[newpath-cost] window=%s claimed direct dispatches (cumulative): %s\n", window, costs.c_str());
+        static constexpr const char* steps[] = {"pre-record", "record head", "ranges", "F4", "route", "twin pipeline", "ensure table", "record commands", "table upload", "record+push", "dispatch+marks", "post-record"};
+        static_assert(std::size(steps) == CostSteps);
+        std::string split;
+        for (std::size_t index = 0; index < state.costs.size(); ++index) {
+            auto& cost = state.costs[index];
+            const auto count = cost.count.load(std::memory_order_relaxed);
+            if (count == 0) continue;
+            split += (split.empty() ? "" : "; ") + std::string(names[index]) + ":";
+            for (std::size_t step = 0; step < CostSteps; ++step) {
+                char text[64];
+                std::snprintf(text, sizeof(text), " %s %.1f", steps[step], static_cast<double>(cost.stepNs[step].load(std::memory_order_relaxed)) / 1000.0 / static_cast<double>(count));
+                split += text;
+            }
+        }
+        const auto completions = state.completions.load(std::memory_order_relaxed);
+        AgcDriver::ProfilePrint_nid_no_patch("[newpath-cost] window=%s us per dispatch after the build (cumulative): %s; command record completions %llu x %.1f us, records made %llu\n", window, split.c_str(), static_cast<unsigned long long>(completions), completions != 0 ? static_cast<double>(state.completionNs.load(std::memory_order_relaxed)) / 1000.0 / static_cast<double>(completions) : 0.0, static_cast<unsigned long long>(table.records));
     }
     const auto ahead = Pipelines().Totals();
     AgcDriver::ProfilePrint_nid_no_patch("[newpath] window=%s pipelines ahead (gate %s): requested %llu, created %llu, failed %llu, inline %llu, blocked %llu, pending fallbacks %llu, prewarmed %llu\n", window, PipelineGateEnabled() ? "on" : "off", static_cast<unsigned long long>(ahead.requested), static_cast<unsigned long long>(ahead.created), static_cast<unsigned long long>(ahead.failed), static_cast<unsigned long long>(ahead.createdInline), static_cast<unsigned long long>(ahead.blockedWaits), static_cast<unsigned long long>(ahead.pendingFallbacks), static_cast<unsigned long long>(ahead.prewarmed));
@@ -202,6 +233,9 @@ bool MayEmitWithoutTable(const EmitCandidate& candidate, bool pipelineReady) {
 
 void NoteDispatchCost(const EmitCandidate& candidate, std::uint64_t deviceNs, std::uint64_t buildNs) {
     if (!Profile()) return;
+    CostLap(CostStep::PostRecord);
+    auto& clock = ThreadSteps();
+    clock.active = false;
     auto& cost = Get().costs[candidate.routed != Route::NewPath ? (candidate.addressBased ? 2 : 3) : candidate.tableDeferred ? 0 : 1];
     if (deviceNs > 50'000'000ull) {
         cost.slow.fetch_add(1, std::memory_order_relaxed);
@@ -210,6 +244,32 @@ void NoteDispatchCost(const EmitCandidate& candidate, std::uint64_t deviceNs, st
     cost.count.fetch_add(1, std::memory_order_relaxed);
     cost.deviceNs.fetch_add(deviceNs, std::memory_order_relaxed);
     cost.buildNs.fetch_add(buildNs, std::memory_order_relaxed);
+    for (std::size_t step = 0; step < CostSteps; ++step) {
+        if (clock.ns[step] != 0) cost.stepNs[step].fetch_add(clock.ns[step], std::memory_order_relaxed);
+    }
+}
+
+void CostBegin() {
+    if (!Profile()) return;
+    auto& clock = ThreadSteps();
+    clock.active = true;
+    clock.ns = {};
+    clock.last = std::chrono::steady_clock::now();
+}
+
+void CostLap(CostStep step) {
+    auto& clock = ThreadSteps();
+    if (!clock.active) return;
+    const auto now = std::chrono::steady_clock::now();
+    clock.ns[static_cast<std::size_t>(step)] += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - clock.last).count());
+    clock.last = now;
+}
+
+void NoteCompletionCost(std::uint64_t ns) {
+    if (!Profile()) return;
+    auto& state = Get();
+    state.completions.fetch_add(1, std::memory_order_relaxed);
+    state.completionNs.fetch_add(ns, std::memory_order_relaxed);
 }
 
 void Close(const char* window) {

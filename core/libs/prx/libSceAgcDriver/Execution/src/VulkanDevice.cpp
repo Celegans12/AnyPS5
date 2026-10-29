@@ -5664,6 +5664,7 @@ bool CheckpointsInRuns() {
 }
 
 void VulkanDevice::recordDispatch(RecordedDispatch& record) {
+    NewPath::CostLap(NewPath::CostStep::PreRecord);
     auto& d = Dispatches();
     auto& recorder = *state->recorder;
     auto& timer = *record.timer;
@@ -5741,6 +5742,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         return resources.WritesOverlap(begin, bytes) || resources.ReadsOverlap(begin, bytes) || (argumentImport != nullptr && begin < arguments + 12 && arguments < end);
     };
     std::shared_ptr<ComputePipelineObjects> emitted;
+    NewPath::CostLap(NewPath::CostStep::RecordHead);
     if (auto* emit = NewPath::CurrentEmit(); emit != nullptr && arguments == 0 && argumentImport == nullptr) {
         auto facts = emit->facts;
         facts.pipelineReady = record.x <= groupLimit[0] && record.y <= groupLimit[1] && record.z <= groupLimit[2];
@@ -5748,14 +5750,22 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         if (!facts.kindSwitchOff && facts.resolvedProgram && facts.pipelineReady && !facts.clothGuard) {
             auto& table = NewPath::DeviceTable();
             if (table.Stale(context.device)) static_cast<void>(table.Refresh(context));
-            facts.tableCovers = table.Covers(resources.AddressTableRanges()) == NewPath::DevicePageTable::Cover::Covered;
+            NewPath::CostLap(NewPath::CostStep::Route);
+            const auto ranges = resources.AddressTableRanges();
+            NewPath::CostLap(NewPath::CostStep::Ranges);
+            facts.tableCovers = table.Covers(ranges) == NewPath::DevicePageTable::Cover::Covered;
+            NewPath::CostLap(NewPath::CostStep::Compare);
         }
         if (NewPath::NoteEmit(*emit, facts).route == NewPath::Route::NewPath) {
             const auto layouts = resources.SetLayouts();
+            NewPath::CostLap(NewPath::CostStep::Route);
             emitted = computePipeline(context, *emit->twin, layouts.main, layouts.mainKey, record.pushStages, record.programAddress);
+            NewPath::CostLap(NewPath::CostStep::TwinPipeline);
         }
+        NewPath::CostLap(NewPath::CostStep::Route);
     }
     if (emitted == nullptr && resources.AddressTableDeferred()) resources.EnsureAddressTable();
+    NewPath::CostLap(NewPath::CostStep::EnsureTable);
     if (recorder.HasQueuedKeyStores() && (resources.HoldsLease() || recorder.AnyQueuedKeyStore(touches))) recorder.FlushKeyStores();
     if (recorder.HasQueuedStores() && (resources.HoldsLease() || recorder.AnyQueuedStore(touches))) recorder.FlushStores();
     if (record.shader->program->bindlessHeap) {
@@ -5929,19 +5939,23 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         context.Resolved(&Graphics::DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, boundObjects.layout, ShaderRecompiler::WorkgroupMemoryDescriptorSet, 1, &memory->set, 0, nullptr);
         recorder.Keep(std::move(memory));
     }
+    NewPath::CostLap(NewPath::CostStep::RecordCommands);
     if (emitted != nullptr || NewPath::ResolvedModule(*record.shader->program)) {
         auto& table = NewPath::DeviceTable();
         if (table.Stale(context.device)) static_cast<void>(table.Refresh(context));
         static_cast<void>(NewPath::UploadTableForLane(context, recorder, table.Current(), static_cast<std::uint32_t>(Graphics::Recorder::ThreadLane())));
+        NewPath::CostLap(NewPath::CostStep::TableUpload);
         auto commandRecord = table.TakeRecord(context);
         const auto resolvedPush = NewPath::ComposeResolvedPush(*record.pushBytes, Graphics::ComputePushConstantBytes, table.RootAddress(), static_cast<std::uint64_t>(commandRecord->DeviceAddress()));
         Graphics::Require(resolvedPush.has_value(), "a new-path resolved dispatch has no page table or fault record for its push block");
         recorder.Keep(commandRecord);
         recorder.OnComplete([commandRecord, leased = table.Lists().writable, device = context.device, programAddress = record.programAddress] {
+            const auto completionStart = std::chrono::steady_clock::now();
             auto bytes = commandRecord->Bytes();
             NewPath::ObserveCommandRecord(std::span<const std::uint32_t, NewPath::CommandRecordWords>(reinterpret_cast<const std::uint32_t*>(bytes.data()), NewPath::CommandRecordWords));
             const auto outcome = NewPath::CompleteCommandRecord(std::span<std::uint32_t, NewPath::CommandRecordWords>(reinterpret_cast<std::uint32_t*>(bytes.data()), NewPath::CommandRecordWords), leased != nullptr ? std::span<const NewPath::AddressRange>(*leased) : std::span<const NewPath::AddressRange>{}, [](std::uint64_t address, std::size_t size) { static_cast<void>(GuestMemory::MarkPossiblyWritten(address, size)); });
             NewPath::DeviceTable().ReturnRecord(commandRecord, device);
+            NewPath::NoteCompletionCost(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - completionStart).count()));
             Graphics::Require(!outcome.faulted, outcome.message + " in shader at " + std::to_string(programAddress));
             Graphics::Require(!outcome.invalid, "a new-path command's written-page record is invalid");
         });
@@ -5949,6 +5963,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     } else if (record.pushStages != 0) {
         context.Resolved(&Graphics::DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, boundObjects.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::ComputePushConstantBytes, record.pushBytes->data());
     }
+    NewPath::CostLap(NewPath::CostStep::RecordPush);
     const auto gpuTiming = recorder.BeginGpuTiming(record.programAddress != 0 ? record.programAddress : record.shader->program->variantId);
     if (state->checkpointMarker != nullptr) state->checkpointMarker(commands, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(record.programAddress)));
     else if (Graphics::Recorder::ThreadLane() == 1) Graphics::Recorder::Checkpoint(commands, Graphics::Recorder::CheckpointKind::AsyncDispatch, record.programAddress);
@@ -6046,6 +6061,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         if (resources.HasCopiedWrites()) writers->push_back(kept);
     }
     recordStep(PhaseRecordCompletion);
+    NewPath::CostLap(NewPath::CostStep::DispatchMarks);
 }
 
 namespace {
@@ -6520,6 +6536,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     if (emit != nullptr) {
         emit->tableDeferred = resources->AddressTableDeferred();
         emit->addressBased = resources->UsesAddressTable();
+        NewPath::CostBegin();
     }
     if (profile) timer.add(PhaseResourcesHookWaits, Graphics::Recorder::ThreadWaitedMs() - waitedBefore);
     // The lookup outcomes of this call: rows with counts on the [indirect] line, and a summary for
