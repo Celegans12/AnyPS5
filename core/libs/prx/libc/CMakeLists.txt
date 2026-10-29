@@ -904,6 +904,13 @@ if(BUILD_TESTING)
     if(WIN32)
         set_tests_properties(file_streams PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        add_test_executable(guest_stream_buffer_host_write_tests ${LIBS_INCLUDE_DIR}/tests/GuestStreamBufferHostWrite.cpp)
+        target_include_directories(guest_stream_buffer_host_write_tests PRIVATE ${LIBS_INCLUDE_DIR})
+        target_link_libraries(guest_stream_buffer_host_write_tests PRIVATE libkernel libc)
+        configure_windows_unwind(guest_stream_buffer_host_write_tests)
+        add_test(NAME guest_stream_buffer_host_write COMMAND guest_stream_buffer_host_write_tests)
+        set_tests_properties(guest_stream_buffer_host_write PROPERTIES TIMEOUT 20 ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test_executable(guest_freopen_host_standard_tests ${LIBS_INCLUDE_DIR}/tests/GuestFreopenHostStandard.cpp)
     target_include_directories(guest_freopen_host_standard_tests PRIVATE ${LIBS_INCLUDE_DIR})

@@ -2002,9 +2002,8 @@ int APS5_VABI scePthreadMutexGetprioceiling(void) {
     return 0;
 }
 
-int APS5_VABI scePthreadMutexInitForInternalLibc(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+int APS5_VABI scePthreadMutexInitForInternalLibc(PthreadMutex* mutex, const PthreadMutexattr* attr) {
+    return SceResult(pthread_mutex_init_nid_postfix(mutex, attr));
 }
 
 int APS5_VABI scePthreadMutexIsowned(void) {
@@ -2022,9 +2021,8 @@ int APS5_VABI scePthreadMutexattrGetgen(void) {
     return 0;
 }
 
-int APS5_VABI scePthreadMutexattrInitForInternalLibc(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+int APS5_VABI scePthreadMutexattrInitForInternalLibc(PthreadMutexattr* attr) {
+    return SceResult(pthread_mutexattr_init_nid_postfix(attr));
 }
 
 int APS5_VABI scePthreadMutexattrSetgen(void) {
