@@ -74,6 +74,7 @@ bool g_noReference = false;
 bool g_variants = false;
 bool g_describe = false;
 bool g_nativeTarget = false;
+bool g_newPathResolved = false;
 bool g_bindless = false;
 std::string g_expectedSpirv;
 
@@ -88,6 +89,7 @@ void ConfigurePipelineReplay(int argc, char** argv) {
         if (option == "--fingerprint-variants") g_variants = true;
         if (option == "--describe") g_describe = true;
         if (option == "--native-target") g_nativeTarget = true;
+        if (option == "--new-path-resolved") g_newPathResolved = true;
         if (option == "--prepare-only") prepare = true;
         if (option == "--maintenance8") maintenance = true;
         if (option == "--expect-spv") {
@@ -412,6 +414,10 @@ bool Replay(const char* path, std::unique_ptr<AgcDriver::VulkanDevice>& device) 
         std::printf("  native target (--native-target): %s%s\n", difference.empty() ? "the captured target matches" : "replaced the captured target's", difference.c_str());
         request.request.target = native;
     }
+    if (g_newPathResolved) {
+        request.request.target.newPathResolved = true;
+        std::printf("  new-path resolved target (--new-path-resolved)\n");
+    }
     // Requests do not carry the lane mode: APS5_SPANNED_WAVE selects it here as the driver does from it at device creation.
     if (std::getenv("APS5_SPANNED_WAVE") != nullptr && !request.request.target.spannedWaves) {
         request.request.target.spannedWaves = true;
@@ -731,7 +737,7 @@ int MakeRequest(int argc, char** argv) {
 int main(int argc, char** argv) {
     if (argc >= 2 && std::string(argv[1]) == "--make-request") return MakeRequest(argc, argv);
     if (argc < 2) {
-        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] [--prepare] [--materialize] [--code] [--maintenance8] [--robust2] [--wave-lds-memory-barriers] [--device-scope-lds-memory-barriers] [--bindless] [--prepare-only | --pipeline-only --pipeline-cache DIR [--expect-spv FILE | --no-reference]] <shader.req>...\n  --prepare replays the request as a prepared artifact\n  --materialize also captures the resources from the request memory and materializes the prepared invocation\n  --prepare-only plans and compiles without materializing runtime memory\n  --pipeline-only recompiles captured compute inputs and creates the native pipeline without guest resources or dispatch\n  --pipeline-cache selects an existing private cache directory; __GL_SHADER_DISK_CACHE_PATH must select a separate fresh empty directory\n  --expect-spv requires byte equality with an ordinary replay before device creation (one request); without it each\n    request needs the .fp sidecar APS5_PIPELINE_REQUESTS saved next to it, and its pipeline fingerprint must match\n  --no-reference skips that check (requests from older runs); a hit in the game's pipeline cache then proves the match\n  several requests share one device and cache; each success prints a PIPELINE-RESULT line\n  --fingerprint-variants prints the pipeline fingerprint components of each way to materialize a request against its .fp\n    (--describe adds the values: specialization constants, bindings)\n  --native-target replaces a captured compute target with this device's (requests from builds with another target) and names the fields that differed\n  --bindless (or APS5_BINDLESS_IMAGES=1) compiles table images through the bindless descriptor heap; a device made for --pipeline-only enables it too\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set; shader_<address>.prepare.req holds a request whose preparation failed before any resource capture, so replay it with --prepare\n");
+        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] [--prepare] [--materialize] [--code] [--maintenance8] [--robust2] [--wave-lds-memory-barriers] [--device-scope-lds-memory-barriers] [--bindless] [--prepare-only | --pipeline-only --pipeline-cache DIR [--expect-spv FILE | --no-reference]] <shader.req>...\n  --prepare replays the request as a prepared artifact\n  --materialize also captures the resources from the request memory and materializes the prepared invocation\n  --prepare-only plans and compiles without materializing runtime memory\n  --pipeline-only recompiles captured compute inputs and creates the native pipeline without guest resources or dispatch\n  --pipeline-cache selects an existing private cache directory; __GL_SHADER_DISK_CACHE_PATH must select a separate fresh empty directory\n  --expect-spv requires byte equality with an ordinary replay before device creation (one request); without it each\n    request needs the .fp sidecar APS5_PIPELINE_REQUESTS saved next to it, and its pipeline fingerprint must match\n  --no-reference skips that check (requests from older runs); a hit in the game's pipeline cache then proves the match\n  several requests share one device and cache; each success prints a PIPELINE-RESULT line\n  --fingerprint-variants prints the pipeline fingerprint components of each way to materialize a request against its .fp\n    (--describe adds the values: specialization constants, bindings)\n  --new-path-resolved sets the target's newPathResolved field (the driver's resolved twin)\n  --native-target replaces a captured compute target with this device's (requests from builds with another target) and names the fields that differed\n  --bindless (or APS5_BINDLESS_IMAGES=1) compiles table images through the bindless descriptor heap; a device made for --pipeline-only enables it too\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set; shader_<address>.prepare.req holds a request whose preparation failed before any resource capture, so replay it with --prepare\n");
         return 2;
     }
     for (int i = 1; i < argc; ++i) {
@@ -759,7 +765,7 @@ int main(int argc, char** argv) {
     std::unique_ptr<AgcDriver::VulkanDevice> device;
     int failures = 0;
     for (int i = 1; i < argc; ++i) {
-        if (std::string(argv[i]) == "--pipeline-only" || std::string(argv[i]) == "--no-reference" || std::string(argv[i]) == "--fingerprint-variants" || std::string(argv[i]) == "--describe" || std::string(argv[i]) == "--native-target" || std::string(argv[i]) == "--bindless") continue;
+        if (std::string(argv[i]) == "--pipeline-only" || std::string(argv[i]) == "--no-reference" || std::string(argv[i]) == "--fingerprint-variants" || std::string(argv[i]) == "--describe" || std::string(argv[i]) == "--native-target" || std::string(argv[i]) == "--new-path-resolved" || std::string(argv[i]) == "--bindless") continue;
         if (std::string(argv[i]) == "--pipeline-cache" || std::string(argv[i]) == "--expect-spv") {
             ++i;
             continue;
