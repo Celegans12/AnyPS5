@@ -217,6 +217,34 @@ void MirrorDeviceTests(const AgcDriver::Graphics::Context& context) {
     table.Release(context.device);
 }
 
+void SerialMemoTests(const AgcDriver::Graphics::Context& context) {
+    using Cover = DevicePageTable::Cover;
+    std::uint64_t version = 1;
+    std::vector<Range> imports{MakeRange(ImportBase, ImportBase + 4 * Page, ImportDevice)};
+    DevicePageTable table([&](const AgcDriver::Graphics::Context& built) {
+        AgcDriver::Graphics::HostImportSnapshot snapshot;
+        snapshot.device = built.device;
+        snapshot.ranges = imports;
+        return snapshot;
+    }, [&](VkDevice) { return version; });
+    const std::vector<Range> inside{MakeRange(ImportBase + Page, ImportBase + 2 * Page, ImportDevice + Page)};
+    const std::vector<Range> outside{MakeRange(ImportBase + 5 * Page, ImportBase + 6 * Page, ImportDevice + 5 * Page)};
+    Expect(table.Covers(7, inside) == Cover::Missing && table.Totals().compares == 0, "a table never built covered a build or compared it");
+    static_cast<void>(table.Refresh(context));
+    Expect(table.Covers(7, inside) == Cover::Covered && table.Totals().compares == 1, "the first use of a space serial was not compared");
+    Expect(table.Covers(7, inside) == Cover::Covered && table.Totals().compares == 1 && table.Totals().serialHits == 1, "a second use of the same space serial compared again");
+    Expect(table.Covers(8, outside) == Cover::Missing && table.Totals().compares == 2, "another space serial was served from the memo");
+    Expect(table.Covers(0, inside) == Cover::Covered && table.Covers(0, outside) == Cover::Missing && table.Totals().compares == 4, "a build without a space serial was served from the memo");
+    imports = {MakeRange(ImportBase + 4 * Page, ImportBase + 8 * Page, ImportDevice + 4 * Page)};
+    ++version;
+    static_cast<void>(table.Refresh(context));
+    Expect(table.Covers(7, inside) == Cover::Missing && table.Covers(8, outside) == Cover::Covered && table.Totals().compares == 6, "a new table version kept the old version's covers");
+    const auto hits = table.Totals().coverHits;
+    Expect(hits[static_cast<std::size_t>(Cover::Covered)] == 4 && hits[static_cast<std::size_t>(Cover::Missing)] == 4, "the cover counts are wrong");
+    table.Release(context.device);
+    Expect(table.Covers(8, outside) == Cover::Missing, "a released table served a memoized cover");
+}
+
 }
 
 int main() {
@@ -231,6 +259,7 @@ int main() {
         }
         DeviceTests(device->graphicsContext());
         MirrorDeviceTests(device->graphicsContext());
+        SerialMemoTests(device->graphicsContext());
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;

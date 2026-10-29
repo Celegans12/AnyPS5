@@ -5751,9 +5751,10 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
             auto& table = NewPath::DeviceTable();
             if (table.Stale(context.device)) static_cast<void>(table.Refresh(context));
             NewPath::CostLap(NewPath::CostStep::Route);
-            const auto ranges = resources.AddressTableRanges();
+            const auto deferred = resources.DeferredAddressTable();
+            const auto ranges = deferred.has_value() ? nullptr : resources.AddressTableRanges();
             NewPath::CostLap(NewPath::CostStep::Ranges);
-            facts.tableCovers = table.Covers(ranges) == NewPath::DevicePageTable::Cover::Covered;
+            facts.tableCovers = (deferred.has_value() ? table.Covers(deferred->serial, deferred->ranges) : table.Covers(ranges)) == NewPath::DevicePageTable::Cover::Covered;
             NewPath::CostLap(NewPath::CostStep::Compare);
         }
         if (NewPath::NoteEmit(*emit, facts).route == NewPath::Route::NewPath) {

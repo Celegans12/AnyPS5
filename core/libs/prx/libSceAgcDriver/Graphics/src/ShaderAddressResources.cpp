@@ -228,6 +228,13 @@ std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>> ShaderResour
     return bda != nullptr && usesBda ? bda->Ranges() : nullptr;
 }
 
+std::optional<ShaderResources::DeferredTableView> ShaderResources::DeferredAddressTable() const {
+    if (!addressTableDeferred || !usesBda) return std::nullopt;
+    const auto cached = guestMemory.CachedAddressTable();
+    if (!cached.has_value() || cached->serial == 0 || cached->ranges == nullptr) return std::nullopt;
+    return DeferredTableView{cached->serial, *cached->ranges};
+}
+
 VkDescriptorBufferInfo ShaderResources::descriptor(Allocation& allocation) {
     if (allocation.guest) return guestMemory.Descriptor(allocation.address, allocation.size, allocation.adjustment);
     if (allocation.role == ShaderRecompiler::DescriptorRole::GuestBuffers) {

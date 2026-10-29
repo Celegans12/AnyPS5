@@ -11,6 +11,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 #include <span>
 #include <vector>
 
@@ -40,6 +41,8 @@ public:
         std::uint64_t outlived = 0;
         std::uint64_t records = 0;
         std::array<std::uint64_t, 4> coverHits{};
+        std::uint64_t serialHits = 0;
+        std::uint64_t compares = 0;
     };
 
     enum class Cover : std::uint8_t { Covered, Missing, OtherAddress, Narrower };
@@ -62,6 +65,7 @@ public:
     [[nodiscard]] std::size_t PooledRecords() const;
 
     [[nodiscard]] Cover Covers(const std::shared_ptr<const std::vector<Range>>& build);
+    [[nodiscard]] Cover Covers(std::uint64_t serial, std::span<const Range> build);
     [[nodiscard]] static Cover Compare(std::span<const Range> table, std::span<const Range> build, const Range** failed = nullptr, std::uint64_t* failedAt = nullptr);
     // The imports (sorted, disjoint) with the mirrors added where no import maps: a mirror's bytes
     // that an import also maps are left to the import. Sorted and disjoint.
@@ -72,6 +76,7 @@ private:
     [[nodiscard]] std::vector<Range> piecesLocked(std::uint64_t begin, std::uint64_t end) const;
 
     [[nodiscard]] std::uint64_t mirrorVersionOf(VkDevice device) const;
+    [[nodiscard]] Cover compareLocked(std::span<const Range> build);
 
     ImportSource imports;
     VersionSource version;
@@ -101,6 +106,8 @@ private:
     };
     std::array<CoverMemo, 16> coverMemo{};
     std::size_t coverNext = 0;
+    std::unordered_map<std::uint64_t, Cover> serialMemo;
+    std::uint64_t serialMemoGeneration = 0;
     std::size_t reportedFailures = 0;
 };
 

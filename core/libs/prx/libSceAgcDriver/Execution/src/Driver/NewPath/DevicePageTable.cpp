@@ -119,17 +119,48 @@ DevicePageTable::Cover DevicePageTable::Covers(const std::shared_ptr<const std::
             return memo.cover;
         }
     }
+    const auto cover = compareLocked(*build);
+    coverMemo[coverNext] = {build, generation, cover};
+    coverNext = (coverNext + 1) % coverMemo.size();
+    return cover;
+}
+
+DevicePageTable::Cover DevicePageTable::Covers(std::uint64_t serial, std::span<const Range> build) {
+    std::lock_guard lock(mutex);
+    if (!built) {
+        ++counts.coverHits[static_cast<std::size_t>(Cover::Missing)];
+        return Cover::Missing;
+    }
+    if (serialMemoGeneration != generation) {
+        serialMemo.clear();
+        serialMemoGeneration = generation;
+    }
+    if (serial != 0) {
+        if (const auto found = serialMemo.find(serial); found != serialMemo.end()) {
+            ++counts.serialHits;
+            ++counts.coverHits[static_cast<std::size_t>(found->second)];
+            return found->second;
+        }
+    }
+    const auto cover = compareLocked(build);
+    if (serial != 0) {
+        if (serialMemo.size() >= 4096) serialMemo.clear();
+        serialMemo.emplace(serial, cover);
+    }
+    return cover;
+}
+
+DevicePageTable::Cover DevicePageTable::compareLocked(std::span<const Range> build) {
+    ++counts.compares;
     const Range* failed = nullptr;
     std::uint64_t failedAt = 0;
-    const auto cover = Compare(tableRanges, *build, &failed, &failedAt);
+    const auto cover = Compare(tableRanges, build, &failed, &failedAt);
     if (cover != Cover::Covered && failed != nullptr && reportedFailures < 12) {
         ++reportedFailures;
         static constexpr const char* names[] = {"covered", "missing", "other address", "narrower"};
         const auto near = std::upper_bound(tableRanges.begin(), tableRanges.end(), failedAt, [](std::uint64_t value, const Range& entry) { return value < entry.end; });
-        std::fprintf(stderr, "[newpath] F4 %s at 0x%llx: build range 0x%llx-0x%llx (device 0x%llx, permissions %u) of %zu; next table entry %s0x%llx-0x%llx (device 0x%llx, permissions %u)\n", names[static_cast<std::size_t>(cover)], static_cast<unsigned long long>(failedAt), static_cast<unsigned long long>(failed->begin), static_cast<unsigned long long>(failed->end), static_cast<unsigned long long>(failed->deviceAddress), static_cast<unsigned>(failed->permissions), build->size(), near == tableRanges.end() ? "none " : "", static_cast<unsigned long long>(near != tableRanges.end() ? near->begin : 0), static_cast<unsigned long long>(near != tableRanges.end() ? near->end : 0), static_cast<unsigned long long>(near != tableRanges.end() ? near->deviceAddress : 0), static_cast<unsigned>(near != tableRanges.end() ? near->permissions : 0));
+        std::fprintf(stderr, "[newpath] F4 %s at 0x%llx: build range 0x%llx-0x%llx (device 0x%llx, permissions %u) of %zu; next table entry %s0x%llx-0x%llx (device 0x%llx, permissions %u)\n", names[static_cast<std::size_t>(cover)], static_cast<unsigned long long>(failedAt), static_cast<unsigned long long>(failed->begin), static_cast<unsigned long long>(failed->end), static_cast<unsigned long long>(failed->deviceAddress), static_cast<unsigned>(failed->permissions), build.size(), near == tableRanges.end() ? "none " : "", static_cast<unsigned long long>(near != tableRanges.end() ? near->begin : 0), static_cast<unsigned long long>(near != tableRanges.end() ? near->end : 0), static_cast<unsigned long long>(near != tableRanges.end() ? near->deviceAddress : 0), static_cast<unsigned>(near != tableRanges.end() ? near->permissions : 0));
     }
-    coverMemo[coverNext] = {build, generation, cover};
-    coverNext = (coverNext + 1) % coverMemo.size();
     ++counts.coverHits[static_cast<std::size_t>(cover)];
     return cover;
 }
@@ -225,6 +256,7 @@ void DevicePageTable::Release(VkDevice device) {
         tableRanges.clear();
         ++generation;
         coverMemo = {};
+        serialMemo.clear();
         tableLists = {};
         built = false;
         builtVersion = 0;
