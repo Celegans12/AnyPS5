@@ -56,7 +56,7 @@ public:
     [[nodiscard]] std::size_t PooledRecords() const;
 
     [[nodiscard]] Cover Covers(const std::shared_ptr<const std::vector<Range>>& build);
-    [[nodiscard]] static Cover Compare(std::span<const Range> table, std::span<const Range> build);
+    [[nodiscard]] static Cover Compare(std::span<const Range> table, std::span<const Range> build, const Range** failed = nullptr, std::uint64_t* failedAt = nullptr);
     [[nodiscard]] static std::vector<Range> Overlay(std::span<const Range> base, std::span<const Range> resident, std::uint64_t begin, std::uint64_t end);
 
 private:
@@ -86,6 +86,7 @@ private:
     };
     std::array<CoverMemo, 16> coverMemo{};
     std::size_t coverNext = 0;
+    std::size_t reportedFailures = 0;
 };
 
 DevicePageTable& DeviceTable();

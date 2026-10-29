@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/DevicePageTable.hpp"
 #include <algorithm>
+#include <cstdio>
 
 namespace AgcDriver::NewPath {
 
@@ -57,15 +58,20 @@ std::vector<Range> DevicePageTable::Overlay(std::span<const Range> base, std::sp
     return out;
 }
 
-DevicePageTable::Cover DevicePageTable::Compare(std::span<const Range> table, std::span<const Range> build) {
+DevicePageTable::Cover DevicePageTable::Compare(std::span<const Range> table, std::span<const Range> build, const Range** failed, std::uint64_t* failedAt) {
+    const auto fail = [&](const Range& range, std::uint64_t cursor, Cover cover) {
+        if (failed != nullptr) *failed = &range;
+        if (failedAt != nullptr) *failedAt = cursor;
+        return cover;
+    };
     for (const auto& range : build) {
         if (range.end <= range.begin) continue;
         auto cursor = range.begin;
         auto at = std::upper_bound(table.begin(), table.end(), cursor, [](std::uint64_t value, const Range& entry) { return value < entry.end; });
         while (cursor < range.end) {
-            if (at == table.end() || at->begin > cursor) return Cover::Missing;
-            if (at->deviceAddress + (cursor - at->begin) != range.deviceAddress + (cursor - range.begin)) return Cover::OtherAddress;
-            if ((at->permissions & range.permissions) != range.permissions) return Cover::Narrower;
+            if (at == table.end() || at->begin > cursor) return fail(range, cursor, Cover::Missing);
+            if (at->deviceAddress + (cursor - at->begin) != range.deviceAddress + (cursor - range.begin)) return fail(range, cursor, Cover::OtherAddress);
+            if ((at->permissions & range.permissions) != range.permissions) return fail(range, cursor, Cover::Narrower);
             cursor = std::min(range.end, at->end);
             ++at;
         }
@@ -85,7 +91,15 @@ DevicePageTable::Cover DevicePageTable::Covers(const std::shared_ptr<const std::
             return memo.cover;
         }
     }
-    const auto cover = Compare(tableRanges, *build);
+    const Range* failed = nullptr;
+    std::uint64_t failedAt = 0;
+    const auto cover = Compare(tableRanges, *build, &failed, &failedAt);
+    if (cover != Cover::Covered && failed != nullptr && reportedFailures < 12) {
+        ++reportedFailures;
+        static constexpr const char* names[] = {"covered", "missing", "other address", "narrower"};
+        const auto near = std::upper_bound(tableRanges.begin(), tableRanges.end(), failedAt, [](std::uint64_t value, const Range& entry) { return value < entry.end; });
+        std::fprintf(stderr, "[newpath] F4 %s at 0x%llx: build range 0x%llx-0x%llx (device 0x%llx, permissions %u) of %zu; next table entry %s0x%llx-0x%llx (device 0x%llx, permissions %u)\n", names[static_cast<std::size_t>(cover)], static_cast<unsigned long long>(failedAt), static_cast<unsigned long long>(failed->begin), static_cast<unsigned long long>(failed->end), static_cast<unsigned long long>(failed->deviceAddress), static_cast<unsigned>(failed->permissions), build->size(), near == tableRanges.end() ? "none " : "", static_cast<unsigned long long>(near != tableRanges.end() ? near->begin : 0), static_cast<unsigned long long>(near != tableRanges.end() ? near->end : 0), static_cast<unsigned long long>(near != tableRanges.end() ? near->deviceAddress : 0), static_cast<unsigned>(near != tableRanges.end() ? near->permissions : 0));
+    }
     coverMemo[coverNext] = {build, generation, cover};
     coverNext = (coverNext + 1) % coverMemo.size();
     ++counts.coverHits[static_cast<std::size_t>(cover)];
