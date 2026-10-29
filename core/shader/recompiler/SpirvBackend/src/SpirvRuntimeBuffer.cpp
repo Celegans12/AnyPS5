@@ -362,6 +362,8 @@ std::uint32_t directWordIndex(SpirvEmitterState& state, const MemoryResourceAcce
     return EmitAddU32(state, relative, base);
 }
 
+std::uint32_t byteBuffers(SpirvEmitterState& state);
+
 std::uint32_t readBuffer(SpirvValueEmitContext& context, const IrValue& instruction, std::uint32_t address, std::uint32_t bits, std::uint32_t enable = 0u) {
     if (context.Memory(instruction).gpuDescriptor) return EmitBdaRead(context, instruction, address, bits);
     auto& state = context.state;
@@ -390,18 +392,65 @@ std::uint32_t readBuffer(SpirvValueEmitContext& context, const IrValue& instruct
         return EmitAndConstant(state, value, bits == 32u ? 0xffffffffu : (1u << bits) - 1u);
     };
     const auto highShift = Binary(state, spv::OpISub, TypeU32(state), ConstantU32(state, 32u), shift);
-    if (!LoadsSelectable(state, access)) {
-        return EmitValueOrZeroIfCondition(state, inBounds, [&] {
-            const auto low = Binary(state, spv::OpShiftRightLogical, TypeU32(state), load(index), shift);
-            const auto high = EmitValueOrZeroIfCondition(state, unaligned, [&] { return Binary(state, spv::OpShiftLeftLogical, TypeU32(state), load(next), highShift); });
-            return combine(low, high);
-        });
-    }
-    const auto lowIndex = GuardedElementIndex(state, access, inBounds, index);
-    const auto highIndex = Select(state, TypeU32(state), both(state, inBounds, unaligned), next, lowIndex);
-    const auto low = Binary(state, spv::OpShiftRightLogical, TypeU32(state), load(lowIndex), shift);
-    const auto high = EmitValueOrZero(state, unaligned, Binary(state, spv::OpShiftLeftLogical, TypeU32(state), load(highIndex), highShift));
-    return EmitValueOrZero(state, inBounds, combine(low, high));
+    const auto dwords = [&] {
+        if (!LoadsSelectable(state, access)) {
+            return EmitValueOrZeroIfCondition(state, inBounds, [&] {
+                const auto low = Binary(state, spv::OpShiftRightLogical, TypeU32(state), load(index), shift);
+                const auto high = EmitValueOrZeroIfCondition(state, unaligned, [&] { return Binary(state, spv::OpShiftLeftLogical, TypeU32(state), load(next), highShift); });
+                return combine(low, high);
+            });
+        }
+        const auto lowIndex = GuardedElementIndex(state, access, inBounds, index);
+        const auto highIndex = Select(state, TypeU32(state), both(state, inBounds, unaligned), next, lowIndex);
+        const auto low = Binary(state, spv::OpShiftRightLogical, TypeU32(state), load(lowIndex), shift);
+        const auto high = EmitValueOrZero(state, unaligned, Binary(state, spv::OpShiftLeftLogical, TypeU32(state), load(highIndex), highShift));
+        return EmitValueOrZero(state, inBounds, combine(low, high));
+    };
+    // A sub-dword read whose dword ends past the binding: the driver binds a V#'s exact byte range (num_records, not
+    // rounded to a dword), so the uint view above has floor(range / 4) elements and the last 1..3 bytes of a buffer
+    // whose size is not a multiple of 4 read 0. The hardware range-checks the element (the caller's per-component
+    // check against num_records), not its dword: the component's bytes inside the binding read memory through the
+    // 8-bit view, a byte past the range reads 0. Compute only (the 8-bit view needs
+    // StorageBuffer8BitAccess); a read whose dwords fit takes the dword path above unchanged.
+    const auto bytes = bits != 32u ? byteBuffers(state) : 0u;
+    if (bytes == 0u) return dwords();
+    const auto value = dwords();
+    const auto u32 = TypeU32(state);
+    const auto boolean = TypeBool(state);
+    const auto element = ResourceForDescriptor(state, DescriptorBindingKind::Buffers, context.Memory(instruction).resource);
+    const auto block = state.module.AllocateId();
+    state.module.AddFunction(spv::OpAccessChain, TypeStorageBufferU8Pointer(state), block, bytes, ConstantU32(state, element));
+    const auto length = state.module.AllocateId();
+    state.module.AddFunction(spv::OpArrayLength, u32, length, block, 0u);
+    // The guest dword's first byte in the binding: (address & ~3) plus the binding's byte offset, whose low bits are
+    // the misalignment the dword path shifts by; the component starts (address & 3) bytes later.
+    const auto first = EmitAddU32(state, EmitAndConstant(state, address, ~3u), access.byteOffset);
+    const auto needed = EmitAddU32(state, first, EmitAndConstant(state, address, 3u));
+    auto tail = both(state, Unary(state, spv::OpLogicalNot, boolean, bounds), Binary(state, spv::OpULessThan, boolean, needed, length));
+    if (enable != 0u) tail = both(state, enable, tail);
+    // With robustBufferAccess2 the bytes load without a branch: a byte outside the read loads past the binding and reads 0.
+    const bool selectable = LoadsSelectable(state, access);
+    // The component's bytes from the one it starts at, each read through the 8-bit view; a byte past the guest dword
+    // stays 0 as in the dword path (a 16-bit component at byte 3 of its dword keeps only that byte).
+    const auto readTail = [&] {
+        auto word = ConstantU32(state, 0u);
+        for (std::uint32_t byte = 0; byte < bits / 8u; ++byte) {
+            const auto at = byte == 0u ? needed : EmitAddU32(state, needed, ConstantU32(state, byte));
+            auto inside = Binary(state, spv::OpULessThan, boolean, at, length);
+            if (byte != 0u) inside = both(state, inside, Binary(state, spv::OpULessThan, boolean, EmitAndConstant(state, address, 3u), ConstantU32(state, 4u - byte)));
+            if (selectable) inside = both(state, tail, inside);
+            const auto pointer = state.module.AllocateId();
+            state.module.AddFunction(spv::OpAccessChain, TypeStorageBufferU8ElementPointer(state), pointer, block, ConstantU32(state, 0u), Select(state, u32, inside, at, ConstantU32(state, selectable ? 0xfffffffeu : 0u)));
+            const auto loaded = state.module.AllocateId();
+            if (access.memoryAccess != 0u) state.module.AddFunction(spv::OpLoad, TypeU8(state), loaded, pointer, access.memoryAccess);
+            else state.module.AddFunction(spv::OpLoad, TypeU8(state), loaded, pointer);
+            const auto widened = EmitValueOrZero(state, inside, Unary(state, spv::OpUConvert, u32, loaded));
+            word = byte == 0u ? widened : EmitOrU32(state, word, Binary(state, spv::OpShiftLeftLogical, u32, widened, ConstantU32(state, byte * 8u)));
+        }
+        return word;
+    };
+    const auto tailValue = selectable ? readTail() : EmitValueOrZeroIfCondition(state, tail, readTail);
+    return Select(state, u32, tail, tailValue, value);
 }
 
 std::uint32_t byteBuffers(SpirvEmitterState& state) {
@@ -726,11 +775,15 @@ std::uint32_t genericFormattedLoad(SpirvValueEmitContext& context, const IrValue
         values[component] = EmitValueOrZeroIfCondition(state, Select(state, boolean, required[component], inBounds, ConstantBool(state, false)), [&] {
             const auto width = Select(state, u32, packed, constant(32u), bits[component]);
             const auto dword = equal(state, width, constant(32u));
+            // A bound buffer's narrower component reads at its own width, so the end of a binding whose size is not a
+            // multiple of 4 reads memory (readBuffer's sub-dword tail) instead of 0.
             const auto raw = spanRead ? spanRaw[component] : memory.gpuDescriptor
                 ? EmitValueIfElse(state, dword, u32, [&] { return readBuffer(context, instruction, addresses[component].guest, 32u); }, [&] {
                     return EmitBdaReadBytes(context, instruction, addresses[component].guest, Binary(state, spv::OpShiftRightLogical, u32, width, constant(3u)));
                 })
-                : Binary(state, spv::OpShiftRightLogical, u32, readBuffer(context, instruction, addresses[component].guest, 32u), Select(state, u32, dword, constant(0u), Binary(state, spv::OpShiftLeftLogical, u32, EmitAndConstant(state, addresses[component].guest, 3u), constant(3u))));
+                : EmitValueIfElse(state, dword, u32, [&] { return readBuffer(context, instruction, addresses[component].guest, 32u); }, [&] {
+                    return EmitValueIfElse(state, equal(state, width, constant(16u)), u32, [&] { return readBuffer(context, instruction, addresses[component].guest, 16u); }, [&] { return readBuffer(context, instruction, addresses[component].guest, 8u); });
+                });
             const auto bitOffset = Select(state, u32, packed, field(state, bitOffsets, component * 8u, 8u), constant(0u));
             const auto unsignedField = EmitBitFieldUExtract(state, raw, bitOffset, bits[component]);
             const auto signedField = state.module.AllocateId();
