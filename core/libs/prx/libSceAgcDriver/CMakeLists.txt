@@ -335,6 +335,8 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/NewPath/DevicePageTable.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/NewPath/Router.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/NewPath/ResolvedTwins.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/NewPath/DrawCensus.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/NewPath/DrawCensusHooks.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Lifecycle.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Memory/BufferCopy.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Memory/BufferFill.cpp
@@ -644,6 +646,17 @@ if(BUILD_TESTING)
     set_tests_properties(agc_newpath_emit PROPERTIES TIMEOUT 20)
     if(WIN32)
         set_tests_properties(agc_newpath_emit PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+
+    add_test_executable(agc_newpath_draw_census_tests tests/NewPathDrawCensus.cpp Execution/src/Driver/NewPath/DrawCensus.cpp)
+    target_include_directories(agc_newpath_draw_census_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/core/shader/recompiler)
+    target_link_libraries(agc_newpath_draw_census_tests PRIVATE libc)
+    configure_windows_unwind(agc_newpath_draw_census_tests)
+    add_test(NAME agc_newpath_draw_census COMMAND agc_newpath_draw_census_tests)
+    set_tests_properties(agc_newpath_draw_census PROPERTIES TIMEOUT 20)
+    if(WIN32)
+        set_tests_properties(agc_newpath_draw_census PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 
