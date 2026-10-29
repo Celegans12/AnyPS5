@@ -64,10 +64,13 @@ struct Options {
     std::filesystem::path frames;
     bool pace = true;
     bool strict = false;
+    bool exact = false;
+    std::size_t frameLimit = 0;
     std::chrono::milliseconds paceTimeout{10000};
     std::chrono::milliseconds memoryPaceTimeout{10000};
-    std::chrono::milliseconds releaseAfter{3};
+    std::chrono::milliseconds releaseAfter{50};
     std::chrono::milliseconds drainTimeout{10000};
+    std::chrono::seconds timeout{900};
     bool release = true;
     bool synthesize = true;
 };
@@ -125,6 +128,30 @@ public:
 private:
     Frames& frames;
 };
+
+[[noreturn]] void hardExit(int code) {
+    std::fflush(stdout);
+    std::fflush(stderr);
+#ifdef _WIN32
+    TerminateProcess(GetCurrentProcess(), static_cast<UINT>(code));
+#endif
+    std::_Exit(code);
+}
+
+void startWatchdog(std::chrono::seconds timeout) {
+    std::thread([timeout] {
+        const auto deadline = Clock::now() + timeout;
+        while (timeout.count() <= 0 || Clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            if (!AgcDriverFailed_nid_postfix()) continue;
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            std::fprintf(stderr, "agc_frame_replay: the driver failed; if it lost the GPU device (Vulkan result -4), the NVIDIA shader store may have been reset: check the game dictionary before the next game run; exiting without a driver shutdown\n");
+            hardExit(6);
+        }
+        std::fprintf(stderr, "agc_frame_replay: no result after %lld s (--timeout-s); exiting without a driver shutdown\n", static_cast<long long>(timeout.count()));
+        hardExit(4);
+    }).detach();
+}
 
 std::uint64_t headerNumber(const std::string& header, std::string_view key) {
     const auto quoted = "\"" + std::string(key) + "\":";
@@ -311,6 +338,7 @@ struct Replay {
     std::map<std::uint64_t, std::vector<const FrameMemoryChunk*>> groups;
     Skipped skipped;
     std::atomic<std::uint64_t> paceTimeouts{0};
+    std::atomic<std::uint64_t> memoryPaceTimeouts{0};
     std::atomic<std::uint64_t> staleRegistrations{0};
     std::atomic<std::uint64_t> failedRegistrations{0};
     std::atomic<std::uint64_t> submits{0};
@@ -345,21 +373,42 @@ struct Replay {
 
     void pace(const FrameCall& call) {
         if (!options.pace || !recording || !paced(call.kind) || call.accepted < call.completed) return;
-        if (stalled.load()) {
+        const bool memory = call.kind == FrameCallKind::Memory;
+        if (!memory && stalled.load()) {
             if (progress().second == stalledAt.load()) return;
             stalled.store(false);
         }
-        const auto inFlight = call.accepted - call.completed;
-        const bool memory = call.kind == FrameCallKind::Memory;
+        const auto inFlight = options.exact || memory ? 0 : call.accepted - call.completed;
         const auto began = Clock::now();
-        const auto deadline = began + (memory ? options.memoryPaceTimeout : options.paceTimeout);
+        const auto timeout = memory ? options.memoryPaceTimeout : options.paceTimeout;
+        auto lastCompleted = progress().second;
+        auto deadline = began + timeout;
+        auto quietSince = began;
         const auto waited = [&] { paceWaitedNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - began).count(); };
         while (true) {
             const auto [accepted, completed] = progress();
-            if (accepted - completed <= inFlight) return waited();
-            if (Clock::now() >= deadline) {
+            if (accepted - completed <= inFlight) {
+                if (options.exact && accepted == completed) AgcDriverWaitIdle_nid_postfix();
+                return waited();
+            }
+            const auto now = Clock::now();
+            if (completed != lastCompleted) {
+                lastCompleted = completed;
+                deadline = now + timeout;
+                quietSince = now;
+            } else if (!AgcDriverQuiescent_nid_postfix()) {
+                deadline = now + timeout;
+            }
+            if (now - quietSince >= (options.exact ? ExactQuiet : BlockedQuiet) && blockedOnWaits()) return waited();
+            if (now >= deadline) {
                 waited();
-                if (memory) return;
+                if (memory) {
+                    ++memoryPaceTimeouts;
+                    std::fprintf(stderr, "[frame-replay] memory pacing gave up at call %llu: no completion for %lld ms, serials %llu/%llu, the capture had %llu in flight\n", static_cast<unsigned long long>(call.ordinal),
+                                 static_cast<long long>(timeout.count()), static_cast<unsigned long long>(completed), static_cast<unsigned long long>(accepted), static_cast<unsigned long long>(inFlight));
+                    if (options.strict) throw std::runtime_error("frame replay: memory call " + std::to_string(call.ordinal) + " waited longer than the pacing timeout");
+                    return;
+                }
                 stalled.store(true);
                 stalledAt.store(completed);
                 std::fprintf(stderr, "[frame-replay] pacing gave up at call %llu (%s): serials %llu/%llu, the capture had %llu in flight\n", static_cast<unsigned long long>(call.ordinal),
@@ -370,6 +419,21 @@ struct Replay {
             }
             std::this_thread::sleep_for(std::chrono::microseconds(50));
         }
+    }
+
+    static constexpr auto ExactQuiet = std::chrono::milliseconds(50);
+    static constexpr auto BlockedQuiet = std::chrono::milliseconds(5);
+
+    bool blockedOnWaits() {
+        if (!AgcDriverQuiescent_nid_postfix()) return false;
+        std::lock_guard lock(memoryMutex);
+        std::array<AgcDriver::AwaitedWait, 64> awaited{};
+        const auto count = AgcDriverAwaitedWaits_nid_postfix(awaited.data(), awaited.size());
+        for (std::size_t slot = 0; slot < count; ++slot) {
+            const auto& wait = awaited[slot];
+            if (wait.address != 0 && (wait.function == 0 || !satisfies(wait, load(wait.address, wait.bytes == 8 ? 8 : 4)))) return true;
+        }
+        return false;
     }
 
     void execute(const FrameCall& call) {
@@ -515,7 +579,14 @@ struct Replay {
             }
             if (!released && options.synthesize) {
                 if (const auto value = satisfying(wait, load(wait.address, bytes))) {
+                    const auto before = load(wait.address, bytes);
                     std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(wait.address)), &*value, bytes);
+                    if (syntheticReleases.load() < 64) {
+                        const auto [accepted, completed] = progress();
+                        std::fprintf(stderr, "[frame-replay] synthesized 0x%llx: 0x%llx -> 0x%llx (function %u, reference 0x%llx, mask 0x%llx) at call %zu, serials %llu/%llu\n", static_cast<unsigned long long>(wait.address),
+                                     static_cast<unsigned long long>(before), static_cast<unsigned long long>(*value), wait.function, static_cast<unsigned long long>(wait.reference), static_cast<unsigned long long>(wait.mask), from,
+                                     static_cast<unsigned long long>(completed), static_cast<unsigned long long>(accepted));
+                    }
                     ++syntheticReleases;
                     released = true;
                 }
@@ -536,16 +607,20 @@ struct Replay {
         std::thread breaker([&] {
             if (!options.release) return;
             auto lastCompleted = progress().second;
+            auto lastSequenced = sequenced.load();
             auto lastProgress = Clock::now();
+            const auto quiet = options.exact ? std::max<std::chrono::milliseconds>(options.releaseAfter, ExactQuiet * 4) : options.releaseAfter;
             while (!finished.load()) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 const auto completed = progress().second;
-                if (completed != lastCompleted) {
+                const auto issued = sequenced.load();
+                if (completed != lastCompleted || issued != lastSequenced || !AgcDriverQuiescent_nid_postfix()) {
                     lastCompleted = completed;
+                    lastSequenced = issued;
                     lastProgress = Clock::now();
                     continue;
                 }
-                if (Clock::now() - lastProgress < options.releaseAfter) continue;
+                if (Clock::now() - lastProgress < quiet) continue;
                 releaseAwaited(calls, sequenced.load());
                 lastProgress = Clock::now();
             }
@@ -625,15 +700,20 @@ struct Replay {
 };
 
 int usage() {
-    std::fprintf(stderr, "usage: agc_frame_replay <capture directory> [--no-pace] [--no-release] [--release-after-ms <n>] [--strict]\n"
+    std::fprintf(stderr, "usage: agc_frame_replay <capture directory> [--no-pace] [--no-release] [--release-after-ms <n>] [--strict] [--exact] [--frame-limit <n>] [--timeout-s <n>]\n"
                          "                        [--dump <address>:<bytes>:<file>]...\n"
                          "  replays the driver calls and guest memory that APS5_FRAME_CAPTURE=<directory> recorded, through this\n"
                          "  build's AGC driver with no title running, and prints one JSON line with the frame times\n"
                          "  --no-pace           issues calls without waiting for the in-flight depth the title had\n"
                          "  --no-release        never copies recorded CPU stores early to release a GPU wait\n"
-                         "  --release-after-ms  milliseconds without a completion before awaited dwords are released (3)\n"
+                         "  --release-after-ms  milliseconds without a completion or a newly issued call before awaited dwords are released (50; at least 200 with --exact)\n"
                          "  --no-synthesize     releases a wait only with a value the capture recorded, never with its reference value\n"
                          "  --strict            fails on a pacing timeout or a failed registration inside the captured frames\n"
+                         "  --exact             waits for every earlier submission and its GPU work to complete before each submission, flip and\n"
+                         "                      memory delta,\n"
+                         "                      so the GPU work runs in one order (a reproducible baseline, slower than the title)\n"
+                         "  --frame-limit <n>   replays the calls through the n-th CPU flip, or the n-th suspend point when the title flips from the GPU\n"
+                         "  --timeout-s <n>     exits with code 4 when the replay has no result after n seconds (900; 0 waits forever)\n"
                          "  --dump              writes guest memory to a file after the replay (hexadecimal or decimal)\n"
                          "  --frames <dir>      writes each recorded and replayed display buffer as reference-<n>.bmp and replay-<n>.bmp\n");
     return 2;
@@ -730,7 +810,17 @@ int run(const Options& options) {
     for (auto call = calls.begin(); call != frameStart; ++call) replay.execute(*call);
     replay.recording = true;
     replay.startedAt = Clock::now();
-    if (frameStart != calls.end()) replay.runWindow(std::span(calls).subspan(static_cast<std::size_t>(frameStart - calls.begin()) + 1));
+    if (frameStart != calls.end()) {
+        auto window = std::span(calls).subspan(static_cast<std::size_t>(frameStart - calls.begin()) + 1);
+        if (options.frameLimit != 0) {
+            const bool cpuFlips = std::any_of(window.begin(), window.end(), [](const FrameCall& call) { return call.kind == FrameCallKind::Flip; });
+            const auto boundary = cpuFlips ? FrameCallKind::Flip : FrameCallKind::Suspend;
+            std::size_t boundaries = 0;
+            const auto cut = std::find_if(window.begin(), window.end(), [&](const FrameCall& call) { return call.kind == boundary && ++boundaries == options.frameLimit; });
+            if (cut != window.end()) window = window.first(static_cast<std::size_t>(cut - window.begin()) + 1);
+        }
+        replay.runWindow(window);
+    }
     if (frameStart == calls.end()) AgcDriverWaitIdle_nid_postfix();
     replay.endedAt = Clock::now();
     if (const auto failure = replay.frames.Failure()) std::rethrow_exception(failure);
@@ -749,9 +839,9 @@ int run(const Options& options) {
     std::sort(frameMs.begin(), frameMs.end());
     const auto percentile = [&](double fraction) { return frameMs.empty() ? 0.0 : frameMs[std::min(frameMs.size() - 1, static_cast<std::size_t>(fraction * static_cast<double>(frameMs.size())))]; };
     const auto seconds = std::chrono::duration<double>(replay.endedAt - replay.startedAt).count();
-    std::printf("{\"frames\":%zu,\"replay_s\":%.3f,\"fps\":%.3f,\"frame_ms\":{\"p50\":%.3f,\"p90\":%.3f,\"max\":%.3f,\"each\":[%s]},\"submits\":%llu,\"delta_mib\":%.1f,\"pace_timeouts\":%llu,\"pace_wait_s\":%.3f,\"stale_registrations\":%llu,\"failed_registrations\":%llu,\"skipped_mib\":%.1f,\"threads\":%zu,\"released_waits\":%llu,\"of_them_from_earlier_writes\":%llu,\"of_them_synthesized\":%llu,\"unfinished\":%llu,\"frames_compared\":%zu,\"pixels_identical\":%.6f,\"max_channel_diff\":%d,\"load_s\":%.3f}\n",
+    std::printf("{\"frames\":%zu,\"replay_s\":%.3f,\"fps\":%.3f,\"frame_ms\":{\"p50\":%.3f,\"p90\":%.3f,\"max\":%.3f,\"each\":[%s]},\"submits\":%llu,\"delta_mib\":%.1f,\"pace_timeouts\":%llu,\"memory_pace_timeouts\":%llu,\"pace_wait_s\":%.3f,\"stale_registrations\":%llu,\"failed_registrations\":%llu,\"skipped_mib\":%.1f,\"threads\":%zu,\"released_waits\":%llu,\"of_them_from_earlier_writes\":%llu,\"of_them_synthesized\":%llu,\"unfinished\":%llu,\"frames_compared\":%zu,\"pixels_identical\":%.6f,\"max_channel_diff\":%d,\"load_s\":%.3f}\n",
                 ready.size(), seconds, seconds > 0 ? static_cast<double>(ready.size()) / seconds : 0.0, percentile(0.5), percentile(0.9), frameMs.empty() ? 0.0 : frameMs.back(), frameList.c_str(),
-                static_cast<unsigned long long>(replay.submits.load()), static_cast<double>(replay.deltaBytes.load()) / (1024.0 * 1024.0), static_cast<unsigned long long>(replay.paceTimeouts.load()),
+                static_cast<unsigned long long>(replay.submits.load()), static_cast<double>(replay.deltaBytes.load()) / (1024.0 * 1024.0), static_cast<unsigned long long>(replay.paceTimeouts.load()), static_cast<unsigned long long>(replay.memoryPaceTimeouts.load()),
                 replay.paceWaitedSeconds(), static_cast<unsigned long long>(replay.staleRegistrations.load()), static_cast<unsigned long long>(replay.failedRegistrations.load()),
                 static_cast<double>(replay.skipped.bytes) / (1024.0 * 1024.0), replay.threads, static_cast<unsigned long long>(replay.earlyReleases.load()), static_cast<unsigned long long>(replay.lateReleases.load()),
                 static_cast<unsigned long long>(replay.syntheticReleases.load()),
@@ -771,6 +861,9 @@ int main(int argc, char** argv) {
         else if (argument == "--no-synthesize") options.synthesize = false;
         else if (argument == "--release-after-ms" && index + 1 < argc) options.releaseAfter = std::chrono::milliseconds(std::strtoll(argv[++index], nullptr, 10));
         else if (argument == "--strict") options.strict = true;
+        else if (argument == "--exact") options.exact = true;
+        else if (argument == "--frame-limit" && index + 1 < argc) options.frameLimit = static_cast<std::size_t>(std::strtoull(argv[++index], nullptr, 10));
+        else if (argument == "--timeout-s" && index + 1 < argc) options.timeout = std::chrono::seconds(std::strtoll(argv[++index], nullptr, 10));
         else if (argument == "--dump" && index + 1 < argc) options.dumps.push_back(parseDump(argv[++index]));
         else if (argument == "--frames" && index + 1 < argc) options.frames = argv[++index];
         else if (!argument.starts_with("-") && options.directory.empty()) options.directory = argument;
@@ -782,6 +875,7 @@ int main(int argc, char** argv) {
 #else
     unsetenv("APS5_FRAME_CAPTURE");
 #endif
+    startWatchdog(options.timeout);
     int code = 2;
     try {
         code = run(options);
@@ -792,7 +886,5 @@ int main(int argc, char** argv) {
     } catch (const std::exception& error) {
         std::fprintf(stderr, "agc_frame_replay: %s\n", error.what());
     }
-    std::fflush(stdout);
-    std::fflush(stderr);
-    std::_Exit(code);
+    hardExit(code);
 }
