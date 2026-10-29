@@ -207,7 +207,10 @@ FrameRecorder* FrameRecorder::Active() {
         const auto atBoundary = readNumber(std::getenv("APS5_FRAME_CAPTURE_AT_FLIP"), 0);
         const auto frames = readNumber(std::getenv("APS5_FRAME_CAPTURE_FRAMES"), DefaultFrames);
         if (frames == 0) throw std::runtime_error("frame capture: APS5_FRAME_CAPTURE_FRAMES must be at least 1");
-        return new FrameRecorder(directory, trigger != nullptr ? trigger : "", atBoundary, frames);
+        auto* created = new FrameRecorder(directory, trigger != nullptr ? trigger : "", atBoundary, frames);
+        created->checkpointFrame = readNumber(std::getenv("APS5_FRAME_CAPTURE_CHECKPOINT"), 0);
+        created->checkpointSubmit = readNumber(std::getenv("APS5_FRAME_CAPTURE_CHECKPOINT_SUBMIT"), 0);
+        return created;
     }();
     return recorder;
 }
@@ -308,6 +311,59 @@ void FrameRecorder::Suspend(const std::function<void()>& accept) {
 void FrameRecorder::PresentBuffer(const DisplayBuffer& buffer) {
     std::lock_guard lock(displayMutex);
     displayBuffers[buffer.address] = buffer;
+    lastPresented = buffer;
+    ++presents;
+}
+
+void FrameRecorder::writeFrameReference() {
+    std::optional<DisplayBuffer> buffer;
+    std::uint64_t presented = 0;
+    {
+        std::lock_guard lock(displayMutex);
+        buffer = lastPresented;
+        presented = presents;
+    }
+    if (!buffer) return;
+    try {
+        const auto pixels = ReadDisplayBuffer(*buffer);
+        const auto index = referenceIndex++;
+        writer->WriteReference(index, buffer->address, pixels);
+        auto call = make(FrameCallKind::DisplayBuffer);
+        call.ordinal = ++ordinal;
+        call.address = buffer->address;
+        call.values = {index, buffer->pixelFormat, buffer->width, buffer->height, buffer->tilingMode, buffer->pitchInPixel, buffer->dccAddress, buffer->dccClearColor, buffer->alignment, recordedFrames + 1, presented};
+        writer->WriteCall(call);
+    } catch (const std::exception& failure) {
+        warnings.push_back(std::string("no reference for a captured frame: ") + failure.what());
+    }
+}
+
+void FrameRecorder::writeCheckpoint() {
+    emitDelta();
+    if (state != State::Recording) return;
+    checkpointTaken = true;
+    if (!DriverDetail::Driver::Get().SettleForCapture(std::chrono::seconds(10))) warnings.push_back("storage images were still pending GPU results at the checkpoint");
+    std::vector<std::byte> bytes;
+    for (const auto& range : ranges) {
+        if (!range.readable) continue;
+        for (std::uint64_t at = 0; at < range.bytes; at += FrameCaptureWriter::BlockBytes) {
+            bytes.resize(static_cast<std::size_t>(std::min<std::uint64_t>(FrameCaptureWriter::BlockBytes, range.bytes - at)));
+            GuestMemory::ReadCommitted(range.address + at, bytes);
+            const auto known = blockHashes.find(range.address + at);
+            const auto hash = wideHash(bytes);
+            if (known != blockHashes.end() ? known->second == hash : AllZero(bytes)) continue;
+            writer->WriteCheckpoint(checkpointFrame, range.address + at, bytes);
+            ++checkpointBlocks;
+            checkpointBytes += bytes.size();
+        }
+    }
+    blockHashes.clear();
+    auto call = make(FrameCallKind::Checkpoint);
+    call.ordinal = ++ordinal;
+    std::tie(call.accepted, call.completed) = DriverDetail::Driver::Get().SerialProgress();
+    call.values = {checkpointFrame, checkpointSubmit};
+    writer->WriteCall(call);
+    std::fprintf(stderr, "[frame-capture] checkpoint in frame %llu after submit %llu: %llu blocks (%.1f MiB) differ from the snapshot\n", static_cast<unsigned long long>(checkpointFrame), static_cast<unsigned long long>(frameSubmits), static_cast<unsigned long long>(checkpointBlocks), static_cast<double>(checkpointBytes) / (1024.0 * 1024.0));
 }
 
 void FrameRecorder::writeReferenceFrames() {
@@ -321,11 +377,12 @@ void FrameRecorder::writeReferenceFrames() {
         warnings.push_back("no reference frames: the driver did not go idle after the last frame");
         return;
     }
-    std::uint64_t index = 0;
     for (const auto& [address, buffer] : presented) {
+        const auto index = referenceIndex;
         try {
             const auto pixels = ReadDisplayBuffer(buffer);
             writer->WriteReference(index, address, pixels);
+            ++referenceIndex;
         } catch (const std::exception& failure) {
             warnings.push_back(std::string("no reference frame for a display buffer: ") + failure.what());
             continue;
@@ -335,7 +392,6 @@ void FrameRecorder::writeReferenceFrames() {
         call.address = buffer.address;
         call.values = {index, buffer.pixelFormat, buffer.width, buffer.height, buffer.tilingMode, buffer.pitchInPixel, buffer.dccAddress, buffer.dccClearColor, buffer.alignment};
         writer->WriteCall(call);
-        ++index;
     }
 }
 
@@ -362,6 +418,7 @@ void FrameRecorder::recordLocked(FrameCall call, bool prologueCall, std::span<co
     std::tie(call.accepted, call.completed) = DriverDetail::Driver::Get().SerialProgress();
     writer->WriteCall(call);
     ++recordedCalls;
+    if (call.kind == FrameCallKind::Submit && ++frameSubmits == checkpointSubmit && checkpointFrame != 0 && recordedFrames + 1 == checkpointFrame && !checkpointTaken) writeCheckpoint();
 }
 
 std::vector<FrameRecorder::PrologueShader> FrameRecorder::prologueShaders(std::span<const Shader* const> shaders, bool registration) {
@@ -513,6 +570,9 @@ void FrameRecorder::FrameBoundary() {
     std::lock_guard lock(mutex);
     ++boundaries;
     if (state == State::Recording) {
+        writeFrameReference();
+        if (checkpointFrame != 0 && recordedFrames + 1 == checkpointFrame && !checkpointTaken) writeCheckpoint();
+        frameSubmits = 0;
         if (++recordedFrames >= frames) finish();
         return;
     }
@@ -753,6 +813,12 @@ void FrameRecorder::snapshot(const Range& range) {
         if (range.kind == FrameRangeKind::Section && (range.access & FrameRangeAccess::Writable) != 0) {
             for (std::size_t page = 0; page < bytes.size(); page += 4096) sectionPageHashes[range.address + at + page] = wideHash(std::span(bytes).subspan(page, std::min<std::size_t>(4096, bytes.size() - page)));
         }
+        if (checkpointFrame != 0) {
+            for (std::size_t block = 0; block < bytes.size(); block += FrameCaptureWriter::BlockBytes) {
+                const auto length = std::min<std::size_t>(FrameCaptureWriter::BlockBytes, bytes.size() - block);
+                blockHashes[range.address + at + block] = wideHash(std::span(bytes).subspan(block, length));
+            }
+        }
         snapshotBytes += writer->WriteSnapshot(range.address + at, bytes);
     }
 }
@@ -863,6 +929,7 @@ std::string FrameRecorder::header() const {
     text += std::string(",\"dirty\":") + (APS5_TRACE_DIRTY < 0 ? "null" : APS5_TRACE_DIRTY != 0 ? "true" : "false");
     text += ",\"arena_base\":" + std::to_string(arenaBase) + ",\"arena_bytes\":" + std::to_string(arenaBytes);
     text += ",\"gds_address\":" + std::to_string(gdsAddress);
+    text += ",\"checkpoint_frame\":" + std::to_string(checkpointFrame) + ",\"checkpoint_submit\":" + std::to_string(checkpointSubmit) + ",\"checkpoint_blocks\":" + std::to_string(checkpointBlocks);
     text += ",\"aliased_pages\":" + std::to_string(aliasedPages) + ",\"alias_groups\":" + std::to_string(aliasGroups);
     text += ",\"start_boundary\":" + std::to_string(startBoundary) + ",\"frames\":" + std::to_string(recordedFrames);
     text += ",\"calls\":" + std::to_string(recordedCalls) + ",\"prologue_calls\":" + std::to_string(prologueCallCount);

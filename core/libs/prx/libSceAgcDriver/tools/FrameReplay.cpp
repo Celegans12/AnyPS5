@@ -66,6 +66,7 @@ struct Options {
     bool strict = false;
     bool exact = false;
     std::size_t frameLimit = 0;
+    std::filesystem::path checkpointReport;
     std::chrono::milliseconds paceTimeout{10000};
     std::chrono::milliseconds memoryPaceTimeout{10000};
     std::chrono::milliseconds releaseAfter{50};
@@ -476,6 +477,7 @@ struct Replay {
             } else if (!AgcDriverQuiescent_nid_postfix()) {
                 deadline = now + timeout;
             }
+            if (memory && deltaReleasesWait(call)) return waited();
             if (now - quietSince >= (options.exact ? ExactQuiet : BlockedQuiet) && blockedOnWaits()) return waited();
             if (now >= deadline) {
                 waited();
@@ -500,6 +502,21 @@ struct Replay {
 
     static constexpr auto ExactQuiet = std::chrono::milliseconds(50);
     static constexpr auto BlockedQuiet = std::chrono::milliseconds(5);
+
+    bool deltaReleasesWait(const FrameCall& call) {
+        const auto found = groups.find(call.values.at(0));
+        if (found == groups.end()) return false;
+        std::array<AgcDriver::AwaitedWait, 64> awaited{};
+        const auto count = AgcDriverAwaitedWaits_nid_postfix(awaited.data(), awaited.size());
+        for (std::size_t slot = 0; slot < count; ++slot) {
+            const auto& wait = awaited[slot];
+            if (wait.address == 0) continue;
+            for (const auto* chunk : found->second) {
+                if (chunk->address <= wait.address && wait.address < chunk->address + chunk->bytes) return true;
+            }
+        }
+        return false;
+    }
 
     bool blockedOnWaits() {
         if (!AgcDriverQuiescent_nid_postfix()) return false;
@@ -566,6 +583,7 @@ struct Replay {
             AgcDriverSuspendPoint_nid_postfix();
             return;
         case FrameCallKind::AliasedPages:
+        case FrameCallKind::Checkpoint:
             return;
         case FrameCallKind::QueueStates: {
             std::vector<std::uint32_t> words;
@@ -668,6 +686,11 @@ struct Replay {
                     const auto before = load(wait.address, bytes);
                     std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(wait.address)), &*value, bytes);
                     if (syntheticReleases.load() < 64) {
+                        for (std::size_t other = 0; other < count; ++other) {
+                            const auto& waiting = awaited[other];
+                            if (waiting.address == 0) continue;
+                            std::fprintf(stderr, "[frame-replay]   awaited 0x%llx == 0x%llx (function %u) holds 0x%llx\n", static_cast<unsigned long long>(waiting.address), static_cast<unsigned long long>(waiting.reference), waiting.function, static_cast<unsigned long long>(load(waiting.address, waiting.bytes == 8 ? 8 : 4)));
+                        }
                         const auto [accepted, completed] = progress();
                         std::fprintf(stderr, "[frame-replay] synthesized 0x%llx: 0x%llx -> 0x%llx (function %u, reference 0x%llx, mask 0x%llx) at call %zu, serials %llu/%llu\n", static_cast<unsigned long long>(wait.address),
                                      static_cast<unsigned long long>(before), static_cast<unsigned long long>(*value), wait.function, static_cast<unsigned long long>(wait.reference), static_cast<unsigned long long>(wait.mask), from,
@@ -798,7 +821,10 @@ int usage() {
                          "  --exact             waits for every earlier submission and its GPU work to complete before each submission, flip and\n"
                          "                      memory delta,\n"
                          "                      so the GPU work runs in one order (a reproducible baseline, slower than the title)\n"
-                         "  --frame-limit <n>   replays the calls through the n-th CPU flip, or the n-th suspend point when the title flips from the GPU\n"
+                         "  --frame-limit <n>   replays the calls through the n-th CPU flip, or the n-th suspend point when the title flips from the GPU,\n"
+                         "                      and compares the display buffer with the title's image at that frame\n"
+                         "  --checkpoint <csv>  replays up to the checkpoint of a capture made with APS5_FRAME_CAPTURE_CHECKPOINT=<frame> and lists\n"
+                         "                      the 64 KiB blocks whose replayed bytes differ from the title's at that point; their replayed bytes go to <csv>.replay.bin\n"
                          "  --timeout-s <n>     exits with code 4 when the replay has no result after n seconds (900; 0 waits forever)\n"
                          "  --dump              writes guest memory to a file after the replay (hexadecimal or decimal)\n"
                          "  --frames <dir>      writes each recorded and replayed display buffer as reference-<n>.bmp and replay-<n>.bmp\n");
@@ -861,6 +887,9 @@ FrameCheck compareFrames(const FrameCaptureReader& reader, const Options& option
             continue;
         }
         const auto reference = reader.Read(*chunk);
+        const bool perFrame = call.values.size() >= 11;
+        if (perFrame && !options.frames.empty()) writeFrame(options.frames / ("game-frame-" + std::to_string(call.values[9]) + ".bmp"), buffer, reference);
+        if (perFrame != (options.frameLimit != 0) || (perFrame && call.values[9] != options.frameLimit)) continue;
         const auto replayed = AgcDriver::ReadDisplayBuffer(buffer);
         ++check.compared;
         std::size_t same = 0;
@@ -882,6 +911,41 @@ FrameCheck compareFrames(const FrameCaptureReader& reader, const Options& option
         writeFrame(options.frames / ("replay-" + index + ".bmp"), buffer, replayed);
     }
     return check;
+}
+
+void compareCheckpoint(const FrameCaptureReader& reader, const std::filesystem::path& path, const Skipped& skipped) {
+    AgcDriverWaitIdle_nid_postfix();
+    if (!AgcDriverSettle_nid_postfix()) std::fprintf(stderr, "[frame-replay] storage images were still pending at the checkpoint\n");
+    std::ofstream report(path, std::ios::trunc);
+    auto blocksPath = path;
+    blocksPath += ".replay.bin";
+    std::ofstream replayed(blocksPath, std::ios::binary | std::ios::trunc);
+    report << "address,bytes,differing_bytes,first_difference\n";
+    std::uint64_t blocks = 0, differing = 0, differingBytes = 0;
+    for (const auto& chunk : reader.Chunks()) {
+        if (chunk.kind != FrameMemoryKind::Checkpoint || skipped.Overlaps(chunk)) continue;
+        ++blocks;
+        const auto expected = reader.Read(chunk);
+        auto* const pointer = reinterpret_cast<const std::byte*>(static_cast<std::uintptr_t>(chunk.address));
+        GuestArena::GuestArenaPrepareHostRead_nid_no_patch(pointer, static_cast<std::size_t>(chunk.bytes));
+        std::uint64_t count = 0;
+        std::int64_t first = -1;
+        for (std::size_t at = 0; at < expected.size(); ++at) {
+            if (pointer[at] == expected[at]) continue;
+            if (first < 0) first = static_cast<std::int64_t>(at);
+            ++count;
+        }
+        if (count == 0) continue;
+        ++differing;
+        differingBytes += count;
+        const std::array<std::uint64_t, 2> head{chunk.address, chunk.bytes};
+        replayed.write(reinterpret_cast<const char*>(head.data()), sizeof(head));
+        replayed.write(reinterpret_cast<const char*>(pointer), static_cast<std::streamsize>(chunk.bytes));
+        char line[96];
+        std::snprintf(line, sizeof(line), "0x%llx,%llu,%llu,%lld\n", static_cast<unsigned long long>(chunk.address), static_cast<unsigned long long>(chunk.bytes), static_cast<unsigned long long>(count), static_cast<long long>(first));
+        report << line;
+    }
+    std::fprintf(stderr, "[frame-replay] checkpoint: %llu of %llu changed blocks differ from the title (%.1f MiB of bytes), listed in %s\n", static_cast<unsigned long long>(differing), static_cast<unsigned long long>(blocks), static_cast<double>(differingBytes) / (1024.0 * 1024.0), path.string().c_str());
 }
 
 int run(const Options& options) {
@@ -913,7 +977,11 @@ int run(const Options& options) {
     replay.startedAt = Clock::now();
     if (frameStart != calls.end()) {
         auto window = std::span(calls).subspan(static_cast<std::size_t>(frameStart - calls.begin()) + 1);
-        if (options.frameLimit != 0) {
+        if (!options.checkpointReport.empty()) {
+            const auto cut = std::find_if(window.begin(), window.end(), [](const FrameCall& call) { return call.kind == FrameCallKind::Checkpoint; });
+            if (cut == window.end()) throw std::runtime_error("frame replay: --checkpoint needs a capture made with APS5_FRAME_CAPTURE_CHECKPOINT");
+            window = window.first(static_cast<std::size_t>(cut - window.begin()));
+        } else if (options.frameLimit != 0) {
             const bool cpuFlips = std::any_of(window.begin(), window.end(), [](const FrameCall& call) { return call.kind == FrameCallKind::Flip; });
             const auto boundary = cpuFlips ? FrameCallKind::Flip : FrameCallKind::Suspend;
             std::size_t boundaries = 0;
@@ -923,10 +991,12 @@ int run(const Options& options) {
         replay.runWindow(window);
     }
     if (frameStart == calls.end()) AgcDriverWaitIdle_nid_postfix();
+    if (!options.checkpointReport.empty()) compareCheckpoint(reader, options.checkpointReport, replay.skipped);
     replay.endedAt = Clock::now();
     if (const auto failure = replay.frames.Failure()) std::rethrow_exception(failure);
     FrameCheck check;
     if (replay.unfinished == 0) {
+        if (!AgcDriverSettle_nid_postfix()) std::fprintf(stderr, "[frame-replay] storage images were still pending before the comparison\n");
         for (const auto& dump : options.dumps) writeDump(dump);
         check = compareFrames(reader, options);
     } else if (!options.dumps.empty()) {
@@ -945,7 +1015,7 @@ int run(const Options& options) {
     gap("failed-registrations", replay.failedRegistrations.load() != 0);
     gap("pacing-timeouts", replay.paceTimeouts.load() != 0 || replay.memoryPaceTimeouts.load() != 0);
     gap("synthesized-waits", replay.syntheticReleases.load() != 0);
-    gap("partial-window", options.frameLimit != 0);
+    gap("partial-window", options.frameLimit != 0 && check.compared == 0);
     gap("no-reference-frames", check.compared == 0 && options.dumps.empty());
     gap("missing-reference-frames", check.missing != 0);
     gap("pixels-differ", check.compared != 0 && check.identical < 1.0);
@@ -984,6 +1054,7 @@ int main(int argc, char** argv) {
         else if (argument == "--release-after-ms" && index + 1 < argc) options.releaseAfter = std::chrono::milliseconds(std::strtoll(argv[++index], nullptr, 10));
         else if (argument == "--strict") options.strict = true;
         else if (argument == "--exact") options.exact = true;
+        else if (argument == "--checkpoint" && index + 1 < argc) options.checkpointReport = argv[++index];
         else if (argument == "--frame-limit" && index + 1 < argc) options.frameLimit = static_cast<std::size_t>(std::strtoull(argv[++index], nullptr, 10));
         else if (argument == "--timeout-s" && index + 1 < argc) options.timeout = std::chrono::seconds(std::strtoll(argv[++index], nullptr, 10));
         else if (argument == "--dump" && index + 1 < argc) options.dumps.push_back(parseDump(argv[++index]));
