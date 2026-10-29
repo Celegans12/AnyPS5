@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ResidencyDriver.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidencyGuest.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidencySession.hpp"
+#include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/DevicePageTable.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "VulkanTestDevice.hpp"
@@ -16,6 +17,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -419,11 +421,192 @@ int SessionReentry() {
     return 0;
 }
 
+void Fence(const Context& context, VkCommandBuffer commands) {
+    const VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_HOST_READ_BIT};
+    context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+}
+
+std::optional<ShaderRecompiler::BdaAbi::Range> TableEntry(const Context& context, std::uint64_t address) {
+    auto& table = AgcDriver::NewPath::DeviceTable();
+    if (table.Stale(context.device)) static_cast<void>(table.Refresh(context));
+    for (const auto& range : table.Ranges()) {
+        if (range.begin <= address && address < range.end) return range;
+    }
+    return std::nullopt;
+}
+
+bool MapsMirror(const Context& context, std::uint64_t address) {
+    const auto entry = TableEntry(context, address);
+    return entry && (entry->reserved & ShaderRecompiler::BdaAbi::RangeMirrored) != 0;
+}
+
+int SessionWindow() {
+    try {
+        auto device = OpenVulkanTestDevice();
+        if (!device) return VulkanTestSkipped;
+        const auto context = device->graphicsContext();
+        if (Recorder::Active() == nullptr) throw std::runtime_error("no active recorder");
+        GuestPages guest;
+        {
+            const std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            Expect(HostImportFor(context, guest.Address(0), Bytes) != nullptr, "the guest pages cannot be imported");
+        }
+        EnsureResidency(context);
+        auto* driver = ResidencyDriver::Active();
+        Expect(ResidencyActive() && driver != nullptr, "window: the residency session did not start");
+        if (driver == nullptr) return 1;
+        {
+            const std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            static_cast<void>(AgcDriver::NewPath::DeviceTable().Refresh(context));
+            const std::array<std::pair<std::uint64_t, std::uint64_t>, 2> reads{{{guest.Address(0), 4096}, {guest.Address(2), 4096}}};
+            NoteStagedRegions(reads, {});
+            driver->Manager().CatchUp(guest.Address(0), ResidencyPageBytes);
+            driver->Manager().CatchUp(guest.Address(2), ResidencyPageBytes);
+            const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> touch{{{guest.Address(4), 4096}}};
+            NoteStagedRegions(touch, {});
+            device->SubmitRecorded(false);
+            device->WaitIdle();
+        }
+        Expect(MapsMirror(context, guest.Address(0)) && MapsMirror(context, guest.Address(2)), "window: the caught-up pages are not mapped to their mirrors (precondition)");
+        {
+            const std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> writes{{{guest.Address(0) + 256, 512}}};
+            NoteStagedRegions({}, writes);
+        }
+        Expect(!MapsMirror(context, guest.Address(0) + 256), "window: after an old-path write note (its copy-back about to be recorded) the table still maps the page to its mirror");
+        Expect(TableEntry(context, guest.Address(0) + 256).has_value(), "window: the written page left the table instead of mapping its import");
+        Expect(MapsMirror(context, guest.Address(2)), "window: a page nobody wrote left the table");
+        reinterpret_cast<volatile std::uint32_t*>(guest.Words(2))[16] = 0x5eed5eedu;
+        Expect(!MapsMirror(context, guest.Address(2)), "window: after a CPU store into a current page the table still maps it to the mirror");
+        ReleaseResidency(context.device);
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "FAIL: exception: %s\n", error.what());
+        return 1;
+    }
+    if (failures != 0) return 1;
+    std::printf("residency session window test passed\n");
+    return 0;
+}
+
+int WrittenSlots() {
+    try {
+        auto device = OpenVulkanTestDevice();
+        if (!device) return VulkanTestSkipped;
+        const auto context = device->graphicsContext();
+        auto* recorder = Recorder::Active();
+        if (recorder == nullptr) throw std::runtime_error("no active recorder");
+        GuestPages guest;
+        const HostImport* import = nullptr;
+        {
+            const std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            import = HostImportFor(context, guest.Address(0), Bytes);
+            Expect(import != nullptr, "the guest pages cannot be imported");
+        }
+        if (import == nullptr) return 1;
+        EnsureResidency(context);
+        Expect(ResidencyActive(), "slots: the residency session did not start");
+        auto& table = AgcDriver::NewPath::DeviceTable();
+        const std::uint64_t address = guest.Address(5) + 0x340;
+        const std::uint64_t bytes = 0x200;
+        const auto fill = [&](VkBuffer target, VkDeviceSize offset, VkDeviceSize size, std::uint32_t value) {
+            const auto commands = recorder->Commands();
+            Fence(context, commands);
+            context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, target, offset, size, value);
+            Fence(context, commands);
+        };
+        const auto copyBack = [&](const HostImport& slot) {
+            const auto commands = recorder->Commands();
+            Fence(context, commands);
+            CopyBuffer(context, commands, slot.buffer, slot.lead + (address - slot.base), import->buffer, HostImportOffset(*import, address), bytes);
+            Fence(context, commands);
+        };
+        const auto readMirror = [&](const HostImport& slot) {
+            auto readback = std::make_shared<Buffer>(context, ResidencyPageBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+            const auto commands = recorder->Commands();
+            Fence(context, commands);
+            CopyBuffer(context, commands, slot.buffer, slot.lead, readback->Handle(), 0, ResidencyPageBytes);
+            Fence(context, commands);
+            recorder->Keep(readback);
+            device->SubmitRecorded(false);
+            device->WaitIdle();
+            std::vector<std::uint32_t> words(ResidencyPageBytes / 4);
+            std::memcpy(words.data(), readback->Bytes().data(), ResidencyPageBytes);
+            return words;
+        };
+        const auto served = [&](const HostImport& slot) {
+            if (table.Stale(context.device)) static_cast<void>(table.Refresh(context));
+            const std::array<ShaderRecompiler::BdaAbi::Range, 1> build{{{address, address + bytes, slot.address + (address - slot.base), ShaderRecompiler::BdaAbi::Read | ShaderRecompiler::BdaAbi::Write, 0u}}};
+            return table.Probe(build) == AgcDriver::NewPath::DevicePageTable::Cover::Covered;
+        };
+        const auto word = [&](std::uint64_t at) { return reinterpret_cast<volatile std::uint32_t*>(static_cast<std::uintptr_t>(at))[0]; };
+        std::shared_ptr<HostImport> slot;
+        {
+            const std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            static_cast<void>(table.Refresh(context));
+            slot = BindWrittenSlot(address, bytes);
+            Expect(slot != nullptr, "slots: a one-page written element got no slot");
+            if (slot == nullptr) return 1;
+            Expect(served(*slot), "slots: the table does not serve the element at the slot its build binds");
+            fill(slot->buffer, slot->lead + (address - slot->base), bytes, 0xa1a1a1a1u);
+            copyBack(*slot);
+        }
+        {
+            const std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            const auto mirror = readMirror(*slot);
+            Expect(word(address) == 0xa1a1a1a1u && word(address + bytes - 4) == 0xa1a1a1a1u, "slots: the old-path build's write did not reach guest memory");
+            Expect(mirror[(address - slot->base) / 4] == 0xa1a1a1a1u, "slots: a new-path read through the table after the old-path write misses it");
+            bool same = true;
+            for (std::uint32_t at = 0; at < ResidencyPageBytes / 4; ++at) same = same && mirror[at] == guest.Words(5)[at];
+            Expect(same, "slots: the mirror page the table serves differs from guest memory");
+        }
+        {
+            const std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            slot = BindWrittenSlot(address, bytes);
+            Expect(slot != nullptr && served(*slot), "slots: the element bound again is not served");
+            if (slot == nullptr) return 1;
+            const auto entry = TableEntry(context, address);
+            Expect(entry.has_value() && entry->deviceAddress + (address - entry->begin) == slot->address + (address - slot->base), "slots: the table entry is not the slot");
+            fill(slot->buffer, slot->lead + (address - slot->base), bytes, 0xb2b2b2b2u);
+            copyBack(*slot);
+            device->SubmitRecorded(false);
+            device->WaitIdle();
+            Expect(word(address) == 0xb2b2b2b2u, "slots: an old-path read after a new-path write through the table misses it");
+        }
+        const std::uint64_t other = guest.Address(5) + 0x8000;
+        {
+            const std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> writes{{{other, 64}}};
+            NoteStagedRegions({}, writes);
+            Expect(!served(*slot), "slots: after an old-path write elsewhere on the page the table still serves the mirror");
+            fill(import->buffer, HostImportOffset(*import, other), 64, 0xc3c3c3c3u);
+            device->SubmitRecorded(false);
+            device->WaitIdle();
+            auto again = BindWrittenSlot(address, bytes);
+            Expect(again != nullptr && served(*again), "slots: binding the element again did not serve it");
+            if (again != nullptr) {
+                const auto mirror = readMirror(*again);
+                Expect(mirror[(other - again->base) / 4] == 0xc3c3c3c3u, "slots: the caught-up mirror misses the old-path write");
+            }
+        }
+        ReleaseResidency(context.device);
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "FAIL: exception: %s\n", error.what());
+        return 1;
+    }
+    if (failures != 0) return 1;
+    std::printf("residency written slot test passed\n");
+    return 0;
+}
+
 int main(int argc, char** argv) {
     const bool asyncLane = argc > 1 && std::string(argv[1]) == "--async-lane";
     const bool sitesOnly = argc > 1 && std::string(argv[1]) == "--driver-sites";
     const bool reentry = argc > 1 && std::string(argv[1]) == "--session-reentry";
 #ifdef _WIN32
+    if (argc > 1 && (std::string(argv[1]) == "--session-window" || std::string(argv[1]) == "--written-slots")) {
+        _putenv_s("APS5_NEW_PATH", "1");
+        return std::string(argv[1]) == "--session-window" ? SessionWindow() : WrittenSlots();
+    }
     if (reentry) {
         _putenv_s("APS5_NEW_PATH", "1");
         _putenv_s("APS5_NEW_PATH_EAGER_COPY_IN", "1");

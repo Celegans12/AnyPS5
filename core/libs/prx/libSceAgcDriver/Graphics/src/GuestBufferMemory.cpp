@@ -5360,6 +5360,11 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
                 continue;
             }
             // An import found when the lease was acquired is reused while none was dropped since.
+            if (region.residencySlot != nullptr) {
+                region.direct = nullptr;
+                region.residencySlot.reset();
+                region.slotCopy = false;
+            }
             const HostImport* entry = region.direct != nullptr && state.epoch == importsEpoch ? region.direct : nullptr;
             region.direct = nullptr;
             if (stale) {
@@ -5550,6 +5555,11 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             }
             // An import taken by UploadPrepare (or at the lease) is still the registry's unless one
             // was dropped since.
+            if (region.residencySlot != nullptr) {
+                region.direct = nullptr;
+                region.residencySlot.reset();
+                region.slotCopy = false;
+            }
             const HostImport* entry = region.direct != nullptr && state.epoch == importsEpoch ? region.direct : nullptr;
             region.direct = nullptr;
             if (entry == nullptr) entry = findImport(state, region.begin, region.end);
@@ -5638,6 +5648,17 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
                     region.deviceLocal = false;
                     anyResidencySlot = true;
                     continue;
+                }
+                if (region.writable) {
+                    if (auto slot = BindWrittenSlot(region.begin, bytes)) {
+                        region.residencySlot = std::move(slot);
+                        region.direct = region.residencySlot.get();
+                        region.buffer.reset();
+                        region.snapshot.clear();
+                        region.deviceLocal = false;
+                        region.slotCopy = true;
+                        anyResidencySlot = true;
+                    }
                 }
             }
             region.gpuCopy = true;
@@ -6154,6 +6175,25 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
     for (auto* region : copies) {
         const auto bytes = region->end - region->begin;
         copiedBytes += bytes;
+        if (region->slotCopy) {
+            Recorder::Checkpoint(commands, Recorder::CheckpointKind::CopyIn, region->begin);
+            CopyBuffer(context, commands, region->copySource, region->begin - region->copySourceBase, region->residencySlot->buffer, region->residencySlot->lead + (region->begin - region->residencySlot->base), bytes);
+            region->diffUse = false;
+            if (stagingDiffEnabled(context) && stagingDiffActive() && region->copySourceAddress != 0 && region->residencySlot->address != 0) {
+                if (region->pristine == nullptr) region->pristine = stagingBuffer(context, static_cast<std::size_t>(bytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+                if (region->pristine != nullptr && region->pristine->DeviceAddress() != 0) {
+                    CopyBuffer(context, commands, region->copySource, region->begin - region->copySourceBase, region->pristine->Handle(), 0, bytes);
+                    recorder->Keep(region->pristine);
+                    region->diffUse = true;
+                } else {
+                    region->pristine.reset();
+                }
+            }
+            recorder->NotePendingRead(region->begin, static_cast<std::size_t>(bytes), Recorder::ReadKind::GpuCopy);
+            recorder->Keep(region->residencySlot);
+            region->snapshot.clear();
+            continue;
+        }
         if (region->buffer == nullptr) {
             // Not made by UploadPrepare (the registry was stale then): made here, under the lock.
             const auto allocateStart = std::chrono::steady_clock::now();
@@ -6281,6 +6321,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         std::vector<Region*> diffed;
         const bool active = stagingDiffActive();
         for (auto* region : copies) {
+            if (region->slotCopy) continue;
             region->diffUse = false;
             if (!active) continue;
             if (!region->deviceLocal || region->buffer == nullptr || region->buffer->DeviceAddress() == 0 || region->copySourceAddress == 0) {
@@ -6426,6 +6467,26 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
             // pristine copy (APS5_STAGING_DIFF) stores only the dwords that differ from it; the
             // unaligned edges copy whole.
             Recorder::Checkpoint(commands, Recorder::CheckpointKind::CopyBack, from);
+            if (region.slotCopy) {
+                const auto& slot = *region.residencySlot;
+                const auto slotOffset = [&](std::uint64_t at) { return slot.lead + (at - slot.base); };
+                auto plainFrom = from;
+                if (diff && region.diffUse && region.pristine != nullptr && region.copySourceAddress != 0 && slot.address != 0 && region.begin % 4u == 0 && region.copySourceBase % 4u == 0 && region.copySourceAddress % 4u == 0) {
+                    const auto alignedFrom = (from + 3u) & ~std::uint64_t{3};
+                    const auto alignedTo = to & ~std::uint64_t{3};
+                    if (alignedFrom < alignedTo && (alignedTo - alignedFrom) / 4u <= std::numeric_limits<std::uint32_t>::max() && recorder.RecordStagingDiff(commands, slot.address + (alignedFrom - slot.base), region.pristine->DeviceAddress() + (alignedFrom - region.begin), region.copySourceAddress + (alignedFrom - region.copySourceBase), static_cast<std::uint32_t>((alignedTo - alignedFrom) / 4u), profile)) {
+                        diffed = true;
+                        recorder.Keep(region.pristine);
+                        if (from < alignedFrom) CopyBuffer(context, commands, slot.buffer, slotOffset(from), region.copySource, from - region.copySourceBase, alignedFrom - from);
+                        if (alignedTo < to) CopyBuffer(context, commands, slot.buffer, slotOffset(alignedTo), region.copySource, alignedTo - region.copySourceBase, to - alignedTo);
+                        plainFrom = to;
+                    }
+                }
+                if (plainFrom < to) CopyBuffer(context, commands, slot.buffer, slotOffset(plainFrom), region.copySource, plainFrom - region.copySourceBase, to - plainFrom);
+                copiedBytes += to - from;
+                recorder.Keep(region.residencySlot);
+                continue;
+            }
             auto whole = from;
             auto wholeEnd = to;
             if (diff && region.diffUse && region.deviceLocal && region.pristine != nullptr && region.copySourceAddress != 0 && region.buffer->DeviceAddress() != 0 && region.begin % 4u == 0 && region.copySourceBase % 4u == 0 && region.copySourceAddress % 4u == 0) {
@@ -7436,11 +7497,20 @@ void GuestBufferMemory::RecordStagingCopies(Recorder& recorder) {
     std::vector<Region*> copies;
     // A previous use in a dispatch run that is still open owes its copy-backs (Recorder::AfterRun):
     // the run is closed first, which records them from the shadows before they are refilled.
-    if (std::any_of(regions.begin(), regions.end(), [](const Region& region) { return region.gpuCopy && region.deviceLocal && !region.copiedBack; })) {
+    if (std::any_of(regions.begin(), regions.end(), [](const Region& region) { return region.gpuCopy && (region.deviceLocal || region.slotCopy) && !region.copiedBack; })) {
         if (profile) recorder.NoteOwedCopyBack(this);
         recorder.CloseRunOwing(this);
     }
     for (auto& region : regions) {
+        if (region.gpuCopy && region.slotCopy) {
+            auto slot = BindWrittenSlot(region.begin, region.end - region.begin);
+            Require(slot != nullptr && slot->buffer == region.residencySlot->buffer && slot->lead == region.residencySlot->lead, "a reused build's residency slot moved");
+            region.residencySlot = std::move(slot);
+            region.direct = region.residencySlot.get();
+            region.copiedBack = false;
+            copies.push_back(&region);
+            continue;
+        }
         if (!region.gpuCopy || !region.deviceLocal) continue;
         // The previous use's copy-back was recorded by its MarkGpuWrites or by the run it was in
         // (or never, when that use threw first: counted); this use records its own after its work,

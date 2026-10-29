@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <exception>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -259,11 +260,68 @@ void SerialMemoTests(const AgcDriver::Graphics::Context& context) {
 
 }
 
+void MirroredReadTests() {
+    using Cover = DevicePageTable::Cover;
+    const std::vector<Range> imports{MakeRange(ImportBase, ImportBase + 4 * Page, ImportDevice)};
+    const std::vector<Range> resident{Range{ImportBase + Page, ImportBase + 2 * Page, ResidentDevice, Abi::Read | Abi::Write, Abi::RangeMirrored}};
+    const auto table = DevicePageTable::Overlay(imports, resident, 0, Abi::PageTableEnd);
+    const std::vector<Range> read{MakeRange(ImportBase + Page / 2, ImportBase + 3 * Page, ImportDevice + Page / 2, Abi::Read)};
+    std::uint64_t mirrored = 0;
+    Expect(DevicePageTable::Compare(table, read, nullptr, nullptr, imports, &mirrored) == Cover::Covered && mirrored == 1, "a build reading the import in place was not covered over a current mirror page");
+    Expect(DevicePageTable::Compare(table, read) == Cover::OtherAddress, "without the imports a read over a mirror page was covered");
+    const std::vector<Range> written{MakeRange(ImportBase + Page, ImportBase + Page + 64, ImportDevice + Page)};
+    Expect(DevicePageTable::Compare(table, written, nullptr, nullptr, imports) == Cover::OtherAddress, "a build writing the import in place was covered over a mirror page");
+    const std::vector<Range> copy{MakeRange(ImportBase + Page, ImportBase + Page + 64, 0x7d0000000000ull, Abi::Read)};
+    Expect(DevicePageTable::Compare(table, copy, nullptr, nullptr, imports) == Cover::OtherAddress, "a read of a copy (another address) was covered over a mirror page");
+    const std::vector<Range> slot{MakeRange(ImportBase + Page + 256, ImportBase + Page + 768, ResidentDevice + 256)};
+    Expect(DevicePageTable::Compare(table, slot, nullptr, nullptr, imports) == Cover::Covered, "a build writing the mirror slot the table maps was not covered");
+}
+
+void ResidentStateTests(const AgcDriver::Graphics::Context& context) {
+    const std::vector<Range> imports{MakeRange(ImportBase, ImportBase + 4 * Page, ImportDevice)};
+    DevicePageTable table([&](const AgcDriver::Graphics::Context& built) {
+        AgcDriver::Graphics::HostImportSnapshot snapshot;
+        snapshot.device = built.device;
+        snapshot.ranges = imports;
+        return snapshot;
+    }, [](VkDevice) { return std::uint64_t{1}; });
+    std::vector<std::uint64_t> current;
+    std::uint64_t mark = 1;
+    std::uint64_t marks = 0;
+    table.SetResidentPieces([&](std::uint64_t begin, std::uint64_t end) {
+        std::vector<Range> pieces;
+        for (const auto page : current) {
+            const auto low = page << Abi::PageShift;
+            if (begin < low + Page && low < end) pieces.push_back(Range{low, low + Page, ResidentDevice + (low - ImportBase), Abi::Read | Abi::Write, Abi::RangeMirrored});
+        }
+        return pieces;
+    }, DevicePageTable::ResidentState{[&] { ++marks; return mark; }, [&] { return current; }});
+    Expect(!table.PatchResident(context).has_value(), "a resident patch without a table did not say so");
+    const auto first = table.Refresh(context);
+    Expect(!table.Stale(context.device), "a table built at the residency's mark is stale");
+    const auto page2 = (ImportBase + 2 * Page) >> Abi::PageShift;
+    current = {page2};
+    ++mark;
+    Expect(table.Stale(context.device), "a residency change did not make the table stale");
+    const auto patched = table.Refresh(context);
+    Expect(patched != first && Translate(patched, ImportBase + 2 * Page + 8) == ResidentDevice + 2 * Page + 8, "the refresh after a residency change did not map the current page to its mirror");
+    Expect(Translate(patched, ImportBase + Page + 8) == ImportDevice + Page + 8, "a page the residency did not change moved");
+    Expect(table.Totals().builds == 1, "a residency change rebuilt the whole table instead of patching it");
+    current.clear();
+    ++mark;
+    const auto changed = table.PatchResident(context);
+    Expect(changed.has_value() && *changed == 1, "the page that left the current set was not patched");
+    Expect(Translate(table.Current(), ImportBase + 2 * Page + 8) == ImportDevice + 2 * Page + 8, "a page that left the current set still maps to its mirror");
+    Expect(!table.Stale(context.device) && table.PatchResident(context) == std::optional<std::size_t>{0}, "an unchanged residency mark patched again");
+    Expect(marks != 0, "the table never asked the residency for its mark");
+}
+
 int main() {
     try {
         OverlayTests();
         CompareTests();
         MirrorMergeTests();
+        MirroredReadTests();
         auto device = OpenVulkanTestDevice();
         if (device == nullptr) {
             if (failures != 0) return 1;
@@ -272,6 +330,7 @@ int main() {
         DeviceTests(device->graphicsContext());
         MirrorDeviceTests(device->graphicsContext());
         SerialMemoTests(device->graphicsContext());
+        ResidentStateTests(device->graphicsContext());
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;

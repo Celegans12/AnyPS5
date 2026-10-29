@@ -580,6 +580,9 @@ private:
         // mapping, so nothing is ever stored from it by the CPU, and the region is taken even when
         // the import could bind it in place.
         bool deviceLocal = false;
+        // A staged written element bound in a residency mirror slot (residencySlot, direct), copied in
+        // and back like a shadow: the device page table maps the range where the work writes it.
+        bool slotCopy = false;
         // The tracker generation and registry generation at this use's copy-in when it may become a
         // GPU source (FindGpuSource), else 0; consumed by MarkDirectWrites.
         mutable std::uint64_t gpuSourceSince = 0;
