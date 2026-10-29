@@ -217,6 +217,8 @@ enum class HeapCost : std::uint8_t {
     Count
 };
 bool HeapCostTimed();
+
+void NoteHeapWalkMemoBytes(std::int64_t delta);
 void NoteHeapCost(HeapCost cost, std::uint64_t nanoseconds);
 class HeapCostScope {
 public:

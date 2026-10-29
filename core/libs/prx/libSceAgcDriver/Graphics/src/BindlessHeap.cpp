@@ -27,6 +27,27 @@ namespace AgcDriver::Graphics {
 
 namespace {
 
+std::atomic<std::int64_t>& walkMemoHeld() {
+    static std::atomic<std::int64_t> held{0};
+    return held;
+}
+
+std::atomic<std::int64_t>& walkMemoPeak() {
+    static std::atomic<std::int64_t> peak{0};
+    return peak;
+}
+
+}
+
+void NoteHeapWalkMemoBytes(std::int64_t delta) {
+    if (delta == 0) return;
+    const auto now = walkMemoHeld().fetch_add(delta, std::memory_order_relaxed) + delta;
+    auto peak = walkMemoPeak().load(std::memory_order_relaxed);
+    while (now > peak && !walkMemoPeak().compare_exchange_weak(peak, now, std::memory_order_relaxed)) {}
+}
+
+namespace {
+
 namespace Abi = ShaderRecompiler::RuntimeAbi;
 
 void check(VkResult result, const char* what) {
@@ -978,7 +999,11 @@ void reportHeapStatistics() {
         std::snprintf(cost, sizeof(cost), " %s %llu x %.2f us = %.0f ms", HeapCostNames[i], printed(calls), averageUs, ns / 1e6);
         costs += cost;
     }
-    if (HeapCostTimed()) std::fprintf(stderr, "[gpu-heap] cost (10 s):%s\n", costs.c_str());
+    if (HeapCostTimed()) {
+        const auto held = static_cast<double>(std::max<std::int64_t>(walkMemoHeld().load(std::memory_order_relaxed), 0)) / 1048576.0;
+        const auto peak = static_cast<double>(walkMemoPeak().load(std::memory_order_relaxed)) / 1048576.0;
+        std::fprintf(stderr, "[gpu-heap] cost (10 s):%s; walk memos hold %.1f MiB on all threads (peak %.1f MiB)\n", costs.c_str(), held, peak);
+    }
     const auto heapDraws = takeCount(heapRecords[heapRecordIndex(false, true)]);
     const auto plainDraws = takeCount(heapRecords[heapRecordIndex(false, false)]);
     const auto heapDispatches = takeCount(heapRecords[heapRecordIndex(true, true)]);

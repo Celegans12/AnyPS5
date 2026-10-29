@@ -459,7 +459,10 @@ void rememberWalk(std::uint64_t memoKey, const ShaderRecompiler::PreparedShaderI
     entry.capture = capture;
     entry.result = result;
     entry.words = std::make_shared<const ShaderRecompiler::HeapStageWords>(words);
-    heapWalkMemo().remember(memoKey, std::move(entry));
+    auto& memo = heapWalkMemo();
+    const auto heldBefore = memo.heldBytes;
+    memo.remember(memoKey, std::move(entry));
+    Graphics::NoteHeapWalkMemoBytes(static_cast<std::int64_t>(memo.heldBytes) - static_cast<std::int64_t>(heldBefore));
 }
 
 }
@@ -485,7 +488,10 @@ MaterializeHeapStage(const ShaderRecompiler::PreparedShaderInvocation& invocatio
     Graphics::HeapCostScope memoCost(Graphics::HeapCost::WalkMemo);
     if (memoOn) {
         memoKey = walkMemoKey(invocation, userData, shaderBase);
-        auto* found = heapWalkMemo().find(memoKey);
+        auto& memo = heapWalkMemo();
+        const auto heldBefore = memo.heldBytes;
+        auto* found = memo.find(memoKey);
+        Graphics::NoteHeapWalkMemoBytes(static_cast<std::int64_t>(memo.heldBytes) - static_cast<std::int64_t>(heldBefore));
         memoKnown = found != nullptr;
         for (std::size_t way = 0; found != nullptr && way < found->size(); ++way) {
             const auto& entry = (*found)[way];
