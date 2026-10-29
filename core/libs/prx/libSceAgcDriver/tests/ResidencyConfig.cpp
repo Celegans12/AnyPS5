@@ -60,6 +60,11 @@ int main() {
     check(config.slotBinding, "APS5_NEW_PATH_SLOT_BINDING turns slot binding on");
     config = with({{"APS5_NEW_PATH_SLOT_BINDING", "1"}});
     check(!config.slotBinding, "slot binding without the master changes nothing");
+    check(!config.eagerCopyIn, "copy-in waits for a reader unless asked for");
+    config = with({{"APS5_NEW_PATH", "1"}, {"APS5_NEW_PATH_EAGER_COPY_IN", "1"}});
+    check(config.eagerCopyIn, "APS5_NEW_PATH_EAGER_COPY_IN copies in as soon as bytes change");
+    config = with({{"APS5_NEW_PATH_EAGER_COPY_IN", "1"}});
+    check(!config.eagerCopyIn, "eager copy-in without the master changes nothing");
 
     config = with({{"APS5_NEW_PATH", "1"}, {"APS5_NEW_PATH_RESIDENT_CHUNK_PAGES", "64"}});
     check(config.residency && config.chunkPages == 64, "chunk pages");
