@@ -331,6 +331,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/NewPath/ResolvedPush.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/NewPath/PipelineAhead.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/NewPath/PipelineAheadConfig.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/NewPath/PipelineAheadTwins.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/NewPath/DevicePageTable.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/NewPath/Router.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/NewPath/ResolvedTwins.cpp
@@ -654,6 +655,17 @@ if(BUILD_TESTING)
     set_tests_properties(agc_newpath_pipeline_gate PROPERTIES TIMEOUT 30)
     if(WIN32)
         set_tests_properties(agc_newpath_pipeline_gate PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+
+    add_test_executable(agc_newpath_pipeline_twins_tests tests/NewPathPipelineTwins.cpp Execution/src/Driver/NewPath/PipelineAhead.cpp Execution/src/Driver/NewPath/PipelineAheadTwins.cpp)
+    target_include_directories(agc_newpath_pipeline_twins_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/core/shader/recompiler)
+    target_link_libraries(agc_newpath_pipeline_twins_tests PRIVATE shader_recompiler_agc_driver libc)
+    configure_windows_unwind(agc_newpath_pipeline_twins_tests)
+    add_test(NAME agc_newpath_pipeline_twins COMMAND agc_newpath_pipeline_twins_tests)
+    set_tests_properties(agc_newpath_pipeline_twins PROPERTIES TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_newpath_pipeline_twins PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 

@@ -91,6 +91,8 @@ void print(State& state, const char* window) {
     }
     const auto ahead = Pipelines().Totals();
     AgcDriver::ProfilePrint_nid_no_patch("[newpath] window=%s pipelines ahead (gate %s): requested %llu, created %llu, failed %llu, inline %llu, blocked %llu, pending fallbacks %llu, prewarmed %llu\n", window, PipelineGateEnabled() ? "on" : "off", static_cast<unsigned long long>(ahead.requested), static_cast<unsigned long long>(ahead.created), static_cast<unsigned long long>(ahead.failed), static_cast<unsigned long long>(ahead.createdInline), static_cast<unsigned long long>(ahead.blockedWaits), static_cast<unsigned long long>(ahead.pendingFallbacks), static_cast<unsigned long long>(ahead.prewarmed));
+    const auto twinPipes = TwinPipelineStore().Totals();
+    AgcDriver::ProfilePrint_nid_no_patch("[newpath] window=%s twin pipelines (cumulative): created on workers %llu (%.0f ms), on the dispatch thread %llu (%.0f ms, max %.0f ms, %llu over 1 s); not ready at a dispatch %llu, layout mismatches %llu; module files written %llu (failed %llu), prewarm queued %llu, skipped %llu, unreadable %llu\n", window, static_cast<unsigned long long>(twinPipes.createdOnWorker), twinPipes.workerMs, static_cast<unsigned long long>(twinPipes.createdOnCaller), twinPipes.callerMs, twinPipes.maxCallerMs, static_cast<unsigned long long>(twinPipes.callerOverSecond), static_cast<unsigned long long>(twinPipes.notReady), static_cast<unsigned long long>(twinPipes.layoutMismatches), static_cast<unsigned long long>(twinPipes.modulesWritten), static_cast<unsigned long long>(twinPipes.moduleWriteFailures), static_cast<unsigned long long>(twinPipes.prewarmQueued), static_cast<unsigned long long>(twinPipes.prewarmSkipped), static_cast<unsigned long long>(twinPipes.moduleReadFailures));
     if (const auto residency = Graphics::ResidencyReportLine(); !residency.empty()) AgcDriver::ProfilePrint_nid_no_patch("%s\n", residency.c_str());
 }
 
@@ -197,6 +199,10 @@ bool MayEmitWithoutTable(const EmitCandidate& candidate, bool pipelineReady) {
     facts.pipelineReady = pipelineReady;
     facts.clothGuard = false;
     facts.tableCovers = true;
+    return Get().router.Decide(facts).route == Route::NewPath;
+}
+
+bool WouldEmit(const CommandFacts& facts) {
     return Get().router.Decide(facts).route == Route::NewPath;
 }
 

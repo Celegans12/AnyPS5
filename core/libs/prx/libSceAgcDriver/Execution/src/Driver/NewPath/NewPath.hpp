@@ -55,6 +55,8 @@ private:
 [[nodiscard]] EmitCandidate* CurrentEmit();
 Decision NoteEmit(EmitCandidate& candidate, const CommandFacts& facts);
 [[nodiscard]] bool MayEmitWithoutTable(const EmitCandidate& candidate, bool pipelineReady);
+// The router's route for these facts, without noting it.
+[[nodiscard]] bool WouldEmit(const CommandFacts& facts);
 void NoteDispatchCost(const EmitCandidate& candidate, std::uint64_t deviceNs, std::uint64_t buildNs);
 
 void Close(const char* window);
