@@ -5742,6 +5742,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         return resources.WritesOverlap(begin, bytes) || resources.ReadsOverlap(begin, bytes) || (argumentImport != nullptr && begin < arguments + 12 && arguments < end);
     };
     std::shared_ptr<ComputePipelineObjects> emitted;
+    NewPath::DevicePageTable::Snapshot admitted;
     NewPath::CostLap(NewPath::CostStep::RecordHead);
     if (auto* emit = NewPath::CurrentEmit(); emit != nullptr && arguments == 0 && argumentImport == nullptr) {
         auto facts = emit->facts;
@@ -5754,7 +5755,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
             const auto deferred = resources.DeferredAddressTable();
             const auto ranges = deferred.has_value() ? nullptr : resources.AddressTableRanges();
             NewPath::CostLap(NewPath::CostStep::Ranges);
-            facts.tableCovers = (deferred.has_value() ? table.Covers(deferred->serial, deferred->ranges) : table.Covers(ranges)) == NewPath::DevicePageTable::Cover::Covered;
+            facts.tableCovers = (deferred.has_value() ? table.Covers(deferred->serial, deferred->ranges, &admitted) : table.Covers(ranges, &admitted)) == NewPath::DevicePageTable::Cover::Covered;
             NewPath::CostLap(NewPath::CostStep::Compare);
         }
         if (NewPath::NoteEmit(*emit, facts).route == NewPath::Route::NewPath) {
@@ -5943,14 +5944,18 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     NewPath::CostLap(NewPath::CostStep::RecordCommands);
     if (emitted != nullptr || NewPath::ResolvedModule(*record.shader->program)) {
         auto& table = NewPath::DeviceTable();
-        if (table.Stale(context.device)) static_cast<void>(table.Refresh(context));
-        static_cast<void>(NewPath::UploadTableForLane(context, recorder, table.Current(), static_cast<std::uint32_t>(Graphics::Recorder::ThreadLane())));
+        if (emitted == nullptr || admitted.table == nullptr) {
+            if (table.Stale(context.device)) static_cast<void>(table.Refresh(context));
+            admitted = table.Use();
+        }
+        Graphics::Require(admitted.table != nullptr, "a new-path resolved dispatch has no page table");
+        if (!NewPath::UploadTableForLane(context, recorder, admitted.table, static_cast<std::uint32_t>(Graphics::Recorder::ThreadLane()))) recorder.Keep(std::const_pointer_cast<Graphics::BdaPageTable>(admitted.table));
         NewPath::CostLap(NewPath::CostStep::TableUpload);
         auto commandRecord = table.TakeRecord(context);
-        const auto resolvedPush = NewPath::ComposeResolvedPush(*record.pushBytes, Graphics::ComputePushConstantBytes, table.RootAddress(), static_cast<std::uint64_t>(commandRecord->DeviceAddress()));
+        const auto resolvedPush = NewPath::ComposeResolvedPush(*record.pushBytes, Graphics::ComputePushConstantBytes, static_cast<std::uint64_t>(admitted.table->Address()), static_cast<std::uint64_t>(commandRecord->DeviceAddress()));
         Graphics::Require(resolvedPush.has_value(), "a new-path resolved dispatch has no page table or fault record for its push block");
         recorder.Keep(commandRecord);
-        recorder.OnComplete([commandRecord, leased = table.Lists().writable, device = context.device, programAddress = record.programAddress] {
+        recorder.OnComplete([commandRecord, leased = std::move(admitted.lists.writable), device = context.device, programAddress = record.programAddress] {
             const auto completionStart = std::chrono::steady_clock::now();
             auto bytes = commandRecord->Bytes();
             NewPath::ObserveCommandRecord(std::span<const std::uint32_t, NewPath::CommandRecordWords>(reinterpret_cast<const std::uint32_t*>(bytes.data()), NewPath::CommandRecordWords));

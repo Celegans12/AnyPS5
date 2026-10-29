@@ -107,12 +107,13 @@ DevicePageTable::Cover DevicePageTable::Compare(std::span<const Range> table, st
     return Cover::Covered;
 }
 
-DevicePageTable::Cover DevicePageTable::Covers(const std::shared_ptr<const std::vector<Range>>& build) {
+DevicePageTable::Cover DevicePageTable::Covers(const std::shared_ptr<const std::vector<Range>>& build, Snapshot* used) {
     std::lock_guard lock(mutex);
     if (build == nullptr || !built) {
         ++counts.coverHits[static_cast<std::size_t>(Cover::Missing)];
         return Cover::Missing;
     }
+    if (used != nullptr) *used = {table, tableLists};
     for (const auto& memo : coverMemo) {
         if (memo.build == build && memo.generation == generation) {
             ++counts.coverHits[static_cast<std::size_t>(memo.cover)];
@@ -125,12 +126,13 @@ DevicePageTable::Cover DevicePageTable::Covers(const std::shared_ptr<const std::
     return cover;
 }
 
-DevicePageTable::Cover DevicePageTable::Covers(std::uint64_t serial, std::span<const Range> build) {
+DevicePageTable::Cover DevicePageTable::Covers(std::uint64_t serial, std::span<const Range> build, Snapshot* used) {
     std::lock_guard lock(mutex);
     if (!built) {
         ++counts.coverHits[static_cast<std::size_t>(Cover::Missing)];
         return Cover::Missing;
     }
+    if (used != nullptr) *used = {table, tableLists};
     if (serialMemoGeneration != generation) {
         serialMemo.clear();
         serialMemoGeneration = generation;
@@ -303,6 +305,11 @@ void DevicePageTable::ReturnRecord(std::shared_ptr<Graphics::Buffer> record, VkD
 std::size_t DevicePageTable::PooledRecords() const {
     std::lock_guard lock(mutex);
     return records.size();
+}
+
+DevicePageTable::Snapshot DevicePageTable::Use() const {
+    std::lock_guard lock(mutex);
+    return {table, tableLists};
 }
 
 TableLists DevicePageTable::Lists() const {

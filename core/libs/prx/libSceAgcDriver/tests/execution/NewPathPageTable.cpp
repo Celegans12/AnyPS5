@@ -235,12 +235,17 @@ void SerialMemoTests(const AgcDriver::Graphics::Context& context) {
     Expect(table.Covers(7, inside) == Cover::Covered && table.Totals().compares == 1 && table.Totals().serialHits == 1, "a second use of the same space serial compared again");
     Expect(table.Covers(8, outside) == Cover::Missing && table.Totals().compares == 2, "another space serial was served from the memo");
     Expect(table.Covers(0, inside) == Cover::Covered && table.Covers(0, outside) == Cover::Missing && table.Totals().compares == 4, "a build without a space serial was served from the memo");
+    DevicePageTable::Snapshot admitted;
+    Expect(table.Covers(7, inside, &admitted) == Cover::Covered && admitted.table == table.Current() && admitted.lists.writable == table.Lists().writable, "a covered compare did not hand out the table version it compared against");
+    const auto admittedTable = admitted.table;
     imports = {MakeRange(ImportBase + 4 * Page, ImportBase + 8 * Page, ImportDevice + 4 * Page)};
     ++version;
     static_cast<void>(table.Refresh(context));
+    Expect(admitted.table == admittedTable && table.Current() != admittedTable && Translate(admitted.table, ImportBase + Page + 8) == ImportDevice + Page + 8, "a refresh changed the version a covered build was admitted with");
+    Expect(table.Use().table == table.Current(), "Use did not hand out the current version");
     Expect(table.Covers(7, inside) == Cover::Missing && table.Covers(8, outside) == Cover::Covered && table.Totals().compares == 6, "a new table version kept the old version's covers");
     const auto hits = table.Totals().coverHits;
-    Expect(hits[static_cast<std::size_t>(Cover::Covered)] == 4 && hits[static_cast<std::size_t>(Cover::Missing)] == 4, "the cover counts are wrong");
+    Expect(hits[static_cast<std::size_t>(Cover::Covered)] == 5 && hits[static_cast<std::size_t>(Cover::Missing)] == 4, "the cover counts are wrong");
     table.Release(context.device);
     Expect(table.Covers(8, outside) == Cover::Missing, "a released table served a memoized cover");
 }
