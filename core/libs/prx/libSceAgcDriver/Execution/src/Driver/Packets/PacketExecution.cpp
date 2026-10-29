@@ -683,7 +683,8 @@ void Driver::execute(const Submission& submission) {
 
                 try {
                     std::string rejected;
-                    if (NewPath::Enabled()) static_cast<void>(NewPath::RouteCommand(NewPath::CommandKind::Draw, device.Load().get()));
+                    if (NewPath::EmitDraws()) NewPath::PrepareCommand(device.Load().get());
+                    else if (NewPath::Enabled()) static_cast<void>(NewPath::RouteCommand(NewPath::CommandKind::Draw, device.Load().get()));
                     const auto verdict = draw(queue, packet, submission, cursor, rejected);
                     drawn = verdict == DrawVerdict::Drawn;
                     CaptureTrace::Log("draw submission=%llu queue=%x offset=%zu target=%llx mask=%x verdict=%d reason=%.256s", static_cast<unsigned long long>(submission.serial), submission.queue, cursor, static_cast<unsigned long long>(color), readRegister(queue.context, 0x8e), static_cast<int>(verdict), rejected.c_str());

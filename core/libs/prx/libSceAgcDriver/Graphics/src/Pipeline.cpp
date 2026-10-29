@@ -312,6 +312,10 @@ namespace {
 thread_local bool prebuilding = false;
 thread_local bool prebuilt = false;
 
+bool ResolvedStages(std::span<const CompiledShader> shaders) {
+    return std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->newPathResolved; });
+}
+
 VkShaderStageFlags pushStagesOf(const Context& context) {
     return PreRasterizationPushStages(context.meshShader, context.tessellationShader, context.geometryShader);
 }
@@ -325,7 +329,7 @@ void appendKey(std::vector<std::byte>& key, const TValue& value) {
 
 bool libraryKeys(PipelineLibraryKeys& keys, const Context& context, const State& state, const VertexInputLayout& input, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders) {
     using Stage = ShaderRecompiler::ShaderStage;
-    if (!context.graphicsPipelineLibrary || context.pipelineExecutableInfo || (state.stages.tessellation && !context.tessellationPipelineCache) || state.depthBiasPerFace || state.rectList || BarycentricPatches(state, shaders) || SplitsAlternateAlpha(state) || !state.blendedColors.empty() || BindlessHeapStages(shaders) != 0u || std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->functionLdsBuffer; }) || FragmentInterlock(shaders)) return false;
+    if (!context.graphicsPipelineLibrary || ResolvedStages(shaders) || context.pipelineExecutableInfo || (state.stages.tessellation && !context.tessellationPipelineCache) || state.depthBiasPerFace || state.rectList || BarycentricPatches(state, shaders) || SplitsAlternateAlpha(state) || !state.blendedColors.empty() || BindlessHeapStages(shaders) != 0u || std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->functionLdsBuffer; }) || FragmentInterlock(shaders)) return false;
     keys = {};
     for (const auto& shader : shaders) {
         const auto identity = shader.program->Identity();
@@ -488,7 +492,11 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
     }
     const auto pushStages = PushConstantStages(shaders);
     Require(pushStages == 0 || context.limits.maxPushConstantsSize >= PushBlockBytes(dynamicRendering), "graphics push constant range exceeds device limit");
-    if (dynamicRendering) {
+    if (ResolvedStages(shaders)) {
+        Require(std::ranges::all_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->newPathResolved; }), "a new-path resolved draw mixes resolved and unresolved stages");
+        Require(context.limits.maxPushConstantsSize >= PipelinePushConstantBytes, "the device's push constant limit is below a resolved draw's 256-byte block");
+        for (const auto& shader : shaders) resolvedPushStages |= VulkanStage(shader.stage);
+    } else if (dynamicRendering) {
         for (const auto& shader : shaders) Require(shader.program->pushConstants.empty() || (shader.pushConstantOffset >= PipelinePushSlotBytes) == (shader.stage == ShaderRecompiler::ShaderStage::Fragment), "a stage's push constants lie outside its push constant slot");
     }
     try {
@@ -548,8 +556,9 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
             layoutInfo.setLayoutCount = ShaderRecompiler::BindlessImageAbi::HeapDescriptorSet + 1u;
         }
         layoutInfo.pSetLayouts = setLayouts.data();
-        layoutInfo.pushConstantRangeCount = dynamicRendering ? static_cast<std::uint32_t>(slots.size()) : pushStages != 0 ? 1 : 0;
-        layoutInfo.pPushConstantRanges = dynamicRendering ? slots.data() : pushStages != 0 ? &push : nullptr;
+        const VkPushConstantRange resolvedPush{resolvedPushStages, 0, PipelinePushConstantBytes};
+        layoutInfo.pushConstantRangeCount = resolvedPushStages != 0 ? 1 : dynamicRendering ? static_cast<std::uint32_t>(slots.size()) : pushStages != 0 ? 1 : 0;
+        layoutInfo.pPushConstantRanges = resolvedPushStages != 0 ? &resolvedPush : dynamicRendering ? slots.data() : pushStages != 0 ? &push : nullptr;
         Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &layoutInfo, nullptr, &layout), "vkCreatePipelineLayout graphics");
         std::vector<VkAttachmentDescription> colors;
         std::vector<VkAttachmentReference> references(state.blends.size(), VkAttachmentReference{VK_ATTACHMENT_UNUSED, attachmentLayout});
@@ -1020,6 +1029,10 @@ void Pipeline::ContinueBackFaces(VkCommandBuffer commands, const State& state) c
 }
 
 void Pipeline::PushConstants(VkCommandBuffer commands, VkShaderStageFlags stages, std::span<const std::byte, PipelinePushConstantBytes> bytes) const {
+    if (resolvedPushStages != 0) {
+        context.Resolved(&DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, layout, resolvedPushStages, 0, PipelinePushConstantBytes, bytes.data());
+        return;
+    }
     if (stages == 0) return;
     if (dynamicRendering) {
         context.Resolved(&DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, layout, pushStagesOf(context), 0, PipelinePushSlotBytes, bytes.data());
@@ -1276,6 +1289,14 @@ void reportPipelines(PipelineStore& store) {
     store.hits = store.misses = store.uncached = store.evicted = 0;
 }
 
+}
+
+std::uint64_t CachedPipelineKey(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
+    std::vector<std::byte> key;
+    pipelineKey(key, context, state, vertexInput, resources, shaders, attachmentLayout);
+    if (key.empty()) return 0;
+    const auto hash = hashKey(key);
+    return hash != 0 ? hash : 1;
 }
 
 std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {

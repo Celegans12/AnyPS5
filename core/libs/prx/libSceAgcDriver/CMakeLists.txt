@@ -337,6 +337,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/NewPath/ResolvedTwins.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/NewPath/DrawCensus.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/NewPath/DrawCensusHooks.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/NewPath/DrawTwins.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Lifecycle.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Memory/BufferCopy.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Memory/BufferFill.cpp
@@ -657,6 +658,17 @@ if(BUILD_TESTING)
     set_tests_properties(agc_newpath_draw_census PROPERTIES TIMEOUT 20)
     if(WIN32)
         set_tests_properties(agc_newpath_draw_census PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+
+    add_test_executable(agc_newpath_draw_twins_tests tests/NewPathDrawTwins.cpp Execution/src/Driver/NewPath/DrawTwins.cpp Execution/src/Driver/NewPath/Router.cpp Execution/src/Driver/NewPath/ResolvedTwins.cpp Execution/src/Driver/NewPath/PushBlock.cpp Execution/src/Driver/NewPath/ResolvedPush.cpp)
+    target_include_directories(agc_newpath_draw_twins_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/core/shader/recompiler)
+    target_link_libraries(agc_newpath_draw_twins_tests PRIVATE libc)
+    configure_windows_unwind(agc_newpath_draw_twins_tests)
+    add_test(NAME agc_newpath_draw_twins COMMAND agc_newpath_draw_twins_tests)
+    set_tests_properties(agc_newpath_draw_twins PROPERTIES TIMEOUT 20)
+    if(WIN32)
+        set_tests_properties(agc_newpath_draw_twins PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 

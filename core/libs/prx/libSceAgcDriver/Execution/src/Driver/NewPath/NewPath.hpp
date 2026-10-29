@@ -16,10 +16,16 @@ class VulkanDevice;
 
 namespace AgcDriver::NewPath {
 
+class PipelineAhead;
+
 [[nodiscard]] bool Enabled();
 [[nodiscard]] bool EmitDispatches();
+// APS5_NEW_PATH_EMIT_DRAWS=1 (only with APS5_NEW_PATH=1): class A draws on the twins (DrawTwins.hpp).
+[[nodiscard]] bool EmitDraws();
 
 Decision RouteCommand(CommandKind kind, const VulkanDevice* device = nullptr);
+// RouteCommand's preparation and report without noting a command (draws counted at the committer).
+void PrepareCommand(const VulkanDevice* device);
 
 void BeginCommand(CommandKind kind, const VulkanDevice* device);
 void EndCommand();
@@ -58,6 +64,25 @@ Decision NoteEmit(EmitCandidate& candidate, const CommandFacts& facts);
 [[nodiscard]] bool MayEmitWithoutTable(const EmitCandidate& candidate, bool pipelineReady);
 // The router's route for these facts, without noting it.
 [[nodiscard]] bool WouldEmit(const CommandFacts& facts);
+// A draw the committer starts (Graphics::Draw): counted once, by its facts when noted, else when dropped.
+[[nodiscard]] std::shared_ptr<EmitCandidate> ClaimDraw();
+class DrawEmitScope {
+public:
+    explicit DrawEmitScope(std::shared_ptr<EmitCandidate> candidate);
+    ~DrawEmitScope();
+    DrawEmitScope(const DrawEmitScope&) = delete;
+    DrawEmitScope& operator=(const DrawEmitScope&) = delete;
+
+private:
+    std::shared_ptr<EmitCandidate> candidate;
+    std::shared_ptr<EmitCandidate> previous;
+};
+[[nodiscard]] EmitCandidate* CurrentDrawEmit();
+// The draw twins' pipelines (created by their own workers; no manifest), reset at device teardown.
+PipelineAhead& DrawTwinPipelines();
+void NoteDrawTwinPipelines();
+[[nodiscard]] bool DrawTwinPipelinesUsed();
+void StopDrawTwinPipelines();
 void NoteDispatchCost(const EmitCandidate& candidate, std::uint64_t deviceNs, std::uint64_t buildNs);
 
 enum class CostStep : std::uint8_t { PreRecord, RecordHead, Ranges, Compare, Route, TwinPipeline, EnsureTable, RecordCommands, TableUpload, RecordPush, DispatchMarks, PostRecord, Count };

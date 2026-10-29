@@ -24,6 +24,13 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/DrawCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/DrawCensusHooks.hpp"
+#include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/CommandAccess.hpp"
+#include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/CommandRecord.hpp"
+#include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/DevicePageTable.hpp"
+#include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/DrawTwins.hpp"
+#include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/NewPath.hpp"
+#include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/PipelineAhead.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BdaPageTable.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -2643,6 +2650,16 @@ struct RecordedDraw {
     std::vector<SampleOrderTarget> reordered;
     SampleOrderPass reorderPass;
     std::optional<DepthSampleLocations> depthLocations;
+    // Route::NewPath (APS5_NEW_PATH_EMIT_DRAWS): `pipeline` is the twins' pipeline; the push block is the
+    // resolved prefix over today's assembled block, read through the admitted table.
+    struct NewPathDraw {
+        std::shared_ptr<const BdaPageTable> table;
+        NewPath::TableLists lists;
+        std::vector<NewPath::DrawStage> stages;
+        std::vector<std::shared_ptr<const ShaderRecompiler::RecompileResult>> twins;
+        std::uint64_t programVariant = 0;
+    };
+    std::shared_ptr<NewPathDraw> newPath;
 };
 
 // A remapped viewport depth range reads its scale and offset from the draw's push block (the vertex shader's
@@ -2823,6 +2840,122 @@ bool WriteOnlyPasses() {
     return enabled;
 }
 
+// The twins' pipeline of a class A draw, created by NewPath::DrawTwinPipelines' workers (never here with the
+// pipeline gate on: null until it is ready, and the draw falls back as no-pipeline). Once created it lives in
+// the pipeline store like any other; a ready key is served from there (rebuilt only if the store evicted it).
+std::shared_ptr<Pipeline> drawTwinPipeline(const Context& context, const State& pipelineState, const VertexInputLayout& vertexInput, const PipelineSetLayouts& layouts, std::span<const CompiledShader> shaders, const std::vector<std::shared_ptr<const ShaderRecompiler::RecompileResult>>& twins) {
+    auto& counts = NewPath::DrawCounts();
+    std::vector<CompiledShader> twinShaders;
+    twinShaders.reserve(shaders.size());
+    for (std::size_t index = 0; index < shaders.size(); ++index) twinShaders.push_back({shaders[index].stage, twins[index].get(), shaders[index].pushConstantOffset});
+    const auto key = CachedPipelineKey(context, pipelineState, vertexInput, layouts, twinShaders, VK_IMAGE_LAYOUT_GENERAL);
+    if (key == 0) {
+        counts.uncachedPipelines.fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
+    }
+    NewPath::NoteDrawTwinPipelines();
+    counts.pipelineRequests.fetch_add(1, std::memory_order_relaxed);
+    auto workerContext = context;
+    workerContext.bufferPool.reset();
+    const auto lookup = NewPath::DrawTwinPipelines().Request(key, [workerContext, state = pipelineState, vertexInput, layouts, stages = twinShaders, twins]() -> NewPath::PipelineHandle {
+        static_cast<void>(CachedPipeline(workerContext, state, vertexInput, layouts, stages, VK_IMAGE_LAYOUT_GENERAL));
+        return std::make_shared<int>(0);
+    }, NewPath::PipelineAhead::Options{true, false});
+    if (lookup == NewPath::PipelineAhead::Lookup::Unknown) {
+        counts.pipelineFailed.fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
+    }
+    if (lookup == NewPath::PipelineAhead::Lookup::Pending) {
+        counts.pipelineNotReady.fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
+    }
+    bool created = false;
+    auto pipeline = CachedPipeline(context, pipelineState, vertexInput, layouts, twinShaders, VK_IMAGE_LAYOUT_GENERAL, &created);
+    if (created) counts.pipelineRebuilt.fetch_add(1, std::memory_order_relaxed);
+    return pipeline;
+}
+
+// The new-path decision for a lean draw (router F1-F7 with the draw facts), made before anything is
+// recorded: on Route::NewPath the record carries the twins' pipeline and what the push needs.
+void routeLeanDraw(NewPath::EmitCandidate& emit, const Context& context, const State& state, const State& pipelineState, const VertexInputLayout& vertexInput, std::span<const CompiledShader> shaders, std::size_t kind, RecordedDraw& record) {
+    auto facts = emit.facts;
+    facts.classA = kind == KindBda;
+    facts.lean = true;
+    std::shared_ptr<RecordedDraw::NewPathDraw> chosen;
+    std::shared_ptr<Pipeline> twinPipeline;
+    if (!facts.kindSwitchOff && !facts.suspended && facts.classA) {
+        auto& counts = NewPath::DrawCounts();
+        auto& resources = *record.resources;
+        chosen = std::make_shared<RecordedDraw::NewPathDraw>();
+        for (const auto& shader : shaders) chosen->stages.push_back({shader.stage, shader.program, shader.pushConstantOffset});
+        const NewPath::DrawShape shape{state.stages.tessellation.has_value(), state.stages.mesh.has_value(), state.rectList, state.depthRemap.mode != 0u, !record.stencilReplay.empty(), record.blended != nullptr || !state.blendedColors.empty(), record.pipeline->SplitsFaces() || record.pipeline->SplitsSecondChannel()};
+        const auto refusal = NewPath::DrawShapeRefusal(chosen->stages, shape);
+        facts.shapeSupported = refusal == NewPath::ShapeRefusal::None;
+        if (!facts.shapeSupported) counts.shapes[static_cast<std::size_t>(refusal)].fetch_add(1, std::memory_order_relaxed);
+        if (facts.shapeSupported) {
+            chosen->twins = NewPath::DrawTwinsOf(chosen->stages, NewPath::DrawStageTwins());
+            facts.resolvedProgram = !chosen->twins.empty();
+            facts.pushFits = NewPath::DrawPushFits(chosen->stages);
+            facts.clothGuard = resources.HasAddressOverlays();
+        }
+        static const bool profileFacts = [] { const char* value = std::getenv("APS5_PROFILE_NEW_PATH"); return value != nullptr && value[0] != ' ' && std::strcmp(value, "0") != 0; }();
+        const bool compareTable = facts.shapeSupported && facts.pushFits && !facts.clothGuard && (facts.resolvedProgram || profileFacts);
+        counts.classA.fetch_add(1, std::memory_order_relaxed);
+        counts.lean.fetch_add(1, std::memory_order_relaxed);
+        if (facts.shapeSupported) counts.shapeOk.fetch_add(1, std::memory_order_relaxed);
+        if (facts.shapeSupported && facts.resolvedProgram) counts.twinned.fetch_add(1, std::memory_order_relaxed);
+        if (facts.shapeSupported && facts.pushFits) counts.pushFits.fetch_add(1, std::memory_order_relaxed);
+        if (facts.shapeSupported && !facts.clothGuard) counts.noCloth.fetch_add(1, std::memory_order_relaxed);
+        if (compareTable) {
+            auto& table = NewPath::DeviceTable();
+            if (table.Stale(context.device)) static_cast<void>(table.Refresh(context));
+            NewPath::DevicePageTable::Snapshot admitted;
+            const auto cover = table.Covers(resources.AddressTableRanges(), &admitted);
+            counts.covers[static_cast<std::size_t>(cover)].fetch_add(1, std::memory_order_relaxed);
+            facts.tableCovers = cover == NewPath::DevicePageTable::Cover::Covered && admitted.table != nullptr;
+            if (facts.tableCovers) {
+                counts.covered.fetch_add(1, std::memory_order_relaxed);
+                counts.eligible.fetch_add(1, std::memory_order_relaxed);
+            }
+            chosen->table = std::move(admitted.table);
+            chosen->lists = std::move(admitted.lists);
+        }
+        if (NewPath::WouldEmit(facts)) {
+            twinPipeline = drawTwinPipeline(context, pipelineState, vertexInput, resources.SetLayouts(), shaders, chosen->twins);
+            facts.pipelineReady = twinPipeline != nullptr;
+        }
+    }
+    if (NewPath::NoteEmit(emit, facts).route != NewPath::Route::NewPath) return;
+    emit.addressBased = true;
+    chosen->programVariant = shaders.empty() || shaders.back().program == nullptr ? 0 : shaders.back().program->variantId;
+    record.pipeline = std::move(twinPipeline);
+    record.newPath = std::move(chosen);
+}
+
+// Route::NewPath's push: the resolved prefix (admitted table root, a zeroed per-draw command record) over
+// today's assembled and patched block; the record completes with the batch (faults throw, written pages
+// are marked as for an emitted dispatch).
+void pushResolvedDrawConstants(const Context& context, Recorder& recorder, VkCommandBuffer commands, const RecordedDraw& record, std::span<const CompiledShader> shaders, const ShaderResources& resources) {
+    auto& newPath = *record.newPath;
+    auto block = AssemblePushConstants(shaders);
+    resources.PatchPushConstants(block);
+    auto& table = NewPath::DeviceTable();
+    auto commandRecord = table.TakeRecord(context);
+    const auto composed = NewPath::ComposeDrawPush(block, newPath.stages, static_cast<std::uint64_t>(newPath.table->Address()), static_cast<std::uint64_t>(commandRecord->DeviceAddress()));
+    Require(composed.has_value(), "a new-path draw's push block does not fit the resolved prefix");
+    NewPath::DrawCounts().records.fetch_add(1, std::memory_order_relaxed);
+    recorder.Keep(commandRecord);
+    recorder.OnComplete([commandRecord, leased = newPath.lists.writable, device = context.device, variant = newPath.programVariant] {
+        auto bytes = commandRecord->Bytes();
+        NewPath::ObserveCommandRecord(std::span<const std::uint32_t, NewPath::CommandRecordWords>(reinterpret_cast<const std::uint32_t*>(bytes.data()), NewPath::CommandRecordWords));
+        const auto outcome = NewPath::CompleteCommandRecord(std::span<std::uint32_t, NewPath::CommandRecordWords>(reinterpret_cast<std::uint32_t*>(bytes.data()), NewPath::CommandRecordWords), leased != nullptr ? std::span<const NewPath::AddressRange>(*leased) : std::span<const NewPath::AddressRange>{}, [](std::uint64_t address, std::size_t size) { static_cast<void>(GuestMemory::MarkPossiblyWritten(address, size)); });
+        NewPath::DeviceTable().ReturnRecord(commandRecord, device);
+        Require(!outcome.faulted, outcome.message + " in a draw (program variant " + std::to_string(variant) + ")");
+        Require(!outcome.invalid, "a new-path draw's written-page record is invalid");
+    });
+    record.pipeline->PushConstants(commands, 0, *composed);
+}
+
 void recordDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawInputs& inputs, RecordedDraw& record, DrawOutcome& outcome, DrawTimer& timer, double& ownWaitedMs, const DrawTraceContext* trace = nullptr) {
     std::uint32_t subdraw = 0;
     auto* recorder = record.recorder;
@@ -2916,7 +3049,9 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     }
     const PassAccess passAccess{passReads, passWrites, passImages, passAttachments, unknownMemory, unknownWrites, passWriteOnly};
     const bool fenced = state.depth.has_value() || !record.proxies.empty() || record.blended != nullptr;
-    const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect || record.blended != nullptr || heap || PixelFunctionLdsSubgroup(shaders) != 0u, fenced, passAccess);
+    const auto lane = static_cast<std::uint32_t>(Recorder::ThreadLane());
+    const bool tableUpload = record.newPath != nullptr && record.newPath->table->NeedsUploads(lane);
+    const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect || record.blended != nullptr || heap || PixelFunctionLdsSubgroup(shaders) != 0u || tableUpload, fenced, passAccess);
     for (const auto& target : record.multisampleTargets) KeepMultisampleTarget_nid_no_patch(target);
     const bool continued = start.continued;
     outcome.passContinued = continued;
@@ -2949,6 +3084,11 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     VkDeviceSize argumentOffset = 0;
     bool rewritten = false;
     if (!meshIndirect && !inputs.restartTable.empty()) meshArguments = directMeshArguments(context, draw, inputs.restartTable);
+    if (record.newPath != nullptr) {
+        Require(!(continued && tableUpload), "a new-path draw's table upload landed inside a continued pass");
+        if (tableUpload && NewPath::UploadTableForLane(context, *recorder, record.newPath->table, lane)) NewPath::DrawCounts().tableUploads.fetch_add(1, std::memory_order_relaxed);
+        else recorder->Keep(std::const_pointer_cast<BdaPageTable>(record.newPath->table));
+    }
     if (continued) {
         record.pipeline->Continue(commands, state, &recorder->PassBound());
     } else {
@@ -2997,7 +3137,8 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     if (record.pipeline->HeapStages() != 0u) context.bindlessTable->Heap().Bind(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout(), record.pipeline->HeapStages());
     if (std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->functionLdsBuffer; })) BindPixelFunctionLds(context, commands, record.pipeline->Layout());
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
-    pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, record.pushBytes, record.pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty());
+    if (record.newPath != nullptr) pushResolvedDrawConstants(context, *recorder, commands, record, shaders, resources);
+    else pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, record.pushBytes, record.pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty());
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
     if (record.stencilReplay.empty()) recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset, trace, subdraw);
     else {
@@ -3657,6 +3798,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
         record.reordered = reordered;
         record.reorderPass = reorderPass;
         record.depthLocations = depthLocations;
+        if (auto* emit = NewPath::CurrentDrawEmit()) routeLeanDraw(*emit, context, state, masked.has_value() ? *masked : state, inputs.VertexLayout(), shaders, outcome.kind, record);
         recordDraw(context, state, draw, shaders, inputs, record, outcome, timer, ownWaitedMs, preparation.trace);
         // The recipe for the caller's draw-cache entry (design_cpu_final M8, rule R3 for draws):
         // only a template the resource cache serves under this content key (reusable: no lease,
@@ -3687,6 +3829,13 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
         timing.Mark("draw_and_resource_release");
         report(outcome.waited ? (outcome.reason == SyncLease ? " recorded then waited (lease)" : " recorded then waited (copied writes)") : completion ? " recorded with completion" : " recorded");
         return;
+    }
+    if (auto* emit = NewPath::CurrentDrawEmit()) {
+        auto facts = emit->facts;
+        facts.classA = outcome.kind == KindBda;
+        facts.lean = false;
+        if (facts.classA) NewPath::DrawCounts().classA.fetch_add(1, std::memory_order_relaxed);
+        static_cast<void>(NewPath::NoteEmit(*emit, facts));
     }
     const bool heap = BindlessHeapStages(shaders) != 0u;
     std::shared_ptr<void> heldRing;
@@ -4000,6 +4149,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     preparation.recipeOut = recipeOut;
     preparation.trace = trace;
     if (profile) NewPath::DrawCensus::Begin(shaders, draw);
+    const NewPath::DrawEmitScope drawEmit(NewPath::EmitDraws() ? NewPath::ClaimDraw() : nullptr);
     if (prepareDraw(context, state, draw, shaders, snapshots, prepared, ahead, preparation)) recordPreparedDraw(context, state, draw, shaders, preparation);
 }
 
@@ -4011,6 +4161,13 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     DrawTimer timer(profile);
     DrawRecipeOutcome result;
+    struct RecipeClaim {
+        std::shared_ptr<NewPath::EmitCandidate> candidate;
+        const DrawRecipeOutcome& result;
+        ~RecipeClaim() {
+            if (candidate != nullptr && !result.recorded) candidate->noted.store(true, std::memory_order_relaxed);
+        }
+    } recipeClaim{NewPath::EmitDraws() ? NewPath::ClaimDraw() : nullptr, result};
     DrawOutcome outcome;
     outcome.kind = KindRecipeHit;
     const auto waitedBefore = profile ? Recorder::ThreadWaitedMs() : 0.0;

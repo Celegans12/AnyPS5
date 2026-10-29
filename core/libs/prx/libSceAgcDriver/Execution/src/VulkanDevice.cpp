@@ -2439,6 +2439,7 @@ void VulkanDevice::startJournalReplay() {
 
 VulkanDevice::~VulkanDevice() {
     if (state != nullptr && state->twinPipelinesUsed.load(std::memory_order_relaxed)) NewPath::TwinPipelineStore().Stop();
+    NewPath::StopDrawTwinPipelines();
     if (state != nullptr && state->recorder != nullptr) Graphics::SetHtileFillOnGpu(state->recorder.get(), nullptr);
 }
 
@@ -2525,6 +2526,7 @@ void VulkanDevice::PrepareForReplacement() {
     }
     DriverDetail::AwaitLibraryPrebuilds();
     if (state->twinPipelinesUsed.load(std::memory_order_relaxed)) NewPath::TwinPipelineStore().Stop();
+    NewPath::StopDrawTwinPipelines();
     Graphics::FlushCachedTextures(state->device);
     Graphics::PublishAllShadows(state->context, Graphics::PublishReason::Teardown);
     WaitIdle();
