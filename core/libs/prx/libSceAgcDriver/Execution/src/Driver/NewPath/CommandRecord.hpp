@@ -29,6 +29,12 @@ void ClearCommandRecord(std::span<std::uint32_t, CommandRecordWords> words);
 [[nodiscard]] bool CommandRecordClear(std::span<const std::uint32_t, CommandRecordWords> words);
 RecordOutcome CompleteCommandRecord(std::span<std::uint32_t, CommandRecordWords> words, std::span<const AddressRange> leased, const MarkWritten& mark);
 
+// Tests only: VulkanDevice hands every resolved dispatch's record to the observer at completion, before it is read and
+// cleared (agc_driver_newpath_walk_device reads the walk's fault and written pages back this way). Empty: none.
+using RecordObserver = std::function<void(std::span<const std::uint32_t, CommandRecordWords> words)>;
+void SetCommandRecordObserver(RecordObserver observer);
+void ObserveCommandRecord(std::span<const std::uint32_t, CommandRecordWords> words);
+
 }
 
 #endif

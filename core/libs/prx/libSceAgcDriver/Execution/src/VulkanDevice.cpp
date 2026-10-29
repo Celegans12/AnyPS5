@@ -5919,6 +5919,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         recorder.Keep(commandRecord);
         recorder.OnComplete([commandRecord, leased = table.Lists().writable, device = context.device, programAddress = record.programAddress] {
             auto bytes = commandRecord->Bytes();
+            NewPath::ObserveCommandRecord(std::span<const std::uint32_t, NewPath::CommandRecordWords>(reinterpret_cast<const std::uint32_t*>(bytes.data()), NewPath::CommandRecordWords));
             const auto outcome = NewPath::CompleteCommandRecord(std::span<std::uint32_t, NewPath::CommandRecordWords>(reinterpret_cast<std::uint32_t*>(bytes.data()), NewPath::CommandRecordWords), leased != nullptr ? std::span<const NewPath::AddressRange>(*leased) : std::span<const NewPath::AddressRange>{}, [](std::uint64_t address, std::size_t size) { static_cast<void>(GuestMemory::MarkPossiblyWritten(address, size)); });
             NewPath::DeviceTable().ReturnRecord(commandRecord, device);
             Graphics::Require(!outcome.faulted, outcome.message + " in shader at " + std::to_string(programAddress));
