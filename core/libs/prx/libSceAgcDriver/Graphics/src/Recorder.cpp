@@ -1443,7 +1443,7 @@ int Recorder::ThreadLane() {
 
 namespace {
 
-std::atomic<std::uint64_t> laneHeldCompletions{0}, laneTemplateEdges[2]{}, laneSerialWaits{0}, laneHeldRetires{0}, laneForwardEdges[2]{};
+std::atomic<std::uint64_t> laneHeldCompletions{0}, laneTemplateEdges[2]{}, laneSerialWaits{0}, laneHeldRetires{0}, laneForwardEdges[2]{}, laneOpenWaitSubmits{0}, laneOpenWaitsInHand{0};
 
 }
 
@@ -1504,8 +1504,8 @@ void Recorder::CountTemplateEdge(bool beforeRefresh) {
 }
 
 std::string Recorder::LaneOrderReport() {
-    char text[768];
-    std::snprintf(text, sizeof(text), "[lane-order] (cumulative) completed-through answers / retired-serial updates lowered by a batch opened before the other lane's submission %llu / %llu (APS5_NO_LANE_OPEN_SERIAL %s); cached-template data edges to the other lane: after its refresh %llu, before a refresh over its reads %llu (APS5_NO_LANE_TEMPLATE_EDGE %s); batches given a wait for the other lane by APS5_LANE_SERIALIZE %llu (%s); cross-lane edges kept off recorded work (APS5_NO_LANE_FORWARD_EDGE %s): other lane submitted first %llu, own lane split at its next command %llu", static_cast<unsigned long long>(laneHeldCompletions.load()), static_cast<unsigned long long>(laneHeldRetires.load()), RuntimeSwitches::Set(RuntimeSwitch::NoLaneOpenSerial) ? "set" : "unset", static_cast<unsigned long long>(laneTemplateEdges[1].load()), static_cast<unsigned long long>(laneTemplateEdges[0].load()), RuntimeSwitches::Set(RuntimeSwitch::NoLaneTemplateEdge) ? "set" : "unset", static_cast<unsigned long long>(laneSerialWaits.load()), RuntimeSwitches::Set(RuntimeSwitch::LaneSerialize) ? "set" : "unset", RuntimeSwitches::Set(RuntimeSwitch::NoLaneForwardEdge) ? "set" : "unset", static_cast<unsigned long long>(laneForwardEdges[0].load()), static_cast<unsigned long long>(laneForwardEdges[1].load()));
+    char text[1024];
+    std::snprintf(text, sizeof(text), "[lane-order] (cumulative) completed-through answers / retired-serial updates lowered by a batch opened before the other lane's submission %llu / %llu (APS5_NO_LANE_OPEN_SERIAL %s); cached-template data edges to the other lane: after its refresh %llu, before a refresh over its reads %llu (APS5_NO_LANE_TEMPLATE_EDGE %s); batches given a wait for the other lane by APS5_LANE_SERIALIZE %llu (%s); cross-lane edges kept off recorded work (APS5_NO_LANE_FORWARD_EDGE %s): other lane submitted first %llu, own lane split at its next command %llu; open batches of the other lane submitted before a blocking wait (APS5_NO_LANE_OPEN_WAIT %s) %llu, left open because this thread held its command buffer %llu", static_cast<unsigned long long>(laneHeldCompletions.load()), static_cast<unsigned long long>(laneHeldRetires.load()), RuntimeSwitches::Set(RuntimeSwitch::NoLaneOpenSerial) ? "set" : "unset", static_cast<unsigned long long>(laneTemplateEdges[1].load()), static_cast<unsigned long long>(laneTemplateEdges[0].load()), RuntimeSwitches::Set(RuntimeSwitch::NoLaneTemplateEdge) ? "set" : "unset", static_cast<unsigned long long>(laneSerialWaits.load()), RuntimeSwitches::Set(RuntimeSwitch::LaneSerialize) ? "set" : "unset", RuntimeSwitches::Set(RuntimeSwitch::NoLaneForwardEdge) ? "set" : "unset", static_cast<unsigned long long>(laneForwardEdges[0].load()), static_cast<unsigned long long>(laneForwardEdges[1].load()), RuntimeSwitches::Set(RuntimeSwitch::NoLaneOpenWait) ? "set" : "unset", static_cast<unsigned long long>(laneOpenWaitSubmits.load()), static_cast<unsigned long long>(laneOpenWaitsInHand.load()));
     return text;
 }
 
@@ -1566,6 +1566,31 @@ void Recorder::submitLane(int lane) {
     if (lanes[static_cast<std::size_t>(lane)] == nullptr) return;
     const LaneScope scope(lane);
     Submit();
+}
+
+void Recorder::submitOtherLaneBeforeWait(const Batch& awaited) {
+    if (asyncTimeline == VK_NULL_HANDLE || awaited.lane < 0 || awaited.lane > 1) return;
+    const int other = 1 - awaited.lane;
+    if (lanes[static_cast<std::size_t>(other)] == nullptr || RuntimeSwitches::Set(RuntimeSwitch::NoLaneOpenWait)) return;
+    if (fenceStatus(awaited.fence) == VK_SUCCESS) return;
+    if (other == currentLane() && CommandBufferInHand()) {
+        // This thread records into that batch's buffer next (CommandInHand): submitting it would
+        // end the buffer under the caller. Counted; the wait goes ahead as before.
+        laneOpenWaitsInHand.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    laneOpenWaitSubmits.fetch_add(1, std::memory_order_relaxed);
+    submitLane(other);
+}
+
+void Recorder::submitOtherLaneBeforeWait(int lane, std::uint64_t serial) {
+    if (asyncTimeline == VK_NULL_HANDLE || serial == 0 || lanes[static_cast<std::size_t>(1 - lane)] == nullptr) return;
+    for (const auto& batch : inFlight) {
+        if (batch->serial == serial) {
+            submitOtherLaneBeforeWait(*batch);
+            return;
+        }
+    }
 }
 
 Recorder::Token Recorder::CallerToken() const {
@@ -5084,6 +5109,9 @@ void Recorder::Submit() {
     batch->submitted = true;
     batch->serial = ++submissions;
     laneSubmitted[static_cast<std::size_t>(batch->lane)] = batch->serial;
+    // A forward edge owed to the lane's next command (takeOwedEdge) moves to the lane's next batch
+    // when this one is submitted by another path (Sync, a wait submitting the other lane first).
+    if (batch->edgeOwed != 0) laneOwed[static_cast<std::size_t>(batch->lane)] = std::max(laneOwed[static_cast<std::size_t>(batch->lane)], std::exchange(batch->edgeOwed, 0));
     if (asyncTimeline != VK_NULL_HANDLE) {
         std::lock_guard logLock(laneLogMutex);
         laneLog.emplace_back(batch->serial, batch->lane);
@@ -5448,6 +5476,9 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
     announcedSource = 4;
     announcedSite = nullptr;
     if (targetSerial == 0) return true;
+    // The mutex is released for the wait, but the other lane's open batch could still be left for
+    // no thread to submit (see submitOtherLaneBeforeWait).
+    for (int lane = 0; lane < 2; ++lane) submitOtherLaneBeforeWait(lane, targets[static_cast<std::size_t>(lane)]);
     if (unsignaled(targets[0]) || unsignaled(targets[1])) ++hookRealWaits;
     // Everything the wait needs is copied out: the recorder may be torn down while the mutex is
     // released (its destructor completes every batch and waits for the semaphore to be left, see
@@ -5653,6 +5684,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
                 }
             }
         } report{profile, source, waitStart, *this, signaledAtStart};
+        submitOtherLaneBeforeWait(*batch);
         const auto waitFences = function(waitForFences, "vkWaitForFences");
         auto result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
         for (int waited = 5; result == VK_TIMEOUT; waited += 5) {
