@@ -1,11 +1,11 @@
 // agc_recorded_requests_v16_tests: the offline tools read the version-16 compute requests of the 2026-10-09 corpus
 // tree, which has neither the v13 float-mode bool nor the v16 float64DenormPreserve bool (tools/RecordedRequests.hpp).
 // The test builds both v16 layouts from a current compute request without a float mode: the current writer's tail
-// after narrowSubgroupClock is 30 bytes for a compute request without linked-call fallbacks (float64DenormPreserve 1,
+// after narrowSubgroupClock is 31 bytes for a compute request without linked-call fallbacks (float64DenormPreserve 1,
 // registrationModules 1, registrationWordLimit 4, vertexSubgroups 1, float16DenormPreserve 1, linkedCallFallbacks 8,
 // spannedWaves 1, depthRangeRemap 1, float32FlushToZero 1, float32DenormPreserve 1, fusedExactArithmetic 1,
-// largePixelFunctionLdsBuffer 1, pixelFunctionStorageDwords 4, singleWorkgroup 1, singleLaneGroups 1, newPathResolved 1, bdaSegments 1). Upstream v16 is the v49 stream
-// without its last 29 bytes; the corpus tree's v16 is that without the last byte too and without the float-mode bool
+// largePixelFunctionLdsBuffer 1, pixelFunctionStorageDwords 4, singleWorkgroup 1, singleLaneGroups 1, newPathResolved 1, bdaSegments 1, orderedWorkgroupWaves 1). Upstream v16 is the
+// v50 stream without its last 30 bytes; the corpus tree's v16 is that without the last byte too and without the float-mode bool
 // that follows the memory regions.
 #include "BdaAbi.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
@@ -71,11 +71,11 @@ int main() try {
     const auto plain = AgcDriver::RecordedRequests::Deserialize(current, &repaired);
     Expect(!repaired, "a current request was repaired");
 
-    const auto withBool = WithVersion(bytes, 16u, 29u);
+    const auto withBool = WithVersion(bytes, 16u, 30u);
     const auto read16 = RequestSerializer{}.Deserialize(withBool);
     Expect(read16.request.target.float64DenormPreserve, "v16 with float64DenormPreserve: the test's tail arithmetic no longer matches the writer");
 
-    const auto withoutBool = WithVersion(bytes, 16u, 30u, true);
+    const auto withoutBool = WithVersion(bytes, 16u, 31u, true);
     bool failed = false;
     try {
         static_cast<void>(RequestSerializer{}.Deserialize(withoutBool));
@@ -93,7 +93,7 @@ int main() try {
 
     failed = false;
     try {
-        static_cast<void>(AgcDriver::RecordedRequests::Deserialize(WithVersion(bytes, 15u, 31u, true)));
+        static_cast<void>(AgcDriver::RecordedRequests::Deserialize(WithVersion(bytes, 15u, 32u, true)));
     } catch (const std::runtime_error&) {
         failed = true;
     }

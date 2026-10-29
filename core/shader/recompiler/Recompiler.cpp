@@ -771,6 +771,7 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program)
     targetOptions.float16DenormPreserve = request.target.float16DenormPreserve;
     targetOptions.spannedWaves = request.target.spannedWaves;
     targetOptions.newPathResolved = request.target.newPathResolved;
+    targetOptions.orderedWorkgroupWaves = request.target.orderedWorkgroupWaves && request.shader.stage == ShaderStage::Compute;
     targetOptions.bindlessImages = request.target.bindlessImages;
     targetOptions.fusedFma = request.target.fusedFma;
     targetOptions.singleWorkgroup = request.context.compute.has_value() && request.context.compute->singleWorkgroup;

@@ -224,6 +224,7 @@ void Driver::resolveGroupAhead(const Submission& submission, const QueueState& l
                                                     localDevice->ComputeTarget(wave, address),
                                                     {0, 0, 0, 128}
                                                 };
+                                                request.target.orderedWorkgroupWaves = OrderedWorkgroupWaves(*registered, codeOffset);
                                                 try { static_cast<void>(InvocationFor(*registered, codeOffset, request)); } catch (const std::exception&) {}
                                             }, registered->prepared.get());
                                         } catch (const std::exception&) {}

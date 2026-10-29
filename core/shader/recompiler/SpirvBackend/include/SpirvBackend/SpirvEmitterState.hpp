@@ -128,6 +128,10 @@ struct SpirvEmitterState {
     bool fusedFma = false;
     // SpirvTarget::newPathResolved (see SpirvEmitter.hpp).
     bool newPathResolved = false;
+    // SpirvTarget::orderedWorkgroupWaves where it applies (OrderedWavesApply): a workgroup counter of returned
+    // invocations, each console wave waiting at entry until every earlier wave has returned.
+    bool orderedWorkgroupWaves = false;
+    std::uint32_t orderedWavesVariable = 0;
     // See ShaderComputeStageInfo::singleWorkgroup: glc reads through the plain binding, buffer-ordering s_barrier.
     bool singleWorkgroup = false;
     bool robustBufferAccess2 = false;
