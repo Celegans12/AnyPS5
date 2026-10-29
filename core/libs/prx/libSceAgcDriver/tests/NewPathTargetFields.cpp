@@ -3,6 +3,7 @@
 // module built today's way is ever cached under its key; newPathResolved recompiles (the page-table walk, compute).
 // orderedWorkgroupWaves (v50) is keyed and serialized too, and leaves the module unchanged where it does not apply: a
 // workgroup of one wave, and a program whose invocations a BDA fault can stop (the device test covers where it does).
+// newPathRuntimeBuffers (v51) is keyed and serialized, and refused without newPathResolved.
 #include "BdaAbi.hpp"
 #include "CacheKey.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
@@ -84,7 +85,24 @@ int main() try {
         const auto waves = Recompile(Request(false, false, true, 32u, threads));
         Expect(!plain.spirv.empty() && plain.spirv == waves.spirv, "orderedWorkgroupWaves changed a wave32 module of " + std::to_string(threads) + " threads where it does not apply");
     }
-    std::puts("NewPathTargetFields: newPathResolved, bdaSegments and orderedWorkgroupWaves are keyed and serialized; bdaSegments is refused until implemented");
+    auto runtime = Request(true, false);
+    runtime.target.newPathRuntimeBuffers = true;
+    std::vector<std::uint64_t> runtimeKey;
+    RecompileCacheKey::Build(runtime, runtimeKey);
+    Expect(runtimeKey != Key(true, false), "newPathRuntimeBuffers is not part of the recompile cache key");
+    Expect(RequestSerializer{}.Deserialize(RequestSerializer{}.Serialize(runtime)).request.target.newPathRuntimeBuffers, "newPathRuntimeBuffers did not survive request serialization");
+    Expect(!RequestSerializer{}.Deserialize(RequestSerializer{}.Serialize(Request(true, false))).request.target.newPathRuntimeBuffers, "newPathRuntimeBuffers appeared in request serialization");
+    Expect(!Recompile(runtime).spirv.empty(), "a resolved request with newPathRuntimeBuffers did not recompile");
+    auto alone = Request(false, false);
+    alone.target.newPathRuntimeBuffers = true;
+    bool refused = false;
+    try {
+        static_cast<void>(Recompile(alone));
+    } catch (const std::exception& error) {
+        refused = std::string_view(error.what()).find("needs newPathResolved") != std::string_view::npos;
+    }
+    Expect(refused, "newPathRuntimeBuffers without newPathResolved was not refused");
+    std::puts("NewPathTargetFields: newPathResolved, bdaSegments, orderedWorkgroupWaves and newPathRuntimeBuffers are keyed and serialized; bdaSegments is refused until implemented, newPathRuntimeBuffers without newPathResolved");
     return 0;
 } catch (const std::exception& error) {
     std::fprintf(stderr, "NewPathTargetFields: %s\n", error.what());

@@ -206,6 +206,7 @@ ShaderStageInputInfo RequestInputInfo(const RecompileRequest& request) {
     // per-stage push layout first).
     if (request.target.newPathResolved && request.shader.stage != ShaderStage::Compute) throw std::runtime_error("the newPathResolved target is implemented for compute programs only");
     if (request.target.bdaSegments) throw std::runtime_error("the bdaSegments target (segment programs) is not implemented yet");
+    if (request.target.newPathRuntimeBuffers && !request.target.newPathResolved) throw std::runtime_error("the newPathRuntimeBuffers target needs newPathResolved (its buffer accesses walk the device page table)");
     const auto* mesh = request.graphics && request.graphics->mesh ? &*request.graphics->mesh : nullptr;
     std::optional<TessellationConfiguration> tessellationCopy;
     if (request.graphics && request.graphics->tessellation) {
