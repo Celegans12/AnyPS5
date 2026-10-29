@@ -204,6 +204,11 @@ void commandRecords() {
     const auto faulted = CompleteCommandRecord(words, leased, mark);
     Expect(faulted.faulted && faulted.reason == BdaAbi::FaultReason::Unmapped && faulted.message.find("5000123000") != std::string::npos, "a fault record was not reported with its reason and address");
     Expect(CommandRecordClear(words), "a faulted record was not cleared");
+
+    words[BdaAbi::SrtGuardWord] = (2u << BdaAbi::SrtGuardStageShift) | 7u;
+    const auto guarded = CompleteCommandRecord(words, leased, mark);
+    Expect(guarded.faulted && guarded.message.find("SRT guard") != std::string::npos && guarded.message.find("stage 2") != std::string::npos, "an SRT guard trip in the record was not reported");
+    Expect(CommandRecordClear(words), "a guard-tripped record was not cleared");
 }
 
 BdaAbi::Range MakeRange(std::uint64_t begin, std::uint64_t end, std::uint32_t permissions) {
