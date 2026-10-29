@@ -303,6 +303,8 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/NewPath/CommandRecord.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/NewPath/PushBlock.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/NewPath/ResolvedPush.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/NewPath/PipelineAhead.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/NewPath/PipelineAheadConfig.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/NewPath/DevicePageTable.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/NewPath/Router.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Lifecycle.cpp
@@ -612,6 +614,29 @@ if(BUILD_TESTING)
     set_tests_properties(agc_newpath_emit PROPERTIES TIMEOUT 20)
     if(WIN32)
         set_tests_properties(agc_newpath_emit PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+
+    add_test_executable(agc_newpath_pipeline_gate_tests tests/NewPathPipelineGate.cpp Execution/src/Driver/NewPath/PipelineAhead.cpp)
+    target_include_directories(agc_newpath_pipeline_gate_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_newpath_pipeline_gate_tests PRIVATE libc)
+    configure_windows_unwind(agc_newpath_pipeline_gate_tests)
+    add_test(NAME agc_newpath_pipeline_gate COMMAND agc_newpath_pipeline_gate_tests)
+    set_tests_properties(agc_newpath_pipeline_gate PROPERTIES TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_newpath_pipeline_gate PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+
+    add_test_executable(agc_pending_write_ranges_tests tests/PendingWriteRanges.cpp)
+    target_include_directories(agc_pending_write_ranges_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_pending_write_ranges_tests PRIVATE libc)
+    set_target_properties(agc_pending_write_ranges_tests PROPERTIES CXX_EXTENSIONS OFF)
+    configure_windows_unwind(agc_pending_write_ranges_tests)
+    add_test(NAME agc_pending_write_ranges COMMAND agc_pending_write_ranges_tests)
+    set_tests_properties(agc_pending_write_ranges PROPERTIES TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_pending_write_ranges PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 
@@ -3076,6 +3101,16 @@ if(BUILD_TESTING)
     set_tests_properties(agc_driver_residency_faults_async_lane PROPERTIES SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 60)
     if(WIN32)
         set_tests_properties(agc_driver_residency_faults_async_lane PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    add_test(NAME agc_residency_session_reentry COMMAND agc_driver_residency_faults_tests --session-reentry)
+    set_tests_properties(agc_residency_session_reentry PROPERTIES SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 60)
+    if(WIN32)
+        set_tests_properties(agc_residency_session_reentry PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    add_test(NAME agc_residency_driver_sites COMMAND agc_driver_residency_faults_tests --driver-sites)
+    set_tests_properties(agc_residency_driver_sites PROPERTIES SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 60)
+    if(WIN32)
+        set_tests_properties(agc_residency_driver_sites PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test(NAME agc_driver_residency_driver_async_lane COMMAND agc_driver_residency_driver_tests --async-lane)
     set_tests_properties(agc_driver_residency_driver_async_lane PROPERTIES SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 60)

@@ -19,6 +19,14 @@ std::uint64_t residentMiB(const char* text) {
     return value;
 }
 
+std::uint32_t chunkPages(const char* text) {
+    char* end = nullptr;
+    errno = 0;
+    const auto value = std::strtoull(text, &end, 10);
+    if (errno != 0 || end == text || *end != '\0' || value == 0 || value > 65535) throw std::invalid_argument(std::string("APS5_NEW_PATH_RESIDENT_CHUNK_PAGES is not a page count from 1 to 65535: ") + text);
+    return static_cast<std::uint32_t>(value);
+}
+
 }
 
 ResidencyConfig ResidencyConfigFrom(ResidencyEnvironment environment) {
@@ -31,6 +39,9 @@ ResidencyConfig ResidencyConfigFrom(ResidencyEnvironment environment) {
         config.budgetForced = true;
         config.residentBytes = residentMiB(budget) * MiB;
     }
+    config.slotBinding = config.residency && environment("APS5_NEW_PATH_SLOT_BINDING") != nullptr;
+    const char* chunk = environment("APS5_NEW_PATH_RESIDENT_CHUNK_PAGES");
+    if (config.residency && chunk != nullptr && *chunk != '\0') config.chunkPages = chunkPages(chunk);
     return config;
 }
 

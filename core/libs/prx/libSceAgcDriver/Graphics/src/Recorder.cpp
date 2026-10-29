@@ -1568,6 +1568,57 @@ void Recorder::submitLane(int lane) {
     Submit();
 }
 
+Recorder::Token Recorder::CallerToken() const {
+    const auto lane = ThreadLane();
+    Require(lane >= 0 && static_cast<std::size_t>(lane) < LaneStreams, "the calling thread's lane has no token stream");
+    Token token{};
+    token[static_cast<std::size_t>(lane)] = OpenSerial();
+    return token;
+}
+
+Recorder::Token Recorder::AllToken() const {
+    Token token{};
+    for (std::size_t stream = 0; stream < LaneStreams; ++stream) token[stream] = OpenSerial();
+    return token;
+}
+
+std::uint64_t Recorder::TokenThrough(const Token& token) {
+    std::uint64_t through = 0;
+    for (std::size_t stream = 0; stream < LaneStreams; ++stream) through = std::max(through, token[stream]);
+    for (std::size_t stream = LaneStreams; stream < MaxStreams; ++stream) Require(token[stream] == 0, "a recorder token names a stream past the recorder's lanes");
+    return through;
+}
+
+bool Recorder::TokenReached(const Token& token) const {
+    return TokenThrough(token) <= CompletedThrough();
+}
+
+namespace {
+thread_local int commandsInHand = 0;
+}
+
+Recorder::CommandInHand::CommandInHand() {
+    ++commandsInHand;
+}
+
+Recorder::CommandInHand::~CommandInHand() {
+    --commandsInHand;
+}
+
+bool Recorder::CommandBufferInHand() {
+    return commandsInHand != 0;
+}
+
+void Recorder::FinishToken(const Token& token) {
+    if (TokenReached(token)) return;
+    Require(commandsInHand == 0, "a recorder token was finished while this thread holds a command buffer for a command it has not recorded yet (finishing would submit that buffer under it)");
+    SubmitAllLanes();
+    const auto submitted = UseSerial() - 1;
+    WaitSerial(submitted);
+    FinishUpTo(submitted);
+    Require(TokenReached(token), "a recorder token was not reached after every submitted batch completed");
+}
+
 void Recorder::SubmitAllLanes() {
     submitLane(1 - currentLane());
     Submit();
@@ -4200,54 +4251,20 @@ void Recorder::NotePendingWrites(std::span<const std::pair<std::uint64_t, std::u
 }
 
 void Recorder::publishPendingWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> additions) const {
-    if (activeRecorder != this) {
-        publishedWriteRangesValid = false;
-        return;
-    }
+    static_cast<void>(additions);
+    if (activeRecorder != this) return;
     const auto started = DrawProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    const auto previous = pendingWrites.load(std::memory_order_acquire);
-    const auto owned = publishedWriteRanges.lock();
-    const bool extend = !additions.empty() && previous != nullptr && previous == owned && publishedWriteRangesValid &&
-        std::all_of(additions.begin(), additions.end(), [](const auto& range) { return range.second > range.first; });
-    publishedWriteRangesValid = false;
-    auto merged = std::make_shared<WriteRanges>();
-    if (extend && additions.size() == 1) {
-        auto range = additions.front();
-        const auto first = std::partition_point(previous->begin(), previous->end(), [&](const auto& entry) { return entry.second < range.first; });
-        auto last = first;
-        while (last != previous->end() && last->first <= range.second) {
-            range.first = std::min(range.first, last->first);
-            range.second = std::max(range.second, last->second);
-            ++last;
-        }
-        merged->reserve(previous->size() - static_cast<std::size_t>(last - first) + 1);
-        merged->insert(merged->end(), previous->begin(), first);
-        merged->push_back(range);
-        merged->insert(merged->end(), last, previous->end());
-    } else {
-        if (extend) {
-            merged->reserve(previous->size() + additions.size());
-            merged->insert(merged->end(), previous->begin(), previous->end());
-            merged->insert(merged->end(), additions.begin(), additions.end());
-        } else {
-            forEachOpen([&](const Batch& batch) { merged->insert(merged->end(), batch.writes.begin(), batch.writes.end()); });
-            for (const auto& batch : inFlight) merged->insert(merged->end(), batch->writes.begin(), batch->writes.end());
-            for (const auto* batch : finishing) merged->insert(merged->end(), batch->writes.begin(), batch->writes.end());
-        }
-        std::sort(merged->begin(), merged->end());
-        std::size_t out = 0;
-        for (const auto& [begin, end] : *merged) {
-            if (out != 0 && begin <= (*merged)[out - 1].second) (*merged)[out - 1].second = std::max((*merged)[out - 1].second, end);
-            else (*merged)[out++] = {begin, end};
-        }
-        merged->resize(out);
-    }
-    publishedWriteRangesValid = std::all_of(merged->begin(), merged->end(), [](const auto& range) { return range.second > range.first; });
-    publishedWriteRanges = merged;
-    published = merged;
-    pendingWrites.store(std::move(merged), std::memory_order_release);
+    std::vector<::AgcDriver::Graphics::PendingWriteRanges::Source> sources;
+    sources.reserve(lanes.size() + inFlight.size() + finishing.size());
+    const auto add = [&](const Batch& batch) { sources.push_back({&batch, batch.writes, batch.writeNotes}); };
+    forEachOpen(add);
+    for (const auto& batch : inFlight) add(*batch);
+    for (const auto* batch : finishing) add(*batch);
+    auto incremental = pendingWriteRanges.Publish(sources, pendingWrites.load(std::memory_order_acquire));
+    published = incremental.snapshot;
+    pendingWrites.store(std::move(incremental.snapshot), std::memory_order_release);
     publishGeneration.fetch_add(1, std::memory_order_release);
-    ++snapshotRebuilds;
+    if (incremental.rebuilt) ++snapshotRebuilds;
     if (DrawProfiled()) snapshotRebuildMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
 }
 

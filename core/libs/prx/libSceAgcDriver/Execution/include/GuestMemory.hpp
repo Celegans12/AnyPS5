@@ -328,6 +328,9 @@ unsigned long long CodeOffset(const void* address);
 void SetFlushHook(void (*hook)(std::uint64_t address, std::size_t bytes));
 void SetReadGuard(void (*guard)(std::uint64_t address, std::size_t bytes));
 void GuardRead(std::uint64_t address, std::size_t bytes);
+void SetGpuOwnedHooks(bool (*owned)(std::uint64_t address, std::size_t bytes), void (*publish)(std::uint64_t address, std::size_t bytes));
+bool GpuOwned(std::uint64_t address, std::size_t bytes);
+void PublishGpuOwned(std::uint64_t address, std::size_t bytes);
 void FlushGpuWrites(std::uint64_t address, std::size_t bytes);
 void PrepareHostWrite(std::uintptr_t address, std::size_t bytes);
 class ISpeculativeReadGate {

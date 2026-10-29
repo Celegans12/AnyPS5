@@ -3,8 +3,13 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include <memory>
 #include <mutex>
+#include <stdexcept>
+#include <type_traits>
 
 namespace AgcDriver::Graphics {
+
+static_assert(std::is_same_v<ResidencyToken, Recorder::Token>);
+static_assert(ResidencyLaneSlots == Recorder::LaneStreams);
 
 namespace {
 
@@ -30,6 +35,28 @@ public:
         std::unique_lock lock(GuestMemory::GpuMutex(), std::defer_lock);
         if (!GuestMemory::GpuMutex().HeldByThisThread()) lock.lock();
         recorder.FinishUpTo(serial);
+    }
+    bool NativeTokens() const override { return true; }
+    ResidencyToken CallerToken() const override { return recorder.CallerToken(); }
+    ResidencyToken AllToken() const override { return recorder.AllToken(); }
+    bool TokenReached(const ResidencyToken& token) const override {
+        std::unique_lock lock(GuestMemory::GpuMutex(), std::defer_lock);
+        if (!GuestMemory::GpuMutex().HeldByThisThread()) lock.lock();
+        return recorder.TokenReached(token);
+    }
+    void FinishToken(const ResidencyToken& token) override {
+        std::unique_lock lock(GuestMemory::GpuMutex(), std::defer_lock);
+        const bool held = GuestMemory::GpuMutex().HeldByThisThread();
+        if (!held) lock.lock();
+        if (recorder.TokenReached(token)) return;
+        if (Recorder::CommandBufferInHand()) throw std::logic_error("residency: a token was finished while this thread holds a command buffer for a command it has not recorded yet");
+        recorder.SubmitAllLanes();
+        const auto submitted = recorder.UseSerial() - 1;
+        if (!held) lock.unlock();
+        recorder.WaitSerial(submitted);
+        if (!held) lock.lock();
+        recorder.FinishUpTo(submitted);
+        if (!recorder.TokenReached(token)) throw std::logic_error("residency: a token not reached after every submitted batch completed");
     }
 
 private:

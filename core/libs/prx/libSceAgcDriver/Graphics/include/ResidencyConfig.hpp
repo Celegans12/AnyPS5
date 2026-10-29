@@ -9,6 +9,8 @@ struct ResidencyConfig {
     bool residency = false;
     bool budgetForced = false;
     std::uint64_t residentBytes = 0;
+    std::uint32_t chunkPages = 0;
+    bool slotBinding = false;
 };
 
 using ResidencyEnvironment = const char* (*)(const char* name);

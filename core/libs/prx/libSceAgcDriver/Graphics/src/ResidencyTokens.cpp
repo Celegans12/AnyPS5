@@ -16,6 +16,7 @@ std::uint64_t ResidencyTokens::Through(const ResidencyToken& token) {
 }
 
 ResidencyToken ResidencyTokens::Caller() const {
+    if (lanes.NativeTokens()) return lanes.CallerToken();
     const auto lane = lanes.CallerLane();
     if (lane < 0 || static_cast<std::size_t>(lane) >= ResidencyLaneSlots) throw std::logic_error("residency: the calling thread's lane has no token slot");
     ResidencyToken token{};
@@ -24,6 +25,7 @@ ResidencyToken ResidencyTokens::Caller() const {
 }
 
 ResidencyToken ResidencyTokens::All() const {
+    if (lanes.NativeTokens()) return lanes.AllToken();
     ResidencyToken token{};
     const auto open = lanes.OpenSerial();
     for (std::size_t slot = 0; slot < ResidencyLaneSlots; ++slot) token[slot] = open;
@@ -31,10 +33,15 @@ ResidencyToken ResidencyTokens::All() const {
 }
 
 bool ResidencyTokens::Reached(const ResidencyToken& token) const {
+    if (lanes.NativeTokens()) return lanes.TokenReached(token);
     return Through(token) <= lanes.CompletedThrough();
 }
 
 void ResidencyTokens::Finish(const ResidencyToken& token) {
+    if (lanes.NativeTokens()) {
+        lanes.FinishToken(token);
+        return;
+    }
     if (Reached(token)) return;
     lanes.SubmitAll();
     const auto submitted = lanes.SubmittedSerial();

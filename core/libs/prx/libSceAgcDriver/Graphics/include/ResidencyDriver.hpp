@@ -9,6 +9,8 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <mutex>
+#include <utility>
 #include <optional>
 #include <span>
 #include <vector>
@@ -68,6 +70,7 @@ public:
     ~ResidencyDriver() override;
 
     static ResidencyDriver* Active();
+    static bool Recording();
     static std::unique_ptr<ResidencyDriver> CreateIfEnabled(const Context& context, Recorder& recorder, IResidencyGuestMemory& guest);
 
     ResidencyManager& Manager() { return manager; }
@@ -80,6 +83,8 @@ public:
     std::uint64_t FastFaults() const { return fastFaults.load(std::memory_order_relaxed); }
     std::uint64_t ServedFaults() const { return servedFaults.load(std::memory_order_relaxed); }
     std::uint64_t RefusedFaults() const { return refusedFaults.load(std::memory_order_relaxed); }
+    std::uint64_t DriverPublishes() const { return driverPublishes.load(std::memory_order_relaxed); }
+    std::uint64_t WriteBackStamps() const { return writeBackStamps.load(std::memory_order_relaxed); }
 
     bool Reached(const ResidencyToken& token) override;
     void Wait(const ResidencyToken& token) override;
@@ -105,6 +110,12 @@ public:
 
 private:
     ResidencyToken record(std::span<const ResidencyCopy> copies, bool intoMirror);
+    bool stampPending(std::uint64_t address, std::size_t bytes);
+    void stampWrittenBack(std::uint64_t address, std::size_t bytes, bool all);
+    struct PendingStamp {
+        ResidencyToken token;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    };
     struct FaultServer;
 
     Context context;
@@ -119,6 +130,11 @@ private:
     std::atomic<std::uint64_t> fastFaults{0};
     std::atomic<std::uint64_t> servedFaults{0};
     std::atomic<std::uint64_t> refusedFaults{0};
+    std::atomic<std::uint64_t> driverPublishes{0};
+    std::atomic<std::uint64_t> writeBackStamps{0};
+    std::mutex stampMutex;
+    std::vector<PendingStamp> pendingStamps;
+    std::atomic<bool> stampsPending{false};
 };
 
 }

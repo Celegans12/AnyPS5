@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_RECORDER_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_RECORDER_HPP
 
+#include "prx/libSceAgcDriver/Graphics/include/PendingWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BarrierBatch.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PassHazards.hpp"
@@ -301,6 +302,22 @@ public:
     // lane's earlier-opened batch completed, while the first one still read it.
     // RetiredSerial() (a use noted at UseSerial()) is capped the same way when a batch finishes.
     std::uint64_t CompletedThrough() const;
+    static constexpr std::size_t MaxStreams = 16;
+    using Token = std::array<std::uint64_t, MaxStreams>;
+    static constexpr std::size_t LaneStreams = 2;
+    Token CallerToken() const;
+    Token AllToken() const;
+    static std::uint64_t TokenThrough(const Token& token);
+    bool TokenReached(const Token& token) const;
+    void FinishToken(const Token& token);
+    class CommandInHand {
+    public:
+        CommandInHand();
+        ~CommandInHand();
+        CommandInHand(const CommandInHand&) = delete;
+        CommandInHand& operator=(const CommandInHand&) = delete;
+    };
+    static bool CommandBufferInHand();
     // Under the mutex, async lane only: the calling thread's lane's open (or next) batch waits on the
     // GPU for everything lane `from` recorded so far (its open batch is submitted first).
     void OrderAfterLane(int from);
@@ -1246,6 +1263,7 @@ private:
     // snapshot (a rebuild from inside a completion must not drop them) until finish returns.
     std::vector<const Batch*> finishing;
     mutable std::shared_ptr<const WriteRanges> published;
+    mutable ::AgcDriver::Graphics::PendingWriteRanges pendingWriteRanges;
     std::uint64_t submissions = 0;
     std::atomic<std::uint64_t> submittedSerial{0};
     std::atomic<std::uint64_t> retiredSerial{0};
@@ -1317,8 +1335,6 @@ private:
     std::list<DrawSnapshotKey> indexRangeRecency;
     bool refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, std::size_t bytes);
     std::shared_ptr<Buffer> containingDrawSnapshot(std::uint64_t address, std::size_t bytes, VkDeviceSize* offset);
-    mutable std::weak_ptr<const WriteRanges> publishedWriteRanges;
-    mutable bool publishedWriteRangesValid = false;
 };
 
 }
