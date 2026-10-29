@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <string>
 
 namespace ShaderRecompiler {
 struct RecompileResult;
@@ -16,6 +17,7 @@ enum class TwinOutcome : std::uint8_t { Built, NotAddressBased, Failed, Mismatch
 inline constexpr std::size_t TwinOutcomeCount = 4;
 
 [[nodiscard]] bool UsesAddressTables(const ShaderRecompiler::RecompileResult& compiled);
+[[nodiscard]] std::string TwinDifference(const ShaderRecompiler::RecompileResult& compiled, const ShaderRecompiler::RecompileResult& twin);
 [[nodiscard]] bool TwinCompatible(const ShaderRecompiler::RecompileResult& compiled, const ShaderRecompiler::RecompileResult& twin);
 
 class ResolvedTwins {

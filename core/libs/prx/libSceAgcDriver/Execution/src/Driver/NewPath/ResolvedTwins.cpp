@@ -23,15 +23,32 @@ bool UsesAddressTables(const ShaderRecompiler::RecompileResult& compiled) {
     return std::ranges::any_of(compiled.bindings, [](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable; });
 }
 
-bool TwinCompatible(const ShaderRecompiler::RecompileResult& compiled, const ShaderRecompiler::RecompileResult& twin) {
-    if (!twin.newPathResolved || compiled.newPathResolved) return false;
-    if (compiled.bindings.size() != twin.bindings.size()) return false;
+std::string TwinDifference(const ShaderRecompiler::RecompileResult& compiled, const ShaderRecompiler::RecompileResult& twin) {
+    if (!twin.newPathResolved || compiled.newPathResolved) return "resolved marker";
+    std::size_t at = 0;
     for (std::size_t index = 0; index < compiled.bindings.size(); ++index) {
         const auto& left = compiled.bindings[index];
-        const auto& right = twin.bindings[index];
-        if (left.kind != right.kind || left.role != right.role || left.descriptorSet != right.descriptorSet || left.binding != right.binding || left.count != right.count || left.readOnly != right.readOnly || left.guestDescriptor != right.guestDescriptor) return false;
+        const bool walkReplaces = left.role == ShaderRecompiler::DescriptorRole::BdaPagetable || left.role == ShaderRecompiler::DescriptorRole::FaultBuffer;
+        if (at == twin.bindings.size() || twin.bindings[at].role != left.role || twin.bindings[at].binding != left.binding) {
+            if (walkReplaces) continue;
+            return "binding " + std::to_string(index) + " missing from the resolved module";
+        }
+        const auto& right = twin.bindings[at++];
+        if (left.kind != right.kind || left.descriptorSet != right.descriptorSet || left.count != right.count || left.readOnly != right.readOnly) return "binding " + std::to_string(index) + " shape";
+        if (left.guestDescriptor != right.guestDescriptor) return "binding " + std::to_string(index) + " guest descriptor words";
     }
-    return compiled.pushConstants == twin.pushConstants && compiled.specialization == twin.specialization && compiled.workgroupMemoryDwords == twin.workgroupMemoryDwords && compiled.bindlessHeap == twin.bindlessHeap && compiled.hostSubgroupSize == twin.hostSubgroupSize && compiled.imageMetadataDword == twin.imageMetadataDword && compiled.shaderDataDwords == twin.shaderDataDwords && compiled.bdaAbiVersion == twin.bdaAbiVersion;
+    if (at != twin.bindings.size()) return "the resolved module binds more than today's";
+    if (compiled.pushConstants != twin.pushConstants) return "push words (" + std::to_string(compiled.pushConstants.size()) + " vs " + std::to_string(twin.pushConstants.size()) + " bytes)";
+    if (compiled.specialization != twin.specialization) return "specialization";
+    if (compiled.workgroupMemoryDwords != twin.workgroupMemoryDwords) return "workgroup memory";
+    if (compiled.bindlessHeap != twin.bindlessHeap) return "bindless heap";
+    if (compiled.hostSubgroupSize != twin.hostSubgroupSize) return "subgroup size";
+    if (compiled.imageMetadataDword != twin.imageMetadataDword || compiled.shaderDataDwords != twin.shaderDataDwords) return "shader data";
+    return {};
+}
+
+bool TwinCompatible(const ShaderRecompiler::RecompileResult& compiled, const ShaderRecompiler::RecompileResult& twin) {
+    return TwinDifference(compiled, twin).empty();
 }
 
 void ResolvedTwins::Remember(const std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiled, std::shared_ptr<const ShaderRecompiler::RecompileResult> twin, TwinOutcome outcome) {

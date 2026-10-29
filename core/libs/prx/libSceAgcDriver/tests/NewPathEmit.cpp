@@ -238,6 +238,19 @@ void resolvedTwins() {
     auto otherBinding = AddressProgram(true);
     otherBinding->bindings[0].binding = 4;
     Expect(!TwinCompatible(*compiled, *otherBinding), "a twin with another binding number was accepted");
+    auto withBuffer = AddressProgram(false);
+    ShaderRecompiler::DescriptorBinding buffer{};
+    buffer.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+    buffer.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+    buffer.binding = 5;
+    buffer.count = 1;
+    buffer.guestDescriptor = {1, 2, 3, 4};
+    withBuffer->bindings.push_back(buffer);
+    auto walkOnly = AddressProgram(true);
+    walkOnly->bindings = {buffer};
+    Expect(TwinCompatible(*withBuffer, *walkOnly), "a twin that drops only the BDA table binding was refused");
+    auto lostBuffer = AddressProgram(true);
+    Expect(!TwinCompatible(*withBuffer, *lostBuffer), "a twin that drops a guest buffer binding was accepted");
 
     ResolvedTwins twins;
     twins.Remember(compiled, twin, TwinOutcome::Built);

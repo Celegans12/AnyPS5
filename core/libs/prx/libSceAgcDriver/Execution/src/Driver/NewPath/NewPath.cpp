@@ -132,7 +132,7 @@ std::shared_ptr<EmitCandidate> ClaimDispatch(const ShaderRecompiler::RecompileRe
     candidate->twin = Twins().Of(compiled);
     candidate->facts.resolvedProgram = candidate->twin != nullptr;
     candidate->facts.pushFits = LegacyPushBytes <= Abi::PushBlockBytes - ResolvedDriverWords * 4u;
-    candidate->facts.staticChains = !compiled.bindlessHeap;
+    candidate->facts.staticChains = true;
     return candidate;
 }
 

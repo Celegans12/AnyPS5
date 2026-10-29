@@ -36,7 +36,9 @@ namespace AgcDriver::DriverDetail {
 
 namespace {
 
-void buildResolvedTwin(const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::ResourceCapture& capture, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiled, VulkanDevice& device) {
+using TwinCapture = std::function<std::shared_ptr<const ShaderRecompiler::ResourceCapture>(const ShaderRecompiler::RecompileRequest&, ShaderRecompiler::PreparedShaderInvocation&)>;
+
+void buildResolvedTwin(const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request, const TwinCapture& capture, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiled) {
     auto& twins = NewPath::Twins();
     if (compiled == nullptr || compiled->newPathResolved || compiled->transferKernel.has_value() || !NewPath::UsesAddressTables(*compiled)) {
         twins.Remember(compiled, nullptr, NewPath::TwinOutcome::NotAddressBased);
@@ -46,14 +48,18 @@ void buildResolvedTwin(const ShaderSnapshot& snapshot, std::size_t codeOffset, c
     try {
         auto resolvedRequest = request;
         resolvedRequest.target.newPathResolved = true;
-        twin = InvocationFor(snapshot, codeOffset, resolvedRequest).Materialize(capture);
+        auto invocation = InvocationFor(snapshot, codeOffset, resolvedRequest);
+        const auto resolvedCapture = capture(resolvedRequest, invocation);
+        if (resolvedCapture != nullptr) twin = invocation.Materialize(*resolvedCapture);
     } catch (const std::exception& error) {
         static std::atomic<int> reported{0};
         if (reported.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[newpath] no resolved module for compute shader 0x%llx: %.200s\n", static_cast<unsigned long long>(request.shader.codeAddress), error.what());
         twins.Remember(compiled, nullptr, NewPath::TwinOutcome::Failed);
         return;
     }
-    if (twin == nullptr || !NewPath::TwinCompatible(*compiled, *twin) || device.PlannedComputeLayoutKey(*compiled) != device.PlannedComputeLayoutKey(*twin)) {
+    if (twin == nullptr || !NewPath::TwinCompatible(*compiled, *twin)) {
+        static std::atomic<int> reported{0};
+        if (twin != nullptr && reported.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[newpath] resolved module of compute shader 0x%llx differs: %s\n", static_cast<unsigned long long>(request.shader.codeAddress), NewPath::TwinDifference(*compiled, *twin).c_str());
         twins.Remember(compiled, nullptr, NewPath::TwinOutcome::Mismatch);
         return;
     }
@@ -553,7 +559,11 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
             timing.Mark("capture_resources");
             compiledResult = invocation.Materialize(*capture);
             CommandMix::NoteMaterialized(*compiledResult, *capture);
-            if (NewPath::EmitDispatches() && indirectArguments == 0) buildResolvedTwin(snapshot, codeOffset, request, *capture, compiledResult, *localDevice);
+            if (NewPath::EmitDispatches() && indirectArguments == 0) buildResolvedTwin(snapshot, codeOffset, [&] { auto source = request; source.context.memory = memory; return source; }(), [&](const ShaderRecompiler::RecompileRequest& resolvedRequest, ShaderRecompiler::PreparedShaderInvocation& resolvedInvocation) {
+                ShaderMemory resolvedMemory(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter(), &QueryPendingSpan);
+                const SampledReadScope sampling(evidenceReads);
+                return CaptureInvocation(resolvedMemory, snapshot, codeOffset, resolvedRequest, resolvedInvocation);
+            }, compiledResult);
             timing.Mark("materialize");
             if (compiledResult->cacheHit) ++cacheHits;
             const auto elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
