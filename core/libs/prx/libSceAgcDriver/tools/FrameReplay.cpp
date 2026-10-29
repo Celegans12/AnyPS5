@@ -21,6 +21,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <future>
 #include <map>
 #include <memory>
@@ -30,10 +31,12 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 #ifdef _WIN32
 #include <windows.h>
+#include <tlhelp32.h>
 #endif
 #ifdef __linux__
 #include "prx/libc/include/specifics/linux/HostMapping.hpp"
@@ -74,6 +77,53 @@ struct Options {
     std::chrono::seconds timeout{900};
     bool release = true;
     bool synthesize = true;
+    bool dedupePrologue = false;
+    bool hostRegions = false;
+};
+
+class PrologueDedupe {
+public:
+    bool Redundant(const FrameCall& call) {
+        const bool resolve = call.kind == FrameCallKind::ResolveShaderAbi || call.kind == FrameCallKind::ResolveGraphicsAbi || call.kind == FrameCallKind::ResolveGraphicsStagesAbi;
+        if (!resolve) {
+            ++epoch;
+            return false;
+        }
+        std::string key;
+        const auto put = [&](const void* data, std::size_t bytes) { key.append(static_cast<const char*>(data), bytes); };
+        const auto kind = static_cast<std::uint32_t>(call.kind);
+        put(&kind, sizeof(kind));
+        put(&call.queue, sizeof(call.queue));
+        put(&call.flags, sizeof(call.flags));
+        put(&call.address, sizeof(call.address));
+        put(&call.size, sizeof(call.size));
+        const auto count = [&](std::size_t value) { put(&value, sizeof(value)); };
+        count(call.values.size());
+        if (!call.values.empty()) put(call.values.data(), call.values.size() * sizeof(call.values[0]));
+        count(call.context.size());
+        for (const auto& reg : call.context) {
+            put(&reg.offset, sizeof(reg.offset));
+            put(&reg.value, sizeof(reg.value));
+        }
+        count(call.primitive.size());
+        for (const auto& reg : call.primitive) {
+            put(&reg.offset, sizeof(reg.offset));
+            put(&reg.value, sizeof(reg.value));
+        }
+        auto [entry, inserted] = seen.try_emplace(std::move(key), epoch);
+        if (inserted || entry->second != epoch) {
+            entry->second = epoch;
+            return false;
+        }
+        ++skipped;
+        return true;
+    }
+    std::uint64_t Skipped() const { return skipped; }
+
+private:
+    std::unordered_map<std::string, std::uint64_t> seen;
+    std::uint64_t epoch = 0;
+    std::uint64_t skipped = 0;
 };
 
 class Frames {
@@ -160,6 +210,81 @@ std::uint64_t headerNumber(const std::string& header, std::string_view key) {
     if (at == std::string::npos) throw std::runtime_error("frame replay: the capture header has no " + std::string(key));
     return std::strtoull(header.c_str() + at + quoted.size(), nullptr, 10);
 }
+
+using Interval = std::pair<std::uint64_t, std::uint64_t>;
+
+std::vector<Interval> HostCollisions(const FrameCaptureReader& reader, const std::function<bool(std::uint64_t, std::uint64_t)>& overlaps) {
+    std::vector<Interval> found;
+    for (const auto& chunk : reader.Chunks()) {
+        if (chunk.kind != FrameMemoryKind::Range || chunk.rangeKind == FrameRangeKind::Host) continue;
+        if (overlaps(chunk.address, chunk.bytes)) found.emplace_back(chunk.address, chunk.address + chunk.bytes);
+    }
+    return found;
+}
+
+#ifdef _WIN32
+std::string DescribeHostRegion(std::uint64_t address) {
+    MEMORY_BASIC_INFORMATION info{};
+    if (VirtualQuery(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)), &info, sizeof(info)) == 0) return "not queryable";
+    const auto base = reinterpret_cast<std::uintptr_t>(info.AllocationBase);
+    std::string owner;
+    if (info.Type == MEM_IMAGE) {
+        char name[MAX_PATH]{};
+        owner = GetModuleFileNameA(reinterpret_cast<HMODULE>(base), name, MAX_PATH) != 0 ? std::string("image ") + name : "image";
+    }
+    std::vector<HANDLE> heaps(256);
+    const auto count = GetProcessHeaps(static_cast<DWORD>(heaps.size()), heaps.data());
+    for (DWORD index = 0; index < count && index < heaps.size(); ++index) {
+        if (reinterpret_cast<std::uintptr_t>(heaps[index]) == base) owner = std::string("heap ") + (heaps[index] == GetProcessHeap() ? "(the process heap)" : std::to_string(index));
+    }
+    using Query = LONG(WINAPI*)(HANDLE, int, void*, ULONG, ULONG*);
+    const auto query = reinterpret_cast<Query>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryInformationThread")));
+    if (const auto snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0); snapshot != INVALID_HANDLE_VALUE && query != nullptr) {
+        THREADENTRY32 entry{};
+        entry.dwSize = sizeof(entry);
+        for (bool more = Thread32First(snapshot, &entry); more; more = Thread32Next(snapshot, &entry)) {
+            if (entry.th32OwnerProcessID != GetCurrentProcessId()) continue;
+            const auto thread = OpenThread(THREAD_QUERY_INFORMATION, FALSE, entry.th32ThreadID);
+            if (thread == nullptr) continue;
+            struct { LONG status; void* teb; void* process; void* thread; std::uintptr_t affinity; LONG priority; LONG basePriority; } basic{};
+            if (query(thread, 0, &basic, sizeof(basic), nullptr) == 0 && basic.teb != nullptr) {
+                const auto* tib = static_cast<const NT_TIB*>(basic.teb);
+                MEMORY_BASIC_INFORMATION stack{};
+                if (VirtualQuery(tib->StackLimit, &stack, sizeof(stack)) != 0 && stack.AllocationBase == info.AllocationBase) owner = "stack of thread " + std::to_string(entry.th32ThreadID);
+                if (reinterpret_cast<std::uintptr_t>(basic.teb) >= base && reinterpret_cast<std::uintptr_t>(basic.teb) < reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize) owner = "TEB of thread " + std::to_string(entry.th32ThreadID);
+            }
+            CloseHandle(thread);
+        }
+        CloseHandle(snapshot);
+    }
+    char text[320];
+    std::snprintf(text, sizeof(text), "region 0x%llx+0x%llx in allocation 0x%llx, %s %s, protect 0x%lx (allocated 0x%lx)%s%s",
+                  static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(info.BaseAddress)), static_cast<unsigned long long>(info.RegionSize), static_cast<unsigned long long>(base),
+                  info.State == MEM_COMMIT ? "committed" : info.State == MEM_RESERVE ? "reserved" : "free",
+                  info.Type == MEM_IMAGE ? "image" : info.Type == MEM_MAPPED ? "mapped" : "private", info.Protect, info.AllocationProtect,
+                  owner.empty() ? "" : ": ", owner.c_str());
+    return text;
+}
+
+int PrintHostRegions() {
+    std::uintptr_t base = 0;
+    std::size_t size = 0;
+    GuestArena::GuestArenaRange_nid_postfix(&base, &size);
+    std::size_t regions = 0;
+    for (std::uintptr_t at = base; at < base + size;) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info)) == 0) break;
+        const auto next = reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize;
+        if (info.State != MEM_FREE && GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(at, std::min<std::uintptr_t>(next, base + size) - at)) {
+            std::printf("host region %s\n", DescribeHostRegion(at).c_str());
+            ++regions;
+        }
+        at = next;
+    }
+    std::printf("%zu host regions in the guest arena 0x%llx+0x%llx\n", regions, static_cast<unsigned long long>(base), static_cast<unsigned long long>(size));
+    return 0;
+}
+#endif
 
 void restore(const FrameCaptureReader& reader, const FrameMemoryChunk& chunk) {
     reader.Read(chunk, std::span(reinterpret_cast<std::byte*>(static_cast<std::uintptr_t>(chunk.address)), static_cast<std::size_t>(chunk.bytes)));
@@ -883,7 +1008,7 @@ struct Replay {
 };
 
 int usage() {
-    std::fprintf(stderr, "usage: agc_frame_replay <capture directory> [--no-pace] [--no-release] [--release-after-ms <n>] [--strict] [--exact] [--frame-limit <n>] [--timeout-s <n>]\n"
+    std::fprintf(stderr, "usage: agc_frame_replay <capture directory> [--no-pace] [--no-release] [--release-after-ms <n>] [--strict] [--exact] [--frame-limit <n>] [--timeout-s <n>] [--dedupe-prologue]\n"
                          "                        [--dump <address>:<bytes>:<file>]...\n"
                          "  replays the driver calls and guest memory that APS5_FRAME_CAPTURE=<directory> recorded, through this\n"
                          "  build's AGC driver with no title running, and prints one JSON line with the frame times\n"
@@ -902,7 +1027,8 @@ int usage() {
                          "                      the 64 KiB blocks whose replayed bytes differ from the title's at that point; their replayed bytes go to <csv>.replay.bin\n"
                          "  --timeout-s <n>     exits with code 4 when the replay has no result after n seconds (900; 0 waits forever)\n"
                          "  --dump              writes guest memory to a file after the replay (hexadecimal or decimal)\n"
-                         "  --frames <dir>      writes each recorded and replayed display buffer as reference-<n>.bmp and replay-<n>.bmp\n");
+                         "  --frames <dir>      writes each recorded and replayed display buffer as reference-<n>.bmp and replay-<n>.bmp\n"
+                         "  --dedupe-prologue   skips prologue ABI resolutions identical to an earlier one with no registration or memory call between\n");
     return 2;
 }
 
@@ -920,12 +1046,21 @@ Dump parseDump(std::string_view text) {
     return {number(text.substr(0, first)), number(text.substr(first + 1, second - first - 1)), std::filesystem::path(std::string(text.substr(second + 1)))};
 }
 
+constexpr std::uint64_t DumpChunkBytes = 256ull << 20u;
+
+bool writeChunked(std::ostream& file, const std::byte* bytes, std::uint64_t size, std::uint64_t chunk = DumpChunkBytes) {
+    for (std::uint64_t at = 0; at < size && file.good(); at += chunk) {
+        const auto part = std::min(chunk, size - at);
+        file.write(reinterpret_cast<const char*>(bytes + at), static_cast<std::streamsize>(part));
+    }
+    return file.good();
+}
+
 void writeDump(const Dump& dump) {
     auto* const pointer = reinterpret_cast<const std::byte*>(static_cast<std::uintptr_t>(dump.address));
     GuestArena::GuestArenaPrepareHostRead_nid_no_patch(pointer, static_cast<std::size_t>(dump.bytes));
     std::ofstream file(dump.path, std::ios::binary | std::ios::trunc);
-    file.write(reinterpret_cast<const char*>(pointer), static_cast<std::streamsize>(dump.bytes));
-    if (!file.good()) throw std::runtime_error("frame replay: cannot write " + dump.path.string());
+    if (!writeChunked(file, pointer, dump.bytes) || !file.flush().good()) throw std::runtime_error("frame replay: cannot write " + dump.path.string());
 }
 
 struct FrameCheck {
@@ -1034,9 +1169,7 @@ void compareCheckpoint(const FrameCaptureReader& reader, const std::filesystem::
     std::fprintf(stderr, "[frame-replay] checkpoint: %llu of %llu changed blocks differ from the title (%.1f MiB of bytes), listed in %s\n", static_cast<unsigned long long>(differing), static_cast<unsigned long long>(blocks), static_cast<double>(differingBytes) / (1024.0 * 1024.0), path.string().c_str());
 }
 
-int run(const Options& options) {
-    const auto loadStart = Clock::now();
-    const FrameCaptureReader reader(options.directory);
+int run(const Options& options, const FrameCaptureReader& reader, Clock::time_point loadStart) {
     if (reader.Truncated()) std::fprintf(stderr, "[frame-replay] the capture is truncated; replaying the complete records\n");
     auto skipped = restoreMemory(reader);
     const auto loaded = Clock::now();
@@ -1050,14 +1183,18 @@ int run(const Options& options) {
     const auto frameStart = std::find_if(calls.begin(), calls.end(), [](const FrameCall& call) { return call.kind == FrameCallKind::FrameStart; });
     std::vector<const FrameMemoryChunk*> rewritten;
     const auto prologueStart = Clock::now();
+    PrologueDedupe dedupe;
     for (auto call = calls.begin(); call != frameStart; ++call) {
         if (call->kind == FrameCallKind::Memory) {
             if (const auto found = replay.groups.find(call->values.at(0)); found != replay.groups.end()) rewritten.insert(rewritten.end(), found->second.begin(), found->second.end());
         }
+        if (options.dedupePrologue && dedupe.Redundant(*call)) continue;
         replay.execute(*call);
     }
     if (!rewritten.empty()) restoreRewritten(reader, rewritten, replay.skipped);
-    std::fprintf(stderr, "[frame-replay] prologue: %zu calls in %.1f s, %zu shader images rewritten and restored, %llu stale registrations\n", static_cast<std::size_t>(frameStart - calls.begin()),
+    const auto prologueSeconds = std::chrono::duration<double>(Clock::now() - prologueStart).count();
+    const auto prologueSkipped = dedupe.Skipped();
+    std::fprintf(stderr, "[frame-replay] prologue: %zu calls (%llu redundant resolutions skipped) in %.1f s, %zu shader images rewritten and restored, %llu stale registrations\n", static_cast<std::size_t>(frameStart - calls.begin()), static_cast<unsigned long long>(dedupe.Skipped()),
                  std::chrono::duration<double>(Clock::now() - prologueStart).count(), rewritten.size(), static_cast<unsigned long long>(replay.staleRegistrations.load()));
     replay.recording = true;
     replay.startedAt = Clock::now();
@@ -1113,13 +1250,13 @@ int run(const Options& options) {
     std::sort(frameMs.begin(), frameMs.end());
     const auto percentile = [&](double fraction) { return frameMs.empty() ? 0.0 : frameMs[std::min(frameMs.size() - 1, static_cast<std::size_t>(fraction * static_cast<double>(frameMs.size())))]; };
     const auto seconds = std::chrono::duration<double>(replay.endedAt - replay.startedAt).count();
-    std::printf("{\"frames\":%zu,\"replay_s\":%.3f,\"fps\":%.3f,\"frame_ms\":{\"p50\":%.3f,\"p90\":%.3f,\"max\":%.3f,\"each\":[%s]},\"submits\":%llu,\"delta_mib\":%.1f,\"pace_timeouts\":%llu,\"memory_pace_timeouts\":%llu,\"pace_wait_s\":%.3f,\"stale_registrations\":%llu,\"failed_registrations\":%llu,\"skipped_mib\":%.1f,\"threads\":%zu,\"released_waits\":%llu,\"of_them_from_earlier_writes\":%llu,\"of_them_synthesized\":%llu,\"unfinished\":%llu,\"frames_compared\":%zu,\"pixels_identical\":%.6f,\"max_channel_diff\":%d,\"load_s\":%.3f,\"gaps\":\"%s\"}\n",
+    std::printf("{\"frames\":%zu,\"replay_s\":%.3f,\"fps\":%.3f,\"frame_ms\":{\"p50\":%.3f,\"p90\":%.3f,\"max\":%.3f,\"each\":[%s]},\"submits\":%llu,\"delta_mib\":%.1f,\"pace_timeouts\":%llu,\"memory_pace_timeouts\":%llu,\"pace_wait_s\":%.3f,\"stale_registrations\":%llu,\"failed_registrations\":%llu,\"skipped_mib\":%.1f,\"threads\":%zu,\"released_waits\":%llu,\"of_them_from_earlier_writes\":%llu,\"of_them_synthesized\":%llu,\"unfinished\":%llu,\"frames_compared\":%zu,\"pixels_identical\":%.6f,\"max_channel_diff\":%d,\"load_s\":%.3f,\"prologue_s\":%.3f,\"prologue_skipped\":%llu,\"gaps\":\"%s\"}\n",
                 ready.size(), seconds, seconds > 0 ? static_cast<double>(ready.size()) / seconds : 0.0, percentile(0.5), percentile(0.9), frameMs.empty() ? 0.0 : frameMs.back(), frameList.c_str(),
                 static_cast<unsigned long long>(replay.submits.load()), static_cast<double>(replay.deltaBytes.load()) / (1024.0 * 1024.0), static_cast<unsigned long long>(replay.paceTimeouts.load()), static_cast<unsigned long long>(replay.memoryPaceTimeouts.load()),
                 replay.paceWaitedSeconds(), static_cast<unsigned long long>(replay.staleRegistrations.load()), static_cast<unsigned long long>(replay.failedRegistrations.load()),
                 static_cast<double>(replay.skipped.bytes) / (1024.0 * 1024.0), replay.threads, static_cast<unsigned long long>(replay.earlyReleases.load()), static_cast<unsigned long long>(replay.lateReleases.load()),
                 static_cast<unsigned long long>(replay.syntheticReleases.load()),
-                static_cast<unsigned long long>(replay.unfinished), check.compared, check.identical, check.maxDifference, std::chrono::duration<double>(loaded - loadStart).count(), gaps.c_str());
+                static_cast<unsigned long long>(replay.unfinished), check.compared, check.identical, check.maxDifference, std::chrono::duration<double>(loaded - loadStart).count(), prologueSeconds, static_cast<unsigned long long>(prologueSkipped), gaps.c_str());
     std::fflush(stdout);
     if (options.strict && !gaps.empty()) {
         std::fprintf(stderr, "agc_frame_replay: --strict rejects this replay: %s\n", gaps.c_str());
@@ -1145,19 +1282,73 @@ int main(int argc, char** argv) {
         else if (argument == "--timeout-s" && index + 1 < argc) options.timeout = std::chrono::seconds(std::strtoll(argv[++index], nullptr, 10));
         else if (argument == "--dump" && index + 1 < argc) options.dumps.push_back(parseDump(argv[++index]));
         else if (argument == "--frames" && index + 1 < argc) options.frames = argv[++index];
+        else if (argument == "--host-regions") options.hostRegions = true;
+        else if (argument == "--dedupe-prologue") options.dedupePrologue = true;
         else if (!argument.starts_with("-") && options.directory.empty()) options.directory = argument;
         else return usage();
     }
+#ifdef _WIN32
+    if (options.hostRegions) return PrintHostRegions();
+#endif
     if (options.directory.empty()) return usage();
 #ifdef _WIN32
     _putenv_s("APS5_FRAME_CAPTURE", "");
 #else
     unsetenv("APS5_FRAME_CAPTURE");
 #endif
-    startWatchdog(options.timeout);
     int code = 2;
     try {
-        code = run(options);
+        const auto loadStart = Clock::now();
+        const FrameCaptureReader reader(options.directory);
+        auto collisions = HostCollisions(reader, [](std::uint64_t address, std::uint64_t bytes) { return GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(static_cast<std::uintptr_t>(address), static_cast<std::size_t>(bytes)); });
+        const char* attemptText = std::getenv("APS5_REPLAY_ATTEMPT");
+        const int attempt = attemptText != nullptr ? std::atoi(attemptText) : 1;
+        if (const char* test = std::getenv("APS5_REPLAY_TEST_COLLISIONS"); test != nullptr && collisions.empty() && attempt <= std::atoi(test)) {
+            for (const auto& chunk : reader.Chunks()) {
+                if (chunk.kind == FrameMemoryKind::Range && chunk.rangeKind != FrameRangeKind::Host) {
+                    collisions.emplace_back(chunk.address, chunk.address + chunk.bytes);
+                    break;
+                }
+            }
+        }
+        if (!collisions.empty()) {
+            for (const auto& [begin, end] : collisions) {
+                std::fprintf(stderr, "[frame-replay] start %d: the captured range 0x%llx+0x%llx lies on a host region of this process", attempt, static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin));
+#ifdef _WIN32
+                for (auto at = begin; at < end;) {
+                    MEMORY_BASIC_INFORMATION info{};
+                    if (VirtualQuery(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(at)), &info, sizeof(info)) == 0) break;
+                    const auto next = reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize;
+                    if (info.State != MEM_FREE && GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(static_cast<std::uintptr_t>(at), static_cast<std::size_t>(std::min<std::uint64_t>(next, end) - at))) std::fprintf(stderr, "; %s", DescribeHostRegion(at).c_str());
+                    at = next;
+                }
+#endif
+                std::fprintf(stderr, "\n");
+            }
+#ifdef _WIN32
+            if (attempt < 4) {
+                const auto next = std::to_string(attempt + 1);
+                _putenv_s("APS5_REPLAY_ATTEMPT", next.c_str());
+                std::fprintf(stderr, "[frame-replay] starting again (start %s of at most 4)\n", next.c_str());
+                std::fflush(stderr);
+                STARTUPINFOW startup{};
+                startup.cb = sizeof(startup);
+                PROCESS_INFORMATION process{};
+                std::wstring line = GetCommandLineW();
+                if (!CreateProcessW(nullptr, line.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &startup, &process)) throw std::runtime_error("frame replay: cannot start again after a host-region collision");
+                WaitForSingleObject(process.hThread, 0);
+                WaitForSingleObject(process.hProcess, INFINITE);
+                DWORD exitCode = 2;
+                GetExitCodeProcess(process.hProcess, &exitCode);
+                CloseHandle(process.hThread);
+                CloseHandle(process.hProcess);
+                hardExit(static_cast<int>(exitCode));
+            }
+#endif
+            throw std::runtime_error("frame replay: captured ranges lie on host regions of this process in every start");
+        }
+        startWatchdog(options.timeout);
+        code = run(options, reader, loadStart);
         if (code == 0) {
             AgcDriverShutdown_nid_postfix();
             return 0;

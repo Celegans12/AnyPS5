@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/FrameRecorder.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include <barrier>
+#include <sstream>
 
 namespace {
 
@@ -418,6 +419,56 @@ void testAliasedPages(const std::filesystem::path& directory) {
 }
 #endif
 
+void testHostCollisions(const std::filesystem::path& directory) {
+    FrameCaptureWriter writer(directory);
+    writer.WriteRange(0x10000000, 0x20000, FrameRangeKind::Watched, 3, FrameRangeAccess::Readable | FrameRangeAccess::Gpu);
+    writer.WriteRange(0x20000000, 0x10000, FrameRangeKind::Watched, 3, FrameRangeAccess::Readable);
+    writer.WriteRange(0x30000000, 0x10000, FrameRangeKind::Host, 3, FrameRangeAccess::Readable | FrameRangeAccess::Gpu);
+    writer.Finish("{}");
+    const FrameCaptureReader reader(directory);
+    const auto overlaps = [](std::uint64_t address, std::uint64_t bytes) {
+        const auto hits = [&](std::uint64_t begin, std::uint64_t end) { return address < end && begin < address + bytes; };
+        return hits(0x1001f000, 0x10021000) || hits(0x30000000, 0x30001000);
+    };
+    const auto found = HostCollisions(reader, overlaps);
+    check(found.size() == 1 && found[0].first == 0x10000000 && found[0].second == 0x10020000, "only the guest range on the host region collides");
+    check(HostCollisions(reader, [](std::uint64_t, std::uint64_t) { return false; }).empty(), "no host region, no collision");
+}
+
+void testPrologueDedupe() {
+    const auto resolve = [](std::uint64_t address, std::uint32_t context) {
+        FrameCall call;
+        call.kind = FrameCallKind::ResolveShaderAbi;
+        call.address = address;
+        call.context = {ShaderRegister{0x200, context}};
+        return call;
+    };
+    FrameCall registration;
+    registration.kind = FrameCallKind::RegisterShader;
+    FrameCall memory = memoryCall(1, 0);
+    PrologueDedupe dedupe;
+    check(!dedupe.Redundant(resolve(0x1000, 1)), "the first resolution is executed");
+    check(dedupe.Redundant(resolve(0x1000, 1)), "an identical repeat is skipped");
+    check(!dedupe.Redundant(resolve(0x1000, 2)), "other registers are a different resolution");
+    check(!dedupe.Redundant(registration), "a registration is never skipped");
+    check(!dedupe.Redundant(resolve(0x1000, 1)), "a repeat after a registration is executed");
+    check(dedupe.Redundant(resolve(0x1000, 1)), "and its repeat skipped again");
+    check(!dedupe.Redundant(memory), "a memory call is never skipped");
+    check(!dedupe.Redundant(resolve(0x1000, 1)), "a repeat after a memory call is executed");
+    check(dedupe.Skipped() == 2, "two skipped");
+}
+
+void testDumpChunks() {
+    std::vector<std::byte> bytes(10000);
+    for (std::size_t index = 0; index < bytes.size(); ++index) bytes[index] = static_cast<std::byte>(index * 7u);
+    std::ostringstream file(std::ios::binary);
+    check(writeChunked(file, bytes.data(), bytes.size(), 4096), "chunked write failed");
+    const auto written = file.str();
+    check(written.size() == bytes.size() && std::memcmp(written.data(), bytes.data(), bytes.size()) == 0, "chunked write changed the bytes");
+    std::ostringstream empty(std::ios::binary);
+    check(writeChunked(empty, bytes.data(), 0, 4096) && empty.str().empty(), "an empty dump wrote bytes");
+}
+
 int main(int argc, char** argv) {
     try {
         check(argc == 3, "expected a test name and capture directory");
@@ -429,6 +480,9 @@ int main(int argc, char** argv) {
         else if (mode == "host_neighbors") testHostNeighbors(directory);
         else if (mode == "unwatched") testUnwatched();
         else if (mode == "tokens") testEopTokens();
+        else if (mode == "dump_chunks") testDumpChunks();
+        else if (mode == "dedupe") testPrologueDedupe();
+        else if (mode == "host_collisions") testHostCollisions(directory);
         else if (mode == "blocking") testBlockingSubmission(directory);
         else if (mode == "shader" || mode == "shader_host") testShaderCode(directory, mode == "shader_host");
         else if (mode == "shader_prologue") testPrologueHeader(directory);
