@@ -206,6 +206,7 @@ ShaderStageInputInfo RequestInputInfo(const RecompileRequest& request) {
     // per-stage push layout first).
     if (request.target.newPathResolved && request.shader.stage != ShaderStage::Compute) throw std::runtime_error("the newPathResolved target is implemented for compute programs only");
     if (request.target.bdaSegments) throw std::runtime_error("the bdaSegments target (segment programs) is not implemented yet");
+    if (request.target.newPathRuntimeBuffers && !request.target.newPathResolved) throw std::runtime_error("the newPathRuntimeBuffers target needs newPathResolved (its buffer accesses walk the device page table)");
     const auto* mesh = request.graphics && request.graphics->mesh ? &*request.graphics->mesh : nullptr;
     std::optional<TessellationConfiguration> tessellationCopy;
     if (request.graphics && request.graphics->tessellation) {
@@ -1672,6 +1673,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
     result.workgroupMemoryDwords = WorkgroupMemoryStrideDwords(variant.info.info);
     result.bindings = std::move(bindings.bindings);
     if (std::ranges::none_of(result.bindings, [](const DescriptorBinding& binding) { return binding.role == DescriptorRole::BdaPagetable || binding.role == DescriptorRole::FaultBuffer; })) result.bdaAbiVersion = 0u;
+    const bool faultSink = result.bdaAbiVersion == BdaAbi::Version || (artifact.newPathResolved && artifact.bdaAbiVersion == BdaAbi::Version);
     if (result.hasDeferredDirectImage && (variant.info.stage != IrShaderStage::Compute || result.bdaAbiVersion != BdaAbi::Version)) throw std::runtime_error("deferred direct image requires a compute fault buffer");
     if (UnnormalizedWrapEnabled()) {
         for (const auto& entry : bindingPlan->bindings) {
@@ -1689,7 +1691,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
             }
         }
     }
-    if (result.hasGuardedUnnormalizedWrap && (variant.info.stage != IrShaderStage::Compute || request.target.bdaAbiVersion != BdaAbi::Version || result.bdaAbiVersion != BdaAbi::Version)) throw std::runtime_error("unnormalized wrap requires a compute fault buffer");
+    if (result.hasGuardedUnnormalizedWrap && (variant.info.stage != IrShaderStage::Compute || request.target.bdaAbiVersion != BdaAbi::Version || !faultSink)) throw std::runtime_error("unnormalized wrap requires a compute fault buffer");
     result.pushConstants = std::move(bindings.pushConstants);
     result.readsDepthRemapPush = depthRemap;
     if (request.shader.stage == ShaderStage::Compute) {
