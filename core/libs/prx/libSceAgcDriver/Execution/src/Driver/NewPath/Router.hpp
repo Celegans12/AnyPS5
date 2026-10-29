@@ -14,8 +14,8 @@ inline constexpr std::size_t CommandKindCount = 3;
 
 enum class Route : std::uint8_t { NewPath, Fallback };
 
-enum class FallbackReason : std::uint8_t { KindSwitch, KindNotEmitted, NoPipeline, RangeNotCovered, PushOverflow, ClothGuard, NonStaticChain, Suspended };
-inline constexpr std::size_t FallbackReasonCount = 8;
+enum class FallbackReason : std::uint8_t { KindSwitch, KindNotEmitted, NoPipeline, RangeNotCovered, PushOverflow, ClothGuard, NonStaticChain, Suspended, NoResolvedModule, NotRecorded };
+inline constexpr std::size_t FallbackReasonCount = 10;
 
 [[nodiscard]] const char* CommandKindName(CommandKind kind);
 [[nodiscard]] const char* FallbackReasonName(FallbackReason reason);

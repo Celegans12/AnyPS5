@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/NewPath.hpp"
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/DevicePageTable.hpp"
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/ResolvedPush.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidencySession.hpp"
@@ -5739,6 +5740,21 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         const auto bytes = static_cast<std::size_t>(end - begin);
         return resources.WritesOverlap(begin, bytes) || resources.ReadsOverlap(begin, bytes) || (argumentImport != nullptr && begin < arguments + 12 && arguments < end);
     };
+    std::shared_ptr<ComputePipelineObjects> emitted;
+    if (auto* emit = NewPath::CurrentEmit(); emit != nullptr && arguments == 0 && argumentImport == nullptr) {
+        auto facts = emit->facts;
+        facts.pipelineReady = record.x <= groupLimit[0] && record.y <= groupLimit[1] && record.z <= groupLimit[2];
+        facts.clothGuard = resources.HasAddressOverlays();
+        if (facts.resolvedProgram && facts.pipelineReady && !facts.clothGuard) {
+            auto& table = NewPath::DeviceTable();
+            if (table.Stale(context.device)) static_cast<void>(table.Refresh(context));
+            facts.tableCovers = table.Covers(resources.AddressTableRanges()) == NewPath::DevicePageTable::Cover::Covered;
+        }
+        if (NewPath::NoteEmit(*emit, facts).route == NewPath::Route::NewPath) {
+            const auto layouts = resources.SetLayouts();
+            emitted = computePipeline(context, *emit->twin, layouts.main, layouts.mainKey, record.pushStages, record.programAddress);
+        }
+    }
     if (recorder.HasQueuedKeyStores() && (resources.HoldsLease() || recorder.AnyQueuedKeyStore(touches))) recorder.FlushKeyStores();
     if (recorder.HasQueuedStores() && (resources.HoldsLease() || recorder.AnyQueuedStore(touches))) recorder.FlushStores();
     if (record.shader->program->bindlessHeap) {
@@ -5769,6 +5785,8 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     if (record.shader->program->bindlessHeap || (overlapCapable && !overlapped)) covered = 0;
     recordStep(PhaseRecordCommands);
     recorder.Keep(record.objects);
+    if (emitted != nullptr) recorder.Keep(emitted);
+    const auto& boundObjects = emitted != nullptr ? *emitted : *record.objects;
     if (record.resources != nullptr) record.resources->KeepStorageImageBytes(recorder);
     recorder.Keep(record.resources);
     if (record.resources != nullptr) recorder.KeepBytes(record.resources.get(), record.resources->CopiedBytes());
@@ -5899,17 +5917,17 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
             recorder.Keep(std::move(checked));
         }
     }
-    context.Resolved(&Graphics::DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->pipeline);
+    context.Resolved(&Graphics::DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, boundObjects.pipeline);
     if (record.bindings != nullptr) Graphics::Require(record.bindings->allocation.set != VK_NULL_HANDLE, "dispatch overlay has no descriptor set");
-    if (record.bindings != nullptr) context.Resolved(&Graphics::DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout, 0, 1, &record.bindings->allocation.set, 0, nullptr);
-    else resources.Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout);
-    if (record.shader->program->bindlessHeap) context.bindlessTable->Heap().Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout, VK_SHADER_STAGE_COMPUTE_BIT);
+    if (record.bindings != nullptr) context.Resolved(&Graphics::DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, boundObjects.layout, 0, 1, &record.bindings->allocation.set, 0, nullptr);
+    else resources.Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, boundObjects.layout);
+    if (record.shader->program->bindlessHeap) context.bindlessTable->Heap().Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, boundObjects.layout, VK_SHADER_STAGE_COMPUTE_BIT);
     if (const auto dwords = record.shader->program->workgroupMemoryDwords; dwords != 0) {
         auto memory = state->WorkgroupMemoryFor(context, record.x, record.y, record.z, dwords);
-        context.Resolved(&Graphics::DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout, ShaderRecompiler::WorkgroupMemoryDescriptorSet, 1, &memory->set, 0, nullptr);
+        context.Resolved(&Graphics::DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, boundObjects.layout, ShaderRecompiler::WorkgroupMemoryDescriptorSet, 1, &memory->set, 0, nullptr);
         recorder.Keep(std::move(memory));
     }
-    if (NewPath::ResolvedModule(*record.shader->program)) {
+    if (emitted != nullptr || NewPath::ResolvedModule(*record.shader->program)) {
         auto& table = NewPath::DeviceTable();
         if (table.Stale(context.device)) static_cast<void>(table.Refresh(context));
         static_cast<void>(NewPath::UploadTableForLane(context, recorder, table.Current(), static_cast<std::uint32_t>(Graphics::Recorder::ThreadLane())));
@@ -5925,9 +5943,9 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
             Graphics::Require(!outcome.faulted, outcome.message + " in shader at " + std::to_string(programAddress));
             Graphics::Require(!outcome.invalid, "a new-path command's written-page record is invalid");
         });
-        context.Resolved(&Graphics::DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, record.objects->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, NewPath::PushRangeBytes(true), resolvedPush->data());
+        context.Resolved(&Graphics::DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, boundObjects.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, NewPath::PushRangeBytes(true), resolvedPush->data());
     } else if (record.pushStages != 0) {
-        context.Resolved(&Graphics::DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, record.objects->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::ComputePushConstantBytes, record.pushBytes->data());
+        context.Resolved(&Graphics::DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, boundObjects.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::ComputePushConstantBytes, record.pushBytes->data());
     }
     const auto gpuTiming = recorder.BeginGpuTiming(record.programAddress != 0 ? record.programAddress : record.shader->program->variantId);
     if (state->checkpointMarker != nullptr) state->checkpointMarker(commands, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(record.programAddress)));

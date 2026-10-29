@@ -19,6 +19,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/NewPath.hpp"
+#include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/ResolvedTwins.hpp"
 #include <algorithm>
 #include <atomic>
 #include <string>
@@ -33,6 +35,30 @@
 namespace AgcDriver::DriverDetail {
 
 namespace {
+
+void buildResolvedTwin(const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::ResourceCapture& capture, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiled, VulkanDevice& device) {
+    auto& twins = NewPath::Twins();
+    if (compiled == nullptr || compiled->newPathResolved || compiled->transferKernel.has_value() || !NewPath::UsesAddressTables(*compiled)) {
+        twins.Remember(compiled, nullptr, NewPath::TwinOutcome::NotAddressBased);
+        return;
+    }
+    std::shared_ptr<const ShaderRecompiler::RecompileResult> twin;
+    try {
+        auto resolvedRequest = request;
+        resolvedRequest.target.newPathResolved = true;
+        twin = InvocationFor(snapshot, codeOffset, resolvedRequest).Materialize(capture);
+    } catch (const std::exception& error) {
+        static std::atomic<int> reported{0};
+        if (reported.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[newpath] no resolved module for compute shader 0x%llx: %.200s\n", static_cast<unsigned long long>(request.shader.codeAddress), error.what());
+        twins.Remember(compiled, nullptr, NewPath::TwinOutcome::Failed);
+        return;
+    }
+    if (twin == nullptr || !NewPath::TwinCompatible(*compiled, *twin) || device.PlannedComputeLayoutKey(*compiled) != device.PlannedComputeLayoutKey(*twin)) {
+        twins.Remember(compiled, nullptr, NewPath::TwinOutcome::Mismatch);
+        return;
+    }
+    twins.Remember(compiled, std::move(twin), NewPath::TwinOutcome::Built);
+}
 
 // Whether a compiled compute program binds images or samplers (directly, through image tables, or
 // the bindless heap): such a dispatch of the async compute ring is recorded into the main lane.
@@ -527,6 +553,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
             timing.Mark("capture_resources");
             compiledResult = invocation.Materialize(*capture);
             CommandMix::NoteMaterialized(*compiledResult, *capture);
+            if (NewPath::EmitDispatches() && indirectArguments == 0) buildResolvedTwin(snapshot, codeOffset, request, *capture, compiledResult, *localDevice);
             timing.Mark("materialize");
             if (compiledResult->cacheHit) ++cacheHits;
             const auto elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
@@ -661,9 +688,11 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
         const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
         const auto queueId = submission.queue;
         itemCommits.fetch_add(1, std::memory_order_relaxed);
-        DrawPipeline::Queue0().Enqueue([this, localDevice = std::move(localDevice), result = compiledResult, snapshots = std::move(snapshots), captured = std::move(captured), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant, dataHit, epoch, htileClearCompletion, htileMask] {
+        auto emit = NewPath::Enabled() && indirectArguments == 0 ? NewPath::ClaimDispatch(*compiledResult) : nullptr;
+        DrawPipeline::Queue0().Enqueue([this, emit, localDevice = std::move(localDevice), result = compiledResult, snapshots = std::move(snapshots), captured = std::move(captured), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant, dataHit, epoch, htileClearCompletion, htileMask] {
             DrawPipeline::FollowEpoch(epoch);
             GuestMemory::SetCurrentPacket(0x15, queueId);
+            const NewPath::EmitScope emitScope(emit);
             const auto& compiledCommit = *result;
             const bool noteWrites = writeEvidenceEnabled() || traceCapSync();
             try {
@@ -720,9 +749,11 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
         const auto queueId = submission.queue;
         auto attachTo = keepVariant != nullptr ? keepVariant : attachVariant;
         missItemCommits.fetch_add(1, std::memory_order_relaxed);
-        DrawPipeline::Queue0().Enqueue([this, localDevice = std::move(localDevice), result = compiledResult, captured = std::move(captured), liveWords = std::move(liveWords), capture, shaderMemory, registeredShader, htileMask, htileClearCompletion, groups, address, queueId, dispatchThreads, attachTo = std::move(attachTo), keepVariant, dataHit, epoch] {
+        auto emit = NewPath::Enabled() && indirectArguments == 0 ? NewPath::ClaimDispatch(*compiledResult) : nullptr;
+        DrawPipeline::Queue0().Enqueue([this, emit, localDevice = std::move(localDevice), result = compiledResult, captured = std::move(captured), liveWords = std::move(liveWords), capture, shaderMemory, registeredShader, htileMask, htileClearCompletion, groups, address, queueId, dispatchThreads, attachTo = std::move(attachTo), keepVariant, dataHit, epoch] {
             DrawPipeline::FollowEpoch(epoch);
             GuestMemory::SetCurrentPacket(0x15, queueId);
+            const NewPath::EmitScope emitScope(emit);
             const auto& compiledCommit = *result;
             std::vector<Graphics::GuestMemorySnapshot> commitSnapshots;
             commitSnapshots.reserve(captured.size());
@@ -788,6 +819,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
         }
     }
 
+    const NewPath::EmitScope emitScope(NewPath::Enabled() && indirectArguments == 0 ? NewPath::ClaimDispatch(compiled) : nullptr);
     for (;;) {
 
         std::shared_ptr<PreparedDispatch> prepared;

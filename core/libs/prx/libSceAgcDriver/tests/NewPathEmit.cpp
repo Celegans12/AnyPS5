@@ -52,7 +52,7 @@ void routerEmitOrder() {
         {"kind switch", [](CommandFacts& facts) { facts.kindSwitchOff = true; facts.pipelineReady = false; }, FallbackReason::KindSwitch},
         {"draw", [](CommandFacts& facts) { facts.kind = CommandKind::Draw; }, FallbackReason::KindNotEmitted},
         {"indirect dispatch", [](CommandFacts& facts) { facts.kind = CommandKind::DispatchIndirect; }, FallbackReason::KindNotEmitted},
-        {"no resolved program", [](CommandFacts& facts) { facts.resolvedProgram = false; facts.tableCovers = false; }, FallbackReason::KindNotEmitted},
+        {"no resolved program", [](CommandFacts& facts) { facts.resolvedProgram = false; facts.tableCovers = false; }, FallbackReason::NoResolvedModule},
         {"no pipeline", [](CommandFacts& facts) { facts.pipelineReady = false; facts.tableCovers = false; }, FallbackReason::NoPipeline},
         {"range", [](CommandFacts& facts) { facts.tableCovers = false; facts.pushFits = false; }, FallbackReason::RangeNotCovered},
         {"push overflow", [](CommandFacts& facts) { facts.pushFits = false; facts.clothGuard = true; }, FallbackReason::PushOverflow},

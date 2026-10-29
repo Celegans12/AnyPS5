@@ -22,6 +22,8 @@ const char* FallbackReasonName(FallbackReason reason) {
     case FallbackReason::ClothGuard: return "cloth-guard";
     case FallbackReason::NonStaticChain: return "non-static-chain";
     case FallbackReason::Suspended: return "suspended";
+    case FallbackReason::NoResolvedModule: return "no-resolved-module";
+    case FallbackReason::NotRecorded: return "not-recorded";
     }
     return "unknown";
 }
@@ -43,7 +45,8 @@ std::uint64_t RouteCounts::NewPathCommands() const {
 Decision Router::Decide(const CommandFacts& facts) const {
     if (facts.suspended) return {Route::Fallback, FallbackReason::Suspended};
     if (facts.kindSwitchOff) return {Route::Fallback, FallbackReason::KindSwitch};
-    if (!emitDispatches || facts.kind != CommandKind::Dispatch || !facts.resolvedProgram) return {Route::Fallback, FallbackReason::KindNotEmitted};
+    if (!emitDispatches || facts.kind != CommandKind::Dispatch) return {Route::Fallback, FallbackReason::KindNotEmitted};
+    if (!facts.resolvedProgram) return {Route::Fallback, FallbackReason::NoResolvedModule};
     if (!facts.pipelineReady) return {Route::Fallback, FallbackReason::NoPipeline};
     if (!facts.tableCovers) return {Route::Fallback, FallbackReason::RangeNotCovered};
     if (!facts.pushFits && !facts.overflowPlaced) return {Route::Fallback, FallbackReason::PushOverflow};
