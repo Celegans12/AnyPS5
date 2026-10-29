@@ -56,6 +56,22 @@ void OverlayTests() {
     Expect(none.empty(), "a span with no import got a piece");
 }
 
+void CompareTests() {
+    using Cover = DevicePageTable::Cover;
+    const std::vector<Range> table{MakeRange(ImportBase, ImportBase + 4 * Page, ImportDevice), MakeRange(ImportBase + 4 * Page, ImportBase + 6 * Page, ImportDevice + 4 * Page, Abi::Read), MakeRange(ImportBase + 8 * Page, ImportBase + 9 * Page, ResidentDevice)};
+    const std::vector<Range> inside{MakeRange(ImportBase + Page, ImportBase + 3 * Page, ImportDevice + Page), MakeRange(ImportBase + 3 * Page, ImportBase + 5 * Page, ImportDevice + 3 * Page, Abi::Read)};
+    Expect(DevicePageTable::Compare(table, inside) == Cover::Covered, "a build mapping the table's addresses across two entries was not covered");
+    Expect(DevicePageTable::Compare(table, {}) == Cover::Covered, "an empty build was not covered");
+    const std::vector<Range> gap{MakeRange(ImportBase + 5 * Page, ImportBase + 7 * Page, ImportDevice + 5 * Page, Abi::Read)};
+    Expect(DevicePageTable::Compare(table, gap) == Cover::Missing, "a build reaching past the table was covered");
+    const std::vector<Range> staged{MakeRange(ImportBase + 2 * Page, ImportBase + 3 * Page, 0x7d0000000000ull)};
+    Expect(DevicePageTable::Compare(table, staged) == Cover::OtherAddress, "a staged copy (another device address) was covered");
+    const std::vector<Range> resident{MakeRange(ImportBase + 8 * Page, ImportBase + 9 * Page, ImportDevice + 8 * Page)};
+    Expect(DevicePageTable::Compare(table, resident) == Cover::OtherAddress, "a page the table maps to its resident slot was covered for an import build");
+    const std::vector<Range> writes{MakeRange(ImportBase + 4 * Page, ImportBase + 5 * Page, ImportDevice + 4 * Page)};
+    Expect(DevicePageTable::Compare(table, writes) == Cover::Narrower, "a writable build range over a read-only table entry was covered");
+}
+
 std::uint64_t Translate(const std::shared_ptr<const AgcDriver::Graphics::BdaPageTable>& table, std::uint64_t address) {
     if (table == nullptr) return 0;
     const auto found = table->Find(address);
@@ -119,6 +135,7 @@ void DeviceTests(const AgcDriver::Graphics::Context& context) {
 int main() {
     try {
         OverlayTests();
+        CompareTests();
         auto device = OpenVulkanTestDevice();
         if (device == nullptr) {
             if (failures != 0) return 1;

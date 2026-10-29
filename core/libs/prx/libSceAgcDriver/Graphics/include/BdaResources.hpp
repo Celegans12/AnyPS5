@@ -17,6 +17,7 @@ public:
     BdaResources(const Context& context, const GuestBufferMemory& memory);
     VkDescriptorBufferInfo Table() const;
     VkDescriptorBufferInfo Fault() const;
+    std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>> Ranges() const;
     void CheckFault(std::uint64_t shaderAddress = 0) const;
     struct ImageTableFaults {
         std::uint32_t stage = 0;
@@ -59,6 +60,7 @@ private:
     void markWrittenPages() const;
     void checkSrtGuard() const;
     std::shared_ptr<Buffer> table;
+    std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>> tableRanges;
     std::unique_ptr<Buffer> fault;
     std::size_t tableBytes = 0;
     std::vector<ImageTableFaults> imageTables;

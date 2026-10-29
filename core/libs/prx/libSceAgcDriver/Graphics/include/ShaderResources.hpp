@@ -317,6 +317,8 @@ public:
     const void* MemoryOwner() const { return &guestMemory; }
     // Whether the build copies buffer regions on the GPU (staged shadows among them).
     bool HasGpuCopies() const { return guestMemory.HasGpuCopies(); }
+    bool HasAddressOverlays() const { return guestMemory.HasOverlays(); }
+    std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>> AddressTableRanges() const;
     void WriteBackBuffers(std::uint64_t shaderAddress = 0);
     // Whether WriteBackBuffers has anything the CPU must see (copied written buffers, BDA faults).
     bool NeedsCompletion() const { return (bda != nullptr && faultChecks) || guestMemory.HasCopiedWrites(); }

@@ -219,6 +219,10 @@ void ShaderResources::prepareAddressBindings(std::span<const CompiledShader> sha
     }
 }
 
+std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>> ShaderResources::AddressTableRanges() const {
+    return bda != nullptr && usesBda ? bda->Ranges() : nullptr;
+}
+
 VkDescriptorBufferInfo ShaderResources::descriptor(Allocation& allocation) {
     if (allocation.guest) return guestMemory.Descriptor(allocation.address, allocation.size, allocation.adjustment);
     if (allocation.role == ShaderRecompiler::DescriptorRole::GuestBuffers) {

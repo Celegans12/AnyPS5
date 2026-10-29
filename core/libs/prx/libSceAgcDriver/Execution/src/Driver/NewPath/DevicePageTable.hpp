@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/BdaPageTable.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -32,7 +33,10 @@ public:
         std::uint64_t released = 0;
         std::uint64_t outlived = 0;
         std::uint64_t records = 0;
+        std::array<std::uint64_t, 4> coverHits{};
     };
+
+    enum class Cover : std::uint8_t { Covered, Missing, OtherAddress, Narrower };
 
     DevicePageTable(ImportSource imports, VersionSource version);
 
@@ -51,6 +55,8 @@ public:
     void ReturnRecord(std::shared_ptr<Graphics::Buffer> record, VkDevice device);
     [[nodiscard]] std::size_t PooledRecords() const;
 
+    [[nodiscard]] Cover Covers(const std::shared_ptr<const std::vector<Range>>& build);
+    [[nodiscard]] static Cover Compare(std::span<const Range> table, std::span<const Range> build);
     [[nodiscard]] static std::vector<Range> Overlay(std::span<const Range> base, std::span<const Range> resident, std::uint64_t begin, std::uint64_t end);
 
 private:
@@ -72,6 +78,14 @@ private:
     VkDevice tableDevice = VK_NULL_HANDLE;
     std::vector<std::shared_ptr<const Graphics::BdaPageTable>> outlivedDevices;
     Counts counts;
+    std::uint64_t generation = 0;
+    struct CoverMemo {
+        std::shared_ptr<const std::vector<Range>> build;
+        std::uint64_t generation = 0;
+        Cover cover = Cover::Missing;
+    };
+    std::array<CoverMemo, 16> coverMemo{};
+    std::size_t coverNext = 0;
 };
 
 DevicePageTable& DeviceTable();

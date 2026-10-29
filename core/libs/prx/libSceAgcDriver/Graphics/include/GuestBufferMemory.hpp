@@ -443,6 +443,10 @@ public:
         for (const auto& region : regions) if (region.gpuCopy) return true;
         return false;
     }
+    bool HasOverlays() const {
+        for (const auto& region : regions) if (region.overlay) return true;
+        return false;
+    }
     // Whether registered allocations are pinned until write-back (address-based shaders): by this
     // build's own lease, or by the cached address space it holds.
     bool HoldsLease() const { return !lease.empty() || space != nullptr; }

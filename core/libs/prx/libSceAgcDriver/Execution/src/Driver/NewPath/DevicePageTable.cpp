@@ -57,6 +57,41 @@ std::vector<Range> DevicePageTable::Overlay(std::span<const Range> base, std::sp
     return out;
 }
 
+DevicePageTable::Cover DevicePageTable::Compare(std::span<const Range> table, std::span<const Range> build) {
+    for (const auto& range : build) {
+        if (range.end <= range.begin) continue;
+        auto cursor = range.begin;
+        auto at = std::upper_bound(table.begin(), table.end(), cursor, [](std::uint64_t value, const Range& entry) { return value < entry.end; });
+        while (cursor < range.end) {
+            if (at == table.end() || at->begin > cursor) return Cover::Missing;
+            if (at->deviceAddress + (cursor - at->begin) != range.deviceAddress + (cursor - range.begin)) return Cover::OtherAddress;
+            if ((at->permissions & range.permissions) != range.permissions) return Cover::Narrower;
+            cursor = std::min(range.end, at->end);
+            ++at;
+        }
+    }
+    return Cover::Covered;
+}
+
+DevicePageTable::Cover DevicePageTable::Covers(const std::shared_ptr<const std::vector<Range>>& build) {
+    std::lock_guard lock(mutex);
+    if (build == nullptr || !built) {
+        ++counts.coverHits[static_cast<std::size_t>(Cover::Missing)];
+        return Cover::Missing;
+    }
+    for (const auto& memo : coverMemo) {
+        if (memo.build == build && memo.generation == generation) {
+            ++counts.coverHits[static_cast<std::size_t>(memo.cover)];
+            return memo.cover;
+        }
+    }
+    const auto cover = Compare(tableRanges, *build);
+    coverMemo[coverNext] = {build, generation, cover};
+    coverNext = (coverNext + 1) % coverMemo.size();
+    ++counts.coverHits[static_cast<std::size_t>(cover)];
+    return cover;
+}
+
 std::vector<Range> DevicePageTable::piecesLocked(std::uint64_t begin, std::uint64_t end) const {
     std::vector<Range> pieces;
     if (resident) pieces = resident(begin, end);
@@ -90,6 +125,7 @@ std::shared_ptr<const Graphics::BdaPageTable> DevicePageTable::Refresh(const Gra
     counts.importVersion = now;
     tableRanges = std::move(ranges);
     tableLists = ListsOf(tableRanges);
+    ++generation;
     return table;
 }
 
@@ -106,6 +142,7 @@ std::shared_ptr<const Graphics::BdaPageTable> DevicePageTable::PatchPages(const 
     ++counts.patches;
     tableRanges = piecesLocked(0, ShaderRecompiler::BdaAbi::PageTableEnd);
     tableLists = ListsOf(tableRanges);
+    ++generation;
     return table;
 }
 
@@ -124,6 +161,8 @@ void DevicePageTable::Release(VkDevice device) {
         tableDevice = VK_NULL_HANDLE;
         importRanges.clear();
         tableRanges.clear();
+        ++generation;
+        coverMemo = {};
         tableLists = {};
         built = false;
         builtVersion = 0;
