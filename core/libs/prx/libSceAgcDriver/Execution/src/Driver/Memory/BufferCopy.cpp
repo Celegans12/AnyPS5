@@ -148,15 +148,6 @@ bool Driver::copyBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
     const bool stream = !hashed && !indexed;
     if (stream && !MatchesStreamCopyKernel(code, userData, compute)) return false;
     const auto started = std::chrono::steady_clock::now();
-    static const std::size_t cpuMax = [] {
-        if (std::getenv("APS5_NO_CPU_COPY") != nullptr) return std::size_t{0};
-        const char* text = std::getenv("APS5_COPY_HLE_CPU_MAX");
-        return text ? static_cast<std::size_t>(std::strtoull(text, nullptr, 10)) : std::size_t{262144};
-    }();
-    static const std::size_t gpuMax = [] {
-        const char* text = std::getenv("APS5_COPY_HLE_GPU_MAX");
-        return text ? static_cast<std::size_t>(std::strtoull(text, nullptr, 10)) : std::numeric_limits<std::size_t>::max();
-    }();
     const auto base = [&](std::size_t word) { return userData[word] | (static_cast<std::uint64_t>(userData[word + 1] & 0xffffu) << 32u); };
     auto source = base(0);
     auto destination = base(4);
@@ -235,6 +226,19 @@ bool Driver::copyBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
             return false;
         }
     }
+    return copyRange(queueId, source, destination, bytes, localDevice, programAddress, started, locked);
+}
+
+bool Driver::copyRange(std::uint32_t queueId, std::uint64_t source, std::uint64_t destination, std::size_t bytes, const std::shared_ptr<VulkanDevice>& localDevice, std::uint64_t programAddress, std::chrono::steady_clock::time_point started, std::chrono::steady_clock::time_point locked) {
+    static const std::size_t cpuMax = [] {
+        if (std::getenv("APS5_NO_CPU_COPY") != nullptr) return std::size_t{0};
+        const char* text = std::getenv("APS5_COPY_HLE_CPU_MAX");
+        return text ? static_cast<std::size_t>(std::strtoull(text, nullptr, 10)) : std::size_t{262144};
+    }();
+    static const std::size_t gpuMax = [] {
+        const char* text = std::getenv("APS5_COPY_HLE_GPU_MAX");
+        return text ? static_cast<std::size_t>(std::strtoull(text, nullptr, 10)) : std::numeric_limits<std::size_t>::max();
+    }();
     if (source < destination + bytes && destination < source + bytes) {
         countCopy(CopyOverlapping, bytes, started, locked);
         return false;

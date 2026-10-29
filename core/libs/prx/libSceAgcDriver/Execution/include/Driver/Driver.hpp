@@ -151,6 +151,8 @@ public:
     DispatchCacheFootprint DispatchCacheSize();
     static std::uint64_t DispatchCacheBytes();
     static ShaderMemory::PendingWrite QueryPendingSpan(std::uint64_t address, std::size_t bytes, std::span<std::byte> known);
+    static std::uint64_t TransferFills();
+    static std::uint64_t TransferCopies();
     std::shared_ptr<const ShaderRegistry> RegisteredShaders();
     DrawAheadCounters DrawAheadStatistics() const;
 
@@ -281,6 +283,8 @@ private:
     static bool copyKnownValues();
     static bool knownValueVerify();
     bool copyBuffer(QueueState& queue, std::uint32_t queueId, std::span<const std::uint32_t> packet, std::span<const std::uint32_t> code, const std::vector<std::uint32_t>& userData, const ShaderRecompiler::ShaderComputeStageInfo& compute, const std::shared_ptr<VulkanDevice>& localDevice, std::uint64_t programAddress);
+    bool copyRange(std::uint32_t queueId, std::uint64_t source, std::uint64_t destination, std::size_t bytes, const std::shared_ptr<VulkanDevice>& localDevice, std::uint64_t programAddress, std::chrono::steady_clock::time_point started, std::chrono::steady_clock::time_point locked);
+    bool transferBuffer(std::uint32_t queueId, const ShaderRecompiler::RecompileResult& compiled, std::span<const std::uint32_t> userData, std::uint64_t threads, const std::shared_ptr<VulkanDevice>& localDevice, std::uint64_t programAddress);
     void traceCopyRefused(const VulkanDevice::CopyOutcome& outcome, std::uint64_t source, std::uint64_t destination, std::size_t bytes, const std::shared_ptr<VulkanDevice>& localDevice);
     static bool traceCopy();
     void traceCopyPending(const char* what, std::uint64_t address, std::size_t bytes, std::uint64_t source, std::uint64_t destination, std::size_t copyBytes, const std::shared_ptr<VulkanDevice>& localDevice);
