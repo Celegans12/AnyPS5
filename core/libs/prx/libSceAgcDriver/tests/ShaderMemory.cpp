@@ -6799,6 +6799,17 @@ void verifyDepthExportClamp() {
     require(clampStored, "depth export: gl_FragDepth was not written from the clamped value");
     const auto replay = RequestSerializer{}.Deserialize(RequestSerializer{}.Serialize(request));
     require(replay.request.context.pixel->depthExportMin == 0.25f && replay.request.context.pixel->depthExportMax == 0.75f, "depth export: the clamp did not survive serialization");
+    const auto ourBlendOffset = [](const auto& serialized) {
+        auto flipped = serialized;
+        auto flippedPixel = *flipped.context.pixel;
+        flippedPixel.targetBlend[0].enable = !flippedPixel.targetBlend[0].enable;
+        flipped.context.pixel = flippedPixel;
+        const auto a = decodeBase64(RequestSerializer{}.Serialize(serialized));
+        const auto b = decodeBase64(RequestSerializer{}.Serialize(flipped));
+        std::size_t at = 0;
+        while (at < a.size() && at < b.size() && a[at] == b[at]) ++at;
+        return static_cast<std::ptrdiff_t>(at);
+    };
     {
         auto tail = request;
         tail.target.largePixelFunctionLdsBuffer = true;
@@ -6808,7 +6819,8 @@ void verifyDepthExportClamp() {
                     both.request.context.pixel->depthExportMin == 0.25f && both.request.context.pixel->depthExportMax == 0.75f,
             "depth export: a version 49 request lost the bounds or the version 45 target tail");
         auto bytes = decodeBase64(RequestSerializer{}.Serialize(tail));
-        require(bytes.size() > 8u && bytes[4] == 49u, "depth export: a depth exporting request did not use serialization version 49");
+        require(bytes.size() > 8u && bytes[4] == 50u, "depth export: a depth exporting request did not use serialization version 50");
+        bytes.erase(bytes.begin() + ourBlendOffset(tail), bytes.begin() + ourBlendOffset(tail) + 40);
         static constexpr std::array<std::uint8_t, 8> boundBytes{0x00u, 0x00u, 0x80u, 0x3eu, 0x00u, 0x00u, 0x40u, 0x3fu};
         const auto found = std::search(bytes.begin(), bytes.end(), boundBytes.begin(), boundBytes.end());
         require(found != bytes.end() && std::search(found + 1, bytes.end(), boundBytes.begin(), boundBytes.end()) == bytes.end(),
@@ -6833,7 +6845,8 @@ void verifyDepthExportClamp() {
             ditheredPixel.ditheredAlphaSamples = 2u;
             dithered.context.pixel = ditheredPixel;
             auto ditheredBytes = decodeBase64(RequestSerializer{}.Serialize(dithered));
-            require(ditheredBytes.size() > 8u && ditheredBytes[4] == 49u, "a two-sample dithered request did not use serialization version 49");
+            require(ditheredBytes.size() > 8u && ditheredBytes[4] == 50u, "a two-sample dithered request did not use serialization version 50");
+            ditheredBytes.erase(ditheredBytes.begin() + ourBlendOffset(dithered), ditheredBytes.begin() + ourBlendOffset(dithered) + 40);
             if (depthExport) {
                 const auto bounds = std::search(ditheredBytes.begin(), ditheredBytes.end(), boundBytes.begin(), boundBytes.end());
                 require(bounds != ditheredBytes.end(), "a two-sample dithered depth exporting request lacks the clamp bounds");

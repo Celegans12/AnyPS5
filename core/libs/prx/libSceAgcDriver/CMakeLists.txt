@@ -3208,7 +3208,7 @@ if(BUILD_TESTING)
     set_tests_properties(agc_driver_linear_target_resident PROPERTIES ENVIRONMENT "APS5_NO_PIPELINE_JOURNAL=1;APS5_RESIDENT_LINEAR=1")
     set_property(TEST agc_driver_linear_target_completion_points agc_driver_linear_target_completion_points_sync_flip agc_driver_linear_target_completion_points_unpipelined
         agc_driver_linear_target_completion_stores agc_driver_linear_target_cpu_writes agc_driver_linear_target_direct_write_completion agc_driver_linear_target_dispatch_access
-        agc_driver_linear_target_rectangle_bound agc_driver_linear_target_draw_bindings APPEND PROPERTY ENVIRONMENT "APS5_RESIDENT_LINEAR=1")
+        agc_driver_linear_target_rectangle_bound agc_driver_linear_target_draw_bindings agc_driver_linear_target_import_creation APPEND PROPERTY ENVIRONMENT "APS5_RESIDENT_LINEAR=1")
     set_property(TEST agc_driver_linear_target_draw_bindings APPEND PROPERTY ENVIRONMENT "APS5_NO_READ_ONLY_LEASE_SKIP=1")
     # Main's 4_4_4_4 target-merge state test describes a linear target's resident surface.
     set_tests_properties(agc_driver_graphics PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_RESIDENT_LINEAR=1")
@@ -3982,7 +3982,7 @@ if(BUILD_TESTING)
                     "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endif()
     endforeach()
-    set_property(TEST agc_driver_depth_plane_partial_store agc_driver_depth_plane_partial_store_unimported APPEND PROPERTY ENVIRONMENT "APS5_LAYER_REFRESH=1")
+    set_property(TEST agc_driver_depth_plane_partial_store agc_driver_depth_plane_partial_store_unimported agc_driver_depth_plane_partial_store_buffer_copy APPEND PROPERTY ENVIRONMENT "APS5_LAYER_REFRESH=1")
     add_test(NAME agc_driver_array_layer_target_cpu COMMAND agc_driver_array_layer_target_tests)
     set_tests_properties(agc_driver_array_layer_target_cpu PROPERTIES
             ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_HOST_IMPORT=1;APS5_LAYER_REFRESH=1;APS5_SELECTED_CPU_UPLOAD=1" TIMEOUT 30 SKIP_RETURN_CODE 77)

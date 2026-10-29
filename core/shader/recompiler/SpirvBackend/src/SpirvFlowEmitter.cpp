@@ -182,13 +182,28 @@ std::uint32_t EmitBranchCondition(SpirvValueEmitContext& ctx, const BlockInfo& i
         return ctx.Def(info.condition);
     }
     auto& state = ctx.state;
-    const auto own = ctx.Def(info.condition);
-    const auto other = ctx.otherHalf->Def(info.condition);
-    if (condition == BranchCondition::ExecZero || condition == BranchCondition::VccZero || condition == BranchCondition::SccZero) {
-        const auto clear = Binary(state, spv::OpLogicalOr, TypeBool(state), Unary(state, spv::OpLogicalNot, TypeBool(state), own), Unary(state, spv::OpLogicalNot, TypeBool(state), other));
-        return Unary(state, spv::OpLogicalNot, TypeBool(state), EmitWaveAny(state, clear));
+    const auto ballot = ctx.Ballot(info.condition);
+    const auto low = state.module.AllocateId();
+    const auto high = state.module.AllocateId();
+    const auto result = state.module.AllocateId();
+    state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), low, ballot, 0u);
+    state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), high, ballot, 1u);
+    const auto kind = info.terminator.condition;
+    const bool zero = kind == BranchCondition::ExecZero || kind == BranchCondition::VccZero || kind == BranchCondition::SccZero;
+    // A zero condition must hold on both lanes of every invocation still running, so the halves' AND is
+    // compared with a ballot of those invocations, not with all 32 bits: an invocation that left early
+    // (StopBdaInvocationIf after a recorded fault) drops out of every later ballot, and a loop leaving on
+    // execz, vccz or scc0 then never left (a GPU hang instead of the fault report).
+    std::uint32_t expected = ConstantU32(state, 0u);
+    if (zero) {
+        const auto active = state.module.AllocateId();
+        EmitSubgroupBallot(state, active, ConstantBool(state, true));
+        expected = state.module.AllocateId();
+        state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), expected, active, 0u);
     }
-    return EmitWaveAny(state, Binary(state, spv::OpLogicalOr, TypeBool(state), own, other));
+    const auto combined = EmitBinaryU32(state, zero ? spv::OpBitwiseAnd : spv::OpBitwiseOr, low, high);
+    state.module.AddFunction(zero ? spv::OpIEqual : spv::OpINotEqual, TypeBool(state), result, combined, expected);
+    return result;
 }
 
 void EmitStructuredTerminator(SpirvValueEmitContext& ctx, const IrProgram& program, const BlockInfo& info) {
