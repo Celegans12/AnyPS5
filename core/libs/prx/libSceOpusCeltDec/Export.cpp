@@ -53,4 +53,8 @@ int APS5_VABI sceOpusCeltDecDecodeWithPriority(void* state, const std::uint8_t* 
     return OpusDecodeVariant(library, ErrorBase, state, data, bytes, pcm, capacity, priority, false);
 }
 
+int APS5_VABI sceOpusCeltDecGetAjmContext() {
+    NotImplemented_nid_no_patch(__func__);
+}
+
 }

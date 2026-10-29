@@ -15,5 +15,6 @@ int APS5_VABI sceOpusCeltDecCtl();
 int APS5_VABI sceOpusCeltDecDecodeFloat(void* state, const std::uint8_t* data, int bytes, float* pcm, int capacity);
 int APS5_VABI sceOpusCeltDecDecodeFloatWithPriority(void* state, const std::uint8_t* data, int bytes, float* pcm, int capacity, int priority);
 int APS5_VABI sceOpusCeltDecDecodeWithPriority(void* state, const std::uint8_t* data, int bytes, std::int16_t* pcm, int capacity, int priority);
+int APS5_VABI sceOpusCeltDecGetAjmContext();
 
 }

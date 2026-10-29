@@ -68,4 +68,8 @@ int APS5_VABI sceOpusDecDecodeWithPriorityAndTimeout(void* state, const std::uin
     return OpusDecodeVariantWithTimeout(library, ErrorBase, state, data, bytes, pcm, capacity, priority, false, timeout, __func__);
 }
 
+int APS5_VABI sceOpusDecGetAjmContext() {
+    NotImplemented_nid_no_patch(__func__);
+}
+
 }

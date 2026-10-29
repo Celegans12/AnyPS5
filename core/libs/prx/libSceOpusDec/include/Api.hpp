@@ -20,5 +20,6 @@ int APS5_VABI sceOpusDecDecodeFloatWithPriorityAndTimeout(void* state, const std
 int APS5_VABI sceOpusDecDecodeWithPriority(void* state, const std::uint8_t* data, int bytes, std::int16_t* pcm, int capacity, int priority);
 int APS5_VABI sceOpusDecDecodeWithPriorityAndTimeout(void* state, const std::uint8_t* data, int bytes, std::int16_t* pcm, int capacity, int priority,
                                                     std::uint32_t timeout, std::uint32_t* result);
+int APS5_VABI sceOpusDecGetAjmContext();
 
 }
