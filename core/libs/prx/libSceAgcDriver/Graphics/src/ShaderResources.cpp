@@ -6054,6 +6054,8 @@ std::uint64_t ShaderResources::GuestBufferBytes(const Context& context, std::spa
 
 std::uint64_t ShaderResources::guestBufferBytes(std::span<const std::uint32_t> words) const {
     return GuestBufferBytes(context, words);
+}
+
 std::uint64_t ShaderResources::BytesUpToTarget(std::uint64_t address, std::uint64_t bytes, std::uint64_t stride, const ColorTarget* target) {
     if (target == nullptr || stride == 0 || address >= target->address || address + bytes <= target->address || address + bytes - target->address >= stride) return bytes;
     return target->address - address;

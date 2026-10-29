@@ -4375,10 +4375,10 @@ void addressMovedBufferTests(const Context& context) {
     {
         ShaderResources resources(context, built, ColorTarget{}, 0, 0, 0, {});
         Require(resources.UsesAddressTable(), "a draw build with a BDA table stage does not use the BDA table");
-        const auto unchanged = resources.MovedReadOnlyBuffers(built, recorder);
+        const auto unchanged = resources.MovedReadOnlyBuffers(built, recorder, nullptr);
         Require(unchanged.has_value() && unchanged->empty(), "an address-based draw build found a buffer moved in the stages it was built from");
-        Require(!resources.MovedReadOnlyBuffers(movedStages, recorder).has_value(), "an address-based draw build would serve a draw whose read-only buffer moved, which it cannot bind per draw");
-        Require(!resources.MovedReadOnlyBuffers(rewrittenStages, recorder).has_value(), "an address-based draw build would serve a draw with other data words, which it cannot bind per draw");
+        Require(!resources.MovedReadOnlyBuffers(movedStages, recorder, nullptr).has_value(), "an address-based draw build would serve a draw whose read-only buffer moved, which it cannot bind per draw");
+        Require(!resources.MovedReadOnlyBuffers(rewrittenStages, recorder, nullptr).has_value(), "an address-based draw build would serve a draw with other data words, which it cannot bind per draw");
         resources.WriteBack();
     }
     recorder.Sync();
@@ -4584,15 +4584,15 @@ void addressTemplateTests(const Context& context) {
         const std::array<GuestMemorySnapshot, 3> outside{{stored[0], stored[1], {reinterpret_cast<std::uint64_t>(elsewhere.data()), elsewhere}}};
         Require(!resources->Revalidate(built, nullptr, outside), "a template served a draw capturing memory outside its regions");
         Require(resources->Revalidate(rewrittenStages, nullptr, stored), "a template was not proved for a draw with other data words");
-        const auto moved = resources->MovedReadOnlyBuffers(rewrittenStages, recorder);
+        const auto moved = resources->MovedReadOnlyBuffers(rewrittenStages, recorder, nullptr);
         Require(moved.has_value() && moved->size() == 1, "a template refused a draw with other data words");
         const auto first = resources->PrepareDrawBindings(recorder, *moved);
         Require(first != nullptr && first->allocation.set != VK_NULL_HANDLE && words(*first, {7u, 8u, 9u, 11u}), "a template's use with other data words got no descriptor set of its own holding them");
         take(resources);
-        const auto unchanged = resources->MovedReadOnlyBuffers(built, recorder);
+        const auto unchanged = resources->MovedReadOnlyBuffers(built, recorder, nullptr);
         Require(unchanged.has_value() && unchanged->empty(), "a use with other data words wrote the template's own data words");
         Require(resources->Revalidate(againStages, nullptr, stored), "a template was not proved for a third use");
-        const auto movedAgain = resources->MovedReadOnlyBuffers(againStages, recorder);
+        const auto movedAgain = resources->MovedReadOnlyBuffers(againStages, recorder, nullptr);
         Require(movedAgain.has_value() && movedAgain->size() == 1, "a template refused a third use's data words");
         const auto second = resources->PrepareDrawBindings(recorder, *movedAgain);
         Require(second != nullptr && second->allocation.set != first->allocation.set && words(*second, {7u, 8u, 9u, 12u}) && words(*first, {7u, 8u, 9u, 11u}), "two uses in flight with other data words share a descriptor set or a data buffer");
@@ -4602,9 +4602,9 @@ void addressTemplateTests(const Context& context) {
         Require(!writer->SharesUses(), "an address-table build that stores through BDA is a shared template");
         take(writer);
         Require(!writer->Revalidate(storingStages, nullptr, snapshots), "an address-table build that stores through BDA was proved while a use was in flight");
-        Require(!writer->MovedReadOnlyBuffers(storingRewritten, recorder).has_value(), "an address-table build that stores through BDA took other data words");
+        Require(!writer->MovedReadOnlyBuffers(storingRewritten, recorder, nullptr).has_value(), "an address-table build that stores through BDA took other data words");
         RuntimeSwitches::Assign(RuntimeSwitch::NoBdaTemplates, true);
-        Require(!resources->SharesUses() && !resources->Revalidate(built, nullptr, stored) && !resources->MovedReadOnlyBuffers(rewrittenStages, recorder).has_value(), "APS5_NO_BDA_TEMPLATES left a template in use");
+        Require(!resources->SharesUses() && !resources->Revalidate(built, nullptr, stored) && !resources->MovedReadOnlyBuffers(rewrittenStages, recorder, nullptr).has_value(), "APS5_NO_BDA_TEMPLATES left a template in use");
         Require(ShaderResources::NeverReusable(built) == ShaderResources::NeverReusable(storingStages), "APS5_NO_BDA_TEMPLATES kept a read-only address-table draw cacheable apart from storing ones");
         auto plain = std::make_shared<ShaderResources>(importing, built, ColorTarget{}, 0, 0, 0, std::span<const GuestMemorySnapshot>(snapshots));
         Require(!plain->SharesUses() && plain->PrepareDrawBindings(recorder, *moved) == nullptr, "APS5_NO_BDA_TEMPLATES built a template");

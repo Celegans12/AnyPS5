@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/PipelineCache.hpp"
 #include "ShaderCacheDirectory.hpp"
 #include "ShaderDiskCache.hpp"
 #include <algorithm>
