@@ -214,12 +214,17 @@ void ShaderResources::prepareAddressBindings(std::span<const CompiledShader> sha
         static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
         guestMemory.AcquireRegistered();
         const auto snapshotsStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        if (addressTableDeferred) guestMemory.SkipLiveSnapshotCompares();
         for (const auto& snapshot : snapshots) guestMemory.AddSnapshot(snapshot);
         if (profile) GuestBufferMemory::CountAddressBuild(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - snapshotsStart).count());
     }
 }
 
 std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>> ShaderResources::AddressTableRanges() const {
+    if (addressTableDeferred && usesBda) {
+        if (deferredRanges == nullptr) deferredRanges = BdaResources::RangesOf(guestMemory);
+        return deferredRanges;
+    }
     return bda != nullptr && usesBda ? bda->Ranges() : nullptr;
 }
 
@@ -230,6 +235,10 @@ VkDescriptorBufferInfo ShaderResources::descriptor(Allocation& allocation) {
         return {context.emptyBuffer, 0, allocation.size};
     }
     if (allocation.role == ShaderRecompiler::DescriptorRole::BdaPagetable || allocation.role == ShaderRecompiler::DescriptorRole::FaultBuffer) {
+        if (bda == nullptr && addressTableDeferred) {
+            Require(context.emptyBuffer != VK_NULL_HANDLE, "no placeholder buffer for a deferred address table");
+            return {context.emptyBuffer, 0, VK_WHOLE_SIZE};
+        }
         Require(bda != nullptr, "BDA descriptors have no memory owner");
         return allocation.role == ShaderRecompiler::DescriptorRole::BdaPagetable ? bda->Table() : bda->Fault();
     }

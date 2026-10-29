@@ -28,6 +28,9 @@ struct EmitCandidate {
     std::shared_ptr<const ShaderRecompiler::RecompileResult> twin;
     std::atomic<bool> noted{false};
     bool counted = true;
+    bool tableDeferred = false;
+    bool addressBased = false;
+    Route routed = Route::Fallback;
 
     EmitCandidate() = default;
     EmitCandidate(const EmitCandidate&) = delete;
@@ -51,6 +54,8 @@ private:
 
 [[nodiscard]] EmitCandidate* CurrentEmit();
 Decision NoteEmit(EmitCandidate& candidate, const CommandFacts& facts);
+[[nodiscard]] bool MayEmitWithoutTable(const EmitCandidate& candidate, bool pipelineReady);
+void NoteDispatchCost(const EmitCandidate& candidate, std::uint64_t deviceNs, std::uint64_t buildNs);
 
 void Close(const char* window);
 

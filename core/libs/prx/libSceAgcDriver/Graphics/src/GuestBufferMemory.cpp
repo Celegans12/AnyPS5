@@ -4840,7 +4840,7 @@ void GuestBufferMemory::AddSnapshot(const GuestMemorySnapshot& snapshot) {
         snapshotUses.push_back({snapshot.address, snapshot.bytes.size(), live});
         // A live region over a unit shadow's fresh results reads the import's stale bytes here
         // (the publish happens when the region is bound, under the device lock): not compared.
-        if (live && !liveSnapshotCompared(snapshot.address, snapshot.bytes.size())) {
+        if (live && (liveSnapshotsUnchecked || !liveSnapshotCompared(snapshot.address, snapshot.bytes.size()))) {
             if (profile) Snapshots().skipped.fetch_add(1, std::memory_order_relaxed);
             return;
         }

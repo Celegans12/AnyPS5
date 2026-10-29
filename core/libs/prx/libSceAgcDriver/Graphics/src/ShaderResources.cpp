@@ -2778,6 +2778,39 @@ void ShaderResources::Complete() {
     forgetDeferredInputs();
 }
 
+void ShaderResources::DeferAddressTable() {
+    Require(!completed, "an address table can only be deferred before the build completes");
+    if (lockedBuild && !drawBuild) addressTableDeferred = true;
+}
+
+void ShaderResources::EnsureAddressTable() {
+    if (!addressTableDeferred) return;
+    Require(completed, "a deferred address table is built after its build completed");
+    addressTableDeferred = false;
+    deferredRanges.reset();
+    if (usesBda) bda = std::make_unique<BdaResources>(context, guestMemory);
+    else if (usesFaultBuffer) bda = std::make_unique<BdaResources>(context);
+    if (bda == nullptr) return;
+    bda->SetSrtGuards(std::move(srtGuardFaults));
+    if (std::exchange(imageTablesDeferred, false)) bda->SetImageTables(std::move(deferredImageFaults), std::move(deferredImageRanges));
+    std::vector<VkWriteDescriptorSet> rewrites;
+    for (const auto& binding : bindings) {
+        if (binding.flags != 0 || binding.layout.descriptorType != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) continue;
+        const auto set = setOf(binding) == 0 ? _set : fragment.set;
+        const auto write = std::find_if(descriptorWrites.begin(), descriptorWrites.end(), [&](const VkWriteDescriptorSet& made) { return made.dstSet == set && made.dstBinding == binding.layout.binding && made.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; });
+        bool rewritten = false;
+        for (std::size_t element = 0; element < binding.allocations.size(); ++element) {
+            auto& allocation = allocations[binding.allocations[element]];
+            if (allocation.role != ShaderRecompiler::DescriptorRole::BdaPagetable && allocation.role != ShaderRecompiler::DescriptorRole::FaultBuffer) continue;
+            Require(write != descriptorWrites.end() && write->pBufferInfo != nullptr && element < write->descriptorCount, "a deferred address table binding has no descriptor write");
+            const_cast<VkDescriptorBufferInfo*>(write->pBufferInfo)[element] = descriptor(allocation);
+            rewritten = true;
+        }
+        if (rewritten) rewrites.push_back(*write);
+    }
+    if (!rewrites.empty()) context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(rewrites.size()), rewrites.data(), 0, nullptr);
+}
+
 void ShaderResources::forgetDeferredInputs() {
     // The compiled shader and the captured regions belong to the dispatch, which returns while this
     // object lives on in the resource cache and the recorder: nothing may reach for them after the
@@ -3608,8 +3641,8 @@ void ShaderResources::buildComplete() {
         timing.bindingsMs += phase(BuildPhase::Images);
         guestMemory.UploadFinish(usesBda);
         timing.uploadMs += phase(BuildPhase::Upload);
-        if (usesBda) bda = std::make_unique<BdaResources>(context, guestMemory);
-        else if (usesFaultBuffer) bda = std::make_unique<BdaResources>(context);
+        if (usesBda && !addressTableDeferred) bda = std::make_unique<BdaResources>(context, guestMemory);
+        else if (usesFaultBuffer && !addressTableDeferred) bda = std::make_unique<BdaResources>(context);
         if (bda) bda->SetSrtGuards(std::move(srtGuardFaults));
         finishImageTables();
         phase(BuildPhase::Bda);
@@ -6937,6 +6970,12 @@ void ShaderResources::finishImageTables() {
         std::memcpy(allocation.buffer->Bytes().data(), map.data(), allocation.size);
         faults.push_back({IrStage(table.stage), table.program->imageTableShader, table.poison, table.messages});
         ranges.insert(ranges.end(), table.program->imageTableRanges.begin(), table.program->imageTableRanges.end());
+    }
+    if (bda == nullptr && addressTableDeferred) {
+        imageTablesDeferred = true;
+        deferredImageFaults = std::move(faults);
+        deferredImageRanges = std::move(ranges);
+        return;
     }
     if (bda == nullptr) return;
     bda->SetImageTables(std::move(faults), std::move(ranges));

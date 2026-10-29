@@ -18,6 +18,7 @@ public:
     VkDescriptorBufferInfo Table() const;
     VkDescriptorBufferInfo Fault() const;
     std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>> Ranges() const;
+    static std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>> RangesOf(const GuestBufferMemory& memory);
     void CheckFault(std::uint64_t shaderAddress = 0) const;
     struct ImageTableFaults {
         std::uint32_t stage = 0;

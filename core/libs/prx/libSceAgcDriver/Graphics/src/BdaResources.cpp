@@ -372,6 +372,19 @@ std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>> BdaResources
     return tableRanges;
 }
 
+std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>> BdaResources::RangesOf(const GuestBufferMemory& memory) {
+    const auto cached = memory.CachedAddressTable();
+    if (cached.has_value() && cached->owner != nullptr) return cached->owner;
+    if (cached.has_value() && cached->serial != 0 && tableCacheEnabled()) {
+        auto& cache = Tables();
+        std::lock_guard lock(cache.mutex);
+        for (const auto& entry : cache.entries) {
+            if (entry.spaceSerial == cached->serial && entry.ranges != nullptr) return entry.ranges;
+        }
+    }
+    return std::make_shared<const std::vector<ShaderRecompiler::BdaAbi::Range>>(cached.has_value() ? *cached->ranges : memory.AddressRanges());
+}
+
 VkDescriptorBufferInfo BdaResources::Fault() const {
     return {fault->Handle(), 0, ShaderRecompiler::BdaAbi::FaultBufferBytes};
 }

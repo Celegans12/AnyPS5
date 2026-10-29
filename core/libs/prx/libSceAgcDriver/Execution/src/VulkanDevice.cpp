@@ -5755,6 +5755,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
             emitted = computePipeline(context, *emit->twin, layouts.main, layouts.mainKey, record.pushStages, record.programAddress);
         }
     }
+    if (emitted == nullptr && resources.AddressTableDeferred()) resources.EnsureAddressTable();
     if (recorder.HasQueuedKeyStores() && (resources.HoldsLease() || recorder.AnyQueuedKeyStore(touches))) recorder.FlushKeyStores();
     if (recorder.HasQueuedStores() && (resources.HoldsLease() || recorder.AnyQueuedStore(touches))) recorder.FlushStores();
     if (record.shader->program->bindlessHeap) {
@@ -6321,6 +6322,10 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     }
     auto pushBytes = Graphics::AssemblePushConstants(shaders);
     const auto context = graphicsContext();
+    auto* const emit = arguments == 0 ? NewPath::CurrentEmit() : nullptr;
+    const auto emitStart = emit != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto* emitLimit = state->properties.limits.maxComputeWorkGroupCount;
+    const bool deferTable = emit != nullptr && NewPath::MayEmitWithoutTable(*emit, x <= emitLimit[0] && y <= emitLimit[1] && z <= emitLimit[2]);
     const auto pipelineKey = ComputePipelineKey::Of(shader, pushStages != 0);
     std::shared_ptr<ComputePipelineObjects> objects = prepared != nullptr ? prepared->objects : nullptr;
     if (objects == nullptr && !pipelineKey.identity.Empty()) {
@@ -6395,6 +6400,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         // (an address-based build also runs its stage A here, under the mutex: 'A locked').
         const auto before = profile ? resources->Timing() : Graphics::ShaderResources::BuildTiming{};
         const auto completeStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        if (deferTable) resources->DeferAddressTable();
         resources->Complete();
         require(prepared->describedLayoutKey.empty() || std::ranges::equal(resources->SetLayouts().mainKey, prepared->describedLayoutKey), "the set layout described for the dispatch's pipeline differs from its build");
         if (profile) {
@@ -6494,7 +6500,13 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     }
     if (resources == nullptr) {
         const auto buildStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        resources = std::make_shared<Graphics::ShaderResources>(context, shaders[0], snapshots, false, prepared != nullptr ? prepared->dispatchThreads : 0);
+        if (deferTable && Graphics::ShaderResources::StagesUseAddressTables(shaders)) {
+            resources = std::make_shared<Graphics::ShaderResources>(context, shaders[0], snapshots, true, prepared != nullptr ? prepared->dispatchThreads : 0);
+            resources->DeferAddressTable();
+            resources->Complete();
+        } else {
+            resources = std::make_shared<Graphics::ShaderResources>(context, shaders[0], snapshots, false, prepared != nullptr ? prepared->dispatchThreads : 0);
+        }
         if (profile) timer.add(PhaseResourcesFullBuild, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - buildStart).count());
         if (cacheable) {
             ++d.cacheMisses;
@@ -6503,6 +6515,11 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         }
     }
     resources->PatchPushConstants(pushBytes);
+    const auto emitBuilt = emit != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    if (emit != nullptr) {
+        emit->tableDeferred = resources->AddressTableDeferred();
+        emit->addressBased = resources->UsesAddressTable();
+    }
     if (profile) timer.add(PhaseResourcesHookWaits, Graphics::Recorder::ThreadWaitedMs() - waitedBefore);
     // The lookup outcomes of this call: rows with counts on the [indirect] line, and a summary for
     // the longest call.
@@ -6542,7 +6559,12 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         timer.phase(PhasePipeline);
     }
     DispatchCompletion completion{context, shaders, pushStages, pushBytes, objects, resources, contentKey, cacheable, fromCache, revalidateMs, overlay, lookupsBefore, timer, timing, groupsText};
-    return recordCompletedDispatch(shader, x, y, z, arguments, programAddress, recipeOut, threadGroup, htileClear, completion);
+    auto outcome = recordCompletedDispatch(shader, x, y, z, arguments, programAddress, recipeOut, threadGroup, htileClear, completion);
+    if (emit != nullptr) {
+        const auto nsBetween = [](auto from, auto to) { return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(to - from).count()); };
+        NewPath::NoteDispatchCost(*emit, nsBetween(emitStart, std::chrono::steady_clock::now()), nsBetween(emitStart, emitBuilt));
+    }
+    return outcome;
 }
 
 VulkanDevice::IndirectOutcome VulkanDevice::recordCompletedDispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::uint64_t programAddress, std::shared_ptr<const Recipe>* recipeOut, const std::array<std::uint32_t, 3>& threadGroup, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear, DispatchCompletion& completion) {

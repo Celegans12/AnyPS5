@@ -23,6 +23,10 @@ bool UsesAddressTables(const ShaderRecompiler::RecompileResult& compiled) {
     return std::ranges::any_of(compiled.bindings, [](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable; });
 }
 
+bool WalkReplacesTables(const ShaderRecompiler::RecompileResult& twin) {
+    return twin.newPathResolved && std::ranges::none_of(twin.bindings, [](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable || binding.role == ShaderRecompiler::DescriptorRole::FaultBuffer; });
+}
+
 std::string TwinDifference(const ShaderRecompiler::RecompileResult& compiled, const ShaderRecompiler::RecompileResult& twin) {
     if (!twin.newPathResolved || compiled.newPathResolved) return "resolved marker";
     std::size_t at = 0;

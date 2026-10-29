@@ -10,7 +10,9 @@
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/ResolvedTwins.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "Recompiler.hpp"
+#include <array>
 #include <cstdio>
+#include <string>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -25,8 +27,13 @@ bool EnvSet(const char* name) {
     return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
 }
 
+struct DispatchCost {
+    std::atomic<std::uint64_t> count{0}, deviceNs{0}, buildNs{0}, slow{0};
+};
+
 struct State {
     Router router{EmitDispatches()};
+    std::array<DispatchCost, 4> costs;
     std::mutex reporting;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
@@ -69,6 +76,18 @@ void print(State& state, const char* window) {
     const auto table = DeviceTable().Totals();
     const auto twins = Twins().Outcomes();
     AgcDriver::ProfilePrint_nid_no_patch("%s; page table builds %llu, patches %llu, ranges %llu, covered %.1f MiB; emit %s: resolved twins built %llu, not address-based %llu, failed %llu, mismatched %llu; table compares covered %llu, missing %llu, other address %llu, narrower %llu\n", line.c_str(), static_cast<unsigned long long>(table.builds), static_cast<unsigned long long>(table.patches), static_cast<unsigned long long>(table.ranges), static_cast<double>(table.coveredBytes) / (1024.0 * 1024.0), EmitDispatches() ? "on" : "off", static_cast<unsigned long long>(twins[0]), static_cast<unsigned long long>(twins[1]), static_cast<unsigned long long>(twins[2]), static_cast<unsigned long long>(twins[3]), static_cast<unsigned long long>(table.coverHits[0]), static_cast<unsigned long long>(table.coverHits[1]), static_cast<unsigned long long>(table.coverHits[2]), static_cast<unsigned long long>(table.coverHits[3]));
+    if (EmitDispatches()) {
+        std::string costs;
+        static constexpr const char* names[] = {"new path (table deferred)", "new path (table built)", "fallback address-based", "fallback other"};
+        for (std::size_t index = 0; index < state.costs.size(); ++index) {
+            auto& cost = state.costs[index];
+            const auto count = cost.count.load(std::memory_order_relaxed);
+            char text[192];
+            std::snprintf(text, sizeof(text), "%s%s %llu x %.1f us device call (resources %.1f us), %llu over 50 ms left out", costs.empty() ? "" : "; ", names[index], static_cast<unsigned long long>(count), count != 0 ? static_cast<double>(cost.deviceNs.load(std::memory_order_relaxed)) / 1000.0 / static_cast<double>(count) : 0.0, count != 0 ? static_cast<double>(cost.buildNs.load(std::memory_order_relaxed)) / 1000.0 / static_cast<double>(count) : 0.0, static_cast<unsigned long long>(cost.slow.load(std::memory_order_relaxed)));
+            costs += text;
+        }
+        AgcDriver::ProfilePrint_nid_no_patch("[newpath-cost] window=%s claimed direct dispatches (cumulative): %s\n", window, costs.c_str());
+    }
     if (const auto residency = Graphics::ResidencyReportLine(); !residency.empty()) AgcDriver::ProfilePrint_nid_no_patch("%s\n", residency.c_str());
 }
 
@@ -162,8 +181,32 @@ EmitCandidate* CurrentEmit() {
 Decision NoteEmit(EmitCandidate& candidate, const CommandFacts& facts) {
     auto& state = Get();
     const auto decision = state.router.Decide(facts);
-    if (!candidate.noted.exchange(true, std::memory_order_relaxed)) state.router.Note(facts.kind, decision);
+    if (!candidate.noted.exchange(true, std::memory_order_relaxed)) {
+        state.router.Note(facts.kind, decision);
+        candidate.routed = decision.route;
+    }
     return decision;
+}
+
+bool MayEmitWithoutTable(const EmitCandidate& candidate, bool pipelineReady) {
+    if (candidate.twin == nullptr || !WalkReplacesTables(*candidate.twin)) return false;
+    auto facts = candidate.facts;
+    facts.pipelineReady = pipelineReady;
+    facts.clothGuard = false;
+    facts.tableCovers = true;
+    return Get().router.Decide(facts).route == Route::NewPath;
+}
+
+void NoteDispatchCost(const EmitCandidate& candidate, std::uint64_t deviceNs, std::uint64_t buildNs) {
+    if (!Profile()) return;
+    auto& cost = Get().costs[candidate.routed != Route::NewPath ? (candidate.addressBased ? 2 : 3) : candidate.tableDeferred ? 0 : 1];
+    if (deviceNs > 50'000'000ull) {
+        cost.slow.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    cost.count.fetch_add(1, std::memory_order_relaxed);
+    cost.deviceNs.fetch_add(deviceNs, std::memory_order_relaxed);
+    cost.buildNs.fetch_add(buildNs, std::memory_order_relaxed);
 }
 
 void Close(const char* window) {

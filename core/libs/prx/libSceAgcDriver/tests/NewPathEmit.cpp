@@ -251,6 +251,12 @@ void resolvedTwins() {
     Expect(TwinCompatible(*withBuffer, *walkOnly), "a twin that drops only the BDA table binding was refused");
     auto lostBuffer = AddressProgram(true);
     Expect(!TwinCompatible(*withBuffer, *lostBuffer), "a twin that drops a guest buffer binding was accepted");
+    Expect(WalkReplacesTables(*walkOnly), "a twin without table and fault bindings does not let the build skip its table");
+    Expect(!WalkReplacesTables(*twin), "a twin that binds the BDA table lets the build skip it");
+    Expect(!WalkReplacesTables(*withBuffer), "an unresolved module lets the build skip its table");
+    auto withFault = AddressProgram(true);
+    withFault->bindings[0].role = ShaderRecompiler::DescriptorRole::FaultBuffer;
+    Expect(!WalkReplacesTables(*withFault), "a twin that binds the fault buffer lets the build skip it");
 
     ResolvedTwins twins;
     twins.Remember(compiled, twin, TwinOutcome::Built);

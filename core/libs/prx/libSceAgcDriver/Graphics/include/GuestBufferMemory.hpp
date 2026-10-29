@@ -443,6 +443,7 @@ public:
         for (const auto& region : regions) if (region.gpuCopy) return true;
         return false;
     }
+    void SkipLiveSnapshotCompares() { liveSnapshotsUnchecked = true; }
     bool HasOverlays() const {
         for (const auto& region : regions) if (region.overlay) return true;
         return false;
@@ -664,6 +665,7 @@ private:
     // Whether `regions` is in ascending address order (true right after AcquireRegistered, whose
     // regions follow the registry's order), so AddSnapshot can search instead of scanning.
     bool regionsSorted = false;
+    bool liveSnapshotsUnchecked = false;
     bool regionsOverlap = false;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> readsOverBase;
