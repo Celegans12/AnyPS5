@@ -30,4 +30,8 @@ int APS5_VABI sceNpHasEAAccessSubscription(int userId, bool* result) {
     return 0;
 }
 
+int APS5_VABI sceNpHasEAAccessSubscriptionAbortRequest() {
+    NotImplemented_nid_no_patch(__func__);
+}
+
 }

@@ -1,5 +1,9 @@
 # libSceNpPartner001 technical debt
 
+### Unknown function info
+
+- [sceNpHasEAAccessSubscriptionAbortRequest](../../../core/libs/prx/libSceNpPartner001/Export.cpp) has an unknown signature and behaviour. The parameterless `int` declaration is an import-resolution placeholder, not a confirmed ABI signature, and every call throws through `NotImplemented_nid_no_patch`. Only its name and NID `pQfYTZHznMc` are established by the [13.60 export inventory](https://github.com/xdCloudy/PS5-13.60-Function-Stub-Library/blob/bfec40deb4c47a17d7603ee2bc79aa6862c0c56b/data/firmware-13.60/libscenppartner001-b5ae22d388.jsonl); not measured on a console.
+
 ### Functional
 
 - [sceNpEAAccessInitialize, sceNpEAAccessTerminate](../../../core/libs/prx/libSceNpPartner001/Export.cpp) (libSceNpPartner001) - initialization marks the library initialized without contacting the server and termination clears it, as in [shadPS4](https://github.com/shadps4-emu/shadPS4/blob/main/src/core/libraries/np/np_partner.cpp); whether the console fails initialization while signed out is unknown. Termination without initialization throws where shadPS4 returns the PS4 error `0x819D0001`, whose PS5 value is unverified, and a second initialization throws where shadPS4 returns 0 without checking. PPSA23566 imports both, not confirmed on its start-up path
