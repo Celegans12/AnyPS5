@@ -22,6 +22,8 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/DrawCensus.hpp"
+#include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/DrawCensusHooks.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -600,6 +602,7 @@ TileMipLayout ColorTargetMip(const ColorTarget& color, const ColorTargetLayout& 
 // the millisecond the old print rounded to), totalled over 10 s in the [draws] line.
 enum DrawPhase : std::size_t { PhaseValidate, PhaseVertex, PhaseSetup, PhaseReadTarget, PhasePrepare, PhaseLookup, PhaseResources, PhasePipeline, PhaseRecord, PhaseKeep, PhaseSync, PhaseWriteBack, PhaseDescribe, PhaseCount };
 constexpr std::array<const char*, PhaseCount> DrawPhaseNames{"validate", "vertex", "setup", "readTarget", "prepare", "lookup", "resources", "pipeline", "record", "keep", "sync", "writeBack", "describe"};
+static_assert(PhaseCount == NewPath::DrawCensus::PhaseCount, "the draw census names Graphics::Draw's phases in this order");
 
 // Why a draw did not go into the recorder without a wait (counted in the [draws] line): its targets
 // are not all resident, no recorder is active, a switch (APS5_SYNC_DRAWS, APS5_DUMP_TARGETS,
@@ -658,6 +661,7 @@ struct DrawOutcome {
 // template hit, a build, or an address-based (BDA) build.
 enum DrawKind : std::size_t { KindRecipeHit, KindTemplateHit, KindBuild, KindBda, KindCount };
 constexpr std::array<const char*, KindCount> DrawKindNames{"recipe hit", "template hit", "build", "BDA"};
+static_assert(KindCount == NewPath::DrawCensus::KindCount, "the draw census names the draw kinds in this order");
 
 struct DrawProfile {
     AgcDriver::Mutex mutex;
@@ -902,6 +906,7 @@ void closeDrawWindow(const char* window) {
     auto& stats = Profile();
     std::lock_guard lock(stats.mutex);
     printDrawWindow(stats, window);
+    NewPath::DrawCensus::Close(window);
 }
 
 void countCache(std::uint64_t DrawProfile::*counter) {
@@ -1386,6 +1391,7 @@ void reportDrawEnd(const State& state, const DrawTimer& timer, const ShaderResou
         }
         std::fprintf(stderr, "%s\n", line);
     }
+    NewPath::DrawCensus::End(outcome.kind, timer.us);
     reportDraw(timer.us, built, outcome);
 }
 
@@ -3356,6 +3362,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     auto& resolved = preparation.resolved;
     resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, outcome, timer, prepared, ahead);
     auto& resources = resolved.resources;
+    if (timer.profile) NewPath::DrawCensus::NoteBuild(*resources);
     if (!stencilReferences.empty() && resources->ChecksFaults()) recordable = false;
     if (!stencilReferences.empty()) {
         const auto readImages = resources->StorageImages();
@@ -3992,6 +3999,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     DrawPreparation preparation(profile);
     preparation.recipeOut = recipeOut;
     preparation.trace = trace;
+    if (profile) NewPath::DrawCensus::Begin(shaders, draw);
     if (prepareDraw(context, state, draw, shaders, snapshots, prepared, ahead, preparation)) recordPreparedDraw(context, state, draw, shaders, preparation);
 }
 
