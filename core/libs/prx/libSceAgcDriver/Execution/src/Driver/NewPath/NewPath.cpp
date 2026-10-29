@@ -5,12 +5,15 @@
 #include "prx/libSceAgcDriver/Graphics/include/ResidencyConfig.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidencySession.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/DevicePageTable.hpp"
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/ResolvedPush.hpp"
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/ResolvedTwins.hpp"
+#include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/ShareCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/PipelineAheadConfig.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "Recompiler.hpp"
+#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <string>
@@ -120,6 +123,7 @@ void print(State& state, const char* window) {
         const auto completions = state.completions.load(std::memory_order_relaxed);
         AgcDriver::ProfilePrint_nid_no_patch("[newpath-cost] window=%s us per dispatch after the build (cumulative): %s; command record completions %llu x %.1f us, records made %llu; F4 compares %llu, served by the space serial %llu\n", window, split.c_str(), static_cast<unsigned long long>(completions), completions != 0 ? static_cast<double>(state.completionNs.load(std::memory_order_relaxed)) / 1000.0 / static_cast<double>(completions) : 0.0, static_cast<unsigned long long>(table.records), static_cast<unsigned long long>(table.compares), static_cast<unsigned long long>(table.serialHits));
     }
+    if (Census::Enabled()) AgcDriver::ProfilePrint_nid_no_patch("%s\n", Census::Format(window).c_str());
     const auto ahead = Pipelines().Totals();
     AgcDriver::ProfilePrint_nid_no_patch("[newpath] window=%s pipelines ahead (gate %s): requested %llu, created %llu, failed %llu, inline %llu, blocked %llu, pending fallbacks %llu, prewarmed %llu\n", window, PipelineGateEnabled() ? "on" : "off", static_cast<unsigned long long>(ahead.requested), static_cast<unsigned long long>(ahead.created), static_cast<unsigned long long>(ahead.failed), static_cast<unsigned long long>(ahead.createdInline), static_cast<unsigned long long>(ahead.blockedWaits), static_cast<unsigned long long>(ahead.pendingFallbacks), static_cast<unsigned long long>(ahead.prewarmed));
     const auto twinPipes = TwinPipelineStore().Totals();
@@ -172,6 +176,7 @@ void EndCommand() {
     auto& pending = ThreadPending();
     if (pending.active) {
         pending.active = false;
+        if (pending.facts.kind == CommandKind::Dispatch) Census::NoteUnclaimed();
         state.router.Note(pending.facts.kind, state.router.Decide(pending.facts));
     }
     report(state);
@@ -188,10 +193,12 @@ std::shared_ptr<EmitCandidate> ClaimDispatch(const ShaderRecompiler::RecompileRe
     candidate->facts.resolvedProgram = candidate->twin != nullptr;
     candidate->facts.pushFits = LegacyPushBytes <= Abi::PushBlockBytes - ResolvedDriverWords * 4u;
     candidate->facts.staticChains = true;
+    Census::Fill(*candidate, compiled);
     return candidate;
 }
 
 EmitCandidate::~EmitCandidate() {
+    if (census.active && !census.committed) Census::NoteCommit(*this, false, 0, 0);
     if (noted.exchange(true, std::memory_order_relaxed)) return;
     auto& state = Get();
     auto facts = this->facts;
@@ -242,6 +249,10 @@ void NoteDispatchCost(const EmitCandidate& candidate, std::uint64_t deviceNs, st
     CostLap(CostStep::PostRecord);
     auto& clock = ThreadSteps();
     clock.active = false;
+    if (candidate.census.active && !candidate.census.committed) {
+        candidate.census.committed = true;
+        Census::NoteCommit(candidate, true, deviceNs, buildNs);
+    }
     auto& cost = Get().costs[candidate.routed != Route::NewPath ? (candidate.addressBased ? 2 : 3) : candidate.tableDeferred ? 0 : 1];
     if (deviceNs > 50'000'000ull) {
         cost.slow.fetch_add(1, std::memory_order_relaxed);
@@ -276,6 +287,30 @@ void NoteCompletionCost(std::uint64_t ns) {
     auto& state = Get();
     state.completions.fetch_add(1, std::memory_order_relaxed);
     state.completionNs.fetch_add(ns, std::memory_order_relaxed);
+}
+
+void NoteBufferCover(const EmitCandidate& candidate, const Graphics::ShaderResources& resources) {
+    if (!candidate.census.active || candidate.twin != nullptr || candidate.addressBased || (candidate.census.shape & (Census::BuffersFromUser | Census::BuffersFromMemory)) == 0) return;
+    auto cover = Census::BufferCover::Unavailable;
+    try {
+        if (const auto ranges = resources.GuestBufferRanges(); ranges != nullptr) {
+            DevicePageTable::Range failed{};
+            switch (DeviceTable().Probe(*ranges, &failed)) {
+            case DevicePageTable::Cover::Covered: cover = Census::BufferCover::Covered; break;
+            case DevicePageTable::Cover::Missing: cover = Census::BufferCover::Missing; break;
+            case DevicePageTable::Cover::OtherAddress: {
+                std::vector<std::array<std::uint64_t, 3>> accesses;
+                resources.RunAccesses(accesses);
+                const bool written = std::ranges::any_of(accesses, [&](const std::array<std::uint64_t, 3>& access) { return (access[2] & Graphics::Recorder::RunAccessImage) == 0 && (access[2] & Graphics::Recorder::RunAccessWritten) != 0 && access[0] < failed.end && failed.begin < access[1]; });
+                cover = written ? Census::BufferCover::OtherAddressWritten : Census::BufferCover::OtherAddress;
+                break;
+            }
+            case DevicePageTable::Cover::Narrower: cover = Census::BufferCover::Narrower; break;
+            }
+        }
+    } catch (const std::exception&) {
+    }
+    candidate.census.cover = static_cast<std::uint8_t>(cover);
 }
 
 void Close(const char* window) {

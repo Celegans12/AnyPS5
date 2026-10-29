@@ -330,6 +330,7 @@ public:
         std::span<const ShaderRecompiler::BdaAbi::Range> ranges;
     };
     std::optional<DeferredTableView> DeferredAddressTable() const;
+    std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>> GuestBufferRanges() const;
     void WriteBackBuffers(std::uint64_t shaderAddress = 0);
     // Whether WriteBackBuffers has anything the CPU must see (copied written buffers, BDA faults).
     bool NeedsCompletion() const { return ((bda != nullptr || addressTableDeferred) && faultChecks) || guestMemory.HasCopiedWrites(); }
