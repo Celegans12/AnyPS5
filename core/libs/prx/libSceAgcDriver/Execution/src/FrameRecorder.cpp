@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/State/include/Configuration.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FrameRecorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/TraceRevision.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -132,6 +133,68 @@ std::uint64_t contentHash(std::span<const std::byte> bytes) {
     for (const auto value : bytes) hash = (hash ^ static_cast<std::uint64_t>(value)) * 0x100000001b3ull;
     return hash == 0 ? 1 : hash;
 }
+
+std::uint64_t wideHash(std::span<const std::byte> bytes) {
+    std::uint64_t hash = 0xcbf29ce484222325ull ^ (static_cast<std::uint64_t>(bytes.size()) * 0x9e3779b97f4a7c15ull);
+    std::size_t at = 0;
+    for (; at + 8 <= bytes.size(); at += 8) {
+        std::uint64_t word = 0;
+        std::memcpy(&word, bytes.data() + at, 8);
+        hash = (hash ^ word) * 0x100000001b3ull;
+        hash ^= hash >> 29;
+    }
+    for (; at < bytes.size(); ++at) hash = (hash ^ static_cast<std::uint64_t>(bytes[at])) * 0x100000001b3ull;
+    return hash == 0 ? 1 : hash;
+}
+
+constexpr std::size_t MaximumHeaderImageBytes = 1u << 20;
+
+class ReplayedMemory {
+public:
+    bool Holds(std::uint64_t address, std::uint64_t bytes, std::uint64_t key) const {
+        const auto found = known.find(address);
+        return found != known.end() && found->second.first == address + bytes && found->second.second == key;
+    }
+
+    bool Rewritten(std::uint64_t address, std::uint64_t bytes) const {
+        const auto next = written.upper_bound(address);
+        if (next != written.begin() && std::prev(next)->second > address) return true;
+        return next != written.end() && next->first < address + bytes;
+    }
+
+    void Write(std::uint64_t address, std::uint64_t bytes, std::uint64_t key) {
+        const auto end = address + bytes;
+        for (auto it = known.lower_bound(address > longest ? address - longest : 0); it != known.end() && it->first < end;) {
+            if (address < it->second.first) it = known.erase(it);
+            else ++it;
+        }
+        remember(address, end, key);
+        auto first = address;
+        auto last = end;
+        auto it = written.upper_bound(address);
+        if (it != written.begin() && std::prev(it)->second >= address) --it;
+        while (it != written.end() && it->first <= last) {
+            first = std::min(first, it->first);
+            last = std::max(last, it->second);
+            it = written.erase(it);
+        }
+        written[first] = last;
+    }
+
+    void Note(std::uint64_t address, std::uint64_t bytes, std::uint64_t key) {
+        if (!Rewritten(address, bytes)) remember(address, address + bytes, key);
+    }
+
+private:
+    void remember(std::uint64_t address, std::uint64_t end, std::uint64_t key) {
+        known[address] = {end, key};
+        longest = std::max(longest, end - address);
+    }
+
+    std::uint64_t longest = 0;
+    std::map<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>> known;
+    std::map<std::uint64_t, std::uint64_t> written;
+};
 
 }
 
@@ -285,7 +348,9 @@ void FrameRecorder::recordLocked(FrameCall call, bool prologueCall, std::span<co
     if (state == State::Waiting) {
         if (!prologueCall) return;
         call.ordinal = ++ordinal;
-        prologue.push_back(std::move(call));
+        const bool registration = call.kind == FrameCallKind::RegisterShader;
+        auto images = prologueShaders(shaders, registration);
+        prologue.push_back({std::move(call), std::move(images)});
         return;
     }
     if (state != State::Recording) return;
@@ -296,6 +361,120 @@ void FrameRecorder::recordLocked(FrameCall call, bool prologueCall, std::span<co
     std::tie(call.accepted, call.completed) = DriverDetail::Driver::Get().SerialProgress();
     writer->WriteCall(call);
     ++recordedCalls;
+}
+
+std::vector<FrameRecorder::PrologueShader> FrameRecorder::prologueShaders(std::span<const Shader* const> shaders, bool registration) {
+    std::vector<PrologueShader> result;
+    for (const auto* shader : shaders) {
+        if (shader == nullptr || !GuestMemory::Accessible(shader, sizeof(Shader))) continue;
+        Shader fields;
+        std::memcpy(&fields, static_cast<const void*>(shader), sizeof(Shader));
+        if (fields.file_header != 0x34333231u || fields.header_size < sizeof(Shader) || fields.header_size > MaximumHeaderImageBytes || !GuestMemory::Accessible(shader, fields.header_size)) continue;
+        const auto image = [&](const void* address, std::size_t bytes) {
+            PrologueShader entry;
+            entry.header = pointer(address);
+            const std::span view(static_cast<const std::byte*>(address), bytes);
+            entry.headerHash = wideHash(view);
+            if (!headerImages.contains(entry.headerHash)) headerImages.emplace(entry.headerHash, std::vector<std::byte>(view.begin(), view.end()));
+            return entry;
+        };
+        const auto begin = pointer(shader);
+        const auto end = begin + fields.header_size;
+        const auto referred = [&](const void* array, std::size_t bytes) {
+            const auto at = pointer(array);
+            if (array == nullptr || bytes == 0 || bytes > MaximumHeaderImageBytes || (at >= begin && at + bytes <= end) || !GuestMemory::Accessible(array, bytes)) return;
+            result.push_back(image(array, bytes));
+        };
+        referred(fields.cx_registers, fields.num_cx_registers * sizeof(ShaderRegister));
+        referred(fields.sh_registers, fields.num_sh_registers * sizeof(ShaderRegister));
+        referred(fields.specials, sizeof(ShaderSpecialRegs));
+        referred(fields.input_semantics, fields.num_input_semantics * sizeof(ShaderSemantic));
+        referred(fields.output_semantics, fields.num_output_semantics * sizeof(ShaderSemantic));
+        auto entry = image(shader, fields.header_size);
+        const auto* code = const_cast<const void*>(fields.code);
+        if (registration && code != nullptr && fields.shader_size != 0 && GuestMemory::Accessible(code, fields.shader_size)) {
+            entry.code = pointer(code);
+            entry.codeBytes = fields.shader_size;
+            entry.codeHash = wideHash(std::span(static_cast<const std::byte*>(code), fields.shader_size));
+        }
+        result.push_back(entry);
+    }
+    return result;
+}
+
+void FrameRecorder::writePrologue() {
+    const auto registry = DriverDetail::Driver::Get().RegisteredShaders();
+    ReplayedMemory replayed;
+    std::vector<std::byte> current;
+    const auto holdsNow = [&](std::uint64_t address, std::uint64_t bytes, std::uint64_t key) {
+        if (replayed.Holds(address, bytes, key)) return true;
+        if (replayed.Rewritten(address, bytes)) return false;
+        const auto* at = reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address));
+        if (!GuestMemory::Accessible(at, static_cast<std::size_t>(bytes))) return false;
+        current.resize(static_cast<std::size_t>(bytes));
+        std::memcpy(current.data(), at, current.size());
+        const auto now = wideHash(current);
+        replayed.Note(address, bytes, now);
+        return now == key;
+    };
+    const auto registeredCode = [&](const PrologueShader& shader) -> std::shared_ptr<const DriverDetail::ShaderSnapshot> {
+        if (registry == nullptr) return {};
+        const auto found = registry->find(shader.code);
+        if (found == registry->end()) return {};
+        for (const auto& snapshot : found->second) {
+            const auto bytes = std::as_bytes(std::span(snapshot->code));
+            if (bytes.size() == shader.codeBytes && wideHash(bytes) == shader.codeHash) return snapshot;
+        }
+        return {};
+    };
+    struct Write {
+        std::uint64_t address;
+        std::span<const std::byte> bytes;
+        std::uint64_t key;
+    };
+    std::vector<Write> writes;
+    std::vector<std::shared_ptr<const DriverDetail::ShaderSnapshot>> pinned;
+    for (const auto& entry : prologue) {
+        writes.clear();
+        pinned.clear();
+        bool stale = false;
+        for (const auto& shader : entry.shaders) {
+            const auto& image = headerImages.at(shader.headerHash);
+            if (!holdsNow(shader.header, image.size(), shader.headerHash)) writes.push_back({shader.header, image, shader.headerHash});
+            if (shader.codeBytes == 0 || holdsNow(shader.code, shader.codeBytes, shader.codeHash)) continue;
+            auto snapshot = registeredCode(shader);
+            if (snapshot == nullptr) {
+                stale = true;
+                break;
+            }
+            writes.push_back({shader.code, std::as_bytes(std::span(snapshot->code)), shader.codeHash});
+            pinned.push_back(std::move(snapshot));
+        }
+        if (stale) {
+            ++prologueDropped;
+            continue;
+        }
+        if (!writes.empty()) {
+            const auto group = ++deltaGroups;
+            for (const auto& write : writes) {
+                writer->WriteDelta(group, 0, write.address, write.bytes);
+                replayed.Write(write.address, write.bytes.size(), write.key);
+                ++prologueRewrites;
+                prologueRewriteBytes += write.bytes.size();
+            }
+            auto memory = make(FrameCallKind::Memory);
+            memory.ordinal = entry.call.ordinal;
+            memory.thread = entry.call.thread;
+            memory.timeNs = entry.call.timeNs;
+            memory.values = {group};
+            writer->WriteCall(memory);
+        }
+        writer->WriteCall(entry.call);
+    }
+    prologueCallCount = prologue.size();
+    prologue.clear();
+    prologue.shrink_to_fit();
+    headerImages.clear();
 }
 
 void FrameRecorder::FrameBoundary() {
@@ -532,7 +711,7 @@ void FrameRecorder::start() {
         snapshot(range);
         if (!writer) return;
     }
-    for (const auto& call : prologue) writer->WriteCall(call);
+    writePrologue();
     std::uintptr_t ringBase = 0;
     std::uint32_t ringSize = 0;
     sceAgcDriverGetTFRing(&ringBase, &ringSize);
@@ -582,7 +761,8 @@ std::string FrameRecorder::header() const {
     text += std::string(",\"dirty\":") + (APS5_TRACE_DIRTY < 0 ? "null" : APS5_TRACE_DIRTY != 0 ? "true" : "false");
     text += ",\"arena_base\":" + std::to_string(arenaBase) + ",\"arena_bytes\":" + std::to_string(arenaBytes);
     text += ",\"start_boundary\":" + std::to_string(startBoundary) + ",\"frames\":" + std::to_string(recordedFrames);
-    text += ",\"calls\":" + std::to_string(recordedCalls) + ",\"prologue_calls\":" + std::to_string(prologue.size());
+    text += ",\"calls\":" + std::to_string(recordedCalls) + ",\"prologue_calls\":" + std::to_string(prologueCallCount);
+    text += ",\"prologue_rewrites\":" + std::to_string(prologueRewrites) + ",\"prologue_rewrite_bytes\":" + std::to_string(prologueRewriteBytes) + ",\"prologue_dropped\":" + std::to_string(prologueDropped);
     text += ",\"ranges\":" + std::to_string(ranges.size()) + ",\"late_ranges\":" + std::to_string(lateRanges) + ",\"snapshot_bytes\":" + std::to_string(snapshotBytes) + ",\"unreadable_bytes\":" + std::to_string(unreadableBytes);
     text += ",\"memory_groups\":" + std::to_string(deltaGroups) + ",\"delta_bytes\":" + std::to_string(deltaBytes);
     text += ",\"capture_seconds\":" + std::to_string(std::chrono::duration<double>(std::chrono::steady_clock::now() - startedAt).count());

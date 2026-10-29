@@ -289,6 +289,50 @@ void testShaderCode(const std::filesystem::path& directory, bool host) {
     check(registered && captured == expected, "the complete separate shader code was not captured before registration");
 }
 
+void testPrologueHeader(const std::filesystem::path& directory) {
+    auto* bytes = allocate(1u << 20);
+    auto* shader = reinterpret_cast<Shader*>(bytes);
+    auto* code = bytes + (1u << 19);
+    constexpr std::size_t CodeBytes = 4096;
+    for (std::size_t i = 0; i < CodeBytes; ++i) code[i] = static_cast<std::byte>(i * 7 + 3);
+    *shader = {};
+    shader->file_header = 0x34333231u;
+    shader->version = 0x18u;
+    shader->header_size = sizeof(Shader);
+    shader->shader_size = CodeBytes;
+    shader->code = code;
+    std::vector<std::byte> registered(sizeof(Shader));
+    std::memcpy(registered.data(), shader, sizeof(Shader));
+    auto* recorder = AgcDriver::FrameRecorder::Active();
+    check(recorder != nullptr, "frame recorder is disabled");
+    recorder->RegisterShader(shader);
+    std::memset(static_cast<void*>(shader), 0x5a, sizeof(Shader));
+    std::vector<std::byte> later(sizeof(Shader));
+    std::memcpy(later.data(), shader, sizeof(Shader));
+    recorder->FrameBoundary();
+    recorder->FrameBoundary();
+    const FrameCaptureReader reader(directory);
+    std::vector<const FrameMemoryChunk*> rewritten;
+    bool restoredFirst = false;
+    for (const auto& call : reader.Calls()) {
+        if (call.kind == FrameCallKind::RegisterShader) {
+            check(call.address == address(shader), "the prologue registration names another header");
+            break;
+        }
+        if (call.kind != FrameCallKind::Memory) continue;
+        for (const auto& chunk : reader.Chunks()) {
+            if (chunk.kind != FrameMemoryKind::Delta || chunk.group != call.values.at(0)) continue;
+            rewritten.push_back(&chunk);
+            restoredFirst = restoredFirst || (chunk.address == address(shader) && reader.Read(chunk) == registered);
+        }
+    }
+    check(restoredFirst, "the prologue registration was not preceded by the header it registered");
+    std::memcpy(shader, registered.data(), registered.size());
+    restoreRewritten(reader, rewritten, Skipped{});
+    check(std::memcmp(shader, later.data(), later.size()) == 0, "the snapshot was not restored over the prologue header image");
+    check(reader.Header().find("\"prologue_rewrites\":1,") != std::string::npos, "the capture header does not count the prologue rewrite");
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -304,6 +348,7 @@ int main(int argc, char** argv) {
         else if (mode == "tokens") testEopTokens();
         else if (mode == "blocking") testBlockingSubmission(directory);
         else if (mode == "shader" || mode == "shader_host") testShaderCode(directory, mode == "shader_host");
+        else if (mode == "shader_prologue") testPrologueHeader(directory);
         else throw std::runtime_error("unknown test");
         AgcDriverShutdown_nid_postfix();
         std::puts("frame replay state test passed");
