@@ -1,5 +1,3 @@
-option(ANYPS5_RELINKER_CLI "Build the native relinker command line" ON)
-
 add_library(relinker_core STATIC
         ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/src/linux/LinuxElfPatcher.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/src/linux/LinuxGuestModuleWriter.cpp
