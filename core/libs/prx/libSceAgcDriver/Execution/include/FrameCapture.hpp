@@ -30,6 +30,8 @@ enum class FrameCallKind : std::uint32_t {
     End,
     DisplayBuffer,
     UnregisterVideoOutput,
+    QueueStates,
+    AliasedPages,
 };
 
 struct FrameCall {

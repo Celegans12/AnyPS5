@@ -59,6 +59,7 @@ void GuestArenaCompareWhenShared_nid_no_patch(std::uintptr_t address, std::size_
 void GuestArenaCompareResidentWhenShared_nid_no_patch(std::uintptr_t address, std::size_t bytes);
 void GuestArenaComparedPages_nid_no_patch(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count);
 void GuestArenaTakeUnreportedPages_nid_no_patch(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count);
+std::size_t GuestArenaAliasedPages_nid_postfix(std::uintptr_t* pages, std::uintptr_t* identities, std::size_t capacity, std::size_t* pageBytes);
 void GuestArenaForgetSection_nid_postfix(void* section);
 bool GuestArenaBeginHostImport_nid_no_patch(void* pointer, std::size_t bytes);
 void GuestArenaEndHostImport_nid_no_patch(void* pointer, std::size_t bytes);

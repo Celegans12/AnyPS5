@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadPriority.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
@@ -143,6 +144,18 @@ extern "C" std::size_t AgcDriverAwaitedWaits_nid_postfix(AgcDriver::AwaitedWait*
 
 extern "C" bool AgcDriverFailed_nid_postfix() {
     return AgcDriver::DriverDetail::Driver::Get().Failed();
+}
+
+extern "C" std::vector<std::uint32_t> AgcDriverSaveQueueStates_nid_postfix() {
+    return AgcDriver::DriverDetail::Driver::Get().SaveQueueStates();
+}
+
+extern "C" void AgcDriverLoadQueueStates_nid_postfix(std::span<const std::uint32_t> words) {
+    AgcDriver::DriverDetail::Driver::Get().LoadQueueStates(words);
+}
+
+extern "C" void AgcDriverUseGdsAt_nid_postfix(std::uint64_t address) {
+    AgcDriver::Pm4::UseGdsAt(address);
 }
 
 extern "C" bool AgcDriverQuiescent_nid_postfix() {

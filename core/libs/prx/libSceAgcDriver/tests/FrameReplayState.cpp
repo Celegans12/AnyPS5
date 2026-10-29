@@ -331,9 +331,61 @@ void testPrologueHeader(const std::filesystem::path& directory) {
     restoreRewritten(reader, rewritten, Skipped{});
     check(std::memcmp(shader, later.data(), later.size()) == 0, "the snapshot was not restored over the prologue header image");
     check(reader.Header().find("\"prologue_rewrites\":1,") != std::string::npos, "the capture header does not count the prologue rewrite");
+    const auto states = std::find_if(reader.Calls().begin(), reader.Calls().end(), [](const FrameCall& call) { return call.kind == FrameCallKind::QueueStates; });
+    const auto start = std::find_if(reader.Calls().begin(), reader.Calls().end(), [](const FrameCall& call) { return call.kind == FrameCallKind::FrameStart; });
+    check(states != reader.Calls().end() && states < start, "the capture does not record the queue states before the first frame");
+    std::vector<std::uint32_t> words;
+    for (const auto value : states->values) words.push_back(static_cast<std::uint32_t>(value));
+    AgcDriverLoadQueueStates_nid_postfix(words);
+    check(AgcDriverSaveQueueStates_nid_postfix() == words, "loaded queue states do not save back unchanged");
 }
 
 }
+
+#ifdef _WIN32
+void testAliasedPages(const std::filesystem::path& directory) {
+    constexpr std::size_t PageBytes = 0x4000;
+    auto* section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, PageBytes, nullptr);
+    check(section != nullptr, "test section creation failed");
+    auto* first = static_cast<std::byte*>(GuestArena::GuestArenaAllocate_nid_postfix(PageBytes, 65536));
+    auto* second = static_cast<std::byte*>(GuestArena::GuestArenaAllocate_nid_postfix(PageBytes, 65536));
+    check(first != nullptr && second != nullptr, "guest allocation failed");
+    GuestArena::GuestArenaMapDirect_nid_postfix(first, PageBytes, section, 0, PAGE_READWRITE);
+    GuestArena::GuestArenaMapDirect_nid_postfix(second, PageBytes, section, 0, PAGE_READWRITE);
+    CloseHandle(section);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(first, PageBytes, true, true, true);
+        mutation.Add(second, PageBytes, true, true, true);
+    }
+    first[16] = std::byte{0x5a};
+    check(second[16] == std::byte{0x5a}, "the test pages do not alias");
+    auto* recorder = AgcDriver::FrameRecorder::Active();
+    check(recorder != nullptr, "frame recorder is disabled");
+    recorder->FrameBoundary();
+    recorder->FrameBoundary();
+    const FrameCaptureReader reader(directory);
+    const auto aliases = aliasedPages(reader);
+    const auto one = aliases.groupOf.find(address(first));
+    const auto other = aliases.groupOf.find(address(second));
+    check(aliases.pageBytes == PageBytes && one != aliases.groupOf.end() && other != aliases.groupOf.end() && one->second == other->second, "the capture does not list the two views as one backing");
+    auto* third = static_cast<std::byte*>(GuestArena::GuestArenaAllocate_nid_postfix(PageBytes, 65536));
+    auto* fourth = static_cast<std::byte*>(GuestArena::GuestArenaAllocate_nid_postfix(PageBytes, 65536));
+    AliasedPages replayed;
+    replayed.pageBytes = PageBytes;
+    replayed.groupOf = {{address(third), 0}, {address(fourth), 0}};
+    std::map<std::uint64_t, void*> sections;
+    for (auto* page : {third, fourth}) {
+        FrameMemoryChunk chunk;
+        chunk.address = address(page);
+        chunk.bytes = PageBytes;
+        commitWithAliases(chunk, replayed, sections);
+    }
+    for (const auto& [group, handle] : sections) CloseHandle(handle);
+    third[32] = std::byte{0x77};
+    check(fourth[32] == std::byte{0x77}, "replayed aliased pages do not share one backing");
+}
+#endif
 
 int main(int argc, char** argv) {
     try {
@@ -349,6 +401,9 @@ int main(int argc, char** argv) {
         else if (mode == "blocking") testBlockingSubmission(directory);
         else if (mode == "shader" || mode == "shader_host") testShaderCode(directory, mode == "shader_host");
         else if (mode == "shader_prologue") testPrologueHeader(directory);
+#ifdef _WIN32
+        else if (mode == "shader_aliases") testAliasedPages(directory);
+#endif
         else throw std::runtime_error("unknown test");
         AgcDriverShutdown_nid_postfix();
         std::puts("frame replay state test passed");

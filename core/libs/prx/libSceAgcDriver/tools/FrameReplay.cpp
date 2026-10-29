@@ -273,6 +273,51 @@ void mapHostRanges(const FrameCaptureReader& reader, Skipped& skipped) {
 #endif
 }
 
+struct AliasedPages {
+    std::size_t pageBytes = 0;
+    std::map<std::uint64_t, std::uint64_t> groupOf;
+};
+
+AliasedPages aliasedPages(const FrameCaptureReader& reader) {
+    AliasedPages result;
+    for (const auto& call : reader.Calls()) {
+        if (call.kind != FrameCallKind::AliasedPages) continue;
+        result.pageBytes = static_cast<std::size_t>(call.size);
+        for (std::size_t index = 0; index + 1 < call.values.size(); index += 2) result.groupOf[call.values[index]] = call.values[index + 1];
+    }
+    return result;
+}
+
+void commitWithAliases(const FrameMemoryChunk& chunk, const AliasedPages& aliases, std::map<std::uint64_t, void*>& sections) {
+    const auto begin = static_cast<std::uintptr_t>(chunk.address);
+    const auto end = begin + static_cast<std::size_t>(chunk.bytes);
+    auto alias = aliases.groupOf.lower_bound(begin);
+    if (alias == aliases.groupOf.end() || alias->first >= end) {
+        commit(chunk);
+        return;
+    }
+#ifdef _WIN32
+    for (auto at = begin; at < end;) {
+        if (alias != aliases.groupOf.end() && alias->first == at) {
+            auto& section = sections[alias->second];
+            if (section == nullptr) {
+                section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, static_cast<DWORD>(aliases.pageBytes), nullptr);
+                if (section == nullptr) throw std::runtime_error("frame replay: cannot create the shared backing of an aliased page");
+            }
+            GuestArena::GuestArenaMapDirect_nid_postfix(reinterpret_cast<void*>(at), aliases.pageBytes, section, 0, PAGE_READWRITE);
+            at += aliases.pageBytes;
+            ++alias;
+            continue;
+        }
+        const auto next = alias != aliases.groupOf.end() && alias->first < end ? static_cast<std::uintptr_t>(alias->first) : end;
+        GuestArena::GuestArenaCommit_nid_postfix(reinterpret_cast<void*>(at), next - at, 0x04, next - at);
+        at = next;
+    }
+#else
+    throw std::runtime_error("frame replay: aliased guest pages are replayed on Windows only");
+#endif
+}
+
 Skipped restoreMemory(const FrameCaptureReader& reader) {
     std::uintptr_t base = 0;
     std::size_t size = 0;
@@ -283,6 +328,8 @@ Skipped restoreMemory(const FrameCaptureReader& reader) {
     mapHostRanges(reader, skipped);
     std::vector<bool> owned;
     for (const auto& chunk : reader.Chunks()) owned.push_back(chunk.kind == FrameMemoryKind::Range && chunk.rangeKind != FrameRangeKind::Host && committedWritable(chunk.address, chunk.bytes));
+    const auto aliases = aliasedPages(reader);
+    std::map<std::uint64_t, void*> sections;
     {
         GuestAllocations::Mutation mutation;
         for (std::size_t index = 0; index < reader.Chunks().size(); ++index) {
@@ -303,10 +350,14 @@ Skipped restoreMemory(const FrameCaptureReader& reader) {
                 skipped.Add(chunk);
                 continue;
             }
-            commit(chunk);
+            commitWithAliases(chunk, aliases, sections);
             mutation.Add(pointer, bytes, (chunk.access & FrameRangeAccess::Readable) != 0, (chunk.access & FrameRangeAccess::Writable) != 0, gpu);
         }
     }
+#ifdef _WIN32
+    for (const auto& [group, section] : sections) CloseHandle(section);
+#endif
+    if (!aliases.groupOf.empty()) std::fprintf(stderr, "[frame-replay] %zu aliased pages share %zu backings\n", aliases.groupOf.size(), sections.size());
     std::vector<const FrameMemoryChunk*> snapshot;
     for (const auto& chunk : reader.Chunks()) {
         if (chunk.kind == FrameMemoryKind::Snapshot && !skipped.Overlaps(chunk)) snapshot.push_back(&chunk);
@@ -514,6 +565,15 @@ struct Replay {
         case FrameCallKind::Suspend:
             AgcDriverSuspendPoint_nid_postfix();
             return;
+        case FrameCallKind::AliasedPages:
+            return;
+        case FrameCallKind::QueueStates: {
+            std::vector<std::uint32_t> words;
+            words.reserve(call.values.size());
+            for (const auto value : call.values) words.push_back(static_cast<std::uint32_t>(value));
+            AgcDriverLoadQueueStates_nid_postfix(words);
+            return;
+        }
         case FrameCallKind::Memory: {
             std::lock_guard lock(memoryMutex);
             const auto found = groups.find(call.values.at(0));
@@ -734,7 +794,7 @@ int usage() {
                          "  --no-release        never copies recorded CPU stores early to release a GPU wait\n"
                          "  --release-after-ms  milliseconds without a completion or a newly issued call before awaited dwords are released (50; at least 200 with --exact)\n"
                          "  --no-synthesize     releases a wait only with a value the capture recorded, never with its reference value\n"
-                         "  --strict            fails on a pacing timeout or a failed registration inside the captured frames\n"
+                         "  --strict            fails on a pacing timeout or a failed registration, and exits with 5 unless the JSON gaps list is empty\n"
                          "  --exact             waits for every earlier submission and its GPU work to complete before each submission, flip and\n"
                          "                      memory delta,\n"
                          "                      so the GPU work runs in one order (a reproducible baseline, slower than the title)\n"
@@ -769,6 +829,7 @@ void writeDump(const Dump& dump) {
 
 struct FrameCheck {
     std::size_t compared = 0;
+    std::size_t missing = 0;
     double identical = 1.0;
     int maxDifference = 0;
 };
@@ -795,7 +856,10 @@ FrameCheck compareFrames(const FrameCaptureReader& reader, const Options& option
         buffer.dccClearColor = call.values[7];
         buffer.alignment = static_cast<std::uint32_t>(call.values[8]);
         const auto chunk = std::find_if(reader.Chunks().begin(), reader.Chunks().end(), [&](const FrameMemoryChunk& candidate) { return candidate.kind == FrameMemoryKind::Reference && candidate.group == call.values[0]; });
-        if (chunk == reader.Chunks().end()) continue;
+        if (chunk == reader.Chunks().end()) {
+            ++check.missing;
+            continue;
+        }
         const auto reference = reader.Read(*chunk);
         const auto replayed = AgcDriver::ReadDisplayBuffer(buffer);
         ++check.compared;
@@ -828,6 +892,7 @@ int run(const Options& options) {
     const auto loaded = Clock::now();
     Replay replay{options, reader};
     replay.skipped = std::move(skipped);
+    if (const auto at = reader.Header().find("\"gds_address\":"); at != std::string::npos) AgcDriverUseGdsAt_nid_postfix(std::strtoull(reader.Header().c_str() + at + 14, nullptr, 10));
     for (const auto& chunk : reader.Chunks()) {
         if (chunk.kind == FrameMemoryKind::Delta) replay.groups[chunk.group].push_back(&chunk);
     }
@@ -867,6 +932,23 @@ int run(const Options& options) {
     } else if (!options.dumps.empty()) {
         std::fprintf(stderr, "[frame-replay] no dumps written: the GPU work did not finish\n");
     }
+    if (check.compared == 0) check.identical = 0.0;
+    std::string gaps;
+    const auto gap = [&](const char* name, bool present) {
+        if (present) gaps += (gaps.empty() ? "" : ",") + std::string(name);
+    };
+    gap("truncated", reader.Truncated());
+    gap("capture-warnings", reader.Header().find("\"warnings\":[]") == std::string::npos);
+    gap("undrained", replay.unfinished != 0);
+    gap("skipped-memory", replay.skipped.bytes != 0);
+    gap("stale-registrations", replay.staleRegistrations.load() != 0);
+    gap("failed-registrations", replay.failedRegistrations.load() != 0);
+    gap("pacing-timeouts", replay.paceTimeouts.load() != 0 || replay.memoryPaceTimeouts.load() != 0);
+    gap("synthesized-waits", replay.syntheticReleases.load() != 0);
+    gap("partial-window", options.frameLimit != 0);
+    gap("no-reference-frames", check.compared == 0 && options.dumps.empty());
+    gap("missing-reference-frames", check.missing != 0);
+    gap("pixels-differ", check.compared != 0 && check.identical < 1.0);
     const auto ready = replay.frames.Times();
     std::vector<double> frameMs;
     for (std::size_t index = 1; index < ready.size(); ++index) frameMs.push_back(std::chrono::duration<double, std::milli>(ready[index] - ready[index - 1]).count());
@@ -875,14 +957,18 @@ int run(const Options& options) {
     std::sort(frameMs.begin(), frameMs.end());
     const auto percentile = [&](double fraction) { return frameMs.empty() ? 0.0 : frameMs[std::min(frameMs.size() - 1, static_cast<std::size_t>(fraction * static_cast<double>(frameMs.size())))]; };
     const auto seconds = std::chrono::duration<double>(replay.endedAt - replay.startedAt).count();
-    std::printf("{\"frames\":%zu,\"replay_s\":%.3f,\"fps\":%.3f,\"frame_ms\":{\"p50\":%.3f,\"p90\":%.3f,\"max\":%.3f,\"each\":[%s]},\"submits\":%llu,\"delta_mib\":%.1f,\"pace_timeouts\":%llu,\"memory_pace_timeouts\":%llu,\"pace_wait_s\":%.3f,\"stale_registrations\":%llu,\"failed_registrations\":%llu,\"skipped_mib\":%.1f,\"threads\":%zu,\"released_waits\":%llu,\"of_them_from_earlier_writes\":%llu,\"of_them_synthesized\":%llu,\"unfinished\":%llu,\"frames_compared\":%zu,\"pixels_identical\":%.6f,\"max_channel_diff\":%d,\"load_s\":%.3f}\n",
+    std::printf("{\"frames\":%zu,\"replay_s\":%.3f,\"fps\":%.3f,\"frame_ms\":{\"p50\":%.3f,\"p90\":%.3f,\"max\":%.3f,\"each\":[%s]},\"submits\":%llu,\"delta_mib\":%.1f,\"pace_timeouts\":%llu,\"memory_pace_timeouts\":%llu,\"pace_wait_s\":%.3f,\"stale_registrations\":%llu,\"failed_registrations\":%llu,\"skipped_mib\":%.1f,\"threads\":%zu,\"released_waits\":%llu,\"of_them_from_earlier_writes\":%llu,\"of_them_synthesized\":%llu,\"unfinished\":%llu,\"frames_compared\":%zu,\"pixels_identical\":%.6f,\"max_channel_diff\":%d,\"load_s\":%.3f,\"gaps\":\"%s\"}\n",
                 ready.size(), seconds, seconds > 0 ? static_cast<double>(ready.size()) / seconds : 0.0, percentile(0.5), percentile(0.9), frameMs.empty() ? 0.0 : frameMs.back(), frameList.c_str(),
                 static_cast<unsigned long long>(replay.submits.load()), static_cast<double>(replay.deltaBytes.load()) / (1024.0 * 1024.0), static_cast<unsigned long long>(replay.paceTimeouts.load()), static_cast<unsigned long long>(replay.memoryPaceTimeouts.load()),
                 replay.paceWaitedSeconds(), static_cast<unsigned long long>(replay.staleRegistrations.load()), static_cast<unsigned long long>(replay.failedRegistrations.load()),
                 static_cast<double>(replay.skipped.bytes) / (1024.0 * 1024.0), replay.threads, static_cast<unsigned long long>(replay.earlyReleases.load()), static_cast<unsigned long long>(replay.lateReleases.load()),
                 static_cast<unsigned long long>(replay.syntheticReleases.load()),
-                static_cast<unsigned long long>(replay.unfinished), check.compared, check.identical, check.maxDifference, std::chrono::duration<double>(loaded - loadStart).count());
+                static_cast<unsigned long long>(replay.unfinished), check.compared, check.identical, check.maxDifference, std::chrono::duration<double>(loaded - loadStart).count(), gaps.c_str());
     std::fflush(stdout);
+    if (options.strict && !gaps.empty()) {
+        std::fprintf(stderr, "agc_frame_replay: --strict rejects this replay: %s\n", gaps.c_str());
+        return 5;
+    }
     return replay.unfinished == 0 ? 0 : 3;
 }
 

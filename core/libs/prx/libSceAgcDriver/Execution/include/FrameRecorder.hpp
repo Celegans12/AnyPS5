@@ -16,6 +16,7 @@
 #include <mutex>
 #include <span>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace AgcDriver {
@@ -80,14 +81,16 @@ private:
     void recordLocked(FrameCall call, bool prologueCall, std::span<const Shader* const> shaders);
     void emitDelta();
     void emitShaderDelta(std::span<const Shader* const> shaders);
-    void writeDelta(std::span<const Span> spans, std::span<const std::uint64_t> hostPages, std::span<const Range> added = {});
+    void writeDelta(std::span<const Span> spans, std::span<const std::uint64_t> hostPages, std::span<const Range> added = {}, std::span<const std::pair<std::uint64_t, std::vector<std::byte>>> images = {});
     bool triggered();
     void start();
     void finish();
     void snapshot(const Range& range);
     void writeReferenceFrames();
+    std::vector<std::pair<std::uint64_t, std::vector<std::byte>>> changedSectionPages();
     std::vector<PrologueShader> prologueShaders(std::span<const Shader* const> shaders, bool registration);
     void writePrologue();
+    void writeAliasedPages();
     bool abandonIfDiskLow();
     void stop(const char* reason);
     std::string header() const;
@@ -107,10 +110,15 @@ private:
     std::uint64_t prologueRewriteBytes = 0;
     std::uint64_t prologueDropped = 0;
     std::uint64_t prologueCallCount = 0;
+    std::uint64_t gdsAddress = 0;
+    std::uint64_t aliasedPages = 0;
+    std::uint64_t aliasGroups = 0;
     std::deque<FrameCall> reservations;
     std::vector<Range> ranges;
     std::map<std::uint64_t, std::uint64_t> shaderMarks;
     std::map<std::uint64_t, std::uint64_t> hostPageHashes;
+    std::unordered_map<std::uint64_t, std::uint64_t> sectionPageHashes;
+    std::map<std::uint64_t, std::uint64_t> shaderImageHashes;
     std::mutex displayMutex;
     std::map<std::uint64_t, DisplayBuffer> displayBuffers;
     std::uint64_t ordinal = 0;
@@ -119,6 +127,8 @@ private:
     std::uint64_t recordedFrames = 0;
     std::uint64_t generation = 0;
     std::uint64_t deltaGroups = 0;
+    std::uint64_t blockedDeltas = 0;
+    std::uint64_t rereadDeltas = 0;
     std::uint64_t deltaBytes = 0;
     std::uint64_t snapshotBytes = 0;
     std::uint64_t recordedCalls = 0;
