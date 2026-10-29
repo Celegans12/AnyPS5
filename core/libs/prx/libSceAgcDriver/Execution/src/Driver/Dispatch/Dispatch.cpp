@@ -104,6 +104,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         localDevice = device;
     }
     const auto codeOffset = static_cast<std::size_t>((address - snapshot.codeAddress) / sizeof(std::uint32_t));
+    if (VulkanDevice::ExactSerialAllocating() && ProgramAllocates(snapshot, codeOffset)) VulkanDevice::NoteAllocatingProgram(address);
     std::array<std::uint32_t, 5> resolved{};
     ResolvedDispatch ahead;
     bool fromAhead = false;

@@ -315,15 +315,63 @@ void testParkedSubmission(const std::filesystem::path& tool) {
     check(readFile(firstDump) == late, "the replay did not reproduce the parked copy");
     check(readFile(secondDump) == late, "the replay did not reproduce the copy after the release");
 }
+
+void testWriterBeyondWindow(const std::filesystem::path& tool) {
+    const char* directory = std::getenv("APS5_FRAME_CAPTURE");
+    check(directory != nullptr && *directory != '\0', "APS5_FRAME_CAPTURE is not set");
+    const std::filesystem::path capture(directory);
+    const auto layout = allocate();
+    auto* const gate = layout.label + 16;
+    const auto early = pattern(5);
+    const auto late = pattern(55);
+    auto output = std::make_shared<Output>();
+    AgcDriverRegisterVideoOutput_nid_postfix(Handle, output);
+
+    flip();
+    std::memcpy(layout.source, early.data(), early.size());
+    {
+        auto* const words = layout.firstCommands;
+        CommandBuffer buffer{words, words + CommandBytes / sizeof(std::uint32_t), words, words + CommandBytes / sizeof(std::uint32_t), nullptr, nullptr, 0};
+        sceAgcDcbWaitRegMem(&buffer, 0, 3, 0, 0, gate, Done, 0xffffffffu, 0);
+        sceAgcDcbDmaData(&buffer, 0, DmaMemory, 0, at(layout.firstTarget), DmaMemory, 0, at(layout.source), DataBytes, 0, 1, 0);
+        sceAgcDcbWriteData(&buffer, GraphicsMemory, 0, at(layout.label), &Done, 1, 0, 1);
+        Packet packet{words, static_cast<std::uint32_t>(buffer.cursor_up - words), 0, {}};
+        check(sceAgcDriverSubmitDcb(&packet) == 0, "submission failed");
+    }
+    std::memcpy(layout.source, late.data(), late.size());
+    flip();
+    std::atomic_ref<std::uint32_t>(*gate).store(Done, std::memory_order_release);
+    copy(layout.secondCommands, CommandBytes, layout.source, layout.secondTarget, layout.label);
+    flip();
+    AgcDriverWaitIdle_nid_postfix();
+    check(equal(layout.firstTarget, late), "the driver did not run the parked copy after the release");
+
+    const FrameCaptureReader reader(capture);
+    check(!reader.Truncated(), "the capture is truncated");
+    const auto firstDump = capture / "beyond-first.bin";
+    const auto log = capture / "beyond-replay.err";
+    const auto command = "\"\"" + tool.string() + "\" \"" + capture.string() + "\" --exact --frame-limit 1 --timeout-s 60 --dump " + std::to_string(at(layout.firstTarget)) + ":" + std::to_string(DataBytes) + ":\"" + firstDump.string() +
+                         "\" 2> \"" + log.string() + "\"\"";
+    const auto began = std::chrono::steady_clock::now();
+    const auto code = std::system(command.c_str());
+    const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();
+    check(code == 0, "agc_frame_replay --exact --frame-limit 1 exited with " + std::to_string(code));
+    check(seconds < 45.0, "agc_frame_replay --exact --frame-limit 1 took " + std::to_string(seconds) + " s");
+    check(readFile(firstDump) == late, "the replay did not run the parked copy whose writer lies beyond the window");
+    const auto text = readFile(log);
+    const std::string stderrText(reinterpret_cast<const char*>(text.data()), text.size());
+    check(stderrText.find("while parked") != std::string::npos && stderrText.find(" 0 while parked") == std::string::npos, "the wait was not released while the replay was parked");
+}
 }
 
 int main(int argc, char** argv) {
-    if (argc != 2 && !(argc == 3 && (std::string(argv[2]) == "concurrent" || std::string(argv[2]) == "parked"))) {
-        std::fprintf(stderr, "usage: agc_driver_frame_replay_tests <agc_frame_replay> [concurrent|parked]\n");
+    if (argc != 2 && !(argc == 3 && (std::string(argv[2]) == "concurrent" || std::string(argv[2]) == "parked" || std::string(argv[2]) == "beyond"))) {
+        std::fprintf(stderr, "usage: agc_driver_frame_replay_tests <agc_frame_replay> [concurrent|parked|beyond]\n");
         return 2;
     }
     try {
         if (argc == 3 && std::string(argv[2]) == "parked") testParkedSubmission(argv[1]);
+        else if (argc == 3 && std::string(argv[2]) == "beyond") testWriterBeyondWindow(argv[1]);
         else if (argc == 3) testConcurrentCopies(argv[1]);
         else testCaptureAndReplay(argv[1]);
     } catch (const std::exception& error) {

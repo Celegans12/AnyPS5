@@ -1193,6 +1193,24 @@ void testReleaseMemDataSelects() {
     for (const auto select : {6u, 7u}) expectFailure([&] { AgcDriver::Pm4::Validate(release(select), 0); }, "reserved RELEASE_MEM DATA_SEL");
 }
 
+void testExactClock() {
+    AgcDriver::QueueState state;
+    alignas(8) std::array<std::uint64_t, 2> clock{};
+    const auto clockCopy = [&](std::uint64_t* target) { return makePacket(0x40, {0x06016209, 0, 0, low(target), high(target)}); };
+    execute(state, clockCopy(&clock[0]));
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    execute(state, clockCopy(&clock[1]));
+    check(clock[0] == 0x100000000000ull && clock[1] == clock[0], "GPU clock COPY_DATA under APS5_EXACT_CLOCK did not write the fixed value");
+    alignas(8) static std::uint64_t stamp = 0;
+    const auto release = makePacket(0x49, {0x0030c514, 3u << 29u, low(&stamp), high(&stamp), 1, 0, 0});
+    const auto label = AgcDriver::Pm4::DecodeLabelWrite(release);
+    std::uint64_t value = 0;
+    if (label.has_value()) std::memcpy(&value, label->Bytes().data(), sizeof(value));
+    check(label.has_value() && label->Bytes().size() == 8 && value == 0x100000000000ull, "a RELEASE_MEM timestamp under APS5_EXACT_CLOCK did not decode to the fixed value");
+    execute(state, release);
+    check(stamp == 0x100000000000ull, "a RELEASE_MEM timestamp under APS5_EXACT_CLOCK did not write the fixed value");
+}
+
 void testMemSemaphore() {
     alignas(8) static std::uint64_t semaphore = 0;
     alignas(8) static std::uint32_t marker = 0;
@@ -2107,6 +2125,12 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string(argv[1]) == "failure") {
             testAsyncMemoryFailure();
             std::puts("PM4 asynchronous memory failure propagated to idle, suspend, submit and shutdown");
+            return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "exact-clock") {
+            testExactClock();
+            LibcRunShutdown_nid_postfix();
+            std::puts("PM4 exact clock test passed");
             return 0;
         }
         if (argc == 2 && std::string(argv[1]) == "priority-refused") {
