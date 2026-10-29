@@ -5745,7 +5745,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         auto facts = emit->facts;
         facts.pipelineReady = record.x <= groupLimit[0] && record.y <= groupLimit[1] && record.z <= groupLimit[2];
         facts.clothGuard = resources.HasAddressOverlays();
-        if (facts.resolvedProgram && facts.pipelineReady && !facts.clothGuard) {
+        if (!facts.kindSwitchOff && facts.resolvedProgram && facts.pipelineReady && !facts.clothGuard) {
             auto& table = NewPath::DeviceTable();
             if (table.Stale(context.device)) static_cast<void>(table.Refresh(context));
             facts.tableCovers = table.Covers(resources.AddressTableRanges()) == NewPath::DevicePageTable::Cover::Covered;

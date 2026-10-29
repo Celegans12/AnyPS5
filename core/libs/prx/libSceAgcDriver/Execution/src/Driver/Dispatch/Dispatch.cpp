@@ -560,7 +560,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
             timing.Mark("capture_resources");
             compiledResult = invocation.Materialize(*capture);
             CommandMix::NoteMaterialized(*compiledResult, *capture);
-            if (NewPath::EmitDispatches() && indirectArguments == 0) buildResolvedTwin(snapshot, codeOffset, [&] { auto source = request; source.context.memory = memory; return source; }(), [&](const ShaderRecompiler::RecompileRequest& resolvedRequest, ShaderRecompiler::PreparedShaderInvocation& resolvedInvocation) {
+            if (NewPath::EmitDispatches() && indirectArguments == 0 && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NewPathNoGpuDispatches)) buildResolvedTwin(snapshot, codeOffset, [&] { auto source = request; source.context.memory = memory; return source; }(), [&](const ShaderRecompiler::RecompileRequest& resolvedRequest, ShaderRecompiler::PreparedShaderInvocation& resolvedInvocation) {
                 ShaderMemory resolvedMemory(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter(), &QueryPendingSpan);
                 const SampledReadScope sampling(evidenceReads);
                 return CaptureInvocation(resolvedMemory, snapshot, codeOffset, resolvedRequest, resolvedInvocation);
