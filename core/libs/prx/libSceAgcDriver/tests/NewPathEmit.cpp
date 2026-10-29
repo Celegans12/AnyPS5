@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/CommandWrites.hpp"
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/PushBlock.hpp"
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/ResolvedPush.hpp"
+#include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/ResolvedTwins.hpp"
 #include "Recompiler.hpp"
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/Router.hpp"
 #include <algorithm>
@@ -211,6 +212,51 @@ void commandRecords() {
     Expect(CommandRecordClear(words), "a guard-tripped record was not cleared");
 }
 
+std::shared_ptr<ShaderRecompiler::RecompileResult> AddressProgram(bool resolved) {
+    auto program = std::make_shared<ShaderRecompiler::RecompileResult>();
+    program->newPathResolved = resolved;
+    ShaderRecompiler::DescriptorBinding table{};
+    table.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+    table.role = ShaderRecompiler::DescriptorRole::BdaPagetable;
+    table.binding = 3;
+    table.count = 1;
+    program->bindings.push_back(table);
+    program->pushConstants = {std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}};
+    return program;
+}
+
+void resolvedTwins() {
+    const auto compiled = AddressProgram(false);
+    auto twin = AddressProgram(true);
+    Expect(UsesAddressTables(*compiled), "a program with a BDA table binding is not address-based");
+    Expect(!UsesAddressTables(ShaderRecompiler::RecompileResult{}), "a program without bindings is address-based");
+    Expect(TwinCompatible(*compiled, *twin), "a resolved twin with the same bindings and push words was refused");
+    Expect(!TwinCompatible(*compiled, *compiled), "an unresolved module was taken as its own twin");
+    auto otherPush = AddressProgram(true);
+    otherPush->pushConstants.push_back(std::byte{5});
+    Expect(!TwinCompatible(*compiled, *otherPush), "a twin with other push words was accepted");
+    auto otherBinding = AddressProgram(true);
+    otherBinding->bindings[0].binding = 4;
+    Expect(!TwinCompatible(*compiled, *otherBinding), "a twin with another binding number was accepted");
+
+    ResolvedTwins twins;
+    twins.Remember(compiled, twin, TwinOutcome::Built);
+    Expect(twins.Of(*compiled) == twin, "a remembered twin was not found");
+    const auto plain = AddressProgram(false);
+    twins.Remember(plain, nullptr, TwinOutcome::NotAddressBased);
+    Expect(twins.Of(*plain) == nullptr && twins.Of(*twin) == nullptr, "a program without a twin got one");
+    const auto outcomes = twins.Outcomes();
+    Expect(outcomes[static_cast<std::size_t>(TwinOutcome::Built)] == 1 && outcomes[static_cast<std::size_t>(TwinOutcome::NotAddressBased)] == 1, "twin outcomes were not counted");
+    {
+        auto shortLived = std::make_shared<const ShaderRecompiler::RecompileResult>(*compiled);
+        twins.Remember(shortLived, twin, TwinOutcome::Built);
+        const auto* address = shortLived.get();
+        shortLived.reset();
+        auto reused = std::shared_ptr<const ShaderRecompiler::RecompileResult>(std::make_shared<ShaderRecompiler::RecompileResult>());
+        if (reused.get() == address) Expect(twins.Of(*reused) == nullptr, "a freed program's twin was served to a new program at its address");
+    }
+}
+
 BdaAbi::Range MakeRange(std::uint64_t begin, std::uint64_t end, std::uint32_t permissions) {
     return {begin, end, 0x7f0000000000ull + begin, permissions, 0u};
 }
@@ -253,6 +299,7 @@ int main() {
         resolvedDispatchPush();
         composedResolvedPush();
         commandRecords();
+        resolvedTwins();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;
