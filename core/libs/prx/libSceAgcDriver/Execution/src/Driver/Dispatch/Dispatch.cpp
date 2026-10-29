@@ -40,6 +40,7 @@ using TwinCapture = std::function<std::shared_ptr<const ShaderRecompiler::Resour
 
 void buildResolvedTwin(const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request, const TwinCapture& capture, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiled) {
     auto& twins = NewPath::Twins();
+    if (compiled != nullptr && twins.Known(*compiled)) return;
     if (compiled == nullptr || compiled->newPathResolved || compiled->transferKernel.has_value() || !NewPath::UsesAddressTables(*compiled)) {
         twins.Remember(compiled, nullptr, NewPath::TwinOutcome::NotAddressBased);
         return;

@@ -75,6 +75,16 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> ResolvedTwins::Of(const
     return found->second.twin;
 }
 
+bool ResolvedTwins::Known(const ShaderRecompiler::RecompileResult& compiled) const {
+    std::lock_guard lock(state->mutex);
+    const auto found = state->entries.find(&compiled);
+    if (found == state->entries.end()) return false;
+    const auto alive = found->second.compiled.lock();
+    if (alive.get() != &compiled) return false;
+    ++state->outcomes[static_cast<std::size_t>(TwinOutcome::Reused)];
+    return true;
+}
+
 std::array<std::uint64_t, TwinOutcomeCount> ResolvedTwins::Outcomes() const {
     std::lock_guard lock(state->mutex);
     return state->outcomes;

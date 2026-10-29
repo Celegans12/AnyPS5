@@ -13,8 +13,8 @@ struct RecompileResult;
 
 namespace AgcDriver::NewPath {
 
-enum class TwinOutcome : std::uint8_t { Built, NotAddressBased, Failed, Mismatch };
-inline constexpr std::size_t TwinOutcomeCount = 4;
+enum class TwinOutcome : std::uint8_t { Built, NotAddressBased, Failed, Mismatch, Reused };
+inline constexpr std::size_t TwinOutcomeCount = 5;
 
 [[nodiscard]] bool UsesAddressTables(const ShaderRecompiler::RecompileResult& compiled);
 [[nodiscard]] bool WalkReplacesTables(const ShaderRecompiler::RecompileResult& twin);
@@ -26,6 +26,7 @@ public:
     ResolvedTwins();
     void Remember(const std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiled, std::shared_ptr<const ShaderRecompiler::RecompileResult> twin, TwinOutcome outcome);
     [[nodiscard]] std::shared_ptr<const ShaderRecompiler::RecompileResult> Of(const ShaderRecompiler::RecompileResult& compiled) const;
+    [[nodiscard]] bool Known(const ShaderRecompiler::RecompileResult& compiled) const;
     [[nodiscard]] std::array<std::uint64_t, TwinOutcomeCount> Outcomes() const;
     [[nodiscard]] std::size_t Size() const;
 

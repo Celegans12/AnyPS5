@@ -261,6 +261,8 @@ void resolvedTwins() {
     ResolvedTwins twins;
     twins.Remember(compiled, twin, TwinOutcome::Built);
     Expect(twins.Of(*compiled) == twin, "a remembered twin was not found");
+    Expect(twins.Known(*compiled) && !twins.Known(*twin), "a remembered program is not known, or an unremembered one is");
+    Expect(twins.Outcomes()[static_cast<std::size_t>(TwinOutcome::Reused)] == 1, "a reuse of a known twin was not counted");
     const auto plain = AddressProgram(false);
     twins.Remember(plain, nullptr, TwinOutcome::NotAddressBased);
     Expect(twins.Of(*plain) == nullptr && twins.Of(*twin) == nullptr, "a program without a twin got one");
