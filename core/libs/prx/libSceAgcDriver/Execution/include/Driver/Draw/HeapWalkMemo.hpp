@@ -37,12 +37,21 @@ constexpr std::size_t HeapWalkSeenKeys = 1u << 16;
 
 std::uint64_t HeapWalkEntryBytes(const HeapWalkEntry& entry);
 
+std::uint64_t HeapWalkEntryOwnBytes(const HeapWalkEntry& entry);
+
+std::uint64_t HeapWalkCaptureBytes(const ShaderRecompiler::ResourceCapture& capture);
+
+std::uint64_t HeapWalkResultBytes(const ShaderRecompiler::RecompileResult& result);
+
+std::uint64_t HeapWalkWordsBytes(const ShaderRecompiler::HeapStageWords& words);
+
 std::uint64_t HeapWalkMemoBudget();
 
 struct HeapWalkMemo {
     std::unordered_map<std::uint64_t, std::vector<HeapWalkEntry>> current;
     std::unordered_map<std::uint64_t, std::vector<HeapWalkEntry>> previous;
     std::vector<std::uint64_t> seen = std::vector<std::uint64_t>(HeapWalkSeenKeys, 0);
+    std::unordered_map<const void*, std::pair<std::uint32_t, std::uint64_t>> pins;
     std::uint64_t heldBytes = 0;
     std::uint64_t stores = 0;
     std::uint64_t budget = HeapWalkMemoBudget();
@@ -81,18 +90,54 @@ struct HeapWalkMemo {
     void remember(std::uint64_t key, HeapWalkEntry entry) {
         auto& ways = slot(key);
         if (ways.size() >= HeapWalkWays) {
-            heldBytes -= ways.back().bytes;
+            drop(ways.back());
             ways.pop_back();
         }
-        entry.bytes = HeapWalkEntryBytes(entry);
+        charge(entry);
         entry.stored = ++stores;
-        heldBytes += entry.bytes;
         ways.insert(ways.begin(), std::move(entry));
         if (budget != 0 && heldBytes > budget) trim();
     }
 
+    void touch(HeapWalkEntry& entry) {
+        entry.stored = ++stores;
+    }
+
+    template <typename TObject, typename TSize>
+    void pin(const std::shared_ptr<const TObject>& object, TSize size) {
+        if (object == nullptr) return;
+        auto& held = pins[object.get()];
+        if (held.first++ == 0) {
+            held.second = size(*object);
+            heldBytes += held.second;
+        }
+    }
+
+    void unpin(const void* object) {
+        if (object == nullptr) return;
+        const auto held = pins.find(object);
+        if (--held->second.first != 0) return;
+        heldBytes -= held->second.second;
+        pins.erase(held);
+    }
+
+    void charge(HeapWalkEntry& entry) {
+        entry.bytes = HeapWalkEntryOwnBytes(entry);
+        heldBytes += entry.bytes;
+        pin(entry.capture, HeapWalkCaptureBytes);
+        pin(entry.result, HeapWalkResultBytes);
+        pin(entry.words, HeapWalkWordsBytes);
+    }
+
+    void drop(const HeapWalkEntry& entry) {
+        heldBytes -= entry.bytes;
+        unpin(entry.capture.get());
+        unpin(entry.result.get());
+        unpin(entry.words.get());
+    }
+
     void release(const std::vector<HeapWalkEntry>& ways) {
-        for (const auto& entry : ways) heldBytes -= entry.bytes;
+        for (const auto& entry : ways) drop(entry);
     }
 
     void trim();

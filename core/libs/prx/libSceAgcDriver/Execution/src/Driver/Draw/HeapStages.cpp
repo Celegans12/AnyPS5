@@ -286,9 +286,25 @@ std::uint64_t wordsBytes(const ShaderRecompiler::HeapStageWords& words) {
 
 }
 
+std::uint64_t HeapWalkEntryOwnBytes(const HeapWalkEntry& entry) {
+    return sizeof(HeapWalkEntry) + vectorBytes(entry.userData) + vectorBytes(entry.ranges) + vectorBytes(entry.values) +
+           vectorBytes(entry.accessible) + vectorBytes(entry.userDataUse.reads);
+}
+
+std::uint64_t HeapWalkCaptureBytes(const ShaderRecompiler::ResourceCapture& capture) {
+    return captureBytes(capture);
+}
+
+std::uint64_t HeapWalkResultBytes(const ShaderRecompiler::RecompileResult& result) {
+    return resultBytes(result);
+}
+
+std::uint64_t HeapWalkWordsBytes(const ShaderRecompiler::HeapStageWords& words) {
+    return wordsBytes(words);
+}
+
 std::uint64_t HeapWalkEntryBytes(const HeapWalkEntry& entry) {
-    auto bytes = sizeof(HeapWalkEntry) + vectorBytes(entry.userData) + vectorBytes(entry.ranges) + vectorBytes(entry.values) +
-                 vectorBytes(entry.accessible) + vectorBytes(entry.userDataUse.reads);
+    auto bytes = HeapWalkEntryOwnBytes(entry);
     if (entry.capture != nullptr) bytes += captureBytes(*entry.capture);
     if (entry.result != nullptr) bytes += resultBytes(*entry.result);
     if (entry.words != nullptr) bytes += wordsBytes(*entry.words);
@@ -310,24 +326,17 @@ void HeapWalkMemo::trim() {
     if (heldBytes <= budget) return;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> stamps;
     for (const auto& [key, ways] : current) {
-        for (const auto& entry : ways) stamps.emplace_back(entry.stored, entry.bytes);
+        for (const auto& entry : ways) stamps.emplace_back(entry.stored, key);
     }
     std::sort(stamps.begin(), stamps.end());
-    const auto excess = heldBytes - budget / 4u * 3u;
-    std::uint64_t freed = 0;
-    std::uint64_t threshold = 0;
-    for (const auto& [stored, bytes] : stamps) {
-        threshold = stored;
-        freed += bytes;
-        if (freed >= excess) break;
-    }
-    for (auto it = current.begin(); it != current.end();) {
-        std::erase_if(it->second, [&](const HeapWalkEntry& entry) {
-            if (entry.stored > threshold) return false;
-            heldBytes -= entry.bytes;
-            return true;
-        });
-        it = it->second.empty() ? current.erase(it) : std::next(it);
+    const auto target = budget / 4u * 3u;
+    for (const auto& [stored, key] : stamps) {
+        if (heldBytes <= target) break;
+        const auto ways = current.find(key);
+        const auto entry = std::find_if(ways->second.begin(), ways->second.end(), [&](const HeapWalkEntry& way) { return way.stored == stored; });
+        drop(*entry);
+        ways->second.erase(entry);
+        if (ways->second.empty()) current.erase(ways);
     }
 }
 
@@ -494,9 +503,10 @@ MaterializeHeapStage(const ShaderRecompiler::PreparedShaderInvocation& invocatio
         Graphics::NoteHeapWalkMemoBytes(static_cast<std::int64_t>(memo.heldBytes) - static_cast<std::int64_t>(heldBefore));
         memoKnown = found != nullptr;
         for (std::size_t way = 0; found != nullptr && way < found->size(); ++way) {
-            const auto& entry = (*found)[way];
+            auto& entry = (*found)[way];
             if (!sameWalkInputs(entry, invocation, userData, shaderBase)) continue;
             if (!rangesSettled(entry.ranges, before.get(), generation)) break;
+            memo.touch(entry);
             guardRanges(entry.ranges);
             if (sharedWords != nullptr) *sharedWords = entry.words;
             else *words = *entry.words;
