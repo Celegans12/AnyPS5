@@ -201,10 +201,9 @@ RdnaProgram DecodeStageProgram(ShaderStageKind stage, std::span<const std::uint3
 
 ShaderStageInputInfo RequestInputInfo(const RecompileRequest& request) {
     // The new path's target fields select emission that is not written yet for every stage (S4 epoch 1): a request that
-    // asks for it must not get today's module under a key that says otherwise. newPathResolved is compute-only so far
-    // (its driver words come first in the push block, ahead of the stage's PushData; graphics stages need D's
-    // per-stage push layout first).
-    if (request.target.newPathResolved && request.shader.stage != ShaderStage::Compute) throw std::runtime_error("the newPathResolved target is implemented for compute programs only");
+    // asks for it must not get today's module under a key that says otherwise. newPathResolved puts its driver words
+    // first in every stage's push block, ahead of the stage's PushData (S2-draws: one 24-byte prefix per draw, today's
+    // per-stage offsets moved up by it).
     if (request.target.bdaSegments) throw std::runtime_error("the bdaSegments target (segment programs) is not implemented yet");
     if (request.target.newPathRuntimeBuffers && !request.target.newPathResolved) throw std::runtime_error("the newPathRuntimeBuffers target needs newPathResolved (its buffer accesses walk the device page table)");
     const auto* mesh = request.graphics && request.graphics->mesh ? &*request.graphics->mesh : nullptr;
