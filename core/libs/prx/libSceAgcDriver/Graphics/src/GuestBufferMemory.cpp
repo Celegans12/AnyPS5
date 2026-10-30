@@ -5084,13 +5084,17 @@ struct ResidentRange {
     // The generation at which the buffer last matched guest memory; 0: not since its creation.
     std::uint64_t syncGeneration = 0;
     std::uint64_t forgetSerial = 0;
+    // Bind order (ResidentRanges::uses at the last bind): the least recently bound slots go first when the
+    // slot count is lowered mid-run (APS5_NO_RESIDENT_SLOT_RAISE under APS5_AB).
+    std::uint64_t lastUse = 0;
 };
 
 struct ResidentRanges {
     std::mutex mutex;
     std::map<std::pair<std::uint64_t, std::uint64_t>, ResidentRange> ranges;
     std::map<std::pair<std::uint64_t, std::uint64_t>, std::uint32_t> heat;
-    std::uint64_t promoted = 0, bound = 0, skipped = 0, skippedBytes = 0, copied = 0, invalidated = 0, otherLane = 0;
+    std::uint64_t promoted = 0, bound = 0, skipped = 0, skippedBytes = 0, copied = 0, invalidated = 0, otherLane = 0, trimmed = 0;
+    std::uint64_t uses = 0;
     std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
 };
 
@@ -5102,7 +5106,21 @@ ResidentRanges& Residents() {
     return *ranges;
 }
 
-constexpr std::size_t ResidentLimit = 32;
+// Slot count: APS5_RESIDENT_RANGE_SLOTS (read once, default 32, 1..4096); the runtime switch
+// APS5_NO_RESIDENT_SLOT_RAISE brings it back to the default of 32 (an in-run A/B arm).
+constexpr std::size_t ResidentDefaultLimit = 32;
+
+std::size_t residentLimit() {
+    static const std::size_t configured = [] {
+        const char* text = std::getenv("APS5_RESIDENT_RANGE_SLOTS");
+        if (text == nullptr || *text == '\0') return ResidentDefaultLimit;
+        char* end = nullptr;
+        const auto value = std::strtoull(text, &end, 10);
+        if (end == text || *end != '\0' || value == 0) return ResidentDefaultLimit;
+        return static_cast<std::size_t>(std::min<unsigned long long>(value, 4096));
+    }();
+    return RuntimeSwitches::Set(RuntimeSwitch::NoResidentSlotRaise) ? ResidentDefaultLimit : configured;
+}
 constexpr std::uint32_t ResidentPromoteAfter = 8;
 constexpr std::uint64_t ResidentMinBytes = 65536;
 
@@ -5111,8 +5129,10 @@ void reportResidents(ResidentRanges& residents) {
     const auto now = std::chrono::steady_clock::now();
     if (now - residents.reported < std::chrono::seconds(10)) return;
     residents.reported = now;
-    if (profile) std::fprintf(stderr, "[resident-ranges] (10 s) %zu resident, %llu promoted, %llu bound by builds, copy-ins %llu skipped (%.1f MiB) / %llu made, %llu invalidated by other stamps, %llu recorded on another lane\n", residents.ranges.size(), static_cast<unsigned long long>(residents.promoted), static_cast<unsigned long long>(residents.bound), static_cast<unsigned long long>(residents.skipped), residents.skippedBytes / 1048576.0, static_cast<unsigned long long>(residents.copied), static_cast<unsigned long long>(residents.invalidated), static_cast<unsigned long long>(residents.otherLane));
-    residents.promoted = residents.bound = residents.skipped = residents.skippedBytes = residents.copied = residents.invalidated = residents.otherLane = 0;
+    std::uint64_t residentBytes = 0;
+    for (const auto& [key, range] : residents.ranges) residentBytes += key.second - key.first;
+    if (profile) std::fprintf(stderr, "[resident-ranges] (10 s) %zu resident (%.1f MiB, limit %zu, %llu trimmed), %llu promoted, %llu bound by builds, copy-ins %llu skipped (%.1f MiB) / %llu made, %llu invalidated by other stamps, %llu recorded on another lane\n", residents.ranges.size(), residentBytes / 1048576.0, residentLimit(), static_cast<unsigned long long>(residents.trimmed), static_cast<unsigned long long>(residents.promoted), static_cast<unsigned long long>(residents.bound), static_cast<unsigned long long>(residents.skipped), residents.skippedBytes / 1048576.0, static_cast<unsigned long long>(residents.copied), static_cast<unsigned long long>(residents.invalidated), static_cast<unsigned long long>(residents.otherLane));
+    residents.promoted = residents.bound = residents.skipped = residents.skippedBytes = residents.copied = residents.invalidated = residents.otherLane = residents.trimmed = 0;
     residents.heat.clear();
 }
 
@@ -5129,14 +5149,26 @@ std::shared_ptr<Buffer> residentBuffer(const Context& context, std::uint64_t beg
     if (const auto found = residents.ranges.find(key); found != residents.ranges.end()) {
         if (found->second.forgetSerial == forget) {
             ++residents.bound;
+            found->second.lastUse = ++residents.uses;
             return found->second.buffer;
         }
         residents.ranges.erase(found);
     }
-    if (++residents.heat[key] < ResidentPromoteAfter || residents.ranges.size() >= ResidentLimit) return nullptr;
+    const auto limit = residentLimit();
+    while (residents.ranges.size() > limit) {
+        // Lowered mid-run: the least recently bound slots are dropped. A build that still holds one copies in
+        // as any staged region (residentCurrent and MarkDirectWrites no longer find its entry).
+        auto oldest = residents.ranges.begin();
+        for (auto it = residents.ranges.begin(); it != residents.ranges.end(); ++it) {
+            if (it->second.lastUse < oldest->second.lastUse) oldest = it;
+        }
+        residents.ranges.erase(oldest);
+        ++residents.trimmed;
+    }
+    if (++residents.heat[key] < ResidentPromoteAfter || residents.ranges.size() >= limit) return nullptr;
     auto buffer = stagingBuffer(context, static_cast<std::size_t>(end - begin), gpuCopyUsage(true) | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
     if (buffer == nullptr) return nullptr;
-    residents.ranges[key] = ResidentRange{buffer, 0, forget};
+    residents.ranges[key] = ResidentRange{buffer, 0, forget, ++residents.uses};
     ++residents.promoted;
     ++residents.bound;
     return buffer;
