@@ -221,6 +221,9 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
     }
     const auto codeOffset = static_cast<std::size_t>((address - snapshot.codeAddress) / sizeof(std::uint32_t));
     if (VulkanDevice::ExactSerialAllocating() && ProgramAllocates(snapshot, codeOffset)) VulkanDevice::NoteAllocatingProgram(address);
+    // APS5_EXACT_NO_SCATTER_SPLIT=1 (diagnostic): exact replays split only the allocating programs, as before.
+    static const bool scatterSplit = std::getenv("APS5_EXACT_NO_SCATTER_SPLIT") == nullptr;
+    if (scatterSplit && VulkanDevice::ExactSerialAllocating() && ProgramScatters(snapshot, codeOffset)) VulkanDevice::NoteScatteringProgram(address);
     if (userData.size() >= 6 && Graphics::HtileMaskKernelCode(std::span(snapshot.code).subspan(codeOffset))) Graphics::Recorder::SetWriteOriginKernel(userData[5], userData[4]);
     static const bool profileWriters = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (profileWriters && Graphics::HtileWriterProgram(address)) {

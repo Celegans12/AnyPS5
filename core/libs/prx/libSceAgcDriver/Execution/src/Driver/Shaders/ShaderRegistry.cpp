@@ -21,6 +21,7 @@
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
 #include <array>
+#include <bitset>
 #include <atomic>
 #include <chrono>
 #include <set>
@@ -55,6 +56,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
+#include <unordered_map>
 #include <thread>
 #include <unordered_set>
 #include "Optimization/ShaderStageInputInfo.hpp"
@@ -618,6 +620,239 @@ bool ProgramAllocates(const ShaderSnapshot& snapshot, std::size_t codeOffset) {
     const bool allocates = decodedAllocates(std::span(snapshot.code).subspan(codeOffset));
     if (codeOffset == 0) snapshot.allocates->store(allocates ? Allocates : Shares, std::memory_order_release);
     return allocates;
+}
+
+namespace {
+
+// ProgramScatters: a forward taint analysis over the decoded program. A register is tainted when, on some path, it
+// holds a value loaded from memory (a VMEM or LDS load, a returning atomic) or computed from one; a VOPC compare of
+// tainted values taints the scalar mask it writes, so a v_cndmask on it taints its result. Scalar loads stay clean:
+// they read the dispatch's constants, the same in every workgroup. Unknown widths are read wide and cleared narrow,
+// so the analysis errs towards tainting.
+struct ScatterTaint {
+    std::bitset<256> vector;
+    std::bitset<128> scalar;  // s0..s105, vcc_lo 106, vcc_hi 107
+    bool operator==(const ScatterTaint&) const = default;
+    ScatterTaint& operator|=(const ScatterTaint& other) {
+        vector |= other.vector;
+        scalar |= other.scalar;
+        return *this;
+    }
+};
+
+constexpr std::uint32_t ScatterVccLo = 106u;
+
+int scatterScalarIndex(const ShaderRecompiler::RdnaOperand& operand) {
+    using Kind = ShaderRecompiler::RdnaOperandKind;
+    if (operand.kind == Kind::ScalarRegister && operand.reg < 106u) return static_cast<int>(operand.reg);
+    if (operand.kind == Kind::VccLo) return static_cast<int>(ScatterVccLo);
+    if (operand.kind == Kind::VccHi) return static_cast<int>(ScatterVccLo + 1u);
+    return -1;
+}
+
+bool scatterReads(const ScatterTaint& taint, const ShaderRecompiler::RdnaOperand& operand, std::uint32_t width) {
+    using Kind = ShaderRecompiler::RdnaOperandKind;
+    if (operand.kind == Kind::VectorRegister) {
+        for (std::uint32_t i = 0; i < width && operand.reg + i < 256u; ++i) {
+            if (taint.vector.test(operand.reg + i)) return true;
+        }
+        return false;
+    }
+    const auto scalar = scatterScalarIndex(operand);
+    if (scalar < 0) return false;
+    for (std::uint32_t i = 0; i < width && static_cast<std::uint32_t>(scalar) + i < 108u; ++i) {
+        if (taint.scalar.test(static_cast<std::uint32_t>(scalar) + i)) return true;
+    }
+    return false;
+}
+
+void scatterWrite(ScatterTaint& taint, const ShaderRecompiler::RdnaOperand& operand, std::uint32_t width, bool tainted) {
+    using Kind = ShaderRecompiler::RdnaOperandKind;
+    const std::uint32_t count = tainted ? width : 1u;
+    if (operand.kind == Kind::VectorRegister) {
+        for (std::uint32_t i = 0; i < count && operand.reg + i < 256u; ++i) taint.vector.set(operand.reg + i, tainted);
+        return;
+    }
+    const auto scalar = scatterScalarIndex(operand);
+    if (scalar < 0) return;
+    for (std::uint32_t i = 0; i < count && static_cast<std::uint32_t>(scalar) + i < 108u; ++i) taint.scalar.set(static_cast<std::uint32_t>(scalar) + i, tainted);
+}
+
+enum class ScatterKind { Other, Load, Store, Atomic };
+
+bool scatterStoreOp(ShaderRecompiler::RdnaOpcode op) {
+    using Op = ShaderRecompiler::RdnaOpcode;
+    switch (op) {
+    case Op::BufferStoreFormatX: case Op::BufferStoreFormatXy: case Op::BufferStoreFormatXyz: case Op::BufferStoreFormatXyzw:
+    case Op::BufferStoreByte: case Op::BufferStoreShort: case Op::BufferStoreByteD16Hi: case Op::BufferStoreShortD16Hi:
+    case Op::BufferStoreDword: case Op::BufferStoreDwordx2: case Op::BufferStoreDwordx3: case Op::BufferStoreDwordx4:
+    case Op::BufferStoreFormatD16X: case Op::BufferStoreFormatD16Xy: case Op::BufferStoreFormatD16Xyz: case Op::BufferStoreFormatD16Xyzw: case Op::BufferStoreFormatD16HiX:
+    case Op::TbufferStoreFormatX: case Op::TbufferStoreFormatXy: case Op::TbufferStoreFormatXyz: case Op::TbufferStoreFormatXyzw:
+    case Op::TbufferStoreFormatD16X: case Op::TbufferStoreFormatD16Xy: case Op::TbufferStoreFormatD16Xyz: case Op::TbufferStoreFormatD16Xyzw:
+    case Op::FlatStoreByte: case Op::FlatStoreShort: case Op::FlatStoreByteD16Hi: case Op::FlatStoreShortD16Hi:
+    case Op::FlatStoreDword: case Op::FlatStoreDwordx2: case Op::FlatStoreDwordx3: case Op::FlatStoreDwordx4: case Op::GlobalStoreDwordAddtid:
+    case Op::ImageStore: case Op::ImageStoreMip: case Op::ImageStorePck: case Op::ImageStoreMipPck: case Op::ImageStoreBy2: case Op::ImageStoreBy4:
+    case Op::ImageStoreMipBy2: case Op::ImageStoreMipBy4: case Op::ImageStorePck2: case Op::ImageStorePck4: case Op::ImageStoreMipPck2: case Op::ImageStoreMipPck4:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// An atomic whose result depends on the order of two writers of one location (a plain add or max does not).
+bool scatterSwapOp(ShaderRecompiler::RdnaOpcode op) {
+    using Op = ShaderRecompiler::RdnaOpcode;
+    switch (op) {
+    case Op::BufferAtomicSwap: case Op::BufferAtomicCmpswap: case Op::BufferAtomicSwapX2: case Op::BufferAtomicCmpswapX2: case Op::BufferAtomicFcmpswap: case Op::BufferAtomicFcmpswapX2:
+    case Op::FlatAtomicSwap: case Op::FlatAtomicCmpswap: case Op::FlatAtomicSwapX2: case Op::FlatAtomicCmpswapX2: case Op::FlatAtomicFcmpswap: case Op::FlatAtomicFcmpswapX2:
+    case Op::ImageAtomicSwap: case Op::ImageAtomicCmpswap: case Op::ImageAtomicFcmpswap:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool scatterAtomicOp(ShaderRecompiler::RdnaOpcode op) {
+    using Op = ShaderRecompiler::RdnaOpcode;
+    return (op >= Op::BufferAtomicSwap && op <= Op::BufferAtomicCsub) || (op >= Op::FlatAtomicSwap && op <= Op::GlobalAtomicCsub) || (op >= Op::ImageAtomicSwap && op <= Op::ImageAtomicFmax);
+}
+
+bool scatterBranchOp(ShaderRecompiler::RdnaOpcode op) {
+    using Op = ShaderRecompiler::RdnaOpcode;
+    switch (op) {
+    case Op::SBranch: case Op::SCbranchScc0: case Op::SCbranchScc1: case Op::SCbranchVccz: case Op::SCbranchVccnz: case Op::SCbranchExecz: case Op::SCbranchExecnz: case Op::SCbranchCdbg:
+        return true;
+    default:
+        return false;
+    }
+}
+
+ScatterKind scatterKind(const ShaderRecompiler::RdnaInstruction& instruction) {
+    using Family = ShaderRecompiler::RdnaInstructionFamily;
+    switch (instruction.family) {
+    case Family::MUBUF: case Family::MTBUF: case Family::FLAT: case Family::MIMG:
+        if (scatterStoreOp(instruction.op)) return ScatterKind::Store;
+        if (scatterAtomicOp(instruction.op)) return returningMemoryAtomic(instruction) ? ScatterKind::Load : ScatterKind::Atomic;
+        return ScatterKind::Load;
+    case Family::DS:
+        return instruction.destination.kind == ShaderRecompiler::RdnaOperandKind::VectorRegister ? ScatterKind::Load : ScatterKind::Other;
+    default:
+        return ScatterKind::Other;
+    }
+}
+
+// The address registers of a VMEM store, with the number of registers each covers (none for a uniform address).
+void scatterAddressReads(const ShaderRecompiler::RdnaInstruction& instruction, std::vector<std::pair<ShaderRecompiler::RdnaOperand, std::uint32_t>>& out) {
+    using Family = ShaderRecompiler::RdnaInstructionFamily;
+    using Kind = ShaderRecompiler::RdnaOperandKind;
+    out.clear();
+    switch (instruction.family) {
+    case Family::MIMG:
+        if (instruction.imageNsaDwordCount != 0u) {
+            out.emplace_back(instruction.source0, 1u);
+            // NSA bytes past the address components are padding (register 0), not addresses.
+            const std::uint32_t extra = std::min(instruction.imageNsaDwordCount * 4u, std::max(instruction.imageAddressComponents, 1u) - 1u);
+            for (std::uint32_t i = 0; i < extra; ++i) {
+                ShaderRecompiler::RdnaOperand operand{};
+                operand.kind = Kind::VectorRegister;
+                operand.reg = instruction.imageNsaVectorRegisters[i];
+                out.emplace_back(operand, 1u);
+            }
+        } else {
+            out.emplace_back(instruction.source0, std::max(instruction.imageAddressComponents, 1u));
+        }
+        return;
+    case Family::MUBUF: case Family::MTBUF:
+        if (instruction.idxen || instruction.offen) out.emplace_back(instruction.source0, instruction.idxen && instruction.offen ? 2u : 1u);
+        return;
+    case Family::FLAT:
+        if (instruction.source0.kind == Kind::VectorRegister) out.emplace_back(instruction.source0, 2u);
+        if (instruction.source1.kind == Kind::VectorRegister) out.emplace_back(instruction.source1, 1u);
+        return;
+    default:
+        return;
+    }
+}
+
+}
+
+bool DecodedProgramScatters(std::span<const std::uint32_t> code) {
+    using Family = ShaderRecompiler::RdnaInstructionFamily;
+    using Op = ShaderRecompiler::RdnaOpcode;
+    ShaderRecompiler::RdnaProgram decoded;
+    try {
+        decoded = ShaderRecompiler::RdnaInstructionDecoder{}.Decode(code);
+    } catch (const std::exception&) {
+        return false;
+    }
+    const auto& instructions = decoded.instructions;
+    std::unordered_map<std::uint32_t, std::size_t> at;
+    for (std::size_t i = 0; i < instructions.size(); ++i) at.emplace(instructions[i].programCounter, i);
+    std::vector<std::optional<ScatterTaint>> entry(instructions.size());
+    std::vector<std::size_t> work;
+    const auto reach = [&](std::size_t index, const ScatterTaint& taint) {
+        if (index >= instructions.size()) return;
+        if (entry[index].has_value()) {
+            auto merged = *entry[index];
+            merged |= taint;
+            if (merged == *entry[index]) return;
+            entry[index] = merged;
+        } else {
+            entry[index] = taint;
+        }
+        work.push_back(index);
+    };
+    reach(0, ScatterTaint{});
+    while (!work.empty()) {
+        const auto index = work.back();
+        work.pop_back();
+        const auto& instruction = instructions[index];
+        auto taint = *entry[index];
+        // An indirect jump leaves the control flow unknown: not classified (the dispatch is not split).
+        if (instruction.op == Op::SSetpcB64 || instruction.op == Op::SSwappcB64 || instruction.op == Op::SCallB64 || instruction.op == Op::SRfeB64) return false;
+        const auto kind = scatterKind(instruction);
+        const std::uint32_t wide = instruction.is64Bit ? 2u : 1u;
+        if (kind == ScatterKind::Load) {
+            scatterWrite(taint, instruction.destination, std::max(instruction.dataDwordCount, 1u) * wide, true);
+        } else if (instruction.family == Family::SMEM) {
+            scatterWrite(taint, instruction.destination, std::max(instruction.dataDwordCount, 1u), false);
+        } else if (kind == ScatterKind::Other && instruction.family != Family::SOPP && instruction.family != Family::DS && instruction.family != Family::EXP) {
+            const bool tainted = scatterReads(taint, instruction.source0, wide) || scatterReads(taint, instruction.source1, wide) || scatterReads(taint, instruction.source2, wide) || scatterReads(taint, instruction.source3, wide);
+            scatterWrite(taint, instruction.destination, wide, tainted);
+            scatterWrite(taint, instruction.destination2, 1u, tainted);
+        }
+        if (instruction.op == Op::SEndpgm) continue;
+        if (scatterBranchOp(instruction.op)) {
+            const auto target = at.find(instruction.branchTarget);
+            if (target == at.end()) return false;
+            reach(target->second, taint);
+            if (instruction.op == Op::SBranch) continue;
+        }
+        reach(index + 1u, taint);
+    }
+    std::vector<std::pair<ShaderRecompiler::RdnaOperand, std::uint32_t>> addresses;
+    for (std::size_t i = 0; i < instructions.size(); ++i) {
+        if (!entry[i].has_value()) continue;
+        const auto kind = scatterKind(instructions[i]);
+        if (kind != ScatterKind::Store && !(kind == ScatterKind::Atomic && scatterSwapOp(instructions[i].op))) continue;
+        scatterAddressReads(instructions[i], addresses);
+        for (const auto& [operand, width] : addresses) {
+            if (scatterReads(*entry[i], operand, width)) return true;
+        }
+    }
+    return false;
+}
+
+bool ProgramScatters(const ShaderSnapshot& snapshot, std::size_t codeOffset) {
+    constexpr std::uint8_t Unknown = 0, Fixed = 1, Scatters = 2;
+    if (codeOffset == 0) {
+        const auto cached = snapshot.scatters->load(std::memory_order_acquire);
+        if (cached != Unknown) return cached == Scatters;
+    }
+    if (codeOffset > snapshot.code.size()) return false;
+    const bool scatters = DecodedProgramScatters(std::span(snapshot.code).subspan(codeOffset));
+    if (codeOffset == 0) snapshot.scatters->store(scatters ? Scatters : Fixed, std::memory_order_release);
+    return scatters;
 }
 
 bool OrderedWorkgroupWaves(const ShaderSnapshot& snapshot, std::size_t codeOffset) {

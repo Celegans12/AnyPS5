@@ -201,6 +201,7 @@ struct ShaderSnapshot {
     std::shared_ptr<std::atomic<std::uint8_t>> positionVectorUse = std::make_shared<std::atomic<std::uint8_t>>(0u);
     std::shared_ptr<std::atomic<std::uint8_t>> memoryWrites = std::make_shared<std::atomic<std::uint8_t>>(0u);
     std::shared_ptr<std::atomic<std::uint8_t>> allocates = std::make_shared<std::atomic<std::uint8_t>>(0u);
+    std::shared_ptr<std::atomic<std::uint8_t>> scatters = std::make_shared<std::atomic<std::uint8_t>>(0u);
     std::shared_ptr<std::atomic<bool>> rawGraphicsNoted = std::make_shared<std::atomic<bool>>(false);
     std::optional<std::uint32_t> userDataTailRegister;
 };
@@ -215,6 +216,12 @@ bool RawGraphicsDrawnIn(std::uint64_t begin, std::uint64_t end);
 bool ProgramUsesWorkgroup(const ShaderSnapshot& snapshot, std::size_t codeOffset);
 bool ProgramWritesMemory(const ShaderSnapshot& snapshot, std::size_t codeOffset);
 bool ProgramAllocates(const ShaderSnapshot& snapshot, std::size_t codeOffset);
+// Whether a store of the program can take its address from memory: an image, buffer or flat store (or a swapping
+// atomic) whose address registers hold, on some path, a value loaded from memory or computed from one. Two
+// workgroups of such a program can write the same location, and which write lands last then follows the host's
+// workgroup schedule. Exact replays record these dispatches one workgroup at a time (NoteScatteringProgram).
+bool ProgramScatters(const ShaderSnapshot& snapshot, std::size_t codeOffset);
+bool DecodedProgramScatters(std::span<const std::uint32_t> code);
 // SpirvTarget::orderedWorkgroupWaves for a compute program: only in exact replays (APS5_EXACT_SERIAL_ALLOCATING)
 // and only for programs that allocate (ProgramAllocates).
 bool OrderedWorkgroupWaves(const ShaderSnapshot& snapshot, std::size_t codeOffset);

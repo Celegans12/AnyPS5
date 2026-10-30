@@ -359,6 +359,9 @@ public:
     static bool ExactSerialAllocating();
     static bool ExactSerialProgram(std::uint64_t programAddress);
     static void NoteAllocatingProgram(std::uint64_t programAddress);
+    // A program whose stores scatter (ProgramScatters): with ExactSerialAllocating its direct dispatches are recorded
+    // one workgroup at a time like an allocating program's, workgroup memory or not.
+    static void NoteScatteringProgram(std::uint64_t programAddress);
     static SerialAllocatingCount SerialAllocatingCounts();
     // The driver's recipe events for the [recipe] line: a restart after Rebuild, an attach; the
     // rows are the dispatch, indirect and draw kinds. NoteDrawRecipeMiss files a draw hit's
