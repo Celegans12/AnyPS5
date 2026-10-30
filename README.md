@@ -11,16 +11,16 @@
 > when a build renders our 60-frame title reference exactly and runs faster in the open world than the build before it.
 > Fixes that apply to `main` go upstream as separate PRs.
 
-## Where it stands (2026-10-27)
+## Where it stands (2026-10-30)
 
 | | |
 |---|---|
 | **Furthest point** | Open world, the Nupur river by the Ainu village, with HUD and quest |
 | **Time to the world** | about 5-7 minutes from a save near Teshio Ridge (warm shader cache) |
-| **Frame rate in the world** | about **0.6-0.8 fps** (6-8.4 presents per 10 s depending on the spot and the session; about 7.8-7.9 at the river village on this build (merged with `main` 2026-10-26; 7.9 against 7.75 for the build before, back to back); this laptop's GPU clocks drift by ~14 % between sessions, so builds are compared back to back in one session) |
-| **Stability** | with the second Vulkan queue on its own compute-only queue family, world runs are clean (our measured runs last 25-40 minutes in the world: 2,400 s on 10-26, three 1,500 s runs on 10-27); the one crash we saw on 10-25 (a second-queue label bug) is fixed since `5becc82a97`. One Linux tester (RTX 3080 Ti 12 GB, 3840x2160 guest) had a GPU hang right after the menu with video memory nearly full; not reproduced here yet |
+| **Frame rate in the world** | about **0.85 fps** at 1080p with the [1080p patch](#run-it) (8.46 presents per 10 s at the river village, against 7.76 / 7.64 at 4K in the runs either side of it: **+9.9 %**); at 4K this build runs at the same speed as the build before (7.98 against 7.95 / 7.91, back to back). This laptop's GPU clocks drift by ~14 % between sessions, so builds are compared back to back in one session |
+| **Stability** | with the second Vulkan queue on its own compute-only queue family, world runs are clean (our measured runs last 25-40 minutes in the world: 2,400 s on 10-26, three 1,500 s runs on 10-27); the one crash we saw on 10-25 (a second-queue label bug) is fixed since `5becc82a97`. The Linux/NVIDIA cutscene freeze with the second queue is fixed in this build (`cc5d69fca6`; Dextroid17: 2 of 2 lane-on runs clean to 3,600 s, after 6 of 6 froze before). One Linux tester (RTX 3080 Ti 12 GB, 3840x2160 guest) had a GPU hang right after the menu with video memory nearly full; not reproduced here yet |
 | **Tested on** | Windows 11, RTX 3080 Laptop GPU 16 GB (driver 610.62), 32 GB RAM, MinGW-w64 GCC 15.2.0, Release |
-| **Build** | `416ce3c368`: our tree (`d3e0db3032`, owned answers from per-block checks within a collect epoch, and everything listed under [What it carries](#what-it-carries-on-top-of-main-2026-10-26)) merged with `main` 2026-10-26 `88795ed448` (which now includes #9957, #9181, #9567 and #11120), plus Pipodi's absent runtime formats (Celegans12/AnyPS5-Ghost-of-Yotei#1) and two of hritikutekar's runtime-format reads from #675, + docs, shader-cache SourceVersion `22c401ea7ca3796f`, title reference T1 exact |
+| **Build** | `27171091f2`: `416ce3c368` plus the changes listed under [Updates](#updates) for 2026-10-30 (the Linux second-queue freeze fix, Pipodi's prebuild fix Celegans12/AnyPS5-Ghost-of-Yotei#3, hritikutekar's speedups, TheBlenDed's shader-preparation retry) and our new-GPU-path work, which is off unless `APS5_NEW_PATH` is set. `416ce3c368` is our tree (`d3e0db3032`, owned answers from per-block checks within a collect epoch, and everything listed under [What it carries](#what-it-carries-on-top-of-main-2026-10-26)) merged with `main` 2026-10-26 `88795ed448` (which now includes #9957, #9181, #9567 and #11120), plus Pipodi's absent runtime formats (Celegans12/AnyPS5-Ghost-of-Yotei#1) and two of hritikutekar's runtime-format reads from #675, + docs, shader-cache SourceVersion `22c401ea7ca3796f`, title reference T1 exact |
 
 <table>
 <tr>
@@ -62,10 +62,20 @@
 | 10-26 | **8.05** (7.70 with them off in the same run: +4.4 %, frames ~55 ms shorter) | owned reuse of untracked vertex/index inputs and draw snapshots; storage flushes wait only for the lanes that write the range |
 | 10-26 | **7.8** (7.3 with all owned features off in the same run: +6.4 %, frames ~80 ms shorter) | the owned features made fault-free: write watch instead of write protection, answered from per-block checks within each collect epoch |
 | 10-27 | **7.9** (the build before: 7.75 between two runs of this one, same script) | merged with `main` 2026-10-26; same speed, newer `main` underneath |
+| 10-30 | **8.46** at 1080p (7.76 / 7.64 at 4K in the runs either side: +9.9 %) | the game's output and render size set to 1920x1080 with a relinker patch (shahulmubeen-a's, ported to v1.008); at 4K the code runs at the same speed as the build before (7.98 against 7.95 / 7.91) |
 
 ## Run it
 
-Build as usual ([build instructions](docs/dev/BUILD.md)), then run the game with:
+Build as usual ([build instructions](docs/dev/BUILD.md)). For 1080p (recommended: about 10 % faster here, and every full-screen target is 1920x1080 instead of 3840x2160), add the patch file [`docs/yotei/yotei-1.008-1080p.toml`](docs/yotei/yotei-1.008-1080p.toml) to your relinker command:
+
+```
+python tools/unwrap_self.py <dump>/app0/eboot.bin eboot.elf
+relinker <your usual options> --patches docs/yotei/yotei-1.008-1080p.toml eboot.elf <runtime>/eboot.exe
+```
+
+It is shahulmubeen-a's 1080p patch for 02.002.000, ported to v1.008 (five sites, `relinker --verify-patches` reports 5 ok). It sets all 16 steps of the game's dynamic-resolution table to 1920x1080, so the render size can't drop during a run; as Ryongen noted on Discord, the lower steps also feed the game's sharpening, so the picture can look a little softer. The patch is for v1.008 only (app0/eboot.bin md5 `748168945449666277eb772f7a371cbc`); on another version the relinker refuses it because the expected bytes differ. The shader cache doesn't change, so a warm 4K cache stays warm.
+
+Then run the game with:
 
 ```
 APS5_SPANNED_WAVE=1 APS5_BINDLESS_IMAGES=1 APS5_BINDLESS_LAZY=1 APS5_NO_RESULT_MEMO=1
@@ -74,7 +84,7 @@ APS5_NO_PIPELINE_JOURNAL=1 APS5_RESOURCE_CACHE_ENTRIES=1024 APS5_ASYNC_LANE=51
 APS5_NO_DRAW_AHEAD=1 APS5_DEFER_REFRESH_FLUSH=1 APS5_PIPELINE_DISPATCH=1
 ```
 
-- **This build has a new shader-cache version (since 2026-10-27, `22c401ea7ca3796f`), so the first run compiles cold**: about 54 minutes to the world on our machine (frame 90 at 3,218 s). The second run can still compile a few very large pipelines (about 3 minutes on the last loading screen for us, if the first run was stopped before the driver saved them); after that, runs start warm (frame 90 at about 400 s).
+- The shader-cache version is unchanged since 2026-10-27 (`22c401ea7ca3796f`), so a cache from the previous build stays warm. **From an empty cache the first run compiles cold**: about 54 minutes to the world on our machine (frame 90 at 3,218 s). The second run can still compile a few very large pipelines (about 3 minutes on the last loading screen for us, if the first run was stopped before the driver saved them); after that, runs start warm (frame 90 at about 400 s).
 - `APS5_ASYNC_LANE=51` runs the cloth compute ring on a second Vulkan queue. That queue now comes from a compute-only queue family by default; `APS5_LANE_GRAPHICS_FAMILY=1` goes back to a third queue of the graphics family, which faulted the GPU for us. Without `APS5_ASYNC_LANE`, everything runs on one queue as before.
 - `APS5_DEFER_REFRESH_FLUSH=1` lets a storage refresh record its GPU-direct write-backs behind the pending writer instead of waiting for it; hritikutekar's GPU slice copies for reflection probes need it.
 - `APS5_NO_DRAW_AHEAD=1` keeps mitul72's draw-ahead (#6188) off: worker threads that capture and compile upcoming draws ahead of queue 0. Leave it out to try it: in our A/B it was +4 % presents (not significant), and one of four title checks with it on stalled at boot and rendered wrong, which we haven't reproduced or explained yet.
@@ -119,7 +129,7 @@ APS5_NO_DRAW_AHEAD=1 APS5_DEFER_REFRESH_FLUSH=1 APS5_PIPELINE_DISPATCH=1
 - A silver sheen sometimes appears on Atsu and the boat after entering the world, and in a few runs over the whole scene. It comes and goes: in one run it cleared by itself after about ten minutes, and the three runs of 10-27 didn't show it, so it may depend on the weather or time of day. Under investigation (one lead: a GPU fill over texture memory that the next texture read doesn't see).
 
 - **The second queue needs a compute-only queue family.** On a third queue of the graphics family (the old setup, or a GPU without a compute-only family, where the driver falls back to it), 8 of 9 world runs lost the GPU within 4-14 minutes. An Nsight Aftermath dump showed a DMA page fault inside the second queue's batch. On the compute-only family, 4 of 4 runs were clean. If you hit GPU hangs, leave `APS5_ASYNC_LANE` out.
-- **On Linux with NVIDIA, leave `APS5_ASYNC_LANE` out for now.** A tester on Linux (RTX 3080 Ti, driver 615.78.08) saw the opening cutscene freeze in 6 of 6 runs with the second queue on (after about 35-65 minutes) and in 0 of 3 with it off. Their stack dumps point to a hand-off deadlock between the two queues in our recorder, which we are fixing. On Windows with NVIDIA (RTX 3080 Laptop, driver 610.62) the second queue has run clean for us; on AMD (RADV) one 27-minute world run by another tester was clean.
+- Fixed on 10-30: on Linux with NVIDIA, the opening cutscene froze with the second queue on (`APS5_ASYNC_LANE=51`; Dextroid17, RTX 3080 Ti, driver 615.78.08: 6 of 6 runs lane on, 0 of 3 lane off). It was a hand-off deadlock between the two queues in our recorder: a wait on one queue's batch could depend on the other queue's open batch, which was never submitted. The recorder now submits the other queue's open batch before any blocking wait (`cc5d69fca6`, with a test that blocks 4 of 4 times without it). Dextroid17's two lane-on runs on the fix went clean to 3,600 s. `APS5_NO_LANE_OPEN_WAIT=1` turns it off.
 - A GPU hang can reset NVIDIA's shader store for the game. After that, the saved pipelines no longer load and every run compiles again (long stalls on the last loading screen). If that happens after a hang, expect one slow run.
 - Black shapes on some rocks and terrain (the depth pre-pass and the G-buffer pass disagree on depth). Cause not found yet.
 - Process memory is about 30-35 GB in the world, so 32 GB of RAM is tight. `main` 2026-10-21 dropped the 2 GiB reserve of the sampled-texture budget (#7862), with no switch; our cold run went down to 0.2 GB of free RAM (paging) without failing.
@@ -130,6 +140,7 @@ APS5_NO_DRAW_AHEAD=1 APS5_DEFER_REFRESH_FLUSH=1 APS5_PIPELINE_DISPATCH=1
 
 ## What it carries on top of `main` 2026-10-26
 
+- New on 2026-10-30 (details under [Updates](#updates)): the recorder fix for the Linux second-queue freeze; Pipodi's prebuild fix (Celegans12/AnyPS5-Ghost-of-Yotei#3); hritikutekar's nine speedups and three diagnostics from #675, with TheBlenDed's cross-lane completion-label deferral and shader-preparation retry; the frame capture and replay tools (`agc_frame_replay`); and our new GPU path (device page table, GPU-resolved draws and dispatches), all of it off unless `APS5_NEW_PATH` is set.
 - Most of the upstream PRs this branch adopted earlier are part of `main` now, including #9957, #9181, #9567, #9558, #9600 and #11120. Still carried here because they're open upstream: mrfelek's #10228, SleglJan's #8887, AlxcBTW's #7514, mitul72's #6188 (off in the env) and our own PRs (#10382 and the dispatch-overlap and staging series).
 - Changes on `main` after 2026-10-26 (over 100 PRs, including #11365 per-draw GPU timing, #8896, #10837 and #10980) aren't in this build yet.
 - Local work:
@@ -191,6 +202,13 @@ APS5_NO_DRAW_AHEAD=1 APS5_DEFER_REFRESH_FLUSH=1 APS5_PIPELINE_DISPATCH=1
 - 2026-10-26: owned answers from per-block checks within a collect epoch (`d3e0db3032`, same shader cache, T1 exact). The write-watch proofs asked Windows for the written pages on every proof, about 15 queries each. Now each collect epoch takes a mark from a shared clock, and a block that was checked after the mark is answered from its word alone, so most proofs are a few atomic loads (0.04-0.2 µs instead of up to 125 µs). A CPU store before the thread's ordering point is seen by the next query; a store racing a submission waits for the next mark, which is the rule the collect memo already had. **The owned features are back on in the env.** In-run A/B (2,400 s, 6 phases per arm): all owned features off -0.50 ± 0.04 presents per 10 s (**+6.4 %** with them on, frames ~80 ms shorter), the epoch checks alone off -0.19 ± 0.09 (+2.5 %), owned vertex inputs alone off +0.01 (neutral). 0 guest faults, 0 epoch disagreements. `APS5_NO_OWNED_EPOCH=1` goes back to one query per proof; `APS5_VERIFY_OWNED_EPOCH=<n>` also queries the first n epoch answers every 10 s and reports any disagreement.
 - 2026-10-27: moved to our tree merged with `main` 2026-10-26 (`416ce3c368`, **new shader cache**, T1 exact cold and warm). `main` now carries #9957 (buffer presence read at run time) and #9181, so those collapse into `main`'s versions; #10228 stays ours. Also Pipodi's absent runtime formats (Celegans12/AnyPS5-Ghost-of-Yotei#1, off with `APS5_NO_ABSENT_RUNTIME_FORMAT=1`) and hritikutekar's straight-line format conversion and single span reads from #675 (`APS5_NO_COMPACT_FORMAT_CONVERT=1`, `APS5_NO_SINGLE_FORMAT_READ=1`). `main`'s PlayGo now throws on chunk IDs outside the scenario list; without `APS5_PLAYGO_SCENARIO_CHUNKS` every chunk answers installed again, as before. Three 1,500 s world runs back to back (this build, the build before, this build): 7.87 / 7.75 / 7.92 presents per 10 s over the steady phases (one 60 s phase of the first run, a compile stall, left out), 1,742 against 1,743 presents in total, so the same speed. Frames clean, no fatal. Focused ctest 448/451 (one fails on plain `main` too, one only with the opt-in `APS5_LAYER_REFRESH=1`, one known NVIDIA-only).
 - 2026-10-29: known issue added: on Linux with NVIDIA, the second queue (`APS5_ASYNC_LANE=51`) can freeze the opening cutscene; leave it out there until the recorder fix lands. No code change in this build.
+- 2026-10-30: moved to `27171091f2` (**same shader cache**, T1 exact at 4K and at 1080p), for 1080p and stability rather than speed at 4K:
+  - **1080p**: [Run it](#run-it) now has a relinker patch that sets the game's output and render size to 1920x1080 (shahulmubeen-a's patch for 02.002.000, ported to v1.008). In three 1,500 s world runs back to back (4K, 1080p, 4K): 7.76 / **8.46** / 7.64 presents per 10 s, **+9.9 %**. GPU time per frame drops only from about 851-873 to 768 ms, so on this laptop the GPU work isn't mainly pixel-bound. 1080p has its own 60-frame title reference, and this build matches it exactly.
+  - **Linux second-queue freeze fixed** (`cc5d69fca6`): see [Known issues](#known-issues). Dextroid17's two lane-on runs on the fix went clean to 3,600 s, after 6 of 6 froze before.
+  - **Pipodi's prebuild fix** (Celegans12/AnyPS5-Ghost-of-Yotei#3, four commits, author kept): a prebuilt fragment library now matches draws whose shader has no push constants or whose target has a depth or stencil attachment, so those draws no longer build their own library. It's a cold-start change: in Pipodi's cold A/B (RTX 4090, empty caches), the graphics-pipeline wall during the loading cinematic was 21 s shorter (161 to 140 s). We didn't run it cold ourselves; with a warm cache it shouldn't change anything.
+  - hritikutekar's nine speedups and three diagnostics from #675 with TheBlenDed's completion-label fix (in-run A/B in the world: all of them off cost 0.31 ± 0.08 presents per 10 s against 9.03, about +3.5 % inside one run, although the back-to-back runs below show no gain overall), TheBlenDed's retry of failed shader preparation at registration, and the frame capture and replay tools we use to test GPU changes offline.
+  - Our new GPU path is in this build but off unless `APS5_NEW_PATH` is set. It isn't faster yet.
+  - At 4K, three 1,500 s runs back to back (the build before, this build without #3, the build before): 7.95 / 7.98 / 7.91 presents per 10 s, so the same speed. Frames clean, no fatal.
 
 ---
 

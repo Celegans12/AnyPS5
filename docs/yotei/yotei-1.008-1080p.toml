@@ -1,0 +1,48 @@
+# Ghost of Yotei PPSA26344 v1.008: fixed 1920x1080 output and render size (the game's own 4K output becomes 1080p).
+# Port of shahulmubeen-a's 02.002.000 relinker patch to 1.008. Five sites, each one hit in 1.008; `relinker --verify-patches`
+# reports 5 ok against the unwrapped v1.008 eboot (app0/eboot.bin md5 748168945449666277eb772f7a371cbc).
+# The va values are ELF virtual addresses. target is the relinker's input file name: unwrap app0/eboot.bin to eboot.elf first
+# (tools/unwrap_self.py app0/eboot.bin eboot.elf), or rename target to match your file.
+# All 16 steps of the dynamic-resolution table are set to 1920x1080, so the render size can't drop during a run.
+# Use: relinker <your usual options> --patches yotei-1.008-1080p.toml eboot.elf <out>/eboot.exe
+format = 1
+
+[[patch]]
+name     = "out_size_init"
+description = "init: movabs rcx, (2160<<32)|3840 -> (1080<<32)|1920, stored to [r12+0x24] (output/target size)"
+target   = "eboot.elf"
+va       = 0xccf61c
+expected = "48b9000f000070080000"
+value    = "48b98007000038040000"
+
+[[patch]]
+name     = "out_width_check"
+description = "per-frame update: cmp dword [rbx+0x24], 3840 -> 1920 (size differs -> reset path)"
+target   = "eboot.elf"
+va       = 0xcd1111
+expected = "817b24000f0000"
+value    = "817b2480070000"
+
+[[patch]]
+name     = "out_height_check"
+description = "per-frame update: cmp dword [rbx+0x28], 2160 -> 1080"
+target   = "eboot.elf"
+va       = 0xcd111a
+expected = "817b2870080000"
+value    = "817b2838040000"
+
+[[patch]]
+name     = "out_size_reset"
+description = "reset path: movabs rdx, (2160<<32)|3840 -> (1080<<32)|1920, stored to [rbx+0x24]"
+target   = "eboot.elf"
+va       = 0xcd11ba
+expected = "48ba000f000070080000"
+value    = "48ba8007000038040000"
+
+[[patch]]
+name     = "drs_table"
+description = "16-step dynamic-resolution table (w,h pairs, 3840x2160 .. 1920x1080) -> all 16 steps 1920x1080"
+target   = "eboot.elf"
+va       = 0x19aa610
+expected = "000f000070080000800e000028080000000e0000e0070000800d000098070000000d000050070000800c000008070000000c0000c0060000800b000078060000000b000030060000800a0000e8050000000a0000a00500008009000058050000000900001005000080080000c804000000080000800400008007000038040000"
+value    = "8007000038040000800700003804000080070000380400008007000038040000800700003804000080070000380400008007000038040000800700003804000080070000380400008007000038040000800700003804000080070000380400008007000038040000800700003804000080070000380400008007000038040000"
