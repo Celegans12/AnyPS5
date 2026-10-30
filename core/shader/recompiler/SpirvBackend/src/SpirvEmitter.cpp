@@ -306,8 +306,7 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
     state.barycentricPositionsLocation = target.barycentricPositionsLocation;
     state.meshExportedLocations = target.meshExportedLocations;
     state.meshPerVertexLocations = target.meshPerVertexLocations;
-    state.deviceDefaultF32Flush = target.float32FlushToZero && std::ranges::find(target.supportedCapabilities, static_cast<std::uint32_t>(spv::CapabilityDenormFlushToZero)) == target.supportedCapabilities.end();
-    state.float16DenormPreserve = target.float16DenormPreserve && !state.deviceDefaultF32Flush;
+    state.float16DenormPreserve = target.float16DenormPreserve;
     state.fusedFma = target.fusedFma;
     state.singleWorkgroup = target.singleWorkgroup && program.Resources().stage == IrShaderStage::Compute;
     state.robustBufferAccess2 = target.robustBufferAccess2;
