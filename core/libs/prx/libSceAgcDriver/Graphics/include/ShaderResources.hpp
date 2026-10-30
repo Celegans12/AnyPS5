@@ -233,8 +233,9 @@ public:
     ShaderResources(const Context& context, const ShaderRecompiler::RecompileResult& vertex, const ShaderRecompiler::RecompileResult& fragment, const ColorTarget& target, std::uint64_t indexAddress, std::size_t indexBytes);
     // `deferAddressTable` (a class A draw the new path would route, APS5_NEW_PATH_EMIT_DRAWS): an address-based
     // build makes no BDA table or fault buffer and skips the live snapshot compares, as DeferAddressTable for
-    // dispatches; a fallback calls EnsureAddressTable before the set is bound.
-    ShaderResources(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::size_t indexBytes, std::span<const GuestMemorySnapshot> snapshots = {}, bool deferAddressTable = false);
+    // dispatches; a fallback calls EnsureAddressTable before the set is bound. `deferredTemplate` (A -> T, opt-in): such a
+    // build may become a resource-cache template although its stages store through BDA (see noteReusable).
+    ShaderResources(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::size_t indexBytes, std::span<const GuestMemorySnapshot> snapshots = {}, bool deferAddressTable = false, bool deferredTemplate = false);
     ShaderResources(const Context& context, const CompiledShader& compute, std::span<const GuestMemorySnapshot> snapshots = {});
     // Two-stage build for dispatches (see build): with `deferred` the constructor runs stage A only,
     // which needs no device lock, and Complete() runs stage B under GuestMemory::GpuMutex; until
@@ -699,6 +700,7 @@ private:
     std::unique_ptr<BdaResources> bda;
     std::vector<BdaResources::SrtGuardFaults> srtGuardFaults;
     bool addressTableDeferred = false;
+    bool deferredTemplate = false;
     bool imageTablesDeferred = false;
     std::vector<BdaResources::ImageTableFaults> deferredImageFaults;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> deferredImageRanges;

@@ -2805,9 +2805,10 @@ void ShaderResources::KeepStorageImageBytes(Recorder& recorder) const {
     }
 }
 
-ShaderResources::ShaderResources(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::size_t indexBytes, std::span<const GuestMemorySnapshot> snapshots, bool deferAddressTable) : context(context), guestMemory(context) {
+ShaderResources::ShaderResources(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::size_t indexBytes, std::span<const GuestMemorySnapshot> snapshots, bool deferAddressTable, bool asTemplate) : context(context), guestMemory(context) {
     drawBuild = true;
     addressTableDeferred = deferAddressTable && StagesUseAddressTables(shaders);
+    deferredTemplate = addressTableDeferred && asTemplate;
     prepareAddressBindings(shaders, snapshots);
     build(shaders, &target, colorAttachments, indexAddress, indexBytes);
 }
@@ -2899,6 +2900,7 @@ void ShaderResources::EnsureAddressTable() {
     deferredRanges.reset();
     // D-draws2: a storing draw build was a template only because its table was deferred (noteReusable); with the
     // table it is what a storing build always was: never reusable, written back by WriteBackBuffers.
+    deferredTemplate = false;
     if (drawBuild && bdaTemplate && !bdaReadOnly) {
         reusable = addressReuse = bdaTemplate = sharedUses = false;
         directRegions.clear();
@@ -3994,7 +3996,7 @@ void ShaderResources::noteReusable() {
     // D-draws2: a draw build that deferred its BDA table (only for draws the new path routes) keeps no per-use
     // write state in the build: faults and written pages go to each draw's command record, so it may be a
     // template although its stages store through BDA (its run accesses still claim a write over the space).
-    const bool templated = usesBda && drawBuild && (bdaReadOnly || addressTableDeferred) && BdaTemplatesOn();
+    const bool templated = usesBda && drawBuild && (bdaReadOnly || deferredTemplate) && BdaTemplatesOn();
     const bool addressBased = usesBda && drawBuild && (AddressReuseEnabled() || templated);
     if (guestMemory.HasCopiedWrites()) return refuse(TemplateOutcome::CopiedWrites);
     if ((!addressBased && (HoldsLease() || usesBda)) || (bda != nullptr && LoopGuardEnabled())) return refuse(TemplateOutcome::LoopGuard);

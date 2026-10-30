@@ -2271,9 +2271,11 @@ DrawCostNote& ThreadDrawCost() {
     return note;
 }
 
-// D-draws2 (A -> T): APS5_NEW_PATH_NO_DRAW_TEMPLATES=1 keeps a deferred-table build out of the resource cache.
+// D-draws2 (A -> T, opt-in): APS5_NEW_PATH_DRAW_TEMPLATES=1 lets a deferred-table build be a resource-cache template.
+// Off by default: in-world (ab-draws3) only 269 of ~63k such builds were hit again, and the key, lookup and template
+// bookkeeping made each miss dearer than step a alone.
 bool NewPathDrawTemplates() {
-    static const bool on = [] { const char* value = std::getenv("APS5_NEW_PATH_NO_DRAW_TEMPLATES"); return value == nullptr || value[0] == '\0' || std::strcmp(value, "0") == 0; }();
+    static const bool on = [] { const char* value = std::getenv("APS5_NEW_PATH_DRAW_TEMPLATES"); return !(value == nullptr || value[0] == '\0' || std::strcmp(value, "0") == 0); }();
     return on;
 }
 
@@ -2313,7 +2315,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     // the alias checks instead. Debug aid: APS5_NO_DRAW_KEY_TRIM=1 keys them as before.
     const bool trimKey = TrimmedDrawKey();
     // D-draws2 (A -> T): an address-table draw the new path would route builds without its BDA table (step a), and
-    // with APS5_NEW_PATH_NO_DRAW_TEMPLATES unset such a build may become a template even when its stages store
+    // with APS5_NEW_PATH_DRAW_TEMPLATES=1 (opt-in) such a build may become a template even when its stages store
     // through BDA (its per-use state is the command record's, see noteReusable). A deferred template serves only
     // draws the new path would route; anything else builds its own.
     const bool routeExpected = recordable && ShaderResources::StagesUseAddressTables(shaders) && mayRouteDrawWithoutTable(state, shaders);
@@ -2392,7 +2394,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
         if (resolved.resources == nullptr) {
             const bool deferTable = routeExpected && (!resolved.cacheable || newPathTemplates);
             const auto buildStart = deferTable || NewPath::DrawCostProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-            resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots, deferTable);
+            resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots, deferTable, deferTable && newPathTemplates);
             if (NewPath::DrawCostProfiled()) ThreadDrawCost().buildNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - buildStart).count());
             if (SplitDrawBuild()) Splits().lockedBuilds.fetch_add(1, std::memory_order_relaxed);
         }
