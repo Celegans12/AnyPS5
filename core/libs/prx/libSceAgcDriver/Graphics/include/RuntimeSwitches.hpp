@@ -90,6 +90,7 @@ enum class RuntimeSwitch : std::size_t {
     NoGpuWrittenIndexEstimate,
     NoLaneOpenWait,
     NoResidentRanges,
+    NoFastOwnedSnapshots,
     Count,
 };
 

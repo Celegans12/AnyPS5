@@ -2995,6 +2995,11 @@ struct CompleteImageProfile {
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
 
+std::atomic<std::uint64_t>& FastOwnedSnapshotHits() {
+    static std::atomic<std::uint64_t> hits{0};
+    return hits;
+}
+
 CompleteImageProfile& CompleteImages() {
     static CompleteImageProfile profile;
     return profile;
@@ -3025,6 +3030,10 @@ void noteCompleteImages(const LookupOutcomes& before, std::size_t deferred, doub
         for (std::size_t kind = 0; kind < LookupOutcomes::Count; ++kind) {
             if (profile.counts[which][kind] == 0) continue;
             std::snprintf(text, sizeof(text), " %s %llux%.1fms", LookupOutcomes::Name(static_cast<LookupOutcomes::Kind>(kind)), static_cast<unsigned long long>(profile.counts[which][kind]), profile.ms[which][kind]);
+            report += text;
+        }
+        if (which == 0) {
+            std::snprintf(text, sizeof(text), "; owned-proof snapshots served by the fast path (all threads) %llu", static_cast<unsigned long long>(FastOwnedSnapshotHits().exchange(0, std::memory_order_relaxed)));
             report += text;
         }
         AgcDriver::ProfilePrint_nid_no_patch("[complete-images] (10 s) %s: %llu stage-B builds; deferred image bindings %llu in %.1f ms, storage image tables %.1f ms, image tables %.1f ms, depth-write check %.1f ms; lookups by outcome (count x ms, the refresh/upload/scan/flush rows lie inside the sampled and storage rows):%s\n", sides[which], static_cast<unsigned long long>(profile.builds[which]), static_cast<unsigned long long>(profile.deferred[which]), profile.deferredMs[which], profile.storageTablesMs[which], profile.imageTablesMs[which], profile.depthMs[which], report.c_str());
@@ -6434,10 +6443,24 @@ std::shared_ptr<Texture> ShaderResources::fastTexture(const ImageRecord& record)
     thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* runsSlot = nullptr;
     auto& runs = ShaderRecompiler::ThreadOwned(runsSlot);
     std::uint64_t committedGeneration = 0;
+    bool ownedUntracked = false;
+    const auto ownedShape = [&] {
+        const auto& resource = record.resource;
+        if (resource.dimension == TextureDimension::k2DMsaa || resource.fmaskCmaskAddress != 0u) return false;
+        if (ShaderRecompiler::DepthBitsTextureWidth(record.words[1], record.words[3]) != 0u) return false;
+        if (ArrayLayerWindow(resource, context.limits.maxImageArrayLayers).baseAddress != address || ViewedArrayWindow(resource, false).baseAddress != address) return false;
+        if (resource.dccAddress != 0 && ViewedArrayWindow(resource, true).baseAddress != address) return false;
+        return !SampledFromStorageEligible(context, resource, record.guestBytes);
+    };
     if (GuestMemory::CollectWrites(address, bytes) == 0) {
-        if (record.source != nullptr || !record.entryCommitted.has_value()) return nullptr;
-        committedGeneration = GuestMemory::CollectCommittedWrites(address, bytes, runs);
-        if (committedGeneration == 0 || runs != *record.entryCommitted) return nullptr;
+        if (record.source == nullptr && !record.entryCommitted.has_value() && !RuntimeSwitches::Set(RuntimeSwitch::NoFastOwnedSnapshots)) {
+            if (GuestMemory::CollectCommittedWrites(address, bytes, runs) != 0 || !ownedShape()) return nullptr;
+            ownedUntracked = true;
+        } else {
+            if (record.source != nullptr || !record.entryCommitted.has_value()) return nullptr;
+            committedGeneration = GuestMemory::CollectCommittedWrites(address, bytes, runs);
+            if (committedGeneration == 0 || runs != *record.entryCommitted) return nullptr;
+        }
     }
     if (PendingStorageOverlaps(address, bytes, record.source.get())) return nullptr;
     auto keys = record.keys;
@@ -6457,6 +6480,8 @@ std::shared_ptr<Texture> ShaderResources::fastTexture(const ImageRecord& record)
         // Under fast-clear keys the view holds only while its image's results are still pending over
         // the surface; flushed, the clear the image cannot see makes the lookup take a snapshot.
         if (keys != DccKeys::Uncompressed && StorageTexture::FindPending(address, record.guestBytes) != record.source) return nullptr;
+    } else if (ownedUntracked) {
+        if (keys != DccKeys::Uncompressed || untrackedKey(address, bytes)[0] != 0) return nullptr;
     } else if (keys == DccKeys::Uncompressed || keys == DccKeys::ClearSingle) {
         if (committedGeneration != 0 ? Recorder::SnapshotWriteOverlaps(address, bytes) || !GuestMemory::UnchangedCommittedSince(runs, record.entryGeneration) : !GuestMemory::UnchangedSince(address, bytes, record.entryGeneration)) return nullptr;
     }
@@ -6466,6 +6491,12 @@ std::shared_ptr<Texture> ShaderResources::fastTexture(const ImageRecord& record)
     std::lock_guard lock(cache.mutex);
     const auto it = findSampledEntry(cache, context.device, record.words, record.components);
     if (it == cache.entries.end() || it->texture != record.texture || (committedGeneration != 0 ? it->committed != runs : it->committed.has_value())) return nullptr;
+    if (ownedUntracked) {
+        if (it->source != nullptr || it->bytes != record.guestBytes || it->keys != keys || it->generation != 0 || it->owned.words.empty() || it->blockSince == 0 || it->hashes.size() != GuestMemory::HashBlockCount(address, bytes) || Recorder::SnapshotWriteOverlaps(address, bytes)) return nullptr;
+        if (!untrackedStillMatches(address, bytes, it->hashes, it->blockSince, it->blockGuard, it->blockLayout, SnapshotCompare::Untracked, it->owned)) return nullptr;
+        it->untracked = {};
+        FastOwnedSnapshotHits().fetch_add(1, std::memory_order_relaxed);
+    }
     if (it->source == nullptr) it->generation = committedGeneration != 0 ? committedGeneration : record.generation;
     touchTexture(cache, it);
     if (committedGeneration != 0) logLookup({record.texture.get(), record.resource, record.guestBytes, keys, 0, nullptr, false, committedGeneration, runs});
