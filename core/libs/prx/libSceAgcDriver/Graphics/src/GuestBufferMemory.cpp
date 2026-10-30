@@ -5162,15 +5162,59 @@ bool GuestBufferMemory::bindableInPlace(std::uint64_t offset, bool addressable) 
     return offset % context.limits.minStorageBufferOffsetAlignment == 0;
 }
 
+namespace {
+
+thread_local bool inPlaceWrites = false;
+std::atomic<std::uint64_t> inPlaceRegions{0};
+std::atomic<std::uint64_t> inPlaceRefusedRun{0};
+std::atomic<std::uint64_t> inPlaceRefusedUnchecked{0};
+std::atomic<std::uint64_t> inPlaceOverlaysKept{0};
+
+bool inPlaceAllowed(std::uint64_t begin, std::uint64_t end, bool count) {
+    if (!inPlaceWrites) return false;
+    if (RuntimeSwitches::Set(RuntimeSwitch::NoOverlapRangeCheck)) {
+        if (count) inPlaceRefusedUnchecked.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->RunOpen()) {
+        const std::array<std::array<std::uint64_t, 3>, 1> access{{{begin, end, Recorder::RunAccessWritten}}};
+        if (recorder->RunRangeConflict(access)) {
+            if (count) inPlaceRefusedRun.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+    }
+    return true;
+}
+
+}
+
+InPlaceWritesScope::InPlaceWritesScope(bool active) : previous(inPlaceWrites) {
+    inPlaceWrites = active;
+}
+
+InPlaceWritesScope::~InPlaceWritesScope() {
+    inPlaceWrites = previous;
+}
+
+bool InPlaceWritesActive() {
+    return inPlaceWrites;
+}
+
+InPlaceWritesCounts InPlaceWritesTotals() {
+    return {inPlaceRegions.load(std::memory_order_relaxed), inPlaceRefusedRun.load(std::memory_order_relaxed), inPlaceRefusedUnchecked.load(std::memory_order_relaxed), inPlaceOverlaysKept.load(std::memory_order_relaxed)};
+}
+
 bool GuestBufferMemory::stagingEligible(const Region& region, bool addressable) const {
     if (!stagingAllowed || (addressable && !region.overlay) || region.unstaged || !gpuCopiesEnabled() || region.sparse || region.mirror != nullptr) return false;
     const auto bytes = region.end - region.begin;
     if (!WritesOverlap(region.begin, static_cast<std::size_t>(bytes))) return false;
+    if (inPlaceAllowed(region.begin, region.end, false)) return false;
     if (region.atomic && atomicStagingEnabled() && bytes <= atomicStageMax()) return true;
     return writtenShadowEnabled() && bytes >= writtenShadowMin() && bytes <= (region.swept ? std::max(writtenShadowMax(context.discreteGpu), context.discreteGpu ? DiscreteSweptShadowMax : SweptShadowMax) : writtenShadowMax(context.discreteGpu));
 }
 
 bool GuestBufferMemory::overlayCandidate(const Region& inside, bool readOnly) const {
+    if (!readOnly && inPlaceAllowed(inside.begin, inside.end, false)) return false;
     return !readOnly && bdaStaging && stagingAllowed && addressStaging && gpuCopiesEnabled() && writtenShadowEnabled() && inside.direct != nullptr && inside.mirror == nullptr && !inside.sparse && Recorder::Active() != nullptr;
 }
 
@@ -5600,6 +5644,9 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             // A staged region (see stagingEligible) is copied out of the import even when aligned;
             // without a recorder to record the copies it binds in place like any other.
             const bool staged = recorder != nullptr && stagingEligible(region, addressable);
+            if (entry != nullptr && !staged && region.writable && InPlaceWritesActive() && stagingAllowed && WritesOverlap(region.begin, static_cast<std::size_t>(bytes)) && bindableInPlace(HostImportOffset(*entry, region.begin), addressable)) {
+                if (inPlaceAllowed(region.begin, region.end, true)) inPlaceRegions.fetch_add(1, std::memory_order_relaxed);
+            }
             if (entry != nullptr && !staged && bindableInPlace(HostImportOffset(*entry, region.begin), addressable)) {
                 region.direct = entry;
                 region.runCut = runImport;

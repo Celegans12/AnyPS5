@@ -607,6 +607,7 @@ int main(int argc, char** argv) {
 #ifdef _WIN32
     if (argc > 1 && (std::string(argv[1]) == "--session-window" || std::string(argv[1]) == "--written-slots")) {
         _putenv_s("APS5_NEW_PATH", "1");
+        if (std::string(argv[1]) == "--written-slots") _putenv_s("APS5_NEW_PATH_WRITTEN_SLOTS", "1");
         return std::string(argv[1]) == "--session-window" ? SessionWindow() : WrittenSlots();
     }
     if (reentry) {

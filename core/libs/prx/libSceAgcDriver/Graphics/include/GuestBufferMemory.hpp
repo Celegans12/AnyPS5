@@ -335,6 +335,28 @@ struct AddressCopy {
 };
 std::string AddressCopyOverflow(std::vector<AddressCopy> copies, std::uint64_t limit);
 
+// Written buffer elements of the builds made inside it bind in place in their imports instead of a
+// staged device-local copy (NewPath::InPlaceWrites: builds whose dispatch may run its resolved twin,
+// which reads and writes those bytes through the device page table, where the imports are mapped).
+class InPlaceWritesScope {
+public:
+    explicit InPlaceWritesScope(bool active);
+    ~InPlaceWritesScope();
+    InPlaceWritesScope(const InPlaceWritesScope&) = delete;
+    InPlaceWritesScope& operator=(const InPlaceWritesScope&) = delete;
+
+private:
+    bool previous;
+};
+bool InPlaceWritesActive();
+struct InPlaceWritesCounts {
+    std::uint64_t inPlace = 0;
+    std::uint64_t refusedRun = 0;
+    std::uint64_t refusedUnchecked = 0;
+    std::uint64_t overlaysKept = 0;
+};
+InPlaceWritesCounts InPlaceWritesTotals();
+
 class GuestBufferMemory {
 public:
     explicit GuestBufferMemory(const Context& context);

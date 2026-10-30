@@ -21,6 +21,7 @@
 #include <string>
 #include <chrono>
 #include <cstdlib>
+#include <string_view>
 #include <cstring>
 #include <mutex>
 
@@ -231,6 +232,15 @@ Decision NoteEmit(EmitCandidate& candidate, const CommandFacts& facts) {
         candidate.routed = decision.route;
     }
     return decision;
+}
+
+bool InPlaceWrites(const EmitCandidate& candidate) {
+    static const int mode = [] {
+        if (!EmitDispatches() || EnvSet("APS5_NEW_PATH_NO_IN_PLACE_WRITES")) return 0;
+        const char* scope = std::getenv("APS5_NEW_PATH_IN_PLACE_WRITES");
+        return scope != nullptr && std::string_view(scope) == "all" ? 2 : 1;
+    }();
+    return mode == 2 || (mode == 1 && candidate.twin != nullptr);
 }
 
 bool MayEmitWithoutTable(const EmitCandidate& candidate, bool pipelineReady) {

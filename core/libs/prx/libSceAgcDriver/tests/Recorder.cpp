@@ -3847,6 +3847,70 @@ bool bdaStagingTests(const Device& device, Recorder& recorder) {
         recorder.Sync();
         memory.WriteBack();
     }
+    const auto checkWords = [&](std::uint32_t value, const char* what) {
+        std::size_t wrong = 0;
+        for (std::size_t index = 0; index < bytes / 4u; ++index) {
+            const auto at = index >= first ? index - first : bytes;
+            const auto expected = at >= 64 && at < 80 ? value : 0x11111111u;
+            if (words[index] != expected && wrong++ < 8) std::cout << what << ": dword " << index << " holds 0x" << std::hex << words[index] << ", expected 0x" << expected << std::dec << "\n";
+        }
+        Require(wrong == 0, std::string(what) + " left the wrong guest bytes");
+    };
+    for (const bool addressable : {true, false}) {
+        std::memset(block, 0x11, bytes);
+        const InPlaceWritesScope inPlace(true);
+        GuestBufferMemory memory(context);
+        memory.AllowDeviceStaging();
+        memory.AcquireRegistered();
+        memory.AddWritable(element, elementBytes, false, false);
+        memory.AddReadable(element + 16, 64);
+        memory.AddReadable(address + (1u << 20u), 64);
+        memory.Upload(addressable);
+        if (addressable) checkTable(memory.AddressRanges(), false);
+        Require(!memory.HasOverlays() && !memory.HasGpuCopies(), "an in-place build staged its written element");
+        std::uint32_t adjustment = 0;
+        const auto view = memory.Descriptor(element, elementBytes, adjustment);
+        Require(view.buffer == importBuffer, "an in-place build's written element is not bound in its import");
+        recorder.Sync();
+        auto commands = recorder.Commands();
+        fill(commands, view.buffer, view.offset + adjustment + 64u * 4u, 64, 0x33333333u);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+        memory.RecordCopyBacks(recorder);
+        recorder.Sync();
+        memory.MarkDirectWrites();
+        checkWords(0x33333333u, addressable ? "an address-based in-place write" : "an in-place write");
+        memory.WriteBack();
+    }
+    {
+        std::memset(block, 0x11, bytes);
+        const InPlaceWritesScope inPlace(true);
+        recorder.Sync();
+        recorder.OpenBatch();
+        const std::array<const void*, 1> owners{&recorder};
+        recorder.DeferDispatchBarrier(0x77, owners);
+        const std::array<std::array<std::uint64_t, 3>, 1> member{{{element + 256, element + 512, Recorder::RunAccessWritten}}};
+        recorder.NoteRunAccess(0x1234, member);
+        if (recorder.RunOpen()) {
+            const auto before = InPlaceWritesTotals().refusedRun;
+            GuestBufferMemory memory(context);
+            memory.AllowDeviceStaging();
+            memory.AcquireRegistered();
+            memory.AddWritable(element, elementBytes, false, false);
+            memory.AddReadable(element + 16, 64);
+            memory.AddReadable(address + (1u << 20u), 64);
+            memory.Upload(true);
+            std::uint32_t adjustment = 0;
+            Require(memory.Descriptor(element, elementBytes, adjustment).buffer != importBuffer, "a written element an open run's dispatch also touches was bound in place");
+            Require(InPlaceWritesTotals().refusedRun == before || memory.HasOverlays(), "the open-run refusal kept no staged copy");
+            memory.RecordCopyBacks(recorder);
+            recorder.Sync();
+            memory.MarkDirectWrites();
+            checkWords(0x11111111u, "a refused in-place build");
+            memory.WriteBack();
+        } else {
+            std::cout << "no dispatch run opened: the open-run refusal is not tested\n";
+        }
+    }
     {
         GuestAllocations::Mutation mutation;
         mutation.Remove(block);
