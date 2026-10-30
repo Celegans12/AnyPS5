@@ -91,6 +91,8 @@ enum class RuntimeSwitch : std::size_t {
     NoLaneOpenWait,
     NoResidentRanges,
     NoCopyTrailMerge,
+    NoCopyForward,
+    NoCopyForwardResident,
     Count,
 };
 

@@ -5196,6 +5196,8 @@ constexpr VkAccessFlags CopiedBackAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS
 constexpr VkAccessFlags DispatchedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
 constexpr VkAccessFlags CopiedInAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
 
+void reportForward();
+
 struct CopyShape {
     std::mutex mutex;
     std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
@@ -5257,6 +5259,7 @@ void reportShape(CopyShape& shape) {
     std::fprintf(stderr, "[copy-shape] (10 s) copy-in calls %llu (inline %llu, in a run inline %llu, prelude %llu; reused builds %llu; with nothing made %llu), leading barriers %llu, regions per call 1:%llu 2:%llu 3-4:%llu 5-8:%llu 9+:%llu; after copy-back %llu (disjoint from it %llu) / dispatch trail %llu / copy-in %llu / other %llu; batches with copy-ins %llu (max %llu calls in one); copies made %llu, resident skipped %llu; made by source snapshot %llu, gpu-sourced %llu, import %llu; pending writer %llu, open write %llu; dest reused %llu, resident %llu; hoistable %llu (%.1f MiB); by size %s; copy-back calls %llu (merging %llu), leading barriers %llu, copies %llu (%.1f MiB), ranges per call 1:%llu 2:%llu 3-4:%llu 5-8:%llu 9+:%llu, after copy-back %llu / dispatch trail %llu / copy-in %llu / other %llu\n",
         u(shape.inCalls), u(shape.inPath[0]), u(shape.inPath[1]), u(shape.inPath[2]), u(shape.inReusedCalls), u(shape.inEmptyCalls), u(shape.inLeading), u(shape.inRegions[0]), u(shape.inRegions[1]), u(shape.inRegions[2]), u(shape.inRegions[3]), u(shape.inRegions[4]), u(shape.inAfter[0]), u(shape.inAfterBackDisjoint), u(shape.inAfter[1]), u(shape.inAfter[2]), u(shape.inAfter[3]), u(shape.batches), u(shape.maxCallsInBatch), u(shape.made), u(shape.residentSkipped), u(shape.madeSnapshot), u(shape.madeSourced), u(shape.madeImport), u(shape.madePending), u(shape.madeOpenWrite), u(shape.madeReused), u(shape.madeResident), u(shape.hoistable), shape.hoistableBytes / 1048576.0, sizes.c_str(),
         u(shape.outCalls), u(shape.outMerging), u(shape.outLeading), u(shape.outCopies), shape.outBytes / 1048576.0, u(shape.outRanges[0]), u(shape.outRanges[1]), u(shape.outRanges[2]), u(shape.outRanges[3]), u(shape.outRanges[4]), u(shape.outAfter[0]), u(shape.outAfter[1]), u(shape.outAfter[2]), u(shape.outAfter[3]));
+    reportForward();
     const auto trail = Recorder::CopyTrailCounts();
     std::fprintf(stderr, "[copy-trail] (cumulative, APS5_NO_COPY_TRAIL_MERGE %s) copy-back trailing barriers held %llu, taken by a copy-in %llu, settled by other work %llu\n", RuntimeSwitches::Set(RuntimeSwitch::NoCopyTrailMerge) ? "set" : "unset", u(trail[0]), u(trail[1]), u(trail[2]));
     const auto keepBatch = shape.lastBatch;
@@ -5283,6 +5286,154 @@ void reportShape(CopyShape& shape) {
 }
 
 thread_local bool copyingReusedBuild = false;
+
+bool copyForwardEnabled() {
+    return !RuntimeSwitches::Set(RuntimeSwitch::NoCopyForward) && !RuntimeSwitches::Set(RuntimeSwitch::NoOverlapRangeCheck);
+}
+
+bool verifyForward() {
+    static const bool on = std::getenv("APS5_VERIFY_COPY_FORWARD") != nullptr;
+    return on;
+}
+
+enum ForwardCounter : std::size_t { ForwardedRegions, ForwardedPieces, ForwardedBytes, ForwardSelfBytes, ForwardFallbacks, ForwardRefusedInexact, ForwardRefusedBuffer, ForwardRefusedLane, ForwardChecked, ForwardMismatched, ForwardRefusedResident, ForwardRefusedKind, ForwardRefusedUncovered, ForwardResidentRegions, ForwardCounters };
+
+bool forwardResident() {
+    return !RuntimeSwitches::Set(RuntimeSwitch::NoCopyForwardResident);
+}
+std::array<std::atomic<std::uint64_t>, ForwardCounters> forwardCounts{};
+
+void countForward(ForwardCounter which, std::uint64_t value) {
+    forwardCounts[which].fetch_add(value, std::memory_order_relaxed);
+}
+
+struct ForwardPiece {
+    std::uint64_t begin;
+    std::uint64_t end;
+    VkBuffer source;
+    VkDeviceSize offset;
+};
+
+struct ForwardCheck {
+    std::shared_ptr<Buffer> destination;
+    VkDeviceSize destinationOffset;
+    VkBuffer import;
+    VkDeviceSize importOffset;
+    VkDeviceSize bytes;
+    std::uint64_t address;
+};
+
+// The pieces of a copy-in region inside a held copy-back window (see the G-copy report, section 7): the parts
+// the copy-backs stored come from their device buffers, the rest from the import. Nullopt when the region
+// cannot be forwarded exactly: a stored part without an exact forward, a written part no copy-back stored,
+// a destination byte range a copy-back reads (other than an identical self piece), a resident region, or
+// a pending writer on the other lane.
+template <typename TRegion>
+std::optional<std::vector<ForwardPiece>> planForward(const TRegion& region, const Recorder::HeldTransfer& held, Recorder& recorder) {
+    if (region.resident && !forwardResident()) {
+        countForward(ForwardRefusedResident, 1);
+        return std::nullopt;
+    }
+    if (!region.deviceLocal || region.overlay || region.sparse) {
+        countForward(ForwardRefusedKind, 1);
+        return std::nullopt;
+    }
+    if (recorder.PendingWriteOtherLane(region.begin, static_cast<std::size_t>(region.end - region.begin))) {
+        countForward(ForwardRefusedLane, 1);
+        return std::nullopt;
+    }
+    std::vector<ForwardPiece> forwarded;
+    for (const auto& forward : held.forwards) {
+        const auto from = std::max(forward.begin, region.begin);
+        const auto to = std::min(forward.end, region.end);
+        if (from >= to) continue;
+        if (!forward.exact) {
+            countForward(ForwardRefusedInexact, 1);
+            return std::nullopt;
+        }
+        forwarded.push_back({from, to, forward.source, forward.offset + (from - forward.begin)});
+    }
+    std::sort(forwarded.begin(), forwarded.end(), [](const auto& left, const auto& right) { return left.begin < right.begin; });
+    for (std::size_t index = 1; index < forwarded.size(); ++index) {
+        if (forwarded[index].begin < forwarded[index - 1].end) return std::nullopt;
+    }
+    for (const auto& [begin, end] : held.writes) {
+        auto at = std::max(begin, region.begin);
+        const auto to = std::min(end, region.end);
+        for (const auto& piece : forwarded) {
+            if (piece.end <= at || piece.begin >= to) continue;
+            if (piece.begin > at) return std::nullopt;
+            at = std::max(at, piece.end);
+        }
+        if (at < to) {
+            countForward(ForwardRefusedUncovered, 1);
+            return std::nullopt;
+        }
+    }
+    const VkBuffer destination = region.buffer != nullptr ? region.buffer->Handle() : VK_NULL_HANDLE;
+    const auto self = [&](VkDeviceSize offset, VkDeviceSize bytes) {
+        return std::any_of(forwarded.begin(), forwarded.end(), [&](const ForwardPiece& piece) { return piece.source == destination && piece.offset == piece.begin - region.begin && piece.begin - region.begin <= offset && offset + bytes <= piece.end - region.begin; });
+    };
+    for (const auto& [buffer, offset, bytes] : held.reads) {
+        if (buffer == VK_NULL_HANDLE) continue;
+        if (buffer == destination && offset < region.end - region.begin && !self(offset, bytes)) {
+            countForward(ForwardRefusedBuffer, 1);
+            return std::nullopt;
+        }
+    }
+    for (const auto& piece : forwarded) {
+        if (piece.source == destination && piece.offset != piece.begin - region.begin) return std::nullopt;
+    }
+    std::vector<ForwardPiece> plan;
+    auto at = region.begin;
+    for (const auto& piece : forwarded) {
+        if (piece.begin > at) plan.push_back({at, piece.begin, VK_NULL_HANDLE, 0});
+        plan.push_back(piece);
+        at = piece.end;
+    }
+    if (at < region.end) plan.push_back({at, region.end, VK_NULL_HANDLE, 0});
+    return plan;
+}
+
+void recordForwardChecks(const Context& context, Recorder& recorder, VkCommandBuffer commands, const std::vector<ForwardCheck>& checks) {
+    for (const auto& check : checks) {
+        auto forwarded = std::make_shared<Buffer>(context, static_cast<std::size_t>(check.bytes), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        auto imported = std::make_shared<Buffer>(context, static_cast<std::size_t>(check.bytes), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        CopyBuffer(context, commands, check.destination->Handle(), check.destinationOffset, forwarded->Handle(), 0, check.bytes);
+        CopyBuffer(context, commands, check.import, check.importOffset, imported->Handle(), 0, check.bytes);
+        recorder.Keep(check.destination);
+        recorder.OnComplete([forwarded, imported, address = check.address] {
+            forwarded->Invalidate();
+            imported->Invalidate();
+            countForward(ForwardChecked, 1);
+            if (std::memcmp(forwarded->Bytes().data(), imported->Bytes().data(), forwarded->Bytes().size()) == 0) return;
+            countForward(ForwardMismatched, 1);
+            static std::atomic<int> reports{0};
+            if (reports.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[copy-forward] verify: forwarded bytes differ from the import at 0x%llx+0x%zx\n", static_cast<unsigned long long>(address), forwarded->Bytes().size());
+        });
+    }
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+}
+
+void reportForward() {
+    const auto u = [](ForwardCounter which) { return static_cast<unsigned long long>(forwardCounts[which].load(std::memory_order_relaxed)); };
+    std::fprintf(stderr, "[copy-forward] (cumulative, APS5_NO_COPY_FORWARD %s) regions forwarded %llu, pieces copied device-to-device %llu (%.1f MiB), self pieces skipped %.1f MiB; held windows that fell back %llu (refused: inexact piece %llu, shared buffer bytes %llu, other-lane writer %llu, resident %llu, not a device-local plain region %llu, written range not stored by a copy-back %llu); resident regions forwarded %llu (APS5_NO_COPY_FORWARD_RESIDENT %s); verify %llu checked, %llu mismatched\n", RuntimeSwitches::Set(RuntimeSwitch::NoCopyForward) ? "set" : "unset", u(ForwardedRegions), u(ForwardedPieces), u(ForwardedBytes) / 1048576.0, u(ForwardSelfBytes) / 1048576.0, u(ForwardFallbacks), u(ForwardRefusedInexact), u(ForwardRefusedBuffer), u(ForwardRefusedLane), u(ForwardRefusedResident), u(ForwardRefusedKind), u(ForwardRefusedUncovered), u(ForwardResidentRegions), RuntimeSwitches::Set(RuntimeSwitch::NoCopyForwardResident) ? "set" : "unset", u(ForwardChecked), u(ForwardMismatched));
+}
+
+struct ForwardReportAtExit {
+    ForwardReportAtExit() {
+        std::atexit([] {
+            if (!copyShapeProfiled()) return;
+            auto& shape = Shape();
+            {
+                std::lock_guard lock(shape.mutex);
+                shape.reported = std::chrono::steady_clock::time_point{};
+                reportShape(shape);
+            }
+            reportForward();
+        });
+    }
+} forwardReportAtExit;
 
 void reportStaging() {
     auto& stats = Copies();
@@ -6321,15 +6472,38 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
     }
     if (trailMerge) recorder->ArmTransferHold(false);
     std::optional<Recorder::HeldTransfer> heldTrail;
+    thread_local std::vector<std::vector<ForwardPiece>>* plansSlot = nullptr;
+    auto& forwardPlans = ShaderRecompiler::ThreadOwned(plansSlot);
+    forwardPlans.clear();
+    thread_local std::vector<ForwardCheck>* checksSlot = nullptr;
+    auto& forwardChecks = ShaderRecompiler::ThreadOwned(checksSlot);
+    forwardChecks.clear();
     if (trailMerge) {
         heldTrail = recorder->TakeHeldTransfer();
         if (heldTrail.has_value()) {
             const auto inHeld = [&](VkBuffer buffer) { return buffer != VK_NULL_HANDLE && std::find(heldTrail->buffers.begin(), heldTrail->buffers.end(), buffer) != heldTrail->buffers.end(); };
-            const bool conflict = heldTrail->commands != commands || std::any_of(copies.begin(), copies.end(), [&](const Region* region) {
-                if (std::any_of(heldTrail->writes.begin(), heldTrail->writes.end(), [&](const auto& range) { return region->begin < range.second && range.first < region->end; })) return true;
-                return (region->buffer != nullptr && inHeld(region->buffer->Handle())) || (region->pristine != nullptr && inHeld(region->pristine->Handle()));
-            });
+            bool conflict = heldTrail->commands != commands;
+            const bool forwarding = copyForwardEnabled();
+            forwardPlans.assign(copies.size(), {});
+            for (std::size_t index = 0; index < copies.size() && !conflict; ++index) {
+                const auto* region = copies[index];
+                const bool overlapsWrites = std::any_of(heldTrail->writes.begin(), heldTrail->writes.end(), [&](const auto& range) { return region->begin < range.second && range.first < region->end; });
+                const bool sharesBuffer = (region->buffer != nullptr && inHeld(region->buffer->Handle())) || (region->pristine != nullptr && inHeld(region->pristine->Handle()));
+                if (!overlapsWrites && !sharesBuffer) continue;
+                if (!forwarding) {
+                    conflict = true;
+                    break;
+                }
+                auto plan = planForward(*region, *heldTrail, *recorder);
+                if (!plan.has_value()) {
+                    conflict = true;
+                    break;
+                }
+                forwardPlans[index] = std::move(*plan);
+            }
             if (conflict) {
+                forwardPlans.clear();
+                countForward(ForwardFallbacks, 1);
                 RecordMemoryBarrier(context, heldTrail->commands, heldTrail->srcStage, heldTrail->dstStage, heldTrail->srcAccess, heldTrail->dstAccess);
                 Recorder::CountBarriers(Recorder::CommandClass::StagingOut);
                 covered = heldTrail->dstAccess;
@@ -6516,7 +6690,31 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
             ++shape.madeBySize[bucket];
             shape.madeBytesBySize[bucket] += bytes;
         }
-        CopyBuffer(context, commands, copySource, copyOffset, region->buffer->Handle(), 0, bytes);
+        const auto planIndex = static_cast<std::size_t>(std::find(copies.begin(), copies.end(), region) - copies.begin());
+        if (planIndex < forwardPlans.size() && !forwardPlans[planIndex].empty()) {
+            Require(inputSnapshot == nullptr && !sourced && copySource == region->copySource, "a forwarded copy-in does not read its import");
+            for (const auto& piece : forwardPlans[planIndex]) {
+                const auto at = piece.begin - region->begin;
+                const auto length = piece.end - piece.begin;
+                if (piece.source == VK_NULL_HANDLE) {
+                    CopyBuffer(context, commands, copySource, copyOffset + at, region->buffer->Handle(), at, length);
+                } else if (piece.source == region->buffer->Handle() && piece.offset == at) {
+                    countForward(ForwardSelfBytes, length);
+                } else {
+                    Require(piece.source != region->buffer->Handle(), "a forwarded copy-in overlaps its own buffer");
+                    CopyBuffer(context, commands, piece.source, piece.offset, region->buffer->Handle(), at, length);
+                    countForward(ForwardedBytes, length);
+                    countForward(ForwardedPieces, 1);
+                    if (verifyForward()) forwardChecks.push_back({region->buffer, at, copySource, copyOffset + at, length, region->begin + at});
+                }
+            }
+            countForward(ForwardedRegions, 1);
+            if (region->resident) countForward(ForwardResidentRegions, 1);
+        } else {
+            CopyBuffer(context, commands, copySource, copyOffset, region->buffer->Handle(), 0, bytes);
+        }
+        region->copyInSubmissions = recorder->Submissions();
+        region->copyInLane = Recorder::ThreadLane();
         if (region->resident) residentCopied(region->begin, region->end, region->buffer);
         if (!expected.empty()) {
             auto readback = std::make_shared<Buffer>(context, expected.size(), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
@@ -6580,7 +6778,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
                 recorder->Keep(region->pristine);
             }
         } else if (!diffed.empty()) {
-            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT | (heldTrail.has_value() ? heldTrail->srcStage : 0u), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
             Recorder::CountBarriers(Recorder::CommandClass::StagingIn);
             for (auto* region : diffed) {
                 CopyBuffer(context, commands, region->buffer->Handle(), 0, region->pristine->Handle(), 0, region->end - region->begin);
@@ -6612,8 +6810,11 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         }
         RecordMemoryBarrier(context, commands, srcStage, dstStage, srcAccess, dstAccess);
         Recorder::CountBarriers(Recorder::CommandClass::StagingIn);
+        if (!forwardChecks.empty()) recordForwardChecks(context, *recorder, commands, forwardChecks);
         recorder->MarkCovered(VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
     }
+    forwardPlans.clear();
+    forwardChecks.clear();
     recorder->EndGpuTiming(timing, copiedBytes);
 }
 
@@ -6649,6 +6850,8 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
     bool shapeLeading = false;
     VkAccessFlags coveredBefore = 0;
     std::vector<VkBuffer> readBuffers;
+    std::vector<Recorder::HeldTransfer::Forward> forwards;
+    std::vector<std::tuple<VkBuffer, VkDeviceSize, VkDeviceSize>> readRanges;
     if (!writes.empty()) {
         auto sorted = writes;
         std::sort(sorted.begin(), sorted.end());
@@ -6756,6 +6959,13 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
             ++shapeCopies;
             readBuffers.push_back(region.buffer->Handle());
             if (region.pristine != nullptr) readBuffers.push_back(region.pristine->Handle());
+            {
+                const bool diffedHere = whole == wholeEnd || (diff && region.diffUse);
+                const bool sameBatch = region.copyInSubmissions == recorder.Submissions() && region.copyInLane == Recorder::ThreadLane();
+                forwards.push_back({from, to, region.buffer->Handle(), from - region.begin, region.deviceLocal && (!region.resident || forwardResident()) && (!diffedHere || sameBatch)});
+                readRanges.emplace_back(region.buffer->Handle(), from - region.begin, to - from);
+                if (region.pristine != nullptr) readRanges.emplace_back(region.pristine->Handle(), from - region.begin, to - from);
+            }
             recorder.Keep(region.buffer);
             if (profile) {
                 Copies().gpuCopyBacks.fetch_add(1, std::memory_order_relaxed);
@@ -6796,6 +7006,8 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
         held.dstAccess = copiedAccess;
         held.writes = merged;
         held.buffers = std::move(readBuffers);
+        held.forwards = std::move(forwards);
+        held.reads = std::move(readRanges);
         if (recorder.HoldTransferBarrier(commands, std::move(held), coveredBefore)) {
             recorder.EndGpuTiming(timing, copiedBytes);
             return;

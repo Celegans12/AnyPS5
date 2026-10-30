@@ -233,6 +233,18 @@ public:
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
         std::vector<VkBuffer> buffers;
         VkCommandBuffer commands = VK_NULL_HANDLE;
+        // Copy forwarding (APS5_NO_COPY_FORWARD=1 off): each guest piece the copy-backs stored, with the
+        // device buffer and offset it was copied from, and whether its bytes equal what the import holds
+        // after the copy-back (see GuestBufferMemory::RecordCopyBacks); the byte ranges the copy-backs read.
+        struct Forward {
+            std::uint64_t begin;
+            std::uint64_t end;
+            VkBuffer source;
+            VkDeviceSize offset;
+            bool exact;
+        };
+        std::vector<Forward> forwards;
+        std::vector<std::tuple<VkBuffer, VkDeviceSize, VkDeviceSize>> reads;
     };
     void ArmTransferHold(bool armed);
     bool HoldTransferBarrier(VkCommandBuffer commands, HeldTransfer held, VkAccessFlags coveredBefore);

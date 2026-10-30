@@ -582,6 +582,10 @@ private:
         // resolveOverlays); the BDA table sends its guest addresses to this region's buffer instead
         // of the import (AddressRanges). APS5_NO_BDA_STAGING=1 serves it from the import as before.
         bool overlay = false;
+        // The recorder's submission count and lane when this region's copy-in was last recorded (copy
+        // forwarding: a diffed copy-back forwards only within the batch of its own copy-in).
+        std::uint64_t copyInSubmissions = ~std::uint64_t{0};
+        int copyInLane = -1;
     };
 
     // How [begin, end) lies against the space's base regions.

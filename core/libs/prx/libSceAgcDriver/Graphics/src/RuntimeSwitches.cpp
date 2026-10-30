@@ -90,6 +90,8 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_NO_LANE_OPEN_WAIT",
     "APS5_NO_RESIDENT_RANGES",
     "APS5_NO_COPY_TRAIL_MERGE",
+    "APS5_NO_COPY_FORWARD",
+    "APS5_NO_COPY_FORWARD_RESIDENT",
 };
 
 struct Refusal {
