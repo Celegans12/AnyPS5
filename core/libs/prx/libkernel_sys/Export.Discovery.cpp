@@ -1023,9 +1023,8 @@ int APS5_VABI sceKernelGetUniversalMode(void) {
     return 0;
 }
 
-int APS5_VABI sceKernelGetUpdVersion(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+int APS5_VABI sceKernelGetUpdVersion(std::uint32_t* version) {
+    return sysKernelGetUpdVersion_nid_postfix(version);
 }
 
 int APS5_VABI sceKernelGetUtokenDataExecutionForRcmgr(void) {
@@ -1331,11 +1330,6 @@ int APS5_VABI sceKernelIsNeoMode(void) {
     std::uint32_t attribute = 0;
     if (!GetAppParamSfoAttribute_nid_no_patch(&attribute)) NotImplemented_nid_no_patch(__func__);
     return (attribute & PARAM_SFO_ATTRIBUTE_SUPPORT_NEO_MODE) != 0 ? 1 : 0;
-}
-
-int APS5_VABI sceKernelIsPs4Process(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
 }
 
 int APS5_VABI sceKernelJitGetSharedMemoryInfo(void) {

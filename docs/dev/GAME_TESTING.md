@@ -112,7 +112,7 @@ Include, in this order:
 
 1. The build: the `main` commit, each PR applied on top with its head, and any local change. A result from an integration branch should stay distinguishable after one of its PRs merges.
 2. Title ID and content version, not only the game name.
-3. Host: CPU, OS (and kernel on Linux), the GPU as the `Selected GPU name=` line names it, the driver version, AC or battery, and the display refresh rate.
+3. Host: CPU, OS (and kernel on Linux), the GPU as the `Selected GPU name=` line names it, the driver version, AC or battery, and the display refresh rate. Start with `ANYPS5_HOST_REPORT=1` and paste the [host report](../user/USAGE.md#host-report) for the CPU, OS, GPU, driver and Vulkan items; AC or battery and the refresh rate are not in it.
 4. The exact command and every `APS5_*` / `ANYPS5_*` variable, the in-game settings if they differ from the defaults, and whether the caches were empty or warm.
 5. How far the title got (menu, a save, a scene) and what stopped it: the exit code and the last 200 log lines, plus the kernel line (Linux) or crash report (Windows) for a crash.
 6. Presents per 10 s, and the storage-image and budget lines (`[gpu] host import budget`, `[gpu] sampled texture cache budget`, `[texture-cache]`) if memory is involved.

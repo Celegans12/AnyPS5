@@ -28,6 +28,7 @@
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/ApplicationHeap.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
+#include "prx/libkernel/AppMetadata/include/AppMetadata.hpp"
 #include "prx/libc/include/FilesystemError.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
 #include "prx/libkernel/Pthread/include/Pthread.hpp"
@@ -426,11 +427,28 @@ int APS5_VABI sceKernelIsKratos(void) {
     return 0;
 }
 
+bool IsPs4Process() {
+    try {
+        const auto titleId = GetAppTitleId_nid_postfix();
+        const std::string_view id(titleId.value, strnlen(titleId.value, sizeof(titleId.value)));
+        return id.starts_with("CUSA");
+    } catch (const std::runtime_error&) {
+        return false;
+    } catch (const std::length_error&) {
+        return false;
+    }
+}
+
+int APS5_VABI sceKernelIsPs4Process(void) {
+    return IsPs4Process() ? 1 : 0;
+}
+
 int APS5_VABI get_authinfo_nid_postfix(int pid, KernelAuthInfo* info) {
     if (info == nullptr) return static_cast<int>(Fail(GuestEperm));
     if (pid != 0 && pid != getpid_nid_postfix()) return static_cast<int>(Fail(GuestEsrch));
-    *info = {};
-    info->capabilities[0] = 0x2000000000000000;
+    KernelAuthInfo local{};
+    local.capabilities[0] = 0x2000000000000000;
+    if (!GuestCopyOut_nid_no_patch(info, &local, sizeof(local))) return static_cast<int>(Fail(GuestEfault));
     return 0;
 }
 
