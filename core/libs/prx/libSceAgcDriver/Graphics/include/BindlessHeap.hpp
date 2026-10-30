@@ -40,8 +40,9 @@ public:
     void BindDescriptorHeaps(VkCommandBuffer commands) const;
     bool DescriptorHeapMappings(std::span<const std::uint32_t> spirv, std::vector<VkDescriptorSetAndBindingMappingEXT>& mappings,
                                 std::uint32_t workgroupAddressOffset = ~0u, bool rootGds = false, bool rootFault = false,
-                                bool pixelLds = false) const;
+                                bool pixelLds = false, bool meshWindow = false) const;
     void WritePixelLdsBuffer(VkDeviceAddress address, VkDeviceSize bytes);
+    void WriteMeshWindowBuffer(VkDeviceAddress address, VkDeviceSize bytes);
     VkDeviceAddress RingAddress() const;
     VkBuffer RingBuffer() const;
 
@@ -98,9 +99,11 @@ private:
     VkDeviceSize samplerHeapStride = 0;
     VkDeviceSize resourceHeapUsed = 0;
     VkDeviceSize pixelLdsHeapOffset = 0;
+    VkDeviceSize meshWindowHeapOffset = 0;
     VkDeviceSize samplerHeapUsed = 0;
     void writeImageSlot(std::uint32_t kind, std::uint32_t slot, VkImageView view, VkImageLayout layout);
     void writeSamplerSlot(std::uint32_t slot, VkSampler sampler);
+    void writeBufferDescriptor(VkDeviceSize offset, VkDeviceAddress address, VkDeviceSize bytes, const char* what);
     static constexpr std::size_t RingChunkBytes = 4u << 20u;
     struct Chunk {
         Recorder* recorder = nullptr;
@@ -172,7 +175,7 @@ bool GpuHeapEnabled();
 void SetDescriptorHeapDevice(bool available);
 bool DescriptorHeapEnabled();
 bool HeapComputeEnabled();
-bool DescriptorHeapMappable(std::span<const std::uint32_t> spirv, bool workgroupAddress, bool gdsAddress, bool pixelLds = false);
+bool DescriptorHeapMappable(std::span<const std::uint32_t> spirv, bool workgroupAddress, bool gdsAddress, bool pixelLds = false, bool meshWindow = false);
 void NoteHeapComputeStage();
 std::uint64_t HeapComputeStages();
 void NoteImageTableBuild();

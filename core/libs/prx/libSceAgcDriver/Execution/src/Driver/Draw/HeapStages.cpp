@@ -185,7 +185,7 @@ bool HeapStageMappable(const ShaderRecompiler::RecompileResult& result, bool wor
     if (const auto found = known.find(key); found != known.end()) return found->second;
     if (known.size() >= 65536u) known.clear();
     const bool mappable = Graphics::DescriptorHeapMappable(std::span<const std::uint32_t>(result.spirv.data(), result.spirv.size()),
-                                                           workgroupAddress, result.dataAddressPush, result.functionLdsBuffer);
+                                                           workgroupAddress, result.dataAddressPush, result.functionLdsBuffer, result.meshWindowBuffer);
     known.emplace(key, mappable);
     return mappable;
 }

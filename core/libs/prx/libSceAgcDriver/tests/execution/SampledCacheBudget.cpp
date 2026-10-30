@@ -596,6 +596,22 @@ bool heapViewTests(const Context& context) {
     return true;
 }
 
+void heapHeldReleaseTests(const Context& context) {
+    Block block(context);
+    auto& heap = BindlessHeap::For(context);
+    std::vector<std::weak_ptr<Texture>> held;
+    for (std::size_t surface = 0; surface < 2; ++surface) {
+        auto texture = Sampled(context, block.Surface(surface));
+        Require(heap.TextureSlot(ShaderRecompiler::RuntimeAbi::FirstImageBinding, texture, texture->View(), texture->Layout()).has_value(), "the cached sampled texture took no heap slot");
+        held.push_back(texture);
+    }
+    Require(TextureCacheUsage().sampledEntries == 2u, "the two sampled textures were not cached");
+    Require(!held[0].expired() && !held[1].expired(), "the cache and the heap slots did not keep the sampled textures");
+    const auto released = ReleaseTextureCaches(SurfaceBytes, true);
+    Require(held[0].expired() != held[1].expired(), "a memory recovery for one texture's bytes did not free exactly one of two textures that only the cache and the GPU heap held");
+    Require(released >= SurfaceBytes && TextureCacheUsage().sampledEntries == 1u, "a memory recovery did not count the texture it freed from the cache and the GPU heap, or went past its target");
+}
+
 ShaderRecompiler::RecompileResult SampledProgram(std::uint64_t address) {
     ShaderRecompiler::DescriptorBinding binding{};
     binding.kind = ShaderRecompiler::DescriptorKind::SampledImage;
@@ -1360,6 +1376,8 @@ int main(int argc, char** argv) {
                 const auto context = heapDevice->GraphicsContext();
                 {
                     std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+                    heapHeldReleaseTests(context);
+                    ClearCachedTextures(context.device);
                     tested = heapViewTests(context);
                     ClearCachedTextures(context.device);
                 }

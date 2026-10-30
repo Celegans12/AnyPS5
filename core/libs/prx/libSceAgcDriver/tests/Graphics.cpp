@@ -5062,6 +5062,18 @@ void TwoSampleDitheredAlphaToCoverageTests() {
     }
     expectFailure([&] { AgcDriver::Graphics::DecodeState(dithered); }, "DB_EQAA");
     Require(AgcDriver::Graphics::DrawRejection(dithered, false).find("DB_EQAA") != std::string::npos, "the precheck accepted DB_ALPHA_TO_MASK 0xe701 with eight samples");
+    auto singleSample = makeState();
+    singleSample.context[0x1b3] = 2;
+    singleSample.context[0x1b4] = 2;
+    singleSample.context[0x2dc] = 0xe701;
+    singleSample.context[0x2f8] = 0;
+    singleSample.context[0x292] = 2;
+    singleSample.context[0x203] &= ~0x800u;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(singleSample); }, "requires two matched raster/DB_EQAA samples");
+    Require(AgcDriver::Graphics::DrawRejection(singleSample, false).find("requires two matched raster/DB_EQAA samples") != std::string::npos, "the precheck accepted DB_ALPHA_TO_MASK 0xe701 on a single-sample target");
+    singleSample.context[0x2dc] = 0x18701;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(singleSample); }, "requires eight matched raster/DB_EQAA samples");
+    Require(AgcDriver::Graphics::DrawRejection(singleSample, false).find("requires eight matched raster/DB_EQAA samples") != std::string::npos, "the precheck accepted DB_ALPHA_TO_MASK 0x18701 on a single-sample target");
 }
 
 void AlphaToCoverageTests() {
