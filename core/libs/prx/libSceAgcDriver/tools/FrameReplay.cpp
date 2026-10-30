@@ -68,6 +68,7 @@ struct Options {
     bool exact = false;
     std::size_t frameLimit = 0;
     std::filesystem::path checkpointReport;
+    std::size_t checkpointSubmit = 0;
     std::chrono::milliseconds paceTimeout{10000};
     std::chrono::milliseconds memoryPaceTimeout{10000};
     std::chrono::milliseconds releaseAfter{50};
@@ -1172,6 +1173,8 @@ int usage() {
                          "                      and compares the display buffer with the title's image at that frame\n"
                          "  --checkpoint <csv>  replays up to the checkpoint of a capture made with APS5_FRAME_CAPTURE_CHECKPOINT=<frame> and lists\n"
                          "                      the 64 KiB blocks whose replayed bytes differ from the title's at that point; their replayed bytes go to <csv>.replay.bin\n"
+                         "  --checkpoint-at-submit <n>  with --checkpoint: ends the window after its n-th submission instead (the title's bytes are\n"
+                         "                      still the checkpoint's, so only replay-to-replay comparisons of the .replay.bin blocks mean anything)\n"
                          "  --timeout-s <n>     exits with code 4 when the replay has no result after n seconds (900; 0 waits forever)\n"
                          "  --dump              writes guest memory to a file after the replay (hexadecimal or decimal)\n"
                          "  --frames <dir>      writes each recorded and replayed display buffer as reference-<n>.bmp and replay-<n>.bmp\n"
@@ -1373,6 +1376,13 @@ int run(const Options& options, const FrameCaptureReader& reader, Clock::time_po
             const auto cut = std::find_if(window.begin(), window.end(), [](const FrameCall& call) { return call.kind == FrameCallKind::Checkpoint; });
             if (cut == window.end()) throw std::runtime_error("frame replay: --checkpoint needs a capture made with APS5_FRAME_CAPTURE_CHECKPOINT");
             window = window.first(static_cast<std::size_t>(cut - window.begin()));
+            if (options.checkpointSubmit != 0) {
+                std::size_t seen = 0;
+                const auto at = std::find_if(window.begin(), window.end(), [&](const FrameCall& call) { return call.kind == FrameCallKind::Submit && ++seen == options.checkpointSubmit; });
+                if (at == window.end()) throw std::runtime_error("frame replay: --checkpoint-at-submit " + std::to_string(options.checkpointSubmit) + " lies beyond the capture's checkpoint (" + std::to_string(seen) + " submissions)");
+                window = window.first(static_cast<std::size_t>(at - window.begin()) + 1);
+                std::fprintf(stderr, "[frame-replay] checkpoint after window submission %zu (%zu calls of the window)\n", options.checkpointSubmit, window.size());
+            }
         } else if (options.frameLimit != 0) {
             const bool cpuFlips = std::any_of(window.begin(), window.end(), [](const FrameCall& call) { return call.kind == FrameCallKind::Flip; });
             const auto boundary = cpuFlips ? FrameCallKind::Flip : FrameCallKind::Suspend;
@@ -1450,6 +1460,7 @@ int main(int argc, char** argv) {
         else if (argument == "--strict") options.strict = true;
         else if (argument == "--exact") options.exact = true;
         else if (argument == "--checkpoint" && index + 1 < argc) options.checkpointReport = argv[++index];
+        else if (argument == "--checkpoint-at-submit" && index + 1 < argc) options.checkpointSubmit = static_cast<std::size_t>(std::strtoull(argv[++index], nullptr, 10));
         else if (argument == "--frame-limit" && index + 1 < argc) options.frameLimit = static_cast<std::size_t>(std::strtoull(argv[++index], nullptr, 10));
         else if (argument == "--timeout-s" && index + 1 < argc) options.timeout = std::chrono::seconds(std::strtoll(argv[++index], nullptr, 10));
         else if (argument == "--dump" && index + 1 < argc) options.dumps.push_back(parseDump(argv[++index]));

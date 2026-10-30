@@ -357,6 +357,7 @@ public:
         std::uint64_t workgroups = 0;
     };
     static bool ExactSerialAllocating();
+    static bool ExactSerialProgram(std::uint64_t programAddress);
     static void NoteAllocatingProgram(std::uint64_t programAddress);
     static SerialAllocatingCount SerialAllocatingCounts();
     // The driver's recipe events for the [recipe] line: a restart after Rebuild, an attach; the
