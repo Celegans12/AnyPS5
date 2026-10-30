@@ -991,6 +991,14 @@ if(BUILD_TESTING)
     target_link_libraries(entry_stub_tests PRIVATE relinker_core)
     add_test(NAME entry_stub COMMAND entry_stub_tests)
 
+    add_test_executable(windows_entry_stub_bounds_tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/tests/WindowsEntryStubBoundsTests.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/tests/WindowsEntryStubAllocation.cpp
+    )
+    target_link_libraries(windows_entry_stub_bounds_tests PRIVATE relinker_core)
+    add_test(NAME windows_entry_stub_bounds COMMAND windows_entry_stub_bounds_tests)
+    set_tests_properties(windows_entry_stub_bounds PROPERTIES TIMEOUT 20)
+
     add_test_executable(control_flow_graph_tests
         ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/ControlFlowGraphTests.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/relinker/src/analysis/RelativeJumpTables.cpp
@@ -1032,10 +1040,11 @@ if(BUILD_TESTING)
     )
     add_test(NAME strict_nid_filter COMMAND strict_nid_filter_tests)
 
-    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+    if((CMAKE_SYSTEM_NAME STREQUAL "Linux" OR WIN32) AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
         add_test_executable(to_intel_linux_stubs_tests
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/ToIntelLinuxStubsTests.cpp
         )
+        target_include_directories(to_intel_linux_stubs_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../libs)
         add_test(NAME to_intel_linux_stubs COMMAND to_intel_linux_stubs_tests $<TARGET_FILE:relinker>)
 
         add_test_executable(rela_bounds_tests
@@ -1050,6 +1059,7 @@ if(BUILD_TESTING)
         add_test_executable(guest_intel_trampolines_tests
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/GuestIntelTrampolinesTests.cpp
         )
+        target_include_directories(guest_intel_trampolines_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../libs)
         add_test(NAME guest_intel_trampolines_execution COMMAND guest_intel_trampolines_tests $<TARGET_FILE:relinker>)
 
         add_test_executable(dynamic_table_bounds_tests
