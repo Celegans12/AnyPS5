@@ -26,6 +26,7 @@ void TranslationContext::TranslateInstruction(const RdnaInstruction& decoded) {
     }
     checkRoundingUse(instruction);
     f32DenormalFlush = f32DenormalFlushFor(instruction);
+    f32InputsFlushedByDevice = f32DenormalFlush == 0u && float32FlushToZero && (!floatMode.has_value() || ((floatMode->floatMode >> 4u) & 3u) == 0u) && flushesInHardware(instruction);
     bool translated = false;
     switch (instruction.family) {
         case RdnaInstructionFamily::SOP1:

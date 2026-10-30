@@ -388,6 +388,10 @@ private:
     IrU1 instructionBranchCondition;
     RdnaOpcode currentOpcode = RdnaOpcode::Unknown;
     std::uint32_t f32DenormalFlush = 0u;
+    // The current instruction's software flush was dropped because the device flushes its f32 inputs and result
+    // (SpirvTarget::float32FlushToZero): its operands reach the IR unflushed, so value tests that the software flush
+    // saw on flushed operands (the 0 x inf test of an fma) must count a denormal as the zero it becomes.
+    bool f32InputsFlushedByDevice = false;
     bool float32FlushToZero = false;
     bool float32FlushDeclared = false;
     bool float32DenormPreserve = false;

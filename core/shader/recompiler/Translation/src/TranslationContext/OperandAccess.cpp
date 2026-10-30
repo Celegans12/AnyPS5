@@ -358,7 +358,10 @@ IrValue* TranslationContext::nanResultF32(std::initializer_list<IrValue*> source
 IrValue& TranslationContext::invalidProductF32(IrValue* lhs, IrValue* rhs) {
     IrValue& lhsMagnitude = ir.BitwiseAnd(ir.BitCastU32(*lhs), ir.Constant(0x7fffffffu));
     IrValue& rhsMagnitude = ir.BitwiseAnd(ir.BitCastU32(*rhs), ir.Constant(0x7fffffffu));
-    const auto infZero = [&](IrValue& inf, IrValue& zero) -> IrValue& { return ir.LogicalAnd(ir.IEqual(inf, ir.Constant(0x7f800000u)), ir.IEqual(zero, ir.Constant(0u))); };
+    // Under the device's flush a denormal factor is the zero the software flush would have made of it: 0 x inf stays
+    // invalid (the default NaN, not a NaN addend), as with the emulated flush (agc_driver_f32_flush_hardware_exact).
+    const auto isZero = [&](IrValue& magnitude) -> IrValue& { return f32InputsFlushedByDevice ? ir.IEqual(ir.BitwiseAnd(magnitude, ir.Constant(0x7f800000u)), ir.Constant(0u)) : ir.IEqual(magnitude, ir.Constant(0u)); };
+    const auto infZero = [&](IrValue& inf, IrValue& zero) -> IrValue& { return ir.LogicalAnd(ir.IEqual(inf, ir.Constant(0x7f800000u)), isZero(zero)); };
     return ir.LogicalOr(infZero(lhsMagnitude, rhsMagnitude), infZero(rhsMagnitude, lhsMagnitude));
 }
 
