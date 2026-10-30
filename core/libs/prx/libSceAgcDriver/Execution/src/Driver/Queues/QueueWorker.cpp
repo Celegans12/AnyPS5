@@ -19,6 +19,11 @@ namespace {
 
 constexpr auto IdleResultsQuietPeriod = std::chrono::milliseconds(50);
 
+bool IdleStores() {
+    static const bool enabled = std::getenv("APS5_EXACT_SERIAL_ALLOCATING") == nullptr || std::getenv("APS5_EXACT_IDLE_STORE") != nullptr;
+    return enabled;
+}
+
 }
 
 FrameTiming* Driver::frameTiming() {
@@ -183,7 +188,7 @@ void Driver::run(std::uint32_t id) noexcept {
                         && std::all_of(workers.begin(), workers.end(), [](const auto& item) { return item.second.pending.empty(); });
                 };
                 const auto idleResultsPending = [&] {
-                    return id == 0 && Graphics::StorageTexture::AnyPending() && allQueuesIdle() && !completionsPending();
+                    return id == 0 && IdleStores() && Graphics::StorageTexture::AnyPending() && allQueuesIdle() && !completionsPending();
                 };
                 const auto poll = [&](const auto& done) {
 #ifdef _WIN32
@@ -221,7 +226,7 @@ void Driver::run(std::uint32_t id) noexcept {
                         lock.lock();
                         if (ready()) break;
                         if (id == 0 && allQueuesIdle() && !completionsPending()
-                            && ((!storeIdleResults && Graphics::StorageTexture::AnyPending()) || idleEpoch.load(std::memory_order_acquire) != idleEpochAtCheck)) continue;
+                            && ((!storeIdleResults && IdleStores() && Graphics::StorageTexture::AnyPending()) || idleEpoch.load(std::memory_order_acquire) != idleEpochAtCheck)) continue;
                         if (id == 0) queue0Dormant.store(true, std::memory_order_relaxed);
                         const auto idleEpochAtWait = idleEpoch.load(std::memory_order_acquire);
                         changed.wait(lock, [&] { return ready() || (id == 0 && (idleEpoch.load(std::memory_order_acquire) != idleEpochAtWait || completionsPending())); });
