@@ -2885,6 +2885,34 @@ void Recorder::NoteAccess(CommandClass which, const Access& access) {
 void Recorder::CountPresent() {
     timingPresents.fetch_add(1, std::memory_order_relaxed);
     presentSerial.fetch_add(1, std::memory_order_relaxed);
+    // Diagnostic: APS5_WATCH_BYTES=<hex address>+<hex bytes> hashes that guest range at every present and prints
+    // [watch-bytes] when its bytes changed, with whether any write stamp (CPU collect or driver MarkWritten) moved
+    // over it since the previous check: a change without a stamp is a writer the tracking does not see.
+    static const std::pair<std::uint64_t, std::uint64_t> watched = [] {
+        const char* text = std::getenv("APS5_WATCH_BYTES");
+        if (text == nullptr) return std::pair<std::uint64_t, std::uint64_t>{0, 0};
+        char* end = nullptr;
+        const auto address = std::strtoull(text, &end, 16);
+        const auto bytes = end != nullptr && *end == '+' ? std::strtoull(end + 1, nullptr, 16) : 0ull;
+        return std::pair<std::uint64_t, std::uint64_t>{address, bytes};
+    }();
+    if (watched.second == 0) return;
+    static std::vector<std::byte> previous;
+    static std::uint64_t generation = 0;
+    static std::uint64_t changes = 0, unstamped = 0;
+    std::vector<std::byte> current(static_cast<std::size_t>(watched.second));
+    std::memcpy(current.data(), reinterpret_cast<const void*>(watched.first), current.size());
+    GuestMemory::CollectWrites(watched.first, static_cast<std::size_t>(watched.second));
+    const bool stamped = generation != 0 && !GuestMemory::UnchangedSince(watched.first, static_cast<std::size_t>(watched.second), generation);
+    if (!previous.empty() && previous != current) {
+        ++changes;
+        if (!stamped) ++unstamped;
+        std::size_t first = 0;
+        while (first < current.size() && current[first] == previous[first]) ++first;
+        if (changes <= 40 || changes % 100 == 0) std::fprintf(stderr, "[watch-bytes] present %llu: 0x%llx+0x%llx changed from +0x%zx, stamped %d (changes %llu, unstamped %llu)\n", static_cast<unsigned long long>(presentSerial.load(std::memory_order_relaxed)), static_cast<unsigned long long>(watched.first), static_cast<unsigned long long>(watched.second), first, stamped ? 1 : 0, static_cast<unsigned long long>(changes), static_cast<unsigned long long>(unstamped));
+    }
+    previous = std::move(current);
+    generation = GuestMemory::TrackerGeneration();
 }
 
 std::uint64_t Recorder::Presents() {
@@ -3928,6 +3956,25 @@ std::shared_ptr<Buffer> Recorder::containingDrawSnapshot(std::uint64_t address, 
     return {};
 }
 
+bool Recorder::DrawSnapshotGpuWrittenOnly(std::uint64_t address, std::size_t bytes) const {
+    const auto found = drawSnapshots.find({address, SnapshotUse::Storage, bytes});
+    if (found == drawSnapshots.end() || found->second.registryGeneration != GuestAllocations::GuestAllocationsGeneration_nid_postfix()) return false;
+    const auto generation = found->second.generation;
+    if (generation == 0 || GuestMemory::UnchangedSince(address, bytes, generation)) return false;
+    const auto count = static_cast<std::size_t>((address + bytes - 1) / GuestMemory::HashBlockBytes - address / GuestMemory::HashBlockBytes + 1);
+    struct Scratch {
+        std::vector<std::uint64_t> generations;
+        std::vector<std::uint8_t> changed;
+        std::vector<std::uint8_t> cpu;
+    };
+    auto& scratch = HostThreadLocal<Scratch, Scratch>();
+    scratch.generations.assign(count, generation);
+    scratch.changed.assign(count, GuestMemory::BlockWritten);
+    scratch.cpu.assign(count, 1);
+    if (!GuestMemory::ChangedBlocks(address, bytes, scratch.generations, scratch.changed, scratch.cpu)) return false;
+    return std::none_of(scratch.cpu.begin(), scratch.cpu.end(), [](std::uint8_t cpu) { return cpu != 0; });
+}
+
 bool Recorder::refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, std::size_t bytes) {
     const auto held = entry.buffer->Bytes();
     if (held.size() != bytes || bytes == 0) return false;
@@ -3962,7 +4009,54 @@ bool Recorder::refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, s
         spans.push_back({held.data() + offset, reinterpret_cast<const void*>(from), static_cast<std::size_t>(to - from)});
     }
     equal.assign(spans.size(), 0);
+    static const bool profileRefresh = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    const auto compareStart = profileRefresh ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     CompareSpans(spans, equal);
+    if (profileRefresh) {
+        // Diagnostic (APS5_PROFILE_DRAW): draw snapshots refreshed by comparing their stamped blocks, by buffer: calls,
+        // bytes compared, bytes found different, compare time; [draw-snapshot-refresh] every 10 s, top 6 by time.
+        struct Refreshes { std::uint64_t calls = 0, compared = 0, different = 0, cpuBlocks = 0, cpuDifferent = 0, driverBlocks = 0, driverDifferent = 0; double ms = 0; };
+        static std::mutex refreshMutex;
+        static std::map<std::pair<std::uint64_t, std::size_t>, Refreshes> refreshes;
+        static auto refreshReport = std::chrono::steady_clock::now();
+        // Which stamps moved the compared blocks: a collect (CPU store) or only the driver's MarkWritten (GPU writes).
+        std::vector<std::uint8_t> cpu(count, 1), unused(count, 0);
+        GuestMemory::ChangedBlocks(address, bytes, generations, unused, cpu);
+        std::uint64_t compared = 0, different = 0, cpuBlocks = 0, cpuDifferent = 0, driverBlocks = 0, driverDifferent = 0;
+        for (std::size_t k = 0, s = 0; k < count && s < spans.size(); ++k) {
+            if (changed[k] == GuestMemory::BlockUnchanged) continue;
+            compared += spans[s].bytes;
+            if (equal[s] == 0) different += spans[s].bytes;
+            (cpu[k] != 0 ? cpuBlocks : driverBlocks) += 1;
+            if (equal[s] == 0) (cpu[k] != 0 ? cpuDifferent : driverDifferent) += 1;
+            ++s;
+        }
+        std::lock_guard refreshLock(refreshMutex);
+        auto& entryStats = refreshes[{address, bytes}];
+        ++entryStats.calls;
+        entryStats.compared += compared;
+        entryStats.different += different;
+        entryStats.cpuBlocks += cpuBlocks;
+        entryStats.cpuDifferent += cpuDifferent;
+        entryStats.driverBlocks += driverBlocks;
+        entryStats.driverDifferent += driverDifferent;
+        entryStats.ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - compareStart).count();
+        if (std::chrono::steady_clock::now() - refreshReport >= std::chrono::seconds(10)) {
+            refreshReport = std::chrono::steady_clock::now();
+            std::vector<std::pair<double, std::pair<std::uint64_t, std::size_t>>> order;
+            for (const auto& [key, stats] : refreshes) order.emplace_back(stats.ms, key);
+            std::sort(order.begin(), order.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+            std::string line;
+            for (std::size_t i = 0; i < order.size() && i < 6; ++i) {
+                const auto& stats = refreshes[order[i].second];
+                char item[320];
+                std::snprintf(item, sizeof(item), "\n  0x%llx+%zu: %llu calls, compared %.1f MiB, different %.1f MiB, %.0f ms; blocks cpu %llu (different %llu), driver-only %llu (different %llu)", static_cast<unsigned long long>(order[i].second.first), order[i].second.second, static_cast<unsigned long long>(stats.calls), stats.compared / 1048576.0, stats.different / 1048576.0, stats.ms, static_cast<unsigned long long>(stats.cpuBlocks), static_cast<unsigned long long>(stats.cpuDifferent), static_cast<unsigned long long>(stats.driverBlocks), static_cast<unsigned long long>(stats.driverDifferent));
+                line += item;
+            }
+            AgcDriver::ProfilePrint_nid_no_patch("[draw-snapshot-refresh] (10 s) %zu buffers:%s\n", refreshes.size(), line.c_str());
+            refreshes.clear();
+        }
+    }
     for (std::size_t k = 0; k < spans.size(); ++k) {
         if (equal[k] != 0) continue;
         const auto offset = static_cast<std::size_t>(static_cast<const std::byte*>(spans[k].first) - held.data());
@@ -4111,6 +4205,33 @@ void Recorder::RefuseOwnedDrawSnapshot(std::uint64_t address, std::size_t bytes,
     dropOwnedSnapshotBuffer(entry);
     entry.backoff = static_cast<std::uint8_t>(std::min<unsigned>(entry.backoff + 1u, 6u));
     entry.skip = static_cast<std::uint16_t>((1u << entry.backoff) - 1u);
+}
+
+std::optional<std::optional<std::uint32_t>> Recorder::GpuWrittenHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use) const {
+    const auto found = indexRanges.find({address, use, bytes});
+    if (found == indexRanges.end() || found->second.registryGeneration != GuestAllocations::GuestAllocationsGeneration_nid_postfix()) return std::nullopt;
+    const auto generation = found->second.generation;
+    if (generation == 0 || GuestMemory::UnchangedSince(address, bytes, generation)) return std::nullopt;
+    const auto count = static_cast<std::size_t>((address + bytes - 1) / GuestMemory::HashBlockBytes - address / GuestMemory::HashBlockBytes + 1);
+    struct Scratch {
+        std::vector<std::uint64_t> generations;
+        std::vector<std::uint8_t> changed;
+        std::vector<std::uint8_t> cpu;
+    };
+    auto& scratch = HostThreadLocal<Scratch, Scratch>();
+    scratch.generations.assign(count, generation);
+    scratch.changed.assign(count, GuestMemory::BlockWritten);
+    scratch.cpu.assign(count, 1);
+    if (!GuestMemory::ChangedBlocks(address, bytes, scratch.generations, scratch.changed, scratch.cpu)) return std::nullopt;
+    for (std::size_t k = 0; k < count; ++k) {
+        if (scratch.changed[k] != GuestMemory::BlockUnchanged && scratch.cpu[k] != 0) return std::nullopt;
+    }
+    return found->second.highest;
+}
+
+std::uint64_t Recorder::KeptHighestIndexGeneration(std::uint64_t address, std::size_t bytes, SnapshotUse use) const {
+    const auto found = indexRanges.find({address, use, bytes});
+    return found != indexRanges.end() ? found->second.generation : 0;
 }
 
 bool Recorder::KnownHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::optional<std::uint32_t>& highest) {
@@ -4793,7 +4914,7 @@ void Recorder::AfterCompletions(std::uint64_t address, std::span<const std::byte
     // poller that sees the bump then finds the label without the GPU mutex.
     noteLabelOn(batch, address, bytes, stamp, queue, behindCompletion);
     noteWriteOn(batch, address, bytes.size(), true);
-    if (&batch == open.get() && activeRecorder == this && pendingLabelSince.load(std::memory_order_relaxed) == NoPendingLabel) {
+    if (activeRecorder == this && std::ranges::any_of(lanes, [&batch](const auto& lane) { return lane.get() == &batch; }) && pendingLabelSince.load(std::memory_order_relaxed) == NoPendingLabel) {
         pendingLabelSince.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_release);
     }
 }

@@ -632,8 +632,12 @@ void Driver::execute(const Submission& submission) {
             } clearOrder{ringOverlap};
             if (ringOverlap) ringOrder.afterDispatch = true;
             timed(&WorkerProfile::dispatchMs, [&] {
+                struct NewPathCommand {
+                    bool active;
+                    ~NewPathCommand() { if (active) NewPath::EndCommand(); }
+                } newPathCommand{NewPath::Enabled()};
                 try {
-                    if (NewPath::Enabled()) static_cast<void>(NewPath::RouteCommand(opcode == 0x15 ? NewPath::CommandKind::Dispatch : NewPath::CommandKind::DispatchIndirect, device.Load().get()));
+                    if (newPathCommand.active) NewPath::BeginCommand(opcode == 0x15 ? NewPath::CommandKind::Dispatch : NewPath::CommandKind::DispatchIndirect, device.Load().get());
                     if (opcode == 0x15) dispatch(queue, packet, submission);
                     else dispatchIndirect(queue, packet, submission);
                 } catch (const ShaderRefusal& refusal) {

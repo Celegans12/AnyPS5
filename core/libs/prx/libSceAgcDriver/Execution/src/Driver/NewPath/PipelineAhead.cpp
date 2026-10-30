@@ -82,7 +82,7 @@ void PipelineAhead::run() {
     for (;;) {
         work.wait(lock, [&] { return stopping || !queue.empty(); });
         if (queue.empty()) return;
-        auto [key, factory] = std::move(queue.front());
+        auto [key, factory, forgetOnFailure] = std::move(queue.front());
         queue.pop_front();
         ++running;
         lock.unlock();
@@ -96,18 +96,26 @@ void PipelineAhead::run() {
             failed = true;
         }
         lock.lock();
-        auto& entry = entries[key];
-        entry.handle = std::move(handle);
-        entry.done = true;
-        entry.failed = failed;
-        entry.onWorker = true;
         ++(failed ? counts.failed : counts.created);
         --running;
+        if (failed && forgetOnFailure) {
+            entries.erase(key);
+        } else {
+            auto& entry = entries[key];
+            entry.handle = std::move(handle);
+            entry.done = true;
+            entry.failed = failed;
+            entry.onWorker = true;
+        }
         finished.notify_all();
     }
 }
 
 PipelineAhead::Lookup PipelineAhead::Request(PipelineKey key, PipelineFactory factory) {
+    return Request(key, std::move(factory), Options{});
+}
+
+PipelineAhead::Lookup PipelineAhead::Request(PipelineKey key, PipelineFactory factory, Options options) {
     std::unique_lock lock(mutex);
     if (const auto found = entries.find(key); found != entries.end()) return found->second.done ? (found->second.failed ? Lookup::Unknown : Lookup::Ready) : Lookup::Pending;
     ++counts.requested;
@@ -136,11 +144,19 @@ PipelineAhead::Lookup PipelineAhead::Request(PipelineKey key, PipelineFactory fa
     }
     entries[key];
     startLocked();
-    queue.emplace_back(key, std::move(factory));
+    if (options.urgent) queue.push_front({key, std::move(factory), options.forgetOnFailure});
+    else queue.push_back({key, std::move(factory), options.forgetOnFailure});
     lock.unlock();
     work.notify_one();
     if (manifest != nullptr) static_cast<void>(manifest->Record(key));
     return Lookup::Pending;
+}
+
+std::optional<PipelineAhead::Lookup> PipelineAhead::Find(PipelineKey key) const {
+    std::lock_guard lock(mutex);
+    const auto found = entries.find(key);
+    if (found == entries.end()) return std::nullopt;
+    return found->second.done ? (found->second.failed ? Lookup::Unknown : Lookup::Ready) : Lookup::Pending;
 }
 
 PipelineHandle PipelineAhead::Ready(PipelineKey key) const {
@@ -181,6 +197,15 @@ std::size_t PipelineAhead::Prewarm(const std::function<PipelineFactory(PipelineK
 void PipelineAhead::WaitIdle() {
     std::unique_lock lock(mutex);
     finished.wait(lock, [&] { return queue.empty() && running == 0; });
+}
+
+void PipelineAhead::Reset() {
+    std::unique_lock lock(mutex);
+    for (const auto& queued : queue) entries.erase(queued.key);
+    queue.clear();
+    finished.wait(lock, [&] { return running == 0; });
+    entries.clear();
+    finished.notify_all();
 }
 
 PipelineAhead::Counts PipelineAhead::Totals() const {

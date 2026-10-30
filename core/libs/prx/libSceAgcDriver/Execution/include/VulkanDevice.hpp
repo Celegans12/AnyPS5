@@ -357,6 +357,7 @@ public:
         std::uint64_t workgroups = 0;
     };
     static bool ExactSerialAllocating();
+    static bool ExactSerialProgram(std::uint64_t programAddress);
     static void NoteAllocatingProgram(std::uint64_t programAddress);
     static SerialAllocatingCount SerialAllocatingCounts();
     // The driver's recipe events for the [recipe] line: a restart after Rebuild, an attach; the
@@ -425,6 +426,9 @@ private:
     // The stage-A pre-sync over `surfaces` (see PrepareDispatch): the serial waited for, 0 none.
     std::uint64_t presync(std::span<const Graphics::PresyncSurface> surfaces);
     std::shared_ptr<ComputePipelineObjects> computePipeline(const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, VkDescriptorSetLayout setLayout, std::span<const std::uint32_t> layoutKey, VkShaderStageFlags pushStages, std::uint64_t programAddress);
+    // A resolved twin's pipeline for an emitted dispatch of `program` (new path, pipeline gate on): ready, or null while
+    // a creation worker builds it (the dispatch then takes today's path). Never created on the calling thread.
+    std::shared_ptr<ComputePipelineObjects> twinPipeline(const Graphics::Context& context, const ShaderRecompiler::RecompileResult& program, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& twin, VkDescriptorSetLayout bound, VkShaderStageFlags pushStages, std::uint64_t programAddress);
     // A DISPATCH_INDIRECT's argument path (see DispatchIndirect): GPU-side from the host import, or
     // the counts read on the CPU (the record then continues as a direct dispatch).
     void decideIndirect(RecordedDispatch& record, IndirectOutcome& outcome, char* groupsText);

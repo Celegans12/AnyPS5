@@ -11,6 +11,7 @@ struct ResidencyConfig {
     std::uint64_t residentBytes = 0;
     std::uint32_t chunkPages = 0;
     bool slotBinding = false;
+    bool eagerCopyIn = false;
 };
 
 using ResidencyEnvironment = const char* (*)(const char* name);

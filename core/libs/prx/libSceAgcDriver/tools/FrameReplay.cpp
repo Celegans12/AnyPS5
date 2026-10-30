@@ -33,6 +33,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -67,6 +68,7 @@ struct Options {
     bool exact = false;
     std::size_t frameLimit = 0;
     std::filesystem::path checkpointReport;
+    std::size_t checkpointSubmit = 0;
     std::chrono::milliseconds paceTimeout{10000};
     std::chrono::milliseconds memoryPaceTimeout{10000};
     std::chrono::milliseconds releaseAfter{50};
@@ -199,6 +201,14 @@ private:
 #endif
     std::_Exit(code);
 }
+
+#ifdef _WIN32
+LONG CALLBACK shutdownFault(EXCEPTION_POINTERS* info) {
+    if (info->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) return EXCEPTION_CONTINUE_SEARCH;
+    std::fprintf(stderr, "[frame-replay] access violation at %p in the driver shutdown, after the result was written: exit 0\n", info->ExceptionRecord->ExceptionAddress);
+    hardExit(0);
+}
+#endif
 
 void startWatchdog(std::chrono::seconds timeout) {
     std::thread([timeout] {
@@ -523,8 +533,16 @@ struct Replay {
     std::atomic<std::uint64_t> syntheticReleases{0};
     std::atomic<std::size_t> sequenced{0};
     std::atomic<int> busy{0};
+    struct LabelWrite {
+        std::uint64_t address = 0;
+        std::uint64_t value = 0;
+        bool known = false;
+    };
+    std::vector<LabelWrite> labelWrites;
+    std::map<std::uint64_t, std::uint64_t> waitOrdinals;
     std::atomic<std::uint64_t> parkedReleases{0};
     std::atomic<std::uint64_t> fallbackReleases{0};
+    std::atomic<std::uint64_t> stuckSubmits{0};
     std::atomic<bool> parkedWithoutRelease{false};
     std::uint64_t unfinished = 0;
     std::size_t threads = 0;
@@ -610,7 +628,7 @@ struct Replay {
                 deadline = now + timeout;
             }
             if (memory && deltaReleasesWait(call)) return waited();
-            if (now - quietSince >= (options.exact ? ExactQuiet : BlockedQuiet) && blockedOnWaits()) return waited();
+            if (!options.exact && now - quietSince >= BlockedQuiet && blockedOnWaits()) return waited();
             if (now >= deadline) {
                 waited();
                 if (memory) {
@@ -634,6 +652,7 @@ struct Replay {
 
     static constexpr auto ExactQuiet = std::chrono::milliseconds(50);
     static constexpr auto ParkedQuiet = std::chrono::milliseconds(5);
+    static constexpr auto StuckSubmit = std::chrono::milliseconds(100);
     static constexpr auto BlockedQuiet = std::chrono::milliseconds(5);
 
     bool deltaReleasesWait(const FrameCall& call) {
@@ -699,6 +718,7 @@ struct Replay {
             return;
         case FrameCallKind::Submit: {
             const Packet packet{reinterpret_cast<std::uint32_t*>(static_cast<std::uintptr_t>(call.address)), static_cast<std::uint32_t>(call.size), static_cast<std::uint8_t>(call.flags), {}};
+            if (recording && options.exact) noteLabelWrites(call.address, call.size, 0, call.ordinal);
             if (call.queue == 0) sceAgcDriverSubmitDcb(&packet);
             else sceAgcDriverSubmitAcb(call.queue, &packet);
             if (++submits % 25 == 0) report();
@@ -822,6 +842,69 @@ struct Replay {
         }
     }
 
+    void noteLabelWrites(std::uint64_t address, std::uint64_t dwords, int depth, std::uint64_t ordinal) {
+        if (address < 0x1000 || address >> 48 != 0 || dwords == 0 || dwords > 0xfffff || depth > 8) return;
+        const auto* const words = reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(address));
+        const auto at48 = [](std::uint32_t low, std::uint32_t high) { return low | static_cast<std::uint64_t>(high & 0xffff) << 32; };
+        std::vector<LabelWrite> found;
+        std::vector<std::uint64_t> waits;
+        for (std::uint64_t at = 0; at < dwords;) {
+            const auto header = words[at];
+            if (header >> 30 != 3) {
+                ++at;
+                continue;
+            }
+            const std::uint64_t length = ((header >> 16) & 0x3fff) + 1;
+            if (at + 1 + length > dwords) break;
+            const auto* const body = words + at + 1;
+            switch ((header >> 8) & 0xff) {
+            case 0x49:
+                if (length >= 6) {
+                    const auto select = (body[1] >> 29) & 7;
+                    if (select == 1) found.push_back({at48(body[2], body[3]), body[4], true});
+                    else if (select == 2) found.push_back({at48(body[2], body[3]), body[4] | static_cast<std::uint64_t>(body[5]) << 32, true});
+                    else if (select != 0) found.push_back({at48(body[2], body[3]), 0, false});
+                }
+                break;
+            case 0x47:
+                if (length >= 4) {
+                    const auto select = (body[2] >> 29) & 7;
+                    if (select == 1 || select == 2) found.push_back({at48(body[1], body[2]), body[3], true});
+                    else if (select != 0) found.push_back({at48(body[1], body[2]), 0, false});
+                }
+                break;
+            case 0x37:
+                if (length >= 4) found.push_back({at48(body[1], body[2]), body[3], true});
+                break;
+            case 0x40:
+            case 0x50:
+                if (length >= 5) found.push_back({at48(body[3], body[4]), 0, false});
+                break;
+            case 0x1e:
+                if (length >= 3) found.push_back({at48(body[1], body[2]), 0, false});
+                break;
+            case 0x33:
+            case 0x3f:
+                if (length >= 3) noteLabelWrites(at48(body[0] & ~3u, body[1]), body[2] & 0xfffff, depth + 1, ordinal);
+                break;
+            case 0x3c:
+                if (length >= 5 && (body[0] >> 4) & 1) waits.push_back(at48(body[1] & ~3u, body[2]));
+                break;
+            default:
+                break;
+            }
+            at += 1 + length;
+        }
+        if (found.empty() && waits.empty()) return;
+        std::lock_guard lock(memoryMutex);
+        labelWrites.insert(labelWrites.end(), found.begin(), found.end());
+        for (const auto wait : waits) waitOrdinals.emplace(wait, ordinal);
+    }
+
+    bool writerInWindow(const AgcDriver::AwaitedWait& wait) const {
+        return std::any_of(labelWrites.begin(), labelWrites.end(), [&](const LabelWrite& write) { return write.address == wait.address && (!write.known || wait.function == 0 || satisfies(wait, write.value)); });
+    }
+
     bool writeRecordedValue(const FrameCall& call, const AgcDriver::AwaitedWait& wait) {
         if (call.kind != FrameCallKind::Memory) return false;
         const auto found = groups.find(call.values.at(0));
@@ -860,10 +943,11 @@ struct Replay {
         std::array<AgcDriver::AwaitedWait, 64> awaited{};
         const auto count = AgcDriverAwaitedWaits_nid_postfix(awaited.data(), awaited.size());
         if (options.exact) {
-            std::array<std::pair<std::size_t, std::uint64_t>, 64> keys{};
+            std::array<std::tuple<std::size_t, std::uint64_t, std::uint64_t>, 64> keys{};
             std::array<std::size_t, 64> order{};
             for (std::size_t slot = 0; slot < count; ++slot) {
-                keys[slot] = {awaited[slot].address == 0 ? calls.size() + 1 : recordedIndex(calls, from, awaited[slot]), awaited[slot].address};
+                const auto waiting = waitOrdinals.find(awaited[slot].address);
+                keys[slot] = {awaited[slot].address == 0 ? calls.size() + 1 : recordedIndex(calls, from, awaited[slot]), waiting == waitOrdinals.end() ? ~std::uint64_t{0} : waiting->second, awaited[slot].address};
                 order[slot] = slot;
             }
             std::sort(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(count), [&](std::size_t left, std::size_t right) { return keys[left] < keys[right]; });
@@ -871,18 +955,20 @@ struct Replay {
             for (std::size_t slot = 0; slot < count; ++slot) sorted[slot] = awaited[order[slot]];
             awaited = sorted;
         }
+        for (int pass = options.exact ? 0 : 1; pass < 2; ++pass)
         for (std::size_t slot = 0; slot < count; ++slot) {
             const auto& wait = awaited[slot];
             if (wait.address == 0) continue;
             const std::size_t bytes = wait.bytes == 8 ? 8 : 4;
             if (wait.function != 0 && satisfies(wait, load(wait.address, bytes))) continue;
+            const bool deferred = pass == 0 && writerInWindow(wait);
             bool released = false;
             for (auto index = from; index < calls.size() && !released; ++index) released = writeRecordedValue(calls[index], wait);
             for (auto index = std::min(from, calls.size()); index > 0 && !released; --index) {
                 released = writeRecordedValue(calls[index - 1], wait);
                 if (released) ++lateReleases;
             }
-            if (!released && options.synthesize) {
+            if (!released && options.synthesize && !deferred) {
                 if (const auto value = satisfying(wait, load(wait.address, bytes))) {
                     const auto before = load(wait.address, bytes);
                     std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(wait.address)), &*value, bytes);
@@ -901,7 +987,9 @@ struct Replay {
                     released = true;
                 }
             }
-            if (released) ++earlyReleases;
+            if (!released) continue;
+            ++earlyReleases;
+            if (options.exact) return;
         }
     }
 
@@ -920,19 +1008,29 @@ struct Replay {
             auto lastSequenced = sequenced.load();
             auto lastProgress = Clock::now();
             std::optional<Clock::time_point> parkedSince;
+            std::optional<Clock::time_point> stuckSince;
             const auto quiet = options.exact ? std::max<std::chrono::milliseconds>(options.releaseAfter, ExactQuiet * 4) : options.releaseAfter;
             while (!finished.load()) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 const auto completed = progress().second;
                 const auto issued = sequenced.load();
-                if (completed != lastCompleted || issued != lastSequenced || closingWindows.load() || !AgcDriverQuiescent_nid_postfix()) {
+                const bool progressed = completed != lastCompleted || issued != lastSequenced || closingWindows.load();
+                if (progressed || !AgcDriverQuiescent_nid_postfix()) {
+                    const auto now = Clock::now();
+                    if (progressed || !options.exact || busy.load() != 0) stuckSince.reset();
+                    else if (!stuckSince) stuckSince = now;
+                    else if (now - *stuckSince >= StuckSubmit) {
+                        if (AgcDriverSubmitOpenForReplay_nid_postfix(stuckSubmits.load() < 16)) ++stuckSubmits;
+                        stuckSince.reset();
+                    }
                     lastCompleted = completed;
                     lastSequenced = issued;
-                    lastProgress = Clock::now();
+                    lastProgress = now;
                     parkedSince.reset();
                     parkedWithoutRelease.store(false);
                     continue;
                 }
+                stuckSince.reset();
                 if (options.exact) {
                     const auto now = Clock::now();
                     if (busy.load() == 0 && blockedOnWaits()) {
@@ -1002,6 +1100,7 @@ struct Replay {
         finished.store(true);
         breaker.join();
         if (options.exact && (parkedReleases.load() != 0 || fallbackReleases.load() != 0)) std::fprintf(stderr, "[frame-replay] --exact releases: %llu while parked, %llu by the wall-clock fallback\n", static_cast<unsigned long long>(parkedReleases.load()), static_cast<unsigned long long>(fallbackReleases.load()));
+        if (stuckSubmits.load() != 0) std::fprintf(stderr, "[frame-replay] --exact: %llu open batch submissions while parked with the driver not quiescent\n", static_cast<unsigned long long>(stuckSubmits.load()));
         if (failure != nullptr) std::rethrow_exception(failure);
     }
 
@@ -1065,11 +1164,17 @@ int usage() {
                          "  --exact             waits for every earlier submission and its GPU work to complete before each submission, flip and\n"
                          "                      memory delta,\n"
                          "                      so the GPU work runs in one order (a reproducible baseline, slower than the title), and releases\n"
-                         "                      awaited dwords when every replay thread is parked and the driver is blocked on waits, in capture order\n"
+                         "                      awaited dwords when every replay thread is parked and the driver is blocked on waits, in capture order,\n"
+                         "                      one dword per parked state, with no timed escape for a submission behind blocked ones, so queues\n"
+                         "                      released past the window's end do not run beside each other; a dword that a submitted packet of the window writes\n"
+                         "                      (RELEASE_MEM, EVENT_WRITE_EOP, WRITE_DATA, COPY_DATA, ATOMIC_MEM, DMA_DATA) is synthesized last;\n"
+                         "                      synthesized dwords go in the capture order of the submission that waits on them\n"
                          "  --frame-limit <n>   replays the calls through the n-th CPU flip, or the n-th suspend point when the title flips from the GPU,\n"
                          "                      and compares the display buffer with the title's image at that frame\n"
                          "  --checkpoint <csv>  replays up to the checkpoint of a capture made with APS5_FRAME_CAPTURE_CHECKPOINT=<frame> and lists\n"
                          "                      the 64 KiB blocks whose replayed bytes differ from the title's at that point; their replayed bytes go to <csv>.replay.bin\n"
+                         "  --checkpoint-at-submit <n>  with --checkpoint: ends the window after its n-th submission instead (the title's bytes are\n"
+                         "                      still the checkpoint's, so only replay-to-replay comparisons of the .replay.bin blocks mean anything)\n"
                          "  --timeout-s <n>     exits with code 4 when the replay has no result after n seconds (900; 0 waits forever)\n"
                          "  --dump              writes guest memory to a file after the replay (hexadecimal or decimal)\n"
                          "  --frames <dir>      writes each recorded and replayed display buffer as reference-<n>.bmp and replay-<n>.bmp\n"
@@ -1271,6 +1376,13 @@ int run(const Options& options, const FrameCaptureReader& reader, Clock::time_po
             const auto cut = std::find_if(window.begin(), window.end(), [](const FrameCall& call) { return call.kind == FrameCallKind::Checkpoint; });
             if (cut == window.end()) throw std::runtime_error("frame replay: --checkpoint needs a capture made with APS5_FRAME_CAPTURE_CHECKPOINT");
             window = window.first(static_cast<std::size_t>(cut - window.begin()));
+            if (options.checkpointSubmit != 0) {
+                std::size_t seen = 0;
+                const auto at = std::find_if(window.begin(), window.end(), [&](const FrameCall& call) { return call.kind == FrameCallKind::Submit && ++seen == options.checkpointSubmit; });
+                if (at == window.end()) throw std::runtime_error("frame replay: --checkpoint-at-submit " + std::to_string(options.checkpointSubmit) + " lies beyond the capture's checkpoint (" + std::to_string(seen) + " submissions)");
+                window = window.first(static_cast<std::size_t>(at - window.begin()) + 1);
+                std::fprintf(stderr, "[frame-replay] checkpoint after window submission %zu (%zu calls of the window)\n", options.checkpointSubmit, window.size());
+            }
         } else if (options.frameLimit != 0) {
             const bool cpuFlips = std::any_of(window.begin(), window.end(), [](const FrameCall& call) { return call.kind == FrameCallKind::Flip; });
             const auto boundary = cpuFlips ? FrameCallKind::Flip : FrameCallKind::Suspend;
@@ -1348,6 +1460,7 @@ int main(int argc, char** argv) {
         else if (argument == "--strict") options.strict = true;
         else if (argument == "--exact") options.exact = true;
         else if (argument == "--checkpoint" && index + 1 < argc) options.checkpointReport = argv[++index];
+        else if (argument == "--checkpoint-at-submit" && index + 1 < argc) options.checkpointSubmit = static_cast<std::size_t>(std::strtoull(argv[++index], nullptr, 10));
         else if (argument == "--frame-limit" && index + 1 < argc) options.frameLimit = static_cast<std::size_t>(std::strtoull(argv[++index], nullptr, 10));
         else if (argument == "--timeout-s" && index + 1 < argc) options.timeout = std::chrono::seconds(std::strtoll(argv[++index], nullptr, 10));
         else if (argument == "--dump" && index + 1 < argc) options.dumps.push_back(parseDump(argv[++index]));
@@ -1430,6 +1543,9 @@ int main(int argc, char** argv) {
         AgcDriver::ProfileWindows::UseFrameWindows(options.frameWindows);
         code = run(options, reader, loadStart);
         if (code == 0) {
+#ifdef _WIN32
+            AddVectoredExceptionHandler(1, shutdownFault);
+#endif
             AgcDriverShutdown_nid_postfix();
             return 0;
         }

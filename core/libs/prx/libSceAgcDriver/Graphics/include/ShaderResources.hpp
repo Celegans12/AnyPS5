@@ -240,6 +240,9 @@ public:
     // reconciles imports and refreshes mirrors, which needs the lock.
     ShaderResources(const Context& context, const CompiledShader& compute, std::span<const GuestMemorySnapshot> snapshots, bool deferred, std::uint64_t dispatchThreads = 0);
     void Complete();
+    void DeferAddressTable();
+    bool AddressTableDeferred() const { return addressTableDeferred; }
+    void EnsureAddressTable();
     // S1 (APS5_NO_SPLIT_DRAW_BUILD=1 off): the draw build in two stages, as for dispatches: the
     // constructor runs stage A only (no device lock; no guest bytes are read: host copies wait for
     // stage B), CompleteDraw() stage B under GuestMemory::GpuMutex. Address-based stages are refused
@@ -269,6 +272,9 @@ public:
             std::shared_ptr<Buffer> buffer;
             VkDeviceSize offset = 0;
             std::size_t bytes = 0;
+            // C67: a moved range read in place: the host import's buffer (`buffer` is null, `offset` is inside the import).
+            VkBuffer inPlace = VK_NULL_HANDLE;
+            VkBuffer Handle() const { return buffer != nullptr ? buffer->Handle() : inPlace; }
             std::span<std::byte> Bytes() const { return buffer->Bytes().subspan(static_cast<std::size_t>(offset), bytes); }
         };
         DescriptorCache* cache = nullptr;
@@ -317,9 +323,16 @@ public:
     const void* MemoryOwner() const { return &guestMemory; }
     // Whether the build copies buffer regions on the GPU (staged shadows among them).
     bool HasGpuCopies() const { return guestMemory.HasGpuCopies(); }
+    bool HasAddressOverlays() const { return guestMemory.HasOverlays(); }
+    std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>> AddressTableRanges() const;
+    struct DeferredTableView {
+        std::uint64_t serial = 0;
+        std::span<const ShaderRecompiler::BdaAbi::Range> ranges;
+    };
+    std::optional<DeferredTableView> DeferredAddressTable() const;
     void WriteBackBuffers(std::uint64_t shaderAddress = 0);
     // Whether WriteBackBuffers has anything the CPU must see (copied written buffers, BDA faults).
-    bool NeedsCompletion() const { return (bda != nullptr && faultChecks) || guestMemory.HasCopiedWrites(); }
+    bool NeedsCompletion() const { return ((bda != nullptr || addressTableDeferred) && faultChecks) || guestMemory.HasCopiedWrites(); }
     // Whether a written buffer was copied (its results reach guest memory by the CPU write-back).
     bool HasCopiedWrites() const { return guestMemory.HasCopiedWrites(); }
     bool HoldsLease() const { return guestMemory.HoldsLease(); }
@@ -682,6 +695,11 @@ private:
     std::size_t maxDrawSnapshotBytes = MaxDrawSnapshotBytes();
     std::unique_ptr<BdaResources> bda;
     std::vector<BdaResources::SrtGuardFaults> srtGuardFaults;
+    bool addressTableDeferred = false;
+    bool imageTablesDeferred = false;
+    std::vector<BdaResources::ImageTableFaults> deferredImageFaults;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> deferredImageRanges;
+    mutable std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>> deferredRanges;
     bool usesBda = false;
     bool bdaReadOnly = true;
     std::vector<std::uint64_t> multisampleSources;

@@ -177,6 +177,10 @@ extern "C" bool AgcDriverQuiescent_nid_postfix() {
     return AgcDriver::DriverDetail::Driver::Get().Quiescent();
 }
 
+extern "C" bool AgcDriverSubmitOpenForReplay_nid_postfix(bool report) {
+    return AgcDriver::DriverDetail::Driver::Get().SubmitOpenForReplay(report);
+}
+
 extern "C" void AgcDriverSerialProgress_nid_postfix(std::uint64_t* accepted, std::uint64_t* completed) {
     const auto [submitted, done] = AgcDriver::DriverDetail::Driver::Get().SerialProgress();
     *accepted = submitted;

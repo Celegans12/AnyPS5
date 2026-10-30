@@ -142,6 +142,32 @@ add_custom_command(
         VERBATIM
 )
 
+set(agcIndexClampShaderSource ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/IndexClamp.comp)
+set(agcIndexClampShaderSpv ${agcTextureDetileGeneratedDir}/IndexClamp.spv)
+set(agcIndexClampShaderHeader ${agcTextureDetileGeneratedDir}/IndexClamp_spv.h)
+add_custom_command(
+        OUTPUT "${agcIndexClampShaderHeader}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${agcTextureDetileGeneratedDir}"
+        COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -o "${agcIndexClampShaderSpv}" "${agcIndexClampShaderSource}"
+        COMMAND ${CMAKE_COMMAND} -DINPUT=${agcIndexClampShaderSpv} -DOUTPUT=${agcIndexClampShaderHeader}
+        -DSYMBOL=INDEX_CLAMP_SPV -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
+        DEPENDS "${agcIndexClampShaderSource}" glslang-standalone
+        VERBATIM
+)
+
+set(agcExpandSingleShaderSource ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/ExpandSingle.comp)
+set(agcExpandSingleShaderSpv ${agcTextureDetileGeneratedDir}/ExpandSingle.spv)
+set(agcExpandSingleShaderHeader ${agcTextureDetileGeneratedDir}/ExpandSingle_spv.h)
+add_custom_command(
+        OUTPUT "${agcExpandSingleShaderHeader}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${agcTextureDetileGeneratedDir}"
+        COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -o "${agcExpandSingleShaderSpv}" "${agcExpandSingleShaderSource}"
+        COMMAND ${CMAKE_COMMAND} -DINPUT=${agcExpandSingleShaderSpv} -DOUTPUT=${agcExpandSingleShaderHeader}
+        -DSYMBOL=EXPAND_SINGLE_SPV -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
+        DEPENDS "${agcExpandSingleShaderSource}" glslang-standalone
+        VERBATIM
+)
+
 set(agcTextureRepackShaderSource ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/TextureRepack.comp)
 set(agcTextureRepackShaderSpv ${agcTextureDetileGeneratedDir}/TextureRepack.spv)
 set(agcTextureRepackShaderHeader ${agcTextureDetileGeneratedDir}/TextureRepack_spv.h)
@@ -305,8 +331,10 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/NewPath/ResolvedPush.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/NewPath/PipelineAhead.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/NewPath/PipelineAheadConfig.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/NewPath/PipelineAheadTwins.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/NewPath/DevicePageTable.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/NewPath/Router.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/NewPath/ResolvedTwins.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Lifecycle.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Memory/BufferCopy.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Memory/BufferFill.cpp
@@ -420,6 +448,8 @@ set(agcDriverSources
         ${agcReadbackHeaders}
         ${agcMultisampleUploadHeader}
         ${agcCmaskClearShaderHeader}
+        ${agcIndexClampShaderHeader}
+        ${agcExpandSingleShaderHeader}
         ${agcMeshArgumentsShaderHeader}
         ${agcStagingDiffShaderHeader}
         ${agcFmaProbeShaderHeader}
@@ -606,7 +636,7 @@ if(BUILD_TESTING)
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 
-    add_test_executable(agc_newpath_emit_tests tests/NewPathEmit.cpp Execution/src/Driver/NewPath/Router.cpp Execution/src/Driver/NewPath/CommandWrites.cpp Execution/src/Driver/NewPath/PushBlock.cpp Execution/src/Driver/NewPath/ResolvedPush.cpp Execution/src/Driver/NewPath/CommandRecord.cpp)
+    add_test_executable(agc_newpath_emit_tests tests/NewPathEmit.cpp Execution/src/Driver/NewPath/Router.cpp Execution/src/Driver/NewPath/ResolvedTwins.cpp Execution/src/Driver/NewPath/CommandWrites.cpp Execution/src/Driver/NewPath/PushBlock.cpp Execution/src/Driver/NewPath/ResolvedPush.cpp Execution/src/Driver/NewPath/CommandRecord.cpp)
     target_include_directories(agc_newpath_emit_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/core/shader/recompiler)
     target_link_libraries(agc_newpath_emit_tests PRIVATE libc)
     configure_windows_unwind(agc_newpath_emit_tests)
@@ -625,6 +655,17 @@ if(BUILD_TESTING)
     set_tests_properties(agc_newpath_pipeline_gate PROPERTIES TIMEOUT 30)
     if(WIN32)
         set_tests_properties(agc_newpath_pipeline_gate PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+
+    add_test_executable(agc_newpath_pipeline_twins_tests tests/NewPathPipelineTwins.cpp Execution/src/Driver/NewPath/PipelineAhead.cpp Execution/src/Driver/NewPath/PipelineAheadTwins.cpp)
+    target_include_directories(agc_newpath_pipeline_twins_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/core/shader/recompiler)
+    target_link_libraries(agc_newpath_pipeline_twins_tests PRIVATE shader_recompiler_agc_driver libc)
+    configure_windows_unwind(agc_newpath_pipeline_twins_tests)
+    add_test(NAME agc_newpath_pipeline_twins COMMAND agc_newpath_pipeline_twins_tests)
+    set_tests_properties(agc_newpath_pipeline_twins PROPERTIES TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_newpath_pipeline_twins PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 

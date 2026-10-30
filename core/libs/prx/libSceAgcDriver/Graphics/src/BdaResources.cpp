@@ -267,6 +267,7 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
                     ++cache.classes.spaceTables;
                     outcome = 0;
                     table = std::move(shared);
+                    tableRanges = it->ranges;
                     cache.entries.splice(cache.entries.begin(), cache.entries, it);
                     return;
                 }
@@ -311,6 +312,7 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
                 // same way): the next build of this space binds it by the serial.
                 if (serial != 0) it->spaceSerial = serial;
                 table = std::move(shared);
+                tableRanges = it->ranges;
                 cache.entries.splice(cache.entries.begin(), cache.entries, it);
                 return;
             }
@@ -345,6 +347,7 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
             cache.device = context.device;
         }
         auto entryRanges = cached.has_value() && lean && cached->owner != nullptr ? cached->owner : std::make_shared<const std::vector<ShaderRecompiler::BdaAbi::Range>>(cached.has_value() ? ranges : std::move(built));
+        tableRanges = entryRanges;
         cache.entries.push_front({hash, std::move(entryRanges), table, serial});
         while (cache.entries.size() > tableCacheEntries()) cache.entries.pop_back();
     }
@@ -363,6 +366,23 @@ BdaResources::TableCacheStats BdaResources::TableCacheCounters() {
 VkDescriptorBufferInfo BdaResources::Table() const {
     Require(table != nullptr, "BDA page table was not requested");
     return {table->Handle(), 0, tableBytes};
+}
+
+std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>> BdaResources::Ranges() const {
+    return tableRanges;
+}
+
+std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>> BdaResources::RangesOf(const GuestBufferMemory& memory) {
+    const auto cached = memory.CachedAddressTable();
+    if (cached.has_value() && cached->owner != nullptr) return cached->owner;
+    if (cached.has_value() && cached->serial != 0 && tableCacheEnabled()) {
+        auto& cache = Tables();
+        std::lock_guard lock(cache.mutex);
+        for (const auto& entry : cache.entries) {
+            if (entry.spaceSerial == cached->serial && entry.ranges != nullptr) return entry.ranges;
+        }
+    }
+    return std::make_shared<const std::vector<ShaderRecompiler::BdaAbi::Range>>(cached.has_value() ? *cached->ranges : memory.AddressRanges());
 }
 
 VkDescriptorBufferInfo BdaResources::Fault() const {

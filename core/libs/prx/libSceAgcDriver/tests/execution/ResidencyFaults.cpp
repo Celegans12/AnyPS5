@@ -426,6 +426,7 @@ int main(int argc, char** argv) {
 #ifdef _WIN32
     if (reentry) {
         _putenv_s("APS5_NEW_PATH", "1");
+        _putenv_s("APS5_NEW_PATH_EAGER_COPY_IN", "1");
         return SessionReentry();
     }
     if (asyncLane) _putenv_s("APS5_ASYNC_LANE", "51");

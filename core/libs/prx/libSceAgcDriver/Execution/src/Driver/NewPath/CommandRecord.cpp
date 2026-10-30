@@ -44,6 +44,12 @@ RecordOutcome CompleteCommandRecord(std::span<std::uint32_t, CommandRecordWords>
         std::ostringstream message;
         message << "new-path command fault: reason " << static_cast<std::uint32_t>(report.reason) << " at 0x" << std::hex << report.address << std::dec << " (" << report.bytes << " bytes, stage " << report.stage << ", pc 0x" << std::hex << report.instruction << ")";
         outcome.message = message.str();
+    } else if (const auto guard = words[Bda::SrtGuardWord]; guard != 0u) {
+        outcome.faulted = true;
+        outcome.reason = Bda::FaultReason::Unmapped;
+        std::ostringstream message;
+        message << "new-path command SRT guard: a guarded SRT read of stage " << (guard >> Bda::SrtGuardStageShift) << " faulted (poison record " << (guard & ((1u << Bda::SrtGuardStageShift) - 1u)) << ")";
+        outcome.message = message.str();
     }
     if (words[Bda::WrittenOverflowWord] != 0u) {
         outcome.overflow = true;

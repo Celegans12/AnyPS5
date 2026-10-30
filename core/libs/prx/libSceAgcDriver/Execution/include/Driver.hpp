@@ -34,6 +34,7 @@ extern "C" void AgcDriverSuspendPoint_nid_postfix();
 extern "C" void AgcDriverSerialProgress_nid_postfix(std::uint64_t* accepted, std::uint64_t* completed);
 extern "C" std::size_t AgcDriverAwaitedWaits_nid_postfix(AgcDriver::AwaitedWait* waits, std::size_t capacity);
 extern "C" bool AgcDriverQuiescent_nid_postfix();
+extern "C" bool AgcDriverSubmitOpenForReplay_nid_postfix(bool report);
 extern "C" bool AgcDriverFailed_nid_postfix();
 extern "C" bool AgcDriverSettle_nid_postfix();
 extern "C" void AgcDriverUseGdsAt_nid_postfix(std::uint64_t address);
