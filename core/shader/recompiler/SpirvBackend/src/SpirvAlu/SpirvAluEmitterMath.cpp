@@ -1536,6 +1536,7 @@ std::uint32_t EmitFAbsValue(SpirvEmitterState& state, std::uint32_t arg0) {
 }
 
 static bool NativeF16Rte(const SpirvEmitterState& state) {
+    if (state.deviceDefaultF32Flush) return false;
     const auto supported = [&](spv::Capability capability) {
         return std::find(state.supportedCapabilities.begin(), state.supportedCapabilities.end(), static_cast<std::uint32_t>(capability)) != state.supportedCapabilities.end();
     };

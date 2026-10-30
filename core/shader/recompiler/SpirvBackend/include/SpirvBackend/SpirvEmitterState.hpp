@@ -136,6 +136,11 @@ struct SpirvEmitterState {
     bool singleWorkgroup = false;
     bool robustBufferAccess2 = false;
     bool float32FlushToZero = false;
+    // float32FlushToZero on a device that declares no f32 flush (NVIDIA): the module relies on the driver's default f32
+    // denormal handling, which NVIDIA switches to preserving as soon as the module declares another denormal mode
+    // (DenormPreserve 16: agc_driver_f32_flush_hardware_exact, cloth-f16). Such a module declares none: f16 operands
+    // are decoded bitwise and f32 -> f16 conversions take the software rounding.
+    bool deviceDefaultF32Flush = false;
     bool float32DenormPreserve = false;
     bool fusedExactArithmetic = false;
     bool meshBarycentricPixel = false;

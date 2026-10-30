@@ -68,6 +68,16 @@ alignas(256) constexpr std::array<std::uint32_t, 46> ClothCode{
     0xe0781000u, 0x80010a03u, 0xe0781010u, 0x80010e03u, 0xe0781020u, 0x80011203u, 0xe0781030u, 0x80011603u,
     0xe07c1040u, 0x80011a03u, 0xbf810000u, 0xbf810000u, 0xbf810000u, 0xbf810000u,
 };
+// The same with result 18 from v_cvt_f32_f16 instead of v_cvt_f32_i32: an f16 operand makes the module declare
+// DenormPreserve 16 (as 0x80001c0d00 does), which a driver's default f32 denormal handling may depend on.
+alignas(256) constexpr std::array<std::uint32_t, 46> ClothF16Code{
+    0x34020084u, 0x160600ffu, 0x0000004cu, 0xe0381000u, 0x80000401u, 0xbf8c3f70u, 0x7e140306u, 0x3e140b04u,
+    0xd541000bu, 0x041a0b04u, 0xd541000cu, 0x04160904u, 0x421a0b04u, 0x3f7ffffeu, 0x401c0b04u, 0x00800001u,
+    0x7e1e5504u, 0x7e205d05u, 0x7e226704u, 0x10240d04u, 0x06260d05u, 0x08280d04u, 0x7e2a4104u, 0x1e2c0b04u,
+    0x202e0d04u, 0x0e300d05u, 0x7e320304u, 0xd51f0019u, 0x00020d05u, 0x7e344b04u, 0x7e364f05u, 0x7e381707u,
+    0xe0781000u, 0x80010a03u, 0xe0781010u, 0x80010e03u, 0xe0781020u, 0x80011203u, 0xe0781030u, 0x80011603u,
+    0xe07c1040u, 0x80011a03u, 0xbf810000u, 0xbf810000u, 0xbf810000u, 0xbf810000u,
+};
 
 struct Program {
     const char* name;
@@ -75,7 +85,7 @@ struct Program {
     std::uint32_t laneDwords;
     std::uint32_t results;
 };
-constexpr std::array<Program, 4> Programs{{{"mixed", MixedCode, 19u, 19u}, {"tiny", TinyCode, 16u, 12u}, {"mixed-tiny", MixedTinyCode, 16u, 8u}, {"cloth", ClothCode, 19u, 19u}}};
+constexpr std::array<Program, 5> Programs{{{"mixed", MixedCode, 19u, 19u}, {"tiny", TinyCode, 16u, 12u}, {"mixed-tiny", MixedTinyCode, 16u, 8u}, {"cloth", ClothCode, 19u, 19u}, {"cloth-f16", ClothF16Code, 19u, 19u}}};
 
 constexpr std::array<std::uint32_t, 48> Edges{
     0x00000000u, 0x80000000u, 0x00000001u, 0x80000001u, 0x00000003u, 0x80000002u, 0x00400000u, 0x007fffffu,
