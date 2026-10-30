@@ -2260,6 +2260,34 @@ struct ResolvedResources {
     ResourceUse use;
 };
 
+// D-draws2: the committer's draw cost by route (APS5_PROFILE_NEW_PATH with APS5_NEW_PATH_EMIT_DRAWS): the
+// build's share of the draw, taken where the build runs.
+struct DrawCostNote {
+    std::uint64_t buildNs = 0;
+    bool templateHit = false;
+};
+DrawCostNote& ThreadDrawCost() {
+    thread_local DrawCostNote note;
+    return note;
+}
+
+// D-draws2 (retire step a for draws): whether the router would route this draw new once its build is class A,
+// F4 covers it, it has no address overlays and its twin pipeline is ready (what only the build or the pipeline
+// tells). Such a build defers its BDA table and fault buffer: the twins walk the device page table and bind
+// neither (WalkReplacesTables), and a fallback builds the table before the set is bound (EnsureAddressTable).
+// APS5_NEW_PATH_NO_DRAW_TABLE_DEFER=1 builds the table as before.
+bool mayRouteDrawWithoutTable(const State& state, std::span<const CompiledShader> shaders) {
+    static const bool off = [] { const char* value = std::getenv("APS5_NEW_PATH_NO_DRAW_TABLE_DEFER"); return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0; }();
+    auto* emit = NewPath::CurrentDrawEmit();
+    if (off || emit == nullptr || !ShaderResources::StagesUseAddressTables(shaders)) return false;
+    std::vector<NewPath::DrawStage> stages;
+    stages.reserve(shaders.size());
+    for (const auto& shader : shaders) stages.push_back({shader.stage, shader.program, shader.pushConstantOffset});
+    const NewPath::DrawShape shape{state.stages.tessellation.has_value(), state.stages.mesh.has_value(), state.rectList, state.depthRemap.mode != 0u, false, !state.blendedColors.empty(), false};
+    const auto facts = NewPath::DrawFactsWithoutTable(emit->facts, stages, shape, NewPath::DrawStageTwins());
+    return facts.has_value() && NewPath::WouldEmit(*facts);
+}
+
 ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, DrawOutcome& outcome, DrawTimer& timer, PreparedDraw* prepared = nullptr, const AheadDraw* ahead = nullptr) {
     ResolvedResources resolved;
     if (prepared != nullptr && (prepared->device != context.device || prepared->indexBytes != indexBytes)) {
@@ -2342,7 +2370,10 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
             prepared->resources.reset();
         }
         if (resolved.resources == nullptr) {
-            resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots);
+            const bool deferTable = recordable && !resolved.cacheable && mayRouteDrawWithoutTable(state, shaders);
+            const auto buildStart = deferTable || NewPath::DrawCostProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots, deferTable);
+            if (NewPath::DrawCostProfiled()) ThreadDrawCost().buildNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - buildStart).count());
             if (SplitDrawBuild()) Splits().lockedBuilds.fetch_add(1, std::memory_order_relaxed);
         }
         resolved.use.resources = resolved.resources;
@@ -2898,7 +2929,7 @@ void routeLeanDraw(NewPath::EmitCandidate& emit, const Context& context, const S
             facts.pushFits = NewPath::DrawPushFits(chosen->stages);
             facts.clothGuard = resources.HasAddressOverlays();
         }
-        static const bool profileFacts = [] { const char* value = std::getenv("APS5_PROFILE_NEW_PATH"); return value != nullptr && value[0] != ' ' && std::strcmp(value, "0") != 0; }();
+        static const bool profileFacts = [] { const char* value = std::getenv("APS5_PROFILE_NEW_PATH"); return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0; }();
         const bool compareTable = facts.shapeSupported && facts.pushFits && !facts.clothGuard && (facts.resolvedProgram || profileFacts);
         counts.classA.fetch_add(1, std::memory_order_relaxed);
         counts.lean.fetch_add(1, std::memory_order_relaxed);
@@ -2910,7 +2941,9 @@ void routeLeanDraw(NewPath::EmitCandidate& emit, const Context& context, const S
             auto& table = NewPath::DeviceTable();
             if (table.Stale(context.device)) static_cast<void>(table.Refresh(context));
             NewPath::DevicePageTable::Snapshot admitted;
-            const auto cover = table.Covers(resources.AddressTableRanges(), &admitted);
+            // A deferred build's space is compared once per space serial and table version (D-cost's memo).
+            const auto deferred = resources.DeferredAddressTable();
+            const auto cover = deferred.has_value() ? table.Covers(deferred->serial, deferred->ranges, &admitted) : table.Covers(resources.AddressTableRanges(), &admitted);
             counts.covers[static_cast<std::size_t>(cover)].fetch_add(1, std::memory_order_relaxed);
             facts.tableCovers = cover == NewPath::DevicePageTable::Cover::Covered && admitted.table != nullptr;
             if (facts.tableCovers) {
@@ -2925,8 +2958,12 @@ void routeLeanDraw(NewPath::EmitCandidate& emit, const Context& context, const S
             facts.pipelineReady = twinPipeline != nullptr;
         }
     }
-    if (NewPath::NoteEmit(emit, facts).route != NewPath::Route::NewPath) return;
-    emit.addressBased = true;
+    emit.addressBased = facts.classA;
+    if (NewPath::NoteEmit(emit, facts).route != NewPath::Route::NewPath) {
+        record.resources->EnsureAddressTable();
+        return;
+    }
+    emit.tableDeferred = record.resources->AddressTableDeferred();
     chosen->programVariant = shaders.empty() || shaders.back().program == nullptr ? 0 : shaders.back().program->variantId;
     record.pipeline = std::move(twinPipeline);
     record.newPath = std::move(chosen);
@@ -3799,6 +3836,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
         record.reorderPass = reorderPass;
         record.depthLocations = depthLocations;
         if (auto* emit = NewPath::CurrentDrawEmit()) routeLeanDraw(*emit, context, state, masked.has_value() ? *masked : state, inputs.VertexLayout(), shaders, outcome.kind, record);
+        if (record.newPath == nullptr) resources->EnsureAddressTable();
         recordDraw(context, state, draw, shaders, inputs, record, outcome, timer, ownWaitedMs, preparation.trace);
         // The recipe for the caller's draw-cache entry (design_cpu_final M8, rule R3 for draws):
         // only a template the resource cache serves under this content key (reusable: no lease,
@@ -3830,10 +3868,12 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
         report(outcome.waited ? (outcome.reason == SyncLease ? " recorded then waited (lease)" : " recorded then waited (copied writes)") : completion ? " recorded with completion" : " recorded");
         return;
     }
+    resources->EnsureAddressTable();
     if (auto* emit = NewPath::CurrentDrawEmit()) {
         auto facts = emit->facts;
         facts.classA = outcome.kind == KindBda;
         facts.lean = false;
+        emit->addressBased = facts.classA;
         if (facts.classA) NewPath::DrawCounts().classA.fetch_add(1, std::memory_order_relaxed);
         static_cast<void>(NewPath::NoteEmit(*emit, facts));
     }
@@ -4149,7 +4189,24 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     preparation.recipeOut = recipeOut;
     preparation.trace = trace;
     if (profile) NewPath::DrawCensus::Begin(shaders, draw);
-    const NewPath::DrawEmitScope drawEmit(NewPath::EmitDraws() ? NewPath::ClaimDraw() : nullptr);
+    const auto drawClaim = NewPath::EmitDraws() ? NewPath::ClaimDraw() : nullptr;
+    const NewPath::DrawEmitScope drawEmit(drawClaim);
+    // D-draws2: the committer's draw by route (cumulative [newpath-cost] draws line).
+    struct DrawCostScope {
+        const NewPath::EmitCandidate* candidate;
+        std::chrono::steady_clock::time_point start;
+        explicit DrawCostScope(const NewPath::EmitCandidate* claimed) : candidate(claimed != nullptr && NewPath::DrawCostProfiled() ? claimed : nullptr), start(candidate != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}) {
+            if (candidate != nullptr) ThreadDrawCost() = {};
+        }
+        ~DrawCostScope() {
+            if (candidate == nullptr) return;
+            const auto ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+            const auto& note = ThreadDrawCost();
+            using Bucket = NewPath::DrawCostBucket;
+            const auto bucket = candidate->routed == NewPath::Route::NewPath ? (note.templateHit ? Bucket::NewTemplate : candidate->tableDeferred ? Bucket::NewDeferred : Bucket::NewBuilt) : candidate->addressBased ? Bucket::FallbackClassA : Bucket::Other;
+            NewPath::NoteDrawCost(bucket, ns, note.buildNs);
+        }
+    } drawCost(drawClaim.get());
     if (prepareDraw(context, state, draw, shaders, snapshots, prepared, ahead, preparation)) recordPreparedDraw(context, state, draw, shaders, preparation);
 }
 

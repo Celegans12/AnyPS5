@@ -200,6 +200,55 @@ void stageTwins() {
     Expect(found.size() == 2 && found[0] == twin && found[1] == pixelTwin, "a draw's twins are not its stages' in order");
 }
 
+// D-draws2: the facts a build defers its table on, before the build.
+void factsWithoutTable() {
+    ResolvedTwins twins;
+    const auto vertex = Program(false, 16);
+    const auto pixel = Program(false, 8);
+    const auto vertexTwin = Program(true, 16);
+    vertexTwin->bindings.clear();
+    const auto pixelTwin = Program(true, 8);
+    const std::vector<DrawStage> stages{{Stage::Vertex, vertex.get(), 0}, {Stage::Fragment, pixel.get(), 128}};
+    const Router router(false, true);
+    CommandFacts decoded;
+    decoded.kind = CommandKind::Draw;
+    decoded.classA = false;
+    Expect(!DrawFactsWithoutTable(decoded, stages, {}, twins).has_value(), "facts without a twin were given");
+    twins.Remember(vertex, vertexTwin, TwinOutcome::Built);
+    twins.Remember(pixel, pixelTwin, TwinOutcome::Built);
+    Expect(!DrawFactsWithoutTable(decoded, stages, {}, twins).has_value(), "a twin that still binds the BDA table took a deferred table");
+    auto walking = Program(true, 8);
+    walking->bindings.clear();
+    twins.Remember(pixel, walking, TwinOutcome::Built);
+    const auto facts = DrawFactsWithoutTable(decoded, stages, {}, twins);
+    Expect(facts.has_value() && facts->classA && facts->lean && facts->resolvedProgram && facts->pushFits && facts->tableCovers && !facts->clothGuard && facts->pipelineReady, "facts of a deferrable draw");
+    Expect(facts.has_value() && router.Decide(*facts).route == Route::NewPath, "a deferrable draw would not route new");
+    auto switched = decoded;
+    switched.kindSwitchOff = true;
+    const auto off = DrawFactsWithoutTable(switched, stages, {}, twins);
+    Expect(off.has_value() && router.Decide(*off).reason == FallbackReason::KindSwitch, "the B arm's switch would defer a table");
+    Expect(Router(true, false).Decide(*facts).reason == FallbackReason::KindNotEmitted, "the dispatch switch alone would defer a draw's table");
+    DrawShape blended;
+    blended.blendedTargets = true;
+    const auto refused = DrawFactsWithoutTable(decoded, stages, blended, twins);
+    Expect(refused.has_value() && !refused->shapeSupported && router.Decide(*refused).route == Route::Fallback, "a refused shape would defer a table");
+    const auto big = Program(false, 120);
+    twins.Remember(big, walking, TwinOutcome::Built);
+    const std::vector<DrawStage> overflow{{Stage::Vertex, vertex.get(), 0}, {Stage::Fragment, big.get(), 128}};
+    const auto pushed = DrawFactsWithoutTable(decoded, overflow, {}, twins);
+    Expect(pushed.has_value() && !pushed->pushFits && router.Decide(*pushed).reason == FallbackReason::PushOverflow, "a draw over the push limit would defer a table");
+}
+
+void costLine() {
+    NoteDrawCost(DrawCostBucket::NewDeferred, 200'000, 50'000);
+    NoteDrawCost(DrawCostBucket::NewDeferred, 400'000, 70'000);
+    NoteDrawCost(DrawCostBucket::FallbackClassA, 60'000'000, 1);
+    const auto line = FormatDrawCost("10 s");
+    Expect(line.rfind("[newpath-cost] window=10 s committer draws", 0) == 0, "cost line head: " + line);
+    Expect(line.find("new path (table deferred) 2 x 300.0 us (build 60.0 us)") != std::string::npos, "cost line mean: " + line);
+    Expect(line.find("fallback class A 0 x 0.0 us (build 0.0 us), 1 over 50 ms left out") != std::string::npos, "cost line slow: " + line);
+}
+
 void emitLine() {
     DrawCounts().shapes[static_cast<std::size_t>(ShapeRefusal::Stages)].fetch_add(2);
     DrawCounts().covers[0].fetch_add(5);
@@ -216,6 +265,8 @@ int main() {
     pushComposition();
     stageTwins();
     emitLine();
+    factsWithoutTable();
+    costLine();
     if (failures != 0) {
         std::fprintf(stderr, "agc_newpath_draw_twins: %d failures\n", failures);
         return 1;

@@ -136,6 +136,7 @@ void print(State& state, const char* window) {
     if (EmitDraws()) {
         const auto drawPipes = DrawTwinPipelines().Totals();
         AgcDriver::ProfilePrint_nid_no_patch("%s; pipelines ahead requested %llu, created %llu, failed %llu, inline %llu\n", FormatDrawEmit(window, true).c_str(), static_cast<unsigned long long>(drawPipes.requested), static_cast<unsigned long long>(drawPipes.created), static_cast<unsigned long long>(drawPipes.failed), static_cast<unsigned long long>(drawPipes.createdInline));
+        AgcDriver::ProfilePrint_nid_no_patch("%s\n", FormatDrawCost(window).c_str());
     }
     if (const auto residency = Graphics::ResidencyReportLine(); !residency.empty()) AgcDriver::ProfilePrint_nid_no_patch("%s\n", residency.c_str());
 }

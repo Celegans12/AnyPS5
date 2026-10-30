@@ -4684,6 +4684,33 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
         reject([&] { ShaderResources completed(context, compiled, snapshots); completed.DeferAddressTable(); }, "before the build completes");
     }
     {
+        // D-draws2: a draw build that defers its address table (a class A draw the new path routes), and its fallback.
+        auto placeholder = context;
+        placeholder.emptyBuffer = reinterpret_cast<VkBuffer>(std::uintptr_t{0x1000});
+        const std::array<CompiledShader, 1> drawStages{{{ShaderRecompiler::ShaderStage::Vertex, &shader, 0}}};
+        ShaderResources deferred(placeholder, drawStages, ColorTarget{}, 0, 0, 0, snapshots, true);
+        Require(deferred.AddressTableDeferred() && deferred.NeedsCompletion() && !deferred.ChecksFaults() && deferred.UsesAddressTable(), "a deferred draw table was built or dropped the build's completion");
+        Require(access.descriptor(4).buffer == placeholder.emptyBuffer && access.descriptor(5).buffer == placeholder.emptyBuffer, "a deferred draw table bound a table or fault buffer");
+        const auto view = deferred.DeferredAddressTable();
+        const auto ranges = deferred.AddressTableRanges();
+        Require(ranges != nullptr && ranges->size() == 1 && ranges->front().begin == snapshots[0].address && ranges->front().end == snapshots[0].address + source.size(), "a deferred draw table lists other ranges than its build");
+        Require(!view.has_value() || (view->ranges.size() == 1 && view->ranges.front().begin == ranges->front().begin && view->ranges.front().end == ranges->front().end), "the deferred draw table's space view differs from its ranges");
+        deferred.EnsureAddressTable();
+        Require(!deferred.AddressTableDeferred() && deferred.ChecksFaults(), "EnsureAddressTable left the draw table deferred");
+        const auto table = access.bytes(access.descriptor(4).buffer);
+        ShaderRecompiler::BdaAbi::Header header{};
+        ShaderRecompiler::BdaAbi::Range range{};
+        std::memcpy(&header, table.data(), sizeof(header));
+        std::memcpy(&range, table.data() + sizeof(header), sizeof(range));
+        Require(header.count == 1 && range.begin == ranges->front().begin && range.end == ranges->front().end && range.deviceAddress == ranges->front().deviceAddress, "the draw table built after deferral differs from the deferred ranges");
+        const auto fault = access.bytes(access.descriptor(5).buffer);
+        for (const auto byte : fault) Require(byte == std::byte{}, "the draw fault buffer built after deferral was not initialized");
+        deferred.WriteBack();
+        ShaderResources whole(context, drawStages, ColorTarget{}, 0, 0, 0, snapshots);
+        Require(!whole.AddressTableDeferred() && whole.ChecksFaults(), "a draw build without the deferral deferred its table");
+        whole.WriteBack();
+    }
+    {
         auto writable = binding(Role::GuestBuffers, 6);
         writable.guestDescriptor = {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32) & 0xffffu, sizeof(guest), 0x31000000u};
         shader.bindings.push_back(writable);

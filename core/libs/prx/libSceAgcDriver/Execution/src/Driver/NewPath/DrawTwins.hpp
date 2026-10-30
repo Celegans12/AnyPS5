@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/PushBlock.hpp"
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/ResolvedTwins.hpp"
+#include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/Router.hpp"
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -76,6 +77,19 @@ struct DrawEmitCounts {
     std::atomic<std::uint64_t> classA{0}, lean{0}, shapeOk{0}, twinned{0}, pushFits{0}, noCloth{0}, covered{0}, eligible{0};
 };
 DrawEmitCounts& DrawCounts();
+
+// D-draws2 (retire step a for draws): the facts of a lean class A draw known before its build (shape from the
+// state and the stages, twins, push fit), with the build's and the pipeline's facts (F4, cloth, pipeline)
+// taken as passing; empty when a stage has no twin or a twin still binds the BDA table or fault buffer. When the
+// router would route these new, the build defers its table and fault buffer.
+[[nodiscard]] std::optional<CommandFacts> DrawFactsWithoutTable(const CommandFacts& decoded, std::span<const DrawStage> stages, const DrawShape& shape, const ResolvedTwins& twins);
+
+// The committer's draw (Graphics::Draw) by route, APS5_PROFILE_NEW_PATH with the draw switch on.
+enum class DrawCostBucket : std::uint8_t { NewDeferred, NewBuilt, NewTemplate, FallbackClassA, Other, Count };
+inline constexpr std::size_t DrawCostBuckets = static_cast<std::size_t>(DrawCostBucket::Count);
+[[nodiscard]] bool DrawCostProfiled();
+void NoteDrawCost(DrawCostBucket bucket, std::uint64_t drawNs, std::uint64_t buildNs);
+[[nodiscard]] std::string FormatDrawCost(const char* window);
 [[nodiscard]] std::string FormatDrawEmit(const char* window, bool emitting);
 
 }
