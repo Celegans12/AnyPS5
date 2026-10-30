@@ -63,7 +63,9 @@ bool SitesInside(std::span<const std::pair<std::uint64_t, std::uint64_t>> sites,
         auto cursor = begin;
         while (cursor < end) {
             const auto found = std::ranges::find_if(build, [&](const ShaderRecompiler::BdaAbi::Range& range) { return range.begin <= cursor && cursor < range.end && (!written || (range.permissions & ShaderRecompiler::BdaAbi::Write) != 0u); });
-            if (found == build.end()) return false;
+            // A bounded site may end up to one 16-byte element past the V#'s records (its offset bound rounds up);
+            // both paths bounds-check those bytes against num_records, so neither reaches memory there.
+            if (found == build.end()) return cursor > begin && end - cursor <= SiteTailBytes;
             cursor = std::min(end, found->end);
         }
     }

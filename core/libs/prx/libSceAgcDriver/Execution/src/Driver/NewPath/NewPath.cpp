@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <unordered_map>
 
 namespace AgcDriver::NewPath {
 
@@ -327,13 +328,54 @@ void NoteBufferCover(const EmitCandidate& candidate, const Graphics::ShaderResou
     candidate.census.cover = static_cast<std::uint8_t>(cover);
 }
 
-void NoteBufferRanges(EmitCandidate& candidate, const Graphics::ShaderResources& resources) {
-    if (!candidate.c1Twin) return;
-    try {
-        candidate.bufferRanges = resources.GuestBufferRanges();
-    } catch (const std::exception&) {
-        candidate.bufferRanges = nullptr;
+namespace {
+
+struct KeptRanges {
+    struct Entry {
+        std::weak_ptr<const Graphics::ShaderResources> resources;
+        std::shared_ptr<const std::vector<DevicePageTable::Range>> ranges;
+    };
+    std::mutex mutex;
+    std::unordered_map<const Graphics::ShaderResources*, Entry> entries;
+    std::size_t prunedAt = 256;
+};
+
+KeptRanges& BuildRanges() {
+    static auto* kept = new KeptRanges;
+    return *kept;
+}
+
+}
+
+void NoteBufferRanges(EmitCandidate& candidate, const std::shared_ptr<Graphics::ShaderResources>& resources, bool fromCache, bool moved) {
+    candidate.bufferRanges = nullptr;
+    if (!candidate.c1Twin || resources == nullptr || moved) return;
+    auto& kept = BuildRanges();
+    if (fromCache) {
+        std::lock_guard lock(kept.mutex);
+        if (const auto found = kept.entries.find(resources.get()); found != kept.entries.end() && found->second.resources.lock() == resources) {
+            candidate.bufferRanges = found->second.ranges;
+            return;
+        }
     }
+    try {
+        candidate.bufferRanges = resources->GuestBufferRanges();
+    } catch (const std::exception&) {
+        return;
+    }
+    if (candidate.bufferRanges == nullptr || !resources->Reusable()) return;
+    std::lock_guard lock(kept.mutex);
+    if (kept.entries.size() >= kept.prunedAt) {
+        std::erase_if(kept.entries, [](const auto& item) { return item.second.resources.expired(); });
+        kept.prunedAt = std::max<std::size_t>(256, kept.entries.size() * 2);
+    }
+    kept.entries[resources.get()] = {resources, candidate.bufferRanges};
+}
+
+std::size_t KeptBufferRanges() {
+    auto& kept = BuildRanges();
+    std::lock_guard lock(kept.mutex);
+    return kept.entries.size();
 }
 
 void CoverBuffers(const EmitCandidate& candidate, const Graphics::ShaderResources& resources, CommandFacts& facts, DevicePageTable::Snapshot* used, const ShaderRecompiler::RecompileResult* threadLimitOf) {
@@ -348,6 +390,24 @@ void CoverBuffers(const EmitCandidate& candidate, const Graphics::ShaderResource
         // bound to a staged copy (the S2-share probe's dominant case).
         facts.tableCovers = false;
         facts.coverReason = SitesInside(candidate.twin->readRanges, *candidate.bufferRanges, false) && SitesInside(candidate.twin->writeRanges, *candidate.bufferRanges, false) ? FallbackReason::C1WrittenElsewhere : FallbackReason::C1NotCovered;
+        static std::atomic<int> reported{0};
+        if (Profile() && reported.fetch_add(1, std::memory_order_relaxed) < 12) {
+            std::string text;
+            const auto list = [&](const char* name, const auto& ranges, auto describe) {
+                text += std::string(text.empty() ? "" : "; ") + name + ":";
+                std::size_t shown = 0;
+                for (const auto& range : ranges) {
+                    if (++shown > 6) { text += " ..."; break; }
+                    text += " " + describe(range);
+                }
+            };
+            const auto hex = [](std::uint64_t value) { char buffer[24]; std::snprintf(buffer, sizeof(buffer), "0x%llx", static_cast<unsigned long long>(value)); return std::string(buffer); };
+            const auto site = [&](const std::pair<std::uint64_t, std::uint64_t>& range) { return hex(range.first) + "-" + hex(range.second); };
+            list("reads", candidate.twin->readRanges, site);
+            list("writes", candidate.twin->writeRanges, site);
+            list("build", *candidate.bufferRanges, [&](const DevicePageTable::Range& range) { return hex(range.begin) + "-" + hex(range.end) + ((range.permissions & ShaderRecompiler::BdaAbi::Write) != 0u ? "w" : "r"); });
+            std::fprintf(stderr, "[newpath] C1 %s (unbounded reads %d writes %d): %s\n", FallbackReasonName(facts.coverReason), candidate.twin->unboundedReads ? 1 : 0, candidate.twin->unboundedWrites ? 1 : 0, text.c_str());
+        }
         return;
     }
     auto& table = DeviceTable();

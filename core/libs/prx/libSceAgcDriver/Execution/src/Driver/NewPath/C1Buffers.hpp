@@ -9,8 +9,10 @@
 namespace AgcDriver::NewPath {
 
 // The build's guest-buffer ranges onto the candidate (after the build, before the record); null when the build
-// cannot give them.
-void NoteBufferRanges(EmitCandidate& candidate, const Graphics::ShaderResources& resources);
+// cannot give them. A resource-cache hit (fromCache) binds the descriptors of its first build, whose ranges are kept
+// per resources object (a committed build no longer lists them); a hit that rebinds moved buffers (moved) has none.
+void NoteBufferRanges(EmitCandidate& candidate, const std::shared_ptr<Graphics::ShaderResources>& resources, bool fromCache, bool moved);
+[[nodiscard]] std::size_t KeptBufferRanges();
 // F4: every guest-buffer range of the build maps in the device page table to the address the build binds, with its
 // permissions (Write where the build writes in place). Fills the facts' cover and reason; `used` as Covers.
 // The twin's bounded read and write sites must lie inside the build's ranges, its write sites inside ranges the build

@@ -6607,7 +6607,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         emit->addressBased = resources->UsesAddressTable();
         NewPath::NoteBufferCover(*emit, *resources);
         NewPath::CostBegin();
-        NewPath::NoteBufferRanges(*emit, *resources);
+        NewPath::NoteBufferRanges(*emit, resources, fromCache, overlay != nullptr);
         NewPath::CostLap(NewPath::CostStep::Ranges);
     }
     if (profile) timer.add(PhaseResourcesHookWaits, Graphics::Recorder::ThreadWaitedMs() - waitedBefore);

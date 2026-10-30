@@ -434,6 +434,11 @@ void c1Twins() {
         Expect(!SitesInside(readOnlyWrite, build, true) && SitesInside(readOnlyWrite, build, false), "a write site over a read-only range was accepted, or the read refused");
         Expect(!SitesInside(outside, build, false), "a site outside the build's ranges was accepted");
         Expect(SitesInside({}, {}, true), "no sites refused");
+        const std::vector<std::pair<std::uint64_t, std::uint64_t>> tail{{0x3f00, 0x4010}};
+        const std::vector<std::pair<std::uint64_t, std::uint64_t>> longTail{{0x3f00, 0x4011}};
+        const std::vector<std::pair<std::uint64_t, std::uint64_t>> tailOnly{{0x4000, 0x4010}};
+        Expect(SitesInside(tail, build, false), "a site one element past the build's last range was refused");
+        Expect(!SitesInside(longTail, build, false) && !SitesInside(tailOnly, build, false), "a site past the build by more than an element, or wholly outside, was accepted");
     }
 
     const auto words = TwinPushWords(*twin);
