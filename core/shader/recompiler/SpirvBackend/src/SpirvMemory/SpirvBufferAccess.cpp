@@ -130,8 +130,12 @@ std::uint32_t EmitShaderDataWordLoad(SpirvEmitterState& state, std::uint32_t ind
 
 std::uint32_t EmitFlattenedSrtLoad(SpirvEmitterState& state, std::uint32_t index) {
     if (state.flattenedSrtAddressed) {
-        const auto inBounds = Binary(state, spv::OpULessThan, TypeBool(state), index, EmitStageRootDword(state, RuntimeAbi::RootStageField::SrtDwords));
-        return EmitValueOrZeroIfCondition(state, inBounds, [&] { return dataAddressLoad(state, RuntimeAbi::RootStageField::FlattenedSrt, index); });
+        const auto u32 = TypeU32(state);
+        const auto dwords = EmitStageRootDword(state, RuntimeAbi::RootStageField::SrtDwords);
+        const auto inBounds = Binary(state, spv::OpULessThan, TypeBool(state), index, dwords);
+        const auto last = Select(state, u32, Binary(state, spv::OpIEqual, TypeBool(state), dwords, ConstantU32(state, 0u)), ConstantU32(state, 0u), Binary(state, spv::OpISub, u32, dwords, ConstantU32(state, 1u)));
+        const auto clamped = Select(state, u32, inBounds, index, last);
+        return Select(state, u32, inBounds, dataAddressLoad(state, RuntimeAbi::RootStageField::FlattenedSrt, clamped), ConstantU32(state, 0u));
     }
     if (state.flattenedSrtVariable == 0) FailEmit("the flattened SRT descriptor is missing");
     const auto pointer = state.module.AllocateId();
