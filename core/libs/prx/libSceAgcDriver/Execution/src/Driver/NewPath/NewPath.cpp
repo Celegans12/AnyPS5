@@ -298,9 +298,12 @@ bool InPlaceWrites(const EmitCandidate& candidate) {
     static const int mode = [] {
         if (!EmitDispatches() || EnvSet("APS5_NEW_PATH_NO_IN_PLACE_WRITES")) return 0;
         const char* scope = std::getenv("APS5_NEW_PATH_IN_PLACE_WRITES");
-        return scope != nullptr && std::string_view(scope) == "all" ? 2 : 1;
+        if (scope != nullptr && std::string_view(scope) == "all") return 2;
+        return scope != nullptr && std::string_view(scope) == "c1" ? 3 : 1;
     }();
-    return mode == 2 || (mode == 1 && candidate.twin != nullptr);
+    // C1 twin builds keep their staged written elements by default: R-written's rows passed the default scope only
+    // for address-based twin builds; in place for C1 builds (R's `all` scope, w6) fails; D-combo s1 failed cap-river13 with it and d1 (APS5_NEW_PATH_NO_IN_PLACE_WRITES) passed.
+    return mode == 2 || (mode == 3 && candidate.twin != nullptr) || (mode == 1 && candidate.twin != nullptr && !candidate.c1Twin);
 }
 
 bool MayEmitWithoutTable(const EmitCandidate& candidate, bool pipelineReady) {
