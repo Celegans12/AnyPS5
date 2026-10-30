@@ -217,6 +217,28 @@ public:
     // the run wrote an overlapping range: the caller then records a barrier first (it orders every
     // earlier copy-back, so the noted ranges restart).
     bool AfterRunMerging() const { return open != nullptr && open->afterRunMerging; }
+    // Copy trail merge (APS5_NO_COPY_TRAIL_MERGE=1 turns it off; an APS5_AB switch). A dispatch's
+    // copy-ins usually close the open run of the previous one, whose copy-backs then record a
+    // trailing barrier right before the copy-ins' own. While a copy-in holds the hold armed (around
+    // its Commands call), the copy-back's trailing barrier is held in the batch instead
+    // (HoldTransferBarrier); the copy-in takes it (TakeHeldTransfer) when it neither reads a guest
+    // range the copy-backs wrote nor writes a buffer they read, and records one barrier for both.
+    // Anything else that records into the batch settles the held barrier first.
+    static bool CopyTrailMergeEnabled();
+    struct HeldTransfer {
+        VkPipelineStageFlags srcStage = 0;
+        VkPipelineStageFlags dstStage = 0;
+        VkAccessFlags srcAccess = 0;
+        VkAccessFlags dstAccess = 0;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
+        std::vector<VkBuffer> buffers;
+        VkCommandBuffer commands = VK_NULL_HANDLE;
+    };
+    void ArmTransferHold(bool armed);
+    bool HoldTransferBarrier(VkCommandBuffer commands, HeldTransfer held, VkAccessFlags coveredBefore);
+    std::optional<HeldTransfer> TakeHeldTransfer();
+    void SettleHeldTransfer();
+    static std::array<std::uint64_t, 3> CopyTrailCounts();
     bool AfterRunWrite(std::uint64_t begin, std::uint64_t end);
     // APS5_PROFILE_DRAW: batched staging and lost-overlap counts, cumulative.
     struct BatchedStagingStats {
@@ -998,6 +1020,7 @@ private:
         // See AfterRunMerging: while the run's copy-backs record, the guest ranges they wrote since
         // the last barrier, and whether any wrote.
         bool afterRunMerging = false;
+        std::optional<HeldTransfer> heldTransfer;
         bool afterRunWrote = false;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> afterRunWritten;
         // The hazard tracker's accesses since its last simulated barrier (see NoteAccess).

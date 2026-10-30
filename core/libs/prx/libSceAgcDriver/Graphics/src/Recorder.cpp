@@ -1874,6 +1874,50 @@ bool Recorder::BatchedStagingEnabled() {
     return !RuntimeSwitches::Set(RuntimeSwitch::NoBatchedStaging);
 }
 
+bool Recorder::CopyTrailMergeEnabled() {
+    return !RuntimeSwitches::Set(RuntimeSwitch::NoCopyTrailMerge);
+}
+
+namespace {
+
+std::array<bool, 2> transferHoldArmed{};
+std::array<std::atomic<std::uint64_t>, 3> copyTrailCounters{};
+
+}
+
+void Recorder::ArmTransferHold(bool armed) {
+    transferHoldArmed[static_cast<std::size_t>(currentLane())] = armed;
+}
+
+bool Recorder::HoldTransferBarrier(VkCommandBuffer commands, HeldTransfer held, VkAccessFlags coveredBefore) {
+    if (!transferHoldArmed[static_cast<std::size_t>(currentLane())] || open == nullptr || commands != open->commands || open->heldTransfer.has_value() || open->renderPass.open || open->run.open || BarrierValidate()) return false;
+    held.commands = commands;
+    open->heldTransfer = std::move(held);
+    open->coveredAccess = coveredBefore;
+    copyTrailCounters[0].fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+std::optional<Recorder::HeldTransfer> Recorder::TakeHeldTransfer() {
+    if (open == nullptr || !open->heldTransfer.has_value()) return std::nullopt;
+    auto held = std::exchange(open->heldTransfer, std::nullopt);
+    copyTrailCounters[1].fetch_add(1, std::memory_order_relaxed);
+    return held;
+}
+
+void Recorder::SettleHeldTransfer() {
+    if (open == nullptr || !open->heldTransfer.has_value()) return;
+    const auto held = *std::exchange(open->heldTransfer, std::nullopt);
+    recordBarrier(held.commands, held.srcStage, held.dstStage, held.srcAccess, held.dstAccess);
+    CountBarriers(CommandClass::StagingOut);
+    open->coveredAccess = held.dstAccess;
+    copyTrailCounters[2].fetch_add(1, std::memory_order_relaxed);
+}
+
+std::array<std::uint64_t, 3> Recorder::CopyTrailCounts() {
+    return {copyTrailCounters[0].load(std::memory_order_relaxed), copyTrailCounters[1].load(std::memory_order_relaxed), copyTrailCounters[2].load(std::memory_order_relaxed)};
+}
+
 bool Recorder::StagedOverlapEnabled() {
     return !RuntimeSwitches::Set(RuntimeSwitch::NoStagedOverlap);
 }
@@ -2097,6 +2141,7 @@ VkCommandBuffer Recorder::beginChunk() {
 VkCommandBuffer Recorder::SplitForRun() {
     Require(open != nullptr, "a run split has no batch");
     GuestMemory::AssertGpuLockHeld("Recorder::SplitForRun");
+    SettleHeldTransfer();
     // A query begun in the batch's command buffer must end in it (sample counting); an open render
     // pass or store run cannot span command buffers either (Commands() closed them).
     if (open->sampleActive || open->segmentActive || open->renderPass.open || open->run.open) return open->commands;
@@ -2234,6 +2279,7 @@ VkCommandBuffer Recorder::RunCommands(std::uint32_t queueKey, const void* owner,
     inRun = queueKey != 0 && open != nullptr && open->edgeOwed == 0 && open->deferredDispatchQueue == queueKey && !open->renderPass.open && !open->run.open && std::find(open->deferredRun.begin(), open->deferredRun.end(), owner) == open->deferredRun.end() && !RunAtomicConflict(accesses) && !RunRangeConflict(accesses);
     if (!inRun) return Commands(coveredAccess);
     GuestMemory::AssertGpuLockHeld("Recorder::RunCommands");
+    SettleHeldTransfer();
     if (coveredAccess != nullptr) *coveredAccess = 0;
     return open->commands;
 }
@@ -2256,6 +2302,7 @@ VkCommandBuffer Recorder::OverlapCommands(std::uint32_t queueKey, std::span<cons
     }
     if (!overlapped) return Commands(coveredAccess);
     GuestMemory::AssertGpuLockHeld("Recorder::OverlapCommands");
+    SettleHeldTransfer();
     if (coveredAccess != nullptr) *coveredAccess = 0;
     // The barrier stays owed (any other command recorded before this dispatch's own still records
     // it first); the dispatch then defers its own trailing barrier, which covers both.
@@ -2283,9 +2330,11 @@ void Recorder::DeferDispatchBarrier(std::uint32_t queueKey, std::span<const void
 
 VkCommandBuffer Recorder::Commands(VkAccessFlags* coveredAccess, std::source_location where) {
     ensureOpen();
+    SettleHeldTransfer();
     takeOwedEdge();
     open->handedOut = true;
     flushDeferredDispatch(0, where);
+    if (open->renderPass.open || (open->run.open && !LabelRunsPerBatch())) SettleHeldTransfer();
     // Work recorded after a draw's render pass or an inline store run must see their writes: the
     // pass's end and the run's trailing barrier go in first (a per-batch run waits for Submit, or
     // for a caller whose ranges overlap a queued store: FlushStores).
@@ -2302,6 +2351,7 @@ void Recorder::MarkCovered(VkAccessFlags access) {
 
 Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access, std::source_location where) {
     ensureOpen();
+    SettleHeldTransfer();
     takeOwedEdge();
     open->handedOut = true;
     flushDeferredDispatch(1, where);
@@ -5001,6 +5051,7 @@ void Recorder::Submit() {
     dropStaleHoldKept();
     if (open == nullptr) return;
     GuestMemory::AssertGpuLockHeld("Recorder::Submit");
+    SettleHeldTransfer();
     flushDeferredDispatch(6);
     sealPrelude();
     if (!open->keyStores.empty()) recordKeyStores(false);

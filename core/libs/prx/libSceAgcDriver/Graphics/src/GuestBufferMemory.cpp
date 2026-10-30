@@ -5192,6 +5192,98 @@ void traceStaged(std::uint64_t begin, std::uint64_t end, bool atomic) {
     std::fprintf(stderr, "[staging] 0x%llx+0x%llx (%.1f KiB)%s\n", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), (end - begin) / 1024.0, atomic ? " atomic" : "");
 }
 
+constexpr VkAccessFlags CopiedBackAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_HOST_READ_BIT;
+constexpr VkAccessFlags DispatchedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
+constexpr VkAccessFlags CopiedInAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+
+struct CopyShape {
+    std::mutex mutex;
+    std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
+    std::array<std::uint64_t, 3> inPath{};
+    std::array<std::uint64_t, 5> inRegions{};
+    std::array<std::uint64_t, 4> inAfter{};
+    std::array<std::uint64_t, 4> outAfter{};
+    std::array<std::uint64_t, 7> madeBySize{};
+    std::array<std::uint64_t, 7> madeBytesBySize{};
+    std::array<std::uint64_t, 5> outRanges{};
+    std::uint64_t inCalls = 0, inLeading = 0, inReusedCalls = 0, inAfterBackDisjoint = 0, inEmptyCalls = 0;
+    std::uint64_t residentSkipped = 0, made = 0, madeSnapshot = 0, madeSourced = 0, madeImport = 0, madePending = 0, madeOpenWrite = 0, madeReused = 0, madeResident = 0, hoistable = 0, hoistableBytes = 0;
+    std::uint64_t batches = 0, lastBatch = ~std::uint64_t{0}, callsInBatch = 0, maxCallsInBatch = 0;
+    const void* lastRecorder = nullptr;
+    std::uint64_t outCalls = 0, outMerging = 0, outCopies = 0, outBytes = 0, outLeading = 0;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> lastBackWrites;
+    std::uint64_t lastBackBatch = ~std::uint64_t{0};
+};
+
+bool copyShapeProfiled() {
+    static const bool on = std::getenv("APS5_PROFILE_COPY_SHAPE") != nullptr;
+    return on;
+}
+
+CopyShape& Shape() {
+    static auto* shape = new CopyShape;
+    return *shape;
+}
+
+std::size_t coveredClass(VkAccessFlags covered) {
+    return covered == CopiedBackAccess ? 0u : covered == DispatchedAccess ? 1u : covered == CopiedInAccess ? 2u : 3u;
+}
+
+std::size_t sizeBucket(std::uint64_t bytes) {
+    std::size_t bucket = 0;
+    for (const std::uint64_t limit : {std::uint64_t{4} << 10u, std::uint64_t{64} << 10u, std::uint64_t{256} << 10u, std::uint64_t{1} << 20u, std::uint64_t{4} << 20u, std::uint64_t{16} << 20u}) {
+        if (bytes < limit) return bucket;
+        ++bucket;
+    }
+    return bucket;
+}
+
+std::size_t countBucket(std::size_t count) {
+    return count <= 1 ? 0u : count == 2 ? 1u : count <= 4 ? 2u : count <= 8 ? 3u : 4u;
+}
+
+void reportShape(CopyShape& shape) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - shape.reported < std::chrono::seconds(10)) return;
+    shape.reported = now;
+    const auto u = [](std::uint64_t value) { return static_cast<unsigned long long>(value); };
+    std::string sizes;
+    static constexpr std::array<const char*, 7> names{"<4K", "<64K", "<256K", "<1M", "<4M", "<16M", ">=16M"};
+    for (std::size_t index = 0; index < names.size(); ++index) {
+        char text[64];
+        std::snprintf(text, sizeof(text), "%s%s %llu/%.1fMiB", sizes.empty() ? "" : " ", names[index], u(shape.madeBySize[index]), shape.madeBytesBySize[index] / 1048576.0);
+        sizes += text;
+    }
+    std::fprintf(stderr, "[copy-shape] (10 s) copy-in calls %llu (inline %llu, in a run inline %llu, prelude %llu; reused builds %llu; with nothing made %llu), leading barriers %llu, regions per call 1:%llu 2:%llu 3-4:%llu 5-8:%llu 9+:%llu; after copy-back %llu (disjoint from it %llu) / dispatch trail %llu / copy-in %llu / other %llu; batches with copy-ins %llu (max %llu calls in one); copies made %llu, resident skipped %llu; made by source snapshot %llu, gpu-sourced %llu, import %llu; pending writer %llu, open write %llu; dest reused %llu, resident %llu; hoistable %llu (%.1f MiB); by size %s; copy-back calls %llu (merging %llu), leading barriers %llu, copies %llu (%.1f MiB), ranges per call 1:%llu 2:%llu 3-4:%llu 5-8:%llu 9+:%llu, after copy-back %llu / dispatch trail %llu / copy-in %llu / other %llu\n",
+        u(shape.inCalls), u(shape.inPath[0]), u(shape.inPath[1]), u(shape.inPath[2]), u(shape.inReusedCalls), u(shape.inEmptyCalls), u(shape.inLeading), u(shape.inRegions[0]), u(shape.inRegions[1]), u(shape.inRegions[2]), u(shape.inRegions[3]), u(shape.inRegions[4]), u(shape.inAfter[0]), u(shape.inAfterBackDisjoint), u(shape.inAfter[1]), u(shape.inAfter[2]), u(shape.inAfter[3]), u(shape.batches), u(shape.maxCallsInBatch), u(shape.made), u(shape.residentSkipped), u(shape.madeSnapshot), u(shape.madeSourced), u(shape.madeImport), u(shape.madePending), u(shape.madeOpenWrite), u(shape.madeReused), u(shape.madeResident), u(shape.hoistable), shape.hoistableBytes / 1048576.0, sizes.c_str(),
+        u(shape.outCalls), u(shape.outMerging), u(shape.outLeading), u(shape.outCopies), shape.outBytes / 1048576.0, u(shape.outRanges[0]), u(shape.outRanges[1]), u(shape.outRanges[2]), u(shape.outRanges[3]), u(shape.outRanges[4]), u(shape.outAfter[0]), u(shape.outAfter[1]), u(shape.outAfter[2]), u(shape.outAfter[3]));
+    const auto trail = Recorder::CopyTrailCounts();
+    std::fprintf(stderr, "[copy-trail] (cumulative, APS5_NO_COPY_TRAIL_MERGE %s) copy-back trailing barriers held %llu, taken by a copy-in %llu, settled by other work %llu\n", RuntimeSwitches::Set(RuntimeSwitch::NoCopyTrailMerge) ? "set" : "unset", u(trail[0]), u(trail[1]), u(trail[2]));
+    const auto keepBatch = shape.lastBatch;
+    const auto* keepRecorder = shape.lastRecorder;
+    const auto keepCalls = shape.callsInBatch;
+    auto keepWrites = std::move(shape.lastBackWrites);
+    const auto keepBackBatch = shape.lastBackBatch;
+    shape.inPath = {};
+    shape.inRegions = {};
+    shape.inAfter = {};
+    shape.outAfter = {};
+    shape.madeBySize = {};
+    shape.madeBytesBySize = {};
+    shape.outRanges = {};
+    shape.inCalls = shape.inLeading = shape.inReusedCalls = shape.inAfterBackDisjoint = shape.inEmptyCalls = 0;
+    shape.residentSkipped = shape.made = shape.madeSnapshot = shape.madeSourced = shape.madeImport = shape.madePending = shape.madeOpenWrite = shape.madeReused = shape.madeResident = shape.hoistable = shape.hoistableBytes = 0;
+    shape.batches = shape.maxCallsInBatch = 0;
+    shape.outCalls = shape.outMerging = shape.outCopies = shape.outBytes = shape.outLeading = 0;
+    shape.lastBatch = keepBatch;
+    shape.lastRecorder = keepRecorder;
+    shape.callsInBatch = keepCalls;
+    shape.lastBackWrites = std::move(keepWrites);
+    shape.lastBackBatch = keepBackBatch;
+}
+
+thread_local bool copyingReusedBuild = false;
+
 void reportStaging() {
     auto& stats = Copies();
     const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -6218,7 +6310,40 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
     auto& runAccesses = ShaderRecompiler::ThreadOwned(runAccessesSlot);
     runAccesses.clear();
     if (recorder->RunOpen()) RunAccesses(runAccesses);
-    auto commands = Recorder::DispatchOverlapEnabled() && Recorder::StagedOverlapEnabled() ? recorder->RunCommands(Recorder::PeekUnorderedDispatch(), this, inRun, &covered, runAccesses) : recorder->Commands(&covered);
+    const bool trailMerge = Recorder::CopyTrailMergeEnabled() && !capture && !Recorder::BarrierValidate();
+    if (trailMerge) recorder->ArmTransferHold(true);
+    VkCommandBuffer commands = VK_NULL_HANDLE;
+    try {
+        commands = Recorder::DispatchOverlapEnabled() && Recorder::StagedOverlapEnabled() ? recorder->RunCommands(Recorder::PeekUnorderedDispatch(), this, inRun, &covered, runAccesses) : recorder->Commands(&covered);
+    } catch (...) {
+        if (trailMerge) recorder->ArmTransferHold(false);
+        throw;
+    }
+    if (trailMerge) recorder->ArmTransferHold(false);
+    std::optional<Recorder::HeldTransfer> heldTrail;
+    if (trailMerge) {
+        heldTrail = recorder->TakeHeldTransfer();
+        if (heldTrail.has_value()) {
+            const auto inHeld = [&](VkBuffer buffer) { return buffer != VK_NULL_HANDLE && std::find(heldTrail->buffers.begin(), heldTrail->buffers.end(), buffer) != heldTrail->buffers.end(); };
+            const bool conflict = heldTrail->commands != commands || std::any_of(copies.begin(), copies.end(), [&](const Region* region) {
+                if (std::any_of(heldTrail->writes.begin(), heldTrail->writes.end(), [&](const auto& range) { return region->begin < range.second && range.first < region->end; })) return true;
+                return (region->buffer != nullptr && inHeld(region->buffer->Handle())) || (region->pristine != nullptr && inHeld(region->pristine->Handle()));
+            });
+            if (conflict) {
+                RecordMemoryBarrier(context, heldTrail->commands, heldTrail->srcStage, heldTrail->dstStage, heldTrail->srcAccess, heldTrail->dstAccess);
+                Recorder::CountBarriers(Recorder::CommandClass::StagingOut);
+                covered = heldTrail->dstAccess;
+                heldTrail.reset();
+            }
+        }
+    }
+    struct HeldGuard {
+        const Context& context;
+        std::optional<Recorder::HeldTransfer>& held;
+        ~HeldGuard() {
+            if (held.has_value()) RecordMemoryBarrier(context, held->commands, held->srcStage, held->dstStage, held->srcAccess, held->dstAccess);
+        }
+    } heldGuard{context, heldTrail};
     // Batched staging (Recorder::SplitForRun): a joining dispatch's copies go to the run's prelude,
     // submitted ahead of the run's dispatches, whose barriers it records once for the whole run.
     // Not with the capture's read-backs or the hazard validator (both work per copy).
@@ -6236,9 +6361,36 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         recorder->NoteAccess(Recorder::CommandClass::StagingIn, Recorder::Access{reads, {}, {}, VK_PIPELINE_STAGE_TRANSFER_BIT});
     }
     constexpr BarrierMask leading{VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT};
+    bool leadingRecorded = false;
     if (!inRun && !Recorder::ElideCovered(Recorder::CommandClass::StagingIn, leading, covered)) {
         RecordMemoryBarrier(context, commands, leading.srcStage, leading.dstStage, leading.srcAccess, leading.dstAccess);
         Recorder::CountBarriers(Recorder::CommandClass::StagingIn);
+        leadingRecorded = true;
+    }
+    const bool shapeProfiled = copyShapeProfiled();
+    std::size_t shapeMade = 0;
+    if (shapeProfiled) {
+        auto& shape = Shape();
+        std::lock_guard lock(shape.mutex);
+        ++shape.inCalls;
+        ++shape.inPath[prelude ? 2u : inRun ? 1u : 0u];
+        if (copyingReusedBuild) ++shape.inReusedCalls;
+        if (leadingRecorded) ++shape.inLeading;
+        ++shape.inRegions[countBucket(copies.size())];
+        const auto after = coveredClass(covered);
+        ++shape.inAfter[after];
+        const auto batch = recorder->Submissions();
+        if (after == 0 && shape.lastBackBatch == batch) {
+            const bool disjoint = std::none_of(copies.begin(), copies.end(), [&](const Region* region) { return std::any_of(shape.lastBackWrites.begin(), shape.lastBackWrites.end(), [&](const auto& range) { return region->begin < range.second && range.first < region->end; }); });
+            if (disjoint) ++shape.inAfterBackDisjoint;
+        }
+        if (shape.lastRecorder != recorder || shape.lastBatch != batch) {
+            shape.lastRecorder = recorder;
+            shape.lastBatch = batch;
+            shape.callsInBatch = 0;
+            ++shape.batches;
+        }
+        shape.maxCallsInBatch = std::max(shape.maxCallsInBatch, ++shape.callsInBatch);
     }
     bool stagedAny = false;
     std::uint64_t copiedBytes = 0;
@@ -6338,7 +6490,31 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
             copiedBytes -= bytes;
             recorder->Keep(region->buffer);
             region->snapshot.clear();
+            if (shapeProfiled) {
+                auto& shape = Shape();
+                std::lock_guard lock(shape.mutex);
+                ++shape.residentSkipped;
+            }
             continue;
+        }
+        if (shapeProfiled) {
+            auto& shape = Shape();
+            const bool openWrite = recorder->OpenWriteOverlaps(address, static_cast<std::size_t>(bytes));
+            std::lock_guard lock(shape.mutex);
+            ++shapeMade;
+            ++shape.made;
+            ++(inputSnapshot != nullptr ? shape.madeSnapshot : sourced ? shape.madeSourced : shape.madeImport);
+            if (pendingWriter) ++shape.madePending;
+            if (openWrite) ++shape.madeOpenWrite;
+            if (copyingReusedBuild) ++shape.madeReused;
+            if (region->resident) ++shape.madeResident;
+            if (!pendingWriter && !openWrite && !copyingReusedBuild && !region->resident) {
+                ++shape.hoistable;
+                shape.hoistableBytes += bytes;
+            }
+            const auto bucket = sizeBucket(bytes);
+            ++shape.madeBySize[bucket];
+            shape.madeBytesBySize[bucket] += bytes;
         }
         CopyBuffer(context, commands, copySource, copyOffset, region->buffer->Handle(), 0, bytes);
         if (region->resident) residentCopied(region->begin, region->end, region->buffer);
@@ -6413,12 +6589,28 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         }
     }
     if (stagedAny) reportStaging();
+    if (shapeProfiled) {
+        auto& shape = Shape();
+        std::lock_guard lock(shape.mutex);
+        if (shapeMade == 0) ++shape.inEmptyCalls;
+        reportShape(shape);
+    }
     // The copied bytes are visible to the shaders bound to the buffers, which may also store into
     // them. Every stage: dispatches and draws share this path, and draws run mesh, task and
     // tessellation shaders too (the batch's own barriers around dispatches are as wide). A
     // prelude's copies get the prelude's barrier at its end (Recorder::sealPrelude).
     if (!prelude) {
-        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        VkPipelineStageFlags srcStage = VK_PIPELINE_STAGE_TRANSFER_BIT, dstStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        VkAccessFlags srcAccess = VK_ACCESS_TRANSFER_WRITE_BIT, dstAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        if (heldTrail.has_value()) {
+            srcStage |= heldTrail->srcStage;
+            dstStage |= heldTrail->dstStage;
+            srcAccess |= heldTrail->srcAccess;
+            dstAccess |= heldTrail->dstAccess;
+            heldTrail.reset();
+            Recorder::CountMerged(Recorder::CommandClass::StagingOut);
+        }
+        RecordMemoryBarrier(context, commands, srcStage, dstStage, srcAccess, dstAccess);
         Recorder::CountBarriers(Recorder::CommandClass::StagingIn);
         recorder->MarkCovered(VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
     }
@@ -6453,6 +6645,10 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
     // need no leading one (the run's deferred barrier just ordered its dispatches' writes) unless
     // an earlier one of them wrote an overlapping range (Recorder::AfterRunWrite).
     const bool merging = recorder.AfterRunMerging();
+    std::size_t shapeCopies = 0, shapeAfter = 3;
+    bool shapeLeading = false;
+    VkAccessFlags coveredBefore = 0;
+    std::vector<VkBuffer> readBuffers;
     if (!writes.empty()) {
         auto sorted = writes;
         std::sort(sorted.begin(), sorted.end());
@@ -6516,9 +6712,13 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
                 // (and the APS5_STAGING_DIFF kernel's reads), unless the trailing barrier just
                 // recorded already orders them (ElideCovered).
                 const BarrierMask leading{VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | (diff ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : 0u), VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | (diff ? VK_ACCESS_SHADER_READ_BIT : 0u)};
+                shapeAfter = coveredClass(covered);
                 if (!Recorder::ElideCovered(Recorder::CommandClass::StagingOut, leading, covered)) {
                     RecordMemoryBarrier(context, commands, leading.srcStage, leading.dstStage, leading.srcAccess, leading.dstAccess);
                     Recorder::CountBarriers(Recorder::CommandClass::StagingOut);
+                    shapeLeading = true;
+                } else {
+                    coveredBefore = covered;
                 }
                 recording = true;
             }
@@ -6553,6 +6753,9 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
                 if (diff && profile && region.deviceLocal) Copies().diffWholeBytes.fetch_add(wholeEnd - whole, std::memory_order_relaxed);
             }
             copiedBytes += to - from;
+            ++shapeCopies;
+            readBuffers.push_back(region.buffer->Handle());
+            if (region.pristine != nullptr) readBuffers.push_back(region.pristine->Handle());
             recorder.Keep(region.buffer);
             if (profile) {
                 Copies().gpuCopyBacks.fetch_add(1, std::memory_order_relaxed);
@@ -6565,12 +6768,39 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
         // staging bytes, instead of losing the shader's results.
         region.copiedBack = true;
     }
+    if (copyShapeProfiled() && recording) {
+        auto& shape = Shape();
+        std::lock_guard lock(shape.mutex);
+        ++shape.outCalls;
+        if (merging) ++shape.outMerging;
+        if (shapeLeading) ++shape.outLeading;
+        ++shape.outAfter[shapeAfter];
+        shape.outCopies += shapeCopies;
+        shape.outBytes += copiedBytes;
+        ++shape.outRanges[countBucket(shapeCopies)];
+        shape.lastBackWrites = merged;
+        shape.lastBackBatch = recorder.Submissions();
+        reportShape(shape);
+    }
     if (!recording || merging) return;
     if (Recorder::BarrierValidate()) recorder.NoteAccess(Recorder::CommandClass::StagingOut, Recorder::Access{{}, merged, {}, VK_PIPELINE_STAGE_TRANSFER_BIT});
     // As a GPU label store or fill: visible to everything recorded after (shaders, transfers, an
     // indirect dispatch's arguments) and to the host once the batch completed; the caller's
     // pending-write note makes CPU readers wait for that.
     constexpr VkAccessFlags copiedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_HOST_READ_BIT;
+    if (Recorder::CopyTrailMergeEnabled() && heapReadbacks.empty()) {
+        Recorder::HeldTransfer held;
+        held.srcStage = VK_PIPELINE_STAGE_TRANSFER_BIT | (diffed ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : 0u);
+        held.dstStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT;
+        held.srcAccess = VK_ACCESS_TRANSFER_WRITE_BIT | (diffed ? VK_ACCESS_SHADER_WRITE_BIT : 0u);
+        held.dstAccess = copiedAccess;
+        held.writes = merged;
+        held.buffers = std::move(readBuffers);
+        if (recorder.HoldTransferBarrier(commands, std::move(held), coveredBefore)) {
+            recorder.EndGpuTiming(timing, copiedBytes);
+            return;
+        }
+    }
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT | (diffed ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : 0u), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | (diffed ? VK_ACCESS_SHADER_WRITE_BIT : 0u), copiedAccess);
     Recorder::CountBarriers(Recorder::CommandClass::StagingOut);
     recorder.MarkCovered(copiedAccess);
@@ -7587,6 +7817,10 @@ void GuestBufferMemory::RecordStagingCopies(Recorder& recorder) {
     if (copies.empty()) return;
     Require(Recorder::Active() == &recorder, "staging copies recorded into a recorder that is not the device's");
     if (profile) Copies().stagedReused.fetch_add(copies.size(), std::memory_order_relaxed);
+    struct ReusedScope {
+        ReusedScope() { copyingReusedBuild = true; }
+        ~ReusedScope() { copyingReusedBuild = false; }
+    } reusedScope;
     recordGpuCopies(copies, false);
 }
 

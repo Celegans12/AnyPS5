@@ -1894,6 +1894,72 @@ void storeRunTests(const Device& device, Recorder& recorder) {
     HostImportFor(context, address, bytes);
 }
 
+void copyTrailHoldTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    recorder.Sync();
+    constexpr std::size_t bytes = 1u << 20u;
+    Buffer source(context, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    Buffer middle(context, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    Buffer target(context, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    auto fill = [](Buffer& buffer, std::uint32_t salt) {
+        auto* words = reinterpret_cast<std::uint32_t*>(buffer.Bytes().data());
+        for (std::size_t index = 0; index < bytes / 4; ++index) words[index] = static_cast<std::uint32_t>(index * 2654435761u) ^ salt;
+
+    };
+    fill(source, 0x1234u);
+    fill(middle, 0u);
+    fill(target, 0u);
+    const auto held = [&](VkCommandBuffer commands) {
+        Recorder::HeldTransfer transfer;
+        transfer.srcStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        transfer.dstStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT;
+        transfer.srcAccess = VK_ACCESS_TRANSFER_WRITE_BIT;
+        transfer.dstAccess = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_HOST_READ_BIT;
+        transfer.writes = {{0x1000, 0x1000 + bytes}};
+        transfer.buffers = {source.Handle()};
+        return recorder.HoldTransferBarrier(commands, std::move(transfer), VK_ACCESS_TRANSFER_READ_BIT);
+    };
+    const auto before = Recorder::CopyTrailCounts();
+    auto commands = recorder.Commands();
+    Require(!held(commands), "a copy-back barrier was held without an armed copy-in");
+    recorder.ArmTransferHold(true);
+    commands = recorder.Commands();
+    CopyBuffer(context, commands, source.Handle(), 0, middle.Handle(), 0, bytes);
+    Require(held(commands), "an armed hold refused the copy-back barrier");
+    Require(!held(commands), "a second barrier was held over the first");
+    recorder.ArmTransferHold(false);
+    VkAccessFlags covered = 0;
+    commands = recorder.Commands(&covered);
+    Require(Recorder::CopyTrailCounts()[2] == before[2] + 1, "the next Commands() call did not settle the held barrier");
+    Require(covered == (VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_HOST_READ_BIT), "a settled barrier does not report its covered access");
+    Require(!recorder.TakeHeldTransfer().has_value(), "a settled barrier could still be taken");
+    CopyBuffer(context, commands, middle.Handle(), 0, target.Handle(), 0, bytes);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+    recorder.Sync();
+    target.Invalidate();
+    Require(std::equal(source.Bytes().begin(), source.Bytes().end(), target.Bytes().begin()), "a copy after the settled barrier read stale bytes");
+    fill(middle, 0u);
+    recorder.ArmTransferHold(true);
+    commands = recorder.Commands();
+    CopyBuffer(context, commands, source.Handle(), 0, middle.Handle(), 0, bytes);
+    Require(held(commands), "an armed hold refused the copy-back barrier in a new batch");
+    recorder.ArmTransferHold(false);
+    auto taken = recorder.TakeHeldTransfer();
+    Require(taken.has_value() && taken->commands == commands && taken->writes.size() == 1 && taken->buffers.size() == 1, "the held barrier was not handed to the copy-in");
+    RecordMemoryBarrier(context, commands, taken->srcStage, taken->dstStage, taken->srcAccess, taken->dstAccess);
+    recorder.ArmTransferHold(true);
+    CopyBuffer(context, commands, source.Handle(), 0, target.Handle(), 0, 16);
+    Require(held(commands), "an armed hold refused a barrier after a take");
+    recorder.ArmTransferHold(false);
+    const auto settledBefore = Recorder::CopyTrailCounts()[2];
+    recorder.Submit();
+    Require(Recorder::CopyTrailCounts()[2] == settledBefore + 1, "Submit did not settle the held barrier");
+    recorder.Sync();
+    middle.Invalidate();
+    Require(std::equal(source.Bytes().begin(), source.Bytes().end(), middle.Bytes().begin()), "the held copy did not land");
+    std::cout << "copy trail hold tests passed\n";
+}
+
 #ifdef _WIN32
 bool deferredSettleTests(const Device& device) {
     using namespace AgcDriver::GuestMemory;
@@ -12842,6 +12908,10 @@ int main(int argc, char** argv) {
             const auto before = Recorder::StoreCounts().stores;
             storeRunTests(device, recorder);
             return Recorder::StoreCounts().stores != before ? 0 : 77;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--copy-trail-only") {
+            copyTrailHoldTests(device, recorder);
+            return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--copied-direct-only") {
             copiedDirectOrderingTests(device, recorder);
