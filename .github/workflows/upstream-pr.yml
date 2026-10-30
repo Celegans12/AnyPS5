@@ -28,17 +28,26 @@ jobs:
       - name: Open a pull request for every queued branch
         shell: bash
         run: |
-          set -euo pipefail
+          set -uo pipefail
           if [ -z "$GH_TOKEN" ]; then echo "::notice::UPSTREAM_PR_TOKEN secret is not set, nothing opened"; exit 0; fi
           shopt -s nullglob
+          failed=0
           for f in .github/upstream-prs/*.md; do
             branch=$(basename "$f" .md | sed 's#__#/#g')
             if ! gh api "repos/$GITHUB_REPOSITORY/branches/$branch" --silent 2>/dev/null; then
               echo "::warning::$branch is not on $GITHUB_REPOSITORY, skipped"; continue
             fi
-            existing=$(gh api "repos/$UPSTREAM/pulls?head=$OWNER:$branch&state=all" --jq '.[0].html_url // empty')
+            if ! existing=$(gh api "repos/$UPSTREAM/pulls?head=$OWNER:$branch&state=all" --jq '.[0].html_url // empty' 2>&1); then
+              echo "::error::$branch: looking up existing PRs failed: $existing"; failed=1; continue
+            fi
             if [ -n "$existing" ]; then echo "$branch already has $existing"; continue; fi
-            title=$(gh api "repos/$GITHUB_REPOSITORY/commits/$branch" --jq '.commit.message' | head -n1)
-            url=$(gh api "repos/$UPSTREAM/pulls" -f title="$title" -f head="$OWNER:$branch" -f base=main -F maintainer_can_modify=true -F body=@"$f" --jq .html_url)
-            echo "$branch -> $url" | tee -a "$GITHUB_STEP_SUMMARY"
+            if ! title=$(gh api "repos/$GITHUB_REPOSITORY/commits/$branch" --jq '.commit.message | split("\n")[0]' 2>&1); then
+              echo "::error::$branch: reading the commit title failed: $title"; failed=1; continue
+            fi
+            if url=$(gh api "repos/$UPSTREAM/pulls" -f title="$title" -f head="$OWNER:$branch" -f base=main -F maintainer_can_modify=true -F body=@"$f" --jq .html_url 2>&1); then
+              echo "$branch -> $url" | tee -a "$GITHUB_STEP_SUMMARY"
+            else
+              echo "::error::$branch: opening the PR failed: $url"; failed=1
+            fi
           done
+          exit $failed
