@@ -139,7 +139,7 @@ std::uint32_t StorageBufferU64BlockType(SpirvEmitterState& state) {
 }
 
 std::uint32_t PushConstantArrayType(SpirvEmitterState& state) {
-    const auto count = ConstantU32(state, PushData::DwordCount);
+    const auto count = ConstantU32(state, state.newPathResolved ? NewPathPushDataDwords(state) : PushData::DwordCount);
     return state.module.DecoratedType(spv::OpTypeArray,
         {{spv::OpDecorate, {spv::DecorationArrayStride, static_cast<std::uint32_t>(sizeof(std::uint32_t))}}},
         TypeU32(state), count);
@@ -162,6 +162,12 @@ std::uint32_t PushConstantBlockType(SpirvEmitterState& state) {
         PushConstantArrayType(state));
 }
 
+}
+
+std::uint32_t NewPathPushDataDwords(const SpirvEmitterState& state) {
+    const auto slot = state.program.Metadata().bindings.PushSlotDword();
+    if (slot + NewPathPushDriverWords >= NewPathPushBlockDwords) FailEmit("a newPathResolved stage's push slot at dword " + std::to_string(slot) + " leaves no room in the 256-byte push block");
+    return std::min(PushData::DwordCount, NewPathPushBlockDwords - NewPathPushDriverWords - slot);
 }
 
 std::uint32_t PushDataMember(SpirvEmitterState& state) {
@@ -521,6 +527,11 @@ void DefineDescriptors(SpirvEmitterState& state) {
     const IrBindingLayout& layout = state.program.Metadata().bindings;
     const IrShaderStage stage = state.program.Resources().stage;
     if (state.newPathResolved || layout.UsesPushData() || state.stencilReplay || stage == IrShaderStage::Mesh || stage == IrShaderStage::TessellationControl || (state.depthRangeRemap && stage == IrShaderStage::Vertex)) {
+        if (state.newPathResolved && NewPathPushDataDwords(state) < PushData::DwordCount) {
+            const auto end = layout.UsesPushData() ? (state.stencilReplay ? layout.pushDataStartDword % PushData::DwordCount : layout.pushDataStartDword - layout.PushSlotDword()) + layout.ShaderDataDwords() : 0u;
+            const bool fixedWords = state.stencilReplay || stage == IrShaderStage::Mesh || stage == IrShaderStage::TessellationControl || (state.depthRangeRemap && stage == IrShaderStage::Vertex);
+            if (end > NewPathPushDataDwords(state) || fixedWords) FailEmit("a newPathResolved stage's push data does not fit after the driver words in the 256-byte push block");
+        }
         const auto type = PushConstantBlockType(state);
         state.pushConstantVariable = state.module.DefineGlobalVariable(TypePointer(state, spv::StorageClassPushConstant, type), spv::StorageClassPushConstant);
         state.module.AddName(type, "BufferResource");

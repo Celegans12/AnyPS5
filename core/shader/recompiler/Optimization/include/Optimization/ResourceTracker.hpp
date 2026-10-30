@@ -7,7 +7,7 @@ namespace ShaderRecompiler {
 
 class ResourceTracker {
 public:
-    void Track(IrProgram& program, bool bindlessHandles = false) const;
+    void Track(IrProgram& program, bool bindlessHandles = false, bool runtimeBuffers = false) const;
 };
 
 }
