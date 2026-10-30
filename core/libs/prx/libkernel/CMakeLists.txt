@@ -1543,6 +1543,13 @@ if(BUILD_TESTING)
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
         set_tests_properties(guest_shm_open PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+        add_test_executable(guest_named_shm_windows_mapping_tests ${LIBS_INCLUDE_DIR}/tests/GuestNamedShmWindowsMapping.cpp)
+        target_include_directories(guest_named_shm_windows_mapping_tests PRIVATE ${LIBS_INCLUDE_DIR})
+        target_link_libraries(guest_named_shm_windows_mapping_tests PRIVATE libkernel libc)
+        configure_windows_unwind(guest_named_shm_windows_mapping_tests)
+        add_test(NAME guest_named_shm_windows_mapping COMMAND guest_named_shm_windows_mapping_tests)
+        set_tests_properties(guest_named_shm_windows_mapping PROPERTIES TIMEOUT 20 ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
     endif()
     add_test_executable(guest_jit_shared_memory_tests ${LIBS_INCLUDE_DIR}/tests/GuestJitSharedMemory.cpp)
     target_include_directories(guest_jit_shared_memory_tests PRIVATE ${LIBS_INCLUDE_DIR})

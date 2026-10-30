@@ -121,6 +121,7 @@ struct HeapSizes {
     VkDeviceSize imageStride = 0;
     VkDeviceSize samplerStride = 0;
     VkDeviceSize pixelLdsOffset = 0;
+    VkDeviceSize meshWindowOffset = 0;
     VkDeviceSize resourceUsed = 0;
     VkDeviceSize samplerUsed = 0;
 };
@@ -135,7 +136,8 @@ HeapSizes heapSizes(const VkPhysicalDeviceDescriptorHeapPropertiesEXT& propertie
     sizes.samplerStride = alignUp(properties.samplerDescriptorSize, properties.samplerDescriptorAlignment);
     const auto imageBytes = static_cast<VkDeviceSize>(Abi::GpuImageHeapSlots) * sizes.imageStride;
     sizes.pixelLdsOffset = alignUp(imageBytes, properties.bufferDescriptorAlignment);
-    sizes.resourceUsed = alignUp(sizes.pixelLdsOffset + properties.bufferDescriptorSize, properties.resourceHeapAlignment);
+    sizes.meshWindowOffset = alignUp(sizes.pixelLdsOffset + properties.bufferDescriptorSize, properties.bufferDescriptorAlignment);
+    sizes.resourceUsed = alignUp(sizes.meshWindowOffset + properties.bufferDescriptorSize, properties.resourceHeapAlignment);
     sizes.samplerUsed = alignUp(static_cast<VkDeviceSize>(Abi::GpuSamplerHeapSlots) * sizes.samplerStride, properties.samplerHeapAlignment);
     return sizes;
 }
@@ -157,6 +159,7 @@ BindlessHeap::BindlessHeap(const Context& context) : context(context) {
     samplerHeapStride = sizes.samplerStride;
     resourceHeapUsed = sizes.resourceUsed;
     pixelLdsHeapOffset = sizes.pixelLdsOffset;
+    meshWindowHeapOffset = sizes.meshWindowOffset;
     samplerHeapUsed = sizes.samplerUsed;
     Require(Fits(heapProperties), "the GPU heap's slots exceed the device's descriptor heap sizes");
     constexpr VkBufferUsageFlags heapUsage = VK_BUFFER_USAGE_DESCRIPTOR_HEAP_BIT_EXT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
@@ -755,6 +758,7 @@ struct HeapBindingRoots {
     bool gdsAddress = false;
     bool faultAddress = false;
     bool pixelLds = false;
+    bool meshWindow = false;
 };
 
 struct HeapBindingUse {
@@ -763,6 +767,7 @@ struct HeapBindingUse {
     std::uint32_t gdsBinding = ~0u;
     bool faultMemory = false;
     bool pixelLdsMemory = false;
+    bool meshWindowMemory = false;
     std::pair<std::uint32_t, std::uint32_t> refused{~0u, ~0u};
 };
 
@@ -814,6 +819,10 @@ bool heapBindings(std::span<const std::uint32_t> spirv, const HeapBindingRoots& 
             use.pixelLdsMemory = true;
             continue;
         }
+        if (roots.meshWindow && !use.meshWindowMemory && set == ShaderRecompiler::MeshWindowDescriptorSet && binding == 0u) {
+            use.meshWindowMemory = true;
+            continue;
+        }
         const bool heapImageOrSampler = set == Abi::FragmentDescriptorSet && binding >= firstImage && binding <= samplers;
         if (!heapImageOrSampler) {
             use.refused = entry;
@@ -823,7 +832,7 @@ bool heapBindings(std::span<const std::uint32_t> spirv, const HeapBindingRoots& 
             use.imageBindings.push_back(binding);
     }
     return (!roots.workgroupAddress || use.workgroupMemory) && (!roots.faultAddress || use.faultMemory) &&
-           (!roots.pixelLds || use.pixelLdsMemory);
+           (!roots.pixelLds || use.pixelLdsMemory) && (!roots.meshWindow || use.meshWindowMemory);
 }
 
 VkDescriptorSetAndBindingMappingEXT heapMapping(std::uint32_t set, std::uint32_t binding, VkSpirvResourceTypeFlagsEXT resources,
@@ -856,9 +865,9 @@ constexpr std::uint32_t rootAddressOffset(std::uint32_t rootField) {
 
 }
 
-bool DescriptorHeapMappable(std::span<const std::uint32_t> spirv, bool workgroupAddress, bool gdsAddress, bool pixelLds) {
+bool DescriptorHeapMappable(std::span<const std::uint32_t> spirv, bool workgroupAddress, bool gdsAddress, bool pixelLds, bool meshWindow) {
     HeapBindingUse use;
-    const bool mappable = heapBindings(spirv, {.workgroupAddress = workgroupAddress, .gdsAddress = gdsAddress, .pixelLds = pixelLds}, use);
+    const bool mappable = heapBindings(spirv, {.workgroupAddress = workgroupAddress, .gdsAddress = gdsAddress, .pixelLds = pixelLds, .meshWindow = meshWindow}, use);
     static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
     if (!mappable && stats) {
         static std::mutex causesMutex;
@@ -878,12 +887,12 @@ bool DescriptorHeapMappable(std::span<const std::uint32_t> spirv, bool workgroup
 }
 
 bool BindlessHeap::DescriptorHeapMappings(std::span<const std::uint32_t> spirv, std::vector<VkDescriptorSetAndBindingMappingEXT>& mappings,
-                                          std::uint32_t workgroupAddressOffset, bool rootGds, bool rootFault, bool pixelLds) const {
+                                          std::uint32_t workgroupAddressOffset, bool rootGds, bool rootFault, bool pixelLds, bool meshWindow) const {
     mappings.clear();
     if (resourceHeap == nullptr) return false;
     HeapBindingUse use;
     const HeapBindingRoots roots{
-        .workgroupAddress = workgroupAddressOffset != ~0u, .gdsAddress = rootGds, .faultAddress = rootFault, .pixelLds = pixelLds};
+        .workgroupAddress = workgroupAddressOffset != ~0u, .gdsAddress = rootGds, .faultAddress = rootFault, .pixelLds = pixelLds, .meshWindow = meshWindow};
     if (!heapBindings(spirv, roots, use)) return false;
     constexpr auto bindingCount = static_cast<std::uint32_t>(Abi::Binding::Count);
     constexpr VkSpirvResourceTypeFlagsEXT imageResources = VK_SPIRV_RESOURCE_TYPE_SAMPLED_IMAGE_BIT_EXT |
@@ -906,21 +915,30 @@ bool BindlessHeap::DescriptorHeapMappings(std::span<const std::uint32_t> spirv, 
     if (use.pixelLdsMemory)
         mappings.push_back(heapMapping(ShaderRecompiler::PixelFunctionLdsDescriptorSet, 0,
                                        VK_SPIRV_RESOURCE_TYPE_READ_WRITE_STORAGE_BUFFER_BIT_EXT, pixelLdsHeapOffset, 0));
+    if (use.meshWindowMemory)
+        mappings.push_back(heapMapping(ShaderRecompiler::MeshWindowDescriptorSet, 0,
+                                       VK_SPIRV_RESOURCE_TYPE_READ_WRITE_STORAGE_BUFFER_BIT_EXT, meshWindowHeapOffset, 0));
     return true;
 }
 
-void BindlessHeap::WritePixelLdsBuffer(VkDeviceAddress address, VkDeviceSize bytes) {
+void BindlessHeap::writeBufferDescriptor(VkDeviceSize offset, VkDeviceAddress address, VkDeviceSize bytes, const char* what) {
     const auto& properties = context.descriptorHeapProperties;
-    Require(pixelLdsHeapOffset + properties.bufferDescriptorSize <= resourceHeapUsed,
-            "the pixel function LDS descriptor lies outside the resource heap");
+    Require(offset + properties.bufferDescriptorSize <= resourceHeapUsed, std::string("the ") + what + " descriptor lies outside the resource heap");
     const VkDeviceAddressRangeEXT buffer{address, bytes};
     VkResourceDescriptorInfoEXT resource{VK_STRUCTURE_TYPE_RESOURCE_DESCRIPTOR_INFO_EXT};
     resource.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     resource.data.pAddressRange = &buffer;
-    const VkHostAddressRangeEXT range{resourceHeap->Bytes().data() + pixelLdsHeapOffset,
-                                      static_cast<std::size_t>(properties.bufferDescriptorSize)};
+    const VkHostAddressRangeEXT range{resourceHeap->Bytes().data() + offset, static_cast<std::size_t>(properties.bufferDescriptorSize)};
     Check(context.Function<PFN_vkWriteResourceDescriptorsEXT>("vkWriteResourceDescriptorsEXT")(context.device, 1, &resource, &range),
-          "vkWriteResourceDescriptorsEXT pixel function LDS");
+          (std::string("vkWriteResourceDescriptorsEXT ") + what).c_str());
+}
+
+void BindlessHeap::WritePixelLdsBuffer(VkDeviceAddress address, VkDeviceSize bytes) {
+    writeBufferDescriptor(pixelLdsHeapOffset, address, bytes, "pixel function LDS");
+}
+
+void BindlessHeap::WriteMeshWindowBuffer(VkDeviceAddress address, VkDeviceSize bytes) {
+    writeBufferDescriptor(meshWindowHeapOffset, address, bytes, "mesh window");
 }
 
 namespace {
