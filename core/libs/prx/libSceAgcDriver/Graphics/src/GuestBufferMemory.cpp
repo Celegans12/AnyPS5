@@ -5644,8 +5644,12 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             // A staged region (see stagingEligible) is copied out of the import even when aligned;
             // without a recorder to record the copies it binds in place like any other.
             const bool staged = recorder != nullptr && stagingEligible(region, addressable);
+            region.inPlaceWrite = false;
             if (entry != nullptr && !staged && region.writable && InPlaceWritesActive() && stagingAllowed && WritesOverlap(region.begin, static_cast<std::size_t>(bytes)) && bindableInPlace(HostImportOffset(*entry, region.begin), addressable)) {
-                if (inPlaceAllowed(region.begin, region.end, true)) inPlaceRegions.fetch_add(1, std::memory_order_relaxed);
+                if (inPlaceAllowed(region.begin, region.end, true)) {
+                    inPlaceRegions.fetch_add(1, std::memory_order_relaxed);
+                    region.inPlaceWrite = true;
+                }
             }
             if (entry != nullptr && !staged && bindableInPlace(HostImportOffset(*entry, region.begin), addressable)) {
                 region.direct = entry;
@@ -7418,12 +7422,12 @@ void GuestBufferMemory::RunAccesses(std::vector<std::array<std::uint64_t, 3>>& o
     if (HoldsLease()) out.push_back({0, std::numeric_limits<std::uint64_t>::max(), 1u});
     for (const auto& region : regions) {
         if (region.gpuCopy) out.push_back({region.begin, region.end, 2u | (region.atomic ? 4u : 0u)});
-        else out.push_back({region.begin, region.direct != nullptr ? inPlaceEnd(region) : region.end, 0});
+        else out.push_back({region.begin, region.direct != nullptr ? inPlaceEnd(region) : region.end, region.inPlaceWrite ? 2u | (region.atomic ? 4u : 0u) : 0u});
     }
     for (const auto& [begin, end] : mergeWrites(writes)) {
         const auto* found = owner(begin, end);
         std::uint64_t flags = 1;
-        if (found != nullptr && found->gpuCopy) flags |= 2;
+        if (found != nullptr && (found->gpuCopy || found->inPlaceWrite)) flags |= 2;
         if (found != nullptr && found->atomic) flags |= 4;
         out.push_back({begin, end, flags});
     }

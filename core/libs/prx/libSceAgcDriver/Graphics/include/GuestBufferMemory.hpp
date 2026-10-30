@@ -605,6 +605,9 @@ private:
         // A staged written element bound in a residency mirror slot (residencySlot, direct), copied in
         // and back like a shadow: the device page table maps the range where the work writes it.
         bool slotCopy = false;
+        // A written element bound in place only because of an InPlaceWritesScope: a dispatch run treats it
+        // as copied (RunAccesses), so the run takes the same dispatches as it would with the staged copy.
+        bool inPlaceWrite = false;
         // The tracker generation and registry generation at this use's copy-in when it may become a
         // GPU source (FindGpuSource), else 0; consumed by MarkDirectWrites.
         mutable std::uint64_t gpuSourceSince = 0;
