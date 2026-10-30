@@ -30,6 +30,9 @@ const char* FallbackReasonName(FallbackReason reason) {
     case FallbackReason::C1WrittenElsewhere: return "c1-written-elsewhere";
     case FallbackReason::C1NotCovered: return "c1-not-covered";
     case FallbackReason::C1Layout: return "c1-layout";
+    case FallbackReason::NotClassA: return "not-class-a";
+    case FallbackReason::DrawShape: return "draw-shape";
+    case FallbackReason::NotLean: return "not-lean";
     }
     return "unknown";
 }
@@ -51,7 +54,10 @@ std::uint64_t RouteCounts::NewPathCommands() const {
 Decision Router::Decide(const CommandFacts& facts) const {
     if (facts.suspended) return {Route::Fallback, FallbackReason::Suspended};
     if (facts.kindSwitchOff) return {Route::Fallback, FallbackReason::KindSwitch};
-    if (!emitDispatches || facts.kind != CommandKind::Dispatch) return {Route::Fallback, FallbackReason::KindNotEmitted};
+    if (facts.kind == CommandKind::Draw ? !emitDraws : (!emitDispatches || facts.kind != CommandKind::Dispatch)) return {Route::Fallback, FallbackReason::KindNotEmitted};
+    if (!facts.classA) return {Route::Fallback, FallbackReason::NotClassA};
+    if (!facts.shapeSupported) return {Route::Fallback, FallbackReason::DrawShape};
+    if (!facts.lean) return {Route::Fallback, FallbackReason::NotLean};
     if (!facts.resolvedProgram) return {Route::Fallback, !facts.c1 ? FallbackReason::NoResolvedModule : facts.c1Switch ? FallbackReason::C1Switch : FallbackReason::C1NoTwin};
     if (!facts.pipelineReady) return {Route::Fallback, FallbackReason::NoPipeline};
     if (!facts.tableCovers) return {Route::Fallback, facts.coverReason};

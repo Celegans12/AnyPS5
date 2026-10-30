@@ -66,7 +66,10 @@ public:
     bool ReordersSamples() const { return Graphics::ReordersSamples(sampleOrder); }
     bool SampleLocationsEnabled() const { return sampleLocationsEnabled; }
     VkExtent2D HostSampleLocationGrid() const { return sampleLocationGrid; }
+    // A new-path resolved pipeline (every stage newPathResolved) has one 256-byte range for all its stages, and
+    // PushConstants pushes the whole block to them.
     void PushConstants(VkCommandBuffer commands, VkShaderStageFlags stages, std::span<const std::byte, PipelinePushConstantBytes> bytes) const;
+    bool ResolvedPush() const { return resolvedPushStages != 0; }
     // Forgets the Vulkan objects without destroying them: for entries of a device that is already gone.
     void Abandon() noexcept;
 
@@ -88,6 +91,7 @@ private:
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkDescriptorSetLayout blendedLayout = VK_NULL_HANDLE;
     VkShaderStageFlags heapStages = 0;
+    VkShaderStageFlags resolvedPushStages = 0;
     VkRenderPass renderPass = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkPipeline backFaces = VK_NULL_HANDLE;
@@ -121,6 +125,8 @@ private:
 // coming back; it never shrinks during a run. APS5_PIPELINE_STORE_ENTRIES fixes it. Debug aid:
 // APS5_NO_PIPELINE_CACHE=1 builds one per draw as before.
 std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+// The hash of CachedPipeline's key for this configuration (0: it would be private, never stored).
+std::uint64_t CachedPipelineKey(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout);
 // `created` reports whether this call built the pipeline (false: served from the store or private).
 std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, bool* created = nullptr);
 // Cumulative pipeline store outcomes since start-up (the [pipecache] line reports 10 s windows).

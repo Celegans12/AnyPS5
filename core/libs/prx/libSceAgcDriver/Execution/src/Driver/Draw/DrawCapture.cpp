@@ -7,6 +7,9 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
+#include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/NewPath.hpp"
+#include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/DrawTwins.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "ShaderDiskCache.hpp"
 #include <algorithm>
@@ -144,6 +147,42 @@ std::shared_ptr<DispatchVariant> DrawStageVariant(const DrawProgram& program, co
     return variant;
 }
 
+// The resolved twin of a draw stage (NewPath::DrawStageTwins), from the stage's own request with the target
+// flag set and a capture of its own over the memory the stage was captured from. Failures are counted and
+// leave the stage without a twin (its draws fall back as no-resolved-module).
+void Driver::buildDrawStageTwin(const DrawProgram& program, const ShaderRecompiler::RecompileRequest& request, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiled) {
+    auto& twins = NewPath::DrawStageTwins();
+    if (compiled == nullptr || twins.Known(*compiled)) return;
+    if (compiled->newPathResolved || compiled->transferKernel.has_value()) {
+        twins.Remember(compiled, nullptr, NewPath::TwinOutcome::NotAddressBased);
+        return;
+    }
+    std::shared_ptr<const ShaderRecompiler::RecompileResult> twin;
+    try {
+        auto resolvedRequest = request;
+        resolvedRequest.target.newPathResolved = true;
+        auto invocation = InvocationFor(*program.snapshot, program.codeOffset, resolvedRequest);
+        ShaderMemory resolvedMemory(request.context.memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter(), &QueryPendingSpan);
+        const auto resolvedCapture = [&] {
+            const SampledReadScope sampling(evidenceReads);
+            return CaptureInvocation(resolvedMemory, *program.snapshot, program.codeOffset, resolvedRequest, invocation);
+        }();
+        if (resolvedCapture != nullptr) twin = invocation.Materialize(*resolvedCapture);
+    } catch (const std::exception& error) {
+        static std::atomic<int> reported{0};
+        if (reported.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[newpath] no resolved module for draw stage %u of shader 0x%llx: %.200s\n", static_cast<unsigned>(program.binary.stage), static_cast<unsigned long long>(program.binary.codeAddress), error.what());
+        twins.Remember(compiled, nullptr, NewPath::TwinOutcome::Failed);
+        return;
+    }
+    if (twin == nullptr || !NewPath::StageTwinCompatible(*compiled, *twin)) {
+        static std::atomic<int> reported{0};
+        if (twin != nullptr && reported.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[newpath] resolved module of draw stage %u of shader 0x%llx differs: %s\n", static_cast<unsigned>(program.binary.stage), static_cast<unsigned long long>(program.binary.codeAddress), NewPath::StageTwinDifference(*compiled, *twin).c_str());
+        twins.Remember(compiled, nullptr, NewPath::TwinOutcome::Mismatch);
+        return;
+    }
+    twins.Remember(compiled, std::move(twin), NewPath::TwinOutcome::Built);
+}
+
 std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDrawStage(std::size_t i, std::uint32_t pushOffset, const QueueState& queue, const Submission& submission, std::size_t packetOffset, std::uint64_t traceToken, const std::vector<DrawProgram>& programs, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, std::vector<ShaderRecompiler::MemoryRegion>& memory, const std::vector<ShaderRecompiler::LinkedProgram>& linked, const Pm4::DrawParameters& drawParameters, const std::shared_ptr<VulkanDevice>& localDevice, ShaderMemory& shaderMemory, std::vector<StageCapture>& stageCaptures, std::vector<bool>& recompiled, bool drawHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, const std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool profile, std::uint64_t dumpTarget, std::uint64_t dumpSlot1, std::uint64_t& captures, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, std::string& rejected, const std::optional<ShaderRecompiler::MeshBarycentricLayout>& meshBarycentrics) try {
     PerformanceTimer timing("Shader.DrawStage");
     phaseTiming.Phase(DrawRowVectors);
@@ -247,6 +286,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
         TraceMaterializationFailure(traceToken, submission, packetOffset, i, "capture-or-materialize", std::current_exception());
         throw named(error, request.context.memory);
     }
+    if (NewPath::EmitDraws() && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NewPathNoGpuDraws)) buildDrawStageTwin(program, request, stageCapture.compiled);
     timing.Mark("materialize");
     stageCapture.userDataMask = StageUserDataMask(*capture, *stageCapture.compiled, vertexInfos[i]);
     phaseTiming.Phase(DrawRowRecompile);

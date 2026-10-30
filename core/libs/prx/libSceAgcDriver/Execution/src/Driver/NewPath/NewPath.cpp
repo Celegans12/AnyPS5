@@ -12,6 +12,8 @@
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/ResolvedTwins.hpp"
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/ShareCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/PipelineAheadConfig.hpp"
+#include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/PipelineAhead.hpp"
+#include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/DrawTwins.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "Recompiler.hpp"
 #include <algorithm>
@@ -53,7 +55,7 @@ StepClock& ThreadSteps() {
 }
 
 struct State {
-    Router router{EmitDispatches()};
+    Router router{EmitDispatches(), EmitDraws()};
     std::array<DispatchCost, 6> costs;
     std::atomic<std::uint64_t> completions{0}, completionNs{0};
     std::mutex reporting;
@@ -84,6 +86,13 @@ std::shared_ptr<EmitCandidate>& ThreadEmit() {
     thread_local std::shared_ptr<EmitCandidate> current;
     return current;
 }
+
+std::shared_ptr<EmitCandidate>& ThreadDrawEmit() {
+    thread_local std::shared_ptr<EmitCandidate> current;
+    return current;
+}
+
+std::atomic<bool> drawTwinPipelinesUsed{false};
 
 CommandFacts FactsAtDecode(CommandKind kind) {
     CommandFacts facts;
@@ -136,6 +145,10 @@ void print(State& state, const char* window) {
     AgcDriver::ProfilePrint_nid_no_patch("[newpath] window=%s pipelines ahead (gate %s): requested %llu, created %llu, failed %llu, inline %llu, blocked %llu, pending fallbacks %llu, prewarmed %llu\n", window, PipelineGateEnabled() ? "on" : "off", static_cast<unsigned long long>(ahead.requested), static_cast<unsigned long long>(ahead.created), static_cast<unsigned long long>(ahead.failed), static_cast<unsigned long long>(ahead.createdInline), static_cast<unsigned long long>(ahead.blockedWaits), static_cast<unsigned long long>(ahead.pendingFallbacks), static_cast<unsigned long long>(ahead.prewarmed));
     const auto twinPipes = TwinPipelineStore().Totals();
     AgcDriver::ProfilePrint_nid_no_patch("[newpath] window=%s twin pipelines (cumulative): created on workers %llu (%.0f ms), on the dispatch thread %llu (%.0f ms, max %.0f ms, %llu over 1 s); not ready at a dispatch %llu, layout mismatches %llu; module files written %llu (failed %llu), prewarm queued %llu, skipped %llu, unreadable %llu\n", window, static_cast<unsigned long long>(twinPipes.createdOnWorker), twinPipes.workerMs, static_cast<unsigned long long>(twinPipes.createdOnCaller), twinPipes.callerMs, twinPipes.maxCallerMs, static_cast<unsigned long long>(twinPipes.callerOverSecond), static_cast<unsigned long long>(twinPipes.notReady), static_cast<unsigned long long>(twinPipes.layoutMismatches), static_cast<unsigned long long>(twinPipes.modulesWritten), static_cast<unsigned long long>(twinPipes.moduleWriteFailures), static_cast<unsigned long long>(twinPipes.prewarmQueued), static_cast<unsigned long long>(twinPipes.prewarmSkipped), static_cast<unsigned long long>(twinPipes.moduleReadFailures));
+    if (EmitDraws()) {
+        const auto drawPipes = DrawTwinPipelines().Totals();
+        AgcDriver::ProfilePrint_nid_no_patch("%s; pipelines ahead requested %llu, created %llu, failed %llu, inline %llu\n", FormatDrawEmit(window, true).c_str(), static_cast<unsigned long long>(drawPipes.requested), static_cast<unsigned long long>(drawPipes.created), static_cast<unsigned long long>(drawPipes.failed), static_cast<unsigned long long>(drawPipes.createdInline));
+    }
     if (const auto residency = Graphics::ResidencyReportLine(); !residency.empty()) AgcDriver::ProfilePrint_nid_no_patch("%s\n", residency.c_str());
 }
 
@@ -163,6 +176,11 @@ bool EmitDispatches() {
     return emit;
 }
 
+bool EmitDraws() {
+    static const bool emit = Enabled() && EnvSet("APS5_NEW_PATH_EMIT_DRAWS");
+    return emit;
+}
+
 Decision RouteCommand(CommandKind kind, const VulkanDevice* device) {
     auto& state = Get();
     prepare(device);
@@ -170,6 +188,11 @@ Decision RouteCommand(CommandKind kind, const VulkanDevice* device) {
     state.router.Note(kind, decision);
     report(state);
     return decision;
+}
+
+void PrepareCommand(const VulkanDevice* device) {
+    prepare(device);
+    report(Get());
 }
 
 void BeginCommand(CommandKind kind, const VulkanDevice* device) {
@@ -263,6 +286,46 @@ bool MayEmitWithoutTable(const EmitCandidate& candidate, bool pipelineReady) {
     facts.clothGuard = false;
     facts.tableCovers = true;
     return Get().router.Decide(facts).route == Route::NewPath;
+}
+
+std::shared_ptr<EmitCandidate> ClaimDraw() {
+    auto candidate = std::make_shared<EmitCandidate>();
+    candidate->counted = true;
+    candidate->facts = FactsAtDecode(CommandKind::Draw);
+    candidate->facts.classA = false;
+    candidate->facts.staticChains = true;
+    return candidate;
+}
+
+DrawEmitScope::DrawEmitScope(std::shared_ptr<EmitCandidate> candidate) : candidate(std::move(candidate)), previous(ThreadDrawEmit()) {
+    ThreadDrawEmit() = this->candidate;
+}
+
+DrawEmitScope::~DrawEmitScope() {
+    ThreadDrawEmit() = std::move(previous);
+}
+
+EmitCandidate* CurrentDrawEmit() {
+    auto& current = ThreadDrawEmit();
+    if (current == nullptr || current->noted.load(std::memory_order_relaxed)) return nullptr;
+    return current.get();
+}
+
+PipelineAhead& DrawTwinPipelines() {
+    static auto* pipelines = new PipelineAhead(PipelineAhead::Settings{PipelineGateEnabled(), 2}, nullptr);
+    return *pipelines;
+}
+
+void NoteDrawTwinPipelines() {
+    drawTwinPipelinesUsed.store(true, std::memory_order_relaxed);
+}
+
+bool DrawTwinPipelinesUsed() {
+    return drawTwinPipelinesUsed.load(std::memory_order_relaxed);
+}
+
+void StopDrawTwinPipelines() {
+    if (DrawTwinPipelinesUsed()) DrawTwinPipelines().Reset();
 }
 
 bool WouldEmit(const CommandFacts& facts) {
