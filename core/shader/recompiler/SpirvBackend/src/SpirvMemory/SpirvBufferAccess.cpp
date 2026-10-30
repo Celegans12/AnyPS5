@@ -97,6 +97,10 @@ std::uint32_t EmitRootAddressReadOnlyWordPointer(SpirvEmitterState& state, std::
     return readOnlyWordPointer(state, rootAddress(state, field), index);
 }
 
+std::uint32_t EmitRingAddress(SpirvEmitterState& state) {
+    return rootAddress(state, RuntimeAbi::RootRingAddress);
+}
+
 std::uint32_t EmitStageRingWordPointer(SpirvEmitterState& state, RuntimeAbi::RootStageField field, std::uint32_t index) {
     const auto u64 = TypeScalarU64(state);
     const auto base = Binary(state, spv::OpIAdd, u64, rootAddress(state, RuntimeAbi::RootRingAddress), Unary(state, spv::OpUConvert, u64, EmitStageRootDword(state, field)));
@@ -382,13 +386,14 @@ std::uint32_t LdsStorageDwords(const SpirvEmitterState& state) {
 
 bool LoadsSelectable(const SpirvEmitterState& state, const MemoryResourceAccess& access) {
     if (access.kind == ResourceKind::Scratch) return true;
-    if (access.kind == ResourceKind::Lds || access.physical) return false;
+    if (access.physical) return access.clampedPhysical;
+    if (access.kind == ResourceKind::Lds) return false;
     return state.robustBufferAccess2;
 }
 
 std::uint32_t GuardedElementIndex(SpirvEmitterState& state, const MemoryResourceAccess& access, std::uint32_t condition, std::uint32_t index) {
     if (access.kind == ResourceKind::Lds) FailEmit("LDS loads keep their branch and have no guarded element");
-    const auto fallback = access.kind == ResourceKind::Scratch ? 0u : 0xfffffffeu;
+    const auto fallback = access.kind == ResourceKind::Scratch || access.physical ? 0u : 0xfffffffeu;
     return Select(state, TypeU32(state), condition, index, ConstantU32(state, fallback));
 }
 

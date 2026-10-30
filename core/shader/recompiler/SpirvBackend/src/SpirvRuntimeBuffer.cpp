@@ -3,6 +3,7 @@
 #include "SpirvBackend/SpirvBda.hpp"
 #include "SpirvBackend/SpirvBufferFormat.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvSubgroup.hpp"
+#include "SpirvBackend/SpirvMemory/SpirvBufferAccess.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvInputOutput.hpp"
 #include "PipelineSpecialization.hpp"
 #include "RdnaDecoder/RdnaDescriptorFormat.hpp"
@@ -204,15 +205,20 @@ MemoryResourceAccess directAccess(SpirvValueEmitContext& context, const IrValue&
         const auto u64 = TypeScalarU64(state);
         const auto low = Unary(state, spv::OpUConvert, u64, EmitShaderDataDwordLoad(state, dword));
         const auto high = Binary(state, spv::OpShiftLeftLogical, u64, Unary(state, spv::OpUConvert, u64, EmitShaderDataDwordLoad(state, dword + 1u)), BdaConstant(state, 32u));
-        const auto address = Binary(state, spv::OpBitwiseOr, u64, low, high);
+        auto address = Binary(state, spv::OpBitwiseOr, u64, low, high);
         MemoryResourceAccess access;
         access.kind = memory.kind;
         access.physical = true;
+        access.length = Binary(state, spv::OpShiftRightLogical, TypeU32(state), EmitShaderDataDwordLoad(state, dword + 2u), ConstantU32(state, wide ? 3u : 2u));
+        if (state.program.Metadata().bindings.UsesDataAddress()) {
+            const auto empty = Binary(state, spv::OpIEqual, TypeBool(state), access.length, ConstantU32(state, 0u));
+            address = Select(state, u64, empty, EmitRingAddress(state), address);
+            access.clampedPhysical = true;
+        }
         access.objectPointer = state.module.AllocateId();
         state.module.AddFunction(spv::OpConvertUToPtr, readOnly ? TypePhysicalReadOnlyBufferPointer(state, wide) : TypePhysicalBufferPointer(state, wide), access.objectPointer, address);
         access.byteOffset = state.memoryByteOffsets.at(element);
         access.memoryAccess = memory.coherent ? spv::MemoryAccessVolatileMask : 0u;
-        access.length = Binary(state, spv::OpShiftRightLogical, TypeU32(state), EmitShaderDataDwordLoad(state, dword + 2u), ConstantU32(state, wide ? 3u : 2u));
         return access;
     }
     const auto variable = wide ? state.storageBufferU64Variable : plainLoad || state.storageBufferCoherentVariable == 0u ? state.storageBufferVariable : state.storageBufferCoherentVariable;
@@ -268,7 +274,7 @@ std::uint32_t readBuffer(SpirvValueEmitContext& context, const IrValue& instruct
     const auto unaligned = nonzero(state, misalignment);
     const auto next = EmitAddU32(state, index, ConstantU32(state, 1u));
     const auto last = Select(state, TypeU32(state), unaligned, next, index);
-    const bool exact = state.exactRobustLoads && LoadsSelectable(state, access);
+    const bool exact = state.exactRobustLoads && !access.physical && LoadsSelectable(state, access);
     const auto bounds = exact ? 0u : EmitMemoryElementInBounds(state, access, last);
     const auto inBounds = exact ? 0u : (enable != 0u ? both(state, enable, bounds) : bounds);
     const auto load = [&](std::uint32_t word) {
