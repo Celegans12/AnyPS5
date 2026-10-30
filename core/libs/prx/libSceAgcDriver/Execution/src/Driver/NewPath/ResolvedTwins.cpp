@@ -58,6 +58,18 @@ bool RuntimeBufferTwin(const ShaderRecompiler::RecompileResult& compiled, const 
     return twin.newPathResolved && C1Shape(compiled) && !Binds(twin, ShaderRecompiler::DescriptorRole::GuestBuffers);
 }
 
+bool SitesInside(std::span<const std::pair<std::uint64_t, std::uint64_t>> sites, std::span<const ShaderRecompiler::BdaAbi::Range> build, bool written) {
+    for (const auto& [begin, end] : sites) {
+        auto cursor = begin;
+        while (cursor < end) {
+            const auto found = std::ranges::find_if(build, [&](const ShaderRecompiler::BdaAbi::Range& range) { return range.begin <= cursor && cursor < range.end && (!written || (range.permissions & ShaderRecompiler::BdaAbi::Write) != 0u); });
+            if (found == build.end()) return false;
+            cursor = std::min(end, found->end);
+        }
+    }
+    return true;
+}
+
 bool WalkReplacesTables(const ShaderRecompiler::RecompileResult& twin) {
     return twin.newPathResolved && std::ranges::none_of(twin.bindings, [](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable || binding.role == ShaderRecompiler::DescriptorRole::FaultBuffer; });
 }
@@ -82,7 +94,14 @@ std::string TwinDifference(const ShaderRecompiler::RecompileResult& compiled, co
         // The twin's own push words go to the device (no memory-offset dwords); its ShaderData, if it binds one, is
         // read from today's buffer, so its layout must be today's.
         if (twin.pushConstants.size() > LegacyPushBytes || twin.pushConstants.size() % 4u != 0u) return "push words of the runtime-buffer twin (" + std::to_string(twin.pushConstants.size()) + " bytes)";
-        if (Binds(twin, ShaderRecompiler::DescriptorRole::ShaderData) && (compiled.memoryOffsetDword != twin.memoryOffsetDword || compiled.shaderDataDwords != twin.shaderDataDwords || compiled.imageMetadataDword != twin.imageMetadataDword || compiled.shaderDataUserWords != twin.shaderDataUserWords)) return "shader data layout of the runtime-buffer twin";
+        // Today's ShaderData holds the user words, then the memory offsets: the twin may read it when its own data is
+        // the same user words and ends there (a twin with dwords after them, e.g. a thread limit, needs today's
+        // layout exactly).
+        if (Binds(twin, ShaderRecompiler::DescriptorRole::ShaderData)) {
+            if (compiled.memoryOffsetDword != twin.memoryOffsetDword || compiled.shaderDataUserWords != twin.shaderDataUserWords) return "shader data user words of the runtime-buffer twin";
+            const bool same = compiled.shaderDataDwords == twin.shaderDataDwords && compiled.imageMetadataDword == twin.imageMetadataDword;
+            if (!same && twin.shaderDataDwords > twin.memoryOffsetDword) return "shader data layout of the runtime-buffer twin (" + std::to_string(twin.shaderDataDwords) + " vs " + std::to_string(compiled.shaderDataDwords) + " dwords)";
+        }
     } else if (compiled.pushConstants != twin.pushConstants) return "push words (" + std::to_string(compiled.pushConstants.size()) + " vs " + std::to_string(twin.pushConstants.size()) + " bytes)";
     if (compiled.specialization != twin.specialization) return "specialization";
     if (compiled.workgroupMemoryDwords != twin.workgroupMemoryDwords) return "workgroup memory";

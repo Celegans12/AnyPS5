@@ -5761,7 +5761,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
             if (table.Stale(context.device)) static_cast<void>(table.Refresh(context));
             NewPath::CostLap(NewPath::CostStep::Route);
             if (emit->c1Twin) {
-                NewPath::CoverBuffers(*emit, resources, facts, &admitted, record.threadGroup != std::array<std::uint32_t, 3>{});
+                NewPath::CoverBuffers(*emit, resources, facts, &admitted, record.threadGroup != std::array<std::uint32_t, 3>{} ? record.shader->program : nullptr);
             } else {
                 const auto deferred = resources.DeferredAddressTable();
                 const auto ranges = deferred.has_value() ? nullptr : resources.AddressTableRanges();

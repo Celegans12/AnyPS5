@@ -336,11 +336,18 @@ void NoteBufferRanges(EmitCandidate& candidate, const Graphics::ShaderResources&
     }
 }
 
-void CoverBuffers(const EmitCandidate& candidate, const Graphics::ShaderResources& resources, CommandFacts& facts, DevicePageTable::Snapshot* used, bool threadLimit) {
-    facts.layoutFits = !threadLimit || !candidate.runtimeBuffers || std::ranges::any_of(candidate.twin->bindings, [](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::ShaderData; });
+void CoverBuffers(const EmitCandidate& candidate, const Graphics::ShaderResources& resources, CommandFacts& facts, DevicePageTable::Snapshot* used, const ShaderRecompiler::RecompileResult* threadLimitOf) {
+    facts.layoutFits = threadLimitOf == nullptr || !candidate.runtimeBuffers || (candidate.twin->imageMetadataDword == threadLimitOf->imageMetadataDword && std::ranges::any_of(candidate.twin->bindings, [](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::ShaderData; }));
     if (candidate.bufferRanges == nullptr) {
         facts.tableCovers = false;
         facts.coverReason = FallbackReason::C1RangesUnavailable;
+        return;
+    }
+    if (!SitesInside(candidate.twin->readRanges, *candidate.bufferRanges, false) || !SitesInside(candidate.twin->writeRanges, *candidate.bufferRanges, true)) {
+        // A write site inside the build's ranges but not where the build writes in place: its written elements are
+        // bound to a staged copy (the S2-share probe's dominant case).
+        facts.tableCovers = false;
+        facts.coverReason = SitesInside(candidate.twin->readRanges, *candidate.bufferRanges, false) && SitesInside(candidate.twin->writeRanges, *candidate.bufferRanges, false) ? FallbackReason::C1WrittenElsewhere : FallbackReason::C1NotCovered;
         return;
     }
     auto& table = DeviceTable();

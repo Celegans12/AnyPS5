@@ -13,9 +13,11 @@ namespace AgcDriver::NewPath {
 void NoteBufferRanges(EmitCandidate& candidate, const Graphics::ShaderResources& resources);
 // F4: every guest-buffer range of the build maps in the device page table to the address the build binds, with its
 // permissions (Write where the build writes in place). Fills the facts' cover and reason; `used` as Covers.
-// threadLimit: a thread-dimension dispatch, whose limit the build writes into today's ShaderData (the twin must
-// bind it, so its layout is today's: TwinDifference), else C1Layout.
-void CoverBuffers(const EmitCandidate& candidate, const Graphics::ShaderResources& resources, CommandFacts& facts, DevicePageTable::Snapshot* used, bool threadLimit);
+// The twin's bounded read and write sites must lie inside the build's ranges, its write sites inside ranges the build
+// writes in place (Write), else C1NotCovered. threadLimitOf: today's program of a thread-dimension dispatch, whose
+// limit the build writes into today's ShaderData (the twin must bind it at the same dword), else C1Layout.
+void CoverBuffers(const EmitCandidate& candidate, const Graphics::ShaderResources& resources, CommandFacts& facts, DevicePageTable::Snapshot* used, const ShaderRecompiler::RecompileResult* threadLimitOf);
+
 
 }
 

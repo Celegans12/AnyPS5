@@ -5,7 +5,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <string>
+#include <utility>
+#include "BdaAbi.hpp"
 
 namespace ShaderRecompiler {
 struct RecompileResult;
@@ -26,6 +29,10 @@ inline constexpr std::size_t TwinOutcomeCount = 5;
 [[nodiscard]] bool WalkReplacesTables(const ShaderRecompiler::RecompileResult& twin);
 [[nodiscard]] std::string TwinDifference(const ShaderRecompiler::RecompileResult& compiled, const ShaderRecompiler::RecompileResult& twin);
 [[nodiscard]] bool TwinCompatible(const ShaderRecompiler::RecompileResult& compiled, const ShaderRecompiler::RecompileResult& twin);
+
+// C1 F4: whether every range of `sites` (a twin's bounded read or write sites) lies inside `build` (the build's
+// guest-buffer ranges, any order), inside ranges with Write where `written`.
+[[nodiscard]] bool SitesInside(std::span<const std::pair<std::uint64_t, std::uint64_t>> sites, std::span<const ShaderRecompiler::BdaAbi::Range> build, bool written);
 
 class ResolvedTwins {
 public:

@@ -416,6 +416,24 @@ void c1Twins() {
         Expect(TwinCompatible(*withData, dataTwin), "a twin with today's ShaderData layout was refused: " + TwinDifference(*withData, dataTwin));
         dataTwin.shaderDataUserWords = {5, 7};
         Expect(!TwinCompatible(*withData, dataTwin), "a twin with other ShaderData user words was accepted");
+        // Smaller data that ends at the user words reads today's prefix; dwords after them would read the offsets.
+        dataTwin.shaderDataUserWords = {5, 6};
+        dataTwin.shaderDataDwords = dataTwin.memoryOffsetDword;
+        dataTwin.imageMetadataDword = dataTwin.memoryOffsetDword;
+        Expect(TwinCompatible(*withData, dataTwin), "a twin whose ShaderData ends at today's user words was refused: " + TwinDifference(*withData, dataTwin));
+        dataTwin.shaderDataDwords = dataTwin.memoryOffsetDword + 3;
+        Expect(!TwinCompatible(*withData, dataTwin), "a twin with data dwords after the user words over today's offsets was accepted");
+    }
+    {
+        const std::vector<BdaAbi::Range> build{{0x3000, 0x4000, 0x93000, BdaAbi::Read, 0}, {0x1000, 0x2000, 0x91000, BdaAbi::Read | BdaAbi::Write, 0}, {0x2000, 0x3000, 0x92000, BdaAbi::Read | BdaAbi::Write, 0}};
+        const std::vector<std::pair<std::uint64_t, std::uint64_t>> inside{{0x1100, 0x2f00}, {0x3000, 0x3010}};
+        const std::vector<std::pair<std::uint64_t, std::uint64_t>> written{{0x1100, 0x2f00}};
+        const std::vector<std::pair<std::uint64_t, std::uint64_t>> readOnlyWrite{{0x2f00, 0x3100}};
+        const std::vector<std::pair<std::uint64_t, std::uint64_t>> outside{{0x0f00, 0x1100}};
+        Expect(SitesInside(inside, build, false) && SitesInside(written, build, true), "sites inside the build's ranges were refused");
+        Expect(!SitesInside(readOnlyWrite, build, true) && SitesInside(readOnlyWrite, build, false), "a write site over a read-only range was accepted, or the read refused");
+        Expect(!SitesInside(outside, build, false), "a site outside the build's ranges was accepted");
+        Expect(SitesInside({}, {}, true), "no sites refused");
     }
 
     const auto words = TwinPushWords(*twin);
