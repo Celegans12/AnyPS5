@@ -5329,6 +5329,22 @@ bool VulkanDevice::ExactSerialAllocating() {
     return serial;
 }
 
+bool VulkanDevice::ExactSerialProgram(std::uint64_t programAddress) {
+    static const std::vector<std::uint64_t> programs = [] {
+        std::vector<std::uint64_t> list;
+        const char* text = std::getenv("APS5_EXACT_SERIAL_PROGRAMS");
+        while (text != nullptr && *text != 0) {
+            char* end = nullptr;
+            const auto value = std::strtoull(text, &end, 16);
+            if (end == text) break;
+            list.push_back(value);
+            text = *end == ',' ? end + 1 : end;
+        }
+        return list;
+    }();
+    return ExactSerialAllocating() && std::find(programs.begin(), programs.end(), programAddress) != programs.end();
+}
+
 void VulkanDevice::NoteAllocatingProgram(std::uint64_t programAddress) {
     auto& programs = Allocating();
     std::lock_guard lock(programs.mutex);
@@ -5700,7 +5716,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     // APS5_NO_LANE_OVERLAP=1 (diagnostic, an APS5_AB switch): no dispatch of the async lane (lane 1) overlaps.
     if (Graphics::Recorder::LaneOwnFamily() && Graphics::Recorder::ThreadLane() == 1) require(!record.shader->program->bindlessHeap && resources.SampledTextures().empty() && resources.StorageImages().empty(), "a dispatch that binds images was recorded into the async lane, whose compute-family queue does not own the images");
     const bool laneOverlap = !recorder.AsyncLaneActive() || Graphics::Recorder::ThreadLane() == 0 || !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoLaneOverlap);
-    const bool serialWorkgroups = ExactSerialAllocating() && arguments == 0 && argumentImport == nullptr && record.shader->program->workgroupMemoryDwords == 0 && static_cast<std::uint64_t>(record.x) * record.y * record.z > 1u && record.x <= groupLimit[0] && record.y <= groupLimit[1] && record.z <= groupLimit[2] && AllocatingProgram(record.programAddress);
+    const bool serialWorkgroups = ExactSerialAllocating() && arguments == 0 && argumentImport == nullptr && (record.shader->program->workgroupMemoryDwords == 0 || ExactSerialProgram(record.programAddress)) && static_cast<std::uint64_t>(record.x) * record.y * record.z > 1u && record.x <= groupLimit[0] && record.y <= groupLimit[1] && record.z <= groupLimit[2] && (AllocatingProgram(record.programAddress) || ExactSerialProgram(record.programAddress));
     const bool overlapCapable = !serialWorkgroups && laneOverlap && overlapQueue != 0 && Graphics::Recorder::DispatchOverlapEnabled() && arguments == 0 && argumentImport == nullptr && !record.htileClear.has_value() && record.shader->program->workgroupMemoryDwords == 0 && (state->checkpointMarker == nullptr || CheckpointsInRuns()) && record.x <= groupLimit[0] && record.y <= groupLimit[1] && record.z <= groupLimit[2] && (Graphics::Recorder::StagedOverlapEnabled() || !resources.HasGpuCopies());
     if (timer.profile && overlapQueue != 0) {
         if (!overlapCapable) {

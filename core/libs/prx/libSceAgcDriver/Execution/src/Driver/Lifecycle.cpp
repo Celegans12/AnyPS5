@@ -531,6 +531,26 @@ bool Driver::Quiescent() {
     return runningWorkers.load(std::memory_order_acquire) == 0 && !DrawPipeline::Queue0().Busy() && !completionsPending();
 }
 
+bool Driver::SubmitOpenForReplay(bool report) {
+    const auto workers = runningWorkers.load(std::memory_order_acquire);
+    const bool queue0Busy = DrawPipeline::Queue0().Busy();
+    const auto labels = Graphics::Recorder::PendingCompletionLabels();
+    const auto writeBacks = Graphics::Recorder::PendingWriteBackCompletions();
+    if (workers != 0 || queue0Busy || (labels == 0 && writeBacks == 0)) return false;
+    {
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Hook);
+        std::lock_guard gpuLock(GuestMemory::GpuMutex());
+        if (const auto localDevice = device.Load()) localDevice->SubmitRecorded(false);
+    }
+    {
+        std::lock_guard lock(mutex);
+    }
+    changed.notify_all();
+    if (report) std::fprintf(stderr, "[frame-replay] driver not quiescent while parked (running workers %u, queue 0 busy %d, completion labels %llu, write-back completions %llu): open batch submitted\n", workers, queue0Busy ? 1 : 0,
+                             static_cast<unsigned long long>(labels), static_cast<unsigned long long>(writeBacks));
+    return true;
+}
+
 std::pair<std::uint64_t, std::uint64_t> Driver::SerialProgress() {
     std::lock_guard lock(mutex);
     return {accepted, completed};
