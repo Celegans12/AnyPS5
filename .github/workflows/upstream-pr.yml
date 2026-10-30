@@ -1,0 +1,61 @@
+name: Upstream PR
+
+on:
+  push:
+    branches: [yotei/best]
+    paths: ['.github/upstream-prs/**', '.github/workflows/upstream-pr.yml']
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-pr
+  cancel-in-progress: false
+
+jobs:
+  open:
+    if: github.repository == 'Celegans12/AnyPS5-Ghost-of-Yotei'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.UPSTREAM_PR_TOKEN }}
+      UPSTREAM: boykopovar/AnyPS5
+      OWNER: ${{ github.repository_owner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Open a pull request for every queued branch
+        shell: bash
+        run: |
+          set -uo pipefail
+          if [ -z "$GH_TOKEN" ]; then echo "::notice::UPSTREAM_PR_TOKEN secret is not set, nothing opened"; exit 0; fi
+          shopt -s nullglob
+          failed=0
+          for f in .github/upstream-prs/*.md; do
+            branch=$(basename "$f" .md | sed 's#__#/#g')
+            if ! gh api "repos/$GITHUB_REPOSITORY/branches/$branch" --silent 2>/dev/null; then
+              echo "::warning::$branch is not on $GITHUB_REPOSITORY, skipped"; continue
+            fi
+            if ! existing=$(gh api "repos/$UPSTREAM/pulls?head=$OWNER:$branch&state=all" --jq '.[0].html_url // empty' 2>&1); then
+              echo "::error::$branch: looking up existing PRs failed: $existing"; failed=1; continue
+            fi
+            if [ -n "$existing" ]; then echo "$branch already has $existing"; continue; fi
+            if ! title=$(gh api "repos/$GITHUB_REPOSITORY/commits/$branch" --jq '.commit.message | split("\n")[0]' 2>&1); then
+              echo "::error::$branch: reading the commit title failed: $title"; failed=1; continue
+            fi
+            opened=""
+            for attempt in 1 2; do
+              if out=$(gh api -i "repos/$UPSTREAM/pulls" -f title="$title" -f head="$OWNER:$branch" -f base=main -F maintainer_can_modify=true -F body=@"$f" 2>&1); then
+                opened=$(printf '%s\n' "$out" | sed -n 's/.*"html_url": *"\([^"]*\/pull\/[0-9]*\)".*/\1/p' | head -n1)
+                break
+              fi
+              sleep 20
+            done
+            if [ -n "$opened" ]; then
+              echo "$branch -> $opened" | tee -a "$GITHUB_STEP_SUMMARY"
+            else
+              echo "::error::$branch: opening the PR failed: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-600)"; failed=1
+            fi
+          done
+          exit $failed
