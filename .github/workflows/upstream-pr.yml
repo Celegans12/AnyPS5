@@ -44,10 +44,18 @@ jobs:
             if ! title=$(gh api "repos/$GITHUB_REPOSITORY/commits/$branch" --jq '.commit.message | split("\n")[0]' 2>&1); then
               echo "::error::$branch: reading the commit title failed: $title"; failed=1; continue
             fi
-            if url=$(gh api "repos/$UPSTREAM/pulls" -f title="$title" -f head="$OWNER:$branch" -f base=main -F maintainer_can_modify=true -F body=@"$f" --jq .html_url 2>&1); then
-              echo "$branch -> $url" | tee -a "$GITHUB_STEP_SUMMARY"
+            opened=""
+            for attempt in 1 2; do
+              if out=$(gh api -i "repos/$UPSTREAM/pulls" -f title="$title" -f head="$OWNER:$branch" -f base=main -F maintainer_can_modify=true -F body=@"$f" 2>&1); then
+                opened=$(printf '%s\n' "$out" | sed -n 's/.*"html_url": *"\([^"]*\/pull\/[0-9]*\)".*/\1/p' | head -n1)
+                break
+              fi
+              sleep 20
+            done
+            if [ -n "$opened" ]; then
+              echo "$branch -> $opened" | tee -a "$GITHUB_STEP_SUMMARY"
             else
-              echo "::error::$branch: opening the PR failed: $url"; failed=1
+              echo "::error::$branch: opening the PR failed: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-600)"; failed=1
             fi
           done
           exit $failed
