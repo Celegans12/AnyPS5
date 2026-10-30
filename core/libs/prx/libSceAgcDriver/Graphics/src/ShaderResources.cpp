@@ -1431,6 +1431,7 @@ std::uint64_t ReleaseTextureCaches(std::uint64_t bytes, bool newImage) {
         ~Done() { flag = false; }
     } done{releasing};
     std::uint64_t freed = 0;
+    std::uint64_t heapHeldBytes = 0;
     std::size_t sampledEntries = 0;
     std::size_t storageEntries = 0;
     std::size_t storageKept = 0;
@@ -1443,9 +1444,10 @@ std::uint64_t ReleaseTextureCaches(std::uint64_t bytes, bool newImage) {
         if ((inherited && (!newImage || sampledCacheReclaimable == 0)) || (!inherited && !lock.try_lock())) {
             sampledSkipped = true;
         } else {
-            for (auto it = cache.entries.end(); it != cache.entries.begin() && freed < bytes;) {
+            for (auto it = cache.entries.end(); it != cache.entries.begin() && freed + heapHeldBytes < bytes;) {
                 --it;
-                if (it->texture.use_count() != 1 || (it->source != nullptr && it->source->Dirty())) continue;
+                const auto heapHolds = static_cast<long>(it->texture->HeapHolds());
+                if (it->texture.use_count() != 1 + heapHolds || (it->source != nullptr && it->source->Dirty())) continue;
                 const auto allocated = it->texture->AllocationBytes();
                 const auto sourceBytes = it->source != nullptr ? it->source->AllocationBytes() : 0u;
                 const std::weak_ptr<StorageTexture> source = it->source;
@@ -1453,10 +1455,18 @@ std::uint64_t ReleaseTextureCaches(std::uint64_t bytes, bool newImage) {
                 eraseTexture(cache, it);
                 ++cache.counts.evicted;
                 ++sampledEntries;
-                freed += allocated;
+                if (heapHolds != 0) heapHeldBytes += allocated;
+                else freed += allocated;
                 if (source.expired()) freed += sourceBytes;
                 it = next;
             }
+        }
+    }
+    if (heapHeldBytes != 0) {
+        BindlessHeap::NoteSweepDue();
+        if (sampledCacheHeld == 0) {
+            BindlessHeap::SweepIfDue();
+            freed += heapHeldBytes;
         }
     }
     if (freed < bytes) {
