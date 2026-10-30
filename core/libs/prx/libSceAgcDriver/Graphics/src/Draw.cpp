@@ -2464,7 +2464,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline Begin OK");
     NoteHeapRecord(false, record.pipeline->DescriptorHeap());
     if (record.pipeline->DescriptorHeap()) {
-        BindlessHeap::For(context).BindDescriptorHeaps(commands);
+        resources.BindDescriptorHeaps(commands);
         NoteEmptyResourceSet();
     } else if (drawBindings != nullptr) {
         Require(!resources.HeapStage(), "a GPU-mode draw needs a VK_EXT_descriptor_heap pipeline");
@@ -3412,7 +3412,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
     pipeline->Begin(commands, *framebuffer, state.renderExtent, state);
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline Begin OK");
     if (pipeline->DescriptorHeap()) {
-        BindlessHeap::For(context).BindDescriptorHeaps(commands);
+        resources->BindDescriptorHeaps(commands);
         NoteEmptyResourceSet();
     } else resources->Bind(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->Layout());
     if (pixelLdsSubgroup != 0u && !pipeline->DescriptorHeap()) BindPixelFunctionLds(context, commands, pipeline->Layout());

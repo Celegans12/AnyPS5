@@ -6024,6 +6024,11 @@ void ShaderResources::requireGuestBuffers(std::span<const MovedBuffer> moved) co
     }
 }
 
+void ShaderResources::BindDescriptorHeaps(VkCommandBuffer commands) const {
+    requireGuestBuffers();
+    BindlessHeap::For(context).BindDescriptorHeaps(commands);
+}
+
 void ShaderResources::Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const {
     requireGuestBuffers();
     if (_set != VK_NULL_HANDLE) CmdBindDescriptorSets(context, commands, bindPoint, layout, 0, 1, &_set, bindPoint == VK_PIPELINE_BIND_POINT_COMPUTE ? SetBindSite::Dispatch : SetBindSite::Draw);
