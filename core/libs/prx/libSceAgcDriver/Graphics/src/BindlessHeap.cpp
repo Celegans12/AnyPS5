@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <stdexcept>
@@ -151,6 +152,22 @@ bool BindlessHeap::Fits(const VkPhysicalDeviceDescriptorHeapPropertiesEXT& prope
     return resourcesFit && samplersFit;
 }
 
+namespace {
+
+std::uint32_t configuredSlotCap() {
+    static const std::uint32_t cap = [] {
+        std::uint32_t result = Abi::GpuImageHeapSlots;
+        if (const char* value = std::getenv("APS5_HEAP_SLOT_CAP")) {
+            const auto requested = static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10));
+            if (requested != 0u) result = static_cast<std::uint32_t>(Abi::Binding::Samplers) + std::min(requested, Abi::GpuImageHeapSlots - static_cast<std::uint32_t>(Abi::Binding::Samplers));
+        }
+        return result;
+    }();
+    return cap;
+}
+
+}
+
 BindlessHeap::BindlessHeap(const Context& context) : context(context) {
     Require(context.descriptorHeap, "the GPU heap needs VK_EXT_descriptor_heap");
     const auto& heapProperties = context.descriptorHeapProperties;
@@ -181,11 +198,7 @@ BindlessHeap::BindlessHeap(const Context& context) : context(context) {
     ringAlignment = static_cast<std::uint32_t>(std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 16));
     ringChunks.resize(RingBytes / RingChunkBytes);
     nextTextureSlot = SamplerKind;
-    slotCap = Abi::GpuImageHeapSlots;
-    if (const char* cap = std::getenv("APS5_HEAP_SLOT_CAP")) {
-        const auto requested = static_cast<std::uint32_t>(std::strtoul(cap, nullptr, 10));
-        if (requested != 0u) slotCap = SamplerKind + std::min(requested, Abi::GpuImageHeapSlots - SamplerKind);
-    }
+    slotCap = configuredSlotCap();
 }
 
 BindlessHeap::~BindlessHeap() = default;
@@ -484,6 +497,10 @@ void noteNearlyFull(const char* what, std::uint32_t margin) {
 
 bool BindlessHeap::NearlyFull() {
     return nearlyFull.load(std::memory_order_relaxed);
+}
+
+std::uint32_t BindlessHeap::ImageSlotCapacity() {
+    return configuredSlotCap() - SamplerKind;
 }
 
 namespace {

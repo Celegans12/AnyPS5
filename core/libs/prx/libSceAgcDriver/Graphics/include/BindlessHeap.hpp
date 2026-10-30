@@ -61,6 +61,7 @@ public:
                             std::span<const std::uint32_t> samplerSlots, std::span<const std::uint32_t> samplerGenerations) const;
     std::uint32_t AbsentSlot(std::uint32_t kind, VkImageView view);
     static bool NearlyFull();
+    static std::uint32_t ImageSlotCapacity();
     static void NoteSweepDue();
     static void NoteStorageEvicted();
     static void SweepIfDue();

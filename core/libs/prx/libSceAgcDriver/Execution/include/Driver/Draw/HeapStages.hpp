@@ -16,6 +16,7 @@ namespace AgcDriver::DriverDetail {
 
 bool HeapFragmentsEnabled();
 bool HeapRefused();
+bool HeapStageExcluded(ShaderRecompiler::ShaderStage stage);
 bool HeapPreRasterStage(ShaderRecompiler::ShaderStage stage);
 Graphics::HeapStageReason HeapStageIneligibility(ShaderRecompiler::ShaderStage stage, const ShaderRecompiler::IrResourcePlan* plan,
                                                  bool heapVertex);

@@ -1392,7 +1392,7 @@ std::vector<PreparedShaders::Entry> PrepareRegistered(RegisteredPreparation& pla
         }
     };
     bool heapPrebuilt = false;
-    if ((fragment || heapVertex) && HeapFragmentsEnabled()) {
+    if ((fragment || heapVertex) && !HeapStageExcluded(request.shader.stage) && HeapFragmentsEnabled()) {
         const auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(request, entries.front().handle);
         if (invocation && HeapStageEligible(request.shader.stage, invocation->Plan().get(), heapVertex)) {
             auto heapRequest = request;
@@ -1942,7 +1942,7 @@ std::vector<PreparedGraphicsStage> PrepareGraphicsStages(const DrawDecode& decod
         std::vector<PreparedGraphicsStage> heap;
         const auto addHeap = [&](std::size_t index, bool heapVertex) {
             const auto& stage = prepared[index];
-            if (stage.entry.handle == nullptr || !requests[index]) return false;
+            if (stage.entry.handle == nullptr || !requests[index] || HeapStageExcluded(stage.stage)) return false;
             const auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(*requests[index], stage.entry.handle);
             if (!invocation || !HeapStageEligible(stage.stage, invocation->Plan().get(), heapVertex)) return false;
             auto request = *requests[index];
