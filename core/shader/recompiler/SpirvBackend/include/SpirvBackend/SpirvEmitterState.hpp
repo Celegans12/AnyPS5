@@ -112,6 +112,7 @@ struct SpirvEmitterState {
     bool registrationModules = false;
     bool gpuResolvedImages = false;
     bool addressedBuffers = false;
+    std::optional<bool> guestBuffersWritten;
     bool fragmentDescriptorSet = false;
     bool float16DenormPreserve = false;
     bool robustBufferAccess2 = false;

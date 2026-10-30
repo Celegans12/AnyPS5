@@ -188,7 +188,14 @@ RuntimeAddress address(SpirvValueEmitContext& context, const IrValue& instructio
     return {AddBdaAddress(context, instruction, resource.base, Unary(state, spv::OpUConvert, TypeScalarU64(state), bytesAddress.guest), false), bytesAddress.inBounds};
 }
 
-MemoryResourceAccess directAccess(SpirvValueEmitContext& context, const IrValue& instruction, bool wide = false, bool plainLoad = false) {
+bool readOnlyLoad(SpirvValueEmitContext& context, const IrValue& instruction) {
+    auto& state = context.state;
+    if (context.Memory(instruction).coherent || (state.requirements.coherentBuffers && state.program.Metadata().invalidatesCaches)) return false;
+    if (!state.guestBuffersWritten.has_value()) state.guestBuffersWritten = WritesGuestBuffers(state.program);
+    return !*state.guestBuffersWritten;
+}
+
+MemoryResourceAccess directAccess(SpirvValueEmitContext& context, const IrValue& instruction, bool wide = false, bool plainLoad = false, bool readOnly = false) {
     auto& state = context.state;
     const auto& memory = context.Memory(instruction);
     if (state.addressedBuffers) {
@@ -202,7 +209,7 @@ MemoryResourceAccess directAccess(SpirvValueEmitContext& context, const IrValue&
         access.kind = memory.kind;
         access.physical = true;
         access.objectPointer = state.module.AllocateId();
-        state.module.AddFunction(spv::OpConvertUToPtr, TypePhysicalBufferPointer(state, wide), access.objectPointer, address);
+        state.module.AddFunction(spv::OpConvertUToPtr, readOnly ? TypePhysicalReadOnlyBufferPointer(state, wide) : TypePhysicalBufferPointer(state, wide), access.objectPointer, address);
         access.byteOffset = state.memoryByteOffsets.at(element);
         access.memoryAccess = memory.coherent ? spv::MemoryAccessVolatileMask : 0u;
         access.length = Binary(state, spv::OpShiftRightLogical, TypeU32(state), EmitShaderDataDwordLoad(state, dword + 2u), ConstantU32(state, wide ? 3u : 2u));
@@ -255,7 +262,7 @@ bool addressedCoherent(SpirvValueEmitContext& context, const IrValue& instructio
 std::uint32_t readBuffer(SpirvValueEmitContext& context, const IrValue& instruction, std::uint32_t address, std::uint32_t bits, std::uint32_t enable = 0u) {
     if (context.Memory(instruction).gpuDescriptor) return EmitBdaRead(context, instruction, address, bits);
     auto& state = context.state;
-    const auto access = directAccess(context, instruction, false, !context.Memory(instruction).coherent);
+    const auto access = directAccess(context, instruction, false, !context.Memory(instruction).coherent, readOnlyLoad(context, instruction));
     const auto index = directWordIndex(state, access, address);
     const auto misalignment = baseMisalignment(context, instruction);
     const auto unaligned = nonzero(state, misalignment);
