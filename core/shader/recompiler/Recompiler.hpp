@@ -359,6 +359,10 @@ struct SpirvTarget {
     // S4 segment program: each V# read translates its base once through its settled segment and checks every access
     // against it (FaultReason::OutsideSegment); no per-access walk. Only together with newPathResolved.
     bool bdaSegments = false;
+    // S2-share C1: every buffer V# is read at run time (the GPU-descriptor path) and its accesses go through the
+    // device page table, so the module binds no guest buffers; the buffer sites (bounded ranges) are still recorded.
+    // Only together with newPathResolved.
+    bool newPathRuntimeBuffers = false;
     // Exact replays (APS5_EXACT_SERIAL_ALLOCATING, allocating programs): the console waves of one workgroup run one
     // after another in wave order, so their returning atomics see the same order in every run. Compute only, and only
     // where one host subgroup holds one console wave, without workgroup barriers or invocations that a BDA fault stops.

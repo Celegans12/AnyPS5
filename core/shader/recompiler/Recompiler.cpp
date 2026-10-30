@@ -201,11 +201,11 @@ RdnaProgram DecodeStageProgram(ShaderStageKind stage, std::span<const std::uint3
 
 ShaderStageInputInfo RequestInputInfo(const RecompileRequest& request) {
     // The new path's target fields select emission that is not written yet for every stage (S4 epoch 1): a request that
-    // asks for it must not get today's module under a key that says otherwise. newPathResolved is compute-only so far
-    // (its driver words come first in the push block, ahead of the stage's PushData; graphics stages need D's
-    // per-stage push layout first).
-    if (request.target.newPathResolved && request.shader.stage != ShaderStage::Compute) throw std::runtime_error("the newPathResolved target is implemented for compute programs only");
+    // asks for it must not get today's module under a key that says otherwise. newPathResolved puts its driver words
+    // first in every stage's push block, ahead of the stage's PushData (S2-draws: one 24-byte prefix per draw, today's
+    // per-stage offsets moved up by it).
     if (request.target.bdaSegments) throw std::runtime_error("the bdaSegments target (segment programs) is not implemented yet");
+    if (request.target.newPathRuntimeBuffers && !request.target.newPathResolved) throw std::runtime_error("the newPathRuntimeBuffers target needs newPathResolved (its buffer accesses walk the device page table)");
     const auto* mesh = request.graphics && request.graphics->mesh ? &*request.graphics->mesh : nullptr;
     std::optional<TessellationConfiguration> tessellationCopy;
     if (request.graphics && request.graphics->tessellation) {
@@ -426,7 +426,7 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
     dumpIr("srt");
 
     constexpr ResourceTracker resourceTracker;
-    resourceTracker.Track(program, request.target.bindlessImages);
+    resourceTracker.Track(program, request.target.bindlessImages, request.target.newPathRuntimeBuffers);
     deadCodeEliminator.Eliminate(program);
     dumpIr("resources");
     if (request.context.compute && !request.context.compute->PartialGroups()) program.Info().linearStore = FindLinearStore(program, request.context.compute->numThreads);
@@ -1672,6 +1672,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
     result.workgroupMemoryDwords = WorkgroupMemoryStrideDwords(variant.info.info);
     result.bindings = std::move(bindings.bindings);
     if (std::ranges::none_of(result.bindings, [](const DescriptorBinding& binding) { return binding.role == DescriptorRole::BdaPagetable || binding.role == DescriptorRole::FaultBuffer; })) result.bdaAbiVersion = 0u;
+    const bool faultSink = result.bdaAbiVersion == BdaAbi::Version || (artifact.newPathResolved && artifact.bdaAbiVersion == BdaAbi::Version);
     if (result.hasDeferredDirectImage && (variant.info.stage != IrShaderStage::Compute || result.bdaAbiVersion != BdaAbi::Version)) throw std::runtime_error("deferred direct image requires a compute fault buffer");
     if (UnnormalizedWrapEnabled()) {
         for (const auto& entry : bindingPlan->bindings) {
@@ -1689,7 +1690,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
             }
         }
     }
-    if (result.hasGuardedUnnormalizedWrap && (variant.info.stage != IrShaderStage::Compute || request.target.bdaAbiVersion != BdaAbi::Version || result.bdaAbiVersion != BdaAbi::Version)) throw std::runtime_error("unnormalized wrap requires a compute fault buffer");
+    if (result.hasGuardedUnnormalizedWrap && (variant.info.stage != IrShaderStage::Compute || request.target.bdaAbiVersion != BdaAbi::Version || !faultSink)) throw std::runtime_error("unnormalized wrap requires a compute fault buffer");
     result.pushConstants = std::move(bindings.pushConstants);
     result.readsDepthRemapPush = depthRemap;
     if (request.shader.stage == ShaderStage::Compute) {

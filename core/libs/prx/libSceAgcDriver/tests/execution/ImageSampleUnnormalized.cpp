@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
+#include "BdaAbi.hpp"
 #include "Recompiler.hpp"
 #include "VulkanTestDevice.hpp"
 #include <algorithm>
@@ -478,12 +479,85 @@ void CapturedSamplerCases(AgcDriver::VulkanDevice& device) {
     CheckCaptured(Guarded, boundary, execute(Guarded, boundary, false));
 }
 
+ShaderRecompiler::RecompileResult CompileCaptured(AgcDriver::VulkanDevice& device, const Program& program, const std::array<std::uint32_t, 8>& texture, std::uint32_t waveSize, bool resolved) {
+    std::vector<std::uint32_t> userData(16, 0u);
+    const auto buffer = BufferDescriptor(Buffer.data(), static_cast<std::uint32_t>(Buffer.size() * 4u));
+    std::copy(buffer.begin(), buffer.end(), userData.begin());
+    std::copy(texture.begin(), texture.end(), userData.begin() + 4);
+    std::copy(CapturedSampler.begin(), CapturedSampler.end(), userData.begin() + 12);
+    const auto code = program.code;
+    const std::array<ShaderRecompiler::MemoryRegion, 1> memory{{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)}}};
+    const ShaderRecompiler::ShaderComputeStageInfo compute{{Threads, 1, 1}, 0u, {false, false, false}, false, 1};
+    ShaderRecompiler::RecompileRequest request{
+        {ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}},
+        {waveSize, 0, userData, compute, std::nullopt, std::nullopt, memory},
+        device.Target(),
+        {0, 0, 0, 128}
+    };
+    request.target.newPathResolved = resolved;
+    request.useCache = false;
+    return ShaderRecompiler::Recompile(request);
 }
 
-int main() {
+struct SpirvFacts {
+    bool physicalAddressing = false;
+    bool physicalCapability = false;
+    std::uint32_t pointerConversions = 0;
+};
+
+SpirvFacts ScanSpirv(std::span<const std::uint32_t> words) {
+    constexpr std::uint32_t OpCapability = 17, OpMemoryModel = 14, OpConvertUToPtr = 120, PhysicalStorageBufferAddresses = 5347, PhysicalStorageBuffer64 = 5348;
+    SpirvFacts facts;
+    for (std::size_t at = 5; at < words.size();) {
+        const auto count = words[at] >> 16u;
+        const auto opcode = words[at] & 0xffffu;
+        Require(count != 0u && at + count <= words.size(), "resolved unnormalized wrap: malformed SPIR-V");
+        if (opcode == OpCapability && words[at + 1] == PhysicalStorageBufferAddresses) facts.physicalCapability = true;
+        if (opcode == OpMemoryModel && words[at + 1] == PhysicalStorageBuffer64) facts.physicalAddressing = true;
+        if (opcode == OpConvertUToPtr) ++facts.pointerConversions;
+        at += count;
+    }
+    return facts;
+}
+
+void ResolvedWrapCases(AgcDriver::VulkanDevice& device) {
+    namespace Bda = ShaderRecompiler::BdaAbi;
+    const auto texture = CapturedTexture();
+    const auto hasRole = [](const ShaderRecompiler::RecompileResult& result, ShaderRecompiler::DescriptorRole role) {
+        return std::any_of(result.bindings.begin(), result.bindings.end(), [&](const auto& binding) { return binding.role == role; });
+    };
+    for (const auto* program : {&Guarded, &GuardedOffsets, &GuardedInactive}) {
+        for (const std::uint32_t waveSize : {32u, 64u}) {
+            const std::string name = std::string(program->instructions[0]) + ", wave" + std::to_string(waveSize);
+            const auto legacy = CompileCaptured(device, *program, texture, waveSize, false);
+            const auto resolved = CompileCaptured(device, *program, texture, waveSize, true);
+            Require(legacy.hasGuardedUnnormalizedWrap && resolved.hasGuardedUnnormalizedWrap, name + ": the guard lost its invocation proof");
+            Require(!legacy.newPathResolved && resolved.newPathResolved, name + ": the resolved marker is wrong");
+            Require(hasRole(legacy, ShaderRecompiler::DescriptorRole::FaultBuffer) && legacy.bdaAbiVersion == Bda::Version, name + ": the range-table module lost its fault buffer");
+            Require(!hasRole(resolved, ShaderRecompiler::DescriptorRole::FaultBuffer) && !hasRole(resolved, ShaderRecompiler::DescriptorRole::BdaPagetable) && resolved.bdaAbiVersion == 0u, name + ": the resolved module still binds a fault buffer or BDA table");
+            const auto legacyFacts = ScanSpirv(legacy.spirv.Words());
+            const auto resolvedFacts = ScanSpirv(resolved.spirv.Words());
+            Require(legacyFacts.pointerConversions == 0u && !legacyFacts.physicalAddressing, name + ": the range-table module addresses memory physically");
+            Require(resolvedFacts.pointerConversions != 0u, name + ": the resolved module does not write its fault to the command record");
+            Require(resolvedFacts.physicalAddressing && resolvedFacts.physicalCapability, name + ": the resolved module's command record pointers lack PhysicalStorageBufferAddresses");
+            std::printf("%s: resolved module records the wrap fault through %u command-record pointers\n", name.c_str(), resolvedFacts.pointerConversions);
+        }
+    }
+}
+
+}
+
+int main(int argc, char** argv) {
     try {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
+        if (argc > 1 && std::string_view(argv[1]) == "--resolved") {
+            const auto* option = std::getenv("APS5_UNNORM_WRAP_GUARD");
+            Require(option != nullptr && std::string_view(option) == "1", "resolved unnormalized wrap: run with APS5_UNNORM_WRAP_GUARD=1");
+            ResolvedWrapCases(*device);
+            std::puts("resolved unnormalized wrap tests passed");
+            return 0;
+        }
         FillTexture(SingleLevel, 1);
         FillTexture(MultiLevel, StorageLevels);
         const auto coordinates = Coordinates(0u);

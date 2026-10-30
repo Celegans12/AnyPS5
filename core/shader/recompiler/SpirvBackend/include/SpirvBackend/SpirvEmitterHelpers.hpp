@@ -45,6 +45,10 @@ std::uint32_t TypePushConstantElementPointer(SpirvEmitterState& state);
 // driver words (NewPathPushDriverWords: page table, fault record, overflow addresses), else 0.
 std::uint32_t PushDataMember(SpirvEmitterState& state);
 inline constexpr std::uint32_t NewPathPushDriverWords = 6;
+// The new path's push block (D's NewPathAbi PushBlockBytes, 256 bytes): a resolved stage's PushData array ends inside
+// it, so a stage whose slot starts at dword 32 (a fragment stage with pipeline libraries) keeps 26 of its 32 dwords.
+inline constexpr std::uint32_t NewPathPushBlockDwords = 64;
+std::uint32_t NewPathPushDataDwords(const SpirvEmitterState& state);
 // The device page table's address (push words 0-1) of a newPathResolved module, as a u64.
 std::uint32_t NewPathPageTableAddress(SpirvEmitterState& state);
 // The dispatch's command record (push words 2-3, BdaAbi::FaultBufferBytes layout: fault, written pages, SRT guard) of a
@@ -92,7 +96,7 @@ std::uint32_t ConstantU64(SpirvEmitterState& state, std::uint64_t value);
 std::uint32_t ConstantU32CompositeZero(SpirvEmitterState& state, std::uint32_t components);
 std::uint32_t DefineInterfaceVariable(SpirvEmitterState& state, std::uint32_t type, std::uint32_t storage, const char* name);
 void CheckBindings(const IrProgram& program, const CompiledBindingLayout& bindings);
-void EmitBaseHeader(SpirvModule& module, const IrProgram& program);
+void EmitBaseHeader(SpirvModule& module, const IrProgram& program, bool newPathRecord = false);
 void DefineInputs(SpirvEmitterState& state);
 void DefineOutputs(SpirvEmitterState& state);
 void DefineDescriptors(SpirvEmitterState& state);
