@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/ResolvedPush.hpp"
 #include "Recompiler.hpp"
 #include <algorithm>
+#include <cstdlib>
 #include <mutex>
 #include <unordered_map>
 
@@ -12,6 +13,8 @@ struct ResolvedTwins::State {
     struct Entry {
         std::weak_ptr<const ShaderRecompiler::RecompileResult> compiled;
         std::shared_ptr<const ShaderRecompiler::RecompileResult> twin;
+        std::uint64_t program = 0;
+        bool skipped = false;
     };
     mutable std::mutex mutex;
     std::unordered_map<const ShaderRecompiler::RecompileResult*, Entry> entries;
@@ -117,7 +120,55 @@ bool TwinCompatible(const ShaderRecompiler::RecompileResult& compiled, const Sha
     return TwinDifference(compiled, twin).empty();
 }
 
-void ResolvedTwins::Remember(const std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiled, std::shared_ptr<const ShaderRecompiler::RecompileResult> twin, TwinOutcome outcome, bool c1) {
+std::uint64_t TwinProgramKey(std::uint64_t codeAddress, const ShaderRecompiler::RecompileResult& compiled) {
+    std::uint64_t key = codeAddress * 0x9e3779b97f4a7c15ull;
+    key ^= (static_cast<std::uint64_t>(compiled.bindings.size()) << 48u) ^ (static_cast<std::uint64_t>(compiled.pushConstants.size()) << 32u);
+    for (const auto& binding : compiled.bindings) key = (key ^ (static_cast<std::uint64_t>(binding.role) | (static_cast<std::uint64_t>(binding.binding) << 8u) | (static_cast<std::uint64_t>(binding.kind) << 24u))) * 0xc2b2ae3d27d4eb4full;
+    return key != 0 ? key : 1;
+}
+
+bool TwinRoutes::ShouldBuild(std::uint64_t program) {
+    std::lock_guard lock(mutex);
+    auto [found, inserted] = programs.try_emplace(program);
+    if (inserted) ++totals.programs;
+    auto& entry = found->second;
+    if (always || entry.observed < MinObserved || entry.history != 0) {
+        ++totals.built;
+        return true;
+    }
+    if (++entry.skippedSince >= ProbeEvery) {
+        entry.skippedSince = 0;
+        ++totals.probes;
+        return true;
+    }
+    ++totals.skipped;
+    return false;
+}
+
+void TwinRoutes::Note(std::uint64_t program, bool routedNew) {
+    if (program == 0) return;
+    std::lock_guard lock(mutex);
+    auto& entry = programs[program];
+    entry.history = static_cast<std::uint16_t>((entry.history << 1u) | (routedNew ? 1u : 0u));
+    if (entry.observed < History) ++entry.observed;
+    if (routedNew) entry.skippedSince = 0;
+    ++(routedNew ? totals.notedNew : totals.notedFallback);
+}
+
+TwinRoutes::Totals TwinRoutes::Take() const {
+    std::lock_guard lock(mutex);
+    return totals;
+}
+
+TwinRoutes& Routes() {
+    static auto* routes = [] {
+        const char* value = std::getenv("APS5_NEW_PATH_TWIN_ALWAYS");
+        return new TwinRoutes(value != nullptr && value[0] != '\0' && value[0] != '0');
+    }();
+    return *routes;
+}
+
+void ResolvedTwins::Remember(const std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiled, std::shared_ptr<const ShaderRecompiler::RecompileResult> twin, TwinOutcome outcome, bool c1, std::uint64_t program) {
     std::lock_guard lock(state->mutex);
     ++state->outcomes[static_cast<std::size_t>(outcome)];
     if (c1) {
@@ -129,15 +180,19 @@ void ResolvedTwins::Remember(const std::shared_ptr<const ShaderRecompiler::Recom
         std::erase_if(state->entries, [](const auto& item) { return item.second.compiled.expired(); });
         state->prunedAt = std::max<std::size_t>(64, state->entries.size() * 2);
     }
-    state->entries[compiled.get()] = {compiled, outcome == TwinOutcome::Built ? std::move(twin) : nullptr};
+    state->entries[compiled.get()] = {compiled, outcome == TwinOutcome::Built ? std::move(twin) : nullptr, program, outcome == TwinOutcome::Skipped};
 }
 
-std::shared_ptr<const ShaderRecompiler::RecompileResult> ResolvedTwins::Of(const ShaderRecompiler::RecompileResult& compiled) const {
+std::shared_ptr<const ShaderRecompiler::RecompileResult> ResolvedTwins::Of(const ShaderRecompiler::RecompileResult& compiled, std::uint64_t* program, bool* skipped) const {
+    if (program != nullptr) *program = 0;
+    if (skipped != nullptr) *skipped = false;
     std::lock_guard lock(state->mutex);
     const auto found = state->entries.find(&compiled);
     if (found == state->entries.end()) return nullptr;
     const auto alive = found->second.compiled.lock();
     if (alive.get() != &compiled) return nullptr;
+    if (program != nullptr) *program = found->second.program;
+    if (skipped != nullptr) *skipped = found->second.skipped;
     return found->second.twin;
 }
 

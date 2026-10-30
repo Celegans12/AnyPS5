@@ -49,6 +49,12 @@ void buildResolvedTwin(const ShaderSnapshot& snapshot, std::size_t codeOffset, c
         twins.Remember(compiled, nullptr, NewPath::TwinOutcome::NotAddressBased);
         return;
     }
+    // TwinRoutes: no twin for a program whose recent twinned dispatches all fell back (the dispatch takes today's path).
+    const auto program = NewPath::TwinProgramKey(request.shader.codeAddress, *compiled);
+    if (!NewPath::Routes().ShouldBuild(program)) {
+        twins.Remember(compiled, nullptr, NewPath::TwinOutcome::Skipped, c1, program);
+        return;
+    }
     std::shared_ptr<const ShaderRecompiler::RecompileResult> twin;
     try {
         auto resolvedRequest = request;
@@ -60,16 +66,18 @@ void buildResolvedTwin(const ShaderSnapshot& snapshot, std::size_t codeOffset, c
     } catch (const std::exception& error) {
         static std::atomic<int> reported{0};
         if (reported.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[newpath] no resolved module for %scompute shader 0x%llx: %.200s\n", c1 ? "C1 " : "", static_cast<unsigned long long>(request.shader.codeAddress), error.what());
-        twins.Remember(compiled, nullptr, NewPath::TwinOutcome::Failed, c1);
+        twins.Remember(compiled, nullptr, NewPath::TwinOutcome::Failed, c1, program);
+        NewPath::Routes().Note(program, false);
         return;
     }
     if (twin == nullptr || !NewPath::TwinCompatible(*compiled, *twin)) {
         static std::atomic<int> reported{0};
         if (twin != nullptr && reported.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[newpath] resolved module of %scompute shader 0x%llx differs: %s\n", c1 ? "C1 " : "", static_cast<unsigned long long>(request.shader.codeAddress), NewPath::TwinDifference(*compiled, *twin).c_str());
-        twins.Remember(compiled, nullptr, NewPath::TwinOutcome::Mismatch, c1);
+        twins.Remember(compiled, nullptr, NewPath::TwinOutcome::Mismatch, c1, program);
+        NewPath::Routes().Note(program, false);
         return;
     }
-    twins.Remember(compiled, std::move(twin), NewPath::TwinOutcome::Built, c1);
+    twins.Remember(compiled, std::move(twin), NewPath::TwinOutcome::Built, c1, program);
 }
 
 // Whether a compiled compute program binds images or samplers (directly, through image tables, or

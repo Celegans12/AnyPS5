@@ -33,6 +33,7 @@ const char* FallbackReasonName(FallbackReason reason) {
     case FallbackReason::NotClassA: return "not-class-a";
     case FallbackReason::DrawShape: return "draw-shape";
     case FallbackReason::NotLean: return "not-lean";
+    case FallbackReason::TwinSkipped: return "twin-skipped";
     }
     return "unknown";
 }
@@ -58,7 +59,7 @@ Decision Router::Decide(const CommandFacts& facts) const {
     if (!facts.classA) return {Route::Fallback, FallbackReason::NotClassA};
     if (!facts.shapeSupported) return {Route::Fallback, FallbackReason::DrawShape};
     if (!facts.lean) return {Route::Fallback, FallbackReason::NotLean};
-    if (!facts.resolvedProgram) return {Route::Fallback, !facts.c1 ? FallbackReason::NoResolvedModule : facts.c1Switch ? FallbackReason::C1Switch : FallbackReason::C1NoTwin};
+    if (!facts.resolvedProgram) return {Route::Fallback, facts.twinSkipped ? FallbackReason::TwinSkipped : !facts.c1 ? FallbackReason::NoResolvedModule : facts.c1Switch ? FallbackReason::C1Switch : FallbackReason::C1NoTwin};
     if (!facts.pipelineReady) return {Route::Fallback, FallbackReason::NoPipeline};
     if (!facts.tableCovers) return {Route::Fallback, facts.coverReason};
     if (!facts.layoutFits) return {Route::Fallback, FallbackReason::C1Layout};

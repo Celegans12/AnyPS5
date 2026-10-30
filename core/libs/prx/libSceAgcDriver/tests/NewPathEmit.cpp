@@ -291,6 +291,48 @@ void resolvedTwins() {
     }
 }
 
+// TwinRoutes: a program builds twins until MinObserved routes are noted; then only while one of its last History
+// twinned dispatches went new, else every ProbeEvery-th claim; a new route brings the builds back.
+void twinRoutes() {
+    TwinRoutes routes;
+    constexpr std::uint64_t program = 0x1234;
+    for (std::uint32_t index = 0; index < TwinRoutes::MinObserved; ++index) {
+        Expect(routes.ShouldBuild(program), "a program without enough noted routes skipped its twin");
+        routes.Note(program, false);
+    }
+    std::uint32_t built = 0;
+    for (std::uint32_t index = 0; index < 2 * TwinRoutes::ProbeEvery; ++index) built += routes.ShouldBuild(program) ? 1u : 0u;
+    Expect(built == 2, "a program whose twinned dispatches all fell back built " + std::to_string(built) + " twins in two probe periods (want 2 probes)");
+    routes.Note(program, true);
+    Expect(routes.ShouldBuild(program), "a program with a new route skipped its twin");
+    for (std::uint32_t index = 0; index + 1 < TwinRoutes::History; ++index) routes.Note(program, false);
+    Expect(routes.ShouldBuild(program), "a new route within the last History twinned dispatches was forgotten");
+    routes.Note(program, false);
+    Expect(!routes.ShouldBuild(program), "a new route older than History still builds twins");
+    Expect(routes.ShouldBuild(0x5678), "another program shares the first one's routes");
+    const auto totals = routes.Take();
+    Expect(totals.programs == 2 && totals.probes == 2 && totals.notedNew == 1 && totals.skipped == 2 * TwinRoutes::ProbeEvery - 2 + 1, "twin route totals were not counted");
+    TwinRoutes always(true);
+    for (std::uint32_t index = 0; index < TwinRoutes::History; ++index) always.Note(program, false);
+    Expect(always.ShouldBuild(program), "APS5_NEW_PATH_TWIN_ALWAYS skipped a twin");
+
+    ResolvedTwins twins;
+    const auto compiled = std::make_shared<const ShaderRecompiler::RecompileResult>();
+    twins.Remember(compiled, nullptr, TwinOutcome::Skipped, true, program);
+    std::uint64_t key = 0;
+    bool skipped = false;
+    Expect(twins.Of(*compiled, &key, &skipped) == nullptr && key == program && skipped, "a skipped twin's program or skip was not kept");
+    Expect(twins.C1Outcomes()[static_cast<std::size_t>(TwinOutcome::Skipped)] == 1, "a skipped C1 twin was not counted");
+    Expect(TwinProgramKey(0x8000100000, *compiled) != TwinProgramKey(0x8000200000, *compiled), "two programs share a key");
+
+    Router router(true);
+    CommandFacts facts;
+    facts.kind = CommandKind::Dispatch;
+    facts.twinSkipped = true;
+    const auto decision = router.Decide(facts);
+    Expect(decision.route == Route::Fallback && decision.reason == FallbackReason::TwinSkipped, "a dispatch whose twin was skipped was not named twin-skipped");
+}
+
 ShaderRecompiler::DescriptorBinding C1Binding(ShaderRecompiler::DescriptorRole role, std::uint32_t number, ShaderRecompiler::DescriptorKind kind = ShaderRecompiler::DescriptorKind::StorageBuffer) {
     ShaderRecompiler::DescriptorBinding binding{};
     binding.kind = kind;
@@ -549,6 +591,7 @@ int main() {
         commandRecords();
         resolvedTwins();
         c1Twins();
+        twinRoutes();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;

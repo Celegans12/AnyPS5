@@ -138,7 +138,9 @@ void print(State& state, const char* window) {
     }
     {
         const auto c1 = Twins().C1Outcomes();
-        AgcDriver::ProfilePrint_nid_no_patch("[newpath] window=%s C1 twins (cumulative, newPathRuntimeBuffers requests): built %llu (binding no guest buffers %llu), failed %llu, mismatched %llu\n", window, static_cast<unsigned long long>(c1[0]), static_cast<unsigned long long>(Twins().C1RuntimeBuilt()), static_cast<unsigned long long>(c1[2]), static_cast<unsigned long long>(c1[3]));
+        AgcDriver::ProfilePrint_nid_no_patch("[newpath] window=%s C1 twins (cumulative, newPathRuntimeBuffers requests): built %llu (binding no guest buffers %llu), failed %llu, mismatched %llu, skipped %llu\n", window, static_cast<unsigned long long>(c1[0]), static_cast<unsigned long long>(Twins().C1RuntimeBuilt()), static_cast<unsigned long long>(c1[2]), static_cast<unsigned long long>(c1[3]), static_cast<unsigned long long>(c1[5]));
+        const auto routes = Routes().Take();
+        AgcDriver::ProfilePrint_nid_no_patch("[newpath] window=%s twin routes (cumulative): programs %llu, twin builds %llu, probes %llu, skipped %llu; routes noted new %llu, fallback %llu\n", window, static_cast<unsigned long long>(routes.programs), static_cast<unsigned long long>(routes.built), static_cast<unsigned long long>(routes.probes), static_cast<unsigned long long>(routes.skipped), static_cast<unsigned long long>(routes.notedNew), static_cast<unsigned long long>(routes.notedFallback));
     }
     if (Census::Enabled()) AgcDriver::ProfilePrint_nid_no_patch("%s\n", Census::Format(window).c_str());
     const auto ahead = Pipelines().Totals();
@@ -220,8 +222,10 @@ std::shared_ptr<EmitCandidate> ClaimDispatch(const ShaderRecompiler::RecompileRe
     candidate->facts = candidate->counted ? pending.facts : FactsAtDecode(CommandKind::Dispatch);
     if (candidate->counted) pending.active = false;
     else candidate->noted.store(true, std::memory_order_relaxed);
-    candidate->twin = Twins().Of(compiled);
+    bool skipped = false;
+    candidate->twin = Twins().Of(compiled, &candidate->program, &skipped);
     candidate->facts.resolvedProgram = candidate->twin != nullptr;
+    candidate->facts.twinSkipped = skipped;
     candidate->facts.c1 = !UsesAddressTables(compiled) && C1Shape(compiled);
     candidate->facts.c1Switch = candidate->facts.c1 && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NewPathNoC1);
     if (candidate->facts.c1Switch) {
@@ -236,8 +240,27 @@ std::shared_ptr<EmitCandidate> ClaimDispatch(const ShaderRecompiler::RecompileRe
     return candidate;
 }
 
+namespace {
+
+// Whether a fallback says something about the program's twinned dispatches (TwinRoutes) rather than the moment: a
+// pipeline still being made, a suspended or switched-off kind.
+bool ProgramFallback(FallbackReason reason) {
+    switch (reason) {
+    case FallbackReason::NoPipeline:
+    case FallbackReason::Suspended:
+    case FallbackReason::KindSwitch:
+    case FallbackReason::KindNotEmitted:
+    case FallbackReason::C1Switch:
+        return false;
+    default: return true;
+    }
+}
+
+}
+
 EmitCandidate::~EmitCandidate() {
     if (census.active && !census.committed) Census::NoteCommit(*this, false, 0, 0);
+    if (program != 0 && twin != nullptr && (routed == Route::NewPath || ProgramFallback(reason))) Routes().Note(program, routed == Route::NewPath);
     if (noted.exchange(true, std::memory_order_relaxed)) return;
     auto& state = Get();
     auto facts = this->facts;
@@ -266,6 +289,7 @@ Decision NoteEmit(EmitCandidate& candidate, const CommandFacts& facts) {
     if (!candidate.noted.exchange(true, std::memory_order_relaxed)) {
         state.router.Note(facts.kind, decision);
         candidate.routed = decision.route;
+        candidate.reason = decision.reason;
     }
     return decision;
 }

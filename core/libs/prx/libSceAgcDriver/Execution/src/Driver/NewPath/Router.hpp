@@ -14,8 +14,8 @@ inline constexpr std::size_t CommandKindCount = 3;
 
 enum class Route : std::uint8_t { NewPath, Fallback };
 
-enum class FallbackReason : std::uint8_t { KindSwitch, KindNotEmitted, NoPipeline, RangeNotCovered, PushOverflow, ClothGuard, NonStaticChain, Suspended, NoResolvedModule, NotRecorded, C1NoTwin, C1Switch, C1RangesUnavailable, C1WrittenElsewhere, C1NotCovered, C1Layout, NotClassA, DrawShape, NotLean };
-inline constexpr std::size_t FallbackReasonCount = 19;
+enum class FallbackReason : std::uint8_t { KindSwitch, KindNotEmitted, NoPipeline, RangeNotCovered, PushOverflow, ClothGuard, NonStaticChain, Suspended, NoResolvedModule, NotRecorded, C1NoTwin, C1Switch, C1RangesUnavailable, C1WrittenElsewhere, C1NotCovered, C1Layout, NotClassA, DrawShape, NotLean, TwinSkipped };
+inline constexpr std::size_t FallbackReasonCount = 20;
 
 [[nodiscard]] const char* CommandKindName(CommandKind kind);
 [[nodiscard]] const char* FallbackReasonName(FallbackReason reason);
@@ -43,6 +43,8 @@ struct CommandFacts {
     bool c1Switch = false;
     FallbackReason coverReason = FallbackReason::RangeNotCovered;
     bool layoutFits = true;
+    // TwinRoutes skipped this dispatch's twin build (its program's recent twinned dispatches all fell back).
+    bool twinSkipped = false;
     // Draws (APS5_NEW_PATH_EMIT_DRAWS): an address-based build (class A), a shape the resolved prefix covers
     // (DrawTwins.hpp), recorded into the open batch (a lean draw).
     bool classA = true;

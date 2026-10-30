@@ -49,6 +49,9 @@ struct EmitCandidate {
     bool tableDeferred = false;
     bool addressBased = false;
     Route routed = Route::Fallback;
+    FallbackReason reason = FallbackReason::NotRecorded;
+    // TwinRoutes' key of the dispatch's program (0: none, e.g. a draw); its route is noted there when it had a twin.
+    std::uint64_t program = 0;
     // S2-share C1: the twin reads the buffer V#s through the page table (RuntimeBufferTwin), or (a twin that still
     // binds guest buffers) any twin of a C1 program; F4 then covers the build's guest-buffer ranges, taken after
     // the build (NoteBufferRanges; null when the build could not give them).
