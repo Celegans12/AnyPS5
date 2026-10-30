@@ -19,6 +19,7 @@ std::string ResidencyReportLine();
 bool ResidencyActive();
 std::shared_ptr<HostImport> BindStagedSlot(std::uint64_t address, std::uint64_t bytes, bool written);
 std::shared_ptr<HostImport> BindWrittenSlot(std::uint64_t address, std::uint64_t bytes);
+void ReleaseWrittenSlot(std::uint64_t address, std::uint64_t bytes);
 std::uint64_t ResidencyBindingSerial();
 void NoteStagedOverlays(std::span<const std::pair<std::uint64_t, std::uint64_t>> overlays);
 void NoteStagedRegions(std::span<const std::pair<std::uint64_t, std::uint64_t>> reads, std::span<const std::pair<std::uint64_t, std::uint64_t>> writes);

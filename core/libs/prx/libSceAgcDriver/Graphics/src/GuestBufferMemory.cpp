@@ -5140,6 +5140,9 @@ void ShutdownGuestBufferWorkers() {
 }
 
 GuestBufferMemory::~GuestBufferMemory() {
+    for (const auto& region : regions) {
+        if (region.slotCopy && !region.copiedBack) ReleaseWrittenSlot(region.begin, region.end - region.begin);
+    }
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (!profile) return;
     // A staged region whose last use recorded its copy-in but no copy-back (the use threw before
@@ -5361,6 +5364,7 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
             }
             // An import found when the lease was acquired is reused while none was dropped since.
             if (region.residencySlot != nullptr) {
+                if (region.slotCopy && !region.copiedBack) ReleaseWrittenSlot(region.begin, region.end - region.begin);
                 region.direct = nullptr;
                 region.residencySlot.reset();
                 region.slotCopy = false;
@@ -5556,6 +5560,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             // An import taken by UploadPrepare (or at the lease) is still the registry's unless one
             // was dropped since.
             if (region.residencySlot != nullptr) {
+                if (region.slotCopy && !region.copiedBack) ReleaseWrittenSlot(region.begin, region.end - region.begin);
                 region.direct = nullptr;
                 region.residencySlot.reset();
                 region.slotCopy = false;
@@ -6524,6 +6529,7 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
         // HasCopiedWrites, so the caller still registers the CPU write-back that stores the
         // staging bytes, instead of losing the shader's results.
         region.copiedBack = true;
+        if (region.slotCopy) ReleaseWrittenSlot(region.begin, region.end - region.begin);
     }
     if (!recording || merging) return;
     if (Recorder::BarrierValidate()) recorder.NoteAccess(Recorder::CommandClass::StagingOut, Recorder::Access{{}, merged, {}, VK_PIPELINE_STAGE_TRANSFER_BIT});

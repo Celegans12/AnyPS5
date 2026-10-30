@@ -519,6 +519,7 @@ int WrittenSlots() {
             Fence(context, commands);
             CopyBuffer(context, commands, slot.buffer, slot.lead + (address - slot.base), import->buffer, HostImportOffset(*import, address), bytes);
             Fence(context, commands);
+            ReleaseWrittenSlot(address, bytes);
         };
         const auto readMirror = [&](const HostImport& slot) {
             auto readback = std::make_shared<Buffer>(context, ResidencyPageBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
@@ -546,6 +547,7 @@ int WrittenSlots() {
             slot = BindWrittenSlot(address, bytes);
             Expect(slot != nullptr, "slots: a one-page written element got no slot");
             if (slot == nullptr) return 1;
+            Expect(BindWrittenSlot(address + 64, 64) == nullptr, "slots: a second element over a range a build still holds got the same slot");
             Expect(served(*slot), "slots: the table does not serve the element at the slot its build binds");
             fill(slot->buffer, slot->lead + (address - slot->base), bytes, 0xa1a1a1a1u);
             copyBack(*slot);

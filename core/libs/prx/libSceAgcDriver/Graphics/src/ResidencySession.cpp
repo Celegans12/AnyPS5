@@ -213,12 +213,20 @@ std::shared_ptr<HostImport> BindWrittenSlot(std::uint64_t address, std::uint64_t
         ++session.writtenRefused;
         return nullptr;
     }
+    if (!manager.HoldWritten(address, bytes)) {
+        ++session.writtenRefused;
+        return nullptr;
+    }
     manager.Pin(address, bytes, ResidencyAccess::Write, session.driver->Current());
     auto import = SlotImport(session, page, *slot, chunk);
     ++session.writtenSlots;
     session.writtenSlotBytes += bytes;
     PatchTable(session);
     return import;
+}
+
+void ReleaseWrittenSlot(std::uint64_t address, std::uint64_t bytes) {
+    if (auto* driver = ResidencyDriver::Active(); driver != nullptr) driver->Manager().ReleaseWritten(address, bytes);
 }
 
 std::uint64_t ResidencyBindingSerial() {
@@ -275,8 +283,8 @@ std::string ResidencyReportLine() {
     if (session.driver == nullptr) return {};
     const auto counts = session.driver->Manager().Counts();
     char line[2048];
-    int at = std::snprintf(line, sizeof(line), "[residency] slots bound %llu (%.1f MiB), refused %llu; written slots %llu (%.1f MiB), refused %llu; old-path write flips %llu (dirty written back %llu, kept %llu), settle checks %llu (flips %llu), table reads of current mirrors %llu; re-entered copy-back notes %llu; staged uses %llu (read; one page %llu, %.1f MiB; spanning %llu, %.1f MiB, of them address-based overlays %llu, %.1f MiB), written ranges refreshed %llu; table patches %llu (%llu pages, %llu without a table); resident %.1f MiB (%u pages, %u chunks), retired 0.0 MiB, private %.0f MiB; admitted %llu, evicted %llu, demoted %llu, dropped %llu, inadmissible %llu (unwatched imports %llu), deferred %llu; faults fast %llu served %llu refused %llu; driver publishes %llu, write-back stamps %llu; written back %.1f MiB, copied in %.1f MiB, copy-in deferred %.1f MiB (%u pages behind the import, %llu caught up); lease flushes 0; refusals:",
-        static_cast<unsigned long long>(session.slotsBound), static_cast<double>(session.slotBoundBytes) / (1024.0 * 1024.0), static_cast<unsigned long long>(session.slotsRefused), static_cast<unsigned long long>(session.writtenSlots), static_cast<double>(session.writtenSlotBytes) / (1024.0 * 1024.0), static_cast<unsigned long long>(session.writtenRefused), static_cast<unsigned long long>(counts.oldPathFlips), static_cast<unsigned long long>(counts.oldPathDirtyWrittenBack), static_cast<unsigned long long>(counts.oldPathDirtyKept), static_cast<unsigned long long>(counts.settleChecks), static_cast<unsigned long long>(counts.settleFlips), static_cast<unsigned long long>(NewPath::DeviceTable().Totals().mirroredReads), static_cast<unsigned long long>(session.reentered.load()),
+    int at = std::snprintf(line, sizeof(line), "[residency] slots bound %llu (%.1f MiB), refused %llu; written slots %llu (%.1f MiB), refused %llu; old-path write flips %llu (dirty written back %llu, kept %llu), settle checks %llu (flips %llu), held slot ranges refused %llu (catch-up skipped %.1f KiB), table reads of current mirrors %llu; re-entered copy-back notes %llu; staged uses %llu (read; one page %llu, %.1f MiB; spanning %llu, %.1f MiB, of them address-based overlays %llu, %.1f MiB), written ranges refreshed %llu; table patches %llu (%llu pages, %llu without a table); resident %.1f MiB (%u pages, %u chunks), retired 0.0 MiB, private %.0f MiB; admitted %llu, evicted %llu, demoted %llu, dropped %llu, inadmissible %llu (unwatched imports %llu), deferred %llu; faults fast %llu served %llu refused %llu; driver publishes %llu, write-back stamps %llu; written back %.1f MiB, copied in %.1f MiB, copy-in deferred %.1f MiB (%u pages behind the import, %llu caught up); lease flushes 0; refusals:",
+        static_cast<unsigned long long>(session.slotsBound), static_cast<double>(session.slotBoundBytes) / (1024.0 * 1024.0), static_cast<unsigned long long>(session.slotsRefused), static_cast<unsigned long long>(session.writtenSlots), static_cast<double>(session.writtenSlotBytes) / (1024.0 * 1024.0), static_cast<unsigned long long>(session.writtenRefused), static_cast<unsigned long long>(counts.oldPathFlips), static_cast<unsigned long long>(counts.oldPathDirtyWrittenBack), static_cast<unsigned long long>(counts.oldPathDirtyKept), static_cast<unsigned long long>(counts.settleChecks), static_cast<unsigned long long>(counts.settleFlips), static_cast<unsigned long long>(counts.heldRefusals), static_cast<double>(counts.heldSkippedBytes) / 1024.0, static_cast<unsigned long long>(NewPath::DeviceTable().Totals().mirroredReads), static_cast<unsigned long long>(session.reentered.load()),
         static_cast<unsigned long long>(session.stagedReads), static_cast<unsigned long long>(session.onePage), static_cast<double>(session.onePageBytes) / (1024.0 * 1024.0), static_cast<unsigned long long>(session.multiPage), static_cast<double>(session.multiPageBytes) / (1024.0 * 1024.0), static_cast<unsigned long long>(session.overlayMulti), static_cast<double>(session.overlayMultiBytes) / (1024.0 * 1024.0), static_cast<unsigned long long>(session.stagedWrites),
         static_cast<unsigned long long>(session.patches), static_cast<unsigned long long>(session.patchedPages), static_cast<unsigned long long>(session.unpatched),
         static_cast<double>(std::uint64_t{counts.resident} << ResidencyPageShift) / (1024.0 * 1024.0), counts.resident, counts.chunks, PrivateMiB(),

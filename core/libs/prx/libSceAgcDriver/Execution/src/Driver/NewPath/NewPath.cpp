@@ -13,6 +13,8 @@
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/PipelineAheadConfig.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "Recompiler.hpp"
+#include <atomic>
+#include <cstdio>
 #include <algorithm>
 #include <array>
 #include <cstdio>
@@ -303,6 +305,14 @@ void NoteBufferCover(const EmitCandidate& candidate, const Graphics::ShaderResou
                 resources.RunAccesses(accesses);
                 const bool written = std::ranges::any_of(accesses, [&](const std::array<std::uint64_t, 3>& access) { return (access[2] & Graphics::Recorder::RunAccessImage) == 0 && (access[2] & Graphics::Recorder::RunAccessWritten) != 0 && access[0] < failed.end && failed.begin < access[1]; });
                 cover = written ? Census::BufferCover::OtherAddressWritten : Census::BufferCover::OtherAddress;
+                static std::atomic<int> shown{0};
+                if (written && shown.fetch_add(1, std::memory_order_relaxed) < 40) {
+                    std::size_t refused = 0;
+                    for (const auto& range : *ranges) {
+                        if (DevicePageTable::Compare(DeviceTable().Ranges(), std::span<const DevicePageTable::Range>(&range, 1)) != DevicePageTable::Cover::Covered) ++refused;
+                    }
+                    std::fprintf(stderr, "[newpath-share] F4 written range 0x%llx-0x%llx (%llu bytes, %s) at device 0x%llx refused; %zu of %zu build ranges refused\n", static_cast<unsigned long long>(failed.begin), static_cast<unsigned long long>(failed.end), static_cast<unsigned long long>(failed.end - failed.begin), (failed.begin >> 16) == ((failed.end - 1) >> 16) ? "one page" : "spanning", static_cast<unsigned long long>(failed.deviceAddress), refused, ranges->size());
+                }
                 break;
             }
             case DevicePageTable::Cover::Narrower: cover = Census::BufferCover::Narrower; break;

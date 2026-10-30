@@ -1144,6 +1144,25 @@ void ResidencyManager::catchUp(std::span<const std::uint32_t> ids, bool waitForW
             bits &= run >= 32 ? 0u : ~(((1u << run) - 1u) << first);
         }
     }
+    if (!heldWritten.empty()) {
+        std::vector<Fill> kept;
+        for (const auto& fill : fills) {
+            const auto held = heldWritten.find(pages[fill.id].index);
+            if (held == heldWritten.end()) {
+                kept.push_back(fill);
+                continue;
+            }
+            auto cursor = fill.begin;
+            for (const auto& [begin, end] : held->second) {
+                if (end <= cursor || begin >= fill.end) continue;
+                if (begin > cursor) kept.push_back({fill.id, cursor, begin, fill.cpu});
+                counts.heldSkippedBytes += std::min(end, fill.end) - std::max(begin, cursor);
+                cursor = std::max(cursor, end);
+            }
+            if (cursor < fill.end) kept.push_back({fill.id, cursor, fill.end, fill.cpu});
+        }
+        fills = std::move(kept);
+    }
     if (fills.empty()) return;
     const bool was = catchingUp;
     catchingUp = true;
@@ -2711,6 +2730,34 @@ void ResidencyManager::NoteOldPathWrite(std::uint64_t address, std::uint64_t byt
         if (pages[fill.id].behind == 0) ++counts.oldPathFlips;
         markBehind(fill.id, RunMask(fill.begin, fill.end));
     }
+}
+
+bool ResidencyManager::HoldWritten(std::uint64_t address, std::uint64_t bytes) {
+    const std::lock_guard structureLock(structure);
+    const auto page = address >> ResidencyPageShift;
+    if (bytes == 0 || ((address + bytes - 1) >> ResidencyPageShift) != page) return false;
+    const auto begin = static_cast<std::uint32_t>(address & (ResidencyPageBytes - 1));
+    const auto end = static_cast<std::uint32_t>(begin + bytes);
+    auto& runs = heldWritten[page];
+    if (std::any_of(runs.begin(), runs.end(), [&](const Run& run) { return run.first < end && begin < run.second; })) {
+        ++counts.heldRefusals;
+        return false;
+    }
+    runs.insert(std::upper_bound(runs.begin(), runs.end(), Run{begin, end}), Run{begin, end});
+    return true;
+}
+
+void ResidencyManager::ReleaseWritten(std::uint64_t address, std::uint64_t bytes) {
+    const std::lock_guard structureLock(structure);
+    const auto page = address >> ResidencyPageShift;
+    const auto held = heldWritten.find(page);
+    if (held == heldWritten.end()) return;
+    const auto begin = static_cast<std::uint32_t>(address & (ResidencyPageBytes - 1));
+    const auto end = static_cast<std::uint32_t>(begin + bytes);
+    auto& runs = held->second;
+    const auto at = std::find(runs.begin(), runs.end(), Run{begin, end});
+    if (at != runs.end()) runs.erase(at);
+    if (runs.empty()) heldWritten.erase(held);
 }
 
 bool ResidencyManager::SettleCurrent() {
