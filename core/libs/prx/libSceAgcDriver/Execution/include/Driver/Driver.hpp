@@ -462,6 +462,9 @@ private:
 
     std::uint64_t dispatchCacheVariants = 0;
     std::uint64_t dispatchCacheVariantBytes = 0;
+    std::unordered_set<std::uint64_t> dispatchGhostKeys;
+    std::deque<std::uint64_t> dispatchGhostOrder;
+    void noteDispatchEvicted(std::uint64_t key);
 
     EntryCounters entryCounters;
 
