@@ -137,6 +137,7 @@ std::atomic<std::uint64_t> pretestSkipped{0}, unregisteredDropped{0}, keyFlipKep
 // Storage refreshes whose flush recorded its write-backs behind the pending writer (APS5_DEFER_REFRESH_FLUSH).
 std::atomic<std::uint64_t> deferredRefreshFlushes{0};
 std::atomic<std::uint64_t> deferredFlipStores{0};
+std::atomic<std::uint64_t> deferredLabelReadbacks{0}, deferredLabelReadbacksTotal{0};
 std::atomic<std::uint64_t> queuedReadHeld{0}, heldReadSkips{0};
 // Images stored by a FlushPending after a hook skip of theirs (AccessKeptByCpu), of which by the
 // hook for the read site of the last skip; images evictStale dropped (the [hooksync] and [storage] lines).
@@ -290,7 +291,7 @@ void reportStorageTraffic(StorageTraffic& traffic) {
     const auto take = [](std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed)); };
     const auto partialUploadCount = take(partialUploads), partialWriteBackCount = take(partialWriteBacks);
     const auto uploadMiB = take(partialUploadBytes) / 1048576.0, writeBackMiB = take(partialWriteBackBytes) / 1048576.0;
-    AgcDriver::ProfilePrint_nid_no_patch( "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, handed over at %llu clear-key refreshes (%llu units superseded), dropped unregistered %llu, kept over a key flip %llu%s, pretest skipped %llu, held for a queued draw read %llu (%llu flushes with nothing to store skipped the check%s), evicted stale %llu, refresh flushes deferred %llu, flip stores deferred %llu; drawn linear targets: stores by reason (count/MiB):%s, pending %zu images / %.1f MiB, oldest %.1f ms\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(clearHandOvers), take(handedOverSuperseded), take(unregisteredDropped), take(keyFlipKept), ShadowReport().c_str(), take(pretestSkipped), take(queuedReadHeld), take(heldReadSkips), RuntimeSwitches::Set(RuntimeSwitch::NoHeldReadSkip) ? ", APS5_NO_HELD_READ_SKIP" : "", take(staleEvicted), take(deferredRefreshFlushes), take(deferredFlipStores), drawnLine.c_str(), drawn.images, drawn.bytes / 1048576.0, drawn.oldestMs);
+    AgcDriver::ProfilePrint_nid_no_patch( "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, handed over at %llu clear-key refreshes (%llu units superseded), dropped unregistered %llu, kept over a key flip %llu%s, pretest skipped %llu, held for a queued draw read %llu (%llu flushes with nothing to store skipped the check%s), evicted stale %llu, refresh flushes deferred %llu, flip stores deferred %llu, label read-backs deferred %llu; drawn linear targets: stores by reason (count/MiB):%s, pending %zu images / %.1f MiB, oldest %.1f ms\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(clearHandOvers), take(handedOverSuperseded), take(unregisteredDropped), take(keyFlipKept), ShadowReport().c_str(), take(pretestSkipped), take(queuedReadHeld), take(heldReadSkips), RuntimeSwitches::Set(RuntimeSwitch::NoHeldReadSkip) ? ", APS5_NO_HELD_READ_SKIP" : "", take(staleEvicted), take(deferredRefreshFlushes), take(deferredFlipStores), take(deferredLabelReadbacks), drawnLine.c_str(), drawn.images, drawn.bytes / 1048576.0, drawn.oldestMs);
     AgcDriver::ProfilePrint_nid_no_patch("%s\n", FlushWaitReport().c_str());
     traffic.writeBacks.clear();
     traffic.uploadReasons.clear();
@@ -4870,10 +4871,16 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
     const bool deferRefresh = RuntimeSwitches::Set(RuntimeSwitch::DeferRefreshFlush);
     const bool flipStore = reason != nullptr && std::strcmp(reason, "flip") == 0;
     const bool deferFlip = flipStore && (deferImported || RuntimeSwitches::Set(RuntimeSwitch::DeferFlipStore));
+    const bool deferLabel = reason != nullptr && std::strcmp(reason, DeferredLabelReadbackReason) == 0;
     bool deferWriter = false;
-    if ((deferFlip || (deferRefresh && reason != nullptr && std::strcmp(reason, "storage refresh") == 0)) && Recorder::Active() != nullptr && !Recorder::InCompletion()) {
+    if ((deferFlip || deferLabel || (deferRefresh && reason != nullptr && std::strcmp(reason, "storage refresh") == 0)) && Recorder::Active() != nullptr && !Recorder::InCompletion()) {
         deferWriter = std::all_of(flush.begin(), flush.end(), [deferImported](const std::shared_ptr<StorageTexture>& texture) { return (texture->blockUnits || deferImported) && HostImportFor(texture->context, texture->descriptor.baseAddress, static_cast<std::size_t>(texture->guestBytes)) != nullptr; });
-        if (deferWriter) (flipStore ? deferredFlipStores : deferredRefreshFlushes).fetch_add(1, std::memory_order_relaxed);
+        if (deferWriter && deferLabel) {
+            deferredLabelReadbacks.fetch_add(1, std::memory_order_relaxed);
+            deferredLabelReadbacksTotal.fetch_add(1, std::memory_order_relaxed);
+        } else if (deferWriter) {
+            (flipStore ? deferredFlipStores : deferredRefreshFlushes).fetch_add(1, std::memory_order_relaxed);
+        }
     }
     if (auto* recorder = Recorder::Active(); !deferWriter && recorder != nullptr && !Recorder::InCompletion()) {
         try {
@@ -5233,6 +5240,10 @@ std::size_t StorageTexture::StoreSmallPending(const char* reason) {
         if (FlushPending(address, bytes, nullptr, reason)) ++stored;
     }
     return stored;
+}
+
+std::uint64_t StorageTexture::DeferredLabelReadbacks() {
+    return deferredLabelReadbacksTotal.load(std::memory_order_relaxed);
 }
 
 void StorageTexture::StoreReadbackBeforeLabel(const char* reason) {

@@ -300,6 +300,8 @@ public:
     static constexpr std::uint64_t SmallStoreBytes = 64 * 1024;
     static std::size_t StoreSmallPending(const char* reason);
     static void StoreReadbackBeforeLabel(const char* reason);
+    static constexpr const char* DeferredLabelReadbackReason = "readback before label, deferred";
+    static std::uint64_t DeferredLabelReadbacks();
     static std::size_t StoreDrawnLinear(const char* reason);
     static std::size_t StoreDrawnLinearTouching(const char* reason, const std::function<bool(std::uint64_t, std::uint64_t)>& touches, bool all);
     static bool AnyPending();

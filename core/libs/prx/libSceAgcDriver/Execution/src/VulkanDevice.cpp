@@ -2646,7 +2646,11 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
     static const bool storeAtLabel = Graphics::StorageTexture::StoreAtLabelRequested(std::getenv("APS5_STORE_AT_LABEL"));
     if (storeAtLabel) Graphics::StorageTexture::FlushAllPending("label");
     if (queue == 0) static_cast<void>(Graphics::StorageTexture::StoreDrawnLinear("label"));
-    Graphics::StorageTexture::StoreReadbackBeforeLabel("readback before label");
+    static const bool drainLabels = std::getenv("APS5_DRAIN_COMPLETION_LABELS") != nullptr;
+    const bool deferReadback = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DeferLabelReadback) && !drainLabels && Graphics::Recorder::LaneOfQueue(queue) == 0 && state->recorder && !bytes.empty() && bytes.size() <= 65536 && address % 4 == 0 && bytes.size() % 4 == 0 &&
+                               Graphics::HostImportFor(graphicsContext(), address, bytes.size()) != nullptr;
+    const auto deferredBefore = deferReadback ? Graphics::StorageTexture::DeferredLabelReadbacks() : 0;
+    Graphics::StorageTexture::StoreReadbackBeforeLabel(deferReadback ? Graphics::StorageTexture::DeferredLabelReadbackReason : "readback before label");
     if (!state->recorder || bytes.empty() || bytes.size() > 65536 || address % 4 != 0 || bytes.size() % 4 != 0) return 4;
     auto& recorder = *state->recorder;
     // Batches that already finished are retired before the checks: their completions ran, so they
@@ -2657,7 +2661,10 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
     // Debug aid: APS5_LABEL_REAP_ALL_QUEUES=1 reaps on every queue as before.
     static const bool reapAllQueues = std::getenv("APS5_LABEL_REAP_ALL_QUEUES") != nullptr;
     if (reapFirst && (queue == 0 || reapAllQueues) && OpportunisticReap()) recorder.Reap();
-    if (recorder.Idle()) return 1;
+    if (recorder.Idle()) {
+        if (deferReadback && Graphics::StorageTexture::DeferredLabelReadbacks() != deferredBefore) recorder.Sync();
+        return 1;
+    }
     static const bool drain = std::getenv("APS5_DRAIN_COMPLETION_LABELS") != nullptr;
     const auto context = graphicsContext();
     const auto* import = Graphics::HostImportFor(context, address, bytes.size());
