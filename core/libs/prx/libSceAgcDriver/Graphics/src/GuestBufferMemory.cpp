@@ -5095,8 +5095,11 @@ struct ResidentRanges {
 };
 
 ResidentRanges& Residents() {
-    static ResidentRanges ranges;
-    return ranges;
+    // Never destroyed (as GpuSources): a static destructor would release the resident buffers into the buffer
+    // pool after the device is gone at process exit (agc_frame_replay crashed there, Buffer::release ->
+    // BufferPool::Put).
+    static auto* ranges = new ResidentRanges;
+    return *ranges;
 }
 
 constexpr std::size_t ResidentLimit = 32;
