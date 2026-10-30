@@ -72,6 +72,8 @@ struct Options {
     std::chrono::milliseconds paceTimeout{10000};
     std::chrono::milliseconds memoryPaceTimeout{10000};
     std::chrono::milliseconds releaseAfter{50};
+    std::size_t stallIndex = ~std::size_t{0};
+    std::chrono::milliseconds stallFor{0};
     std::chrono::milliseconds drainTimeout{10000};
     std::chrono::seconds timeout{900};
     bool release = true;
@@ -531,6 +533,8 @@ struct Replay {
     std::atomic<std::uint64_t> earlyReleases{0};
     std::atomic<std::uint64_t> lateReleases{0};
     std::atomic<std::uint64_t> syntheticReleases{0};
+    std::atomic<std::uint64_t> recordedReleases{0};
+    std::span<const FrameCall> window;
     std::atomic<std::size_t> sequenced{0};
     std::atomic<int> busy{0};
     struct LabelWrite {
@@ -684,6 +688,12 @@ struct Replay {
 
     void execute(const FrameCall& call) {
         pace(call);
+        if (!window.empty() && &call >= window.data() && &call < window.data() + window.size() && static_cast<std::size_t>(&call - window.data()) == options.stallIndex) {
+            std::fprintf(stderr, "[frame-replay] --stall-at: sleeping %lld ms before window call %zu\n", static_cast<long long>(options.stallFor.count()), options.stallIndex);
+            --busy;
+            std::this_thread::sleep_for(options.stallFor);
+            ++busy;
+        }
         switch (call.kind) {
         case FrameCallKind::RegisterShader:
             registration([&] { AgcDriverRegisterShader_nid_postfix(shader(call.address)); });
@@ -938,7 +948,7 @@ struct Replay {
         return calls.size();
     }
 
-    void releaseAwaited(std::span<const FrameCall> calls, std::size_t from) {
+    void releaseAwaited(std::span<const FrameCall> calls, std::size_t from, const char* why) {
         std::lock_guard lock(memoryMutex);
         std::array<AgcDriver::AwaitedWait, 64> awaited{};
         const auto count = AgcDriverAwaitedWaits_nid_postfix(awaited.data(), awaited.size());
@@ -963,10 +973,24 @@ struct Replay {
             if (wait.function != 0 && satisfies(wait, load(wait.address, bytes))) continue;
             const bool deferred = pass == 0 && writerInWindow(wait);
             bool released = false;
-            for (auto index = from; index < calls.size() && !released; ++index) released = writeRecordedValue(calls[index], wait);
+            std::size_t source = calls.size();
+            const auto held = load(wait.address, bytes);
+            for (auto index = from; index < calls.size() && !released; ++index) {
+                released = writeRecordedValue(calls[index], wait);
+                if (released) source = index;
+            }
             for (auto index = std::min(from, calls.size()); index > 0 && !released; --index) {
                 released = writeRecordedValue(calls[index - 1], wait);
-                if (released) ++lateReleases;
+                if (released) {
+                    ++lateReleases;
+                    source = index - 1;
+                }
+            }
+            if (released && options.exact && recordedReleases.fetch_add(1) < 64) {
+                const auto [accepted, completed] = progress();
+                std::fprintf(stderr, "[frame-replay] %s release 0x%llx: 0x%llx -> 0x%llx (function %u, reference 0x%llx) with the value of call %zu at call %zu, serials %llu/%llu\n", why, static_cast<unsigned long long>(wait.address),
+                             static_cast<unsigned long long>(held), static_cast<unsigned long long>(load(wait.address, bytes)), wait.function, static_cast<unsigned long long>(wait.reference), source, from,
+                             static_cast<unsigned long long>(completed), static_cast<unsigned long long>(accepted));
             }
             if (!released && options.synthesize && !deferred) {
                 if (const auto value = satisfying(wait, load(wait.address, bytes))) {
@@ -994,6 +1018,7 @@ struct Replay {
     }
 
     void runWindow(std::span<const FrameCall> calls) {
+        window = calls;
         std::map<std::uint64_t, std::vector<std::size_t>> byThread;
         for (std::size_t index = 0; index < calls.size(); ++index) byThread[calls[index].thread].push_back(index);
         threads = byThread.size();
@@ -1037,7 +1062,7 @@ struct Replay {
                         if (!parkedSince) parkedSince = now;
                         if (now - *parkedSince < ParkedQuiet) continue;
                         const auto before = earlyReleases.load();
-                        releaseAwaited(calls, sequenced.load());
+                        releaseAwaited(calls, sequenced.load(), "parked");
                         parkedWithoutRelease.store(earlyReleases.load() == before);
                         ++parkedReleases;
                         parkedSince.reset();
@@ -1050,12 +1075,12 @@ struct Replay {
                     const auto [accepted, completed] = progress();
                     std::fprintf(stderr, "[frame-replay] --exact: no parked state for %lld ms (%d replay threads running, serials %llu/%llu): wall-clock fallback release at call %zu\n", static_cast<long long>(quiet.count()), busy.load(),
                                  static_cast<unsigned long long>(completed), static_cast<unsigned long long>(accepted), sequenced.load());
-                    releaseAwaited(calls, sequenced.load());
+                    releaseAwaited(calls, sequenced.load(), "fallback");
                     lastProgress = Clock::now();
                     continue;
                 }
                 if (Clock::now() - lastProgress < quiet) continue;
-                releaseAwaited(calls, sequenced.load());
+                releaseAwaited(calls, sequenced.load(), "timed");
                 lastProgress = Clock::now();
             }
         });
@@ -1104,6 +1129,18 @@ struct Replay {
         if (failure != nullptr) std::rethrow_exception(failure);
     }
 
+    void printAwaited() {
+        std::lock_guard lock(memoryMutex);
+        std::array<AgcDriver::AwaitedWait, 64> awaited{};
+        const auto count = AgcDriverAwaitedWaits_nid_postfix(awaited.data(), awaited.size());
+        for (std::size_t slot = 0; slot < count; ++slot) {
+            const auto& wait = awaited[slot];
+            if (wait.address == 0) continue;
+            std::fprintf(stderr, "[frame-replay]   still awaited 0x%llx == 0x%llx (function %u) holds 0x%llx, written in the window: %s\n", static_cast<unsigned long long>(wait.address), static_cast<unsigned long long>(wait.reference), wait.function,
+                         static_cast<unsigned long long>(load(wait.address, wait.bytes == 8 ? 8 : 4)), writerInWindow(wait) ? "yes" : "no");
+        }
+    }
+
     void drain() {
         auto lastCompleted = progress().second;
         auto lastReleases = earlyReleases.load();
@@ -1122,8 +1159,9 @@ struct Replay {
                              static_cast<unsigned long long>(completed), static_cast<unsigned long long>(accepted));
                 return;
             } else if (Clock::now() - lastProgress >= timeout) {
-                std::fprintf(stderr, "[frame-replay] %llu submissions did not complete after the last captured call (serials %llu/%llu)\n", static_cast<unsigned long long>(unfinished),
-                             static_cast<unsigned long long>(completed), static_cast<unsigned long long>(accepted));
+                std::fprintf(stderr, "[frame-replay] %llu submissions did not complete after the last captured call (serials %llu/%llu, driver %s, %d replay threads running)\n", static_cast<unsigned long long>(unfinished),
+                             static_cast<unsigned long long>(completed), static_cast<unsigned long long>(accepted), AgcDriverQuiescent_nid_postfix() ? "quiescent" : "not quiescent", busy.load());
+                printAwaited();
                 return;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -1159,6 +1197,7 @@ int usage() {
                          "  --no-pace           issues calls without waiting for the in-flight depth the title had\n"
                          "  --no-release        never copies recorded CPU stores early to release a GPU wait\n"
                          "  --release-after-ms  milliseconds without a completion or a newly issued call before awaited dwords are released (50; at least 200 with --exact)\n"
+                         "  --stall-at <i>:<ms> diagnostic: sleeps <ms> milliseconds after pacing the i-th call of the window (from 0), counted as parked\n"
                          "  --no-synthesize     releases a wait only with a value the capture recorded, never with its reference value\n"
                          "  --strict            fails on a pacing timeout or a failed registration, and exits with 5 unless the JSON gaps list is empty\n"
                          "  --exact             waits for every earlier submission and its GPU work to complete before each submission, flip and\n"
@@ -1456,7 +1495,11 @@ int main(int argc, char** argv) {
         if (argument == "--no-pace") options.pace = false;
         else if (argument == "--no-release") options.release = false;
         else if (argument == "--no-synthesize") options.synthesize = false;
-        else if (argument == "--release-after-ms" && index + 1 < argc) options.releaseAfter = std::chrono::milliseconds(std::strtoll(argv[++index], nullptr, 10));
+        else if (argument == "--stall-at" && index + 1 < argc) {
+            char* end = nullptr;
+            options.stallIndex = static_cast<std::size_t>(std::strtoull(argv[++index], &end, 10));
+            options.stallFor = std::chrono::milliseconds(end != nullptr && *end == ':' ? std::strtoll(end + 1, nullptr, 10) : 1000);
+        } else if (argument == "--release-after-ms" && index + 1 < argc) options.releaseAfter = std::chrono::milliseconds(std::strtoll(argv[++index], nullptr, 10));
         else if (argument == "--strict") options.strict = true;
         else if (argument == "--exact") options.exact = true;
         else if (argument == "--checkpoint" && index + 1 < argc) options.checkpointReport = argv[++index];
