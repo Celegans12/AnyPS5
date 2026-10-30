@@ -156,17 +156,8 @@ bool OneLaneGroupsEligible(std::span<const std::uint32_t> code) {
     return eligible;
 }
 
-// The host subgroup width wave64 programs are laid out for. Debug aid: APS5_SINGLE_LANE=<hex code
-// addresses, comma separated, or "all"> keeps the listed programs at one guest lane per invocation.
-std::uint32_t HostSubgroupSize(const RecompileRequest& request) {
-    const bool vertexStage = request.shader.stage == ShaderStage::Vertex || request.shader.stage == ShaderStage::Local;
-    if (vertexStage && !request.target.vertexSubgroups) return 1u;
-    if (request.shader.stage == ShaderStage::TessellationControl && MergedHullStage(request)) return 1u;
+bool OneLaneWanted(const RecompileRequest& request) {
     static const std::string list = [] { const char* text = std::getenv("APS5_SINGLE_LANE"); return text ? std::string(text) : std::string(); }();
-    // One guest lane per invocation (singleLaneGroups, APS5_SINGLE_LANE) needs a host subgroup as wide as the wave: on
-    // a 32-lane host a wave64 program would need the spanned layout, which spans only single-wave workgroups, and
-    // without it its wave operations see one 32-lane half (v_readlane 63 reads lane 31, a half-wave scan's lane 63 reads
-    // the identity; agc_driver_single_lane_readlane, T-6/T-7). There the request keeps two lanes per invocation.
     bool wantsOneLane = false;
     if (request.target.singleLaneGroups && request.shader.stage == ShaderStage::Compute && request.context.waveSize == 64u && request.context.compute.has_value()) {
         const auto& threads = request.context.compute->numThreads;
@@ -177,10 +168,26 @@ std::uint32_t HostSubgroupSize(const RecompileRequest& request) {
         std::snprintf(address, sizeof(address), "%llx", static_cast<unsigned long long>(request.shader.codeAddress));
         wantsOneLane = wantsOneLane || list == "all" || list.find(address) != std::string::npos;
     }
-    if (wantsOneLane) {
+    return wantsOneLane;
+}
+
+bool SpannedOneLaneGroups(const RecompileRequest& request) {
+    static const bool enabled = std::getenv("APS5_SPANNED_GROUPS") != nullptr;
+    return enabled && request.target.subgroupSize == 32u && request.target.spannedWaves && request.shader.stage == ShaderStage::Compute && OneLaneWanted(request);
+}
+
+// The host subgroup width wave64 programs are laid out for. One guest lane per invocation needs a host subgroup as
+// wide as the wave, or the spanned layout: without either its wave operations see one 32-lane half (v_readlane 63 reads
+// lane 31, a half-wave scan's lane 63 reads the identity; agc_driver_single_lane_readlane, T-6/T-7). There the request
+// keeps two lanes per invocation.
+std::uint32_t HostSubgroupSize(const RecompileRequest& request) {
+    const bool vertexStage = request.shader.stage == ShaderStage::Vertex || request.shader.stage == ShaderStage::Local;
+    if (vertexStage && !request.target.vertexSubgroups) return 1u;
+    if (request.shader.stage == ShaderStage::TessellationControl && MergedHullStage(request)) return 1u;
+    if (OneLaneWanted(request)) {
         if (request.target.subgroupSize >= 64u) return 64u;
         static std::atomic<bool> said{false};
-        if (!said.exchange(true)) std::fprintf(stderr, "[one-lane] the host subgroup has %u lanes: wave64 programs keep two lanes per invocation (one lane per invocation needs a 64-lane subgroup or the spanned layout)\n", request.target.subgroupSize);
+        if (!SpannedOneLaneGroups(request) && !said.exchange(true)) std::fprintf(stderr, "[one-lane] the host subgroup has %u lanes and waves are not spanned: wave64 programs keep two lanes per invocation (one lane per invocation needs a 64-lane subgroup or the spanned layout, APS5_SPANNED_WAVE)\n", request.target.subgroupSize);
     }
     return request.target.subgroupSize;
 }
@@ -770,6 +777,7 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program)
     targetOptions.fragmentDescriptorSet = request.target.registrationModules;
     targetOptions.float16DenormPreserve = request.target.float16DenormPreserve;
     targetOptions.spannedWaves = request.target.spannedWaves;
+    targetOptions.spannedGroups = SpannedOneLaneGroups(request);
     targetOptions.newPathResolved = request.target.newPathResolved;
     targetOptions.orderedWorkgroupWaves = request.target.orderedWorkgroupWaves && request.shader.stage == ShaderStage::Compute;
     targetOptions.bindlessImages = request.target.bindlessImages;
@@ -826,6 +834,7 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program)
     } catch (const SpannedWaveUnsupported& error) {
         std::fprintf(stderr, "[spanned-wave] 0x%llx falls back to two lanes per invocation: %s\n", static_cast<unsigned long long>(request.shader.codeAddress), error.what());
         targetOptions.spannedWaves = false;
+        targetOptions.spannedGroups = false;
         result.spirv = spirvEmitter.Emit(program, inputInfo, bindings, targetOptions, &emitted);
     }
     if (registration && result.spirv.size() > request.target.registrationWordLimit) {

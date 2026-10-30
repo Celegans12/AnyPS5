@@ -2,8 +2,10 @@
 // wave with v_readlane_b32 and stores them per thread (the cloth programs' reduction tail: DPP row shifts, then
 // v_readlane 31 and 63). Every thread must store 63 and 31. Run in both layouts: two guest lanes per invocation (the
 // default) and one lane per invocation (SpirvTarget::singleLaneGroups), whose host subgroups are 32 lanes wide on
-// NVIDIA: a lane-63 read inside one host subgroup has no lane 63 to read, so on such a host the recompiler keeps two lanes
-// per invocation (T-7 guard). Also run with APS5_SINGLE_LANE=all. Exit 1 when a layout stores a wrong value.
+// NVIDIA: a lane-63 read inside one host subgroup has no lane 63 to read, so on such a host one lane per invocation spans
+// each wave over two host subgroups (with APS5_SPANNED_WAVE=1) or keeps two lanes per invocation. Each thread also reads
+// the LDS word its mirrored lane (lane ^ 63, the other half) wrote without a barrier, and the lane count of a 64-bit
+// compare mask (40). Also run with APS5_SINGLE_LANE=all. Exit 1 when a layout stores a wrong value.
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "Recompiler.hpp"
@@ -16,6 +18,7 @@
 #endif
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <iostream>
@@ -43,6 +46,19 @@ std::span<const std::uint32_t> Code() {
     code.push_back((0x80u << 24u) | (1u << 16u) | (2u << 8u) | 3u);
     code.push_back(0xe0000000u | (0x1cu << 18u) | 0x1000u | 512u);      // buffer_store_dword v4, v3, s[4:7], 0 offen offset:512
     code.push_back((0x80u << 24u) | (1u << 16u) | (4u << 8u) | 3u);
+    code.push_back((0x1du << 25u) | (6u << 17u) | (0u << 9u) | 191u);   // v_xor_b32 v6, 63, v0 (mirrored lane of the wave)
+    code.push_back((0x1au << 25u) | (7u << 17u) | (6u << 9u) | 130u);   // v_lshlrev_b32 v7, 2, v6
+    code.push_back(0xd8340000u); code.push_back(0x00000003u);           // ds_write_b32 v3, v0
+    code.push_back(0xbf8c0000u);                                        // s_waitcnt 0
+    code.push_back(0xd8d80000u); code.push_back(0x08000007u);           // ds_read_b32 v8, v7 (the other half's write, no barrier)
+    code.push_back(0xbf8c0000u);                                        // s_waitcnt 0
+    code.push_back(0xe0000000u | (0x1cu << 18u) | 0x1000u | 1024u);     // buffer_store_dword v8, v3, s[4:7], 0 offen offset:1024
+    code.push_back((0x80u << 24u) | (1u << 16u) | (8u << 8u) | 3u);
+    code.push_back(0x7d8802a8u);                                        // v_cmp_gt_u32 vcc, 40, v1 (lanes 0-39)
+    code.push_back(0xbe8b106au);                                        // s_bcnt1_i32_b64 s11, vcc
+    code.push_back((0x3fu << 25u) | (9u << 17u) | (1u << 9u) | 11u);    // v_mov_b32 v9, s11
+    code.push_back(0xe0000000u | (0x1cu << 18u) | 0x1000u | 1536u);     // buffer_store_dword v9, v3, s[4:7], 0 offen offset:1536
+    code.push_back((0x80u << 24u) | (1u << 16u) | (9u << 8u) | 3u);
     code.push_back(0xbf8c0000u);                                        // s_waitcnt 0
     code.push_back(0xbf810000u);                                        // s_endpgm
     std::copy(code.begin(), code.end(), Program.begin());
@@ -68,7 +84,7 @@ int main() {
             static_cast<std::uint32_t>(out), static_cast<std::uint32_t>((out >> 32u) & 0xffffu), static_cast<std::uint32_t>(bytes), Selects | (Float32 << 12u) | Raw,
         };
         const std::array<ShaderRecompiler::MemoryRegion, 1> regions{{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)}}};
-        const ShaderRecompiler::ShaderComputeStageInfo compute{{Threads, 1, 1}, 0, {true, false, false}, false, 1};
+        const ShaderRecompiler::ShaderComputeStageInfo compute{{Threads, 1, 1}, Threads, {true, false, false}, false, 1};
         int failures = 0;
         for (const bool oneLane : {false, true}) {
             std::memset(output, 0xff, bytes);
@@ -86,14 +102,16 @@ int main() {
             std::uint32_t wrong = 0;
             std::uint32_t first = ~0u;
             for (std::uint32_t thread = 0; thread < Threads; ++thread) {
-                const bool bad = output[thread] != 63u || output[128u + thread] != 31u;
+                const bool bad = output[thread] != 63u || output[128u + thread] != 31u || output[256u + thread] != (thread ^ 63u) || output[384u + thread] != 40u;
                 if (bad && first == ~0u) first = thread;
                 wrong += bad;
             }
-            std::printf("%s (host subgroup %u): %u of %u threads wrong", oneLane ? "one lane per invocation" : "two lanes per invocation", shader.hostSubgroupSize, wrong, Threads);
-            if (wrong != 0u) std::printf("; first thread %u stored lane63=%u lane31=%u", first, output[first], output[128u + first]);
+            const bool spanned = (oneLane || std::getenv("APS5_SINGLE_LANE") != nullptr) && std::getenv("APS5_SPANNED_GROUPS") != nullptr && request.target.spannedWaves && request.target.subgroupSize == 32u;
+            std::printf("%s (host subgroup %u, %s): %u of %u threads wrong", oneLane ? "one lane per invocation" : "two lanes per invocation", shader.hostSubgroupSize, shader.fullSubgroups ? "spanned waves" : "two lanes per invocation", wrong, Threads);
+            if (wrong != 0u) std::printf("; first thread %u stored lane63=%u lane31=%u mirrored=%u count=%u", first, output[first], output[128u + first], output[256u + first], output[384u + first]);
+            if (spanned != shader.fullSubgroups) std::printf("; the layout should %sbe spanned", spanned ? "" : "not ");
             std::printf("\n");
-            failures += wrong != 0u;
+            failures += wrong != 0u || spanned != shader.fullSubgroups;
         }
         std::fflush(stdout);
         std::fflush(nullptr);

@@ -27,6 +27,7 @@ struct SpirvTargetOptions {
     bool fragmentDescriptorSet = false;
     bool float16DenormPreserve = false;
     bool spannedWaves = false;
+    bool spannedGroups = false;
     // SpirvTarget::newPathResolved: BDA lookups walk the device page table whose address is push word 0-1.
     bool newPathResolved = false;
     // SpirvTarget::orderedWorkgroupWaves (compute).

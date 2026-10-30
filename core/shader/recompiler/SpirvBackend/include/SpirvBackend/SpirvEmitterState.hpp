@@ -117,6 +117,10 @@ struct SpirvEmitterState {
     bool splitSubgroup = false;
     bool spannedWave = false;
     std::uint32_t spannedExchangeVariable = 0;
+    std::uint32_t spannedGroupWaves = 0;
+    std::uint32_t spannedFlagsVariable = 0;
+    std::uint32_t spannedSequenceVariable = 0;
+    std::unordered_set<const IrValue*> halfLocalBallots;
     bool narrowSubgroupClock = false;
     bool float64DenormPreserve = false;
     bool depthRangeRemap = false;

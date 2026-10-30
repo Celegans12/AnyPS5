@@ -341,7 +341,9 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
     if (state.splitSubgroup && (state.requirements.subgroupBallot || state.requirements.subgroupShuffle)) state.requirements.subgroupLocalInvocationId = true;
     const auto* workgroup = ShaderWorkgroupInputFor(state);
     const bool halfHost = workgroup != nullptr && program.WaveSize() == 64u && workgroup->hostSubgroupSize == 32u;
-    state.spannedWave = halfHost && target.spannedWaves && program.Resources().stage == IrShaderStage::Compute && !state.requirements.computeDerivatives && std::max(workgroup->threadsNum[0], 1u) * std::max(workgroup->threadsNum[1], 1u) * std::max(workgroup->threadsNum[2], 1u) == 64u;
+    const auto groupThreads = workgroup == nullptr ? 0u : std::max(workgroup->threadsNum[0], 1u) * std::max(workgroup->threadsNum[1], 1u) * std::max(workgroup->threadsNum[2], 1u);
+    state.spannedWave = halfHost && target.spannedWaves && program.Resources().stage == IrShaderStage::Compute && !state.requirements.computeDerivatives && (groupThreads == 64u || (target.spannedGroups && groupThreads > 64u && groupThreads % 64u == 0u));
+    state.spannedGroupWaves = state.spannedWave && groupThreads > 64u ? groupThreads / 64u : 0u;
     state.laneCount = halfHost && !state.spannedWave ? 2u : 1u;
     if (state.spannedWave) {
         state.requirements.subgroupLocalInvocationId = true;
@@ -349,6 +351,7 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
         state.requirements.subgroupShuffle = true;
     }
     if (state.laneCount == 2u) state.sharedLaneValues = WaveUniformValues(program);
+    if (state.spannedGroupWaves != 0u && std::getenv("APS5_SPANNED_GROUP_EXACT_BALLOTS") == nullptr) state.halfLocalBallots = HalfLocalBallots(program);
     if (program.Resources().stage == IrShaderStage::Compute && workgroup != nullptr) {
         // The key comes from a subgroup ballot (ReadFirstLane), so the slot is uniform over the
         // workgroup only when the workgroup is one wave held by one host subgroup; a wave64 program

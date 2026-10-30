@@ -63,7 +63,7 @@ std::array<std::uint32_t, 3> WorkgroupLocalSize(const SpirvEmitterState& state, 
         workgroup.threadsNum[1] != 0u ? workgroup.threadsNum[1] : derivativeDefault,
         workgroup.threadsNum[2] != 0u ? workgroup.threadsNum[2] : 1u};
     if (state.spannedWave) {
-        size = {64u, 1u, 1u};
+        size = {state.spannedGroupWaves != 0u ? state.spannedGroupWaves * 64u : 64u, 1u, 1u};
     }
     if (state.laneCount == 2) {
         size = {((size[0] * size[1] * size[2] + 63u) / 64u) * 32u, 1u, 1u};

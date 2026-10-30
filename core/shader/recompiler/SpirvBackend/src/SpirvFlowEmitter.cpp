@@ -290,6 +290,15 @@ decltype(auto) DispatchArgument(SpirvValueEmitContext& ctx, const IrValue& inst,
 // per-invocation mode already has (half 0 before half 1), and it needs no subgroup operation. The barrier sits at the
 // guest instruction, where the spanned ballot and shuffle already place theirs (uniform per wave; a spanned wave is
 // its whole workgroup). Data append/consume/ordered count are excluded: they already take one atomic per wave.
+SharedAccess SpannedMemoryAccessOf(IrOpcode opcode) {
+    const auto buffer = BufferAccessOf(opcode);
+    const auto address = AddressOpcodeInfoOf(opcode).access;
+    const auto image = ImageOpcodeInfoOf(opcode).access;
+    if (buffer == BufferAccess::Write || buffer == BufferAccess::Atomic || address == AddressAccess::Write || address == AddressAccess::Atomic || image == ImageAccess::Write || image == ImageAccess::Atomic) return SharedAccess::Write;
+    if (buffer == BufferAccess::Read || address == AddressAccess::Read || image == ImageAccess::Read || opcode == IrOpcode::ReadConst) return SharedAccess::Read;
+    return SharedAccess::None;
+}
+
 bool SpannedHalfOrdered(const SpirvEmitterState& state, const IrValue& inst) {
     if (!state.spannedWave) return false;
     const auto name = IrOpcodeName(inst.Opcode());
@@ -300,6 +309,7 @@ bool SpannedHalfOrdered(const SpirvEmitterState& state, const IrValue& inst) {
 template<typename TCall>
 std::uint32_t EmitSpannedHalfOrdered(SpirvValueEmitContext& ctx, const IrValue& inst, TCall&& call) {
     auto& state = ctx.state;
+    if (state.spannedGroupWaves != 0u) throw SpannedWaveUnsupported("a spanned wave of a multi-wave workgroup has no half-ordered memory atomics");
     const auto type = TypeId(state, inst.Type());
     const auto lane = Binary(state, spv::OpBitwiseAnd, TypeU32(state), EmitLocalInvocationIndex(state), ConstantU32(state, 63u));
     const auto upper = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), lane, ConstantU32(state, 32u));
@@ -348,7 +358,12 @@ void EmitDirectInstruction(SpirvValueEmitContext& ctx, const IrValue& inst) {
         case IrOpcode::Barrier: return Invoke(EmitBarrier, ctx, inst);
         case IrOpcode::ReadFirstLane: return Invoke(EmitReadFirstLane, ctx, inst);
         case IrOpcode::ReadLane: return Invoke(EmitReadLane, ctx, inst);
-        case IrOpcode::Ballot: return Invoke(EmitBallot, ctx, inst);
+        case IrOpcode::Ballot:
+            if (ctx.state.halfLocalBallots.contains(&inst)) {
+                ctx.Define(inst, EmitHalfLocalBallot(ctx.state, ctx.Def(inst.Argument(0))));
+                return;
+            }
+            return Invoke(EmitBallot, ctx, inst);
         case IrOpcode::Void: return Invoke(EmitVoid, ctx, inst);
         case IrOpcode::Reference: return Invoke(EmitReference, ctx, inst);
         case IrOpcode::ReferenceU32: return Invoke(EmitReferenceU32, ctx, inst);
@@ -791,6 +806,8 @@ void EmitStructuredBlock(SpirvValueEmitContext& ctx, StructuredFunctionState& fu
     // and a read from the next write. The block may be entered right after a write.
     bool ldsWritten = true;
     bool ldsRead = false;
+    bool memoryWritten = true;
+    bool memoryRead = false;
     for (const IrValue* inst : block->Instructions()) {
         if (inst->Opcode() == IrOpcode::Phi) {
             if (emittedNonPhi) {
@@ -799,7 +816,23 @@ void EmitStructuredBlock(SpirvValueEmitContext& ctx, StructuredFunctionState& fu
         } else {
             emittedNonPhi = true;
         }
-        if (state.waveLdsScope != 0) {
+        static const bool noMemorySync = [] { const char* t = std::getenv("APS5_SG_DIAG"); return t != nullptr && (std::atoi(t) & 2) != 0; }();
+        if (state.spannedGroupWaves != 0u && !noMemorySync) {
+            const auto memory = SpannedMemoryAccessOf(inst->Opcode());
+            if (memory != SharedAccess::None) {
+                const bool writes = memory != SharedAccess::Read;
+                if (memoryWritten || (writes && memoryRead)) {
+                    EmitSpannedGroupSync(state, LdsMemorySemantics(state) | spv::MemorySemanticsUniformMemoryMask | spv::MemorySemanticsImageMemoryMask);
+                    memoryWritten = false;
+                    memoryRead = false;
+                    ldsWritten = false;
+                    ldsRead = false;
+                }
+                memoryWritten |= writes;
+                memoryRead |= memory != SharedAccess::Write;
+            }
+        }
+        if (state.waveLdsScope != 0 || state.spannedGroupWaves != 0u) {
             const auto access = SharedAccessOf(inst->Opcode());
             if (inst->Opcode() == IrOpcode::Barrier) {
                 ldsWritten = false;
@@ -808,7 +841,8 @@ void EmitStructuredBlock(SpirvValueEmitContext& ctx, StructuredFunctionState& fu
                 const bool writes = access != SharedAccess::Read;
                 if (ldsWritten || (writes && ldsRead)) {
                     const auto semantics = ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask | LdsMemorySemantics(state));
-                    if (state.waveLdsMemoryBarriers && state.waveLdsScope == spv::ScopeSubgroup) state.module.AddFunction(spv::OpMemoryBarrier, ConstantU32(state, spv::ScopeSubgroup), semantics);
+                    if (state.spannedGroupWaves != 0u) EmitSpannedGroupSync(state, LdsMemorySemantics(state));
+                    else if (state.waveLdsMemoryBarriers && state.waveLdsScope == spv::ScopeSubgroup) state.module.AddFunction(spv::OpMemoryBarrier, ConstantU32(state, spv::ScopeSubgroup), semantics);
                     else state.module.AddFunction(spv::OpControlBarrier, ConstantU32(state, state.waveLdsScope), ConstantU32(state, spv::ScopeWorkgroup), semantics);
                     ldsWritten = false;
                     ldsRead = false;

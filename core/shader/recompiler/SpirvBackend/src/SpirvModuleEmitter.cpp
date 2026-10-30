@@ -2,6 +2,7 @@
 #include "SpirvBackend/SpirvModuleEmitter.hpp"
 #include "SpirvBackend/SpirvBufferFormat.hpp"
 #include "SpirvBackend/SpirvEmitterHelpers.hpp"
+#include "SpirvBackend/SpirvMemory/SpirvSubgroup.hpp"
 #include "SpirvBackend/SpirvEmitterInstructions.hpp"
 #include "SpirvBackend/SpirvFlowEmitter.hpp"
 #include "SpirvBackend/SpirvBda.hpp"
@@ -1901,6 +1902,7 @@ void EmitProgram(SpirvEmitterState& state) {
         EmitLabel(state, mergeLabel);
         if (state.quadSampleCoverage != 0u) StoreCoverage(state, ConstantI32(state, -1));
     }
+    EmitSpannedGroupEntry(state);
     EmitOrderedWavesEntry(state);
     if (program.BlockOrder().empty()) {
         EmitOrderedWavesReturn(state);

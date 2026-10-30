@@ -44,6 +44,7 @@ inline constexpr std::uint32_t PixelFunctionLdsDescriptorSet = 2u;
 [[nodiscard]] std::uint32_t FunctionLdsDwords(const IrProgram& program);
 [[nodiscard]] std::unordered_map<const IrValue*, std::uint32_t> FunctionLdsLaneAddresses(const IrProgram& program);
 [[nodiscard]] std::unordered_set<const IrValue*> WaveUniformValues(const IrProgram& program);
+[[nodiscard]] std::unordered_set<const IrValue*> HalfLocalBallots(const IrProgram& program);
 [[nodiscard]] bool IsWaveMaskBranch(BranchCondition condition);
 
 }

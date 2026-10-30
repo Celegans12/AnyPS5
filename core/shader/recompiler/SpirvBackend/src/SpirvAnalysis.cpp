@@ -491,6 +491,155 @@ bool IsWaveMaskBranch(BranchCondition condition) {
     return condition == BranchCondition::ExecZero || condition == BranchCondition::ExecNonZero || condition == BranchCondition::VccZero || condition == BranchCondition::VccNonZero;
 }
 
+namespace {
+
+bool HalfLocalOperation(IrOpcode opcode) {
+    switch (opcode) {
+    case IrOpcode::Identity:
+    case IrOpcode::Phi:
+    case IrOpcode::IAdd32:
+    case IrOpcode::ISub32:
+    case IrOpcode::IMul32:
+    case IrOpcode::IAnd32:
+    case IrOpcode::IOr32:
+    case IrOpcode::IXor32:
+    case IrOpcode::IShiftLeft32:
+    case IrOpcode::IShiftRightLogical32:
+    case IrOpcode::IShiftRightArithmetic32:
+    case IrOpcode::INegate32:
+    case IrOpcode::INot32:
+    case IrOpcode::CompareEqual:
+    case IrOpcode::CompareNotEqual:
+    case IrOpcode::CompareLessThan:
+    case IrOpcode::CompareGreaterThan:
+    case IrOpcode::Select:
+    case IrOpcode::SelectU1:
+    case IrOpcode::SelectU32:
+    case IrOpcode::BitFieldInsert:
+    case IrOpcode::BitFieldUExtract:
+    case IrOpcode::BitFieldSExtract:
+    case IrOpcode::ShiftLeftLogical32:
+    case IrOpcode::ShiftRightLogical32:
+    case IrOpcode::ShiftRightArithmetic32:
+    case IrOpcode::BitwiseAnd32:
+    case IrOpcode::BitwiseOr32:
+    case IrOpcode::BitwiseXor32:
+    case IrOpcode::BitwiseNot32:
+    case IrOpcode::BitReverse32:
+    case IrOpcode::BitCount32:
+    case IrOpcode::FindUMsb32:
+    case IrOpcode::FindILsb32:
+    case IrOpcode::SMin32:
+    case IrOpcode::UMin32:
+    case IrOpcode::SMax32:
+    case IrOpcode::UMax32:
+    case IrOpcode::SLessThan32:
+    case IrOpcode::ULessThan32:
+    case IrOpcode::IEqual32:
+    case IrOpcode::SLessThanEqual32:
+    case IrOpcode::ULessThanEqual32:
+    case IrOpcode::SGreaterThan32:
+    case IrOpcode::UGreaterThan32:
+    case IrOpcode::INotEqual32:
+    case IrOpcode::SGreaterThanEqual32:
+    case IrOpcode::UGreaterThanEqual32:
+    case IrOpcode::LogicalOr:
+    case IrOpcode::LogicalAnd:
+    case IrOpcode::LogicalXor:
+    case IrOpcode::LogicalNot:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool LowerHalfLane(const IrValue* value) {
+    const auto* compare = value == nullptr ? nullptr : value->Resolve();
+    if (compare == nullptr || compare->Opcode() != IrOpcode::ULessThan32 || compare->ArgumentCount() != 2u) return false;
+    const auto* lane = compare->Argument(0) == nullptr ? nullptr : compare->Argument(0)->Resolve();
+    const auto* bound = compare->Argument(1) == nullptr ? nullptr : compare->Argument(1)->Resolve();
+    return lane != nullptr && lane->Opcode() == IrOpcode::LaneId && bound != nullptr && bound->HasImmediate() && bound->ImmediateU32() == 32u;
+}
+
+}
+
+std::unordered_set<const IrValue*> HalfLocalBallots(const IrProgram& program) {
+    std::unordered_set<const IrValue*> local;
+    for (const IrBlock* block : program.BlockOrder()) {
+        for (const IrValue* inst : block->Instructions()) {
+            if (inst->Opcode() == IrOpcode::Ballot) local.insert(inst);
+        }
+    }
+    while (!local.empty()) {
+        std::unordered_map<const IrValue*, std::uint8_t> halves;
+        const auto halvesOf = [&](const IrValue* value) -> std::uint8_t {
+            const auto* resolved = value == nullptr ? nullptr : value->Resolve();
+            if (resolved == nullptr) return 0u;
+            const auto found = halves.find(resolved);
+            return found == halves.end() ? 0u : found->second;
+        };
+        const IrValue* bad = nullptr;
+        bool changed = true;
+        while (changed && bad == nullptr) {
+            changed = false;
+            for (const IrBlock* block : program.BlockOrder()) {
+                for (const IrValue* inst : block->Instructions()) {
+                    std::uint8_t result = 0u;
+                    const auto* source = inst->ArgumentCount() == 2u && inst->Argument(0) != nullptr ? inst->Argument(0)->Resolve() : nullptr;
+                    if (inst->Opcode() == IrOpcode::CompositeExtractU32x4 && source != nullptr && local.contains(source)) {
+                        const auto* word = inst->Argument(1)->Resolve();
+                        if (word == nullptr || !word->HasImmediate()) { bad = inst; break; }
+                        result = word->ImmediateU32() == 0u ? 1u : word->ImmediateU32() == 1u ? 2u : 0u;
+                    } else if (inst->Opcode() == IrOpcode::SelectU32 && inst->ArgumentCount() == 3u && LowerHalfLane(inst->Argument(0))) {
+                        const auto low = halvesOf(inst->Argument(1));
+                        const auto high = halvesOf(inst->Argument(2));
+                        if ((low & 2u) != 0u || (high & 1u) != 0u) { bad = inst; break; }
+                    } else {
+                        for (std::size_t index = 0; index < inst->ArgumentCount(); index++) result |= halvesOf(inst->Argument(index));
+                        if (inst->Opcode() == IrOpcode::Ballot && local.contains(inst) && result == 0u) {
+                            bool direct = false;
+                            for (const auto* user : inst->Uses()) direct |= user->Opcode() != IrOpcode::CompositeExtractU32x4;
+                            if (direct) { bad = inst; break; }
+                            continue;
+                        }
+                        if (result != 0u && (!HalfLocalOperation(inst->Opcode()) || result == 3u)) { bad = inst; break; }
+                    }
+                    auto& entry = halves[inst];
+                    if ((entry | result) != entry) {
+                        entry |= result;
+                        changed = true;
+                    }
+                }
+                if (bad != nullptr) break;
+            }
+        }
+        for (const auto& info : program.Metadata().blockInfo) {
+            for (const IrValue* used : {info.condition, info.indirectTarget}) {
+                if (bad == nullptr && used != nullptr && halvesOf(used) != 0u) bad = used->Resolve();
+            }
+        }
+        if (bad == nullptr) break;
+        std::vector<const IrValue*> pending{bad};
+        std::unordered_set<const IrValue*> seen;
+        bool removed = false;
+        while (!pending.empty()) {
+            const auto* value = pending.back();
+            pending.pop_back();
+            if (value == nullptr || !seen.insert(value).second) continue;
+            if (local.erase(value) != 0u) removed = true;
+            for (std::size_t index = 0; index < value->ArgumentCount(); index++) {
+                const auto* argument = value->Argument(index) == nullptr ? nullptr : value->Argument(index)->Resolve();
+                if (argument != nullptr && (halvesOf(argument) != 0u || local.contains(argument))) pending.push_back(argument);
+            }
+        }
+        if (!removed) {
+            local.clear();
+            break;
+        }
+    }
+    return local;
+}
+
 std::unordered_set<const IrValue*> WaveUniformValues(const IrProgram& program) {
     std::unordered_map<const IrValue*, bool> varying;
     const auto isVarying = [&](const IrValue* value) {

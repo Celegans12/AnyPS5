@@ -3,6 +3,7 @@
 #include "SpirvBackend/SpirvMemory/SpirvSubgroup.hpp"
 #include <spirv/unified1/GLSL.std.450.h>
 #include <spirv/unified1/spirv.hpp>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <SpirvBackend/SpirvEmitterInstructions.hpp>
@@ -50,6 +51,85 @@ namespace ShaderRecompiler
             return value;
         }
 
+        std::uint32_t SpannedGroupWave(SpirvEmitterState& state) {
+            return EmitBinaryU32(state, spv::OpShiftRightLogical, EmitLocalInvocationIndex(state), ConstantU32(state, 6u));
+        }
+
+        std::uint32_t SpannedGroupFlag(SpirvEmitterState& state, bool partner) {
+            const auto half = EmitBinaryU32(state, spv::OpBitwiseAnd, EmitBinaryU32(state, spv::OpShiftRightLogical, EmitLocalInvocationIndex(state), ConstantU32(state, 5u)), ConstantU32(state, 1u));
+            const auto index = EmitBinaryU32(state, spv::OpBitwiseOr, EmitBinaryU32(state, spv::OpShiftLeftLogical, SpannedGroupWave(state), ConstantU32(state, 1u)), partner ? EmitBinaryU32(state, spv::OpBitwiseXor, half, ConstantU32(state, 1u)) : half);
+            const auto pointer = state.module.AllocateId();
+            state.module.AddFunction(spv::OpAccessChain, TypeU32ElementPointer(state, spv::StorageClassWorkgroup), pointer, state.spannedFlagsVariable, index);
+            return pointer;
+        }
+
+        std::uint32_t SpannedGroupNext(SpirvEmitterState& state) {
+            if (state.spannedSequenceVariable == 0u) FailEmit("the spanned group mailbox was not declared at the entry");
+            const auto previous = state.module.AllocateId();
+            state.module.AddFunction(spv::OpLoad, TypeU32(state), previous, state.spannedSequenceVariable);
+            const auto sequence = EmitAddU32(state, previous, ConstantU32(state, 1u));
+            state.module.AddFunction(spv::OpStore, state.spannedSequenceVariable, sequence);
+            return sequence;
+        }
+
+        void SpannedGroupWait(SpirvEmitterState& state, std::uint32_t sequence, std::uint32_t memory) {
+            static const int diag = [] { const char* t = std::getenv("APS5_SG_DIAG"); return t ? std::atoi(t) : 0; }();
+            if ((diag & 1) != 0) {
+                state.module.AddFunction(spv::OpControlBarrier, ConstantU32(state, spv::ScopeWorkgroup), ConstantU32(state, spv::ScopeWorkgroup), ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask | memory));
+                return;
+            }
+            state.module.AddFunction(spv::OpControlBarrier, ConstantU32(state, spv::ScopeSubgroup), ConstantU32(state, spv::ScopeWorkgroup), ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask | memory));
+            state.module.AddFunction(spv::OpAtomicStore, SpannedGroupFlag(state, false), ConstantU32(state, spv::ScopeWorkgroup), ConstantU32(state, spv::MemorySemanticsReleaseMask | memory), sequence);
+            const auto partner = SpannedGroupFlag(state, true);
+            const auto header = state.module.AllocateId();
+            const auto body = state.module.AllocateId();
+            const auto next = state.module.AllocateId();
+            const auto merge = state.module.AllocateId();
+            state.module.AddFunction(spv::OpBranch, header);
+            EmitLabel(state, header);
+            state.module.AddFunction(spv::OpLoopMerge, merge, next, spv::LoopControlMaskNone);
+            state.module.AddFunction(spv::OpBranch, body);
+            EmitLabel(state, body);
+            const auto counted = state.module.AllocateId();
+            state.module.AddFunction(spv::OpAtomicLoad, TypeU32(state), counted, partner, ConstantU32(state, spv::ScopeWorkgroup), ConstantU32(state, spv::MemorySemanticsAcquireMask | memory));
+            const auto ahead = Unary(state, spv::OpBitcast, TypeI32(state), EmitBinaryU32(state, spv::OpISub, counted, sequence));
+            state.module.AddFunction(spv::OpBranchConditional, Binary(state, spv::OpSGreaterThanEqual, TypeBool(state), ahead, ConstantI32(state, 0)), merge, next);
+            EmitLabel(state, next);
+            state.module.AddFunction(spv::OpBranch, header);
+            EmitLabel(state, merge);
+        }
+
+        std::uint32_t SpannedGroupSlot(SpirvEmitterState& state, std::uint32_t sequence, std::uint32_t index) {
+            const auto base = EmitBinaryU32(state, spv::OpBitwiseOr, EmitBinaryU32(state, spv::OpShiftLeftLogical, SpannedGroupWave(state), ConstantU32(state, 7u)), EmitBinaryU32(state, spv::OpShiftLeftLogical, EmitBinaryU32(state, spv::OpBitwiseAnd, sequence, ConstantU32(state, 1u)), ConstantU32(state, 6u)));
+            const auto pointer = state.module.AllocateId();
+            state.module.AddFunction(spv::OpAccessChain, TypeU32ElementPointer(state, spv::StorageClassWorkgroup), pointer, state.spannedExchangeVariable, EmitBinaryU32(state, spv::OpBitwiseOr, base, index));
+            return pointer;
+        }
+
+        std::uint32_t SpannedGroupExchange(SpirvEmitterState& state, std::uint32_t word, std::uint32_t lane) {
+            const auto sequence = SpannedGroupNext(state);
+            state.module.AddFunction(spv::OpStore, SpannedGroupSlot(state, sequence, SpannedLane(state)), word);
+            SpannedGroupWait(state, sequence, spv::MemorySemanticsWorkgroupMemoryMask);
+            const auto value = state.module.AllocateId();
+            state.module.AddFunction(spv::OpLoad, TypeU32(state), value, SpannedGroupSlot(state, sequence, EmitBinaryU32(state, spv::OpBitwiseAnd, lane, ConstantU32(state, 63u))));
+            return value;
+        }
+
+        void SpannedGroupBallot(SpirvEmitterState& state, std::uint32_t result, std::uint32_t predicate) {
+            const auto own = state.module.AllocateId();
+            state.module.AddSubgroupBallot(TypeU32Vector(state, 4u), own, ConstantU32(state, spv::ScopeSubgroup), predicate);
+            const auto word = state.module.AllocateId();
+            state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), word, own, 0u);
+            const auto sequence = SpannedGroupNext(state);
+            state.module.AddFunction(spv::OpStore, SpannedGroupSlot(state, sequence, SpannedLane(state)), word);
+            SpannedGroupWait(state, sequence, spv::MemorySemanticsWorkgroupMemoryMask);
+            const auto low = state.module.AllocateId();
+            const auto high = state.module.AllocateId();
+            state.module.AddFunction(spv::OpLoad, TypeU32(state), low, SpannedGroupSlot(state, sequence, ConstantU32(state, 0u)));
+            state.module.AddFunction(spv::OpLoad, TypeU32(state), high, SpannedGroupSlot(state, sequence, ConstantU32(state, 32u)));
+            state.module.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4u), result, low, high, ConstantU32(state, 0u), ConstantU32(state, 0u));
+        }
+
         void SpannedBallot(SpirvEmitterState& state, std::uint32_t result, std::uint32_t predicate) {
             const auto lane = SpannedLane(state);
             SpannedBarrier(state);
@@ -70,10 +150,15 @@ namespace ShaderRecompiler
             std::uint32_t word = value;
             if (boolean) word = Select(state, TypeU32(state), value, ConstantU32(state, 1u), ConstantU32(state, 0u));
             else if (type != TypeU32(state)) word = Unary(state, spv::OpBitcast, TypeU32(state), value);
-            SpannedBarrier(state);
-            state.module.AddFunction(spv::OpStore, SpannedSlot(state, SpannedLane(state)), word);
-            SpannedBarrier(state);
-            const auto read = SpannedLoad(state, EmitBinaryU32(state, spv::OpBitwiseAnd, lane, ConstantU32(state, 63u)));
+            std::uint32_t read = 0u;
+            if (state.spannedGroupWaves != 0u) {
+                read = SpannedGroupExchange(state, word, lane);
+            } else {
+                SpannedBarrier(state);
+                state.module.AddFunction(spv::OpStore, SpannedSlot(state, SpannedLane(state)), word);
+                SpannedBarrier(state);
+                read = SpannedLoad(state, EmitBinaryU32(state, spv::OpBitwiseAnd, lane, ConstantU32(state, 63u)));
+            }
             if (boolean) state.module.AddFunction(spv::OpINotEqual, type, result, read, ConstantU32(state, 0u));
             else if (type != TypeU32(state)) state.module.AddFunction(spv::OpBitcast, type, result, read);
             else state.module.AddFunction(spv::OpCopyObject, type, result, read);
@@ -81,11 +166,47 @@ namespace ShaderRecompiler
 
     }
 
+    void EmitSpannedGroupEntry(SpirvEmitterState& state) {
+        if (state.spannedGroupWaves == 0u) return;
+        state.spannedExchangeVariable = state.module.DefineGlobalVariable(TypeU32ArrayPointer(state, spv::StorageClassWorkgroup, state.spannedGroupWaves * 128u), spv::StorageClassWorkgroup);
+        state.module.AddName(state.spannedExchangeVariable, "wave_exchange");
+        state.spannedFlagsVariable = state.module.DefineGlobalVariable(TypeU32ArrayPointer(state, spv::StorageClassWorkgroup, state.spannedGroupWaves * 2u), spv::StorageClassWorkgroup);
+        state.module.AddName(state.spannedFlagsVariable, "wave_exchange_counts");
+        state.spannedSequenceVariable = state.module.DefineGlobalVariable(TypePointer(state, spv::StorageClassPrivate, TypeU32(state)), spv::StorageClassPrivate);
+        state.module.AddName(state.spannedSequenceVariable, "wave_exchange_sequence");
+        state.module.AddFunction(spv::OpStore, state.spannedSequenceVariable, ConstantU32(state, 0u));
+        const auto index = EmitLocalInvocationIndex(state);
+        EmitIfCondition(state, Binary(state, spv::OpULessThan, TypeBool(state), index, ConstantU32(state, state.spannedGroupWaves * 2u)), [&] {
+            const auto pointer = state.module.AllocateId();
+            state.module.AddFunction(spv::OpAccessChain, TypeU32ElementPointer(state, spv::StorageClassWorkgroup), pointer, state.spannedFlagsVariable, index);
+            state.module.AddFunction(spv::OpStore, pointer, ConstantU32(state, 0u));
+        });
+        state.module.AddFunction(spv::OpControlBarrier, ConstantU32(state, spv::ScopeWorkgroup), ConstantU32(state, spv::ScopeWorkgroup), ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask | spv::MemorySemanticsWorkgroupMemoryMask));
+    }
+
+    std::uint32_t EmitHalfLocalBallot(SpirvEmitterState& state, std::uint32_t predicate) {
+        const auto own = state.module.AllocateId();
+        state.module.AddSubgroupBallot(TypeU32Vector(state, 4u), own, ConstantU32(state, spv::ScopeSubgroup), predicate);
+        const auto word = state.module.AllocateId();
+        state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), word, own, 0u);
+        const auto result = state.module.AllocateId();
+        state.module.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4u), result, word, word, ConstantU32(state, 0u), ConstantU32(state, 0u));
+        return result;
+    }
+
+    void EmitSpannedGroupSync(SpirvEmitterState& state, std::uint32_t memory) {
+        SpannedGroupWait(state, SpannedGroupNext(state), memory);
+    }
+
     bool HostSubgroupSingleLane(const SpirvEmitterState& state) {
         return state.hostSubgroupSize == 1u;
     }
 
     void EmitSubgroupBallot(SpirvEmitterState& state, std::uint32_t result, std::uint32_t predicate) {
+        if (state.spannedGroupWaves != 0u) {
+            SpannedGroupBallot(state, result, predicate);
+            return;
+        }
         if (state.spannedWave) {
             SpannedBallot(state, result, predicate);
             return;

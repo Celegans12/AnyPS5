@@ -349,8 +349,8 @@ struct SpirvTarget {
     bool bindlessImages = false;
     bool spannedWaves = false;
     // One guest lane per host invocation for a wave64 compute program whose workgroup holds more than one
-    // wave (the two-lane layout otherwise, HostSubgroupSize). Measured on the cloth family (request bench,
-    // research/speed/newpath/census-c.md): -11..-26 % GPU time, about half the SPIR-V, same results.
+    // wave (the two-lane layout otherwise, HostSubgroupSize). On a 32-lane host it needs spannedWaves:
+    // each guest wave then spans two host subgroups (SpirvTargetOptions::spannedGroups).
     bool singleLaneGroups = false;
     // New GPU path (PLAN v2 S2/S4): the program reads user SGPRs from the new path's push block and reaches guest
     // memory through the device page table (the walk, BdaAbi page entries) instead of the per-build range list.
