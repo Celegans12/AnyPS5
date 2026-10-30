@@ -1,0 +1,3 @@
+add_library(libSceCloudMessaging SHARED EXCLUDE_FROM_ALL Export.cpp)
+target_include_directories(libSceCloudMessaging PRIVATE ${LIBS_INCLUDE_DIR})
+configure_windows_unwind(libSceCloudMessaging)
