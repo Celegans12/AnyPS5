@@ -18,7 +18,7 @@ inline constexpr std::size_t TwinOutcomeCount = 5;
 
 [[nodiscard]] bool UsesAddressTables(const ShaderRecompiler::RecompileResult& compiled);
 // S2-share C1: a program that binds guest buffers and no other guest resource (no BDA table, images, samplers,
-// bindless tables, GDS or texel buffers). Its twin is requested with SpirvTarget::newPathRuntimeBuffers.
+// bindless tables, GDS or texel buffers; a fault buffer is allowed: the twin's faults go to the command record). Its twin is requested with SpirvTarget::newPathRuntimeBuffers.
 [[nodiscard]] bool C1Shape(const ShaderRecompiler::RecompileResult& compiled);
 // A resolved twin that reads the buffer V#s at run time: today's build binds guest buffers, the twin binds none.
 // It pushes its own words (no per-buffer memory offsets), so TwinDifference compares its layout instead.

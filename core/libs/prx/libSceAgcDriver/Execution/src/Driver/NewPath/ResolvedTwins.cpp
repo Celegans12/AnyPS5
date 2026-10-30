@@ -38,7 +38,8 @@ bool C1Shape(const ShaderRecompiler::RecompileResult& compiled) {
             buffers = true;
             break;
         case Role::FlattenedSrt:
-        case Role::ShaderData: break;
+        case Role::ShaderData:
+        case Role::FaultBuffer: break;
         default: return false;
         }
     }

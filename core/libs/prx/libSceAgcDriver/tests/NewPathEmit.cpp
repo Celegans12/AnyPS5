@@ -335,6 +335,8 @@ void c1Twins() {
         program.bindings.push_back(C1Binding(Role::ShaderData, 2));
         program.workgroupMemoryDwords = 64;
         Expect(C1Shape(program), "shader data or LDS took a program out of C1");
+        program.bindings.push_back(C1Binding(Role::FaultBuffer, 3));
+        Expect(C1Shape(program), "a fault buffer took a program out of C1");
     }
     const struct {
         const char* name;
@@ -360,6 +362,11 @@ void c1Twins() {
     const auto twin = C1Twin();
     Expect(RuntimeBufferTwin(*compiled, *twin), "a resolved twin without guest buffers is not a runtime-buffer twin");
     Expect(TwinCompatible(*compiled, *twin), "the runtime-buffer twin was refused: " + TwinDifference(*compiled, *twin));
+    {
+        auto withFault = *compiled;
+        withFault.bindings.push_back(C1Binding(Role::FaultBuffer, 2));
+        Expect(TwinCompatible(withFault, *twin), "a runtime-buffer twin that drops today's fault buffer was refused: " + TwinDifference(withFault, *twin));
+    }
     {
         // A twin that keeps the guest buffers (the field without effect) is the plain twin: same push words needed.
         auto bound = std::make_shared<ShaderRecompiler::RecompileResult>(*compiled);
