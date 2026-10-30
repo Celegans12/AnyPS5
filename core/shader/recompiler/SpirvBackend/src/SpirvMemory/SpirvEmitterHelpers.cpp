@@ -530,7 +530,10 @@ void DefineDescriptors(SpirvEmitterState& state) {
             }
             break;
         case DescriptorBindingKind::ShaderData:
-            if (!layout.UsesDataAddress()) state.shaderDataStorageVariable = Define(StorageBufferBlockType(state), "shader_data");
+            if (!layout.UsesDataAddress()) {
+                state.shaderDataStorageVariable = Define(StorageBufferBlockType(state), "shader_data");
+                state.module.AddAnnotation(spv::OpDecorate, state.shaderDataStorageVariable, spv::DecorationNonWritable);
+            }
             break;
         case DescriptorBindingKind::FlattenedSrt:
             if (layout.UsesDataAddress()) state.flattenedSrtAddressed = true;

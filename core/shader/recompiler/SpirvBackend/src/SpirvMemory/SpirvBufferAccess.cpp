@@ -73,16 +73,34 @@ std::uint32_t wordPointer(SpirvEmitterState& state, std::uint32_t base, std::uin
     return pointer;
 }
 
+std::uint32_t readOnlyWordPointer(SpirvEmitterState& state, std::uint32_t base, std::uint32_t index) {
+    const auto array = state.module.DecoratedType(spv::OpTypeRuntimeArray, {{spv::OpDecorate, {spv::DecorationArrayStride, 4u}}}, TypeU32(state));
+    const auto words = state.module.DecoratedType(spv::OpTypeStruct,
+        {{spv::OpDecorate, {spv::DecorationBlock}},
+         {spv::OpMemberDecorate, {0u, spv::DecorationOffset, 0u}},
+         {spv::OpMemberDecorate, {0u, spv::DecorationNonWritable}}},
+        array);
+    const auto block = state.module.AllocateId();
+    state.module.AddFunction(spv::OpConvertUToPtr, TypePointer(state, spv::StorageClassPhysicalStorageBuffer, words), block, base);
+    const auto pointer = state.module.AllocateId();
+    state.module.AddFunction(spv::OpAccessChain, TypePhysicalU32Pointer(state), pointer, block, ConstantU32(state, 0u), index);
+    return pointer;
+}
+
 }
 
 std::uint32_t EmitRootAddressWordPointer(SpirvEmitterState& state, std::uint32_t field, std::uint32_t index) {
     return wordPointer(state, rootAddress(state, field), index);
 }
 
+std::uint32_t EmitRootAddressReadOnlyWordPointer(SpirvEmitterState& state, std::uint32_t field, std::uint32_t index) {
+    return readOnlyWordPointer(state, rootAddress(state, field), index);
+}
+
 std::uint32_t EmitStageRingWordPointer(SpirvEmitterState& state, RuntimeAbi::RootStageField field, std::uint32_t index) {
     const auto u64 = TypeScalarU64(state);
     const auto base = Binary(state, spv::OpIAdd, u64, rootAddress(state, RuntimeAbi::RootRingAddress), Unary(state, spv::OpUConvert, u64, EmitStageRootDword(state, field)));
-    return wordPointer(state, base, index);
+    return readOnlyWordPointer(state, base, index);
 }
 
 namespace {

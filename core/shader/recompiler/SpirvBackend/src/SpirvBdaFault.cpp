@@ -13,7 +13,7 @@ std::uint32_t BdaConstant(SpirvEmitterState& state, std::uint64_t value) {
 }
 
 std::uint32_t BdaWord(SpirvEmitterState& state, std::uint32_t variable, std::uint32_t index) {
-    if (state.bdaAddressed && variable == state.bdaPagetableVariable) return EmitRootAddressWordPointer(state, RuntimeAbi::RootPagetableAddress, index);
+    if (state.bdaAddressed && variable == state.bdaPagetableVariable) return EmitRootAddressReadOnlyWordPointer(state, RuntimeAbi::RootPagetableAddress, index);
     if (state.bdaAddressed && variable == state.faultBufferVariable) return EmitRootAddressWordPointer(state, RuntimeAbi::RootFaultAddress, index);
     const auto pointer = state.module.AllocateId();
     state.module.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), pointer, variable, ConstantU32(state, 0u), index);
