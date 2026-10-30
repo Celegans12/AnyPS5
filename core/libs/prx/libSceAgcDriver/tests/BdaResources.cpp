@@ -4696,7 +4696,7 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
         Require(ranges != nullptr && ranges->size() == 1 && ranges->front().begin == snapshots[0].address && ranges->front().end == snapshots[0].address + source.size(), "a deferred draw table lists other ranges than its build");
         Require(!view.has_value() || (view->ranges.size() == 1 && view->ranges.front().begin == ranges->front().begin && view->ranges.front().end == ranges->front().end), "the deferred draw table's space view differs from its ranges");
         deferred.EnsureAddressTable();
-        Require(!deferred.AddressTableDeferred() && deferred.ChecksFaults(), "EnsureAddressTable left the draw table deferred");
+        Require(!deferred.AddressTableDeferred() && deferred.ChecksFaults() && !deferred.Reusable() && !deferred.SharesUses(), "EnsureAddressTable left the draw table deferred or the storing build reusable");
         const auto table = access.bytes(access.descriptor(4).buffer);
         ShaderRecompiler::BdaAbi::Header header{};
         ShaderRecompiler::BdaAbi::Range range{};

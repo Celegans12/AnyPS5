@@ -2271,6 +2271,12 @@ DrawCostNote& ThreadDrawCost() {
     return note;
 }
 
+// D-draws2 (A -> T): APS5_NEW_PATH_NO_DRAW_TEMPLATES=1 keeps a deferred-table build out of the resource cache.
+bool NewPathDrawTemplates() {
+    static const bool on = [] { const char* value = std::getenv("APS5_NEW_PATH_NO_DRAW_TEMPLATES"); return value == nullptr || value[0] == '\0' || std::strcmp(value, "0") == 0; }();
+    return on;
+}
+
 // D-draws2 (retire step a for draws): whether the router would route this draw new once its build is class A,
 // F4 covers it, it has no address overlays and its twin pipeline is ready (what only the build or the pipeline
 // tells). Such a build defers its BDA table and fault buffer: the twins walk the device page table and bind
@@ -2306,7 +2312,16 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     // The render target and index ranges stay out of the key (see DrawResourceKey); a hit repeats
     // the alias checks instead. Debug aid: APS5_NO_DRAW_KEY_TRIM=1 keys them as before.
     const bool trimKey = TrimmedDrawKey();
-    resolved.cacheable = recordable && !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; }) && !ShaderResources::NeverReusable(shaders);
+    // D-draws2 (A -> T): an address-table draw the new path would route builds without its BDA table (step a), and
+    // with APS5_NEW_PATH_NO_DRAW_TEMPLATES unset such a build may become a template even when its stages store
+    // through BDA (its per-use state is the command record's, see noteReusable). A deferred template serves only
+    // draws the new path would route; anything else builds its own.
+    const bool routeExpected = recordable && ShaderResources::StagesUseAddressTables(shaders) && mayRouteDrawWithoutTable(state, shaders);
+    // Only builds that are never reusable today (stages storing through BDA: class A) take this; read-only
+    // address-table builds stay the templates they are.
+    const bool neverReusable = ShaderResources::NeverReusable(shaders);
+    const bool newPathTemplates = routeExpected && neverReusable && NewPathDrawTemplates() && context.descriptorCache != nullptr;
+    resolved.cacheable = recordable && !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; }) && (newPathTemplates || !neverReusable);
     if (timer.profile && recordable && !resolved.cacheable && ShaderResources::StagesUseAddressTables(shaders) && ShaderResources::StagesStoreThroughAddresses(shaders)) {
         ShaderResources::CountTemplateOutcome(ShaderResources::TemplateOutcome::Storing);
         if (ShaderResources::StagesStoreOnlyThroughExtInst(shaders)) ShaderResources::CountTemplateOutcome(ShaderResources::TemplateOutcome::StoringExtOnly);
@@ -2322,6 +2337,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
             resolved.contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
         }
         auto cached = SharedResourceCache().Find(resolved.contentKey);
+        if (cached != nullptr && cached->AddressTableDeferred() && !newPathTemplates) cached = nullptr;
         const bool inUse = cached != nullptr && cached->InUse() && !cached->SharesUses();
         if (inUse) CountAddressReuse(AddressReuse::InUse);
         if (cached != nullptr && !inUse) {
@@ -2337,6 +2353,10 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                 resolved.moved = std::move(*moved);
                 if (trimKey) CheckBufferAliases(context, shaders, state.color, draw.indexAddress, indexBytes);
                 outcome.kind = KindTemplateHit;
+                if (resolved.resources->AddressTableDeferred()) {
+                    ThreadDrawCost().templateHit = true;
+                    NewPath::DrawCounts().templateHits.fetch_add(1, std::memory_order_relaxed);
+                }
                 countCache(&DrawProfile::cacheHits);
                 if (addressBased) CountAddressReuse(AddressReuse::Reused);
             } else if (valid) {
@@ -2370,7 +2390,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
             prepared->resources.reset();
         }
         if (resolved.resources == nullptr) {
-            const bool deferTable = recordable && !resolved.cacheable && mayRouteDrawWithoutTable(state, shaders);
+            const bool deferTable = routeExpected && (!resolved.cacheable || newPathTemplates);
             const auto buildStart = deferTable || NewPath::DrawCostProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots, deferTable);
             if (NewPath::DrawCostProfiled()) ThreadDrawCost().buildNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - buildStart).count());
@@ -2910,7 +2930,7 @@ std::shared_ptr<Pipeline> drawTwinPipeline(const Context& context, const State& 
 // recorded: on Route::NewPath the record carries the twins' pipeline and what the push needs.
 void routeLeanDraw(NewPath::EmitCandidate& emit, const Context& context, const State& state, const State& pipelineState, const VertexInputLayout& vertexInput, std::span<const CompiledShader> shaders, std::size_t kind, RecordedDraw& record) {
     auto facts = emit.facts;
-    facts.classA = kind == KindBda;
+    facts.classA = kind == KindBda || (kind == KindTemplateHit && record.resources->AddressTableDeferred());
     facts.lean = true;
     std::shared_ptr<RecordedDraw::NewPathDraw> chosen;
     std::shared_ptr<Pipeline> twinPipeline;
@@ -3339,6 +3359,7 @@ struct DrawPreparation {
     double ownWaitedMs = 0;
     DrawInputs inputs;
     const Pm4::DrawParameters::IndirectDraw* args = nullptr;
+    std::span<const GuestMemorySnapshot> snapshots;
     int dumpLimit = 0;
     std::vector<TargetBinding> targets;
     std::vector<VkImageView> targetViews;
@@ -3365,6 +3386,7 @@ struct DrawPreparation {
 
 bool prepareDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, PreparedDraw* prepared, const AheadDraw* ahead, DrawPreparation& preparation) {
     auto*& recipeOut = preparation.recipeOut;
+    preparation.snapshots = snapshots;
     auto& stencilReferences = preparation.stencilReferences;
     for (const auto& shader : shaders) {
         if (shader.program != nullptr && !shader.program->stencilReferences.empty()) {
@@ -3809,6 +3831,26 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
     const auto& reorderPass = preparation.reorderPass;
     const auto& depthLocations = preparation.depthLocations;
     const auto& blendedSet = preparation.blendedSet;
+    // D-draws2: a draw whose build deferred its BDA table but that does not route new gets the table before
+    // anything binds the set. A fresh build builds it in place (and leaves the resource cache, which held it as a
+    // deferred template); a shared deferred template may be bound by uses in flight, so this use gets a build
+    // of its own with the table (same stages, so the same set layouts the pipeline was made for).
+    const auto leaveDeferredTable = [&] {
+        if (!resources->AddressTableDeferred()) return;
+        if (outcome.kind != KindTemplateHit) {
+            if (cacheable) SharedResourceCache().Remove(contentKey, resources.get());
+            resources->EnsureAddressTable();
+            return;
+        }
+        auto own = std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(inputs.indexBytes), preparation.snapshots);
+        const auto before = resources->SetLayouts();
+        const auto after = own->SetLayouts();
+        Require(before.main == after.main && before.fragment == after.fragment && before.split == after.split && !own->HasCopiedWrites() && own->NeedsCompletion() == completion, "a deferred draw template's own build differs from the template in its set layouts or completion");
+        resources = std::move(own);
+        resolved.moved.clear();
+        outcome.kind = KindBda;
+        NewPath::DrawCounts().templateFallbacks.fetch_add(1, std::memory_order_relaxed);
+    };
     if (lean) {
         RecordedDraw record;
         record.recorder = recorder;
@@ -3836,7 +3878,11 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
         record.reorderPass = reorderPass;
         record.depthLocations = depthLocations;
         if (auto* emit = NewPath::CurrentDrawEmit()) routeLeanDraw(*emit, context, state, masked.has_value() ? *masked : state, inputs.VertexLayout(), shaders, outcome.kind, record);
-        if (record.newPath == nullptr) resources->EnsureAddressTable();
+        if (record.newPath == nullptr && resources->AddressTableDeferred()) {
+            leaveDeferredTable();
+            record.resources = resources;
+            record.moved = resolved.moved;
+        }
         recordDraw(context, state, draw, shaders, inputs, record, outcome, timer, ownWaitedMs, preparation.trace);
         // The recipe for the caller's draw-cache entry (design_cpu_final M8, rule R3 for draws):
         // only a template the resource cache serves under this content key (reusable: no lease,
@@ -3868,7 +3914,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
         report(outcome.waited ? (outcome.reason == SyncLease ? " recorded then waited (lease)" : " recorded then waited (copied writes)") : completion ? " recorded with completion" : " recorded");
         return;
     }
-    resources->EnsureAddressTable();
+    leaveDeferredTable();
     if (auto* emit = NewPath::CurrentDrawEmit()) {
         auto facts = emit->facts;
         facts.classA = outcome.kind == KindBda;

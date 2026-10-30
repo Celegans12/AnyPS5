@@ -75,6 +75,8 @@ struct DrawEmitCounts {
     // Class A draws by fact, every fact evaluated (F4 also without a twin when APS5_PROFILE_NEW_PATH is set):
     // the share that would route new once every stage has its twin.
     std::atomic<std::uint64_t> classA{0}, lean{0}, shapeOk{0}, twinned{0}, pushFits{0}, noCloth{0}, covered{0}, eligible{0};
+    // D-draws2: deferred-table templates (A -> T): hits, and hits that fell back and took a build of their own.
+    std::atomic<std::uint64_t> templateHits{0}, templateFallbacks{0};
 };
 DrawEmitCounts& DrawCounts();
 
