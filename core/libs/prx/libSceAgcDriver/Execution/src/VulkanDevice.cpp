@@ -6412,6 +6412,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     const auto emitStart = emit != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto* emitLimit = state->properties.limits.maxComputeWorkGroupCount;
     const bool deferTable = emit != nullptr && NewPath::MayEmitWithoutTable(*emit, x <= emitLimit[0] && y <= emitLimit[1] && z <= emitLimit[2]);
+    const Graphics::InPlaceWritesScope inPlaceWrites(emit != nullptr && NewPath::InPlaceWrites(*emit));
     const auto pipelineKey = ComputePipelineKey::Of(shader, pushStages != 0);
     std::shared_ptr<ComputePipelineObjects> objects = prepared != nullptr ? prepared->objects : nullptr;
     if (objects == nullptr && !pipelineKey.identity.Empty()) {

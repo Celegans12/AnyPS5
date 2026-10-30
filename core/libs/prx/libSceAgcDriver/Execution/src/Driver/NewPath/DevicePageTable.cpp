@@ -1,5 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/DevicePageTable.hpp"
 #include <algorithm>
+#include <array>
+#include <iterator>
 #include <cstdio>
 
 namespace AgcDriver::NewPath {
@@ -86,7 +88,7 @@ std::vector<Range> DevicePageTable::Overlay(std::span<const Range> base, std::sp
     return out;
 }
 
-DevicePageTable::Cover DevicePageTable::Compare(std::span<const Range> table, std::span<const Range> build, const Range** failed, std::uint64_t* failedAt) {
+DevicePageTable::Cover DevicePageTable::Compare(std::span<const Range> table, std::span<const Range> build, const Range** failed, std::uint64_t* failedAt, std::span<const Range> imports, std::uint64_t* mirroredReads) {
     const auto fail = [&](const Range& range, std::uint64_t cursor, Cover cover) {
         if (failed != nullptr) *failed = &range;
         if (failedAt != nullptr) *failedAt = cursor;
@@ -98,9 +100,16 @@ DevicePageTable::Cover DevicePageTable::Compare(std::span<const Range> table, st
         auto at = std::upper_bound(table.begin(), table.end(), cursor, [](std::uint64_t value, const Range& entry) { return value < entry.end; });
         while (cursor < range.end) {
             if (at == table.end() || at->begin > cursor) return fail(range, cursor, Cover::Missing);
-            if (at->deviceAddress + (cursor - at->begin) != range.deviceAddress + (cursor - range.begin)) return fail(range, cursor, Cover::OtherAddress);
-            if ((at->permissions & range.permissions) != range.permissions) return fail(range, cursor, Cover::Narrower);
-            cursor = std::min(range.end, at->end);
+            const auto stop = std::min(range.end, at->end);
+            if (at->deviceAddress + (cursor - at->begin) != range.deviceAddress + (cursor - range.begin)) {
+                if ((at->reserved & ShaderRecompiler::BdaAbi::RangeMirrored) == 0 || (range.permissions & ShaderRecompiler::BdaAbi::Write) != 0 || imports.empty()) return fail(range, cursor, Cover::OtherAddress);
+                const std::array<Range, 1> piece{Range{cursor, stop, range.deviceAddress + (cursor - range.begin), range.permissions, range.reserved}};
+                if (Compare(imports, piece) != Cover::Covered) return fail(range, cursor, Cover::OtherAddress);
+                if (mirroredReads != nullptr) ++*mirroredReads;
+            } else if ((at->permissions & range.permissions) != range.permissions) {
+                return fail(range, cursor, Cover::Narrower);
+            }
+            cursor = stop;
             ++at;
         }
     }
@@ -156,7 +165,7 @@ DevicePageTable::Cover DevicePageTable::compareLocked(std::span<const Range> bui
     ++counts.compares;
     const Range* failed = nullptr;
     std::uint64_t failedAt = 0;
-    const auto cover = Compare(tableRanges, build, &failed, &failedAt);
+    const auto cover = Compare(tableRanges, build, &failed, &failedAt, importRanges, &counts.mirroredReads);
     if (cover != Cover::Covered && failed != nullptr && reportedFailures < 12) {
         ++reportedFailures;
         static constexpr const char* names[] = {"covered", "missing", "other address", "narrower"};
@@ -171,7 +180,7 @@ DevicePageTable::Cover DevicePageTable::Probe(std::span<const Range> build, Rang
     std::lock_guard lock(mutex);
     if (!built) return Cover::Missing;
     const Range* first = nullptr;
-    const auto cover = Compare(tableRanges, build, &first);
+    const auto cover = Compare(tableRanges, build, &first, nullptr, importRanges);
     if (failed != nullptr && first != nullptr) *failed = *first;
     return cover;
 }
@@ -186,11 +195,35 @@ std::vector<Range> DevicePageTable::piecesLocked(std::uint64_t begin, std::uint6
 std::shared_ptr<const Graphics::BdaPageTable> DevicePageTable::Refresh(const Graphics::Context& context) {
     const auto now = version(context.device);
     const auto mirrorNow = mirrorVersionOf(context.device);
+    const auto residentNow = residentMarkOf();
+    std::vector<std::uint64_t> residentPages;
+    {
+        std::function<std::vector<std::uint64_t>()> listing;
+        {
+            std::lock_guard lock(mutex);
+            listing = residentState.pages;
+        }
+        if (listing) residentPages = listing();
+    }
     std::lock_guard lock(mutex);
-    if (built && now == builtVersion && mirrorNow == builtMirrorVersion) {
+    if (built && now == builtVersion && mirrorNow == builtMirrorVersion && tableDevice == context.device) {
+        if (residentNow != builtResidentMark) {
+            std::vector<std::uint64_t> changed;
+            std::set_symmetric_difference(residentPages.begin(), residentPages.end(), residentPatched.begin(), residentPatched.end(), std::back_inserter(changed));
+            builtResidentMark = residentNow;
+            residentPatched = std::move(residentPages);
+            if (!changed.empty()) {
+                patchLocked(context, changed);
+                ++counts.residentPatches;
+                counts.residentPages += changed.size();
+            }
+            return table;
+        }
         ++counts.unchanged;
         return table;
     }
+    builtResidentMark = residentNow;
+    residentPatched = std::move(residentPages);
     if (table != nullptr && tableDevice != context.device) {
         outlivedDevices.push_back(std::move(table));
         ++counts.outlived;
@@ -233,19 +266,57 @@ std::shared_ptr<const Graphics::BdaPageTable> DevicePageTable::Refresh(const Gra
 bool DevicePageTable::Stale(VkDevice device) const {
     const auto now = version(device);
     const auto mirrorNow = mirrorVersionOf(device);
+    const auto residentNow = residentMarkOf();
     std::lock_guard lock(mutex);
-    return !built || now != builtVersion || mirrorNow != builtMirrorVersion;
+    return !built || now != builtVersion || mirrorNow != builtMirrorVersion || residentNow != builtResidentMark;
 }
 
 std::shared_ptr<const Graphics::BdaPageTable> DevicePageTable::PatchPages(const Graphics::Context& context, std::span<const std::uint64_t> pages) {
     std::lock_guard lock(mutex);
     if (table == nullptr) return nullptr;
+    patchLocked(context, pages);
+    return table;
+}
+
+void DevicePageTable::patchLocked(const Graphics::Context& context, std::span<const std::uint64_t> pages) {
     table = Graphics::BdaPageTable::Patch(context, table, pages, [this](std::uint64_t begin, std::uint64_t end) { return piecesLocked(begin, end); });
     ++counts.patches;
     tableRanges = piecesLocked(0, ShaderRecompiler::BdaAbi::PageTableEnd);
     tableLists = ListsOf(tableRanges);
     ++generation;
-    return table;
+}
+
+std::uint64_t DevicePageTable::residentMarkOf() const {
+    std::function<std::uint64_t()> mark;
+    {
+        std::lock_guard lock(mutex);
+        mark = residentState.mark;
+    }
+    return mark ? mark() : 0u;
+}
+
+std::optional<std::size_t> DevicePageTable::PatchResident(const Graphics::Context& context) {
+    const auto mark = residentMarkOf();
+    std::function<std::vector<std::uint64_t>()> listing;
+    {
+        std::lock_guard lock(mutex);
+        if (table == nullptr || !built || tableDevice != context.device) return std::nullopt;
+        if (mark == builtResidentMark) return 0u;
+        listing = residentState.pages;
+    }
+    std::vector<std::uint64_t> now;
+    if (listing) now = listing();
+    std::lock_guard lock(mutex);
+    if (table == nullptr || !built || tableDevice != context.device) return std::nullopt;
+    std::vector<std::uint64_t> changed;
+    std::set_symmetric_difference(now.begin(), now.end(), residentPatched.begin(), residentPatched.end(), std::back_inserter(changed));
+    builtResidentMark = mark;
+    residentPatched = std::move(now);
+    if (changed.empty()) return 0u;
+    patchLocked(context, changed);
+    ++counts.residentPatches;
+    counts.residentPages += changed.size();
+    return changed.size();
 }
 
 void DevicePageTable::Release(VkDevice device) {
@@ -269,15 +340,18 @@ void DevicePageTable::Release(VkDevice device) {
         coverMemo = {};
         serialMemo.clear();
         tableLists = {};
+        residentPatched.clear();
+        builtResidentMark = 0;
         built = false;
         builtVersion = 0;
         ++counts.released;
     }
 }
 
-void DevicePageTable::SetResidentPieces(ResidentPieces pieces) {
+void DevicePageTable::SetResidentPieces(ResidentPieces pieces, ResidentState state) {
     std::lock_guard lock(mutex);
     resident = std::move(pieces);
+    residentState = std::move(state);
 }
 
 std::shared_ptr<const Graphics::BdaPageTable> DevicePageTable::Current() const {

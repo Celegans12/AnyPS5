@@ -41,6 +41,7 @@ ResidencyConfig ResidencyConfigFrom(ResidencyEnvironment environment) {
     }
     config.slotBinding = config.residency && environment("APS5_NEW_PATH_SLOT_BINDING") != nullptr;
     config.eagerCopyIn = config.residency && environment("APS5_NEW_PATH_EAGER_COPY_IN") != nullptr;
+    config.writtenSlots = config.residency && !config.slotBinding && !config.eagerCopyIn && environment("APS5_NEW_PATH_WRITTEN_SLOTS") != nullptr;
     const char* chunk = environment("APS5_NEW_PATH_RESIDENT_CHUNK_PAGES");
     if (config.residency && chunk != nullptr && *chunk != '\0') config.chunkPages = chunkPages(chunk);
     return config;

@@ -83,6 +83,10 @@ private:
 [[nodiscard]] EmitCandidate* CurrentEmit();
 Decision NoteEmit(EmitCandidate& candidate, const CommandFacts& facts);
 [[nodiscard]] bool MayEmitWithoutTable(const EmitCandidate& candidate, bool pipelineReady);
+// Whether the candidate's build binds its written buffer elements in place (Graphics::InPlaceWritesScope):
+// with emission on, for a build whose dispatch may run its resolved twin (APS5_NEW_PATH_IN_PLACE_WRITES=all:
+// every candidate's; APS5_NEW_PATH_NO_IN_PLACE_WRITES=1: none).
+[[nodiscard]] bool InPlaceWrites(const EmitCandidate& candidate);
 // The router's route for these facts, without noting it.
 [[nodiscard]] bool WouldEmit(const CommandFacts& facts);
 void NoteDispatchCost(const EmitCandidate& candidate, std::uint64_t deviceNs, std::uint64_t buildNs);

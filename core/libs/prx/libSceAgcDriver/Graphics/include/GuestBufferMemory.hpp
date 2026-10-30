@@ -335,6 +335,28 @@ struct AddressCopy {
 };
 std::string AddressCopyOverflow(std::vector<AddressCopy> copies, std::uint64_t limit);
 
+// Written buffer elements of the builds made inside it bind in place in their imports instead of a
+// staged device-local copy (NewPath::InPlaceWrites: builds whose dispatch may run its resolved twin,
+// which reads and writes those bytes through the device page table, where the imports are mapped).
+class InPlaceWritesScope {
+public:
+    explicit InPlaceWritesScope(bool active);
+    ~InPlaceWritesScope();
+    InPlaceWritesScope(const InPlaceWritesScope&) = delete;
+    InPlaceWritesScope& operator=(const InPlaceWritesScope&) = delete;
+
+private:
+    bool previous;
+};
+bool InPlaceWritesActive();
+struct InPlaceWritesCounts {
+    std::uint64_t inPlace = 0;
+    std::uint64_t refusedRun = 0;
+    std::uint64_t refusedUnchecked = 0;
+    std::uint64_t overlaysKept = 0;
+};
+InPlaceWritesCounts InPlaceWritesTotals();
+
 class GuestBufferMemory {
 public:
     explicit GuestBufferMemory(const Context& context);
@@ -580,6 +602,12 @@ private:
         // mapping, so nothing is ever stored from it by the CPU, and the region is taken even when
         // the import could bind it in place.
         bool deviceLocal = false;
+        // A staged written element bound in a residency mirror slot (residencySlot, direct), copied in
+        // and back like a shadow: the device page table maps the range where the work writes it.
+        bool slotCopy = false;
+        // A written element bound in place only because of an InPlaceWritesScope: a dispatch run treats it
+        // as copied (RunAccesses), so the run takes the same dispatches as it would with the staged copy.
+        bool inPlaceWrite = false;
         // The tracker generation and registry generation at this use's copy-in when it may become a
         // GPU source (FindGpuSource), else 0; consumed by MarkDirectWrites.
         mutable std::uint64_t gpuSourceSince = 0;

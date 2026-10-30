@@ -232,6 +232,13 @@ struct ResidencyCounts {
     std::uint64_t behindFlips = 0;
     std::uint64_t caughtUp = 0;
     std::uint32_t behind = 0;
+    std::uint64_t oldPathFlips = 0;
+    std::uint64_t oldPathDirtyWrittenBack = 0;
+    std::uint64_t oldPathDirtyKept = 0;
+    std::uint64_t settleChecks = 0;
+    std::uint64_t settleFlips = 0;
+    std::uint64_t heldRefusals = 0;
+    std::uint64_t heldSkippedBytes = 0;
 };
 
 enum class ResidencyRangeState : std::uint8_t { Uniform, Completed, Demoted, Conflict };
@@ -338,6 +345,10 @@ public:
     std::vector<std::pair<std::uint64_t, std::uint64_t>> MirroredIn(std::uint64_t address, std::uint64_t bytes);
     std::vector<std::uint64_t> CurrentPages() const;
     void CatchUp(std::uint64_t address, std::uint64_t bytes);
+    void NoteOldPathWrite(std::uint64_t address, std::uint64_t bytes, bool mayRecord);
+    bool HoldWritten(std::uint64_t address, std::uint64_t bytes);
+    void ReleaseWritten(std::uint64_t address, std::uint64_t bytes);
+    bool SettleCurrent();
     ResidencyMask Behind(std::uint64_t page) const;
     std::uint64_t ChunkAddress(std::uint32_t chunk) const;
     std::uint32_t ChunkSlots() const { return chunkSlots; }
@@ -548,6 +559,7 @@ private:
     const std::uint32_t quietFrames;
     const bool deferCopyIn;
     bool catchingUp = false;
+    std::unordered_map<std::uint64_t, std::vector<Run>> heldWritten;
     std::uint64_t budget = 0;
     std::uint32_t maxChunks = 0;
     std::uint64_t limitEpoch = 0;

@@ -11,6 +11,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <unordered_map>
 #include <span>
 #include <vector>
@@ -23,6 +24,13 @@ public:
     using ImportSource = std::function<Graphics::HostImportSnapshot(const Graphics::Context&)>;
     using VersionSource = std::function<std::uint64_t(VkDevice)>;
     using ResidentPieces = std::function<std::vector<Range>(std::uint64_t begin, std::uint64_t end)>;
+    // The residency's side of the table: `mark` settles the current pages (a mirror page whose
+    // import was written since its catch-up leaves them) and returns a value that changes whenever
+    // the set or a page's mapping changes; `pages` lists the pages ResidentPieces maps to a mirror.
+    struct ResidentState {
+        std::function<std::uint64_t()> mark;
+        std::function<std::vector<std::uint64_t>()> pages;
+    };
     // The read-only image mirrors an address-based build binds in place (exe ranges no import can
     // serve), mapped at the build's own device address; versioned apart from the imports.
     using MirrorSource = std::function<Graphics::ImageMirrorTableSnapshot(const Graphics::Context&)>;
@@ -43,6 +51,9 @@ public:
         std::array<std::uint64_t, 4> coverHits{};
         std::uint64_t serialHits = 0;
         std::uint64_t compares = 0;
+        std::uint64_t residentPatches = 0;
+        std::uint64_t residentPages = 0;
+        std::uint64_t mirroredReads = 0;
     };
 
     enum class Cover : std::uint8_t { Covered, Missing, OtherAddress, Narrower };
@@ -57,7 +68,10 @@ public:
     std::shared_ptr<const Graphics::BdaPageTable> Refresh(const Graphics::Context& context);
     [[nodiscard]] bool Stale(VkDevice device) const;
     std::shared_ptr<const Graphics::BdaPageTable> PatchPages(const Graphics::Context& context, std::span<const std::uint64_t> pages);
-    void SetResidentPieces(ResidentPieces pieces);
+    void SetResidentPieces(ResidentPieces pieces, ResidentState state = {});
+    // Patches the pages whose residency mapping changed since the last build or patch; nullopt
+    // when no table is built (the next build maps them).
+    std::optional<std::size_t> PatchResident(const Graphics::Context& context);
     void Release(VkDevice device);
 
     [[nodiscard]] std::shared_ptr<const Graphics::BdaPageTable> Current() const;
@@ -73,7 +87,10 @@ public:
     [[nodiscard]] Cover Covers(std::uint64_t serial, std::span<const Range> build, Snapshot* used = nullptr);
     [[nodiscard]] Snapshot Use() const;
     [[nodiscard]] Cover Probe(std::span<const Range> build, Range* failed = nullptr) const;
-    [[nodiscard]] static Cover Compare(std::span<const Range> table, std::span<const Range> build, const Range** failed = nullptr, std::uint64_t* failedAt = nullptr);
+    // A build range that reads (only) an import in place is also covered where the table maps a
+    // current mirror page over it (RangeMirrored): `imports` holds the import entries under the
+    // mirrors. A written range must map at its own address.
+    [[nodiscard]] static Cover Compare(std::span<const Range> table, std::span<const Range> build, const Range** failed = nullptr, std::uint64_t* failedAt = nullptr, std::span<const Range> imports = {}, std::uint64_t* mirroredReads = nullptr);
     // The imports (sorted, disjoint) with the mirrors added where no import maps: a mirror's bytes
     // that an import also maps are left to the import. Sorted and disjoint.
     [[nodiscard]] static std::vector<Range> WithMirrors(std::vector<Range> imports, std::span<const Range> mirrors);
@@ -84,6 +101,8 @@ private:
 
     [[nodiscard]] std::uint64_t mirrorVersionOf(VkDevice device) const;
     [[nodiscard]] Cover compareLocked(std::span<const Range> build);
+    [[nodiscard]] std::uint64_t residentMarkOf() const;
+    void patchLocked(const Graphics::Context& context, std::span<const std::uint64_t> pages);
 
     ImportSource imports;
     VersionSource version;
@@ -93,6 +112,9 @@ private:
     std::uint64_t builtMirrorVersion = 0;
     mutable std::mutex mutex;
     ResidentPieces resident;
+    ResidentState residentState;
+    std::vector<std::uint64_t> residentPatched;
+    std::uint64_t builtResidentMark = 0;
     std::vector<Range> importRanges;
     std::vector<Range> tableRanges;
     TableLists tableLists;
