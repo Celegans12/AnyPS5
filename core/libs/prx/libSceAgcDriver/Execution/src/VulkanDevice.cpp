@@ -5652,6 +5652,12 @@ void VulkanDevice::decideIndirect(RecordedDispatch& record, IndirectOutcome& out
         recorder.Sync();
     } else if (record.shader->program->workgroupMemoryDwords != 0) {
         outcome.cpuReason = 8;
+    } else if (ExactSerialAllocating() && (AllocatingProgram(record.programAddress) || ScatteringProgram(record.programAddress) || ExactSerialProgram(record.programAddress))) {
+        // An exact replay splits these programs one workgroup at a time, which needs the workgroup count on the
+        // CPU: drain the recorded work first, as for a pending flush, so the read sees the arguments' writer.
+        outcome.cpuReason = 9;
+        Graphics::Recorder::CountSync(2);
+        recorder.Sync();
     } else if (labelPending() || state->CopiedWriterOverlaps(arguments, 12)) {
         outcome.cpuReason = 2;
     } else if ((record.argumentImport = Graphics::HostImportFor(context, arguments, 12)) == nullptr || (threadDimensions && record.argumentImport->address == 0)) {
