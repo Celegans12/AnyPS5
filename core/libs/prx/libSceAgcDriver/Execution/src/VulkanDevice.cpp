@@ -511,6 +511,7 @@ struct VulkanDevice::State {
     // built once after setup (see graphicsContext); the context's pool reference is dropped before
     // the pool at teardown.
     Graphics::DeviceFunctions deviceFunctions;
+    std::unique_ptr<Graphics::DeviceFunctionCache> functionCache = std::make_unique<Graphics::DeviceFunctionCache>();
     bool functionsReady = false;
     Graphics::Context context;
     bool contextReady = false;
@@ -630,12 +631,14 @@ struct VulkanDevice::State {
 
     template<typename TFunction>
     TFunction DeviceFunction(const char* name) const {
+        if (const auto cached = functionCache->Find(name, deviceProc); cached != nullptr) return reinterpret_cast<TFunction>(cached);
         ++Graphics::DeviceProcLookups();
-        auto function = reinterpret_cast<TFunction>(deviceProc(device, name));
+        const auto function = deviceProc(device, name);
         if (function == nullptr) {
             throw std::runtime_error(std::string("Vulkan device function missing: ") + name);
         }
-        return function;
+        functionCache->Keep(name, deviceProc, function);
+        return reinterpret_cast<TFunction>(function);
     }
 
     void CreateWorkgroupMemoryLayout() {
@@ -4266,6 +4269,7 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.exactRobustLoads = state->exactRobustLoads;
     context.copiedWriters = state->copiedWriters.get();
     context.functions = state->functionsReady ? &state->deviceFunctions : nullptr;
+    context.functionCache = state->functionsReady ? state->functionCache.get() : nullptr;
     context.descriptorIndexing = state->descriptorIndexing;
     context.descriptorIndexingLimits = state->descriptorIndexingProperties;
     context.imageInt64Atomics = state->imageInt64Atomics;
