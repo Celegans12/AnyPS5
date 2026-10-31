@@ -1977,11 +1977,11 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         }
     }
     VkPhysicalDeviceDescriptorHeapFeaturesEXT descriptorHeapFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_FEATURES_EXT};
-    const auto deviceApi = state->properties.apiVersion;
-    bool releasedDescriptorHeap = deviceApi >= VK_MAKE_API_VERSION(0, 1, 4, 340);
-    if (Graphics::GpuHeapEnabled() && hasExtension(VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME) && !releasedDescriptorHeap)
-        std::fprintf(stderr, "[gpu-heap] the driver reports Vulkan %u.%u.%u, older than 1.4.340 where VK_EXT_descriptor_heap was released, so its descriptor heap is a pre-release revision and the GPU heap stays off\n",
-                     VK_API_VERSION_MAJOR(deviceApi), VK_API_VERSION_MINOR(deviceApi), VK_API_VERSION_PATCH(deviceApi));
+    const auto heapExtension = std::find_if(availableExtensions.begin(), availableExtensions.end(), [](const auto& item) { return std::strcmp(item.extensionName, VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME) == 0; });
+    bool releasedDescriptorHeap = heapExtension != availableExtensions.end() && heapExtension->specVersion >= VK_EXT_DESCRIPTOR_HEAP_SPEC_VERSION;
+    if (Graphics::GpuHeapEnabled() && heapExtension != availableExtensions.end() && !releasedDescriptorHeap)
+        std::fprintf(stderr, "[gpu-heap] the driver's VK_EXT_descriptor_heap is revision %u, older than the released revision %u, so the GPU heap stays off\n",
+                     heapExtension->specVersion, static_cast<unsigned>(VK_EXT_DESCRIPTOR_HEAP_SPEC_VERSION));
     if (Graphics::GpuHeapEnabled() && releasedDescriptorHeap && hasExtension(VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME)) {
         const auto validationVersion = ActiveValidationLayerVersion(state->instanceProc);
         if (validationVersion.has_value() && *validationVersion < VK_MAKE_API_VERSION(0, 1, 4, 363)) {
