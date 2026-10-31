@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BindlessHeap.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DescriptorHeapObjects.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
@@ -99,6 +100,30 @@ void viewSlots(const Context& context, VkImageView view) {
     require(heap.SlotGeneration(*slot) != generation, "a released view slot moves its generation");
     require(heap.ViewSlot(kind, &second, view) == slot, "a released view slot is reused");
     heap.ReleaseViewSlots(&second);
+}
+
+void encodedViews(const Context& context) {
+    BindlessHeap heap(context);
+    const auto base = heap.Statistics();
+    const auto encodes = [&] { return heap.Statistics().encodes - base.encodes; };
+    const auto copies = [&] { return heap.Statistics().encodedCopies - base.encodedCopies; };
+    VkImageView destroyed = VK_NULL_HANDLE;
+    const auto storageKey = static_cast<std::uint32_t>(VK_IMAGE_LAYOUT_GENERAL) | 0x80000000u;
+    std::vector<std::byte> bytes(static_cast<std::size_t>(heap.ImageHeapStride()));
+    {
+        const PlaceholderImages placeholders(context);
+        const auto view = placeholders.View(Abi::FirstStorageImageBinding);
+        heap.AbsentSlot(Abi::FirstStorageImageBinding + 2u, view);
+        require(encodes() == 1u && copies() == 0u, "a view's first heap slot encodes its descriptor");
+        heap.AbsentSlot(Abi::FirstStorageImageBinding + 3u, view);
+        require(encodes() == 1u && copies() == 1u, "another slot for the same view copies the encoded descriptor");
+        require(CopyEncodedImageView(view, storageKey, bytes), "a live view keeps its encoded descriptor");
+        destroyed = view;
+    }
+    require(!CopyEncodedImageView(destroyed, storageKey, bytes), "a destroyed view drops its encoded descriptor");
+    const PlaceholderImages again(context);
+    heap.AbsentSlot(Abi::FirstStorageImageBinding + 4u, again.View(Abi::FirstStorageImageBinding));
+    require(encodes() == 2u && copies() == 1u, "a destroyed view's encoded descriptor is not copied to a new view");
 }
 
 void sweptOwnerReentry(const Context& context, VkImageView view) {
@@ -345,6 +370,7 @@ int main(int argc, char** argv) {
             samplerSlots(context);
             ringSpans(context);
             viewSlots(context, placeholders.View(Abi::FirstStorageImageBinding));
+            encodedViews(context);
             sweptOwnerReentry(context, placeholders.View(Abi::FirstStorageImageBinding));
             device->WaitIdle();
         }

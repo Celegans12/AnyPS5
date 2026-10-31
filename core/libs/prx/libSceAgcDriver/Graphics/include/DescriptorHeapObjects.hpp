@@ -3,7 +3,10 @@
 
 #include <vulkan/vulkan.h>
 
+#include <cstddef>
+#include <cstdint>
 #include <optional>
+#include <span>
 
 namespace AgcDriver::Graphics {
 
@@ -13,6 +16,7 @@ struct ImageViewRecord {
     VkImageViewMinLodCreateInfoEXT minLod{VK_STRUCTURE_TYPE_IMAGE_VIEW_MIN_LOD_CREATE_INFO_EXT};
     bool hasUsage = false;
     bool hasMinLod = false;
+    std::uint64_t generation = 0;
     const VkImageViewCreateInfo* Chain();
 };
 
@@ -26,6 +30,8 @@ struct SamplerRecord {
 PFN_vkVoidFunction DescriptorHeapObjectFunction(VkDevice device, PFN_vkGetDeviceProcAddr deviceProc, const char* name);
 std::optional<ImageViewRecord> FindImageView(VkImageView view);
 std::optional<SamplerRecord> FindSampler(VkSampler sampler);
+bool CopyEncodedImageView(VkImageView view, std::uint32_t key, std::span<std::byte> target);
+void KeepEncodedImageView(VkImageView view, std::uint64_t generation, std::uint32_t key, std::span<const std::byte> bytes);
 
 }
 

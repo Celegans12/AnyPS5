@@ -4,6 +4,7 @@
 #include <cstring>
 #include <mutex>
 #include <unordered_map>
+#include <vector>
 
 namespace AgcDriver::Graphics {
 
@@ -21,6 +22,16 @@ std::mutex& recordsMutex() {
 
 std::unordered_map<VkImageView, ImageViewRecord>& views() {
     static auto& map = *new std::unordered_map<VkImageView, ImageViewRecord>();
+    return map;
+}
+
+struct EncodedImageView {
+    std::uint32_t key = 0;
+    std::vector<std::byte> bytes;
+};
+
+std::unordered_map<VkImageView, std::vector<EncodedImageView>>& encodedViews() {
+    static auto& map = *new std::unordered_map<VkImageView, std::vector<EncodedImageView>>();
     return map;
 }
 
@@ -63,8 +74,11 @@ VKAPI_ATTR VkResult VKAPI_CALL createImageView(VkDevice device, const VkImageVie
     const auto result = realCreateImageView.load(std::memory_order_acquire)(device, info, allocator, view);
     if (result == VK_SUCCESS) {
         auto record = recordOf(*info);
+        static std::atomic<std::uint64_t> generations{0};
+        record.generation = generations.fetch_add(1, std::memory_order_relaxed) + 1u;
         std::lock_guard lock(recordsMutex());
         views()[*view] = std::move(record);
+        encodedViews().erase(*view);
     }
     return result;
 }
@@ -73,6 +87,7 @@ VKAPI_ATTR void VKAPI_CALL destroyImageView(VkDevice device, VkImageView view, c
     {
         std::lock_guard lock(recordsMutex());
         views().erase(view);
+        encodedViews().erase(view);
     }
     realDestroyImageView.load(std::memory_order_acquire)(device, view, allocator);
 }
@@ -147,6 +162,32 @@ PFN_vkVoidFunction DescriptorHeapObjectFunction(VkDevice device, PFN_vkGetDevice
         return reinterpret_cast<PFN_vkVoidFunction>(&destroySampler);
     }
     return nullptr;
+}
+
+bool CopyEncodedImageView(VkImageView view, std::uint32_t key, std::span<std::byte> target) {
+    std::lock_guard lock(recordsMutex());
+    const auto found = encodedViews().find(view);
+    if (found == encodedViews().end()) return false;
+    for (const auto& encoded : found->second) {
+        if (encoded.key != key || encoded.bytes.size() != target.size()) continue;
+        std::memcpy(target.data(), encoded.bytes.data(), target.size());
+        return true;
+    }
+    return false;
+}
+
+void KeepEncodedImageView(VkImageView view, std::uint64_t generation, std::uint32_t key, std::span<const std::byte> bytes) {
+    std::lock_guard lock(recordsMutex());
+    const auto record = views().find(view);
+    if (record == views().end() || record->second.generation != generation) return;
+    auto& entries = encodedViews()[view];
+    for (auto& encoded : entries) {
+        if (encoded.key == key) {
+            encoded.bytes.assign(bytes.begin(), bytes.end());
+            return;
+        }
+    }
+    entries.push_back({key, std::vector<std::byte>(bytes.begin(), bytes.end())});
 }
 
 std::optional<ImageViewRecord> FindImageView(VkImageView view) {

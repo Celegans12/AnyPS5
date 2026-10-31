@@ -83,7 +83,7 @@ public:
     void Submitted(Recorder& recorder, std::uint64_t serial);
 
     struct Counts {
-        std::uint64_t textures = 0, samplers = 0, full = 0, ringWraps = 0;
+        std::uint64_t textures = 0, samplers = 0, full = 0, ringWraps = 0, encodes = 0, encodedCopies = 0;
         std::uint64_t slotsFreed = 0, slotsReused = 0, sweeps = 0, chunkWaits = 0;
         std::uint64_t spansWritten = 0, spansKept = 0, spansExpired = 0, keptChunksSkipped = 0;
     };
@@ -102,6 +102,9 @@ private:
     VkDeviceSize pixelLdsHeapOffset = 0;
     VkDeviceSize meshWindowHeapOffset = 0;
     VkDeviceSize samplerHeapUsed = 0;
+    PFN_vkWriteResourceDescriptorsEXT writeResourceDescriptors = nullptr;
+    PFN_vkWriteSamplerDescriptorsEXT writeSamplerDescriptors = nullptr;
+    std::vector<std::byte> encodeScratch;
     void writeImageSlot(std::uint32_t kind, std::uint32_t slot, VkImageView view, VkImageLayout layout);
     void writeSamplerSlot(std::uint32_t slot, VkSampler sampler);
     void writeBufferDescriptor(VkDeviceSize offset, VkDeviceAddress address, VkDeviceSize bytes, const char* what);

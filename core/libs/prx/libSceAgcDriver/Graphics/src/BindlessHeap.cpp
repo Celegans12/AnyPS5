@@ -57,6 +57,8 @@ void check(VkResult result, const char* what) {
 }
 
 std::atomic<std::uint64_t> spansWrittenWindow{0};
+std::atomic<std::uint64_t> imageEncodesWindow{0};
+std::atomic<std::uint64_t> imageCopiesWindow{0};
 std::atomic<std::uint64_t> spansKeptWindow{0};
 std::atomic<std::uint64_t> spansExpiredWindow{0};
 std::atomic<std::uint64_t> heapComputeStages{0};
@@ -743,8 +745,8 @@ void BindlessHeap::writeSamplerSlot(std::uint32_t slot, VkSampler sampler) {
     const auto offset = static_cast<VkDeviceSize>(slot) * samplerHeapStride;
     Require(offset + samplerHeapStride <= samplerHeapUsed, "a GPU heap sampler slot lies outside the sampler heap");
     const VkHostAddressRangeEXT target{samplerHeap->Bytes().data() + offset, static_cast<std::size_t>(samplerHeapStride)};
-    check(context.Function<PFN_vkWriteSamplerDescriptorsEXT>("vkWriteSamplerDescriptorsEXT")(context.device, 1, record->Chain(), &target),
-          "vkWriteSamplerDescriptorsEXT");
+    if (writeSamplerDescriptors == nullptr) writeSamplerDescriptors = context.Function<PFN_vkWriteSamplerDescriptorsEXT>("vkWriteSamplerDescriptorsEXT");
+    check(writeSamplerDescriptors(context.device, 1, record->Chain(), &target), "vkWriteSamplerDescriptorsEXT");
 }
 
 void BindlessHeap::writeImageSlot(std::uint32_t kind, std::uint32_t slot, VkImageView view, VkImageLayout layout) {
@@ -755,15 +757,28 @@ void BindlessHeap::writeImageSlot(std::uint32_t kind, std::uint32_t slot, VkImag
         std::memset(target, 0, static_cast<std::size_t>(imageHeapStride));
         return;
     }
+    const bool storage = Abi::GpuHeapStorageKind(kind);
+    const auto key = static_cast<std::uint32_t>(layout) | (storage ? 0x80000000u : 0u);
+    const auto stride = static_cast<std::size_t>(imageHeapStride);
+    if (CopyEncodedImageView(view, key, std::span<std::byte>(target, stride))) {
+        ++counts.encodedCopies;
+        imageCopiesWindow.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     auto record = FindImageView(view);
     Require(record.has_value(), "a GPU heap image view has no recorded create info");
     const VkImageDescriptorInfoEXT imageInfo{VK_STRUCTURE_TYPE_IMAGE_DESCRIPTOR_INFO_EXT, nullptr, record->Chain(), layout};
     VkResourceDescriptorInfoEXT resource{VK_STRUCTURE_TYPE_RESOURCE_DESCRIPTOR_INFO_EXT};
-    resource.type = Abi::GpuHeapStorageKind(kind) ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    resource.type = storage ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     resource.data.pImage = &imageInfo;
-    const VkHostAddressRangeEXT range{target, static_cast<std::size_t>(imageHeapStride)};
-    check(context.Function<PFN_vkWriteResourceDescriptorsEXT>("vkWriteResourceDescriptorsEXT")(context.device, 1, &resource, &range),
-          "vkWriteResourceDescriptorsEXT");
+    encodeScratch.resize(stride);
+    const VkHostAddressRangeEXT range{encodeScratch.data(), stride};
+    if (writeResourceDescriptors == nullptr) writeResourceDescriptors = context.Function<PFN_vkWriteResourceDescriptorsEXT>("vkWriteResourceDescriptorsEXT");
+    check(writeResourceDescriptors(context.device, 1, &resource, &range), "vkWriteResourceDescriptorsEXT");
+    std::memcpy(target, encodeScratch.data(), stride);
+    KeepEncodedImageView(view, record->generation, key, encodeScratch);
+    ++counts.encodes;
+    imageEncodesWindow.fetch_add(1, std::memory_order_relaxed);
 }
 
 namespace {
@@ -1050,14 +1065,16 @@ void reportHeapStatistics() {
     const auto spansWritten = takeCount(spansWrittenWindow);
     const auto spansKept = takeCount(spansKeptWindow);
     const auto spansExpired = takeCount(spansExpiredWindow);
+    const auto imageEncodes = takeCount(imageEncodesWindow);
+    const auto imageCopies = takeCount(imageCopiesWindow);
     const auto templates = ShaderRecompiler::HeapTemplateCounts();
     std::fprintf(stderr,
                  "[gpu-heap] (10 s): draws %llu heap / %llu plain, dispatches %llu heap / %llu plain; "
                  "heap binds %llu over %llu command buffers; set binds:%s; fallbacks:%s; draw stages:%s; "
-                 "CPU buffer copies %llu (%llu MiB); ring spans %llu written / %llu kept / %llu expired; templates %llu (%llu MiB, %llu evicted)\n",
+                 "CPU buffer copies %llu (%llu MiB); ring spans %llu written / %llu kept / %llu expired; image descriptors %llu encoded / %llu copied; templates %llu (%llu MiB, %llu evicted)\n",
                  printed(heapDraws), printed(plainDraws), printed(heapDispatches), printed(plainDispatches), printed(heapBindsSeen),
                  printed(commandBuffers), binds.c_str(), fallbacks.c_str(), stageReasons.c_str(), printed(copies), printed(copiedMiB),
-                 printed(spansWritten), printed(spansKept), printed(spansExpired), printed(templates.entries), printed(templates.bytes >> 20u), printed(templates.evicted));
+                 printed(spansWritten), printed(spansKept), printed(spansExpired), printed(imageEncodes), printed(imageCopies), printed(templates.entries), printed(templates.bytes >> 20u), printed(templates.evicted));
 }
 
 void forgetHeapBinding(VkCommandBuffer commands) {
