@@ -6555,7 +6555,13 @@ void ShaderResources::patchHeapSlotWords(const CompiledShader& shader, const Hea
     for (const auto& word : program.heapSlotWords) {
         Require(word.dword < patched.size(), "a GPU-mode slot word lies outside the shader data");
         if (word.kind == static_cast<std::uint32_t>(Abi::Binding::Samplers)) {
-            Require(word.element < samplerSlots.size(), "a GPU-mode slot word names a sampler the stage does not bind");
+            if (word.element >= samplerSlots.size()) {
+                char text[256];
+                std::snprintf(text, sizeof(text),
+                              "AGC graphics: a GPU-mode slot word names a sampler the stage does not bind (stage %u, element %u, sampler slots %zu, bindings %zu)",
+                              static_cast<unsigned>(shader.stage), word.element, samplerSlots.size(), bindings.size());
+                throw std::runtime_error(text);
+            }
             patched[word.dword] = samplerSlots[word.element];
             continue;
         }
