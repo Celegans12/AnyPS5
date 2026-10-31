@@ -50,7 +50,7 @@ int main() {
         auto empty = Fixture();
         Io::WriteU64(empty, 112, 0);
         Require(Relinker::UnusedNidFilter::ReadExceptionFunctions(empty, {load, eh}, {}, {}).empty());
-        for (int kind = 0; kind < 11; ++kind) {
+        for (int kind = 0; kind < 12; ++kind) {
             auto bytes = Fixture(); auto segment = load;
             switch (kind) {
                 case 0: Io::WriteU32(bytes, 64, 0x1000); break;
@@ -77,6 +77,12 @@ int main() {
                     Io::WriteU32(bytes, 16, 0x107F0);
                     Io::WriteU32(bytes, 20, 0x4C);
                     Io::WriteU64(bytes, 104, 0x800);
+                    break;
+                }
+                case 11: {
+                    bytes[3] = 0x3B;
+                    Io::WriteU32(bytes, 96, 0x80000000);
+                    Io::WriteU32(bytes, 100, 0x80000000);
                     break;
                 }
             }
@@ -120,6 +126,16 @@ int main() {
             udata4Rejected = std::string(error.what()).find("unwind pointer address overflowed") != std::string::npos;
         }
         Require(udata4Rejected);
-        std::cout << "19 unwind record cases passed\n";
+        auto sdataOverflow = Fixture();
+        sdataOverflow[3] = 0x3B;
+        Io::WriteU32(sdataOverflow, 16, 0x1000);
+        Io::WriteU32(sdataOverflow, 20, 0x1000);
+        bool sdataRejected = false;
+        try { Relinker::UnusedNidFilter::ReadExceptionFunctions(sdataOverflow, {highLoad, highEh}, {}, {}); }
+        catch (const Domain::RelinkerException& error) {
+            sdataRejected = std::string(error.what()).find("unwind pointer address overflowed") != std::string::npos;
+        }
+        Require(sdataRejected);
+        std::cout << "20 unwind record cases passed\n";
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }
