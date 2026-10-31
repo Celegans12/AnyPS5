@@ -533,6 +533,11 @@ void DefineDescriptors(SpirvEmitterState& state) {
             if (!layout.UsesDataAddress()) {
                 state.shaderDataStorageVariable = Define(StorageBufferBlockType(state), "shader_data");
                 state.module.AddAnnotation(spv::OpDecorate, state.shaderDataStorageVariable, spv::DecorationNonWritable);
+            } else if (layout.ShaderDataDwords() != 0u && layout.ShaderDataDwords() <= state.heapDataUniformDwords) {
+                const auto vectors = (layout.ShaderDataDwords() + 3u) / 4u;
+                const auto array = state.module.DecoratedType(spv::OpTypeArray, {{spv::OpDecorate, {spv::DecorationArrayStride, 16u}}}, TypeU32Vector(state, 4), ConstantU32(state, vectors));
+                const auto block = state.module.DecoratedType(spv::OpTypeStruct, {{spv::OpDecorate, {spv::DecorationBlock}}, {spv::OpMemberDecorate, {0, spv::DecorationOffset, 0}}}, array);
+                state.shaderDataUniformVariable = Define(block, "shader_data", spv::StorageClassUniform);
             }
             break;
         case DescriptorBindingKind::FlattenedSrt:

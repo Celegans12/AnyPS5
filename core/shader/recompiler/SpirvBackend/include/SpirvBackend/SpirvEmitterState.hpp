@@ -112,6 +112,7 @@ struct SpirvEmitterState {
     std::uint32_t depthRemapClipIndex = 0;
     bool registrationModules = false;
     bool gpuResolvedImages = false;
+    std::uint32_t heapDataUniformDwords = 0;
     bool addressedBuffers = false;
     std::optional<bool> guestBuffersWritten;
     bool fragmentDescriptorSet = false;
@@ -213,6 +214,7 @@ struct SpirvEmitterState {
     std::uint32_t gdsLength = 0;
     std::uint32_t pushConstantVariable = 0;
     std::uint32_t shaderDataStorageVariable = 0;
+    std::uint32_t shaderDataUniformVariable = 0;
     std::unordered_map<std::uint32_t, std::uint32_t> heapSlotVariables;
     std::uint32_t flattenedSrtVariable = 0;
     bool flattenedSrtAddressed = false;

@@ -768,6 +768,7 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program)
     targetOptions.waveLdsMemoryBarriers = request.target.waveLdsMemoryBarriers;
     targetOptions.deviceScopeLdsMemoryBarriers = request.target.deviceScopeLdsMemoryBarriers;
     targetOptions.gpuResolvedImages = gpuMode;
+    targetOptions.heapDataUniformDwords = request.target.heapDataUniformDwords;
     targetOptions.ldsLockFences = request.target.ldsLockFences;
     targetOptions.meshWindowBuffer = request.target.meshWindowBuffer;
 

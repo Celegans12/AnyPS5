@@ -147,6 +147,31 @@ HeapSizes heapSizes(const VkPhysicalDeviceDescriptorHeapPropertiesEXT& propertie
 
 }
 
+namespace {
+
+struct ResourceRing {
+    VkDeviceSize offset = 0;
+    std::size_t bytes = 0;
+};
+
+ResourceRing resourceRing(const VkPhysicalDeviceDescriptorHeapPropertiesEXT& properties, VkDeviceSize uniformAlignment) {
+    static const bool disabled = std::getenv("APS5_NO_HEAP_DATA_UNIFORM") != nullptr;
+    if (disabled) return {};
+    const auto sizes = heapSizes(properties);
+    const auto offset = alignUp(sizes.resourceUsed + properties.minResourceHeapReservedRange, std::max<VkDeviceSize>(uniformAlignment, properties.resourceHeapAlignment));
+    if (offset >= properties.maxResourceHeapSize) return {};
+    const auto room = static_cast<std::size_t>(properties.maxResourceHeapSize - offset) / BindlessHeap::RingChunkBytes * BindlessHeap::RingChunkBytes;
+    const auto bytes = std::min(room, BindlessHeap::RingBytes);
+    if (bytes < 2u * BindlessHeap::RingChunkBytes) return {};
+    return {offset, bytes};
+}
+
+}
+
+bool BindlessHeap::RingInResourceHeap(const VkPhysicalDeviceDescriptorHeapPropertiesEXT& properties, VkDeviceSize uniformAlignment) {
+    return resourceRing(properties, uniformAlignment).bytes != 0u;
+}
+
 bool BindlessHeap::Fits(const VkPhysicalDeviceDescriptorHeapPropertiesEXT& properties) {
     const auto sizes = heapSizes(properties);
     const bool resourcesFit = sizes.resourceUsed + properties.minResourceHeapReservedRange <= properties.maxResourceHeapSize;
@@ -181,24 +206,39 @@ BindlessHeap::BindlessHeap(const Context& context) : context(context) {
     meshWindowHeapOffset = sizes.meshWindowOffset;
     samplerHeapUsed = sizes.samplerUsed;
     Require(Fits(heapProperties), "the GPU heap's slots exceed the device's descriptor heap sizes");
-    constexpr VkBufferUsageFlags heapUsage = VK_BUFFER_USAGE_DESCRIPTOR_HEAP_BIT_EXT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
-    resourceHeap = std::make_unique<Buffer>(
-        context, static_cast<std::size_t>(resourceHeapUsed + heapProperties.minResourceHeapReservedRange), heapUsage);
-    samplerHeap = std::make_unique<Buffer>(
-        context, static_cast<std::size_t>(samplerHeapUsed + heapProperties.minSamplerHeapReservedRangeWithEmbedded), heapUsage);
-    std::fill(resourceHeap->Bytes().begin(), resourceHeap->Bytes().end(), std::byte{0});
-    std::fill(samplerHeap->Bytes().begin(), samplerHeap->Bytes().end(), std::byte{0});
+    static const bool hostDescriptors = std::getenv("APS5_NO_HEAP_DEVICE_DESCRIPTORS") != nullptr;
+    constexpr VkMemoryPropertyFlags deviceVisible = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    const auto makeBuffer = [&](std::size_t bytes, VkBufferUsageFlags usage, bool deviceLocal) {
+        if (deviceLocal) {
+            try {
+                return std::make_unique<Buffer>(context, bytes, usage, deviceVisible);
+            } catch (const std::exception&) {
+            }
+        }
+        return std::make_unique<Buffer>(context, bytes, usage);
+    };
     constexpr VkBufferUsageFlags ringUsage =
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    try {
-        ring = std::make_unique<Buffer>(context, RingBytes, ringUsage,
-                                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    } catch (const std::exception&) {
-        ring = std::make_unique<Buffer>(context, RingBytes, ringUsage);
+    constexpr VkBufferUsageFlags heapUsage = VK_BUFFER_USAGE_DESCRIPTOR_HEAP_BIT_EXT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    const auto heapRing = resourceRing(heapProperties, context.limits.minUniformBufferOffsetAlignment);
+    ringInHeap = heapRing.bytes != 0u;
+    const auto resourceBytes = ringInHeap ? static_cast<std::size_t>(heapRing.offset) + heapRing.bytes
+                                          : static_cast<std::size_t>(resourceHeapUsed + heapProperties.minResourceHeapReservedRange);
+    resourceHeap = makeBuffer(resourceBytes, ringInHeap ? heapUsage | ringUsage : heapUsage, ringInHeap || !hostDescriptors);
+    samplerHeap = makeBuffer(static_cast<std::size_t>(samplerHeapUsed + heapProperties.minSamplerHeapReservedRangeWithEmbedded), heapUsage, !hostDescriptors);
+    std::fill(resourceHeap->Bytes().begin(), resourceHeap->Bytes().end(), std::byte{0});
+    std::fill(samplerHeap->Bytes().begin(), samplerHeap->Bytes().end(), std::byte{0});
+    if (ringInHeap) {
+        ringHeapOffset = heapRing.offset;
+        ringBytes = heapRing.bytes;
+        ringData = resourceHeap->Bytes().data() + ringHeapOffset;
+        ringAlignment = static_cast<std::uint32_t>(std::max<VkDeviceSize>({context.limits.minStorageBufferOffsetAlignment, context.limits.minUniformBufferOffsetAlignment, 16}));
+    } else {
+        ring = makeBuffer(RingBytes, ringUsage, true);
+        ringData = ring->Bytes().data();
+        ringAlignment = static_cast<std::uint32_t>(std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 16));
     }
-    ringAlignment = static_cast<std::uint32_t>(std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 16));
-    ringChunks.resize(RingBytes / RingChunkBytes);
+    ringChunks.resize(ringBytes / RingChunkBytes);
     nextTextureSlot = SamplerKind;
     slotCap = configuredSlotCap();
 }
@@ -695,11 +735,11 @@ bool BindlessHeap::Held(const SpanMark& mark) {
 }
 
 BindlessHeap::DataSpan BindlessHeap::Allocate(std::size_t words, SpanMark& mark) {
-    const auto bytes = words * sizeof(std::uint32_t);
+    const auto bytes = ringInHeap ? (words * sizeof(std::uint32_t) + 15u) / 16u * 16u : words * sizeof(std::uint32_t);
     if (bytes > RingChunkBytes) throw std::runtime_error("AGC bindless heap: per-draw data exceeds a ring chunk");
     std::lock_guard lock(mutex);
     auto offset = (ringCursor + ringAlignment - 1) / ringAlignment * ringAlignment;
-    if (offset + bytes > RingBytes) {
+    if (offset + bytes > ringBytes) {
         offset = 0;
         ++counts.ringWraps;
     }
@@ -713,7 +753,7 @@ BindlessHeap::DataSpan BindlessHeap::Allocate(std::size_t words, SpanMark& mark)
     for (std::size_t skipped = 0; keptAhead(); ++skipped) {
         if (skipped == ringChunks.size()) throw std::runtime_error("AGC bindless heap: one batch's shader data exceeds its ring");
         offset = (offset / RingChunkBytes + 1u) * RingChunkBytes;
-        if (offset + bytes > RingBytes) {
+        if (offset + bytes > ringBytes) {
             offset = 0;
             ++counts.ringWraps;
         }
@@ -721,7 +761,7 @@ BindlessHeap::DataSpan BindlessHeap::Allocate(std::size_t words, SpanMark& mark)
     }
     ringCursor = offset + bytes;
     for (auto chunk = offset / RingChunkBytes; chunk <= lastChunk(); ++chunk) enterChunk(ringChunks, chunk, ringChunk, "shader data");
-    auto* base = reinterpret_cast<std::uint32_t*>(ring->Bytes().data() + offset);
+    auto* base = reinterpret_cast<std::uint32_t*>(ringData + offset);
     ++counts.spansWritten;
     spansWrittenWindow.fetch_add(1, std::memory_order_relaxed);
     mark = {static_cast<std::uint32_t>(offset), static_cast<std::uint32_t>(words), ringChunks[offset / RingChunkBytes].entries};
@@ -806,6 +846,7 @@ struct HeapBindingUse {
     bool faultMemory = false;
     bool pixelLdsMemory = false;
     bool meshWindowMemory = false;
+    std::vector<std::uint32_t> dataUniforms;
     std::pair<std::uint32_t, std::uint32_t> refused{~0u, ~0u};
 };
 
@@ -859,6 +900,10 @@ bool heapBindings(std::span<const std::uint32_t> spirv, const HeapBindingRoots& 
         }
         if (roots.meshWindow && !use.meshWindowMemory && set == ShaderRecompiler::MeshWindowDescriptorSet && binding == 0u) {
             use.meshWindowMemory = true;
+            continue;
+        }
+        if (set == Abi::GpuDataSet && binding % bindingCount == static_cast<std::uint32_t>(Abi::Binding::ShaderData) && binding / bindingCount < Abi::StageCount) {
+            use.dataUniforms.push_back(binding);
             continue;
         }
         const bool heapImageOrSampler = set == Abi::FragmentDescriptorSet && binding >= firstImage && binding <= samplers;
@@ -943,6 +988,21 @@ bool BindlessHeap::DescriptorHeapMappings(std::span<const std::uint32_t> spirv, 
             mappings.push_back(
                 heapMapping(Abi::FragmentDescriptorSet, binding, VK_SPIRV_RESOURCE_TYPE_SAMPLER_BIT_EXT, 0, samplerHeapStride));
         else mappings.push_back(heapMapping(Abi::FragmentDescriptorSet, binding, imageResources, 0, imageHeapStride));
+    }
+    if (!use.dataUniforms.empty() && !ringInHeap) {
+        mappings.clear();
+        return false;
+    }
+    for (const auto binding : use.dataUniforms) {
+        VkDescriptorSetAndBindingMappingEXT mapping{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_AND_BINDING_MAPPING_EXT};
+        mapping.descriptorSet = Abi::GpuDataSet;
+        mapping.firstBinding = binding;
+        mapping.bindingCount = 1;
+        mapping.resourceMask = VK_SPIRV_RESOURCE_TYPE_UNIFORM_BUFFER_BIT_EXT;
+        mapping.source = VK_DESCRIPTOR_MAPPING_SOURCE_RESOURCE_HEAP_DATA_EXT;
+        mapping.sourceData.heapData.heapOffset = static_cast<std::uint32_t>(ringHeapOffset);
+        mapping.sourceData.heapData.pushOffset = rootAddressOffset(Abi::RootStageDword(static_cast<Abi::Stage>(binding / bindingCount), Abi::RootStageField::ShaderData));
+        mappings.push_back(mapping);
     }
     if (use.workgroupMemory)
         mappings.push_back(pushAddressMapping(ShaderRecompiler::GpuWorkgroupMemoryDescriptorSet, 0, workgroupAddressOffset));
@@ -1155,7 +1215,7 @@ void BindlessHeap::BindDescriptorHeaps(VkCommandBuffer commands) const {
     heapBinds.fetch_add(1, std::memory_order_relaxed);
     heapBindWindow.fetch_add(1, std::memory_order_relaxed);
     VkBindHeapInfoEXT info{VK_STRUCTURE_TYPE_BIND_HEAP_INFO_EXT};
-    info.heapRange = {resourceHeap->DeviceAddress(), resourceHeapUsed + context.descriptorHeapProperties.minResourceHeapReservedRange};
+    info.heapRange = {resourceHeap->DeviceAddress(), ringInHeap ? ringHeapOffset + ringBytes : resourceHeapUsed + context.descriptorHeapProperties.minResourceHeapReservedRange};
     info.reservedRangeOffset = resourceHeapUsed;
     info.reservedRangeSize = context.descriptorHeapProperties.minResourceHeapReservedRange;
     context.Function<PFN_vkCmdBindResourceHeapEXT>("vkCmdBindResourceHeapEXT")(commands, &info);
@@ -1167,11 +1227,15 @@ void BindlessHeap::BindDescriptorHeaps(VkCommandBuffer commands) const {
 }
 
 VkDeviceAddress BindlessHeap::RingAddress() const {
-    return ring->DeviceAddress();
+    return ringInHeap ? resourceHeap->DeviceAddress() + ringHeapOffset : ring->DeviceAddress();
 }
 
 VkBuffer BindlessHeap::RingBuffer() const {
-    return ring->Handle();
+    return ringInHeap ? resourceHeap->Handle() : ring->Handle();
+}
+
+VkDeviceSize BindlessHeap::RingOffset() const {
+    return ringInHeap ? ringHeapOffset : 0;
 }
 
 void BindlessHeap::Submitted(Recorder& recorder, std::uint64_t serial) {

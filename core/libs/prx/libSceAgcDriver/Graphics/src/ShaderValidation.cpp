@@ -612,6 +612,12 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
             } else {
                 Require(binding->count != 0u && binding->count <= capacity && count != module.constants.end() && count->second == binding->count, "typed heap array length disagrees with compact binding");
             }
+        } else if (variable.storage == spv::StorageClassUniform) {
+            namespace Abi = ShaderRecompiler::RuntimeAbi;
+            constexpr auto bindingCount = static_cast<std::uint32_t>(Abi::Binding::Count);
+            Require(shader.dataAddressPush && decoration.set && decoration.binding && *decoration.set == Abi::GpuDataSet &&
+                        *decoration.binding % bindingCount == static_cast<std::uint32_t>(Abi::Binding::ShaderData),
+                    "a uniform buffer is only the GPU heap's shader data");
         } else {
             Require(variable.storage == spv::StorageClassStorageBuffer && decoration.set && decoration.binding, "unsupported or unbound shader resource");
             const auto key = std::make_pair(*decoration.set, *decoration.binding);

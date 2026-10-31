@@ -360,6 +360,7 @@ private:
         append(key, value.deviceScopeLdsMemoryBarriers);
         append(key, value.gpuResolvedImages);
         append(key, value.descriptorMemory);
+        append(key, value.heapDataUniformDwords);
         append(key, value.ldsLockFences);
         append(key, value.meshWindowBuffer);
     }

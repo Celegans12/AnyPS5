@@ -152,7 +152,7 @@ void ringSpans(const Context& context) {
     BindlessHeap::SpanMark first;
     const auto span = heap.Allocate(16u, first);
     require(first.offset == span.offset && first.words == 16u && heap.Held(first), "a span written in the open chunk is held");
-    constexpr std::size_t chunkWords = (4u << 20u) / sizeof(std::uint32_t);
+    constexpr std::size_t chunkWords = AgcDriver::Graphics::BindlessHeap::RingChunkBytes / sizeof(std::uint32_t);
     BindlessHeap::SpanMark filler;
     static_cast<void>(heap.Allocate(chunkWords - 1024u, filler));
     BindlessHeap::SpanMark crossing;
@@ -173,7 +173,7 @@ void ringSpans(const Context& context) {
         while (heap.Statistics().ringWraps == wraps) last = heap.Allocate(chunkWords, fill);
         return last.offset;
     };
-    require(untilWrap() == (4u << 20u), "the ring skips a chunk a later batch still reads kept spans from");
+    require(untilWrap() == AgcDriver::Graphics::BindlessHeap::RingChunkBytes, "the ring skips a chunk a later batch still reads kept spans from");
     require(heap.Held(first), "the skipped chunk's kept span is still held");
     require(heap.Statistics().keptChunksSkipped == 1u, "one kept chunk skipped");
     heap.Submitted(recorder, 0u);

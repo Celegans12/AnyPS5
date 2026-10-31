@@ -110,6 +110,16 @@ std::uint32_t EmitStageRingWordPointer(SpirvEmitterState& state, RuntimeAbi::Roo
 namespace {
 
 std::uint32_t dataAddressLoad(SpirvEmitterState& state, RuntimeAbi::RootStageField field, std::uint32_t index) {
+    if (field == RuntimeAbi::RootStageField::ShaderData && state.shaderDataUniformVariable != 0u) {
+        const auto u32 = TypeU32(state);
+        const auto vector = Binary(state, spv::OpShiftRightLogical, u32, index, ConstantU32(state, 2u));
+        const auto component = Binary(state, spv::OpBitwiseAnd, u32, index, ConstantU32(state, 3u));
+        const auto element = state.module.AllocateId();
+        state.module.AddFunction(spv::OpAccessChain, TypePointer(state, spv::StorageClassUniform, u32), element, state.shaderDataUniformVariable, ConstantU32(state, 0u), vector, component);
+        const auto value = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, u32, value, element);
+        return value;
+    }
     const auto pointer = EmitStageRingWordPointer(state, field, index);
     const auto value = state.module.AllocateId();
     state.module.AddFunction(spv::OpLoad, TypeU32(state), value, pointer, spv::MemoryAccessAlignedMask, 4u);

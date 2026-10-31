@@ -6199,7 +6199,8 @@ std::size_t DataOffsetIndex(std::size_t stage, ShaderRecompiler::RuntimeAbi::Bin
 std::pair<VkBuffer, VkDeviceSize> ShaderResources::shaderDataLocation(const CompiledShader& shader, const DrawBindings* rewritten) const {
     if (!heapStage || shader.program == nullptr || !shader.program->gpuResolvedImages) return {shaderDataBuffer(shader), 0};
     const auto& offsets = rewritten != nullptr && rewritten->addressOffsets ? rewritten->heapOffsets : heapOffsets;
-    return {BindlessHeap::For(context).RingBuffer(), offsets[DataOffsetIndex(HeapStageIndex(shader.stage), ShaderRecompiler::RuntimeAbi::Binding::ShaderData)]};
+    const auto& heap = BindlessHeap::For(context);
+    return {heap.RingBuffer(), heap.RingOffset() + offsets[DataOffsetIndex(HeapStageIndex(shader.stage), ShaderRecompiler::RuntimeAbi::Binding::ShaderData)]};
 }
 
 void ShaderResources::PatchDataAddresses(std::span<std::byte, PipelinePushConstantBytes> bytes, std::span<const CompiledShader> shaders, const DrawBindings* rewritten) const {

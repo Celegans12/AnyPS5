@@ -537,6 +537,7 @@ struct VulkanDevice::State {
     std::unique_ptr<Graphics::TextureDetiler> detiler;
     bool descriptorHeap = false;
     VkPhysicalDeviceDescriptorHeapPropertiesEXT descriptorHeapProperties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_PROPERTIES_EXT};
+    std::uint32_t heapDataUniformDwords = 0;
     std::unique_ptr<Graphics::Recorder> recorder;
     // Device-local buffers of a repeated 16-byte fill pattern (FillBuffer), most recently used
     // last; each is filled once by a doubling chain in device memory.
@@ -1947,6 +1948,8 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         if (descriptorHeapFeatures.descriptorHeap == VK_TRUE && heapMaintenance5.maintenance5 == VK_TRUE && Graphics::BindlessHeap::Fits(state->descriptorHeapProperties)) {
             state->descriptorHeap = true;
             state->maintenance5 = true;
+            if (Graphics::BindlessHeap::RingInResourceHeap(state->descriptorHeapProperties, state->properties.limits.minUniformBufferOffsetAlignment))
+                state->heapDataUniformDwords = std::min<std::uint32_t>(16384u, state->properties.limits.maxUniformBufferRange / 4u);
             deviceExtensions.push_back(VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME);
             for (const char* required : {VK_KHR_MAINTENANCE_5_EXTENSION_NAME, VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME, VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME, VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME}) {
                 if (std::find_if(deviceExtensions.begin(), deviceExtensions.end(), [&](const char* name) { return std::strcmp(name, required) == 0; }) == deviceExtensions.end()) deviceExtensions.push_back(required);
@@ -4143,6 +4146,7 @@ ShaderRecompiler::SpirvTarget VulkanDevice::Target() const {
     target.fusedExactArithmetic = state->fusedExactArithmetic;
     target.float32DenormPreserve = state->float32DenormPreserve;
     target.descriptorMemory = Graphics::DescriptorHeapEnabled();
+    target.heapDataUniformDwords = target.descriptorMemory ? state->heapDataUniformDwords : 0u;
     return target;
 }
 
@@ -5364,7 +5368,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         Graphics::Recorder::CountMerged(CommandClass::DispatchLeading);
     } else {
         const auto timing = recorder.BeginGpuTiming(CommandClass::DispatchLeading);
-        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
         Graphics::Recorder::CountBarriers(CommandClass::DispatchLeading);
         recorder.EndGpuTiming(timing);
         ++d.preBarriersRecorded;
