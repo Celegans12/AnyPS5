@@ -1,4 +1,4 @@
-add_library(libSceNKWebKit SHARED EXCLUDE_FROM_ALL Export.cpp DateParsing.cpp)
+add_library(libSceNKWebKit SHARED EXCLUDE_FROM_ALL Export.cpp DateParsing.cpp CharactersToNumber.cpp)
 target_include_directories(libSceNKWebKit PRIVATE ${LIBS_INCLUDE_DIR})
 configure_windows_unwind(libSceNKWebKit)
 
@@ -11,6 +11,17 @@ if(BUILD_TESTING)
     set_tests_properties(guest_nkwebkit_dates PROPERTIES TIMEOUT 20)
     if(WIN32)
         set_tests_properties(guest_nkwebkit_dates PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceNKWebKit>")
+    endif()
+
+    add_test_executable(guest_nkwebkit_numbers_tests ${LIBS_INCLUDE_DIR}/tests/GuestNKWebKitNumbers.cpp)
+    target_include_directories(guest_nkwebkit_numbers_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_nkwebkit_numbers_tests PRIVATE libSceNKWebKit libc)
+    configure_windows_unwind(guest_nkwebkit_numbers_tests)
+    add_test(NAME guest_nkwebkit_numbers COMMAND guest_nkwebkit_numbers_tests)
+    set_tests_properties(guest_nkwebkit_numbers PROPERTIES TIMEOUT 20)
+    if(WIN32)
+        set_tests_properties(guest_nkwebkit_numbers PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceNKWebKit>")
     endif()
 endif()

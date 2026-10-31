@@ -4,7 +4,20 @@
 
 - [ICU export availability](../../../core/libs/prx/libSceIcu/Unescape.cpp) across firmware versions remains unproven. The [PS5 3.20 inventory](https://github.com/DNNDHH/PS5-3.20_Libs/blob/b2a77c09cd71c01f34c790cfbe98c751a13262ad/libSceIcu.c) includes the implemented escape, invariant-character and version helpers. [BunnyFl’s firmware 13.42 report](https://github.com/boykopovar/AnyPS5/pull/10961#issuecomment-6400071863) records `u_getVersion` returning `78.1.0.0` under an emulator, but neither escape function is in the checked native `system_ex/common_ex/lib/libSceIcu.sprx` export table. Only 104 of the 661 inventory NIDs appear among that module’s 299 exports. The exports for compatibility with older firmware are retained; availability and routing across firmware versions remain unproven.
 
+### Older dispatch exports
+
+- [Older dispatch exports](../../../core/libs/prx/libSceIcu/Export.cpp) - Four 3.20 callable NIDs are declared as throwing placeholders. Their signatures and behavior are unverified. The four selector wrappers have identical instruction bytes in the 3.20 and later version-labelled modules, and corresponding consumer switch cases call them. Their NIDs and internal layouts differ; no forwarding or binary compatibility is claimed. Later image version metadata does not authenticate a retail firmware release.
+
+| 3.20 NID | Later candidate NID | Selector |
+| --- | --- | --- |
+| `BufsAiaX0+s` | `3lVihhFbXus` | 0 |
+| `xdF5zg0V5Oc` | `HFkUTLyJkZ0` | 1 |
+| `Con4H1SB3nw` | `jXOj7dZh7RQ` | 2 |
+| `lME28PLmu54` | `bxjI++g9NkE` | 3 |
+
 ### Functional
+
+- [Older callable exports](../../../core/libs/prx/libSceIcu/LegacyExports.cpp) - 2347 3.20 callable NIDs have unidentified names and are declared as throwing placeholders. Their signatures and behavior are unverified; no ICU functionality is implemented. These NIDs do not appear in the later version-labelled module inventory; no cross-version identity or compatibility is claimed.
 
 - [UTF-8 macro helpers](../../../core/libs/prx/libSceIcu/Utf8.cpp) have no console ABI or behavior verification. Their names and NIDs are in the [PS5 3.20 inventory](https://github.com/DNNDHH/PS5-3.20_Libs/blob/b2a77c09cd71c01f34c790cfbe98c751a13262ad/libSceIcu.c); behavior follows ICU 78.1 [utf_impl.cpp](https://github.com/unicode-org/icu/blob/049e0d6a420629ac7db77256987d083a563287b5/icu4c/source/common/utf_impl.cpp). These are macro bodies, not complete UTF-8 operations: append encodes ASCII with two bytes, and null-error-pointer failures write the legacy length-dependent error characters. Null index pointers, negative positions, reversed bounds, overflowing index or capacity arithmetic, and null buffers when accessed throw instead of reproducing undefined behavior. Negative forward lengths denote NUL-terminated input. Cross-firmware export availability and native behavior outside the macros' preconditions remain unverified.
 
