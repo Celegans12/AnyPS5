@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BindlessHeap.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DeviceImageTable.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -27,6 +28,7 @@
 #include <exception>
 #include <initializer_list>
 #include <iostream>
+#include <mutex>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -37,6 +39,7 @@ namespace {
 using AgcDriver::Graphics::DeviceImageTable;
 using SamplerWords = std::array<std::uint32_t, 4>;
 using Texel = std::array<float, 4>;
+namespace Abi = ShaderRecompiler::DeviceImageTableAbi;
 
 constexpr std::size_t BlockBytes = 0x10000;
 constexpr std::size_t ImagesOffset = 0x1000;
@@ -44,6 +47,7 @@ constexpr std::size_t SamplersOffset = 0x2000;
 constexpr std::size_t OtherSamplersOffset = 0x3000;
 constexpr std::size_t SrtOffset = 0x4000;
 constexpr std::size_t OutputsOffset = 0x5000;
+constexpr std::size_t SamplerPointerOffset = 0x6000;
 constexpr std::uint32_t ImageEntries = 2;
 constexpr std::uint32_t SamplerEntries = 2;
 constexpr SamplerWords PointClamp{0x92u, (4u * 256u) << 12u, 0u, 0u};
@@ -61,6 +65,14 @@ alignas(256) constexpr std::array<std::uint32_t, 22> TableCode{
 alignas(256) constexpr std::array<std::uint32_t, 15> DirectCode{
     0x7e0002ffu, 0x3f900000u, 0x7e0202ffu, 0x3e000000u,
     0xf40c0500u, 0xfa000020u, 0xf4080700u, 0xfa000040u, 0xbf8cc07fu,
+    0xf09c0f08u, 0x00e50000u, 0xbf8c0000u, 0xe0780000u, 0x80010000u, 0xbf810000u,
+};
+
+alignas(256) constexpr std::array<std::uint32_t, 26> RuntimeAddressCode{
+    0x7e0002ffu, 0x3f900000u, 0x7e0202ffu, 0x3e000000u,
+    0xf4080200u, 0xfa000000u, 0xf4080300u, 0xfa000010u, 0xbf8cc07fu,
+    0x8f108502u, 0xf42c0504u, 0x20000000u, 0xe0340000u, 0x80030200u, 0xbf8c0000u,
+    0x7e240502u, 0x7e260503u, 0xf4080709u, 0xfa000000u, 0xbf8cc07fu,
     0xf09c0f08u, 0x00e50000u, 0xbf8c0000u, 0xe0780000u, 0x80010000u, 0xbf810000u,
 };
 
@@ -109,6 +121,7 @@ public:
     std::uint32_t* OtherSamplers() const { return reinterpret_cast<std::uint32_t*>(block + OtherSamplersOffset); }
     std::uint32_t* Srt() const { return reinterpret_cast<std::uint32_t*>(block + SrtOffset); }
     float* Output(std::size_t index) const { return reinterpret_cast<float*>(block + OutputsOffset) + index * 4u; }
+    std::uint32_t* SamplerPointer() const { return reinterpret_cast<std::uint32_t*>(block + SamplerPointerOffset); }
 
 private:
     std::uint8_t* block = nullptr;
@@ -151,6 +164,7 @@ struct Header {
 
 alignas(8) Header TableHeader{};
 alignas(8) Header DirectHeader{};
+alignas(8) Header RuntimeAddressHeader{};
 
 void Register(Header& header, std::span<const std::uint32_t> code) {
     header.shader.file_header = 0x34333231u;
@@ -202,6 +216,8 @@ struct Counts {
     std::uint64_t tables = 0;
     std::uint64_t prepares = 0;
     std::uint64_t expectedInserted = 0;
+    std::uint64_t inserted = 0;
+    std::uint64_t entries = 0;
     std::uint64_t misses = 0;
     std::uint64_t fallbacks = 0;
     std::uint64_t faults = 0;
@@ -215,6 +231,8 @@ Counts ReadCounts() {
     for (const auto& table : tables) {
         result.prepares += table.prepares;
         result.expectedInserted += table.expectedInserted;
+        result.inserted += table.inserted;
+        result.entries += table.entries;
         result.misses += table.drained;
         result.fallbacks += table.fallbacks;
         result.faults += table.faults;
@@ -224,7 +242,7 @@ Counts ReadCounts() {
 
 std::string Describe(const Counts& before, const Counts& after) {
     return " (heap binds " + std::to_string(after.heapBinds - before.heapBinds) + ", prepares " + std::to_string(after.prepares - before.prepares) +
-           ", expected inserts " + std::to_string(after.expectedInserted - before.expectedInserted) + ", misses " + std::to_string(after.misses - before.misses) +
+           ", expected inserts " + std::to_string(after.expectedInserted - before.expectedInserted) + ", inserts " + std::to_string(after.inserted - before.inserted) + ", misses " + std::to_string(after.misses - before.misses) +
            ", fallbacks " + std::to_string(after.fallbacks - before.fallbacks) + ", faults " + std::to_string(after.faults - before.faults) + ")";
 }
 
@@ -282,9 +300,88 @@ void CheckSamplers(const GuestBlock& block, bool devicePath) {
                 devicePath ? "the device table" : "the CPU table map", Describe(before, after).c_str());
 }
 
+std::vector<DeviceImageTable::Key> ResolvedKeys() {
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    const auto* recorder = AgcDriver::Graphics::Recorder::Active();
+    Require(recorder != nullptr, "runtime sampler keys have no active recorder");
+    AgcDriver::Graphics::Context context{};
+    context.device = recorder->Device();
+    const auto* table = DeviceImageTable::Existing(context);
+    Require(table != nullptr, "runtime sampler keys have no device image table");
+    const auto words = table->KeyWords();
+    Require(words.size() % Abi::BucketWords == 0u, "the runtime sampler key table has a partial bucket");
+    std::vector<DeviceImageTable::Key> keys;
+    for (std::size_t offset = 0; offset < words.size(); offset += Abi::BucketWords) {
+        if (words[offset + Abi::StateWord] != Abi::LiveState) continue;
+        DeviceImageTable::Key key{};
+        std::copy_n(words.begin() + offset, Abi::KeyWords, key.begin());
+        keys.push_back(key);
+    }
+    return keys;
 }
 
-int main() {
+void SetSamplerPointer(const GuestBlock& block, const std::uint32_t* sampler) {
+    const auto address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(sampler));
+    block.SamplerPointer()[0] = static_cast<std::uint32_t>(address);
+    block.SamplerPointer()[1] = static_cast<std::uint32_t>(address >> 32u);
+}
+
+void CheckRuntimeSamplers(const GuestBlock& block) {
+    Require(DeviceImageTable::KeepsUnexpectedPrograms(), "runtime sampler addresses need APS5_KEEP_UNEXPECTED_DEVICE_IMAGES");
+    std::copy(PointClamp.begin(), PointClamp.end(), block.Srt() + 16u);
+    const auto directClamp = Sample(block, DirectCode.data(), 0u, 0u, 0u);
+    std::copy(PointRepeat.begin(), PointRepeat.end(), block.Srt() + 16u);
+    const auto directRepeat = Sample(block, DirectCode.data(), 0u, 0u, 1u);
+    RequireTexel(directClamp, ClampTexel, "runtime-address direct clamp-to-edge control");
+    RequireTexel(directRepeat, RepeatTexel, "runtime-address direct repeat control");
+    Require(directClamp != directRepeat, "runtime-address direct controls did not distinguish sampler addressing modes");
+    const auto pointerBuffer = Buffer(block.SamplerPointer(), 2u * sizeof(std::uint32_t));
+    std::copy(pointerBuffer.begin(), pointerBuffer.end(), block.Srt() + 4u);
+    const auto initial = ReadCounts();
+    Require(initial.entries == 0u, "runtime sampler addresses require a table with no warmed image keys");
+    std::size_t output = 2u;
+    const auto sample = [&](const Texel& expected, bool cold, bool resolves, const std::string& what) {
+        const auto before = ReadCounts();
+        const auto actual = Sample(block, RuntimeAddressCode.data(), 1u, 0u, output++);
+        const auto after = ReadCounts();
+        const auto detail = Describe(before, after);
+        Require(after.tables == 1u && after.heapBinds > before.heapBinds && after.prepares > before.prepares, what + " did not bind the descriptor heap and prepare its device image table" + detail);
+        Require(after.expectedInserted == before.expectedInserted, what + " inserted a host expectation for a GPU-loaded sampler address" + detail);
+        Require(after.misses == before.misses + (cold ? 1u : 0u) && after.inserted == before.inserted + (resolves ? 1u : 0u), what + " did not record or resolve exactly its own new sampler key" + detail);
+        Require(after.fallbacks == before.fallbacks && after.faults == before.faults, what + " faulted or fell back" + detail);
+        RequireTexel(actual, expected, what);
+    };
+    SetSamplerPointer(block, block.Samplers());
+    sample({}, true, false, "cold runtime clamp address");
+    sample(directClamp, false, true, "settled runtime clamp address");
+    SetSamplerPointer(block, block.Samplers() + 4u);
+    sample({}, true, false, "cold runtime repeat address");
+    sample(directRepeat, false, true, "settled runtime repeat address");
+    const auto keys = ResolvedKeys();
+    Require(keys.size() == 2u && std::equal(keys[0].begin(), keys[0].begin() + Abi::SamplerWord, keys[1].begin()), "the two settled runtime keys differ in their image, interface or sampler class");
+    const auto descriptor = Image(block.Texture());
+    for (const auto& key : keys) {
+        Require(std::equal(descriptor.begin(), descriptor.end(), key.begin()) && (key[Abi::SamplerClassWord] & Abi::RuntimeSampler) != 0u, "a settled runtime sampler key changed the fixed image or lacks the runtime sampler class");
+    }
+    const auto hasSampler = [&](const SamplerWords& words) {
+        return std::any_of(keys.begin(), keys.end(), [&](const auto& key) { return std::equal(words.begin(), words.end(), key.begin() + Abi::SamplerWord); });
+    };
+    Require(hasSampler(PointClamp) && hasSampler(PointRepeat), "the two settled runtime keys do not contain the four raw clamp and repeat S# words");
+    SetSamplerPointer(block, block.Samplers());
+    sample(directClamp, false, false, "runtime address A before mutation");
+    std::copy(PointRepeat.begin(), PointRepeat.end(), block.Samplers());
+    sample(directRepeat, false, false, "runtime address A after changing only its S# words to B");
+    SetSamplerPointer(block, block.OtherSamplers());
+    sample(directClamp, false, false, "runtime pointer relocated to a separate A descriptor");
+    const auto after = ReadCounts();
+    Require(after.entries == 2u && after.inserted == initial.inserted + 2u && after.misses == initial.misses + 2u, "runtime sampler mutation or pointer relocation introduced extra keys or misses" + Describe(initial, after));
+    std::printf("runtime sampler addresses: two cold keys, exact settled clamp/repeat and A/B/A mutation colors%s\n", Describe(initial, after).c_str());
+}
+
+}
+
+int main(int argc, char** argv) {
+    const bool runtimeAddress = argc > 1 && std::string(argv[1]) == "--runtime-address";
 #ifdef _WIN32
     _putenv_s("APS5_EAGER_WRITEBACK", "1");
 #else
@@ -307,11 +404,20 @@ int main() {
             std::puts("skipped, descriptor heap features, limits or validation policy do not permit the device image path; see the device diagnostics");
             return VulkanTestSkipped;
         }
+        if (runtimeAddress && !devicePath) {
+            std::puts("skipped, runtime sampler addresses require the enabled and supported device image path");
+            return VulkanTestSkipped;
+        }
         GuestBlock block;
         FillGuest(block);
         Register(DirectHeader, DirectCode);
-        Register(TableHeader, TableCode);
-        CheckSamplers(block, devicePath);
+        if (runtimeAddress) {
+            Register(RuntimeAddressHeader, RuntimeAddressCode);
+            CheckRuntimeSamplers(block);
+        } else {
+            Register(TableHeader, TableCode);
+            CheckSamplers(block, devicePath);
+        }
         AgcDriverShutdown_nid_postfix();
         std::puts("device image sampler tests passed");
         return 0;
