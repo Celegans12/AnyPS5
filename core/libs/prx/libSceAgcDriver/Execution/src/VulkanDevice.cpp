@@ -23,6 +23,7 @@
 #include "prx/libSceAgcDriver/Execution/include/DeviceFault.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FragmentBarycentric.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Float32FlushControl.hpp"
+#include "prx/libSceAgcDriver/Execution/include/DescriptorHeapVersions.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PipelineLinkOptimization.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DrawInputsInPlace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/SubgroupBarrier.hpp"
@@ -1977,13 +1978,13 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     }
     VkPhysicalDeviceDescriptorHeapFeaturesEXT descriptorHeapFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_FEATURES_EXT};
     const auto heapExtension = std::find_if(availableExtensions.begin(), availableExtensions.end(), [](const auto& item) { return std::strcmp(item.extensionName, VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME) == 0; });
-    bool releasedDescriptorHeap = heapExtension != availableExtensions.end() && heapExtension->specVersion >= VK_EXT_DESCRIPTOR_HEAP_SPEC_VERSION;
+    bool releasedDescriptorHeap = heapExtension != availableExtensions.end() && DescriptorHeapVersionsSupported(heapExtension->specVersion);
     if (Graphics::GpuHeapEnabled() && heapExtension != availableExtensions.end() && !releasedDescriptorHeap)
         std::fprintf(stderr, "[gpu-heap] the driver's VK_EXT_descriptor_heap is revision %u, older than the released revision %u, so the GPU heap stays off\n",
                      heapExtension->specVersion, static_cast<unsigned>(VK_EXT_DESCRIPTOR_HEAP_SPEC_VERSION));
     if (Graphics::GpuHeapEnabled() && releasedDescriptorHeap && hasExtension(VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME)) {
         const auto validationVersion = ActiveValidationLayerVersion(state->instanceProc);
-        if (validationVersion.has_value() && *validationVersion < VK_MAKE_API_VERSION(0, 1, 4, 363)) {
+        if (validationVersion.has_value() && !DescriptorHeapVersionsSupported(heapExtension->specVersion, validationVersion)) {
             std::fprintf(stderr, "[gpu-heap] VK_LAYER_KHRONOS_validation %u.%u.%u predates its descriptor heap rules (1.4.363 is the oldest layer that validates heap push data), so the GPU heap stays off\n",
                          VK_API_VERSION_MAJOR(*validationVersion), VK_API_VERSION_MINOR(*validationVersion), VK_API_VERSION_PATCH(*validationVersion));
             releasedDescriptorHeap = false;
@@ -4197,10 +4198,29 @@ void VulkanDevice::NoteDeviceImageProgram(const ShaderRecompiler::RecompileResul
     if (auto* table = Graphics::DeviceImageTable::Existing(state->context)) table->NoteProgram(result.Identity(), codeAddress);
 }
 
-std::optional<std::string> VulkanDevice::ExpectDeviceImages(std::span<const ShaderRecompiler::DeviceImageTableAbi::Expectation> images) const {
+std::optional<std::string> VulkanDevice::ExpectDeviceImages(std::span<const ShaderRecompiler::DeviceImageTableAbi::Expectation> images, bool unexpected) const {
     auto* table = Graphics::DeviceImageTable::Existing(state->context);
     require(table != nullptr && state->recorder != nullptr, "expected device images need the device's table and its recorder");
-    return table->Expect(graphicsContext(), *state->recorder, images);
+    auto unserved = table->Expect(graphicsContext(), *state->recorder, images);
+    if (unexpected) table->NoteUnexpectedBatch(*state->recorder);
+    return unserved;
+}
+
+void VulkanDevice::SettleDeviceImageMisses() const {
+    if (!state->deviceImagePath || !Graphics::DeviceImageTable::KeepsUnexpectedPrograms() || state->recorder == nullptr) return;
+    auto* table = Graphics::DeviceImageTable::Existing(state->context);
+    if (table == nullptr) return;
+    std::uint64_t serial = 0;
+    {
+        std::lock_guard lock(GuestMemory::GpuMutex());
+        serial = table->UnexpectedSerial(*state->recorder);
+        if (serial != 0u && !state->recorder->HasTimeline()) state->recorder->Sync();
+    }
+    if (serial == 0u) return;
+    if (state->recorder->HasTimeline()) state->recorder->WaitSerial(serial);
+    std::lock_guard lock(GuestMemory::GpuMutex());
+    if (state->recorder->HasTimeline()) state->recorder->FinishUpTo(serial);
+    table->Settle(graphicsContext(), *state->recorder);
 }
 
 void VulkanDevice::FallBackDeviceImages(const ShaderRecompiler::RecompileResult& result, std::uint64_t codeAddress, const std::string& reason) const {
