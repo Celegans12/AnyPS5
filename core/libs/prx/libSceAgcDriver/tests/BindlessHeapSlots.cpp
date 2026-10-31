@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BindlessHeap.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DescriptorHeapObjects.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
@@ -101,6 +102,30 @@ void viewSlots(const Context& context, VkImageView view) {
     heap.ReleaseViewSlots(&second);
 }
 
+void encodedViews(const Context& context) {
+    BindlessHeap heap(context);
+    const auto base = heap.Statistics();
+    const auto encodes = [&] { return heap.Statistics().encodes - base.encodes; };
+    const auto copies = [&] { return heap.Statistics().encodedCopies - base.encodedCopies; };
+    VkImageView destroyed = VK_NULL_HANDLE;
+    const auto storageKey = static_cast<std::uint32_t>(VK_IMAGE_LAYOUT_GENERAL) | 0x80000000u;
+    std::vector<std::byte> bytes(static_cast<std::size_t>(heap.ImageHeapStride()));
+    {
+        const PlaceholderImages placeholders(context);
+        const auto view = placeholders.View(Abi::FirstStorageImageBinding);
+        heap.AbsentSlot(Abi::FirstStorageImageBinding + 2u, view);
+        require(encodes() == 1u && copies() == 0u, "a view's first heap slot encodes its descriptor");
+        heap.AbsentSlot(Abi::FirstStorageImageBinding + 3u, view);
+        require(encodes() == 1u && copies() == 1u, "another slot for the same view copies the encoded descriptor");
+        require(CopyEncodedImageView(view, storageKey, bytes), "a live view keeps its encoded descriptor");
+        destroyed = view;
+    }
+    require(!CopyEncodedImageView(destroyed, storageKey, bytes), "a destroyed view drops its encoded descriptor");
+    const PlaceholderImages again(context);
+    heap.AbsentSlot(Abi::FirstStorageImageBinding + 4u, again.View(Abi::FirstStorageImageBinding));
+    require(encodes() == 2u && copies() == 1u, "a destroyed view's encoded descriptor is not copied to a new view");
+}
+
 void sweptOwnerReentry(const Context& context, VkImageView view) {
     auto& heap = BindlessHeap::For(context);
     const auto kind = Abi::FirstStorageImageBinding + 1u;
@@ -127,7 +152,7 @@ void ringSpans(const Context& context) {
     BindlessHeap::SpanMark first;
     const auto span = heap.Allocate(16u, first);
     require(first.offset == span.offset && first.words == 16u && heap.Held(first), "a span written in the open chunk is held");
-    constexpr std::size_t chunkWords = (4u << 20u) / sizeof(std::uint32_t);
+    constexpr std::size_t chunkWords = AgcDriver::Graphics::BindlessHeap::RingChunkBytes / sizeof(std::uint32_t);
     BindlessHeap::SpanMark filler;
     static_cast<void>(heap.Allocate(chunkWords - 1024u, filler));
     BindlessHeap::SpanMark crossing;
@@ -148,7 +173,7 @@ void ringSpans(const Context& context) {
         while (heap.Statistics().ringWraps == wraps) last = heap.Allocate(chunkWords, fill);
         return last.offset;
     };
-    require(untilWrap() == (4u << 20u), "the ring skips a chunk a later batch still reads kept spans from");
+    require(untilWrap() == AgcDriver::Graphics::BindlessHeap::RingChunkBytes, "the ring skips a chunk a later batch still reads kept spans from");
     require(heap.Held(first), "the skipped chunk's kept span is still held");
     require(heap.Statistics().keptChunksSkipped == 1u, "one kept chunk skipped");
     heap.Submitted(recorder, 0u);
@@ -345,6 +370,7 @@ int main(int argc, char** argv) {
             samplerSlots(context);
             ringSpans(context);
             viewSlots(context, placeholders.View(Abi::FirstStorageImageBinding));
+            encodedViews(context);
             sweptOwnerReentry(context, placeholders.View(Abi::FirstStorageImageBinding));
             device->WaitIdle();
         }

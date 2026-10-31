@@ -150,6 +150,46 @@ inline std::uint64_t& DeviceProcLookups() {
     return count;
 }
 
+class DeviceFunctionCache {
+public:
+    PFN_vkVoidFunction Find(const char* name, PFN_vkGetDeviceProcAddr proc) const {
+        for (std::size_t probe = 0, slot = slotOf(name); probe < MaxProbes; ++probe, slot = (slot + 1u) & (Slots - 1u)) {
+            const auto& entry = entries[slot];
+            const auto* stored = entry.name.load(std::memory_order_acquire);
+            if (stored == nullptr) return nullptr;
+            if (stored != name) continue;
+            const auto function = entry.function.load(std::memory_order_acquire);
+            return function != nullptr && entry.proc.load(std::memory_order_relaxed) == proc ? function : nullptr;
+        }
+        return nullptr;
+    }
+
+    void Keep(const char* name, PFN_vkGetDeviceProcAddr proc, PFN_vkVoidFunction function) {
+        for (std::size_t probe = 0, slot = slotOf(name); probe < MaxProbes; ++probe, slot = (slot + 1u) & (Slots - 1u)) {
+            auto& entry = entries[slot];
+            const char* expected = nullptr;
+            if (!entry.name.compare_exchange_strong(expected, name, std::memory_order_acq_rel) && expected != name) continue;
+            if (expected == name) return;
+            entry.proc.store(proc, std::memory_order_relaxed);
+            entry.function.store(function, std::memory_order_release);
+            return;
+        }
+    }
+
+private:
+    static constexpr std::size_t Slots = 2048;
+    static constexpr std::size_t MaxProbes = 32;
+    struct Entry {
+        std::atomic<const char*> name{nullptr};
+        std::atomic<PFN_vkGetDeviceProcAddr> proc{nullptr};
+        std::atomic<PFN_vkVoidFunction> function{nullptr};
+    };
+    static std::size_t slotOf(const char* name) {
+        return static_cast<std::size_t>((reinterpret_cast<std::uintptr_t>(name) >> 3u) * 0x9e3779b97f4a7c15ull >> 40u) & (Slots - 1u);
+    }
+    std::array<Entry, Slots> entries{};
+};
+
 inline constexpr std::size_t EmptyBufferBytes = 16;
 
 struct Context {
@@ -232,6 +272,7 @@ struct Context {
     const std::vector<std::shared_ptr<ShaderResources>>* copiedWriters = nullptr;
     // The device's resolved entry points (see DeviceFunctions); null until the device set up.
     const DeviceFunctions* functions = nullptr;
+    DeviceFunctionCache* functionCache = nullptr;
     // VK_EXT_descriptor_indexing with non-uniform sampled/storage image array indexing enabled
     // (bindless image tables in graphics stages).
     bool descriptorIndexing = false;
@@ -289,13 +330,18 @@ struct Context {
     template<typename TFunction>
     TFunction Function(const char* name) const {
         Require(deviceProc != nullptr, "missing Vulkan device function resolver");
-        ++DeviceProcLookups();
         if (descriptorHeap) {
             if (const auto hooked = DescriptorHeapObjectFunction(device, deviceProc, name); hooked != nullptr) return reinterpret_cast<TFunction>(hooked);
         }
-        const auto function = reinterpret_cast<TFunction>(deviceProc(device, name));
+        const auto* cache = functions != nullptr ? functionCache : nullptr;
+        if (cache != nullptr) {
+            if (const auto cached = cache->Find(name, deviceProc); cached != nullptr) return reinterpret_cast<TFunction>(cached);
+        }
+        ++DeviceProcLookups();
+        const auto function = deviceProc(device, name);
         if (function == nullptr) throw std::runtime_error(std::string("AGC graphics: missing Vulkan function: ") + name);
-        return function;
+        if (cache != nullptr) functionCache->Keep(name, deviceProc, function);
+        return reinterpret_cast<TFunction>(function);
     }
 
     // The table's entry point, or a per-call lookup while the table is absent or lacks it.

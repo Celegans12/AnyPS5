@@ -42,6 +42,7 @@ std::uint32_t TypeStorageBufferU8Pointer(SpirvEmitterState& state);
 std::uint32_t TypeStorageBufferU8ElementPointer(SpirvEmitterState& state);
 std::uint32_t TypePhysicalU32Pointer(SpirvEmitterState& state);
 std::uint32_t TypePhysicalBufferPointer(SpirvEmitterState& state, bool wide);
+std::uint32_t TypePhysicalReadOnlyBufferPointer(SpirvEmitterState& state, bool wide);
 std::uint32_t TypePushConstantElementPointer(SpirvEmitterState& state);
 std::uint32_t TypeU32ArrayPointer(SpirvEmitterState& state, std::uint32_t storageClass, std::uint32_t dwords);
 std::uint32_t TypeU32ElementPointer(SpirvEmitterState& state, std::uint32_t storageClass);
@@ -112,6 +113,8 @@ std::uint32_t EmitBallotLaneActiveBool(SpirvEmitterState& state, std::uint32_t b
 std::uint32_t EmitSubgroupLaneActiveBool(SpirvEmitterState& state, std::uint32_t lane);
 std::uint32_t EmitBinaryU32(SpirvEmitterState& state, std::uint32_t opcode, std::uint32_t lhs, std::uint32_t rhs);
 std::uint32_t EmitShaderDataDwordLoad(SpirvEmitterState& state, std::uint32_t dwordIndex);
+bool WritesGuestBuffers(const IrProgram& program);
+bool WritesGuestMemory(const IrProgram& program);
 void EmitMemoryOffsets(SpirvEmitterState& state);
 void EmitHeapSlotPreload(SpirvEmitterState& state);
 std::uint32_t LdsDwordCount(const SpirvEmitterState& state);
@@ -160,6 +163,7 @@ std::uint32_t EmitF16BitsToF32Decoded(SpirvEmitterState& state, std::uint32_t bi
 void EmitProgram(SpirvEmitterState& state);
 void DefineGetBdaPointer(SpirvEmitterState& state);
 void DefineDot2F32F16Function(SpirvEmitterState& state);
+void DefineIntegerFloat64Functions(SpirvEmitterState& state);
 void DefineReciprocalCorrectionFunction(SpirvEmitterState& state);
 void EmitLabel(SpirvEmitterState& state, std::uint32_t label);
 std::uint32_t Unary(SpirvEmitterState& state, std::uint32_t opcode, std::uint32_t type, std::uint32_t value);

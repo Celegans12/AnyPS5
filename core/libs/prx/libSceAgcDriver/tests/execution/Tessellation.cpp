@@ -713,6 +713,7 @@ void Draw(AgcDriver::VulkanDevice& device, const Stages& stages, VkCullModeFlags
 
 void RequireDepthRangeRemap(AgcDriver::VulkanDevice& device) {
     auto target = device.Target();
+    target.gpuResolvedImages = AgcDriver::Graphics::DescriptorHeapEnabled();
     Require(device.graphicsContext().depthClamp, "tessellation depth remap needs depth clamping");
     target.depthRangeRemap = true;
     const auto compile = [&](float z, std::uint32_t mode) {

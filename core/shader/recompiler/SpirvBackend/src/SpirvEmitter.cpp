@@ -267,6 +267,7 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
     state.depthRangeRemap = target.depthRangeRemap;
     state.registrationModules = target.registrationModules;
     state.gpuResolvedImages = target.gpuResolvedImages;
+    state.heapDataUniformDwords = target.heapDataUniformDwords;
     state.fragmentDescriptorSet = target.fragmentDescriptorSet;
     state.meshBarycentricPixel = target.meshBarycentricPixel;
     state.meshBarycentricVertex = target.meshBarycentricVertex;

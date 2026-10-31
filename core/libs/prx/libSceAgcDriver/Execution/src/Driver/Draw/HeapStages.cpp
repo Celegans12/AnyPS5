@@ -18,9 +18,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <mutex>
+#include <stdexcept>
+#include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 namespace AgcDriver::DriverDetail {
 
@@ -178,14 +183,77 @@ void RefuseHeapPair(std::uint64_t pair) {
     refused.insert(pair);
 }
 
+namespace {
+
+struct HeapExclusions {
+    std::uint32_t stages = 0;
+    bool tables = false;
+    bool storage = false;
+    bool sampled = false;
+};
+
+const HeapExclusions& heapExclusions() {
+    static const HeapExclusions exclusions = [] {
+        using Stage = ShaderRecompiler::ShaderStage;
+        HeapExclusions result;
+        const char* value = std::getenv("APS5_GPU_HEAP_EXCLUDE");
+        std::string_view list = value != nullptr ? value : "";
+        static constexpr std::pair<std::string_view, Stage> stages[] = {{"compute", Stage::Compute}, {"vertex", Stage::Vertex}, {"hull", Stage::TessellationControl}, {"domain", Stage::TessellationEvaluation},
+                                                                        {"geometry", Stage::Geometry}, {"pixel", Stage::Fragment}, {"local", Stage::Local}, {"mesh", Stage::Mesh}};
+        while (!list.empty()) {
+            const auto comma = list.find(',');
+            const auto item = list.substr(0, comma);
+            bool known = true;
+            if (item == "tables") {
+                result.tables = true;
+            } else if (item == "storage") {
+                result.storage = true;
+            } else if (item == "sampled") {
+                result.sampled = true;
+            } else {
+                const auto stage = std::find_if(std::begin(stages), std::end(stages), [&](const auto& entry) { return entry.first == item; });
+                known = stage != std::end(stages);
+                if (known) result.stages |= 1u << static_cast<std::uint32_t>(stage->second);
+            }
+            if (!known) throw std::runtime_error("APS5_GPU_HEAP_EXCLUDE: unknown class '" + std::string(item) + "'; use compute, vertex, hull, domain, geometry, pixel, local, mesh, tables, storage or sampled");
+            if (comma == std::string_view::npos) break;
+            list.remove_prefix(comma + 1u);
+        }
+        return result;
+    }();
+    return exclusions;
+}
+
+bool heapClassesAllowed(const ShaderRecompiler::RecompileResult& result) {
+    using Role = ShaderRecompiler::DescriptorRole;
+    using Kind = ShaderRecompiler::DescriptorKind;
+    const auto& exclusions = heapExclusions();
+    std::uint64_t demand = 0;
+    for (const auto& binding : result.bindings) {
+        const bool table = binding.role == Role::ImageTable || binding.role == Role::ImageStorageTable;
+        const bool image = binding.role == Role::GuestImages && (binding.kind == Kind::SampledImage || binding.kind == Kind::StorageImage);
+        if (table || image) demand += binding.count;
+        if (table && exclusions.tables) return false;
+        if (image && binding.kind == Kind::StorageImage && exclusions.storage) return false;
+        if (image && binding.kind == Kind::SampledImage && exclusions.sampled) return false;
+    }
+    return demand <= Graphics::BindlessHeap::ImageSlotCapacity();
+}
+
+}
+
+bool HeapStageExcluded(ShaderRecompiler::ShaderStage stage) {
+    return (heapExclusions().stages >> static_cast<std::uint32_t>(stage) & 1u) != 0u;
+}
+
 bool HeapStageMappable(const ShaderRecompiler::RecompileResult& result, bool workgroupAddress) {
     struct MappableStorage {};
     auto& known = HostThreadLocal<std::unordered_map<std::uint64_t, bool>, MappableStorage>();
     const auto key = result.variantId * 2u + (workgroupAddress ? 1u : 0u);
     if (const auto found = known.find(key); found != known.end()) return found->second;
     if (known.size() >= 65536u) known.clear();
-    const bool mappable = Graphics::DescriptorHeapMappable(std::span<const std::uint32_t>(result.spirv.data(), result.spirv.size()),
-                                                           workgroupAddress, result.dataAddressPush, result.functionLdsBuffer, result.meshWindowBuffer);
+    const bool mappable = heapClassesAllowed(result) &&
+                          Graphics::DescriptorHeapMappable(std::span<const std::uint32_t>(result.spirv.data(), result.spirv.size()), workgroupAddress, result.dataAddressPush, result.functionLdsBuffer, result.meshWindowBuffer);
     known.emplace(key, mappable);
     return mappable;
 }
@@ -568,7 +636,7 @@ void SetHeapStageUnmapped(std::optional<ShaderRecompiler::ShaderStage> stage) {
 }
 
 bool HeapDrawStageMappable(const ShaderRecompiler::RecompileResult& result, ShaderRecompiler::ShaderStage stage) {
-    return unmappedStage.load(std::memory_order_relaxed) != static_cast<int>(stage) && HeapStageMappable(result);
+    return unmappedStage.load(std::memory_order_relaxed) != static_cast<int>(stage) && !HeapStageExcluded(stage) && HeapStageMappable(result);
 }
 
 std::uint64_t HeapStagesTaken() {

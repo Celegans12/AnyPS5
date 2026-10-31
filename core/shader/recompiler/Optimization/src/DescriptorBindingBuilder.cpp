@@ -616,7 +616,14 @@ DescriptorBindingPlan DescriptorBindingBuilder::Select(const DescriptorBindingPl
     }
     selected.imageMetadata = plan.imageMetadata;
     selected.runtimeState = plan.runtimeState;
-    selected.heapSlotWords = plan.heapSlotWords;
+    constexpr auto bindingCount = static_cast<std::uint32_t>(RuntimeAbi::Binding::Count);
+    std::set<std::uint32_t> droppedKinds;
+    for (const auto& binding : plan.bindings) droppedKinds.insert(binding.descriptor.binding % bindingCount);
+    for (const auto& binding : selected.bindings) droppedKinds.erase(binding.descriptor.binding % bindingCount);
+    selected.heapSlotWords.reserve(plan.heapSlotWords.size());
+    for (const auto& word : plan.heapSlotWords) {
+        if (!droppedKinds.contains(word.kind)) selected.heapSlotWords.push_back(word);
+    }
     selected.addressedBuffers = plan.addressedBuffers;
     selected.addressedData = plan.addressedData;
     return selected;

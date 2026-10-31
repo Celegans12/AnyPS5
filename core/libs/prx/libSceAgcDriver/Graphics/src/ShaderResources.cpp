@@ -51,6 +51,11 @@
 namespace AgcDriver::Graphics {
 namespace {
 
+bool UintStorageBinding(std::uint32_t binding) {
+    const auto kind = binding % static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Count);
+    return kind >= ShaderRecompiler::RuntimeAbi::FirstStorageImageBinding + 7u && kind < ShaderRecompiler::RuntimeAbi::FirstStorageImageBinding + 14u;
+}
+
 bool overlap(std::uint64_t first, std::size_t firstSize, std::uint64_t second, std::size_t secondSize) {
     return first < second + secondSize && second < first + firstSize;
 }
@@ -1686,7 +1691,7 @@ bool UsesAddressTables(const CompiledShader& compute) {
 
 }
 
-ShaderResources::ShaderResources(const Context& context, const CompiledShader& compute, std::span<const GuestMemorySnapshot> snapshots, bool deferred, std::uint64_t dispatchThreads) : context(context), guestMemory(context), dispatchThreads(dispatchThreads), deferredCompute(compute), deferredSnapshots(snapshots) {
+ShaderResources::ShaderResources(const Context& context, const CompiledShader& compute, std::span<const GuestMemorySnapshot> snapshots, bool deferred, std::uint64_t dispatchThreads, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear) : context(context), guestMemory(context), dispatchThreads(dispatchThreads), htileClear(htileClear), deferredCompute(compute), deferredSnapshots(snapshots) {
     Require(compute.stage == ShaderRecompiler::ShaderStage::Compute, "compute resources require a compute shader");
     // Every use of a compute build is a recorded dispatch that calls MarkGpuWrites, which staged
     // buffers need (a synchronous draw's use would not).
@@ -2565,7 +2570,7 @@ void ShaderResources::buildComplete() {
         resolveImageTables();
         timing.bindingsMs += phase(BuildPhase::Images);
         requireGuestBuffers();
-        guestMemory.UploadFinish(usesBda);
+        guestMemory.UploadFinish(usesBda, htileClear);
         timing.uploadMs += phase(BuildPhase::Upload);
         if (usesBda) bda = std::make_unique<BdaResources>(context, guestMemory);
         else if (usesFaultBuffer) bda = std::make_unique<BdaResources>(context);
@@ -2624,7 +2629,7 @@ void ShaderResources::buildComplete() {
                         for (auto element = first; element < last; ++element) {
                             const auto index = binding.imageAllocations[element];
                             if (binding.layout.descriptorType == VK_DESCRIPTOR_TYPE_SAMPLER) images.push_back({samplers[index]->Handle(), VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED});
-                            else if (binding.layout.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) images.push_back({VK_NULL_HANDLE, storageAtomic64[index] ? storageTextures[index]->Atomic64View(storageMips[index], storageFirstLayer[index]) : storageAtomic[index] ? storageTextures[index]->AtomicView(storageMips[index], storageFirstLayer[index]) : storageTextures[index]->StorageView(storageMips[index], storageFirstLayer[index], binding.layout.binding >= ShaderRecompiler::RuntimeAbi::FirstStorageImageBinding + 7u && binding.layout.binding < ShaderRecompiler::RuntimeAbi::FirstStorageImageBinding + 14u), VK_IMAGE_LAYOUT_GENERAL});
+                            else if (binding.layout.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) images.push_back({VK_NULL_HANDLE, storageAtomic64[index] ? storageTextures[index]->Atomic64View(storageMips[index], storageFirstLayer[index]) : storageAtomic[index] ? storageTextures[index]->AtomicView(storageMips[index], storageFirstLayer[index]) : storageTextures[index]->StorageView(storageMips[index], storageFirstLayer[index], UintStorageBinding(binding.layout.binding)), VK_IMAGE_LAYOUT_GENERAL});
                             else images.push_back({VK_NULL_HANDLE, textureFirstLayer[index] ? textures[index]->FirstLayerView() : textures[index]->View(), textures[index]->Layout()});
                         }
                         if (recorded) runs.emplace_back(write.dstArrayElement, write.descriptorCount);
@@ -2669,7 +2674,7 @@ void ShaderResources::buildComplete() {
                         for (const auto index : binding.imageAllocations) {
                             if (index == std::numeric_limits<std::size_t>::max()) images.push_back(absentImage(binding.layout.binding));
                             else if (storageTextures[index] == nullptr) images.push_back({VK_NULL_HANDLE, multisampleStorageViews[index], VK_IMAGE_LAYOUT_GENERAL});
-                            else images.push_back({VK_NULL_HANDLE, storageAtomic64[index] ? storageTextures[index]->Atomic64View(storageMips[index], storageFirstLayer[index]) : storageAtomic[index] ? storageTextures[index]->AtomicView(storageMips[index], storageFirstLayer[index]) : storageTextures[index]->StorageView(storageMips[index], storageFirstLayer[index], binding.layout.binding >= ShaderRecompiler::RuntimeAbi::FirstStorageImageBinding + 7u && binding.layout.binding < ShaderRecompiler::RuntimeAbi::FirstStorageImageBinding + 14u), VK_IMAGE_LAYOUT_GENERAL});
+                            else images.push_back({VK_NULL_HANDLE, storageAtomic64[index] ? storageTextures[index]->Atomic64View(storageMips[index], storageFirstLayer[index]) : storageAtomic[index] ? storageTextures[index]->AtomicView(storageMips[index], storageFirstLayer[index]) : storageTextures[index]->StorageView(storageMips[index], storageFirstLayer[index], UintStorageBinding(binding.layout.binding)), VK_IMAGE_LAYOUT_GENERAL});
                         }
                         Require(binding.imageAllocations.size() == binding.layout.descriptorCount, "descriptor allocations disagree with compact binding");
                         break;
@@ -2779,8 +2784,8 @@ void ShaderResources::noteReusable() {
     reusable = false;
     spaceReuse = false;
     directRegions.clear();
-    const bool spaceReusable = drawBuild && usesBda && bdaReadOnly && !SpaceReuseDisabled() && guestMemory.SpaceOnly() && !guestMemory.HasCopiedWrites() && multisampleSources.empty() && !(bda != nullptr && LoopGuardEnabled());
-    if (!spaceReusable && (guestMemory.HasCopiedWrites() || HoldsLease() || usesBda || !multisampleSources.empty() || (bda != nullptr && LoopGuardEnabled()))) return;
+    const bool spaceReusable = drawBuild && usesBda && bdaReadOnly && !htileClear.has_value() && !SpaceReuseDisabled() && guestMemory.SpaceOnly() && !guestMemory.HasCopiedWrites() && multisampleSources.empty() && !(bda != nullptr && LoopGuardEnabled());
+    if (!spaceReusable && (htileClear.has_value() || guestMemory.HasCopiedWrites() || HoldsLease() || usesBda || !multisampleSources.empty() || (bda != nullptr && LoopGuardEnabled()))) return;
     if (std::any_of(textures.begin(), textures.end(), [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->RefreshedPerUse(); })) return;
     if (TemplateDataRefresh() && std::any_of(allocations.begin(), allocations.end(), [](const Allocation& allocation) { return allocation.buffer != nullptr && !allocation.guest && allocation.role != ShaderRecompiler::DescriptorRole::ImageTableMap && allocation.size > MaxRefreshBytes; })) return;
     if (spaceReusable) {
@@ -3982,6 +3987,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     // (3) Buffers staged in device memory (GuestBufferMemory::AllowDeviceStaging) are copied in
     // from their imports anew for this use, after the flushes above and before the work is
     // recorded; a failure to record leaves the object unusable for this dispatch, not the batch.
+    if (!guestMemory.StagingDecisionsCurrent()) return finish(fast, false, ProofFailure::Changed);
     if (auto* recorder = Recorder::Active(); recorder != nullptr) {
         try {
             guestMemory.RecordStagingCopies(*recorder);
@@ -5233,7 +5239,7 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
             Require(!(element < binding.imageAtomic.size() && binding.imageAtomic[element]) && !(element < binding.imageAtomic64.size() && binding.imageAtomic64[element]), "storage image atomics on a multisampled texture are not implemented");
             storageTextures.push_back(nullptr);
             multisampleStorageViews.resize(storageTextures.size(), VK_NULL_HANDLE);
-            const bool uintStorage = binding.binding >= ShaderRecompiler::RuntimeAbi::FirstStorageImageBinding + 7u && binding.binding < ShaderRecompiler::RuntimeAbi::FirstStorageImageBinding + 14u;
+            const bool uintStorage = UintStorageBinding(binding.binding);
             multisampleStorageViews.back() = MultisampleTargetStorageView(context, resource, uintStorage);
             multisampleSources.push_back(resource.baseAddress);
             storageMips.push_back(0);
@@ -6193,7 +6199,8 @@ void ShaderResources::requireGuestBuffers(std::span<const MovedBuffer> moved) co
         const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
         const auto address = override != moved.end() ? override->address : item.address;
         const auto bytes = override != moved.end() ? override->size : item.size;
-        RequireNoMultisampleTarget(address, bytes, "a shader buffer access");
+        RequireNoResidentDepthRead_nid_no_patch(address, bytes, htileClear);
+        RequireNoMultisampleColorTarget(address, bytes, "a shader buffer access");
     }
 }
 
@@ -6258,7 +6265,8 @@ std::size_t DataOffsetIndex(std::size_t stage, ShaderRecompiler::RuntimeAbi::Bin
 std::pair<VkBuffer, VkDeviceSize> ShaderResources::shaderDataLocation(const CompiledShader& shader, const DrawBindings* rewritten) const {
     if (!heapStage || shader.program == nullptr || !shader.program->gpuResolvedImages) return {shaderDataBuffer(shader), 0};
     const auto& offsets = rewritten != nullptr && rewritten->addressOffsets ? rewritten->heapOffsets : heapOffsets;
-    return {BindlessHeap::For(context).RingBuffer(), offsets[DataOffsetIndex(HeapStageIndex(shader.stage), ShaderRecompiler::RuntimeAbi::Binding::ShaderData)]};
+    const auto& heap = BindlessHeap::For(context);
+    return {heap.RingBuffer(), heap.RingOffset() + offsets[DataOffsetIndex(HeapStageIndex(shader.stage), ShaderRecompiler::RuntimeAbi::Binding::ShaderData)]};
 }
 
 void ShaderResources::PatchDataAddresses(std::span<std::byte, PipelinePushConstantBytes> bytes, std::span<const CompiledShader> shaders, const DrawBindings* rewritten) const {
@@ -6411,9 +6419,11 @@ void ShaderResources::writeHeapTableMap(const CompiledShader& shader, std::size_
         }
         return false;
     };
+    const auto samplerSpan = std::max<std::size_t>(elements, map[TableAbi::HeaderSamplerCount]);
+    Require(table->tableSamplers.size() <= samplerSpan, "an image table map has more table samplers than its header counts");
+    const auto extraBase = base + 2u * elements + samplerSpan;
     if (anyAtomic(false) || anyAtomic(true)) {
-        Require(table->tableSamplers.size() <= elements, "an image table with atomics has more table samplers than elements");
-        map.resize(base + 3u * elements, fallbackSampler);
+        map.resize(extraBase, fallbackSampler);
         for (const bool wide : {false, true}) {
             const auto kind = wide ? Abi::FirstAtomic64ImageBinding : Abi::FirstAtomicImageBinding;
             const auto absent = heap.AbsentSlot(kind, heapPlaceholderView(kind));
@@ -6430,6 +6440,24 @@ void ShaderResources::writeHeapTableMap(const CompiledShader& shader, std::size_
                 Require(slot.has_value(), "the global atomic image heap is full");
                 map.push_back(*slot);
             }
+        }
+    }
+    const bool storageTable = std::ranges::any_of(shader.program->bindings, [](const ShaderRecompiler::DescriptorBinding& binding) {
+        return binding.role == ShaderRecompiler::DescriptorRole::ImageStorageTable;
+    });
+    if (storageTable) {
+        map.resize(extraBase + 2u * elements, fallbackSampler);
+        const auto kind = Abi::FirstStorageImageBinding + 7u;
+        const auto absent = heap.AbsentSlot(kind, heapPlaceholderView(kind));
+        for (std::size_t element = 0; element < elements; ++element) {
+            const auto index = element < table->elementStorage.size() ? table->elementStorage[element] : noElement;
+            if (index == noElement || storageTextures[index] == nullptr) {
+                map.push_back(absent);
+                continue;
+            }
+            const auto slot = heap.StorageSlot(kind, storageTextures[index], storageTextures[index]->UintStorageViewOrDefault(storageMips[index], storageFirstLayer[index]));
+            Require(slot.has_value(), "the global storage image heap is full");
+            map.push_back(*slot);
         }
     }
     if (map.size() == base) map.push_back(sampledAbsent);
@@ -6458,13 +6486,15 @@ VkImageView ShaderResources::heapSampledView(std::size_t index) const {
     return texture->View();
 }
 
+VkImageView ShaderResources::heapMultisampleStorageView(std::size_t index) const {
+    return index < multisampleStorageViews.size() ? multisampleStorageViews[index] : VK_NULL_HANDLE;
+}
+
 VkImageView ShaderResources::heapStorageView(std::size_t index, std::uint32_t binding) const {
     const auto& texture = storageTextures[index];
     if (storageAtomic64[index]) return texture->Atomic64View(storageMips[index], storageFirstLayer[index]);
     if (storageAtomic[index]) return texture->AtomicView(storageMips[index], storageFirstLayer[index]);
-    const auto kind = binding % static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Count);
-    const bool uintStorage = kind >= ShaderRecompiler::RuntimeAbi::FirstStorageImageBinding + 7u && kind < ShaderRecompiler::RuntimeAbi::FirstStorageImageBinding + 14u;
-    return texture->StorageView(storageMips[index], storageFirstLayer[index], uintStorage);
+    return texture->StorageView(storageMips[index], storageFirstLayer[index], UintStorageBinding(binding));
 }
 
 void ShaderResources::appendHeapSlotKey(VkShaderStageFlags stageBit, std::vector<std::uintptr_t>& key) const {
@@ -6484,6 +6514,11 @@ void ShaderResources::appendHeapSlotKey(VkShaderStageFlags stageBit, std::vector
             }
         } else if (binding.layout.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) {
             for (const auto index : binding.imageAllocations) {
+                if (index != absent && storageTextures[index] == nullptr && heapMultisampleStorageView(index) != VK_NULL_HANDLE) {
+                    key.insert(key.end(), {0u, reinterpret_cast<std::uintptr_t>(heapMultisampleStorageView(index)),
+                                           static_cast<std::uintptr_t>(VK_IMAGE_LAYOUT_GENERAL)});
+                    continue;
+                }
                 if (index == absent || storageTextures[index] == nullptr) {
                     key.push_back(0u);
                     continue;
@@ -6541,6 +6576,14 @@ void ShaderResources::takeHeapSlots(BindlessHeap& heap, HeapStageState& state, V
         } else if (binding.layout.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) {
             auto& kindSlots = state.slots[kind];
             for (const auto index : binding.imageAllocations) {
+                if (index != absent && storageTextures[index] == nullptr && heapMultisampleStorageView(index) != VK_NULL_HANDLE) {
+                    const auto view = reinterpret_cast<VkImageView>(key[cursor + 1]);
+                    cursor += 3;
+                    const auto slot = heap.ViewSlot(kind, reinterpret_cast<const void*>(view), view);
+                    Require(slot.has_value(), "the global storage image heap is full");
+                    kindSlots.push_back(*slot);
+                    continue;
+                }
                 if (index == absent || storageTextures[index] == nullptr) {
                     ++cursor;
                     kindSlots.push_back(heap.AbsentSlot(kind, heapPlaceholderView(kind)));
@@ -6574,22 +6617,37 @@ void ShaderResources::noteHeapSlotGenerations(const BindlessHeap& heap, HeapStag
 
 void ShaderResources::verifyHeapSlots(const BindlessHeap& heap, const HeapStageState& state, VkShaderStageFlags stageBit) const {
     constexpr auto bindingCount = static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Count);
-    static std::atomic<std::uint64_t> checked{0}, wrong{0};
+    static std::atomic<std::uint64_t> checked{0}, wrong{0}, storageChecked{0}, storageWrong{0};
     for (const auto& binding : bindings) {
-        if (!ownsHeapBinding(binding, stageBit) || binding.layout.descriptorType != VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE) continue;
+        if (!ownsHeapBinding(binding, stageBit)) continue;
+        const bool sampled = binding.layout.descriptorType == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        const bool storage = binding.layout.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        if (!sampled && !storage) continue;
         const auto kind = binding.layout.binding % bindingCount;
         for (std::size_t element = 0; element < binding.imageAllocations.size(); ++element) {
             const auto index = binding.imageAllocations[element];
             if (index == std::numeric_limits<std::size_t>::max()) continue;
-            ++checked;
-            const bool holdsTexture =
-                element < state.slots[kind].size() && heap.SlotTexture(kind, state.slots[kind][element]) == textures[index].get();
-            if (!holdsTexture) ++wrong;
+            const bool bound = element < state.slots[kind].size();
+            if (sampled) {
+                ++checked;
+                if (!bound || heap.SlotTexture(kind, state.slots[kind][element]) != textures[index].get()) ++wrong;
+                continue;
+            }
+            if (storageTextures[index] == nullptr) {
+                const auto view = heapMultisampleStorageView(index);
+                if (view == VK_NULL_HANDLE) continue;
+                ++storageChecked;
+                if (!bound || !heap.SlotHoldsStorage(kind, state.slots[kind][element], reinterpret_cast<const void*>(view), view)) ++storageWrong;
+                continue;
+            }
+            ++storageChecked;
+            if (!bound || !heap.SlotHoldsStorage(kind, state.slots[kind][element], storageTextures[index].get(), heapStorageView(index, binding.layout.binding))) ++storageWrong;
         }
     }
-    if (checked.load() % 100000u < 8u) {
-        std::fprintf(stderr, "[heap-slots] verify: %llu image slots checked, %llu hold another texture\n",
-                     static_cast<unsigned long long>(checked.load()), static_cast<unsigned long long>(wrong.load()));
+    if ((checked.load() + storageChecked.load()) % 100000u < 8u) {
+        std::fprintf(stderr, "[heap-slots] verify: %llu image slots checked, %llu hold another texture; %llu storage slots checked, %llu hold another image or view\n",
+                     static_cast<unsigned long long>(checked.load()), static_cast<unsigned long long>(wrong.load()),
+                     static_cast<unsigned long long>(storageChecked.load()), static_cast<unsigned long long>(storageWrong.load()));
     }
 }
 
@@ -6623,7 +6681,13 @@ void ShaderResources::patchHeapSlotWords(const CompiledShader& shader, const Hea
     for (const auto& word : program.heapSlotWords) {
         Require(word.dword < patched.size(), "a GPU-mode slot word lies outside the shader data");
         if (word.kind == static_cast<std::uint32_t>(Abi::Binding::Samplers)) {
-            Require(word.element < samplerSlots.size(), "a GPU-mode slot word names a sampler the stage does not bind");
+            if (word.element >= samplerSlots.size()) {
+                char text[256];
+                std::snprintf(text, sizeof(text),
+                              "AGC graphics: a GPU-mode slot word names a sampler the stage does not bind (stage %u, element %u, sampler slots %zu, bindings %zu)",
+                              static_cast<unsigned>(shader.stage), word.element, samplerSlots.size(), bindings.size());
+                throw std::runtime_error(text);
+            }
             patched[word.dword] = samplerSlots[word.element];
             continue;
         }

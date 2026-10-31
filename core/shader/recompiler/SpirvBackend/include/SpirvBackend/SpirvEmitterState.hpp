@@ -72,6 +72,7 @@ struct MemoryResourceAccess {
     std::uint32_t memoryAccess = 0;
     std::uint32_t misalignment = 0;
     bool physical = false;
+    bool clampedPhysical = false;
 };
 
 struct SpirvTableImageVariable {
@@ -112,7 +113,9 @@ struct SpirvEmitterState {
     std::uint32_t depthRemapClipIndex = 0;
     bool registrationModules = false;
     bool gpuResolvedImages = false;
+    std::uint32_t heapDataUniformDwords = 0;
     bool addressedBuffers = false;
+    std::optional<bool> guestBuffersWritten;
     bool fragmentDescriptorSet = false;
     bool float16DenormPreserve = false;
     bool robustBufferAccess2 = false;
@@ -180,6 +183,11 @@ struct SpirvEmitterState {
     std::map<std::pair<bool, std::uint32_t>, std::uint32_t> interpolateFunctions;
     std::map<std::pair<bool, std::uint32_t>, std::uint32_t> fastInterpolateFunctions;
     bool integerInterpolation = false;
+    bool integerFloat64 = false;
+    std::uint32_t integerAddF64Function = 0;
+    std::uint32_t integerMulF64Function = 0;
+    std::uint32_t integerF64FromF32Function = 0;
+    std::uint32_t integerF32FromF64Function = 0;
     std::array<std::array<std::uint32_t, 2>, 2> bdaDwordReadFunctions {};
     std::array<std::array<std::uint32_t, 2>, 2> bdaSpanReadFunctions {};
     std::unordered_map<const IrValue*, std::pair<std::uint32_t, std::uint32_t>> bdaGroupedLoads;
@@ -212,6 +220,7 @@ struct SpirvEmitterState {
     std::uint32_t gdsLength = 0;
     std::uint32_t pushConstantVariable = 0;
     std::uint32_t shaderDataStorageVariable = 0;
+    std::uint32_t shaderDataUniformVariable = 0;
     std::unordered_map<std::uint32_t, std::uint32_t> heapSlotVariables;
     std::uint32_t flattenedSrtVariable = 0;
     bool flattenedSrtAddressed = false;

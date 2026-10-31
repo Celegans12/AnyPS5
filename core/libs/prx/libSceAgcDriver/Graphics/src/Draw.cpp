@@ -995,6 +995,8 @@ void countCache(std::uint64_t DrawProfile::*counter) {
     ++(stats.*counter);
 }
 
+}
+
 // ValidateShaders decodes every SPIR-V instruction of every stage on every draw. Its outcome depends
 // only on the stages' compiled variants (a variant id names identical SPIR-V and binding layout),
 // their push constant placement and vertex attribute shapes, and the state fields it checks, so the
@@ -1012,10 +1014,12 @@ bool ValidationKey(const Context& context, std::span<const CompiledShader> shade
     if (keyed) {
         key.reserve(40 + shaders.size() * 12);
         add(shaders.size());
+        const bool patches = BarycentricPatches(state, shaders);
+        add(patches ? static_cast<std::uint64_t>(state.provokingVertexMode) + 1u : 0u);
         for (const auto& shader : shaders) {
             Require(shader.program != nullptr, "missing compiled shader");
             const auto& program = *shader.program;
-            const bool generated = (state.rectList && (shader.stage == Stage::TessellationControl || shader.stage == Stage::TessellationEvaluation)) || shader.stage == Stage::Geometry;
+            const bool generated = ((state.rectList || patches) && (shader.stage == Stage::TessellationControl || shader.stage == Stage::TessellationEvaluation)) || shader.stage == Stage::Geometry;
             if (!generated && program.PipelineVariantId() == 0) {
                 keyed = false;
                 break;
@@ -1082,6 +1086,8 @@ bool ValidationKey(const Context& context, std::span<const CompiledShader> shade
     }
     return keyed;
 }
+
+namespace {
 
 AgcDriver::Mutex& validationMutex() {
     static AgcDriver::Mutex mutex;
@@ -1909,17 +1915,17 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     if (resolved.cacheable) {
         resolved.contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
         if (auto cached = SharedResourceCache().Find(resolved.contentKey)) {
+            const auto releaseSpace = [](ShaderResources* resources) { static_cast<void>(resources->ReleaseSpace()); };
+            std::unique_ptr<ShaderResources, decltype(releaseSpace)> heldSpace(cached->SpaceReuse() ? cached.get() : nullptr, releaseSpace);
             bool spaceHeld = !cached->SpaceReuse();
-            if (!spaceHeld && cached->RetakeSpace()) {
-                spaceHeld = cached->SnapshotsServedInPlace(snapshots);
-                if (!spaceHeld) static_cast<void>(cached->ReleaseSpace());
-            }
+            if (!spaceHeld && cached->RetakeSpace()) spaceHeld = cached->SnapshotsServedInPlace(snapshots);
             const bool valid = spaceHeld && cached->Revalidate(shaders);
             auto* recorder = Recorder::Active();
             std::optional<std::vector<ShaderResources::MovedBuffer>> moved;
             if (valid && recorder != nullptr) moved = cached->MovedReadOnlyBuffers(shaders, *recorder, &state.color);
             if (moved.has_value()) {
                 if (trimKey) CheckBufferAliases(shaders, state.color, draw.indexAddress, indexBytes);
+                static_cast<void>(heldSpace.release());
                 resolved.resources = std::move(cached);
                 resolved.moved = std::move(*moved);
                 if (resolved.resources->HeapStage()) resolved.resources->RefreshHeapStage(shaders);
@@ -1927,10 +1933,8 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                 outcome.kind = KindTemplateHit;
                 countCache(&DrawProfile::cacheHits);
             } else if (valid) {
-                if (cached->SpaceReuse()) static_cast<void>(cached->ReleaseSpace());
                 countCache(&DrawProfile::cacheMisses);
             } else {
-                if (cached->SpaceReuse()) static_cast<void>(cached->ReleaseSpace());
                 SharedResourceCache().Remove(resolved.contentKey);
                 countCache(&DrawProfile::cacheInvalidated);
             }
@@ -3274,6 +3278,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         Require(std::ranges::any_of(images, [&](const std::pair<VkImage, bool>& image) { return image.first == binding.resident->Image() && image.second; }), "the partial write of a packed color target does not store into the target's resident image");
     }
     if (!lean && !resolved.moved.empty()) {
+        if (resolved.resources->SpaceReuse()) static_cast<void>(resolved.resources->ReleaseSpace());
         resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots);
         resolved.moved.clear();
     }
@@ -3419,7 +3424,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
         // only a template the resource cache serves under this content key (reusable: no lease,
         // no copied writes, every direct region import- or mirror-served) of a direct draw, so a
         // hit's proof is the template's ProveCurrent and nothing needs completion work.
-        if (recipeOut != nullptr && DrawRecipes() && cacheable && !outcome.waited && args == nullptr && resources->Reusable() && resolved.moved.empty() && !multisampled && !pipeline->ReordersSamples()) {
+        if (recipeOut != nullptr && DrawRecipes() && cacheable && !outcome.waited && args == nullptr && resources->Reusable() && !resources->SpaceReuse() && resolved.moved.empty() && !multisampled && !pipeline->ReordersSamples()) {
             auto recipe = std::make_shared<DrawRecipe>();
             recipe->device = context.device;
             recipe->templateRef = resources;
@@ -3802,6 +3807,15 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     prepared.recipeOut = recipeOut;
     prepared.trace = trace;
     prepared.shape = shape;
+    const struct HeldSpace {
+        PreparedDraw& prepared;
+        ~HeldSpace() {
+            const auto& resources = prepared.resolved.resources;
+            if (resources == nullptr || !resources->SpaceReuse()) return;
+            auto space = resources->ReleaseSpace();
+            if (space != nullptr && prepared.recorder != nullptr) prepared.recorder->Keep(std::const_pointer_cast<void>(std::move(space)));
+        }
+    } heldSpace{prepared};
     if (prepareDraw(context, state, draw, shaders, snapshots, prepared)) recordPreparedDraw(context, state, draw, shaders, prepared);
 }
 

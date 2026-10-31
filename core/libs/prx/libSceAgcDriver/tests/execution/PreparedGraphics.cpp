@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/HeapStages.hpp"
 #include "VulkanTestDevice.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderPreparation.hpp"
 #include "SceShaders.hpp"
@@ -564,7 +565,23 @@ void CheckMergedHull(AgcDriver::VulkanDevice& device) {
     DecodeGraphicsPrograms(stale, unmapped, registry, false, true);
     Require(stale.programs[1].userData[0] == 0x10u && stale.programs[1].userData[1] == 0u, "a merged hull draw did not pass a user-data address it does not need unchecked");
     const auto stages = PrepareGraphicsStages(prepared, device.Target());
-    Require(stages.size() == 4u && stages[0].entry.handle != stages[1].entry.handle, "a merged hull program was not prepared as separate local and hull stages");
+    for (const bool heapVariant : {false, true}) {
+        std::vector<const AgcDriver::DriverDetail::PreparedGraphicsStage*> set;
+        for (const auto& stage : stages) {
+            if (stage.heapVariant == heapVariant) set.push_back(&stage);
+        }
+        if (heapVariant && set.empty()) {
+            Require(!HeapFragmentsEnabled(), "the heap prepared no heap variants of the merged hull draw");
+            continue;
+        }
+        const auto handleOf = [&](ShaderRecompiler::ShaderStage wanted) {
+            const auto found = std::find_if(set.begin(), set.end(), [&](const auto* stage) { return stage->stage == wanted; });
+            return found == set.end() ? nullptr : (*found)->entry.handle.get();
+        };
+        const auto* local = handleOf(ShaderRecompiler::ShaderStage::Local);
+        const auto* hull = handleOf(ShaderRecompiler::ShaderStage::TessellationControl);
+        Require((heapVariant || set.size() == 4u) && local != nullptr && hull != nullptr && local != hull, "a merged hull program was not prepared as separate local and hull stages");
+    }
     for (const auto& stage : stages) stage.snapshot->prepared->entries.push_back(stage.entry);
     std::vector<LinkedProgram> linked;
     std::vector<MemoryRegion> memory;

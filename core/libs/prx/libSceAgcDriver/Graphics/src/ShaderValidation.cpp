@@ -121,7 +121,7 @@ struct Module {
             return;
         }
         // One gl_ClipDistance array holds the guest clip distances and the recompiler's all-zero position distance.
-        if (!input && ((value == spv::BuiltInClipDistance && (vertex || stage == Stage::TessellationControl || stage == Stage::TessellationEvaluation || stage == Stage::Mesh)) || (value == spv::BuiltInCullDistance && (vertex || stage == Stage::Mesh)))) {
+        if (!input && ((value == spv::BuiltInClipDistance && (vertex || stage == Stage::TessellationControl || stage == Stage::TessellationEvaluation || stage == Stage::Mesh)) || (value == spv::BuiltInCullDistance && (vertex || stage == Stage::TessellationEvaluation || stage == Stage::Mesh)))) {
             const auto signature = Signature(type);
             auto& count = value == spv::BuiltInClipDistance ? clipDistances : cullDistances;
             Require(count == 0 && signature.size() == 6 && signature.starts_with("f32[") && signature[4] >= '1' && signature[4] <= '8' && signature[5] == ']', "invalid or duplicate clip or cull distance output");
@@ -274,7 +274,7 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
                 if ((vertex || control || evaluation || mesh) && (capability == spv::CapabilityClipDistance || capability == spv::CapabilityCullDistance)) {
                     char word[16];
                     std::snprintf(word, sizeof(word), "0x%08x", state.paClVsOutCntl);
-                    Require(capability == spv::CapabilityClipDistance ? shaderClipDistance : (vertex || mesh) && shaderCullDistance, std::string("vertex clip or cull distance needs shaderClipDistance or shaderCullDistance, which the device lacks (PA_CL_VS_OUT_CNTL=") + word + ")");
+                    Require(capability == spv::CapabilityClipDistance ? shaderClipDistance : (vertex || evaluation || mesh) && shaderCullDistance, std::string("vertex clip or cull distance needs shaderClipDistance or shaderCullDistance, which the device lacks (PA_CL_VS_OUT_CNTL=") + word + ")");
                 }
 
                 // Enabled unconditionally or by the device setup in VulkanDevice.
@@ -290,7 +290,7 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
                     (fragment && sampleRateShading && capability == spv::CapabilityInterpolationFunction) ||
                     capability == spv::CapabilityImageMSArray ||
                     capability == spv::CapabilityStorageImageMultisample ||
-                    ((vertex || mesh) && shaderCullDistance && capability == spv::CapabilityCullDistance) ||
+                    ((vertex || evaluation || mesh) && shaderCullDistance && capability == spv::CapabilityCullDistance) ||
                     capability == spv::CapabilityStorageImageWriteWithoutFormat ||
                     capability == spv::CapabilityStorageImageReadWithoutFormat ||
                     capability == spv::CapabilityInt64 ||
@@ -612,6 +612,12 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
             } else {
                 Require(binding->count != 0u && binding->count <= capacity && count != module.constants.end() && count->second == binding->count, "typed heap array length disagrees with compact binding");
             }
+        } else if (variable.storage == spv::StorageClassUniform) {
+            namespace Abi = ShaderRecompiler::RuntimeAbi;
+            constexpr auto bindingCount = static_cast<std::uint32_t>(Abi::Binding::Count);
+            Require(shader.dataAddressPush && decoration.set && decoration.binding && *decoration.set == Abi::GpuDataSet &&
+                        *decoration.binding % bindingCount == static_cast<std::uint32_t>(Abi::Binding::ShaderData),
+                    "a uniform buffer is only the GPU heap's shader data");
         } else {
             Require(variable.storage == spv::StorageClassStorageBuffer && decoration.set && decoration.binding, "unsupported or unbound shader resource");
             const auto key = std::make_pair(*decoration.set, *decoration.binding);

@@ -33,6 +33,7 @@ public:
     static BindlessHeap* Existing(const Context& context);
     static void Release(VkDevice device);
     static bool Fits(const VkPhysicalDeviceDescriptorHeapPropertiesEXT& properties);
+    static bool RingInResourceHeap(const VkPhysicalDeviceDescriptorHeapPropertiesEXT& properties, VkDeviceSize uniformAlignment);
 
     bool DescriptorHeapMode() const { return resourceHeap != nullptr; }
     VkDeviceSize ImageHeapStride() const { return imageHeapStride; }
@@ -45,6 +46,7 @@ public:
     void WriteMeshWindowBuffer(VkDeviceAddress address, VkDeviceSize bytes);
     VkDeviceAddress RingAddress() const;
     VkBuffer RingBuffer() const;
+    VkDeviceSize RingOffset() const;
 
     std::optional<std::uint32_t> TextureSlot(std::uint32_t kind, const std::shared_ptr<Texture>& texture, VkImageView view,
                                              VkImageLayout layout);
@@ -54,6 +56,7 @@ public:
     void ReleaseViewSlots(const void* owner);
     std::uint32_t SlotGeneration(std::uint32_t slot) const;
     const Texture* SlotTexture(std::uint32_t kind, std::uint32_t slot) const;
+    bool SlotHoldsStorage(std::uint32_t kind, std::uint32_t slot, const void* owner, VkImageView view) const;
     std::optional<std::uint32_t> SamplerSlot(const std::shared_ptr<Sampler>& sampler);
     std::uint32_t SamplerGeneration(std::uint32_t slot) const;
     std::uint64_t SlotSerial() const { return slotSerial.load(std::memory_order_acquire); }
@@ -61,6 +64,7 @@ public:
                             std::span<const std::uint32_t> samplerSlots, std::span<const std::uint32_t> samplerGenerations) const;
     std::uint32_t AbsentSlot(std::uint32_t kind, VkImageView view);
     static bool NearlyFull();
+    static std::uint32_t ImageSlotCapacity();
     static void NoteSweepDue();
     static void NoteStorageEvicted();
     static void SweepIfDue();
@@ -82,17 +86,22 @@ public:
     void Submitted(Recorder& recorder, std::uint64_t serial);
 
     struct Counts {
-        std::uint64_t textures = 0, samplers = 0, full = 0, ringWraps = 0;
+        std::uint64_t textures = 0, samplers = 0, full = 0, ringWraps = 0, encodes = 0, encodedCopies = 0;
         std::uint64_t slotsFreed = 0, slotsReused = 0, sweeps = 0, chunkWaits = 0;
         std::uint64_t spansWritten = 0, spansKept = 0, spansExpired = 0, keptChunksSkipped = 0;
     };
     Counts Statistics() const;
 
     static constexpr std::size_t RingBytes = 64u << 20u;
+    static constexpr std::size_t RingChunkBytes = 2u << 20u;
 
 private:
     Context context;
     std::unique_ptr<Buffer> ring;
+    std::byte* ringData = nullptr;
+    std::size_t ringBytes = RingBytes;
+    VkDeviceSize ringHeapOffset = 0;
+    bool ringInHeap = false;
     std::unique_ptr<Buffer> resourceHeap;
     std::unique_ptr<Buffer> samplerHeap;
     VkDeviceSize imageHeapStride = 0;
@@ -101,10 +110,12 @@ private:
     VkDeviceSize pixelLdsHeapOffset = 0;
     VkDeviceSize meshWindowHeapOffset = 0;
     VkDeviceSize samplerHeapUsed = 0;
+    PFN_vkWriteResourceDescriptorsEXT writeResourceDescriptors = nullptr;
+    PFN_vkWriteSamplerDescriptorsEXT writeSamplerDescriptors = nullptr;
+    std::vector<std::byte> encodeScratch;
     void writeImageSlot(std::uint32_t kind, std::uint32_t slot, VkImageView view, VkImageLayout layout);
     void writeSamplerSlot(std::uint32_t slot, VkSampler sampler);
     void writeBufferDescriptor(VkDeviceSize offset, VkDeviceAddress address, VkDeviceSize bytes, const char* what);
-    static constexpr std::size_t RingChunkBytes = 4u << 20u;
     struct Chunk {
         Recorder* recorder = nullptr;
         std::uint64_t serial = 0;

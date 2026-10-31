@@ -308,12 +308,12 @@ void PlanMeshWindowBuffer(SpirvEmitterState& state) {
     state.meshWindowEntryLive = order.empty() ? Slots(slots, true) : liveIn.at(order.front());
 }
 
-bool WritesGuestMemory(const IrProgram& program) {
+}
+
+bool WritesGuestBuffers(const IrProgram& program) {
     const auto& info = program.Info();
-    const auto writtenImage = [](const ImageResource& image) { return !image.targetMerge && (image.written || image.atomic || image.atomic64); };
-    const auto writtenModes = [&](const std::vector<ImageResource>& modes) { return std::ranges::any_of(modes, writtenImage); };
     const auto writtenBuffer = [](const BufferResource& buffer) { return buffer.written || buffer.atomic; };
-    if (info.bdaWrites || std::ranges::any_of(info.buffers, writtenBuffer) || std::ranges::any_of(info.images, writtenImage) || std::ranges::any_of(info.runtimeImageModes, writtenModes)) return true;
+    if (info.bdaWrites || std::ranges::any_of(info.buffers, writtenBuffer)) return true;
     const auto& memory = program.Resources().memoryInfo;
     for (const auto& block : program.Blocks()) {
         for (const IrValue* inst : block->Instructions()) {
@@ -327,6 +327,11 @@ bool WritesGuestMemory(const IrProgram& program) {
     return false;
 }
 
+bool WritesGuestMemory(const IrProgram& program) {
+    const auto& info = program.Info();
+    const auto writtenImage = [](const ImageResource& image) { return !image.targetMerge && (image.written || image.atomic || image.atomic64); };
+    const auto writtenModes = [&](const std::vector<ImageResource>& modes) { return std::ranges::any_of(modes, writtenImage); };
+    return std::ranges::any_of(info.images, writtenImage) || std::ranges::any_of(info.runtimeImageModes, writtenModes) || WritesGuestBuffers(program);
 }
 
 void DefineModule(SpirvEmitterState& state) {
@@ -471,7 +476,9 @@ void DefineModule(SpirvEmitterState& state) {
     const bool deviceFloat64 = std::find(state.supportedCapabilities.begin(), state.supportedCapabilities.end(), static_cast<std::uint32_t>(spv::CapabilityFloat64)) != state.supportedCapabilities.end();
     state.integerInterpolation = state.requirements.float64Interpolation && !deviceFloat64;
     if (state.integerInterpolation) state.module.EmitCapability(spv::CapabilityInt64);
-    if (state.requirements.float64 || (state.requirements.float64Interpolation && deviceFloat64)) {
+    state.integerFloat64 = state.requirements.float64 && !deviceFloat64 && !state.requirements.float64NeedsDevice;
+    if (state.integerFloat64) state.module.EmitCapability(spv::CapabilityInt64);
+    if (!state.integerFloat64 && (state.requirements.float64 || (state.requirements.float64Interpolation && deviceFloat64))) {
         if (!deviceFloat64) {
             throw std::runtime_error("64-bit float instructions need the Float64 capability, which the device lacks");
         }
