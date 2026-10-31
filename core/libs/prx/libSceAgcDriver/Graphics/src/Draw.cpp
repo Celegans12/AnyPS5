@@ -1909,17 +1909,17 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     if (resolved.cacheable) {
         resolved.contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
         if (auto cached = SharedResourceCache().Find(resolved.contentKey)) {
+            const auto releaseSpace = [](ShaderResources* resources) { static_cast<void>(resources->ReleaseSpace()); };
+            std::unique_ptr<ShaderResources, decltype(releaseSpace)> heldSpace(cached->SpaceReuse() ? cached.get() : nullptr, releaseSpace);
             bool spaceHeld = !cached->SpaceReuse();
-            if (!spaceHeld && cached->RetakeSpace()) {
-                spaceHeld = cached->SnapshotsServedInPlace(snapshots);
-                if (!spaceHeld) static_cast<void>(cached->ReleaseSpace());
-            }
+            if (!spaceHeld && cached->RetakeSpace()) spaceHeld = cached->SnapshotsServedInPlace(snapshots);
             const bool valid = spaceHeld && cached->Revalidate(shaders);
             auto* recorder = Recorder::Active();
             std::optional<std::vector<ShaderResources::MovedBuffer>> moved;
             if (valid && recorder != nullptr) moved = cached->MovedReadOnlyBuffers(shaders, *recorder, &state.color);
             if (moved.has_value()) {
                 if (trimKey) CheckBufferAliases(shaders, state.color, draw.indexAddress, indexBytes);
+                static_cast<void>(heldSpace.release());
                 resolved.resources = std::move(cached);
                 resolved.moved = std::move(*moved);
                 if (resolved.resources->HeapStage()) resolved.resources->RefreshHeapStage(shaders);
@@ -1927,10 +1927,8 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                 outcome.kind = KindTemplateHit;
                 countCache(&DrawProfile::cacheHits);
             } else if (valid) {
-                if (cached->SpaceReuse()) static_cast<void>(cached->ReleaseSpace());
                 countCache(&DrawProfile::cacheMisses);
             } else {
-                if (cached->SpaceReuse()) static_cast<void>(cached->ReleaseSpace());
                 SharedResourceCache().Remove(resolved.contentKey);
                 countCache(&DrawProfile::cacheInvalidated);
             }

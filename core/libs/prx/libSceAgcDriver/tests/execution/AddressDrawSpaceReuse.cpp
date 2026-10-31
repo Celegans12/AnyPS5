@@ -159,6 +159,7 @@ struct Scene {
     Pages code{BlockBytes};
     Pages constants{BlockBytes};
     Pages spare{BlockBytes};
+    Pages alias{BlockBytes};
     std::deque<ShaderRecompiler::RecompileResult> vertexResults;
     std::uint32_t vertexPush = 0;
     std::deque<ShaderRecompiler::RecompileResult> pixelResults;
@@ -175,6 +176,7 @@ struct Scene {
         code.Register(false);
         constants.Register(true);
         spare.Register(true);
+        alias.Register(true);
         Fetch(vertices, 0);
         state.stages = {AgcDriver::Graphics::ShaderPath::Vertex, 0u, 64u, 64u, std::nullopt, std::nullopt};
         state.color = {pixels.Address(), {Width, Height}, VK_FORMAT_R8G8B8A8_UNORM, TargetLayout.Bytes(), 0xe4u, ColorTileMode::RenderTarget};
@@ -356,6 +358,30 @@ void RecipeAfterSnapshotChange(Scene& scene) {
     Require(recipe == nullptr, "address draw space reuse: a draw recipe was made from a build whose reuse must retake its address space and check its snapshots");
 }
 
+void ThrowingHit(Scene& scene) {
+    scene.Store(scene.constants, 0, 110);
+    for (int warm = 0; warm < 2; ++warm) Require(scene.DrawnColor() == 110, "address draw space reuse: the draw before the aliasing draw did not read the guest constant");
+    const auto color = scene.state.color;
+    scene.state.color.address = scene.alias.Address();
+    scene.state.colors = {scene.state.color};
+    scene.Fetch(scene.alias, 0);
+    const auto before = Builds();
+    std::string refused;
+    try {
+        scene.Draw();
+    } catch (const std::exception& error) {
+        refused = error.what();
+    }
+    const auto built = Builds() - before;
+    scene.state.color = color;
+    scene.state.colors = {color};
+    scene.Fetch(scene.vertices, 0);
+    Require(!refused.empty(), "address draw space reuse: a draw whose vertex buffer aliases its render target was recorded");
+    Require(built == 0, "address draw space reuse: the draw whose vertex buffer aliases its render target built its resources (" + std::to_string(built) + " builds) instead of hitting the cached build");
+    scene.RequireFreeAtOnce("after a hit that threw before it was served (" + refused + ")");
+    Require(scene.DrawnColor() == 110, "address draw space reuse: the draw after the refused aliasing draw did not read the guest constant");
+}
+
 void Disabled(Scene& scene) {
     scene.Store(scene.constants, 0, 70);
     Require(scene.DrawnColor() == 70, "address draw space reuse: the first draw with the reuse off did not read the guest constant");
@@ -381,11 +407,12 @@ struct NamedCase {
     Case run;
 };
 
-constexpr std::array<NamedCase, 4> Cases{{
+constexpr std::array<NamedCase, 5> Cases{{
     {"unchanged", UnchangedInputs},
     {"cpu-write", CpuWrite},
     {"idle-free", IdleFree},
     {"recipe-snapshot", RecipeAfterSnapshotChange},
+    {"throwing-hit", ThrowingHit},
 }};
 
 }
@@ -405,19 +432,24 @@ int main(int argc, char** argv) {
                 std::puts("skipped, host imports are unavailable: the cached address space needs one");
                 return VulkanTestSkipped;
             }
-            if (!reuse) {
-                Require(only.empty(), "address draw space reuse: --case needs APS5_GPU_HEAP set");
-                Disabled(scene);
-            } else {
-                bool ran = false;
-                for (const auto& entry : Cases) {
-                    if (!only.empty() && only != entry.name) continue;
-                    entry.run(scene);
-                    ran = true;
+            try {
+                if (!reuse) {
+                    Require(only.empty(), "address draw space reuse: --case needs APS5_GPU_HEAP set");
+                    Disabled(scene);
+                } else {
+                    bool ran = false;
+                    for (const auto& entry : Cases) {
+                        if (!only.empty() && only != entry.name) continue;
+                        entry.run(scene);
+                        ran = true;
+                    }
+                    Require(ran, "address draw space reuse: no case is named " + only);
                 }
-                Require(ran, "address draw space reuse: no case is named " + only);
+                scene.Wait();
+            } catch (const std::exception& error) {
+                std::cerr << error.what() << std::endl;
+                std::_Exit(1);
             }
-            scene.Wait();
         }
         std::printf("address draw space reuse tests passed%s%s\n", reuse ? "" : " with the reuse off", only.empty() ? "" : (" " + only).c_str());
         return 0;
