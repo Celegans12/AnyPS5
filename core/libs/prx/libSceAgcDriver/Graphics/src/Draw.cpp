@@ -3271,6 +3271,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         Require(std::ranges::any_of(images, [&](const std::pair<VkImage, bool>& image) { return image.first == binding.resident->Image() && image.second; }), "the partial write of a packed color target does not store into the target's resident image");
     }
     if (!lean && !resolved.moved.empty()) {
+        if (resolved.resources->SpaceReuse()) static_cast<void>(resolved.resources->ReleaseSpace());
         resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots);
         resolved.moved.clear();
     }
@@ -3799,6 +3800,15 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     prepared.recipeOut = recipeOut;
     prepared.trace = trace;
     prepared.shape = shape;
+    const struct HeldSpace {
+        PreparedDraw& prepared;
+        ~HeldSpace() {
+            const auto& resources = prepared.resolved.resources;
+            if (resources == nullptr || !resources->SpaceReuse()) return;
+            auto space = resources->ReleaseSpace();
+            if (space != nullptr && prepared.recorder != nullptr) prepared.recorder->Keep(std::const_pointer_cast<void>(std::move(space)));
+        }
+    } heldSpace{prepared};
     if (prepareDraw(context, state, draw, shaders, snapshots, prepared)) recordPreparedDraw(context, state, draw, shaders, prepared);
 }
 

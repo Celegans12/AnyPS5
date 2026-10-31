@@ -48,6 +48,9 @@ constexpr std::size_t BlockBytes = 65536;
 constexpr std::size_t VertexCodeOffset = 0;
 constexpr std::size_t PixelCodeOffset = 256;
 constexpr std::size_t CapturedOffset = 1024;
+constexpr std::size_t RecordsOffset = 2048;
+constexpr std::size_t MovedVerticesOffset = 32768;
+constexpr std::uint32_t NoLocation = 0x280u;
 constexpr std::uint32_t PinWaitMs = 4000;
 
 constexpr std::array<std::uint32_t, 6> VertexCode{
@@ -170,6 +173,7 @@ struct Scene {
     explicit Scene(AgcDriver::VulkanDevice& device) : device(device) {
         pixels.Register(true);
         std::memcpy(vertices.Data(), Triangle.data(), sizeof(Triangle));
+        std::memcpy(vertices.Data() + MovedVerticesOffset, Triangle.data(), sizeof(Triangle));
         vertices.Register(false);
         std::memcpy(code.Data() + VertexCodeOffset, VertexCode.data(), sizeof(VertexCode));
         std::memcpy(code.Data() + PixelCodeOffset, PixelCode.data(), sizeof(PixelCode));
@@ -249,6 +253,13 @@ struct Scene {
         std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
         const AgcDriver::Pm4::DrawParameters draw{0, static_cast<std::uint32_t>(Triangle.size()), 0, 1, 0, false};
         device.Draw(state, draw, shaders, snapshots, recipe);
+    }
+
+    void DrawWithoutRecords() {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        AgcDriver::Pm4::DrawParameters draw{0, 0, 0, 0, 0, false, 0, 0};
+        draw.indirect = AgcDriver::Pm4::DrawParameters::IndirectDraw{constants.Address(RecordsOffset), 0x24u, 16u, 16u, 0u, false, 0u, NoLocation, NoLocation, NoLocation, false, 0u};
+        device.Draw(state, draw, shaders, snapshots);
     }
 
     AgcDriver::RecipeOutcome DrawFromRecipe(const std::shared_ptr<const AgcDriver::DrawRecipe>& recipe) {
@@ -382,6 +393,29 @@ void ThrowingHit(Scene& scene) {
     Require(scene.DrawnColor() == 110, "address draw space reuse: the draw after the refused aliasing draw did not read the guest constant");
 }
 
+void MovedVertices(Scene& scene) {
+    scene.Store(scene.constants, 0, 170);
+    for (int warm = 0; warm < 2; ++warm) Require(scene.DrawnColor() == 170, "address draw space reuse: the draw before the vertex buffer moved did not read the guest constant");
+    const auto before = Builds();
+    scene.Fetch(scene.vertices, MovedVerticesOffset);
+    const auto color = scene.DrawnColor();
+    scene.Fetch(scene.vertices, 0);
+    Require(color == 170, "address draw space reuse: the draw after its read-only vertex buffer moved read " + std::to_string(color) + " instead of 170");
+    const bool transitions = std::getenv("APS5_DRAW_TRANSITIONS") != nullptr;
+    Require(transitions || Builds() == before, "address draw space reuse: the draw whose read-only vertex buffer moved inside the space built its resources (" + std::to_string(Builds() - before) + " builds) instead of binding the moved buffer to the cached build");
+    scene.RequireFreeAtOnce(transitions ? "after the transition path built a draw whose vertex buffer moved anew" : "after a draw whose vertex buffer moved inside it");
+}
+
+void NoRecords(Scene& scene) {
+    scene.Store(scene.constants, 0, 60);
+    for (int warm = 0; warm < 2; ++warm) Require(scene.DrawnColor() == 60, "address draw space reuse: the draw before the indirect draw did not read the guest constant");
+    const auto before = Builds();
+    scene.DrawWithoutRecords();
+    Require(Builds() == before, "address draw space reuse: the indirect draw without records built its resources (" + std::to_string(Builds() - before) + " builds) instead of hitting the cached build");
+    scene.RequireFreeAtOnce("after an indirect draw without records ended after its resource-cache hit");
+    Require(scene.DrawnColor() == 60, "address draw space reuse: the draw after the indirect draw did not read the guest constant");
+}
+
 void Disabled(Scene& scene) {
     scene.Store(scene.constants, 0, 70);
     Require(scene.DrawnColor() == 70, "address draw space reuse: the first draw with the reuse off did not read the guest constant");
@@ -407,12 +441,14 @@ struct NamedCase {
     Case run;
 };
 
-constexpr std::array<NamedCase, 5> Cases{{
+constexpr std::array<NamedCase, 7> Cases{{
     {"unchanged", UnchangedInputs},
     {"cpu-write", CpuWrite},
     {"idle-free", IdleFree},
     {"recipe-snapshot", RecipeAfterSnapshotChange},
     {"throwing-hit", ThrowingHit},
+    {"moved-vertices", MovedVertices},
+    {"no-records", NoRecords},
 }};
 
 }
