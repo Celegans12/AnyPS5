@@ -6349,9 +6349,11 @@ void ShaderResources::writeHeapTableMap(const CompiledShader& shader, std::size_
         }
         return false;
     };
+    const auto samplerSpan = std::max<std::size_t>(elements, map[TableAbi::HeaderSamplerCount]);
+    Require(table->tableSamplers.size() <= samplerSpan, "an image table map has more table samplers than its header counts");
+    const auto extraBase = base + 2u * elements + samplerSpan;
     if (anyAtomic(false) || anyAtomic(true)) {
-        Require(table->tableSamplers.size() <= elements, "an image table with atomics has more table samplers than elements");
-        map.resize(base + 3u * elements, fallbackSampler);
+        map.resize(extraBase, fallbackSampler);
         for (const bool wide : {false, true}) {
             const auto kind = wide ? Abi::FirstAtomic64ImageBinding : Abi::FirstAtomicImageBinding;
             const auto absent = heap.AbsentSlot(kind, heapPlaceholderView(kind));
@@ -6368,6 +6370,24 @@ void ShaderResources::writeHeapTableMap(const CompiledShader& shader, std::size_
                 Require(slot.has_value(), "the global atomic image heap is full");
                 map.push_back(*slot);
             }
+        }
+    }
+    const bool storageTable = std::ranges::any_of(shader.program->bindings, [](const ShaderRecompiler::DescriptorBinding& binding) {
+        return binding.role == ShaderRecompiler::DescriptorRole::ImageStorageTable;
+    });
+    if (storageTable) {
+        map.resize(extraBase + 2u * elements, fallbackSampler);
+        const auto kind = Abi::FirstStorageImageBinding + 7u;
+        const auto absent = heap.AbsentSlot(kind, heapPlaceholderView(kind));
+        for (std::size_t element = 0; element < elements; ++element) {
+            const auto index = element < table->elementStorage.size() ? table->elementStorage[element] : noElement;
+            if (index == noElement || storageTextures[index] == nullptr) {
+                map.push_back(absent);
+                continue;
+            }
+            const auto slot = heap.StorageSlot(kind, storageTextures[index], storageTextures[index]->UintStorageViewOrDefault(storageMips[index], storageFirstLayer[index]));
+            Require(slot.has_value(), "the global storage image heap is full");
+            map.push_back(*slot);
         }
     }
     if (map.size() == base) map.push_back(sampledAbsent);

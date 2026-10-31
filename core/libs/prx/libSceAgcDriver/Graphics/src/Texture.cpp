@@ -2072,6 +2072,13 @@ VkImageView StorageTexture::StorageView(std::uint32_t mip, bool firstLayer, bool
     return created;
 }
 
+VkImageView StorageTexture::UintStorageViewOrDefault(std::uint32_t mip, bool firstLayer) {
+    const auto uintFormat = UintStorageViewFormat(storageFormat);
+    const bool available = PackedStorageViewFormat(storageFormat) == VK_FORMAT_UNDEFINED && uintFormat != VK_FORMAT_UNDEFINED &&
+                           StorageFormatOrUndefined(context, uintFormat) == uintFormat;
+    return StorageView(mip, firstLayer, available);
+}
+
 VkImageView StorageTexture::ElementView() {
     if (elementView != VK_NULL_HANDLE) return elementView;
     if (descriptor.dimension != TextureDimension::k2D || geometry.imageLayers != 1) return VK_NULL_HANDLE;
