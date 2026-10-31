@@ -629,6 +629,12 @@ const Texture* BindlessHeap::SlotTexture(std::uint32_t kind, std::uint32_t slot)
     return owner != nullptr && owner->key.kind == kind ? owner->texture.get() : nullptr;
 }
 
+bool BindlessHeap::SlotHoldsStorage(std::uint32_t kind, std::uint32_t slot, const void* owner, VkImageView view) const {
+    std::lock_guard lock(mutex);
+    const auto* held = ownerLocked(slot);
+    return held != nullptr && held->key == TextureKey{kind, owner, view, VK_IMAGE_LAYOUT_GENERAL};
+}
+
 std::uint32_t BindlessHeap::AbsentSlot(std::uint32_t kind, VkImageView view) {
     if (kind < Abi::FirstImageBinding || kind >= SamplerKind) throw std::runtime_error("AGC bindless heap: invalid absent slot request");
     std::lock_guard lock(mutex);

@@ -54,6 +54,7 @@ public:
     void ReleaseViewSlots(const void* owner);
     std::uint32_t SlotGeneration(std::uint32_t slot) const;
     const Texture* SlotTexture(std::uint32_t kind, std::uint32_t slot) const;
+    bool SlotHoldsStorage(std::uint32_t kind, std::uint32_t slot, const void* owner, VkImageView view) const;
     std::optional<std::uint32_t> SamplerSlot(const std::shared_ptr<Sampler>& sampler);
     std::uint32_t SamplerGeneration(std::uint32_t slot) const;
     std::uint64_t SlotSerial() const { return slotSerial.load(std::memory_order_acquire); }

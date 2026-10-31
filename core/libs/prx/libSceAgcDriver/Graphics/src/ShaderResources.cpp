@@ -6506,22 +6506,31 @@ void ShaderResources::noteHeapSlotGenerations(const BindlessHeap& heap, HeapStag
 
 void ShaderResources::verifyHeapSlots(const BindlessHeap& heap, const HeapStageState& state, VkShaderStageFlags stageBit) const {
     constexpr auto bindingCount = static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Count);
-    static std::atomic<std::uint64_t> checked{0}, wrong{0};
+    static std::atomic<std::uint64_t> checked{0}, wrong{0}, storageChecked{0}, storageWrong{0};
     for (const auto& binding : bindings) {
-        if (!ownsHeapBinding(binding, stageBit) || binding.layout.descriptorType != VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE) continue;
+        if (!ownsHeapBinding(binding, stageBit)) continue;
+        const bool sampled = binding.layout.descriptorType == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        const bool storage = binding.layout.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        if (!sampled && !storage) continue;
         const auto kind = binding.layout.binding % bindingCount;
         for (std::size_t element = 0; element < binding.imageAllocations.size(); ++element) {
             const auto index = binding.imageAllocations[element];
             if (index == std::numeric_limits<std::size_t>::max()) continue;
-            ++checked;
-            const bool holdsTexture =
-                element < state.slots[kind].size() && heap.SlotTexture(kind, state.slots[kind][element]) == textures[index].get();
-            if (!holdsTexture) ++wrong;
+            const bool bound = element < state.slots[kind].size();
+            if (sampled) {
+                ++checked;
+                if (!bound || heap.SlotTexture(kind, state.slots[kind][element]) != textures[index].get()) ++wrong;
+                continue;
+            }
+            if (storageTextures[index] == nullptr) continue;
+            ++storageChecked;
+            if (!bound || !heap.SlotHoldsStorage(kind, state.slots[kind][element], storageTextures[index].get(), heapStorageView(index, binding.layout.binding))) ++storageWrong;
         }
     }
-    if (checked.load() % 100000u < 8u) {
-        std::fprintf(stderr, "[heap-slots] verify: %llu image slots checked, %llu hold another texture\n",
-                     static_cast<unsigned long long>(checked.load()), static_cast<unsigned long long>(wrong.load()));
+    if ((checked.load() + storageChecked.load()) % 100000u < 8u) {
+        std::fprintf(stderr, "[heap-slots] verify: %llu image slots checked, %llu hold another texture; %llu storage slots checked, %llu hold another image or view\n",
+                     static_cast<unsigned long long>(checked.load()), static_cast<unsigned long long>(wrong.load()),
+                     static_cast<unsigned long long>(storageChecked.load()), static_cast<unsigned long long>(storageWrong.load()));
     }
 }
 
