@@ -7,6 +7,8 @@
 #include <iterator>
 #include <initializer_list>
 #include <vector>
+#include <cstdlib>
+#include <string>
 
 namespace ShaderRecompiler {
 
@@ -266,6 +268,20 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
         {binary(spv::OpULessThan, boolean, result, base), BdaAbi::FaultReason::Overflow},
         {binary(spv::OpULessThanEqual, boolean, deviceEnd, result), BdaAbi::FaultReason::Overflow},
     });
+    // Diagnostic (request bench overlap prototype, never in the game): APS5_DIAG_WATCH=lo-hi,... (hex guest ranges, read
+    // when the module is emitted): a read whose bytes reach a listed range records FaultReason::Watched and goes on.
+    if (const char* watch = std::getenv("APS5_DIAG_WATCH"); watch != nullptr && *watch != '\0' && (permission & BdaAbi::Read) != 0u && state.bdaFaultFunction != 0 && state.program.Info().usesDma) {
+        std::uint32_t hit = ConstantBool(state, false);
+        for (const char* cursor = watch; *cursor != '\0';) {
+            char* next = nullptr;
+            const auto lo = std::strtoull(cursor, &next, 16);
+            if (next == cursor || *next != '-') break;
+            const auto hi = std::strtoull(next + 1, &next, 16);
+            hit = binary(spv::OpLogicalOr, boolean, hit, binary(spv::OpLogicalAnd, boolean, binary(spv::OpULessThan, boolean, address, BdaConstant(state, hi)), binary(spv::OpUGreaterThan, boolean, end, BdaConstant(state, lo))));
+            cursor = *next == ',' ? next + 1 : next;
+        }
+        EmitIfCondition(state, hit, [&] { RecordBdaFaultReason(state, address, bytes, instruction, constant(static_cast<std::uint32_t>(BdaAbi::FaultReason::Watched))); });
+    }
     if (rangeResult) {
         const auto last = binary(spv::OpUGreaterThanEqual, boolean, index, count);
         const auto next = BdaLoadAddress(state, binary(spv::OpIAdd, u32, constant(4), binary(spv::OpIMul, u32, Select(state, u32, last, binary(spv::OpISub, u32, index, constant(1)), index), constant(8))));

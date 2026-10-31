@@ -391,6 +391,11 @@ VkDescriptorBufferInfo BdaResources::Fault() const {
 
 namespace {
 std::atomic<bool> loopGuardTripped{false};
+std::atomic<std::uint64_t> watchHits{0};
+}
+
+std::uint64_t BdaWatchHits() {
+    return watchHits.load(std::memory_order_relaxed);
 }
 
 bool LoopGuardTripped() {
@@ -408,6 +413,11 @@ void BdaResources::CheckFault(std::uint64_t shaderAddress) const {
     }
     Require(report.state == ShaderRecompiler::BdaAbi::FaultState::Ready && report.otherFaults <= 1, "incomplete or invalid BDA fault record");
     Require(report.reason != ShaderRecompiler::BdaAbi::FaultReason::InvalidRectangle, "rect-list requires finite nondegenerate axis-aligned positions with equal positive W");
+    if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::Watched) {
+        watchHits.fetch_add(1u + report.otherFaults, std::memory_order_relaxed);
+        std::memset(fault->Bytes().data(), 0, fault->Bytes().size());
+        return;
+    }
     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::LoopLimit) {
         // APS5_LOOP_GUARD: the shader left a loop that ran past the guard; the dispatch result is kept.
         loopGuardTripped.store(true, std::memory_order_relaxed);

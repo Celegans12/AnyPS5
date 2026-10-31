@@ -10,6 +10,8 @@
 namespace AgcDriver::Graphics {
 
 bool LoopGuardTripped();
+// Request-bench diagnostic: reads that hit an APS5_DIAG_WATCH range (FaultReason::Watched), cumulative.
+std::uint64_t BdaWatchHits();
 
 class BdaResources {
 public:

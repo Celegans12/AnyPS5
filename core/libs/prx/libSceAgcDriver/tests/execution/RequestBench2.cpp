@@ -15,6 +15,7 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
@@ -344,8 +345,32 @@ int main(int argc, char** argv) {
                 }
             }
         };
+        // BENCH_WATCH=1 (with BENCH_COPIES > 1 and BENCH_OVERLAP=1; overlap prototype, diagnostic build only): every
+        // instance is recompiled with APS5_DIAG_WATCH = the other instances' write ranges, so a read of another
+        // instance's written bytes records FaultReason::Watched (BdaWatchHits). A round with a hit is a conflict and is
+        // replayed serially from the restored inputs (its time counts both). BENCH_WATCH_ALL=1: positive control, every
+        // read is watched, so every round must conflict.
+        const bool watch = std::getenv("BENCH_WATCH") != nullptr && copies > 1u;
+        const auto watchList = [&](std::uint64_t self) {
+            if (std::getenv("BENCH_WATCH_ALL") != nullptr) return std::string("0-ffffffffffffff");
+            std::string list;
+            char item[64];
+            for (std::uint64_t other = 0; other < copies; ++other) {
+                if (other == self) continue;
+                for (const auto& [begin, end] : shader.writeRanges) {
+                    std::snprintf(item, sizeof(item), "%s%llx-%llx", list.empty() ? "" : ",", static_cast<unsigned long long>(begin + other * copyStride), static_cast<unsigned long long>(end + other * copyStride));
+                    list += item;
+                }
+            }
+            return list;
+        };
+        if (watch) {
+            if (shader.unboundedWrites) throw std::runtime_error("BENCH_WATCH: the program's writes are unbounded");
+            std::printf("request bench: watch: %zu write ranges per instance, unbounded reads %d\n", shader.writeRanges.size(), shader.unboundedReads ? 1 : 0);
+        }
         for (std::uint64_t k = 1; k < copies; ++k) {
             auto& copy = copyList[k - 1u];
+            if (watch) _putenv_s("APS5_DIAG_WATCH", watchList(k).c_str());
             copy.offset = k * copyStride;
             for (const auto& region : request.request.context.memory) {
                 const bool code = region.guestAddress >= codeBegin && region.guestAddress < codeEnd;
@@ -366,6 +391,15 @@ int main(int argc, char** argv) {
             copy.shader = std::make_unique<ShaderRecompiler::RecompileResult>(ShaderRecompiler::Recompile(copied));
             for (const auto& [begin, end] : owned) space.Want(begin + copy.offset, end - begin);
         }
+        if (watch) _putenv_s("APS5_DIAG_WATCH", "");
+        std::unique_ptr<ShaderRecompiler::RecompileResult> watchedBase;
+        if (watch) {
+            _putenv_s("APS5_DIAG_WATCH", watchList(0).c_str());
+            watchedBase = std::make_unique<ShaderRecompiler::RecompileResult>(ShaderRecompiler::Recompile(request.request));
+            _putenv_s("APS5_DIAG_WATCH", "");
+        }
+        const ShaderRecompiler::RecompileResult& base = watchedBase ? *watchedBase : shader;
+        if (watch) std::printf("request bench: watch: base module %zu words (unwatched %zu), first copy %zu words\n", base.spirv.size(), shader.spirv.size(), copyList.empty() ? std::size_t{0} : copyList.front().shader->spirv.size());
         if (copies > 1u) std::printf("request bench: %llu relocated copies, %llu guest words relocated per copy\n", static_cast<unsigned long long>(copies - 1u), static_cast<unsigned long long>(relocated / (copies - 1u)));
         space.Map();
         const auto fill = EnvText("BENCH_FILL", "mix");
@@ -452,15 +486,16 @@ int main(int argc, char** argv) {
         // BENCH_OVERLAP=1: the round's dispatches are one unordered run of a guest compute ring (as the packet
         // loop marks dispatches with no packet between them), so the recorder may overlap them.
         const bool overlap = std::getenv("BENCH_OVERLAP") != nullptr;
+        bool serialRound = false;
         const auto dispatchRound = [&] {
             bool first = true;
             const auto one = [&](const ShaderRecompiler::RecompileResult& compiled) {
-                if (overlap) AgcDriver::Graphics::Recorder::SetDispatchOrder(0x53, !first);
+                if (overlap && !serialRound) AgcDriver::Graphics::Recorder::SetDispatchOrder(0x53, !first);
                 first = false;
                 device->Dispatch(compiled, groups[0], groups[1], groups[2], {}, request.request.shader.codeAddress);
             };
             for (std::uint64_t batch = 0; batch < batchCount; ++batch) {
-                one(shader);
+                one(base);
                 for (const auto& copy : copyList) one(*copy.shader);
             }
         };
@@ -495,6 +530,8 @@ int main(int argc, char** argv) {
             probeTimes.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
         };
         std::vector<double> times;
+        std::uint64_t watchHitTotal = 0;
+        std::uint64_t conflictRounds = 0;
         std::uint64_t firstHash = 0;
         bool stable = true;
         // BENCH_WARMUP=s (default 4): dispatch for s seconds before timing, so a laptop GPU that idled through the
@@ -522,9 +559,22 @@ int main(int argc, char** argv) {
         for (std::uint64_t repeat = 0; repeat < repeats || std::chrono::steady_clock::now() - loopStart < std::chrono::seconds(seconds); ++repeat) {
             restore();
             const auto started = std::chrono::steady_clock::now();
+            const auto hitsBefore = AgcDriver::Graphics::BdaWatchHits();
             if (asyncProbe) probeRound();
             else dispatchRound();
             device->WaitIdle();
+            if (watch) {
+                const auto hits = AgcDriver::Graphics::BdaWatchHits() - hitsBefore;
+                watchHitTotal += hits;
+                if (hits != 0u) {
+                    ++conflictRounds;
+                    restore();
+                    serialRound = true;
+                    dispatchRound();
+                    device->WaitIdle();
+                    serialRound = false;
+                }
+            }
             times.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
             // Hash on the first repeat, then every 16th (images are large); the last one is hashed after the loop.
             if (repeat == 0 || repeat % 16u == 15u) {
@@ -549,6 +599,7 @@ int main(int argc, char** argv) {
         auto sorted = times;
         std::sort(sorted.begin(), sorted.end());
         std::printf("BENCH batch=%llu copies=%llu request=%s words=%zu groups=%u,%u,%u fill=%s best_ms=%.3f median_ms=%.3f hash=%016llx stable=%d\n", static_cast<unsigned long long>(batchCount), static_cast<unsigned long long>(copies), argv[1], shader.spirv.size(), groups[0], groups[1], groups[2], fill.c_str(), sorted.front(), sorted[sorted.size() / 2], static_cast<unsigned long long>(firstHash), stable ? 1 : 0);
+        if (watch) std::printf("WATCH rounds=%zu conflict_rounds=%llu watched_reads=%llu\n", times.size(), static_cast<unsigned long long>(conflictRounds), static_cast<unsigned long long>(watchHitTotal));
         if (asyncProbe && !probeTimes.empty()) {
             std::sort(probeTimes.begin(), probeTimes.end());
             std::printf("PROBE async_lane=%s main-lane result wait median_ms=%.3f best_ms=%.3f\n", std::getenv("APS5_ASYNC_LANE") != nullptr ? std::getenv("APS5_ASYNC_LANE") : "off", probeTimes[probeTimes.size() / 2], probeTimes.front());
