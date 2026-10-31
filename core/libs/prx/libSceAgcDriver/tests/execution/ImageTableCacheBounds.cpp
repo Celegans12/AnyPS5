@@ -404,7 +404,7 @@ void AtomicTable(const GuestBlock& block) {
     std::puts("image table atomics passed");
 }
 
-void StoreTable(const GuestBlock& block) {
+bool StoreTable(const GuestBlock& block) {
     std::memcpy(block.Bytes(AtomicKernelOffset), StoreTableCode.data(), sizeof(StoreTableCode));
     for (std::uint32_t record = 0; record < AtomicRecords; ++record) {
         const auto surface = TexturesOffset + static_cast<std::size_t>(record) * StoreSurfaceBytes;
@@ -421,6 +421,10 @@ void StoreTable(const GuestBlock& block) {
     std::copy(output.begin(), output.end(), srt + 12);
     const auto heapStages = AgcDriver::Graphics::HeapComputeStages();
     Dispatch(block, 0, AtomicKernelOffset);
+    if (!AgcDriver::Graphics::DescriptorHeapEnabled()) {
+        std::puts("image table store skipped: per-dispatch image tables have no uint storage view (docs/dev/debt/libSceAgcDriver.md)");
+        return false;
+    }
     std::array<std::uint64_t, AtomicWidth> texels{};
     AgcDriver::GuestMemory::Read(block.At(TexturesOffset + static_cast<std::size_t>(AtomicElement) * StoreSurfaceBytes), std::as_writable_bytes(std::span(texels)));
     for (std::uint32_t texel = 0; texel < AtomicWidth; ++texel) {
@@ -431,6 +435,7 @@ void StoreTable(const GuestBlock& block) {
     }
     if (AgcDriver::Graphics::DescriptorHeapEnabled()) Require(AgcDriver::Graphics::HeapComputeStages() > heapStages, "image table store: the dispatch did not take the descriptor heap");
     std::puts("image table store passed");
+    return true;
 }
 
 struct QueuedDraw {
@@ -574,9 +579,9 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (argc == 2 && std::string(argv[1]) == "--store-table") {
-            StoreTable(block);
+            const bool ran = StoreTable(block);
             AgcDriverShutdown_nid_postfix();
-            return 0;
+            return ran ? 0 : VulkanTestSkipped;
         }
         if (argc == 2 && std::string(argv[1]) == "--atomic-table") {
             AtomicTable(block);
