@@ -30,6 +30,7 @@ namespace AgcDriver::Graphics {
 
 class Buffer;
 class Recorder;
+class Sampler;
 class Texture;
 
 struct DeviceTableView {
@@ -72,6 +73,8 @@ public:
         std::function<std::uint32_t(std::uint32_t kind, std::uint32_t slot)> generation;
         std::function<std::uint64_t()> serial;
         std::function<bool()> nearlyFull;
+        std::function<std::optional<std::uint32_t>(const std::shared_ptr<Sampler>& sampler)> takeSampler;
+        std::function<std::uint32_t(std::uint32_t slot)> samplerGeneration;
     };
     struct Budget {
         std::uint32_t entries = 16384u;
@@ -166,6 +169,9 @@ private:
         std::uint64_t usedPresent = 0;
         std::array<std::uint32_t, 8> words{};
         bool depthCompare = false;
+        std::shared_ptr<Sampler> sampler;
+        std::uint32_t samplerSlot = 0;
+        std::uint32_t samplerGeneration = 0;
     };
     struct ValidationState {
         std::uint64_t epoch = 0;
