@@ -136,6 +136,16 @@ int main() {
             sdataRejected = std::string(error.what()).find("unwind pointer address overflowed") != std::string::npos;
         }
         Require(sdataRejected);
-        std::cout << "20 unwind record cases passed\n";
+        auto sdata8Overflow = Fixture();
+        sdata8Overflow[3] = 0x3C;
+        Io::WriteU64(sdata8Overflow, 16, 0x1000);
+        Io::WriteU64(sdata8Overflow, 24, 0x1000);
+        bool sdata8Rejected = false;
+        try { Relinker::UnusedNidFilter::ReadExceptionFunctions(sdata8Overflow, {highLoad, highEh}, {}, {}); }
+        catch (const Domain::RelinkerException& error) {
+            sdata8Rejected = std::string(error.what()).find("unwind pointer address overflowed") != std::string::npos;
+        }
+        Require(sdata8Rejected);
+        std::cout << "21 unwind record cases passed\n";
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }
