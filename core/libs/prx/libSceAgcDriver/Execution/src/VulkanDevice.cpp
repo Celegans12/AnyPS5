@@ -134,6 +134,25 @@ DeviceQueuePlan PlanDeviceQueues(std::span<const VkQueueFamilyProperties> famili
 
 namespace {
 
+std::optional<std::uint32_t> ActiveValidationLayerVersion(PFN_vkGetInstanceProcAddr instanceProc) {
+    const auto requested = [](const char* variable) {
+        const char* value = std::getenv(variable);
+        return value != nullptr && (std::strstr(value, "validation") != nullptr || std::strchr(value, '*') != nullptr);
+    };
+    if (!requested("VK_INSTANCE_LAYERS") && !requested("VK_LOADER_LAYERS_ENABLE")) return std::nullopt;
+    const auto enumerate = reinterpret_cast<PFN_vkEnumerateInstanceLayerProperties>(instanceProc(VK_NULL_HANDLE, "vkEnumerateInstanceLayerProperties"));
+    if (enumerate == nullptr) return std::nullopt;
+    std::uint32_t count = 0;
+    if (enumerate(&count, nullptr) != VK_SUCCESS) return std::nullopt;
+    std::vector<VkLayerProperties> layers(count);
+    if (enumerate(&count, layers.data()) != VK_SUCCESS) return std::nullopt;
+    for (const auto& layer : layers) {
+        if (std::strcmp(layer.layerName, "VK_LAYER_KHRONOS_validation") == 0) return layer.specVersion;
+    }
+    return std::nullopt;
+}
+
+
 void check(VkResult result, const char* operation) {
     if (result == VK_ERROR_DEVICE_LOST) Graphics::ReportDeviceLost();
     if (result != VK_SUCCESS) {
@@ -1904,7 +1923,20 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         }
     }
     VkPhysicalDeviceDescriptorHeapFeaturesEXT descriptorHeapFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_FEATURES_EXT};
-    if (Graphics::GpuHeapEnabled() && hasExtension(VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME) && hasExtension(VK_KHR_MAINTENANCE_5_EXTENSION_NAME) && hasExtension(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME) && hasExtension(VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME) && hasExtension(VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME)) {
+    const auto deviceApi = state->properties.apiVersion;
+    bool releasedDescriptorHeap = deviceApi >= VK_MAKE_API_VERSION(0, 1, 4, 340);
+    if (Graphics::GpuHeapEnabled() && hasExtension(VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME) && !releasedDescriptorHeap)
+        std::fprintf(stderr, "[gpu-heap] the driver reports Vulkan %u.%u.%u, older than 1.4.340 where VK_EXT_descriptor_heap was released, so its descriptor heap is a pre-release revision and the GPU heap stays off\n",
+                     VK_API_VERSION_MAJOR(deviceApi), VK_API_VERSION_MINOR(deviceApi), VK_API_VERSION_PATCH(deviceApi));
+    if (Graphics::GpuHeapEnabled() && releasedDescriptorHeap && hasExtension(VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME)) {
+        const auto validationVersion = ActiveValidationLayerVersion(state->instanceProc);
+        if (validationVersion.has_value() && *validationVersion < VK_MAKE_API_VERSION(0, 1, 4, 363)) {
+            std::fprintf(stderr, "[gpu-heap] VK_LAYER_KHRONOS_validation %u.%u.%u predates its descriptor heap rules (1.4.363 is the oldest layer that validates heap push data), so the GPU heap stays off\n",
+                         VK_API_VERSION_MAJOR(*validationVersion), VK_API_VERSION_MINOR(*validationVersion), VK_API_VERSION_PATCH(*validationVersion));
+            releasedDescriptorHeap = false;
+        }
+    }
+    if (Graphics::GpuHeapEnabled() && releasedDescriptorHeap && hasExtension(VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME) && hasExtension(VK_KHR_MAINTENANCE_5_EXTENSION_NAME) && hasExtension(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME) && hasExtension(VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME) && hasExtension(VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME)) {
         VkPhysicalDeviceMaintenance5FeaturesKHR heapMaintenance5{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR, &descriptorHeapFeatures};
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &heapMaintenance5};
         state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(selected, &features);
