@@ -2,6 +2,7 @@ add_library(libSceIcu SHARED EXCLUDE_FROM_ALL Export.cpp Invariant.cpp Version.c
 target_include_directories(libSceIcu PRIVATE ${LIBS_INCLUDE_DIR})
 configure_windows_unwind(libSceIcu)
 target_sources(libSceIcu PRIVATE ConverterCallbacks.cpp)
+target_sources(libSceIcu PRIVATE LegacyExports.cpp)
 target_sources(libSceIcu PRIVATE CString.cpp)
 target_sources(libSceIcu PRIVATE CompareIter.cpp)
 target_sources(libSceIcu PRIVATE Space.cpp)
