@@ -1230,8 +1230,25 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             instanceExtensions.push_back(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
             state->swapchainColorSpaces = true;
         }
+        // APS5_DEBUG_LABELS (diagnostic, lane G-trace): debug-utils labels around timed ranges, for Nsight GPU Trace (Recorder.cpp).
+        if (const char* labels = std::getenv("APS5_DEBUG_LABELS"); labels != nullptr && *labels != '\0' && std::strcmp(labels, "0") != 0
+            && std::any_of(available.begin(), available.end(), [](const auto& item) { return std::strcmp(item.extensionName, VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0; })) {
+            instanceExtensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+        }
         create.enabledExtensionCount = static_cast<std::uint32_t>(instanceExtensions.size());
         create.ppEnabledExtensionNames = instanceExtensions.data();
+    } else if (const char* labels = std::getenv("APS5_DEBUG_LABELS"); labels != nullptr && *labels != '\0' && std::strcmp(labels, "0") != 0) {
+        // Headless (tests, benches): only the debug-utils extension, for the labels.
+        std::uint32_t availableCount = 0;
+        const auto enumerateExtensions = state->InstanceFunction<PFN_vkEnumerateInstanceExtensionProperties>("vkEnumerateInstanceExtensionProperties");
+        check(enumerateExtensions(nullptr, &availableCount, nullptr), "vkEnumerateInstanceExtensionProperties");
+        std::vector<VkExtensionProperties> available(availableCount);
+        check(enumerateExtensions(nullptr, &availableCount, available.data()), "vkEnumerateInstanceExtensionProperties");
+        if (std::any_of(available.begin(), available.end(), [](const auto& item) { return std::strcmp(item.extensionName, VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0; })) {
+            instanceExtensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+            create.enabledExtensionCount = 1;
+            create.ppEnabledExtensionNames = instanceExtensions.data();
+        }
     }
     check(state->InstanceFunction<PFN_vkCreateInstance>("vkCreateInstance")(&create, nullptr, &state->instance), "vkCreateInstance");
     APS5_LOG_OUT("Vulkan instance created instance=%p", reinterpret_cast<void*>(state->instance));

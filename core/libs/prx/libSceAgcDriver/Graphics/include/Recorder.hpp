@@ -785,6 +785,10 @@ public:
     static constexpr std::uint32_t NoTiming = 0xffffffffu;
     static bool GpuTimingEnabled();
     static bool BatchStampsEnabled();
+    // APS5_DEBUG_LABELS=1 (diagnostic, lane G-trace): every timed range also gets a Vulkan debug-utils label
+    // ("p<program>", a class name or "batch") for Nsight GPU Trace; Begin returns LabelOnly when no timestamp is taken.
+    static constexpr std::uint32_t LabelOnly = 0xfffffffeu;
+    static bool DebugLabelsEnabled();
     std::uint32_t BeginGpuTiming(std::uint64_t key);
     // `bytes`: what the range moved (a fill's, a copy's), summed per key on the [gputime] line.
     void EndGpuTiming(std::uint32_t index, std::uint64_t bytes = 0);
@@ -1103,6 +1107,7 @@ private:
     // BeginGpuTiming on the open batch without Commands() (RecordStore times its own run, which
     // Commands() would close).
     std::uint32_t beginTiming(std::uint64_t key);
+    std::uint32_t beginTimingStamps(std::uint64_t key);
     // Vulkan entry points resolved once (constructor): the loader's vkGetDeviceProcAddr is a name
     // lookup per call, paid by every reap, store and submit otherwise. APS5_NO_PROC_TABLE=1 leaves
     // them null and resolves per call as before; vkWaitSemaphoresKHR stays a lazy lookup (timeline
