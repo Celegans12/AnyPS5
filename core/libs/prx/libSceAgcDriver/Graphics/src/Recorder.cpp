@@ -2877,7 +2877,7 @@ std::shared_ptr<Buffer> Recorder::containingDrawSnapshot(std::uint64_t address, 
     for (std::size_t probe = 0; probe < ContainingSnapshotProbes && entry != drawSnapshots.begin(); ++probe) {
         --entry;
         const auto& [start, use, held] = entry->first;
-        if (use != SnapshotUse::Storage || start + held < address + bytes || (address - start) % alignment != 0) continue;
+        if (use != SnapshotUse::Storage || !entry->second.owned.words.empty() || start + held < address + bytes || (address - start) % alignment != 0) continue;
         if (entry->second.registryGeneration != registry || !GuestMemory::UnchangedSince(address, bytes, entry->second.generation)) continue;
         auto& recency = drawSnapshotPools[SnapshotPool(use)].recency;
         recency.splice(recency.end(), recency, entry->second.recent);
@@ -2981,7 +2981,6 @@ bool Recorder::ownedDrawInputHolds(std::uint64_t address, std::size_t bytes, con
 
 std::shared_ptr<Buffer> Recorder::ReusableOwnedDrawInput(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint32_t* derived) {
     GuestMemory::AssertGpuLockHeld("reuse owned draw input");
-    Require(use != SnapshotUse::Storage, "an owned draw input is a vertex or index buffer");
     const auto found = drawSnapshots.find({address, use, bytes});
     if (found == drawSnapshots.end() || found->second.owned.words.empty()) return {};
     if (!ownedDrawInputHolds(address, bytes, found->second.owned)) {
@@ -3004,7 +3003,6 @@ std::shared_ptr<Buffer> Recorder::ReusableOwnedDrawInput(std::uint64_t address, 
 }
 
 void Recorder::KeepOwnedDrawInput(std::uint64_t address, std::size_t bytes, const OwnedDrawInputProof& proof, std::shared_ptr<Buffer> buffer, SnapshotUse use, std::uint32_t derived) {
-    Require(use != SnapshotUse::Storage, "an owned draw input is a vertex or index buffer");
     if (buffer == nullptr || buffer->Bytes().size() != bytes || !ownedDrawInputHolds(address, bytes, proof)) return;
     auto kept = proof;
     KeepDrawSnapshot(address, bytes, proof.since, proof.registry, std::move(buffer), use, derived);
